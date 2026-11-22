@@ -249,6 +249,25 @@ int main()
     t.w = 1920; t.h = 0;
     expect_u("tiled dst NOT ok: zero rows", rdna4_scanout_tiled_dst_ok(&t, 8294400), 0);
 
+    // 16 GiB full-BAR back-buffer B validation: invalid tail [16304 MiB, 16384 MiB) & overflow refused.
+    {
+        const uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
+        RDNA4ScanoutGeom g16 = live();
+        g16.bar0Phys = 0x7C00000000ull;
+        g16.fbPhys   = g16.bar0Phys;
+        g16.bar0Size = 16ull * GiB;
+        g16.vramSize = 16304ull * MiB;
+        uint64_t dstLen = 0;
+        expect_u("16 GiB flip B valid at 12 GiB",
+                 rdna4_scanout_flip_dst_check(&g16, 12ull * GiB, 8294400u, 12ull * GiB, &dstLen), kScanGeomOk);
+        expect_u("16 GiB flip B in invalid tail [16304 MiB, 16384 MiB) refused",
+                 rdna4_scanout_flip_dst_check(&g16, 16304ull * MiB, 8294400u, 16304ull * MiB, &dstLen), kScanGeomOutsideBar0);
+        expect_u("16 GiB flip B straddling valid VRAM end refused",
+                 rdna4_scanout_flip_dst_check(&g16, 16304ull * MiB - 65536u, 8294400u, 16304ull * MiB - 65536u, &dstLen), kScanGeomOutsideBar0);
+        expect_u("16 GiB flip B wrapping bOff + bLen refused",
+                 rdna4_scanout_flip_dst_check(&g16, ~0ull - 65535ull, 131072u, ~0ull - 65535ull, &dstLen), kScanGeomOutsideBar0);
+    }
+
     std::printf("\n%d/%d passed\n", gRun - gFail, gRun);
     return gFail ? 1 : 0;
 }

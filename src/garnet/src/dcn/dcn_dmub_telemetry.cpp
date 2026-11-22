@@ -173,7 +173,7 @@ uint32_t dmubRing(uint64_t arg, uint64_t *out, unsigned outCount) {
 	struct dcn41_dmub_state st;
 	if (dcn41_dmub_probe(&gLr.d, &st) != DCN41_OK) { out[0] = RDNA4DR_NO_DEVICE; return RDNA4DR_NO_DEVICE; }
 	amdgpu::DeviceContext *dev = static_cast<amdgpu::DeviceContext *>(gLr.d.cookie);
-	const uint64_t bar0Size = dev ? (uint64_t)dev->bar0Size : 0ull;
+	const uint64_t bar0Size = dev ? amdgpu::bar0_cpu_bound(*dev) : 0ull;
 	const bool known = st.ring_map != DCN41_DMUB_MAP_UNKNOWN && st.ring_addr != 0ull;
 	const uint64_t ringOff = (known && st.ring_addr >= st.fb_base_mc) ? st.ring_addr - st.fb_base_mc : ~0ull;
 	uint32_t sane = 0u;

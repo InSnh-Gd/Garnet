@@ -598,7 +598,7 @@ uint32_t flip_prepare() {
 
     /* The buffer must be inside the frame-buffer window the hardware reports, and inside the BAR0
      * aperture we are about to write it through. Both checked before a single byte is written. */
-    if (gDcn.testVramOff + bytes > gDcn.dev->bar0Size || !gDcn.dev->bar0) {
+    if (!amdgpu::bar0_range_ok(*gDcn.dev, gDcn.testVramOff, bytes)) {
         RDNA4LOG("dcn-flip: the allocation (vram+%#llx, %llu bytes) is outside the %zu-byte BAR0 "
                "aperture — REFUSING", (unsigned long long)gDcn.testVramOff,
                (unsigned long long)bytes, gDcn.dev->bar0Size);

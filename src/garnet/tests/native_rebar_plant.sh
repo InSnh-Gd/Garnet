@@ -175,5 +175,6 @@ plant 84 $BT "4.1: bartest_run_point skips immediate low-canary check" '    // 2
         if (got != want) { res = { kBtCanaryCorrupt, i, want, got }; return res; }
     }' ''
 plant 85 $B "4.1: runHighBarBidirTest falls back to MM_INDEX" 'uint32_t bar0_read32(uint64_t off)                { return amdgpu::RBAR0_32(*d, off); }' 'uint32_t bar0_read32(uint64_t off)                { return amdgpu::RVRAM32_via_mm(*d, off); }'
+plant 86 $B "4.1: runHighBarBidirTest skips n1c_hung fail-closed guard" 'if (amdgpu::n1c_hung()) { out[0] = kBtSdmaNotReady; return kIOReturnSuccess; }' ''
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

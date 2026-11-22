@@ -306,9 +306,10 @@ static inline uint32_t rdna4_scanout_flip_dst_check(const RDNA4ScanoutGeom *g, u
     if (dstOff == aOff) { if (dstLenOut) *dstLenOut = g->fbLen; return kScanGeomOk; }
     if (dstOff != bOff || bLen == 0) return kScanGeomNotConsole;
     if ((bOff & 0xffffull) || (bLen & 3u)) return kScanGeomAlign;
+    if (bOff > g->bar0Size || bLen > g->bar0Size - bOff) return kScanGeomOutsideBar0;
+    if (g->vramSize != 0 && (bOff > g->vramSize || bLen > g->vramSize - bOff)) return kScanGeomOutsideBar0;
     if (bOff < g->vramBase) return kScanGeomNotConsole;
     if (bOff < aOff + g->fbLen && aOff < bOff + bLen) return kScanGeomNotConsole;
-    if (bOff > g->bar0Size || bLen > g->bar0Size - bOff) return kScanGeomOutsideBar0;
     if ((uint64_t)g->rowBytes * g->height > bLen) return kScanGeomShape;
     if (dstLenOut) *dstLenOut = bLen;
     return kScanGeomOk;

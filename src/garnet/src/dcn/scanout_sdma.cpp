@@ -668,7 +668,7 @@ static uint32_t fc89_control() {
 	IOLockUnlock(gScanoutLock);
 	if (!have) { RDNA4LOG("fastcopy89: CONTROL not run - no %u-byte scratch in our allocator", RDNA4_FC_STAGING_BYTES); return 4u; }
 	const uint64_t off = a.gpu_va - gBringup.gmc.vram_start;
-	if (off + RDNA4_FC_STAGING_BYTES > dev.bar0Size) {
+	if (!amdgpu::bar0_range_ok(dev, off, RDNA4_FC_STAGING_BYTES)) {
 		IOLockLock(gScanoutLock); gBringup.gmc.vram_alloc.free(a); IOLockUnlock(gScanoutLock);
 		RDNA4LOG("fastcopy89: CONTROL not run - scratch VRAM %#llx is outside BAR0", (unsigned long long)off);
 		return 5u;
@@ -1246,8 +1246,8 @@ static uint32_t scanout_full_case(amdgpu::DeviceContext &dev, amdgpu::SDMAInstan
 	r->tiledOff = ta.gpu_va - gBringup.gmc.vram_start;
 	r->destOff  = da.gpu_va - gBringup.gmc.vram_start;
 	r->probeMc = pa.gpu_va; r->tiledMc = ta.gpu_va; r->destMc = da.gpu_va;
-	if (r->probeOff + r->linBytes > dev.bar0Size || r->destOff + r->linBytes > dev.bar0Size ||
-	    r->tiledOff + r->tilBytes > dev.bar0Size || (r->tiledOff & 0xffffu) || (r->probeOff & 0xffffu) ||
+	if (!amdgpu::bar0_range_ok(dev, r->probeOff, r->linBytes) || !amdgpu::bar0_range_ok(dev, r->destOff, r->linBytes) ||
+	    !amdgpu::bar0_range_ok(dev, r->tiledOff, r->tilBytes) || (r->tiledOff & 0xffffu) || (r->probeOff & 0xffffu) ||
 	    (r->destOff & 0xffffu)) { st = kScanStAlloc; goto done; }
 	// S3: the CPU writes the LINEAR probe in ASCENDING address order; pattern rdna4_tile_probe_pixel.
 	for (uint32_t y = 0; y < h; y++)
@@ -1394,8 +1394,8 @@ static uint32_t scanout_gcr_case(amdgpu::DeviceContext &dev, amdgpu::SDMAInstanc
 		return kScanStAlloc;
 	}
 	const uint64_t scOff = sc.gpu_va - gBringup.gmc.vram_start;
-	if (scOff + RDNA4_GCR_WINDOW_BYTES > dev.bar0Size ||
-	    (control && (pat.gpu_va - gBringup.gmc.vram_start) + RDNA4_GCR_WINDOW_BYTES > dev.bar0Size)) {
+	if (!amdgpu::bar0_range_ok(dev, scOff, RDNA4_GCR_WINDOW_BYTES) ||
+	    (control && !amdgpu::bar0_range_ok(dev, pat.gpu_va - gBringup.gmc.vram_start, RDNA4_GCR_WINDOW_BYTES))) {
 		scanout_free_vram(sc); scanout_free_vram(pat);
 		v[1] = (uint64_t)gcr | ((uint64_t)control << 1); v[2] = srcOff;
 		return kScanStAlloc;
@@ -1655,8 +1655,8 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			const uint64_t tOff = a.gpu_va - gBringup.gmc.vram_start;     // tiled, CPU-written from the equation
 			const uint64_t dOff = b.gpu_va - gBringup.gmc.vram_start;     // linear destination
 			const uint64_t t2Off = c.gpu_va - gBringup.gmc.vram_start;    // tiled, SDMA-written (the cross-check)
-			if (tOff + tilBytes > dev.bar0Size || dOff + linBytes > dev.bar0Size ||
-			    t2Off + tilBytes > dev.bar0Size || (tOff & 0xffffu) || (t2Off & 0xffffu)) { st = kScanStAlloc; goto done; }
+			if (!amdgpu::bar0_range_ok(dev, tOff, tilBytes) || !amdgpu::bar0_range_ok(dev, dOff, linBytes) ||
+			    !amdgpu::bar0_range_ok(dev, t2Off, tilBytes) || (tOff & 0xffffu) || (t2Off & 0xffffu)) { st = kScanStAlloc; goto done; }
 			// The known tiled image, plus poison everywhere the copies must write.
 			uint32_t nonLinear = 0;
 			for (uint32_t y = 0; y < kTH; y++)
@@ -2001,7 +2001,7 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			st = kScanStAlloc; goto done;
 		}
 		const uint64_t aOff = a.gpu_va - gBringup.gmc.vram_start, bOff = b.gpu_va - gBringup.gmc.vram_start;
-		if (aOff + bytes > dev.bar0Size || bOff + bytes > dev.bar0Size) { st = kScanStAlloc; goto done; }
+		if (!amdgpu::bar0_range_ok(dev, aOff, bytes) || !amdgpu::bar0_range_ok(dev, bOff, bytes)) { st = kScanStAlloc; goto done; }
 		// The pattern, and a poisoned scratch buffer.
 		for (uint32_t y = 0; y < kScanPcH; y++)
 			for (uint32_t x = 0; x < kScanPcW; x++) {
@@ -2333,7 +2333,7 @@ uint32_t rdna4_scanout_copy_vram(uint64_t srcOff, uint64_t srcLen, uint32_t srcW
 			v[5] = 0; v[6] = 0; v[7] = 0;
 		} else if (st == kScanStOk) {
 			// Rows 0 and h-1 in full, 64 dwords per source read.
-			const bool srcInBar = srcOff + srcLen <= dev.bar0Size;
+			const bool srcInBar = amdgpu::bar0_range_ok(dev, srcOff, srcLen);
 			uint32_t bad = 0, compared = 0, clientOk = 0, samples = 0;
 			const uint32_t rows[2] = { 0, plan.h - 1 };
 			for (unsigned r = 0; r < 2; r++) {
@@ -3075,7 +3075,8 @@ uint32_t rdna4_scanout_copy_staged(IOMemoryDescriptor *md, uint32_t srcStride, u
 		}
 		const uint32_t bytes = cw * ch * 4u;
 		if (st == kScanStOk && (!gBringup.gmc.vram_alloc.alloc(bytes, 16384, &stg) ||
-		                        stg.gpu_va - gBringup.gmc.vram_start + bytes > dev.bar0Size))
+		                        stg.gpu_va < gBringup.gmc.vram_start ||
+		                        !amdgpu::bar0_range_ok(dev, stg.gpu_va - gBringup.gmc.vram_start, bytes)))
 			st = kScanStAlloc;
 		const uint64_t stgOff = stg.size ? stg.gpu_va - gBringup.gmc.vram_start : 0;
 		v[2] = stgOff;

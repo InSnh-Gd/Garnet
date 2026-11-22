@@ -1151,6 +1151,7 @@ IOReturn GarnetDriver::runHighBarBidirTest(uint64_t arg, uint64_t out[kAccelExtr
 	out[10] = bar0Phys;
 	out[11] = (bar0FullMode ? 1ull : 0ull) | (bar0WriteCombined() ? 2ull : 0ull);
 	if (!bartest_arg_ok(arg)) { out[0] = kBtBadArg; return kIOReturnBadArgument; }
+	if (amdgpu::n1c_hung()) { out[0] = kBtSdmaNotReady; return kIOReturnSuccess; }
 	if (!bar0 || bar0Size == 0 || bar0Limit == 0 || !gBringup.dev) { out[0] = kBtNoBar0; return kIOReturnSuccess; }
 	if (!gBringup.gmc.vram_alloc.is_inited()) { out[0] = kBtAllocFail; return kIOReturnSuccess; }
 	if (!gBringup.sdma.instance[0].inited || !gBringup.sdma.instance[0].enabled) { out[0] = kBtSdmaNotReady; return kIOReturnSuccess; }

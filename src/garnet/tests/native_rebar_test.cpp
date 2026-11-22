@@ -707,8 +707,8 @@ static void p13_bartest(const std::string &root) {
     expect(has(aw, "rdna4rebar::aperture_boundary_points(") && has(aw, "rdna4rebar::layout_points_clear_console("),
            "P13 pin 3.1: apertureCheckWindow validates and checks full-BAR 4/8/12 GiB boundary points");
     const std::string bt = between(b, "IOReturn GarnetDriver::runHighBarBidirTest(", "IOReturn GarnetDriver::accelExperiment(");
-    expect(!bt.empty() && has(bt, "bartest_plan_targets(") && has(bt, "n1c_vram_alloc_excl_at(") && has(bt, "bartest_run_point(") && has(bt, "amdgpu::WBAR0_32(") && has(bt, "amdgpu::RBAR0_32(") && has(bt, "amdgpu::amdgpu_hdp_flush(") && has(bt, "rdna4_sdma_copy_linear_sync("),
-           "P13 pin 4.1: runHighBarBidirTest uses exclusive alloc_at + direct BAR0 + HDP flush + SDMA");
+    expect(!bt.empty() && has(bt, "if (amdgpu::n1c_hung()) { out[0] = kBtSdmaNotReady; return kIOReturnSuccess; }") && has(bt, "bartest_plan_targets(") && has(bt, "n1c_vram_alloc_excl_at(") && has(bt, "bartest_run_point(") && has(bt, "amdgpu::WBAR0_32(") && has(bt, "amdgpu::RBAR0_32(") && has(bt, "amdgpu::amdgpu_hdp_flush(") && has(bt, "rdna4_sdma_copy_linear_sync("),
+           "P13 pin 4.1: runHighBarBidirTest checks n1c_hung and uses exclusive alloc_at + direct BAR0 + HDP flush + SDMA");
     expect(!has(bt, "RVRAM32_via_mm") && !has(bt, "WVRAM32_via_mm") && !has(bt, "vramRead32") && !has(bt, "vramWrite32"),
            "P13 pin 4.1: runHighBarBidirTest NEVER falls back to MM_INDEX");
     const std::string mfh = between(s1c, "IOReturn n1c_memory_for_handle(", "// ==== 0.0.627:");
