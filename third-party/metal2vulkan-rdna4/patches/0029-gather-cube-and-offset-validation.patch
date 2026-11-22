@@ -1,0 +1,1244 @@
+--- a/src/passes/air_calls/images/gather.rs
++++ b/src/passes/air_calls/images/gather.rs
+@@ -2,11 +2,145 @@
+ 
+ use super::*;
+ 
+-/// Lower `air.gather_texture_2d.v4f32`: gather one selected component from the four neighboring
+-/// texels around the sampled coordinate. AIR args observed in real AIR are
+-/// `(texture, sampler, coord, i1 has_offset, offset, component, flags)`. `has_offset` is not a
+-/// coordinate-mode flag and carries nothing this lowering needs -- the offset operand states its
+-/// own value. Whether the coordinate is normalized or in texels is the sampler state's to say.
++#[derive(Clone, Copy)]
++struct GatherRequest {
++    result: Word,
++    result_ty: Word,
++    image: Word,
++    dim: Dim,
++    arrayed: bool,
++    sampler: Word,
++    coord: Word,
++    layer: Option<Word>,
++    offset: Option<Word>,
++    component: Word,
++    depth_image: bool,
++    gather_v4: Word,
++}
++
++/// Parse the stable AIR shape token shared by every gather family. The fixed MSL 2.1 text defines
++/// gather for 2D, 2D-array, cube and cube-array textures; it defines no 3D gather overload.
++fn gather_shape(name: &str, operation: &str) -> Result<(Dim, bool), String> {
++    let shape = intrinsic_texture_shape(name)
++        .ok_or_else(|| format!("{operation} has no recognized texture shape: {name}"))?;
++    match shape {
++        (Dim::Dim2D, _) | (Dim::DimCube, _) => Ok(shape),
++        (dim, _) => Err(format!(
++            "{operation} does not support {dim:?} texture gather"
++        )),
++    }
++}
++
++/// OpImageGather's Component operand must be a 32-bit integer constant in `[0, 3]`. AIR's i32
++/// component operand is normally already a literal; canonicalize it to uint so every emitted form
++/// has the scalar integer type SPIR-V requires.
++fn gather_component(ctx: &mut Ctx, component: Word) -> Result<Word, String> {
++    let ty = value_result_type(ctx, component)
++        .ok_or("air.gather_texture component has no result type")?;
++    if integer_shape(ctx, ty) != Some((32, 1)) {
++        return Err("air.gather_texture component must be a 32-bit integer scalar".into());
++    }
++    let value = const_i32_scalar(ctx, component)
++        .or_else(|| {
++            const_inst(ctx, component)
++                .filter(|inst| inst.class.opcode == Op::ConstantNull)
++                .map(|_| 0)
++        })
++        .ok_or("air.gather_texture component must be a constant")?;
++    if !(0..4).contains(&value) {
++        return Err(format!(
++            "air.gather_texture component {value} is out of range 0..3"
++        ));
++    }
++    Ok(ctx.const_uint(value as u32))
++}
++
++/// Verify that a recovered image can be used by the gather operation named by the AIR symbol.
++/// This is deliberately independent of the fixture name: shape, depth class and sampled access
++/// are properties of the actual `OpTypeImage` and the stable intrinsic family.
++fn validate_gather_image(
++    ctx: &Ctx,
++    image_ty: Word,
++    dim: Dim,
++    arrayed: bool,
++    depth_image: bool,
++    component: crate::passes::ImageComp,
++) -> Result<u32, String> {
++    let def = type_def_of(ctx, image_ty).ok_or("air.gather_texture image type is undefined")?;
++    if def.class.opcode != Op::TypeImage {
++        return Err("air.gather_texture operand is not an image".into());
++    }
++    let actual_dim = match def.operands.get(1) {
++        Some(Operand::Dim(value)) => *value,
++        _ => return Err("air.gather_texture image type has no dimension".into()),
++    };
++    let actual_depth = matches!(def.operands.get(2), Some(Operand::LiteralBit32(1)));
++    let actual_arrayed = matches!(def.operands.get(3), Some(Operand::LiteralBit32(1)));
++    let multisampled = matches!(def.operands.get(4), Some(Operand::LiteralBit32(1)));
++    let sampled = match def.operands.get(5) {
++        Some(Operand::LiteralBit32(value)) => *value,
++        _ => return Err("air.gather_texture image type has no Sampled operand".into()),
++    };
++    if actual_dim != dim || actual_arrayed != arrayed {
++        return Err(format!(
++            "air.gather_texture intrinsic shape {dim:?}/arrayed={arrayed} does not match image \
++             type {actual_dim:?}/arrayed={actual_arrayed}"
++        ));
++    }
++    if actual_depth != depth_image {
++        return Err(format!(
++            "air.gather_texture {} requires a {} image",
++            if depth_image { "depth" } else { "color" },
++            if depth_image { "depth" } else { "color" }
++        ));
++    }
++    if multisampled {
++        return Err("air.gather_texture does not support multisampled images".into());
++    }
++    if depth_image && component != crate::passes::ImageComp::Float {
++        return Err("air.gather_depth requires a float depth image".into());
++    }
++    Ok(sampled)
++}
++
++/// Validate a 2D gather offset against the MSL range and SPIR-V operand form.
++///
++/// A constant offset lowers to `ConstOffset`, which is core SPIR-V and does not require
++/// `ImageGatherExtended`. A runtime offset is folded into the coordinate by
++/// [`apply_dynamic_sample_offset`] instead of emitting a feature-gated `Offset` operand. Cube
++/// gather overloads have no offset at all.
++fn validated_gather_offset(
++    ctx: &Ctx,
++    offset: Option<Word>,
++) -> Result<(Option<[i32; 2]>, Option<Word>), String> {
++    let Some(offset) = offset else {
++        return Ok((None, None));
++    };
++    let ty =
++        value_result_type(ctx, offset).ok_or("air.gather_texture offset has no result type")?;
++    if integer_shape(ctx, ty) != Some((32, 2)) {
++        return Err(
++            "air.gather_texture offset must be a two-component 32-bit integer vector".into(),
++        );
++    }
++    let (constant, dynamic) = gather_const_or_dynamic_offset(ctx, offset)?;
++    if let Some(value) = constant {
++        if value.iter().any(|component| !(-8..=7).contains(component)) {
++            return Err(format!(
++                "air.gather_texture offset {value:?} is outside the MSL range [-8, 7]"
++            ));
++        }
++    }
++    Ok((constant, dynamic))
++}
++
++/// Lower `air.gather_texture_<shape>`. AIR uses two ABI families:
++///
++/// - 2D: `(texture, sampler, coord, [layer,] i1 has_offset, offset, component, flags)`
++/// - cube: `(texture, sampler, float3 coord, [layer,] component, flags)`
++///
++/// `has_offset` names no coordinate domain; the sampler state supplies that. Cube has no MSL gather
++/// offset overload, so its AIR call has no offset operand at all.
+ pub(in crate::passes) fn lower_gather(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -19,9 +153,42 @@
+         (Some(r), Some(t)) => (r, t),
+         _ => return Err("air.gather_texture has no result".into()),
+     };
+-    if args.len() < 6 {
+-        return Err("air.gather_texture missing texture/sampler/coord/offset/component".into());
+-    }
++    let (dim, arrayed) = gather_shape(name, "air.gather_texture")?;
++    let (layer, offset, component) = match (dim, arrayed) {
++        (Dim::Dim2D, false) => {
++            if args.len() < 7 {
++                return Err(
++                    "air.gather_texture 2D form missing texture/sampler/coord/offset/component"
++                        .into(),
++                );
++            }
++            (None, Some(args[4]), args[5])
++        }
++        (Dim::Dim2D, true) => {
++            if args.len() < 8 {
++                return Err(
++                    "air.gather_texture 2D-array form missing layer/offset/component".into(),
++                );
++            }
++            (Some(args[3]), Some(args[5]), args[6])
++        }
++        (Dim::DimCube, false) => {
++            if args.len() < 5 {
++                return Err(
++                    "air.gather_texture cube form missing texture/sampler/coord/component".into(),
++                );
++            }
++            (None, None, args[3])
++        }
++        (Dim::DimCube, true) => {
++            if args.len() < 6 {
++                return Err("air.gather_texture cube-array form missing layer/component".into());
++            }
++            (Some(args[3]), None, args[4])
++        }
++        _ => unreachable!("gather_shape filters unsupported dimensions"),
++    };
++    let component = gather_component(ctx, component)?;
+     let samp = args[1];
+     let mut img = resolve_image_value(ctx, args[0]);
+     if texture_operand_is_absent(ctx, img) {
+@@ -33,29 +200,27 @@
+             return lower_null_texture_result(ctx, res, rty);
+         }
+     }
+-    let (dim, _, _) = image_shape_or_recorded(ctx, img);
+-    let arrayed = name.starts_with("air.gather_texture_2d_array.");
+-    let (layer, offset, component) = if arrayed {
+-        if args.len() < 7 {
+-            return Err("air.gather_texture array form missing layer/offset/component".into());
+-        }
+-        (Some(args[3]), args[5], args[6])
+-    } else {
+-        (None, args[4], args[5])
+-    };
+-    lower_gather_2d(
+-        ctx, res, rty, img, dim, arrayed, samp, args[2], layer, offset, component, v4,
++    lower_gather_image(
++        ctx,
++        GatherRequest {
++            result: res,
++            result_ty: rty,
++            image: img,
++            dim,
++            arrayed,
++            sampler: samp,
++            coord: args[2],
++            layer,
++            offset,
++            component,
++            depth_image: false,
++            gather_v4: v4,
++        },
+     )
+ }
+ 
+-/// Lower `air.gather_depth_2d[_array].v4f32`: gather the four neighboring depth texels around the
+-/// coordinate. A `depth2d` AIR type is emitted as a real `OpTypeImage` depth image, so depth is
+-/// component zero. The depth ABI sits one slot right of the color layout — `(texture, sampler, i32,
+-/// coord, [layer,] i1, offset, i32 flags)`, no component operand. The `i1` is `true` at every call
+-/// site the frontend emits, for pixel and normalized samplers alike and with or without an offset,
+-/// so it names no coordinate domain and this lowering does not read it. Which domain the coordinate
+-/// is in comes from the sampler, exactly as it does for the non-array and color forms, and
+-/// `lower_gather_2d` is what decides between the reconstructed pixel footprint and `OpImageGather`.
++/// Lower `air.gather_depth_<shape>`. Depth is always component zero and uses the depth ABI's extra
++/// control operand before the coordinate. As with color gather, cube has no offset operand.
+ pub(in crate::passes) fn lower_gather_depth(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -68,9 +233,34 @@
+         (Some(r), Some(t)) => (r, t),
+         _ => return Err("air.gather_depth has no result".into()),
+     };
+-    if args.len() < 7 {
+-        return Err("air.gather_depth missing texture/sampler/coord/offset".into());
+-    }
++    let (dim, arrayed) = gather_shape(name, "air.gather_depth")?;
++    let (layer, offset) = match (dim, arrayed) {
++        (Dim::Dim2D, false) => {
++            if args.len() < 7 {
++                return Err("air.gather_depth 2D form missing coord/offset".into());
++            }
++            (None, Some(args[5]))
++        }
++        (Dim::Dim2D, true) => {
++            if args.len() < 8 {
++                return Err("air.gather_depth 2D-array form missing layer/offset".into());
++            }
++            (Some(args[4]), Some(args[6]))
++        }
++        (Dim::DimCube, false) => {
++            if args.len() < 5 {
++                return Err("air.gather_depth cube form missing coord".into());
++            }
++            (None, None)
++        }
++        (Dim::DimCube, true) => {
++            if args.len() < 6 {
++                return Err("air.gather_depth cube-array form missing layer".into());
++            }
++            (Some(args[4]), None)
++        }
++        _ => unreachable!("gather_shape filters unsupported dimensions"),
++    };
+     let samp = args[1];
+     let mut img = resolve_image_value(ctx, args[0]);
+     if texture_operand_is_absent(ctx, img) {
+@@ -82,21 +272,23 @@
+             return lower_null_texture_result(ctx, res, rty);
+         }
+     }
+-    let (dim, _, _) = image_shape_or_recorded(ctx, img);
+-    let arrayed = name.starts_with("air.gather_depth_2d_array.");
+-    let coord = args[3];
+-    let (layer, offset_index) = if arrayed {
+-        if args.len() < 8 {
+-            return Err("air.gather_depth array form missing layer/offset".into());
+-        }
+-        (Some(args[4]), 6)
+-    } else {
+-        (None, 5)
+-    };
+-    let offset = args[offset_index];
+     let component = ctx.const_uint(0);
+-    lower_gather_2d(
+-        ctx, res, rty, img, dim, arrayed, samp, coord, layer, offset, component, v4,
++    lower_gather_image(
++        ctx,
++        GatherRequest {
++            result: res,
++            result_ty: rty,
++            image: img,
++            dim,
++            arrayed,
++            sampler: samp,
++            coord: args[3],
++            layer,
++            offset,
++            component,
++            depth_image: true,
++            gather_v4: v4,
++        },
+     )
+ }
+ 
+@@ -125,23 +317,42 @@
+         (Some(r), Some(t)) => (r, t),
+         _ => return Err("air.gather_compare_depth has no result".into()),
+     };
+-    let array_form = name.starts_with("air.gather_compare_depth_2d_array.");
+-    let minimum_args = if array_form { 9 } else { 8 };
+-    if args.len() < minimum_args {
+-        return Err(
+-            "air.gather_compare_depth missing texture/sampler/coord/reference/offset".into(),
+-        );
+-    }
+-
++    let (dim, arrayed) = gather_shape(name, "air.gather_compare_depth")?;
++    let (layer, reference, offset) = match (dim, arrayed) {
++        (Dim::Dim2D, false) => {
++            if args.len() < 8 {
++                return Err(
++                    "air.gather_compare_depth 2D form missing coord/reference/offset".into(),
++                );
++            }
++            (None, args[4], Some(args[6]))
++        }
++        (Dim::Dim2D, true) => {
++            if args.len() < 9 {
++                return Err(
++                    "air.gather_compare_depth 2D-array form missing layer/reference/offset".into(),
++                );
++            }
++            (Some(args[4]), args[5], Some(args[7]))
++        }
++        (Dim::DimCube, false) => {
++            if args.len() < 6 {
++                return Err("air.gather_compare_depth cube form missing coord/reference".into());
++            }
++            (None, args[4], None)
++        }
++        (Dim::DimCube, true) => {
++            if args.len() < 7 {
++                return Err(
++                    "air.gather_compare_depth cube-array form missing layer/reference".into(),
++                );
++            }
++            (Some(args[4]), args[5], None)
++        }
++        _ => unreachable!("gather_shape filters unsupported dimensions"),
++    };
+     let samp = args[1];
+     let coord = args[3];
+-    // Real 2D-array AIR inserts the layer between the spatial coordinate and the reference:
+-    // `(texture, sampler, control, coord, layer, reference, i1, offset, flags)`.
+-    let (layer, reference, offset) = if array_form {
+-        (Some(args[4]), args[5], args[7])
+-    } else {
+-        (None, args[4], args[6])
+-    };
+     let mut img = resolve_image_value(ctx, args[0]);
+     if texture_operand_is_absent(ctx, img) {
+         if let Some(sampled_img) =
+@@ -156,13 +367,14 @@
+     let mut out = vec![];
+     img = load_image_if_pointer(ctx, img, &mut out);
+     let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+-    let (img_ty, dim, arrayed, comp) =
++    let (img_ty, _, _, comp) =
+         sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
+     if comp != crate::passes::ImageComp::Float {
+         return Err("air.gather_compare_depth on non-float texture".into());
+     }
+-    if dim != Dim::Dim2D || arrayed != array_form {
+-        return Err("air.gather_compare_depth requires a matching 2D texture shape".into());
++    let sampled = validate_gather_image(ctx, img_ty, dim, arrayed, true, comp)?;
++    if sampled != 1 {
++        return Err("air.gather_compare_depth requires a sampled image".into());
+     }
+ 
+     let sampler_state = ctx.sampler_states.get(&samp).copied();
+@@ -176,18 +388,17 @@
+             "air.gather_compare_depth with pixel-coordinate samplers is not supported".into(),
+         );
+     }
+-    let mut coord_for_gather = build_gather_coord_2d(ctx, array_form, coord, layer, &mut out)?;
+-    let (const_offset, dynamic_offset) = gather_const_or_dynamic_offset(ctx, offset)?;
++    let mut coord_for_gather = build_gather_coord(ctx, dim, arrayed, coord, layer, &mut out)?;
++    let (const_offset, dynamic_offset) = validated_gather_offset(ctx, offset)?;
+     if let Some(offset) = dynamic_offset {
+-        coord_for_gather = apply_dynamic_sample_offset(
+-            ctx,
+-            img,
+-            array_form,
+-            coord_for_gather,
+-            offset,
+-            2,
+-            &mut out,
+-        )?;
++        if dim != Dim::Dim2D {
++            return Err(
++                "air.gather_compare_depth dynamic offsets are supported only for 2D textures"
++                    .into(),
++            );
++        }
++        coord_for_gather =
++            apply_dynamic_sample_offset(ctx, img, arrayed, coord_for_gather, offset, 2, &mut out)?;
+     }
+ 
+     let si_ty = ctx.ty_sampled_image(img_ty);
+@@ -222,57 +433,82 @@
+     finish_sample_result(ctx, res, rty, color, v4, out)
+ }
+ 
+-#[allow(clippy::too_many_arguments)]
+-pub(in crate::passes) fn lower_gather_2d(
+-    ctx: &mut Ctx,
+-    res: Word,
+-    rty: Word,
+-    img: Word,
+-    dim: Dim,
+-    arrayed: bool,
+-    samp: Word,
+-    coord: Word,
+-    layer: Option<Word>,
+-    offset: Word,
+-    component: Word,
+-    v4: Word,
+-) -> Result<Vec<Instruction>, String> {
+-    if dim != Dim::Dim2D {
+-        return Err("air.gather_texture currently supports 2D textures only".into());
+-    }
++fn lower_gather_image(ctx: &mut Ctx, request: GatherRequest) -> Result<Vec<Instruction>, String> {
+     let mut out = vec![];
+-    let img = load_image_if_pointer(ctx, img, &mut out);
+-    let (_, _, fallback_comp) = image_shape_or_recorded(ctx, img);
+-    let (img_ty, _dim, arrayed, _) =
+-        sampled_operand_image_info(ctx, img, dim, arrayed, fallback_comp);
+-    let gather_v4 = image_fetch_v4(ctx, img, v4);
++    let img = load_image_if_pointer(ctx, request.image, &mut out);
++    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
++    let (img_ty, _, _, comp) =
++        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
++    let sampled = validate_gather_image(
++        ctx,
++        img_ty,
++        request.dim,
++        request.arrayed,
++        request.depth_image,
++        comp,
++    )?;
++    let gather_v4 = image_fetch_v4(ctx, img, request.gather_v4);
++    if request.dim != Dim::Dim2D
++        && ctx
++            .sampler_states
++            .get(&request.sampler)
++            .is_some_and(|state| state.uses_pixel_coordinates())
++    {
++        return Err(format!(
++            "air.gather_texture with pixel-coordinate samplers does not support {:?}",
++            request.dim
++        ));
++    }
++    let pixel_state = (!ctx.normalized_sampler_coordinates)
++        .then(|| ctx.sampler_states.get(&request.sampler).copied())
++        .flatten()
++        .filter(|state| state.uses_pixel_coordinates());
+     let zero_lod = ctx.const_uint(0);
+-    let coord =
+-        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
+-
+-    if let Some(sampler_state) = (!ctx.normalized_sampler_coordinates)
+-        .then(|| ctx.sampler_states.get(&samp).copied())
+-        .flatten()
+-        .filter(|state| state.uses_pixel_coordinates())
+-    {
++    let coord = normalize_sampler_coordinate(
++        ctx,
++        request.sampler,
++        img,
++        request.dim,
++        request.arrayed,
++        request.coord,
++        zero_lod,
++        &mut out,
++    )?;
++
++    if let Some(sampler_state) = pixel_state {
++        if request.dim != Dim::Dim2D {
++            return Err(format!(
++                "air.gather_texture with pixel-coordinate samplers does not support {:?}",
++                request.dim
++            ));
++        }
++        // ABI8 kept storage-image pixel gathers working by reconstructing their four fetches.
++        // The ABI9 ImageShape/Access rollout narrows this to Sampled images once every legacy
++        // pixel-sampler producer reports access explicitly.
++        if !matches!(sampled, 1 | 2) {
++            return Err("air.gather_texture requires a sampled or storage image".into());
++        }
+         return lower_pixel_gather_2d(
+             ctx,
+-            res,
+-            rty,
++            request.result,
++            request.result_ty,
+             img,
+-            arrayed,
++            request.arrayed,
+             sampler_state,
+             coord,
+-            layer,
+-            offset,
+-            component,
++            request.layer,
++            request.offset,
++            request.component,
+             gather_v4,
+             out,
+         );
+     }
++    if sampled != 1 {
++        return Err("air.gather_texture requires a sampled image".into());
++    }
+ 
+     let si_ty = ctx.ty_sampled_image(img_ty);
+-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
++    let samp = valid_sampler_value(ctx, request.sampler, &mut out)?;
+     let si = ctx.module.fresh_id();
+     out.push(Instruction::new(
+         Op::SampledImage,
+@@ -281,18 +517,37 @@
+         vec![Operand::IdRef(img), Operand::IdRef(samp)],
+     ));
+ 
+-    let mut coord_for_gather = build_gather_coord_2d(ctx, arrayed, coord, layer, &mut out)?;
+-    let (const_offset, dynamic_offset) = gather_const_or_dynamic_offset(ctx, offset)?;
++    let mut coord_for_gather = build_gather_coord(
++        ctx,
++        request.dim,
++        request.arrayed,
++        coord,
++        request.layer,
++        &mut out,
++    )?;
++    let (const_offset, dynamic_offset) = validated_gather_offset(ctx, request.offset)?;
+     if let Some(offset) = dynamic_offset {
+-        coord_for_gather =
+-            apply_dynamic_sample_offset(ctx, img, arrayed, coord_for_gather, offset, 2, &mut out)?;
++        if request.dim != Dim::Dim2D {
++            return Err(
++                "air.gather_texture dynamic offsets are supported only for 2D textures".into(),
++            );
++        }
++        coord_for_gather = apply_dynamic_sample_offset(
++            ctx,
++            img,
++            request.arrayed,
++            coord_for_gather,
++            offset,
++            2,
++            &mut out,
++        )?;
+     }
+ 
+     let color = ctx.module.fresh_id();
+     let mut ops = vec![
+         Operand::IdRef(si),
+         Operand::IdRef(coord_for_gather),
+-        Operand::IdRef(component),
++        Operand::IdRef(request.component),
+     ];
+     if let Some(offset) = const_offset {
+         if offset != [0, 0] {
+@@ -301,6 +556,8 @@
+             ops.push(Operand::IdRef(offset_id));
+         }
+     }
++    // MSL and Vulkan both number gather lanes counter-clockwise from the lower-left texel:
++    // (-,+), (+,+), (+,-), (-,-). There is no order conversion to perform.
+     out.push(Instruction::new(
+         Op::ImageGather,
+         Some(gather_v4),
+@@ -308,14 +565,20 @@
+         ops,
+     ));
+ 
+-    finish_sample_result(ctx, res, rty, color, gather_v4, out)
++    finish_sample_result(
++        ctx,
++        request.result,
++        request.result_ty,
++        color,
++        gather_v4,
++        out,
++    )
+ }
+ 
+ /// Assemble an arrayed sampled-image coordinate: the `spatial` float components of `coord` plus the
+ /// array `layer` converted to a trailing float component, as a `vecf(spatial + 1)`. Shared by
+-/// normalized sampling (`build_sample_coord`) and 2D gather (`build_gather_coord_2d`), which differ
+-/// only in where the layer word originates (sample: `args[3]`; gather: an explicit operand) and the
+-/// spatial component count.
++/// normalized sampling (`build_sample_coord`) and gather, which differ only in where the layer word
++/// originates (sample: `args[3]`; gather: an explicit operand) and the spatial component count.
+ pub(in crate::passes) fn build_arrayed_sample_coord(
+     ctx: &mut Ctx,
+     spatial: u32,
+@@ -336,8 +599,9 @@
+     Ok(combined)
+ }
+ 
+-pub(in crate::passes) fn build_gather_coord_2d(
+-    ctx: &mut Ctx,
++fn build_gather_coord(
++    ctx: &mut Ctx,
++    dim: Dim,
+     arrayed: bool,
+     coord: Word,
+     layer: Option<Word>,
+@@ -347,7 +611,27 @@
+         return Ok(coord);
+     }
+     let layer = layer.ok_or("air.gather_texture array texture missing layer")?;
+-    build_arrayed_sample_coord(ctx, 2, coord, layer, out)
++    let spatial = match dim {
++        Dim::Dim2D => 2,
++        Dim::DimCube => 3,
++        _ => {
++            return Err(format!(
++                "air.gather_texture unsupported arrayed dimension {dim:?}"
++            ))
++        }
++    };
++    build_arrayed_sample_coord(ctx, spatial, coord, layer, out)
++}
++
++#[cfg(test)]
++pub(in crate::passes) fn build_gather_coord_2d(
++    ctx: &mut Ctx,
++    arrayed: bool,
++    coord: Word,
++    layer: Option<Word>,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    build_gather_coord(ctx, Dim::Dim2D, arrayed, coord, layer, out)
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -360,18 +644,17 @@
+     sampler_state: StaticSamplerState,
+     coord: Word,
+     layer: Option<Word>,
+-    offset: Word,
++    offset: Option<Word>,
+     component: Word,
+     v4: Word,
+     mut out: Vec<Instruction>,
+ ) -> Result<Vec<Instruction>, String> {
++    let component = gather_component(ctx, component)?;
+     let component = const_i32_scalar(ctx, component)
+-        .ok_or("air.gather_texture pixel component must be a constant scalar")?;
+-    if !(0..4).contains(&component) {
+-        return Err("air.gather_texture pixel component is out of range".into());
+-    }
++        .ok_or("air.gather_texture component must be a constant scalar")?;
++    let component = component as u32;
+     let selected_ty = vector_element_type(ctx, v4).unwrap_or_else(|| ctx.ty_float());
+-    let (const_offset, dynamic_offset) = gather_const_or_dynamic_offset(ctx, offset)?;
++    let (const_offset, dynamic_offset) = validated_gather_offset(ctx, offset)?;
+     let sample_v4 = image_fetch_v4(ctx, img, v4);
+     let lod = ctx.const_uint(0);
+     // Metal's `texture.gather()` returns the bilinear footprint whose base texel is
+@@ -414,10 +697,7 @@
+             Op::CompositeExtract,
+             Some(selected_ty),
+             Some(selected),
+-            vec![
+-                Operand::IdRef(color),
+-                Operand::LiteralBit32(component as u32),
+-            ],
++            vec![Operand::IdRef(color), Operand::LiteralBit32(component)],
+         ));
+         if let Some(in_bounds) = fetch.in_bounds {
+             let guarded = ctx.module.fresh_id();
+--- /dev/null
++++ b/tests/gather_cube.rs
+@@ -0,0 +1,538 @@
++//! Cube and cube-array gather ABI and lowering.
++//!
++//! These declarations mirror the operand order emitted by Metal's AIR:
++//!
++//! - color: `(texture, sampler, float3 coord, [layer,] component, flags)`
++//! - depth: `(texture, sampler, i32 control, float3 coord, [layer,] flags)`
++//! - Dref: `(texture, sampler, i32 control, float3 coord, [layer,] compare, flags)`
++
++use metal2vulkan::passes::Stage;
++use metal2vulkan::{disassemble, translate_sanitized_native};
++use std::path::PathBuf;
++
++const NORMALIZED_SAMPLER: u64 = 34_901_797_601_020_416;
++const COMPARE_NEVER: u64 = 34_901_797_601_017_929;
++const COMPARE_ALWAYS: u64 = 34_901_797_600_952_393;
++
++#[derive(Clone, Copy)]
++enum Gather {
++    Color,
++    ColorArray,
++    Integer,
++    Depth,
++    DepthArray,
++    Dref,
++    DrefArray,
++}
++
++impl Gather {
++    fn arrayed(self) -> bool {
++        matches!(self, Self::ColorArray | Self::DepthArray | Self::DrefArray)
++    }
++
++    fn depth(self) -> bool {
++        matches!(
++            self,
++            Self::Depth | Self::DepthArray | Self::Dref | Self::DrefArray
++        )
++    }
++}
++
++fn scratch(label: &str) -> PathBuf {
++    let directory = std::env::temp_dir().join(format!(
++        "metal2vulkan_gather_cube_{}_{}",
++        std::process::id(),
++        label
++    ));
++    std::fs::create_dir_all(&directory).expect("create scratch directory");
++    directory
++}
++
++fn translate(source: &str, label: &str) -> Result<String, String> {
++    let directory = scratch(label);
++    let result = translate_sanitized_native(source, Stage::Kernel, &directory);
++    let _ = std::fs::remove_dir_all(directory);
++    result.and_then(|spirv| disassemble(&spirv))
++}
++
++fn gather_source(
++    gather: Gather,
++    sampler_word: u64,
++    component: &str,
++    component_expression: &str,
++) -> String {
++    let (intrinsic, texture_type, result_type, out_type, call_tail, declaration) = match gather {
++        Gather::Color => (
++            "air.gather_texture_cube.v4f32",
++            "texturecube<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            format!("<3 x float> <float 1.0, float 0.0, float 0.0>, i32 {component}, i32 0"),
++            "<3 x float>, i32, i32".to_string(),
++        ),
++        Gather::ColorArray => (
++            "air.gather_texture_cube_array.v4f32",
++            "texturecube_array<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            format!("<3 x float> <float 1.0, float 0.0, float 0.0>, i32 1, i32 {component}, i32 0"),
++            "<3 x float>, i32, i32, i32".to_string(),
++        ),
++        Gather::Integer => (
++            "air.gather_texture_cube.u.v4i32",
++            "texturecube<uint, sample>",
++            "{ <4 x i32>, i8 }",
++            "int4*",
++            format!("<3 x float> <float 1.0, float 0.0, float 0.0>, i32 {component}, i32 0"),
++            "<3 x float>, i32, i32".to_string(),
++        ),
++        Gather::Depth => (
++            "air.gather_depth_cube.v4f32",
++            "depthcube<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            "<3 x float> <float 1.0, float 0.0, float 0.0>, i32 0".to_string(),
++            "<3 x float>, i32".to_string(),
++        ),
++        Gather::DepthArray => (
++            "air.gather_depth_cube_array.v4f32",
++            "depthcube_array<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            "<3 x float> <float 1.0, float 0.0, float 0.0>, i32 1, i32 0".to_string(),
++            "<3 x float>, i32, i32".to_string(),
++        ),
++        Gather::Dref => (
++            "air.gather_compare_depth_cube.f32",
++            "depthcube<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            "<3 x float> <float 1.0, float 0.0, float 0.0>, float 5.000000e-01, i32 0".to_string(),
++            "<3 x float>, float, i32".to_string(),
++        ),
++        Gather::DrefArray => (
++            "air.gather_compare_depth_cube_array.f32",
++            "depthcube_array<float, sample>",
++            "{ <4 x float>, i8 }",
++            "float4*",
++            "<3 x float> <float 1.0, float 0.0, float 0.0>, i32 1, float 5.000000e-01, i32 0"
++                .to_string(),
++            "<3 x float>, i32, float, i32".to_string(),
++        ),
++    };
++    let control = if gather.depth() { ", i32 1" } else { "" };
++    let stored_type = if matches!(gather, Gather::Integer) {
++        "<4 x i32>"
++    } else {
++        "<4 x float>"
++    };
++    format!(
++        r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {sampler_word}, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {{
++entry:
++{component_expression}  %gather = tail call {result_type} @{intrinsic}(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state{control}, {call_tail})
++  %color = extractvalue {result_type} %gather, 0
++  store {stored_type} %color, ptr addrspace(1) %out, align 16
++  ret void
++}}
++
++declare {result_type} @{intrinsic}(ptr addrspace(1), ptr addrspace(2), {declaration})
++
++!air.kernel = !{{!0}}
++!air.sampler_states = !{{!5}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4}}
++!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"{texture_type}", !"air.arg_name", !"tex"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"{out_type}", !"air.arg_name", !"out"}}
++!5 = !{{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}}
++"#
++    )
++}
++
++fn gather_line<'a>(assembly: &'a str, opcode: &str) -> &'a str {
++    let mut matches = assembly.lines().filter(|line| line.contains(opcode));
++    let line = matches
++        .next()
++        .unwrap_or_else(|| panic!("missing {opcode}:\n{assembly}"));
++    assert!(
++        matches.next().is_none(),
++        "more than one {opcode}:\n{assembly}"
++    );
++    line
++}
++
++fn assert_image(assembly: &str, expected: &str) {
++    assert!(
++        assembly
++            .lines()
++            .any(|line| line.contains("OpTypeImage") && line.contains(expected)),
++        "missing image type {expected}:\n{assembly}"
++    );
++}
++
++fn assert_no_gather_image_operands(line: &str) {
++    assert!(!line.contains("ImageOperands"), "{line}");
++    for forbidden in ["Bias", "Lod", "Grad", "Offset"] {
++        assert!(
++            !line.contains(forbidden),
++            "gather unexpectedly carries {forbidden}: {line}"
++        );
++    }
++}
++
++fn vector_type_id(assembly: &str, lanes: u32) -> &str {
++    assembly
++        .lines()
++        .find(|line| {
++            line.contains("OpTypeVector")
++                && line
++                    .split_whitespace()
++                    .last()
++                    .is_some_and(|last| last == lanes.to_string())
++        })
++        .and_then(|line| line.split_whitespace().next())
++        .unwrap_or_else(|| panic!("missing {lanes}-component float vector type:\n{assembly}"))
++}
++
++fn definition<'a>(assembly: &'a str, id: &str) -> &'a str {
++    assembly
++        .lines()
++        .find(|line| line.split_whitespace().next() == Some(id))
++        .unwrap_or_else(|| panic!("missing definition for {id}:\n{assembly}"))
++}
++
++fn has_integer_constant(assembly: &str, value: &str) -> bool {
++    assembly.lines().any(|line| {
++        let words: Vec<_> = line.split_whitespace().collect();
++        if words.get(2) != Some(&"OpConstant") || words.last() != Some(&value) {
++            return false;
++        }
++        let Some(type_id) = words.get(3) else {
++            return false;
++        };
++        definition(assembly, type_id).contains("OpTypeInt")
++    })
++}
++
++fn assert_layer_coordinate(assembly: &str) {
++    let vec4 = vector_type_id(assembly, 4);
++    assert!(
++        assembly.lines().any(|line| {
++            let words: Vec<_> = line.split_whitespace().collect();
++            words.get(2) == Some(&"OpCompositeConstruct") && words.get(3) == Some(&vec4)
++        }),
++        "cube-array gather did not build a four-component coordinate:\n{assembly}"
++    );
++    assert!(
++        assembly.contains("OpConvertUToF"),
++        "cube-array layer was not converted to float:\n{assembly}"
++    );
++}
++
++#[test]
++fn color_cube_gather_uses_cube_image_and_no_offset_or_lod_operands() {
++    let source = gather_source(Gather::Color, NORMALIZED_SAMPLER, "2", "");
++    let assembly =
++        translate(&source, "color_cube").expect("color cube gather translates and validates");
++    let gather = gather_line(&assembly, "OpImageGather");
++    assert_no_gather_image_operands(gather);
++    assert_image(&assembly, "Cube 0 0 0 1");
++    assert!(!assembly.contains("OpConvertUToF"), "{assembly}");
++    assert!(has_integer_constant(&assembly, "2"), "{assembly}");
++}
++
++#[test]
++fn color_cube_array_gather_appends_layer_to_vec3_direction() {
++    let source = gather_source(Gather::ColorArray, NORMALIZED_SAMPLER, "1", "");
++    let assembly =
++        translate(&source, "color_cube_array").expect("color cube-array gather translates");
++    let gather = gather_line(&assembly, "OpImageGather");
++    assert_no_gather_image_operands(gather);
++    assert_image(&assembly, "Cube 0 1 0 1");
++    assert_layer_coordinate(&assembly);
++}
++
++#[test]
++fn integer_cube_gather_keeps_the_uint_image_and_result_type() {
++    let source = gather_source(Gather::Integer, NORMALIZED_SAMPLER, "3", "");
++    let assembly = translate(&source, "integer_cube").expect("integer cube gather translates");
++    let gather = gather_line(&assembly, "OpImageGather");
++    assert_no_gather_image_operands(gather);
++    assert_image(&assembly, "Cube 0 0 0 1");
++    let words: Vec<_> = gather.split_whitespace().collect();
++    let result_ty = words.get(3).expect("gather result type");
++    let result_def: Vec<_> = definition(&assembly, result_ty)
++        .split_whitespace()
++        .collect();
++    assert_eq!(result_def.get(2), Some(&"OpTypeVector"), "{assembly}");
++    let vector_elem = result_def.get(3).expect("gather result element type");
++    assert!(
++        definition(&assembly, vector_elem).contains("OpTypeInt 32 0"),
++        "{assembly}"
++    );
++    let image = assembly
++        .lines()
++        .find(|line| line.contains("OpTypeImage") && line.contains("Cube 0 0 0 1"))
++        .expect("cube image type");
++    let image_words: Vec<_> = image.split_whitespace().collect();
++    assert_eq!(image_words.get(3), Some(vector_elem), "{assembly}");
++    assert!(!assembly.contains("OpImageFetch"), "{assembly}");
++}
++
++#[test]
++fn depth_cube_and_cube_array_gather_use_depth_images_without_operands() {
++    for (gather, expected_image, label) in [
++        (Gather::Depth, "Cube 1 0 0 1", "depth_cube"),
++        (Gather::DepthArray, "Cube 1 1 0 1", "depth_cube_array"),
++    ] {
++        let source = gather_source(gather, NORMALIZED_SAMPLER, "0", "");
++        let assembly = translate(&source, label).unwrap_or_else(|error| panic!("{label}: {error}"));
++        let gather_instruction = gather_line(&assembly, "OpImageGather");
++        assert_no_gather_image_operands(gather_instruction);
++        assert_image(&assembly, expected_image);
++        assert!(!assembly.contains("OpImageDrefGather"), "{assembly}");
++        if gather.arrayed() {
++            assert_layer_coordinate(&assembly);
++        }
++    }
++}
++
++#[test]
++fn compare_cube_and_cube_array_gather_use_dref_for_never_and_always() {
++    for (gather, compare, label) in [
++        (Gather::Dref, COMPARE_NEVER, "dref_cube_never"),
++        (Gather::Dref, COMPARE_ALWAYS, "dref_cube_always"),
++        (Gather::DrefArray, COMPARE_NEVER, "dref_cube_array_never"),
++        (Gather::DrefArray, COMPARE_ALWAYS, "dref_cube_array_always"),
++    ] {
++        let source = gather_source(gather, compare, "0", "");
++        let assembly = translate(&source, label).unwrap_or_else(|error| panic!("{label}: {error}"));
++        let dref = gather_line(&assembly, "OpImageDrefGather");
++        assert_no_gather_image_operands(dref);
++        assert_image(
++            &assembly,
++            if gather.arrayed() {
++                "Cube 1 1 0 1"
++            } else {
++                "Cube 1 0 0 1"
++            },
++        );
++        assert!(!assembly.contains("OpImageGather "), "{assembly}");
++        if gather.arrayed() {
++            assert_layer_coordinate(&assembly);
++        }
++    }
++}
++
++#[test]
++fn ordinary_cube_gather_rejects_dynamic_and_out_of_range_components() {
++    for (component, expression, label) in [
++        (
++            "%component",
++            "  %component = add i32 1, i32 2\n",
++            "dynamic_component",
++        ),
++        ("4", "", "component_four"),
++        ("-1", "", "component_negative"),
++    ] {
++        let source = gather_source(Gather::Color, NORMALIZED_SAMPLER, component, expression);
++        let error = translate(&source, label).expect_err("invalid component must be rejected");
++        assert!(error.contains("component"), "{label}: {error}");
++    }
++}
++
++#[test]
++fn two_dimensional_gather_rejects_constant_offsets_outside_the_msl_range() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
++entry:
++  %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> <i32 8, i32 0>, i32 0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %color, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++    let error = translate(source, "offset_eight").expect_err("offset +8 must be rejected");
++    assert!(error.contains("[-8, 7]"), "{error}");
++}
++
++#[test]
++fn two_dimensional_gather_rejects_non_integer_offsets() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
++entry:
++  %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x float> zeroinitializer, i32 0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %color, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++    let error = translate(source, "float_offset").expect_err("float offsets must be rejected");
++    assert!(error.contains("32-bit integer vector"), "{error}");
++}
++
++#[test]
++fn cube_compare_gather_rejects_an_image_of_a_different_shape() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {
++entry:
++  %gather = tail call { <4 x float>, i8 } @air.gather_compare_depth_cube.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 1, <2 x float> <float 5.000000e-01, float 5.000000e-01>, float 5.000000e-01, i32 0)
++  %values = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %values, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_compare_depth_cube.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++    let error =
++        translate(source, "cube_intrinsic_2d_image").expect_err("shape mismatch must be rejected");
++    assert!(error.contains("does not match image type"), "{error}");
++}
++
++#[test]
++fn normalized_gather_rejects_storage_image_access() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
++entry:
++  %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i32 0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %color, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++    let error =
++        translate(source, "normalized_storage").expect_err("storage access must be rejected");
++    assert!(error.contains("requires a sampled image"), "{error}");
++}
++
++#[test]
++fn dynamic_two_dimensional_offsets_fold_without_the_extended_gather_feature() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out, i32 %lane) {
++entry:
++  %x = or i32 %lane, -8
++  %offset0 = insertelement <2 x i32> undef, i32 %x, i32 0
++  %offset = insertelement <2 x i32> %offset0, i32 -5, i32 1
++  %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> %offset, i32 0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %color, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !6}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"int", !"air.arg_name", !"lane"}
++"#;
++    let assembly =
++        translate(source, "dynamic_offset").expect("dynamic 2D offset translates and validates");
++    let gather = gather_line(&assembly, "OpImageGather");
++    assert_no_gather_image_operands(gather);
++    assert!(!assembly.contains("ImageGatherExtended"), "{assembly}");
++    assert!(assembly.contains("OpImageQuerySizeLod"), "{assembly}");
++    assert!(assembly.contains("OpFDiv"), "{assembly}");
++}
++
++#[test]
++fn three_dimensional_gather_is_rejected_instead_of_inventing_an_abi() {
++    let source = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
++
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
++entry:
++  %gather = tail call { <4 x float>, i8 } @air.gather_texture_3d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <3 x float> <float 0.5, float 0.5, float 0.5>, i32 0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %gather, 0
++  store <4 x float> %color, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.gather_texture_3d.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i32, i32)
++
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture3d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++    let error = translate(source, "three_d").expect_err("3D gather has no baseline overload");
++    assert!(error.contains("3D"), "{error}");
++}

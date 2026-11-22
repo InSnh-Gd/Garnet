@@ -1,0 +1,458 @@
+Subject: [PATCH] Preserve bounded constant reads before derivative placement
+
+Honor entry readonly/dereferenceable spans and load ordering in typed AIR.
+Prove every intermediate and final address, load extent and alignment before
+moving numeric reads and static address paths. Retain guarded storage, nullable,
+dynamic, resource-pointer and helper-only reads. Preserve inlined parameter aliases.
+
+diff --git a/src/native/cfg/blocks.rs b/src/native/cfg/blocks.rs
+--- a/src/native/cfg/blocks.rs
++++ b/src/native/cfg/blocks.rs
+@@ -2357,6 +2357,7 @@
+                 ("%6".to_string(), LlType::Int(32)),
+             ],
+             byval_param_pointees: vec![None; 3],
++            constant_read_spans: HashMap::new(),
+             is_static_initializer: false,
+             blocks: Vec::new(),
+         };
+@@ -2368,6 +2369,7 @@
+             ret: LlType::Void,
+             params: vec![("%named".to_string(), LlType::Int(32))],
+             byval_param_pointees: vec![None],
++            constant_read_spans: HashMap::new(),
+             is_static_initializer: false,
+             blocks: Vec::new(),
+         };
+diff --git a/src/native/constant_reads.rs b/src/native/constant_reads.rs
+new file mode 100644
+--- /dev/null
++++ b/src/native/constant_reads.rs
+@@ -0,0 +1,250 @@
++//! Move only unconditionally accessible constant-buffer reads to their entry invocation.
++//!
++//! LLVM `readonly` alone does not make a guarded access safe. The entry parameter must also
++//! promise `dereferenceable(n)`, and the complete constant-offset load must fit that span.
++//! Moving the source read before interface construction gives direct and cached paths the same
++//! dominating value without teaching derivative placement to speculate arbitrary storage loads.
++
++use super::cfg::BodyBlock;
++use super::ir::{LlFunction, LlModule, LlType, LlValue};
++use super::tir::{TirInst, TirOpcode};
++use std::collections::{HashMap, HashSet};
++
++pub(super) fn hoist(parsed: &LlModule, function: &LlFunction, blocks: &mut [BodyBlock]) {
++    // A helper's dereferenceable promise only holds when called, possibly behind a guard.
++    if !parsed.entry_functions.contains(&function.name) || function.constant_read_spans.is_empty() {
++        return;
++    }
++    let Some(entry) = blocks.first().and_then(|block| block.typed.as_ref()) else {
++        return;
++    };
++    let entry_values = entry
++        .insts
++        .iter()
++        .filter_map(|i| i.result.as_deref())
++        .collect::<HashSet<_>>();
++    let definitions = blocks
++        .iter()
++        .filter_map(|block| block.typed.as_ref())
++        .flat_map(|block| &block.insts)
++        .filter_map(|i| Some((i.result.as_deref()?, i)))
++        .collect::<HashMap<_, _>>();
++    let mut moved = HashSet::new();
++    let mut prologue = Vec::new();
++    for block in blocks
++        .iter()
++        .skip(1)
++        .filter_map(|block| block.typed.as_ref())
++    {
++        for instruction in &block.insts {
++            let Some(path) = read_path(parsed, function, &definitions, instruction) else {
++                continue;
++            };
++            for dependency in path {
++                let name = dependency
++                    .result
++                    .as_deref()
++                    .expect("read path has SSA results");
++                if !entry_values.contains(name) && moved.insert(name.to_string()) {
++                    prologue.push(dependency.clone());
++                }
++            }
++        }
++    }
++    if prologue.is_empty() {
++        return;
++    }
++    for block in blocks.iter_mut().skip(1).filter_map(BodyBlock::typed_mut) {
++        block
++            .insts
++            .retain(|i| i.result.as_ref().is_none_or(|name| !moved.contains(name)));
++    }
++    blocks[0]
++        .typed_mut()
++        .expect("entry checked above")
++        .insts
++        .extend(prologue);
++}
++
++fn read_path<'a>(
++    parsed: &LlModule,
++    function: &LlFunction,
++    definitions: &HashMap<&str, &'a TirInst>,
++    instruction: &'a TirInst,
++) -> Option<Vec<&'a TirInst>> {
++    let load = instruction.load().as_deref()?;
++    let numeric = |ty: &LlType| {
++        matches!(
++            parsed.resolve_known_type(ty),
++            LlType::Int(_) | LlType::Float | LlType::Half | LlType::BFloat
++        )
++    };
++    let ty = parsed.resolve_known_type(&load.result_ty);
++    if load.ordered
++        || !(numeric(&ty) || matches!(&ty, LlType::Vector(element, _) if numeric(element)))
++    {
++        return None;
++    }
++    let (bytes, _) = parsed.native_memcpy_type_size_align(&load.result_ty)?;
++    let LlValue::Local(mut pointer) = load.ptr.value.clone() else {
++        return None;
++    };
++    let mut path = vec![instruction];
++    let mut visited = HashSet::new();
++    while !function.constant_read_spans.contains_key(&pointer) {
++        if !visited.insert(pointer.clone()) {
++            return None;
++        }
++        let definition = *definitions.get(pointer.as_str())?;
++        if let Some(gep) = definition.gep().as_deref() {
++            let LlValue::Local(base) = &gep.base.value else {
++                return None;
++            };
++            pointer = base.clone();
++        } else if let Some((_, base)) = definition.identity_ptr_bitcast() {
++            pointer = base.to_string();
++        } else if definition.opcode == TirOpcode::Metal2VulkanInlineParameter {
++            let argument = definition.operands.first()?.as_typed_value()?;
++            if argument.ty != LlType::Ptr(2) {
++                return None;
++            }
++            let LlValue::Local(base) = argument.value else {
++                return None;
++            };
++            pointer = base;
++        } else {
++            return None;
++        }
++        path.push(definition);
++    }
++    let span = &function.constant_read_spans[&pointer];
++    let mut offset = 0i128;
++    for dependency in path.iter().rev() {
++        if let Some(gep) = dependency.gep().as_deref() {
++            offset =
++                offset.checked_add(super::emit_tiers::constant_gep_byte_offset(parsed, gep)?)?;
++            // An intermediate inbounds pointer can be poison even when the final offset fits.
++            if offset < 0 || offset > i128::from(span.bytes) {
++                return None;
++            }
++        }
++    }
++    let align = load
++        .align
++        .unwrap_or(parsed.native_memcpy_type_size_align(&load.result_ty)?.1);
++    if offset < 0
++        || offset.checked_add(i128::from(bytes))? > i128::from(span.bytes)
++        || align == 0
++        || span.align < align
++        || offset % i128::from(align) != 0
++    {
++        return None;
++    }
++    path.reverse();
++    Some(path)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn rewritten(parameter: &str, body: &str, entry: bool) -> Vec<BodyBlock> {
++        let source = format!("define float @main({parameter} %buffer, i1 %condition, i64 %index) {{\nentry:\n br i1 %condition, label %arm, label %exit\narm:\n {body}\n br label %exit\nexit:\n ret float 0.0\n}}\n");
++        let mut parsed = LlModule::parse(&source).unwrap();
++        if entry {
++            parsed.entry_functions.insert("main".into());
++        }
++        let function = &parsed.functions[0];
++        let mut blocks = function.blocks.clone();
++        hoist(&parsed, function, &mut blocks);
++        blocks
++    }
++
++    fn names(block: &BodyBlock) -> Vec<&str> {
++        block
++            .typed
++            .as_ref()
++            .unwrap()
++            .insts
++            .iter()
++            .filter_map(|i| i.result.as_deref())
++            .collect()
++    }
++
++    #[test]
++    fn bounded_aligned_read_moves_with_shared_pointer_path_once() {
++        let blocks = rewritten(
++            "ptr addrspace(2) readonly align 16 dereferenceable(32)",
++            "%base = getelementptr i8, ptr addrspace(2) %buffer, i64 16\n \
++             %p = getelementptr i8, ptr addrspace(2) %base, i64 12\n \
++             %first = load float, ptr addrspace(2) %p, align 4\n \
++             %second = load float, ptr addrspace(2) %p, align 4",
++            true,
++        );
++        assert_eq!(names(&blocks[0]), ["%base", "%p", "%first", "%second"]);
++        assert!(names(&blocks[1]).is_empty());
++    }
++
++    #[test]
++    fn guards_are_preserved_without_an_unconditional_span_and_alignment() {
++        for parameter in [
++            "ptr addrspace(2) readonly align 4",
++            "ptr addrspace(2) readonly nonnull align 4",
++            "ptr addrspace(2) readonly align 4 dereferenceable_or_null(32)",
++            "ptr addrspace(2) readonly align 4 dereferenceable(31)",
++            "ptr addrspace(2) readonly align 1 dereferenceable(32)",
++            "ptr addrspace(2) align 4 dereferenceable(32)",
++            "ptr addrspace(1) readonly align 4 dereferenceable(32)",
++        ] {
++            let blocks = rewritten(parameter, "%p = getelementptr i8, ptr addrspace(2) %buffer, i64 28\n %value = load float, ptr addrspace(2) %p, align 4", true);
++            assert!(names(&blocks[0]).is_empty(), "{parameter}");
++            assert_eq!(names(&blocks[1]), ["%p", "%value"], "{parameter}");
++        }
++    }
++
++    #[test]
++    fn negative_overflow_dynamic_misaligned_and_ordered_reads_stay_guarded() {
++        for (offset, load) in [
++            ("-4", "float"),
++            ("29", "float"),
++            ("%index", "float"),
++            ("9223372036854775807", "float"),
++            ("28", "volatile float"),
++            ("28", "atomic float"),
++        ] {
++            let body = format!("%p = getelementptr i8, ptr addrspace(2) %buffer, i64 {offset}\n %value = load {load}, ptr addrspace(2) %p, align 4");
++            let blocks = rewritten(
++                "ptr addrspace(2) readonly align 4 dereferenceable(32)",
++                &body,
++                true,
++            );
++            assert!(names(&blocks[0]).is_empty(), "{offset} {load}");
++            assert_eq!(names(&blocks[1]), ["%p", "%value"]);
++        }
++    }
++
++    #[test]
++    fn an_inbounds_path_cannot_leave_the_promised_object_and_reenter_it() {
++        for (first, second) in [(-4, 4), (40, -40)] {
++            let body = format!("%outside = getelementptr inbounds i8, ptr addrspace(2) %buffer, i64 {first}\n %p = getelementptr i8, ptr addrspace(2) %outside, i64 {second}\n %value = load float, ptr addrspace(2) %p, align 4");
++            let blocks = rewritten(
++                "ptr addrspace(2) readonly align 4 dereferenceable(32)",
++                &body,
++                true,
++            );
++            assert!(names(&blocks[0]).is_empty(), "{first} {second}");
++            assert_eq!(names(&blocks[1]), ["%outside", "%p", "%value"]);
++        }
++    }
++
++    #[test]
++    fn helper_attribute_never_establishes_an_entry_promise() {
++        let blocks = rewritten(
++            "ptr addrspace(2) readonly align 4 dereferenceable(32)",
++            "%value = load float, ptr addrspace(2) %buffer, align 4",
++            false,
++        );
++        assert!(names(&blocks[0]).is_empty());
++        assert_eq!(names(&blocks[1]), ["%value"]);
++    }
++}
+diff --git a/src/native/emit_tiers.rs b/src/native/emit_tiers.rs
+--- a/src/native/emit_tiers.rs
++++ b/src/native/emit_tiers.rs
+@@ -738,6 +738,18 @@
+     Some(offset)
+ }
+ 
++pub(super) fn constant_gep_byte_offset(
++    parsed: &LlModule,
++    gep: &crate::native::ir::LlGep,
++) -> Option<i128> {
++    let offset = gep_byte_offset_range(parsed, &gep.source_ty, &gep.indices, |index| {
++        integer_bits(parsed, &index.ty)
++            .and_then(|bits| signed_constant(&index.value, bits))
++            .map_or_else(IntRange::full, IntRange::point)
++    })?;
++    (offset.min == offset.max).then_some(offset.min)
++}
++
+ fn merge_root_ranges(into: &mut HashMap<usize, IntRange>, from: &HashMap<usize, IntRange>) {
+     for (root, range) in from {
+         into.entry(*root)
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -248,6 +248,7 @@
+                             ptr: ptr.clone(),
+                             result_ty: result_ty.clone(),
+                             align: inst.mem_align(),
++                            ordered: inst.load().as_ref().is_some_and(|load| load.ordered),
+                         };
+                         let name = name.clone();
+                         return self.emit_load_resolved(name, load, result_ty, instructions);
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -555,6 +555,7 @@
+         };
+         let mut body_blocks =
+             crate::native::tir::prune_literal_branch_dead_blocks(switch_ready_blocks);
++        crate::native::constant_reads::hoist(&self.ir, f, &mut body_blocks);
+         body_blocks = crate::native::tir::prune_unused_geps(body_blocks);
+         let buffer_params = f
+             .params
+diff --git a/src/native/ir/mod.rs b/src/native/ir/mod.rs
+--- a/src/native/ir/mod.rs
++++ b/src/native/ir/mod.rs
+@@ -112,6 +112,12 @@
+ }
+ 
+ #[derive(Clone, Debug)]
++pub(super) struct ConstantReadSpan {
++    pub(super) bytes: u64,
++    pub(super) align: u64,
++}
++
++#[derive(Clone, Debug)]
+ pub(super) struct LlFunction {
+     pub(super) name: String,
+     pub(super) ret: LlType,
+@@ -120,6 +126,8 @@
+     /// pointer syntax otherwise erases `T`, and a parameter used only as a memcpy source has no
+     /// dereference from which the ordinary body-use inference could recover it.
+     pub(super) byval_param_pointees: Vec<Option<LlType>>,
++    /// Explicit LLVM `readonly dereferenceable(n)` spans on constant-address-space parameters.
++    pub(super) constant_read_spans: HashMap<String, ConstantReadSpan>,
+     /// Whether the `define` carried `section "air.static_init"` — the AIR ABI's marker for the
+     /// function that runs a translation unit's namespace-scope initialization, most importantly the
+     /// `[[function_constant]]` default-state stores. See `crate::air_static_init` for why this is
+diff --git a/src/native/mod.rs b/src/native/mod.rs
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -10,6 +10,7 @@
+ // Differential test support for the control-flow constructors (test builds only).
+ #[cfg(test)]
+ mod cfg_testkit;
++mod constant_reads;
+ mod constfold;
+ // Read-only typed-SSA soundness / carrier-comparison / reject-census diagnostics (no emission path).
+ mod diagnostics;
+diff --git a/src/native/parse.rs b/src/native/parse.rs
+--- a/src/native/parse.rs
++++ b/src/native/parse.rs
+@@ -23,6 +23,7 @@
+     pub(super) result_ty: LlType,
+     pub(super) ptr: TypedValue,
+     pub(super) align: Option<u64>,
++    pub(super) ordered: bool,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -60,6 +61,50 @@
+         .ok_or_else(|| format!("native emitter: unmatched params in define: {head}"))?;
+     let ret = parse_return_type(&head["define".len()..at])?;
+     let (params, byval_param_pointees) = parse_params(&head[open + 1..close])?;
++    let mut constant_read_spans = std::collections::HashMap::new();
++    for (raw, (name, ty)) in split_top_level(&head[open + 1..close], ',')
++        .into_iter()
++        .zip(&params)
++    {
++        if *ty != LlType::Ptr(2) {
++            continue;
++        }
++        let attributes = split_top_level_whitespace(raw);
++        if !attributes.contains(&"readonly") {
++            continue;
++        }
++        let align = attributes
++            .windows(2)
++            .find(|tokens| tokens[0] == "align")
++            .map(|tokens| tokens[1].parse::<u64>())
++            .transpose()
++            .map_err(|_| format!("native emitter: malformed parameter alignment: {raw}"))?
++            .unwrap_or(1);
++        if !align.is_power_of_two() {
++            return Err(format!(
++                "native emitter: invalid parameter alignment: {raw}"
++            ));
++        }
++        for attribute in attributes {
++            if let Some(bytes) = attribute
++                .strip_prefix("dereferenceable(")
++                .and_then(|s| s.strip_suffix(')'))
++            {
++                let bytes = bytes.parse::<u64>().map_err(|_| {
++                    format!("native emitter: malformed dereferenceable span: {attribute}")
++                })?;
++                if bytes > 0
++                    && constant_read_spans
++                        .insert(name.clone(), super::ir::ConstantReadSpan { bytes, align })
++                        .is_some()
++                {
++                    return Err(format!(
++                        "native emitter: repeated dereferenceable span: {name}"
++                    ));
++                }
++            }
++        }
++    }
+     let is_static_initializer =
+         crate::air_static_init::tail_declares_static_init_section(&head[close + 1..]);
+     Ok(LlFunction {
+@@ -67,6 +112,7 @@
+         ret,
+         params,
+         byval_param_pointees,
++        constant_read_spans,
+         is_static_initializer,
+         blocks: Vec::new(),
+     })
+@@ -694,6 +740,9 @@
+         result_ty: parse_type(parts[0])?,
+         ptr: parse_typed_value(parts[1])?,
+         align: parse_memory_alignment(&parts[2..])?,
++        ordered: split_top_level_whitespace(parts[0])
++            .iter()
++            .any(|token| matches!(*token, "volatile" | "atomic")),
+     })
+ }
+ 
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -645,3 +645,13 @@
+ interpolation are not speculated. Source-coordinate facts still refer to the
+ original coordinate at the original sample. This changes translation/cache
+ semantics without changing reflection 66 or argument-table ABI 9.
++
++Numeric constant-buffer reads may precede a source branch when the entry's AIR parameter
++explicitly declares `readonly dereferenceable(n)` in constant address space 2. The entire
++load must fit that byte span, and its offset and parameter alignment must satisfy the
++load alignment. The native typed-IR transform moves the read and constant address path
++before interface construction; its dominating value therefore survives ordinary source
++proof serialization without additional safety metadata. Helper-only promises, volatile
++or atomic reads, loaded resource pointers, dynamic offsets and merely `NonWritable`
++storage loads do not authorize this transformation. Cache identities must change;
++reflection 66, source-proof version 2 and argument-table ABI 9 remain unchanged.

@@ -1,0 +1,99 @@
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -1,7 +1,8 @@
+ //! GPU-visible opaque argument tokens, resolved against dense per-command resource tables.
+ 
+ use super::*;
+-use crate::spirv_module::{Block, Function};
++use crate::reflect::{module_has_comparison_sampler_operation, ArgumentResourceTables};
++use crate::spirv_module::{Block, Function, Operand};
+ use crate::{UniformControlProof, UniformControlValue};
+ use spirv::{Capability, Decoration, ExecutionModel, FunctionControl, LoopControl};
+ use std::collections::{BTreeMap, HashMap, HashSet};
+@@ -10,6 +11,60 @@
+ pub const ARGUMENT_RESOURCE_ROOT_BINDING: u32 = 704;
+ pub const ARGUMENT_RESOURCE_FIRST_SET: u32 = 2;
+ 
++/// Check cached table metadata against the descriptor interface in its SPIR-V module.
++pub fn validate_argument_resource_tables(
++    bytes: &[u8],
++    tables: &ArgumentResourceTables,
++) -> Result<(), String> {
++    let module = crate::spirv_module::load_bytes(bytes)
++        .map_err(|error| format!("cached GPU argument SPIR-V: {error:?}"))?;
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for instruction in &module.annotations {
++        if instruction.class.opcode != spirv::Op::Decorate {
++            continue;
++        }
++        match instruction.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    let mut categories = sets
++        .iter()
++        .filter(|(id, set)| {
++            (ARGUMENT_RESOURCE_FIRST_SET..=4).contains(*set) && bindings.get(*id) == Some(&0)
++        })
++        .map(|(_, set)| *set - ARGUMENT_RESOURCE_FIRST_SET)
++        .collect::<Vec<_>>();
++    categories.sort_unstable();
++    categories.dedup();
++    let image_query_binding = bindings
++        .iter()
++        .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0))
++        .then_some(673);
++    let has_table = bindings.iter().any(|(id, binding)| {
++        *binding == ARGUMENT_RESOURCE_TABLE_BINDING && sets.get(id) == Some(&0)
++    });
++    let comparison_sampler =
++        categories.contains(&2) && module_has_comparison_sampler_operation(&module);
++    if tables.table_binding != ARGUMENT_RESOURCE_TABLE_BINDING
++        || tables.categories != categories
++        || tables.image_query_binding != image_query_binding
++        || tables.comparison_sampler != comparison_sampler
++        || ((!categories.is_empty() || image_query_binding.is_some()) && !has_table)
++    {
++        return Err("cached GPU argument metadata disagrees with SPIR-V interface".into());
++    }
++    Ok(())
++}
++
+ /// The original standalone descriptor and its exact serialized argument-buffer coordinate.
+ #[derive(Clone, Copy, Debug)]
+ pub struct ArgumentResourceField {
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -33,8 +33,8 @@
+     lower_argument_resource_tables_versioned_with_query_lod_replay,
+     lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+-    ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+-    ARGUMENT_RESOURCE_TABLE_BINDING,
++    validate_argument_resource_tables, ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET,
++    ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ pub(in crate::passes) use lod_query::lower_argument_lod_queries;
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1921,8 +1921,8 @@
+     lower_argument_resource_tables_versioned_with_query_lod_replay,
+     lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+-    ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+-    ARGUMENT_RESOURCE_TABLE_BINDING,
++    validate_argument_resource_tables, ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET,
++    ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ mod spirv_cfg;
+ mod stage_input;

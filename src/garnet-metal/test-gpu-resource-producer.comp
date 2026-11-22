@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 1, std430) readonly buffer Control { uint round; } control;
+layout(set = 0, binding = 3, std430) buffer Destination { uvec2 words[]; } destination;
+layout(set = 0, binding = 5, std430) readonly buffer Source { uvec2 words[]; } source;
+void main() {
+    for (uint i = 0; i < 2; ++i) {
+        destination.words[i] = source.words[i ^ (control.round & 1u)];
+        destination.words[2u + i] = source.words[3u - i];
+    }
+    if (control.round == 2u) destination.words[0] = uvec2(7u, 9u);
+    if (control.round == 3u) destination.words[1] = uvec2(0u);
+    destination.words[4] = source.words[4];
+    destination.words[5] = source.words[5];
+}

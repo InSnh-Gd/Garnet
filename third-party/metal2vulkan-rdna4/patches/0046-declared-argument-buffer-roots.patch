@@ -1,0 +1,218 @@
+Subject: [PATCH] Preserve declared argument-buffer roots after opaque graph lowering
+
+Retain explicit AIR roots through reflection and validate their binding and version.
+Keep ordinary buffers outside native sampler scans and preserve sparse typed spans.
+
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `65`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `66`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -630,3 +630,11 @@
+ - Not populated for passthrough vertex generation (`translate_passthrough`).
+ - Ordinary descriptor-backed texture nullness remains fixed at translation time; serialized
+   argument-buffer tokens can be checked at run time — see *Nil texture bindings*.
++
++Reflection 66 adds `argument_buffer_roots`: sorted unique Metal buffer indices explicitly
++declared by AIR `air.indirect_buffer`. These survive opaque nested graph lowering even when
++`argument_buffer_fields` is empty. Each root must match a reflected entry buffer; ordinary
++storage buffers are not inferred to be roots. Runtime scanning uses existing typed spans when
++available and a conservative root span otherwise. Table ABI 9 and descriptor numbers are
++unchanged; reflection 65 remains readable without the new field. Native cache identities
++must change so old translations that lost roots are regenerated.
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -211,7 +211,8 @@
+ /// v64 adds the ABI 8 sampler-coordinate contract: dynamic direct samplers read a stage-local
+ /// 32-word flag SSBO at binding 674, GPU argument-table version 8 appends one flag word per sampler
+ /// token, and static pixel samplers use normalized coordinate conversion in shader code.
+-pub const REFLECTION_VERSION: u32 = 65;
++/// v66 retains AIR-declared argument-buffer roots after opaque resource graph lowering.
++pub const REFLECTION_VERSION: u32 = 66;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -2108,6 +2109,13 @@
+     /// All resource-handle fields declared inside shader argument buffers. Authored resources use
+     /// this shared coordinate to obtain the Metal argument index without re-parsing AIR metadata.
+     pub argument_buffer_fields: Vec<EmbeddedArgBuffer>,
++    /// Metal buffer indices explicitly declared with `air.indirect_buffer`, sorted and unique.
++    /// These roots survive when nested opaque fields have no static member coordinates.
++    #[cfg_attr(
++        feature = "serde",
++        serde(default, skip_serializing_if = "Vec::is_empty")
++    )]
++    pub argument_buffer_roots: Vec<u32>,
+     /// Additional runtime resource arrays at binding zero of sets 2..4. Version 2 resolves
+     /// tokens read through the shader's actual pointer graph and needs no raw root descriptors.
+     #[cfg_attr(
+@@ -2170,6 +2178,22 @@
+     pub function_constants: Vec<FunctionConstant>,
+ }
+ 
++fn declared_argument_buffer_roots(params: &[u32], bindings: &[ResourceBinding]) -> Vec<u32> {
++    let mut roots = bindings
++        .iter()
++        .filter(|binding| {
++            binding.kind == ResourceKind::Buffer
++                && binding
++                    .param_index
++                    .is_some_and(|param| params.contains(&param))
++        })
++        .map(|binding| binding.metal_index)
++        .collect::<Vec<_>>();
++    roots.sort_unstable();
++    roots.dedup();
++    roots
++}
++
+ impl ShaderReflection {
+     pub(crate) fn reconcile_argument_resource_tables(
+         &mut self,
+@@ -2510,9 +2534,27 @@
+         self.descriptor_layout
+             .validate()
+             .map_err(|error| error.to_string())?;
++        if !self.argument_buffer_roots.is_empty()
++            && (self.reflection_version != 66
++                || self
++                    .argument_buffer_roots
++                    .windows(2)
++                    .any(|pair| pair[0] >= pair[1])
++                || self.argument_buffer_roots.iter().any(|root| {
++                    *root >= 32
++                        || !self.bindings.iter().any(|binding| {
++                            binding.kind == ResourceKind::Buffer
++                                && binding.metal_index == *root
++                                && binding.param_index.is_some()
++                                && binding.descriptor.is_some()
++                        })
++                }))
++        {
++            return Err("invalid declared argument-buffer roots".into());
++        }
+         if let Some(table) = &self.argument_resource_tables {
+             validate_null_shapes(&table.null_shapes)?;
+-            if (table.version == 9 && self.reflection_version != 65)
++            if (table.version == 9 && !matches!(self.reflection_version, 65 | 66))
+                 || (table.version == 8
+                     && (self.reflection_version != 64 || !self.normalized_sampler_coordinates))
+             {
+@@ -2795,7 +2837,7 @@
+                     ));
+                 }
+                 if resource.kind == ResourceKind::StageResourceMetadata
+-                    && (self.reflection_version != 65
++                    && (!matches!(self.reflection_version, 65 | 66)
+                         || !self
+                             .argument_resource_tables
+                             .as_ref()
+@@ -2804,7 +2846,7 @@
+                         || resource.extent != Some(BufferExtent::Object { bytes: 384 })
+                         || resource.access != Some(ResourceAccess::ReadOnly))
+                 {
+-                    return Err("StageResourceMetadata requires reflection65/table9 and a readonly 384-byte extent".into());
++                    return Err("StageResourceMetadata requires reflection65/66/table9 and a readonly 384-byte extent".into());
+                 }
+                 if resource.kind == ResourceKind::SamplerCoordinateFlags
+                     && (self.reflection_version != 64
+@@ -3454,6 +3496,10 @@
+             descriptor_layout: DescriptorLayout::default(),
+             stage: ShaderStage::Fragment,
+             entry_point: entry_point.map(str::to_string),
++            argument_buffer_roots: declared_argument_buffer_roots(
++                &meta.argument_buffer_params,
++                &bindings,
++            ),
+             bindings,
+             argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+@@ -3633,6 +3679,10 @@
+                 ShaderStage::Vertex
+             },
+             entry_point: entry_point.map(str::to_string),
++            argument_buffer_roots: declared_argument_buffer_roots(
++                &meta.argument_buffer_params,
++                &bindings,
++            ),
+             bindings,
+             argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+@@ -3861,6 +3911,10 @@
+             descriptor_layout: DescriptorLayout::default(),
+             stage: ShaderStage::Kernel,
+             entry_point: entry_point.map(str::to_string),
++            argument_buffer_roots: declared_argument_buffer_roots(
++                &meta.argument_buffer_params,
++                &bindings,
++            ),
+             bindings,
+             argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+diff --git a/src/reflect/tests.rs b/src/reflect/tests.rs
+--- a/src/reflect/tests.rs
++++ b/src/reflect/tests.rs
+@@ -7,6 +7,47 @@
+ use super::*;
+ 
+ #[test]
++fn declared_argument_roots_are_explicit_sorted_and_stage_independent() {
++    let mut fragment = FragMeta::default();
++    fragment.roles.push((0, FragRole::Buffer(3)));
++    fragment.roles.push((1, FragRole::Buffer(0)));
++    fragment.argument_buffer_params = vec![0];
++    let mut vertex = VertMeta::default();
++    vertex.roles.push((0, VertRole::Buffer(3)));
++    vertex.roles.push((1, VertRole::Buffer(0)));
++    vertex.argument_buffer_params = vec![0];
++    let mut kernel = KernMeta::default();
++    kernel.roles.push((0, KernRole::Buffer(3)));
++    kernel.roles.push((1, KernRole::Buffer(0)));
++    kernel.argument_buffer_params = vec![0];
++    for mut reflection in [
++        ShaderReflection::from_fragment(&fragment, Some("f")),
++        ShaderReflection::from_vertex(&vertex, Some("v")),
++        ShaderReflection::from_kernel(&kernel, Some("k"), [1, 1, 1]),
++    ] {
++        assert_eq!(reflection.argument_buffer_roots, vec![3]);
++        assert!(reflection.argument_buffer_fields.is_empty());
++        assert!(reflection.validate_descriptor_abi().is_ok());
++        for invalid in [vec![3, 3], vec![32], vec![7], vec![3, 0]] {
++            reflection.argument_buffer_roots = invalid;
++            assert!(reflection.validate_descriptor_abi().is_err());
++        }
++        reflection.argument_buffer_roots = vec![3];
++        reflection.reflection_version = 65;
++        assert!(reflection.validate_descriptor_abi().is_err());
++    }
++    kernel.argument_buffer_params = vec![0, 1];
++    assert_eq!(
++        ShaderReflection::from_kernel(&kernel, None, [1, 1, 1]).argument_buffer_roots,
++        vec![0, 3]
++    );
++    kernel.argument_buffer_params.clear();
++    assert!(ShaderReflection::from_kernel(&kernel, None, [1, 1, 1])
++        .argument_buffer_roots
++        .is_empty());
++}
++
++#[test]
+ fn kernel_dispatch_push_constant_range_is_exact_and_validated() {
+     assert_eq!(
+         KernelDispatch::safe_default(),
+@@ -1618,6 +1659,7 @@
+             },
+         ],
+         argument_resource_tables: None,
++        argument_buffer_roots: vec![],
+         argument_buffer_fields: vec![EmbeddedArgBuffer {
+             buffer_param_index: 0,
+             buffer_index: 0,

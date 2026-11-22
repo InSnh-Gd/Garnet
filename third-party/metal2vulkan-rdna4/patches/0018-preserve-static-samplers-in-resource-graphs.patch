@@ -1,0 +1,46 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -898,7 +898,6 @@
+     validate_reflected_runtime_storage_images(&reflection, &options)?;
+     reflection.function_constants = meta::parse_function_constants(san_ll);
+     reflection.refine_buffer_access_from_entry(san_ll);
+-    reflection.add_static_samplers(san_ll)?;
+     reflection.validate_descriptor_abi()?;
+     let finished = translate_sanitized_with_meta_prevalidated_carrier(
+         san_ll,
+@@ -916,6 +915,8 @@
+     // no longer predicts that from the AIR text when a module is in hand to be read.
+     reflection.reconcile_buffer_address_table(&finished.module);
+     reflection.reconcile_argument_resource_tables(&finished.module);
++    // Token-backed samplers occupy set 4, leaving their former stage-local slots for constexprs.
++    reflection.add_static_samplers(san_ll)?;
+     reflection.retract_unbound_embedded_resources(&finished.module);
+     // Nothing in the AIR metadata describes a descriptor the passes invented to type an AIR value,
+     // so only the module and the pass that made it can say a consumer has to bind one.
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -203,7 +203,9 @@
+ /// v57 adds token-backed image dimensions without requiring a typed image descriptor.
+ /// v58 guards token-backed texel reads and writes before loading an image descriptor, and retracts
+ /// embedded texture/sampler reflection entries whose descriptors the final module discarded.
+-pub const REFLECTION_VERSION: u32 = 59;
++/// v60 allocates constexpr sampler reflection after token-backed argument samplers leave the stage
++/// descriptor band, matching the bindings emitted for mixed static and dynamic resource graphs.
++pub const REFLECTION_VERSION: u32 = 60;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `59`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `60`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 

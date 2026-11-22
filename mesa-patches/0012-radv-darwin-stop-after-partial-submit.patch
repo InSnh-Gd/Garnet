@@ -1,0 +1,95 @@
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -9,6 +9,7 @@
+ 
+ #include <errno.h>
+ #include <stdio.h>
++#include <stdatomic.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -72,6 +73,7 @@
+ struct acd_kext {
+    struct acd_kext_ops ops;
+    void *ctx;
++   atomic_bool submit_lost;
+ };
+ 
+ /* G6: the service class of the RDNA4N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+@@ -108,6 +110,7 @@
+    }
+    k->ops = *ops;
+    k->ctx = ctx;
++   atomic_init(&k->submit_lost, false);
+    return k;
+ }
+ 
+@@ -517,11 +520,19 @@
+    return r;
+ }
+ 
++void
++acd_kext_abort_submissions(struct acd_kext *k)
++{
++   atomic_store(&k->submit_lost, true);
++}
++
+ int
+ acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno)
+ {
+    uint8_t buf[sizeof(struct rdna4n_cs_in) + RDNA4N_MAX_IBS * sizeof(struct rdna4n_cs_ib)];
+-   uint64_t seq = 0;
++   *last_seqno = 0;
++   if (atomic_load(&k->submit_lost))
++      return -ECANCELED;
+ 
+    if (plan->n_ibs == 0)
+       return -EINVAL;
+@@ -550,13 +561,18 @@
+       acd_sfence();
+       int r = kcall(k, ACD_SEL_SUBMIT, NULL, 0, buf, sizeof(hdr) + n * sizeof(struct rdna4n_cs_ib), sout, &nout,
+                     NULL, NULL);
+-      if (r)
+-         return r;
+-      if (nout != 1)
+-         return -EIO;
+-      seq = sout[0];
++      if (r) {
++         if (off == 0)
++            return r;
++         acd_kext_abort_submissions(k);
++         return -ECANCELED;
++      }
++      if (nout != 1) {
++         acd_kext_abort_submissions(k);
++         return -ECANCELED;
++      }
++      *last_seqno = sout[0];
+    }
+-   *last_seqno = seq;
+    return 0;
+ }
+ 
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -183,6 +183,7 @@
+ /* Splits into Submits of <= RDNA4N_MAX_IBS IBs (fence on the last only). Returns
+  * the last seqno. */
+ int acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno);
++void acd_kext_abort_submissions(struct acd_kext *k);
+ /* Number of Submit calls a plan of n IBs needs. */
+ uint32_t acd_cs_split_count(uint32_t n_ibs);
+ 
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -617,6 +617,10 @@
+       r = acd_sync_cs_attach(dev->sync, plan.signals[i].handle, plan.signals[i].point, seq);
+ 
+    acd_cs_plan_fini(&plan);
++   if (r && seq) {
++      acd_kext_abort_submissions(dev->core->kext);
++      return -ECANCELED;
++   }
+    if (r)
+       return r;
+    memset(&cs->out, 0, sizeof(cs->out));

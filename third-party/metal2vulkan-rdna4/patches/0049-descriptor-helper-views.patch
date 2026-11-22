@@ -1,0 +1,143 @@
+Subject: [PATCH] Preserve descriptor pointee views through typed helper inlining
+
+Use one shared raw layout for proven device/constant descriptor roots and
+cloned helper proxies while retaining every load/store type and byte cursor.
+Keep conflicting local or ambiguous pointers behind their typed boundary.
+Compute caller roots lazily once instead of scanning ordinary value helpers.
+
+diff --git a/src/native/ir/ordinary_inline/mod.rs b/src/native/ir/ordinary_inline/mod.rs
+--- a/src/native/ir/ordinary_inline/mod.rs
++++ b/src/native/ir/ordinary_inline/mod.rs
+@@ -422,6 +422,7 @@
+             if !reachable.contains(&caller_name) {
+                 continue;
+             }
++            let mut caller_roots = None;
+             let mut block_index = 0usize;
+             while block_index < self.functions[function_index].blocks.len() {
+                 let mut instruction_index = 0usize;
+@@ -448,6 +449,7 @@
+                                 }
+                                 _ => return None,
+                             };
++                            let mut reinterpretations = Vec::new();
+                             let arguments = helper
+                                 .params
+                                 .iter()
+@@ -469,12 +471,28 @@
+                                                 (helper_pointee, caller_pointee),
+                                                 (Some(helper), Some(caller)) if helper != caller
+                                             ) {
+-                                                // The old function boundary retains the helper's
+-                                                // load type and an explicit value bitcast. Early
+-                                                // splicing would instead retarget the load through
+-                                                // the caller pointer type, a semantics-visible
+-                                                // executable delta.
+-                                                return None;
++                                                // Descriptor roots can share their byte layout while
++                                                // every cloned load/store keeps its original type.
++                                                // Local allocations still need the typed boundary.
++                                                let root = caller_roots
++                                                    .get_or_insert_with(|| {
++                                                        pointer_param_alias_roots(
++                                                            &self.functions[function_index],
++                                                        )
++                                                    })
++                                                    .get(argument_name)?;
++                                                if !matches!(expected_type, LlType::Ptr(1 | 2))
++                                                    || !self.functions[function_index]
++                                                        .params
++                                                        .iter()
++                                                        .any(|(name, ty)| {
++                                                            name == root && ty == expected_type
++                                                        })
++                                                {
++                                                    return None;
++                                                }
++                                                reinterpretations
++                                                    .push((parameter.clone(), root.clone()));
+                                             }
+                                         }
+                                         Some(argument.clone())
+@@ -483,9 +501,9 @@
+                                     }
+                                 })
+                                 .collect::<Option<Vec<_>>>()?;
+-                            Some((helper, arguments, call_result))
++                            Some((helper, arguments, call_result, reinterpretations))
+                         });
+-                    let Some((helper, arguments, call_result)) = plan else {
++                    let Some((helper, arguments, call_result, reinterpretations)) = plan else {
+                         let Some(block) = self.functions[function_index].blocks[block_index]
+                             .typed
+                             .as_ref()
+@@ -512,6 +530,11 @@
+                         parameter_bindings.push(crate::native::tir::TirInst::inline_parameter(
+                             proxy, argument,
+                         ));
++                    }
++                    for (parameter, root) in reinterpretations {
++                        cloned_raw_buffers.push((caller_name.clone(), root));
++                        cloned_raw_buffers
++                            .push((caller_name.clone(), local_rename[&parameter].clone()));
+                     }
+                     for block in &helper.blocks {
+                         let typed = block
+diff --git a/src/native/ir/ordinary_inline/tests.rs b/src/native/ir/ordinary_inline/tests.rs
+--- a/src/native/ir/ordinary_inline/tests.rs
++++ b/src/native/ir/ordinary_inline/tests.rs
+@@ -403,6 +403,38 @@
+ }
+ 
+ #[test]
++fn descriptor_pointer_reinterpretation_keeps_typed_accesses_in_a_shared_raw_layout() {
++    for space in [1, 2] {
++        for offset in [0, 16] {
++            let ll = format!("define float @main(ptr addrspace({space}) %slot) {{\nentry:\n %typed = load float, ptr addrspace({space}) %slot\n %view = getelementptr i8, ptr addrspace({space}) %slot, i64 {offset}\n %result = call float @load_bits(ptr addrspace({space}) %view)\n ret float %result\n}}\ndefine float @load_bits(ptr addrspace({space}) %pointer) {{\nentry:\n %bits = load i32, ptr addrspace({space}) %pointer\n %value = bitcast i32 %bits to float\n ret float %value\n}}\n");
++            let mut module = parsed(&ll);
++            let stats = module.inline_ordinary_leaf_helpers();
++            assert_eq!(stats.splices, 1, "addrspace={space}");
++            assert!(call_names(function(&module, "main")).is_empty());
++            assert!(module
++                .raw_buffer_params
++                .contains(&("main".into(), "%slot".into())));
++            let proxy = inline_bindings(function(&module, "main"))[0]
++                .result
++                .clone()
++                .unwrap();
++            assert!(module.raw_buffer_params.contains(&("main".into(), proxy)));
++            assert_eq!(
++                inline_bindings(function(&module, "main"))[0].operands[0]
++                    .as_typed_value()
++                    .unwrap()
++                    .value,
++                LlValue::Local("%view".into())
++            );
++            assert!(function(&module, "main").carrier_insts().any(|i| i
++                .load()
++                .as_ref()
++                .is_some_and(|load| load.result_ty == LlType::Int(32))));
++        }
++    }
++}
++
++#[test]
+ fn conflicting_caller_and_helper_pointer_pointees_remain_residual() {
+     let ll = r#"
+ define float @main() {
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -655,3 +655,12 @@
+ or atomic reads, loaded resource pointers, dynamic offsets and merely `NonWritable`
+ storage loads do not authorize this transformation. Cache identities must change;
+ reflection 66, source-proof version 2 and argument-table ABI 9 remain unchanged.
++
++An ordinary leaf helper may interpret an entry buffer through a different pointee
++type. For device/constant pointers rooted in the same descriptor parameter, typed
++inlining selects one shared raw byte layout for the caller root and helper proxy;
++each cloned load/store retains its source type and the argument retains its offset.
++This also keeps entry accessibility facts available to coordinate placement across
++linked helper expansion. Conflicting local/workgroup allocations and pointers with
++no single descriptor root retain their typed call boundary. No new reflection or
++source-proof fields are needed, but translation/cache identities must change.

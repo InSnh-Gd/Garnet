@@ -1,0 +1,49 @@
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -184,6 +184,45 @@
+         }
+     }
+     let names = air_names(&ctx.module);
++    // Nullness belongs to the serialized handle, including fields that keep the static ABI.
++    for block in 0..ctx.module.functions[entry].blocks.len() {
++        let instructions = ctx.module.functions[entry].blocks[block]
++            .instructions
++            .clone();
++        let mut body = Vec::with_capacity(instructions.len());
++        for inst in instructions {
++            let token = match (inst.class.opcode, inst.operands.as_slice()) {
++                (Op::FunctionCall, [Operand::IdRef(callee), Operand::IdRef(handle)])
++                    if names
++                        .get(callee)
++                        .is_some_and(|name| name.starts_with("air.is_null_texture")) =>
++                {
++                    payloads.get(handle)
++                }
++                _ => None,
++            };
++            if let Some(&(low, high)) = token {
++                let uint = ctx.ty_uint();
++                let zero = ctx.const_uint(0);
++                let words = value(
++                    ctx,
++                    &mut body,
++                    Op::BitwiseOr,
++                    uint,
++                    vec![Operand::IdRef(low), Operand::IdRef(high)],
++                );
++                body.push(Instruction::new(
++                    Op::IEqual,
++                    inst.result_type,
++                    inst.result_id,
++                    vec![Operand::IdRef(words), Operand::IdRef(zero)],
++                ));
++            } else {
++                body.push(inst);
++            }
++        }
++        ctx.module.functions[entry].blocks[block].instructions = body;
++    }
+     let needs_graph = ctx.module.functions[entry].blocks.iter().flat_map(|block| &block.instructions)
+         .filter(|inst| inst.class.opcode == Op::FunctionCall)
+         .filter(|inst| matches!(inst.operands.first(), Some(Operand::IdRef(callee)) if names.get(callee).is_some_and(|name| name.starts_with("air.") && (name.contains("_texture_") || name.contains("_depth_")))))

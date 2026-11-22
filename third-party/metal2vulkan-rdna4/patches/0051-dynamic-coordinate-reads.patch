@@ -1,0 +1,227 @@
+diff --git a/src/native/constant_reads.rs b/src/native/constant_reads.rs
+--- a/src/native/constant_reads.rs
++++ b/src/native/constant_reads.rs
+@@ -135,7 +135,6 @@
+         }
+         let definition = *definitions.get(pointer.as_str())?;
+         if let Some(gep) = definition.gep().as_deref() {
+-            super::emit_tiers::constant_gep_byte_offset(parsed, gep)?;
+             let LlValue::Local(base) = &gep.base.value else {
+                 return None;
+             };
+diff --git a/src/native/guarded_reads.rs b/src/native/guarded_reads.rs
+--- a/src/native/guarded_reads.rs
++++ b/src/native/guarded_reads.rs
+@@ -222,7 +222,6 @@
+         }
+     }
+     let mut reads = Vec::new();
+-    let mut dependencies = Vec::new();
+     let mut copied = HashSet::new();
+     for instruction in &block.insts {
+         if !readable_prefix(instruction) {
+@@ -235,23 +234,52 @@
+         {
+             continue;
+         }
+-        let Some((path, _)) =
+-            super::constant_reads::entry_read_path(parsed, function, definitions, instruction)
++        if instruction.load().is_none() {
++            continue;
++        }
++        let Some(path) = read_dependencies(parsed, function, instruction, &local, definitions)
+         else {
+             continue;
+         };
+-        for dependency in path {
+-            if copied.insert(dependency.result.clone()?) {
+-                dependencies.push(dependency.clone());
+-            }
+-        }
++        copied.extend(path);
+         reads.push(instruction.clone());
+     }
++    let dependencies = block
++        .insts
++        .iter()
++        .filter(|i| i.result.as_ref().is_some_and(|name| copied.contains(name)))
++        .cloned()
++        .collect();
+     (!reads.is_empty()).then_some(Arm {
+         block: index,
+         reads,
+         dependencies,
+     })
++}
++
++fn read_dependencies(
++    parsed: &LlModule,
++    function: &LlFunction,
++    instruction: &TirInst,
++    local: &HashSet<&str>,
++    definitions: &HashMap<&str, &TirInst>,
++) -> Option<HashSet<String>> {
++    let mut pending = vec![instruction.result.clone()?];
++    let mut copied = HashSet::new();
++    while let Some(name) = pending.pop() {
++        if !local.contains(name.as_str()) || !copied.insert(name.clone()) {
++            continue;
++        }
++        let dependency = definitions.get(name.as_str())?;
++        if !readable_prefix(dependency) {
++            return None;
++        }
++        if dependency.load().is_some() {
++            super::constant_reads::entry_read_path(parsed, function, definitions, dependency)?;
++        }
++        dependency.visit_uses(|name| pending.push(name.to_string()));
++    }
++    Some(copied)
+ }
+ 
+ fn readable_prefix(instruction: &TirInst) -> bool {
+@@ -279,6 +307,10 @@
+             | TirOpcode::And
+             | TirOpcode::Or
+             | TirOpcode::Xor
++            | TirOpcode::Shl
++            | TirOpcode::LShr
++            | TirOpcode::Ashr
++            | TirOpcode::ICmp
+             | TirOpcode::ZExt
+             | TirOpcode::SExt
+             | TirOpcode::Trunc
+diff --git a/src/native/guarded_reads/tests.rs b/src/native/guarded_reads/tests.rs
+--- a/src/native/guarded_reads/tests.rs
++++ b/src/native/guarded_reads/tests.rs
+@@ -91,7 +91,7 @@
+ }
+ 
+ #[test]
+-fn side_effects_ordered_reads_and_dynamic_addresses_remain_in_the_source_arm() {
++fn side_effects_and_ordered_reads_remain_in_the_source_arm() {
+     for (prefix, load) in [
+         ("store i32 7, ptr addrspace(1) %output", "float"),
+         ("call void @side_effect()", "float"),
+@@ -106,8 +106,84 @@
+             .iter()
+             .any(|i| i.opcode == TirOpcode::Load));
+     }
+-    let blocks = rewritten(&source("", "float").replace("i64 8", "i64 %index"));
+-    assert_eq!(blocks.len(), 3);
++}
++
++#[test]
++fn dynamic_addresses_keep_local_integer_dependencies_inside_the_original_guard() {
++    let text = source(
++        "%step = mul i64 %index, 4\n %offset = add i64 %step, 8",
++        "float",
++    )
++    .replace("%buffer, i64 8", "%buffer, i64 %offset");
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 5);
++    let TirTerminator::BrCond { t, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    let guard = named(&blocks, t);
++    assert_eq!(
++        guard
++            .insts
++            .iter()
++            .map(|i| i.opcode.clone())
++            .collect::<Vec<_>>(),
++        [
++            TirOpcode::Mul,
++            TirOpcode::Add,
++            TirOpcode::GetElementPtr,
++            TirOpcode::Load
++        ]
++    );
++    let defs = guard
++        .insts
++        .iter()
++        .filter_map(|i| i.result.as_deref())
++        .collect::<HashSet<_>>();
++    for instruction in &guard.insts {
++        instruction.visit_uses(|name| {
++            assert!(
++                defs.contains(name) || name == "%index" || name == "%buffer",
++                "{name}"
++            )
++        });
++    }
++}
++
++#[test]
++fn loaded_runtime_indices_move_with_the_read_but_unproven_address_roots_do_not() {
++    let text = source(
++        "%index_ptr = getelementptr i8, ptr addrspace(2) %buffer, i64 0\n \
++         %loaded_index = load i64, ptr addrspace(2) %index_ptr, align 8\n \
++         %offset = shl i64 %loaded_index, 2",
++        "float",
++    )
++    .replace("%buffer, i64 8", "%buffer, i64 %offset");
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 5);
++    let TirTerminator::BrCond { t, f, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    assert_eq!(
++        named(&blocks, t)
++            .insts
++            .iter()
++            .filter(|i| i.load().is_some())
++            .count(),
++        2
++    );
++    assert_eq!(named(&blocks, f).insts.len(), 2);
++    assert!(!named(&blocks, "%arm")
++        .insts
++        .iter()
++        .any(|i| i.load().is_some()));
++    for prefix in [
++        "%raw = ptrtoint ptr addrspace(2) %buffer to i64\n %p = inttoptr i64 %raw to ptr addrspace(2)",
++        "%p = load ptr addrspace(2), ptr addrspace(2) %buffer, align 8",
++    ] {
++        let text = source("", "float").replace(
++            "%p = getelementptr i8, ptr addrspace(2) %buffer, i64 8", prefix);
++        assert_eq!(rewritten(&text).len(), 3, "{prefix}");
++    }
+ }
+ 
+ #[test]
+diff --git a/src/passes/finalize.rs b/src/passes/finalize.rs
+--- a/src/passes/finalize.rs
++++ b/src/passes/finalize.rs
+@@ -269,6 +269,8 @@
+         )
+     });
+ 
++    // Preserve source readonly provenance before cleanup removes replaced descriptor views.
++    resources::fragment_control::record_readonly_aliases(ctx);
+     drop_dead_unreferenced_variables(ctx, &referenced_from_functions, &interface_ids);
+     gc_dead_globals(ctx);
+     drop_unused_scalar_width_capabilities(&mut ctx.module);
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -670,8 +670,17 @@
+ sampling selection. The native typed transform builds guarded address/read blocks
+ and phi values with zero on inactive paths; the original descriptor operations,
+ samples and side effects keep their source sites. This is conditional evaluation,
+-not storage-load speculation. It requires single-predecessor source arms, static
++not storage-load speculation. It requires single-predecessor source arms,
+ entry-rooted address paths and a prefix free of writes, calls, barriers and ordered
+-reads. The CFG/derivative pass still proves uniformity and matching loop instances.
++reads. Runtime GEP indices retain their integer width and source guard; their
++arm-local integer dependencies and numeric entry-buffer reads move with the
++coordinate read in source order. Physical-address bounds and permissions remain
++checked after interface lowering. Unconditional hoisting still requires static
++offsets inside the explicit accessible span. The CFG/derivative pass still proves
++uniformity and matching loop instances.
++Readonly provenance is copied to surviving descriptor aliases before dead-view
++cleanup removes the original variable and its binding decorations. Thus a
++constant-buffer early-return predicate remains provably uniform when another
++buffer needs checked dynamic addressing.
+ Unsupported shapes remain visible refusals. Direct, linked and cached paths share
+ the resulting dominating values without additional source-proof metadata.

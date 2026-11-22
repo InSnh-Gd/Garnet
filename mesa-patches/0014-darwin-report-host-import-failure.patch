@@ -1,0 +1,23 @@
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ /* ---- the mirrored structs must be layout-identical to their drm twins (D2) ---- */
+ _Static_assert(sizeof(struct rdna4n_gem_create_in) == 32, "gem_create_in size");
+@@ -211,6 +212,12 @@
+ {
+    int kr = k->ops.call(k->ctx, sel, sin, nsin, stin, stinsz, sout, nsout, stout, stoutsz);
+    const int r = acd_kr_to_errno(sel, kr);
++   if (r && sel == ACD_SEL_BO_IMPORT_HOST)
++      fprintf(stderr,
++              "radv-darwin: host import failed pid=%ld sel=%u host=0x%llx size=%llu flags=0x%llx gpuVA=0x%llx "
++              "IOReturn=0x%08x errno=%d\n",
++              (long)getpid(), sel, (unsigned long long)sin[0], (unsigned long long)sin[1],
++              (unsigned long long)sin[2], (unsigned long long)sin[3], (unsigned)kr, r);
+    if (trace_enabled())
+       fprintf(stderr, "radv-darwin: trace sel %u nsin %u stin %zu -> IOReturn 0x%08x errno %d\n", sel, nsin, stinsz,
+               (unsigned)kr, r);

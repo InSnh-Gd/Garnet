@@ -1,0 +1,15 @@
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -304,6 +304,11 @@ bool
+ radv_is_dcc_disabled(const struct radv_physical_device *pdev)
+ {
++#ifdef HAVE_AMDGPU_DARWIN
++   if (pdev->info.gfx_level >= GFX12)
++      return true;
++#endif
++
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+    return RADV_DEBUG(instance, NO_DCC) || pdev->drirc.debug.disable_dcc;
+ }

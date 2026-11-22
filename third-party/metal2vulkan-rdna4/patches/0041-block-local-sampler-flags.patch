@@ -1,0 +1,48 @@
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -514,7 +514,7 @@
+             })
+         })
+         .flatten();
+-    let mut coordinate_loads = coordinate_flags
++    let coordinate_loads = coordinate_flags
+         .map(|flags| coordinate_flag_loads(ctx, flags, &defs))
+         .transpose()?
+         .unwrap_or_default();
+@@ -619,7 +619,6 @@
+     let mut globals = BTreeMap::new();
+     let mut replacement = BTreeMap::new();
+     let mut flag_replacements = HashMap::<Word, Word>::new();
+-    let mut flag_replacement_by_word = HashMap::<u32, Word>::new();
+     let mut removed_flag_loads = HashSet::<Word>::new();
+     for (&var, resource) in &resources {
+         let new_var = *globals
+@@ -677,6 +676,12 @@
+             let old = ctx.module.functions[function_index].blocks[block_index]
+                 .instructions
+                 .clone();
++            let local_values = old
++                .iter()
++                .filter_map(|inst| inst.result_id)
++                .collect::<HashSet<_>>();
++            // Token lookup results are block-local SSA values; another branch needs its own flags.
++            let mut flag_replacement_by_word = HashMap::<u32, Word>::new();
+             let mut body = Vec::with_capacity(old.len());
+             for mut inst in old {
+                 if inst
+@@ -808,7 +813,14 @@
+                             if let std::collections::hash_map::Entry::Vacant(entry) =
+                                 flag_replacement_by_word.entry(word)
+                             {
+-                                if let Some(old_words) = coordinate_loads.remove(&word) {
++                                let old_words = coordinate_loads
++                                    .get(&word)
++                                    .into_iter()
++                                    .flatten()
++                                    .copied()
++                                    .filter(|id| local_values.contains(id))
++                                    .collect::<Vec<_>>();
++                                if !old_words.is_empty() {
+                                     let old_flags =
+                                         old_words.iter().copied().collect::<HashSet<_>>();
+                                     let chain_start = remove_flag_loads_before(

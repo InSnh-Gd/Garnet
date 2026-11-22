@@ -1,0 +1,72 @@
+diff --git a/src/native/rewrites.rs b/src/native/rewrites.rs
+--- a/src/native/rewrites.rs
++++ b/src/native/rewrites.rs
+@@ -747,16 +747,12 @@
+         )
+         .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
+         .collect::<HashMap<_, _>>();
+-    let address_ty = module
+-        .types_global_values
+-        .iter()
+-        .find_map(|inst| {
+-            (inst.class.opcode == Op::TypeInt
+-                && matches!(inst.operands.first(), Some(Operand::LiteralBit32(64)))
+-                && matches!(inst.operands.get(1), Some(Operand::LiteralBit32(0))))
+-            .then_some(inst.result_id?)
+-        })
+-        .ok_or("native construction: PhysicalStorageBuffer64 module has no ulong type")?;
++    let address_ty = module.types_global_values.iter().find_map(|inst| {
++        (inst.class.opcode == Op::TypeInt
++            && matches!(inst.operands.first(), Some(Operand::LiteralBit32(64)))
++            && matches!(inst.operands.get(1), Some(Operand::LiteralBit32(0))))
++        .then_some(inst.result_id?)
++    });
+     let target_field =
+         |mut aggregate_ty: Word, indices: &[Operand]| -> Option<(Word, usize, Word)> {
+             let mut target = None;
+@@ -789,7 +785,7 @@
+                     _ => None,
+                 });
+                 let object_is_pointer = object_ty.is_some_and(|ty| pointer_types.contains(&ty));
+-                let object_is_address = object_ty == Some(address_ty);
++                let object_is_address = address_ty.is_some() && object_ty == address_ty;
+                 if pointer_types.contains(&leaf_ty) && (object_is_pointer || object_is_address) {
+                     candidates.insert((owner, member));
+                 }
+@@ -866,6 +862,8 @@
+         return Ok(false);
+     }
+ 
++    let address_ty = address_ty
++        .ok_or("native construction: PhysicalStorageBuffer64 module has no ulong type")?;
+     let zero = module
+         .types_global_values
+         .iter()
+@@ -1871,6 +1869,27 @@
+         });
+         module.functions.push(function);
+         module
++    }
++
++    #[test]
++    fn unobserved_bda_noop_needs_no_address_type_or_zero() {
++        let mut module = module_with_forwarded_bda_address(vec![
++            Operand::LiteralBit32(0),
++            Operand::LiteralBit32(1),
++        ]);
++        module.functions.clear();
++        module
++            .types_global_values
++            .retain(|inst| inst.result_id == Some(1));
++        assert!(!lower_unobserved_bda_aggregate_pointer_fields_module(&mut module).unwrap());
++
++        module.types_global_values.push(inst(
++            Op::TypeInt,
++            None,
++            Some(2),
++            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
++        ));
++        assert!(!lower_unobserved_bda_aggregate_pointer_fields_module(&mut module).unwrap());
+     }
+ 
+     #[test]

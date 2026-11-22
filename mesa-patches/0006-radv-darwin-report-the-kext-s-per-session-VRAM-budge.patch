@@ -1,0 +1,285 @@
+From 97aaa5af867194873fd04273b9fc79614c9b73f5 Mon Sep 17 00:00:00 2001
+From: RDNA4-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 6/9] radv/darwin: keep physical heaps, budget only bounds Private
+ max_allocation headroom
+
+Mesa reports the physical pool totals and real usages; the kext's
+per-session VRAM budget (ABI 1.10 reserved[3..7]) only bounds
+vram.max_allocation (avail when valid, otherwise the real free bytes).
+No shrinking of totals to the shared cap, no cap-avail fake usage, and
+Private max is not bound to the visible 3/4 limit. ABI layout and minor
+stay 1.10; per-session held bytes and the visible subcap are not
+reported and must not be invented (see the header comments).
+
+---
+ include/darwin/rdna4_native_abi.h           | 19 ++++-
+ src/amd/common/darwin/ac_darwin_budget.h     | 69 +++++++++++++++++++
+ src/amd/common/darwin/ac_darwin_drm.c        |  6 +-
+ src/amd/common/darwin/test/acd_budget_test.c | 104 ++++++++++++++++++++
+ 4 files changed, 193 insertions(+), 5 deletions(-)
+ create mode 100644 src/amd/common/darwin/ac_darwin_budget.h
+ create mode 100644 src/amd/common/darwin/test/acd_budget_test.c
+
+diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi.h
+--- a/include/darwin/rdna4_native_abi.h
++++ b/include/darwin/rdna4_native_abi.h
+@@ -26,7 +26,7 @@
+ 
+ #define RDNA4N_UC_TYPE       0x47524E54u      /* 'GRNT' */
+ #define RDNA4N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, rdna4native, s1d-replay) still handshakes */
+-#define RDNA4N_ABI_MINOR     9u            /* 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
++#define RDNA4N_ABI_MINOR     10u           /* 1.10 (kext 0.0.640, GPU-apps G4): rdna4n_info.reserved[3..7] report the session's VRAM budget (RDNA4N_INFO_R_* / RDNA4N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args garnet-apps=1 + garnet-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
+ #define RDNA4N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define RDNA4N_MAX_IBS       64u
+ #define RDNA4N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+@@ -69,7 +69,7 @@
+     RDNA4N_SEL_COUNT_1_8     = 21,
+     /* ---- ABI 1.9 (kext 0.0.612): host-memory import, milestone #11 step 11c. Needs Hello first. ---- */
+     RDNA4N_SEL_BO_IMPORT_HOST = 21, /* in: [0] host VA (4 KiB aligned, in the CALLER's address space) [1] size (4 KiB multiple, 1 page .. 64 MiB) [2] flags (0, or with [3] != 0 the GemVa vm flags R/W/X/MTYPE of the mapping) [3] GPU VA to map at (0 = do not map: map later with GemVa MAP on the handle, as RADV does)
+-                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (RDNA4N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 256 MiB per client (separate from the GTT cap).
++                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (RDNA4N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 4 GiB per client (0.0.621; 2 GiB in 0.0.620, 256 MiB before; separate from the GTT cap).
+                                      BoFree, and the close of the client, unmap the PTEs, flush the TLB, then complete() and release the pages (under the HUNG latch they are leaked, never released). A host BO cannot be a scanout slot, a user-fence target or CPU-mapped by clientMemoryForType (NotPermitted). Errors: BadArgument (alignment, size 0, > 64 MiB, user range, flags), NoMemory (the per-client cap, no descriptor, no page table space), NotReady (no Hello), Aborted / Timeout (HUNG). */
+     RDNA4N_SEL_COUNT_1_9     = 22
+ };
+@@ -183,13 +183,28 @@
+ #define RDNA4N_INFO_HUNG          (1u << 0)
+ #define RDNA4N_INFO_S1B_POSITIVE  (1u << 1)
+ #define RDNA4N_INFO_NATIVE_BOOT   (1u << 2)
++/* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
++ *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
++ *   reserved[3] = RDNA4N_BUDGET_* flags
++ *   reserved[4],[5] = the VRAM budget CAP in bytes, low / high dword: what ALL non-WindowServer sessions together may hold (shared allowance: pool total minus WS/internal/PT and the WS-growth reserve; older kexts reported 25 % of the pools). 0 when RDNA4N_BUDGET_VALID is clear.
++ *   reserved[6],[7] = the bytes still AVAILABLE to this session now = min(cap - held by all non-WindowServer sessions, free bytes of the VRAM pools), low / high dword.
++ *                     The budget is SHARED, so AVAILABLE can shrink between two queries (e.g. WindowServer growth). Per-session held bytes and the visible-subcap are NOT reported;
++ *                     a user-space allocator must keep heap sizes at the physical pool totals and only bound new allocations by AVAILABLE (see ac_darwin_budget.h), never shrinking
++ *                     totals/usages to the cap nor synthesizing usage as cap - avail. */
++#define RDNA4N_INFO_R_BUDGET_FLAGS 3u
++#define RDNA4N_INFO_R_BUDGET_CAP_LO 4u
++#define RDNA4N_INFO_R_BUDGET_CAP_HI 5u
++#define RDNA4N_INFO_R_BUDGET_AVAIL_LO 6u
++#define RDNA4N_INFO_R_BUDGET_AVAIL_HI 7u
++#define RDNA4N_BUDGET_VALID (1u << 0)   /* a VRAM budget applies to this session (multi-session boot, not WindowServer's session) */
++#define RDNA4N_BUDGET_APP   (1u << 1)   /* this session was admitted as an APP (the kernel allow-list role) */
+ /* BoCreate scalar out [3] */
+ #define RDNA4N_PLACED_CPU_MAPPABLE (1u << 0)
+ #define RDNA4N_PLACED_ZEROED       (1u << 1)
+ #define RDNA4N_PLACED_HI_POOL      (1u << 2)
+ #define RDNA4N_PLACED_HOST_IMPORT  (1u << 3)   /* ABI 1.9: the BO is an import of caller memory (SYSTEM pages) */
+ #define RDNA4N_IMPORT_MAX_BO       (64ull << 20)   /* ABI 1.9: per BoImportHost call */
+-#define RDNA4N_IMPORT_CAP          (256ull << 20)  /* ABI 1.9: per client, separate from the 512 MiB GTT cap */
++#define RDNA4N_IMPORT_CAP          (4096ull << 20) /* ABI 1.9: per client, 4 GiB since kext 0.0.621 (2 GiB in 0.0.620, 256 MiB before), separate from the 512 MiB GTT cap */
+ 
+ /* ---- ABI 1.1: native scanout (kext 0.0.603) ------------------------------------------------------------------------------------ */
+ #define RDNA4N_SCAN_MAX_SLOTS   3u
+diff --git a/src/amd/common/darwin/ac_darwin_budget.h b/src/amd/common/darwin/ac_darwin_budget.h
+new file mode 100644
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_budget.h
+@@ -0,0 +1,69 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Per-session VRAM budget (kext ABI 1.10, rdna4n_info.reserved[3..7]). Pure helpers so the
++ * host test can drive them without a kext. Totals and usages stay physical; the budget only
++ * bounds Private max_allocation headroom. No per-session held bytes and no visible subcap are
++ * reported (see rdna4_native_abi.h); callers must not invent them and must clamp conservatively.
++ * All helpers are no-ops / "not valid" when RDNA4N_BUDGET_VALID is clear (WindowServer's
++ * session and older kexts report zeros): then max_allocation is the real free bytes.
++ */
++#ifndef AC_DARWIN_BUDGET_H
++#define AC_DARWIN_BUDGET_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "drm-uapi/amdgpu_drm.h"
++#include "rdna4_native_abi.h"
++
++static inline bool
++acd_budget_valid(const struct rdna4n_info *k)
++{
++   return (k->reserved[RDNA4N_INFO_R_BUDGET_FLAGS] & RDNA4N_BUDGET_VALID) != 0;
++}
++
++static inline uint64_t
++acd_budget_cap(const struct rdna4n_info *k)
++{
++   return (uint64_t)k->reserved[RDNA4N_INFO_R_BUDGET_CAP_LO] |
++          ((uint64_t)k->reserved[RDNA4N_INFO_R_BUDGET_CAP_HI] << 32);
++}
++
++static inline uint64_t
++acd_budget_avail(const struct rdna4n_info *k)
++{
++   return (uint64_t)k->reserved[RDNA4N_INFO_R_BUDGET_AVAIL_LO] |
++          ((uint64_t)k->reserved[RDNA4N_INFO_R_BUDGET_AVAIL_HI] << 32);
++}
++
++/* Budget only bounds new Private allocations via max_allocation. Totals, usable sizes and
++ * heap usages are left at the physical pool values the caller already filled in; this helper
++ * never shrinks them to the shared cap and never synthesizes usage as cap - avail. Returns
++ * whether a budget applies; even when it does not, max_allocation is set to the real free
++ * bytes so WindowServer sessions also report a truthful headroom. */
++static inline bool
++acd_apply_budget(struct drm_amdgpu_memory_info *m, const struct rdna4n_info *k, uint64_t vram_total,
++                 uint64_t vram_free)
++{
++   uint64_t avail = vram_free < vram_total ? vram_free : vram_total;
++   bool valid = acd_budget_valid(k);
++   if (valid) {
++      uint64_t a = acd_budget_avail(k);
++      uint64_t cap = acd_budget_cap(k);
++      /* Defensive clamps only: the kernel already reports
++       * avail = min(cap - held_by_all_nonWS, pool_free). A stale snapshot must not exceed
++       * the current free bytes, the pool total, or the shared cap. */
++      if (a > cap)
++         a = cap;
++      if (a > vram_free)
++         a = vram_free;
++      if (a > vram_total)
++         a = vram_total;
++      avail = a;
++   }
++   m->vram.max_allocation = avail;
++   return valid;
++}
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -6,6 +6,7 @@
+ 
+ #include "ac_darwin_drm.h"
+ #include "ac_darwin_kext.h"
++#include "ac_darwin_budget.h"
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -417,11 +418,15 @@
+    m->vram.total_heap_size = vram_total;
+    m->vram.usable_heap_size = vram_total;
+    m->vram.heap_usage = vram_total - vram_free;
+-   m->vram.max_allocation = k.vram_vis_total * 3 / 4;
++   m->vram.max_allocation = vram_free;
+    m->cpu_accessible_vram.total_heap_size = k.vram_vis_total;
+    m->cpu_accessible_vram.usable_heap_size = k.vram_vis_total;
+    m->cpu_accessible_vram.heap_usage = k.vram_vis_total - k.vram_vis_free;
+    m->cpu_accessible_vram.max_allocation = k.vram_vis_total * 3 / 4;
++   /* ABI 1.10: the per-session VRAM budget only bounds Private max_allocation headroom.
++    * Totals (vram_total, vis_total) and usages stay physical; no second shrink to the shared
++    * cap and no cap-avail fake usage. Without a budget max is the real free bytes. */
++   acd_apply_budget(m, &k, vram_total, vram_free);
+    m->gtt.total_heap_size = k.gtt_cap;
+    m->gtt.usable_heap_size = k.gtt_cap;
+    m->gtt.heap_usage = k.gtt_used;
+diff --git a/src/amd/common/darwin/test/acd_budget_test.c b/src/amd/common/darwin/test/acd_budget_test.c
+new file mode 100644
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_budget_test.c
+@@ -0,0 +1,104 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * Host test of acd_apply_budget (ac_darwin_budget.h). Build and run:
++ *   clang -std=gnu11 -I include -I include/darwin -I src/amd/common/darwin \
++ *     src/amd/common/darwin/test/acd_budget_test.c -o acd_budget_test && ./acd_budget_test
++ *
++ * Budget semantics under test: heap totals/usages stay at the physical pool values;
++ * only vram.max_allocation carries the shared headroom (avail when a budget applies,
++ * otherwise the real free bytes). No cap-avail fake usage, no shrinking to the cap.
++ */
++#include "ac_darwin_budget.h"
++
++#include <stdio.h>
++#include <string.h>
++
++static int failures, checks;
++#define CHECK(c) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
++
++#define GiB (1ull << 30)
++
++static void
++set64(struct rdna4n_info *k, uint32_t lo, uint32_t hi, uint64_t v)
++{
++   k->reserved[lo] = (uint32_t)v;
++   k->reserved[hi] = (uint32_t)(v >> 32);
++}
++
++int
++main(void)
++{
++   const uint64_t vis = 256ull << 20, total = 16 * GiB, free = 12 * GiB;
++   struct rdna4n_info k;
++   struct drm_amdgpu_memory_info m, ref;
++
++   /* flag clear: totals/usages untouched, max falls back to the real free bytes */
++   memset(&k, 0, sizeof(k));
++   set64(&k, RDNA4N_INFO_R_BUDGET_CAP_LO, RDNA4N_INFO_R_BUDGET_CAP_HI, 4 * GiB);
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 3 * GiB);
++   memset(&m, 0, sizeof(m));
++   m.vram.total_heap_size = m.vram.usable_heap_size = total;
++   m.vram.heap_usage = total - free;
++   m.vram.max_allocation = 0xdeadbeefu;
++   m.cpu_accessible_vram.total_heap_size = m.cpu_accessible_vram.usable_heap_size = vis;
++   m.cpu_accessible_vram.heap_usage = 1 * GiB;
++   ref = m;
++   CHECK(!acd_apply_budget(&m, &k, total, free) && !acd_budget_valid(&k));
++   CHECK(m.vram.total_heap_size == ref.vram.total_heap_size &&
++         m.vram.usable_heap_size == ref.vram.usable_heap_size &&
++         m.vram.heap_usage == ref.vram.heap_usage);
++   CHECK(m.cpu_accessible_vram.total_heap_size == vis &&
++         m.cpu_accessible_vram.usable_heap_size == vis &&
++         m.cpu_accessible_vram.heap_usage == 1 * GiB);
++   CHECK(m.vram.max_allocation == free);
++
++   /* flag set: cap 4 GiB (above the 32-bit range), 3 GiB available; totals/usages stay physical */
++   memset(&k, 0, sizeof(k));
++   k.reserved[RDNA4N_INFO_R_BUDGET_FLAGS] = RDNA4N_BUDGET_VALID | RDNA4N_BUDGET_APP;
++   set64(&k, RDNA4N_INFO_R_BUDGET_CAP_LO, RDNA4N_INFO_R_BUDGET_CAP_HI, 4 * GiB);
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 3 * GiB);
++   memset(&m, 0, sizeof(m));
++   m.vram.total_heap_size = m.vram.usable_heap_size = total;
++   m.vram.heap_usage = total - free;
++   m.cpu_accessible_vram.total_heap_size = m.cpu_accessible_vram.usable_heap_size = vis;
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.vram.total_heap_size == total && m.vram.usable_heap_size == total);
++   CHECK(m.vram.heap_usage == total - free);
++   CHECK(m.vram.max_allocation == 3 * GiB);
++   CHECK(m.cpu_accessible_vram.total_heap_size == vis && m.cpu_accessible_vram.usable_heap_size == vis);
++
++   /* avail smaller than before -> max follows avail; usage still physical, never cap-avail */
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 1ull << 20);
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.vram.max_allocation == (1ull << 20));
++   CHECK(m.vram.heap_usage == total - free);
++   CHECK(m.vram.total_heap_size == total);
++
++   /* stale avail above cap clamps to cap (shared allowance); totals never shrink */
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 15 * GiB);
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.vram.max_allocation == 4 * GiB);
++   set64(&k, RDNA4N_INFO_R_BUDGET_CAP_LO, RDNA4N_INFO_R_BUDGET_CAP_HI, 4 * GiB);
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 5 * GiB);
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.vram.max_allocation == 4 * GiB);
++   CHECK(m.vram.total_heap_size == total && m.vram.heap_usage == total - free);
++
++   /* cap below the visible pool must not shrink the visible heap; max still follows avail */
++   set64(&k, RDNA4N_INFO_R_BUDGET_CAP_LO, RDNA4N_INFO_R_BUDGET_CAP_HI, 100ull << 20);
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 40ull << 20);
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.cpu_accessible_vram.total_heap_size == vis);
++   CHECK(m.vram.total_heap_size == total);
++   CHECK(m.vram.max_allocation == (40ull << 20));
++
++   /* cap above total: max still bounded by free/total, totals stay physical */
++   set64(&k, RDNA4N_INFO_R_BUDGET_CAP_LO, RDNA4N_INFO_R_BUDGET_CAP_HI, 64 * GiB);
++   set64(&k, RDNA4N_INFO_R_BUDGET_AVAIL_LO, RDNA4N_INFO_R_BUDGET_AVAIL_HI, 15 * GiB);
++   CHECK(acd_apply_budget(&m, &k, total, free));
++   CHECK(m.vram.total_heap_size == total);
++   CHECK(m.vram.max_allocation == free);
++
++   printf("acd_budget_test: %d checks, %d failures\n", checks, failures);
++   return failures != 0;
++}

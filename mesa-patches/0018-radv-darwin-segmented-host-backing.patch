@@ -1,0 +1,187 @@
+From: RDNA4 local integration
+Subject: [PATCH 18/18] radv/darwin: segment large host-pointer imports
+
+Import native host pointers above 64 MiB as fully mapped 64 MiB children in one
+contiguous VA. Preserve the borrowed CPU pointer and roll back partial imports.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 with patches 0001..0017.
+
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -34,6 +34,8 @@
+ #endif
+ 
+ static void radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo);
++static uint64_t radv_amdgpu_get_optimal_vm_alignment(struct radv_amdgpu_winsys *ws, uint64_t size,
++                                                      unsigned alignment);
+ 
+ static int
+ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr,
+@@ -648,6 +650,136 @@
+    radv_amdgpu_winsys_bo_destroy(_ws, &bo->base);
+    return result;
+ }
++
++#define RADV_DARWIN_HOST_CHUNK (UINT64_C(64) << 20)
++#define RADV_DARWIN_HOST_CHILDREN 2048u
++
++static VkResult
++radv_amdgpu_host_child_from_ptr(struct radv_amdgpu_winsys *ws, void *pointer, uint64_t size,
++                                uint64_t va, unsigned priority,
++                                struct radv_amdgpu_winsys_bo **out_child)
++{
++   struct radv_amdgpu_winsys_bo *bo;
++   ac_drm_bo buf_handle;
++   int r;
++
++   *out_child = NULL;
++
++   bo = CALLOC_STRUCT(radv_amdgpu_winsys_bo);
++   if (!bo)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   r = ac_drm_create_bo_from_user_mem(ws->dev, pointer, size, &buf_handle);
++   if (r) {
++      FREE(bo);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   uint32_t kms_handle = 0;
++   r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);
++   if (r) {
++      if (ac_drm_bo_free(ws->dev, buf_handle))
++         fprintf(stderr, "radv/darwin: Failed to release host import segment.\n");
++      FREE(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, size, va, 0, 0, AMDGPU_VA_OP_MAP);
++   if (r) {
++      if (ac_drm_bo_free(ws->dev, buf_handle))
++         fprintf(stderr, "radv/darwin: Failed to release host import segment.\n");
++      FREE(bo);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   bo->base.va = va;
++   bo->base.size = size;
++   bo->base.is_virtual = false;
++   bo->va_handle = NULL;
++   bo->bo = buf_handle;
++   bo->bo_handle = kms_handle;
++   bo->base.initial_domain = RADEON_DOMAIN_GTT;
++   bo->base.use_global_list = false;
++   bo->priority = priority;
++   bo->cpu_map = NULL;
++   bo->base.obj_id = (uintptr_t)(buf_handle.abo);
++
++   p_atomic_add(&ws->alloc_tracker->allocated_gtt, align64(bo->base.size, ws->info.gart_page_size));
++
++   if (ws->debug_all_bos)
++      radv_amdgpu_global_bo_list_add(ws, bo);
++   radv_amdgpu_log_bo(ws, bo, false);
++
++   *out_child = bo;
++   return VK_SUCCESS;
++}
++
++static VkResult
++radv_amdgpu_host_composite_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_t size,
++                                    unsigned priority, uint64_t chunk_limit,
++                                    struct radeon_winsys_bo **out_bo)
++{
++   struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++   *out_bo = NULL;
++
++   if (!pointer || !size || size % 4096)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   if (!chunk_limit || chunk_limit > RADV_DARWIN_HOST_CHUNK || chunk_limit % 4096)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   if ((uintptr_t)pointer > UINTPTR_MAX - (size - 1))
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++   const uint64_t child_count = size / chunk_limit + !!(size % chunk_limit);
++   if (child_count > RADV_DARWIN_HOST_CHILDREN)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct radv_amdgpu_winsys_bo *bo = CALLOC_STRUCT(radv_amdgpu_winsys_bo);
++   if (!bo)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   bo->children = calloc(RADV_DARWIN_HOST_CHILDREN, sizeof(*bo->children));
++   if (!bo->children) {
++      FREE(bo);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   bo->base.size = size;
++   bo->base.is_virtual = false;
++   bo->base.initial_domain = RADEON_DOMAIN_GTT;
++   bo->base.obj_id = (uintptr_t)bo;
++   bo->priority = priority;
++   bo->cpu_map = pointer;
++
++   uint64_t vm_alignment = radv_amdgpu_get_optimal_vm_alignment(ws, size, ws->info.gart_page_size);
++   uint64_t va = 0;
++   int r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size, vm_alignment, 0,
++                                 &va, &bo->va_handle, AMDGPU_VA_RANGE_HIGH);
++   if (r) {
++      FREE(bo->children);
++      FREE(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   bo->base.va = va;
++
++   uint64_t offset = 0;
++   VkResult result = VK_SUCCESS;
++   while (offset < size) {
++      uint64_t chunk = MIN2(chunk_limit, size - offset);
++      struct radv_amdgpu_winsys_bo *child = NULL;
++      result = radv_amdgpu_host_child_from_ptr(ws, (uint8_t *)pointer + offset, chunk,
++                                               va + offset, priority, &child);
++      if (result != VK_SUCCESS)
++         goto fail;
++      bo->children[bo->child_count++] = child;
++      offset += chunk;
++   }
++
++   radv_amdgpu_log_bo(ws, bo, false);
++   *out_bo = &bo->base;
++   return VK_SUCCESS;
++fail:
++   radv_amdgpu_winsys_bo_destroy(_ws, &bo->base);
++   return result;
++}
+ #endif
+ 
+ static VkResult
+@@ -880,7 +1012,7 @@
+ {
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
+    if (bo->children)
+-      return NULL;
++      return bo->cpu_map;
+ 
+    /* Safeguard for the Quantic Dream layer skipping unmaps. */
+    if (bo->cpu_map && !use_fixed_addr)
+@@ -931,6 +1063,9 @@
+ {
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
+ 
++   if (bo->children && bo->cpu_map)
++      return;
++
+    /* Defense in depth against buggy apps. */
+    if (!bo->cpu_map && !replace)
+       return;
+@@ -980,6 +1115,11 @@
+                                struct radeon_winsys_bo **out_bo)
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++#ifdef HAVE_AMDGPU_DARWIN
++   if (size > RADV_DARWIN_HOST_CHUNK && ac_drm_darwin_kext(ws->dev, NULL))
++      return radv_amdgpu_host_composite_from_ptr(_ws, pointer, size, priority,
++                                                 RADV_DARWIN_HOST_CHUNK, out_bo);
++#endif
+    ac_drm_bo buf_handle;
+    struct radv_amdgpu_winsys_bo *bo;
+    uint64_t va;

@@ -1,0 +1,260 @@
+--- a/include/darwin/rdna4_native_abi.h
++++ b/include/darwin/rdna4_native_abi.h
+@@ -79,7 +79,16 @@
+     RDNA4N_SEL_SCANX_PRESENT  = 24, /* in: [0] instance (2) [1] tagged slot id [2] flags (0)   out: [0] present id [1] target frame [2] 0 */
+     RDNA4N_SEL_SCANX_STATUS   = 25, /* in: [0] instance (2)   struct out: rdna4n_scan_status (256 B; console_mc = A; slot ids tagged)   out: [0] M6 table generation [1] reuse_inuse_refused [2] restores | restore failures << 32 [3] write refusals | write failures << 32. A call IS the keep-alive. */
+     RDNA4N_SEL_SCANX_RELEASE  = 26, /* in: [0] instance (2)   out: [0] restore of A verified (1/0) [1] plane MC after; idempotent */
+-    RDNA4N_SEL_COUNT_1_11     = 27
++    RDNA4N_SEL_COUNT_1_11     = 27,
++    RDNA4N_SEL_BUFFER_COPY   = 27,
++    RDNA4N_SEL_BUFFER_FILL   = 28
++};
++
++#define RDNA4N_BUFFER_MAX_BYTES (1024u * 1024u)
++struct rdna4n_buffer_op {
++    uint32_t src_handle, dst_handle, pattern, flags;
++    uint64_t src_offset, dst_offset, length;
++    uint64_t reserved;
+ };
+ #define RDNA4N_SCANX_INSTANCE   2u
+ #define RDNA4N_SCANX_SLOT_TAG   0x20u
+@@ -193,6 +202,7 @@
+ #define RDNA4N_INFO_HUNG          (1u << 0)
+ #define RDNA4N_INFO_S1B_POSITIVE  (1u << 1)
+ #define RDNA4N_INFO_NATIVE_BOOT   (1u << 2)
++#define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
+ /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+  *   reserved[3] = RDNA4N_BUDGET_* flags
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -43,6 +43,9 @@
+ _Static_assert(offsetof(struct rdna4n_cs_ib, ip_type) == offsetof(struct drm_amdgpu_cs_chunk_ib, ip_type), "ib.ip");
+ _Static_assert(offsetof(struct rdna4n_cs_ib, ring) == offsetof(struct drm_amdgpu_cs_chunk_ib, ring), "ib.ring");
+ _Static_assert(sizeof(struct rdna4n_cs_in) == 32, "cs_in size");
++_Static_assert(sizeof(struct rdna4n_buffer_op) == 48, "buffer_op size");
++_Static_assert(offsetof(struct rdna4n_buffer_op, src_offset) == 16, "buffer_op offsets");
++_Static_assert(offsetof(struct rdna4n_buffer_op, reserved) == 40, "buffer_op reserved");
+ _Static_assert(sizeof(struct rdna4n_info) == 192, "info size");
+ _Static_assert(ACD_SEL_SCAN_QUERY == RDNA4N_SEL_SCAN_QUERY && ACD_SEL_SCAN_ACQUIRE == RDNA4N_SEL_SCAN_ACQUIRE &&
+                ACD_SEL_SCAN_REGISTER == RDNA4N_SEL_SCAN_REGISTER && ACD_SEL_SCAN_PRESENT == RDNA4N_SEL_SCAN_PRESENT &&
+@@ -75,6 +78,7 @@
+    struct acd_kext_ops ops;
+    void *ctx;
+    atomic_bool submit_lost;
++   atomic_int buffer_support;
+ };
+ 
+ /* G6: the service class of the RDNA4N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+@@ -112,6 +116,7 @@
+    k->ops = *ops;
+    k->ctx = ctx;
+    atomic_init(&k->submit_lost, false);
++   atomic_init(&k->buffer_support, 0);
+    return k;
+ }
+ 
+@@ -157,7 +162,8 @@
+    case ACD_KR_NOT_FOUND:
+       return -ENOENT;
+    case ACD_KR_UNSUPPORTED:
+-      return sel == ACD_SEL_HELLO ? -ENODEV : -EINVAL;
++      return sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_FILL ? -ENOSYS :
++             sel == ACD_SEL_HELLO ? -ENODEV : -EINVAL;
+    case ACD_KR_NO_MEMORY:
+    case ACD_KR_NO_RESOURCES:
+       return -ENOMEM;
+@@ -166,6 +172,9 @@
+    case ACD_KR_EXCLUSIVE_ACCESS:
+       return -EBUSY;
+    case ACD_KR_NOT_PRIVILEGED:
++      if (sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_FILL)
++         return -ENOSYS;
++      return -EACCES;
+    case ACD_KR_NOT_PERMITTED:
+       return -EACCES;
+    case ACD_KR_TIMEOUT:
+@@ -584,6 +593,71 @@
+ }
+ 
+ int
++acd_kext_buffer_op(struct acd_kext *k, const struct rdna4n_buffer_op *op, bool fill, uint64_t *seq)
++{
++   if (!seq)
++      return -EINVAL;
++   *seq = 0;
++   if (!k || !op || !op->dst_handle || op->flags || op->reserved || !op->length ||
++       op->length > RDNA4N_BUFFER_MAX_BYTES || ((op->src_offset | op->dst_offset | op->length) & 3) ||
++       op->dst_offset > UINT64_MAX - op->length || op->src_offset > UINT64_MAX - op->length)
++      return -EINVAL;
++   if (fill ? (op->src_handle || op->src_offset) : (!op->src_handle || op->pattern))
++      return -EINVAL;
++   if (!fill && op->src_handle == op->dst_handle &&
++       op->src_offset < op->dst_offset + op->length && op->dst_offset < op->src_offset + op->length)
++      return -EINVAL;
++   if (atomic_load(&k->submit_lost))
++      return -ECANCELED;
++   int support = atomic_load(&k->buffer_support);
++   if (!support) {
++      struct rdna4n_info info;
++      int r = acd_kext_query_info(k, &info);
++      if (r)
++         return r;
++      support = info.flags & RDNA4N_INFO_BUFFER_OPS ? 1 : -1;
++      atomic_store(&k->buffer_support, support);
++   }
++   if (support < 0)
++      return -ENOSYS;
++   uint64_t out = 0;
++   uint32_t nout = 1;
++   acd_sfence();
++   int r = kcall(k, fill ? RDNA4N_SEL_BUFFER_FILL : RDNA4N_SEL_BUFFER_COPY,
++                 NULL, 0, op, sizeof(*op), &out, &nout, NULL, NULL);
++   if (r)
++      return r;
++   if (nout != 1 || !out) {
++      acd_kext_abort_submissions(k);
++      return -ECANCELED;
++   }
++   *seq = out;
++   return 0;
++}
++
++int
++acd_kext_buffer_wait(struct acd_kext *k, uint64_t seq, uint64_t timeout_ns, bool *busy)
++{
++   if (!busy)
++      return -EINVAL;
++   *busy = true;
++   if (!k || !seq)
++      return -EINVAL;
++   if (atomic_load(&k->submit_lost))
++      return -ECANCELED;
++   struct acd_wait_status status = {0};
++   int r = acd_kext_wait_seq(k, seq, timeout_ns, busy, &status);
++   if (r)
++      return r;
++   if (status.emitted < seq || status.retired > status.emitted || (!*busy && status.retired < seq)) {
++      *busy = true;
++      acd_kext_abort_submissions(k);
++      return -ECANCELED;
++   }
++   return 0;
++}
++
++int
+ acd_kext_wait_seq(struct acd_kext *k, uint64_t seq, uint64_t rel_ns, bool *busy, struct acd_wait_status *st)
+ {
+    if (rel_ns > RDNA4N_WAIT_CAP_NS)
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -191,6 +191,9 @@
+    uint64_t retired, emitted;
+ };
+ /* One WaitSeq call, relative ns (capped to 2 s here as in the kernel). *busy 0/1. */
++int acd_kext_buffer_op(struct acd_kext *k, const struct rdna4n_buffer_op *op, bool fill, uint64_t *seq);
++int acd_kext_buffer_wait(struct acd_kext *k, uint64_t seq, uint64_t timeout_ns, bool *busy);
++
+ int acd_kext_wait_seq(struct acd_kext *k, uint64_t seq, uint64_t rel_ns, bool *busy,
+                       struct acd_wait_status *st);
+ /* Loops WaitSeq in <= 2 s slices to an absolute CLOCK_MONOTONIC deadline
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+@@ -161,3 +161,74 @@
+    }
+    return r;
+ }
++
++static int
++buffer_kext(VkDevice _dev, struct acd_kext **k)
++{
++   VK_FROM_HANDLE(radv_device, device, _dev);
++   if (!device)
++      return -EINVAL;
++   if (vk_device_is_lost_no_report(&device->vk))
++      return -ECANCELED;
++   *k = ac_drm_darwin_kext(radv_amdgpu_winsys(device->ws)->dev, NULL);
++   return *k ? 0 : -ENOSYS;
++}
++
++static int
++buffer_handle(VkDevice _dev, VkDeviceMemory _mem, uint64_t offset, uint64_t size, uint32_t *handle)
++{
++   VK_FROM_HANDLE(radv_device, device, _dev);
++   VK_FROM_HANDLE(radv_device_memory, mem, _mem);
++   if (!device || !mem || mem->base.device != &device->vk || !mem->bo || mem->bo->is_virtual ||
++       mem->user_ptr || mem->import_handle_type || !size || size > RDNA4N_BUFFER_MAX_BYTES ||
++       ((offset | size) & 3) || offset > mem->alloc_size || size > mem->alloc_size - offset ||
++       offset > mem->bo->size || size > mem->bo->size - offset)
++      return -EINVAL;
++   *handle = radv_amdgpu_winsys_bo(mem->bo)->bo_handle;
++   return *handle ? 0 : -EINVAL;
++}
++
++API int
++radv_darwin_buffer_copy(VkDevice dev, VkDeviceMemory src, uint64_t src_offset,
++                        VkDeviceMemory dst, uint64_t dst_offset, uint64_t size, uint64_t *seq)
++{
++   if (!seq)
++      return -EINVAL;
++   *seq = 0;
++   struct acd_kext *k = NULL;
++   int r = buffer_kext(dev, &k);
++   if (r)
++      return r;
++   struct rdna4n_buffer_op op = {.src_offset = src_offset, .dst_offset = dst_offset, .length = size};
++   r = buffer_handle(dev, src, src_offset, size, &op.src_handle);
++   if (!r)
++      r = buffer_handle(dev, dst, dst_offset, size, &op.dst_handle);
++   return r ? r : acd_kext_buffer_op(k, &op, false, seq);
++}
++
++API int
++radv_darwin_buffer_fill(VkDevice dev, VkDeviceMemory dst, uint64_t dst_offset,
++                        uint64_t size, uint32_t pattern, uint64_t *seq)
++{
++   if (!seq)
++      return -EINVAL;
++   *seq = 0;
++   struct acd_kext *k = NULL;
++   int r = buffer_kext(dev, &k);
++   if (r)
++      return r;
++   struct rdna4n_buffer_op op = {.dst_offset = dst_offset, .length = size, .pattern = pattern};
++   r = buffer_handle(dev, dst, dst_offset, size, &op.dst_handle);
++   return r ? r : acd_kext_buffer_op(k, &op, true, seq);
++}
++
++API int
++radv_darwin_buffer_wait(VkDevice dev, uint64_t seq, uint64_t timeout_ns, bool *busy)
++{
++   if (!busy)
++      return -EINVAL;
++   *busy = true;
++   struct acd_kext *k = NULL;
++   int r = buffer_kext(dev, &k);
++   return r ? r : acd_kext_buffer_wait(k, seq, timeout_ns, busy);
++}
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+@@ -11,6 +11,7 @@
+ #define RADV_DARWIN_SCANOUT_H
+ 
+ #include <vulkan/vulkan.h>
++#include <stdbool.h>
+ #include "rdna4_native_abi.h"
+ 
+ #ifdef __cplusplus
+@@ -44,6 +45,12 @@
+  * vkCreateInstance (the connection is opened when the physical devices are enumerated); it is process-wide. No VkDevice is needed. */
+ int radv_darwin_set_service_class(const char *cls);
+ 
++int radv_darwin_buffer_copy(VkDevice dev, VkDeviceMemory src, uint64_t src_offset,
++                            VkDeviceMemory dst, uint64_t dst_offset, uint64_t size, uint64_t *seq);
++int radv_darwin_buffer_fill(VkDevice dev, VkDeviceMemory dst, uint64_t dst_offset,
++                            uint64_t size, uint32_t pattern, uint64_t *seq);
++int radv_darwin_buffer_wait(VkDevice dev, uint64_t seq, uint64_t timeout_ns, bool *busy);
++
+ #ifdef __cplusplus
+ }
+ #endif

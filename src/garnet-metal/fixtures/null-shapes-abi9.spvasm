@@ -1,0 +1,126 @@
+; Synthetic reflection fixture for ABI 9 shape extraction. It is not a
+; pipeline shader; spirv-as only needs to encode the declarations.
+OpCapability Shader
+OpCapability RuntimeDescriptorArray
+OpCapability SampledBuffer
+OpCapability ImageBuffer
+OpCapability UniformTexelBufferArrayDynamicIndexing
+OpCapability StorageTexelBufferArrayDynamicIndexing
+OpCapability UniformTexelBufferArrayNonUniformIndexing
+OpCapability StorageTexelBufferArrayNonUniformIndexing
+OpExtension "SPV_EXT_descriptor_indexing"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+OpDecorate %sampled_2d DescriptorSet 2
+OpDecorate %sampled_2d Binding 0
+OpDecorate %sampled_2d_array DescriptorSet 2
+OpDecorate %sampled_2d_array Binding 0
+OpDecorate %sampled_2d_ms DescriptorSet 2
+OpDecorate %sampled_2d_ms Binding 0
+OpDecorate %sampled_2d_ms_array DescriptorSet 2
+OpDecorate %sampled_2d_ms_array Binding 0
+OpDecorate %depth_2d DescriptorSet 2
+OpDecorate %depth_2d Binding 0
+OpDecorate %depth_2d_array DescriptorSet 2
+OpDecorate %depth_2d_array Binding 0
+OpDecorate %storage_2d DescriptorSet 3
+OpDecorate %storage_2d Binding 0
+OpDecorate %storage_2d_array DescriptorSet 3
+OpDecorate %storage_2d_array Binding 0
+OpDecorate %storage_3d DescriptorSet 3
+OpDecorate %storage_3d Binding 0
+OpDecorate %sampled_buffer_float DescriptorSet 2
+OpDecorate %sampled_buffer_float Binding 1
+OpDecorate %sampled_buffer_uint DescriptorSet 2
+OpDecorate %sampled_buffer_uint Binding 1
+OpDecorate %sampled_buffer_sint DescriptorSet 2
+OpDecorate %sampled_buffer_sint Binding 1
+OpDecorate %storage_buffer_float DescriptorSet 3
+OpDecorate %storage_buffer_float Binding 1
+OpDecorate %storage_buffer_uint DescriptorSet 3
+OpDecorate %storage_buffer_uint Binding 1
+OpDecorate %storage_buffer_sint DescriptorSet 3
+OpDecorate %storage_buffer_sint Binding 1
+OpDecorate %direct_2d DescriptorSet 2
+OpDecorate %direct_2d Binding 32
+
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%sint = OpTypeInt 32 1
+
+%sampled_image_2d = OpTypeImage %float 2D 0 0 0 1 Unknown
+%sampled_image_2d_array = OpTypeImage %float 2D 0 1 0 1 Unknown
+%sampled_image_2d_ms = OpTypeImage %float 2D 0 0 1 1 Unknown
+%sampled_image_2d_ms_array = OpTypeImage %float 2D 0 1 1 1 Unknown
+%sampled_depth_2d = OpTypeImage %float 2D 1 0 0 1 Unknown
+%sampled_depth_2d_array = OpTypeImage %float 2D 1 1 0 1 Unknown
+%storage_image_2d = OpTypeImage %float 2D 0 0 0 2 R32f
+%storage_image_2d_array = OpTypeImage %uint 2D 0 1 0 2 R32ui
+%storage_image_3d = OpTypeImage %uint 3D 0 0 0 2 R32ui
+%sampled_buffer_float_image = OpTypeImage %float Buffer 0 0 0 1 Unknown
+%sampled_buffer_uint_image = OpTypeImage %uint Buffer 0 0 0 1 Unknown
+%sampled_buffer_sint_image = OpTypeImage %sint Buffer 0 0 0 1 Unknown
+%storage_buffer_float_image = OpTypeImage %float Buffer 0 0 0 2 R32f
+%storage_buffer_uint_image = OpTypeImage %uint Buffer 0 0 0 2 R32ui
+%storage_buffer_sint_image = OpTypeImage %sint Buffer 0 0 0 2 R32i
+
+%sampled_2d_type = OpTypeRuntimeArray %sampled_image_2d
+%sampled_2d_array_type = OpTypeRuntimeArray %sampled_image_2d_array
+%sampled_2d_ms_type = OpTypeRuntimeArray %sampled_image_2d_ms
+%sampled_2d_ms_array_type = OpTypeRuntimeArray %sampled_image_2d_ms_array
+%depth_2d_type = OpTypeRuntimeArray %sampled_depth_2d
+%depth_2d_array_type = OpTypeRuntimeArray %sampled_depth_2d_array
+%storage_2d_type = OpTypeRuntimeArray %storage_image_2d
+%storage_2d_array_type = OpTypeRuntimeArray %storage_image_2d_array
+%storage_3d_type = OpTypeRuntimeArray %storage_image_3d
+%sampled_buffer_float_type = OpTypeRuntimeArray %sampled_buffer_float_image
+%sampled_buffer_uint_type = OpTypeRuntimeArray %sampled_buffer_uint_image
+%sampled_buffer_sint_type = OpTypeRuntimeArray %sampled_buffer_sint_image
+%storage_buffer_float_type = OpTypeRuntimeArray %storage_buffer_float_image
+%storage_buffer_uint_type = OpTypeRuntimeArray %storage_buffer_uint_image
+%storage_buffer_sint_type = OpTypeRuntimeArray %storage_buffer_sint_image
+%direct_2d_type = OpTypeRuntimeArray %sampled_image_2d
+
+%uniform_constant = OpConstant %uint 0
+%sampled_2d_ptr = OpTypePointer UniformConstant %sampled_2d_type
+%sampled_2d_array_ptr = OpTypePointer UniformConstant %sampled_2d_array_type
+%sampled_2d_ms_ptr = OpTypePointer UniformConstant %sampled_2d_ms_type
+%sampled_2d_ms_array_ptr = OpTypePointer UniformConstant %sampled_2d_ms_array_type
+%depth_2d_ptr = OpTypePointer UniformConstant %depth_2d_type
+%depth_2d_array_ptr = OpTypePointer UniformConstant %depth_2d_array_type
+%storage_2d_ptr = OpTypePointer UniformConstant %storage_2d_type
+%storage_2d_array_ptr = OpTypePointer UniformConstant %storage_2d_array_type
+%storage_3d_ptr = OpTypePointer UniformConstant %storage_3d_type
+%sampled_buffer_float_ptr = OpTypePointer UniformConstant %sampled_buffer_float_type
+%sampled_buffer_uint_ptr = OpTypePointer UniformConstant %sampled_buffer_uint_type
+%sampled_buffer_sint_ptr = OpTypePointer UniformConstant %sampled_buffer_sint_type
+%storage_buffer_float_ptr = OpTypePointer UniformConstant %storage_buffer_float_type
+%storage_buffer_uint_ptr = OpTypePointer UniformConstant %storage_buffer_uint_type
+%storage_buffer_sint_ptr = OpTypePointer UniformConstant %storage_buffer_sint_type
+%direct_2d_ptr = OpTypePointer UniformConstant %direct_2d_type
+
+%sampled_2d = OpVariable %sampled_2d_ptr UniformConstant
+%sampled_2d_array = OpVariable %sampled_2d_array_ptr UniformConstant
+%sampled_2d_ms = OpVariable %sampled_2d_ms_ptr UniformConstant
+%sampled_2d_ms_array = OpVariable %sampled_2d_ms_array_ptr UniformConstant
+%depth_2d = OpVariable %depth_2d_ptr UniformConstant
+%depth_2d_array = OpVariable %depth_2d_array_ptr UniformConstant
+%storage_2d = OpVariable %storage_2d_ptr UniformConstant
+%storage_2d_array = OpVariable %storage_2d_array_ptr UniformConstant
+%storage_3d = OpVariable %storage_3d_ptr UniformConstant
+%sampled_buffer_float = OpVariable %sampled_buffer_float_ptr UniformConstant
+%sampled_buffer_uint = OpVariable %sampled_buffer_uint_ptr UniformConstant
+%sampled_buffer_sint = OpVariable %sampled_buffer_sint_ptr UniformConstant
+%storage_buffer_float = OpVariable %storage_buffer_float_ptr UniformConstant
+%storage_buffer_uint = OpVariable %storage_buffer_uint_ptr UniformConstant
+%storage_buffer_sint = OpVariable %storage_buffer_sint_ptr UniformConstant
+%direct_2d = OpVariable %direct_2d_ptr UniformConstant
+
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd

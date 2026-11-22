@@ -1,0 +1,515 @@
+--- a/src/native/ir/mod.rs
++++ b/src/native/ir/mod.rs
+@@ -11,6 +11,7 @@
+ mod parse;
+ mod pointer_pointees;
+ mod raw_buffer;
++mod sampler_stores;
+ mod static_init;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+--- a/src/native/ir/parse.rs
++++ b/src/native/ir/parse.rs
+@@ -264,6 +264,7 @@
+             call_connected_raw_params: HashSet::new(),
+             param_connected_raw_params: HashSet::new(),
+         };
++        module.validate_sampler_stores(ll, kern)?;
+         module.infer_metadata_buffer_pointees(kern, entry_name);
+         module.infer_pointer_pointees();
+         if primitive_phi_metadata {
+--- /dev/null
++++ b/src/native/ir/sampler_stores.rs
+@@ -0,0 +1,227 @@
++//! MSL 2.1 section 2.12.1 forbids copying a thread/constexpr sampler to device memory.
++
++use super::*;
++use crate::native::tir::{RetEmit, TirOperand};
++
++type Origins = HashSet<usize>;
++const STATIC_SAMPLER: usize = usize::MAX;
++
++#[derive(Clone, Default, PartialEq, Eq)]
++struct Summary {
++    returned: Origins,
++    stored: Origins,
++}
++
++fn origins(value: &LlValue, values: &HashMap<String, Origins>) -> Origins {
++    match value {
++        LlValue::Local(name) => values.get(name).cloned().unwrap_or_default(),
++        LlValue::Global(name) if meta::is_static_sampler_global(name) => {
++            HashSet::from([STATIC_SAMPLER])
++        }
++        LlValue::Struct(values_) | LlValue::Array(values_) | LlValue::Vector(values_) => values_
++            .iter()
++            .flat_map(|value| origins(&value.value, values))
++            .collect(),
++        _ => Origins::new(),
++    }
++}
++
++fn substitute(
++    summary: &Origins,
++    args: &[TypedValue],
++    values: &HashMap<String, Origins>,
++) -> Origins {
++    summary
++        .iter()
++        .flat_map(|index| {
++            if *index == STATIC_SAMPLER {
++                HashSet::from([STATIC_SAMPLER])
++            } else {
++                args.get(*index)
++                    .map(|arg| origins(&arg.value, values))
++                    .unwrap_or_default()
++            }
++        })
++        .collect()
++}
++
++fn summarize(function: &LlFunction, summaries: &HashMap<String, Summary>) -> Summary {
++    let mut values = function
++        .params
++        .iter()
++        .enumerate()
++        .map(|(index, (name, _))| (name.clone(), HashSet::from([index])))
++        .collect::<HashMap<_, _>>();
++    let mut summary = Summary::default();
++    let mut local_stores = HashMap::<String, Origins>::new();
++    loop {
++        let mut changed = false;
++        for instruction in function.carrier_insts() {
++            if let Some(store) = instruction.store() {
++                let (object, pointer) = store.as_ref();
++                if matches!(pointer.ty, LlType::Ptr(1)) {
++                    summary.stored.extend(origins(&object.value, &values));
++                } else if matches!(pointer.ty, LlType::Ptr(0)) {
++                    if let LlValue::Local(name) = &pointer.value {
++                        let stored = local_stores.entry(name.clone()).or_default();
++                        let before = stored.len();
++                        stored.extend(origins(&object.value, &values));
++                        changed |= before != stored.len();
++                    }
++                }
++            }
++            let incoming = if let Some(call) = instruction.call() {
++                if let Some(callee) = summaries.get(&call.callee) {
++                    summary
++                        .stored
++                        .extend(substitute(&callee.stored, &call.args, &values));
++                    substitute(&callee.returned, &call.args, &values)
++                } else {
++                    Origins::new()
++                }
++            } else if let Some(load) = instruction.load() {
++                match &load.ptr.value {
++                    LlValue::Local(name) if matches!(load.ptr.ty, LlType::Ptr(0)) => {
++                        local_stores.get(name).cloned().unwrap_or_default()
++                    }
++                    _ => Origins::new(),
++                }
++            } else if let Some(gep) = instruction.gep() {
++                origins(&gep.base.value, &values)
++            } else if let Some(incoming) = instruction.phi_values() {
++                incoming.flat_map(|value| origins(value, &values)).collect()
++            } else if matches!(
++                instruction.opcode.as_str(),
++                "bitcast" | "addrspacecast" | "ptrtoint" | "inttoptr" | "freeze" | "select"
++            ) {
++                instruction
++                    .operands
++                    .iter()
++                    .skip(usize::from(instruction.opcode.as_str() == "select"))
++                    .filter_map(TirOperand::as_typed_value)
++                    .flat_map(|value| origins(&value.value, &values))
++                    .collect()
++            } else {
++                Origins::new()
++            };
++            if let Some(result) = &instruction.result {
++                let known = values.entry(result.clone()).or_default();
++                let before = known.len();
++                known.extend(incoming);
++                changed |= before != known.len();
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    for block in &function.blocks {
++        if let Some(typed) = &block.typed {
++            if let RetEmit::Value(value) = &typed.ret {
++                summary.returned.extend(origins(&value.value, &values));
++            }
++        }
++    }
++    summary
++}
++
++impl LlModule {
++    pub(super) fn validate_sampler_stores(
++        &self,
++        ll: &str,
++        kern: Option<&meta::KernMeta>,
++    ) -> Result<(), String> {
++        if !ll.contains("\"air.sampler\"") && !ll.contains("__air_sampler_state") {
++            return Ok(());
++        }
++        let mut entries = Vec::new();
++        if let (Some(meta), Some(entry)) = (kern, meta::entry_name(ll, "kernel")) {
++            entries.push((
++                entry,
++                meta.roles
++                    .iter()
++                    .filter_map(|(index, role)| {
++                        matches!(role, meta::KernRole::Sampler(_)).then_some(*index as usize)
++                    })
++                    .collect::<Origins>(),
++            ));
++        }
++        if let (Some(meta), Some(entry)) = (
++            meta::parse_air_vertex_meta(ll),
++            meta::entry_name(ll, "vertex"),
++        ) {
++            entries.push((
++                entry,
++                meta.roles
++                    .iter()
++                    .filter_map(|(index, role)| {
++                        matches!(role, meta::VertRole::Sampler(_)).then_some(*index as usize)
++                    })
++                    .collect(),
++            ));
++        }
++        if let (Some(meta), Some(entry)) = (
++            meta::parse_air_fragment_meta(ll),
++            meta::entry_name(ll, "fragment"),
++        ) {
++            entries.push((
++                entry,
++                meta.roles
++                    .iter()
++                    .filter_map(|(index, role)| {
++                        matches!(role, meta::FragRole::Sampler(_)).then_some(*index as usize)
++                    })
++                    .collect(),
++            ));
++        }
++        // Symbolic parameter origins keep helper calls independent: a legal device-loaded argument
++        // does not inherit the thread origin of a different call to the same helper.
++        let mut summaries = HashMap::new();
++        loop {
++            let mut changed = false;
++            for function in &self.functions {
++                let summary = summarize(function, &summaries);
++                if summaries.get(&function.name) != Some(&summary) {
++                    summaries.insert(function.name.clone(), summary);
++                    changed = true;
++                }
++            }
++            if !changed {
++                break;
++            }
++        }
++        for (entry, mut forbidden) in entries {
++            forbidden.insert(STATIC_SAMPLER);
++            if summaries
++                .get(&entry)
++                .is_some_and(|summary| !summary.stored.is_disjoint(&forbidden))
++            {
++                return Err("MSL 2.1 section 2.12.1: thread/constexpr sampler cannot be copied to device memory; copy directly from another argument buffer".into());
++            }
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn helper_returns_keep_call_site_sampler_origins_separate() {
++        let source = include_str!("../../../garnetxlate/tests/fixtures/argument_device_resource_copy.ll")
++            .replace("ptr addrspace(1) %observed)", "ptr addrspace(1) %observed, ptr addrspace(2) %thread_sampler)")
++            .replace("  %element =", "  %unused = call ptr addrspace(2) @identity(ptr addrspace(2) %thread_sampler)\n  %element =")
++            .replace("  store ptr addrspace(2) %sampler,", "  %forward = call ptr addrspace(2) @identity(ptr addrspace(2) %sampler)\n  store ptr addrspace(2) %forward,")
++            .replace("!2 = !{!3, !4, !5, !9}", "!2 = !{!3, !4, !5, !9, !11}")
++            + "\n!11 = !{i32 4, !\"air.sampler\", !\"air.location_index\", i32 12, i32 1, !\"air.arg_type_name\", !\"sampler\", !\"air.arg_name\", !\"thread_sampler\"}\ndefine internal ptr addrspace(2) @identity(ptr addrspace(2) %value) {\nentry:\n  ret ptr addrspace(2) %value\n}\n";
++        LlModule::parse(&source).expect("legal copy inherited the unrelated call's thread origin");
++        let illegal = source.replace(
++            "@identity(ptr addrspace(2) %sampler)",
++            "@identity(ptr addrspace(2) %thread_sampler)",
++        );
++        assert!(LlModule::parse(&illegal)
++            .unwrap_err()
++            .contains("MSL 2.1 section 2.12.1"));
++    }
++}
+--- /dev/null
++++ b/garnetxlate/tests/sampler_copy.rs
+@@ -0,0 +1,228 @@
++use std::collections::{HashMap, HashSet};
++
++const THREAD: &str = include_str!("fixtures/argument_sampler_thread_store.ll");
++const DEVICE: &str = include_str!("fixtures/argument_device_resource_copy.ll");
++const RULE: &str = "MSL 2.1 section 2.12.1: thread/constexpr sampler";
++
++fn translate_via_c_abi8(source: &str) -> Vec<u8> {
++    let mut spirv = std::ptr::null_mut();
++    let mut metadata = std::ptr::null_mut();
++    let mut spirv_len = 0;
++    let mut metadata_len = 0;
++    let mut error = [0i8; 512];
++    let local = [2, 1, 1];
++    let status = unsafe {
++        garnetxlate::garnetx_translate(
++            source.as_ptr(),
++            source.len(),
++            local.as_ptr(),
++            &mut spirv,
++            &mut spirv_len,
++            &mut metadata,
++            &mut metadata_len,
++            error.as_mut_ptr(),
++            error.len(),
++        )
++    };
++    assert_eq!(
++        status,
++        garnetxlate::RC_OK,
++        "{}",
++        unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
++    );
++    assert!(!spirv.is_null() && !metadata.is_null());
++    let bytes = unsafe { std::slice::from_raw_parts(spirv, spirv_len) }.to_vec();
++    let reflected: serde_json::Value =
++        serde_json::from_slice(unsafe { std::slice::from_raw_parts(metadata, metadata_len) })
++            .unwrap();
++    assert_eq!(reflected["normalized_sampler_coordinates"], true);
++    unsafe {
++        garnetxlate::garnetx_free(spirv, spirv_len);
++        garnetxlate::garnetx_free(metadata, metadata_len);
++    }
++    bytes
++}
++
++fn illegal_sources() -> Vec<(&'static str, String)> {
++    let constexpr = THREAD.replace("ptr addrspace(2) %input, ptr addrspace(1) %slot", "ptr addrspace(2) @__air_sampler_state, ptr addrspace(1) %slot")
++        + "\n@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601017929, i64 0], align 8\n!air.sampler_states = !{!8}\n!8 = !{!\"air.sampler_state\", ptr addrspace(2) @__air_sampler_state}\n";
++    let freeze = THREAD
++        .replace(
++            "  store ptr",
++            "  %forward = freeze ptr addrspace(2) %input\n  store ptr",
++        )
++        .replace(
++            "store ptr addrspace(2) %input",
++            "store ptr addrspace(2) %forward",
++        );
++    let select = THREAD.replace("  store ptr", "  %forward = select i1 true, ptr addrspace(2) %input, ptr addrspace(2) %input\n  store ptr")
++        .replace("store ptr addrspace(2) %input", "store ptr addrspace(2) %forward");
++    let phi = THREAD.replace("  store ptr", "  br i1 true, label %left, label %right\nleft:\n  br label %merge\nright:\n  br label %merge\nmerge:\n  %forward = phi ptr addrspace(2) [ %input, %left ], [ %input, %right ]\n  store ptr")
++        .replace("store ptr addrspace(2) %input", "store ptr addrspace(2) %forward");
++    let helper = THREAD.replace("  store ptr addrspace(2) %input, ptr addrspace(1) %slot, align 8", "  call void @sink(ptr addrspace(1) %slot, ptr addrspace(2) %input)")
++        + "\ndefine internal void @sink(ptr addrspace(1) %dst, ptr addrspace(2) %s) {\nentry:\n  store ptr addrspace(2) %s, ptr addrspace(1) %dst, align 8\n  ret void\n}\n";
++    let returned = THREAD.replace("  store ptr", "  %forward = call ptr addrspace(2) @identity(ptr addrspace(2) %input)\n  store ptr")
++        .replace("store ptr addrspace(2) %input", "store ptr addrspace(2) %forward")
++        + "\ndefine internal ptr addrspace(2) @identity(ptr addrspace(2) %s) {\nentry:\n  ret ptr addrspace(2) %s\n}\n";
++    let spilled = THREAD.replace("  store ptr", "  %local = alloca ptr addrspace(2), align 8\n  store ptr addrspace(2) %input, ptr %local, align 8\n  %forward = load ptr addrspace(2), ptr %local, align 8\n  store ptr")
++        .replace("store ptr addrspace(2) %input, ptr addrspace(1)", "store ptr addrspace(2) %forward, ptr addrspace(1)");
++    let integer = THREAD.replace(
++        "  store ptr addrspace(2) %input,",
++        "  %forward = ptrtoint ptr addrspace(2) %input to i64\n  store i64 %forward,",
++    );
++    let static_gep = constexpr.replace("  store ptr", "  %forward = getelementptr [2 x i64], ptr addrspace(2) @__air_sampler_state, i64 0, i64 0\n  store ptr")
++        .replace("store ptr addrspace(2) @__air_sampler_state,", "store ptr addrspace(2) %forward,");
++    vec![
++        ("parameter", THREAD.into()),
++        ("constexpr", constexpr),
++        ("freeze", freeze),
++        ("select", select),
++        ("phi", phi),
++        ("helper-store", helper),
++        ("helper-return", returned),
++        ("thread-spill", spilled),
++        ("integer-token", integer),
++        ("constexpr-gep", static_gep),
++    ]
++}
++
++#[test]
++fn illegal_sampler_origins_have_the_source_rule_error() {
++    for (name, source) in illegal_sources() {
++        let error = garnetxlate::translate_text(&source, [1, 1, 1]).unwrap_err();
++        assert!(error.contains(RULE), "{name}: {error}");
++        if let Some(evidence) = std::env::var_os("SAMPLER_COPY_EVIDENCE") {
++            let evidence = std::path::PathBuf::from(evidence);
++            std::fs::create_dir_all(&evidence).unwrap();
++            std::fs::write(evidence.join(format!("illegal-{name}.ll")), source).unwrap();
++            std::fs::write(evidence.join(format!("illegal-{name}.txt")), error).unwrap();
++        }
++    }
++}
++
++#[test]
++fn c_abi_refusal_publishes_neither_spirv_nor_reflection() {
++    for (name, source) in illegal_sources() {
++        let mut spirv = std::ptr::dangling_mut();
++        let mut metadata = std::ptr::dangling_mut();
++        let mut spirv_len = 123;
++        let mut metadata_len = 456;
++        let mut error = [0i8; 512];
++        let local = [1, 1, 1];
++        let status = unsafe {
++            garnetxlate::garnetx_translate(
++                source.as_ptr(),
++                source.len(),
++                local.as_ptr(),
++                &mut spirv,
++                &mut spirv_len,
++                &mut metadata,
++                &mut metadata_len,
++                error.as_mut_ptr(),
++                error.len(),
++            )
++        };
++        assert_eq!(status, garnetxlate::RC_REFUSED, "{name}");
++        assert!(spirv.is_null() && metadata.is_null(), "{name}");
++        assert_eq!((spirv_len, metadata_len), (0, 0), "{name}");
++        let error = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
++            .to_str()
++            .unwrap();
++        assert!(error.contains(RULE), "{name}: {error}");
++    }
++}
++
++#[test]
++fn argument_buffer_sampler_copy_preserves_each_loaded_token_word() {
++    for address_space in [1, 2] {
++        let mut source = DEVICE.replace(
++            "ptr addrspace(2) %source",
++            &format!("ptr addrspace({address_space}) %source"),
++        );
++        for field in ["texture_source", "sampler_source", "data_source"] {
++            source = source.replace(
++                &format!("ptr addrspace(2) %{field}"),
++                &format!("ptr addrspace({address_space}) %{field}"),
++            );
++        }
++        source = source.replace(
++            "!\"air.read\", !\"air.address_space\", i32 2, !\"air.struct_type_info\"",
++            &format!("!\"air.read\", !\"air.address_space\", i32 {address_space}, !\"air.struct_type_info\""),
++        );
++        let spirv = translate_via_c_abi8(&source);
++        let directory = std::env::temp_dir().join(format!(
++            "rdna4-sampler-copy-{}-{address_space}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let path = directory.join("copy.spv");
++        std::fs::write(&path, spirv).unwrap();
++        let validated = std::process::Command::new("spirv-val")
++            .args(["--target-env", "vulkan1.2"])
++            .arg(&path)
++            .output()
++            .unwrap();
++        assert!(
++            validated.status.success(),
++            "{}",
++            String::from_utf8_lossy(&validated.stderr)
++        );
++        let disassembled = std::process::Command::new("spirv-dis")
++            .arg(&path)
++            .output()
++            .unwrap();
++        assert!(disassembled.status.success());
++        let text = String::from_utf8(disassembled.stdout).unwrap();
++        let mut definitions = HashMap::<String, Vec<String>>::new();
++        let mut stores = HashSet::new();
++        for line in text.lines() {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            if words.get(1) == Some(&"=") {
++                definitions.insert(
++                    words[0].into(),
++                    words[2..].iter().map(|word| (*word).into()).collect(),
++                );
++            }
++            if words.first() == Some(&"OpStore") {
++                stores.insert(words[2].to_owned());
++            }
++        }
++        let mut halves = HashMap::<String, u8>::new();
++        for stored in stores {
++            let Some(conversion) = definitions.get(&stored) else {
++                continue;
++            };
++            if conversion.first().map(String::as_str) != Some("OpUConvert") {
++                continue;
++            }
++            let source = &conversion[2];
++            let Some(definition) = definitions.get(source) else {
++                continue;
++            };
++            match definition[0].as_str() {
++                "OpBitwiseOr" => *halves.entry(source.clone()).or_default() |= 1,
++                "OpShiftRightLogical" if definition[3] == "%ulong_32" => {
++                    *halves.entry(definition[2].clone()).or_default() |= 2;
++                }
++                _ => {}
++            }
++        }
++        assert!(text.contains("PhysicalStorageBuffer64"), "{text}");
++        assert!(
++            halves.values().filter(|mask| **mask == 3).count() >= 3,
++            "texture/sampler copy must store both halves of each token: {text}"
++        );
++        if let Some(evidence) = std::env::var_os("SAMPLER_COPY_EVIDENCE") {
++            let evidence = std::path::PathBuf::from(evidence);
++            std::fs::create_dir_all(&evidence).unwrap();
++            std::fs::copy(&path, evidence.join(format!("copy-as{address_space}.spv"))).unwrap();
++            std::fs::write(
++                evidence.join(format!("copy-as{address_space}.spvasm")),
++                text,
++            )
++            .unwrap();
++            std::fs::write(evidence.join(format!("copy-as{address_space}.ll")), source).unwrap();
++        }
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++}
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/sampler-copy-controls.metal
+@@ -0,0 +1,31 @@
++#include <metal_stdlib>
++using namespace metal;
++
++struct SamplerArgs {
++    array<sampler, 2> filters [[id(0)]];
++};
++
++// Compile each control separately with -std=macos-metal2.1. The default translation unit is legal.
++#if defined(CONTROL_THREAD)
++kernel void sampler_copy_control(device SamplerArgs &dst [[buffer(0)]],
++                                 sampler input [[sampler(0)]]) {
++    dst.filters[0] = input;
++}
++#elif defined(CONTROL_CONSTEXPR)
++kernel void sampler_copy_control(device SamplerArgs &dst [[buffer(0)]]) {
++    constexpr sampler local(coord::normalized, filter::nearest);
++    dst.filters[0] = local;
++}
++#else
++kernel void sampler_copy_device(device SamplerArgs &dst [[buffer(0)]],
++                                const device SamplerArgs &src [[buffer(1)]],
++                                uint index [[thread_position_in_grid]]) {
++    dst.filters[index & 1] = src.filters[1 - (index & 1)];
++}
++
++kernel void sampler_copy_constant(device SamplerArgs &dst [[buffer(0)]],
++                                  constant SamplerArgs &src [[buffer(1)]],
++                                  uint index [[thread_position_in_grid]]) {
++    dst.filters[index & 1] = src.filters[1 - (index & 1)];
++}
++#endif

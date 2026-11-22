@@ -1,0 +1,464 @@
+Subject: [PATCH] Share pure GLSL math semantics for coordinate placement and uniformity
+
+Recognize arithmetic by instruction-set import, preserve module dependencies,
+and keep pure math loop bounds uniform. Do not speculate pointer-output or
+interpolation operations. Test multi-entry placement and varying loop rejection.
+
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -638,3 +638,10 @@
+ available and a conservative root span otherwise. Table ABI 9 and descriptor numbers are
+ unchanged; reflection 65 remains readable without the new field. Native cache identities
+ must change so old translations that lost roots are regenerated.
++
++Implicit argument sampling may recompute pure coordinate math at a legal uniform
++dominator. GLSL.std.450 arithmetic such as Fma is identified by its declared
++instruction-set import; pointer-output Modf/Frexp and invocation-dependent
++interpolation are not speculated. Source-coordinate facts still refer to the
++original coordinate at the original sample. This changes translation/cache
++semantics without changing reflection 66 or argument-table ABI 9.
+diff --git a/src/passes/resources/fragment_control.rs b/src/passes/resources/fragment_control.rs
+--- a/src/passes/resources/fragment_control.rs
++++ b/src/passes/resources/fragment_control.rs
+@@ -795,6 +795,7 @@
+     uniform_phi_predecessors: &HashSet<Word>,
+     callees: &[Word],
+ ) -> HashSet<Word> {
++    let math_imports = super::glsl_math::imports(module);
+     let readonly_aliases = uniform_memory::readonly_aliases(module, readonly_addresses);
+     let readonly_addresses = readonly_aliases.as_slice();
+     let mut roots = module
+@@ -945,6 +946,16 @@
+                     }
+                     Op::CopyObject | Op::Bitcast => (all_uniform(), pointer),
+                     Op::Load => (pointer, false),
++                    Op::ExtInst => (
++                        super::glsl_math::arguments(instruction, &math_imports).is_some_and(
++                            |args| {
++                                args.iter().all(
++                                    |arg| matches!(arg, Operand::IdRef(id) if uniform.contains(id)),
++                                )
++                            },
++                        ),
++                        false,
++                    ),
+                     Op::FunctionCall => (
+                         uniform_calls::result_is_uniform(
+                             instruction,
+diff --git a/src/passes/resources/glsl_math.rs b/src/passes/resources/glsl_math.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/glsl_math.rs
+@@ -0,0 +1,47 @@
++//! Shared value-only GLSL arithmetic semantics for uniformity and coordinate speculation.
++
++use super::*;
++use spirv::GlslStd450Op;
++
++pub(super) fn imports(module: &Module) -> HashSet<Word> {
++    module
++        .ext_inst_imports
++        .iter()
++        .filter_map(|import| {
++            (import.class.opcode == Op::ExtInstImport
++                && matches!(import.operands.as_slice(), [Operand::LiteralString(name)]
++                if name == "GLSL.std.450"))
++            .then_some(import.result_id)
++            .flatten()
++        })
++        .collect()
++}
++
++pub(super) fn arguments<'a>(
++    instruction: &'a Instruction,
++    imports: &HashSet<Word>,
++) -> Option<&'a [Operand]> {
++    if instruction.class.opcode != Op::ExtInst {
++        return None;
++    }
++    let [Operand::IdRef(set), Operand::LiteralExtInstInteger(opcode), arguments @ ..] =
++        instruction.operands.as_slice()
++    else {
++        return None;
++    };
++    if !imports.contains(set) {
++        return None;
++    }
++    let opcode = GlslStd450Op::from_u32(*opcode)?;
++    // Pointer-output operations write memory; interpolation depends on invocation state.
++    (!matches!(
++        opcode,
++        GlslStd450Op::Modf
++            | GlslStd450Op::Frexp
++            | GlslStd450Op::IMix
++            | GlslStd450Op::InterpolateAtCentroid
++            | GlslStd450Op::InterpolateAtSample
++            | GlslStd450Op::InterpolateAtOffset
++    ))
++    .then_some(arguments)
++}
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -8,6 +8,7 @@
+ mod collapse;
+ mod discovery;
+ pub(in crate::passes) mod fragment_control;
++mod glsl_math;
+ mod gpu_argument_graph;
+ mod gpu_arguments;
+ pub(in crate::passes) mod lod_query;
+diff --git a/src/passes/resources/quad_sampling/placement.rs b/src/passes/resources/quad_sampling/placement.rs
+--- a/src/passes/resources/quad_sampling/placement.rs
++++ b/src/passes/resources/quad_sampling/placement.rs
+@@ -13,6 +13,7 @@
+     owners: HashMap<Word, usize>,
+     external: HashSet<Word>,
+     immutable_inputs: HashSet<Word>,
++    math_imports: HashSet<Word>,
+     loops: Vec<(usize, usize)>,
+ }
+ 
+@@ -90,6 +91,7 @@
+             }
+         }
+         Ok(Self {
++            math_imports: super::super::glsl_math::imports(&ctx.module),
+             dominance: BlockDominance::of(&function.blocks),
+             owners: function
+                 .blocks
+@@ -106,6 +108,7 @@
+                 .module
+                 .types_global_values
+                 .iter()
++                .chain(&ctx.module.ext_inst_imports)
+                 .chain(&ctx.new_globals)
+                 .chain(&function.parameters)
+                 .filter_map(|instruction| instruction.result_id)
+@@ -182,7 +185,7 @@
+             if self.dominance.dominates(owner, target) {
+                 continue;
+             }
+-            if !can_speculate(instruction, &self.immutable_inputs) {
++            if !can_speculate(instruction, &self.immutable_inputs, &self.math_imports) {
+                 return Err(format!(
+                     "cannot safely recompute derivative coordinate dependency %{value} ({:?})",
+                     instruction.class.opcode
+@@ -259,10 +262,15 @@
+     }
+ }
+ 
+-fn can_speculate(instruction: &Instruction, immutable_inputs: &HashSet<Word>) -> bool {
++fn can_speculate(
++    instruction: &Instruction,
++    immutable_inputs: &HashSet<Word>,
++    math_imports: &HashSet<Word>,
++) -> bool {
+     match instruction.class.opcode {
+         Op::Load => matches!(instruction.operands.as_slice(), [Operand::IdRef(pointer)]
+         if immutable_inputs.contains(pointer)),
++        Op::ExtInst => super::super::glsl_math::arguments(instruction, math_imports).is_some(),
+         Op::CopyObject
+         | Op::CompositeConstruct
+         | Op::CompositeExtract
+diff --git a/src/passes/resources/quad_sampling/tests/entries.rs b/src/passes/resources/quad_sampling/tests/entries.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/quad_sampling/tests/entries.rs
+@@ -0,0 +1,102 @@
++use super::*;
++
++#[test]
++fn every_fragment_entry_is_lowered_without_changing_other_stage_or_dead_functions() {
++    let preamble = PREAMBLE
++        .replace(
++            "OpExecutionMode %main OriginUpperLeft",
++            "OpEntryPoint Fragment %other \"other\" %flat_input %position %sampled_var %table\n\
++             OpEntryPoint Vertex %vertex \"vertex\" %sampled_var %table\n\
++             OpEntryPoint GLCompute %compute \"compute\" %sampled_var %table\n\
++             OpExecutionMode %main OriginUpperLeft\n\
++             OpExecutionMode %other OriginUpperLeft\n\
++             OpExecutionMode %compute LocalSize 1 1 1",
++        )
++        .replace(
++            "%void = OpTypeVoid",
++            "OpDecorate %other_sampled NonUniform\n\
++             OpName %other \"other_fragment\"\n\
++             OpName %other_entry \"other_entry\"\n\
++             OpName %sample_arm \"sample_arm\"\n\
++             OpName %vertex \"vertex\"\n\
++             OpName %compute \"compute\"\n\
++             OpName %dead \"dead\"\n\
++             %void = OpTypeVoid",
++        );
++    let source = format!(
++        "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++%other = OpFunction %void None %fn
++%other_entry = OpLabel
++%pos = OpLoad %v4float %position
++%x = OpCompositeExtract %float %pos 0
++%condition = OpFOrdGreaterThan %bool %x %float_0
++OpSelectionMerge %sample_arm None
++OpBranchConditional %condition %discard %sample_arm
++%discard = OpLabel
++OpKill
++%sample_arm = OpLabel
++%other_sampled = OpLoad %sampled_type %sampled_var
++%other_color = OpImageSampleImplicitLod %v4float %other_sampled %coord
++OpReturn
++OpFunctionEnd
++%vertex = OpFunction %void None %fn
++%vertex_entry = OpLabel
++%vertex_sampled = OpLoad %sampled_type %sampled_var
++%vertex_color = OpImageSampleExplicitLod %v4float %vertex_sampled %coord Lod %float_0
++OpReturn
++OpFunctionEnd
++%compute = OpFunction %void None %fn
++%compute_entry = OpLabel
++%compute_sampled = OpLoad %sampled_type %sampled_var
++%compute_color = OpImageSampleExplicitLod %v4float %compute_sampled %coord Lod %float_0
++OpReturn
++OpFunctionEnd
++%dead = OpFunction %void None %fn
++%dead_entry = OpLabel
++%dead_sampled = OpLoad %sampled_type %sampled_var
++%dead_color = OpImageSampleImplicitLod %v4float %dead_sampled %coord
++OpReturn
++OpFunctionEnd
++"
++    );
++    let module = assemble(&source).expect("SPIR-V assembler is required");
++    validate(&module);
++    let untouched = ["vertex", "compute", "dead"].map(|name| {
++        let id = named_id(&module, name);
++        (
++            id,
++            module.functions[function_index(&module, id)]
++                .all_inst_iter()
++                .cloned()
++                .collect::<Vec<_>>(),
++        )
++    });
++    let lowered = run(module, &[]).unwrap();
++    validate(&lowered);
++    for (id, original) in untouched {
++        assert!(
++            lowered.functions[function_index(&lowered, id)]
++                .all_inst_iter()
++                .eq(original.iter()),
++            "non-fragment or unreachable function %{id} changed"
++        );
++    }
++    for (entry, label) in [("entry", "entry_block"), ("other_fragment", "other_entry")] {
++        let function = named_id(&lowered, entry);
++        assert_eq!(
++            has_derivatives(&lowered, function, named_id(&lowered, label)),
++            (true, true)
++        );
++    }
++    let other = named_id(&lowered, "other_fragment");
++    assert_eq!(
++        has_derivatives(&lowered, other, named_id(&lowered, "sample_arm")),
++        (false, false)
++    );
++}
+diff --git a/src/passes/resources/quad_sampling/tests/mod.rs b/src/passes/resources/quad_sampling/tests/mod.rs
+--- a/src/passes/resources/quad_sampling/tests/mod.rs
++++ b/src/passes/resources/quad_sampling/tests/mod.rs
+@@ -179,5 +179,6 @@
+ "#;
+ 
+ mod control;
++mod entries;
+ mod images;
+ mod placement;
+diff --git a/src/passes/resources/quad_sampling/tests/placement.rs b/src/passes/resources/quad_sampling/tests/placement.rs
+--- a/src/passes/resources/quad_sampling/tests/placement.rs
++++ b/src/passes/resources/quad_sampling/tests/placement.rs
+@@ -62,6 +62,119 @@
+ }
+ 
+ #[test]
++fn branch_local_fma_coordinate_is_recomputed_without_moving_the_sample() {
++    let source = branch_source(
++        "%local_pos = OpLoad %v4float %position
++%xy = OpVectorShuffle %v2float %local_pos %local_pos 1 0
++%local_coord = OpExtInst %v2float %glsl Fma %xy %xy %coord",
++    )
++    .replace(
++        "OpMemoryModel",
++        "%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel",
++    );
++    let module = assemble(&source).expect("SPIR-V assembler is required");
++    let main = named_id(&module, "entry");
++    let local = named_id(&module, "local_coordinate");
++    let lowered = run(module, &[]).unwrap();
++    validate(&lowered);
++    let definition = &lowered.functions[function_index(&lowered, main)];
++    assert!(definition.blocks[0]
++        .instructions
++        .iter()
++        .any(|i| i.class.opcode == Op::ExtInst));
++    assert_eq!(
++        has_derivatives(&lowered, main, named_id(&lowered, "entry_block")),
++        (true, true)
++    );
++    let arm = block_index(&lowered, main, named_id(&lowered, "sample_arm"));
++    assert!(definition.blocks[arm].instructions.iter().any(|i| {
++        i.class.opcode == Op::ImageSampleExplicitLod
++            && i.operands.get(1) == Some(&Operand::IdRef(local))
++    }));
++}
++
++#[test]
++fn pointer_output_math_is_not_speculated_as_coordinate_arithmetic() {
++    for (opcode, output_type) in [("Modf", "%float"), ("Frexp", "%uint")] {
++        let source = branch_source(&format!(
++            "%fraction = OpExtInst %float %glsl {opcode} %x %integral\n\
++             %local_coord = OpCompositeConstruct %v2float %fraction %fraction"
++        ))
++        .replace(
++            "OpMemoryModel",
++            "%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel",
++        )
++        .replace(
++            "%input_float = OpTypePointer",
++            &format!(
++                "%out_ptr = OpTypePointer Function {output_type}\n%input_float = OpTypePointer"
++            ),
++        )
++        .replace(
++            "%entry = OpLabel",
++            "%entry = OpLabel\n%integral = OpVariable %out_ptr Function",
++        );
++        let module = assemble(&source).expect("SPIR-V assembler is required");
++        validate(&module);
++        let error = run(module, &[]).unwrap_err();
++        assert!(
++            error.contains("cannot safely recompute") && error.contains("ExtInst"),
++            "{opcode}: {error}"
++        );
++    }
++}
++
++#[test]
++fn interpolation_state_is_not_speculated_as_coordinate_arithmetic() {
++    for (opcode, extra) in [
++        ("InterpolateAtCentroid", ""),
++        ("InterpolateAtSample", " %uint_0"),
++        ("InterpolateAtOffset", " %coord"),
++    ] {
++        let source = branch_source(&format!(
++            "%part = OpExtInst %float %glsl {opcode} %interpolated{extra}\n\
++             %local_coord = OpCompositeConstruct %v2float %part %part"
++        ))
++        .replace("OpMemoryModel", "OpCapability InterpolationFunction\n%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel")
++        .replace("\"main\" %flat_input", "\"main\" %interpolated %flat_input")
++        .replace("%void = OpTypeVoid", "OpDecorate %interpolated Location 1\n%void = OpTypeVoid")
++        .replace("%float_0 = OpConstant", "%uint_0 = OpConstant %uint 0\n%interpolated = OpVariable %input_float Input\n%float_0 = OpConstant");
++        let module = assemble(&source).expect("SPIR-V assembler is required");
++        validate(&module);
++        let error = run(module, &[]).unwrap_err();
++        assert!(
++            error.contains("cannot safely recompute") && error.contains("ExtInst"),
++            "{opcode}: {error}"
++        );
++    }
++}
++
++#[test]
++fn an_extinst_opcode_is_interpreted_only_in_its_declared_instruction_set() {
++    let source = branch_source("%local_coord = OpExtInst %v2float %glsl Fma %coord %coord %coord")
++        .replace(
++            "OpMemoryModel",
++            "%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel",
++        );
++    let original = assemble(&source).expect("SPIR-V assembler is required");
++    validate(&original);
++    for name in ["OpenCL.std", "NonSemantic.DebugPrintf", "unknown.math"] {
++        let mut module = original.clone();
++        let import = module
++            .ext_inst_imports
++            .iter_mut()
++            .find(|i| i.class.opcode == Op::ExtInstImport)
++            .unwrap();
++        import.operands = vec![Operand::LiteralString(name.into())];
++        let error = run(module, &[]).unwrap_err();
++        assert!(
++            error.contains("cannot safely recompute") && error.contains("ExtInst"),
++            "{name}: {error}"
++        );
++    }
++}
++
++#[test]
+ fn a_dominating_input_load_is_reused_without_speculating_another_load() {
+     let source = branch_source("%local_coord = OpVectorShuffle %v2float %pos %pos 0 1");
+     let Some(module) = assemble(&source) else {
+@@ -256,3 +369,59 @@
+         count - 1
+     );
+ }
++
++#[test]
++fn a_uniform_math_loop_bound_keeps_derivatives_in_each_loop_instance() {
++    let preamble = PREAMBLE.replace(
++        "OpMemoryModel",
++        "%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel",
++    );
++    let source = format!(
++        "{preamble}
++OpName %body \"sample_body\"
++%float_1 = OpConstant %float 1
++%float_2 = OpConstant %float 2
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++%bound = OpExtInst %float %glsl Fma %flat %float_1 %float_2
++OpBranch %header
++%header = OpLabel
++%iteration = OpPhi %float %float_0 %entry %next %continue
++%again = OpFOrdLessThan %bool %iteration %bound
++OpLoopMerge %merge %continue None
++OpBranchConditional %again %body %merge
++%body = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpBranch %continue
++%continue = OpLabel
++%next = OpFAdd %float %iteration %float_1
++OpBranch %header
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++    );
++    let module = assemble(&source).expect("SPIR-V assembler is required");
++    validate(&module);
++    let main = named_id(&module, "entry");
++    let lowered = run(module, &[]).unwrap();
++    validate(&lowered);
++    assert_eq!(
++        has_derivatives(&lowered, main, named_id(&lowered, "sample_body")),
++        (true, true)
++    );
++    assert_eq!(
++        has_derivatives(&lowered, main, named_id(&lowered, "entry_block")),
++        (false, false)
++    );
++    let varying = source.replace(
++        "%flat = OpLoad %float %flat_input",
++        "%pos = OpLoad %v4float %position\n%flat = OpCompositeExtract %float %pos 0",
++    );
++    let module = assemble(&varying).expect("SPIR-V assembler is required");
++    validate(&module);
++    let error = run(module, &[]).unwrap_err();
++    assert!(error.contains("cannot cross a loop instance"), "{error}");
++}

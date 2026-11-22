@@ -1,0 +1,105 @@
+diff --git a/src/passes/module_cleanup.rs b/src/passes/module_cleanup.rs
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -263,6 +263,11 @@
+         }
+     }
+ 
++    // Pending synthesis survives this sweep and still owns its published dependencies.
++    for instruction in &ctx.new_globals {
++        collect(instruction, &mut live);
++    }
++
+     let definitions = ctx
+         .module
+         .types_global_values
+@@ -286,6 +291,16 @@
+     ctx.module
+         .types_global_values
+         .retain(|instruction| instruction.result_id.is_none_or(|id| live.contains(&id)));
++    let defined = ctx
++        .module
++        .types_global_values
++        .iter()
++        .chain(&ctx.new_globals)
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    ctx.struct_cache.retain(|_, id| defined.contains(id));
++    ctx.synth_cache.retain(|_, id| defined.contains(id));
++    ctx.singleton_types.retain(|_, id| defined.contains(id));
+     drop_dangling_debug(&mut ctx.module);
+ }
+ 
+@@ -1501,6 +1516,72 @@
+     }
+ 
+     #[test]
++    fn gc_rebuilds_retired_synthesized_definitions() {
++        let mut module = Module::new();
++        module.header = Some(ModuleHeader::new(1));
++        let mut ctx = Ctx::new(module);
++        let uint = ctx.ty_uint();
++        ctx.const_uint(4);
++        ctx.const_float(1.25);
++        ctx.ty_int16();
++        ctx.ty_array(uint, 4);
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++        let retired = ctx
++            .module
++            .types_global_values
++            .iter()
++            .filter_map(|inst| inst.result_id)
++            .collect::<HashSet<_>>();
++
++        gc_dead_globals(&mut ctx);
++        assert!(ctx.module.types_global_values.is_empty());
++
++        let four = ctx.const_uint(4);
++        let float = ctx.const_float(1.25);
++        let short = ctx.ty_int16();
++        let uint = ctx.ty_uint();
++        let array = ctx.ty_array(uint, 4);
++        let defined = ctx
++            .new_globals
++            .iter()
++            .filter_map(|inst| inst.result_id)
++            .collect::<HashSet<_>>();
++        for id in [four, float, short, uint, array] {
++            assert!(defined.contains(&id), "builder returned undefined id %{id}");
++            assert!(!retired.contains(&id), "builder reused retired id %{id}");
++        }
++    }
++
++    #[test]
++    fn gc_preserves_pending_synthesis_and_its_dependencies() {
++        let mut module = Module::new();
++        module.header = Some(ModuleHeader::new(1));
++        let mut ctx = Ctx::new(module);
++        let uint = ctx.ty_uint();
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++        let array = ctx.ty_array(uint, 4);
++        let short = ctx.ty_int16();
++
++        gc_dead_globals(&mut ctx);
++
++        assert!(ctx
++            .module
++            .types_global_values
++            .iter()
++            .any(|inst| inst.result_id == Some(uint)));
++        assert_eq!(ctx.ty_uint(), uint);
++        assert_eq!(ctx.ty_array(uint, 4), array);
++        assert_eq!(ctx.ty_int16(), short);
++        assert_eq!(
++            ctx.new_globals
++                .iter()
++                .filter(|inst| inst.result_id == Some(array))
++                .count(),
++            1
++        );
++    }
++
++    #[test]
+     fn gc_keeps_local_pointer_store_sentinel_rooted_by_typed_sidecar() {
+         let ulong = 1;
+         let sentinel = 2;

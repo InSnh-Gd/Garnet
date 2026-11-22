@@ -1,0 +1,455 @@
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -1,6 +1,6 @@
+ //! Resource handles reached through affine record indexing or device-address pointers.
+ 
+-use super::gpu_arguments::{lookup_function, raw_buffer, value};
++use super::gpu_arguments::{load_word, lookup_function, raw_buffer, value};
+ use super::*;
+ use crate::meta::{EmbeddedSampler, EmbeddedTexture};
+ use spirv::Capability;
+@@ -13,6 +13,180 @@
+     comp: ImageComp,
+     storage: bool,
+     multisampled: bool,
++}
++
++fn image_query(name: &str) -> Option<(u32, bool)> {
++    for (prefix, field, mip) in [
++        ("air.get_width_", 0, true),
++        ("air.get_height_", 1, true),
++        ("air.get_depth_", 2, true),
++        ("air.get_array_size_", 3, false),
++        ("air.get_num_mip_levels_", 4, false),
++        ("air.get_num_samples_", 5, false),
++    ] {
++        if name.starts_with(prefix) && (name.contains("_texture_") || name.contains("_depth_")) {
++            return Some((field, mip));
++        }
++    }
++    None
++}
++
++fn lower_query(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    inst: &Instruction,
++    table: Word,
++    selected: Word,
++    query: (u32, bool),
++    defs: &HashMap<Word, Instruction>,
++) -> Result<(), String> {
++    let (field, mip) = query;
++    let uint = ctx.ty_uint();
++    if inst.result_type != Some(uint) || inst.result_id.is_none() {
++        return Err("GPU argument image query must return a 32-bit integer".into());
++    }
++    let args = &inst.operands[1..];
++    if args.is_empty() || args.len() > if mip { 2 } else { 1 } {
++        return Err("invalid GPU argument image query operands".into());
++    }
++    let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    let zero = ctx.const_uint(0);
++    let four = ctx.const_uint(4);
++    let five = ctx.const_uint(5);
++    let one = ctx.const_uint(1);
++    let eight = ctx.const_uint(8);
++    let field = ctx.const_uint(field);
++    // The dimensions follow the final token list. Both descriptors alias the same immutable table.
++    let last = load_word(ctx, body, table, pointer, uint, zero, four);
++    let count = load_word(ctx, body, table, pointer, uint, zero, five);
++    let twice = value(
++        ctx,
++        body,
++        Op::ShiftLeftLogical,
++        uint,
++        vec![Operand::IdRef(count), Operand::IdRef(one)],
++    );
++    let base = value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(last), Operand::IdRef(twice)],
++    );
++    let row = value(
++        ctx,
++        body,
++        Op::IMul,
++        uint,
++        vec![Operand::IdRef(selected), Operand::IdRef(eight)],
++    );
++    let row = value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(base), Operand::IdRef(row)],
++    );
++    let offset = value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(row), Operand::IdRef(field)],
++    );
++    let extent = load_word(ctx, body, table, pointer, uint, zero, offset);
++    let result = if mip {
++        let lod = match args.get(1) {
++            Some(Operand::IdRef(lod)) => {
++                if defs.get(lod).and_then(|inst| inst.result_type) != Some(uint) {
++                    return Err("GPU argument mip level must contain 32 bits".into());
++                }
++                *lod
++            }
++            None => zero,
++            _ => return Err("GPU argument mip level must be an integer value".into()),
++        };
++        let levels_at = value(
++            ctx,
++            body,
++            Op::IAdd,
++            uint,
++            vec![Operand::IdRef(row), Operand::IdRef(four)],
++        );
++        let levels = load_word(ctx, body, table, pointer, uint, zero, levels_at);
++        let boolean = ctx.ty_bool();
++        let valid = value(
++            ctx,
++            body,
++            Op::ULessThan,
++            boolean,
++            vec![Operand::IdRef(lod), Operand::IdRef(levels)],
++        );
++        let limit = ctx.const_uint(31);
++        let small = value(
++            ctx,
++            body,
++            Op::ULessThanEqual,
++            boolean,
++            vec![Operand::IdRef(lod), Operand::IdRef(limit)],
++        );
++        let safe_lod = value(
++            ctx,
++            body,
++            Op::Select,
++            uint,
++            vec![
++                Operand::IdRef(small),
++                Operand::IdRef(lod),
++                Operand::IdRef(limit),
++            ],
++        );
++        let scaled = value(
++            ctx,
++            body,
++            Op::ShiftRightLogical,
++            uint,
++            vec![Operand::IdRef(extent), Operand::IdRef(safe_lod)],
++        );
++        let empty = value(
++            ctx,
++            body,
++            Op::IEqual,
++            boolean,
++            vec![Operand::IdRef(scaled), Operand::IdRef(zero)],
++        );
++        let scaled = value(
++            ctx,
++            body,
++            Op::Select,
++            uint,
++            vec![
++                Operand::IdRef(empty),
++                Operand::IdRef(one),
++                Operand::IdRef(scaled),
++            ],
++        );
++        value(
++            ctx,
++            body,
++            Op::Select,
++            uint,
++            vec![
++                Operand::IdRef(valid),
++                Operand::IdRef(scaled),
++                Operand::IdRef(zero),
++            ],
++        )
++    } else {
++        extent
++    };
++    body.push(Instruction::new(
++        Op::CopyObject,
++        inst.result_type,
++        inst.result_id,
++        vec![Operand::IdRef(result)],
++    ));
++    Ok(())
+ }
+ 
+ fn image_shape(
+@@ -267,6 +441,16 @@
+     let table = raw_buffer(ctx, super::gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING);
+     ctx.interface_buffer_var(table);
+     let lookup = lookup_function(ctx, table);
++    let queries = ctx.module.functions[entry].blocks.iter().flat_map(|block| &block.instructions).any(|inst| {
++        matches!((inst.class.opcode, inst.operands.first(), inst.operands.get(1)),
++            (Op::FunctionCall, Some(Operand::IdRef(callee)), Some(Operand::IdRef(handle)))
++            if names.get(callee).is_some_and(|name| image_query(name).is_some()) && payloads.contains_key(handle))
++    });
++    let query_table = queries.then(|| {
++        let var = raw_buffer(ctx, 673);
++        ctx.interface_buffer_var(var);
++        var
++    });
+     let uint = ctx.ty_uint();
+     let mut globals = BTreeMap::new();
+     for block in 0..ctx.module.functions[entry].blocks.len() {
+@@ -280,6 +464,48 @@
+                 _ => None,
+             };
+             if let Some(name) = name {
++                if let (Some((field, mip)), Some(&token), Some(query_table)) = (
++                    image_query(name),
++                    inst.operands.get(1).and_then(|operand| match operand {
++                        Operand::IdRef(id) => payloads.get(id),
++                        _ => None,
++                    }),
++                    query_table,
++                ) {
++                    let shape = super::super::air_calls::intrinsic_texture_shape(name)
++                        .ok_or("GPU argument image query has no known shape")?;
++                    if shapes
++                        .get(&token)
++                        .is_some_and(|typed| (typed.dim, typed.arrayed) != shape)
++                    {
++                        return Err(
++                            "GPU argument image query shape disagrees with its resource".into()
++                        );
++                    }
++                    let category = ctx.const_uint(0);
++                    let selected = value(
++                        ctx,
++                        &mut body,
++                        Op::FunctionCall,
++                        uint,
++                        vec![
++                            Operand::IdRef(lookup),
++                            Operand::IdRef(token.0),
++                            Operand::IdRef(token.1),
++                            Operand::IdRef(category),
++                        ],
++                    );
++                    lower_query(
++                        ctx,
++                        &mut body,
++                        &inst,
++                        query_table,
++                        selected,
++                        (field, mip),
++                        &defs,
++                    )?;
++                    continue;
++                }
+                 for position in 1..=2 {
+                     let Some(Operand::IdRef(handle)) = inst.operands.get(position) else {
+                         continue;
+@@ -393,6 +619,8 @@
+         }
+         ctx.module.functions[entry].blocks[block].instructions = body;
+     }
+-    ctx.add_capability(Capability::RuntimeDescriptorArray);
++    if !globals.is_empty() {
++        ctx.add_capability(Capability::RuntimeDescriptorArray);
++    }
+     Ok(true)
+ }
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -467,7 +467,7 @@
+     id
+ }
+ 
+-fn load_word(
++pub(super) fn load_word(
+     ctx: &mut Ctx,
+     body: &mut Vec<Instruction>,
+     var: Word,
+diff --git a/src/passes/resources/bindings.rs b/src/passes/resources/bindings.rs
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -248,14 +248,19 @@
+         }
+     }
+ 
+-    let graph = module.capabilities.iter().any(|capability| {
+-        capability.operands.first()
+-            == Some(&Operand::Capability(
+-                spirv::Capability::RuntimeDescriptorArray,
+-            ))
+-    }) && bindings
++    let query_table = bindings
+         .iter()
+-        .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0));
++        .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0));
++    let graph = (query_table
++        || module.capabilities.iter().any(|capability| {
++            capability.operands.first()
++                == Some(&Operand::Capability(
++                    spirv::Capability::RuntimeDescriptorArray,
++                ))
++        }))
++        && bindings
++            .iter()
++            .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0));
+     let mut occupied = std::collections::BTreeMap::<(u32, u32), (Word, DescriptorClass)>::new();
+     for variable in module
+         .types_global_values
+@@ -307,7 +312,9 @@
+             })
+             .is_some_and(|ty| ty.class.opcode == Op::TypeRuntimeArray);
+         let graph_binding = graph
+-            && ((set == 0 && binding == 672 && class == DescriptorClass::StorageBuffer)
++            && ((set == 0
++                && (binding == 672 || (query_table && binding == 673))
++                && class == DescriptorClass::StorageBuffer)
+                 || (runtime
+                     && binding == 0
+                     && matches!(
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -200,7 +200,8 @@
+ /// access -- 1846 `ReadWrite`->`WriteOnly`, 388 `ReadWrite`->`ReadOnly`, 21 `WriteOnly`->`Unused`,
+ /// 3 `ReadOnly`->`Unused`. No SPIR-V, no other reflected field, and no status changes.**
+ /// v56 adds descriptor-backed flat argument-buffer sampler fields and their owner coordinates.
+-pub const REFLECTION_VERSION: u32 = 56;
++/// v57 adds token-backed image dimensions without requiring a typed image descriptor.
++pub const REFLECTION_VERSION: u32 = 57;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -1857,6 +1858,12 @@
+     pub table_binding: u32,
+     /// Sampled images (0), storage images (1), samplers (2), sorted without duplicates.
+     pub categories: Vec<u32>,
++    /// ABI 3 aliases the token table at this binding to read exact resource dimensions.
++    #[cfg_attr(
++        feature = "serde",
++        serde(default, skip_serializing_if = "Option::is_none")
++    )]
++    pub image_query_binding: Option<u32>,
+ }
+ 
+ /// Consumer-shaped reflection of one translated shader.
+@@ -1979,7 +1986,11 @@
+             .collect::<Vec<_>>();
+         categories.sort_unstable();
+         categories.dedup();
+-        if categories.is_empty() {
++        let image_query_binding = bindings
++            .iter()
++            .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0))
++            .then_some(673);
++        if categories.is_empty() && image_query_binding.is_none() {
+             return;
+         }
+         self.bindings.retain(|resource| {
+@@ -1989,9 +2000,10 @@
+             )
+         });
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: 2,
++            version: if image_query_binding.is_some() { 3 } else { 2 },
+             table_binding: 672,
+             categories,
++            image_query_binding,
+         });
+     }
+ 
+@@ -2090,15 +2102,23 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if table.version != 2
++            if table.version
++                != if table.image_query_binding.is_some() {
++                    3
++                } else {
++                    2
++                }
+                 || table.table_binding != 672
+-                || table.categories.is_empty()
++                || table
++                    .image_query_binding
++                    .is_some_and(|binding| binding != 673)
++                || (table.categories.is_empty() && table.image_query_binding.is_none())
+                 || table.categories.iter().any(|category| *category > 2)
+                 || table.categories.windows(2).any(|pair| pair[0] >= pair[1])
+                 || self.bindings.iter().any(|binding| {
+-                    binding
+-                        .descriptor
+-                        .is_some_and(|location| location.binding == 672 || location.set >= 2)
++                    binding.descriptor.is_some_and(|location| {
++                        location.binding == 672 || location.binding == 673 || location.set >= 2
++                    })
+                 })
+             {
+                 return Err("invalid GPU argument resource graph ABI".into());
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `49`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `57`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -95,6 +95,16 @@
+ descriptors. Consumers must bind these additional resources and enable the corresponding
+ descriptor-indexing features. Unknown graph operations return an error. Flat resources
+ with representable coordinates retain their existing static descriptor ABI.
++
++Graphs using image dimension queries carry version 3 and `image_query_binding: 673`.
++Bindings 672 and 673 alias the same read-only buffer. After the final token list, the
++consumer appends eight u32 words for every sampled-list entry (including index 0):
++width, height, depth, Metal array length, mip-level count, sample count, and two zero
++reserved words. The null row is all zero. Queries look up the actual token in the
++sampled list and apply the requested mip level to its base dimensions. These rows
++describe the texture view. They do not require guessing the image component or
++access type. `categories` can be empty when the shader only queries dimensions;
++no image descriptor array or descriptor-indexing capability is needed in that case.
+ 
+ By default, every descriptor-backed Metal-facing resource uses **descriptor set 0**
+ (`RESOURCE_DESCRIPTOR_SET`). Most default bindings are a fixed base plus Metal resource index `n`:
+@@ -412,7 +422,14 @@
+ `None` for `Unknown`; the corresponding binding's `texture_shape.storage_format` reports the same
+ choice. Create the image view and descriptor from the same runtime state used for translation.
+ 
+-### Nil texture bindings are resolved at translation time
++### Nil texture bindings
++
++An argument-buffer resource with serialized token words checks `air.is_null_texture_*`
++at run time by comparing both words with zero. Version 3 dimension queries also return
++zero for null tokens. This does not establish general null descriptor behavior for
++unguarded sample/read/write operations.
++
++The following restriction remains for ordinary descriptor-backed texture arguments.
+ 
+ Metal decides whether a texture slot is nil when the encoder binds, and `air.is_null_texture_*`
+ observes that decision at run time. A Logical SPIR-V module has no equivalent query: a descriptor
+@@ -492,6 +509,5 @@
+   descriptor/type/value graph required for conservative buffer footprints.
+ - Not a substitute for `spirv-val` or runtime pipeline creation.
+ - Not populated for passthrough vertex generation (`translate_passthrough`).
+-- Not a description of run-time binding choices. `air.is_null_texture_*` is resolved when the module
+-  is built, not when the encoder binds — see *Nil texture bindings are resolved at translation
+-  time*.
++- Ordinary descriptor-backed texture nullness remains fixed at translation time; serialized
++  argument-buffer tokens can be checked at run time — see *Nil texture bindings*.

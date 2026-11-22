@@ -1,0 +1,32 @@
+; Authored static resource array with a constant image offset.
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %images
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %images DescriptorSet 0
+OpDecorate %images Binding 32
+%void = OpTypeVoid
+%float = OpTypeFloat 32
+%int = OpTypeInt 32 1
+%uint = OpTypeInt 32 0
+%v2int = OpTypeVector %int 2
+%v4float = OpTypeVector %float 4
+%uint0 = OpConstant %uint 0
+%uint2 = OpConstant %uint 2
+%int0 = OpConstant %int 0
+%int1 = OpConstant %int 1
+%coordinate = OpConstantComposite %v2int %int0 %int0
+%offset = OpConstantComposite %v2int %int1 %int1
+%image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%array = OpTypeArray %image %uint2
+%arrayptr = OpTypePointer UniformConstant %array
+%imageptr = OpTypePointer UniformConstant %image
+%images = OpVariable %arrayptr UniformConstant
+%function = OpTypeFunction %void
+%main = OpFunction %void None %function
+%entry = OpLabel
+%pointer = OpAccessChain %imageptr %images %uint0
+%texture = OpLoad %image %pointer
+%result = OpImageFetch %v4float %texture %coordinate Lod|ConstOffset %int0 %offset
+OpReturn
+OpFunctionEnd

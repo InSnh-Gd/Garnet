@@ -1,0 +1,29 @@
+# build outputs
+build/
+build-*/
+*.kext/
+*.o
+*.d
+*.dylib
+*.a
+*.app/
+*.dSYM/
+__pycache__/
+*.bin
+*.spv
+*.air
+*.metallib
+# generated firmware C arrays (fw_table.h in the same directory IS tracked source)
+src/garnet/src/fw/fw_*.c
+src/garnet/firmware/
+# our own assembled compute test shaders (from shaders/*.s), tracked so no LLVM is needed
+!src/garnet/shaders/store_magic.bin
+!src/garnet/shaders/store_magic_hsa.bin
+# local run output
+runs/
+*.log
+*.orig
+*.rej
+/temp/
+/logs/
+.DS_Store

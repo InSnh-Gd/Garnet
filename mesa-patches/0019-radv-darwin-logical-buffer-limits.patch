@@ -1,0 +1,134 @@
+From: RDNA4 local integration
+Subject: [PATCH 19] radv/darwin: report logical limits and bound fixed-function windows
+
+Raise native logical buffer/allocation limits to the implemented 8 GiB ceiling
+without changing UBO/SSBO descriptor limits. Reject oversized creates before
+alignment, saturate hardware vertex/index windows, and exclude composite BOs
+from the single-handle native transfer API.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 + patches 0001..0018.
+
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -47,6 +47,11 @@
+ #endif
+ #include "git_sha1.h"
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor);
++static void radv_create_drm_device_locked(struct radv_physical_device *pdev);
++#endif
++
+ #if AMD_LLVM_AVAILABLE
+ #include <llvm-c/TargetMachine.h>
+ #endif
+@@ -425,6 +430,22 @@
+    RADV_HEAP_VRAM_VIS = 1 << 2,
+    RADV_HEAP_MAX = 1 << 3,
+ };
++
++static uint64_t
++radv_get_max_allocation_size(struct radv_physical_device *pdev)
++{
++   uint64_t size = RADV_MAX_MEMORY_ALLOCATION_SIZE;
++#ifdef HAVE_AMDGPU_DARWIN
++   if (pdev->drm_device_type == RADV_DRM_DEVICE_AMDGPU_DARWIN) {
++      simple_mtx_lock(&pdev->drm_device_mtx);
++      radv_create_drm_device_locked(pdev);
++      if (pdev->drm_device && ac_drm_darwin_kext(pdev->drm_device, NULL))
++         size = MAX2(size, MIN2(UINT64_C(8) << 30, (uint64_t)pdev->info.vram_size_kb * 1024));
++      simple_mtx_unlock(&pdev->drm_device_mtx);
++   }
++#endif
++   return size;
++}
+ 
+ static uint64_t
+ radv_get_adjusted_vram_size(struct radv_physical_device *pdev)
+@@ -1798,6 +1819,7 @@
+ 
+    VkExtent2D vrs_texel_extent = radv_vrs_attachment_enabled(pdev) ? (VkExtent2D){8, 8} : (VkExtent2D){0, 0};
+    const int32_t max_viewport_size = pdev->info.gfx_level >= GFX12 ? 32768 : 16384;
++   const uint64_t max_allocation_size = radv_get_max_allocation_size(pdev);
+ 
+    uint64_t os_page_size = 4096;
+    os_get_page_size(&os_page_size);
+@@ -1950,7 +1972,7 @@
+       .maxMultiviewInstanceIndex = INT_MAX,
+       .protectedNoFault = false,
+       .maxPerSetDescriptors = RADV_MAX_PER_SET_DESCRIPTORS,
+-      .maxMemoryAllocationSize = RADV_MAX_MEMORY_ALLOCATION_SIZE,
++      .maxMemoryAllocationSize = max_allocation_size,
+ 
+       /* Vulkan 1.2 */
+       /* On AMD hardware, denormals and rounding modes for fp16/fp64 are
+@@ -2066,7 +2088,7 @@
+       .storageTexelBufferOffsetSingleTexelAlignment = true,
+       .uniformTexelBufferOffsetAlignmentBytes = 4,
+       .uniformTexelBufferOffsetSingleTexelAlignment = true,
+-      .maxBufferSize = RADV_MAX_MEMORY_ALLOCATION_SIZE,
++      .maxBufferSize = max_allocation_size,
+ 
+       /* Vulkan 1.4 */
+       .lineSubPixelPrecisionBits = 4,
+--- a/src/amd/vulkan/radv_buffer.c
++++ b/src/amd/vulkan/radv_buffer.c
+@@ -48,6 +48,11 @@
+ 
+    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   if (pCreateInfo->size > pdev->vk.properties.maxBufferSize)
++      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++#endif
++
+ #if DETECT_OS_ANDROID
+    /* reject buffers that are larger than maxBufferSize on Android, which
+     * might not have VK_KHR_maintenance4
+--- a/src/amd/vulkan/radv_device_memory.c
++++ b/src/amd/vulkan/radv_device_memory.c
+@@ -104,6 +104,12 @@
+       *pMem = VK_NULL_HANDLE;
+       return VK_SUCCESS;
+    }
++
++#ifdef HAVE_AMDGPU_DARWIN
++   if (pAllocateInfo->allocationSize > radv_device_physical(device)->vk.properties.maxMemoryAllocationSize ||
++       pAllocateInfo->allocationSize > UINT64_MAX - 4095)
++      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++#endif
+ 
+    mem = vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*mem), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    if (mem == NULL)
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -7185,7 +7185,7 @@
+ 
+    vbo_info->binding = binding;
+    vbo_info->va = vertex_buffer->bindings[binding].addr;
+-   vbo_info->size = vertex_buffer->bindings[binding].size;
++   vbo_info->size = MIN2(vertex_buffer->bindings[binding].size, UINT32_MAX);
+ 
+    vbo_info->stride = d->vk.vi_binding_strides[binding];
+ 
+@@ -8707,7 +8707,7 @@
+       index_buffer->va = pInfo->addressRange.address;
+ 
+       int index_size = radv_get_vgt_index_size(vk_to_index_type(pInfo->indexType));
+-      index_buffer->max_index_count = pInfo->addressRange.size / index_size;
++      index_buffer->max_index_count = MIN2(pInfo->addressRange.size / index_size, UINT32_MAX);
+    } else {
+       index_buffer->va = 0;
+       index_buffer->max_index_count = 0;
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+@@ -179,6 +179,9 @@
+ {
+    VK_FROM_HANDLE(radv_device, device, _dev);
+    VK_FROM_HANDLE(radv_device_memory, mem, _mem);
++   if (device && mem && mem->base.device == &device->vk && mem->bo &&
++       radv_amdgpu_winsys_bo(mem->bo)->children)
++      return -ENOSYS;
+    if (!device || !mem || mem->base.device != &device->vk || !mem->bo || mem->bo->is_virtual ||
+        mem->user_ptr || mem->import_handle_type || !size || size > RDNA4N_BUFFER_MAX_BYTES ||
+        ((offset | size) & 3) || offset > mem->alloc_size || size > mem->alloc_size - offset ||

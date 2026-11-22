@@ -1,0 +1,105 @@
+--- a/src/passes/resources/sampler_usage.rs
++++ b/src/passes/resources/sampler_usage.rs
+@@ -262,12 +262,12 @@
+ fn build_comparison_access(
+     ctx: &mut Ctx,
+     defs: &HashMap<Word, Instruction>,
+-    variables: &HashMap<Word, DescriptorVariable>,
++    variables: &mut HashMap<Word, DescriptorVariable>,
+     access: &SamplerAccess,
+     reuse_ordinary_descriptor: bool,
+     out: &mut Vec<Instruction>,
+ ) -> Result<Word, String> {
+-    let descriptor = variables.get(&access.variable).ok_or_else(|| {
++    let descriptor = variables.get(&access.variable).cloned().ok_or_else(|| {
+         "comparison sampling uses a sampler that is not a descriptor variable".to_string()
+     })?;
+     let is_comparison =
+@@ -317,6 +317,13 @@
+             .ok_or_else(|| "comparison sampler binding overflow".to_string())?;
+         let variable = if reuse_ordinary_descriptor {
+             rebind_descriptor_variable(ctx, access.variable, binding)?;
++            variables.insert(
++                access.variable,
++                DescriptorVariable {
++                    binding,
++                    ..descriptor.clone()
++                },
++            );
+             access.variable
+         } else {
+             let existing = variables.iter().find_map(|(&variable, candidate)| {
+@@ -327,7 +334,17 @@
+             });
+             match existing {
+                 Some(variable) => variable,
+-                None => ctx.descriptor_variable(descriptor.pointee, binding),
++                None => {
++                    let variable = ctx.descriptor_variable(descriptor.pointee, binding);
++                    variables.insert(
++                        variable,
++                        DescriptorVariable {
++                            binding,
++                            ..descriptor.clone()
++                        },
++                    );
++                    variable
++                }
+             }
+         };
+         (variable, None)
+@@ -409,7 +426,7 @@
+         .chain(ctx.new_globals.iter())
+         .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+         .collect::<HashMap<_, _>>();
+-    let variables = descriptor_variables(ctx, &defs)?;
++    let mut variables = descriptor_variables(ctx, &defs)?;
+     let mut samples = HashMap::new();
+     for (function, body) in ctx.module.functions.iter().enumerate() {
+         for (block, instructions) in body.blocks.iter().enumerate() {
+@@ -485,7 +502,7 @@
+         let sampler = build_comparison_access(
+             ctx,
+             &defs,
+-            &variables,
++            &mut variables,
+             &access,
+             ordinary.is_empty(),
+             &mut inserted,
+--- a/tests/sampler_operation_usage.rs
++++ b/tests/sampler_operation_usage.rs
+@@ -150,6 +150,34 @@
+     );
+     assert_binding(&assembly, 160, true);
+     assert_binding(&assembly, 736, true);
++}
++
++#[test]
++fn repeated_comparison_uses_share_one_descriptor_per_sampler() {
++    for ordinary in [false, true] {
++        let input = source(SamplerSource::Direct, ordinary, true).replace(
++            "  %comparison_value = extractvalue { float, i8 } %comparison, 0",
++            r#"  %first = extractvalue { float, i8 } %comparison, 0
++  %second = call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 1, <2 x float> <float 0.75, float 0.25>, float 0.25, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)
++  %next = extractvalue { float, i8 } %second, 0
++  %comparison_value = fadd float %first, %next"#,
++        );
++        let (_, reflection, assembly) = translate("repeated-comparison", &input);
++        assert_eq!(
++            assembly
++                .lines()
++                .filter(|line| line.ends_with(" Binding 736"))
++                .count(),
++            1,
++            "each sampler representation has one descriptor: {assembly}"
++        );
++        let sampler = sampler(&reflection);
++        let comparison = sampler
++            .comparison_descriptor
++            .unwrap_or(sampler.descriptor.unwrap());
++        assert_eq!(comparison.binding, 736);
++        assert_eq!(assembly.matches("OpImageSampleDrefExplicitLod").count(), 2);
++    }
+ }
+ 
+ fn array_source(element: u32) -> String {

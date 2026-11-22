@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RDNA4-MacOS contributors <noreply@example.invalid>
+Date: Sun, 1 Nov 2026 22:00:00 +0800
+Subject: [PATCH 11/11] radv/darwin: expose only native queues and avoid null
+ member arithmetic
+
+RDNA4N Submit's cs_parse accepts only GFX instance 0, ring 0. The canned
+Linux compute ring masks otherwise make RADV advertise asynchronous
+compute queues whose submissions the kernel rejects. Hide those queues
+on native/mock connections; compute dispatch remains available on the
+general GFX queue. Keep HOST_BO's synthetic device information intact.
+
+Use offsetof in the vendored list helper. Its null-pointer member
+expression trips UBSan when the VA manager is destroyed, even without
+allocating a BO.
+
+Neither fix changes the gfx1200 topology or memory sizing. Native memory
+queries already use QueryInfo's pool totals and per-session budget.
+---
+ src/amd/common/darwin/ac_darwin_drm.c           | 6 +++++-
+ src/amd/common/darwin/libdrm_util_double_list.h | 2 +-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -501,8 +501,12 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+    case AMDGPU_INFO_HW_IP_INFO:
+       if (info->query_hw_ip.type == AMDGPU_HW_IP_GFX)
+          *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_gfx;
+-      else if (info->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE)
++      else if (info->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE) {
+          *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_compute;
++         /* RDNA4N Submit accepts only GFX ring 0, which also handles compute dispatch. */
++         if (dev->core->kext)
++            ((struct drm_amdgpu_info_hw_ip *)out)->available_rings = 0;
++      }
+       return 0;
+    case AMDGPU_INFO_HW_IP_COUNT:
+       *(uint32_t *)out = 1;
+diff --git a/src/amd/common/darwin/libdrm_util_double_list.h b/src/amd/common/darwin/libdrm_util_double_list.h
+--- a/src/amd/common/darwin/libdrm_util_double_list.h
++++ b/src/amd/common/darwin/libdrm_util_double_list.h
+@@ -88,7 +88,7 @@
+ #ifndef libdrm_container_of /* Mesa util/macros.h has a different container_of */
+ #define libdrm_container_of(ptr, sample, member)				\
+     (void *)((char *)(ptr)						\
+-	     - ((char *)&((__typeof__(sample))0)->member))
++	     - offsetof(__typeof__(*(sample)), member))
+ #endif
+ 
+ #define LIST_FOR_EACH_ENTRY(pos, head, member)				\
+-- 
+2.47.3

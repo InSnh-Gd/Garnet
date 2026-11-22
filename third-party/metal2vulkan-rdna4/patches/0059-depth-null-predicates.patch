@@ -1,0 +1,268 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -7,6 +7,10 @@
+ //! authored-resource audit.
+ 
+ use std::collections::BTreeMap;
++
++pub(crate) fn is_null_texture_intrinsic(name: &str) -> bool {
++    name.starts_with("air.is_null_texture") || name.starts_with("air.is_null_depth")
++}
+ 
+ /// How the product treats an AIR intrinsic family it recognises.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -372,6 +376,7 @@
+             "air.get_num_samples_texture",
+             "air.get_num_samples_depth",
+             "air.is_null_texture",
++            "air.is_null_depth",
+             "air.get_null_texture",
+         ],
+     )
+@@ -727,6 +732,7 @@
+         assert!(air_image_intrinsic("air.write_texture_2d.i16.v4f32"));
+         assert!(air_image_intrinsic("air.sample_compare_depth_2d.f32"));
+         assert!(air_image_intrinsic("air.gather_compare_depth_2d.f32"));
++        assert!(air_image_intrinsic("air.is_null_depth_2d_ms"));
+         assert!(air_image_intrinsic(
+             "air.calculate_unclamped_lod_texture_2d"
+         ));
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -234,7 +234,7 @@
+         || callee.starts_with("air.get_num_samples_depth")
+         || callee.starts_with("air.calculate_unclamped_lod_texture")
+         || callee.starts_with("air.calculate_clamped_lod_texture")
+-        || callee.starts_with("air.is_null_texture")
++        || crate::air_intrinsics::is_null_texture_intrinsic(callee)
+         || callee.starts_with("air.fence_texture")
+ }
+ 
+diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
+--- a/src/native/emitter/ops/air_calls.rs
++++ b/src/native/emitter/ops/air_calls.rs
+@@ -208,7 +208,7 @@
+             // NOT in the set, so it falls through to the default emission and the passes layer lowers
+             // it exactly as before — keeping every regression case byte-identical. Dispatches on a stable
+             // `air.*` ABI symbol plus our own data-flow set, never a shader name.
+-            callee if callee.starts_with("air.is_null_texture") => {
++            callee if crate::air_intrinsics::is_null_texture_intrinsic(callee) => {
+                 if call.args.len() == 1 {
+                     if let LlValue::Local(arg_name) = &call.args[0].value {
+                         if self.null_texture_values.contains(arg_name) {
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1629,7 +1629,7 @@
+     // AIR exposes optional texture presence through this intrinsic. Real bound interface textures are
+     // non-null in the conformance harness; values synthesized by `air.get_null_texture_*` are tracked
+     // explicitly below.
+-    if name.starts_with("air.is_null_texture") {
++    if crate::air_intrinsics::is_null_texture_intrinsic(name) {
+         return lower_is_null_texture(ctx, name, res, rty, args);
+     }
+     // `air.get_num_mip_levels_{texture,depth}_<dim>(texture)` -> OpImageQueryLevels for sampled images.
+diff --git a/src/passes/image_facts.rs b/src/passes/image_facts.rs
+--- a/src/passes/image_facts.rs
++++ b/src/passes/image_facts.rs
+@@ -608,7 +608,7 @@
+     entry_idx: usize,
+ ) -> Result<(), String> {
+     let names = air_names(&ctx.module);
+-    let needs_null_facts = ctx.module.functions[entry_idx].blocks.iter().flat_map(|block| &block.instructions).any(|inst| inst.class.opcode == Op::FunctionCall && matches!(inst.operands.first(), Some(Operand::IdRef(callee)) if names.get(callee).is_some_and(|name| name.starts_with("air.get_null_texture") || name.starts_with("air.is_null_texture"))));
++    let needs_null_facts = ctx.module.functions[entry_idx].blocks.iter().flat_map(|block| &block.instructions).any(|inst| inst.class.opcode == Op::FunctionCall && matches!(inst.operands.first(), Some(Operand::IdRef(callee)) if names.get(callee).is_some_and(|name| name.starts_with("air.get_null_texture") || crate::air_intrinsics::is_null_texture_intrinsic(name))));
+     if !needs_null_facts {
+         return Ok(());
+     }
+@@ -1082,7 +1082,7 @@
+             };
+             names
+                 .get(callee)
+-                .is_some_and(|name| name.starts_with("air.is_null_texture"))
++                .is_some_and(|name| crate::air_intrinsics::is_null_texture_intrinsic(name))
+                 .then(|| match inst.operands.get(1) {
+                     Some(Operand::IdRef(image)) => Some(*image),
+                     _ => None,
+@@ -1331,7 +1331,7 @@
+     if name.starts_with("air.get_null_texture") {
+         return Ok(None);
+     }
+-    let is_null = name.starts_with("air.is_null_texture");
++    let is_null = crate::air_intrinsics::is_null_texture_intrinsic(name);
+     let depth = intrinsic_depth_evidence(name);
+     let multisampled = name
+         .split('.')
+@@ -1372,7 +1372,7 @@
+             ImageAccess::Sampled
+         })
+     };
+-    if name.starts_with("air.is_null_texture") || name.starts_with("air.get_") {
++    if crate::air_intrinsics::is_null_texture_intrinsic(name) || name.starts_with("air.get_") {
+         // Queries and nullness do not select a descriptor compatibility class. The resource's
+         // structural image type or an actual sample/read/write use supplies it.
+         return Ok(None);
+@@ -1438,6 +1438,7 @@
+         "air.get_num_mip_levels_depth",
+         "air.get_num_samples_depth",
+         "air.get_array_size_depth",
++        "air.is_null_depth",
+     ];
+     if DEPTH.iter().any(|prefix| name.starts_with(prefix)) {
+         return Some(true);
+diff --git a/src/passes/resources/discovery.rs b/src/passes/resources/discovery.rs
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -528,7 +528,7 @@
+                 || name.starts_with("air.sample_compare_depth")
+                 || name.starts_with("air.read_texture")
+                 || name.starts_with("air.read_depth")
+-                || name.starts_with("air.is_null_texture")
++                || crate::air_intrinsics::is_null_texture_intrinsic(name)
+                 || name.starts_with("air.get_width_texture")
+                 || name.starts_with("air.get_height_texture")
+                 || name.starts_with("air.get_depth_texture")
+@@ -550,7 +550,7 @@
+             };
+             if ((name.starts_with("air.read_texture") || name.starts_with("air.read_depth"))
+                 || is_size_query(name)
+-                || name.starts_with("air.is_null_texture"))
++                || crate::air_intrinsics::is_null_texture_intrinsic(name))
+                 && write_textures.contains(tex)
+             {
+                 continue;
+@@ -801,7 +801,7 @@
+         Some(ImageComp::Uint)
+     } else if name.contains(".s.") {
+         Some(ImageComp::Sint)
+-    } else if is_size_query(name) || name.starts_with("air.is_null_texture") {
++    } else if is_size_query(name) || crate::air_intrinsics::is_null_texture_intrinsic(name) {
+         None
+     } else {
+         Some(ImageComp::Float)
+@@ -825,6 +825,7 @@
+         "air.get_num_mip_levels_depth",
+         "air.get_num_samples_depth",
+         "air.get_array_size_depth",
++        "air.is_null_depth",
+     ]
+     .iter()
+     .any(|prefix| name.starts_with(prefix))
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -728,9 +728,9 @@
+         for inst in instructions {
+             let token = match (inst.class.opcode, inst.operands.as_slice()) {
+                 (Op::FunctionCall, [Operand::IdRef(callee), Operand::IdRef(handle)])
+-                    if names
+-                        .get(callee)
+-                        .is_some_and(|name| name.starts_with("air.is_null_texture")) =>
++                    if names.get(callee).is_some_and(|name| {
++                        crate::air_intrinsics::is_null_texture_intrinsic(name)
++                    }) =>
+                 {
+                     payloads.get(handle)
+                 }
+diff --git a/src/passes/resources/texture_array.rs b/src/passes/resources/texture_array.rs
+--- a/src/passes/resources/texture_array.rs
++++ b/src/passes/resources/texture_array.rs
+@@ -506,7 +506,7 @@
+         || name.starts_with("air.get_num_mip_levels_depth")
+         || name.starts_with("air.get_num_samples_texture")
+         || name.starts_with("air.get_num_samples_depth")
+-        || name.starts_with("air.is_null_texture")
++        || crate::air_intrinsics::is_null_texture_intrinsic(name)
+ }
+ fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
+     type_def_of(ctx, image_ty)
+diff --git a/tests/depth_null_predicates.rs b/tests/depth_null_predicates.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/depth_null_predicates.rs
+@@ -0,0 +1,84 @@
++use metal2vulkan::passes::{Stage, TransformOptions};
++
++#[test]
++fn direct_and_dynamic_depth_null_predicates_share_texture_lowering() {
++    for shape in ["2d", "2d_array", "2d_ms", "cube", "cube_array"] {
++        for indirect in [false, true] {
++            let args = if indirect {
++                "ptr addrspace(2) %args"
++            } else {
++                "ptr addrspace(1) %image"
++            };
++            let load = if indirect {
++                "  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i32 %choose\n  %bits = load i64, ptr addrspace(2) %slot, align 8\n  %image = inttoptr i64 %bits to ptr addrspace(1)\n"
++            } else {
++                ""
++            };
++            let binding = if indirect {
++                "!3 = !{i32 0, !\"air.indirect_buffer\", !\"air.location_index\", i32 3, i32 1, !\"air.read\", !\"air.address_space\", i32 2, !\"air.arg_type_name\", !\"Root\"}".to_owned()
++            } else {
++                format!("!3 = !{{i32 0, !\"air.texture\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.arg_type_name\", !\"depth{shape}<float>\"}}")
++            };
++            let source = format!(
++                r#"target triple = "air64-apple-macosx"
++%Root = type {{ [2 x ptr addrspace(1)] }}
++define void @entry({args}, ptr addrspace(1) %out, i32 %choose) {{
++entry:
++{load}  %missing = call i1 @air.is_null_depth_{shape}(ptr addrspace(1) %image)
++  %word = zext i1 %missing to i32
++  store i32 %word, ptr addrspace(1) %out
++  ret void
++}}
++declare i1 @air.is_null_depth_{shape}(ptr addrspace(1))
++!air.kernel = !{{!0}}
++!0 = !{{ptr @entry, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4, !5}}
++{binding}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}}
++!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}}
++"#
++            );
++            let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected_unvalidated(
++                &source,
++                Stage::Kernel,
++                &std::env::temp_dir(),
++                TransformOptions::default(),
++                None,
++            )
++            .unwrap_or_else(|error| panic!("shape={shape} indirect={indirect}: {error}"));
++            reflection.validate_descriptor_abi().unwrap();
++            let dir = std::env::temp_dir().join(format!(
++                "depth-null-{}-{shape}-{indirect}",
++                std::process::id()
++            ));
++            std::fs::create_dir_all(&dir).unwrap();
++            let path = dir.join("shader.spv");
++            std::fs::write(&path, spv).unwrap();
++            let output = std::process::Command::new("spirv-val")
++                .args(["--target-env", "vulkan1.2"])
++                .arg(&path)
++                .output()
++                .unwrap();
++            assert!(
++                output.status.success(),
++                "{}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++            let dis = std::process::Command::new("spirv-dis")
++                .arg(&path)
++                .output()
++                .unwrap();
++            let dis = String::from_utf8(dis.stdout).unwrap();
++            assert!(!dis.contains("air.is_null_depth"), "{dis}");
++            assert!(
++                !dis.contains("OpImageRead") && !dis.contains("OpImageFetch"),
++                "{dis}"
++            );
++            if indirect {
++                assert!(dis.contains("OpIEqual"), "{dis}");
++            }
++            std::fs::remove_dir_all(dir).unwrap();
++        }
++    }
++}

@@ -1,0 +1,15 @@
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -98,6 +98,11 @@ bool
+ radv_sparse_enabled(const struct radv_physical_device *pdev)
+ {
++#ifdef HAVE_AMDGPU_DARWIN
++   /* RDNA4N has no PRT mappings or sparse binds, including experimental mode. */
++   return false;
++#endif
++
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+    if (instance->queue_disable_flags & RADV_QUEUE_DISABLE_SPARSE)
+       return false;

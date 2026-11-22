@@ -1,0 +1,137 @@
+#include "amdgpu_smu.h"
+#include <cstdio>
+#include <vector>
+
+constexpr kern_return_t kIOReturnNoSpace = 0x2db;
+
+namespace {
+struct Message { uint32_t id, param; };
+std::vector<Message> messages;
+bool high_written;
+bool reject_high;
+bool reject_hardmin;
+bool reject_enable;
+bool bad_uclk_freq;
+bool fine_uclk;
+unsigned failures;
+void expect(bool value, const char *description) {
+    if (!value) { ++failures; std::printf("FAIL: %s\n", description); }
+}
+}
+
+namespace amdgpu {
+uint64_t smu_driver_table_mc(const DeviceContext &) { return 0; }
+kern_return_t smu_get_driver_if_version(const DeviceContext &, uint32_t *value) {
+    *value = 0x33;
+    return kIOReturnSuccess;
+}
+kern_return_t smu_send_msg_with_param(const DeviceContext &, uint32_t id,
+                                     uint32_t param, uint32_t *value) {
+    messages.push_back({id, param});
+    if (value) *value = 0;
+    if (id == PPSMC::NotifyPowerSource && param != 0) return kIOReturnError;
+    if (id == PPSMC::SetAllowedFeaturesMaskHigh) {
+        if (reject_high) return kIOReturnUnsupported;
+        high_written = true;
+    }
+    if (id == PPSMC::SetAllowedFeaturesMaskLow && !high_written)
+        return kIOReturnNotReady;
+    if (id == PPSMC::EnableAllSmuFeatures && reject_enable)
+        return kIOReturnUnsupported;
+    if (id == PPSMC::GetDpmFreqByIndex && value) {
+        const uint32_t clk = param >> 16;
+        const uint32_t idx = param & 0xFFFFu;
+        if (clk == PPCLK::UCLK) {
+            if (fine_uclk) {
+                if (idx == 0xFFu) *value = 0x80000002u;
+                else if (idx == 1u) *value = bad_uclk_freq ? 0u : 0x800004eau;
+                else return kIOReturnError;
+            } else {
+                if (idx == 0xFFu) *value = 6u;
+                else if (idx == 5u) *value = bad_uclk_freq ? 0u : 1258u;
+                else return kIOReturnError;
+            }
+        } else {
+            return kIOReturnError;
+        }
+    }
+    if (id == PPSMC::SetHardMinByFreq && reject_hardmin)
+        return kIOReturnUnsupported;
+    return kIOReturnSuccess;
+}
+kern_return_t smu_send_msg(const DeviceContext &dev, uint32_t id) {
+    return smu_send_msg_with_param(dev, id, 0, nullptr);
+}
+#define SMU_LOG(...) ((void)0)
+#include "smu_setup_actual.inc"
+#undef SMU_LOG
+}
+
+int main() {
+    amdgpu::DeviceContext dev {};
+    for (bool unsupported : {false, true}) {
+        reject_high = unsupported;
+        reject_hardmin = false;
+        reject_enable = false;
+        bad_uclk_freq = false;
+        fine_uclk = unsupported;
+        high_written = false;
+        messages.clear();
+        expect(amdgpu::smu_smc_hw_setup(dev, 0x8002e00000) == kIOReturnSuccess,
+               "setup completes with explicit feature-mask fallback");
+        size_t hi = messages.size(), lo = messages.size();
+        unsigned ac = 0, enable = 0, hard_uclk = 0, hard_fclk = 0;
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto &m = messages[i];
+            if (m.id == amdgpu::PPSMC::NotifyPowerSource) {
+                ++ac;
+                expect(m.param == 0, "SMU 14 AC power source is zero, not DC");
+            }
+            if (m.id == amdgpu::PPSMC::SetAllowedFeaturesMaskHigh) hi = i;
+            if (m.id == amdgpu::PPSMC::SetAllowedFeaturesMaskLow) lo = i;
+            if (m.id == amdgpu::PPSMC::EnableAllSmuFeatures) ++enable;
+            if (m.id == amdgpu::PPSMC::SetHardMinByFreq) {
+                if (m.param == ((amdgpu::PPCLK::UCLK << 16) | 1258u)) ++hard_uclk;
+                if ((m.param >> 16) == amdgpu::PPCLK::FCLK) ++hard_fclk;
+            }
+        }
+        expect(ac == 1 && enable == 1, "power source and master enable sent once");
+        expect(hi < messages.size(), "high feature word is sent");
+        if (unsupported)
+            expect(lo == messages.size(), "high-word rejection does not send an invalid low-word commit");
+        else
+            expect(hi < lo && lo < messages.size(), "high feature word precedes low-word commit");
+        expect(hard_uclk == 1, "UCLK table pins top level (1258 MHz) via SetHardMinByFreq");
+        expect(hard_fclk == 0, "FCLK is left unpinned so PMFW keeps low idle SOCCLK/power");
+    }
+
+    // Fallback to SetSoftMinByFreq when SetHardMinByFreq is rejected.
+    reject_high = false; reject_hardmin = true; reject_enable = false; bad_uclk_freq = false; fine_uclk = false; high_written = false;
+    messages.clear();
+    expect(amdgpu::smu_smc_hw_setup(dev, 0x8002e00000) == kIOReturnSuccess, "soft-min fallback setup completes");
+    unsigned soft_uclk = 0;
+    for (const auto &m : messages)
+        if (m.id == amdgpu::PPSMC::SetSoftMinByFreq && m.param == ((amdgpu::PPCLK::UCLK << 16) | 1258u)) ++soft_uclk;
+    expect(soft_uclk == 1, "SetHardMin rejection falls back to SetSoftMinByFreq for UCLK");
+
+    // Out-of-range frequency is skipped safely without sending a bogus floor.
+    reject_hardmin = false; bad_uclk_freq = true; high_written = false;
+    messages.clear();
+    expect(amdgpu::smu_smc_hw_setup(dev, 0x8002e00000) == kIOReturnSuccess, "bad UCLK frequency is non-fatal");
+    unsigned any_pin = 0;
+    for (const auto &m : messages)
+        if (m.id == amdgpu::PPSMC::SetHardMinByFreq || m.id == amdgpu::PPSMC::SetSoftMinByFreq) ++any_pin;
+    expect(any_pin == 0, "bad UCLK frequency skips pinning safely");
+
+    // Failed EnableAllSmuFeatures skips DPM floor pinning.
+    reject_enable = true; bad_uclk_freq = false; high_written = false;
+    messages.clear();
+    expect(amdgpu::smu_smc_hw_setup(dev, 0x8002e00000) == kIOReturnSuccess, "disabled DPM setup completes");
+    unsigned any_dpm_query = 0;
+    for (const auto &m : messages)
+        if (m.id == amdgpu::PPSMC::GetDpmFreqByIndex || m.id == amdgpu::PPSMC::SetHardMinByFreq) ++any_dpm_query;
+    expect(any_dpm_query == 0, "failed EnableAllSmuFeatures skips DPM clock pinning");
+
+    std::printf("smu setup: %u failed; simulated PMFW, no hardware access\n", failures);
+    return failures ? 1 : 0;
+}

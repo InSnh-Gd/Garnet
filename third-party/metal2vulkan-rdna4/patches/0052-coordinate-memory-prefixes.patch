@@ -1,0 +1,340 @@
+diff --git a/src/native/constant_reads.rs b/src/native/constant_reads.rs
+--- a/src/native/constant_reads.rs
++++ b/src/native/constant_reads.rs
+@@ -108,16 +108,7 @@
+     instruction: &'a TirInst,
+ ) -> Option<(Vec<&'a TirInst>, String)> {
+     let load = instruction.load().as_deref()?;
+-    let numeric = |ty: &LlType| {
+-        matches!(
+-            parsed.resolve_known_type(ty),
+-            LlType::Int(_) | LlType::Float | LlType::Half | LlType::BFloat
+-        )
+-    };
+-    let ty = parsed.resolve_known_type(&load.result_ty);
+-    if load.ordered
+-        || !(numeric(&ty) || matches!(&ty, LlType::Vector(element, _) if numeric(element)))
+-    {
++    if load.ordered || !numeric_type(parsed, &load.result_ty) {
+         return None;
+     }
+     let LlValue::Local(mut pointer) = load.ptr.value.clone() else {
+@@ -157,6 +148,17 @@
+     }
+     path.reverse();
+     Some((path, pointer))
++}
++
++pub(super) fn numeric_type(parsed: &LlModule, ty: &LlType) -> bool {
++    match parsed.resolve_known_type(ty) {
++        LlType::Int(_) | LlType::Float | LlType::Half | LlType::BFloat => true,
++        LlType::Vector(element, _) => matches!(
++            parsed.resolve_known_type(&element),
++            LlType::Int(_) | LlType::Float | LlType::Half | LlType::BFloat
++        ),
++        _ => false,
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/native/guarded_reads.rs b/src/native/guarded_reads.rs
+--- a/src/native/guarded_reads.rs
++++ b/src/native/guarded_reads.rs
+@@ -1,8 +1,8 @@
+ //! Reconverge guarded coordinate reads without speculating their memory accesses.
+ //!
+-//! Reads keep their source condition, then supply zero on inactive paths at a new merge before
+-//! the original selection. Derivatives can use the dominating value after reconvergence while
+-//! descriptor selection, sampling and side effects keep their original execution sites.
++//! Memory prefixes keep their source condition and order, then reads supply zero on inactive
++//! paths at a new merge. Derivatives can use the dominating value after reconvergence while
++//! descriptor selection and sampling keep their original execution sites.
+ 
+ use super::cfg::{BlockRole, BodyBlock};
+ use super::ir::{LlFunction, LlModule, LlValue};
+@@ -17,6 +17,7 @@
+     block: usize,
+     reads: Vec<TirInst>,
+     dependencies: Vec<TirInst>,
++    removed: HashSet<usize>,
+ }
+ 
+ pub(super) fn reconverge(parsed: &LlModule, function: &LlFunction, blocks: &mut Vec<BodyBlock>) {
+@@ -134,16 +135,16 @@
+                     ],
+                 );
+             }
+-            let removed = arm
+-                .reads
+-                .iter()
+-                .filter_map(|i| i.result.as_ref())
+-                .collect::<HashSet<_>>();
++            let mut index = 0;
+             blocks[arm.block]
+                 .typed_mut()
+                 .expect("planned source arm")
+                 .insts
+-                .retain(|i| i.result.as_ref().is_none_or(|name| !removed.contains(name)));
++                .retain(|_| {
++                    let keep = !arm.removed.contains(&index);
++                    index += 1;
++                    keep
++                });
+             additions.push(body(guard));
+         }
+         additions.push(body(merge));
+@@ -223,8 +224,10 @@
+     }
+     let mut reads = Vec::new();
+     let mut copied = HashSet::new();
+-    for instruction in &block.insts {
+-        if !readable_prefix(instruction) {
++    let mut removed = HashSet::new();
++    let mut last_read = None;
++    for (position, instruction) in block.insts.iter().enumerate() {
++        if !readable_prefix(instruction) && !ordinary_store(parsed, instruction) {
+             break;
+         }
+         if !instruction
+@@ -243,6 +246,29 @@
+         };
+         copied.extend(path);
+         reads.push(instruction.clone());
++        removed.insert(position);
++        last_read = Some(position);
++    }
++    let end = last_read? + 1;
++    let prefix = &block.insts[..end];
++    if prefix.iter().any(|i| i.opcode == TirOpcode::Store) {
++        reads.clear();
++        for (position, instruction) in prefix.iter().enumerate() {
++            if instruction.opcode == TirOpcode::Load {
++                super::constant_reads::entry_read_path(parsed, function, definitions, instruction)?;
++                reads.push(instruction.clone());
++                removed.insert(position);
++            } else if instruction.opcode == TirOpcode::Store {
++                removed.insert(position);
++            }
++        }
++        // Move the complete memory prefix; leaving an earlier read behind a write changes its value.
++        return Some(Arm {
++            block: index,
++            reads,
++            dependencies: prefix.to_vec(),
++            removed,
++        });
+     }
+     let dependencies = block
+         .insts
+@@ -254,7 +280,16 @@
+         block: index,
+         reads,
+         dependencies,
++        removed,
+     })
++}
++
++fn ordinary_store(parsed: &LlModule, instruction: &TirInst) -> bool {
++    !instruction.ordered_memory()
++        && instruction
++            .store()
++            .as_ref()
++            .is_some_and(|store| super::constant_reads::numeric_type(parsed, &store.0.ty))
+ }
+ 
+ fn read_dependencies(
+@@ -285,6 +320,9 @@
+ fn readable_prefix(instruction: &TirInst) -> bool {
+     if let Some(load) = instruction.load().as_ref() {
+         return !load.ordered;
++    }
++    if let Some(call) = instruction.call().as_ref() {
++        return call.callee.starts_with("air.convert.");
+     }
+     matches!(
+         instruction.opcode,
+diff --git a/src/native/guarded_reads/tests.rs b/src/native/guarded_reads/tests.rs
+--- a/src/native/guarded_reads/tests.rs
++++ b/src/native/guarded_reads/tests.rs
+@@ -93,7 +93,11 @@
+ #[test]
+ fn side_effects_and_ordered_reads_remain_in_the_source_arm() {
+     for (prefix, load) in [
+-        ("store i32 7, ptr addrspace(1) %output", "float"),
++        ("store volatile i32 7, ptr addrspace(1) %output", "float"),
++        (
++            "store atomic i32 7, ptr addrspace(1) %output seq_cst",
++            "float",
++        ),
+         ("call void @side_effect()", "float"),
+         ("fence seq_cst", "float"),
+         ("", "volatile float"),
+@@ -106,6 +110,104 @@
+             .iter()
+             .any(|i| i.opcode == TirOpcode::Load));
+     }
++}
++
++#[test]
++fn ordinary_store_and_all_preceding_reads_keep_their_order_and_execute_once() {
++    let text = source(
++        "%before = load i32, ptr addrspace(2) %buffer, align 4\n \
++         store i32 %before, ptr addrspace(1) %output, align 4",
++        "float",
++    )
++    .replace(
++        " br label %exit\nexit:",
++        " store i32 %before, ptr addrspace(1) %output, align 4\n br label %exit\nexit:",
++    );
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 5);
++    let TirTerminator::BrCond { t, f, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    let guard = named(&blocks, t);
++    assert_eq!(
++        guard
++            .insts
++            .iter()
++            .map(|i| i.opcode.clone())
++            .collect::<Vec<_>>(),
++        [
++            TirOpcode::Load,
++            TirOpcode::Store,
++            TirOpcode::GetElementPtr,
++            TirOpcode::Load
++        ]
++    );
++    let merge = named(&blocks, f);
++    assert_eq!(merge.insts.len(), 2);
++    assert!(merge
++        .insts
++        .iter()
++        .any(|i| i.result.as_deref() == Some("%before")));
++    let arm = named(&blocks, "%arm");
++    assert!(!arm.insts.iter().any(|i| i.load().is_some()));
++    assert_eq!(arm.insts.iter().filter(|i| i.store().is_some()).count(), 1);
++    assert_eq!(
++        blocks
++            .iter()
++            .flat_map(|b| &b.typed.as_ref().unwrap().insts)
++            .filter(|i| i.store().is_some())
++            .count(),
++        2
++    );
++    let parsed = LlModule::parse_with_stage_meta(&text, None, Some("main")).unwrap();
++    let mut repeated = blocks.clone();
++    reconverge(&parsed, &parsed.functions[0], &mut repeated);
++    assert_eq!(
++        repeated.iter().map(BodyBlock::lines).collect::<Vec<_>>(),
++        blocks.iter().map(BodyBlock::lines).collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn store_prefix_cannot_reorder_opaque_or_ordered_preceding_reads() {
++    for prefix in [
++        "%opaque = load ptr addrspace(1), ptr addrspace(2) %buffer, align 8\n store i32 7, ptr addrspace(1) %output",
++        "%old = load volatile i32, ptr addrspace(2) %buffer, align 4\n store i32 7, ptr addrspace(1) %output",
++        "store ptr addrspace(2) %sampler, ptr addrspace(1) %output",
++    ] {
++        assert_eq!(rewritten(&source(prefix, "float")).len(), 3, "{prefix}");
++    }
++}
++
++#[test]
++fn numeric_air_conversion_keeps_the_original_store_guard_and_order() {
++    let text = source(
++        "%converted = call i32 @air.convert.u.i32.f.f32(float 0.25)\n \
++         store i32 %converted, ptr addrspace(1) %output, align 4",
++        "float",
++    );
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 5);
++    let TirTerminator::BrCond { t, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    assert_eq!(
++        named(&blocks, t)
++            .insts
++            .iter()
++            .map(|i| i.opcode.clone())
++            .collect::<Vec<_>>(),
++        [
++            TirOpcode::Call,
++            TirOpcode::Store,
++            TirOpcode::GetElementPtr,
++            TirOpcode::Load
++        ]
++    );
++    assert!(!named(&blocks, "%arm")
++        .insts
++        .iter()
++        .any(|i| i.store().is_some()));
+ }
+ 
+ #[test]
+diff --git a/src/native/tir/mod.rs b/src/native/tir/mod.rs
+--- a/src/native/tir/mod.rs
++++ b/src/native/tir/mod.rs
+@@ -810,6 +810,7 @@
+         rest: Option<String>,
+     },
+     Memory {
++        ordered: bool,
+         align: Option<u64>,
+         load: Option<Box<LlLoad>>,
+         store: Option<Box<(TypedValue, TypedValue)>>,
+@@ -1025,6 +1026,13 @@
+             TirInstData::Memory { align, .. } => *align,
+             _ => None,
+         }
++    }
++
++    pub(super) fn ordered_memory(&self) -> bool {
++        matches!(
++            &self.data.payload,
++            TirInstData::Memory { ordered: true, .. }
++        )
+     }
+ 
+     pub(super) fn gep_source_ty(&self) -> Option<&LlType> {
+diff --git a/src/native/tir/lower.rs b/src/native/tir/lower.rs
+--- a/src/native/tir/lower.rs
++++ b/src/native/tir/lower.rs
+@@ -559,6 +559,11 @@
+             rest: icmp_rest,
+         },
+         "load" | "store" => TirInstData::Memory {
++            ordered: rhs_of(line).split(',').next().is_some_and(|prefix| {
++                prefix
++                    .split_whitespace()
++                    .any(|token| matches!(token, "volatile" | "atomic"))
++            }),
+             align: mem_align,
+             load,
+             store,
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -668,11 +668,16 @@
+ A branch-local numeric entry-buffer read without an unconditional accessible span
+ can be evaluated under its original branch condition, then reconverged before the
+ sampling selection. The native typed transform builds guarded address/read blocks
+-and phi values with zero on inactive paths; the original descriptor operations,
+-samples and side effects keep their source sites. This is conditional evaluation,
++and phi values with zero on inactive paths; the original descriptor operations
++and samples keep their source sites. This is conditional evaluation,
+ not storage-load speculation. It requires single-predecessor source arms,
+-entry-rooted address paths and a prefix free of writes, calls, barriers and ordered
+-reads. Runtime GEP indices retain their integer width and source guard; their
++entry-rooted address paths and a prefix free of unknown calls, barriers and ordered
++memory operations. Pure AIR numeric conversions are permitted. Ordinary numeric
++stores require moving the complete prefix, including every preceding numeric
++read, in source order under the original predicate. Reads return through phis
++so later source instructions see the original values; stores execute exactly once.
++Prefixes with opaque read/store values remain unsupported. Runtime GEP indices
++retain their integer width and source guard; their
+ arm-local integer dependencies and numeric entry-buffer reads move with the
+ coordinate read in source order. Physical-address bounds and permissions remain
+ checked after interface lowering. Unconditional hoisting still requires static

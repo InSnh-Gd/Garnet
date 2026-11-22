@@ -1,0 +1,69 @@
+diff --git a/src/native/guarded_reads.rs b/src/native/guarded_reads.rs
+--- a/src/native/guarded_reads.rs
++++ b/src/native/guarded_reads.rs
+@@ -23,6 +23,8 @@
+     if !parsed.entry_functions.contains(&function.name) {
+         return;
+     }
++    // Identity phis are already values; resolve them before tracing guarded address/read paths.
++    super::tir::canonicalize_single_predecessor_phis(blocks);
+     let positions = blocks
+         .iter()
+         .enumerate()
+diff --git a/src/native/guarded_reads/tests.rs b/src/native/guarded_reads/tests.rs
+--- a/src/native/guarded_reads/tests.rs
++++ b/src/native/guarded_reads/tests.rs
+@@ -363,6 +363,31 @@
+ }
+ 
+ #[test]
++fn single_predecessor_address_identities_are_resolved_before_region_planning() {
++    let text = source("", "float")
++        .replace("arm:\n", "arm:\n %offset = add i64 %index, 8\n br label %read\nread:\n %forward = phi i64 [ %offset, %arm ]\n %base = phi ptr addrspace(2) [ %buffer, %arm ]\n")
++        .replace("%buffer, i64 8", "%base, i64 %forward")
++        .replace("[ %sample, %arm ]", "[ %sample, %read ]");
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 6);
++    let TirTerminator::BrCond { t, .. } = &named(&blocks, "%entry").terminator else {
++        panic!()
++    };
++    assert_eq!(
++        named(&blocks, t)
++            .insts
++            .iter()
++            .filter(|i| i.load().is_some())
++            .count(),
++        1
++    );
++    assert!(!blocks
++        .iter()
++        .flat_map(|b| &b.typed.as_ref().unwrap().insts)
++        .any(|i| matches!(i.result.as_deref(), Some("%base" | "%forward"))));
++}
++
++#[test]
+ fn loaded_runtime_indices_move_with_the_read_but_unproven_address_roots_do_not() {
+     let text = source(
+         "%index_ptr = getelementptr i8, ptr addrspace(2) %buffer, i64 0\n \
+diff --git a/src/native/tir/mod.rs b/src/native/tir/mod.rs
+--- a/src/native/tir/mod.rs
++++ b/src/native/tir/mod.rs
+@@ -55,7 +55,7 @@
+ /// names that predecessor with the same value, the phi is the value itself. Substitute every such
+ /// result in the typed carrier before SPIR-V values or pointer-representation sidecars are built.
+ ///
+-/// This runs on the finalized structurized carriers, where the predecessor relation is authoritative.
++/// This runs on source or finalized structurized carriers, using their actual predecessor relation.
+ /// It deliberately leaves partial, conflicting, and multi-predecessor phis intact and fail-visible.
+ pub(in crate::native) fn canonicalize_single_predecessor_phis(
+     blocks: &mut [crate::native::cfg::BodyBlock],
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -692,3 +692,6 @@
+ buffer needs checked dynamic addressing.
+ Unsupported shapes remain visible refusals. Direct, linked and cached paths share
+ the resulting dominating values without additional source-proof metadata.
++Single-predecessor identity phis are substituted using the existing typed-CFG
++canonicalizer before guarded address/read planning. Multi-predecessor, incomplete,
++conflicting and self-referential phis retain their normal analysis boundary.

@@ -1,0 +1,954 @@
+diff --git a/src/emit_sidecar.rs b/src/emit_sidecar.rs
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -64,6 +64,8 @@
+     /// Pointer handle loaded from element `index` of a buffer parameter whose AIR element is one
+     /// serialized 64-bit opaque handle (for example `array_ref<texture2d<...>>`).
+     pub(crate) buffer_pointer_dynamic_field_loads: Vec<BufferPointerDynamicFieldLoad>,
++    /// Actual serialized token words, independent of the pointer path that reached a resource.
++    pub(crate) opaque_resource_payloads: Vec<OpaqueResourcePayload>,
+     pub(crate) local_pointer_field_stores: Vec<LocalPointerFieldStore>,
+     pub(crate) local_pointer_field_loads: Vec<LocalPointerFieldLoad>,
+     pub(crate) local_pointer_dynamic_field_loads: Vec<LocalPointerDynamicFieldLoad>,
+@@ -194,6 +196,13 @@
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct OpaqueResourcePayload {
++    pub(crate) id: Word,
++    pub(crate) low: Word,
++    pub(crate) high: Word,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub(crate) struct LocalPointerFieldStore {
+     pub(crate) id: Word,
+     pub(crate) source: Word,
+@@ -245,6 +254,9 @@
+         }
+         for fact in &self.buffer_pointer_dynamic_field_loads {
+             ids.extend([fact.id, fact.root, fact.index]);
++        }
++        for fact in &self.opaque_resource_payloads {
++            ids.extend([fact.id, fact.low, fact.high]);
+         }
+         for fact in &self.local_pointer_field_stores {
+             ids.extend([fact.id, fact.source, fact.root]);
+@@ -307,6 +319,11 @@
+             replace(&mut fact.id);
+             replace(&mut fact.root);
+             replace(&mut fact.index);
++        }
++        for fact in &mut self.opaque_resource_payloads {
++            replace(&mut fact.id);
++            replace(&mut fact.low);
++            replace(&mut fact.high);
+         }
+         for fact in &mut self.local_pointer_field_stores {
+             replace(&mut fact.id);
+@@ -422,6 +439,18 @@
+             .collect::<Vec<_>>();
+         self.buffer_pointer_dynamic_field_loads.extend(clones);
+         let clones = self
++            .opaque_resource_payloads
++            .iter()
++            .filter_map(|fact| {
++                Some(OpaqueResourcePayload {
++                    id: remap.get(&fact.id).copied()?,
++                    low: remap.get(&fact.low).copied().unwrap_or(fact.low),
++                    high: remap.get(&fact.high).copied().unwrap_or(fact.high),
++                })
++            })
++            .collect::<Vec<_>>();
++        self.opaque_resource_payloads.extend(clones);
++        let clones = self
+             .local_pointer_field_loads
+             .iter()
+             .filter_map(|fact| {
+@@ -495,6 +524,11 @@
+     #[test]
+     fn inlining_clones_load_facts_and_remaps_store_sources() {
+         let mut sidecar = EmitSidecar {
++            opaque_resource_payloads: vec![OpaqueResourcePayload {
++                id: 80,
++                low: 71,
++                high: 91,
++            }],
+             ordinary_plan_rejected_functions: HashSet::new(),
+             ownership_plan_rejected_functions: HashSet::new(),
+             post_lowering_cfg_construction_functions: HashSet::new(),
+@@ -550,6 +584,21 @@
+ 
+         sidecar.clone_inlined_facts(&remap);
+         sidecar.remap_local_pointer_field_store_sources(&remap);
++        assert_eq!(
++            sidecar.opaque_resource_payloads,
++            vec![
++                OpaqueResourcePayload {
++                    id: 80,
++                    low: 71,
++                    high: 91
++                },
++                OpaqueResourcePayload {
++                    id: 180,
++                    low: 71,
++                    high: 191
++                },
++            ]
++        );
+ 
+         assert_eq!(
+             sidecar.buffer_access_offsets,
+@@ -656,6 +705,11 @@
+     #[test]
+     fn whole_module_substitution_remaps_every_sidecar_id_field() {
+         let mut sidecar = EmitSidecar {
++            opaque_resource_payloads: vec![OpaqueResourcePayload {
++                id: 53,
++                low: 54,
++                high: 55,
++            }],
+             all_device_buffers_raw: false,
+             large_buffer_addressing: true,
+             construct_cross_binding_addresses: false,
+@@ -731,6 +785,9 @@
+         };
+         let remap = HashMap::from([
+             (10, 110),
++            (53, 153),
++            (54, 154),
++            (55, 155),
+             (11, 111),
+             (12, 112),
+             (13, 113),
+@@ -761,6 +818,14 @@
+ 
+         sidecar.remap_ids(&remap);
+         assert_eq!(
++            sidecar.opaque_resource_payloads,
++            vec![OpaqueResourcePayload {
++                id: 153,
++                low: 154,
++                high: 155
++            }]
++        );
++        assert_eq!(
+             sidecar.aggregate_pointer_values,
+             vec![AggregatePointerValue {
+                 aggregate: 143,
+diff --git a/src/native/constfold/simplify.rs b/src/native/constfold/simplify.rs
+--- a/src/native/constfold/simplify.rs
++++ b/src/native/constfold/simplify.rs
+@@ -351,6 +351,8 @@
+             | Op::Load
+             | Op::CopyObject
+             | Op::Bitcast
++            | Op::ConvertPtrToU
++            | Op::ConvertUToPtr
+             | Op::UConvert
+             | Op::SConvert
+             | Op::FConvert
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -1706,6 +1706,19 @@
+                 .iter()
+                 .filter_map(|name| self.values.get(name).map(|(id, _)| *id)),
+         );
++        for name in &self.opaque_resource_pointers {
++            if let (Some((id, _)), Some((low, high))) =
++                (self.values.get(name), self.pointer_payload_words.get(name))
++            {
++                self.emit_sidecar.opaque_resource_payloads.push(
++                    crate::emit_sidecar::OpaqueResourcePayload {
++                        id: *id,
++                        low: *low,
++                        high: *high,
++                    },
++                );
++            }
++        }
+         Ok(())
+     }
+ 
+diff --git a/src/native/emitter/mod.rs b/src/native/emitter/mod.rs
+--- a/src/native/emitter/mod.rs
++++ b/src/native/emitter/mod.rs
+@@ -1395,6 +1395,12 @@
+                     .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
+                     .map(|fact| fact.id),
+             )
++            .chain(
++                self.emit_sidecar
++                    .opaque_resource_payloads
++                    .iter()
++                    .map(|fact| fact.id),
++            )
+             .collect::<HashSet<_>>();
+         let memory_pointer_values = self
+             .module
+@@ -1712,6 +1718,12 @@
+                     .buffer_pointer_dynamic_field_loads
+                     .iter()
+                     .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
++                    .map(|fact| fact.id),
++            )
++            .chain(
++                self.emit_sidecar
++                    .opaque_resource_payloads
++                    .iter()
+                     .map(|fact| fact.id),
+             )
+             .collect::<HashSet<_>>();
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -0,0 +1,232 @@
++//! Resource handles reached through affine record indexing or device-address pointers.
++
++use super::gpu_arguments::{lookup_function, raw_buffer, value};
++use super::*;
++use crate::meta::{EmbeddedSampler, EmbeddedTexture};
++use spirv::Capability;
++use std::collections::BTreeMap;
++
++/// Keep the static ABI when every token has a representable root/field coordinate. Otherwise
++/// consume the emitter's actual token words, so nested addresses are evaluated on the GPU.
++pub(in crate::passes) fn lower_argument_resource_graph(
++    ctx: &mut Ctx,
++    entry: usize,
++    textures: &[EmbeddedTexture],
++    samplers: &[EmbeddedSampler],
++) -> Result<bool, String> {
++    let mut payloads = ctx
++        .emit_sidecar
++        .opaque_resource_payloads
++        .iter()
++        .map(|fact| (fact.id, (fact.low, fact.high)))
++        .collect::<HashMap<_, _>>();
++    if payloads.is_empty() {
++        return Ok(false);
++    }
++    let mut covered = HashSet::new();
++    for (param, offset, length) in textures
++        .iter()
++        .map(|field| {
++            (
++                field.buffer_param_index,
++                field.field_offset,
++                field.array_length.unwrap_or(1),
++            )
++        })
++        .chain(samplers.iter().map(|field| {
++            (
++                field.buffer_param_index,
++                field.field_offset,
++                field.array_length.unwrap_or(1),
++            )
++        }))
++    {
++        let Some(root) = ctx.module.functions[entry]
++            .parameters
++            .get(param as usize)
++            .and_then(|p| p.result_id)
++        else {
++            continue;
++        };
++        let start = u64::from(offset);
++        let end = start + u64::from(length) * 8;
++        covered.extend(
++            ctx.emit_sidecar
++                .buffer_pointer_field_loads
++                .iter()
++                .filter(|fact| {
++                    fact.root == root
++                        && fact.byte_offset >= start
++                        && fact.byte_offset < end
++                        && (fact.byte_offset - start) % 8 == 0
++                })
++                .map(|fact| fact.id),
++        );
++        covered.extend(
++            ctx.emit_sidecar
++                .buffer_pointer_dynamic_field_loads
++                .iter()
++                .filter(|fact| fact.root == root && fact.byte_offset == start)
++                .map(|fact| fact.id),
++        );
++    }
++    let copies = ctx.module.functions[entry]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .filter(|inst| matches!(inst.class.opcode, Op::CopyObject | Op::Bitcast))
++        .filter_map(|inst| match (inst.result_id, inst.operands.first()) {
++            (Some(id), Some(Operand::IdRef(source))) => Some((id, *source)),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    loop {
++        let before = (payloads.len(), covered.len());
++        for &(id, source) in &copies {
++            if let Some(&words) = payloads.get(&source) {
++                payloads.entry(id).or_insert(words);
++            }
++            if let Some(&words) = payloads.get(&id) {
++                payloads.entry(source).or_insert(words);
++            }
++            if covered.contains(&source) {
++                covered.insert(id);
++            }
++            if covered.contains(&id) {
++                covered.insert(source);
++            }
++        }
++        if before == (payloads.len(), covered.len()) {
++            break;
++        }
++    }
++    let names = air_names(&ctx.module);
++    let needs_graph = ctx.module.functions[entry].blocks.iter().flat_map(|block| &block.instructions)
++        .filter(|inst| inst.class.opcode == Op::FunctionCall)
++        .filter(|inst| matches!(inst.operands.first(), Some(Operand::IdRef(callee)) if names.get(callee).is_some_and(|name| name.starts_with("air.") && (name.contains("_texture_") || name.contains("_depth_")))))
++        .any(|inst| inst.operands.iter().skip(1).take(2).any(|operand|
++            matches!(operand, Operand::IdRef(id) if payloads.contains_key(id) && !covered.contains(id))));
++    if !needs_graph {
++        return Ok(false);
++    }
++    if ctx.descriptor_layout != crate::reflect::DescriptorLayout::default() {
++        return Err("GPU argument graphs require the default stage descriptor ABI".into());
++    }
++    let table = raw_buffer(ctx, super::gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING);
++    ctx.interface_buffer_var(table);
++    let lookup = lookup_function(ctx, table);
++    let uint = ctx.ty_uint();
++    let mut globals = BTreeMap::new();
++    for block in 0..ctx.module.functions[entry].blocks.len() {
++        let instructions = ctx.module.functions[entry].blocks[block]
++            .instructions
++            .clone();
++        let mut body = Vec::with_capacity(instructions.len());
++        for mut inst in instructions {
++            let name = match (inst.class.opcode, inst.operands.first()) {
++                (Op::FunctionCall, Some(Operand::IdRef(callee))) => names.get(callee),
++                _ => None,
++            };
++            if let Some(name) = name {
++                for position in 1..=2 {
++                    let Some(Operand::IdRef(handle)) = inst.operands.get(position) else {
++                        continue;
++                    };
++                    let Some(&(low, high)) = payloads.get(handle) else {
++                        continue;
++                    };
++                    if !(name.starts_with("air.sample_") || name.starts_with("air.gather_")) {
++                        if name.contains("_texture_") || name.contains("_depth_") {
++                            return Err(format!("GPU argument graph does not yet model {name}"));
++                        }
++                        continue;
++                    }
++                    let (category, element, shape) = if position == 2 {
++                        (2, ctx.ty_sampler(), None)
++                    } else {
++                        let (dim, arrayed) = super::super::air_calls::intrinsic_texture_shape(name)
++                            .ok_or("GPU argument texture intrinsic has no known shape")?;
++                        if dim == Dim::DimBuffer {
++                            return Err("GPU argument graph texel buffers are unsupported".into());
++                        }
++                        let component = name
++                            .rsplit('.')
++                            .next()
++                            .ok_or("missing image component type")?;
++                        let comp = match component {
++                            "v4f16" | "v4f32" | "f16" | "f32" => ImageComp::Float,
++                            "v4i16" | "v4i32" | "i16" | "i32" => {
++                                if name.split('.').any(|part| part == "u") {
++                                    ImageComp::Uint
++                                } else {
++                                    ImageComp::Sint
++                                }
++                            }
++                            _ => {
++                                return Err(format!(
++                                    "unknown GPU argument image component in {name}"
++                                ))
++                            }
++                        };
++                        (
++                            0,
++                            ctx.ty_image(dim, arrayed, comp),
++                            Some((dim, arrayed, comp)),
++                        )
++                    };
++                    let global = *globals.entry((category, element)).or_insert_with(|| {
++                        let array = ctx.ty_runtime_array(element);
++                        let pointer = ctx.ty_ptr(StorageClass::UniformConstant, array);
++                        let global = ctx.module.fresh_id();
++                        ctx.new_globals.push(Instruction::new(
++                            Op::Variable,
++                            Some(pointer),
++                            Some(global),
++                            vec![Operand::StorageClass(StorageClass::UniformConstant)],
++                        ));
++                        decorate_binding(&mut ctx.module, global, 2 + category, 0);
++                        ctx.interface_buffer_var(global);
++                        global
++                    });
++                    let category = ctx.const_uint(category);
++                    let index = value(
++                        ctx,
++                        &mut body,
++                        Op::FunctionCall,
++                        uint,
++                        vec![
++                            Operand::IdRef(lookup),
++                            Operand::IdRef(low),
++                            Operand::IdRef(high),
++                            Operand::IdRef(category),
++                        ],
++                    );
++                    let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, element);
++                    let pointer = value(
++                        ctx,
++                        &mut body,
++                        Op::AccessChain,
++                        pointer_ty,
++                        vec![Operand::IdRef(global), Operand::IdRef(index)],
++                    );
++                    let loaded = value(
++                        ctx,
++                        &mut body,
++                        Op::Load,
++                        element,
++                        vec![Operand::IdRef(pointer)],
++                    );
++                    if let Some((dim, arrayed, comp)) = shape {
++                        ctx.image_dims.insert(loaded, (dim, arrayed));
++                        ctx.image_comp.insert(loaded, comp);
++                    }
++                    inst.operands[position] = Operand::IdRef(loaded);
++                }
++            }
++            body.push(inst);
++        }
++        ctx.module.functions[entry].blocks[block].instructions = body;
++    }
++    ctx.add_capability(Capability::RuntimeDescriptorArray);
++    Ok(true)
++}
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -6,6 +6,7 @@
+ mod buffer_addresses;
+ mod collapse;
+ mod discovery;
++mod gpu_argument_graph;
+ mod gpu_arguments;
+ mod nonuniform;
+ mod query_select;
+@@ -17,6 +18,7 @@
+ pub(in crate::passes) use buffer_addresses::*;
+ pub(in crate::passes) use collapse::*;
+ pub(in crate::passes) use discovery::*;
++pub(in crate::passes) use gpu_argument_graph::lower_argument_resource_graph;
+ pub use gpu_arguments::{
+     lower_argument_resource_tables, ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET,
+     ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -390,7 +390,7 @@
+     Ok(())
+ }
+ 
+-fn raw_buffer(ctx: &mut Ctx, binding: u32) -> Word {
++pub(super) fn raw_buffer(ctx: &mut Ctx, binding: u32) -> Word {
+     let uint = ctx.ty_uint();
+     let array = ctx.ty_runtime_array(uint);
+     let stride = vec![
+@@ -455,7 +455,7 @@
+     var
+ }
+ 
+-fn value(
++pub(super) fn value(
+     ctx: &mut Ctx,
+     body: &mut Vec<Instruction>,
+     op: Op,
+@@ -497,7 +497,7 @@
+     }
+ }
+ 
+-fn lookup_function(ctx: &mut Ctx, table: Word) -> Word {
++pub(super) fn lookup_function(ctx: &mut Ctx, table: Word) -> Word {
+     let uint = ctx.ty_uint();
+     let boolean = ctx.ty_bool();
+     let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+diff --git a/src/passes/resources/bindings.rs b/src/passes/resources/bindings.rs
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -248,6 +248,14 @@
+         }
+     }
+ 
++    let graph = module.capabilities.iter().any(|capability| {
++        capability.operands.first()
++            == Some(&Operand::Capability(
++                spirv::Capability::RuntimeDescriptorArray,
++            ))
++    }) && bindings
++        .iter()
++        .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0));
+     let mut occupied = std::collections::BTreeMap::<(u32, u32), (Word, DescriptorClass)>::new();
+     for variable in module
+         .types_global_values
+@@ -290,7 +298,25 @@
+             }
+             DescriptorClass::InputAttachment => layout.color_inputs.contains(binding),
+         };
+-        if set != layout.set || !allowed {
++        let runtime = variable
++            .result_type
++            .and_then(|ty| definitions.get(&ty))
++            .and_then(|ty| match ty.operands.get(1) {
++                Some(Operand::IdRef(id)) => definitions.get(id),
++                _ => None,
++            })
++            .is_some_and(|ty| ty.class.opcode == Op::TypeRuntimeArray);
++        let graph_binding = graph
++            && ((set == 0 && binding == 672 && class == DescriptorClass::StorageBuffer)
++                || (runtime
++                    && binding == 0
++                    && matches!(
++                        (set, class),
++                        (2, DescriptorClass::SampledImage)
++                            | (3, DescriptorClass::StorageImage)
++                            | (4, DescriptorClass::Sampler)
++                    )));
++        if !graph_binding && (set != layout.set || !allowed) {
+             return Err(format!(
+                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
+                 label(id)
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -2328,21 +2328,31 @@
+         Stage::Vertex => vert.map(|meta| meta.embedded_samplers.as_slice()),
+         Stage::Kernel => kern.map(|meta| meta.embedded_samplers.as_slice()),
+     };
+-    register_embedded_samplers(ctx, entry_idx, embedded_samplers)?;
+-    // Convert AIR constexpr sampler globals to real sampler resources and rewrite their uses.
+-    handle_static_sampler(ctx)?;
+-    include_existing_private_globals(ctx);
+-
+-    // Register textures embedded in an argument buffer (via `air.indirect_argument` → `air.texture`,
+-    // read/written by AIR texture intrinsics) as standalone images BEFORE applying param bindings. This
+-    // lands them in `ctx.image_dims`/`ctx.image_comp` and, for writable fields, `ctx.image_storage`, so
+-    // private-placeholder helper operands can recover the real descriptor.
+     let embedded_textures = match stage {
+         Stage::Fragment => frag.map(|meta| meta.embedded_textures.as_slice()),
+         Stage::Vertex => vert.map(|meta| meta.embedded_textures.as_slice()),
+         Stage::Kernel => kern.map(|meta| meta.embedded_textures.as_slice()),
+     };
+-    register_embedded_textures(ctx, entry_idx, embedded_textures)?;
++    let resource_graph = super::resources::lower_argument_resource_graph(
++        ctx,
++        entry_idx,
++        embedded_textures.unwrap_or(&[]),
++        embedded_samplers.unwrap_or(&[]),
++    )?;
++    if !resource_graph {
++        register_embedded_samplers(ctx, entry_idx, embedded_samplers)?;
++    }
++    // Convert AIR constexpr sampler globals to real sampler resources and rewrite their uses.
++    handle_static_sampler(ctx)?;
++    include_existing_private_globals(ctx);
++
++    // Register textures embedded in an argument buffer (via `air.indirect_argument` → `air.texture`,
++    // read/written by AIR texture intrinsics) as standalone images BEFORE applying param bindings. This
++    // lands them in `ctx.image_dims`/`ctx.image_comp` and, for writable fields, `ctx.image_storage`, so
++    // private-placeholder helper operands can recover the real descriptor.
++    if !resource_graph {
++        register_embedded_textures(ctx, entry_idx, embedded_textures)?;
++    }
+ 
+     // Apply param bindings to the body: drop params, then splice replacements.
+     apply_bindings(ctx, entry_idx, bindings, &buffer_structs, &all_defs)?;
+diff --git a/src/passes/air_calls/mod.rs b/src/passes/air_calls/mod.rs
+--- a/src/passes/air_calls/mod.rs
++++ b/src/passes/air_calls/mod.rs
+@@ -5,6 +5,7 @@
+ use super::*;
+ 
+ mod images;
++pub(in crate::passes) use images::intrinsic_texture_shape;
+ use images::*;
+ 
+ mod dispatch_texture;
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -1849,6 +1849,16 @@
+     })
+ }
+ 
++/// GPU token-table and descriptor-array ABI for a nested argument resource graph.
++#[derive(Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct ArgumentResourceTables {
++    pub version: u32,
++    pub table_binding: u32,
++    /// Sampled images (0), storage images (1), samplers (2), sorted without duplicates.
++    pub categories: Vec<u32>,
++}
++
+ /// Consumer-shaped reflection of one translated shader.
+ ///
+ /// Interface declarations are built from parser-shaped AIR metadata and the translator's shared
+@@ -1872,6 +1882,13 @@
+     /// All resource-handle fields declared inside shader argument buffers. Authored resources use
+     /// this shared coordinate to obtain the Metal argument index without re-parsing AIR metadata.
+     pub argument_buffer_fields: Vec<EmbeddedArgBuffer>,
++    /// Additional runtime resource arrays at binding zero of sets 2..4. Version 2 resolves
++    /// tokens read through the shader's actual pointer graph and needs no raw root descriptors.
++    #[cfg_attr(
++        feature = "serde",
++        serde(default, skip_serializing_if = "Option::is_none")
++    )]
++    pub argument_resource_tables: Option<ArgumentResourceTables>,
+     /// Vertex input attributes (vertex stage only).
+     pub vertex_attributes: Vec<VertexAttribute>,
+     /// Varyings: fragment `[[stage_in]]` inputs, or vertex user-varying outputs.
+@@ -1928,6 +1945,56 @@
+ }
+ 
+ impl ShaderReflection {
++    pub(crate) fn reconcile_argument_resource_tables(&mut self, module: &Module) {
++        use crate::spirv_module::Operand;
++        use std::collections::HashMap;
++        let mut sets = HashMap::new();
++        let mut bindings = HashMap::new();
++        for inst in &module.annotations {
++            if inst.class.opcode != spirv::Op::Decorate {
++                continue;
++            }
++            match inst.operands.as_slice() {
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++                {
++                    sets.insert(*id, *set);
++                }
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(binding)] =>
++                {
++                    bindings.insert(*id, *binding);
++                }
++                _ => {}
++            }
++        }
++        if !bindings
++            .iter()
++            .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0))
++        {
++            return;
++        }
++        let mut categories = sets
++            .iter()
++            .filter(|(id, set)| (2..=4).contains(*set) && bindings.get(*id) == Some(&0))
++            .map(|(_, set)| *set - 2)
++            .collect::<Vec<_>>();
++        categories.sort_unstable();
++        categories.dedup();
++        if categories.is_empty() {
++            return;
++        }
++        self.bindings.retain(|resource| {
++            !matches!(
++                resource.kind,
++                ResourceKind::EmbeddedArgBufferTexture | ResourceKind::EmbeddedArgBufferSampler
++            )
++        });
++        self.argument_resource_tables = Some(ArgumentResourceTables {
++            version: 2,
++            table_binding: 672,
++            categories,
++        });
++    }
++
+     pub(crate) fn apply_descriptor_layout(
+         &mut self,
+         layout: DescriptorLayout,
+@@ -2022,6 +2089,21 @@
+         self.descriptor_layout
+             .validate()
+             .map_err(|error| error.to_string())?;
++        if let Some(table) = &self.argument_resource_tables {
++            if table.version != 2
++                || table.table_binding != 672
++                || table.categories.is_empty()
++                || table.categories.iter().any(|category| *category > 2)
++                || table.categories.windows(2).any(|pair| pair[0] >= pair[1])
++                || self.bindings.iter().any(|binding| {
++                    binding
++                        .descriptor
++                        .is_some_and(|location| location.binding == 672 || location.set >= 2)
++                })
++            {
++                return Err("invalid GPU argument resource graph ABI".into());
++            }
++        }
+         match (self.stage, self.kernel_dispatch) {
+             (ShaderStage::Kernel, Some(dispatch)) => dispatch.validate()?,
+             (ShaderStage::Kernel, None) => {
+@@ -2769,6 +2851,7 @@
+             stage: ShaderStage::Fragment,
+             entry_point: entry_point.map(str::to_string),
+             bindings,
++            argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+             vertex_attributes: Vec::new(),
+             varyings,
+@@ -2937,6 +3020,7 @@
+             },
+             entry_point: entry_point.map(str::to_string),
+             bindings,
++            argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+             vertex_attributes,
+             varyings,
+@@ -3150,6 +3234,7 @@
+             stage: ShaderStage::Kernel,
+             entry_point: entry_point.map(str::to_string),
+             bindings,
++            argument_resource_tables: None,
+             argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
+             vertex_attributes: Vec::new(),
+             varyings: Vec::new(),
+diff --git a/src/reflect/tests.rs b/src/reflect/tests.rs
+--- a/src/reflect/tests.rs
++++ b/src/reflect/tests.rs
+@@ -1587,6 +1587,7 @@
+                 ),
+             },
+         ],
++        argument_resource_tables: None,
+         argument_buffer_fields: vec![EmbeddedArgBuffer {
+             buffer_param_index: 0,
+             buffer_index: 0,
+diff --git a/src/reflect/nonwritable.rs b/src/reflect/nonwritable.rs
+--- a/src/reflect/nonwritable.rs
++++ b/src/reflect/nonwritable.rs
+@@ -99,6 +99,16 @@
+ 
+     for (id, key) in variables {
+         if !unwritten.contains(&key) {
++            continue;
++        }
++        if module.annotations.iter().any(|inst| {
++            inst.class.opcode == Op::Decorate
++                && inst.operands
++                    == [
++                        Operand::IdRef(id),
++                        Operand::Decoration(Decoration::NonWritable),
++                    ]
++        }) {
+             continue;
+         }
+         module.annotations.push(Instruction::new(
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -915,6 +915,7 @@
+     // The emitter decides whether the constructed pointer graph needs an address table; reflection
+     // no longer predicts that from the AIR text when a module is in hand to be read.
+     reflection.reconcile_buffer_address_table(&finished.module);
++    reflection.reconcile_argument_resource_tables(&finished.module);
+     // Nothing in the AIR metadata describes a descriptor the passes invented to type an AIR value,
+     // so only the module and the pass that made it can say a consumer has to bind one.
+     reflection.report_synthesized_placeholders(
+diff --git a/tests/argument_buffer_graph.rs b/tests/argument_buffer_graph.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/argument_buffer_graph.rs
+@@ -0,0 +1,130 @@
++//! Authored dynamic record and pointer graphs, independent of captured AIR.
++use metal2vulkan::{
++    passes::{Stage, TransformOptions},
++    translate_sanitized_native_reflected_unvalidated,
++};
++
++fn source(indirect: bool) -> String {
++    let root = if indirect {
++        "%Root = type { ptr addrspace(2) }"
++    } else {
++        "%Root = type { [2 x %Record] }"
++    };
++    let access = if indirect {
++        "%slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0\n  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8\n  %image_slot = getelementptr %Record, ptr addrspace(2) %base, i64 %group, i32 0, i64 %index\n  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 %group, i32 1"
++    } else {
++        "%image_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group, i32 0, i64 %index\n  %sampler_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group, i32 1"
++    };
++    format!(
++        r#"target triple = "air64-apple-macosx"
++{root}
++%Record = type {{ [2 x ptr addrspace(1)], ptr addrspace(2) }}
++define void @graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {{
++entry:
++  %g = lshr i32 %i, 2
++  %g1 = and i32 %g, 1
++  %group = zext i32 %g1 to i64
++  %ix = and i32 %i, 1
++  %index = zext i32 %ix to i64
++  {access}
++  %image = load ptr addrspace(1), ptr addrspace(2) %image_slot, align 8
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %sample = call {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue {{ <4 x float>, i8 }} %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  store float %red, ptr addrspace(1) %out, align 4
++  ret void
++}}
++declare {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++!air.kernel = !{{!0}}
++!0 = !{{ptr @graph, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4, !5}}
++!3 = !{{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}}
++!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}}
++"#
++    )
++}
++
++#[test]
++fn dynamic_record_and_indirect_resource_graphs() {
++    for (indirect, helper) in [(false, false), (true, false), (false, true), (true, true)] {
++        let text = if helper {
++            source(indirect).replace("define void @graph(", "define internal void @helper(")
++                .replace("declare {", "define void @graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {\nentry:\n  call void @helper(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i)\n  ret void\n}\ndeclare {")
++        } else {
++            source(indirect)
++        };
++        let (spv, reflection) = translate_sanitized_native_reflected_unvalidated(
++            &text,
++            Stage::Kernel,
++            &std::env::temp_dir(),
++            TransformOptions::default(),
++            None,
++        )
++        .unwrap_or_else(|e| panic!("indirect={indirect} helper={helper}: {e}"));
++        let directory = std::env::temp_dir().join(format!(
++            "m2v-graph-{}-{indirect}-{helper}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let path = directory.join("graph.spv");
++        std::fs::write(&path, spv).unwrap();
++        let result = std::process::Command::new("spirv-val")
++            .args(["--target-env", "vulkan1.2"])
++            .arg(&path)
++            .output()
++            .unwrap();
++        assert!(
++            result.status.success(),
++            "{}",
++            String::from_utf8_lossy(&result.stderr)
++        );
++        #[cfg(feature = "serde")]
++        {
++            let json = serde_json::to_value(&reflection).unwrap();
++            assert_eq!(json["argument_resource_tables"]["version"], 2);
++            assert_eq!(
++                json["argument_resource_tables"]["categories"],
++                serde_json::json!([0, 2])
++            );
++        }
++        reflection.validate_descriptor_abi().unwrap();
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++}
++
++#[test]
++fn unknown_graph_shape_is_refused() {
++    let text = source(false).replace("sample_texture_2d", "sample_texture_7d");
++    let error = translate_sanitized_native_reflected_unvalidated(
++        &text,
++        Stage::Kernel,
++        &std::env::temp_dir(),
++        TransformOptions::default(),
++        None,
++    )
++    .unwrap_err();
++    assert!(error.contains("no known shape"), "{error}");
++}
++
++#[test]
++fn custom_layout_does_not_silently_change_the_graph_abi() {
++    let options = TransformOptions {
++        descriptor_layout: metal2vulkan::reflect::DescriptorLayout {
++            set: 1,
++            ..Default::default()
++        },
++        ..Default::default()
++    };
++    let error = translate_sanitized_native_reflected_unvalidated(
++        &source(false),
++        Stage::Kernel,
++        &std::env::temp_dir(),
++        options,
++        None,
++    )
++    .unwrap_err();
++    assert!(error.contains("default stage descriptor ABI"), "{error}");
++}
+diff --git a/tests/argument_buffer_wrapped_resource.rs b/tests/argument_buffer_wrapped_resource.rs
+--- a/tests/argument_buffer_wrapped_resource.rs
++++ b/tests/argument_buffer_wrapped_resource.rs
+@@ -300,15 +300,16 @@
+     );
+ }
+ 
+-/// A wrapper declared as an ARRAY of structs stays a named refusal. Binding element 0 alone would
+-/// leave every other element reading black in a module that validates and binds cleanly.
+-#[test]
+-fn an_arrayed_wrapper_still_refuses() {
+-    let error = translate_sanitized_native(WRAPPED_ARRAY, Stage::Fragment, &tmp())
+-        .expect_err("one of several declared textures must not be the only one bound");
+-    assert!(
+-        error.contains("does not surface") && error.contains("air.texture"),
+-        "the refusal names the resource that was missed: {error}"
++/// A wrapper array uses actual GPU token loads rather than binding only its first element.
++#[test]
++fn an_arrayed_wrapper_uses_gpu_resource_tokens() {
++    let binary = translate_sanitized_native(WRAPPED_ARRAY, Stage::Fragment, &tmp()).unwrap();
++    let asm = disassemble(&binary).unwrap();
++    assert!(
++        asm.contains("OpTypeRuntimeArray")
++            && asm.contains("Binding 672")
++            && asm.contains("OpImageSample"),
++        "the repeated field must resolve its loaded token: {asm}"
+     );
+ }
+ 
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -83,6 +83,18 @@
+ field can make old JSON fail deserialization.
+ 
+ ## Descriptor ABI (binding map)
++
++Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
++`argument_resource_tables: {version: 2, table_binding: 672, categories: [...]}`.
++They require the default descriptor layout. Binding 672 in set 0 is the read-only token
++table; categories 0, 1, 2 denote runtime sampled-image, storage-image and sampler arrays
++at binding 0 of sets 2, 3, 4. The first six table words contain each category's
++`(word_offset, count)`, followed by sorted low/high token pairs. Descriptor index 0 is
++reserved for a dummy. Tokens are opaque identifiers, never GPU addresses. The shader
++loads them through its actual record/pointer graph, so this contract has no raw root
++descriptors. Consumers must bind these additional resources and enable the corresponding
++descriptor-indexing features. Unknown graph operations return an error. Flat resources
++with representable coordinates retain their existing static descriptor ABI.
+ 
+ By default, every descriptor-backed Metal-facing resource uses **descriptor set 0**
+ (`RESOURCE_DESCRIPTOR_SET`). Most default bindings are a fixed base plus Metal resource index `n`:

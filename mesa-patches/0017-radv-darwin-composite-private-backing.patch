@@ -1,0 +1,358 @@
+From: RDNA4 local integration
+Subject: [PATCH 17/17] radv/darwin: fully backed composite buffers in one GPU VA
+
+Split large native Private allocations into bounded physical BOs without sparse
+operations or duplicate child VA reservations. Expand submission references and
+preserve metadata, readonly mappings, exact teardown and error reporting.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 with patches 0001..0016.
+
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h
+@@ -37,6 +37,10 @@
+    void *cpu_map;
+ 
+    bool emulate_sparse_residency;
++
++   struct radv_amdgpu_winsys_bo **children;
++   uint32_t child_count;
++   bool composite_pad;
+ };
+ 
+ static inline struct radv_amdgpu_winsys_bo *
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <stdio.h>
++#include <errno.h>
+ 
+ #include "tools/radv_debug.h"
+ #include "radv_amdgpu_bo.h"
+@@ -27,6 +28,10 @@
+ #include "util/u_atomic.h"
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
++
++#ifdef HAVE_AMDGPU_DARWIN
++struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor);
++#endif
+ 
+ static void radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo);
+ 
+@@ -267,6 +272,8 @@
+ 
+    assert(parent->base.is_virtual);
+    assert(!bo || !bo->base.is_virtual);
++   if (parent->children)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
+ 
+    /* When the BO is NULL, AMDGPU will reset the PTE VA range to the initial state. Otherwise, it
+     * will first unmap all existing VA that overlap the requested range and then map.
+@@ -377,6 +384,23 @@
+ 
+    radv_amdgpu_log_bo(ws, bo, true);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   if (bo->children) {
++      if (bo->composite_pad) {
++         int r = radv_amdgpu_bo_va_op(ws, bo->children[0]->bo_handle, 0, 4096,
++                                       bo->base.va + bo->base.size, 0, 0, AMDGPU_VA_OP_UNMAP);
++         if (r)
++            fprintf(stderr, "radv/darwin: Failed to unmap composite padding (%d).\n", r);
++      }
++      for (uint32_t i = bo->child_count; i > 0; --i)
++         radv_amdgpu_winsys_bo_destroy(_ws, &bo->children[i - 1]->base);
++      ac_drm_va_range_free(bo->va_handle);
++      FREE(bo->children);
++      FREE(bo);
++      return;
++   }
++#endif
++
+    if (bo->base.is_virtual) {
+       radv_amdgpu_winsys_virtual_bo_destroy(_ws, _bo);
+       return;
+@@ -389,8 +413,10 @@
+       radv_amdgpu_global_bo_list_del(ws, bo);
+ 
+    const uint64_t va_size = radv_amdgpu_bo_va_size(bo->base.size, bo->flags);
+-   radv_amdgpu_bo_va_op(ws, bo->bo_handle, 0, va_size, bo->base.va, 0, 0, AMDGPU_VA_OP_UNMAP);
+-   ac_drm_bo_free(ws->dev, bo->bo);
++   int unmap_result = radv_amdgpu_bo_va_op(ws, bo->bo_handle, 0, va_size, bo->base.va, 0, 0, AMDGPU_VA_OP_UNMAP);
++   int free_result = ac_drm_bo_free(ws->dev, bo->bo);
++   if (unmap_result || free_result)
++      fprintf(stderr, "radv/amdgpu: BO release failed (unmap %d, free %d).\n", unmap_result, free_result);
+ 
+    if (bo->base.initial_domain & RADEON_DOMAIN_VRAM) {
+       if (bo->base.vram_no_cpu_access) {
+@@ -403,7 +429,8 @@
+    if (bo->base.initial_domain & RADEON_DOMAIN_GTT)
+       p_atomic_add(&ws->alloc_tracker->allocated_gtt, -align64(bo->base.size, ws->info.gart_page_size));
+ 
+-   ac_drm_va_range_free(bo->va_handle);
++   if (bo->va_handle)
++      ac_drm_va_range_free(bo->va_handle);
+    FREE(bo);
+ }
+ 
+@@ -517,18 +544,128 @@
+ }
+ 
+ static VkResult
+-radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned alignment,
+-                             enum radeon_bo_domain initial_domain, enum radeon_bo_flag flags, unsigned priority,
+-                             uint64_t replay_address, struct radeon_winsys_bo **out_bo)
++radv_amdgpu_winsys_bo_create_internal(struct radeon_winsys *_ws, uint64_t size, unsigned alignment,
++                                       enum radeon_bo_domain initial_domain, enum radeon_bo_flag flags,
++                                       unsigned priority, uint64_t replay_address, uint64_t child_va,
++                                       bool *allocation_failed, struct radeon_winsys_bo **out_bo);
++
++#ifdef HAVE_AMDGPU_DARWIN
++#define RADV_DARWIN_COMPOSITE_CHUNK (UINT64_C(256) << 20)
++#define RADV_DARWIN_COMPOSITE_CHILDREN 2048u
++
++static VkResult
++radv_amdgpu_composite_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned alignment,
++                                enum radeon_bo_domain domain, enum radeon_bo_flag flags,
++                                unsigned priority, uint64_t chunk_limit, struct radeon_winsys_bo **out_bo)
++{
++   struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++   *out_bo = NULL;
++   if (!size || size % 4096 || !chunk_limit || chunk_limit > RADV_DARWIN_COMPOSITE_CHUNK ||
++       chunk_limit % 4096 || (alignment && (alignment & (alignment - 1))) ||
++       alignment > chunk_limit || !(domain & RADEON_DOMAIN_VRAM) ||
++       !(flags & RADEON_FLAG_NO_CPU_ACCESS) || !(flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) ||
++       (flags & (RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_32BIT | RADEON_FLAG_REPLAYABLE |
++                 RADEON_FLAG_VIRTUAL | RADEON_FLAG_EMULATE_SPARSE_RESIDENCY)))
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct radv_amdgpu_winsys_bo *bo = CALLOC_STRUCT(radv_amdgpu_winsys_bo);
++   if (!bo)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   bo->children = calloc(RADV_DARWIN_COMPOSITE_CHILDREN, sizeof(*bo->children));
++   if (!bo->children) {
++      FREE(bo);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   bo->base.size = size;
++   bo->base.is_local = true;
++   bo->base.initial_domain = domain;
++   bo->base.vram_no_cpu_access = true;
++   bo->base.gfx12_allow_dcc = !!(flags & RADEON_FLAG_GFX12_ALLOW_DCC);
++   bo->base.obj_id = (uintptr_t)bo;
++   bo->flags = flags;
++   bo->priority = priority;
++   const uint64_t va_size = radv_amdgpu_bo_va_size(size, flags);
++   if (va_size < size || va_size > UINT64_MAX - (ws->debug_vm ? 65536 : 0)) {
++      FREE(bo->children);
++      FREE(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   unsigned va_alignment = MAX2(4096, MAX2(alignment, ws->info.pte_fragment_size));
++   uint64_t va = 0;
++   uint64_t va_gap = ws->debug_vm ? MAX2(UINT64_C(4) * va_alignment, 65536) : 0;
++   if (va_size > UINT64_MAX - va_gap) {
++      FREE(bo->children);
++      FREE(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   int r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general,
++                                 va_size + va_gap, va_alignment, 0,
++                                 &va, &bo->va_handle, AMDGPU_VA_RANGE_HIGH);
++   if (r) {
++      FREE(bo->children);
++      FREE(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   bo->base.va = va;
++   uint64_t offset = 0;
++   const uint64_t minimum = MAX2(alignment, 4096);
++   VkResult result = VK_SUCCESS;
++   while (offset < size) {
++      if (bo->child_count == RADV_DARWIN_COMPOSITE_CHILDREN) {
++         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         goto fail;
++      }
++      uint64_t chunk = MIN2(chunk_limit, size - offset);
++      struct radeon_winsys_bo *child = NULL;
++      for (;;) {
++         bool allocation_failed = false;
++         result = radv_amdgpu_winsys_bo_create_internal(_ws, chunk, alignment, domain,
++                   (flags & ~RADEON_FLAG_VM_PAD_1PAGE) | RADEON_FLAG_PREFER_LOCAL_BO,
++                   priority, 0, va + offset, &allocation_failed, &child);
++         if (result == VK_SUCCESS)
++            break;
++         if (!allocation_failed || result != VK_ERROR_OUT_OF_DEVICE_MEMORY || chunk <= minimum)
++            goto fail;
++         chunk = MAX2(minimum, (chunk / 2) & ~(minimum - 1));
++      }
++      bo->children[bo->child_count++] = radv_amdgpu_winsys_bo(child);
++      offset += chunk;
++      chunk_limit = chunk;
++   }
++   if (flags & RADEON_FLAG_VM_PAD_1PAGE) {
++      r = radv_amdgpu_bo_va_op(ws, bo->children[0]->bo_handle, 0, 4096, va + size,
++                               flags | RADEON_FLAG_READ_ONLY, 0, AMDGPU_VA_OP_MAP);
++      if (r) {
++         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         goto fail;
++      }
++      bo->composite_pad = true;
++   }
++   radv_amdgpu_log_bo(ws, bo, false);
++   *out_bo = &bo->base;
++   return VK_SUCCESS;
++fail:
++   radv_amdgpu_winsys_bo_destroy(_ws, &bo->base);
++   return result;
++}
++#endif
++
++static VkResult
++radv_amdgpu_winsys_bo_create_internal(struct radeon_winsys *_ws, uint64_t size, unsigned alignment,
++                                       enum radeon_bo_domain initial_domain, enum radeon_bo_flag flags,
++                                       unsigned priority, uint64_t replay_address, uint64_t child_va,
++                                       bool *allocation_failed, struct radeon_winsys_bo **out_bo)
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+    struct radv_amdgpu_winsys_bo *bo;
+    struct amdgpu_bo_alloc_request request = {0};
+    ac_drm_bo buf_handle;
+    uint64_t va = 0;
+-   amdgpu_va_handle va_handle;
++   amdgpu_va_handle va_handle = NULL;
+    int r;
+    VkResult result = VK_SUCCESS;
++   if (allocation_failed)
++      *allocation_failed = false;
+ 
+    if (flags & RADEON_FLAG_VIRTUAL)
+       return radv_amdgpu_winsys_virtual_bo_create(_ws, size, alignment, flags, replay_address, out_bo);
+@@ -553,8 +690,13 @@
+                              (flags & RADEON_FLAG_REPLAYABLE ? AMDGPU_VA_RANGE_REPLAYABLE : 0);
+    uint64_t va_gap_size = ws->debug_vm ? MAX2(4 * virt_alignment, 64 * 1024) : 0;
+ 
+-   r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, va_size + va_gap_size, virt_alignment, replay_address,
+-                             &va, &va_handle, va_flags);
++   if (child_va) {
++      va = child_va;
++      r = 0;
++   } else {
++      r = ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, va_size + va_gap_size, virt_alignment, replay_address,
++                                &va, &va_handle, va_flags);
++   }
+    if (r) {
+       result = replay_address ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       goto error_va_alloc;
+@@ -633,6 +775,8 @@
+ 
+    r = ac_drm_bo_alloc(ws->dev, &request, &buf_handle);
+    if (r) {
++      if (allocation_failed)
++         *allocation_failed = r == -ENOMEM;
+       fprintf(stderr, "radv/amdgpu: Failed to allocate a buffer:\n");
+       fprintf(stderr, "radv/amdgpu:    size      : %" PRIu64 " bytes\n", size);
+       fprintf(stderr, "radv/amdgpu:    alignment : %u bytes\n", alignment);
+@@ -643,7 +787,10 @@
+ 
+    uint32_t kms_handle = 0;
+    r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);
+-   assert(!r);
++   if (r) {
++      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      goto error_va_map;
++   }
+ 
+    r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, size, va, flags, 0, AMDGPU_VA_OP_MAP);
+    if (r) {
+@@ -699,18 +846,41 @@
+    ac_drm_bo_free(ws->dev, buf_handle);
+ 
+ error_bo_alloc:
+-   ac_drm_va_range_free(va_handle);
++   if (va_handle)
++      ac_drm_va_range_free(va_handle);
+ 
+ error_va_alloc:
+    FREE(bo);
+    return result;
+ }
+ 
++static VkResult
++radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned alignment,
++                             enum radeon_bo_domain initial_domain, enum radeon_bo_flag flags, unsigned priority,
++                             uint64_t replay_address, struct radeon_winsys_bo **out_bo)
++{
++#ifdef HAVE_AMDGPU_DARWIN
++   struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++   if (size > UINT64_C(0xfffffffc) && ac_drm_darwin_kext(ws->dev, NULL)) {
++      if (replay_address) {
++         *out_bo = NULL;
++         return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
++      }
++      return radv_amdgpu_composite_bo_create(_ws, size, alignment, initial_domain, flags,
++                                             priority, RADV_DARWIN_COMPOSITE_CHUNK, out_bo);
++   }
++#endif
++   return radv_amdgpu_winsys_bo_create_internal(_ws, size, alignment, initial_domain, flags,
++                                                priority, replay_address, 0, NULL, out_bo);
++}
++
+ static void *
+ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo, bool use_fixed_addr,
+                           void *fixed_addr)
+ {
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
++   if (bo->children)
++      return NULL;
+ 
+    /* Safeguard for the Quantic Dream layer skipping unmaps. */
+    if (bo->cpu_map && !use_fixed_addr)
+@@ -991,6 +1161,8 @@
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
++   if (bo->children)
++      return false;
+    enum amdgpu_bo_handle_type type = amdgpu_bo_handle_type_dma_buf_fd;
+    int r;
+    unsigned handle;
+@@ -1116,6 +1288,11 @@
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
++   if (bo->children) {
++      for (uint32_t i = 0; i < bo->child_count; ++i)
++         radv_amdgpu_winsys_bo_set_metadata(_ws, &bo->children[i]->base, md);
++      return;
++   }
+    struct amdgpu_bo_metadata metadata = {0};
+    uint64_t tiling_flags = 0;
+ 
+@@ -1169,6 +1346,10 @@
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
++   if (bo->children) {
++      radv_amdgpu_winsys_bo_get_metadata(_ws, &bo->children[0]->base, md);
++      return;
++   }
+    struct amdgpu_bo_info info = {0};
+ 
+    int r = ac_drm_bo_query_info(ws->dev, bo->bo_handle, &info);
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -701,6 +701,11 @@
+    if (cs->status != VK_SUCCESS)
+       return;
+ 
++   if (bo->children) {
++      for (uint32_t i = 0; i < bo->child_count && cs->status == VK_SUCCESS; ++i)
++         radv_amdgpu_cs_add_buffer_internal(cs, bo->children[i]->bo_handle, bo->priority);
++      return;
++   }
+    if (bo->base.is_virtual)
+       return;
+ 

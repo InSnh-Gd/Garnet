@@ -1,0 +1,3251 @@
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -82,6 +82,13 @@
+     /// emitter cannot reach the descriptor-backed planes that represent those; `aliased_imageblock`
+     /// fills every cell from them on entry and writes it back on return.
+     pub(crate) aliased_imageblock_staging: Option<Word>,
++    /// Values a source `air.is_uniform` assertion declared equal for every thread executing the
++    /// function. `function` is the function result id the assertion was lowered in; both ids are
++    /// remapped by canonicalization so the fact can cross the cached GPU-argument metadata boundary.
++    ///
++    /// This is a source-language fact, not the weaker subgroup-scope assertion expressed by the
++    /// SPIR-V `Uniform` decoration. Consumers must not infer it from decorations or names.
++    pub(crate) uniform_value_facts: Vec<UniformValueFact>,
+ }
+ 
+ #[derive(Debug)]
+@@ -258,6 +265,12 @@
+     pub(crate) indices: Vec<u32>,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct UniformValueFact {
++    pub(crate) function: Word,
++    pub(crate) value: Word,
++}
++
+ impl EmitSidecar {
+     /// Every SPIR-V id referenced by a typed fact crossing the emitter-to-passes seam.
+     pub(crate) fn referenced_ids(&self) -> HashSet<Word> {
+@@ -403,6 +416,10 @@
+         for fact in &mut self.aggregate_pointer_values {
+             replace(&mut fact.aggregate);
+             replace(&mut fact.source);
++        }
++        for fact in &mut self.uniform_value_facts {
++            replace(&mut fact.function);
++            replace(&mut fact.value);
+         }
+         if let Some(id) = &mut self.aliased_imageblock_staging {
+             replace(id);
+@@ -929,6 +946,10 @@
+                 aggregate: 43,
+                 source: 44,
+                 indices: vec![1, 0],
++            }],
++            uniform_value_facts: vec![UniformValueFact {
++                function: 45,
++                value: 46,
+             }],
+             aliased_imageblock_staging: Some(51),
+         };
+@@ -966,6 +987,8 @@
+             (42, 142),
+             (43, 143),
+             (44, 144),
++            (45, 145),
++            (46, 146),
+             (5, 105),
+             (50, 150),
+             (51, 151),
+@@ -1008,6 +1031,13 @@
+                 aggregate: 143,
+                 source: 144,
+                 indices: vec![1, 0],
++            }]
++        );
++        assert_eq!(
++            sidecar.uniform_value_facts,
++            vec![UniformValueFact {
++                function: 145,
++                value: 146,
+             }]
+         );
+         assert_eq!(
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -79,6 +79,34 @@
+ pub enum BufferAddressTableMode {
+     LegacyV1,
+     AddressLengthAccessV2,
++}
++
++/// One fragment entry point named by a [`UniformControlProof`].
++#[doc(hidden)]
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct UniformControlEntry {
++    pub function: u32,
++    pub name: String,
++}
++
++/// One exact `(function, value)` pair from a source `air.is_uniform` assertion.
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct UniformControlValue {
++    pub function: u32,
++    pub value: u32,
++}
++
++/// Typed source-uniformity facts bound to the exact fragment entries they describe.
++///
++/// This is not a general trust token. The RDNA4 wrapper must bind it to the exact SPIR-V byte
++/// stream before handing it to the cached GPU-argument post-pass; ids alone may collide across
++/// modules.
++#[doc(hidden)]
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct UniformControlProof {
++    pub entries: Vec<UniformControlEntry>,
++    pub values: Vec<UniformControlValue>,
+ }
+ 
+ /// Detect the shader stage from the AIR's own `!air.vertex`/`!air.fragment`/`!air.kernel` metadata
+@@ -811,6 +839,44 @@
+         finished.bytes,
+         reflection,
+         finished.buffer_address_table_mode,
++    ))
++}
++
++/// The reflected carrier plus typed source uniformity facts and the exact fragment entries those
++/// facts belong to.
++///
++/// The final module is already canonicalized, so every id names the returned SPIR-V bytes.
++#[doc(hidden)]
++pub fn translate_sanitized_native_reflected_unvalidated_with_uniform_control_proof(
++    san_ll: &str,
++    stage: passes::Stage,
++    tmp: &Path,
++    options: passes::TransformOptions,
++    datalayout: Option<&str>,
++) -> Result<
++    (
++        Vec<u8>,
++        reflect::ShaderReflection,
++        BufferAddressTableMode,
++        UniformControlProof,
++    ),
++    String,
++> {
++    let parsed_datalayout = datalayout.map(layout::AirDataLayout::parse).transpose()?;
++    let (finished, mut reflection) = translate_sanitized_native_reflected_carrier_with_layout(
++        san_ll,
++        stage,
++        tmp,
++        options,
++        parsed_datalayout,
++        Validation::Skip,
++    )?;
++    reflection.datalayout = datalayout.map(str::to_string);
++    Ok((
++        finished.bytes,
++        reflection,
++        finished.buffer_address_table_mode,
++        finished.uniform_control_proof,
+     ))
+ }
+ 
+@@ -1119,6 +1185,9 @@
+     /// to those this module still declares. Only the passes know these exist; reflection reports
+     /// them from here so a consumer's descriptor-set layout covers them.
+     placeholder_descriptor_bindings: Vec<u32>,
++    /// Typed `air.is_uniform` proof at the final canonical ids. The cached GPU argument pass binds
++    /// this proof to the exact SPIR-V bytes with a content hash before using it.
++    uniform_control_proof: UniformControlProof,
+ }
+ 
+ impl FinishedModule {
+@@ -1127,6 +1196,7 @@
+         module: Module,
+         buffer_address_table_mode: BufferAddressTableMode,
+         placeholder_descriptor_bindings: Vec<u32>,
++        uniform_control_proof: UniformControlProof,
+     ) -> Self {
+         let bytes = assemble_finished_module(&module);
+         Self {
+@@ -1134,6 +1204,7 @@
+             bytes,
+             buffer_address_table_mode,
+             placeholder_descriptor_bindings,
++            uniform_control_proof,
+         }
+     }
+ }
+@@ -1357,10 +1428,63 @@
+         .into_iter()
+         .filter(|binding| declared.contains(binding))
+         .collect::<Vec<_>>();
++    let mut uniform_value_facts = sidecar
++        .uniform_value_facts
++        .iter()
++        .filter_map(|fact| {
++            let function = out.functions.iter().find(|function| {
++                function
++                    .def
++                    .as_ref()
++                    .and_then(|definition| definition.result_id)
++                    == Some(fact.function)
++            })?;
++            function
++                .all_inst_iter()
++                .any(|instruction| instruction.result_id == Some(fact.value))
++                .then_some((fact.function, fact.value))
++        })
++        .collect::<Vec<_>>();
++    uniform_value_facts.sort_unstable();
++    uniform_value_facts.dedup();
++    let mut uniform_control_entries = out
++        .entry_points
++        .iter()
++        .filter(|entry| {
++            entry.operands.first()
++                == Some(&spirv_module::Operand::ExecutionModel(
++                    spirv::ExecutionModel::Fragment,
++                ))
++        })
++        .filter_map(|entry| match entry.operands.as_slice() {
++            [
++                spirv_module::Operand::ExecutionModel(_),
++                spirv_module::Operand::IdRef(function),
++                spirv_module::Operand::LiteralString(name),
++                ..,
++            ] => Some(UniformControlEntry {
++                function: *function,
++                name: name.clone(),
++            }),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    uniform_control_entries.sort_by(|left, right| {
++        (left.function, left.name.as_str()).cmp(&(right.function, right.name.as_str()))
++    });
++    uniform_control_entries.dedup();
++    let uniform_control_proof = UniformControlProof {
++        entries: uniform_control_entries,
++        values: uniform_value_facts
++            .into_iter()
++            .map(|(function, value)| UniformControlValue { function, value })
++            .collect(),
++    };
+     let finished = FinishedModule::new(
+         out,
+         buffer_address_table_mode,
+         placeholder_descriptor_bindings,
++        uniform_control_proof,
+     );
+     if retry_debug {
+         eprintln!("[retry-debug] finish: assembly complete");
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1133,6 +1133,21 @@
+         if !is_bool_type(ctx, rty) {
+             return Err(format!("{name} result type is not bool"));
+         }
++        if let Some(function) = ctx
++            .air_call_body
++            .as_ref()
++            .and_then(|body| ctx.module.functions.get(body.function))
++            .and_then(|function| function.def.as_ref())
++            .and_then(|definition| definition.result_id)
++        {
++            let fact = crate::emit_sidecar::UniformValueFact {
++                function,
++                value: args[0],
++            };
++            if !ctx.emit_sidecar.uniform_value_facts.contains(&fact) {
++                ctx.emit_sidecar.uniform_value_facts.push(fact);
++            }
++        }
+         let asserted = ctx.const_bool_of(rty, true);
+         return Ok(Some(vec![Instruction::new(
+             Op::CopyObject,
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1781,6 +1781,7 @@
+ mod resources;
+ pub use resources::{
+     lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+     ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+@@ -3148,6 +3149,8 @@
+     }
+     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
+         .ok_or_else(|| "no entry function with a body found".to_string())?;
++    debug_phase!("fragment control preparation");
++    resources::fragment_control::prepare_fragment_control(&mut ctx, entry_idx)?;
+     debug_phase!("cleanup start");
+     // Producer-side closure already made the entry self-contained. Preserve the former residual
+     // inliner's two post-splice cleanup operations at this phase.
+--- /dev/null
++++ b/src/passes/resources/fragment_control.rs
+@@ -0,0 +1,1755 @@
++//! Fragment-entry reachability and derivative-group control-flow facts.
++//!
++//! The Vulkan 1.2 baseline used by this translator does not enable `QuadDerivativesKHR`, so a
++//! fragment derivative's group is the primitive scope instance. An explicit derivative must execute
++//! in control flow uniform within that group. This analysis is deliberately separate from
++//! `BlockDominance`: dominance answers whether a value is available, not whether every invocation
++//! in a derivative group executes the same dynamic instruction.
++//!
++//! A predecessor meet is not sufficient here. SPIR-V explicitly allows divergent control flow to
++//! reconverge at a structured merge, so a block whose incoming edges have mixed path histories can
++//! still execute uniformly after the merge. The analysis below instead computes control dependence
++//! on each conditional/switch through the post-dominator tree of the executable CFG.
++
++use super::*;
++use spirv::ExecutionModel;
++use std::collections::{BTreeSet, VecDeque};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::passes) enum ControlStatus {
++    NotReachable,
++    Uniform,
++    NonUniform,
++    PartialDemote,
++}
++
++#[derive(Default)]
++pub(in crate::passes) struct FragmentControl {
++    functions: HashMap<usize, FunctionControl>,
++    entry_context: HashMap<usize, bool>,
++}
++
++struct FunctionControl {
++    /// Indexed by the function's original `Block` position.
++    status: Vec<ControlStatus>,
++    calls: Vec<CallSite>,
++}
++
++#[derive(Clone, Copy)]
++struct CallSite {
++    block: usize,
++    callee: usize,
++}
++
++impl FragmentControl {
++    pub(in crate::passes) fn status(&self, function: usize, block: usize) -> ControlStatus {
++        self.functions
++            .get(&function)
++            .and_then(|control| control.status.get(block))
++            .copied()
++            .map(|status| {
++                if status == ControlStatus::Uniform
++                    && !self.entry_context.get(&function).copied().unwrap_or(false)
++                {
++                    ControlStatus::NonUniform
++                } else {
++                    status
++                }
++            })
++            .unwrap_or(ControlStatus::NotReachable)
++    }
++}
++
++/// Specialize residual bodied helper calls at each fragment entry's calls path before AIR lowering.
++///
++/// A single helper body has one CFG but can be reached from both uniform and nonuniform call sites.
++/// Leaving it shared cannot represent that distinction: the helper's blocks would have to be both
++/// uniform and nonuniform. Splice a clone at every resolvable callsite first, so a later
++/// `air.is_uniform` assertion is recorded against the exact caller value and derivative analysis
++/// sees the guard that actually reaches each clone. AIR declarations remain bodyless and are left
++/// for `lower_air_calls`.
++pub(in crate::passes) fn prepare_fragment_control(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++) -> Result<(), String> {
++    if ctx.stage != Stage::Fragment {
++        return Ok(());
++    }
++    let entry_ids = ctx
++        .module
++        .entry_points
++        .iter()
++        .filter(|entry| {
++            entry.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::Fragment))
++        })
++        .filter_map(|entry| match entry.operands.get(1) {
++            Some(Operand::IdRef(id)) => Some(*id),
++            _ => None,
++        })
++        .collect::<BTreeSet<_>>();
++    let declared_entry_functions = entry_ids
++        .iter()
++        .map(|entry_id| {
++            ctx.module
++                .functions
++                .iter()
++                .position(|function| {
++                    function
++                        .def
++                        .as_ref()
++                        .and_then(|definition| definition.result_id)
++                        == Some(*entry_id)
++                })
++                .ok_or_else(|| {
++                    format!(
++                        "fragment OpEntryPoint names function %{entry_id}, but no owned function \
++                         definition has that result id"
++                    )
++                })
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    let entry_id = ctx.module.functions[entry_idx]
++        .def
++        .as_ref()
++        .and_then(|definition| definition.result_id)
++        .ok_or_else(|| format!("selected fragment entry function #{entry_idx} has no result id"))?;
++    let mut entry_functions = vec![entry_idx];
++    entry_functions.extend(
++        declared_entry_functions
++            .into_iter()
++            .filter(|&declared| declared != entry_idx),
++    );
++    entry_functions.sort_unstable();
++    entry_functions.dedup();
++    let selected = ctx
++        .module
++        .functions
++        .iter()
++        .filter(|function| !function.blocks.is_empty())
++        .filter_map(|function| function.def.as_ref()?.result_id)
++        .filter(|function| *function != entry_id && !entry_ids.contains(function))
++        .collect::<HashSet<_>>();
++    if selected.is_empty() {
++        return Ok(());
++    }
++
++    let mut splices = 0usize;
++    for entry in entry_functions {
++        let stats = crate::passes::emitted_inline::inline_selected_helpers(ctx, entry, &selected)?;
++        splices = splices.saturating_add(stats.splices);
++    }
++    if splices != 0 {
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++    }
++    Ok(())
++}
++
++/// Analyze every declared fragment entry independently, following only executable terminator edges.
++///
++/// This compatibility entry is for modules whose `OpEntryPoint` instructions already exist, such as
++/// the cached SPIR-V post-pass. Pre-finalize lowering passes must use [`analyze_entry`], because
++/// native finalization has not synthesized `OpEntryPoint` yet and `entry_idx` is authoritative.
++pub(in crate::passes) fn analyze(ctx: &Ctx) -> Result<FragmentControl, String> {
++    let fragment_entries = ctx
++        .module
++        .entry_points
++        .iter()
++        .filter(|entry| {
++            entry.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::Fragment))
++        })
++        .filter_map(|entry| match entry.operands.get(1) {
++            Some(Operand::IdRef(id)) => Some(*id),
++            _ => None,
++        })
++        .collect::<BTreeSet<_>>();
++    if fragment_entries.is_empty() {
++        return Ok(FragmentControl::default());
++    }
++
++    let functions_by_id = ctx
++        .module
++        .functions
++        .iter()
++        .enumerate()
++        .filter_map(|(index, function)| Some((function.def.as_ref()?.result_id?, index)))
++        .collect::<HashMap<_, _>>();
++    let entry_functions = fragment_entries
++        .iter()
++        .map(|entry_id| {
++            functions_by_id.get(entry_id).copied().ok_or_else(|| {
++                format!(
++                    "fragment OpEntryPoint names function %{entry_id}, but no owned function \
++                     definition has that result id"
++                )
++            })
++        })
++        .collect::<Result<BTreeSet<_>, _>>()?;
++    if ctx.stage == Stage::Fragment && entry_functions.len() == 1 {
++        return analyze_entry(ctx, *entry_functions.first().unwrap());
++    }
++    analyze_roots(ctx, entry_functions)
++}
++
++/// Analyze the selected fragment entry before `OpEntryPoint` finalization.
++///
++/// The native pipeline chooses the entry by body/name before the module has any `OpEntryPoint`
++/// instructions. Treating that module list as the source of truth here would return an empty
++/// `FragmentControl` and make every real block appear unreachable.
++pub(in crate::passes) fn analyze_entry(
++    ctx: &Ctx,
++    entry_idx: usize,
++) -> Result<FragmentControl, String> {
++    if ctx.stage != Stage::Fragment {
++        return Err("selected-entry fragment control analysis requires the fragment stage".into());
++    }
++    let function = ctx.module.functions.get(entry_idx).ok_or_else(|| {
++        format!("selected fragment entry function #{entry_idx} is outside the module")
++    })?;
++    if function.blocks.is_empty() {
++        return Err(format!(
++            "selected fragment entry function #{entry_idx} has no executable block"
++        ));
++    }
++    analyze_roots(ctx, BTreeSet::from([entry_idx]))
++}
++
++/// Analyze one or more executable roots, following only executable terminator edges.
++///
++/// Bodied helpers left in the graph inherit the conjunction of every reachable call-site context;
++/// `prepare_fragment_control` specializes mixed call sites first. Any remaining bodyless call is
++/// rejected because an unresolved AIR call has no executable CFG whose control condition this
++/// analysis can inspect.
++fn analyze_roots(ctx: &Ctx, entry_functions: BTreeSet<usize>) -> Result<FragmentControl, String> {
++    let mut facts_by_function: HashMap<Word, Vec<Word>> = HashMap::new();
++    for fact in &ctx.emit_sidecar.uniform_value_facts {
++        facts_by_function
++            .entry(fact.function)
++            .or_default()
++            .push(fact.value);
++    }
++
++    // Discover the executable function closure from all selected roots. A callee remains
++    // context-sensitive only at the granularity of "every reachable call site executes in a
++    // uniform context"; a helper called from both uniform and nonuniform sites is therefore not
++    // claimed uniform. Call-site cloning is required before that can be relaxed.
++    let mut reachable_functions = entry_functions.clone();
++    let mut work = entry_functions.iter().copied().collect::<VecDeque<_>>();
++    while let Some(function_index) = work.pop_front() {
++        let function = &ctx.module.functions[function_index];
++        let function_id = function
++            .def
++            .as_ref()
++            .and_then(|definition| definition.result_id);
++        let Some(function_id) = function_id else {
++            return Err(format!(
++                "reachable function #{function_index} has no result id"
++            ));
++        };
++        let local = analyze_function(
++            function,
++            function_id,
++            facts_by_function
++                .get(&function_id)
++                .map(Vec::as_slice)
++                .unwrap_or(&[]),
++            &ctx.module,
++            &HashSet::new(),
++        )?;
++        for call in &local.calls {
++            let callee_id = ctx.module.functions[call.callee]
++                .def
++                .as_ref()
++                .and_then(|definition| definition.result_id)
++                .ok_or_else(|| format!("reachable callee #{function_index} has no result id"))?;
++            if ctx.module.functions[call.callee].blocks.is_empty() {
++                return Err(format!(
++                    "fragment entry function %{function_id} reaches a call to bodyless function \
++                     %{callee_id}; unresolved AIR calls must be lowered before derivative analysis"
++                ));
++            }
++            if reachable_functions.insert(call.callee) {
++                work.push_back(call.callee);
++            }
++        }
++    }
++
++    let initial = reachable_functions
++        .iter()
++        .map(|&function_index| {
++            let function = &ctx.module.functions[function_index];
++            let function_id = function
++                .def
++                .as_ref()
++                .and_then(|definition| definition.result_id)
++                .ok_or_else(|| format!("reachable function #{function_index} has no result id"))?;
++            let control = analyze_function(
++                function,
++                function_id,
++                facts_by_function
++                    .get(&function_id)
++                    .map(Vec::as_slice)
++                    .unwrap_or(&[]),
++                &ctx.module,
++                &HashSet::new(),
++            )?;
++            Ok((function_index, control))
++        })
++        .collect::<Result<HashMap<_, _>, String>>()?;
++
++    // A callee that can terminate only some group invocations makes every caller continuation
++    // partial. Exit effects in a provably uniform block act on every invocation that reaches the
++    // call, so they cannot split the group and do not taint the caller continuation.
++    let function_ids = ctx
++        .module
++        .functions
++        .iter()
++        .enumerate()
++        .filter_map(|(index, function)| Some((index, function.def.as_ref()?.result_id?)))
++        .collect::<HashMap<_, _>>();
++    let mut effectful = HashSet::new();
++    for (&function_index, control) in &initial {
++        if function_has_local_exit_effect(&ctx.module.functions[function_index], &control.status) {
++            effectful.insert(function_ids[&function_index]);
++        }
++    }
++    loop {
++        let before = effectful.len();
++        for (&function_index, control) in &initial {
++            if control.calls.iter().any(|call| {
++                function_ids
++                    .get(&call.callee)
++                    .is_some_and(|callee| effectful.contains(callee))
++            }) {
++                effectful.insert(function_ids[&function_index]);
++            }
++        }
++        if effectful.len() == before {
++            break;
++        }
++    }
++
++    let mut controls = HashMap::new();
++    let mut calls = Vec::new();
++    for &function_index in &reachable_functions {
++        let function = &ctx.module.functions[function_index];
++        let function_id = function_ids[&function_index];
++        let control = analyze_function(
++            function,
++            function_id,
++            facts_by_function
++                .get(&function_id)
++                .map(Vec::as_slice)
++                .unwrap_or(&[]),
++            &ctx.module,
++            &effectful,
++        )?;
++        calls.extend(control.calls.iter().map(|call| (function_index, *call)));
++        controls.insert(function_index, control);
++    }
++
++    let mut entry_context = reachable_functions
++        .iter()
++        .map(|&function| (function, true))
++        .collect::<HashMap<_, _>>();
++    loop {
++        let mut changed = false;
++        for &(caller, call) in &calls {
++            let uniform_call = entry_context[&caller]
++                && controls[&caller].status[call.block] == ControlStatus::Uniform;
++            if !uniform_call && entry_context[&call.callee] {
++                entry_context.insert(call.callee, false);
++                changed = true;
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    Ok(FragmentControl {
++        functions: controls,
++        entry_context,
++    })
++}
++
++fn analyze_function(
++    function: &Function,
++    function_id: Word,
++    asserted_uniform: &[Word],
++    module: &Module,
++    effectful_callees: &HashSet<Word>,
++) -> Result<FunctionControl, String> {
++    if function.blocks.is_empty() {
++        return Err(format!(
++            "fragment entry function %{function_id} has no executable block"
++        ));
++    }
++    let positions = function
++        .blocks
++        .iter()
++        .enumerate()
++        .filter_map(|(index, block)| Some((block.label.as_ref()?.result_id?, index)))
++        .collect::<HashMap<_, _>>();
++    if positions.len() != function.blocks.len() {
++        return Err(format!(
++            "fragment entry function %{function_id} has a block without a label"
++        ));
++    }
++
++    let mut successors = vec![Vec::new(); function.blocks.len()];
++    for (block_index, block) in function.blocks.iter().enumerate() {
++        let terminator = block.instructions.last().ok_or_else(|| {
++            format!(
++                "fragment entry function %{function_id} block {} has no terminator",
++                block
++                    .label
++                    .as_ref()
++                    .and_then(|label| label.result_id)
++                    .map(|id| format!("%{id}"))
++                    .unwrap_or_else(|| format!("#{block_index}"))
++            )
++        })?;
++        if !is_supported_fragment_terminator(terminator.class.opcode) {
++            return Err(format!(
++                "fragment control-flow analysis does not support {:?} terminating block {} in \
++                 function %{function_id}",
++                terminator.class.opcode,
++                block
++                    .label
++                    .as_ref()
++                    .and_then(|label| label.result_id)
++                    .map(|id| format!("%{id}"))
++                    .unwrap_or_else(|| format!("#{block_index}"))
++            ));
++        }
++        let mut targets = crate::spirv_module::block_successors(block)
++            .into_iter()
++            .map(|label| {
++                positions.get(&label).copied().ok_or_else(|| {
++                    format!(
++                        "fragment entry function %{function_id} block {} branches to unknown \
++                         block %{label}",
++                        block
++                            .label
++                            .as_ref()
++                            .and_then(|label| label.result_id)
++                            .map(|id| format!("%{id}"))
++                            .unwrap_or_else(|| format!("#{block_index}"))
++                    )
++                })
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++        targets.sort_unstable();
++        targets.dedup();
++        successors[block_index] = targets;
++    }
++
++    // The crate's single dominator implementation roots at dense index zero. Assign zero to the
++    // executable entry block, then visit only blocks reachable through actual terminator edges.
++    let mut order = Vec::with_capacity(function.blocks.len());
++    let mut dense_position = vec![None; function.blocks.len()];
++    let mut work = VecDeque::from([0usize]);
++    dense_position[0] = Some(0);
++    while let Some(block) = work.pop_front() {
++        order.push(block);
++        for &target in &successors[block] {
++            if dense_position[target].is_none() {
++                dense_position[target] = Some(order.len() + work.len());
++                work.push_back(target);
++            }
++        }
++    }
++    // The provisional numbering above is not stable while the queue drains. Rebuild it from the
++    // completed order so it is exactly the dense index in `successors`.
++    for (dense, &original) in order.iter().enumerate() {
++        dense_position[original] = Some(dense);
++    }
++    let dense_successors = order
++        .iter()
++        .map(|&block| {
++            successors[block]
++                .iter()
++                .filter_map(|target| dense_position[*target])
++                .collect::<Vec<_>>()
++        })
++        .collect::<Vec<_>>();
++
++    let (_, postdominators, _) = reverse_post_dominance(&dense_successors);
++    let mut uniform_phi_predecessors = HashSet::new();
++    let nonuniform = loop {
++        let uniform_values = uniform_values(
++            function,
++            asserted_uniform,
++            module,
++            &uniform_phi_predecessors,
++        );
++        let mut nonuniform = vec![false; order.len()];
++        for (header, &block) in order.iter().enumerate() {
++            let terminator = function.blocks[block].instructions.last().unwrap();
++            let condition = match terminator.class.opcode {
++                Op::BranchConditional => match terminator.operands.first() {
++                    Some(Operand::IdRef(id)) => Some(*id),
++                    _ => {
++                        return Err(format!(
++                            "fragment function %{function_id} has malformed OpBranchConditional"
++                        ))
++                    }
++                },
++                Op::Switch => match terminator.operands.first() {
++                    Some(Operand::IdRef(id)) => Some(*id),
++                    _ => {
++                        return Err(format!(
++                            "fragment function %{function_id} has malformed OpSwitch"
++                        ))
++                    }
++                },
++                _ => None,
++            };
++            let Some(condition) = condition else {
++                continue;
++            };
++            if uniform_values.contains(&condition) || dense_successors[header].len() < 2 {
++                continue;
++            }
++
++            for &successor in &dense_successors[header] {
++                let mut pending = vec![successor];
++                let mut visited = HashSet::new();
++                while let Some(node) = pending.pop() {
++                    if !visited.insert(node) {
++                        continue;
++                    }
++                    // This node is where the paths reconverge. The branch no longer controls it, and
++                    // neither it nor anything after it inherits this branch's divergence.
++                    if crate::dominators::dominates_interval(&postdominators, node + 1, header + 1)
++                    {
++                        continue;
++                    }
++                    nonuniform[node] = true;
++                    pending.extend(dense_successors[node].iter().copied());
++                }
++            }
++        }
++
++        // Different uniform incoming values form a uniform phi only when every incoming edge
++        // executes uniformly. Start without that assumption and grow the proof to a fixed point.
++        let before = uniform_phi_predecessors.len();
++        for (node, &block) in order.iter().enumerate() {
++            if !nonuniform[node] {
++                uniform_phi_predecessors.insert(
++                    function.blocks[block]
++                        .label
++                        .as_ref()
++                        .unwrap()
++                        .result_id
++                        .unwrap(),
++                );
++            }
++        }
++        if uniform_phi_predecessors.len() == before {
++            break nonuniform;
++        }
++    };
++
++    // `OpDemoteToHelperInvocation` is not a flow-control instruction, so the CFG can reconverge even
++    // after some lanes executed discard_fragment. Metal 2.1 leaves every following derivative
++    // undefined in that case. Carry that fact forward independently of the control-dependence mark.
++    let mut partial_demote = vec![false; order.len()];
++    let mut pending = Vec::new();
++    let mut effective_call_blocks = Vec::new();
++    for (node, &block) in order.iter().enumerate() {
++        let local_demote = nonuniform[node]
++            && function.blocks[block]
++                .instructions
++                .iter()
++                .any(|instruction| instruction.class.opcode == Op::DemoteToHelperInvocation);
++        let effective_call = function.blocks[block]
++            .instructions
++            .iter()
++            .any(|instruction| {
++                instruction.class.opcode == Op::FunctionCall
++                    && instruction.operands.first().is_some_and(|operand| {
++                        matches!(operand, Operand::IdRef(callee) if effectful_callees.contains(callee))
++                    })
++            });
++        effective_call_blocks.extend(effective_call.then_some(node));
++        if local_demote || effective_call {
++            pending.extend(dense_successors[node].iter().copied());
++        }
++    }
++    while let Some(node) = pending.pop() {
++        if partial_demote[node] {
++            continue;
++        }
++        partial_demote[node] = true;
++        pending.extend(dense_successors[node].iter().copied());
++    }
++    // The block is a conservative boundary: a sample later in this same block must not be treated
++    // as before the call, and the current block-level representation cannot split at the
++    // instruction.
++    for block in effective_call_blocks {
++        partial_demote[block] = true;
++    }
++
++    let mut status = vec![ControlStatus::NotReachable; function.blocks.len()];
++    for (node, &block) in order.iter().enumerate() {
++        status[block] = if partial_demote[node] {
++            ControlStatus::PartialDemote
++        } else if nonuniform[node] {
++            ControlStatus::NonUniform
++        } else {
++            ControlStatus::Uniform
++        };
++    }
++    let calls = order
++        .iter()
++        .flat_map(|&block| {
++            function.blocks[block]
++                .instructions
++                .iter()
++                .filter_map(move |instruction| {
++                    if instruction.class.opcode != Op::FunctionCall {
++                        return None;
++                    }
++                    let Some(Operand::IdRef(callee)) = instruction.operands.first() else {
++                        return None;
++                    };
++                    let target = module.functions.iter().position(|function| {
++                        function
++                            .def
++                            .as_ref()
++                            .and_then(|definition| definition.result_id)
++                            == Some(*callee)
++                    })?;
++                    Some(CallSite {
++                        block,
++                        callee: target,
++                    })
++                })
++        })
++        .collect();
++    Ok(FunctionControl { status, calls })
++}
++
++fn function_has_local_exit_effect(function: &Function, status: &[ControlStatus]) -> bool {
++    function.blocks.iter().enumerate().any(|(block, value)| {
++        matches!(
++            status
++                .get(block)
++                .copied()
++                .unwrap_or(ControlStatus::NotReachable),
++            ControlStatus::NonUniform | ControlStatus::PartialDemote
++        ) && value.instructions.iter().any(|instruction| {
++            matches!(
++                instruction.class.opcode,
++                Op::DemoteToHelperInvocation | Op::Kill | Op::TerminateInvocation | Op::Unreachable
++            )
++        })
++    })
++}
++
++fn is_supported_fragment_terminator(opcode: Op) -> bool {
++    matches!(
++        opcode,
++        Op::Branch
++            | Op::BranchConditional
++            | Op::Switch
++            | Op::Return
++            | Op::ReturnValue
++            | Op::Kill
++            | Op::TerminateInvocation
++            | Op::Unreachable
++    )
++}
++
++/// Post-dominators of a dense executable CFG, rooted at a synthetic exit.
++///
++/// The crate's dominance implementation always roots at index zero. Reversing the graph and putting
++/// the virtual exit there therefore computes post-dominators with the same CHK implementation used
++/// by the rest of the translator. Dense block `n` has reverse-graph index `n + 1`.
++fn reverse_post_dominance(
++    successors: &[Vec<usize>],
++) -> (Vec<bool>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>) {
++    let mut reverse = vec![Vec::new(); successors.len() + 1];
++    for (source, targets) in successors.iter().enumerate() {
++        for &target in targets {
++            reverse[target + 1].push(source + 1);
++        }
++        if targets.is_empty() {
++            reverse[0].push(source + 1);
++        }
++    }
++    let predecessors = crate::dominators::build_predecessors(&reverse);
++    crate::dominators::dominance(&reverse, &predecessors)
++}
++
++fn uniform_values(
++    function: &Function,
++    asserted_uniform: &[Word],
++    module: &Module,
++    uniform_phi_predecessors: &HashSet<Word>,
++) -> HashSet<Word> {
++    let mut uniform = module
++        .types_global_values
++        .iter()
++        .filter(|instruction| is_uniform_constant(instruction.class.opcode))
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    uniform.extend(asserted_uniform.iter().copied());
++
++    let mut uniform_input_pointers = flat_or_primitive_input_variables(module);
++    loop {
++        let before = uniform.len();
++        let pointers_before = uniform_input_pointers.len();
++        for block in &function.blocks {
++            for instruction in &block.instructions {
++                let Some(result) = instruction.result_id else {
++                    continue;
++                };
++                match instruction.class.opcode {
++                    Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
++                        let Some(Operand::IdRef(base)) = instruction.operands.first() else {
++                            continue;
++                        };
++                        if uniform_input_pointers.contains(base)
++                            && instruction
++                                .operands
++                                .iter()
++                                .skip(1)
++                                .filter_map(|operand| match operand {
++                                    Operand::IdRef(id) => Some(*id),
++                                    _ => None,
++                                })
++                                .all(|id| uniform.contains(&id))
++                        {
++                            uniform_input_pointers.insert(result);
++                            uniform.insert(result);
++                        }
++                    }
++                    Op::CopyObject | Op::Bitcast => {
++                        if instruction.operands.iter().all(|operand| match operand {
++                            Operand::IdRef(id) => uniform.contains(id),
++                            _ => true,
++                        }) {
++                            uniform.insert(result);
++                        }
++                        if instruction.operands.first().is_some_and(|operand| {
++                            matches!(operand, Operand::IdRef(id) if uniform_input_pointers.contains(id))
++                        }) {
++                            uniform_input_pointers.insert(result);
++                        }
++                    }
++                    Op::Load => {
++                        if instruction.operands.first().is_some_and(|operand| {
++                            matches!(operand, Operand::IdRef(id) if uniform_input_pointers.contains(id))
++                        }) {
++                            uniform.insert(result);
++                        }
++                    }
++                    Op::Phi => {
++                        let sources = instruction
++                            .operands
++                            .chunks_exact(2)
++                            .filter_map(|pair| match pair.first() {
++                                Some(Operand::IdRef(id)) => Some(*id),
++                                _ => None,
++                            })
++                            .collect::<Vec<_>>();
++                        let same_source = sources.first().is_some_and(|first| {
++                            sources.iter().all(|source| source == first)
++                        });
++                        let uniform_edges = instruction.operands.chunks_exact(2).all(|pair| {
++                            matches!(pair.get(1), Some(Operand::IdRef(label))
++                                if uniform_phi_predecessors.contains(label))
++                        });
++                        if !sources.is_empty()
++                            && sources.iter().all(|id| uniform.contains(id))
++                            && (same_source || uniform_edges)
++                        {
++                            uniform.insert(result);
++                        }
++                    }
++                    op if is_uniform_preserving_operation(op)
++                        && instruction
++                            .operands
++                            .iter()
++                            .filter_map(|operand| match operand {
++                                Operand::IdRef(id) => Some(*id),
++                                _ => None,
++                            })
++                            .all(|id| uniform.contains(&id)) =>
++                    {
++                        uniform.insert(result);
++                    }
++                    _ => {}
++                }
++            }
++        }
++        if uniform.len() == before && uniform_input_pointers.len() == pointers_before {
++            break;
++        }
++    }
++    uniform
++}
++
++fn flat_or_primitive_input_variables(module: &Module) -> HashSet<Word> {
++    let mut flat = HashSet::new();
++    let mut primitive_id = HashSet::new();
++    for annotation in &module.annotations {
++        let [Operand::IdRef(id), Operand::Decoration(decoration), rest @ ..] =
++            annotation.operands.as_slice()
++        else {
++            continue;
++        };
++        match (annotation.class.opcode, decoration, rest) {
++            (Op::Decorate, Decoration::Flat, []) => {
++                flat.insert(*id);
++            }
++            (Op::Decorate, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::PrimitiveId)]) => {
++                primitive_id.insert(*id);
++            }
++            _ => {}
++        }
++    }
++    let input_variables = module
++        .types_global_values
++        .iter()
++        .filter(|instruction| instruction.class.opcode == Op::Variable)
++        .filter(|instruction| {
++            instruction.operands.first() == Some(&Operand::StorageClass(StorageClass::Input))
++        })
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    flat.intersection(&input_variables)
++        .chain(primitive_id.intersection(&input_variables))
++        .copied()
++        .collect()
++}
++
++fn is_uniform_constant(opcode: Op) -> bool {
++    matches!(
++        opcode,
++        Op::Constant
++            | Op::ConstantTrue
++            | Op::ConstantFalse
++            | Op::ConstantComposite
++            | Op::ConstantNull
++            | Op::ConstantSampler
++            | Op::SpecConstant
++            | Op::SpecConstantComposite
++            | Op::SpecConstantOp
++            | Op::SpecConstantTrue
++            | Op::SpecConstantFalse
++    )
++}
++
++fn is_uniform_preserving_operation(opcode: Op) -> bool {
++    matches!(
++        opcode,
++        Op::Select
++            | Op::CompositeConstruct
++            | Op::CompositeExtract
++            | Op::CompositeInsert
++            | Op::VectorShuffle
++            | Op::VectorExtractDynamic
++            | Op::VectorInsertDynamic
++            | Op::SampledImage
++            | Op::Image
++            | Op::SNegate
++            | Op::FNegate
++            | Op::IAdd
++            | Op::FAdd
++            | Op::ISub
++            | Op::FSub
++            | Op::IMul
++            | Op::FMul
++            | Op::UDiv
++            | Op::SDiv
++            | Op::FDiv
++            | Op::UMod
++            | Op::SRem
++            | Op::SMod
++            | Op::FRem
++            | Op::FMod
++            | Op::VectorTimesScalar
++            | Op::MatrixTimesScalar
++            | Op::VectorTimesMatrix
++            | Op::MatrixTimesVector
++            | Op::MatrixTimesMatrix
++            | Op::OuterProduct
++            | Op::Dot
++            | Op::IAddCarry
++            | Op::ISubBorrow
++            | Op::UMulExtended
++            | Op::SMulExtended
++            | Op::Any
++            | Op::All
++            | Op::IsNan
++            | Op::IsInf
++            | Op::IsFinite
++            | Op::IsNormal
++            | Op::LogicalEqual
++            | Op::LogicalNotEqual
++            | Op::LogicalOr
++            | Op::LogicalAnd
++            | Op::LogicalNot
++            | Op::IEqual
++            | Op::INotEqual
++            | Op::UGreaterThan
++            | Op::SGreaterThan
++            | Op::UGreaterThanEqual
++            | Op::SGreaterThanEqual
++            | Op::ULessThan
++            | Op::SLessThan
++            | Op::ULessThanEqual
++            | Op::SLessThanEqual
++            | Op::FOrdEqual
++            | Op::FUnordEqual
++            | Op::FOrdNotEqual
++            | Op::FUnordNotEqual
++            | Op::FOrdLessThan
++            | Op::FUnordLessThan
++            | Op::FOrdGreaterThan
++            | Op::FUnordGreaterThan
++            | Op::FOrdLessThanEqual
++            | Op::FUnordLessThanEqual
++            | Op::FOrdGreaterThanEqual
++            | Op::FUnordGreaterThanEqual
++            | Op::ShiftRightLogical
++            | Op::ShiftRightArithmetic
++            | Op::ShiftLeftLogical
++            | Op::BitwiseOr
++            | Op::BitwiseXor
++            | Op::BitwiseAnd
++            | Op::Not
++            | Op::BitFieldInsert
++            | Op::BitFieldSExtract
++            | Op::BitFieldUExtract
++            | Op::BitReverse
++            | Op::BitCount
++            | Op::ConvertFToU
++            | Op::ConvertFToS
++            | Op::ConvertSToF
++            | Op::ConvertUToF
++            | Op::UConvert
++            | Op::SConvert
++            | Op::FConvert
++            | Op::QuantizeToF16
++            | Op::ConvertPtrToU
++            | Op::SatConvertSToU
++            | Op::SatConvertUToS
++            | Op::ConvertUToPtr
++            | Op::PtrCastToGeneric
++            | Op::GenericCastToPtr
++            | Op::GenericCastToPtrExplicit
++            | Op::Bitcast
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static COUNTER: AtomicU64 = AtomicU64::new(0);
++
++    fn assemble(source: &str) -> Option<Module> {
++        if std::process::Command::new("spirv-as")
++            .arg("--version")
++            .output()
++            .is_err()
++        {
++            return None;
++        }
++        let directory = std::env::temp_dir().join(format!(
++            "metal2vulkan-fragment-control-{}-{}",
++            std::process::id(),
++            COUNTER.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let source_path = directory.join("input.spvasm");
++        let binary_path = directory.join("output.spv");
++        std::fs::write(&source_path, source).unwrap();
++        let output = std::process::Command::new("spirv-as")
++            .args(["--target-env", crate::tools::VULKAN_TARGET_ENV])
++            .arg(&source_path)
++            .arg("-o")
++            .arg(&binary_path)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "spirv-as: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let bytes = std::fs::read(binary_path).unwrap();
++        std::fs::remove_dir_all(directory).unwrap();
++        crate::spirv_module::load_bytes(&bytes).ok()
++    }
++
++    fn named_id(module: &Module, wanted: &str) -> Word {
++        module
++            .debug_names
++            .iter()
++            .find_map(|instruction| match instruction.operands.as_slice() {
++                [Operand::IdRef(id), Operand::LiteralString(name)]
++                    if instruction.class.opcode == Op::Name && name == wanted =>
++                {
++                    Some(*id)
++                }
++                _ => None,
++            })
++            .unwrap_or_else(|| panic!("missing OpName {wanted:?}"))
++    }
++
++    fn function_index(module: &Module, function: Word) -> usize {
++        module
++            .functions
++            .iter()
++            .position(|definition| {
++                definition.def.as_ref().and_then(|def| def.result_id) == Some(function)
++            })
++            .unwrap()
++    }
++
++    fn block_index(module: &Module, function: usize, block: Word) -> usize {
++        module.functions[function]
++            .blocks
++            .iter()
++            .position(|value| value.label.as_ref().and_then(|label| label.result_id) == Some(block))
++            .unwrap()
++    }
++
++    fn analyze_module(module: Module, facts: &[(Word, Word)]) -> FragmentControl {
++        let sidecar = crate::emit_sidecar::EmitSidecar {
++            uniform_value_facts: facts
++                .iter()
++                .map(|&(function, value)| crate::emit_sidecar::UniformValueFact { function, value })
++                .collect(),
++            ..crate::emit_sidecar::EmitSidecar::default()
++        };
++        let ctx = Ctx::with_options_and_sidecar(
++            module,
++            sidecar,
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        analyze(&ctx).unwrap()
++    }
++
++    fn status(
++        control: &FragmentControl,
++        module: &Module,
++        function: Word,
++        block: Word,
++    ) -> ControlStatus {
++        let function = function_index(module, function);
++        let block = block_index(module, function, block);
++        control.status(function, block)
++    }
++
++    const PREAMBLE: &str = r#"
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %flat_input %position
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %flat_input Location 0
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpName %main "entry"
++OpName %entry "entry_block"
++OpName %then "then_block"
++OpName %else "else_block"
++OpName %merge "merge_block"
++OpName %flat_input "flat_input"
++OpName %position "position"
++OpName %flat_cond "flat_cond"
++OpName %varying_cond "varying_cond"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%bool = OpTypeBool
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%float_0 = OpConstant %float 0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++"#;
++
++    #[test]
++    fn structured_merge_reconverges_after_nonuniform_selection_and_flat_selection_is_uniform() {
++        let selection = |loads: &str, condition: &str| {
++            format!(
++                "{PREAMBLE}
++OpName %varying \"varying_value\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++{loads}
++OpSelectionMerge %merge None
++OpBranchConditional {condition} %then %else
++%then = OpLabel
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++            )
++        };
++
++        let flat_source = selection(
++            "%flat = OpLoad %float %flat_input\n%flat_cond = OpFOrdGreaterThan %bool %flat %float_0",
++            "%flat_cond",
++        );
++        let Some(flat_module) = assemble(&flat_source) else {
++            return;
++        };
++        let main = named_id(&flat_module, "entry");
++        let then = named_id(&flat_module, "then_block");
++        let merge = named_id(&flat_module, "merge_block");
++        let flat_control = analyze_module(flat_module.clone(), &[]);
++        assert_eq!(
++            status(&flat_control, &flat_module, main, then),
++            ControlStatus::Uniform
++        );
++        assert_eq!(
++            status(&flat_control, &flat_module, main, merge),
++            ControlStatus::Uniform
++        );
++
++        let varying_source = selection(
++            "%pos = OpLoad %v4float %position\n%varying = OpCompositeExtract %float %pos 0\n%varying_cond = OpFOrdGreaterThan %bool %varying %float_0",
++            "%varying_cond",
++        );
++        let Some(varying_module) = assemble(&varying_source) else {
++            return;
++        };
++        let main = named_id(&varying_module, "entry");
++        let then = named_id(&varying_module, "then_block");
++        let else_block = named_id(&varying_module, "else_block");
++        let merge = named_id(&varying_module, "merge_block");
++        let varying = named_id(&varying_module, "varying_value");
++        let varying_control = analyze_module(varying_module.clone(), &[]);
++        assert_eq!(
++            status(&varying_control, &varying_module, main, then),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(&varying_control, &varying_module, main, else_block),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(&varying_control, &varying_module, main, merge),
++            ControlStatus::Uniform
++        );
++
++        let uniform_position = analyze_module(varying_module.clone(), &[(main, varying)]);
++        assert_eq!(
++            status(&uniform_position, &varying_module, main, then),
++            ControlStatus::Uniform
++        );
++    }
++
++    #[test]
++    fn phi_uniformity_depends_on_its_incoming_control_edges() {
++        for (varying, same_source, expected) in [
++            (true, false, ControlStatus::NonUniform),
++            (false, false, ControlStatus::Uniform),
++            (true, true, ControlStatus::Uniform),
++        ] {
++            let input = if varying {
++                "%position_value = OpLoad %v4float %position\n\
++                 %input = OpCompositeExtract %float %position_value 0"
++            } else {
++                "%input = OpLoad %float %flat_input"
++            };
++            let right = if same_source { "%true" } else { "%false" };
++            let Some(module) = assemble(&format!(
++                "{PREAMBLE}
++OpName %target \"target\"
++%true = OpConstantTrue %bool
++%false = OpConstantFalse %bool
++%main = OpFunction %void None %fn
++%entry = OpLabel
++{input}
++%condition = OpFOrdGreaterThan %bool %input %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %condition %then %else
++%then = OpLabel
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++%selected = OpPhi %bool %true %then {right} %else
++OpSelectionMerge %done None
++OpBranchConditional %selected %target %done
++%target = OpLabel
++OpBranch %done
++%done = OpLabel
++OpReturn
++OpFunctionEnd
++"
++            )) else {
++                return;
++            };
++            let main = named_id(&module, "entry");
++            let target = named_id(&module, "target");
++            let control = analyze_module(module.clone(), &[]);
++            assert_eq!(
++                status(&control, &module, main, target),
++                expected,
++                "varying={varying}, same_source={same_source}"
++            );
++        }
++    }
++
++    #[test]
++    fn selected_entry_analysis_is_authoritative_before_op_entry_point_finalization() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++%flat_cond = OpFOrdGreaterThan %bool %flat %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %flat_cond %then %else
++%then = OpLabel
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let then = named_id(&module, "then_block");
++        let main_index = function_index(&module, main);
++        let mut ctx = Ctx::with_options_and_sidecar(
++            module,
++            crate::emit_sidecar::EmitSidecar::default(),
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        // The native emitter has not synthesized OpEntryPoint when pre-finalize passes run.
++        ctx.module.entry_points.clear();
++        let without_entry = analyze(&ctx).unwrap();
++        assert_eq!(
++            without_entry.status(main_index, block_index(&ctx.module, main_index, then)),
++            ControlStatus::NotReachable
++        );
++        let selected = analyze_entry(&ctx, main_index).unwrap();
++        assert_eq!(
++            selected.status(main_index, block_index(&ctx.module, main_index, then)),
++            ControlStatus::Uniform
++        );
++    }
++
++    #[test]
++    fn uniform_loop_body_is_uniform_and_varying_loop_rejoins_at_its_merge() {
++        let loop_body = |loads: &str, condition: &str| {
++            format!(
++                "{PREAMBLE}
++OpName %body \"body\"
++OpName %continue \"continue\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++{loads}
++OpBranch %header
++%header = OpLabel
++OpLoopMerge %merge %continue None
++OpBranchConditional {condition} %body %merge
++%body = OpLabel
++OpBranch %continue
++%continue = OpLabel
++OpBranch %header
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++            )
++        };
++        let flat_source = loop_body(
++            "%flat = OpLoad %float %flat_input\n%flat_cond = OpFOrdGreaterThan %bool %flat %float_0",
++            "%flat_cond",
++        );
++        let Some(flat_module) = assemble(&flat_source) else {
++            return;
++        };
++        let flat_main = named_id(&flat_module, "entry");
++        let flat_cond = named_id(&flat_module, "flat_cond");
++        let flat_control = analyze_module(flat_module.clone(), &[(flat_main, flat_cond)]);
++        let flat_body = named_id(&flat_module, "body");
++        let flat_merge = named_id(&flat_module, "merge_block");
++        assert_eq!(
++            status(&flat_control, &flat_module, flat_main, flat_body),
++            ControlStatus::Uniform
++        );
++        assert_eq!(
++            status(&flat_control, &flat_module, flat_main, flat_merge),
++            ControlStatus::Uniform
++        );
++
++        let varying_source = loop_body(
++            "%pos = OpLoad %v4float %position\n%varying = OpCompositeExtract %float %pos 0\n%varying_cond = OpFOrdGreaterThan %bool %varying %float_0",
++            "%varying_cond",
++        );
++        let Some(varying_module) = assemble(&varying_source) else {
++            return;
++        };
++        let varying_main = named_id(&varying_module, "entry");
++        let varying_control = analyze_module(varying_module.clone(), &[]);
++        let varying_body = named_id(&varying_module, "body");
++        let varying_merge = named_id(&varying_module, "merge_block");
++        assert_eq!(
++            status(
++                &varying_control,
++                &varying_module,
++                varying_main,
++                varying_body
++            ),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(
++                &varying_control,
++                &varying_module,
++                varying_main,
++                varying_merge
++            ),
++            ControlStatus::Uniform
++        );
++    }
++
++    #[test]
++    fn nonuniform_demote_taints_the_reconverged_continuation() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%varying_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %varying_cond %then %else
++%then = OpLabel
++OpDemoteToHelperInvocation
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let merge = named_id(&module, "merge_block");
++        let control = analyze_module(module.clone(), &[]);
++        assert_eq!(
++            status(&control, &module, main, merge),
++            ControlStatus::PartialDemote
++        );
++    }
++
++    #[test]
++    fn an_early_return_keeps_every_continuation_control_dependent_on_the_branch() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%condition = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %condition %then %else
++%then = OpLabel
++OpReturn
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let merge = named_id(&module, "merge_block");
++        let control = analyze_module(module.clone(), &[]);
++        assert_eq!(
++            status(&control, &module, main, merge),
++            ControlStatus::NonUniform
++        );
++    }
++
++    #[test]
++    fn every_fragment_entry_is_analyzed_and_other_execution_models_are_ignored() {
++        let source = r#"
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main_a "a" %flat_input
++OpEntryPoint Fragment %main_b "b" %position
++OpEntryPoint GLCompute %main_c "c"
++OpExecutionMode %main_a OriginUpperLeft
++OpExecutionMode %main_b OriginUpperLeft
++OpExecutionMode %main_c LocalSize 1 1 1
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpName %main_a "entry_a"
++OpName %a_entry "a_entry"
++OpName %a_then "a_then"
++OpName %a_merge "a_merge"
++OpName %main_b "entry_b"
++OpName %b_entry "b_entry"
++OpName %b_then "b_then"
++OpName %b_merge "b_merge"
++OpName %main_c "entry_c"
++OpName %c_entry "c_entry"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%bool = OpTypeBool
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%float_0 = OpConstant %float 0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++%main_a = OpFunction %void None %fn
++%a_entry = OpLabel
++%flat = OpLoad %float %flat_input
++%a_cond = OpFOrdGreaterThan %bool %flat %float_0
++OpSelectionMerge %a_merge None
++OpBranchConditional %a_cond %a_then %a_merge
++%a_then = OpLabel
++OpBranch %a_merge
++%a_merge = OpLabel
++OpReturn
++OpFunctionEnd
++%main_b = OpFunction %void None %fn
++%b_entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%b_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %b_merge None
++OpBranchConditional %b_cond %b_then %b_merge
++%b_then = OpLabel
++OpBranch %b_merge
++%b_merge = OpLabel
++OpReturn
++OpFunctionEnd
++%main_c = OpFunction %void None %fn
++%c_entry = OpLabel
++OpReturn
++OpFunctionEnd
++"#;
++        let Some(module) = assemble(source) else {
++            return;
++        };
++        let entry_a = named_id(&module, "entry_a");
++        let entry_b = named_id(&module, "entry_b");
++        let entry_c = named_id(&module, "entry_c");
++        let control = analyze_module(module.clone(), &[]);
++        assert_eq!(
++            status(&control, &module, entry_a, named_id(&module, "a_then")),
++            ControlStatus::Uniform
++        );
++        assert_eq!(
++            status(&control, &module, entry_b, named_id(&module, "b_then")),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(&control, &module, entry_c, named_id(&module, "c_entry")),
++            ControlStatus::NotReachable
++        );
++    }
++
++    #[test]
++    fn a_helper_inherits_its_call_sites_but_a_nonuniform_call_site_cannot_be_promoted() {
++        let source = r#"
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %flat_input %position
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpName %main "entry"
++OpName %entry "entry_block"
++OpName %uniform_arm "uniform_arm"
++OpName %varying_arm "varying_arm"
++OpName %merge "merge_block"
++OpName %helper "helper"
++OpName %helper_entry "helper_entry"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%bool = OpTypeBool
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%float_0 = OpConstant %float 0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++OpSelectionMerge %merge None
++OpBranchConditional %flat %uniform_arm %varying_arm
++%uniform_arm = OpLabel
++%uniform_call = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_arm = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%varying_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %varying_cond %uniform_call_site %varying_skip
++%uniform_call_site = OpLabel
++%second_call = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_skip = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++%helper = OpFunction %void None %fn
++%helper_entry = OpLabel
++OpReturn
++OpFunctionEnd
++"#;
++        let Some(module) = assemble(source) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let helper = named_id(&module, "helper");
++        let control = analyze_module(module.clone(), &[]);
++        let helper_entry = named_id(&module, "helper_entry");
++        assert_eq!(
++            status(&control, &module, helper, helper_entry),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(&control, &module, main, named_id(&module, "entry_block")),
++            ControlStatus::Uniform
++        );
++    }
++
++    #[test]
++    fn mixed_call_sites_are_specialized_before_fragment_control_analysis() {
++        let source = r#"
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %flat_input %position
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpName %main "entry"
++OpName %entry "entry_block"
++OpName %uniform_arm "uniform_arm"
++OpName %varying_arm "varying_arm"
++OpName %varying_call "varying_call"
++OpName %varying_skip "varying_skip"
++OpName %merge "merge_block"
++OpName %varying "varying_value"
++OpName %helper "helper"
++OpName %helper_entry "helper_entry"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%bool = OpTypeBool
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%float_0 = OpConstant %float 0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++OpSelectionMerge %merge None
++OpBranchConditional %flat %uniform_arm %varying_arm
++%uniform_arm = OpLabel
++%uniform_call = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_arm = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%varying_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %varying_cond %varying_call %varying_skip
++%varying_call = OpLabel
++%varying_call_result = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_skip = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++%helper = OpFunction %void None %fn
++%helper_entry = OpLabel
++%helper_flat = OpLoad %float %flat_input
++OpReturn
++OpFunctionEnd
++"#;
++        let Some(module) = assemble(source) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let helper = named_id(&module, "helper");
++        let before = analyze_module(module.clone(), &[]);
++        assert_eq!(
++            status(&before, &module, helper, named_id(&module, "helper_entry")),
++            ControlStatus::NonUniform
++        );
++
++        let mut ctx = Ctx::with_options_and_sidecar(
++            module.clone(),
++            crate::emit_sidecar::EmitSidecar::default(),
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        let main_index = function_index(&ctx.module, main);
++        prepare_fragment_control(&mut ctx, main_index).unwrap();
++        let after = analyze(&ctx).unwrap();
++        assert_eq!(
++            status(
++                &after,
++                &ctx.module,
++                main,
++                named_id(&ctx.module, "uniform_arm")
++            ),
++            ControlStatus::Uniform
++        );
++        assert_eq!(
++            status(
++                &after,
++                &ctx.module,
++                main,
++                named_id(&ctx.module, "varying_call")
++            ),
++            ControlStatus::NonUniform
++        );
++        assert_eq!(
++            status(
++                &after,
++                &ctx.module,
++                helper,
++                named_id(&ctx.module, "helper_entry")
++            ),
++            ControlStatus::NotReachable
++        );
++        let main_index = function_index(&ctx.module, main);
++        assert!(ctx.module.functions[main_index]
++            .blocks
++            .iter()
++            .flat_map(|block| &block.instructions)
++            .all(|instruction| instruction.class.opcode != Op::FunctionCall));
++        for block in ["uniform_arm", "varying_call"] {
++            let block = block_index(&ctx.module, main_index, named_id(&ctx.module, block));
++            assert!(
++                ctx.module.functions[main_index].blocks[block]
++                    .instructions
++                    .iter()
++                    .any(|instruction| instruction.class.opcode == Op::Load),
++                "helper body was not cloned into {block}"
++            );
++        }
++    }
++
++    #[test]
++    fn inlined_air_is_uniform_assertions_are_recorded_per_call_argument() {
++        let source = r#"
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %flat_input %position
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpName %main "entry"
++OpName %entry "entry_block"
++OpName %flat "flat"
++OpName %uniform_arm "uniform_arm"
++OpName %varying_arm "varying_arm"
++OpName %varying_call "varying_call"
++OpName %varying_skip "varying_skip"
++OpName %merge "merge_block"
++OpName %varying "varying_value"
++OpName %helper "helper"
++OpName %helper_entry "helper_entry"
++OpName %air_is_uniform "air.is_uniform.f32"
++%void = OpTypeVoid
++%void_fn = OpTypeFunction %void
++%bool = OpTypeBool
++%bool_float_fn = OpTypeFunction %bool %float
++%void_float_fn = OpTypeFunction %void %float
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%float_0 = OpConstant %float 0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++%main = OpFunction %void None %void_fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++OpSelectionMerge %merge None
++OpBranchConditional %flat %uniform_arm %varying_arm
++%uniform_arm = OpLabel
++%uniform_call = OpFunctionCall %void %helper %flat
++OpBranch %merge
++%varying_arm = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%varying_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %varying_cond %varying_call %varying_skip
++%varying_call = OpLabel
++%varying_helper_call = OpFunctionCall %void %helper %varying
++OpBranch %merge
++%varying_skip = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++%helper = OpFunction %void None %void_float_fn
++%helper_value = OpFunctionParameter %float
++%helper_entry = OpLabel
++%asserted = OpFunctionCall %bool %air_is_uniform %helper_value
++OpReturn
++OpFunctionEnd
++%air_is_uniform = OpFunction %bool None %bool_float_fn
++OpFunctionEnd
++"#;
++        let Some(module) = assemble(source) else {
++            return;
++        };
++        let flat = named_id(&module, "flat");
++        let varying = named_id(&module, "varying_value");
++        let main = named_id(&module, "entry");
++        let mut ctx = Ctx::with_options_and_sidecar(
++            module,
++            crate::emit_sidecar::EmitSidecar::default(),
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        // The native emitter has not synthesized the final OpEntryPoint yet when this preparation
++        // runs; the selected entry index is the authoritative anchor in that phase.
++        ctx.module.entry_points.clear();
++        let main_index = function_index(&ctx.module, main);
++        prepare_fragment_control(&mut ctx, main_index).unwrap();
++        ctx.phase_value_types = Some(crate::passes::function_value_types(&ctx, main_index));
++        crate::passes::lower_air_calls(&mut ctx, main_index).unwrap();
++        let facts = ctx
++            .emit_sidecar
++            .uniform_value_facts
++            .iter()
++            .map(|fact| (fact.function, fact.value))
++            .collect::<HashSet<_>>();
++        assert_eq!(facts, HashSet::from([(main, flat), (main, varying)]));
++    }
++}
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -2,7 +2,8 @@
+ 
+ use super::*;
+ use crate::spirv_module::{Block, Function};
+-use spirv::{Capability, Decoration, FunctionControl, LoopControl};
++use crate::{UniformControlProof, UniformControlValue};
++use spirv::{Capability, Decoration, ExecutionModel, FunctionControl, LoopControl};
+ use std::collections::{BTreeMap, HashMap, HashSet};
+ 
+ pub const ARGUMENT_RESOURCE_TABLE_BINDING: u32 = 672;
+@@ -43,6 +44,25 @@
+     fields: &[ArgumentResourceField],
+     table_version: u32,
+ ) -> Result<Vec<u8>, String> {
++    lower_argument_resource_tables_with_table_version_and_uniform_control_proof(
++        bytes,
++        fields,
++        table_version,
++        None,
++    )
++}
++
++/// Lower an explicit GPU argument table ABI with an optional cached typed-uniformity proof.
++///
++/// The proof is scoped to the exact serialized module by the wrapper before this entry point. It
++/// seeds only `air.is_uniform` facts; descriptor representation and normalized-sampler coordinate
++/// selection remain controlled by `table_version`.
++pub fn lower_argument_resource_tables_with_table_version_and_uniform_control_proof(
++    bytes: &[u8],
++    fields: &[ArgumentResourceField],
++    table_version: u32,
++    proof: Option<&UniformControlProof>,
++) -> Result<Vec<u8>, String> {
+     if !matches!(table_version, 7 | 8) {
+         return Err(format!(
+             "unsupported GPU argument table version {table_version}"
+@@ -53,16 +73,12 @@
+     }
+     let module = crate::spirv_module::load_bytes(bytes)
+         .map_err(|error| format!("argument resource SPIR-V: {error:?}"))?;
++    let sidecar = uniform_control_sidecar(&module, proof)?;
+     let options = TransformOptions {
+         normalized_sampler_coordinates: table_version >= 8,
+         ..TransformOptions::default()
+     };
+-    let mut ctx = Ctx::with_options_and_sidecar(
+-        module,
+-        crate::emit_sidecar::EmitSidecar::default(),
+-        Stage::Kernel,
+-        options,
+-    );
++    let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, Stage::Kernel, options);
+     lower(&mut ctx, fields, table_version)?;
+     super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
+     super::null_sampling::protect_argument_sampling(&mut ctx)?;
+@@ -83,6 +99,78 @@
+         .iter()
+         .flat_map(|word| word.to_le_bytes())
+         .collect())
++}
++
++fn uniform_control_sidecar(
++    module: &Module,
++    proof: Option<&UniformControlProof>,
++) -> Result<crate::emit_sidecar::EmitSidecar, String> {
++    let mut sidecar = crate::emit_sidecar::EmitSidecar::default();
++    let Some(proof) = proof else {
++        return Ok(sidecar);
++    };
++
++    let mut actual_entries = module
++        .entry_points
++        .iter()
++        .filter(|entry| {
++            entry.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::Fragment))
++        })
++        .filter_map(|entry| match entry.operands.as_slice() {
++            [
++                Operand::ExecutionModel(_),
++                Operand::IdRef(function),
++                Operand::LiteralString(name),
++                ..,
++            ] => Some((*function, name.clone())),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    actual_entries
++        .sort_by(|left, right| (left.0, left.1.as_str()).cmp(&(right.0, right.1.as_str())));
++    actual_entries.dedup();
++    let mut claimed_entries = proof
++        .entries
++        .iter()
++        .map(|entry| (entry.function, entry.name.clone()))
++        .collect::<Vec<_>>();
++    claimed_entries
++        .sort_by(|left, right| (left.0, left.1.as_str()).cmp(&(right.0, right.1.as_str())));
++    let claimed_len = claimed_entries.len();
++    claimed_entries.dedup();
++    if claimed_entries.len() != claimed_len || claimed_entries != actual_entries {
++        return Err(
++            "uniform control proof does not name this SPIR-V module's fragment entries".into(),
++        );
++    }
++
++    let mut seen = HashSet::new();
++    for UniformControlValue { function, value } in proof.values.iter().copied() {
++        if !seen.insert((function, value)) {
++            return Err(format!(
++                "uniform control proof repeats function %{function} value %{value}"
++            ));
++        }
++        let definition = module
++            .functions
++            .iter()
++            .find(|definition| {
++                definition.def.as_ref().and_then(|def| def.result_id) == Some(function)
++            })
++            .ok_or_else(|| format!("uniform control proof names unknown function %{function}"))?;
++        if !definition
++            .all_inst_iter()
++            .any(|instruction| instruction.result_id == Some(value))
++        {
++            return Err(format!(
++                "uniform control proof names value %{value} outside function %{function}"
++            ));
++        }
++        sidecar
++            .uniform_value_facts
++            .push(crate::emit_sidecar::UniformValueFact { function, value });
++    }
++    Ok(sidecar)
+ }
+ 
+ #[derive(Clone, Copy)]
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -6,6 +6,7 @@
+ mod buffer_addresses;
+ mod collapse;
+ mod discovery;
++pub(in crate::passes) mod fragment_control;
+ mod gpu_argument_graph;
+ mod gpu_arguments;
+ mod nonuniform;
+@@ -26,6 +27,7 @@
+ pub(in crate::passes) use gpu_arguments::table_sampler_flag_word;
+ pub use gpu_arguments::{
+     lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+     ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+--- a/src/passes/resources/quad_sampling.rs
++++ b/src/passes/resources/quad_sampling.rs
+@@ -1,4 +1,10 @@
+ //! Compute derivatives before the backend serializes nonuniform image/sampler selection.
++//!
++//! This pass deliberately lowers an implicit sample only in its own uniform CFG instance. A source
++//! sample in nonuniform control flow can still have defined derivative behavior when the coordinate
++//! and its dependencies can be recomputed at an earlier uniform dominator without changing loop,
++//! call, or side-effect semantics. Hoisting/recomputation is not implemented here: rejecting that
++//! shape is a fail-closed boundary, not evidence that the remaining legal hoist cases are supported.
+ 
+ use super::*;
+ use spirv::{Decoration, ExecutionModel, GlslStd450Op, ImageOperands};
+@@ -34,6 +40,11 @@
+     }) else {
+         return Ok(());
+     };
++    // Resolve every executable fragment-entry closure and control-flow fact before this pass edits
++    // any instruction. A helper body that no fragment entry reaches is not part of the program; a
++    // residual reachable call is rejected because its call-site guard is no longer represented at
++    // the callee.
++    let control = super::fragment_control::analyze(ctx)?;
+     let defs = ctx
+         .module
+         .all_inst_iter()
+@@ -42,6 +53,10 @@
+         .collect::<HashMap<_, _>>();
+     for function in 0..ctx.module.functions.len() {
+         for block in 0..ctx.module.functions[function].blocks.len() {
++            let control_status = control.status(function, block);
++            if control_status == super::fragment_control::ControlStatus::NotReachable {
++                continue;
++            }
+             let original = ctx.module.functions[function].blocks[block]
+                 .instructions
+                 .clone();
+@@ -50,6 +65,13 @@
+                 let (opcode, operands) = match inst.class.opcode {
+                     Op::ImageSampleImplicitLod => (Op::ImageSampleExplicitLod, 2),
+                     Op::ImageSampleDrefImplicitLod => (Op::ImageSampleDrefExplicitLod, 3),
++                    Op::ImageSampleProjImplicitLod | Op::ImageSampleProjDrefImplicitLod
++                        if inst.operands.first().is_some_and(|operand| {
++                            matches!(operand, Operand::IdRef(sampled) if nonuniform.contains(sampled))
++                        }) =>
++                    {
++                        return Err("nonuniform projected implicit argument sampling requires projection before derivative lowering".into());
++                    }
+                     _ => {
+                         body.push(inst);
+                         continue;
+@@ -61,6 +83,39 @@
+                 if !nonuniform.contains(sampled) {
+                     body.push(inst);
+                     continue;
++                }
++                if control_status != super::fragment_control::ControlStatus::Uniform {
++                    let function_id = ctx.module.functions[function]
++                        .def
++                        .as_ref()
++                        .and_then(|definition| definition.result_id)
++                        .map(|id| format!("%{id}"))
++                        .unwrap_or_else(|| format!("#{function}"));
++                    let block_id = ctx.module.functions[function].blocks[block]
++                        .label
++                        .as_ref()
++                        .and_then(|label| label.result_id)
++                        .map(|id| format!("%{id}"))
++                        .unwrap_or_else(|| format!("#{block}"));
++                    let reason = match control_status {
++                        super::fragment_control::ControlStatus::PartialDemote => {
++                            "a non-uniform discard_fragment precedes it"
++                        }
++                        super::fragment_control::ControlStatus::NonUniform => {
++                            "its block is not in uniform control flow"
++                        }
++                        super::fragment_control::ControlStatus::NotReachable
++                        | super::fragment_control::ControlStatus::Uniform => {
++                            unreachable!("reachable nonuniform sample has an invalid status")
++                        }
++                    };
++                    return Err(format!(
++                        "nonuniform argument implicit sample in fragment function {function_id} \
++                         block {block_id} cannot be lowered in place: {reason}; safe hoisting or \
++                         dependency recomputation at an earlier uniform dominator is not implemented \
++                         for this site, and without QuadDerivativesKHR explicit derivatives must be \
++                         uniform within the primitive-scope derivative group"
++                    ));
+                 }
+                 let image = defs
+                     .get(sampled)
+@@ -83,6 +138,20 @@
+                         )
+                     }
+                 };
++                if image.operands.get(4) != Some(&Operand::LiteralBit32(0)) {
++                    return Err(
++                        "implicit argument sampling requires a non-multisampled image".into(),
++                    );
++                }
++                let arrayed = match image.operands.get(3) {
++                    Some(Operand::LiteralBit32(0)) => 0,
++                    Some(Operand::LiteralBit32(1)) => 1,
++                    _ => {
++                        return Err(
++                            "implicit argument sample has an invalid array image type".into()
++                        )
++                    }
++                };
+                 let Some(Operand::IdRef(coord)) = inst.operands.get(1) else {
+                     return Err("implicit argument sample has no coordinate".into());
+                 };
+@@ -91,6 +160,32 @@
+                     .get(&coord)
+                     .and_then(|value| value.result_type)
+                     .ok_or("implicit argument sample coordinate has no type")?;
++                let coordinate_type = defs
++                    .get(&coord_type)
++                    .ok_or("implicit argument sample coordinate type is undefined")?;
++                let (component, components) = match coordinate_type.operands.as_slice() {
++                    [Operand::LiteralBit32(32)]
++                        if coordinate_type.class.opcode == Op::TypeFloat =>
++                    {
++                        (coord_type, 1)
++                    }
++                    [Operand::IdRef(component), Operand::LiteralBit32(components)]
++                        if coordinate_type.class.opcode == Op::TypeVector =>
++                    {
++                        (*component, *components)
++                    }
++                    _ => return Err("implicit argument sample requires float32 coordinates".into()),
++                };
++                if components != spatial + arrayed
++                    || !defs.get(&component).is_some_and(|component| {
++                        component.class.opcode == Op::TypeFloat
++                            && component.operands == [Operand::LiteralBit32(32)]
++                    })
++                {
++                    return Err(
++                        "implicit argument sample coordinate shape does not match its image".into(),
++                    );
++                }
+                 let gradient_type = if spatial == 1 {
+                     ctx.ty_float()
+                 } else {
+@@ -215,3 +310,892 @@
+     }
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static COUNTER: AtomicU64 = AtomicU64::new(0);
++
++    fn assemble(source: &str) -> Option<crate::spirv_module::Module> {
++        if std::process::Command::new("spirv-as")
++            .arg("--version")
++            .output()
++            .is_err()
++        {
++            return None;
++        }
++        let directory = std::env::temp_dir().join(format!(
++            "metal2vulkan-quad-control-{}-{}",
++            std::process::id(),
++            COUNTER.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let source_path = directory.join("input.spvasm");
++        let binary_path = directory.join("output.spv");
++        std::fs::write(&source_path, source).unwrap();
++        let output = std::process::Command::new("spirv-as")
++            .args(["--target-env", crate::tools::VULKAN_TARGET_ENV])
++            .arg(&source_path)
++            .arg("-o")
++            .arg(&binary_path)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "spirv-as: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let bytes = std::fs::read(binary_path).unwrap();
++        std::fs::remove_dir_all(directory).unwrap();
++        crate::spirv_module::load_bytes(&bytes).ok()
++    }
++
++    fn named_id(module: &Module, wanted: &str) -> Word {
++        module
++            .debug_names
++            .iter()
++            .find_map(|instruction| match instruction.operands.as_slice() {
++                [Operand::IdRef(id), Operand::LiteralString(name)]
++                    if instruction.class.opcode == Op::Name && name == wanted =>
++                {
++                    Some(*id)
++                }
++                _ => None,
++            })
++            .unwrap_or_else(|| panic!("missing OpName {wanted:?}"))
++    }
++
++    fn function_index(module: &Module, function: Word) -> usize {
++        module
++            .functions
++            .iter()
++            .position(|definition| {
++                definition.def.as_ref().and_then(|def| def.result_id) == Some(function)
++            })
++            .unwrap()
++    }
++
++    fn block_index(module: &Module, function: Word, block: Word) -> usize {
++        let function = function_index(module, function);
++        module.functions[function]
++            .blocks
++            .iter()
++            .position(|value| value.label.as_ref().and_then(|label| label.result_id) == Some(block))
++            .unwrap()
++    }
++
++    fn run(
++        module: crate::spirv_module::Module,
++        facts: &[(Word, Word)],
++    ) -> Result<crate::spirv_module::Module, String> {
++        let sidecar = crate::emit_sidecar::EmitSidecar {
++            uniform_value_facts: facts
++                .iter()
++                .map(|&(function, value)| crate::emit_sidecar::UniformValueFact { function, value })
++                .collect(),
++            ..crate::emit_sidecar::EmitSidecar::default()
++        };
++        let mut ctx = Ctx::with_options_and_sidecar(
++            module,
++            sidecar,
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        lower_argument_implicit_lod(&mut ctx)?;
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++        Ok(ctx.module)
++    }
++
++    fn validate(module: &crate::spirv_module::Module) {
++        let directory = std::env::temp_dir().join(format!(
++            "metal2vulkan-quad-validate-{}-{}",
++            std::process::id(),
++            COUNTER.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let path = directory.join("output.spv");
++        let bytes = module
++            .assemble()
++            .into_iter()
++            .flat_map(Word::to_le_bytes)
++            .collect::<Vec<_>>();
++        std::fs::write(&path, &bytes).unwrap();
++        let output = std::process::Command::new("spirv-val")
++            .args(["--target-env", crate::tools::VULKAN_TARGET_ENV])
++            .arg(&path)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "spirv-val: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++
++    fn has_derivatives(
++        module: &crate::spirv_module::Module,
++        function: Word,
++        block: Word,
++    ) -> (bool, bool) {
++        let function_position = function_index(module, function);
++        let block_position = block_index(module, function, block);
++        let body = &module.functions[function_position].blocks[block_position].instructions;
++        (
++            body.iter()
++                .any(|instruction| instruction.class.opcode == Op::DPdx),
++            body.iter()
++                .any(|instruction| instruction.class.opcode == Op::DPdy),
++        )
++    }
++
++    const PREAMBLE: &str = r#"
++OpCapability Shader
++OpCapability ShaderNonUniform
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %flat_input %position %sampled_var %table
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %flat_input Location 0
++OpDecorate %flat_input Flat
++OpDecorate %position BuiltIn FragCoord
++OpDecorate %sampled_var DescriptorSet 0
++OpDecorate %sampled_var Binding 32
++OpDecorate %table DescriptorSet 0
++OpDecorate %table Binding 672
++OpDecorate %table_type Block
++OpDecorate %table_words ArrayStride 4
++OpMemberDecorate %table_type 0 Offset 0
++OpDecorate %sampled NonUniform
++OpName %main "entry"
++OpName %entry "entry_block"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%bool = OpTypeBool
++%uint = OpTypeInt 32 0
++%float = OpTypeFloat 32
++%v2float = OpTypeVector %float 2
++%v4float = OpTypeVector %float 4
++%input_float = OpTypePointer Input %float
++%input_v4float = OpTypePointer Input %v4float
++%image = OpTypeImage %float 2D 0 0 0 1 Unknown
++%sampled_type = OpTypeSampledImage %image
++%sampled_ptr = OpTypePointer UniformConstant %sampled_type
++%table_words = OpTypeRuntimeArray %uint
++%table_type = OpTypeStruct %table_words
++%table_ptr = OpTypePointer StorageBuffer %table_type
++%float_0 = OpConstant %float 0
++%coord = OpConstantComposite %v2float %float_0 %float_0
++%flat_input = OpVariable %input_float Input
++%position = OpVariable %input_v4float Input
++%sampled_var = OpVariable %sampled_ptr UniformConstant
++%table = OpVariable %table_ptr StorageBuffer
++"#;
++
++    #[test]
++    fn derivatives_stay_in_the_uniform_branch_that_contains_the_sample() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++OpName %then \"then_block\"
++OpName %else \"else_block\"
++OpName %merge \"merge_block\"
++OpName %varying \"varying_value\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%condition = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %condition %then %else
++%then = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let varying = named_id(&module, "varying_value");
++        let lowered = run(module.clone(), &[(main, varying)]).unwrap();
++        validate(&lowered);
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "then_block")),
++            (true, true)
++        );
++        for block in ["entry_block", "else_block", "merge_block"] {
++            assert_eq!(
++                has_derivatives(&lowered, main, named_id(&lowered, block)),
++                (false, false),
++                "derivatives were hoisted into {block}"
++            );
++        }
++        let error = run(module, &[]).unwrap_err();
++        assert!(error.contains("not in uniform control flow"), "{error}");
++        assert!(
++            error.contains("safe hoisting or dependency recomputation")
++                && error.contains("not implemented"),
++            "the fail-closed boundary must name the remaining hoist gap: {error}"
++        );
++    }
++
++    #[test]
++    fn derivatives_remain_inside_a_uniform_loop_body() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++OpName %header \"header\"
++OpName %body \"body\"
++OpName %continue \"continue\"
++OpName %merge \"merge_block\"
++OpName %varying \"varying_value\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%condition = OpFOrdGreaterThan %bool %varying %float_0
++OpBranch %header
++%header = OpLabel
++OpLoopMerge %merge %continue None
++OpBranchConditional %condition %body %merge
++%body = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpBranch %continue
++%continue = OpLabel
++OpBranch %header
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let varying = named_id(&module, "varying_value");
++        let lowered = run(module, &[(main, varying)]).unwrap();
++        validate(&lowered);
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "body")),
++            (true, true)
++        );
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "entry_block")),
++            (false, false)
++        );
++    }
++
++    #[test]
++    fn helper_sample_is_lowered_at_the_helper_site_not_hoisted_to_the_caller() {
++        let source = format!(
++            "{PREAMBLE}
++OpName %then \"then_block\"
++OpName %else \"else_block\"
++OpName %merge \"merge_block\"
++OpName %helper \"helper\"
++OpName %helper_entry \"helper_entry\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++%condition = OpFOrdGreaterThan %bool %flat %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %condition %then %else
++%then = OpLabel
++%call = OpFunctionCall %void %helper
++OpBranch %merge
++%else = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++%helper = OpFunction %void None %fn
++%helper_entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++        );
++        let Some(module) = assemble(&source) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let helper = named_id(&module, "helper");
++        let lowered = run(module.clone(), &[]).unwrap();
++        validate(&lowered);
++        assert_eq!(
++            has_derivatives(&lowered, helper, named_id(&lowered, "helper_entry")),
++            (true, true)
++        );
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "entry_block")),
++            (false, false)
++        );
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "then_block")),
++            (false, false)
++        );
++    }
++
++    #[test]
++    fn mixed_helper_call_sites_keep_the_uniform_clone_lowerable() {
++        let source = format!(
++            "{PREAMBLE}
++OpName %uniform_arm \"uniform_arm\"
++OpName %varying_arm \"varying_arm\"
++OpName %varying_call \"varying_call\"
++OpName %varying_skip \"varying_skip\"
++OpName %merge \"merge_block\"
++OpName %helper \"helper\"
++OpName %helper_entry \"helper_entry\"
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%flat = OpLoad %float %flat_input
++OpSelectionMerge %merge None
++OpBranchConditional %flat %uniform_arm %varying_arm
++%uniform_arm = OpLabel
++%uniform_call = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_arm = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%varying_cond = OpFOrdGreaterThan %bool %varying %float_0
++OpSelectionMerge %merge None
++OpBranchConditional %varying_cond %varying_call %varying_skip
++%varying_call = OpLabel
++%varying_call_result = OpFunctionCall %void %helper
++OpBranch %merge
++%varying_skip = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++%helper = OpFunction %void None %fn
++%helper_entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++        );
++        let Some(module) = assemble(&source) else {
++            return;
++        };
++        let mut ctx = Ctx::with_options_and_sidecar(
++            module,
++            crate::emit_sidecar::EmitSidecar::default(),
++            Stage::Fragment,
++            TransformOptions::default(),
++        );
++        let main = named_id(&ctx.module, "entry");
++        let main_index = function_index(&ctx.module, main);
++        super::fragment_control::prepare_fragment_control(&mut ctx, main_index).unwrap();
++        let error = lower_argument_implicit_lod(&mut ctx).unwrap_err();
++        let varying_call = named_id(&ctx.module, "varying_call");
++        assert!(
++            error.contains(&format!("%{varying_call}")),
++            "the nonuniform clone must be the rejected site: {error}"
++        );
++        assert_eq!(
++            has_derivatives(&ctx.module, main, named_id(&ctx.module, "uniform_arm")),
++            (true, true),
++            "the uniform clone must not be rejected because its sibling call site is nonuniform"
++        );
++    }
++
++    #[test]
++    fn fragment_lowering_leaves_a_compute_entry_without_derivatives() {
++        let source = r#"
++OpCapability Shader
++OpCapability ShaderNonUniform
++OpCapability ComputeDerivativeGroupQuadsKHR
++OpExtension "SPV_KHR_compute_shader_derivatives"
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %sampled_var %table
++OpEntryPoint GLCompute %compute_main "compute" %sampled_var %table
++OpExecutionMode %main OriginUpperLeft
++OpExecutionMode %compute_main LocalSize 2 2 1
++OpExecutionMode %compute_main DerivativeGroupQuadsKHR
++OpDecorate %sampled_var DescriptorSet 0
++OpDecorate %sampled_var Binding 32
++OpDecorate %table DescriptorSet 0
++OpDecorate %table Binding 672
++OpDecorate %table_type Block
++OpDecorate %table_words ArrayStride 4
++OpMemberDecorate %table_type 0 Offset 0
++OpDecorate %sampled_fragment NonUniform
++OpDecorate %sampled_compute NonUniform
++OpName %main "entry"
++OpName %fragment_entry "fragment_entry"
++OpName %compute_main "compute_main"
++OpName %compute_entry "compute_entry"
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%uint = OpTypeInt 32 0
++%float = OpTypeFloat 32
++%v2float = OpTypeVector %float 2
++%v4float = OpTypeVector %float 4
++%image = OpTypeImage %float 2D 0 0 0 1 Unknown
++%sampled_type = OpTypeSampledImage %image
++%sampled_ptr = OpTypePointer UniformConstant %sampled_type
++%table_words = OpTypeRuntimeArray %uint
++%table_type = OpTypeStruct %table_words
++%table_ptr = OpTypePointer StorageBuffer %table_type
++%float_0 = OpConstant %float 0
++%coord = OpConstantComposite %v2float %float_0 %float_0
++%sampled_var = OpVariable %sampled_ptr UniformConstant
++%table = OpVariable %table_ptr StorageBuffer
++%main = OpFunction %void None %fn
++%fragment_entry = OpLabel
++%sampled_fragment = OpLoad %sampled_type %sampled_var
++%fragment_color = OpImageSampleImplicitLod %v4float %sampled_fragment %coord
++OpReturn
++OpFunctionEnd
++%compute_main = OpFunction %void None %fn
++%compute_entry = OpLabel
++%sampled_compute = OpLoad %sampled_type %sampled_var
++%compute_color = OpImageSampleImplicitLod %v4float %sampled_compute %coord
++OpReturn
++OpFunctionEnd
++"#;
++        let Some(module) = assemble(source) else {
++            return;
++        };
++        let fragment = named_id(&module, "entry");
++        let compute = named_id(&module, "compute_main");
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        assert_eq!(
++            has_derivatives(&lowered, fragment, named_id(&lowered, "fragment_entry")),
++            (true, true)
++        );
++        let compute_index = function_index(&lowered, compute);
++        let compute_block = block_index(&lowered, compute, named_id(&lowered, "compute_entry"));
++        let compute_body = &lowered.functions[compute_index].blocks[compute_block].instructions;
++        assert!(compute_body
++            .iter()
++            .any(|instruction| instruction.class.opcode == Op::ImageSampleImplicitLod));
++        assert!(compute_body
++            .iter()
++            .all(|instruction| { !matches!(instruction.class.opcode, Op::DPdx | Op::DPdy) }));
++    }
++
++    #[test]
++    fn supported_image_dimensions_use_only_spatial_gradient_components() {
++        for (dimension, spatial, arrayed, capability) in [
++            ("1D", 1, 0, "OpCapability Sampled1D\n"),
++            ("1D", 1, 1, "OpCapability Sampled1D\n"),
++            ("3D", 3, 0, ""),
++            ("Cube", 3, 0, ""),
++            ("Cube", 3, 1, "OpCapability SampledCubeArray\n"),
++        ] {
++            let components = spatial + arrayed;
++            let coordinate = if components == 1 {
++                "%coord = OpConstant %float 0".to_string()
++            } else {
++                format!(
++                    "%coord = OpConstantComposite %v{components}float {}",
++                    vec!["%float_0"; components].join(" ")
++                )
++            };
++            let preamble = PREAMBLE
++                .replace(
++                    "OpCapability Shader\n",
++                    &format!("OpCapability Shader\n{capability}"),
++                )
++                .replace(
++                    "%v2float = OpTypeVector %float 2\n",
++                    "%v2float = OpTypeVector %float 2\n%v3float = OpTypeVector %float 3\n",
++                )
++                .replace(
++                    "%coord = OpConstantComposite %v2float %float_0 %float_0",
++                    &coordinate,
++                )
++                .replace(
++                    "%image = OpTypeImage %float 2D 0 0 0 1 Unknown",
++                    &format!("%image = OpTypeImage %float {dimension} 0 {arrayed} 0 1 Unknown"),
++                );
++            let Some(module) = assemble(&format!(
++                "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++            )) else {
++                return;
++            };
++            let lowered = run(module, &[]).unwrap();
++            validate(&lowered);
++            for derivative in lowered
++                .all_inst_iter()
++                .filter(|inst| matches!(inst.class.opcode, Op::DPdx | Op::DPdy))
++            {
++                let ty = lowered
++                    .types_global_values
++                    .iter()
++                    .find(|ty| ty.result_id == derivative.result_type)
++                    .unwrap();
++                if spatial == 1 {
++                    assert_eq!(ty.class.opcode, Op::TypeFloat);
++                } else {
++                    assert_eq!(ty.class.opcode, Op::TypeVector);
++                    assert_eq!(
++                        ty.operands.get(1),
++                        Some(&Operand::LiteralBit32(spatial as u32))
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn projected_nonuniform_sampling_requires_a_projection_lowering() {
++        let preamble = PREAMBLE
++            .replace(
++                "%v2float = OpTypeVector %float 2\n",
++                "%v2float = OpTypeVector %float 2\n%v3float = OpTypeVector %float 3\n",
++            )
++            .replace(
++                "%coord = OpConstantComposite %v2float %float_0 %float_0",
++                "%coord = OpConstantComposite %v3float %float_0 %float_0 %float_0",
++            );
++        let Some(module) = assemble(&format!(
++            "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleProjImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        assert!(run(module, &[])
++            .unwrap_err()
++            .contains("projection before derivative lowering"));
++    }
++
++    #[test]
++    fn invalid_coordinate_shapes_and_multisample_types_fail_before_derivatives() {
++        for (preamble, expected) in [
++            (
++                PREAMBLE.replace(
++                    "%coord = OpConstantComposite %v2float %float_0 %float_0",
++                    "%coord = OpConstant %uint 0",
++                ),
++                "requires float32 coordinates",
++            ),
++            (
++                PREAMBLE.replace(
++                    "%image = OpTypeImage %float 2D 0 0 0 1 Unknown",
++                    "%image = OpTypeImage %float 2D 0 1 0 1 Unknown",
++                ),
++                "coordinate shape does not match",
++            ),
++            (
++                PREAMBLE.replace(
++                    "%image = OpTypeImage %float 2D 0 0 0 1 Unknown",
++                    "%image = OpTypeImage %float 2D 0 0 1 1 Unknown",
++                ),
++                "requires a non-multisampled image",
++            ),
++        ] {
++            let Some(module) = assemble(&format!(
++                "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++            )) else {
++                return;
++            };
++            assert!(run(module, &[]).unwrap_err().contains(expected));
++        }
++    }
++
++    #[test]
++    fn dref_implicit_sample_becomes_grad_and_explicit_controls_are_preserved() {
++        let preamble = PREAMBLE.replace(
++            "%image = OpTypeImage %float 2D 0 0 0 1 Unknown",
++            "%image = OpTypeImage %float 2D 1 0 0 1 Unknown",
++        );
++        let Some(module) = assemble(&format!(
++            "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%implicit = OpImageSampleDrefImplicitLod %float %sampled %coord %float_0
++%level = OpImageSampleDrefExplicitLod %float %sampled %coord %float_0 Lod %float_0
++%gradient = OpImageSampleDrefExplicitLod %float %sampled %coord %float_0 Grad %coord %coord
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let controls = module
++            .functions
++            .iter()
++            .flat_map(|function| &function.blocks)
++            .flat_map(|block| &block.instructions)
++            .filter(|inst| inst.class.opcode == Op::ImageSampleDrefExplicitLod)
++            .cloned()
++            .collect::<Vec<_>>();
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        let instructions = lowered
++            .functions
++            .iter()
++            .flat_map(|function| &function.blocks)
++            .flat_map(|block| &block.instructions)
++            .collect::<Vec<_>>();
++        assert_eq!(
++            instructions
++                .iter()
++                .filter(|inst| inst.class.opcode == Op::ImageSampleDrefExplicitLod)
++                .count(),
++            3
++        );
++        for control in controls {
++            assert!(instructions.contains(&&control));
++        }
++    }
++
++    #[test]
++    fn array_layer_is_not_part_of_the_gradient() {
++        let preamble = PREAMBLE
++            .replace(
++                "%v2float = OpTypeVector %float 2\n",
++                "%v2float = OpTypeVector %float 2\n%v3float = OpTypeVector %float 3\n",
++            )
++            .replace(
++                "%coord = OpConstantComposite %v2float %float_0 %float_0",
++                "%coord = OpConstantComposite %v3float %float_0 %float_0 %float_0",
++            )
++            .replace(
++                "%image = OpTypeImage %float 2D 0 0 0 1 Unknown",
++                "%image = OpTypeImage %float 2D 0 1 0 1 Unknown",
++            )
++            .replace(
++                "OpName %entry \"entry_block\"\n",
++                "OpName %entry \"entry_block\"\nOpName %v2float \"v2float\"\n\
++                 OpName %coord \"array_coord\"\n",
++            );
++        let Some(module) = assemble(&format!(
++            "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let coord = named_id(&module, "array_coord");
++        let v2float = named_id(&module, "v2float");
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        let entry = block_index(&lowered, main, named_id(&lowered, "entry_block"));
++        let body = &lowered.functions[function_index(&lowered, main)].blocks[entry].instructions;
++        let shuffle = body
++            .iter()
++            .find(|instruction| instruction.class.opcode == Op::VectorShuffle)
++            .expect("array coordinate projection must select the two spatial components");
++        assert_eq!(shuffle.result_type, Some(v2float));
++        assert_eq!(
++            shuffle.operands,
++            vec![
++                Operand::IdRef(coord),
++                Operand::IdRef(coord),
++                Operand::LiteralBit32(0),
++                Operand::LiteralBit32(1),
++            ]
++        );
++        let shuffle_result = shuffle.result_id.unwrap();
++        let dx = body
++            .iter()
++            .find(|instruction| instruction.class.opcode == Op::DPdx)
++            .unwrap();
++        let dy = body
++            .iter()
++            .find(|instruction| instruction.class.opcode == Op::DPdy)
++            .unwrap();
++        assert_eq!(dx.operands, vec![Operand::IdRef(shuffle_result)]);
++        assert_eq!(dy.operands, vec![Operand::IdRef(shuffle_result)]);
++        assert_eq!(dx.result_type, Some(v2float));
++        assert_eq!(dy.result_type, Some(v2float));
++    }
++
++    #[test]
++    fn bias_uses_the_table_limit_and_scales_both_signed_operands() {
++        let preamble = PREAMBLE
++            .replace(
++                "OpName %entry \"entry_block\"\n",
++                "OpName %entry \"entry_block\"\nOpName %table \"table\"\n",
++            )
++            .replace(
++                "%float_0 = OpConstant %float 0\n",
++                "%float_0 = OpConstant %float 0\n\
++             %bias_positive = OpConstant %float 2\n\
++             %bias_negative = OpConstant %float -2\n",
++            );
++        let Some(module) = assemble(&format!(
++            "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%positive = OpImageSampleImplicitLod %v4float %sampled %coord Bias %bias_positive
++%negative = OpImageSampleImplicitLod %v4float %sampled %coord Bias %bias_negative
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let table = named_id(&module, "table");
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        let entry = block_index(&lowered, main, named_id(&lowered, "entry_block"));
++        let body = &lowered.functions[function_index(&lowered, main)].blocks[entry].instructions;
++
++        let constant_six = body
++            .iter()
++            .filter(|instruction| instruction.class.opcode == Op::AccessChain)
++            .filter(|instruction| instruction.operands.first() == Some(&Operand::IdRef(table)))
++            .filter_map(|instruction| match instruction.operands.get(2) {
++                Some(Operand::IdRef(index)) => Some(*index),
++                _ => None,
++            })
++            .find(|index| {
++                lowered
++                    .types_global_values
++                    .iter()
++                    .chain(lowered.functions.iter().flat_map(|function| {
++                        function
++                            .parameters
++                            .iter()
++                            .chain(function.blocks.iter().flat_map(|block| &block.instructions))
++                    }))
++                    .any(|instruction| {
++                        instruction.result_id == Some(*index)
++                            && instruction.class.opcode == Op::Constant
++                            && instruction.operands == vec![Operand::LiteralBit32(6)]
++                    })
++            });
++        assert!(
++            constant_six.is_some(),
++            "bias limit must be loaded from table word 6"
++        );
++        assert_eq!(
++            body.iter()
++                .filter(|instruction| instruction.class.opcode == Op::FNegate)
++                .count(),
++            2
++        );
++        for op in [GlslStd450Op::FClamp, GlslStd450Op::Exp2] {
++            assert_eq!(
++                body.iter()
++                    .filter(|instruction| {
++                        instruction.class.opcode == Op::ExtInst
++                            && instruction.operands.get(1)
++                                == Some(&Operand::LiteralExtInstInteger(op as u32))
++                    })
++                    .count(),
++                2,
++                "{op:?} must be emitted for both signed bias operands"
++            );
++        }
++        for instruction in body
++            .iter()
++            .filter(|instruction| instruction.class.opcode == Op::ImageSampleExplicitLod)
++        {
++            let mask = instruction
++                .operands
++                .iter()
++                .find_map(|operand| match operand {
++                    Operand::ImageOperands(mask) => Some(*mask),
++                    _ => None,
++                })
++                .unwrap();
++            assert_eq!(mask, ImageOperands::GRAD);
++        }
++    }
++
++    #[test]
++    fn bias_conversion_preserves_non_bias_image_operands_in_wire_order() {
++        let preamble = PREAMBLE
++            .replace(
++                "OpCapability Shader\n",
++                "OpCapability Shader\nOpCapability MinLod\n",
++            )
++            .replace(
++                "OpName %entry \"entry_block\"\n",
++                "OpName %entry \"entry_block\"\nOpName %bias \"bias\"\n\
++                 OpName %offset \"offset\"\nOpName %min_lod \"min_lod\"\n",
++            )
++            .replace(
++                "%float_0 = OpConstant %float 0\n",
++                "%int = OpTypeInt 32 1\n%v2int = OpTypeVector %int 2\n\
++                 %int_0 = OpConstant %int 0\n%offset = OpConstantComposite %v2int %int_0 %int_0\n\
++                 %float_0 = OpConstant %float 0\n%bias = OpConstant %float 2\n\
++                 %min_lod = OpConstant %float 0.5\n",
++            );
++        let Some(module) = assemble(&format!(
++            "{preamble}
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord Bias|ConstOffset|MinLod %bias %offset %min_lod
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let offset = named_id(&module, "offset");
++        let min_lod = named_id(&module, "min_lod");
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        let entry = block_index(&lowered, main, named_id(&lowered, "entry_block"));
++        let body = &lowered.functions[function_index(&lowered, main)].blocks[entry].instructions;
++        let sample = body
++            .iter()
++            .find(|instruction| instruction.class.opcode == Op::ImageSampleExplicitLod)
++            .expect("bias sample must become explicit Grad");
++        assert_eq!(
++            sample.operands.iter().find_map(|operand| match operand {
++                Operand::ImageOperands(mask) => Some(*mask),
++                _ => None,
++            }),
++            Some(ImageOperands::GRAD | ImageOperands::CONST_OFFSET | ImageOperands::MIN_LOD)
++        );
++        let tail = sample
++            .operands
++            .iter()
++            .skip_while(|operand| !matches!(operand, Operand::ImageOperands(_)))
++            .skip(1)
++            .collect::<Vec<_>>();
++        assert_eq!(tail.len(), 4);
++        assert!(matches!(tail[0], Operand::IdRef(_)));
++        assert!(matches!(tail[1], Operand::IdRef(_)));
++        assert_eq!(tail[2], &Operand::IdRef(offset));
++        assert_eq!(tail[3], &Operand::IdRef(min_lod));
++    }
++}
+--- a/garnetxlate/tests/gpu_argument_graph_token_merge.rs
++++ b/garnetxlate/tests/gpu_argument_graph_token_merge.rs
+@@ -1,8 +1,6 @@
+-use std::path::PathBuf;
+-
+ fn validate_and_disassemble(spv: &[u8], label: &str) -> String {
+-    let directory = PathBuf::from(std::env::temp_dir())
+-        .join(format!("rdna4-token-merge-{label}-{}", std::process::id()));
++    let directory =
++        std::env::temp_dir().join(format!("rdna4-token-merge-{label}-{}", std::process::id()));
+     std::fs::create_dir_all(&directory).unwrap();
+     let path = directory.join("shader.spv");
+     std::fs::write(&path, spv).unwrap();

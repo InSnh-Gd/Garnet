@@ -1,0 +1,417 @@
+From 2ab545dc08426ede4d254e17678bcbc92174faae Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Sun, 1 Nov 2026 03:32:17 +0800
+Subject: [PATCH] radv/darwin: Navi 44 (RX 9060 XT, gfx1200) canned entry, chip
+ chosen from the kext's QueryInfo gc_version
+
+- amdgpu_devices.c: a gfx1200 entry (1002:7590, ext_rev 0x41, 2 SE x 2 SA x 8 CU,
+  8 RB, 16 TCC, 128-bit, 4 MiB L2, 32 MiB MALL, GB_ADDR_CONFIG 0x08200545, CP fw =
+  gc_12_0_0 in linux-firmware bda6eccc3a8f). Topology and device fields are
+  confirmed by an amdgpu DRM_INFO dump from the target RX 9060 XT; live output is
+  preserved in .omo/evidence/navi44-topology/linux-amdgpu-dump.txt.
+- ac_darwin_drm.c: the shared core picks the chip after QueryInfo
+  (0x0c0001 gfx1201 / 0x0c0000 gfx1200; 0 = pre-Navi44 kext -> gfx1201; unknown ->
+  -ENODEV). RADV_DARWIN_CHIP=gfx1200|gfx1201 forces it (and is the HOST_BO
+  stand-in's choice, default gfx1201). GB_ADDR_CONFIG is checked against the
+  chosen entry; marketing name follows the chip.
+- ac_darwin_mock.c: RADV_DARWIN_MOCK_GC=gfx1200 reports GC 12.0.0.
+---
+ src/amd/common/amdgpu_devices.c        | 130 +++++++++++++++++++++++++
+ src/amd/common/darwin/ac_darwin_drm.c  | 108 ++++++++++++++------
+ src/amd/common/darwin/ac_darwin_mock.c |   4 +-
+ 3 files changed, 211 insertions(+), 31 deletions(-)
+
+diff --git a/src/amd/common/amdgpu_devices.c b/src/amd/common/amdgpu_devices.c
+index 2899e97..fc6459e 100644
+--- a/src/amd/common/amdgpu_devices.c
++++ b/src/amd/common/amdgpu_devices.c
+@@ -2700,6 +2700,136 @@ const struct amdgpu_device amdgpu_devices[] = {
+          },
+       },
+    },
++   /* Captured from the target RX 9060 XT with amdgpu DRM_INFO; see the repository evidence dump. */
++   {
++      .name = "gfx1200",
++      .radeon_family = CHIP_GFX1200,
++      .hw_ip_gfx = {
++         .hw_ip_version_major = 12,
++         .hw_ip_version_minor = 0,
++         .capabilities_flags = UINT64_C(0),
++         .ib_start_alignment = 32,
++         .ib_size_alignment = 32,
++         .available_rings = 0x1,
++         .ip_discovery_version = 0xc0000,
++      },
++      .hw_ip_compute = {
++         .hw_ip_version_major = 12,
++         .hw_ip_version_minor = 0,
++         .capabilities_flags = UINT64_C(0),
++         .ib_start_alignment = 32,
++         .ib_size_alignment = 32,
++         .available_rings = 0xf,
++         .ip_discovery_version = 0xc0000,
++      },
++      .fw_gfx_me = {
++         .ver = 3110,
++         .feature = 29,
++      },
++      .fw_gfx_pfp = {
++         .ver = 3220,
++         .feature = 29,
++      },
++      .fw_gfx_mec = {
++         .ver = 3490,
++         .feature = 29,
++      },
++      .mmr_regs = {
++         0x263e, 0xffffffff, 0x08200545,
++      },
++      .mmr_reg_count = 1,
++      .dev = {
++         .device_id = 0x7590,
++         .chip_rev = 0x01,
++         .external_rev = 0x41,
++         .pci_rev = 0xc0,
++         .family = AMDGPU_FAMILY_GC_12_0_0,
++         .num_shader_engines = 2,
++         .num_shader_arrays_per_engine = 2,
++         .gpu_counter_freq = 100000,
++         .max_engine_clock = UINT64_C(2780000),
++         .max_memory_clock = UINT64_C(1258000),
++         .cu_active_number = 32,
++         .cu_ao_mask = 0x0,
++         .cu_bitmap = {
++            { 0xff, 0xff, 0x0, 0x0, },
++            { 0xff, 0xff, 0x0, 0x0, },
++            { 0x0, 0x0, 0x0, 0x0, },
++            { 0x0, 0x0, 0x0, 0x0, },
++         },
++         .enabled_rb_pipes_mask = 0xff,
++         .num_rb_pipes = 8,
++         .num_hw_gfx_contexts = 8,
++         .pcie_gen = 5,
++         .ids_flags = UINT64_C(0x18),
++         .virtual_address_offset = UINT64_C(0x10000),
++         .virtual_address_max = UINT64_C(0x800000000000),
++         .virtual_address_alignment = 4096,
++         .pte_fragment_size = 2097152,
++         .gart_page_size = 4096,
++         .ce_ram_size = 0,
++         .vram_type = 9,
++         .vram_bit_width = 128,
++         .vce_harvest_config = 0,
++         .gc_double_offchip_lds_buf = 64,
++         .prim_buf_gpu_addr = UINT64_C(0),
++         .pos_buf_gpu_addr = UINT64_C(0),
++         .cntl_sb_buf_gpu_addr = UINT64_C(0),
++         .param_buf_gpu_addr = UINT64_C(0),
++         .prim_buf_size = 0,
++         .pos_buf_size = 0,
++         .cntl_sb_buf_size = 0,
++         .param_buf_size = 0,
++         .wave_front_size = 32,
++         .num_shader_visible_vgprs = 1536,
++         .num_cu_per_sh = 8,
++         .num_tcc_blocks = 16,
++         .gs_vgt_table_depth = 32,
++         .gs_prim_buffer_depth = 1792,
++         .max_gs_waves_per_vgt = 32,
++         .pcie_num_lanes = 16,
++         .cu_ao_bitmap = {
++            { 0x0, 0x0, 0x0, 0x0, },
++            { 0x0, 0x0, 0x0, 0x0, },
++            { 0x0, 0x0, 0x0, 0x0, },
++            { 0x0, 0x0, 0x0, 0x0, },
++         },
++         .high_va_offset = UINT64_C(0xffff800000000000),
++         .high_va_max = UINT64_C(0xffffffffffbf0000),
++         .pa_sc_tile_steering_override = 0,
++         .tcc_disabled_mask = UINT64_C(0),
++         .min_engine_clock = UINT64_C(500000),
++         .min_memory_clock = UINT64_C(96000),
++         .tcp_cache_size = 32,
++         .num_sqc_per_wgp = 1,
++         .sqc_data_cache_size = 16,
++         .sqc_inst_cache_size = 32,
++         .gl1c_cache_size = 256,
++         .gl2c_cache_size = 4096,
++         .mall_size = UINT64_C(33554432),
++         .enabled_rb_pipes_mask_hi = 0,
++      },
++      .mem = {
++         .vram = {
++            .total_heap_size = UINT64_C(17095983104),
++            .usable_heap_size = UINT64_C(16543346688),
++            .heap_usage = UINT64_C(555782144),
++            .max_allocation = UINT64_C(12407510016),
++         },
++         .cpu_accessible_vram = {
++            .total_heap_size = UINT64_C(268435456),
++            .usable_heap_size = UINT64_C(265252864),
++            .heap_usage = UINT64_C(4526080),
++            .max_allocation = UINT64_C(198939648),
++         },
++         .gtt = {
++            .total_heap_size = UINT64_C(16785289216),
++            .usable_heap_size = UINT64_C(16769716224),
++            .heap_usage = UINT64_C(15622144),
++            .max_allocation = UINT64_C(12577287168),
++         },
++      },
++   },
+ };
+ 
+ const size_t num_amdgpu_devices = ARRAY_SIZE(amdgpu_devices);
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 9e35f84..4184f5c 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -26,8 +26,14 @@
+ #define ACD_DRM_MAJOR AC_AMDGPU_DRM_MAJOR
+ #define ACD_DRM_MINOR AC_AMDGPU_DRM_MINOR
+ 
+-/* amdgpu.ids: 7550,C0 */
+-#define ACD_MARKETING_NAME "AMD Radeon RX 9070 XT"
++static const struct acd_chip {
++   const char *name;
++   uint32_t gc_version;
++   const char *marketing;
++} acd_chips[] = {
++   {"gfx1201", 0x0c0001, "AMD Radeon RX 9070 XT"},
++   {"gfx1200", 0x0c0000, "AMD Radeon RX 9060 XT"},
++};
+ 
+ #define ACD_METADATA_MAX 256
+ /* How long a submit blocks on a dependency that was never submitted (WAIT_FOR_SUBMIT). */
+@@ -59,6 +65,8 @@ struct amdgpu_bo {
+  * device to go closes the connection. */
+ struct acd_core {
+    int refcount;
++   const struct acd_chip *chip;
++   const struct amdgpu_device *canned;
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+@@ -96,6 +104,33 @@ find_canned(const char *name)
+    return NULL;
+ }
+ 
++static int
++acd_select_chip(struct acd_core *c, uint32_t gc_version, bool native)
++{
++   const char *forced = getenv("RADV_DARWIN_CHIP");
++   for (uint32_t i = 0; i < ARRAY_SIZE(acd_chips); i++) {
++      if (forced ? !strcmp(forced, acd_chips[i].name)
++                 : acd_chips[i].gc_version == (gc_version ? gc_version : 0x0c0001)) {
++         c->chip = &acd_chips[i];
++         break;
++      }
++   }
++   if (!c->chip) {
++      if (forced)
++         fprintf(stderr, "radv-darwin: invalid RADV_DARWIN_CHIP '%s'\n", forced);
++      else
++         fprintf(stderr, "radv-darwin: unsupported GC version 0x%06x\n", gc_version);
++      return -ENODEV;
++   }
++   if (native && !gc_version)
++      fprintf(stderr, "radv-darwin: pre-Navi44 kext reports GC version 0; assuming gfx1201 unless overridden\n");
++   if (native && forced && gc_version != c->chip->gc_version)
++      fprintf(stderr, "radv-darwin: warning: RADV_DARWIN_CHIP=%s overrides GC version 0x%06x\n",
++              forced, gc_version);
++   c->canned = find_canned(c->chip->name);
++   return c->canned ? 0 : -ENODEV;
++}
++
+ /* kext wait callback for the sync provider: -ETIME from the kernel means "hung". */
+ static int
+ acd_backend_wait_seq(void *ctx, uint64_t seq, uint64_t rel_ns, bool *busy, uint64_t *retired)
+@@ -116,8 +151,9 @@ env_is_1(const char *name)
+ 
+ /* Hello, live checks and the info snapshot; every failure is one clear stderr line. */
+ static int
+-acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned, uint32_t *minor_out)
++acd_native_handshake(struct acd_core *c)
+ {
++   struct acd_kext *kext = c->kext;
+    struct acd_hello h;
+    int r = acd_kext_hello(kext, &h);
+    if (r) {
+@@ -126,7 +162,7 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+               r, strerror(-r));
+       return r < 0 ? r : -ENODEV;
+    }
+-   *minor_out = h.minor;
++   c->minor = h.minor;
+    if (h.abi != RDNA4N_ABI_VERSION) {
+       fprintf(stderr, "radv-darwin: kext ABI %u != Mesa ABI %u\n", h.abi, RDNA4N_ABI_VERSION);
+       return -ENODEV;
+@@ -142,6 +178,19 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       return r;
+    }
+ 
++   r = acd_select_chip(c, info.gc_version, true);
++   if (r)
++      return r;
++
++   uint32_t canned_gb = 0;
++   for (uint32_t i = 0; i < c->canned->mmr_reg_count; i++) {
++      const uint32_t *triple = &c->canned->mmr_regs[i * 3];
++      if (triple[0] == ACD_GB_ADDR_CONFIG_REG) {
++         canned_gb = triple[2];
++         break;
++      }
++   }
++
+    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. QueryInfo carries the live value
+     * (rdna4n_info.gb_addr_config); ReadRegs is root-only and refused for a user-application (G4 APP) session, so it is
+     * only the fallback for a kernel that left the field 0. */
+@@ -153,15 +202,15 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+          return r;
+       }
+    }
+-   if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
+-      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
++   if (gb != canned_gb && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
++      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned %s 0x%08x (set "
+                       "RADV_DARWIN_ALLOW_ADDRCFG=1 to override)\n",
+-              gb, ACD_GB_ADDR_CONFIG_GFX1201);
++              gb, c->canned->name, canned_gb);
+       return -ENODEV;
+    }
+ 
+    /* The canned VA ranges must lie inside the kernel's. */
+-   const struct drm_amdgpu_info_device *di = &canned->dev;
++   const struct drm_amdgpu_info_device *di = &c->canned->dev;
+    if (di->virtual_address_offset < info.va_low_first || di->virtual_address_max - 1 > info.va_low_last ||
+        (di->high_va_offset &&
+         (di->high_va_offset < info.va_high_first || di->high_va_max - 1 > info.va_high_last))) {
+@@ -178,8 +227,9 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+    if (!logged) {
+       logged = true;
+       fprintf(stderr, "radv-darwin: native kext: ABI %u.%u, build %u, VMID %u, max %u IBs/submit, GB_ADDR_CONFIG "
+-                      "0x%08x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
+-              h.abi, h.minor, h.build, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
++                      "0x%08x, chip %s, GC 0x%06x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
++              h.abi, h.minor, h.build, h.vmid, h.max_ibs, gb, c->chip->name, info.gc_version,
++              (unsigned long long)(info.vram_vis_total >> 20),
+               (unsigned long long)(info.vram_hi_total >> 20), (unsigned long long)(info.gtt_cap >> 20));
+    }
+    return 0;
+@@ -195,7 +245,7 @@ acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
+ 
+ /* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider. */
+ static int
+-acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_core **out)
++acd_core_create(bool host_bo, struct acd_core **out)
+ {
+    struct acd_core *c = calloc(1, sizeof(*c));
+    if (!c)
+@@ -203,16 +253,19 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+    pthread_mutex_init(&c->bo_lock, NULL);
+    c->refcount = 1;
+ 
+-   if (!host_bo) {
+-      int r = acd_kext_open(&c->kext);
++   int r;
++   if (host_bo) {
++      r = acd_select_chip(c, 0, false);
++   } else {
++      r = acd_kext_open(&c->kext);
+       if (r == 0)
+-         r = acd_native_handshake(c->kext, canned, &c->minor);
+-      if (r) {
+-         acd_kext_destroy(c->kext);
+-         pthread_mutex_destroy(&c->bo_lock);
+-         free(c);
+-         return r;
+-      }
++         r = acd_native_handshake(c);
++   }
++   if (r) {
++      acd_kext_destroy(c->kext);
++      pthread_mutex_destroy(&c->bo_lock);
++      free(c);
++      return r;
+    }
+ 
+    const struct acd_sync_backend be = {.wait_seq = acd_backend_wait_seq, .ctx = c->kext};
+@@ -228,7 +281,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+       return -ENOMEM;
+    }
+ 
+-   const struct drm_amdgpu_info_device *di = &canned->dev;
++   const struct drm_amdgpu_info_device *di = &c->canned->dev;
+    /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
+    amdgpu_va_manager_init2(c->va_mgr, di->virtual_address_offset, di->virtual_address_max, di->high_va_offset,
+                            di->high_va_max, di->virtual_address_alignment, AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
+@@ -257,25 +310,19 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+    if (!dev)
+       return -ENOMEM;
+ 
+-   dev->canned = find_canned("gfx1201");
+-   if (!dev->canned) {
+-      free(dev);
+-      return -ENODEV;
+-   }
+-
+    const bool mock = env_is_1("RADV_DARWIN_MOCK");
+    dev->host_bo = env_is_1("RADV_DARWIN_HOST_BO") && !mock;
+ 
+    int r = 0;
+    if (dev->host_bo) {
+-      r = acd_core_create(dev->canned, true, &dev->core); /* private, no kext */
++      r = acd_core_create(true, &dev->core); /* private, no kext */
+    } else {
+       pthread_mutex_lock(&g_core_lock);
+       if (g_core) {
+          g_core->refcount++;
+          dev->core = g_core;
+       } else {
+-         r = acd_core_create(dev->canned, false, &g_core);
++         r = acd_core_create(false, &g_core);
+          if (r == 0) {
+             g_core->shared = true;
+             dev->core = g_core;
+@@ -288,6 +335,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+       return r;
+    }
+ 
++   dev->canned = dev->core->canned;
+    dev->sync = dev->core->sync->clone(dev->core->sync);
+    if (!dev->sync) {
+       acd_device_deinitialize(dev);
+@@ -331,7 +379,7 @@ acd_device_get_sync_provider(acd_device_handle dev)
+ const char *
+ acd_get_marketing_name(acd_device_handle dev)
+ {
+-   return ACD_MARKETING_NAME;
++   return dev->core->chip->marketing;
+ }
+ 
+ int
+diff --git a/src/amd/common/darwin/ac_darwin_mock.c b/src/amd/common/darwin/ac_darwin_mock.c
+index b7588d5..8cc7fa4 100644
+--- a/src/amd/common/darwin/ac_darwin_mock.c
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -2,6 +2,7 @@
+  * SPDX-License-Identifier: MIT
+  *
+  * In-process mock of the kext's GarnetNativeClient (RADV_DARWIN_MOCK=1).
++ * RADV_DARWIN_MOCK_GC=gfx1200 selects GC 12.0.0; the default is GC 12.0.1.
+  *
+  * It implements the selectors of NATIVE-S1C-ABI.md with the kernel's own
+  * argument validation (exact scalar counts and struct sizes, canonical VAs,
+@@ -612,7 +613,8 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       inf.flags = RDNA4N_INFO_S1B_POSITIVE | RDNA4N_INFO_NATIVE_BOOT;
+       inf.vmid = 8;
+       inf.gb_addr_config = ACD_GB_ADDR_CONFIG_GFX1201;
+-      inf.gc_version = (12u << 16) | (0u << 8) | 1u;
++      const char *gc = getenv("RADV_DARWIN_MOCK_GC");
++      inf.gc_version = gc && !strcmp(gc, "gfx1200") ? 0x0c0000 : 0x0c0001;
+       inf.ring_size_dw = 4096;
+       inf.max_ibs = RDNA4N_MAX_IBS;
+       inf.vram_vis_total = MOCK_VIS_TOTAL;
+-- 
+2.47.3
+

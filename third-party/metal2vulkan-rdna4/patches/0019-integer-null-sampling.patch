@@ -1,0 +1,110 @@
+diff --git a/src/passes/resources/null_sampling.rs b/src/passes/resources/null_sampling.rs
+--- a/src/passes/resources/null_sampling.rs
++++ b/src/passes/resources/null_sampling.rs
+@@ -60,12 +60,24 @@
+         if *dim as u32 > 3 || *depth > 1 || *arrayed > 1 {
+             continue;
+         }
+-        if !defs.get(sampled).is_some_and(|ty| {
+-            ty.class.opcode == Op::TypeFloat && ty.operands == [Operand::LiteralBit32(32)]
+-        }) {
+-            continue;
+-        }
+-        arrays.insert(id, (*dim as u32 * 2 + arrayed) + 8 * depth);
++        let component = match defs
++            .get(sampled)
++            .map(|ty| (ty.class.opcode, ty.operands.as_slice()))
++        {
++            Some((Op::TypeFloat, [Operand::LiteralBit32(32)])) => 0,
++            Some((Op::TypeInt, [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]))
++                if *depth == 0 =>
++            {
++                1
++            }
++            Some((Op::TypeInt, [Operand::LiteralBit32(32), Operand::LiteralBit32(1)]))
++                if *depth == 0 =>
++            {
++                2
++            }
++            _ => continue,
++        };
++        arrays.insert(id, (*dim as u32 * 2 + arrayed) + 8 * depth + 16 * component);
+     }
+     if arrays.is_empty() {
+         return Ok(());
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -205,7 +205,8 @@
+ /// embedded texture/sampler reflection entries whose descriptors the final module discarded.
+ /// v60 allocates constexpr sampler reflection after token-backed argument samplers leave the stage
+ /// descriptor band, matching the bindings emitted for mixed static and dynamic resource graphs.
+-pub const REFLECTION_VERSION: u32 = 60;
++/// v61 distinguishes float, unsigned and signed null sampling descriptors in argument table ABI 5.
++pub const REFLECTION_VERSION: u32 = 61;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -2004,7 +2005,7 @@
+             )
+         });
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: 4,
++            version: 5,
+             table_binding: 672,
+             categories,
+             image_query_binding,
+@@ -2191,7 +2192,7 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if table.version != 4
++            if table.version != 5
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+diff --git a/tests/argument_buffer_graph.rs b/tests/argument_buffer_graph.rs
+--- a/tests/argument_buffer_graph.rs
++++ b/tests/argument_buffer_graph.rs
+@@ -84,7 +84,7 @@
+         #[cfg(feature = "serde")]
+         {
+             let json = serde_json::to_value(&reflection).unwrap();
+-            assert_eq!(json["argument_resource_tables"]["version"], 4);
++            assert_eq!(json["argument_resource_tables"]["version"], 5);
+             assert_eq!(
+                 json["argument_resource_tables"]["categories"],
+                 serde_json::json!([0, 2])
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `60`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `61`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -85,15 +85,16 @@
+ ## Descriptor ABI (binding map)
+ 
+ Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
+-`argument_resource_tables: {version: 4, table_binding: 672, categories: [...]}`.
++`argument_resource_tables: {version: 5, table_binding: 672, categories: [...]}`.
+ They require the default descriptor layout. Binding 672 in set 0 is the read-only token
+ table; categories 0, 1, 2 denote runtime sampled-image, storage-image and sampler arrays
+ at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+ `(word_offset, count)`, followed by sorted low/high token pairs. Descriptor index 0 is
+-reserved for texel guards or a default sampler. ABI 4 appends shape-specific sampled
++reserved for texel guards or a default sampler. ABI 5 appends type-specific sampled
+ image descriptors after the sampled token count, at `count + shape`, where
+-`shape = 2 * Dim + Arrayed + 8 * Depth` uses the SPIR-V image type fields
+-(float32, non-MS images with Dim 0..3). Only shapes declared by the shader need
++`shape = 2 * Dim + Arrayed + 8 * Depth + 16 * Component` uses the SPIR-V image type fields
++(non-MS images with Dim 0..3; Component 0=float32, 1=uint32, 2=int32).
++Integer images require Depth=0. Float descriptors keep their ABI 4 offsets. Only shapes declared by the shader need
+ bindings; intervening slots remain partially bound. These descriptors are not
+ additional token rows and do not move the dimension data. A consumer may bind a
+ Vulkan null image when `nullDescriptor` is enabled, otherwise it binds a matching

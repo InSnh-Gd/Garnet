@@ -1,0 +1,278 @@
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -1420,6 +1420,40 @@
+             ));
+         };
+         let src_id = self.value_id(&src.value, &src.ty)?;
++        if self.opaque_resource_pointers.contains(&name) {
++            if src_ty != LlType::Int(64) {
++                return Err("native emitter: opaque resource token must contain 64 bits".into());
++            }
++            let uint = self.type_id(&LlType::Int(32))?;
++            let ulong = self.type_id(&src_ty)?;
++            let low = self.module.fresh_id();
++            let shifted = self.module.fresh_id();
++            let high = self.module.fresh_id();
++            let shift = self.const_signed_int(64, 32)?;
++            _instructions.extend([
++                Self::inst(
++                    Op::UConvert,
++                    Some(uint),
++                    Some(low),
++                    vec![Operand::IdRef(src_id)],
++                ),
++                Self::inst(
++                    Op::ShiftRightLogical,
++                    Some(ulong),
++                    Some(shifted),
++                    vec![Operand::IdRef(src_id), Operand::IdRef(shift)],
++                ),
++                Self::inst(
++                    Op::UConvert,
++                    Some(uint),
++                    Some(high),
++                    vec![Operand::IdRef(shifted)],
++                ),
++            ]);
++            self.define_unmodeled_pointer_value(&name, addrspace, &LlType::Int(8))?;
++            self.pointer_payload_words.insert(name, (low, high));
++            return Ok(());
++        }
+         if self.bda_device_pointers && matches!(addrspace, 1 | 2) {
+             self.used_device_address = true;
+             self.emit_device_address_nullness(&name, src_id, _instructions)?;
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -5,6 +5,89 @@
+ use crate::meta::{EmbeddedSampler, EmbeddedTexture};
+ use spirv::Capability;
+ use std::collections::BTreeMap;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct ImageShape {
++    dim: Dim,
++    arrayed: bool,
++    comp: ImageComp,
++    storage: bool,
++    multisampled: bool,
++}
++
++fn image_shape(
++    name: &str,
++    inst: &Instruction,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<Option<ImageShape>, String> {
++    let sample = name.starts_with("air.sample_") || name.starts_with("air.gather_");
++    let read = name.starts_with("air.read_texture") || name.starts_with("air.read_depth");
++    let write = name.starts_with("air.write_texture");
++    if !(sample || read || write) {
++        return Ok(None);
++    }
++    let (dim, arrayed) = super::super::air_calls::intrinsic_texture_shape(name)
++        .ok_or("GPU argument texture intrinsic has no known shape")?;
++    if dim == Dim::DimBuffer {
++        return Err("GPU argument graph texel buffers are unsupported".into());
++    }
++    let component = name
++        .rsplit('.')
++        .next()
++        .ok_or("missing image component type")?;
++    let comp = match component {
++        "v4f16" | "v4f32" | "f16" | "f32" => ImageComp::Float,
++        "v4i16" | "v4i32" | "i16" | "i32" => {
++            if name.split('.').any(|part| part == "u") {
++                ImageComp::Uint
++            } else {
++                ImageComp::Sint
++            }
++        }
++        _ => return Err(format!("unknown GPU argument image component in {name}")),
++    };
++    let storage = if sample {
++        false
++    } else {
++        let access = inst
++            .operands
++            .last()
++            .and_then(|operand| match operand {
++                Operand::IdRef(id) => defs.get(id),
++                _ => None,
++            })
++            .filter(|def| def.class.opcode == Op::Constant)
++            .and_then(|def| match def.operands.as_slice() {
++                [Operand::LiteralBit32(value)] => Some(*value),
++                _ => None,
++            })
++            .ok_or("GPU argument image access must be a constant AIR access class")?;
++        match access {
++            1 if !write => false,
++            2 if write => true,
++            3 => true,
++            _ => {
++                return Err(format!(
++                    "invalid GPU argument image access {access} for {name}"
++                ))
++            }
++        }
++    };
++    let multisampled = name
++        .split('.')
++        .next()
++        .is_some_and(|family| family.ends_with("_ms") || family.ends_with("_ms_array"));
++    if storage && multisampled {
++        return Err("GPU argument multisampled storage images are unsupported".into());
++    }
++    Ok(Some(ImageShape {
++        dim,
++        arrayed,
++        comp,
++        storage,
++        multisampled,
++    }))
++}
+ 
+ /// Keep the static ABI when every token has a representable root/field coordinate. Otherwise
+ /// consume the emitter's actual token words, so nested addresses are evaluated on the GPU.
+@@ -112,6 +195,36 @@
+     if ctx.descriptor_layout != crate::reflect::DescriptorLayout::default() {
+         return Err("GPU argument graphs require the default stage descriptor ABI".into());
+     }
++    let defs = ctx
++        .module
++        .all_inst_iter()
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    let mut shapes = HashMap::new();
++    for inst in ctx.module.functions[entry]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++    {
++        let (Op::FunctionCall, Some(Operand::IdRef(callee)), Some(Operand::IdRef(handle))) = (
++            inst.class.opcode,
++            inst.operands.first(),
++            inst.operands.get(1),
++        ) else {
++            continue;
++        };
++        let (Some(name), Some(&token)) = (names.get(callee), payloads.get(handle)) else {
++            continue;
++        };
++        if let Some(shape) = image_shape(name, inst, &defs)? {
++            if shapes
++                .insert(token, shape)
++                .is_some_and(|previous| previous != shape)
++            {
++                return Err("conflicting image types for one GPU argument token".into());
++            }
++        }
++    }
+     let table = raw_buffer(ctx, super::gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING);
+     ctx.interface_buffer_var(table);
+     let lookup = lookup_function(ctx, table);
+@@ -135,44 +248,52 @@
+                     let Some(&(low, high)) = payloads.get(handle) else {
+                         continue;
+                     };
+-                    if !(name.starts_with("air.sample_") || name.starts_with("air.gather_")) {
+-                        if name.contains("_texture_") || name.contains("_depth_") {
+-                            return Err(format!("GPU argument graph does not yet model {name}"));
+-                        }
++                    let image_operation = name.starts_with("air.sample_")
++                        || name.starts_with("air.gather_")
++                        || name.starts_with("air.read_texture")
++                        || name.starts_with("air.read_depth")
++                        || name.starts_with("air.write_texture")
++                        || name.starts_with("air.get_")
++                            && super::super::air_calls::intrinsic_texture_shape(name).is_some();
++                    if !image_operation {
+                         continue;
+                     }
+-                    let (category, element, shape) = if position == 2 {
++                    let sampler = position == 2
++                        && (name.starts_with("air.sample_") || name.starts_with("air.gather_"));
++                    if position == 2 && !sampler {
++                        continue;
++                    }
++                    let (category, element, shape) = if sampler {
+                         (2, ctx.ty_sampler(), None)
+                     } else {
+-                        let (dim, arrayed) = super::super::air_calls::intrinsic_texture_shape(name)
+-                            .ok_or("GPU argument texture intrinsic has no known shape")?;
+-                        if dim == Dim::DimBuffer {
+-                            return Err("GPU argument graph texel buffers are unsupported".into());
++                        let shape = *shapes.get(&(low, high)).ok_or(
++                            "GPU argument image query has no established component/access type",
++                        )?;
++                        if super::super::air_calls::intrinsic_texture_shape(name)
++                            != Some((shape.dim, shape.arrayed))
++                        {
++                            return Err(
++                                "GPU argument image query shape disagrees with its resource".into(),
++                            );
+                         }
+-                        let component = name
+-                            .rsplit('.')
+-                            .next()
+-                            .ok_or("missing image component type")?;
+-                        let comp = match component {
+-                            "v4f16" | "v4f32" | "f16" | "f32" => ImageComp::Float,
+-                            "v4i16" | "v4i32" | "i16" | "i32" => {
+-                                if name.split('.').any(|part| part == "u") {
+-                                    ImageComp::Uint
+-                                } else {
+-                                    ImageComp::Sint
+-                                }
+-                            }
+-                            _ => {
+-                                return Err(format!(
+-                                    "unknown GPU argument image component in {name}"
+-                                ))
+-                            }
++                        let ty = if shape.storage {
++                            ctx.add_capability(Capability::StorageImageReadWithoutFormat);
++                            ctx.add_capability(Capability::StorageImageWriteWithoutFormat);
++                            ctx.ty_storage_image(
++                                shape.dim,
++                                shape.arrayed,
++                                spirv::ImageFormat::Unknown,
++                                shape.comp,
++                            )
++                        } else {
++                            ctx.ty_image_ms(
++                                shape.dim,
++                                shape.arrayed,
++                                shape.comp,
++                                shape.multisampled,
++                            )
+                         };
+-                        (
+-                            0,
+-                            ctx.ty_image(dim, arrayed, comp),
+-                            Some((dim, arrayed, comp)),
+-                        )
++                        (u32::from(shape.storage), ty, Some(shape))
+                     };
+                     let global = *globals.entry((category, element)).or_insert_with(|| {
+                         let array = ctx.ty_runtime_array(element);
+@@ -216,9 +337,15 @@
+                         element,
+                         vec![Operand::IdRef(pointer)],
+                     );
+-                    if let Some((dim, arrayed, comp)) = shape {
+-                        ctx.image_dims.insert(loaded, (dim, arrayed));
+-                        ctx.image_comp.insert(loaded, comp);
++                    if let Some(shape) = shape {
++                        ctx.image_dims.insert(loaded, (shape.dim, shape.arrayed));
++                        ctx.image_comp.insert(loaded, shape.comp);
++                        if shape.storage {
++                            ctx.image_storage.insert(loaded);
++                        }
++                        if shape.multisampled {
++                            ctx.image_multisampled.insert(loaded);
++                        }
+                     }
+                     inst.operands[position] = Operand::IdRef(loaded);
+                 }

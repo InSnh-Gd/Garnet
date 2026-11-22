@@ -1,0 +1,146 @@
+--- a/src/amd/vulkan/meta/radv_meta_buffer.c
++++ b/src/amd/vulkan/meta/radv_meta_buffer.c
+@@ -93,6 +93,11 @@
+    bool use_16B_copy;
+ };
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++#define RADV_DARWIN_TRANSFER_CHUNK_SIZE  UINT64_C(0xfffffff0)
++#define RADV_DARWIN_BYTE_COPY_CHUNK_SIZE UINT64_C(0xffffffc0)
++#endif
++
+ static bool
+ radv_is_copy_memory_4B_aligned(uint64_t src_va, uint64_t dst_va, uint64_t size)
+ {
+@@ -264,19 +269,11 @@
+ }
+ 
+ static uint32_t
+-radv_fill_memory_internal(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image, uint64_t dst_va,
+-                          uint64_t size, uint32_t value, VkAddressCopyFlagsKHR dst_copy_flags)
++radv_fill_memory_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image, uint64_t dst_va,
++                       uint64_t size, uint32_t value, VkAddressCopyFlagsKHR dst_copy_flags)
+ {
+-   assert(!(dst_va & 3));
+-   assert(!(size & 3));
+-
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+ 
+-   if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+-      radv_sdma_fill_memory(device, cmd_buffer->cs, dst_va, size, value);
+-      return 0;
+-   }
+-
+    const bool use_compute = radv_is_compute_required(device, dst_copy_flags, dst_copy_flags) ||
+                             radv_prefer_compute_or_cp_dma(device, size, dst_copy_flags, dst_copy_flags);
+    uint32_t flush_bits = 0;
+@@ -294,6 +291,43 @@
+    return flush_bits;
+ }
+ 
++static uint32_t
++radv_fill_memory_internal(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image, uint64_t dst_va,
++                          uint64_t size, uint32_t value, VkAddressCopyFlagsKHR dst_copy_flags)
++{
++   assert(!(dst_va & 3));
++   assert(!(size & 3));
++
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   uint32_t flush_bits = 0;
++
++#ifdef HAVE_AMDGPU_DARWIN
++   if (vk_command_buffer_has_error(&cmd_buffer->vk) || !size)
++      return 0;
++#endif
++
++   if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
++      radv_sdma_fill_memory(device, cmd_buffer->cs, dst_va, size, value);
++      return 0;
++   }
++
++#ifdef HAVE_AMDGPU_DARWIN
++   while (size) {
++      if (vk_command_buffer_has_error(&cmd_buffer->vk))
++         break;
++
++      const uint64_t chunk_size = MIN2(size, RADV_DARWIN_TRANSFER_CHUNK_SIZE);
++      flush_bits |= radv_fill_memory_chunk(cmd_buffer, image, dst_va, chunk_size, value, dst_copy_flags);
++      dst_va += chunk_size;
++      size -= chunk_size;
++   }
++#else
++   flush_bits = radv_fill_memory_chunk(cmd_buffer, image, dst_va, size, value, dst_copy_flags);
++#endif
++
++   return flush_bits;
++}
++
+ uint32_t
+ radv_fill_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size, uint32_t value,
+                  VkAddressCopyFlagsKHR copy_flags)
+@@ -367,27 +401,57 @@
+    radv_resume_conditional_rendering(cmd_buffer);
+ }
+ 
++static void
++radv_copy_memory_chunk(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dst_va, uint64_t size,
++                       VkAddressCopyFlagsKHR src_copy_flags, VkAddressCopyFlagsKHR dst_copy_flags)
++{
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++
++   const bool use_compute = radv_is_compute_required(device, src_copy_flags, dst_copy_flags) ||
++                            (radv_is_copy_memory_4B_aligned(src_va, dst_va, size) &&
++                             radv_prefer_compute_or_cp_dma(device, size, src_copy_flags, dst_copy_flags));
++
++   if (use_compute) {
++      radv_compute_copy_memory(cmd_buffer, src_va, dst_va, size);
++   } else if (size) {
++      radv_cp_dma_copy_memory(cmd_buffer, src_va, dst_va, size);
++   }
++}
++
+ void
+ radv_copy_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dst_va, uint64_t size,
+                  VkAddressCopyFlagsKHR src_copy_flags, VkAddressCopyFlagsKHR dst_copy_flags)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   if (vk_command_buffer_has_error(&cmd_buffer->vk) || !size)
++      return;
++#endif
++
+    if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+       radv_sdma_copy_memory(device, cmd_buffer->cs, src_va, dst_va, size,
+                             cmd_buffer->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT);
+       return;
+    }
+ 
+-   const bool use_compute = radv_is_compute_required(device, src_copy_flags, dst_copy_flags) ||
+-                            (radv_is_copy_memory_4B_aligned(src_va, dst_va, size) &&
+-                             radv_prefer_compute_or_cp_dma(device, size, src_copy_flags, dst_copy_flags));
+-
+-   if (use_compute) {
+-      radv_compute_copy_memory(cmd_buffer, src_va, dst_va, size);
+-   } else if (size) {
+-      radv_cp_dma_copy_memory(cmd_buffer, src_va, dst_va, size);
++#ifdef HAVE_AMDGPU_DARWIN
++   while (size) {
++      if (vk_command_buffer_has_error(&cmd_buffer->vk))
++         break;
++
++      uint64_t chunk_size = MIN2(size, RADV_DARWIN_TRANSFER_CHUNK_SIZE);
++      if (!radv_is_copy_memory_4B_aligned(src_va, dst_va, chunk_size))
++         chunk_size = MIN2(size, RADV_DARWIN_BYTE_COPY_CHUNK_SIZE);
++
++      radv_copy_memory_chunk(cmd_buffer, src_va, dst_va, chunk_size, src_copy_flags, dst_copy_flags);
++      src_va += chunk_size;
++      dst_va += chunk_size;
++      size -= chunk_size;
+    }
++#else
++   radv_copy_memory_chunk(cmd_buffer, src_va, dst_va, size, src_copy_flags, dst_copy_flags);
++#endif
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL

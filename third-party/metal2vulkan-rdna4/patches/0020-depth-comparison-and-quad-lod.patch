@@ -1,0 +1,1699 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -352,6 +352,7 @@
+             "air.sample_depth",
+             "air.sample_compare_depth",
+             "air.gather_texture",
++            "air.gather_compare_depth",
+             "air.gather_depth",
+             "air.read_texture",
+             "air.read_depth",
+@@ -723,6 +724,7 @@
+     fn image_handle_families_are_classified_by_the_shared_abi_predicate() {
+         assert!(air_image_intrinsic("air.write_texture_2d.i16.v4f32"));
+         assert!(air_image_intrinsic("air.sample_compare_depth_2d.f32"));
++        assert!(air_image_intrinsic("air.gather_compare_depth_2d.f32"));
+         assert!(air_image_intrinsic(
+             "air.calculate_unclamped_lod_texture_2d"
+         ));
+diff --git a/src/meta/embedded.rs b/src/meta/embedded.rs
+--- a/src/meta/embedded.rs
++++ b/src/meta/embedded.rs
+@@ -58,6 +58,8 @@
+     /// Texture dimensionality (2D, with `arrayed` carrying the 2D-array distinction).
+     pub dim: Dim,
+     pub arrayed: bool,
++    /// A Metal `depth...` texture, emitted with `OpTypeImage` Depth=1.
++    pub depth: bool,
+     /// Sampled/storage component type (Float for `texture2d<float, read/write>`).
+     pub comp: ImageComp,
+     /// Storage-image format for write/read_write textures; `None` for sampled/read textures.
+@@ -151,6 +153,7 @@
+                 argument_index: member.argument_index(tex_node),
+                 dim: shape.dimension.to_spirv_dim(),
+                 arrayed: shape.arrayed,
++                depth: shape.depth,
+                 comp: shape.component.to_image_comp(),
+                 storage_format: shape.storage_format,
+                 array_length: shape.array_length,
+@@ -632,6 +635,7 @@
+         assert_eq!(textures[0].argument_index, 4);
+         assert_eq!(textures[0].array_length, Some(2));
+         assert!(textures[0].arrayed);
++        assert!(textures[0].depth);
+         assert_eq!(textures[0].storage_format, None);
+     }
+ 
+diff --git a/src/meta/tests.rs b/src/meta/tests.rs
+--- a/src/meta/tests.rs
++++ b/src/meta/tests.rs
+@@ -2361,6 +2361,7 @@
+         assert!(shape.arrayed, "{name} is arrayed");
+         assert_eq!(shape.dimension, dimension, "{name}");
+         assert_eq!(shape.multisampled, multisampled, "{name}");
++        assert_eq!(shape.depth, name.contains("depth"), "{name}");
+     }
+ 
+     let single: [(&str, TextureDimension, bool); 7] = [
+@@ -2381,5 +2382,6 @@
+         assert!(!shape.arrayed, "{name} is a single texture");
+         assert_eq!(shape.dimension, dimension, "{name}");
+         assert_eq!(shape.multisampled, multisampled, "{name}");
++        assert_eq!(shape.depth, name.contains("depth"), "{name}");
+     }
+ }
+diff --git a/src/meta/textures.rs b/src/meta/textures.rs
+--- a/src/meta/textures.rs
++++ b/src/meta/textures.rs
+@@ -195,6 +195,10 @@
+     pub dimension: TextureDimension,
+     pub arrayed: bool,
+     pub multisampled: bool,
++    /// A Metal `depth...` texture. SPIR-V carries this on `OpTypeImage`'s Depth operand, and the
++    /// runtime uses that operand to choose the matching depth image format when a descriptor is
++    /// null.
++    pub depth: bool,
+     pub component: TextureComponent,
+     /// The access qualifier declares `write`/`read_write` — a storage image (vs `sample`/`read`).
+     pub writable: bool,
+@@ -264,6 +268,7 @@
+     // either, so the suffix answers every spelling on its own.
+     let arrayed = head.ends_with("_array");
+     let multisampled = head.contains("_ms");
++    let depth = head.starts_with("depth");
+     let component = texture_component_from_name(shape_name);
+     let storage_format = if writable {
+         Some(storage_format_from_name(name, component))
+@@ -274,6 +279,7 @@
+         dimension,
+         arrayed,
+         multisampled,
++        depth,
+         component,
+         writable,
+         array_ref,
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -213,6 +213,7 @@
+         || callee.starts_with("air.sample_depth")
+         || callee.starts_with("air.sample_compare_depth")
+         || callee.starts_with("air.gather_texture")
++        || callee.starts_with("air.gather_compare_depth")
+         || callee.starts_with("air.gather_depth")
+         || callee.starts_with("air.read_texture")
+         || callee.starts_with("air.read_depth")
+diff --git a/src/native/tests/textures.rs b/src/native/tests/textures.rs
+--- a/src/native/tests/textures.rs
++++ b/src/native/tests/textures.rs
+@@ -1172,7 +1172,7 @@
+     let asm = disassemble(&spv).expect("disassemble");
+     assert!(
+         asm.lines()
+-            .any(|line| line.contains("OpTypeImage") && line.contains(" 2D ")),
++            .any(|line| line.contains("OpTypeImage") && line.contains(" 2D 0 0 0 1 ")),
+         "{asm}"
+     );
+     assert!(asm.contains("OpTypeSampler"), "{asm}");
+@@ -2705,9 +2705,9 @@
+     let _ = std::fs::create_dir_all(&tmp);
+     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+     let asm = disassemble(&spv).expect("disassemble");
+-    assert!(asm.contains("OpImageSampleImplicitLod"), "{asm}");
++    assert!(asm.contains("OpImageSampleDrefImplicitLod"), "{asm}");
+     assert!(asm.contains("OpConvertUToF"), "{asm}");
+-    assert!(asm.contains("OpFOrdLessThanEqual"), "{asm}");
++    assert!(!asm.contains("OpFOrd"), "{asm}");
+     if std::process::Command::new("spirv-val")
+         .arg("--version")
+         .output()
+diff --git a/src/passes/air_calls/images/gather.rs b/src/passes/air_calls/images/gather.rs
+--- a/src/passes/air_calls/images/gather.rs
++++ b/src/passes/air_calls/images/gather.rs
+@@ -49,11 +49,11 @@
+ }
+ 
+ /// Lower `air.gather_depth_2d[_array].v4f32`: gather the four neighboring depth texels around the
+-/// coordinate. The harness binds `depth2d<float>` as a float color texture, so depth is component
+-/// zero. The depth ABI sits one slot right of the color layout — `(texture, sampler, i32, coord,
+-/// [layer,] i1, offset, i32 flags)`, no component operand. The `i1` is `true` at every call site
+-/// the frontend emits, for pixel and normalized samplers alike and with or without an offset, so
+-/// it names no coordinate domain and this lowering does not read it. Which domain the coordinate
++/// coordinate. A `depth2d` AIR type is emitted as a real `OpTypeImage` depth image, so depth is
++/// component zero. The depth ABI sits one slot right of the color layout — `(texture, sampler, i32,
++/// coord, [layer,] i1, offset, i32 flags)`, no component operand. The `i1` is `true` at every call
++/// site the frontend emits, for pixel and normalized samplers alike and with or without an offset,
++/// so it names no coordinate domain and this lowering does not read it. Which domain the coordinate
+ /// is in comes from the sampler, exactly as it does for the non-array and color forms, and
+ /// `lower_gather_2d` is what decides between the reconstructed pixel footprint and `OpImageGather`.
+ pub(in crate::passes) fn lower_gather_depth(
+@@ -100,6 +100,129 @@
+     )
+ }
+ 
++/// Lower `air.gather_compare_depth_2d[_array].f32`: gather four depth comparisons around the
++/// coordinate.
++///
++/// The non-array AIR ABI observed in real fragment AIR is
++/// `(texture, sampler, i32 control, coord, compare_reference, i1, offset, i32 flags)`. Keep the
++/// comparison in Vulkan: `OpImageDrefGather` consumes the sampler's runtime comparison state and
++/// returns the four comparison results in the same shape as Metal's `gather_compare`. This is
++/// uses the same runtime comparison state as the scalar Dref `sample_compare` path.
++///
++/// The image type carries `Depth=1`, derived from the AIR `depth2d...` type name. Although
++/// `OpImageDrefGather` also validates against a `Depth=0` image type, the runtime derives the shape
++/// of a null descriptor from that operand. A null depth descriptor built as a color image therefore
++/// selects the wrong image format/view and cannot be bound as the depth texture the call describes.
++pub(in crate::passes) fn lower_gather_compare_depth(
++    ctx: &mut Ctx,
++    name: &str,
++    res: Option<Word>,
++    rty: Option<Word>,
++    args: &[Word],
++    v4: Word,
++) -> Result<Vec<Instruction>, String> {
++    let (res, rty) = match (res, rty) {
++        (Some(r), Some(t)) => (r, t),
++        _ => return Err("air.gather_compare_depth has no result".into()),
++    };
++    let array_form = name.starts_with("air.gather_compare_depth_2d_array.");
++    let minimum_args = if array_form { 9 } else { 8 };
++    if args.len() < minimum_args {
++        return Err(
++            "air.gather_compare_depth missing texture/sampler/coord/reference/offset".into(),
++        );
++    }
++
++    let samp = args[1];
++    let coord = args[3];
++    // Real 2D-array AIR inserts the layer between the spatial coordinate and the reference:
++    // `(texture, sampler, control, coord, layer, reference, i1, offset, flags)`.
++    let (layer, reference, offset) = if array_form {
++        (Some(args[4]), args[5], args[7])
++    } else {
++        (None, args[4], args[6])
++    };
++    let mut img = resolve_image_value(ctx, args[0]);
++    if texture_operand_is_absent(ctx, img) {
++        if let Some(sampled_img) =
++            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
++        {
++            img = sampled_img;
++        } else {
++            return lower_null_texture_result(ctx, res, rty);
++        }
++    }
++
++    let mut out = vec![];
++    img = load_image_if_pointer(ctx, img, &mut out);
++    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
++    let (img_ty, dim, arrayed, comp) =
++        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
++    if comp != crate::passes::ImageComp::Float {
++        return Err("air.gather_compare_depth on non-float texture".into());
++    }
++    if dim != Dim::Dim2D || arrayed != array_form {
++        return Err("air.gather_compare_depth requires a matching 2D texture shape".into());
++    }
++
++    let sampler_state = ctx.sampler_states.get(&samp).copied();
++    if sampler_state.is_some_and(|state| state.uses_pixel_coordinates()) {
++        return Err(
++            "air.gather_compare_depth with pixel-coordinate samplers is not supported".into(),
++        );
++    }
++    if sampler_state
++        .is_some_and(|state| state.compare_function == crate::reflect::SamplerCompareFunction::None)
++    {
++        return Err("air.gather_compare_depth requires a sampler with comparison enabled".into());
++    }
++
++    let mut coord_for_gather = build_gather_coord_2d(ctx, array_form, coord, layer, &mut out)?;
++    let (const_offset, dynamic_offset) = gather_const_or_dynamic_offset(ctx, offset)?;
++    if let Some(offset) = dynamic_offset {
++        coord_for_gather = apply_dynamic_sample_offset(
++            ctx,
++            img,
++            array_form,
++            coord_for_gather,
++            offset,
++            2,
++            &mut out,
++        )?;
++    }
++
++    let si_ty = ctx.ty_sampled_image(img_ty);
++    let valid_sampler = valid_sampler_value(ctx, samp, &mut out)?;
++    let si = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::SampledImage,
++        Some(si_ty),
++        Some(si),
++        vec![Operand::IdRef(img), Operand::IdRef(valid_sampler)],
++    ));
++
++    let color = ctx.module.fresh_id();
++    let mut ops = vec![
++        Operand::IdRef(si),
++        Operand::IdRef(coord_for_gather),
++        Operand::IdRef(reference),
++    ];
++    if let Some(offset) = const_offset {
++        if offset != [0, 0] {
++            ops.push(Operand::ImageOperands(spirv::ImageOperands::CONST_OFFSET));
++            ops.push(Operand::IdRef(const_sint_vec(ctx, &offset)));
++        }
++    }
++    out.push(Instruction::new(
++        Op::ImageDrefGather,
++        Some(v4),
++        Some(color),
++        ops,
++    ));
++
++    finish_sample_result(ctx, res, rty, color, v4, out)
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(in crate::passes) fn lower_gather_2d(
+     ctx: &mut Ctx,
+diff --git a/src/passes/air_calls/images/resolve.rs b/src/passes/air_calls/images/resolve.rs
+--- a/src/passes/air_calls/images/resolve.rs
++++ b/src/passes/air_calls/images/resolve.rs
+@@ -862,6 +862,8 @@
+             ("air.sample_compare_depth_2d.f32", (Dim::Dim2D, false)),
+             ("air.gather_texture_2d.v4f32", (Dim::Dim2D, false)),
+             ("air.gather_texture_2d_array.v4f32", (Dim::Dim2D, true)),
++            ("air.gather_compare_depth_2d.f32", (Dim::Dim2D, false)),
++            ("air.gather_compare_depth_2d_array.f32", (Dim::Dim2D, true)),
+             ("air.gather_depth_2d.v4f32", (Dim::Dim2D, false)),
+             ("air.read_texture_2d.v4f32", (Dim::Dim2D, false)),
+             ("air.read_texture_2d_array.v4f32", (Dim::Dim2D, true)),
+diff --git a/src/passes/air_calls/images/sample.rs b/src/passes/air_calls/images/sample.rs
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -332,6 +332,7 @@
+         color,
+         si,
+         coord_for_sample,
++        None,
+         level,
+         is_int_tex,
+         const_offset,
+diff --git a/src/passes/air_calls/images/sample_depth.rs b/src/passes/air_calls/images/sample_depth.rs
+--- a/src/passes/air_calls/images/sample_depth.rs
++++ b/src/passes/air_calls/images/sample_depth.rs
+@@ -2,10 +2,7 @@
+ 
+ use super::*;
+ 
+-/// Lower `air.sample_depth_<dim>.f32`: sample through the existing color-image path and return the
+-/// first component as the depth scalar. The harness currently seeds captured depth textures as
+-/// RGBA8_UNORM images, so this intentionally preserves the sampled-image contract instead of
+-/// introducing true depth-image formats before the cross-host evidence needs them.
++/// Lower `air.sample_depth_<dim>.f32` without comparison and return its depth component.
+ pub(in crate::passes) fn lower_sample_depth(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -179,6 +176,7 @@
+             color,
+             si,
+             coord_for_sample,
++            None,
+             level,
+             false,
+             const_offset,
+@@ -220,10 +218,8 @@
+     Ok(out)
+ }
+ 
+-/// Lower `air.sample_compare_depth_<dim>.f32`: sample the RGBA8-backed depth fixture, extract
+-/// component 0, compare it against the AIR reference value, and return 1.0 or 0.0 in the AIR
+-/// `{float, i8}` shape. This mirrors `lower_sample_depth`'s current harness contract; it is not a
+-/// Vulkan Dref/comparison-sampler lowering.
++/// Lower normalized depth comparison through the sampler's actual comparison operation.
++/// Pixel-coordinate samplers retain the fetch-based coordinate emulation.
+ pub(in crate::passes) fn lower_sample_compare_depth(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -283,10 +279,6 @@
+     };
+     let float_ty = ctx.ty_float();
+     let bool_ty = ctx.ty_bool();
+-    let depth = ctx.module.fresh_id();
+-    let shadow = ctx.module.fresh_id();
+-    let one = ctx.const_float(1.0);
+-    let zero = ctx.const_float(0.0);
+     let sampler_state = ctx.sampler_states.get(&samp).copied();
+     if sampler_state
+         .map(|state| state.compare_function == crate::reflect::SamplerCompareFunction::None)
+@@ -304,7 +296,8 @@
+         args.get(5..).unwrap_or_default()
+     };
+     sample_args.extend_from_slice(trailing);
+-    let color = if let Some(state) = sampler_state.filter(|state| state.uses_pixel_coordinates()) {
++    let pixel_state = sampler_state.filter(|state| state.uses_pixel_coordinates());
++    let sampled = if let Some(state) = pixel_state {
+         let lod = match find_sample_lod(ctx, arrayed, &sample_args, &mut out) {
+             Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+             None => ctx.const_uint(0),
+@@ -362,7 +355,7 @@
+     } else {
+         let si_ty = ctx.ty_sampled_image(img_ty);
+         let si = ctx.module.fresh_id();
+-        let color = ctx.module.fresh_id();
++        let shadow = ctx.module.fresh_id();
+         let valid_sampler = valid_sampler_value(ctx, samp, &mut out)?;
+         out.push(Instruction::new(
+             Op::SampledImage,
+@@ -403,66 +396,73 @@
+         push_image_sample(
+             ctx,
+             &mut out,
+-            v4,
+-            color,
++            float_ty,
++            shadow,
+             si,
+             coord_for_sample,
++            Some(reference),
+             level,
+             false,
+             const_offset,
+             None,
+         );
+-        color
++        shadow
+     };
+-    out.push(Instruction::new(
+-        Op::CompositeExtract,
+-        Some(float_ty),
+-        Some(depth),
+-        vec![Operand::IdRef(color), Operand::LiteralBit32(0)],
+-    ));
+-    let compare = sampler_state
+-        .map(|state| state.compare_function)
+-        // Unspecialized runtime/selected samplers do not carry exact state through the AIR value
+-        // graph; preserve the pre-existing depth <= reference relation for that path.
+-        .unwrap_or(crate::reflect::SamplerCompareFunction::GreaterEqual);
+-    let passed = match compare {
+-        crate::reflect::SamplerCompareFunction::None
+-        | crate::reflect::SamplerCompareFunction::Never => ctx.const_bool_of(bool_ty, false),
+-        crate::reflect::SamplerCompareFunction::Always => ctx.const_bool_of(bool_ty, true),
+-        compare => {
+-            let passed = ctx.module.fresh_id();
+-            let opcode = match compare {
+-                crate::reflect::SamplerCompareFunction::Less => Op::FOrdLessThan,
+-                crate::reflect::SamplerCompareFunction::LessEqual => Op::FOrdLessThanEqual,
+-                crate::reflect::SamplerCompareFunction::Greater => Op::FOrdGreaterThan,
+-                crate::reflect::SamplerCompareFunction::GreaterEqual => Op::FOrdGreaterThanEqual,
+-                crate::reflect::SamplerCompareFunction::Equal => Op::FOrdEqual,
+-                crate::reflect::SamplerCompareFunction::NotEqual => Op::FOrdNotEqual,
+-                crate::reflect::SamplerCompareFunction::None
+-                | crate::reflect::SamplerCompareFunction::Always
+-                | crate::reflect::SamplerCompareFunction::Never => unreachable!(),
+-            };
+-            // Metal compares the incoming reference (the new value) against the sampled depth
+-            // (the existing value), matching MTLCompareFunction's ordering contract.
+-            out.push(Instruction::new(
+-                opcode,
+-                Some(bool_ty),
+-                Some(passed),
+-                vec![Operand::IdRef(reference), Operand::IdRef(depth)],
+-            ));
+-            passed
+-        }
++    let shadow = if let Some(state) = pixel_state {
++        let depth = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::CompositeExtract,
++            Some(float_ty),
++            Some(depth),
++            vec![Operand::IdRef(sampled), Operand::LiteralBit32(0)],
++        ));
++        let passed = match state.compare_function {
++            crate::reflect::SamplerCompareFunction::None
++            | crate::reflect::SamplerCompareFunction::Never => ctx.const_bool_of(bool_ty, false),
++            crate::reflect::SamplerCompareFunction::Always => ctx.const_bool_of(bool_ty, true),
++            compare => {
++                let passed = ctx.module.fresh_id();
++                let opcode = match compare {
++                    crate::reflect::SamplerCompareFunction::Less => Op::FOrdLessThan,
++                    crate::reflect::SamplerCompareFunction::LessEqual => Op::FOrdLessThanEqual,
++                    crate::reflect::SamplerCompareFunction::Greater => Op::FOrdGreaterThan,
++                    crate::reflect::SamplerCompareFunction::GreaterEqual => {
++                        Op::FOrdGreaterThanEqual
++                    }
++                    crate::reflect::SamplerCompareFunction::Equal => Op::FOrdEqual,
++                    crate::reflect::SamplerCompareFunction::NotEqual => Op::FOrdNotEqual,
++                    crate::reflect::SamplerCompareFunction::None
++                    | crate::reflect::SamplerCompareFunction::Always
++                    | crate::reflect::SamplerCompareFunction::Never => unreachable!(),
++                };
++                // Metal compares the incoming reference (the new value) against the sampled depth
++                // (the existing value), matching MTLCompareFunction's ordering contract.
++                out.push(Instruction::new(
++                    opcode,
++                    Some(bool_ty),
++                    Some(passed),
++                    vec![Operand::IdRef(reference), Operand::IdRef(depth)],
++                ));
++                passed
++            }
++        };
++        let shadow = ctx.module.fresh_id();
++        let one = ctx.const_float(1.0);
++        let zero = ctx.const_float(0.0);
++        out.push(Instruction::new(
++            Op::Select,
++            Some(float_ty),
++            Some(shadow),
++            vec![
++                Operand::IdRef(passed),
++                Operand::IdRef(one),
++                Operand::IdRef(zero),
++            ],
++        ));
++        shadow
++    } else {
++        sampled
+     };
+-    out.push(Instruction::new(
+-        Op::Select,
+-        Some(float_ty),
+-        Some(shadow),
+-        vec![
+-            Operand::IdRef(passed),
+-            Operand::IdRef(one),
+-            Operand::IdRef(zero),
+-        ],
+-    ));
+ 
+     let rdef = type_def_of(ctx, rty);
+     let is_struct = rdef
+@@ -632,6 +632,7 @@
+     result: Word,
+     sampled_image: Word,
+     coord: Word,
++    dref: Option<Word>,
+     level: Option<SampleLevel>,
+     force_lod0: bool,
+     const_offset: Option<Word>,
+@@ -657,6 +658,9 @@
+         _ => None,
+     };
+     let mut operands = vec![Operand::IdRef(sampled_image), Operand::IdRef(coord)];
++    if let Some(reference) = dref {
++        operands.push(Operand::IdRef(reference));
++    }
+     let mut image_operands = spirv::ImageOperands::empty();
+     if bias.is_some() {
+         image_operands |= spirv::ImageOperands::BIAS;
+@@ -688,10 +692,11 @@
+         }
+     }
+     out.push(Instruction::new(
+-        if lod.is_some() || grad.is_some() {
+-            Op::ImageSampleExplicitLod
+-        } else {
+-            Op::ImageSampleImplicitLod
++        match (dref.is_some(), lod.is_some() || grad.is_some()) {
++            (true, true) => Op::ImageSampleDrefExplicitLod,
++            (true, false) => Op::ImageSampleDrefImplicitLod,
++            (false, true) => Op::ImageSampleExplicitLod,
++            (false, false) => Op::ImageSampleImplicitLod,
+         },
+         Some(result_ty),
+         Some(result),
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1508,8 +1508,11 @@
+     if name.starts_with("air.gather_texture") {
+         return lower_gather(ctx, name, res, rty, args, v4);
+     }
+-    // `air.gather_depth_<dim>.<ret>`: depth texture gather. The synthesized private capture harness backs
+-    // captured depth textures through color-image fixtures, so gather their component zero.
++    // `air.gather_compare_depth_<dim>.<ret>`: comparison gather on a depth texture.
++    if name.starts_with("air.gather_compare_depth") {
++        return lower_gather_compare_depth(ctx, name, res, rty, args, v4);
++    }
++    // `air.gather_depth_<dim>.<ret>`: gather the depth image's scalar component.
+     if name.starts_with("air.gather_depth") {
+         return lower_gather_depth(ctx, name, res, rty, args, v4);
+     }
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -294,6 +294,7 @@
+ pub(in crate::passes) struct ImageShape {
+     pub(in crate::passes) dim: Dim,
+     pub(in crate::passes) arrayed: bool,
++    pub(in crate::passes) depth: bool,
+     pub(in crate::passes) comp: ImageComp,
+     pub(in crate::passes) multisampled: bool,
+ }
+@@ -1291,7 +1292,7 @@
+ 
+     /// Get or create OpTypeImage with the given sampled component type, 2D/1D, sampled.
+     fn ty_image(&mut self, dim: Dim, arrayed: bool, comp: ImageComp) -> Word {
+-        self.ty_image_ms(dim, arrayed, comp, false)
++        self.ty_image_ms(dim, arrayed, comp, false, false)
+     }
+ 
+     fn ty_image_ms(
+@@ -1300,6 +1301,7 @@
+         arrayed: bool,
+         comp: ImageComp,
+         multisampled: bool,
++        depth: bool,
+     ) -> Word {
+         let f = match comp {
+             ImageComp::Float => self.ty_float(),
+@@ -1312,10 +1314,10 @@
+             vec![
+                 Operand::IdRef(f),
+                 Operand::Dim(dim),
+-                Operand::LiteralBit32(0), // Depth: not a depth image
++                Operand::LiteralBit32(depth as u32),   // Depth
+                 Operand::LiteralBit32(arrayed as u32), // Arrayed
+                 Operand::LiteralBit32(multisampled as u32), // MS
+-                Operand::LiteralBit32(1), // Sampled: 1 = used with sampler
++                Operand::LiteralBit32(1),              // Sampled: 1 = used with sampler
+                 Operand::ImageFormat(ImageFormat::Unknown),
+             ],
+         )
+@@ -3357,6 +3359,8 @@
+     debug_phase!("complete");
+ 
+     resources::decorate_nonuniform_descriptor_accesses(&mut ctx);
++    resources::lower_argument_implicit_lod(&mut ctx)?;
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
+ 
+     let placeholder_descriptor_bindings = surviving_placeholder_bindings(&ctx);
+     Ok(Transformed {
+diff --git a/src/passes/resources/discovery.rs b/src/passes/resources/discovery.rs
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -561,9 +561,12 @@
+                     .get(tex)
+                     .map(|shape| shape.multisampled)
+                     .unwrap_or(false);
++            let depth = type_hints.get(tex).is_some_and(|shape| shape.depth)
++                || texture_intrinsic_uses_depth_image(name);
+             let shape = ImageShape {
+                 dim,
+                 arrayed,
++                depth,
+                 comp,
+                 multisampled,
+             };
+@@ -576,6 +579,7 @@
+                         e.comp = comp;
+                     }
+                     e.multisampled |= multisampled;
++                    e.depth |= depth;
+                 })
+                 .or_insert(shape);
+         }
+@@ -795,11 +799,34 @@
+     }
+ }
+ 
++/// Whether an AIR texture intrinsic operates on a Metal depth texture rather than a color texture.
++/// `air.get_depth_texture_*` is deliberately absent: that query returns the Z size of a color 3D
++/// texture, not a texel from a depth image.
++pub(super) fn texture_intrinsic_uses_depth_image(name: &str) -> bool {
++    [
++        "air.sample_depth",
++        "air.sample_compare_depth",
++        "air.gather_depth",
++        "air.gather_compare_depth",
++        "air.read_depth",
++        "air.write_depth",
++        "air.get_width_depth",
++        "air.get_height_depth",
++        "air.get_depth_depth",
++        "air.get_num_mip_levels_depth",
++        "air.get_num_samples_depth",
++        "air.get_array_size_depth",
++    ]
++    .iter()
++    .any(|prefix| name.starts_with(prefix))
++}
++
+ pub(in crate::passes) fn texture_arg_shape(name: &str) -> ImageShape {
+     let shape = crate::meta::texture_shape_from_name(name);
+     ImageShape {
+         dim: shape.dimension.to_spirv_dim(),
+         arrayed: shape.arrayed,
++        depth: shape.depth,
+         comp: shape.component.to_image_comp(),
+         multisampled: shape.multisampled,
+     }
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -10,6 +10,7 @@
+ struct ImageShape {
+     dim: Dim,
+     arrayed: bool,
++    depth: bool,
+     comp: ImageComp,
+     storage: bool,
+     multisampled: bool,
+@@ -257,6 +258,7 @@
+     Ok(Some(ImageShape {
+         dim,
+         arrayed,
++        depth: super::discovery::texture_intrinsic_uses_depth_image(name),
+         comp,
+         storage,
+         multisampled,
+@@ -474,10 +476,11 @@
+                 ) {
+                     let shape = super::super::air_calls::intrinsic_texture_shape(name)
+                         .ok_or("GPU argument image query has no known shape")?;
+-                    if shapes
+-                        .get(&token)
+-                        .is_some_and(|typed| (typed.dim, typed.arrayed) != shape)
+-                    {
++                    if shapes.get(&token).is_some_and(|typed| {
++                        (typed.dim, typed.arrayed) != shape
++                            || typed.depth
++                                != super::discovery::texture_intrinsic_uses_depth_image(name)
++                    }) {
+                         return Err(
+                             "GPU argument image query shape disagrees with its resource".into()
+                         );
+@@ -536,6 +539,8 @@
+                         )?;
+                         if super::super::air_calls::intrinsic_texture_shape(name)
+                             != Some((shape.dim, shape.arrayed))
++                            || shape.depth
++                                != super::discovery::texture_intrinsic_uses_depth_image(name)
+                         {
+                             return Err(
+                                 "GPU argument image query shape disagrees with its resource".into(),
+@@ -556,6 +561,7 @@
+                                 shape.arrayed,
+                                 shape.comp,
+                                 shape.multisampled,
++                                shape.depth,
+                             )
+                         };
+                         (u32::from(shape.storage), ty, Some(shape))
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -20,7 +20,8 @@
+ /// Replace finished static argument descriptors with GPU token loads and runtime descriptor arrays.
+ ///
+ /// Set 0 binding 672 is a read-only u32 token table. Its first six words are
+-/// `(word_offset, count)` for sampled images, storage images and samplers. Each
++/// `(word_offset, count)` for sampled images, storage images and samplers. ABI 6 adds
++/// the runtime maxSamplerLodBias as float32 bits in word 6. Each
+ /// sorted list contains low/high token words, with index zero reserved for a dummy.
+ /// The matching descriptor arrays use binding zero of sets 2, 3 and 4. Argument
+ /// buffer roots are raw u32 views at set 0 binding `704 + buffer_index`.
+@@ -45,6 +46,8 @@
+     super::null_sampling::protect_argument_sampling(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+     super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
++    super::quad_sampling::lower_argument_implicit_lod(&mut ctx)?;
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
+     super::super::canonicalize_ids(&mut ctx.module);
+     Ok(ctx
+         .module
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -11,6 +11,7 @@
+ mod nonuniform;
+ mod null_sampling;
+ mod null_texels;
++mod quad_sampling;
+ mod query_select;
+ pub(in crate::passes) mod rewrites;
+ mod selected_load;
+@@ -28,6 +29,7 @@
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
+ pub(in crate::passes) use null_sampling::protect_argument_sampling;
+ pub(in crate::passes) use null_texels::guard_argument_texel_accesses;
++pub(in crate::passes) use quad_sampling::lower_argument_implicit_lod;
+ pub(in crate::passes) use query_select::rewrite_resource_query_selects;
+ pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
+ pub(in crate::passes) use texture_array::{
+diff --git a/src/passes/resources/quad_sampling.rs b/src/passes/resources/quad_sampling.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/quad_sampling.rs
+@@ -0,0 +1,217 @@
++//! Compute derivatives before the backend serializes nonuniform image/sampler selection.
++
++use super::*;
++use spirv::{Decoration, ExecutionModel, GlslStd450Op, ImageOperands};
++
++pub(in crate::passes) fn lower_argument_implicit_lod(ctx: &mut Ctx) -> Result<(), String> {
++    if !ctx.module.entry_points.iter().any(|entry| {
++        entry.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::Fragment))
++    }) {
++        return Ok(());
++    }
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    let mut nonuniform = HashSet::new();
++    for annotation in &ctx.module.annotations {
++        match annotation.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::NonUniform)] => {
++                nonuniform.insert(*id);
++            }
++            _ => {}
++        }
++    }
++    let Some(table) = bindings.iter().find_map(|(&id, &binding)| {
++        (binding == gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING && sets.get(&id) == Some(&0))
++            .then_some(id)
++    }) else {
++        return Ok(());
++    };
++    let defs = ctx
++        .module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    for function in 0..ctx.module.functions.len() {
++        for block in 0..ctx.module.functions[function].blocks.len() {
++            let original = ctx.module.functions[function].blocks[block]
++                .instructions
++                .clone();
++            let mut body = Vec::with_capacity(original.len());
++            for mut inst in original {
++                let (opcode, operands) = match inst.class.opcode {
++                    Op::ImageSampleImplicitLod => (Op::ImageSampleExplicitLod, 2),
++                    Op::ImageSampleDrefImplicitLod => (Op::ImageSampleDrefExplicitLod, 3),
++                    _ => {
++                        body.push(inst);
++                        continue;
++                    }
++                };
++                let Some(Operand::IdRef(sampled)) = inst.operands.first() else {
++                    return Err("implicit image sample has no sampled image".into());
++                };
++                if !nonuniform.contains(sampled) {
++                    body.push(inst);
++                    continue;
++                }
++                let image = defs
++                    .get(sampled)
++                    .and_then(|value| value.result_type)
++                    .and_then(|ty| defs.get(&ty))
++                    .filter(|ty| ty.class.opcode == Op::TypeSampledImage)
++                    .and_then(|ty| ty.operands.first())
++                    .and_then(|operand| match operand {
++                        Operand::IdRef(id) => defs.get(id),
++                        _ => None,
++                    })
++                    .ok_or("nonuniform sample has no image type")?;
++                let spatial = match image.operands.get(1) {
++                    Some(Operand::Dim(Dim::Dim1D)) => 1,
++                    Some(Operand::Dim(Dim::Dim2D)) => 2,
++                    Some(Operand::Dim(Dim::Dim3D | Dim::DimCube)) => 3,
++                    _ => {
++                        return Err(
++                            "implicit argument sampling has an unsupported image dimension".into(),
++                        )
++                    }
++                };
++                let Some(Operand::IdRef(coord)) = inst.operands.get(1) else {
++                    return Err("implicit argument sample has no coordinate".into());
++                };
++                let coord = *coord;
++                let coord_type = defs
++                    .get(&coord)
++                    .and_then(|value| value.result_type)
++                    .ok_or("implicit argument sample coordinate has no type")?;
++                let gradient_type = if spatial == 1 {
++                    ctx.ty_float()
++                } else {
++                    ctx.ty_vecf(spatial)
++                };
++                let gradient_coord = if coord_type == gradient_type {
++                    coord
++                } else {
++                    let id = ctx.module.fresh_id();
++                    let (op, args) = if spatial == 1 {
++                        (
++                            Op::CompositeExtract,
++                            vec![Operand::IdRef(coord), Operand::LiteralBit32(0)],
++                        )
++                    } else {
++                        let mut args = vec![Operand::IdRef(coord), Operand::IdRef(coord)];
++                        args.extend((0..spatial).map(Operand::LiteralBit32));
++                        (Op::VectorShuffle, args)
++                    };
++                    body.push(Instruction::new(op, Some(gradient_type), Some(id), args));
++                    id
++                };
++                let mut gradients = [0; 2];
++                for (gradient, op) in gradients.iter_mut().zip([Op::DPdx, Op::DPdy]) {
++                    *gradient = ctx.module.fresh_id();
++                    body.push(Instruction::new(
++                        op,
++                        Some(gradient_type),
++                        Some(*gradient),
++                        vec![Operand::IdRef(gradient_coord)],
++                    ));
++                }
++                let (mut mask, mut trailing) = match inst.operands.get(operands) {
++                    None => (ImageOperands::empty(), Vec::new()),
++                    Some(Operand::ImageOperands(mask)) => {
++                        (*mask, inst.operands[operands + 1..].to_vec())
++                    }
++                    _ => return Err("implicit argument sample has invalid image operands".into()),
++                };
++                if mask.intersects(ImageOperands::LOD | ImageOperands::GRAD) {
++                    return Err(
++                        "implicit argument sample unexpectedly names a level or gradient".into(),
++                    );
++                }
++                if mask.contains(ImageOperands::BIAS) {
++                    let Some(Operand::IdRef(bias)) = trailing.first().cloned() else {
++                        return Err("implicit argument sample has no bias operand".into());
++                    };
++                    trailing.remove(0);
++                    mask.remove(ImageOperands::BIAS);
++                    // ABI 6 stores the actual Vulkan bias limit after the three offset/count pairs.
++                    let uint = ctx.ty_uint();
++                    let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++                    let zero = ctx.const_uint(0);
++                    let slot = ctx.const_uint(6);
++                    let bits =
++                        gpu_arguments::load_word(ctx, &mut body, table, pointer, uint, zero, slot);
++                    let float = ctx.ty_float();
++                    let limit = gpu_arguments::value(
++                        ctx,
++                        &mut body,
++                        Op::Bitcast,
++                        float,
++                        vec![Operand::IdRef(bits)],
++                    );
++                    let negative = gpu_arguments::value(
++                        ctx,
++                        &mut body,
++                        Op::FNegate,
++                        float,
++                        vec![Operand::IdRef(limit)],
++                    );
++                    let glsl = ctx.glsl();
++                    let bias = gpu_arguments::value(
++                        ctx,
++                        &mut body,
++                        Op::ExtInst,
++                        float,
++                        vec![
++                            Operand::IdRef(glsl),
++                            Operand::LiteralExtInstInteger(GlslStd450Op::FClamp as u32),
++                            Operand::IdRef(bias),
++                            Operand::IdRef(negative),
++                            Operand::IdRef(limit),
++                        ],
++                    );
++                    let scale = gpu_arguments::value(
++                        ctx,
++                        &mut body,
++                        Op::ExtInst,
++                        float,
++                        vec![
++                            Operand::IdRef(glsl),
++                            Operand::LiteralExtInstInteger(GlslStd450Op::Exp2 as u32),
++                            Operand::IdRef(bias),
++                        ],
++                    );
++                    for gradient in &mut gradients {
++                        *gradient = gpu_arguments::value(
++                            ctx,
++                            &mut body,
++                            if spatial == 1 {
++                                Op::FMul
++                            } else {
++                                Op::VectorTimesScalar
++                            },
++                            gradient_type,
++                            vec![Operand::IdRef(*gradient), Operand::IdRef(scale)],
++                        );
++                    }
++                }
++                mask.insert(ImageOperands::GRAD);
++                inst.class.opcode = opcode;
++                inst.operands.truncate(operands);
++                inst.operands.push(Operand::ImageOperands(mask));
++                inst.operands.extend(gradients.map(Operand::IdRef));
++                inst.operands.extend(trailing);
++                body.push(inst);
++            }
++            ctx.module.functions[function].blocks[block].instructions = body;
++        }
++    }
++    Ok(())
++}
+diff --git a/src/passes/resources/texture_array.rs b/src/passes/resources/texture_array.rs
+--- a/src/passes/resources/texture_array.rs
++++ b/src/passes/resources/texture_array.rs
+@@ -491,6 +491,7 @@
+         || name.starts_with("air.read_depth")
+         || name.starts_with("air.write_texture")
+         || name.starts_with("air.gather_texture")
++        || name.starts_with("air.gather_compare_depth")
+         || name.starts_with("air.gather_depth")
+         || name.starts_with("air.get_width_texture")
+         || name.starts_with("air.get_height_texture")
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -869,11 +869,18 @@
+                         .unwrap_or(ImageShape {
+                             dim: Dim::Dim2D,
+                             arrayed: false,
++                            depth: false,
+                             comp: ImageComp::Float,
+                             multisampled: false,
+                         });
+                     (
+-                        ctx.ty_image_ms(shape.dim, shape.arrayed, shape.comp, shape.multisampled),
++                        ctx.ty_image_ms(
++                            shape.dim,
++                            shape.arrayed,
++                            shape.comp,
++                            shape.multisampled,
++                            shape.depth,
++                        ),
+                         shape.dim,
+                         shape.arrayed,
+                         shape.comp,
+@@ -962,11 +969,17 @@
+                 .unwrap_or(ImageShape {
+                     dim: Dim::Dim2D,
+                     arrayed: false,
++                    depth: false,
+                     comp: ImageComp::Float,
+                     multisampled: false,
+                 });
+-            let image_ty =
+-                ctx.ty_image_ms(shape.dim, shape.arrayed, shape.comp, shape.multisampled);
++            let image_ty = ctx.ty_image_ms(
++                shape.dim,
++                shape.arrayed,
++                shape.comp,
++                shape.multisampled,
++                shape.depth,
++            );
+             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
+             let var = ctx.module.fresh_id();
+             ctx.new_globals.push(Instruction::new(
+@@ -2820,7 +2833,10 @@
+                 state,
+             )
+         } else {
+-            (ctx.ty_image(tex.dim, tex.arrayed, tex.comp), None)
++            (
++                ctx.ty_image_ms(tex.dim, tex.arrayed, tex.comp, false, tex.depth),
++                None,
++            )
+         };
+         let binding_ty = tex
+             .array_length
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -206,7 +206,8 @@
+ /// v60 allocates constexpr sampler reflection after token-backed argument samplers leave the stage
+ /// descriptor band, matching the bindings emitted for mixed static and dynamic resource graphs.
+ /// v61 distinguishes float, unsigned and signed null sampling descriptors in argument table ABI 5.
+-pub const REFLECTION_VERSION: u32 = 61;
++/// v62 preserves depth image types and supplies the runtime LOD bias limit in argument table ABI 6.
++pub const REFLECTION_VERSION: u32 = 62;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -1736,6 +1737,7 @@
+     dimension: TextureDimension,
+     arrayed: bool,
+     multisampled: bool,
++    depth: bool,
+     component: TextureComponent,
+     writable: bool,
+     storage_format: Option<crate::meta::TextureFormat>,
+@@ -1780,6 +1782,7 @@
+         };
+         Some(Self {
+             dimension,
++            depth: literal(2)? != 0,
+             arrayed: literal(3)? != 0,
+             multisampled: literal(4)? != 0,
+             component,
+@@ -1827,6 +1830,7 @@
+             dimension: self.dimension,
+             arrayed: self.arrayed,
+             multisampled: self.multisampled,
++            depth: self.depth,
+             component: self.component,
+             writable: self.writable,
+             array_ref: false,
+@@ -2005,7 +2009,7 @@
+             )
+         });
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: 5,
++            version: 6,
+             table_binding: 672,
+             categories,
+             image_query_binding,
+@@ -2192,7 +2196,7 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if table.version != 5
++            if table.version != 6
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+@@ -2614,6 +2618,7 @@
+             shape.dimension = image.dimension;
+             shape.arrayed = image.arrayed;
+             shape.multisampled = image.multisampled;
++            shape.depth = image.depth;
+             shape.component = image.component;
+             shape.writable = image.writable;
+             shape.storage_format = image.storage_format;
+@@ -3769,6 +3774,7 @@
+                 dimension: TextureDimension::from_spirv_dim(embedded.dim),
+                 arrayed: embedded.arrayed,
+                 multisampled: false,
++                depth: embedded.depth,
+                 component: TextureComponent::from_image_comp(embedded.comp),
+                 writable: embedded.storage_format.is_some(),
+                 array_ref: embedded.array_length.is_some(),
+diff --git a/src/reflect/tests.rs b/src/reflect/tests.rs
+--- a/src/reflect/tests.rs
++++ b/src/reflect/tests.rs
+@@ -976,6 +976,7 @@
+         argument_index: 0,
+         dim: spirv::Dim::Dim2D,
+         arrayed: false,
++        depth: false,
+         comp: crate::passes::ImageComp::Float,
+         storage_format: None,
+         array_length: Some(2),
+diff --git a/tests/argument_buffer_graph.rs b/tests/argument_buffer_graph.rs
+--- a/tests/argument_buffer_graph.rs
++++ b/tests/argument_buffer_graph.rs
+@@ -84,7 +84,7 @@
+         #[cfg(feature = "serde")]
+         {
+             let json = serde_json::to_value(&reflection).unwrap();
+-            assert_eq!(json["argument_resource_tables"]["version"], 5);
++            assert_eq!(json["argument_resource_tables"]["version"], 6);
+             assert_eq!(
+                 json["argument_resource_tables"]["categories"],
+                 serde_json::json!([0, 2])
+diff --git a/tests/argument_implicit_lod.rs b/tests/argument_implicit_lod.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/argument_implicit_lod.rs
+@@ -0,0 +1,100 @@
++use metal2vulkan::{
++    passes::{Stage, TransformOptions},
++    translate_sanitized_native_reflected_unvalidated,
++};
++
++fn fragment(arrayed: bool, bias: bool) -> String {
++    let dimension = if arrayed { "2d_array" } else { "2d" };
++    let layer = if arrayed { " i32 1," } else { "" };
++    let layer_type = if arrayed { " i32," } else { "" };
++    let bias_value = if bias { "%runtime_bias" } else { "0.0" };
++    format!(
++        r#"
++target triple = "air64-apple-macosx"
++%Args = type {{ [2 x ptr addrspace(1)], [2 x ptr addrspace(2)] }}
++define <4 x float> @fragment(ptr addrspace(2) %args, <4 x float> %position) {{
++entry:
++  %x = extractelement <4 x float> %position, i32 0
++  %runtime_bias = extractelement <4 x float> %position, i32 1
++  %pixel = call i32 @air.convert.u.i32.f.f32(float %x)
++  %index32 = and i32 %pixel, 1
++  %index = zext i32 %index32 to i64
++  %image_slot = getelementptr %Args, ptr addrspace(2) %args, i64 0, i32 0, i64 %index
++  %sampler_slot = getelementptr %Args, ptr addrspace(2) %args, i64 0, i32 1, i64 %index
++  %image = load ptr addrspace(1), ptr addrspace(2) %image_slot, align 8
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %coord = shufflevector <4 x float> %position, <4 x float> poison, <2 x i32> <i32 0, i32 1>
++  %sample = call {{ <4 x float>, i8 }} @air.sample_texture_{dimension}.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord,{layer} i1 true, <2 x i32> zeroinitializer, i1 false, float {bias_value}, float 0.0, i32 0)
++  %rgba = extractvalue {{ <4 x float>, i8 }} %sample, 0
++  ret <4 x float> %rgba
++}}
++declare {{ <4 x float>, i8 }} @air.sample_texture_{dimension}.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>,{layer_type} i1, <2 x i32>, i1, float, float, i32)
++declare i32 @air.convert.u.i32.f.f32(float)
++!air.fragment = !{{!0}}
++!0 = !{{ptr @fragment, !1, !2}}
++!1 = !{{!5}}
++!2 = !{{!3, !4}}
++!3 = !{{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Args"}}
++!4 = !{{i32 1, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4"}}
++!5 = !{{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}}
++"#
++    )
++}
++
++#[test]
++fn nonuniform_implicit_samples_compute_spatial_gradients_before_resource_selection() {
++    for (arrayed, bias) in [(false, false), (false, true), (true, false), (true, true)] {
++        let directory = std::env::temp_dir().join(format!(
++            "argument-implicit-lod-{}-{arrayed}-{bias}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&directory).unwrap();
++        let (spv, reflection) = translate_sanitized_native_reflected_unvalidated(
++            &fragment(arrayed, bias),
++            Stage::Fragment,
++            &directory,
++            TransformOptions::default(),
++            None,
++        )
++        .unwrap_or_else(|error| panic!("arrayed={arrayed} bias={bias}: {error}"));
++        reflection.validate_descriptor_abi().unwrap();
++        metal2vulkan::tools::spirv_val_bytes(&spv, &directory).unwrap();
++        let assembly = metal2vulkan::disassemble(&spv).unwrap();
++        assert!(!assembly.contains("OpImageSampleImplicitLod"), "{assembly}");
++        let lines = assembly
++            .lines()
++            .map(|line| line.split_whitespace().collect::<Vec<_>>())
++            .collect::<Vec<_>>();
++        let float = lines
++            .iter()
++            .find(|line| line.get(2) == Some(&"OpTypeFloat") && line.get(3) == Some(&"32"))
++            .unwrap()[0];
++        let float2 = lines
++            .iter()
++            .find(|line| {
++                line.get(2) == Some(&"OpTypeVector")
++                    && line.get(3) == Some(&float)
++                    && line.get(4) == Some(&"2")
++            })
++            .unwrap()[0];
++        for derivative in ["OpDPdx", "OpDPdy"] {
++            assert!(
++                lines
++                    .iter()
++                    .any(|line| line.get(2) == Some(&derivative) && line.get(3) == Some(&float2)),
++                "{assembly}"
++            );
++        }
++        assert!(
++            assembly
++                .lines()
++                .any(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Grad")),
++            "{assembly}"
++        );
++        if bias {
++            assert!(assembly.contains("FClamp"), "{assembly}");
++            assert!(assembly.contains("Exp2"), "{assembly}");
++        }
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++}
+diff --git a/tests/gather_compare_depth.rs b/tests/gather_compare_depth.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/gather_compare_depth.rs
+@@ -0,0 +1,213 @@
++//! `air.gather_compare_depth_2d[_array].f32` must lower to a comparison gather, not to a color
++//! gather followed by an unrelated scalar comparison.
++
++use metal2vulkan::passes::Stage;
++use metal2vulkan::{disassemble, translate_sanitized_native};
++use std::path::PathBuf;
++
++const COMPARE_LESS: i64 = 34_901_797_600_561_737;
++const COMPARE_NONE: i64 = 34_901_797_600_496_201;
++const PIXEL_COMPARE_LESS: i64 = 34_901_797_600_594_505;
++
++fn scratch(label: &str) -> PathBuf {
++    let directory = std::env::temp_dir().join(format!(
++        "metal2vulkan_gather_compare_depth_{}_{}",
++        std::process::id(),
++        label
++    ));
++    std::fs::create_dir_all(&directory).expect("create scratch directory");
++    directory
++}
++
++fn translate(source: &str, label: &str) -> Result<Vec<u8>, String> {
++    let directory = scratch(label);
++    let result = translate_sanitized_native(source, Stage::Kernel, &directory);
++    let _ = std::fs::remove_dir_all(directory);
++    result
++}
++
++fn assert_depth_image(assembly: &str, arrayed: bool) {
++    let shape = if arrayed {
++        " 2D 1 1 0 1 "
++    } else {
++        " 2D 1 0 0 1 "
++    };
++    assert!(
++        assembly
++            .lines()
++            .any(|line| line.contains("OpTypeImage") && line.contains(shape)),
++        "expected a Depth=1 image type ({shape})\n\n{assembly}"
++    );
++}
++
++fn comparison_gather_ll(
++    sampler_word: i64,
++    arrayed: bool,
++    offset: &str,
++    include_texture: bool,
++) -> String {
++    let (type_name, intrinsic, array_arg, array_decl) = if arrayed {
++        (
++            "depth2d_array<float, sample>",
++            "air.gather_compare_depth_2d_array.f32",
++            " i32 1,",
++            " i32,",
++        )
++    } else {
++        (
++            "depth2d<float, sample>",
++            "air.gather_compare_depth_2d.f32",
++            "",
++            "",
++        )
++    };
++    let params = if include_texture {
++        "ptr addrspace(1) %depth, ptr addrspace(1) %out"
++    } else {
++        "ptr addrspace(1) %out"
++    };
++    let texture_operand = if include_texture {
++        "ptr addrspace(1) %depth"
++    } else {
++        "ptr addrspace(1) null"
++    };
++    let metadata_args = if include_texture {
++        r#"!3, !4"#
++    } else {
++        r#"!4"#
++    };
++    let texture_metadata = if include_texture {
++        format!(
++            r#"!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"{type_name}", !"air.arg_name", !"depth"}}
++"#
++        )
++    } else {
++        String::new()
++    };
++    format!(
++        r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {sampler_word}, i64 0], align 8
++
++define void @k({params}) {{
++entry:
++  %c0 = insertelement <2 x float> poison, float 5.000000e-01, i32 0
++  %coord = insertelement <2 x float> %c0, float 5.000000e-01, i32 1
++  %gather = tail call {{ <4 x float>, i8 }} @{intrinsic}({texture_operand}, ptr addrspace(2) @__air_sampler_state, i32 1, <2 x float> %coord,{array_arg} float 5.000000e-01, i1 true, {offset}, i32 0)
++  %values = extractvalue {{ <4 x float>, i8 }} %gather, 0
++  store <4 x float> %values, ptr addrspace(1) %out, align 16
++  ret void
++}}
++
++declare {{ <4 x float>, i8 }} @{intrinsic}(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>,{array_decl} float, i1, <2 x i32>, i32)
++
++!air.kernel = !{{!0}}
++!air.sampler_states = !{{!5}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{{metadata_args}}}
++{texture_metadata}!4 = !{{i32 1, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}}
++!5 = !{{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}}
++"#
++    )
++}
++
++#[test]
++fn normalized_depth_compare_gather_uses_dref_gather() {
++    let source = comparison_gather_ll(COMPARE_LESS, false, "<2 x i32> zeroinitializer", true);
++    let spv = translate(&source, "normalized").expect("depth comparison gather translates");
++    let assembly = disassemble(&spv).expect("disassemble");
++    assert_eq!(
++        assembly.matches("OpImageDrefGather").count(),
++        1,
++        "{assembly}"
++    );
++    let gather = assembly
++        .lines()
++        .find(|line| line.contains("OpImageDrefGather"))
++        .expect("Dref gather instruction");
++    assert!(!gather.contains("ConstOffset"), "{gather}\n\n{assembly}");
++    assert!(assembly.contains("OpSampledImage"), "{assembly}");
++    assert_depth_image(&assembly, false);
++    assert!(!assembly.contains("air.gather_compare_depth"), "{assembly}");
++}
++
++#[test]
++fn depth_compare_gather_preserves_a_nonzero_constant_offset() {
++    let source = comparison_gather_ll(COMPARE_LESS, false, "<2 x i32> <i32 1, i32 -1>", true);
++    let spv = translate(&source, "constant_offset").expect("offset gather translates");
++    let assembly = disassemble(&spv).expect("disassemble");
++    let gather = assembly
++        .lines()
++        .find(|line| line.contains("OpImageDrefGather"))
++        .expect("Dref gather instruction");
++    assert!(gather.contains("ConstOffset"), "{gather}\n\n{assembly}");
++}
++
++#[test]
++fn depth_compare_gather_2d_array_appends_the_layer() {
++    let source = comparison_gather_ll(COMPARE_LESS, true, "<2 x i32> zeroinitializer", true);
++    let spv = translate(&source, "array").expect("arrayed depth comparison gather translates");
++    let assembly = disassemble(&spv).expect("disassemble");
++    assert_eq!(
++        assembly.matches("OpImageDrefGather").count(),
++        1,
++        "{assembly}"
++    );
++    assert_depth_image(&assembly, true);
++    let float_type = assembly
++        .lines()
++        .find(|line| line.contains("OpTypeFloat 32"))
++        .and_then(|line| line.split_whitespace().next())
++        .expect("float type");
++    assert!(
++        assembly.contains(&format!("OpTypeVector {float_type} 3")),
++        "{assembly}"
++    );
++    assert!(assembly.contains("OpConvertUToF"), "{assembly}");
++}
++
++#[test]
++fn depth_compare_gather_reflection_reports_the_depth_image() {
++    let source = comparison_gather_ll(COMPARE_LESS, false, "<2 x i32> zeroinitializer", true);
++    let directory = scratch("reflection");
++    let (_, reflection) = metal2vulkan::translate_sanitized_native_reflected(
++        &source,
++        Stage::Kernel,
++        &directory,
++        Default::default(),
++    )
++    .expect("reflected depth comparison gather translates");
++    let _ = std::fs::remove_dir_all(directory);
++    let shape = reflection
++        .bindings
++        .iter()
++        .find_map(|binding| binding.texture_shape)
++        .expect("the depth texture reflects a shape");
++    assert!(shape.depth, "{shape:?}");
++}
++
++#[test]
++fn absent_texture_compare_gather_returns_zero_without_an_image_operation() {
++    let source = comparison_gather_ll(COMPARE_LESS, false, "<2 x i32> zeroinitializer", false);
++    let spv = translate(&source, "null").expect("null depth comparison gather translates");
++    let assembly = disassemble(&spv).expect("disassemble");
++    assert!(!assembly.contains("OpImageDrefGather"), "{assembly}");
++    assert!(!assembly.contains("OpSampledImage"), "{assembly}");
++    assert!(assembly.contains("OpConstantNull"), "{assembly}");
++}
++
++#[test]
++fn depth_compare_gather_requires_a_comparison_sampler() {
++    let source = comparison_gather_ll(COMPARE_NONE, false, "<2 x i32> zeroinitializer", true);
++    let error = translate(&source, "compare_none").expect_err("comparison must be enabled");
++    assert!(error.contains("comparison enabled"), "{error}");
++}
++
++#[test]
++fn depth_compare_gather_rejects_pixel_coordinate_samplers() {
++    let source = comparison_gather_ll(PIXEL_COMPARE_LESS, false, "<2 x i32> zeroinitializer", true);
++    let error = translate(&source, "pixel").expect_err("pixel coordinates are unsupported");
++    assert!(error.contains("pixel-coordinate"), "{error}");
++}
+diff --git a/tests/reflection_describes_the_image_it_binds.rs b/tests/reflection_describes_the_image_it_binds.rs
+--- a/tests/reflection_describes_the_image_it_binds.rs
++++ b/tests/reflection_describes_the_image_it_binds.rs
+@@ -1,8 +1,8 @@
+ //! A reflected `texture_shape` describes the image the module binds, not the Metal type name.
+ //!
+ //! `ShaderReflection::texture_shape` exists so a consumer does not have to walk the emitted
+-//! `OpTypeImage` itself. What it decides — dimensionality, arrayedness, multisampling, component
+-//! class, storage format — is what a consumer feeds into `VkImageViewCreateInfo`, and Vulkan
++//! `OpTypeImage` itself. What it decides — dimensionality, arrayedness, multisampling, depth,
++//! component class, storage format — is what a consumer feeds into `VkImageViewCreateInfo`, and Vulkan
+ //! requires the created view's type to match the `Dim` and `Arrayed` of the image variable the
+ //! descriptor is read through. So a shape that disagrees with the module is not a cosmetic
+ //! difference: it is a view the driver will reject at dispatch.
+@@ -204,6 +204,7 @@
+                 shape.dimension,
+                 shape.arrayed,
+                 shape.multisampled,
++                shape.depth,
+                 shape.component,
+                 shape.writable
+             ),
+@@ -211,6 +212,7 @@
+                 image.dimension,
+                 image.arrayed,
+                 image.multisampled,
++                image.depth,
+                 image.component,
+                 image.writable
+             ),
+@@ -265,7 +267,7 @@
+             [result, "=", "OpVariable", pointer, _] => {
+                 variables.insert((*result).to_string(), (*pointer).to_string());
+             }
+-            [result, "=", "OpTypeImage", sampled, dimension, _, arrayed, multisampled, sampled_operand, format] =>
++            [result, "=", "OpTypeImage", sampled, dimension, depth, arrayed, multisampled, sampled_operand, format] =>
+             {
+                 let component = if floats.iter().any(|id| id == sampled) {
+                     TextureComponent::Float
+@@ -290,6 +292,7 @@
+                         dimension,
+                         arrayed: *arrayed != "0",
+                         multisampled: *multisampled != "0",
++                        depth: *depth != "0",
+                         component,
+                         writable: *sampled_operand == "2",
+                         array_ref: false,
+diff --git a/tests/runtime_depth_comparison.rs b/tests/runtime_depth_comparison.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/runtime_depth_comparison.rs
+@@ -0,0 +1,146 @@
++use metal2vulkan::passes::Stage;
++
++const KERNEL: &str = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
++entry:
++  %reference = load float, ptr addrspace(1) %out, align 4
++  %sample = call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 0, <2 x float> <float 2.500000e-01, float 7.500000e-01>, float %reference, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
++  %value = extractvalue { float, i8 } %sample, 0
++  store float %value, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>"}
++!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*"}
++"#;
++
++#[test]
++fn runtime_depth_comparison_uses_the_sampler_instead_of_guessing_its_compare_function() {
++    let tmp = std::env::temp_dir().join(format!("runtime-depth-compare-{}", std::process::id()));
++    std::fs::create_dir_all(&tmp).unwrap();
++    let spv = metal2vulkan::translate_sanitized_native(KERNEL, Stage::Kernel, &tmp)
++        .expect("runtime comparison sampler");
++    let asm = metal2vulkan::disassemble(&spv).unwrap();
++    assert_eq!(
++        asm.matches("OpImageSampleDrefExplicitLod").count(),
++        1,
++        "{asm}"
++    );
++    assert!(!asm.contains("OpImageSampleExplicitLod"), "{asm}");
++    assert!(!asm.contains("OpFOrd"), "{asm}");
++    assert!(
++        asm.lines()
++            .any(|line| line.contains("OpTypeImage") && line.contains(" 2D 1 0 0 1 ")),
++        "{asm}"
++    );
++    metal2vulkan::tools::spirv_val_bytes(&spv, &tmp).unwrap();
++    std::fs::remove_dir_all(tmp).unwrap();
++}
++
++fn depth_graph(arrayed: bool, gather: bool) -> String {
++    let dimension = if arrayed { "2d_array" } else { "2d" };
++    let family = if gather {
++        "gather_compare"
++    } else {
++        "sample_compare"
++    };
++    let result = if gather { "<4 x float>" } else { "float" };
++    let layer = if arrayed { " i32 1," } else { "" };
++    let layer_type = if arrayed { " i32," } else { "" };
++    let tail = if gather {
++        ""
++    } else {
++        ", i1 true, float 0.0, float 0.0"
++    };
++    let tail_type = if gather { "" } else { ", i1, float, float" };
++    let output = if gather {
++        "%red = extractelement <4 x float> %value, i32 0"
++    } else {
++        "%red = fadd float %value, 0.0"
++    };
++    format!(
++        r#"
++target triple = "air64-apple-macosx"
++%Root = type {{ ptr addrspace(2) }}
++%Record = type {{ [2 x ptr addrspace(1)], ptr addrspace(2) }}
++define void @depth_graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {{
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %group32 = and i32 %i, 1
++  %group = zext i32 %group32 to i64
++  %image_slot = getelementptr %Record, ptr addrspace(2) %base, i64 %group, i32 0, i64 1
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 %group, i32 1
++  %image = load ptr addrspace(1), ptr addrspace(2) %image_slot, align 8
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %reference = load float, ptr addrspace(1) %out, align 4
++  %sample = call {{ {result}, i8 }} @air.{family}_depth_{dimension}.f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, i32 0, <2 x float> <float 0.25, float 0.75>,{layer} float %reference, i1 true, <2 x i32> zeroinitializer{tail}, i32 0)
++  %value = extractvalue {{ {result}, i8 }} %sample, 0
++  {output}
++  store float %red, ptr addrspace(1) %out, align 4
++  ret void
++}}
++declare {{ {result}, i8 }} @air.{family}_depth_{dimension}.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>,{layer_type} float, i1, <2 x i32>{tail_type}, i32)
++!air.kernel = !{{!0}}
++!0 = !{{ptr @depth_graph, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4, !5}}
++!3 = !{{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}}
++!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}}
++"#
++    )
++}
++
++#[test]
++fn nested_depth_tokens_keep_depth_views_and_shape_correct_null_descriptors() {
++    for (arrayed, gather) in [(false, false), (false, true), (true, false), (true, true)] {
++        let tmp = std::env::temp_dir().join(format!(
++            "depth-graph-{}-{arrayed}-{gather}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&tmp).unwrap();
++        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected_unvalidated(
++            &depth_graph(arrayed, gather),
++            Stage::Kernel,
++            &tmp,
++            Default::default(),
++            None,
++        )
++        .unwrap_or_else(|error| panic!("arrayed={arrayed} gather={gather}: {error}"));
++        reflection.validate_descriptor_abi().unwrap();
++        metal2vulkan::tools::spirv_val_bytes(&spv, &tmp).unwrap();
++        let asm = metal2vulkan::disassemble(&spv).unwrap();
++        let shape = format!(" 2D 1 {} 0 1 ", u32::from(arrayed));
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpTypeImage") && line.contains(&shape)),
++            "{asm}"
++        );
++        assert!(
++            asm.contains(if gather {
++                "OpImageDrefGather"
++            } else {
++                "OpImageSampleDrefExplicitLod"
++            }),
++            "{asm}"
++        );
++        assert!(
++            asm.contains("DescriptorSet 2") && asm.contains("OpConvertUToPtr"),
++            "{asm}"
++        );
++        let shape_index = format!(" {}", 10 + u32::from(arrayed));
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpConstant ") && line.ends_with(&shape_index)),
++            "depth null descriptor shape missing: {asm}"
++        );
++        std::fs::remove_dir_all(tmp).unwrap();
++    }
++}
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `61`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `62`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -85,11 +85,12 @@
+ ## Descriptor ABI (binding map)
+ 
+ Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
+-`argument_resource_tables: {version: 5, table_binding: 672, categories: [...]}`.
++`argument_resource_tables: {version: 6, table_binding: 672, categories: [...]}`.
+ They require the default descriptor layout. Binding 672 in set 0 is the read-only token
+ table; categories 0, 1, 2 denote runtime sampled-image, storage-image and sampler arrays
+ at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+-`(word_offset, count)`, followed by sorted low/high token pairs. Descriptor index 0 is
++`(word_offset, count)`. ABI 6 stores the device maxSamplerLodBias as float32 bits in
++word 6, followed by sorted low/high token pairs. Descriptor index 0 is
+ reserved for texel guards or a default sampler. ABI 5 appends type-specific sampled
+ image descriptors after the sampled token count, at `count + shape`, where
+ `shape = 2 * Dim + Arrayed + 8 * Depth + 16 * Component` uses the SPIR-V image type fields
+@@ -99,8 +100,10 @@
+ additional token rows and do not move the dimension data. A consumer may bind a
+ Vulkan null image when `nullDescriptor` is enabled, otherwise it binds a matching
+ image view. Sampling and gather select these descriptors for absent tokens and
+-select a zero result afterwards, preserving the original control flow, implicit
+-LOD and bias operands. Texel reads/writes branch before descriptor access.
++select a zero result afterwards. Nonuniform fragment samples compute spatial
++derivatives before sampling and use explicit gradients; shader bias scales those
++gradients after clamping to the runtime device limit. Sampler mipLodBias must be
++zero for this lowering. Texel reads/writes branch before descriptor access.
+ Tokens are opaque identifiers, never GPU addresses. The shader
+ loads them through its actual record/pointer graph, so this contract has no raw root
+ descriptors. Consumers must bind these additional resources and enable the corresponding
+@@ -261,7 +264,7 @@
+ | `extent` | Buffer reachability: `Object { bytes }`, `Unbounded`, or `Unknown` |
+ | `footprint` | Final-module static byte ranges, invocation-strided accesses, and an explicit unbounded-access flag |
+ | `type_name` | AIR type string when metadata carried it |
+-| `texture_shape` | Dim / arrayed / MS / component / writable / storage format, plus fixed handle-array length when present (`descriptor.count` is derived from it, so the two never disagree). Reflected translation corrects these to the `OpTypeImage` the module declares at the binding, so the view a consumer creates matches the image variable the descriptor is read through — a texel-read `texturecube` binds as a `D2` array, since SPIR-V has no cube texel fetch. A binding whose image variables do not all declare the same type (a function-constant-gated texture argument can produce that) keeps the type-name-derived shape, as does `reflect_sanitized`, which builds no module. |
++| `texture_shape` | Dim / arrayed / MS / depth / component / writable / storage format, plus fixed handle-array length when present (`descriptor.count` is derived from it, so the two never disagree). Reflected translation corrects these to the `OpTypeImage` the module declares at the binding, so the view a consumer creates matches the image variable the descriptor is read through — a texel-read `texturecube` binds as a `D2` array, since SPIR-V has no cube texel fetch. A binding whose image variables do not all declare the same type (a function-constant-gated texture argument can produce that) keeps the type-name-derived shape, as does `reflect_sanitized`, which builds no module. |
+ | `embedded_source` | For arg-buffer textures: owning buffer index, field byte offset, and Metal `[[id(n)]]` argument-encoder index |
+ | `access` | When known: `Unused` / `ReadOnly` / `WriteOnly` / `ReadWrite` / `Sampled` / `Storage`. For a descriptor-backed buffer, reflected translation widens the declared classification to cover the loads and stores the finished module performs through it, so it is safe to barrier and stage from. It only ever widens: the analysis follows the pointer graph it can attribute, so a buffer it saw no write through may still be written via a device address. `reflect_sanitized` builds no module and reports the declared classification alone. |
+ | `static_sampler` | Decoded immutable state for `StaticSampler`; `None` for other kinds. A `StaticSampler` binding is invented by translation, not declared by Metal, so reflected translation reports only the ones the finished module binds -- a constexpr sampler state no sample reads is dropped rather than asked for. `reflect_sanitized` builds no module and reports every state the AIR declares. |

@@ -1,0 +1,40 @@
+--- a/src/amd/common/darwin/ac_darwin_sync.c
++++ b/src/amd/common/darwin/ac_darwin_sync.c
+@@ -382,8 +382,11 @@
+                newest = o->tl[j].seq;
+       }
+       pthread_mutex_unlock(&s->mtx);
+-      if (newest && backend_wait(s, newest, 0))
+-         ; /* a failing backend just leaves the previous state */
++      if (newest) {
++         int r = backend_wait(s, newest, 0);
++         if (r)
++            return SYNC_FAIL(-r);
++      }
+    }
+ 
+    pthread_mutex_lock(&s->mtx);
+--- a/src/vulkan/runtime/vk_drm_syncobj.c
++++ b/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -161,6 +161,10 @@
+ 
+    int err = device->sync->query(device->sync, &sobj->syncobj, value, 1, 0);
+    if (err) {
++#ifdef __APPLE__
++      if (errno == ECANCELED || errno == ENODEV)
++         return vk_device_set_lost(device, "Darwin timeline query failed: %m");
++#endif
+       return vk_errorf(device, VK_ERROR_UNKNOWN,
+                        "DRM_IOCTL_SYNCOBJ_QUERY failed: %m");
+    }
+@@ -356,6 +360,10 @@
+    if (err && errno == ETIME) {
+       return VK_TIMEOUT;
+    } else if (err) {
++#ifdef __APPLE__
++      if (errno == ECANCELED || errno == ENODEV)
++         return vk_device_set_lost(device, "Darwin synchronization wait failed: %m");
++#endif
+       return vk_errorf(device, VK_ERROR_UNKNOWN,
+                        "DRM_IOCTL_SYNCOBJ_WAIT failed: %m");
+    }

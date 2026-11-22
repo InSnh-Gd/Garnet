@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""Fail-closed identity checks for the standalone Garnet build inputs."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+GARNET_KEXT = "Garnet.kext"
+GARNET_ID = "org.garnet.driver"
+GARNET_EXECUTABLE = "Garnet"
+ACCEL_KEXT = "GarnetAccel.kext"
+ACCEL_ID = "org.garnet.accel"
+ACCEL_EXECUTABLE = "GarnetAccel"
+DELIVERY_FORMAT = "garnet-delivery-v1"
+LEGACY_IDENTITY_TOKENS = (
+    b"AMDRadeonRDNA4",
+    b"as.vit9696.Lilu",
+    b"RDNA4FB",
+    b"RDNA4Bringup",
+    b"RDNA4Accel",
+    b"RDNA4Metal",
+    b"Navi48",
+)
+IGNORED_INPUT_ROOTS = (
+    "src/garnet/firmware",
+    "src/garnet-metal/spvcache",
+)
+
+
+class IdentityError(Exception):
+    """A build input or output does not match its required identity."""
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def digest_names(names):
+    return sha256_bytes(
+        "".join("{}\n".format(name) for name in sorted(names)).encode("utf-8")
+    )
+
+
+def valid_exclude_name(value):
+    if not value or value.startswith("/") or "\\" in value:
+        return False
+    return all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+def path_is_excluded(relative, excludes):
+    parts = relative.split("/")
+    if ".git" in parts:
+        return True
+    return any(
+        relative == excluded
+        or relative.startswith(excluded + "/")
+        or excluded in parts
+        for excluded in excludes
+    )
+
+
+def directory_identity(root, excludes):
+    entries = []
+    file_count = 0
+    symlink_count = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        relative_directory = os.path.relpath(directory, root)
+        if relative_directory == ".":
+            relative_directory = ""
+
+        kept_directories = []
+        for name in sorted(dirnames):
+            relative = "/".join(part for part in (relative_directory, name) if part)
+            full = os.path.join(directory, name)
+            if path_is_excluded(relative, excludes):
+                continue
+            if os.path.islink(full):
+                target = os.readlink(full)
+                entries.append(
+                    (
+                        os.fsencode(relative),
+                        b"L  "
+                        + sha256_bytes(os.fsencode(target)).encode("ascii")
+                        + b"  ./"
+                        + os.fsencode(relative)
+                        + b"\n",
+                    )
+                )
+                symlink_count += 1
+            else:
+                kept_directories.append(name)
+        dirnames[:] = kept_directories
+
+        for name in sorted(filenames):
+            relative = "/".join(part for part in (relative_directory, name) if part)
+            if path_is_excluded(relative, excludes):
+                continue
+            full = os.path.join(directory, name)
+            metadata = os.lstat(full)
+            if stat.S_ISLNK(metadata.st_mode):
+                target = os.readlink(full)
+                entries.append(
+                    (
+                        os.fsencode(relative),
+                        b"L  "
+                        + sha256_bytes(os.fsencode(target)).encode("ascii")
+                        + b"  ./"
+                        + os.fsencode(relative)
+                        + b"\n",
+                    )
+                )
+                symlink_count += 1
+            elif stat.S_ISREG(metadata.st_mode):
+                digest = sha256_file(Path(os.fsdecode(os.fsencode(full))))
+                entries.append(
+                    (
+                        os.fsencode(relative),
+                        digest.encode("ascii")
+                        + b"  ./"
+                        + os.fsencode(relative)
+                        + b"\n",
+                    )
+                )
+                file_count += 1
+            else:
+                raise IdentityError(
+                    "unsupported input type: {}".format(os.path.join(root, relative))
+                )
+    canonical = b"".join(entry for _, entry in sorted(entries))
+    return sha256_bytes(canonical), file_count, symlink_count
+
+
+def read_key_values(path):
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise IdentityError("cannot read {}: {}".format(path, error)) from error
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise IdentityError("{}:{}: expected KEY=VALUE".format(path, number))
+        key, value = line.split("=", 1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            raise IdentityError("{}:{}: invalid key {!r}".format(path, number, key))
+        if key in values:
+            raise IdentityError("{}:{}: duplicate key {}".format(path, number, key))
+        values[key] = value
+    return values
+
+
+def read_identity_values(path):
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise IdentityError("cannot read {}: {}".format(path, error)) from error
+    for number, raw in enumerate(lines, 1):
+        if not raw or raw.startswith("#"):
+            continue
+        if "=" not in raw:
+            raise IdentityError("{}:{}: expected KEY=VALUE".format(path, number))
+        key, value = raw.split("=", 1)
+        if not key or key in values:
+            raise IdentityError(
+                "{}:{}: missing or duplicate key {!r}".format(path, number, key)
+            )
+        values[key] = value
+    return values
+
+
+def run_git(args, cwd, env=None, check=True):
+    command = ["git"] + args
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise IdentityError("cannot run git: {}".format(error)) from error
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise IdentityError(
+            "{} failed in {}: {}".format(" ".join(command), cwd, detail)
+        )
+    return result
+
+
+def run_git_bytes(args, cwd):
+    command = ["git"] + args
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise IdentityError("cannot run git: {}".format(error)) from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise IdentityError(
+            "{} failed in {}: {}".format(" ".join(command), cwd, detail)
+        )
+    return result.stdout
+
+
+def git_output(args, cwd, env=None):
+    return run_git(args, cwd, env=env).stdout.strip()
+
+
+def valid_exclude_path(value):
+    if not value or value in (".", ".."):
+        return False
+    if value.startswith("/") or "\\" in value:
+        return False
+    return all(part not in ("", ".", "..") for part in value.split("/"))
+
+
+def generated_source_excludes(source):
+    excludes = set()
+    for path in source.iterdir():
+        if path.is_dir() and re.fullmatch(r"[Bb]uild(?:[-.].*)?", path.name):
+            excludes.add(path.name)
+        elif path.is_file() and (path.name.endswith(".log") or path.name == ".DS_Store"):
+            excludes.add(path.name)
+    return excludes
+
+
+def series_patches(patches_dir):
+    series = patches_dir / "series"
+    try:
+        lines = series.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise IdentityError("cannot read patch series {}: {}".format(series, error)) from error
+    patches = []
+    for number, raw in enumerate(lines, 1):
+        name = raw.strip()
+        if not name or name.startswith("#"):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
+            raise IdentityError(
+                "{}:{}: patch must be a plain filename: {!r}".format(
+                    series, number, name
+                )
+            )
+        patch = patches_dir / name
+        if not patch.is_file():
+            raise IdentityError("{}:{}: missing patch {}".format(series, number, patch))
+        if name in patches:
+            raise IdentityError("{}:{}: duplicate patch {}".format(series, number, name))
+        patches.append(name)
+    if not patches:
+        raise IdentityError("{}: patch series is empty".format(series))
+    return series, patches
+
+
+def stage_tree(source, excludes, env=None):
+    args = ["add", "-f", "-A", "--", "."]
+    for path in excludes:
+        if not valid_exclude_path(path):
+            raise IdentityError("invalid source exclusion {!r}".format(path))
+        args.extend(
+            [":(exclude){}".format(path), ":(exclude){}/**".format(path)]
+        )
+    git_output(args, source, env=env)
+    return git_output(["write-tree"], source, env=env)
+
+
+def tree_for_worktree(source, temporary, excludes):
+    index = temporary / "source-index"
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = str(index)
+    git_output(["read-tree", "HEAD"], source, env=env)
+    return stage_tree(source, excludes, env=env)
+
+
+def check_submodule(source, path, expected):
+    directory = source / path
+    if not directory.is_dir():
+        raise IdentityError("missing submodule: {}".format(directory))
+    top = Path(git_output(["rev-parse", "--show-toplevel"], directory)).resolve()
+    if top != directory.resolve():
+        raise IdentityError("submodule path is not its own repository: {}".format(directory))
+    actual = git_output(["rev-parse", "HEAD"], directory)
+    if actual != expected:
+        raise IdentityError(
+            "submodule {} is at {}, expected {}".format(path, actual, expected)
+        )
+    dirty = git_output(
+        ["status", "--porcelain", "--untracked-files=normal"], directory
+    )
+    if dirty:
+        raise IdentityError("submodule {} is dirty:\n{}".format(path, dirty))
+    return actual, git_output(["rev-parse", "HEAD^{tree}"], directory)
+
+
+def verify_standalone_kext(kext_path, expected_bundle, expected_id, expected_exec, prefix):
+    kext = Path(kext_path).resolve()
+    if kext.name != expected_bundle:
+        raise IdentityError(
+            "{} bundle must be {}, got {}".format(prefix, expected_bundle, kext.name)
+        )
+    plist = kext / "Contents/Info.plist"
+    try:
+        data = plist.read_bytes()
+        info = plistlib.loads(data)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise IdentityError("cannot read {}: {}".format(plist, error)) from error
+    if info.get("CFBundleIdentifier") != expected_id:
+        raise IdentityError(
+            "wrong CFBundleIdentifier: {!r}".format(info.get("CFBundleIdentifier"))
+        )
+    executable = info.get("CFBundleExecutable")
+    if executable != expected_exec:
+        raise IdentityError(
+            "wrong CFBundleExecutable: {!r}".format(executable)
+        )
+    binary = kext / "Contents/MacOS" / executable
+    if not binary.is_file():
+        raise IdentityError("missing {} executable: {}".format(prefix, binary))
+    libraries = info.get("OSBundleLibraries")
+    if isinstance(libraries, dict) and "as.vit9696.Lilu" in libraries:
+        raise IdentityError(
+            "{} bundle must not declare as.vit9696.Lilu".format(prefix)
+        )
+    binary_data = binary.read_bytes()
+    for label, blob in (("Info.plist", data), ("executable", binary_data)):
+        for token in LEGACY_IDENTITY_TOKENS:
+            if token in blob:
+                raise IdentityError(
+                    "legacy {} identity remains in {} {}".format(
+                        token.decode("ascii"), prefix, label
+                    )
+                )
+    version = info.get("CFBundleVersion")
+    if not version:
+        raise IdentityError("{} bundle has no CFBundleVersion".format(prefix))
+    output = {
+        "{}.bundle".format(prefix): kext.name,
+        "{}.identifier".format(prefix): info["CFBundleIdentifier"],
+        "{}.executable".format(prefix): executable,
+        "{}.version".format(prefix): str(version),
+        "{}.standalone".format(prefix): "true",
+        "{}.legacy_identity".format(prefix): "absent",
+        "{}.info_plist_sha256".format(prefix): sha256_bytes(data),
+        "{}.executable_sha256".format(prefix): sha256_bytes(binary_data),
+    }
+    for key, value in output.items():
+        print("{}={}".format(key, value))
+
+
+def command_garnet(args):
+    verify_standalone_kext(
+        args.kext, GARNET_KEXT, GARNET_ID, GARNET_EXECUTABLE, "garnet"
+    )
+
+
+def command_accel(args):
+    verify_standalone_kext(
+        args.kext, ACCEL_KEXT, ACCEL_ID, ACCEL_EXECUTABLE, "accel"
+    )
+
+
+def command_input(args):
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", args.label):
+        raise IdentityError("input label must be uppercase KEY: {!r}".format(args.label))
+    path = Path(args.path).resolve()
+    excludes = []
+    for value in args.exclude:
+        if not valid_exclude_name(value):
+            raise IdentityError("invalid input exclusion {!r}".format(value))
+        excludes.append(value)
+    if path.is_file():
+        metadata = path.stat()
+        output = {
+            "path": str(path),
+            "kind": "file",
+            "sha256": sha256_file(path),
+            "size_bytes": str(metadata.st_size),
+            "file_count": "1",
+            "symlink_count": "0",
+        }
+    elif path.is_dir():
+        digest, file_count, symlink_count = directory_identity(path, excludes)
+        output = {
+            "path": str(path),
+            "kind": "directory",
+            "sha256": digest,
+            "file_count": str(file_count),
+            "symlink_count": str(symlink_count),
+        }
+        git_marker = path / ".git"
+        if git_marker.exists():
+            parent = Path(git_output(["rev-parse", "--show-toplevel"], path)).resolve()
+            if parent != path:
+                raise IdentityError(
+                    "input is below but not the root of a Git checkout: {}".format(path)
+                )
+            output["git_head"] = git_output(["rev-parse", "HEAD"], path)
+            output["git_tree"] = git_output(["rev-parse", "HEAD^{tree}"], path)
+            output["git_dirty"] = (
+                "yes"
+                if git_output(
+                    ["status", "--porcelain", "--untracked-files=normal"], path
+                )
+                else "no"
+            )
+    else:
+        raise IdentityError("input is not a file or directory: {}".format(path))
+    for key, value in output.items():
+        print("{}.{}={}".format(args.label, key, value))
+
+
+def command_manifest(args):
+    garnet = read_identity_values(Path(args.garnet_identity).resolve())
+    accel = read_identity_values(Path(args.accel_identity).resolve())
+    values = {
+        "FORMAT": DELIVERY_FORMAT,
+        "GARNET_BUNDLE_ID": garnet.get("garnet.identifier", ""),
+        "GARNET_VERSION": garnet.get("garnet.version", ""),
+        "GARNET_EXECUTABLE_SHA256": garnet.get("garnet.executable_sha256", ""),
+        "GARNET_INFO_SHA256": garnet.get("garnet.info_plist_sha256", ""),
+        "GARNET_STANDALONE": garnet.get("garnet.standalone", ""),
+        "ACCEL_BUNDLE_ID": accel.get("accel.identifier", ""),
+        "ACCEL_VERSION": accel.get("accel.version", ""),
+        "ACCEL_EXECUTABLE_SHA256": accel.get("accel.executable_sha256", ""),
+        "ACCEL_INFO_SHA256": accel.get("accel.info_plist_sha256", ""),
+        "ACCEL_STANDALONE": accel.get("accel.standalone", ""),
+    }
+    for key, value in values.items():
+        if not value:
+            raise IdentityError("delivery manifest is missing {}".format(key))
+        if "\n" in value or "\r" in value:
+            raise IdentityError("delivery manifest value contains a line break: {}".format(key))
+    if values["GARNET_BUNDLE_ID"] != GARNET_ID:
+        raise IdentityError(
+            "delivery manifest Garnet id is {}".format(values["GARNET_BUNDLE_ID"])
+        )
+    if values["ACCEL_BUNDLE_ID"] != ACCEL_ID:
+        raise IdentityError(
+            "delivery manifest Accel id is {}".format(values["ACCEL_BUNDLE_ID"])
+        )
+    if values["GARNET_STANDALONE"] != "true" or values["ACCEL_STANDALONE"] != "true":
+        raise IdentityError("delivery manifest requires standalone kext builds")
+    for key in (
+        "GARNET_EXECUTABLE_SHA256",
+        "GARNET_INFO_SHA256",
+        "ACCEL_EXECUTABLE_SHA256",
+        "ACCEL_INFO_SHA256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", values[key]):
+            raise IdentityError("delivery manifest {} is not a SHA256".format(key))
+    for key, value in values.items():
+        print("{}={}".format(key, value))
+
+
+def local_source_entry(repo, relative):
+    path = os.path.join(os.fsencode(repo), relative)
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return "M", "000000", "-"
+    except OSError as error:
+        raise IdentityError(
+            "cannot stat local source {}: {}".format(os.fsdecode(relative), error)
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as error:
+            raise IdentityError(
+                "cannot read symlink {}: {}".format(os.fsdecode(relative), error)
+            ) from error
+        return "L", "120000", sha256_bytes(target)
+    if stat.S_ISREG(metadata.st_mode):
+        mode = "100755" if metadata.st_mode & 0o111 else "100644"
+        try:
+            return "F", mode, sha256_file(Path(os.fsdecode(path)))
+        except OSError as error:
+            raise IdentityError(
+                "cannot hash local source {}: {}".format(os.fsdecode(relative), error)
+            ) from error
+    raise IdentityError(
+        "unsupported local source type: {}".format(os.fsdecode(relative))
+    )
+
+
+def command_local_source(args):
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        raise IdentityError("repository is not a directory: {}".format(repo))
+    top = Path(git_output(["rev-parse", "--show-toplevel"], repo)).resolve()
+    if top != repo:
+        raise IdentityError("local source is not the repository root: {}".format(repo))
+
+    tracked = {
+        path
+        for path in run_git_bytes(
+            ["ls-files", "-z", "--cached"], repo
+        ).split(b"\0")
+        if path
+    }
+    untracked = {
+        path
+        for path in run_git_bytes(
+            ["ls-files", "-z", "--others", "--exclude-standard"], repo
+        ).split(b"\0")
+        if path
+    }
+    ignored_inputs = set()
+    for relative_root in IGNORED_INPUT_ROOTS:
+        root = repo / relative_root
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() or path.is_symlink():
+                ignored_inputs.add(os.fsencode(str(path.relative_to(repo))))
+    ignored_inputs -= tracked
+    ignored_inputs -= untracked
+    output = Path(args.output).resolve()
+    try:
+        output_relative = os.fsencode(str(output.relative_to(repo)))
+    except ValueError:
+        output_relative = None
+    if output_relative is not None:
+        tracked.discard(output_relative)
+        untracked.discard(output_relative)
+        ignored_inputs.discard(output_relative)
+
+    entries = []
+    patch_entries = []
+    for relative in sorted(tracked | untracked | ignored_inputs):
+        entry_type, mode, digest = local_source_entry(repo, relative)
+        path_text = os.fsdecode(relative)
+        line = "{}\t{}\t{}\t{}\n".format(
+            entry_type, mode, digest, json.dumps(path_text, ensure_ascii=True)
+        )
+        entries.append(line)
+        if (
+            path_text.startswith("mesa-patches/")
+            or path_text.startswith("patches/")
+            or "/patches/" in path_text
+        ):
+            patch_entries.append(line)
+
+    canonical = "".join(entries)
+    patch_canonical = "".join(patch_entries)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        "# RDNA4 local source snapshot v1\n"
+        "# scope=git-tracked+untracked-nonignored+declared-ignored-inputs; "
+        "generated build outputs excluded\n"
+        "# fields=type<TAB>mode<TAB>sha256<TAB>path-json\n"
+        + canonical,
+        encoding="utf-8",
+    )
+    values = {
+        "local_source.scope": "git-tracked+untracked-nonignored+declared-ignored-inputs",
+        "local_source.digest": sha256_bytes(canonical.encode("utf-8")),
+        "local_source.file_count": str(len(entries)),
+        "local_source.tracked_count": str(len(tracked)),
+        "local_source.untracked_count": str(len(untracked)),
+        "local_source.ignored_input_count": str(len(ignored_inputs)),
+        "local_source.patch_count": str(len(patch_entries)),
+        "local_source.patch_digest": sha256_bytes(
+            patch_canonical.encode("utf-8")
+        ),
+        "local_source.sidecar": output.name,
+    }
+    for key, value in values.items():
+        print("{}={}".format(key, value))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Verify standalone Garnet build outputs and local source inputs."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+
+    garnet = subparsers.add_parser("garnet")
+    garnet.add_argument("kext")
+    garnet.set_defaults(func=command_garnet)
+
+    accel = subparsers.add_parser("accel")
+    accel.add_argument("kext")
+    accel.set_defaults(func=command_accel)
+
+    input_identity = subparsers.add_parser("input")
+    input_identity.add_argument("label")
+    input_identity.add_argument("path")
+    input_identity.add_argument("--exclude", action="append", default=[])
+    input_identity.set_defaults(func=command_input)
+
+    manifest = subparsers.add_parser("manifest")
+    manifest.add_argument("--garnet-identity", required=True)
+    manifest.add_argument("--accel-identity", required=True)
+    manifest.set_defaults(func=command_manifest)
+
+    local_source = subparsers.add_parser("local-source")
+    local_source.add_argument("--repo", required=True)
+    local_source.add_argument("--output", required=True)
+    local_source.set_defaults(func=command_local_source)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except IdentityError as error:
+        print("build_identity.py: {}".format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,101 @@
+{
+  "input": {
+    "reflection_version": 64,
+    "normalized_sampler_coordinates": true,
+    "stage": "Fragment",
+    "entry_point": "frag",
+    "bindings": [
+      {
+        "kind": "SamplerCoordinateFlags",
+        "metal_index": 0,
+        "descriptor": {
+          "set": 0,
+          "binding": 674,
+          "count": 1,
+          "producer_noise": 0
+        },
+        "declared_size": 128,
+        "extent": {
+          "Object": {"bytes": 128, "producer_noise": 0},
+          "producer_noise": 0
+        },
+        "access": "ReadOnly",
+        "param_index": null,
+        "static_sampler": null,
+        "texture_shape": null,
+        "type_name": null,
+        "noise_binding": "drop"
+      },
+      {
+        "kind": "EmbeddedArgBufferSampler",
+        "metal_index": 1,
+        "descriptor": {"set": 2, "binding": 0, "count": 0},
+        "comparison_descriptor": {"set": 4, "binding": 0, "count": 0},
+        "embedded_source": {"buffer_index": 3, "field_offset": 16},
+        "noise_binding": "drop"
+      }
+    ],
+    "argument_buffer_fields": [
+      {"buffer_index": 3, "field_offset": 16}
+    ],
+    "argument_resource_tables": {
+      "version": 8,
+      "table_binding": 672,
+      "categories": [0, 2],
+      "comparison_sampler": true
+    },
+    "buffer_address_table_version": 2,
+    "buffer_address_table_bytes": 768,
+    "vertex_attributes": [],
+    "local_size": [1, 1, 1],
+    "max_work_group_size": null,
+    "kernel_dispatch": null,
+    "function_constants": [],
+    "descriptor_layout": {"set": 0},
+    "runtime_sampler_specializations": [],
+    "runtime_storage_image_specializations": null,
+    "noise_top": "drop"
+  },
+  "expected": {
+    "trimmed_from_reflection_version": 64,
+    "normalized_sampler_coordinates": true,
+    "stage": "Fragment",
+    "entry_point": "frag",
+    "bindings": [
+      {
+        "kind": "SamplerCoordinateFlags",
+        "metal_index": 0,
+        "descriptor": {"set": 0, "binding": 674, "count": 1},
+        "declared_size": 128,
+        "extent": {"Object": {"bytes": 128}},
+        "access": "ReadOnly"
+      },
+      {
+        "kind": "EmbeddedArgBufferSampler",
+        "metal_index": 1,
+        "descriptor": {"set": 2, "binding": 0, "count": 0},
+        "comparison_descriptor": {"set": 4, "binding": 0, "count": 0},
+        "embedded_source": {"buffer_index": 3, "field_offset": 16}
+      }
+    ],
+    "argument_buffer_fields": [
+      {"buffer_index": 3, "field_offset": 16}
+    ],
+    "argument_resource_tables": {
+      "version": 8,
+      "table_binding": 672,
+      "categories": [0, 2],
+      "comparison_sampler": true
+    },
+    "buffer_address_table_version": 2,
+    "buffer_address_table_bytes": 768,
+    "vertex_attributes": [],
+    "local_size": [1, 1, 1],
+    "max_work_group_size": null,
+    "kernel_dispatch": null,
+    "function_constants": [],
+    "descriptor_layout": {"set": 0},
+    "runtime_sampler_specializations": [],
+    "runtime_storage_image_specializations": null
+  }
+}

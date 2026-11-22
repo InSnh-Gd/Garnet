@@ -1,0 +1,564 @@
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -439,6 +439,8 @@
+     /// `materialize_texture_array_loads` reads it to turn each `OpLoad` of a handle from a
+     /// dynamically-indexed array element into `OpAccessChain %arrayvar %idx` + `OpLoad %image`.
+     image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp, bool)>,
++    /// Direct sampler-array root -> (first Metal sampler index, per-element descriptor variables).
++    sampler_array_vars: HashMap<Word, (u32, Vec<Word>)>,
+     /// StorageBuffer descriptor variables introduced for AIR buffer parameters. Retained until the
+     /// memory phase has consumed every source-shaped access so resource construction can omit only
+     /// dead pointer projections rooted at an exact bound buffer.
+@@ -588,6 +590,7 @@
+             image_multisampled: HashSet::new(),
+             image_storage: HashSet::new(),
+             image_array_vars: HashMap::new(),
++            sampler_array_vars: HashMap::new(),
+             bound_buffer_vars: HashSet::new(),
+             null_image_values: HashSet::new(),
+             laid_out: HashSet::new(),
+@@ -3176,6 +3179,7 @@
+     // BEFORE `recover_inlined_local_pointer_fields`, which otherwise rewrites the per-element handle
+     // load into a local-pointer-field marker and severs the access chain this pass keys on.
+     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
++    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
+     hoist_function_variables(&mut ctx, entry_idx);
+     // Entry texture parameters become loaded image ids only after interface binding. Replay any
+     // helper-field markers that still reference those parameters before image calls lower.
+@@ -3184,6 +3188,7 @@
+     // of one descriptor array. Re-run the materializer so it can replace that table's pointer select
+     // with a descriptor-array access using the exact recorded store mapping.
+     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
++    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
+     // Resource binding must get first refusal on pointer-shaped texture handles. Only after exact
+     // single-image and descriptor-array roots have been materialized may remaining private
+     // placeholders be neutralized as genuinely unmodeled memory.
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -666,6 +666,10 @@
+                 resource_values.insert(lid);
+                 splices.push((pid, lid));
+             }
++            ParamBinding::SamplerArray { var } => {
++                resource_values.insert(var);
++                splices.push((pid, var));
++            }
+             ParamBinding::Image {
+                 var,
+                 image_ty,
+@@ -914,6 +918,8 @@
+             replace_id_in_function(func, from, to);
+         }
+     }
++    // Recover opaque sampler elements before generic pointer construction can collapse their loads.
++    materialize_sampler_array_loads(ctx, entry_idx);
+     let _ = collapse_resource_wrappers(ctx, entry_idx, &resource_values);
+     ctx.emit_sidecar
+         .remap_ids(&buffer_root_splices.iter().copied().collect());
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -15,6 +15,7 @@
+ mod quad_sampling;
+ mod query_select;
+ pub(in crate::passes) mod rewrites;
++mod sampler_array;
+ mod sampler_usage;
+ mod selected_load;
+ mod texture_array;
+@@ -36,6 +37,7 @@
+ pub(in crate::passes) use null_texels::guard_argument_texel_accesses;
+ pub(in crate::passes) use quad_sampling::lower_argument_implicit_lod;
+ pub(in crate::passes) use query_select::rewrite_resource_query_selects;
++pub(in crate::passes) use sampler_array::materialize_sampler_array_loads;
+ pub(in crate::passes) use sampler_usage::select_sampler_operation_usage;
+ pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
+ pub(in crate::passes) use texture_array::{
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -290,6 +290,9 @@
+         /// ABI 8 runtime coordinate-flag word for a direct `[[sampler(n)]]`.
+         coordinate_word: Option<u32>,
+     },
++    /// A byval sampler array is spliced to its first descriptor variable; fixed element loads
++    /// are materialized separately before AIR image operations lower.
++    SamplerArray { var: Word },
+     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
+     Buffer { var: Word, wrap: BufWrap },
+     /// A compute `[[stage_in]]` value. Vulkan has no compute-stage attribute stream, so the
+@@ -318,7 +321,8 @@
+     ZeroPointer { var: Word },
+ }
+ 
+-/// Refuse an argument whose declared descriptor count this translator cannot honour.
++/// Check descriptor-array metadata against the texture type; sampler counts are checked against
++/// the actual byval pointee while building their per-element bindings below.
+ ///
+ /// The count is the second `air.location_index` operand -- the stable ABI statement of how many
+ /// descriptors the argument occupies at its Metal slot. Only a texture handle array has a lowering
+@@ -342,27 +346,6 @@
+     let mut declared = counts.iter().collect::<Vec<_>>();
+     declared.sort();
+     for (&idx, &count) in declared {
+-        let is_sampler = match stage {
+-            Stage::Fragment => matches!(
+-                frag.and_then(|m| m.role_of(idx)),
+-                Some(FragRole::Sampler(_))
+-            ),
+-            Stage::Vertex => matches!(
+-                vert.and_then(|m| m.role_of(idx)),
+-                Some(VertRole::Sampler(_))
+-            ),
+-            Stage::Kernel => matches!(
+-                kern.and_then(|m| m.role_of(idx)),
+-                Some(KernRole::Sampler(_))
+-            ),
+-        };
+-        if is_sampler {
+-            return Err(format!(
+-                "entry parameter {idx} is an array of {count} samplers, which this translator has \
+-                 no descriptor-array lowering for; emitting the module would sample with a \
+-                 synthesized default sampler instead of the one the shader selected"
+-            ));
+-        }
+         let texture_type_name = match stage {
+             Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
+             Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
+@@ -1028,18 +1011,6 @@
+                 },
+             ));
+         } else if role_is("sampler") {
+-            let sty = ctx.ty_sampler();
+-            let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
+-            let var = ctx.module.fresh_id();
+-            ctx.new_globals.push(Instruction::new(
+-                Op::Variable,
+-                Some(pptr),
+-                Some(var),
+-                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+-            ));
+-            let binding = required_resource_binding(*pid, resource_binding)?;
+-            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+-            ctx.interface_buffer_var(var);
+             let metal_index = match stage {
+                 Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
+                     Some(FragRole::Sampler(index)) => Some(*index),
+@@ -1055,6 +1026,60 @@
+                 }),
+             }
+             .ok_or_else(|| format!("sampler parameter {pid} has no Metal sampler index"))?;
++            let count = match stage {
++                Stage::Fragment => frag.and_then(|meta| meta.declared_descriptor_count(idx)),
++                Stage::Vertex => vert.and_then(|meta| meta.declared_descriptor_count(idx)),
++                Stage::Kernel => kern.and_then(|meta| meta.declared_descriptor_count(idx)),
++            }
++            .unwrap_or(1);
++            let llvm_count = ptr_pointee(&defs, *pty)
++                .and_then(|pointee| array_type(&defs, pointee))
++                .map(|(_, length)| length);
++            let is_array = count > 1 || llvm_count.is_some();
++            if is_array && llvm_count != Some(count) {
++                return Err(format!(
++                    "entry parameter {idx} occupies {count} sampler descriptors per \
++                     `air.location_index`, but its type states {llvm_count:?}"
++                ));
++            }
++            if count == 0
++                || metal_index
++                    .checked_add(count)
++                    .is_none_or(|end| end > crate::reflect::SAMPLER_ARGUMENT_COUNT)
++            {
++                return Err(format!(
++                    "entry parameter {idx} is an array of {count} samplers from index {metal_index}, \
++                     past the {} sampler indices a stage has",
++                    crate::reflect::SAMPLER_ARGUMENT_COUNT
++                ));
++            }
++            let sty = ctx.ty_sampler();
++            let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
++            let binding = required_resource_binding(*pid, resource_binding)?;
++            let mut elements = Vec::with_capacity(count as usize);
++            for element in 0..count {
++                let var = ctx.module.fresh_id();
++                ctx.new_globals.push(Instruction::new(
++                    Op::Variable,
++                    Some(pptr),
++                    Some(var),
++                    vec![Operand::StorageClass(StorageClass::UniformConstant)],
++                ));
++                decorate_binding(
++                    &mut ctx.module,
++                    var,
++                    descriptor_layout.set,
++                    binding + element,
++                );
++                ctx.interface_buffer_var(var);
++                elements.push(var);
++            }
++            let var = elements[0];
++            if is_array {
++                ctx.sampler_array_vars.insert(var, (metal_index, elements));
++                bindings.push((*pid, ParamBinding::SamplerArray { var }));
++                continue;
++            }
+             let specialized_state = usize::try_from(metal_index)
+                 .ok()
+                 .and_then(|index| ctx.runtime_sampler_states.get(index))
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -3242,7 +3242,15 @@
+                     static_sampler: None,
+                 },
+                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
+-                FragRole::Sampler(n) => sampler_binding(*n, Some(idx)),
++                FragRole::Sampler(n) => {
++                    append_direct_samplers(
++                        &mut bindings,
++                        *n,
++                        idx,
++                        meta.declared_descriptor_count(idx).unwrap_or(1),
++                    );
++                    continue;
++                }
+                 FragRole::VisibleFunctionTable(n) => {
+                     function_table_binding(ResourceKind::VisibleFunctionTable, *n, idx)
+                 }
+@@ -3431,7 +3439,15 @@
+                     static_sampler: None,
+                 },
+                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
+-                VertRole::Sampler(n) => sampler_binding(*n, Some(idx)),
++                VertRole::Sampler(n) => {
++                    append_direct_samplers(
++                        &mut bindings,
++                        *n,
++                        idx,
++                        meta.declared_descriptor_count(idx).unwrap_or(1),
++                    );
++                    continue;
++                }
+                 VertRole::VisibleFunctionTable(n) => {
+                     function_table_binding(ResourceKind::VisibleFunctionTable, *n, idx)
+                 }
+@@ -3612,7 +3628,15 @@
+                     }
+                 }
+                 KernRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
+-                KernRole::Sampler(n) => sampler_binding(*n, Some(idx)),
++                KernRole::Sampler(n) => {
++                    append_direct_samplers(
++                        &mut bindings,
++                        *n,
++                        idx,
++                        meta.declared_descriptor_count(idx).unwrap_or(1),
++                    );
++                    continue;
++                }
+                 KernRole::StageInput(location) => {
+                     let metal_index = stage_input_bindings
+                         .get(&idx)
+@@ -4234,6 +4258,19 @@
+         .collect()
+ }
+ 
++fn append_direct_samplers(bindings: &mut Vec<ResourceBinding>, first: u32, param: u32, count: u32) {
++    let end = first.checked_add(count);
++    if count == 0 || end.is_none_or(|end| end > SAMPLER_ARGUMENT_COUNT) {
++        let mut invalid = sampler_binding(first, Some(param));
++        invalid.descriptor = None;
++        bindings.push(invalid);
++        return;
++    }
++    for element in 0..count {
++        bindings.push(sampler_binding(first + element, Some(param)));
++    }
++}
++
+ fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
+     ResourceBinding {
+         kind: ResourceKind::Sampler,
+--- a/tests/must_fallback.rs
++++ b/tests/must_fallback.rs
+@@ -745,17 +745,10 @@
+ /// A sampler argument AIR states occupies more than one descriptor.
+ ///
+ /// `air.location_index` carries two operands, the Metal slot and the descriptor count, and Metal
+-/// spells `array<sampler, 8>` with a count of 8. There is no sampler descriptor-array lowering:
+-/// the element loads resolve to nothing, so the sample falls back to the synthesized default
+-/// sampler and the state the shader selected is dropped -- in a module that validates, binds and
+-/// reflects as though one sampler at that slot were the whole story. Two of 14579 local corpus
+-/// sources declare one.
+-///
+-/// Pinned from both sides over one template, so the boundary is what is fixed: the ordinary
+-/// single-sampler spelling of the same kernel -- one declared descriptor, sampled straight off the
+-/// entry parameter -- must keep translating.
+-#[test]
+-fn a_sampler_descriptor_array_fallbacks() {
++/// spells `array<sampler, 8>` with a count of 8. Constant element loads must use the chosen sampler;
++/// contradictory descriptor counts must still fall back rather than inventing a default state.
++#[test]
++fn a_sampler_descriptor_array_preserves_its_element_and_rejects_a_count_mismatch() {
+     const KERNEL: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+ 
+ define void @k(ptr addrspace(1) %tex, SAMPLER_PARAM, ptr addrspace(1) %out) {
+@@ -787,7 +780,13 @@
+             "SAMPLER_ELEMENT",
+             "  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5\n               %s = load ptr addrspace(2), ptr %slot, align 8",
+         );
+-    match translate_sanitized_native(&array, Stage::Kernel, &tmp()) {
++    let bytes =
++        translate_sanitized_native(&array, Stage::Kernel, &tmp()).expect("fixed sampler element");
++    let assembly = metal2vulkan::disassemble(&bytes).unwrap();
++    assert!(assembly.contains("Binding 165"), "{assembly}");
++    assert!(assembly.contains("OpImageSampleExplicitLod"), "{assembly}");
++    let mismatched = array.replace("byval([8 x", "byval([7 x");
++    match translate_sanitized_native(&mismatched, Stage::Kernel, &tmp()) {
+         Ok(spv) => panic!(
+             "expected a clean FALLBACK but translate succeeded ({} bytes); a sample through a \
+              default sampler the shader never asked for is a silently wrong module",
+@@ -795,7 +794,7 @@
+         ),
+         Err(e) => {
+             assert!(
+-                e.contains("array of 8 samplers"),
++                e.contains("occupies 8 sampler descriptors"),
+                 "the diagnostic should name the declared count; got: {e}"
+             );
+             assert!(
+--- a/tests/sampler_operation_usage.rs
++++ b/tests/sampler_operation_usage.rs
+@@ -152,6 +152,124 @@
+     assert_binding(&assembly, 736, true);
+ }
+ 
++fn array_source(element: u32) -> String {
++    // Change only the entry parameter; AIR sampling calls still consume the element load.
++    source(SamplerSource::Direct, true, true)
++        .replacen(", ptr addrspace(2) %sampler, ", ", ptr byval([2 x ptr addrspace(2)]) %samplers, ", 1)
++        .replace("entry:\n", &format!("entry:\n  %slot = getelementptr inbounds [2 x ptr addrspace(2)], ptr %samplers, i32 0, i32 {element}\n  %sampler = load ptr addrspace(2), ptr %slot, align 8\n"))
++        .replace(r#"!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1}"#, r#"!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 2}"#)
++}
++
++#[test]
++fn direct_sampler_array_element_keeps_both_representations_and_exact_reflection() {
++    let (_, reflection, assembly) = translate("direct-array-mixed", &array_source(1));
++    let element = reflection
++        .bindings
++        .iter()
++        .find(|row| row.kind == ResourceKind::Sampler && row.metal_index == 1)
++        .expect("element 1 has its own reflection row");
++    assert_eq!(element.param_index, Some(2));
++    assert_eq!(element.descriptor.unwrap().binding, 161);
++    assert_eq!(element.descriptor.unwrap().count, 1);
++    assert_eq!(element.comparison_descriptor.unwrap().binding, 737);
++    assert_eq!(element.comparison_descriptor.unwrap().count, 1);
++    assert_binding(&assembly, 161, true);
++    assert_binding(&assembly, 737, true);
++    assert_binding(&assembly, 160, false);
++    assert_binding(&assembly, 736, false);
++    assert!(assembly.contains("OpImageSampleExplicitLod"), "{assembly}");
++    assert!(
++        assembly.contains("OpImageSampleDrefExplicitLod"),
++        "{assembly}"
++    );
++}
++
++#[test]
++fn direct_sampler_array_rejects_out_of_range_elements_and_dynamic_indices() {
++    for input in [
++        array_source(2),
++        array_source(1).replace(
++            "i32 0, i32 1\n  %sampler = load",
++            "i32 0, i32 %i\n  %sampler = load",
++        ),
++    ] {
++        let directory =
++            std::env::temp_dir().join(format!("m2v-invalid-sampler-array-{}", std::process::id()));
++        let result = metal2vulkan::translate_sanitized_native(&input, Stage::Kernel, &directory);
++        let _ = std::fs::remove_dir_all(&directory);
++        assert!(
++            result.is_err(),
++            "an unproven element must not sample a default sampler"
++        );
++    }
++}
++
++#[test]
++fn direct_sampler_array_keeps_the_selected_coordinate_flag() {
++    let directory =
++        std::env::temp_dir().join(format!("m2v-array-coordinate-{}", std::process::id()));
++    let (bytes, reflection) = metal2vulkan::translate_sanitized_native_reflected_unvalidated(
++        &array_source(1),
++        Stage::Kernel,
++        &directory,
++        metal2vulkan::passes::TransformOptions {
++            normalized_sampler_coordinates: true,
++            ..Default::default()
++        },
++        None,
++    )
++    .expect("array coordinates");
++    metal2vulkan::tools::spirv_val_bytes(&bytes, &directory).expect("valid array coordinates");
++    let assembly = metal2vulkan::disassemble(&bytes).unwrap();
++    assert_binding(&assembly, 674, true);
++    assert!(assembly.contains("OpImageQuerySizeLod"), "{assembly}");
++    let flag_buffer = assembly
++        .lines()
++        .find_map(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            (words.len() == 4
++                && words[0] == "OpDecorate"
++                && words[2] == "Binding"
++                && words[3] == "674")
++                .then(|| words[1])
++        })
++        .expect("coordinate metadata buffer");
++    let word_one = assembly
++        .lines()
++        .filter_map(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            (words.len() == 5 && words[2] == "OpConstant" && words[4] == "1").then(|| words[0])
++        })
++        .collect::<Vec<_>>();
++    assert!(
++        assembly.lines().any(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            words.len() == 7
++                && words[2] == "OpAccessChain"
++                && words[4] == flag_buffer
++                && word_one.contains(&words[6])
++        }),
++        "selected sampler must read coordinate word 1: {assembly}"
++    );
++    let flags = reflection
++        .bindings
++        .iter()
++        .find(|row| {
++            row.descriptor
++                .is_some_and(|location| location.binding == 674)
++        })
++        .expect("coordinate reflection row");
++    assert_eq!(
++        flags.declared_size,
++        Some(if reflection.reflection_version >= 65 {
++            384
++        } else {
++            128
++        })
++    );
++    std::fs::remove_dir_all(directory).unwrap();
++}
++
+ #[test]
+ fn direct_comparison_only_sampler_reports_the_comparison_binding_as_primary() {
+     let source = source(SamplerSource::Direct, false, true);
+--- /dev/null
++++ b/src/passes/resources/sampler_array.rs
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++// Adapted from NullMoth Systems, nvidia-macos-driver 18ba05f38b5eadea8b5ae05834bb51c61fb4c5c3.
++//! Materializes the element loads of an `array<sampler, N>` entry parameter.
++//!
++//! Apple's AIR passes `array<sampler, N>` byval, as `[N x ptr addrspace(2)]`, and the shader
++//! selects one element with a constant index before handing it to `air.sample_*`:
++//!
++//! ```text
++//!   %slot = getelementptr inbounds [2 x ptr addrspace(2)], ptr %samps, i32 0, i32 1
++//!   %s = load ptr addrspace(2), ptr %slot
++//! ```
++//!
++//! Every element is its own descriptor at its own sampler index, so the parameter is declared as
++//! one `OpTypeSampler` variable per element at consecutive bindings, matching the plugin's layout.
++//! The emitter does not model a loaded sampler-state pointer, so it hands the value over as an
++//! opaque placeholder and records what it was: a `LocalPointerFieldLoad` naming the array root
++//! (element 0's variable) and the constant element index.
++//!
++//! This pass turns each of those facts into the load Vulkan wants: an `OpLoad` of that element's
++//! sampler variable. The placeholder keeps its result id, so every existing use stays valid and
++//! the sampling intrinsic sees a sampler value.
++//!
++//! This direct-binding pass supports fixed indices; GPU argument-table indexing remains separate.
++
++use crate::spirv_module::Instruction;
++use crate::spirv_module::Operand;
++use spirv::{Op, Word};
++
++use crate::reflect::RuntimeSamplerState;
++use std::collections::HashMap;
++
++use super::super::Ctx;
++use super::retire_dead_pointer_projections;
++
++pub(crate) fn materialize_sampler_array_loads(ctx: &mut Ctx, entry_idx: usize) {
++    if ctx.sampler_array_vars.is_empty() {
++        return;
++    }
++
++    // element load -> the sampler variable of that element; an index past the declared length is
++    // left alone, so the placeholder fails the module loudly instead of sampling another binding
++    let mut rewrites: HashMap<Word, (Word, u32)> = HashMap::default();
++    for fact in &ctx.emit_sidecar.local_pointer_field_loads {
++        let Some((first_index, elements)) = ctx.sampler_array_vars.get(&fact.root) else {
++            continue;
++        };
++        let Some(element) = fixed_array_element(&fact.indices) else {
++            continue;
++        };
++        if let Some(var) = elements.get(element as usize) {
++            rewrites.insert(fact.id, (*var, first_index + element));
++        }
++    }
++    if rewrites.is_empty() {
++        return;
++    }
++
++    let sty = ctx.ty_sampler();
++    let consumed: Vec<Word> = rewrites.keys().copied().collect();
++
++    for (&id, &(_, index)) in &rewrites {
++        if let Some(state) = ctx.runtime_sampler_states[index as usize] {
++            ctx.sampler_states
++                .insert(id, RuntimeSamplerState::lowering_state(state));
++            ctx.specialized_runtime_sampler_values.insert(id);
++        }
++        if ctx.normalized_sampler_coordinates {
++            ctx.sampler_coordinate_sources.insert(
++                id,
++                crate::passes::SamplerCoordinateSource::RuntimeWord(index),
++            );
++        }
++    }
++    let func = &mut ctx.module.functions[entry_idx];
++    for blk in func.blocks.iter_mut() {
++        let mut rebuilt: Vec<Instruction> =
++            Vec::with_capacity(blk.instructions.len() + rewrites.len());
++        for inst in blk.instructions.drain(..) {
++            if let Some(id) = inst.result_id {
++                if let Some((var, _)) = rewrites.remove(&id) {
++                    let mut load = inst;
++                    load.class.opcode = Op::Load;
++                    load.result_type = Some(sty);
++                    load.operands = vec![Operand::IdRef(var)];
++                    rebuilt.push(load);
++                    continue;
++                }
++            }
++            rebuilt.push(inst);
++        }
++        blk.instructions = rebuilt;
++    }
++
++    ctx.emit_sidecar
++        .local_pointer_field_loads
++        .retain(|fact| !consumed.contains(&fact.id));
++
++    let roots = ctx.sampler_array_vars.keys().copied().collect::<Vec<_>>();
++    retire_dead_pointer_projections(ctx, entry_idx, roots);
++}
++
++/// The element a byval `[N x ptr addrspace(2)]` projection selects, as the emitter reduces it.
++fn fixed_array_element(indices: &[u32]) -> Option<u32> {
++    match indices {
++        [element] | [element, 0] => Some(*element),
++        _ => None,
++    }
++}

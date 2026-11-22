@@ -1,0 +1,1920 @@
+diff --git a/src/emit_sidecar.rs b/src/emit_sidecar.rs
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -66,6 +66,10 @@
+     pub(crate) buffer_pointer_dynamic_field_loads: Vec<BufferPointerDynamicFieldLoad>,
+     /// Actual serialized token words, independent of the pointer path that reached a resource.
+     pub(crate) opaque_resource_payloads: Vec<OpaqueResourcePayload>,
++    /// Opaque texture/sampler values merged by typed AIR `select` or `phi`. The emitted pointer
++    /// placeholder is not itself a legal resource selection in Logical SPIR-V; this fact lets the
++    /// resource-graph pass materialize the selection in the two serialized-token word lanes.
++    pub(crate) opaque_resource_merges: Vec<OpaqueResourceMerge>,
+     pub(crate) local_pointer_field_stores: Vec<LocalPointerFieldStore>,
+     pub(crate) local_pointer_field_loads: Vec<LocalPointerFieldLoad>,
+     pub(crate) local_pointer_dynamic_field_loads: Vec<LocalPointerDynamicFieldLoad>,
+@@ -203,6 +207,27 @@
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct OpaqueResourceMerge {
++    pub(crate) result: Word,
++    /// Emitted block containing the source select/phi. The emitter may deliberately omit the
++    /// pointer-typed merge instruction, so this label preserves where its integer-word form belongs.
++    pub(crate) block: Word,
++    pub(crate) kind: OpaqueResourceMergeKind,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum OpaqueResourceMergeKind {
++    Select {
++        condition: Word,
++        true_value: Word,
++        false_value: Word,
++    },
++    Phi {
++        incoming: Vec<(Word, Word)>,
++    },
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub(crate) struct LocalPointerFieldStore {
+     pub(crate) id: Word,
+     pub(crate) source: Word,
+@@ -258,6 +283,21 @@
+         for fact in &self.opaque_resource_payloads {
+             ids.extend([fact.id, fact.low, fact.high]);
+         }
++        for fact in &self.opaque_resource_merges {
++            ids.extend([fact.result, fact.block]);
++            match &fact.kind {
++                OpaqueResourceMergeKind::Select {
++                    condition,
++                    true_value,
++                    false_value,
++                } => ids.extend([*condition, *true_value, *false_value]),
++                OpaqueResourceMergeKind::Phi { incoming } => {
++                    for (value, label) in incoming {
++                        ids.extend([*value, *label]);
++                    }
++                }
++            }
++        }
+         for fact in &self.local_pointer_field_stores {
+             ids.extend([fact.id, fact.source, fact.root]);
+         }
+@@ -325,6 +365,27 @@
+             replace(&mut fact.low);
+             replace(&mut fact.high);
+         }
++        for fact in &mut self.opaque_resource_merges {
++            replace(&mut fact.result);
++            replace(&mut fact.block);
++            match &mut fact.kind {
++                OpaqueResourceMergeKind::Select {
++                    condition,
++                    true_value,
++                    false_value,
++                } => {
++                    replace(condition);
++                    replace(true_value);
++                    replace(false_value);
++                }
++                OpaqueResourceMergeKind::Phi { incoming } => {
++                    for (value, label) in incoming {
++                        replace(value);
++                        replace(label);
++                    }
++                }
++            }
++        }
+         for fact in &mut self.local_pointer_field_stores {
+             replace(&mut fact.id);
+             replace(&mut fact.source);
+@@ -451,6 +512,41 @@
+             .collect::<Vec<_>>();
+         self.opaque_resource_payloads.extend(clones);
+         let clones = self
++            .opaque_resource_merges
++            .iter()
++            .filter_map(|fact| {
++                let result = remap.get(&fact.result).copied()?;
++                let kind = match &fact.kind {
++                    OpaqueResourceMergeKind::Select {
++                        condition,
++                        true_value,
++                        false_value,
++                    } => OpaqueResourceMergeKind::Select {
++                        condition: remap.get(condition).copied().unwrap_or(*condition),
++                        true_value: remap.get(true_value).copied().unwrap_or(*true_value),
++                        false_value: remap.get(false_value).copied().unwrap_or(*false_value),
++                    },
++                    OpaqueResourceMergeKind::Phi { incoming } => OpaqueResourceMergeKind::Phi {
++                        incoming: incoming
++                            .iter()
++                            .map(|(value, label)| {
++                                (
++                                    remap.get(value).copied().unwrap_or(*value),
++                                    remap.get(label).copied().unwrap_or(*label),
++                                )
++                            })
++                            .collect(),
++                    },
++                };
++                Some(OpaqueResourceMerge {
++                    result,
++                    block: remap.get(&fact.block).copied().unwrap_or(fact.block),
++                    kind,
++                })
++            })
++            .collect::<Vec<_>>();
++        self.opaque_resource_merges.extend(clones);
++        let clones = self
+             .local_pointer_field_loads
+             .iter()
+             .filter_map(|fact| {
+@@ -529,6 +625,15 @@
+                 low: 71,
+                 high: 91,
+             }],
++            opaque_resource_merges: vec![OpaqueResourceMerge {
++                result: 84,
++                block: 95,
++                kind: OpaqueResourceMergeKind::Select {
++                    condition: 83,
++                    true_value: 80,
++                    false_value: 81,
++                },
++            }],
+             ordinary_plan_rejected_functions: HashSet::new(),
+             ownership_plan_rejected_functions: HashSet::new(),
+             post_lowering_cfg_construction_functions: HashSet::new(),
+@@ -578,6 +683,9 @@
+             (90, 190),
+             (81, 181),
+             (91, 191),
++            (83, 183),
++            (84, 184),
++            (95, 195),
+             (82, 182),
+             (92, 192),
+         ]);
+@@ -599,6 +707,29 @@
+                 },
+             ]
+         );
++        assert_eq!(
++            sidecar.opaque_resource_merges,
++            vec![
++                OpaqueResourceMerge {
++                    result: 84,
++                    block: 95,
++                    kind: OpaqueResourceMergeKind::Select {
++                        condition: 83,
++                        true_value: 80,
++                        false_value: 81,
++                    },
++                },
++                OpaqueResourceMerge {
++                    result: 184,
++                    block: 195,
++                    kind: OpaqueResourceMergeKind::Select {
++                        condition: 183,
++                        true_value: 180,
++                        false_value: 181,
++                    },
++                },
++            ]
++        );
+ 
+         assert_eq!(
+             sidecar.buffer_access_offsets,
+@@ -710,6 +841,24 @@
+                 low: 54,
+                 high: 55,
+             }],
++            opaque_resource_merges: vec![
++                OpaqueResourceMerge {
++                    result: 56,
++                    block: 61,
++                    kind: OpaqueResourceMergeKind::Select {
++                        condition: 57,
++                        true_value: 54,
++                        false_value: 55,
++                    },
++                },
++                OpaqueResourceMerge {
++                    result: 58,
++                    block: 62,
++                    kind: OpaqueResourceMergeKind::Phi {
++                        incoming: vec![(53, 59), (58, 60)],
++                    },
++                },
++            ],
+             all_device_buffers_raw: false,
+             large_buffer_addressing: true,
+             construct_cross_binding_addresses: false,
+@@ -788,6 +937,13 @@
+             (53, 153),
+             (54, 154),
+             (55, 155),
++            (56, 156),
++            (57, 157),
++            (58, 158),
++            (59, 159),
++            (60, 160),
++            (61, 161),
++            (62, 162),
+             (11, 111),
+             (12, 112),
+             (13, 113),
+@@ -826,6 +982,27 @@
+             }]
+         );
+         assert_eq!(
++            sidecar.opaque_resource_merges,
++            vec![
++                OpaqueResourceMerge {
++                    result: 156,
++                    block: 161,
++                    kind: OpaqueResourceMergeKind::Select {
++                        condition: 157,
++                        true_value: 154,
++                        false_value: 155,
++                    },
++                },
++                OpaqueResourceMerge {
++                    result: 158,
++                    block: 162,
++                    kind: OpaqueResourceMergeKind::Phi {
++                        incoming: vec![(153, 159), (158, 160)],
++                    },
++                },
++            ]
++        );
++        assert_eq!(
+             sidecar.aggregate_pointer_values,
+             vec![AggregatePointerValue {
+                 aggregate: 143,
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -248,15 +248,34 @@
+         .iter()
+         .map(|function| (function.name.as_str(), function))
+         .collect::<HashMap<_, _>>();
+-    let mut opaque_params = HashSet::<(String, usize)>::new();
++    let mut opaque_by_function = ir
++        .functions
++        .iter()
++        .map(|function| (function.name.clone(), HashSet::new()))
++        .collect::<HashMap<String, HashSet<String>>>();
++    let returns = ir
++        .functions
++        .iter()
++        .map(|function| {
++            let values = function
++                .blocks
++                .iter()
++                .filter_map(|block| block.typed.as_ref())
++                .filter_map(|typed| match &typed.terminator {
++                    TirTerminator::Ret(Some(value)) => {
++                        Some(value.strip_prefix('%').unwrap_or(value).to_string())
++                    }
++                    _ => None,
++                })
++                .collect::<Vec<_>>();
++            (function.name.clone(), values)
++        })
++        .collect::<HashMap<_, _>>();
+ 
++    // Seed from the actual AIR texture consumers. Everything below is a bidirectional fixed point
++    // over the typed pointer graph and user-call edges, so helper parameters and returns carry the
++    // same opaque-resource identity as a direct load in the entry body.
+     for function in &ir.functions {
+-        let params = function
+-            .params
+-            .iter()
+-            .enumerate()
+-            .map(|(index, (name, _))| (name.as_str(), index))
+-            .collect::<HashMap<_, _>>();
+         for instruction in function.carrier_insts() {
+             let Some(call) = instruction.call().as_deref() else {
+                 continue;
+@@ -272,9 +291,10 @@
+                     || (matches!(argument.ty, LlType::Ptr(2))
+                         && is_air_sampler_operand(&call.callee, argument_index))
+                 {
+-                    if let Some(index) = params.get(name.as_str()) {
+-                        opaque_params.insert((function.name.clone(), *index));
+-                    }
++                    opaque_by_function
++                        .get_mut(&function.name)
++                        .expect("function seeded above")
++                        .insert(name.clone());
+                 }
+             }
+         }
+@@ -284,63 +304,21 @@
+     while changed {
+         changed = false;
+         for function in &ir.functions {
+-            let params = function
+-                .params
+-                .iter()
+-                .enumerate()
+-                .map(|(index, (name, _))| (name.as_str(), index))
+-                .collect::<HashMap<_, _>>();
+-            for instruction in function.carrier_insts() {
+-                let Some(call) = instruction.call().as_deref() else {
+-                    continue;
+-                };
+-                if !functions.contains_key(call.callee.as_str()) {
+-                    continue;
+-                }
+-                for (callee_index, argument) in call.args.iter().enumerate() {
+-                    if !opaque_params.contains(&(call.callee.clone(), callee_index)) {
+-                        continue;
+-                    }
+-                    let LlValue::Local(name) = &argument.value else {
+-                        continue;
+-                    };
+-                    if let Some(caller_index) = params.get(name.as_str()) {
+-                        changed |= opaque_params.insert((function.name.clone(), *caller_index));
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    ir.functions
+-        .iter()
+-        .map(|function| {
+-            let mut opaque = HashSet::new();
+-            for instruction in function.carrier_insts() {
+-                let Some(call) = instruction.call().as_deref() else {
+-                    continue;
+-                };
+-                for (index, argument) in call.args.iter().enumerate() {
+-                    let direct_texture = is_air_texture_operation(&call.callee)
+-                        && (matches!(argument.ty, LlType::Ptr(1))
+-                            || (matches!(argument.ty, LlType::Ptr(2))
+-                                && is_air_sampler_operand(&call.callee, index)));
+-                    let helper_texture = opaque_params.contains(&(call.callee.clone(), index));
+-                    if direct_texture || helper_texture {
+-                        if let LlValue::Local(name) = &argument.value {
+-                            opaque.insert(name.clone());
+-                        }
+-                    }
+-                }
+-            }
+-            let mut changed = true;
+-            while changed {
+-                changed = false;
++            loop {
++                let current = opaque_by_function
++                    .get(&function.name)
++                    .cloned()
++                    .unwrap_or_default();
++                let mut updates = Vec::new();
+                 for instruction in function.carrier_insts() {
+                     let Some(result) = instruction.result.as_ref() else {
+                         continue;
+                     };
+-                    if !matches!(instruction.result_ty, Some(LlType::Ptr(1 | 2)))
++                    // Selects can retain the source's default addrspace(0) result while both typed
++                    // operands are opaque addrspace(1|2) resource pointers. This graph only grows
++                    // from actual AIR texture consumers, so admitting any pointer result here cannot
++                    // seed an unrelated pointer on its own.
++                    if !matches!(instruction.result_ty, Some(LlType::Ptr(_)))
+                         || !matches!(
+                             instruction.opcode.as_str(),
+                             "bitcast"
+@@ -354,18 +332,92 @@
+                     }
+                     let mut operands = Vec::new();
+                     instruction.visit_uses(|name| operands.push(name.to_owned()));
+-                    if opaque.contains(result) {
+-                        for operand in operands {
+-                            changed |= opaque.insert(operand);
+-                        }
+-                    } else if operands.iter().any(|operand| opaque.contains(operand)) {
+-                        changed |= opaque.insert(result.clone());
++                    if current.contains(result) {
++                        updates.extend(operands.into_iter().filter(|name| !current.contains(name)));
++                    } else if operands.iter().any(|operand| current.contains(operand)) {
++                        updates.push(result.clone());
++                    }
++                }
++                let set = opaque_by_function
++                    .get_mut(&function.name)
++                    .expect("function seeded above");
++                let added = updates
++                    .into_iter()
++                    .filter(|name| set.insert(name.clone()))
++                    .count();
++                changed |= added != 0;
++                if added == 0 {
++                    break;
++                }
++            }
++
++            for instruction in function.carrier_insts() {
++                let Some(call) = instruction.call().as_deref() else {
++                    continue;
++                };
++                let Some(callee) = functions.get(call.callee.as_str()) else {
++                    continue;
++                };
++                let caller_values = opaque_by_function
++                    .get(&function.name)
++                    .cloned()
++                    .unwrap_or_default();
++                let callee_values = opaque_by_function
++                    .get(&call.callee)
++                    .cloned()
++                    .unwrap_or_default();
++                let mut caller_updates = Vec::new();
++                let mut callee_updates = Vec::new();
++                for (callee_index, argument) in call.args.iter().enumerate() {
++                    let LlValue::Local(caller_value) = &argument.value else {
++                        continue;
++                    };
++                    let Some((callee_param, _)) = callee.params.get(callee_index) else {
++                        continue;
++                    };
++                    if callee_values.contains(callee_param) && !caller_values.contains(caller_value)
++                    {
++                        caller_updates.push(caller_value.clone());
++                    }
++                    if caller_values.contains(caller_value) && !callee_values.contains(callee_param)
++                    {
++                        callee_updates.push(callee_param.clone());
+                     }
+                 }
++                let returned = returns.get(&call.callee).map(Vec::as_slice).unwrap_or(&[]);
++                if let Some(result) = instruction.result.as_ref() {
++                    if caller_values.contains(result) {
++                        callee_updates.extend(
++                            returned
++                                .iter()
++                                .filter(|value| !callee_values.contains(*value))
++                                .cloned(),
++                        );
++                    }
++                    if returned.iter().any(|value| callee_values.contains(value)) {
++                        caller_updates.push(result.clone());
++                    }
++                }
++                let caller_set = opaque_by_function
++                    .get_mut(&function.name)
++                    .expect("function seeded above");
++                changed |= caller_updates
++                    .into_iter()
++                    .filter(|name| caller_set.insert(name.clone()))
++                    .count()
++                    != 0;
++                let callee_set = opaque_by_function
++                    .get_mut(&call.callee)
++                    .expect("callee comes from ir.functions");
++                changed |= callee_updates
++                    .into_iter()
++                    .filter(|name| callee_set.insert(name.clone()))
++                    .count()
++                    != 0;
+             }
+-            (function.name.clone(), opaque)
+-        })
+-        .collect()
++        }
++    }
++    opaque_by_function
+ }
+ 
+ impl Emitter {
+@@ -1724,6 +1776,133 @@
+                 );
+             }
+         }
++        self.record_opaque_resource_merges(&tir)?;
++        // Merge facts are recorded from the final typed body, after the first inline-parameter
++        // substitution has already rewritten the emitted instructions and older sidecar facts.
++        // Inline parameters that survive in an opaque merge arm therefore still carry their
++        // deferred placeholder ids here; apply the same caller substitution to the newly recorded
++        // facts so helper parameter/return provenance reaches the graph pass as caller values.
++        self.emit_sidecar.remap_ids(&inline_parameter_substitutions);
++        Ok(())
++    }
++
++    /// Preserve the typed select/phi structure for opaque resource values. The logical pointer
++    /// placeholder is a valid value for the ordinary emitter but carries no descriptor identity;
++    /// the graph pass uses this fact to propagate the two token words through the same control flow.
++    fn record_opaque_resource_merges(
++        &mut self,
++        tir: &crate::native::tir::TirFunction,
++    ) -> Result<(), String> {
++        let mut facts = Vec::new();
++        let mut zero_payload_recorded = false;
++        let merge_payload_id = |value: &LlValue,
++                                emitter: &mut Self,
++                                zero_payload_recorded: &mut bool|
++         -> Result<Option<Word>, String> {
++            match value {
++                LlValue::Local(name) => Ok(emitter.values.get(name).map(|(id, _)| *id)),
++                LlValue::Zero | LlValue::Undef => {
++                    let zero = emitter.const_uint(0)?;
++                    if !*zero_payload_recorded {
++                        emitter.emit_sidecar.opaque_resource_payloads.push(
++                            crate::emit_sidecar::OpaqueResourcePayload {
++                                id: zero,
++                                low: zero,
++                                high: zero,
++                            },
++                        );
++                        *zero_payload_recorded = true;
++                    }
++                    Ok(Some(zero))
++                }
++                _ => Ok(None),
++            }
++        };
++        let merge_condition_id =
++            |value: &LlValue, emitter: &mut Self| -> Result<Option<Word>, String> {
++                match value {
++                    LlValue::Local(name) => Ok(emitter.values.get(name).map(|(id, _)| *id)),
++                    LlValue::Zero | LlValue::Undef => Ok(Some(emitter.const_bool(false)?)),
++                    LlValue::Bool(value) => Ok(Some(emitter.const_bool(*value)?)),
++                    LlValue::Int(value @ 0..=1) => Ok(Some(emitter.const_bool(*value == 1)?)),
++                    _ => Ok(None),
++                }
++            };
++
++        for block in &tir.blocks {
++            let block_id = self.label_id(&block.label)?;
++            for inst in &block.insts {
++                let Some(result_name) = inst.result.as_ref() else {
++                    continue;
++                };
++                // `TirInst::result_ty` can retain the select's addrspace(0) result while both typed
++                // arms carry the actual addrspace(1|2) resource pointers. The opaque set was derived
++                // from the original typed AIR definitions, so it is the authoritative provenance
++                // gate here.
++                if !self.opaque_resource_pointers.contains(result_name) {
++                    continue;
++                }
++                let Some(result) = self.values.get(result_name).map(|(id, _)| *id) else {
++                    continue;
++                };
++                let kind = match inst.opcode {
++                    TirOpcode::Select => {
++                        let Some(condition) =
++                            inst.operands.first().and_then(TirOperand::as_typed_value)
++                        else {
++                            continue;
++                        };
++                        let Some((true_value, false_value)) = inst.select_arms().as_deref() else {
++                            continue;
++                        };
++                        let Some(condition) = merge_condition_id(&condition.value, self)? else {
++                            continue;
++                        };
++                        let Some(true_value) =
++                            merge_payload_id(&true_value.value, self, &mut zero_payload_recorded)?
++                        else {
++                            continue;
++                        };
++                        let Some(false_value) =
++                            merge_payload_id(&false_value.value, self, &mut zero_payload_recorded)?
++                        else {
++                            continue;
++                        };
++                        crate::emit_sidecar::OpaqueResourceMergeKind::Select {
++                            condition,
++                            true_value,
++                            false_value,
++                        }
++                    }
++                    TirOpcode::Phi => {
++                        let Some((_, incoming)) = inst.phi_incoming().as_ref() else {
++                            continue;
++                        };
++                        let mut values = Vec::with_capacity(incoming.len());
++                        for (value, label) in incoming {
++                            let Some(value) =
++                                merge_payload_id(value, self, &mut zero_payload_recorded)?
++                            else {
++                                values.clear();
++                                break;
++                            };
++                            values.push((value, self.label_id(label)?));
++                        }
++                        if values.is_empty() {
++                            continue;
++                        }
++                        crate::emit_sidecar::OpaqueResourceMergeKind::Phi { incoming: values }
++                    }
++                    _ => continue,
++                };
++                facts.push(crate::emit_sidecar::OpaqueResourceMerge {
++                    result,
++                    block: block_id,
++                    kind,
++                });
++            }
++        }
++        self.emit_sidecar.opaque_resource_merges.extend(facts);
+         Ok(())
+     }
+ 
+diff --git a/src/passes/emitted_inline/mod.rs b/src/passes/emitted_inline/mod.rs
+--- a/src/passes/emitted_inline/mod.rs
++++ b/src/passes/emitted_inline/mod.rs
+@@ -1269,6 +1269,24 @@
+                 .filter(|fact| callee_params.contains(&fact.root))
+                 .map(|fact| fact.id),
+         )
++        .chain(
++            ctx.emit_sidecar
++                .opaque_resource_merges
++                .iter()
++                .filter(|fact| match &fact.kind {
++                    crate::emit_sidecar::OpaqueResourceMergeKind::Select {
++                        condition,
++                        true_value,
++                        false_value,
++                    } => [*condition, *true_value, *false_value]
++                        .into_iter()
++                        .any(|id| callee_params.contains(&id)),
++                    crate::emit_sidecar::OpaqueResourceMergeKind::Phi { incoming } => incoming
++                        .iter()
++                        .any(|(value, _)| callee_params.contains(value)),
++                })
++                .map(|fact| fact.result),
++        )
+         .collect::<HashSet<_>>();
+     for placeholder in pointer_placeholders {
+         let Some(mut cloned) = ctx
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -16,6 +16,115 @@
+     multisampled: bool,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct PayloadWords {
++    low: Word,
++    high: Word,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct SelectPayload {
++    result: Word,
++    condition: Word,
++    true_value: Word,
++    false_value: Word,
++    words: PayloadWords,
++}
++
++#[derive(Clone, Debug)]
++struct PhiPayload {
++    result: Word,
++    incoming: Vec<(Word, Word)>,
++    words: PayloadWords,
++}
++
++fn word_select(
++    select: &SelectPayload,
++    payloads: &HashMap<Word, PayloadWords>,
++    uint: Word,
++) -> [Instruction; 2] {
++    let true_words = payloads[&select.true_value];
++    let false_words = payloads[&select.false_value];
++    [
++        Instruction::new(
++            Op::Select,
++            Some(uint),
++            Some(select.words.low),
++            vec![
++                Operand::IdRef(select.condition),
++                Operand::IdRef(true_words.low),
++                Operand::IdRef(false_words.low),
++            ],
++        ),
++        Instruction::new(
++            Op::Select,
++            Some(uint),
++            Some(select.words.high),
++            vec![
++                Operand::IdRef(select.condition),
++                Operand::IdRef(true_words.high),
++                Operand::IdRef(false_words.high),
++            ],
++        ),
++    ]
++}
++
++fn word_phi(
++    phi: &PhiPayload,
++    payloads: &HashMap<Word, PayloadWords>,
++    uint: Word,
++) -> [Instruction; 2] {
++    let mut low_operands = Vec::with_capacity(phi.incoming.len() * 2);
++    let mut high_operands = Vec::with_capacity(phi.incoming.len() * 2);
++    for (value, label) in &phi.incoming {
++        let words = if *value == phi.result {
++            phi.words
++        } else {
++            payloads[value]
++        };
++        low_operands.extend([Operand::IdRef(words.low), Operand::IdRef(*label)]);
++        high_operands.extend([Operand::IdRef(words.high), Operand::IdRef(*label)]);
++    }
++    [
++        Instruction::new(Op::Phi, Some(uint), Some(phi.words.low), low_operands),
++        Instruction::new(Op::Phi, Some(uint), Some(phi.words.high), high_operands),
++    ]
++}
++
++fn record_payload(
++    payloads: &mut HashMap<Word, PayloadWords>,
++    id: Word,
++    words: PayloadWords,
++) -> Result<bool, String> {
++    match payloads.get(&id) {
++        Some(existing) if *existing != words => Err(format!(
++            "GPU argument resource merge has conflicting payloads for value {id}"
++        )),
++        Some(_) => Ok(false),
++        None => {
++            payloads.insert(id, words);
++            Ok(true)
++        }
++    }
++}
++
++fn record_shape(
++    shapes: &mut HashMap<Word, ImageShape>,
++    id: Word,
++    shape: ImageShape,
++) -> Result<bool, String> {
++    match shapes.get(&id) {
++        Some(existing) if *existing != shape => {
++            Err("conflicting image types for one GPU argument resource".into())
++        }
++        Some(_) => Ok(false),
++        None => {
++            shapes.insert(id, shape);
++            Ok(true)
++        }
++    }
++}
++
+ fn lod_query(name: &str) -> bool {
+     matches!(
+         name,
+@@ -43,6 +152,15 @@
+     None
+ }
+ 
++fn image_operation(name: &str) -> bool {
++    sampled_operation(name)
++        || name.starts_with("air.read_texture")
++        || name.starts_with("air.read_depth")
++        || name.starts_with("air.write_texture")
++        || (name.starts_with("air.get_")
++            && super::super::air_calls::intrinsic_texture_shape(name).is_some())
++}
++
+ fn lower_query(
+     ctx: &mut Ctx,
+     body: &mut Vec<Instruction>,
+@@ -290,7 +408,15 @@
+         .emit_sidecar
+         .opaque_resource_payloads
+         .iter()
+-        .map(|fact| (fact.id, (fact.low, fact.high)))
++        .map(|fact| {
++            (
++                fact.id,
++                PayloadWords {
++                    low: fact.low,
++                    high: fact.high,
++                },
++            )
++        })
+         .collect::<HashMap<_, _>>();
+     if payloads.is_empty() {
+         return Ok(false);
+@@ -342,24 +468,116 @@
+                 .map(|fact| fact.id),
+         );
+     }
+-    let copies = ctx.module.functions[entry]
++    let instructions = ctx.module.functions[entry]
+         .blocks
+         .iter()
+         .flat_map(|block| &block.instructions)
++        .cloned()
++        .collect::<Vec<_>>();
++    let entry_used = instructions
++        .iter()
++        .flat_map(|instruction| &instruction.operands)
++        .filter_map(|operand| match operand {
++            Operand::IdRef(id) => Some(*id),
++            _ => None,
++        })
++        .collect::<HashSet<_>>();
++    let entry_defined = instructions
++        .iter()
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    let merge_facts = ctx
++        .emit_sidecar
++        .opaque_resource_merges
++        .iter()
++        .map(|fact| (fact.result, fact))
++        .collect::<HashMap<_, _>>();
++    let mut relevant_merges = HashSet::new();
++    let mut pending_merges = merge_facts
++        .keys()
++        .filter(|result| entry_used.contains(result) || entry_defined.contains(result))
++        .copied()
++        .collect::<Vec<_>>();
++    while let Some(result) = pending_merges.pop() {
++        if !relevant_merges.insert(result) {
++            continue;
++        }
++        let Some(fact) = merge_facts.get(&result) else {
++            continue;
++        };
++        let inputs = match &fact.kind {
++            crate::emit_sidecar::OpaqueResourceMergeKind::Select {
++                true_value,
++                false_value,
++                ..
++            } => vec![*true_value, *false_value],
++            crate::emit_sidecar::OpaqueResourceMergeKind::Phi { incoming } => {
++                incoming.iter().map(|(value, _)| *value).collect()
++            }
++        };
++        pending_merges.extend(
++            inputs
++                .into_iter()
++                .filter(|value| merge_facts.contains_key(value)),
++        );
++    }
++    let copies = instructions
++        .iter()
+         .filter(|inst| matches!(inst.class.opcode, Op::CopyObject | Op::Bitcast))
+         .filter_map(|inst| match (inst.result_id, inst.operands.first()) {
+             (Some(id), Some(Operand::IdRef(source))) => Some((id, *source)),
+             _ => None,
+         })
+         .collect::<Vec<_>>();
++    // The native emitter preserves opaque resource selects/phis as typed sidecar facts. It cannot
++    // leave the source pointer merge in SPIR-V: a Logical entry placeholder has no descriptor
++    // identity, and final image-select construction runs only after this resource pass.
++    let mut select_candidates = Vec::new();
++    let mut phi_candidates = Vec::new();
++    for fact in &ctx.emit_sidecar.opaque_resource_merges {
++        if !relevant_merges.contains(&fact.result) {
++            continue;
++        }
++        match &fact.kind {
++            crate::emit_sidecar::OpaqueResourceMergeKind::Select {
++                condition,
++                true_value,
++                false_value,
++            } => {
++                select_candidates.push((fact.result, *condition, *true_value, *false_value));
++            }
++            crate::emit_sidecar::OpaqueResourceMergeKind::Phi { incoming } => {
++                phi_candidates.push((fact.result, incoming.clone()));
++            }
++        }
++    }
++    let candidate_results = select_candidates
++        .iter()
++        .map(|(result, ..)| *result)
++        .chain(phi_candidates.iter().map(|(result, _)| *result))
++        .collect::<HashSet<_>>();
++    let merge_blocks = ctx
++        .emit_sidecar
++        .opaque_resource_merges
++        .iter()
++        .filter(|fact| relevant_merges.contains(&fact.result))
++        .map(|fact| (fact.result, fact.block))
++        .collect::<HashMap<_, _>>();
++    let present_merge_results = instructions
++        .iter()
++        .filter(|instruction| matches!(instruction.class.opcode, Op::Select | Op::Phi))
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    let mut selects = HashMap::<Word, SelectPayload>::new();
++    let mut phis = HashMap::<Word, PhiPayload>::new();
+     loop {
+         let before = (payloads.len(), covered.len());
+         for &(id, source) in &copies {
+             if let Some(&words) = payloads.get(&source) {
+-                payloads.entry(id).or_insert(words);
++                record_payload(&mut payloads, id, words)?;
+             }
+             if let Some(&words) = payloads.get(&id) {
+-                payloads.entry(source).or_insert(words);
++                record_payload(&mut payloads, source, words)?;
+             }
+             if covered.contains(&source) {
+                 covered.insert(id);
+@@ -368,11 +586,109 @@
+                 covered.insert(source);
+             }
+         }
++        for &(result, condition, true_value, false_value) in &select_candidates {
++            if selects.contains_key(&result) {
++                continue;
++            }
++            if !payloads.contains_key(&true_value) || !payloads.contains_key(&false_value) {
++                continue;
++            }
++            let words = PayloadWords {
++                low: ctx.module.fresh_id(),
++                high: ctx.module.fresh_id(),
++            };
++            record_payload(&mut payloads, result, words)?;
++            selects.insert(
++                result,
++                SelectPayload {
++                    result,
++                    condition,
++                    true_value,
++                    false_value,
++                    words,
++                },
++            );
++        }
++        for (result, incoming) in &phi_candidates {
++            if phis.contains_key(result) {
++                continue;
++            }
++            let non_self = incoming
++                .iter()
++                .filter(|(value, _)| value != result)
++                .map(|(value, _)| *value)
++                .collect::<Vec<_>>();
++            if non_self.is_empty() || !non_self.iter().any(|value| payloads.contains_key(value)) {
++                continue;
++            }
++            let words = PayloadWords {
++                low: ctx.module.fresh_id(),
++                high: ctx.module.fresh_id(),
++            };
++            record_payload(&mut payloads, *result, words)?;
++            phis.insert(
++                *result,
++                PhiPayload {
++                    result: *result,
++                    incoming: incoming.clone(),
++                    words,
++                },
++            );
++        }
+         if before == (payloads.len(), covered.len()) {
+             break;
+         }
+     }
+     let names = air_names(&ctx.module);
++    for select in selects.values() {
++        if !payloads.contains_key(&select.true_value) || !payloads.contains_key(&select.false_value)
++        {
++            return Err(format!(
++                "GPU argument select {} has an unresolved resource payload",
++                select.result
++            ));
++        }
++    }
++    for phi in phis.values() {
++        if phi
++            .incoming
++            .iter()
++            .any(|(value, _)| !payloads.contains_key(value))
++        {
++            return Err(format!(
++                "GPU argument phi {} has an unresolved resource payload",
++                phi.result
++            ));
++        }
++    }
++    for inst in &instructions {
++        let (Op::FunctionCall, Some(Operand::IdRef(callee))) =
++            (inst.class.opcode, inst.operands.first())
++        else {
++            continue;
++        };
++        let Some(name) = names.get(callee) else {
++            continue;
++        };
++        if !image_operation(name) {
++            continue;
++        }
++        for operand in inst.operands.iter().skip(1).take(2) {
++            let Operand::IdRef(handle) = operand else {
++                continue;
++            };
++            if !candidate_results.contains(handle) {
++                continue;
++            }
++            if !payloads.contains_key(handle)
++                || (!selects.contains_key(handle) && !phis.contains_key(handle))
++            {
++                return Err(format!(
++                    "GPU argument image merge {handle} has no complete resource payload"
++                ));
++            }
++        }
++    }
+     // Nullness belongs to the serialized handle, including fields that keep the static ABI.
+     for block in 0..ctx.module.functions[entry].blocks.len() {
+         let instructions = ctx.module.functions[entry].blocks[block]
+@@ -390,7 +706,7 @@
+                 }
+                 _ => None,
+             };
+-            if let Some(&(low, high)) = token {
++            if let Some(words) = token {
+                 let uint = ctx.ty_uint();
+                 let zero = ctx.const_uint(0);
+                 let words = value(
+@@ -398,7 +714,7 @@
+                     &mut body,
+                     Op::BitwiseOr,
+                     uint,
+-                    vec![Operand::IdRef(low), Operand::IdRef(high)],
++                    vec![Operand::IdRef(words.low), Operand::IdRef(words.high)],
+                 );
+                 body.push(Instruction::new(
+                     Op::IEqual,
+@@ -423,17 +739,185 @@
+     if ctx.descriptor_layout != crate::reflect::DescriptorLayout::default() {
+         return Err("GPU argument graphs require the default stage descriptor ABI".into());
+     }
++    let replaced_merges = selects
++        .keys()
++        .chain(phis.keys())
++        .copied()
++        .collect::<HashSet<_>>();
++    let uint = ctx.ty_uint();
++    let block_by_label = ctx.module.functions[entry]
++        .blocks
++        .iter()
++        .enumerate()
++        .filter_map(|(index, block)| {
++            block
++                .label
++                .as_ref()
++                .and_then(|label| label.result_id)
++                .map(|label| (label, index))
++        })
++        .collect::<HashMap<_, _>>();
++    let mut missing_phis = phis
++        .values()
++        .filter(|phi| !present_merge_results.contains(&phi.result))
++        .cloned()
++        .collect::<Vec<_>>();
++    missing_phis.sort_by_key(|phi| phi.result);
++    let mut pending_phi_by_block = HashMap::<usize, Vec<Instruction>>::new();
++    for phi in missing_phis {
++        let block = merge_blocks
++            .get(&phi.result)
++            .and_then(|label| block_by_label.get(label))
++            .copied()
++            .ok_or_else(|| {
++                format!(
++                    "GPU argument phi {} has no emitted block for its token materialization",
++                    phi.result
++                )
++            })?;
++        pending_phi_by_block
++            .entry(block)
++            .or_default()
++            .extend(word_phi(&phi, &payloads, uint));
++    }
++
++    let missing_selects = selects
++        .values()
++        .filter(|select| !present_merge_results.contains(&select.result))
++        .copied()
++        .collect::<Vec<_>>();
++    let missing_select_results = missing_selects
++        .iter()
++        .map(|select| select.result)
++        .collect::<HashSet<_>>();
++    let mut ordered_selects = Vec::with_capacity(missing_selects.len());
++    let mut ready_selects = HashSet::new();
++    let mut pending_selects = missing_selects;
++    while !pending_selects.is_empty() {
++        let before = pending_selects.len();
++        let mut index = 0;
++        while index < pending_selects.len() {
++            let select = pending_selects[index];
++            let dependencies_ready = [select.true_value, select.false_value]
++                .into_iter()
++                .filter(|value| missing_select_results.contains(value))
++                .all(|value| ready_selects.contains(&value));
++            if dependencies_ready {
++                ready_selects.insert(select.result);
++                ordered_selects.push(pending_selects.remove(index));
++            } else {
++                index += 1;
++            }
++        }
++        if pending_selects.len() == before {
++            // A scalar select cycle has no SSA definition order and is invalid source IR. Keep the
++            // remaining deterministic order so the owned module check reports the exact bad use.
++            ordered_selects.append(&mut pending_selects);
++        }
++    }
++    let mut pending_select_by_block = HashMap::<usize, HashMap<usize, Vec<Instruction>>>::new();
++    for select in ordered_selects {
++        let block = merge_blocks
++            .get(&select.result)
++            .and_then(|label| block_by_label.get(label))
++            .copied()
++            .ok_or_else(|| {
++                format!(
++                    "GPU argument select {} has no emitted block for its token materialization",
++                    select.result
++                )
++            })?;
++        let instructions = &ctx.module.functions[entry].blocks[block].instructions;
++        let terminator = instructions.len().checked_sub(1).ok_or_else(|| {
++            format!(
++                "GPU argument select {} has an empty emitted block",
++                select.result
++            )
++        })?;
++        let anchor = instructions
++            .iter()
++            .position(|instruction| {
++                instruction
++                    .operands
++                    .iter()
++                    .any(|operand| matches!(operand, Operand::IdRef(id) if *id == select.result))
++            })
++            .unwrap_or(terminator);
++        pending_select_by_block
++            .entry(block)
++            .or_default()
++            .entry(anchor)
++            .or_default()
++            .extend(word_select(&select, &payloads, uint));
++    }
++    for block in 0..ctx.module.functions[entry].blocks.len() {
++        let old = ctx.module.functions[entry].blocks[block]
++            .instructions
++            .clone();
++        let existing_phi_prefix = old
++            .iter()
++            .take_while(|instruction| instruction.class.opcode == Op::Phi)
++            .count();
++        let mut rebuilt = Vec::with_capacity(
++            old.len()
++                + pending_phi_by_block.get(&block).map_or(0, Vec::len)
++                + pending_select_by_block
++                    .get(&block)
++                    .map_or(0, |pending| pending.values().map(Vec::len).sum()),
++        );
++        for (index, inst) in old.into_iter().enumerate() {
++            if index == existing_phi_prefix {
++                if let Some(pending) = pending_phi_by_block.get(&block) {
++                    rebuilt.extend(pending.iter().cloned());
++                }
++            }
++            if let Some(pending) = pending_select_by_block
++                .get(&block)
++                .and_then(|pending| pending.get(&index))
++            {
++                rebuilt.extend(pending.iter().cloned());
++            }
++            if let Some(select) = inst.result_id.and_then(|id| selects.get(&id)).copied() {
++                rebuilt.extend(word_select(&select, &payloads, uint));
++                continue;
++            }
++            if let Some(phi) = inst.result_id.and_then(|id| phis.get(&id)).cloned() {
++                rebuilt.extend(word_phi(&phi, &payloads, uint));
++                continue;
++            }
++            rebuilt.push(inst);
++        }
++        ctx.module.functions[entry].blocks[block].instructions = rebuilt;
++    }
++    let rebuilt_results = ctx.module.functions[entry]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    let removed_results = entry_defined
++        .difference(&rebuilt_results)
++        .copied()
++        .collect::<HashSet<_>>();
++    ctx.module.debug_names.retain(|inst| {
++        !matches!(
++            inst.operands.first(),
++            Some(Operand::IdRef(id)) if removed_results.contains(id)
++        )
++    });
++    ctx.module.annotations.retain(|inst| {
++        !matches!(
++            inst.operands.first(),
++            Some(Operand::IdRef(id)) if removed_results.contains(id)
++        )
++    });
+     let defs = ctx
+         .module
+         .all_inst_iter()
+         .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+         .collect::<HashMap<_, _>>();
+     let mut shapes = HashMap::new();
+-    for inst in ctx.module.functions[entry]
+-        .blocks
+-        .iter()
+-        .flat_map(|block| &block.instructions)
+-    {
++    for inst in &instructions {
+         let (Op::FunctionCall, Some(Operand::IdRef(callee)), Some(Operand::IdRef(handle))) = (
+             inst.class.opcode,
+             inst.operands.first(),
+@@ -441,17 +925,95 @@
+         ) else {
+             continue;
+         };
+-        let (Some(name), Some(&token)) = (names.get(callee), payloads.get(handle)) else {
++        let (Some(name), Some(_)) = (names.get(callee), payloads.get(handle)) else {
+             continue;
+         };
+         if let Some(shape) = image_shape(name, inst, &defs)? {
+-            if shapes
+-                .insert(token, shape)
+-                .is_some_and(|previous| previous != shape)
+-            {
+-                return Err("conflicting image types for one GPU argument token".into());
++            record_shape(&mut shapes, *handle, shape)?;
++        }
++    }
++    loop {
++        let mut changed = false;
++        for &(id, source) in &copies {
++            if let Some(&shape) = shapes.get(&source) {
++                changed |= record_shape(&mut shapes, id, shape)?;
++            }
++            if let Some(&shape) = shapes.get(&id) {
++                changed |= record_shape(&mut shapes, source, shape)?;
++            }
++        }
++        for select in selects.values() {
++            let arm_shapes = (
++                shapes.get(&select.true_value),
++                shapes.get(&select.false_value),
++            );
++            if let (Some(&true_shape), Some(&false_shape)) = arm_shapes {
++                if true_shape != false_shape {
++                    return Err(format!(
++                        "GPU argument select {} merges incompatible image types",
++                        select.result
++                    ));
++                }
++                changed |= record_shape(&mut shapes, select.result, true_shape)?;
++            }
++            let Some(&result_shape) = shapes.get(&select.result) else {
++                continue;
++            };
++            for arm in [select.true_value, select.false_value] {
++                if shapes
++                    .get(&arm)
++                    .is_some_and(|arm_shape| *arm_shape != result_shape)
++                {
++                    return Err(format!(
++                        "GPU argument select {} merges incompatible image types",
++                        select.result
++                    ));
++                }
++                changed |= record_shape(&mut shapes, arm, result_shape)?;
+             }
+         }
++        for phi in phis.values() {
++            let incoming = phi
++                .incoming
++                .iter()
++                .filter(|(value, _)| *value != phi.result)
++                .map(|(value, _)| *value)
++                .collect::<Vec<_>>();
++            let incoming_shapes = incoming
++                .iter()
++                .map(|value| shapes.get(value).copied())
++                .collect::<Option<Vec<_>>>();
++            if let Some(incoming_shapes) = incoming_shapes {
++                let Some((&shape, rest)) = incoming_shapes.split_first() else {
++                    continue;
++                };
++                if rest.iter().any(|other| *other != shape) {
++                    return Err(format!(
++                        "GPU argument phi {} merges incompatible image types",
++                        phi.result
++                    ));
++                }
++                changed |= record_shape(&mut shapes, phi.result, shape)?;
++            }
++            let Some(&result_shape) = shapes.get(&phi.result) else {
++                continue;
++            };
++            for value in incoming {
++                if shapes
++                    .get(&value)
++                    .is_some_and(|incoming_shape| *incoming_shape != result_shape)
++                {
++                    return Err(format!(
++                        "GPU argument phi {} merges incompatible image types",
++                        phi.result
++                    ));
++                }
++                changed |= record_shape(&mut shapes, value, result_shape)?;
++            }
++        }
++        if !changed {
++            break;
++        }
+     }
+     let table = raw_buffer(ctx, super::gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING);
+     ctx.interface_buffer_var(table);
+@@ -479,17 +1041,17 @@
+                 _ => None,
+             };
+             if let Some(name) = name {
+-                if let (Some((field, mip)), Some(&token), Some(query_table)) = (
+-                    image_query(name),
+-                    inst.operands.get(1).and_then(|operand| match operand {
+-                        Operand::IdRef(id) => payloads.get(id),
+-                        _ => None,
+-                    }),
+-                    query_table,
+-                ) {
++                let query_handle = inst.operands.get(1).and_then(|operand| match operand {
++                    Operand::IdRef(id) => Some(*id),
++                    _ => None,
++                });
++                if let (Some((field, mip)), Some(handle), Some(query_table)) =
++                    (image_query(name), query_handle, query_table)
++                {
++                    let payload = payloads[&handle];
+                     let shape = super::super::air_calls::intrinsic_texture_shape(name)
+                         .ok_or("GPU argument image query has no known shape")?;
+-                    if shapes.get(&token).is_some_and(|typed| {
++                    if shapes.get(&handle).is_some_and(|typed| {
+                         (typed.dim, typed.arrayed) != shape
+                             || typed.depth
+                                 != super::discovery::texture_intrinsic_uses_depth_image(name)
+@@ -506,8 +1068,8 @@
+                         uint,
+                         vec![
+                             Operand::IdRef(lookup),
+-                            Operand::IdRef(token.0),
+-                            Operand::IdRef(token.1),
++                            Operand::IdRef(payload.low),
++                            Operand::IdRef(payload.high),
+                             Operand::IdRef(category),
+                         ],
+                     );
+@@ -526,16 +1088,10 @@
+                     let Some(Operand::IdRef(handle)) = inst.operands.get(position) else {
+                         continue;
+                     };
+-                    let Some(&(low, high)) = payloads.get(handle) else {
++                    let Some(words) = payloads.get(handle).copied() else {
+                         continue;
+                     };
+-                    let image_operation = sampled_operation(name)
+-                        || name.starts_with("air.read_texture")
+-                        || name.starts_with("air.read_depth")
+-                        || name.starts_with("air.write_texture")
+-                        || name.starts_with("air.get_")
+-                            && super::super::air_calls::intrinsic_texture_shape(name).is_some();
+-                    if !image_operation {
++                    if !image_operation(name) {
+                         continue;
+                     }
+                     let sampler = position == 2 && sampled_operation(name);
+@@ -545,7 +1101,7 @@
+                     let (category, element, shape) = if sampler {
+                         (2, ctx.ty_sampler(), None)
+                     } else {
+-                        let shape = *shapes.get(&(low, high)).ok_or(
++                        let shape = *shapes.get(handle).ok_or(
+                             "GPU argument image query has no established component/access type",
+                         )?;
+                         if lod_query(name) && (shape.storage || shape.multisampled) {
+@@ -605,8 +1161,8 @@
+                         uint,
+                         vec![
+                             Operand::IdRef(lookup),
+-                            Operand::IdRef(low),
+-                            Operand::IdRef(high),
++                            Operand::IdRef(words.low),
++                            Operand::IdRef(words.high),
+                             Operand::IdRef(category),
+                         ],
+                     );
+@@ -642,6 +1198,19 @@
+         }
+         ctx.module.functions[entry].blocks[block].instructions = body;
+     }
++    for inst in ctx.module.functions[entry]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++    {
++        if inst
++            .operands
++            .iter()
++            .any(|operand| matches!(operand, Operand::IdRef(id) if replaced_merges.contains(id)))
++        {
++            return Err("GPU argument resource merge still has a non-image consumer".into());
++        }
++    }
+     if !globals.is_empty() {
+         ctx.add_capability(Capability::RuntimeDescriptorArray);
+     }
+diff --git a/garnetxlate/tests/gpu_argument_graph_token_merge.rs b/garnetxlate/tests/gpu_argument_graph_token_merge.rs
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/gpu_argument_graph_token_merge.rs
+@@ -0,0 +1,165 @@
++use std::path::PathBuf;
++
++fn validate_and_disassemble(spv: &[u8], label: &str) -> String {
++    let directory = PathBuf::from(std::env::temp_dir())
++        .join(format!("rdna4-token-merge-{label}-{}", std::process::id()));
++    std::fs::create_dir_all(&directory).unwrap();
++    let path = directory.join("shader.spv");
++    std::fs::write(&path, spv).unwrap();
++    let validation = std::process::Command::new("spirv-val")
++        .args(["--target-env", "vulkan1.2"])
++        .arg(&path)
++        .output()
++        .unwrap();
++    assert!(
++        validation.status.success(),
++        "{}",
++        String::from_utf8_lossy(&validation.stderr)
++    );
++    let disassembly = std::process::Command::new("spirv-dis")
++        .arg(&path)
++        .output()
++        .unwrap();
++    assert!(
++        disassembly.status.success(),
++        "{}",
++        String::from_utf8_lossy(&disassembly.stderr)
++    );
++    std::fs::remove_dir_all(directory).unwrap();
++    String::from_utf8(disassembly.stdout).unwrap()
++}
++
++fn entry_function_body(assembly: &str) -> &str {
++    let entry_id = assembly
++        .lines()
++        .find(|line| line.trim_start().starts_with("OpEntryPoint "))
++        .and_then(|line| line.split_whitespace().nth(2))
++        .unwrap_or_else(|| panic!("entry point missing:\n{assembly}"));
++    let function = format!("{entry_id} = OpFunction");
++    let start = assembly
++        .find(&function)
++        .unwrap_or_else(|| panic!("entry function missing:\n{assembly}"));
++    let rest = &assembly[start..];
++    let end = rest
++        .find("OpFunctionEnd")
++        .unwrap_or_else(|| panic!("entry function end missing:\n{assembly}"));
++    &rest[..end]
++}
++
++fn has_call_consuming_merge_pair(entry: &str, opcode: &str, ty: &str) -> bool {
++    let mut defs = Vec::<(&str, Option<&str>)>::new();
++    for line in entry.lines() {
++        let fields = line.split_whitespace().collect::<Vec<_>>();
++        if fields.get(1) == Some(&"=")
++            && fields.get(2) == Some(&opcode)
++            && fields.get(3) == Some(&ty)
++        {
++            defs.push((fields[0], fields.get(4).copied()));
++        }
++    }
++    entry.lines().any(|line| {
++        let fields = line.split_whitespace().collect::<Vec<_>>();
++        if !fields.contains(&"OpFunctionCall") || fields.len() < 6 {
++            return false;
++        }
++        let call_operands = &fields[5..];
++        let used = defs
++            .iter()
++            .filter(|(result, _)| call_operands.contains(result))
++            .collect::<Vec<_>>();
++        if opcode == "OpSelect" {
++            used.iter().enumerate().any(|(index, (_, condition))| {
++                used[index + 1..]
++                    .iter()
++                    .any(|(_, other)| condition.is_some() && condition == other)
++            })
++        } else {
++            used.len() >= 2
++        }
++    })
++}
++
++fn has_uint_select_pair_with_one_condition(entry: &str) -> bool {
++    let mut conditions = Vec::<&str>::new();
++    for line in entry.lines() {
++        let fields = line.split_whitespace().collect::<Vec<_>>();
++        if fields.get(1) == Some(&"=")
++            && fields.get(2) == Some(&"OpSelect")
++            && fields.get(3) == Some(&"%uint")
++        {
++            let condition = fields[4];
++            if conditions.contains(&condition) {
++                return true;
++            }
++            conditions.push(condition);
++        }
++    }
++    false
++}
++
++#[test]
++fn token_select_uses_two_uint_words() {
++    let source = include_str!("fixtures/argument_graph_token_select.ll");
++    let (spv, metadata) = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap();
++    let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
++    assert_eq!(
++        metadata["argument_resource_tables"]["categories"],
++        serde_json::json!([0, 2])
++    );
++    let assembly = validate_and_disassemble(&spv, "select");
++    let entry = entry_function_body(&assembly);
++    assert!(
++        has_call_consuming_merge_pair(entry, "OpSelect", "%uint"),
++        "{assembly}"
++    );
++    assert!(assembly.contains("OpSampledImage"), "{assembly}");
++    assert!(assembly.contains("DescriptorSet 2"), "{assembly}");
++}
++
++#[test]
++fn token_loop_fixed_point_materializes_texture_phi() {
++    let source = include_str!("fixtures/argument_graph_token_loop.ll");
++    let (spv, _) = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap();
++    let assembly = validate_and_disassemble(&spv, "loop");
++    let entry = entry_function_body(&assembly);
++    assert!(has_uint_select_pair_with_one_condition(entry), "{assembly}");
++    assert!(
++        has_call_consuming_merge_pair(entry, "OpPhi", "%uint"),
++        "{assembly}"
++    );
++    assert!(assembly.contains("OpSampledImage"), "{assembly}");
++}
++
++#[test]
++fn token_helper_parameter_and_return_are_inlined_before_payload_merge() {
++    let source = include_str!("fixtures/argument_graph_token_helper.ll");
++    let (spv, _) = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap();
++    let assembly = validate_and_disassemble(&spv, "helper");
++    assert!(!assembly.contains("pick_texture"), "{assembly}");
++    let entry = entry_function_body(&assembly);
++    assert!(
++        has_call_consuming_merge_pair(entry, "OpSelect", "%uint"),
++        "{assembly}"
++    );
++    assert!(assembly.contains("OpSampledImage"), "{assembly}");
++}
++
++#[test]
++fn token_select_rejects_result_shape_conflicting_with_an_arm() {
++    let source = include_str!("fixtures/argument_graph_token_select_shape_mismatch.ll");
++    let error = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap_err();
++    assert!(
++        error.contains("select") && error.contains("merges incompatible image types"),
++        "{error}"
++    );
++}
++
++#[test]
++fn token_phi_rejects_incompatible_incoming_image_types() {
++    let source = include_str!("fixtures/argument_graph_token_phi_shape_mismatch.ll");
++    let error = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap_err();
++    assert!(
++        error.contains("phi") && error.contains("merges incompatible image types"),
++        "{error}"
++    );
++}
+diff --git a/garnetxlate/tests/fixtures/argument_graph_token_select.ll b/garnetxlate/tests/fixtures/argument_graph_token_select.ll
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_graph_token_select.ll
+@@ -0,0 +1,48 @@
++; Authored select between two argument-buffer texture tokens.
++target triple = "air64-apple-macosx"
++%Root = type { ptr addrspace(2) }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2) }
++
++define void @select_graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %index0 = and i32 %i, 1
++  %index1 = xor i32 %index0, 1
++  %index0_64 = zext i32 %index0 to i64
++  %index1_64 = zext i32 %index1 to i64
++  %image0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index0_64
++  %image1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index1_64
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1
++  %token0 = load i64, ptr addrspace(2) %image0_slot, align 8
++  %token1 = load i64, ptr addrspace(2) %image1_slot, align 8
++  %image0 = inttoptr i64 %token0 to ptr addrspace(1)
++  %image1 = inttoptr i64 %token1 to ptr addrspace(1)
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %sample0 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image0, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %sample1 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image1, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba0 = extractvalue { <4 x float>, i8 } %sample0, 0
++  %rgba1 = extractvalue { <4 x float>, i8 } %sample1, 0
++  %red0 = extractelement <4 x float> %rgba0, i32 0
++  %red1 = extractelement <4 x float> %rgba1, i32 0
++  %arm_sum = fadd float %red0, %red1
++  %odd = and i32 %i, 1
++  %condition = icmp ne i32 %odd, 0
++  %image = select i1 %condition, ptr addrspace(1) %image0, ptr addrspace(1) %image1
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  %combined = fadd float %red, %arm_sum
++  store float %combined, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @select_graph, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+diff --git a/garnetxlate/tests/fixtures/argument_graph_token_loop.ll b/garnetxlate/tests/fixtures/argument_graph_token_loop.ll
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_graph_token_loop.ll
+@@ -0,0 +1,64 @@
++; Authored loop recurrence between an image token phi and a token select.
++target triple = "air64-apple-macosx"
++%Root = type { ptr addrspace(2) }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2) }
++
++define void @loop_graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %n) {
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %index0 = and i32 %n, 1
++  %index1 = xor i32 %index0, 1
++  %index0_64 = zext i32 %index0 to i64
++  %index1_64 = zext i32 %index1 to i64
++  %image0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index0_64
++  %image1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index1_64
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1
++  %token0 = load i64, ptr addrspace(2) %image0_slot, align 8
++  %token1 = load i64, ptr addrspace(2) %image1_slot, align 8
++  %image0 = inttoptr i64 %token0 to ptr addrspace(1)
++  %image1 = inttoptr i64 %token1 to ptr addrspace(1)
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %sample0 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image0, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %sample1 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image1, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba0 = extractvalue { <4 x float>, i8 } %sample0, 0
++  %rgba1 = extractvalue { <4 x float>, i8 } %sample1, 0
++  %red0 = extractelement <4 x float> %rgba0, i32 0
++  %red1 = extractelement <4 x float> %rgba1, i32 0
++  %sum = fadd float %red0, %red1
++  br label %loop
++
++loop:
++  %index = phi i32 [ 0, %entry ], [ %next_index, %loop ]
++  %image = phi ptr addrspace(1) [ %image0, %entry ], [ %next_image, %loop ]
++  %accumulator = phi float [ 0.0, %entry ], [ %next_accumulator, %loop ]
++  %odd = and i32 %index, 1
++  %take_second = icmp ne i32 %odd, 0
++  %next_image = select i1 %take_second, ptr addrspace(1) %image1, ptr addrspace(1) %image
++  %next_accumulator = fadd float %accumulator, %sum
++  %next_index = add i32 %index, 1
++  %more = icmp ult i32 %next_index, %n
++  br i1 %more, label %loop, label %exit
++
++exit:
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  %first = insertelement <4 x float> zeroinitializer, float %red, i32 0
++  %second = insertelement <4 x float> %first, float %accumulator, i32 1
++  %third = insertelement <4 x float> %second, float %red0, i32 2
++  %fourth = insertelement <4 x float> %third, float %red1, i32 3
++  %result = extractelement <4 x float> %fourth, i32 0
++  store float %result, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @loop_graph, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+diff --git a/garnetxlate/tests/fixtures/argument_graph_token_helper.ll b/garnetxlate/tests/fixtures/argument_graph_token_helper.ll
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_graph_token_helper.ll
+@@ -0,0 +1,54 @@
++; Authored helper parameter and return propagation for opaque texture tokens.
++target triple = "air64-apple-macosx"
++%Root = type { ptr addrspace(2) }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2) }
++
++define internal ptr addrspace(1) @pick_texture(ptr addrspace(1) %left, ptr addrspace(1) %right, i1 %take_right) {
++entry:
++  %selected = select i1 %take_right, ptr addrspace(1) %right, ptr addrspace(1) %left
++  ret ptr addrspace(1) %selected
++}
++
++define void @helper_graph(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %index0 = and i32 %i, 1
++  %index1 = xor i32 %index0, 1
++  %index0_64 = zext i32 %index0 to i64
++  %index1_64 = zext i32 %index1 to i64
++  %image0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index0_64
++  %image1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index1_64
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1
++  %token0 = load i64, ptr addrspace(2) %image0_slot, align 8
++  %token1 = load i64, ptr addrspace(2) %image1_slot, align 8
++  %image0 = inttoptr i64 %token0 to ptr addrspace(1)
++  %image1 = inttoptr i64 %token1 to ptr addrspace(1)
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %sample0 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image0, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %sample1 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image1, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba0 = extractvalue { <4 x float>, i8 } %sample0, 0
++  %rgba1 = extractvalue { <4 x float>, i8 } %sample1, 0
++  %red0 = extractelement <4 x float> %rgba0, i32 0
++  %red1 = extractelement <4 x float> %rgba1, i32 0
++  %arm_sum = fadd float %red0, %red1
++  %odd = and i32 %i, 1
++  %take_second = icmp ne i32 %odd, 0
++  %image = call ptr addrspace(1) @pick_texture(ptr addrspace(1) %image0, ptr addrspace(1) %image1, i1 %take_second)
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  %combined = fadd float %red, %arm_sum
++  store float %combined, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @helper_graph, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+diff --git a/garnetxlate/tests/fixtures/argument_graph_token_select_shape_mismatch.ll b/garnetxlate/tests/fixtures/argument_graph_token_select_shape_mismatch.ll
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_graph_token_select_shape_mismatch.ll
+@@ -0,0 +1,49 @@
++; Authored mismatch where the selected token's sampled shape must constrain an arm.
++target triple = "air64-apple-macosx"
++%Root = type { ptr addrspace(2) }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2) }
++
++define void @select_shape_mismatch(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %index0 = and i32 %i, 1
++  %index1 = xor i32 %index0, 1
++  %index0_64 = zext i32 %index0 to i64
++  %index1_64 = zext i32 %index1 to i64
++  %image0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index0_64
++  %image1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index1_64
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1
++  %token0 = load i64, ptr addrspace(2) %image0_slot, align 8
++  %token1 = load i64, ptr addrspace(2) %image1_slot, align 8
++  %image0 = inttoptr i64 %token0 to ptr addrspace(1)
++  %image1 = inttoptr i64 %token1 to ptr addrspace(1)
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %odd = and i32 %i, 1
++  %take_second = icmp ne i32 %odd, 0
++  %width1 = call i32 @air.get_width_texture_2d(ptr addrspace(1) %image1, i32 0)
++  %width_present = icmp ne i32 %width1, 0
++  %condition = or i1 %take_second, %width_present
++  %sample0 = call { <4 x float>, i8 } @air.sample_texture_3d.v4f32(ptr addrspace(1) %image0, ptr addrspace(2) %sampler, <3 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba0 = extractvalue { <4 x float>, i8 } %sample0, 0
++  %red0 = extractelement <4 x float> %rgba0, i32 0
++  %image = select i1 %condition, ptr addrspace(1) %image0, ptr addrspace(1) %image1
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  %combined = fadd float %red, %red0
++  store float %combined, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { <4 x float>, i8 } @air.sample_texture_3d.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @select_shape_mismatch, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+diff --git a/garnetxlate/tests/fixtures/argument_graph_token_phi_shape_mismatch.ll b/garnetxlate/tests/fixtures/argument_graph_token_phi_shape_mismatch.ll
+new file mode 100644
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_graph_token_phi_shape_mismatch.ll
+@@ -0,0 +1,65 @@
++; Authored loop phi whose incoming texture shapes disagree.
++target triple = "air64-apple-macosx"
++%Root = type { ptr addrspace(2) }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2) }
++
++define void @phi_shape_mismatch(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %n) {
++entry:
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
++  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
++  %index0 = and i32 %n, 1
++  %index1 = xor i32 %index0, 1
++  %index0_64 = zext i32 %index0 to i64
++  %index1_64 = zext i32 %index1 to i64
++  %image0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index0_64
++  %image1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0, i64 %index1_64
++  %sampler_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1
++  %token0 = load i64, ptr addrspace(2) %image0_slot, align 8
++  %token1 = load i64, ptr addrspace(2) %image1_slot, align 8
++  %image0 = inttoptr i64 %token0 to ptr addrspace(1)
++  %image1 = inttoptr i64 %token1 to ptr addrspace(1)
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %sample0 = call { <4 x float>, i8 } @air.sample_texture_3d.v4f32(ptr addrspace(1) %image0, ptr addrspace(2) %sampler, <3 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %sample1 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image1, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba0 = extractvalue { <4 x float>, i8 } %sample0, 0
++  %rgba1 = extractvalue { <4 x float>, i8 } %sample1, 0
++  %red0 = extractelement <4 x float> %rgba0, i32 0
++  %red1 = extractelement <4 x float> %rgba1, i32 0
++  %sum = fadd float %red0, %red1
++  br label %loop
++
++loop:
++  %index = phi i32 [ 0, %entry ], [ %next_index, %loop ]
++  %image = phi ptr addrspace(1) [ %image0, %entry ], [ %next_image, %loop ]
++  %accumulator = phi float [ 0.0, %entry ], [ %next_accumulator, %loop ]
++  %odd = and i32 %index, 1
++  %take_second = icmp ne i32 %odd, 0
++  %next_image = select i1 %take_second, ptr addrspace(1) %image1, ptr addrspace(1) %image
++  %next_accumulator = fadd float %accumulator, %sum
++  %next_index = add i32 %index, 1
++  %more = icmp ult i32 %next_index, %n
++  br i1 %more, label %loop, label %exit
++
++exit:
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  %first = insertelement <4 x float> zeroinitializer, float %red, i32 0
++  %second = insertelement <4 x float> %first, float %accumulator, i32 1
++  %third = insertelement <4 x float> %second, float %red0, i32 2
++  %fourth = insertelement <4 x float> %third, float %red1, i32 3
++  %result = extractelement <4 x float> %fourth, i32 0
++  store float %result, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { <4 x float>, i8 } @air.sample_texture_3d.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @phi_shape_mismatch, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}

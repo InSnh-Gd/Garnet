@@ -1,0 +1,718 @@
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -89,6 +89,9 @@
+     /// This is a source-language fact, not the weaker subgroup-scope assertion expressed by the
+     /// SPIR-V `Uniform` decoration. Consumers must not infer it from decorations or names.
+     pub(crate) uniform_value_facts: Vec<UniformValueFact>,
++    /// Direct constant-buffer pointers or physical base addresses, identical for the entry's
++    /// derivative group. Addresses loaded from buffer contents never establish this provenance.
++    pub(crate) readonly_uniform_addresses: Vec<UniformValueFact>,
+ }
+ 
+ #[derive(Debug)]
+@@ -417,7 +420,11 @@
+             replace(&mut fact.aggregate);
+             replace(&mut fact.source);
+         }
+-        for fact in &mut self.uniform_value_facts {
++        for fact in self
++            .uniform_value_facts
++            .iter_mut()
++            .chain(&mut self.readonly_uniform_addresses)
++        {
+             replace(&mut fact.function);
+             replace(&mut fact.value);
+         }
+@@ -950,6 +957,10 @@
+             uniform_value_facts: vec![UniformValueFact {
+                 function: 45,
+                 value: 46,
++            }],
++            readonly_uniform_addresses: vec![UniformValueFact {
++                function: 45,
++                value: 52,
+             }],
+             aliased_imageblock_staging: Some(51),
+         };
+@@ -1071,6 +1082,8 @@
+         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].id, 140);
+         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].root, 141);
+         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].index, 142);
++        assert_eq!(sidecar.readonly_uniform_addresses[0].function, 145);
++        assert_eq!(sidecar.readonly_uniform_addresses[0].value, 152);
+         assert_eq!(sidecar.aliased_imageblock_staging, Some(151));
+     }
+ }
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -1587,13 +1587,24 @@
+                 // same input. Order by the entry parameter ordinal instead: it is stable, and it is
+                 // the order a reader expects the prologue to be in.
+                 direct_buffers.sort_unstable();
+-                for (_, name) in direct_buffers {
++                for (param_index, name) in direct_buffers {
+                     let (low, high) =
+                         self.emit_direct_buffer_address_payload(&name, &mut instructions)?;
+                     let address =
+                         self.combine_pointer_payload_words(low, high, &mut instructions)?;
+                     self.pointer_payload_words.insert(name.clone(), (low, high));
+                     self.bda_direct_addresses.insert(name.clone(), address);
++                    if f.params
++                        .get(param_index as usize)
++                        .is_some_and(|(_, ty)| matches!(ty, LlType::Ptr(2)))
++                    {
++                        self.emit_sidecar.readonly_uniform_addresses.push(
++                            crate::emit_sidecar::UniformValueFact {
++                                function: func_id,
++                                value: address,
++                            },
++                        );
++                    }
+                     if self.large_buffer_addressing
+                         && self
+                             .large_buffer_roots
+--- a/src/passes/resources/buffer_addresses.rs
++++ b/src/passes/resources/buffer_addresses.rs
+@@ -137,6 +137,15 @@
+         .find(|binding| !occupied.contains(binding))
+         .ok_or_else(|| "descriptor binding space exhausted for buffer-address table".to_string())?;
+     decorate_binding(&mut ctx.module, table, layout.set, binding);
++    ctx.module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(table),
++            Operand::Decoration(Decoration::NonWritable),
++        ],
++    ));
+     ctx.interface_buffer_var(table);
+ 
+     let zero = ctx.const_uint(0);
+--- a/src/passes/resources/fragment_control.rs
++++ b/src/passes/resources/fragment_control.rs
+@@ -33,6 +33,7 @@
+     /// Indexed by the function's original `Block` position.
+     status: Vec<ControlStatus>,
+     calls: Vec<CallSite>,
++    uniform_values: HashSet<Word>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -42,6 +43,14 @@
+ }
+ 
+ impl FragmentControl {
++    /// Whether a value is equal within the derivative group at this function's uniform instances.
++    /// Callers must separately require `status(function, block) == Uniform` at the use site.
++    pub(in crate::passes) fn value_is_uniform(&self, function: usize, value: Word) -> bool {
++        self.functions
++            .get(&function)
++            .is_some_and(|control| control.uniform_values.contains(&value))
++    }
++
+     pub(in crate::passes) fn status(&self, function: usize, block: usize) -> ControlStatus {
+         self.functions
+             .get(&function)
+@@ -228,6 +237,14 @@
+             .push(fact.value);
+     }
+ 
++    let mut readonly_by_function: HashMap<Word, Vec<Word>> = HashMap::new();
++    for fact in &ctx.emit_sidecar.readonly_uniform_addresses {
++        readonly_by_function
++            .entry(fact.function)
++            .or_default()
++            .push(fact.value);
++    }
++
+     // Discover the executable function closure from all selected roots. A callee remains
+     // context-sensitive only at the granularity of "every reachable call site executes in a
+     // uniform context"; a helper called from both uniform and nonuniform sites is therefore not
+@@ -252,6 +269,10 @@
+                 .get(&function_id)
+                 .map(Vec::as_slice)
+                 .unwrap_or(&[]),
++            readonly_by_function
++                .get(&function_id)
++                .map(Vec::as_slice)
++                .unwrap_or(&[]),
+             &ctx.module,
+             &HashSet::new(),
+         )?;
+@@ -289,6 +310,10 @@
+                     .get(&function_id)
+                     .map(Vec::as_slice)
+                     .unwrap_or(&[]),
++                readonly_by_function
++                    .get(&function_id)
++                    .map(Vec::as_slice)
++                    .unwrap_or(&[]),
+                 &ctx.module,
+                 &HashSet::new(),
+             )?;
+@@ -340,6 +365,10 @@
+                 .get(&function_id)
+                 .map(Vec::as_slice)
+                 .unwrap_or(&[]),
++            readonly_by_function
++                .get(&function_id)
++                .map(Vec::as_slice)
++                .unwrap_or(&[]),
+             &ctx.module,
+             &effectful,
+         )?;
+@@ -375,6 +404,7 @@
+     function: &Function,
+     function_id: Word,
+     asserted_uniform: &[Word],
++    readonly_addresses: &[Word],
+     module: &Module,
+     effectful_callees: &HashSet<Word>,
+ ) -> Result<FunctionControl, String> {
+@@ -474,11 +504,15 @@
+         .collect::<Vec<_>>();
+ 
+     let (_, postdominators, _) = reverse_post_dominance(&dense_successors);
+-    let mut uniform_phi_predecessors = HashSet::new();
+-    let nonuniform = loop {
++    let mut uniform_phi_predecessors = order
++        .iter()
++        .filter_map(|&block| function.blocks[block].label.as_ref()?.result_id)
++        .collect::<HashSet<_>>();
++    let (nonuniform, uniform_values) = loop {
+         let uniform_values = uniform_values(
+             function,
+             asserted_uniform,
++            readonly_addresses,
+             module,
+             &uniform_phi_predecessors,
+         );
+@@ -530,13 +564,13 @@
+             }
+         }
+ 
+-        // Different uniform incoming values form a uniform phi only when every incoming edge
+-        // executes uniformly. Start without that assumption and grow the proof to a fixed point.
++        // Loop-carried pure values and their control edges prove each other inductively. Begin
++        // with candidate edges, then remove any proof that depends on varying data or control.
+         let before = uniform_phi_predecessors.len();
+         for (node, &block) in order.iter().enumerate() {
+-            if !nonuniform[node] {
+-                uniform_phi_predecessors.insert(
+-                    function.blocks[block]
++            if nonuniform[node] {
++                uniform_phi_predecessors.remove(
++                    &function.blocks[block]
+                         .label
+                         .as_ref()
+                         .unwrap()
+@@ -546,7 +580,7 @@
+             }
+         }
+         if uniform_phi_predecessors.len() == before {
+-            break nonuniform;
++            break (nonuniform, uniform_values);
+         }
+     };
+ 
+@@ -627,7 +661,11 @@
+                 })
+         })
+         .collect();
+-    Ok(FunctionControl { status, calls })
++    Ok(FunctionControl {
++        status,
++        calls,
++        uniform_values,
++    })
+ }
+ 
+ fn function_has_local_exit_effect(function: &Function, status: &[ControlStatus]) -> bool {
+@@ -685,66 +723,158 @@
+ fn uniform_values(
+     function: &Function,
+     asserted_uniform: &[Word],
++    readonly_addresses: &[Word],
+     module: &Module,
+     uniform_phi_predecessors: &HashSet<Word>,
+ ) -> HashSet<Word> {
+-    let mut uniform = module
++    let mut roots = module
+         .types_global_values
+         .iter()
+         .filter(|instruction| is_uniform_constant(instruction.class.opcode))
+         .filter_map(|instruction| instruction.result_id)
+         .collect::<HashSet<_>>();
+-    uniform.extend(asserted_uniform.iter().copied());
+-
+-    let mut uniform_input_pointers = flat_or_primitive_input_variables(module);
++    roots.extend(asserted_uniform.iter().copied());
++    roots.extend(readonly_addresses.iter().copied());
++    let mut uniform = roots.clone();
++    uniform.extend(
++        function
++            .blocks
++            .iter()
++            .flat_map(|block| &block.instructions)
++            .filter_map(|instruction| instruction.result_id),
++    );
++
++    let mut flat_pointers = flat_or_primitive_input_variables(module);
++    flat_pointers.extend(readonly_addresses.iter().copied());
++    let nonwritable = module
++        .annotations
++        .iter()
++        .filter_map(|annotation| match annotation.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::NonWritable)] => Some(*id),
++            _ => None,
++        })
++        .collect::<HashSet<_>>();
++    flat_pointers.extend(module.types_global_values.iter().filter_map(|instruction| {
++        (instruction.class.opcode == Op::Variable
++            && (matches!(
++                instruction.operands.first(),
++                Some(Operand::StorageClass(
++                    StorageClass::Uniform
++                        | StorageClass::PushConstant
++                        | StorageClass::UniformConstant
++                ))
++            ) || (instruction.operands.first()
++                == Some(&Operand::StorageClass(StorageClass::StorageBuffer))
++                && instruction
++                    .result_id
++                    .is_some_and(|id| nonwritable.contains(&id)))))
++        .then_some(instruction.result_id)
++        .flatten()
++    }));
++    let mut readonly_integer_addresses = readonly_addresses.iter().copied().collect::<HashSet<_>>();
++    readonly_integer_addresses.extend(
++        function
++            .blocks
++            .iter()
++            .flat_map(|block| &block.instructions)
++            .filter_map(|instruction| {
++                matches!(
++                    instruction.class.opcode,
++                    Op::IAdd | Op::ISub | Op::CopyObject | Op::Bitcast | Op::Select | Op::Phi
++                )
++                .then_some(instruction.result_id)
++                .flatten()
++            }),
++    );
++    let mut uniform_input_pointers = flat_pointers.clone();
++    uniform_input_pointers.extend(
++        function
++            .blocks
++            .iter()
++            .flat_map(|block| &block.instructions)
++            .filter_map(|instruction| {
++                matches!(
++                    instruction.class.opcode,
++                    Op::AccessChain
++                        | Op::InBoundsAccessChain
++                        | Op::PtrAccessChain
++                        | Op::ConvertUToPtr
++                        | Op::CopyObject
++                        | Op::Bitcast
++                )
++                .then_some(instruction.result_id)
++                .flatten()
++            }),
++    );
+     loop {
+         let before = uniform.len();
+         let pointers_before = uniform_input_pointers.len();
++        let addresses_before = readonly_integer_addresses.len();
+         for block in &function.blocks {
+             for instruction in &block.instructions {
+                 let Some(result) = instruction.result_id else {
+                     continue;
+                 };
+-                match instruction.class.opcode {
++                let all_uniform = || {
++                    instruction.operands.iter().all(|operand| match operand {
++                        Operand::IdRef(id) => uniform.contains(id),
++                        _ => true,
++                    })
++                };
++                let pointer = instruction.operands.first().is_some_and(|operand| {
++                    matches!(operand, Operand::IdRef(id) if uniform_input_pointers.contains(id))
++                });
++                let readonly_address_operand = |operand: &Operand| matches!(operand, Operand::IdRef(id) if readonly_integer_addresses.contains(id));
++                let address_proof = match instruction.class.opcode {
++                    Op::IAdd => {
++                        instruction.operands.iter().any(readonly_address_operand) && all_uniform()
++                    }
++                    Op::ISub | Op::CopyObject | Op::Bitcast => {
++                        instruction
++                            .operands
++                            .first()
++                            .is_some_and(readonly_address_operand)
++                            && all_uniform()
++                    }
++                    Op::Select => {
++                        instruction
++                            .operands
++                            .iter()
++                            .skip(1)
++                            .all(readonly_address_operand)
++                            && all_uniform()
++                    }
++                    Op::Phi => {
++                        instruction
++                            .operands
++                            .chunks_exact(2)
++                            .all(|pair| pair.first().is_some_and(readonly_address_operand))
++                            && uniform.contains(&result)
++                    }
++                    _ => false,
++                };
++                let (value_proof, pointer_proof) = match instruction.class.opcode {
+                     Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
+-                        let Some(Operand::IdRef(base)) = instruction.operands.first() else {
+-                            continue;
+-                        };
+-                        if uniform_input_pointers.contains(base)
+-                            && instruction
++                        let indices_uniform =
++                            instruction
+                                 .operands
+                                 .iter()
+                                 .skip(1)
+-                                .filter_map(|operand| match operand {
+-                                    Operand::IdRef(id) => Some(*id),
+-                                    _ => None,
+-                                })
+-                                .all(|id| uniform.contains(&id))
+-                        {
+-                            uniform_input_pointers.insert(result);
+-                            uniform.insert(result);
+-                        }
++                                .all(|operand| match operand {
++                                    Operand::IdRef(id) => uniform.contains(id),
++                                    _ => true,
++                                });
++                        (pointer && indices_uniform, pointer && indices_uniform)
+                     }
+-                    Op::CopyObject | Op::Bitcast => {
+-                        if instruction.operands.iter().all(|operand| match operand {
+-                            Operand::IdRef(id) => uniform.contains(id),
+-                            _ => true,
+-                        }) {
+-                            uniform.insert(result);
+-                        }
+-                        if instruction.operands.first().is_some_and(|operand| {
+-                            matches!(operand, Operand::IdRef(id) if uniform_input_pointers.contains(id))
+-                        }) {
+-                            uniform_input_pointers.insert(result);
+-                        }
++                    Op::ConvertUToPtr => {
++                        let readonly = instruction
++                            .operands
++                            .first()
++                            .is_some_and(readonly_address_operand);
++                        (all_uniform(), readonly && all_uniform())
+                     }
+-                    Op::Load => {
+-                        if instruction.operands.first().is_some_and(|operand| {
+-                            matches!(operand, Operand::IdRef(id) if uniform_input_pointers.contains(id))
+-                        }) {
+-                            uniform.insert(result);
+-                        }
+-                    }
++                    Op::CopyObject | Op::Bitcast => (all_uniform(), pointer),
++                    Op::Load => (pointer, false),
+                     Op::Phi => {
+                         let sources = instruction
+                             .operands
+@@ -754,37 +884,38 @@
+                                 _ => None,
+                             })
+                             .collect::<Vec<_>>();
+-                        let same_source = sources.first().is_some_and(|first| {
+-                            sources.iter().all(|source| source == first)
+-                        });
++                        let same_source = sources
++                            .first()
++                            .is_some_and(|first| sources.iter().all(|source| source == first));
+                         let uniform_edges = instruction.operands.chunks_exact(2).all(|pair| {
+                             matches!(pair.get(1), Some(Operand::IdRef(label))
+                                 if uniform_phi_predecessors.contains(label))
+                         });
+-                        if !sources.is_empty()
+-                            && sources.iter().all(|id| uniform.contains(id))
+-                            && (same_source || uniform_edges)
+-                        {
+-                            uniform.insert(result);
+-                        }
++                        (
++                            !sources.is_empty()
++                                && sources.iter().all(|id| uniform.contains(id))
++                                && (same_source || uniform_edges),
++                            false,
++                        )
+                     }
+-                    op if is_uniform_preserving_operation(op)
+-                        && instruction
+-                            .operands
+-                            .iter()
+-                            .filter_map(|operand| match operand {
+-                                Operand::IdRef(id) => Some(*id),
+-                                _ => None,
+-                            })
+-                            .all(|id| uniform.contains(&id)) =>
+-                    {
+-                        uniform.insert(result);
+-                    }
+-                    _ => {}
++                    op if is_uniform_preserving_operation(op) => (all_uniform(), false),
++                    _ => (false, false),
++                };
++                if !value_proof && !roots.contains(&result) {
++                    uniform.remove(&result);
++                }
++                if !address_proof && !readonly_addresses.contains(&result) {
++                    readonly_integer_addresses.remove(&result);
++                }
++                if !pointer_proof && !flat_pointers.contains(&result) {
++                    uniform_input_pointers.remove(&result);
+                 }
+             }
+         }
+-        if uniform.len() == before && uniform_input_pointers.len() == pointers_before {
++        if uniform.len() == before
++            && uniform_input_pointers.len() == pointers_before
++            && readonly_integer_addresses.len() == addresses_before
++        {
+             break;
+         }
+     }
+@@ -1325,6 +1456,63 @@
+     }
+ 
+     #[test]
++    fn unannotated_loop_induction_is_uniform_only_with_uniform_bound_and_step() {
++        for (bound, step, expected) in [
++            ("%float_2", "%float_1", ControlStatus::Uniform),
++            ("%float_2", "%flat", ControlStatus::Uniform),
++            ("%varying", "%float_1", ControlStatus::NonUniform),
++            ("%float_2", "%varying", ControlStatus::NonUniform),
++        ] {
++            let Some(module) = assemble(&format!(
++                "{PREAMBLE}
++OpName %body \"body\"
++OpName %iteration \"iteration\"
++OpName %accumulated \"accumulated\"
++%float_1 = OpConstant %float 1
++%float_2 = OpConstant %float 2
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%pos = OpLoad %v4float %position
++%varying = OpCompositeExtract %float %pos 0
++%flat = OpLoad %float %flat_input
++OpBranch %header
++%header = OpLabel
++%iteration = OpPhi %float %float_0 %entry %next %continue
++%accumulated = OpPhi %float %float_0 %entry %varying %continue
++%again = OpFOrdLessThan %bool %iteration {bound}
++OpLoopMerge %merge %continue None
++OpBranchConditional %again %body %merge
++%body = OpLabel
++OpBranch %continue
++%continue = OpLabel
++%next = OpFAdd %float %iteration {step}
++OpBranch %header
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++            )) else {
++                return;
++            };
++            let main = named_id(&module, "entry");
++            let body = named_id(&module, "body");
++            let control = analyze_module(module.clone(), &[]);
++            assert_eq!(
++                status(&control, &module, main, body),
++                expected,
++                "bound={bound}, step={step}"
++            );
++            let function = function_index(&module, main);
++            assert!(!control.value_is_uniform(function, named_id(&module, "accumulated")));
++            assert_eq!(
++                control.value_is_uniform(function, named_id(&module, "iteration")),
++                expected == ControlStatus::Uniform,
++                "bound={bound}, step={step}"
++            );
++        }
++    }
++
++    #[test]
+     fn nonuniform_demote_taints_the_reconverged_continuation() {
+         let Some(module) = assemble(&format!(
+             "{PREAMBLE}
+--- a/src/passes/resources/quad_sampling.rs
++++ b/src/passes/resources/quad_sampling.rs
+@@ -34,17 +34,66 @@
+             _ => {}
+         }
+     }
+-    let Some(table) = bindings.iter().find_map(|(&id, &binding)| {
++    let table = bindings.iter().find_map(|(&id, &binding)| {
+         (binding == gpu_arguments::ARGUMENT_RESOURCE_TABLE_BINDING && sets.get(&id) == Some(&0))
+             .then_some(id)
+-    }) else {
++    });
++    let inferred_proof_needed = !ctx.emit_sidecar.readonly_uniform_addresses.is_empty()
++        || ctx.module.annotations.iter().any(|annotation| {
++            matches!(
++                annotation.operands.as_slice(),
++                [
++                    Operand::IdRef(_),
++                    Operand::Decoration(Decoration::NonWritable)
++                ]
++            )
++        });
++    if table.is_none() && !inferred_proof_needed {
++        return Ok(());
++    }
++    let control = super::fragment_control::analyze(ctx)?;
++    let mut recorded = ctx
++        .emit_sidecar
++        .uniform_value_facts
++        .iter()
++        .map(|fact| (fact.function, fact.value))
++        .collect::<HashSet<_>>();
++    for (function, definition) in ctx.module.functions.iter().enumerate() {
++        if !(0..definition.blocks.len()).any(|block| {
++            control.status(function, block) == super::fragment_control::ControlStatus::Uniform
++        }) {
++            continue;
++        }
++        let Some(function_id) = definition
++            .def
++            .as_ref()
++            .and_then(|definition| definition.result_id)
++        else {
++            continue;
++        };
++        for value in definition
++            .blocks
++            .iter()
++            .flat_map(|block| &block.instructions)
++            .filter_map(|instruction| instruction.result_id)
++            .filter(|value| control.value_is_uniform(function, *value))
++        {
++            let fact = crate::emit_sidecar::UniformValueFact {
++                function: function_id,
++                value,
++            };
++            if recorded.insert((fact.function, fact.value)) {
++                ctx.emit_sidecar.uniform_value_facts.push(fact);
++            }
++        }
++    }
++    let Some(table) = table else {
+         return Ok(());
+     };
+     // Resolve every executable fragment-entry closure and control-flow fact before this pass edits
+     // any instruction. A helper body that no fragment entry reaches is not part of the program; a
+     // residual reachable call is rejected because its call-site guard is no longer represented at
+     // the callee.
+-    let control = super::fragment_control::analyze(ctx)?;
+     let defs = ctx
+         .module
+         .all_inst_iter()
+@@ -591,6 +640,46 @@
+     }
+ 
+     #[test]
++    fn derivatives_remain_inside_an_unannotated_induction_loop() {
++        let Some(module) = assemble(&format!(
++            "{PREAMBLE}
++OpName %body \"sample_body\"
++%float_1 = OpConstant %float 1
++%float_2 = OpConstant %float 2
++%main = OpFunction %void None %fn
++%entry = OpLabel
++OpBranch %header
++%header = OpLabel
++%iteration = OpPhi %float %float_0 %entry %next %continue
++%again = OpFOrdLessThan %bool %iteration %float_2
++OpLoopMerge %merge %continue None
++OpBranchConditional %again %body %merge
++%body = OpLabel
++%sampled = OpLoad %sampled_type %sampled_var
++%color = OpImageSampleImplicitLod %v4float %sampled %coord
++OpBranch %continue
++%continue = OpLabel
++%next = OpFAdd %float %iteration %float_1
++OpBranch %header
++%merge = OpLabel
++OpReturn
++OpFunctionEnd
++"
++        )) else {
++            return;
++        };
++        let main = named_id(&module, "entry");
++        let body = named_id(&module, "sample_body");
++        let lowered = run(module, &[]).unwrap();
++        validate(&lowered);
++        assert_eq!(has_derivatives(&lowered, main, body), (true, true));
++        assert_eq!(
++            has_derivatives(&lowered, main, named_id(&lowered, "entry_block")),
++            (false, false)
++        );
++    }
++
++    #[test]
+     fn helper_sample_is_lowered_at_the_helper_site_not_hoisted_to_the_caller() {
+         let source = format!(
+             "{PREAMBLE}
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -1497,6 +1497,25 @@
+                     buffer_structs.push((alias_var, alias_block));
+                 }
+             }
++            if frag.is_some_and(|meta| meta.buffer_address_spaces.get(&idx) == Some(&2)) {
++                let function = ctx.module.functions[entry_idx]
++                    .def
++                    .as_ref()
++                    .and_then(|definition| definition.result_id)
++                    .ok_or("constant-buffer uniformity requires an entry function")?;
++                let aliases = match &wrap {
++                    BufWrap::Collapsed { typed_aliases, .. } => typed_aliases
++                        .iter()
++                        .map(|(_, variable)| *variable)
++                        .collect::<Vec<_>>(),
++                    _ => Vec::new(),
++                };
++                for value in std::iter::once(var).chain(aliases) {
++                    ctx.emit_sidecar
++                        .readonly_uniform_addresses
++                        .push(crate::emit_sidecar::UniformValueFact { function, value });
++                }
++            }
+             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
+             buffer_structs.push((var, struct_ty));
+         } else if role_is("varying") {
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -122,6 +122,14 @@
+ helpers; null sampling preserves the sample operation and selects a zero result from its original
+ null predicate. `air.is_null_texture` follows known null/bound values, token zero pairs and the
+ corresponding select or phi predicate.
++
++The cached argument postpass can also carry a SPIR-V-hash-bound `uniform_control_proof`.
++It records source uniformity assertions and values proved uniform from constant-buffer roots,
++readonly runtime address-table rows, uniform pointer arithmetic and loop induction. Readonly
++data provenance remains separate from address equality: a varying index or a writable data
++root does not make its load uniform. The consumer must match the proof to the exact SPIR-V
++bytes and fragment entry identities before use. A value proof does not establish uniform
++control flow at its use site; derivative lowering checks the CFG dynamic instance separately.
+ 
+ ## Descriptor ABI (binding map)
+ 

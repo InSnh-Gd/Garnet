@@ -1,0 +1,499 @@
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -252,6 +252,8 @@
+ if with_amdgpu_darwin
+   radv_flags += '-DHAVE_AMDGPU_DARWIN'
+   libradv_files += files(
++    'radv_darwin_argument_limits.c',
++    'radv_darwin_argument_limits_core.h',
+     'winsys/amdgpu/radv_darwin_scanout.c',
+     'winsys/amdgpu/radv_darwin_scanout.h',
+   )
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -32,6 +32,7 @@
+ #include "radv_android.h"
+ #include "radv_device.h"
+ #include "radv_entrypoints.h"
++#include "radv_darwin_argument_limits_core.h"
+ #include "radv_instance.h"
+ #include "radv_physical_device.h"
+ #include "radv_pipeline_rt.h"
+@@ -445,7 +446,7 @@
+       simple_mtx_lock(&pdev->drm_device_mtx);
+       radv_create_drm_device_locked(pdev);
+       if (pdev->drm_device && ac_drm_darwin_kext(pdev->drm_device, NULL))
+-         size = MAX2(size, MIN2(UINT64_C(8) << 30, (uint64_t)pdev->info.vram_size_kb * 1024));
++         size = radv_darwin_max_allocation_size_from_native_vram((uint64_t)pdev->info.vram_size_kb * 1024);
+       simple_mtx_unlock(&pdev->drm_device_mtx);
+    }
+ #endif
+@@ -1717,21 +1718,6 @@
+    };
+ }
+ 
+-static size_t
+-radv_max_descriptor_set_size()
+-{
+-   /* make sure that the entire descriptor set is addressable with a signed
+-    * 32-bit int. So the sum of all limits scaled by descriptor size has to
+-    * be at most 2 GiB. the combined image & samples object count as one of
+-    * both. This limit is for the pipeline layout, not for the set layout, but
+-    * there is no set limit, so we just set a pipeline limit. I don't think
+-    * any app is going to hit this soon. */
+-   return ((1ull << 31) - 16 * MAX_DYNAMIC_BUFFERS - MAX_INLINE_UNIFORM_BLOCK_SIZE * MAX_INLINE_UNIFORM_BLOCK_COUNT) /
+-          (32 /* uniform buffer, 32 due to potential space wasted on alignment */ +
+-           32 /* storage buffer, 32 due to potential space wasted on alignment */ +
+-           32 /* sampler, largest when combined with image */ + 64 /* sampled image */ + 64 /* storage image */);
+-}
+-
+ static uint32_t
+ radv_uniform_buffer_offset_alignment(const struct radv_physical_device *pdev)
+ {
+@@ -1803,7 +1789,7 @@
+ {
+    VkSampleCountFlags sample_counts = 0xf;
+ 
+-   size_t max_descriptor_set_size = radv_max_descriptor_set_size();
++   const uint32_t max_descriptor_set_size = radv_darwin_max_descriptor_set_size();
+ 
+    VkPhysicalDeviceType device_type;
+    if (pdev->info.has_dedicated_vram) {
+@@ -1855,10 +1841,10 @@
+       .maxImageArrayLayers = pdev->image_props.max_array_layers,
+       .maxTexelBufferElements = 512 * 1024 * 1024,
+       .maxUniformBufferRange = UINT32_MAX,
+-      .maxStorageBufferRange = UINT32_MAX,
++      .maxStorageBufferRange = RADV_DARWIN_MAX_STORAGE_BUFFER_RANGE,
+       .maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE,
+       .maxMemoryAllocationCount = UINT32_MAX,
+-      .maxSamplerAllocationCount = 64 * 1024,
++      .maxSamplerAllocationCount = RADV_DARWIN_MAX_SAMPLER_ALLOCATIONS,
+       .bufferImageGranularity = 1,
+       .sparseAddressSpaceSize = enable_sparse ? pdev->info.virtual_address_max : 0,
+       .maxBoundDescriptorSets = MAX_SETS,
+@@ -1896,8 +1882,8 @@
+       .maxGeometryOutputVertices = 256,
+       .maxGeometryTotalOutputComponents = 1024,
+       .maxFragmentInputComponents = 128,
+-      .maxFragmentOutputAttachments = 8,
+-      .maxFragmentDualSrcAttachments = 1,
++      .maxFragmentOutputAttachments = RADV_DARWIN_MAX_FRAGMENT_OUTPUT_ATTACHMENTS,
++      .maxFragmentDualSrcAttachments = RADV_DARWIN_MAX_FRAGMENT_DUAL_SRC_ATTACHMENTS,
+       .maxFragmentCombinedOutputResources = max_descriptor_set_size,
+       .maxComputeSharedMemorySize = pdev->info.compiler_info.lds_size_per_workgroup,
+       .maxComputeWorkGroupCount = {4294967295, 65535, 65535},
+@@ -2009,7 +1995,7 @@
+       .shaderRoundingModeRTEFloat64 = true,
+       .shaderRoundingModeRTZFloat64 = !pdev->use_llvm,
+       .shaderSignedZeroInfNanPreserveFloat64 = true,
+-      .maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 64,
++      .maxUpdateAfterBindDescriptorsInAllPools = RADV_DARWIN_MAX_UAB_DESCRIPTORS_ALL_POOLS,
+       .shaderUniformBufferArrayNonUniformIndexingNative = false,
+       .shaderSampledImageArrayNonUniformIndexingNative = false,
+       .shaderStorageBufferArrayNonUniformIndexingNative = false,
+@@ -2302,7 +2288,7 @@
+       .maxResourceDescriptorBufferBindings = MAX_SETS,
+       .maxSamplerDescriptorBufferBindings = MAX_SETS,
+       .maxEmbeddedImmutableSamplerBindings = MAX_SETS,
+-      .maxEmbeddedImmutableSamplers = radv_max_descriptor_set_size(),
++      .maxEmbeddedImmutableSamplers = radv_darwin_max_descriptor_set_size(),
+       /* No data required for capture/replay (except for sparse buffers/images) but these values
+        * need to be non-zero.
+        */
+
+diff --git a/include/darwin/radv_darwin_argument_limits.h b/include/darwin/radv_darwin_argument_limits.h
+new file mode 100644
+--- /dev/null
++++ b/include/darwin/radv_darwin_argument_limits.h
+@@ -0,0 +1,147 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Versioned, read-only RADV limits for the Darwin argument-table allocator.
++ * This API does not create a Vulkan instance or device and does not open or
++ * query a native connection. Call it with dlopen/dlsym on the same
++ * libvulkan_radeon.dylib that will later be opened lazily.
++ */
++
++#ifndef RADV_DARWIN_ARGUMENT_LIMITS_H
++#define RADV_DARWIN_ARGUMENT_LIMITS_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define RADV_DARWIN_ARGUMENT_LIMITS_ABI 1u
++
++enum radv_darwin_host_fact_flags {
++    RADV_DARWIN_FACT_VENDOR_ID = 1u << 0,
++    RADV_DARWIN_FACT_DEVICE_ID = 1u << 1,
++    RADV_DARWIN_FACT_GC_VERSION = 1u << 2,
++    RADV_DARWIN_FACT_VRAM_BYTES = 1u << 3,
++    RADV_DARWIN_FACT_NATIVE_ABI = 1u << 4,
++    RADV_DARWIN_FACT_KEXT_BUILD = 1u << 5,
++};
++
++enum radv_darwin_argument_limit_flags {
++    RADV_DARWIN_LIMITS_READ_ONLY = 1u << 0,
++    RADV_DARWIN_LIMITS_NO_VULKAN_OBJECT = 1u << 1,
++    RADV_DARWIN_LIMITS_NO_PIPELINE_UUID = 1u << 2,
++};
++
++enum radv_darwin_argument_limit_valid_flags {
++    RADV_DARWIN_LIMITS_VALID_STABLE_CORE = 1u << 0,
++    RADV_DARWIN_LIMITS_VALID_MEMORY = 1u << 1,
++};
++
++/*
++ * Facts are optional. Unknown valid_flags and nonzero reserved words are
++ * rejected. vendor_id/device_id/gc_version use the PCI and native QueryInfo
++ * encodings; vram_bytes is the total VRAM heap size from the native snapshot.
++ */
++struct radv_darwin_host_facts_v1 {
++    uint32_t struct_size;
++    uint32_t valid_flags;
++    uint32_t vendor_id;
++    uint32_t device_id;
++    uint32_t gc_version;
++    uint32_t native_abi_major;
++    uint32_t native_abi_minor;
++    uint32_t kext_build;
++    uint32_t reserved[2];
++    uint64_t vram_bytes;
++};
++
++/*
++ * build_identity is a deterministic build label, not pipelineCacheUUID.
++ * pipelineCacheUUID belongs to a fully opened physical device and is
++ * deliberately not fabricated or returned by this pre-open API.
++ *
++ * max_memory_allocation_size and max_buffer_size are valid only when
++ * RADV_DARWIN_LIMITS_VALID_MEMORY is set.
++ */
++struct radv_darwin_argument_limits_v1 {
++    uint32_t struct_size;
++    uint32_t abi_version;
++    uint32_t flags;
++    uint32_t valid_flags;
++    char build_identity[64];
++
++    uint32_t api_version;
++    uint32_t driver_version;
++    uint32_t driver_id;
++
++    uint32_t max_descriptor_set_size;
++    uint32_t max_sampler_allocations;
++    uint32_t max_bound_descriptor_sets;
++    uint32_t max_per_set_descriptors;
++    uint32_t max_storage_buffer_range;
++    uint32_t max_uab_descriptors_all_pools;
++
++    /* Ordinary limits: samplers, UBOs, SSBOs, sampled images, storage images,
++     * input attachments, and (for the per-stage total) non-sampler resources.
++     */
++    uint32_t max_per_stage_descriptor_samplers;
++    uint32_t max_per_stage_descriptor_uniform_buffers;
++    uint32_t max_per_stage_descriptor_storage_buffers;
++    uint32_t max_per_stage_descriptor_sampled_images;
++    uint32_t max_per_stage_descriptor_storage_images;
++    uint32_t max_per_stage_descriptor_input_attachments;
++    uint32_t max_per_stage_resources;
++
++    uint32_t max_descriptor_set_samplers;
++    uint32_t max_descriptor_set_uniform_buffers;
++    uint32_t max_descriptor_set_uniform_buffers_dynamic;
++    uint32_t max_descriptor_set_storage_buffers;
++    uint32_t max_descriptor_set_storage_buffers_dynamic;
++    uint32_t max_descriptor_set_sampled_images;
++    uint32_t max_descriptor_set_storage_images;
++    uint32_t max_descriptor_set_input_attachments;
++
++    /* The Vulkan 1.2 update-after-bind limits apply to the complete pipeline
++     * layout, across all stages and all elements of pSetLayouts.
++     */
++    uint32_t max_per_stage_descriptor_update_after_bind_samplers;
++    uint32_t max_per_stage_descriptor_update_after_bind_uniform_buffers;
++    uint32_t max_per_stage_descriptor_update_after_bind_storage_buffers;
++    uint32_t max_per_stage_descriptor_update_after_bind_sampled_images;
++    uint32_t max_per_stage_descriptor_update_after_bind_storage_images;
++    uint32_t max_per_stage_descriptor_update_after_bind_input_attachments;
++    uint32_t max_per_stage_update_after_bind_resources;
++
++    uint32_t max_descriptor_set_update_after_bind_samplers;
++    uint32_t max_descriptor_set_update_after_bind_uniform_buffers;
++    uint32_t max_descriptor_set_update_after_bind_uniform_buffers_dynamic;
++    uint32_t max_descriptor_set_update_after_bind_storage_buffers;
++    uint32_t max_descriptor_set_update_after_bind_storage_buffers_dynamic;
++    uint32_t max_descriptor_set_update_after_bind_sampled_images;
++    uint32_t max_descriptor_set_update_after_bind_storage_images;
++    uint32_t max_descriptor_set_update_after_bind_input_attachments;
++    uint32_t max_update_after_bind_descriptors_in_all_pools;
++
++    uint32_t max_fragment_combined_output_resources;
++    uint32_t max_color_attachments;
++    uint32_t max_fragment_output_attachments;
++    uint32_t max_fragment_dual_src_attachments;
++
++    uint64_t max_memory_allocation_size;
++    uint64_t max_buffer_size;
++};
++
++/*
++ * The v1 structs must be initialized to zero and struct_size must equal
++ * sizeof(the v1 struct). facts may be NULL to request only stable core limits.
++ * Returns 0 on success, -EINVAL for malformed inputs or inconsistent facts.
++ */
++int radv_darwin_get_argument_limits_v1(const struct radv_darwin_host_facts_v1 *facts,
++                                       struct radv_darwin_argument_limits_v1 *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+
+diff --git a/src/amd/vulkan/radv_darwin_argument_limits.c b/src/amd/vulkan/radv_darwin_argument_limits.c
+new file mode 100644
+--- /dev/null
++++ b/src/amd/vulkan/radv_darwin_argument_limits.c
+@@ -0,0 +1,28 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Pure, versioned read-only export of the limits used by RADV on Darwin.
++ */
++
++#include <stdio.h>
++#include <vulkan/vulkan_core.h>
++
++#include "git_sha1.h"
++#include "radv_darwin_argument_limits_core.h"
++
++#define API __attribute__((visibility("default")))
++
++/* Provided by src/vulkan/util/vk_util.c, also used by physical properties. */
++uint32_t vk_get_driver_version(void);
++
++API int
++radv_darwin_get_argument_limits_v1(const struct radv_darwin_host_facts_v1 *facts,
++                                   struct radv_darwin_argument_limits_v1 *out)
++{
++   char build_identity[sizeof(out->build_identity)];
++   const int length = snprintf(build_identity, sizeof(build_identity), "rdal-v1 " PACKAGE_VERSION MESA_GIT_SHA1);
++   if (length < 0 || (size_t)length >= sizeof(build_identity))
++      return -EINVAL;
++   return radv_darwin_fill_argument_limits_v1(facts, out, build_identity, VK_MAKE_VERSION(1, 4, VK_HEADER_VERSION),
++                                              vk_get_driver_version(), VK_DRIVER_ID_MESA_RADV);
++}
+
+diff --git a/src/amd/vulkan/radv_darwin_argument_limits_core.h b/src/amd/vulkan/radv_darwin_argument_limits_core.h
+new file mode 100644
+--- /dev/null
++++ b/src/amd/vulkan/radv_darwin_argument_limits_core.h
+@@ -0,0 +1,200 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Shared pure constants and arithmetic used by RADV's physical-device
++ * properties and the Darwin read-only argument-limit export.
++ */
++
++#ifndef RADV_DARWIN_ARGUMENT_LIMITS_CORE_H
++#define RADV_DARWIN_ARGUMENT_LIMITS_CORE_H
++
++#include <errno.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "radv_constants.h"
++#include "radv_darwin_argument_limits.h"
++
++#define RADV_DARWIN_MAX_SAMPLER_ALLOCATIONS (64u * 1024u)
++#define RADV_DARWIN_MAX_STORAGE_BUFFER_RANGE UINT32_MAX
++#define RADV_DARWIN_MAX_UAB_DESCRIPTORS_ALL_POOLS (UINT32_MAX / 64u)
++#define RADV_DARWIN_MAX_FRAGMENT_OUTPUT_ATTACHMENTS 8u
++#define RADV_DARWIN_MAX_FRAGMENT_DUAL_SRC_ATTACHMENTS 1u
++
++/* The complete pipeline layout must be addressable by a signed 32-bit int. */
++static inline uint32_t
++radv_darwin_max_descriptor_set_size(void)
++{
++   const uint64_t numerator =
++      (UINT64_C(1) << 31) - 16 * MAX_DYNAMIC_BUFFERS - MAX_INLINE_UNIFORM_BLOCK_SIZE * MAX_INLINE_UNIFORM_BLOCK_COUNT;
++   const uint64_t denominator = 32 /* uniform buffer alignment */ + 32 /* storage buffer alignment */ +
++                                32 /* largest sampler with an image */ + 64 /* sampled image */ +
++                                64 /* storage image */;
++   return numerator / denominator;
++}
++
++/* vram_bytes must be the native vram.total_heap_size input. */
++static inline uint64_t
++radv_darwin_max_allocation_size_from_vram(uint64_t vram_bytes)
++{
++   const uint64_t ceiling = UINT64_C(8) << 30;
++   const uint64_t bounded = vram_bytes < ceiling ? vram_bytes : ceiling;
++   return bounded > RADV_MAX_MEMORY_ALLOCATION_SIZE ? bounded : RADV_MAX_MEMORY_ALLOCATION_SIZE;
++}
++
++static inline int
++radv_darwin_fix_vram_size(uint64_t vram_bytes, uint64_t *fixed)
++{
++   const uint64_t alignment = UINT64_C(256) << 20;
++   if (!fixed || vram_bytes > UINT64_MAX - (alignment - 1))
++      return 0;
++   *fixed = (vram_bytes + alignment - 1) & ~(alignment - 1);
++   return 1;
++}
++
++/* Native snapshots report the physical total. ac_gpu_info.c rounds that value
++ * up to 256 MiB before publishing vram_size_kb, so the opened physical device
++ * is already aligned here. The second alignment is idempotent and keeps the
++ * pre-open export on exactly the same path as a later full open.
++ */
++static inline uint64_t
++radv_darwin_max_allocation_size_from_native_vram(uint64_t vram_bytes)
++{
++   uint64_t fixed_vram = 0;
++   if (!radv_darwin_fix_vram_size(vram_bytes, &fixed_vram))
++      return 0;
++   return radv_darwin_max_allocation_size_from_vram(fixed_vram);
++}
++
++static inline int
++radv_darwin_gc_for_device(uint32_t device_id, uint32_t *gc_version)
++{
++   switch (device_id) {
++   case 0x7590:
++      if (gc_version)
++         *gc_version = 0x0c0000;
++      return 1;
++   case 0x7550:
++      if (gc_version)
++         *gc_version = 0x0c0001;
++      return 1;
++   default:
++      return 0;
++   }
++}
++
++static inline int
++radv_darwin_validate_facts(const struct radv_darwin_host_facts_v1 *facts)
++{
++   if (!facts)
++      return 0;
++
++   const uint32_t known = RADV_DARWIN_FACT_VENDOR_ID | RADV_DARWIN_FACT_DEVICE_ID | RADV_DARWIN_FACT_GC_VERSION |
++                          RADV_DARWIN_FACT_VRAM_BYTES | RADV_DARWIN_FACT_NATIVE_ABI | RADV_DARWIN_FACT_KEXT_BUILD;
++   if (facts->struct_size != sizeof(*facts) || (facts->valid_flags & ~known) || facts->reserved[0] ||
++       facts->reserved[1])
++      return -EINVAL;
++
++   if ((facts->valid_flags & RADV_DARWIN_FACT_VENDOR_ID) && facts->vendor_id != 0x1002)
++      return -EINVAL;
++
++   uint32_t expected_gc = 0;
++   if ((facts->valid_flags & RADV_DARWIN_FACT_DEVICE_ID) && !radv_darwin_gc_for_device(facts->device_id, &expected_gc))
++      return -EINVAL;
++   if ((facts->valid_flags & RADV_DARWIN_FACT_GC_VERSION) && facts->gc_version != 0x0c0000 &&
++       facts->gc_version != 0x0c0001)
++      return -EINVAL;
++   if ((facts->valid_flags & RADV_DARWIN_FACT_DEVICE_ID) && (facts->valid_flags & RADV_DARWIN_FACT_GC_VERSION) &&
++       facts->gc_version != expected_gc)
++      return -EINVAL;
++
++   if ((facts->valid_flags & RADV_DARWIN_FACT_VRAM_BYTES) && !facts->vram_bytes)
++      return -EINVAL;
++   return 0;
++}
++
++static inline int
++radv_darwin_fill_argument_limits_v1(const struct radv_darwin_host_facts_v1 *facts,
++                                    struct radv_darwin_argument_limits_v1 *out, const char *build_identity,
++                                    uint32_t api_version, uint32_t driver_version, uint32_t driver_id)
++{
++   if (!out || !build_identity)
++      return -EINVAL;
++   memset(out, 0, sizeof(*out));
++   if (!build_identity[0] || strlen(build_identity) >= sizeof(out->build_identity))
++      return -EINVAL;
++   int result = radv_darwin_validate_facts(facts);
++   if (result)
++      return result;
++
++   const uint32_t descriptor_size = radv_darwin_max_descriptor_set_size();
++   out->struct_size = sizeof(*out);
++   out->abi_version = RADV_DARWIN_ARGUMENT_LIMITS_ABI;
++   out->flags =
++      RADV_DARWIN_LIMITS_READ_ONLY | RADV_DARWIN_LIMITS_NO_VULKAN_OBJECT | RADV_DARWIN_LIMITS_NO_PIPELINE_UUID;
++   out->valid_flags = RADV_DARWIN_LIMITS_VALID_STABLE_CORE;
++   snprintf(out->build_identity, sizeof(out->build_identity), "%s", build_identity);
++
++   out->api_version = api_version;
++   out->driver_version = driver_version;
++   out->driver_id = driver_id;
++   out->max_descriptor_set_size = descriptor_size;
++   out->max_sampler_allocations = RADV_DARWIN_MAX_SAMPLER_ALLOCATIONS;
++   out->max_bound_descriptor_sets = MAX_SETS;
++   out->max_per_set_descriptors = RADV_MAX_PER_SET_DESCRIPTORS;
++   out->max_storage_buffer_range = RADV_DARWIN_MAX_STORAGE_BUFFER_RANGE;
++   out->max_uab_descriptors_all_pools = RADV_DARWIN_MAX_UAB_DESCRIPTORS_ALL_POOLS;
++
++   out->max_per_stage_descriptor_samplers = descriptor_size;
++   out->max_per_stage_descriptor_uniform_buffers = descriptor_size;
++   out->max_per_stage_descriptor_storage_buffers = descriptor_size;
++   out->max_per_stage_descriptor_sampled_images = descriptor_size;
++   out->max_per_stage_descriptor_storage_images = descriptor_size;
++   out->max_per_stage_descriptor_input_attachments = descriptor_size;
++   out->max_per_stage_resources = descriptor_size;
++
++   out->max_descriptor_set_samplers = descriptor_size;
++   out->max_descriptor_set_uniform_buffers = descriptor_size;
++   out->max_descriptor_set_uniform_buffers_dynamic = MAX_DYNAMIC_UNIFORM_BUFFERS;
++   out->max_descriptor_set_storage_buffers = descriptor_size;
++   out->max_descriptor_set_storage_buffers_dynamic = MAX_DYNAMIC_STORAGE_BUFFERS;
++   out->max_descriptor_set_sampled_images = descriptor_size;
++   out->max_descriptor_set_storage_images = descriptor_size;
++   out->max_descriptor_set_input_attachments = descriptor_size;
++
++   out->max_per_stage_descriptor_update_after_bind_samplers = descriptor_size;
++   out->max_per_stage_descriptor_update_after_bind_uniform_buffers = descriptor_size;
++   out->max_per_stage_descriptor_update_after_bind_storage_buffers = descriptor_size;
++   out->max_per_stage_descriptor_update_after_bind_sampled_images = descriptor_size;
++   out->max_per_stage_descriptor_update_after_bind_storage_images = descriptor_size;
++   out->max_per_stage_descriptor_update_after_bind_input_attachments = descriptor_size;
++   out->max_per_stage_update_after_bind_resources = descriptor_size;
++
++   out->max_descriptor_set_update_after_bind_samplers = descriptor_size;
++   out->max_descriptor_set_update_after_bind_uniform_buffers = descriptor_size;
++   out->max_descriptor_set_update_after_bind_uniform_buffers_dynamic = MAX_DYNAMIC_UNIFORM_BUFFERS;
++   out->max_descriptor_set_update_after_bind_storage_buffers = descriptor_size;
++   out->max_descriptor_set_update_after_bind_storage_buffers_dynamic = MAX_DYNAMIC_STORAGE_BUFFERS;
++   out->max_descriptor_set_update_after_bind_sampled_images = descriptor_size;
++   out->max_descriptor_set_update_after_bind_storage_images = descriptor_size;
++   out->max_descriptor_set_update_after_bind_input_attachments = descriptor_size;
++   out->max_update_after_bind_descriptors_in_all_pools = RADV_DARWIN_MAX_UAB_DESCRIPTORS_ALL_POOLS;
++
++   out->max_fragment_combined_output_resources = descriptor_size;
++   out->max_color_attachments = MAX_RTS;
++   out->max_fragment_output_attachments = RADV_DARWIN_MAX_FRAGMENT_OUTPUT_ATTACHMENTS;
++   out->max_fragment_dual_src_attachments = RADV_DARWIN_MAX_FRAGMENT_DUAL_SRC_ATTACHMENTS;
++
++   if (facts && (facts->valid_flags & RADV_DARWIN_FACT_VRAM_BYTES)) {
++      const uint64_t memory_limit = radv_darwin_max_allocation_size_from_native_vram(facts->vram_bytes);
++      if (!memory_limit)
++         return -EINVAL;
++      out->max_memory_allocation_size = memory_limit;
++      out->max_buffer_size = memory_limit;
++      out->valid_flags |= RADV_DARWIN_LIMITS_VALID_MEMORY;
++   }
++   return 0;
++}
++
++#endif

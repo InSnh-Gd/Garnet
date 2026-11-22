@@ -1,0 +1,1193 @@
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -363,12 +363,14 @@
+             "air.get_height_texture",
+             "air.get_depth_texture",
+             "air.get_array_size_texture",
++            "air.get_array_size_depth",
+             "air.get_width_depth",
+             "air.get_height_depth",
+             "air.get_depth_depth",
+             "air.get_num_mip_levels_texture",
+             "air.get_num_mip_levels_depth",
+             "air.get_num_samples_texture",
++            "air.get_num_samples_depth",
+             "air.is_null_texture",
+             "air.get_null_texture",
+         ],
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -224,12 +224,14 @@
+         || callee.starts_with("air.get_height_texture")
+         || callee.starts_with("air.get_depth_texture")
+         || callee.starts_with("air.get_array_size_texture")
++        || callee.starts_with("air.get_array_size_depth")
+         || callee.starts_with("air.get_width_depth")
+         || callee.starts_with("air.get_height_depth")
+         || callee.starts_with("air.get_depth_depth")
+         || callee.starts_with("air.get_num_mip_levels_texture")
+         || callee.starts_with("air.get_num_mip_levels_depth")
+         || callee.starts_with("air.get_num_samples_texture")
++        || callee.starts_with("air.get_num_samples_depth")
+         || callee.starts_with("air.calculate_unclamped_lod_texture")
+         || callee.starts_with("air.calculate_clamped_lod_texture")
+         || callee.starts_with("air.is_null_texture")
+--- a/src/passes/air_calls/dispatch_texture.rs
++++ b/src/passes/air_calls/dispatch_texture.rs
+@@ -1416,7 +1416,8 @@
+         _ => 2,
+     };
+     let ncomp = spatial + if arrayed { 1 } else { 0 };
+-    let is_array_size_query = name.starts_with("air.get_array_size_texture");
++    let is_array_size_query = name.starts_with("air.get_array_size_texture")
++        || name.starts_with("air.get_array_size_depth");
+     if is_array_size_query && !arrayed {
+         return Err(format!(
+             "{name} used on non-array texture id {img} ({})",
+@@ -1433,6 +1434,9 @@
+         0
+     };
+     let lod = args.get(1).copied();
++    if dim == Dim::Dim1D && lod.is_some_and(|lod| !integer_operand_is_constant_zero(ctx, lod)) {
++        return Err("1D texture requires zero LOD".into());
++    }
+     let uint = ctx.ty_uint();
+     let size_ty = if ncomp == 1 {
+         uint
+@@ -1521,6 +1525,11 @@
+             let one = ctx.const_uint(1);
+             return Ok(vec![copy_or_bitcast_result(rty, res, uint, one)]);
+         }
++    }
++    if image_shape_or_recorded(ctx, img).0 == Dim::Dim1D {
++        let uint = ctx.ty_uint();
++        let zero = ctx.const_uint(0);
++        return Ok(vec![copy_or_bitcast_result(rty, res, uint, zero)]);
+     }
+     if image_is_storage(ctx, img) {
+         let uint = ctx.ty_uint();
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -23,7 +23,7 @@
+ /// an arrayed family, its layer), then a single scalar `min_lod_clamp` float. Without this the
+ /// generic LOD search reads that clamp as an explicit level and the derivatives are dropped, which
+ /// is a sample of the wrong mip in every module that asked for one.
+-fn sample_gradient_pair(
++pub(in crate::passes) fn sample_gradient_pair(
+     ctx: &Ctx,
+     name: &str,
+     arrayed: bool,
+@@ -96,6 +96,7 @@
+     let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+     let (img_ty, dim, arrayed, comp) =
+         sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
++    validate_cube_sample_operands(ctx, dim, arrayed, args)?;
+     // ABI 8 keeps the source coordinate domain in the sampler's Metal state and presents every
+     // backend sampler through normalized coordinates. ABI 7 and earlier leave the coordinate
+     // untouched and continue through the pixel-emulation paths below.
+@@ -296,10 +297,12 @@
+     // coordinate has (#spatial-dims + arrayed) float components.
+     let mut coord_for_sample = build_sample_coord(ctx, dim, arrayed, coord, args, &mut out)?;
+     let spatial = sample_spatial_dims(dim);
+-    let grad = match spatial {
+-        Some(spatial) => sample_gradient_pair(ctx, name, arrayed, args, spatial)?,
+-        None => sample_gradient_pair(ctx, name, arrayed, args, 0)?,
+-    };
++    let derivative_dims = if dim == Dim::DimCube {
++        3
++    } else {
++        spatial.unwrap_or(0)
++    };
++    let grad = sample_gradient_pair(ctx, name, arrayed, args, derivative_dims)?;
+     let level = if grad.is_some() {
+         None
+     } else {
+--- a/src/passes/air_calls/images/sample_depth.rs
++++ b/src/passes/air_calls/images/sample_depth.rs
+@@ -50,11 +50,21 @@
+     } else {
+         sample_args.extend_from_slice(&args[4..]);
+     }
++    validate_cube_sample_operands(ctx, dim, arrayed, &sample_args)?;
++    let derivative_dims = if dim == Dim::DimCube {
++        3
++    } else {
++        sample_spatial_dims(dim).unwrap_or(0)
++    };
++    let grad = sample_gradient_pair(ctx, name, arrayed, &sample_args, derivative_dims)?;
+     let pixel_state = (!ctx.normalized_sampler_coordinates)
+         .then(|| ctx.sampler_states.get(&samp).copied())
+         .flatten()
+         .filter(|state| state.uses_pixel_coordinates());
+     let color = if let Some(state) = pixel_state {
++        if grad.is_some() {
++            return Err("pixel-coordinate depth gradients are unsupported".into());
++        }
+         // These emulations fetch one mip level, so the level the call names is the one to fetch.
+         // The base level is the fallback for a call that names none, not the answer for all of
+         // them -- this is the same read the colour pixel-coordinate path makes.
+@@ -143,7 +153,11 @@
+         // the layer, which is exactly where the depth ABI's control operand has been dropped. A
+         // depth `sample()` that names `level(n)` or a pixel offset means them, so read them here
+         // rather than sampling implicitly at the untouched coordinate.
+-        let level = find_sample_level(ctx, arrayed, &sample_args, &mut out);
++        let level = if grad.is_some() {
++            None
++        } else {
++            find_sample_level(ctx, arrayed, &sample_args, &mut out)
++        };
+         let spatial = sample_spatial_dims(dim);
+         let (const_offset, dynamic_offset) = match spatial {
+             Some(spatial) => {
+@@ -182,7 +196,7 @@
+             level,
+             false,
+             const_offset,
+-            None,
++            grad,
+         );
+         color
+     };
+@@ -295,6 +309,19 @@
+         args.get(5..).unwrap_or_default()
+     };
+     sample_args.extend_from_slice(trailing);
++    if name.split('.').any(|token| token.ends_with("_grad")) {
++        return Err("macOS depth comparison does not support gradients".into());
++    }
++    match classify_sample_level(ctx, arrayed, &sample_args) {
++        Some(SampleLevel::Explicit(lod)) if !float_operand_is_constant_zero(ctx, lod) => {
++            return Err("macOS depth comparison requires level(0)".into());
++        }
++        Some(SampleLevel::Bias(_)) => {
++            return Err("macOS depth comparison does not support bias".into());
++        }
++        _ => {}
++    }
++    validate_cube_sample_operands(ctx, dim, arrayed, &sample_args)?;
+     let pixel_state = (!ctx.normalized_sampler_coordinates)
+         .then_some(sampler_state)
+         .flatten()
+@@ -623,6 +650,27 @@
+     }
+ }
+ 
++pub(in crate::passes) fn validate_cube_sample_operands(
++    ctx: &Ctx,
++    dim: Dim,
++    arrayed: bool,
++    args: &[Word],
++) -> Result<(), String> {
++    if dim == Dim::DimCube {
++        let start = if arrayed { 4 } else { 3 };
++        if args.iter().skip(start).any(|arg| {
++            value_result_type(ctx, *arg)
++                .and_then(|ty| vector_type_shape(ctx, ty))
++                .is_some_and(|(element, _)| {
++                    type_def_of(ctx, element).is_some_and(|ty| ty.class.opcode == Op::TypeInt)
++                })
++        }) {
++            return Err("cube sample has no offset overload".into());
++        }
++    }
++    Ok(())
++}
++
+ /// Emit the sample. `grad` is Metal's `gradient2d(dPdx, dPdy)`: it selects the mip level the same
+ /// way an explicit level does, so it takes the place of one rather than joining it -- SPIR-V forbids
+ /// `Lod` and `Grad` on the same instruction.
+--- a/src/passes/air_calls/images/write_read.rs
++++ b/src/passes/air_calls/images/write_read.rs
+@@ -8,15 +8,23 @@
+ /// `(image, coord, face, texel, lod, access)`, and array writes as
+ /// `(image, coord, layer, texel, lod, access)`. We coerce float writes to `<4 x float>` and integer
+ /// writes to the storage image's signedness, while the coord becomes the integer coordinate shape the
+-/// image expects. Anything we can't express (non-storage image, unexpected texel/coord shape, a LOD
+-/// operand a basic storage image can't take) -> Err so the shader FALLBACKs cleanly rather than
+-/// emitting an invalid OpImageWrite.
++/// image expects. macOS (MSL 2.1) requires storage texture writes to use LOD zero, so any other
++/// LOD -> Err rather than silently dropping the caller-visible level. Anything else we can't express
++/// (non-storage image or unexpected texel/coord shape) also -> Err so the shader FALLBACKs cleanly
++/// rather than emitting an invalid or differently-addressed OpImageWrite.
+ pub(in crate::passes) fn lower_write(
+     ctx: &mut Ctx,
+     name: &str,
+     args: &[Word],
+     v4: Word,
+ ) -> Result<Vec<Instruction>, String> {
++    if name
++        .split('.')
++        .nth(1)
++        .is_some_and(|family| family.ends_with("_ms") || family.ends_with("_ms_array"))
++    {
++        return Err("multisampled storage image writes are unsupported".into());
++    }
+     if args.len() < 3 {
+         return Err("air.write_texture missing image/coord/texel".into());
+     }
+@@ -72,6 +80,17 @@
+     } else {
+         (args[1], None, args[2])
+     };
++    let lod_index = if (dim == Dim::DimCube && !arrayed) || arrayed {
++        4
++    } else {
++        3
++    };
++    if dim != Dim::DimBuffer {
++        let lod = *args.get(lod_index).ok_or("air.write_texture missing LOD")?;
++        if !integer_operand_is_constant_zero(ctx, lod) {
++            return Err("air.write_texture requires zero LOD".into());
++        }
++    }
+ 
+     let coord32 = build_fetch_coord(ctx, dim, arrayed, coord, layer, &mut out)?;
+ 
+@@ -258,9 +277,10 @@
+ /// (a3=access flag, ignored). Sampled images use `OpImageFetch` with the integer coord + Lod when
+ /// the SPIR-V image dimension permits it; texel-buffer fetches (`Dim Buffer`) have no mip levels and
+ /// must omit Lod.
+-/// read-write storage images use `OpImageRead` and ignore the LOD because storage images are not
+-/// mipmapped in the current harness. The read produces the image component vector, then converts to
+-/// the AIR result shape when needed.
++/// read-write storage images use `OpImageRead`, which has no LOD operand. macOS therefore requires
++/// every storage read to name a constant zero LOD; other values are refused rather than silently
++/// reading a different level. The read produces the image component vector, then converts to the AIR
++/// result shape when needed.
+ pub(in crate::passes) fn lower_read(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -331,6 +351,14 @@
+             args.get(4).copied(),
+         )
+     };
++    if dim == Dim::Dim1D && lod.is_some_and(|lod| !integer_operand_is_constant_zero(ctx, lod)) {
++        return Err("1D texture requires zero LOD".into());
++    }
++    if image_is_storage(ctx, img)
++        && lod.is_some_and(|lod| !integer_operand_is_constant_zero(ctx, lod))
++    {
++        return Err("storage image read requires zero LOD".into());
++    }
+     let mut out = vec![];
+     // OpImageFetch's result vector component type must match the image's sampled type. For integer
+     // textures the fetch yields v4uint/v4int, not v4float.
+@@ -447,6 +475,27 @@
+     Ok(out)
+ }
+ 
++/// Whether `value` is a scalar integer constant of exactly zero.
++pub(in crate::passes) fn integer_operand_is_constant_zero(ctx: &Ctx, value: Word) -> bool {
++    let Some(def) = value_def_instruction(ctx, value) else {
++        return false;
++    };
++    let Some(ty) = def.result_type else {
++        return false;
++    };
++    if type_def_of(ctx, ty).is_none_or(|ty| ty.class.opcode != Op::TypeInt) {
++        return false;
++    }
++    match def.class.opcode {
++        Op::ConstantNull => true,
++        Op::Constant => matches!(
++            def.operands.first(),
++            Some(Operand::LiteralBit32(0) | Operand::LiteralBit64(0))
++        ),
++        _ => false,
++    }
++}
++
+ /// Lower `air.read_depth_<dim>.f32`: read an integer-coordinate depth texel through the current
+ /// RGBA8-backed harness image, extract component 0, and rebuild AIR's `{float, i8}` result shape.
+ pub(in crate::passes) fn lower_read_depth(
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1642,7 +1642,9 @@
+     }
+     // `air.get_num_samples_texture*` reads the bound image's sample count, so it lowers to
+     // OpImageQuerySamples whenever the operand really is a multisample image.
+-    if name.starts_with("air.get_num_samples_texture") {
++    if name.starts_with("air.get_num_samples_texture")
++        || name.starts_with("air.get_num_samples_depth")
++    {
+         return lower_get_num_samples_texture(ctx, name, res, rty, args);
+     }
+     if name == "air.get_num_samples.i32" {
+--- a/src/passes/air_calls/rawbyte_unary.rs
++++ b/src/passes/air_calls/rawbyte_unary.rs
+@@ -308,6 +308,7 @@
+         || name.starts_with("air.get_height_texture")
+         || name.starts_with("air.get_depth_texture")
+         || name.starts_with("air.get_array_size_texture")
++        || name.starts_with("air.get_array_size_depth")
+         || name.starts_with("air.get_width_depth")
+         || name.starts_with("air.get_height_depth")
+         || name.starts_with("air.get_depth_depth")
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -532,12 +532,14 @@
+                 || name.starts_with("air.get_height_texture")
+                 || name.starts_with("air.get_depth_texture")
+                 || name.starts_with("air.get_array_size_texture")
++                || name.starts_with("air.get_array_size_depth")
+                 || name.starts_with("air.get_width_depth")
+                 || name.starts_with("air.get_height_depth")
+                 || name.starts_with("air.get_depth_depth")
+                 || name.starts_with("air.get_num_mip_levels_texture")
+                 || name.starts_with("air.get_num_mip_levels_depth")
+-                || name.starts_with("air.get_num_samples_texture"))
++                || name.starts_with("air.get_num_samples_texture")
++                || name.starts_with("air.get_num_samples_depth"))
+             {
+                 continue;
+             }
+@@ -686,12 +688,14 @@
+         || name.starts_with("air.get_height_texture")
+         || name.starts_with("air.get_depth_texture")
+         || name.starts_with("air.get_array_size_texture")
++        || name.starts_with("air.get_array_size_depth")
+         || name.starts_with("air.get_width_depth")
+         || name.starts_with("air.get_height_depth")
+         || name.starts_with("air.get_depth_depth")
+         || name.starts_with("air.get_num_mip_levels_texture")
+         || name.starts_with("air.get_num_mip_levels_depth")
+         || name.starts_with("air.get_num_samples_texture")
++        || name.starts_with("air.get_num_samples_depth")
+ }
+ 
+ /// Map each WRITE-texture PARAMETER id -> (Dim, arrayed, ImageFormat, ImageComp) by scanning the
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -167,10 +167,10 @@
+     inst: &Instruction,
+     table: Word,
+     selected: Word,
+-    query: (u32, bool),
++    query: (u32, bool, Dim),
+     defs: &HashMap<Word, Instruction>,
+ ) -> Result<(), String> {
+-    let (field, mip) = query;
++    let (field, mip, dim) = query;
+     let uint = ctx.ty_uint();
+     if inst.result_type != Some(uint) || inst.result_id.is_none() {
+         return Err("GPU argument image query must return a 32-bit integer".into());
+@@ -178,6 +178,29 @@
+     let args = &inst.operands[1..];
+     if args.is_empty() || args.len() > if mip { 2 } else { 1 } {
+         return Err("invalid GPU argument image query operands".into());
++    }
++    if dim == Dim::Dim1D {
++        if mip
++            && args.get(1).is_some_and(|arg| {
++                !matches!(arg, Operand::IdRef(lod) if defs.get(lod).is_some_and(|def| {
++                    def.result_type == Some(uint) && (def.class.opcode == Op::ConstantNull
++                        || (def.class.opcode == Op::Constant
++                            && def.operands.first() == Some(&Operand::LiteralBit32(0))))
++                }))
++            })
++        {
++            return Err("1D texture requires zero LOD".into());
++        }
++        if field == 4 {
++            let zero = ctx.const_uint(0);
++            body.push(Instruction::new(
++                Op::CopyObject,
++                Some(uint),
++                inst.result_id,
++                vec![Operand::IdRef(zero)],
++            ));
++            return Ok(());
++        }
+     }
+     let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+     let zero = ctx.const_uint(0);
+@@ -232,7 +255,7 @@
+         vec![Operand::IdRef(row), Operand::IdRef(field)],
+     );
+     let extent = load_word(ctx, body, table, pointer, uint, zero, offset);
+-    let result = if mip {
++    let result = if mip && dim != Dim::Dim1D {
+         let lod = match args.get(1) {
+             Some(Operand::IdRef(lod)) => {
+                 if defs.get(lod).and_then(|inst| inst.result_type) != Some(uint) {
+@@ -388,7 +411,7 @@
+     };
+     let multisampled = name
+         .split('.')
+-        .next()
++        .nth(1)
+         .is_some_and(|family| family.ends_with("_ms") || family.ends_with("_ms_array"));
+     if storage && multisampled {
+         return Err("GPU argument multisampled storage images are unsupported".into());
+@@ -1086,7 +1109,7 @@
+                         &inst,
+                         query_table,
+                         selected,
+-                        (field, mip),
++                        (field, mip, shape.0),
+                         &defs,
+                     )?;
+                     continue;
+--- a/src/passes/resources/texture_array.rs
++++ b/src/passes/resources/texture_array.rs
+@@ -497,12 +497,14 @@
+         || name.starts_with("air.get_height_texture")
+         || name.starts_with("air.get_depth_texture")
+         || name.starts_with("air.get_array_size_texture")
++        || name.starts_with("air.get_array_size_depth")
+         || name.starts_with("air.get_width_depth")
+         || name.starts_with("air.get_height_depth")
+         || name.starts_with("air.get_depth_depth")
+         || name.starts_with("air.get_num_mip_levels_texture")
+         || name.starts_with("air.get_num_mip_levels_depth")
+         || name.starts_with("air.get_num_samples_texture")
++        || name.starts_with("air.get_num_samples_depth")
+         || name.starts_with("air.is_null_texture")
+ }
+ fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
+--- /dev/null
++++ b/garnetxlate/tests/fixtures/argument_image_sampling_queries.ll
+@@ -0,0 +1,187 @@
++; Authored dynamic-token image matrix: sampled float/uint/sint/depth operations,
++; nonzero mip/layer/offset, every image query family, and storage read/write.
++target triple = "air64-apple-macosx"
++%Root = type { [2 x %Record] }
++%Record = type { [2 x ptr addrspace(1)], ptr addrspace(2), [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)], [2 x ptr addrspace(1)] }
++
++define internal float @sample_float_level(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord) {
++entry:
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord, i1 true, <2 x i32> <i32 1, i32 -1>, i1 true, float 2.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i32 0
++  ret float %red
++}
++
++define internal float @sample_float_gradient(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord, <2 x float> %dx, <2 x float> %dy) {
++entry:
++  %grad_sample = call { <4 x float>, i8 } @air.sample_texture_2d_grad.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord, <2 x float> %dx, <2 x float> %dy, float 0.0, i1 true, <2 x i32> zeroinitializer, i32 0)
++  %grad_rgba = extractvalue { <4 x float>, i8 } %grad_sample, 0
++  %green = extractelement <4 x float> %grad_rgba, i32 1
++  ret float %green
++}
++
++define void @image_operations(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {
++entry:
++  %group = and i32 %i, 1
++  %group64 = zext i32 %group to i64
++  %index = and i32 %i, 1
++  %index64 = zext i32 %index to i64
++  %mip = and i32 %i, 1
++  %layer = and i32 %i, 1
++
++  %image_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 0, i64 %index64
++  %sampler_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 1
++  %depth_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 2, i64 %index64
++  %array_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 3, i64 %index64
++  %image3d_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 4, i64 %index64
++  %image_ms_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 5, i64 %index64
++  %storage_f_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 6, i64 %index64
++  %storage_u_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 7, i64 %index64
++  %storage_s_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 8, i64 %index64
++  %image_u_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 9, i64 %index64
++  %image_s_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 10, i64 %index64
++  %image_1d_slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 %group64, i32 11, i64 %index64
++
++  %image_token = load i64, ptr addrspace(2) %image_slot, align 8
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler_slot, align 8
++  %depth_token = load i64, ptr addrspace(2) %depth_slot, align 8
++  %array_token = load i64, ptr addrspace(2) %array_slot, align 8
++  %image3d_token = load i64, ptr addrspace(2) %image3d_slot, align 8
++  %image_ms_token = load i64, ptr addrspace(2) %image_ms_slot, align 8
++  %storage_f_token = load i64, ptr addrspace(2) %storage_f_slot, align 8
++  %storage_u_token = load i64, ptr addrspace(2) %storage_u_slot, align 8
++  %storage_s_token = load i64, ptr addrspace(2) %storage_s_slot, align 8
++  %image_u_token = load i64, ptr addrspace(2) %image_u_slot, align 8
++  %image_s_token = load i64, ptr addrspace(2) %image_s_slot, align 8
++  %image_1d_token = load i64, ptr addrspace(2) %image_1d_slot, align 8
++
++  %image = inttoptr i64 %image_token to ptr addrspace(1)
++  %depth = inttoptr i64 %depth_token to ptr addrspace(1)
++  %image_array = inttoptr i64 %array_token to ptr addrspace(1)
++  %image3d = inttoptr i64 %image3d_token to ptr addrspace(1)
++  %image_ms = inttoptr i64 %image_ms_token to ptr addrspace(1)
++  %storage_f = inttoptr i64 %storage_f_token to ptr addrspace(1)
++  %storage_u = inttoptr i64 %storage_u_token to ptr addrspace(1)
++  %storage_s = inttoptr i64 %storage_s_token to ptr addrspace(1)
++  %image_u = inttoptr i64 %image_u_token to ptr addrspace(1)
++  %image_s = inttoptr i64 %image_s_token to ptr addrspace(1)
++  %image_1d = inttoptr i64 %image_1d_token to ptr addrspace(1)
++
++  %coord = insertelement <2 x float> poison, float 0.25, i32 0
++  %coord1 = insertelement <2 x float> %coord, float 0.75, i32 1
++  %dx = fmul <2 x float> %coord1, <float 0.5, float 0.0>
++  %dy = fmul <2 x float> %coord1, <float 0.0, float 0.5>
++  %level_value = call float @sample_float_level(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord1)
++  %gradient_value = call float @sample_float_gradient(ptr addrspace(1) %image, ptr addrspace(2) %sampler, <2 x float> %coord1, <2 x float> %dx, <2 x float> %dy)
++
++  %uint_sample = call { <4 x i32>, i8 } @air.sample_texture_2d.u.v4i32(ptr addrspace(1) %image_u, ptr addrspace(2) %sampler, <2 x float> %coord1, i1 true, <2 x i32> zeroinitializer, i1 true, float 1.0, float 0.0, i32 0)
++  %uint_rgba = extractvalue { <4 x i32>, i8 } %uint_sample, 0
++  %uint_value = extractelement <4 x i32> %uint_rgba, i32 0
++
++  %sint_sample = call { <4 x i32>, i8 } @air.sample_texture_2d.v4i32(ptr addrspace(1) %image_s, ptr addrspace(2) %sampler, <2 x float> %coord1, i1 true, <2 x i32> zeroinitializer, i1 true, float 1.0, float 0.0, i32 0)
++  %sint_rgba = extractvalue { <4 x i32>, i8 } %sint_sample, 0
++  %sint_value = extractelement <4 x i32> %sint_rgba, i32 0
++
++  %depth_sample = call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 0, <2 x float> %coord1, i1 true, <2 x i32> zeroinitializer, i1 true, float 2.0, float 0.0, i32 0)
++  %depth_value = extractvalue { float, i8 } %depth_sample, 0
++  %depth_compare = call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 0, <2 x float> %coord1, float 0.5, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)
++  %compare_value = extractvalue { float, i8 } %depth_compare, 0
++
++  %array_sample = call { <4 x float>, i8 } @air.sample_texture_2d_array.v4f32(ptr addrspace(1) %image_array, ptr addrspace(2) %sampler, <2 x float> %coord1, i32 %layer, i1 true, <2 x i32> zeroinitializer, i1 true, float 1.0, float 0.0, i32 0)
++  %array_rgba = extractvalue { <4 x float>, i8 } %array_sample, 0
++  %array_value = extractelement <4 x float> %array_rgba, i32 2
++
++  %float_fetch = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %image, <2 x i32> zeroinitializer, i32 0, i32 1)
++  %float_fetch_rgba = extractvalue { <4 x float>, i8 } %float_fetch, 0
++  %float_fetch_value = extractelement <4 x float> %float_fetch_rgba, i32 3
++  %uint_fetch = call { <4 x i32>, i8 } @air.read_texture_2d.u.v4i32(ptr addrspace(1) %image_u, <2 x i32> zeroinitializer, i32 0, i32 1)
++  %uint_fetch_rgba = extractvalue { <4 x i32>, i8 } %uint_fetch, 0
++  %uint_fetch_value = extractelement <4 x i32> %uint_fetch_rgba, i32 1
++  %sint_fetch = call { <4 x i32>, i8 } @air.read_texture_2d.v4i32(ptr addrspace(1) %image_s, <2 x i32> zeroinitializer, i32 0, i32 1)
++  %sint_fetch_rgba = extractvalue { <4 x i32>, i8 } %sint_fetch, 0
++  %sint_fetch_value = extractelement <4 x i32> %sint_fetch_rgba, i32 2
++
++  %width1d = call i32 @air.get_width_texture_1d(ptr addrspace(1) %image_1d, i32 0)
++  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %image, i32 %mip)
++  %height = call i32 @air.get_height_texture_2d(ptr addrspace(1) %image, i32 %mip)
++  %width3d = call i32 @air.get_width_texture_3d(ptr addrspace(1) %image3d, i32 %mip)
++  %height3d = call i32 @air.get_height_texture_3d(ptr addrspace(1) %image3d, i32 %mip)
++  %depth3d = call i32 @air.get_depth_texture_3d(ptr addrspace(1) %image3d, i32 %mip)
++  %array_size = call i32 @air.get_array_size_texture_2d_array(ptr addrspace(1) %image_array)
++  %mip_count = call i32 @air.get_num_mip_levels_texture_2d(ptr addrspace(1) %image)
++  %sample_count = call i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1) %image_ms)
++
++  %store_read = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, i32 0, i32 3)
++  %store_rgba = extractvalue { <4 x float>, i8 } %store_read, 0
++  %store_red = extractelement <4 x float> %store_rgba, i32 0
++  %write_texel = insertelement <4 x float> %store_rgba, float 91.0, i32 0
++  call void @air.write_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, <4 x float> %write_texel, i32 0, i32 3)
++
++  %uint_read = call { <4 x i32>, i8 } @air.read_texture_2d.u.v4i32(ptr addrspace(1) %storage_u, <2 x i32> zeroinitializer, i32 0, i32 3)
++  %uint_read_rgba = extractvalue { <4 x i32>, i8 } %uint_read, 0
++  %uint_read_value = extractelement <4 x i32> %uint_read_rgba, i32 0
++  %uint_write_texel = insertelement <4 x i32> %uint_read_rgba, i32 4000000000, i32 0
++  call void @air.write_texture_2d.u.v4i32(ptr addrspace(1) %storage_u, <2 x i32> zeroinitializer, <4 x i32> %uint_write_texel, i32 0, i32 3)
++
++  %sint_read = call { <4 x i32>, i8 } @air.read_texture_2d.v4i32(ptr addrspace(1) %storage_s, <2 x i32> zeroinitializer, i32 0, i32 3)
++  %sint_read_rgba = extractvalue { <4 x i32>, i8 } %sint_read, 0
++  %sint_read_value = extractelement <4 x i32> %sint_read_rgba, i32 0
++  %sint_write_texel = insertelement <4 x i32> %sint_read_rgba, i32 -91, i32 0
++  call void @air.write_texture_2d.v4i32(ptr addrspace(1) %storage_s, <2 x i32> zeroinitializer, <4 x i32> %sint_write_texel, i32 0, i32 3)
++
++  %sum0 = fadd float %level_value, %gradient_value
++  %sum1 = fadd float %sum0, %depth_value
++  %sum2 = fadd float %sum1, %compare_value
++  %sum3 = fadd float %sum2, %array_value
++  %sum4 = fadd float %sum3, %store_red
++  %sum5 = fadd float %sum4, %float_fetch_value
++  %size_1d = add i32 %width1d, %width
++  %size_sum = add i32 %size_1d, %height
++  %size3d_sum0 = add i32 %width3d, %height3d
++  %size3d_sum1 = add i32 %size3d_sum0, %depth3d
++  %counts = add i32 %array_size, %mip_count
++  %counts1 = add i32 %counts, %sample_count
++  %int_sum = add i32 %size_sum, %size3d_sum1
++  %int_sum1 = add i32 %int_sum, %counts1
++  %int_sum2 = add i32 %int_sum1, %uint_value
++  %int_sum3 = add i32 %int_sum2, %uint_read_value
++  %int_sum4 = add i32 %int_sum3, %uint_fetch_value
++  %int_sum5 = add i32 %int_sum4, %sint_value
++  %int_sum6 = add i32 %int_sum5, %sint_read_value
++  %int_sum7 = add i32 %int_sum6, %sint_fetch_value
++  %int_f = sitofp i32 %int_sum7 to float
++  %result = fadd float %sum5, %int_f
++  store float %result, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { <4 x float>, i8 } @air.sample_texture_2d_grad.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, <2 x float>, <2 x float>, float, i1, <2 x i32>, i32)
++declare { <4 x i32>, i8 } @air.sample_texture_2d.u.v4i32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { <4 x i32>, i8 } @air.sample_texture_2d.v4i32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)
++declare { <4 x float>, i8 } @air.sample_texture_2d_array.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i32, i1, <2 x i32>, i1, float, float, i32)
++declare i32 @air.get_width_texture_1d(ptr addrspace(1), i32)
++declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
++declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
++declare i32 @air.get_width_texture_3d(ptr addrspace(1), i32)
++declare i32 @air.get_height_texture_3d(ptr addrspace(1), i32)
++declare i32 @air.get_depth_texture_3d(ptr addrspace(1), i32)
++declare i32 @air.get_array_size_texture_2d_array(ptr addrspace(1))
++declare i32 @air.get_num_mip_levels_texture_2d(ptr addrspace(1))
++declare i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1))
++declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
++declare { <4 x i32>, i8 } @air.read_texture_2d.u.v4i32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare void @air.write_texture_2d.u.v4i32(ptr addrspace(1), <2 x i32>, <4 x i32>, i32, i32)
++declare { <4 x i32>, i8 } @air.read_texture_2d.v4i32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare void @air.write_texture_2d.v4i32(ptr addrspace(1), <2 x i32>, <4 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @image_operations, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+--- /dev/null
++++ b/garnetxlate/tests/gpu_image_operations.rs
+@@ -0,0 +1,187 @@
++fn validate_and_disassemble(spv: &[u8], label: &str) -> String {
++    let directory =
++        std::env::temp_dir().join(format!("rdna4-image-{label}-{}", std::process::id()));
++    std::fs::create_dir_all(&directory).unwrap();
++    let path = directory.join("shader.spv");
++    std::fs::write(&path, spv).unwrap();
++    let validation = std::process::Command::new("spirv-val")
++        .args(["--target-env", "vulkan1.2"])
++        .arg(&path)
++        .output()
++        .unwrap();
++    assert!(
++        validation.status.success(),
++        "{}",
++        String::from_utf8_lossy(&validation.stderr)
++    );
++    let disassembly = std::process::Command::new("spirv-dis")
++        .arg(&path)
++        .output()
++        .unwrap();
++    assert!(
++        disassembly.status.success(),
++        "{}",
++        String::from_utf8_lossy(&disassembly.stderr)
++    );
++    std::fs::remove_dir_all(directory).unwrap();
++    String::from_utf8(disassembly.stdout).unwrap()
++}
++
++#[test]
++fn dynamic_image_matrix_preserves_types_lod_grad_queries_and_storage() {
++    let (spv, metadata) = garnetxlate::translate_text_gpu_arguments(
++        include_str!("fixtures/argument_image_sampling_queries.ll"),
++        [8, 1, 1],
++    )
++    .unwrap();
++    let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
++    assert_eq!(
++        metadata["argument_resource_tables"]["categories"],
++        serde_json::json!([0, 1, 2])
++    );
++    assert_eq!(
++        metadata["argument_resource_tables"]["image_query_binding"],
++        673
++    );
++
++    let assembly = validate_and_disassemble(&spv, "matrix");
++    for expected in [
++        "OpTypeImage %float 2D",
++        "OpTypeImage %uint 2D",
++        "OpTypeImage %int 2D",
++        "OpImageSampleExplicitLod",
++        "OpImageSampleDrefExplicitLod",
++        "Grad",
++        "ConstOffset",
++        "OpImageFetch",
++        "OpImageRead",
++        "OpImageWrite",
++        "Binding 672",
++        "Binding 673",
++        "DescriptorSet 0",
++        "DescriptorSet 2",
++        "DescriptorSet 3",
++        "DescriptorSet 4",
++    ] {
++        assert!(
++            assembly.contains(expected),
++            "missing {expected}:\n{assembly}"
++        );
++    }
++    assert!(
++        assembly.matches("OpImageWrite").count() == 3,
++        "one write per selected float/uint/sint token:\n{assembly}"
++    );
++    assert!(
++        assembly
++            .lines()
++            .filter(|line| line.contains("OpImageSampleExplicitLod"))
++            .any(|line| line.contains("Lod|ConstOffset")),
++        "explicit level and nonzero offset must share one sample:\n{assembly}"
++    );
++    assert!(
++        assembly
++            .lines()
++            .filter(|line| line.contains("OpImageSampleExplicitLod"))
++            .any(|line| line.contains("Grad")),
++        "gradient sample must retain Grad:\n{assembly}"
++    );
++    assert!(
++        assembly
++            .lines()
++            .any(|line| { line.contains("OpShiftRightLogical %uint") && line.contains("OpLoad") })
++            || (assembly.contains("OpShiftRightLogical %uint")
++                && assembly.contains("OpULessThan %bool")),
++        "query lowering must retain mip shifting and bounds checks:\n{assembly}"
++    );
++}
++
++#[test]
++fn storage_writes_require_the_macos_zero_lod_constant() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let write = "call void @air.write_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, <4 x float> %write_texel, i32 0, i32 3)";
++    assert!(original.contains(write), "fixture write anchor changed");
++    for (lod, expected) in [("i32 1", "zero LOD"), ("i32 %mip", "zero LOD")] {
++        let source = original.replacen(
++            write,
++            &write.replace(
++                "<4 x float> %write_texel, i32 0, i32 3",
++                &format!("<4 x float> %write_texel, {lod}, i32 3"),
++            ),
++            1,
++        );
++        let error = garnetxlate::translate_text_gpu_arguments(&source, [8, 1, 1]).unwrap_err();
++        assert!(error.contains(expected), "{error}");
++    }
++}
++
++#[test]
++fn storage_reads_reject_a_lod_the_spirv_op_cannot_carry() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let read = "call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, i32 0, i32 3)";
++    assert!(original.contains(read), "fixture read anchor changed");
++    for (lod, expected) in [
++        ("i32 2", "storage image read requires zero LOD"),
++        ("i32 %mip", "storage image read requires zero LOD"),
++    ] {
++        let source = original.replacen(
++            read,
++            &read.replace("i32 0, i32 3", &format!("{lod}, i32 3")),
++            1,
++        );
++        let error = garnetxlate::translate_text_gpu_arguments(&source, [8, 1, 1]).unwrap_err();
++        assert!(error.contains(expected), "{error}");
++    }
++}
++
++#[test]
++fn storage_accepts_constant_zero_initializer_lod() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let source = original
++        .replace(
++            "call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, i32 0, i32 3)",
++            "call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, i32 zeroinitializer, i32 3)",
++        )
++        .replace(
++            "call void @air.write_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, <4 x float> %write_texel, i32 0, i32 3)",
++            "call void @air.write_texture_2d.v4f32(ptr addrspace(1) %storage_f, <2 x i32> zeroinitializer, <4 x float> %write_texel, i32 zeroinitializer, i32 3)",
++        );
++    let (spv, _) = garnetxlate::translate_text_gpu_arguments(&source, [8, 1, 1]).unwrap();
++    let assembly = validate_and_disassemble(&spv, "storage-zero-initializer");
++    assert!(assembly.contains("OpImageRead") && assembly.contains("OpImageWrite"));
++}
++
++#[test]
++fn integer_gradient_samples_are_refused_without_emitting_an_invalid_instruction() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let source = original
++        .replace(
++            "%gradient_value = call float @sample_float_gradient(ptr addrspace(1) %image,",
++            "%gradient_value = call float @sample_float_gradient(ptr addrspace(1) %image_u,",
++        )
++        .replace(
++            "@air.sample_texture_2d_grad.v4f32",
++            "@air.sample_texture_2d_grad.u.v4i32",
++        )
++        .replace(
++            "declare { <4 x float>, i8 } @air.sample_texture_2d_grad.v4f32",
++            "declare { <4 x float>, i8 } @air.sample_texture_2d_grad.u.v4i32",
++        )
++        .replace(
++            "%grad_sample = call { <4 x float>, i8 }",
++            "%grad_sample = call { <4 x i32>, i8 }",
++        )
++        .replace(
++            "%grad_rgba = extractvalue { <4 x float>, i8 }",
++            "%grad_rgba = extractvalue { <4 x i32>, i8 }",
++        )
++        .replace(
++            "%green = extractelement <4 x float> %grad_rgba, i32 1",
++            "%green_i = extractelement <4 x i32> %grad_rgba, i32 1\n  %green = sitofp i32 %green_i to float",
++        );
++    let error = garnetxlate::translate_text_gpu_arguments(&source, [8, 1, 1]).unwrap_err();
++    assert!(
++        error.contains("integer texture") && error.contains("gradient"),
++        "{error}"
++    );
++}
+--- /dev/null
++++ b/garnetxlate/tests/image_operation_legality.rs
+@@ -0,0 +1,363 @@
++use metal2vulkan::passes::Stage;
++
++fn source(shape: &str, access: &str, body: &str, declarations: &str) -> String {
++    format!(
++        r#"target triple = "air64-apple-macosx"
++define void @probe(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {{
++entry:
++{body}
++  ret void
++}}
++{declarations}
++!air.kernel = !{{!0}}
++!0 = !{{ptr @probe, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4, !5}}
++!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.{access}", !"air.arg_type_name", !"{shape}"}}
++!4 = !{{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}}
++!5 = !{{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4*"}}
++"#
++    )
++}
++
++fn translate(source: &str, label: &str) -> Result<Vec<u8>, String> {
++    let tmp = std::env::temp_dir().join(format!("image-legality-{label}-{}", std::process::id()));
++    std::fs::create_dir_all(&tmp).unwrap();
++    let result = metal2vulkan::translate_sanitized_native(source, Stage::Kernel, &tmp)
++        .map_err(|e| e.to_string());
++    std::fs::remove_dir_all(&tmp).unwrap();
++    result
++}
++
++fn assembly(bytes: &[u8], label: &str) -> String {
++    let tmp =
++        std::env::temp_dir().join(format!("image-legality-val-{label}-{}", std::process::id()));
++    std::fs::create_dir_all(&tmp).unwrap();
++    let path = tmp.join("shader.spv");
++    std::fs::write(&path, bytes).unwrap();
++    let validation = std::process::Command::new("spirv-val")
++        .args(["--target-env", "vulkan1.2"])
++        .arg(&path)
++        .output()
++        .unwrap();
++    assert!(
++        validation.status.success(),
++        "{}",
++        String::from_utf8_lossy(&validation.stderr)
++    );
++    let disassembly = std::process::Command::new("spirv-dis")
++        .arg(&path)
++        .output()
++        .unwrap();
++    std::fs::remove_dir_all(&tmp).unwrap();
++    assert!(disassembly.status.success());
++    String::from_utf8(disassembly.stdout).unwrap()
++}
++
++#[test]
++fn direct_depth_array_size_and_depth_ms_sample_count_are_dispatched() {
++    for (shape, intrinsic, opcode) in [
++        (
++            "depth2d_array<float, sample>",
++            "air.get_array_size_depth_2d_array",
++            "OpImageQuerySizeLod",
++        ),
++        (
++            "depth2d_ms<float, read>",
++            "air.get_num_samples_depth_2d_ms",
++            "OpImageQuerySamples",
++        ),
++    ] {
++        let ll = source(shape, if shape.contains("_ms") { "read" } else { "sample" },
++            &format!("  %n = call i32 @{intrinsic}(ptr addrspace(1) %tex)\n  store i32 %n, ptr addrspace(1) %out"),
++            &format!("declare i32 @{intrinsic}(ptr addrspace(1))"));
++        let bytes = translate(&ll, intrinsic).unwrap();
++        assert!(assembly(&bytes, intrinsic).contains(opcode));
++    }
++}
++
++#[test]
++fn one_dimensional_read_and_width_require_zero_lod() {
++    for suffix in ["1d", "1d_array"] {
++        let layer = if suffix.ends_with("array") {
++            "i32 1, "
++        } else {
++            ""
++        };
++        let layer_ty = if layer.is_empty() { "" } else { "i32, " };
++        let shape = format!("texture{suffix}<float, read>");
++        for lod in [0, 1] {
++            let read = source(&shape, "read", &format!("  %r = call {{ <4 x float>, i8 }} @air.read_texture_{suffix}.v4f32(ptr addrspace(1) %tex, i32 3, {layer}i32 {lod}, i32 1)\n  %c = extractvalue {{ <4 x float>, i8 }} %r, 0\n  store <4 x float> %c, ptr addrspace(1) %out"),
++                &format!("declare {{ <4 x float>, i8 }} @air.read_texture_{suffix}.v4f32(ptr addrspace(1), i32, {layer_ty}i32, i32)"));
++            let width = source(&shape, "read", &format!("  %n = call i32 @air.get_width_texture_{suffix}(ptr addrspace(1) %tex, i32 {lod})\n  store i32 %n, ptr addrspace(1) %out"),
++                &format!("declare i32 @air.get_width_texture_{suffix}(ptr addrspace(1), i32)"));
++            for (label, ll) in [
++                (format!("read-{suffix}-{lod}"), read),
++                (format!("width-{suffix}-{lod}"), width),
++            ] {
++                let result = translate(&ll, &label);
++                if lod == 0 {
++                    assembly(&result.unwrap(), &label);
++                } else {
++                    assert!(result
++                        .expect_err("operation must be rejected")
++                        .contains("1D texture requires zero LOD"));
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn one_dimensional_mip_count_is_zero() {
++    for suffix in ["1d", "1d_array"] {
++        let ll = source(&format!("texture{suffix}<float, sample>"), "sample",
++            &format!("  %n = call i32 @air.get_num_mip_levels_texture_{suffix}(ptr addrspace(1) %tex)\n  store i32 %n, ptr addrspace(1) %out"),
++            &format!("declare i32 @air.get_num_mip_levels_texture_{suffix}(ptr addrspace(1))"));
++        let asm = assembly(&translate(&ll, suffix).unwrap(), suffix);
++        assert!(!asm.contains("OpImageQueryLevels"), "{asm}");
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpCopyObject %uint %uint_0")),
++            "{asm}"
++        );
++    }
++}
++
++fn cube_gradient(arrayed: bool, lanes: u32) -> String {
++    let suffix = if arrayed { "cube_array" } else { "cube" };
++    let layer = if arrayed { "i32 1, " } else { "" };
++    let layer_ty = if arrayed { "i32, " } else { "" };
++    let derivative = if lanes == 3 {
++        "<float 0.125, float 0.25, float 0.5>"
++    } else {
++        "<float 0.125, float 0.25>"
++    };
++    source(&format!("texture{suffix}<float, sample>"), "sample",
++        &format!("  %r = call {{ <4 x float>, i8 }} @air.sample_texture_{suffix}_grad.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <3 x float> <float 0.5, float 1.0, float 0.25>, {layer}<{lanes} x float> {derivative}, <{lanes} x float> {derivative}, float 0.0, i32 0)\n  %c = extractvalue {{ <4 x float>, i8 }} %r, 0\n  store <4 x float> %c, ptr addrspace(1) %out"),
++        &format!("declare {{ <4 x float>, i8 }} @air.sample_texture_{suffix}_grad.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, {layer_ty}<{lanes} x float>, <{lanes} x float>, float, i32)"))
++}
++
++#[test]
++fn cube_and_cube_array_gradients_have_three_spatial_derivatives() {
++    for arrayed in [false, true] {
++        let label = if arrayed { "cube-array" } else { "cube" };
++        let asm = assembly(
++            &translate(&cube_gradient(arrayed, 3), label).unwrap(),
++            label,
++        );
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Grad")),
++            "{asm}"
++        );
++        assert!(!asm.contains("ConstOffset"), "{asm}");
++        let grad = asm
++            .lines()
++            .find(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Grad"))
++            .unwrap();
++        for derivative in grad.split_whitespace().rev().take(2) {
++            assert!(
++                asm.lines().any(|line| line
++                    .trim_start()
++                    .starts_with(&format!("{derivative} = OpConstantComposite %v3float"))),
++                "{asm}"
++            );
++        }
++        assert!(
++            translate(&cube_gradient(arrayed, 2), &format!("{label}-bad"))
++                .expect_err("operation must be rejected")
++                .contains("3-component float derivatives")
++        );
++    }
++}
++
++#[test]
++fn macos_depth_comparison_rejects_nonzero_level_bias_and_gradients() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let anchor = "%coord1, float 0.5, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)";
++    assert!(original.contains(anchor));
++    for (tail, expected) in [
++        ("%coord1, float 0.5, i1 true, <2 x i32> zeroinitializer, i1 true, float 1.0, float 0.0, i32 0)", "level(0)"),
++        ("%coord1, float 0.5, i1 true, <2 x i32> zeroinitializer, i1 false, float 1.0, float 0.0, i32 0)", "bias"),
++    ] {
++        let ll = original.replace(anchor, tail);
++        assert!(indirect(&ll).expect_err("operation must be rejected").contains(expected));
++    }
++    let ll = original.replace(
++        "air.sample_compare_depth_2d.f32",
++        "air.sample_compare_depth_2d_grad.f32",
++    );
++    assert!(indirect(&ll)
++        .expect_err("operation must be rejected")
++        .contains("gradient"));
++}
++
++#[test]
++fn cube_sample_has_no_offset_overload() {
++    let ll = cube_gradient(false, 3)
++        .replace("cube_grad.v4f32", "cube.v4f32")
++        .replace(
++            "<3 x float> <float 0.125, float 0.25, float 0.5>, <3 x float> <float 0.125, float 0.25, float 0.5>, float 0.0, i32 0)",
++            "i1 true, <2 x i32> <i32 1, i32 -1>, i1 true, float 0.0, float 0.0, i32 0)",
++        )
++        .replace(
++            "<3 x float>, <3 x float>, float, i32)",
++            "i1, <2 x i32>, i1, float, float, i32)",
++        );
++    assert!(translate(&ll, "cube-offset")
++        .expect_err("operation must be rejected")
++        .contains("cube sample has no offset"));
++}
++
++#[test]
++fn indirect_one_dimensional_query_lod_is_checked() {
++    let ll = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let ll = ll.replace("%image_1d, i32 0)", "%image_1d, i32 %mip)");
++    assert!(indirect(&ll)
++        .expect_err("nonzero/dynamic 1D LOD must fail")
++        .contains("1D texture requires zero LOD"));
++}
++
++#[test]
++fn depth_cube_gradient_keeps_float3_derivatives() {
++    let ll = cube_gradient(true, 3)
++        .replace(
++            "texturecube_array<float, sample>",
++            "depthcube_array<float, sample>",
++        )
++        .replace(
++            "air.sample_texture_cube_array_grad.v4f32",
++            "air.sample_depth_cube_array_grad.f32",
++        )
++        .replace("{ <4 x float>, i8 }", "{ float, i8 }")
++        .replace(
++            "ptr addrspace(2) %sampler, <3 x float>",
++            "ptr addrspace(2) %sampler, i32 0, <3 x float>",
++        )
++        .replace(
++            "ptr addrspace(2), <3 x float>",
++            "ptr addrspace(2), i32, <3 x float>",
++        )
++        .replace("store <4 x float> %c", "store float %c");
++    let asm = assembly(
++        &translate(&ll, "depth-cube-grad").unwrap(),
++        "depth-cube-grad",
++    );
++    assert!(
++        asm.lines()
++            .any(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Grad")),
++        "{asm}"
++    );
++}
++
++#[test]
++fn multisample_reads_preserve_component_type_and_sample_operand() {
++    for (suffix, element) in [("v4f32", "float"), ("u.v4i32", "i32"), ("s.v4i32", "i32")] {
++        let scalar = if suffix == "u.v4i32" {
++            "uint"
++        } else if element == "i32" {
++            "int"
++        } else {
++            "float"
++        };
++        let ll = source(&format!("texture2d_ms<{scalar}, read>"), "read",
++            &format!("  %r = call {{ <4 x {element}>, i8 }} @air.read_texture_2d_ms.{suffix}(ptr addrspace(1) %tex, <2 x i32> <i32 2, i32 1>, i32 2, i32 1)\n  %c = extractvalue {{ <4 x {element}>, i8 }} %r, 0\n  store <4 x {element}> %c, ptr addrspace(1) %out"),
++            &format!("declare {{ <4 x {element}>, i8 }} @air.read_texture_2d_ms.{suffix}(ptr addrspace(1), <2 x i32>, i32, i32)"));
++        let asm = assembly(
++            &translate(&ll, suffix).unwrap_or_else(|error| panic!("{suffix}: {error}")),
++            suffix,
++        );
++        assert!(
++            asm.contains(&format!("OpTypeImage %{scalar} 2D 0 0 1 1")),
++            "{asm}"
++        );
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpImageFetch") && line.contains("Sample %uint_2")),
++            "{asm}"
++        );
++        assert!(
++            !asm.lines()
++                .any(|line| line.contains("OpImageFetch") && line.contains("Lod")),
++            "{asm}"
++        );
++    }
++}
++
++#[test]
++fn multisample_storage_write_is_refused() {
++    let original = include_str!("fixtures/argument_image_sampling_queries.ll");
++    let ll = original.replace(
++        "air.write_texture_2d.v4f32",
++        "air.write_texture_2d_ms.v4f32",
++    );
++    let error = indirect(&ll).expect_err("multisample write must be refused");
++    assert!(
++        error.contains("multisampled storage") || error.contains("conflicting image types"),
++        "{error}"
++    );
++}
++
++fn indirect(source: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
++    let (spv, metadata) = garnetxlate::translate_bytes(source.as_bytes(), [8, 1, 1])?;
++    garnetxlate::lower_gpu_arguments(&spv, &metadata)
++}
++
++#[test]
++fn indirect_multisample_reads_keep_ms_type_and_selected_sample() {
++    for (suffix, element, component) in [
++        ("v4f32", "float", "float"),
++        ("u.v4i32", "i32", "uint"),
++        ("s.v4i32", "i32", "int"),
++    ] {
++        let ll = format!(
++            r#"target triple = "air64-apple-macosx"
++%Root = type {{ [2 x %Record] }}
++%Record = type {{ [2 x ptr addrspace(1)] }}
++define void @probe(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {{
++entry:
++  %ix = and i32 %i, 1
++  %index = zext i32 %ix to i64
++  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0, i64 1, i32 0, i64 %index
++  %token = load i64, ptr addrspace(2) %slot, align 8
++  %image = inttoptr i64 %token to ptr addrspace(1)
++  %read = call {{ <4 x {element}>, i8 }} @air.read_texture_2d_ms.{suffix}(ptr addrspace(1) %image, <2 x i32> <i32 2, i32 1>, i32 2, i32 1)
++  %rgba = extractvalue {{ <4 x {element}>, i8 }} %read, 0
++  store <4 x {element}> %rgba, ptr addrspace(1) %out, align 16
++  ret void
++}}
++declare {{ <4 x {element}>, i8 }} @air.read_texture_2d_ms.{suffix}(ptr addrspace(1), <2 x i32>, i32, i32)
++!air.kernel = !{{!0}}
++!0 = !{{ptr @probe, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4, !5}}
++!3 = !{{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"{element}4"}}
++!5 = !{{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}}
++"#
++        );
++        let (spv, metadata) = indirect(&ll).unwrap();
++        let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
++        assert_eq!(metadata["argument_resource_tables"]["version"], 8);
++        let asm = assembly(&spv, &format!("indirect-ms-{suffix}"));
++        assert!(
++            asm.contains(&format!("OpTypeImage %{component} 2D 0 0 1 1")),
++            "{asm}"
++        );
++        assert!(
++            asm.lines()
++                .any(|line| line.contains("OpImageFetch") && line.contains("Sample %uint_2")),
++            "{asm}"
++        );
++    }
++}
++
++#[test]
++fn abi8_image_matrix_uses_current_query_tail_contract() {
++    let (spv, metadata) =
++        indirect(include_str!("fixtures/argument_image_sampling_queries.ll")).unwrap();
++    let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
++    assert_eq!(metadata["argument_resource_tables"]["version"], 8);
++    assembly(&spv, "abi8-image-matrix");
++}

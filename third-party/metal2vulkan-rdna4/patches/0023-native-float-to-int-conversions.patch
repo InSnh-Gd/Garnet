@@ -1,0 +1,235 @@
+diff --git a/src/native/emitter/body/mod.rs b/src/native/emitter/body/mod.rs
+--- a/src/native/emitter/body/mod.rs
++++ b/src/native/emitter/body/mod.rs
+@@ -113,16 +113,19 @@
+ 
+ /// Which resolved conversion emitter a single-operand type-conversion opcode routes to under the graph
+ /// walk. The variants distinguish integer resize (`zext`/`sext`/`trunc`, carrying the SPIR-V `Op`),
+-/// float resize (`fptrunc`/`fpext`), and integer→float (`sitofp`/`uitofp`, carrying the `Op`).
++/// float resize (`fptrunc`/`fpext`), integer→float (`sitofp`/`uitofp`, carrying the `Op`), and
++/// float→integer (`fptoui`/`fptosi`, carrying the `Op`).
+ #[derive(Clone, Copy)]
+ enum ConvertKind {
+     Int(Op),
+     Float,
+     IntToFloat(Op),
++    FloatToInt(Op),
+ }
+ 
+-/// The conversion emitter a `zext`/`sext`/`trunc`/`fptrunc`/`fpext`/`sitofp`/`uitofp` opcode dispatches
+-/// to, or `None` for any other opcode (`"zext" => Int(Op::UConvert)`, etc.).
++/// The conversion emitter a `zext`/`sext`/`trunc`/`fptrunc`/`fpext`/`sitofp`/`uitofp`/`fptoui`/
++/// `fptosi` opcode dispatches to, or `None` for any other opcode (`"zext" => Int(Op::UConvert)`,
++/// etc.).
+ fn convert_op_dispatch(opcode: &str) -> Option<ConvertKind> {
+     let kind = match opcode {
+         "zext" => ConvertKind::Int(Op::UConvert),
+@@ -131,6 +134,8 @@
+         "fptrunc" | "fpext" => ConvertKind::Float,
+         "sitofp" => ConvertKind::IntToFloat(Op::ConvertSToF),
+         "uitofp" => ConvertKind::IntToFloat(Op::ConvertUToF),
++        "fptoui" => ConvertKind::FloatToInt(Op::ConvertFToU),
++        "fptosi" => ConvertKind::FloatToInt(Op::ConvertFToS),
+         _ => return None,
+     };
+     Some(kind)
+@@ -354,9 +359,10 @@
+             Some(UnaryKind::Freeze)
+         ));
+         // Conversions are single-operand but NOT part of this family (they split src/dst); everything
+-        // else must also decline so it stays on the text substrate.
++        // else must also decline so it reaches the typed unmigrated-opcode error.
+         for opcode in [
+-            "zext", "sext", "trunc", "fptrunc", "sitofp", "add", "load", "select", "",
++            "zext", "sext", "trunc", "fptrunc", "sitofp", "fptoui", "fptosi", "add", "load",
++            "select", "",
+         ] {
+             assert!(
+                 unary_op_dispatch(opcode).is_none(),
+@@ -395,11 +401,17 @@
+             convert_op_dispatch("uitofp"),
+             Some(ConvertKind::IntToFloat(Op::ConvertUToF))
+         ));
+-        // `fptoui`/`fptosi`/`ptrtoint`/`inttoptr` are conversions the text path handles elsewhere (or
+-        // not at all) — they must NOT route through this family.
+-        for opcode in [
+-            "fptoui", "fptosi", "ptrtoint", "inttoptr", "add", "load", "",
+-        ] {
++        assert!(matches!(
++            convert_op_dispatch("fptoui"),
++            Some(ConvertKind::FloatToInt(Op::ConvertFToU))
++        ));
++        assert!(matches!(
++            convert_op_dispatch("fptosi"),
++            Some(ConvertKind::FloatToInt(Op::ConvertFToS))
++        ));
++        // `ptrtoint`/`inttoptr` are conversions the text path handles elsewhere (or not at all) —
++        // they must NOT route through this family.
++        for opcode in ["ptrtoint", "inttoptr", "add", "load", ""] {
+             assert!(
+                 convert_op_dispatch(opcode).is_none(),
+                 "{opcode} must not route through the conversion dispatch"
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -124,6 +124,13 @@
+                                 name,
+                                 instructions,
+                             ),
++                            ConvertKind::FloatToInt(op) => self.emit_float_to_int_convert_resolved(
++                                op,
++                                src,
++                                dst_ty,
++                                name,
++                                instructions,
++                            ),
+                         };
+                     }
+                 }
+diff --git a/src/native/emitter/ops/conversions.rs b/src/native/emitter/ops/conversions.rs
+--- a/src/native/emitter/ops/conversions.rs
++++ b/src/native/emitter/ops/conversions.rs
+@@ -334,6 +334,35 @@
+         Ok(())
+     }
+ 
++    /// The operand-resolved core of `fptoui`/`fptosi`. The destination is resolved before checking
++    /// shapes so LLVM `i1` (which becomes SPIR-V `OpTypeBool`) cannot reach `OpConvertFToU/S`.
++    pub(in crate::native::emitter) fn emit_float_to_int_convert_resolved(
++        &mut self,
++        op: Op,
++        src: TypedValue,
++        dst_ty: LlType,
++        name: String,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
++        let src_ty = self.resolve_type(&src.ty)?;
++        let resolved_dst = self.resolve_type(&dst_ty)?;
++        if !int_to_float_convert_supported(&resolved_dst, &src_ty) {
++            return Err(format!(
++                "native emitter: float-to-integer conversion needs matching float-to-integer shapes, got {src_ty:?} to {resolved_dst:?}"
++            ));
++        }
++        let result_type = self.type_id(&dst_ty)?;
++        let result = self.result_id(&name, &dst_ty)?;
++        let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
++        instructions.push(Self::inst(
++            op,
++            Some(result_type),
++            Some(result),
++            vec![Operand::IdRef(src_id)],
++        ));
++        Ok(())
++    }
++
+     /// Like [`Self::bfloat_bits_to_float_shaped`] but allocating the result id.
+     pub(in crate::native::emitter) fn bfloat_bits_to_float_shaped_id(
+         &mut self,
+diff --git a/src/native/tests/mod.rs b/src/native/tests/mod.rs
+--- a/src/native/tests/mod.rs
++++ b/src/native/tests/mod.rs
+@@ -11,6 +11,7 @@
+ mod bounded_work;
+ mod buffers;
+ mod control_flow;
++mod float_to_int_convert;
+ mod interface;
+ mod intrinsics;
+ mod misc;
+diff --git a/src/native/tests/float_to_int_convert.rs b/src/native/tests/float_to_int_convert.rs
+new file mode 100644
+--- /dev/null
++++ b/src/native/tests/float_to_int_convert.rs
+@@ -0,0 +1,92 @@
++use crate::passes::Stage;
++use crate::{disassemble, tools};
++
++#[test]
++fn native_llvm_float_to_int_conversions_cover_scalar_half_narrow_and_vectors() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++define void @k(ptr addrspace(1) %in_f, ptr addrspace(1) %in_h, ptr addrspace(1) %in_vf, ptr addrspace(1) %out_u32, ptr addrspace(1) %out_s32, ptr addrspace(1) %out_u8, ptr addrspace(1) %out_s16, ptr addrspace(1) %out_vu8) {
++entry:
++  %f = load float, ptr addrspace(1) %in_f, align 4
++  %h = load half, ptr addrspace(1) %in_h, align 2
++  %vf = load <2 x float>, ptr addrspace(1) %in_vf, align 8
++  %u32 = fptoui float %f to i32
++  %s32 = fptosi float %f to i32
++  %u8 = fptoui float %f to i8
++  %s16 = fptosi half %h to i16
++  %vu8 = fptoui <2 x float> %vf to <2 x i8>
++  store i32 %u32, ptr addrspace(1) %out_u32, align 4
++  store i32 %s32, ptr addrspace(1) %out_s32, align 4
++  store i8 %u8, ptr addrspace(1) %out_u8, align 1
++  store i16 %s16, ptr addrspace(1) %out_s16, align 2
++  store <2 x i8> %vu8, ptr addrspace(1) %out_vu8, align 2
++  ret void
++}
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6, !7, !8, !9, !10}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"in_f"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half*", !"air.arg_name", !"in_h"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2*", !"air.arg_name", !"in_vf"}
++!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out_u32"}
++!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int*", !"air.arg_name", !"out_s32"}
++!8 = !{i32 5, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar*", !"air.arg_name", !"out_u8"}
++!9 = !{i32 6, !"air.buffer", !"air.location_index", i32 6, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"short*", !"air.arg_name", !"out_s16"}
++!10 = !{i32 7, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"uchar2*", !"air.arg_name", !"out_vu8"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_float_to_int_convert_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert_eq!(asm.matches("OpConvertFToU").count(), 3, "{asm}");
++    assert_eq!(asm.matches("OpConvertFToS").count(), 2, "{asm}");
++    assert!(!asm.contains("OpFunctionCall"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(tmp);
++}
++
++#[test]
++fn native_llvm_float_to_int_conversion_rejects_mismatched_shapes() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++define void @k(ptr addrspace(1) %in, ptr addrspace(1) %out) {
++entry:
++  %v = load <2 x float>, ptr addrspace(1) %in, align 8
++  %bad = fptoui <2 x float> %v to i32
++  store i32 %bad, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2*", !"air.arg_name", !"in"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_float_to_int_mismatch_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let error = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
++        .expect_err("mismatched float-to-integer shapes must not translate");
++    assert!(
++        error.contains("float-to-integer conversion needs matching float-to-integer shapes"),
++        "{error}"
++    );
++    let _ = std::fs::remove_dir_all(tmp);
++}

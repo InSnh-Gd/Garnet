@@ -1,0 +1,23 @@
+; Invalid MS shape: a multisampled 1D image cannot be represented by the
+; canonical ABI 9 registry. Reflection must set argumentNullShapesInvalid.
+OpCapability Shader
+OpCapability RuntimeDescriptorArray
+OpExtension "SPV_EXT_descriptor_indexing"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %bad DescriptorSet 2
+OpDecorate %bad Binding 0
+
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%image = OpTypeImage %float 1D 0 0 1 1 Unknown
+%array = OpTypeRuntimeArray %image
+%ptr = OpTypePointer UniformConstant %array
+%bad = OpVariable %ptr UniformConstant
+
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd

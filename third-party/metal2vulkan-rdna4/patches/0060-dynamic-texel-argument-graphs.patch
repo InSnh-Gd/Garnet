@@ -1,0 +1,426 @@
+diff --git a/src/passes/air_calls/images/read.rs b/src/passes/air_calls/images/read.rs
+--- a/src/passes/air_calls/images/read.rs
++++ b/src/passes/air_calls/images/read.rs
+@@ -55,7 +55,16 @@
+     // A cube read carries the face index in the array-layer slot (`(tex[, sampler], coord, face,
+     // lod, access)`), so parse it with the arrayed shape.
+     let cube = dim == Dim::DimCube;
+-    let (coord, layer, lod, slice) = if cube && arrayed {
++    let (coord, layer, lod, slice) = if dim == Dim::DimBuffer {
++        // Texture-buffer reads carry a final access selector, not a mip level. AIR can also
++        // include an otherwise-unused sampler operand, so locate the integer coordinate by type.
++        let coord = if value_is_int_or_intvec(ctx, args[1]) {
++            args[1]
++        } else {
++            *args.get(2).ok_or("air.read_texture buffer missing coord")?
++        };
++        (coord, None, None, None)
++    } else if cube && arrayed {
+         // NullMoth's cube-array AIR ABI: coord, face, slice, [offset], lod, access.
+         let base = if value_is_int_or_intvec(ctx, args[1]) {
+             1
+diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -362,9 +362,6 @@
+     }
+     let (dim, arrayed) = super::super::air_calls::intrinsic_texture_shape(name)
+         .ok_or("GPU argument texture intrinsic has no known shape")?;
+-    if dim == Dim::DimBuffer {
+-        return Err("GPU argument graph texel buffers are unsupported".into());
+-    }
+     let component = name
+         .rsplit('.')
+         .next()
+@@ -1150,8 +1147,10 @@
+                             );
+                         }
+                         let ty = if shape.storage {
+-                            ctx.add_capability(Capability::StorageImageReadWithoutFormat);
+-                            ctx.add_capability(Capability::StorageImageWriteWithoutFormat);
++                            if shape.dim != Dim::DimBuffer {
++                                ctx.add_capability(Capability::StorageImageReadWithoutFormat);
++                                ctx.add_capability(Capability::StorageImageWriteWithoutFormat);
++                            }
+                             ctx.ty_storage_image(
+                                 shape.dim,
+                                 shape.arrayed,
+@@ -1167,7 +1166,23 @@
+                                 shape.depth,
+                             )
+                         };
+-                        (u32::from(shape.storage), ty, Some(shape))
++                        let category = if shape.dim == Dim::DimBuffer {
++                            ctx.add_capability(if shape.storage {
++                                Capability::StorageTexelBufferArrayDynamicIndexing
++                            } else {
++                                Capability::UniformTexelBufferArrayDynamicIndexing
++                            });
++                            if shape.storage {
++                                ctx.add_capability(Capability::ImageBuffer);
++                                4
++                            } else {
++                                ctx.add_capability(Capability::SampledBuffer);
++                                3
++                            }
++                        } else {
++                            u32::from(shape.storage)
++                        };
++                        (category, ty, Some(shape))
+                     };
+                     let category_number = category;
+                     let global = *globals.entry((category, element)).or_insert_with(|| {
+@@ -1180,7 +1195,12 @@
+                             Some(global),
+                             vec![Operand::StorageClass(StorageClass::UniformConstant)],
+                         ));
+-                        decorate_binding(&mut ctx.module, global, 2 + category, 0);
++                        let (set, binding) = match category {
++                            3 => (2, 1),
++                            4 => (3, 1),
++                            category => (2 + category, 0),
++                        };
++                        decorate_binding(&mut ctx.module, global, set, binding);
+                         ctx.interface_buffer_var(global);
+                         global
+                     });
+@@ -1198,43 +1218,44 @@
+                         ],
+                     );
+                     let token_index = index;
+-                    let index = if let Some(shape) = shape {
+-                        let shape = super::super::ImageShape {
+-                            dim: shape.dim,
+-                            arrayed: shape.arrayed,
+-                            depth: shape.depth,
+-                            comp: shape.comp,
+-                            multisampled: shape.multisampled,
+-                            access: if shape.storage {
+-                                ImageAccess::Storage
+-                            } else {
+-                                ImageAccess::Sampled
+-                            },
++                    let index =
++                        if let Some(shape) = shape.filter(|shape| shape.dim != Dim::DimBuffer) {
++                            let shape = super::super::ImageShape {
++                                dim: shape.dim,
++                                arrayed: shape.arrayed,
++                                depth: shape.depth,
++                                comp: shape.comp,
++                                multisampled: shape.multisampled,
++                                access: if shape.storage {
++                                    ImageAccess::Storage
++                                } else {
++                                    ImageAccess::Sampled
++                                },
++                            };
++                            let dummy = ctx.null_descriptor_index(shape, Some(table), &mut body)?;
++                            let zero = ctx.const_uint(0);
++                            let boolean = ctx.ty_bool();
++                            let missing = value(
++                                ctx,
++                                &mut body,
++                                Op::IEqual,
++                                boolean,
++                                vec![Operand::IdRef(token_index), Operand::IdRef(zero)],
++                            );
++                            value(
++                                ctx,
++                                &mut body,
++                                Op::Select,
++                                uint,
++                                vec![
++                                    Operand::IdRef(missing),
++                                    Operand::IdRef(dummy),
++                                    Operand::IdRef(token_index),
++                                ],
++                            )
++                        } else {
++                            index
+                         };
+-                        let dummy = ctx.null_descriptor_index(shape, Some(table), &mut body)?;
+-                        let zero = ctx.const_uint(0);
+-                        let boolean = ctx.ty_bool();
+-                        let missing = value(
+-                            ctx,
+-                            &mut body,
+-                            Op::IEqual,
+-                            boolean,
+-                            vec![Operand::IdRef(token_index), Operand::IdRef(zero)],
+-                        );
+-                        value(
+-                            ctx,
+-                            &mut body,
+-                            Op::Select,
+-                            uint,
+-                            vec![
+-                                Operand::IdRef(missing),
+-                                Operand::IdRef(dummy),
+-                                Operand::IdRef(token_index),
+-                            ],
+-                        )
+-                    } else {
+-                        index
+-                    };
+                     let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, element);
+                     let pointer = value(
+                         ctx,
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -43,6 +43,27 @@
+         })
+         .map(|(_, set)| *set - ARGUMENT_RESOURCE_FIRST_SET)
+         .collect::<Vec<_>>();
++    let defs = module
++        .all_inst_iter()
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    for (&id, &binding) in &bindings {
++        let Some(&set) = sets.get(&id) else { continue };
++        if binding != 1 || !matches!(set, 2 | 3) {
++            continue;
++        }
++        let Some(pointer) = defs.get(&id).and_then(|inst| inst.result_type) else {
++            continue;
++        };
++        let Some(image) = ptr_pointee(&defs, pointer).and_then(|ty| defs.get(&ty)) else {
++            continue;
++        };
++        if image.class.opcode == spirv::Op::TypeImage
++            && image.operands.get(1) == Some(&Operand::Dim(spirv::Dim::DimBuffer))
++        {
++            categories.push(if set == 2 { 3 } else { 4 });
++        }
++    }
+     categories.sort_unstable();
+     categories.dedup();
+     let image_query_binding = bindings
+@@ -155,18 +176,18 @@
+     proof: Option<&UniformControlProof>,
+     replay: QueryLodReplay,
+ ) -> Result<(Vec<u8>, Vec<u32>, bool), String> {
+-    if !matches!(table_version, 7..=9) {
++    if !matches!(table_version, 7..=10) {
+         return Err(format!(
+             "unsupported GPU argument table version {table_version}"
+         ));
+     }
+-    if table_version != 9 && normalized != (table_version == 8) {
++    if !matches!(table_version, 9 | 10) && normalized != (table_version == 8) {
+         return Err("table and coordinate versions disagree".into());
+     }
+     if null_shapes.len() > 64 || null_shapes.windows(2).any(|pair| pair[0] >= pair[1]) {
+         return Err("invalid ABI 9 null shape registry ordering or extent".into());
+     }
+-    if table_version != 9 && !null_shapes.is_empty() {
++    if table_version < 9 && !null_shapes.is_empty() {
+         return Err("null registry requires ABI 9".into());
+     }
+     for word in null_shapes {
+@@ -198,7 +219,7 @@
+     };
+     let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, stage, options);
+     ctx.argument_table_version = table_version;
+-    let rebase = if table_version == 9 {
++    let rebase = if table_version >= 9 {
+         ctx.restore_null_shape_indices(null_shapes)?
+     } else {
+         HashMap::new()
+@@ -207,7 +228,7 @@
+         &mut ctx,
+         fields,
+         if normalized { 8 } else { 7 },
+-        table_version == 9,
++        table_version >= 9,
+     )?;
+     ctx.rebase_cached_null_images(&rebase)?;
+     super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
+@@ -235,7 +256,7 @@
+         super::lod_query::lower_argument_lod_queries(&mut ctx, index)?;
+     }
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+-    if table_version == 9 {
++    if table_version >= 9 {
+         super::super::null_shapes::finalize_null_shape_indices(&mut ctx)?;
+         ctx.module.types_global_values.append(&mut ctx.new_globals);
+     }
+@@ -679,17 +700,14 @@
+         let category = match defs.get(&element) {
+             Some(inst) if inst.class.opcode == Op::TypeSampler => 2,
+             Some(inst) if inst.class.opcode == Op::TypeImage => {
+-                if matches!(
+-                    inst.operands.get(1),
+-                    Some(Operand::Dim(
+-                        spirv::Dim::DimBuffer | spirv::Dim::DimSubpassData
+-                    ))
+-                ) {
+-                    return Err(
+-                        "GPU argument image requires a non-image descriptor category".into(),
+-                    );
+-                }
+-                if inst.operands.get(5) == Some(&Operand::LiteralBit32(2)) {
++                let storage = inst.operands.get(5) == Some(&Operand::LiteralBit32(2));
++                if inst.operands.get(1) == Some(&Operand::Dim(spirv::Dim::DimBuffer)) {
++                    if storage {
++                        4
++                    } else {
++                        3
++                    }
++                } else if storage {
+                     1
+                 } else {
+                     0
+@@ -737,12 +755,19 @@
+                     Some(id),
+                     vec![Operand::StorageClass(StorageClass::UniformConstant)],
+                 ));
+-                decorate_binding(
+-                    &mut ctx.module,
+-                    id,
+-                    ARGUMENT_RESOURCE_FIRST_SET + resource.category,
+-                    0,
+-                );
++                let (set, binding) = match resource.category {
++                    3 => (2, 1),
++                    4 => (3, 1),
++                    category => (ARGUMENT_RESOURCE_FIRST_SET + category, 0),
++                };
++                decorate_binding(&mut ctx.module, id, set, binding);
++                if resource.category == 3 {
++                    ctx.add_capability(Capability::UniformTexelBufferArrayDynamicIndexing);
++                    ctx.add_capability(Capability::SampledBuffer);
++                } else if resource.category == 4 {
++                    ctx.add_capability(Capability::StorageTexelBufferArrayDynamicIndexing);
++                    ctx.add_capability(Capability::ImageBuffer);
++                }
+                 id
+             });
+         replacement.insert(var, new_var);
+@@ -1177,13 +1202,54 @@
+     let next_low = ctx.module.fresh_id();
+     let next_high = ctx.module.fresh_id();
+     let mut first = vec![];
+-    let pair = value(
++    let three = ctx.const_uint(3);
++    let seven = ctx.const_uint(7);
++    let image_pair = value(
+         ctx,
+         &mut first,
+         Op::IMul,
+         uint,
+         vec![Operand::IdRef(category), Operand::IdRef(two)],
+     );
++    let texel_category = value(
++        ctx,
++        &mut first,
++        Op::UGreaterThanEqual,
++        boolean,
++        vec![Operand::IdRef(category), Operand::IdRef(three)],
++    );
++    let texel_index = value(
++        ctx,
++        &mut first,
++        Op::ISub,
++        uint,
++        vec![Operand::IdRef(category), Operand::IdRef(three)],
++    );
++    let texel_pair = value(
++        ctx,
++        &mut first,
++        Op::IMul,
++        uint,
++        vec![Operand::IdRef(texel_index), Operand::IdRef(two)],
++    );
++    let texel_pair = value(
++        ctx,
++        &mut first,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(texel_pair), Operand::IdRef(seven)],
++    );
++    let pair = value(
++        ctx,
++        &mut first,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(texel_category),
++            Operand::IdRef(texel_pair),
++            Operand::IdRef(image_pair),
++        ],
++    );
+     let count_at = value(
+         ctx,
+         &mut first,
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -1952,6 +1952,7 @@
+ 
+ /// GPU token-table and descriptor-array ABI for a nested argument resource graph.
+ pub const ARGUMENT_RESOURCE_NULL_SHAPES_VERSION: u32 = 9;
++pub const ARGUMENT_RESOURCE_TABLE_VERSION: u32 = 10;
+ pub const ARGUMENT_RESOURCE_NULL_SHAPES_MAX: usize = 64;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -2020,7 +2021,7 @@
+         }
+ 
+         let wire = Wire::deserialize(deserializer)?;
+-        if wire.version > ARGUMENT_RESOURCE_NULL_SHAPES_VERSION {
++        if wire.version > ARGUMENT_RESOURCE_TABLE_VERSION {
+             return Err(serde::de::Error::custom(format!(
+                 "unknown argument_resource_tables version {}",
+                 wire.version
+@@ -2259,7 +2260,9 @@
+             });
+         }
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: if !null_shapes.is_empty() || normalized_sampler_coordinates || has_metadata {
++            version: if categories.iter().any(|category| *category >= 3) {
++                ARGUMENT_RESOURCE_TABLE_VERSION
++            } else if !null_shapes.is_empty() || normalized_sampler_coordinates || has_metadata {
+                 9
+             } else {
+                 7
+@@ -2554,7 +2557,7 @@
+         }
+         if let Some(table) = &self.argument_resource_tables {
+             validate_null_shapes(&table.null_shapes)?;
+-            if (table.version == 9 && !matches!(self.reflection_version, 65 | 66))
++            if (table.version >= 9 && !matches!(self.reflection_version, 65 | 66))
+                 || (table.version == 8
+                     && (self.reflection_version != 64 || !self.normalized_sampler_coordinates))
+             {
+@@ -2563,7 +2566,7 @@
+             if table.version < 9 && !table.null_shapes.is_empty() {
+                 return Err("null shapes require ABI 9".into());
+             }
+-            if !matches!(table.version, 7..=9)
++            if !matches!(table.version, 7..=ARGUMENT_RESOURCE_TABLE_VERSION)
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+@@ -2571,8 +2574,10 @@
+                 || (table.categories.is_empty()
+                     && table.image_query_binding.is_none()
+                     && table.null_shapes.is_empty()
+-                    && table.version != 9)
+-                || table.categories.iter().any(|category| *category > 2)
++                    && table.version < 9)
++                || table.categories.iter().any(|category| *category > 4)
++                || (table.categories.iter().any(|category| *category >= 3)
++                    && table.version < ARGUMENT_RESOURCE_TABLE_VERSION)
+                 || table.categories.windows(2).any(|pair| pair[0] >= pair[1])
+                 || (table.comparison_sampler && !table.categories.contains(&2))
+                 || self.bindings.iter().any(|binding| {
+@@ -2841,7 +2846,7 @@
+                         || !self
+                             .argument_resource_tables
+                             .as_ref()
+-                            .is_some_and(|table| table.version == 9)
++                            .is_some_and(|table| table.version >= 9)
+                         || resource.declared_size != Some(384)
+                         || resource.extent != Some(BufferExtent::Object { bytes: 384 })
+                         || resource.access != Some(ResourceAccess::ReadOnly))

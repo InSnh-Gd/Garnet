@@ -1,0 +1,712 @@
+diff --git a/src/meta/embedded.rs b/src/meta/embedded.rs
+index f9311db..7015388 100644
+--- a/src/meta/embedded.rs
++++ b/src/meta/embedded.rs
+@@ -70,6 +70,17 @@ pub struct EmbeddedTexture {
+     pub synthetic_texture_index: u32,
+ }
+ 
++/// A flat scalar sampler handle owned by an AIR indirect argument buffer.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct EmbeddedSampler {
++    pub buffer_param_index: u32,
++    pub buffer_index: u32,
++    pub field_offset: u32,
++    pub field_ordinal: u32,
++    pub argument_index: u32,
++    pub synthetic_sampler_index: u32,
++}
++
+ /// One resource-handle member of an AIR indirect argument buffer. This is the common structural
+ /// coordinate used by authored embedded resources, Metal argument encoding, and static lowering.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -150,6 +161,47 @@ pub(super) fn detect_embedded_textures(
+     out
+ }
+ 
++pub(super) fn detect_embedded_samplers(
++    nodes: &HashMap<u32, String>,
++    argument_buffers: &ArgumentBuffers,
++    top_level_sampler_locations: &[u32],
++) -> Vec<EmbeddedSampler> {
++    let mut next = top_level_sampler_locations
++        .iter()
++        .copied()
++        .max()
++        .map_or(0, |index| index.saturating_add(1));
++    let mut out = Vec::new();
++    for (buffer_param_index, buffer_index, sref) in argument_buffers.iter() {
++        for member in embedded_argument_members(nodes, sref) {
++            let Some(node) = nodes.get(&member.node_ref) else {
++                continue;
++            };
++            if !expressible_embedded_sampler(&member, node) {
++                continue;
++            }
++            out.push(EmbeddedSampler {
++                buffer_param_index,
++                buffer_index,
++                field_offset: member.field_offset,
++                field_ordinal: member.field_ordinal,
++                argument_index: member.argument_index(node),
++                synthetic_sampler_index: next,
++            });
++            // Exhaustion is rejected against the selected descriptor layout in stage input.
++            next = next.saturating_add(1);
++        }
++    }
++    out
++}
++
++fn expressible_embedded_sampler(member: &ArgumentMember, node: &str) -> bool {
++    member.depth == 0
++        && !member.in_array_wrapper
++        && member.array_len <= 1
++        && role_strings(node).iter().any(|role| role == "sampler")
++}
++
+ /// The texture shape of an `air.indirect_argument` member the embedded lowering can materialize a
+ /// descriptor for, or `None` for any other member.
+ ///
+@@ -329,6 +381,13 @@ pub(super) fn unsurfaced_embedded_resources(
+                 continue;
+             };
+             let offset = member.field_offset;
++            if role == "sampler" && !expressible_embedded_sampler(&member, node) {
++                out.push(format!(
++                    "argument buffer parameter {buffer_param_index} holds an unsupported sampler \
++                     array or nested sampler at byte offset {offset}"
++                ));
++                continue;
++            }
+             if role == "buffer" && !member.in_array_wrapper {
+                 continue;
+             }
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index 78b4b47..2b17404 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -13,10 +13,12 @@ mod samplers;
+ mod textures;
+ mod types;
+ use embedded::{
+-    body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures,
+-    unsurfaced_embedded_resources, ArgumentBuffers,
++    body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_samplers,
++    detect_embedded_textures, unsurfaced_embedded_resources, ArgumentBuffers,
++};
++pub use embedded::{
++    embedded_synthetic_texture_index, EmbeddedArgument, EmbeddedSampler, EmbeddedTexture,
+ };
+-pub use embedded::{embedded_synthetic_texture_index, EmbeddedArgument, EmbeddedTexture};
+ pub(crate) use function_constants::function_constants_without_a_supplied_value;
+ pub use function_constants::{parse_function_constants, FunctionConstant};
+ use globals::{location_index_with_static, static_init_int_global_values};
+@@ -277,6 +279,7 @@ pub struct FragMeta {
+     /// Framebuffer-fetch color input Location -> AIR render-target type name, e.g. `float4`.
+     pub color_input_type_names: HashMap<u32, String>,
+     pub embedded_textures: Vec<EmbeddedTexture>,
++    pub embedded_samplers: Vec<EmbeddedSampler>,
+     pub embedded_arguments: Vec<EmbeddedArgument>,
+     /// Resource handles an argument buffer declares inside a nested `air.struct_type_info` member,
+     /// which the embedded-argument walk does not surface. Non-empty means every texture operation on
+@@ -551,6 +554,7 @@ pub struct VertMeta {
+     /// a function-constant global.
+     pub declared_descriptor_counts: HashMap<u32, u32>,
+     pub embedded_textures: Vec<EmbeddedTexture>,
++    pub embedded_samplers: Vec<EmbeddedSampler>,
+     pub embedded_arguments: Vec<EmbeddedArgument>,
+     /// Resource handles an argument buffer declares inside a nested `air.struct_type_info` member,
+     /// which the embedded-argument walk does not surface. Non-empty means every texture operation on
+@@ -782,6 +786,7 @@ pub struct KernMeta {
+     /// surfaced as a standalone image resource so the read/write lowers to a real descriptor instead of a
+     /// private placeholder. See [`EmbeddedTexture`].
+     pub embedded_textures: Vec<EmbeddedTexture>,
++    pub embedded_samplers: Vec<EmbeddedSampler>,
+     /// Every resource-handle member carried by an `air.indirect_buffer`, including handles whose
+     /// concrete kind is supplied by an authored manifest and verified from its AIR use.
+     pub embedded_arguments: Vec<EmbeddedArgument>,
+@@ -1224,6 +1229,18 @@ fn parse_air_kernel_meta_with_nodes(
+         }
+         aliased_implicit_imageblock_planes.insert(*param, planes);
+     }
++    let top_level_sampler_locations = roles
++        .iter()
++        .filter_map(|(_, role)| match role {
++            KernRole::Sampler(location) => Some(*location),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    let embedded_samplers = if body_uses_texture_intrinsic(ll) {
++        detect_embedded_samplers(nodes, &argument_buffers, &top_level_sampler_locations)
++    } else {
++        Vec::new()
++    };
+     Some(KernMeta {
+         roles,
+         unmodelled_input_params,
+@@ -1244,6 +1261,7 @@ fn parse_air_kernel_meta_with_nodes(
+         declared_descriptor_counts,
+         stage_input_type_names,
+         embedded_textures,
++        embedded_samplers,
+         embedded_arguments,
+         unsurfaced_embedded_resources: unsurfaced,
+     })
+@@ -3044,6 +3062,18 @@ fn parse_air_fragment_meta_with_nodes(
+         })
+         .collect::<Vec<_>>();
+     let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
++    let top_level_sampler_locations = roles
++        .iter()
++        .filter_map(|(_, role)| match role {
++            FragRole::Sampler(location) => Some(*location),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    let embedded_samplers = if body_uses_texture_intrinsic(ll) {
++        detect_embedded_samplers(nodes, &argument_buffers, &top_level_sampler_locations)
++    } else {
++        Vec::new()
++    };
+     Some(FragMeta {
+         roles,
+         unmodelled_stage_attributes,
+@@ -3078,6 +3108,7 @@ fn parse_air_fragment_meta_with_nodes(
+         } else {
+             Vec::new()
+         },
++        embedded_samplers,
+         embedded_arguments: detect_embedded_arguments(nodes, &argument_buffers),
+         unsurfaced_embedded_resources: unsurfaced_embedded_resources(nodes, &argument_buffers),
+     })
+@@ -3377,6 +3408,18 @@ fn parse_air_vertex_meta_with_nodes(
+         })
+         .collect::<Vec<_>>();
+     let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
++    let top_level_sampler_locations = roles
++        .iter()
++        .filter_map(|(_, role)| match role {
++            VertRole::Sampler(location) => Some(*location),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    let embedded_samplers = if body_uses_texture_intrinsic(ll) {
++        detect_embedded_samplers(nodes, &argument_buffers, &top_level_sampler_locations)
++    } else {
++        Vec::new()
++    };
+     Some(VertMeta {
+         roles,
+         unmodelled_input_params,
+@@ -3405,6 +3448,7 @@ fn parse_air_vertex_meta_with_nodes(
+         } else {
+             Vec::new()
+         },
++        embedded_samplers,
+         embedded_arguments: detect_embedded_arguments(nodes, &argument_buffers),
+         unsurfaced_embedded_resources: unsurfaced_embedded_resources(nodes, &argument_buffers),
+         undecoded_patch_shape,
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index 509fcb5..6f1d8e4 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -235,6 +235,10 @@ fn is_air_texture_operation(callee: &str) -> bool {
+         || callee.starts_with("air.fence_texture")
+ }
+ 
++fn is_air_sampler_operand(callee: &str, index: usize) -> bool {
++    index == 1 && (callee.starts_with("air.sample_") || callee.starts_with("air.gather_"))
++}
++
+ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+     ir: &LlModule,
+ ) -> HashMap<String, HashSet<String>> {
+@@ -259,11 +263,14 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+             if !is_air_texture_operation(&call.callee) {
+                 continue;
+             }
+-            for argument in &call.args {
++            for (argument_index, argument) in call.args.iter().enumerate() {
+                 let LlValue::Local(name) = &argument.value else {
+                     continue;
+                 };
+-                if matches!(argument.ty, LlType::Ptr(1)) {
++                if matches!(argument.ty, LlType::Ptr(1))
++                    || (matches!(argument.ty, LlType::Ptr(2))
++                        && is_air_sampler_operand(&call.callee, argument_index))
++                {
+                     if let Some(index) = params.get(name.as_str()) {
+                         opaque_params.insert((function.name.clone(), *index));
+                     }
+@@ -314,7 +321,9 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+                 };
+                 for (index, argument) in call.args.iter().enumerate() {
+                     let direct_texture = is_air_texture_operation(&call.callee)
+-                        && matches!(argument.ty, LlType::Ptr(1));
++                        && (matches!(argument.ty, LlType::Ptr(1))
++                            || (matches!(argument.ty, LlType::Ptr(2))
++                                && is_air_sampler_operand(&call.callee, index)));
+                     let helper_texture = opaque_params.contains(&(call.callee.clone(), index));
+                     if direct_texture || helper_texture {
+                         if let LlValue::Local(name) = &argument.value {
+@@ -330,7 +339,7 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+                     let Some(result) = instruction.result.as_ref() else {
+                         continue;
+                     };
+-                    if !matches!(instruction.result_ty, Some(LlType::Ptr(1)))
++                    if !matches!(instruction.result_ty, Some(LlType::Ptr(1 | 2)))
+                         || !matches!(
+                             instruction.opcode.as_str(),
+                             "bitcast" | "freeze" | "phi" | "select"
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index c6b4772..62e7567 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -2322,9 +2322,14 @@ pub(super) fn build_stage_input(
+         ctx.interface_buffer_var(*var); // SPIR-V 1.4+ lists all globals; harmless for <=1.3.
+     }
+ 
+-    // Convert the module-scope static sampler `__air_sampler_state` (an AIR-embedded default sampler,
+-    // an OpVariable UniformConstant with a constant array initializer) into a real sampler resource
+-    // and rewrite its `OpBitcast ... %__air_sampler_state` uses into a load of that sampler.
++    // Reserve embedded sampler bindings before constexpr samplers allocate free slots.
++    let embedded_samplers = match stage {
++        Stage::Fragment => frag.map(|meta| meta.embedded_samplers.as_slice()),
++        Stage::Vertex => vert.map(|meta| meta.embedded_samplers.as_slice()),
++        Stage::Kernel => kern.map(|meta| meta.embedded_samplers.as_slice()),
++    };
++    register_embedded_samplers(ctx, entry_idx, embedded_samplers)?;
++    // Convert AIR constexpr sampler globals to real sampler resources and rewrite their uses.
+     handle_static_sampler(ctx)?;
+     include_existing_private_globals(ctx);
+ 
+@@ -2562,6 +2567,73 @@ fn lower_patch_control_point_calls(
+     Ok(())
+ }
+ 
++/// Recover only statically addressed scalar sampler fields. A token is not a device address:
++/// replace the opaque field load by a real descriptor load, retaining owner/offset in reflection.
++fn register_embedded_samplers(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++    embedded: Option<&[crate::meta::EmbeddedSampler]>,
++) -> Result<(), String> {
++    let Some(embedded) = embedded else {
++        return Ok(());
++    };
++    let layout = ctx.descriptor_layout;
++    let mut loads = Vec::new();
++    for sampler in embedded {
++        let binding = sampler_resource_binding(layout, sampler.synthetic_sampler_index)?;
++        let root = ctx.module.functions[entry_idx]
++            .parameters
++            .get(sampler.buffer_param_index as usize)
++            .and_then(|parameter| parameter.result_id)
++            .ok_or_else(|| "embedded sampler owner parameter is missing".to_string())?;
++        if ctx
++            .emit_sidecar
++            .buffer_pointer_dynamic_field_loads
++            .iter()
++            .any(|fact| fact.root == root && fact.byte_offset == u64::from(sampler.field_offset))
++        {
++            return Err("dynamic argument-buffer sampler field access is unsupported".into());
++        }
++        let handles = ctx
++            .emit_sidecar
++            .buffer_pointer_field_loads
++            .iter()
++            .filter(|fact| fact.root == root && fact.byte_offset == u64::from(sampler.field_offset))
++            .map(|fact| fact.id)
++            .collect::<Vec<_>>();
++        let sampler_ty = ctx.ty_sampler();
++        let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, sampler_ty);
++        let var = ctx.module.fresh_id();
++        ctx.new_globals.push(Instruction::new(
++            Op::Variable,
++            Some(pointer_ty),
++            Some(var),
++            vec![Operand::StorageClass(StorageClass::UniformConstant)],
++        ));
++        decorate_binding(&mut ctx.module, var, layout.set, binding);
++        ctx.interface_buffer_var(var);
++        let value = ctx.module.fresh_id();
++        loads.push(Instruction::new(
++            Op::Load,
++            Some(sampler_ty),
++            Some(value),
++            vec![Operand::IdRef(var)],
++        ));
++        for handle in handles {
++            replace_id_in_function(&mut ctx.module.functions[entry_idx], handle, value);
++        }
++    }
++    if let Some(entry) = ctx.module.functions[entry_idx].blocks.first_mut() {
++        let at = entry
++            .instructions
++            .iter()
++            .position(|instruction| instruction.class.opcode != Op::Variable)
++            .unwrap_or(entry.instructions.len());
++        entry.instructions.splice(at..at, loads);
++    }
++    Ok(())
++}
++
+ /// Materialize a UniformConstant image for each argument-buffer-embedded texture the meta
+ /// pass surfaced (see `KernMeta::embedded_textures`), decorate it in the sampled- or storage-texture
+ /// band at index `K`
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+index ea09bc9..f5ba92a 100644
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -199,7 +199,8 @@ pub(crate) fn decorate_unwritten_descriptors(module: &mut Module) {
+ /// **Measured reach over the 14579-source corpus: 2258 buffer bindings in 1727 modules change
+ /// access -- 1846 `ReadWrite`->`WriteOnly`, 388 `ReadWrite`->`ReadOnly`, 21 `WriteOnly`->`Unused`,
+ /// 3 `ReadOnly`->`Unused`. No SPIR-V, no other reflected field, and no status changes.**
+-pub const REFLECTION_VERSION: u32 = 55;
++/// v56 adds descriptor-backed flat argument-buffer sampler fields and their owner coordinates.
++pub const REFLECTION_VERSION: u32 = 56;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -785,6 +786,8 @@ pub enum ResourceKind {
+     /// A texture embedded inside an `air.indirect_buffer` argument buffer, surfaced as a standalone
+     /// sampled or storage image in the corresponding texture binding band.
+     EmbeddedArgBufferTexture,
++    /// A flat sampler field surfaced as a descriptor; embedded_source identifies its owner.
++    EmbeddedArgBufferSampler,
+     /// A device buffer embedded inside an `air.indirect_buffer`. The Vulkan module dereferences the
+     /// device address written into the owner field, so this consumes no descriptor of its own.
+     EmbeddedArgBufferBuffer,
+@@ -1506,12 +1509,12 @@ pub struct EmbeddedArgBuffer {
+ pub struct ResourceBinding {
+     pub kind: ResourceKind,
+     /// The Metal resource index (`n` in `[[buffer(n)]]`/`[[texture(n)]]`/`[[sampler(n)]]`), or the
+-    /// synthetic index for an embedded argument-buffer texture.
++    /// synthetic index for an embedded argument-buffer texture or sampler.
+     pub metal_index: u32,
+     /// The SPIR-V descriptor location, or `None` for a resource that consumes no descriptor.
+     pub descriptor: Option<DescriptorLocation>,
+     /// The entry-parameter index this resource came from (SPIR-V `OpFunctionParameter` order), when
+-    /// applicable. `None` for synthesized resources (embedded argument-buffer textures).
++    /// applicable. `None` for synthesized resources, including embedded textures and samplers.
+     pub param_index: Option<u32>,
+     /// AIR attribute location for [`ResourceKind::KernelStageInput`]; `None` otherwise.
+     pub stage_input_location: Option<u32>,
+@@ -1535,8 +1538,8 @@ pub struct ResourceBinding {
+     /// access qualifier), so a consumer need not re-parse the type name or walk the emitted
+     /// `OpTypeImage`. `None` for non-textures / when no type name was carried.
+     pub texture_shape: Option<TextureShape>,
+-    /// For an `EmbeddedArgBufferTexture`: the arg-buffer argument + offset it was synthesized from.
+-    /// `None` for every other binding.
++    /// Owner argument and field offset for embedded texture, sampler, and buffer resources.
++    /// `None` for resources that do not originate in an argument-buffer field.
+     pub embedded_source: Option<EmbeddedArgBuffer>,
+     /// Declared or structurally tightened access classification; `None` when AIR does not provide
+     /// enough information for a conservative classification.
+@@ -1956,7 +1959,9 @@ impl ShaderReflection {
+                         layout.sampled_texture_binding(resource.metal_index)
+                     }
+                 }
+-                ResourceKind::Sampler => layout.sampler_binding(resource.metal_index),
++                ResourceKind::Sampler | ResourceKind::EmbeddedArgBufferSampler => {
++                    layout.sampler_binding(resource.metal_index)
++                }
+                 ResourceKind::ColorInput => layout.color_input_binding(resource.metal_index),
+                 ResourceKind::StaticSampler
+                 | ResourceKind::BufferAddressTable
+@@ -2142,6 +2147,7 @@ impl ShaderReflection {
+                     }
+                 }
+                 ResourceKind::Sampler
++                | ResourceKind::EmbeddedArgBufferSampler
+                 | ResourceKind::StaticSampler
+                 | ResourceKind::SynthesizedReadSampler => DescriptorClass::Sampler,
+                 ResourceKind::SynthesizedNullTexture => DescriptorClass::SampledImage,
+@@ -2170,7 +2176,7 @@ impl ShaderReflection {
+                     self.descriptor_layout
+                         .sampled_texture_binding(resource.metal_index)
+                 }),
+-                ResourceKind::Sampler => {
++                ResourceKind::Sampler | ResourceKind::EmbeddedArgBufferSampler => {
+                     Some(self.descriptor_layout.sampler_binding(resource.metal_index))
+                 }
+                 ResourceKind::StaticSampler => Some(
+@@ -2730,6 +2736,7 @@ impl ShaderReflection {
+         append_embedded_resources(
+             &mut bindings,
+             &meta.embedded_textures,
++            &meta.embedded_samplers,
+             &meta.embedded_arguments,
+         );
+         let varyings = meta
+@@ -2891,6 +2898,7 @@ impl ShaderReflection {
+         append_embedded_resources(
+             &mut bindings,
+             &meta.embedded_textures,
++            &meta.embedded_samplers,
+             &meta.embedded_arguments,
+         );
+         let vertex_attributes = meta
+@@ -3133,6 +3141,7 @@ impl ShaderReflection {
+         append_embedded_resources(
+             &mut bindings,
+             &meta.embedded_textures,
++            &meta.embedded_samplers,
+             &meta.embedded_arguments,
+         );
+         ShaderReflection {
+@@ -3539,6 +3548,7 @@ fn buffer_access(
+ fn append_embedded_resources(
+     bindings: &mut Vec<ResourceBinding>,
+     textures: &[crate::meta::EmbeddedTexture],
++    samplers: &[crate::meta::EmbeddedSampler],
+     arguments: &[crate::meta::EmbeddedArgument],
+ ) {
+     for embedded in textures {
+@@ -3591,6 +3601,19 @@ fn append_embedded_resources(
+             static_sampler: None,
+         });
+     }
++    for sampler in samplers {
++        let mut binding = sampler_binding(sampler.synthetic_sampler_index, None);
++        binding.kind = ResourceKind::EmbeddedArgBufferSampler;
++        binding.embedded_source = Some(EmbeddedArgBuffer {
++            buffer_param_index: sampler.buffer_param_index,
++            buffer_index: sampler.buffer_index,
++            field_offset: sampler.field_offset,
++            field_ordinal: sampler.field_ordinal,
++            argument_index: sampler.argument_index,
++            resource_buffer_index: None,
++        });
++        bindings.push(binding);
++    }
+     for argument in arguments {
+         let Some(resource_index) = argument.resource_buffer_index else {
+             continue;
+diff --git a/tests/argument_buffer_sampler.rs b/tests/argument_buffer_sampler.rs
+new file mode 100644
+index 0000000..671f1e7
+--- /dev/null
++++ b/tests/argument_buffer_sampler.rs
+@@ -0,0 +1,111 @@
++use metal2vulkan::meta::parse_air_kernel_meta;
++use metal2vulkan::passes::{Stage, TransformOptions};
++use metal2vulkan::reflect::{ResourceKind, ShaderReflection, SAMPLER_BINDING_BASE};
++use std::path::Path;
++
++const SOURCE: &str = include_str!("fixtures/argument_buffer_sampler.ll");
++
++fn translate(source: &str) -> Result<(Vec<u8>, ShaderReflection), String> {
++    let (sanitized, layout) = metal2vulkan::tools::sanitize_ll_text_with_datalayout(source);
++    metal2vulkan::translate_sanitized_native_reflected_unvalidated(
++        &sanitized,
++        Stage::Kernel,
++        Path::new(""),
++        TransformOptions {
++            kernel_local_size: [1, 1, 1],
++            ..Default::default()
++        },
++        layout.as_deref(),
++    )
++}
++
++fn with_direct_sampler(index: u32) -> String {
++    let source = SOURCE
++        .replace("i32 %i) {", "i32 %i, ptr addrspace(2) %direct) {")
++        .replace("!2 = !{!3, !4, !5, !6}", "!2 = !{!3, !4, !5, !6, !30}");
++    format!("{source}\n!30 = !{{i32 4, !\"air.sampler\", !\"air.location_index\", i32 {index}, i32 1, !\"air.arg_type_name\", !\"sampler\", !\"air.arg_name\", !\"direct\"}}\n")
++}
++
++#[test]
++fn constant_argbuf_sampler_is_a_typed_descriptor() {
++    let (spv, reflection) = translate(SOURCE).expect("embedded sampler must translate");
++    reflection.validate_descriptor_abi().unwrap();
++    metal2vulkan::tools::spirv_val_bytes(&spv, &std::env::temp_dir()).unwrap();
++    let sampler = reflection
++        .bindings
++        .iter()
++        .find(|binding| binding.kind == ResourceKind::EmbeddedArgBufferSampler)
++        .unwrap();
++    let descriptor = sampler.descriptor.as_ref().unwrap();
++    assert_eq!(
++        (descriptor.set, descriptor.binding, descriptor.count),
++        (0, SAMPLER_BINDING_BASE, 1)
++    );
++    let owner = sampler.embedded_source.as_ref().unwrap();
++    assert_eq!((owner.buffer_param_index, owner.buffer_index), (2, 2));
++    assert_eq!((owner.field_offset, owner.argument_index), (16, 2));
++    let assembly = metal2vulkan::disassemble(&spv).unwrap();
++    let sampler_ty = assembly
++        .lines()
++        .find(|line| line.contains("= OpTypeSampler"))
++        .unwrap()
++        .split_whitespace()
++        .next()
++        .unwrap();
++    let values = assembly
++        .lines()
++        .filter_map(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            (words.len() >= 5 && words[2] == "OpLoad" && words[3] == sampler_ty)
++                .then(|| words[0].to_string())
++        })
++        .collect::<Vec<_>>();
++    assert!(
++        assembly.lines().any(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            words.len() >= 6
++                && words[2] == "OpSampledImage"
++                && values.iter().any(|value| value == words[5])
++        }),
++        "sample must consume a descriptor-loaded sampler"
++    );
++}
++
++#[test]
++fn embedded_sampler_follows_direct_slots() {
++    let (spv, reflection) = translate(&with_direct_sampler(3)).unwrap();
++    assert!(!spv.is_empty());
++    let sampler = reflection
++        .bindings
++        .iter()
++        .find(|binding| binding.kind == ResourceKind::EmbeddedArgBufferSampler)
++        .unwrap();
++    assert_eq!(sampler.metal_index, 4);
++    assert_eq!(
++        sampler.descriptor.as_ref().unwrap().binding,
++        SAMPLER_BINDING_BASE + 4
++    );
++}
++
++#[test]
++fn exhausted_sampler_band_refuses() {
++    let error = translate(&with_direct_sampler(15)).unwrap_err();
++    assert!(
++        error.contains("EmbeddedArgBufferSampler(16)") && error.contains("descriptor ABI band"),
++        "{error}"
++    );
++}
++
++#[test]
++fn sampler_arrays_are_not_surfaced_as_one_scalar() {
++    let source = SOURCE.replace(
++        "i32 16, i32 8, i32 0, !\"sampler\"",
++        "i32 16, i32 8, i32 2, !\"sampler\"",
++    );
++    let metadata = parse_air_kernel_meta(&source).unwrap();
++    assert!(metadata.embedded_samplers.is_empty());
++    assert!(metadata
++        .unsurfaced_embedded_resources
++        .iter()
++        .any(|reason| reason.contains("sampler")));
++}
+diff --git a/tests/fixtures/argument_buffer_sampler.ll b/tests/fixtures/argument_buffer_sampler.ll
+new file mode 100644
+index 0000000..5307d7f
+--- /dev/null
++++ b/tests/fixtures/argument_buffer_sampler.ll
+@@ -0,0 +1,55 @@
++; Authored regression matching probe.m: a constant Resources& holds a data pointer,
++; texture and sampler. The sampler must become a descriptor, not a BDA pointer.
++source_filename = "argument_buffer_sampler"
++target datalayout = "e-p:64:64-i64:64-v128:128-n8:16:32"
++target triple = "air64_v28-apple-macosx26.7.0"
++
++%Params = type { <4 x float>, float, i32 }
++%Resources = type { ptr addrspace(1), %Texture, %Sampler }
++%Texture = type { ptr addrspace(1) }
++%Sampler = type { ptr addrspace(2) }
++
++define void @argbuf_sampler(ptr addrspace(1) %out, ptr addrspace(2) %p, ptr addrspace(2) %r, i32 %i) {
++entry:
++  %count.field = getelementptr inbounds %Params, ptr addrspace(2) %p, i64 0, i32 2
++  %count = load i32, ptr addrspace(2) %count.field, align 4
++  %active = icmp ult i32 %i, %count
++  br i1 %active, label %work, label %exit
++work:
++  %values.field = getelementptr inbounds %Resources, ptr addrspace(2) %r, i64 0, i32 0
++  %values = load ptr addrspace(1), ptr addrspace(2) %values.field, align 8
++  %index = zext i32 %i to i64
++  %element = getelementptr inbounds float, ptr addrspace(1) %values, i64 %index
++  %value = load float, ptr addrspace(1) %element, align 4
++  %scale.field = getelementptr inbounds %Params, ptr addrspace(2) %p, i64 0, i32 1
++  %scale = load float, ptr addrspace(2) %scale.field, align 4
++  %scaled = fmul float %value, %scale
++  %sampler.field = getelementptr inbounds %Resources, ptr addrspace(2) %r, i64 0, i32 2, i32 0
++  %sampler = load ptr addrspace(2), ptr addrspace(2) %sampler.field, align 8
++  %texture.field = getelementptr inbounds %Resources, ptr addrspace(2) %r, i64 0, i32 1, i32 0
++  %texture = load ptr addrspace(1), ptr addrspace(2) %texture.field, align 8
++  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %sample, 0
++  %red = extractelement <4 x float> %rgba, i64 0
++  %sum = fadd float %scaled, %red
++  %dst = getelementptr inbounds float, ptr addrspace(1) %out, i64 %index
++  store float %sum, ptr addrspace(1) %dst, align 4
++  br label %exit
++exit:
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @argbuf_sampler, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Params", !"air.arg_name", !"p"}
++!5 = !{i32 2, !"air.indirect_buffer", !"air.buffer_size", i32 24, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !7, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Resources", !"air.arg_name", !"r"}
++!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"i"}
++!7 = !{i32 0, i32 8, i32 0, !"float", !"values", !"air.indirect_argument", !8, i32 8, i32 8, i32 0, !"texture2d<float, sample>", !"tex", !"air.indirect_argument", !9, i32 16, i32 8, i32 0, !"sampler", !"smp", !"air.indirect_argument", !10}
++!8 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"values"}
++!9 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!10 = !{i32 2, !"air.sampler", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"smp"}
+diff --git a/validation/src/executor_contract.rs b/validation/src/executor_contract.rs
+index 2c0f3ef..263bea5 100644
+--- a/validation/src/executor_contract.rs
++++ b/validation/src/executor_contract.rs
+@@ -149,6 +149,10 @@ pub fn unsupported_reflection_requirements(
+             // null texture, so that row is executable. A synthesized read sampler still has no
+             // placeholder behind it.
+             ResourceKind::SynthesizedNullTexture => {}
++            ResourceKind::EmbeddedArgBufferSampler => {
++                // Descriptor translation does not yet provide authored Metal/Vulkan binding support.
++                requirements.insert(ToolingRequirement::EmbeddedArgumentSampler);
++            }
+             ResourceKind::SynthesizedReadSampler => {
+                 requirements.insert(ToolingRequirement::SynthesizedPlaceholderDescriptor);
+             }
+diff --git a/validation/src/requirement.rs b/validation/src/requirement.rs
+index 54211eb..b628db9 100644
+--- a/validation/src/requirement.rs
++++ b/validation/src/requirement.rs
+@@ -30,10 +30,11 @@ pub enum ToolingRequirement {
+     FragmentVaryingLinkage,
+     FragmentOutputObservationType,
+     SynthesizedPlaceholderDescriptor,
++    EmbeddedArgumentSampler,
+ }
+ 
+ impl ToolingRequirement {
+-    pub const ALL: [Self; 21] = [
++    pub const ALL: [Self; 22] = [
+         Self::FunctionConstantLiteral,
+         Self::VertexAttributeLiteral,
+         Self::TessellationAttributeLiteral,
+@@ -55,6 +56,7 @@ impl ToolingRequirement {
+         Self::FragmentVaryingLinkage,
+         Self::FragmentOutputObservationType,
+         Self::SynthesizedPlaceholderDescriptor,
++        Self::EmbeddedArgumentSampler,
+     ];
+ 
+     pub const fn as_str(self) -> &'static str {
+@@ -80,6 +82,7 @@ impl ToolingRequirement {
+             Self::FragmentVaryingLinkage => "fragment_varying_linkage",
+             Self::FragmentOutputObservationType => "fragment_output_observation_type",
+             Self::SynthesizedPlaceholderDescriptor => "synthesized_placeholder_descriptor",
++            Self::EmbeddedArgumentSampler => "embedded_argument_sampler",
+         }
+     }
+ }

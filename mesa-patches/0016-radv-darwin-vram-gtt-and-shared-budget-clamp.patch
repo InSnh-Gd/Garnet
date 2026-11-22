@@ -1,0 +1,169 @@
+Subject: [PATCH 16] radv/darwin: report live pools and share local budget headroom
+
+Keep physical totals and application usage; clamp the combined local headroom
+once to native available bytes. Canned devices retain their synthetic budgets.
+Answer VRAM_GTT so the generic dynamic heap usage queries can succeed.
+
+diff --git a/src/amd/common/darwin/ac_darwin_budget.h b/src/amd/common/darwin/ac_darwin_budget.h
+--- a/src/amd/common/darwin/ac_darwin_budget.h
++++ b/src/amd/common/darwin/ac_darwin_budget.h
+@@ -66,4 +66,30 @@
+    return valid;
+ }
+ 
++/* Share available headroom once across disjoint local heaps. Usage is the
++ * caller's allocation counter and never becomes cap - available. */
++static inline void
++acd_clamp_local_budget(uint32_t count, uint32_t local_mask, const uint64_t *sizes,
++                       const uint64_t *usage, uint64_t *budget, uint64_t available)
++{
++   unsigned __int128 total = 0;
++   for (uint32_t i = 0; i < count; ++i) {
++      if (!(local_mask & (UINT32_C(1) << i)))
++         continue;
++      uint64_t used = usage[i] < sizes[i] ? usage[i] : sizes[i];
++      uint64_t current = budget[i] < sizes[i] ? budget[i] : sizes[i];
++      budget[i] = current < used ? used : current;
++      total += budget[i] - used;
++   }
++   if (total <= available)
++      return;
++   for (uint32_t i = 0; i < count; ++i) {
++      if (!(local_mask & (UINT32_C(1) << i)))
++         continue;
++      uint64_t used = usage[i] < sizes[i] ? usage[i] : sizes[i];
++      uint64_t extra = (uint64_t)((unsigned __int128)(budget[i] - used) * available / total);
++      budget[i] = used + extra;
++   }
++}
++
+ #endif
+diff --git a/src/amd/common/darwin/test/acd_budget_test.c b/src/amd/common/darwin/test/acd_budget_test.c
+--- a/src/amd/common/darwin/test/acd_budget_test.c
++++ b/src/amd/common/darwin/test/acd_budget_test.c
+@@ -99,6 +99,33 @@
+    CHECK(m.vram.total_heap_size == total);
+    CHECK(m.vram.max_allocation == free);
+ 
++   /* Two disjoint local heaps share 3 GiB once. Host memory is untouched. */
++   const uint64_t sizes[] = { 12 * GiB, 4 * GiB, 32 * GiB };
++   uint64_t usages[] = { 2 * GiB, GiB, 2 * GiB };
++   uint64_t budgets[] = { 12 * GiB, 4 * GiB, 30 * GiB };
++   acd_clamp_local_budget(3, 3, sizes, usages, budgets, 3 * GiB);
++   CHECK(budgets[0] - usages[0] + budgets[1] - usages[1] <= 3 * GiB);
++   CHECK(budgets[0] >= usages[0] && budgets[1] >= usages[1]);
++   CHECK(budgets[2] == 30 * GiB && usages[0] == 2 * GiB && usages[1] == GiB);
++   acd_clamp_local_budget(3, 3, sizes, usages, budgets, 0);
++   CHECK(budgets[0] == usages[0] && budgets[1] == usages[1]);
++   budgets[0] = budgets[1] = 0;
++   acd_clamp_local_budget(3, 3, sizes, usages, budgets, GiB);
++   CHECK(budgets[0] == usages[0] && budgets[1] == usages[1]);
++   const uint64_t huge_sizes[] = { UINT64_MAX, UINT64_MAX };
++   uint64_t huge_usage[] = { 0, 0 };
++   uint64_t huge_budget[] = { UINT64_MAX, UINT64_MAX };
++   acd_clamp_local_budget(2, 3, huge_sizes, huge_usage, huge_budget, 4 * GiB);
++   CHECK(huge_budget[0] + huge_budget[1] == 4 * GiB);
++   /* Exhaustive small budgets exercise rounding and already-held allocations. */
++   for (uint64_t available = 0; available < 100; ++available) {
++      uint64_t sz[] = { 71, 29 }, us[] = { 21, 9 }, bu[] = { 71, 29 };
++      acd_clamp_local_budget(2, 3, sz, us, bu, available);
++      CHECK(bu[0] >= us[0] && bu[1] >= us[1]);
++      CHECK(bu[0] <= sz[0] && bu[1] <= sz[1]);
++      CHECK(bu[0] - us[0] + bu[1] - us[1] <= available);
++   }
++
+    printf("acd_budget_test: %d checks, %d failures\n", checks, failures);
+    return failures != 0;
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -479,6 +479,18 @@
+     * Totals (vram_total, vis_total) and usages stay physical; no second shrink to the shared
+     * cap and no cap-avail fake usage. Without a budget max is the real free bytes. */
+    acd_apply_budget(m, &k, vram_total, vram_free);
++   /* Visible headroom never exceeds the real visible free bytes nor the shared
++    * allowance (vram.max above). The 64 MiB app-visible subcap itself is enforced
++    * by the kernel on native; Mesa only reports a conservative headroom here and
++    * never invents per-session held bytes. Totals/usages stay physical. */
++   {
++      uint64_t vis_max = k.vram_vis_total * 3 / 4;
++      if (vis_max > k.vram_vis_free)
++         vis_max = k.vram_vis_free;
++      if (vis_max > m->vram.max_allocation)
++         vis_max = m->vram.max_allocation;
++      m->cpu_accessible_vram.max_allocation = vis_max;
++   }
+    m->gtt.total_heap_size = k.gtt_cap;
+    m->gtt.usable_heap_size = k.gtt_cap;
+    m->gtt.heap_usage = k.gtt_used;
+@@ -524,6 +536,27 @@
+    case AMDGPU_INFO_DEV_INFO:
+       *(struct drm_amdgpu_info_device *)out = d->dev;
+       return 0;
++   case AMDGPU_INFO_VRAM_GTT: {
++      /* ac_drm_query_heap_info first queries this; without it every heap query
++       * fails and VK_EXT_memory_budget stays full. Native reports the live pools
++       * (vram = vis + high, visible = vis, gtt = cap); the canned stand-in keeps
++       * its synthetic totals. Usages still come from the *_USAGE queries. */
++      struct drm_amdgpu_info_vram_gtt *vg = out;
++      if (dev->core->kext) {
++         struct rdna4n_info k;
++         int r = acd_kext_query_info(dev->core->kext, &k);
++         if (r)
++            return r;
++         vg->vram_size = k.vram_vis_total + k.vram_hi_total;
++         vg->vram_cpu_accessible_size = k.vram_vis_total;
++         vg->gtt_size = k.gtt_cap;
++      } else {
++         vg->vram_size = d->mem.vram.total_heap_size;
++         vg->vram_cpu_accessible_size = d->mem.cpu_accessible_vram.total_heap_size;
++         vg->gtt_size = d->mem.gtt.total_heap_size;
++      }
++      return 0;
++   }
+    case AMDGPU_INFO_MEMORY:
+       if (dev->core->kext)
+          return acd_info_memory(dev, info, out);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -15,6 +15,10 @@
+ 
+ #ifdef MAJOR_IN_SYSMACROS
+ #include <sys/sysmacros.h>
++#endif
++
++#ifdef HAVE_AMDGPU_DARWIN
++#include "darwin/ac_darwin_budget.h"
+ #endif
+ 
+ #include "vk_drm_syncobj.h"
+@@ -3493,6 +3497,27 @@
+       memoryBudget->heapBudget[i] = MIN2(memory_properties->memoryHeaps[i].size, memoryBudget->heapBudget[i]);
+    }
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   /* Canned devices have no native usage query. The shared allowance is a
++    * single pool of headroom, not a separate grant for each local heap. */
++   uint64_t probe;
++   struct drm_amdgpu_memory_info native_memory;
++   if (pdev->drm_device &&
++       ac_drm_query_info(pdev->drm_device, AMDGPU_INFO_VRAM_USAGE, sizeof(probe), &probe) == 0 &&
++       ac_drm_query_info(pdev->drm_device, AMDGPU_INFO_MEMORY, sizeof(native_memory), &native_memory) == 0) {
++      uint64_t sizes[VK_MAX_MEMORY_HEAPS];
++      uint32_t local_mask = 0;
++      for (uint32_t i = 0; i < memory_properties->memoryHeapCount; ++i) {
++         sizes[i] = memory_properties->memoryHeaps[i].size;
++         if (memory_properties->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
++            local_mask |= UINT32_C(1) << i;
++      }
++      acd_clamp_local_budget(memory_properties->memoryHeapCount, local_mask, sizes,
++                             memoryBudget->heapUsage, memoryBudget->heapBudget,
++                             native_memory.vram.max_allocation);
++   }
++#endif
++
+    /* The heapBudget and heapUsage values must be zero for array elements
+     * greater than or equal to
+     * VkPhysicalDeviceMemoryProperties::memoryHeapCount.

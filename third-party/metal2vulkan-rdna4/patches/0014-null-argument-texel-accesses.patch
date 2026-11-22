@@ -1,0 +1,668 @@
+diff --git a/src/passes/resources/null_texels.rs b/src/passes/resources/null_texels.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/null_texels.rs
+@@ -0,0 +1,350 @@
++//! Null argument textures must not access a descriptor of an unrelated image shape.
++
++use super::*;
++use crate::spirv_module::{Block, Function};
++use spirv::{Decoration, FunctionControl, SelectionControl};
++
++#[derive(Clone, Copy)]
++struct Image {
++    array: Word,
++    element: Word,
++    index: Word,
++}
++
++pub(in crate::passes) fn guard_argument_texel_accesses(ctx: &mut Ctx) -> Result<(), String> {
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for inst in &ctx.module.annotations {
++        match inst.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    if !bindings
++        .iter()
++        .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0))
++    {
++        return Ok(());
++    }
++    let defs = ctx
++        .module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    let mut arrays = HashMap::new();
++    for (&id, &set) in &sets {
++        if !matches!(set, 2 | 3) || bindings.get(&id) != Some(&0) {
++            continue;
++        }
++        let Some(pointer) = defs
++            .get(&id)
++            .and_then(|var| var.result_type)
++            .and_then(|ty| defs.get(&ty))
++        else {
++            continue;
++        };
++        let [Operand::StorageClass(StorageClass::UniformConstant), Operand::IdRef(array)] =
++            pointer.operands.as_slice()
++        else {
++            continue;
++        };
++        let Some(array) = defs
++            .get(array)
++            .filter(|array| array.class.opcode == Op::TypeRuntimeArray)
++        else {
++            continue;
++        };
++        if let [Operand::IdRef(element)] = array.operands.as_slice() {
++            arrays.insert(id, *element);
++        }
++    }
++    if arrays.is_empty() {
++        return Ok(());
++    }
++    let mut paths = HashMap::new();
++    let mut images = HashMap::new();
++    loop {
++        let before = (paths.len(), images.len());
++        for (&id, inst) in &defs {
++            match (inst.class.opcode, inst.operands.as_slice()) {
++                (
++                    Op::AccessChain | Op::InBoundsAccessChain,
++                    [Operand::IdRef(array), Operand::IdRef(index)],
++                ) => {
++                    if let Some(&element) = arrays.get(array) {
++                        paths.insert(
++                            id,
++                            Image {
++                                array: *array,
++                                element,
++                                index: *index,
++                            },
++                        );
++                    }
++                }
++                (Op::Load, [Operand::IdRef(pointer)]) => {
++                    if let Some(&image) = paths.get(pointer) {
++                        images.insert(id, image);
++                    }
++                }
++                (Op::CopyObject | Op::Bitcast | Op::Image, [Operand::IdRef(source)]) => {
++                    if let Some(&image) = images.get(source) {
++                        images.insert(id, image);
++                    }
++                }
++                (Op::SampledImage, [Operand::IdRef(source), _]) => {
++                    if let Some(&image) = images.get(source) {
++                        images.insert(id, image);
++                    }
++                }
++                _ => {}
++            }
++        }
++        if before == (paths.len(), images.len()) {
++            break;
++        }
++    }
++    // A helper owns the branch so loop headers, merge blocks and caller Phi predecessors stay intact.
++    for function in 0..ctx.module.functions.len() {
++        for block in 0..ctx.module.functions[function].blocks.len() {
++            let old = ctx.module.functions[function].blocks[block]
++                .instructions
++                .clone();
++            let mut body = Vec::with_capacity(old.len());
++            for inst in old {
++                if matches!(
++                    inst.class.opcode,
++                    Op::ImageFetch | Op::ImageRead | Op::ImageWrite
++                ) {
++                    if let Some(image) = inst.operands.first().and_then(|op| match op {
++                        Operand::IdRef(id) => images.get(id),
++                        _ => None,
++                    }) {
++                        body.push(guarded_call(ctx, &inst, *image, &defs)?);
++                        continue;
++                    }
++                }
++                body.push(inst);
++            }
++            ctx.module.functions[function].blocks[block].instructions = body;
++        }
++    }
++    let mut candidates = paths
++        .keys()
++        .chain(images.keys())
++        .copied()
++        .collect::<HashSet<_>>();
++    let mut retired = HashSet::new();
++    loop {
++        let used = ctx
++            .module
++            .functions
++            .iter()
++            .flat_map(Function::all_inst_iter)
++            .flat_map(|inst| &inst.operands)
++            .filter_map(|op| match op {
++                Operand::IdRef(id) => Some(*id),
++                _ => None,
++            })
++            .collect::<HashSet<_>>();
++        let dead = candidates
++            .difference(&used)
++            .copied()
++            .collect::<HashSet<_>>();
++        if dead.is_empty() {
++            break;
++        }
++        for function in &mut ctx.module.functions {
++            for block in &mut function.blocks {
++                block
++                    .instructions
++                    .retain(|inst| !inst.result_id.is_some_and(|id| dead.contains(&id)));
++            }
++        }
++        candidates.retain(|id| !dead.contains(id));
++        retired.extend(dead);
++    }
++    for instructions in [&mut ctx.module.annotations, &mut ctx.module.debug_names] {
++        instructions.retain(|inst| !matches!(inst.operands.first(), Some(Operand::IdRef(id)) if retired.contains(id)));
++    }
++    Ok(())
++}
++
++fn block(label: Word, instructions: Vec<Instruction>) -> Block {
++    Block {
++        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
++        instructions,
++    }
++}
++
++fn guarded_call(
++    ctx: &mut Ctx,
++    inst: &Instruction,
++    image: Image,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<Instruction, String> {
++    let uint = ctx.ty_uint();
++    let boolean = ctx.ty_bool();
++    let zero = ctx.const_uint(0);
++    let result_ty = inst.result_type.unwrap_or_else(|| ctx.ty_void());
++    let mut types = vec![Operand::IdRef(result_ty), Operand::IdRef(uint)];
++    let index = ctx.module.fresh_id();
++    let mut parameters = vec![Instruction::new(
++        Op::FunctionParameter,
++        Some(uint),
++        Some(index),
++        vec![],
++    )];
++    let mut arguments = vec![Operand::IdRef(image.index)];
++    let mut operation = inst.clone();
++    for operand in operation.operands.iter_mut().skip(1) {
++        if let Operand::IdRef(id) = operand {
++            // ConstOffset and other constant image operands must remain compile-time constants.
++            if defs.get(id).is_some_and(|def| {
++                matches!(
++                    def.class.opcode,
++                    Op::Constant
++                        | Op::ConstantComposite
++                        | Op::ConstantNull
++                        | Op::ConstantTrue
++                        | Op::ConstantFalse
++                        | Op::SpecConstant
++                        | Op::SpecConstantComposite
++                        | Op::SpecConstantOp
++                        | Op::SpecConstantTrue
++                        | Op::SpecConstantFalse
++                )
++            }) {
++                continue;
++            }
++            let ty = defs
++                .get(id)
++                .and_then(|def| def.result_type)
++                .ok_or("argument texel operand has no value type")?;
++            types.push(Operand::IdRef(ty));
++            arguments.push(Operand::IdRef(*id));
++            let parameter = ctx.module.fresh_id();
++            parameters.push(Instruction::new(
++                Op::FunctionParameter,
++                Some(ty),
++                Some(parameter),
++                vec![],
++            ));
++            *id = parameter;
++        }
++    }
++    let function_type = ctx.get_or_create(Op::TypeFunction, None, types);
++    let function = ctx.module.fresh_id();
++    let entry = ctx.module.fresh_id();
++    let access = ctx.module.fresh_id();
++    let exit = ctx.module.fresh_id();
++    let valid = ctx.module.fresh_id();
++    let first = vec![
++        Instruction::new(
++            Op::INotEqual,
++            Some(boolean),
++            Some(valid),
++            vec![Operand::IdRef(index), Operand::IdRef(zero)],
++        ),
++        Instruction::new(
++            Op::SelectionMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(exit),
++                Operand::SelectionControl(SelectionControl::NONE),
++            ],
++        ),
++        Instruction::new(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(valid),
++                Operand::IdRef(access),
++                Operand::IdRef(exit),
++            ],
++        ),
++    ];
++    let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, image.element);
++    let pointer = ctx.module.fresh_id();
++    let loaded = ctx.module.fresh_id();
++    let mut body = vec![
++        Instruction::new(
++            Op::AccessChain,
++            Some(pointer_ty),
++            Some(pointer),
++            vec![Operand::IdRef(image.array), Operand::IdRef(index)],
++        ),
++        Instruction::new(
++            Op::Load,
++            Some(image.element),
++            Some(loaded),
++            vec![Operand::IdRef(pointer)],
++        ),
++    ];
++    operation.operands[0] = Operand::IdRef(loaded);
++    let result = operation.result_type.map(|_| ctx.module.fresh_id());
++    operation.result_id = result;
++    body.push(operation);
++    body.push(Instruction::new(
++        Op::Branch,
++        None,
++        None,
++        vec![Operand::IdRef(exit)],
++    ));
++    let mut last = vec![];
++    if let Some(result) = result {
++        let zero = ctx.const_null(result_ty);
++        let selected = ctx.module.fresh_id();
++        last.push(Instruction::new(
++            Op::Phi,
++            Some(result_ty),
++            Some(selected),
++            vec![
++                Operand::IdRef(zero),
++                Operand::IdRef(entry),
++                Operand::IdRef(result),
++                Operand::IdRef(access),
++            ],
++        ));
++        last.push(Instruction::new(
++            Op::ReturnValue,
++            None,
++            None,
++            vec![Operand::IdRef(selected)],
++        ));
++    } else {
++        last.push(Instruction::new(Op::Return, None, None, vec![]));
++    }
++    ctx.module.functions.push(Function {
++        def: Some(Instruction::new(
++            Op::Function,
++            Some(result_ty),
++            Some(function),
++            vec![
++                Operand::FunctionControl(FunctionControl::NONE),
++                Operand::IdRef(function_type),
++            ],
++        )),
++        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
++        parameters,
++        blocks: vec![block(entry, first), block(access, body), block(exit, last)],
++    });
++    let mut operands = vec![Operand::IdRef(function)];
++    operands.extend(arguments);
++    Ok(Instruction::new(
++        Op::FunctionCall,
++        Some(result_ty),
++        Some(inst.result_id.unwrap_or_else(|| ctx.module.fresh_id())),
++        operands,
++    ))
++}
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -41,6 +41,7 @@
+         TransformOptions::default(),
+     );
+     lower(&mut ctx, fields)?;
++    super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+     super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
+     super::super::canonicalize_ids(&mut ctx.module);
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -9,6 +9,7 @@
+ mod gpu_argument_graph;
+ mod gpu_arguments;
+ mod nonuniform;
++mod null_texels;
+ mod query_select;
+ pub(in crate::passes) mod rewrites;
+ mod selected_load;
+@@ -24,6 +25,7 @@
+     ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
++pub(in crate::passes) use null_texels::guard_argument_texel_accesses;
+ pub(in crate::passes) use query_select::rewrite_resource_query_selects;
+ pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
+ pub(in crate::passes) use texture_array::{
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -3346,6 +3346,8 @@
+     // their result; where nothing ever consumed that value, retract the synthesis before liveness
+     // runs so the descriptor goes too.
+     stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
++    resources::guard_argument_texel_accesses(&mut ctx)?;
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
+     // The closures above are the last of this boundary's instruction changes, and any of them can
+     // delete a variable's last use. Re-establish global liveness against the finished bodies before
+     // the collection that would otherwise root a stranded variable at its own interface entry.
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -916,6 +916,7 @@
+     // no longer predicts that from the AIR text when a module is in hand to be read.
+     reflection.reconcile_buffer_address_table(&finished.module);
+     reflection.reconcile_argument_resource_tables(&finished.module);
++    reflection.retract_unbound_embedded_resources(&finished.module);
+     // Nothing in the AIR metadata describes a descriptor the passes invented to type an AIR value,
+     // so only the module and the pass that made it can say a consumer has to bind one.
+     reflection.report_synthesized_placeholders(
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -201,7 +201,9 @@
+ /// 3 `ReadOnly`->`Unused`. No SPIR-V, no other reflected field, and no status changes.**
+ /// v56 adds descriptor-backed flat argument-buffer sampler fields and their owner coordinates.
+ /// v57 adds token-backed image dimensions without requiring a typed image descriptor.
+-pub const REFLECTION_VERSION: u32 = 57;
++/// v58 guards token-backed texel reads and writes before loading an image descriptor, and retracts
++/// embedded texture/sampler reflection entries whose descriptors the final module discarded.
++pub const REFLECTION_VERSION: u32 = 58;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -2004,6 +2006,91 @@
+             table_binding: 672,
+             categories,
+             image_query_binding,
++        });
++    }
++
++    /// Drop embedded texture and sampler entries whose descriptors the finished module discarded.
++    ///
++    /// AIR metadata names these fields even when the specialized entry never reads one. The
++    /// interface pass then removes the unused descriptor, so reporting the metadata-only entry
++    /// asks a consumer to bind a resource the returned module does not declare. Keep the owner
++    /// fields in `argument_buffer_fields`: they describe the argument-buffer layout, not the set
++    /// of descriptors that survived specialization.
++    pub(crate) fn retract_unbound_embedded_resources(&mut self, module: &Module) {
++        use crate::spirv_module::Operand;
++        use std::collections::{BTreeSet, HashMap};
++
++        if !self.bindings.iter().any(|resource| {
++            matches!(
++                resource.kind,
++                ResourceKind::EmbeddedArgBufferTexture | ResourceKind::EmbeddedArgBufferSampler
++            )
++        }) {
++            return;
++        }
++        let types = module
++            .types_global_values
++            .iter()
++            .filter_map(|instruction| Some((instruction.result_id?, instruction)))
++            .collect::<HashMap<_, _>>();
++        let mut sets = HashMap::new();
++        let mut bindings = HashMap::new();
++        for instruction in &module.annotations {
++            if instruction.class.opcode != spirv::Op::Decorate {
++                continue;
++            }
++            match instruction.operands.as_slice() {
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++                {
++                    sets.insert(*id, *set);
++                }
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(binding)] =>
++                {
++                    bindings.insert(*id, *binding);
++                }
++                _ => {}
++            }
++        }
++        let mut images = BTreeSet::new();
++        let mut samplers = BTreeSet::new();
++        for instruction in module
++            .types_global_values
++            .iter()
++            .filter(|instruction| instruction.class.opcode == spirv::Op::Variable)
++        {
++            let Some(variable) = instruction.result_id else {
++                continue;
++            };
++            let (Some(set), Some(binding)) = (sets.get(&variable), bindings.get(&variable)) else {
++                continue;
++            };
++            let Some(pointee) = instruction
++                .result_type
++                .and_then(|pointer| pointee_of(&types, pointer))
++            else {
++                continue;
++            };
++            match types
++                .get(&pointee)
++                .map(|instruction| instruction.class.opcode)
++            {
++                Some(spirv::Op::TypeImage) => {
++                    images.insert((*set, *binding));
++                }
++                Some(spirv::Op::TypeSampler) => {
++                    samplers.insert((*set, *binding));
++                }
++                _ => {}
++            }
++        }
++        self.bindings.retain(|resource| match resource.kind {
++            ResourceKind::EmbeddedArgBufferTexture => resource
++                .descriptor
++                .is_none_or(|location| images.contains(&(location.set, location.binding))),
++            ResourceKind::EmbeddedArgBufferSampler => resource
++                .descriptor
++                .is_none_or(|location| samplers.contains(&(location.set, location.binding))),
++            _ => true,
+         });
+     }
+ 
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `57`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `58`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -426,8 +426,10 @@
+ 
+ An argument-buffer resource with serialized token words checks `air.is_null_texture_*`
+ at run time by comparing both words with zero. Version 3 dimension queries also return
+-zero for null tokens. This does not establish general null descriptor behavior for
+-unguarded sample/read/write operations.
++zero for null tokens. Token-backed texel reads and writes branch before loading an
++image descriptor: null reads return every component as zero, and null writes do
++nothing. The static-resource postpass applies the same rule. Unguarded sampling and
++gather operations still require separate null-resource handling.
+ 
+ The following restriction remains for ordinary descriptor-backed texture arguments.
+ 
+diff --git a/tests/embedded_descriptor_reflection.rs b/tests/embedded_descriptor_reflection.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/embedded_descriptor_reflection.rs
+@@ -0,0 +1,124 @@
++use metal2vulkan::passes::{Stage, TransformOptions};
++use metal2vulkan::reflect::{ResourceKind, ShaderReflection};
++use std::path::Path;
++
++fn translate(source: &str) -> (Vec<u8>, ShaderReflection) {
++    let (sanitized, layout) = metal2vulkan::tools::sanitize_ll_text_with_datalayout(source);
++    metal2vulkan::translate_sanitized_native_reflected_unvalidated(
++        &sanitized,
++        Stage::Kernel,
++        Path::new(""),
++        TransformOptions {
++            kernel_local_size: [1, 1, 1],
++            ..Default::default()
++        },
++        layout.as_deref(),
++    )
++    .unwrap()
++}
++
++fn source(operation: &str) -> String {
++    let image = if operation == "none" {
++        ""
++    } else {
++        " %index = and i32 %i, 1\n %wide = zext i32 %index to i64\n %slot = getelementptr %Resources, ptr addrspace(2) %r, i64 0, i32 0, i64 %wide, i32 0\n %image = load ptr addrspace(1), ptr addrspace(2) %slot, align 8\n"
++    };
++    let body = match operation {
++        "sample" => " %filter_slot = getelementptr %Resources, ptr addrspace(2) %r, i64 0, i32 1, i64 %wide, i32 0\n %filter = load ptr addrspace(2), ptr addrspace(2) %filter_slot, align 8\n %result = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %filter, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)\n",
++        "read" => " %filter = call ptr addrspace(2) @air.get_read_sampler()\n %result = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %filter, <2 x i32> zeroinitializer, <2 x i32> zeroinitializer, i32 0, i32 1)\n",
++        "none" => "",
++        _ => unreachable!(),
++    };
++    let output = if operation == "none" {
++        " store float 0.0, ptr addrspace(1) %out, align 4\n"
++    } else {
++        " %rgba = extractvalue { <4 x float>, i8 } %result, 0\n %red = extractelement <4 x float> %rgba, i32 0\n store float %red, ptr addrspace(1) %out, align 4\n"
++    };
++    let header = r#"target triple = "air64-apple-macosx"
++%Resources = type { [2 x %Image], [2 x %Filter] }
++%Image = type { ptr addrspace(1) }
++%Filter = type { ptr addrspace(2) }
++define void @resources(ptr addrspace(2) %r, ptr addrspace(1) %out, i32 %i) {
++entry:
++"#;
++    let footer = r#" ret void
++}
++declare ptr addrspace(2) @air.get_read_sampler()
++declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++!air.kernel = !{!0}
++!0 = !{ptr @resources, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Resources"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++!6 = !{i32 0, i32 16, i32 0, !"array<texture2d<float, sample>, 2>", !"images", !"air.indirect_argument", !7, i32 16, i32 16, i32 0, !"array<sampler, 2>", !"filters", !"air.indirect_argument", !8}
++!7 = !{i32 0, !"air.texture", !"air.location_index", i32 1, i32 2, !"air.sample", !"air.arg_type_name", !"array<texture2d<float, sample>, 2>"}
++!8 = !{i32 1, !"air.sampler", !"air.location_index", i32 4, i32 2, !"air.arg_type_name", !"array<sampler, 2>"}
++"#;
++    let source = [header, image, body, output, footer].concat();
++    if operation == "read" {
++        source
++            .replace("texture2d<float, sample>", "texture2d<float, read>")
++            .replace("!\"air.sample\"", "!\"air.read\"")
++    } else {
++        source
++    }
++}
++
++#[test]
++fn embedded_descriptor_reflection_tracks_the_finished_module_and_keeps_layout() {
++    for operation in ["sample", "read", "none"] {
++        let (spv, reflection) = translate(&source(operation));
++        let assembly = metal2vulkan::disassemble(&spv).unwrap();
++        for (kind, expected, binding) in [
++            (
++                ResourceKind::EmbeddedArgBufferTexture,
++                operation != "none",
++                32,
++            ),
++            (
++                ResourceKind::EmbeddedArgBufferSampler,
++                operation == "sample",
++                160,
++            ),
++        ] {
++            assert_eq!(
++                assembly.contains(&format!("Binding {binding}\n")),
++                expected,
++                "{operation}: {assembly}"
++            );
++            assert_eq!(
++                reflection.bindings.iter().any(|row| row.kind == kind),
++                expected,
++                "{operation}: {reflection:?}"
++            );
++        }
++        assert_eq!(reflection.argument_buffer_fields.len(), 2, "{operation}");
++        reflection.validate_descriptor_abi().unwrap();
++    }
++}
++
++#[test]
++fn scalar_descriptor_loads_that_survive_keep_their_binding() {
++    let (spv, reflection) = translate(include_str!("fixtures/argument_buffer_sampler.ll"));
++    let assembly = metal2vulkan::disassemble(&spv).unwrap();
++    for kind in [
++        ResourceKind::EmbeddedArgBufferTexture,
++        ResourceKind::EmbeddedArgBufferSampler,
++    ] {
++        let binding = reflection
++            .bindings
++            .iter()
++            .find(|row| row.kind == kind)
++            .unwrap()
++            .descriptor
++            .unwrap();
++        assert!(
++            assembly.contains(&format!("Binding {}\n", binding.binding)),
++            "{assembly}"
++        );
++    }
++    assert_eq!(reflection.argument_buffer_fields.len(), 3);
++}

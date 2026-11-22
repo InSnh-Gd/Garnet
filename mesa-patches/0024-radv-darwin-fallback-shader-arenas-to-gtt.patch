@@ -1,0 +1,15 @@
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -1181,6 +1181,11 @@ radv_create_shader_arena(struct radv_device *device, struct radv_shader_free_list
+    VkResult result;
+    result = radv_bo_create(device, NULL, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM, flags,
+                            RADV_BO_PRIORITY_SHADER, replay_va, true, &arena->bo);
++#ifdef HAVE_AMDGPU_DARWIN
++   if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !(flags & (RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_REPLAYABLE)))
++      result = radv_bo_create(device, NULL, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_GTT, flags,
++                              RADV_BO_PRIORITY_SHADER, replay_va, true, &arena->bo);
++#endif
+    if (result != VK_SUCCESS)
+       goto fail;
+ 

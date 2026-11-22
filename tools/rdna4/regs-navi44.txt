@@ -1,0 +1,12 @@
+# Bases from WhateverRed#6 ground truth; confirm against your own card's discovery dump.
+# Read-only; returns 0xffffffff before the ladder built the device context.
+0x16600 THM_TCON_CUR_TMP
+0x1660f CG_MULT_THERMAL_STATUS
+0x16614 CG_TACH_CTRL
+0x16615 CG_TACH_STATUS
+0x16063 MP0_C2PMSG_35
+0x1607a MP0_C2PMSG_58
+0x16080 MP0_C2PMSG_64
+0x16091 MP0_C2PMSG_81
+0x2004 GRBM_STATUS
+0x21a0 CP_STAT

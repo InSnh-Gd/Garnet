@@ -1,0 +1,368 @@
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -3347,6 +3347,7 @@
+     // runs so the descriptor goes too.
+     stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
+     resources::guard_argument_texel_accesses(&mut ctx)?;
++    resources::protect_argument_sampling(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+     // The closures above are the last of this boundary's instruction changes, and any of them can
+     // delete a variable's last use. Re-establish global liveness against the finished bodies before
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -42,6 +42,7 @@
+     );
+     lower(&mut ctx, fields)?;
+     super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
++    super::null_sampling::protect_argument_sampling(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+     super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
+     super::super::canonicalize_ids(&mut ctx.module);
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -9,6 +9,7 @@
+ mod gpu_argument_graph;
+ mod gpu_arguments;
+ mod nonuniform;
++mod null_sampling;
+ mod null_texels;
+ mod query_select;
+ pub(in crate::passes) mod rewrites;
+@@ -25,6 +26,7 @@
+     ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
++pub(in crate::passes) use null_sampling::protect_argument_sampling;
+ pub(in crate::passes) use null_texels::guard_argument_texel_accesses;
+ pub(in crate::passes) use query_select::rewrite_resource_query_selects;
+ pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
+diff --git a/src/passes/resources/null_sampling.rs b/src/passes/resources/null_sampling.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/null_sampling.rs
+@@ -0,0 +1,228 @@
++//! Shape-correct null images preserve sampling control flow and implicit derivatives.
++
++use super::*;
++use spirv::Decoration;
++
++pub(in crate::passes) fn protect_argument_sampling(ctx: &mut Ctx) -> Result<(), String> {
++    let defs = ctx
++        .module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for inst in &ctx.module.annotations {
++        match inst.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    let Some(table) = bindings
++        .iter()
++        .find_map(|(&id, &binding)| (binding == 672 && sets.get(&id) == Some(&0)).then_some(id))
++    else {
++        return Ok(());
++    };
++    let mut arrays = HashMap::new();
++    for (&id, &set) in &sets {
++        if set != 2 || bindings.get(&id) != Some(&0) {
++            continue;
++        }
++        let image = defs
++            .get(&id)
++            .and_then(|var| var.result_type)
++            .and_then(|ty| defs.get(&ty))
++            .and_then(|ptr| ptr.operands.get(1))
++            .and_then(|op| match op {
++                Operand::IdRef(id) => defs.get(id),
++                _ => None,
++            })
++            .filter(|array| array.class.opcode == Op::TypeRuntimeArray)
++            .and_then(|array| array.operands.first())
++            .and_then(|op| match op {
++                Operand::IdRef(id) => defs.get(id),
++                _ => None,
++            });
++        let Some(image) = image else { continue };
++        let [Operand::IdRef(sampled), Operand::Dim(dim), Operand::LiteralBit32(depth), Operand::LiteralBit32(arrayed), Operand::LiteralBit32(0), Operand::LiteralBit32(1), ..] =
++            image.operands.as_slice()
++        else {
++            continue;
++        };
++        if *dim as u32 > 3 || *depth > 1 || *arrayed > 1 {
++            continue;
++        }
++        if !defs.get(sampled).is_some_and(|ty| {
++            ty.class.opcode == Op::TypeFloat && ty.operands == [Operand::LiteralBit32(32)]
++        }) {
++            continue;
++        }
++        arrays.insert(id, (*dim as u32 * 2 + arrayed) + 8 * depth);
++    }
++    if arrays.is_empty() {
++        return Ok(());
++    }
++    let mut pointers = HashMap::new();
++    let mut images = HashMap::new();
++    loop {
++        let before = (pointers.len(), images.len());
++        for (&id, inst) in &defs {
++            match (inst.class.opcode, inst.operands.as_slice()) {
++                (
++                    Op::AccessChain | Op::InBoundsAccessChain,
++                    [Operand::IdRef(array), Operand::IdRef(index)],
++                ) if arrays.contains_key(array) => {
++                    pointers.insert(id, *index);
++                }
++                (Op::Load, [Operand::IdRef(pointer)]) => {
++                    if let Some(&index) = pointers.get(pointer) {
++                        images.insert(id, index);
++                    }
++                }
++                (
++                    Op::CopyObject | Op::Bitcast | Op::Image | Op::SampledImage,
++                    [Operand::IdRef(source), ..],
++                ) => {
++                    if let Some(&index) = images.get(source) {
++                        images.insert(id, index);
++                    }
++                }
++                _ => {}
++            }
++        }
++        if before == (pointers.len(), images.len()) {
++            break;
++        }
++    }
++    let uint = ctx.ty_uint();
++    let boolean = ctx.ty_bool();
++    let zero = ctx.const_uint(0);
++    let one = ctx.const_uint(1);
++    let word_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    for function in 0..ctx.module.functions.len() {
++        for block in 0..ctx.module.functions[function].blocks.len() {
++            let old = ctx.module.functions[function].blocks[block]
++                .instructions
++                .clone();
++            let mut body = Vec::with_capacity(old.len());
++            for mut inst in old {
++                if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
++                    if let [Operand::IdRef(array), Operand::IdRef(index)] = inst.operands.as_slice()
++                    {
++                        if let Some(&shape) = arrays.get(array) {
++                            let index = *index;
++                            let count = super::gpu_arguments::load_word(
++                                ctx,
++                                &mut body,
++                                table,
++                                word_pointer,
++                                uint,
++                                zero,
++                                one,
++                            );
++                            let shape = ctx.const_uint(shape);
++                            let tail = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::IAdd,
++                                uint,
++                                vec![Operand::IdRef(count), Operand::IdRef(shape)],
++                            );
++                            let null = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::IEqual,
++                                boolean,
++                                vec![Operand::IdRef(index), Operand::IdRef(zero)],
++                            );
++                            let selected = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::Select,
++                                uint,
++                                vec![
++                                    Operand::IdRef(null),
++                                    Operand::IdRef(tail),
++                                    Operand::IdRef(index),
++                                ],
++                            );
++                            inst.operands[1] = Operand::IdRef(selected);
++                        }
++                    }
++                }
++                let sampling = matches!(
++                    inst.class.opcode,
++                    Op::ImageSampleImplicitLod
++                        | Op::ImageSampleExplicitLod
++                        | Op::ImageSampleDrefImplicitLod
++                        | Op::ImageSampleDrefExplicitLod
++                        | Op::ImageSampleProjImplicitLod
++                        | Op::ImageSampleProjExplicitLod
++                        | Op::ImageSampleProjDrefImplicitLod
++                        | Op::ImageSampleProjDrefExplicitLod
++                        | Op::ImageGather
++                        | Op::ImageDrefGather
++                        | Op::ImageQueryLod
++                );
++                let source = inst.operands.first().and_then(|op| match op {
++                    Operand::IdRef(id) => images.get(id).copied(),
++                    _ => None,
++                });
++                if sampling {
++                    if let (Some(index), Some(result), Some(ty)) =
++                        (source, inst.result_id, inst.result_type)
++                    {
++                        let mut null = super::gpu_arguments::value(
++                            ctx,
++                            &mut body,
++                            Op::IEqual,
++                            boolean,
++                            vec![Operand::IdRef(index), Operand::IdRef(zero)],
++                        );
++                        if let Some(def) = defs
++                            .get(&ty)
++                            .filter(|def| def.class.opcode == Op::TypeVector)
++                        {
++                            if let [_, Operand::LiteralBit32(count)] = def.operands.as_slice() {
++                                let bools = ctx.ty_vec_bool(*count);
++                                null = super::gpu_arguments::value(
++                                    ctx,
++                                    &mut body,
++                                    Op::CompositeConstruct,
++                                    bools,
++                                    vec![Operand::IdRef(null); *count as usize],
++                                );
++                            }
++                        }
++                        let actual = ctx.module.fresh_id();
++                        inst.result_id = Some(actual);
++                        body.push(inst);
++                        let zero_result = ctx.const_null(ty);
++                        body.push(Instruction::new(
++                            Op::Select,
++                            Some(ty),
++                            Some(result),
++                            vec![
++                                Operand::IdRef(null),
++                                Operand::IdRef(zero_result),
++                                Operand::IdRef(actual),
++                            ],
++                        ));
++                        continue;
++                    }
++                }
++                body.push(inst);
++            }
++            ctx.module.functions[function].blocks[block].instructions = body;
++        }
++    }
++    Ok(())
++}
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -203,7 +203,7 @@
+ /// v57 adds token-backed image dimensions without requiring a typed image descriptor.
+ /// v58 guards token-backed texel reads and writes before loading an image descriptor, and retracts
+ /// embedded texture/sampler reflection entries whose descriptors the final module discarded.
+-pub const REFLECTION_VERSION: u32 = 58;
++pub const REFLECTION_VERSION: u32 = 59;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -2002,7 +2002,7 @@
+             )
+         });
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: if image_query_binding.is_some() { 3 } else { 2 },
++            version: 4,
+             table_binding: 672,
+             categories,
+             image_query_binding,
+@@ -2189,12 +2189,7 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if table.version
+-                != if table.image_query_binding.is_some() {
+-                    3
+-                } else {
+-                    2
+-                }
++            if table.version != 4
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+diff --git a/tests/argument_buffer_graph.rs b/tests/argument_buffer_graph.rs
+--- a/tests/argument_buffer_graph.rs
++++ b/tests/argument_buffer_graph.rs
+@@ -84,7 +84,7 @@
+         #[cfg(feature = "serde")]
+         {
+             let json = serde_json::to_value(&reflection).unwrap();
+-            assert_eq!(json["argument_resource_tables"]["version"], 2);
++            assert_eq!(json["argument_resource_tables"]["version"], 4);
+             assert_eq!(
+                 json["argument_resource_tables"]["categories"],
+                 serde_json::json!([0, 2])
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `58`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `59`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -85,21 +85,28 @@
+ ## Descriptor ABI (binding map)
+ 
+ Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
+-`argument_resource_tables: {version: 2, table_binding: 672, categories: [...]}`.
++`argument_resource_tables: {version: 4, table_binding: 672, categories: [...]}`.
+ They require the default descriptor layout. Binding 672 in set 0 is the read-only token
+ table; categories 0, 1, 2 denote runtime sampled-image, storage-image and sampler arrays
+ at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+ `(word_offset, count)`, followed by sorted low/high token pairs. Descriptor index 0 is
+-reserved for a null image or a default sampler. Image consumers enable Vulkan
+-`nullDescriptor` and bind `VK_NULL_HANDLE` at image index 0, so sample/gather reads
+-return zero across image shapes without adding divergent control flow around
+-implicit derivatives. Tokens are opaque identifiers, never GPU addresses. The shader
++reserved for texel guards or a default sampler. ABI 4 appends shape-specific sampled
++image descriptors after the sampled token count, at `count + shape`, where
++`shape = 2 * Dim + Arrayed + 8 * Depth` uses the SPIR-V image type fields
++(float32, non-MS images with Dim 0..3). Only shapes declared by the shader need
++bindings; intervening slots remain partially bound. These descriptors are not
++additional token rows and do not move the dimension data. A consumer may bind a
++Vulkan null image when `nullDescriptor` is enabled, otherwise it binds a matching
++image view. Sampling and gather select these descriptors for absent tokens and
++select a zero result afterwards, preserving the original control flow, implicit
++LOD and bias operands. Texel reads/writes branch before descriptor access.
++Tokens are opaque identifiers, never GPU addresses. The shader
+ loads them through its actual record/pointer graph, so this contract has no raw root
+ descriptors. Consumers must bind these additional resources and enable the corresponding
+ descriptor-indexing features. Unknown graph operations return an error. Flat resources
+ with representable coordinates retain their existing static descriptor ABI.
+ 
+-Graphs using image dimension queries carry version 3 and `image_query_binding: 673`.
++Graphs using image dimension queries also carry `image_query_binding: 673`.
+ Bindings 672 and 673 alias the same read-only buffer. After the final token list, the
+ consumer appends eight u32 words for every sampled-list entry (including index 0):
+ width, height, depth, Metal array length, mip-level count, sample count, and two zero

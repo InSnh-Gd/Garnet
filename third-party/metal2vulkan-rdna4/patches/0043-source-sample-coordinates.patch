@@ -1,0 +1,351 @@
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -93,6 +93,9 @@
+     /// Direct constant-buffer pointers or physical base addresses, identical for the entry's
+     /// derivative group. Addresses loaded from buffer contents never establish this provenance.
+     pub(crate) readonly_uniform_addresses: Vec<UniformValueFact>,
++    /// Original spatial AIR coordinate for each remaining implicit sample. This is independent of
++    /// backend normalization and array-layer composition, and is remapped with its sample result.
++    pub(crate) source_sample_coordinates: Vec<crate::SourceSampleCoordinate>,
+ }
+ 
+ #[derive(Debug)]
+@@ -338,6 +341,9 @@
+         for fact in &self.aggregate_pointer_values {
+             ids.extend([fact.aggregate, fact.source]);
+         }
++        for fact in &self.source_sample_coordinates {
++            ids.extend([fact.sample, fact.coordinate]);
++        }
+         ids.extend(self.aliased_imageblock_staging);
+         ids.extend(self.air_struct_offsets.keys().copied());
+         ids.extend(
+@@ -447,6 +453,10 @@
+         if let Some(id) = &mut self.aliased_imageblock_staging {
+             replace(id);
+         }
++        for fact in &mut self.source_sample_coordinates {
++            replace(&mut fact.sample);
++            replace(&mut fact.coordinate);
++        }
+         for mapping in &mut self.air_struct_layout_mappings {
+             if let Some(struct_ty) = &mut mapping.struct_ty {
+                 replace(struct_ty);
+@@ -470,6 +480,20 @@
+     }
+ 
+     pub(crate) fn clone_inlined_facts(&mut self, remap: &HashMap<Word, Word>) {
++        let coordinates = self
++            .source_sample_coordinates
++            .iter()
++            .filter_map(|fact| {
++                Some(crate::SourceSampleCoordinate {
++                    sample: *remap.get(&fact.sample)?,
++                    coordinate: remap
++                        .get(&fact.coordinate)
++                        .copied()
++                        .unwrap_or(fact.coordinate),
++                })
++            })
++            .collect::<Vec<_>>();
++        self.source_sample_coordinates.extend(coordinates);
+         let guards = self
+             .buffer_registry_guards
+             .iter()
+@@ -1021,6 +1045,10 @@
+                 value: 52,
+             }],
+             aliased_imageblock_staging: Some(51),
++            source_sample_coordinates: vec![crate::SourceSampleCoordinate {
++                sample: 45,
++                coordinate: 52,
++            }],
+         };
+         let remap = HashMap::from([
+             (10, 110),
+@@ -1146,5 +1174,12 @@
+         assert_eq!(sidecar.buffer_registry_guards[0].address, 154);
+         assert_eq!(sidecar.buffer_registry_guards[0].size, 4);
+         assert_eq!(sidecar.aliased_imageblock_staging, Some(151));
++        assert_eq!(
++            sidecar.source_sample_coordinates,
++            vec![crate::SourceSampleCoordinate {
++                sample: 145,
++                coordinate: 152
++            }]
++        );
+     }
+ }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -99,7 +99,19 @@
+     pub value: u32,
+ }
+ 
+-/// Typed source-uniformity facts bound to the exact fragment entries they describe.
++/// A source sample's spatial coordinate, before sampler normalization, layer and offset lowering.
++///
++/// Pixel-coordinate sampler representations clamp mip selection to zero and use equal min/mag
++/// filters. Normalized representations must derive LOD from this original coordinate, rather than
++/// from per-lane image sizes or coordinate-mode flags introduced by backend lowering.
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct SourceSampleCoordinate {
++    pub sample: u32,
++    pub coordinate: u32,
++}
++
++/// Typed source-uniformity and sample-coordinate facts bound to their fragment entries.
+ ///
+ /// This is not a general trust token. The RDNA4 wrapper must bind it to the exact SPIR-V byte
+ /// stream before handing it to the cached GPU-argument post-pass; ids alone may collide across
+@@ -109,6 +121,7 @@
+ pub struct UniformControlProof {
+     pub entries: Vec<UniformControlEntry>,
+     pub values: Vec<UniformControlValue>,
++    pub sampling_coordinates: Vec<SourceSampleCoordinate>,
+ }
+ 
+ /// Detect the shader stage from the AIR's own `!air.vertex`/`!air.fragment`/`!air.kernel` metadata
+@@ -1488,6 +1501,29 @@
+             .into_iter()
+             .map(|(function, value)| UniformControlValue { function, value })
+             .collect(),
++        sampling_coordinates: {
++            let definitions = out
++                .all_inst_iter()
++                .filter_map(|i| Some((i.result_id?, i)))
++                .collect::<std::collections::HashMap<_, _>>();
++            let mut facts = sidecar
++                .source_sample_coordinates
++                .iter()
++                .copied()
++                .filter(|fact| {
++                    definitions.get(&fact.sample).is_some_and(|i| {
++                        matches!(
++                            i.class.opcode,
++                            spirv::Op::ImageSampleImplicitLod
++                                | spirv::Op::ImageSampleDrefImplicitLod
++                        )
++                    }) && definitions.contains_key(&fact.coordinate)
++                })
++                .collect::<Vec<_>>();
++            facts.sort_unstable_by_key(|fact| (fact.sample, fact.coordinate));
++            facts.dedup();
++            facts
++        },
+     };
+     let finished = FinishedModule::new(
+         out,
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -346,6 +346,7 @@
+         const_offset,
+         grad,
+     );
++    record_source_sample_coordinate(ctx, &out, color, args[2]);
+ 
+     finish_sample_result(ctx, res, rty, color, sample_v4, out)
+ }
+--- a/src/passes/air_calls/images/sample_depth.rs
++++ b/src/passes/air_calls/images/sample_depth.rs
+@@ -198,6 +198,7 @@
+             const_offset,
+             grad,
+         );
++        record_source_sample_coordinate(ctx, &out, color, args[3]);
+         color
+     };
+     let depth = ctx.module.fresh_id();
+@@ -435,6 +436,7 @@
+             const_offset,
+             None,
+         );
++        record_source_sample_coordinate(ctx, &out, shadow, args[3]);
+         shadow
+     };
+     let shadow = if let Some(state) = pixel_state {
+--- a/src/passes/air_calls/images/sampler_coordinates.rs
++++ b/src/passes/air_calls/images/sampler_coordinates.rs
+@@ -2,6 +2,27 @@
+ 
+ use super::*;
+ use std::collections::HashMap;
++
++pub(in crate::passes) fn record_source_sample_coordinate(
++    ctx: &mut Ctx,
++    instructions: &[Instruction],
++    sample: Word,
++    coordinate: Word,
++) {
++    if ctx.normalized_sampler_coordinates
++        && instructions.iter().rev().any(|instruction| {
++            instruction.result_id == Some(sample)
++                && matches!(
++                    instruction.class.opcode,
++                    Op::ImageSampleImplicitLod | Op::ImageSampleDrefImplicitLod
++                )
++        })
++    {
++        ctx.emit_sidecar
++            .source_sample_coordinates
++            .push(crate::SourceSampleCoordinate { sample, coordinate });
++    }
++}
+ 
+ #[derive(Clone, Copy)]
+ struct DescriptorVariable {
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -276,6 +276,55 @@
+         sidecar
+             .uniform_value_facts
+             .push(crate::emit_sidecar::UniformValueFact { function, value });
++    }
++    let globals = module
++        .types_global_values
++        .iter()
++        .filter_map(|i| i.result_id)
++        .collect::<HashSet<_>>();
++    let mut definitions = HashMap::new();
++    for (function, definition) in module.functions.iter().enumerate() {
++        for (block, definition) in definition.blocks.iter().enumerate() {
++            for (position, instruction) in definition.instructions.iter().enumerate() {
++                if let Some(id) = instruction.result_id {
++                    definitions.insert(id, (function, block, position, instruction));
++                }
++            }
++        }
++    }
++    let mut dominance = HashMap::new();
++    let mut samples = HashSet::new();
++    for fact in &proof.sampling_coordinates {
++        if !samples.insert(fact.sample) {
++            return Err("source proof repeats a sampling coordinate".into());
++        }
++        let &(function, block, position, sample) = definitions
++            .get(&fact.sample)
++            .ok_or("source sampling coordinate names an unknown sample")?;
++        if !matches!(
++            sample.class.opcode,
++            Op::ImageSampleImplicitLod | Op::ImageSampleDrefImplicitLod
++        ) {
++            return Err("source sampling coordinate does not name an implicit sample".into());
++        }
++        if !globals.contains(&fact.coordinate) {
++            let &(owner, source_block, source_position, _) = definitions
++                .get(&fact.coordinate)
++                .ok_or("source sampling coordinate has an unknown coordinate")?;
++            let dominance = dominance.entry(function).or_insert_with(|| {
++                crate::passes::spirv_cfg::BlockDominance::of(&module.functions[function].blocks)
++            });
++            if owner != function
++                || !dominance.dominates(source_block, block)
++                || (source_block == block && source_position >= position)
++            {
++                return Err(
++                    "source sampling coordinate does not dominate its sample in the same function"
++                        .into(),
++                );
++            }
++        }
++        sidecar.source_sample_coordinates.push(*fact);
+     }
+     Ok(sidecar)
+ }
+--- a/src/passes/resources/null_sampling.rs
++++ b/src/passes/resources/null_sampling.rs
+@@ -123,6 +123,13 @@
+     }
+     let boolean = ctx.ty_bool();
+     let zero = ctx.const_uint(0);
++    let source_coordinates = ctx
++        .emit_sidecar
++        .source_sample_coordinates
++        .iter()
++        .enumerate()
++        .map(|(index, fact)| (fact.sample, index))
++        .collect::<HashMap<_, _>>();
+     for function in 0..ctx.module.functions.len() {
+         for block in 0..ctx.module.functions[function].blocks.len() {
+             let old = ctx.module.functions[function].blocks[block]
+@@ -175,6 +182,9 @@
+                             }
+                         }
+                         let actual = ctx.module.fresh_id();
++                        if let Some(&index) = source_coordinates.get(&result) {
++                            ctx.emit_sidecar.source_sample_coordinates[index].sample = actual;
++                        }
+                         inst.result_id = Some(actual);
+                         body.push(inst);
+                         let zero_result = ctx.const_null(ty);
+@@ -200,6 +210,13 @@
+ }
+ 
+ fn protect_legacy_argument_sampling(ctx: &mut Ctx) -> Result<(), String> {
++    let source_coordinates = ctx
++        .emit_sidecar
++        .source_sample_coordinates
++        .iter()
++        .enumerate()
++        .map(|(index, fact)| (fact.sample, index))
++        .collect::<HashMap<_, _>>();
+     let defs = ctx
+         .module
+         .all_inst_iter()
+@@ -411,6 +428,9 @@
+                             }
+                         }
+                         let actual = ctx.module.fresh_id();
++                        if let Some(&index) = source_coordinates.get(&result) {
++                            ctx.emit_sidecar.source_sample_coordinates[index].sample = actual;
++                        }
+                         inst.result_id = Some(actual);
+                         body.push(inst);
+                         let zero_result = ctx.const_null(ty);
+--- a/src/passes/resources/quad_sampling.rs
++++ b/src/passes/resources/quad_sampling.rs
+@@ -101,6 +101,12 @@
+         .chain(ctx.new_globals.iter())
+         .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+         .collect::<HashMap<_, _>>();
++    let source_coordinates = ctx
++        .emit_sidecar
++        .source_sample_coordinates
++        .iter()
++        .map(|fact| (fact.sample, fact.coordinate))
++        .collect::<HashMap<_, _>>();
+     for function in 0..ctx.module.functions.len() {
+         if (0..ctx.module.functions[function].blocks.len()).all(|block| {
+             control.status(function, block) == super::fragment_control::ControlStatus::NotReachable
+@@ -179,7 +185,14 @@
+                 let Some(Operand::IdRef(coord)) = inst.operands.get(1) else {
+                     return Err("implicit argument sample has no coordinate".into());
+                 };
+-                let coord = *coord;
++                let source_coordinate = inst
++                    .result_id
++                    .and_then(|id| source_coordinates.get(&id))
++                    .copied();
++                if ctx.normalized_sampler_coordinates && source_coordinate.is_none() {
++                    return Err("normalized implicit argument sampling requires its source spatial coordinate proof".into());
++                }
++                let coord = source_coordinate.unwrap_or(*coord);
+                 let coord_type = defs
+                     .get(&coord)
+                     .and_then(|value| value.result_type)
+@@ -200,7 +213,13 @@
+                     }
+                     _ => return Err("implicit argument sample requires float32 coordinates".into()),
+                 };
+-                if components != spatial + arrayed
++                if components
++                    != spatial
++                        + if source_coordinate.is_some() {
++                            0
++                        } else {
++                            arrayed
++                        }
+                     || !defs.get(&component).is_some_and(|component| {
+                         component.class.opcode == Op::TypeFloat
+                             && component.operands == [Operand::LiteralBit32(32)]

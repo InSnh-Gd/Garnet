@@ -1,0 +1,106 @@
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -109,7 +109,7 @@
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
++    /// See the internal `variant_texture_slot` helper.
+     VariantAbsentTexture,
+     /// Anything we don't model.
+     Other,
+@@ -435,7 +435,7 @@
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
++    /// See the internal `variant_texture_slot` helper.
+     VariantAbsentTexture,
+     Other,
+ }
+@@ -718,7 +718,7 @@
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
++    /// See the internal `variant_texture_slot` helper.
+     VariantAbsentTexture,
+     Other,
+ }
+diff --git a/validation/src/bin/corpus-triage.rs b/validation/src/bin/corpus-triage.rs
+--- a/validation/src/bin/corpus-triage.rs
++++ b/validation/src/bin/corpus-triage.rs
+@@ -74,13 +74,65 @@
+ }
+ 
+ fn reserve_allocation(bytes: usize) -> bool {
+-    let reserved = LIVE_ALLOCATED_BYTES
+-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+-            live.checked_add(bytes)
+-                .filter(|next| *next <= ALLOCATION_LIMIT_BYTES.load(Ordering::Relaxed))
+-        })
+-        .ok();
+-    reserved.is_some()
++    reserve_budget(&LIVE_ALLOCATED_BYTES, &ALLOCATION_LIMIT_BYTES, bytes)
++}
++
++fn reserve_budget(counter: &AtomicUsize, limit: &AtomicUsize, bytes: usize) -> bool {
++    let mut live = counter.load(Ordering::Relaxed);
++    loop {
++        let Some(next) = live.checked_add(bytes) else {
++            return false;
++        };
++        if next > limit.load(Ordering::Relaxed) {
++            return false;
++        }
++        match counter.compare_exchange_weak(live, next, Ordering::Relaxed, Ordering::Relaxed) {
++            Ok(_) => return true,
++            Err(current) => live = current,
++        }
++    }
++}
++
++#[test]
++fn allocation_budget_preserves_boundaries_and_released_capacity() {
++    let counter = AtomicUsize::new(7);
++    let limit = AtomicUsize::new(10);
++    assert!(reserve_budget(&counter, &limit, 3));
++    assert!(!reserve_budget(&counter, &limit, 1));
++    assert_eq!(counter.load(Ordering::Relaxed), 10);
++    counter.fetch_sub(4, Ordering::Relaxed);
++    assert!(reserve_budget(&counter, &limit, 4));
++    limit.store(9, Ordering::Relaxed);
++    assert!(!reserve_budget(&counter, &limit, 0));
++    counter.store(usize::MAX, Ordering::Relaxed);
++    limit.store(usize::MAX, Ordering::Relaxed);
++    assert!(!reserve_budget(&counter, &limit, 1));
++    assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
++}
++
++#[test]
++fn allocation_budget_serializes_concurrent_reservations() {
++    let counter = AtomicUsize::new(0);
++    let limit = AtomicUsize::new(1000);
++    let start = Barrier::new(8);
++    let reserved = std::thread::scope(|scope| {
++        let threads: Vec<_> = (0..8)
++            .map(|_| {
++                scope.spawn(|| {
++                    start.wait();
++                    (0..1000)
++                        .filter(|_| reserve_budget(&counter, &limit, 1))
++                        .count()
++                })
++            })
++            .collect();
++        threads
++            .into_iter()
++            .map(|thread| thread.join().unwrap())
++            .sum::<usize>()
++    });
++    assert_eq!(reserved, 1000);
++    assert_eq!(counter.load(Ordering::Relaxed), 1000);
+ }
+ 
+ fn enable_translation_memory_budget() {

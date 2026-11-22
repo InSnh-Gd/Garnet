@@ -1,0 +1,4425 @@
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `64`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `65`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -86,12 +86,47 @@
+ contract. It is `true` only for an opt-in ABI 8 translation, and is `false` for the legacy Rust
+ entry points. ABI 8 argument table version 8 requires both this flag and
+ `trimmed_from_reflection_version: 64`; table version 7 requires the flag to be absent or false.
+-Consumers must reject a non-boolean value, as well as `true` paired with any other trimmed version.
++Consumers reject non-boolean markers. Reflection 65 pairs the same option with table version 9 as
++described in the next section.
++
++## ABI 9 null descriptors
++
++Reflection 65 uses table version 9 for normalized-coordinate GPU tables and for stages carrying
++null descriptors or runtime sampler flags. `normalized_sampler_coordinates` remains the exact
++translation option: false retains the ABI 7 token/query layout, while true retains the ABI 8
++sampler-flag tail. ABI 9 does not imply normalized coordinates. Historical reflection 64/table 8
++continues to use the 128-byte `SamplerCoordinateFlags` row described below.
++
++ABI 9 uses one readonly `StageResourceMetadata` buffer at binding 674 with an exact 384-byte object
++extent. Words 0..31 preserve the sampler flags. Words 32..95 contain 64 null-shape remap entries.
++The buffer and its version 9 metadata envelope may exist without binding 672 for static-null or
++direct-sampler stages. Empty `null_shapes` lists are valid.
++
++`argument_resource_tables.null_shapes` is strictly ascending, duplicate-free and limited to 64
++canonical words. A word encodes dimension in bits 0..2 (1D, 2D, 3D, cube, buffer), arrayedness in bit 3,
++component in bits 4..5 (float, uint, sint), depth in bit 6, multisampling in bit 7 and access in bits 8..9
++(sampled,storage,uniform texel,storage texel). Reserved bits and invalid combinations are rejected.
++The current legal matrix contains 54 shapes.
++
++Each stage remap entry corresponds to that stage's globally sorted shape-list position. Native
++pipeline assembly maps it into the shared descriptor arrays. Image descriptors use sets 2/3
++binding 0; a stage reading binding 672 adds its category token count to the remap value. A static
++stage loads an absolute shared tail index. Texel buffers use sets 2/3 binding 1, each with three
++slots, and load their merged dense per-access ordinal from the remap. The sets remain 0..4.
++Typed SPIR-V arrays keep component, depth, multisample and access distinctions even when several
++variables share a descriptor binding. Live dynamic texel tokens remain unsupported.
++
++The final registry is collected after lowering and liveness. Cached argument lowering merges new
++shapes and relocates existing references against that final sorted list before serializing.
++Registration order does not define descriptor indices. Null texel reads and writes use guarded
++helpers; null sampling preserves the sample operation and selects a zero result from its original
++null predicate. `air.is_null_texture` follows known null/bound values, token zero pairs and the
++corresponding select or phi predicate.
+ 
+ ## Descriptor ABI (binding map)
+ 
+ Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
+-`argument_resource_tables: {version: 7|8, table_binding: 672, categories: [...],
++`argument_resource_tables: {version: 7|8|9, table_binding: 672, categories: [...],
+ comparison_sampler: <bool>}`. They require the default descriptor layout. Binding 672 in set 0 is
+ the read-only token table; categories 0, 1, 2 denote runtime sampled-image, storage-image and
+ sampler arrays at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1031,7 +1031,8 @@
+     reflection.reconcile_argument_resource_tables(
+         &finished.module,
+         options.normalized_sampler_coordinates,
+-    );
++        &finished.null_shapes,
++    )?;
+     // Token-backed samplers occupy set 4, leaving their former stage-local slots for constexprs.
+     reflection.add_static_samplers(san_ll)?;
+     reflection.reconcile_sampler_operation_usage(&finished.module);
+@@ -1185,6 +1186,7 @@
+     /// to those this module still declares. Only the passes know these exist; reflection reports
+     /// them from here so a consumer's descriptor-set layout covers them.
+     placeholder_descriptor_bindings: Vec<u32>,
++    null_shapes: Vec<u32>,
+     /// Typed `air.is_uniform` proof at the final canonical ids. The cached GPU argument pass binds
+     /// this proof to the exact SPIR-V bytes with a content hash before using it.
+     uniform_control_proof: UniformControlProof,
+@@ -1196,6 +1198,7 @@
+         module: Module,
+         buffer_address_table_mode: BufferAddressTableMode,
+         placeholder_descriptor_bindings: Vec<u32>,
++        null_shapes: Vec<u32>,
+         uniform_control_proof: UniformControlProof,
+     ) -> Self {
+         let bytes = assemble_finished_module(&module);
+@@ -1204,6 +1207,7 @@
+             bytes,
+             buffer_address_table_mode,
+             placeholder_descriptor_bindings,
++            null_shapes,
+             uniform_control_proof,
+         }
+     }
+@@ -1325,6 +1329,7 @@
+         module: mut out,
+         mut sidecar,
+         placeholder_descriptor_bindings,
++        null_shapes,
+     } = passes::transform_with_options_and_sidecar(
+         emitted.module,
+         emitted.sidecar,
+@@ -1484,6 +1489,7 @@
+         out,
+         buffer_address_table_mode,
+         placeholder_descriptor_bindings,
++        null_shapes,
+         uniform_control_proof,
+     );
+     if retry_debug {
+--- a/src/native/tests/textures.rs
++++ b/src/native/tests/textures.rs
+@@ -961,10 +961,8 @@
+ }
+ 
+ #[test]
+-fn native_get_null_texture_models_unmodeled_placeholder() {
+-    // `air.get_null_texture_2d()` yields a synthesized image in the texture descriptor band. A
+-    // kernel that reads through the placeholder keeps that descriptor, and the translator-owned
+-    // resource must not escape into sampler/color-input bindings. The opposite case -- a
++fn native_get_null_texture_keeps_shape_descriptor_and_stage_remap() {
++    // A consumed null image keeps its ABI9 descriptor and stage-local remap. The opposite case -- a
+     // placeholder nothing consumes, whose descriptor is retracted -- is
+     // `tests/reflection_covers_declared_bindings.rs`.
+     let ll = r#"
+@@ -994,7 +992,10 @@
+         .expect("null-texture kernel must translate");
+     let asm = disassemble(&spv).expect("disassemble");
+     assert!(asm.contains("OpFunction"), "{asm}");
+-    assert!(asm.contains("Binding 32"), "{asm}");
++    assert!(asm.contains("DescriptorSet 2"), "{asm}");
++    assert!(asm.contains("Binding 674"), "{asm}");
++    assert!(asm.contains("OpTypeRuntimeArray"), "{asm}");
++    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
+     for line in asm.lines() {
+         let Some(binding) = line
+             .split_whitespace()
+@@ -1011,7 +1012,7 @@
+         assert!(
+             !crate::reflect::SAMPLER_BINDING_RANGE.contains(binding)
+                 && !crate::reflect::COLOR_INPUT_BINDING_RANGE.contains(binding),
+-            "the translator-owned placeholder must stay in the texture band; got:\n{asm}"
++            "the translator-owned null resources must avoid sampler/color-input bands; got:\n{asm}"
+         );
+     }
+     let _ = std::fs::remove_dir_all(tmp);
+--- a/src/passes/air_calls/dispatch_texture.rs
++++ b/src/passes/air_calls/dispatch_texture.rs
+@@ -1488,14 +1488,45 @@
+         .first()
+         .copied()
+         .ok_or_else(|| format!("{name} missing texture"))?;
+-    let is_null = ctx.null_image_values.contains(&img);
+-    let c = ctx.const_bool_of(rty, is_null);
+-    Ok(vec![Instruction::new(
+-        Op::CopyObject,
+-        Some(rty),
+-        Some(res),
+-        vec![Operand::IdRef(c)],
+-    )])
++    let fact = ctx
++        .image_facts
++        .get(&img)
++        .cloned()
++        .ok_or_else(|| format!("{name} operand {img} has no typed image shape/null fact"))?;
++    if let (Some(expected), Some(actual), false) = (
++        intrinsic_texture_shape(name),
++        fact.shape,
++        matches!(fact.nullness, ImageNullPredicate::KnownIsNull(false)),
++    ) {
++        if (actual.dim, actual.arrayed) != expected {
++            return Err(format!(
++                "{name} names {:?}, but operand {img} has shape {:?}",
++                expected, actual
++            ));
++        }
++    }
++    let predicate = if let Some(value) = ctx.materialized_null_predicates.get(&img).copied() {
++        value
++    } else {
++        match fact.nullness {
++            ImageNullPredicate::KnownIsNull(is_null) => {
++                let bool_ty = ctx.ty_bool();
++                ctx.const_bool_of(bool_ty, is_null)
++            }
++            ImageNullPredicate::Unknown => {
++                return Err(format!(
++                    "{name} operand {img} has no closed nullness predicate"
++                ))
++            }
++            other => {
++                return Err(format!(
++                    "{name} operand {img} has an unmaterialized predicate {other:?}"
++                ))
++            }
++        }
++    };
++    let bool_ty = ctx.ty_bool();
++    Ok(vec![copy_or_bitcast_result(rty, res, bool_ty, predicate)])
+ }
+ 
+ /// `air.get_num_mip_levels_texture_<dim>(texture)` -> `OpImageQueryLevels` for sampled images.
+@@ -1744,20 +1775,53 @@
+     res: Option<Word>,
+ ) -> Result<Vec<Instruction>, String> {
+     let res = res.ok_or_else(|| format!("{name} has no result"))?;
+-    // `air.get_null_texture_<shape>` names its shape the same way every other texture intrinsic
+-    // does; read it with the same parser so a family added to one is not missing from the other.
+-    let (dim, arrayed) = intrinsic_texture_shape(name).unwrap_or((Dim::Dim2D, false));
+-    let var = ctx.default_null_image_of(dim, arrayed)?;
+-    let img_ty = ctx.ty_image(dim, arrayed, crate::passes::ImageComp::Float);
+-    ctx.image_dims.insert(res, (dim, arrayed));
+-    ctx.image_comp.insert(res, crate::passes::ImageComp::Float);
++    let (dim, arrayed) = intrinsic_texture_shape(name)
++        .ok_or_else(|| format!("unknown null image shape in {name}"))?;
++    let shape = ctx
++        .image_facts
++        .get(&res)
++        .and_then(|facts| facts.shape)
++        .unwrap_or(ImageShape::sampled(
++            dim,
++            arrayed,
++            ImageComp::Float,
++            false,
++            false,
++        ));
++    let array = ctx.null_descriptor_array(shape)?;
++    let ty = ctx.ty_image_shape(shape);
++    let table = ctx.module.annotations.iter().find_map(|inst| match inst.operands.as_slice() {
++        [Operand::IdRef(var), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(672)] => Some(*var), _ => None });
++    let mut out = Vec::new();
++    let index = ctx.null_descriptor_index(shape, table, &mut out)?;
++    let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, ty);
++    let pointer = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::AccessChain,
++        Some(pointer_ty),
++        Some(pointer),
++        vec![Operand::IdRef(array), Operand::IdRef(index)],
++    ));
++    out.push(Instruction::new(
++        Op::Load,
++        Some(ty),
++        Some(res),
++        vec![Operand::IdRef(pointer)],
++    ));
++    ctx.image_dims.insert(res, (shape.dim, shape.arrayed));
++    ctx.image_comp.insert(res, shape.comp);
++    if shape.multisampled {
++        ctx.image_multisampled.insert(res);
++    }
++    if matches!(
++        shape.access,
++        ImageAccess::Storage | ImageAccess::StorageTexel
++    ) {
++        ctx.image_storage.insert(res);
++    }
+     ctx.null_image_values.insert(res);
+-    Ok(vec![Instruction::new(
+-        Op::Load,
+-        Some(img_ty),
+-        Some(res),
+-        vec![Operand::IdRef(var)],
+-    )])
++    ctx.image_facts.insert(res, ImageFacts::known(shape, true));
++    Ok(out)
+ }
+ 
+ /// `air.map_screen_to_physical_coordinates.*`: with a rasterization-rate map whose rate is a uniform
+--- a/src/passes/air_calls/images/mod.rs
++++ b/src/passes/air_calls/images/mod.rs
+@@ -30,6 +30,15 @@
+ ) -> (Word, Dim, bool, crate::passes::ImageComp) {
+     if let Some((ty, dim, arrayed, comp)) = image_type_from_value(ctx, image) {
+         return (ty, dim, arrayed, comp);
++    }
++    // A null-image load emitted earlier in this block is not in the module yet.
++    if let Some(shape) = ctx.image_facts.get(&image).and_then(|facts| facts.shape) {
++        return (
++            ctx.ty_image_shape(shape),
++            shape.dim,
++            shape.arrayed,
++            shape.comp,
++        );
+     }
+     (ctx.ty_image(dim, arrayed, comp), dim, arrayed, comp)
+ }
+--- a/src/passes/air_calls/images/resolve.rs
++++ b/src/passes/air_calls/images/resolve.rs
+@@ -195,6 +195,7 @@
+         ("cube_array", Dim::DimCube, true),
+         ("buffer_1d", Dim::DimBuffer, false),
+         ("1d_array", Dim::Dim1D, true),
++        ("2d_ms_array", Dim::Dim2D, true),
+         ("2d_array", Dim::Dim2D, true),
+         ("buffer", Dim::DimBuffer, false),
+         ("cube", Dim::DimCube, false),
+--- a/src/passes/air_calls/images/sampler_coordinates.rs
++++ b/src/passes/air_calls/images/sampler_coordinates.rs
+@@ -153,7 +153,7 @@
+ }
+ 
+ impl Ctx {
+-    fn sampler_coordinate_flags_var(&mut self) -> Word {
++    pub(in crate::passes) fn sampler_coordinate_flags_var(&mut self) -> Word {
+         if let Some(var) = self.sampler_coordinate_flags_var {
+             return var;
+         }
+--- /dev/null
++++ b/src/passes/image_facts.rs
+@@ -0,0 +1,1728 @@
++//! Typed image-shape and nullness facts.
++//!
++//! AIR image handles are values, not names: they survive through copies, loads/stores, aggregate
++//! insert/extract, selects, and phis. The legacy `image_dims`/`null_image_values` maps describe only
++//! a few of those forms, so a guard such as `is_null_texture(phi(null, bound))` used to observe
++//! whichever spelling happened to be registered. This module carries one typed fact through that
++//! value graph and materializes `is_null_texture` as ordinary boolean SSA.
++//!
++//! The shape word and access classes match the ABI-9 schema. Nothing here keys a fact by a shader,
++//! variable, or helper name; AIR intrinsic symbols only identify the stable operation family that
++//! states Dim/array/component/Depth/MS/access.
++
++use super::*;
++use crate::passes::air_calls::intrinsic_texture_shape;
++use std::collections::BTreeSet;
++
++/// A null predicate is allowed to contain vectors of phi inputs, so it is deliberately `Clone` but
++/// not `Copy`.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(in crate::passes) enum ImageNullPredicate {
++    /// `KnownIsNull(true)` means the value is the null texture; the wording avoids polarity drift.
++    KnownIsNull(bool),
++    /// A serialized GPU argument is null exactly when both token words are zero.
++    #[allow(dead_code)]
++    GpuToken {
++        low: Word,
++        high: Word,
++    },
++    /// Select between two image values; the fields name the condition and image arms.
++    Select {
++        condition: Word,
++        when_true: Word,
++        when_false: Word,
++    },
++    /// A control-flow join. Each pair is `(incoming image value, predecessor block)`.
++    Phi(Vec<(Word, Word)>),
++    Unknown,
++}
++
++impl ImageNullPredicate {
++    #[cfg(test)]
++    fn remap_ids(&mut self, remap: &HashMap<Word, Word>) -> Result<(), String> {
++        let map = |id: &mut Word| {
++            if let Some(new) = remap.get(id).copied() {
++                *id = new;
++            }
++        };
++        match self {
++            ImageNullPredicate::KnownIsNull(_) | ImageNullPredicate::Unknown => {}
++            ImageNullPredicate::GpuToken { low, high } => {
++                map(low);
++                map(high);
++            }
++            ImageNullPredicate::Select {
++                condition,
++                when_true,
++                when_false,
++            } => {
++                map(condition);
++                map(when_true);
++                map(when_false);
++            }
++            ImageNullPredicate::Phi(arms) => {
++                let mut seen = HashSet::new();
++                for (incoming, predecessor) in arms.iter_mut() {
++                    map(incoming);
++                    map(predecessor);
++                    if !seen.insert((*incoming, *predecessor)) {
++                        return Err(
++                            "image null phi remap produced a duplicate incoming edge".into()
++                        );
++                    }
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(in crate::passes) struct ImageFacts {
++    pub(in crate::passes) shape: Option<ImageShape>,
++    pub(in crate::passes) nullness: ImageNullPredicate,
++}
++
++impl Default for ImageFacts {
++    fn default() -> Self {
++        Self {
++            shape: None,
++            nullness: ImageNullPredicate::Unknown,
++        }
++    }
++}
++
++impl ImageFacts {
++    pub(in crate::passes) fn known(shape: ImageShape, is_null: bool) -> Self {
++        Self {
++            shape: Some(shape),
++            nullness: ImageNullPredicate::KnownIsNull(is_null),
++        }
++    }
++
++    /// Remap every SSA id carried by these facts. Returning an error on a shape collision keeps a
++    /// caller from silently merging two differently typed image facts after canonicalization.
++    #[cfg(test)]
++    pub(in crate::passes) fn remap_ids(
++        &mut self,
++        remap: &HashMap<Word, Word>,
++    ) -> Result<(), String> {
++        self.nullness.remap_ids(remap)?;
++        Ok(())
++    }
++}
++
++/// ABI-9 canonical shape registry.
++///
++/// Ordinals are per access class over a sorted set. The serialized list is de-duplicated and sorted
++/// before any ordinal is consumed, so an unused shape never occupies a slot.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(in crate::passes) struct NullShapeRegistry {
++    by_access: [BTreeSet<u32>; 4],
++}
++
++impl NullShapeRegistry {
++    fn slot(access: ImageAccess) -> usize {
++        match access {
++            ImageAccess::Sampled => 0,
++            ImageAccess::Storage => 1,
++            ImageAccess::UniformTexel => 2,
++            ImageAccess::StorageTexel => 3,
++        }
++    }
++
++    pub(in crate::passes) fn register(&mut self, shape: ImageShape) -> Result<(), String> {
++        let word = shape.canonical_word()?;
++        let slot = Self::slot(shape.access);
++        if !self.by_access[slot].contains(&word)
++            && self.by_access.iter().map(BTreeSet::len).sum::<usize>() >= 64
++        {
++            return Err("ABI-9 null shape registry exceeds its 64-entry ABI limit".into());
++        }
++        let set = &mut self.by_access[slot];
++        set.insert(word);
++        Ok(())
++    }
++
++    #[cfg(test)]
++    pub(in crate::passes) fn ordinal(&self, shape: ImageShape) -> Option<u32> {
++        let word = shape.canonical_word().ok()?;
++        let set = &self.by_access[Self::slot(shape.access)];
++        set.contains(&word)
++            .then(|| set.range(..word).count() as u32)
++    }
++
++    pub(in crate::passes) fn words(&self, access: ImageAccess) -> Vec<u32> {
++        self.by_access[Self::slot(access)].iter().copied().collect()
++    }
++
++    /// The ABI-9 wire list is globally sorted by the full word, not grouped by access. The four
++    /// per-access sets above are only an ordinal index; this helper is the authoritative order the
++    /// metadata producer and native decoder consume.
++    pub(in crate::passes) fn all_words(&self) -> Vec<u32> {
++        let mut words = self
++            .by_access
++            .iter()
++            .flat_map(BTreeSet::iter)
++            .copied()
++            .collect::<Vec<_>>();
++        words.sort_unstable();
++        words.dedup();
++        words
++    }
++
++    pub(in crate::passes) fn access_count(&self, access: ImageAccess) -> u32 {
++        self.by_access[Self::slot(access)].len() as u32
++    }
++
++    pub(in crate::passes) fn validate(&self) -> Result<(), String> {
++        let all = self.all_words();
++        if all.len() > 64 {
++            return Err("ABI-9 null shape registry exceeds its 64-entry ABI limit".into());
++        }
++        for access in [
++            ImageAccess::Sampled,
++            ImageAccess::Storage,
++            ImageAccess::UniformTexel,
++            ImageAccess::StorageTexel,
++        ] {
++            let words = self.words(access);
++            if words.len() != self.access_count(access) as usize {
++                return Err("ABI-9 null shape per-access index is inconsistent".into());
++            }
++            for word in words {
++                validate_canonical_null_shape_word(word)?;
++            }
++        }
++        Ok(())
++    }
++}
++
++impl ImageShape {
++    pub(in crate::passes) fn sampled(
++        dim: Dim,
++        arrayed: bool,
++        comp: ImageComp,
++        multisampled: bool,
++        depth: bool,
++    ) -> Self {
++        let access = if dim == Dim::DimBuffer {
++            ImageAccess::UniformTexel
++        } else {
++            ImageAccess::Sampled
++        };
++        Self {
++            dim,
++            arrayed,
++            comp,
++            depth,
++            multisampled,
++            access,
++        }
++    }
++
++    /// Encode the exact ABI-9 word:
++    /// `dim[0..3] | arrayed<<3 | component<<4 | depth<<6 | ms<<7 | access<<8`.
++    pub(in crate::passes) fn canonical_word(self) -> Result<u32, String> {
++        self.validate()?;
++        let dim = match self.dim {
++            Dim::Dim1D => 0,
++            Dim::Dim2D => 1,
++            Dim::Dim3D => 2,
++            Dim::DimCube => 3,
++            Dim::DimBuffer => 4,
++            other => return Err(format!("unsupported image dimension {other:?}")),
++        };
++        let component = match self.comp {
++            ImageComp::Float => 0,
++            ImageComp::Uint => 1,
++            ImageComp::Sint => 2,
++        };
++        let access = match self.access {
++            ImageAccess::Sampled => 0,
++            ImageAccess::Storage => 1,
++            ImageAccess::UniformTexel => 2,
++            ImageAccess::StorageTexel => 3,
++        };
++        Ok(dim
++            | ((self.arrayed as u32) << 3)
++            | (component << 4)
++            | ((self.depth as u32) << 6)
++            | ((self.multisampled as u32) << 7)
++            | (access << 8))
++    }
++
++    pub(in crate::passes) fn from_canonical_word(word: u32) -> Result<Self, String> {
++        if word & !0x3ff != 0 {
++            return Err(format!(
++                "image shape word 0x{word:08x} has non-zero reserved bits 10..31"
++            ));
++        }
++        let dim = match word & 0x7 {
++            0 => Dim::Dim1D,
++            1 => Dim::Dim2D,
++            2 => Dim::Dim3D,
++            3 => Dim::DimCube,
++            4 => Dim::DimBuffer,
++            value => {
++                return Err(format!(
++                    "image shape word 0x{word:08x} has invalid dim {value}"
++                ))
++            }
++        };
++        let component = match (word >> 4) & 0x3 {
++            0 => ImageComp::Float,
++            1 => ImageComp::Uint,
++            2 => ImageComp::Sint,
++            value => {
++                return Err(format!(
++                    "image shape word 0x{word:08x} has invalid component {value}"
++                ))
++            }
++        };
++        let access = ImageAccess::from_bits((word >> 8) & 0x3)
++            .ok_or_else(|| format!("image shape word 0x{word:08x} has invalid access"))?;
++        let shape = Self {
++            dim,
++            arrayed: word & (1 << 3) != 0,
++            comp: component,
++            depth: word & (1 << 6) != 0,
++            multisampled: word & (1 << 7) != 0,
++            access,
++        };
++        shape.validate()?;
++        Ok(shape)
++    }
++
++    pub(in crate::passes) fn validate(self) -> Result<(), String> {
++        if self.dim == Dim::DimBuffer {
++            if self.arrayed {
++                return Err("buffer image must not be arrayed".into());
++            }
++            if !self.access.is_texel() {
++                return Err("Dim::Buffer requires UniformTexel or StorageTexel access".into());
++            }
++        } else if self.access.is_texel() {
++            return Err(format!(
++                "{:?} cannot use texel-buffer access {:?}",
++                self.dim, self.access
++            ));
++        }
++        if self.dim == Dim::Dim3D && self.arrayed {
++            return Err("3D images cannot be arrayed".into());
++        }
++        if self.access == ImageAccess::Storage {
++            if self.depth {
++                return Err("storage images cannot carry the Depth operand".into());
++            }
++            if self.multisampled {
++                return Err("storage images cannot be multisampled".into());
++            }
++            if self.dim == Dim::DimCube {
++                return Err("storage images cannot be cubes".into());
++            }
++        }
++        if self.depth {
++            if self.access != ImageAccess::Sampled {
++                return Err("depth images must use sampled access".into());
++            }
++            if self.comp != ImageComp::Float {
++                return Err("depth images require Float component".into());
++            }
++            if !matches!(self.dim, Dim::Dim2D | Dim::DimCube) {
++                return Err("depth images must be 2D or cube".into());
++            }
++            if self.multisampled && self.dim != Dim::Dim2D {
++                return Err("only 2D depth images may be multisampled".into());
++            }
++        }
++        if self.multisampled {
++            if self.access != ImageAccess::Sampled {
++                return Err("multisampled images must use sampled access".into());
++            }
++            if self.dim != Dim::Dim2D {
++                return Err("ABI-9 multisample images must be 2D".into());
++            }
++        }
++        Ok(())
++    }
++
++    pub(in crate::passes) fn spirv_sampled(self) -> u32 {
++        self.access.spirv_sampled()
++    }
++}
++
++/// Validate one ABI-9 canonical image-shape word without exposing the pass-local shape type at the
++/// public reflection boundary.
++pub(crate) fn validate_canonical_null_shape_word(word: u32) -> Result<(), String> {
++    ImageShape::from_canonical_word(word).map(|_| ())
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(in crate::passes) struct ImageShapeEvidence {
++    dim: Option<Dim>,
++    arrayed: Option<bool>,
++    comp: Option<ImageComp>,
++    depth: Option<bool>,
++    multisampled: Option<bool>,
++    access: Option<ImageAccess>,
++}
++
++impl ImageShapeEvidence {
++    pub(in crate::passes) fn exact(shape: ImageShape) -> Self {
++        Self {
++            dim: Some(shape.dim),
++            arrayed: Some(shape.arrayed),
++            comp: Some(shape.comp),
++            depth: Some(shape.depth),
++            multisampled: Some(shape.multisampled),
++            access: Some(shape.access),
++        }
++    }
++
++    fn merge(&mut self, other: Self) -> Result<bool, String> {
++        let before = *self;
++        macro_rules! merge_field {
++            ($field:ident, $label:expr) => {
++                match (self.$field, other.$field) {
++                    (None, value) => self.$field = value,
++                    (Some(current), Some(incoming)) if current != incoming => {
++                        return Err(format!(
++                            "conflicting image {} evidence: {current:?} vs {incoming:?}",
++                            $label
++                        ))
++                    }
++                    _ => {}
++                }
++            };
++        }
++        merge_field!(dim, "dimension");
++        merge_field!(arrayed, "arrayed");
++        merge_field!(comp, "component");
++        merge_field!(depth, "Depth");
++        merge_field!(multisampled, "multisample");
++        merge_field!(access, "access");
++        Ok(before != *self)
++    }
++
++    fn materialize(self) -> Result<Option<ImageShape>, String> {
++        let Some(dim) = self.dim else {
++            return Ok(None);
++        };
++        let access = self.access.unwrap_or(if dim == Dim::DimBuffer {
++            ImageAccess::UniformTexel
++        } else {
++            ImageAccess::Sampled
++        });
++        let shape = ImageShape {
++            dim,
++            arrayed: self.arrayed.unwrap_or(false),
++            comp: self.comp.unwrap_or(ImageComp::Float),
++            depth: self.depth.unwrap_or(false),
++            multisampled: self.multisampled.unwrap_or(false),
++            access,
++        };
++        shape.validate()?;
++        Ok(Some(shape))
++    }
++}
++
++#[derive(Clone, Default)]
++struct FactGraph {
++    evidence: HashMap<Word, ImageShapeEvidence>,
++    field_evidence: HashMap<(Word, Vec<u32>), ImageShapeEvidence>,
++    facts: HashMap<Word, ImageFacts>,
++    field_facts: HashMap<(Word, Vec<u32>), ImageFacts>,
++}
++
++impl FactGraph {
++    fn set_evidence(&mut self, id: Word, evidence: ImageShapeEvidence) -> Result<bool, String> {
++        if evidence == ImageShapeEvidence::default() {
++            return Ok(false);
++        }
++        let entry = self.evidence.entry(id).or_default();
++        entry.merge(evidence)
++    }
++
++    fn set_field_evidence(
++        &mut self,
++        id: Word,
++        path: Vec<u32>,
++        evidence: ImageShapeEvidence,
++    ) -> Result<bool, String> {
++        if evidence == ImageShapeEvidence::default() {
++            return Ok(false);
++        }
++        let entry = self.field_evidence.entry((id, path)).or_default();
++        entry.merge(evidence)
++    }
++
++    fn alias_fact(&mut self, dst: Word, src: Word) -> Result<bool, String> {
++        let Some(src_fact) = self.facts.get(&src).cloned() else {
++            return Ok(false);
++        };
++        let entry = self.facts.entry(dst).or_default();
++        let before = entry.clone();
++        if let Some(src_shape) = src_fact.shape {
++            match entry.shape {
++                Some(dst_shape) if dst_shape != src_shape => {
++                    return Err(format!(
++                        "image facts for %{dst} and %{src} disagree on shape: {dst_shape:?} vs {src_shape:?}"
++                    ))
++                }
++                None => entry.shape = Some(src_shape),
++                _ => {}
++            }
++        }
++        match (&entry.nullness, &src_fact.nullness) {
++            (ImageNullPredicate::Unknown, incoming) => {
++                entry.nullness = incoming.clone();
++            }
++            (_current, ImageNullPredicate::Unknown) => {}
++            (current, incoming) if current == incoming => {}
++            (current, incoming) => {
++                return Err(format!(
++                    "image null facts for %{dst} and %{src} disagree: {current:?} vs {incoming:?}"
++                ))
++            }
++        }
++        Ok(*entry != before)
++    }
++
++    fn alias_field_fact(&mut self, dst: Word, src: Word, path: &[u32]) -> Result<bool, String> {
++        let Some(src_fact) = self.field_facts.get(&(src, path.to_vec())).cloned() else {
++            return Ok(false);
++        };
++        let key = (dst, path.to_vec());
++        let entry = self.field_facts.entry(key).or_default();
++        let before = entry.clone();
++        if let Some(src_shape) = src_fact.shape {
++            match entry.shape {
++                Some(dst_shape) if dst_shape != src_shape => {
++                    return Err(format!(
++                        "aggregate image fields {src:?}/{path:?} and {dst:?}/{path:?} disagree on shape"
++                    ))
++                }
++                None => entry.shape = Some(src_shape),
++                _ => {}
++            }
++        }
++        match (&entry.nullness, &src_fact.nullness) {
++            (ImageNullPredicate::Unknown, incoming) => entry.nullness = incoming.clone(),
++            (_current, ImageNullPredicate::Unknown) => {}
++            (current, incoming) if current == incoming => {}
++            (current, incoming) => {
++                return Err(format!(
++                    "aggregate image fields {src:?}/{path:?} and {dst:?}/{path:?} disagree on nullness: {current:?} vs {incoming:?}"
++                ))
++            }
++        }
++        Ok(*entry != before)
++    }
++
++    fn set_join(
++        &mut self,
++        result: Word,
++        arms: Vec<(Word, Word)>,
++        predicate: ImageNullPredicate,
++    ) -> Result<bool, String> {
++        let mut changed = false;
++        for (incoming, _) in &arms {
++            if let Some(fact) = self.facts.get(incoming).cloned() {
++                let entry = self.facts.entry(result).or_default();
++                let before = entry.clone();
++                if let Some(shape) = fact.shape {
++                    match entry.shape {
++                        Some(current) if current != shape => {
++                            return Err(format!(
++                                "image join %{result} mixes shapes {current:?} and {shape:?} from %{incoming}"
++                            ))
++                        }
++                        None => entry.shape = Some(shape),
++                        _ => {}
++                    }
++                }
++                changed |= *entry != before;
++            }
++        }
++        let entry = self.facts.entry(result).or_default();
++        if entry.nullness != predicate {
++            entry.nullness = predicate;
++            changed = true;
++        }
++        Ok(changed)
++    }
++
++    fn finalize(
++        &mut self,
++    ) -> Result<
++        (
++            HashMap<Word, ImageFacts>,
++            HashMap<(Word, Vec<u32>), ImageFacts>,
++        ),
++        String,
++    > {
++        for (id, evidence) in &self.evidence {
++            if let Some(shape) = evidence.materialize()? {
++                let fact = self.facts.entry(*id).or_default();
++                match fact.shape {
++                    Some(current) if current != shape => {
++                        return Err(format!(
++                            "image %{id} has contradictory full shapes {current:?} and {shape:?}"
++                        ))
++                    }
++                    None => fact.shape = Some(shape),
++                    _ => {}
++                }
++            }
++        }
++        for ((id, path), evidence) in &self.field_evidence {
++            if let Some(shape) = evidence.materialize()? {
++                let fact = self.field_facts.entry((*id, path.clone())).or_default();
++                match fact.shape {
++                    Some(current) if current != shape => {
++                        return Err(format!(
++                            "aggregate image field %{id}/{path:?} has contradictory shapes"
++                        ))
++                    }
++                    None => fact.shape = Some(shape),
++                    _ => {}
++                }
++            }
++        }
++        for fact in self.facts.values() {
++            if let Some(shape) = fact.shape {
++                shape.validate()?;
++            }
++        }
++        for fact in self.field_facts.values() {
++            if let Some(shape) = fact.shape {
++                shape.validate()?;
++            }
++        }
++        Ok((self.facts.clone(), self.field_facts.clone()))
++    }
++}
++
++/// Gather shape/nullness facts for the entry before AIR calls are rewritten. This runs after
++/// interface binding and GPU-token materialization, so every real image has its final SSA form.
++pub(in crate::passes) fn prepare_image_facts(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++) -> Result<(), String> {
++    let names = air_names(&ctx.module);
++    let needs_null_facts = ctx.module.functions[entry_idx].blocks.iter().flat_map(|block| &block.instructions).any(|inst| inst.class.opcode == Op::FunctionCall && matches!(inst.operands.first(), Some(Operand::IdRef(callee)) if names.get(callee).is_some_and(|name| name.starts_with("air.get_null_texture") || name.starts_with("air.is_null_texture"))));
++    if !needs_null_facts {
++        return Ok(());
++    }
++    let mut graph = FactGraph::default();
++    seed_interface_facts(ctx, &mut graph)?;
++    collect_intrinsic_facts(ctx, entry_idx, &names, &mut graph)?;
++
++    let instructions = ctx
++        .module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .cloned()
++        .collect::<Vec<_>>();
++    // A conservative fixed point bounded by the instruction count. Alias joins converge
++    // monotonically; this limit turns a malformed cyclic type graph into a diagnosis.
++    let limit = instructions.len().saturating_mul(2).max(16);
++    for _ in 0..limit {
++        if !propagate_once(ctx, &instructions, &mut graph)? {
++            break;
++        }
++    }
++    let (facts, field_facts) = graph.finalize()?;
++    for (id, evidence) in graph.evidence.drain() {
++        let entry = ctx.image_shape_evidence.entry(id).or_default();
++        entry.merge(evidence)?;
++    }
++    for (key, evidence) in graph.field_evidence.drain() {
++        let entry = ctx.image_field_shape_evidence.entry(key).or_default();
++        entry.merge(evidence)?;
++    }
++    for fact in facts.values().chain(field_facts.values()) {
++        if let (Some(shape), false) = (
++            fact.shape,
++            matches!(fact.nullness, ImageNullPredicate::KnownIsNull(false)),
++        ) {
++            // Collect candidates now; final liveness closes the registry and relocates accesses.
++            ctx.null_shape_registry.register(shape)?;
++        }
++    }
++    ctx.null_shape_registry.validate()?;
++    ctx.image_facts = facts;
++    ctx.image_field_facts = field_facts;
++    materialize_is_null_predicates(ctx, entry_idx, &names)?;
++    Ok(())
++}
++
++fn seed_interface_facts(ctx: &Ctx, graph: &mut FactGraph) -> Result<(), String> {
++    let mut ids = ctx
++        .image_dims
++        .keys()
++        .copied()
++        .chain(ctx.image_storage.iter().copied())
++        .collect::<BTreeSet<_>>();
++    ids.extend(ctx.null_image_values.iter().copied());
++    for id in ids {
++        let Some((dim, arrayed)) = ctx.image_dims.get(&id).copied() else {
++            continue;
++        };
++        let shape = shape_from_image_value(ctx, id).unwrap_or_else(|| {
++            let access = if ctx.image_storage.contains(&id) {
++                if dim == Dim::DimBuffer {
++                    ImageAccess::StorageTexel
++                } else {
++                    ImageAccess::Storage
++                }
++            } else if dim == Dim::DimBuffer {
++                ImageAccess::UniformTexel
++            } else {
++                ImageAccess::Sampled
++            };
++            ImageShape {
++                dim,
++                arrayed,
++                comp: ctx.image_comp.get(&id).copied().unwrap_or(ImageComp::Float),
++                depth: false,
++                multisampled: ctx.image_multisampled.contains(&id),
++                access,
++            }
++        });
++        graph.set_evidence(id, ImageShapeEvidence::exact(shape))?;
++        let predicate = if ctx.null_image_values.contains(&id) {
++            ImageNullPredicate::KnownIsNull(true)
++        } else if value_def_instruction(ctx, id)
++            .is_some_and(|inst| matches!(inst.class.opcode, Op::Select | Op::Phi))
++        {
++            ImageNullPredicate::Unknown
++        } else {
++            ImageNullPredicate::KnownIsNull(false)
++        };
++        graph.facts.insert(
++            id,
++            ImageFacts {
++                shape: Some(shape),
++                nullness: predicate,
++            },
++        );
++    }
++    Ok(())
++}
++
++fn collect_intrinsic_facts(
++    ctx: &Ctx,
++    entry_idx: usize,
++    names: &HashMap<Word, String>,
++    graph: &mut FactGraph,
++) -> Result<(), String> {
++    for inst in ctx.module.functions[entry_idx]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++    {
++        if inst.class.opcode != Op::FunctionCall {
++            continue;
++        }
++        let Some(Operand::IdRef(callee)) = inst.operands.first() else {
++            continue;
++        };
++        let Some(name) = names.get(callee) else {
++            continue;
++        };
++        if name.starts_with("air.get_null_texture") {
++            let Some(result) = inst.result_id else {
++                return Err(format!("{name} has no result"));
++            };
++            let (dim, arrayed) = intrinsic_texture_shape(name).unwrap_or((Dim::Dim2D, false));
++            graph.set_evidence(
++                result,
++                ImageShapeEvidence {
++                    dim: Some(dim),
++                    arrayed: Some(arrayed),
++                    ..ImageShapeEvidence::default()
++                },
++            )?;
++            graph.facts.insert(
++                result,
++                ImageFacts {
++                    shape: None,
++                    nullness: ImageNullPredicate::KnownIsNull(true),
++                },
++            );
++            continue;
++        }
++        let Some(evidence) = intrinsic_evidence(ctx, name, inst)? else {
++            continue;
++        };
++        let Some(Operand::IdRef(image)) = inst.operands.get(1) else {
++            continue;
++        };
++        if graph
++            .facts
++            .get(image)
++            .is_some_and(|fact| matches!(fact.nullness, ImageNullPredicate::KnownIsNull(false)))
++        {
++            continue;
++        }
++        graph.set_evidence(*image, evidence)?;
++    }
++    Ok(())
++}
++
++fn propagate_once(
++    ctx: &Ctx,
++    instructions: &[Instruction],
++    graph: &mut FactGraph,
++) -> Result<bool, String> {
++    let mut changed = false;
++    for inst in instructions {
++        let Some(result) = inst.result_id else {
++            continue;
++        };
++        match (inst.class.opcode, inst.operands.as_slice()) {
++            (Op::CopyObject | Op::Bitcast, [Operand::IdRef(source)]) => {
++                changed |= alias_all(graph, result, *source)?;
++            }
++            (Op::Load, [Operand::IdRef(pointer)]) => {
++                if let Some(stored) = unique_store_value(ctx, *pointer) {
++                    changed |= alias_all(graph, result, stored)?;
++                }
++                changed |= alias_fields_between(graph, result, *pointer)?;
++            }
++            (Op::Store, [Operand::IdRef(pointer), Operand::IdRef(value)]) => {
++                if unique_store_value(ctx, *pointer) == Some(*value) {
++                    changed |= alias_all(graph, *pointer, *value)?;
++                    changed |= alias_fields_between(graph, *pointer, *value)?;
++                }
++            }
++            (Op::CompositeExtract, [Operand::IdRef(composite), rest @ ..]) => {
++                let path = literal_path(rest);
++                if let Some(source) = resolve_composite_path(ctx, *composite, &path) {
++                    changed |= alias_all(graph, result, source)?;
++                }
++                if let Some(fact) = graph.field_facts.get(&(*composite, path.clone())).cloned() {
++                    changed |= merge_fact(graph, result, fact)?;
++                }
++                if let Some(evidence) = graph
++                    .field_evidence
++                    .get(&(*composite, path.clone()))
++                    .copied()
++                {
++                    changed |= graph.set_evidence(result, evidence)?;
++                }
++            }
++            (Op::CompositeInsert, [Operand::IdRef(inserted), Operand::IdRef(base), rest @ ..]) => {
++                let path = literal_path(rest);
++                changed |= alias_fields_between(graph, result, *base)?;
++                if let Some(evidence) = graph.evidence.get(inserted).copied() {
++                    changed |= graph.set_field_evidence(result, path.clone(), evidence)?;
++                }
++                if let Some(fact) = graph.facts.get(inserted).cloned() {
++                    let entry = graph.field_facts.entry((result, path.clone())).or_default();
++                    let before = entry.clone();
++                    merge_into_fact_entry(entry, fact)?;
++                    changed |= *entry != before;
++                }
++                let inserted_fields = graph
++                    .field_evidence
++                    .iter()
++                    .filter(|((base, _), _)| base == inserted)
++                    .map(|((_, child), evidence)| (child.clone(), *evidence))
++                    .collect::<Vec<_>>();
++                for (child, evidence) in inserted_fields {
++                    let mut nested = path.clone();
++                    nested.extend(child);
++                    changed |= graph.set_field_evidence(result, nested, evidence)?;
++                }
++            }
++            (
++                Op::Select,
++                [Operand::IdRef(condition), Operand::IdRef(when_true), Operand::IdRef(when_false)],
++            ) => {
++                if graph.evidence.contains_key(&result) || graph.facts.contains_key(&result) {
++                    if let Some(evidence) = graph.evidence.get(&result).copied() {
++                        changed |= graph.set_evidence(*when_true, evidence)?;
++                        changed |= graph.set_evidence(*when_false, evidence)?;
++                    }
++                }
++                let mut arms = Vec::new();
++                for arm in [*when_true, *when_false] {
++                    if let Some(evidence) = graph.evidence.get(&arm).copied() {
++                        changed |= graph.set_evidence(result, evidence)?;
++                        arms.push((arm, graph.facts.get(&arm).cloned()));
++                    }
++                }
++                changed |= merge_join_fields(graph, result, &[*when_true, *when_false])?;
++                if arms.len() == 2 && arms.iter().all(|(arm, _)| graph.facts.contains_key(arm)) {
++                    changed |= graph.set_join(
++                        result,
++                        vec![(*when_true, *condition), (*when_false, *condition)],
++                        ImageNullPredicate::Select {
++                            condition: *condition,
++                            when_true: *when_true,
++                            when_false: *when_false,
++                        },
++                    )?;
++                }
++            }
++            (Op::Phi, operands) if operands.len().is_multiple_of(2) => {
++                let pairs = operands
++                    .chunks_exact(2)
++                    .filter_map(|pair| match pair {
++                        [Operand::IdRef(value), Operand::IdRef(label)] => Some((*value, *label)),
++                        _ => None,
++                    })
++                    .collect::<Vec<_>>();
++                if pairs.len() != operands.len() / 2 {
++                    continue;
++                }
++                if let Some(evidence) = graph.evidence.get(&result).copied() {
++                    for (incoming, _) in &pairs {
++                        changed |= graph.set_evidence(*incoming, evidence)?;
++                    }
++                }
++                let incoming = pairs.iter().map(|(value, _)| *value).collect::<Vec<_>>();
++                changed |= merge_join_fields(graph, result, &incoming)?;
++                for (value, _) in &pairs {
++                    if let Some(evidence) = graph.evidence.get(value).copied() {
++                        changed |= graph.set_evidence(result, evidence)?;
++                    }
++                }
++                if pairs
++                    .iter()
++                    .all(|(value, _)| graph.facts.contains_key(value))
++                {
++                    changed |=
++                        graph.set_join(result, pairs.clone(), ImageNullPredicate::Phi(pairs))?;
++                }
++            }
++            _ => {}
++        }
++    }
++    Ok(changed)
++}
++
++fn alias_all(graph: &mut FactGraph, dst: Word, src: Word) -> Result<bool, String> {
++    let mut changed = graph.alias_fact(dst, src)?;
++    changed |= graph.alias_fact(src, dst)?;
++    if let Some(evidence) = graph.evidence.get(&src).copied() {
++        changed |= graph.set_evidence(dst, evidence)?;
++    }
++    if let Some(evidence) = graph.evidence.get(&dst).copied() {
++        changed |= graph.set_evidence(src, evidence)?;
++    }
++    Ok(changed)
++}
++
++fn alias_fields_between(graph: &mut FactGraph, a: Word, b: Word) -> Result<bool, String> {
++    let keys = graph
++        .field_evidence
++        .keys()
++        .chain(graph.field_facts.keys())
++        .filter(|(id, _)| *id == a || *id == b)
++        .cloned()
++        .collect::<BTreeSet<_>>();
++    let mut changed = false;
++    for (id, path) in keys {
++        let other = if id == a { b } else { a };
++        if let Some(evidence) = graph.field_evidence.get(&(id, path.clone())).copied() {
++            changed |= graph.set_field_evidence(other, path.clone(), evidence)?;
++        }
++        if let Some(fact) = graph.field_facts.get(&(id, path.clone())).cloned() {
++            changed |= graph.alias_field_fact(other, id, &path)?;
++            let entry = graph.field_facts.entry((other, path.clone())).or_default();
++            let before = entry.clone();
++            merge_into_fact_entry(entry, fact)?;
++            changed |= *entry != before;
++        }
++    }
++    Ok(changed)
++}
++
++fn merge_join_fields(graph: &mut FactGraph, result: Word, inputs: &[Word]) -> Result<bool, String> {
++    let mut changed = false;
++    let keys = graph
++        .field_evidence
++        .keys()
++        .chain(graph.field_facts.keys())
++        .filter(|(id, _)| inputs.contains(id) || *id == result)
++        .cloned()
++        .collect::<BTreeSet<_>>();
++    for (id, path) in keys {
++        if id == result {
++            if let Some(evidence) = graph.field_evidence.get(&(result, path.clone())).copied() {
++                for input in inputs {
++                    changed |= graph.set_field_evidence(*input, path.clone(), evidence)?;
++                }
++            }
++            if let Some(fact) = graph.field_facts.get(&(result, path.clone())).cloned() {
++                for input in inputs {
++                    let entry = graph.field_facts.entry((*input, path.clone())).or_default();
++                    let before = entry.clone();
++                    merge_into_fact_entry(entry, fact.clone())?;
++                    changed |= *entry != before;
++                }
++            }
++        } else {
++            if let Some(evidence) = graph.field_evidence.get(&(id, path.clone())).copied() {
++                changed |= graph.set_field_evidence(result, path.clone(), evidence)?;
++            }
++            if let Some(fact) = graph.field_facts.get(&(id, path.clone())).cloned() {
++                let entry = graph.field_facts.entry((result, path.clone())).or_default();
++                let before = entry.clone();
++                merge_into_fact_entry(entry, fact)?;
++                changed |= *entry != before;
++            }
++        }
++    }
++    Ok(changed)
++}
++
++fn merge_fact(graph: &mut FactGraph, id: Word, fact: ImageFacts) -> Result<bool, String> {
++    let entry = graph.facts.entry(id).or_default();
++    let before = entry.clone();
++    merge_into_fact_entry(entry, fact)?;
++    Ok(*entry != before)
++}
++
++fn merge_into_fact_entry(entry: &mut ImageFacts, fact: ImageFacts) -> Result<(), String> {
++    if let Some(shape) = fact.shape {
++        match entry.shape {
++            Some(current) if current != shape => {
++                return Err(format!(
++                    "image fact merge has contradictory shapes {current:?} and {shape:?}"
++                ))
++            }
++            None => entry.shape = Some(shape),
++            _ => {}
++        }
++    }
++    match (&entry.nullness, fact.nullness) {
++        (ImageNullPredicate::Unknown, incoming) => entry.nullness = incoming,
++        (_, ImageNullPredicate::Unknown) => {}
++        (current, incoming) if *current == incoming => {}
++        (current, incoming) => {
++            return Err(format!(
++                "image fact merge has contradictory nullness {current:?} and {incoming:?}"
++            ))
++        }
++    }
++    Ok(())
++}
++
++fn resolve_composite_path(ctx: &Ctx, mut value: Word, path: &[u32]) -> Option<Word> {
++    for _ in 0..32 {
++        let inst = value_def_instruction(ctx, value)?;
++        match inst.class.opcode {
++            Op::CopyObject => {
++                value = match inst.operands.first()? {
++                    Operand::IdRef(source) => *source,
++                    _ => return None,
++                };
++            }
++            Op::Load => {
++                let pointer = match inst.operands.first()? {
++                    Operand::IdRef(pointer) => *pointer,
++                    _ => return None,
++                };
++                value = unique_store_value(ctx, pointer)?;
++            }
++            Op::CompositeInsert => {
++                let inserted = match inst.operands.first()? {
++                    Operand::IdRef(id) => *id,
++                    _ => return None,
++                };
++                let base = match inst.operands.get(1)? {
++                    Operand::IdRef(id) => *id,
++                    _ => return None,
++                };
++                let insert_path = literal_path(&inst.operands[2..]);
++                if insert_path == path {
++                    return Some(inserted);
++                }
++                value = base;
++            }
++            _ => return None,
++        }
++    }
++    None
++}
++
++/// Value stored through `pointer`, when every store to it agrees on exactly one value.
++fn unique_store_value(ctx: &Ctx, pointer: Word) -> Option<Word> {
++    let mut found = None;
++    for inst in ctx.module.all_inst_iter().chain(ctx.new_globals.iter()) {
++        if inst.class.opcode != Op::Store || inst.operands.first() != Some(&Operand::IdRef(pointer))
++        {
++            continue;
++        }
++        let Some(Operand::IdRef(value)) = inst.operands.get(1) else {
++            return None;
++        };
++        if found.replace(*value).is_some() {
++            return None;
++        }
++    }
++    found
++}
++
++fn materialize_is_null_predicates(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++    names: &HashMap<Word, String>,
++) -> Result<(), String> {
++    let calls = ctx.module.functions[entry_idx]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .filter(|inst| inst.class.opcode == Op::FunctionCall)
++        .filter_map(|inst| {
++            let Operand::IdRef(callee) = inst.operands.first()? else {
++                return None;
++            };
++            names
++                .get(callee)
++                .is_some_and(|name| name.starts_with("air.is_null_texture"))
++                .then(|| match inst.operands.get(1) {
++                    Some(Operand::IdRef(image)) => Some(*image),
++                    _ => None,
++                })
++        })
++        .flatten()
++        .collect::<Vec<_>>();
++    for image in calls {
++        let mut visiting = HashSet::new();
++        materialize_predicate(ctx, image, &mut visiting)?;
++    }
++    Ok(())
++}
++
++fn materialize_predicate(
++    ctx: &mut Ctx,
++    image: Word,
++    visiting: &mut HashSet<Word>,
++) -> Result<Word, String> {
++    if let Some(value) = ctx.materialized_null_predicates.get(&image).copied() {
++        return Ok(value);
++    }
++    if !visiting.insert(image) {
++        return Err(format!(
++            "cyclic image null predicate at %{image}; a phi backedge must name the materialized phi itself"
++        ));
++    }
++    let fact =
++        ctx.image_facts.get(&image).cloned().ok_or_else(|| {
++            format!("no image shape/null fact for is_null_texture operand %{image}")
++        })?;
++    let value = match fact.nullness.clone() {
++        ImageNullPredicate::KnownIsNull(is_null) => {
++            let bool_ty = ctx.ty_bool();
++            ctx.const_bool_of(bool_ty, is_null)
++        }
++        ImageNullPredicate::GpuToken { low, high } => {
++            let mut ops = Vec::new();
++            let uint = ctx.ty_uint();
++            let zero = ctx.const_uint(0);
++            let words = ctx.module.fresh_id();
++            ops.push(Instruction::new(
++                Op::BitwiseOr,
++                Some(uint),
++                Some(words),
++                vec![Operand::IdRef(low), Operand::IdRef(high)],
++            ));
++            let boolean = ctx.ty_bool();
++            let value = ctx.module.fresh_id();
++            ops.push(Instruction::new(
++                Op::IEqual,
++                Some(boolean),
++                Some(value),
++                vec![Operand::IdRef(words), Operand::IdRef(zero)],
++            ));
++            insert_after_image_definition(ctx, image, ops)?;
++            value
++        }
++        ImageNullPredicate::Select {
++            condition,
++            when_true,
++            when_false,
++        } => {
++            let when_true = materialize_predicate(ctx, when_true, visiting)?;
++            let when_false = materialize_predicate(ctx, when_false, visiting)?;
++            let bool_ty = ctx.ty_bool();
++            let value = ctx.module.fresh_id();
++            insert_after_image_definition(
++                ctx,
++                image,
++                vec![Instruction::new(
++                    Op::Select,
++                    Some(bool_ty),
++                    Some(value),
++                    vec![
++                        Operand::IdRef(condition),
++                        Operand::IdRef(when_true),
++                        Operand::IdRef(when_false),
++                    ],
++                )],
++            )?;
++            value
++        }
++        ImageNullPredicate::Phi(arms) => {
++            let bool_ty = ctx.ty_bool();
++            let value = ctx.module.fresh_id();
++            // A loop header's backedge names the image phi itself. Reserving the boolean phi before
++            // walking the incoming values makes that self edge direct rather than recursive.
++            ctx.materialized_null_predicates.insert(image, value);
++            let mut operands = Vec::with_capacity(arms.len() * 2);
++            for (incoming, predecessor) in arms {
++                let predicate = if incoming == image {
++                    value
++                } else {
++                    materialize_predicate(ctx, incoming, visiting)?
++                };
++                operands.push(Operand::IdRef(predicate));
++                operands.push(Operand::IdRef(predecessor));
++            }
++            insert_phi(
++                ctx,
++                image,
++                Instruction::new(Op::Phi, Some(bool_ty), Some(value), operands),
++            )?;
++            value
++        }
++        ImageNullPredicate::Unknown => {
++            return Err(format!(
++                "is_null_texture operand %{image} has no closed nullness predicate"
++            ))
++        }
++    };
++    visiting.remove(&image);
++    ctx.materialized_null_predicates.insert(image, value);
++    Ok(value)
++}
++
++fn insert_after_image_definition(
++    ctx: &mut Ctx,
++    image: Word,
++    instructions: Vec<Instruction>,
++) -> Result<(), String> {
++    for function in &mut ctx.module.functions {
++        for block in &mut function.blocks {
++            let Some(index) = block
++                .instructions
++                .iter()
++                .position(|inst| inst.result_id == Some(image))
++            else {
++                continue;
++            };
++            block
++                .instructions
++                .splice(index + 1..index + 1, instructions);
++            return Ok(());
++        }
++    }
++    // Function parameters and module-scope image declarations dominate every use; put ancillary
++    // predicate arithmetic in the entry block after its leading phis and local variables.
++    let entry = ctx
++        .module
++        .functions
++        .iter_mut()
++        .find(|function| !function.blocks.is_empty())
++        .ok_or_else(|| "cannot place image null predicate without a function body".to_string())?;
++    let block = &mut entry.blocks[0];
++    let at = block
++        .instructions
++        .iter()
++        .take_while(|inst| matches!(inst.class.opcode, Op::Phi | Op::Variable))
++        .count();
++    block.instructions.splice(at..at, instructions);
++    Ok(())
++}
++
++fn insert_phi(ctx: &mut Ctx, image: Word, phi: Instruction) -> Result<(), String> {
++    for function in &mut ctx.module.functions {
++        for block in &mut function.blocks {
++            if !block
++                .instructions
++                .iter()
++                .any(|inst| inst.result_id == Some(image) && inst.class.opcode == Op::Phi)
++            {
++                continue;
++            }
++            let at = block
++                .instructions
++                .iter()
++                .take_while(|inst| inst.class.opcode == Op::Phi)
++                .count();
++            block.instructions.insert(at, phi);
++            return Ok(());
++        }
++    }
++    Err(format!(
++        "cannot materialize null predicate for image phi %{image}: defining block not found"
++    ))
++}
++
++fn shape_from_image_value(ctx: &Ctx, image: Word) -> Option<ImageShape> {
++    let mut ty = value_result_type(ctx, image)?;
++    for _ in 0..4 {
++        let def = type_def_of(ctx, ty)?;
++        match def.class.opcode {
++            Op::TypePointer => {
++                ty = match def.operands.get(1)? {
++                    Operand::IdRef(pointee) => *pointee,
++                    _ => return None,
++                };
++            }
++            Op::TypeImage => {
++                let sampled_ty = match def.operands.first()? {
++                    Operand::IdRef(id) => *id,
++                    _ => return None,
++                };
++                let comp = match type_def_of(ctx, sampled_ty)?.class.opcode {
++                    Op::TypeFloat => ImageComp::Float,
++                    Op::TypeInt => match type_def_of(ctx, sampled_ty)?.operands.get(1) {
++                        Some(Operand::LiteralBit32(0)) => ImageComp::Uint,
++                        Some(Operand::LiteralBit32(1)) => ImageComp::Sint,
++                        _ => return None,
++                    },
++                    _ => return None,
++                };
++                let dim = match def.operands.get(1)? {
++                    Operand::Dim(dim) => *dim,
++                    _ => return None,
++                };
++                let depth = matches!(def.operands.get(2), Some(Operand::LiteralBit32(1)));
++                let arrayed = matches!(def.operands.get(3), Some(Operand::LiteralBit32(1)));
++                let multisampled = matches!(def.operands.get(4), Some(Operand::LiteralBit32(1)));
++                let sampled = match def.operands.get(5) {
++                    Some(Operand::LiteralBit32(1)) => true,
++                    Some(Operand::LiteralBit32(2)) => false,
++                    _ => ctx.image_storage.contains(&image),
++                };
++                let access = match (dim, sampled) {
++                    (Dim::DimBuffer, true) => ImageAccess::UniformTexel,
++                    (Dim::DimBuffer, false) => ImageAccess::StorageTexel,
++                    (_, true) => ImageAccess::Sampled,
++                    (_, false) => ImageAccess::Storage,
++                };
++                return Some(ImageShape {
++                    dim,
++                    arrayed,
++                    comp,
++                    depth,
++                    multisampled,
++                    access,
++                });
++            }
++            _ => return None,
++        }
++    }
++    None
++}
++
++fn intrinsic_evidence(
++    ctx: &Ctx,
++    name: &str,
++    inst: &Instruction,
++) -> Result<Option<ImageShapeEvidence>, String> {
++    let Some((dim, arrayed)) = intrinsic_texture_shape(name) else {
++        return Ok(None);
++    };
++    if name.starts_with("air.get_null_texture") {
++        return Ok(None);
++    }
++    let is_null = name.starts_with("air.is_null_texture");
++    let depth = intrinsic_depth_evidence(name);
++    let multisampled = name
++        .split('.')
++        .nth(1)
++        .is_some_and(|family| family.ends_with("_ms") || family.ends_with("_ms_array"));
++    let evidence = ImageShapeEvidence {
++        dim: Some(dim),
++        arrayed: Some(arrayed),
++        comp: if is_null {
++            None
++        } else {
++            intrinsic_component(name)
++        },
++        depth,
++        multisampled: multisampled.then_some(true),
++        access: intrinsic_access(ctx, name, inst, dim)?,
++    };
++    Ok(Some(evidence))
++}
++
++fn intrinsic_access(
++    ctx: &Ctx,
++    name: &str,
++    inst: &Instruction,
++    dim: Dim,
++) -> Result<Option<ImageAccess>, String> {
++    let storage = || {
++        Some(if dim == Dim::DimBuffer {
++            ImageAccess::StorageTexel
++        } else {
++            ImageAccess::Storage
++        })
++    };
++    let sampled = || {
++        Some(if dim == Dim::DimBuffer {
++            ImageAccess::UniformTexel
++        } else {
++            ImageAccess::Sampled
++        })
++    };
++    if name.starts_with("air.is_null_texture") || name.starts_with("air.get_") {
++        // Queries and nullness do not select a descriptor compatibility class. The resource's
++        // structural image type or an actual sample/read/write use supplies it.
++        return Ok(None);
++    }
++    if name.starts_with("air.sample_") || name.starts_with("air.gather_") {
++        return Ok(sampled());
++    }
++    let write = name.starts_with("air.write_texture")
++        || name.starts_with("air.write_depth")
++        || name.starts_with("air.write_imageblock_slice_to_texture")
++        || name.starts_with("air.atomic_fetch_")
++            && (name.contains("_texture_") || name.contains("_depth_"));
++    if write {
++        return Ok(storage());
++    }
++    if name.starts_with("air.read_texture") || name.starts_with("air.read_depth") {
++        let Some(Operand::IdRef(access)) = inst.operands.last() else {
++            return Ok(None);
++        };
++        let value = match value_def_instruction(ctx, *access) {
++            Some(definition) => match definition.operands.first() {
++                Some(Operand::LiteralBit32(value)) => *value,
++                _ => return Ok(None),
++            },
++            None => return Ok(None),
++        };
++        return match value {
++            0 => Ok(None),
++            1 => Ok(sampled()),
++            2 | 3 => Ok(storage()),
++            _ => Err(format!(
++                "AIR image access {value} in {name} is not a known image access class"
++            )),
++        };
++    }
++    Ok(None)
++}
++
++pub(in crate::passes) fn intrinsic_component(name: &str) -> Option<ImageComp> {
++    let suffix = name.rsplit('.').next()?;
++    match suffix {
++        "v4f16" | "v4f32" | "f16" | "f32" => Some(ImageComp::Float),
++        "v4i16" | "v4i32" | "i16" | "i32" => Some(if name.split('.').any(|part| part == "u") {
++            ImageComp::Uint
++        } else {
++            ImageComp::Sint
++        }),
++        _ => None,
++    }
++}
++
++fn intrinsic_depth_evidence(name: &str) -> Option<bool> {
++    const DEPTH: &[&str] = &[
++        "air.sample_depth",
++        "air.sample_compare_depth",
++        "air.gather_depth",
++        "air.gather_compare_depth",
++        "air.read_depth",
++        "air.write_depth",
++        "air.get_width_depth",
++        "air.get_height_depth",
++        "air.get_depth_depth",
++        "air.get_num_mip_levels_depth",
++        "air.get_num_samples_depth",
++        "air.get_array_size_depth",
++    ];
++    if DEPTH.iter().any(|prefix| name.starts_with(prefix)) {
++        return Some(true);
++    }
++    const COLOR: &[&str] = &[
++        "air.sample_texture",
++        "air.gather_texture",
++        "air.read_texture",
++        "air.write_texture",
++        "air.get_width_texture",
++        "air.get_height_texture",
++        "air.get_depth_texture",
++        "air.get_num_mip_levels_texture",
++        "air.get_num_samples_texture",
++        "air.get_array_size_texture",
++    ];
++    COLOR
++        .iter()
++        .any(|prefix| name.starts_with(prefix))
++        .then_some(false)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn shape(access: ImageAccess) -> ImageShape {
++        ImageShape {
++            dim: Dim::Dim2D,
++            arrayed: true,
++            comp: ImageComp::Uint,
++            depth: false,
++            multisampled: false,
++            access,
++        }
++    }
++
++    #[test]
++    fn canonical_shape_word_matches_abi9_layout() {
++        let sampled = ImageShape::sampled(Dim::Dim2D, true, ImageComp::Float, true, true);
++        assert_eq!(sampled.canonical_word().unwrap(), 0x00c9);
++        assert_eq!(ImageShape::from_canonical_word(0x00c9).unwrap(), sampled);
++        for access in [
++            ImageAccess::Sampled,
++            ImageAccess::Storage,
++            ImageAccess::UniformTexel,
++            ImageAccess::StorageTexel,
++        ] {
++            let shape = ImageShape {
++                dim: if access.is_texel() {
++                    Dim::DimBuffer
++                } else {
++                    Dim::Dim2D
++                },
++                arrayed: false,
++                comp: ImageComp::Float,
++                depth: false,
++                multisampled: false,
++                access,
++            };
++            let word = shape.canonical_word().unwrap();
++            assert_eq!(word & 0x300, (access as u32) << 8);
++            assert_eq!(ImageShape::from_canonical_word(word).unwrap(), shape);
++        }
++    }
++
++    #[test]
++    fn canonical_shape_rejects_reserved_bits_and_bad_access() {
++        assert!(ImageShape::from_canonical_word(1 | (1 << 10)).is_err());
++        assert!(ImageShape::from_canonical_word(1 | (3 << 4)).is_err());
++        assert!(ImageShape::from_canonical_word(1 | (3 << 8)).is_err());
++    }
++
++    #[test]
++    fn access_invariants_keep_texel_and_storage_distinct() {
++        let mut texel = shape(ImageAccess::UniformTexel);
++        texel.dim = Dim::DimBuffer;
++        texel.arrayed = false;
++        assert!(texel.validate().is_ok());
++        let mut sampled_buffer = texel;
++        sampled_buffer.access = ImageAccess::Sampled;
++        assert!(sampled_buffer.validate().is_err());
++        let mut storage = shape(ImageAccess::Storage);
++        storage.multisampled = true;
++        assert!(storage.validate().is_err());
++    }
++
++    #[test]
++    fn abi9_legal_matrix_is_exactly_fifty_four_shapes() {
++        let mut by_access = [0usize; 4];
++        let mut words = Vec::new();
++        for dim in [
++            Dim::Dim1D,
++            Dim::Dim2D,
++            Dim::Dim3D,
++            Dim::DimCube,
++            Dim::DimBuffer,
++        ] {
++            for arrayed in [false, true] {
++                for comp in [ImageComp::Float, ImageComp::Uint, ImageComp::Sint] {
++                    for depth in [false, true] {
++                        for multisampled in [false, true] {
++                            for access in [
++                                ImageAccess::Sampled,
++                                ImageAccess::Storage,
++                                ImageAccess::UniformTexel,
++                                ImageAccess::StorageTexel,
++                            ] {
++                                let shape = ImageShape {
++                                    dim,
++                                    arrayed,
++                                    comp,
++                                    depth,
++                                    multisampled,
++                                    access,
++                                };
++                                if shape.validate().is_ok() {
++                                    by_access[NullShapeRegistry::slot(access)] += 1;
++                                    words.push(shape.canonical_word().unwrap());
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        assert_eq!(by_access, [33, 15, 3, 3]);
++        assert_eq!(words.len(), 54);
++        words.sort_unstable();
++        assert_eq!(
++            words,
++            vec![
++                0x000, 0x001, 0x002, 0x003, 0x008, 0x009, 0x00b, 0x010, 0x011, 0x012, 0x013, 0x018,
++                0x019, 0x01b, 0x020, 0x021, 0x022, 0x023, 0x028, 0x029, 0x02b, 0x041, 0x043, 0x049,
++                0x04b, 0x081, 0x089, 0x091, 0x099, 0x0a1, 0x0a9, 0x0c1, 0x0c9, 0x100, 0x101, 0x102,
++                0x108, 0x109, 0x110, 0x111, 0x112, 0x118, 0x119, 0x120, 0x121, 0x122, 0x128, 0x129,
++                0x204, 0x214, 0x224, 0x304, 0x314, 0x324,
++            ]
++        );
++    }
++
++    #[test]
++    fn abi9_rejects_non_matrix_combinations() {
++        let base = ImageShape::sampled(Dim::Dim2D, false, ImageComp::Float, false, false);
++        for invalid in [
++            ImageShape {
++                dim: Dim::Dim3D,
++                arrayed: true,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::DimCube,
++                access: ImageAccess::Storage,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::Dim1D,
++                depth: true,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::DimCube,
++                multisampled: true,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::DimCube,
++                multisampled: true,
++                depth: true,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::DimBuffer,
++                access: ImageAccess::Storage,
++                ..base
++            },
++        ] {
++            assert!(invalid.validate().is_err(), "{invalid:?} must be rejected");
++        }
++
++        for valid in [
++            ImageShape {
++                dim: Dim::Dim2D,
++                arrayed: true,
++                multisampled: true,
++                comp: ImageComp::Uint,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::Dim2D,
++                arrayed: true,
++                multisampled: true,
++                depth: true,
++                ..base
++            },
++            ImageShape {
++                dim: Dim::Dim3D,
++                comp: ImageComp::Sint,
++                ..base
++            },
++        ] {
++            assert!(valid.validate().is_ok(), "{valid:?} must be legal");
++        }
++    }
++
++    #[test]
++    fn shape_registry_assigns_dense_per_access_ordinals() {
++        let mut registry = NullShapeRegistry::default();
++        let a = ImageShape::sampled(Dim::Dim2D, false, ImageComp::Float, false, false);
++        let b = ImageShape::sampled(Dim::Dim3D, false, ImageComp::Float, false, false);
++        let storage = shape(ImageAccess::Storage);
++        registry.register(b).unwrap();
++        registry.register(a).unwrap();
++        registry.register(storage).unwrap();
++        assert_eq!(registry.words(ImageAccess::Sampled), vec![0x01, 0x02]);
++        assert_eq!(registry.ordinal(a), Some(0));
++        assert_eq!(registry.ordinal(b), Some(1));
++        assert_eq!(registry.all_words(), vec![0x01, 0x02, 0x119]);
++        assert_eq!(registry.access_count(ImageAccess::Sampled), 2);
++        assert_eq!(registry.access_count(ImageAccess::Storage), 1);
++    }
++
++    #[test]
++    fn texel_ordinals_use_final_sorted_words_not_insertion_order() {
++        let texel = |comp| ImageShape {
++            dim: Dim::DimBuffer,
++            arrayed: false,
++            comp,
++            depth: false,
++            multisampled: false,
++            access: ImageAccess::UniformTexel,
++        };
++        let float = texel(ImageComp::Float);
++        let uint = texel(ImageComp::Uint);
++        let sint = texel(ImageComp::Sint);
++        let mut registry = NullShapeRegistry::default();
++        registry.register(uint).unwrap();
++        registry.register(float).unwrap();
++        registry.register(sint).unwrap();
++        assert_eq!(registry.ordinal(float), Some(0));
++        assert_eq!(registry.ordinal(uint), Some(1));
++        assert_eq!(registry.ordinal(sint), Some(2));
++        assert_eq!(
++            registry.words(ImageAccess::UniformTexel),
++            vec![0x204, 0x214, 0x224]
++        );
++    }
++
++    #[test]
++    fn intrinsic_component_uses_the_stable_air_suffix() {
++        assert_eq!(
++            intrinsic_component("air.sample_texture_2d.v4f32"),
++            Some(ImageComp::Float)
++        );
++        assert_eq!(
++            intrinsic_component("air.sample_texture_2d.u.v4i16"),
++            Some(ImageComp::Uint)
++        );
++        assert_eq!(
++            intrinsic_component("air.read_texture_2d.i16.v4i32"),
++            Some(ImageComp::Sint)
++        );
++        assert_eq!(
++            intrinsic_component("air.read_depth_2d.f32"),
++            Some(ImageComp::Float)
++        );
++        assert_eq!(intrinsic_component("air.get_width_texture_2d"), None);
++    }
++
++    #[test]
++    fn facts_remap_every_ssa_id_and_is_clone() {
++        let mut facts = ImageFacts {
++            shape: None,
++            nullness: ImageNullPredicate::Phi(vec![(3, 4), (5, 6)]),
++        };
++        let remap = HashMap::from([(3, 30), (4, 40), (5, 50), (6, 60)]);
++        facts.remap_ids(&remap).unwrap();
++        assert_eq!(
++            facts.nullness,
++            ImageNullPredicate::Phi(vec![(30, 40), (50, 60)])
++        );
++        let cloned = facts.clone();
++        assert_eq!(facts, cloned);
++    }
++}
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -254,7 +254,7 @@
+ /// textures (`air.read_texture_2d.u.v4i32` / `.s.v4i32`) must produce an int-typed image so the
+ /// OpImageFetch result is `v4uint`/`v4int` and matches the AIR result struct member — a float image
+ /// (the common case) would emit `v4float` and fail spirv-val on the struct construct.
+-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+ pub enum ImageComp {
+     Float,
+     Uint,
+@@ -338,13 +338,58 @@
+     Int16,
+ }
+ 
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++/// How an image descriptor is consumed. `UniformTexel` and `StorageTexel` are kept distinct from
++/// sampled/storage images because `Dim::Buffer` has no multisample or depth form and Vulkan gives
++/// buffer views a different descriptor compatibility class.
++///
++/// The bit values are the ABI-9 wire encoding; do not renumber them independently of the native
++/// decoder.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++#[repr(u8)]
++pub(in crate::passes) enum ImageAccess {
++    Sampled = 0,
++    Storage = 1,
++    UniformTexel = 2,
++    StorageTexel = 3,
++}
++
++impl ImageAccess {
++    const fn from_bits(bits: u32) -> Option<Self> {
++        match bits {
++            0 => Some(Self::Sampled),
++            1 => Some(Self::Storage),
++            2 => Some(Self::UniformTexel),
++            3 => Some(Self::StorageTexel),
++            _ => None,
++        }
++    }
++
++    const fn is_texel(self) -> bool {
++        matches!(self, Self::UniformTexel | Self::StorageTexel)
++    }
++
++    const fn spirv_sampled(self) -> u32 {
++        match self {
++            Self::Sampled | Self::UniformTexel => 1,
++            Self::Storage | Self::StorageTexel => 2,
++        }
++    }
++}
++
++/// The complete structural identity of an image as far as null placeholders and descriptor
++/// compatibility are concerned.
++///
++/// `access` is not derivable from `dim`: a 2D image may be sampled or storage, and a buffer image
++/// may be uniform-texel or storage-texel. `Dim::Buffer` therefore still needs its access bit in the
++/// canonical ABI-9 shape word.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub(in crate::passes) struct ImageShape {
+     pub(in crate::passes) dim: Dim,
+     pub(in crate::passes) arrayed: bool,
+     pub(in crate::passes) depth: bool,
+     pub(in crate::passes) comp: ImageComp,
+     pub(in crate::passes) multisampled: bool,
++    pub(in crate::passes) access: ImageAccess,
+ }
+ 
+ /// Typed cache key for the synthesized array type + numeric constants the lowering passes memoize
+@@ -447,6 +492,24 @@
+     bound_buffer_vars: HashSet<Word>,
+     /// loaded-image ids synthesized by `air.get_null_texture_*()`.
+     null_image_values: HashSet<Word>,
++    /// Typed shape and nullness facts carried through copies, memory aliases, aggregates,
++    /// selects, and phis. The legacy image_* maps above remain mirrored for existing lowerings.
++    image_facts: HashMap<Word, ImageFacts>,
++    /// Field-wise evidence gathered from stable AIR intrinsic families. It is merged before
++    /// `image_facts` is finalized so a `get_null_texture_2d` does not permanently claim Float /
++    /// Sampled before a later integer or storage use supplies the stronger fact.
++    image_shape_evidence: HashMap<Word, ImageShapeEvidence>,
++    /// Facts for an image stored at a path inside a non-image aggregate value.
++    image_field_facts: HashMap<(Word, Vec<u32>), ImageFacts>,
++    /// Shape evidence at an aggregate field path. Kept separate until all field-wise AIR evidence
++    /// has been joined and can be materialized into a complete `ImageShape`.
++    image_field_shape_evidence: HashMap<(Word, Vec<u32>), ImageShapeEvidence>,
++    /// Materialized `bool` value for an image's null predicate. A phi-select expression must be
++    /// materialized where its SSA inputs are available; a consumer in a later block cannot rebuild it
++    /// by scanning backwards.
++    materialized_null_predicates: HashMap<Word, Word>,
++    /// Sorted stage-local ABI9 registry; native metadata supplies merged per-access ordinals.
++    null_shape_registry: NullShapeRegistry,
+     /// composite type ids already given explicit Offset/ArrayStride layout (dedup; a type decorated
+     /// twice is a validation error).
+     laid_out: HashSet<Word>,
+@@ -531,9 +594,10 @@
+     /// operation cannot soundly specialize one of these values without cloning the operation per
+     /// incoming state, so it must fail visibly instead of falling back to native sampling.
+     ambiguous_sampler_states: HashSet<Word>,
+-    /// lazily-created default (null) float image variables for `air.get_null_texture_*()`, keyed by
+-    /// (Dim, arrayed) so a 2D and a 3D null texture get distinct bindings/types.
+-    default_null_image_vars: HashMap<(Dim, bool), Word>,
++    /// Descriptor variables keyed by the complete null-image shape.
++    null_arrays: HashMap<ImageShape, Word>,
++    /// Unique constant ids relocated to final global registry positions after liveness.
++    null_index_fixups: HashMap<Word, ImageShape>,
+     /// `(render-target attachment, AIR imageblock data rate)` -> storage-image variable/type/format.
+     /// The image is 2D-arrayed; the AIR color/sample index selects its array layer.
+     implicit_imageblock_vars: HashMap<(u32, u32), (Word, Word, ImageFormat)>,
+@@ -593,6 +657,12 @@
+             sampler_array_vars: HashMap::new(),
+             bound_buffer_vars: HashSet::new(),
+             null_image_values: HashSet::new(),
++            image_facts: HashMap::new(),
++            image_shape_evidence: HashMap::new(),
++            image_field_facts: HashMap::new(),
++            image_field_shape_evidence: HashMap::new(),
++            materialized_null_predicates: HashMap::new(),
++            null_shape_registry: NullShapeRegistry::default(),
+             laid_out: HashSet::new(),
+             air_struct_offsets,
+             air_data_layout,
+@@ -623,7 +693,8 @@
+             sampler_coordinate_flags_var: None,
+             specialized_runtime_sampler_values: HashSet::new(),
+             ambiguous_sampler_states: HashSet::new(),
+-            default_null_image_vars: HashMap::new(),
++            null_arrays: HashMap::new(),
++            null_index_fixups: HashMap::new(),
+             placeholder_descriptor_vars: HashMap::new(),
+             implicit_imageblock_vars: HashMap::new(),
+             fragment_imageblock_vars: HashMap::new(),
+@@ -1434,6 +1505,38 @@
+         )
+     }
+ 
++    fn ty_image_shape(&mut self, shape: ImageShape) -> Word {
++        shape
++            .validate()
++            .expect("callers validate image shapes before creating their SPIR-V type");
++        let f = match shape.comp {
++            ImageComp::Float => self.ty_float(),
++            ImageComp::Uint => self.ty_uint(),
++            ImageComp::Sint => self.ty_sint(),
++        };
++        let format = match shape.access {
++            ImageAccess::StorageTexel => match shape.comp {
++                ImageComp::Float => ImageFormat::R32f,
++                ImageComp::Uint => ImageFormat::R32ui,
++                ImageComp::Sint => ImageFormat::R32i,
++            },
++            _ => ImageFormat::Unknown,
++        };
++        self.get_or_create(
++            Op::TypeImage,
++            None,
++            vec![
++                Operand::IdRef(f),
++                Operand::Dim(shape.dim),
++                Operand::LiteralBit32(shape.depth as u32), // Depth
++                Operand::LiteralBit32(shape.arrayed as u32), // Arrayed
++                Operand::LiteralBit32(shape.multisampled as u32), // MS
++                Operand::LiteralBit32(shape.spirv_sampled()), // Sampled
++                Operand::ImageFormat(format),
++            ],
++        )
++    }
++
+     /// Get or create an input-attachment image type (`subpassInput`/`SubpassData`).
+     fn ty_input_attachment(&mut self, sampled: Word) -> Word {
+         self.get_or_create(
+@@ -1771,6 +1874,10 @@
+ mod aliased_imageblock;
+ mod emitted_inline;
+ mod finalize;
++mod image_facts;
++mod null_shapes;
++pub(crate) use image_facts::validate_canonical_null_shape_word;
++use image_facts::*;
+ pub(crate) mod loop_budget;
+ #[cfg(test)]
+ mod lowering_regression_tests;
+@@ -1783,7 +1890,8 @@
+ mod prune;
+ mod resources;
+ pub use resources::{
+-    lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    lower_argument_resource_tables, lower_argument_resource_tables_versioned,
++    lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+     ARGUMENT_RESOURCE_TABLE_BINDING,
+@@ -3086,6 +3194,7 @@
+     /// Bindings of descriptors the passes synthesized with no Metal argument behind them, still
+     /// present at this boundary. Reflection reports these; nothing else describes them.
+     pub(crate) placeholder_descriptor_bindings: Vec<u32>,
++    pub(crate) null_shapes: Vec<u32>,
+ }
+ 
+ pub(crate) fn transform_with_options_and_sidecar(
+@@ -3194,6 +3303,7 @@
+     // placeholders be neutralized as genuinely unmodeled memory.
+     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+     propagate_sampler_state_aliases(&mut ctx, entry_idx);
++    prepare_image_facts(&mut ctx, entry_idx)?;
+ 
+     debug_phase!("air lowering start");
+     // 2) lower residual air.* calls inside the entry function.
+@@ -3464,6 +3574,7 @@
+     // `air.get_read_sampler()` and `air.get_null_texture_*()` each needed a real descriptor to type
+     // their result; where nothing ever consumed that value, retract the synthesis before liveness
+     // runs so the descriptor goes too.
++    null_shapes::prune_dead_null_value_scaffolding(&mut ctx);
+     stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
+     resources::guard_argument_texel_accesses(&mut ctx)?;
+     resources::protect_argument_sampling(&mut ctx)?;
+@@ -3487,11 +3598,15 @@
+     resources::lower_argument_implicit_lod(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+ 
++    null_shapes::finalize_null_shape_indices(&mut ctx)?;
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
++    let null_shapes = ctx.null_shape_registry.all_words();
+     let placeholder_descriptor_bindings = surviving_placeholder_bindings(&ctx);
+     Ok(Transformed {
+         module: ctx.module,
+         sidecar: ctx.emit_sidecar,
+         placeholder_descriptor_bindings,
++        null_shapes,
+     })
+ }
+ 
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -451,6 +451,37 @@
+ /// declaration is legal SPIR-V, but it demands the strictly stronger `variablePointers` feature of
+ /// every consumer and cues native drivers down a variable-pointer compiler path.
+ pub(crate) fn drop_unrequired_capabilities(module: &mut Module) {
++    let definitions = module
++        .types_global_values
++        .iter()
++        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
++        .collect::<HashMap<_, _>>();
++    let runtime_descriptors = module.types_global_values.iter().any(|instruction| {
++        if instruction.class.opcode != Op::Variable {
++            return false;
++        }
++        let Some(pointer) = instruction.result_type.and_then(|id| definitions.get(&id)) else {
++            return false;
++        };
++        let [Operand::StorageClass(storage), Operand::IdRef(pointee)] = pointer.operands.as_slice()
++        else {
++            return false;
++        };
++        matches!(
++            storage,
++            StorageClass::UniformConstant | StorageClass::Uniform | StorageClass::StorageBuffer
++        ) && definitions
++            .get(pointee)
++            .is_some_and(|ty| ty.class.opcode == Op::TypeRuntimeArray)
++    });
++    // Folding a nullness-only image use can retire the last descriptor array.
++    module.capabilities.retain(|instruction| {
++        runtime_descriptors
++            || instruction.operands.first()
++                != Some(&Operand::Capability(
++                    spirv::Capability::RuntimeDescriptorArray,
++                ))
++    });
+     let mut required: HashSet<spirv::Capability> = HashSet::new();
+     let mut required_extensions: HashSet<&'static str> = HashSet::new();
+     for instruction in module.all_inst_iter() {
+--- /dev/null
++++ b/src/passes/null_shapes.rs
+@@ -0,0 +1,423 @@
++//! ABI 9 null descriptors and stage-local registry relocation.
++use super::*;
++
++impl Ctx {
++    pub(in crate::passes) fn null_shape_from_type(&self, ty: Word) -> Result<ImageShape, String> {
++        let image = self
++            .module
++            .all_inst_iter()
++            .chain(self.new_globals.iter())
++            .find(|inst| inst.result_id == Some(ty))
++            .ok_or("missing image type")?;
++        let [Operand::IdRef(component), Operand::Dim(dim), Operand::LiteralBit32(depth), Operand::LiteralBit32(arrayed), Operand::LiteralBit32(ms), Operand::LiteralBit32(sampled), ..] =
++            image.operands.as_slice()
++        else {
++            return Err("invalid null image type".into());
++        };
++        let component = self
++            .module
++            .all_inst_iter()
++            .chain(self.new_globals.iter())
++            .find(|inst| inst.result_id == Some(*component))
++            .ok_or("missing image component")?;
++        let comp = match (component.class.opcode, component.operands.as_slice()) {
++            (Op::TypeFloat, _) => ImageComp::Float,
++            (Op::TypeInt, [_, Operand::LiteralBit32(0)]) => ImageComp::Uint,
++            (Op::TypeInt, [_, Operand::LiteralBit32(1)]) => ImageComp::Sint,
++            _ => return Err("invalid image component type".into()),
++        };
++        let access = match (*dim == Dim::DimBuffer, sampled) {
++            (false, 1) => ImageAccess::Sampled,
++            (false, 2) => ImageAccess::Storage,
++            (true, 1) => ImageAccess::UniformTexel,
++            (true, 2) => ImageAccess::StorageTexel,
++            _ => return Err("image access is not explicit".into()),
++        };
++        let shape = ImageShape {
++            dim: *dim,
++            arrayed: *arrayed != 0,
++            depth: *depth != 0,
++            multisampled: *ms != 0,
++            comp,
++            access,
++        };
++        shape.validate()?;
++        Ok(shape)
++    }
++
++    pub(in crate::passes) fn restore_null_shape_indices(
++        &mut self,
++        words: &[u32],
++    ) -> Result<HashMap<Word, ImageShape>, String> {
++        let metadata = self.module.annotations.iter().find_map(|inst| match inst.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(674)] => Some(*id), _ => None,
++        });
++        let Some(metadata) = metadata else {
++            return Ok(HashMap::new());
++        };
++        let constants = self
++            .module
++            .types_global_values
++            .iter()
++            .filter_map(|inst| {
++                match (inst.class.opcode, inst.result_id, inst.operands.as_slice()) {
++                    (Op::Constant, Some(id), [Operand::LiteralBit32(value)]) => Some((id, *value)),
++                    _ => None,
++                }
++            })
++            .collect::<HashMap<_, _>>();
++        let uint = self.ty_uint();
++        let mut pointers = HashMap::new();
++        for fi in 0..self.module.functions.len() {
++            for bi in 0..self.module.functions[fi].blocks.len() {
++                let mut body = self.module.functions[fi].blocks[bi].instructions.clone();
++                for inst in &mut body {
++                    if let [Operand::IdRef(base), _, Operand::IdRef(slot)] =
++                        inst.operands.as_slice()
++                    {
++                        if *base == metadata
++                            && matches!(
++                                inst.class.opcode,
++                                Op::AccessChain | Op::InBoundsAccessChain
++                            )
++                        {
++                            let Some(index) =
++                                constants.get(slot).and_then(|index| index.checked_sub(32))
++                            else {
++                                continue;
++                            };
++                            let word = *words
++                                .get(index as usize)
++                                .ok_or("null metadata index exceeds cached registry")?;
++                            let shape = ImageShape::from_canonical_word(word)?;
++                            let slot = self.module.fresh_id();
++                            self.new_globals.push(Instruction::new(
++                                Op::Constant,
++                                Some(uint),
++                                Some(slot),
++                                vec![Operand::LiteralBit32(0)],
++                            ));
++                            self.null_index_fixups.insert(slot, shape);
++                            inst.operands[2] = Operand::IdRef(slot);
++                            if let Some(id) = inst.result_id {
++                                pointers.insert(id, shape);
++                            }
++                        }
++                    }
++                }
++                self.module.functions[fi].blocks[bi].instructions = body;
++            }
++        }
++        Ok(self
++            .module
++            .all_inst_iter()
++            .filter_map(
++                |inst| match (inst.class.opcode, inst.result_id, inst.operands.first()) {
++                    (Op::Load, Some(id), Some(Operand::IdRef(pointer))) => pointers
++                        .get(pointer)
++                        .copied()
++                        .filter(|shape| !shape.access.is_texel())
++                        .map(|shape| (id, shape)),
++                    _ => None,
++                },
++            )
++            .collect())
++    }
++
++    pub(in crate::passes) fn rebase_cached_null_images(
++        &mut self,
++        loads: &HashMap<Word, ImageShape>,
++    ) -> Result<(), String> {
++        if loads.is_empty() {
++            return Ok(());
++        }
++        let table = self.module.annotations.iter().find_map(|inst| match inst.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(672)] => Some(*id), _ => None,
++        }).ok_or("cached null image rebase needs token table")?;
++        let uint = self.ty_uint();
++        let zero = self.const_uint(0);
++        let pointer_ty = self.ty_ptr(StorageClass::StorageBuffer, uint);
++        for fi in 0..self.module.functions.len() {
++            for bi in 0..self.module.functions[fi].blocks.len() {
++                let mut body = Vec::new();
++                for mut inst in self.module.functions[fi].blocks[bi].instructions.clone() {
++                    if let Some((id, shape)) = inst
++                        .result_id
++                        .and_then(|id| loads.get(&id).map(|shape| (id, shape)))
++                    {
++                        let raw = self.module.fresh_id();
++                        inst.result_id = Some(raw);
++                        body.push(inst);
++                        let slot = self.const_uint(if shape.access == ImageAccess::Sampled {
++                            1
++                        } else {
++                            3
++                        });
++                        let pointer = self.module.fresh_id();
++                        body.push(Instruction::new(
++                            Op::AccessChain,
++                            Some(pointer_ty),
++                            Some(pointer),
++                            vec![
++                                Operand::IdRef(table),
++                                Operand::IdRef(zero),
++                                Operand::IdRef(slot),
++                            ],
++                        ));
++                        let count = self.module.fresh_id();
++                        body.push(Instruction::new(
++                            Op::Load,
++                            Some(uint),
++                            Some(count),
++                            vec![Operand::IdRef(pointer)],
++                        ));
++                        body.push(Instruction::new(
++                            Op::IAdd,
++                            Some(uint),
++                            Some(id),
++                            vec![Operand::IdRef(raw), Operand::IdRef(count)],
++                        ));
++                    } else {
++                        body.push(inst);
++                    }
++                }
++                self.module.functions[fi].blocks[bi].instructions = body;
++            }
++        }
++        Ok(())
++    }
++
++    pub(in crate::passes) fn null_descriptor_array(
++        &mut self,
++        shape: ImageShape,
++    ) -> Result<Word, String> {
++        shape.validate()?;
++        if self.descriptor_layout != crate::reflect::DescriptorLayout::default() {
++            return Err("ABI 9 null descriptors require the default descriptor layout".into());
++        }
++        if let Some(&var) = self.null_arrays.get(&shape) {
++            return Ok(var);
++        }
++        let image = self.ty_image_shape(shape);
++        let array = self.ty_runtime_array(image);
++        let pointer = self.ty_ptr(StorageClass::UniformConstant, array);
++        let var = self.module.fresh_id();
++        self.new_globals.push(Instruction::new(
++            Op::Variable,
++            Some(pointer),
++            Some(var),
++            vec![Operand::StorageClass(StorageClass::UniformConstant)],
++        ));
++        let set = match shape.access {
++            ImageAccess::Sampled | ImageAccess::UniformTexel => 2,
++            _ => 3,
++        };
++        decorate_binding(
++            &mut self.module,
++            var,
++            set,
++            u32::from(shape.access.is_texel()),
++        );
++        self.interface_buffer_var(var);
++        self.add_capability(spirv::Capability::RuntimeDescriptorArray);
++        if !self.module.extensions.iter().any(|inst| {
++            inst.operands == vec![Operand::LiteralString("SPV_EXT_descriptor_indexing".into())]
++        }) {
++            self.module.extensions.push(Instruction::new(
++                Op::Extension,
++                None,
++                None,
++                vec![Operand::LiteralString("SPV_EXT_descriptor_indexing".into())],
++            ));
++        }
++        if shape.access.is_texel() {
++            self.add_capability(if shape.access == ImageAccess::UniformTexel {
++                spirv::Capability::UniformTexelBufferArrayDynamicIndexing
++            } else {
++                spirv::Capability::StorageTexelBufferArrayDynamicIndexing
++            });
++            self.add_capability(if shape.access == ImageAccess::UniformTexel {
++                spirv::Capability::SampledBuffer
++            } else {
++                spirv::Capability::ImageBuffer
++            });
++        }
++        if shape.access == ImageAccess::Storage {
++            self.add_capability(spirv::Capability::StorageImageReadWithoutFormat);
++            self.add_capability(spirv::Capability::StorageImageWriteWithoutFormat);
++        }
++        self.null_arrays.insert(shape, var);
++        Ok(var)
++    }
++
++    pub(in crate::passes) fn null_descriptor_index(
++        &mut self,
++        shape: ImageShape,
++        table: Option<Word>,
++        out: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        shape.validate()?;
++        // This unique constant is relocated only after all lowering and global liveness finish.
++        let uint = self.ty_uint();
++        let slot = self.module.fresh_id();
++        self.new_globals.push(Instruction::new(
++            Op::Constant,
++            Some(uint),
++            Some(slot),
++            vec![Operand::LiteralBit32(0)],
++        ));
++        self.null_index_fixups.insert(slot, shape);
++        let metadata = self.sampler_coordinate_flags_var();
++        let zero = self.const_uint(0);
++        let pointer_ty = self.ty_ptr(StorageClass::StorageBuffer, uint);
++        let pointer = self.module.fresh_id();
++        out.push(Instruction::new(
++            Op::AccessChain,
++            Some(pointer_ty),
++            Some(pointer),
++            vec![
++                Operand::IdRef(metadata),
++                Operand::IdRef(zero),
++                Operand::IdRef(slot),
++            ],
++        ));
++        let index = self.module.fresh_id();
++        out.push(Instruction::new(
++            Op::Load,
++            Some(uint),
++            Some(index),
++            vec![Operand::IdRef(pointer)],
++        ));
++        if let Some(table) = table.filter(|_| !shape.access.is_texel()) {
++            let count_at = self.const_uint(if shape.access == ImageAccess::Sampled {
++                1
++            } else {
++                3
++            });
++            let count_ptr = self.module.fresh_id();
++            out.push(Instruction::new(
++                Op::AccessChain,
++                Some(pointer_ty),
++                Some(count_ptr),
++                vec![
++                    Operand::IdRef(table),
++                    Operand::IdRef(zero),
++                    Operand::IdRef(count_at),
++                ],
++            ));
++            let count = self.module.fresh_id();
++            out.push(Instruction::new(
++                Op::Load,
++                Some(uint),
++                Some(count),
++                vec![Operand::IdRef(count_ptr)],
++            ));
++            let tail = self.module.fresh_id();
++            out.push(Instruction::new(
++                Op::IAdd,
++                Some(uint),
++                Some(tail),
++                vec![Operand::IdRef(count), Operand::IdRef(index)],
++            ));
++            return Ok(tail);
++        }
++        Ok(index)
++    }
++}
++
++pub(super) fn finalize_null_shape_indices(ctx: &mut Ctx) -> Result<(), String> {
++    let live = ctx
++        .module
++        .all_inst_iter()
++        .filter_map(|inst| inst.result_id)
++        .collect::<HashSet<_>>();
++    let mut registry = NullShapeRegistry::default();
++    for (id, shape) in &ctx.null_index_fixups {
++        if live.contains(id) {
++            registry.register(*shape)?;
++        }
++    }
++    registry.validate()?;
++    let words = registry.all_words();
++    for inst in &mut ctx.module.types_global_values {
++        if let Some(shape) = inst.result_id.and_then(|id| ctx.null_index_fixups.get(&id)) {
++            let ordinal = words
++                .binary_search(&shape.canonical_word()?)
++                .map_err(|_| "missing final null shape")?;
++            inst.operands = vec![Operand::LiteralBit32(32 + ordinal as u32)];
++        }
++    }
++    ctx.null_shape_registry = registry;
++    Ok(())
++}
++
++pub(super) fn prune_dead_null_value_scaffolding(ctx: &mut Ctx) {
++    let mut candidates = ctx
++        .image_facts
++        .iter()
++        .filter_map(|(id, fact)| {
++            (!matches!(
++                fact.nullness,
++                ImageNullPredicate::KnownIsNull(false) | ImageNullPredicate::Unknown
++            ))
++            .then_some(*id)
++        })
++        .collect::<HashSet<_>>();
++    candidates.extend(ctx.null_image_values.iter().copied());
++    loop {
++        let used = ctx
++            .module
++            .functions
++            .iter()
++            .flat_map(|function| function.all_inst_iter())
++            .flat_map(|inst| &inst.operands)
++            .filter_map(|operand| match operand {
++                Operand::IdRef(id) => Some(*id),
++                _ => None,
++            })
++            .collect::<HashSet<_>>();
++        let mut retired = HashSet::new();
++        let mut dependencies = HashSet::new();
++        for function in &mut ctx.module.functions {
++            for block in &mut function.blocks {
++                block.instructions.retain(|inst| {
++                    let dead = inst
++                        .result_id
++                        .is_some_and(|id| candidates.contains(&id) && !used.contains(&id))
++                        && matches!(
++                            inst.class.opcode,
++                            Op::Load
++                                | Op::CopyObject
++                                | Op::Bitcast
++                                | Op::Select
++                                | Op::Phi
++                                | Op::AccessChain
++                                | Op::InBoundsAccessChain
++                                | Op::IAdd
++                        );
++                    if dead {
++                        retired.extend(inst.result_id);
++                        dependencies.extend(inst.operands.iter().filter_map(
++                            |operand| match operand {
++                                Operand::IdRef(id) => Some(*id),
++                                _ => None,
++                            },
++                        ));
++                    }
++                    !dead
++                });
++            }
++        }
++        if retired.is_empty() {
++            break;
++        }
++        candidates.extend(dependencies.into_iter().filter(|id| {
++            !ctx.image_facts
++                .get(id)
++                .is_some_and(|fact| matches!(fact.nullness, ImageNullPredicate::KnownIsNull(false)))
++        }));
++        for list in [&mut ctx.module.annotations, &mut ctx.module.debug_names] {
++            list.retain(|inst| !matches!(inst.operands.first(), Some(Operand::IdRef(id)) if retired.contains(id)));
++        }
++    }
++}
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -58,6 +58,7 @@
+ 
+ /// Allocate one translator-owned null-image descriptor inside the texture ABI band. It must never
+ /// use a sampler/color-input binding merely because those bands contain the global high-water mark.
++#[cfg(test)]
+ pub(in crate::passes) fn allocate_default_texture_binding(
+     module: &Module,
+     layout: DescriptorLayout,
+@@ -199,6 +200,10 @@
+             _ => {}
+         }
+     }
++
++    let coordinate_metadata = bindings
++        .iter()
++        .any(|(id, binding)| *binding == 674 && sets.get(id) == Some(&0));
+ 
+     fn classify(
+         definitions: &HashMap<Word, &Instruction>,
+@@ -333,7 +338,16 @@
+         let coordinate_flags = set == layout.set
+             && binding == crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING
+             && class == DescriptorClass::StorageBuffer;
+-        if !graph_binding && !coordinate_flags && (set != layout.set || !allowed) {
++        let null_array = coordinate_metadata
++            && runtime
++            && matches!(
++                (set, binding, class),
++                (2, 0, DescriptorClass::SampledImage)
++                    | (3, 0, DescriptorClass::StorageImage)
++                    | (2, 1, DescriptorClass::UniformTexelBuffer)
++                    | (3, 1, DescriptorClass::StorageTexelBuffer)
++            );
++        if !graph_binding && !null_array && !coordinate_flags && (set != layout.set || !allowed) {
+             return Err(format!(
+                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
+                 label(id)
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -1892,51 +1892,6 @@
+ mod tests {
+     use super::*;
+     use crate::spirv_module::ModuleHeader;
+-
+-    #[test]
+-    fn sampler_binding_preserves_the_optional_abi8_coordinate_word() {
+-        for coordinate_word in [None, Some(3)] {
+-            let mut module = Module::new();
+-            module.header = Some(ModuleHeader::new(100));
+-            module.functions.push(Function {
+-                def: None,
+-                parameters: vec![],
+-                blocks: vec![Block {
+-                    label: Some(Instruction::new(Op::Label, None, Some(30), vec![])),
+-                    instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
+-                }],
+-                end: None,
+-            });
+-            let mut ctx = Ctx::new(module);
+-            apply_bindings(
+-                &mut ctx,
+-                0,
+-                vec![(
+-                    10,
+-                    ParamBinding::Sampler {
+-                        var: 20,
+-                        specialized_state: None,
+-                        coordinate_word,
+-                    },
+-                )],
+-                &[],
+-                &HashMap::new(),
+-            )
+-            .unwrap();
+-            let loaded_sampler = ctx.module.functions[0].blocks[0]
+-                .instructions
+-                .iter()
+-                .find(|inst| inst.class.opcode == Op::Load && inst.operands == [Operand::IdRef(20)])
+-                .and_then(|inst| inst.result_id)
+-                .expect("sampler binding must materialize a descriptor load");
+-            assert_eq!(
+-                ctx.sampler_coordinate_sources.get(&loaded_sampler),
+-                coordinate_word
+-                    .map(crate::passes::SamplerCoordinateSource::RuntimeWord)
+-                    .as_ref(),
+-            );
+-        }
+-    }
+ 
+     /// Builds `base -> insert A at path_a -> insert B at path_b -> insert plain at [3]`, where each
+     /// resource insert carries an opaque placeholder object (as the emitter does, with the real
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -571,6 +571,7 @@
+                 depth,
+                 comp,
+                 multisampled,
++                access: ImageAccess::Sampled,
+             };
+             // Let a suffix-derived integer use refine a provisional Float classification from an
+             // earlier ambiguous query. Valid Metal does not mix float and integer texel views for the
+@@ -833,6 +834,7 @@
+         depth: shape.depth,
+         comp: shape.component.to_image_comp(),
+         multisampled: shape.multisampled,
++        access: ImageAccess::Sampled,
+     }
+ }
+ 
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -1197,6 +1197,44 @@
+                             Operand::IdRef(category),
+                         ],
+                     );
++                    let token_index = index;
++                    let index = if let Some(shape) = shape {
++                        let shape = super::super::ImageShape {
++                            dim: shape.dim,
++                            arrayed: shape.arrayed,
++                            depth: shape.depth,
++                            comp: shape.comp,
++                            multisampled: shape.multisampled,
++                            access: if shape.storage {
++                                ImageAccess::Storage
++                            } else {
++                                ImageAccess::Sampled
++                            },
++                        };
++                        let dummy = ctx.null_descriptor_index(shape, Some(table), &mut body)?;
++                        let zero = ctx.const_uint(0);
++                        let boolean = ctx.ty_bool();
++                        let missing = value(
++                            ctx,
++                            &mut body,
++                            Op::IEqual,
++                            boolean,
++                            vec![Operand::IdRef(token_index), Operand::IdRef(zero)],
++                        );
++                        value(
++                            ctx,
++                            &mut body,
++                            Op::Select,
++                            uint,
++                            vec![
++                                Operand::IdRef(missing),
++                                Operand::IdRef(dummy),
++                                Operand::IdRef(token_index),
++                            ],
++                        )
++                    } else {
++                        index
++                    };
+                     let pointer_ty = ctx.ty_ptr(StorageClass::UniformConstant, element);
+                     let pointer = value(
+                         ctx,
+@@ -1216,7 +1254,7 @@
+                         loaded,
+                         SampledDescriptorAccess {
+                             category: category_number,
+-                            token_index: index,
++                            token_index,
+                             physical_index: index,
+                             shape: shape.map(|shape| SampledDescriptorShape {
+                                 dim: shape.dim,
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -52,34 +52,73 @@
+     )
+ }
+ 
+-/// Lower an explicit GPU argument table ABI with an optional cached typed-uniformity proof.
+-///
+-/// The proof is scoped to the exact serialized module by the wrapper before this entry point. It
+-/// seeds only `air.is_uniform` facts; descriptor representation and normalized-sampler coordinate
+-/// selection remain controlled by `table_version`.
++/// Lower a historical table contract with its hash-verified uniformity proof.
+ pub fn lower_argument_resource_tables_with_table_version_and_uniform_control_proof(
+     bytes: &[u8],
+     fields: &[ArgumentResourceField],
+     table_version: u32,
+     proof: Option<&UniformControlProof>,
+ ) -> Result<Vec<u8>, String> {
+-    if !matches!(table_version, 7 | 8) {
++    lower_argument_resource_tables_versioned(
++        bytes,
++        fields,
++        table_version,
++        table_version == 8,
++        &[],
++        proof,
++    )
++    .map(|result| result.0)
++}
++
++/// ABI 9 preserves the explicit coordinate option independently from the null registry.
++pub fn lower_argument_resource_tables_versioned(
++    bytes: &[u8],
++    fields: &[ArgumentResourceField],
++    table_version: u32,
++    normalized: bool,
++    null_shapes: &[u32],
++    proof: Option<&UniformControlProof>,
++) -> Result<(Vec<u8>, Vec<u32>, bool), String> {
++    if !matches!(table_version, 7..=9) {
+         return Err(format!(
+             "unsupported GPU argument table version {table_version}"
+         ));
+     }
++    if table_version != 9 && normalized != (table_version == 8) {
++        return Err("table and coordinate versions disagree".into());
++    }
++    if null_shapes.len() > 64 || null_shapes.windows(2).any(|pair| pair[0] >= pair[1]) {
++        return Err("invalid ABI 9 null shape registry ordering or extent".into());
++    }
++    if table_version != 9 && !null_shapes.is_empty() {
++        return Err("null registry requires ABI 9".into());
++    }
++    for word in null_shapes {
++        super::super::validate_canonical_null_shape_word(*word)?;
++    }
+     if fields.is_empty() {
+-        return Ok(bytes.to_vec());
++        return Ok((bytes.to_vec(), null_shapes.to_vec(), false));
+     }
+     let module = crate::spirv_module::load_bytes(bytes)
+         .map_err(|error| format!("argument resource SPIR-V: {error:?}"))?;
+     let sidecar = uniform_control_sidecar(&module, proof)?;
+     let options = TransformOptions {
+-        normalized_sampler_coordinates: table_version >= 8,
++        normalized_sampler_coordinates: normalized,
+         ..TransformOptions::default()
+     };
+     let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, Stage::Kernel, options);
+-    lower(&mut ctx, fields, table_version)?;
++    let rebase = if table_version == 9 {
++        ctx.restore_null_shape_indices(null_shapes)?
++    } else {
++        HashMap::new()
++    };
++    lower(
++        &mut ctx,
++        fields,
++        if normalized { 8 } else { 7 },
++        table_version == 9,
++    )?;
++    ctx.rebase_cached_null_images(&rebase)?;
+     super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
+     super::null_sampling::protect_argument_sampling(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+@@ -92,13 +131,31 @@
+     super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
+     super::quad_sampling::lower_argument_implicit_lod(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
++    if table_version == 9 {
++        super::super::null_shapes::finalize_null_shape_indices(&mut ctx)?;
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++    }
++    let null_shapes = ctx.null_shape_registry.all_words();
++    let has_metadata = ctx.module.annotations.iter().any(|inst| {
++        matches!(
++            inst.operands.as_slice(),
++            [
++                _,
++                Operand::Decoration(Decoration::Binding),
++                Operand::LiteralBit32(674)
++            ]
++        )
++    });
+     super::super::canonicalize_ids(&mut ctx.module);
+-    Ok(ctx
+-        .module
+-        .assemble()
+-        .iter()
+-        .flat_map(|word| word.to_le_bytes())
+-        .collect())
++    Ok((
++        ctx.module
++            .assemble()
++            .iter()
++            .flat_map(|word| word.to_le_bytes())
++            .collect(),
++        null_shapes,
++        has_metadata,
++    ))
+ }
+ 
+ fn uniform_control_sidecar(
+@@ -227,6 +284,9 @@
+             let Some(word) = constant_word(defs, *word_index) else {
+                 return Err("ABI 8 sampler-coordinate flag index is not constant".into());
+             };
++            if word >= 32 {
++                continue;
++            }
+             let Some(pointer) = instruction.result_id else {
+                 return Err("ABI 8 sampler-coordinate flag projection has no result".into());
+             };
+@@ -358,6 +418,7 @@
+     ctx: &mut Ctx,
+     fields: &[ArgumentResourceField],
+     table_version: u32,
++    abi9: bool,
+ ) -> Result<(), String> {
+     let defs = type_defs(&ctx.module);
+     let mut sets = HashMap::new();
+@@ -378,7 +439,7 @@
+             _ => {}
+         }
+     }
+-    if sets.values().any(|set| *set >= ARGUMENT_RESOURCE_FIRST_SET) {
++    if !abi9 && sets.values().any(|set| *set >= ARGUMENT_RESOURCE_FIRST_SET) {
+         return Err("GPU argument resource sets 2..4 are already occupied".into());
+     }
+     if bindings.iter().any(|(id, binding)| {
+@@ -388,6 +449,11 @@
+                     .contains(binding))
+     }) {
+         return Err("GPU argument table/root bindings are already occupied".into());
++    }
++    if abi9 {
++        ctx.sampler_coordinate_flags_var = bindings.iter().find_map(|(&id, &binding)| {
++            (binding == 674 && sets.get(&id) == Some(&0)).then_some(id)
++        });
+     }
+     let coordinate_flags = (table_version >= 8)
+         .then(|| {
+@@ -650,12 +716,38 @@
+                                 Operand::IdRef(category),
+                             ],
+                         );
++                        let token_index = selected;
++                        let selected = if abi9 && resource.category < 2 {
++                            let shape = ctx.null_shape_from_type(resource.element)?;
++                            let dummy = ctx.null_descriptor_index(shape, Some(table), &mut body)?;
++                            let boolean = ctx.ty_bool();
++                            let missing = value(
++                                ctx,
++                                &mut body,
++                                Op::IEqual,
++                                boolean,
++                                vec![Operand::IdRef(token_index), Operand::IdRef(zero)],
++                            );
++                            value(
++                                ctx,
++                                &mut body,
++                                Op::Select,
++                                uint,
++                                vec![
++                                    Operand::IdRef(missing),
++                                    Operand::IdRef(dummy),
++                                    Operand::IdRef(token_index),
++                                ],
++                            )
++                        } else {
++                            selected
++                        };
+                         if let Some(old) = inst.result_id {
+                             ctx.sampled_descriptor_accesses.insert(
+                                 old,
+                                 SampledDescriptorAccess {
+                                     category: resource.category,
+-                                    token_index: index,
++                                    token_index,
+                                     physical_index: selected,
+                                     shape: None,
+                                 },
+@@ -775,7 +867,7 @@
+     }
+     crate::native::eliminate_dead_values_module(&mut ctx.module, &HashSet::new());
+     super::super::module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
+-    if let Some(flags) = coordinate_flags {
++    if let Some(flags) = coordinate_flags.filter(|_| !abi9) {
+         if ctx.module.all_inst_iter().any(|inst| {
+             inst.operands
+                 .iter()
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -27,7 +27,8 @@
+ pub(in crate::passes) use gpu_argument_graph::lower_argument_resource_graph;
+ pub(in crate::passes) use gpu_arguments::table_sampler_flag_word;
+ pub use gpu_arguments::{
+-    lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    lower_argument_resource_tables, lower_argument_resource_tables_versioned,
++    lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+     ARGUMENT_RESOURCE_TABLE_BINDING,
+--- a/src/passes/resources/null_sampling.rs
++++ b/src/passes/resources/null_sampling.rs
+@@ -4,6 +4,9 @@
+ use spirv::Decoration;
+ 
+ pub(in crate::passes) fn protect_argument_sampling(ctx: &mut Ctx) -> Result<(), String> {
++    if ctx.null_index_fixups.is_empty() {
++        return protect_legacy_argument_sampling(ctx);
++    }
+     let defs = ctx
+         .module
+         .all_inst_iter()
+@@ -25,12 +28,6 @@
+             _ => {}
+         }
+     }
+-    let Some(table) = bindings
+-        .iter()
+-        .find_map(|(&id, &binding)| (binding == 672 && sets.get(&id) == Some(&0)).then_some(id))
+-    else {
+-        return Ok(());
+-    };
+     let mut arrays = HashMap::new();
+     for (&id, &set) in &sets {
+         if set != 2 || bindings.get(&id) != Some(&0) {
+@@ -96,7 +93,17 @@
+                 }
+                 (Op::Load, [Operand::IdRef(pointer)]) => {
+                     if let Some(&index) = pointers.get(pointer) {
+-                        images.insert(id, index);
++                        let token = ctx
++                            .sampled_descriptor_accesses
++                            .get(&id)
++                            .map(|access| access.token_index)
++                            .unwrap_or(index);
++                        let token = if ctx.null_image_values.contains(&id) {
++                            ctx.const_uint(0)
++                        } else {
++                            token
++                        };
++                        images.insert(id, token);
+                     }
+                 }
+                 (
+@@ -114,11 +121,8 @@
+             break;
+         }
+     }
+-    let uint = ctx.ty_uint();
+     let boolean = ctx.ty_bool();
+     let zero = ctx.const_uint(0);
+-    let one = ctx.const_uint(1);
+-    let word_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+     for function in 0..ctx.module.functions.len() {
+         for block in 0..ctx.module.functions[function].blocks.len() {
+             let old = ctx.module.functions[function].blocks[block]
+@@ -126,50 +130,6 @@
+                 .clone();
+             let mut body = Vec::with_capacity(old.len());
+             for mut inst in old {
+-                if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
+-                    if let [Operand::IdRef(array), Operand::IdRef(index)] = inst.operands.as_slice()
+-                    {
+-                        if let Some(&shape) = arrays.get(array) {
+-                            let index = *index;
+-                            let count = super::gpu_arguments::load_word(
+-                                ctx,
+-                                &mut body,
+-                                table,
+-                                word_pointer,
+-                                uint,
+-                                zero,
+-                                one,
+-                            );
+-                            let shape = ctx.const_uint(shape);
+-                            let tail = super::gpu_arguments::value(
+-                                ctx,
+-                                &mut body,
+-                                Op::IAdd,
+-                                uint,
+-                                vec![Operand::IdRef(count), Operand::IdRef(shape)],
+-                            );
+-                            let null = super::gpu_arguments::value(
+-                                ctx,
+-                                &mut body,
+-                                Op::IEqual,
+-                                boolean,
+-                                vec![Operand::IdRef(index), Operand::IdRef(zero)],
+-                            );
+-                            let selected = super::gpu_arguments::value(
+-                                ctx,
+-                                &mut body,
+-                                Op::Select,
+-                                uint,
+-                                vec![
+-                                    Operand::IdRef(null),
+-                                    Operand::IdRef(tail),
+-                                    Operand::IdRef(index),
+-                                ],
+-                            );
+-                            inst.operands[1] = Operand::IdRef(selected);
+-                        }
+-                    }
+-                }
+                 let sampling = matches!(
+                     inst.class.opcode,
+                     Op::ImageSampleImplicitLod
+@@ -238,3 +198,239 @@
+     }
+     Ok(())
+ }
++
++fn protect_legacy_argument_sampling(ctx: &mut Ctx) -> Result<(), String> {
++    let defs = ctx
++        .module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
++        .collect::<HashMap<_, _>>();
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for inst in &ctx.module.annotations {
++        match inst.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    let Some(table) = bindings
++        .iter()
++        .find_map(|(&id, &binding)| (binding == 672 && sets.get(&id) == Some(&0)).then_some(id))
++    else {
++        return Ok(());
++    };
++    let mut arrays = HashMap::new();
++    for (&id, &set) in &sets {
++        if set != 2 || bindings.get(&id) != Some(&0) {
++            continue;
++        }
++        let image = defs
++            .get(&id)
++            .and_then(|var| var.result_type)
++            .and_then(|ty| defs.get(&ty))
++            .and_then(|ptr| ptr.operands.get(1))
++            .and_then(|op| match op {
++                Operand::IdRef(id) => defs.get(id),
++                _ => None,
++            })
++            .filter(|array| array.class.opcode == Op::TypeRuntimeArray)
++            .and_then(|array| array.operands.first())
++            .and_then(|op| match op {
++                Operand::IdRef(id) => defs.get(id),
++                _ => None,
++            });
++        let Some(image) = image else { continue };
++        let [Operand::IdRef(sampled), Operand::Dim(dim), Operand::LiteralBit32(depth), Operand::LiteralBit32(arrayed), Operand::LiteralBit32(0), Operand::LiteralBit32(1), ..] =
++            image.operands.as_slice()
++        else {
++            continue;
++        };
++        if *dim as u32 > 3 || *depth > 1 || *arrayed > 1 {
++            continue;
++        }
++        let component = match defs
++            .get(sampled)
++            .map(|ty| (ty.class.opcode, ty.operands.as_slice()))
++        {
++            Some((Op::TypeFloat, [Operand::LiteralBit32(32)])) => 0,
++            Some((Op::TypeInt, [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]))
++                if *depth == 0 =>
++            {
++                1
++            }
++            Some((Op::TypeInt, [Operand::LiteralBit32(32), Operand::LiteralBit32(1)]))
++                if *depth == 0 =>
++            {
++                2
++            }
++            _ => continue,
++        };
++        arrays.insert(id, (*dim as u32 * 2 + arrayed) + 8 * depth + 16 * component);
++    }
++    if arrays.is_empty() {
++        return Ok(());
++    }
++    let mut pointers = HashMap::new();
++    let mut images = HashMap::new();
++    loop {
++        let before = (pointers.len(), images.len());
++        for (&id, inst) in &defs {
++            match (inst.class.opcode, inst.operands.as_slice()) {
++                (
++                    Op::AccessChain | Op::InBoundsAccessChain,
++                    [Operand::IdRef(array), Operand::IdRef(index)],
++                ) if arrays.contains_key(array) => {
++                    pointers.insert(id, *index);
++                }
++                (Op::Load, [Operand::IdRef(pointer)]) => {
++                    if let Some(&index) = pointers.get(pointer) {
++                        images.insert(id, index);
++                    }
++                }
++                (
++                    Op::CopyObject | Op::Bitcast | Op::Image | Op::SampledImage,
++                    [Operand::IdRef(source), ..],
++                ) => {
++                    if let Some(&index) = images.get(source) {
++                        images.insert(id, index);
++                    }
++                }
++                _ => {}
++            }
++        }
++        if before == (pointers.len(), images.len()) {
++            break;
++        }
++    }
++    let uint = ctx.ty_uint();
++    let boolean = ctx.ty_bool();
++    let zero = ctx.const_uint(0);
++    let one = ctx.const_uint(1);
++    let word_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    for function in 0..ctx.module.functions.len() {
++        for block in 0..ctx.module.functions[function].blocks.len() {
++            let old = ctx.module.functions[function].blocks[block]
++                .instructions
++                .clone();
++            let mut body = Vec::with_capacity(old.len());
++            for mut inst in old {
++                if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
++                    if let [Operand::IdRef(array), Operand::IdRef(index)] = inst.operands.as_slice()
++                    {
++                        if let Some(&shape) = arrays.get(array) {
++                            let index = *index;
++                            let count = super::gpu_arguments::load_word(
++                                ctx,
++                                &mut body,
++                                table,
++                                word_pointer,
++                                uint,
++                                zero,
++                                one,
++                            );
++                            let shape = ctx.const_uint(shape);
++                            let tail = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::IAdd,
++                                uint,
++                                vec![Operand::IdRef(count), Operand::IdRef(shape)],
++                            );
++                            let null = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::IEqual,
++                                boolean,
++                                vec![Operand::IdRef(index), Operand::IdRef(zero)],
++                            );
++                            let selected = super::gpu_arguments::value(
++                                ctx,
++                                &mut body,
++                                Op::Select,
++                                uint,
++                                vec![
++                                    Operand::IdRef(null),
++                                    Operand::IdRef(tail),
++                                    Operand::IdRef(index),
++                                ],
++                            );
++                            inst.operands[1] = Operand::IdRef(selected);
++                        }
++                    }
++                }
++                let sampling = matches!(
++                    inst.class.opcode,
++                    Op::ImageSampleImplicitLod
++                        | Op::ImageSampleExplicitLod
++                        | Op::ImageSampleDrefImplicitLod
++                        | Op::ImageSampleDrefExplicitLod
++                        | Op::ImageSampleProjImplicitLod
++                        | Op::ImageSampleProjExplicitLod
++                        | Op::ImageSampleProjDrefImplicitLod
++                        | Op::ImageSampleProjDrefExplicitLod
++                        | Op::ImageGather
++                        | Op::ImageDrefGather
++                        | Op::ImageQueryLod
++                );
++                let source = inst.operands.first().and_then(|op| match op {
++                    Operand::IdRef(id) => images.get(id).copied(),
++                    _ => None,
++                });
++                if sampling {
++                    if let (Some(index), Some(result), Some(ty)) =
++                        (source, inst.result_id, inst.result_type)
++                    {
++                        let mut null = super::gpu_arguments::value(
++                            ctx,
++                            &mut body,
++                            Op::IEqual,
++                            boolean,
++                            vec![Operand::IdRef(index), Operand::IdRef(zero)],
++                        );
++                        if let Some(def) = defs
++                            .get(&ty)
++                            .filter(|def| def.class.opcode == Op::TypeVector)
++                        {
++                            if let [_, Operand::LiteralBit32(count)] = def.operands.as_slice() {
++                                let bools = ctx.ty_vec_bool(*count);
++                                null = super::gpu_arguments::value(
++                                    ctx,
++                                    &mut body,
++                                    Op::CompositeConstruct,
++                                    bools,
++                                    vec![Operand::IdRef(null); *count as usize],
++                                );
++                            }
++                        }
++                        let actual = ctx.module.fresh_id();
++                        inst.result_id = Some(actual);
++                        body.push(inst);
++                        let zero_result = ctx.const_null(ty);
++                        body.push(Instruction::new(
++                            Op::Select,
++                            Some(ty),
++                            Some(result),
++                            vec![
++                                Operand::IdRef(null),
++                                Operand::IdRef(zero_result),
++                                Operand::IdRef(actual),
++                            ],
++                        ));
++                        continue;
++                    }
++                }
++                body.push(inst);
++            }
++            ctx.module.functions[function].blocks[block].instructions = body;
++        }
++    }
++    Ok(())
++}
+--- a/src/passes/resources/null_texels.rs
++++ b/src/passes/resources/null_texels.rs
+@@ -9,6 +9,7 @@
+     array: Word,
+     element: Word,
+     index: Word,
++    physical_index: Word,
+ }
+ 
+ pub(in crate::passes) fn guard_argument_texel_accesses(ctx: &mut Ctx) -> Result<(), String> {
+@@ -27,12 +28,6 @@
+             _ => {}
+         }
+     }
+-    if !bindings
+-        .iter()
+-        .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0))
+-    {
+-        return Ok(());
+-    }
+     let defs = ctx
+         .module
+         .all_inst_iter()
+@@ -41,7 +36,7 @@
+         .collect::<HashMap<_, _>>();
+     let mut arrays = HashMap::new();
+     for (&id, &set) in &sets {
+-        if !matches!(set, 2 | 3) || bindings.get(&id) != Some(&0) {
++        if !matches!(set, 2 | 3) || !matches!(bindings.get(&id), Some(0 | 1)) {
+             continue;
+         }
+         let Some(pointer) = defs
+@@ -85,13 +80,25 @@
+                             Image {
+                                 array: *array,
+                                 element,
+-                                index: *index,
++                                index: if bindings.get(array) == Some(&1) {
++                                    ctx.const_uint(0)
++                                } else {
++                                    *index
++                                },
++                                physical_index: *index,
+                             },
+                         );
+                     }
+                 }
+                 (Op::Load, [Operand::IdRef(pointer)]) => {
+                     if let Some(&image) = paths.get(pointer) {
++                        let mut image = image;
++                        if let Some(access) = ctx.sampled_descriptor_accesses.get(&id) {
++                            image.index = access.token_index;
++                        }
++                        if ctx.null_image_values.contains(&id) {
++                            image.index = ctx.const_uint(0);
++                        }
+                         images.insert(id, image);
+                     }
+                 }
+@@ -195,7 +202,11 @@
+     let boolean = ctx.ty_bool();
+     let zero = ctx.const_uint(0);
+     let result_ty = inst.result_type.unwrap_or_else(|| ctx.ty_void());
+-    let mut types = vec![Operand::IdRef(result_ty), Operand::IdRef(uint)];
++    let mut types = vec![
++        Operand::IdRef(result_ty),
++        Operand::IdRef(uint),
++        Operand::IdRef(uint),
++    ];
+     let index = ctx.module.fresh_id();
+     let mut parameters = vec![Instruction::new(
+         Op::FunctionParameter,
+@@ -203,7 +214,17 @@
+         Some(index),
+         vec![],
+     )];
+-    let mut arguments = vec![Operand::IdRef(image.index)];
++    let physical_index = ctx.module.fresh_id();
++    parameters.push(Instruction::new(
++        Op::FunctionParameter,
++        Some(uint),
++        Some(physical_index),
++        vec![],
++    ));
++    let mut arguments = vec![
++        Operand::IdRef(image.index),
++        Operand::IdRef(image.physical_index),
++    ];
+     let mut operation = inst.clone();
+     for operand in operation.operands.iter_mut().skip(1) {
+         if let Operand::IdRef(id) = operand {
+@@ -282,7 +303,7 @@
+             Op::AccessChain,
+             Some(pointer_ty),
+             Some(pointer),
+-            vec![Operand::IdRef(image.array), Operand::IdRef(index)],
++            vec![Operand::IdRef(image.array), Operand::IdRef(physical_index)],
+         ),
+         Instruction::new(
+             Op::Load,
+--- a/src/passes/stage_input/layout.rs
++++ b/src/passes/stage_input/layout.rs
+@@ -95,29 +95,6 @@
+         let sty = self.ty_sampler();
+         let var = self.placeholder_descriptor(sty, binding);
+         self.default_sampler_var = Some(var);
+-        Ok(var)
+-    }
+-
+-    /// Lazily create a default (null) 2D float texture resource for `air.get_null_texture_2d()`.
+-    /// Metal's `[[function_constant]]`-gated optional attachments resolve (with our FCs folded off) to
+-    /// a "null texture" the shader still threads through phis and may sample (yielding 0). We bind one
+-    /// real `OpTypeImage` 2D-float UniformConstant variable in a free texture-ABI binding and load it;
+-    /// sampling it is valid (reads as the unbound-descriptor default). Memoized across all uses so the
+-    /// phi-merged values share one image id and type.
+-    pub(in crate::passes) fn default_null_image_of(
+-        &mut self,
+-        dim: Dim,
+-        arrayed: bool,
+-    ) -> Result<Word, String> {
+-        if let Some(&v) = self.default_null_image_vars.get(&(dim, arrayed)) {
+-            return Ok(v);
+-        }
+-        let layout = self.descriptor_layout;
+-        let binding = allocate_default_texture_binding(&self.module, layout)
+-            .ok_or_else(|| "no free texture binding for synthesized null image".to_string())?;
+-        let img_ty = self.ty_image(dim, arrayed, ImageComp::Float);
+-        let var = self.placeholder_descriptor(img_ty, binding);
+-        self.default_null_image_vars.insert((dim, arrayed), var);
+         Ok(var)
+     }
+ 
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -857,6 +857,7 @@
+                             depth: false,
+                             comp: ImageComp::Float,
+                             multisampled: false,
++                            access: ImageAccess::Sampled,
+                         });
+                     (
+                         ctx.ty_image_ms(
+@@ -957,6 +958,7 @@
+                     depth: false,
+                     comp: ImageComp::Float,
+                     multisampled: false,
++                    access: ImageAccess::Sampled,
+                 });
+             let image_ty = ctx.ty_image_ms(
+                 shape.dim,
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -211,7 +211,7 @@
+ /// v64 adds the ABI 8 sampler-coordinate contract: dynamic direct samplers read a stage-local
+ /// 32-word flag SSBO at binding 674, GPU argument-table version 8 appends one flag word per sampler
+ /// token, and static pixel samplers use normalized coordinate conversion in shader code.
+-pub const REFLECTION_VERSION: u32 = 64;
++pub const REFLECTION_VERSION: u32 = 65;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -828,6 +828,8 @@
+     /// ordinary binding is `SAMPLER_BINDING_BASE + n`; the matching comparison binding maps to the
+     /// same word. Bit zero means normalized coordinates.
+     SamplerCoordinateFlags,
++    /// ABI 9 readonly sampler flags followed by 64 stage-local null-shape remap words.
++    StageResourceMetadata,
+     /// A placeholder sampled image the translator binds for `air.get_null_texture_*()`, at the first
+     /// binding in the sampled-texture band no Metal texture claims.
+     ///
+@@ -1948,6 +1950,9 @@
+ }
+ 
+ /// GPU token-table and descriptor-array ABI for a nested argument resource graph.
++pub const ARGUMENT_RESOURCE_NULL_SHAPES_VERSION: u32 = 9;
++pub const ARGUMENT_RESOURCE_NULL_SHAPES_MAX: usize = 64;
++
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct ArgumentResourceTables {
+     pub version: u32,
+@@ -1960,6 +1965,9 @@
+     pub comparison_sampler: bool,
+     /// ABI 3 aliases the token table at this binding to read exact resource dimensions.
+     pub image_query_binding: Option<u32>,
++    /// ABI 9 canonical image-shape words for null dummies. The list is strictly ascending over the
++    /// full 32-bit word and must be present (possibly empty) for version 9.
++    pub null_shapes: Vec<u32>,
+ }
+ 
+ #[cfg(feature = "serde")]
+@@ -1970,7 +1978,14 @@
+     {
+         use serde::ser::SerializeStruct;
+ 
+-        let mut state = serializer.serialize_struct("ArgumentResourceTables", 5)?;
++        let mut state = serializer.serialize_struct(
++            "ArgumentResourceTables",
++            if self.version >= ARGUMENT_RESOURCE_NULL_SHAPES_VERSION {
++                6
++            } else {
++                5
++            },
++        )?;
+         state.serialize_field("version", &self.version)?;
+         state.serialize_field("table_binding", &self.table_binding)?;
+         state.serialize_field("categories", &self.categories)?;
+@@ -1979,6 +1994,9 @@
+         }
+         if self.image_query_binding.is_some() {
+             state.serialize_field("image_query_binding", &self.image_query_binding)?;
++        }
++        if self.version >= ARGUMENT_RESOURCE_NULL_SHAPES_VERSION {
++            state.serialize_field("null_shapes", &self.null_shapes)?;
+         }
+         state.end()
+     }
+@@ -1997,9 +2015,16 @@
+             categories: Vec<u32>,
+             comparison_sampler: Option<bool>,
+             image_query_binding: Option<u32>,
++            null_shapes: Option<Vec<u32>>,
+         }
+ 
+         let wire = Wire::deserialize(deserializer)?;
++        if wire.version > ARGUMENT_RESOURCE_NULL_SHAPES_VERSION {
++            return Err(serde::de::Error::custom(format!(
++                "unknown argument_resource_tables version {}",
++                wire.version
++            )));
++        }
+         let comparison_sampler = match (wire.version, wire.comparison_sampler) {
+             (7.., Some(value)) => value,
+             (7.., None) => {
+@@ -2012,14 +2037,49 @@
+                 ));
+             }
+         };
++        let null_shapes = match (
++            wire.version >= ARGUMENT_RESOURCE_NULL_SHAPES_VERSION,
++            wire.null_shapes,
++        ) {
++            (true, Some(words)) => words,
++            (true, None) => {
++                return Err(serde::de::Error::missing_field("null_shapes"));
++            }
++            (false, None) => Vec::new(),
++            (false, Some(_)) => {
++                return Err(serde::de::Error::custom(
++                    "null_shapes is not valid before table version 9",
++                ));
++            }
++        };
++        validate_null_shapes(&null_shapes).map_err(serde::de::Error::custom)?;
+         Ok(Self {
+             version: wire.version,
+             table_binding: wire.table_binding,
+             categories: wire.categories,
+             comparison_sampler,
+             image_query_binding: wire.image_query_binding,
++            null_shapes,
+         })
+     }
++}
++
++fn validate_null_shapes(words: &[u32]) -> Result<(), String> {
++    if words.len() > ARGUMENT_RESOURCE_NULL_SHAPES_MAX {
++        return Err(format!(
++            "ABI-9 null_shapes has {} entries, exceeding the {ARGUMENT_RESOURCE_NULL_SHAPES_MAX}-entry limit",
++            words.len()
++        ));
++    }
++    let mut previous = None;
++    for &word in words {
++        crate::passes::validate_canonical_null_shape_word(word)?;
++        if previous.is_some_and(|previous| word <= previous) {
++            return Err("ABI-9 null_shapes must be strictly ascending with no duplicates".into());
++        }
++        previous = Some(word);
++    }
++    Ok(())
+ }
+ 
+ /// Consumer-shaped reflection of one translated shader.
+@@ -2115,7 +2175,8 @@
+         &mut self,
+         module: &Module,
+         normalized_sampler_coordinates: bool,
+-    ) {
++        null_shapes: &[u32],
++    ) -> Result<(), String> {
+         use crate::spirv_module::Operand;
+         use std::collections::HashMap;
+         let mut sets = HashMap::new();
+@@ -2136,11 +2197,14 @@
+                 _ => {}
+             }
+         }
+-        if !bindings
++        let has_table = bindings
+             .iter()
+-            .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0))
+-        {
+-            return;
++            .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0));
++        let has_metadata = bindings
++            .iter()
++            .any(|(id, binding)| *binding == 674 && sets.get(id) == Some(&0));
++        if !has_table && !has_metadata && null_shapes.is_empty() {
++            return Ok(());
+         }
+         let mut categories = sets
+             .iter()
+@@ -2155,22 +2219,35 @@
+             .iter()
+             .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0))
+             .then_some(673);
+-        if categories.is_empty() && image_query_binding.is_none() {
+-            return;
+-        }
+-        self.bindings.retain(|resource| {
+-            !matches!(
+-                resource.kind,
+-                ResourceKind::EmbeddedArgBufferTexture | ResourceKind::EmbeddedArgBufferSampler
+-            )
+-        });
++        if categories.is_empty()
++            && image_query_binding.is_none()
++            && null_shapes.is_empty()
++            && !has_metadata
++        {
++            return Ok(());
++        }
++        if has_table {
++            self.bindings.retain(|resource| {
++                !matches!(
++                    resource.kind,
++                    ResourceKind::EmbeddedArgBufferTexture | ResourceKind::EmbeddedArgBufferSampler
++                )
++            });
++        }
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: if normalized_sampler_coordinates { 8 } else { 7 },
++            version: if !null_shapes.is_empty() || normalized_sampler_coordinates || has_metadata {
++                9
++            } else {
++                7
++            },
+             table_binding: 672,
+             categories,
+             comparison_sampler,
+             image_query_binding,
++            null_shapes: null_shapes.to_vec(),
+         });
++        validate_null_shapes(null_shapes)?;
++        Ok(())
+     }
+ 
+     /// Report the stage-local runtime coordinate-flag SSBO when the finished module declares it.
+@@ -2203,13 +2280,18 @@
+             *binding == SAMPLER_COORDINATE_FLAGS_BINDING
+                 && sets.get(id) == Some(&self.descriptor_layout.set)
+         });
+-        self.bindings
+-            .retain(|resource| resource.kind != ResourceKind::SamplerCoordinateFlags);
++        self.bindings.retain(|resource| {
++            !matches!(
++                resource.kind,
++                ResourceKind::SamplerCoordinateFlags | ResourceKind::StageResourceMetadata
++            )
++        });
+         if !declared {
+             return;
+         }
++        let bytes = 384;
+         self.bindings.push(ResourceBinding {
+-            kind: ResourceKind::SamplerCoordinateFlags,
++            kind: ResourceKind::StageResourceMetadata,
+             metal_index: 0,
+             descriptor: Some(DescriptorLocation {
+                 set: self.descriptor_layout.set,
+@@ -2220,8 +2302,8 @@
+             param_index: None,
+             stage_input_location: None,
+             address_space: None,
+-            declared_size: Some(128),
+-            extent: Some(BufferExtent::Object { bytes: 128 }),
++            declared_size: Some(bytes),
++            extent: Some(BufferExtent::Object { bytes }),
+             footprint: None,
+             type_layout: None,
+             type_name: None,
+@@ -2365,6 +2447,7 @@
+                 ResourceKind::ColorInput => layout.color_input_binding(resource.metal_index),
+                 ResourceKind::StaticSampler
+                 | ResourceKind::BufferAddressTable
++                | ResourceKind::StageResourceMetadata
+                 | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+                 | ResourceKind::SynthesizedReadSampler => {
+@@ -2428,12 +2511,25 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if !matches!(table.version, 7 | 8)
++            validate_null_shapes(&table.null_shapes)?;
++            if (table.version == 9 && self.reflection_version != 65)
++                || (table.version == 8
++                    && (self.reflection_version != 64 || !self.normalized_sampler_coordinates))
++            {
++                return Err("incoherent reflection and GPU argument table versions".into());
++            }
++            if table.version < 9 && !table.null_shapes.is_empty() {
++                return Err("null shapes require ABI 9".into());
++            }
++            if !matches!(table.version, 7..=9)
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+                     .is_some_and(|binding| binding != 673)
+-                || (table.categories.is_empty() && table.image_query_binding.is_none())
++                || (table.categories.is_empty()
++                    && table.image_query_binding.is_none()
++                    && table.null_shapes.is_empty()
++                    && table.version != 9)
+                 || table.categories.iter().any(|category| *category > 2)
+                 || table.categories.windows(2).any(|pair| pair[0] >= pair[1])
+                 || (table.comparison_sampler && !table.categories.contains(&2))
+@@ -2556,6 +2652,7 @@
+                 | ResourceKind::AccelerationStructureShadow
+                 | ResourceKind::PrimitiveAccelerationStructure
+                 | ResourceKind::BufferAddressTable
++                | ResourceKind::StageResourceMetadata
+                 | ResourceKind::SamplerCoordinateFlags => DescriptorClass::StorageBuffer,
+                 ResourceKind::Texture
+                 | ResourceKind::TextureArray
+@@ -2617,6 +2714,7 @@
+                 // Metal argument claims, so there is no index to recompute the expectation from.
+                 // The band check below is what constrains them.
+                 ResourceKind::BufferAddressTable
++                | ResourceKind::StageResourceMetadata
+                 | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+                 | ResourceKind::SynthesizedReadSampler => None,
+@@ -2680,7 +2778,10 @@
+                 record(location, owner, class)?;
+                 continue;
+             }
+-            if resource.kind == ResourceKind::SamplerCoordinateFlags {
++            if matches!(
++                resource.kind,
++                ResourceKind::SamplerCoordinateFlags | ResourceKind::StageResourceMetadata
++            ) {
+                 let location = resource
+                     .descriptor
+                     .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
+@@ -2692,6 +2793,27 @@
+                         "{owner} must be one descriptor at set {} binding {SAMPLER_COORDINATE_FLAGS_BINDING}",
+                         self.descriptor_layout.set
+                     ));
++                }
++                if resource.kind == ResourceKind::StageResourceMetadata
++                    && (self.reflection_version != 65
++                        || !self
++                            .argument_resource_tables
++                            .as_ref()
++                            .is_some_and(|table| table.version == 9)
++                        || resource.declared_size != Some(384)
++                        || resource.extent != Some(BufferExtent::Object { bytes: 384 })
++                        || resource.access != Some(ResourceAccess::ReadOnly))
++                {
++                    return Err("StageResourceMetadata requires reflection65/table9 and a readonly 384-byte extent".into());
++                }
++                if resource.kind == ResourceKind::SamplerCoordinateFlags
++                    && (self.reflection_version != 64
++                        || !self.normalized_sampler_coordinates
++                        || resource.declared_size != Some(128)
++                        || resource.extent != Some(BufferExtent::Object { bytes: 128 })
++                        || resource.access != Some(ResourceAccess::ReadOnly))
++                {
++                    return Err("SamplerCoordinateFlags requires reflection64 and a readonly 128-byte extent".into());
+                 }
+                 record(location, owner, class)?;
+                 continue;
+--- a/src/reflect/tests.rs
++++ b/src/reflect/tests.rs
+@@ -2248,6 +2248,7 @@
+         categories: vec![0, 2],
+         comparison_sampler: true,
+         image_query_binding: None,
++        null_shapes: vec![],
+     };
+     assert_eq!(
+         serde_json::to_value(&table).unwrap(),
+@@ -2307,3 +2308,64 @@
+         .is_err()
+     );
+ }
++
++#[cfg(feature = "serde")]
++#[test]
++fn argument_resource_table_nine_requires_a_sorted_canonical_bounded_registry() {
++    let valid = serde_json::json!({"version":9,"table_binding":672,"categories":[0],"comparison_sampler":false,"null_shapes":[1,129,516]});
++    let table: ArgumentResourceTables = serde_json::from_value(valid.clone()).unwrap();
++    assert_eq!(table.null_shapes, vec![1, 129, 516]);
++    assert_eq!(serde_json::to_value(table).unwrap(), valid);
++    for words in [
++        serde_json::json!([129, 1]),
++        serde_json::json!([1, 1]),
++        serde_json::json!([1025]),
++        serde_json::json!(vec![1; 65]),
++    ] {
++        let mut invalid = valid.clone();
++        invalid["null_shapes"] = words;
++        assert!(serde_json::from_value::<ArgumentResourceTables>(invalid).is_err());
++    }
++    let mut missing = valid.clone();
++    missing.as_object_mut().unwrap().remove("null_shapes");
++    assert!(serde_json::from_value::<ArgumentResourceTables>(missing).is_err());
++    let mut old = valid;
++    old["version"] = serde_json::json!(8);
++    assert!(serde_json::from_value::<ArgumentResourceTables>(old).is_err());
++}
++
++#[test]
++fn argument_table_versions_require_coherent_reflection_and_coordinate_contracts() {
++    let mut reflection = ShaderReflection::from_kernel(&KernMeta::default(), Some("k"), [1, 1, 1]);
++    reflection.argument_resource_tables = Some(ArgumentResourceTables {
++        version: 9,
++        table_binding: 672,
++        categories: vec![0],
++        comparison_sampler: false,
++        image_query_binding: None,
++        null_shapes: vec![],
++    });
++    for (version, table, normalized, accepted) in [
++        (65, 9, false, true),
++        (65, 9, true, true),
++        (64, 9, true, false),
++        (64, 8, true, true),
++        (64, 8, false, false),
++        (65, 8, true, false),
++        (63, 7, false, true),
++        (65, 7, false, true),
++    ] {
++        reflection.reflection_version = version;
++        reflection.normalized_sampler_coordinates = normalized;
++        reflection
++            .argument_resource_tables
++            .as_mut()
++            .unwrap()
++            .version = table;
++        assert_eq!(
++            reflection.validate_descriptor_abi().is_ok(),
++            accepted,
++            "reflection{version}/table{table}/normalized={normalized}"
++        );
++    }
++}
+--- a/tests/argument_buffer_graph.rs
++++ b/tests/argument_buffer_graph.rs
+@@ -84,7 +84,11 @@
+         #[cfg(feature = "serde")]
+         {
+             let json = serde_json::to_value(&reflection).unwrap();
+-            assert_eq!(json["argument_resource_tables"]["version"], 7);
++            assert_eq!(json["argument_resource_tables"]["version"], 9);
++            assert_eq!(
++                json["argument_resource_tables"]["null_shapes"],
++                serde_json::json!([1])
++            );
+             assert_eq!(
+                 json["argument_resource_tables"]["comparison_sampler"],
+                 false
+--- /dev/null
++++ b/tests/null_shape_abi9.rs
+@@ -0,0 +1,240 @@
++use metal2vulkan::{
++    passes::{Stage, TransformOptions},
++    reflect::ResourceKind,
++};
++use std::{path::PathBuf, process::Command};
++
++fn translate(
++    body: &str,
++    declarations: &str,
++    label: &str,
++) -> (String, metal2vulkan::reflect::ShaderReflection) {
++    translate_with_sampler(body, declarations, label, false)
++}
++
++fn translate_with_sampler(
++    body: &str,
++    declarations: &str,
++    label: &str,
++    sampler: bool,
++) -> (String, metal2vulkan::reflect::ShaderReflection) {
++    let source = format!(
++        r#"target triple = "spirv-unknown-vulkan1.2"
++define void @main_kernel(ptr addrspace(1) %out) {{
++entry:
++{body}
++  ret void
++}}
++{declarations}
++!air.kernel = !{{!0}}
++!0 = !{{ptr @main_kernel, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3}}
++!3 = !{{i32 0, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint4", !"air.arg_name", !"out"}}
++"#
++    );
++    let source = if sampler {
++        source.replace("%out) {", "%out, ptr addrspace(2) %sampler) {")
++            .replace("!2 = !{!3}", "!2 = !{!3, !4}")
++            + "\n!4 = !{i32 1, !\"air.sampler\", !\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"sampler\", !\"air.arg_name\", !\"sampler\"}\n"
++    } else if label.starts_with("bound_") {
++        source.replace("%out) {", "%out, ptr addrspace(1) %bound) {")
++            .replace("!2 = !{!3}", "!2 = !{!3, !4}")
++            + "\n!4 = !{i32 1, !\"air.texture\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.arg_type_name\", !\"texture2d<float, read>\", !\"air.arg_name\", !\"bound\"}\n"
++    } else {
++        source
++    };
++    let dir: PathBuf =
++        std::env::temp_dir().join(format!("nullshape_{}_{}", std::process::id(), label));
++    std::fs::create_dir_all(&dir).unwrap();
++    let (bytes, reflection) = metal2vulkan::translate_sanitized_native_reflected(
++        &source,
++        Stage::Kernel,
++        &dir,
++        TransformOptions::default(),
++    )
++    .unwrap_or_else(|e| panic!("{label}: {e}"));
++    let path = dir.join("shader.spv");
++    std::fs::write(&path, bytes).unwrap();
++    let output = Command::new("spirv-dis").arg(&path).output().unwrap();
++    assert!(output.status.success());
++    (String::from_utf8(output.stdout).unwrap(), reflection)
++}
++
++#[test]
++fn null_multisample_read_keeps_exact_type_and_sample_operand() {
++    let (spv, reflection) = translate("  %tex = call ptr addrspace(1) @air.get_null_texture_2d_ms()\n  %read = call <4 x float> @air.read_texture_2d_ms.v4f32(ptr addrspace(1) %tex, <2 x i32> zeroinitializer, i32 0, i32 1)\n  store <4 x float> %read, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d_ms()\ndeclare <4 x float> @air.read_texture_2d_ms.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)", "ms");
++    assert!(spv.contains("2D 0 0 1 1 Unknown"), "{spv}");
++    assert!(
++        spv.contains("OpImageFetch") && spv.contains("Sample"),
++        "{spv}"
++    );
++    let tables = reflection.argument_resource_tables.unwrap();
++    assert_eq!(tables.version, 9);
++    assert_eq!(tables.null_shapes, vec![0x81]);
++    assert!(!spv.contains("Binding 672"));
++    let metadata = reflection
++        .bindings
++        .iter()
++        .find(|b| b.kind == ResourceKind::StageResourceMetadata)
++        .unwrap();
++    assert_eq!(metadata.declared_size, Some(384));
++}
++
++#[test]
++fn null_texel_fetch_uses_buffer_image_without_lod() {
++    let (spv, reflection) = translate("  %tex = call ptr addrspace(1) @air.get_null_texture_buffer()\n  %read = call <4 x float> @air.read_texture_buffer.v4f32(ptr addrspace(1) %tex, i32 0, i32 1)\n  store <4 x float> %read, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_buffer()\ndeclare <4 x float> @air.read_texture_buffer.v4f32(ptr addrspace(1), i32, i32)", "texel");
++    assert!(spv.contains("Buffer 0 0 0 1 Unknown"), "{spv}");
++    let fetch = spv
++        .lines()
++        .find(|line| line.contains("OpImageFetch"))
++        .unwrap();
++    assert!(!fetch.contains("Lod"), "{fetch}");
++    assert_eq!(
++        reflection.argument_resource_tables.unwrap().null_shapes,
++        vec![0x204]
++    );
++    assert!(spv.contains("Binding 1"));
++}
++
++#[test]
++fn null_storage_texel_write_is_typed_and_guarded() {
++    let (spv, reflection) = translate("  %tex = call ptr addrspace(1) @air.get_null_texture_buffer_1d()\n  call void @air.write_texture_buffer_1d.u.v4i32(ptr addrspace(1) %tex, i32 7, <4 x i32> <i32 1, i32 2, i32 3, i32 4>, i32 2)", "declare ptr addrspace(1) @air.get_null_texture_buffer_1d()\ndeclare void @air.write_texture_buffer_1d.u.v4i32(ptr addrspace(1), i32, <4 x i32>, i32)", "texel_write");
++    assert!(spv.contains("Buffer 0 0 0 2 R32ui"), "{spv}");
++    assert!(
++        spv.contains("OpImageWrite") && spv.contains("OpBranchConditional"),
++        "{spv}"
++    );
++    assert_eq!(
++        reflection.argument_resource_tables.unwrap().null_shapes,
++        vec![0x314]
++    );
++}
++
++#[test]
++fn late_lower_sorted_texel_shape_relocates_previous_access() {
++    let (spv, reflection) = translate("  %uint_tex = call ptr addrspace(1) @air.get_null_texture_buffer_1d()\n  %uint_read = call <4 x i32> @air.read_texture_buffer_1d.u.v4i32(ptr addrspace(1) %uint_tex, i32 1, i32 1)\n  store <4 x i32> %uint_read, ptr addrspace(1) %out\n  %float_tex = call ptr addrspace(1) @air.get_null_texture_buffer_1d()\n  %float_read = call <4 x float> @air.read_texture_buffer_1d.v4f32(ptr addrspace(1) %float_tex, i32 2, i32 1)\n  store <4 x float> %float_read, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_buffer_1d()\ndeclare <4 x i32> @air.read_texture_buffer_1d.u.v4i32(ptr addrspace(1), i32, i32)\ndeclare <4 x float> @air.read_texture_buffer_1d.v4f32(ptr addrspace(1), i32, i32)", "sorted_texels");
++    assert_eq!(
++        reflection.argument_resource_tables.unwrap().null_shapes,
++        vec![0x204, 0x214]
++    );
++    let remaps = spv
++        .lines()
++        .filter(|line| {
++            line.contains("OpAccessChain %_ptr_StorageBuffer_uint")
++                && (line.contains("%uint_32") || line.contains("%uint_33"))
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(remaps.len(), 2, "{spv}");
++    assert!(
++        remaps[0].contains("%uint_33"),
++        "first Uint use must refer to final global registry slot 1: {spv}"
++    );
++    assert!(
++        remaps[1].contains("%uint_32"),
++        "later Float use must refer to final slot 0: {spv}"
++    );
++}
++
++#[test]
++fn explicit_is_null_select_is_a_boolean_predicate() {
++    let (spv, _) = translate("  %condition_word = load i32, ptr addrspace(1) %out\n  %condition = icmp ne i32 %condition_word, 0\n  %a = call ptr addrspace(1) @air.get_null_texture_2d()\n  %b = call ptr addrspace(1) @air.get_null_texture_2d()\n  %selected = select i1 %condition, ptr addrspace(1) %a, ptr addrspace(1) %b\n  %null = call i1 @air.is_null_texture_2d(ptr addrspace(1) %selected)\n  %word = zext i1 %null to i32\n  store i32 %word, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d()\ndeclare i1 @air.is_null_texture_2d(ptr addrspace(1))", "isnull_select");
++    assert!(
++        spv.contains("OpSelect %bool") || spv.contains("OpConstantTrue %bool"),
++        "{spv}"
++    );
++    assert!(!spv.contains("air.is_null_texture"));
++    assert!(
++        !spv.contains("OpCapability RuntimeDescriptorArray"),
++        "{spv}"
++    );
++    assert!(!spv.contains("Binding 674"), "{spv}");
++}
++
++#[test]
++fn bound_image_is_null_is_false() {
++    let (spv, _) = translate("  %null = call i1 @air.is_null_texture_2d(ptr addrspace(1) %bound)\n  %word = zext i1 %null to i32\n  store i32 %word, ptr addrspace(1) %out", "declare i1 @air.is_null_texture_2d(ptr addrspace(1))", "bound_false");
++    assert!(spv.contains("OpConstantFalse %bool"), "{spv}");
++}
++
++#[test]
++fn selected_null_and_bound_image_follow_the_selected_value() {
++    let (spv, _) = translate("  %condition_word = load i32, ptr addrspace(1) %out\n  %condition = icmp ne i32 %condition_word, 0\n  %null_image = call ptr addrspace(1) @air.get_null_texture_2d()\n  %selected = select i1 %condition, ptr addrspace(1) %null_image, ptr addrspace(1) %bound\n  %null = call i1 @air.is_null_texture_2d(ptr addrspace(1) %selected)\n  %word = zext i1 %null to i32\n  store i32 %word, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d()\ndeclare i1 @air.is_null_texture_2d(ptr addrspace(1))", "bound_select");
++    assert!(
++        spv.lines()
++            .any(|line| line.contains("OpSelect %bool") && line.contains("%true %false")),
++        "{spv}"
++    );
++}
++
++#[test]
++fn phi_nullness_has_matching_incoming_control_edges() {
++    let (spv, _) = translate("  %condition_word = load i32, ptr addrspace(1) %out\n  %condition = icmp ne i32 %condition_word, 0\n  br i1 %condition, label %left, label %right\nleft:\n  %null_image = call ptr addrspace(1) @air.get_null_texture_2d()\n  br label %join\nright:\n  br label %join\njoin:\n  %selected = phi ptr addrspace(1) [%null_image, %left], [%bound, %right]\n  %null = call i1 @air.is_null_texture_2d(ptr addrspace(1) %selected)\n  %word = zext i1 %null to i32\n  store i32 %word, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d()\ndeclare i1 @air.is_null_texture_2d(ptr addrspace(1))", "bound_phi");
++    assert!(
++        spv.lines().any(|line| line.contains("OpPhi %bool")
++            && line.contains("%true")
++            && line.contains("%false")),
++        "{spv}"
++    );
++}
++
++#[test]
++fn selected_null_and_bound_fetch_retains_a_zero_result_guard() {
++    let (spv, reflection) = translate("  %condition_word = load i32, ptr addrspace(1) %out\n  %condition = icmp ne i32 %condition_word, 0\n  %null_image = call ptr addrspace(1) @air.get_null_texture_2d()\n  %selected = select i1 %condition, ptr addrspace(1) %null_image, ptr addrspace(1) %bound\n  %read = call <4 x float> @air.read_texture_2d.v4f32(ptr addrspace(1) %selected, <2 x i32> zeroinitializer, i32 0, i32 1)\n  store <4 x float> %read, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d()\ndeclare <4 x float> @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)", "bound_fetch");
++    assert!(spv.contains("OpImageFetch"), "{spv}");
++    assert!(spv.contains("OpConstantNull %v4float"), "{spv}");
++    assert!(spv.contains("OpBranchConditional"), "{spv}");
++    assert_eq!(
++        reflection.argument_resource_tables.unwrap().null_shapes,
++        vec![1]
++    );
++}
++
++#[test]
++fn null_depth_compare_masks_the_real_comparison_result_to_zero() {
++    let (spv, reflection) = translate_with_sampler("  %tex = call ptr addrspace(1) @air.get_null_texture_2d()\n  %sample = call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, i32 1, <2 x float> <float 0.25, float 0.75>, float 0.5, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.0, float 0.0, i32 0)\n  %value = extractvalue { float, i8 } %sample, 0\n  store float %value, ptr addrspace(1) %out", "declare ptr addrspace(1) @air.get_null_texture_2d()\ndeclare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)", "null_compare", true);
++    assert!(spv.contains("OpImageSampleDrefExplicitLod"), "{spv}");
++    let definitions = spv
++        .lines()
++        .filter_map(|line| line.split_once(" = "))
++        .map(|(id, instruction)| {
++            (
++                id.trim(),
++                instruction.split_whitespace().collect::<Vec<_>>(),
++            )
++        })
++        .collect::<std::collections::HashMap<_, _>>();
++    let stores = spv
++        .lines()
++        .filter_map(|line| {
++            let words = line.split_whitespace().collect::<Vec<_>>();
++            (words.first() == Some(&"OpStore")).then_some(words)
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(stores.len(), 1, "{spv}");
++    let mut value = stores[0][2];
++    for _ in 0..definitions.len() {
++        let definition = &definitions[value];
++        match definition.as_slice() {
++            ["OpCopyObject", _, source] => value = source,
++            ["OpCompositeExtract", _, composite, index] => {
++                let composite = &definitions[composite];
++                assert_eq!(composite[0], "OpCompositeConstruct", "{spv}");
++                value = composite[2 + index.parse::<usize>().unwrap()];
++            }
++            _ => break,
++        }
++    }
++    // Constant folding may erase the select; the scalar actually stored must still be zero.
++    assert!(
++        matches!(
++            definitions[value].as_slice(),
++            ["OpConstantNull", "%float"] | ["OpConstant", "%float", "0"]
++        ),
++        "{spv}"
++    );
++    assert_eq!(
++        reflection.argument_resource_tables.unwrap().null_shapes,
++        vec![0x41]
++    );
++}
+--- a/tests/reflection_covers_declared_bindings.rs
++++ b/tests/reflection_covers_declared_bindings.rs
+@@ -23,7 +23,6 @@
+ //! that value then turned out to be nothing at all. No Metal argument corresponds to either, so
+ //! reflection had nothing to report — while the module demanded the binding anyway.
+ 
+-use metal2vulkan::meta::TextureDimension;
+ use metal2vulkan::passes::{Stage, TransformOptions};
+ use metal2vulkan::reflect::{
+     DescriptorBindingRange, DescriptorLayout, ResourceKind, ShaderReflection,
+@@ -86,6 +85,22 @@
+             reported.insert((location.set, location.binding));
+         }
+     }
++    if let Some(table) = &reflection.argument_resource_tables {
++        for category in &table.categories {
++            reported.insert((2 + category, 0));
++        }
++        for word in &table.null_shapes {
++            match (word >> 8) & 3 {
++                2 => {
++                    reported.insert((2, 1));
++                }
++                3 => {
++                    reported.insert((3, 1));
++                }
++                _ => {}
++            }
++        }
++    }
+     for attachment in &reflection.implicit_imageblock_attachments {
+         reported.insert((set, attachment.binding));
+     }
+@@ -287,26 +302,20 @@
+         &spirv,
+         &reflection,
+     );
+-    let placeholder = reflection
++    let tables = reflection
++        .argument_resource_tables
++        .as_ref()
++        .expect("null registry is reflected");
++    assert_eq!(tables.version, 9);
++    assert_eq!(tables.null_shapes, vec![1]);
++    assert_eq!(tables.categories, vec![0]);
++    assert!(declared.contains(&(2, 0)));
++    let metadata = reflection
+         .bindings
+         .iter()
+-        .find(|resource| resource.kind == ResourceKind::SynthesizedNullTexture)
+-        .expect("the placeholder the module reads through is reported");
+-    let location = placeholder.descriptor.expect("it consumes a descriptor");
+-    assert!(
+-        TEXTURE_BINDING_RANGE.contains(location.binding),
+-        "a placeholder image belongs in the sampled-texture band, not at {}",
+-        location.binding
+-    );
+-    assert!(
+-        declared.contains(&(location.set, location.binding)),
+-        "the reported binding is one the module decorates; module declares {declared:?}"
+-    );
+-    let shape = placeholder
+-        .texture_shape
+-        .expect("a consumer needs the shape of the image it has to bind");
+-    assert_eq!(shape.dimension, TextureDimension::D2);
+-    assert!(!shape.arrayed && !shape.writable);
++        .find(|resource| resource.kind == ResourceKind::StageResourceMetadata)
++        .expect("stage remap is reflected");
++    assert_eq!(metadata.declared_size, Some(384));
+ }
+ 
+ /// A fragment shader that reads its render target back through the implicit imageblock.
+--- a/tests/runtime_depth_comparison.rs
++++ b/tests/runtime_depth_comparison.rs
+@@ -135,11 +135,12 @@
+             asm.contains("DescriptorSet 2") && asm.contains("OpConvertUToPtr"),
+             "{asm}"
+         );
+-        let shape_index = format!(" {}", 10 + u32::from(arrayed));
++        let tables = reflection.argument_resource_tables.as_ref().unwrap();
++        assert_eq!(tables.version, 9);
++        assert_eq!(tables.null_shapes, vec![0x41 | (u32::from(arrayed) << 3)]);
+         assert!(
+-            asm.lines()
+-                .any(|line| line.contains("OpConstant ") && line.ends_with(&shape_index)),
+-            "depth null descriptor shape missing: {asm}"
++            asm.contains("Binding 674"),
++            "null remap metadata missing: {asm}"
+         );
+         std::fs::remove_dir_all(tmp).unwrap();
+     }
+--- a/validation/src/executor_contract.rs
++++ b/validation/src/executor_contract.rs
+@@ -154,7 +154,9 @@
+                 requirements.insert(ToolingRequirement::EmbeddedArgumentSampler);
+             }
+             // The executor has no authored payload for the ABI 8 coordinate flag buffer either.
+-            ResourceKind::SynthesizedReadSampler | ResourceKind::SamplerCoordinateFlags => {
++            ResourceKind::SynthesizedReadSampler
++            | ResourceKind::SamplerCoordinateFlags
++            | ResourceKind::StageResourceMetadata => {
+                 requirements.insert(ToolingRequirement::SynthesizedPlaceholderDescriptor);
+             }
+         }
+@@ -1085,7 +1087,7 @@
+     }
+ 
+     #[test]
+-    fn a_synthesized_null_texture_is_executable_and_a_read_sampler_is_not() {
++    fn stage_null_remaps_require_executor_support() {
+         // `air.get_null_texture_2d()` whose handle is read: the translator binds a real image at a
+         // binding no Metal argument produces. The Vulkan executor now writes an all-zero one-texel
+         // placeholder there, so the row is executable; only a synthesized read sampler still has
+@@ -1124,13 +1126,15 @@
+         let placeholder = reflection
+             .bindings
+             .iter()
+-            .position(|binding| binding.kind == ResourceKind::SynthesizedNullTexture)
++            .position(|binding| binding.kind == ResourceKind::StageResourceMetadata)
+             .expect("the placeholder the module reads through is reported");
+-        assert!(unsupported_reflection_requirements(&reflection).is_empty());
++        assert!(unsupported_reflection_requirements(&reflection)
++            .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
+ 
+         for kind in [
+             ResourceKind::SynthesizedReadSampler,
+             ResourceKind::SamplerCoordinateFlags,
++            ResourceKind::StageResourceMetadata,
+         ] {
+             let mut unsupported = reflection.clone();
+             unsupported.bindings[placeholder].kind = kind;

@@ -1,0 +1,91 @@
+diff --git a/src/passes/stage_output/mod.rs b/src/passes/stage_output/mod.rs
+--- a/src/passes/stage_output/mod.rs
++++ b/src/passes/stage_output/mod.rs
+@@ -38,6 +38,16 @@ fn fragment_output_type(
+     if interface_ty != ty {
+         return interface_ty;
+     }
++    if fragment_output_location(frag, member_idx).is_some() {
++        if let Some((component, lanes)) = scalar_or_vector_component(defs, ty) {
++            if is_float_width(ctx, component, 16) {
++                return match lanes {
++                    Some(lanes) => ctx.ty_vecf(lanes),
++                    None => ctx.ty_float(),
++                };
++            }
++        }
++    }
+     let Some(name) = frag.and_then(|meta| meta.render_target_type_name(member_idx as u32)) else {
+         return ty;
+     };
+@@ -151,6 +161,18 @@ fn value_for_store(
+     if src_ty == dst_ty {
+         return value;
+     }
++    if let Some(lanes) = float_shape(ctx, src_ty, 16) {
++        if float_shape(ctx, dst_ty, 32) == Some(lanes) {
++            let converted = ctx.module.fresh_id();
++            stores.push(Instruction::new(
++                Op::FConvert,
++                Some(dst_ty),
++                Some(converted),
++                vec![Operand::IdRef(value)],
++            ));
++            return converted;
++        }
++    }
+     if let (Some((src_bits, _)), Some((dst_bits, dst_signed))) = (
+         int_component_shape_live(ctx, src_ty),
+         int_component_shape_live(ctx, dst_ty),
+@@ -173,6 +195,21 @@ fn value_for_store(
+     bitcast_for_store(ctx, stores, value, src_ty, dst_ty)
+ }
+ 
++fn float_shape(ctx: &Ctx, ty: Word, width: u32) -> Option<u32> {
++    let def = type_def_of(ctx, ty)?;
++    match def.operands.as_slice() {
++        [Operand::IdRef(component), Operand::LiteralBit32(lanes)]
++            if def.class.opcode == Op::TypeVector && is_float_width(ctx, *component, width) =>
++        {
++            Some(*lanes)
++        }
++        [Operand::LiteralBit32(bits)] if def.class.opcode == Op::TypeFloat && *bits == width => {
++            Some(1)
++        }
++        _ => None,
++    }
++}
++
+ fn int_component_shape_live(ctx: &Ctx, ty: Word) -> Option<(u32, bool)> {
+     let mut scalar_ty = ty;
+     let def = type_def_of(ctx, ty)?;
+@@ -1196,6 +1233,29 @@ mod tests {
+     use crate::passes::resources::rewrites::combined_type_defs;
+ 
+     #[test]
++    fn half_fragment_color_outputs_use_float_interface() {
++        let mut ctx = Ctx::new(Module::new());
++        let cases = [
++            (ctx.ty_half(), ctx.ty_float()),
++            (ctx.ty_vech(4), ctx.ty_vecf(4)),
++            (ctx.ty_vech(2), ctx.ty_vecf(2)),
++        ];
++        let defs = combined_type_defs(&ctx, &HashMap::new());
++
++        for (half, float) in cases {
++            assert_eq!(fragment_output_type(&mut ctx, None, 0, half, &defs), float);
++            assert_eq!(fragment_output_type(&mut ctx, None, 0, float, &defs), float);
++            let value = ctx.module.fresh_id();
++            let mut stores = Vec::new();
++            let converted = value_for_store(&mut ctx, &mut stores, value, half, float);
++            assert_eq!(stores.len(), 1);
++            assert_eq!(stores[0].class.opcode, Op::FConvert);
++            assert_eq!(stores[0].result_type, Some(float));
++            assert_eq!(stores[0].result_id, Some(converted));
++        }
++    }
++
++    #[test]
+     fn scalar_bool_fragment_output_uses_uint_interface_and_select() {
+         let mut ctx = Ctx::new(Module::new());
+         let bool_ty = ctx.ty_bool();

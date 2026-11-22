@@ -1,0 +1,94 @@
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -643,6 +643,7 @@
+             ParamBinding::Sampler {
+                 var,
+                 specialized_state,
++                coordinate_word,
+             } => {
+                 let sty = ctx.ty_sampler();
+                 let lid = ctx.module.fresh_id();
+@@ -655,6 +656,12 @@
+                 if let Some(state) = specialized_state {
+                     ctx.sampler_states.insert(lid, state);
+                     ctx.specialized_runtime_sampler_values.insert(lid);
++                }
++                if let Some(word) = coordinate_word {
++                    ctx.sampler_coordinate_sources.insert(
++                        lid,
++                        crate::passes::SamplerCoordinateSource::RuntimeWord(word),
++                    );
+                 }
+                 resource_values.insert(lid);
+                 splices.push((pid, lid));
+@@ -1879,6 +1886,51 @@
+ mod tests {
+     use super::*;
+     use crate::spirv_module::ModuleHeader;
++
++    #[test]
++    fn sampler_binding_preserves_the_optional_abi8_coordinate_word() {
++        for coordinate_word in [None, Some(3)] {
++            let mut module = Module::new();
++            module.header = Some(ModuleHeader::new(100));
++            module.functions.push(Function {
++                def: None,
++                parameters: vec![],
++                blocks: vec![Block {
++                    label: Some(Instruction::new(Op::Label, None, Some(30), vec![])),
++                    instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
++                }],
++                end: None,
++            });
++            let mut ctx = Ctx::new(module);
++            apply_bindings(
++                &mut ctx,
++                0,
++                vec![(
++                    10,
++                    ParamBinding::Sampler {
++                        var: 20,
++                        specialized_state: None,
++                        coordinate_word,
++                    },
++                )],
++                &[],
++                &HashMap::new(),
++            )
++            .unwrap();
++            let loaded_sampler = ctx.module.functions[0].blocks[0]
++                .instructions
++                .iter()
++                .find(|inst| inst.class.opcode == Op::Load && inst.operands == [Operand::IdRef(20)])
++                .and_then(|inst| inst.result_id)
++                .expect("sampler binding must materialize a descriptor load");
++            assert_eq!(
++                ctx.sampler_coordinate_sources.get(&loaded_sampler),
++                coordinate_word
++                    .map(crate::passes::SamplerCoordinateSource::RuntimeWord)
++                    .as_ref(),
++            );
++        }
++    }
+ 
+     /// Builds `base -> insert A at path_a -> insert B at path_b -> insert plain at [3]`, where each
+     /// resource insert carries an opaque placeholder object (as the emitter does, with the real
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -287,6 +287,8 @@
+     Sampler {
+         var: Word,
+         specialized_state: Option<StaticSamplerState>,
++        /// ABI 8 runtime coordinate-flag word for a direct `[[sampler(n)]]`.
++        coordinate_word: Option<u32>,
+     },
+     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
+     Buffer { var: Word, wrap: BufWrap },
+@@ -1064,6 +1066,7 @@
+                 ParamBinding::Sampler {
+                     var,
+                     specialized_state,
++                    coordinate_word: ctx.normalized_sampler_coordinates.then_some(metal_index),
+                 },
+             ));
+         } else if is_threadgroup_buffer {

@@ -1,0 +1,1092 @@
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -227,11 +227,24 @@
+ | Authored visible/intersection function table | `VisibleFunctionTable` / `IntersectionFunctionTable` | **no descriptor** (`descriptor: None`); `metal_index` and `param_index` identify static linkage |
+ | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | selected sampled- or storage-texture range at `synthetic_index` |
+ | Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
+-| Synthesized direct-buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); one `u64` address per Metal buffer slot. Reflected translation reads it off the finished module; `reflect_sanitized` predicts it with the emitter's device-address predicate and can differ in either direction |
++| Synthesized buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); layout selected by `BufferAddressTableMode`. Reflected translation reads it off the finished module; `reflect_sanitized` predicts it with the emitter's device-address predicate and can differ in either direction |
+ | Placeholder image for `air.get_null_texture_*()` | `SynthesizedNullTexture` | first binding in the sampled-texture band no Metal texture claims; reported only when the shader reads through the handle |
+ | Placeholder sampler for `air.get_read_sampler()` | `SynthesizedReadSampler` | first binding in the sampler band no Metal sampler claims; reported only when something consumes the value |
+ 
+ Constants live in `metal2vulkan::reflect`:
++
++`BufferAddressTableMode::RegistryV3` retains the 768-byte direct prefix (32 addresses,
++32 lengths, 32 access masks), followed by four `u64` words: row count, stride 24,
++exact descriptor byte extent, and reserved zero. Rows begin at byte 800 and contain
++`u64` base, length and access mask. The runtime publishes only immutable ranges of
++declared buffers and retains them through the consuming segment. GPU-loaded addresses
++must match a complete, nonoverflowing range with the required access bits. Unknown,
++out-of-range and readonly write accesses take the existing zero-load/discard-store
++guard path. Loaded constant-space pointers reject writes during translation.
++
++The wrapper reports table version 3, minimum bytes 800, row stride bytes 24 and
++`buffer_address_table_dynamic_extent: true`; the descriptor extent includes all rows.
++Version 2 remains sufficient for direct bounded accesses without registry lookups.
+ 
+ ```text
+ RESOURCE_DESCRIPTOR_SET = 0
+--- a/src/emit_sidecar.rs
++++ b/src/emit_sidecar.rs
+@@ -46,6 +46,7 @@
+     /// The emitter uses them to materialize per-root bounds/permission checks; interface
+     /// construction replaces each marker with a load from the corresponding table row.
+     pub(crate) buffer_range_words: Vec<BufferRangeWord>,
++    pub(crate) buffer_registry_guards: Vec<BufferRegistryGuard>,
+     /// Exact constant byte address of a GEP result relative to one buffer root. This preserves the
+     /// source aggregate layout across the native-emitter → remodeled-interface seam, where an
+     /// overlapping struct/union may intentionally become a raw word block.
+@@ -159,6 +160,14 @@
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct BufferRegistryGuard {
++    pub(crate) id: Word,
++    pub(crate) address: Word,
++    pub(crate) size: u64,
++    pub(crate) access: u64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub(crate) struct BufferAddressWord {
+     pub(crate) id: Word,
+     pub(crate) param_index: u32,
+@@ -283,6 +292,9 @@
+             .map(|fact| fact.id)
+             .collect::<HashSet<_>>();
+         ids.extend(self.buffer_range_words.iter().map(|fact| fact.id));
++        for fact in &self.buffer_registry_guards {
++            ids.extend([fact.id, fact.address]);
++        }
+         for fact in &self.buffer_access_offsets {
+             ids.extend([fact.id, fact.root]);
+         }
+@@ -355,6 +367,10 @@
+         }
+         for fact in &mut self.buffer_range_words {
+             replace(&mut fact.id);
++        }
++        for fact in &mut self.buffer_registry_guards {
++            replace(&mut fact.id);
++            replace(&mut fact.address);
+         }
+         for fact in &mut self.buffer_access_offsets {
+             replace(&mut fact.id);
+@@ -454,6 +470,19 @@
+     }
+ 
+     pub(crate) fn clone_inlined_facts(&mut self, remap: &HashMap<Word, Word>) {
++        let guards = self
++            .buffer_registry_guards
++            .iter()
++            .filter_map(|fact| {
++                Some(BufferRegistryGuard {
++                    id: remap.get(&fact.id).copied()?,
++                    address: remap.get(&fact.address).copied().unwrap_or(fact.address),
++                    size: fact.size,
++                    access: fact.access,
++                })
++            })
++            .collect::<Vec<_>>();
++        self.buffer_registry_guards.extend(guards);
+         let clones = self
+             .buffer_access_offsets
+             .iter()
+@@ -644,6 +673,12 @@
+     #[test]
+     fn inlining_clones_load_facts_and_remaps_store_sources() {
+         let mut sidecar = EmitSidecar {
++            buffer_registry_guards: vec![BufferRegistryGuard {
++                id: 80,
++                address: 90,
++                size: 16,
++                access: 3,
++            }],
+             opaque_resource_payloads: vec![OpaqueResourcePayload {
+                 id: 80,
+                 low: 71,
+@@ -715,6 +750,23 @@
+         ]);
+ 
+         sidecar.clone_inlined_facts(&remap);
++        assert_eq!(
++            sidecar.buffer_registry_guards,
++            vec![
++                BufferRegistryGuard {
++                    id: 80,
++                    address: 90,
++                    size: 16,
++                    access: 3
++                },
++                BufferRegistryGuard {
++                    id: 180,
++                    address: 190,
++                    size: 16,
++                    access: 3
++                },
++            ]
++        );
+         sidecar.remap_local_pointer_field_store_sources(&remap);
+         assert_eq!(
+             sidecar.opaque_resource_payloads,
+@@ -901,6 +953,12 @@
+                 id: 10,
+                 param_index: 2,
+                 component: 1,
++            }],
++            buffer_registry_guards: vec![BufferRegistryGuard {
++                id: 53,
++                address: 54,
++                size: 4,
++                access: 1,
+             }],
+             buffer_range_words: vec![BufferRangeWord {
+                 id: 52,
+@@ -1084,6 +1142,9 @@
+         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].index, 142);
+         assert_eq!(sidecar.readonly_uniform_addresses[0].function, 145);
+         assert_eq!(sidecar.readonly_uniform_addresses[0].value, 152);
++        assert_eq!(sidecar.buffer_registry_guards[0].id, 153);
++        assert_eq!(sidecar.buffer_registry_guards[0].address, 154);
++        assert_eq!(sidecar.buffer_registry_guards[0].size, 4);
+         assert_eq!(sidecar.aliased_imageblock_staging, Some(151));
+     }
+ }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -74,11 +74,13 @@
+ /// This is carried separately from [`reflect::ShaderReflection`] so the existing reflection schema
+ /// does not need a version bump. `LegacyV1` emits only the 32 device addresses. `AddressLengthAccessV2`
+ /// selects the 768-byte table with addresses, logical lengths, and read/write access flags.
++/// `RegistryV3` appends a validated header and declared-buffer ranges for GPU-loaded addresses.
+ #[doc(hidden)]
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum BufferAddressTableMode {
+     LegacyV1,
+     AddressLengthAccessV2,
++    RegistryV3,
+ }
+ 
+ /// One fragment entry point named by a [`UniformControlProof`].
+@@ -1296,7 +1298,9 @@
+     options: passes::TransformOptions,
+     construction: FinishConstruction,
+ ) -> Result<FinishedModule, FinishFailure> {
+-    let buffer_address_table_mode = if emitted.sidecar.large_buffer_addressing {
++    let buffer_address_table_mode = if !emitted.sidecar.buffer_registry_guards.is_empty() {
++        BufferAddressTableMode::RegistryV3
++    } else if emitted.sidecar.large_buffer_addressing {
+         BufferAddressTableMode::AddressLengthAccessV2
+     } else {
+         BufferAddressTableMode::LegacyV1
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -2417,7 +2417,10 @@
+                         self.bda_address_values.insert(addr);
+                         self.emit_device_address_nullness(&name, addr, instructions)?;
+                         self.used_device_address = true;
+-                        let mut dev = RawBufferOffset::root(format!(".bda_{addr}"), 1);
++                        let LlType::Ptr(addrspace) = result_ty else {
++                            unreachable!()
++                        };
++                        let mut dev = RawBufferOffset::root(format!(".bda_{addr}"), addrspace);
+                         dev.device_addr_base = Some(addr);
+                         self.raw_offsets.insert(name.clone(), dev);
+                         // A GEP through this pointer (`emit_gep_result`) reads `pointer_storage` for
+--- a/src/native/emitter/memory/device_addr.rs
++++ b/src/native/emitter/memory/device_addr.rs
+@@ -728,8 +728,15 @@
+         required_access: u64,
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<Option<Word>, String> {
++        if raw.addrspace == 2 && required_access & 2 != 0 {
++            return Err(
++                "native emitter: cannot write through a constant-space buffer pointer".into(),
++            );
++        }
+         let Some(bounds) = raw.table_bounds.as_ref() else {
+-            return Ok(None);
++            return self
++                .emit_buffer_registry_guard(address, access_size, required_access, instructions)
++                .map(Some);
+         };
+         let i64_ty = self.type_id(&LlType::Int(64))?;
+         let bool_ty = self.type_id(&LlType::Bool)?;
+@@ -744,13 +751,13 @@
+                 Operand::IdRef(self.const_int(64, required_access)?),
+             ],
+         ));
+-        let required_access = self.const_int(64, required_access)?;
++        let required_access_id = self.const_int(64, required_access)?;
+         let has_access = self.fresh();
+         instructions.push(Self::inst(
+             Op::IEqual,
+             Some(bool_ty),
+             Some(has_access),
+-            vec![Operand::IdRef(allowed), Operand::IdRef(required_access)],
++            vec![Operand::IdRef(allowed), Operand::IdRef(required_access_id)],
+         ));
+ 
+         let above_base = self.fresh();
+@@ -813,21 +820,47 @@
+         let Some(when) = bounds.when else {
+             return Ok(Some(valid));
+         };
+-        let not_when = self.fresh();
+-        instructions.push(Self::inst(
+-            Op::LogicalNot,
+-            Some(bool_ty),
+-            Some(not_when),
+-            vec![Operand::IdRef(when)],
+-        ));
++        let registry =
++            self.emit_buffer_registry_guard(address, access_size, required_access, instructions)?;
+         let gated = self.fresh();
+         instructions.push(Self::inst(
+-            Op::LogicalOr,
++            Op::Select,
+             Some(bool_ty),
+             Some(gated),
+-            vec![Operand::IdRef(not_when), Operand::IdRef(valid)],
++            vec![
++                Operand::IdRef(when),
++                Operand::IdRef(valid),
++                Operand::IdRef(registry),
++            ],
+         ));
+         Ok(Some(gated))
++    }
++
++    fn emit_buffer_registry_guard(
++        &mut self,
++        address: Word,
++        size: u64,
++        access: u64,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        let ty = self.type_id(&LlType::Bool)?;
++        let id = self.fresh();
++        let denied = self.const_bool(false)?;
++        instructions.push(Self::inst(
++            Op::CopyObject,
++            Some(ty),
++            Some(id),
++            vec![Operand::IdRef(denied)],
++        ));
++        self.emit_sidecar
++            .buffer_registry_guards
++            .push(crate::emit_sidecar::BufferRegistryGuard {
++                id,
++                address,
++                size,
++                access,
++            });
++        Ok(id)
+     }
+ 
+     pub(in crate::native::emitter) fn emit_guarded_bda_load(
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -16,6 +16,34 @@
+ use spirv::{Capability, Decoration, Op, Scope, SelectionControl, StorageClass, Word};
+ use std::collections::{HashMap, HashSet};
+ use std::path::PathBuf;
++
++fn forwarded_loaded_values(
++    module: &crate::spirv_module::Module,
++    seeds: HashSet<Word>,
++) -> HashSet<Word> {
++    let mut values = seeds;
++    loop {
++        let before = values.len();
++        for instruction in module.all_inst_iter() {
++            let sources = match instruction.class.opcode {
++                Op::CopyObject => instruction.operands.first().into_iter().collect::<Vec<_>>(),
++                Op::Phi => instruction.operands.iter().step_by(2).collect::<Vec<_>>(),
++                _ => continue,
++            };
++            if sources
++                .iter()
++                .any(|operand| matches!(operand, Operand::IdRef(id) if values.contains(id)))
++            {
++                if let Some(id) = instruction.result_id {
++                    values.insert(id);
++                }
++            }
++        }
++        if values.len() == before {
++            return values;
++        }
++    }
++}
+ 
+ #[test]
+ fn native_null_rooted_pointer_recurrence_is_valid_by_construction() {
+@@ -517,6 +545,7 @@
+         !loaded_i16.is_empty(),
+         "direct source load was replaced with zero:\n{asm}"
+     );
++    let loaded_i16 = forwarded_loaded_values(&module, loaded_i16);
+     assert!(
+         module.all_inst_iter().any(|instruction| {
+             instruction.class.opcode == Op::Store
+@@ -1520,7 +1549,10 @@
+     let asm = disassemble(&spv).expect("disassemble");
+     assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+     assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+-    assert!(!asm.contains("OpFunctionCall"), "{asm}");
++    assert!(
++        asm.contains("OpFunctionCall") && asm.contains("OpArrayLength"),
++        "{asm}"
++    );
+     if std::process::Command::new("spirv-val")
+         .arg("--version")
+         .output()
+@@ -6027,10 +6059,13 @@
+             _ => None,
+         })
+         .expect("returned value");
++    let loaded = module
++        .all_inst_iter()
++        .filter(|inst| inst.class.opcode == Op::Load)
++        .filter_map(|inst| inst.result_id)
++        .collect();
+     assert!(
+-        module
+-            .all_inst_iter()
+-            .any(|inst| { inst.class.opcode == Op::Load && inst.result_id == Some(returned) }),
++        forwarded_loaded_values(&module, loaded).contains(&returned),
+         "constant-pointer read was replaced by a placeholder:\n{asm}"
+     );
+ }
+@@ -13295,83 +13330,87 @@
+     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+     let asm = disassemble(&spv).expect("disassemble");
+ 
+-    // Result type and operand ids of every defining instruction, keyed by result id, plus the
+-    // declaration of every type id (our disassembler prints type OPERANDS as ids, not names).
+-    let mut defs: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+-    let mut type_decl: HashMap<String, String> = HashMap::new();
+-    for line in asm.lines() {
+-        let words: Vec<&str> = line.split_whitespace().collect();
+-        let [result, "=", opcode, rest @ ..] = words.as_slice() else {
++    let module = load_bytes(&spv).unwrap();
++    let entry = id_ref_operand(&module.entry_points[0].operands[1]).unwrap();
++    let body = module
++        .functions
++        .iter()
++        .find(|function| function.def.as_ref().unwrap().result_id == Some(entry))
++        .unwrap();
++    let defs = body
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
++        .collect::<HashMap<_, _>>();
++    let address_type = module
++        .types_global_values
++        .iter()
++        .find(|instruction| {
++            instruction.class.opcode == Op::TypeInt
++                && instruction.operands == [Operand::LiteralBit32(64), Operand::LiteralBit32(0)]
++        })
++        .unwrap()
++        .result_id
++        .unwrap();
++    let backedge = defs
++        .values()
++        .filter(|instruction| {
++            instruction.class.opcode == Op::Phi && instruction.result_type == Some(address_type)
++        })
++        .find_map(|instruction| {
++            instruction
++                .operands
++                .chunks_exact(2)
++                .map(|pair| id_ref_operand(&pair[0]).unwrap())
++                .find(|id| {
++                    defs.get(id)
++                        .is_some_and(|source| source.class.opcode == Op::IAdd)
++                })
++        })
++        .expect("entry loop must carry the offset child address");
++
++    let mut pending = vec![backedge];
++    let mut seen = HashSet::new();
++    let mut loaded_address = false;
++    while let Some(id) = pending.pop() {
++        if !seen.insert(id) {
++            continue;
++        }
++        let Some(instruction) = defs.get(&id) else {
+             continue;
+         };
+-        if opcode.starts_with("OpType") {
+-            type_decl.insert(result.to_string(), format!("{opcode} {}", rest.join(" ")));
+-            continue;
+-        }
+-        let [ty, operands @ ..] = rest else {
+-            continue;
+-        };
+-        let operands = operands
+-            .iter()
+-            .filter(|word| word.starts_with('%'))
+-            .map(|word| word.to_string())
+-            .collect();
+-        defs.insert(
+-            result.to_string(),
+-            (opcode.to_string(), ty.to_string(), operands),
++        assert_eq!(
++            instruction.result_type,
++            Some(address_type),
++            "the loop-carried address cone reached a non-64-bit value: {instruction:?}\n{asm}"
+         );
+-    }
+-    let address_type = type_decl
+-        .iter()
+-        .find(|(_, decl)| decl.as_str() == "OpTypeInt 64 0")
+-        .map(|(id, _)| id.clone())
+-        .expect("a 64-bit integer type");
+-
+-    // The loop-carried address is a 64-bit phi with two incoming values; the entry arm is the
+-    // buffer root and the backedge arm is the offset child address.
+-    let backedge = defs
+-        .values()
+-        .find(|(opcode, ty, operands)| {
+-            opcode == "OpPhi" && *ty == address_type && operands.len() == 4
+-        })
+-        .map(|(_, _, operands)| operands[2].clone())
+-        .expect("a 64-bit loop-carried address phi");
+-
+-    // Everything the backedge address is built from must itself be address-typed arithmetic
+-    // bottoming out in the 64-bit load of the child address. A 32-bit word, a bool, or a pointer id
+-    // reaching this cone is the bug.
+-    let mut pending = vec![backedge];
+-    let mut seen: HashSet<String> = HashSet::new();
+-    let mut loaded_address = false;
+-    while let Some(id) = pending.pop() {
+-        if !seen.insert(id.clone()) {
+-            continue;
+-        }
+-        let Some((opcode, ty, operands)) = defs.get(&id) else {
+-            continue; // a constant, a type, or a label
+-        };
+-        let declared = type_decl.get(ty).cloned().unwrap_or_default();
+-        assert!(
+-            !declared.starts_with("OpTypePointer") && declared != "OpTypeBool",
+-            "the loop-carried address cone reached {id} = {opcode} typed {declared}, \
+-             which is not an address"
+-        );
+-        if opcode == "OpLoad" {
+-            assert_eq!(
+-                declared, "OpTypeInt 64 0",
+-                "the child address must be loaded 64 bits wide, saw {id} = OpLoad {declared}"
+-            );
++        if instruction.class.opcode == Op::Load {
+             loaded_address = true;
+             continue;
+         }
+-        if opcode == "OpPhi" {
+-            continue;
+-        }
+-        pending.extend(operands.iter().cloned());
++        let stride = if instruction.class.opcode == Op::Phi {
++            2
++        } else {
++            1
++        };
++        pending.extend(
++            instruction
++                .operands
++                .iter()
++                .step_by(stride)
++                .filter_map(|operand| {
++                    if let Operand::IdRef(id) = operand {
++                        Some(*id)
++                    } else {
++                        None
++                    }
++                }),
++        );
+     }
+     assert!(
+         loaded_address,
+-        "the backedge address must derive from a 64-bit load of the child address"
++        "the backedge address must derive from a 64-bit load of the child address\n{asm}"
+     );
+ }
+ 
+@@ -13499,8 +13538,7 @@
+         physical_loads > 0,
+         "the read through the constant-space pointer must be an address load"
+     );
+-    // The tell that it was not one: the folded zero. Every `OpConstantNull` the old lowering left
+-    // behind was consumed as the loaded value, so no function may reference one at all here.
++    // A rejected registry access contributes zero only on a guarded load's failure edge.
+     let nulls = module
+         .types_global_values
+         .iter()
+@@ -13511,10 +13549,26 @@
+         for inst in function.all_inst_iter() {
+             for operand in &inst.operands {
+                 if let Operand::IdRef(id) = operand {
+-                    assert!(
+-                        !nulls.contains(id),
+-                        "a null stands in for the value the shader read: {inst:?}"
+-                    );
++                    if nulls.contains(id) {
++                        assert_eq!(
++                            inst.class.opcode,
++                            Op::Phi,
++                            "unguarded placeholder: {inst:?}"
++                        );
++                        assert!(
++                            inst.operands.iter().step_by(2).any(|operand| {
++                                let Operand::IdRef(value) = operand else {
++                                    return false;
++                                };
++                                module.all_inst_iter().any(|definition| {
++                                    definition.class.opcode == Op::Load
++                                        && definition.result_id == Some(*value)
++                                        && definition.result_type == inst.result_type
++                                })
++                            }),
++                            "guarded value lost its real load: {inst:?}"
++                        );
++                    }
+                 }
+             }
+         }
+--- a/src/passes/resources/buffer_addresses.rs
++++ b/src/passes/resources/buffer_addresses.rs
+@@ -41,7 +41,8 @@
+             (fact.id, (fact.param_index, field, fact.component))
+         }))
+         .collect::<HashMap<_, _>>();
+-    if facts.is_empty() {
++    let guards = ctx.emit_sidecar.buffer_registry_guards.clone();
++    if facts.is_empty() && guards.is_empty() {
+         return Ok(());
+     }
+     let mut locations = HashMap::new();
+@@ -147,6 +148,12 @@
+         ],
+     ));
+     ctx.interface_buffer_var(table);
++    let guard_function = (!guards.is_empty())
++        .then(|| super::buffer_registry::registry_guard_function(ctx, table, vec_ty));
++    let guards = guards
++        .into_iter()
++        .map(|fact| (fact.id, fact))
++        .collect::<HashMap<_, _>>();
+ 
+     let zero = ctx.const_uint(0);
+     // `ctx.const_uint` mints a new constant the first time it sees a value, so the order these are
+@@ -171,6 +178,24 @@
+                 rewritten.push(inst);
+                 continue;
+             };
++            if let Some(guard) = guards.get(&result) {
++                let boolean = ctx.ty_bool();
++                let ulong = ctx.ty_ulong();
++                let size = ctx.const_int_of(ulong, guard.size as i64);
++                let access = ctx.const_int_of(ulong, guard.access as i64);
++                rewritten.push(Instruction::new(
++                    Op::FunctionCall,
++                    Some(boolean),
++                    Some(result),
++                    vec![
++                        Operand::IdRef(guard_function.unwrap()),
++                        Operand::IdRef(guard.address),
++                        Operand::IdRef(size),
++                        Operand::IdRef(access),
++                    ],
++                ));
++                continue;
++            }
+             let Some((row, component)) = locations.get(&result).copied() else {
+                 rewritten.push(inst);
+                 continue;
+@@ -198,5 +223,6 @@
+     }
+     ctx.emit_sidecar.buffer_address_words.clear();
+     ctx.emit_sidecar.buffer_range_words.clear();
++    ctx.emit_sidecar.buffer_registry_guards.clear();
+     Ok(())
+ }
+--- /dev/null
++++ b/src/passes/resources/buffer_registry.rs
+@@ -0,0 +1,268 @@
++//! Bounded lookup of GPU-produced addresses in the immutable declared-buffer registry.
++
++use super::*;
++use crate::spirv_module::{Block, Function};
++
++#[cfg(test)]
++mod tests;
++
++pub(super) fn registry_guard_function(ctx: &mut Ctx, table: Word, vector: Word) -> Word {
++    use super::gpu_arguments::value;
++    let uint = ctx.ty_uint();
++    let ulong = ctx.ty_ulong();
++    let boolean = ctx.ty_bool();
++    let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, vector);
++    let zero = ctx.const_uint(0);
++    let hundred = ctx.const_uint(100);
++    let three = ctx.const_uint(3);
++    let zero64 = ctx.const_int_of(ulong, 0);
++    let one64 = ctx.const_int_of(ulong, 1);
++    let three64 = ctx.const_int_of(ulong, 3);
++    let hundred64 = ctx.const_int_of(ulong, 100);
++    let eight64 = ctx.const_int_of(ulong, 8);
++    let twenty_four = ctx.const_int_of(ulong, 24);
++    let max64 = ctx.const_int_of(ulong, -1);
++    let denied = ctx.const_bool_of(boolean, false);
++    let accepted = ctx.const_bool_of(boolean, true);
++    let function_type = ctx.get_or_create(
++        Op::TypeFunction,
++        None,
++        vec![
++            Operand::IdRef(boolean),
++            Operand::IdRef(ulong),
++            Operand::IdRef(ulong),
++            Operand::IdRef(ulong),
++        ],
++    );
++    let function = ctx.module.fresh_id();
++    let address = ctx.module.fresh_id();
++    let size = ctx.module.fresh_id();
++    let required = ctx.module.fresh_id();
++    let entry = ctx.module.fresh_id();
++    let header = ctx.module.fresh_id();
++    let initialize = ctx.module.fresh_id();
++    let loop_header = ctx.module.fresh_id();
++    let body = ctx.module.fresh_id();
++    let found = ctx.module.fresh_id();
++    let next = ctx.module.fresh_id();
++    let continuing = ctx.module.fresh_id();
++    let exit = ctx.module.fresh_id();
++    let reject_short = ctx.module.fresh_id();
++    let reject_header = ctx.module.fresh_id();
++    let index = ctx.module.fresh_id();
++    let next_index = ctx.module.fresh_id();
++    let inst = |op, operands| Instruction::new(op, None, None, operands);
++    let branch = |label| inst(Op::Branch, vec![Operand::IdRef(label)]);
++    let conditional = |condition, yes, no| {
++        inst(
++            Op::BranchConditional,
++            vec![
++                Operand::IdRef(condition),
++                Operand::IdRef(yes),
++                Operand::IdRef(no),
++            ],
++        )
++    };
++    let selection = |label| {
++        inst(
++            Op::SelectionMerge,
++            vec![
++                Operand::IdRef(label),
++                Operand::SelectionControl(spirv::SelectionControl::NONE),
++            ],
++        )
++    };
++    let returned = |id| inst(Op::ReturnValue, vec![Operand::IdRef(id)]);
++    let binary = |ctx: &mut Ctx, block: &mut Vec<Instruction>, op, ty, a, b| {
++        value(
++            ctx,
++            block,
++            op,
++            ty,
++            vec![Operand::IdRef(a), Operand::IdRef(b)],
++        )
++    };
++    let load = |ctx: &mut Ctx, block: &mut Vec<Instruction>, at| {
++        let p = value(
++            ctx,
++            block,
++            Op::AccessChain,
++            pointer,
++            vec![
++                Operand::IdRef(table),
++                Operand::IdRef(zero),
++                Operand::IdRef(at),
++            ],
++        );
++        let words = value(ctx, block, Op::Load, vector, vec![Operand::IdRef(p)]);
++        value(ctx, block, Op::Bitcast, ulong, vec![Operand::IdRef(words)])
++    };
++    let mut first = vec![];
++    let words = value(
++        ctx,
++        &mut first,
++        Op::ArrayLength,
++        uint,
++        vec![Operand::IdRef(table), Operand::LiteralBit32(0)],
++    );
++    let enough = binary(
++        ctx,
++        &mut first,
++        Op::UGreaterThanEqual,
++        boolean,
++        words,
++        hundred,
++    );
++    first.extend([selection(header), conditional(enough, header, reject_short)]);
++    let mut checks = vec![];
++    let mut fields = vec![];
++    for offset in 96..100 {
++        let at = ctx.const_uint(offset);
++        fields.push(load(ctx, &mut checks, at));
++    }
++    let count = fields[0];
++    let stride_ok = binary(
++        ctx,
++        &mut checks,
++        Op::IEqual,
++        boolean,
++        fields[1],
++        twenty_four,
++    );
++    let reserved_ok = binary(ctx, &mut checks, Op::IEqual, boolean, fields[3], zero64);
++    let words64 = value(
++        ctx,
++        &mut checks,
++        Op::UConvert,
++        ulong,
++        vec![Operand::IdRef(words)],
++    );
++    let bytes = binary(ctx, &mut checks, Op::IMul, ulong, words64, eight64);
++    let bytes_ok = binary(ctx, &mut checks, Op::IEqual, boolean, fields[2], bytes);
++    let row_words = binary(ctx, &mut checks, Op::ISub, uint, words, hundred);
++    let capacity = binary(ctx, &mut checks, Op::UDiv, uint, row_words, three);
++    let capacity64 = value(
++        ctx,
++        &mut checks,
++        Op::UConvert,
++        ulong,
++        vec![Operand::IdRef(capacity)],
++    );
++    let count_ok = binary(
++        ctx,
++        &mut checks,
++        Op::ULessThanEqual,
++        boolean,
++        count,
++        capacity64,
++    );
++    let rows_bytes = binary(ctx, &mut checks, Op::IMul, ulong, count, twenty_four);
++    let prefix = ctx.const_int_of(ulong, 800);
++    let expected_bytes = binary(ctx, &mut checks, Op::IAdd, ulong, rows_bytes, prefix);
++    let exact = binary(ctx, &mut checks, Op::IEqual, boolean, expected_bytes, bytes);
++    let mut valid = stride_ok;
++    for check in [reserved_ok, bytes_ok, count_ok, exact] {
++        valid = binary(ctx, &mut checks, Op::LogicalAnd, boolean, valid, check);
++    }
++    checks.extend([
++        selection(initialize),
++        conditional(valid, initialize, reject_header),
++    ]);
++    let init = vec![branch(loop_header)];
++    let mut loop_test = vec![Instruction::new(
++        Op::Phi,
++        Some(ulong),
++        Some(index),
++        vec![
++            Operand::IdRef(zero64),
++            Operand::IdRef(initialize),
++            Operand::IdRef(next_index),
++            Operand::IdRef(continuing),
++        ],
++    )];
++    let more = binary(ctx, &mut loop_test, Op::ULessThan, boolean, index, count);
++    loop_test.push(inst(
++        Op::LoopMerge,
++        vec![
++            Operand::IdRef(exit),
++            Operand::IdRef(continuing),
++            Operand::LoopControl(spirv::LoopControl::NONE),
++        ],
++    ));
++    loop_test.push(conditional(more, body, exit));
++    let mut row = vec![];
++    let scaled = binary(ctx, &mut row, Op::IMul, ulong, index, three64);
++    let at = binary(ctx, &mut row, Op::IAdd, ulong, scaled, hundred64);
++    let length_at = binary(ctx, &mut row, Op::IAdd, ulong, at, one64);
++    let two64 = ctx.const_int_of(ulong, 2);
++    let access_at = binary(ctx, &mut row, Op::IAdd, ulong, at, two64);
++    let base = load(ctx, &mut row, at);
++    let length = load(ctx, &mut row, length_at);
++    let access = load(ctx, &mut row, access_at);
++    let base_ok = binary(ctx, &mut row, Op::INotEqual, boolean, base, zero64);
++    let nonempty = binary(ctx, &mut row, Op::INotEqual, boolean, length, zero64);
++    let maximum_length = binary(ctx, &mut row, Op::ISub, ulong, max64, base);
++    let no_overflow = binary(
++        ctx,
++        &mut row,
++        Op::ULessThanEqual,
++        boolean,
++        length,
++        maximum_length,
++    );
++    let above = binary(ctx, &mut row, Op::UGreaterThanEqual, boolean, address, base);
++    let fits = binary(ctx, &mut row, Op::UGreaterThanEqual, boolean, length, size);
++    let delta = binary(ctx, &mut row, Op::ISub, ulong, address, base);
++    let remaining = binary(ctx, &mut row, Op::ISub, ulong, length, size);
++    let range = binary(ctx, &mut row, Op::ULessThanEqual, boolean, delta, remaining);
++    let allowed = binary(ctx, &mut row, Op::BitwiseAnd, ulong, access, required);
++    let permission = binary(ctx, &mut row, Op::IEqual, boolean, allowed, required);
++    let mut matches = base_ok;
++    for check in [nonempty, no_overflow, above, fits, range, permission] {
++        matches = binary(ctx, &mut row, Op::LogicalAnd, boolean, matches, check);
++    }
++    row.extend([selection(next), conditional(matches, found, next)]);
++    let advance = vec![
++        Instruction::new(
++            Op::IAdd,
++            Some(ulong),
++            Some(next_index),
++            vec![Operand::IdRef(index), Operand::IdRef(one64)],
++        ),
++        branch(loop_header),
++    ];
++    let block = |label, instructions| Block {
++        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
++        instructions,
++    };
++    ctx.module.functions.push(Function {
++        def: Some(Instruction::new(
++            Op::Function,
++            Some(boolean),
++            Some(function),
++            vec![
++                Operand::FunctionControl(spirv::FunctionControl::NONE),
++                Operand::IdRef(function_type),
++            ],
++        )),
++        end: Some(inst(Op::FunctionEnd, vec![])),
++        parameters: [address, size, required]
++            .into_iter()
++            .map(|id| Instruction::new(Op::FunctionParameter, Some(ulong), Some(id), vec![]))
++            .collect(),
++        blocks: vec![
++            block(entry, first),
++            block(reject_short, vec![returned(denied)]),
++            block(header, checks),
++            block(reject_header, vec![returned(denied)]),
++            block(initialize, init),
++            block(loop_header, loop_test),
++            block(body, row),
++            block(found, vec![returned(accepted)]),
++            block(next, vec![branch(continuing)]),
++            block(continuing, advance),
++            block(exit, vec![returned(denied)]),
++        ],
++    });
++    function
++}
+--- /dev/null
++++ b/src/passes/resources/buffer_registry/tests.rs
+@@ -0,0 +1,193 @@
++use crate::spirv_module::{load_bytes, Operand};
++use spirv::Op;
++use std::collections::HashMap;
++
++trait RegistryId {
++    fn registry_id(&self) -> u32;
++}
++impl RegistryId for Operand {
++    fn registry_id(&self) -> u32 {
++        match self {
++            Self::IdRef(id) => *id,
++            _ => panic!("expected an id: {self:?}"),
++        }
++    }
++}
++
++// Interpret the generated registry helper so boundary tests exercise its actual SPIR-V branches.
++fn execute_guard(bytes: &[u8], table: &[u64], arguments: [u64; 3]) -> bool {
++    let module = load_bytes(bytes).unwrap();
++    let call = module
++        .functions
++        .iter()
++        .flat_map(|function| &function.blocks)
++        .flat_map(|block| &block.instructions)
++        .find(|instruction| instruction.class.opcode == Op::FunctionCall)
++        .unwrap();
++    let function_id = call.operands[0].registry_id();
++    let function = module
++        .functions
++        .iter()
++        .find(|function| function.def.as_ref().unwrap().result_id == Some(function_id))
++        .unwrap();
++    let mut values = HashMap::new();
++    for instruction in &module.types_global_values {
++        let value = match instruction.class.opcode {
++            Op::Constant => match instruction.operands[0] {
++                Operand::LiteralBit32(value) => u64::from(value),
++                Operand::LiteralBit64(value) => value,
++                _ => panic!("unexpected constant {instruction:?}"),
++            },
++            Op::ConstantTrue => 1,
++            Op::ConstantFalse => 0,
++            _ => continue,
++        };
++        values.insert(instruction.result_id.unwrap(), value);
++    }
++    for (parameter, value) in function.parameters.iter().zip(arguments) {
++        values.insert(parameter.result_id.unwrap(), value);
++    }
++    let mut current = function.blocks[0]
++        .label
++        .as_ref()
++        .unwrap()
++        .result_id
++        .unwrap();
++    let mut previous = 0;
++    for _ in 0..4096 {
++        let block = function
++            .blocks
++            .iter()
++            .find(|block| block.label.as_ref().unwrap().result_id == Some(current))
++            .unwrap();
++        for instruction in &block.instructions {
++            let id = |index: usize| instruction.operands[index].registry_id();
++            let read = |index: usize| values[&id(index)];
++            let value = match instruction.class.opcode {
++                Op::ArrayLength => table.len() as u64,
++                Op::AccessChain => read(2),
++                Op::Load => table[read(0) as usize],
++                Op::Bitcast | Op::CopyObject | Op::UConvert => read(0),
++                Op::CompositeExtract => match instruction.operands[1] {
++                    Operand::LiteralBit32(component) => (read(0) >> (32 * component)) & 0xffff_ffff,
++                    _ => panic!("unexpected registry vector extraction"),
++                },
++                Op::CompositeConstruct => (read(0) & 0xffff_ffff) | (read(1) << 32),
++                Op::IAdd => read(0).wrapping_add(read(1)),
++                Op::ISub => read(0).wrapping_sub(read(1)),
++                Op::IMul => read(0).wrapping_mul(read(1)),
++                Op::UDiv => read(0) / read(1),
++                Op::IEqual => u64::from(read(0) == read(1)),
++                Op::INotEqual => u64::from(read(0) != read(1)),
++                Op::UGreaterThanEqual => u64::from(read(0) >= read(1)),
++                Op::ULessThanEqual => u64::from(read(0) <= read(1)),
++                Op::ULessThan => u64::from(read(0) < read(1)),
++                Op::BitwiseAnd => read(0) & read(1),
++                Op::ShiftRightLogical => read(0) >> read(1),
++                Op::ShiftLeftLogical => read(0) << read(1),
++                Op::BitwiseOr => read(0) | read(1),
++                Op::LogicalAnd => u64::from(read(0) != 0 && read(1) != 0),
++                Op::LogicalOr => u64::from(read(0) != 0 || read(1) != 0),
++                Op::LogicalNot => u64::from(read(0) == 0),
++                Op::Select => {
++                    if read(0) != 0 {
++                        read(1)
++                    } else {
++                        read(2)
++                    }
++                }
++                Op::Phi => {
++                    let pair = instruction
++                        .operands
++                        .chunks_exact(2)
++                        .find(|pair| pair[1].registry_id() == previous)
++                        .unwrap();
++                    values[&pair[0].registry_id()]
++                }
++                Op::SelectionMerge | Op::LoopMerge => continue,
++                Op::Branch | Op::BranchConditional => {
++                    let target = if instruction.class.opcode == Op::Branch {
++                        id(0)
++                    } else if read(0) != 0 {
++                        id(1)
++                    } else {
++                        id(2)
++                    };
++                    previous = current;
++                    current = target;
++                    break;
++                }
++                Op::ReturnValue => return read(0) != 0,
++                _ => panic!("unmodeled registry instruction {instruction:?}"),
++            };
++            if let Some(result) = instruction.result_id {
++                values.insert(result, value);
++            }
++        }
++    }
++    panic!("registry failed to terminate within the test's row bound");
++}
++
++#[test]
++fn emitted_registry_checks_complete_ranges_permissions_and_malformed_headers() {
++    let source = r#"
++define void @consume(ptr addrspace(2) %args, ptr addrspace(1) %out) {
++entry:
++  %child = load ptr addrspace(1), ptr addrspace(2) %args, align 8
++  %value = load i32, ptr addrspace(1) %child, align 4
++  store i32 %value, ptr addrspace(1) %out, align 4
++  ret void
++}
++!air.kernel = !{!0}
++!0 = !{ptr @consume, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"uint*"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++"#;
++    let bytes = crate::translate_sanitized_native(
++        source,
++        crate::passes::Stage::Kernel,
++        &std::env::temp_dir(),
++    )
++    .unwrap();
++    let base = 0x18_0000_0000;
++    let mut table = vec![0; 100 + 257 * 3];
++    let extent = (table.len() * 8) as u64;
++    table[96..100].copy_from_slice(&[257, 24, extent, 0]);
++    let last = 100 + 256 * 3;
++    table[last..].copy_from_slice(&[base, 64, 1]);
++    for (address, size, access, expected) in [
++        (base, 4, 1, true),
++        (base + 60, 4, 1, true),
++        (base + 61, 4, 1, false),
++        (base - 1, 4, 1, false),
++        (base, 65, 1, false),
++        (base, 4, 2, false),
++        (base, 4, 3, false),
++        (base & 0xffff_ffff, 4, 1, false),
++        (0, 4, 1, false),
++        (u64::MAX - 1, 4, 1, false),
++    ] {
++        assert_eq!(
++            execute_guard(&bytes, &table, [address, size, access]),
++            expected,
++            "address={address:x} size={size} access={access}"
++        );
++    }
++    table[last + 2] = 3;
++    assert!(execute_guard(&bytes, &table, [base, 64, 3]));
++    table[last] = u64::MAX - 1;
++    assert!(!execute_guard(&bytes, &table, [u64::MAX - 1, 4, 1]));
++    table[last] = base;
++    for (word, malformed) in [(96, u64::MAX), (96, 258), (97, 16), (98, 800), (99, 1)] {
++        let valid = table[word];
++        table[word] = malformed;
++        assert!(
++            !execute_guard(&bytes, &table, [base, 4, 1]),
++            "header word {word}"
++        );
++        table[word] = valid;
++    }
++    assert!(!execute_guard(&bytes, &table[..99], [base, 4, 1]));
++}
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -4,6 +4,7 @@
+ 
+ mod bindings;
+ mod buffer_addresses;
++mod buffer_registry;
+ mod collapse;
+ mod discovery;
+ pub(in crate::passes) mod fragment_control;

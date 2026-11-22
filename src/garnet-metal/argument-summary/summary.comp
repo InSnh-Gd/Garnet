@@ -1,0 +1,114 @@
+#version 450
+
+/*
+ * Scan every byte start in one source chunk and mark candidate tokens that
+ * occur there. The CPU planner gives each job one dictionary page, so the
+ * binary search and scratch working set per dispatch are bounded.
+ *
+ * Source bytes are read through uint words. Token assembly is little-endian
+ * and deliberately uses two uint loads; no 64-bit integer or atomic support is
+ * required.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Source {
+    uint words[];
+} source;
+
+layout(set = 0, binding = 1, std430) readonly buffer Dictionary {
+    uvec2 tokens[]; /* one page-local (lo, hi), sorted by the full token */
+} dictionary;
+
+layout(set = 0, binding = 2, std430) buffer Summary {
+    uint bits[];
+} summary;
+
+layout(push_constant, std430) uniform Push {
+    uint source_begin;        /* first byte start to test, relative to binding 0 */
+    uint source_count;        /* number of byte starts to test in this chunk */
+    uint source_end;          /* available bytes, including up to 7 overlap bytes */
+    uint dictionary_begin;    /* first global candidate index in this page */
+    uint dictionary_count;    /* candidates in this page */
+    uint dictionary_page;     /* zero-based page ordinal */
+    uint dictionary_page_count;
+    uint output_word_base;    /* first global bit word represented by binding 2 */
+} push;
+
+bool load_le32(uint byte_offset, out uint value) {
+    uint word_index = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint word_length = uint(source.words.length());
+    if (word_index >= word_length)
+        return false;
+    value = source.words[word_index] >> shift;
+    if (shift == 0u)
+        return true;
+    if (word_index + 1u >= word_length)
+        return false;
+    value |= source.words[word_index + 1u] << (32u - shift);
+    return true;
+}
+
+bool candidate_less(uvec2 a, uvec2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.source_count || push.dictionary_page >= push.dictionary_page_count ||
+        push.dictionary_page_count == 0u || push.dictionary_count == 0u)
+        return;
+    if ((push.dictionary_begin & 31u) != 0u)
+        return;
+    if (push.source_begin > 0xffffffffu - push.source_count)
+        return;
+
+    uint start_limit = push.source_begin + push.source_count;
+    if (push.source_end < 8u || start_limit > push.source_end)
+        return;
+    if (index > 0xffffffffu - push.source_begin)
+        return;
+
+    uint position = push.source_begin + index;
+    if (position > push.source_end - 8u)
+        return;
+
+    uint token_lo;
+    uint token_hi;
+    if (!load_le32(position, token_lo) ||
+        !load_le32(position + 4u, token_hi))
+        return;
+    uvec2 token = uvec2(token_lo, token_hi);
+    if ((token.y >> 16u) != 0x5244u)
+        return;
+
+    uint dictionary_length = uint(dictionary.tokens.length());
+    uint count = min(push.dictionary_count, dictionary_length);
+    if (count == 0u)
+        return;
+
+    uint low = 0u;
+    uint high = count;
+    while (low < high) {
+        uint middle = low + (high - low) / 2u;
+        if (candidate_less(dictionary.tokens[middle], token))
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    if (low >= count)
+        return;
+    uvec2 found = dictionary.tokens[low];
+    if (found != token)
+        return;
+    if (push.dictionary_begin > 0xffffffffu - low)
+        return;
+
+    uint global_index = push.dictionary_begin + low;
+    uint global_word = global_index >> 5u;
+    if (global_word < push.output_word_base)
+        return;
+    uint local_word = global_word - push.output_word_base;
+    if (local_word < uint(summary.bits.length()))
+        atomicOr(summary.bits[local_word], 1u << (global_index & 31u));
+}

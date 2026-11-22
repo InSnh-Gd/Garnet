@@ -1,0 +1,126 @@
+diff --git a/src/passes/resources/collapse.rs b/src/passes/resources/collapse.rs
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -884,9 +884,6 @@
+         }
+     }
+ 
+-    // Remove parameters.
+-    ctx.module.functions[entry_idx].parameters.clear();
+-
+     // Inject loads at the top of the first block, but AFTER any leading function-local OpVariables:
+     // SPIR-V requires every OpVariable in a function to be among the first instructions of the entry
+     // block, so the load (a non-Variable instruction) must follow them. Order among the loads is
+@@ -943,6 +940,8 @@
+             ctx, entry_idx, pid, var, block_ty, elem_ty, defs,
+         ));
+     }
++    // Remove parameters.
++    ctx.module.functions[entry_idx].parameters.clear();
+     if !nested_air_ordinal_roots.is_empty() {
+         remap_nested_air_struct_accesses(ctx, entry_idx, &nested_air_ordinal_roots, defs);
+     }
+diff --git a/src/passes/resources/rewrites/air_struct_remap.rs b/src/passes/resources/rewrites/air_struct_remap.rs
+--- a/src/passes/resources/rewrites/air_struct_remap.rs
++++ b/src/passes/resources/rewrites/air_struct_remap.rs
+@@ -34,6 +34,33 @@
+     Some(cur)
+ }
+ 
++pub(in crate::passes) fn direct_buffer_element_access(
++    ctx: &Ctx,
++    types: &HashMap<Word, Instruction>,
++    source_pointer_type: Word,
++    element: Word,
++    instruction: &Instruction,
++) -> Option<Word> {
++    if !matches!(
++        instruction.class.opcode,
++        Op::AccessChain | Op::InBoundsAccessChain
++    ) || !types.get(&element).is_some_and(|definition| {
++        matches!(
++            definition.class.opcode,
++            Op::TypeArray | Op::TypeVector | Op::TypeMatrix
++        )
++    }) {
++        return None;
++    }
++    let source_pointee = ptr_pointee(types, source_pointer_type)?;
++    if !types_structurally_match(ctx, types, source_pointee, element) {
++        return None;
++    }
++    let reached = type_after_spirv_access_operands(types, element, &instruction.operands[1..])?;
++    let original = ptr_pointee(types, instruction.result_type?)?;
++    types_structurally_match(ctx, types, reached, original).then_some(original)
++}
++
+ /// Rewrite a struct buffer that AIR indexes as an implicit array of records. The native emitter omits
+ /// LLVM GEP's leading zero for record-0 member paths, so each chain is classified before mutation:
+ /// direct member paths become `var, 0, 0, ...old_indices`; record-indexed paths become
+@@ -85,14 +112,27 @@
+                 if old_indices.is_empty() {
+                     None
+                 } else {
+-                    let (operands, pointee) = if let Some((indices, pointee)) =
+-                        remap_direct_air_struct_access(
++                    let direct_element = value_types.get(&pid).and_then(|source_pointer_type| {
++                        direct_buffer_element_access(
+                             ctx,
+                             &types,
++                            *source_pointer_type,
+                             elem_ty,
+-                            &old_indices,
+-                            result_type,
+-                        ) {
++                            &ctx.module.functions[entry_idx].blocks[bi].instructions[ii],
++                        )
++                    });
++                    let (operands, pointee) = if let Some(pointee) = direct_element {
++                        let mut operands =
++                            vec![Operand::IdRef(var), Operand::IdRef(u0), Operand::IdRef(u0)];
++                        operands.extend(old_indices);
++                        (operands, Some(pointee))
++                    } else if let Some((indices, pointee)) = remap_direct_air_struct_access(
++                        ctx,
++                        &types,
++                        elem_ty,
++                        &old_indices,
++                        result_type,
++                    ) {
+                         let mut operands = vec![
+                             Operand::IdRef(var),
+                             Operand::IdRef(u0), // Block member 0: RuntimeArray<Struct>.
+diff --git a/src/passes/workgroup/pointers.rs b/src/passes/workgroup/pointers.rs
+--- a/src/passes/workgroup/pointers.rs
++++ b/src/passes/workgroup/pointers.rs
+@@ -243,6 +243,30 @@
+ 
+             let original_pointee = result_type.and_then(|ty| ptr_pointee(&types, ty));
+ 
++            let typed_element_path = (|| {
++                if !prepend_member0 {
++                    return None;
++                }
++                let element = runtime_array_block_element_type(&types, block_ty)?;
++                direct_buffer_element_access(
++                    ctx,
++                    &types,
++                    *value_types.get(&pid)?,
++                    element,
++                    &ctx.module.functions[entry_idx].blocks[bi].instructions[ii],
++                )
++            })();
++            if let Some(pointee) = typed_element_path {
++                let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, pointee);
++                let mut operands =
++                    vec![Operand::IdRef(var), Operand::IdRef(u0), Operand::IdRef(u0)];
++                operands.extend(old_indices);
++                let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
++                inst.operands = operands;
++                inst.result_type = Some(ptr_ty);
++                continue;
++            }
++
+             // A metadata-gated buffer can retain an aggregate LLVM GEP even when its descriptor
+             // interface is necessarily represented as `{ RuntimeArray<scalar> }`. The emitted
+             // access-chain operands still describe the source aggregate (`row, lane`), so merely

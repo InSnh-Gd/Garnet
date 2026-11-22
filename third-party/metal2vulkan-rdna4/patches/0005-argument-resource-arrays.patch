@@ -1,0 +1,477 @@
+diff --git a/src/meta/embedded.rs b/src/meta/embedded.rs
+--- a/src/meta/embedded.rs
++++ b/src/meta/embedded.rs
+@@ -70,7 +70,7 @@
+     pub synthetic_texture_index: u32,
+ }
+ 
+-/// A flat scalar sampler handle owned by an AIR indirect argument buffer.
++/// A fixed sampler field owned by an AIR indirect argument buffer.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct EmbeddedSampler {
+     pub buffer_param_index: u32,
+@@ -78,6 +78,7 @@
+     pub field_offset: u32,
+     pub field_ordinal: u32,
+     pub argument_index: u32,
++    pub array_length: Option<u32>,
+     pub synthetic_sampler_index: u32,
+ }
+ 
+@@ -186,6 +187,7 @@
+                 field_offset: member.field_offset,
+                 field_ordinal: member.field_ordinal,
+                 argument_index: member.argument_index(node),
++                array_length: embedded_sampler_length(&member, node).flatten(),
+                 synthetic_sampler_index: next,
+             });
+             // Exhaustion is rejected against the selected descriptor layout in stage input.
+@@ -196,10 +198,29 @@
+ }
+ 
+ fn expressible_embedded_sampler(member: &ArgumentMember, node: &str) -> bool {
+-    member.depth == 0
+-        && !member.in_array_wrapper
+-        && member.array_len <= 1
++    !member.in_array_wrapper
+         && role_strings(node).iter().any(|role| role == "sampler")
++        && embedded_sampler_length(member, node).is_some()
++}
++
++fn embedded_sampler_length(member: &ArgumentMember, node: &str) -> Option<Option<u32>> {
++    let name = arg_type_name(node).unwrap_or_default();
++    let compact = name
++        .chars()
++        .filter(|ch| !ch.is_whitespace())
++        .collect::<String>();
++    if compact.starts_with("array<sampler,") {
++        let length = compact
++            .strip_prefix("array<sampler,")?
++            .strip_suffix('>')?
++            .parse::<u32>()
++            .ok()?;
++        return (length > 0).then_some(Some(length));
++    }
++    if compact != "sampler" {
++        return None;
++    }
++    Some((member.array_len > 0).then_some(member.array_len))
+ }
+ 
+ /// The texture shape of an `air.indirect_argument` member the embedded lowering can materialize a
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -3603,6 +3603,9 @@
+     }
+     for sampler in samplers {
+         let mut binding = sampler_binding(sampler.synthetic_sampler_index, None);
++        if let Some(descriptor) = &mut binding.descriptor {
++            descriptor.count = sampler.array_length.unwrap_or(1);
++        }
+         binding.kind = ResourceKind::EmbeddedArgBufferSampler;
+         binding.embedded_source = Some(EmbeddedArgBuffer {
+             buffer_param_index: sampler.buffer_param_index,
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -2567,8 +2567,7 @@
+     Ok(())
+ }
+ 
+-/// Recover only statically addressed scalar sampler fields. A token is not a device address:
+-/// replace the opaque field load by a real descriptor load, retaining owner/offset in reflection.
++/// Replace opaque sampler tokens with descriptors, retaining owner/offset in reflection.
+ fn register_embedded_samplers(
+     ctx: &mut Ctx,
+     entry_idx: usize,
+@@ -2586,6 +2585,10 @@
+             .get(sampler.buffer_param_index as usize)
+             .and_then(|parameter| parameter.result_id)
+             .ok_or_else(|| "embedded sampler owner parameter is missing".to_string())?;
++        if let Some(length) = sampler.array_length {
++            register_embedded_sampler_array(ctx, entry_idx, sampler, root, binding, length)?;
++            continue;
++        }
+         if ctx
+             .emit_sidecar
+             .buffer_pointer_dynamic_field_loads
+@@ -2631,6 +2634,132 @@
+             .unwrap_or(entry.instructions.len());
+         entry.instructions.splice(at..at, loads);
+     }
++    Ok(())
++}
++
++fn register_embedded_sampler_array(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++    sampler: &crate::meta::EmbeddedSampler,
++    root: Word,
++    binding: u32,
++    length: u32,
++) -> Result<(), String> {
++    if length == 0 {
++        return Err("empty argument-buffer sampler array".into());
++    }
++    let sampler_ty = ctx.ty_sampler();
++    let array_ty = ctx.ty_array(sampler_ty, length);
++    let array_ptr = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
++    let elem_ptr = ctx.ty_ptr(StorageClass::UniformConstant, sampler_ty);
++    let var = ctx.module.fresh_id();
++    ctx.new_globals.push(Instruction::new(
++        Op::Variable,
++        Some(array_ptr),
++        Some(var),
++        vec![Operand::StorageClass(StorageClass::UniformConstant)],
++    ));
++    decorate_binding(&mut ctx.module, var, ctx.descriptor_layout.set, binding);
++    ctx.interface_buffer_var(var);
++    let start = u64::from(sampler.field_offset);
++    let end = start + u64::from(length) * 8;
++    let fixed = ctx
++        .emit_sidecar
++        .buffer_pointer_field_loads
++        .iter()
++        .filter(|fact| {
++            fact.root == root
++                && fact.byte_offset >= start
++                && fact.byte_offset < end
++                && (fact.byte_offset - start) % 8 == 0
++        })
++        .map(|fact| (fact.id, ((fact.byte_offset - start) / 8) as u32))
++        .collect::<Vec<_>>();
++    let mut handles = fixed
++        .into_iter()
++        .map(|(id, element)| (id, ctx.const_uint(element)))
++        .collect::<HashMap<_, _>>();
++    handles.extend(
++        ctx.emit_sidecar
++            .buffer_pointer_dynamic_field_loads
++            .iter()
++            .filter(|fact| fact.root == root && fact.byte_offset == start)
++            .map(|fact| (fact.id, fact.index)),
++    );
++    // Sidecar facts and call operands can name opposite ends of the same opaque copy.
++    let copies = ctx.module.functions[entry_idx]
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .filter(|inst| matches!(inst.class.opcode, Op::CopyObject | Op::Bitcast))
++        .filter_map(|inst| match (inst.result_id, inst.operands.first()) {
++            (Some(id), Some(Operand::IdRef(source))) => Some((id, *source)),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    loop {
++        let before = handles.len();
++        for &(id, source) in &copies {
++            if let Some(&index) = handles.get(&id) {
++                handles.entry(source).or_insert(index);
++            }
++            if let Some(&index) = handles.get(&source) {
++                handles.entry(id).or_insert(index);
++            }
++        }
++        if handles.len() == before {
++            break;
++        }
++    }
++    let names = air_names(&ctx.module);
++    for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
++        let instructions = ctx.module.functions[entry_idx].blocks[block_idx]
++            .instructions
++            .clone();
++        let mut rewritten = Vec::with_capacity(instructions.len());
++        for mut inst in instructions {
++            let index = if inst.class.opcode == Op::FunctionCall {
++                match (inst.operands.first(), inst.operands.get(2)) {
++                    (Some(Operand::IdRef(callee)), Some(Operand::IdRef(handle)))
++                        if names.get(callee).is_some_and(|name| {
++                            name.starts_with("air.sample_") || name.starts_with("air.gather_")
++                        }) =>
++                    {
++                        handles.get(handle).copied()
++                    }
++                    _ => None,
++                }
++            } else {
++                None
++            };
++            if let Some(index) = index {
++                let pointer = ctx.module.fresh_id();
++                let value = ctx.module.fresh_id();
++                rewritten.push(Instruction::new(
++                    Op::AccessChain,
++                    Some(elem_ptr),
++                    Some(pointer),
++                    vec![Operand::IdRef(var), Operand::IdRef(index)],
++                ));
++                rewritten.push(Instruction::new(
++                    Op::Load,
++                    Some(sampler_ty),
++                    Some(value),
++                    vec![Operand::IdRef(pointer)],
++                ));
++                inst.operands[2] = Operand::IdRef(value);
++            }
++            rewritten.push(inst);
++        }
++        ctx.module.functions[entry_idx].blocks[block_idx].instructions = rewritten;
++    }
++    super::resources::retire_dead_pointer_projections(ctx, entry_idx, handles.keys().copied());
++    ctx.emit_sidecar
++        .buffer_pointer_dynamic_field_loads
++        .retain(|fact| !handles.contains_key(&fact.id));
++    ctx.emit_sidecar
++        .buffer_pointer_field_loads
++        .retain(|fact| !handles.contains_key(&fact.id));
+     Ok(())
+ }
+ 
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -3349,6 +3349,8 @@
+     module_cleanup::gc_dead_globals(&mut ctx);
+     debug_phase!("complete");
+ 
++    resources::decorate_nonuniform_descriptor_accesses(&mut ctx);
++
+     let placeholder_descriptor_bindings = surviving_placeholder_bindings(&ctx);
+     Ok(Transformed {
+         module: ctx.module,
+diff --git a/src/passes/resources/mod.rs b/src/passes/resources/mod.rs
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -6,6 +6,7 @@
+ mod buffer_addresses;
+ mod collapse;
+ mod discovery;
++mod nonuniform;
+ mod query_select;
+ pub(in crate::passes) mod rewrites;
+ mod selected_load;
+@@ -15,6 +16,7 @@
+ pub(in crate::passes) use buffer_addresses::*;
+ pub(in crate::passes) use collapse::*;
+ pub(in crate::passes) use discovery::*;
++pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
+ pub(in crate::passes) use query_select::rewrite_resource_query_selects;
+ pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
+ pub(in crate::passes) use texture_array::{
+diff --git a/src/passes/resources/nonuniform.rs b/src/passes/resources/nonuniform.rs
+new file mode 100644
+--- /dev/null
++++ b/src/passes/resources/nonuniform.rs
+@@ -0,0 +1,168 @@
++//! Descriptor indices derived from runtime values may differ between invocations.
++
++use std::collections::{HashMap, HashSet};
++
++use super::*;
++use spirv::{Capability, Decoration};
++
++pub(crate) fn decorate_nonuniform_descriptor_accesses(ctx: &mut Ctx) {
++    let defs = ctx
++        .module
++        .types_global_values
++        .iter()
++        .filter_map(|inst| inst.result_id.map(|id| (id, inst)))
++        .collect::<HashMap<_, _>>();
++    let constants = defs
++        .iter()
++        .filter_map(|(&id, inst)| {
++            matches!(inst.class.opcode, Op::Constant | Op::ConstantNull).then_some(id)
++        })
++        .collect::<HashSet<_>>();
++    let mut resources = HashMap::new();
++    for (&id, inst) in &defs {
++        if inst.class.opcode != Op::Variable {
++            continue;
++        }
++        let Some(pointer) = inst.result_type.and_then(|ty| defs.get(&ty)) else {
++            continue;
++        };
++        if pointer.operands.first() != Some(&Operand::StorageClass(StorageClass::UniformConstant)) {
++            continue;
++        }
++        let Some(Operand::IdRef(array_ty)) = pointer.operands.get(1) else {
++            continue;
++        };
++        let Some(array) = defs.get(array_ty) else {
++            continue;
++        };
++        if !matches!(array.class.opcode, Op::TypeArray | Op::TypeRuntimeArray) {
++            continue;
++        }
++        let Some(Operand::IdRef(element)) = array.operands.first() else {
++            continue;
++        };
++        let Some(element) = defs.get(element) else {
++            continue;
++        };
++        let capability = match element.class.opcode {
++            Op::TypeSampler => Capability::SampledImageArrayNonUniformIndexing,
++            Op::TypeImage => {
++                let storage = element.operands.get(5) == Some(&Operand::LiteralBit32(2));
++                match element.operands.get(1) {
++                    Some(Operand::Dim(spirv::Dim::DimBuffer)) => {
++                        if storage {
++                            Capability::StorageTexelBufferArrayNonUniformIndexing
++                        } else {
++                            Capability::UniformTexelBufferArrayNonUniformIndexing
++                        }
++                    }
++                    Some(Operand::Dim(spirv::Dim::DimSubpassData)) => {
++                        Capability::InputAttachmentArrayNonUniformIndexing
++                    }
++                    _ => {
++                        if storage {
++                            Capability::StorageImageArrayNonUniformIndexing
++                        } else {
++                            Capability::SampledImageArrayNonUniformIndexing
++                        }
++                    }
++                }
++            }
++            _ => continue,
++        };
++        resources.insert(id, (capability, false));
++    }
++    if resources.is_empty() {
++        return;
++    }
++    let mut capabilities = HashSet::new();
++    let mut decorated = HashSet::new();
++    loop {
++        let before = (resources.len(), decorated.len());
++        for function in &ctx.module.functions {
++            for inst in function.blocks.iter().flat_map(|block| &block.instructions) {
++                let Some(id) = inst.result_id else { continue };
++                if resources.get(&id).is_some_and(|(_, dynamic)| *dynamic) {
++                    continue;
++                }
++                let source = match inst.class.opcode {
++                    Op::AccessChain
++                    | Op::InBoundsAccessChain
++                    | Op::Load
++                    | Op::CopyObject
++                    | Op::Bitcast
++                    | Op::Image => inst.operands.first().and_then(|operand| match operand {
++                        Operand::IdRef(id) => resources.get(id).copied(),
++                        _ => None,
++                    }),
++                    Op::SampledImage | Op::Select | Op::Phi => inst
++                        .operands
++                        .iter()
++                        .filter_map(|operand| match operand {
++                            Operand::IdRef(id) => resources.get(id).copied(),
++                            _ => None,
++                        })
++                        .find(|(_, dynamic)| *dynamic),
++                    _ => None,
++                };
++                let Some((capability, mut dynamic)) = source else {
++                    continue;
++                };
++                if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
++                    dynamic |= inst.operands.iter().skip(1).any(|operand| match operand {
++                        Operand::IdRef(index) => !constants.contains(index),
++                        _ => false,
++                    });
++                }
++                resources.insert(id, (capability, dynamic));
++                if dynamic {
++                    capabilities.insert(capability);
++                    decorated.insert(id);
++                }
++            }
++        }
++        if before == (resources.len(), decorated.len()) {
++            break;
++        }
++    }
++    if decorated.is_empty() {
++        return;
++    }
++    if !ctx.module.extensions.iter().any(|inst| {
++        inst.operands.first()
++            == Some(&Operand::LiteralString(
++                "SPV_EXT_descriptor_indexing".into(),
++            ))
++    }) {
++        ctx.module.extensions.push(Instruction::new(
++            Op::Extension,
++            None,
++            None,
++            vec![Operand::LiteralString("SPV_EXT_descriptor_indexing".into())],
++        ));
++    }
++    ctx.add_capability(Capability::ShaderNonUniform);
++    let mut capabilities = capabilities.into_iter().collect::<Vec<_>>();
++    capabilities.sort_unstable_by_key(|capability| *capability as u32);
++    for capability in capabilities {
++        ctx.add_capability(capability);
++    }
++    let mut ids = decorated.into_iter().collect::<Vec<_>>();
++    ids.sort_unstable();
++    for id in ids {
++        let operands = vec![
++            Operand::IdRef(id),
++            Operand::Decoration(Decoration::NonUniform),
++        ];
++        if !ctx
++            .module
++            .annotations
++            .iter()
++            .any(|inst| inst.class.opcode == Op::Decorate && inst.operands == operands)
++        {
++            ctx.module
++                .annotations
++                .push(Instruction::new(Op::Decorate, None, None, operands));
++        }
++    }
++}
+diff --git a/src/passes/resources/texture_array.rs b/src/passes/resources/texture_array.rs
+--- a/src/passes/resources/texture_array.rs
++++ b/src/passes/resources/texture_array.rs
+@@ -20,8 +20,8 @@
+ //! carries the same texture the Metal handle referenced. Floor-safe: fires ONLY on a param the
+ //! stage-input pass bound as `ImageArray` (a texture-handle array shape whose real handle loads the
+ //! single-image path mis-emits as an illegal `OpLoad` of a pointer from an image); no single-texture
+-//! case is touched. The index is `air.is_uniform`-marked in the source, so plain uniform indexing is
+-//! legal (no `ShaderNonUniform`).
++//! case is touched. The final descriptor-indexing pass conservatively marks runtime resource
++//! selections non-uniform, including the resulting sampled image.
+ 
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+diff --git a/tests/argument_buffer_sampler.rs b/tests/argument_buffer_sampler.rs
+--- a/tests/argument_buffer_sampler.rs
++++ b/tests/argument_buffer_sampler.rs
+@@ -103,6 +103,24 @@
+         "i32 16, i32 8, i32 2, !\"sampler\"",
+     );
+     let metadata = parse_air_kernel_meta(&source).unwrap();
++    assert_eq!(metadata.embedded_samplers.len(), 1);
++    assert_eq!(metadata.embedded_samplers[0].array_length, Some(2));
++    assert!(metadata.unsurfaced_embedded_resources.is_empty());
++    let error = translate(&source).unwrap_err();
++    assert!(error.contains("32-byte member layout") && error.contains("24-byte argument"));
++    let (_, reflection) = translate(&source.replace("i32 24", "i32 32")).unwrap();
++    let sampler = reflection
++        .bindings
++        .iter()
++        .find(|binding| binding.kind == ResourceKind::EmbeddedArgBufferSampler)
++        .unwrap();
++    assert_eq!(sampler.descriptor.as_ref().unwrap().count, 2);
++}
++
++#[test]
++fn unknown_length_sampler_array_stays_a_refusal() {
++    let source = SOURCE.replace("!\"sampler\"", "!\"array_ref<sampler>\"");
++    let metadata = parse_air_kernel_meta(&source).unwrap();
+     assert!(metadata.embedded_samplers.is_empty());
+     assert!(metadata
+         .unsurfaced_embedded_resources

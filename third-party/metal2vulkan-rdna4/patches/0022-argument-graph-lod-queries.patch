@@ -1,0 +1,71 @@
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -16,6 +16,17 @@
+     multisampled: bool,
+ }
+ 
++fn lod_query(name: &str) -> bool {
++    matches!(
++        name,
++        "air.calculate_clamped_lod_texture_2d" | "air.calculate_unclamped_lod_texture_2d"
++    )
++}
++
++fn sampled_operation(name: &str) -> bool {
++    name.starts_with("air.sample_") || name.starts_with("air.gather_") || lod_query(name)
++}
++
+ fn image_query(name: &str) -> Option<(u32, bool)> {
+     for (prefix, field, mip) in [
+         ("air.get_width_", 0, true),
+@@ -195,7 +206,7 @@
+     inst: &Instruction,
+     defs: &HashMap<Word, Instruction>,
+ ) -> Result<Option<ImageShape>, String> {
+-    let sample = name.starts_with("air.sample_") || name.starts_with("air.gather_");
++    let sample = sampled_operation(name);
+     let read = name.starts_with("air.read_texture") || name.starts_with("air.read_depth");
+     let write = name.starts_with("air.write_texture");
+     if !(sample || read || write) {
+@@ -219,6 +230,8 @@
+                 ImageComp::Sint
+             }
+         }
++        // LOD query symbols do not encode the component type; another typed use must establish it.
++        _ if lod_query(name) => return Ok(None),
+         _ => return Err(format!("unknown GPU argument image component in {name}")),
+     };
+     let storage = if sample {
+@@ -516,8 +529,7 @@
+                     let Some(&(low, high)) = payloads.get(handle) else {
+                         continue;
+                     };
+-                    let image_operation = name.starts_with("air.sample_")
+-                        || name.starts_with("air.gather_")
++                    let image_operation = sampled_operation(name)
+                         || name.starts_with("air.read_texture")
+                         || name.starts_with("air.read_depth")
+                         || name.starts_with("air.write_texture")
+@@ -526,8 +538,7 @@
+                     if !image_operation {
+                         continue;
+                     }
+-                    let sampler = position == 2
+-                        && (name.starts_with("air.sample_") || name.starts_with("air.gather_"));
++                    let sampler = position == 2 && sampled_operation(name);
+                     if position == 2 && !sampler {
+                         continue;
+                     }
+@@ -537,6 +548,12 @@
+                         let shape = *shapes.get(&(low, high)).ok_or(
+                             "GPU argument image query has no established component/access type",
+                         )?;
++                        if lod_query(name) && (shape.storage || shape.multisampled) {
++                            return Err(
++                                "GPU argument LOD query requires a non-multisampled sampled texture"
++                                    .into(),
++                            );
++                        }
+                         if super::super::air_calls::intrinsic_texture_shape(name)
+                             != Some((shape.dim, shape.arrayed))
+                             || shape.depth

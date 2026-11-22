@@ -1,0 +1,67 @@
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -732,7 +732,11 @@
+                         .cloned()
+                         .unwrap_or_else(|| name.clone());
+                     if self.bda_device_pointers
+-                        && addrspace == 1
++                        && (addrspace == 1
++                            || (addrspace == 2
++                                && self
++                                    .large_buffer_roots
++                                    .contains(&(f.name.clone(), name.clone()))))
+                         && !self.ir.entry_functions.contains(&f.name)
+                     {
+                         raw.device_addr_base = Some(id);
+@@ -3228,7 +3232,11 @@
+                 .contains(&(func.to_string(), name.to_string()))
+             {
+                 if self.bda_device_pointers
+-                    && *addrspace == 1
++                    && (*addrspace == 1
++                        || (*addrspace == 2
++                            && self
++                                .large_buffer_roots
++                                .contains(&(func.to_string(), name.to_string()))))
+                     && !self.ir.entry_functions.contains(func)
+                 {
+                     return self.type_id(&LlType::Int(64));
+diff --git a/src/native/emitter/body/calls.rs b/src/native/emitter/body/calls.rs
+--- a/src/native/emitter/body/calls.rs
++++ b/src/native/emitter/body/calls.rs
+@@ -875,16 +875,20 @@
+         // matters here: the SAME helper is routinely called with several members of one struct,
+         // and only one cursor per parameter can be recorded. Admit only the shape where a second,
+         // conflicting cursor cannot exist.
+-        if param_addrspace == 2 && !self.constant_call_cursor_cannot_conflict(callee, param_index) {
+-            return Ok(None);
+-        }
+         let LlValue::Local(arg_name) = &arg.value else {
+             return Ok(None);
+         };
+         let Some(raw) = self.raw_offsets.get(arg_name).cloned() else {
+             return Ok(None);
+         };
+-        if self.bda_device_pointers && raw.addrspace == 1 && !raw.unmodelable {
++        if self.bda_device_pointers
++            && (raw.addrspace == 1
++                || (raw.addrspace == 2
++                    && self
++                        .large_buffer_roots
++                        .contains(&(callee.to_string(), param_name.to_string()))))
++            && !raw.unmodelable
++        {
+             if raw.table_bounds.is_some() {
+                 // A physical address is not a table row: crossing the function boundary would
+                 // preserve the pointer value while dropping the row's length and access checks.
+@@ -908,6 +912,9 @@
+                 .materialize_device_address(&address_raw, instructions)
+                 .map(Some);
+         }
++        if param_addrspace == 2 && !self.constant_call_cursor_cannot_conflict(callee, param_index) {
++            return Ok(None);
++        }
+         if !matches!(raw.addrspace, 1 | 2)
+             || !raw.dyn_terms.is_empty()
+             || raw.unmodelable

@@ -1,0 +1,2225 @@
+--- a/src/passes/air_calls/mod.rs
++++ b/src/passes/air_calls/mod.rs
+@@ -5,8 +5,8 @@
+ use super::*;
+ 
+ mod images;
+-pub(in crate::passes) use images::intrinsic_texture_shape;
+ use images::*;
++pub(in crate::passes) use images::{intrinsic_texture_shape, normalize_sampler_coordinate};
+ 
+ mod dispatch_texture;
+ pub(in crate::passes) use dispatch_texture::*;
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -35,6 +35,21 @@
+     /// Metal compute kernel (`!air.kernel`). GLCompute entry, LocalSize (64,1,1) default, compute
+     /// thread/grid builtins -> Vulkan builtins or local-size constants, `air.buffer` -> SSBO.
+     Kernel,
++}
++
++/// Backend strategy for an existing fragment LOD-query extension whose runtime image/sampler
++/// selection can diverge within a quad.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum QueryLodReplay {
++    /// Preserve the one-pair query only when its operands and control flow are provably uniform.
++    #[default]
++    UniformOnly,
++    /// Replay four quad-broadcast descriptor-index tuples. Requires the backend to expose
++    /// `VK_SUBGROUP_FEATURE_QUAD_BIT` for fragment execution with subgroup size at least four.
++    QuadBroadcast,
++    /// Replay a uniform bounded descriptor-tuple enumeration. This is the fallback for a backend
++    /// without fragment quad subgroup operations.
++    DescriptorEnumeration,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq)]
+@@ -67,6 +82,7 @@
+     /// The default keeps the legacy unnormalized-coordinate lowering so existing library users
+     /// preserve their prior SPIR-V.
+     pub normalized_sampler_coordinates: bool,
++    pub query_lod_replay: QueryLodReplay,
+     /// Runtime surface format and host features by top-level Metal `[[texture(n)]]` index or
+     /// reflected synthetic embedded-texture index. Only storage-image bindings consume these
+     /// entries; sampled textures retain their AIR-derived image type.
+@@ -104,6 +120,7 @@
+             vertex_amplification_count: 1,
+             runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
+             normalized_sampler_coordinates: false,
++            query_lod_replay: QueryLodReplay::UniformOnly,
+             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
+             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+         }
+@@ -114,6 +131,12 @@
+     /// Select the ABI 8 normalized sampler-coordinate contract described on the field.
+     pub fn with_normalized_sampler_coordinates(mut self) -> Self {
+         self.normalized_sampler_coordinates = true;
++        self
++    }
++
++    /// Select how an indirect fragment LOD query handles a dynamically selected descriptor pair.
++    pub fn with_query_lod_replay(mut self, replay: QueryLodReplay) -> Self {
++        self.query_lod_replay = replay;
+         self
+     }
+ 
+@@ -534,6 +557,8 @@
+     runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
+     /// Select the ABI 8 normalized-coordinate backend.
+     normalized_sampler_coordinates: bool,
++    query_lod_replay: QueryLodReplay,
++    argument_table_version: u32,
+     runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
+     /// Byte length the pipeline allocates per `[[threadgroup(n)]]` buffer, sizing its `Workgroup`
+     /// array (see [`TransformOptions::threadgroup_memory_lengths`]).
+@@ -677,6 +702,8 @@
+             vertex_amplification_count: options.vertex_amplification_count,
+             runtime_sampler_states: options.runtime_sampler_states,
+             normalized_sampler_coordinates: options.normalized_sampler_coordinates,
++            query_lod_replay: options.query_lod_replay,
++            argument_table_version: 9,
+             runtime_storage_image_states: options.runtime_storage_image_states,
+             threadgroup_memory_lengths: options.threadgroup_memory_lengths,
+             runtime_storage_image_values: HashMap::new(),
+@@ -1891,6 +1918,7 @@
+ mod resources;
+ pub use resources::{
+     lower_argument_resource_tables, lower_argument_resource_tables_versioned,
++    lower_argument_resource_tables_versioned_with_query_lod_replay,
+     lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+@@ -3311,6 +3339,8 @@
+     let air_lowering = lower_air_calls(&mut ctx, entry_idx);
+     ctx.phase_value_types = None;
+     air_lowering?;
++    resources::lower_argument_lod_queries(&mut ctx, entry_idx)?;
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
+     // The staging array an aliased explicit imageblock lives in is undefined on entry and reaches
+     // no attachment on return; give it the render-target planes the alias says it IS. Runs after
+     // `lower_air_calls` because it lowers implicit-imageblock intrinsics of its own.
+--- a/src/passes/resources/fragment_control.rs
++++ b/src/passes/resources/fragment_control.rs
+@@ -12,6 +12,26 @@
+ //! on each conditional/switch through the post-dominator tree of the executable CFG.
+ 
+ use super::*;
++
++mod uniform_calls;
++mod uniform_memory;
++
++pub(in crate::passes) fn record_readonly_aliases(ctx: &mut Ctx) {
++    let mut facts = ctx.emit_sidecar.readonly_uniform_addresses.clone();
++    for fact in &ctx.emit_sidecar.readonly_uniform_addresses {
++        facts.extend(
++            uniform_memory::readonly_aliases(&ctx.module, &[fact.value])
++                .into_iter()
++                .map(|value| crate::emit_sidecar::UniformValueFact {
++                    function: fact.function,
++                    value,
++                }),
++        );
++    }
++    facts.sort_unstable_by_key(|fact| (fact.function, fact.value));
++    facts.dedup_by_key(|fact| (fact.function, fact.value));
++    ctx.emit_sidecar.readonly_uniform_addresses = facts;
++}
+ use spirv::ExecutionModel;
+ use std::collections::{BTreeSet, VecDeque};
+ 
+@@ -515,6 +535,7 @@
+             readonly_addresses,
+             module,
+             &uniform_phi_predecessors,
++            &[],
+         );
+         let mut nonuniform = vec![false; order.len()];
+         for (header, &block) in order.iter().enumerate() {
+@@ -726,7 +747,10 @@
+     readonly_addresses: &[Word],
+     module: &Module,
+     uniform_phi_predecessors: &HashSet<Word>,
++    callees: &[Word],
+ ) -> HashSet<Word> {
++    let readonly_aliases = uniform_memory::readonly_aliases(module, readonly_addresses);
++    let readonly_addresses = readonly_aliases.as_slice();
+     let mut roots = module
+         .types_global_values
+         .iter()
+@@ -875,6 +899,16 @@
+                     }
+                     Op::CopyObject | Op::Bitcast => (all_uniform(), pointer),
+                     Op::Load => (pointer, false),
++                    Op::FunctionCall => (
++                        uniform_calls::result_is_uniform(
++                            instruction,
++                            &uniform,
++                            &uniform_input_pointers,
++                            module,
++                            callees,
++                        ),
++                        false,
++                    ),
+                     Op::Phi => {
+                         let sources = instruction
+                             .operands
+--- /dev/null
++++ b/src/passes/resources/fragment_control/uniform_calls.rs
+@@ -0,0 +1,103 @@
++use super::*;
++
++pub(super) fn result_is_uniform(
++    call: &Instruction,
++    caller_uniform: &HashSet<Word>,
++    caller_pointers: &HashSet<Word>,
++    module: &Module,
++    callees: &[Word],
++) -> bool {
++    let Some(Operand::IdRef(callee)) = call.operands.first() else {
++        return false;
++    };
++    if callees.contains(callee) {
++        return false;
++    }
++    let Some(function) = module.functions.iter().find(|function| {
++        function
++            .def
++            .as_ref()
++            .and_then(|definition| definition.result_id)
++            == Some(*callee)
++    }) else {
++        return false;
++    };
++    let arguments = &call.operands[1..];
++    if function.blocks.is_empty() || arguments.len() != function.parameters.len() {
++        return false;
++    }
++    let mut parameters = Vec::new();
++    let mut pointers = Vec::new();
++    for (parameter, argument) in function.parameters.iter().zip(arguments) {
++        let (Some(parameter), Operand::IdRef(argument)) = (parameter.result_id, argument) else {
++            return false;
++        };
++        if !caller_uniform.contains(argument) {
++            return false;
++        }
++        parameters.push(parameter);
++        if caller_pointers.contains(argument) {
++            pointers.push(parameter);
++        }
++    }
++    // A result proof may not hide side effects or invocation-dependent control in a helper.
++    if function
++        .blocks
++        .iter()
++        .flat_map(|block| &block.instructions)
++        .any(|instruction| {
++            !is_uniform_preserving_operation(instruction.class.opcode)
++                && !matches!(
++                    instruction.class.opcode,
++                    Op::Load
++                        | Op::CopyObject
++                        | Op::AccessChain
++                        | Op::InBoundsAccessChain
++                        | Op::PtrAccessChain
++                        | Op::Phi
++                        | Op::FunctionCall
++                        | Op::Branch
++                        | Op::BranchConditional
++                        | Op::Switch
++                        | Op::SelectionMerge
++                        | Op::LoopMerge
++                        | Op::ReturnValue
++                        | Op::Return
++                )
++        })
++    {
++        return false;
++    }
++    let labels = function
++        .blocks
++        .iter()
++        .filter_map(|block| block.label.as_ref()?.result_id)
++        .collect();
++    let mut next_callees = callees.to_vec();
++    next_callees.push(*callee);
++    let uniform = uniform_values(
++        function,
++        &parameters,
++        &pointers,
++        module,
++        &labels,
++        &next_callees,
++    );
++    let mut returned = false;
++    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
++        let condition = match instruction.class.opcode {
++            Op::BranchConditional | Op::Switch => instruction.operands.first(),
++            Op::ReturnValue => {
++                returned = true;
++                instruction.operands.first()
++            }
++            _ => None,
++        };
++        if let Some(operand) = condition {
++            if !matches!(operand, Operand::IdRef(id) if uniform.contains(id)) {
++                return false;
++            }
++        }
++    }
++    returned
++}
+--- /dev/null
++++ b/src/passes/resources/fragment_control/uniform_memory.rs
+@@ -0,0 +1,44 @@
++use super::*;
++
++// Typed and raw views of the same declared buffer share its source readonly provenance.
++pub(super) fn readonly_aliases(module: &Module, addresses: &[Word]) -> Vec<Word> {
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for instruction in &module.annotations {
++        match instruction.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    let coordinates = addresses
++        .iter()
++        .filter_map(|id| Some((*sets.get(id)?, *bindings.get(id)?)))
++        .collect::<HashSet<_>>();
++    let mut aliases = addresses.to_vec();
++    aliases.extend(module.types_global_values.iter().filter_map(|instruction| {
++        if instruction.class.opcode != Op::Variable
++            || !matches!(
++                instruction.operands.first(),
++                Some(Operand::StorageClass(
++                    StorageClass::StorageBuffer | StorageClass::Uniform
++                ))
++            )
++        {
++            return None;
++        }
++        let id = instruction.result_id?;
++        coordinates
++            .contains(&(*sets.get(&id)?, *bindings.get(&id)?))
++            .then_some(id)
++    }));
++    aliases.sort_unstable();
++    aliases.dedup();
++    aliases
++}
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -79,6 +79,27 @@
+     null_shapes: &[u32],
+     proof: Option<&UniformControlProof>,
+ ) -> Result<(Vec<u8>, Vec<u32>, bool), String> {
++    lower_argument_resource_tables_versioned_with_query_lod_replay(
++        bytes,
++        fields,
++        table_version,
++        normalized,
++        null_shapes,
++        proof,
++        QueryLodReplay::UniformOnly,
++    )
++}
++
++/// Preserve the versioned null registry while selecting a backend query replay strategy.
++pub fn lower_argument_resource_tables_versioned_with_query_lod_replay(
++    bytes: &[u8],
++    fields: &[ArgumentResourceField],
++    table_version: u32,
++    normalized: bool,
++    null_shapes: &[u32],
++    proof: Option<&UniformControlProof>,
++    replay: QueryLodReplay,
++) -> Result<(Vec<u8>, Vec<u32>, bool), String> {
+     if !matches!(table_version, 7..=9) {
+         return Err(format!(
+             "unsupported GPU argument table version {table_version}"
+@@ -104,9 +125,24 @@
+     let sidecar = uniform_control_sidecar(&module, proof)?;
+     let options = TransformOptions {
+         normalized_sampler_coordinates: normalized,
++        query_lod_replay: replay,
+         ..TransformOptions::default()
+     };
+-    let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, Stage::Kernel, options);
++    let fragment_entry = module.entry_points.iter().find_map(|entry| {
++        match entry.operands.as_slice() {
++            [Operand::ExecutionModel(ExecutionModel::Fragment), Operand::IdRef(function), ..] => {
++                Some(*function)
++            }
++            _ => None,
++        }
++    });
++    let stage = if fragment_entry.is_some() {
++        Stage::Fragment
++    } else {
++        Stage::Kernel
++    };
++    let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, stage, options);
++    ctx.argument_table_version = table_version;
+     let rebase = if table_version == 9 {
+         ctx.restore_null_shape_indices(null_shapes)?
+     } else {
+@@ -130,6 +166,15 @@
+     }
+     super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
+     super::quad_sampling::lower_argument_implicit_lod(&mut ctx)?;
++    if let Some(entry) = fragment_entry {
++        let index = ctx
++            .module
++            .functions
++            .iter()
++            .position(|function| function.def.as_ref().and_then(|def| def.result_id) == Some(entry))
++            .ok_or("fragment entry missing from cached SPIR-V")?;
++        super::lod_query::lower_argument_lod_queries(&mut ctx, index)?;
++    }
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+     if table_version == 9 {
+         super::super::null_shapes::finalize_null_shape_indices(&mut ctx)?;
+@@ -146,6 +191,7 @@
+             ]
+         )
+     });
++    super::nonuniform::decorate_nonuniform_descriptor_accesses(&mut ctx);
+     super::super::canonicalize_ids(&mut ctx.module);
+     Ok((
+         ctx.module
+--- /dev/null
++++ b/src/passes/resources/lod_query/analysis.rs
+@@ -0,0 +1,321 @@
++use super::*;
++
++pub(super) fn analyze_fragment_control(
++    ctx: &Ctx,
++    entry_idx: usize,
++) -> Result<FragmentControl, String> {
++    if ctx.module.entry_points.iter().any(|entry| {
++        entry.operands.first() == Some(&Operand::ExecutionModel(spirv::ExecutionModel::Fragment))
++    }) {
++        analyze(ctx)
++    } else {
++        analyze_entry(ctx, entry_idx)
++    }
++}
++
++pub(super) fn resource_variable(module: &Module, set: u32, binding: u32) -> Option<Word> {
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for annotation in &module.annotations {
++        match annotation.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(value)] =>
++            {
++                sets.insert(*id, *value);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(value)] =>
++            {
++                bindings.insert(*id, *value);
++            }
++            _ => {}
++        }
++    }
++    bindings
++        .into_iter()
++        .find_map(|(id, value)| (value == binding && sets.get(&id) == Some(&set)).then_some(id))
++}
++
++pub(super) fn query_rewrite(
++    ctx: &Ctx,
++    function_index: usize,
++    block_index: usize,
++    query_index: usize,
++) -> Result<QueryRewrite, String> {
++    let instruction =
++        &ctx.module.functions[function_index].blocks[block_index].instructions[query_index];
++    let Some(Operand::IdRef(sampled)) = instruction.operands.first() else {
++        return Err("fragment LOD query has no sampled image".into());
++    };
++    let defs = definitions(ctx);
++    let sampled_definition = defs
++        .get(sampled)
++        .filter(|definition| definition.class.opcode == Op::SampledImage)
++        .ok_or("fragment LOD query operand is not an OpSampledImage")?;
++    let [Operand::IdRef(image), Operand::IdRef(sampler)] = sampled_definition.operands.as_slice()
++    else {
++        return Err("fragment LOD query sampled image has invalid operands".into());
++    };
++    let image_access = descriptor_operand(ctx, *image, 0, true, &defs)?;
++    let sampler_access = descriptor_operand(ctx, *sampler, 2, false, &defs)?;
++    // Selected direct handles can retain a temporary pointer type until opaque cleanup.
++    let derived_shape = sampled_image_shape(ctx, *sampled, &defs)?;
++    let shape = if let Some(access) = image_access {
++        let access = ctx
++            .sampled_descriptor_accesses
++            .get(&access.original)
++            .ok_or("GPU argument LOD image has no descriptor access fact")?;
++        match access.shape {
++            Some(mapped) if mapped != derived_shape => {
++                return Err(
++                    "GPU argument LOD image shape fact disagrees with the loaded image type".into(),
++                )
++            }
++            Some(mapped) => mapped,
++            None => derived_shape,
++        }
++    } else {
++        derived_shape
++    };
++    if shape.dim != Dim::Dim2D || shape.arrayed {
++        return Err("fragment LOD query requires a non-array 2D image".into());
++    }
++    if shape.storage {
++        return Err("fragment LOD query image is a storage image".into());
++    }
++    if shape.multisampled {
++        return Err("fragment LOD query does not support a multisampled image".into());
++    }
++    Ok(QueryRewrite {
++        image: image_access,
++        sampler: sampler_access,
++        shape,
++    })
++}
++
++pub(super) fn descriptor_operand(
++    ctx: &Ctx,
++    value: Word,
++    category: u32,
++    image: bool,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<Option<DescriptorOperand>, String> {
++    let access = descriptor_access(ctx, value, &mut HashSet::new());
++    let Some((loaded, access)) = access else {
++        return Ok(None);
++    };
++    if access.category != category {
++        return Err(format!(
++            "GPU argument LOD descriptor category {} does not match expected {category}",
++            access.category
++        ));
++    }
++    let load = defs
++        .get(&loaded)
++        .filter(|instruction| instruction.class.opcode == Op::Load)
++        .ok_or("GPU argument LOD descriptor access does not name a load")?;
++    let Some(Operand::IdRef(pointer)) = load.operands.first() else {
++        return Err("GPU argument LOD descriptor load has no pointer".into());
++    };
++    let element_type = load
++        .result_type
++        .ok_or("GPU argument LOD descriptor load has no element type")?;
++    let pointer_definition = defs
++        .get(pointer)
++        .filter(|instruction| {
++            matches!(
++                instruction.class.opcode,
++                Op::AccessChain | Op::InBoundsAccessChain
++            )
++        })
++        .ok_or("GPU argument LOD descriptor load is not from an access chain")?;
++    let pointer_type = pointer_definition
++        .result_type
++        .ok_or("GPU argument LOD descriptor access chain has no pointer type")?;
++    let Some(Operand::IdRef(array)) = pointer_definition.operands.first() else {
++        return Err("GPU argument LOD descriptor access chain has no array".into());
++    };
++    if image {
++        let shape = image_shape_from_type(ctx, element_type, defs)?;
++        if let Some(mapped) = access.shape {
++            if mapped != shape {
++                return Err(
++                    "GPU argument LOD image shape fact disagrees with the descriptor array type"
++                        .into(),
++                );
++            }
++        }
++    } else if !defs
++        .get(&element_type)
++        .is_some_and(|instruction| instruction.class.opcode == Op::TypeSampler)
++    {
++        return Err("GPU argument LOD sampler does not load an OpTypeSampler".into());
++    }
++    Ok(Some(DescriptorOperand {
++        original: loaded,
++        token_index: access.physical_index,
++        pointer_type,
++        array: *array,
++        element_type,
++    }))
++}
++
++pub(super) fn descriptor_access(
++    ctx: &Ctx,
++    value: Word,
++    seen: &mut HashSet<Word>,
++) -> Option<(Word, SampledDescriptorAccess)> {
++    if !seen.insert(value) {
++        return None;
++    }
++    if let Some(access) = ctx.sampled_descriptor_accesses.get(&value).copied() {
++        return Some((value, access));
++    }
++    let defs = definitions(ctx);
++    let definition = defs.get(&value)?;
++    if !matches!(definition.class.opcode, Op::CopyObject | Op::Bitcast) {
++        return None;
++    }
++    let Operand::IdRef(source) = definition.operands.first()? else {
++        return None;
++    };
++    descriptor_access(ctx, *source, seen)
++}
++
++pub(super) fn definitions(ctx: &Ctx) -> HashMap<Word, Instruction> {
++    ctx.module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|instruction| Some((instruction.result_id?, instruction.clone())))
++        .collect()
++}
++
++pub(super) fn sampled_image_shape(
++    ctx: &Ctx,
++    image: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<SampledDescriptorShape, String> {
++    let image_type = type_from_value_or_alias(image, defs)
++        .ok_or("fragment LOD query image has no SPIR-V type")?;
++    image_shape_from_type(ctx, image_type, defs)
++}
++
++pub(super) fn image_shape_from_type(
++    _ctx: &Ctx,
++    ty: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<SampledDescriptorShape, String> {
++    let definition = defs
++        .get(&ty)
++        .ok_or("fragment LOD query image type is undefined")?;
++    match definition.class.opcode {
++        Op::TypePointer => {
++            let Some(Operand::IdRef(pointee)) = definition.operands.get(1) else {
++                return Err("fragment LOD query image pointer has no pointee".into());
++            };
++            image_shape_from_type(_ctx, *pointee, defs)
++        }
++        Op::TypeSampledImage => {
++            let Some(Operand::IdRef(image)) = definition.operands.first() else {
++                return Err("fragment LOD query sampled-image type has no image type".into());
++            };
++            image_shape_from_type(_ctx, *image, defs)
++        }
++        Op::TypeImage => {
++            let dim = match definition.operands.get(1) {
++                Some(Operand::Dim(dim)) => *dim,
++                _ => return Err("fragment LOD query image type has no dimension".into()),
++            };
++            let depth = match definition.operands.get(2) {
++                Some(Operand::LiteralBit32(0)) => false,
++                Some(Operand::LiteralBit32(1)) => true,
++                Some(Operand::LiteralBit32(2)) => {
++                    return Err(
++                        "fragment LOD query image has unknown depth semantics in its SPIR-V type"
++                            .into(),
++                    )
++                }
++                _ => return Err("fragment LOD query image type has invalid depth semantics".into()),
++            };
++            let arrayed = match definition.operands.get(3) {
++                Some(Operand::LiteralBit32(0)) => false,
++                Some(Operand::LiteralBit32(1)) => true,
++                _ => return Err("fragment LOD query image type has invalid arrayed state".into()),
++            };
++            let multisampled = match definition.operands.get(4) {
++                Some(Operand::LiteralBit32(0)) => false,
++                Some(Operand::LiteralBit32(1)) => true,
++                _ => {
++                    return Err(
++                        "fragment LOD query image type has invalid multisampled state".into(),
++                    )
++                }
++            };
++            let sampled = match definition.operands.get(5) {
++                Some(Operand::LiteralBit32(0)) => 0,
++                Some(Operand::LiteralBit32(1)) => 1,
++                Some(Operand::LiteralBit32(2)) => 2,
++                _ => return Err("fragment LOD query image type has invalid sampled state".into()),
++            };
++            let Some(Operand::IdRef(component_type)) = definition.operands.first() else {
++                return Err("fragment LOD query image type has no component type".into());
++            };
++            let component = defs
++                .get(component_type)
++                .ok_or("fragment LOD query image component type is undefined")?;
++            let comp = match component.class.opcode {
++                Op::TypeFloat => ImageComp::Float,
++                Op::TypeInt if component.operands.get(1) == Some(&Operand::LiteralBit32(0)) => {
++                    ImageComp::Uint
++                }
++                Op::TypeInt if component.operands.get(1) == Some(&Operand::LiteralBit32(1)) => {
++                    ImageComp::Sint
++                }
++                _ => return Err("fragment LOD query image component is not float/uint/sint".into()),
++            };
++            Ok(SampledDescriptorShape {
++                dim,
++                arrayed,
++                depth,
++                comp,
++                storage: sampled == 2,
++                multisampled,
++            })
++        }
++        _ => Err("fragment LOD query image value does not have an image type".into()),
++    }
++}
++
++pub(super) fn type_from_value_or_alias(
++    value: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Option<Word> {
++    let definition = defs.get(&value)?;
++    if let Some(ty) = definition.result_type {
++        return Some(ty);
++    }
++    if matches!(definition.class.opcode, Op::CopyObject | Op::Bitcast) {
++        if let Some(Operand::IdRef(source)) = definition.operands.first() {
++            return type_from_value_or_alias(*source, defs);
++        }
++    }
++    None
++}
++
++pub(super) fn shape_tag(shape: SampledDescriptorShape) -> Result<u32, String> {
++    let dim = match shape.dim {
++        Dim::Dim1D => 0,
++        Dim::Dim2D => 1,
++        Dim::Dim3D => 2,
++        Dim::DimCube => 3,
++        other => {
++            return Err(format!(
++                "fragment LOD query image dimension {other:?} has no ABI 8 shape tag"
++            ))
++        }
++    };
++    let component = match shape.comp {
++        ImageComp::Float => 0,
++        ImageComp::Uint => 1,
++        ImageComp::Sint => 2,
++    };
++    Ok(dim * 2 + u32::from(shape.arrayed) + 8 * u32::from(shape.depth) + 16 * component)
++}
+--- /dev/null
++++ b/src/passes/resources/lod_query/coordinates.rs
+@@ -0,0 +1,545 @@
++use super::*;
++
++pub(super) fn normalize_uniform_query(
++    ctx: &mut Ctx,
++    function_index: usize,
++    block_index: usize,
++    query_index: usize,
++    rewrite: &QueryRewrite,
++) -> Result<(), String> {
++    if !ctx.normalized_sampler_coordinates {
++        return Ok(());
++    }
++    let original =
++        ctx.module.functions[function_index].blocks[block_index].instructions[query_index].clone();
++    let Some(Operand::IdRef(sampled)) = original.operands.first() else {
++        return Err("fragment LOD query has no sampled image".into());
++    };
++    let Some(Operand::IdRef(coord)) = original.operands.get(1) else {
++        return Err("fragment LOD query has no coordinate".into());
++    };
++    let defs = definitions(ctx);
++    let sampled_definition = defs
++        .get(sampled)
++        .filter(|instruction| instruction.class.opcode == Op::SampledImage)
++        .ok_or("fragment LOD query operand is not an OpSampledImage")?;
++    let [Operand::IdRef(image), Operand::IdRef(sampler)] = sampled_definition.operands.as_slice()
++    else {
++        return Err("fragment LOD query sampled image has invalid operands".into());
++    };
++    let mut prefix = Vec::new();
++    let zero = ctx.const_uint(0);
++    let normalized = crate::passes::air_calls::normalize_sampler_coordinate(
++        ctx,
++        *sampler,
++        *image,
++        rewrite.shape.dim,
++        rewrite.shape.arrayed,
++        *coord,
++        zero,
++        &mut prefix,
++    )?;
++    if normalized == *coord {
++        return Ok(());
++    }
++    let mut replacement = original;
++    replacement.operands[1] = Operand::IdRef(normalized);
++    prefix.push(replacement);
++    let instructions = &mut ctx.module.functions[function_index].blocks[block_index].instructions;
++    instructions.splice(query_index..=query_index, prefix);
++    Ok(())
++}
++
++pub(super) fn broadcast_index(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    uint: Word,
++    index: Word,
++    source_lane: u32,
++) -> Word {
++    let scope = ctx.const_uint(Scope::Subgroup as u32);
++    let lane = ctx.const_uint(source_lane);
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::GroupNonUniformQuadBroadcast,
++        uint,
++        vec![
++            Operand::IdScope(scope),
++            Operand::IdRef(index),
++            Operand::IdRef(lane),
++        ],
++    )
++}
++
++pub(super) fn load_count(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    table: Word,
++    pointer: Word,
++    uint: Word,
++    zero: Word,
++    word: u32,
++) -> Word {
++    let word = ctx.const_uint(word);
++    load_word(ctx, body, table, pointer, uint, zero, word)
++}
++
++pub(super) fn bounded_count(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    uint: Word,
++    count: Word,
++    maximum: Word,
++) -> Word {
++    let bool_type = ctx.ty_bool();
++    let over_maximum = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::UGreaterThan,
++        bool_type,
++        vec![Operand::IdRef(count), Operand::IdRef(maximum)],
++    );
++    let count = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(over_maximum),
++            Operand::IdRef(maximum),
++            Operand::IdRef(count),
++        ],
++    );
++    let one = ctx.const_uint(1);
++    let below_one = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::ULessThan,
++        bool_type,
++        vec![Operand::IdRef(count), Operand::IdRef(one)],
++    );
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(below_one),
++            Operand::IdRef(one),
++            Operand::IdRef(count),
++        ],
++    )
++}
++
++pub(super) fn clamp_index(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    uint: Word,
++    bool_type: Word,
++    index: Word,
++    count: Word,
++    zero: Word,
++) -> Word {
++    let in_range = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::ULessThan,
++        bool_type,
++        vec![Operand::IdRef(index), Operand::IdRef(count)],
++    );
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(in_range),
++            Operand::IdRef(index),
++            Operand::IdRef(zero),
++        ],
++    )
++}
++
++pub(super) fn dimension_base(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    query_table: Word,
++    pointer: Word,
++    uint: Word,
++    bool_type: Word,
++    zero: Word,
++    sampler_count: Word,
++) -> Word {
++    let sampler_offset = bounded_table_base(ctx, body, query_table, pointer, uint, bool_type, zero);
++    let three = ctx.const_uint(3);
++    let trailing = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IMul,
++        uint,
++        vec![Operand::IdRef(sampler_count), Operand::IdRef(three)],
++    );
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(sampler_offset), Operand::IdRef(trailing)],
++    )
++}
++
++pub(super) fn bounded_table_base(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    query_table: Word,
++    pointer: Word,
++    uint: Word,
++    bool_type: Word,
++    zero: Word,
++) -> Word {
++    let offset = load_count(ctx, body, query_table, pointer, uint, zero, 4);
++    let maximum = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::ArrayLength,
++        uint,
++        vec![Operand::IdRef(query_table), Operand::LiteralBit32(0)],
++    );
++    let too_large = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::UGreaterThan,
++        bool_type,
++        vec![Operand::IdRef(offset), Operand::IdRef(maximum)],
++    );
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(too_large),
++            Operand::IdRef(zero),
++            Operand::IdRef(offset),
++        ],
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn query_coordinate(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    query_table: Word,
++    word_pointer: Word,
++    uint: Word,
++    bool_type: Word,
++    zero: Word,
++    sampler_count: Word,
++    image: Word,
++    sampler: Word,
++    sampler_token: Option<Word>,
++    coord: Word,
++    lod: Word,
++) -> Result<Word, String> {
++    if !ctx.normalized_sampler_coordinates {
++        return Ok(coord);
++    }
++    let Some(sampler_token) = sampler_token else {
++        return crate::passes::air_calls::normalize_sampler_coordinate(
++            ctx,
++            sampler,
++            image,
++            Dim::Dim2D,
++            false,
++            coord,
++            lod,
++            body,
++        );
++    };
++    let flag = sampler_flag_word(
++        ctx,
++        body,
++        query_table,
++        word_pointer,
++        uint,
++        zero,
++        sampler_count,
++        sampler_token,
++    );
++    let one = ctx.const_uint(1);
++    let masked = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::BitwiseAnd,
++        uint,
++        vec![Operand::IdRef(flag), Operand::IdRef(one)],
++    );
++    let pixel = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::INotEqual,
++        bool_type,
++        vec![Operand::IdRef(masked), Operand::IdRef(zero)],
++    );
++    let vector_float_type = ctx.ty_vecf(2);
++    let normalized = pixel_coordinate_to_normalized_2d(ctx, body, image, coord, lod)?;
++    Ok(crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        vector_float_type,
++        vec![
++            Operand::IdRef(pixel),
++            Operand::IdRef(normalized),
++            Operand::IdRef(coord),
++        ],
++    ))
++}
++
++pub(super) fn sampler_flag_word(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    query_table: Word,
++    pointer: Word,
++    uint: Word,
++    zero: Word,
++    sampler_count: Word,
++    sampler_token: Word,
++) -> Word {
++    let bool_type = ctx.ty_bool();
++    let sampler_offset = bounded_table_base(ctx, body, query_table, pointer, uint, bool_type, zero);
++    let one = ctx.const_uint(1);
++    let twice_count = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::ShiftLeftLogical,
++        uint,
++        vec![Operand::IdRef(sampler_count), Operand::IdRef(one)],
++    );
++    let flags_base = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(sampler_offset), Operand::IdRef(twice_count)],
++    );
++    let at = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(flags_base), Operand::IdRef(sampler_token)],
++    );
++    load_word(ctx, body, query_table, pointer, uint, zero, at)
++}
++
++pub(super) fn pixel_coordinate_to_normalized_2d(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    image: Word,
++    coord: Word,
++    lod: Word,
++) -> Result<Word, String> {
++    let defs = definitions(ctx);
++    let coord_type = type_from_value_or_alias(coord, &defs)
++        .ok_or("fragment LOD query coordinate has no type")?;
++    let float_type = ctx.ty_float();
++    let vector_float_type = ctx.ty_vecf(2);
++    if coord_type != vector_float_type {
++        return Err("fragment LOD query pixel coordinate is not a two-component float".into());
++    }
++    let size_type = ctx.ty_vec_uint(2);
++    let size = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::ImageQuerySizeLod,
++        size_type,
++        vec![Operand::IdRef(image), Operand::IdRef(lod)],
++    );
++    let uint = ctx.ty_uint();
++    let mut components = Vec::with_capacity(2);
++    for component in 0..2 {
++        let extent = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            body,
++            Op::CompositeExtract,
++            uint,
++            vec![Operand::IdRef(size), Operand::LiteralBit32(component)],
++        );
++        let extent_float = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            body,
++            Op::ConvertUToF,
++            float_type,
++            vec![Operand::IdRef(extent)],
++        );
++        let coordinate = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            body,
++            Op::CompositeExtract,
++            float_type,
++            vec![Operand::IdRef(coord), Operand::LiteralBit32(component)],
++        );
++        let normalized = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            body,
++            Op::FDiv,
++            float_type,
++            vec![Operand::IdRef(coordinate), Operand::IdRef(extent_float)],
++        );
++        components.push(Operand::IdRef(normalized));
++    }
++    Ok(crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::CompositeConstruct,
++        vector_float_type,
++        components,
++    ))
++}
++
++pub(super) fn safe_image_index(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    query_table: Word,
++    pointer: Word,
++    uint: Word,
++    bool_type: Word,
++    zero: Word,
++    base: Word,
++    image_count: Word,
++    image_index: Word,
++    shape: SampledDescriptorShape,
++) -> Result<SafeImageIndex, String> {
++    let clamped = clamp_index(ctx, body, uint, bool_type, image_index, image_count, zero);
++    let eight = ctx.const_uint(8);
++    let row = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IMul,
++        uint,
++        vec![Operand::IdRef(clamped), Operand::IdRef(eight)],
++    );
++    let row = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(base), Operand::IdRef(row)],
++    );
++    let six = ctx.const_uint(6);
++    let seven = ctx.const_uint(7);
++    let shape_at = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(row), Operand::IdRef(six)],
++    );
++    let flags_at = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(row), Operand::IdRef(seven)],
++    );
++    let stored_shape = load_word(ctx, body, query_table, pointer, uint, zero, shape_at);
++    let stored_flags = load_word(ctx, body, query_table, pointer, uint, zero, flags_at);
++    let tag = ctx.const_uint(shape_tag(shape)?);
++    let shape_ok = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IEqual,
++        bool_type,
++        vec![Operand::IdRef(stored_shape), Operand::IdRef(tag)],
++    );
++    let expected_ms = ctx.const_uint(u32::from(shape.multisampled));
++    let ms_ok = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::IEqual,
++        bool_type,
++        vec![Operand::IdRef(stored_flags), Operand::IdRef(expected_ms)],
++    );
++    let valid = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::LogicalAnd,
++        bool_type,
++        vec![Operand::IdRef(shape_ok), Operand::IdRef(ms_ok)],
++    );
++    let nonzero = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::INotEqual,
++        bool_type,
++        vec![Operand::IdRef(clamped), Operand::IdRef(zero)],
++    );
++    let valid = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::LogicalAnd,
++        bool_type,
++        vec![Operand::IdRef(valid), Operand::IdRef(nonzero)],
++    );
++    let dummy = if ctx.argument_table_version == 9 {
++        ctx.null_descriptor_index(
++            ImageShape {
++                dim: shape.dim,
++                arrayed: shape.arrayed,
++                depth: shape.depth,
++                comp: shape.comp,
++                multisampled: shape.multisampled,
++                access: ImageAccess::Sampled,
++            },
++            Some(
++                resource_variable(&ctx.module, 0, ARGUMENT_RESOURCE_TABLE_BINDING)
++                    .ok_or("query replay lost the token table")?,
++            ),
++            body,
++        )?
++    } else {
++        crate::passes::resources::gpu_arguments::value(
++            ctx,
++            body,
++            Op::IAdd,
++            uint,
++            vec![Operand::IdRef(image_count), Operand::IdRef(tag)],
++        )
++    };
++    let index = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Select,
++        uint,
++        vec![
++            Operand::IdRef(valid),
++            Operand::IdRef(clamped),
++            Operand::IdRef(dummy),
++        ],
++    );
++    Ok(SafeImageIndex { index, valid })
++}
++
++pub(super) fn descriptor_load(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    operand: DescriptorOperand,
++    index: Word,
++) -> Word {
++    let pointer = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::AccessChain,
++        operand.pointer_type,
++        vec![Operand::IdRef(operand.array), Operand::IdRef(index)],
++    );
++    crate::passes::resources::gpu_arguments::value(
++        ctx,
++        body,
++        Op::Load,
++        operand.element_type,
++        vec![Operand::IdRef(pointer)],
++    )
++}
+--- /dev/null
++++ b/src/passes/resources/lod_query/enumeration.rs
+@@ -0,0 +1,490 @@
++use super::*;
++
++pub(super) fn rewrite_query_as_enumeration(
++    ctx: &mut Ctx,
++    function_index: usize,
++    block_index: usize,
++    query_index: usize,
++    rewrite: &QueryRewrite,
++    table: Word,
++    query_table: Word,
++) -> Result<(), String> {
++    let block = ctx.module.functions[function_index].blocks[block_index].clone();
++    if block
++        .instructions
++        .iter()
++        .any(|instruction| instruction.class.opcode == Op::LoopMerge)
++    {
++        return Err("descriptor enumeration cannot split a structured loop-header block".into());
++    }
++    let original = block.instructions[query_index].clone();
++    let Some(Operand::IdRef(sampled)) = original.operands.first() else {
++        return Err("fragment LOD query has no sampled image".into());
++    };
++    let Some(Operand::IdRef(coord)) = original.operands.get(1) else {
++        return Err("fragment LOD query has no coordinate".into());
++    };
++    let defs = definitions(ctx);
++    let sampled_type = defs
++        .get(sampled)
++        .and_then(|definition| definition.result_type)
++        .ok_or("fragment LOD query sampled image has no type")?;
++    let sampled_definition = defs
++        .get(sampled)
++        .ok_or("fragment LOD query sampled image is undefined")?;
++    let [Operand::IdRef(original_image), Operand::IdRef(original_sampler)] =
++        sampled_definition.operands.as_slice()
++    else {
++        return Err("fragment LOD query sampled image has invalid operands".into());
++    };
++    let result_type = original
++        .result_type
++        .ok_or("fragment LOD query has no result type")?;
++    let result_id = original
++        .result_id
++        .ok_or("fragment LOD query has no result id")?;
++    let uint = ctx.ty_uint();
++    let bool_type = ctx.ty_bool();
++    let word_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    let zero = ctx.const_uint(0);
++    let one = ctx.const_uint(1);
++    let original_label = block
++        .label
++        .as_ref()
++        .and_then(|label| label.result_id)
++        .ok_or("fragment LOD query block has no label")?;
++    let mut prefix = block.instructions[..query_index].to_vec();
++    let tail = block.instructions[query_index + 1..].to_vec();
++    let table_words = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::ArrayLength,
++        uint,
++        vec![Operand::IdRef(query_table), Operand::LiteralBit32(0)],
++    );
++    let eight = ctx.const_uint(8);
++    let three = ctx.const_uint(3);
++    let maximum_images = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::UDiv,
++        uint,
++        vec![Operand::IdRef(table_words), Operand::IdRef(eight)],
++    );
++    let maximum_samplers = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::UDiv,
++        uint,
++        vec![Operand::IdRef(table_words), Operand::IdRef(three)],
++    );
++    let image_count = load_count(ctx, &mut prefix, table, word_pointer, uint, zero, 1);
++    let image_count = bounded_count(ctx, &mut prefix, uint, image_count, maximum_images);
++    let sampler_count = load_count(ctx, &mut prefix, table, word_pointer, uint, zero, 5);
++    let sampler_count = bounded_count(ctx, &mut prefix, uint, sampler_count, maximum_samplers);
++    let image_limit = if rewrite.image.is_some() {
++        image_count
++    } else {
++        one
++    };
++    let sampler_limit = if rewrite.sampler.is_some() {
++        sampler_count
++    } else {
++        one
++    };
++    let base = dimension_base(
++        ctx,
++        &mut prefix,
++        query_table,
++        word_pointer,
++        uint,
++        bool_type,
++        zero,
++        sampler_count,
++    );
++    let image_token = rewrite
++        .image
++        .map(|image| {
++            safe_image_index(
++                ctx,
++                &mut prefix,
++                query_table,
++                word_pointer,
++                uint,
++                bool_type,
++                zero,
++                base,
++                image_count,
++                image.token_index,
++                rewrite.shape,
++            )
++        })
++        .transpose()?;
++    let sampler_token = rewrite.sampler.map(|sampler| {
++        clamp_index(
++            ctx,
++            &mut prefix,
++            uint,
++            bool_type,
++            sampler.token_index,
++            sampler_limit,
++            zero,
++        )
++    });
++    let initial = ctx.get_or_create(Op::ConstantNull, Some(result_type), vec![]);
++
++    let outer_header = ctx.module.fresh_id();
++    let outer_body = ctx.module.fresh_id();
++    let inner_header = ctx.module.fresh_id();
++    let inner_body = ctx.module.fresh_id();
++    let inner_continue = ctx.module.fresh_id();
++    let inner_merge = ctx.module.fresh_id();
++    let outer_continue = ctx.module.fresh_id();
++    let outer_merge = ctx.module.fresh_id();
++
++    prefix.push(Instruction::new(
++        Op::Branch,
++        None,
++        None,
++        vec![Operand::IdRef(outer_header)],
++    ));
++
++    let outer_index = ctx.module.fresh_id();
++    let outer_value = ctx.module.fresh_id();
++    let outer_next_index = ctx.module.fresh_id();
++    let outer_next_value = ctx.module.fresh_id();
++    let inner_index = ctx.module.fresh_id();
++    let inner_value = ctx.module.fresh_id();
++    let inner_next_index = ctx.module.fresh_id();
++    let inner_next_value = ctx.module.fresh_id();
++    let outer_condition = ctx.module.fresh_id();
++    let inner_condition = ctx.module.fresh_id();
++
++    let mut outer_header_body = vec![
++        Instruction::new(
++            Op::Phi,
++            Some(uint),
++            Some(outer_index),
++            vec![
++                Operand::IdRef(zero),
++                Operand::IdRef(original_label),
++                Operand::IdRef(outer_next_index),
++                Operand::IdRef(outer_continue),
++            ],
++        ),
++        Instruction::new(
++            Op::Phi,
++            Some(result_type),
++            Some(outer_value),
++            vec![
++                Operand::IdRef(initial),
++                Operand::IdRef(original_label),
++                Operand::IdRef(outer_next_value),
++                Operand::IdRef(outer_continue),
++            ],
++        ),
++        Instruction::new(
++            Op::ULessThan,
++            Some(bool_type),
++            Some(outer_condition),
++            vec![Operand::IdRef(outer_index), Operand::IdRef(image_limit)],
++        ),
++        Instruction::new(
++            Op::LoopMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(outer_merge),
++                Operand::IdRef(outer_continue),
++                Operand::LoopControl(LoopControl::NONE),
++            ],
++        ),
++    ];
++    outer_header_body.push(Instruction::new(
++        Op::BranchConditional,
++        None,
++        None,
++        vec![
++            Operand::IdRef(outer_condition),
++            Operand::IdRef(outer_body),
++            Operand::IdRef(outer_merge),
++        ],
++    ));
++
++    let outer_body_body = vec![Instruction::new(
++        Op::Branch,
++        None,
++        None,
++        vec![Operand::IdRef(inner_header)],
++    )];
++
++    let mut inner_header_body = vec![
++        Instruction::new(
++            Op::Phi,
++            Some(uint),
++            Some(inner_index),
++            vec![
++                Operand::IdRef(zero),
++                Operand::IdRef(outer_body),
++                Operand::IdRef(inner_next_index),
++                Operand::IdRef(inner_continue),
++            ],
++        ),
++        Instruction::new(
++            Op::Phi,
++            Some(result_type),
++            Some(inner_value),
++            vec![
++                Operand::IdRef(outer_value),
++                Operand::IdRef(outer_body),
++                Operand::IdRef(inner_next_value),
++                Operand::IdRef(inner_continue),
++            ],
++        ),
++        Instruction::new(
++            Op::ULessThan,
++            Some(bool_type),
++            Some(inner_condition),
++            vec![Operand::IdRef(inner_index), Operand::IdRef(sampler_limit)],
++        ),
++        Instruction::new(
++            Op::LoopMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(inner_merge),
++                Operand::IdRef(inner_continue),
++                Operand::LoopControl(LoopControl::NONE),
++            ],
++        ),
++    ];
++    inner_header_body.push(Instruction::new(
++        Op::BranchConditional,
++        None,
++        None,
++        vec![
++            Operand::IdRef(inner_condition),
++            Operand::IdRef(inner_body),
++            Operand::IdRef(inner_merge),
++        ],
++    ));
++
++    let mut inner_body_body = Vec::new();
++    let safe_image = if rewrite.image.is_some() {
++        Some(safe_image_index(
++            ctx,
++            &mut inner_body_body,
++            query_table,
++            word_pointer,
++            uint,
++            bool_type,
++            zero,
++            base,
++            image_limit,
++            outer_index,
++            rewrite.shape,
++        )?)
++    } else {
++        None
++    };
++    let image = if let (Some(image), Some(safe_image)) = (rewrite.image, safe_image) {
++        descriptor_load(ctx, &mut inner_body_body, image, safe_image.index)
++    } else {
++        *original_image
++    };
++    let sampler = if let Some(sampler) = rewrite.sampler {
++        let sampler_index = clamp_index(
++            ctx,
++            &mut inner_body_body,
++            uint,
++            bool_type,
++            inner_index,
++            sampler_limit,
++            zero,
++        );
++        descriptor_load(ctx, &mut inner_body_body, sampler, sampler_index)
++    } else {
++        *original_sampler
++    };
++    let query_coord = query_coordinate(
++        ctx,
++        &mut inner_body_body,
++        query_table,
++        word_pointer,
++        uint,
++        bool_type,
++        zero,
++        sampler_count,
++        image,
++        sampler,
++        rewrite.sampler.map(|_| inner_index),
++        *coord,
++        zero,
++    )?;
++    let sampled_image = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut inner_body_body,
++        Op::SampledImage,
++        sampled_type,
++        vec![Operand::IdRef(image), Operand::IdRef(sampler)],
++    );
++    let query = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut inner_body_body,
++        Op::ImageQueryLod,
++        result_type,
++        vec![Operand::IdRef(sampled_image), Operand::IdRef(query_coord)],
++    );
++    let image_match = if let (Some(image_token), Some(safe_image)) = (image_token, safe_image) {
++        let equal = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::IEqual,
++            bool_type,
++            vec![
++                Operand::IdRef(image_token.index),
++                Operand::IdRef(outer_index),
++            ],
++        );
++        crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::LogicalAnd,
++            bool_type,
++            vec![Operand::IdRef(safe_image.valid), Operand::IdRef(equal)],
++        )
++    } else {
++        ctx.const_bool_of(bool_type, true)
++    };
++    let selected = if let Some(sampler_token) = sampler_token {
++        let sampler_match = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::IEqual,
++            bool_type,
++            vec![Operand::IdRef(sampler_token), Operand::IdRef(inner_index)],
++        );
++        let both = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::LogicalAnd,
++            bool_type,
++            vec![Operand::IdRef(image_match), Operand::IdRef(sampler_match)],
++        );
++        crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::Select,
++            result_type,
++            vec![
++                Operand::IdRef(both),
++                Operand::IdRef(query),
++                Operand::IdRef(inner_value),
++            ],
++        )
++    } else {
++        crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut inner_body_body,
++            Op::Select,
++            result_type,
++            vec![
++                Operand::IdRef(image_match),
++                Operand::IdRef(query),
++                Operand::IdRef(inner_value),
++            ],
++        )
++    };
++    inner_body_body.push(Instruction::new(
++        Op::Branch,
++        None,
++        None,
++        vec![Operand::IdRef(inner_continue)],
++    ));
++
++    let inner_continue_body = vec![
++        Instruction::new(
++            Op::IAdd,
++            Some(uint),
++            Some(inner_next_index),
++            vec![Operand::IdRef(inner_index), Operand::IdRef(one)],
++        ),
++        Instruction::new(
++            Op::CopyObject,
++            Some(result_type),
++            Some(inner_next_value),
++            vec![Operand::IdRef(selected)],
++        ),
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(inner_header)]),
++    ];
++    let inner_merge_body = vec![Instruction::new(
++        Op::Branch,
++        None,
++        None,
++        vec![Operand::IdRef(outer_continue)],
++    )];
++    let outer_continue_body = vec![
++        Instruction::new(
++            Op::IAdd,
++            Some(uint),
++            Some(outer_next_index),
++            vec![Operand::IdRef(outer_index), Operand::IdRef(one)],
++        ),
++        Instruction::new(
++            Op::CopyObject,
++            Some(result_type),
++            Some(outer_next_value),
++            vec![Operand::IdRef(inner_value)],
++        ),
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(outer_header)]),
++    ];
++    let mut outer_merge_body = vec![Instruction::new(
++        Op::CopyObject,
++        Some(result_type),
++        Some(result_id),
++        vec![Operand::IdRef(outer_value)],
++    )];
++    outer_merge_body.extend(tail);
++
++    let make_block = |label: Word, instructions: Vec<Instruction>| Block {
++        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
++        instructions,
++    };
++    let inserted = vec![
++        make_block(outer_header, outer_header_body),
++        make_block(outer_body, outer_body_body),
++        make_block(inner_header, inner_header_body),
++        make_block(inner_body, inner_body_body),
++        make_block(inner_continue, inner_continue_body),
++        make_block(inner_merge, inner_merge_body),
++        make_block(outer_continue, outer_continue_body),
++        make_block(outer_merge, outer_merge_body),
++    ];
++    ctx.module.functions[function_index].blocks[block_index].instructions = prefix;
++    // Update existing successor phis before inserting phis whose initial edge still comes from
++    // the original block.
++    repoint_phi_predecessor(
++        &mut ctx.module.functions[function_index],
++        original_label,
++        outer_merge,
++    );
++    ctx.module.functions[function_index]
++        .blocks
++        .splice(block_index + 1..block_index + 1, inserted);
++    Ok(())
++}
++
++pub(super) fn repoint_phi_predecessor(function: &mut Function, old: Word, new: Word) {
++    for block in &mut function.blocks {
++        for instruction in &mut block.instructions {
++            if instruction.class.opcode != Op::Phi {
++                continue;
++            }
++            for pair in instruction.operands.chunks_exact_mut(2) {
++                if pair.get(1) == Some(&Operand::IdRef(old)) {
++                    pair[1] = Operand::IdRef(new);
++                }
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/src/passes/resources/lod_query/mod.rs
+@@ -0,0 +1,190 @@
++//! Quad-safe replay for the existing fragment `calculate_*_lod_texture_2d` extension.
++//!
++//! `OpImageQueryLod` has implicit derivatives. When the image or sampler descriptor is selected by
++//! a divergent value inside a quad, Vulkan has no defined per-lane descriptor tuple to query. The
++//! quad path broadcasts only the descriptor *indices* (never opaque handles), reloads a uniform
++//! tuple for each quad source lane, and selects a result by comparing the lane's original tuple
++//! with those broadcast tuples. It therefore does not depend on how Vulkan maps a quad to subgroup
++//! lanes. The enumeration path performs the same query for every bounded tuple in uniform control
++//! flow.
++
++use super::fragment_control::{analyze, analyze_entry, ControlStatus, FragmentControl};
++use super::gpu_arguments::{load_word, raw_buffer, ARGUMENT_RESOURCE_TABLE_BINDING};
++use super::*;
++
++use spirv::{Capability, Decoration, Dim, LoopControl, Op, Scope, StorageClass};
++use std::collections::{HashMap, HashSet};
++
++const QUERY_TABLE_BINDING: u32 = 673;
++const QUAD_LANES: usize = 4;
++
++#[derive(Clone, Copy)]
++struct DescriptorOperand {
++    original: Word,
++    token_index: Word,
++    pointer_type: Word,
++    array: Word,
++    element_type: Word,
++}
++
++struct QueryRewrite {
++    image: Option<DescriptorOperand>,
++    sampler: Option<DescriptorOperand>,
++    shape: SampledDescriptorShape,
++}
++
++#[derive(Clone, Copy)]
++struct SafeImageIndex {
++    index: Word,
++    valid: Word,
++}
++
++pub(in crate::passes) fn lower_argument_lod_queries(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++) -> Result<(), String> {
++    // Entry points are synthesized after these lowering passes, so the selected stage in `Ctx` is
++    // authoritative here rather than the not-yet-emitted `OpEntryPoint` list.
++    if ctx.stage != Stage::Fragment {
++        return Ok(());
++    }
++
++    let table = resource_variable(&ctx.module, 0, ARGUMENT_RESOURCE_TABLE_BINDING);
++    let mut query_table = resource_variable(&ctx.module, 0, QUERY_TABLE_BINDING);
++    let mut capabilities = HashSet::new();
++    let mut sites = ctx
++        .module
++        .functions
++        .iter()
++        .enumerate()
++        .flat_map(|(function, definition)| {
++            definition
++                .blocks
++                .iter()
++                .enumerate()
++                .flat_map(move |(block, definition)| {
++                    definition
++                        .instructions
++                        .iter()
++                        .enumerate()
++                        .filter(|(_, instruction)| instruction.class.opcode == Op::ImageQueryLod)
++                        .map(move |(instruction, _)| (function, block, instruction))
++                })
++        })
++        .collect::<Vec<_>>();
++    if sites.is_empty() {
++        return Ok(());
++    }
++    // AIR lowering creates constants and immutable token-table roots needed by the shared proof.
++    ctx.module.types_global_values.append(&mut ctx.new_globals);
++    super::fragment_control::record_readonly_aliases(ctx);
++    let control = analyze_fragment_control(ctx, entry_idx)?;
++    // Enumeration and quad replay insert instructions before the query. Rewriting from the end
++    // keeps every as-yet-unprocessed site at the index reported by the original analysis.
++    sites.sort_unstable_by(|left, right| right.cmp(left));
++    for (function_index, block_index, query_index) in sites {
++        let function_id = ctx.module.functions[function_index]
++            .def
++            .as_ref()
++            .and_then(|definition| definition.result_id)
++            .ok_or_else(|| format!("fragment function #{function_index} has no result id"))?;
++        if ctx.module.functions[function_index].blocks[block_index].instructions[query_index]
++            .class
++            .opcode
++            != Op::ImageQueryLod
++        {
++            return Err("fragment LOD query moved during another query rewrite".into());
++        }
++        let status = control.status(function_index, block_index);
++        if status == ControlStatus::NotReachable {
++            continue;
++        }
++        if status != ControlStatus::Uniform {
++            return Err(format!(
++                "fragment LOD query in function %{function_id} block #{block_index} is not in \
++                 derivative-uniform control flow ({status:?})"
++            ));
++        }
++        let rewrite = query_rewrite(ctx, function_index, block_index, query_index)?;
++        if rewrite.image.is_none() && rewrite.sampler.is_none() {
++            normalize_uniform_query(ctx, function_index, block_index, query_index, &rewrite)?;
++            continue;
++        }
++        let uniformly_selected = [rewrite.image, rewrite.sampler]
++            .into_iter()
++            .flatten()
++            .all(|operand| control.value_is_uniform(function_index, operand.token_index));
++        if uniformly_selected {
++            normalize_uniform_query(ctx, function_index, block_index, query_index, &rewrite)?;
++            continue;
++        }
++        let replay = QueryRewrite {
++            image: rewrite
++                .image
++                .filter(|operand| !control.value_is_uniform(function_index, operand.token_index)),
++            sampler: rewrite
++                .sampler
++                .filter(|operand| !control.value_is_uniform(function_index, operand.token_index)),
++            shape: rewrite.shape,
++        };
++        if ctx.argument_table_version < 8 {
++            return Err("indirect fragment LOD replay requires ABI 8 typed shape rows".into());
++        }
++        let table = table.ok_or_else(|| {
++            "indirect fragment LOD query has no GPU argument resource table".to_string()
++        })?;
++        if query_table.is_none() {
++            let synthesized = raw_buffer(ctx, QUERY_TABLE_BINDING);
++            ctx.interface_buffer_var(synthesized);
++            query_table = Some(synthesized);
++        }
++        let query_table = query_table.expect("query table synthesized above");
++
++        match ctx.query_lod_replay {
++            QueryLodReplay::UniformOnly => {
++                return Err(
++                    "fragment LOD query selects its descriptor from nonuniform GPU argument \
++                     data; choose a quad-broadcast or enumeration backend"
++                        .into(),
++                );
++            }
++            QueryLodReplay::QuadBroadcast => {
++                rewrite_quad_query(
++                    ctx,
++                    function_index,
++                    block_index,
++                    query_index,
++                    &replay,
++                    table,
++                    query_table,
++                )?;
++                capabilities.insert(Capability::GroupNonUniform);
++                capabilities.insert(Capability::GroupNonUniformQuad);
++            }
++            QueryLodReplay::DescriptorEnumeration => {
++                rewrite_query_as_enumeration(
++                    ctx,
++                    function_index,
++                    block_index,
++                    query_index,
++                    &replay,
++                    table,
++                    query_table,
++                )?;
++            }
++        }
++    }
++    for capability in capabilities {
++        ctx.add_capability(capability);
++    }
++    Ok(())
++}
++
++mod analysis;
++mod coordinates;
++mod enumeration;
++mod quad;
++use analysis::*;
++use coordinates::*;
++use enumeration::*;
++use quad::*;
+--- /dev/null
++++ b/src/passes/resources/lod_query/quad.rs
+@@ -0,0 +1,242 @@
++use super::*;
++
++pub(super) fn rewrite_quad_query(
++    ctx: &mut Ctx,
++    function_index: usize,
++    block_index: usize,
++    query_index: usize,
++    rewrite: &QueryRewrite,
++    table: Word,
++    query_table: Word,
++) -> Result<(), String> {
++    let original =
++        ctx.module.functions[function_index].blocks[block_index].instructions[query_index].clone();
++    let Some(Operand::IdRef(sampled)) = original.operands.first() else {
++        return Err("fragment LOD query has no sampled image".into());
++    };
++    let Some(Operand::IdRef(coord)) = original.operands.get(1) else {
++        return Err("fragment LOD query has no coordinate".into());
++    };
++    let defs = definitions(ctx);
++    let sampled_type = defs
++        .get(sampled)
++        .and_then(|definition| definition.result_type)
++        .ok_or("fragment LOD query sampled image has no type")?;
++    let sampled_definition = defs
++        .get(sampled)
++        .ok_or("fragment LOD query sampled image is undefined")?;
++    let [Operand::IdRef(original_image), Operand::IdRef(original_sampler)] =
++        sampled_definition.operands.as_slice()
++    else {
++        return Err("fragment LOD query sampled image has invalid operands".into());
++    };
++    let result_type = original
++        .result_type
++        .ok_or("fragment LOD query has no result type")?;
++    let result_id = original
++        .result_id
++        .ok_or("fragment LOD query has no result id")?;
++    let uint = ctx.ty_uint();
++    let bool_type = ctx.ty_bool();
++    let word_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    let zero = ctx.const_uint(0);
++    let mut prefix = Vec::new();
++    let table_words = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::ArrayLength,
++        uint,
++        vec![Operand::IdRef(query_table), Operand::LiteralBit32(0)],
++    );
++    let eight = ctx.const_uint(8);
++    let three = ctx.const_uint(3);
++    let maximum_images = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::UDiv,
++        uint,
++        vec![Operand::IdRef(table_words), Operand::IdRef(eight)],
++    );
++    let maximum_samplers = crate::passes::resources::gpu_arguments::value(
++        ctx,
++        &mut prefix,
++        Op::UDiv,
++        uint,
++        vec![Operand::IdRef(table_words), Operand::IdRef(three)],
++    );
++    let image_count = load_count(ctx, &mut prefix, table, word_pointer, uint, zero, 1);
++    let image_count = bounded_count(ctx, &mut prefix, uint, image_count, maximum_images);
++    let sampler_count = load_count(ctx, &mut prefix, table, word_pointer, uint, zero, 5);
++    let sampler_count = bounded_count(ctx, &mut prefix, uint, sampler_count, maximum_samplers);
++    let base = dimension_base(
++        ctx,
++        &mut prefix,
++        query_table,
++        word_pointer,
++        uint,
++        bool_type,
++        zero,
++        sampler_count,
++    );
++    let image_token = rewrite
++        .image
++        .map(|image| {
++            safe_image_index(
++                ctx,
++                &mut prefix,
++                query_table,
++                word_pointer,
++                uint,
++                bool_type,
++                zero,
++                base,
++                image_count,
++                image.token_index,
++                rewrite.shape,
++            )
++        })
++        .transpose()?;
++    let image_valid = image_token.map(|safe| safe.valid);
++    let image_source_index = image_token.map(|safe| safe.index);
++    let sampler_token = rewrite.sampler.map(|sampler| {
++        clamp_index(
++            ctx,
++            &mut prefix,
++            uint,
++            bool_type,
++            sampler.token_index,
++            sampler_count,
++            zero,
++        )
++    });
++
++    let mut broadcasts = [0; QUAD_LANES];
++    let mut sampler_broadcasts = [0; QUAD_LANES];
++    let mut queries = [0; QUAD_LANES];
++    let mut matches = [0; QUAD_LANES];
++    for lane in 0..QUAD_LANES {
++        let image_index = if let Some(image_source_index) = image_source_index {
++            let broadcast =
++                broadcast_index(ctx, &mut prefix, uint, image_source_index, lane as u32);
++            broadcasts[lane] = broadcast;
++            broadcast
++        } else {
++            *original_image
++        };
++        let sampler_index = if let Some(sampler_token) = sampler_token {
++            let broadcast = broadcast_index(ctx, &mut prefix, uint, sampler_token, lane as u32);
++            sampler_broadcasts[lane] = broadcast;
++            broadcast
++        } else {
++            *original_sampler
++        };
++        let image = if let Some(image) = rewrite.image {
++            descriptor_load(ctx, &mut prefix, image, image_index)
++        } else {
++            image_index
++        };
++        let sampler = if let Some(sampler) = rewrite.sampler {
++            descriptor_load(ctx, &mut prefix, sampler, sampler_index)
++        } else {
++            sampler_index
++        };
++        let query_coord = query_coordinate(
++            ctx,
++            &mut prefix,
++            query_table,
++            word_pointer,
++            uint,
++            bool_type,
++            zero,
++            sampler_count,
++            image,
++            sampler,
++            rewrite.sampler.map(|_| sampler_index),
++            *coord,
++            zero,
++        )?;
++        let sampled_image = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut prefix,
++            Op::SampledImage,
++            sampled_type,
++            vec![Operand::IdRef(image), Operand::IdRef(sampler)],
++        );
++        queries[lane] = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut prefix,
++            Op::ImageQueryLod,
++            result_type,
++            vec![Operand::IdRef(sampled_image), Operand::IdRef(query_coord)],
++        );
++        matches[lane] = image_valid.unwrap_or_else(|| ctx.const_bool_of(bool_type, true));
++        if let Some(image_source_index) = image_source_index {
++            matches[lane] = crate::passes::resources::gpu_arguments::value(
++                ctx,
++                &mut prefix,
++                Op::IEqual,
++                bool_type,
++                vec![
++                    Operand::IdRef(image_source_index),
++                    Operand::IdRef(broadcasts[lane]),
++                ],
++            );
++            if let Some(image_valid) = image_valid {
++                matches[lane] = crate::passes::resources::gpu_arguments::value(
++                    ctx,
++                    &mut prefix,
++                    Op::LogicalAnd,
++                    bool_type,
++                    vec![Operand::IdRef(image_valid), Operand::IdRef(matches[lane])],
++                );
++            }
++        }
++        if let Some(sampler_token) = sampler_token {
++            let equal = crate::passes::resources::gpu_arguments::value(
++                ctx,
++                &mut prefix,
++                Op::IEqual,
++                bool_type,
++                vec![
++                    Operand::IdRef(sampler_token),
++                    Operand::IdRef(sampler_broadcasts[lane]),
++                ],
++            );
++            matches[lane] = if rewrite.image.is_some() {
++                crate::passes::resources::gpu_arguments::value(
++                    ctx,
++                    &mut prefix,
++                    Op::LogicalAnd,
++                    bool_type,
++                    vec![Operand::IdRef(matches[lane]), Operand::IdRef(equal)],
++                )
++            } else {
++                equal
++            };
++        }
++    }
++    let initial = ctx.get_or_create(Op::ConstantNull, Some(result_type), vec![]);
++    let mut selected = initial;
++    for lane in 0..QUAD_LANES {
++        selected = crate::passes::resources::gpu_arguments::value(
++            ctx,
++            &mut prefix,
++            Op::Select,
++            result_type,
++            vec![
++                Operand::IdRef(matches[lane]),
++                Operand::IdRef(queries[lane]),
++                Operand::IdRef(selected),
++            ],
++        );
++    }
++    prefix.push(Instruction::new(
++        Op::CopyObject,
++        Some(result_type),
++        Some(result_id),
++        vec![Operand::IdRef(selected)],
++    ));
++    let instructions = &mut ctx.module.functions[function_index].blocks[block_index].instructions;
++    instructions.splice(query_index..=query_index, prefix);
++    Ok(())
++}
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -10,6 +10,7 @@
+ pub(in crate::passes) mod fragment_control;
+ mod gpu_argument_graph;
+ mod gpu_arguments;
++pub(in crate::passes) mod lod_query;
+ mod nonuniform;
+ mod null_sampling;
+ mod null_texels;
+@@ -29,11 +30,13 @@
+ pub(in crate::passes) use gpu_arguments::table_sampler_flag_word;
+ pub use gpu_arguments::{
+     lower_argument_resource_tables, lower_argument_resource_tables_versioned,
++    lower_argument_resource_tables_versioned_with_query_lod_replay,
+     lower_argument_resource_tables_with_table_version,
+     lower_argument_resource_tables_with_table_version_and_uniform_control_proof,
+     ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
+     ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
++pub(in crate::passes) use lod_query::lower_argument_lod_queries;
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
+ pub(in crate::passes) use null_sampling::protect_argument_sampling;
+ pub(in crate::passes) use null_texels::guard_argument_texel_accesses;

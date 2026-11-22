@@ -1,0 +1,229 @@
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -5,7 +5,9 @@
+ //! a directly linked AIR function before native parsing. The linkage contract is structural: entry
+ //! parameter index, table slot, exact LLVM symbol, and sanitized dependency module.
+ 
++use crate::reflect::{static_sampler_metadata_globals, STATIC_SAMPLER_METADATA};
+ use std::collections::{HashMap, HashSet};
++use std::fmt::Write as _;
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ pub struct LinkedFunctionLinkage {
+@@ -536,7 +538,7 @@
+             &mut used,
+             &mut pending,
+         )?;
+-        append_dependency_module(&mut output, &rewritten);
++        append_dependency_module(&mut output, &rewritten)?;
+     }
+     let direct_functions = used
+         .into_iter()
+@@ -1056,7 +1058,7 @@
+     for module in linked_modules {
+         output.push('\n');
+         let resolved = specialize_visible_function_references(module, linkage)?;
+-        append_dependency_module(&mut output, &resolved);
++        append_dependency_module(&mut output, &resolved)?;
+     }
+     Ok(output)
+ }
+@@ -1177,9 +1179,33 @@
+ ///
+ /// LLVM metadata ids and attribute-group ids are module-local. Concatenating their definitions
+ /// would allow a helper's `!0`/`#0` to replace the entry module's stage metadata or attributes.
+-/// Native parsing consumes instruction semantics directly and does not need those definition
+-/// tables, so dependency modules contribute types, globals, declarations, and function bodies only.
+-fn append_dependency_module(output: &mut String, module: &str) {
++/// The sampler-state root is reconstructed from dependency globals with fresh node IDs.
++fn append_dependency_module(output: &mut String, module: &str) -> Result<(), String> {
++    let samplers = static_sampler_metadata_globals(module)?;
++    let mut renames = HashMap::new();
++    let mut added = Vec::new();
++    let mut suffix = 0usize;
++    for sampler in samplers {
++        if !crate::meta::is_static_sampler_global(sampler) {
++            return Err(format!("unrecognized AIR sampler-state global {sampler}"));
++        }
++        if added.contains(&sampler) {
++            continue;
++        }
++        if contains_llvm_value(output, sampler) {
++            loop {
++                suffix += 1;
++                let candidate = format!("{sampler}.{suffix}");
++                if !contains_llvm_value(output, &candidate)
++                    && !contains_llvm_value(module, &candidate)
++                {
++                    renames.insert(sampler, candidate);
++                    break;
++                }
++            }
++        }
++        added.push(sampler);
++    }
+     for line in module.lines() {
+         let trimmed = line.trim_start();
+         if trimmed.starts_with("; ModuleID =")
+@@ -1191,9 +1217,63 @@
+         {
+             continue;
+         }
+-        output.push_str(line);
++        if renames.is_empty() {
++            output.push_str(line);
++        } else {
++            append_with_sampler_renames(output, line, &renames);
++        }
+         output.push('\n');
+     }
++    if !added.is_empty() {
++        let mut id = output
++            .lines()
++            .filter_map(|line| {
++                line.trim_start().strip_prefix('!')?.split_once(" = ")?.0.parse::<u32>().ok()
++            })
++            .max()
++            .unwrap_or(0);
++        let mut refs = Vec::with_capacity(added.len());
++        for sampler in added {
++            id = id.checked_add(1).ok_or("AIR metadata IDs exhausted")?;
++            let name = renames.get(sampler).map_or(sampler, String::as_str);
++            writeln!(output, "!{id} = !{{!\"air.sampler_state\", ptr addrspace(2) {name}}}")
++                .unwrap();
++            refs.push(format!("!{id}"));
++        }
++        let refs = refs.join(", ");
++        if let Some(body) = output.lines().find_map(|line| {
++            line.trim_start().strip_prefix(STATIC_SAMPLER_METADATA)
++        }) {
++            let end = body.find('}').ok_or("unterminated AIR sampler-state root")?;
++            let separator = if body[..end].trim().is_empty() { "" } else { ", " };
++            let offset = body.as_ptr() as usize - output.as_ptr() as usize;
++            output.insert_str(offset + end, &format!("{separator}{refs}"));
++        } else {
++            writeln!(output, "{STATIC_SAMPLER_METADATA}{refs}}}").unwrap();
++        }
++    }
++    Ok(())
++}
++
++fn append_with_sampler_renames(output: &mut String, mut line: &str, renames: &HashMap<&str, String>) {
++    while let Some(start) = line.find(['@', '"', ';']) {
++        let tail = &line[start..];
++        let end = match tail.as_bytes()[0] {
++            b';' => break,
++            b'"' => llvm_quoted_string(&tail[1..]).map_or(tail.len(), |(_, len)| len + 1),
++            _ if tail.starts_with("@\"") => {
++                llvm_quoted_string(&tail[2..]).map_or(tail.len(), |(_, len)| len + 2)
++            }
++            _ => tail[1..]
++                .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$' | '-')))
++                .map_or(tail.len(), |len| len + 1),
++        };
++        output.push_str(&line[..start]);
++        let token = &tail[..end];
++        output.push_str(renames.get(token).map_or(token, String::as_str));
++        line = &tail[end..];
++    }
++    output.push_str(line);
+ }
+ 
+ fn validate_linkage(linkage: &LinkedFunctionLinkage) -> Result<(), String> {
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -4138,10 +4138,14 @@
+         .any(|token| token == attribute)
+ }
+ 
++pub(crate) const STATIC_SAMPLER_METADATA: &str = "!air.sampler_states = !{";
++
+ fn parse_static_sampler_constants(ll: &str) -> Result<Vec<[u64; 2]>, String> {
+-    let mut globals = std::collections::HashMap::<String, [u64; 2]>::new();
+-    let mut nodes = std::collections::HashMap::<u32, String>::new();
+-    let mut root = None;
++    let mut names = static_sampler_metadata_globals(ll)?;
++    if names.is_empty() {
++        return Ok(Vec::new());
++    }
++    let mut globals = std::collections::HashMap::<&str, [u64; 2]>::new();
+ 
+     for raw in ll.lines() {
+         let line = raw.trim();
+@@ -4156,11 +4160,33 @@
+                     .map(|value| value as u64)
+             });
+             if let Some(first) = values.next() {
+-                globals.insert(name.to_string(), [first, values.next().unwrap_or(0)]);
++                globals.insert(name, [first, values.next().unwrap_or(0)]);
+             }
+-            continue;
+         }
+-        if let Some(body) = line.strip_prefix("!air.sampler_states = !{") {
++    }
++    // The interface pass sorts the same globals with the same key, from SPIR-V `OpName` rather
++    // than from this root. The key is total, so both sequences agree and the state reported here
++    // belongs to the binding the module gave that global.
++    names.sort_by_key(|name| crate::meta::static_sampler_name_order(name));
++    names
++        .into_iter()
++        .map(|name| {
++            globals.get(name).copied().ok_or_else(|| {
++                format!("AIR sampler-state global {name} has no i64 initializer")
++            })
++        })
++        .collect()
++}
++
++pub(crate) fn static_sampler_metadata_globals(ll: &str) -> Result<Vec<&str>, String> {
++    if !ll.contains(STATIC_SAMPLER_METADATA) {
++        return Ok(Vec::new());
++    }
++    let mut nodes = std::collections::HashMap::<u32, &str>::new();
++    let mut root = None;
++    for raw in ll.lines() {
++        let line = raw.trim();
++        if let Some(body) = line.strip_prefix(STATIC_SAMPLER_METADATA) {
+             root = Some(metadata_refs(body));
+             continue;
+         }
+@@ -4171,14 +4197,14 @@
+             continue;
+         };
+         if let Ok(id) = id.parse::<u32>() {
+-            nodes.insert(id, body.trim_end_matches('}').to_string());
++            nodes.insert(id, body.trim_end_matches('}'));
+         }
+     }
+ 
+     let Some(root) = root else {
+         return Ok(Vec::new());
+     };
+-    let mut constants = Vec::with_capacity(root.len());
++    let mut names = Vec::with_capacity(root.len());
+     for node_id in root {
+         let body = nodes
+             .get(&node_id)
+@@ -4188,19 +4214,10 @@
+                 "AIR sampler-state root references non-sampler node !{node_id}"
+             ));
+         }
+-        let name = global_name(body)
+-            .ok_or_else(|| format!("AIR sampler-state node !{node_id} has no global"))?;
+-        let words = globals
+-            .get(name)
+-            .copied()
+-            .ok_or_else(|| format!("AIR sampler-state global {name} has no i64 initializer"))?;
+-        constants.push((name.to_string(), words));
++        names.push(global_name(body)
++            .ok_or_else(|| format!("AIR sampler-state node !{node_id} has no global"))?);
+     }
+-    // The interface pass sorts the same globals with the same key, from SPIR-V `OpName` rather
+-    // than from this root. The key is total, so both sequences agree and the state reported here
+-    // belongs to the binding the module gave that global.
+-    constants.sort_by_key(|(name, _)| crate::meta::static_sampler_name_order(name));
+-    Ok(constants.into_iter().map(|(_, words)| words).collect())
++    Ok(names)
+ }
+ 
+ fn metadata_refs(body: &str) -> Vec<u32> {

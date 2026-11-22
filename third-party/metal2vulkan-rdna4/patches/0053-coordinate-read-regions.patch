@@ -1,0 +1,336 @@
+diff --git a/src/native/guarded_reads.rs b/src/native/guarded_reads.rs
+--- a/src/native/guarded_reads.rs
++++ b/src/native/guarded_reads.rs
+@@ -14,10 +14,9 @@
+ mod tests;
+ 
+ struct Arm {
+-    block: usize,
+     reads: Vec<TirInst>,
+     dependencies: Vec<TirInst>,
+-    removed: HashSet<usize>,
++    removed: Vec<(usize, usize)>,
+ }
+ 
+ pub(super) fn reconverge(parsed: &LlModule, function: &LlFunction, blocks: &mut Vec<BodyBlock>) {
+@@ -61,8 +60,7 @@
+                 plan_arm(
+                     parsed,
+                     function,
+-                    index,
+-                    blocks[index].typed.as_ref()?,
++                    &linear_arm(header, index, blocks, &positions, &predecessors),
+                     &definitions,
+                 )
+             });
+@@ -135,21 +133,62 @@
+                     ],
+                 );
+             }
+-            let mut index = 0;
+-            blocks[arm.block]
+-                .typed_mut()
+-                .expect("planned source arm")
++            let mut removed = HashMap::<usize, HashSet<usize>>::new();
++            for (block, position) in arm.removed {
++                removed.entry(block).or_default().insert(position);
++            }
++            for (block, positions) in removed {
++                let mut index = 0;
++                blocks[block]
++                    .typed_mut()
++                    .expect("planned source arm")
++                    .insts
++                    .retain(|_| {
++                        let keep = !positions.contains(&index);
++                        index += 1;
++                        keep
++                    });
++            }
++            additions.push(body(guard));
++        }
++        additions.push(body(merge));
++    }
++    blocks.extend(additions);
++}
++
++fn linear_arm<'a>(
++    header: usize,
++    mut index: usize,
++    blocks: &'a [BodyBlock],
++    positions: &HashMap<String, usize>,
++    predecessors: &HashMap<&str, Vec<usize>>,
++) -> Vec<(usize, usize, &'a TirInst)> {
++    let mut instructions = Vec::new();
++    let mut visited = HashSet::from([header]);
++    while visited.insert(index) {
++        let Some(block) = &blocks[index].typed else {
++            break;
++        };
++        instructions.extend(
++            block
+                 .insts
+-                .retain(|_| {
+-                    let keep = !arm.removed.contains(&index);
+-                    index += 1;
+-                    keep
+-                });
+-            additions.push(body(guard));
+-        }
+-        additions.push(body(merge));
+-    }
+-    blocks.extend(additions);
++                .iter()
++                .enumerate()
++                .map(|(position, i)| (index, position, i)),
++        );
++        let TirTerminator::Br(next) = &block.terminator else {
++            break;
++        };
++        // A join or backedge has a different predicate or dynamic instance.
++        if predecessors.get(next.as_str()).map(Vec::as_slice) != Some(&[index]) {
++            break;
++        }
++        let Some(&next) = positions.get(next) else {
++            break;
++        };
++        index = next;
++    }
++    instructions
+ }
+ 
+ fn fresh(names: &mut HashSet<String>, serial: &mut usize) -> String {
+@@ -173,20 +212,17 @@
+ fn plan_arm(
+     parsed: &LlModule,
+     function: &LlFunction,
+-    index: usize,
+-    block: &TirBlock,
++    instructions: &[(usize, usize, &TirInst)],
+     definitions: &HashMap<&str, &TirInst>,
+ ) -> Option<Arm> {
+-    let local = block
+-        .insts
+-        .iter()
+-        .filter_map(|i| i.result.as_deref())
++    let local = instructions
++        .iter()
++        .filter_map(|(_, _, i)| i.result.as_deref())
+         .collect::<HashSet<_>>();
+     let mut needed = HashSet::new();
+-    let mut pending = block
+-        .insts
+-        .iter()
+-        .filter_map(|i| i.call().as_ref())
++    let mut pending = instructions
++        .iter()
++        .filter_map(|(_, _, i)| i.call().as_ref())
+         .filter(|call| {
+             [
+                 "air.sample_texture",
+@@ -226,7 +262,7 @@
+     let mut copied = HashSet::new();
+     let mut removed = HashSet::new();
+     let mut last_read = None;
+-    for (position, instruction) in block.insts.iter().enumerate() {
++    for (position, (_, _, instruction)) in instructions.iter().enumerate() {
+         if !readable_prefix(instruction) && !ordinary_store(parsed, instruction) {
+             break;
+         }
+@@ -245,18 +281,18 @@
+             continue;
+         };
+         copied.extend(path);
+-        reads.push(instruction.clone());
++        reads.push((*instruction).clone());
+         removed.insert(position);
+         last_read = Some(position);
+     }
+     let end = last_read? + 1;
+-    let prefix = &block.insts[..end];
+-    if prefix.iter().any(|i| i.opcode == TirOpcode::Store) {
++    let prefix = &instructions[..end];
++    if prefix.iter().any(|(_, _, i)| i.opcode == TirOpcode::Store) {
+         reads.clear();
+-        for (position, instruction) in prefix.iter().enumerate() {
++        for (position, (_, _, instruction)) in prefix.iter().enumerate() {
+             if instruction.opcode == TirOpcode::Load {
+                 super::constant_reads::entry_read_path(parsed, function, definitions, instruction)?;
+-                reads.push(instruction.clone());
++                reads.push((*instruction).clone());
+                 removed.insert(position);
+             } else if instruction.opcode == TirOpcode::Store {
+                 removed.insert(position);
+@@ -264,23 +300,26 @@
+         }
+         // Move the complete memory prefix; leaving an earlier read behind a write changes its value.
+         return Some(Arm {
+-            block: index,
+             reads,
+-            dependencies: prefix.to_vec(),
+-            removed,
++            dependencies: prefix.iter().map(|(_, _, i)| (*i).clone()).collect(),
++            removed: removed
++                .into_iter()
++                .map(|p| (instructions[p].0, instructions[p].1))
++                .collect(),
+         });
+     }
+-    let dependencies = block
+-        .insts
+-        .iter()
+-        .filter(|i| i.result.as_ref().is_some_and(|name| copied.contains(name)))
+-        .cloned()
++    let dependencies = instructions
++        .iter()
++        .filter(|(_, _, i)| i.result.as_ref().is_some_and(|name| copied.contains(name)))
++        .map(|(_, _, i)| (*i).clone())
+         .collect();
+     (!reads.is_empty()).then_some(Arm {
+-        block: index,
+         reads,
+         dependencies,
+-        removed,
++        removed: removed
++            .into_iter()
++            .map(|p| (instructions[p].0, instructions[p].1))
++            .collect(),
+     })
+ }
+ 
+diff --git a/src/native/guarded_reads/tests.rs b/src/native/guarded_reads/tests.rs
+--- a/src/native/guarded_reads/tests.rs
++++ b/src/native/guarded_reads/tests.rs
+@@ -252,6 +252,117 @@
+ }
+ 
+ #[test]
++fn linear_coordinate_region_preserves_cross_block_memory_order_and_source_edges() {
++    let text = source(
++        "%before = load i32, ptr addrspace(2) %buffer, align 4\n \
++         store i32 %before, ptr addrspace(1) %output, align 4\n \
++         br label %read\nread:\n %offset = add i64 %index, 8\n \
++         br label %sample_block\nsample_block:",
++        "float",
++    )
++    .replace("%buffer, i64 8", "%buffer, i64 %offset")
++    .replace("[ %sample, %arm ]", "[ %sample, %sample_block ]");
++    let blocks = rewritten(&text);
++    assert_eq!(blocks.len(), 7);
++    let TirTerminator::BrCond { t, f, .. } = &named(&blocks, "%entry").terminator else {
++        panic!()
++    };
++    let guard = named(&blocks, t);
++    assert_eq!(
++        guard
++            .insts
++            .iter()
++            .map(|i| i.opcode.clone())
++            .collect::<Vec<_>>(),
++        [
++            TirOpcode::Load,
++            TirOpcode::Store,
++            TirOpcode::Add,
++            TirOpcode::GetElementPtr,
++            TirOpcode::Load
++        ]
++    );
++    assert_eq!(named(&blocks, f).insts.len(), 2);
++    assert_eq!(
++        named(&blocks, "%arm").terminator,
++        TirTerminator::Br("%read".into())
++    );
++    assert_eq!(
++        named(&blocks, "%read").terminator,
++        TirTerminator::Br("%sample_block".into())
++    );
++    for name in ["%arm", "%read", "%sample_block"] {
++        assert!(!named(&blocks, name)
++            .insts
++            .iter()
++            .any(|i| i.load().is_some() || i.store().is_some()));
++    }
++    assert!(named(&blocks, "%exit").insts[0]
++        .phi_incoming()
++        .as_ref()
++        .unwrap()
++        .1
++        .iter()
++        .any(|(_, pred)| pred == "%sample_block"));
++    let parsed = LlModule::parse_with_stage_meta(&text, None, Some("main")).unwrap();
++    let mut repeated = blocks.clone();
++    reconverge(&parsed, &parsed.functions[0], &mut repeated);
++    assert_eq!(
++        repeated.iter().map(BodyBlock::lines).collect::<Vec<_>>(),
++        blocks.iter().map(BodyBlock::lines).collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn linear_regions_stop_at_joins_conditionals_cycles_and_ordered_prefixes() {
++    let original = source("", "float");
++    for prefix in [
++        "call void @side_effect()",
++        "fence seq_cst",
++        "store volatile i32 7, ptr addrspace(1) %output",
++    ] {
++        let text = source(prefix, "float")
++            .replace(" %p =", " br label %read\nread:\n %p =")
++            .replace("[ %sample, %arm ]", "[ %sample, %read ]");
++        assert_eq!(rewritten(&text).len(), 4, "{prefix}");
++    }
++    let conditional = original
++        .replace(
++            "arm:\n",
++            "arm:\n br i1 %condition, label %read, label %exit\nread:\n",
++        )
++        .replace(
++            "[ %sample, %arm ], [ 0.0, %entry ]",
++            "[ %sample, %read ], [ 0.0, %entry ], [ 0.0, %arm ]",
++        );
++    let blocks = rewritten(&conditional);
++    // The nested condition may plan its own read, but the outer selection must not do so.
++    assert_eq!(
++        named(&blocks, "%entry").terminator,
++        TirTerminator::BrCond {
++            cond: "%condition".into(),
++            t: "%arm".into(),
++            f: "%exit".into()
++        }
++    );
++    let joined = original
++        .replace("label %arm, label %exit", "label %arm, label %other")
++        .replace(
++            "arm:\n",
++            "other:\n br label %read\narm:\n br label %read\nread:\n",
++        )
++        .replace("[ %sample, %arm ], [ 0.0, %entry ]", "[ %sample, %read ]");
++    assert_eq!(rewritten(&joined).len(), 5);
++    let cycle = original
++        .replace(
++            "arm:\n",
++            "arm:\n br label %cycle\ncycle:\n br label %arm\nunreachable_sample:\n",
++        )
++        .replace("[ %sample, %arm ]", "[ %sample, %unreachable_sample ]");
++    assert_eq!(rewritten(&cycle).len(), 5);
++}
++
++#[test]
+ fn loaded_runtime_indices_move_with_the_read_but_unproven_address_roots_do_not() {
+     let text = source(
+         "%index_ptr = getelementptr i8, ptr addrspace(2) %buffer, i64 0\n \
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -670,7 +670,10 @@
+ sampling selection. The native typed transform builds guarded address/read blocks
+ and phi values with zero on inactive paths; the original descriptor operations
+ and samples keep their source sites. This is conditional evaluation,
+-not storage-load speculation. It requires single-predecessor source arms,
++not storage-load speculation. It follows unconditional source edges through
++single-predecessor blocks, retaining their original labels, terminators and sample sites.
++Joins, conditional edges and cycles end the region, so a read cannot move across a
++different predicate or loop instance. It requires
+ entry-rooted address paths and a prefix free of unknown calls, barriers and ordered
+ memory operations. Pure AIR numeric conversions are permitted. Ordinary numeric
+ stores require moving the complete prefix, including every preceding numeric

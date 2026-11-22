@@ -1,0 +1,33 @@
+diff --git a/src/amd/vulkan/radv_pipeline_cache.c b/src/amd/vulkan/radv_pipeline_cache.c
+--- a/src/amd/vulkan/radv_pipeline_cache.c
++++ b/src/amd/vulkan/radv_pipeline_cache.c
+@@ -209,7 +209,8 @@ radv_shader_create(struct radv_device *device, struct vk_pipeline_cache *cache, con
+ {
+    if (radv_is_cache_disabled(&device->compiler_info, cache) || skip_cache || (dbg && dbg->dump_shader)) {
+       struct radv_shader *shader;
+-      radv_shader_create_uncached(device, binary, false, NULL, dbg, &shader);
++      if (radv_shader_create_uncached(device, binary, false, NULL, dbg, &shader) != VK_SUCCESS)
++         return NULL;
+       /* radv_parse_binary_debug_info() might have been done earlier by radv_shader_dump_asm(). Skip it in that case to
+        * avoid memory leaks. */
+       if (!dbg || (!dbg->statistics && !dbg->ir_string && !dbg->disasm_string && !dbg->debug_info_count))
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3051,7 +3051,15 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const VkGr
+    radv_graphics_shaders_create(device, cache, skip_shaders_cache, pipeline->base.shaders, binaries, debug,
+                                 &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
+ 
+-   if (!skip_shaders_cache) {
++   for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
++      if (binaries[i] && !pipeline->base.shaders[i])
++         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   if (gs_copy_binary && !pipeline->base.gs_copy_shader)
++      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   if (result == VK_SUCCESS && !skip_shaders_cache) {
+       radv_pipeline_cache_insert(device, cache, &pipeline->base);
+    }
+ 

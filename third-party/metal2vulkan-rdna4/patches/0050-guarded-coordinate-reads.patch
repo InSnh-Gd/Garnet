@@ -1,0 +1,639 @@
+Subject: [PATCH] Reconverge guarded coordinate reads before derivative placement
+
+Keep memory accesses under their original branch condition, then form inactive
+zero phi values before the original sampling selection. Preserve effects,
+address guards, helper-root provenance and per-loop dynamic instances.
+
+diff --git a/src/native/constant_reads.rs b/src/native/constant_reads.rs
+--- a/src/native/constant_reads.rs
++++ b/src/native/constant_reads.rs
+@@ -72,6 +72,41 @@
+     definitions: &HashMap<&str, &'a TirInst>,
+     instruction: &'a TirInst,
+ ) -> Option<Vec<&'a TirInst>> {
++    let (path, root) = entry_read_path(parsed, function, definitions, instruction)?;
++    let load = instruction.load().as_deref()?;
++    let span = function.constant_read_spans.get(&root)?;
++    let (bytes, natural_align) = parsed.native_memcpy_type_size_align(&load.result_ty)?;
++    let mut offset = 0i128;
++    for dependency in &path {
++        if let Some(gep) = dependency.gep().as_deref() {
++            offset =
++                offset.checked_add(super::emit_tiers::constant_gep_byte_offset(parsed, gep)?)?;
++            // An intermediate inbounds pointer can be poison even when the final offset fits.
++            if offset < 0 || offset > i128::from(span.bytes) {
++                return None;
++            }
++        }
++    }
++    let align = load.align.unwrap_or(natural_align);
++    if offset < 0
++        || offset.checked_add(i128::from(bytes))? > i128::from(span.bytes)
++        || align == 0
++        || span.align < align
++        || offset % i128::from(align) != 0
++    {
++        return None;
++    }
++    Some(path)
++}
++
++/// A numeric read rooted in an entry buffer. This alone does not permit speculation:
++/// callers must prove an accessible span or retain the original branch guard.
++pub(super) fn entry_read_path<'a>(
++    parsed: &LlModule,
++    function: &LlFunction,
++    definitions: &HashMap<&str, &'a TirInst>,
++    instruction: &'a TirInst,
++) -> Option<(Vec<&'a TirInst>, String)> {
+     let load = instruction.load().as_deref()?;
+     let numeric = |ty: &LlType| {
+         matches!(
+@@ -85,18 +120,22 @@
+     {
+         return None;
+     }
+-    let (bytes, _) = parsed.native_memcpy_type_size_align(&load.result_ty)?;
+     let LlValue::Local(mut pointer) = load.ptr.value.clone() else {
+         return None;
+     };
+     let mut path = vec![instruction];
+     let mut visited = HashSet::new();
+-    while !function.constant_read_spans.contains_key(&pointer) {
++    while !function
++        .params
++        .iter()
++        .any(|(name, ty)| name == &pointer && matches!(ty, LlType::Ptr(1 | 2)))
++    {
+         if !visited.insert(pointer.clone()) {
+             return None;
+         }
+         let definition = *definitions.get(pointer.as_str())?;
+         if let Some(gep) = definition.gep().as_deref() {
++            super::emit_tiers::constant_gep_byte_offset(parsed, gep)?;
+             let LlValue::Local(base) = &gep.base.value else {
+                 return None;
+             };
+@@ -105,7 +144,7 @@
+             pointer = base.to_string();
+         } else if definition.opcode == TirOpcode::Metal2VulkanInlineParameter {
+             let argument = definition.operands.first()?.as_typed_value()?;
+-            if argument.ty != LlType::Ptr(2) {
++            if !matches!(argument.ty, LlType::Ptr(1 | 2)) {
+                 return None;
+             }
+             let LlValue::Local(base) = argument.value else {
+@@ -117,31 +156,8 @@
+         }
+         path.push(definition);
+     }
+-    let span = &function.constant_read_spans[&pointer];
+-    let mut offset = 0i128;
+-    for dependency in path.iter().rev() {
+-        if let Some(gep) = dependency.gep().as_deref() {
+-            offset =
+-                offset.checked_add(super::emit_tiers::constant_gep_byte_offset(parsed, gep)?)?;
+-            // An intermediate inbounds pointer can be poison even when the final offset fits.
+-            if offset < 0 || offset > i128::from(span.bytes) {
+-                return None;
+-            }
+-        }
+-    }
+-    let align = load
+-        .align
+-        .unwrap_or(parsed.native_memcpy_type_size_align(&load.result_ty)?.1);
+-    if offset < 0
+-        || offset.checked_add(i128::from(bytes))? > i128::from(span.bytes)
+-        || align == 0
+-        || span.align < align
+-        || offset % i128::from(align) != 0
+-    {
+-        return None;
+-    }
+     path.reverse();
+-    Some(path)
++    Some((path, pointer))
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -556,6 +556,7 @@
+         let mut body_blocks =
+             crate::native::tir::prune_literal_branch_dead_blocks(switch_ready_blocks);
+         crate::native::constant_reads::hoist(&self.ir, f, &mut body_blocks);
++        crate::native::guarded_reads::reconverge(&self.ir, f, &mut body_blocks);
+         body_blocks = crate::native::tir::prune_unused_geps(body_blocks);
+         let buffer_params = f
+             .params
+diff --git a/src/native/guarded_reads/tests.rs b/src/native/guarded_reads/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/src/native/guarded_reads/tests.rs
+@@ -0,0 +1,184 @@
++use super::*;
++use crate::native::ir::LlType;
++
++fn sample(value: &str) -> String {
++    format!("%sample = call float @air.sample_texture_2d.f32(ptr addrspace(1) %image, ptr addrspace(2) %sampler, float {value})")
++}
++
++fn source(prefix: &str, load: &str) -> String {
++    format!("define float @main(ptr addrspace(2) %buffer, ptr addrspace(1) %output, ptr addrspace(1) %image, ptr addrspace(2) %sampler, i1 %condition, i64 %index) {{\nentry:\n br i1 %condition, label %arm, label %exit\narm:\n {prefix}\n %p = getelementptr i8, ptr addrspace(2) %buffer, i64 8\n %value = load {load}, ptr addrspace(2) %p, align 4\n {}\n br label %exit\nexit:\n %result = phi float [ %sample, %arm ], [ 0.0, %entry ]\n ret float %result\n}}\n", sample("%value"))
++}
++
++fn rewritten(source: &str) -> Vec<BodyBlock> {
++    let parsed = LlModule::parse_with_stage_meta(source, None, Some("main")).unwrap();
++    let function = &parsed.functions[0];
++    let mut blocks = function.blocks.clone();
++    reconverge(&parsed, function, &mut blocks);
++    blocks
++}
++
++fn named<'a>(blocks: &'a [BodyBlock], name: &str) -> &'a TirBlock {
++    blocks
++        .iter()
++        .find(|b| b.name == name)
++        .unwrap()
++        .typed
++        .as_ref()
++        .unwrap()
++}
++
++#[test]
++fn guarded_read_retains_true_predicate_and_reconverges_before_original_selection() {
++    let source = source("", "float");
++    let blocks = rewritten(&source);
++    assert_eq!(blocks.len(), 5);
++    let entry = &blocks[0];
++    assert!(!entry
++        .typed
++        .as_ref()
++        .unwrap()
++        .insts
++        .iter()
++        .any(|i| i.load().is_some()));
++    let TirTerminator::BrCond { cond, t, f } = &entry.typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    assert_eq!(cond, "%condition");
++    let guard = named(&blocks, t);
++    assert_eq!(guard.insts.iter().filter(|i| i.load().is_some()).count(), 1);
++    let merge = named(&blocks, f);
++    assert_eq!(guard.terminator, TirTerminator::Br(f.clone()));
++    assert_eq!(
++        merge.terminator,
++        TirTerminator::BrCond {
++            cond: cond.clone(),
++            t: "%arm".into(),
++            f: "%exit".into()
++        }
++    );
++    let phi = merge
++        .insts
++        .iter()
++        .find(|i| i.result.as_deref() == Some("%value"))
++        .unwrap();
++    let Some((ty, incoming)) = phi.phi_incoming() else {
++        panic!()
++    };
++    assert_eq!(*ty, LlType::Float);
++    assert_eq!(incoming[1], (LlValue::Zero, entry.name.clone()));
++    assert!(!named(&blocks, "%arm")
++        .insts
++        .iter()
++        .any(|i| i.load().is_some()));
++    assert!(named(&blocks, "%arm")
++        .insts
++        .iter()
++        .any(|i| i.call().is_some()));
++    assert!(named(&blocks, "%exit").insts[0]
++        .phi_incoming()
++        .as_ref()
++        .unwrap()
++        .1
++        .iter()
++        .any(|(_, pred)| pred == f));
++    let parsed = LlModule::parse_with_stage_meta(&source, None, Some("main")).unwrap();
++    let mut repeated = blocks.clone();
++    reconverge(&parsed, &parsed.functions[0], &mut repeated);
++    assert_eq!(
++        repeated.iter().map(BodyBlock::lines).collect::<Vec<_>>(),
++        blocks.iter().map(BodyBlock::lines).collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn side_effects_ordered_reads_and_dynamic_addresses_remain_in_the_source_arm() {
++    for (prefix, load) in [
++        ("store i32 7, ptr addrspace(1) %output", "float"),
++        ("call void @side_effect()", "float"),
++        ("fence seq_cst", "float"),
++        ("", "volatile float"),
++        ("", "atomic float"),
++    ] {
++        let blocks = rewritten(&source(prefix, load));
++        assert_eq!(blocks.len(), 3, "{prefix} {load}");
++        assert!(named(&blocks, "%arm")
++            .insts
++            .iter()
++            .any(|i| i.opcode == TirOpcode::Load));
++    }
++    let blocks = rewritten(&source("", "float").replace("i64 8", "i64 %index"));
++    assert_eq!(blocks.len(), 3);
++}
++
++#[test]
++fn unrelated_numeric_loads_do_not_create_a_coordinate_phase() {
++    let source = source("", "float").replace(&sample("%value"), &sample("0.25"));
++    assert_eq!(rewritten(&source).len(), 3);
++}
++
++#[test]
++fn duplicate_predecessors_cannot_be_replaced_by_a_single_branch_guard() {
++    let source = source("", "float")
++        .replace("label %arm, label %exit", "label %arm, label %other")
++        .replace("arm:\n", "other:\n br label %arm\narm:\n");
++    assert_eq!(rewritten(&source).len(), 4);
++}
++
++#[test]
++fn generated_names_never_capture_existing_parameter_names() {
++    let source = source("", "float").replace("%index", "%metal2vulkan.guarded.read.0");
++    let blocks = rewritten(&source);
++    assert!(!blocks
++        .iter()
++        .any(|b| b.name == "%metal2vulkan.guarded.read.0"));
++}
++
++#[test]
++fn false_and_two_sided_guards_preserve_selected_values() {
++    let false_arm =
++        source("", "float").replace("label %arm, label %exit", "label %exit, label %arm");
++    let blocks = rewritten(&false_arm);
++    let TirTerminator::BrCond { t, f, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    assert_eq!(
++        named(&blocks, f)
++            .insts
++            .iter()
++            .filter(|i| i.load().is_some())
++            .count(),
++        1
++    );
++    assert_eq!(named(&blocks, f).terminator, TirTerminator::Br(t.clone()));
++    let mut both =
++        source("", "float").replace("label %arm, label %exit", "label %arm, label %other");
++    both = both.replace("exit:\n", &format!("other:\n %other_p = getelementptr i8, ptr addrspace(2) %buffer, i64 12\n %other_value = load float, ptr addrspace(2) %other_p, align 4\n {}\n br label %exit\nexit:\n", sample("%other_value").replace("%sample", "%other_sample")))
++        .replace("[ 0.0, %entry ]", "[ %other_sample, %other ]");
++    let blocks = rewritten(&both);
++    assert_eq!(blocks.len(), 7);
++    let TirTerminator::BrCond { t, f, .. } = &blocks[0].typed.as_ref().unwrap().terminator else {
++        panic!()
++    };
++    for guard in [t, f] {
++        assert_eq!(
++            named(&blocks, guard)
++                .insts
++                .iter()
++                .filter(|i| i.load().is_some())
++                .count(),
++            1
++        );
++    }
++    let TirTerminator::Br(merge) = &named(&blocks, t).terminator else {
++        panic!()
++    };
++    assert_eq!(named(&blocks, merge).insts.len(), 2);
++    for phi in &named(&blocks, merge).insts {
++        let (_, incoming) = phi.phi_incoming().as_ref().unwrap();
++        assert!(incoming.iter().any(|(v, _)| v == &LlValue::Zero));
++        assert_eq!(
++            incoming.iter().map(|(_, p)| p).collect::<HashSet<_>>(),
++            HashSet::from([t, f])
++        );
++    }
++}
+diff --git a/src/native/guarded_reads.rs b/src/native/guarded_reads.rs
+new file mode 100644
+--- /dev/null
++++ b/src/native/guarded_reads.rs
+@@ -0,0 +1,287 @@
++//! Reconverge guarded coordinate reads without speculating their memory accesses.
++//!
++//! Reads keep their source condition, then supply zero on inactive paths at a new merge before
++//! the original selection. Derivatives can use the dominating value after reconvergence while
++//! descriptor selection, sampling and side effects keep their original execution sites.
++
++use super::cfg::{BlockRole, BodyBlock};
++use super::ir::{LlFunction, LlModule, LlValue};
++use super::tir::{TirBlock, TirInst, TirOpcode, TirTerminator};
++use std::collections::{HashMap, HashSet};
++use std::sync::Arc;
++
++#[cfg(test)]
++mod tests;
++
++struct Arm {
++    block: usize,
++    reads: Vec<TirInst>,
++    dependencies: Vec<TirInst>,
++}
++
++pub(super) fn reconverge(parsed: &LlModule, function: &LlFunction, blocks: &mut Vec<BodyBlock>) {
++    if !parsed.entry_functions.contains(&function.name) {
++        return;
++    }
++    let positions = blocks
++        .iter()
++        .enumerate()
++        .map(|(i, b)| (b.name.clone(), i))
++        .collect::<HashMap<_, _>>();
++    let definitions = blocks
++        .iter()
++        .filter_map(|b| b.typed.as_ref())
++        .flat_map(|b| &b.insts)
++        .filter_map(|i| Some((i.result.as_deref()?, i)))
++        .collect::<HashMap<_, _>>();
++    let mut predecessors = HashMap::<&str, Vec<usize>>::new();
++    for (index, block) in blocks.iter().enumerate() {
++        if let Some(typed) = &block.typed {
++            for successor in typed.terminator.successors() {
++                predecessors.entry(successor).or_default().push(index);
++            }
++        }
++    }
++    let plans = blocks
++        .iter()
++        .enumerate()
++        .filter_map(|(header, block)| {
++            let TirTerminator::BrCond { t, f, .. } = &block.typed.as_ref()?.terminator else {
++                return None;
++            };
++            if t == f {
++                return None;
++            }
++            let arms = [t, f].map(|name| {
++                let index = *positions.get(name)?;
++                if index == header || predecessors.get(name.as_str())?.as_slice() != [header] {
++                    return None;
++                }
++                plan_arm(
++                    parsed,
++                    function,
++                    index,
++                    blocks[index].typed.as_ref()?,
++                    &definitions,
++                )
++            });
++            arms.iter().any(Option::is_some).then_some((header, arms))
++        })
++        .collect::<Vec<_>>();
++    if plans.is_empty() {
++        return;
++    }
++    let mut names = positions
++        .keys()
++        .cloned()
++        .chain(definitions.keys().map(|s| s.to_string()))
++        .chain(function.params.iter().map(|(name, _)| name.clone()))
++        .collect::<HashSet<_>>();
++    let mut serial = 0usize;
++    let mut additions = Vec::new();
++    for (header, arms) in plans {
++        let merge_name = fresh(&mut names, &mut serial);
++        let guard_names = arms
++            .each_ref()
++            .map(|arm| arm.as_ref().map(|_| fresh(&mut names, &mut serial)));
++        let original_header = blocks[header].name.clone();
++        let typed = blocks[header].typed.as_ref().expect("planned typed header");
++        let mut merge = typed.terminator_only_block(&merge_name);
++        let successors = typed
++            .terminator
++            .successors()
++            .iter()
++            .map(|s| s.to_string())
++            .collect::<Vec<_>>();
++        for successor in &successors {
++            if let Some(&index) = positions.get(successor) {
++                blocks[index]
++                    .typed_mut()
++                    .expect("planned typed arm")
++                    .rewrite_phi_predecessor(&original_header, &merge_name);
++            }
++        }
++        for (side, arm) in arms.into_iter().enumerate() {
++            let target = guard_names[side].as_deref().unwrap_or(&merge_name);
++            blocks[header]
++                .typed_mut()
++                .expect("planned typed header")
++                .redirect_successor(&successors[side], target);
++            let Some(arm) = arm else {
++                continue;
++            };
++            let name = guard_names[side].as_ref().expect("active arm label");
++            let inactive = guard_names[1 - side].as_ref().unwrap_or(&original_header);
++            let mut guard = merge.terminator_only_block(name);
++            guard.set_unconditional_branch(&merge_name);
++            let remap = arm
++                .dependencies
++                .iter()
++                .filter_map(|i| i.result.as_ref())
++                .map(|value| (value.clone(), fresh(&mut names, &mut serial)))
++                .collect::<HashMap<_, _>>();
++            guard.insts = arm.dependencies;
++            guard.rename(&remap);
++            for read in &arm.reads {
++                let value = read.result.as_ref().expect("planned read result");
++                let ty = &read.load().as_ref().expect("planned read").result_ty;
++                merge.push_value_phi(
++                    value,
++                    ty,
++                    &[
++                        (LlValue::Local(remap[value].clone()), name.clone()),
++                        (LlValue::Zero, inactive.clone()),
++                    ],
++                );
++            }
++            let removed = arm
++                .reads
++                .iter()
++                .filter_map(|i| i.result.as_ref())
++                .collect::<HashSet<_>>();
++            blocks[arm.block]
++                .typed_mut()
++                .expect("planned source arm")
++                .insts
++                .retain(|i| i.result.as_ref().is_none_or(|name| !removed.contains(name)));
++            additions.push(body(guard));
++        }
++        additions.push(body(merge));
++    }
++    blocks.extend(additions);
++}
++
++fn fresh(names: &mut HashSet<String>, serial: &mut usize) -> String {
++    loop {
++        let name = format!("%metal2vulkan.guarded.read.{serial}");
++        *serial += 1;
++        if names.insert(name.clone()) {
++            return name;
++        }
++    }
++}
++
++fn body(block: TirBlock) -> BodyBlock {
++    BodyBlock {
++        name: block.label.clone(),
++        role: BlockRole::Normal,
++        typed: Some(Arc::new(block)),
++    }
++}
++
++fn plan_arm(
++    parsed: &LlModule,
++    function: &LlFunction,
++    index: usize,
++    block: &TirBlock,
++    definitions: &HashMap<&str, &TirInst>,
++) -> Option<Arm> {
++    let local = block
++        .insts
++        .iter()
++        .filter_map(|i| i.result.as_deref())
++        .collect::<HashSet<_>>();
++    let mut needed = HashSet::new();
++    let mut pending = block
++        .insts
++        .iter()
++        .filter_map(|i| i.call().as_ref())
++        .filter(|call| {
++            [
++                "air.sample_texture",
++                "air.sample_depth",
++                "air.sample_compare_depth",
++            ]
++            .iter()
++            .any(|prefix| call.callee.starts_with(prefix))
++        })
++        .filter_map(|call| {
++            match &call
++                .args
++                .get(if call.callee.starts_with("air.sample_texture") {
++                    2
++                } else {
++                    3
++                })?
++                .value
++            {
++                LlValue::Local(name) => Some(name.clone()),
++                _ => None,
++            }
++        })
++        .collect::<Vec<_>>();
++    while let Some(name) = pending.pop() {
++        if !needed.insert(name.clone()) {
++            continue;
++        }
++        if let Some(instruction) = definitions
++            .get(name.as_str())
++            .filter(|_| local.contains(name.as_str()))
++        {
++            instruction.visit_uses(|value| pending.push(value.to_string()));
++        }
++    }
++    let mut reads = Vec::new();
++    let mut dependencies = Vec::new();
++    let mut copied = HashSet::new();
++    for instruction in &block.insts {
++        if !readable_prefix(instruction) {
++            break;
++        }
++        if !instruction
++            .result
++            .as_ref()
++            .is_some_and(|name| needed.contains(name))
++        {
++            continue;
++        }
++        let Some((path, _)) =
++            super::constant_reads::entry_read_path(parsed, function, definitions, instruction)
++        else {
++            continue;
++        };
++        for dependency in path {
++            if copied.insert(dependency.result.clone()?) {
++                dependencies.push(dependency.clone());
++            }
++        }
++        reads.push(instruction.clone());
++    }
++    (!reads.is_empty()).then_some(Arm {
++        block: index,
++        reads,
++        dependencies,
++    })
++}
++
++fn readable_prefix(instruction: &TirInst) -> bool {
++    if let Some(load) = instruction.load().as_ref() {
++        return !load.ordered;
++    }
++    matches!(
++        instruction.opcode,
++        TirOpcode::GetElementPtr
++            | TirOpcode::Bitcast
++            | TirOpcode::Metal2VulkanInlineParameter
++            | TirOpcode::ExtractElement
++            | TirOpcode::InsertElement
++            | TirOpcode::ShuffleVector
++            | TirOpcode::ExtractValue
++            | TirOpcode::InsertValue
++            | TirOpcode::FAdd
++            | TirOpcode::FSub
++            | TirOpcode::FMul
++            | TirOpcode::FDiv
++            | TirOpcode::FNeg
++            | TirOpcode::Add
++            | TirOpcode::Sub
++            | TirOpcode::Mul
++            | TirOpcode::And
++            | TirOpcode::Or
++            | TirOpcode::Xor
++            | TirOpcode::ZExt
++            | TirOpcode::SExt
++            | TirOpcode::Trunc
++            | TirOpcode::Select
++    )
++}
+diff --git a/src/native/mod.rs b/src/native/mod.rs
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -12,6 +12,7 @@
+ mod cfg_testkit;
+ mod constant_reads;
+ mod constfold;
++mod guarded_reads;
+ // Read-only typed-SSA soundness / carrier-comparison / reject-census diagnostics (no emission path).
+ mod diagnostics;
+ mod dynamic_memcpy;
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -664,3 +664,14 @@
+ linked helper expansion. Conflicting local/workgroup allocations and pointers with
+ no single descriptor root retain their typed call boundary. No new reflection or
+ source-proof fields are needed, but translation/cache identities must change.
++
++A branch-local numeric entry-buffer read without an unconditional accessible span
++can be evaluated under its original branch condition, then reconverged before the
++sampling selection. The native typed transform builds guarded address/read blocks
++and phi values with zero on inactive paths; the original descriptor operations,
++samples and side effects keep their source sites. This is conditional evaluation,
++not storage-load speculation. It requires single-predecessor source arms, static
++entry-rooted address paths and a prefix free of writes, calls, barriers and ordered
++reads. The CFG/derivative pass still proves uniformity and matching loop instances.
++Unsupported shapes remain visible refusals. Direct, linked and cached paths share
++the resulting dominating values without additional source-proof metadata.

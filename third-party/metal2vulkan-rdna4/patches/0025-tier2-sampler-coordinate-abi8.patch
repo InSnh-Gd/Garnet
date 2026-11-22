@@ -1,0 +1,1631 @@
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -73,7 +73,7 @@
+ ```
+ 
+ `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+-current `REFLECTION_VERSION` is `63`. Serialized Rust enums use serde's externally tagged default:
++current `REFLECTION_VERSION` is `64`. Serialized Rust enums use serde's externally tagged default:
+ unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+ `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+ 
+@@ -82,16 +82,47 @@
+ cache envelope—before deserializing the strongly typed current structure, because a newly required
+ field can make old JSON fail deserialization.
+ 
++`normalized_sampler_coordinates` records whether translation selected the ABI 8 coordinate
++contract. It is `true` only for an opt-in ABI 8 translation, and is `false` for the legacy Rust
++entry points. ABI 8 argument table version 8 requires both this flag and
++`trimmed_from_reflection_version: 64`; table version 7 requires the flag to be absent or false.
++Consumers must reject a non-boolean value, as well as `true` paired with any other trimmed version.
++
+ ## Descriptor ABI (binding map)
+ 
+ Nested texture/sampler graphs that cannot use a fixed root/field coordinate carry
+-`argument_resource_tables: {version: 7, table_binding: 672, categories: [...],
++`argument_resource_tables: {version: 7|8, table_binding: 672, categories: [...],
+ comparison_sampler: <bool>}`. They require the default descriptor layout. Binding 672 in set 0 is
+ the read-only token table; categories 0, 1, 2 denote runtime sampled-image, storage-image and
+ sampler arrays at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+ `(word_offset, count)`. ABI 6 stores the finite, nonnegative device maxSamplerLodBias as float32
+ bits in word 6. ABI 7 preserves header words 0 through 6 unchanged and begins the sorted low/high
+ token pairs at word 7.
++
++ABI 8 also preserves header words 0 through 6 and the token-pair order. It requires
++`normalized_sampler_coordinates: true` and `trimmed_from_reflection_version: 64`. After all three
++token lists, the consumer appends `N`
++u32 sampler-coordinate flags where `N = word[5]` (the sampler count including descriptor zero).
++Their base is `word[4] + 2*N`; bit zero is one for Metal pixel coordinates and zero for
++normalized coordinates. Ordinary and comparison uses share one flag word. Set 4 still reserves
++`N` ordinary samplers followed by `N` comparison samplers, so comparison descriptor indices add
++`N` even in a compare-only shader.
++
++Direct and static runtime samplers do not use the token tail. ABI 8 may add one read-only storage
++buffer binding row:
++
++```json
++{"kind":"SamplerCoordinateFlags","metal_index":0,
++ "descriptor":{"set":0,"binding":674,"count":1},
++ "declared_size":128,"extent":{"Object":{"bytes":128}},"access":"ReadOnly"}
++```
++
++The descriptor is stage-local: render stages use their own reflected descriptor set. Its 32 flag
++words correspond to the ordinary sampler band and dummy slots; bit zero has the same meaning as
++the GPU-table flags. The row has no comparison descriptor. A consumer selects the normalized
++sampler representation only when `normalized_sampler_coordinates` is true, reflection is 64, and
++this exact row is present. Legacy translations report the flag as false and keep source-coordinate
++sampler lowering.
+ 
+ `comparison_sampler` is a required JSON boolean for table ABI 7 and is forbidden in table versions
+ 1 through 6. It is true only when category 2 is present and the shader uses a comparison sampler
+@@ -121,12 +152,17 @@
+ Graphs using image dimension queries also carry `image_query_binding: 673`.
+ Bindings 672 and 673 alias the same read-only buffer. After the final token list, the
+ consumer appends eight u32 words for every sampled-list entry (including index 0):
+-width, height, depth, Metal array length, mip-level count, sample count, and two zero
+-reserved words. The null row is all zero. Queries look up the actual token in the
++width, height, depth, Metal array length, mip-level count, sample count, image shape, and image
++flags. The null row is all zero. For table ABI 7 the rows begin at `word[4] + 2*N` and words 6/7
++remain zero. For ABI 8 the sampler-coordinate flag tail precedes the rows, so they begin at
++`word[4] + 3*N`; word 6 is
++`2*Dim + Arrayed + 8*Depth + 16*Component` (component 0/1/2 is float/uint/sint) and word 7 bit
++zero marks multisampled images. Queries look up the actual token in the
+ sampled list and apply the requested mip level to its base dimensions. These rows
+-describe the texture view. They do not require guessing the image component or
+-access type. `categories` can be empty when the shader only queries dimensions;
+-no image descriptor array or descriptor-indexing capability is needed in that case.
++describe the texture view. A query replay may use the shape and flag words to reject incompatible
++views rather than issuing an instruction with the wrong image type. `categories` can be empty when
++the shader only queries dimensions; no image descriptor array or descriptor-indexing capability is
++needed in that case.
+ 
+ By default, every descriptor-backed Metal-facing resource uses **descriptor set 0**
+ (`RESOURCE_DESCRIPTOR_SET`). Most default bindings are a fixed base plus Metal resource index `n`:
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -342,6 +342,7 @@
+             options.kernel_local_size,
+         ),
+     };
++    reflection.normalized_sampler_coordinates = options.normalized_sampler_coordinates;
+     if matches!(stage, passes::Stage::Kernel) {
+         reflection.kernel_dispatch = Some(
+             options
+@@ -914,11 +915,15 @@
+     // The emitter decides whether the constructed pointer graph needs an address table; reflection
+     // no longer predicts that from the AIR text when a module is in hand to be read.
+     reflection.reconcile_buffer_address_table(&finished.module);
+-    reflection.reconcile_argument_resource_tables(&finished.module);
++    reflection.reconcile_argument_resource_tables(
++        &finished.module,
++        options.normalized_sampler_coordinates,
++    );
+     // Token-backed samplers occupy set 4, leaving their former stage-local slots for constexprs.
+     reflection.add_static_samplers(san_ll)?;
+     reflection.reconcile_sampler_operation_usage(&finished.module);
+     reflection.retract_unbound_embedded_resources(&finished.module);
++    reflection.reconcile_sampler_coordinate_flags(&finished.module);
+     // Nothing in the AIR metadata describes a descriptor the passes invented to type an AIR value,
+     // so only the module and the pass that made it can say a consumer has to bind one.
+     reflection.report_synthesized_placeholders(
+--- a/src/passes/air_calls/images/gather.rs
++++ b/src/passes/air_calls/images/gather.rs
+@@ -166,7 +166,12 @@
+     }
+ 
+     let sampler_state = ctx.sampler_states.get(&samp).copied();
+-    if sampler_state.is_some_and(|state| state.uses_pixel_coordinates()) {
++    let zero_lod = ctx.const_uint(0);
++    let coord =
++        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
++    if sampler_state.is_some_and(|state| state.uses_pixel_coordinates())
++        && !ctx.normalized_sampler_coordinates
++    {
+         return Err(
+             "air.gather_compare_depth with pixel-coordinate samplers is not supported".into(),
+         );
+@@ -241,11 +246,13 @@
+     let (img_ty, _dim, arrayed, _) =
+         sampled_operand_image_info(ctx, img, dim, arrayed, fallback_comp);
+     let gather_v4 = image_fetch_v4(ctx, img, v4);
+-
+-    if let Some(sampler_state) = ctx
+-        .sampler_states
+-        .get(&samp)
+-        .copied()
++    let zero_lod = ctx.const_uint(0);
++    let coord =
++        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
++
++    if let Some(sampler_state) = (!ctx.normalized_sampler_coordinates)
++        .then(|| ctx.sampler_states.get(&samp).copied())
++        .flatten()
+         .filter(|state| state.uses_pixel_coordinates())
+     {
+         return lower_pixel_gather_2d(
+--- a/src/passes/air_calls/images/mod.rs
++++ b/src/passes/air_calls/images/mod.rs
+@@ -18,6 +18,8 @@
+ pub(in crate::passes) use query_offset::*;
+ mod resolve;
+ pub(in crate::passes) use resolve::*;
++mod sampler_coordinates;
++pub(in crate::passes) use sampler_coordinates::*;
+ 
+ pub(in crate::passes) fn sampled_operand_image_info(
+     ctx: &mut Ctx,
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -96,16 +96,21 @@
+     let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+     let (img_ty, dim, arrayed, comp) =
+         sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
++    // ABI 8 keeps the source coordinate domain in the sampler's Metal state and presents every
++    // backend sampler through normalized coordinates. ABI 7 and earlier leave the coordinate
++    // untouched and continue through the pixel-emulation paths below.
++    let zero_lod = ctx.const_uint(0);
++    let coord =
++        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
+     // The sample result vector component type must match the image's sampled type (v4uint/v4int for
+     // integer textures); a float sample with explicit LOD is needed at fragment scope for integer
+     // textures (implicit-LOD sampling of integer images is invalid).
+     let sample_v4 = image_fetch_v4(ctx, img, v4);
+     let is_int_tex = comp != crate::passes::ImageComp::Float;
+ 
+-    if let Some(sampler_state) = ctx
+-        .sampler_states
+-        .get(&samp)
+-        .copied()
++    if let Some(sampler_state) = (!ctx.normalized_sampler_coordinates)
++        .then(|| ctx.sampler_states.get(&samp).copied())
++        .flatten()
+         .filter(|state| state.uses_pixel_coordinates())
+     {
+         // Pixel-coordinate linear float sampling is emulated in-shader (per-tap fetch + lerp) for
+--- a/src/passes/air_calls/images/sample_depth.rs
++++ b/src/passes/air_calls/images/sample_depth.rs
+@@ -36,6 +36,9 @@
+     if comp != crate::passes::ImageComp::Float {
+         return Err("air.sample_depth on non-float texture".into());
+     }
++    let zero_lod = ctx.const_uint(0);
++    let coord =
++        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
+     let mut sample_args = vec![args[0], args[1], coord];
+     if arrayed {
+         sample_args.push(
+@@ -47,10 +50,9 @@
+     } else {
+         sample_args.extend_from_slice(&args[4..]);
+     }
+-    let pixel_state = ctx
+-        .sampler_states
+-        .get(&samp)
+-        .copied()
++    let pixel_state = (!ctx.normalized_sampler_coordinates)
++        .then(|| ctx.sampler_states.get(&samp).copied())
++        .flatten()
+         .filter(|state| state.uses_pixel_coordinates());
+     let color = if let Some(state) = pixel_state {
+         // These emulations fetch one mip level, so the level the call names is the one to fetch.
+@@ -253,6 +255,9 @@
+     if comp != crate::passes::ImageComp::Float {
+         return Err("air.sample_compare_depth on non-float texture".into());
+     }
++    let zero_lod = ctx.const_uint(0);
++    let coord =
++        normalize_sampler_coordinate(ctx, samp, img, dim, arrayed, coord, zero_lod, &mut out)?;
+     // Compare-depth uses the depth-sample ABI, not the ordinary color-sample ABI:
+     // texture, sampler, control, spatial coord, [array layer], reference, flags...
+     let (mut coord_for_sample, reference) = if arrayed {
+@@ -290,7 +295,10 @@
+         args.get(5..).unwrap_or_default()
+     };
+     sample_args.extend_from_slice(trailing);
+-    let pixel_state = sampler_state.filter(|state| state.uses_pixel_coordinates());
++    let pixel_state = (!ctx.normalized_sampler_coordinates)
++        .then_some(sampler_state)
++        .flatten()
++        .filter(|state| state.uses_pixel_coordinates());
+     let sampled = if let Some(state) = pixel_state {
+         let lod = match find_sample_lod(ctx, arrayed, &sample_args, &mut out) {
+             Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+--- /dev/null
++++ b/src/passes/air_calls/images/sampler_coordinates.rs
+@@ -0,0 +1,427 @@
++//! ABI 8 runtime sampler-coordinate selection.
++
++use super::*;
++use std::collections::HashMap;
++
++#[derive(Clone, Copy)]
++struct DescriptorVariable {
++    set: u32,
++    binding: u32,
++}
++
++fn descriptor_variables(
++    ctx: &Ctx,
++    defs: &HashMap<Word, Instruction>,
++) -> HashMap<Word, DescriptorVariable> {
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for annotation in &ctx.module.annotations {
++        match annotation.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++            {
++                sets.insert(*id, *set);
++            }
++            [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(binding)] =>
++            {
++                bindings.insert(*id, *binding);
++            }
++            _ => {}
++        }
++    }
++    defs.iter()
++        .filter_map(|(id, instruction)| {
++            if instruction.class.opcode != Op::Variable {
++                return None;
++            }
++            Some((
++                *id,
++                DescriptorVariable {
++                    set: *sets.get(id)?,
++                    binding: *bindings.get(id)?,
++                },
++            ))
++        })
++        .collect()
++}
++
++fn definitions(ctx: &Ctx) -> HashMap<Word, Instruction> {
++    ctx.module
++        .all_inst_iter()
++        .chain(ctx.new_globals.iter())
++        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
++        .collect()
++}
++
++fn sampler_load(ctx: &Ctx, samp: Word) -> Option<(Word, Option<Word>)> {
++    let defs = definitions(ctx);
++    let mut value = samp;
++    for _ in 0..32 {
++        let instruction = defs.get(&value)?;
++        match instruction.class.opcode {
++            Op::Load => {
++                let mut pointer = match instruction.operands.first()? {
++                    Operand::IdRef(pointer) => *pointer,
++                    _ => return None,
++                };
++                let mut index = None;
++                for _ in 0..32 {
++                    let instruction = defs.get(&pointer)?;
++                    match instruction.class.opcode {
++                        Op::Variable => return Some((pointer, index)),
++                        Op::AccessChain | Op::InBoundsAccessChain => {
++                            if index.is_none() {
++                                index =
++                                    instruction
++                                        .operands
++                                        .get(1)
++                                        .and_then(|operand| match operand {
++                                            Operand::IdRef(index) => Some(*index),
++                                            _ => None,
++                                        });
++                            }
++                            pointer = match instruction.operands.first()? {
++                                Operand::IdRef(base) => *base,
++                                _ => return None,
++                            };
++                        }
++                        Op::CopyObject | Op::Bitcast => {
++                            pointer = match instruction.operands.first()? {
++                                Operand::IdRef(base) => *base,
++                                _ => return None,
++                            };
++                        }
++                        _ => return None,
++                    }
++                }
++                return None;
++            }
++            Op::CopyObject | Op::Bitcast => {
++                value = match instruction.operands.first()? {
++                    Operand::IdRef(source) => *source,
++                    _ => return None,
++                };
++            }
++            _ => return None,
++        }
++    }
++    None
++}
++
++fn boolean_from_flag_word(ctx: &mut Ctx, word: Word, out: &mut Vec<Instruction>) -> Word {
++    let one = ctx.const_uint(1);
++    let masked = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::BitwiseAnd,
++        Some(ctx.ty_uint()),
++        Some(masked),
++        vec![Operand::IdRef(word), Operand::IdRef(one)],
++    ));
++    let zero = ctx.const_uint(0);
++    let pixel = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::INotEqual,
++        Some(ctx.ty_bool()),
++        Some(pixel),
++        vec![Operand::IdRef(masked), Operand::IdRef(zero)],
++    ));
++    pixel
++}
++
++fn load_word(ctx: &mut Ctx, buffer: Word, index: Word, out: &mut Vec<Instruction>) -> Word {
++    let uint = ctx.ty_uint();
++    let pointer_ty = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    let zero = ctx.const_uint(0);
++    let pointer = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::AccessChain,
++        Some(pointer_ty),
++        Some(pointer),
++        vec![
++            Operand::IdRef(buffer),
++            Operand::IdRef(zero),
++            Operand::IdRef(index),
++        ],
++    ));
++    let word = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::Load,
++        Some(uint),
++        Some(word),
++        vec![Operand::IdRef(pointer)],
++    ));
++    word
++}
++
++impl Ctx {
++    fn sampler_coordinate_flags_var(&mut self) -> Word {
++        if let Some(var) = self.sampler_coordinate_flags_var {
++            return var;
++        }
++        let uint = self.ty_uint();
++        let array = self.ty_runtime_array(uint);
++        let stride = vec![
++            Operand::IdRef(array),
++            Operand::Decoration(spirv::Decoration::ArrayStride),
++            Operand::LiteralBit32(4),
++        ];
++        if !self.module.annotations.iter().any(|instruction| {
++            instruction.class.opcode == Op::Decorate && instruction.operands == stride
++        }) {
++            self.module
++                .annotations
++                .push(Instruction::new(Op::Decorate, None, None, stride));
++        }
++        let structure = self.module.fresh_id();
++        self.new_globals.push(Instruction::new(
++            Op::TypeStruct,
++            None,
++            Some(structure),
++            vec![Operand::IdRef(array)],
++        ));
++        self.module.annotations.push(Instruction::new(
++            Op::Decorate,
++            None,
++            None,
++            vec![
++                Operand::IdRef(structure),
++                Operand::Decoration(Decoration::Block),
++            ],
++        ));
++        self.module.annotations.push(Instruction::new(
++            Op::MemberDecorate,
++            None,
++            None,
++            vec![
++                Operand::IdRef(structure),
++                Operand::LiteralBit32(0),
++                Operand::Decoration(Decoration::Offset),
++                Operand::LiteralBit32(0),
++            ],
++        ));
++        let pointer = self.ty_ptr(StorageClass::StorageBuffer, structure);
++        let var = self.module.fresh_id();
++        self.new_globals.push(Instruction::new(
++            Op::Variable,
++            Some(pointer),
++            Some(var),
++            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++        ));
++        decorate_binding(
++            &mut self.module,
++            var,
++            self.descriptor_layout.set,
++            crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING,
++        );
++        self.module.annotations.push(Instruction::new(
++            Op::Decorate,
++            None,
++            None,
++            vec![
++                Operand::IdRef(var),
++                Operand::Decoration(Decoration::NonWritable),
++            ],
++        ));
++        self.interface_buffer_var(var);
++        self.sampler_coordinate_flags_var = Some(var);
++        var
++    }
++}
++
++fn runtime_word_flag(ctx: &mut Ctx, index: Word, out: &mut Vec<Instruction>) -> Word {
++    let buffer = ctx.sampler_coordinate_flags_var();
++    let word = load_word(ctx, buffer, index, out);
++    boolean_from_flag_word(ctx, word, out)
++}
++
++fn gpu_table_flag(
++    ctx: &mut Ctx,
++    table: Word,
++    token_index: Word,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    let word = crate::passes::resources::table_sampler_flag_word(ctx, out, table, token_index);
++    Ok(boolean_from_flag_word(ctx, word, out))
++}
++
++fn sampler_coordinate_source(
++    ctx: &mut Ctx,
++    samp: Word,
++    out: &mut Vec<Instruction>,
++) -> Result<SamplerCoordinateSource, String> {
++    if let Some(source) = ctx.sampler_coordinate_sources.get(&samp).copied() {
++        return Ok(source);
++    }
++    if let Some(state) = ctx.sampler_states.get(&samp).copied() {
++        return Ok(if state.uses_pixel_coordinates() {
++            SamplerCoordinateSource::Pixel
++        } else {
++            SamplerCoordinateSource::Normalized
++        });
++    }
++    let defs = definitions(ctx);
++    let variables = descriptor_variables(ctx, &defs);
++    if let Some((variable, token_index)) = sampler_load(ctx, samp) {
++        if let Some(descriptor) = variables.get(&variable) {
++            if descriptor.set == 4 && descriptor.binding == 0 {
++                let table = variables
++                    .iter()
++                    .find_map(|(id, candidate)| {
++                        (candidate.set == 0 && candidate.binding == ARGUMENT_RESOURCE_TABLE_BINDING)
++                            .then_some(*id)
++                    })
++                    .ok_or("GPU sampler has no argument resource table")?;
++                let token_index = token_index.ok_or("GPU sampler array load has no token index")?;
++                return Ok(SamplerCoordinateSource::RuntimeFlag(gpu_table_flag(
++                    ctx,
++                    table,
++                    token_index,
++                    out,
++                )?));
++            }
++            let ordinary =
++                if crate::reflect::COMPARISON_SAMPLER_BINDING_RANGE.contains(descriptor.binding) {
++                    descriptor
++                        .binding
++                        .checked_sub(crate::reflect::COMPARISON_SAMPLER_BINDING_OFFSET)
++                } else {
++                    Some(descriptor.binding)
++                };
++            if let Some(word) = ordinary
++                .filter(|binding| crate::reflect::SAMPLER_BINDING_RANGE.contains(*binding))
++                .map(|binding| binding - crate::reflect::SAMPLER_BINDING_BASE)
++            {
++                return Ok(SamplerCoordinateSource::RuntimeWord(word));
++            }
++        }
++    }
++    Err("normalized sampler sampling has no recoverable coordinate source".into())
++}
++
++fn coordinate_type(ctx: &Ctx, coord: Word, out: &[Instruction]) -> Result<Word, String> {
++    out.iter()
++        .rev()
++        .find(|instruction| instruction.result_id == Some(coord))
++        .and_then(|instruction| instruction.result_type)
++        .or_else(|| value_result_type(ctx, coord))
++        .ok_or_else(|| "sampler coordinate has no type".to_string())
++}
++
++fn pixel_to_normalized(
++    ctx: &mut Ctx,
++    img: Word,
++    dim: Dim,
++    arrayed: bool,
++    coord: Word,
++    lod: Word,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    let (spatial, coord_lanes) = match dim {
++        Dim::Dim1D => (1usize, 1u32),
++        Dim::Dim2D => (2, 2),
++        Dim::Dim3D => (3, 3),
++        Dim::DimCube => (2, 3),
++        _ => {
++            return Err(format!(
++                "pixel coordinates are unsupported for image dimension {dim:?}"
++            ))
++        }
++    };
++    let coord_ty = coordinate_type(ctx, coord, out)?;
++    let size = query_image_size(ctx, img, spatial, arrayed, lod, out);
++    let float_ty = ctx.ty_float();
++    let mut components = sample_coord_components(ctx, coord, coord_lanes, out)?;
++    for (axis, component) in components.iter_mut().take(spatial).enumerate() {
++        let Operand::IdRef(component_id) = *component else {
++            return Err("pixel sampler coordinate component is not an id".into());
++        };
++        let extent = image_size_component(ctx, size, axis, spatial, arrayed, out)?;
++        let extent_f = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ConvertUToF,
++            Some(float_ty),
++            Some(extent_f),
++            vec![Operand::IdRef(extent)],
++        ));
++        let normalized = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::FDiv,
++            Some(float_ty),
++            Some(normalized),
++            vec![Operand::IdRef(component_id), Operand::IdRef(extent_f)],
++        ));
++        *component = Operand::IdRef(normalized);
++    }
++    if coord_lanes == 1 {
++        if coord_ty != float_ty {
++            return Err("scalar pixel sampler coordinate is not float".into());
++        }
++        let Operand::IdRef(component) = components[0] else {
++            unreachable!();
++        };
++        return Ok(component);
++    }
++    let normalized = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::CompositeConstruct,
++        Some(coord_ty),
++        Some(normalized),
++        components,
++    ));
++    Ok(normalized)
++}
++
++pub(in crate::passes) fn normalize_sampler_coordinate(
++    ctx: &mut Ctx,
++    samp: Word,
++    img: Word,
++    dim: Dim,
++    arrayed: bool,
++    coord: Word,
++    lod: Word,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    if !ctx.normalized_sampler_coordinates {
++        return Ok(coord);
++    }
++    let source = sampler_coordinate_source(ctx, samp, out)?;
++    match source {
++        SamplerCoordinateSource::Normalized => Ok(coord),
++        SamplerCoordinateSource::Pixel => {
++            pixel_to_normalized(ctx, img, dim, arrayed, coord, lod, out)
++        }
++        SamplerCoordinateSource::RuntimeWord(word) => {
++            let word = ctx.const_uint(word);
++            let pixel = runtime_word_flag(ctx, word, out);
++            let normalized = pixel_to_normalized(ctx, img, dim, arrayed, coord, lod, out)?;
++            let selected = ctx.module.fresh_id();
++            let ty = coordinate_type(ctx, coord, out)?;
++            out.push(Instruction::new(
++                Op::Select,
++                Some(ty),
++                Some(selected),
++                vec![
++                    Operand::IdRef(pixel),
++                    Operand::IdRef(normalized),
++                    Operand::IdRef(coord),
++                ],
++            ));
++            Ok(selected)
++        }
++        SamplerCoordinateSource::RuntimeFlag(pixel) => {
++            let normalized = pixel_to_normalized(ctx, img, dim, arrayed, coord, lod, out)?;
++            let selected = ctx.module.fresh_id();
++            let ty = coordinate_type(ctx, coord, out)?;
++            out.push(Instruction::new(
++                Op::Select,
++                Some(ty),
++                Some(selected),
++                vec![
++                    Operand::IdRef(pixel),
++                    Operand::IdRef(normalized),
++                    Operand::IdRef(coord),
++                ],
++            ));
++            Ok(selected)
++        }
++    }
++}
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -59,6 +59,14 @@
+     /// sampler state, but pixel-coordinate samplers require operation-aware shader specialization
+     /// to remain legal in Vulkan. Unspecified slots retain ordinary runtime sampling.
+     pub runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
++    /// Select the ABI 8 normalized sampler-coordinate contract.
++    ///
++    /// Dynamic direct samplers read one runtime flag word from the translator-owned SSBO at
++    /// [`crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING`]. Static pixel-coordinate samplers are
++    /// converted to normalized coordinates at compile time. GPU argument tables advance to ABI 8.
++    /// The default keeps the legacy unnormalized-coordinate lowering so existing library users
++    /// preserve their prior SPIR-V.
++    pub normalized_sampler_coordinates: bool,
+     /// Runtime surface format and host features by top-level Metal `[[texture(n)]]` index or
+     /// reflected synthetic embedded-texture index. Only storage-image bindings consume these
+     /// entries; sampled textures retain their AIR-derived image type.
+@@ -95,6 +103,7 @@
+             raster_sample_count: None,
+             vertex_amplification_count: 1,
+             runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
++            normalized_sampler_coordinates: false,
+             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
+             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+         }
+@@ -102,6 +111,12 @@
+ }
+ 
+ impl TransformOptions {
++    /// Select the ABI 8 normalized sampler-coordinate contract described on the field.
++    pub fn with_normalized_sampler_coordinates(mut self) -> Self {
++        self.normalized_sampler_coordinates = true;
++        self
++    }
++
+     /// Select the complete kernel dispatch/grid contract. Push-constant offsets are validated before
+     /// translation mutates the module.
+     pub fn with_kernel_dispatch(
+@@ -244,6 +259,39 @@
+     Float,
+     Uint,
+     Sint,
++}
++
++/// Coordinate domain attached to one sampler SSA value.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::passes) enum SamplerCoordinateSource {
++    Normalized,
++    Pixel,
++    /// Load word `n` from the stage-local ABI 8 flag SSBO.
++    RuntimeWord(u32),
++    /// A precomputed boolean where true selects pixel coordinates.
++    RuntimeFlag(Word),
++}
++
++/// Image type facts attached to a runtime descriptor selected from a GPU argument table.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::passes) struct SampledDescriptorShape {
++    pub dim: Dim,
++    pub arrayed: bool,
++    pub depth: bool,
++    pub comp: ImageComp,
++    pub storage: bool,
++    pub multisampled: bool,
++}
++
++/// The table coordinate and image type attached to a loaded image or sampler value.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::passes) struct SampledDescriptorAccess {
++    pub category: u32,
++    /// Index in the category's ordinary token list.
++    pub token_index: Word,
++    /// Index used to load the descriptor; comparison samplers add the token count.
++    pub physical_index: Word,
++    pub shape: Option<SampledDescriptorShape>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -419,6 +467,8 @@
+     /// [`TransformOptions::vertex_amplification_count`]).
+     vertex_amplification_count: u32,
+     runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
++    /// Select the ABI 8 normalized-coordinate backend.
++    normalized_sampler_coordinates: bool,
+     runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
+     /// Byte length the pipeline allocates per `[[threadgroup(n)]]` buffer, sizing its `Workgroup`
+     /// array (see [`TransformOptions::threadgroup_memory_lengths`]).
+@@ -467,6 +517,12 @@
+     placeholder_descriptor_vars: HashMap<Word, u32>,
+     /// Loaded sampler value ids with an exact static or pipeline-provided state.
+     sampler_states: HashMap<Word, StaticSamplerState>,
++    /// Sampler values whose coordinate domain is known independently of the complete sampler state.
++    sampler_coordinate_sources: HashMap<Word, SamplerCoordinateSource>,
++    /// Loaded image/sampler values whose descriptor was selected from a GPU argument table.
++    sampled_descriptor_accesses: HashMap<Word, SampledDescriptorAccess>,
++    /// Lazily-created ABI 8 stage-local sampler coordinate-flag SSBO.
++    sampler_coordinate_flags_var: Option<Word>,
+     /// Direct loads of runtime sampler bindings that were given pipeline state.
+     specialized_runtime_sampler_values: HashSet<Word>,
+     /// Sampler-typed aliases whose incoming values do not share one exact state. A sampling
+@@ -547,6 +603,7 @@
+             raster_sample_count: options.raster_sample_count,
+             vertex_amplification_count: options.vertex_amplification_count,
+             runtime_sampler_states: options.runtime_sampler_states,
++            normalized_sampler_coordinates: options.normalized_sampler_coordinates,
+             runtime_storage_image_states: options.runtime_storage_image_states,
+             threadgroup_memory_lengths: options.threadgroup_memory_lengths,
+             runtime_storage_image_values: HashMap::new(),
+@@ -558,6 +615,9 @@
+             unsurfaced_embedded_resources: Vec::new(),
+             variant_absent_texture_values: HashSet::new(),
+             sampler_states: HashMap::new(),
++            sampler_coordinate_sources: HashMap::new(),
++            sampled_descriptor_accesses: HashMap::new(),
++            sampler_coordinate_flags_var: None,
+             specialized_runtime_sampler_values: HashSet::new(),
+             ambiguous_sampler_states: HashSet::new(),
+             default_null_image_vars: HashMap::new(),
+@@ -944,6 +1004,54 @@
+             }
+         }
+     }
++
++    // Coordinate provenance is independent of the complete sampler state: an unspecialized
++    // `[[sampler(n)]]` has no filter/address facts but still has one ABI 8 flag word. Propagate that
++    // fact through copies and joins only when every incoming value names the same source.
++    for _ in 0..aliases.len() {
++        let mut changed = false;
++        for (result, sources) in &aliases {
++            if ctx.sampler_coordinate_sources.contains_key(result) {
++                continue;
++            }
++            let mut exact = None;
++            let mut complete = true;
++            let mut conflict = false;
++            for source in sources {
++                let coordinate =
++                    ctx.sampler_coordinate_sources
++                        .get(source)
++                        .copied()
++                        .or_else(|| {
++                            ctx.sampler_states.get(source).map(|state| {
++                                if state.uses_pixel_coordinates() {
++                                    SamplerCoordinateSource::Pixel
++                                } else {
++                                    SamplerCoordinateSource::Normalized
++                                }
++                            })
++                        });
++                let Some(coordinate) = coordinate else {
++                    complete = false;
++                    continue;
++                };
++                if exact.is_some_and(|existing| existing != coordinate) {
++                    conflict = true;
++                } else {
++                    exact = Some(coordinate);
++                }
++            }
++            if complete && !conflict {
++                if let Some(coordinate) = exact {
++                    ctx.sampler_coordinate_sources.insert(*result, coordinate);
++                    changed = true;
++                }
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -1672,8 +1780,9 @@
+ mod prune;
+ mod resources;
+ pub use resources::{
+-    lower_argument_resource_tables, ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET,
+-    ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
++    lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
++    ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ mod spirv_cfg;
+ mod stage_input;
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -328,7 +328,12 @@
+                             | (3, DescriptorClass::StorageImage)
+                             | (4, DescriptorClass::Sampler)
+                     )));
+-        if !graph_binding && (set != layout.set || !allowed) {
++        // Binding 674 is the translator-owned ABI 8 sampler-coordinate flag SSBO. It deliberately
++        // lives outside the Metal resource bands, so admit exactly this reserved storage buffer.
++        let coordinate_flags = set == layout.set
++            && binding == crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING
++            && class == DescriptorClass::StorageBuffer;
++        if !graph_binding && !coordinate_flags && (set != layout.set || !allowed) {
+             return Err(format!(
+                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
+                 label(id)
+--- a/src/passes/resources/gpu_argument_graph.rs
++++ b/src/passes/resources/gpu_argument_graph.rs
+@@ -189,19 +189,26 @@
+     // The dimensions follow the final token list. Both descriptors alias the same immutable table.
+     let last = load_word(ctx, body, table, pointer, uint, zero, four);
+     let count = load_word(ctx, body, table, pointer, uint, zero, five);
+-    let twice = value(
++    // ABI 8 inserts one sampler-coordinate flag word after the ordinary/comparison token
++    // pair for every sampler token. Query rows follow that tail.
++    let tail_factor = ctx.const_uint(if ctx.normalized_sampler_coordinates {
++        3
++    } else {
++        2
++    });
++    let tokens_and_flags = value(
+         ctx,
+         body,
+-        Op::ShiftLeftLogical,
++        Op::IMul,
+         uint,
+-        vec![Operand::IdRef(count), Operand::IdRef(one)],
++        vec![Operand::IdRef(count), Operand::IdRef(tail_factor)],
+     );
+     let base = value(
+         ctx,
+         body,
+         Op::IAdd,
+         uint,
+-        vec![Operand::IdRef(last), Operand::IdRef(twice)],
++        vec![Operand::IdRef(last), Operand::IdRef(tokens_and_flags)],
+     );
+     let row = value(
+         ctx,
+@@ -1139,6 +1146,7 @@
+                         };
+                         (u32::from(shape.storage), ty, Some(shape))
+                     };
++                    let category_number = category;
+                     let global = *globals.entry((category, element)).or_insert_with(|| {
+                         let array = ctx.ty_runtime_array(element);
+                         let pointer = ctx.ty_ptr(StorageClass::UniformConstant, array);
+@@ -1181,6 +1189,22 @@
+                         element,
+                         vec![Operand::IdRef(pointer)],
+                     );
++                    ctx.sampled_descriptor_accesses.insert(
++                        loaded,
++                        SampledDescriptorAccess {
++                            category: category_number,
++                            token_index: index,
++                            physical_index: index,
++                            shape: shape.map(|shape| SampledDescriptorShape {
++                                dim: shape.dim,
++                                arrayed: shape.arrayed,
++                                depth: shape.depth,
++                                comp: shape.comp,
++                                storage: shape.storage,
++                                multisampled: shape.multisampled,
++                            }),
++                        },
++                    );
+                     if let Some(shape) = shape {
+                         ctx.image_dims.insert(loaded, (shape.dim, shape.arrayed));
+                         ctx.image_comp.insert(loaded, shape.comp);
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -30,18 +30,40 @@
+     bytes: &[u8],
+     fields: &[ArgumentResourceField],
+ ) -> Result<Vec<u8>, String> {
++    lower_argument_resource_tables_with_table_version(bytes, fields, 7)
++}
++
++/// Lower the table with an explicit ABI version.
++///
++/// Version 8 enables the normalized sampler-coordinate contract: an embedded sampler that needs
++/// runtime coordinate flags reads the table's ABI 8 flag tail instead of the stage-local direct
++/// sampler word array.
++pub fn lower_argument_resource_tables_with_table_version(
++    bytes: &[u8],
++    fields: &[ArgumentResourceField],
++    table_version: u32,
++) -> Result<Vec<u8>, String> {
++    if !matches!(table_version, 7 | 8) {
++        return Err(format!(
++            "unsupported GPU argument table version {table_version}"
++        ));
++    }
+     if fields.is_empty() {
+         return Ok(bytes.to_vec());
+     }
+     let module = crate::spirv_module::load_bytes(bytes)
+         .map_err(|error| format!("argument resource SPIR-V: {error:?}"))?;
++    let options = TransformOptions {
++        normalized_sampler_coordinates: table_version >= 8,
++        ..TransformOptions::default()
++    };
+     let mut ctx = Ctx::with_options_and_sidecar(
+         module,
+         crate::emit_sidecar::EmitSidecar::default(),
+         Stage::Kernel,
+-        TransformOptions::default(),
+-    );
+-    lower(&mut ctx, fields)?;
++        options,
++    );
++    lower(&mut ctx, fields, table_version)?;
+     super::null_texels::guard_argument_texel_accesses(&mut ctx)?;
+     super::null_sampling::protect_argument_sampling(&mut ctx)?;
+     ctx.module.types_global_values.append(&mut ctx.new_globals);
+@@ -70,9 +92,185 @@
+     element: Word,
+     category: u32,
+     array: bool,
+-}
+-
+-fn lower(ctx: &mut Ctx, fields: &[ArgumentResourceField]) -> Result<(), String> {
++    coordinate_word: Option<u32>,
++}
++
++fn sampler_coordinate_word(binding: u32) -> Option<u32> {
++    let ordinary = if crate::reflect::COMPARISON_SAMPLER_BINDING_RANGE.contains(binding) {
++        binding.checked_sub(crate::reflect::COMPARISON_SAMPLER_BINDING_OFFSET)?
++    } else {
++        binding
++    };
++    crate::reflect::SAMPLER_BINDING_RANGE
++        .contains(ordinary)
++        .then(|| ordinary - crate::reflect::SAMPLER_BINDING_BASE)
++}
++
++fn constant_word(defs: &HashMap<Word, Instruction>, id: Word) -> Option<u32> {
++    let instruction = defs.get(&id)?;
++    match (instruction.class.opcode, instruction.operands.as_slice()) {
++        (Op::Constant, [Operand::LiteralBit32(value)]) => Some(*value),
++        _ => None,
++    }
++}
++
++fn coordinate_flag_loads(
++    ctx: &Ctx,
++    flags: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Result<HashMap<u32, Vec<Word>>, String> {
++    let mut projections = HashMap::new();
++    for function in &ctx.module.functions {
++        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
++            if !matches!(
++                instruction.class.opcode,
++                Op::AccessChain | Op::InBoundsAccessChain
++            ) {
++                continue;
++            }
++            let [Operand::IdRef(base), Operand::IdRef(zero), Operand::IdRef(word_index)] =
++                instruction.operands.as_slice()
++            else {
++                continue;
++            };
++            if *base != flags || constant_word(defs, *zero) != Some(0) {
++                continue;
++            }
++            let Some(word) = constant_word(defs, *word_index) else {
++                return Err("ABI 8 sampler-coordinate flag index is not constant".into());
++            };
++            let Some(pointer) = instruction.result_id else {
++                return Err("ABI 8 sampler-coordinate flag projection has no result".into());
++            };
++            projections.insert(pointer, word);
++        }
++    }
++    let mut loads = HashMap::<u32, Vec<Word>>::new();
++    for function in &ctx.module.functions {
++        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
++            if instruction.class.opcode != Op::Load {
++                continue;
++            }
++            let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
++                continue;
++            };
++            let Some(word) = projections.get(pointer) else {
++                continue;
++            };
++            let Some(loaded) = instruction.result_id else {
++                return Err("ABI 8 sampler-coordinate flag load has no result".into());
++            };
++            loads.entry(*word).or_default().push(loaded);
++        }
++    }
++    Ok(loads)
++}
++
++fn remove_flag_loads_before(
++    body: &mut Vec<Instruction>,
++    ids: &HashSet<Word>,
++    before: usize,
++) -> usize {
++    let mut removed = 0;
++    for index in (0..before).rev() {
++        if body[index].class.opcode == Op::Load
++            && body[index]
++                .result_id
++                .is_some_and(|result| ids.contains(&result))
++        {
++            body.remove(index);
++            removed += 1;
++        }
++    }
++    before - removed
++}
++
++fn hoist_chain_before_first_use(
++    body: &mut Vec<Instruction>,
++    chain_start: usize,
++    old_flags: &HashSet<Word>,
++) -> Result<(), String> {
++    let Some(insert_at) = body[..chain_start].iter().position(|inst| {
++        inst.operands
++            .iter()
++            .any(|operand| matches!(operand, Operand::IdRef(id) if old_flags.contains(id)))
++    }) else {
++        return Ok(());
++    };
++    let definitions_before = body[..insert_at]
++        .iter()
++        .filter_map(|inst| inst.result_id)
++        .collect::<HashSet<_>>();
++    let definitions_after = body[insert_at..chain_start]
++        .iter()
++        .filter_map(|inst| inst.result_id)
++        .collect::<HashSet<_>>();
++    let chain = body.split_off(chain_start);
++    let mut chain_definitions = HashSet::new();
++    for instruction in &chain {
++        for operand in &instruction.operands {
++            let Operand::IdRef(id) = operand else {
++                continue;
++            };
++            if !chain_definitions.contains(id)
++                && !definitions_before.contains(id)
++                && definitions_after.contains(id)
++            {
++                return Err(
++                    "ABI 8 sampler flags depend on a descriptor index defined after their use"
++                        .into(),
++                );
++            }
++        }
++        chain_definitions.extend(instruction.result_id);
++    }
++    body.splice(insert_at..insert_at, chain);
++    Ok(())
++}
++
++pub(in crate::passes) fn table_sampler_flag_word(
++    ctx: &mut Ctx,
++    body: &mut Vec<Instruction>,
++    table: Word,
++    token_index: Word,
++) -> Word {
++    let uint = ctx.ty_uint();
++    let pointer = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
++    let zero = ctx.const_uint(0);
++    let one = ctx.const_uint(1);
++    let four = ctx.const_uint(4);
++    let five = ctx.const_uint(5);
++    let sampler_offset = load_word(ctx, body, table, pointer, uint, zero, four);
++    let sampler_count = load_word(ctx, body, table, pointer, uint, zero, five);
++    let twice_count = value(
++        ctx,
++        body,
++        Op::ShiftLeftLogical,
++        uint,
++        vec![Operand::IdRef(sampler_count), Operand::IdRef(one)],
++    );
++    let flags_base = value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(sampler_offset), Operand::IdRef(twice_count)],
++    );
++    let index = value(
++        ctx,
++        body,
++        Op::IAdd,
++        uint,
++        vec![Operand::IdRef(flags_base), Operand::IdRef(token_index)],
++    );
++    load_word(ctx, body, table, pointer, uint, zero, index)
++}
++
++fn lower(
++    ctx: &mut Ctx,
++    fields: &[ArgumentResourceField],
++    table_version: u32,
++) -> Result<(), String> {
+     let defs = type_defs(&ctx.module);
+     let mut sets = HashMap::new();
+     let mut bindings = HashMap::new();
+@@ -103,6 +301,19 @@
+     }) {
+         return Err("GPU argument table/root bindings are already occupied".into());
+     }
++    let coordinate_flags = (table_version >= 8)
++        .then(|| {
++            bindings.iter().find_map(|(&id, &binding)| {
++                (binding == crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING
++                    && sets.get(&id) == Some(&0))
++                .then_some(id)
++            })
++        })
++        .flatten();
++    let mut coordinate_loads = coordinate_flags
++        .map(|flags| coordinate_flag_loads(ctx, flags, &defs))
++        .transpose()?
++        .unwrap_or_default();
+     let mut resources = BTreeMap::new();
+     let mut seen = HashSet::new();
+     for field in fields {
+@@ -178,6 +389,9 @@
+             }
+             _ => return Err("GPU argument descriptor is not a texture or sampler".into()),
+         };
++        let coordinate_word = (table_version >= 8 && category == 2)
++            .then(|| sampler_coordinate_word(field.binding))
++            .flatten();
+         resources.insert(
+             var,
+             Resource {
+@@ -186,6 +400,7 @@
+                 element,
+                 category,
+                 array,
++                coordinate_word,
+             },
+         );
+     }
+@@ -199,6 +414,9 @@
+     let lookup = lookup_function(ctx, table);
+     let mut globals = BTreeMap::new();
+     let mut replacement = BTreeMap::new();
++    let mut flag_replacements = HashMap::<Word, Word>::new();
++    let mut flag_replacement_by_word = HashMap::<u32, Word>::new();
++    let mut removed_flag_loads = HashSet::<Word>::new();
+     for (&var, resource) in &resources {
+         let new_var = *globals
+             .entry((resource.category, resource.element))
+@@ -257,6 +475,12 @@
+                 .clone();
+             let mut body = Vec::with_capacity(old.len());
+             for mut inst in old {
++                if inst
++                    .result_id
++                    .is_some_and(|result| removed_flag_loads.contains(&result))
++                {
++                    continue;
++                }
+                 if inst.class.opcode == Op::Load {
+                     let coordinate = match inst.operands.first() {
+                         Some(Operand::IdRef(pointer)) => resources
+@@ -268,6 +492,7 @@
+                     };
+                     if let Some((var, index)) = coordinate {
+                         let resource = resources[&var];
++                        let chain_start = body.len();
+                         let index = if index == zero || value_types.get(&index) == Some(&uint) {
+                             index
+                         } else {
+@@ -337,6 +562,51 @@
+                                 Operand::IdRef(category),
+                             ],
+                         );
++                        if let Some(old) = inst.result_id {
++                            ctx.sampled_descriptor_accesses.insert(
++                                old,
++                                SampledDescriptorAccess {
++                                    category: resource.category,
++                                    token_index: index,
++                                    physical_index: selected,
++                                    shape: None,
++                                },
++                            );
++                        }
++                        if let (Some(word), Some(_)) = (resource.coordinate_word, coordinate_flags)
++                        {
++                            if let std::collections::hash_map::Entry::Vacant(entry) =
++                                flag_replacement_by_word.entry(word)
++                            {
++                                if let Some(old_words) = coordinate_loads.remove(&word) {
++                                    let old_flags =
++                                        old_words.iter().copied().collect::<HashSet<_>>();
++                                    let chain_start = remove_flag_loads_before(
++                                        &mut body,
++                                        &old_flags,
++                                        chain_start,
++                                    );
++                                    removed_flag_loads.extend(old_flags.iter().copied());
++                                    let replacement =
++                                        table_sampler_flag_word(ctx, &mut body, table, selected);
++                                    hoist_chain_before_first_use(
++                                        &mut body,
++                                        chain_start,
++                                        &old_flags,
++                                    )?;
++                                    for old_word in old_words {
++                                        if let Some(previous) =
++                                            flag_replacements.insert(old_word, replacement)
++                                        {
++                                            return Err(format!(
++                                                "ABI 8 sampler-coordinate word {word} is shared by multiple table tokens ({previous}, {replacement})"
++                                            ));
++                                        }
++                                    }
++                                    entry.insert(replacement);
++                                }
++                            }
++                        }
+                         let pointer_ty =
+                             ctx.ty_ptr(StorageClass::UniformConstant, resource.element);
+                         let pointer = value(
+@@ -362,6 +632,24 @@
+             ctx.module.functions[function_index].blocks[block_index].instructions = body;
+         }
+     }
++    if !flag_replacements.is_empty() {
++        for function in &mut ctx.module.functions {
++            for instruction in function
++                .blocks
++                .iter_mut()
++                .flat_map(|block| &mut block.instructions)
++            {
++                for operand in &mut instruction.operands {
++                    let Operand::IdRef(id) = operand else {
++                        continue;
++                    };
++                    if let Some(replacement) = flag_replacements.get(id) {
++                        *id = *replacement;
++                    }
++                }
++            }
++        }
++    }
+     // Refuse a representation we did not consume; retaining an old descriptor here would lie.
+     for function in &ctx.module.functions {
+         if function.all_inst_iter().any(|inst| {
+@@ -396,6 +684,19 @@
+         entry
+             .operands
+             .extend(interface.iter().copied().map(Operand::IdRef));
++    }
++    crate::native::eliminate_dead_values_module(&mut ctx.module, &HashSet::new());
++    super::super::module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
++    if let Some(flags) = coordinate_flags {
++        if ctx.module.all_inst_iter().any(|inst| {
++            inst.operands
++                .iter()
++                .any(|operand| matches!(operand, Operand::IdRef(id) if *id == flags))
++        }) {
++            return Err(
++                "ABI 8 sampler-coordinate flags remain in the stage-local direct channel".into(),
++            );
++        }
+     }
+     ctx.add_capability(Capability::RuntimeDescriptorArray);
+     Ok(())
+--- a/src/passes/resources/mod.rs
++++ b/src/passes/resources/mod.rs
+@@ -23,9 +23,11 @@
+ pub(in crate::passes) use collapse::*;
+ pub(in crate::passes) use discovery::*;
+ pub(in crate::passes) use gpu_argument_graph::lower_argument_resource_graph;
++pub(in crate::passes) use gpu_arguments::table_sampler_flag_word;
+ pub use gpu_arguments::{
+-    lower_argument_resource_tables, ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET,
+-    ARGUMENT_RESOURCE_ROOT_BINDING, ARGUMENT_RESOURCE_TABLE_BINDING,
++    lower_argument_resource_tables, lower_argument_resource_tables_with_table_version,
++    ArgumentResourceField, ARGUMENT_RESOURCE_FIRST_SET, ARGUMENT_RESOURCE_ROOT_BINDING,
++    ARGUMENT_RESOURCE_TABLE_BINDING,
+ };
+ pub(in crate::passes) use nonuniform::decorate_nonuniform_descriptor_accesses;
+ pub(in crate::passes) use null_sampling::protect_argument_sampling;
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -208,7 +208,10 @@
+ /// v61 distinguishes float, unsigned and signed null sampling descriptors in argument table ABI 5.
+ /// v63 distinguishes ordinary and comparison sampler descriptors and marks GPU argument tables
+ /// whose sampler array carries both representations.
+-pub const REFLECTION_VERSION: u32 = 63;
++/// v64 adds the ABI 8 sampler-coordinate contract: dynamic direct samplers read a stage-local
++/// 32-word flag SSBO at binding 674, GPU argument-table version 8 appends one flag word per sampler
++/// token, and static pixel samplers use normalized coordinate conversion in shader code.
++pub const REFLECTION_VERSION: u32 = 64;
+ 
+ /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+ /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+@@ -471,6 +474,8 @@
+     start: COMPARISON_SAMPLER_BINDING_BASE,
+     end: COMPARISON_SAMPLER_BINDING_BASE + SAMPLER_ARGUMENT_COUNT + 16,
+ };
++/// Stage-local read-only SSBO carrying one runtime coordinate-flag word per sampler-band entry.
++pub const SAMPLER_COORDINATE_FLAGS_BINDING: u32 = 674;
+ /// Number of sampler argument-table entries exposed by the Metal ABI. The remainder of
+ /// [`SAMPLER_BINDING_RANGE`] is reserved for synthesized static samplers.
+ pub const SAMPLER_ARGUMENT_COUNT: u32 = 16;
+@@ -817,6 +822,12 @@
+     /// Synthesized table of Vulkan buffer device addresses indexed by Metal buffer location. Used
+     /// by the BDA retry tier for direct device-buffer parameters.
+     BufferAddressTable,
++    /// Translator-owned read-only StorageBuffer holding runtime sampler-coordinate flags.
++    ///
++    /// Bit 0 of word `n` selects Metal pixel coordinates for the direct sampler resources whose
++    /// ordinary binding is `SAMPLER_BINDING_BASE + n`; the matching comparison binding maps to the
++    /// same word. Bit zero means normalized coordinates.
++    SamplerCoordinateFlags,
+     /// A placeholder sampled image the translator binds for `air.get_null_texture_*()`, at the first
+     /// binding in the sampled-texture band no Metal texture claims.
+     ///
+@@ -2022,6 +2033,9 @@
+ pub struct ShaderReflection {
+     /// Schema version, always [`REFLECTION_VERSION`] at build time.
+     pub reflection_version: u32,
++    /// Whether this module implements the ABI 8 normalized sampler-coordinate contract.
++    #[cfg_attr(feature = "serde", serde(default))]
++    pub normalized_sampler_coordinates: bool,
+     /// Effective descriptor-set and binding-range ABI used by the returned SPIR-V module.
+     #[cfg_attr(feature = "serde", serde(default))]
+     pub descriptor_layout: DescriptorLayout,
+@@ -2097,7 +2111,11 @@
+ }
+ 
+ impl ShaderReflection {
+-    pub(crate) fn reconcile_argument_resource_tables(&mut self, module: &Module) {
++    pub(crate) fn reconcile_argument_resource_tables(
++        &mut self,
++        module: &Module,
++        normalized_sampler_coordinates: bool,
++    ) {
+         use crate::spirv_module::Operand;
+         use std::collections::HashMap;
+         let mut sets = HashMap::new();
+@@ -2147,11 +2165,70 @@
+             )
+         });
+         self.argument_resource_tables = Some(ArgumentResourceTables {
+-            version: 7,
++            version: if normalized_sampler_coordinates { 8 } else { 7 },
+             table_binding: 672,
+             categories,
+             comparison_sampler,
+             image_query_binding,
++        });
++    }
++
++    /// Report the stage-local runtime coordinate-flag SSBO when the finished module declares it.
++    ///
++    /// The pass that creates binding 674 knows why the buffer exists; reflection derives the exact
++    /// descriptor from the module so a cached or linked result cannot carry a stale metadata claim.
++    pub(crate) fn reconcile_sampler_coordinate_flags(&mut self, module: &Module) {
++        use crate::spirv_module::Operand;
++        use std::collections::HashMap;
++
++        let mut sets = HashMap::new();
++        let mut bindings = HashMap::new();
++        for instruction in &module.annotations {
++            if instruction.class.opcode != spirv::Op::Decorate {
++                continue;
++            }
++            match instruction.operands.as_slice() {
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++                {
++                    sets.insert(*id, *set);
++                }
++                [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(binding)] =>
++                {
++                    bindings.insert(*id, *binding);
++                }
++                _ => {}
++            }
++        }
++        let declared = bindings.iter().any(|(id, binding)| {
++            *binding == SAMPLER_COORDINATE_FLAGS_BINDING
++                && sets.get(id) == Some(&self.descriptor_layout.set)
++        });
++        self.bindings
++            .retain(|resource| resource.kind != ResourceKind::SamplerCoordinateFlags);
++        if !declared {
++            return;
++        }
++        self.bindings.push(ResourceBinding {
++            kind: ResourceKind::SamplerCoordinateFlags,
++            metal_index: 0,
++            descriptor: Some(DescriptorLocation {
++                set: self.descriptor_layout.set,
++                binding: SAMPLER_COORDINATE_FLAGS_BINDING,
++                count: 1,
++            }),
++            comparison_descriptor: None,
++            param_index: None,
++            stage_input_location: None,
++            address_space: None,
++            declared_size: Some(128),
++            extent: Some(BufferExtent::Object { bytes: 128 }),
++            footprint: None,
++            type_layout: None,
++            type_name: None,
++            texture_shape: None,
++            embedded_source: None,
++            access: Some(ResourceAccess::ReadOnly),
++            static_sampler: None,
+         });
+     }
+ 
+@@ -2288,6 +2365,7 @@
+                 ResourceKind::ColorInput => layout.color_input_binding(resource.metal_index),
+                 ResourceKind::StaticSampler
+                 | ResourceKind::BufferAddressTable
++                | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+                 | ResourceKind::SynthesizedReadSampler => {
+                     return Err(format!(
+@@ -2350,7 +2428,7 @@
+             .validate()
+             .map_err(|error| error.to_string())?;
+         if let Some(table) = &self.argument_resource_tables {
+-            if table.version != 7
++            if !matches!(table.version, 7 | 8)
+                 || table.table_binding != 672
+                 || table
+                     .image_query_binding
+@@ -2477,7 +2555,8 @@
+                 | ResourceKind::KernelStageInput
+                 | ResourceKind::AccelerationStructureShadow
+                 | ResourceKind::PrimitiveAccelerationStructure
+-                | ResourceKind::BufferAddressTable => DescriptorClass::StorageBuffer,
++                | ResourceKind::BufferAddressTable
++                | ResourceKind::SamplerCoordinateFlags => DescriptorClass::StorageBuffer,
+                 ResourceKind::Texture
+                 | ResourceKind::TextureArray
+                 | ResourceKind::StorageImage
+@@ -2538,6 +2617,7 @@
+                 // Metal argument claims, so there is no index to recompute the expectation from.
+                 // The band check below is what constrains them.
+                 ResourceKind::BufferAddressTable
++                | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+                 | ResourceKind::SynthesizedReadSampler => None,
+                 ResourceKind::ThreadgroupBuffer
+@@ -2595,6 +2675,22 @@
+                         location.binding,
+                         self.descriptor_layout.synthetic.start,
+                         self.descriptor_layout.synthetic.end
++                    ));
++                }
++                record(location, owner, class)?;
++                continue;
++            }
++            if resource.kind == ResourceKind::SamplerCoordinateFlags {
++                let location = resource
++                    .descriptor
++                    .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
++                if location.set != self.descriptor_layout.set
++                    || location.binding != SAMPLER_COORDINATE_FLAGS_BINDING
++                    || location.count != 1
++                {
++                    return Err(format!(
++                        "{owner} must be one descriptor at set {} binding {SAMPLER_COORDINATE_FLAGS_BINDING}",
++                        self.descriptor_layout.set
+                     ));
+                 }
+                 record(location, owner, class)?;
+@@ -3224,6 +3320,7 @@
+             .collect();
+         ShaderReflection {
+             reflection_version: REFLECTION_VERSION,
++            normalized_sampler_coordinates: false,
+             descriptor_layout: DescriptorLayout::default(),
+             stage: ShaderStage::Fragment,
+             entry_point: entry_point.map(str::to_string),
+@@ -3390,6 +3487,7 @@
+             .collect();
+         ShaderReflection {
+             reflection_version: REFLECTION_VERSION,
++            normalized_sampler_coordinates: false,
+             descriptor_layout: DescriptorLayout::default(),
+             stage: if is_tessellation {
+                 ShaderStage::TessellationEvaluation
+@@ -3613,6 +3711,7 @@
+         );
+         ShaderReflection {
+             reflection_version: REFLECTION_VERSION,
++            normalized_sampler_coordinates: false,
+             descriptor_layout: DescriptorLayout::default(),
+             stage: ShaderStage::Kernel,
+             entry_point: entry_point.map(str::to_string),
+--- a/src/reflect/tests.rs
++++ b/src/reflect/tests.rs
+@@ -172,6 +172,31 @@
+         .bindings
+         .iter()
+         .all(|b| b.kind != ResourceKind::ColorInput));
++}
++
++#[test]
++fn reflection_records_the_sampler_coordinate_option_without_changing_schema_version() {
++    let meta = parse_air_fragment_meta(FRAG_LL).unwrap();
++    let build = |options| {
++        crate::build_reflection(
++            crate::passes::Stage::Fragment,
++            Some(&meta),
++            None,
++            None,
++            Some("myFragment"),
++            &options,
++        )
++        .unwrap()
++    };
++
++    let legacy = build(crate::passes::TransformOptions::default());
++    assert_eq!(legacy.reflection_version, REFLECTION_VERSION);
++    assert!(!legacy.normalized_sampler_coordinates);
++
++    let normalized =
++        build(crate::passes::TransformOptions::default().with_normalized_sampler_coordinates());
++    assert_eq!(normalized.reflection_version, REFLECTION_VERSION);
++    assert!(normalized.normalized_sampler_coordinates);
+ }
+ 
+ #[test]
+@@ -1502,6 +1527,7 @@
+     assert!(storage_tex.writable && storage_tex.storage_format.is_some());
+     let r = ShaderReflection {
+         reflection_version: REFLECTION_VERSION,
++        normalized_sampler_coordinates: true,
+         descriptor_layout: DescriptorLayout::default(),
+         stage: ShaderStage::Kernel,
+         entry_point: Some("k".to_string()),
+--- a/validation/src/executor_contract.rs
++++ b/validation/src/executor_contract.rs
+@@ -153,7 +153,8 @@
+                 // Descriptor translation does not yet provide authored Metal/Vulkan binding support.
+                 requirements.insert(ToolingRequirement::EmbeddedArgumentSampler);
+             }
+-            ResourceKind::SynthesizedReadSampler => {
++            // The executor has no authored payload for the ABI 8 coordinate flag buffer either.
++            ResourceKind::SynthesizedReadSampler | ResourceKind::SamplerCoordinateFlags => {
+                 requirements.insert(ToolingRequirement::SynthesizedPlaceholderDescriptor);
+             }
+         }
+@@ -1127,10 +1128,15 @@
+             .expect("the placeholder the module reads through is reported");
+         assert!(unsupported_reflection_requirements(&reflection).is_empty());
+ 
+-        let mut sampler = reflection.clone();
+-        sampler.bindings[placeholder].kind = ResourceKind::SynthesizedReadSampler;
+-        assert!(unsupported_reflection_requirements(&sampler)
+-            .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
++        for kind in [
++            ResourceKind::SynthesizedReadSampler,
++            ResourceKind::SamplerCoordinateFlags,
++        ] {
++            let mut unsupported = reflection.clone();
++            unsupported.bindings[placeholder].kind = kind;
++            assert!(unsupported_reflection_requirements(&unsupported)
++                .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
++        }
+     }
+ 
+     #[test]

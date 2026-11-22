@@ -1,0 +1,251 @@
+Subject: [PATCH] Preserve checked buffer cursors in defined helper calls
+
+Expand only refused cursor call sites before native emission, retaining root,
+64-bit offset, runtime length and access checks. Keep exported definitions,
+reject recursive graphs and leave ordinary internal-only inlining unchanged.
+
+diff --git a/src/native/inline.rs b/src/native/inline.rs
+--- a/src/native/inline.rs
++++ b/src/native/inline.rs
+@@ -4,13 +4,14 @@
+ //! AIR modules emitted by the Metal front end frequently split a kernel across small `internal`
+ //! helper functions (`fastcc`, mangled names) that the native emitter would otherwise have to model
+ //! as full SPIR-V `OpFunctionCall`s — a construct the Logical-addressing emitter does not lower.
+-//! This pass folds every direct call to a module-local `internal` helper into its caller so the
++//! This pass folds eligible direct calls to a module-local `internal` helper into its caller so the
+ //! emitter sees a single self-contained function body per entry point. It runs on the sanitized AIR
+ //! TEXT before [`super::LlModule::parse`], so the reconstructed CFG/SSA is recomputed from the
+ //! rewritten text.
+ //!
+ //! It is **floor-safe by construction**: it fires only when a direct call targets a function that is
+-//! `define internal` in this very module (never a `declare`, never an `air.*`/`llvm.*` intrinsic,
++//! `define internal` in this very module (or a defined linked helper selected for cursor repair;
++//! never a `declare`, never an `air.*`/`llvm.*` intrinsic,
+ //! never an indirect `%ptr` call), the internal call graph on the inlined path is acyclic, and every
+ //! callee body is a shape the tokenized renamer can handle safely. On ANY difficulty — recursion, a
+ //! parse it cannot model, a construct it cannot rename — it returns the module text UNCHANGED,
+@@ -62,7 +63,7 @@
+             return source;
+         };
+         let targets = HashSet::from([consumer]);
+-        let Some(inlined) = try_inline(&source, Some((&targets, &function, None))) else {
++        let Some(inlined) = try_inline(&source, Some((&targets, &function, None)), false) else {
+             return source;
+         };
+         if inlined == source {
+@@ -76,7 +77,7 @@
+ /// fixpoint. Returns the module text unchanged when nothing is eligible or any difficulty is hit.
+ #[cfg(test)]
+ pub(super) fn inline_nonrecursive_internal_calls(san_ll: &str) -> String {
+-    match try_inline(san_ll, None) {
++    match try_inline(san_ll, None, false) {
+         Some(out) => out,
+         None => san_ll.to_string(),
+     }
+@@ -156,8 +157,11 @@
+     let mut changed = false;
+     for (selected, consumer) in selected_consumers {
+         let targets = HashSet::from([consumer]);
+-        if let Some(inlined) = try_inline(&source, Some((&targets, selected.as_str(), entry_name)))
+-        {
++        if let Some(inlined) = try_inline(
++            &source,
++            Some((&targets, selected.as_str(), entry_name)),
++            false,
++        ) {
+             changed |= inlined != source;
+             source = inlined;
+         }
+@@ -175,6 +179,8 @@
+ /// cross a SPIR-V function boundary. Each site is `(callee, the caller-local name of the argument
+ /// that carries the cursor)`; the argument name selects the exact call, so a helper called with a
+ /// plain buffer root elsewhere keeps that call site and its body.
++/// Defined linked helpers are eligible too: substitution preserves the checked pointer's root,
++/// cursor and permissions, while their original externally visible definitions remain intact.
+ ///
+ /// Returns `None` when nothing could be spliced -- a caller uses this only after an emission that
+ /// already failed, so leaving the source alone simply preserves that failure.
+@@ -191,7 +197,8 @@
+         let targets = HashSet::from([format!("@{}", callee.trim_start_matches('@'))]);
+         // No caller filter: the cursor may be built in a helper rather than the entry, and an
+         // argument name that also occurs in an unrelated caller only inlines one more call.
+-        if let Some(inlined) = try_inline(&source, Some((&targets, argument.as_str(), None))) {
++        if let Some(inlined) = try_inline(&source, Some((&targets, argument.as_str(), None)), true)
++        {
+             changed |= inlined != source;
+             source = inlined;
+         }
+@@ -796,18 +803,21 @@
+ fn try_inline(
+     san_ll: &str,
+     targets: Option<(&HashSet<String>, &str, Option<&str>)>,
++    allow_defined_helpers: bool,
+ ) -> Option<String> {
+     let items = parse_items(san_ll)?;
+ 
+-    // Collect the internal-function table: name -> (signature, body). Only `define internal`.
++    // Cursor repair can also use a linked definition. Check its complete call graph before
++    // selecting sites, including cycles through a helper not selected in this retry.
+     let mut internal: HashMap<String, (DefSig, Vec<String>)> = HashMap::new();
+     let mut has_any_func = false;
+     for it in &items {
+         if let Item::Func(f) = it {
+             has_any_func = true;
+             let sig = parse_def_header(&f.header)?;
+-            if sig.internal
+-                && targets.is_none_or(|(targets, _selected, _entry)| targets.contains(&sig.name))
++            if (sig.internal || allow_defined_helpers)
++                && (allow_defined_helpers
++                    || targets.is_none_or(|(targets, _, _)| targets.contains(&sig.name)))
+             {
+                 // Every param must name a value for us to substitute; reject varargs/unnamed.
+                 if sig.params.iter().any(|p| p.is_empty()) {
+@@ -822,12 +832,30 @@
+     if !has_any_func || internal.is_empty() {
+         return None; // nothing to inline
+     }
++    if allow_defined_helpers {
++        let (targets, _, _) = targets?;
++        let mut pending = targets.iter().cloned().collect::<Vec<_>>();
++        let mut reachable = HashSet::new();
++        while let Some(name) = pending.pop() {
++            if !reachable.insert(name.clone()) {
++                continue;
++            }
++            if let Some((_, body)) = internal.get(&name) {
++                pending.extend(
++                    body.iter()
++                        .filter_map(|line| parse_call(line).map(|c| c.callee)),
++                );
++            }
++        }
++        internal.retain(|name, _| reachable.contains(name));
++    }
+ 
+     // Acyclicity check over the internal call graph restricted to inlinable direct calls. If ANY
+     // cycle exists among internal functions, bail — inlining would not terminate.
+     if internal_callgraph_has_cycle(&internal) {
+         return None;
+     }
++    internal.retain(|name, _| targets.is_none_or(|(targets, _, _)| targets.contains(name)));
+ 
+     // Determine whether any caller actually calls an internal function; if none, byte-identical.
+     let mut any_call = false;
+@@ -1584,6 +1612,10 @@
+ // ---------------------------------------------------------------------------------------------
+ 
+ #[cfg(test)]
++#[path = "inline_cursor_tests.rs"]
++mod cursor_tests;
++
++#[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -13763,18 +13763,16 @@
+         "the refused call must be spliced away, not emitted"
+     );
+     assert_physical_memory_bytes(&module, 4, 16, true);
+-    // The refusal survives for a call the text inliner cannot remove: an externally linked helper
+-    // is not a splice candidate, so there is still no representation that reaches the buffer.
++    // A linked helper's definition has external linkage, but its checked cursor must reach the
++    // same buffer without losing length or access permission at that call boundary.
+     let external_helper = ll.replace(
+         "define internal fastcc void @store_helper",
+         "define fastcc void @store_helper",
+     );
+-    let error = emit_vulkan_spirv(&external_helper)
+-        .expect_err("a cursor into an unspliceable helper must not emit a module");
+-    assert!(
+-        error.contains("checked large-buffer pointer whose table bounds cannot cross the call"),
+-        "refusal must name the cursor, got: {error}"
+-    );
++    let spv =
++        emit_vulkan_spirv(&external_helper).expect("a defined helper must keep checked bounds");
++    let module = load_bytes(&spv).expect("load external helper spv");
++    assert_physical_memory_bytes(&module, 4, 16, true);
+ 
+     // The refusal is narrow: the same placeholder handed to a helper that never dereferences it is
+     // not a loss, and that module still emits with its own store reaching the buffer.
+diff --git a/src/native/inline_cursor_tests.rs b/src/native/inline_cursor_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/src/native/inline_cursor_tests.rs
+@@ -0,0 +1,74 @@
++use super::{inline_cursor_call_sites, inline_nonrecursive_internal_calls};
++use std::collections::HashSet;
++
++#[test]
++fn cursor_repair_inlines_only_selected_calls_and_keeps_exported_definition() {
++    let source = r#"
++define void @entry(ptr addrspace(1) %buffer, i64 %index) {
++entry:
++  %cursor = getelementptr i32, ptr addrspace(1) %buffer, i64 %index
++  call void @writer(ptr addrspace(1) %cursor)
++  call void @writer(ptr addrspace(1) %buffer)
++  ret void
++}
++define void @writer(ptr addrspace(1) %destination) {
++entry:
++  store i32 37, ptr addrspace(1) %destination, align 4
++  ret void
++}
++"#;
++    assert_eq!(inline_nonrecursive_internal_calls(source), source);
++    let sites = HashSet::from([("writer".into(), "%cursor".into())]);
++    let result = inline_cursor_call_sites(source, &sites).expect("defined helper is spliceable");
++    assert!(!result.contains("call void @writer(ptr addrspace(1) %cursor)"));
++    assert!(result.contains("store i32 37, ptr addrspace(1) %cursor"));
++    assert!(result.contains("call void @writer(ptr addrspace(1) %buffer)"));
++    assert!(result.contains("define void @writer"));
++    assert!(inline_cursor_call_sites(&result, &sites).is_none());
++    let unrelated_cycle = format!(
++        "{source}\ndefine void @cycle() {{\nentry:\n  call void @cycle()\n  ret void\n}}\n"
++    );
++    assert!(inline_cursor_call_sites(&unrelated_cycle, &sites).is_some());
++}
++
++#[test]
++fn cursor_repair_does_not_inline_a_declaration() {
++    let source = r#"
++define void @entry(ptr addrspace(1) %cursor) {
++entry:
++  call void @writer(ptr addrspace(1) %cursor)
++  ret void
++}
++declare void @writer(ptr addrspace(1))
++"#;
++    let sites = HashSet::from([("writer".into(), "%cursor".into())]);
++    assert!(inline_cursor_call_sites(source, &sites).is_none());
++}
++
++#[test]
++fn cursor_repair_rejects_cycles_through_unselected_definitions() {
++    let source = r#"
++define void @entry(ptr addrspace(1) %cursor) {
++entry:
++  call void @writer(ptr addrspace(1) %cursor)
++  ret void
++}
++define void @writer(ptr addrspace(1) %destination) {
++entry:
++  call void @relay(ptr addrspace(1) %destination)
++  ret void
++}
++define internal void @relay(ptr addrspace(1) %p) {
++entry:
++  call void @writer(ptr addrspace(1) %p)
++  ret void
++}
++"#;
++    let sites = HashSet::from([("writer".into(), "%cursor".into())]);
++    assert!(inline_cursor_call_sites(source, &sites).is_none());
++    let recursive = source.replace(
++        "@relay(ptr addrspace(1) %destination)",
++        "@writer(ptr addrspace(1) %destination)",
++    );
++    assert!(inline_cursor_call_sites(&recursive, &sites).is_none());
++}

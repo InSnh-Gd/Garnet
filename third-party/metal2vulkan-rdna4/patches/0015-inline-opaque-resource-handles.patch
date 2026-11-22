@@ -1,0 +1,64 @@
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -342,7 +342,11 @@
+                     if !matches!(instruction.result_ty, Some(LlType::Ptr(1 | 2)))
+                         || !matches!(
+                             instruction.opcode.as_str(),
+-                            "bitcast" | "freeze" | "phi" | "select"
++                            "bitcast"
++                                | "freeze"
++                                | "phi"
++                                | "select"
++                                | "metal2vulkan.inline_parameter"
+                         )
+                     {
+                         continue;
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -890,17 +890,22 @@
+ 
+ declare void @air.gather_depth_probe(ptr addrspace(1))
+ "#;
+-    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse mixed argument buffer");
++    let mut parsed = crate::native::ir::LlModule::parse(ll).expect("parse mixed argument buffer");
+     assert!(crate::native::emit_tiers::requires_device_address_model(
+         &parsed
+     ));
+ 
+-    let opaque =
+-        crate::native::emitter::functions::opaque_resource_pointer_values_by_function(&parsed);
+-    let kernel = opaque.get("k").expect("kernel pointer classification");
+-    assert!(kernel.contains("%texture"), "{opaque:?}");
+-    assert!(!kernel.contains("%buffer"));
+-    assert!(!kernel.contains("%element"));
++    for inline in [false, true] {
++        if inline {
++            parsed.inline_ordinary_leaf_helpers();
++        }
++        let opaque =
++            crate::native::emitter::functions::opaque_resource_pointer_values_by_function(&parsed);
++        let kernel = opaque.get("k").expect("kernel pointer classification");
++        assert!(kernel.contains("%texture"), "inline={inline}: {opaque:?}");
++        assert!(!kernel.contains("%buffer"));
++        assert!(!kernel.contains("%element"));
++    }
+ }
+ 
+ #[test]
+diff --git a/docs/REFLECTION.md b/docs/REFLECTION.md
+--- a/docs/REFLECTION.md
++++ b/docs/REFLECTION.md
+@@ -90,7 +90,10 @@
+ table; categories 0, 1, 2 denote runtime sampled-image, storage-image and sampler arrays
+ at binding 0 of sets 2, 3, 4. The first six table words contain each category's
+ `(word_offset, count)`, followed by sorted low/high token pairs. Descriptor index 0 is
+-reserved for a dummy. Tokens are opaque identifiers, never GPU addresses. The shader
++reserved for a null image or a default sampler. Image consumers enable Vulkan
++`nullDescriptor` and bind `VK_NULL_HANDLE` at image index 0, so sample/gather reads
++return zero across image shapes without adding divergent control flow around
++implicit derivatives. Tokens are opaque identifiers, never GPU addresses. The shader
+ loads them through its actual record/pointer graph, so this contract has no raw root
+ descriptors. Consumers must bind these additional resources and enable the corresponding
+ descriptor-indexing features. Unknown graph operations return an error. Flat resources

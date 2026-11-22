@@ -1,0 +1,167 @@
+diff --git a/src/meta/embedded.rs b/src/meta/embedded.rs
+index 09668ea3..f9311db1 100644
+--- a/src/meta/embedded.rs
++++ b/src/meta/embedded.rs
+@@ -206,10 +206,15 @@ pub(super) fn detect_embedded_arguments(
+         .flat_map(|(buffer_param_index, buffer_index, sref)| {
+             embedded_argument_members(nodes, sref)
+                 .into_iter()
+-                // Flat members only. A wrapped `air.buffer` is a device address a consumer has to
+-                // write into the owning argument buffer, and nothing binds one yet, so it stays a
+-                // refusal reason in `unsurfaced_embedded_resources` rather than a silent descriptor.
+-                .filter(|member| member.depth == 0)
++                .filter(|member| {
++                    member.depth == 0
++                        || (!member.in_array_wrapper
++                            && nodes.get(&member.node_ref).is_some_and(|node| {
++                                role_strings(node).iter().any(|role| {
++                                    matches!(role.as_str(), "buffer" | "indirect_constant")
++                                })
++                            }))
++                })
+                 .flat_map(move |member| {
+                     let node = nodes.get(&member.node_ref);
+                     let is_buffer = node
+@@ -218,9 +223,8 @@ pub(super) fn detect_embedded_arguments(
+                     // element, at consecutive argument ids and consecutive 8-byte slots, and states
+                     // its length only in the member tuple. A consumer given the first element alone
+                     // leaves every later slot of the argument buffer unwritten, so a runtime index
+-                    // into the member reads a device address nothing ever populated. Only the
+-                    // handle roles repeat this way: `air.indirect_constant` is stored INLINE, so its
+-                    // array is one span of data rather than N resources.
++                    // into the member reads a device address nothing ever populated. Inline
++                    // constants repeat too, using the AIR element size instead of a handle stride.
+                     let elements = match node {
+                         // A texture array is already counted ONCE, by
+                         // `EmbeddedTexture::array_length`, and every consumer derives its elements
+@@ -228,8 +232,21 @@ pub(super) fn detect_embedded_arguments(
+                         // for no reader, and 512 entries wide in the corpus's largest atlas.
+                         Some(node) if expressible_embedded_texture(&member, node).is_some() => 1,
+                         Some(node) if member.repeats_a_handle(node) => member.array_len,
++                        Some(node)
++                            if member.array_len > 1
++                                && role_strings(node)
++                                    .iter()
++                                    .any(|role| role == "indirect_constant") =>
++                        {
++                            member.array_len
++                        }
+                         _ => 1,
+                     };
++                    let stride = if node.is_some_and(|node| member.repeats_a_handle(node)) {
++                        HANDLE_BYTES
++                    } else {
++                        member.element_size
++                    };
+                     (0..elements).filter_map(move |element| {
+                         let node = node?;
+                         let argument_index = member.argument_index(node).checked_add(element)?;
+@@ -239,7 +256,7 @@ pub(super) fn detect_embedded_arguments(
+                             field_ordinal: member.field_ordinal,
+                             field_offset: member
+                                 .field_offset
+-                                .checked_add(element.checked_mul(HANDLE_BYTES)?)?,
++                                .checked_add(element.checked_mul(stride)?)?,
+                             argument_index,
+                             resource_buffer_index: is_buffer.then_some(argument_index),
+                             resource_address_space: is_buffer
+@@ -278,8 +295,9 @@ const EMBEDDED_RESOURCE_ROLES: &[&str] = &[
+ ///
+ /// Metal lets an argument-buffer member be a user struct that itself holds a texture, sampler or
+ /// buffer -- `struct texture2d_wrapper { texture2d<half> t; };` as one member. A wrapped texture is
+-/// surfaced like a flat one, at the argument id [`ArgumentMember::argument_index`] derives; anything
+-/// else wrapped -- a buffer, a sampler, a function table, or any member of a wrapper declared as an
++/// or buffer is surfaced like a flat one, at the argument id
++/// [`ArgumentMember::argument_index`] derives; anything
++/// else wrapped -- a sampler, a function table, or any member of a wrapper declared as an
+ /// ARRAY of structs -- has no descriptor. Nor does a flat `air.texture` whose access class the
+ /// read/write lowerings cannot express.
+ ///
+@@ -311,6 +329,9 @@ pub(super) fn unsurfaced_embedded_resources(
+                 continue;
+             };
+             let offset = member.field_offset;
++            if role == "buffer" && !member.in_array_wrapper {
++                continue;
++            }
+             match (member.depth, role.as_str()) {
+                 (0, "texture") => out.push(format!(
+                     "argument buffer parameter {buffer_param_index} holds an air.texture at byte \
+@@ -352,6 +373,8 @@ struct ArgumentMember {
+     /// a single handle. This is a third, independent statement of a descriptor-array length -- see
+     /// [`expressible_embedded_texture`] for why the type name cannot answer it.
+     array_len: u32,
++    /// AIR's byte size of one inline array element, independent of its argument id.
++    element_size: u32,
+ }
+ 
+ impl ArgumentMember {
+@@ -452,6 +475,7 @@ fn collect_argument_members(
+                         depth: enclosing.depth,
+                         in_array_wrapper: enclosing.in_array_wrapper,
+                         array_len: member.array_len,
++                        element_size: member.size,
+                     });
+                 }
+             }
+@@ -594,7 +618,14 @@ mod tests {
+             .collect::<Vec<_>>();
+         assert_eq!(
+             coordinates,
+-            vec![(0, 12, Some(12)), (8, 13, Some(13)), (16, 14, None)]
++            vec![
++                (0, 12, Some(12)),
++                (8, 13, Some(13)),
++                (16, 14, None),
++                (20, 15, None),
++                (24, 16, None),
++                (28, 17, None)
++            ]
+         );
+     }
+ 
+@@ -695,11 +726,9 @@ mod tests {
+         );
+     }
+ 
+-    /// A wrapped `air.buffer` is a device address a consumer has to write into the owning argument
+-    /// buffer, and nothing binds one, so it is named as unsurfaced rather than becoming a silent
+-    /// `EmbeddedArgument` beside the flat members.
++    /// Wrapped buffers use the same physical address representation as flat buffers.
+     #[test]
+-    fn a_wrapped_buffer_is_named_unsurfaced_and_is_not_an_embedded_argument() {
++    fn a_wrapped_buffer_keeps_its_absolute_offset_and_summed_argument_id() {
+         let nodes = HashMap::from([
+             (
+                 10_u32,
+@@ -724,16 +753,21 @@ mod tests {
+                 .iter()
+                 .map(|argument| (argument.field_offset, argument.resource_buffer_index))
+                 .collect::<Vec<_>>(),
+-            vec![(24, Some(7))],
+-        );
+-        assert_eq!(
+-            unsurfaced_embedded_resources(&nodes, &buffers),
+-            vec![
+-                "argument buffer parameter 0 holds an air.buffer at byte offset 16 inside a nested \
+-                 struct member"
+-                    .to_string()
+-            ],
++            vec![(16, Some(5)), (24, Some(7))],
+         );
++        assert!(unsurfaced_embedded_resources(&nodes, &buffers).is_empty());
++    }
++
++    #[test]
++    fn an_array_of_structs_containing_buffers_stays_unsurfaced() {
++        let nodes = HashMap::from([
++            (10, r#"!"air.struct_type_info", !11, i32 0, i32 8, i32 2, !"Wrapper", !"items", !"air.indirect_argument", i32 5"#.to_string()),
++            (11, r#"i32 0, i32 8, i32 0, !"uint", !"pointer", !"air.indirect_argument", !12"#.to_string()),
++            (12, r#"i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.address_space", i32 1"#.to_string()),
++        ]);
++        let buffers = ArgumentBuffers::new(vec![(0, 3, 10)]);
++        assert!(detect_embedded_arguments(&nodes, &buffers).is_empty());
++        assert_eq!(unsurfaced_embedded_resources(&nodes, &buffers).len(), 1);
+     }
+ 
+     /// A nested struct with no `air.indirect_argument` suffix is an inline value, not a wrapped

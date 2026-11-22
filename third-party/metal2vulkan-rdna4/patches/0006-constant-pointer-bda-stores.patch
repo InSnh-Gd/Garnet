@@ -1,0 +1,157 @@
+From: RDNA4 local integration
+Subject: [PATCH] Preserve constant-space addresses and encoded resource copies
+
+Select physical addressing for reconstructed constant-space memory pointers,
+including constant offsets and helper consumers, using the same structural
+memory-use test as device-space pointers. Texture/sampler operations alone and
+null comparisons keep their existing address model. Handle both address spaces
+when storing raw or typed 64-bit pointer payloads.
+
+This fixes raw store for Ptr(2) for device argument-buffer copies mixed with
+constant-pointer offset/read/writeback. Thread/constexpr sampler stores still
+have no device payload and remain rejected. GPU token-to-descriptor consumption
+is separate.
+
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -1760,11 +1760,9 @@
+                         }
+                     }
+                 }
+-                // BDA mode: storing a DEVICE pointer VALUE (`store ptr addrspace(1) %p, %dst`) is a
+-                // verbatim 8-byte copy of the loaded address. `%p` is tracked as a device-address
+-                // offset (no plain value id); materialize its 64-bit address and store it as an
+-                // `Int(64)` word at the target offset. Byte-exact (the exact loaded address bits).
+-                if self.bda_device_pointers && matches!(object.ty, LlType::Ptr(1)) {
++                // Device and constant-space pointers share the same 64-bit payload. Copying a
++                // constant-space pointer (including an encoded sampler) must preserve both words.
++                if self.bda_device_pointers && matches!(object.ty, LlType::Ptr(1 | 2)) {
+                     if let LlValue::Local(obj_name) = &object.value {
+                         if let Some(src) = self.raw_offsets.get(obj_name).cloned() {
+                             if src.device_addr_base.is_some() {
+@@ -1841,7 +1839,9 @@
+         if let Some(pointee) = self.pointer_pointee_for_value(&ptr.value)? {
+             let pointee = self.resolve_type(&pointee)?;
+             let object_ty = self.resolve_type(&object.ty)?;
+-            if self.bda_device_pointers && pointee == LlType::Int(64) && object_ty == LlType::Ptr(1)
++            if self.bda_device_pointers
++                && pointee == LlType::Int(64)
++                && matches!(object_ty, LlType::Ptr(1 | 2))
+             {
+                 if let LlValue::Local(object_name) = &object.value {
+                     let address = if let Some(address) =
+diff --git a/src/native/emit_tiers.rs b/src/native/emit_tiers.rs
+--- a/src/native/emit_tiers.rs
++++ b/src/native/emit_tiers.rs
+@@ -1077,7 +1077,7 @@
+     let mut address_consuming_params = HashSet::<(String, usize)>::new();
+     for function in &parsed.functions {
+         for (index, (param, ty)) in function.params.iter().enumerate() {
+-            if !matches!(ty, LlType::Ptr(1)) {
++            if !matches!(ty, LlType::Ptr(1 | 2)) {
+                 continue;
+             }
+             let consumed = function.carrier_insts().any(|inst| {
+@@ -1224,13 +1224,12 @@
+                 _ => None,
+             })
+             .collect::<HashSet<_>>();
+-        // Pointer payloads loaded from a constant argument buffer remain byte values unless they
+-        // cross a helper/atomic ABI boundary that consumes them as device addresses. Keep that
+-        // distinction explicit: direct null/payload comparisons retain their logical raw lowering,
+-        // while helper-connected memory pointers select BDA before either function is emitted.
++        // Both device and constant pointers loaded from an argument buffer are addresses when
++        // dereferenced or offset. Opaque resource handles used only by AIR texture calls and plain
++        // null comparisons remain payloads and do not select the physical address model.
+         let mut argument_buffer_addresses = function
+             .carrier_insts()
+-            .filter(|inst| matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1))))
++            .filter(|inst| matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1 | 2))))
+             .filter(|inst| {
+                 inst.load()
+                     .as_deref()
+@@ -1246,7 +1245,7 @@
+                     continue;
+                 };
+                 if argument_buffer_addresses.contains(result)
+-                    || !matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1)))
++                    || !matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1 | 2)))
+                 {
+                     continue;
+                 }
+@@ -1355,7 +1354,7 @@
+         let mut addresses = function
+             .carrier_insts()
+             .filter(|inst| {
+-                matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1)))
++                matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1 | 2)))
+                     || (matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(0)))
+                         && inst
+                             .result
+@@ -1369,7 +1368,7 @@
+                     // seed only when the entry metadata declares the array contract; ordinary
+                     // local pointer staging must remain in the logical address model.
+                     return inst.load().as_deref().is_some_and(|load| {
+-                        matches!(load.ptr.ty, LlType::Ptr(1)) || has_device_buffer_array
++                        matches!(load.ptr.ty, LlType::Ptr(1 | 2)) || has_device_buffer_array
+                     });
+                 }
+                 if inst.opcode != "inttoptr" {
+@@ -1402,10 +1401,7 @@
+                     continue;
+                 };
+                 if addresses.contains(result)
+-                    || !matches!(
+-                        inst.result_ty.as_ref(),
+-                        Some(LlType::Ptr(0) | LlType::Ptr(1))
+-                    )
++                    || !matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(0..=2)))
+                 {
+                     continue;
+                 }
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -5987,7 +5987,7 @@
+ }
+ 
+ #[test]
+-fn native_unmodeled_gep_to_pointer_field_uses_byte_placeholder() {
++fn native_constant_pointer_field_preserves_its_address_and_loaded_value() {
+     let ll = r#"
+ target triple = "spirv-unknown-vulkan1.2"
+ %Header = type { i64, ptr addrspace(2) }
+@@ -6001,9 +6001,30 @@
+   ret i32 %v
+ }
+ "#;
+-    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+-    assert!(asm.contains("OpVariable"), "{asm}");
++    let spv = emit_vulkan_spirv(ll).expect("native emit");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(
++        asm.contains("OpMemoryModel PhysicalStorageBuffer64"),
++        "{asm}"
++    );
++    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+     assert!(!asm.contains("_ptr_Private__ptr_"), "{asm}");
++    let module = load_bytes(&spv).expect("load spv");
++    let returned = module
++        .all_inst_iter()
++        .find(|inst| inst.class.opcode == Op::ReturnValue)
++        .and_then(|inst| inst.operands.first())
++        .and_then(|operand| match operand {
++            Operand::IdRef(id) => Some(*id),
++            _ => None,
++        })
++        .expect("returned value");
++    assert!(
++        module
++            .all_inst_iter()
++            .any(|inst| { inst.class.opcode == Op::Load && inst.result_id == Some(returned) }),
++        "constant-pointer read was replaced by a placeholder:\n{asm}"
++    );
+ }
+ 
+ #[test]
