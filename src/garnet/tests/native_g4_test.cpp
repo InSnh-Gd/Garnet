@@ -429,7 +429,7 @@ static void t8_pins(const std::string &root) {
                            "if (action > 82 && !rdna4disp::action_admitted(rdna4disp_latched_on(), action)) return kIOReturnBadArgument;" }),
            "T8: the user client lets 104 past the old action bound only with the role on");
     expect(slurp(K + "src/GarnetUserClient.cpp").find("kIOClientPrivilegeAdministrator") != std::string::npos, "T8: the verb's user client is the root-only legacy client");
-    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat\\n") != std::string::npos &&
+    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat bartest\\n") != std::string::npos &&
            cmd.find("appallow add <name>/remove <name>/list/strikes]") != std::string::npos, "T8: rdna4test: the table line, the name, the known list and the usage");
     expect(cmd.find("rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2))") != std::string::npos && cmd.find("rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0)") != std::string::npos && cmd.find("GarnetAppKey.h") != std::string::npos, "T8: garnettest hashes the name with the kext's own function");
     expect(g4p.find("#include \"../GarnetAppKey.h\"") != std::string::npos && cli.find("#include \"GarnetAppKey.h\"") != std::string::npos, "T8: kext and CLI share one key header");
