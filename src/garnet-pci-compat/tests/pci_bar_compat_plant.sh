@@ -111,5 +111,39 @@ plant 6 "removed late-load refusal" \
         return CompatStatus::kLateLoad;
     }'
 
+plant 7 "removed interior &r->end / size==0 sentinel stop (OOB past 0x80 IOPCIRange)" \
+    '                if (!allocHead || allocHead == sentinel) {
+                    if (gap_fits_aligned(winStart, end, requiredSize)) return true;
+                } else {
+                    uint64_t cursor = winStart;
+                    const void *sub = allocHead;
+                    bool hitZeroSize = false;
+                    uint32_t aCount = 0;
+                    for (; aCount < kMaxRangeNodes && sub != nullptr && sub != sentinel; ++aCount) {
+                        const uint8_t *s = static_cast<const uint8_t *>(sub);
+                        const uint64_t sStart = read_unaligned<uint64_t>(s + kOffRangeStart);
+                        const uint64_t sSize = read_unaligned<uint64_t>(s + kOffRangeSize);
+                        // Stop before reading s + kOffRangeNextSub on interior sentinels (size == 0).
+                        if (sSize == 0ULL) {
+                            hitZeroSize = true;
+                            break;
+                        }' \
+    '                if (!allocHead) {
+                    (void)sentinel;
+                    if (gap_fits_aligned(winStart, end, requiredSize)) return true;
+                } else {
+                    uint64_t cursor = winStart;
+                    const void *sub = allocHead;
+                    bool hitZeroSize = false;
+                    uint32_t aCount = 0;
+                    for (; aCount < kMaxRangeNodes && sub != nullptr; ++aCount) {
+                        const uint8_t *s = static_cast<const uint8_t *>(sub);
+                        const uint64_t sStart = read_unaligned<uint64_t>(s + kOffRangeStart);
+                        const uint64_t sSize = read_unaligned<uint64_t>(s + kOffRangeSize);
+                        if (false && sSize == 0ULL) {
+                            hitZeroSize = true;
+                            break;
+                        }'
+
 printf 'pci_bar_compat_plant: %d cases run, %d escaped/failed\n' "$total" "$escaped"
 [ "$escaped" -eq 0 ]

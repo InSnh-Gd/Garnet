@@ -153,20 +153,21 @@ struct FakeRange {
     uint8_t type() const { return read_unaligned<uint8_t>(raw + 0x50u); }
     uint32_t flags() const { return read_unaligned<uint32_t>(raw + kOffRangeFlags); }
 
-    void setWindow(uint64_t s, uint64_t sz, FakeRange *nextRange = nullptr, FakeRange *allocs = nullptr) {
+    void setWindow(uint64_t s, uint64_t sz, FakeRange *nextRange = nullptr, void *allocs = nullptr) {
         std::memset(raw, 0, sizeof(raw));
         write_unaligned<uint64_t>(raw + kOffRangeStart, s);
         write_unaligned<uint64_t>(raw + kOffRangeSize, sz);
-        write_unaligned<uint64_t>(raw + 0x28u, s + sz);
+        write_unaligned<uint64_t>(raw + kOffRangeEnd, s + sz);
         write_unaligned<void *>(raw + kOffRangeNext, nextRange);
-        write_unaligned<void *>(raw + kOffRangeAllocations, allocs);
+        write_unaligned<void *>(raw + kOffRangeAllocations,
+                                allocs ? allocs : static_cast<void *>(raw + kOffRangeEnd));
     }
 
-    void setAlloc(uint64_t s, uint64_t sz, FakeRange *nextSub = nullptr) {
+    void setAlloc(uint64_t s, uint64_t sz, void *nextSub = nullptr) {
         std::memset(raw, 0, sizeof(raw));
         write_unaligned<uint64_t>(raw + kOffRangeStart, s);
         write_unaligned<uint64_t>(raw + kOffRangeSize, sz);
-        write_unaligned<uint64_t>(raw + 0x28u, s + sz);
+        write_unaligned<uint64_t>(raw + kOffRangeEnd, s + sz);
         write_unaligned<void *>(raw + kOffRangeNextSub, nextSub);
     }
 };
@@ -737,17 +738,60 @@ void test_bridge_pfm64_sufficiency_and_bounds() {
     CHECK(cnt.refusedBridgeCount == 3u);
 
     // 4. Fragmented by allocation [32 GiB, 33 GiB) inside [17.5 GiB, 48 GiB) -> refused!
+    // Terminates with Apple's real interior sentinel (&hbPfm.raw[kOffRangeEnd]).
     rig.initR9060XT16G();
     FakeRange alloc1;
-    alloc1.setAlloc(0x800000000ULL, 1ULL << 30);
+    alloc1.setAlloc(0x800000000ULL, 1ULL << 30, rig.hbPfm.raw + kOffRangeEnd);
     rig.hbPfm.setWindow(0x460000000ULL, 0x7A0000000ULL, nullptr, &alloc1); // ends at 48 GiB
     CHECK(!handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
     CHECK(cnt.refusedBridgeCount == 4u);
 
-    // 5. Same allocation but window ends at 64 GiB -> [48 GiB, 64 GiB) fits aligned 16 GiB!
+    // 5. Same allocation + Apple &hbPfm.end tail sentinel but window ends at 64 GiB -> fits [48 GiB, 64 GiB)!
     rig.hbPfm.setWindow(0x460000000ULL, 0xBA0000000ULL, nullptr, &alloc1); // ends at 64 GiB
     CHECK(handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
     CHECK(cnt.interceptCount == 1u);
+
+    // 5b. Exact 0x80-byte IOPCIRange with Apple interior &r->end sentinel (empty & trailing gap) + zero-size sub node:
+    // under ASan, reading r + kOffRangeEnd + kOffRangeNextSub (r + 0x88) traps immediately.
+    {
+        std::vector<uint8_t> exactObj(0x80u, 0u);
+        uint8_t *r = exactObj.data();
+        write_unaligned<uint64_t>(r + kOffRangeStart, 0x460000000ULL);
+        write_unaligned<uint64_t>(r + kOffRangeSize, 0xF8A0000000ULL);
+        write_unaligned<uint64_t>(r + kOffRangeEnd, 0x460000000ULL + 0xF8A0000000ULL);
+        write_unaligned<void *>(r + kOffRangeAllocations, r + kOffRangeEnd);
+        rig.hb.setBridgePfm(reinterpret_cast<FakeRange *>(r));
+        CHECK(check_root_pfm64_capacity(&rig.cfg, &rig.dev, 16ULL << 30));
+
+        // Non-empty alloc whose nextSub is a zero-size node inside an exact 0x10-byte buffer.
+        std::vector<uint8_t> zeroSub(0x10u, 0u);
+        FakeRange aExact;
+        aExact.setAlloc(0x800000000ULL, 1ULL << 30, zeroSub.data());
+        write_unaligned<void *>(r + kOffRangeAllocations, &aExact);
+        CHECK(check_root_pfm64_capacity(&rig.cfg, &rig.dev, 16ULL << 30));
+    }
+
+    // 5c. Null allocHead legacy fixture and null bar0Range / start64==mask64 guards.
+    {
+        rig.initR9060XT16G();
+        write_unaligned<void *>(rig.hbPfm.raw + kOffRangeAllocations, nullptr);
+        CHECK(check_root_pfm64_capacity(&rig.cfg, &rig.dev, 16ULL << 30));
+
+        const uint64_t prevIntercepts = cnt.interceptCount;
+        const uint64_t prevPassthroughs = cnt.passthroughCount;
+        rig.dev.setRangeSlot(0u, nullptr);
+        CHECK(!handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
+        CHECK(cnt.interceptCount == prevIntercepts);
+        CHECK(cnt.passthroughCount == prevPassthroughs + 1u);
+
+        rig.initR9060XT16G();
+        rig.pci.cfg[0x10 >> 2] = rig.pci.mask[0x10 >> 2];
+        rig.pci.cfg[0x14 >> 2] = rig.pci.mask[0x14 >> 2];
+        CHECK(handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
+        CHECK(cnt.interceptCount == prevIntercepts);
+        CHECK(cnt.passthroughCount == prevPassthroughs + 2u);
+        CHECK(rig.pci.ranges[0].proposedSize() == 0ULL);
+    }
 
     // 6. PFM null + MEM fallback >= 16 GiB -> accepted (matches Apple bridgeTotalResources).
     rig.initR9060XT16G();
