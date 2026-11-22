@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4CommandQueue / RDNA4CommandBuffer (10b). A shared scheduler advances only each logical queue's
 // head. Event positions split the Vulkan recording into ordered segments; each segment has its own fence.
-// Every segment boundary flushes IOSurface writes; a signal also makes them host-visible before its fence. A serial completion queue
-// waits the fence in 2 s slices, signals that segment's events on success, and calls
-// commandBufferDidComplete:startTime:completionTime:error: only after the terminal segment.
+// Every segment boundary flushes IOSurface writes; a signal also makes them host-visible before its fence. A concurrent waiter queue
+// waits each fence in 2 s slices without blocking the serial completion queue, which then signals that segment's events on success and
+// calls commandBufferDidComplete:startTime:completionTime:error: only after the terminal segment.
 // 11e: the command buffer owns the bytes upload ring and non-resource command
 // state. Each Vulkan command segment owns its descriptor pools and the strong
 // resource snapshots encoded into that segment; both are released at that
@@ -169,7 +169,6 @@ static rdna4crc_rec_t *rdna4s_crc_check(RDNA4Texture *dt, int slot, uint64_t seq
 - (void)rdna4TerminalSuccessWithQueue:(RDNA4CommandQueue *)queue;
 - (void)rdna4TerminalFailure:(NSError *)err queue:(RDNA4CommandQueue *)queue unresolved:(BOOL)unresolved fault:(VkResult)fault;
 - (void)rdna4FenceWait:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue;
-- (void)rdna4FencePoll:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue t1:(uint64_t)t1 elapsedMs:(uint64_t)elapsedMs polls:(int)polls;
 - (void)rdna4FenceDone:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue r:(VkResult)r t1:(uint64_t)t1 slices:(int)slices delivered:(BOOL)delivered werr:(NSError *)werr;
 - (uint64_t)rdna4TBegin;
 - (BOOL)rdna4IsFrame;

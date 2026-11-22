@@ -1,3 +1,36 @@
+#include "rdna4_fencewait.h"
+_Static_assert((int)VK_TIMEOUT == RDNA4FW_TIMEOUT, "VK_TIMEOUT == RDNA4FW_TIMEOUT");
+
+typedef struct {
+    VkFence fence;
+    uint64_t cbid;
+    uint64_t t1;
+} rdna4_fence_wait_ctx;
+
+static dispatch_queue_t rdna4_fence_wait_queue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INTERACTIVE, 0);
+        queue = dispatch_queue_create("rdna4.fence-wait", attr);
+    });
+    return queue;
+}
+
+static int rdna4_fence_wait_slice(void *ctx, uint64_t timeoutNs) {
+    rdna4_fence_wait_ctx *w = (rdna4_fence_wait_ctx *)ctx;
+    return (int)vkWaitForFences(RDNA4R.dev, 1, &w->fence, VK_TRUE, timeoutNs);
+}
+
+static void rdna4_fence_wait_pending(void *ctx, int slices) {
+    const rdna4_fence_wait_ctx *w = (const rdna4_fence_wait_ctx *)ctx;
+    const uint64_t now = rdna4_now();
+    const uint64_t elapsedMs = now > w->t1 ? (now - w->t1) / 1000000ULL : 0ULL;
+    RDNA4LOG("FENCE PENDING: command buffer %llu has not completed after %llu ms (%d slice(s))",
+             (unsigned long long)w->cbid, (unsigned long long)elapsedMs, slices);
+}
+
 @implementation RDNA4CommandBuffer
 - (BOOL)rdna4IOFirstTouch:(RDNA4Texture *)t {
     RDNA4Texture *backing = [t rootResource];
@@ -991,7 +1024,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (r != VK_SUCCESS && !werr)
         werr = rdna4_err(54, [NSString stringWithFormat:@"the GPU fence = %d%s", r, r == VK_ERROR_DEVICE_LOST ? " (DEVICE_LOST)" : r == VK_TIMEOUT ? " (TIMEOUT: HUNG?)" : ""]);
     { uint64_t tg_ = rdna4_now() - t1; rdna4t_add(&T1.gpu, tg_); if (self->_frame) rdna4t_add(&T1.fgpu, tg_); }
-    RDNA4LOGR("segment fence wait done = %d after %d poll(s)", r, slices);
+    RDNA4LOGR("segment fence wait done = %d after %d slice(s)", r, slices);
     BOOL terminal = NO;
     BOOL terminalClaimed = NO;
     pthread_mutex_lock(&self->_smu);
@@ -1025,32 +1058,9 @@ RDNA4_DNR(RDNA4CommandBuffer)
     }
     if (terminalClaimed) [self rdna4DeliverTerminalFailure:werr queue:queue unresolved:YES fault:r];
 }
-// Production wait: POLL the fence instead of blocking the completion queue on it.
-// One blocked fence used to stop every later completion from being delivered (the
-// queue is serial), so WindowServer sat in -waitUntilCompleted on a command buffer
-// whose completion was queued behind a stuck one: that is the frozen picture that
-// recovers by itself after tens of seconds. Polling keeps the queue free; the budget
-// (60 s) and the fail-closed result are the blocking loop's.
-- (void)rdna4FencePoll:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue t1:(uint64_t)t1 elapsedMs:(uint64_t)elapsedMs polls:(int)polls {
-    const VkResult r = vkGetFenceStatus(RDNA4R.dev, segment->fence);
-    if (r == VK_NOT_READY) {
-        if (elapsedMs >= 60000ull) {
-            RDNA4LOG("FENCE STALL: command buffer %llu: the GPU fence did not signal within %llu ms (%d polls); failing this submission",
-                     (unsigned long long)_cbid, (unsigned long long)elapsedMs, polls);
-            [self rdna4FenceDone:segment queue:queue r:VK_TIMEOUT t1:t1 slices:polls delivered:NO werr:nil];
-            return;
-        }
-        // 2 ms while the GPU is normally a few ms behind, 20 ms once it is clearly late.
-        const uint64_t waitMs = elapsedMs < 2000ull ? 2ull : (elapsedMs < 10000ull ? 10ull : 20ull);
-        if (polls == 100 || polls == 1000)   // 200 ms and ~4 s: the first poll is normal, a late one is the diagnosis
-            RDNA4LOG("FENCE PENDING: command buffer %llu has not completed after %llu ms (%d polls)", (unsigned long long)_cbid, (unsigned long long)elapsedMs, polls);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)waitMs * NSEC_PER_MSEC), [queue rdna4CompletionQueue], ^{
-            [self rdna4FencePoll:segment queue:queue t1:t1 elapsedMs:elapsedMs + waitMs polls:polls + 1];
-        });
-        return;
-    }
-    [self rdna4FenceDone:segment queue:queue r:r t1:t1 slices:polls delivered:NO werr:nil];
-}
+// Production wait: run bounded vkWaitForFences slices on a concurrent waiter queue
+// so a stuck fence never blocks the serial completion queue or other queues, and
+// normal completions wake immediately from kernel n1c_wait (no 2 ms timer floor).
 - (void)rdna4FenceWait:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue {
     static _Atomic int testUsed;
     static long testMs = -1;
@@ -1059,10 +1069,33 @@ RDNA4_DNR(RDNA4CommandBuffer)
     long tms = testMs;
     uint64_t t1 = _readyTime;
     uint64_t tenq = rdna4_now();
-    if (!testWait) {   // production: never hold the completion queue while waiting
-        dispatch_async([queue rdna4CompletionQueue], ^{
+    if (!testWait) {
+        dispatch_queue_t completionQueue = [queue rdna4CompletionQueue];
+        const rdna4_fence_wait_ctx waitCtx = { .fence = segment->fence, .cbid = _cbid, .t1 = t1 };
+        // Transfer +1 refs to completionQueue so the waiter thread never retains or
+        // deallocates self/segment/queue after handoff.
+        CFTypeRef cbRef = CFBridgingRetain(self);
+        CFTypeRef segRef = CFBridgingRetain(segment);
+        CFTypeRef qRef = CFBridgingRetain(queue);
+        dispatch_async(rdna4_fence_wait_queue(), ^{
             rdna4t_add(&T1.wake, rdna4_now() - tenq);
-            [self rdna4FencePoll:segment queue:queue t1:t1 elapsedMs:0 polls:1];
+            rdna4_fence_wait_ctx ctx = waitCtx;
+            int slices = 0;
+            const VkResult r = (VkResult)rdna4fw_wait_bounded(
+                rdna4_fence_wait_slice, &ctx, 0, RDNA4FW_MAX_SLICES, RDNA4FW_SLICE_NS,
+                rdna4_fence_wait_pending, &slices);
+            if (r == VK_TIMEOUT) {
+                const uint64_t now = rdna4_now();
+                const uint64_t elapsedMs = now > t1 ? (now - t1) / 1000000ULL : 0ULL;
+                RDNA4LOG("FENCE STALL: command buffer %llu: the GPU fence did not signal within %llu ms (%d slice(s)); failing this submission",
+                         (unsigned long long)ctx.cbid, (unsigned long long)elapsedMs, slices);
+            }
+            dispatch_async(completionQueue, ^{
+                RDNA4CommandBuffer *cb = (__bridge_transfer RDNA4CommandBuffer *)cbRef;
+                RDNA4CommandSegment *seg = (__bridge_transfer RDNA4CommandSegment *)segRef;
+                RDNA4CommandQueue *q = (__bridge_transfer RDNA4CommandQueue *)qRef;
+                [cb rdna4FenceDone:seg queue:q r:r t1:t1 slices:slices delivered:NO werr:nil];
+            });
         });
         return;
     }
@@ -1079,9 +1112,11 @@ RDNA4_DNR(RDNA4CommandBuffer)
             RDNA4LOG("TEST_TIMEOUT: commandBufferDidComplete(error) sent; still waiting the fence before release");
             delivered = YES;
         }
-        while (r == VK_TIMEOUT && slices < 30) {
-            r = vkWaitForFences(RDNA4R.dev, 1, &segment->fence, VK_TRUE, 2000000000ULL);
-            slices++;
+        if (r == VK_TIMEOUT) {
+            rdna4_fence_wait_ctx ctx = { .fence = segment->fence, .cbid = self->_cbid, .t1 = t1 };
+            r = (VkResult)rdna4fw_wait_bounded(
+                rdna4_fence_wait_slice, &ctx, slices, RDNA4FW_MAX_SLICES, RDNA4FW_SLICE_NS,
+                NULL, &slices);
         }
         [self rdna4FenceDone:segment queue:queue r:r t1:t1 slices:slices delivered:delivered werr:werr];
     });
