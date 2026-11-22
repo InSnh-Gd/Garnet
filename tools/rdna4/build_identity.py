@@ -22,6 +22,9 @@ GARNET_EXECUTABLE = "Garnet"
 ACCEL_KEXT = "GarnetAccel.kext"
 ACCEL_ID = "org.garnet.accel"
 ACCEL_EXECUTABLE = "GarnetAccel"
+PCIBARCOMPAT_KEXT = "GarnetPCIBarCompat.kext"
+PCIBARCOMPAT_ID = "org.garnet.pcibarcompat"
+PCIBARCOMPAT_EXECUTABLE = "GarnetPCIBarCompat"
 DELIVERY_FORMAT = "garnet-delivery-v1"
 LEGACY_IDENTITY_TOKENS = (
     b"AMDRadeonRDNA4",
@@ -387,6 +390,16 @@ def command_accel(args):
     )
 
 
+def command_pcibarcompat(args):
+    verify_standalone_kext(
+        args.kext,
+        PCIBARCOMPAT_KEXT,
+        PCIBARCOMPAT_ID,
+        PCIBARCOMPAT_EXECUTABLE,
+        "pcibarcompat",
+    )
+
+
 def command_input(args):
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", args.label):
         raise IdentityError("input label must be uppercase KEY: {!r}".format(args.label))
@@ -437,43 +450,64 @@ def command_input(args):
         print("{}.{}={}".format(args.label, key, value))
 
 
+def _append_manifest_kext(
+    values, expected_ids, standalone_keys, sha_keys, prefix, out_prefix, expected_id, identity
+):
+    values["{}_BUNDLE_ID".format(out_prefix)] = identity.get("{}.identifier".format(prefix), "")
+    values["{}_VERSION".format(out_prefix)] = identity.get("{}.version".format(prefix), "")
+    values["{}_EXECUTABLE_SHA256".format(out_prefix)] = identity.get(
+        "{}.executable_sha256".format(prefix), ""
+    )
+    values["{}_INFO_SHA256".format(out_prefix)] = identity.get(
+        "{}.info_plist_sha256".format(prefix), ""
+    )
+    values["{}_STANDALONE".format(out_prefix)] = identity.get("{}.standalone".format(prefix), "")
+    expected_ids["{}_BUNDLE_ID".format(out_prefix)] = expected_id
+    standalone_keys.append("{}_STANDALONE".format(out_prefix))
+    sha_keys.extend(
+        ["{}_EXECUTABLE_SHA256".format(out_prefix), "{}_INFO_SHA256".format(out_prefix)]
+    )
+
+
 def command_manifest(args):
     garnet = read_identity_values(Path(args.garnet_identity).resolve())
     accel = read_identity_values(Path(args.accel_identity).resolve())
-    values = {
-        "FORMAT": DELIVERY_FORMAT,
-        "GARNET_BUNDLE_ID": garnet.get("garnet.identifier", ""),
-        "GARNET_VERSION": garnet.get("garnet.version", ""),
-        "GARNET_EXECUTABLE_SHA256": garnet.get("garnet.executable_sha256", ""),
-        "GARNET_INFO_SHA256": garnet.get("garnet.info_plist_sha256", ""),
-        "GARNET_STANDALONE": garnet.get("garnet.standalone", ""),
-        "ACCEL_BUNDLE_ID": accel.get("accel.identifier", ""),
-        "ACCEL_VERSION": accel.get("accel.version", ""),
-        "ACCEL_EXECUTABLE_SHA256": accel.get("accel.executable_sha256", ""),
-        "ACCEL_INFO_SHA256": accel.get("accel.info_plist_sha256", ""),
-        "ACCEL_STANDALONE": accel.get("accel.standalone", ""),
-    }
+    values = {"FORMAT": DELIVERY_FORMAT}
+    expected_ids = {}
+    standalone_keys = []
+    sha_keys = []
+    _append_manifest_kext(
+        values, expected_ids, standalone_keys, sha_keys, "garnet", "GARNET", GARNET_ID, garnet
+    )
+    _append_manifest_kext(
+        values, expected_ids, standalone_keys, sha_keys, "accel", "ACCEL", ACCEL_ID, accel
+    )
+    if args.pcibarcompat_identity is not None:
+        if not args.pcibarcompat_identity:
+            raise IdentityError("delivery manifest pcibarcompat identity path is empty")
+        pcibar = read_identity_values(Path(args.pcibarcompat_identity).resolve())
+        _append_manifest_kext(
+            values,
+            expected_ids,
+            standalone_keys,
+            sha_keys,
+            "pcibarcompat",
+            "PCIBARCOMPAT",
+            PCIBARCOMPAT_ID,
+            pcibar,
+        )
     for key, value in values.items():
         if not value:
             raise IdentityError("delivery manifest is missing {}".format(key))
         if "\n" in value or "\r" in value:
             raise IdentityError("delivery manifest value contains a line break: {}".format(key))
-    if values["GARNET_BUNDLE_ID"] != GARNET_ID:
-        raise IdentityError(
-            "delivery manifest Garnet id is {}".format(values["GARNET_BUNDLE_ID"])
-        )
-    if values["ACCEL_BUNDLE_ID"] != ACCEL_ID:
-        raise IdentityError(
-            "delivery manifest Accel id is {}".format(values["ACCEL_BUNDLE_ID"])
-        )
-    if values["GARNET_STANDALONE"] != "true" or values["ACCEL_STANDALONE"] != "true":
-        raise IdentityError("delivery manifest requires standalone kext builds")
-    for key in (
-        "GARNET_EXECUTABLE_SHA256",
-        "GARNET_INFO_SHA256",
-        "ACCEL_EXECUTABLE_SHA256",
-        "ACCEL_INFO_SHA256",
-    ):
+    for key, expected_id in expected_ids.items():
+        if values[key] != expected_id:
+            raise IdentityError("delivery manifest {} is {}".format(key, values[key]))
+    for key in standalone_keys:
+        if values[key] != "true":
+            raise IdentityError("delivery manifest requires standalone kext builds")
+    for key in sha_keys:
         if not re.fullmatch(r"[0-9a-f]{64}", values[key]):
             raise IdentityError("delivery manifest {} is not a SHA256".format(key))
     for key, value in values.items():
@@ -612,6 +646,10 @@ def build_parser():
     accel.add_argument("kext")
     accel.set_defaults(func=command_accel)
 
+    pcibarcompat = subparsers.add_parser("pcibarcompat")
+    pcibarcompat.add_argument("kext")
+    pcibarcompat.set_defaults(func=command_pcibarcompat)
+
     input_identity = subparsers.add_parser("input")
     input_identity.add_argument("label")
     input_identity.add_argument("path")
@@ -621,6 +659,7 @@ def build_parser():
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--garnet-identity", required=True)
     manifest.add_argument("--accel-identity", required=True)
+    manifest.add_argument("--pcibarcompat-identity")
     manifest.set_defaults(func=command_manifest)
 
     local_source = subparsers.add_parser("local-source")

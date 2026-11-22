@@ -150,6 +150,102 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(m_kv["ACCEL_EXECUTABLE_SHA256"], a_kv["accel.executable_sha256"])
         self.assertEqual(m_kv["ACCEL_INFO_SHA256"], a_kv["accel.info_plist_sha256"])
         self.assertEqual(m_kv["ACCEL_STANDALONE"], "true")
+        self.assertNotIn("PCIBARCOMPAT_BUNDLE_ID", m_kv)
+
+    def test_valid_pcibarcompat_and_optional_manifest(self):
+        garnet_kext = self.root / "Garnet.kext"
+        make_kext(garnet_kext, "org.garnet.driver", "Garnet", "0.0.673")
+        accel_kext = self.root / "GarnetAccel.kext"
+        make_kext(accel_kext, "org.garnet.accel", "GarnetAccel", "0.0.8")
+        compat_kext = self.root / "GarnetPCIBarCompat.kext"
+        c_plist, c_exe = make_kext(
+            compat_kext,
+            "org.garnet.pcibarcompat",
+            "GarnetPCIBarCompat",
+            "1.0.0",
+            libraries={
+                "com.apple.iokit.IOPCIFamily": "1.1",
+                "com.apple.kpi.iokit": "20.0",
+                "com.apple.kpi.libkern": "20.0",
+                "com.apple.kpi.mach": "20.0",
+                "com.apple.kpi.unsupported": "20.0",
+            },
+            extra_plist={"OSBundleRequired": "Root"},
+        )
+        c_res = self.run_cli("pcibarcompat", str(compat_kext))
+        self.assertEqual(c_res.returncode, 0, c_res.stderr)
+        c_kv = parse_kv(c_res.stdout)
+        self.assertEqual(c_kv["pcibarcompat.bundle"], "GarnetPCIBarCompat.kext")
+        self.assertEqual(c_kv["pcibarcompat.identifier"], "org.garnet.pcibarcompat")
+        self.assertEqual(c_kv["pcibarcompat.executable"], "GarnetPCIBarCompat")
+        self.assertEqual(c_kv["pcibarcompat.version"], "1.0.0")
+        self.assertEqual(c_kv["pcibarcompat.standalone"], "true")
+        self.assertEqual(c_kv["pcibarcompat.legacy_identity"], "absent")
+        self.assertEqual(c_kv["pcibarcompat.info_plist_sha256"], sha256_bytes(c_plist.read_bytes()))
+        self.assertEqual(c_kv["pcibarcompat.executable_sha256"], sha256_bytes(c_exe.read_bytes()))
+
+        g_file = self.root / "g.id"
+        a_file = self.root / "a.id"
+        c_file = self.root / "c.id"
+        g_file.write_text(self.run_cli("garnet", str(garnet_kext)).stdout)
+        a_file.write_text(self.run_cli("accel", str(accel_kext)).stdout)
+        c_file.write_text(c_res.stdout)
+        m_res = self.run_cli(
+            "manifest",
+            "--garnet-identity",
+            str(g_file),
+            "--accel-identity",
+            str(a_file),
+            "--pcibarcompat-identity",
+            str(c_file),
+        )
+        self.assertEqual(m_res.returncode, 0, m_res.stderr)
+        m_kv = parse_kv(m_res.stdout)
+        self.assertEqual(m_kv["PCIBARCOMPAT_BUNDLE_ID"], "org.garnet.pcibarcompat")
+        self.assertEqual(m_kv["PCIBARCOMPAT_VERSION"], "1.0.0")
+        self.assertEqual(m_kv["PCIBARCOMPAT_EXECUTABLE_SHA256"], c_kv["pcibarcompat.executable_sha256"])
+        self.assertEqual(m_kv["PCIBARCOMPAT_INFO_SHA256"], c_kv["pcibarcompat.info_plist_sha256"])
+        self.assertEqual(m_kv["PCIBARCOMPAT_STANDALONE"], "true")
+
+        # Rejects Lilu dependency, wrong bundle ID, and legacy token in pcibarcompat.
+        bad_lilu = self.root / "bad-pcibar-lilu" / "GarnetPCIBarCompat.kext"
+        make_kext(
+            bad_lilu,
+            "org.garnet.pcibarcompat",
+            "GarnetPCIBarCompat",
+            "1.0.0",
+            libraries={"as.vit9696.Lilu": "1.7.2"},
+        )
+        self.assertNotEqual(self.run_cli("pcibarcompat", str(bad_lilu)).returncode, 0)
+
+        bad_id = self.root / "bad-pcibar-id" / "GarnetPCIBarCompat.kext"
+        make_kext(bad_id, "org.wrong.pcibarcompat", "GarnetPCIBarCompat", "1.0.0")
+        self.assertNotEqual(self.run_cli("pcibarcompat", str(bad_id)).returncode, 0)
+
+        bad_tok = self.root / "bad-pcibar-tok" / "GarnetPCIBarCompat.kext"
+        make_kext(
+            bad_tok,
+            "org.garnet.pcibarcompat",
+            "GarnetPCIBarCompat",
+            "1.0.0",
+            binary_bytes=b"\xcf\xfa\xed\xfeNavi48\n",
+        )
+        self.assertNotEqual(self.run_cli("pcibarcompat", str(bad_tok)).returncode, 0)
+
+        # Rejects non-standalone or mismatched pcibarcompat identity in manifest.
+        c_file.write_text(c_res.stdout.replace("pcibarcompat.standalone=true", "pcibarcompat.standalone=false"))
+        self.assertNotEqual(
+            self.run_cli(
+                "manifest",
+                "--garnet-identity",
+                str(g_file),
+                "--accel-identity",
+                str(a_file),
+                "--pcibarcompat-identity",
+                str(c_file),
+            ).returncode,
+            0,
+        )
 
     def test_rejects_lilu_dependency_and_wrong_identity(self):
         lilu_garnet = self.root / "bad-lilu" / "Garnet.kext"
