@@ -68,6 +68,7 @@ static void record(char operation) {
 - (void)retireWritebackFixture;
 - (void)setTraceFixtureID:(uint64_t)identifier;
 - (BOOL)hasIncompleteDisplayInput;
+- (BOOL)defersScheduledPublication;
 @end
 @implementation RDNA4CommandBuffer (WritebackFixture)
 - (void)configureWritebackFixture {
@@ -80,6 +81,7 @@ static void record(char operation) {
 - (NSUInteger)writebackSegmentCount { return _segments.count; }
 - (void)setTraceFixtureID:(uint64_t)identifier { _cbid = identifier; }
 - (BOOL)hasIncompleteDisplayInput { return _displayIncomplete; }
+- (BOOL)defersScheduledPublication { return _scheduleAfterPublish; }
 - (void)retireWritebackFixture {
     RDNA4CommandSegment *segment = _segments[0];
     segment->vk = VK_NULL_HANDLE;
@@ -866,6 +868,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
         require(RDNA4CB.bytes == 0, "unretired write-back reported completion");
         require(accepted && !error && ![command rdna4Error] && copies == (linear ? 0u : 1u) && ends == 1,
             "writable desktop write-back refused or not ended");
+        require([command defersScheduledPublication], "IOSurface write did not defer scheduled publication");
         require(!strcmp(recorded, linear ? "HBHE" : "BWHBHE"), "host visibility must precede segment completion");
         [command retireWritebackFixture];
     } else {

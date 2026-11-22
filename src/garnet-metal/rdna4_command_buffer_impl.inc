@@ -56,15 +56,16 @@
 - (void)rdna4IOWritten:(RDNA4Texture *)t {
     t = [t rootResource];
     [self rdna4CBTraceSurface:t use:"write"];
-    // A path-(b) IOSurface is written through a private image and copied back
-    // at the end of this command buffer. Do not publish the command buffer as
-    // scheduled until that fence has completed; a WindowServer or capture
-    // consumer may read the surface as soon as scheduled is visible. The
-    // /private/tmp/rdna4m-early-schedule kill file restores the old timing.
-    if ([t rdna4IsIOS] && ![t rdna4IOSLinear] &&
+    // IOSurfaces (both path (a) linear and path (b) copy-back) are imported
+    // outside IOAccelerator fence tracking. Do not publish the command buffer as
+    // scheduled until its GPU fence and host-visibility barrier complete; a
+    // WindowServer, CA Whippet, or CPU capture consumer may read the surface as
+    // soon as scheduled is visible. The /private/tmp/rdna4m-early-schedule kill
+    // file restores early scheduling.
+    if ([t rdna4IsIOS] &&
         access("/private/tmp/rdna4m-early-schedule", F_OK) != 0 && !_scheduleAfterPublish) {
         _scheduleAfterPublish = YES;
-        RDNA4_ONCE("scheduled publication deferred until path-(b) IOSurface write-back completes");
+        RDNA4_ONCE("scheduled publication deferred until IOSurface write completes");
     }
     // rdna4Finish selects the last display write, including a revisit through a view.
     [_iow removeObjectIdenticalTo:t];

@@ -18,6 +18,8 @@ finish = command_buffer[command_buffer.index("- (BOOL)rdna4Finish:"):]
 flush_at = finish.index("[self rdna4FlushEventWrites:_vk];")
 display_at = finish.index("for (RDNA4Texture *t in _iow)")
 finish_after_flush = finish[flush_at:display_at]
+written = command_buffer[command_buffer.index("- (void)rdna4IOWritten:"):]
+written = written[:written.index("\n}") + 2]
 
 checks = {
     "blit rejections fail the command buffer": not re.search(
@@ -36,6 +38,11 @@ checks = {
     "read-only render attachment test expects command failure": bool(
         "renderCommandEncoderWithDescriptor:pass" in runtime_test
         and "NOCOPY_%s_RENDER_TARGET" in runtime_test
+    ),
+    "linear and copy-back IOSurface writes defer scheduled publication": bool(
+        "[t rdna4IsIOS]" in written
+        and "_scheduleAfterPublish = YES;" in written
+        and "![t rdna4IOSLinear]" not in written
     ),
 }
 

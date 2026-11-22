@@ -66,9 +66,10 @@ run_case() {
             /^garnettest accel appallow add system_profiler$/ { if (phase == 6) phase = 7; next }
             /^garnettest accel appallow add System Settings$/ { if (phase == 7) phase = 8; next }
             /^garnettest accel appallow add iconservicesagent$/ { if (phase == 8) phase = 9; next }
-            /^garnettest accel pipeadopt$/ { if (phase == 9) phase = 10; next }
-            /^killall -9 WindowServer$/ { if (phase == 10) phase = 11; next }
-            END { exit phase != 11 }
+            /^garnettest accel appallow add Terminal$/ { if (phase == 9) phase = 10; next }
+            /^garnettest accel pipeadopt$/ { if (phase == 10) phase = 11; next }
+            /^killall -9 WindowServer$/ { if (phase == 11) phase = 12; next }
+            END { exit phase != 12 }
         ' "$work/trace" || ok=0
     fi
     if [ "$ok" -eq 1 ]; then
@@ -102,5 +103,9 @@ run_case settings-allowlist-full native '' '' 0 0 full 'System Settings'
 run_case icons-already-allowed native '' '' 0 0 already iconservicesagent
 run_case icons-allowlist-wrong-result native '' '' 0 0 wrong iconservicesagent
 run_case icons-allowlist-transport-failure native '' '' 0 0 transport iconservicesagent
+run_case terminal-already-allowed native '' '' 0 0 already Terminal
+run_case terminal-allowlist-full native '' '' 0 0 full Terminal
+run_case terminal-allowlist-wrong-result native '' '' 0 0 wrong Terminal
+run_case terminal-allowlist-transport-failure native '' '' 0 0 transport Terminal
 printf 'ACTIVATION_SUITE cases=%s failures=%s hardware_commands=stubbed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

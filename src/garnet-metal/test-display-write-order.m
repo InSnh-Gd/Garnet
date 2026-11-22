@@ -55,7 +55,7 @@ __attribute__((objc_root_class))
 #define NSMutableArray RDNA4Array
 #endif
 
-@interface RDNA4Texture : RDNA4Base { @public RDNA4Texture *_root; unsigned sid, pixel; }
+@interface RDNA4Texture : RDNA4Base { @public RDNA4Texture *_root; unsigned sid, pixel; BOOL nonIOS, linear; }
 - (id)rootResource;
 - (BOOL)rdna4IsIOS;
 - (BOOL)rdna4IOSLinear;
@@ -66,8 +66,8 @@ __attribute__((objc_root_class))
 @end
 @implementation RDNA4Texture
 #include "root.inc"
-- (BOOL)rdna4IsIOS { return YES; }
-- (BOOL)rdna4IOSLinear { return NO; }
+- (BOOL)rdna4IsIOS { return !nonIOS; }
+- (BOOL)rdna4IOSLinear { return linear; }
 - (BOOL)rdna4IsDisp { return YES; }
 - (BOOL)rdna4DispImgOnly { return NO; }
 - (id)rdna4IOSRef { return self; }
@@ -90,6 +90,7 @@ static int rdna4s_damage_on(void) { return 0; }
 - (RDNA4Texture *)chosen;
 - (BOOL)accountsFinalAfterFallback:(BOOL)fallback;
 - (BOOL)counts:(unsigned)n;
+- (BOOL)defersScheduledPublication;
 @end
 @implementation WriteFixture
 #include "written.inc"
@@ -127,6 +128,7 @@ static int rdna4s_damage_on(void) { return 0; }
     return roots && [_iow count] == n && [_iot count] == n && [_eventDirty count] == n &&
         _ndw == (int)n && _ncbw == n && _scheduleAfterPublish;
 }
+- (BOOL)defersScheduledPublication { return _scheduleAfterPublish; }
 @end
 
 #define F (RDNA4DF_W_PASS | RDNA4DF_W_DRAW_FINAL)
@@ -184,7 +186,25 @@ static int run_tests(void) {
     printf("%s FINAL with earlier offscreen fallback: clean=%d incomplete=%d\n",
         suppressesIncomplete ? "PASS" : "FAIL", noFallback, withFallback);
     if (!suppressesIncomplete) failed++;
-    printf("display-write-order: %zu cases, %u failed\n", sizeof cases / sizeof cases[0] + 1, failed);
+    RDNA4Texture *linearSurface = [RDNA4Texture new];
+    linearSurface->sid = 201;
+    linearSurface->linear = YES;
+    WriteFixture *linearCmd = [WriteFixture new];
+    [linearCmd write:linearSurface bits:F pixel:1];
+    const BOOL linearDefers = [linearCmd defersScheduledPublication];
+    printf("%s linear IOSurface defers scheduled publication: schedule_after_publish=%d\n",
+        linearDefers ? "PASS" : "FAIL", linearDefers);
+    if (!linearDefers) failed++;
+    RDNA4Texture *privateSurface = [RDNA4Texture new];
+    privateSurface->sid = 202;
+    privateSurface->nonIOS = YES;
+    WriteFixture *privateCmd = [WriteFixture new];
+    [privateCmd rdna4IOWritten:privateSurface];
+    const BOOL privateDefers = [privateCmd defersScheduledPublication];
+    printf("%s non-IOSurface texture does not defer scheduled publication: schedule_after_publish=%d\n",
+        !privateDefers ? "PASS" : "FAIL", privateDefers);
+    if (privateDefers) failed++;
+    printf("display-write-order: %zu cases, %u failed\n", sizeof cases / sizeof cases[0] + 3, failed);
     return failed ? 1 : 0;
 }
 int main(void) {

@@ -85,6 +85,8 @@ step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add syste
 # Settings and its user-side icon renderer open their own Metal sessions.
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add 'System Settings'
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add iconservicesagent
+# Terminal uses RGhA CA Whippet IOSurfaces on wide-gamut (P3) displays, which macOS 26 drops to zero without Metal.
+step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add Terminal
 # /tmp is cleared at boot; an owned persistent opt-in restores observational diagnostics.
 if [ -f /private/var/tmp/rdna4m-observe ] && [ ! -L /private/var/tmp/rdna4m-observe ] && [ -O /private/var/tmp/rdna4m-observe ]; then
     observe_flag() {
