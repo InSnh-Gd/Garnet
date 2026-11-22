@@ -1251,7 +1251,8 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
             VRAMAllocation a {};
             // 0.0.641 (G4 review), apps ON: a non-WindowServer session's NO_CPU_ACCESS BO goes to the hi pool FIRST (the visible pool is WindowServer's), and a CPU-visible placement of such a
             // session must fit under the shared cap (appvis_cap(), default 64 MiB) or the request fails like any other out-of-memory. Everything else is as 0.0.640.
-            const bool appsNow = apps_on();
+            // On a full-BAR (> 1 GiB) boot, visible pool is nearly all usable VRAM (hi pool is tiny), so appvis_active disables the small-BAR 64 MiB choke while g2::app_vram_budget_ok still binds.
+            const bool appsNow = rdna4native::g4::appvis_active(apps_on(), rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit));
             bool got = false;
             bool hiDone = rdna4native::g4::hi_first(appsNow, s->ws, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a);
             if (!hiDone) {
@@ -2440,7 +2441,8 @@ IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
             const uint64_t poolFree = sat_add(gCtx->gmc.vram_alloc.bytes_free(), gCtx->gmc.vram_alloc_hi.is_inited() ? gCtx->gmc.vram_alloc_hi.bytes_free() : 0ull);
             g.othersCap = app_vram_cap(poolTotal, poolFree, gVramOthers, pt_held_bytes(gPtN, kArenaBlockBytes));
         }
-        if (apps_on()) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }   // 0.0.641: the visible-pool use of non-WindowServer sessions and its cap
+        const bool fullBar = gCtx->dev != nullptr && rdna4rebar::is_full_bar_aperture(gCtx->dev->bar0Size, gCtx->dev->vramLimit);
+        if (rdna4native::g4::appvis_active(apps_on(), fullBar)) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }   // 0.0.641: the visible-pool use of non-WindowServer sessions and its cap (small BAR only)
         IOLockUnlock(gCliLock);
         g.hung = hung_now(); g.emitted = emitted_now(); g.retired = retired_now(g.emitted);
         g.mappedLeakBos = gMappedLeakBos;   // 0.0.640 (G4): BOs leaked at close because a CPU mapping outlived the session (read without gCliLock: a diagnostic)

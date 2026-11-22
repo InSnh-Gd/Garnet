@@ -423,6 +423,12 @@ static void p11_fullbar_policy() {
            "P11: garnet-full-bar requires present && value == 1");
     expect_u("P11: default cap is 1 GiB", map_cap_for(false), kMaxBar0Map);
     expect_u("P11: full-BAR opt-in cap is 16 GiB", map_cap_for(true), kMaxBar0Full);
+    expect(!is_full_bar_aperture(256 * MiB, 256 * MiB), "P11: 256 MiB BAR0 is not full-BAR aperture");
+    expect(!is_full_bar_aperture(GiB, GiB), "P11: 1 GiB BAR0 is not full-BAR aperture");
+    expect(is_full_bar_aperture(16 * GiB, 15472 * MiB), "P11: 16 GiB BAR0 with 15472 MiB limit is full-BAR aperture");
+    expect(!is_full_bar_aperture(16 * GiB, GiB), "P11: 16 GiB BAR0 with 1 GiB limit is not full-BAR aperture");
+    expect(!is_full_bar_aperture(16 * GiB, 0ull), "P11: 16 GiB BAR0 with 0 limit is not full-BAR aperture");
+    expect(!is_full_bar_aperture(0ull, 16 * GiB), "P11: 0 BAR0 with 16 GiB limit is not full-BAR aperture");
 
     // Full-BAR 16 GiB at 0x7C00000000 with 16304 MiB valid VRAM (RX 9060 XT): aperture vs valid VRAM vs allocatable pools
     {

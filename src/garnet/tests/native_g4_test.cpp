@@ -557,7 +557,10 @@ static void t11_visible_pool(const std::string &root) {
     expect(appvis_ok(true, true, cap * 10, cap * 10, cap) && appvis_ok(false, false, cap * 10, cap * 10, cap), "T11: WindowServer is never capped, and apps OFF has no cap (0.0.632)");
     expect(hi_first(true, false, true) && !hi_first(true, true, true) && !hi_first(true, false, false) && !hi_first(false, false, true), "T11: hi first only for apps ON, non-WindowServer, NO_CPU_ACCESS");
     expect(appvis_counts(true, false, true) && !appvis_counts(true, true, true) && !appvis_counts(false, false, true) && !appvis_counts(true, false, false), "T11: only a non-WindowServer visible placement with apps ON counts");
-    // placement decisions
+    expect(appvis_active(true, false) && !appvis_active(true, true) && !appvis_active(false, false) && !appvis_active(false, true), "T11: visible-pool sub-cap and hi-first apply only with apps ON and small BAR (<= 1 GiB)");
+    // placement decisions (small BAR vs full BAR)
+    expect(place_sim(appvis_active(true, true), false, true, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS NO_CPU_ACCESS BO goes to visible pool past 64 MiB");
+    expect(place_sim(appvis_active(true, true), false, false, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS CPU-visible BO goes to visible pool past 64 MiB");
     expect(place_sim(true, false, true, true, true, 0, 4096, cap) == kWhereHi, "T11: apps ON, NO_CPU_ACCESS, both pools free: the hi pool");
     expect(place_sim(true, false, true, false, true, 0, 4096, cap) == kWhereVis, "T11: ... the hi pool full: falls back to visible (under the cap)");
     expect(place_sim(true, false, true, false, true, cap, 4096, cap) == kWhereNone, "T11: ... the hi pool full and the cap reached: out of memory");
@@ -581,14 +584,14 @@ static void t11_visible_pool(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
     const std::string bc = fn_body(eng, "IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64_t out[4]) {");
-    expect(in_order(bc, { "app_vram_budget_ok(multi, s->ws, gVramOthers, p.size, poolTotal, poolFree, ptHeld)", "const bool appsNow = apps_on();", "rdna4native::g4::hi_first(appsNow, s->ws, p.hiOk)", "vram_alloc_hi.alloc(p.size, p.align, &a)", "if (!hiDone) {",
+    expect(in_order(bc, { "app_vram_budget_ok(multi, s->ws, gVramOthers, p.size, poolTotal, poolFree, ptHeld)", "const bool appsNow = rdna4native::g4::appvis_active(apps_on(), rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit));", "rdna4native::g4::hi_first(appsNow, s->ws, p.hiOk)", "vram_alloc_hi.alloc(p.size, p.align, &a)", "if (!hiDone) {",
                           "rdna4native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)", "rc = kIOReturnNoMemory; break;", "got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);",
                           "rdna4native::g4::appvis_counts(appsNow, s->ws, true)) { b.visCounted = 1u; gVisOthers += p.size; }", "} else if (hiDone || (p.hiOk &&", "b.kind = kBoHi;" }),
            "T11: REACHABLE, in this order: the shared allowance, hi first for a non-WindowServer NO_CPU_ACCESS BO, the visible cap (the existing NoMemory), the visible pool, the count, the hi fallback");
     expect(in_order(eng, { "static inline void budget_release(Bo &b) {", "if (b.visCounted != 0u) { gVisOthers =", "b.visCounted = 0u;" }), "T11: freeing a visible BO takes it off the visible counter (a leaked one is never released, so it stays counted)");
     expect_u("T11: garnet-appvis is read in exactly one place", count_of(eng, "PE_parse_boot_argn(\"garnet-appvis\""), 1);
     expect(in_order(fn_body(eng, "static uint64_t appvis_cap() {"), { "PE_parse_boot_argn(\"garnet-appvis\"", "rdna4native::g4::appvis_cap_bytes(present, v)", "__atomic_store_n(&gAppVisLatch, 1u" }), "T11: the cap comes from the pure function, latched once");
-    expect(in_order(fn_body(eng, "IOReturn n1c_g2_stat("), { "if (apps_on()) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }", "global_out(g, o);" }), "T11: sessstat 8 reports the use and the cap (apps ON), under the lock that guards the counter");
+    expect(in_order(fn_body(eng, "IOReturn n1c_g2_stat("), { "if (rdna4native::g4::appvis_active(apps_on(), fullBar)) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }", "global_out(g, o);" }), "T11: sessstat 8 reports the use and the cap (apps ON), under the lock that guards the counter");
     expect(cmd.find("(out[5] >> 36) & 0xfffff, (out[5] >> 56));") != std::string::npos && cmd.find("if ((out[5] >> 56) != 0)") != std::string::npos, "T11: rdna4test prints the non-WindowServer visible use and its cap");
 }
 

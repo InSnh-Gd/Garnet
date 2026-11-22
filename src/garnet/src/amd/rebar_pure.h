@@ -28,6 +28,11 @@ constexpr uint64_t kNoConsole   = ~0ull;           // PlanIn::consoleOff when th
 
 constexpr bool     full_bar_enabled(bool present, uint32_t value) { return present && value == 1u; }
 constexpr uint64_t map_cap_for(bool fullBar) { return fullBar ? kMaxBar0Full : kMaxBar0Map; }
+// True when BAR0 covers a full-BAR aperture (> 1 GiB) and vramLimit extends past 1 GiB:
+// the visible pool holds nearly all usable VRAM (e.g. 15416 MiB), not a scarce <= 1 GiB window.
+constexpr bool     is_full_bar_aperture(uint64_t bar0Size, uint64_t vramLimit) {
+    return bar0Size > kMaxBar0Map && vramLimit > kMaxBar0Map;
+}
 
 enum Reason : uint32_t {
     kOk = 0,

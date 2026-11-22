@@ -211,6 +211,10 @@ constexpr uint32_t unmap_attempts(bool appsOn, bool isVisVram, bool hasDescripto
 constexpr uint32_t kAppVisDefaultMiB = 64u, kAppVisMinMiB = 16u, kAppVisMaxMiB = 128u;
 // boot-arg rdna4-appvis=<MiB>: in range 16..128 it is the cap; absent or out of range, the default (64 MiB).
 constexpr uint64_t appvis_cap_bytes(bool present, uint32_t mib) { return (uint64_t)((present && mib >= kAppVisMinMiB && mib <= kAppVisMaxMiB) ? mib : kAppVisDefaultMiB) << 20; }
+// The small-BAR visible-pool sub-cap and hi-first spill apply only when BAR0 is <= 1 GiB;
+// on a full-BAR (> 1 GiB) boot the visible pool IS almost all usable VRAM and non-WindowServer
+// sessions remain bounded by g2::app_vram_budget_ok.
+constexpr bool appvis_active(bool appsOn, bool fullBar) { return appsOn && !fullBar; }
 constexpr bool appvis_ok(bool appsOn, bool isWs, uint64_t held, uint64_t add, uint64_t cap) { return !appsOn || isWs || !s1c::would_exceed(held, add, cap); }
 constexpr bool hi_first(bool appsOn, bool isWs, bool hiOk) { return appsOn && !isWs && hiOk; }
 // Does a non-WindowServer BO count against the visible cap? Yes when it was placed in the visible pool (not hi, not GTT) with apps ON.
