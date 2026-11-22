@@ -241,6 +241,12 @@ enum ReloadEv : uint32_t { kRwOpened = 0, kRwTolerated = 1, kRwClosed267 = 2, kR
 constexpr uint32_t reload_state(bool live, bool closeSeen) { return live ? (closeSeen ? 2u : 1u) : 0u; }
 constexpr const char *reload_state_name(uint32_t s) { return s == 1u ? "OPEN, waiting for the old client's close" : s == 2u ? "OPEN, close tolerated, waiting for the new client's first slot 267" : "closed"; }
 
+// ---- display mode-change exemption for K3 (legitimate setDisplayMode -> displayModeDidChange -> slot 267) ------------------------------------------------------------
+// One-shot token valid strictly inside [armedNs, armedNs + kModeChangeWindowNs) on the uptime clock; a backwards clock fails closed (expired), and HUNG always wins.
+constexpr uint64_t kModeChangeWindowNs = 5ull * 1000000000ull;
+constexpr bool mode_change_live(uint32_t pending, uint64_t armedNs, uint64_t nowNs) { return pending != 0u && nowNs >= armedNs && nowNs - armedNs < kModeChangeWindowNs; }
+constexpr bool mode_change_honoured(bool live, bool hung) { return live && !hung; }
+
 // P1: the aux kext's display-machine walk is handed the PCI device ONLY with the latch on AND the resource facts on: a pipe created without them dereferences a NULL resource (11h.1 correction 1),
 // and any requestProbe (ours or anybody's) before `pipeadopt` would create one. Otherwise the ops hook answers NULL and the aux walk falls back to the nub (0.0.612 behaviour: finds nothing).
 constexpr bool pci_admit(bool latchOn, uint32_t factoryMask) { return latchOn && facts_ok(factoryMask); }

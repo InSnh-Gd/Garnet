@@ -20,6 +20,7 @@
 //    0.0.618:  bool vbl_on() /* the pipevbl switch */;  bool class_derives(uint64_t obj, const char *name) /* the class or a superclass is `name` */;  bool vbl_sample(VblSample *s) /* one OTG0 timing sample, read-only; false = none */;
 //              void note_vbl(uint32_t reason, const VblPlan &p, uint64_t periodNs, uint64_t delayNs);
 //    0.0.619:  ReloadWin &rw() /* the operator restart window state */;  void note_reload(uint32_t ev /* ReloadEv */);
+//    mode-chg: ModeChangeWin &mc() /* one-shot K3 exemption armed by setDisplayMode HW OK */;  void note_mode_change_exempt();
 //    stamps:   uint64_t accel_addr();  bool class_is(uint64_t obj, const char *name);
 //    slot 62:  void note_res62(const Res62Plan &p, bool smKnown, bool surfKnown, bool flagsKnown, bool bit4);
 //    0.0.616:  MdCache &mdc();  bool md_prepare(uint64_t md) /* retain + prepare(kIODirectionOut); true = prepared and held */;  void md_unprepare(uint64_t md) /* complete + release */;
@@ -49,6 +50,38 @@ inline bool guard_on_init_fb(CrashGuard &g, uint64_t nowNs) {             // tru
     __atomic_store_n(&g.ts[idx % 3u], nowNs, __ATOMIC_RELEASE);
     const uint64_t oldest = __atomic_load_n(&g.ts[(idx + 1u) % 3u], __ATOMIC_ACQUIRE);   // the call two before this one (idx-2 = idx+1 mod 3)
     return guard_trip(idx, nowNs, oldest);
+}
+
+// ---- display mode-change exemption (decisions: native_disp_pure.h mode_change_*) --------------------------------------------------------------------------------
+// Atomics only (hooks take no lock). `pending` carries a nonzero monotonic tag (0 = none; CAS tag->0 consumes one credit, ABA-free against re-arm).
+struct ModeChangeWin { uint64_t armedNs; uint32_t pending; uint32_t nextTag; uint64_t armed, exempted, expired; };
+inline void mode_change_shut(ModeChangeWin &m) { __atomic_store_n(&m.pending, 0u, __ATOMIC_RELEASE); }
+template <class E> void mode_change_arm_flow(E &e) {
+    if (!e.latch_on() || !e.armed() || e.hung()) return;
+    ModeChangeWin &m = e.mc();
+    __atomic_store_n(&m.pending, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&m.armedNs, e.now_ns(), __ATOMIC_RELEASE);
+    uint32_t tag = __atomic_add_fetch(&m.nextTag, 1u, __ATOMIC_RELAXED);
+    if (tag == 0u) tag = __atomic_add_fetch(&m.nextTag, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&m.pending, tag, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&m.armed, 1ull, __ATOMIC_RELAXED);
+}
+template <class E> bool mode_change_consume_flow(E &e) {
+    ModeChangeWin &m = e.mc();
+    uint32_t tag = __atomic_load_n(&m.pending, __ATOMIC_ACQUIRE);
+    if (tag == 0u) return false;
+    const uint64_t on = __atomic_load_n(&m.armedNs, __ATOMIC_ACQUIRE);
+    const uint64_t now = e.now_ns();
+    if (!mode_change_live(tag, on, now)) {
+        if (__atomic_compare_exchange_n(&m.pending, &tag, 0u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            __atomic_add_fetch(&m.expired, 1ull, __ATOMIC_RELAXED);
+        return false;
+    }
+    if (!mode_change_honoured(true, e.hung())) return false;
+    if (!__atomic_compare_exchange_n(&m.pending, &tag, 0u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return false;
+    __atomic_add_fetch(&m.exempted, 1ull, __ATOMIC_RELAXED);
+    e.note_mode_change_exempt();
+    return true;
 }
 
 // ---- 0.0.619 (R1): the operator restart window (the decisions are native_disp_pure.h reload_*) ---------------------------------------------------------------------------------
@@ -260,6 +293,7 @@ template <class E> void withdraw_flow(E &e) {
     e.disarm();
     mdc_teardown(e);                                                       // 0.0.616: every prepared descriptor completed and released (after the mirror is clear, before anything is forgotten)
     reload_shut(e.rw());                                                   // 0.0.619 (R1)
+    mode_change_shut(e.mc());
     e.forget_pipes();
     e.note_withdraw(was);
 }
@@ -399,6 +433,7 @@ template <class E> bool auto_disarm_flow(E &e, uint32_t cause) {
     e.disarm();
     mdc_teardown(e);
     reload_shut(e.rw());                                                     // 0.0.619 (R1): a disarmed pipe has no restart to tolerate
+    mode_change_shut(e.mc());
     e.note_autodisarm(cause);
     return true;
 }
@@ -424,7 +459,7 @@ template <class E> int init_fb_flow(E &e, uint64_t pipe, uint64_t res, uint64_t 
     // 0.0.659 (M6): the restart-loop guard counts WindowServer STARTS, which call slot 267 once per display pipe. With the latch ON only the DP's pipe is counted (a start with three pipes is still one start); OFF there is one pipe and this is 0.0.658's line.
     const bool m6 = e.m6_on();
     const bool counted = rdna4m6::restart_guard_counts(m6, m6 ? e.pipe_inst(pipe) : rdna4m6::kInstDp);     // 0.0.660 (S5): fail CLOSED - only a pipe KNOWN to be the monitor A's or the monitor B's is exempt; an unplaceable pipe is counted
-    if (counted && e.armed() && !reload_on_init_fb(e) && guard_on_init_fb(e.guard(), e.now_ns())) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); e.note_autodisarm(kAdGuard); }   // 0.0.619 (R1): inside an operator restart window the call is not counted   // 0.0.615 (G1), 0.0.617 (K3): three starts inside 120 s, presented or not
+    if (counted && e.armed() && !reload_on_init_fb(e) && !mode_change_consume_flow(e) && guard_on_init_fb(e.guard(), e.now_ns())) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); mode_change_shut(e.mc()); e.note_autodisarm(kAdGuard); }   // 0.0.619 (R1): inside an operator restart window the call is not counted; a legitimate setDisplayMode consumes one mode-change credit   // 0.0.615 (G1), 0.0.617 (K3): three starts inside 120 s, presented or not
     return 1;
 }
 
@@ -502,8 +537,9 @@ template <class E> uint32_t arm_flow(E &e, uint64_t arg) {
     }
     const uint32_t d = arm_decide(arg, a);
     if (d != kOk) return d;
-    if (arg == 0ull) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); return kOk; }                             // always allowed
+    if (arg == 0ull) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); mode_change_shut(e.mc()); return kOk; }                             // always allowed
     guard_reset(e.guard());                                                  // 0.0.615 (G1): the counter starts from zero at every arm (before the byte opens)
+    mode_change_shut(e.mc());
     ival_reset(e.ivl());                                                     // 0.0.617 (K6): the interval statistics start with the arm
     if (e.m6_on()) e.m6_reset();                                             // 0.0.660 (M6, S1): every arm / re-arm starts from an empty surface table, BEFORE the byte opens the gate (a submit learned after it is kept)
     const bool ok = e.arm_write(1u);

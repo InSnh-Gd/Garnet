@@ -187,6 +187,9 @@ struct BatEnv {
     ReloadWin rwin {}; uint32_t rwEv[kRwCount] = {}; std::vector<uint32_t> rwSeq;
     ReloadWin &rw() { return rwin; }
     void note_reload(uint32_t ev) { if (ev < kRwCount) rwEv[ev]++; rwSeq.push_back(ev); }
+    ModeChangeWin mcwin {};
+    ModeChangeWin &mc() { return mcwin; }
+    void note_mode_change_exempt() {}
 
     // M6 concept members: NEVER used with the latch OFF (the 0.0.658 flows do not know them; the 0.0.659 flows ask m6_on() first and get false)
     bool m6_on() { return false; }

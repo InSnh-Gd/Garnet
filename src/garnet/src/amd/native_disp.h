@@ -45,6 +45,7 @@ void     rdna4disp_on_trace(uint32_t event, uint64_t a, uint64_t b);   // the au
 int      rdna4disp_res62(void *self, const uint64_t *args, uint32_t nargs, uint64_t *ret);   // RDNA4Resource slot 62 (type 0xC0 surfaces); 1 = handled, 0 = the generic vhook path (latch OFF: always 0)
 void     rdna4disp_on_ws_client_closed(bool closingIsWsSession);   // 0.0.617 (K1): the native client closed / died: WindowServer's session (0.0.627: keyed on the session, not on "not admin") disarms an armed pipe; other clients never do; latch OFF: returns at once
 void     rdna4disp_on_hung(void);                    // 0.0.617 (K2): the HUNG latch was set: disarm an armed pipe; latch OFF: returns at once
+void     rdna4disp_on_mode_change(void);             // primaryfb setDisplayMode HW OK: arm a one-shot K3 slot-267 exemption; latch OFF: returns at once
 void     rdna4disp_on_withdraw(void);                // the nub was withdrawn / the kext stops: forget the pipes, disarm the mirror, release the accelerator reference
 
 // 0.0.652 (M5): pipeadopt succeeded this boot (gD.adopted); one atomic load. fbpublish refuses while it is true (and the display nub's presence refuses pipeadopt / pipearm 1: rdna4disp::fb_interlock_refuses).

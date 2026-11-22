@@ -7,6 +7,7 @@
 #include "GarnetDriverInternal.hpp"
 #include "amd/amdgpu_asic.h"
 #include "amd/amdgpu_smu.h"
+#include "amd/native_disp.h"
 #include "amd/rdna4_log.h"
 #include "amd/smu_dal_pure.h"
 #include "dcn/dcn41_modeset.h"
@@ -1237,6 +1238,7 @@ IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode
 	}
 	fCurrentMode = displayMode;
 	fCurrentDepth = depth;
+	rdna4disp_on_mode_change();
 	if (fVblTimer) {
 		bool enabled = false;
 		if (fVblLock) IOLockLock(fVblLock);

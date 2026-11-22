@@ -68,6 +68,7 @@ struct State {
     uint64_t          vblLastT, vblLastNext, vblLastPeriodNs, vblLastDelayNs, vblLastPeriodAbs;   // the last plan written (mach_absolute_time units for T / Next / PeriodAbs)
     volatile uint32_t autoCause;                    // 0.0.617 (K4): rdna4disp::AutoCause of the last auto-disarm, kept until the next explicit `pipearm 1`
     rdna4disp::ReloadWin reload;                      // 0.0.619 (R1): the operator restart window (`pipereload`); all zero = closed
+    rdna4disp::ModeChangeWin modeChange;              // one-shot K3 exemption armed by primaryfb setDisplayMode HW OK; all zero = none
     rdna4disp::CrashGuard guard;                      // 0.0.615 (G1)
     rdna4disp::MdCache mdc;                           // 0.0.616: the descriptors submit prepared; perform reads ONLY these (zero = all entries Empty)
     uint32_t lastAdopt;
@@ -139,6 +140,12 @@ struct KernelEnv {
         else if (ev == rdna4disp::kRwTolerated) DLOG("operator restart window: client close tolerated (the pipe stays armed; the settle time restarts)");
         else if (ev == rdna4disp::kRwClosed267) DLOG("operator restart window: closed (the new client's slot 267 was seen and the last tolerated close is at least %llu s old, the pipe is still armed)", (unsigned long long)(rdna4disp::kReloadSettleNs / 1000000000ull));
         else DLOG("operator restart window: expired (%llu s)", (unsigned long long)(rdna4disp::kReloadWindowNs / 1000000000ull));
+    }
+    rdna4disp::ModeChangeWin &mc() { return gD.modeChange; }
+    void note_mode_change_exempt() {
+        const uint64_t n = __atomic_load_n(&gD.modeChange.exempted, __ATOMIC_RELAXED);
+        if (n <= 16u || (n & 0x3fu) == 0u)
+            DLOG("slot 267 exempted by display mode change (count %llu; K3 restart-loop guard unchanged)", (unsigned long long)n);
     }
     // -- 0.0.618: the vblank timestamps (flow: native_disp_flow.h vbl_stamp_flow) --
     bool vbl_on() { return __atomic_load_n(&gD.vblOff, __ATOMIC_ACQUIRE) == 0u; }
@@ -665,6 +672,12 @@ void rdna4disp_on_hung(void) {
     if (!rdna4disp_latched_on()) return;
     KernelEnv env;
     (void)rdna4disp::hung_latched_flow(env);
+}
+
+void rdna4disp_on_mode_change(void) {
+    if (!rdna4disp_latched_on()) return;
+    KernelEnv env;
+    rdna4disp::mode_change_arm_flow(env);
 }
 
 void rdna4disp_on_withdraw(void) {

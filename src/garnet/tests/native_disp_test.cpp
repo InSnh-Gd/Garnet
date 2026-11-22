@@ -214,6 +214,9 @@ struct FakeEnv {
     ReloadWin rwin {}; uint32_t rwEv[kRwCount] = {}; std::vector<uint32_t> rwSeq;
     ReloadWin &rw() { return rwin; }
     void note_reload(uint32_t ev) { if (ev < kRwCount) rwEv[ev]++; rwSeq.push_back(ev); }
+    ModeChangeWin mcwin {}; uint32_t mcExemptNotes = 0;
+    ModeChangeWin &mc() { return mcwin; }
+    void note_mode_change_exempt() { mcExemptNotes++; }
 
     // 0.0.659 (M6 Stage 1a): the latch, the framebuffer -> instance answers, the surface table (the REAL rdna4m6:: table code), and the counters the kernel glue keeps
     bool m6 = false; std::map<uint64_t, uint32_t> pinst; rdna4m6::SurfTable surfTbl {};
@@ -1066,6 +1069,100 @@ int main(int argc, char **argv) {
       World w; w.e.latch = false; w.e.armByte = 1; w.e.clockStep = 0; w.e.now = 100 * S; reload_open_flow(w.e); uint64_t ret = 0;
       expect(!ws_client_closed_flow(w.e, true) == true && w.e.armedFlag && init267(w, 101 * S, &ret) == 0 && w.e.cg.n == 0 && w.e.rwEv[kRwTolerated] == 0, "R1: latch OFF -> the close and the hooks do nothing, window or not (0.0.616 behaviour)"); }
 
+    // ---- display mode-change exemption (legitimate setDisplayMode -> displayModeDidChange -> slot 267 must not trip K3)
+    expect(kModeChangeWindowNs == 5ull * 1000000000ull, "MC: the mode-change exemption window is 5 s");
+    expect(!mode_change_live(0u, 100 * S, 100 * S) && mode_change_live(1u, 100 * S, 100 * S) &&
+           mode_change_live(1u, 100 * S, 100 * S + kModeChangeWindowNs - 1ull) &&
+           !mode_change_live(1u, 100 * S, 100 * S + kModeChangeWindowNs) &&
+           !mode_change_live(1u, 100 * S, 100 * S + kModeChangeWindowNs + 1ull) &&
+           !mode_change_live(1u, 100 * S, 99 * S),
+           "MC: live strictly inside [armed, armed+5 s); exact expiry and backwards clock fail closed");
+    expect(mode_change_honoured(true, false) && !mode_change_honoured(true, true) && !mode_change_honoured(false, false) && !mode_change_honoured(false, true),
+           "MC: HUNG precedence: a hung GPU never honours the mode-change exemption");
+    { // 4 rapid setDisplayMode-backed slot-267 calls within 120 s (160->144->75->60->160 Hz): stays armed and VBL stamps continue
+      World w; w.e.armByte = 1; w.e.clockStep = 0; w.e.txnClass[A_TXN] = kTxnClass; uint64_t ret = 0;
+      for (uint64_t i = 0; i < 4; ++i) {
+          w.e.now = (10 + i * 2) * S;
+          mode_change_arm_flow(w.e);
+          expect(init267(w, (10 + i * 2) * S + 1000000ull, &ret) == 1 && ret != 0, "MC: rapid mode switch slot 267 handled");
+      }
+      expect(w.e.armedFlag && w.e.armByte == 1 && w.e.autoDisarms == 0 && w.e.cg.n == 0 && w.e.mcExemptNotes == 4 && w.e.mcwin.exempted == 4 && w.e.mcwin.pending == 0,
+             "MC: 4 rapid setDisplayMode-backed slot-267 calls within 120 s stay armed with K3 counter untouched");
+      uint64_t pr = 5; (void)w.perform(&pr);
+      expect(w.e.vblNotes[kVblWrote] == 1 && w.e.vblNotes[kVblDisarmed] == 0 && w.e.lastVblPeriod == 16680000ull,
+             "MC: VBL timestamps continue with nonzero period after rapid mode switches"); }
+    { // one-shot: a second unpaired slot-267 after one mode change IS counted, and 3 unpaired calls still trip K3
+      World w; w.e.armByte = 1; w.e.clockStep = 0; uint64_t ret = 0;
+      w.e.now = 100 * S; mode_change_arm_flow(w.e);
+      init267(w, 100 * S + 1000000ull, &ret);
+      expect(w.e.cg.n == 0 && w.e.mcExemptNotes == 1 && w.e.mcwin.pending == 0 && w.e.armedFlag, "MC: first slot 267 consumes the one-shot token");
+      init267(w, 100 * S + 50000000ull, &ret);
+      expect(w.e.cg.n == 1 && w.e.mcExemptNotes == 1 && w.e.armedFlag, "MC: second unpaired slot 267 after one mode change IS counted by K3");
+      init267(w, 101 * S, &ret); init267(w, 102 * S, &ret);
+      expect(!w.e.armedFlag && w.e.armByte == 0 && w.e.autoDisarms == 1 && w.e.autoCause == kAdGuard && w.e.cg.n == 3,
+             "MC: 3 unpaired slot-267 calls within 120 s still auto-disarm with kAdGuard"); }
+    { // non-accumulating: multiple arm calls without slot 267 never bank >1 credit
+      World w; w.e.armByte = 1; w.e.clockStep = 0; uint64_t ret = 0;
+      w.e.now = 100 * S; mode_change_arm_flow(w.e); w.e.now = 101 * S; mode_change_arm_flow(w.e);
+      init267(w, 101 * S + 1000000ull, &ret); init267(w, 101 * S + 2000000ull, &ret);
+      expect(w.e.mcExemptNotes == 1 && w.e.cg.n == 1 && w.e.armedFlag, "MC: repeated arming never banks multiple credits (strictly one-shot)"); }
+    { // expiry boundary and backwards clock fail closed
+      World w; w.e.armByte = 1; w.e.clockStep = 0; uint64_t ret = 0;
+      w.e.now = 100 * S; mode_change_arm_flow(w.e);
+      init267(w, 100 * S + kModeChangeWindowNs - 1ull, &ret);
+      expect(w.e.mcExemptNotes == 1 && w.e.cg.n == 0 && w.e.mcwin.expired == 0, "MC: 1 ns before expiry is exempted");
+      w.e.now = 200 * S; mode_change_arm_flow(w.e);
+      init267(w, 200 * S + kModeChangeWindowNs, &ret);
+      expect(w.e.mcExemptNotes == 1 && w.e.cg.n == 1 && w.e.mcwin.expired == 1 && w.e.mcwin.pending == 0, "MC: exact expiry (5 s) fails closed and counts toward K3");
+      w.e.now = 300 * S; mode_change_arm_flow(w.e);
+      init267(w, 299 * S, &ret);
+      expect(w.e.mcExemptNotes == 1 && w.e.cg.n == 2 && w.e.mcwin.expired == 2 && w.e.mcwin.pending == 0, "MC: backwards clock fails closed and counts toward K3"); }
+    { // HUNG precedence (K2 wins over mode-change exemption) and K1 unaffected
+      World w; w.e.armByte = 1; w.e.clockStep = 0; uint64_t ret = 0;
+      w.e.now = 100 * S; mode_change_arm_flow(w.e); w.e.hungFlag = true;
+      init267(w, 100 * S + 1000000ull, &ret);
+      expect(w.e.cg.n == 1 && w.e.mcExemptNotes == 0, "MC: slot 267 while HUNG is NOT exempted (counted by K3)");
+      expect(hung_latched_flow(w.e) && !w.e.armedFlag && w.e.autoCause == kAdHung && w.e.mcwin.pending == 0, "MC: K2 HUNG disarms and clears pending token");
+      World u; u.e.armByte = 1; u.e.clockStep = 0; u.e.hungFlag = true; u.e.now = 100 * S; mode_change_arm_flow(u.e);
+      expect(u.e.mcwin.pending == 0 && u.e.mcwin.armed == 0, "MC: arming while HUNG is refused");
+      World v; v.e.armByte = 1; v.e.clockStep = 0; v.e.now = 100 * S; mode_change_arm_flow(v.e);
+      expect(ws_client_closed_flow(v.e, true) && !v.e.armedFlag && v.e.autoCause == kAdWsClose && v.e.mcwin.pending == 0,
+             "MC: K1 (WindowServer GPU client close) is never disabled by a pending mode-change token and clears it"); }
+    { // cleared on disarm, withdraw, arm reset; ignored when disarmed or latch OFF
+      World w; w.e.armByte = 1; w.e.clockStep = 0; w.e.now = 100 * S; mode_change_arm_flow(w.e);
+      expect_u("MC: arm 0", arm_flow(w.e, 0), kOk); expect(w.e.mcwin.pending == 0, "MC: arm 0 clears pending token");
+      World v; v.e.armByte = 1; v.e.clockStep = 0; v.e.now = 100 * S; mode_change_arm_flow(v.e);
+      withdraw_flow(v.e); expect(v.e.mcwin.pending == 0, "MC: withdraw clears pending token");
+      World u; u.e.armByte = 1; u.e.before = good_probe(); u.e.layoutOk = true; u.e.clockStep = 0; u.e.now = 100 * S; mode_change_arm_flow(u.e);
+      expect(u.e.mcwin.pending != 0, "MC: setup - token armed");
+      expect_u("MC: re-arm 1", arm_flow(u.e, 1), kOk); expect(u.e.mcwin.pending == 0, "MC: arm 1 resets pending token");
+      World d; d.e.armedFlag = false; d.e.now = 100 * S; mode_change_arm_flow(d.e);
+      expect(d.e.mcwin.pending == 0 && d.e.mcwin.armed == 0, "MC: disarmed pipe ignores mode-change arm");
+      World lo; lo.e.latch = false; lo.e.now = 100 * S; mode_change_arm_flow(lo.e);
+      expect(lo.e.mcwin.pending == 0 && lo.e.mcwin.armed == 0, "MC: latch OFF ignores mode-change arm"); }
+    { // M6: an uncounted non-DP pipe's slot 267 must NOT steal the DP's mode-change credit
+      World w; w.e.m6 = true; w.e.pipes = { A_PIPE, A_PIPE2 }; w.e.pinst[A_PIPE] = rdna4m6::kInstDp; w.e.pinst[A_PIPE2] = rdna4m6::kInstMonB;
+      w.e.armByte = 1; w.e.clockStep = 0; w.e.now = 100 * S; mode_change_arm_flow(w.e);
+      uint64_t a[2] = { 0, A_RES }, ret = 0;
+      (void)hook_dispatch(w.e, GARNET_VC_DISPLAYPIPE, 267, A_PIPE2, a, 2, &ret);
+      expect(w.e.mcwin.pending != 0 && w.e.mcExemptNotes == 0 && w.e.cg.n == 0, "MC (M6): uncounted non-DP slot 267 does not consume the DP credit");
+      init267(w, 100 * S + 1000000ull, &ret);
+      expect(w.e.mcwin.pending == 0 && w.e.mcExemptNotes == 1 && w.e.cg.n == 0 && w.e.armedFlag, "MC (M6): DP slot 267 then consumes the credit"); }
+    { // concurrent consume race: 4 threads racing on 1 token -> strictly 1 winner
+      struct McRaceEnv {
+          ModeChangeWin m {}; std::atomic<uint32_t> notes { 0 };
+          bool latch_on() { return true; } bool armed() { return true; } bool hung() { return false; }
+          uint64_t now_ns() { return 100ull * 1000000000ull; }
+          ModeChangeWin &mc() { return m; }
+          void note_mode_change_exempt() { notes.fetch_add(1u, std::memory_order_relaxed); }
+      } re;
+      mode_change_arm_flow(re);
+      std::atomic<uint32_t> wins { 0 }; std::vector<std::thread> th;
+      for (int i = 0; i < 4; ++i) th.emplace_back([&]() { if (mode_change_consume_flow(re)) wins.fetch_add(1u, std::memory_order_relaxed); });
+      for (auto &t : th) t.join();
+      expect(wins.load() == 1u && re.notes.load() == 1u && re.m.exempted == 1u && re.m.pending == 0u,
+             "MC: 4 concurrent consumers on 1 token -> strictly 1 exempted"); }
+
     // ---- K4: after an auto-disarm the arm stays refused until an explicit `pipearm 1`; the cause is exposed
     expect(auto_cause_name(kAdWsClose) != nullptr && std::string(auto_cause_name(kAdWsClose)).find("WindowServer GPU client closed while armed") != std::string::npos && std::string(auto_cause_name(kAdNone)) == "none", "K4: cause names");
     expect(disp_flags(true, true, false, true, true, true, 0) == 59 && disp_flags(true, true, false, true, true, true, kAdWsClose) == (59u | 64u | (2u << 8)) && disp_flags(true, true, false, true, true, true, kAdHung) == (59u | 64u | (3u << 8)) &&
@@ -1311,7 +1408,20 @@ int main(int argc, char **argv) {
         expect(c != std::string::npos && t != std::string::npos && d != std::string::npos && c < t && t < d, "R1: K1 order: the uid-88 / latch check, then the window, then the disarm");
         const size_t h1 = flow.find("template <class E> bool hung_latched_flow("), h2 = flow.find("// ---- slot 267:");
         expect(h1 != std::string::npos && h2 > h1 && flow.substr(h1, h2 - h1).find("reload_") == std::string::npos, "R1: K2 (hung_latched_flow) never consults the window");
-        expect(flow.find("if (counted && e.armed() && !reload_on_init_fb(e) && guard_on_init_fb(e.guard(), e.now_ns()))") != std::string::npos && flow.find("const bool counted = rdna4m6::restart_guard_counts(m6, m6 ? e.pipe_inst(pipe) : rdna4m6::kInstDp);") != std::string::npos, "R1: K3: the window is consulted before the guard counts, and only while armed (0.0.660: and the exemption is the pure restart_guard_counts: only a KNOWN monitor A / monitor B pipe)");
+        expect(flow.find("if (counted && e.armed() && !reload_on_init_fb(e) && !mode_change_consume_flow(e) && guard_on_init_fb(e.guard(), e.now_ns()))") != std::string::npos && flow.find("const bool counted = rdna4m6::restart_guard_counts(m6, m6 ? e.pipe_inst(pipe) : rdna4m6::kInstDp);") != std::string::npos, "R1/MC: K3: the reload window and mode-change credit are consulted before the guard counts, and only while armed (0.0.660: and the exemption is the pure restart_guard_counts: only a KNOWN monitor A / monitor B pipe)");
+        {   // MC: glue entry point and primaryfb setDisplayMode call site (after applyHardwareMode succeeds, never on early same-mode return)
+            const std::string pfb = slurp(K + "src/GarnetPrimaryFramebuffer.cpp");
+            expect(ghdr.find("void     rdna4disp_on_mode_change(void);") != std::string::npos &&
+                   glue.find("void rdna4disp_on_mode_change(void) {\n    if (!rdna4disp_latched_on()) return;\n    KernelEnv env;\n    rdna4disp::mode_change_arm_flow(env);\n}") != std::string::npos &&
+                   glue.find("slot 267 exempted by display mode change") != std::string::npos,
+                   "MC: rdna4disp_on_mode_change is declared, latch-gated through mode_change_arm_flow, and logs exempted slot-267 calls");
+            const size_t s0 = pfb.find("IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode("), s1 = pfb.find("\n}\n", s0);
+            const std::string sm = (s0 != std::string::npos && s1 != std::string::npos && s1 > s0) ? pfb.substr(s0, s1 - s0) : std::string();
+            const size_t ap = sm.find("if (!applyHardwareMode(target))"), mc = sm.find("rdna4disp_on_mode_change();"), ok = sm.rfind("return kIOReturnSuccess;");
+            expect(pfb.find("#include \"amd/native_disp.h\"") != std::string::npos && count_of(pfb, "rdna4disp_on_mode_change();") == 1 &&
+                   ap != std::string::npos && mc != std::string::npos && ok != std::string::npos && ap < mc && mc < ok,
+                   "MC: GarnetPrimaryFramebuffer::setDisplayMode arms mode-change credit once, strictly after applyHardwareMode succeeds and before returning kIOReturnSuccess");
+        }
         {   // 0.0.621: every close is tolerated and stamps the settle time BEFORE closeSeen; the 267 closes only through reload_settled; the lazy settle runs in the common honoured check
             const size_t tc = flow.find("template <class E> bool reload_tolerate_close("), tce = flow.find("// K3 side:");
             const std::string tcs = tc != std::string::npos && tce > tc ? flow.substr(tc, tce - tc) : std::string();
