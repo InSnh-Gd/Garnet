@@ -55,6 +55,7 @@ constexpr size_t kOffEntryIsHostBridge = 0x14Du;
 
 constexpr size_t kOffRangeStart = 0x00u;
 constexpr size_t kOffRangeSize = 0x08u;
+constexpr size_t kOffRangeEnd = 0x28u;
 constexpr size_t kOffRangeMinAddr = 0x40u;
 constexpr size_t kOffRangeMaxAddr = 0x48u;
 constexpr size_t kOffRangeFlags = 0x54u;
@@ -646,21 +647,28 @@ inline bool check_root_pfm64_capacity(const void *configurator, const void *devi
         const uint64_t size = read_unaligned<uint64_t>(r + kOffRangeSize);
         const void *allocHead = read_unaligned<const void *>(r + kOffRangeAllocations);
         const void *nextRange = read_unaligned<const void *>(r + kOffRangeNext);
+        const void *sentinel = r + kOffRangeEnd;
 
         if (size != 0ULL && start <= UINT64_MAX - size) {
             const uint64_t end = start + size;
             const uint64_t winStart = start < kAbove4GMin ? kAbove4GMin : start;
             if (end > winStart && (end - winStart) >= requiredSize) {
-                if (!allocHead) {
+                if (!allocHead || allocHead == sentinel) {
                     if (gap_fits_aligned(winStart, end, requiredSize)) return true;
                 } else {
                     uint64_t cursor = winStart;
                     const void *sub = allocHead;
+                    bool hitZeroSize = false;
                     uint32_t aCount = 0;
-                    for (; aCount < kMaxRangeNodes && sub != nullptr; ++aCount) {
+                    for (; aCount < kMaxRangeNodes && sub != nullptr && sub != sentinel; ++aCount) {
                         const uint8_t *s = static_cast<const uint8_t *>(sub);
                         const uint64_t sStart = read_unaligned<uint64_t>(s + kOffRangeStart);
                         const uint64_t sSize = read_unaligned<uint64_t>(s + kOffRangeSize);
+                        // Stop before reading s + kOffRangeNextSub on interior sentinels (size == 0).
+                        if (sSize == 0ULL) {
+                            hitZeroSize = true;
+                            break;
+                        }
                         const void *nextSub = read_unaligned<const void *>(s + kOffRangeNextSub);
                         if (sSize > UINT64_MAX - sStart) break;
                         const uint64_t sEnd = sStart + sSize;
@@ -670,9 +678,10 @@ inline bool check_root_pfm64_capacity(const void *configurator, const void *devi
                         }
                         if (sEnd > cursor) cursor = sEnd;
                         if (cursor >= end) break;
+                        if (nextSub == sub) break;
                         sub = nextSub;
                     }
-                    if (sub == nullptr && cursor < end &&
+                    if ((sub == nullptr || sub == sentinel || hitZeroSize) && cursor < end &&
                         gap_fits_aligned(cursor, end, requiredSize)) {
                         return true;
                     }
@@ -778,6 +787,13 @@ inline bool handle_probe_base_address_register(const ProbeOps &ops,
         return false;
     }
 
+    void *bar0Range = entry_range_slot(device, 0u);
+    if (!bar0Range) {
+        ops.configWrite16(configurator, device, 0x04u, savedCmd, nullptr);
+        __atomic_fetch_add(&counters.passthroughCount, 1ULL, __ATOMIC_RELAXED);
+        return false;
+    }
+
     uint32_t effectiveLastBar = lastBarNum > 6u ? 6u : lastBarNum;
 
     // 1. Expansion ROM (0x30) when effectiveLastBar == 6 (matching Apple display class 0x030000 check).
@@ -800,6 +816,7 @@ inline bool handle_probe_base_address_register(const ProbeOps &ops,
     }
 
     // 2. BAR0 ONLY: preserve full 64-bit size64 and clean64 = 1, then step barNum -> 2.
+    bool bar0Initialized = false;
     {
         uint64_t start64 = static_cast<uint64_t>(origBar0Lo & ~0xFu) |
                            (static_cast<uint64_t>(origBar0Hi) << 32);
@@ -807,11 +824,11 @@ inline bool handle_probe_base_address_register(const ProbeOps &ops,
             start64 = 0ULL;
         }
         const uint64_t mask64 = 0ULL - bar0Size64;
-        void *bar0Range = entry_range_slot(device, 0u);
-        if (bar0Range && start64 != mask64) {
+        if (start64 != mask64) {
             ops.rangeInit(bar0Range, kIOPCIResourcePrefetchMemory,
                           start64, bar0Size64, bar0Size64);
             finalize_range(bar0Range, kIOPCIResourcePrefetchMemory, 1u, fFlags);
+            bar0Initialized = true;
         }
     }
 
@@ -883,9 +900,13 @@ inline bool handle_probe_base_address_register(const ProbeOps &ops,
 
     ops.configWrite16(configurator, device, 0x04u, savedCmd, nullptr);
 
-    __atomic_fetch_add(&counters.interceptCount, 1ULL, __ATOMIC_RELAXED);
-    __atomic_store_n(&counters.preservedBar0Bytes, bar0Size64, __ATOMIC_RELAXED);
-    __atomic_store_n(&counters.deviceId, static_cast<uint32_t>(devId), __ATOMIC_RELAXED);
+    if (bar0Initialized) {
+        __atomic_fetch_add(&counters.interceptCount, 1ULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&counters.preservedBar0Bytes, bar0Size64, __ATOMIC_RELAXED);
+        __atomic_store_n(&counters.deviceId, static_cast<uint32_t>(devId), __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&counters.passthroughCount, 1ULL, __ATOMIC_RELAXED);
+    }
     return true;
 }
 

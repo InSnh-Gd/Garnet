@@ -207,15 +207,17 @@ class GarnetPCIBarCompat : public IOService {
 
 public:
     bool start(IOService *provider) override;
+    bool serializeProperties(OSSerialize *serialize) const override;
     IOReturn setProperties(OSObject *properties) override;
+
+private:
+    void publishDiagnostics();
 };
 
 #define super IOService
 OSDefineMetaClassAndStructors(GarnetPCIBarCompat, IOService)
 
-bool GarnetPCIBarCompat::start(IOService *provider) {
-    if (!super::start(provider)) return false;
-
+void GarnetPCIBarCompat::publishDiagnostics() {
     setProperty("GarnetPCIBarCompat,Status", garnet_pcibar::status_name(gStatus));
     setProperty("GarnetPCIBarCompat,HookInstalled",
                 __atomic_load_n(&gHookInstalled, __ATOMIC_ACQUIRE));
@@ -231,9 +233,19 @@ bool GarnetPCIBarCompat::start(IOService *provider) {
     setProperty("GarnetPCIBarCompat,RefusedBridgeCount",
                 __atomic_load_n(&gCounters.refusedBridgeCount, __ATOMIC_RELAXED), 64);
     setProperty("GarnetPCIBarCompat,LateLoadRefused", gLateLoadRefused);
+}
 
+bool GarnetPCIBarCompat::start(IOService *provider) {
+    if (!super::start(provider)) return false;
+
+    publishDiagnostics();
     registerService();
     return true;
+}
+
+bool GarnetPCIBarCompat::serializeProperties(OSSerialize *serialize) const {
+    const_cast<GarnetPCIBarCompat *>(this)->publishDiagnostics();
+    return super::serializeProperties(serialize);
 }
 
 IOReturn GarnetPCIBarCompat::setProperties(OSObject *properties) {
