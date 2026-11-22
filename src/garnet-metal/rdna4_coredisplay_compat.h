@@ -77,6 +77,7 @@ static void rdna4_coredisplay_compat(io_service_t accelerator) {
     });
 #else
     (void)accelerator;
+    (void)rdna4_cd_bound_primary;
 #endif
 }
 
