@@ -344,7 +344,7 @@ static void p6_vramstat(const std::string &root) {
     expect(at(b, "if (action == rdna4disp::kActVramStat) {") < at(b, "if (action == 83 || action == 84"), "P6: served before the pipe verbs");
     const std::string cli = slurp(root + "/tools/rdna4/native/garnettest.c");
     expect(has(cli, "else if (what && !strcmp(what, \"vramstat\")) in = 108;") && has(cli, "in == 108 ? \"vramstat\"") && has(cli, "if (in == 108) return cmd_vramstat(arg);") && has(cli, "static int cmd_vramstat(const char *a1) {") && has(cli, "dr_call(108, 0, o)"), "P6: the CLI sites (table, name, dispatch, command)");
-    expect(has(cli, "scdcread appallow fbpublish m6stat m6xstat vramstat\\n") && has(cli, "|m6xstat [0|1|2]|vramstat|capstream"), "P6: the known list and the usage string name vramstat");
+    expect(has(cli, "scdcread appallow fbpublish m6stat m6xstat vramstat bartest\\n") && has(cli, "|m6xstat [0|1|2]|vramstat|bartest [0|1]|capstream"), "P6: the known list and the usage string name vramstat and bartest");
     const std::string uc = slurp(root + "/src/garnet/src/GarnetUserClient.cpp");
     expect(has(uc, "108 = vramstat"), "P6: the user client's table comment names the verb (its bound is the pure admission)");
     const std::string pure = slurp(root + "/src/garnet/src/amd/native_disp_pure.h");
@@ -718,6 +718,11 @@ static void p13_bartest(const std::string &root) {
            "P13 pin 3.3: GarnetPrimaryFramebuffer cross-checks config BAR0 and verifies snapshot agreement before peer registration");
     expect(has(gate, "candidate.consolePhysBase != current.consolePhysBase") && has(gate, "consoleEnd > current.vramLimit"),
            "P13 pin 3.3: GarnetDisplayGate verifies console phys/offset and vramLimit on primary registration");
+    const std::string cli = slurp(root + "/tools/rdna4/native/garnettest.c");
+    expect(has(cli, "else if (what && !strcmp(what, \"bartest\")) in = 109;") && has(cli, "in == 109 ? \"bartest\"") &&
+               has(cli, "if (in == 109) return cmd_bartest(arg);") && has(cli, "static int cmd_bartest(const char *a1) {") &&
+               has(cli, "dr_call(109, mode, o)") && has(cli, "fullMode=%s"),
+           "P13 pin 4.2: garnettest exposes accel bartest (action 109) and vramstat bar0FullMode display");
 }
 
 int main(int argc, char **argv) {
