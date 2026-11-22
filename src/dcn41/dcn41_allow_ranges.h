@@ -39,11 +39,12 @@ struct dcn41_deny_range {
 
 /* Checked FIRST, before the allow table: indirect-access windows and Navi 44 hardware freeze hazards.
  * A write to an indirect window selects a target anywhere in SMN or VRAM and the next write goes there,
- * which would defeat an address allowlist; ODM_MEM_PWR_CTRL2 freezes Navi 44 on access. */
+ * which would defeat an address allowlist; ODM_MEM_PWR_CTRL2 freezes Navi 44 on access
+ * (RX4Darwin/AMDRadeonRDNA4.kext PR #17, BSD-3-Clause, Copyright (c) 2026 Sunneva N. Mariu). */
 #define DCN41_HARD_DENY_COUNT 2u
 static const struct dcn41_deny_range dcn41_hard_deny[DCN41_HARD_DENY_COUNT] = {
     { 0x00000000u, 0x000000ffu, "the low BAR5 page: MM_INDEX/MM_DATA/MM_INDEX_HI (0x0/0x1/0x6) and NBIO's BIF_BX1_PCIE_INDEX2/DATA2 (0xe/0xf), RSMU_INDEX/DATA (0x14/0x15) and BIF_BX0_PCIE_INDEX/DATA (0x20/0x21) - indirect windows into all of SMN" },
-    { 0x000052efu, 0x000052efu, "ODM_MEM_PWR_CTRL2 (DMU seg2 + 0x1e2f): Navi 44 (RX 9060 XT) hardware freeze / device lost from bus hazard (RX4Darwin/AMDRadeonRDNA4.kext PR #17, BSD-3-Clause)" },
+    { 0x000052efu, 0x000052efu, "ODM_MEM_PWR_CTRL2 (DMU seg2 + 0x1e2f): Navi 44 (RX 9060 XT) hardware freeze / device lost from bus hazard" },
 };
 
 /* Checked SECOND. None of these intersects an allowed range (gen_allow.py asserts it); they are named

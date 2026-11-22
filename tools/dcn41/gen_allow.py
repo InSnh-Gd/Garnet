@@ -61,7 +61,7 @@ HARD_DENY = [
     # Copyright (c) 2026 Sunneva N. Mariu): reading ODM_MEM_PWR_CTRL2 (DMU seg2 + 0x1e2f)
     # causes a bus-loss freeze on Navi 44 (RX 9060 XT).
     (0x000052ef, 0x000052ef, "ODM_MEM_PWR_CTRL2 (DMU seg2 + 0x1e2f): Navi 44 (RX 9060 XT) hardware "
-                             "freeze / device lost from bus hazard (RX4Darwin/AMDRadeonRDNA4.kext PR #17)"),
+                             "freeze / device lost from bus hazard"),
 ]
 
 # Documented blocks that must never be reachable. None of them overlaps a display range - the generator
