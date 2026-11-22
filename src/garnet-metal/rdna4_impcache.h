@@ -3,7 +3,7 @@
 //
 //  (A) IMPORT CACHE.  One host import (a VkDeviceMemory over the whole IOSurface allocation) is shared by all live textures of the same IOSurface. Key: (IOSurface id,
 //      base address, import size). Each entry is refcounted by textures. When the last texture lets go the entry stays cached (unused) for RDNA4IC_IDLE_NS, and the cache
-//      keeps at most RDNA4IC_CAP bytes of UNUSED entries (oldest unused evicted first). An entry whose id comes back with another base or size is marked stale: it can no
+//      keeps at most capBytes (RDNA4IC_CAP default, RDNA4IC_CAP_WS in WindowServer) of UNUSED entries (oldest unused evicted first). An entry whose id comes back with another base or size is marked stale: it can no
 //      longer be matched, and is released as soon as its last texture lets go. Memory the cache gives up goes to a release queue; every item carries a fence stamp
 //      (the P1 `submitted` serial at the moment it was given up, 0 when the pool is OFF) and rdna4ic_pop hands it out only when `completed` >= stamp. The cache never
 //      calls Vulkan: the caller drains the queue (vkFreeMemory + CFRelease of the entry's owner) outside its mutex.
@@ -29,17 +29,20 @@ static inline int rdna4f1_inject(unsigned every, unsigned long *ctr) { if (!ever
 
 #define RDNA4IC_IDLE_NS  2000000000ULL
 #define RDNA4IC_CAP      (128ULL << 20)
+#define RDNA4IC_CAP_WS   (512ULL << 20)
+static inline uint64_t rdna4ic_cap_for_process(int isWs) { return isWs ? RDNA4IC_CAP_WS : RDNA4IC_CAP; }
 
 typedef struct { uint32_t id; uint64_t base, size; void *mem, *owner; int refs, stale; uint64_t lastUnref; } rdna4ic_ent;
 typedef struct { void *mem, *owner; uint64_t size, stamp; } rdna4ic_rel;
 typedef struct {
-    int on; rdna4ic_ent *e; size_t n, c; uint64_t cachedBytes, liveBytes;   // cachedBytes = unused entries; liveBytes = every entry (what the kernel holds for us)
+    int on; rdna4ic_ent *e; size_t n, c; uint64_t cachedBytes, liveBytes, capBytes;   // cachedBytes = unused entries; liveBytes = every entry (what the kernel holds for us)
     rdna4ic_rel *rl; size_t nrl, crl;
     uint64_t created, reused, evIdle, evCap, evStale, evFlush, mismatches;
 } rdna4ic_cache;
 
-static inline void rdna4ic_init(rdna4ic_cache *c, int on) { memset(c, 0, sizeof *c); c->on = on; }
-static inline void rdna4ic_destroy(rdna4ic_cache *c) { free(c->e); free(c->rl); { int on = c->on; memset(c, 0, sizeof *c); c->on = on; } }
+static inline void rdna4ic_init(rdna4ic_cache *c, int on) { memset(c, 0, sizeof *c); c->on = on; c->capBytes = RDNA4IC_CAP; }
+static inline void rdna4ic_set_cap(rdna4ic_cache *c, uint64_t capBytes) { c->capBytes = capBytes ? capBytes : RDNA4IC_CAP; }
+static inline void rdna4ic_destroy(rdna4ic_cache *c) { free(c->e); free(c->rl); { int on = c->on; uint64_t cap = c->capBytes; memset(c, 0, sizeof *c); c->on = on; c->capBytes = cap; } }
 static inline void rdna4ic_release_ent(rdna4ic_cache *c, size_t i, uint64_t stamp) {   // moves entry i to the release queue
     if (c->nrl == c->crl) { c->crl = c->crl ? c->crl * 2 : 16; c->rl = (rdna4ic_rel *)realloc(c->rl, c->crl * sizeof *c->rl); }
     c->rl[c->nrl++] = (rdna4ic_rel){ c->e[i].mem, c->e[i].owner, c->e[i].size, stamp };
@@ -94,8 +97,9 @@ static inline int rdna4ic_unref(rdna4ic_cache *c, void *mem, uint64_t now, uint6
         if (c->e[i].refs == 0) {
             if (c->e[i].stale) { c->evStale++; rdna4ic_release_ent(c, i, stamp); }
             else {
+                const uint64_t cap = c->capBytes ? c->capBytes : RDNA4IC_CAP;
                 c->e[i].lastUnref = now; c->cachedBytes += c->e[i].size;
-                while (c->cachedBytes > RDNA4IC_CAP) {   // oldest unused first
+                while (c->cachedBytes > cap) {   // oldest unused first
                     size_t o = c->n; for (size_t k = 0; k < c->n; k++) if (c->e[k].refs == 0 && !c->e[k].stale && (o == c->n || c->e[k].lastUnref < c->e[o].lastUnref)) o = k;
                     if (o == c->n) break;
                     c->cachedBytes -= c->e[o].size; c->evCap++; rdna4ic_release_ent(c, o, stamp);

@@ -245,7 +245,7 @@ static void rdna4_drawopt_report(unsigned tick) {
 // ---------------------------------------------------------------------------------------------------------------
 // P4 import cache (rdna4_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/rdna4m-noimpcache switches it OFF, latched ONCE at device creation;
 // OFF = -initWithDevice:descriptor:iosurface:plane: and -dealloc run the per-texture import exactly as before (`_impShared` stays NO).
-//  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused.
+//  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused (512 MiB in WindowServer).
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
 //  * An import given up is vkFreeMemory'd only once the P1 fence has cleared the serial taken when it was given up (stamp 0 / completed 0 when the pool is OFF = as today).
 // ---------------------------------------------------------------------------------------------------------------
@@ -255,8 +255,9 @@ static void rdna4_imp_latch(void) {
     static int done; if (done) return; done = 1;
     RDNA4IC.on = rdna4ic_default_on(access(RDNA4_IMPCACHE_KILL_FILE, F_OK) == 0) ? YES : NO;   // build 16 (F2): default ON
     rdna4ic_init(&RDNA4IC.c, RDNA4IC.on);
+    rdna4ic_set_cap(&RDNA4IC.c, rdna4ic_cap_for_process(rdna4_is_ws() ? 1 : 0));
     if (RDNA4IC.on) RDNA4LOG("P4 impcache: ON (default since build 16; kill file %s absent at device creation; latched for the life of this process): one shared import per IOSurface, kept %llu ms after its last texture, <= %llu MiB unused, frees fence-gated (%s)",
-        RDNA4_IMPCACHE_KILL_FILE, (unsigned long long)(RDNA4IC_IDLE_NS / 1000000ULL), (unsigned long long)(RDNA4IC_CAP >> 20), RDNA4P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
+        RDNA4_IMPCACHE_KILL_FILE, (unsigned long long)(RDNA4IC_IDLE_NS / 1000000ULL), (unsigned long long)(RDNA4IC.c.capBytes >> 20), RDNA4P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
     else RDNA4LOG("P4 impcache: OFF (kill file %s present at device creation; latched for the life of this process)", RDNA4_IMPCACHE_KILL_FILE);
 }
 static void rdna4_imp_fence(uint64_t *stamp, uint64_t *completed) {

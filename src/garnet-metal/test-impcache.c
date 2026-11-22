@@ -273,6 +273,89 @@ int main(void) {
     CHECK("F1: ANY refused import falls back to the GPU-only image, never to nil", rdna4f1_action(-2) == RDNA4F1_FALLBACK && rdna4f1_action(-1) == RDNA4F1_FALLBACK && rdna4f1_action(-1000072003) == RDNA4F1_FALLBACK, "fallback");
     { unsigned long c = 0; int hits = 0; for (int i = 0; i < 100; i++) hits += rdna4f1_inject(4, &c);
       CHECK("F1 hook: every 4th attempt fails (25 of 100), 0 = never", hits == 25 && (c = 0, rdna4f1_inject(0, &c) == 0 && c == 0), "hits %d", hits); }
+
+    // ---- 9. per-process cap (128 MiB app default vs 512 MiB WindowServer) --------------------------------------------------------------
+    CHECK("cap policy: non-WindowServer stays 128 MiB, WindowServer gets 512 MiB",
+          rdna4ic_cap_for_process(0) == 128 * MIB && rdna4ic_cap_for_process(1) == 512 * MIB,
+          "app %llu MiB ws %llu MiB", (unsigned long long)(rdna4ic_cap_for_process(0) >> 20), (unsigned long long)(rdna4ic_cap_for_process(1) >> 20));
+    {
+        // Zero-init and set_cap(0) both fall back safely to the 128 MiB default cap.
+        rdna4ic_cache z;
+        memset(&z, 0, sizeof z);
+        z.on = 1;
+        for (uint32_t i = 0; i < 4; i++) {
+            rdna4ic_add(&z, 300 + i, 0x10000ULL * (i + 1), 40 * MIB, M(0x300 + i), M(0x380 + i));
+            rdna4ic_unref(&z, M(0x300 + i), 10 + i, 0);
+        }
+        CHECK("zero-init cache enforces 128 MiB fallback cap", z.evCap == 1 && z.cachedBytes == 120 * MIB && z.nrl == 1 && z.rl[0].mem == M(0x300),
+              "evCap %llu cached %llu MiB", (unsigned long long)z.evCap, (unsigned long long)(z.cachedBytes >> 20));
+        rdna4ic_set_cap(&z, 0);
+        CHECK("rdna4ic_set_cap(0) keeps 128 MiB default cap", z.capBytes == 128 * MIB, "cap %llu MiB", (unsigned long long)(z.capBytes >> 20));
+        rdna4ic_destroy(&z);
+    }
+    {
+        // WindowServer holds >128 MiB (208 MiB: 160 MiB desktop windows + 3x16 MiB rotating swapchain) with 0 cap evictions and 100% reuse.
+        rdna4ic_cache ws;
+        rdna4ic_init(&ws, 1);
+        rdna4ic_set_cap(&ws, rdna4ic_cap_for_process(1));
+        for (uint32_t i = 0; i < 4; i++) {
+            rdna4ic_add(&ws, 400 + i, 0x10000ULL * (i + 1), 40 * MIB, M(0x400 + i), M(0x440 + i));
+            rdna4ic_unref(&ws, M(0x400 + i), 1000 + i, 0);
+        }
+        for (uint32_t i = 0; i < 3; i++) {
+            rdna4ic_add(&ws, 500 + i, 0x100000ULL * (i + 1), 16 * MIB, M(0x500 + i), M(0x540 + i));
+            rdna4ic_unref(&ws, M(0x500 + i), 2000 + i, 0);
+        }
+        int swapHits = 0;
+        uint64_t t = 10000;
+        for (int f = 0; f < 30; f++) {
+            uint32_t slot = (uint32_t)(f % 3);
+            void *hitMem = NULL;
+            if (rdna4ic_acquire(&ws, 500 + slot, 0x100000ULL * (slot + 1), 16 * MIB, t, 0, &hitMem) && hitMem == M(0x500 + slot)) {
+                swapHits++;
+                rdna4ic_unref(&ws, hitMem, t + 1000000ULL, 0);
+            }
+            t += 6250000ULL;   // ~160 Hz frame spacing
+        }
+        CHECK("WindowServer cache holds 208 MiB rotating swapchain with 0 cap evictions and 100% reuse",
+              ws.capBytes == 512 * MIB && ws.cachedBytes == 208 * MIB && ws.evCap == 0 && ws.nrl == 0 && swapHits == 30 && ws.reused == 30,
+              "cached %llu MiB evCap %llu hits %d reused %llu", (unsigned long long)(ws.cachedBytes >> 20), (unsigned long long)ws.evCap, swapHits, (unsigned long long)ws.reused);
+
+        // Idle trim (> RDNA4IC_IDLE_NS) still reclaims idle desktop entries; flush reclaims the rest.
+        rdna4ic_trim(&ws, 1003 + RDNA4IC_IDLE_NS + 1, 7);
+        CHECK("WindowServer cache still reclaims idle entries after RDNA4IC_IDLE_NS",
+              ws.evIdle == 4 && ws.cachedBytes == 48 * MIB && ws.n == 3 && ws.nrl == 4,
+              "evIdle %llu cached %llu MiB n %zu queued %zu", (unsigned long long)ws.evIdle, (unsigned long long)(ws.cachedBytes >> 20), ws.n, ws.nrl);
+        size_t flushed = rdna4ic_flush(&ws, 8);
+        CHECK("WindowServer cache still reclaims all unused entries on rdna4ic_flush",
+              flushed == 3 && ws.evFlush == 3 && ws.cachedBytes == 0 && ws.liveBytes == 0 && ws.n == 0 && ws.nrl == 7,
+              "flushed %zu cached %llu live %llu queued %zu", flushed, (unsigned long long)ws.cachedBytes, (unsigned long long)ws.liveBytes, ws.nrl);
+        rdna4ic_destroy(&ws);
+    }
+    {
+        // WindowServer cache still enforces the 512 MiB cap, evicting oldest unused first.
+        rdna4ic_cache ws;
+        rdna4ic_init(&ws, 1);
+        rdna4ic_set_cap(&ws, rdna4ic_cap_for_process(1));
+        for (uint32_t i = 0; i < 8; i++) {
+            rdna4ic_add(&ws, 600 + i, 0x20000ULL * (i + 1), 64 * MIB, M(0x600 + i), M(0x680 + i));
+            rdna4ic_unref(&ws, M(0x600 + i), 100 + i * 10, 0);
+        }
+        CHECK("WindowServer cache holds exactly 512 MiB unused with 0 evictions",
+              ws.cachedBytes == 512 * MIB && ws.evCap == 0 && ws.nrl == 0,
+              "cached %llu MiB evCap %llu", (unsigned long long)(ws.cachedBytes >> 20), (unsigned long long)ws.evCap);
+        rdna4ic_add(&ws, 608, 0x20000ULL * 9, 64 * MIB, M(0x608), M(0x688));
+        rdna4ic_unref(&ws, M(0x608), 200, 0);
+        CHECK("WindowServer cache > 512 MiB evicts oldest unused (0x600) first",
+              ws.cachedBytes == 512 * MIB && ws.evCap == 1 && ws.nrl == 1 && ws.rl[0].mem == M(0x600),
+              "cached %llu MiB evCap %llu evicted %p", (unsigned long long)(ws.cachedBytes >> 20), (unsigned long long)ws.evCap, ws.nrl ? ws.rl[0].mem : NULL);
+        CHECK("WindowServer evicted entry misses while surviving entries still hit",
+              !rdna4ic_acquire(&ws, 600, 0x20000ULL, 64 * MIB, 201, 0, &m) &&
+              rdna4ic_acquire(&ws, 601, 0x40000ULL, 64 * MIB, 201, 0, &m) && m == M(0x601),
+              "hit %p", m);
+        rdna4ic_destroy(&ws);
+    }
+
     printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails != 0;
 }
