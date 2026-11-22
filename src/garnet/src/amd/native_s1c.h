@@ -98,6 +98,10 @@ IOReturn n1c_memory_for_handle(const N1cRef &ref, uint32_t handle, IOOptionBits 
 // other instance's pair (held or pinned) never blocks it. Free gives BOTH back (the caller does it only after the instance's HUBP clock reads off); with none held it is a no-op. Neither touches a register or any memory.
 IOReturn n1c_d2_alloc(BringupContext &ctx, uint32_t inst, uint64_t bytes, uint64_t mc[2], uint64_t off[2]);
 void n1c_d2_free(uint32_t inst);
+// Exclusive visible-VRAM allocator helpers serialized under gCliLock (for diagnostic direct-BAR tests).
+bool n1c_vram_alloc_excl(BringupContext &ctx, uint64_t bytes, uint64_t align, VRAMAllocation *out);
+bool n1c_vram_alloc_excl_at(BringupContext &ctx, uint64_t gpuVa, uint64_t bytes, VRAMAllocation *out);
+void n1c_vram_free_excl(BringupContext &ctx, const VRAMAllocation &a);
 // 0.0.652 (M5, `accel disp2 fbhold 2`): pin the pair for the rest of the boot (the framebuffer scans A, WindowServer maps it). pin: under gCliLock, true only when the allocator holds exactly mc[0] / mc[1] for that instance and nothing was pinned yet. While
 // pinned n1c_d2_free is a LOGGED NO-OP (nothing returns to the allocator; the pair stays held, so a second alloc is refused as before). There is no unpin: a reboot is the release. 0.0.655: per instance.
 bool n1c_d2_pin(uint32_t inst, const uint64_t mc[2]);

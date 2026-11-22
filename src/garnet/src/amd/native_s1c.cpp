@@ -30,6 +30,7 @@
 #include <libkern/OSAtomic.h>
 
 #include "native_s1c.h"
+#include "rebar_pure.h"
 #include "native_hostimport_pure.h"   // 0.0.612 (ABI 1.9): BoImportHost
 #include "native_buffer_pure.h"
 #include "GarnetMetalNub.hpp"        // 0.0.612: hungLatched() writes Garnet,Ready = 0
@@ -638,7 +639,7 @@ struct PtMem {
                 VRAMAllocation a {};
                 if (!gCtx->gmc.vram_alloc.alloc(kArenaBlockBytes, kArenaBlockBytes, &a)) return 0ull;
                 const uint64_t off = a.gpu_va - gCtx->gmc.vram_start;
-                if (a.size < kArenaBlockBytes || off + a.size > gCtx->dev->bar0Size) { gCtx->gmc.vram_alloc.free(a); return 0ull; }
+                if (a.size < kArenaBlockBytes || a.gpu_va < gCtx->gmc.vram_start || off > gCtx->dev->bar0Size || a.size > gCtx->dev->bar0Size - off) { gCtx->gmc.vram_alloc.free(a); return 0ull; }
                 gPt[gPtN] = a;
                 idx = gPtN++;
             }
@@ -883,7 +884,7 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         if (!gPark.have) {
             if (!ctx.gmc.vram_alloc.alloc(kArenaBlockBytes, kArenaBlockBytes, &gPark.a)) { rc = kIOReturnNoMemory; break; }
             const uint64_t off = gPark.a.gpu_va - ctx.gmc.vram_start;
-            if (off + gPark.a.size > dev->bar0Size) { ctx.gmc.vram_alloc.free(gPark.a); rc = kIOReturnNoMemory; break; }
+            if (!rdna4rebar::vis_vram_range_ok(gPark.a.gpu_va, gPark.a.size, ctx.gmc.vram_start, dev->vramLimit, dev->bar0Size, dev->vramSizeBytes)) { ctx.gmc.vram_alloc.free(gPark.a); rc = kIOReturnNoMemory; break; }
             bar0_memset_vram(*dev, off, 0, gPark.a.size);
             amdgpu_hdp_flush(*dev);
             gPark.pa = pa_of_mc(gPark.a.gpu_va);
@@ -1261,8 +1262,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
                 }
                 got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);
                 if (got) {
-                    const uint64_t off = a.gpu_va - gCtx->gmc.vram_start;
-                    if (off + a.size > dev.bar0Size) { gCtx->gmc.vram_alloc.free(a); got = false; }
+                    if (!rdna4rebar::vis_vram_range_ok(a.gpu_va, a.size, gCtx->gmc.vram_start, dev.vramLimit, dev.bar0Size, dev.vramSizeBytes)) { gCtx->gmc.vram_alloc.free(a); got = false; }
                 }
             }
             if (got) {
@@ -1325,7 +1325,7 @@ IOReturn n1c_d2_alloc(BringupContext &ctx, uint32_t inst, uint64_t bytes, uint64
         for (uint32_t k = 0; k < 2 && ok; k++) {
             if (!ctx.gmc.vram_alloc.alloc(bytes, 65536, &a[k])) { ok = false; break; }
             got = k + 1;
-            ok = (a[k].gpu_va & 0xFFFFull) == 0 && a[k].gpu_va >= ctx.gmc.vram_start && (a[k].gpu_va - ctx.gmc.vram_start) + a[k].size <= ctx.dev->bar0Size;     // 64 KiB aligned and INSIDE the BAR0 aperture, else give it back
+            ok = (a[k].gpu_va & 0xFFFFull) == 0 && rdna4rebar::vis_vram_range_ok(a[k].gpu_va, a[k].size, ctx.gmc.vram_start, ctx.dev->vramLimit, ctx.dev->bar0Size, ctx.dev->vramSizeBytes);     // 64 KiB aligned and INSIDE valid visible BAR0, else give it back
         }
         if (!ok) {
             for (uint32_t k = 0; k < got; k++) ctx.gmc.vram_alloc.free(a[k]);
@@ -1338,6 +1338,38 @@ IOReturn n1c_d2_alloc(BringupContext &ctx, uint32_t inst, uint64_t bytes, uint64
     IOLockUnlock(gCliLock);
     return rc;
 }
+bool n1c_vram_alloc_excl(BringupContext &ctx, uint64_t bytes, uint64_t align, VRAMAllocation *out) {
+    if (!out || bytes == 0 || !ctx.dev || lazy_lock(&gCliLock) == nullptr) return false;
+    bool ok = false;
+    IOLockLock(gCliLock);
+    if (ctx.gmc.vram_alloc.is_inited() && ctx.gmc.vram_alloc.alloc(bytes, align, out)) {
+        if (rdna4rebar::vis_vram_range_ok(out->gpu_va, out->size, ctx.gmc.vram_start, ctx.dev->vramLimit, ctx.dev->bar0Size, ctx.dev->vramSizeBytes))
+            ok = true;
+        else
+            ctx.gmc.vram_alloc.free(*out);
+    }
+    IOLockUnlock(gCliLock);
+    return ok;
+}
+bool n1c_vram_alloc_excl_at(BringupContext &ctx, uint64_t gpuVa, uint64_t bytes, VRAMAllocation *out) {
+    if (!out || bytes == 0 || !ctx.dev || lazy_lock(&gCliLock) == nullptr) return false;
+    bool ok = false;
+    IOLockLock(gCliLock);
+    if (ctx.gmc.vram_alloc.is_inited() &&
+        rdna4rebar::vis_vram_range_ok(gpuVa, bytes, ctx.gmc.vram_start, ctx.dev->vramLimit, ctx.dev->bar0Size, ctx.dev->vramSizeBytes) &&
+        ctx.gmc.vram_alloc.alloc_at(gpuVa, bytes, out)) {
+        ok = true;
+    }
+    IOLockUnlock(gCliLock);
+    return ok;
+}
+void n1c_vram_free_excl(BringupContext &ctx, const VRAMAllocation &a) {
+    if (a.size == 0 || gCliLock == nullptr) return;
+    IOLockLock(gCliLock);
+    if (ctx.gmc.vram_alloc.is_inited()) ctx.gmc.vram_alloc.free(a);
+    IOLockUnlock(gCliLock);
+}
+
 void n1c_d2_free(uint32_t inst) {
     if ((inst != 1u && inst != 2u) || gCliLock == nullptr) return;
     const uint32_t sl = d2slot(inst);
@@ -2191,12 +2223,23 @@ IOReturn n1c_memory_for_handle(const N1cRef &ref, uint32_t handle, IOOptionBits 
             // ONE descriptor per BO (0.0.602): IOConnectUnmapMemory64 finds the existing mapping by descriptor identity, so a fresh object per call
             // could never be unmapped. Created on first use, kept in the BO record, retained for each caller, released once at BoFree / close.
             if (b.vmd == nullptr) {
-                const uint64_t phys = gCtx->dev->bar0Phys + (b.mc - gCtx->gmc.vram_start);
-                b.vmd = IODeviceMemory::withRange((IOPhysicalAddress)phys, (IOPhysicalLength)b.size);
+                uint64_t phys = 0;
+                if (!gCtx || !gCtx->dev ||
+                    !rdna4rebar::cpu_map_vram_ok(b.mc, b.size, gCtx->gmc.vram_start, gCtx->dev->vramBase,
+                                                 rdna4rebar::kVisAllocOffset, gCtx->dev->vramLimit, gCtx->dev->bar0Size,
+                                                 gCtx->dev->bar0Phys, gCtx->dev->vramSizeBytes, &phys)) {
+                    rc = kIOReturnNotPermitted;
+                } else {
+                    IODeviceMemory *created = IODeviceMemory::withRange((IOPhysicalAddress)phys, (IOPhysicalLength)b.size);
+                    if (created != nullptr && created->getLength() != b.size) { created->release(); created = nullptr; }
+                    b.vmd = created;
+                }
             }
-            IODeviceMemory *md = b.vmd;
-            if (md == nullptr) rc = kIOReturnNoMemory;
-            else { md->retain(); *memory = md; if (options) *options |= kIOMapWriteCombineCache; }   // NOTE: XNU's mapClientMemory64 replaces the cache bits with the caller's own mapFlags, so a caller that wants write-combining passes kIOMapWriteCombineCache itself
+            if (rc == kIOReturnSuccess) {
+                IODeviceMemory *md = b.vmd;
+                if (md == nullptr) rc = kIOReturnNoMemory;
+                else { md->retain(); *memory = md; if (options) *options |= kIOMapWriteCombineCache; }   // NOTE: XNU's mapClientMemory64 replaces the cache bits with the caller's own mapFlags, so a caller that wants write-combining passes kIOMapWriteCombineCache itself
+            }
         }
     }
     sess_unlock(s);
@@ -2512,7 +2555,7 @@ struct G1Env {
             VRAMAllocation a {};
             if (!gCtx->gmc.vram_alloc.alloc(kTestBytes, kArenaBlockBytes, &a)) { rc = kNoMemory; break; }
             const uint64_t off = a.gpu_va - gCtx->gmc.vram_start;
-            if (a.size < kTestBytes || off + a.size > dev.bar0Size) { gCtx->gmc.vram_alloc.free(a); rc = kNoMemory; break; }
+            if (a.size < kTestBytes || !rdna4rebar::vis_vram_range_ok(a.gpu_va, a.size, gCtx->gmc.vram_start, dev.vramLimit, dev.bar0Size, dev.vramSizeBytes)) { gCtx->gmc.vram_alloc.free(a); rc = kNoMemory; break; }
             bar0_memset_vram(dev, off, 0, kTestBytes);
             Bo b {};
             b.kind = kBoVis; b.uc = true; b.size = kTestBytes; b.mc = a.gpu_va; b.a = a;

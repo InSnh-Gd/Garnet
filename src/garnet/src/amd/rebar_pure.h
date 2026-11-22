@@ -17,12 +17,17 @@ namespace rdna4rebar {
 
 constexpr uint64_t kMiB = 1ull << 20;
 constexpr uint64_t kGiB = 1ull << 30;
-constexpr uint64_t kMaxBar0Map  = kGiB;            // 0.0.663 (item 1): the most BAR0 the kext ever maps. Tahoe's IOPCIFamily cannot size a BAR above 1 GiB (REBAR.md F1), so a full BAR is mapped and anything larger is capped.
+constexpr uint64_t kMaxBar0Map  = kGiB;            // 0.0.663 (item 1): default boot cap (1 GiB); full 16 GiB BAR requires explicit garnet-full-bar=1 opt-in
+constexpr uint64_t kMaxBar0Full = 16ull * kGiB;    // explicit opt-in full-BAR cap (16 GiB, ReBAR code 14)
+constexpr uint32_t kFullBarRebarCode = 14u;
 constexpr uint64_t kLimitAlign  = 64ull << 10;     // vramLimit is rounded DOWN to this
 constexpr uint64_t kLimitSlack  = 64ull << 20;     // vramLimit <= VRAM size - hi reserve - this
 constexpr uint64_t kLegacyBar   = 256ull << 20;    // today's BAR0; above it a ReBAR capability read is REQUIRED (no capability read = no cross-check = refuse)
 constexpr uint64_t kApertureTail = 64ull << 10;    // the top check sits this far below vramLimit
 constexpr uint64_t kNoConsole   = ~0ull;           // PlanIn::consoleOff when the console was not located inside BAR0
+
+constexpr bool     full_bar_enabled(bool present, uint32_t value) { return present && value == 1u; }
+constexpr uint64_t map_cap_for(bool fullBar) { return fullBar ? kMaxBar0Full : kMaxBar0Map; }
 
 enum Reason : uint32_t {
     kOk = 0,
@@ -39,7 +44,9 @@ enum Reason : uint32_t {
     kMapCapZero = 11,
     kRebarSizeBad = 12,      // the capability's size code is not a power of two we can hold (code >= 40)
     kConsoleOverlap = 13,    // 0.0.664 (F5): vramBase, a check point or the visible pool overlaps the console or its 64 KiB cursor
-    kLenTooBig = 14          // 0.0.664 (F3): the length exceeds the map cap (1 GiB): IOPCIFamily mis-sized the BAR
+    kLenTooBig = 14,         // 0.0.664 (F3): the length exceeds the map cap: IOPCIFamily mis-sized the BAR or full BAR was not opted in
+    kFullBarNotAssigned = 15,// garnet-full-bar=1 requested, but BAR0 is not a full-VRAM ReBAR aperture
+    kBarOverlap = 16         // BAR0 overlaps another PCI BAR or expansion ROM of this device
 };
 
 inline const char *reason_name(uint32_t r) {
@@ -55,11 +62,27 @@ inline const char *reason_name(uint32_t r) {
     case kRebarSizeBad: return "the ReBAR size code is out of range";
     case kConsoleOverlap: return "the bring-up region, a check point or the visible pool overlaps the console or its cursor";
     case kLenTooBig: return "BAR0 length is above the map cap (IOPCIFamily mis-sized the BAR)";
+    case kFullBarNotAssigned: return "full BAR requested (garnet-full-bar=1) but BAR0 does not cover VRAM";
+    case kBarOverlap: return "BAR0 overlaps another PCI BAR of this device";
     default: return "?";
     }
 }
 
 constexpr bool is_pow2(uint64_t v) { return v != 0ull && (v & (v - 1ull)) == 0ull; }
+
+constexpr bool ranges_overlap_64(uint64_t aBase, uint64_t aLen, uint64_t bBase, uint64_t bLen) {
+    if (aLen == 0ull || bLen == 0ull) return false;
+    const uint64_t aEnd = aBase > ~0ull - aLen ? ~0ull : aBase + aLen;
+    const uint64_t bEnd = bBase > ~0ull - bLen ? ~0ull : bBase + bLen;
+    return aBase < bEnd && bBase < aEnd;
+}
+constexpr bool bar_overlaps_any(uint64_t base, uint64_t len, const uint64_t *otherBase, const uint64_t *otherLen, uint32_t n) {
+    if (len == 0ull || !otherBase || !otherLen) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ranges_overlap_64(base, len, otherBase[i], otherLen[i])) return true;
+    }
+    return false;
+}
 
 struct PlanIn {
     uint64_t ioLen;          // IOPCIFamily: getDeviceMemoryWithRegister(BAR0)->getLength() (0 = absent)
@@ -71,7 +94,9 @@ struct PlanIn {
     uint64_t hiReserve;      // kVramHiTotalReserve (amdgpu_gmc.h)
     uint64_t consoleOff;     // the console's offset inside BAR0 (kNoConsole = not located)
     uint64_t consoleLen;
-    uint64_t mapCap;         // kMaxBar0Map in production; a test may pass more
+    uint64_t mapCap;         // kMaxBar0Map by default; kMaxBar0Full when garnet-full-bar=1
+    bool     requireFullBar = false;   // true when garnet-full-bar=1: refuse rather than silently claiming full BAR on a small BAR
+    bool     barOverlap = false;       // true when BAR0 overlaps another PCI BAR / ROM of this device
 };
 struct PlanOut { bool ok; uint32_t reason; uint64_t mapLen; uint64_t vramLimit; };
 
@@ -87,10 +112,13 @@ constexpr PlanOut plan_bar0(const PlanIn &in) {
     if ((in.ioAddr & (in.ioLen - 1ull)) != 0ull) { r.reason = kAddrMisaligned; return r; }
     if (in.ioAddr + in.ioLen < in.ioAddr) { r.reason = kAddrWrap; return r; }
     if (in.cfgAddr != in.ioAddr) { r.reason = kAddrMismatch; return r; }
+    if (in.barOverlap) { r.reason = kBarOverlap; return r; }
     if (in.rebarPresent) { if (in.rebarBytes != in.ioLen) { r.reason = kRebarMismatch; return r; } }
     else if (in.ioLen > kLegacyBar) { r.reason = kNoRebarCap; return r; }
-    const uint64_t mapLen = in.ioLen < in.mapCap ? in.ioLen : in.mapCap;
+    if (in.hiReserve > ~0ull - kLimitSlack) { r.reason = kVramTooSmall; return r; }
     if (in.vramBytes <= in.hiReserve + kLimitSlack) { r.reason = kVramTooSmall; return r; }
+    if (in.requireFullBar && (!in.rebarPresent || in.ioLen <= kMaxBar0Map || in.ioLen < in.vramBytes)) { r.reason = kFullBarNotAssigned; return r; }
+    const uint64_t mapLen = in.ioLen < in.mapCap ? in.ioLen : in.mapCap;
     const uint64_t cap = in.vramBytes - in.hiReserve - kLimitSlack;
     uint64_t lim = mapLen < cap ? mapLen : cap;
     lim &= ~(kLimitAlign - 1ull);
@@ -209,12 +237,95 @@ constexpr LatchOut bar0_latch(uint64_t ioBase, uint64_t ioLen, uint64_t cfgBase,
 // ---- the aperture check points (item 4) ----------------------------------------------------------------------------------------------------
 // vramBase, the middle (64 KiB aligned) and vramLimit - 64 KiB; each has 16 bytes tested, so each must lie inside the mapped window. false = degenerate (refuse).
 constexpr bool aperture_points(uint64_t vramBase, uint64_t vramLimit, uint64_t bar0Size, uint64_t out[3]) {
-    if (vramLimit > bar0Size || vramLimit < kApertureTail + 16ull || vramBase + 16ull > vramLimit) return false;
+    if (vramLimit > bar0Size || vramLimit < kApertureTail + 16ull || vramBase > vramLimit - 16ull) return false;
     const uint64_t top = vramLimit - kApertureTail;
     const uint64_t mid = (vramBase + ((vramLimit - vramBase) >> 1)) & ~(kLimitAlign - 1ull);
     if (!(vramBase < mid && mid < top)) return false;
     out[0] = vramBase; out[1] = mid; out[2] = top;
     return true;
+}
+
+// Full-BAR multi-point aperture check boundaries (4/8/12 GiB straddle points strictly inside (vramBase, top)
+// and below both vramLimit and valid VRAM vramBytes). Returns 0 for small BARs (<= 1 GiB).
+constexpr uint32_t kMaxExtraAperturePoints = 8u;
+constexpr uint32_t aperture_boundary_points(uint64_t vramBase, uint64_t vramLimit, uint64_t bar0Size,
+                                            uint64_t vramBytes, uint64_t out[kMaxExtraAperturePoints]) {
+    if (!out || vramLimit <= kMaxBar0Map || vramLimit > bar0Size) return 0u;
+    if (vramBytes != 0ull && vramLimit > vramBytes) return 0u;
+    if (vramLimit < kApertureTail + 16ull || vramBase > vramLimit - 16ull) return 0u;
+    const uint64_t topPt = vramLimit - kApertureTail;
+    const uint64_t candidates[6] = {
+        4ull * kGiB - kApertureTail, 4ull * kGiB,
+        8ull * kGiB - kApertureTail, 8ull * kGiB,
+        12ull * kGiB - kApertureTail, 12ull * kGiB,
+    };
+    uint32_t n = 0u;
+    for (uint32_t i = 0; i < 6u && n < kMaxExtraAperturePoints; i++) {
+        const uint64_t p = candidates[i];
+        if (p > vramBase && p < topPt && p <= vramLimit - 16ull && (vramBytes == 0ull || p <= vramBytes - 16ull))
+            out[n++] = p;
+    }
+    return n;
+}
+constexpr bool layout_points_clear_console(uint64_t consoleOff, uint64_t consoleLen,
+                                           const uint64_t *pts, uint32_t npts) {
+    if (consoleOff == kNoConsole || consoleLen == 0ull) return true;
+    if (consoleLen > ~0ull - kCursorBytes || consoleOff > ~0ull - (consoleLen + kCursorBytes)) return false;
+    const uint64_t consEnd = consoleOff + consoleLen + kCursorBytes;
+    for (uint32_t i = 0; i < npts; i++) {
+        if (pts[i] > ~0ull - 16ull) return false;
+        if (pts[i] < consEnd && pts[i] + 16ull > consoleOff) return false;
+    }
+    return true;
+}
+
+// Overflow-safe 64-bit check that [fbPhys, fbPhys + fbLen) lies inside [bar0Phys, bar0Phys + bar0Bound).
+// Never guesses a console offset when fbPhys is outside the active BAR0.
+constexpr bool console_in_bar0(uint64_t bar0Phys, uint64_t bar0Bound, uint64_t fbPhys, uint64_t fbLen,
+                               uint64_t *offOut = nullptr) {
+    if (offOut) *offOut = kNoConsole;
+    if (bar0Phys == 0ull || bar0Bound == 0ull || fbPhys == 0ull || fbLen == 0ull) return false;
+    if (bar0Bound > ~0ull - bar0Phys) return false;
+    if (fbPhys < bar0Phys) return false;
+    const uint64_t off = fbPhys - bar0Phys;
+    if (off > bar0Bound || fbLen > bar0Bound - off) return false;
+    if (offOut) *offOut = off;
+    return true;
+}
+
+// Strict 64-bit boundary check for userspace CPU BAR0 mapping of a visible VRAM BO.
+// Ensures full 16 GiB BAR mapping never opens console, cursor, bring-up, FW tail / Apple carve,
+// or the invalid tail [vramBytes, bar0Size) to CPU mappings.
+constexpr bool cpu_map_vram_ok(uint64_t mc, uint64_t size, uint64_t vramStart,
+                               uint64_t vramBase, uint64_t visAllocOff,
+                               uint64_t vramLimit, uint64_t bar0Size,
+                               uint64_t bar0Phys, uint64_t vramBytes,
+                               uint64_t *physOut = nullptr) {
+    if (physOut) *physOut = 0ull;
+    if (size == 0ull || bar0Phys == 0ull || bar0Size == 0ull || vramLimit == 0ull) return false;
+    if (mc < vramStart || vramBase > ~0ull - visAllocOff) return false;
+    const uint64_t off = mc - vramStart;
+    const uint64_t floor = vramBase + visAllocOff;
+    uint64_t ceil = bar0Size < vramLimit ? bar0Size : vramLimit;
+    if (vramBytes != 0ull && vramBytes < ceil) ceil = vramBytes;
+    if (floor >= ceil) return false;
+    if (off < floor || off > ceil || size > ceil - off) return false;
+    if (bar0Phys > ~0ull - off) return false;
+    const uint64_t phys = bar0Phys + off;
+    if (phys > ~0ull - size) return false;
+    if (physOut) *physOut = phys;
+    return true;
+}
+
+// Overflow-safe visible-VRAM range check for kernel allocations (bounded by bar0Size, vramLimit, vramBytes).
+constexpr bool vis_vram_range_ok(uint64_t gpuVa, uint64_t size, uint64_t vramStart,
+                                 uint64_t vramLimit, uint64_t bar0Size, uint64_t vramBytes) {
+    if (size == 0ull || gpuVa < vramStart) return false;
+    const uint64_t off = gpuVa - vramStart;
+    uint64_t ceil = bar0Size;
+    if (vramLimit != 0ull && vramLimit < ceil) ceil = vramLimit;
+    if (vramBytes != 0ull && vramBytes < ceil) ceil = vramBytes;
+    return off <= ceil && size <= ceil - off;
 }
 
 // ---- the allocator sizes (item 3) ----------------------------------------------------------------------------------------------------------
@@ -227,9 +338,11 @@ constexpr uint64_t visible_size(uint64_t vramLimit, uint64_t bar0Size, uint64_t 
 struct Pools { uint64_t visBase; uint64_t visSize; bool hi; uint64_t hiBase; uint64_t hiSize; };
 // gmc_vram_alloc_init: the visible pool is [vramBase + allocOff, vramLimit); the hi pool is [vramLimit, vramBytes - hiReserve) when there is room.
 constexpr Pools pool_sizes(uint64_t vramBase, uint64_t allocOff, uint64_t vramLimit, uint64_t vramBytes, uint64_t hiReserve) {
-    Pools p { vramBase + allocOff, 0ull, false, 0ull, 0ull };
+    Pools p { 0ull, 0ull, false, 0ull, 0ull };
+    if (vramBase > ~0ull - allocOff) return p;
+    p.visBase = vramBase + allocOff;
     if (vramLimit > p.visBase) p.visSize = vramLimit - p.visBase;
-    if (vramBytes > vramLimit + hiReserve) { p.hi = true; p.hiBase = vramLimit; p.hiSize = vramBytes - hiReserve - vramLimit; }
+    if (vramLimit <= ~0ull - hiReserve && vramBytes > vramLimit + hiReserve) { p.hi = true; p.hiBase = vramLimit; p.hiSize = vramBytes - hiReserve - vramLimit; }
     return p;
 }
 

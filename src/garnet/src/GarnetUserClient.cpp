@@ -547,7 +547,10 @@ IOReturn GarnetUserClient::doAccelExperiment(IOExternalMethodArguments *args) {
 	//   79 = agdchold, 82 = sdmadcc, 83..90 = native display pipe, 106..107 = m6, 108 = vramstat,
 	//   91..99 = ddcread / dmubring / dispcensus / region4read / dmub* / disp2 / scdcread,
 	//   100..102 = hangtest / hangrecover / hangstat (G1), 103 = sessstat (G2/G5),
-	//   104 = appallow (G4), 105 = fbpublish.
+	//   104 = appallow (G4), 105 = fbpublish, 109 = bartest (direct CPU BAR0 <-> GPU test).
+	if (rdna4rebar::bartest_is_action(action)) {
+		// 109 is admitted by the admin-only legacy client (its own argument/mode gate runs in accelExperiment)
+	} else
 	if (rdna4native::g4::action_admitted(amdgpu::n1c_apps_enabled(), action)) {
 		// 104 is admitted: it skips the old bound below (the verb's own argument check is rdna4native::g4::native_exempt in accelExperiment)
 	} else

@@ -23,6 +23,8 @@
 #include <fstream>
 #include <sstream>
 #include "amd/rebar_pure.h"
+#include "amd/rebar_bartest_pure.h"
+#include "amd/amdgpu_vram.h"
 #include "amd/native_fb_pure.h"
 #include "amd/native_disp_pure.h"
 
@@ -413,9 +415,315 @@ static void p10_pins664(const std::string &root) {
     expect(has(b, "smallest %llu MiB, current %llu MiB"), "P10: the census logs the smallest supported size");
 }
 
+// P11 (Task 3.1): explicit opt-in 16 GiB full-BAR policy, 64-bit aperture/VRAM/pool separation, BAR overlap, boundary checks.
+static void p11_fullbar_policy() {
+    expect_u("P11: kMaxBar0Full is 16 GiB (ReBAR code 14)", kMaxBar0Full, 16 * GiB);
+    expect_u("P11: ReBAR code 14 == kMaxBar0Full", entry_bytes(kFullBarRebarCode << 8), kMaxBar0Full);
+    expect(!full_bar_enabled(false, 0u) && !full_bar_enabled(false, 1u) && !full_bar_enabled(true, 0u) && !full_bar_enabled(true, 2u) && full_bar_enabled(true, 1u),
+           "P11: garnet-full-bar requires present && value == 1");
+    expect_u("P11: default cap is 1 GiB", map_cap_for(false), kMaxBar0Map);
+    expect_u("P11: full-BAR opt-in cap is 16 GiB", map_cap_for(true), kMaxBar0Full);
+
+    // Full-BAR 16 GiB at 0x7C00000000 with 16304 MiB valid VRAM (RX 9060 XT): aperture vs valid VRAM vs allocatable pools
+    {
+        PlanIn p = mk(16 * GiB, 0x7C00000000ull);
+        p.mapCap = map_cap_for(true);
+        p.requireFullBar = true;
+        const PlanOut o = plan_bar0(p);
+        expect(o.ok && o.reason == kOk, "P11: 16 GiB full-BAR opt-in plans OK at 0x7C00000000");
+        expect_u("P11: physical BAR0 mapLen is 16 GiB", o.mapLen, 16 * GiB);
+        expect_u("P11: vramLimit clamps to 15472 MiB (excludes 768 MiB reserve + 64 MiB slack + 80 MiB invalid tail)", o.vramLimit, 15472 * MiB);
+        expect(o.vramLimit < kVram && o.vramLimit + kReserve <= kVram, "P11: vramLimit never touches FW/Apple reserve or invalid tail [16304 MiB, 16384 MiB)");
+        const Pools pl = pool_sizes(kBase, kAllocOff, o.vramLimit, kVram, kReserve);
+        expect_u("P11: visible pool base = 39 MiB", pl.visBase, 39 * MiB);
+        expect_u("P11: visible pool size = 15433 MiB", pl.visSize, 15433 * MiB);
+        expect(pl.hi && pl.hiBase == 15472 * MiB && pl.hiSize == 64 * MiB, "P11: hi pool covers disjoint [15472 MiB, 15536 MiB)");
+        expect_u("P11: zero double-counting: visBase + visSize + hiSize + hiReserve == valid VRAM (16304 MiB)",
+                 pl.visBase + pl.visSize + pl.hiSize + kReserve, kVram);
+        expect_u("P11: visible_size reports vramLimit (15472 MiB), never 16384 MiB", visible_size(o.vramLimit, o.mapLen, kVram, 256 * MiB), 15472 * MiB);
+    }
+    // Zero double-counting when vramLimit covers ALL allocatable VRAM (vramBytes - hiReserve) -> hi = false, hiSize = 0
+    {
+        const uint64_t fullAllocLimit = kVram - kReserve;
+        const Pools pl = pool_sizes(kBase, kAllocOff, fullAllocLimit, kVram, kReserve);
+        expect(!pl.hi && pl.hiBase == 0ull && pl.hiSize == 0ull, "P11: full allocatable vramLimit produces hi = false, hiSize = 0");
+        expect_u("P11: visBase + visSize + hiReserve == valid VRAM (zero double-counting)", pl.visBase + pl.visSize + kReserve, kVram);
+    }
+    // requireFullBar refuses small BARs rather than silently claiming full BAR
+    {
+        for (uint64_t small : { 256 * MiB, 512 * MiB, GiB }) {
+            PlanIn p = mk(small, 0x80000000ull);
+            p.mapCap = map_cap_for(true);
+            p.requireFullBar = true;
+            const PlanOut o = plan_bar0(p);
+            expect(!o.ok && o.reason == kFullBarNotAssigned, "P11: requireFullBar refuses small BAR (256M/512M/1G)");
+        }
+        PlanIn noCap = mk(16 * GiB, 0x400000000ull);
+        noCap.mapCap = map_cap_for(true);
+        noCap.requireFullBar = true;
+        noCap.rebarPresent = false;
+        expect_u("P11: 16 GiB without ReBAR cap refuses kNoRebarCap", plan_bar0(noCap).reason, kNoRebarCap);
+        PlanIn ov = mk(16 * GiB, 0x400000000ull);
+        ov.mapCap = map_cap_for(true);
+        ov.requireFullBar = true;
+        ov.hiReserve = ~0ull - 16 * MiB;
+        expect_u("P11: overflowing hiReserve refuses cleanly", plan_bar0(ov).reason, kVramTooSmall);
+    }
+    // BAR overlap detection (BAR0 vs BAR2/BAR5/ROM)
+    {
+        const uint64_t otherBase[2] = { 0x800000000ull, 0xFC000000ull };
+        const uint64_t otherLen[2]  = { 8 * MiB, 1 * MiB };
+        expect(!bar_overlaps_any(0x400000000ull, 16 * GiB, otherBase, otherLen, 2u), "P11: disjoint 16 GiB BAR0 does not overlap BAR2/BAR5");
+        expect(bar_overlaps_any(0x400000000ull, 16 * GiB, otherBase, otherLen, 1u) == false, "P11: [16G, 32G) disjoint from [32G, 32G+8M)");
+        const uint64_t clashBase[1] = { 0x7FF000000ull };
+        const uint64_t clashLen[1]  = { 8 * MiB };
+        expect(bar_overlaps_any(0x400000000ull, 16 * GiB, clashBase, clashLen, 1u), "P11: BAR2 inside 16 GiB BAR0 detected as overlap");
+        PlanIn p = mk(16 * GiB, 0x400000000ull);
+        p.mapCap = kMaxBar0Full; p.requireFullBar = true; p.barOverlap = true;
+        expect_u("P11: plan_bar0 refuses overlapping BAR0 with kBarOverlap", plan_bar0(p).reason, kBarOverlap);
+    }
+    // Multi-point aperture boundary checks (4/8/12 GiB)
+    {
+        uint64_t ex[kMaxExtraAperturePoints] = {};
+        expect_u("P11: small 256 MiB BAR has 0 extra boundary points", aperture_boundary_points(kBase, 256 * MiB, 256 * MiB, kVram, ex), 0u);
+        expect_u("P11: small 1 GiB BAR has 0 extra boundary points", aperture_boundary_points(kBase, GiB, GiB, kVram, ex), 0u);
+        const uint32_t n = aperture_boundary_points(kBase, 15472 * MiB, 16 * GiB, kVram, ex);
+        expect_u("P11: 16 GiB full BAR yields 6 boundary points (4/8/12 GiB -64KiB and exact)", n, 6u);
+        expect_u("P11: pt0 = 4 GiB - 64 KiB", ex[0], 4 * GiB - 64 * 1024);
+        expect_u("P11: pt1 = 4 GiB",          ex[1], 4 * GiB);
+        expect_u("P11: pt2 = 8 GiB - 64 KiB", ex[2], 8 * GiB - 64 * 1024);
+        expect_u("P11: pt3 = 8 GiB",          ex[3], 8 * GiB);
+        expect_u("P11: pt4 = 12 GiB - 64 KiB", ex[4], 12 * GiB - 64 * 1024);
+        expect_u("P11: pt5 = 12 GiB",         ex[5], 12 * GiB);
+        expect(layout_points_clear_console(0, 14745600ull, ex, n), "P11: normal console at 0 is clear of all 6 boundary points");
+        expect(!layout_points_clear_console(4 * GiB - 4096, 8192, ex, n), "P11: console overlapping 4 GiB boundary is refused");
+        expect_u("P11: vramLimit above valid VRAM yields 0 boundary points", aperture_boundary_points(kBase, 16 * GiB, 16 * GiB, kVram, ex), 0u);
+    }
+    // Console containment in high 64-bit BAR0 (Task 3.3)
+    {
+        const uint64_t hiBar = 0x7C00000000ull;
+        uint64_t off = 0;
+        expect(console_in_bar0(hiBar, kVram, hiBar, 14745600ull, &off) && off == 0ull, "P11: console at bottom of high 64-bit BAR0 is inside");
+        expect(console_in_bar0(hiBar, kVram, hiBar + 16 * MiB, 14745600ull, &off) && off == 16 * MiB, "P11: console offset computed cleanly for high 64-bit BAR0");
+        expect(!console_in_bar0(hiBar, kVram, 0xD0000000ull, 14745600ull, &off) && off == kNoConsole, "P11: stale low 32-bit console phys outside high BAR0 is REFUSED (never guessed)");
+        expect(!console_in_bar0(hiBar, kVram, hiBar + kVram - 4096ull, 8192ull, &off) && off == kNoConsole, "P11: console crossing valid VRAM end into invalid tail is REFUSED");
+        expect(!console_in_bar0(0xFFFFFFFFF0000000ull, 256 * MiB, 0xFFFFFFFFF0000000ull, 4096ull, &off), "P11: wrapping BAR0 range is REFUSED");
+    }
+}
+
+// P12 (Task 3.2): 64-bit CPU mapping boundary enforcement and visible-VRAM bounds.
+static void p12_cpumap_bounds() {
+    const uint64_t vramStart = 0x8000000000ull;
+    const uint64_t bar0Phys  = 0x7C00000000ull;
+    const uint64_t bar0Size  = 16 * GiB;
+    const uint64_t vramLimit = 15472 * MiB;
+    const uint64_t visFloor  = kBase + kVisAllocOffset;  // 39 MiB
+    uint64_t phys = 0;
+
+    // Valid BO mappings at low, 4/8/12 GiB boundaries, and top below vramLimit
+    const uint64_t validOffs[] = { visFloor, 4 * GiB - 65536ull, 4 * GiB, 8 * GiB, 12 * GiB, vramLimit - 65536ull };
+    for (uint64_t off : validOffs) {
+        expect(cpu_map_vram_ok(vramStart + off, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys) && phys == bar0Phys + off,
+               "P12: 64-bit CPU map accepts valid visible BO inside [visFloor, vramLimit)");
+    }
+    // Strict boundary refusals (full 16 GiB BAR must NEVER open protected regions!)
+    expect(!cpu_map_vram_ok(vramStart + 0ull, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: console [0, 15 MiB) REFUSED for CPU map");
+    expect(!cpu_map_vram_ok(vramStart + kBase, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: bring-up / PSP region REFUSED for CPU map");
+    expect(!cpu_map_vram_ok(vramStart + visFloor - 4096ull, 8192ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: BO straddling visFloor REFUSED");
+    expect(!cpu_map_vram_ok(vramStart + vramLimit - 4096ull, 8192ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: BO straddling vramLimit REFUSED");
+    expect(!cpu_map_vram_ok(vramStart + vramLimit, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: hi pool [15472 MiB, 15536 MiB) REFUSED for CPU map");
+    expect(!cpu_map_vram_ok(vramStart + 15600 * MiB, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: FW tail / Apple carve REFUSED for CPU map");
+    expect(!cpu_map_vram_ok(vramStart + kVram, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: invalid tail [16304 MiB, 16384 MiB) REFUSED for CPU map");
+    expect(!cpu_map_vram_ok(vramStart + kVram, 65536ull, vramStart, kBase, kVisAllocOffset, bar0Size, bar0Size, bar0Phys, kVram, &phys), "P12: invalid tail REFUSED by vramBytes cap even if vramLimit == bar0Size");
+    expect(!cpu_map_vram_ok(vramStart + 4 * GiB, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, 0ull, kVram, &phys), "P12: zero bar0Phys REFUSED");
+    expect(!cpu_map_vram_ok(vramStart - 65536ull, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: mc below vramStart REFUSED");
+    expect(!cpu_map_vram_ok(vramStart + 4 * GiB, 65536ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, 0xFFFFFFFF00000000ull, kVram, &phys), "P12: wrapping phys address REFUSED");
+    expect(!cpu_map_vram_ok(vramStart + 4 * GiB, 0ull, vramStart, kBase, kVisAllocOffset, vramLimit, bar0Size, bar0Phys, kVram, &phys), "P12: zero size REFUSED");
+
+    // vis_vram_range_ok: excludes invalid tail and respects vramLimit
+    expect(vis_vram_range_ok(vramStart + 12 * GiB, 65536ull, vramStart, vramLimit, bar0Size, kVram), "P12: vis_vram_range_ok accepts 12 GiB inside vramLimit");
+    expect(!vis_vram_range_ok(vramStart + vramLimit, 65536ull, vramStart, vramLimit, bar0Size, kVram), "P12: vis_vram_range_ok refuses past vramLimit");
+    expect(!vis_vram_range_ok(vramStart + kVram, 65536ull, vramStart, 0ull, bar0Size, kVram), "P12: vis_vram_range_ok refuses invalid tail [16304, 16384) MiB");
+}
+
+// P13 (Task 4.1): VRAMBumpAllocator::alloc_at + direct CPU BAR <-> GPU bidirectional test simulation + fault injection + source pins.
+struct FakeBarVram {
+    std::map<uint64_t, uint32_t> mem;
+    uint64_t vramStart = 0x8000000000ull;
+    uint64_t bar0Size  = 16 * GiB;
+    uint64_t vramLimit = 15472 * MiB;
+    bool wrap32BarWrite = false;
+    bool failGpuCopy    = false;
+    int  corruptDir1Idx = -1;
+    int  corruptDir2Idx = -1;
+    int  corruptGuard   = 0;   // 1 = leading, 2 = trailing
+    uint32_t flushes = 0, hdpFlushes = 0, copies = 0;
+
+    void bar0_write32(uint64_t off, uint32_t val) {
+        if (off > vramLimit || 4ull > vramLimit - off) return;
+        const uint64_t eff = wrap32BarWrite ? (off & 0xFFFFFFFFull) : off;
+        mem[eff] = val;
+    }
+    uint32_t bar0_read32(uint64_t off) {
+        if (off > vramLimit || 4ull > vramLimit - off) return 0xFFFFFFFFu;
+        auto it = mem.find(off);
+        return it == mem.end() ? 0u : it->second;
+    }
+    void wc_and_hdp_flush() { flushes++; hdpFlushes++; }
+    void hdp_flush()        { hdpFlushes++; }
+    bool gpu_copy(uint64_t srcMc, uint64_t dstMc, uint32_t bytes) {
+        copies++;
+        if (failGpuCopy) return false;
+        if (srcMc < vramStart || dstMc < vramStart) return false;
+        const uint64_t sOff = srcMc - vramStart, dOff = dstMc - vramStart;
+        for (uint32_t i = 0; i < bytes; i += 4u) {
+            uint32_t v = mem.count(sOff + i) ? mem[sOff + i] : 0u;
+            if (copies == 1u && corruptDir1Idx >= 0 && i == static_cast<uint32_t>(corruptDir1Idx) * 4u) v ^= 0x1u;
+            if (copies == 2u && corruptDir2Idx >= 0 && i == static_cast<uint32_t>(corruptDir2Idx) * 4u) v ^= 0x80000000u;
+            mem[dOff + i] = v;
+        }
+        if (corruptGuard == 1 && copies == 2u) mem[dOff - kBarTestPayloadOff] ^= 0x1u;
+        if (corruptGuard == 2 && copies == 2u) mem[dOff - kBarTestPayloadOff + kBarTestTailGuardOff] ^= 0x1u;
+        return true;
+    }
+};
+
+static void p13_bartest(const std::string &root) {
+    const uint64_t vramStart = 0x8000000000ull;
+    const uint64_t visBase   = kBase + kVisAllocOffset;
+    const uint64_t vramLimit = 15472 * MiB;
+    const uint64_t bar0Size  = 16 * GiB;
+    const uint64_t consLen   = 14745600ull;
+
+    // 1) Target planner: full-BAR vs small-BAR vs fail-closed refusals
+    uint64_t targets[kMaxBarTestTargets] = {};
+    uint32_t nTargets = 0;
+    expect_u("P13: full-BAR arg 0 plans 4 targets", bartest_plan_targets(true, 0ull, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, targets, &nTargets), kBtOk);
+    expect_u("P13: 4 targets planned", nTargets, 4u);
+    expect_u("P13: target 0 straddles 4 GiB", targets[0], 4 * GiB - 64 * 1024);
+    expect_u("P13: target 1 straddles 8 GiB", targets[1], 8 * GiB - 64 * 1024);
+    expect_u("P13: target 2 straddles 12 GiB", targets[2], 12 * GiB - 64 * 1024);
+    expect_u("P13: target 3 is top valid block below vramLimit", targets[3], vramLimit - kBarTestBlockBytes);
+    expect_u("P13: arg 0 refuses when fullBarMode is OFF (never fakes full BAR)", bartest_plan_targets(false, 0ull, visBase, GiB, GiB, kVram, 0ull, consLen, targets, &nTargets), kBtNotFullBar);
+    expect_u("P13: arg 0 refuses truncated 8 GiB BAR0 (fails closed at 8/12 GiB)", bartest_plan_targets(true, 0ull, visBase, 8 * GiB, 8 * GiB, kVram, 0ull, consLen, targets, &nTargets), kBtBeyondLimit);
+    expect_u("P13: arg 0 refuses bar0Size < vramLimit", bartest_plan_targets(true, 0ull, visBase, vramLimit, GiB, kVram, 0ull, consLen, targets, &nTargets), kBtBadAperture);
+    expect_u("P13: arg 1 works on 256 MiB small BAR (regression)", bartest_plan_targets(false, 1ull, visBase, 256 * MiB, 256 * MiB, kVram, 0ull, consLen, targets, &nTargets), kBtOk);
+    expect_u("P13: small BAR arg 1 plans 1 target at 256 MiB - 128 KiB", nTargets, 1u);
+    expect_u("P13: small BAR target offset", targets[0], 256 * MiB - kBarTestBlockBytes);
+    expect_u("P13: arg 2 refused kBtBadArg", bartest_plan_targets(true, 2ull, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, targets, &nTargets), kBtBadArg);
+    expect_u("P13: invalid tail [16304, 16384) MiB refused kBtBeyondLimit", bartest_range_ok(kVram, kBarTestBlockBytes, visBase, vramLimit, bar0Size, kVram, 0ull, consLen), kBtBeyondLimit);
+    expect_u("P13: below visBase (console/bring-up) refused kBtBelowVisBase", bartest_range_ok(kBase, kBarTestBlockBytes, visBase, vramLimit, bar0Size, kVram, 0ull, consLen), kBtBelowVisBase);
+    expect_u("P13: overlapping console refused kBtConsoleOverlap", bartest_range_ok(0ull, kBarTestBlockBytes, 0ull, vramLimit, bar0Size, kVram, 0ull, consLen), kBtConsoleOverlap);
+
+    // 2) VRAMBumpAllocator::alloc_at exclusive high-VRAM reservation + coalescing
+    {
+        amdgpu::VRAMBumpAllocator alloc;
+        alloc.init(vramStart + visBase, vramLimit - visBase);
+        amdgpu::VRAMAllocation low {}, scratch {}, b4 {}, b8 {}, b12 {}, bTop {}, dup {};
+        expect(alloc.alloc(kBarTestCanaryBytes, 65536ull, &low) && alloc.alloc(kBarTestCanaryBytes, 65536ull, &scratch), "P13: low canary + scratch allocated");
+        expect(alloc.alloc_at(vramStart + 4 * GiB - 64 * 1024, kBarTestBlockBytes, &b4), "P13: alloc_at 4 GiB straddle succeeds");
+        expect(alloc.alloc_at(vramStart + 8 * GiB - 64 * 1024, kBarTestBlockBytes, &b8), "P13: alloc_at 8 GiB straddle succeeds");
+        expect(alloc.alloc_at(vramStart + 12 * GiB - 64 * 1024, kBarTestBlockBytes, &b12), "P13: alloc_at 12 GiB straddle succeeds");
+        expect(alloc.alloc_at(vramStart + vramLimit - kBarTestBlockBytes, kBarTestBlockBytes, &bTop), "P13: alloc_at top below vramLimit succeeds");
+        expect(!alloc.alloc_at(vramStart + 4 * GiB - 32 * 1024, 65536ull, &dup), "P13: overlapping alloc_at refuses (exclusive!)");
+        expect(!alloc.alloc_at(vramStart + kVram, kBarTestBlockBytes, &dup), "P13: alloc_at invalid tail refuses");
+        expect(!alloc.alloc_at(vramStart + 4 * GiB + 4096ull, kBarTestBlockBytes, &dup), "P13: unaligned alloc_at refuses");
+        alloc.free(bTop); alloc.free(b12); alloc.free(b8); alloc.free(b4); alloc.free(scratch); alloc.free(low);
+        expect_u("P13: all exclusive allocations coalesced cleanly (bytes_used == 0)", alloc.bytes_used(), 0ull);
+        expect_u("P13: full visible pool restored", alloc.bytes_free(), vramLimit - visBase);
+    }
+
+    // 3) Direct CPU BAR <-> GPU bidirectional execution on all 4 targets
+    expect_u("P13: re-plan 4 full-BAR targets", bartest_plan_targets(true, 0ull, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, targets, &nTargets), kBtOk);
+    for (uint32_t i = 0; i < nTargets; i++) {
+        FakeBarVram sim;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, targets[i], visBase, visBase + kBarTestCanaryBytes };
+        const BarTestPointOut r = bartest_run_point(sim, pin);
+        expect(r.status == kBtOk && sim.copies == 2u && sim.flushes >= 3u && sim.hdpFlushes >= 5u, "P13: bidirectional direct-BAR <-> GPU test PASSES target");
+        // Verify scrub cleared target payload
+        expect_u("P13: target payload scrubbed to 0 on exit", sim.bar0_read32(targets[i] + kBarTestPayloadOff), 0u);
+    }
+
+    // 4) Fault injections: 32-bit wrap/alias onto low canary, direction 1/2 mismatch, guard corruption, SDMA failure, self-overlap
+    {
+        // 32-bit wrap aliasing onto low canary: target at 8 GiB - 64 KiB (0x1FFFF0000) wraps to 0xFFFF0000!
+        FakeBarVram sim; sim.wrap32BarWrite = true;
+        const uint64_t target8G = 8 * GiB - kBarTestHalfBlock;
+        const uint64_t aliasCanary = target8G & 0xFFFFFFFFull; // 0xFFFF0000 (distinct from 0x1FFFF0000, inside low 4 GiB)
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, target8G, aliasCanary, visBase };
+        const BarTestPointOut r = bartest_run_point(sim, pin);
+        expect_u("P13: 32-bit BAR0 wrap aliasing onto low canary caught (kBtCanaryCorrupt)", r.status, kBtCanaryCorrupt);
+    }
+    {
+        // 32-bit wrap with non-aliasing low canary still caught on Direction 1 (GPU reads high address, CPU wrote low address!)
+        FakeBarVram sim; sim.wrap32BarWrite = true;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 8 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        const BarTestPointOut r = bartest_run_point(sim, pin);
+        expect_u("P13: 32-bit BAR0 wrap caught by GPU readback mismatch (kBtCpuWriteGpuReadMismatch)", r.status, kBtCpuWriteGpuReadMismatch);
+    }
+    {
+        FakeBarVram sim; sim.corruptDir1Idx = 513;   // right past the 4 GiB boundary!
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 4 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        const BarTestPointOut r = bartest_run_point(sim, pin);
+        expect(r.status == kBtCpuWriteGpuReadMismatch && r.firstBadIdx == 513u, "P13: Direction 1 mismatch across 4 GiB boundary caught with exact index");
+    }
+    {
+        FakeBarVram sim; sim.corruptDir2Idx = 512;   // exact 4 GiB boundary dword!
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 12 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        const BarTestPointOut r = bartest_run_point(sim, pin);
+        expect(r.status == kBtGpuWriteCpuReadMismatch && r.firstBadIdx == 512u, "P13: Direction 2 mismatch at exact 12 GiB boundary caught with exact index");
+    }
+    {
+        FakeBarVram sim; sim.corruptGuard = 1;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 8 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        expect_u("P13: leading guard corruption caught", bartest_run_point(sim, pin).status, kBtGuardCorrupt);
+    }
+    {
+        FakeBarVram sim; sim.corruptGuard = 2;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 8 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        expect_u("P13: trailing guard corruption caught", bartest_run_point(sim, pin).status, kBtGuardCorrupt);
+    }
+    {
+        FakeBarVram sim; sim.failGpuCopy = true;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, 4 * GiB - kBarTestHalfBlock, visBase, visBase + kBarTestCanaryBytes };
+        expect_u("P13: SDMA copy/fence failure caught", bartest_run_point(sim, pin).status, kBtSdmaFailed);
+    }
+    {
+        FakeBarVram sim;
+        BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, visBase, visBase, visBase + kBarTestBlockBytes };
+        expect_u("P13: overlapping target and canary refused kBtOverlapSelf", bartest_run_point(sim, pin).status, kBtOverlapSelf);
+    }
+
+    // 5) Source pins for Tasks 3.1 / 3.2 / 3.3 / 4.1
+    const std::string K = root + "/src/garnet/src/";
+    const std::string b = slurp(K + "GarnetDriver.cpp");
+    const std::string s1c = slurp(K + "amd/native_s1c.cpp");
+    const std::string pfb = slurp(K + "GarnetPrimaryFramebuffer.cpp");
+    const std::string gate = slurp(K + "GarnetDisplayGate.cpp");
+    const std::string mv = between(b, "bool GarnetDriver::mapVramAperture() {", "// The plan again, now that the console is located");
+    expect(has(mv, "PE_parse_boot_argn(\"garnet-full-bar\"") && has(mv, "rdna4rebar::full_bar_enabled(") && has(mv, "pin.mapCap = rdna4rebar::kMaxBar0Full;") && has(mv, "pin.requireFullBar = true;") && has(mv, "pin.barOverlap = rdna4rebar::bar_overlaps_any("),
+           "P13 pin 3.1: mapVramAperture parses garnet-full-bar, sets requireFullBar, and checks PCI BAR overlap");
+    const std::string aw = between(b, "bool GarnetDriver::apertureCheckWindow() {", "static amdgpu::BringupContext gBringup;");
+    expect(has(aw, "rdna4rebar::aperture_boundary_points(") && has(aw, "rdna4rebar::layout_points_clear_console("),
+           "P13 pin 3.1: apertureCheckWindow validates and checks full-BAR 4/8/12 GiB boundary points");
+    const std::string bt = between(b, "IOReturn GarnetDriver::runHighBarBidirTest(", "IOReturn GarnetDriver::accelExperiment(");
+    expect(!bt.empty() && has(bt, "bartest_plan_targets(") && has(bt, "n1c_vram_alloc_excl_at(") && has(bt, "bartest_run_point(") && has(bt, "amdgpu::WBAR0_32(") && has(bt, "amdgpu::RBAR0_32(") && has(bt, "amdgpu::amdgpu_hdp_flush(") && has(bt, "rdna4_sdma_copy_linear_sync("),
+           "P13 pin 4.1: runHighBarBidirTest uses exclusive alloc_at + direct BAR0 + HDP flush + SDMA");
+    expect(!has(bt, "RVRAM32_via_mm") && !has(bt, "WVRAM32_via_mm") && !has(bt, "vramRead32") && !has(bt, "vramWrite32"),
+           "P13 pin 4.1: runHighBarBidirTest NEVER falls back to MM_INDEX");
+    const std::string mfh = between(s1c, "IOReturn n1c_memory_for_handle(", "// ==== 0.0.627:");
+    expect(has(mfh, "if (!gCtx || !gCtx->dev ||\n                    !rdna4rebar::cpu_map_vram_ok(") && at(mfh, "rdna4rebar::cpu_map_vram_ok(") < at(mfh, "IODeviceMemory::withRange("),
+           "P13 pin 3.2: n1c_memory_for_handle validates full 64-bit CPU map bounds BEFORE withRange");
+    expect(has(pfb, "rdna4rebar::bar_addr_agree(bar0Phys, cfgBar0Phys)") && has(pfb, "rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)"),
+           "P13 pin 3.3: GarnetPrimaryFramebuffer cross-checks config BAR0 and verifies snapshot agreement before peer registration");
+    expect(has(gate, "candidate.consolePhysBase != current.consolePhysBase") && has(gate, "consoleEnd > current.vramLimit"),
+           "P13 pin 3.3: GarnetDisplayGate verifies console phys/offset and vramLimit on primary registration");
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
     p1_plan(); p2_census(); p3_pure(); p4_high(); p8_identity(); p3b_layout(); p10_pins664(root); p5_pins(root); p6_vramstat(root); p7_mesa(root);
+    p11_fullbar_policy(); p12_cpumap_bounds(); p13_bartest(root);
     std::printf("native_rebar_test: %d checks, %d failed\n", gRun, gFail);
     return gFail == 0 ? 0 : 1;
 }

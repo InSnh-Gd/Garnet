@@ -138,6 +138,7 @@ inline bool plan_cursor_slot(uint64_t bar0Phys, uint64_t bar0Size,
 	if (!bar0Phys || bar0Size < kCursorSlotBytes || !consolePhys || consoleLen < 4096ull) {
 		return false;
 	}
+	if (bar0Size > UINT64_MAX - bar0Phys) return false;
 	if (consolePhys < bar0Phys || consoleLen > bar0Size) return false;
 	const uint64_t consoleOff = consolePhys - bar0Phys;
 	if (consoleOff > bar0Size - consoleLen) return false;
@@ -153,6 +154,8 @@ inline bool plan_cursor_slot(uint64_t bar0Phys, uint64_t bar0Size,
 
 	const uint64_t fbMcBase = hubpPrimaryMc - consoleOff;
 	if (bar0Phys > UINT64_MAX - slotOff || fbMcBase > UINT64_MAX - slotOff) return false;
+	if (bar0Phys + slotOff > UINT64_MAX - kCursorSlotBytes ||
+	    fbMcBase + slotOff > UINT64_MAX - kCursorSlotBytes) return false;
 
 	out->slotOffset = slotOff;
 	out->physAddr = bar0Phys + slotOff;

@@ -102,6 +102,7 @@ public:
         if (alignment < 16384) alignment = 16384;
         // Round size up to alignment to keep neighbouring allocs aligned
         // too. Free coalesce will eat the slop on release.
+        if (bytes > ~0ull - (alignment - 1)) return false;
         uint64_t rounded = (bytes + alignment - 1) & ~(alignment - 1);
 
         // First-fit walk.
@@ -111,10 +112,11 @@ public:
             FreeNode &n = m_pool[cur];
             // Compute aligned start within this node.
             uint64_t start_abs = m_base + n.offset;
+            if (start_abs > ~0ull - (alignment - 1)) return false;
             uint64_t aligned_abs = (start_abs + alignment - 1) &
                                   ~(alignment - 1);
             uint64_t pad = aligned_abs - start_abs;
-            if (n.length >= pad + rounded) {
+            if (n.length >= pad && n.length - pad >= rounded) {
                 // Carve.
                 uint64_t alloc_offset = n.offset + pad;
                 // 3 cases: exact, head-trim, tail-trim, middle-split.
@@ -158,11 +160,59 @@ public:
         return false;  // OOM
     }
 
+    // Carve an exact [gpu_va, gpu_va + bytes) range if wholly free (16 KiB aligned).
+    // Fails closed if any byte is already allocated, out of bounds, or overflows.
+    bool alloc_at(uint64_t gpu_va, uint64_t bytes, VRAMAllocation *out) {
+        if (!m_inited || bytes == 0 || out == nullptr) return false;
+        if ((gpu_va & 16383ull) != 0 || (bytes & 16383ull) != 0) return false;
+        if (gpu_va < m_base) return false;
+        const uint64_t off = gpu_va - m_base;
+        if (off > m_size || bytes > m_size - off) return false;
+
+        uint16_t prev = kInvalid;
+        uint16_t cur  = m_head;
+        while (cur != kInvalid) {
+            FreeNode &n = m_pool[cur];
+            if (off >= n.offset && (off - n.offset) <= n.length && bytes <= n.length - (off - n.offset)) {
+                const uint64_t pad = off - n.offset;
+                if (pad == 0 && n.length == bytes) {
+                    if (prev == kInvalid) m_head = n.next;
+                    else m_pool[prev].next = n.next;
+                    pool_release(cur);
+                } else if (pad == 0) {
+                    n.offset += bytes;
+                    n.length -= bytes;
+                } else if (n.length - pad == bytes) {
+                    n.length = pad;
+                } else {
+                    uint16_t tail = pool_take();
+                    if (tail == kInvalid) return false;
+                    m_pool[tail].offset = off + bytes;
+                    m_pool[tail].length = n.length - pad - bytes;
+                    m_pool[tail].next   = n.next;
+                    n.length = pad;
+                    n.next   = tail;
+                }
+                m_bytes_used += bytes;
+                m_alloc_count++;
+                out->gpu_va    = gpu_va;
+                out->size      = bytes;
+                out->alignment = 16384ull;
+                out->cpu_ptr   = (m_cpu_base != nullptr) ? (m_cpu_base + off) : nullptr;
+                return true;
+            }
+            if (n.offset > off) break;
+            prev = cur;
+            cur  = n.next;
+        }
+        return false;
+    }
+
     // Free. Returns the bytes released to the pool, or 0 if the
     // allocation didn't match this allocator's range.
     void free(const VRAMAllocation &a) {
         if (!m_inited || a.size == 0) return;
-        if (a.gpu_va < m_base || a.gpu_va + a.size > m_base + m_size) {
+        if (a.gpu_va < m_base || a.gpu_va - m_base > m_size || a.size > m_size - (a.gpu_va - m_base)) {
             return;  // not ours
         }
         uint64_t offset = a.gpu_va - m_base;

@@ -227,19 +227,44 @@ bool GarnetDriver::mapVramAperture() {
 	rebarMask = rebarFound ? rdna4rebar::entry_supported_mask(cen.e[e0].capReg) : 0u;
 	rebarCurMB = rebarFound ? (rdna4rebar::entry_bytes(cen.e[e0].ctrlReg) >> 20) : 0ull;
 	if (rebarFound) RDNA4LOG("rebar census: BAR0 offers sizes mask %#x, smallest %llu MiB, current %llu MiB (ResizeAppleGpuBars code for 'smallest' = the lowest set bit)", rebarMask, (unsigned long long)(rdna4rebar::entry_min_bytes(rebarMask) >> 20), (unsigned long long)rebarCurMB);
+	uint32_t fullBarArg = 0;
+	const bool fullBarPresent = PE_parse_boot_argn("garnet-full-bar", &fullBarArg, sizeof(fullBarArg));
+	const bool fullBarRequested = rdna4rebar::full_bar_enabled(fullBarPresent, fullBarArg);
+	bar0FullMode = false;
+	static const UInt8 kOtherBars[] = { kIOPCIConfigBaseAddress2, kIOPCIConfigBaseAddress4, kIOPCIConfigBaseAddress5, kIOPCIConfigExpansionROMBase };
+	uint64_t otherBase[4] = {}, otherLen[4] = {};
+	uint32_t nOther = 0;
+	for (uint32_t i = 0; i < 4u; i++) {
+		IODeviceMemory *om = pciDevice->getDeviceMemoryWithRegister(kOtherBars[i]);
+		if (!om) continue;
+		const uint64_t ol = om->getLength();
+		if (ol == 0) continue;
+		otherBase[nOther] = static_cast<uint64_t>(om->getPhysicalAddress());
+		otherLen[nOther]  = ol;
+		nOther++;
+	}
 	rdna4rebar::PlanIn pin {};
 	pin.ioLen = fullLen; pin.ioAddr = (uint64_t)bar->getPhysicalAddress(); pin.cfgAddr = cfgAddr;
 	pin.rebarPresent = cen.found && e0 >= 0; pin.rebarBytes = pin.rebarPresent ? rdna4rebar::entry_bytes(cen.e[e0].ctrlReg) : 0ull;
 	pin.vramBytes = static_cast<uint64_t>(vramMB) << 20; pin.hiReserve = amdgpu::kVramHiTotalReserve;
 	pin.consoleOff = rdna4rebar::kNoConsole; pin.consoleLen = 0; pin.mapCap = kMaxBar0Map;
+	pin.barOverlap = rdna4rebar::bar_overlaps_any(pin.ioAddr, pin.ioLen, otherBase, otherLen, nOther);
+	if (fullBarRequested) {
+		pin.mapCap = rdna4rebar::kMaxBar0Full;
+		pin.requireFullBar = true;
+	}
 	const rdna4rebar::PlanOut pl = rdna4rebar::plan_bar0(pin);
-	RDNA4LOG("vram: BAR0 plan: IOPCIFamily [%#llx, +%llu MiB), config space %#llx, ReBAR %s %llu MiB, VRAM %llu MiB -> %s%s (map %llu MiB, vramLimit %llu MiB)", (unsigned long long)pin.ioAddr, (unsigned long long)(pin.ioLen >> 20),
+	RDNA4LOG("vram: BAR0 plan (garnet-full-bar=%u, cap %llu MiB): IOPCIFamily [%#llx, +%llu MiB), config space %#llx, ReBAR %s %llu MiB, VRAM %llu MiB -> %s%s (map %llu MiB, vramLimit %llu MiB)",
+	       fullBarRequested ? 1u : 0u, (unsigned long long)(pin.mapCap >> 20), (unsigned long long)pin.ioAddr, (unsigned long long)(pin.ioLen >> 20),
 	       (unsigned long long)pin.cfgAddr, pin.rebarPresent ? "current" : "absent", (unsigned long long)(pin.rebarBytes >> 20), (unsigned long long)(pin.vramBytes >> 20),
 	       pl.ok ? "OK" : "REFUSED: ", pl.ok ? "" : rdna4rebar::reason_name(pl.reason), (unsigned long long)(pl.mapLen >> 20), (unsigned long long)(pl.vramLimit >> 20));
 	setProperty("BAR0,PlanReason", rdna4rebar::reason_name(pl.reason));
+	setProperty("BAR0,FullRequested", fullBarRequested);
+	setProperty("BAR0,FullMode", false);
+	setProperty("BAR0,MapCapMB", static_cast<uint64_t>(pin.mapCap >> 20), 64);
 	if (!pl.ok) { RDNA4LOG("vram: BAR0 refused (%s): nothing is mapped, the native ladder will not run", rdna4rebar::reason_name(pl.reason)); return false; }
 	bar0Plan = pin;
-	// Map the planned length: all of a BAR up to 1 GiB; anything larger is capped by kMaxBar0Map.
+	// Map the planned length: up to 1 GiB by default, or up to 16 GiB with explicit garnet-full-bar=1 opt-in.
 	const uint64_t winLen  = pl.mapLen;
 	IODeviceMemory *win = IODeviceMemory::withSubRange(bar, 0, winLen);
 	if (!win) { RDNA4LOG("vram: BAR0 sub-range failed"); return false; }
@@ -257,10 +282,12 @@ bool GarnetDriver::mapVramAperture() {
 	if (fullLen != bar0Size) RDNA4LOG("vram: BAR0 is %llu MiB; mapped the first %zu MiB", fullLen >> 20, bar0Size >> 20);
 
 	bar0Phys = cfgAddr;                          // planned equal to IOPCIFamily's address (plan_bar0 refuses a difference)
-	RDNA4LOG("vram: BAR0 aperture phys 0x%llx, %zu MiB, mapped %s", bar0Phys, bar0Size >> 20,
-	       (bar0Map->getMapOptions() & kIOMapWriteCombineCache) ? "write-combining" : "uncached");
+	bar0FullMode = fullBarRequested && bar0Size > kMaxBar0Map;
+	RDNA4LOG("vram: BAR0 aperture phys 0x%llx, %zu MiB, fullMode=%u, mapped %s", bar0Phys, bar0Size >> 20,
+	       bar0FullMode ? 1u : 0u, (bar0Map->getMapOptions() & kIOMapWriteCombineCache) ? "write-combining" : "uncached");
 	setProperty("BAR0,Phys", bar0Phys, 64);
-	setProperty("BAR0,SizeMB", static_cast<uint64_t>(bar0Size >> 20), 32);
+	setProperty("BAR0,SizeMB", static_cast<uint64_t>(bar0Size >> 20), 64);
+	setProperty("BAR0,FullMode", bar0FullMode);
 	return bar0 != nullptr && bar0Size >= 2 * kOneMiB;
 }
 
@@ -274,8 +301,9 @@ bool GarnetDriver::finishVramPlan() {
 		return false;
 	}
 	bar0Limit = pl.vramLimit;
-	RDNA4LOG("vram: vramLimit %llu MiB (mapped %zu MiB, VRAM %u MiB, hi reserve %llu MiB)", (unsigned long long)(bar0Limit >> 20), bar0Size >> 20, vramMB, (unsigned long long)(amdgpu::kVramHiTotalReserve >> 20));
-	setProperty("BAR0,VramLimitMB", static_cast<uint64_t>(bar0Limit >> 20), 32);
+	RDNA4LOG("vram: vramLimit %llu MiB (mapped %zu MiB, VRAM %u MiB, hi reserve %llu MiB, fullMode=%u)", (unsigned long long)(bar0Limit >> 20), bar0Size >> 20, vramMB, (unsigned long long)(amdgpu::kVramHiTotalReserve >> 20), bar0FullMode ? 1u : 0u);
+	setProperty("BAR0,VramLimitMB", static_cast<uint64_t>(bar0Limit >> 20), 64);
+	setProperty("BAR0,ValidVramMB", static_cast<uint64_t>(vramMB), 64);
 	return true;
 }
 
@@ -318,6 +346,8 @@ bool GarnetDriver::mapDoorbells() {
 void GarnetDriver::dropBar0() {
 	unmapVramAperture();
 	bar0Phys = 0; bar0Limit = 0; vramBase = 0;
+	bar0FullMode = false;
+	setProperty("BAR0,FullMode", false);
 }
 
 void GarnetDriver::unmapVramAperture() {
@@ -325,13 +355,23 @@ void GarnetDriver::unmapVramAperture() {
 	if (bar0Map) { bar0Map->release(); bar0Map = nullptr; }
 }
 
+uint64_t GarnetDriver::bar0AccessLimit() const {
+	uint64_t cap = static_cast<uint64_t>(bar0Size);
+	if (bar0Limit != 0ull && bar0Limit < cap) cap = bar0Limit;
+	const uint64_t validVram = static_cast<uint64_t>(vramMB) << 20;
+	if (validVram != 0ull && validVram < cap) cap = validVram;
+	return cap;
+}
+
 uint32_t GarnetDriver::bar0Read32(uint64_t vramOffset) const {
-	if (!bar0 || vramOffset + 4 > bar0Size) return 0xFFFFFFFF;
+	const uint64_t cap = bar0AccessLimit();
+	if (!bar0 || vramOffset > cap || 4ull > cap - vramOffset) return 0xFFFFFFFF;
 	return *reinterpret_cast<const volatile uint32_t *>(bar0 + vramOffset);
 }
 
 bool GarnetDriver::vramWrite(uint64_t vramOffset, const void *src, size_t len) {
-	if (!bar0 || vramOffset + len > bar0Size) return false;
+	const uint64_t cap = bar0AccessLimit();
+	if (!bar0 || vramOffset > cap || len > cap - vramOffset) return false;
 	const uint8_t *s = static_cast<const uint8_t *>(src);
 	volatile uint8_t *d = bar0 + vramOffset;
 	size_t i = 0;
@@ -345,7 +385,8 @@ bool GarnetDriver::vramWrite(uint64_t vramOffset, const void *src, size_t len) {
 }
 
 bool GarnetDriver::vramMemset(uint64_t vramOffset, uint8_t value, size_t len) {
-	if (!bar0 || vramOffset + len > bar0Size) return false;
+	const uint64_t cap = bar0AccessLimit();
+	if (!bar0 || vramOffset > cap || len > cap - vramOffset) return false;
 	volatile uint8_t *d = bar0 + vramOffset;
 	const uint32_t w = static_cast<uint32_t>(value) * 0x01010101u;
 	size_t i = 0;
@@ -370,7 +411,10 @@ bool rdna4_console_size(uint32_t &w, uint32_t &h) {
 // 0.0.613: the console region for the display pipe's present. Known only when the boot capture located it inside BAR0 and rowBytes * height is its length.
 bool GarnetDriver::consoleGeometry(uint64_t *off, uint64_t *len, uint32_t *w, uint32_t *h, uint32_t *rowBytes) const {
 	if (bootFbOff == ~0ULL || bootFbLen == 0 || bootFbRow == 0 || !gRDNA4ConsoleW || !gRDNA4ConsoleH) return false;
-	if (bootFbRow * gRDNA4ConsoleH != bootFbLen || bootFbOff + bootFbLen > bar0Size) return false;
+	const uint64_t cap = bar0AccessLimit();
+	uint64_t verifiedOff = rdna4rebar::kNoConsole;
+	if (!rdna4rebar::console_in_bar0(bar0Phys, cap, bootFbPhys, bootFbLen, &verifiedOff) || verifiedOff != bootFbOff) return false;
+	if (bootFbRow * gRDNA4ConsoleH != bootFbLen) return false;
 	if (off) *off = bootFbOff;
 	if (len) *len = bootFbLen;
 	if (w) *w = gRDNA4ConsoleW;
@@ -404,11 +448,14 @@ bool GarnetDriver::captureBootFramebuffer() {
 		RDNA4LOG("vram: console info empty (base 0x%llx len 0x%llx)", bootFbPhys, bootFbLen);
 		return false;
 	}
-	const bool inBar0 = bootFbPhys >= bar0Phys && bootFbPhys + bootFbLen <= bar0Phys + bar0Size;
-	bootFbOff = inBar0 ? bootFbPhys - bar0Phys : ~0ULL;
-	RDNA4LOG("vram: console framebuffer phys 0x%llx %lux%lu rowBytes %lu depth %lu (%llu KiB) -> %s",
+	const uint64_t validBound = bar0AccessLimit();
+	uint64_t off = rdna4rebar::kNoConsole;
+	const bool inBar0 = rdna4rebar::console_in_bar0(bar0Phys, validBound, bootFbPhys, bootFbLen, &off);
+	bootFbOff = inBar0 ? off : ~0ULL;
+	RDNA4LOG("vram: console framebuffer phys 0x%llx %lux%lu rowBytes %lu depth %lu (%llu KiB) vs BAR0 [0x%llx, +%llu MiB valid) -> %s",
 	       bootFbPhys, video.v_width, video.v_height, video.v_rowBytes, video.v_depth, bootFbLen >> 10,
-	       inBar0 ? "inside BAR0" : "NOT inside BAR0");
+	       (unsigned long long)bar0Phys, (unsigned long long)(validBound >> 20),
+	       inBar0 ? "inside BAR0" : "NOT inside BAR0 (console writes refused, offset not guessed)");
 	if (inBar0) {
 		RDNA4LOG("vram: console framebuffer occupies vram+[0x%llx, 0x%llx)", bootFbOff, bootFbOff + bootFbLen);
 		setProperty("BootFB,VramOffset", bootFbOff, 64);
@@ -418,27 +465,32 @@ bool GarnetDriver::captureBootFramebuffer() {
 }
 
 bool GarnetDriver::chooseVramBase() {
+	const uint64_t cap = bar0AccessLimit();
 	uint64_t base;
 	if (bootFbOff != ~0ULL) {
 		// First choice: just above the console FB (1 MiB aligned). If that does
 		// not fit in the aperture (FB parked at the top), fall back to offset 0
 		// provided the whole span ends below the FB.
+		if (bootFbOff > ~0ULL - bootFbLen || bootFbOff + bootFbLen > ~0ULL - (kOneMiB - 1)) {
+			RDNA4LOG("vram: console FB range wraps; refusing");
+			return false;
+		}
 		base = (bootFbOff + bootFbLen + kOneMiB - 1) & ~(kOneMiB - 1);
-		if (base + kBringupSpan > bar0Size) {
-			if (kBringupSpan <= bootFbOff) {
+		if (base > cap || kBringupSpan > cap - base) {
+			if (kBringupSpan <= bootFbOff && kBringupSpan <= cap) {
 				RDNA4LOG("vram: no room above the console FB; using vram+0 (FB starts at 0x%llx)", bootFbOff);
 				base = 0;
 			} else {
-				RDNA4LOG("vram: console FB at vram+0x%llx (%llu KiB) leaves no %llu MiB window in a %zu MiB BAR0; refusing",
-				       bootFbOff, bootFbLen >> 10, kBringupSpan >> 20, bar0Size >> 20);
+				RDNA4LOG("vram: console FB at vram+0x%llx (%llu KiB) leaves no %llu MiB window in a %llu MiB BAR0; refusing",
+				       bootFbOff, bootFbLen >> 10, kBringupSpan >> 20, (unsigned long long)(cap >> 20));
 				return false;
 			}
 		}
 	} else {
 		base = kFallbackBase;                                             // unknown: assume it is low
 		RDNA4LOG("vram: console FB not located in BAR0; using fallback base %llu MiB", base >> 20);
-		if (base + kBringupSpan > bar0Size) {
-			RDNA4LOG("vram: fallback base does not fit in a %zu MiB BAR0; refusing", bar0Size >> 20);
+		if (base > cap || kBringupSpan > cap - base) {
+			RDNA4LOG("vram: fallback base does not fit in a %llu MiB BAR0; refusing", (unsigned long long)(cap >> 20));
 			return false;
 		}
 	}
@@ -456,10 +508,13 @@ bool GarnetDriver::chooseVramBase() {
 // Write a pattern through BAR0 and read it back through the MM_INDEX/MM_DATA
 // indirect window (the path that already read the on-die discovery table).
 // Both address VRAM by byte offset; if they agree, BAR0 offset == VRAM offset
-// and our MC arithmetic (FB_LOCATION_BASE + offset) stands. Touches only the
-// first 16 bytes of our own region.
+// and our MC arithmetic (FB_LOCATION_BASE + offset) stands. Touches only 16 bytes
+// at `off` and restores the original bytes. High 32 bits are mixed into the pattern
+// so 32-bit wrap/aliasing above 4 GiB is detected.
 bool GarnetDriver::apertureCheck(uint64_t off) {
-	const uint32_t pat[4] = { 0x4E343821u, 0xA5C3F00Du, static_cast<uint32_t>(off), static_cast<uint32_t>(~off) };
+	const uint32_t offLo = static_cast<uint32_t>(off);
+	const uint32_t offHi = static_cast<uint32_t>(off >> 32);
+	const uint32_t pat[4] = { 0x4E343821u ^ (offHi * 0x9E3779B9u), 0xA5C3F00Du ^ offHi, offLo, ~offLo ^ (offHi << 16) };
 	uint32_t before[4], mm[4], bar[4];
 	for (uint64_t i = 0; i < 4; i++) before[i] = vramRead32(off + 4 * i);
 	if (!vramWrite(off, pat, sizeof(pat))) return false;
@@ -480,7 +535,7 @@ bool GarnetDriver::apertureCheck(uint64_t off) {
 }
 
 // 0.0.663 (ReBAR item 4): three points across the window (rdna4rebar::aperture_points): proves BAR0 offset == VRAM offset at the bottom, the middle and the top of the planned window, BEFORE the allocator exists
-// (stagePSP calls this ahead of buildDeviceContext; the visible pool never starts until all three MATCH). Any mismatch, or a degenerate window, refuses.
+// (stagePSP calls this ahead of buildDeviceContext; the visible pool never starts until all three MATCH). In full-BAR mode (> 1 GiB) also checks 4/8/12 GiB boundary points before any write. Any mismatch, or a degenerate window, refuses.
 bool GarnetDriver::apertureCheckWindow() {
 	uint64_t pt[3] = {};
 	if (bar0Limit == 0 || !rdna4rebar::aperture_points(vramBase, bar0Limit, bar0Size, pt)) {
@@ -488,14 +543,23 @@ bool GarnetDriver::apertureCheckWindow() {
 		setProperty("Garnet,ApertureCheck", "mismatch");
 		return false;
 	}
-	if (!rdna4rebar::layout_ok(bootFbOff == ~0ULL ? rdna4rebar::kNoConsole : bootFbOff, bootFbLen, vramBase, pt, vramBase + rdna4rebar::kVisAllocOffset, bar0Limit)) {
+	const uint64_t consOff = bootFbOff == ~0ULL ? rdna4rebar::kNoConsole : bootFbOff;
+	if (!rdna4rebar::layout_ok(consOff, bootFbLen, vramBase, pt, vramBase + rdna4rebar::kVisAllocOffset, bar0Limit)) {
 		RDNA4LOG("vram: aperture check: vramBase %#llx, a check point or the visible pool overlaps the console [%#llx, +%#llx) or its 64 KiB cursor; refusing before any write", (unsigned long long)vramBase, (unsigned long long)bootFbOff, (unsigned long long)bootFbLen);
+		setProperty("Garnet,ApertureCheck", "mismatch");
+		return false;
+	}
+	uint64_t extra[rdna4rebar::kMaxExtraAperturePoints] = {};
+	const uint32_t nExtra = rdna4rebar::aperture_boundary_points(vramBase, bar0Limit, bar0Size, static_cast<uint64_t>(vramMB) << 20, extra);
+	if (nExtra > 0u && !rdna4rebar::layout_points_clear_console(consOff, bootFbLen, extra, nExtra)) {
+		RDNA4LOG("vram: aperture check: full-BAR boundary point overlaps console [%#llx, +%#llx) or its 64 KiB cursor; refusing before any write", (unsigned long long)bootFbOff, (unsigned long long)bootFbLen);
 		setProperty("Garnet,ApertureCheck", "mismatch");
 		return false;
 	}
 	bool all = true;
 	for (int i = 0; i < 3; i++) all = apertureCheck(pt[i]) && all;     // every point is tried and logged even after a mismatch
-	RDNA4LOG("vram: aperture checks at vram+[%#llx, %#llx, %#llx] -> %s", (unsigned long long)pt[0], (unsigned long long)pt[1], (unsigned long long)pt[2], all ? "ALL MATCH" : "MISMATCH");
+	for (uint32_t i = 0; i < nExtra; i++) all = apertureCheck(extra[i]) && all;
+	RDNA4LOG("vram: aperture checks at vram+[%#llx, %#llx, %#llx] (+%u full-BAR boundary pts) -> %s", (unsigned long long)pt[0], (unsigned long long)pt[1], (unsigned long long)pt[2], nExtra, all ? "ALL MATCH" : "MISMATCH");
 	setProperty("Garnet,ApertureCheck", all ? "match" : "mismatch");
 	return all;
 }
@@ -1076,6 +1140,110 @@ bool GarnetDriver::start(IOService *provider) {
 	return true;
 }
 
+// Direct CPU BAR0 <-> GPU bidirectional verification on allocator-granted exclusive regions
+// (4/8/12 GiB boundaries + highest valid offset below vramLimit). Uses bar0Virt ONLY (WC drain + HDP flush)
+// plus SDMA0 QUEUE0 COPY_LINEAR — never MM_INDEX. Fails closed if BAR0 does not cover the targets.
+IOReturn GarnetDriver::runHighBarBidirTest(uint64_t arg, uint64_t out[kAccelExtraScalars]) {
+	using namespace rdna4rebar;
+	for (unsigned i = 0; i < kAccelExtraScalars; i++) out[i] = 0;
+	out[8]  = bar0Size;
+	out[9]  = bar0Limit;
+	out[10] = bar0Phys;
+	out[11] = (bar0FullMode ? 1ull : 0ull) | (bar0WriteCombined() ? 2ull : 0ull);
+	if (!bartest_arg_ok(arg)) { out[0] = kBtBadArg; return kIOReturnBadArgument; }
+	if (!bar0 || bar0Size == 0 || bar0Limit == 0 || !gBringup.dev) { out[0] = kBtNoBar0; return kIOReturnSuccess; }
+	if (!gBringup.gmc.vram_alloc.is_inited()) { out[0] = kBtAllocFail; return kIOReturnSuccess; }
+	if (!gBringup.sdma.instance[0].inited || !gBringup.sdma.instance[0].enabled) { out[0] = kBtSdmaNotReady; return kIOReturnSuccess; }
+
+	const uint64_t visBase    = vramBase + kVisAllocOffset;
+	const uint64_t vramBytes  = static_cast<uint64_t>(vramMB) << 20;
+	const uint64_t consoleOff = bootFbOff == ~0ULL ? kNoConsole : bootFbOff;
+	uint64_t targets[kMaxBarTestTargets] = {};
+	uint32_t nTargets = 0;
+	const uint32_t planSt = bartest_plan_targets(bar0FullMode, arg, visBase, bar0Limit, bar0Size,
+	                                             vramBytes, consoleOff, bootFbLen, targets, &nTargets);
+	if (planSt != kBtOk) {
+		out[0] = planSt;
+		RDNA4LOG("bartest: plan refused (%u: %s) arg=%llu fullMode=%u bar0Size=%zuMiB vramLimit=%lluMiB",
+		         planSt, bartest_status_name(planSt), (unsigned long long)arg, bar0FullMode ? 1u : 0u,
+		         bar0Size >> 20, (unsigned long long)(bar0Limit >> 20));
+		return kIOReturnSuccess;
+	}
+	out[1] = nTargets;
+
+	amdgpu::VRAMAllocation canary {}, scratch {};
+	if (!amdgpu::n1c_vram_alloc_excl(gBringup, kBarTestCanaryBytes, 65536ull, &canary)) {
+		out[0] = kBtAllocFail;
+		return kIOReturnSuccess;
+	}
+	if (!amdgpu::n1c_vram_alloc_excl(gBringup, kBarTestCanaryBytes, 65536ull, &scratch)) {
+		amdgpu::n1c_vram_free_excl(gBringup, canary);
+		out[0] = kBtAllocFail;
+		return kIOReturnSuccess;
+	}
+	const uint64_t vramStart  = gBringup.gmc.vram_start;
+	const uint64_t canaryOff  = canary.gpu_va - vramStart;
+	const uint64_t scratchOff = scratch.gpu_va - vramStart;
+	if (arg == 0ull && canaryOff >= 4ull * kGiB) {
+		amdgpu::n1c_vram_free_excl(gBringup, scratch);
+		amdgpu::n1c_vram_free_excl(gBringup, canary);
+		out[0] = kBtAllocFail;
+		RDNA4LOG("bartest: low canary landed at %#llx (>= 4 GiB); refusing", (unsigned long long)canaryOff);
+		return kIOReturnSuccess;
+	}
+
+	static volatile uint32_t gBarTestFenceSeq = 0x5B400000u;
+	struct DirectBarOps {
+		amdgpu::DeviceContext *d;
+		void     bar0_write32(uint64_t off, uint32_t val) { amdgpu::WBAR0_32(*d, off, val); }
+		uint32_t bar0_read32(uint64_t off)                { return amdgpu::RBAR0_32(*d, off); }
+		void     wc_and_hdp_flush()                       { storeFence(); amdgpu::amdgpu_hdp_flush(*d); }
+		void     hdp_flush()                              { amdgpu::amdgpu_hdp_flush(*d); }
+		bool     gpu_copy(uint64_t srcMc, uint64_t dstMc, uint32_t bytes) {
+			const uint32_t f = __atomic_add_fetch(&gBarTestFenceSeq, 1u, __ATOMIC_RELAXED);
+			return rdna4_sdma_copy_linear_sync(srcMc, dstMc, bytes, f, 200u) == 0u;
+		}
+	};
+	DirectBarOps ops { gBringup.dev };
+
+	uint32_t passed = 0;
+	uint32_t finalSt = kBtOk;
+	for (uint32_t i = 0; i < nTargets; i++) {
+		const uint64_t targetOff = targets[i];
+		out[12] = targetOff;
+		amdgpu::VRAMAllocation blk {};
+		if (!amdgpu::n1c_vram_alloc_excl_at(gBringup, vramStart + targetOff, kBarTestBlockBytes, &blk)) {
+			finalSt = kBtAllocFail;
+			out[3] = i; out[4] = targetOff;
+			RDNA4LOG("bartest: target[%u] vram+%#llx exclusive alloc_at refused (in use or out of range)",
+			         i, (unsigned long long)targetOff);
+			break;
+		}
+		BarTestPointIn pin {
+			vramStart, visBase, bar0Limit, bar0Size, vramBytes,
+			consoleOff, bootFbLen, targetOff, canaryOff, scratchOff
+		};
+		const BarTestPointOut ptRes = bartest_run_point(ops, pin);
+		amdgpu::n1c_vram_free_excl(gBringup, blk);
+		if (ptRes.status != kBtOk) {
+			finalSt = ptRes.status;
+			out[3] = i; out[4] = targetOff; out[5] = ptRes.firstBadIdx; out[6] = ptRes.want; out[7] = ptRes.got;
+			RDNA4LOG("bartest: target[%u] vram+%#llx FAILED (%u: %s) idx=%u want=%#010x got=%#010x",
+			         i, (unsigned long long)targetOff, ptRes.status, bartest_status_name(ptRes.status),
+			         ptRes.firstBadIdx, ptRes.want, ptRes.got);
+			break;
+		}
+		passed++;
+		RDNA4LOG("bartest: target[%u] vram+%#llx PASSED (direct BAR0 <-> SDMA bidirectional + guards + canary %#llx)",
+		         i, (unsigned long long)targetOff, (unsigned long long)canaryOff);
+	}
+	amdgpu::n1c_vram_free_excl(gBringup, scratch);
+	amdgpu::n1c_vram_free_excl(gBringup, canary);
+	out[0] = finalSt;
+	out[2] = passed;
+	return kIOReturnSuccess;
+}
+
 // Native bringup/display verb dispatch, reachable from the admin user client.
 IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
                                         uint64_t *outTtlCalls, uint64_t *outFirstUnsupported,
@@ -1120,6 +1288,19 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < rdna4native::g4::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
 	}
+	// action 109 (enable-rdna4-16g-bar Task 4.1): direct CPU BAR0 <-> GPU bidirectional verification on exclusive high-VRAM regions.
+	// Root-only legacy client; fails closed if BAR0 does not cover targets; never falls back to MM_INDEX.
+	if (rdna4rebar::bartest_is_action(action)) {
+		uint64_t v[kAccelExtraScalars] = { 0 };
+		const IOReturn kr = runHighBarBidirTest(argScalar, v);
+		RDNA4LOG("accel-experiment: bartest %llu -> kr %#x status %llu (%s), passed %llu/%llu",
+		         (unsigned long long)argScalar, kr, (unsigned long long)v[0],
+		         rdna4rebar::bartest_status_name(static_cast<uint32_t>(v[0])),
+		         (unsigned long long)v[2], (unsigned long long)v[1]);
+		if (outExtra)
+			for (unsigned i = 0; i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kr;
+	}
 	if (!rdna4scan::accel_exempt(action, argScalar) && !rdna4disp::native_exempt(rdna4disp_latched_on(), action, argScalar)) {
 	if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;
 	}
@@ -1156,6 +1337,7 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			} else v[0] = 1ull;
 			// 0.0.664: the census for the step-B3 choice of ResizeAppleGpuBars: bit1 = the capability was found for BAR0, bits 8..31 = its current size in MiB, bits 32..63 = its supported-sizes mask (bit k = 1 MiB << k)
 			v[11] |= (rebarFound ? 2ull : 0ull) | ((rebarCurMB & 0xFFFFFFull) << 8) | ((uint64_t)rebarMask << 32);
+			if (bar0FullMode) v[11] |= 4ull;   // bit2 = full BAR mode active (garnet-full-bar=1, BAR0 > 1 GiB)
 		}
 		RDNA4LOG("accel-experiment: vramstat -> status %u: visible %llu / %llu KiB free, hi %llu / %llu KiB free, vramLimit %#llx, BAR0 mapped %#llx at %#llx", st == rdna4disp::kBadArg ? 2u : (uint32_t)v[0],
 		       (unsigned long long)(v[2] >> 10), (unsigned long long)(v[1] >> 10), (unsigned long long)(v[4] >> 10), (unsigned long long)(v[3] >> 10), (unsigned long long)v[5], (unsigned long long)v[6], (unsigned long long)v[7]);
@@ -1434,10 +1616,11 @@ IOReturn GarnetDriver::sleepWakeCallback(void *target, void *, UInt32 messageTyp
 	rdna4sleep::Actions act {};
 	uint32_t readBack = 0u;
 	if (self->sleepLock) IOLockLock(self->sleepLock);
+	const uint64_t cap = self->bar0AccessLimit();
 	const uint64_t markOff =
-	    (self->vramBase != 0u && self->vramBase + 4u <= self->bar0Size)
+	    (self->vramBase != 0u && self->vramBase <= cap && 4u <= cap - self->vramBase)
 	        ? self->vramBase
-	        : ((self->bootFbOff != 0u && self->bootFbOff != ~0ULL && self->bar0Size >= 4u) ? 0u : ~0ULL);
+	        : ((self->bootFbOff != 0u && self->bootFbOff != ~0ULL && cap >= 4u) ? 0u : ~0ULL);
 	bool writeOk = false;
 	if (msg == rdna4sleep::Message::WillSleep && self->bar0 && markOff != ~0ULL) {
 		auto *w = reinterpret_cast<volatile uint32_t *>(self->bar0 + markOff);

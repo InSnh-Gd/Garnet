@@ -40,5 +40,6 @@ uint32_t rdna4_fm_control(uint32_t m, uint32_t contRefused);
 uint32_t rdna4_fm_test(uint32_t n, uint64_t *out, unsigned count);
 
 uint32_t rdna4_scanfull_read(uint64_t off, void *dst, uint32_t max, uint64_t *total, uint64_t *seq);
+uint32_t rdna4_sdma_copy_linear_sync(uint64_t srcMc, uint64_t dstMc, uint32_t bytes, uint32_t fenceVal, uint32_t timeoutMs);
 
 #endif /* RDNA4ScanoutSdma_hpp */

@@ -62,9 +62,22 @@ inline uint64_t consolePhysicalAddress(uint64_t baseAddress) {
 inline bool validateApertureRange(uint64_t bar0Phys, uint64_t bar0Size,
                                   uint64_t consolePhys, uint64_t consoleLen) {
 	if (!bar0Phys || !bar0Size || !consolePhys || consoleLen < 4096ull) return false;
+	if (bar0Size > ~0ull - bar0Phys) return false;
 	if (consoleLen > bar0Size) return false;
 	if (consolePhys < bar0Phys) return false;
 	return (consolePhys - bar0Phys) <= (bar0Size - consoleLen);
+}
+
+inline bool primaryMatchesSnapshot(uint64_t bar0Phys, uint64_t bar0Size,
+                                   uint64_t consolePhys, uint64_t consoleLen,
+                                   const rdna4peer::Snapshot &snap) {
+	if (!validateApertureRange(bar0Phys, bar0Size, consolePhys, consoleLen)) return false;
+	if (snap.state != rdna4peer::kStateReady) return false;
+	if (bar0Phys != snap.bar0Phys || bar0Size != snap.bar0Size) return false;
+	if (consolePhys != snap.consolePhysBase || consoleLen != snap.console.length) return false;
+	if (snap.vramLimit == 0ull || snap.vramLimit > snap.bar0Size || snap.vramLimit > snap.vramBytes) return false;
+	const uint64_t off = consolePhys - bar0Phys;
+	return off == snap.console.offset && off <= snap.vramLimit && consoleLen <= snap.vramLimit - off;
 }
 
 inline void buildModeTable(const uint8_t *edidBytes, size_t edidLen,

@@ -604,7 +604,30 @@ static void h5_pins2(const std::string &root) {
         expect(normal.find("(void)flush_vmid") == std::string::npos, "D: no flush result is ignored in the Normal branch");
     }
 }
-static void h6_run(const std::string &root) { h6_device_pages(); h7_session_ordering(); h5_pins2(root); }
+static void h6_fullbar_16g_exclusion() {
+    // Task 3.2: full 16 GiB BAR0 at high 64-bit physical address (including 4/8/12 GiB boundaries
+    // and invalid tail [16304 MiB, 16384 MiB)) must be wholly excluded from BoImportHost!
+    const uint64_t GiB = 1ull << 30;
+    const uint64_t bar0Base = 0x7C00000000ull;
+    const uint64_t bar0Len  = 16ull * GiB;
+    const uint64_t dramTop  = 0x10000000000ull;   // 1 TiB synthetic DRAM ceiling above BAR0
+    const PciBar bars[2] = { { bar0Base, bar0Len }, { bar0Base + bar0Len + 0x1000000ull, 8 * MiB } };
+    const uint64_t blocked[] = {
+        bar0Base,
+        bar0Base + 4 * GiB - 0x1000ull,
+        bar0Base + 4 * GiB,
+        bar0Base + 8 * GiB,
+        bar0Base + 12 * GiB,
+        bar0Base + 16304 * MiB - 0x1000ull,
+        bar0Base + 16304 * MiB,              // invalid VRAM tail still inside physical 16 GiB BAR0
+        bar0Base + bar0Len - 0x1000ull,      // last page of 16 GiB BAR0
+    };
+    for (uint64_t pa : blocked)
+        expect_u("16 GiB BAR0 page excluded from BoImportHost", import_page_verdict(pa, bars, 2u, dramTop), kPageInBar);
+    expect_u("page immediately past 16 GiB BAR0 allowed as DRAM", import_page_verdict(bar0Base + bar0Len, bars, 2u, dramTop), kPageOk);
+    expect_u("page immediately before 16 GiB BAR0 allowed as DRAM", import_page_verdict(bar0Base - 0x1000ull, bars, 2u, dramTop), kPageOk);
+}
+static void h6_run(const std::string &root) { h6_device_pages(); h6_fullbar_16g_exclusion(); h7_session_ordering(); h5_pins2(root); }
 
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";

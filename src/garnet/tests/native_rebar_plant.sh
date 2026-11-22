@@ -155,5 +155,25 @@ plant 72 $B "vramstat does not report the supported-sizes mask" '((uint64_t)reba
 plant 73 $CLI "the CLI does not name the ResizeAppleGpuBars code" 'ResizeAppleGpuBars code %u' 'code %u'
 plant 74 $PURE "entry_min_bytes returns the largest size" 'for (uint32_t k = 0; k < 32u; k++) if ((supportedMask >> k) & 1u) return 1ull << (20u + k);' 'for (uint32_t k = 31; k < 32u; k--) if ((supportedMask >> k) & 1u) return 1ull << (20u + k);'
 plant 75 $GMC "F5: the layout offset is not tied to the allocator's" 'static_assert(kGMCVRAMAllocOffset == rdna4rebar::kVisAllocOffset' 'static_assert(true || kGMCVRAMAllocOffset == rdna4rebar::kVisAllocOffset'
+# ---- enable-rdna4-16g-bar (Tasks 3.1 / 3.2 / 3.3 / 4.1) ----
+BT=$SR/amd/rebar_bartest_pure.h
+PFB=$SR/GarnetPrimaryFramebuffer.cpp
+GATE=$SR/GarnetDisplayGate.cpp
+plant 76 $PURE "3.1: requireFullBar silently accepts small BARs" 'if (in.requireFullBar && (!in.rebarPresent || in.ioLen <= kMaxBar0Map || in.ioLen < in.vramBytes)) { r.reason = kFullBarNotAssigned; return r; }' ''
+plant 77 $PURE "3.1: BAR0 overlap check is dropped" 'if (in.barOverlap) { r.reason = kBarOverlap; return r; }' ''
+plant 78 $PURE "3.2: cpu_map_vram_ok allows mapping below visFloor (console/bring-up)" 'if (off < floor || off > ceil || size > ceil - off) return false;' 'if (off > ceil || size > ceil - off) return false;'
+plant 79 $PURE "3.2: cpu_map_vram_ok allows mapping invalid tail past vramBytes" '    uint64_t ceil = bar0Size < vramLimit ? bar0Size : vramLimit;
+    if (vramBytes != 0ull && vramBytes < ceil) ceil = vramBytes;' '    uint64_t ceil = bar0Size < vramLimit ? bar0Size : vramLimit;'
+plant 80 $S1C "3.2: n1c_memory_for_handle skips cpu_map_vram_ok" '!rdna4rebar::cpu_map_vram_ok(b.mc, b.size, gCtx->gmc.vram_start, gCtx->dev->vramBase,' 'false && !rdna4rebar::cpu_map_vram_ok(b.mc, b.size, gCtx->gmc.vram_start, gCtx->dev->vramBase,'
+plant 81 $PFB "3.3: primary FB skips snapshot agreement check" 'if (!rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)) {' 'if (false) {'
+plant 82 $GATE "3.3: display gate skips console vramLimit check" 'consoleEnd > current.vramLimit ||' ''
+plant 83 $BT "4.1: bartest_plan_targets allows arg 0 without fullBarMode" 'if (arg == 0ull && !fullBarMode) return kBtNotFullBar;' ''
+plant 84 $BT "4.1: bartest_run_point skips immediate low-canary check" '    // 2) Immediate low-canary check catches CPU BAR0 32-bit wrap/aliasing before GPU touches anything.
+    for (uint32_t i = 0; i < kBarTestCanaryDwords; i++) {
+        const uint32_t want = bartest_canary_word(i);
+        const uint32_t got  = ops.bar0_read32(in.lowCanaryOff + static_cast<uint64_t>(i) * 4u);
+        if (got != want) { res = { kBtCanaryCorrupt, i, want, got }; return res; }
+    }' ''
+plant 85 $B "4.1: runHighBarBidirTest falls back to MM_INDEX" 'uint32_t bar0_read32(uint64_t off)                { return amdgpu::RBAR0_32(*d, off); }' 'uint32_t bar0_read32(uint64_t off)                { return amdgpu::RVRAM32_via_mm(*d, off); }'
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

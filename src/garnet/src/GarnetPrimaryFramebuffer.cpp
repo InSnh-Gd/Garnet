@@ -81,6 +81,15 @@ bool read_console_and_bar0(IOPCIDevice *pci,
 	if (!bar0) return false;
 	const uint64_t bar0Phys = static_cast<uint64_t>(bar0->getPhysicalAddress());
 	const uint64_t bar0Size = static_cast<uint64_t>(bar0->getLength());
+	const uint32_t bar0Lo = pci->configRead32(kIOPCIConfigBaseAddress0);
+	const uint32_t bar0Hi = ((bar0Lo & 0x6u) == 0x4u) ? pci->configRead32(kIOPCIConfigBaseAddress1) : 0u;
+	const uint64_t cfgBar0Phys = rdna4rebar::cfg_bar_addr(bar0Lo, bar0Hi);
+	if (!rdna4rebar::bar_addr_agree(bar0Phys, cfgBar0Phys)) {
+		RDNA4LOG("primaryfb: refusing BAR0 — IOPCIFamily phys %#llx != config space %#llx",
+		         static_cast<unsigned long long>(bar0Phys),
+		         static_cast<unsigned long long>(cfgBar0Phys));
+		return false;
+	}
 
 	PE_Video video {};
 	IOPlatformExpert *pe = IOService::getPlatform();
@@ -974,6 +983,15 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 	if (fPeerRegistered) return;
 	rdna4peer::Snapshot snap {};
 	if (!driver->snapshotDisplayState(&snap)) return;
+	if (!rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)) {
+		RDNA4LOG("primaryfb: refusing peer registration — local BAR0/console [%#llx+%#llx, console %#llx+%#llx] disagrees with snapshot [%#llx+%#llx, limit %#llx, console %#llx+%#llx]",
+		         static_cast<unsigned long long>(fBar0Phys), static_cast<unsigned long long>(fBar0Size),
+		         static_cast<unsigned long long>(fConsolePhys), static_cast<unsigned long long>(fConsoleLen),
+		         static_cast<unsigned long long>(snap.bar0Phys), static_cast<unsigned long long>(snap.bar0Size),
+		         static_cast<unsigned long long>(snap.vramLimit),
+		         static_cast<unsigned long long>(snap.consolePhysBase), static_cast<unsigned long long>(snap.console.length));
+		return;
+	}
 
 	rdna4peer::PrimaryView candidate =
 	    rdna4fbprimary::makePrimaryView(snap, getRegistryEntryID());
@@ -1506,8 +1524,19 @@ void AMDGarnetPrimaryFramebuffer::initCursorSlot(GarnetDriver *driver) {
 	const uint64_t primaryMc = (static_cast<uint64_t>(hi & 0xffffu) << 32) | lo;
 	if (!primaryMc) return;
 
+	uint64_t cursorApertureLimit = fBar0Size;
+	if (driver) {
+		rdna4peer::Snapshot snap {};
+		if (driver->snapshotDisplayState(&snap) && snap.state == rdna4peer::kStateReady) {
+			if (snap.bar0Phys != fBar0Phys) return;
+			if (snap.vramLimit != 0u && snap.vramLimit < cursorApertureLimit) {
+				cursorApertureLimit = snap.vramLimit;
+			}
+		}
+	}
+
 	rdna4cursor::CursorSlotPlan plan {};
-	if (!rdna4cursor::plan_cursor_slot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen,
+	if (!rdna4cursor::plan_cursor_slot(fBar0Phys, cursorApertureLimit, fConsolePhys, fConsoleLen,
 	                                    primaryMc, &plan)) {
 		return;
 	}

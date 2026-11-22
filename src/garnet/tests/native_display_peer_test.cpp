@@ -695,6 +695,78 @@ static void startup_order_checks() {
              attach_note(peerFirst, kOk), kStopped);
 }
 
+static void full_bar_64bit_checks() {
+    const uint64_t kHiBarPhys = 0x7C00000000ull;
+    const uint64_t kFullBar   = 16ull * 1024ull * MiB;
+    const uint64_t kValidVram = 16304ull * MiB;
+    const uint64_t kFullLimit = 15472ull * MiB;
+
+    Layout lay {};
+    LayoutIn lin { kValidVram, kBase, kFullLimit, kFixedReserve, 768ull * MiB,
+                   0, kConsoleBytes, true };
+    expect_u("fullbar-peer: 16 GiB layout builds cleanly", build_layout(lin, lay), kOk);
+
+    Snapshot s = snapshot();
+    s.bar0Phys = kHiBarPhys;
+    s.bar0Size = kFullBar;
+    s.vramBytes = kValidVram;
+    s.vramLimit = kFullLimit;
+    s.consolePhysBase = kHiBarPhys;
+    s.console = lay.console;
+    s.fixed = lay.fixed;
+    s.pool = lay.pool;
+    s.hold = lay.hold;
+    Expected e = expected();
+    e.bar0Phys = kHiBarPhys;
+    e.bar0Size = kFullBar;
+    expect_u("fullbar-peer: 64-bit 16 GiB snapshot validates", validate_peer(s, e, true), kOk);
+
+    PrimaryView pv {};
+    pv.version = kVersion;
+    pv.asic = s.asic; pv.vendor = s.vendor; pv.device = s.device;
+    pv.generation = s.generation; pv.providerEntryID = s.providerEntryID;
+    pv.fbEntryID = kFramebuffer;
+    pv.bar0Phys = kHiBarPhys; pv.bar0Size = kFullBar;
+    pv.consolePhysBase = kHiBarPhys; pv.consoleVramOffset = 0;
+    pv.consoleLength = kConsoleBytes; pv.consoleWidth = kWidth;
+    pv.consoleHeight = kHeight; pv.consoleRowBytes = kRowBytes; pv.consoleDepth = 32;
+    pv.modeWidth = kWidth; pv.modeHeight = kHeight; pv.modeRowBytes = kRowBytes; pv.modeDepth = 32;
+    expect_u("fullbar-peer: 64-bit PrimaryView validates", validate_primary(s, pv), kOk);
+
+    // Console in hi-pool [15472 MiB, 15536 MiB) must be refused by both build_layout and validate_snapshot_layout
+    Layout badLay {};
+    LayoutIn hiCons = lin;
+    hiCons.consoleOffset = kFullLimit;
+    hiCons.consoleLength = 8ull * MiB;
+    expect_u("fullbar-peer: console in hi pool refused by build_layout", build_layout(hiCons, badLay), kBadRange);
+
+    Snapshot sHi = s;
+    sHi.console.offset = kFullLimit;
+    sHi.console.length = kConsoleBytes;
+    sHi.consolePhysBase = kHiBarPhys + sHi.console.offset;
+    expect_u("fullbar-peer: console past vramLimit refused by validate_snapshot_layout",
+             validate_snapshot_layout(sHi), kBadRange);
+
+    // Stale low 32-bit console physical address against high 64-bit BAR0 refused
+    Snapshot sStale = s;
+    sStale.consolePhysBase = 0xD0000000ull;
+    expect_u("fullbar-peer: stale console phys outside high BAR0 refused",
+             validate_snapshot_layout(sStale), kPrimaryMismatch);
+
+    // vramLimit exceeding mapped bar0Size refused
+    Snapshot sTrunc = s;
+    sTrunc.bar0Size = 1024ull * MiB;
+    expect_u("fullbar-peer: vramLimit > bar0Size refused",
+             validate_snapshot_layout(sTrunc), kBadRange);
+
+    // Wrapping bar0Phys + bar0Size refused
+    Snapshot sWrap = s;
+    sWrap.bar0Phys = ~0ull - 4096ull;
+    sWrap.consolePhysBase = sWrap.bar0Phys;
+    expect_u("fullbar-peer: wrapping bar0Phys + bar0Size refused",
+             validate_snapshot_layout(sWrap), kRangeOverflow);
+}
+
 int main() {
     arithmetic_checks();
     layout_checks();
@@ -708,6 +780,7 @@ int main() {
     primary_checks();
     concurrency_check();
     startup_order_checks();
+    full_bar_64bit_checks();
     std::printf("native_display_peer_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

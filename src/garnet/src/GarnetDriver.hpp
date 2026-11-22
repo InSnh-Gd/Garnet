@@ -31,6 +31,7 @@
 #include "amd/rdna4_log.h"
 #include "amd/rdna4_sleep_pure.h"
 #include "amd/rebar_pure.h"   // 0.0.663: Resizable BAR planning (pure)
+#include "amd/rebar_bartest_pure.h"   // high-VRAM direct CPU BAR <-> GPU bidirectional test (pure)
 #include "dcn/display_state_pure.h"   // in-kext display state & primary hand-off (pure)
 #include "amd/amdgpu_init.h"
 struct RDNA4Counters;
@@ -113,6 +114,7 @@ private:
 	// --- VRAM aperture (BAR0, CPU-visible window onto the start of VRAM) ---
 	bool mapVramAperture();
 	void unmapVramAperture();
+	uint64_t bar0AccessLimit() const;
 	uint32_t bar0Read32(uint64_t vramOffset) const;
 	bool captureBootFramebuffer();      // where the UEFI/GOP console lives in VRAM
 	bool chooseVramBase();              // pick vramBase clear of it
@@ -120,6 +122,7 @@ private:
 	bool finishVramPlan();              // 0.0.663 (ReBAR item 2/3): re-plan with the console located; sets bar0Limit or refuses
 	void dropBar0();                    // 0.0.664 (F4): unmap BAR0 and clear every BAR0 field: exactly the 'no BAR0' state
 	bool apertureCheckWindow();         // 0.0.663 (ReBAR item 4): apertureCheck at vramBase, the middle and vramLimit - 64 KiB, before the allocator exists
+	IOReturn runHighBarBidirTest(uint64_t arg, uint64_t out[kAccelExtraScalars]);
 	bool buildDisplayPeerSnapshot(uint32_t state, rdna4peer::Snapshot &out, uint32_t &reason) const;
 	void publishDisplayPeer(uint32_t state);   // identity/state/one reservation table; no GRNT selector
 	void publishDisplayDiagnostics(const rdna4peer::Snapshot &s,
@@ -198,6 +201,7 @@ private:
 	uint32_t           rebarMask  { 0 };      // BAR0's supported-sizes mask (bit k = 1 MiB << k)
 	uint64_t           rebarCurMB { 0 };      // BAR0's current size in MiB
 	uint64_t           bar0Limit  { 0 };      // 0.0.663: vramLimit planned by rdna4rebar::plan_bar0 (== bar0Size at a 256 MiB BAR0); 0 until finishVramPlan succeeds
+	bool               bar0FullMode { false };// true only when garnet-full-bar=1 succeeded with a > 1 GiB full BAR0 mapping
 	rdna4rebar::PlanIn   bar0Plan   {};         // 0.0.663: the plan's inputs, kept so finishVramPlan can add the console
 	uint64_t           bootFbPhys { 0 };      // console framebuffer, physical
 	uint64_t           bootFbLen  { 0 };

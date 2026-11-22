@@ -472,7 +472,7 @@ static uint32_t fc_positive_control() {
 	if (!have) { RDNA4LOG("fastcopy63: CONTROL not run - no %u-byte scratch in our allocator", RDNA4_FC_STAGING_BYTES); return 2u; }
 	const uint64_t off = a.gpu_va - gBringup.gmc.vram_start;
 	gFcPcOff = off;                                         // build 0.0.534 (review M1): switch 89's control line names it
-	if (off + RDNA4_FC_STAGING_BYTES > dev.bar0Size) {
+	if (!amdgpu::bar0_range_ok(dev, off, RDNA4_FC_STAGING_BYTES)) {
 		IOLockLock(gScanoutLock); gBringup.gmc.vram_alloc.free(a); IOLockUnlock(gScanoutLock);
 		RDNA4LOG("fastcopy63: CONTROL not run - scratch VRAM %#llx is outside BAR0", (unsigned long long)off);
 		return 3u;
@@ -3438,6 +3438,26 @@ uint32_t rdna4_scanfull_read(uint64_t off, void *dst, uint32_t max, uint64_t *to
 	return n;
 }
 
+
+// Serialized synchronous single COPY_LINEAR + FENCE on SDMA0 QUEUE0 (used by direct-BAR diagnostic tests).
+// Never touches scanout surfaces or gScanoutWrites. Returns kScanStOk (0) on verified fence completion.
+uint32_t rdna4_sdma_copy_linear_sync(uint64_t srcMc, uint64_t dstMc, uint32_t bytes,
+                                     uint32_t fenceVal, uint32_t timeoutMs) {
+	if (!gBringup.dev || !gScanoutLock) return kScanStNoContext;
+	if (bytes == 0u || bytes > RDNA4_SDMA_COPY_MAX_BYTES) return kScanStPlan;
+	amdgpu::DeviceContext &dev = *gBringup.dev;
+	amdgpu::SDMAInstance &inst = gBringup.sdma.instance[0];
+	IOLockLock(gScanoutLock);
+	uint32_t rptr = 0u;
+	uint32_t st = scanout_queue_check(dev, inst, &rptr);
+	if (st == kScanStOk) {
+		uint64_t us = 0u;
+		uint32_t lastFence = 0u;
+		st = scanout_sdma_copies(dev, inst, &srcMc, &dstMc, &bytes, 1u, fenceVal, timeoutMs, &us, &lastFence);
+	}
+	IOLockUnlock(gScanoutLock);
+	return st;
+}
 
 void rdna4_scanout_sdma_init_locks(void) {
 	if (!gScanoutLock) gScanoutLock = IOLockAlloc(); // 0.0.272: never freed, same reason

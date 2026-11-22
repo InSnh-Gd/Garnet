@@ -456,8 +456,16 @@ uint32_t GarnetDriver::registerPrimaryFramebuffer(IOService *fb,
 	           candidate.otg > rdna4peer::kMaxDisplayOtg) {
 		status = rdna4peer::kBadRequest;
 	} else {
-		uint64_t consoleEnd = 0;
-		if (!rdna4peer::add_ok(candidate.consoleVramOffset, candidate.consoleLength, consoleEnd) ||
+		uint64_t consoleEnd = 0, consolePhys = 0;
+		if (candidate.consolePhysBase != current.consolePhysBase ||
+		    candidate.consoleVramOffset != current.console.offset ||
+		    candidate.consoleLength != current.console.length ||
+		    !rdna4peer::add_ok(current.bar0Phys, candidate.consoleVramOffset, consolePhys) ||
+		    consolePhys != candidate.consolePhysBase) {
+			status = rdna4peer::kPrimaryMismatch;
+		} else if (!rdna4peer::add_ok(candidate.consoleVramOffset, candidate.consoleLength, consoleEnd) ||
+		    consoleEnd > current.bar0Size ||
+		    consoleEnd > current.vramLimit ||
 		    consoleEnd > current.vramBytes) {
 			status = rdna4peer::kBadRange;
 		} else {

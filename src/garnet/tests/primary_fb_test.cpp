@@ -192,6 +192,48 @@ int main() {
 	expect_u("makePrimaryView passes validate_primary",
 	         rdna4peer::validate_primary(snap, pv), rdna4peer::kOk);
 
+	// 5. High 64-bit 16 GiB BAR0 aperture & snapshot agreement checks (Task 3.3).
+	{
+		const uint64_t hiBar = 0x7C00000000ull;
+		const uint64_t bar16G = 16ull << 30;
+		const uint64_t vram16304M = 16304ull << 20;
+		const uint64_t lim15472M = 15472ull << 20;
+		const uint64_t consLen = 8192ull * 1080ull;
+
+		expect(validateApertureRange(hiBar, bar16G, hiBar, consLen),
+		       "16 GiB high BAR0 accepts console at offset 0");
+		expect(!validateApertureRange(hiBar, bar16G, 0xD0000000ull, consLen),
+		       "stale 32-bit console phys outside 64-bit BAR0 rejected");
+		expect(!validateApertureRange(0xFFFFFFFFFFFF0000ull, 0x20000ull, 0xFFFFFFFFFFFF0000ull, 4096ull),
+		       "wrapping bar0Phys + bar0Size rejected");
+
+		rdna4peer::Snapshot hiSnap = snap;
+		hiSnap.bar0Phys = hiBar;
+		hiSnap.bar0Size = bar16G;
+		hiSnap.vramBytes = vram16304M;
+		hiSnap.vramLimit = lim15472M;
+		hiSnap.consolePhysBase = hiBar;
+		hiSnap.console.offset = 0ull;
+		hiSnap.console.length = consLen;
+		expect(primaryMatchesSnapshot(hiBar, bar16G, hiBar, consLen, hiSnap),
+		       "primaryMatchesSnapshot accepts matching 64-bit 16 GiB snapshot");
+		expect(!primaryMatchesSnapshot(0xD0000000ull, bar16G, hiBar, consLen, hiSnap),
+		       "primaryMatchesSnapshot rejects BAR0 physical mismatch");
+		expect(!primaryMatchesSnapshot(hiBar, 1ull << 30, hiBar, consLen, hiSnap),
+		       "primaryMatchesSnapshot rejects truncated BAR0 size mismatch");
+		expect(!primaryMatchesSnapshot(hiBar, bar16G, hiBar + 4096ull, consLen, hiSnap),
+		       "primaryMatchesSnapshot rejects stale console physical address");
+		rdna4peer::Snapshot badLim = hiSnap;
+		badLim.console.offset = lim15472M;
+		badLim.consolePhysBase = hiBar + lim15472M;
+		expect(!primaryMatchesSnapshot(hiBar, bar16G, badLim.consolePhysBase, consLen, badLim),
+		       "primaryMatchesSnapshot rejects console above vramLimit");
+		rdna4peer::Snapshot notReady = hiSnap;
+		notReady.state = rdna4peer::kStateStarting;
+		expect(!primaryMatchesSnapshot(hiBar, bar16G, hiBar, consLen, notReady),
+		       "primaryMatchesSnapshot rejects non-READY snapshot");
+	}
+
 	std::printf("primary_fb_test: %d checks, %d failed\n", gRun, gFail);
 	return gFail ? 1 : 0;
 }

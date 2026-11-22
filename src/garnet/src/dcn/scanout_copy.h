@@ -53,9 +53,11 @@ static inline uint32_t rdna4_scanout_geom_check(const RDNA4ScanoutGeom *g, uint6
     if (!g || g->fbPhys == 0 || g->fbLen == 0) return kScanGeomNoFramebuffer;
     if (g->depth != 32) return kScanGeomDepth;
     if ((g->fbPhys & 3u) || (g->fbLen & 3u) || (g->rowBytes & 3u)) return kScanGeomAlign;
+    if (g->bar0Phys == 0 || g->bar0Size == 0 || g->bar0Size > ~0ull - g->bar0Phys) return kScanGeomOutsideBar0;
     if (g->fbPhys < g->bar0Phys) return kScanGeomOutsideBar0;
     const uint64_t off = g->fbPhys - g->bar0Phys;
     if (off > g->bar0Size || g->fbLen > g->bar0Size - off) return kScanGeomOutsideBar0;
+    if (g->vramSize != 0 && (off > g->vramSize || g->fbLen > g->vramSize - off)) return kScanGeomOutsideBar0;
     if (off > g->vramBase || g->fbLen > g->vramBase - off) return kScanGeomNotConsole;
     if (g->width == 0 || g->height == 0 || g->rowBytes == 0) return kScanGeomShape;
     if ((uint64_t)g->width * 4u > g->rowBytes) return kScanGeomShape;

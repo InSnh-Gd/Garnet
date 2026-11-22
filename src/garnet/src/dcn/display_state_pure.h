@@ -350,6 +350,7 @@ inline uint32_t build_layout(const LayoutIn &in, Layout &out) {
         if (ranges_overlap(out.console, out.fixed) || ranges_overlap(out.console, out.pool) ||
             ranges_overlap(out.console, out.hold))
             return kRangeOverlap;
+        if (ce > in.vramLimit) return kBadRange;
     }
     return kOk;
 }
@@ -376,6 +377,9 @@ inline uint32_t validate_identity(const Snapshot &s, const Expected &e) {
 inline uint32_t validate_snapshot_layout(const Snapshot &s) {
     if (s.vramBytes == 0 || s.vramBase > s.vramLimit || s.vramLimit > s.vramBytes)
         return kBadRange;
+    if (s.bar0Size == 0 || s.vramLimit > s.bar0Size) return kBadRange;
+    uint64_t barEnd = 0;
+    if (!add_ok(s.bar0Phys, s.bar0Size, barEnd)) return kRangeOverflow;
     if (s.fixed.length == 0 || s.pool.length == 0) return kBadRange;
 
     uint64_t fixedEnd = 0, poolEnd = 0, holdEnd = 0;
@@ -404,7 +408,7 @@ inline uint32_t validate_snapshot_layout(const Snapshot &s) {
     if (pixels > s.console.length) return kBadRange;
     if (!add_ok(s.console.offset, s.console.length, consoleEnd)) return kRangeOverflow;
     if (s.console.offset > s.bar0Size || consoleEnd > s.bar0Size ||
-        consoleEnd > s.vramBytes)
+        consoleEnd > s.vramLimit || consoleEnd > s.vramBytes)
         return kBadRange;
     uint64_t consolePhys = 0, consolePhysEnd = 0;
     if (!add_ok(s.bar0Phys, s.console.offset, consolePhys) ||

@@ -209,7 +209,7 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
     // Deviation D6: CPU ring writes go through BAR0, so the ring must
     // land inside the mapped aperture — otherwise WBAR0_32 silently
     // drops every packet and the engine spins on stale memory.
-    if (inst.ring_vram_off + kSDMARingDefaultBytes > dev.bar0Size) {
+    if (!bar0_range_ok(dev, inst.ring_vram_off, kSDMARingDefaultBytes)) {
         SDMA_LOG("instance %u: ring vram_off %#llx + %u outside BAR0 "
                  "(bar0Size=%llu) — refusing",
                  inst.instance, (unsigned long long)inst.ring_vram_off,
@@ -268,7 +268,7 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
         inst.wb_in_vram  = true;
         inst.wb_bus      = wb_alloc.gpu_va;
         inst.wb_vram_off = wb_alloc.gpu_va - gmc.vram_start;
-        if (inst.wb_vram_off + kSDMAWBPageBytes > dev.bar0Size) {
+        if (!bar0_range_ok(dev, inst.wb_vram_off, kSDMAWBPageBytes)) {
             SDMA_LOG("instance %u: WB vram_off %#llx outside BAR0 — refusing",
                      inst.instance, (unsigned long long)inst.wb_vram_off);
             gmc.vram_alloc.free(wb_alloc);

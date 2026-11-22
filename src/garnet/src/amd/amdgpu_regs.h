@@ -88,31 +88,45 @@ static inline uint32_t RREG32_abs(const DeviceContext &ctx, uint32_t reg) { retu
 // ---- VRAM aperture (BAR0) ------------------------------------------------------
 static inline void storeFence() { __asm__ __volatile__("sfence" ::: "memory"); }
 
+// Effective CPU BAR0 access bound: never exceed mapped bar0Size, planned vramLimit,
+// or valid VRAM (vramSizeBytes) — protects the invalid tail [vramSizeBytes, bar0Size).
+static inline uint64_t bar0_cpu_bound(const DeviceContext &ctx) {
+    uint64_t cap = static_cast<uint64_t>(ctx.bar0Size);
+    if (ctx.vramLimit != 0ull && ctx.vramLimit < cap) cap = ctx.vramLimit;
+    if (ctx.vramSizeBytes != 0ull && ctx.vramSizeBytes < cap) cap = ctx.vramSizeBytes;
+    return cap;
+}
+static inline bool bar0_range_ok(const DeviceContext &ctx, uint64_t byte_offset, uint64_t len) {
+    if (!ctx.bar0) return false;
+    const uint64_t cap = bar0_cpu_bound(ctx);
+    return byte_offset <= cap && len <= cap - byte_offset;
+}
+
 static inline uint32_t RBAR0_32(const DeviceContext &ctx, uint64_t byte_offset) {
-    if (!ctx.bar0 || byte_offset + 4 > ctx.bar0Size) return 0xFFFFFFFFu;
+    if (!bar0_range_ok(ctx, byte_offset, 4ull)) return 0xFFFFFFFFu;
     return *reinterpret_cast<const volatile uint32_t *>(ctx.bar0 + byte_offset);
 }
 // The reference names its VRAM-aperture read RBAR2_32 (on Apple Silicon the
 // aperture is BAR2); keep the name so ported code compiles.
 static inline uint32_t RBAR2_32(const DeviceContext &ctx, uint64_t byte_offset) { return RBAR0_32(ctx, byte_offset); }
 static inline uint64_t RBAR0_64(const DeviceContext &ctx, uint64_t byte_offset) {
-    if (!ctx.bar0 || byte_offset + 8 > ctx.bar0Size) return ~0ULL;
+    if (!bar0_range_ok(ctx, byte_offset, 8ull)) return ~0ULL;
     return *reinterpret_cast<const volatile uint64_t *>(ctx.bar0 + byte_offset);
 }
 static inline void WBAR0_32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value) {
-    if (!ctx.bar0 || byte_offset + 4 > ctx.bar0Size) return;
+    if (!bar0_range_ok(ctx, byte_offset, 4ull)) return;
     *reinterpret_cast<volatile uint32_t *>(ctx.bar0 + byte_offset) = value;
     storeFence();
 }
 static inline void WBAR0_64(const DeviceContext &ctx, uint64_t byte_offset, uint64_t value) {
-    if (!ctx.bar0 || byte_offset + 8 > ctx.bar0Size) return;
+    if (!bar0_range_ok(ctx, byte_offset, 8ull)) return;
     *reinterpret_cast<volatile uint64_t *>(ctx.bar0 + byte_offset) = value;
     storeFence();
 }
 
 static inline void bar0_memcpy_to_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
                                        const void *src, uint64_t size_bytes) {
-    if (!ctx.bar0 || vram_byte_offset + size_bytes > ctx.bar0Size) return;
+    if (!bar0_range_ok(ctx, vram_byte_offset, size_bytes)) return;
     const uint8_t *bytes = static_cast<const uint8_t *>(src);
     volatile uint8_t *dst = ctx.bar0 + vram_byte_offset;
     uint64_t off = 0;
@@ -128,9 +142,9 @@ static inline void bar0_memcpy_to_vram(const DeviceContext &ctx, uint64_t vram_b
         uint32_t v; memcpy(&v, bytes + off, 4);
         *reinterpret_cast<volatile uint32_t *>(dst + off) = v; off += 4;
     }
-    if (off < size_bytes) {
-        uint32_t v = 0; memcpy(&v, bytes + off, size_bytes - off);
-        *reinterpret_cast<volatile uint32_t *>(dst + off) = v;
+    while (off < size_bytes) {
+        dst[off] = bytes[off];
+        off++;
     }
     storeFence();
 }
@@ -138,7 +152,7 @@ static inline void bar0_memcpy_to_vram(const DeviceContext &ctx, uint64_t vram_b
 // NOTE: `pattern` is a 32-bit pattern, as in the reference (not a byte).
 static inline void bar0_memset_vram(const DeviceContext &ctx, uint64_t vram_byte_offset,
                                     uint32_t pattern, uint64_t size_bytes) {
-    if (!ctx.bar0 || vram_byte_offset + size_bytes > ctx.bar0Size) return;
+    if (!bar0_range_ok(ctx, vram_byte_offset, size_bytes)) return;
     volatile uint8_t *dst = ctx.bar0 + vram_byte_offset;
     const uint64_t pattern64 = ((uint64_t)pattern << 32) | pattern;
     uint64_t off = 0;
@@ -187,10 +201,12 @@ static inline void WVRAM32_via_mm(const DeviceContext &ctx, uint64_t pos, uint32
 // is rounded down to a dword; callers stage dword-aligned data.
 static inline void vram_memcpy(const DeviceContext &ctx, uint64_t vram_byte_offset,
                                const void *src, size_t len) {
-    if (vram_byte_offset + len <= ctx.bar0Size && ctx.bar0 != nullptr) {
+    if (bar0_range_ok(ctx, vram_byte_offset, len)) {
         bar0_memcpy_to_vram(ctx, vram_byte_offset, src, len);
         return;
     }
+    if (ctx.vramSizeBytes != 0ull && (vram_byte_offset > ctx.vramSizeBytes || len > ctx.vramSizeBytes - vram_byte_offset))
+        return;
     const auto *p = static_cast<const uint8_t *>(src);
     for (size_t i = 0; i + 4 <= len; i += 4) {
         uint32_t v = (uint32_t)p[i] | ((uint32_t)p[i+1] << 8) |
@@ -251,17 +267,17 @@ static inline void PCIE_PORT_WREG32(const DeviceContext &ctx, uint32_t pcie_port
 
 // ---- BAR2 doorbells (reference: dev.pci->MemoryWrite32/64(bar2MemIndex, byteOff, v)) ----
 static inline void WDOORBELL32(const DeviceContext &ctx, uint64_t byte_offset, uint32_t value) {
-    if (!ctx.bar2 || byte_offset + 4 > ctx.bar2Size) return;
+    if (!ctx.bar2 || byte_offset > ctx.bar2Size || 4ull > ctx.bar2Size - byte_offset) return;
     *reinterpret_cast<volatile uint32_t *>(ctx.bar2 + byte_offset) = value;
     storeFence();
 }
 static inline void WDOORBELL64(const DeviceContext &ctx, uint64_t byte_offset, uint64_t value) {
-    if (!ctx.bar2 || byte_offset + 8 > ctx.bar2Size) return;
+    if (!ctx.bar2 || byte_offset > ctx.bar2Size || 8ull > ctx.bar2Size - byte_offset) return;
     *reinterpret_cast<volatile uint64_t *>(ctx.bar2 + byte_offset) = value;
     storeFence();
 }
 static inline uint32_t RDOORBELL32(const DeviceContext &ctx, uint64_t byte_offset) {
-    if (!ctx.bar2 || byte_offset + 4 > ctx.bar2Size) return 0xFFFFFFFFu;
+    if (!ctx.bar2 || byte_offset > ctx.bar2Size || 4ull > ctx.bar2Size - byte_offset) return 0xFFFFFFFFu;
     return *reinterpret_cast<const volatile uint32_t *>(ctx.bar2 + byte_offset);
 }
 
