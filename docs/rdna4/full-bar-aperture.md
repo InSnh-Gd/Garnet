@@ -8,7 +8,7 @@ This document specifies the pre-PCI-configuration BAR0 compatibility layer (`Gar
 
 ### Why an Early Standalone `Root` Kext Is Needed
 
-On macOS 26.7.2 (`25G332`), `com.apple.iokit.IOPCIFamily` (`726.100.6`, `LC_UUID 227771C6-ADC2-30C7-8408-263F723CF81C`) clamps every probed PCI BAR in `IOPCIConfigurator::probeBaseAddressRegister` (`hdr+0x3712e`) against `MAX_BAR_SIZE = 1 GiB` (`0x40000000`). A 16 GiB RDNA4 BAR0 (`0xFFFFFFFC00000000`) is truncated to 1 GiB (`0x40000000`) unless preserved at probe time.
+On macOS 26.7.2 (`25G332`), `com.apple.iokit.IOPCIFamily` (`726.100.6`, `LC_UUID 227771C6-ADC2-30C7-8408-263F723CF81C`) clamps every probed PCI BAR in `IOPCIConfigurator::probeBaseAddressRegister` (`hdr+0x3712e`) against `MAX_BAR_SIZE = 1 GiB` (`0x40000000`). A 16 GiB RDNA4 BAR0 (`0xFFFFFFFC00000000`) is truncated via `mov ecx, eax` to its low 32 bits = **`0`** (clearing `clean64`, so `safeProbeBaseAddressRegister` frees/erases BAR0 completely while Site 1 decrements `nextBarNum` from `2` to `1` and corrupts BAR1/BAR2) unless preserved at probe time.
 
 `GarnetPCIBarCompat.kext` (`org.garnet.pcibarcompat`) declares `OSBundleRequired = Root`, matches `IOResources` (`IOResourceMatch = IOKit`), and links only `IOPCIFamily` (`1.1`) plus Apple KPIs (`iokit`, `libkern`, `mach`, `unsupported`) — with no third-party kernel patcher dependency. Its `kmod_start` initializer executes synchronously in the prelinked boot kernel ~405 ms **before** `[ PCI configuration begin ]`. Late kernel extension callbacks (such as screen-release callbacks firing ~380 ms **after** PCI configuration completes) run too late to affect BAR range probing.
 
@@ -29,12 +29,12 @@ PCI device BAR ranges, upstream PCIe switch windows, and host-bridge PFM64 decod
 `GarnetPCIBarCompat.kext` is strictly opt-in so standard small-BAR builds and `install-native.sh` remain unchanged:
 
 - `RDNA4_BUILD_PCIBARCOMPAT=0` (default): `GarnetPCIBarCompat.kext` is not built or staged, and delivery manifests omit `PCIBARCOMPAT_*` fields.
-- `RDNA4_BUILD_PCIBARCOMPAT=1`: `build-all.sh` builds `src/garnet-pci-compat`, signs the bundle, validates `build_identity.py pcibarcompat` and `check_legacy` cleanly, stages it at `payload/optional/GarnetPCIBarCompat.kext` (never installed automatically into `/Library/Extensions`), emits `PCIBARCOMPAT_*` into `MANIFEST.txt`, and records load-order and disable-flag provenance (`LOAD_ORDER=before-IOPCIFamily-via-OpenCore-Kernel-Add-Root`, `DISABLE_BOOT_ARG=garnet-rebar-compat=0`).
+- `RDNA4_BUILD_PCIBARCOMPAT=1`: `build-all.sh` builds `src/garnet-pci-compat`, signs the bundle, validates `build_identity.py pcibarcompat` and `check_legacy` cleanly, stages it at `payload/optional/GarnetPCIBarCompat.kext` (never installed automatically into `/Library/Extensions`), emits `PCIBARCOMPAT_*` into `MANIFEST.txt`, and records load-order and disable-flag provenance (`LOAD_ORDER=after-IOPCIFamily-before-PCI-config-and-Garnet-via-OpenCore-Kernel-Add-Root`, `DISABLE_BOOT_ARG=garnet-rebar-compat=0`).
 
 ### OpenCore `config.plist` Requirements
 
 1. **`Kernel -> Add` Load Order**:
-   - Place `GarnetPCIBarCompat.kext` enabled **before** `Garnet.kext` and `GarnetAccel.kext` so OpenCore prelinks it into `BootKernelExtensions` and `kmod_start` runs before PCI configuration.
+   - Place `GarnetPCIBarCompat.kext` enabled **after** `IOPCIFamily` (its `OSBundleLibraries` dependency) and **before** `Garnet.kext` and `GarnetAccel.kext` so OpenCore prelinks it into `BootKernelExtensions` and `kmod_start` runs after `IOPCIFamily` loads and before `[ PCI configuration begin ]`.
 2. **`Booter -> Quirks`**:
    - `ResizeAppleGpuBars = -1` (preserve firmware-sized BAR0; do not downsize to 256 MiB / 1 GiB).
    - `ResizeGpuBars = -1`.

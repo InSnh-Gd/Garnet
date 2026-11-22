@@ -380,7 +380,7 @@ fi
     printf 'BUILD_ACCEL_OPTIONS=CHIPS=%s BUILD=work/accel C64_LAYOUT_OUT=%s C64_WORK=%s\n' \
         "$CHIPS" "$C64_LAYOUT_OUT" "$C64_WORK"
     if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
-        printf 'BUILD_PCIBARCOMPAT_OPTIONS=BUILD=work/pcibarcompat STAGED=optional/GarnetPCIBarCompat.kext LOAD_ORDER=before-IOPCIFamily-via-OpenCore-Kernel-Add-Root DISABLE_BOOT_ARG=garnet-rebar-compat=0\n'
+        printf 'BUILD_PCIBARCOMPAT_OPTIONS=BUILD=work/pcibarcompat STAGED=optional/GarnetPCIBarCompat.kext LOAD_ORDER=after-IOPCIFamily-before-PCI-config-and-Garnet-via-OpenCore-Kernel-Add-Root DISABLE_BOOT_ARG=garnet-rebar-compat=0\n'
     fi
     printf 'BUILD_METAL_OPTIONS=RDNA4_LAZY=%s RDNA4_9D=%s\n' \
         "${RDNA4_LAZY:-1}" "${RDNA4_9D:-1}"
