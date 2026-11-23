@@ -34,9 +34,10 @@ constexpr uint32_t latch_value(bool present, uint32_t value) { return (present &
 constexpr bool latch_is_on(uint32_t latch) { return latch == kLatchOn; }
 
 // ---- slots and VMIDs ------------------------------------------------------------------------------------------------------------------------------
-constexpr uint32_t kMaxSessions = 8u;
+constexpr uint32_t kHwVmids = 8u;
+constexpr uint32_t kMaxSessions = 64u;
 constexpr uint32_t vmid_of_slot(uint32_t slot) { return kNativeVmid + slot; }
-static_assert(vmid_of_slot(0) == 8u && vmid_of_slot(kMaxSessions - 1u) == 15u, "VMID 8 for slot 0, 9..15 for the others");
+static_assert(vmid_of_slot(0) == 8u && vmid_of_slot(kHwVmids - 1u) == 15u, "VMID 8 for slot 0, 9..15 for the others");
 static_assert(vmid_ok(vmid_of_slot(0)) && vmid_ok(vmid_of_slot(1)) && vmid_ok(vmid_of_slot(2)) && vmid_ok(vmid_of_slot(3)) &&
               vmid_ok(vmid_of_slot(4)) && vmid_ok(vmid_of_slot(5)) && vmid_ok(vmid_of_slot(6)) && vmid_ok(vmid_of_slot(7)),
               "every session VMID is outside the MES mask (8..15)");
@@ -83,18 +84,18 @@ inline uint32_t own_wait_resolve(uint64_t target, uint64_t globalEmitted, uint64
 // ---- seqno ownership and the guilty session -----------------------------------------------------------------------------------------------------------
 constexpr uint32_t kOwnerN = 1024u;          // > the most submissions the 4096-dword ring can hold (each is >= 15 dwords: <= 273 in flight)
 constexpr uint8_t kOwnerKernel = 0xFEu;      // a kernel-only probe fence (the recovery's), never a session
-struct OwnerEnt { uint64_t seq; uint64_t startWc; uint32_t sessId; uint8_t slot; };
+struct OwnerEnt { uint64_t seq; uint64_t startWc; uint32_t sessId; uint8_t slot; uint8_t vmid; };
 struct OwnerLog { OwnerEnt e[kOwnerN]; };
-inline void owner_note(OwnerLog &l, uint64_t seq, uint8_t slot, uint32_t sessId, uint64_t startWc) { l.e[seq % kOwnerN] = OwnerEnt{ seq, startWc, sessId, slot }; }
-struct Guilty { bool known; uint8_t slot; uint32_t sessId; uint64_t seq; uint64_t startWc; };
+inline void owner_note(OwnerLog &l, uint64_t seq, uint8_t slot, uint32_t sessId, uint64_t startWc, uint8_t vmid = (uint8_t)kNativeVmid) { l.e[seq % kOwnerN] = OwnerEnt{ seq, startWc, sessId, slot, vmid }; }
+struct Guilty { bool known; uint8_t slot; uint8_t vmid; uint32_t sessId; uint64_t seq; uint64_t startWc; };
 // The owner of the OLDEST unretired seqno (retired + 1). Unknown when nothing is outstanding, when more than kOwnerN are outstanding (the entry was
 // overwritten), or when the entry does not carry that very seqno.
 inline Guilty guilty_of(const OwnerLog &l, uint64_t retired, uint64_t emitted) {
-    if (retired >= emitted || emitted - retired > (uint64_t)kOwnerN) return Guilty{ false, 0u, 0u, 0ull, 0ull };
+    if (retired >= emitted || emitted - retired > (uint64_t)kOwnerN) return Guilty{ false, 0u, 0u, 0u, 0ull, 0ull };
     const uint64_t seq = retired + 1ull;
     const OwnerEnt &x = l.e[seq % kOwnerN];
-    if (x.seq != seq) return Guilty{ false, 0u, 0u, seq, 0ull };
-    return Guilty{ true, x.slot, x.sessId, seq, x.startWc };
+    if (x.seq != seq) return Guilty{ false, 0u, 0u, 0u, seq, 0ull };
+    return Guilty{ true, x.slot, x.vmid, x.sessId, seq, x.startWc };
 }
 
 // ---- what a stall does ----------------------------------------------------------------------------------------------------------------------------------
@@ -224,8 +225,17 @@ template <class S> inline void sess_wipe_keep_lock(S *s) {
 constexpr uint32_t kActSessStat = 103u;
 constexpr bool is_g2_action(uint32_t a) { return a == kActSessStat; }
 constexpr bool action_admitted(bool latchOn, uint32_t a) { return latchOn && is_g2_action(a); }
-constexpr uint32_t kStatGlobal = kMaxSessions;    // page 8: the global page; 0..7: one session each
-constexpr bool args_ok(uint32_t a, uint64_t arg) { return a == kActSessStat && arg <= (uint64_t)kStatGlobal; }
+constexpr uint32_t kStatGlobal = 8u;              // page 8: the global page; 0..7: slots 0..7; 100..163: slots 0..63
+constexpr uint32_t kStatSlotExtBase = 100u;
+constexpr bool stat_is_ext_slot(uint64_t arg) {
+    return arg >= (uint64_t)kStatSlotExtBase && arg < (uint64_t)kStatSlotExtBase + (uint64_t)kMaxSessions;
+}
+constexpr uint32_t stat_slot_of_page(uint64_t arg) {
+    return stat_is_ext_slot(arg) ? (uint32_t)(arg - (uint64_t)kStatSlotExtBase) : (uint32_t)arg;
+}
+constexpr bool args_ok(uint32_t a, uint64_t arg) {
+    return a == kActSessStat && (arg <= (uint64_t)kStatGlobal || stat_is_ext_slot(arg));
+}
 constexpr bool native_exempt(bool latchOn, uint32_t a, uint64_t arg) { return action_admitted(latchOn, a) && args_ok(a, arg); }
 constexpr uint32_t kOutN = 13u;
 enum StatCode : uint32_t { kStatOk = 0u, kStatOff = 1u, kStatBadArg = 2u };

@@ -1631,6 +1631,18 @@ static int appdeny_parse_args(const char *arg, const char *arg2, const char *arg
     return 1;
 }
 
+static void print_sessstat_slot(const uint64_t out[16]) {
+    const unsigned long long st = out[5] & 0xff;
+    if (st == 1 && out[6] == 0) printf("  slot / VMID / session   : %llu / (unbound) / %llu\n", out[4], out[7]);
+    else printf("  slot / VMID / session   : %llu / %llu / %llu\n", out[4], out[6], out[7]);
+    printf("  state                   : %s%s%s%s\n", st == 0 ? "free" : st == 1 ? "OPEN" : st == 2 ? "DEAD (its VMID is never reused this boot)" : "?",
+           (out[5] & 0x100) ? ", WindowServer" : "", (out[5] & 0x200) ? ", hello" : "", (out[5] & 0x400) ? ", POISONED (guilty of a recovered hang)" : "");
+    if (out[5] & 0x800) printf("  role                    : APP (an allow-listed user application: no ReadRegs, no scanout, the shared VRAM allowance; 0.0.640)\n");
+    printf("  VRAM / GTT / imported   : %llu / %llu / %llu KiB\n", out[8] >> 10, out[9] >> 10, out[10] >> 10);
+    printf("  page tables / last seq / BOs : %llu KiB / %llu / %llu\n", out[11] >> 10, out[12], out[13]);
+    printf("  gcvm fault at open      : %#llx (vmid %llu)   (0.0.629: compare with sessstat 8)\n", out[14], (out[14] >> 20) & 0xf);   /* R5, read only */
+}
+
 static int cmd_accel(const char *what, const char *arg, const char *arg2, const char *arg3) {
     // 0 = status, 1 = fire, 2 = re-drive AMDHardware::setMemoryAllocationsEnabled(true)
     // so the 68 MiB page-table VRAM allocation it makes can be traced; see
@@ -2471,8 +2483,11 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     if (in == 103) {
         // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/native_g2_pure.h sess_out / global_out); v[0] is the code.
         const unsigned long long c = out[3];
+        const int isExtSlot = in2[1] >= 100;
         printf("  code                    : %llu (%s)\n", c, c == 0 ? "ok" : c == 1 ? "OFF: boot-arg garnet-multisession is not 1" : c == 2 ? "bad page" : "?");
-        if (c == 0 && out[4] == 8) {
+        if (isExtSlot && c == 0) {
+            print_sessstat_slot(out);
+        } else if (c == 0 && out[4] == 8) {
             printf("  open / DEAD slots / HUNG: %llu / %llu / %llu\n", out[5] & 0xff, (out[5] >> 8) & 0xff, (out[5] >> 16) & 1);
             if ((out[5] >> 20) & 0xffff) printf("  BOs leaked at close     : %llu (a CPU mapping outlived the session: the range stays out of the pool until reboot; 0.0.640)\n", (out[5] >> 20) & 0xffff);
             if ((out[5] >> 56) != 0)   /* 0.0.641: apps ON: the visible-pool use of non-WindowServer sessions and its cap (boot-arg garnet-appvis) */
@@ -2493,14 +2508,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             if (out[14] == ~0ull) printf("  since WindowServer's last submit : never\n"); else printf("  since WindowServer's last submit : %llu ms\n", out[14]);
             printf("  WindowServer ring reserve: %llu dwords (only WindowServer may use the last of the ring)\n", out[15]);
         } else if (c == 0) {
-            const unsigned long long st = out[5] & 0xff;
-            printf("  slot / VMID / session   : %llu / %llu / %llu\n", out[4], out[6], out[7]);
-            printf("  state                   : %s%s%s%s\n", st == 0 ? "free" : st == 1 ? "OPEN" : st == 2 ? "DEAD (its VMID is never reused this boot)" : "?",
-                   (out[5] & 0x100) ? ", WindowServer" : "", (out[5] & 0x200) ? ", hello" : "", (out[5] & 0x400) ? ", POISONED (guilty of a recovered hang)" : "");
-            if (out[5] & 0x800) printf("  role                    : APP (an allow-listed user application: no ReadRegs, no scanout, the shared VRAM allowance; 0.0.640)\n");
-            printf("  VRAM / GTT / imported   : %llu / %llu / %llu KiB\n", out[8] >> 10, out[9] >> 10, out[10] >> 10);
-            printf("  page tables / last seq / BOs : %llu KiB / %llu / %llu\n", out[11] >> 10, out[12], out[13]);
-            printf("  gcvm fault at open      : %#llx (vmid %llu)   (0.0.629: compare with sessstat 8)\n", out[14], (out[14] >> 20) & 0xf);   /* R5, read only */
+            print_sessstat_slot(out);
         }
         return c == 0 ? 0 : 3;
     }

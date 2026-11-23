@@ -17,7 +17,7 @@ constexpr uint32_t kSlots      = kLast + 1u;
 constexpr uint32_t kMaxDomains = 4u;
 constexpr uint32_t kDomainGfx  = 2u;
 
-using FenceReached = bool (*)(void *context, uint32_t domain, uint32_t seq);
+using FenceReached = bool (*)(void *context, uint32_t domain, uint64_t seq);
 
 enum class Result {
 	Ok,
@@ -33,7 +33,7 @@ struct Grant {
 	bool      stolen     { false };
 	uintptr_t prevOwner  { 0u };
 	uint32_t  waitDomain { 0u };
-	uint32_t  waitSeq    { 0u };
+	uint64_t  waitSeq    { 0ull };
 };
 
 struct Stats {
@@ -63,6 +63,7 @@ public:
 	bool idle(uint32_t v) {
 		if (v >= kSlots) return true;
 		Slot &s = slot[v];
+		if (s.inFlight != 0u) return false;
 		for (uint32_t d = 0u; d < kMaxDomains; ++d) {
 			if (!s.pending[d]) continue;
 			if (!reached || !reached(ctx, d, s.pendingSeq[d])) return false;
@@ -113,6 +114,38 @@ public:
 		return true;
 	}
 
+	// Synchronous PT mutation flushed directly on an active owner's bound VMID.
+	void noteFlushed(uintptr_t owner, uint32_t vmid, uint64_t coveredSeq) {
+		if (!owner || vmid < kFirst || vmid > kLast) return;
+		Slot &s = slot[vmid];
+		if (s.quarantined || s.owner != owner) return;
+		if (coveredSeq > s.boundSeq) s.boundSeq = coveredSeq;
+		if (s.flushPending && coveredSeq >= s.flushSeq) s.flushPending = false;
+	}
+
+	uint32_t vmidOf(uintptr_t owner) const {
+		if (!owner) return 0u;
+		for (uint32_t v = kFirst; v <= kLast; ++v) {
+			if (usable(v) && !slot[v].quarantined && slot[v].owner == owner) return v;
+		}
+		return 0u;
+	}
+
+	// Clear pending fence trackers when the ring seqno restarts; keep quarantined slots poisoned.
+	void resetFences() {
+		for (uint32_t v = kFirst; v <= kLast; ++v) {
+			Slot &s = slot[v];
+			if (s.quarantined) continue;
+			for (uint32_t d = 0u; d < kMaxDomains; ++d) {
+				s.pending[d] = false;
+				s.pendingSeq[d] = 0ull;
+			}
+		}
+		starving = false;
+		starveDomain = 0u;
+		starveSeq = 0ull;
+	}
+
 	// Permanently quarantine a VMID whose hardware invalidation/reset state is uncertain until unbindAll().
 	bool quarantine(uintptr_t owner, uint32_t vmid) {
 		if (!owner || vmid < kFirst || vmid > kLast) return false;
@@ -125,7 +158,7 @@ public:
 		return true;
 	}
 
-	void noteSubmit(uint32_t vmid, uint32_t domain, uint32_t seq) {
+	void noteSubmit(uint32_t vmid, uint32_t domain, uint64_t seq) {
 		if (vmid < kFirst || vmid > kLast || domain >= kMaxDomains || slot[vmid].quarantined) {
 			return;
 		}
@@ -133,6 +166,14 @@ public:
 		s.pending[domain] = true;
 		s.pendingSeq[domain] = seq;
 		s.lastUse = ++tick;
+	}
+
+	void beginSubmit(uint32_t vmid) {
+		if (vmid >= kFirst && vmid <= kLast && !slot[vmid].quarantined) slot[vmid].inFlight++;
+	}
+
+	void endSubmit(uint32_t vmid) {
+		if (vmid >= kFirst && vmid <= kLast && slot[vmid].inFlight > 0u) slot[vmid].inFlight--;
 	}
 
 	bool forget(uintptr_t owner, bool force, uint32_t &vmid) {
@@ -180,8 +221,9 @@ private:
 		bool      flushPending { false };
 		bool      pinned { false };
 		bool      quarantined { false };
+		uint32_t  inFlight { 0u };
 		bool      pending[kMaxDomains] {};
-		uint32_t  pendingSeq[kMaxDomains] {};
+		uint64_t  pendingSeq[kMaxDomains] {};
 	};
 
 	Slot         slot[kSlots] {};
@@ -191,14 +233,14 @@ private:
 	uint64_t     tick { 0u };
 	bool         starving { false };
 	uint32_t     starveDomain { 0u };
-	uint32_t     starveSeq { 0u };
+	uint64_t     starveSeq { 0ull };
 	Stats        counters {};
 
 	bool usable(uint32_t v) const {
 		return v >= kFirst && v <= kLast && !(reserved & (1u << v));
 	}
 
-	bool firstPending(uint32_t v, uint32_t &domain, uint32_t &seq) {
+	bool firstPending(uint32_t v, uint32_t &domain, uint64_t &seq) {
 		const Slot &s = slot[v];
 		for (uint32_t d = 0u; d < kMaxDomains; ++d) {
 			if (s.pending[d] && !(reached && reached(ctx, d, s.pendingSeq[d]))) {
@@ -279,8 +321,12 @@ private:
 		}
 		if (!any || !oldestBusy) return Result::Exhausted;
 		uint32_t d = 0u;
-		uint32_t q = 0u;
+		uint64_t q = 0ull;
 		if (!firstPending(oldestBusy, d, q)) {
+			if (slot[oldestBusy].inFlight != 0u) {
+				counters.busy++;
+				return Result::Busy;
+			}
 			bind(oldestBusy, owner, pd, tlbSeq, out);
 			slot[oldestBusy].pinned = pinIt;
 			return Result::Ok;

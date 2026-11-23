@@ -336,9 +336,16 @@ static void s5_source_pins(const std::string &root) {
            "a HUNG quarantine keeps the descriptor, UPL pages and gSysHeld counted");
 
     const std::string create = fn_body(eng, "IOReturn n1c_bo_create(");
+    const std::string gttAlloc = fn_body(eng, "static IOReturn gtt_alloc_pages(");
     expect(create.find("const uint64_t hcap = host_cap_now();") != std::string::npos &&
-           create.find("host_sys_budget_ok(multi, s->ws, heldPending, p.size, hcap)") != std::string::npos,
-           "GTT creation uses the same dynamic host cap and includes pending imports");
+           create.find("host_reserve_ok(gSysHeld, gSysPending, p.size, hcap)") != std::string::npos &&
+           create.find("gtt_alloc_pages(p.size, &gmd, &gpages, &gpageCount)") != std::string::npos &&
+           create.find("host_commit(gSysHeld, gSysPending, p.size)") != std::string::npos &&
+           create.find("sys_pending_rollback(gttReserved, p.size)") != std::string::npos &&
+           create.find("kIOMemoryPhysicallyContiguous") == std::string::npos &&
+           gttAlloc.find("IOBufferMemoryDescriptor::inTaskWithOptions(") != std::string::npos &&
+           gttAlloc.find("kIOMemoryPhysicallyContiguous") == std::string::npos,
+           "GTT creation uses the same dynamic host cap (pre-lock pending + commit) and non-contiguous pages outside gCliLock");
     expect(eng.find("static uint64_t gSysHeld;") != std::string::npos &&
            eng.find("static uint64_t gSysPending;") != std::string::npos,
            "GTT and host imports share gSysHeld / gSysPending");

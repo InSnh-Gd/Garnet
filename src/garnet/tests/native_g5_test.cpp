@@ -440,18 +440,18 @@ static void t10_pins(const std::string &root) {
     expect(fn_body(eng, "static uint32_t ring_submit(Session *s,") == kRingSubmit642, "T10: ring_submit is byte-for-byte the 0.0.642 function");
     const std::string sub = fn_body(eng, "IOReturn n1c_submit(");
     expect(!sub.empty() && in_order(sub, { "const uint32_t gate = gpu_gate(s);", "id_live(s->ctxUsed, RDNA4N_MAX_CTX, v.ctx)", "resolve_fence(s, v.fenceHandle, v.fenceOffset, &fenceAddr);", "uint32_t er;",
-                                          "if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642",
+                                          "if (!g5_on()) er = s->pinnedVmid ? ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut) : ring_submit_pooled(s, va, by, v.nIbs, hasFence, fenceAddr, false, seqOut);",
                                           "else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }",
                                           "else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);", "if (er != kOk) { rc = (IOReturn)er; break; }" }),
-           "T10: n1c_submit keeps gpu_gate, the IB checks and resolve_fence, then: OFF -> ring_submit unchanged; ON + WindowServer -> stamp + ring_submit; ON + other -> ring_submit_app_g5");
+           "T10: n1c_submit keeps gpu_gate, the IB checks and resolve_fence, then: OFF -> ring_submit (pinned vs pooled); ON + WindowServer -> stamp + ring_submit; ON + other -> ring_submit_app_g5");
     expect_u("T10: ring_submit_app_g5 is reached from Submit and the bounded buffer route", count_of(eng, "ring_submit_app_g5("), 3);
     expect_u("T10: the app path is reached only after !g5_on() and s->ws were both false (an else-if chain)", count_of(sub, "else er = ring_submit_app_g5("), 1);
-    expect_u("T10: ring_submit call sites: definition, two Submit, two buffer, two G1", count_of(eng, "ring_submit("), 7);
+    expect_u("T10: ring_submit call sites: definition, pooled submit, two Submit, two buffer, two G1", count_of(eng, "ring_submit("), 8);
     expect_u("T10: the G1 kernel paths still call ring_submit on gSess", count_of(eng, "ring_submit(&gSess, &va, &by, 1u, false, 0ull, &seq)"), 2);
     expect_u("T10: gWsLastNs is stored only in Submit and buffer WindowServer branches", count_of(eng, "__atomic_store_n(&gWsLastNs,"), 2);
     const auto buffer = eng.substr(eng.find("struct BufferEnv {"), eng.find("IOReturn n1c_wait(") - eng.find("struct BufferEnv {"));
-    expect(in_order(buffer, {"s->bufferSubmitting = true;", "if (!g5_on()) rc = ring_submit(", "else if (s->ws) {", "__atomic_store_n(&gWsLastNs,", "rc = ring_submit(s,", "else rc = ring_submit_app_g5(s,", "s->bufferSubmitting = false;"}),
-           "T10: bounded buffer operations preserve G5 admission and WindowServer stamping");
+    expect(in_order(buffer, {"s->bufferSubmitting = true;", "if (!g5_on()) rc = s->pinnedVmid ? ring_submit(", "else if (s->ws) {", "__atomic_store_n(&gWsLastNs,", "rc = ring_submit(s,", "else rc = ring_submit_app_g5(s,", "s->bufferSubmitting = false;"}),
+           "T10: bounded buffer operations preserve G5 admission, pooled dispatch, and WindowServer stamping");
     expect(in_order(eng, {"owner_note(gOwners,", "gBufferFlights[ownerSlot] = BufferFlight{seq, ownerId};", "__atomic_store_n(&gEmitted, seq,"}) &&
            in_order(fn_body(eng, "static bool g2_recover("), {"buffer_reset_loses(gBufferFlights[slot]", "__atomic_store_n(&pending->poisoned,", "mes_reset_legacy_gfx_queue("}),
            "T10: pending buffer ownership is published under the ring lock and collateral buffers fail before RESET advances the timeline");
@@ -459,8 +459,11 @@ static void t10_pins(const std::string &root) {
            "T10: buffer validation and submission hold the identity-checked session lock");
     expect_u("T10: gG5Since is written only through since_mark / since_clear", count_of(eng, "gG5Since[s->slot] ="), 0);
     expect_u("T10: the OFF path writes nothing: the only users of gG5 are the app path, the stat page", count_of(eng, "stat_admit(gG5") + count_of(eng, "stat_timeout(gG5") + count_of(eng, "v.st = gG5;"), 3);
-    // the app path
-    const std::string ap = fn_body(eng, "static uint32_t ring_submit_app_g5(");
+    // the app path (ring_submit_g5_body, invoked directly for pinnedVmid or via ring_submit_pooled for pooled apps)
+    const std::string apWrap = fn_body(eng, "static uint32_t ring_submit_app_g5(");
+    expect(in_order(apWrap, { "if (!s->pinnedVmid) return ring_submit_pooled(", "return ring_submit_g5_body(" }),
+           "T10: ring_submit_app_g5 routes non-pinned sessions through ring_submit_pooled(..., true)");
+    const std::string ap = fn_body(eng, "static uint32_t ring_submit_g5_body(");
     expect(!ap.empty(), "T10: ring_submit_app_g5 exists");
     expect(in_order(ap, { "const uint32_t need = submit_dwords(nIbs, hasFence);", "IOLockLock(gRingLock);", "g5_fill_in_locked(s, K, need);", "admission(gOwners, gG5In) == kAdmit", "since_clear(gG5Since, s->slot); waiting = false;",
                           "const uint64_t seq = emitted_now() + 1ull;", "build_submit(", "ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->slot, s->id, s);", "stat_admit(gG5, waitedNs);", "IOLockUnlock(gRingLock);" }),

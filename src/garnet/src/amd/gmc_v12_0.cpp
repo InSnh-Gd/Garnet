@@ -136,7 +136,7 @@ constexpr uint64_t kGARTInitialSize      = 256ULL * 1024 * 1024;  // 256 MB
 //: window reserved at the TOP of the aperture for this driver's own buffers,
 // clear of Apple's bottom-up allocations (~2218 pages, 8.7 MiB). Our measured
 // footprint is 0x38000 (224 KiB); 4 MiB leaves ample headroom.
-constexpr uint64_t kGARTBumpHighReserve  = 4ULL * 1024 * 1024;    // 4 MB
+constexpr uint64_t kGARTBumpHighReserve  = 8ULL * 1024 * 1024;    // 8 MB
 // Upstream amdgpu_gmc_gart_location's `four_gb` (Deviation 5).
 constexpr uint64_t kGARTAlignment        = 0x0000000100000000ULL;
 

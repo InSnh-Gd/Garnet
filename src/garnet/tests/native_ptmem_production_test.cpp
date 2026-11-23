@@ -47,7 +47,7 @@ namespace amdgpu {
 // ---- boundary stubs with real kernel names (host memory, same call shape) ----
 constexpr uint32_t kArenaBlocks = (uint32_t)(kPtCap / 16384u);
 constexpr uint32_t kArenaBlockBytes = 16384u;
-constexpr uint32_t kArenaReserve = kArenaBlocks * rdna4native::g2::kMaxSessions;
+constexpr uint32_t kArenaReserve = kArenaBlocks * rdna4native::g2::kHwVmids;
 static_assert(kArenaReserve <= 0xFFFFu, "page-table block indices fit the uint16_t lists");
 
 struct DeviceContext { size_t bar0Size = 0; };

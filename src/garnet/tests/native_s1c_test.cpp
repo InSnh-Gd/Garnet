@@ -605,7 +605,7 @@ static void u12_pins(const std::string &root) {
     // ring path: one helper, space check before the write, the owner and emitted before the doorbell. 0.0.627 (G2): ring_put_locked (the caller holds gRingLock);
     // ring_submit assigns the seqno, builds and puts under ONE hold of gRingLock (two sessions can never take the same seqno).
     const size_t re = eng.find("static uint32_t ring_put_locked("), sp = eng.find("ring_has_space(ring_free64(r, gWc, mask), n)", re), wr = eng.find("ring[ring_idx(wc, mask)] = dw[i]", re),
-                 on = eng.find("rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc);", re),
+                 on = eng.find("rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc, ownerVmid);", re),
                  em = eng.find("__atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);", re), hf = eng.find("amdgpu_hdp_flush(dev)", em), db = eng.find("WDOORBELL64(dev, off, wptr64)", re);
     expect(re != std::string::npos && sp != std::string::npos && wr != std::string::npos && on != std::string::npos && em != std::string::npos && hf != std::string::npos && db != std::string::npos, "ring_put_locked's steps are present");
     expect(re < sp && sp < wr && wr < on && on < em && em < hf && hf < db, "ORDER in ring_put_locked: space check, ring write, owner record, emitted++, HDP flush, doorbell");
@@ -653,7 +653,7 @@ static void u12_pins(const std::string &root) {
            count_of(eng, "cp.wptr = ring_idx(wc, mask)") == 1, "the doorbell / wptr shadow carry the full 64-bit counter, initialised once from cp.wptr");
     expect_u("the native path never calls native_s1b_refuse", count_of(eng, "native_s1b_refuse("), 0);
     expect_u("... and does not touch CP_DEBUG", count_of(eng, "0x1e1f"), 0);
-    expect_u("close is idempotent and single-owner: the session's open flag is cleared once, under its lock (0.0.627)", count_of(eng, "    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..7)\n"), 1);
+    expect_u("close is idempotent and single-owner: the session's open flag is cleared once, under its lock (0.0.627)", count_of(eng, "    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..63)\n"), 1);
     expect(eng.find("LEAKED (HUNG)") != std::string::npos && eng.find("seqs, freed\"") != std::string::npos, "both close log lines exist");
     expect(eng.find("if (!leak && !own_wait(s)) leak = true;") != std::string::npos, "close waits for ITS OWN work (0.0.627) and leaks when it cannot");
     expect(eng.find("program_root(s->vmid, gPark.pa)") != std::string::npos && eng.find("program_root(s->vmid, gPark.pa)") < eng.find("bo_release(s, h, kRelClosing)"), "the session's context is parked BEFORE any memory is freed");
@@ -690,7 +690,7 @@ static void u12_pins(const std::string &root) {
         const size_t bo = eng.find("static void bo_release(Session *s, uint32_t h, RelMode mode) {"), cl = eng.find("if (mode == kRelClosing) {", bo), nm = eng.find("mode == kRelNormal", bo), lk = eng.find("} else {\n        // Leak:", bo);
         const size_t r1 = eng.find("b.vmd->release()", bo), r2 = eng.find("b.vmd->release()", r1 + 1);
         expect(cl < r1 && r1 < nm && nm < r2 && r2 < lk, "one release in the closing branch, one in the normal branch, none in the leak branch (leaked with the BO)");
-        expect(eng.find("b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed\n        if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }", bo) != std::string::npos, "released before the memory it names is freed");
+        expect(eng.find("b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed\n        if (b.kind == kBoGtt) { gtt_release(b); sys_release(b); }", bo) != std::string::npos, "released before the memory it names is freed");
     }
     // build plumbing
     expect(mk.find("src/GarnetNativeClient.cpp") != std::string::npos, "the Makefile builds the client");

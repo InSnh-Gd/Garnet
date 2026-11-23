@@ -643,12 +643,12 @@ static void t12_slots(const std::string &root) {
       expect(p.rc == kOk && p.slot == 0u, "T12 (i): WindowServer restarts while 3 non-WindowServer sessions are open: it gets the free slot");
       const OpenPick o = open_pick(true, st, 3u, true, false, false, false);
       expect(o.rc != kOk, "T12 (iii): ... and with apps absent it is still refused, as in 0.0.640"); }
-    // The reserve keeps one of the eight session slots free for WindowServer.
+    // The reserve keeps one of the kMaxSessions session slots free for WindowServer.
     { uint8_t st[kMaxSessions] = {}; uint32_t open = 0, ok = 0;
-      for (int i = 0; i < 8; i++) { const OpenPick p = open_pick(true, st, open, false, false, true, false); if (p.rc == kOk) { st[p.slot] = kSlotOpen; open++; ok++; } }
-      expect_u("T12 (i): with no WindowServer session, non-WindowServer opens stop at seven: one slot stays reserved", ok, 7);
+      for (uint32_t i = 0; i < kMaxSessions; i++) { const OpenPick p = open_pick(true, st, open, false, false, true, false); if (p.rc == kOk) { st[p.slot] = kSlotOpen; open++; ok++; } }
+      expect_u("T12 (i): with no WindowServer session, non-WindowServer opens stop at kMaxSessions - 1: one slot stays reserved", ok, kMaxSessions - 1u);
       const OpenPick w = open_pick(true, st, open, true, false, true, false);
-      expect(w.rc == kOk && w.slot == 7u, "T12 (i): ... and WindowServer then gets the reserved slot"); }
+      expect(w.rc == kOk && w.slot == kMaxSessions - 1u, "T12 (i): ... and WindowServer then gets the reserved slot"); }
     // random lifetimes: the reserve holds under any open/close order (no DEAD slots)
     { uint32_t seed = 12345u; uint8_t st[kMaxSessions] = { 0, 0, 0, 0 }; bool wsOpen = false; int wsSlot = -1; uint32_t open = 0; uint64_t wsRefusedWithFree = 0, wsTry = 0;
       for (int step = 0; step < 20000; step++) {

@@ -69,8 +69,8 @@ static std::string fn_body(const std::string &s, const char *head) {
 struct SessM { bool open = false, hello = false, ws = false, poisoned = false; uint32_t id = 0; uint64_t last = 0; };
 struct Model {
     bool multi;
-    uint8_t state[8] = {};
-    SessM s[8];
+    uint8_t state[kMaxSessions] = {};
+    SessM s[kMaxSessions];
     uint32_t open = 0, idCounter = 0;
     bool g1Holds = false, mesTimedOut = false, hung = false;
     uint64_t attempts = 0;   // 0.0.629 (R3): automatic recoveries tried this boot (gG2.recoveries + gG2.failed)
@@ -139,10 +139,15 @@ static void t1_switch() {
     expect_u("latch =2 -> OFF (only 1 turns it on)", latch_value(true, 2), kLatchOff);
     expect(!latch_is_on(kLatchUnset) && !latch_is_on(kLatchOff) && latch_is_on(kLatchOn), "only the ON latch is on");
     expect(!action_admitted(false, kActSessStat) && action_admitted(true, kActSessStat) && !action_admitted(true, 102u) && !action_admitted(true, 104u), "103 exists only with the latch ON, and only 103");
-    expect_u("G2 has eight session slots", kMaxSessions, 8);
-    expect_u("the global stat page follows session pages 0..7", kStatGlobal, 8);
+    expect_u("G2 has 64 software session slots", kMaxSessions, 64);
+    expect_u("G2 manages 8 hardware GFXHUB VMIDs (8..15)", kHwVmids, 8);
+    expect_u("the global stat page stays page 8 for G5 compatibility", kStatGlobal, 8);
     for (uint64_t a = 0; a <= 8; a++) expect(native_exempt(true, kActSessStat, a), "session pages 0..7 and global page 8 are legal");
     expect(!native_exempt(true, kActSessStat, 9) && !native_exempt(false, kActSessStat, 0), "page 9 and the latch OFF are refused");
+    expect(!native_exempt(true, kActSessStat, 99) && !native_exempt(true, kActSessStat, 164), "gaps outside 0..8 and 100..163 are refused");
+    for (uint64_t a = 100; a <= 163; a++) {
+        expect(native_exempt(true, kActSessStat, a) && stat_slot_of_page(a) == (uint32_t)(a - 100ull), "extended pages 100..163 map to slots 0..63");
+    }
     expect_u("13 scalars (the accel extra budget)", kOutN, 13);
 }
 
@@ -154,7 +159,7 @@ static void t2_off_identity() {
     expect(a.rc == kOk && a.slot == 0 && vmid_of_slot(a.slot) == 8u, "OFF: the first open gets slot 0 = VMID 8");
     expect(m.open_(false).rc == kExclusive, "OFF: a second (root) open is refused with ExclusiveAccess, as today");
     expect(m.open_(true).rc == kExclusive, "OFF: a second WindowServer open is refused");
-    { uint8_t st[8] = {};
+    { uint8_t st[kMaxSessions] = {};
       for (uint32_t open = 1; open < 5; open++) expect(open_pick(false, st, open, false, false).rc == kExclusive, "OFF: any open count refuses (the CAS already guarantees 0)");
       st[0] = kSlotDead; expect(open_pick(false, st, 0, false, false).rc == kExclusive, "OFF: a DEAD slot 0 is never reused");
       st[0] = kSlotFree; expect(open_pick(false, st, 0, false, true).rc == kOk, "OFF: the G1 test's own open is admitted exactly as before (g1Holds is not an OFF input)"); }
@@ -173,31 +178,31 @@ static void t2_off_identity() {
 
 // ---- T3 ----------------------------------------------------------------------------------------------------------------------------------------------------
 static void t3_slots() {
-    expect_u("ON uses eight slots", slots_in_use(true), 8);
-    for (uint32_t i = 0; i < 8; i++) {
-        expect_u("VMID of slot", vmid_of_slot(i), 8u + i);
-        expect(rdna4native::vmid_ok(vmid_of_slot(i)), "every slot VMID 8..15 is outside the MES mask");
+    expect_u("ON uses 64 software session slots", slots_in_use(true), 64);
+    for (uint32_t i = 0; i < kHwVmids; i++) {
+        expect_u("HW VMID index", vmid_of_slot(i), 8u + i);
+        expect(rdna4native::vmid_ok(vmid_of_slot(i)), "every HW VMID 8..15 is outside the MES mask");
     }
     Model m(true);
     const OpenPick w = m.open_(true);
-    expect(w.rc == kOk && w.slot == 0, "ON: WindowServer first gets slot 0 / VMID 8");
-    for (uint32_t i = 1; i <= 7; i++) {
+    expect(w.rc == kOk && w.slot == 0, "ON: WindowServer first gets slot 0");
+    for (uint32_t i = 1; i < kMaxSessions; i++) {
         const OpenPick p = m.open_(false);
-        expect(p.rc == kOk && p.slot == i && vmid_of_slot(p.slot) == 8u + i, "ON: eight concurrent sessions map slots 0..7 to VMIDs 8..15 in order");
+        expect(p.rc == kOk && p.slot == i, "ON: 64 concurrent sessions allocate slots 0..63 in order");
     }
-    expect(m.open_(false).rc == kExclusive, "ON: a ninth open is refused (ExclusiveAccess)");
-    m.close_(7);
-    const OpenPick slot7 = m.open_(false);
-    expect(m.state[7] == kSlotOpen && slot7.rc == kOk && slot7.slot == 7 && vmid_of_slot(slot7.slot) == 15u,
-           "ON: a cleanly closed slot 7 is reallocated as VMID 15");
-    m.close_(7, false);
-    expect(m.state[7] == kSlotDead && m.open_(false).rc == kExclusive, "ON: DEAD slot 7's VMID 15 is never reused");
+    expect(m.open_(false).rc == kExclusive, "ON: a 65th open is refused (ExclusiveAccess)");
+    m.close_(kMaxSessions - 1u);
+    const OpenPick lastSlot = m.open_(false);
+    expect(m.state[kMaxSessions - 1u] == kSlotOpen && lastSlot.rc == kOk && lastSlot.slot == kMaxSessions - 1u,
+           "ON: a cleanly closed slot 63 is reallocated cleanly");
+    m.close_(kMaxSessions - 1u, false);
+    expect(m.state[kMaxSessions - 1u] == kSlotDead && m.open_(false).rc == kExclusive, "ON: DEAD slot 63 is never reused");
     Model n(true); (void)n.open_(false);
     expect(n.open_(true).rc == kExclusive, "ON: WindowServer opens only when NO session is open (exactly the policy's WsAlreadyOpen, re-checked under the lock)");
     Model g(true); g.g1Holds = true;
     expect(g.open_(false).rc == kExclusive && g.open_(true).rc == kExclusive, "ON: while a G1 test holds the GPU every open is refused");
     Model r(true); const OpenPick r0 = r.open_(false);
-    expect(r0.slot == 0 && vmid_of_slot(r0.slot) == 8u, "ON: with no WindowServer the first root session gets VMID 8");
+    expect(r0.slot == 0 && vmid_of_slot(r0.slot) == 8u, "ON: with no WindowServer the first root session gets slot 0");
 }
 
 // ---- T4 ----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -404,17 +409,18 @@ static void t11_pins(const std::string &root) {
     // the switch: one latch, read once
     expect(eng.find("PE_parse_boot_argn(\"garnet-multisession\", &v, sizeof(v))") != std::string::npos && count_of(eng, "PE_parse_boot_argn(\"garnet-multisession\"") == 1, "the switch is boot-arg garnet-multisession, parsed in one place");
     expect(eng.find("if (OSCompareAndSwap(rdna4native::g2::kLatchUnset, rdna4native::g2::latch_value(present, v), &gMultiLatch))") != std::string::npos, "latched once (first writer wins)");
-    // open: OFF = the CAS, ON = open_pick; the VMID of the slot everywhere
+    // open: OFF = the CAS, ON = open_pick; pinned VMID 8 for !multi / WS / G1, pooled VMIDs 9..15 for others
     const std::string op = fn_body(eng, "IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {");
     expect(!op.empty(), "n1c_open found");
     expect(in_order(op, { "if (gHang.hung) {", "const bool multi = multi_on();", "if (!multi && !OSCompareAndSwap(0, 1, &gOpenFlag)) {", "IOLockLock(gCliLock);",
-                          "const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);", "if (pk.rc != kOk) {", "const uint32_t slot = pk.slot, vmid = vmid_of_slot(slot);",
-                          "const uint32_t cntl = ctx_prepare(slot, vmid, &ctxOk);", "if (!ctxOk) { rc = kIOReturnNotReady; break; }", "if (program_root(vmid, s->rootPa) != kOk)", "gSlotState[slot] = kSlotOpen;", "IOLockUnlock(gCliLock);" }),
-           "n1c_open: HUNG gate, the OFF compare-and-swap, the lock, open_pick, the slot's VMID for the context and the root, the slot marked open");
+                          "const bool pinnedVmid = !multi || ws || g1Caller;", "const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);",
+                          "if (pk.rc != kOk) {", "if (pinnedVmid && gVmid8Dead)", "const uint32_t vmid = pinnedVmid ? kNativeVmid : 0u;",
+                          "if (pinnedVmid && program_root(vmid, s->rootPa) != kOk)", "gSlotState[slot] = kSlotOpen;", "IOLockUnlock(gCliLock);" }),
+           "n1c_open: HUNG gate, the OFF compare-and-swap, the lock, open_pick, pinned VMID 8 vs unbound pooled session, the slot marked open");
     expect(op.find("const uint32_t openNow = multi ? __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST) : 0u;") != std::string::npos, "OFF feeds open_pick an open count of 0 (the CAS already made it exclusive)");
-    { const std::string cp = fn_body(eng, "static __attribute__((noinline)) uint32_t ctx_prepare(uint32_t slot, uint32_t vmid, bool *ok) {");
-      expect(in_order(cp, { "const CtxRegs r = ctx_regs(vmid);", "if (slot != 0u && !ctx_geometry_ok(cntl)) {", "WREG32(dev, r.cntl, cntl_native(before));", "cntl = RREG32(dev, r.cntl);", "*ok = ctx_geometry_ok(cntl);" }),
-             "session VMID contexts get cntl_native once (never CONTEXT8), then geometry is checked by read-back before use"); }
+    { const std::string cp = fn_body(eng, "static __attribute__((noinline)) uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok) {");
+      expect(in_order(cp, { "const CtxRegs r = ctx_regs(vmid);", "if (vmid != kNativeVmid && !ctx_geometry_ok(cntl)) {", "WREG32(dev, r.cntl, cntl_native(before));", "cntl = RREG32(dev, r.cntl);", "*ok = ctx_geometry_ok(cntl);" }),
+             "pooled VMID contexts (9..15) get cntl_native once (never CONTEXT8), then geometry is checked by read-back before use"); }
     expect_u("the only CNTL write is that one", count_of(eng, "WREG32(dev, r.cntl,"), 1);
     expect(in_order(op, { "if (openNow == 0u) {", "(*cp.rptr_cpu & cp.ring_ptr_mask) == cp.wptr" }) && in_order(op, { "if (openNow == 0u) {", "*seq_slot() = 0ull;", "__atomic_store_n(&gEmitted, 0ull, __ATOMIC_RELEASE);" }),
            "only the FIRST session waits for an idle ring and restarts the seqno");
@@ -442,8 +448,8 @@ static void t11_pins(const std::string &root) {
     expect(in_order(rs, { "IOLockLock(gRingLock);", "const uint64_t seq = emitted_now() + 1ull;", "va, by, nIbs, s->vmid, hasFence,", "ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->slot, s->id, s);", "IOLockUnlock(gRingLock);" }),
            "ring_submit: the seqno, the packet with THIS session's VMID and the owner, under one hold of the ring lock");
     const std::string rp = fn_body(eng, "static uint32_t ring_put_locked(");
-    expect(in_order(rp, { "ring[ring_idx(wc, mask)] = dw[i]", "rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc);", "if (owner != nullptr) __atomic_store_n(&owner->emitted, seq, __ATOMIC_RELEASE);", "__atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);", "WDOORBELL64(" }),
-           "ring_put_locked: the owner and the session's last seqno are recorded BEFORE the global seqno is published and the doorbell rung");
+    expect(in_order(rp, { "ring[ring_idx(wc, mask)] = dw[i]", "rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc, ownerVmid);", "if (owner != nullptr) __atomic_store_n(&owner->emitted, seq, __ATOMIC_RELEASE);", "__atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);", "WDOORBELL64(" }),
+           "ring_put_locked: the owner (and active VMID) and the session's last seqno are recorded BEFORE the global seqno is published and the doorbell rung");
     expect(rp.find("IOLockLock(gRingLock)") == std::string::npos && rp.find("hang_from_wait") == std::string::npos, "ring_put_locked neither takes the ring lock (the caller holds it) nor latches (the caller decides, after dropping the lock)");
     expect(eng.find("kNativeVmid, hasFence") == std::string::npos && eng.find("build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), &va, &by, 1u, kNativeVmid") == std::string::npos, "no submit is built with a fixed VMID 8");
     // the stall path
@@ -456,9 +462,9 @@ static void t11_pins(const std::string &root) {
     expect(in_order(hp, { "if (multi_on()) {", "hang_note(gHang, re, em, now);", "expired = hang_expired(gHang, re, em, now);", "return expired ? stall_handle(em, re) : false;", "const bool det = hang_detect(gHang, re, em, now);" }),
            "hang_poll: ON goes to stall_handle (one owner: gRecovering), OFF is the 0.0.626 hang_detect");
     const std::string rc = fn_body(eng, "static bool g2_recover(");
-    expect(in_order(rc, { "IOLockLock(gRingLock);", "g2_scrub_locked(g.startWc);", "__atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);", "mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, gs->vmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);",
+    expect(in_order(rc, { "IOLockLock(gRingLock);", "g2_scrub_locked(g.startWc);", "__atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);", "mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, resetVmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);",
                           "if (r == kIOReturnSuccess) {", "put = ring_put_locked(dw, 8u, probe, kOwnerKernel, 0u, nullptr) == kOk;", "IOLockUnlock(gRingLock);", "const bool ok = recovery_ok(r == kIOReturnSuccess, put, ret);" }),
-           "g2_recover: emission frozen, scrub, POISON before the RESET, one MES RESET of the guilty VMID, the probe only after an ack, verdict by recovery_ok");
+           "g2_recover: emission frozen, scrub, POISON before the RESET, one MES RESET of the guilty VMID (g.vmid), the probe only after an ack, verdict by recovery_ok");
     expect(rc.find("mes_remove_hw_queue") == std::string::npos && rc.find("cp_map_gfx_kgq_mes") == std::string::npos && rc.find("WREG32") == std::string::npos && rc.find("gHang.hung") == std::string::npos,
            "the automatic recovery sends no REMOVE_QUEUE / ADD_QUEUE (G1 review condition 1: never `auto`), writes no register, never touches the HUNG flag");
     expect_u("the HUNG flag is still cleared in exactly one place (G1's clear_latch)", count_of(eng, "gHang.hung = false"), 1);
@@ -660,9 +666,10 @@ static void t12_pins(const std::string &root) {
     expect(in_order(fn_body(eng, "static bool g2_recover("), { "const bool ok = recovery_ok(r == kIOReturnSuccess, put, ret);", "gG2.recoveries++;", "else gG2.failed++;" }), "R3: every attempt is counted");
     // R4
     const std::string bc = fn_body(eng, "IOReturn n1c_bo_create(");
-    expect(in_order(bc, { "would_exceed(s->gttUsed, p.size, kGttCap)", "host_sys_budget_ok(multi, s->ws, heldPending", "rc = kIOReturnNoMemory; break;", "sysmem_alloc(sm, p.size, p.align)", "if (multi) { b.sysCounted = 1u; gSysHeld += p.size; }" }),
-           "R4: BoCreate (GTT): the global cap before the allocation, the charge after it (3.5: dynamic host cap with held+pending, never VRAM-derived)");
+    expect(in_order(bc, { "host_reserve_ok(gSysHeld, gSysPending, p.size, hcap)", "gtt_alloc_pages(p.size, &gmd, &gpages, &gpageCount)", "would_exceed(s->gttUsed, p.size, kGttCap)", "host_commit(gSysHeld, gSysPending, p.size)" }),
+           "R4: BoCreate (GTT): pre-lock reservation (held+pending), non-contiguous page allocation outside locks, authoritative commit (dynamic host cap, never VRAM-derived)");
     expect(bc.find("host_cap_now()") != std::string::npos && bc.find("sat_add(gSysHeld, gSysPending)") != std::string::npos, "R4: BoCreate includes in-flight import reservations (held+pending) in the host-budget gate");
+    expect(bc.find("kIOMemoryPhysicallyContiguous") == std::string::npos, "Fix A: n1c_bo_create never allocates physically contiguous GTT pages");
     const std::string im = fn_body(eng, "IOReturn n1c_bo_import_host(");
     expect(in_order(im, { "host_reserve_ok(gSysHeld, gSysPending, size, hcap)", "gSysPending = rdna4native::g2::host_pending_acquire(gSysPending, size);", "pt_map_pages_tx(s->rootPa, vaCanon", "host_commit(gSysHeld, gSysPending, size)" }),
            "R4: import: 3.5 reservation BEFORE pinning (pending += size under gCliLock, never across prepare), commit pending->held with the record (no double account)");

@@ -20,8 +20,8 @@ void check(bool cond, const char *msg) {
 }
 
 struct FenceMock {
-	uint32_t completed[rdna4vmid::kMaxDomains] {};
-	static bool reached(void *ctx, uint32_t domain, uint32_t seq) {
+	uint64_t completed[rdna4vmid::kMaxDomains] {};
+	static bool reached(void *ctx, uint32_t domain, uint64_t seq) {
 		const auto *self = static_cast<const FenceMock *>(ctx);
 		return domain < rdna4vmid::kMaxDomains && self->completed[domain] >= seq;
 	}
@@ -42,6 +42,7 @@ void test_vmid_pool_exact_ack_and_quarantine() {
 	const uint32_t vmidA = g.vmid;
 	check(vmidA >= 1u && vmidA <= 15u && vmidA != 8u, "reservedMask and VMID 0 excluded");
 	check(g.rebind && g.flush && g.flushSeq == 10u, "initial bind requests rebind + exact flushSeq");
+	check(pool.vmidOf(clientA) == vmidA && pool.vmidOf(clientB) == 0u, "vmidOf reports active owner");
 
 	// Stale/wrong/non-matching flushComplete rejected.
 	check(!pool.flushComplete(clientB, vmidA, 10u), "wrong owner flushComplete rejected");
@@ -63,6 +64,11 @@ void test_vmid_pool_exact_ack_and_quarantine() {
 	check(pool.grab(clientA, 0xaaaa0000u, 11u, g2) == rdna4vmid::Result::Ok, "clean reuse");
 	check(!g2.flush && !g2.rebind && g2.vmid == vmidA, "clean reuse skips flush and rebind");
 
+	// Synchronous PT mutation flushed via noteFlushed advances boundSeq without re-flushing on grab.
+	pool.noteFlushed(clientA, vmidA, 12u);
+	check(pool.grab(clientA, 0xaaaa0000u, 12u, g2) == rdna4vmid::Result::Ok && !g2.flush && !g2.rebind,
+	      "noteFlushed keeps clean reuse without extra flush");
+
 	// Quarantine on uncertain hardware state permanently blocks VMID until unbindAll().
 	check(!pool.quarantine(clientB, vmidA), "wrong owner cannot quarantine");
 	check(pool.quarantine(clientA, vmidA), "owner quarantines uncertain VMID");
@@ -70,6 +76,8 @@ void test_vmid_pool_exact_ack_and_quarantine() {
 	check(pool.stats().quarantines == 1u, "quarantine counter incremented");
 
 	// Reserve all remaining usable VMIDs except vmidA is quarantined -> pin/grab cannot reuse vmidA.
+	// Use 64-bit seqnos > UINT32_MAX to verify 64-bit fence tracking.
+	const uint64_t hiBase = 0x100000000ull;
 	std::vector<uint32_t> grabbed;
 	for (uint32_t k = 1u; k <= 13u; ++k) {
 		rdna4vmid::Grant gk {};
@@ -77,21 +85,30 @@ void test_vmid_pool_exact_ack_and_quarantine() {
 		const auto res = pool.grab(owner, 0x50000u + k * 0x1000u, 1u, gk);
 		check(res == rdna4vmid::Result::Ok, "fill remaining unreserved/unquarantined VMIDs");
 		check(gk.vmid != vmidA && gk.vmid != 8u, "quarantined/reserved VMID never granted");
-		pool.noteSubmit(gk.vmid, rdna4vmid::kDomainGfx, 100u + k);
+		pool.noteSubmit(gk.vmid, rdna4vmid::kDomainGfx, hiBase + 100ull + k);
 		grabbed.push_back(gk.vmid);
 	}
 
 	// All 13 usable slots are now in-flight (8 is reserved, vmidA is quarantined) -> Busy + starvation gate.
 	check(pool.grab(clientB, 0xbbbb0000u, 1u, g) == rdna4vmid::Result::Busy, "pool reports Busy when all usable slots in flight");
-	check(g.waitDomain == rdna4vmid::kDomainGfx && g.waitSeq == 101u, "Busy identifies oldest pending fence");
-	// Complete first fence on 101; starvation clears, next LRU steals freed slot.
-	fence.completed[rdna4vmid::kDomainGfx] = 101u;
+	check(g.waitDomain == rdna4vmid::kDomainGfx && g.waitSeq == hiBase + 101ull, "Busy identifies oldest 64-bit pending fence");
+	// Complete first fence on hiBase+101; starvation clears, next LRU steals freed slot.
+	fence.completed[rdna4vmid::kDomainGfx] = hiBase + 101ull;
 	check(pool.grab(clientB, 0xbbbb0000u, 1u, g) == rdna4vmid::Result::Ok && g.stolen,
-	      "once waiter fence completes, LRU idle slot is stolen cleanly");
+	      "once waiter 64-bit fence completes, LRU idle slot is stolen cleanly");
+
+	// resetFences() clears pending fences and starvation while preserving quarantined slots.
+	pool.noteSubmit(g.vmid, rdna4vmid::kDomainGfx, hiBase + 999ull);
+	pool.resetFences();
+	check(pool.isQuarantined(vmidA), "resetFences preserves quarantined VMID");
+	uint32_t tmpVmid = 0u;
+	check(pool.forget(clientB, false, tmpVmid), "after resetFences, forget(false) sees idle slot");
+	check(pool.grab(clientB, 0xbbbb0000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid != vmidA,
+	      "after resetFences, quarantined VMID stays excluded");
 
 	// forget(force=false) refuses while in flight, forget(force=true) force-releases, idle forget(false) succeeds.
 	uint32_t releasedVmid = 0u;
-	pool.noteSubmit(g.vmid, rdna4vmid::kDomainGfx, 500u);
+	pool.noteSubmit(g.vmid, rdna4vmid::kDomainGfx, hiBase + 500ull);
 	check(!pool.forget(clientB, false, releasedVmid), "forget(false) refuses while in-flight");
 	check(pool.forget(clientB, true, releasedVmid) && releasedVmid == g.vmid, "forget(true) force-releases");
 	rdna4vmid::Grant gIdle {};
@@ -208,11 +225,24 @@ void test_sparse_pt_rollback_and_range() {
 	check(mock.ptes[0][510] == ptes[0] && mock.ptes[1][1] == ptes[3], "PTEs populated");
 }
 
+void test_in_flight_prevents_steal() {
+	FenceMock f;
+	rdna4vmid::Pool pool;
+	pool.init(&FenceMock::reached, &f, 0x7FFFu); // only VMID 15 usable
+	rdna4vmid::Grant g {};
+	check(pool.grab(1u, 0x1000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid == 15u, "owner 1 grabs 15");
+	pool.beginSubmit(15u);
+	check(pool.grab(2u, 0x2000u, 1u, g) == rdna4vmid::Result::Busy, "inFlight blocks steal without waitSeq poison");
+	pool.endSubmit(15u);
+	check(pool.grab(2u, 0x2000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid == 15u && g.stolen, "steal succeeds after endSubmit");
+}
+
 } // namespace
 
 int main() {
 	test_vmid_pool_exact_ack_and_quarantine();
 	test_sparse_pt_rollback_and_range();
+	test_in_flight_prevents_steal();
 	std::printf("vmid_pool_test: %d checks, %d failed\n", gChecks, gFails);
 	return gFails ? 1 : 0;
 }

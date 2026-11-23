@@ -27,9 +27,11 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOUserClient.h>   // 0.0.641: IOUserClient::removeMappingForDescriptor (n1c_unmap_for_close)
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/OSAtomic.h>
 
 #include "native_s1c.h"
+#include "rdna4_vmid_pool.h"
 #include "rebar_pure.h"
 #include "native_hostimport_pure.h"   // 0.0.612 (ABI 1.9): BoImportHost
 #include "native_buffer_pure.h"
@@ -93,17 +95,17 @@ struct Bo {
     uint8_t   budgeted;    // 0.0.627 (G2): this VRAM BO is counted in gVramOthers (a non-WindowServer session, switch ON); taken off when its memory is freed
     uint8_t   sysCounted;  // 0.0.629 (R4): this GTT / host-import BO is counted in gSysHeld (switch ON, any session); taken off only when its memory is really freed
     uint8_t   visCounted;  // 0.0.641 (G4 review): this VISIBLE-pool BO is counted in gVisOthers (a non-WindowServer session, apps ON); taken off when its memory is freed
-    SysMem    sm;          // gtt
+    IOBufferMemoryDescriptor *gmd;   // gtt: non-contiguous page descriptor (Fix A); page list kept in hpages / hpageCount
     IODeviceMemory *vmd;   // vis: the ONE CPU-map descriptor of this BO (0.0.602), created on first clientMemoryForType, released at BoFree / close, leaked with the BO when HUNG
     IOMemoryDescriptor *hmd;   // host (0.0.612): the prepare()d descriptor of the caller's range; complete() + release() at BoFree / close, LEAKED when HUNG
-    uint64_t *hpages;          // host: the physical page list (heap, hpageCount entries), freed with the descriptor
+    uint64_t *hpages;          // host / gtt: the physical page list (heap, hpageCount entries), freed with the descriptor
     uint32_t  hpageCount;
     uint8_t   hro;             // host (b43): 1 = the caller's range was only wired READ (InOut refused: e.g. CoreAnimation's shared IOSurface pages). GPU WRITE leaves are clamped off at map time (host_vm_flags).
 };
 using rdna4native::g2::kMaxSessions;
 constexpr uint32_t kArenaBlocks = (uint32_t)(kPtCap / 16384ull);   // 2048 blocks of 16 KiB (the pool's minimum allocation): one session's page-table cap
 constexpr uint32_t kArenaBlockBytes = 16384u;
-constexpr uint32_t kArenaReserve = kArenaBlocks * kMaxSessions;    // 0.0.627 (G2): the per-boot reserve can hold every session's cap (with the switch OFF only kArenaBlocks are ever used)
+constexpr uint32_t kArenaReserve = kArenaBlocks * rdna4native::g2::kHwVmids;   // page-table reserve scaled to the hardware VMID budget
 static_assert(kArenaReserve <= 0xFFFFu, "page-table block indices fit the uint16_t lists");
 struct Session {
     bool      hello;
@@ -126,15 +128,17 @@ struct Session {
     uint64_t  emitted;         // seqno of THIS session's last Submit (0.0.627: the global count is gEmitted). Written under gRingLock; atomics
     // 0.0.627 (G2): identity. lock / slot / vmid never change once the slot exists; id / open / ws are written under gCliLock at open and close.
     IOLock   *lock;            // THIS session's lock: its tables and counters (the old client lock's job for one session). Allocated with the slot, never freed
-    uint32_t  slot, vmid, id;  // id: unique per open (1, 2, 3 ...), the client's N1cRef carries it; 0 = never opened
+    uint32_t  slot, vmid, id;  // id: unique per open (1, 2, 3 ...), the client's N1cRef carries it; 0 = never opened; vmid is pinned (8) or dynamically pooled (9..15, 0 = unbound)
     bool      open, ws;        // ws: admitted by the uid-88 (WindowServer) rule
+    bool      pinnedVmid;      // true: pinned to VMID 8 (!multi || WindowServer || G1 test); false: pooled VMID 9..15
     bool      app;             // 0.0.640 (G4): admitted by the allow-list rule (an ordinary user application); set once by n1c_mark_app right after the open, never ReadRegs / scanout
     uint64_t  appKey;          // 0.0.641: the executable-name key (RDNA4AppKey.h) of an APP session, for the strike count; written once with `app`
     volatile UInt32 poisoned;  // 1 once an automatic recovery named this session guilty (switch ON): Submit refused, waits and GPU calls Aborted
     uint64_t  faultAtOpen;     // 0.0.629 (R5): rdna4native::g2::fault_word read (never cleared) at this session's open, for sessstat
+    uint64_t  tlbSeq;          // monotonically bumped on PT mutations / unmaps; synced into gVmidPool boundSeq
 };
-static Session gSess;          // slot 0 (VMID 8): STATIC and never freed: a selector racing a close can never touch freed memory
-// 0.0.627 (G2): the session slots. Slot 0 is gSess; slots 1..7 (switch ON only) are allocated on first use and NEVER freed, for the same reason.
+static Session gSess;          // slot 0: STATIC and never freed: a selector racing a close can never touch freed memory
+// 0.0.627 (G2): the session slots. Slot 0 is gSess; slots 1..63 (switch ON only) are allocated on first use and NEVER freed, for the same reason.
 static Session *gSlot[kMaxSessions] = { &gSess };
 static uint8_t gSlotState[kMaxSessions];   // rdna4native::g2::SlotState; written under gCliLock. A DEAD slot's VMID is never handed out again this boot
 // The per-boot page-table reserve: blocks taken from vram_alloc for page tables are NEVER returned to it (a user CPU mapping kept
@@ -180,6 +184,12 @@ struct FenceWindow { bool reserved; uint64_t gartOff; uint64_t mc; };
 static FenceWindow gWin[kMaxSessions];   // 0.0.627 (G2): one 16-page window per slot (slot 0's is the 0.0.626 window)
 struct ParkRoot { bool have; VRAMAllocation a; uint64_t pa; };
 static ParkRoot gPark;
+// Pooled GFXHUB VMIDs 9..15 (under gCliLock). VMID 8 stays pinned for WindowServer / !multi / G1.
+static rdna4vmid::Pool gVmidPool;
+static bool gVmidPoolInited;
+static bool gVmid8Dead;
+static bool gVmidCtxReady[rdna4vmid::kSlots];
+static thread_t gG1OpenThread;
 // 0.0.627 (G2) state.
 static rdna4native::g2::OwnerLog gOwners;   // the owner of every seqno (written under gRingLock before the seqno is published)
 static BufferFlight gBufferFlights[kMaxSessions]; // gRingLock; ids prevent stale records from poisoning a reopened slot
@@ -251,6 +261,16 @@ static inline uint64_t retired_now(uint64_t emitted) {
     return retired_clamped(*seq_slot(), emitted);
 }
 static inline bool hung_now() { return __atomic_load_n(&gHang.hung, __ATOMIC_ACQUIRE); }
+static uint32_t flush_vmid(uint32_t vmid);
+static uint32_t program_root(uint32_t vmid, uint64_t rootPa);
+static uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok);
+static bool vmid_fence_reached(void *, uint32_t, uint64_t seq) { return retired_now(emitted_now()) >= seq; }
+static void ensure_vmid_pool_locked() {
+    if (!gVmidPoolInited) {
+        gVmidPool.init(&vmid_fence_reached, nullptr, 0x1FFu);   // reserve 0..8; pool 9..15
+        gVmidPoolInited = true;
+    }
+}
 
 // ---- the sessions (0.0.627, G2) ------------------------------------------------------------------------------------------------------
 static bool multi_on();   // boot-arg garnet-multisession=1 (latched once; below)
@@ -427,7 +447,8 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
     IOLockLock(gHangLock);
     hang_kick(gHang, reNow, emBefore, now_ns());
     IOLockUnlock(gHangLock);
-    rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc);
+    const uint8_t ownerVmid = owner != nullptr ? (uint8_t)__atomic_load_n(&owner->vmid, __ATOMIC_ACQUIRE) : 0u;
+    rdna4native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc, ownerVmid);
     if (owner != nullptr && owner->bufferSubmitting) gBufferFlights[ownerSlot] = BufferFlight{seq, ownerId};
     if (owner != nullptr) __atomic_store_n(&owner->emitted, seq, __ATOMIC_RELEASE);
     __atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);
@@ -471,7 +492,7 @@ __attribute__((noinline)) static void g5_fill_in_locked(const Session *s, uint32
 // 0.0.650 (G5 Stage 1; rdna4-g5=1 only): the Submit of a session that is NOT WindowServer. Called with ONLY the session's own lock held (the lock order of own_wait).
 // The admission verdict (rdna4native::g5::admission: ring reserve, the credit while WindowServer is active, first come first served) and the seqno are taken in ONE hold of
 // gRingLock; the wait for a Wait verdict runs OUTSIDE it (no sleep under the lock), bounded by kG5WaitBoundNs. Every exit clears this slot's gG5Since entry.
-static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
+static uint32_t ring_submit_g5_body(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
     using namespace rdna4native::g5;
     const uint32_t need = submit_dwords(nIbs, hasFence);
     const uint32_t K = g5_credit();
@@ -515,6 +536,97 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
     }
     return rc;
 }
+// Pooled submission for non-pinned multi-session clients (GFXHUB VMIDs 9..15): binds/flushes a pool VMID under gCliLock,
+// holds it against eviction via beginSubmit/endSubmit while calling ring_submit[_g5_body], then records the emitted seqno.
+static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, bool useG5, uint64_t *seqOut) {
+    uint64_t busyStart = 0ull;
+    bool stallDone = false;
+    for (;;) {
+        if (hung_now()) return hang_rc(true, false);
+        if (sess_poisoned(s)) return rdna4native::g2::poison_rc(true);
+        rdna4vmid::Grant grant {};
+        IOLockLock(gCliLock);
+        ensure_vmid_pool_locked();
+        const uint64_t seqNeed = __atomic_load_n(&s->tlbSeq, __ATOMIC_ACQUIRE);
+        const rdna4vmid::Result pr = gVmidPool.grab(reinterpret_cast<uintptr_t>(s), s->rootPa, seqNeed, grant);
+        if (pr == rdna4vmid::Result::Exhausted) {
+            IOLockUnlock(gCliLock);
+            N1C_LOG("submit refused (NoResources): pooled VMID pool exhausted (slot %u)", s->slot);
+            return kNoResources;
+        }
+        if (pr == rdna4vmid::Result::Ok) {
+            if (grant.stolen && grant.prevOwner != 0u) {
+                Session *prev = reinterpret_cast<Session *>(grant.prevOwner);
+                if (__atomic_load_n(&prev->vmid, __ATOMIC_ACQUIRE) == grant.vmid) __atomic_store_n(&prev->vmid, 0u, __ATOMIC_RELEASE);
+            }
+            if (!gVmidCtxReady[grant.vmid]) {
+                bool ctxOk = false;
+                (void)ctx_prepare_vmid(grant.vmid, &ctxOk);
+                if (!ctxOk) {
+                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                    IOLockUnlock(gCliLock);
+                    return kNotReady;
+                }
+                gVmidCtxReady[grant.vmid] = true;
+            }
+            if (grant.rebind) {
+                if (program_root(grant.vmid, s->rootPa) != kOk) {
+                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                    IOLockUnlock(gCliLock);
+                    return kTimeout;
+                }
+                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
+                (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
+            } else {
+                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
+                if (grant.flush) {
+                    amdgpu_hdp_flush(*gCtx->dev);
+                    if (flush_vmid(grant.vmid) != kOk) {
+                        (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                        __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                        IOLockUnlock(gCliLock);
+                        return kTimeout;
+                    }
+                    (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
+                }
+            }
+            const uint32_t vmid = grant.vmid;
+            gVmidPool.beginSubmit(vmid);
+            IOLockUnlock(gCliLock);
+            uint64_t seq = 0ull;
+            const uint32_t er = useG5 ? ring_submit_g5_body(s, va, by, nIbs, hasFence, fenceAddr, &seq)
+                                      : ring_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq);
+            IOLockLock(gCliLock);
+            if (er == kOk) {
+                if (gVmidPool.ownerOf(vmid) == reinterpret_cast<uintptr_t>(s)) gVmidPool.noteSubmit(vmid, rdna4vmid::kDomainGfx, seq);
+                *seqOut = seq;
+            }
+            gVmidPool.endSubmit(vmid);
+            IOLockUnlock(gCliLock);
+            return er;
+        }
+        IOLockUnlock(gCliLock);
+        const uint64_t now = now_ns();
+        if (busyStart == 0ull) busyStart = now;
+        const uint64_t el = now - busyStart;
+        if (el >= kWaitCapNs + kRecoverWaitNs) {
+            N1C_LOG("submit refused (Timeout): pooled VMID wait exceeded bound (slot %u)", s->slot);
+            return kTimeout;
+        }
+        if (!stallDone && el >= kWaitCapNs) {
+            stallDone = true;
+            (void)stall_from_wait();
+            continue;
+        }
+        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+    }
+}
+static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
+    if (!s->pinnedVmid) return ring_submit_pooled(s, va, by, nIbs, hasFence, fenceAddr, true, seqOut);
+    return ring_submit_g5_body(s, va, by, nIbs, hasFence, fenceAddr, seqOut);
+}
 
 // ---- the automatic recovery (0.0.627, G2; switch ON only) ----------------------------------------------------------------------------
 // NOP every ring dword outside the live range [liveStart, gWc) - the G1 scrub rule (the older dwords have run; the free space must not hold stale
@@ -551,8 +663,9 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
     }
     g2_scrub_locked(g.startWc);
     __atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);
+    const uint32_t resetVmid = (g.vmid >= kNativeVmid && g.vmid < rdna4vmid::kSlots) ? g.vmid : __atomic_load_n(&gs->vmid, __ATOMIC_ACQUIRE);
     const uint64_t t0 = now_ns();
-    const kern_return_t r = mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, gs->vmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);
+    const kern_return_t r = mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, resetVmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);
     const uint64_t actNs = now_ns() - t0;
     bool put = false, ret = false;
     uint64_t probe = 0, verifyNs = 0;
@@ -574,7 +687,7 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
     if (ok) { gG2.recoveries++; gG2.lastGuiltySlot = g.slot; gG2.lastGuiltySeq = g.seq; gG2.collateralTotal += collateral(g.seq, emAt); }
     else gG2.failed++;
     N1C_LOG("g2 recovery: MES RESET(reset_legacy_gfx, vmid %u) %s (%#x, %llu us); probe seq %llu %s (%llu us); guilty slot %u session %u seq %llu POISONED; "
-            "%llu later submission(s) of other sessions were queued behind it (executed or dropped: not known): %s", gs->vmid, r == kIOReturnSuccess ? "ACKED" : "NOT acked", r,
+            "%llu later submission(s) of other sessions were queued behind it (executed or dropped: not known): %s", resetVmid, r == kIOReturnSuccess ? "ACKED" : "NOT acked", r,
             (unsigned long long)(actNs / 1000ull), (unsigned long long)probe, ret ? "RETIRED" : put ? "did NOT retire" : "not emitted", (unsigned long long)(verifyNs / 1000ull),
             g.slot, g.sessId, (unsigned long long)g.seq, (unsigned long long)collateral(g.seq, emAt), ok ? "RECOVERED, the other sessions continue" : "FAILED: latching HUNG");
     return ok;
@@ -763,21 +876,66 @@ static uint32_t program_root(uint32_t vmid, uint64_t rootPa) {
 // ---- open / close -------------------------------------------------------------------------------------------------------------------
 // 0.0.627 (G2): n1c_open's helpers, out of line so its frame stays within the stack rule (+0x40).
 // CONTEXT<vmid> must carry the S1b geometry (DEPTH 3 / BLOCK 0 / RETRY 0): a context that lost it must not be pointed at a tree.
-// VMIDs 9..15 (slots 1..7, switch ON only) still carry the boot geometry with RETRY 1 (hub_setup_vmid_config): their CNTL gets cntl_native exactly as
-// native_s1b.cpp set CONTEXT8, then is read back. CONTEXT8 itself is never written here (the S1b self-test owns it). Returns the CNTL read; *ok = usable.
-static __attribute__((noinline)) uint32_t ctx_prepare(uint32_t slot, uint32_t vmid, bool *ok) {
+// VMIDs 9..15 still carry the boot geometry with RETRY 1 (hub_setup_vmid_config): their CNTL gets cntl_native on first bind, then is read back.
+// CONTEXT8 itself is never written here (the S1b self-test owns it). Returns the CNTL read; *ok = usable.
+static __attribute__((noinline)) uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok) {
     DeviceContext &dev = *gCtx->dev;
     const CtxRegs r = ctx_regs(vmid);
     uint32_t cntl = RREG32(dev, r.cntl);
-    if (slot != 0u && !ctx_geometry_ok(cntl)) {
+    if (vmid != kNativeVmid && !ctx_geometry_ok(cntl)) {
         const uint32_t before = cntl;
         WREG32(dev, r.cntl, cntl_native(before));
         cntl = RREG32(dev, r.cntl);
         N1C_LOG("CONTEXT%u CNTL %#010x -> %#010x (cntl_native: DEPTH 3 / BLOCK 0 / RETRY 0, as S1b set CONTEXT8)", vmid, before, cntl);
     }
     *ok = ctx_geometry_ok(cntl);
-    if (!*ok) N1C_LOG("open refused (NotReady): CONTEXT%u CNTL %#010x is not the native geometry (DEPTH 3 / BLOCK 0 / RETRY 0)", vmid, cntl);
+    if (!*ok) N1C_LOG("CONTEXT%u CNTL %#010x is not the native geometry (DEPTH 3 / BLOCK 0 / RETRY 0)", vmid, cntl);
     return cntl;
+}
+// Caller holds s->lock AND gCliLock. Records PT mutation epoch and flushes hardware TLB immediately only if a VMID is currently bound.
+static uint32_t session_flush_if_bound_locked(Session *s) {
+    const uint64_t nextSeq = __atomic_load_n(&s->tlbSeq, __ATOMIC_RELAXED) + 1ull;
+    __atomic_store_n(&s->tlbSeq, nextSeq, __ATOMIC_RELEASE);
+    if (s->pinnedVmid) return flush_vmid(kNativeVmid);
+    const uint32_t vmid = gVmidPool.vmidOf(reinterpret_cast<uintptr_t>(s));
+    if (vmid == 0u) return kOk;
+    const uint32_t rc = flush_vmid(vmid);
+    if (rc == kOk) gVmidPool.noteFlushed(reinterpret_cast<uintptr_t>(s), vmid, nextSeq);
+    else {
+        (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), vmid);
+        __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+    }
+    return rc;
+}
+// Caller holds s->lock only.
+static uint32_t session_pt_flush(Session *s) {
+    IOLockLock(gCliLock);
+    const uint32_t rc = session_flush_if_bound_locked(s);
+    IOLockUnlock(gCliLock);
+    return rc;
+}
+// Lazy 16-page GART fence window reservation, called under gCliLock on first kBoGtt fence resolve.
+static bool fence_window_reserve_locked(FenceWindow &win) {
+    if (win.reserved) return true;
+    GMCContext &gmc = gCtx->gmc;
+    DeviceContext &dev = *gCtx->dev;
+    const uint64_t bytes = (uint64_t)RDNA4N_FENCE_SLOTS * kPage;
+    if (gmc.gart_size == 0 || gmc.gart_pt_bus == 0 || gmc.gart_bump_offset + bytes > gmc.gart_size) {
+        N1C_LOG("fence window reserve failed (NoMemory): no GART room (%llu + %llu > %llu)",
+                (unsigned long long)gmc.gart_bump_offset, (unsigned long long)bytes, (unsigned long long)gmc.gart_size);
+        return false;
+    }
+    win.gartOff = gmc.gart_bump_offset;
+    gmc.gart_bump_offset += bytes;
+    win.mc = gmc.gart_start + win.gartOff;
+    win.reserved = true;
+    const uint64_t zero = 0;
+    for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++)
+        bar0_memcpy_to_vram(dev, gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
+    amdgpu_hdp_flush(dev);
+    N1C_LOG("fence window reserved: %u GART pages at mc %#llx (offset %#llx), every PTE invalid until a GTT fence target binds it",
+            RDNA4N_FENCE_SLOTS, (unsigned long long)win.mc, (unsigned long long)win.gartOff);
+    return true;
 }
 // 0.0.629 (G2 review fix R5): READ the GCVM L2 protection-fault registers of the GFXHUB - STATUS_LO32 0x15d0, STATUS_HI32 0x15d1, ADDR_LO32 0x15d2, ADDR_HI32
 // 0x15d3, the four native_s1b.cpp's fault leg reads - log them, and return rdna4native::g2::fault_word(STATUS_LO32, ADDR_LO32). NEVER written or cleared here (the
@@ -838,15 +996,20 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
 
     // The whole open runs under the client lock so a racing close cannot see a half-built session.
     IOLockLock(gCliLock);
+    ensure_vmid_pool_locked();
     IOReturn rc = kIOReturnSuccess;
     Session *s = nullptr;
     do {
         CPContext &cp = ctx.cp;
         const uint32_t openNow = multi ? __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST) : 0u;
         const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;   // 0.0.641: apps ON = a WindowServer slot is always available and the last free slot is its
+        const bool g1Caller = __atomic_load_n(&gG1OpenThread, __ATOMIC_ACQUIRE) == current_thread();
+        const bool pinnedVmid = !multi || ws || g1Caller;
         const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);
         if (pk.rc != kOk) { open_refused_log(multi, ws, openNow, appsNow, wsOpen); rc = kIOReturnExclusiveAccess; break; }
-        const uint32_t slot = pk.slot, vmid = vmid_of_slot(slot);
+        if (pinnedVmid && gVmid8Dead) { open_refused_log(multi, ws, openNow, appsNow, wsOpen); rc = kIOReturnExclusiveAccess; break; }
+        const uint32_t slot = pk.slot;
+        const uint32_t vmid = pinnedVmid ? kNativeVmid : 0u;
         // The ring must be idle for the FIRST session: S1b's (or the last session's) work has retired and the seqno restarts. 0.0.627: a later session
         // (switch ON) opens next to the running ones.
         if (openNow == 0u) {
@@ -859,27 +1022,11 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             }
         }
         if (rc != kIOReturnSuccess) break;
-        bool ctxOk = false;
-        const uint32_t cntl = ctx_prepare(slot, vmid, &ctxOk);   // CONTEXT<vmid>: the S1b geometry, set once for VMIDs 9..15, read back
-        if (!ctxOk) { rc = kIOReturnNotReady; break; }
-        // The slot's fence window: 16 GART pages reserved once per boot from the same bump allocator the ring, MQD and write-back page came from.
-        FenceWindow &win = gWin[slot];
-        if (!win.reserved) {
-            GMCContext &gmc = ctx.gmc;
-            const uint64_t bytes = (uint64_t)RDNA4N_FENCE_SLOTS * kPage;
-            if (gmc.gart_size == 0 || gmc.gart_pt_bus == 0 || gmc.gart_bump_offset + bytes > gmc.gart_size) {
-                N1C_LOG("open refused (NoMemory): no GART room for the fence window"); rc = kIOReturnNoMemory; break;
-            }
-            win.gartOff = gmc.gart_bump_offset;
-            gmc.gart_bump_offset += bytes;
-            win.mc = gmc.gart_start + win.gartOff;
-            win.reserved = true;
-            const uint64_t zero = 0;
-            for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++)
-                bar0_memcpy_to_vram(*dev, gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
-            amdgpu_hdp_flush(*dev);
-            N1C_LOG("fence window reserved: %u GART pages at mc %#llx (offset %#llx), every PTE invalid until a GTT fence target binds it",
-                    RDNA4N_FENCE_SLOTS, (unsigned long long)win.mc, (unsigned long long)win.gartOff);
+        uint32_t cntl = 0u;
+        if (pinnedVmid) {
+            bool ctxOk = false;
+            cntl = ctx_prepare_vmid(vmid, &ctxOk);
+            if (!ctxOk) { rc = kIOReturnNotReady; break; }
         }
         // The park root: a kernel-owned zeroed page a context is pointed at while no client owns a tree.
         if (!gPark.have) {
@@ -892,7 +1039,7 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             gPark.have = true;
         }
         if (!gWcInit) { gWc = cp.wptr; gWcInit = true; }   // the ring is idle: the counter starts at the hardware wptr and never restarts
-        // The session record. Slot 0 is the static gSess; slots 1..7 are allocated once (switch ON) and never freed. Its lock is kept across opens.
+        // The session record. Slot 0 is the static gSess; slots 1..63 are allocated once (switch ON) and never freed. Its lock is kept across opens.
         if (gSlot[slot] == nullptr) {
             Session *ns = static_cast<Session *>(IOMalloc(sizeof(Session)));
             if (ns == nullptr) { rc = kIOReturnNoMemory; break; }
@@ -908,7 +1055,7 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             __atomic_store_n(&s->lock, nl, __ATOMIC_RELEASE);
         }
         rdna4native::g2::sess_wipe_keep_lock(s);
-        s->slot = slot; s->vmid = vmid; s->ws = ws;
+        s->slot = slot; s->vmid = vmid; s->ws = ws; s->pinnedVmid = pinnedVmid; s->tlbSeq = 1ull;
         s->faultAtOpen = fault_snap("open", slot);   // R5: read only
         s->pagesInBlk = 4u;   // forces the first block
         PtMem mem{ s };
@@ -920,9 +1067,10 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             *seq_slot() = 0ull;
             sysmem_wmb();
             __atomic_store_n(&gEmitted, 0ull, __ATOMIC_RELEASE);
+            gVmidPool.resetFences();
             gHang.lastRetired = 0; gHang.tProgress = now_ns();
         }
-        if (program_root(vmid, s->rootPa) != kOk) { rc = kIOReturnNotReady; break; }
+        if (pinnedVmid && program_root(vmid, s->rootPa) != kOk) { rc = kIOReturnNotReady; break; }
         __atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);   // 0.0.609
         __atomic_store_n(&s->open, true, __ATOMIC_RELEASE);
         gSlotState[slot] = kSlotOpen;
@@ -930,7 +1078,7 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);   // 0.0.623 (G1) note, 0.0.627: set with the open itself
         if (ws) __atomic_store_n(&gWsId, s->id, __ATOMIC_SEQ_CST);   // 0.0.650 (G5): WindowServer is found by its session id, never by its slot
         if (out != nullptr) { out->slot = slot; out->id = s->id; }
-        opened_log(s, cntl, win.mc);
+        opened_log(s, cntl, gWin[slot].reserved ? gWin[slot].mc : 0ull);
     } while (false);
     if (rc != kIOReturnSuccess) {
         if (s != nullptr) pt_release_blocks(s);
@@ -1027,34 +1175,46 @@ void n1c_close(const N1cRef &ref, const char *how) {
     const uint32_t ptPages = s->ptPages;
     IOLockLock(gCliLock);
     bool parked = false;
+    const uint32_t closeVmid = s->pinnedVmid ? kNativeVmid : gVmidPool.vmidOf(reinterpret_cast<uintptr_t>(s));
+    if (s->pinnedVmid) __atomic_store_n(&s->vmid, closeVmid, __ATOMIC_RELAXED);
     if (!leak) {
         // No client owns this tree from here: park the context on the kernel's zeroed page, then free everything.
-        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
+        if (s->vmid == 0u) parked = true;
+        else { if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true; }
     }
     if (!leak) {
         for (uint32_t h = 1; h < RDNA4N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);
         bool slots = false;
         const FenceWindow &win = gWin[s->slot];
-        for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++) {
-            if (!s->fslot[i].used) continue;
-            const uint64_t zero = 0;
-            bar0_memcpy_to_vram(dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
-            s->fslot[i].used = 0; slots = true;
+        if (win.reserved) {
+            for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++) {
+                if (!s->fslot[i].used) continue;
+                const uint64_t zero = 0;
+                bar0_memcpy_to_vram(dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
+                s->fslot[i].used = 0; slots = true;
+            }
         }
         if (slots) { amdgpu_hdp_flush(dev); (void)flush_vmid(0); }
         pt_release_blocks(s);   // into the reserve, not vram_alloc
-        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, freed", how, s->slot, s->vmid, nBos,
+        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, freed", how, s->slot, closeVmid, nBos,
                 (unsigned long long)(vramB >> 20), (unsigned long long)(gttB >> 20), ptPages, (unsigned long long)seqs);
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) unmapped, then completed and released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
     } else {
         // HUNG (or this slot's own work not proven retired): nothing the GPU might still read is freed; the context stays as it is, and the slot is DEAD.
-        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, LEAKED (HUNG)", how, s->slot, s->vmid, nBos,
+        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, LEAKED (HUNG)", how, s->slot, closeVmid, nBos,
                 (unsigned long long)(vramB >> 20), (unsigned long long)(gttB >> 20), ptPages, (unsigned long long)seqs);
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) LEAKED (HUNG): pages stay wired, never completed or released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
     }
+    if (s->pinnedVmid) {
+        if (!(parked && ownIdle)) gVmid8Dead = true;
+    } else if (closeVmid != 0u) {
+        if (!leak) { uint32_t rv = 0u; (void)gVmidPool.forget(reinterpret_cast<uintptr_t>(s), true, rv); }
+        else (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), closeVmid);
+    }
+    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&s->hello, false, __ATOMIC_RELEASE);
-    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..7)
-    gSlotState[s->slot] = slot_after_close(parked, ownIdle);       // 0.0.627 (G2): a VMID that may still be in use is never handed out again
+    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..63)
+    gSlotState[s->slot] = slot_after_close(parked, ownIdle);       // 0.0.627 (G2): a DEAD slot stays retired; pooled VMIDs are quarantined individually
     if (s->ws) __atomic_store_n(&gSessWs, 0u, __ATOMIC_SEQ_CST);   // 0.0.623 (G1): no WindowServer session any more
     if (s->ws) __atomic_store_n(&gWsId, 0u, __ATOMIC_SEQ_CST);     // 0.0.650 (G5)
     if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag);
@@ -1069,6 +1229,43 @@ void n1c_close(const N1cRef &ref, const char *how) {
 static void host_release(Bo &b) {
     if (b.hmd != nullptr) { b.hmd->complete(); b.hmd->release(); b.hmd = nullptr; }
     if (b.hpages != nullptr) { IOFree(b.hpages, (vm_size_t)b.hpageCount * sizeof(uint64_t)); b.hpages = nullptr; }
+}
+// Fix A: release a non-contiguous kBoGtt buffer (same complete/release/IOFree lifecycle as host_release).
+static void gtt_release(Bo &b) {
+    if (b.gmd != nullptr) { b.gmd->complete(); b.gmd->release(); b.gmd = nullptr; }
+    if (b.hpages != nullptr) { IOFree(b.hpages, (vm_size_t)b.hpageCount * sizeof(uint64_t)); b.hpages = nullptr; b.hpageCount = 0; }
+}
+// Fix A: allocate non-contiguous 4 KiB system pages OUTSIDE gCliLock and Session::lock (avoids vm_page_find_contiguous stalls).
+static IOReturn gtt_alloc_pages(uint64_t size, IOBufferMemoryDescriptor **mdOut, uint64_t **pagesOut, uint32_t *countOut) {
+    *mdOut = nullptr; *pagesOut = nullptr; *countOut = 0;
+    const uint64_t nPages = size / kPage;
+    if (nPages == 0 || nPages > (kGttMaxBo / kPage)) return kIOReturnNoMemory;
+    IOBufferMemoryDescriptor *gmd = IOBufferMemoryDescriptor::inTaskWithOptions(
+        kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryMapperNone, (vm_size_t)size, (vm_offset_t)kPage);
+    if (gmd == nullptr) return kIOReturnNoMemory;
+    if (gmd->prepare() != kIOReturnSuccess) { gmd->release(); return kIOReturnNoMemory; }
+    void *cpu = gmd->getBytesNoCopy();
+    if (cpu == nullptr || gmd->getLength() < size) { gmd->complete(); gmd->release(); return kIOReturnNoMemory; }
+    bzero(cpu, (size_t)size);
+    uint64_t *pages = static_cast<uint64_t *>(IOMalloc((vm_size_t)(nPages * sizeof(uint64_t))));
+    if (pages == nullptr) { gmd->complete(); gmd->release(); return kIOReturnNoMemory; }
+    struct GttSeg {
+        IOMemoryDescriptor *md;
+        uint64_t phys(uint64_t off, uint64_t *len) {
+            IOByteCount seg = 0;
+            const addr64_t pa = md->getPhysicalSegment((IOByteCount)off, &seg, kIOMemoryMapperNone);
+            *len = pa != 0 ? (uint64_t)seg : 0ull;
+            return (uint64_t)pa;
+        }
+    } seg { gmd };
+    const uint32_t crc = collect_pages(seg, size, pages, kGttMaxBo / kPage);
+    if (crc != kOk) {
+        IOFree(pages, (vm_size_t)(nPages * sizeof(uint64_t)));
+        gmd->complete(); gmd->release();
+        return (IOReturn)crc;
+    }
+    *mdOut = gmd; *pagesOut = pages; *countOut = (uint32_t)nPages;
+    return kIOReturnSuccess;
 }
 // The VRAM a BO held goes back to its pool: take it off the budget too (0.0.627). Caller holds gCliLock.
 static inline void budget_release(Bo &b) {
@@ -1102,7 +1299,7 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
         // garnet-apps: as 0.0.632 (always freed). By now the client's close has already removed the mappings it could (n1c_unmap_for_close): what is still counted here is the fallback.
         const bool vramReturnOk = rdna4native::g4::close_vram_return_ok(apps_on(), b.kind == kBoVis, b.vmd != nullptr, b.vmd != nullptr ? (uint32_t)b.vmd->getRetainCount() : 0u);
         if (b.vmd != nullptr) { b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed
-        if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }
+        if (b.kind == kBoGtt) { gtt_release(b); sys_release(b); }
         else if (b.kind == kBoHi) { gCtx->gmc.vram_alloc_hi.free(b.a); budget_release(b); }
         else if (b.kind == kBoVis && !vramReturnOk) {
             // LEAKED until reboot, and still COUNTED: gVramOthers keeps these bytes (they are never taken off the budget), so the shared allowance reflects what the pool really lost.
@@ -1120,19 +1317,21 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
             if (va_ent_used(e) && e.handle == h) { pt_unmap(s->rootPa, e.start, e.size / kPage, mem); touched = true; }
         }
         bool memOk = true;   // review item D: false once a TLB flush did not acknowledge (HUNG): the memory of this BO is then leaked, like the HUNG leak
-        if (touched) { amdgpu_hdp_flush(*gCtx->dev); memOk = memory_may_free_after_flush(flush_vmid(s->vmid)) && memOk; }
+        if (touched) { amdgpu_hdp_flush(*gCtx->dev); memOk = memory_may_free_after_flush(session_flush_if_bound_locked(s)) && memOk; }
         bool slotCleared = false;
-        for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++) {
-            if (s->fslot[i].used && s->fslot[i].handle == h) {
-                const uint64_t zero = 0;
-                bar0_memcpy_to_vram(*gCtx->dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
-                s->fslot[i] = FenceSlot{ 0, 0, 0 };
-                slotCleared = true;
+        if (win.reserved) {
+            for (uint32_t i = 0; i < RDNA4N_FENCE_SLOTS; i++) {
+                if (s->fslot[i].used && s->fslot[i].handle == h) {
+                    const uint64_t zero = 0;
+                    bar0_memcpy_to_vram(*gCtx->dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + i) * 8ull, &zero, sizeof(zero));
+                    s->fslot[i] = FenceSlot{ 0, 0, 0 };
+                    slotCleared = true;
+                }
             }
         }
         if (slotCleared) { amdgpu_hdp_flush(*gCtx->dev); memOk = memory_may_free_after_flush(flush_vmid(0)) && memOk; }
         if (b.vmd != nullptr) { b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed
-        if (b.kind == kBoGtt) { if (memOk) { sysmem_free(b.sm); sys_release(b); } }   // review item D: a flush that did not acknowledge leaks the GTT pages (they stay counted, R4)
+        if (b.kind == kBoGtt) { if (memOk) { gtt_release(b); sys_release(b); } }   // review item D: a flush that did not acknowledge leaks the GTT pages (they stay counted, R4)
         else if (b.kind == kBoHi) { gCtx->gmc.vram_alloc_hi.free(b.a); budget_release(b); }
         else if (b.kind == kBoVis) { gCtx->gmc.vram_alloc.free(b.a); budget_release(b); }
         else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) { host_release(b); sys_release(b); }   // 0.0.612: AFTER pt_unmap and flush_vmid above (unmap before complete)
@@ -1166,7 +1365,7 @@ IOReturn n1c_hello(const N1cRef &ref, uint64_t clientAbi, uint64_t flags, uint64
         __atomic_store_n(&s->hello, true, __ATOMIC_RELEASE);
         // ABI 1.1: the minor is reported only when the client asks for it; without the flag out[0] is exactly the major, as in 1.0.
         out[0] = ((flags & RDNA4N_HELLO_F_MINOR) != 0ull) ? (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16) : (uint64_t)RDNA4N_ABI_VERSION;
-        out[1] = kN1cKextBuild; out[2] = RDNA4N_MAX_IBS; out[3] = s->vmid;   // 0.0.627: the session's own VMID (8 with the switch OFF)
+        out[1] = kN1cKextBuild; out[2] = RDNA4N_MAX_IBS; out[3] = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);   // 0.0.627: pinned (8) or dynamic (9..15, 0 = unbound)
     }
     sess_unlock(s);
     return rc;
@@ -1183,7 +1382,7 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
     o->abi_version = RDNA4N_ABI_VERSION; o->kext_build = kN1cKextBuild;
     o->flags = RDNA4N_INFO_BUFFER_OPS | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
-    o->vmid = s->vmid;
+    o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));
     o->gc_version = ((uint32_t)v.major << 16) | ((uint32_t)v.minor << 8) | v.rev;
     o->ring_size_dw = c.cp.ring_size_dwords; o->max_ibs = RDNA4N_MAX_IBS;
@@ -1225,8 +1424,47 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
     if (!sess_hello(ref)) return kIOReturnNotReady;
     const Place p = place_decide(in->bo_size, in->alignment, in->domains, in->domain_flags);
     if (p.rc != kOk) return (IOReturn)p.rc;
+    uint32_t seq0 = 0u;
+    bool multi0 = false, ws0 = false, gttReserved = false, gttTaken = false;
+    IOBufferMemoryDescriptor *gmd = nullptr;
+    uint64_t *gpages = nullptr;
+    uint32_t gpageCount = 0u;
+    if (p.kind != kPlaceVis) {
+        if (p.size > kGttMaxBo) return kIOReturnNoMemory;
+        Session *s0 = sess_peek(ref);
+        if (s0 == nullptr || !__atomic_load_n(&s0->hello, __ATOMIC_ACQUIRE)) return kIOReturnNotReady;
+        seq0 = __atomic_load_n(&s0->id, __ATOMIC_ACQUIRE);
+        multi0 = multi_on();
+        ws0 = s0->ws;
+        if (would_exceed(__atomic_load_n(&s0->gttUsed, __ATOMIC_RELAXED), p.size, kGttCap)) return kIOReturnNoMemory;
+        if (multi0 && !ws0) {
+            IOLockLock(gCliLock);
+            const uint64_t hcap = host_cap_now();
+            if (!rdna4native::g2::host_reserve_ok(gSysHeld, gSysPending, p.size, hcap)) {
+                const uint64_t heldPend = rdna4native::g2::sat_add(gSysHeld, gSysPending);
+                N1C_LOG("BoCreate refused (NoMemory): slot %u: GTT + host imports of all sessions would pass the host cap %llu MiB (%llu MiB held+pending, %llu KiB asked; phys %llu MiB)", s0->slot,
+                        (unsigned long long)(hcap >> 20), (unsigned long long)(heldPend >> 20), (unsigned long long)(p.size >> 10),
+                        (unsigned long long)(host_physmem_bytes() >> 20));
+                IOLockUnlock(gCliLock);
+                return kIOReturnNoMemory;
+            }
+            gSysPending = rdna4native::g2::host_pending_acquire(gSysPending, p.size);
+            gttReserved = true;
+            IOLockUnlock(gCliLock);
+        }
+        const IOReturn grc = gtt_alloc_pages(p.size, &gmd, &gpages, &gpageCount);
+        if (grc != kIOReturnSuccess) {
+            sys_pending_rollback(gttReserved, p.size);
+            return grc;
+        }
+    }
     Session *s = sess_lock(ref, true);
-    if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
+    if (s == nullptr) {
+        if (gmd != nullptr) { gmd->complete(); gmd->release(); }
+        if (gpages != nullptr) IOFree(gpages, (vm_size_t)gpageCount * sizeof(uint64_t));
+        sys_pending_rollback(gttReserved, p.size);
+        return kIOReturnNotReady;   // closed while we waited for the lock
+    }
     DeviceContext &dev = *gCtx->dev;
     IOReturn rc = (IOReturn)gpu_gate(s);
     const bool multi = multi_on();
@@ -1279,22 +1517,20 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
             } else { rc = kIOReturnNoMemory; break; }
             if (multi && !s->ws) { b.budgeted = 1u; gVramOthers += p.size; }
         } else {
+            if (!session_unchanged(seq0, s->id) || multi != multi0 || s->ws != ws0) { rc = kIOReturnNotReady; break; }
             if (p.size > kGttMaxBo || would_exceed(s->gttUsed, p.size, kGttCap)) { rc = kIOReturnNoMemory; break; }
-            {   // 3.5 host budget: under gCliLock, include in-flight imports (held+pending). WindowServer keeps its per-session caps.
-                const uint64_t hcap = host_cap_now();
-                const uint64_t heldPending = rdna4native::g2::sat_add(gSysHeld, gSysPending);
-                if (!rdna4native::g2::host_sys_budget_ok(multi, s->ws, heldPending, p.size, hcap)) {
-                    N1C_LOG("BoCreate refused (NoMemory): slot %u: GTT + host imports of all sessions would pass the host cap %llu MiB (%llu MiB held+pending, %llu KiB asked; phys %llu MiB)", s->slot,
-                            (unsigned long long)(hcap >> 20), (unsigned long long)(heldPending >> 20), (unsigned long long)(p.size >> 10),
-                            (unsigned long long)(host_physmem_bytes() >> 20));
-                    rc = kIOReturnNoMemory; break;
+            b.kind = kBoGtt; b.gmd = gmd; b.hpages = gpages; b.hpageCount = gpageCount;
+            s->gttUsed += p.size;
+            if (multi) {
+                if (s->ws) { b.sysCounted = 1u; gSysHeld = rdna4native::g2::sat_add(gSysHeld, p.size); }
+                else {
+                    const rdna4native::g2::HostCommit hc = rdna4native::g2::host_commit(gSysHeld, gSysPending, p.size);
+                    gSysHeld = hc.held; gSysPending = hc.pending;
+                    gttReserved = false;
+                    b.sysCounted = 1u;
                 }
             }
-            SysMem sm {};
-            if (sysmem_alloc(sm, p.size, p.align) != kIOReturnSuccess || !sm.valid()) { sysmem_free(sm); rc = kIOReturnNoMemory; break; }
-            b.kind = kBoGtt; b.sm = sm;
-            s->gttUsed += p.size;
-            if (multi) { b.sysCounted = 1u; gSysHeld += p.size; }
+            gttTaken = true;
             bits = RDNA4N_PLACED_CPU_MAPPABLE | RDNA4N_PLACED_ZEROED;
         }
         if (b.kind != kBoGtt) s->vramBytes += p.size;
@@ -1303,6 +1539,11 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
     } while (false);
     IOLockUnlock(gCliLock);
     sess_unlock(s);
+    if (!gttTaken) {
+        if (gmd != nullptr) { gmd->complete(); gmd->release(); }
+        if (gpages != nullptr) IOFree(gpages, (vm_size_t)gpageCount * sizeof(uint64_t));
+        sys_pending_rollback(gttReserved, p.size);
+    }
     return rc;
 }
 
@@ -1675,7 +1916,7 @@ IOReturn n1c_bo_import_host(const N1cRef &ref, task_t task, uint64_t hostVa, uin
             uint32_t r = pt_map_pages_tx(s->rootPa, vaCanon, c.pages, pages, leaf_flags(host_vm_flags((uint32_t)flags, hro != 0u), false, true), mem);   // SYSTEM | SNOOPED (+ R/X as asked; W only when the caller's pages are writable)
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
-                const uint32_t f = flush_vmid(s->vmid);   // invalidate rolled-back directory pointers before another session reuses the reserve
+                const uint32_t f = session_flush_if_bound_locked(s);   // invalidate rolled-back directory pointers before another session reuses the reserve
                 if (f != kOk) { mem.quarantine_rollback(); r = f; }
             }
             if (r != kOk) {
@@ -1701,7 +1942,7 @@ IOReturn n1c_bo_import_host(const N1cRef &ref, task_t task, uint64_t hostVa, uin
         if (mapped) {
             s->maps[slot] = VaEnt{ c.gpuStripped, size, 0, h, (uint32_t)flags };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);               // synchronous: the mapping is complete on return
+            const uint32_t f = session_flush_if_bound_locked(s);   // synchronous: the mapping is complete on return
             if (f != kOk) rc = (IOReturn)f;                        // a hang was latched: the BO stays recorded (leaked at close)
         }
         out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = RDNA4N_PLACED_HOST_IMPORT;
@@ -1739,8 +1980,10 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
         if (in->operation == RDNA4N_VA_OP_MAP) {
             if (va_overlap(s->maps, kMaxMaps, q.stripped, in->map_size) >= 0) { rc = kIOReturnBadArgument; break; }
             const bool host = b.kind == kBoHost;                      // 0.0.612: scattered pages (b.hpages), mapped SYSTEM|SNOOPED like a GTT BO
-            const bool sys = b.kind == kBoGtt || host;
-            const uint64_t basePa = host ? 0ull : (sys ? b.sm.bus : pa_of_mc(b.mc)) + in->offset_in_bo;
+            const bool scattered = host || b.kind == kBoGtt;        // Fix A: kBoGtt also stores non-contiguous pages in b.hpages
+            const bool sys = scattered;
+            const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
+            const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
             uint32_t slot = 0xFFFFFFFFu;
             for (uint32_t i = 0; i < kMaxMaps; i++) if (!va_ent_used(s->maps[i])) { slot = i; break; }
             if (slot == 0xFFFFFFFFu) { rc = kIOReturnNoResources; break; }
@@ -1751,18 +1994,18 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             // alloc_page per new block; upper-bound helpers never gate reuse. Failure returns
             // blocks to the pt reserve, never to vram_alloc.
             const uint64_t vaCanon = va_canonicalize(q.stripped);
-            uint32_t r = host ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(host_vm_flags(in->flags, b.hro != 0u), b.uc, sys), mem)
-                                    : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(in->flags, b.uc, sys), mem);
+            uint32_t r = scattered ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
+                                   : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys), mem);
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
-                const uint32_t f = flush_vmid(s->vmid);   // gCliLock prevents reserve reuse until the directory invalidation completes
+                const uint32_t f = session_flush_if_bound_locked(s);   // gCliLock prevents reserve reuse until the directory invalidation completes
                 if (f != kOk) { mem.quarantine_rollback(); r = f; }
             }
             IOLockUnlock(gCliLock);
             if (r != kOk) { rc = (IOReturn)r; break; }
             s->maps[slot] = VaEnt{ q.stripped, in->map_size, in->offset_in_bo, in->handle, in->flags };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);      // synchronous: the mapping is complete on return
+            const uint32_t f = session_pt_flush(s);      // synchronous when bound; otherwise recorded in tlbSeq
             if (f != kOk) rc = (IOReturn)f;
         } else {
             const int hit = va_find_exact(s->maps, kMaxMaps, in->handle, q.stripped, in->map_size);
@@ -1775,7 +2018,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             pt_unmap(s->rootPa, q.stripped, in->map_size / kPage, mem);
             s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);
+            const uint32_t f = session_pt_flush(s);
             if (f != kOk) rc = (IOReturn)f;
         }
     } while (false);
@@ -1818,17 +2061,18 @@ IOReturn n1c_ctx(const N1cRef &ref, const rdna4n_ctx *in, rdna4n_ctx *out) {
 // session's lock and gCliLock (the GART table and the VMID-0 TLB are shared).
 static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_t *addr) {
     const Bo &b = s->bo[handle];
-    const FenceWindow &win = gWin[s->slot];
+    FenceWindow &win = gWin[s->slot];
     if (b.kind == kBoHost) return kNotPermitted;   // 0.0.612: an imported range of the caller's memory is never a kernel-written fence target
     if (b.kind != kBoGtt) { *addr = fence_addr_vram(b.mc, off); return kOk; }
     const uint32_t page = off / (uint32_t)kPage;
+    if (page >= b.hpageCount || b.hpages == nullptr) return kBadArg;
     bool isNew = false;
     const int slot = fence_slot_pick(s->fslot, RDNA4N_FENCE_SLOTS, handle, page, &isNew);
     if (slot < 0) return kNoResources;
+    if (!fence_window_reserve_locked(win)) return kNoMemory;
     if (isNew) {
-        // U3: gmc_bind_existing only bumps, gart_bind_existing runs a different allocator; so the slot's PTE is written directly with the
-        // encoding gmc_bind_existing uses (PTEFlags::SYSMEM_RW on the page's bus address), inside the window reserved at first open.
-        const uint64_t pte = ((b.sm.bus + (uint64_t)page * kPage) & ~0xFFFull) | PTEFlags::SYSMEM_RW;
+        // Bind only the targeted non-contiguous GTT page into the session's lazy 16-page GART window.
+        const uint64_t pte = (b.hpages[page] & ~0xFFFull) | PTEFlags::SYSMEM_RW;
         bar0_memcpy_to_vram(*gCtx->dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + (uint64_t)slot) * 8ull, &pte, sizeof(pte));
         amdgpu_hdp_flush(*gCtx->dev);
         const uint32_t f = flush_vmid(0);
@@ -1873,7 +2117,7 @@ IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_
             if (fr != kOk) { rc = (IOReturn)fr; break; }
         }
         uint32_t er;
-        if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642
+        if (!g5_on()) er = s->pinnedVmid ? ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut) : ring_submit_pooled(s, va, by, v.nIbs, hasFence, fenceAddr, false, seqOut);   // G5 OFF
         else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }   // 0.0.650 (G5): WindowServer is stamped, never gated
         else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // 0.0.650 (G5): every other session passes the admission
         if (er != kOk) { rc = (IOReturn)er; break; }
@@ -1914,14 +2158,14 @@ struct BufferEnv {
                     pt_unmap(s->rootPa, kBufferIbVa, 1, mem);
                     mem.rollback(snap, s->rootPa, kBufferIbVa, 1);
                     amdgpu_hdp_flush(*gCtx->dev);
-                    const uint32_t f = flush_vmid(s->vmid);
+                    const uint32_t f = session_flush_if_bound_locked(s);
                     if (f != kOk) { mem.quarantine_rollback(); rc = f; }
                 }
             }
             IOLockUnlock(gCliLock);
             if (rc != kOk) return rc;
             amdgpu_hdp_flush(*gCtx->dev);
-            rc = flush_vmid(s->vmid);
+            rc = session_pt_flush(s);
             if (rc != kOk) return rc;
             s->bufferIbPa = pa;
         }
@@ -1934,7 +2178,7 @@ struct BufferEnv {
         const uint32_t bytes = n * 4;
         uint32_t rc;
         s->bufferSubmitting = true;
-        if (!g5_on()) rc = ring_submit(s, &va, &bytes, 1, false, 0, seqOut);
+        if (!g5_on()) rc = s->pinnedVmid ? ring_submit(s, &va, &bytes, 1, false, 0, seqOut) : ring_submit_pooled(s, &va, &bytes, 1, false, 0, false, seqOut);
         else if (s->ws) {
             __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE);
             rc = ring_submit(s, &va, &bytes, 1, false, 0, seqOut);
@@ -2219,8 +2463,8 @@ IOReturn n1c_memory_for_handle(const N1cRef &ref, uint32_t handle, IOOptionBits 
         Bo &b = s->bo[handle];
         if (b.kind == kBoHi || b.kind == kBoHost) rc = kIOReturnNotPermitted;   // 0.0.612: a host import is already in the caller's own address space
         else if (b.kind == kBoGtt) {
-            b.sm.md->retain();
-            *memory = b.sm.md;
+            b.gmd->retain();
+            *memory = b.gmd;
         } else {
             // ONE descriptor per BO (0.0.602): IOConnectUnmapMemory64 finds the existing mapping by descriptor identity, so a fresh object per call
             // could never be unmapped. Created on first use, kept in the BO record, retained for each caller, released once at BoFree / close.
@@ -2258,7 +2502,7 @@ static bool multi_on() {
         const bool present = PE_parse_boot_argn("garnet-multisession", &v, sizeof(v));
         if (OSCompareAndSwap(rdna4native::g2::kLatchUnset, rdna4native::g2::latch_value(present, v), &gMultiLatch))
             N1C_LOG("boot-arg garnet-multisession %s: native sessions are %s for this boot", present ? (v == 1u ? "=1" : "present but not 1") : "absent",
-					 rdna4native::g2::latch_is_on(gMultiLatch) ? "MULTIPLE (up to 8: VMID 8..15)" : "SINGLE (VMID 8, one open at a time)");
+					 rdna4native::g2::latch_is_on(gMultiLatch) ? "MULTIPLE (up to 64 sessions, VMID 8 pinned + 9..15 pooled)" : "SINGLE (VMID 8, one open at a time)");
         l = gMultiLatch;
     }
     return rdna4native::g2::latch_is_on(l);
@@ -2432,13 +2676,13 @@ IOReturn n1c_app_deny_verb(uint64_t arg, uint64_t *o) {
     if (rc == kAllowOk && o[2] != RDNA4A_OP_LIST) N1C_LOG("appdeny: %s key %#llx -> %u entr%s on the denylist", o[2] == RDNA4A_OP_ADD ? "ADDED" : o[2] == RDNA4A_OP_CLEAR ? "CLEARED" : "REMOVED", (unsigned long long)o[4], (unsigned)o[1], o[1] == 1ull ? "y" : "ies");
     return rc == kAllowOk || rc == kAllowExists || rc == kAllowNotFound ? kIOReturnSuccess : rc == kAllowFull ? kIOReturnNoSpace : rc == kAllowOff ? kIOReturnNotPermitted : kIOReturnBadArgument;
 }
-// accel 103 `sessstat <page>`: page 0..7 one session slot, page 8 the global page. Read-only. The caller (accelExperiment) checked the latch and the argument.
+// accel 103 `sessstat <page>`: page 0..7 or 100..163 one session slot, page 8 the global page. Read-only. The caller (accelExperiment) checked the latch and the argument.
 IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
     using namespace rdna4native::g2;
     for (uint32_t i = 0; i < kOutN; i++) o[i] = 0;
     if (!multi_on()) { o[0] = kStatOff; return kIOReturnSuccess; }
-    if (page > (uint64_t)kStatGlobal) { o[0] = kStatBadArg; return kIOReturnBadArgument; }
-    if (gCliLock == nullptr || gCtx == nullptr) { o[0] = kStatOk; o[1] = page; return kIOReturnSuccess; }   // nothing ever opened this boot
+    if (!args_ok(kActSessStat, page)) { o[0] = kStatBadArg; return kIOReturnBadArgument; }
+    if (gCliLock == nullptr || gCtx == nullptr) { o[0] = kStatOk; o[1] = stat_slot_of_page(page); return kIOReturnSuccess; }   // nothing ever opened this boot
     if (page == (uint64_t)kStatGlobal) {
         GlobalView g {};
         IOLockLock(gCliLock);
@@ -2464,13 +2708,13 @@ IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
         global_out(g, o);
         return kIOReturnSuccess;
     }
-    const uint32_t slot = (uint32_t)page;
+    const uint32_t slot = stat_slot_of_page(page);
     SessView v {};
-    v.vmid = vmid_of_slot(slot);
     IOLockLock(gCliLock);
     v.state = gSlotState[slot];
     Session *s = slot_ptr(slot);
     if (s != nullptr && __atomic_load_n(&s->open, __ATOMIC_ACQUIRE)) {   // the counters are read under gCliLock (a racing selector may be mid-update: a diagnostic)
+        v.vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
         v.ws = s->ws; v.app = s->app; v.hello = s->hello; v.poisoned = sess_poisoned(s); v.id = s->id;   // 0.0.640 (G4): app
         v.vram = s->vramBytes; v.gtt = s->gttUsed; v.imported = s->importedBytes; v.ptBytes = (uint64_t)s->nblk * kArenaBlockBytes;
         v.lastSeq = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE); v.nBos = s->nBos;
@@ -2551,7 +2795,9 @@ struct G1Env {
 
     // ---- hangtest ----
     uint32_t open_test() {
+        __atomic_store_n(&gG1OpenThread, current_thread(), __ATOMIC_RELEASE);
         const IOReturn rc = n1c_open(*ctx, false, &gG1.ref);
+        __atomic_store_n(&gG1OpenThread, nullptr, __ATOMIC_RELEASE);
         if (rc == kIOReturnSuccess) { gG1.holds = true; gG1.resetAcked = false; gG1.attempts = 0; }
         return (uint32_t)rc;
     }
