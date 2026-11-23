@@ -1196,8 +1196,8 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     if (family == RDNA4G_FAMILY_METAL3 && !rdna4_is_ws()) RDNA4_ONCE("supportsFamily(Metal3) -> NO for this application: argument-buffer support is incomplete (WindowServer keeps YES)");
     return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;   // Apple1..9 (1001..1009), Mac1, MacCatalyst, Metal3, Metal4, unknown -> NO
 }
-// The lowest tier (MTLArgumentBuffersTier1 == 0); the base class's value is unknown, so it is pinned here (build 6, C1 finding B).
-- (NSUInteger)argumentBuffersSupport {   // WindowServer: the base class's answer, exactly as before build 6; applications: Tier1
+// Tier 2 argument buffers (MTLArgumentBuffersTier2 == 1) for applications; WindowServer keeps the base class's answer.
+- (NSUInteger)argumentBuffersSupport {
     if (rdna4_is_ws()) {   // the base class's answer, as before build 6 (it is not in our private header, so ask the runtime)
         Class sc = [MTLIOAccelDevice class];
         if ([sc instancesRespondToSelector:@selector(argumentBuffersSupport)]) {
@@ -1205,7 +1205,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
             return ((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, @selector(argumentBuffersSupport));
         }
     }
-    RDNA4_ONCE("argumentBuffersSupport -> Tier1 (0) for this application: argument buffers beyond the basics are not implemented"); return (NSUInteger)RDNA4G_ARGBUF_TIER1; }
+    return (NSUInteger)RDNA4G_ARGBUF_TIER2; }
 - (NSUInteger)maxBufferLength                { return (NSUInteger)[self rdna4MemoryCaps].buffer_length; }
 - (uint64_t)recommendedMaxWorkingSetSize     { return [self rdna4MemoryCaps].working_set; }
 - (BOOL)hasUnifiedMemory { return NO; }

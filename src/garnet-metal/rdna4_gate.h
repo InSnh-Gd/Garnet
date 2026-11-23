@@ -260,15 +260,17 @@ static inline void rdna4g_sync_result(rdna4g_sync *s, int found) {
 }
 
 // ---- the GPU family claim (bundle build 6, C1 finding B) ----
-// GPU buffer addresses alone do not implement argument-buffer encoding and
-// shader translation, so the bundle still does not claim Metal3 for applications.
-// Mac2 and Common1..3 stay (what the compositor and the apps' base paths use). argumentBuffersSupport reports tier 1 (MTLArgumentBuffersTier1 == 0), the lowest.
+// Tier 2 argument buffers are now implemented and verified for applications
+// (MTLArgumentBuffersTier2 == 1); MTLGPUFamilyMetal3 stays gated (NO for apps,
+// YES for WindowServer) until tessellation, ICB, and remaining Metal 2 work
+// complete. Mac2 and Common1..3 stay (what the compositor and apps' base paths use).
 #define RDNA4G_FAMILY_MAC2     2002
 #define RDNA4G_FAMILY_COMMON1  3001
 #define RDNA4G_FAMILY_COMMON2  3002
 #define RDNA4G_FAMILY_COMMON3  3003
 #define RDNA4G_FAMILY_METAL3   5001
 #define RDNA4G_ARGBUF_TIER1    0
+#define RDNA4G_ARGBUF_TIER2    1
 // WindowServer keeps the pre-build-6 answer for Metal3 (YES): the GPU desktop has run with it since #11 and nothing it uses needs argument buffers; changing it there is an untested display-path risk (reviewer. Apps get NO.
 static inline int rdna4g_supports_family(long family, int isWs) {
     switch (family) {
