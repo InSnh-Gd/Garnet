@@ -86,7 +86,18 @@ CHIPS=${CHIPS:-navi44}
 for chip in $CHIPS; do
     case "$chip" in navi44|navi48) ;; *) fail "CHIPS contains unsupported chip: $chip";; esac
 done
-RDNA4_BUILD_PCIBARCOMPAT=${RDNA4_BUILD_PCIBARCOMPAT:-0}
+RDNA4_RELEASE=${RDNA4_RELEASE:-0}
+case "$RDNA4_RELEASE" in
+    0|1) ;;
+    *) fail "RDNA4_RELEASE must be 0 or 1: $RDNA4_RELEASE";;
+esac
+if [ "$RDNA4_RELEASE" = 1 ]; then
+    [ "$CHIPS" = navi44 ] || fail "RDNA4_RELEASE=1 strictly requires CHIPS=navi44 (got: $CHIPS)"
+    RDNA4_BUILD_PCIBARCOMPAT=${RDNA4_BUILD_PCIBARCOMPAT:-1}
+    [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ] || fail "RDNA4_RELEASE=1 requires RDNA4_BUILD_PCIBARCOMPAT=1"
+else
+    RDNA4_BUILD_PCIBARCOMPAT=${RDNA4_BUILD_PCIBARCOMPAT:-0}
+fi
 case "$RDNA4_BUILD_PCIBARCOMPAT" in
     0|1) ;;
     *) fail "RDNA4_BUILD_PCIBARCOMPAT must be 0 or 1: $RDNA4_BUILD_PCIBARCOMPAT";;
@@ -122,6 +133,19 @@ done
 collector="$repo/tools/rdna4/collect-installed.sh"
 require_file 'Build identity helper' "$helper"
 require_file 'Collector script' "$collector"
+if [ "$RDNA4_RELEASE" = 1 ]; then
+    fp_exporter="$repo/tools/ioaccel-layout/export_fingerprint.py"
+    amd_license=${RDNA4_AMD_FIRMWARE_LICENSE:-$repo/src/garnet/firmware/LICENSE.amdgpu}
+    default_denylist="$repo/tools/rdna4/default-app-denylist.txt"
+    vulkan_icd_src="$repo/tools/rdna4/optional/vulkan/radeon_icd.x86_64.json"
+    radv_app_src="$repo/tools/rdna4/radv-app.sh"
+    require_file 'Fingerprint exporter' "$fp_exporter"
+    require_file 'AMD firmware redistribution license (LICENSE.amdgpu)' "$amd_license"
+    [ -s "$amd_license" ] || fail "LICENSE.amdgpu must be non-empty: $amd_license"
+    require_file 'Default app denylist' "$default_denylist"
+    require_file 'Optional Vulkan ICD template' "$vulkan_icd_src"
+    require_file 'Optional radv-app wrapper' "$radv_app_src"
+fi
 printf '#include <vulkan/vulkan.h>\n' | clang -arch x86_64 "${vk_flags[@]}" -E -x c - >/dev/null \
     || fail 'RDNA4_VK_INC does not resolve Vulkan headers'
 [ ! -e "$out/payload" ] && [ ! -L "$out/payload" ] || fail 'OUT_DIR/payload already exists; choose a fresh OUT_DIR'
@@ -182,7 +206,35 @@ bash "$repo/tools/rdna4/build-native-tools.sh" "$work/tools" >&2
 payload="$out/payload"
 mkdir "$payload"
 cp -R "$work/garnet/Garnet.kext" "$payload/"
-cp -R "$work/accel/GarnetAccel.kext" "$payload/"
+release_layout_id=
+release_short_id=
+if [ "$RDNA4_RELEASE" = 1 ]; then
+    release_layout_id=$(python3 "$fp_exporter" \
+        --layout-out "$C64_LAYOUT_OUT" \
+        --gates-dir "$repo/src/garnet-accel/gates" \
+        --out "$work/layout-fingerprint.json" \
+        --variants-index "$work/variants-index.json" \
+        --verified-build "${RDNA4_VERIFIED_BUILD:-25G332}" \
+        --print-layout-id) || fail 'Failed to export GarnetAccel layout fingerprint'
+    [ -n "$release_layout_id" ] || fail 'Empty layoutId from export_fingerprint.py'
+    release_short_id=${release_layout_id:0:16}
+    accel_rel="variants/$release_short_id/GarnetAccel.kext"
+    accel_kext="$payload/$accel_rel"
+    mkdir -p "$payload/variants/$release_short_id" "$payload/optional/vulkan"
+    cp -R "$work/accel/GarnetAccel.kext" "$accel_kext"
+    cp "$work/layout-fingerprint.json" "$payload/layout-fingerprint.json"
+    cp "$work/layout-fingerprint.json" "$payload/variants/$release_short_id/layout-fingerprint.json"
+    cp "$work/variants-index.json" "$payload/variants/index.json"
+    cp "$amd_license" "$payload/LICENSE.amdgpu"
+    cp "$default_denylist" "$payload/default-app-denylist.txt"
+    cp "$vulkan_icd_src" "$payload/optional/vulkan/radeon_icd.x86_64.json"
+    cp "$radv_app_src" "$payload/optional/vulkan/radv-app.sh"
+    chmod 755 "$payload/optional/vulkan/radv-app.sh"
+else
+    accel_rel=GarnetAccel.kext
+    accel_kext="$payload/$accel_rel"
+    cp -R "$work/accel/GarnetAccel.kext" "$accel_kext"
+fi
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     mkdir -p "$payload/optional"
     cp -R "$work/pcibarcompat/GarnetPCIBarCompat.kext" "$payload/optional/"
@@ -205,7 +257,7 @@ check_identity() {
     require_file 'Bundle executable' "$1/Contents/MacOS/$3"
 }
 check_identity "$payload/Garnet.kext" org.garnet.driver Garnet
-check_identity "$payload/GarnetAccel.kext" org.garnet.accel GarnetAccel
+check_identity "$accel_kext" org.garnet.accel GarnetAccel
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     check_identity "$payload/optional/GarnetPCIBarCompat.kext" org.garnet.pcibarcompat GarnetPCIBarCompat
 fi
@@ -219,12 +271,11 @@ ensure_signed() {
     codesign --force --deep --sign - "$kext" || return 1
     codesign --verify --deep --strict "$kext"
 }
-for name in Garnet GarnetAccel; do
-    ensure_signed "$payload/$name.kext" || fail "Cannot sign payload kext: $name"
-done
+ensure_signed "$payload/Garnet.kext" || fail 'Cannot sign payload kext: Garnet'
+ensure_signed "$accel_kext" || fail 'Cannot sign payload kext: GarnetAccel'
 python3 "$helper" garnet "$payload/Garnet.kext" > "$work/payload-garnet-identity.txt" \
     || fail 'payload Garnet.kext has the wrong identity'
-python3 "$helper" accel "$payload/GarnetAccel.kext" > "$work/payload-accel-identity.txt" \
+python3 "$helper" accel "$accel_kext" > "$work/payload-accel-identity.txt" \
     || fail 'payload GarnetAccel.kext has the wrong identity'
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     ensure_signed "$payload/optional/GarnetPCIBarCompat.kext" \
@@ -260,11 +311,10 @@ cp "$bundle/Contents/MacOS/GarnetMetal" "$work/unsigned/GarnetMetal"
 codesign --remove-signature "$work/unsigned/GarnetMetal" \
     || fail 'Cannot remove the Metal executable signature for identity comparison'
 record_input OUTPUT_METAL_UNSIGNED_EXECUTABLE "$work/unsigned/GarnetMetal"
-for name in Garnet GarnetAccel; do
-    executable=$(plist_value "$payload/$name.kext/Contents/Info.plist" CFBundleExecutable)
-    record_input "OUTPUT_${name}_EXECUTABLE" "$payload/$name.kext/Contents/MacOS/$executable"
-    record_input "OUTPUT_${name}_INFO_PLIST" "$payload/$name.kext/Contents/Info.plist"
-done
+record_input OUTPUT_GARNET_EXECUTABLE "$payload/Garnet.kext/Contents/MacOS/$(plist_value "$payload/Garnet.kext/Contents/Info.plist" CFBundleExecutable)"
+record_input OUTPUT_GARNET_INFO_PLIST "$payload/Garnet.kext/Contents/Info.plist"
+record_input OUTPUT_GARNETACCEL_EXECUTABLE "$accel_kext/Contents/MacOS/$(plist_value "$accel_kext/Contents/Info.plist" CFBundleExecutable)"
+record_input OUTPUT_GARNETACCEL_INFO_PLIST "$accel_kext/Contents/Info.plist"
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     executable=$(plist_value "$payload/optional/GarnetPCIBarCompat.kext/Contents/Info.plist" CFBundleExecutable)
     record_input OUTPUT_GARNETPCIBARCOMPAT_EXECUTABLE "$payload/optional/GarnetPCIBarCompat.kext/Contents/MacOS/$executable"
@@ -290,10 +340,10 @@ check_legacy() {
         [ "$?" -eq 1 ] || fail "Cannot scan strings from $1"
     fi
 }
-for name in Garnet GarnetAccel; do
-    executable=$(plist_value "$payload/$name.kext/Contents/Info.plist" CFBundleExecutable)
-    require_file 'Kext executable' "$payload/$name.kext/Contents/MacOS/$executable"
-    check_legacy "$payload/$name.kext/Contents/MacOS/$executable"
+for kext_check in "$payload/Garnet.kext" "$accel_kext"; do
+    executable=$(plist_value "$kext_check/Contents/Info.plist" CFBundleExecutable)
+    require_file 'Kext executable' "$kext_check/Contents/MacOS/$executable"
+    check_legacy "$kext_check/Contents/MacOS/$executable"
 done
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     executable=$(plist_value "$payload/optional/GarnetPCIBarCompat.kext/Contents/Info.plist" CFBundleExecutable)
@@ -345,7 +395,19 @@ ninja_version=unavailable
 if command -v ninja >/dev/null 2>&1; then ninja_version=$(ninja --version); fi
 meson_version=unavailable
 if command -v meson >/dev/null 2>&1; then meson_version=$(meson --version); fi
-if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
+if [ "$RDNA4_RELEASE" = 1 ]; then
+    python3 "$helper" manifest \
+        --garnet-identity "$work/payload-garnet-identity.txt" \
+        --accel-identity "$work/payload-accel-identity.txt" \
+        --pcibarcompat-identity "$work/payload-pcibarcompat-identity.txt" \
+        --release-mode 1 \
+        --target-silicon navi44 \
+        --target-pci-ids 1002:7590 \
+        --default-layout-id "$release_layout_id" \
+        --amd-firmware-license LICENSE.amdgpu \
+        --default-accel-variant-path "$accel_rel" > "$work/delivery-manifest.txt" \
+        || fail 'delivery release manifest identity check failed'
+elif [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     python3 "$helper" manifest \
         --garnet-identity "$work/payload-garnet-identity.txt" \
         --accel-identity "$work/payload-accel-identity.txt" \
@@ -388,8 +450,10 @@ fi
         "$metal_cache" "$metal_spv_count" "$metal_meta_count"
     printf 'KEXT_SIGNING=strict-verified-after-ad-hoc-fallback\n'
     printf 'RADV_INPUT=%s\nXLATE_INPUT=%s\n' "$RDNA4_RADV_LIB" "$RDNA4_XLATE_LIB"
-    for name in Garnet GarnetAccel; do
-        version=$(plist_value "$payload/$name.kext/Contents/Info.plist" CFBundleVersion)
+    for kext_ver_entry in "Garnet:$payload/Garnet.kext" "GarnetAccel:$accel_kext"; do
+        name=${kext_ver_entry%%:*}
+        kext_ver_path=${kext_ver_entry#*:}
+        version=$(plist_value "$kext_ver_path/Contents/Info.plist" CFBundleVersion)
         [ -n "$version" ] || fail "Missing CFBundleVersion: $name"
         printf '%s_CFBUNDLEVERSION=%s\n' "$name" "$version"
     done
@@ -415,4 +479,8 @@ fi
     while IFS= read -r path; do shasum -a 256 "$path"; done < "$work/checksum-files.txt" > SHA256SUMS
     shasum -a 256 -c SHA256SUMS >&2
 )
+if [ "$RDNA4_RELEASE" = 1 ]; then
+    python3 "$helper" verify-release-payload "$payload" >&2 \
+        || fail 'Release 1 payload verification failed'
+fi
 printf '%s\n' "$payload"

@@ -449,6 +449,235 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
         self.assertIn("build-all label self-check passed", res.stdout)
 
+    def _write_sha256sums(self, payload: pathlib.Path):
+        lines = []
+        for p in sorted(payload.rglob("*")):
+            if p.is_file() and p.relative_to(payload).as_posix() != "SHA256SUMS":
+                rel = p.relative_to(payload).as_posix()
+                digest = sha256_bytes(p.read_bytes())
+                lines.append(f"{digest}  ./{rel}\n")
+        (payload / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
+
+    def _make_release_payload(self, root: pathlib.Path) -> pathlib.Path:
+        import json
+        payload = root / "release-payload"
+        payload.mkdir(parents=True, exist_ok=True)
+        classes = [
+            {
+                "leaf": f"Class{i}",
+                "parent": f"Parent{i}",
+                "instanceSize": 64 + i * 8,
+                "nslots": 200 if i < 12 else 320,
+                "overrideSlots": [0, 1],
+                "inheritedBindings": [{"slot": 2, "symbol": f"__ZN6Parent{i}3fooEv"}],
+            }
+            for i in range(13)
+        ]
+        canonical_core = {
+            "schema": "garnet-layout-fingerprint-v1",
+            "arch": "x86_64",
+            "expectClasses": 13,
+            "expectSlots": 2720,
+            "classes": classes,
+        }
+        canonical = json.dumps(
+            canonical_core, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        lid = sha256_bytes(canonical)
+        sid = lid[:16]
+        fp_doc = {
+            "schema": "garnet-layout-fingerprint-v1",
+            "arch": "x86_64",
+            "expectClasses": 13,
+            "expectSlots": 2720,
+            "layoutId": lid,
+            "shortId": sid,
+            "classes": classes,
+        }
+        fp_json = json.dumps(fp_doc, indent=2, sort_keys=True) + "\n"
+        (payload / "layout-fingerprint.json").write_text(fp_json, encoding="utf-8")
+        vdir = payload / "variants" / sid
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "layout-fingerprint.json").write_text(fp_json, encoding="utf-8")
+        make_kext(payload / "Garnet.kext", "org.garnet.driver", "Garnet", "0.0.673")
+        make_kext(vdir / "GarnetAccel.kext", "org.garnet.accel", "GarnetAccel", "0.0.8")
+        make_kext(
+            payload / "optional" / "GarnetPCIBarCompat.kext",
+            "org.garnet.pcibarcompat",
+            "GarnetPCIBarCompat",
+            "0.1.0",
+        )
+        idx_doc = {
+            "schema": "garnet-accel-variants-v1",
+            "defaultVariant": lid,
+            "variants": [
+                {
+                    "layoutId": lid,
+                    "shortId": sid,
+                    "accelBundleRelPath": f"variants/{sid}/GarnetAccel.kext",
+                    "fingerprintRelPath": f"variants/{sid}/layout-fingerprint.json",
+                    "verifiedBuilds": ["25G332"],
+                }
+            ],
+        }
+        (payload / "variants" / "index.json").write_text(
+            json.dumps(idx_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (payload / "optional" / "vulkan").mkdir(parents=True, exist_ok=True)
+        (payload / "optional" / "vulkan" / "radeon_icd.x86_64.json").write_text(
+            json.dumps(
+                {
+                    "file_format_version": "1.0.0",
+                    "ICD": {
+                        "library_path": "/Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib",
+                        "api_version": "1.3.0",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (payload / "optional" / "vulkan" / "radv-app.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        (payload / "LICENSE.amdgpu").write_text("AMD firmware license fixture\n", encoding="utf-8")
+        (payload / "default-app-denylist.txt").write_text("# default empty\n", encoding="utf-8")
+        for fname in (
+            "GarnetMetal.bundle.tar",
+            "native-translate",
+            "native-bundle-check",
+            "publish-metal",
+            "mtlprobe-direct",
+            "garnettest",
+            "install-native.sh",
+            "uninstall-native.sh",
+            "deploy-common.sh",
+            "activate-native.sh",
+            "collect-installed.sh",
+            "com.garnet.native.plist",
+            "com.garnet.native-translate.plist",
+            "LOCAL-SOURCE-MANIFEST.txt",
+        ):
+            (payload / fname).write_bytes(b"fixture-content-" + fname.encode("ascii") + b"\n")
+        (payload / "MANIFEST.txt").write_text(
+            "\n".join(
+                [
+                    "FORMAT=garnet-delivery-v1",
+                    "RELEASE_MODE=1",
+                    "TARGET_SILICON=navi44",
+                    "TARGET_PCI_IDS=1002:7590",
+                    "CHIPS=navi44",
+                    f"DEFAULT_LAYOUT_ID={lid}",
+                    "AMD_FIRMWARE_LICENSE=LICENSE.amdgpu",
+                    "GARNET_BUNDLE_ID=org.garnet.driver",
+                    "ACCEL_BUNDLE_ID=org.garnet.accel",
+                    "PCIBARCOMPAT_BUNDLE_ID=org.garnet.pcibarcompat",
+                    "#",
+                    "# Payload files",
+                    "",
+                    "SHA256 content files (SHA256SUMS also covers MANIFEST.txt):",
+                    "0" * 64 + "  ./Garnet.kext/Contents/Info.plist",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self._write_sha256sums(payload)
+        return payload
+
+    def test_release_manifest_requires_navi44_pcibar_and_license(self):
+        g_file = self.root / "g.id"
+        a_file = self.root / "a.id"
+        p_file = self.root / "p.id"
+        g_file.write_text(
+            "garnet.bundle=Garnet.kext\ngarnet.identifier=org.garnet.driver\ngarnet.executable=Garnet\n"
+            "garnet.version=0.0.673\ngarnet.standalone=true\ngarnet.legacy_identity=absent\n"
+            f"garnet.info_plist_sha256={'a'*64}\ngarnet.executable_sha256={'b'*64}\n"
+        )
+        a_file.write_text(
+            "accel.bundle=GarnetAccel.kext\naccel.identifier=org.garnet.accel\naccel.executable=GarnetAccel\n"
+            "accel.version=0.0.8\naccel.standalone=true\naccel.legacy_identity=absent\n"
+            f"accel.info_plist_sha256={'c'*64}\naccel.executable_sha256={'d'*64}\n"
+        )
+        p_file.write_text(
+            "pcibarcompat.bundle=GarnetPCIBarCompat.kext\npcibarcompat.identifier=org.garnet.pcibarcompat\n"
+            "pcibarcompat.executable=GarnetPCIBarCompat\npcibarcompat.version=0.1.0\npcibarcompat.standalone=true\n"
+            f"pcibarcompat.legacy_identity=absent\npcibarcompat.info_plist_sha256={'e'*64}\npcibarcompat.executable_sha256={'f'*64}\n"
+        )
+        good_lid = "0" * 64
+        ok = self.run_cli(
+            "manifest", "--garnet-identity", str(g_file), "--accel-identity", str(a_file),
+            "--pcibarcompat-identity", str(p_file), "--release-mode", "1",
+            "--target-silicon", "navi44", "--target-pci-ids", "1002:7590",
+            "--default-layout-id", good_lid, "--amd-firmware-license", "LICENSE.amdgpu",
+        )
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        kv = parse_kv(ok.stdout)
+        self.assertEqual(kv["RELEASE_MODE"], "1")
+        self.assertEqual(kv["TARGET_SILICON"], "navi44")
+        self.assertEqual(kv["TARGET_PCI_IDS"], "1002:7590")
+
+        bad_navi48 = self.run_cli(
+            "manifest", "--garnet-identity", str(g_file), "--accel-identity", str(a_file),
+            "--pcibarcompat-identity", str(p_file), "--release-mode", "1",
+            "--target-silicon", "navi48", "--target-pci-ids", "1002:7550",
+            "--default-layout-id", good_lid, "--amd-firmware-license", "LICENSE.amdgpu",
+        )
+        self.assertNotEqual(bad_navi48.returncode, 0)
+
+        bad_no_lic = self.run_cli(
+            "manifest", "--garnet-identity", str(g_file), "--accel-identity", str(a_file),
+            "--pcibarcompat-identity", str(p_file), "--release-mode", "1",
+            "--target-silicon", "navi44", "--target-pci-ids", "1002:7590",
+            "--default-layout-id", good_lid, "--amd-firmware-license", "",
+        )
+        self.assertNotEqual(bad_no_lic.returncode, 0)
+
+    def test_verify_release_payload_contract_and_negative_cases(self):
+        payload = self._make_release_payload(self.root)
+        ok = self.run_cli("verify-release-payload", str(payload))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("release_payload.verified=true", ok.stdout)
+
+        # Uncovered stray file must fail
+        stray = payload / "uncovered.txt"
+        stray.write_text("stray\n")
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        stray.unlink()
+
+        # Missing LICENSE.amdgpu (even if re-hashed) must fail
+        saved_lic = (payload / "LICENSE.amdgpu").read_text()
+        (payload / "LICENSE.amdgpu").unlink()
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        (payload / "LICENSE.amdgpu").write_text(saved_lic)
+        self._write_sha256sums(payload)
+
+        # Top-level duplicate GarnetAccel.kext must fail in Release 1 layout
+        make_kext(payload / "GarnetAccel.kext", "org.garnet.accel", "GarnetAccel", "0.0.8")
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        shutil.rmtree(payload / "GarnetAccel.kext")
+        self._write_sha256sums(payload)
+
+        # Symlink inside payload must fail
+        (payload / "evil-link").symlink_to("LICENSE.amdgpu")
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        (payload / "evil-link").unlink()
+
+        # Non-navi44 TARGET_SILICON must fail
+        m_text = (payload / "MANIFEST.txt").read_text()
+        (payload / "MANIFEST.txt").write_text(m_text.replace("TARGET_SILICON=navi44", "TARGET_SILICON=navi48"))
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        (payload / "MANIFEST.txt").write_text(m_text)
+        self._write_sha256sums(payload)
+
+        # Legacy identifier inside layout-fingerprint.json must fail
+        fp_text = (payload / "layout-fingerprint.json").read_text()
+        (payload / "layout-fingerprint.json").write_text(fp_text.replace("Class0", "/Users/leak/Class0"))
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

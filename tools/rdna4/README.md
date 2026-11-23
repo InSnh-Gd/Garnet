@@ -34,8 +34,11 @@ path below is taken from the scripts themselves.
   it uses only Python's standard library and local Git.
 - `build-all.sh OUT_DIR`: builds one matched, signed standalone Garnet payload (`$PWD/payload`,
   outside the repo). Needs `MKSDK`, `C64_LAYOUT_OUT`, `C64_WORK` dirs; `CHIPS`
-  (default `navi44`, only `navi44`/`navi48`); `RDNA4_RADV_LIB` or `RDNA4_MESA_SRC`;
-  `RDNA4_XLATE_LIB` or `RDNA4_M2V_SRC`; `RDNA4_VK_INC` (default `-I$RDNA4_MESA_SRC/include`).
+  (default `navi44`, only `navi44`/`navi48`; `RDNA4_RELEASE=1` enforces `navi44` and implies
+  `RDNA4_BUILD_PCIBARCOMPAT=1`); `RDNA4_RADV_LIB` or `RDNA4_MESA_SRC`;
+  `RDNA4_XLATE_LIB` or `RDNA4_M2V_SRC`; `RDNA4_VK_INC` (default `-I$RDNA4_MESA_SRC/include`);
+  `RDNA4_RELEASE` (`0` default dev layout, `1` Navi 44 Release 1 payload layout requiring
+  `src/garnet/firmware/LICENSE.amdgpu` or `RDNA4_AMD_FIRMWARE_LICENSE`).
   `C64_WORK` is the directory holding `kc/` and `kexts/` carved from the target OS, used by the
   accel trampoline generator. Verifies bundle ids, rejects `Lilu` dependencies and legacy tokens
   (`Navi48Bringup|Navi48Metal|RDNA4Bringup|RDNA4Accel|RDNA4Metal|AMDRadeonRDNA4|com.navi48|n48m`),
@@ -83,8 +86,23 @@ path below is taken from the scripts themselves.
 `com.garnet.native.plist`, `com.garnet.native-translate.plist`,
 `LOCAL-SOURCE-MANIFEST.txt`, `MANIFEST.txt`, `SHA256SUMS`.
 
-The Metal bundle carries `libvulkan_radeon.dylib` and `libgarnetxlate.dylib`; this build does not
-supply a Vulkan loader, `vulkaninfo`, or an ICD JSON manifest.
+The Metal bundle carries `libvulkan_radeon.dylib` and `libgarnetxlate.dylib`; the default dev build
+(`RDNA4_RELEASE=0`) does not supply a Vulkan loader, `vulkaninfo`, or an ICD JSON manifest.
+
+### Release 1 payload layout (`RDNA4_RELEASE=1 build-all.sh OUT_DIR`)
+
+Adds Release provenance and layout selection assets while moving `GarnetAccel.kext` under a single
+variant path (`SHA256SUMS` covers 100% of payload files and `build_identity.py verify-release-payload`
+enforces completeness):
+
+- `Garnet.kext` (`CHIPS=navi44` only, embedded Navi 44 firmware) + `LICENSE.amdgpu`
+- `variants/index.json` (`garnet-accel-variants-v1`), top-level `layout-fingerprint.json`, and
+  `variants/<shortId>/{GarnetAccel.kext,layout-fingerprint.json}`
+- `optional/GarnetPCIBarCompat.kext` (users install into OpenCore `EFI/OC/Kexts/` for 16G Full-BAR)
+- `optional/vulkan/radeon_icd.x86_64.json` and `optional/vulkan/radv-app.sh` (optional, default OFF)
+- `default-app-denylist.txt` (template initialized to `/Library/Application Support/RDNA4/native/app-denylist.txt`)
+- `MANIFEST.txt` includes `RELEASE_MODE=1`, `TARGET_SILICON=navi44`, `TARGET_PCI_IDS=1002:7590`,
+  `DEFAULT_LAYOUT_ID=<sha256>`, and `AMD_FIRMWARE_LICENSE=LICENSE.amdgpu`.
 
 ## Build identity tests
 

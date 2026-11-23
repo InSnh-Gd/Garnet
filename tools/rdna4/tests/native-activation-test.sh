@@ -13,7 +13,7 @@ work=$(mktemp -d "${scratch_root%/}/native-activation-test.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 cp "$activation" "$work/activate-native.sh"
 chmod 700 "$work/activate-native.sh"
-for name in sw_vers sysctl ioreg sleep kmutil native-bundle-check native-translate publish-metal mtlprobe-direct garnettest touch chmod pgrep killall; do
+for name in sw_vers uname sysctl ioreg sleep kmutil native-bundle-check native-translate publish-metal mtlprobe-direct garnettest touch chmod pgrep killall; do
     cp "$source_dir/native-activation-stub.sh" "$work/$name"
     chmod 700 "$work/$name"
 done
@@ -107,5 +107,90 @@ run_case terminal-already-allowed native '' '' 0 0 already Terminal
 run_case terminal-allowlist-full native '' '' 0 0 full Terminal
 run_case terminal-allowlist-wrong-result native '' '' 0 0 wrong Terminal
 run_case terminal-allowlist-transport-failure native '' '' 0 0 transport Terminal
+
+# Multi-26.x version & arch checks + GarnetAccel gate fail-closed
+run_override_case() {
+    local name=$1 prod=${2:-26.7.2} bld=${3:-25G332} arch=${4:-x86_64} gatefail=${5:-0} expect_pass=${6:-1} rc=0
+    cases=$((cases + 1))
+    printf 'native\n' > "$work/profile"
+    rm -f "$work/app-denylist.txt" "$work/default-app-denylist.txt"
+    : > "$RDNA4_ACTIVATION_TEST_TRACE"
+    rm -f "$RDNA4_ACTIVATION_TEST_TRACE.service-ready"
+    RDNA4_ACTIVATION_PRODUCT_VERSION=$prod RDNA4_ACTIVATION_BUILD_VERSION=$bld \
+        RDNA4_ACTIVATION_ARCH=$arch RDNA4_ACTIVATION_ACCEL_GATE_FAIL=$gatefail \
+        bash "$work/activate-native.sh" > "$work/output" 2>&1 || rc=$?
+    if [ "$expect_pass" -eq 1 ] && [ "$rc" -eq 0 ]; then
+        printf 'ACTIVATION_CASE_PASS %s\n' "$name"
+    elif [ "$expect_pass" -eq 0 ] && [ "$rc" -ne 0 ]; then
+        if [ "$gatefail" -eq 1 ] && grep -Eq '^(publish-metal|mtlprobe-direct|garnettest|killall) ' "$work/trace"; then
+            printf 'ACTIVATION_CASE_FAIL %s unexpected GPU call on gate fail\n' "$name"
+            failures=$((failures + 1))
+        else
+            printf 'ACTIVATION_CASE_PASS %s\n' "$name"
+        fi
+    else
+        printf 'ACTIVATION_CASE_FAIL %s rc=%s expect_pass=%s\n' "$name" "$rc" "$expect_pass"
+        cat "$work/trace" "$work/output"
+        failures=$((failures + 1))
+    fi
+}
+run_override_case macos-26-8-x86-64-pass 26.8 25H101 x86_64 0 1
+run_override_case macos-26-0-pass 26 25A100 x86_64 0 1
+run_override_case macos-15-5-rejected 15.5 24F74 x86_64 0 0
+run_override_case macos-27-0-rejected 27.0 26A10 x86_64 0 0
+run_override_case arm64-arch-rejected 26.8 25H101 arm64 0 0
+run_override_case accel-gate-fail-refused 26.8 25H101 x86_64 1 0
+
+# Boot denylist loading (primary app-denylist.txt & fallback default-app-denylist.txt & failures)
+cases=$((cases + 1))
+printf 'native\n' > "$work/profile"
+printf '# header comment\n\n  bundle:com.example.DeniedBundle  \r\n  proc:BadToolAlpha\r\nproc: Bad Tool Beta \n' > "$work/app-denylist.txt"
+: > "$RDNA4_ACTIVATION_TEST_TRACE"
+rm -f "$RDNA4_ACTIVATION_TEST_TRACE.service-ready"
+if bash "$work/activate-native.sh" > "$work/output" 2>&1 &&
+   grep -Fxq 'garnettest accel appdeny add BadToolAlpha' "$work/trace" &&
+   grep -Fxq 'garnettest accel appdeny add Bad Tool Beta' "$work/trace" &&
+   ! grep -Fq 'com.example.DeniedBundle' "$work/trace" &&
+   awk '
+       /^garnettest accel appallow add Terminal$/ { t = NR }
+       /^garnettest accel appdeny add BadToolAlpha$/ { d1 = NR }
+       /^garnettest accel appdeny add Bad Tool Beta$/ { d2 = NR }
+       /^garnettest accel pipeadopt$/ { p = NR }
+       END { exit !(t > 0 && d1 > t && d2 > d1 && p > d2) }
+   ' "$work/trace"; then
+    printf 'ACTIVATION_CASE_PASS denylist-boot-load-order\n'
+else
+    printf 'ACTIVATION_CASE_FAIL denylist-boot-load-order\n'
+    failures=$((failures + 1))
+fi
+
+cases=$((cases + 1))
+rm -f "$work/app-denylist.txt"
+printf 'proc:FallbackProc\n' > "$work/default-app-denylist.txt"
+: > "$RDNA4_ACTIVATION_TEST_TRACE"
+rm -f "$RDNA4_ACTIVATION_TEST_TRACE.service-ready"
+if RDNA4_ACTIVATION_APP_DENY=already RDNA4_ACTIVATION_APP_DENY_TARGET=FallbackProc bash "$work/activate-native.sh" > "$work/output" 2>&1 &&
+   grep -Fxq 'garnettest accel appdeny add FallbackProc' "$work/trace"; then
+    printf 'ACTIVATION_CASE_PASS denylist-default-fallback\n'
+else
+    printf 'ACTIVATION_CASE_FAIL denylist-default-fallback\n'
+    failures=$((failures + 1))
+fi
+
+cases=$((cases + 1))
+rm -f "$work/default-app-denylist.txt"
+printf 'proc:BrokenEntry\n' > "$work/app-denylist.txt"
+: > "$RDNA4_ACTIVATION_TEST_TRACE"
+rm -f "$RDNA4_ACTIVATION_TEST_TRACE.service-ready"
+rc=0
+RDNA4_ACTIVATION_APP_DENY=full RDNA4_ACTIVATION_APP_DENY_TARGET=BrokenEntry bash "$work/activate-native.sh" > "$work/output" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ] && ! grep -Eq '^(garnettest accel pipe|killall) ' "$work/trace"; then
+    printf 'ACTIVATION_CASE_PASS denylist-failure-aborts-before-display\n'
+else
+    printf 'ACTIVATION_CASE_FAIL denylist-failure-aborts-before-display rc=%s\n' "$rc"
+    failures=$((failures + 1))
+fi
+rm -f "$work/app-denylist.txt"
+
 printf 'ACTIVATION_SUITE cases=%s failures=%s hardware_commands=stubbed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

@@ -3,7 +3,16 @@ set -eu
 name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$RDNA4_ACTIVATION_TEST_TRACE"
 case "$name" in
-    sw_vers) printf '25G332\n';;
+    sw_vers)
+        case "${1:-}" in
+            -productVersion) printf '%s\n' "${RDNA4_ACTIVATION_PRODUCT_VERSION:-26.7.2}";;
+            *) printf '%s\n' "${RDNA4_ACTIVATION_BUILD_VERSION:-25G332}";;
+        esac;;
+    uname)
+        case "${1:-}" in
+            -m) printf '%s\n' "${RDNA4_ACTIVATION_ARCH:-x86_64}";;
+            *) printf 'Darwin\n';;
+        esac;;
     sysctl)
         case "$*" in
             *kern.bootsessionuuid*) printf 'activation-test-boot\n';;
@@ -33,6 +42,9 @@ case "$name" in
                 [ "$bundle" = "${RDNA4_ACTIVATION_MISSING_BOOT:-}" ] || printf '%s\n' "$bundle"
             done
             [ "${RDNA4_ACTIVATION_LEGACY_FB:-0}" != 1 ] || printf 'com.hackintosh.RDNA4FB\n'
+        elif [ "${1:-}" = load ] && [ "${RDNA4_ACTIVATION_ACCEL_GATE_FAIL:-0}" = 1 ]; then
+            printf 'GarnetAccel layout gate rejected running kernel collection\n' >&2
+            exit 71
         fi;;
     mtlprobe-direct)
         [ "${1:-}" != "${RDNA4_ACTIVATION_FAIL_PROBE:-}" ] || exit 9;;
@@ -50,6 +62,18 @@ case "$name" in
                     already) printf 'code : 4 (already on the list)\n';;
                     full) printf 'code : 3 (FULL (32 entries))\n'; exit 3;;
                     wrong) printf 'code : 5 (not on the list)\n';;
+                    transport) exit 9;;
+                    *) exit 64;;
+                esac;;
+            appdeny)
+                [ "${2:-}" = appdeny ] && [ "${3:-}" = add ] && [ -n "${4:-}" ] || exit 64
+                deny=ok
+                [ "${4:-}" != "${RDNA4_ACTIVATION_APP_DENY_TARGET:-}" ] || deny=${RDNA4_ACTIVATION_APP_DENY:-ok}
+                case "$deny" in
+                    ok) printf 'code : 0 (ok)\n';;
+                    already) printf 'code : 4 (already on the denylist)\n';;
+                    full) printf 'code : 3 (FULL (64 entries))\n'; exit 3;;
+                    wrong) printf 'code : 5 (not on the denylist)\n';;
                     transport) exit 9;;
                     *) exit 64;;
                 esac;;

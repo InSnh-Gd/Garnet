@@ -1,0 +1,9 @@
+# Garnet Application Denylist (/Library/Application Support/RDNA4/native/app-denylist.txt)
+# Lines starting with # and blank lines are ignored.
+#
+# Supported entry formats:
+#   bundle:<CFBundleIdentifier>   Exact CFBundleIdentifier match in GarnetMetal.bundle (avoids 16-char p_comm truncation)
+#   proc:<executable_name>        Matched by GarnetMetal.bundle (exact) and synced into kernel `appdeny` at boot (first 16 bytes)
+#
+# WindowServer and privileged root diagnostic tools (RDNA4M_ALLOW=1) remain unconditionally immune.
+# Released empty by default when `garnet-apps-all=1` + 3-strike auto-quarantine is active; manage via `Garnet.app` or `garnetctl denylist`.

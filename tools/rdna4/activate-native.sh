@@ -9,7 +9,12 @@ fi
 root=$(cd "$(dirname "$0")" && pwd)
 printf 'RDNA4 boot activation: %s\n' "$(date -u +%FT%TZ)"
 boot=$(sysctl -n kern.bootsessionuuid)
-[ "$(sw_vers -buildVersion)" = 25G332 ] || { printf 'Unsupported macOS build\n' >&2; exit 1; }
+product_ver=$(sw_vers -productVersion)
+case "$product_ver" in
+    26|26.*) ;;
+    *) printf 'Unsupported macOS version: %s (macOS 26.x required)\n' "$product_ver" >&2; exit 1;;
+esac
+[ "$(uname -m)" = x86_64 ] || { printf 'Unsupported architecture: %s (x86_64 required)\n' "$(uname -m)" >&2; exit 1; }
 profile=$(cat "$root/profile")
 case "$profile" in
     vm-load-only) style=start-only;;
@@ -87,6 +92,33 @@ step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add 'Syst
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add iconservicesagent
 # Terminal uses RGhA CA Whippet IOSurfaces on wide-gamut (P3) displays, which macOS 26 drops to zero without Metal.
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add Terminal
+# Persistent application denylist: load proc: entries into kernel gAppDeny (bundle: entries are enforced by GarnetMetal.bundle).
+deny_file=
+if [ -L "$root/app-denylist.txt" ]; then
+    printf 'Refusing symbolic-link denylist: %s/app-denylist.txt\n' "$root" >&2
+    exit 1
+elif [ -f "$root/app-denylist.txt" ]; then
+    deny_file="$root/app-denylist.txt"
+elif [ -f "$root/default-app-denylist.txt" ] && [ ! -L "$root/default-app-denylist.txt" ]; then
+    deny_file="$root/default-app-denylist.txt"
+fi
+if [ -n "$deny_file" ]; then
+    while IFS= read -r raw_deny || [ -n "$raw_deny" ]; do
+        deny_line=${raw_deny%$'\r'}
+        deny_line=${deny_line#"${deny_line%%[!$' \t']*}"}
+        deny_line=${deny_line%"${deny_line##*[!$' \t']}"}
+        case "$deny_line" in
+            ''|\#*) continue;;
+            proc:*)
+                deny_proc=${deny_line#proc:}
+                deny_proc=${deny_proc#"${deny_proc%%[!$' \t']*}"}
+                [ -n "$deny_proc" ] || continue
+                step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the denylist\))' appdeny add "$deny_proc"
+                ;;
+            bundle:*) ;;
+        esac
+    done < "$deny_file"
+fi
 # /tmp is cleared at boot; an owned persistent opt-in restores observational diagnostics.
 if [ -f /private/var/tmp/rdna4m-observe ] && [ ! -L /private/var/tmp/rdna4m-observe ] && [ -O /private/var/tmp/rdna4m-observe ]; then
     observe_flag() {

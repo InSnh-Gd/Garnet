@@ -16,6 +16,16 @@ import sys
 import tempfile
 
 
+FP_SCHEMA = "garnet-layout-fingerprint-v1"
+VARIANTS_SCHEMA = "garnet-accel-variants-v1"
+RELEASE_TARGET_SILICON = "navi44"
+RELEASE_TARGET_PCI_IDS = "1002:7590"
+RELEASE_FIRMWARE_LICENSE = "LICENSE.amdgpu"
+RELEASE_VULKAN_LIB = (
+    "/Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib"
+)
+
+
 GARNET_KEXT = "Garnet.kext"
 GARNET_ID = "org.garnet.driver"
 GARNET_EXECUTABLE = "Garnet"
@@ -173,13 +183,15 @@ def read_key_values(path):
     return values
 
 
-def read_identity_values(path):
+def read_identity_values(path, stop_before_section=None):
     values = {}
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as error:
         raise IdentityError("cannot read {}: {}".format(path, error)) from error
     for number, raw in enumerate(lines, 1):
+        if stop_before_section and raw.strip() == stop_before_section:
+            break
         if not raw or raw.startswith("#"):
             continue
         if "=" not in raw:
@@ -496,6 +508,44 @@ def command_manifest(args):
             PCIBARCOMPAT_ID,
             pcibar,
         )
+    if args.release_mode == "1":
+        if args.pcibarcompat_identity is None:
+            raise IdentityError("Release 1 manifest requires --pcibarcompat-identity")
+        if args.target_silicon != RELEASE_TARGET_SILICON:
+            raise IdentityError(
+                "Release 1 TARGET_SILICON must be {}, got {!r}".format(
+                    RELEASE_TARGET_SILICON, args.target_silicon
+                )
+            )
+        if args.target_pci_ids != RELEASE_TARGET_PCI_IDS:
+            raise IdentityError(
+                "Release 1 TARGET_PCI_IDS must be {}, got {!r}".format(
+                    RELEASE_TARGET_PCI_IDS, args.target_pci_ids
+                )
+            )
+        if not args.default_layout_id or not re.fullmatch(
+            r"[0-9a-f]{64}", args.default_layout_id
+        ):
+            raise IdentityError(
+                "Release 1 DEFAULT_LAYOUT_ID must be 64-char hex SHA256, got {!r}".format(
+                    args.default_layout_id
+                )
+            )
+        if args.amd_firmware_license != RELEASE_FIRMWARE_LICENSE:
+            raise IdentityError(
+                "Release 1 AMD_FIRMWARE_LICENSE must be {}, got {!r}".format(
+                    RELEASE_FIRMWARE_LICENSE, args.amd_firmware_license
+                )
+            )
+        values["RELEASE_MODE"] = "1"
+        values["TARGET_SILICON"] = args.target_silicon
+        values["TARGET_PCI_IDS"] = args.target_pci_ids
+        values["DEFAULT_LAYOUT_ID"] = args.default_layout_id
+        values["AMD_FIRMWARE_LICENSE"] = args.amd_firmware_license
+        if args.default_accel_variant_path:
+            values["DEFAULT_ACCEL_VARIANT_PATH"] = args.default_accel_variant_path
+    elif args.release_mode not in (None, "0"):
+        raise IdentityError("invalid --release-mode: {!r}".format(args.release_mode))
     for key, value in values.items():
         if not value:
             raise IdentityError("delivery manifest is missing {}".format(key))
@@ -512,6 +562,207 @@ def command_manifest(args):
             raise IdentityError("delivery manifest {} is not a SHA256".format(key))
     for key, value in values.items():
         print("{}={}".format(key, value))
+
+
+def _safe_rel_path(payload, rel):
+    if not rel or rel.startswith("/") or "\\" in rel or ".." in rel.split("/"):
+        raise IdentityError("unsafe relative path in release payload: {!r}".format(rel))
+    target = (payload / rel).resolve()
+    try:
+        target.relative_to(payload)
+    except ValueError as error:
+        raise IdentityError("path escapes payload root: {!r}".format(rel)) from error
+    return target
+
+
+def _verify_fingerprint_doc(fp_path, expected_layout_id=None):
+    try:
+        fp_raw = fp_path.read_text(encoding="utf-8")
+        fp = json.loads(fp_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IdentityError("invalid layout fingerprint {}: {}".format(fp_path, error)) from error
+    if fp.get("schema") != FP_SCHEMA:
+        raise IdentityError("unexpected fingerprint schema in {}: {!r}".format(fp_path, fp.get("schema")))
+    if fp.get("arch") != "x86_64":
+        raise IdentityError("unexpected fingerprint arch: {!r}".format(fp.get("arch")))
+    if fp.get("expectClasses") != 13 or fp.get("expectSlots") != 2720:
+        raise IdentityError("unexpected fingerprint expectations in {}".format(fp_path))
+    lid = fp.get("layoutId")
+    if not isinstance(lid, str) or not re.fullmatch(r"[0-9a-f]{64}", lid):
+        raise IdentityError("invalid layoutId in {}".format(fp_path))
+    if fp.get("shortId") != lid[:16]:
+        raise IdentityError("mismatched shortId in {}".format(fp_path))
+    if expected_layout_id and lid != expected_layout_id:
+        raise IdentityError(
+            "layoutId mismatch in {}: got {}, want {}".format(fp_path, lid, expected_layout_id)
+        )
+    classes = fp.get("classes")
+    if not isinstance(classes, list) or len(classes) != 13:
+        raise IdentityError("fingerprint classes must hold 13 entries in {}".format(fp_path))
+    canonical_core = {
+        "schema": FP_SCHEMA,
+        "arch": "x86_64",
+        "expectClasses": 13,
+        "expectSlots": 2720,
+        "classes": classes,
+    }
+    canonical = json.dumps(
+        canonical_core, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    actual_lid = sha256_bytes(canonical)
+    if actual_lid != lid:
+        raise IdentityError(
+            "layoutId integrity mismatch in {}: declared {}, computed {}".format(
+                fp_path, lid, actual_lid
+            )
+        )
+    for bad in ("/Users/", "/home/", "__TEXT", "AppleParavirtGPU.kext", "mach_header"):
+        if bad in fp_raw:
+            raise IdentityError("forbidden path or binary token {!r} in {}".format(bad, fp_path))
+    return fp
+
+
+def command_verify_release_payload(args):
+    payload = Path(args.payload).resolve()
+    if not payload.is_dir():
+        raise IdentityError("release payload is not a directory: {}".format(payload))
+
+    actual_files = set()
+    for root_dir, dirnames, filenames in os.walk(payload, followlinks=False):
+        for name in dirnames + filenames:
+            p = Path(root_dir) / name
+            if p.is_symlink():
+                raise IdentityError("release payload must not contain symlinks: {}".format(p))
+        for name in filenames:
+            p = Path(root_dir) / name
+            if not stat.S_ISREG(p.lstat().st_mode):
+                raise IdentityError("non-regular file in release payload: {}".format(p))
+            actual_files.add(p.relative_to(payload).as_posix())
+
+    sha_path = payload / "SHA256SUMS"
+    manifest_path = payload / "MANIFEST.txt"
+    if not sha_path.is_file():
+        raise IdentityError("missing SHA256SUMS in release payload")
+    if not manifest_path.is_file():
+        raise IdentityError("missing MANIFEST.txt in release payload")
+
+    recorded = {}
+    for line_no, raw in enumerate(sha_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw:
+            continue
+        m = re.fullmatch(r"([0-9a-f]{64})  \./(.+)", raw)
+        if not m:
+            raise IdentityError("SHA256SUMS line {} malformed: {!r}".format(line_no, raw))
+        digest, rel = m.group(1), m.group(2)
+        if rel == "SHA256SUMS":
+            raise IdentityError("SHA256SUMS must not list itself")
+        if rel in recorded:
+            raise IdentityError("duplicate SHA256SUMS entry: {}".format(rel))
+        target = _safe_rel_path(payload, rel)
+        if not target.is_file():
+            raise IdentityError("SHA256SUMS references missing file: {}".format(rel))
+        actual_digest = sha256_file(target)
+        if actual_digest != digest:
+            raise IdentityError("SHA256 mismatch for {}: expected {}, got {}".format(rel, digest, actual_digest))
+        recorded[rel] = digest
+
+    expected_covered = actual_files - {"SHA256SUMS"}
+    missing_from_sums = expected_covered - set(recorded.keys())
+    if missing_from_sums:
+        raise IdentityError(
+            "files missing from SHA256SUMS: {}".format(", ".join(sorted(missing_from_sums)[:5]))
+        )
+
+    manifest_kv = read_identity_values(manifest_path, stop_before_section="# Payload files")
+    for k, want in (
+        ("FORMAT", DELIVERY_FORMAT),
+        ("RELEASE_MODE", "1"),
+        ("TARGET_SILICON", RELEASE_TARGET_SILICON),
+        ("TARGET_PCI_IDS", RELEASE_TARGET_PCI_IDS),
+        ("CHIPS", RELEASE_TARGET_SILICON),
+        ("AMD_FIRMWARE_LICENSE", RELEASE_FIRMWARE_LICENSE),
+        ("GARNET_BUNDLE_ID", GARNET_ID),
+        ("ACCEL_BUNDLE_ID", ACCEL_ID),
+        ("PCIBARCOMPAT_BUNDLE_ID", PCIBARCOMPAT_ID),
+    ):
+        if manifest_kv.get(k) != want:
+            raise IdentityError(
+                "MANIFEST.txt {} mismatch: got {!r}, want {!r}".format(k, manifest_kv.get(k), want)
+            )
+    default_lid = manifest_kv.get("DEFAULT_LAYOUT_ID", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", default_lid):
+        raise IdentityError("invalid DEFAULT_LAYOUT_ID in MANIFEST.txt: {!r}".format(default_lid))
+
+    required_files = (
+        "GarnetMetal.bundle.tar",
+        "native-translate",
+        "native-bundle-check",
+        "publish-metal",
+        "mtlprobe-direct",
+        "garnettest",
+        "install-native.sh",
+        "uninstall-native.sh",
+        "deploy-common.sh",
+        "activate-native.sh",
+        "collect-installed.sh",
+        "com.garnet.native.plist",
+        "com.garnet.native-translate.plist",
+        "LICENSE.amdgpu",
+        "default-app-denylist.txt",
+        "layout-fingerprint.json",
+        "variants/index.json",
+        "optional/vulkan/radeon_icd.x86_64.json",
+        "optional/vulkan/radv-app.sh",
+        "LOCAL-SOURCE-MANIFEST.txt",
+    )
+    for rel in required_files:
+        p = payload / rel
+        if not p.is_file() or p.stat().st_size == 0 and rel not in ("default-app-denylist.txt",):
+            raise IdentityError("missing or empty required release file: {}".format(rel))
+    if (payload / "GarnetAccel.kext").exists():
+        raise IdentityError("Release 1 payload must place GarnetAccel.kext under variants/<shortId>/ only")
+
+    icd = json.loads((payload / "optional/vulkan/radeon_icd.x86_64.json").read_text(encoding="utf-8"))
+    if icd.get("file_format_version") != "1.0.0":
+        raise IdentityError("unexpected Vulkan ICD file_format_version")
+    if icd.get("ICD", {}).get("library_path") != RELEASE_VULKAN_LIB:
+        raise IdentityError("unexpected Vulkan ICD library_path: {!r}".format(icd.get("ICD", {}).get("library_path")))
+
+    verify_standalone_kext(payload / GARNET_KEXT, GARNET_KEXT, GARNET_ID, GARNET_EXECUTABLE, "garnet")
+    verify_standalone_kext(
+        payload / "optional" / PCIBARCOMPAT_KEXT,
+        PCIBARCOMPAT_KEXT,
+        PCIBARCOMPAT_ID,
+        PCIBARCOMPAT_EXECUTABLE,
+        "pcibarcompat",
+    )
+    _verify_fingerprint_doc(payload / "layout-fingerprint.json", expected_layout_id=default_lid)
+
+    idx = json.loads((payload / "variants/index.json").read_text(encoding="utf-8"))
+    if idx.get("schema") != VARIANTS_SCHEMA:
+        raise IdentityError("unexpected variants/index.json schema: {!r}".format(idx.get("schema")))
+    if idx.get("defaultVariant") != default_lid:
+        raise IdentityError("variants/index.json defaultVariant disagrees with MANIFEST DEFAULT_LAYOUT_ID")
+    variants = idx.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise IdentityError("variants/index.json variants list is empty")
+    seen_default = False
+    for entry in variants:
+        lid = entry.get("layoutId", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", lid) or entry.get("shortId") != lid[:16]:
+            raise IdentityError("invalid variant entry: {!r}".format(entry))
+        if lid == default_lid:
+            seen_default = True
+        accel_p = _safe_rel_path(payload, entry.get("accelBundleRelPath", ""))
+        fp_p = _safe_rel_path(payload, entry.get("fingerprintRelPath", ""))
+        verify_standalone_kext(accel_p, ACCEL_KEXT, ACCEL_ID, ACCEL_EXECUTABLE, "accel")
+        _verify_fingerprint_doc(fp_p, expected_layout_id=lid)
+    if not seen_default:
+        raise IdentityError("defaultVariant {} not listed in variants/index.json".format(default_lid))
+
+    print("release_payload.verified=true")
+    print("release_payload.file_count={}".format(len(recorded)))
+    print("release_payload.default_layout_id={}".format(default_lid))
 
 
 def local_source_entry(repo, relative):
@@ -660,7 +911,17 @@ def build_parser():
     manifest.add_argument("--garnet-identity", required=True)
     manifest.add_argument("--accel-identity", required=True)
     manifest.add_argument("--pcibarcompat-identity")
+    manifest.add_argument("--release-mode", default="0")
+    manifest.add_argument("--target-silicon", default="")
+    manifest.add_argument("--target-pci-ids", default="")
+    manifest.add_argument("--default-layout-id", default="")
+    manifest.add_argument("--amd-firmware-license", default="")
+    manifest.add_argument("--default-accel-variant-path", default="")
     manifest.set_defaults(func=command_manifest)
+
+    verify_rel = subparsers.add_parser("verify-release-payload")
+    verify_rel.add_argument("payload")
+    verify_rel.set_defaults(func=command_verify_release_payload)
 
     local_source = subparsers.add_parser("local-source")
     local_source.add_argument("--repo", required=True)
