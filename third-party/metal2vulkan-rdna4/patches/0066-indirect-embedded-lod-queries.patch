@@ -1,0 +1,480 @@
+diff --git a/src/meta/embedded.rs b/src/meta/embedded.rs
+index 35cfa92..442947b 100644
+--- a/src/meta/embedded.rs
++++ b/src/meta/embedded.rs
+@@ -124,6 +124,8 @@ pub(super) fn body_uses_texture_intrinsic(ll: &str) -> bool {
+         || ll.contains("@air.read_texture")
+         || ll.contains("@air.write_texture")
+         || ll.contains("@air.write_imageblock_slice_to_texture")
++        || ll.contains("@air.calculate_clamped_lod_texture")
++        || ll.contains("@air.calculate_unclamped_lod_texture")
+ }
+ 
+ /// Scan each `air.indirect_buffer`'s `air.struct_type_info` for members marked
+@@ -582,6 +584,12 @@ mod tests {
+         assert!(body_uses_texture_intrinsic(
+             "call <4 x float> @air.gather_texture_2d(...)"
+         ));
++        assert!(body_uses_texture_intrinsic(
++            "call float @air.calculate_clamped_lod_texture_2d(...)"
++        ));
++        assert!(body_uses_texture_intrinsic(
++            "call float @air.calculate_unclamped_lod_texture_2d(...)"
++        ));
+         assert!(!body_uses_texture_intrinsic(
+             "declare void @unrelated_texture_helper()"
+         ));
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index 4c816a0..6f70edc 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -239,7 +239,11 @@ fn is_air_texture_operation(callee: &str) -> bool {
+ }
+ 
+ fn is_air_sampler_operand(callee: &str, index: usize) -> bool {
+-    index == 1 && (callee.starts_with("air.sample_") || callee.starts_with("air.gather_"))
++    index == 1
++        && (callee.starts_with("air.sample_")
++            || callee.starts_with("air.gather_")
++            || callee.starts_with("air.calculate_clamped_lod_texture")
++            || callee.starts_with("air.calculate_unclamped_lod_texture"))
+ }
+ 
+ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+diff --git a/src/passes/resources/discovery.rs b/src/passes/resources/discovery.rs
+index 6f4d9d0..e273415 100644
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -518,7 +518,11 @@ pub(in crate::passes) fn texture_dims(
+             let Some(name) = names.get(callee) else {
+                 continue;
+             };
+-            if name.starts_with("air.sample_") || name.starts_with("air.gather_") {
++            if name.starts_with("air.sample_")
++                || name.starts_with("air.gather_")
++                || name.starts_with("air.calculate_clamped_lod_texture")
++                || name.starts_with("air.calculate_unclamped_lod_texture")
++            {
+                 if let Some(Operand::IdRef(tex)) = inst.operands.get(1) {
+                     direction_sampled.insert(*tex);
+                 }
+@@ -526,6 +530,8 @@ pub(in crate::passes) fn texture_dims(
+             if !(name.starts_with("air.sample_texture")
+                 || name.starts_with("air.sample_depth")
+                 || name.starts_with("air.sample_compare_depth")
++                || name.starts_with("air.calculate_clamped_lod_texture")
++                || name.starts_with("air.calculate_unclamped_lod_texture")
+                 || name.starts_with("air.read_texture")
+                 || name.starts_with("air.read_depth")
+                 || crate::air_intrinsics::is_null_texture_intrinsic(name)
+@@ -801,7 +807,11 @@ fn texture_comp(name: &str) -> Option<ImageComp> {
+         Some(ImageComp::Uint)
+     } else if name.contains(".s.") {
+         Some(ImageComp::Sint)
+-    } else if is_size_query(name) || crate::air_intrinsics::is_null_texture_intrinsic(name) {
++    } else if is_size_query(name)
++        || crate::air_intrinsics::is_null_texture_intrinsic(name)
++        || name.starts_with("air.calculate_clamped_lod_texture")
++        || name.starts_with("air.calculate_unclamped_lod_texture")
++    {
+         None
+     } else {
+         Some(ImageComp::Float)
+diff --git a/src/passes/resources/lod_query/coordinates.rs b/src/passes/resources/lod_query/coordinates.rs
+index 9275e82..9465e7f 100644
+--- a/src/passes/resources/lod_query/coordinates.rs
++++ b/src/passes/resources/lod_query/coordinates.rs
+@@ -1,5 +1,189 @@
+ use super::*;
+ 
++pub(super) struct UnwrappedCoordinate {
++    pub raw: Word,
++    pub dead_candidates: Vec<Word>,
++}
++
++fn is_zero_constant(id: Word, defs: &HashMap<Word, Instruction>) -> bool {
++    let Some(def) = defs.get(&id) else {
++        return false;
++    };
++    def.class.opcode == Op::ConstantNull
++        || (def.class.opcode == Op::Constant
++            && def.operands.as_slice() == [Operand::LiteralBit32(0)])
++}
++
++/// Unwrap an earlier `normalize_sampler_coordinate` `OpSelect` when postpass re-lowers a fragment LOD query.
++pub(super) fn unwrap_normalized_query_coordinate(
++    coord: Word,
++    image: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Option<UnwrappedCoordinate> {
++    let select = defs.get(&coord)?;
++    if select.class.opcode != Op::Select {
++        return None;
++    }
++    let [Operand::IdRef(cond), Operand::IdRef(norm), Operand::IdRef(raw)] =
++        select.operands.as_slice()
++    else {
++        return None;
++    };
++    let construct = defs.get(norm)?;
++    if construct.class.opcode != Op::CompositeConstruct {
++        return None;
++    }
++    let [Operand::IdRef(div0), Operand::IdRef(div1)] = construct.operands.as_slice() else {
++        return None;
++    };
++    let mut size_query = None;
++    let mut dead = vec![coord, *norm];
++    for (axis, div_id) in [(0u32, *div0), (1u32, *div1)] {
++        let div = defs.get(&div_id)?;
++        if div.class.opcode != Op::FDiv {
++            return None;
++        }
++        let [Operand::IdRef(raw_comp), Operand::IdRef(u2f)] = div.operands.as_slice() else {
++            return None;
++        };
++        let raw_ext = defs.get(raw_comp)?;
++        if raw_ext.class.opcode != Op::CompositeExtract
++            || raw_ext.operands.as_slice() != [Operand::IdRef(*raw), Operand::LiteralBit32(axis)]
++        {
++            return None;
++        }
++        let convert = defs.get(u2f)?;
++        if convert.class.opcode != Op::ConvertUToF {
++            return None;
++        }
++        let [Operand::IdRef(size_ext_id)] = convert.operands.as_slice() else {
++            return None;
++        };
++        let size_ext = defs.get(size_ext_id)?;
++        if size_ext.class.opcode != Op::CompositeExtract {
++            return None;
++        }
++        let [Operand::IdRef(size_id), Operand::LiteralBit32(s_axis)] = size_ext.operands.as_slice()
++        else {
++            return None;
++        };
++        if *s_axis != axis {
++            return None;
++        }
++        if let Some(prev) = size_query {
++            if prev != *size_id {
++                return None;
++            }
++        } else {
++            size_query = Some(*size_id);
++        }
++        dead.extend([div_id, *raw_comp, *u2f, *size_ext_id]);
++    }
++    let size_id = size_query?;
++    let query = defs.get(&size_id)?;
++    if query.class.opcode != Op::ImageQuerySizeLod {
++        return None;
++    }
++    let [Operand::IdRef(query_img), Operand::IdRef(lod)] = query.operands.as_slice() else {
++        return None;
++    };
++    if *query_img != image || !is_zero_constant(*lod, defs) {
++        return None;
++    }
++    dead.push(size_id);
++    if let Some(neq) = defs.get(cond).filter(|i| i.class.opcode == Op::INotEqual) {
++        if let [Operand::IdRef(and_id), Operand::IdRef(zero_id)] = neq.operands.as_slice() {
++            if is_zero_constant(*zero_id, defs) {
++                if let Some(band) = defs
++                    .get(and_id)
++                    .filter(|i| i.class.opcode == Op::BitwiseAnd)
++                {
++                    dead.extend([*cond, *and_id]);
++                    if let Some(Operand::IdRef(flag_word)) = band.operands.first() {
++                        if let Some(load) =
++                            defs.get(flag_word).filter(|i| i.class.opcode == Op::Load)
++                        {
++                            dead.push(*flag_word);
++                            if let Some(Operand::IdRef(ptr)) = load.operands.first() {
++                                if defs.get(ptr).is_some_and(|i| {
++                                    matches!(
++                                        i.class.opcode,
++                                        Op::AccessChain | Op::InBoundsAccessChain
++                                    )
++                                }) {
++                                    dead.push(*ptr);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    Some(UnwrappedCoordinate {
++        raw: *raw,
++        dead_candidates: dead,
++    })
++}
++
++pub(super) fn prune_dead_candidates(ctx: &mut Ctx, function_index: usize, candidates: &[Word]) {
++    if candidates.is_empty() {
++        return;
++    }
++    let mut protected = HashSet::new();
++    for inst in ctx
++        .module
++        .annotations
++        .iter()
++        .chain(&ctx.module.debug_names)
++        .chain(&ctx.module.entry_points)
++        .chain(&ctx.module.execution_modes)
++        .chain(&ctx.module.types_global_values)
++    {
++        for op in &inst.operands {
++            if let Operand::IdRef(id) = op {
++                protected.insert(*id);
++            }
++        }
++    }
++    let candidate_set: HashSet<Word> = candidates
++        .iter()
++        .copied()
++        .filter(|id| !protected.contains(id))
++        .collect();
++    if candidate_set.is_empty() {
++        return;
++    }
++    loop {
++        let mut used = HashSet::new();
++        for block in &ctx.module.functions[function_index].blocks {
++            for inst in &block.instructions {
++                for op in &inst.operands {
++                    if let Operand::IdRef(id) = op {
++                        used.insert(*id);
++                    }
++                }
++            }
++        }
++        let mut removed = false;
++        for block in &mut ctx.module.functions[function_index].blocks {
++            let before = block.instructions.len();
++            block.instructions.retain(|inst| {
++                let Some(id) = inst.result_id else {
++                    return true;
++                };
++                !candidate_set.contains(&id) || used.contains(&id)
++            });
++            if block.instructions.len() != before {
++                removed = true;
++            }
++        }
++        if !removed {
++            break;
++        }
++    }
++}
++
+ pub(super) fn normalize_uniform_query(
+     ctx: &mut Ctx,
+     function_index: usize,
+@@ -27,6 +211,9 @@ pub(super) fn normalize_uniform_query(
+     else {
+         return Err("fragment LOD query sampled image has invalid operands".into());
+     };
++    if unwrap_normalized_query_coordinate(*coord, *image, &defs).is_some() {
++        return Ok(());
++    }
+     let mut prefix = Vec::new();
+     let zero = ctx.const_uint(0);
+     let normalized = crate::passes::air_calls::normalize_sampler_coordinate(
+@@ -483,7 +670,7 @@ pub(super) fn safe_image_index(
+         bool_type,
+         vec![Operand::IdRef(valid), Operand::IdRef(nonzero)],
+     );
+-    let dummy = if ctx.argument_table_version == 9 {
++    let dummy = if ctx.argument_table_version >= 9 {
+         ctx.null_descriptor_index(
+             ImageShape {
+                 dim: shape.dim,
+diff --git a/src/passes/resources/lod_query/enumeration.rs b/src/passes/resources/lod_query/enumeration.rs
+index cf51ab3..3ba49fa 100644
+--- a/src/passes/resources/lod_query/enumeration.rs
++++ b/src/passes/resources/lod_query/enumeration.rs
+@@ -8,7 +8,7 @@ pub(super) fn rewrite_query_as_enumeration(
+     rewrite: &QueryRewrite,
+     table: Word,
+     query_table: Word,
+-) -> Result<(), String> {
++) -> Result<Vec<Word>, String> {
+     let block = ctx.module.functions[function_index].blocks[block_index].clone();
+     if block
+         .instructions
+@@ -37,6 +37,11 @@ pub(super) fn rewrite_query_as_enumeration(
+     else {
+         return Err("fragment LOD query sampled image has invalid operands".into());
+     };
++    let (source_coord, dead_candidates) =
++        match unwrap_normalized_query_coordinate(*coord, *original_image, &defs) {
++            Some(unwrapped) => (unwrapped.raw, unwrapped.dead_candidates),
++            None => (*coord, Vec::new()),
++        };
+     let result_type = original
+         .result_type
+         .ok_or("fragment LOD query has no result type")?;
+@@ -318,7 +323,7 @@ pub(super) fn rewrite_query_as_enumeration(
+         image,
+         sampler,
+         rewrite.sampler.map(|_| inner_index),
+-        *coord,
++        source_coord,
+         zero,
+     )?;
+     let sampled_image = crate::passes::resources::gpu_arguments::value(
+@@ -471,7 +476,7 @@ pub(super) fn rewrite_query_as_enumeration(
+     ctx.module.functions[function_index]
+         .blocks
+         .splice(block_index + 1..block_index + 1, inserted);
+-    Ok(())
++    Ok(dead_candidates)
+ }
+ 
+ pub(super) fn repoint_phi_predecessor(function: &mut Function, old: Word, new: Word) {
+diff --git a/src/passes/resources/lod_query/mod.rs b/src/passes/resources/lod_query/mod.rs
+index 0af3b35..533123c 100644
+--- a/src/passes/resources/lod_query/mod.rs
++++ b/src/passes/resources/lod_query/mod.rs
+@@ -82,6 +82,7 @@ pub(in crate::passes) fn lower_argument_lod_queries(
+     // Enumeration and quad replay insert instructions before the query. Rewriting from the end
+     // keeps every as-yet-unprocessed site at the index reported by the original analysis.
+     sites.sort_unstable_by(|left, right| right.cmp(left));
++    let mut dead_by_function: HashMap<usize, Vec<Word>> = HashMap::new();
+     for (function_index, block_index, query_index) in sites {
+         let function_id = ctx.module.functions[function_index]
+             .def
+@@ -140,7 +141,7 @@ pub(in crate::passes) fn lower_argument_lod_queries(
+         }
+         let query_table = query_table.expect("query table synthesized above");
+ 
+-        match ctx.query_lod_replay {
++        let dead = match ctx.query_lod_replay {
+             QueryLodReplay::UniformOnly => {
+                 return Err(
+                     "fragment LOD query selects its descriptor from nonuniform GPU argument \
+@@ -149,20 +150,9 @@ pub(in crate::passes) fn lower_argument_lod_queries(
+                 );
+             }
+             QueryLodReplay::QuadBroadcast => {
+-                rewrite_quad_query(
+-                    ctx,
+-                    function_index,
+-                    block_index,
+-                    query_index,
+-                    &replay,
+-                    table,
+-                    query_table,
+-                )?;
+                 capabilities.insert(Capability::GroupNonUniform);
+                 capabilities.insert(Capability::GroupNonUniformQuad);
+-            }
+-            QueryLodReplay::DescriptorEnumeration => {
+-                rewrite_query_as_enumeration(
++                rewrite_quad_query(
+                     ctx,
+                     function_index,
+                     block_index,
+@@ -170,9 +160,25 @@ pub(in crate::passes) fn lower_argument_lod_queries(
+                     &replay,
+                     table,
+                     query_table,
+-                )?;
++                )?
+             }
+-        }
++            QueryLodReplay::DescriptorEnumeration => rewrite_query_as_enumeration(
++                ctx,
++                function_index,
++                block_index,
++                query_index,
++                &replay,
++                table,
++                query_table,
++            )?,
++        };
++        dead_by_function
++            .entry(function_index)
++            .or_default()
++            .extend(dead);
++    }
++    for (function_index, dead) in dead_by_function {
++        prune_dead_candidates(ctx, function_index, &dead);
+     }
+     for capability in capabilities {
+         ctx.add_capability(capability);
+diff --git a/src/passes/resources/lod_query/quad.rs b/src/passes/resources/lod_query/quad.rs
+index 0ea0665..11116b0 100644
+--- a/src/passes/resources/lod_query/quad.rs
++++ b/src/passes/resources/lod_query/quad.rs
+@@ -8,7 +8,7 @@ pub(super) fn rewrite_quad_query(
+     rewrite: &QueryRewrite,
+     table: Word,
+     query_table: Word,
+-) -> Result<(), String> {
++) -> Result<Vec<Word>, String> {
+     let original =
+         ctx.module.functions[function_index].blocks[block_index].instructions[query_index].clone();
+     let Some(Operand::IdRef(sampled)) = original.operands.first() else {
+@@ -110,6 +110,12 @@ pub(super) fn rewrite_quad_query(
+         )
+     });
+ 
++    let (source_coord, dead_candidates) =
++        match unwrap_normalized_query_coordinate(*coord, *original_image, &defs) {
++            Some(unwrapped) => (unwrapped.raw, unwrapped.dead_candidates),
++            None => (*coord, Vec::new()),
++        };
++
+     let mut broadcasts = [0; QUAD_LANES];
+     let mut sampler_broadcasts = [0; QUAD_LANES];
+     let mut queries = [0; QUAD_LANES];
+@@ -152,7 +158,7 @@ pub(super) fn rewrite_quad_query(
+             image,
+             sampler,
+             rewrite.sampler.map(|_| sampler_index),
+-            *coord,
++            source_coord,
+             zero,
+         )?;
+         let sampled_image = crate::passes::resources::gpu_arguments::value(
+@@ -238,5 +244,5 @@ pub(super) fn rewrite_quad_query(
+     ));
+     let instructions = &mut ctx.module.functions[function_index].blocks[block_index].instructions;
+     instructions.splice(query_index..=query_index, prefix);
+-    Ok(())
++    Ok(dead_candidates)
+ }
+diff --git a/src/passes/resources/texture_array.rs b/src/passes/resources/texture_array.rs
+index 4d83404..abc692c 100644
+--- a/src/passes/resources/texture_array.rs
++++ b/src/passes/resources/texture_array.rs
+@@ -506,6 +506,8 @@ fn is_texture_intrinsic(name: &str) -> bool {
+         || name.starts_with("air.get_num_mip_levels_depth")
+         || name.starts_with("air.get_num_samples_texture")
+         || name.starts_with("air.get_num_samples_depth")
++        || name.starts_with("air.calculate_clamped_lod_texture")
++        || name.starts_with("air.calculate_unclamped_lod_texture")
+         || crate::air_intrinsics::is_null_texture_intrinsic(name)
+ }
+ fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index ceca89c..6185383 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -2794,7 +2794,10 @@ fn register_embedded_sampler_array(
+                 match (inst.operands.first(), inst.operands.get(2)) {
+                     (Some(Operand::IdRef(callee)), Some(Operand::IdRef(handle)))
+                         if names.get(callee).is_some_and(|name| {
+-                            name.starts_with("air.sample_") || name.starts_with("air.gather_")
++                            name.starts_with("air.sample_")
++                                || name.starts_with("air.gather_")
++                                || name.starts_with("air.calculate_clamped_lod_texture")
++                                || name.starts_with("air.calculate_unclamped_lod_texture")
+                         }) =>
+                     {
+                         handles.get(handle).copied()

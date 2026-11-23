@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0065).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0066).
 
 Verification and Tier 2 Scope
 =============================
@@ -17,6 +17,20 @@ version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
 translation and metadata invariants only; they do not establish physical RDNA4
 GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
 stays controlled by the native bundle and compatibility runner.
+
+0066-indirect-embedded-lod-queries.patch extends the indirect embedded-resource
+gates (`body_uses_texture_intrinsic`, `is_air_sampler_operand`,
+`register_embedded_samplers`, `texture_array::is_texture_intrinsic`, and
+`discovery.rs`) to recognize query-only `air.calculate_clamped_lod_texture*`
+and `air.calculate_unclamped_lod_texture*` uses inside structured argument
+buffers (with AIR metadata providing the component type rather than assuming
+float), unwraps prior `normalize_sampler_coordinate` selections when postpass
+re-runs `lower_argument_lod_queries` (preventing double normalization and
+pruning dead pre-postpass size queries), and fixes `lod_query/coordinates.rs`
+to use ABI 9+ null-shape dummy indices for `argument_table_version >= 9`
+(including ABI 10) rather than `== 9`. Dynamic untyped graphs without a known
+component/access type remain rejected. User cache tag:
+rdna4x-52-indirect-embedded-lod-queries.
 
 0063-widen-fragment-color-outputs.patch converts half-precision fragment color
 values to float32 at attachment stores. Internal half arithmetic and attachment
@@ -399,9 +413,11 @@ Cache tag: rdna4x-40-coordinate-identities; postpass: rdna4x-argument-resources-
   arrays under table ABI 10, fixes AIR texture-buffer read parsing so its final
   access selector is not mistaken for a mip LOD, and preserves the ABI 9 null-shape
   registry in ABI 10 metadata. Synthetic float read/write graphs validate as Vulkan
-  1.2 SPIR-V and round-trip through the translator metadata type. The current native
-  argument-table consumer still rejects ABI 10 and does not publish live dynamic
-  VkBufferView descriptors.
+  1.2 SPIR-V and round-trip through the translator metadata type. Native ABI 10
+  metadata, layout, and dynamic VkBufferView descriptor publication are wired in
+  `src/garnet-metal/{rdna4_argument_tables.inc,rdna4_argument_table_commands.inc}`
+  and gated via `rdna4ns_registry_build_abi`, while live RDNA4 GPU execution of
+  ABI 10 dynamic texel graphs remains pending in Tier 2 verification.
   Cache tag: rdna4x-47-dynamic-texel; postpass: rdna4x-argument-resources-47-dynamic-texel.
 
 0061-nested-buffer-element-paths.patch
@@ -430,3 +446,23 @@ Cache tag: rdna4x-40-coordinate-identities; postpass: rdna4x-argument-resources-
   iconservicesagent request also replays successfully with this correction;
   that translation result alone does not establish correct desktop pixels.
   Cache tag: rdna4x-49-constant-helper-addresses; postpass identity unchanged.
+
+0063-widen-fragment-color-outputs.patch
+  Widens 16-bit half scalar and vector fragment color outputs at location
+  attachments to 32-bit float SPIR-V interface variables in
+  `src/passes/stage_output/mod.rs` and emits `OpFConvert` on stores, with unit
+  test `half_fragment_color_outputs_use_float_interface`.
+
+0064-preserve-linked-static-samplers.patch
+  Preserves and renames `!air.sampler_states` static sampler metadata globals
+  when appending linked dependency modules in `src/linked_functions.rs` and
+  exposes shared lookup helpers in `src/reflect/mod.rs`.
+
+0065-do-not-cache-forward-select-edge-address.patch
+  Stops caching latch-local forward BDA `OpSelect` IDs into
+  `bda_direct_addresses` in `src/native/emitter/pointers/phi_merge.rs`, fixing
+  loop-exit phi dominance regression
+  `native_bda_forward_pointer_select_does_not_poison_loop_exit_phi` in
+  `src/native/tests/buffers.rs`. Current cache tag:
+  `rdna4x-51-forward-select-edge-addr`; postpass identity:
+  `rdna4x-argument-resources-47-dynamic-texel`.

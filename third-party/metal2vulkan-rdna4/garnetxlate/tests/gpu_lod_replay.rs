@@ -583,3 +583,65 @@ fn both_replay_paths_validate_clamped_and_unclamped_query_components() {
         }
     }
 }
+
+#[test]
+fn embedded_query_only_argument_buffers_work_under_both_replay_paths() {
+    let base = include_str!("fixtures/abi8/sampler-fragment-indirect.ll")
+        .replace("!{!\"Metal\", i32 2, i32 1, i32 0}", "!{!\"Metal\", i32 2, i32 2, i32 0}")
+        .replace(
+            "  %3 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %agg.tmp.sroa.0.0.copyload, <2 x float> %mul, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #2\n  %4 = extractvalue { <4 x float>, i8 } %3, 0\n  ret <4 x float> %4",
+            "  %clamped = tail call float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %agg.tmp.sroa.0.0.copyload, <2 x float> %mul, i32 0) #2\n  %unclamped = tail call float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %agg.tmp.sroa.0.0.copyload, <2 x float> %mul, i32 0) #2\n  %v0 = insertelement <4 x float> zeroinitializer, float %clamped, i32 0\n  %v1 = insertelement <4 x float> %v0, float %unclamped, i32 1\n  ret <4 x float> %v1",
+        )
+        .replace(
+            "declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i1, <2 x i32>, i1, float, float, i32) local_unnamed_addr #1",
+            "declare float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i32) local_unnamed_addr #1\ndeclare float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i32) local_unnamed_addr #1",
+        );
+    let divergent = base.replace(
+        "  %0 = load i32, ptr addrspace(2) %flip, align 4, !tbaa !24, !alias.scope !28, !noalias !31",
+        "  %px = extractelement <4 x float> %position, i32 0\n  %0 = fptoui float %px to i32",
+    );
+    for (label, source, expect_divergent) in
+        [("uniform", &base, false), ("divergent", &divergent, true)]
+    {
+        for quad in [true, false] {
+            let caps = garnetxlate::RDNA4xBackendCapabilities {
+                subgroup_supported_operations: if quad { 0x80 } else { 0 },
+                ..capabilities()
+            };
+            let (spv, metadata) = translate_c(source, Some(caps), false)
+                .expect("query-only embedded argument buffer should translate");
+            let (postpass_spv, postpass_meta) = garnetxlate::lower_gpu_arguments_with_capabilities(
+                &spv, &metadata, caps,
+            )
+            .expect("query-only embedded argument buffer should lower through ABI 9+ postpass");
+            let assembly = disassemble(
+                &postpass_spv,
+                &format!("embedded-query-only-{label}-{quad}"),
+            );
+            assert!(assembly.contains("DescriptorSet 2"), "{assembly}");
+            assert!(assembly.contains("DescriptorSet 4"), "{assembly}");
+            let queries = count(&assembly, "OpImageQueryLod");
+            assert!(queries >= 2, "{assembly}");
+            assert_eq!(
+                count(&assembly, "OpImageQuerySizeLod"),
+                queries,
+                "postpass double-normalized or kept dead size query\n{assembly}"
+            );
+            assert_eq!(
+                assembly.contains("OpGroupNonUniformQuadBroadcast"),
+                expect_divergent && quad,
+                "{assembly}"
+            );
+            let postpass_meta: serde_json::Value = serde_json::from_slice(&postpass_meta).unwrap();
+            assert_eq!(postpass_meta["argument_resource_tables"]["version"], 9);
+            assert_eq!(
+                postpass_meta["argument_resource_tables"]["image_query_binding"],
+                if expect_divergent {
+                    serde_json::json!(673)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+        }
+    }
+}
