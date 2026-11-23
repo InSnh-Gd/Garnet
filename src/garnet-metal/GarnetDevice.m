@@ -1006,8 +1006,35 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (BOOL)supportsTextureSampleCount:(NSUInteger)n { return [self supportsSampleCount:n]; }
 - (NSUInteger)iosurfaceTextureAlignmentBytes { return 32; }
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)pf { (void)pf; return 256; }
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf { (void)pf; return 256; }
 - (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
 - (BOOL)supportsUnalignedVertexFetch { return YES; }
+- (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier2; }
+- (BOOL)areProgrammableSamplePositionsSupported { return RDNA4R.ok ? RDNA4R.sampleLocationsExt : YES; }
+- (BOOL)areRasterOrderGroupsSupported { return RDNA4R.ok ? RDNA4R.fragInterlock : YES; }
+- (BOOL)supportsBCTextureCompression { return RDNA4R.ok ? RDNA4R.bcCompression : YES; }
+- (BOOL)supports32BitFloatFiltering { return YES; }
+- (BOOL)supports32BitMSAA { return YES; }
+- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }
+- (BOOL)supportsRaytracing { return NO; }
+- (BOOL)supportsRaytracingFromRender { return NO; }
+- (BOOL)supportsPrimitiveMotionBlur { return NO; }
+- (BOOL)supportsFunctionPointers { return NO; }
+- (BOOL)supportsFunctionPointersFromRender { return NO; }
+- (BOOL)supportsPullModelInterpolation { return NO; }
+- (BOOL)supportsShaderBarycentricCoordinates { return NO; }
+- (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
+    if (!positions) return;
+    static const MTLSamplePosition p1[1] = { { 0.5f, 0.5f } };
+    static const MTLSamplePosition p2[2] = { { 0.75f, 0.75f }, { 0.25f, 0.25f } };
+    static const MTLSamplePosition p4[4] = { { 0.375f, 0.125f }, { 0.875f, 0.375f }, { 0.125f, 0.625f }, { 0.625f, 0.875f } };
+    static const MTLSamplePosition p8[8] = {
+        { 0.5625f, 0.3125f }, { 0.4375f, 0.6875f }, { 0.8125f, 0.5625f }, { 0.3125f, 0.1875f },
+        { 0.1875f, 0.8125f }, { 0.0625f, 0.4375f }, { 0.6875f, 0.9375f }, { 0.9375f, 0.0625f }
+    };
+    const MTLSamplePosition *src = count == 1 ? p1 : count == 2 ? p2 : count == 4 ? p4 : count == 8 ? p8 : NULL;
+    if (src) memcpy(positions, src, count * sizeof(*positions));
+}
 - (id)newGLDrawable {
     rdna4_gl_surfaces_install();
     return [GarnetGLDrawable new];
@@ -1211,6 +1238,8 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     if (family == RDNA4G_FAMILY_METAL3 && !rdna4_is_ws()) RDNA4_ONCE("supportsFamily(Metal3) -> NO for this application: argument-buffer support is incomplete (WindowServer keeps YES)");
     return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;   // Apple1..9 (1001..1009), Mac1, MacCatalyst, Metal3, Metal4, unknown -> NO
 }
+- (BOOL)supportsFeatureSet:(NSUInteger)featureSet { return rdna4g_supports_feature_set((unsigned long)featureSet) ? YES : NO; }
+- (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet { return [self supportsFeatureSet:featureSet]; }
 // Tier 2 argument buffers (MTLArgumentBuffersTier2 == 1) for applications; WindowServer keeps the base class's answer.
 - (NSUInteger)argumentBuffersSupport {
     if (rdna4_is_ws()) {   // the base class's answer, as before build 6 (it is not in our private header, so ask the runtime)

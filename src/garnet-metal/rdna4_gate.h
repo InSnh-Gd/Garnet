@@ -280,4 +280,15 @@ static inline int rdna4g_supports_family(long family, int isWs) {
     }
 }
 
+#define RDNA4G_FS_MACOS_GPUFAMILY1_V1 10000ul
+#define RDNA4G_FS_MACOS_GPUFAMILY1_V2 10001ul
+#define RDNA4G_FS_MACOS_RW_TEXTURE_T2 10002ul
+#define RDNA4G_FS_MACOS_GPUFAMILY1_V3 10003ul
+#define RDNA4G_FS_MACOS_GPUFAMILY1_V4 10004ul
+#define RDNA4G_FS_MACOS_GPUFAMILY2_V1 10005ul
+
+static inline int rdna4g_supports_feature_set(unsigned long fs) {
+    return fs >= RDNA4G_FS_MACOS_GPUFAMILY1_V1 && fs <= RDNA4G_FS_MACOS_GPUFAMILY2_V1;
+}
+
 #endif /* RDNA4_GATE_H */

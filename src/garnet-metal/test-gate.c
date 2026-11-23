@@ -155,6 +155,20 @@ int main(int argc, char **argv) {
       for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | (no[i] != RDNA4G_FAMILY_METAL3 ? rdna4g_supports_family(no[i], 1) : 0);
       CHECK("G14: Apple1..9, Mac1, MacCatalyst, Metal3, Metal4 and unknown values are all NO", !any); }
     CHECK("G14: argument buffer tier constants", RDNA4G_ARGBUF_TIER1 == 0 && RDNA4G_ARGBUF_TIER2 == 1);
+    { static const unsigned long yes_fs[] = {
+          RDNA4G_FS_MACOS_GPUFAMILY1_V1, RDNA4G_FS_MACOS_GPUFAMILY1_V2,
+          RDNA4G_FS_MACOS_RW_TEXTURE_T2, RDNA4G_FS_MACOS_GPUFAMILY1_V3,
+          RDNA4G_FS_MACOS_GPUFAMILY1_V4, RDNA4G_FS_MACOS_GPUFAMILY2_V1
+      };
+      int all_fs = 1;
+      for (unsigned i = 0; i < sizeof yes_fs / sizeof yes_fs[0]; i++)
+          all_fs &= rdna4g_supports_feature_set(yes_fs[i]);
+      CHECK("G14: macOS feature sets 10000..10005 are YES", all_fs);
+      static const unsigned long no_fs[] = { 0, 1, 9999, 10006, 20000, 30000, 99999 };
+      int any_bad_fs = 0;
+      for (unsigned i = 0; i < sizeof no_fs / sizeof no_fs[0]; i++)
+          any_bad_fs |= rdna4g_supports_feature_set(no_fs[i]);
+      CHECK("G14: iOS/tvOS/out-of-range feature sets are NO", !any_bad_fs); }
     // ---- G15 (bundle 8, G6): sandboxed applications open RDNA4N on the accelerator port the bundle holds ----
     CHECK("G15: WindowServer keeps Mesa's default service (no setter call)", rdna4g_mesa_service_for_class(RDNA4G_CLASS_WS) == NULL);
     CHECK("G15: an RDNA4M_ALLOW root tool keeps Mesa's default service", rdna4g_mesa_service_for_class(RDNA4G_CLASS_ROOT) == NULL);
@@ -165,6 +179,24 @@ int main(int argc, char **argv) {
     { char *pl = slurp(dir, "Info.plist");
       CHECK("G11: Info.plist: bundle version 0.1.1, build 43", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"));
       free(pl); }
+    { char *gm = slurp(dir, "GarnetDevice.m");
+      CHECK("G14: GarnetDevice.m exposes Metal2 capability and out-of-scope selectors",
+            gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
+               && strstr(gm, "- (BOOL)supportsBCTextureCompression")
+               && strstr(gm, "- (BOOL)supports32BitFloatFiltering")
+               && strstr(gm, "- (BOOL)supports32BitMSAA")
+               && strstr(gm, "- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }")
+               && strstr(gm, "- (BOOL)supportsRaytracing { return NO; }")
+               && strstr(gm, "- (BOOL)supportsRaytracingFromRender { return NO; }")
+               && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return NO; }")
+               && strstr(gm, "- (BOOL)supportsFunctionPointers { return NO; }")
+               && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return NO; }")
+               && strstr(gm, "- (BOOL)supportsPullModelInterpolation { return NO; }")
+               && strstr(gm, "- (BOOL)supportsShaderBarycentricCoordinates { return NO; }")
+               && strstr(gm, "- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf")
+               && strstr(gm, "- (BOOL)supportsFeatureSet:(NSUInteger)featureSet")
+               && strstr(gm, "- (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet"));
+      free(gm); }
     // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----
     CHECK("G16: denylist applies only to class OTHER (WindowServer & RDNA4M_ALLOW=1 root immune)",
           !rdna4g_denylist_applies(RDNA4G_CLASS_WS) && !rdna4g_denylist_applies(RDNA4G_CLASS_ROOT) && rdna4g_denylist_applies(RDNA4G_CLASS_OTHER));
