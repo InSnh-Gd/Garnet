@@ -18,13 +18,22 @@ static inline uint32_t rdna4if_clear_u(double v, unsigned bits) {
     return (uint32_t)v;                        // truncate toward zero
 }
 
-// Signed 32-bit clears preserve the sign and saturate before the integer cast.
-static inline int32_t rdna4if_clear_s32(double v) {
+// Signed integer clears preserve sign, truncate toward zero, and saturate to [-(2^(bits-1)), 2^(bits-1)-1].
+static inline int32_t rdna4if_clear_s(double v, unsigned bits) {
     if (v != v) return 0;
-    if (v <= (double)INT32_MIN) return INT32_MIN;
-    if (v >= (double)INT32_MAX) return INT32_MAX;
+    if (bits >= 32) {
+        if (v <= (double)INT32_MIN) return INT32_MIN;
+        if (v >= (double)INT32_MAX) return INT32_MAX;
+        return (int32_t)v;
+    }
+    const int64_t lo = -(INT64_C(1) << (bits - 1));
+    const int64_t hi = (INT64_C(1) << (bits - 1)) - 1;
+    if (v <= (double)lo) return (int32_t)lo;
+    if (v >= (double)hi) return (int32_t)hi;
     return (int32_t)v;
 }
+
+static inline int32_t rdna4if_clear_s32(double v) { return rdna4if_clear_s(v, 32); }
 
 // The colour write mask of one pipeline attachment: `wm` is the mask the descriptor asked for (VkColorComponentFlags bits). A FALLBACK pipeline (the built-in float magenta shader) must not
 // write into an integer attachment, so its mask is 0 there; real pipelines and float attachments keep the descriptor's mask unchanged.

@@ -82,14 +82,19 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
 @end
 
 @interface RDNA4RenderEncoder : _MTLCommandEncoder {
-    RDNA4CommandBuffer *_cb; BOOL _ended, _inPass, _begun, _hostWriteDropped; uint32_t _roWarnV, _roWarnF; uint32_t _w, _h, _na; NSString *_lbl;
+    RDNA4CommandBuffer *_cb; BOOL _ended, _inPass, _begun, _hostWriteDropped; uint32_t _roWarnV, _roWarnF; uint32_t _w, _h, _na, _layers; NSString *_lbl;
     VkRenderPass _rp1; BOOL _rp1c; VkFramebuffer _fb, _fbf; VkClearValue _cvs[9]; VkAttachmentDescription _ads[9];
     RDNA4RenderHandles *_baseHandles, *_fetchHandles;
     VkImageView _views[9]; RDNA4Texture *_tex[9]; VkImageLayout _curLay[9]; BOOL _fetch;   // bundle 10: slot [_na] is the depth/stencil attachment when _nd == 1; 11e-2: _fetch = the current/next pass is the framebuffer-fetch shape
     uint32_t _nd; VkFormat _dsVkFmt; unsigned _encSamples;   // bundle 10: depth/stencil attachment present; its VkFormat (UNDEFINED = none); the pass's sample count (0 until the first attachment, then >= 1)
     id _rtex[8]; uint32_t _slvl[8], _sslice[8], _rlvl[8], _rslice[8]; NSUInteger _sact[8];   // bundle 10: per colour attachment the resolve texture (+ level, slice), its source level / slice and the store action
+    id _drtex, _srtex; uint32_t _dlvl, _dslice, _drlvl, _drslice, _srlvl, _srslice; NSUInteger _dsact, _ssact, _dresFilter, _sresFilter;
     RDNA4DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
-    RDNA4RenderPipelineState *_pso; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf; MTLViewport _vp; MTLScissorRect _sr; float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
+    RDNA4RenderPipelineState *_pso; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf;
+    MTLViewport _vp, _vps[16]; uint32_t _nvp; MTLScissorRect _sr, _srs[16]; uint32_t _nsr;
+    MTLTriangleFillMode _fillMode; MTLDepthClipMode _depthClipMode;
+    BOOL _hasSamplePos; MTLSamplePosition _samplePos[8]; uint32_t _samplePosCount;
+    float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
     id _tessFactorBuf; NSUInteger _tessFactorOff, _tessFactorStride; float _tessFactorScale;
     NSMutableSet *_samplerBindings;
     rdna4dc_enc _dc; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcOn = the rdna4m-drawopt switch as latched at device creation)
@@ -104,12 +109,58 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
 @end
 
 @implementation RDNA4RenderEncoder
+- (BOOL)rdna4CheckDSResolve:(BOOL)isDepth {
+    if (!_nd) return NO;
+    RDNA4Texture *src = _tex[_na]; id r = isDepth ? _drtex : _srtex;
+    uint32_t rlvl = isDepth ? _drlvl : _srlvl, rslice = isDepth ? _drslice : _srslice;
+    NSUInteger filter = isDepth ? _dresFilter : _sresFilter;
+    if (!RDNA4R.ok || !vkCreateRenderPass2 || !vkCmdBeginRenderPass2 || !vkCmdEndRenderPass2) {
+        RDNA4LOG("render pass: depth/stencil resolve requires Vulkan 1.2 renderPass2; refused"); return NO;
+    }
+    if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: %s resolve texture is not an RDNA4Texture; refused", isDepth ? "depth" : "stencil"); return NO; }
+    RDNA4Texture *dst = r;
+    if (dst == src || [dst rdna4IsView] || [dst textureType] == MTLTextureType3D) {
+        RDNA4LOG("render pass: %s resolve texture is self, a view or a 3D texture; refused", isDepth ? "depth" : "stencil"); return NO;
+    }
+    if (rlvl >= [dst mipmapLevelCount] || rslice + _layers > [dst rdna4Layers]) {
+        RDNA4LOG("render pass: %s resolve level %u slice %u+%u outside resolve texture; refused", isDepth ? "depth" : "stencil", rlvl, rslice, _layers); return NO;
+    }
+    unsigned sw = (unsigned)MAX((NSUInteger)1, src.width >> _dlvl), sh = (unsigned)MAX((NSUInteger)1, src.height >> _dlvl);
+    unsigned dw = (unsigned)MAX((NSUInteger)1, dst.width >> rlvl), dh = (unsigned)MAX((NSUInteger)1, dst.height >> rlvl);
+    VkFormat svkf = [src vkFormat], dvkf = [dst vkFormat];
+    BOOL compatFmt = (svkf == dvkf) || (svkf == VK_FORMAT_D32_SFLOAT_S8_UINT && ((isDepth && dvkf == VK_FORMAT_D32_SFLOAT) || (!isDepth && dvkf == VK_FORMAT_S8_UINT)));
+    const char *why = NULL;
+    if (!rdna4sa_ds_target_ok(sw, sh, (unsigned)svkf, dw, dh, compatFmt ? (unsigned)svkf : (unsigned)dvkf, (unsigned)[dst rdna4Samples], &why)) {
+        RDNA4LOG("render pass: %s resolve: %s; refused", isDepth ? "depth" : "stencil", why); return NO;
+    }
+    if (isDepth) {
+        VkResolveModeFlagBits rm = filter == 1 ? VK_RESOLVE_MODE_MIN_BIT : filter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        if (filter > 2 || !(RDNA4R.depthResolveModes & rm)) {
+            RDNA4LOG("render pass: depthResolveFilter %lu is not supported on RADV (modes 0x%x); refused", (unsigned long)filter, RDNA4R.depthResolveModes); return NO;
+        }
+    } else {
+        if (filter != 0) {
+            RDNA4LOG("render pass: stencilResolveFilter %lu (DepthResolvedSample) is not supported on Vulkan; refused", (unsigned long)filter); return NO;
+        }
+        if (!(RDNA4R.stencilResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)) {
+            RDNA4LOG("render pass: stencil Sample0 resolve is not supported on RADV (modes 0x%x); refused", RDNA4R.stencilResolveModes); return NO;
+        }
+    }
+    return YES;
+}
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d {
     self = [super initWithCommandBuffer:cb];
     if (!self) return nil;
     _cb = cb; _wind = MTLWindingClockwise; _tessFactorScale = 1.0f;
+    _fillMode = MTLTriangleFillModeFill; _depthClipMode = MTLDepthClipModeClip;
     _resourceBindings = [RDNA4ResourceBindings new];
     _resourceSegmentSerial = [_cb rdna4SegmentSerial];
+    NSUInteger reqLayers = [d respondsToSelector:@selector(renderTargetArrayLength)] ? d.renderTargetArrayLength : 0;
+    if (reqLayers && (!RDNA4R.ok || reqLayers > RDNA4R.lim.maxFramebufferLayers)) {
+        RDNA4LOG("render pass: renderTargetArrayLength %lu exceeds RADV maxFramebufferLayers %u; refused", (unsigned long)reqLayers, RDNA4R.lim.maxFramebufferLayers);
+        return nil;
+    }
+    _layers = reqLayers ? (uint32_t)reqLayers : 1u;
     // Keep attachment indices and render-pass compatibility intact: an unsafe pass records nothing.
     for (NSUInteger i = 0; i < 8; i++) {
         id texture = d.colorAttachments[i].texture;
@@ -137,7 +188,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         _encSamples = (unsigned)tsm;
         // m11h9: a mip level of a 2D texture can be the attachment (the compositor renders into the base level of mipmapped textures and generates the rest)
         NSUInteger lvl = ca.level;
-        if (lvl >= [t mipmapLevelCount] || ca.slice >= [t rdna4Layers] || ca.depthPlane != 0) { RDNA4LOG("render pass: attachment %lu level %lu slice %lu depthPlane %lu outside the texture (%lu level(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount]); return nil; }
+        if (lvl >= [t mipmapLevelCount] || ca.slice >= [t rdna4Layers] || _layers > [t rdna4Layers] - ca.slice || ca.depthPlane != 0) { RDNA4LOG("render pass: attachment %lu level %lu slice %lu+%u depthPlane %lu outside the texture (%lu level(s), %u slice(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, _layers, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return nil; }
         const NSUInteger attachmentWidth = MAX((NSUInteger)1, t.width >> lvl);
         const NSUInteger attachmentHeight = MAX((NSUInteger)1, t.height >> lvl);
         if (na == 0) { _w = (uint32_t)attachmentWidth; _h = (uint32_t)attachmentHeight; }
@@ -161,15 +212,19 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
                 (load || preserveOutsideClear ? [t layout] : VK_IMAGE_LAYOUT_UNDEFINED),
             .finalLayout = attachmentLayout };
         if (ca.loadAction == MTLLoadActionClear) _clrm |= 1u << na;
-        views[na] = [t rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)ca.slice]; _views[na] = views[na]; _tex[na] = t; _sf.att[na] = t;
+        views[na] = _layers > 1
+            ? [t rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)ca.slice layerCount:_layers]
+            : [t rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)ca.slice];
+        _views[na] = views[na]; _tex[na] = t; _sf.att[na] = t;
         [self rdna4OwnResource:t kind:RDNA4_RESOURCE_ATTACHMENT
                       fragment:NO index:na];
         MTLClearColor c = ca.clearColor;
         if ([t rdna4IsUInt]) {   // bundle 19: an integer attachment is cleared through .uint32 with Metal's conversion (truncate, saturate; measured on an Apple-silicon Mac, rdna4_intfmt.h); .float32 would put float bits in the texture
-            unsigned bits = [t rdna4UIntBits];
-            _cvs[na] = (VkClearValue){ .color = { .uint32 = { rdna4if_clear_u(c.red, bits), rdna4if_clear_u(c.green, bits), rdna4if_clear_u(c.blue, bits), rdna4if_clear_u(c.alpha, bits) } } };
+            unsigned rgbB = 16, aB = 16; [t rdna4IntBitsRGB:&rgbB alpha:&aB];
+            _cvs[na] = (VkClearValue){ .color = { .uint32 = { rdna4if_clear_u(c.red, rgbB), rdna4if_clear_u(c.green, rgbB), rdna4if_clear_u(c.blue, rgbB), rdna4if_clear_u(c.alpha, aB) } } };
         } else if ([t rdna4IsSInt]) {
-            _cvs[na] = (VkClearValue){ .color = { .int32 = { rdna4if_clear_s32(c.red), rdna4if_clear_s32(c.green), rdna4if_clear_s32(c.blue), rdna4if_clear_s32(c.alpha) } } };
+            unsigned rgbB = 32, aB = 32; [t rdna4IntBitsRGB:&rgbB alpha:&aB];
+            _cvs[na] = (VkClearValue){ .color = { .int32 = { rdna4if_clear_s(c.red, rgbB), rdna4if_clear_s(c.green, rgbB), rdna4if_clear_s(c.blue, rgbB), rdna4if_clear_s(c.alpha, aB) } } };
         } else
         _cvs[na] = (VkClearValue){ .color = { .float32 = { (float)c.red, (float)c.green, (float)c.blue, (float)c.alpha } } };
         [t setLayout:attachmentLayout];
@@ -192,21 +247,16 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         RDNA4Texture *dt = ti; unsigned asp = [dt rdna4Aspects];
         if (![dt rdna4IsDS]) { RDNA4LOG("render pass: the depth/stencil attachment texture has a colour pixel format; refused"); return nil; }
         if ((dtI && !(asp & RDNA4DP_ASP_DEPTH)) || (stI && !(asp & RDNA4DP_ASP_STENCIL))) { RDNA4LOG("render pass: the %s attachment texture (pixel format %lu) has no %s aspect; refused", dtI ? "depth" : "stencil", (unsigned long)dt.pixelFormat, dtI ? "depth" : "stencil"); return nil; }
-        if ([dt rdna4IsView] && asp != rdna4dp_view_aspect(asp)) { RDNA4LOG("render pass: a view of a combined depth/stencil texture cannot be an attachment; refused"); return nil; }
+        if ([dt rdna4IsView] && ([dt pixelFormat] == MTLPixelFormatX32_Stencil8 || asp != rdna4dp_view_aspect(asp))) { RDNA4LOG("render pass: a view of a combined depth/stencil texture cannot be an attachment; refused"); return nil; }
         if (dtI && stI && (da.level != sa.level || da.slice != sa.slice)) { RDNA4LOG("render pass: the depth and stencil attachments name different levels / slices; refused"); return nil; }
         NSUInteger lvl = dtI ? da.level : sa.level, slc = dtI ? da.slice : sa.slice, dpl = dtI ? da.depthPlane : sa.depthPlane;
-        if (lvl >= [dt mipmapLevelCount] || slc >= [dt rdna4Layers] || dpl != 0) { RDNA4LOG("render pass: the depth/stencil attachment level %lu slice %lu depthPlane %lu is outside the texture; refused", (unsigned long)lvl, (unsigned long)slc, (unsigned long)dpl); return nil; }
+        if (lvl >= [dt mipmapLevelCount] || slc >= [dt rdna4Layers] || _layers > [dt rdna4Layers] - slc || dpl != 0) { RDNA4LOG("render pass: the depth/stencil attachment level %lu slice %lu+%u depthPlane %lu is outside the texture; refused", (unsigned long)lvl, (unsigned long)slc, _layers, (unsigned long)dpl); return nil; }
         NSUInteger tsm = [dt rdna4Samples];
         if (_encSamples && tsm != _encSamples) { RDNA4LOG("render pass: the depth/stencil attachment has %lu samples, the colour attachments %u; refused", (unsigned long)tsm, _encSamples); return nil; }
         _encSamples = (unsigned)tsm;
         uint32_t dw = (uint32_t)MAX((NSUInteger)1, dt.width >> lvl), dh = (uint32_t)MAX((NSUInteger)1, dt.height >> lvl);
         if (na == 0) { _w = dw; _h = dh; }
         else if (dw < _w || dh < _h) { RDNA4LOG("render pass: the depth/stencil attachment (%ux%u) is smaller than the colour attachments (%ux%u); refused", dw, dh, _w, _h); return nil; }
-        { rdna4sa_t sat; const char *rw = NULL;
-          if (dtI && !rdna4sa_map((unsigned long)da.storeAction, da.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: depth attachment: %s; refused", sat.why); return nil; }
-          if (dtI && sat.resolve) { (void)rdna4sa_target_ok(dw, dh, [dt vkFormat], asp, dw, dh, [dt vkFormat], 1, &rw); RDNA4LOG("render pass: depth attachment resolve: %s; refused", rw); return nil; }
-          if (stI && !rdna4sa_map((unsigned long)sa.storeAction, sa.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: stencil attachment: %s; refused", sat.why); return nil; }
-          if (stI && sat.resolve) { (void)rdna4sa_target_ok(dw, dh, [dt vkFormat], asp, dw, dh, [dt vkFormat], 1, &rw); RDNA4LOG("render pass: stencil attachment resolve: %s; refused", rw); return nil; } }
         rdna4rp_ds_t ops; rdna4rp_ds(asp, dtI != nil, (unsigned)da.loadAction, stI != nil, (unsigned)sa.loadAction, [dt layout] == VK_IMAGE_LAYOUT_UNDEFINED, &ops);
         BOOL wholeImg = [dt rdna4Levels] > 1 || [dt rdna4ImageLayers] > 1;
         if (wholeImg) rdna4_tex_to([_cb vk], dt, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -214,7 +264,26 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
             .loadOp = (VkAttachmentLoadOp)ops.depthLoad, .storeOp = (VkAttachmentStoreOp)ops.depthStore, .stencilLoadOp = (VkAttachmentLoadOp)ops.stencilLoad, .stencilStoreOp = (VkAttachmentStoreOp)ops.stencilStore,
             .initialLayout = wholeImg ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : ops.undefinedInitial ? VK_IMAGE_LAYOUT_UNDEFINED : [dt layout], .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
         _cvs[na] = (VkClearValue){ .depthStencil = { (float)da.clearDepth, (uint32_t)sa.clearStencil } };
-        views[na] = [dt rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)slc]; _views[na] = views[na]; _tex[na] = dt; _dsVkFmt = [dt vkFormat]; _nd = 1;
+        views[na] = _layers > 1
+            ? [dt rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)slc layerCount:_layers]
+            : [dt rdna4AttViewLevel:(uint32_t)lvl layer:(uint32_t)slc];
+        _views[na] = views[na]; _tex[na] = dt; _dsVkFmt = [dt vkFormat]; _nd = 1;
+        _dlvl = (uint32_t)lvl; _dslice = (uint32_t)slc;
+        if (dtI) {
+            _dsact = (NSUInteger)da.storeAction; _drtex = da.resolveTexture; _drlvl = (uint32_t)da.resolveLevel; _drslice = (uint32_t)da.resolveSlice;
+            _dresFilter = [da respondsToSelector:@selector(depthResolveFilter)] ? (NSUInteger)da.depthResolveFilter : 0;
+            if (da.resolveTexture) [self rdna4OwnResource:da.resolveTexture kind:RDNA4_RESOURCE_RESOLVE fragment:NO index:8];
+        }
+        if (stI) {
+            _ssact = (NSUInteger)sa.storeAction; _srtex = sa.resolveTexture; _srlvl = (uint32_t)sa.resolveLevel; _srslice = (uint32_t)sa.resolveSlice;
+            _sresFilter = [sa respondsToSelector:@selector(stencilResolveFilter)] ? (NSUInteger)sa.stencilResolveFilter : 0;
+            if (sa.resolveTexture) [self rdna4OwnResource:sa.resolveTexture kind:RDNA4_RESOURCE_RESOLVE fragment:NO index:9];
+        }
+        { rdna4sa_t sat;
+          if (dtI && !rdna4sa_map((unsigned long)da.storeAction, da.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: depth attachment: %s; refused", sat.why); return nil; }
+          if (dtI && sat.resolve && ![self rdna4CheckDSResolve:YES]) return nil;
+          if (stI && !rdna4sa_map((unsigned long)sa.storeAction, sa.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: stencil attachment: %s; refused", sat.why); return nil; }
+          if (stI && sat.resolve && ![self rdna4CheckDSResolve:NO]) return nil; }
         [self rdna4OwnResource:dt kind:RDNA4_RESOURCE_ATTACHMENT
                       fragment:NO index:na];
         [dt setLayout:VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL];
@@ -223,17 +292,31 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     }
     if (!_encSamples) _encSamples = 1;
     if (!na && !_nd) { RDNA4LOG("render pass: no colour or depth/stencil attachments"); return nil; }
+    if ([d respondsToSelector:@selector(getSamplePositions:count:)]) {
+        NSUInteger spc = [d getSamplePositions:NULL count:0];
+        if (spc > 0) {
+            if (!RDNA4R.sampleLocationsExt || spc != _encSamples || spc > 8 || !(RDNA4R.sampleLocationCounts & _encSamples)) {
+                RDNA4LOG("render pass: programmable sample positions count %lu for %u samples unsupported (ext %d counts 0x%x); refused",
+                         (unsigned long)spc, _encSamples, RDNA4R.sampleLocationsExt, RDNA4R.sampleLocationCounts);
+                return nil;
+            }
+            [d getSamplePositions:_samplePos count:spc];
+            _samplePosCount = (uint32_t)spc;
+            _hasSamplePos = YES;
+        }
+    }
     _na = na;
     for (uint32_t i = 0; i < na + _nd; i++) _curLay[i] = _ads[i].initialLayout;
     _rp1 = rdna4_mk_rp_c(_ads, na, _nd, NO, &_rp1c); if (!_rp1) return nil;
-    VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = _rp1, .attachmentCount = na + _nd, .pAttachments = views, .width = _w, .height = _h, .layers = 1 };
+    VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = _rp1, .attachmentCount = na + _nd, .pAttachments = views, .width = _w, .height = _h, .layers = _layers };
     VkResult r = vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &_fb);
     if (r != VK_SUCCESS) { RDNA4LOG("render pass: vkCreateFramebuffer = %d", r); if (!_rp1c) vkDestroyRenderPass(RDNA4R.dev, _rp1, NULL); return nil; }
     _baseHandles = [[RDNA4RenderHandles alloc]
         initWithRenderPass:_rp1c ? VK_NULL_HANDLE : _rp1 framebuffer:_fb];
     // Metal's default viewport = the attachment, y down; translated shaders do not flip clip Y (F6): the viewport is emitted with a negative height.
     _vp = (MTLViewport){ 0, 0, _w, _h, 0, 1 }; _sr = (MTLScissorRect){ 0, 0, _w, _h };
-    RDNA4LOGR("RDNA4RenderEncoder %p: %u x %u, %u attachment(s); the Vulkan render pass begins at the first draw (or at endEncoding)", (__bridge void *)self, _w, _h, na);
+    _vps[0] = _vp; _nvp = 1; _srs[0] = _sr; _nsr = 1;
+    RDNA4LOGR("RDNA4RenderEncoder %p: %u x %u x %u, %u attachment(s); the Vulkan render pass begins at the first draw (or at endEncoding)", (__bridge void *)self, _w, _h, _layers, na);
     [self rdna4OccInit:d];   // build 18 (P2): outside any render pass (the previous encoder has ended), so the query reset is legal
     return self;
 }
@@ -303,26 +386,87 @@ RDNA4_DNR(RDNA4RenderEncoder)
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
 - (NSUInteger)getType { return 1; }
 
-// ---- bundle 10: multisample resolve ----
+// ---- bundle 10 + Metal 2: multisample resolve ----
 // 1 when colour attachment i's resolve texture is usable (a 2D single-sample texture of the attachment's size and format); logs and returns 0 otherwise.
 - (BOOL)rdna4CheckResolve:(uint32_t)i {
     RDNA4Texture *src = _tex[i]; id r = _rtex[i];
     if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: attachment %u: the resolve texture is not an RDNA4Texture; refused", i); return NO; }
     RDNA4Texture *dst = r;
     if (dst == src || [dst rdna4IsView] || [dst textureType] == MTLTextureType3D) { RDNA4LOG("render pass: attachment %u: the resolve texture is the attachment itself, a view or a 3D texture; refused", i); return NO; }
-    if (_rlvl[i] >= [dst mipmapLevelCount] || _rslice[i] >= [dst rdna4Layers]) { RDNA4LOG("render pass: attachment %u: resolve level %u slice %u is outside the resolve texture; refused", i, _rlvl[i], _rslice[i]); return NO; }
+    if (_rlvl[i] >= [dst mipmapLevelCount] || _rslice[i] + _layers > [dst rdna4Layers]) { RDNA4LOG("render pass: attachment %u: resolve level %u slice %u+%u is outside the resolve texture; refused", i, _rlvl[i], _rslice[i], _layers); return NO; }
     unsigned sw = (unsigned)MAX((NSUInteger)1, src.width >> _slvl[i]), sh = (unsigned)MAX((NSUInteger)1, src.height >> _slvl[i]), dw = (unsigned)MAX((NSUInteger)1, dst.width >> _rlvl[i]), dh = (unsigned)MAX((NSUInteger)1, dst.height >> _rlvl[i]);
     const char *why = NULL;
     if (!rdna4sa_target_ok(sw, sh, (unsigned)[src vkFormat], [src rdna4Aspects], dw, dh, (unsigned)[dst vkFormat], (unsigned)[dst rdna4Samples], &why)) { RDNA4LOG("render pass: attachment %u: %s; refused", i, why); return NO; }
     return YES;
 }
-// At endEncoding (after the last vkCmdEndRenderPass): every colour attachment whose FINAL store action resolves is resolved into its resolve texture.
+- (void)rdna4RunDSResolveInto:(RDNA4Texture *)dst level:(uint32_t)dlvl slice:(uint32_t)dslice
+                    depthMode:(VkResolveModeFlagBits)dMode stencilMode:(VkResolveModeFlagBits)sMode {
+    RDNA4Texture *src = _tex[_na];
+    VkCommandBuffer cmd = [_cb vk];
+    if (rdna4nc_drop_write(dst, RDNA4NC_RESOLVE, "depth/stencil resolve", "RenderCommandEncoder")) { [_cb rdna4Fail:@"depth/stencil resolve destination is read-only"]; return; }
+    [_cb rdna4RetainEncoded:src];
+    [_cb rdna4RetainEncoded:dst];
+    rdna4_ios_usek(_cb, dst, NO, YES, RDNA4DF_W_BLIT);
+    rdna4_tex_to(cmd, src, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    rdna4_tex_to(cmd, dst, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    uint32_t sw = (uint32_t)MAX((NSUInteger)1, src.width >> _dlvl), sh = (uint32_t)MAX((NSUInteger)1, src.height >> _dlvl);
+    VkImageView srcView = _layers > 1 ? [src rdna4AttViewLevel:_dlvl layer:_dslice layerCount:_layers] : [src rdna4AttViewLevel:_dlvl layer:_dslice];
+    VkImageView dstView = _layers > 1 ? [dst rdna4AttViewLevel:dlvl layer:dslice layerCount:_layers] : [dst rdna4AttViewLevel:dlvl layer:dslice];
+    unsigned srcAsp = [src rdna4Aspects], dstAsp = [dst rdna4Aspects];
+    BOOL dstHasD = (dstAsp & RDNA4DP_ASP_DEPTH) != 0, dstHasS = (dstAsp & RDNA4DP_ASP_STENCIL) != 0;
+    VkAttachmentDescription2 ad[2] = {
+        { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, .format = [src vkFormat], .samples = (VkSampleCountFlagBits)[src rdna4Samples],
+          .loadOp = (srcAsp & RDNA4DP_ASP_DEPTH) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .storeOp = (srcAsp & RDNA4DP_ASP_DEPTH) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = (srcAsp & RDNA4DP_ASP_STENCIL) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = (srcAsp & RDNA4DP_ASP_STENCIL) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL },
+        { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, .format = [dst vkFormat], .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = !dstHasD ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : dMode ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+          .storeOp = dstHasD ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = !dstHasS ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : sMode ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+          .stencilStoreOp = dstHasS ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL }
+    };
+    VkAttachmentReference2 refSrc = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, .attachment = 0, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .aspectMask = (VkImageAspectFlags)srcAsp };
+    VkAttachmentReference2 refDst = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, .attachment = 1, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .aspectMask = (VkImageAspectFlags)dstAsp };
+    VkSubpassDescriptionDepthStencilResolve dsRes = { .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+        .depthResolveMode = dMode, .stencilResolveMode = sMode, .pDepthStencilResolveAttachment = &refDst };
+    VkSubpassDescription2 sp = { .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, .pNext = &dsRes,
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .pDepthStencilAttachment = &refSrc };
+    VkSubpassDependency2 deps[2] = {
+        { .sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+          .srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT },
+        { .sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
+          .srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+          .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT }
+    };
+    VkRenderPassCreateInfo2 rpci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2, .attachmentCount = 2, .pAttachments = ad,
+        .subpassCount = 1, .pSubpasses = &sp, .dependencyCount = 2, .pDependencies = deps };
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkResult vr = vkCreateRenderPass2(RDNA4R.dev, &rpci, NULL, &rp);
+    if (vr != VK_SUCCESS) { [_cb rdna4Fail:[NSString stringWithFormat:@"vkCreateRenderPass2 (depth/stencil resolve) = %d", vr]]; return; }
+    VkImageView views[2] = { srcView, dstView };
+    VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = 2, .pAttachments = views, .width = sw, .height = sh, .layers = _layers };
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    vr = vkCreateFramebuffer(RDNA4R.dev, &fci, NULL, &fb);
+    if (vr != VK_SUCCESS) { vkDestroyRenderPass(RDNA4R.dev, rp, NULL); [_cb rdna4Fail:[NSString stringWithFormat:@"vkCreateFramebuffer (depth/stencil resolve) = %d", vr]]; return; }
+    [_cb rdna4RetainEncoded:[[RDNA4RenderHandles alloc] initWithRenderPass:rp framebuffer:fb]];
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb, .renderArea = { { 0, 0 }, { sw, sh } } };
+    VkSubpassBeginInfo sbi = { .sType = VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO, .contents = VK_SUBPASS_CONTENTS_INLINE };
+    VkSubpassEndInfo sei = { .sType = VK_STRUCTURE_TYPE_SUBPASS_END_INFO };
+    vkCmdBeginRenderPass2(cmd, &rbi, &sbi);
+    vkCmdEndRenderPass2(cmd, &sei);
+    [dst setLayout:VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL];
+    [src setLayout:VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL];
+}
+// At endEncoding (after the last vkCmdEndRenderPass): every colour and depth/stencil attachment whose FINAL store action resolves is resolved into its resolve texture.
 - (void)rdna4ResolveAll {
     VkCommandBuffer cmd = [_cb vk];
     for (uint32_t i = 0; i < _na; i++) {
-        if (!_rtex[i]) continue;
         rdna4sa_t sat; RDNA4Texture *src = _tex[i];
-        if (!rdna4sa_map((unsigned long)_sact[i], YES, [src rdna4Samples] > 1, &sat)) { [_cb rdna4Fail:[NSString stringWithFormat:@"attachment %u: %s", i, sat.why]]; continue; }
+        if (!rdna4sa_map((unsigned long)_sact[i], _rtex[i] != nil, [src rdna4Samples] > 1, &sat)) { [_cb rdna4Fail:[NSString stringWithFormat:@"attachment %u: %s", i, sat.why]]; continue; }
         if (!sat.resolve) continue;
         if (![self rdna4CheckResolve:i]) { [_cb rdna4Fail:[NSString stringWithFormat:@"attachment %u: the resolve texture is unusable (see the log)", i]]; continue; }
         RDNA4Texture *dst = _rtex[i];
@@ -330,11 +474,40 @@ RDNA4_DNR(RDNA4RenderEncoder)
         [_cb rdna4RetainEncoded:dst];
         rdna4_ios_usek(_cb, dst, NO, YES, RDNA4DF_W_BLIT);
         rdna4_tex_to(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); rdna4_tex_to(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkImageResolve rg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _slvl[i], _sslice[i], 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _rlvl[i], _rslice[i], 1 },
+        VkImageResolve rg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _slvl[i], _sslice[i], _layers }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _rlvl[i], _rslice[i], _layers },
             .extent = { (uint32_t)MAX((NSUInteger)1, src.width >> _slvl[i]), (uint32_t)MAX((NSUInteger)1, src.height >> _slvl[i]), 1 } };
         vkCmdResolveImage(cmd, [src vkImage], rdna4_use_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
             [dst vkImage], rdna4_use_layout(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &rg);
-        RDNA4LOGR("render pass: attachment %u (%lu samples) resolved into texture %p level %u slice %u", i, (unsigned long)[src rdna4Samples], (__bridge void *)dst, _rlvl[i], _rslice[i]);
+        RDNA4LOGR("render pass: attachment %u (%lu samples) resolved into texture %p level %u slice %u+%u", i, (unsigned long)[src rdna4Samples], (__bridge void *)dst, _rlvl[i], _rslice[i], _layers);
+    }
+    if (_nd) {
+        RDNA4Texture *dsSrc = _tex[_na];
+        unsigned srcSamples = (unsigned)[dsSrc rdna4Samples];
+        rdna4sa_t dsat = {0}, ssat = {0};
+        BOOL wantD = _drtex != nil || _dsact == MTLStoreActionMultisampleResolve || _dsact == MTLStoreActionStoreAndMultisampleResolve;
+        BOOL wantS = _srtex != nil || _ssact == MTLStoreActionMultisampleResolve || _ssact == MTLStoreActionStoreAndMultisampleResolve;
+        BOOL resD = NO, resS = NO;
+        if (wantD && ([dsSrc rdna4Aspects] & RDNA4DP_ASP_DEPTH)) {
+            if (!rdna4sa_map((unsigned long)_dsact, _drtex != nil, srcSamples > 1, &dsat)) { [_cb rdna4Fail:[NSString stringWithFormat:@"depth resolve: %s", dsat.why]]; return; }
+            if (dsat.resolve) {
+                if (![self rdna4CheckDSResolve:YES]) { [_cb rdna4Fail:@"depth resolve target or filter invalid"]; return; }
+                resD = YES;
+            }
+        }
+        if (wantS && ([dsSrc rdna4Aspects] & RDNA4DP_ASP_STENCIL)) {
+            if (!rdna4sa_map((unsigned long)_ssact, _srtex != nil, srcSamples > 1, &ssat)) { [_cb rdna4Fail:[NSString stringWithFormat:@"stencil resolve: %s", ssat.why]]; return; }
+            if (ssat.resolve) {
+                if (![self rdna4CheckDSResolve:NO]) { [_cb rdna4Fail:@"stencil resolve target or filter invalid"]; return; }
+                resS = YES;
+            }
+        }
+        VkResolveModeFlagBits dMode = _dresFilter == 1 ? VK_RESOLVE_MODE_MIN_BIT : _dresFilter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        if (resD && resS && _drtex == _srtex && _drlvl == _srlvl && _drslice == _srslice) {
+            [self rdna4RunDSResolveInto:_drtex level:_drlvl slice:_drslice depthMode:dMode stencilMode:VK_RESOLVE_MODE_SAMPLE_ZERO_BIT];
+        } else {
+            if (resD) [self rdna4RunDSResolveInto:_drtex level:_drlvl slice:_drslice depthMode:dMode stencilMode:VK_RESOLVE_MODE_NONE];
+            if (resS) [self rdna4RunDSResolveInto:_srtex level:_srlvl slice:_srslice depthMode:VK_RESOLVE_MODE_NONE stencilMode:VK_RESOLVE_MODE_SAMPLE_ZERO_BIT];
+        }
     }
 }
 // ---- pass management ----
@@ -360,7 +533,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
         if (!rp) { [_cb rdna4Fail:@"cannot create the continuation / framebuffer-fetch render pass"]; return; }
         if (_fetch) {
             if (!_fbf) {   // the fetch framebuffer: same views, a fetch-shaped (input-attachment) render pass for compatibility
-                VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = _na + _nd, .pAttachments = _views, .width = _w, .height = _h, .layers = 1 };
+                VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = _na + _nd, .pAttachments = _views, .width = _w, .height = _h, .layers = _layers };
                 VkResult r = vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &_fbf);
                 if (r != VK_SUCCESS) { _fbf = VK_NULL_HANDLE; if (!rpc) vkDestroyRenderPass(RDNA4R.dev, rp, NULL); [_cb rdna4Fail:[NSString stringWithFormat:@"vkCreateFramebuffer (fetch) = %d", r]]; return; }
                 _fetchHandles = [[RDNA4RenderHandles alloc]
@@ -373,8 +546,19 @@ RDNA4_DNR(RDNA4RenderEncoder)
     }
     for (uint32_t i = 0; i < _na; i++) { _curLay[i] = _fetch ? VK_IMAGE_LAYOUT_GENERAL : _ads[i].finalLayout; [_tex[i] setLayout:_curLay[i]]; }
     if (_nd) { _curLay[_na] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; [_tex[_na] setLayout:_curLay[_na]]; }
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb,
-        .renderArea = { { 0, 0 }, { _w, _h } }, .clearValueCount = ncv, .pClearValues = _cvs };
+    VkSampleLocationEXT vkSL[8];
+    if (_hasSamplePos) for (uint32_t s = 0; s < _samplePosCount && s < 8; s++) vkSL[s] = (VkSampleLocationEXT){ _samplePos[s].x, _samplePos[s].y };
+    VkSampleLocationsInfoEXT slInfo = { .sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
+        .sampleLocationsPerPixel = (VkSampleCountFlagBits)_encSamples,
+        .sampleLocationGridSize = { 1, 1 },
+        .sampleLocationsCount = _samplePosCount, .pSampleLocations = vkSL };
+    VkAttachmentSampleLocationsEXT attLoc = { .attachmentIndex = _na, .sampleLocationsInfo = slInfo };
+    VkSubpassSampleLocationsEXT postLoc = { .subpassIndex = 0, .sampleLocationsInfo = slInfo };
+    VkRenderPassSampleLocationsBeginInfoEXT rpSL = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT,
+        .attachmentInitialSampleLocationsCount = _nd ? 1u : 0u, .pAttachmentInitialSampleLocations = _nd ? &attLoc : NULL,
+        .postSubpassSampleLocationsCount = 1u, .pPostSubpassSampleLocations = &postLoc };
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .pNext = _hasSamplePos ? &rpSL : NULL,
+        .renderPass = rp, .framebuffer = fb, .renderArea = { { 0, 0 }, { _w, _h } }, .clearValueCount = ncv, .pClearValues = _cvs };
     // A clear-only pass can begin before its encoder's first draw. Snapshot
     // attachments into the segment that actually records the pass.
     [self rdna4SnapshotResources];
@@ -403,13 +587,29 @@ RDNA4_DNR(RDNA4RenderEncoder)
 }
 - (void)setCullMode:(MTLCullMode)m { _cull = m; }
 - (void)setFrontFacingWinding:(MTLWinding)w { _wind = w; }
-- (void)setViewport:(MTLViewport)v { _vp = v; }
-- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n { if (n) _vp = v[0]; if (n > 1) RDNA4LOG("setViewports: %lu viewports, only the first is used", (unsigned long)n); }
-- (void)setScissorRect:(MTLScissorRect)r { _sr = r; }
-- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n { if (n) _sr = r[0]; if (n > 1) RDNA4LOG("setScissorRects: %lu rects, only the first is used", (unsigned long)n); }
+- (void)setViewport:(MTLViewport)v { _vp = v; _vps[0] = v; _nvp = 1; }
+- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
+    if (!n || !v) return;
+    if (n > (RDNA4R.maxViewports ?: 1u)) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"setViewports: count %lu > maxViewports %u", (unsigned long)n, RDNA4R.maxViewports ?: 1u]];
+        return;
+    }
+    for (NSUInteger i = 0; i < n; i++) _vps[i] = v[i];
+    _nvp = (uint32_t)n; _vp = v[0];
+}
+- (void)setScissorRect:(MTLScissorRect)r { _sr = r; _srs[0] = r; _nsr = 1; }
+- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n {
+    if (!n || !r) return;
+    if (n > (RDNA4R.maxViewports ?: 1u)) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"setScissorRects: count %lu > maxViewports %u", (unsigned long)n, RDNA4R.maxViewports ?: 1u]];
+        return;
+    }
+    for (NSUInteger i = 0; i < n; i++) _srs[i] = r[i];
+    _nsr = (uint32_t)n; _sr = r[0];
+}
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; }
-- (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) RDNA4LOG("setTriangleFillMode %lu: NOT IMPLEMENTED (fill)", (unsigned long)m); }
-- (void)setDepthClipMode:(NSUInteger)m { if (m) RDNA4_ONCE("setDepthClipMode: Clamp is not implemented (depth clip stays on)"); }
+- (void)setTriangleFillMode:(MTLTriangleFillMode)m { _fillMode = m; }
+- (void)setDepthClipMode:(NSUInteger)m { _depthClipMode = (MTLDepthClipMode)m; }
 - (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { _bias[0] = a; _bias[1] = RDNA4R.dbClamp ? c : 0.0f; _bias[2] = b; if (c != 0.0f && !RDNA4R.dbClamp) RDNA4_ONCE("setDepthBias: a non-zero clamp is ignored (the device lacks depthBiasClamp)"); }   // bundle 10
 - (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; }
 - (void)setDepthStencilState:(id)s {   // bundle 10: recorded; read at every draw of a pipeline that has a depth/stencil attachment (a colour-only pipeline never looks at it)
@@ -455,9 +655,9 @@ RDNA4_DNR(RDNA4RenderEncoder)
 }
 - (void)setColorStoreAction:(NSUInteger)a atIndex:(NSUInteger)i { if (i < _na) _sact[i] = a; else RDNA4_ONCE("setColorStoreAction: index past the colour attachments; ignored"); }   // bundle 10: only a resolve changes anything (colour attachments are always stored)
 - (void)setColorStoreActionOptions:(NSUInteger)a atIndex:(NSUInteger)i { (void)a; (void)i; }
-- (void)setDepthStoreAction:(NSUInteger)a { (void)a; }
+- (void)setDepthStoreAction:(NSUInteger)a { if (_nd) _dsact = a; }
 - (void)setDepthStoreActionOptions:(NSUInteger)a { (void)a; }
-- (void)setStencilStoreAction:(NSUInteger)a { (void)a; }
+- (void)setStencilStoreAction:(NSUInteger)a { if (_nd) _ssact = a; }
 - (void)setStencilStoreActionOptions:(NSUInteger)a { (void)a; }
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _sref[0] = f; _sref[1] = b; }
 - (void)setLineWidth:(float)w { (void)w; }
@@ -625,7 +825,7 @@ RDNA4_ENCODER_SHARED
                 RDNA4Texture *t = (!inp && p->embedded)
                     ? (RDNA4Texture *)rdna4_embedded_resource(p, k, st, YES, [_cb device])
                     : ((p->binding >= (inp ? 192u : 480u) && ix < (inp ? 8u : 128u)) ? (inp ? st->att[ix] : st->tex[ix]) : nil);
-                rdna4dc_sig_push(&sig, (uint64_t)(uintptr_t)(__bridge void *)t); rdna4dc_sig_push(&sig, t ? (uint64_t)(uintptr_t)[t rdna4AttViewLevel:0] : 0); }
+                rdna4dc_sig_push(&sig, (uint64_t)(uintptr_t)(__bridge void *)t); rdna4dc_sig_push(&sig, t ? (uint64_t)(uintptr_t)(inp ? [t rdna4AttViewLevel:0] : [t rdna4StorageView]) : 0); }
             break; }
         default: sig.over = 1; break;   // unsupported type: let rdna4FillSet refuse it as before
         }
@@ -676,13 +876,18 @@ RDNA4_ENCODER_SHARED
     if ([_pso rdna4DSVk] != _dsVkFmt || [_pso rdna4SampleCount] != _encSamples) {   // bundle 10: the pipeline's attachments must be the pass's (Metal validation; a Vulkan render-pass compatibility rule)
         [_cb rdna4Fail:[NSString stringWithFormat:@"the render pipeline's depth/stencil format (vk %d) or sample count (%u) differs from the pass's (vk %d, %u)", (int)[_pso rdna4DSVk], [_pso rdna4SampleCount], (int)_dsVkFmt, _encSamples]]; return NO; }
     uint32_t dk = [_pso rdna4DSKey:&_dsi];   // bundle 10: 0 for a colour-only pipeline
-    uint32_t fkey = (uint32_t)front | (dk << 1);   // the last-answer cache compares (topology, cull, front, pso): the depth/stencil variant rides in the front word
+    uint32_t vpCount = MAX(1u, MIN(MAX(_nvp, _nsr), 16u));
+    uint32_t rflags = ((_fillMode == MTLTriangleFillModeLines) ? 1u : 0u) |
+                      ((_depthClipMode == MTLDepthClipModeClamp) ? 2u : 0u) |
+                      (_hasSamplePos ? 4u : 0u) | ((vpCount - 1u) << 3);
+    uint32_t ckey = (uint32_t)cull | (rflags << 4);
+    uint32_t fkey = (uint32_t)front | (dk << 1);   // the last-answer cache compares (topology, cull+rflags, front+ds, pso)
     VkPipeline vkp;
     if (_dcOn) {   // P5b item 3: the last (topology, cull, front, pso) -> VkPipeline answer skips pipelineForTopology's NSNumber / NSLock / NSDictionary
         uint64_t pp;
-        if (rdna4dc_enc_pc_get(&_dc, (uint32_t)topo, (uint32_t)cull, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
-        else { vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk]; rdna4dc_enc_pc_put(&_dc, (uint32_t)topo, (uint32_t)cull, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp); }
-    } else vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk];
+        if (rdna4dc_enc_pc_get(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
+        else { vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags]; rdna4dc_enc_pc_put(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp); }
+    } else vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];
     if (!vkp) { [_cb rdna4Fail:@"cannot build a pipeline variant for this draw"]; return NO; }
     const uint32_t *need = [_pso needBindings]; uint32_t nn = [_pso nNeed];
     for (uint32_t i = 0; i < nn; i++) if (need[i] != 31 && !_sv.buf[need[i]].b) {
@@ -767,9 +972,23 @@ RDNA4_ENCODER_SHARED
         if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp)) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
     } else
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
-    VkViewport vp = { (float)_vp.originX, (float)(_vp.originY + _vp.height), (float)_vp.width, -(float)_vp.height, (float)_vp.znear, (float)_vp.zfar };
-    VkRect2D sc = { { (int32_t)_sr.x, (int32_t)_sr.y }, { (uint32_t)_sr.width, (uint32_t)_sr.height } };
-    vkCmdSetViewport(cmd, 0, 1, &vp); vkCmdSetScissor(cmd, 0, 1, &sc); vkCmdSetBlendConstants(cmd, _blend);
+    VkViewport vps[16]; VkRect2D scs[16];
+    for (uint32_t i = 0; i < vpCount; i++) {
+        MTLViewport mv = i < _nvp ? _vps[i] : _vps[_nvp - 1];
+        MTLScissorRect ms = i < _nsr ? _srs[i] : (MTLScissorRect){ 0, 0, _w, _h };
+        vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
+        scs[i] = (VkRect2D){ { (int32_t)ms.x, (int32_t)ms.y }, { (uint32_t)ms.width, (uint32_t)ms.height } };
+    }
+    vkCmdSetViewport(cmd, 0, vpCount, vps); vkCmdSetScissor(cmd, 0, vpCount, scs); vkCmdSetBlendConstants(cmd, _blend);
+    if (_hasSamplePos && rdna4_vkCmdSetSampleLocationsEXT) {
+        VkSampleLocationEXT vkSL[8];
+        for (uint32_t s = 0; s < _samplePosCount && s < 8; s++) vkSL[s] = (VkSampleLocationEXT){ _samplePos[s].x, _samplePos[s].y };
+        VkSampleLocationsInfoEXT slInfo = { .sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
+            .sampleLocationsPerPixel = (VkSampleCountFlagBits)_encSamples,
+            .sampleLocationGridSize = { 1, 1 },
+            .sampleLocationsCount = _samplePosCount, .pSampleLocations = vkSL };
+        rdna4_vkCmdSetSampleLocationsEXT(cmd, &slInfo);
+    }
     if ([_pso rdna4HasDS]) {   // bundle 10: the dynamic depth/stencil state (masks and reference per face; the bias when the pipeline has depth)
         vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead); vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bRead);
         vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fWrite); vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite);

@@ -4,9 +4,12 @@
 @end
 
 // m11h9: one buffer<->image copy region for a level / slice (2D, 1D arrays) or a box (3D: baseArrayLayer 0, depth in the extent, bufferImageHeight from bytesPerImage).
+// Vulkan specifies bufferRowLength and bufferImageHeight in TEXELS (for compressed formats, multiply block counts by the 4x4 block dimension).
 static VkBufferImageCopy rdna4_bic(RDNA4Texture *t, NSUInteger off, NSUInteger bpr, NSUInteger bpi, NSUInteger level, NSUInteger slice, MTLOrigin o, MTLSize sz) {
     BOOL is3 = [t textureType] == MTLTextureType3D; uint32_t bpp = [t bytesPerPixel];
-    return (VkBufferImageCopy){ .bufferOffset = off, .bufferRowLength = (uint32_t)(bpr / bpp), .bufferImageHeight = (is3 && sz.depth > 1 && bpr) ? (uint32_t)(bpi / bpr) : 0,
+    uint32_t rowTexels = bpr && bpp ? (uint32_t)((bpr / bpp) * ([t isCompressed] ? 4u : 1u)) : 0u;
+    uint32_t imgHeight = (is3 && sz.depth > 1 && bpr) ? (uint32_t)((bpi / bpr) * ([t isCompressed] ? 4u : 1u)) : 0u;
+    return (VkBufferImageCopy){ .bufferOffset = off, .bufferRowLength = rowTexels, .bufferImageHeight = imgHeight,
         .imageSubresource = { [t rdna4CopyAspect], [t rdna4MipLevel:level], [t rdna4Slice:slice], 1 },   // bundle 10: colour, or the one depth / stencil aspect
         .imageOffset = { (int32_t)o.x, (int32_t)o.y, is3 ? (int32_t)o.z : 0 }, .imageExtent = { (uint32_t)sz.width, (uint32_t)sz.height, is3 ? (uint32_t)sz.depth : 1 } };
 }
@@ -15,18 +18,21 @@ static BOOL rdna4_blit_buffer_layout(RDNA4Texture *texture, RDNA4Buffer *buffer,
     VkDeviceSize *vkOffset) {
     NSUInteger rowBytes, minimumImage;
     NSUInteger bpp = [texture bytesPerPixel];
-    if (!bpp || __builtin_mul_overflow(size.width, bpp, &rowBytes)) return NO;
+    BOOL bc = [texture isCompressed];
+    NSUInteger bw = bc ? (size.width + 3) / 4 : size.width;
+    NSUInteger bh = bc ? (size.height + 3) / 4 : size.height;
+    if (!bpp || __builtin_mul_overflow(bw, bpp, &rowBytes)) return NO;
     NSUInteger row = *rowStride ?: rowBytes;
     NSUInteger depth = [texture textureType] == MTLTextureType3D ? size.depth : 1;
     NSUInteger image = 0;
     if (depth > 1) {
-        if (!row || __builtin_mul_overflow(row, size.height, &minimumImage)) return NO;
+        if (!row || __builtin_mul_overflow(row, bh, &minimumImage)) return NO;
         image = *imageStride ?: minimumImage;
-        if (image % row || image / row > UINT32_MAX) return NO;
+        if (image % row || (image / row) * (bc ? 4 : 1) > UINT32_MAX) return NO;
     }
     rdna4_texture_transfer transfer;
-    if (row % bpp || row / bpp > UINT32_MAX ||
-        !rdna4_texture_transfer_layout(size.width, size.height, depth, bpp, row, image, &transfer) ||
+    if (row % bpp || (row / bpp) * (bc ? 4 : 1) > UINT32_MAX ||
+        !rdna4_texture_transfer_layout(bw, bh, depth, bpp, row, image, &transfer) ||
         !rdna4_buffer_range(buffer.length, offset, transfer.span)) return NO;
     VkDeviceSize relocated;
     if (__builtin_add_overflow([buffer rdna4VkOffset], (VkDeviceSize)offset, &relocated) ||
@@ -45,10 +51,13 @@ static NSArray<NSValue *> *rdna4_blit_texture_buffer_ranges(RDNA4Texture *textur
     NSUInteger depth = is3 ? size.depth : 1;
     if (!depth) return @[];
     if (offset > bufferLength) return nil;
+    BOOL bc = [texture isCompressed];
+    NSUInteger bw = bc ? (size.width + 3) / 4 : size.width;
+    NSUInteger bh = bc ? (size.height + 3) / 4 : size.height;
     NSUInteger pixelBytes = [texture bytesPerPixel], rowBytes = 0, minimumImageBytes = 0;
-    if (!pixelBytes || __builtin_mul_overflow(size.width, pixelBytes, &rowBytes)) return nil;
+    if (!pixelBytes || __builtin_mul_overflow(bw, pixelBytes, &rowBytes)) return nil;
     NSUInteger rowStride = bytesPerRow ? bytesPerRow : rowBytes;
-    if (rowStride < rowBytes || __builtin_mul_overflow(rowStride, size.height,
+    if (rowStride < rowBytes || __builtin_mul_overflow(rowStride, bh,
                                                        &minimumImageBytes)) return nil;
     NSUInteger imageStride = depth > 1 && bytesPerImage ? bytesPerImage : minimumImageBytes;
     if (imageStride < minimumImageBytes) return nil;
@@ -59,7 +68,7 @@ static NSArray<NSValue *> *rdna4_blit_texture_buffer_ranges(RDNA4Texture *textur
         NSUInteger imageOffset = 0;
         if (__builtin_mul_overflow(z, imageStride, &imageOffset) ||
             imageOffset > NSUIntegerMax - offset) return nil;
-        for (NSUInteger y = 0; y < size.height; ++y) {
+        for (NSUInteger y = 0; y < bh; ++y) {
             NSUInteger rowOffset = 0, start = 0, end = 0;
             if (__builtin_mul_overflow(y, rowStride, &rowOffset) ||
                 rowOffset > NSUIntegerMax - imageOffset - offset) return nil;
@@ -311,7 +320,7 @@ RDNA4_ENCODER_SHARED
     if (![tex isKindOfClass:[RDNA4Texture class]]) { [_cb rdna4Fail:@"blit generateMipmapsForTexture: bad class"]; return; }
     if (rdna4nc_drop_write(tex, RDNA4NC_MIPMAPS, "generateMipmapsForTexture:", "BlitCommandEncoder")) { [_cb rdna4Fail:@"generateMipmapsForTexture: destination is read-only"]; return; }
     RDNA4Texture *t = tex; uint32_t nl = (uint32_t)[t mipmapLevelCount];
-    if ([t rdna4IsDS] || [t rdna4Samples] > 1) { [_cb rdna4Fail:@"blit generateMipmapsForTexture: depth/stencil and multisample textures cannot be mip-mapped here"]; return; }   // bundle 10
+    if ([t rdna4IsDS] || [t rdna4Samples] > 1 || [t isCompressed]) { [_cb rdna4Fail:@"blit generateMipmapsForTexture: depth/stencil, multisample and compressed textures cannot be mip-mapped here"]; return; }   // bundle 10
     if (nl <= 1) { RDNA4_ONCE("generateMipmapsForTexture: the texture has a single level; nothing to generate"); return; }
     VkFormatProperties fp = {0}; vkGetPhysicalDeviceFormatProperties(RDNA4R.pd, [t vkFormat], &fp);
     if ((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) != (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {

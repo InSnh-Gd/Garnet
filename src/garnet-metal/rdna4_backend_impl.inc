@@ -25,7 +25,8 @@
     X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) \
     X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults) X(vkGetFenceStatus) /* build 18 (P2) */ \
-    X(vkCmdResolveImage) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias)
+    X(vkCmdResolveImage) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) \
+    X(vkCreateRenderPass2) X(vkCmdBeginRenderPass2) X(vkCmdEndRenderPass2)
 #define X(n) static PFN_##n n;
 RDNA4_VK_FUNCS(X)
 #undef X
@@ -33,6 +34,7 @@ static PFN_vkCreateInstance rdna4_vkCreateInstance;
 static PFN_vkGetInstanceProcAddr rdna4_gipa;
 static PFN_vkGetMemoryHostPointerPropertiesEXT rdna4_vkGetMHPP;   // 11h.6: VK_EXT_external_memory_host
 static PFN_vkGetBufferDeviceAddress rdna4_vkGetBufferAddress;
+static PFN_vkCmdSetSampleLocationsEXT rdna4_vkCmdSetSampleLocationsEXT;
 static PFN_vkQueueWaitIdle rdna4_vkQueueWaitIdle;
 static RDNA4NativeBridge rdna4_native_bridge;
 
@@ -44,6 +46,14 @@ static struct {
     BOOL dbClamp;   // bundle 10: depthBiasClamp enabled on the device (a non-zero clamp in setDepthBias is passed on only then)
     BOOL hostExt, drmModExt; uint64_t hostAlign; uint64_t impTotal;   // host pointer import and explicit DRM-modifier linear images
     BOOL orderedColorAccess, indirectFirstInstance, cubeArray, bufferAddress;
+    BOOL fragInterlock;
+    BOOL dualSrcBlend, depthClamp, fillModeNonSolid, multiViewport, bcCompression, sampleRateShading;
+    BOOL storageImageExtFormats, storageImageMultisample;
+    BOOL sampleLocationsExt, variableSampleLocations;
+    VkSampleCountFlags sampleLocationCounts; VkExtent2D sampleLocationGrid; float sampleLocationRange[2];
+    VkResolveModeFlags depthResolveModes, stencilResolveModes;
+    BOOL dsResolveIndep, dsResolveIndepNone;
+    uint32_t maxViewports;
     BOOL tessellation; uint32_t maxTessGenLevel, maxTessPatchSize;
     BOOL descriptorIndexing, nonUniformSampledImages, nonUniformStorageImages, nonUniformBuffers;
     BOOL gpuArgumentTables, nullDescriptors, samplerAnisotropy, samplerMirrorClamp;
@@ -566,6 +576,17 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                                         .shaderInt64 = pf.shaderInt64, .shaderInt16 = pf.shaderInt16, .fragmentStoresAndAtomics = pf.fragmentStoresAndAtomics, .shaderStorageImageReadWithoutFormat = pf.shaderStorageImageReadWithoutFormat,
                                         .shaderStorageImageWriteWithoutFormat = pf.shaderStorageImageWriteWithoutFormat,
                                         .independentBlend = pf.independentBlend,
+                                        .dualSrcBlend = pf.dualSrcBlend,
+                                        .depthClamp = pf.depthClamp,
+                                        .fillModeNonSolid = pf.fillModeNonSolid,
+                                        .multiViewport = pf.multiViewport,
+                                        .textureCompressionBC = pf.textureCompressionBC,
+                                        .sampleRateShading = pf.sampleRateShading,
+                                        .shaderStorageImageExtendedFormats = pf.shaderStorageImageExtendedFormats,
+                                        .shaderStorageImageMultisample = pf.shaderStorageImageMultisample,
+                                        .vertexPipelineStoresAndAtomics = pf.vertexPipelineStoresAndAtomics,
+                                        .shaderClipDistance = pf.shaderClipDistance,
+                                        .shaderCullDistance = pf.shaderCullDistance,
                                         .shaderSampledImageArrayDynamicIndexing = pf.shaderSampledImageArrayDynamicIndexing,
                                         .shaderStorageImageArrayDynamicIndexing = pf.shaderStorageImageArrayDynamicIndexing,
                                         .shaderUniformBufferArrayDynamicIndexing = pf.shaderUniformBufferArrayDynamicIndexing,
@@ -576,6 +597,15 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                                         .samplerAnisotropy = pf.samplerAnisotropy,
                                         .shaderImageGatherExtended = gatherCaps.supported ? VK_TRUE : VK_FALSE,
                                         .occlusionQueryPrecise = pf.occlusionQueryPrecise };   // build 18 (P2): Counting visibility mode
+        RDNA4R.dualSrcBlend = ef.dualSrcBlend;
+        RDNA4R.depthClamp = ef.depthClamp;
+        RDNA4R.fillModeNonSolid = ef.fillModeNonSolid;
+        RDNA4R.multiViewport = ef.multiViewport;
+        RDNA4R.bcCompression = ef.textureCompressionBC;
+        RDNA4R.sampleRateShading = ef.sampleRateShading;
+        RDNA4R.storageImageExtFormats = ef.shaderStorageImageExtendedFormats;
+        RDNA4R.storageImageMultisample = ef.shaderStorageImageMultisample;
+        RDNA4R.maxViewports = ef.multiViewport ? MIN(pp.limits.maxViewports, 16u) : 1u;
         RDNA4R.maxTessGenLevel = pp.limits.maxTessellationGenerationLevel;
         RDNA4R.maxTessPatchSize = pp.limits.maxTessellationPatchSize;
         RDNA4R.tessellation = ef.tessellationShader && RDNA4R.maxTessGenLevel >= 64 && RDNA4R.maxTessPatchSize >= 32;
@@ -635,8 +665,10 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT };
         VkPhysicalDeviceRobustness2FeaturesEXT supportedNull = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
+        VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragInterlockFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT };
         const char *orderedColorExt = NULL;
-        BOOL hasDrmMod = NO, hasMemoryBudget = NO;
+        BOOL hasDrmMod = NO, hasMemoryBudget = NO, hasSampleLoc = NO, hasInterlock = NO;
         {
             uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, NULL);
             VkExtensionProperties *ex = calloc(ne ? ne : 1, sizeof *ex); vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, ex);
@@ -649,6 +681,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 if (!strcmp(ex[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) RDNA4R.hostExt = YES;
                 hasDrmMod |= !strcmp(ex[i].extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
                 hasMemoryBudget |= !strcmp(ex[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                hasSampleLoc |= !strcmp(ex[i].extensionName, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+                hasInterlock |= !strcmp(ex[i].extensionName, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
                 hasNull |= !strcmp(ex[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
                 hasRO |= !strcmp(ex[i].extensionName, "VK_EXT_rasterization_order_attachment_access") || !strcmp(ex[i].extensionName, "VK_ARM_rasterization_order_attachment_access");
                 if (!strcmp(ex[i].extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
@@ -658,16 +692,39 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasDR |= !strcmp(ex[i].extensionName, "VK_KHR_dynamic_rendering");
             }
             free(ex);
+            if (hasInterlock) supportedNull.pNext = &fragInterlockFeat;
             if (hasNull) orderedColor.pNext = &supportedNull;
+            else if (hasInterlock) orderedColor.pNext = &fragInterlockFeat;
             VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &orderedColor };
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &flr };
             if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(RDNA4R.pd, &f2);
             RDNA4LOG("radv: framebuffer-fetch support: rasterization_order_attachment_access ext %d (color feature %d, depth %d, stencil %d); dynamic_rendering_local_read ext %d (feature %d); attachment_feedback_loop_layout ext %d; dynamic_rendering ext %d; classic render-pass input attachments: core 1.0",
                    hasRO, orderedColor.rasterizationOrderColorAttachmentAccess, orderedColor.rasterizationOrderDepthAttachmentAccess, orderedColor.rasterizationOrderStencilAttachmentAccess, hasLR, flr.dynamicRenderingLocalRead, hasFL, hasDR);
             orderedColor.pNext = NULL;
+            supportedNull.pNext = NULL;
+            fragInterlockFeat.pNext = NULL;
+            if (vkGetPhysicalDeviceProperties2 && pp.apiVersion >= VK_API_VERSION_1_2) {
+                VkPhysicalDeviceSampleLocationsPropertiesEXT slp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT };
+                VkPhysicalDeviceDepthStencilResolveProperties dsr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES,
+                    .pNext = hasSampleLoc ? &slp : NULL };
+                VkPhysicalDeviceProperties2 p2b = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dsr };
+                vkGetPhysicalDeviceProperties2(RDNA4R.pd, &p2b);
+                RDNA4R.depthResolveModes = dsr.supportedDepthResolveModes;
+                RDNA4R.stencilResolveModes = dsr.supportedStencilResolveModes;
+                RDNA4R.dsResolveIndep = dsr.independentResolve != VK_FALSE;
+                RDNA4R.dsResolveIndepNone = dsr.independentResolveNone != VK_FALSE;
+                if (hasSampleLoc) {
+                    RDNA4R.sampleLocationCounts = slp.sampleLocationSampleCounts;
+                    RDNA4R.sampleLocationGrid = slp.maxSampleLocationGridSize;
+                    RDNA4R.sampleLocationRange[0] = slp.sampleLocationCoordinateRange[0];
+                    RDNA4R.sampleLocationRange[1] = slp.sampleLocationCoordinateRange[1];
+                    RDNA4R.variableSampleLocations = slp.variableSampleLocations != VK_FALSE;
+                }
+            }
         }
-        const char *devExts[4]; uint32_t devExtCount = 0;
+        const char *devExts[12]; uint32_t devExtCount = 0;
         if (RDNA4R.hostExt) devExts[devExtCount++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+        if (hasSampleLoc) devExts[devExtCount++] = VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
         RDNA4R.orderedColorAccess = orderedColorExt && orderedColor.rasterizationOrderColorAttachmentAccess;
         if (RDNA4R.orderedColorAccess) {
             orderedColor.rasterizationOrderDepthAttachmentAccess = VK_FALSE;
@@ -687,6 +744,14 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             enabled13.pNext = &enabledNull;
             devExts[devExtCount++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
         }
+        RDNA4R.fragInterlock = hasInterlock && fragInterlockFeat.fragmentShaderPixelInterlock;
+        if (RDNA4R.fragInterlock) {
+            fragInterlockFeat.fragmentShaderShadingRateInterlock = VK_FALSE;
+            fragInterlockFeat.pNext = enabled13.pNext;
+            enabled13.pNext = &fragInterlockFeat;
+            devExts[devExtCount++] = VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME;
+        }
+        RDNA4LOG("radv: fragment shader pixel interlock %s", RDNA4R.fragInterlock ? "enabled" : "unavailable");
         RDNA4LOG("radv: null descriptors %s", RDNA4R.nullDescriptors ? "enabled" : "unavailable (typed dummy images)");
         RDNA4LOG("radv: robust texture-buffer access %s", RDNA4R.robustTexelBuffers ? "enabled" : "unavailable");
         RDNA4LOG("radv: GPU argument tables %s", RDNA4R.gpuArgumentTables ? "enabled" : "unavailable");
@@ -700,6 +765,10 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         if (enabled12.bufferDeviceAddress && vkGetDeviceProcAddr) {
             rdna4_vkGetBufferAddress = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetBufferDeviceAddress");
             RDNA4R.bufferAddress = rdna4_vkGetBufferAddress != NULL;
+        }
+        if (hasSampleLoc && vkGetDeviceProcAddr) {
+            rdna4_vkCmdSetSampleLocationsEXT = (PFN_vkCmdSetSampleLocationsEXT)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetSampleLocationsEXT");
+            RDNA4R.sampleLocationsExt = rdna4_vkCmdSetSampleLocationsEXT != NULL && RDNA4R.sampleLocationCounts != 0;
         }
         vkGetDeviceQueue(RDNA4R.dev, qfi, 0, &RDNA4R.q);
         RDNA4R.hostAlign = 4096;

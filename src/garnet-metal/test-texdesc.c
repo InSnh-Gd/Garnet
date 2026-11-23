@@ -193,8 +193,11 @@ int main(int argc, char **argv) {
         const char *init_end = init ? strstr(init, "\n// A single-level, identity-swizzle view") : NULL;
         CHECK(init && init_end, "the RDNA4Texture descriptor initialiser is found");
         if (init && init_end) {
-            CHECK(strstr(m, "- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err {\n    return [self initWithDevice:dev descriptor:d heap:nil error:err];") != NULL,
-                  "the public initialiser delegates to the heap-aware initialiser");
+            CHECK(strstr(m, "- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err {\n"
+                             "    if (d.textureType == MTLTextureTypeTextureBuffer)\n"
+                             "        return [self initTextureBufferWithDevice:dev descriptor:d buffer:nil offset:0 error:err];\n"
+                             "    return [self initWithDevice:dev descriptor:d heap:nil error:err];") != NULL,
+                  "the public initialiser delegates to texture-buffer or heap-aware initialiser");
             CHECK(strstr(init, "rdna4_heap_image_plan plan;") != NULL &&
                   strstr(init, "rdna4_heap_image_plan_make(d, heap != nil, &plan, err)") != NULL &&
                   strstr(init, "rdna4td_t ti = plan.td;") != NULL,
@@ -244,7 +247,7 @@ int main(int argc, char **argv) {
         CHECK(strstr(m, "- (uint32_t)rdna4Layers { return rdna4td_nlayers((unsigned)_layers); }") != NULL &&
               strstr(m, "- (uint32_t)rdna4ImageLayers { return _root ? [_root rdna4ImageLayers] : rdna4td_nlayers((unsigned)_layers); }") != NULL,
               "visible view layers stay separate from whole-image transition layers");
-        CHECK(strstr(m, "- (MTLTextureType)textureType { return (MTLTextureType)rdna4td_mtl_type(_tdk); }") != NULL, "textureType comes from the kind");
+        CHECK(strstr(m, "- (MTLTextureType)textureType { return _texel ? MTLTextureTypeTextureBuffer : (MTLTextureType)rdna4td_mtl_type(_tdk); }") != NULL, "textureType comes from the kind or texture-buffer flag");
         CHECK(strstr(m, "- (NSUInteger)arrayLength { return rdna4td_array_length(_tdk, (unsigned)_layers); }") != NULL, "arrayLength comes from the kind (cube 1)");
         CHECK(strstr(m, "- (uint32_t)rdna4Slice:(NSUInteger)slice { return rdna4td_base_layer(_is3D, (NSUInteger)_baseSlice + slice); }") != NULL &&
               count(m, "[self rdna4Slice:slice]") == 2 && strstr(m, "[t rdna4Slice:slice]") != NULL,

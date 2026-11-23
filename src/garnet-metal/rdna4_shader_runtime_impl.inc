@@ -1243,7 +1243,11 @@ static VkBlendFactor rdna4_bf(MTLBlendFactor f, BOOL *bad) {
     case MTLBlendFactorSourceAlphaSaturated: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
     case MTLBlendFactorBlendColor: return VK_BLEND_FACTOR_CONSTANT_COLOR; case MTLBlendFactorOneMinusBlendColor: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
     case MTLBlendFactorBlendAlpha: return VK_BLEND_FACTOR_CONSTANT_ALPHA; case MTLBlendFactorOneMinusBlendAlpha: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
-    default: *bad = YES; return VK_BLEND_FACTOR_ZERO;   // Source1* (dual-source blending): dualSrcBlend not enabled
+    case MTLBlendFactorSource1Color: if (!RDNA4R.dualSrcBlend) *bad = YES; return VK_BLEND_FACTOR_SRC1_COLOR;
+    case MTLBlendFactorOneMinusSource1Color: if (!RDNA4R.dualSrcBlend) *bad = YES; return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    case MTLBlendFactorSource1Alpha: if (!RDNA4R.dualSrcBlend) *bad = YES; return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case MTLBlendFactorOneMinusSource1Alpha: if (!RDNA4R.dualSrcBlend) *bad = YES; return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    default: *bad = YES; return VK_BLEND_FACTOR_ZERO;
     }
 }
 static VkBlendOp rdna4_bo(MTLBlendOperation o, BOOL *bad) {

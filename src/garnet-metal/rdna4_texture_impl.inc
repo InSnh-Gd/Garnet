@@ -81,11 +81,15 @@ _Static_assert((int)MTLTextureTypeTextureBuffer == RDNA4TD_MTL_BUFFER, "MTLTextu
 - (BOOL)rdna4IsUInt;   // bundle 19: an unsigned-integer colour format (RG16Uint)
 - (BOOL)rdna4IsSInt;
 - (unsigned)rdna4UIntBits;
+- (void)rdna4IntBitsRGB:(unsigned *)rgb alpha:(unsigned *)alpha;
 - (BOOL)rdna4IsView;
+- (BOOL)isCompressed;
 - (NSUInteger)rdna4Samples;
 - (unsigned)rdna4CopyAspect;   // the aspect of a buffer<->image copy (0 = refuse: a combined depth/stencil format)
 - (VkImageView)rdna4AttViewLevel:(uint32_t)lv;
 - (VkImageView)rdna4AttViewLevel:(uint32_t)lv layer:(uint32_t)ly;   // bundle 9: cube / 2D array render targets and attachments are per-layer 2D views
+- (VkImageView)rdna4AttViewLevel:(uint32_t)lv layer:(uint32_t)ly layerCount:(uint32_t)lc;
+- (VkImageView)rdna4StorageView;
 - (VkFormat)vkFormat;
 - (uint32_t)bytesPerPixel;
 - (VkImageLayout)layout;
@@ -152,6 +156,13 @@ static BOOL rdna4_region_ok(RDNA4Texture *t, MTLRegion r, NSUInteger level, NSUI
         r.origin.y > lh || r.size.height > lh - r.origin.y || r.origin.z > ld || r.size.depth > ld - r.origin.z) {
         RDNA4LOG("%s: region origin %lu,%lu,%lu size %lux%lux%lu outside the %lux%lux%lu level %lu; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y,
                (unsigned long)r.origin.z, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.size.depth, (unsigned long)lw, (unsigned long)lh, (unsigned long)ld, (unsigned long)level); return NO; }
+    if ([t isCompressed] &&
+        ((r.origin.x & 3) || (r.origin.y & 3) ||
+         ((r.size.width & 3) && r.origin.x + r.size.width != lw) ||
+         ((r.size.height & 3) && r.origin.y + r.size.height != lh))) {
+        RDNA4LOG("%s: block-compressed region origin/size (%lu,%lu %lux%lu) is not 4x4 block aligned on %lux%lu level; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)lw, (unsigned long)lh);
+        return NO;
+    }
     return YES;
 }
 
@@ -211,11 +222,21 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
         if (err) *err = rdna4_err(44, @"A8Unorm render targets are not supported (an R8 attachment cannot take the fragment's alpha)");
         return NO;
     }
+    if (rdna4_fmt_is_bc(p->fmt)) {
+        if (p->is1D || p->samples > 1 || (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) {
+            if (err) *err = rdna4_err(44, @"block-compressed textures do not support 1D, multisample, render-target, or ShaderWrite usage");
+            return NO;
+        }
+    }
     if (p->is3D && (d.usage & MTLTextureUsageRenderTarget)) {
         if (err) *err = rdna4_err(45, @"3D render targets are not supported");
         return NO;
     }
     if (!rdna4_radv_open(err)) return NO;
+    if (rdna4_fmt_is_bc(p->fmt) && !RDNA4R.bcCompression) {
+        if (err) *err = rdna4_err(30, @"RADV does not support BC texture compression");
+        return NO;
+    }
     if (d.textureType == MTLTextureTypeCubeArray && !RDNA4R.cubeArray) {
         if (err) *err = rdna4_err(31, @"RADV does not support cube-array image views");
         return NO;
@@ -250,7 +271,7 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
         return NO;
     }
     p->canRT = p->isDS ? ((ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
-                       : (!p->is1D && !p->is3D && !(p->fmt->flags & RDNA4F_A8) && (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+                       : (!p->is1D && !p->is3D && !rdna4_fmt_is_bc(p->fmt) && !(p->fmt->flags & RDNA4F_A8) && (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
     if ((d.usage & MTLTextureUsageRenderTarget) && !p->canRT) {
         if (err) *err = rdna4_err(39, [NSString stringWithFormat:@"pixel format %lu (vk %d) type %lu cannot be a render target on RADV (features 0x%x)",
             (unsigned long)d.pixelFormat, p->fmt->vk, (unsigned long)d.textureType, ff]);
@@ -270,7 +291,8 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
         ((ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) |
         (p->canRT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
     VkImageCreateFlags icf = ((d.usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) | p->td.flags |
-        (aliasable ? VK_IMAGE_CREATE_ALIAS_BIT : 0);
+        (aliasable ? VK_IMAGE_CREATE_ALIAS_BIT : 0) |
+        ((RDNA4R.sampleLocationsExt && p->isDS && p->td.samples > 1) ? VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT : 0);
     VkImageType vit = (VkImageType)p->td.imageType;
     VkImageFormatProperties ifp = {0};
     VkResult qr = vkGetPhysicalDeviceImageFormatProperties ? vkGetPhysicalDeviceImageFormatProperties(RDNA4R.pd, p->fmt->vk, vit, VK_IMAGE_TILING_OPTIMAL, iu, icf, &ifp) : VK_SUCCESS;
@@ -430,6 +452,28 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
         return v;
     }
 }
+- (VkImageView)rdna4AttViewLevel:(uint32_t)lv layer:(uint32_t)ly layerCount:(uint32_t)lc {
+    if (lc <= 1) return [self rdna4AttViewLevel:lv layer:ly];
+    @synchronized (self) {
+        if (!_lvViews) _lvViews = [NSMutableDictionary dictionary];
+        unsigned long long rawKey = (1ULL << 62) | ((unsigned long long)lc << 40) | ((unsigned long long)ly << 16) | (unsigned long long)lv;
+        NSNumber *key = @(rawKey);
+        NSNumber *have = _lvViews[key]; if (have) return (VkImageView)(uintptr_t)have.unsignedLongLongValue;
+        VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = [self vkImage],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = _fmt->vk,
+            .subresourceRange = { rdna4dp_barrier_aspect(_aspects), [self rdna4MipLevel:lv], 1, [self rdna4Slice:ly], lc } };
+        VkImageView v = VK_NULL_HANDLE; VkResult r = vkCreateImageView(RDNA4R.dev, &vc, NULL, &v);
+        if (r != VK_SUCCESS) { RDNA4LOG("rdna4AttViewLevel %u layer %u+%u: vkCreateImageView = %d; falling back to single layer", lv, ly, lc, r); return [self rdna4AttViewLevel:lv layer:ly]; }
+        _lvViews[key] = @((unsigned long long)(uintptr_t)v);
+        [_hpBacking addView:v];
+        return v;
+    }
+}
+- (VkImageView)rdna4StorageView {
+    if (!_viewSwz && _levels <= 1 && !_aspects) return _view;
+    if (rdna4td_is_layered2d(_tdk)) return [self rdna4AttViewLevel:0 layer:0 layerCount:[self rdna4Layers]];
+    return [self rdna4AttViewLevel:0];
+}
 - (void)rdna4AdoptHeap:(RDNA4Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid {
     _hpHeap = h; _hpOff = o; _hpSize = sz; _hpId = bid;
     if (h) _hpPhysSize = sz;
@@ -516,6 +560,7 @@ RDNA4_DNR(RDNA4Texture)
     // m11h9: any pixel format of the table whose bytes per pixel equal the surface's bytes per element (BGR10A2Unorm 'l10r' and RGBA16Float 'RGhA' are what the compositor's
     // display surfaces use); an A8 / render-target mismatch is refused below by the same rules as an ordinary texture.
     if (!_fmt) IOSFAIL(71, @"pixel format %lu is not in the format table", (unsigned long)_pf);
+    if (rdna4_fmt_is_bc(_fmt)) IOSFAIL(71, @"block-compressed IOSurface textures are not supported");
     if ((_fmt->flags & RDNA4F_A8) && (d.usage & MTLTextureUsageRenderTarget)) IOSFAIL(71, @"A8Unorm render targets are not supported");
     if (d.textureType != MTLTextureType2D || d.depth != 1 || d.arrayLength != 1 || d.mipmapLevelCount != 1 || d.sampleCount != 1) IOSFAIL(72, @"only single 2D textures (no mips/array/MSAA)");
     size_t pc = IOSurfaceGetPlaneCount(s);
@@ -780,6 +825,7 @@ RDNA4_DNR(RDNA4Texture)
     _opts = ((NSUInteger)d.storageMode << 4) | ((NSUInteger)d.cpuCacheMode) | ((NSUInteger)d.hazardTrackingMode << 8);
     _fmt = rdna4_fmt(_pf);
     if (!_fmt) BFAIL(120, @"pixel format %lu not supported", (unsigned long)_pf);
+    if (rdna4_fmt_is_bc(_fmt)) BFAIL(120, @"block-compressed buffer-backed textures are not supported");
     if (d.textureType != MTLTextureType2D || d.depth != 1 || d.arrayLength != 1 || d.mipmapLevelCount != 1 || d.sampleCount != 1) BFAIL(121, @"only single 2D textures (no mips/array/MSAA)");
     if ((_fmt->flags & RDNA4F_A8) && (d.usage & MTLTextureUsageRenderTarget)) BFAIL(121, @"A8Unorm render targets are not supported");
     if (![b isKindOfClass:[RDNA4Buffer class]] || ![b contents]) BFAIL(122, @"the buffer has no CPU mapping (Private storage)");
@@ -853,11 +899,14 @@ RDNA4_DNR(RDNA4Texture)
     if (!bytes) { RDNA4LOG("replaceRegion: NULL bytes; refused"); return; }
     if ([self rdna4HostReadOnly]) { RDNA4LOG("replaceRegion: read-only backing; CPU write refused"); return; }
     if (!rdna4_region_ok(self, r, lvl, slice, "replaceRegion")) return;
+    BOOL bc = rdna4_fmt_is_bc(_fmt);
+    NSUInteger bw = bc ? (r.size.width + 3) / 4 : r.size.width;
+    NSUInteger bh = bc ? (r.size.height + 3) / 4 : r.size.height;
     NSUInteger rowBytes = 0;
-    if (__builtin_mul_overflow(r.size.width, (NSUInteger)_fmt->bpp, &rowBytes)) return;
+    if (__builtin_mul_overflow(bw, (NSUInteger)_fmt->bpp, &rowBytes)) return;
     if ((_is1D || _texel) && bpr < rowBytes) bpr = rowBytes;
     rdna4_texture_transfer transfer;
-    if (!rdna4_texture_transfer_layout(r.size.width, r.size.height, r.size.depth,
+    if (!rdna4_texture_transfer_layout(bw, bh, r.size.depth,
             _fmt->bpp, bpr, bpi, &transfer) ||
         !rdna4_texture_transfer_pointer(bytes, transfer.span)) {
         RDNA4LOG("replaceRegion: CPU row/image layout is too small or overflows; refused"); return;
@@ -878,8 +927,8 @@ RDNA4_DNR(RDNA4Texture)
     NSUInteger opts = MTLResourceStorageModeShared | RDNA4_OPT_NOZERO;
     RDNA4Buffer *stg = [[RDNA4Buffer alloc] initWithDevice:_dev length:transfer.packed_bytes options:opts error:&err];
     if (!stg) { RDNA4LOG("replaceRegion: staging buffer failed: %s", err.localizedDescription.UTF8String); return; }
-    for (NSUInteger z = 0; z < nz; z++) for (NSUInteger y = 0; y < r.size.height; y++)
-        memcpy((uint8_t *)[stg contents] + (z * r.size.height + y) * rowBytes, (const uint8_t *)bytes + z * bpi + y * bpr, rowBytes);
+    for (NSUInteger z = 0; z < nz; z++) for (NSUInteger y = 0; y < bh; y++)
+        memcpy((uint8_t *)[stg contents] + (z * bh + y) * rowBytes, (const uint8_t *)bytes + z * bpi + y * bpr, rowBytes);
     BOOL ok = rdna4_oneshot(&err, ^(VkCommandBuffer cmd) {
         rdna4_tex_to(cmd, self, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy bic = { .bufferOffset = [stg rdna4VkOffset], .bufferRowLength = 0, .bufferImageHeight = 0,
@@ -893,7 +942,8 @@ RDNA4_DNR(RDNA4Texture)
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr {
     NSUInteger bpi = 0;
-    if (r.size.depth > 1 && __builtin_mul_overflow(bpr, r.size.height, &bpi)) {
+    NSUInteger bh = rdna4_fmt_is_bc(_fmt) ? (r.size.height + 3) / 4 : r.size.height;
+    if (r.size.depth > 1 && __builtin_mul_overflow(bpr, bh, &bpi)) {
         RDNA4LOG("replaceRegion: image stride overflows; refused"); return;
     }
     [self replaceRegion:r mipmapLevel:lvl slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:bpi];
@@ -901,11 +951,14 @@ RDNA4_DNR(RDNA4Texture)
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)slice {
     if (!dst) { RDNA4LOG("getBytes: NULL destination; refused"); return; }
     if (!rdna4_region_ok(self, r, lvl, slice, "getBytes")) return;
+    BOOL bc = rdna4_fmt_is_bc(_fmt);
+    NSUInteger bw = bc ? (r.size.width + 3) / 4 : r.size.width;
+    NSUInteger bh = bc ? (r.size.height + 3) / 4 : r.size.height;
     NSUInteger rowBytes = 0;
-    if (__builtin_mul_overflow(r.size.width, (NSUInteger)_fmt->bpp, &rowBytes)) return;
+    if (__builtin_mul_overflow(bw, (NSUInteger)_fmt->bpp, &rowBytes)) return;
     if ((_is1D || _texel) && bpr < rowBytes) bpr = rowBytes;
     rdna4_texture_transfer transfer;
-    if (!rdna4_texture_transfer_layout(r.size.width, r.size.height, r.size.depth,
+    if (!rdna4_texture_transfer_layout(bw, bh, r.size.depth,
             _fmt->bpp, bpr, bpi, &transfer) ||
         !rdna4_texture_transfer_pointer(dst, transfer.span)) {
         RDNA4LOG("getBytes: CPU row/image layout is too small or overflows; refused"); return;
@@ -935,13 +988,14 @@ RDNA4_DNR(RDNA4Texture)
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         if (was != VK_IMAGE_LAYOUT_UNDEFINED) rdna4_tex_to(cmd, self, was);
     }, NULL);
-    if (ok) for (NSUInteger z = 0; z < nz; z++) for (NSUInteger y = 0; y < r.size.height; y++)
-        memcpy((uint8_t *)dst + z * bpi + y * bpr, (const uint8_t *)[stg contents] + (z * r.size.height + y) * rowBytes, rowBytes);
+    if (ok) for (NSUInteger z = 0; z < nz; z++) for (NSUInteger y = 0; y < bh; y++)
+        memcpy((uint8_t *)dst + z * bpi + y * bpr, (const uint8_t *)[stg contents] + (z * bh + y) * rowBytes, rowBytes);
     RDNA4LOGR("getBytes: %lux%lux%lu level %lu: %s", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)nz, (unsigned long)lvl, ok ? "ok" : err.localizedDescription.UTF8String);
 }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl {
     NSUInteger bpi = 0;
-    if (r.size.depth > 1 && __builtin_mul_overflow(bpr, r.size.height, &bpi)) {
+    NSUInteger bh = rdna4_fmt_is_bc(_fmt) ? (r.size.height + 3) / 4 : r.size.height;
+    if (r.size.depth > 1 && __builtin_mul_overflow(bpr, bh, &bpi)) {
         RDNA4LOG("getBytes: image stride overflows; refused"); return;
     }
     [self getBytes:dst bytesPerRow:bpr bytesPerImage:bpi fromRegion:r mipmapLevel:lvl slice:0];
@@ -957,7 +1011,8 @@ RDNA4_DNR(RDNA4Texture)
 - (BOOL)rdna4IsDS { return (_root ? [_root rdna4Aspects] : _aspects) != 0 && (_root ? [_root rdna4Aspects] : _aspects) != RDNA4DP_ASP_COLOR; }
 - (BOOL)rdna4IsUInt { return _fmt != NULL && (_fmt->flags & RDNA4F_UINT) != 0; }
 - (BOOL)rdna4IsSInt { return _fmt != NULL && (_fmt->flags & RDNA4F_SINT) != 0; }
-- (unsigned)rdna4UIntBits { return _fmt && _fmt->mtl == MTLPixelFormatR32Uint ? 32 : 16; }
+- (unsigned)rdna4UIntBits { unsigned rgb = 16, a = 16; rdna4_int_bits(_pf, &rgb, &a); return rgb; }
+- (void)rdna4IntBitsRGB:(unsigned *)rgb alpha:(unsigned *)alpha { unsigned r = 16, a = 16; rdna4_int_bits(_pf, &r, &a); if (rgb) *rgb = r; if (alpha) *alpha = a; }
 - (BOOL)rdna4IsView { return _root != nil; }
 - (NSUInteger)rdna4Samples { return _root ? 1 : (_samples ? _samples : 1); }
 - (unsigned)rdna4CopyAspect { return [self rdna4IsDS] ? rdna4dp_copy_aspect([self rdna4Aspects]) : RDNA4DP_ASP_COLOR; }
@@ -1003,7 +1058,7 @@ RDNA4_RESOURCE_SPI
 - (id)remoteStorageTexture { return nil; }
 - (id)newRemoteTextureViewForDevice:(id)d { (void)d; return nil; }
 - (MTLTextureSwizzleChannels)swizzle { return _swz; }
-- (BOOL)isCompressed { return NO; }
+- (BOOL)isCompressed { return rdna4_fmt_is_bc(_fmt); }
 - (BOOL)isDrawable { return NO; }
 - (void)didModifyData {}
 - (BOOL)canGenerateMipmapLevels { return _levels > 1; }
@@ -1048,11 +1103,20 @@ RDNA4_RESOURCE_SPI
         VFAIL(98, @"the parent image was not created as cube-compatible");
     if (view.kind == RDNA4TD_K_CUBEARRAY && !RDNA4R.cubeArray) VFAIL(98, @"RADV does not support cube-array image views");
     const RDNA4Fmt *f = rdna4_fmt(pf);
-    if (root->_aspects) {   // bundle 10: a view of a depth/stencil texture keeps the texture's own format (no reinterpretation) and its single sampling aspect
-        if (pf != root->_pf) VFAIL(101, @"pixel-format views of a depth/stencil texture (%lu -> %lu) are not supported", (unsigned long)root->_pf, (unsigned long)pf);
-        f = root->_fmt; }
+    unsigned viewAspects = root->_aspects;
+    if (root->_aspects) {   // bundle 10 + Metal 2 F29: Depth32Float_Stencil8 allows X32_Stencil8 sampling views; other DS reinterpretation stays refused
+        if (root->_pf == MTLPixelFormatDepth32Float_Stencil8 && pf == MTLPixelFormatX32_Stencil8) {
+            f = root->_fmt;
+            viewAspects = RDNA4DP_ASP_STENCIL;
+        } else if (pf != root->_pf) {
+            VFAIL(101, @"pixel-format views of a depth/stencil texture (%lu -> %lu) are not supported", (unsigned long)root->_pf, (unsigned long)pf);
+        } else {
+            f = root->_fmt;
+        }
+    }
     if (!f) VFAIL(94, @"view pixel format %lu not supported", (unsigned long)pf);
-    if (pf != root->_pf) {
+    if (!root->_aspects && pf != root->_pf) {
+        if (rdna4_fmt_is_bc(f) != rdna4_fmt_is_bc(root->_fmt)) VFAIL(95, @"cannot reinterpret between block-compressed and uncompressed formats (%lu -> %lu)", (unsigned long)root->_pf, (unsigned long)pf);
         if (f->bpp != root->_fmt->bpp) VFAIL(95, @"view pixel format %lu has %u bytes per pixel, the texture has %u", (unsigned long)pf, f->bpp, root->_fmt->bpp);
         if (!(root->_usage & MTLTextureUsagePixelFormatView)) VFAIL(96, @"the texture was not created with MTLTextureUsagePixelFormatView");
     }
@@ -1064,9 +1128,9 @@ RDNA4_RESOURCE_SPI
     if (root->_is3D) VFAIL(99, @"views of 3D textures are not implemented");
     VkComponentMapping vcm = rdna4_view_map(f, swz);   // composes the client swizzle with the format's own (A8: (0,0,0,R))
     // Attachments and storage images require identity mapping, including views.
-    _levels = levels.length; _depth = 1; _aspects = root->_aspects; _viewSwz = !rdna4_is_identity_map(&vcm);
+    _levels = levels.length; _depth = 1; _aspects = viewAspects; _viewSwz = !rdna4_is_identity_map(&vcm);
     VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = [root vkImage], .viewType = (VkImageViewType)view.viewType, .format = f->vk,
-        .components = vcm, .subresourceRange = { root->_aspects ? rdna4dp_view_aspect(root->_aspects) : VK_IMAGE_ASPECT_COLOR_BIT,
+        .components = vcm, .subresourceRange = { viewAspects ? rdna4dp_view_aspect(viewAspects) : VK_IMAGE_ASPECT_COLOR_BIT,
             _baseLevel, (uint32_t)_levels, _baseSlice, rdna4td_nlayers(view.layersIvar) } };
     VkResult r = vkCreateImageView(RDNA4R.dev, &vc, NULL, &_view);
     if (r != VK_SUCCESS) VFAIL(98, @"vkCreateImageView = %d", r);

@@ -104,6 +104,13 @@ static inline int rdna4sa_target_ok(unsigned srcW, unsigned srcH, unsigned srcFm
     if (srcFmt != dstFmt) { *why = "the resolve texture's pixel format differs from the attachment's"; return 0; }
     *why = NULL; return 1;
 }
+// Depth/stencil resolve target validation (Vulkan 1.2 VkSubpassDescriptionDepthStencilResolve).
+static inline int rdna4sa_ds_target_ok(unsigned srcW, unsigned srcH, unsigned srcFmt, unsigned dstW, unsigned dstH, unsigned dstFmt, unsigned dstSamples, const char **why) {
+    if (dstSamples != 1) { *why = "the resolve texture must be single-sample"; return 0; }
+    if (srcW != dstW || srcH != dstH) { *why = "the resolve texture's level size differs from the attachment's"; return 0; }
+    if (srcFmt != dstFmt) { *why = "the depth/stencil resolve texture's pixel format differs from the attachment's"; return 0; }
+    *why = NULL; return 1;
+}
 
 // ---- render-pass attachment operations for a depth/stencil attachment ----
 enum { RDNA4VK_LOAD = 0, RDNA4VK_CLEAR = 1, RDNA4VK_LOAD_DONT_CARE = 2, RDNA4VK_STORE = 0, RDNA4VK_STORE_DONT_CARE = 1 };   // VkAttachmentLoadOp / StoreOp

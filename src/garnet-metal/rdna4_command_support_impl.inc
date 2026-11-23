@@ -10,9 +10,10 @@ static uint64_t rdna4_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
 // flags: RDNA4F_A8 = Metal A8Unorm stored as VK R8_UNORM; sampling goes through a view with components (0,0,0,R) (Metal returns (0,0,0,a)); a render target of this
 // format is refused (a Vulkan attachment view must be identity, so a fragment's alpha cannot be steered into the R8 image).
-#define RDNA4F_A8 1u
+#define RDNA4F_A8   1u
 #define RDNA4F_SINT 8u
 #define RDNA4F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/rdna4m-nouint restores the old refusal. (2u is RDNA4F_DS below.)
+#define RDNA4F_BC   16u  // 4x4 block-compressed format; bpp holds bytes per 4x4 block (8 or 16)
 typedef struct { MTLPixelFormat mtl; VkFormat vk; uint32_t bpp; uint32_t flags; } RDNA4Fmt;
 static const RDNA4Fmt rdna4_fmts[] = {
     { MTLPixelFormatBGRA8Unorm,      VK_FORMAT_B8G8R8A8_UNORM, 4, 0 },
@@ -43,7 +44,63 @@ static const RDNA4Fmt rdna4_fmts[] = {
     { MTLPixelFormatRG16Uint,        VK_FORMAT_R16G16_UINT,              4, RDNA4F_UINT },
     { MTLPixelFormatR32Uint,         VK_FORMAT_R32_UINT,                 4, RDNA4F_UINT },
     { MTLPixelFormatR32Sint,         VK_FORMAT_R32_SINT,                 4, RDNA4F_SINT },
+    // Metal 2 Mac2 uncompressed SNorm / UInt / SInt / RGB9E5Float formats
+    { MTLPixelFormatR8Snorm,         VK_FORMAT_R8_SNORM,                 1, 0 },
+    { MTLPixelFormatR8Uint,          VK_FORMAT_R8_UINT,                  1, RDNA4F_UINT },
+    { MTLPixelFormatR8Sint,          VK_FORMAT_R8_SINT,                  1, RDNA4F_SINT },
+    { MTLPixelFormatR16Snorm,        VK_FORMAT_R16_SNORM,                2, 0 },
+    { MTLPixelFormatR16Uint,         VK_FORMAT_R16_UINT,                 2, RDNA4F_UINT },
+    { MTLPixelFormatR16Sint,         VK_FORMAT_R16_SINT,                 2, RDNA4F_SINT },
+    { MTLPixelFormatRG8Snorm,        VK_FORMAT_R8G8_SNORM,               2, 0 },
+    { MTLPixelFormatRG8Uint,         VK_FORMAT_R8G8_UINT,                2, RDNA4F_UINT },
+    { MTLPixelFormatRG8Sint,         VK_FORMAT_R8G8_SINT,                2, RDNA4F_SINT },
+    { MTLPixelFormatRG16Snorm,       VK_FORMAT_R16G16_SNORM,             4, 0 },
+    { MTLPixelFormatRG16Sint,        VK_FORMAT_R16G16_SINT,              4, RDNA4F_SINT },
+    { MTLPixelFormatRGBA8Snorm,      VK_FORMAT_R8G8B8A8_SNORM,           4, 0 },
+    { MTLPixelFormatRGBA8Uint,       VK_FORMAT_R8G8B8A8_UINT,            4, RDNA4F_UINT },
+    { MTLPixelFormatRGBA8Sint,       VK_FORMAT_R8G8B8A8_SINT,            4, RDNA4F_SINT },
+    { MTLPixelFormatRGB10A2Uint,     VK_FORMAT_A2B10G10R10_UINT_PACK32,  4, RDNA4F_UINT },
+    { MTLPixelFormatRGB9E5Float,     VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,   4, 0 },
+    { MTLPixelFormatRG32Uint,        VK_FORMAT_R32G32_UINT,              8, RDNA4F_UINT },
+    { MTLPixelFormatRG32Sint,        VK_FORMAT_R32G32_SINT,              8, RDNA4F_SINT },
+    { MTLPixelFormatRGBA16Snorm,     VK_FORMAT_R16G16B16A16_SNORM,       8, 0 },
+    { MTLPixelFormatRGBA16Uint,      VK_FORMAT_R16G16B16A16_UINT,        8, RDNA4F_UINT },
+    { MTLPixelFormatRGBA16Sint,      VK_FORMAT_R16G16B16A16_SINT,        8, RDNA4F_SINT },
+    { MTLPixelFormatRGBA32Uint,      VK_FORMAT_R32G32B32A32_UINT,       16, RDNA4F_UINT },
+    { MTLPixelFormatRGBA32Sint,      VK_FORMAT_R32G32B32A32_SINT,       16, RDNA4F_SINT },
+    // Metal 2 Mac2 BC1..BC7 block-compressed formats (bpp = bytes per 4x4 block)
+    { MTLPixelFormatBC1_RGBA,        VK_FORMAT_BC1_RGBA_UNORM_BLOCK,     8, RDNA4F_BC },
+    { MTLPixelFormatBC1_RGBA_sRGB,   VK_FORMAT_BC1_RGBA_SRGB_BLOCK,      8, RDNA4F_BC },
+    { MTLPixelFormatBC2_RGBA,        VK_FORMAT_BC2_UNORM_BLOCK,         16, RDNA4F_BC },
+    { MTLPixelFormatBC2_RGBA_sRGB,   VK_FORMAT_BC2_SRGB_BLOCK,          16, RDNA4F_BC },
+    { MTLPixelFormatBC3_RGBA,        VK_FORMAT_BC3_UNORM_BLOCK,         16, RDNA4F_BC },
+    { MTLPixelFormatBC3_RGBA_sRGB,   VK_FORMAT_BC3_SRGB_BLOCK,          16, RDNA4F_BC },
+    { MTLPixelFormatBC4_RUnorm,      VK_FORMAT_BC4_UNORM_BLOCK,          8, RDNA4F_BC },
+    { MTLPixelFormatBC4_RSnorm,      VK_FORMAT_BC4_SNORM_BLOCK,          8, RDNA4F_BC },
+    { MTLPixelFormatBC5_RGUnorm,     VK_FORMAT_BC5_UNORM_BLOCK,         16, RDNA4F_BC },
+    { MTLPixelFormatBC5_RGSnorm,     VK_FORMAT_BC5_SNORM_BLOCK,         16, RDNA4F_BC },
+    { MTLPixelFormatBC6H_RGBFloat,   VK_FORMAT_BC6H_SFLOAT_BLOCK,       16, RDNA4F_BC },
+    { MTLPixelFormatBC6H_RGBUfloat,  VK_FORMAT_BC6H_UFLOAT_BLOCK,       16, RDNA4F_BC },
+    { MTLPixelFormatBC7_RGBAUnorm,   VK_FORMAT_BC7_UNORM_BLOCK,         16, RDNA4F_BC },
+    { MTLPixelFormatBC7_RGBAUnorm_sRGB, VK_FORMAT_BC7_SRGB_BLOCK,       16, RDNA4F_BC },
 };
+static inline BOOL rdna4_fmt_is_bc(const RDNA4Fmt *f) { return f != NULL && (f->flags & RDNA4F_BC) != 0; }
+static inline void rdna4_int_bits(MTLPixelFormat pf, unsigned *rgb, unsigned *a) {
+    switch (pf) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+        *rgb = 8; *a = 8; return;
+    case MTLPixelFormatRGB10A2Uint:
+        *rgb = 10; *a = 2; return;
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        *rgb = 32; *a = 32; return;
+    default:
+        *rgb = 16; *a = 16; return;
+    }
+}
 #define RDNA4_NOUINT_FILE "/private/tmp/rdna4m-nouint"   // bundle 19: exists -> the integer formats are refused as before (nil), read ONCE per process
 static BOOL rdna4_nouint(void) {
     static BOOL v; static dispatch_once_t once;

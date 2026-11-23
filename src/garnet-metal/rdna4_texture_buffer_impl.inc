@@ -8,7 +8,7 @@
     if (!d || d.textureType != MTLTextureTypeTextureBuffer || !d.width || d.height != 1 ||
         d.depth != 1 || d.arrayLength != 1 || d.sampleCount != 1 || d.mipmapLevelCount != 1 ||
         (d.usage & ~(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)) ||
-        !format || (format->flags & RDNA4F_A8) ||
+        !format || (format->flags & (RDNA4F_A8 | RDNA4F_BC)) ||
         __builtin_mul_overflow(d.width, (NSUInteger)format->bpp, &bytes))
         TBFAIL(@"invalid texture-buffer geometry, format, or usage");
     if (buffer && (![buffer isKindOfClass:[RDNA4Buffer class]] || [buffer device] != dev ||

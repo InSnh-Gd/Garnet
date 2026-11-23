@@ -1896,7 +1896,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 if (!t) { [self rdna4Fail:[NSString stringWithFormat:@"%s: writable texture(%u) is used by the shader but was never bound", nm, ix]]; return NO; }
                 if ([t rdna4IsTexel]) { [self rdna4Fail:@"storage image binding cannot use a texture buffer"]; return NO; }
                 [self rdna4RetainEncoded:t];
-                ii[nii++] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, [t rdna4AttViewLevel:0], VK_IMAGE_LAYOUT_GENERAL };   // storage images: single-level, identity-swizzle view
+                ii[nii++] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, [t rdna4StorageView], VK_IMAGE_LAYOUT_GENERAL };   // storage images: identity-swizzle full-layer view
             }
             break;
         case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:   // 11e-2: [[color(n)]] = binding 192+n = the encoder's colour attachment n, read in place (GENERAL)

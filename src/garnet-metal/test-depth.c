@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
         // pipelines
         CHECK(strstr(m, "rdna4pc_config(d.depthAttachmentPixelFormat != MTLPixelFormatInvalid, d.stencilAttachmentPixelFormat != MTLPixelFormatInvalid, (unsigned long)d.rasterSampleCount") != NULL, "pipeline creation asks rdna4pc_config with the descriptor's depth / stencil formats and rasterSampleCount");
         CHECK(!strstr(m, "depth/stencil attachments not implemented in 10d"), "the old depth/stencil refusal is gone");
-        CHECK(strstr(m, ".pDepthStencilState = _pc.hasDS ? &dss : NULL") != NULL && strstr(m, ".rasterizationSamples = (VkSampleCountFlagBits)_pc.samples") != NULL && strstr(m, ".dynamicStateCount = _pc.ndyn") != NULL, "the Vulkan pipeline takes the depth/stencil state, the sample count and the dynamic states from the config");
+        CHECK(strstr(m, ".pDepthStencilState = _pc.hasDS ? &dss : NULL") != NULL && strstr(m, ".rasterizationSamples = (VkSampleCountFlagBits)_pc.samples") != NULL && strstr(m, ".dynamicStateCount = ndyn") != NULL, "the Vulkan pipeline takes the depth/stencil state, the sample count and the dynamic states from the config");
         CHECK(strstr(m, "rdna4ds_decode(dk, &dv);") != NULL && strstr(m, ".depthWriteEnable = dv.depthWrite ? VK_TRUE : VK_FALSE, .depthCompareOp = (VkCompareOp)dv.depthCompareOp") != NULL, "VkPipelineDepthStencilStateCreateInfo is filled from the decoded key (write enable, compare op)");
         CHECK(strstr(m, ".front = { (VkStencilOp)dv.front.failOp, (VkStencilOp)dv.front.passOp, (VkStencilOp)dv.front.depthFailOp, (VkCompareOp)dv.front.compareOp, 0, 0, 0 }") != NULL &&
               strstr(m, ".back = { (VkStencilOp)dv.back.failOp, (VkStencilOp)dv.back.passOp, (VkStencilOp)dv.back.depthFailOp, (VkCompareOp)dv.back.compareOp, 0, 0, 0 }") != NULL, "front and back VkStencilOpState get fail / pass / depthFail / compare in Vulkan's order");
@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
         CHECK(strstr(m, "k.na = na + nd; k.fetch = (fetch ? 1u : 0u) | (nd << 1);") != NULL, "the render-pass cache key counts the depth attachment (a colour-only pass: the old key)");
         // draws
         CHECK(strstr(m, "[_pso rdna4DSVk] != _dsVkFmt || [_pso rdna4SampleCount] != _encSamples") != NULL, "a draw checks that the pipeline's depth/stencil format and sample count are the pass's");
-        CHECK(strstr(m, "uint32_t dk = [_pso rdna4DSKey:&_dsi];") != NULL && strstr(m, "vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk];") != NULL && strstr(m, "uint32_t fkey = (uint32_t)front | (dk << 1);") != NULL, "a draw looks the pipeline up with the bound state's key, and the last-answer cache keys on it too");
+        CHECK(strstr(m, "uint32_t dk = [_pso rdna4DSKey:&_dsi];") != NULL && strstr(m, "pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];") != NULL && strstr(m, "uint32_t fkey = (uint32_t)front | (dk << 1);") != NULL, "a draw looks the pipeline up with the bound state's key, and the last-answer cache keys on it too");
         CHECK(strstr(m, "vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, _sref[0]); vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, _sref[1]);") != NULL && strstr(m, "vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead)") != NULL &&
               strstr(m, "vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite)") != NULL && strstr(m, "vkCmdSetDepthBias(cmd, _bias[0], _bias[1], _bias[2])") != NULL, "a draw sets the stencil masks, both references and the depth bias dynamically");
         CHECK(strstr(m, "- (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; }") != NULL && strstr(m, "_dsi = [(RDNA4DepthStencilState *)s rdna4Info];") != NULL && strstr(m, "[self rdna4OwnResource:s kind:RDNA4_RESOURCE_DEPTH_STENCIL") != NULL && strstr(m, "_bias[0] = a; _bias[1] = RDNA4R.dbClamp ? c : 0.0f; _bias[2] = b;") != NULL, "setStencilReferenceValue:, setDepthStencilState: and setDepthBias: record their values");
@@ -195,8 +195,8 @@ int main(int argc, char **argv) {
           const char *e = enc ? strstr(enc, "- (void)endEncoding {") : NULL;
           const char *r = e ? strstr(e, "[self rdna4ResolveAll];") : NULL, *b = e ? strstr(e, "rdna4_full_barrier([_cb vk]);") : NULL, *end = e ? strstr(e, "RDNA4LOGR(\"RDNA4RenderEncoder endEncoding") : NULL, *ep = e ? strstr(e, "if (_inPass) { [self rdna4EndPass]; }") : NULL;   // build 18: the pass ends through the one rdna4EndPass helper (it ends the open occlusion query first)
           CHECK(e && r && b && end && ep && ep < r && r < b && b < end, "endEncoding ends the render pass, THEN resolves, THEN the barrier (resolve never runs inside a pass and is not skipped)"); }
-        CHECK(strstr(m, "vkCmdResolveImage(cmd, [src vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, [dst vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);") != NULL && strstr(m, "if (!sat.resolve) continue;") != NULL, "the resolve is a vkCmdResolveImage from the attachment's level / slice into the resolve texture's");
-        CHECK(strstr(m, ".srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _slvl[i], _sslice[i], 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _rlvl[i], _rslice[i], 1 }") != NULL, "the resolve names the source level / slice and the destination level / slice");
+        CHECK(strstr(m, "vkCmdResolveImage(cmd, [src vkImage], rdna4_use_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),") != NULL && strstr(m, "if (!sat.resolve) continue;") != NULL, "the resolve is a vkCmdResolveImage from the attachment's level / slice into the resolve texture's");
+        CHECK(strstr(m, ".srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _slvl[i], _sslice[i], _layers }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _rlvl[i], _rslice[i], _layers }") != NULL, "the resolve names the source level / slice and the destination level / slice");
         // blit and descriptors
         CHECK(strstr(m, ".imageSubresource = { [t rdna4CopyAspect], [t rdna4MipLevel:level], [t rdna4Slice:slice], 1 }") != NULL && strstr(m, ".srcSubresource = { [a rdna4Aspects], sourceMip, sourceSlice, 1 }") != NULL && strstr(m, ".dstSubresource = { [b rdna4Aspects], destinationMip, destinationSlice, 1 }") != NULL, "blit copies use the texture's aspect (buffer copies: the single copy aspect; texture to texture: every aspect)");
         CHECK(strstr(m, "if (expectedKinds != sampleKind)") != NULL &&
@@ -209,6 +209,12 @@ int main(int argc, char **argv) {
               "heap sizing knows the colour and depth formats");
         CHECK(strstr(m, "_Static_assert((int)MTLPixelFormatDepth16Unorm == RDNA4DP_MTL_DEPTH16") != NULL && strstr(m, "(int)MTLStoreActionStoreAndMultisampleResolve == RDNA4SA_STORE_RESOLVE") != NULL && strstr(m, "(int)VK_STENCIL_OP_DECREMENT_AND_WRAP == RDNA4DS_OP_DEC_WRAP") != NULL, "the header's numeric values are asserted against the real Metal and Vulkan enums");
     }
+    { const char *why = NULL;
+      CHECK(rdna4sa_ds_target_ok(64, 64, 126, 64, 64, 126, 1, &why) &&
+            !rdna4sa_ds_target_ok(64, 64, 126, 64, 64, 126, 4, &why) &&
+            !rdna4sa_ds_target_ok(64, 64, 126, 32, 64, 126, 1, &why) &&
+            !rdna4sa_ds_target_ok(64, 64, 126, 64, 64, 124, 1, &why),
+            "rdna4sa_ds_target_ok validates sample count, dimensions, and compatible format"); }
     free(m);
     printf("test-depth: %d checks, %d failed\n", checks, fails); return fails ? 1 : 0;
 }

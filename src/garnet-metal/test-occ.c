@@ -105,6 +105,9 @@ int main(int argc, char **argv) {
     p_begin(&p, 4, 0); { int e; int rc = rdna4occ_set(&p.o, RDNA4OCC_BOOLEAN, 0, &e); CHECK("a 4-byte buffer cannot hold an 8-byte result", rc == -1, "rc %d", rc); }
     p_begin(&p, 64, 0); p_set(&p, RDNA4OCC_COUNTING, 3); p_draw(&p, 99); p_resolve(&p, b, 1);
     CHECK("a rejected selection writes nothing and counts nothing", b[1] == 77 && p.begun == 0 && p.o.nu == 0, "[8]=%llu begun %d nu %u", (unsigned long long)b[1], p.begun, p.o.nu);
+    p_begin(&p, UINT64_C(512) * 1024u, 0);
+    { int e; int rc = rdna4occ_set(&p.o, RDNA4OCC_COUNTING, RDNA4OCC_MAX_BYTES - 8, &e); CHECK("256 KiB - 8 offset is accepted in a 512 KiB buffer", rc == 0 && p.o.mode == RDNA4OCC_COUNTING, "rc %d", rc); }
+    { int e; int rc = rdna4occ_set(&p.o, RDNA4OCC_COUNTING, RDNA4OCC_MAX_BYTES, &e); CHECK("256 KiB offset is rejected at the Mac2 limit", rc == -1 && p.o.mode == RDNA4OCC_DISABLED, "rc %d mode %d", rc, p.o.mode); }
 
     // ---- the fail-safe: "visible", never zero
     memset(b, 0, sizeof b);
@@ -151,13 +154,13 @@ int main(int argc, char **argv) {
     CHECK("pin: vkCmdEndRenderPass( is called from rdna4EndPass only", COUNT("vkCmdEndRenderPass(") == 1, "%d", COUNT("vkCmdEndRenderPass("));
     { const char *h = FIND("- (void)rdna4EndPass {", src); const char *e = h ? FIND("\n}\n", h) : NULL; const char *a = h ? FIND("[self rdna4OccEndQuery];", h) : NULL; const char *b2 = h ? FIND("vkCmdEndRenderPass(", h) : NULL;
       CHECK("pin: rdna4EndPass ends the open query BEFORE it ends the render pass", h && e && a && b2 && a < b2 && b2 < e, "helper present %d, order ok %d", h != NULL, (a && b2 && a < b2)); }
-    CHECK("pin: every pass-end site goes through rdna4EndPass (6 splits incl. indirect-argument sync + endEncoding)", COUNT("[self rdna4EndPass]") == 7, "%d", COUNT("[self rdna4EndPass]"));
+    CHECK("pin: every pass-end site goes through rdna4EndPass (uploads, barriers, framebuffer fetch, indirect-arg sync, endEncoding)", COUNT("[self rdna4EndPass]") == 10, "%d", COUNT("[self rdna4EndPass]"));
     { const char *pd = FIND("- (BOOL)rdna4PrepareDraw:", src); const char *bp = pd ? FIND("[self rdna4BeginPass];", pd) : NULL; const char *od = bp ? FIND("[self rdna4OccDraw];", bp) : NULL; const char *dr = FIND("- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)ic baseInstance", src);
       CHECK("pin: the query begins in rdna4PrepareDraw AFTER the render pass has begun, and before the draw is recorded", pd && bp && od && dr && pd < bp && bp < od && od < dr, "ordered %d", (pd && bp && od && dr && pd < bp && bp < od && od < dr)); }
-    { const char *pd = FIND("- (void)rdna4PoolDone {", src); const char *e = pd ? FIND("\n", pd) : NULL; int ok = pd && e; if (ok) { const char *r = FIND("rdna4OccResolve", pd); const char *c = FIND("rdna4_fence_close", pd); ok = r && c && r < e && r < c; }
+    { const char *pd = FIND("- (void)rdna4PoolDone {", src); const char *e = pd ? FIND("\n}", pd) : NULL; int ok = pd && e; if (ok) { const char *r = FIND("rdna4OccResolve", pd); const char *c = FIND("rdna4_fence_close", pd); ok = r && c && r < e && r < c; }
       CHECK("pin: rdna4PoolDone resolves the visibility buffers (before it closes the fence serial)", ok, "ok %d", ok); }
-    { const char *a = FIND("if (r == VK_SUCCESS) [keep rdna4PoolDone];", src); const char *b2 = a ? FIND("[self commandBufferDidComplete:keep startTime:t1 completionTime:rdna4_now() error:werr];\n            RDNA4LOGR(\"commandBufferDidComplete sent\")", a) : NULL;
-      CHECK("pin: the resolve (rdna4PoolDone) happens BEFORE commandBufferDidComplete on the normal completion path", a && b2 && a < b2, "ordered %d", (a && b2 && a < b2)); }
+    { const char *a = FIND("- (void)rdna4DeliverTerminalSuccessWithQueue:", src); const char *p2 = a ? FIND("[self rdna4PoolDone];", a) : NULL; const char *b2 = p2 ? FIND("[queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:self->_encErr];", p2) : NULL;
+      CHECK("pin: the resolve (rdna4PoolDone) happens BEFORE commandBufferDidComplete on the normal completion path", p2 && b2 && p2 < b2, "ordered %d", (p2 && b2 && p2 < b2)); }
     CHECK("pin: the write happens through rdna4occ_final (the arithmetic of this header), once per used offset", COUNT("rdna4occ_final(") == 1, "%d", COUNT("rdna4occ_final("));
     CHECK("pin: the results are read with the availability bit and without VK_QUERY_RESULT_WAIT_BIT", COUNT("VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") == 1 && COUNT("VK_QUERY_RESULT_WAIT_BIT") == 0, "avail %d wait %d", COUNT("VK_QUERY_RESULT_WITH_AVAILABILITY_BIT"), COUNT("VK_QUERY_RESULT_WAIT_BIT"));
     CHECK("pin: the query pool is reset at encoder creation (outside the pass), once", COUNT("vkCmdResetQueryPool([_cb vk]") == 1, "%d", COUNT("vkCmdResetQueryPool([_cb vk]"));

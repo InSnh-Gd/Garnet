@@ -30,6 +30,7 @@
 enum { RDNA4OCC_DISABLED = 0, RDNA4OCC_BOOLEAN = 1, RDNA4OCC_COUNTING = 2 };
 #define RDNA4OCC_MAXQ 256   // query intervals per render pass = the chunk of query indices reserved at encoder creation
 #define RDNA4OCC_MAXU 256   // distinct offsets per render pass
+#define RDNA4OCC_MAX_BYTES (UINT64_C(256) * 1024u)   // Mac2 visibility query offset table limit (256 KiB)
 
 typedef struct { uint64_t off; uint8_t b, c; } rdna4occ_u;   // a used offset: Boolean / Counting selected for it at least once
 typedef struct {
@@ -53,7 +54,7 @@ static inline void rdna4occ_dead(rdna4occ *o) { o->overflow = 1; o->dead = 1; }
 // setVisibilityResultMode:offset:. Returns 0 = recorded, -1 = rejected (the mode and offset are then Disabled). *endActive = 1: the caller must vkCmdEndQuery the query that was open NOW (it is o->activeQ; the interval is already closed in the bookkeeping).
 static inline int rdna4occ_set(rdna4occ *o, unsigned long mode, uint64_t off, int *endActive) {
     *endActive = 0;
-    int bad = mode > RDNA4OCC_COUNTING || (mode != RDNA4OCC_DISABLED && ((off & 7u) != 0 || off > o->buflen || o->buflen - off < 8));
+    int bad = mode > RDNA4OCC_COUNTING || (mode != RDNA4OCC_DISABLED && ((off & 7u) != 0 || off > o->buflen || o->buflen - off < 8 || off >= RDNA4OCC_MAX_BYTES || RDNA4OCC_MAX_BYTES - off < 8));
     if (bad) { o->rejected++; mode = RDNA4OCC_DISABLED; }
     if ((int)mode == o->mode && (mode == RDNA4OCC_DISABLED || off == o->off)) return bad ? -1 : 0;   // nothing changed: the open interval continues
     if (o->active) { o->active = 0; *endActive = 1; }
