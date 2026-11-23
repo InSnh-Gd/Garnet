@@ -12,8 +12,11 @@
     }
     // Keep only this draw/dispatch's declarations; each segment owns its snapshot.
     NSSet *bufferSnapshot = [bufferResources copy];
-    [self rdna4RetainArgument:bufferSnapshot];
-    _bufferAddressResources = bufferSnapshot;
+    NSSet *retainedSnapshot = (_curSegment && !_curSegment->ended)
+        ? ([_curSegment->argumentRefs member:bufferSnapshot] ?: bufferSnapshot)
+        : bufferSnapshot;
+    [self rdna4RetainArgument:retainedSnapshot];
+    _bufferAddressResources = retainedSnapshot;
     NSMutableSet *samplers = [NSMutableSet set];
     NSMutableArray<NSDictionary *> *writes = [NSMutableArray array];
     NSString *scopeError = nil;
@@ -42,10 +45,11 @@
         if ([row[2] boolValue]) {
             RDNA4Texture *texture = row[1];
             if ([texture rdna4IsTexel]) {
-                BOOL storage = [texture rdna4TexelWritable];
-                unsigned category = storage ? 1u : 0u;
-                if (tables->dynamicTexel[category])
-                    [texelRows[category] addObject:row];
+                MTLTextureUsage usage = [texture usage];
+                if (tables->dynamicTexel[0] && (!usage || (usage & MTLTextureUsageShaderRead)))
+                    [texelRows[0] addObject:row];
+                if (tables->dynamicTexel[1] && [texture rdna4TexelWritable])
+                    [texelRows[1] addObject:row];
                 continue;
             }
             if (tables->capacity[0] || tables->imageQueries) [rows[0] addObject:row];
@@ -283,15 +287,16 @@
             for (NSUInteger index = 1; valid && index < tokenCount; ++index) {
                 NSArray *row = texelRows[texel][index - 1];
                 RDNA4Texture *texture = row[1];
+                MTLTextureUsage usage = [texture usage];
                 if (![texture rdna4IsTexel] ||
-                    [texture rdna4TexelWritable] != (texel != 0) ||
+                    (texel ? ![texture rdna4TexelWritable]
+                           : (usage && !(usage & MTLTextureUsageShaderRead))) ||
                     !(views[index] = [texture rdna4TexelView])) {
                     valid = NO;
                     break;
                 }
                 [self rdna4RetainArgument:texture];
-                prepare(texture, VK_IMAGE_LAYOUT_GENERAL,
-                        [texture rdna4TexelWritable]);
+                prepare(texture, VK_IMAGE_LAYOUT_GENERAL, texel != 0);
             }
         }
         for (uint16_t ordinal = 0; valid && ordinal < count; ++ordinal) {

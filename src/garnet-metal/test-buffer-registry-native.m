@@ -146,6 +146,15 @@ int main(void) {
                 !contains(command->captured, undeclared->base, undeclared->extent, 3),
                 "aliasable or undeclared buffer entered the registry");
         }
+        @autoreleasepool {
+            prepare(command, [NSSet setWithSet:resources]);
+        }
+        require([command activeCount] == 259,
+            "duplicate snapshot in same segment lost active buffer declarations");
+        require(fill(command, &state, "compute") &&
+            header(command->captured).row_count == 259 &&
+            contains(command->captured, overlap->base, overlap->extent, 3),
+            "duplicate snapshot in same segment dropped indirect registry rows");
         RDNA4CommandSegment *first = [command nextSegment];
         prepare(command, [NSSet set]);
         require([command activeCount] == 0, "previous draw declarations leaked into current registry");
