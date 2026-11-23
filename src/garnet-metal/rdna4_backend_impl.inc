@@ -398,6 +398,20 @@ static BOOL rdna4_test_refuse(void) {
     if (left > 0) { left--; return YES; }
     return NO;
 }
+static int rdna4_csv_has_token(const char *csv, const char *tok) {
+    if (!csv || !*csv || !tok || !*tok) return 0;
+    const size_t tlen = strlen(tok);
+    const char *p = csv;
+    while (*p) {
+        while (*p == ',') p++;
+        const char *e = strchr(p, ',');
+        const size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == tlen && strncmp(p, tok, tlen) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
 static void rdna4s_prebind_on_radv_open(void);
 // One open attempt (#12 R4: the retry policy is in rdna4_radv_open). Returns YES when the RADV device + queue are up; on failure *err
 // is set. Called with the class lock held.
@@ -446,10 +460,13 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             // (system memory, CPU-cached, GPU-snooped) instead of the BAR, whose uncached stores stalled radv_emit_* during desktop drags (P5 study, ws-p1.txt). Absent = unchanged.
             struct stat sb_;
             if (stat("/private/tmp/rdna4m-nosam", &sb_) == 0 || stat("/private/tmp/rdna4m-nosam-off", &sb_) != 0) {   //: DEFAULT ON (60 fps under drag measured); /private/tmp/rdna4m-nosam-off disables
-                const char *pt = getenv("RADV_PERFTEST"); char v[256];
-                snprintf(v, sizeof v, "%s%snosam", pt && *pt ? pt : "", pt && *pt ? "," : "");
-                setenv("RADV_PERFTEST", v, 1);
-                RDNA4LOG("radv open: P5a /private/tmp/rdna4m-nosam present: RADV_PERFTEST=%s (command buffers in GTT)", v);
+                const char *pt = getenv("RADV_PERFTEST");
+                if (!rdna4_csv_has_token(pt, "nosam")) {
+                    char v[256];
+                    snprintf(v, sizeof v, "%s%snosam", pt && *pt ? pt : "", pt && *pt ? "," : "");
+                    setenv("RADV_PERFTEST", v, 1);
+                    RDNA4LOG("radv open: P5a /private/tmp/rdna4m-nosam present: RADV_PERFTEST=%s (command buffers in GTT)", v);
+                }
             }
         }
         VkResult r = rdna4_vkCreateInstance(&ici, NULL, &RDNA4R.inst);
