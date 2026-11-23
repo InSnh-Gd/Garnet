@@ -1,0 +1,763 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 0c36b72..802c335 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -510,6 +510,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+             | "air.simd_any"
+             | "air.simd_all"
+             | "air.simd_ballot.i64"
++            | "air.simd_active_threads_mask.i64"
+             | "air.quad_all"
+             | "air.quad_any"
+             | "air.quad_active_threads_mask"
+@@ -616,6 +617,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+             "air.simd_shuffle",
+             "air.simd_shuffle_down",
+             "air.simd_shuffle_rotate_down",
++            "air.simd_shuffle_rotate_up",
+             "air.simd_shuffle_and_fill_down",
+             "air.simd_shuffle_and_fill_up",
+             "air.simd_shuffle_up",
+@@ -627,6 +629,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+             "air.quad_max",
+             "air.quad_shuffle_xor",
+             "air.quad_shuffle_rotate_down",
++            "air.quad_shuffle_rotate_up",
+             "air.quad_shuffle_up",
+             "air.quad_shuffle_down",
+             "air.simd_prefix_exclusive_sum",
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index c6d8833..a0214b9 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -226,8 +226,12 @@ pub struct FragMeta {
+     /// Return-struct member index -> color attachment Location for actual `air.render_target`
+     /// outputs. Non-color outputs such as `air.stencil` are deliberately absent.
+     pub render_target_members: Vec<(u32, u32)>,
++    /// Return-struct member index -> dual-source blend index (`[[index(n)]]`), defaulting to `0`.
++    pub render_target_blend_indices: HashMap<u32, u32>,
+     /// Return-struct member index -> AIR render-target type name (`float4`, `int4`, ...).
+     pub render_target_type_names: HashMap<u32, String>,
++    /// Sorted deduplicated `[[raster_order_group(n)]]` ids declared on fragment resources.
++    pub raster_order_groups: Vec<u32>,
+     /// Return-struct member indices tagged as `air.depth` (`[[depth(...)]]`).
+     pub depth_members: Vec<u32>,
+     /// Conservative depth-test relation declared by `[[depth(...)]]`.
+@@ -383,6 +387,15 @@ impl FragMeta {
+             .iter()
+             .find_map(|(member, location)| (*member == member_idx).then_some(*location))
+     }
++    pub fn render_target_blend_index_for_member(&self, member_idx: u32) -> u32 {
++        self.render_target_blend_indices
++            .get(&member_idx)
++            .copied()
++            .unwrap_or(0)
++    }
++    pub fn uses_raster_order_groups(&self) -> bool {
++        !self.raster_order_groups.is_empty()
++    }
+     pub fn render_target_type_name(&self, member_idx: u32) -> Option<&str> {
+         self.render_target_type_names
+             .get(&member_idx)
+@@ -1848,6 +1861,56 @@ fn render_target_location(
+     declared_slot(body, "air.render_target", fallback, static_int_globals)
+ }
+ 
++fn render_target_blend_index(
++    body: &str,
++    static_int_globals: &HashMap<String, u32>,
++) -> u32 {
++    match marker_operands(body, "air.render_target")
++        .into_iter()
++        .nth(1)
++        .flatten()
++    {
++        Some(LocationOperand::Literal(index)) => index,
++        Some(LocationOperand::Global(global)) => {
++            static_int_globals.get(&global).copied().unwrap_or(0)
++        }
++        None => 0,
++    }
++}
++
++fn collect_raster_order_groups(
++    node: &str,
++    nodes: &HashMap<u32, String>,
++    groups: &mut Vec<u32>,
++) {
++    let scan_node = |text: &str, groups: &mut Vec<u32>| {
++        let toks = tokenize(text);
++        for pair in toks.windows(2) {
++            if let [Tok::Str(marker), Tok::Int(group)] = pair {
++                if marker == "air.raster_order_group" {
++                    groups.push(*group);
++                }
++            }
++        }
++    };
++    scan_node(node, groups);
++    let Some(sref) = struct_info_ref(node) else {
++        return;
++    };
++    let mut stack = vec![sref];
++    let mut seen = std::collections::HashSet::new();
++    while let Some(id) = stack.pop() {
++        if !seen.insert(id) {
++            continue;
++        }
++        let Some(sub) = nodes.get(&id) else { continue };
++        scan_node(sub, groups);
++        for child in refs_in(sub) {
++            stack.push(child);
++        }
++    }
++}
++
+ fn address_space(body: &str) -> Option<u32> {
+     i32_after_marker(body, "air.address_space")
+ }
+@@ -2920,6 +2983,28 @@ fn parse_air_fragment_meta_with_nodes(
+                 .collect()
+         })
+         .unwrap_or_default();
++    let render_target_blend_indices: HashMap<u32, u32> = nodes
++        .get(&out_ref)
++        .map(|c| {
++            refs_in(c)
++                .into_iter()
++                .enumerate()
++                .filter_map(|(i, r)| {
++                    let node = nodes.get(&r)?;
++                    let roles = role_strings(node);
++                    let is_render_target = primary_role(&roles) == Some("render_target");
++                    (is_render_target
++                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
++                    .then(|| {
++                        let idx = render_target_blend_index(node, &static_int_globals);
++                        (idx != 0).then_some((i as u32, idx))
++                    })
++                    .flatten()
++                })
++                .collect()
++        })
++        .unwrap_or_default();
++    let mut raster_order_groups: Vec<u32> = Vec::new();
+ 
+     let mut roles = vec![];
+     let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
+@@ -2947,6 +3032,9 @@ fn parse_air_fragment_meta_with_nodes(
+     for r in refs_in(nodes.get(&in_ref)?) {
+         let Some(node) = nodes.get(&r) else { continue };
+         let Some(idx) = first_i32(node) else { continue };
++        if metadata_enabled_by_default(node, nodes, &static_int_globals) {
++            collect_raster_order_groups(node, nodes, &mut raster_order_groups);
++        }
+         // Reconstruct any buffer struct layout used when native emission produces a bare pointer.
+         if let Some(sref) = struct_info_ref(node) {
+             if let Some(t) = parse_struct_info(nodes, sref, 0) {
+@@ -3082,6 +3170,8 @@ fn parse_air_fragment_meta_with_nodes(
+         .collect::<Vec<_>>();
+     argument_buffer_params.sort_unstable();
+     argument_buffer_params.dedup();
++    raster_order_groups.sort_unstable();
++    raster_order_groups.dedup();
+     let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
+     let top_level_sampler_locations = roles
+         .iter()
+@@ -3107,7 +3197,9 @@ fn parse_air_fragment_meta_with_nodes(
+         varying_interpolation,
+         n_render_targets,
+         render_target_members,
++        render_target_blend_indices,
+         render_target_type_names,
++        raster_order_groups,
+         depth_members,
+         depth_qualifier,
+         stencil_members,
+diff --git a/src/meta/tests.rs b/src/meta/tests.rs
+index a9f0d51..c5e0a3a 100644
+--- a/src/meta/tests.rs
++++ b/src/meta/tests.rs
+@@ -2385,3 +2385,23 @@ fn every_arrayed_texture_spelling_reflects_as_arrayed() {
+         assert_eq!(shape.depth, name.contains("depth"), "{name}");
+     }
+ }
++
++#[test]
++fn fragment_dual_source_and_raster_order_groups_are_parsed() {
++    const LL: &str = r#"
++!air.fragment = !{!0}
++!0 = !{ptr @f, !1, !4}
++!1 = !{!2, !3}
++!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"c0"}
++!3 = !{!"air.render_target", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"c1"}
++!4 = !{!5, !6}
++!5 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.raster_order_group", i32 3, !"air.arg_type_name", !"uint"}
++!6 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.raster_order_group", i32 0, !"air.arg_type_name", !"uint"}
++"#;
++    let meta = parse_air_fragment_meta(LL).unwrap();
++    assert_eq!(meta.render_target_members, vec![(0, 0), (1, 0)]);
++    assert_eq!(meta.render_target_blend_index_for_member(0), 0);
++    assert_eq!(meta.render_target_blend_index_for_member(1), 1);
++    assert_eq!(meta.raster_order_groups, vec![0, 3]);
++    assert!(meta.uses_raster_order_groups());
++}
+diff --git a/src/native/tests/interface.rs b/src/native/tests/interface.rs
+index 8ea256b..2bf5129 100644
+--- a/src/native/tests/interface.rs
++++ b/src/native/tests/interface.rs
+@@ -2664,3 +2664,126 @@ attributes #0 = {{ nounwind }}
+     );
+     let _ = std::fs::remove_dir_all(&tmp);
+ }
++
++#[test]
++fn native_fragment_dual_source_and_raster_order_group_lower_cleanly() {
++    let dual_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%DualOut = type { <4 x float>, <4 x float> }
++
++define %DualOut @f() {
++entry:
++  %a = insertvalue %DualOut poison, <4 x float> <float 0.5, float 0.5, float 0.5, float 1.0>, 0
++  %b = insertvalue %DualOut %a, <4 x float> <float 0.4, float 0.2, float 0.0, float 1.0>, 1
++  ret %DualOut %b
++}
++
++!air.fragment = !{!0}
++!0 = !{ptr @f, !1, !4}
++!1 = !{!2, !3}
++!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"c0"}
++!3 = !{!"air.render_target", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"c1"}
++!4 = !{}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_dual_rog_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (dual_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        dual_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("dual");
++    let dual_asm = disassemble(&dual_spv).expect("disassemble dual");
++    assert_eq!(
++        dual_asm.matches("Location 0").count(),
++        2,
++        "expected both dual-source outputs at Location 0:\n{dual_asm}"
++    );
++    assert!(
++        dual_asm.contains("Index 1"),
++        "expected second output decorated Index 1:\n{dual_asm}"
++    );
++
++    let make_rog_ll = |ret_color: bool, group: u32| {
++        if ret_color {
++            format!(
++                r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @f(ptr addrspace(1) %buf) {{
++entry:
++  %v = load i32, ptr addrspace(1) %buf, align 4
++  %n = add i32 %v, 1
++  store i32 %n, ptr addrspace(1) %buf, align 4
++  ret <4 x float> <float 0.0, float 1.0, float 0.0, float 1.0>
++}}
++
++!air.fragment = !{{!0}}
++!0 = !{{ptr @f, !1, !2}}
++!1 = !{{!3}}
++!2 = !{{!4}}
++!3 = !{{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}}
++!4 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.raster_order_group", i32 {group}, !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}}
++"#
++            )
++        } else {
++            format!(
++                r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @f(ptr addrspace(1) %buf) {{
++entry:
++  %v = load i32, ptr addrspace(1) %buf, align 4
++  %n = add i32 %v, 1
++  store i32 %n, ptr addrspace(1) %buf, align 4
++  ret void
++}}
++
++!air.fragment = !{{!0}}
++!0 = !{{ptr @f, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3}}
++!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.raster_order_group", i32 {group}, !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}}
++"#
++            )
++        }
++    };
++
++    for (label, ret_color) in [("color", true), ("void", false)] {
++        let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &make_rog_ll(ret_color, 0),
++            Stage::Fragment,
++            &tmp,
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .unwrap_or_else(|e| panic!("rog {label} failed: {e}"));
++        let asm = disassemble(&spv).expect("disassemble rog");
++        assert!(asm.contains("FragmentShaderPixelInterlockEXT"), "{label}:\n{asm}");
++        assert!(asm.contains("SPV_EXT_fragment_shader_interlock"), "{label}:\n{asm}");
++        assert!(asm.contains("PixelInterlockOrderedEXT"), "{label}:\n{asm}");
++        assert!(asm.contains("OpBeginInvocationInterlockEXT"), "{label}:\n{asm}");
++        assert!(asm.contains("OpEndInvocationInterlockEXT"), "{label}:\n{asm}");
++        if std::process::Command::new("spirv-val")
++            .arg("--version")
++            .output()
++            .is_ok()
++        {
++            tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++        }
++    }
++
++    let err = crate::translate_sanitized_native_reflected_unvalidated(
++        &make_rog_ll(true, 8),
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect_err("raster_order_group(8) exceeds Mac2 limit");
++    assert!(err.to_string().contains("raster_order_group(8)"), "{err}");
++    let _ = std::fs::remove_dir_all(&tmp);
++}
+diff --git a/src/native/tests/threadgroup.rs b/src/native/tests/threadgroup.rs
+index fc5caef..6c3998d 100644
+--- a/src/native/tests/threadgroup.rs
++++ b/src/native/tests/threadgroup.rs
+@@ -652,6 +652,60 @@ declare i16 @air.get_simdgroup_size.i16()
+     }
+ }
+ 
++#[test]
++fn air_simd_active_threads_mask_and_rotate_up_lower_cleanly() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(i32 %v, ptr addrspace(1) %out) {
++entry:
++  %mask = tail call i64 @air.simd_active_threads_mask.i64()
++  %srot = tail call i32 @air.simd_shuffle_rotate_up.u.i32(i32 %v, i16 1)
++  %qrot = tail call i32 @air.quad_shuffle_rotate_up.u.i32(i32 %srot, i16 1)
++  %lo = trunc i64 %mask to i32
++  %sum = add i32 %lo, %qrot
++  store i32 %sum, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare i64 @air.simd_active_threads_mask.i64()
++declare i32 @air.simd_shuffle_rotate_up.u.i32(i32, i16)
++declare i32 @air.quad_shuffle_rotate_up.u.i32(i32, i16)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3}
++!3 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_simd_mask_rotup_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(asm.contains("OpCapability GroupNonUniformBallot"), "{asm}");
++    assert!(asm.contains("OpCapability GroupNonUniformShuffle"), "{asm}");
++    assert!(asm.contains("OpGroupNonUniformBallot"), "{asm}");
++    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
++    assert!(asm.contains("OpISub"), "{asm}");
++    assert!(!asm.contains("OpFunctionCall"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++}
++
+ /// `simd_shuffle_and_fill_up` picks data vs fill by comparing the in-cluster lane against the
+ /// UNREDUCED delta.
+ ///
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+index b2928fe..f6a2e45 100644
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1165,6 +1165,11 @@ pub(in crate::passes) fn lower_simd_op(
+     if name == "air.simd_ballot.i64" && args.len() == 1 {
+         return lower_simd_ballot(ctx, res, rty, args[0]).map(Some);
+     }
++    if name == "air.simd_active_threads_mask.i64" && args.is_empty() {
++        let bool_ty = ctx.ty_bool();
++        let active = ctx.const_bool_of(bool_ty, true);
++        return lower_simd_ballot(ctx, res, rty, active).map(Some);
++    }
+     if name == "air.quad_active_threads_mask" && args.is_empty() {
+         return lower_quad_active_threads_mask(ctx, res, rty).map(Some);
+     }
+@@ -1273,6 +1278,9 @@ pub(in crate::passes) fn lower_simd_op(
+     if name.starts_with("air.simd_shuffle_rotate_down.") && args.len() == 2 {
+         return lower_simd_shuffle_rotate_down(ctx, res, rty, args).map(Some);
+     }
++    if name.starts_with("air.simd_shuffle_rotate_up.") && args.len() == 2 {
++        return lower_simd_shuffle_rotate_up(ctx, res, rty, args).map(Some);
++    }
+     if name.starts_with("air.simd_shuffle_and_fill_down.") && args.len() == 4 {
+         return lower_simd_shuffle_and_fill_down(ctx, res, rty, args).map(Some);
+     }
+@@ -1335,6 +1343,9 @@ pub(in crate::passes) fn lower_simd_op(
+     if name.starts_with("air.quad_shuffle_rotate_down.") && args.len() == 2 {
+         return lower_quad_shuffle_rotate_down(ctx, res, rty, args).map(Some);
+     }
++    if name.starts_with("air.quad_shuffle_rotate_up.") && args.len() == 2 {
++        return lower_quad_shuffle_rotate_up(ctx, res, rty, args).map(Some);
++    }
+     if name.starts_with("air.quad_shuffle_up.") && args.len() == 2 {
+         return lower_quad_shuffle_up(ctx, res, rty, args).map(Some);
+     }
+diff --git a/src/passes/air_calls/shuffle.rs b/src/passes/air_calls/shuffle.rs
+index e2aa0d2..4e89075 100644
+--- a/src/passes/air_calls/shuffle.rs
++++ b/src/passes/air_calls/shuffle.rs
+@@ -81,15 +81,15 @@ pub(in crate::passes) fn lower_quad_shuffle(
+     Ok(insts)
+ }
+ 
+-/// `air.quad_shuffle_rotate_down(value, delta)` rotates values DOWN within the 4-lane quad, wrapping:
+-/// result on lane L = `value` from lane `(L + delta) % 4`. Verified bit-exact on Apple Metal (lane L,
+-/// delta d -> lane (L+d)%4 for all L,d in 0..3). Lowered as a masked `GroupNonUniformShuffle`:
+-/// `source_lane = (quad_base) + ((lane & 3) + delta) % 4`.
+-pub(in crate::passes) fn lower_quad_shuffle_rotate_down(
++/// `air.quad_shuffle_rotate_down(value, delta)` / `air.quad_shuffle_rotate_up(value, delta)` rotate
++/// values within the 4-lane quad, wrapping at quad boundaries:
++/// `source_lane = quad_base + ((lane & 3) +/- delta) & 3`.
++fn lower_quad_shuffle_rotate(
+     ctx: &mut Ctx,
+     result: Word,
+     result_type: Word,
+     args: &[Word],
++    up: bool,
+ ) -> Result<Vec<Instruction>, String> {
+     let scope = ctx.const_uint(Scope::Subgroup as u32);
+     let mut insts = Vec::new();
+@@ -116,21 +116,21 @@ pub(in crate::passes) fn lower_quad_shuffle_rotate_down(
+             Operand::IdRef(ctx.const_uint(3)),
+         ],
+     ));
+-    let local_plus_delta = ctx.module.fresh_id();
++    let shifted_local = ctx.module.fresh_id();
+     insts.push(Instruction::new(
+-        Op::IAdd,
++        if up { Op::ISub } else { Op::IAdd },
+         Some(uint),
+-        Some(local_plus_delta),
++        Some(shifted_local),
+         vec![Operand::IdRef(local), Operand::IdRef(delta)],
+     ));
+-    // (local + delta) % 4 — the quad size is a power of two, so a bitwise AND is the modulo.
++    // (local +/- delta) % 4 — the quad size is a power of two, so a bitwise AND wraps mod 4.
+     let source_local = ctx.module.fresh_id();
+     insts.push(Instruction::new(
+         Op::BitwiseAnd,
+         Some(uint),
+         Some(source_local),
+         vec![
+-            Operand::IdRef(local_plus_delta),
++            Operand::IdRef(shifted_local),
+             Operand::IdRef(ctx.const_uint(3)),
+         ],
+     ));
+@@ -154,13 +154,33 @@ pub(in crate::passes) fn lower_quad_shuffle_rotate_down(
+     Ok(insts)
+ }
+ 
+-/// `air.simd_shuffle_rotate_down(value, delta)` rotates values down within Metal's 32-lane simdgroup,
+-/// wrapping at the simdgroup boundary: source lane = `(lane + delta) & 31`.
+-pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
++pub(in crate::passes) fn lower_quad_shuffle_rotate_down(
++    ctx: &mut Ctx,
++    result: Word,
++    result_type: Word,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    lower_quad_shuffle_rotate(ctx, result, result_type, args, false)
++}
++
++pub(in crate::passes) fn lower_quad_shuffle_rotate_up(
++    ctx: &mut Ctx,
++    result: Word,
++    result_type: Word,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    lower_quad_shuffle_rotate(ctx, result, result_type, args, true)
++}
++
++/// `air.simd_shuffle_rotate_down(value, delta)` / `air.simd_shuffle_rotate_up(value, delta)` rotate
++/// values within Metal's 32-lane simdgroup, wrapping at the simdgroup boundary:
++/// `source_lane = simd_base + ((lane +/- delta) & 31)`.
++fn lower_simd_shuffle_rotate(
+     ctx: &mut Ctx,
+     result: Word,
+     result_type: Word,
+     args: &[Word],
++    up: bool,
+ ) -> Result<Vec<Instruction>, String> {
+     let scope = ctx.const_uint(Scope::Subgroup as u32);
+     let mut insts = Vec::new();
+@@ -169,11 +189,11 @@ pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
+     let subgroup_lane = subgroup_lane_index_u32(ctx, &mut insts);
+     let simd_lane = metal_simd_lane_local_u32(ctx, subgroup_lane, &mut insts);
+     let simd_base = metal_simd_lane_base_u32(ctx, subgroup_lane, simd_lane, &mut insts);
+-    let local_plus_delta = ctx.module.fresh_id();
++    let shifted_local = ctx.module.fresh_id();
+     insts.push(Instruction::new(
+-        Op::IAdd,
++        if up { Op::ISub } else { Op::IAdd },
+         Some(uint),
+-        Some(local_plus_delta),
++        Some(shifted_local),
+         vec![Operand::IdRef(simd_lane), Operand::IdRef(delta)],
+     ));
+     let source_local = ctx.module.fresh_id();
+@@ -182,7 +202,7 @@ pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
+         Some(uint),
+         Some(source_local),
+         vec![
+-            Operand::IdRef(local_plus_delta),
++            Operand::IdRef(shifted_local),
+             Operand::IdRef(ctx.const_uint(31)),
+         ],
+     ));
+@@ -206,6 +226,24 @@ pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
+     Ok(insts)
+ }
+ 
++pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
++    ctx: &mut Ctx,
++    result: Word,
++    result_type: Word,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    lower_simd_shuffle_rotate(ctx, result, result_type, args, false)
++}
++
++pub(in crate::passes) fn lower_simd_shuffle_rotate_up(
++    ctx: &mut Ctx,
++    result: Word,
++    result_type: Word,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    lower_simd_shuffle_rotate(ctx, result, result_type, args, true)
++}
++
+ /// `air.simd_shuffle_down(value, delta)` reads `value` from lane `lane + delta` within Metal's
+ /// 32-lane simdgroup. Lower via absolute shuffle instead of `ShuffleDown` so wider Vulkan subgroups
+ /// cannot cross the Metal simdgroup boundary. Out-of-range reads select the current lane to avoid
+diff --git a/src/passes/finalize.rs b/src/passes/finalize.rs
+index b7262c6..ca7cf88 100644
+--- a/src/passes/finalize.rs
++++ b/src/passes/finalize.rs
+@@ -179,7 +179,7 @@ pub(in crate::passes) fn finalize(
+                 ],
+             ));
+         }
+-        if ctx.uses_fragment_imageblock {
++        if ctx.needs_pixel_interlock() {
+             let capability = spirv::Capability::FragmentShaderPixelInterlockEXT;
+             if !ctx.module.capabilities.iter().any(|instruction| {
+                 instruction.operands.as_slice() == [Operand::Capability(capability)]
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index ab218c5..d015030 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -631,6 +631,8 @@ struct Ctx {
+     fragment_imageblock_vars: HashMap<u32, (Word, Word)>,
+     /// The custom fragment imageblock contract requires ordered per-pixel access.
+     uses_fragment_imageblock: bool,
++    /// Fragment resource `[[raster_order_group(n)]]` also requires ordered per-pixel access.
++    uses_raster_order_groups: bool,
+     fragment_imageblock_coord_var: Option<Word>,
+     /// Fragment output rewrite created a `BuiltIn FragDepth` Output variable.
+     writes_frag_depth: bool,
+@@ -726,11 +728,16 @@ impl Ctx {
+             implicit_imageblock_vars: HashMap::new(),
+             fragment_imageblock_vars: HashMap::new(),
+             uses_fragment_imageblock: false,
++            uses_raster_order_groups: false,
+             fragment_imageblock_coord_var: None,
+             writes_frag_depth: false,
+         }
+     }
+ 
++    pub(in crate::passes) fn needs_pixel_interlock(&self) -> bool {
++        self.uses_fragment_imageblock || self.uses_raster_order_groups
++    }
++
+     fn add_capability(&mut self, capability: spirv::Capability) {
+         if self.module.capabilities.iter().any(|instruction| {
+             instruction.operands.first() == Some(&Operand::Capability(capability))
+diff --git a/src/passes/stage_input/decorations.rs b/src/passes/stage_input/decorations.rs
+index 730214b..dbc34b4 100644
+--- a/src/passes/stage_input/decorations.rs
++++ b/src/passes/stage_input/decorations.rs
+@@ -16,6 +16,19 @@ pub(in crate::passes) fn decorate_location(module: &mut Module, id: Word, loc: u
+     ));
+ }
+ 
++pub(in crate::passes) fn decorate_index(module: &mut Module, id: Word, index: u32) {
++    module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(id),
++            Operand::Decoration(Decoration::Index),
++            Operand::LiteralBit32(index),
++        ],
++    ));
++}
++
+ /// A fragment Input interface variable of integer / 64-bit-float component type cannot be
+ /// interpolated and MUST carry a `Flat` decoration (VUID-StandaloneSpirv-Flat-04744).
+ pub(in crate::passes) fn decorate_flat(module: &mut Module, id: Word) {
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index 6185383..fdacdb5 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -2418,16 +2418,27 @@ pub(super) fn build_stage_input(
+ 
+     // Apply param bindings to the body: drop params, then splice replacements.
+     apply_bindings(ctx, entry_idx, bindings, &buffer_structs, &all_defs)?;
+-    if frag
+-        .and_then(|meta| meta.fragment_imageblock.as_ref())
+-        .is_some()
+-    {
+-        ctx.uses_fragment_imageblock = true;
+-        ctx.fragment_imageblock_coord_var = fragcoord_var;
++    if matches!(stage, Stage::Fragment) {
++        if let Some(meta) = frag {
++            if let Some(&bad) = meta.raster_order_groups.iter().find(|&&group| group >= 8) {
++                return Err(format!(
++                    "raster_order_group({bad}) exceeds Metal Mac2 limit of 8 groups (0..7)"
++                ));
++            }
++            if meta.uses_raster_order_groups() {
++                ctx.uses_raster_order_groups = true;
++            }
++            if meta.fragment_imageblock.is_some() {
++                ctx.uses_fragment_imageblock = true;
++                ctx.fragment_imageblock_coord_var = fragcoord_var;
++            }
++        }
++    }
++    if ctx.needs_pixel_interlock() {
+         let block = ctx.module.functions[entry_idx]
+             .blocks
+             .first_mut()
+-            .ok_or_else(|| "fragment imageblock entry has no block".to_string())?;
++            .ok_or_else(|| "fragment pixel interlock entry has no block".to_string())?;
+         let insert_at = block
+             .instructions
+             .iter()
+diff --git a/src/passes/stage_output/mod.rs b/src/passes/stage_output/mod.rs
+index b61178d..8f2e2a9 100644
+--- a/src/passes/stage_output/mod.rs
++++ b/src/passes/stage_output/mod.rs
+@@ -2,7 +2,7 @@
+ 
+ use super::*;
+ use crate::passes::stage_input::{
+-    decorate_builtin, decorate_location, decorate_with, scalar_or_vector_component,
++    decorate_builtin, decorate_index, decorate_location, decorate_with, scalar_or_vector_component,
+ };
+ 
+ fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
+@@ -12,6 +12,11 @@ fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Optio
+     }
+ }
+ 
++fn fragment_output_blend_index(frag: Option<&FragMeta>, member_idx: usize) -> u32 {
++    frag.map(|meta| meta.render_target_blend_index_for_member(member_idx as u32))
++        .unwrap_or(0)
++}
++
+ fn fragment_output_is_depth(frag: Option<&FragMeta>, member_idx: usize) -> bool {
+     frag.map(|meta| meta.is_depth_member(member_idx as u32))
+         .unwrap_or(false)
+@@ -443,7 +448,23 @@ pub(in crate::passes) fn rewrite_return(
+                     .to_string(),
+             );
+         }
+-        // void return (e.g. a discard-only shader): nothing to do.
++        if ctx.needs_pixel_interlock() {
++            for blk in &mut ctx.module.functions[entry_idx].blocks {
++                let returns: Vec<usize> = blk
++                    .instructions
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(ii, inst)| (inst.class.opcode == Op::Return).then_some(ii))
++                    .collect();
++                for ii in returns.into_iter().rev() {
++                    blk.instructions.insert(
++                        ii,
++                        Instruction::new(Op::EndInvocationInterlockEXT, None, None, vec![]),
++                    );
++                }
++            }
++        }
++        // void return (e.g. a discard-only or ROG buffer/texture-writing fragment shader).
+         return Ok(());
+     }
+ 
+@@ -823,7 +844,11 @@ pub(in crate::passes) fn rewrite_return(
+                         let var = make_output_var(ctx, output_ty);
+                         match kind {
+                             OutKind::Location(location) => {
+-                                decorate_location(&mut ctx.module, var, location)
++                                decorate_location(&mut ctx.module, var, location);
++                                let blend_index = fragment_output_blend_index(frag, mi);
++                                if blend_index > 0 {
++                                    decorate_index(&mut ctx.module, var, blend_index);
++                                }
+                             }
+                             OutKind::Depth => {
+                                 decorate_builtin(&mut ctx.module, var, BuiltIn::FragDepth);
+@@ -889,6 +914,10 @@ pub(in crate::passes) fn rewrite_return(
+                         let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
+                         let var = make_output_var(ctx, output_ty);
+                         decorate_location(&mut ctx.module, var, location);
++                        let blend_index = fragment_output_blend_index(frag, 0);
++                        if blend_index > 0 {
++                            decorate_index(&mut ctx.module, var, blend_index);
++                        }
+                         ctx.interface.push(var);
+                         outputs.push(OutputWrite::Direct {
+                             var,
+@@ -1012,7 +1041,7 @@ pub(in crate::passes) fn rewrite_return(
+         for output in &outputs {
+             replacement.extend(output.stores(ctx, retval, declared_outputs_must_be_written));
+         }
+-        if ctx.uses_fragment_imageblock {
++        if ctx.needs_pixel_interlock() {
+             replacement.push(Instruction::new(
+                 Op::EndInvocationInterlockEXT,
+                 None,
