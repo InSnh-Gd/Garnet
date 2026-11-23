@@ -656,3 +656,64 @@ source pins on the assembled `GarnetDevice.m` output (`supportsUnalignedVertexFe
 Run on the dev host after assembling `GarnetDevice.m` with `assemble-device.py`;
 it validates CPU invariants and source wiring rather than live macOS WindowServer
 or OpenGL runtime execution.
+
+---
+
+## Hardware tessellation (`offline-metadata` and `live`)
+
+Post-tessellation vertex pipelines (`[[patch(triangle, N)]]` / `[[patch(quad, N)]]`)
+compile through a pass-through vertex stage, a synthesized Tessellation Control
+Shader (`rdna4_tessellation.h`) that reads `MTLTriangleTessellationFactorsHalf` /
+`MTLQuadTessellationFactorsHalf` factors and `PerPatchControlPoint` / `PerPatch` /
+`Constant` vertex attributes via buffer device addresses, and the translated
+Tessellation Evaluation stage with `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT`:
+
+```objc
+MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+vd.attributes[0].format = MTLVertexFormatFloat2;
+vd.attributes[0].bufferIndex = 0;
+vd.layouts[0].stride = sizeof(simd_float2);
+vd.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+vd.layouts[0].stepRate = 1;
+
+MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+d.vertexFunction = [lib newFunctionWithName:@"tri_tes"];
+d.fragmentFunction = [lib newFunctionWithName:@"pass_fs"];
+d.vertexDescriptor = vd;
+d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+d.tessellationPartitionMode = MTLTessellationPartitionModeFractionalEven;
+d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+d.tessellationOutputWindingOrder = MTLWindingClockwise;
+d.maxTessellationFactor = 16;
+
+id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+[enc setRenderPipelineState:pso];
+[enc setVertexBuffer:cpBuf offset:0 atIndex:0];
+[enc setTessellationFactorBuffer:factorBuf offset:0 instanceStride:0];
+[enc drawPatches:3 patchStart:0 patchCount:1 patchIndexBuffer:nil
+  patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+```
+
+Offline SPIR-V generation, 16-bit capability gating, cache-key isolation and negative
+configuration validation:
+
+```sh
+clang -std=c11 -O2 -Wall -Wextra -Werror -I/path/to/vulkan/include \
+  src/garnet-metal/test-tessellation-spv.c -lm -o "$TMPDIR/test-tessellation-spv"
+"$TMPDIR/test-tessellation-spv"
+```
+
+Live RX 9060 XT tessellation execution (all 9 scenarios: direct triangle/quad patches,
+compute-generated half factors and scale, all four partition modes with same-function
+isolation, CW/CCW winding and culling plus asymmetric quad edge check, factor step
+functions and `instanceStride`/`baseInstance`, `UInt16`/`UInt32` `drawIndexedPatches:`
+with `patchIndexBuffer`, GPU indirect direct/indexed patch draws, zero/negative/NaN
+culling, zero-CP patches, and negative validation checks):
+
+```sh
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-tessellation.m -o "$TMPDIR/test-tessellation"
+sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+  "$TMPDIR/test-tessellation" /path/to/GarnetMetal.bundle
+```
