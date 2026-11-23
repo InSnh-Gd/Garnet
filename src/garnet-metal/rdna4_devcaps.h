@@ -105,6 +105,10 @@ static inline int rdna4dc_buffer_ok(const rdna4dc_caps *c, uint64_t length) {
     return length && length <= c->buffer_length;
 }
 
+static inline uint32_t rdna4dc_thread_execution_width(const rdna4dc_caps *c) {
+    return (c && c->subgroup_size && c->subgroup_size < 32u) ? c->subgroup_size : 32u;
+}
+
 static inline uint64_t rdna4dc_heap_size(uint64_t requested, uint64_t limit) {
     if (!requested || requested > UINT64_MAX - (RDNA4DC_HEAP_PAGE - 1)) return 0;
     uint64_t rounded = (requested + RDNA4DC_HEAP_PAGE - 1) & ~(RDNA4DC_HEAP_PAGE - 1);

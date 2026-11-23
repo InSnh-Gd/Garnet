@@ -85,6 +85,13 @@ int main(void) {
     CHECK("zero length is rejected through the common buffer constructor", !rdna4dc_buffer_ok(&c, 0));
     CHECK("LDS keeps the existing 32 KiB Metal ceiling", c.shared_memory == 32768);
     CHECK("compute pipeline execution width follows Vulkan subgroup properties", c.subgroup_size == 64);
+    CHECK("Metal compute threadExecutionWidth tracks Metal 32-lane simdgroup execution",
+        rdna4dc_thread_execution_width(&fallback) == 32 &&
+        rdna4dc_thread_execution_width(&c) == 32);
+    p.subgroup_size = 32;
+    CHECK("subgroupSize 32 reports threadExecutionWidth 32", rdna4dc_thread_execution_width(&(rdna4dc_caps){ .subgroup_size = 32 }) == 32);
+    CHECK("narrow hardware subgroups (<32) preserve smaller width", rdna4dc_thread_execution_width(&(rdna4dc_caps){ .subgroup_size = 16 }) == 16);
+    p.subgroup_size = 64;
     CHECK("a valid 1024-thread group is accepted", rdna4dc_workgroup_ok(&c, 32, 32, 1));
     CHECK("zero and out-of-axis local sizes are refused", !rdna4dc_workgroup_ok(&c, 1, 0, 1) && !rdna4dc_workgroup_ok(&c, 1025, 1, 1));
     CHECK("a per-axis-valid group can still exceed the invocation limit", !rdna4dc_workgroup_ok(&c, 32, 32, 2));

@@ -186,7 +186,10 @@ RDNA4_DNR(RDNA4ComputePipelineState)
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
 - (NSUInteger)maxTotalThreadsPerThreadgroup { return rdna4_device_caps().invocations; }
-- (NSUInteger)threadExecutionWidth { return rdna4_device_caps().subgroup_size; }
+- (NSUInteger)threadExecutionWidth {
+    rdna4dc_caps caps = rdna4_device_caps();
+    return rdna4dc_thread_execution_width(&caps);
+}
 - (NSUInteger)staticThreadgroupMemoryLength { return 0; }
 - (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { (void)d; return 0; }
 - (BOOL)supportIndirectCommandBuffers { return NO; }
