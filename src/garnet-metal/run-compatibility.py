@@ -472,8 +472,9 @@ def main():
         if not run_case(
                 out, name, command, marker, timeout=timeout,
                 env=env if case_env is None else case_env,
-                live=native and args.mode == "live", capture=capture,
-                evidence_class=evidence_class, required=required):
+                live=native and args.mode == "live" and not capture,
+                capture=capture, evidence_class=evidence_class,
+                required=required):
             failures += 1
 
     build_cache = {}
@@ -640,7 +641,6 @@ def main():
                     capture_name,
                     [exe, target, str(out / capture_name), "--capture-only"],
                     f"ARGUMENT_SAMPLER_COMPARE_CAPTURE backend={label}",
-                    native=label == "bundle",
                     timeout=120,
                     capture=True,
                     evidence_class="capture-only",
@@ -700,7 +700,6 @@ def main():
                     capture_name,
                     [exe, target, str(out / capture_name), "--capture-only"],
                     f"ARGUMENT_SAMPLER_COORDINATES_CAPTURE backend={label}",
-                    native=label == "bundle",
                     timeout=120,
                     capture=True,
                     evidence_class="capture-only",

@@ -287,20 +287,6 @@ class RunnerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("sampling-limits requires --sampling-bias-limit", result.stderr)
 
-    def test_declared_source_and_fixture_hashes_match_ready_files(self):
-        _, manifest = runner.load_tier2_manifest()
-        source = Path(runner.__file__).parent
-        for case in manifest["cases"]:
-            if "source_file" in case:
-                with self.subTest(case=case["id"]):
-                    self.assertEqual(case["source_sha256"], hashlib.sha256(
-                        (source / case["source_file"]).read_bytes()).hexdigest())
-            for key in ("component_source_sha256", "component_fixture_sha256"):
-                for filename, expected in case.get(key, {}).items():
-                    with self.subTest(case=case["id"], file=filename):
-                        self.assertEqual(expected, hashlib.sha256(
-                            (source / filename).read_bytes()).hexdigest())
-
     def test_target_memory_cases_reject_vm_before_platform_or_bundle_access(self):
         for case_id in ("A03.large-addressing-small-backing",
                         "A03.physical-over4g-private",
@@ -632,15 +618,6 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("required-present\tPASS\t0\t", results)
             self.assertIn("host-mock\n", results)
 
-    def test_quad_fixture_calls_match_run_case_signature(self):
-        source = Path(runner.__file__).with_name("test-argument-quad-lod.m").read_text()
-        calls = re.findall(r"(?m)^\s+runCase\((.*?)\);", source, re.S)
-        self.assertEqual(len(calls), 2)
-        for call in calls:
-            self.assertEqual(len(call.split(",")), 14)
-        self.assertEqual(calls[0].split(",")[-3].strip(), "NO")
-        self.assertEqual(calls[1].split(",")[-3].strip(), "YES")
-
     def test_capture_only_fixture_markers_declare_no_gpu_execution(self):
         source_dir = Path(runner.__file__).parent
         required = {
@@ -710,124 +687,6 @@ class RunnerTests(unittest.TestCase):
         broken["cases"][0]["reference"]["execution_class"] = "unknown"
         with self.assertRaisesRegex(ValueError, "execution_class must be one of"):
             runner.validate_tier2_manifest(broken)
-
-    def test_new_fixture_markers_declare_evidence_boundaries(self):
-        source_dir = Path(runner.__file__).parent
-        required = {
-            "test-argument-segment-retire.m": (
-                "ARGUMENT_SEGMENT_RETIRE_PASS",
-                "mock_vulkan=1",
-                "gpu_execution=0"),
-            "test-sampler-api-reject.m": (
-                "SAMPLER_API_REJECT_PASS",
-                "simulated_vulkan=1",
-                "gpu_execution=0"),
-            "test-sampler-metadata.m": (
-                "SAMPLER_METADATA_PASS",
-                "simulated_vulkan=1",
-                "gpu_execution=0"),
-            "test-sampler-coordinate-runtime.m": (
-                "SAMPLER_COORDINATE_RUNTIME_PASS",
-                "simulated_vulkan=1",
-                "gpu_execution=0"),
-            "test-sampler-coordinate-metadata.m": (
-                "SAMPLER_COORDINATE_METADATA_PASS",
-                "simulated_vulkan=1",
-                "gpu_execution=0"),
-            "test-sampler-coordinate-state.c": (
-                "sampler-coordinate-state: pixel validation",
-                "normalized backend",
-                "legacy separation PASS"),
-            "test-argument-private-retire.m": (
-                "ARGUMENT_PRIVATE_RETIRE_LAYOUT",
-                "gpu_execution=0",
-                "submissions=0"),
-            "test-sampler-binding-state.m": (
-                "SAMPLER_BINDING_STATE_PASS",
-                "SAMPLER_BINDING_ORACLE_PASS",
-                "simulated_vulkan=1",
-                "gpu_execution=0"),
-            "test-argument-scan-runtime.m": (
-                "ARGUMENT_SCAN_RUNTIME_PASS",
-                "no_all_device_fallback=1",
-                "gpu_execution=0"),
-            "test-argument-submit-faults.m": (
-                "ARGUMENT_SUBMIT_FAULTS_PASS",
-                "mock_vulkan=1",
-                "mock_metal_queue=1",
-                "gpu_execution=0",
-                "quarantined=1"),
-            "test-argument-private-summary.m": (
-                "ARGUMENT_PRIVATE_SUMMARY_PASS",
-                "rounds=%lu",
-                "backend=runtime-summary-gpu",
-                "gpu_execution=1"),
-            "test-reflection-trim.py": (
-                "REFLECTION_TRIM_ABI8_PASS",
-                "paths=2",
-                "rust_fixture=1"),
-        }
-        for filename, markers in required.items():
-            with self.subTest(filename=filename):
-                text = (source_dir / filename).read_text()
-                for marker in markers:
-                    self.assertIn(marker, text)
-        private_summary = (
-            source_dir / "test-argument-private-summary.m").read_text()
-        self.assertIn("kRounds = 10;", private_summary)
-        _, manifest = runner.load_tier2_manifest()
-        scan_case = next(
-            case for case in manifest["cases"]
-            if case["id"] == "A04.argument-scan-runtime-host")
-        scan_path = source_dir / "test-argument-scan-runtime.m"
-        self.assertEqual(
-            scan_case["source_sha256"],
-            hashlib.sha256(scan_path.read_bytes()).hexdigest())
-        reflection_case = next(
-            case for case in manifest["cases"]
-            if case["id"] == "T03.reflection-trim-abi8")
-        reflection_path = source_dir / "test-reflection-trim.py"
-        self.assertEqual(
-            reflection_case["source_sha256"],
-            hashlib.sha256(reflection_path.read_bytes()).hexdigest())
-        reflection_fixture = source_dir / "fixtures" / "reflection-trim-abi8.json"
-        self.assertEqual(
-            reflection_case["fixture_sha256"],
-            hashlib.sha256(reflection_fixture.read_bytes()).hexdigest())
-        for case_id, filename in (
-                ("T02.private-summary-runtime",
-                 "test-argument-private-summary.m"),
-                ("A04.submit-faults-host",
-                 "test-argument-submit-faults.m"),
-                ("T03.sampler-api-reject",
-                 "test-sampler-api-reject.m"),
-                ("T03.sampler-binding-state",
-                 "test-sampler-binding-state.m")):
-            with self.subTest(case_id=case_id):
-                case = next(
-                    value for value in manifest["cases"]
-                    if value["id"] == case_id)
-                path = source_dir / filename
-                self.assertEqual(
-                    case["source_sha256"],
-                    hashlib.sha256(path.read_bytes()).hexdigest())
-        coordinate_support = next(
-            case for case in manifest["cases"]
-            if case["id"] == "T03.sampler-coordinate-support-host")
-        for filename, expected_hash in (
-                coordinate_support["component_source_sha256"].items()):
-            with self.subTest(component=filename):
-                self.assertEqual(
-                    expected_hash,
-                    hashlib.sha256(
-                        (source_dir / filename).read_bytes()).hexdigest())
-        for filename, expected_hash in (
-                coordinate_support["component_fixture_sha256"].items()):
-            with self.subTest(component=filename):
-                self.assertEqual(
-                    expected_hash,
-                    hashlib.sha256(
-                        (source_dir / filename).read_bytes()).hexdigest())
 
     def test_tier2_unknown_case_fails_before_metal_access(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:

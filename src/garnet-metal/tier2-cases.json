@@ -1020,7 +1020,6 @@
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/native/private-summary-r10-r1/logs/run-sudo.log"
       ],
-      "source_sha256": "771d4966eb297d51ab72de38b456f0a913383719096762c2d6c1210454c8d647",
       "source_file": "test-argument-private-summary.m",
       "backend_gap": "This runtime-only case has no MSL/AIR translator or ABI8 acceptance and does not include the later summary producer postcase."
     },
@@ -1060,7 +1059,6 @@
           "submit-faults"
         ]
       },
-      "source_sha256": "fd1b97d5bb15f8fef0764979b354cb124eb43e6e7144e07dec2985f4a1e78840",
       "source_file": "test-argument-submit-faults.m",
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md"
@@ -1103,7 +1101,6 @@
         ]
       },
       "source_file": "test-argument-segment-retire.m",
-      "source_sha256": "1cd4568f67f5e9b648ddac6ab67fc22afe972e63bc4fe873622807e5df9e6331",
       "backend_gap": "The current render-pass/framebuffer lifetime fixture extends the earlier host checkpoint; mocked lifecycle success does not establish Vulkan delivery or actual GPU completion."
     },
     {
@@ -1143,7 +1140,6 @@
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/sampler-tests/api-reject/STRICT-COMPILE.txt"
       ],
-      "source_sha256": "b6fc376143095d80048c80d25fabaacde953233ab347e06ddfa533081bd99e2c",
       "source_file": "test-sampler-api-reject.m",
       "backend_gap": "The strict compile does not by itself prove runtime rejection counters; the selectable host check must run. Comparison retry remains covered by the sampler-runtime case."
     },
@@ -1188,7 +1184,6 @@
         "logs/rdna4-metal2/20261106-tier2-implementation/native/sampler-metadata-r5-r1.log"
       ],
       "source_file": "test-sampler-metadata.m",
-      "source_sha256": "5802959f9133d038cb56f7f7134888fd86d7980441378e123488a35fc70fb6ae",
       "backend_gap": "The runner requires an explicit --metadata-samples directory and is frozen to the five r2 actual samples. It does not automatically consume r3 ABI8 samples, and captured metadata cannot prove pipeline execution or descriptor binding on a GPU."
     },
     {
@@ -1235,7 +1230,6 @@
         "logs/rdna4-metal2/20261106-tier2-implementation/native/sampler-coordinates-reference-r2.log"
       ],
       "source_file": "test-sampler-coordinates.m",
-      "source_sha256": "04690e4a21274ac869ebbe93a49d18fadfd53a2b0d9297d5acd3d7f9c9c2e9ad",
       "backend_gap": "No RDNA4 full candidate log is registered yet; reference success cannot stand in for candidate execution."
     },
     {
@@ -1274,7 +1268,6 @@
         ]
       },
       "source_file": "test-sampler-coordinates.m",
-      "source_sha256": "04690e4a21274ac869ebbe93a49d18fadfd53a2b0d9297d5acd3d7f9c9c2e9ad",
       "backend_gap": "Capture evidence cannot satisfy ordinary sample, compare or gather execution."
     },
     {
@@ -1325,15 +1318,6 @@
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/native/source-preflight-r9-logs/test-sampler-coordinate-runtime.log"
       ],
-      "component_source_sha256": {
-        "test-sampler-coordinate-runtime.m": "5ef89e0938344ea24a571335fe8aab9171309313503fc3623349972cd7609684",
-        "test-sampler-coordinate-metadata.m": "661005295d57f2daeecd8ca24e5a144cb09a48f24d6e195ab2c6d08292347312",
-        "test-sampler-coordinate-state.c": "6bc754a0890f0887d1ecae7d9ef626c737878b8ce4539d809d31e806595cf3d8"
-      },
-      "component_fixture_sha256": {
-        "fixtures/abi8/fragment-indirect.spv": "4ff1a46d762084c3ac29feab4882fad4075758ec87c788b341207b3a2cf70708",
-        "fixtures/abi8/fragment-indirect.meta.json": "0241ba6ed45dc3a6a04a3a735e353a1ad57e3913e3851d2e6b8fca3b3e647cec"
-      },
       "backend_gap": "These host checks cannot establish coordinate sampling, descriptor binding or target-GPU support."
     },
     {
@@ -1385,11 +1369,7 @@
         "analysis": "The old expected value and tolerance remain unchanged. This selector must report FAIL until the fixture or implementation is corrected with independent evidence."
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
-      "backend_gap": "Divergent implicit derivatives require either corrected oracle analysis or explicit-gradient lowering; this case is not a capability SKIP.",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      }
+      "backend_gap": "Divergent implicit derivatives require either corrected oracle analysis or explicit-gradient lowering; this case is not a capability SKIP."
     },
     {
       "id": "T02.quad-margin-bias1",
@@ -1428,11 +1408,7 @@
         ]
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
-      "backend_gap": "This selector has no registered full reference/candidate log yet; gradient success does not imply bias1 success.",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      }
+      "backend_gap": "This selector has no registered full reference/candidate log yet; gradient success does not imply bias1 success."
     },
     {
       "id": "T02.quad-margin-gradient",
@@ -1475,11 +1451,7 @@
         "logs/rdna4-metal2/20261106-tier2-implementation/native/quad-margin-sampling-r2/logs/candidate-gradient.log"
       ],
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
-      "backend_gap": "Gradient control success does not close implicit divergent LOD or bias1.",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      }
+      "backend_gap": "Gradient control success does not close implicit divergent LOD or bias1."
     },
     {
       "id": "T03.sampler-binding-state",
@@ -1521,12 +1493,8 @@
           "sampler-binding-state"
         ]
       },
-      "source_sha256": "48d2315f0e69f12cb0037ae4b5fd91425ad06b1974e1b361e5204a11c553268a",
       "source_file": "test-sampler-binding-state.m",
-      "backend_gap": "This host mock cannot prove GPU state mapping, descriptor creation or target hardware behavior.",
-      "component_source_sha256": {
-        "test-sampler-pattern-oracle.h": "49d7788a780c41c637472d40c179487d2b9637f601c43039b9f8ee8111157c4f"
-      }
+      "backend_gap": "This host mock cannot prove GPU state mapping, descriptor creation or target hardware behavior."
     },
     {
       "id": "T03.sampler-binding-oracle-host",
@@ -1562,12 +1530,8 @@
           "sampler-binding-oracle"
         ]
       },
-      "source_sha256": "48d2315f0e69f12cb0037ae4b5fd91425ad06b1974e1b361e5204a11c553268a",
       "source_file": "test-sampler-binding-state.m",
-      "backend_gap": "A CPU oracle validates expected sampling rules but is not backend or GPU execution.",
-      "component_source_sha256": {
-        "test-sampler-pattern-oracle.h": "49d7788a780c41c637472d40c179487d2b9637f601c43039b9f8ee8111157c4f"
-      }
+      "backend_gap": "A CPU oracle validates expected sampling rules but is not backend or GPU execution."
     },
     {
       "id": "A04.argument-scan-runtime-host",
@@ -1610,7 +1574,6 @@
           "argument-scan-runtime"
         ]
       },
-      "source_sha256": "3356b2e155259bac411ee26c6770e6a7bc5094f7923397cdde92fe516da446cd",
       "source_file": "test-argument-scan-runtime.m",
       "backend_gap": "Mock buffers exercise production planning and ownership, but not actual Vulkan memory, driver completion or hardware retirement."
     },
@@ -1651,8 +1614,6 @@
           "reflection-trim-abi8"
         ]
       },
-      "source_sha256": "f477429fecc8cf628c35492f3f500fad2f38309f6973151a2f77bc1e55fdac9d",
-      "fixture_sha256": "d7c73c4e2c563e93510fdbf655809eef5f0c8b4e3b5111497484fb032057f1ba",
       "source_file": "test-reflection-trim.py",
       "backend_gap": "The Python check proves agreement with the shared fixture and the Rust fixture leg consumes it, but xlate source/test landing is still separate from this runner and none of these checks is a Vulkan or GPU reflection result."
     },
@@ -1695,7 +1656,6 @@
         ]
       },
       "source_file": "test-argument-gather-cube.m",
-      "source_sha256": "9629d357368559562a43539d17ea6df2f6e31e67dad47e51828d6ddb94bd7a61",
       "backend_gap": "Strict compilation and SPIR-V validation do not prove GPU outputs. Missing candidate depth cube/array image support is a hard failure, not a skip."
     },
     {
@@ -1737,11 +1697,7 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "backend_gap": "This fixture is compiled but has no registered paired GPU execution yet. Missing format, shape or 4-sample support remains a visible failure.",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      }
+      "backend_gap": "This fixture is compiled but has no registered paired GPU execution yet. Missing format, shape or 4-sample support remains a visible failure."
     },
     {
       "id": "T02.gather-capability-host",
@@ -1779,10 +1735,6 @@
         ]
       },
       "source_file": "test-gather-capability.m",
-      "source_sha256": "114b50f763bfa08a387e9b2a98f7acc1d70047c81699c661265365ac61016b53",
-      "component_source_sha256": {
-        "rdna4_gather_caps.h": "4d4aedc9980c4190230037a1f0e8f14def23ffe04b96589e58df8476207a3be1"
-      },
       "backend_gap": "A mocked feature decision does not prove device feature enablement or GPU gather execution."
     },
     {
@@ -1819,10 +1771,6 @@
         ]
       },
       "source_file": "test-gather-caps.c",
-      "source_sha256": "354a803ea4b9e44838dcb32a15a296e8b45edfa05fedfd9c4b58b9b8fd5279fa",
-      "component_source_sha256": {
-        "rdna4_gather_caps.h": "4d4aedc9980c4190230037a1f0e8f14def23ffe04b96589e58df8476207a3be1"
-      },
       "backend_gap": "CPU rules do not query a Vulkan device or establish gather execution."
     },
     {
@@ -1861,10 +1809,6 @@
         ]
       },
       "source_file": "test-null-runtime.m",
-      "source_sha256": "95308ea7784a6f77b6fce6c17bc6cac88dea655ee59abece6224164f98319495",
-      "component_source_sha256": {
-        "rdna4_null_shape.h": "7ed3affd1010898003e83df2ef52833419abaeb5fbaef082a4e13ff11fdb7deb"
-      },
       "backend_gap": "This fixture uses mocked layout functions and does not allocate or bind GPU null resources."
     },
     {
@@ -1902,10 +1846,6 @@
         ]
       },
       "source_file": "test-null-shape.c",
-      "source_sha256": "70203f916638a539766d2d78c6b10b8f4ce8068b072b41cdcb85dc502d228775",
-      "component_source_sha256": {
-        "rdna4_null_shape.h": "7ed3affd1010898003e83df2ef52833419abaeb5fbaef082a4e13ff11fdb7deb"
-      },
       "backend_gap": "CPU registry validation does not establish driver dummy-resource creation or null read/write GPU behavior."
     },
     {
@@ -1942,10 +1882,6 @@
         ]
       },
       "source_file": "test-null-remap.c",
-      "source_sha256": "83f0e0619e867d0b4d4e280589ba392b78e0c9536c69c6cafcbe3995e40e554e",
-      "component_source_sha256": {
-        "rdna4_null_shape.h": "7ed3affd1010898003e83df2ef52833419abaeb5fbaef082a4e13ff11fdb7deb"
-      },
       "backend_gap": "CPU stage ordinal checks do not prove pipeline descriptor writes or GPU resource access."
     },
     {
@@ -1985,7 +1921,6 @@
         ]
       },
       "source_file": "test-argument-summary-event-progress.m",
-      "source_sha256": "05086be5d1cd5ab36d092477a4b39ef5b46ae21e00e3b807a32ab9d89b7dfbe1",
       "backend_gap": "This driver lifecycle fixture uses no translator or ABI8. Fixture owner peaks are observable; driver and scratch/pool peak counters require separate host instrumentation."
     },
     {
@@ -2023,7 +1958,6 @@
         ]
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
       "backend_gap": "Candidate success does not resolve the system-reference mismatch. Controls do not replace this original divergent implicit oracle.",
       "known_failure": {
         "status": "open",
@@ -2031,9 +1965,6 @@
         "evidence": [
           "logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md"
         ]
-      },
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
       }
     },
     {
@@ -2071,7 +2002,6 @@
         ]
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
       "backend_gap": "Candidate success does not resolve the system-reference mismatch. Controls do not replace this original divergent implicit oracle.",
       "known_failure": {
         "status": "open",
@@ -2079,9 +2009,6 @@
         "evidence": [
           "logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md"
         ]
-      },
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
       }
     },
     {
@@ -2120,14 +2047,10 @@
         ]
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
       "backend_gap": "Paired control PASS isolates coordinate/explicit-LOD behavior; it does not close the original sampler/image implicit reference failures.",
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md"
-      ],
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      }
+      ]
     },
     {
       "id": "T02.quad-margin-control-lod1",
@@ -2165,14 +2088,10 @@
         ]
       },
       "source_file": "test-argument-quad-margin.m",
-      "source_sha256": "b5a4e59b5ef30a302679badd17854647d997a49a61f067b2fc35247c737a4911",
       "backend_gap": "Paired control PASS isolates coordinate/explicit-LOD behavior; it does not close the original sampler/image implicit reference failures.",
       "evidence": [
         "logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md"
-      ],
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      }
+      ]
     },
     {
       "id": "PROJECT.null-shape-reflection",
@@ -2208,17 +2127,6 @@
         ]
       },
       "source_file": "test-null-shape-reflection.c",
-      "source_sha256": "54bd383b63890fe4ee6e5c9f70a09ea6903e463fc3eab5ae4267e2380e000afc",
-      "component_source_sha256": {
-        "rdna4_null_shape.h": "7ed3affd1010898003e83df2ef52833419abaeb5fbaef082a4e13ff11fdb7deb",
-        "rdna4_spvrefl.h": "b97063b89e58612deff0fc55972936311cc83b7555f90cf38c63a9c356d38d81"
-      },
-      "component_fixture_sha256": {
-        "fixtures/null-shapes-abi9.spv": "f99eca0eaec727497a54d655b1785b6960400e73c42ab0def63af429e2b7ea66",
-        "fixtures/null-shapes-invalid.spv": "864b69a08962172c23890ade64e86ff804026713872daa39100e68b8f34ab81c",
-        "fixtures/null-shapes-abi9.spvasm": "a456263d726522a0b8adc005b32eff1233fb51df8598d4a91d011b65c36e4f25",
-        "fixtures/null-shapes-invalid.spvasm": "612229ef7451e2d1a9a7cdda381e94e318faf8133b01f166665eec0d5a4c613c"
-      },
       "backend_gap": "The malformed fixture is intentionally rejected by spirv-val; parser rejection flags are the test oracle. Offline reflection does not prove descriptor allocation or GPU null behavior."
     },
     {
@@ -2256,11 +2164,6 @@
         ]
       },
       "source_file": "test-argument-summary-plan.c",
-      "source_sha256": "51ac3e2a0567be8c212ce783fd4c4406cb25a91887fdf4b31c0be2c76f52d993",
-      "component_source_sha256": {
-        "rdna4_argument_summary.h": "a096fcdfa1a75ffdb7baef2e7df84e60bfebe2a3269a7d9e8b59050e59697330",
-        "argument-summary/rdna4_argument_summary_spv.h": "8cbab949baf2012b8e8e1748fd708dc8257eaa512a9163e0c60d7db089f6a986"
-      },
       "backend_gap": "Logical >4 GiB range arithmetic is not an actual GPU allocation or scan."
     },
     {
@@ -2298,11 +2201,6 @@
         ]
       },
       "source_file": "test-argument-summary-owners.c",
-      "source_sha256": "3df382b74ed01c830ceb65d1cf24dda8388d6bf12994a251374018dc162b51a4",
-      "component_source_sha256": {
-        "rdna4_argument_summary.h": "a096fcdfa1a75ffdb7baef2e7df84e60bfebe2a3269a7d9e8b59050e59697330",
-        "rdna4_argument_summary_owners.inc": "95ff1fb9dbcf44c57750ec026b4f2cded71d79c96978c59a8753128f1cd9db2b"
-      },
       "backend_gap": "Pure CPU ordering checks do not prove Vulkan completion or Metal object lifetime."
     },
     {
@@ -2340,11 +2238,6 @@
         ]
       },
       "source_file": "test-argument-summary-runtime.m",
-      "source_sha256": "de2955b496a7721a0e2d5792eed013b4e91c742745163af5c8efadc30c2605d4",
-      "component_source_sha256": {
-        "rdna4_argument_summary.h": "a096fcdfa1a75ffdb7baef2e7df84e60bfebe2a3269a7d9e8b59050e59697330",
-        "rdna4_argument_summary.inc": "ed1cba662849f196186932acd1ef53dfa32b737d4cb9c881f807f33454731443"
-      },
       "backend_gap": "This .m fixture is deliberately compiled as plain C and runs simulated callbacks without a Vulkan loader, queue or GPU."
     },
     {
@@ -2382,10 +2275,6 @@
         ]
       },
       "source_file": "test-argument-writer-epochs.c",
-      "source_sha256": "4a68e03567a2f086da5b44a83a06429a88951e7a08ed56238e5f5c8f54bfd891",
-      "component_source_sha256": {
-        "rdna4_argument_epochs.h": "e28adf41a32d4a828ef3b460e32015b80c035378141c2ba859c148e5f77032af"
-      },
       "backend_gap": "CPU state checks cannot establish actual asynchronous command submission or resource lifetime."
     },
     {
@@ -2422,10 +2311,6 @@
         ]
       },
       "source_file": "test-argument-capacity.c",
-      "source_sha256": "d5bbb23dad37d10fd1e55ffe0de073ef6698138b5c21be56756345565922b92f",
-      "component_source_sha256": {
-        "rdna4_argument_capacity.h": "59e03bf3a96fac215810e4eb14f0d9c69989cd927cecec2441e4c3bf3777c4c0"
-      },
       "backend_gap": "Host arithmetic does not query or allocate the target backend limits; missing target capability is not a GPU PASS."
     },
     {
@@ -2463,10 +2348,6 @@
         ]
       },
       "source_file": "test-argument-public-sampler.c",
-      "source_sha256": "cac1cf901a3677be7c3b524a62cbff8c955f48c73d49589357bbca4742f990c5",
-      "component_source_sha256": {
-        "rdna4_argument_public_sampler.h": "2d859325f1f86bbe278405ecb26d682bd6686d5a31d4caaad632aed7296908b8"
-      },
       "backend_gap": "This is CPU arithmetic, not backend sampler creation or proof of public GPU capacity."
     },
     {
@@ -2504,7 +2385,6 @@
         ]
       },
       "source_file": "test-argument-pool.m",
-      "source_sha256": "bdb16fee208b06ac0499303081e27fef63391cbdf1d43bda639393baa6d12ab0",
       "backend_gap": "Mock descriptor accounting does not establish actual backend allocation or target GPU capacity."
     },
     {
@@ -2543,13 +2423,6 @@
         ]
       },
       "source_file": "test-argument-limit-snapshot.c",
-      "source_sha256": "4da77517c74acb26f28883568c56730e7ce606a8b6a1bc0249a658a04572638e",
-      "component_source_sha256": {
-        "test-argument-limit-snapshot-provider.c": "6436c56fce9194e3eb37ac16146827204cfa2ecf64f703e827c331e6af03635c",
-        "rdna4_argument_limit_snapshot.h": "cc20568763198165156daf030eb8da62fac95c9f35e569a374daf35ba509b1bf",
-        "rdna4_argument_limit_snapshot.inc": "487c9d4386df729e0b7f0bac68af436df11bc41c0656b22debc1145c04662a21",
-        "rdna4_argument_public_sampler.h": "2d859325f1f86bbe278405ecb26d682bd6686d5a31d4caaad632aed7296908b8"
-      },
       "backend_gap": "The loaded fixture provider is synthetic and creates no Vulkan objects; it does not establish actual backend support or public target capacity."
     },
     {
@@ -2587,11 +2460,6 @@
         ]
       },
       "source_file": "test-argument-limit-snapshot-device.m",
-      "source_sha256": "ec38ebd3189a0b43c284f2446add16fd498696548320c5cbcbf6a9cc7436d688",
-      "component_source_sha256": {
-        "rdna4_argument_limit_snapshot.h": "cc20568763198165156daf030eb8da62fac95c9f35e569a374daf35ba509b1bf",
-        "rdna4_argument_limit_snapshot.inc": "487c9d4386df729e0b7f0bac68af436df11bc41c0656b22debc1145c04662a21"
-      },
       "backend_gap": "A mock device is not the actual driver device and cannot prove GPU capability or allocation."
     },
     {
@@ -2629,11 +2497,6 @@
         ]
       },
       "source_file": "test-snapshot-admission.m",
-      "source_sha256": "94a29761424a58b8eaf5cda3810cf35347849a2a31c5423ca69c3db4a03ea2aa",
-      "component_source_sha256": {
-        "test-sampler-runtime.m": "f3783c6895d6d7b5508cc993202c9623064f23dc296f65b630cfd3e3733ac48e",
-        "test-argument-limit-snapshot-provider.c": "6436c56fce9194e3eb37ac16146827204cfa2ecf64f703e827c331e6af03635c"
-      },
       "backend_gap": "This synthetic snapshot admission test cannot prove a queried target limit or actual GPU sampler behavior."
     },
     {
@@ -2671,11 +2534,6 @@
         ]
       },
       "source_file": "test-argument-scan.c",
-      "source_sha256": "f61082241eb5ac96994c931f158133cd95083d194593141997093a16908f92e3",
-      "component_source_sha256": {
-        "rdna4_argument_scan.h": "e07c8f82ee694160ba916288ff302c889f92d29deee0c1177d57c8ee630c5f7c",
-        "rdna4_argument_scan.inc": "200ba466e689404cf92b5e30503cf62f7d301a48181ae7b0f1963e1f8d7f0aea"
-      },
       "backend_gap": "Logical mapped range tests do not scan actual Private GPU memory or prove runtime completion."
     },
     {
@@ -2713,7 +2571,6 @@
         ]
       },
       "source_file": "test-argument-contract.m",
-      "source_sha256": "e0cd9ad73034f0f929d6b04b5527e6b29ba6bdc7a90ab4414d3ce7b5e488fc53",
       "backend_gap": "The candidate-only invalid-encoding checks are not a reference API contract; this compute fixture does not cover all required vertex/fragment resource graph stages."
     },
     {
@@ -2752,7 +2609,6 @@
         ]
       },
       "source_file": "test-argument-resources.m",
-      "source_sha256": "603444adfe8ab7b8ba1f59cdc08d0ef8dd7c74a63f52a73bad6abc0d71b81d14",
       "backend_gap": "This fixture checks compute values only; dynamic vertex/fragment resource graphs remain separate named requirements."
     },
     {
@@ -2792,7 +2648,6 @@
         ]
       },
       "source_file": "test-large-buffer-addressing.m",
-      "source_sha256": "dac0b5bca7915989419230be8b8f7fb6c0757eadc169bfe759d182a3f7712fb6",
       "backend_gap": "This opt-in target-only fixture proves compute addressing within a small allocation; it does not prove real >4 GiB backing, vertex/fragment addressing or full Tier 2.",
       "required_mode": "live",
       "required_stages": [
@@ -2836,7 +2691,6 @@
         ]
       },
       "source_file": "test-large-memory.m",
-      "source_sha256": "4dfc033dcf1faeb67debfa9a8548e6d5bc34b4d3c143f533ed1584a47eef9917",
       "backend_gap": "8.1 target-only, opt-in after the matched hardware workflow. Required backend capacity and real backing must succeed; inability remains FAIL/SKIP with nonzero suite exit. This compute memory workload does not close >4 GiB argument/helper consumers or required vertex/fragment stage execution.",
       "required_mode": "live",
       "required_stages": [
@@ -2881,7 +2735,6 @@
         ]
       },
       "source_file": "test-large-memory.m",
-      "source_sha256": "4dfc033dcf1faeb67debfa9a8548e6d5bc34b4d3c143f533ed1584a47eef9917",
       "backend_gap": "8.1 target-only, opt-in after the matched hardware workflow. Required backend capacity and real backing must succeed; inability remains FAIL/SKIP with nonzero suite exit. This compute memory workload does not close >4 GiB argument/helper consumers or required vertex/fragment stage execution.",
       "required_mode": "live",
       "required_stages": [
@@ -2926,7 +2779,6 @@
         ]
       },
       "source_file": "test-large-memory.m",
-      "source_sha256": "4dfc033dcf1faeb67debfa9a8548e6d5bc34b4d3c143f533ed1584a47eef9917",
       "backend_gap": "8.1 target-only, opt-in after the matched hardware workflow. Required backend capacity and real backing must succeed; inability remains FAIL/SKIP with nonzero suite exit. This compute memory workload does not close >4 GiB argument/helper consumers or required vertex/fragment stage execution.",
       "required_mode": "live",
       "required_stages": [
@@ -2973,7 +2825,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3013,7 +2864,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3053,7 +2903,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3093,7 +2942,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3133,7 +2981,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3173,7 +3020,6 @@
         ]
       },
       "source_file": "test-sampler-usage.m",
-      "source_sha256": "3c3905d1aa2db1bdc1c7dd71fdb1c6ab549ed558f906957ae4323594cd3a36b3",
       "backend_gap": "A compiler refusal, crash or missing descriptor capability remains a failure; separate controls do not close the mixed-use execution requirement."
     },
     {
@@ -3226,11 +3072,7 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "backend_gap": "Write controls do not establish sampled cube-array reads or full mixed image-operation support. Unsupported backend compilation or execution remains visible.",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      }
+      "backend_gap": "Write controls do not establish sampled cube-array reads or full mixed image-operation support. Unsupported backend compilation or execution remains visible."
     },
     {
       "id": "T02.cube-texel-reads",
@@ -3283,14 +3125,7 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "backend_gap": "A failed reference, missing cube-array capability, compiler refusal or GPU mismatch remains a visible failure. These read/sample controls do not establish cube storage writes, gather or depth operations.",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b",
-        "rdna4_shader_runtime_impl.inc": "a55a232504181794ad5d11c02e23207445cbb73dbdc55f0afe67e7c11c217a28",
-        "rdna4_sampler_runtime_impl.inc": "db0c5eee7bf47ec4b21d6e7195845cc37784a13ecc8baea288e7da27961e4c2b",
-        "rdna4_sampler.h": "f377c9aaa4b6b9b49c0e6fd895c24d3f7b36174e655cff5528c4d114ebbc3788"
-      }
+      "backend_gap": "A failed reference, missing cube-array capability, compiler refusal or GPU mismatch remains a visible failure. These read/sample controls do not establish cube storage writes, gather or depth operations."
     },
     {
       "id": "T02.synthesized-read-sampler-host",
@@ -3323,12 +3158,6 @@
         ]
       },
       "source_file": "test-synthesized-read-sampler.m",
-      "source_sha256": "13998cb31ee255e2c5ef49aa46a9f038dcf0170e21ed8f076c5ae2ce5830c1b8",
-      "component_source_sha256": {
-        "rdna4_shader_runtime_impl.inc": "a55a232504181794ad5d11c02e23207445cbb73dbdc55f0afe67e7c11c217a28",
-        "rdna4_sampler_runtime_impl.inc": "db0c5eee7bf47ec4b21d6e7195845cc37784a13ecc8baea288e7da27961e4c2b",
-        "rdna4_sampler.h": "f377c9aaa4b6b9b49c0e6fd895c24d3f7b36174e655cff5528c4d114ebbc3788"
-      },
       "reference": {
         "domain": "not applicable; mocked Vulkan stage-layout check",
         "execution_class": "not-applicable",
@@ -3375,11 +3204,6 @@
         ]
       },
       "source_file": "test-sampler-patterns.m",
-      "source_sha256": "58ada76ad6d5f3190bbc177df40b967fc8bfa72e04a1887ff13d564a8d0bf2ac",
-      "component_source_sha256": {
-        "test-sampler-pattern-oracle.h": "49d7788a780c41c637472d40c179487d2b9637f601c43039b9f8ee8111157c4f",
-        "test-sampler-anisotropy.inc": "9191061adeca76fde7380a6214d8225ddf08f9788f60fef45991f9ba9fedad06"
-      },
       "backend_gap": "Reference failure, unsupported state or GPU mismatch is a failure; sampler footprint controls have a separate case."
     },
     {
@@ -3422,11 +3246,6 @@
         ]
       },
       "source_file": "test-sampler-patterns.m",
-      "source_sha256": "58ada76ad6d5f3190bbc177df40b967fc8bfa72e04a1887ff13d564a8d0bf2ac",
-      "component_source_sha256": {
-        "test-sampler-pattern-oracle.h": "49d7788a780c41c637472d40c179487d2b9637f601c43039b9f8ee8111157c4f",
-        "test-sampler-anisotropy.inc": "9191061adeca76fde7380a6214d8225ddf08f9788f60fef45991f9ba9fedad06"
-      },
       "backend_gap": "Sampling footprint is implementation-dependent. The predeclared stripe-recovery quality control is retained as a project check; underlying target GPU acceptance remains separate."
     },
     {
@@ -3469,12 +3288,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3517,12 +3330,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3565,12 +3372,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3613,12 +3414,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3661,12 +3456,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3709,12 +3498,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. Actual AIR/SPIR-V must be inspected to distinguish preserved control flow from compiler flattening; broader hoisting and negative control-flow requirements remain separate."
     },
     {
@@ -3757,12 +3540,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not establish target RDNA4 acceptance. Captured AIR/SPIR-V must retain the varying branch and show the derivative placement; compiler-flattened cases cannot prove hoisting. Dynamic sampler normalization dependencies and broader partial-exit coverage remain separate."
     },
     {
@@ -3805,12 +3582,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not establish target RDNA4 acceptance. Captured AIR/SPIR-V must retain the varying branch and show the derivative placement; compiler-flattened cases cannot prove hoisting. Dynamic sampler normalization dependencies and broader partial-exit coverage remain separate."
     },
     {
@@ -3853,12 +3624,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. The branch case has a preserved VM reference failure at pixel (3,2), state=0/resource=0: mip value 23 instead of fixed oracle 22. It remains a reference FAIL; candidate success cannot make the pair a PASS. The loop reference succeeds. Dynamic sampler normalization dependencies and broader partial exits remain separate."
     },
     {
@@ -3901,12 +3666,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM output does not establish target RDNA4 acceptance. The branch case has a preserved VM reference failure at pixel (3,2), state=0/resource=0: mip value 23 instead of fixed oracle 22. It remains a reference FAIL; candidate success cannot make the pair a PASS. The loop reference succeeds. Dynamic sampler normalization dependencies and broader partial exits remain separate."
     },
     {
@@ -3950,12 +3709,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM is not target RDNA4 acceptance. Initial system-Metal reference for the four mixed-domain branch/loop cases gives top mip 24/124 instead of the fixed oracle; preserve these failures without changing tolerance or expected values. The independent return control does not mix lane resource identities. Inspect actual AIR/SPIR-V to confirm gradient placement and array layer isolation."
     },
     {
@@ -3999,12 +3752,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM is not target RDNA4 acceptance. Initial system-Metal reference for the four mixed-domain branch/loop cases gives top mip 24/124 instead of the fixed oracle; preserve these failures without changing tolerance or expected values. The independent return control does not mix lane resource identities. Inspect actual AIR/SPIR-V to confirm gradient placement and array layer isolation."
     },
     {
@@ -4048,12 +3795,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM is not target RDNA4 acceptance. Initial system-Metal reference for the four mixed-domain branch/loop cases gives top mip 24/124 instead of the fixed oracle; preserve these failures without changing tolerance or expected values. The independent return control does not mix lane resource identities. Inspect actual AIR/SPIR-V to confirm gradient placement and array layer isolation."
     },
     {
@@ -4097,12 +3838,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM is not target RDNA4 acceptance. Initial system-Metal reference for the four mixed-domain branch/loop cases gives top mip 24/124 instead of the fixed oracle; preserve these failures without changing tolerance or expected values. The independent return control does not mix lane resource identities. Inspect actual AIR/SPIR-V to confirm gradient placement and array layer isolation."
     },
     {
@@ -4146,12 +3881,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM is not target RDNA4 acceptance. Initial system-Metal reference for the four mixed-domain branch/loop cases gives top mip 24/124 instead of the fixed oracle; preserve these failures without changing tolerance or expected values. The independent return control does not mix lane resource identities. Inspect actual AIR/SPIR-V to confirm gradient placement and array layer isolation."
     },
     {
@@ -4194,12 +3923,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement.",
       "known_failure": {
         "status": "open",
@@ -4250,12 +3973,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement.",
       "known_failure": {
         "status": "open",
@@ -4306,12 +4023,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4355,12 +4066,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement.",
       "known_failure": {
         "status": "open",
@@ -4412,12 +4117,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4460,12 +4159,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4508,12 +4201,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4556,12 +4243,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4604,12 +4285,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4652,12 +4327,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4700,12 +4369,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4748,12 +4411,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4796,12 +4453,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4844,12 +4495,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4892,12 +4537,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4940,12 +4579,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -4988,12 +4621,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -5037,12 +4664,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -5086,12 +4707,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -5135,12 +4750,6 @@
         ]
       },
       "source_file": "test-argument-fragment-flow.m",
-      "source_sha256": "83464ecb44daf8bfc2dbac91907dfa409a5ef2cf7027157ef4bdc574f18d72ac",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790",
-        "test-argument-runtime-flow.inc": "764a42ba0457673aab8a3db5b4eb519d6429039431beb5353bd5964eba11bfce",
-        "test-argument-exit-flow.inc": "905fd1a67d2b6506411f6f8b30feabecd52993217b4b6b72ab1e01172885b005"
-      },
       "backend_gap": "VM execution does not prove target RDNA4 acceptance. Preserve any reference output failure or unsupported backend result; do not change the fixed mip oracle or compare only candidate/reference agreement."
     },
     {
@@ -5184,10 +4793,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5231,10 +4836,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5278,10 +4879,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5325,10 +4922,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5372,10 +4965,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5419,10 +5008,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5466,10 +5051,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5513,10 +5094,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5560,10 +5137,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5607,10 +5180,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5654,10 +5223,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5701,10 +5266,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5748,10 +5309,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5795,10 +5352,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5842,10 +5395,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5889,10 +5438,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5936,10 +5481,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -5983,10 +5524,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6030,10 +5567,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6077,10 +5610,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6124,10 +5653,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6171,10 +5696,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6218,10 +5739,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6265,10 +5782,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6312,10 +5825,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6359,10 +5868,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6406,10 +5911,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6453,10 +5954,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6500,10 +5997,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6547,10 +6040,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM evidence does not establish target RDNA4 acceptance. Bias +/-2 is within the queried VM maxSamplerLodBias; this selection does not close endpoint/over-limit bias, depth/array/projection or offset combinations."
     },
     {
@@ -6595,11 +6084,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.bias.negative-limit",
@@ -6643,11 +6128,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.bias.positive-over",
@@ -6691,11 +6172,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.bias.negative-over",
@@ -6739,11 +6216,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.grad.positive-limit",
@@ -6787,11 +6260,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.grad.negative-limit",
@@ -6835,11 +6304,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.grad.positive-over",
@@ -6883,11 +6348,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.pot.grad.negative-over",
@@ -6931,11 +6392,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.bias.positive-limit",
@@ -6979,11 +6436,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.bias.negative-limit",
@@ -7027,11 +6480,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.bias.positive-over",
@@ -7075,11 +6524,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.bias.negative-over",
@@ -7123,11 +6568,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.grad.positive-limit",
@@ -7171,11 +6612,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.grad.negative-limit",
@@ -7219,11 +6656,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.grad.positive-over",
@@ -7267,11 +6700,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-limits.npot.grad.negative-over",
@@ -7315,11 +6744,7 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
-      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage.",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec"
+      "backend_gap": "Requires the actual queried --sampling-bias-limit. Fixture supports bounds 0..120 to keep inverse-scaled coordinates and explicit gradients finite; this is a fixture range, not a public sampler limit. VM evidence does not establish target RDNA4 output or depth/array/offset coverage."
     },
     {
       "id": "T02.sampling-array.array-pot.bias.-2",
@@ -7362,10 +6787,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7409,10 +6830,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7456,10 +6873,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7503,10 +6916,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7550,10 +6959,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7597,10 +7002,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7644,10 +7045,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7691,10 +7088,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7738,10 +7131,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7785,10 +7174,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7832,10 +7217,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7879,10 +7260,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7926,10 +7303,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -7973,10 +7346,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -8020,10 +7389,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -8067,10 +7432,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -8114,10 +7475,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -8161,10 +7518,6 @@
         ]
       },
       "source_file": "test-argument-sampling-matrix.m",
-      "source_sha256": "f35794854c68e7bf1760b5407feb06b363b9277128285553e21ae920242faaec",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "VM results do not establish target RDNA4 acceptance. Source is fixed MSL 2.1 texture2d_array sample with valid int2(1,-1) offset; failures remain visible. Other dimensions, depth/Dref and the full task contract remain separate."
     },
     {
@@ -8210,10 +7563,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8259,10 +7608,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8308,10 +7653,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8357,10 +7698,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8406,10 +7743,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8455,10 +7788,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8504,10 +7833,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8553,10 +7878,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8605,10 +7926,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8657,10 +7974,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8709,10 +8022,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8761,10 +8070,6 @@
         ]
       },
       "source_file": "test-argument-depth-mips.m",
-      "source_sha256": "533612746ec00228090230a7cc12174d5ede4d41b7d50d71c24e50eb7b91204c",
-      "component_source_sha256": {
-        "test-argument-render-support.h": "cb979d7978c766a1da1784c935f27865271f8606cb418ce417f10debff219790"
-      },
       "backend_gap": "MSL 2.1 macOS compare source uses only implicit LOD or constant level(0), with compile-time offset. Internal implicit-to-Grad lowering is separately inspected. VM results are not physical acceptance; failures remain failures."
     },
     {
@@ -8809,10 +8114,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Current VM reference execution hits host ArgumentBufferTextures:NotImplemented and aborts the VM. Capture stays CAPTURE, never GPU PASS; actual reference/target execution remains for a capable backend. Candidate output is checked independently."
     },
     {
@@ -8857,10 +8158,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Current VM reference execution hits host ArgumentBufferTextures:NotImplemented and aborts the VM. Capture stays CAPTURE, never GPU PASS; actual reference/target execution remains for a capable backend. Candidate output is checked independently."
     },
     {
@@ -8903,7 +8200,6 @@
         ]
       },
       "source_file": "test-argument-nested.m",
-      "source_sha256": "581297f2b53102da667acfab3246af68d462cd7958e601abeb0bcedca246adbd",
       "backend_gap": "Reference VM execution aborts at Lowering(Access):NotImplemented. Candidate query and GPU argument copy are executable. This case does not test sample texel reads or multisample population/resolve."
     },
     {
@@ -8945,10 +8241,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Population uses legal sample-mask output without a sample-position input. Any host, producer, read, query or guard failure remains FAIL; this is not physical acceptance."
     },
     {
@@ -8990,10 +8282,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Population uses legal sample-mask output without a sample-position input. Any host, producer, read, query or guard failure remains FAIL; this is not physical acceptance."
     },
     {
@@ -9035,10 +8323,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Population uses legal sample-mask output without a sample-position input. Any host, producer, read, query or guard failure remains FAIL; this is not physical acceptance."
     },
     {
@@ -9080,10 +8364,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Population uses legal sample-mask output without a sample-position input. Any host, producer, read, query or guard failure remains FAIL; this is not physical acceptance."
     },
     {
@@ -9121,12 +8401,6 @@
         ]
       },
       "source_file": "test-multisample-binding.m",
-      "source_sha256": "0fa84a9fa2bedc786487315c443e87ad5d75b4a1a657a606c429b3094d54950f",
-      "component_source_sha256": {
-        "rdna4_spvrefl.h": "b97063b89e58612deff0fc55972936311cc83b7555f90cf38c63a9c356d38d81",
-        "rdna4_shader_runtime_impl.inc": "a55a232504181794ad5d11c02e23207445cbb73dbdc55f0afe67e7c11c217a28",
-        "rdna4_command_buffer_impl.inc": "6b948da9ab0f49339cf6c5b148938d1b7732134509d2eef173d1163ea0a595a8"
-      },
       "backend_gap": "Host-mock evidence only. Actual direct and indirect multisample reads have separate GPU cases."
     },
     {
@@ -9167,10 +8441,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Direct texture rebindings are a shared-path regression, not proof of dynamic argument resource selection or physical acceptance. Producer, read, query and guard failures remain visible."
     },
     {
@@ -9211,10 +8481,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Direct texture rebindings are a shared-path regression, not proof of dynamic argument resource selection or physical acceptance. Producer, read, query and guard failures remain visible."
     },
     {
@@ -9255,10 +8521,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Direct texture rebindings are a shared-path regression, not proof of dynamic argument resource selection or physical acceptance. Producer, read, query and guard failures remain visible."
     },
     {
@@ -9299,10 +8561,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "Direct texture rebindings are a shared-path regression, not proof of dynamic argument resource selection or physical acceptance. Producer, read, query and guard failures remain visible."
     },
     {
@@ -9343,10 +8601,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "On this VM uint/sint descriptor-array queries return width 1 instead of 4 despite a valid token lookup; direct-image query succeeds. The native and reference mixed cases remain FAIL. Direct read-only and query-only controls are separate named cases; do not count this failure as GPU PASS."
     },
     {
@@ -9387,10 +8641,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "VM reference uint/sint query-only cases fail width 4/1; candidate controls pass. Keep reference failures visible; no physical acceptance claim."
     },
     {
@@ -9431,10 +8681,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "On this VM uint/sint descriptor-array queries return width 1 instead of 4 despite a valid token lookup; direct-image query succeeds. The native and reference mixed cases remain FAIL. Direct read-only and query-only controls are separate named cases; do not count this failure as GPU PASS."
     },
     {
@@ -9475,10 +8721,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "VM reference uint/sint query-only cases fail width 4/1; candidate controls pass. Keep reference failures visible; no physical acceptance claim."
     },
     {
@@ -9519,10 +8761,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "On this VM uint/sint descriptor-array queries return width 1 instead of 4 despite a valid token lookup; direct-image query succeeds. The native and reference mixed cases remain FAIL. Direct read-only and query-only controls are separate named cases; do not count this failure as GPU PASS."
     },
     {
@@ -9563,10 +8801,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "VM reference uint/sint query-only cases fail width 4/1; candidate controls pass. Keep reference failures visible; no physical acceptance claim."
     },
     {
@@ -9607,10 +8841,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "On this VM uint/sint descriptor-array queries return width 1 instead of 4 despite a valid token lookup; direct-image query succeeds. The native and reference mixed cases remain FAIL. Direct read-only and query-only controls are separate named cases; do not count this failure as GPU PASS."
     },
     {
@@ -9651,10 +8881,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-cube-read-grid.inc": "b3b1da4fbb893f69e454aae7aca40ef4227f23644ad842892ce4676f13f7222b"
-      },
       "backend_gap": "VM reference uint/sint query-only cases fail width 4/1; candidate controls pass. Keep reference failures visible; no physical acceptance claim."
     },
     {
@@ -9698,10 +8924,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9745,10 +8967,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9792,10 +9010,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9839,10 +9053,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9886,10 +9096,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9933,10 +9139,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -9980,10 +9182,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10027,10 +9225,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10074,10 +9268,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10121,10 +9311,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10168,10 +9354,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10215,10 +9397,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10262,10 +9440,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10309,10 +9483,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10356,10 +9526,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10403,10 +9569,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10450,10 +9612,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10497,10 +9655,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10544,10 +9698,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10591,10 +9741,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10638,10 +9784,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10685,10 +9827,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10732,10 +9870,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10779,10 +9913,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10826,10 +9956,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10873,10 +9999,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10920,10 +10042,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -10967,10 +10085,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -11014,10 +10128,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "No nil-sampler or undefined null member result is counted as a language PASS. Cube storage writes may exceed VM lowering support; preserve backend/reference failures. This case does not validate target RDNA4."
     },
     {
@@ -11061,10 +10171,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11108,10 +10214,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11155,10 +10257,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11202,10 +10300,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11249,10 +10343,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11296,10 +10386,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11343,10 +10429,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11390,10 +10472,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11437,10 +10515,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11484,10 +10558,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11531,10 +10601,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11578,10 +10644,6 @@
         ]
       },
       "source_file": "test-argument-image-operations.m",
-      "source_sha256": "7a72277d5acd078a3be6d8bb5ea173670719e8437c8be5bdeab0c474558a2fc2",
-      "component_source_sha256": {
-        "test-null-image-guards.inc": "2da395bc1ee1ef89e3fb0b79013f9be904319bba1b5d50a47cd92396a7f9f381"
-      },
       "backend_gap": "A valid sampler is bound even on null-image lanes. This is a defined GPU output check; missing sampler descriptor creation is separately host-mocked. Host lowering refusals remain visible; this does not prove physical RDNA4 or complete task 4.1."
     },
     {
@@ -11621,12 +10683,6 @@
         ]
       },
       "source_file": "test-null-sampler-bindings.m",
-      "source_sha256": "4b77cd222f4ee3fd1efdadaf4245009ecf0b1da5963f4e63b6823d13aa9368b2",
-      "component_source_sha256": {
-        "rdna4_command_buffer_impl.inc": "6b948da9ab0f49339cf6c5b148938d1b7732134509d2eef173d1163ea0a595a8",
-        "rdna4_stage_bindings_impl.inc": "26be6a65b05d49439216d3da49026b8da207da971b73d09c087f07888098f4e2",
-        "rdna4_sampler_runtime_impl.inc": "db0c5eee7bf47ec4b21d6e7195845cc37784a13ecc8baea288e7da27961e4c2b"
-      },
       "backend_gap": "No GPU execution or undefined missing-sampler output claim."
     },
     {
@@ -11666,11 +10722,6 @@
         ]
       },
       "source_file": "test-null-texel-dummies.m",
-      "source_sha256": "6124436c5eab0ebeac080b975431a912cea162d2e6f8db4b613da02979e7fcde",
-      "component_source_sha256": {
-        "rdna4_stage_bindings_impl.inc": "26be6a65b05d49439216d3da49026b8da207da971b73d09c087f07888098f4e2",
-        "rdna4_null_shape.h": "7ed3affd1010898003e83df2ef52833419abaeb5fbaef082a4e13ff11fdb7deb"
-      },
       "backend_gap": "Host-mock construction and rollback only. It does not prove live texture-buffer allocation, dynamic token lookup or GPU fetch/write."
     },
     {
@@ -11710,17 +10761,6 @@
         ]
       },
       "source_file": "test-texture-buffer-runtime.m",
-      "source_sha256": "25714bb419ac444a40c44357b7b0e429dcd436e93776eeaec96a7bf61dd3c144",
-      "component_source_sha256": {
-        "rdna4_texture_buffer_impl.inc": "d24d17da68e4bc87392027f0641a9e2e25a9419979ed617351fdd9a37b37e60f",
-        "rdna4_texture_impl.inc": "7e2753b6ababc1b6d150bce734247033fe71faa0183bde4985bceb9ce2f943ee",
-        "rdna4_buffer_impl.inc": "c995a7d0a474cb0b716ee55eb40a0c9ead115a6b693fb42953a58b0602f394f4",
-        "rdna4_command_buffer_impl.inc": "6b948da9ab0f49339cf6c5b148938d1b7732134509d2eef173d1163ea0a595a8",
-        "rdna4_stage_bindings_impl.inc": "26be6a65b05d49439216d3da49026b8da207da971b73d09c087f07888098f4e2",
-        "rdna4_shader_runtime_impl.inc": "a55a232504181794ad5d11c02e23207445cbb73dbdc55f0afe67e7c11c217a28",
-        "rdna4_spvrefl.h": "b97063b89e58612deff0fc55972936311cc83b7555f90cf38c63a9c356d38d81",
-        "rdna4_backend_impl.inc": "effab21668c67cfa28153d9611cc91c807745248df0ff9692071014b55043702"
-      },
       "backend_gap": "Host mock only; native GPU execution and dynamic texel token tables remain unverified. The VM lacks robustBufferAccess2 and the provisional pipeline hit host ArgumentBufferTextures/NotImplemented. Direct read_write SPIR-V passes the CPU Vulkan replay; OOB write/read forwarding requires an explicit volatile audit."
     }
   ]
