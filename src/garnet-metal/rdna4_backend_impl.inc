@@ -44,6 +44,7 @@ static struct {
     BOOL dbClamp;   // bundle 10: depthBiasClamp enabled on the device (a non-zero clamp in setDepthBias is passed on only then)
     BOOL hostExt, drmModExt; uint64_t hostAlign; uint64_t impTotal;   // host pointer import and explicit DRM-modifier linear images
     BOOL orderedColorAccess, indirectFirstInstance, cubeArray, bufferAddress;
+    BOOL tessellation; uint32_t maxTessGenLevel, maxTessPatchSize;
     BOOL descriptorIndexing, nonUniformSampledImages, nonUniformStorageImages, nonUniformBuffers;
     BOOL gpuArgumentTables, nullDescriptors, samplerAnisotropy, samplerMirrorClamp;
     BOOL robustTexelBuffers;
@@ -539,10 +540,13 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .shaderStorageTexelBufferArrayNonUniformIndexing = supported12.shaderStorageTexelBufferArrayNonUniformIndexing,
             .bufferDeviceAddress = supported12.bufferDeviceAddress };
         VkPhysicalDeviceVulkan11Features enabled11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &enabled12,
+            .shaderDrawParameters = supported11.shaderDrawParameters,
             .storageBuffer16BitAccess = supported11.storageBuffer16BitAccess,
-            .uniformAndStorageBuffer16BitAccess = supported11.uniformAndStorageBuffer16BitAccess };
+            .uniformAndStorageBuffer16BitAccess = supported11.uniformAndStorageBuffer16BitAccess,
+            .storageInputOutput16 = supported11.storageInputOutput16 };
         // translated AIR uses Int64 (10a); 11e: storage images are translated with format Unknown + Read/WriteWithoutFormat (add-air.py)
-        VkPhysicalDeviceFeatures ef = { .shaderInt64 = pf.shaderInt64, .shaderInt16 = pf.shaderInt16, .fragmentStoresAndAtomics = pf.fragmentStoresAndAtomics, .shaderStorageImageReadWithoutFormat = pf.shaderStorageImageReadWithoutFormat,
+        VkPhysicalDeviceFeatures ef = { .tessellationShader = pf.tessellationShader,
+                                        .shaderInt64 = pf.shaderInt64, .shaderInt16 = pf.shaderInt16, .fragmentStoresAndAtomics = pf.fragmentStoresAndAtomics, .shaderStorageImageReadWithoutFormat = pf.shaderStorageImageReadWithoutFormat,
                                         .shaderStorageImageWriteWithoutFormat = pf.shaderStorageImageWriteWithoutFormat,
                                         .independentBlend = pf.independentBlend,
                                         .shaderSampledImageArrayDynamicIndexing = pf.shaderSampledImageArrayDynamicIndexing,
@@ -555,6 +559,12 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                                         .samplerAnisotropy = pf.samplerAnisotropy,
                                         .shaderImageGatherExtended = gatherCaps.supported ? VK_TRUE : VK_FALSE,
                                         .occlusionQueryPrecise = pf.occlusionQueryPrecise };   // build 18 (P2): Counting visibility mode
+        RDNA4R.maxTessGenLevel = pp.limits.maxTessellationGenerationLevel;
+        RDNA4R.maxTessPatchSize = pp.limits.maxTessellationPatchSize;
+        RDNA4R.tessellation = ef.tessellationShader && RDNA4R.maxTessGenLevel >= 64 && RDNA4R.maxTessPatchSize >= 32;
+        RDNA4LOG("radv: tessellation %s (feature %u, maxGen %u, maxPatch %u, shaderDrawParameters %u)",
+                 RDNA4R.tessellation ? "enabled" : "unavailable", ef.tessellationShader,
+                 RDNA4R.maxTessGenLevel, RDNA4R.maxTessPatchSize, enabled11.shaderDrawParameters);
         RDNA4R.uniformTexelBuffers = enabled12.runtimeDescriptorArray &&
             enabled12.descriptorBindingPartiallyBound &&
             enabled12.descriptorBindingUniformTexelBufferUpdateAfterBind &&

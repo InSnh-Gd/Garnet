@@ -41,7 +41,10 @@ static VkShaderStageFlags rdna4_argument_stage_flags(uint32_t stages,
     if (!stages) return 0;
     if (compute) return VK_SHADER_STAGE_COMPUTE_BIT;
     VkShaderStageFlags flags = 0;
-    if (stages & 1u) flags |= VK_SHADER_STAGE_VERTEX_BIT;
+    if (stages & 1u) {
+        flags |= VK_SHADER_STAGE_VERTEX_BIT;
+        if (RDNA4R.tessellation) flags |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    }
     if (stages & 2u) flags |= VK_SHADER_STAGE_FRAGMENT_BIT;
     return flags;
 }

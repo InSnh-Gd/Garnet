@@ -4,7 +4,8 @@
 #include "rdna4_fragment_output.h"
 
 @interface RDNA4RenderPipelineState : _MTLRenderPipelineState {
-    id _dev; NSString *_lbl; VkShaderModule _vs, _fs; VkPipelineLayout _pl; VkRenderPass _rp; VkDescriptorSetLayout _dsl[2];
+    id _dev; NSString *_lbl; VkShaderModule _vs, _tcs, _tes, _fs; VkPipelineLayout _pl; VkRenderPass _rp; VkDescriptorSetLayout _dsl[2], _tessDsl;
+    BOOL _isTess; uint32_t _tessSet; rdna4_tess_cfg_t _tessCfg; uint64_t _tessKey;
     RDNA4PB *_pbV, *_pbF; uint32_t _npbV, _npbF; BOOL _fetch; uint32_t _fetchMax;   // 11e-2: fragment reads [[color(n)]] (input attachments 0.._fetchMax)
     VkVertexInputBindingDescription _vib[32]; VkVertexInputAttributeDescription _via[32]; uint32_t _nvib, _nvia; uint32_t _need[32]; uint32_t _nneed;
     VkPipelineColorBlendAttachmentState _cba[8]; uint32_t _na; char _vep[128], _fep[128];
@@ -37,6 +38,11 @@
 - (const char *)rdna4VName; - (const char *)rdna4FName; - (BOOL)rdna4HasFragment;
 - (id)reflection;
 - (void)rdna4SetReflection:(MTLRenderPipelineReflection *)reflection;
+- (BOOL)rdna4IsTessellation;
+- (const rdna4_tess_cfg_t *)tessCfg;
+- (VkDescriptorSetLayout)tessDsl;
+- (uint32_t)tessSet;
+- (uint64_t)tessCacheKey;
 @end
 static VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
@@ -113,6 +119,11 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     // from the built-in no-write shaders instead of failing (the AIR is dumped by the caller-side rdna4_dump_pipeline).
     NSString *vname = nil, *fname = hasFrag ? nil : @"(none)"; NSError *e1 = nil, *e2 = nil; NSDictionary *mv_ = nil, *mf_ = nil;
     NSData *vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
+    if (vsd && [mv_[@"stage"] isEqual:@"TessellationEvaluation"] &&
+        ![mv_[@"tessellation"] isKindOfClass:[NSDictionary class]] && !nofb && rdna4x_active()) {
+        vsd = nil; mv_ = nil;
+        e1 = rdna4_err(41, @"cached tessellation sidecar lacks tessellation metadata");
+    }
     NSData *fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
     strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm);
     BOOL fb = NO;
@@ -179,7 +190,7 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
         fsp = hasFrag ? rdna4_spv_set(fsd, 1) : nil;   // fragment descriptors live in set 1 (binding-model comment above)
         rv = calloc(1, sizeof *rv); rf = hasFrag ? calloc(1, sizeof *rf) : NULL;
         BOOL bad = NO;
-        if (rdna4s_parse(vsd.bytes, vsd.length / 4, &mv, why, sizeof why) || !mv.has_ep || mv.ep_model != 0 || rdna4s_reflect(&mv, 0, rv)) {
+        if (rdna4s_parse(vsd.bytes, vsd.length / 4, &mv, why, sizeof why) || !mv.has_ep || (mv.ep_model != 0 && mv.ep_model != 2) || rdna4s_reflect(&mv, 0, rv)) {
             if (err) *err = rdna4_err(51, [NSString stringWithFormat:@"vertex SPIR-V reflection: %s", why[0] ? why : rv->why[0] ? rv->why : "no/wrong entry point"]); bad = YES; }
         else if (hasFrag && (rdna4s_parse(fsp.bytes, fsp.length / 4, &mf, why, sizeof why) || !mf.has_ep || mf.ep_model != 4 || rdna4s_reflect(&mf, 1, rf))) {
             if (err) *err = rdna4_err(52, [NSString stringWithFormat:@"fragment SPIR-V reflection: %s", why[0] ? why : rf->why[0] ? rf->why : "no/wrong entry point"]); bad = YES; }
@@ -206,6 +217,106 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
                 fsp = [NSData dataWithBytesNoCopy:normalized length:count * 4 freeWhenDone:YES];
             }
         }
+        if (!bad && mv.ep_model == 2) {
+            _isTess = YES;
+            memset(&_tessCfg, 0, sizeof _tessCfg);
+            if (!RDNA4R.tessellation || !RDNA4R.bufferAddress) {
+                if (err) *err = rdna4_err(49, @"tessellation requires RADV tessellationShader and bufferDeviceAddress");
+                bad = YES;
+            } else if (d.tessellationFactorFormat != MTLTessellationFactorFormatHalf) {
+                if (err) *err = rdna4_err(57, @"unsupported tessellationFactorFormat (only Half is supported)");
+                bad = YES;
+            } else {
+                NSDictionary *tessMeta = [mv_[@"tessellation"] isKindOfClass:[NSDictionary class]] ? mv_[@"tessellation"] : nil;
+                if (!tessMeta) {
+                    if (err) *err = rdna4_err(51, @"tessellation SPIR-V metadata is missing (stale spvcache sidecar)");
+                    bad = YES;
+                } else if ([tessMeta[@"amplification_id"] isKindOfClass:[NSDictionary class]] ||
+                           [tessMeta[@"amplification_count"] isKindOfClass:[NSDictionary class]]) {
+                    if (err) *err = rdna4_err(57, @"vertex amplification in tessellation pipelines is not supported");
+                    bad = YES;
+                }
+                if (!bad) {
+                    if (tessMeta && tessMeta[@"control_point_count"]) {
+                        _tessCfg.control_point_count = [tessMeta[@"control_point_count"] unsignedIntValue];
+                    } else {
+                        for (uint32_t id = 1; id <= mv.bound; id++) {
+                            const RDNA4sId *v = &mv.id[id];
+                            if (v->op == 59 && v->sc == 1 && !v->patch && v->builtin < 0 && v->loc >= 0 && v->elem <= mv.bound) {
+                                uint32_t pt = mv.id[v->elem].elem;
+                                if (pt <= mv.bound && mv.id[pt].op == 28 && mv.id[pt].n <= mv.bound) {
+                                    _tessCfg.control_point_count = mv.id[mv.id[pt].n].cval;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    NSDictionary *instMeta = (tessMeta && [tessMeta[@"instance_id"] isKindOfClass:[NSDictionary class]]) ? tessMeta[@"instance_id"] : nil;
+                    if (instMeta && instMeta[@"location"]) {
+                        _tessCfg.has_instance_id = 1;
+                        _tessCfg.instance_id_loc = [instMeta[@"location"] unsignedIntValue];
+                    }
+                    if (d.tessellationPartitionMode > MTLTessellationPartitionModeFractionalEven ||
+                        d.tessellationOutputWindingOrder > MTLWindingCounterClockwise ||
+                        d.tessellationFactorStepFunction > MTLTessellationFactorStepFunctionPerPatchAndPerInstance ||
+                        d.tessellationControlPointIndexType > MTLTessellationControlPointIndexTypeUInt32 ||
+                        d.maxTessellationFactor == 0 || d.maxTessellationFactor > RDNA4R.maxTessGenLevel) {
+                        if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"tessellation pipeline descriptor parameter out of range (part=%lu wind=%lu step=%lu cpidx=%lu max=%lu)",
+                            (unsigned long)d.tessellationPartitionMode, (unsigned long)d.tessellationOutputWindingOrder,
+                            (unsigned long)d.tessellationFactorStepFunction, (unsigned long)d.tessellationControlPointIndexType, (unsigned long)d.maxTessellationFactor]);
+                        bad = YES;
+                    } else {
+                        _tessCfg.partition = (uint8_t)d.tessellationPartitionMode;
+                        _tessCfg.winding = (uint8_t)d.tessellationOutputWindingOrder;
+                        _tessCfg.factor_step = (uint8_t)d.tessellationFactorStepFunction;
+                        _tessCfg.cp_idx_type = (uint8_t)d.tessellationControlPointIndexType;
+                        _tessCfg.factor_scale_enabled = d.isTessellationFactorScaleEnabled ? 1 : 0;
+                        _tessCfg.max_tess_factor = (float)d.maxTessellationFactor;
+                        _tessCfg.tess_set = 2u;
+                    }
+                    if (!bad && !rdna4_tess_inspect_tes(&mv, &_tessCfg, why, sizeof why)) {
+                        if (err) *err = rdna4_err(51, [NSString stringWithFormat:@"tessellation SPIR-V: %s", why]);
+                        bad = YES;
+                    } else if (!bad) {
+                        MTLVertexDescriptor *vd = d.vertexDescriptor;
+                        for (uint32_t i = 0; i < _tessCfg.num_inputs; i++) {
+                            rdna4_tess_input_t *in = &_tessCfg.inputs[i];
+                            if (in->location >= 31) {
+                                if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"tessellation vertex attribute %u exceeds max attributes (31)", in->location]);
+                                bad = YES; break;
+                            }
+                            MTLVertexAttributeDescriptor *a = vd ? vd.attributes[in->location] : nil;
+                            if (!a || a.format == MTLVertexFormatInvalid) continue;
+                            VkFormat vf = rdna4_vkvfmt(a.format);
+                            rdna4_tess_vfmt_t tf = rdna4_tess_vfmt_from_vk((uint32_t)vf);
+                            NSUInteger bi = a.bufferIndex;
+                            if (tf == RDNA4_TFMT_INVALID || bi >= RDNA4_TESS_MAX_VBUFS || a.offset > 2047) {
+                                if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"tessellation vertex attribute %u: format %lu / bufferIndex %lu / offset %lu not supported", in->location, (unsigned long)a.format, (unsigned long)bi, (unsigned long)a.offset]);
+                                bad = YES; break;
+                            }
+                            MTLVertexBufferLayoutDescriptor *l = vd.layouts[bi];
+                            if (!l || l.stride == (NSUInteger)-1 || l.stride > 2048 ||
+                                (l.stepFunction != MTLVertexStepFunctionConstant && l.stepFunction != MTLVertexStepFunctionPerPatch && l.stepFunction != MTLVertexStepFunctionPerPatchControlPoint) ||
+                                (l.stepFunction != MTLVertexStepFunctionConstant && !l.stepRate)) {
+                                if (err) *err = rdna4_err(58, [NSString stringWithFormat:@"tessellation vertex layout %lu: stride %lu stepFunction %lu rate %lu not supported", (unsigned long)bi, (unsigned long)l.stride, (unsigned long)l.stepFunction, (unsigned long)l.stepRate]);
+                                bad = YES; break;
+                            }
+                            in->has_attr = 1;
+                            in->vfmt = (uint8_t)tf;
+                            in->buf_idx = (uint8_t)bi;
+                            in->step_func = (uint8_t)l.stepFunction;
+                            in->step_rate = (uint32_t)l.stepRate;
+                            in->attr_offset = (uint32_t)a.offset;
+                            in->buf_stride = (l.stepFunction == MTLVertexStepFunctionConstant) ? 0u : (uint32_t)l.stride;
+                        }
+                        if (!bad && !rdna4_tess_validate_cfg(&_tessCfg, RDNA4R.maxTessGenLevel, RDNA4R.maxTessPatchSize, why, sizeof why)) {
+                            if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"tessellation config: %s", why]);
+                            bad = YES;
+                        }
+                    }
+                }
+            }
+        }
         if (!bad) { strlcpy(vep, mv.ep_name, sizeof vep); if (hasFrag) strlcpy(fep, mf.ep_name, sizeof fep); }
         rdna4s_free(&mv); if (hasFrag) rdna4s_free(&mf);
         if (bad) { free(rv); free(rf); return nil; }
@@ -213,7 +324,10 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     strlcpy(_vep, vep, sizeof _vep); strlcpy(_fep, fep, sizeof _fep);
     BOOL ok = NO;
     do {
-        _vs = fb ? rdna4_spv_module(rdna4_fb_vs_spv, sizeof rdna4_fb_vs_spv, "vertex", err) : rdna4_spv_module(vsd.bytes, vsd.length, "vertex", err); if (!_vs) break;
+        if (!_isTess) {
+            _vs = fb ? rdna4_spv_module(rdna4_fb_vs_spv, sizeof rdna4_fb_vs_spv, "vertex", err) : rdna4_spv_module(vsd.bytes, vsd.length, "vertex", err);
+            if (!_vs) break;
+        }
         if (hasFrag) { _fs = fb ? rdna4_spv_module(rdna4_fb_fs_spv, sizeof rdna4_fb_fs_spv, "fragment", err) : rdna4_spv_module(fsp.bytes, fsp.length, "fragment", err); if (!_fs) break; }
         ok = YES;
     } while (0);
@@ -306,9 +420,10 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     r = vkCreateRenderPass(RDNA4R.dev, &rpc, NULL, &_rp);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(45, [NSString stringWithFormat:@"vkCreateRenderPass = %d", r]); free(rv); free(rf); return nil; }
     }
-    // Layouts: vertex = set 0, fragment = set 1 (both always exist, possibly empty) + push constants when a stage declares a block.
+    // Layouts: vertex/TES = set 0, fragment = set 1 (both always exist, possibly empty) + push constants when a stage declares a block.
     NSError *le = nil;
-    if (!rdna4_stage_dsl(rv, 0, VK_SHADER_STAGE_VERTEX_BIT, mv_, &_dsl[0], &_pbV, &_npbV, _owned, &le) ||
+    VkShaderStageFlags vsStage = _isTess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+    if (!rdna4_stage_dsl(rv, 0, vsStage, mv_, &_dsl[0], &_pbV, &_npbV, _owned, &le) ||
         !rdna4_stage_dsl(rf, 1, VK_SHADER_STAGE_FRAGMENT_BIT, mf_, &_dsl[1], &_pbF, &_npbF, _owned, &le)) {
         if (err) *err = le; free(rv); free(rf); return nil; }
     if (!rdna4_argument_table_stages_compatible(mv_, mf_)) {
@@ -331,20 +446,45 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
         !rdna4_argument_scan_plan_build(&_scanF, preF, mf_, "fragment", &scanError)) {
         if (err) *err = scanError; free(rv); free(rf); return nil;
     }
+    if (_isTess) {
+        _tessSet = _argumentTables.active ? 5u : 2u;
+        _tessCfg.tess_set = _tessSet;
+        _tessKey = rdna4_tess_pipeline_cache_key(&_tessCfg, vsd.bytes, vsd.length);
+        uint32_t *vsW = NULL, *tcsW = NULL, *tesW = NULL;
+        size_t vsNW = 0, tcsNW = 0, tesNW = 0;
+        BOOL tessOk = rdna4_tess_emit_vs_spv(&vsW, &vsNW) &&
+                      rdna4_tess_emit_tcs_spv(&_tessCfg, &tcsW, &tcsNW) &&
+                      rdna4_tess_patch_tes_spv(vsd.bytes, vsd.length / 4, &_tessCfg, &tesW, &tesNW);
+        if (!tessOk) {
+            free(vsW); free(tcsW); free(tesW);
+            if (err) *err = rdna4_err(42, @"failed to emit tessellation adapter SPIR-V");
+            free(rv); free(rf); return nil;
+        }
+        _vs = rdna4_spv_module(vsW, vsNW * 4, "tess-vertex", err);
+        _tcs = rdna4_spv_module(tcsW, tcsNW * 4, "tess-control", err);
+        _tes = rdna4_spv_module(tesW, tesNW * 4, "tess-eval", err);
+        free(vsW); free(tcsW); free(tesW);
+        if (!_vs || !_tcs || !_tes) { free(rv); free(rf); return nil; }
+        VkDescriptorSetLayoutBinding tb = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT };
+        VkDescriptorSetLayoutCreateInfo td = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &tb };
+        r = vkCreateDescriptorSetLayout(RDNA4R.dev, &td, NULL, &_tessDsl);
+        if (r != VK_SUCCESS) { if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout (tess) = %d", r]); free(rv); free(rf); return nil; }
+    }
     uint32_t pcs = 0; VkShaderStageFlags pcf = 0;
-    if (rv && rv->pc_size) { pcs = rv->pc_size; pcf |= VK_SHADER_STAGE_VERTEX_BIT; }
+    if (rv && rv->pc_size) { pcs = rv->pc_size; pcf |= vsStage; }
     if (rf && rf->pc_size) { if (rf->pc_size > pcs) pcs = rf->pc_size; pcf |= VK_SHADER_STAGE_FRAGMENT_BIT; }
     if (pcs > 256) { if (err) *err = rdna4_err(48, [NSString stringWithFormat:@"push constant block %u B > 256", pcs]); free(rv); free(rf); return nil; }
     VkPushConstantRange pcr = { pcf, 0, pcs };
-    VkDescriptorSetLayout layouts[5] = {_dsl[0], _dsl[1], _argumentTables.dsl[0], _argumentTables.dsl[1], _argumentTables.dsl[2]};
-    VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = _argumentTables.active ? 5 : 2, .pSetLayouts = layouts,
+    VkDescriptorSetLayout layouts[6] = {_dsl[0], _dsl[1], _argumentTables.active ? _argumentTables.dsl[0] : _tessDsl, _argumentTables.dsl[1], _argumentTables.dsl[2], _tessDsl};
+    uint32_t layoutCount = _argumentTables.active ? (_isTess ? 6u : 5u) : (_isTess ? 3u : 2u);
+    VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = layoutCount, .pSetLayouts = layouts,
         .pushConstantRangeCount = pcs ? 1 : 0, .pPushConstantRanges = &pcr };
     r = vkCreatePipelineLayout(RDNA4R.dev, &plc, NULL, &_pl);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout = %d", r]); free(rv); free(rf); return nil; }
     // Vertex input: for every SPIR-V input Location, the descriptor's attribute of that index (format, offset, bufferIndex) and its
     // buffer layout (stride, step function). A Location without a descriptor attribute reads binding 31 (stride 0, a null buffer).
     MTLVertexDescriptor *vd = d.vertexDescriptor; BOOL dummy = NO;
-    for (int i = 0; rv && i < rv->nva; i++) {
+    for (int i = 0; !_isTess && rv && i < rv->nva; i++) {
         uint32_t loc = rv->va[i].location;
         MTLVertexAttributeDescriptor *a = vd ? vd.attributes[loc] : nil;
         if (a && a.format != MTLVertexFormatInvalid) {
@@ -371,11 +511,12 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     }
     free(rv); free(rf);
     uint32_t dk0 = [self rdna4DSKey:NULL];   // bundle 10: 0 for a colour-only pipeline (the key below is then exactly the old one)
-    NSError *ve = nil; VkPipeline p0 = [self rdna4Build:VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE ds:dk0 error:&ve];
+    VkPrimitiveTopology topo0 = _isTess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    NSError *ve = nil; VkPipeline p0 = [self rdna4Build:topo0 cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE ds:dk0 error:&ve];
     if (!p0) { if (err) *err = ve; return nil; }
-    _variants[@((uint64_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24))] = [NSValue valueWithPointer:(void *)p0];
-    RDNA4LOG("RDNA4RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s)", (__bridge void *)self, (void *)p0, na,
-           _npbV, _npbF, _nvia, _nvib, fb ? ", FALLBACK no-write" : "", _fetch ? ", FRAMEBUFFER FETCH (input attachments)" : "");
+    _variants[@((uint64_t)topo0 | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24))] = [NSValue valueWithPointer:(void *)p0];
+    RDNA4LOG("RDNA4RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s%s)", (__bridge void *)self, (void *)p0, na,
+           _npbV, _npbF, _nvia, _nvib, _isTess ? ", TESSELLATION" : "", fb ? ", FALLBACK no-write" : "", _fetch ? ", FRAMEBUFFER FETCH (input attachments)" : "");
     if (fb) {   // hot-swap: remember how to rebuild (descriptor copy: the client may reuse its own) and watch for the .spv files
         NSString *sv = rdna4_fn_sha(d.vertexFunction), *sf = hasFrag ? rdna4_fn_sha(d.fragmentFunction) : nil;
         if (sv && (!hasFrag || sf)) {
@@ -396,13 +537,25 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
 - (VkFormat)rdna4DSVk { return _dsVk; }
 - (unsigned)rdna4SampleCount { return _pc.samples; }
 - (VkPipeline)rdna4Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk error:(NSError **)err {
-    VkPipelineShaderStageCreateInfo st[2] = {
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = _vep },
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep } };
+    VkPipelineShaderStageCreateInfo st[4];
+    uint32_t stCount = 0;
+    if (_isTess) {
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = "main" };
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, .module = _tcs, .pName = "main" };
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, .module = _tes, .pName = _vep };
+        if (_fs) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep };
+    } else {
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = _vep };
+        if (_fs) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep };
+    }
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = _nvib, .pVertexBindingDescriptions = _vib, .vertexAttributeDescriptionCount = _nvia, .pVertexAttributeDescriptions = _via };
     BOOL strip = topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;   // Metal restarts indexed strips at the max index value
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo, .primitiveRestartEnable = strip };
+    VkPipelineTessellationDomainOriginStateCreateInfo tdo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO,
+        .domainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT };
+    VkPipelineTessellationStateCreateInfo ts = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, .pNext = &tdo, .patchControlPoints = 1 };
     VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
         .rasterizerDiscardEnable = _rastOff ? VK_TRUE : VK_FALSE,
@@ -418,8 +571,8 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
         .attachmentCount = _na, .pAttachments = _cba };
     VkDynamicState dyn[8]; for (unsigned i = 0; i < _pc.ndyn && i < 8; i++) dyn[i] = (VkDynamicState)_pc.dyn[i];   // bundle 10: viewport, scissor, blend constants (+ stencil masks / reference and depth bias for a depth/stencil pipeline)
     VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = _pc.ndyn, .pDynamicStates = dyn };
-    VkGraphicsPipelineCreateInfo gpc = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = _fs ? 2u : 1u, .pStages = st, .pVertexInputState = &vi,
-        .pInputAssemblyState = &ia, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pColorBlendState = &cb,
+    VkGraphicsPipelineCreateInfo gpc = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = stCount, .pStages = st, .pVertexInputState = &vi,
+        .pInputAssemblyState = &ia, .pTessellationState = _isTess ? &ts : NULL, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pColorBlendState = &cb,
         .pDynamicState = &ds, .layout = _pl, .renderPass = _rp };
     VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, RDNA4R.pc, 1, &gpc, NULL, &p); rdna4t_add(&T1.gfx, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines = %d", r]); return VK_NULL_HANDLE; }
@@ -443,10 +596,13 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
         for (NSValue *v in _variants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
         if (_pl) vkDestroyPipelineLayout(RDNA4R.dev, _pl, NULL);
         for (int i = 0; i < 2; i++) if (_dsl[i]) vkDestroyDescriptorSetLayout(RDNA4R.dev, _dsl[i], NULL);
+        if (_tessDsl) vkDestroyDescriptorSetLayout(RDNA4R.dev, _tessDsl, NULL);
         rdna4_argument_tables_destroy(&_argumentTables);
         for (NSValue *v in _owned) rdna4_destroy_sampler((VkSampler)v.pointerValue, NULL);
         if (_rp) vkDestroyRenderPass(RDNA4R.dev, _rp, NULL);
         if (_vs) vkDestroyShaderModule(RDNA4R.dev, _vs, NULL);
+        if (_tcs) vkDestroyShaderModule(RDNA4R.dev, _tcs, NULL);
+        if (_tes) vkDestroyShaderModule(RDNA4R.dev, _tes, NULL);
         if (_fs) vkDestroyShaderModule(RDNA4R.dev, _fs, NULL);
     }
     rdna4_argument_scan_reflection_plan_destroy(&_scanV);
@@ -455,9 +611,14 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);   // the published real object
 }
 RDNA4_DNR(RDNA4RenderPipelineState)
-- (VkPipeline)vkPipeline { return [self pipelineForTopology:VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE]; }
+- (VkPipeline)vkPipeline { return [self pipelineForTopology:_isTess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE]; }
 - (id)reflection { return _reflection; }
 - (void)rdna4SetReflection:(MTLRenderPipelineReflection *)reflection { _reflection = reflection; }
+- (BOOL)rdna4IsTessellation { return _isTess; }
+- (const rdna4_tess_cfg_t *)tessCfg { return &_tessCfg; }
+- (VkDescriptorSetLayout)tessDsl { return _tessDsl; }
+- (uint32_t)tessSet { return _tessSet; }
+- (uint64_t)tessCacheKey { return _tessKey; }
 - (VkPipelineLayout)layout { return _pl; }
 - (VkDescriptorSetLayout)dsl:(int)i { return _dsl[i]; }
 - (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }

@@ -2,6 +2,8 @@
  * Ported from tools/native/shader-compile-census/compile-census.c (validated on 274/274 compositor-set modules):
  * descriptor sets/bindings from OpVariable + Decoration, push-constant size from member Offsets, vertex inputs from Location,
  * fragment colour outputs from Location/FragDepth. Names are prefixed rdna4s_. Header-only, static. */
+#ifndef RDNA4_SPVREFL_H
+#define RDNA4_SPVREFL_H
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +32,7 @@ typedef struct {
    uint32_t *mem;      /* struct members */
    uint32_t *moff, *mstride; /* member Offset / MatrixStride decorations (0xffffffff = none) */
    int set, bind, loc, builtin; /* -1 = none */
-   int block, bufblock;
+   int block, bufblock, patch;
    uint32_t stride;    /* ArrayStride */
 } RDNA4sId;
 
@@ -38,6 +40,7 @@ typedef struct {
    uint32_t bound;
    RDNA4sId *id;
    uint32_t ep_model, ep_id; char ep_name[128]; int has_ep;
+   uint32_t tess_domain;
    uint32_t descriptor_features;
 } RDNA4sMod;
 
@@ -77,10 +80,15 @@ static int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, s
             strncpy(m->ep_name, (const char *)&a[2], sizeof m->ep_name - 1);
          }
          break;
+      case 16: /* OpExecutionMode fn mode [operands...] */
+         if (wc >= 3 && (a[1] == 22 || a[1] == 24 || a[1] == 25))
+            m->tess_domain = a[1];
+         break;
       case 71: { /* OpDecorate target decoration [args] */
          RDNA4sId *t = ID(a[0]);
          switch (a[1]) {
          case 11: t->builtin = (int)a[2]; break;
+         case 15: t->patch = 1; break;
          case 33: t->bind = (int)a[2]; break;
          case 34: t->set = (int)a[2]; break;
          case 30: t->loc = (int)a[2]; break;
@@ -308,7 +316,7 @@ static int rdna4s_reflect(RDNA4sMod *m, int stage /* 0 v, 1 f, 2 k */, RDNA4sRef
          }
          if (set > r->maxset) r->maxset = set;
       } else if (v->sc == 1 && v->builtin < 0) { /* Input */
-         if (stage != 0) continue;
+         if (stage != 0 || m->ep_model == 2) continue;
          if (v->loc < 0) continue;
          uint32_t t = pointee, reps = 1;
          while (m->id[t].op == 28) { reps *= m->id[m->id[t].n].cval ? m->id[m->id[t].n].cval : 1; t = m->id[t].elem; }
@@ -343,3 +351,4 @@ static void rdna4s_free(RDNA4sMod *m)
    for (uint32_t k = 0; k <= m->bound; k++) { free(m->id[k].mem); free(m->id[k].moff); free(m->id[k].mstride); }
    free(m->id); m->id = NULL;
 }
+#endif

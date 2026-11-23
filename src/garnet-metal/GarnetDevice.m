@@ -446,6 +446,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_sampler_runtime_impl.inc"
 #include "rdna4_depth_fence_impl.inc"
 #include "rdna4_shader_runtime_impl.inc"
+#include "rdna4_tessellation.h"
 #include "rdna4_render_pipeline_impl.inc"
 #include "rdna4_stage_bindings_impl.inc"
 #include "rdna4_compute_pipeline_impl.inc"

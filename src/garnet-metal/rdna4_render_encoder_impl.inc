@@ -90,6 +90,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     id _rtex[8]; uint32_t _slvl[8], _sslice[8], _rlvl[8], _rslice[8]; NSUInteger _sact[8];   // bundle 10: per colour attachment the resolve texture (+ level, slice), its source level / slice and the store action
     RDNA4DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
     RDNA4RenderPipelineState *_pso; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf; MTLViewport _vp; MTLScissorRect _sr; float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
+    id _tessFactorBuf; NSUInteger _tessFactorOff, _tessFactorStride; float _tessFactorScale;
     NSMutableSet *_samplerBindings;
     rdna4dc_enc _dc; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcOn = the rdna4m-drawopt switch as latched at device creation)
     rdna4occ *_occ; VkQueryPool _qp; uint32_t _qbase;   // build 18 (P2): this pass's occlusion bookkeeping (owned by the command buffer), its query pool and the first of its RDNA4OCC_MAXQ reserved query indices
@@ -106,7 +107,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d {
     self = [super initWithCommandBuffer:cb];
     if (!self) return nil;
-    _cb = cb; _wind = MTLWindingClockwise;
+    _cb = cb; _wind = MTLWindingClockwise; _tessFactorScale = 1.0f;
     _resourceBindings = [RDNA4ResourceBindings new];
     _resourceSegmentSerial = [_cb rdna4SegmentSerial];
     // Keep attachment indices and render-pass compatibility intact: an unsafe pass records nothing.
@@ -657,6 +658,12 @@ RDNA4_ENCODER_SHARED
                         fragment:NO index:0];
           RDNA4LOGR("HOT-SWAP: render encoder now uses the real pipeline %p", (__bridge void *)r);
       } }
+    if ([_pso rdna4IsTessellation] != (topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST)) {
+        [_cb rdna4Fail:[_pso rdna4IsTessellation]
+            ? @"drawPrimitives called with a tessellation render pipeline"
+            : @"drawPatches called with a non-tessellation render pipeline"];
+        return NO;
+    }
     MTLRenderPipelineReflection *reflection = [_pso reflection] ?: _roReflection;
     const BOOL hasFrag = [_pso rdna4HasFragment];
     BOOL roV = rdna4nc_stage_writes(&_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX), RDNA4NC_VERTEX, "vertex draw", &_roWarnV);
@@ -914,6 +921,143 @@ RDNA4_ENCODER_SHARED
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)c indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off {
     [self drawIndexedPrimitives:t indexCount:c indexType:it indexBuffer:ib indexBufferOffset:off instanceCount:1 baseVertex:0 baseInstance:0];
+}
+- (void)setTessellationFactorBuffer:(id)buffer offset:(NSUInteger)offset instanceStride:(NSUInteger)instanceStride {
+    _tessFactorBuf = buffer; _tessFactorOff = offset; _tessFactorStride = instanceStride;
+}
+- (void)setTessellationFactorScale:(float)scale { _tessFactorScale = scale; }
+- (BOOL)rdna4PreparePatchDraw:(NSUInteger)numCP indexed:(BOOL)indexed
+                   patchIndex:(id)patchBuf patchIndexOffset:(NSUInteger)patchOff
+                 controlIndex:(id)cpBuf controlIndexOffset:(NSUInteger)cpOff
+                     indirect:(BOOL)indirect {
+    if (_hostWriteDropped) return NO;
+    if (_ended) { [_cb rdna4Fail:@"drawPatches after endEncoding"]; return NO; }
+    if ([_cb rdna4Error]) return NO;
+    if (!_pso) { [_cb rdna4Fail:@"drawPatches without a render pipeline state"]; return NO; }
+    RDNA4RenderPipelineState *real = [_pso rdna4Real] ?: _pso;
+    if (![real rdna4IsTessellation]) {
+        [_cb rdna4Fail:@"drawPatches: called with a non-tessellation render pipeline"]; return NO;
+    }
+    if (numCP > RDNA4R.maxTessPatchSize) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"numberOfPatchControlPoints %lu exceeds %u", (unsigned long)numCP, RDNA4R.maxTessPatchSize]];
+        return NO;
+    }
+    id dev = [_cb device];
+    const rdna4_tess_cfg_t *cfg = [real tessCfg];
+    if (![_tessFactorBuf isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)_tessFactorBuf device] != dev ||
+        (_tessFactorOff & 3) || (_tessFactorStride & 3) || _tessFactorOff > [_tessFactorBuf length] ||
+        ![(RDNA4Buffer *)_tessFactorBuf gpuAddress] || _tessFactorOff > UINT64_MAX - [(RDNA4Buffer *)_tessFactorBuf gpuAddress]) {
+        [_cb rdna4Fail:@"tessellation factor buffer, offset or instance stride is invalid"]; return NO;
+    }
+    uint32_t fbytes = rdna4_tess_factor_stride(cfg);
+    if ((!indirect || cfg->factor_step == RDNA4_TESS_FSTEP_CONST) && fbytes > [_tessFactorBuf length] - _tessFactorOff) {
+        [_cb rdna4Fail:@"tessellation factor buffer range exceeds buffer length"]; return NO;
+    }
+    if (patchBuf && (![patchBuf isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)patchBuf device] != dev ||
+                     (patchOff & 3) || patchOff > [patchBuf length] ||
+                     ![(RDNA4Buffer *)patchBuf gpuAddress] || patchOff > UINT64_MAX - [(RDNA4Buffer *)patchBuf gpuAddress])) {
+        [_cb rdna4Fail:@"tessellation patch index buffer or offset is invalid"]; return NO;
+    }
+    if (indexed) {
+        if (cfg->cp_idx_type == RDNA4_TESS_CPIDX_NONE) {
+            [_cb rdna4Fail:@"drawIndexedPatches: requires tessellationControlPointIndexType != None"]; return NO;
+        }
+        NSUInteger align = cfg->cp_idx_type == RDNA4_TESS_CPIDX_U32 ? 4u : 2u;
+        if (![cpBuf isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)cpBuf device] != dev ||
+            (cpOff & (align - 1u)) || cpOff > [cpBuf length] ||
+            ![(RDNA4Buffer *)cpBuf gpuAddress] || cpOff > UINT64_MAX - [(RDNA4Buffer *)cpBuf gpuAddress]) {
+            [_cb rdna4Fail:@"control point index buffer, alignment or offset is invalid"]; return NO;
+        }
+    }
+    rdna4_tess_draw_params_t params = {0};
+    params.factor_bda = [(RDNA4Buffer *)_tessFactorBuf gpuAddress] + _tessFactorOff;
+    params.factor_size = [_tessFactorBuf length] - _tessFactorOff;
+    params.factor_instance_stride = _tessFactorStride;
+    if (patchBuf) {
+        params.patch_idx_bda = [(RDNA4Buffer *)patchBuf gpuAddress] + patchOff;
+        params.patch_idx_size = [patchBuf length] - patchOff;
+    }
+    if (indexed) {
+        params.cp_idx_bda = [(RDNA4Buffer *)cpBuf gpuAddress] + cpOff;
+        params.cp_idx_size = [cpBuf length] - cpOff;
+    }
+    params.factor_scale = _tessFactorScale;
+    params.num_patch_cp = (uint32_t)numCP;
+    RDNA4Buffer *retainVbs[RDNA4_TESS_MAX_VBUFS];
+    uint32_t nRetainVbs = 0;
+    for (uint32_t i = 0; i < cfg->num_inputs; i++) {
+        const rdna4_tess_input_t *in = &cfg->inputs[i];
+        if (!in->has_attr) continue;
+        RDNA4Buffer *vb = _sv.buf[in->buf_idx].b;
+        NSUInteger vo = _sv.buf[in->buf_idx].off;
+        if (!vb || ![vb isKindOfClass:[RDNA4Buffer class]] || [vb device] != dev || vo > [vb length]) {
+            [_cb rdna4Fail:[NSString stringWithFormat:@"tessellation vertex buffer at index %u is missing or out of range", in->buf_idx]];
+            return NO;
+        }
+        uint64_t va = [vb gpuAddress];
+        if (!va || vo > UINT64_MAX - va) {
+            [_cb rdna4Fail:[NSString stringWithFormat:@"tessellation vertex buffer at index %u has invalid GPU address", in->buf_idx]];
+            return NO;
+        }
+        if (!params.vb_bda[in->buf_idx]) {
+            retainVbs[nRetainVbs++] = vb;
+            params.vb_bda[in->buf_idx] = va + vo;
+            params.vb_size[in->buf_idx] = [vb length] - vo;
+        }
+    }
+    if (![self rdna4PrepareDraw:VK_PRIMITIVE_TOPOLOGY_PATCH_LIST]) return NO;
+    for (uint32_t i = 0; i < nRetainVbs; i++) [_cb rdna4RetainEncoded:retainVbs[i]];
+    [_cb rdna4RetainEncoded:_tessFactorBuf];
+    if (patchBuf) [_cb rdna4RetainEncoded:patchBuf];
+    if (indexed) [_cb rdna4RetainEncoded:cpBuf];
+    RDNA4Buffer *pbuf = nil; NSUInteger poff = 0;
+    if (![_cb rdna4Bytes:&params length:sizeof params buffer:&pbuf offset:&poff]) return NO;
+    VkDescriptorSet ds = [_cb rdna4AllocSet:[_pso tessDsl]];
+    if (!ds) return NO;
+    VkDescriptorBufferInfo dbi = { [pbuf vkBuffer], [pbuf rdna4VkOffset] + poff, sizeof params };
+    VkWriteDescriptorSet wds = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi };
+    vkUpdateDescriptorSets(RDNA4R.dev, 1, &wds, 0, NULL);
+    vkCmdBindDescriptorSets([_cb vk], VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], [_pso tessSet], 1, &ds, 0, NULL);
+    return YES;
+}
+- (void)drawPatches:(NSUInteger)numberOfPatchControlPoints patchStart:(NSUInteger)patchStart patchCount:(NSUInteger)patchCount patchIndexBuffer:(id)patchIndexBuffer patchIndexBufferOffset:(NSUInteger)patchIndexBufferOffset instanceCount:(NSUInteger)instanceCount baseInstance:(NSUInteger)baseInstance {
+    if (_hostWriteDropped) return;
+    _dvc = patchCount * (instanceCount ? instanceCount : 1);
+    if (!patchCount || !instanceCount) return;
+    if (patchCount > UINT32_MAX || instanceCount > UINT32_MAX || patchStart > UINT32_MAX || baseInstance > UINT32_MAX ||
+        patchCount - 1 > UINT32_MAX - patchStart || instanceCount - 1 > UINT32_MAX - baseInstance) {
+        [_cb rdna4Fail:@"drawPatches range exceeds Vulkan's 32-bit limits"]; return;
+    }
+    if ([self rdna4PreparePatchDraw:numberOfPatchControlPoints indexed:NO patchIndex:patchIndexBuffer patchIndexOffset:patchIndexBufferOffset controlIndex:nil controlIndexOffset:0 indirect:NO]) {
+        vkCmdDraw([_cb vk], (uint32_t)patchCount, (uint32_t)instanceCount, (uint32_t)patchStart, (uint32_t)baseInstance);
+    }
+}
+- (void)drawPatches:(NSUInteger)numberOfPatchControlPoints patchIndexBuffer:(id)patchIndexBuffer patchIndexBufferOffset:(NSUInteger)patchIndexBufferOffset indirectBuffer:(id)indirectBuffer indirectBufferOffset:(NSUInteger)indirectBufferOffset {
+    if (![self rdna4IndirectBuffer:indirectBuffer offset:indirectBufferOffset bytes:sizeof(VkDrawIndirectCommand)]) return;
+    if ([self rdna4PreparePatchDraw:numberOfPatchControlPoints indexed:NO patchIndex:patchIndexBuffer patchIndexOffset:patchIndexBufferOffset controlIndex:nil controlIndexOffset:0 indirect:YES]) {
+        [_cb rdna4RetainEncoded:indirectBuffer];
+        vkCmdDrawIndirect([_cb vk], [(RDNA4Buffer *)indirectBuffer vkBuffer], [(RDNA4Buffer *)indirectBuffer rdna4VkOffset] + indirectBufferOffset, 1, sizeof(VkDrawIndirectCommand));
+    }
+}
+- (void)drawIndexedPatches:(NSUInteger)numberOfPatchControlPoints patchStart:(NSUInteger)patchStart patchCount:(NSUInteger)patchCount patchIndexBuffer:(id)patchIndexBuffer patchIndexBufferOffset:(NSUInteger)patchIndexBufferOffset controlPointIndexBuffer:(id)controlPointIndexBuffer controlPointIndexBufferOffset:(NSUInteger)controlPointIndexBufferOffset instanceCount:(NSUInteger)instanceCount baseInstance:(NSUInteger)baseInstance {
+    if (_hostWriteDropped) return;
+    _dvc = patchCount * (instanceCount ? instanceCount : 1);
+    if (!patchCount || !instanceCount) return;
+    if (patchCount > UINT32_MAX || instanceCount > UINT32_MAX || patchStart > UINT32_MAX || baseInstance > UINT32_MAX ||
+        patchCount - 1 > UINT32_MAX - patchStart || instanceCount - 1 > UINT32_MAX - baseInstance) {
+        [_cb rdna4Fail:@"drawIndexedPatches range exceeds Vulkan's 32-bit limits"]; return;
+    }
+    if ([self rdna4PreparePatchDraw:numberOfPatchControlPoints indexed:YES patchIndex:patchIndexBuffer patchIndexOffset:patchIndexBufferOffset controlIndex:controlPointIndexBuffer controlIndexOffset:controlPointIndexBufferOffset indirect:NO]) {
+        vkCmdDraw([_cb vk], (uint32_t)patchCount, (uint32_t)instanceCount, (uint32_t)patchStart, (uint32_t)baseInstance);
+    }
+}
+- (void)drawIndexedPatches:(NSUInteger)numberOfPatchControlPoints patchIndexBuffer:(id)patchIndexBuffer patchIndexBufferOffset:(NSUInteger)patchIndexBufferOffset controlPointIndexBuffer:(id)controlPointIndexBuffer controlPointIndexBufferOffset:(NSUInteger)controlPointIndexBufferOffset indirectBuffer:(id)indirectBuffer indirectBufferOffset:(NSUInteger)indirectBufferOffset {
+    if (![self rdna4IndirectBuffer:indirectBuffer offset:indirectBufferOffset bytes:sizeof(VkDrawIndirectCommand)]) return;
+    if ([self rdna4PreparePatchDraw:numberOfPatchControlPoints indexed:YES patchIndex:patchIndexBuffer patchIndexOffset:patchIndexBufferOffset controlIndex:controlPointIndexBuffer controlIndexOffset:controlPointIndexBufferOffset indirect:YES]) {
+        [_cb rdna4RetainEncoded:indirectBuffer];
+        vkCmdDrawIndirect([_cb vk], [(RDNA4Buffer *)indirectBuffer vkBuffer], [(RDNA4Buffer *)indirectBuffer rdna4VkOffset] + indirectBufferOffset, 1, sizeof(VkDrawIndirectCommand));
+    }
 }
 - (void)endEncoding {
     if (_ended) return;
