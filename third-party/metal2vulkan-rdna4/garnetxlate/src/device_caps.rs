@@ -154,7 +154,7 @@ pub(crate) fn lower_gpu_arguments_with_table_version_and_replay(
     } else {
         requested_table_version.unwrap_or(7)
     };
-    if table_version != 9 && (table_version == 8) != normalized {
+    if !matches!(table_version, 9 | 10) && (table_version == 8) != normalized {
         return Err("GPU argument table version and sampler coordinate contract disagree".into());
     }
     if let Some(table) = metadata.get("argument_resource_tables") {
