@@ -758,3 +758,52 @@ for b in test-icb test-icb-gpu test-icb-lifecycle-o0 test-icb-lifecycle-o2; do
     "$TMPDIR/$b" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Remaining Metal 2 Formats, MSL 2.1, and Limits (8.1–8.3)
+
+Host pure-C checks for occlusion 256 KiB boundary (`L20`), depth/stencil target
+validation, integer clears/formats, texture descriptors, Wave32 `threadExecutionWidth`,
+and Mac2 feature sets / capability source pins (compile against an assembled
+`GarnetDevice.m` directory via `assemble-device.py`):
+
+```sh
+python3 src/garnet-metal/assemble-device.py --output "$TMPDIR/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cp src/garnet-metal/Info.plist "$TMPDIR/"
+for t in test-gate test-occ test-depth test-intfmt test-texdesc test-devcaps; do
+  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
+    -Isrc/garnet-metal -Isrc/garnet/src -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
+done
+"$TMPDIR/test-gate" "$TMPDIR"
+"$TMPDIR/test-occ" "$TMPDIR"
+"$TMPDIR/test-depth" "$TMPDIR"
+"$TMPDIR/test-intfmt" "$TMPDIR"
+"$TMPDIR/test-texdesc" "$TMPDIR"
+"$TMPDIR/test-devcaps"
+```
+
+Offline translator checks for patch `0069` (dual-source `Decoration::Index`,
+`raster_order_group(0..7)` pixel interlock & `< 8` enforcement,
+`air.simd_active_threads_mask.i64`, `air.simd_shuffle_rotate_up`,
+`air.quad_shuffle_rotate_up`):
+
+```sh
+cargo test --offline -p garnetxlate --lib --test linked --test stack --test metal2_msl21
+cargo test --offline -p metal2vulkan --lib -- \
+  fragment_dual_source_and_raster_order_groups_are_parsed \
+  air_simd_active_threads_mask_and_rotate_up_lower_cleanly \
+  native_fragment_dual_source_and_raster_order_group_lower_cleanly
+```
+
+Live RX 9060 XT Objective-C verification suites (build with Xcode CLT on macOS;
+pre-`01:30` baseline ran `test-metal2-formats-render` 9/10 before patch `0069`,
+and all three must run on next macOS boot against the rebuilt bundle and
+`libgarnetxlate.dylib`):
+
+```sh
+for t in test-metal2-formats-render test-metal2-msl-probe test-metal2-limits; do
+  clang -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal \
+    "src/garnet-metal/$t.m" -o "$TMPDIR/$t"
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$t" /path/to/GarnetMetal.bundle
+done
+```

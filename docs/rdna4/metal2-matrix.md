@@ -311,3 +311,37 @@ it does not become PASS. Synthetic 8 GiB layouts cannot close M01..M05 physical
 capacity checks. Tasks 9.1..9.3 verify software integration and provenance;
 10.1..10.3 run the physical matrix last, after explicit release. Old regression
 contracts and permitted query upgrades are in `metal2-baseline.md`.
+
+### Implemented device capability queries and explicit overrides (8.3)
+
+- **Mac2 / Metal 2 baseline (`YES` when backend-supported)**: `supportsFamily:`
+  (`MTLGPUFamilyMac2`, `Common1..3`), `supportsFeatureSet:` /
+  `deviceSupportsFeatureSet:` (`macOS_GPUFamily1_v1..v4`,
+  `macOS_ReadWriteTextureTier2`, `macOS_GPUFamily2_v1` = `10000..10005`),
+  `argumentBuffersSupport` (`Tier2` for apps), `readWriteTextureSupport`
+  (`Tier2`), `supportsBCTextureCompression` (`ef.textureCompressionBC`),
+  `supports32BitFloatFiltering`, `supports32BitMSAA`,
+  `areRasterOrderGroupsSupported` (`VK_EXT_fragment_shader_interlock`
+  `fragmentShaderPixelInterlock`), `areProgrammableSamplePositionsSupported`
+  (`VK_EXT_sample_locations`), `supportsTextureSampleCount:` /
+  `supportsSampleCount:` (`1,2,4,8`), `supportsQueryTextureLOD`,
+  `supportsUnalignedVertexFetch`,
+  `minimumTextureBufferAlignmentForPixelFormat:` /
+  `minimumLinearTextureAlignmentForPixelFormat:` (`256`), and
+  `supportsVertexAmplificationCount:` (`1` -> `YES`, others -> `NO`).
+- **Explicit `NO` / out-of-scope overrides**:
+  `isDepth24Stencil8PixelFormatSupported` (`NO`), `supportsRaytracing` (`NO`),
+  `supportsRaytracingFromRender` (`NO`), `supportsPrimitiveMotionBlur` (`NO`),
+  `supportsFunctionPointers` (`NO`), `supportsFunctionPointersFromRender` (`NO`),
+  `supportsPullModelInterpolation` (`NO`),
+  `supportsShaderBarycentricCoordinates` (`NO`), `supportsDynamicLibraries` (`NO`),
+  `supportsRenderDynamicLibraries` (`NO`), `supportsBinaryArchives` (`NO`), and
+  application `supportsFamily:(Metal3)` (`NO`; WindowServer preserves legacy
+  compatibility `YES`).
+- **Current verification boundary (`2026-11-24`)**: Pre-`01:30+08:00` RX 9060 XT
+  live testing (`logs/rdna4-metal2/20261124-metal2-8x/RESULT.md`) passed 9/10
+  cases in `test-metal2-formats-render.m` plus ICB/tessellation/argument/renderbox
+  regressions; subsequent `0069` translator, Wave32, interlock probe, 256 KiB occ
+  clamp, capability/limit changes, `test-metal2-msl-probe.m`, and
+  `test-metal2-limits.m` are offline/host-verified on Linux and await macOS
+  compilation and next-boot RX 9060 XT execution.
