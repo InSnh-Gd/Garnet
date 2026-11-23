@@ -76,7 +76,8 @@ int main(void) {
         reflection.maxset = 2;
         reflection.bind[0][674] = (RDNA4sBind){.used=1, .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .count=1};
         reflection.bind[2][0] = (RDNA4sBind){.used=1, .type=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .runtime=1};
-        reflection.bind[2][1] = (RDNA4sBind){.used=1, .type=VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .runtime=1};
+        reflection.bind[2][1] = (RDNA4sBind){.used=1, .type=VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .runtime=1,
+            .texelComponentKinds=1u << RDNA4NS_COMP_FLOAT};
         reflection.argumentNullShapes[0] = 0x001;
         reflection.argumentNullShapes[1] = 0x204;
         reflection.argumentNullShapeCount = 2;

@@ -551,7 +551,8 @@ static BOOL rdna4_argument_table_metadata_ex(
             words[i] = (uint32_t)word;
         }
         valid = valid &&
-            rdna4ns_registry_build(words, count, &shapes) == RDNA4NS_OK;
+            rdna4ns_registry_build_abi((uint32_t)version, words, count,
+                                       &shapes) == RDNA4NS_OK;
         if (valid && count) {
             const RDNA4sBind *stageMetadata = &reflection->bind[stageSet][674];
             valid = stageMetadata->used &&

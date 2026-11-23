@@ -215,7 +215,8 @@ int main(void) {
         checkMetadata(v, 0, metadata9(@[@0, @1], @[@0x001, @0x001]), NO);
         checkMetadata(v, 0, metadata9(@[@0], @[@0x001, @0x101]), NO);
         v->bind[2][1] = (RDNA4sBind){.used = 1,
-            .type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .runtime = 1};
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .runtime = 1,
+            .texelComponentKinds = 1u << RDNA4NS_COMP_FLOAT};
         v->argumentNullShapes[2] = 0x204;
         v->argumentNullShapeCount = 3;
         checkMetadata(v, 0, metadata9(@[@0, @1], @[@0x001, @0x101, @0x204]), YES);
@@ -246,7 +247,7 @@ int main(void) {
         texelGraph.argumentNullShapeCount = 1;
         NSDictionary *texel10 = metadata10(@[@3], @[@0x204]);
         checkMetadata(&texelGraph, 0, texel10, YES);
-        RDNA4ArgumentTables texelTables = {0}; error = nil;
+        RDNA4ArgumentTables texelTables = {0}; NSError *error = nil;
         require(rdna4_argument_table_metadata_apply(&texelTables,
             &texelGraph, 0, texel10, &error) && texelTables.shapeRegistry &&
             texelTables.abi10 && texelTables.dynamicTexel[0] &&
@@ -302,7 +303,7 @@ int main(void) {
         v->bind[3][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .runtime = 1};
         v->bind[4][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_SAMPLER, .runtime = 1};
         v->argumentNullImages = (1u << 2) | (1u << 10);
-        RDNA4ArgumentTables tables = {0}; NSError *error = nil;
+        RDNA4ArgumentTables tables = {0}; error = nil;
         resetLayoutStages();
         require(rdna4_argument_table_layouts(&tables, v, NULL, YES, &error) && !error && tables.active, "compute layouts");
         require(layoutStageMask == 7u &&

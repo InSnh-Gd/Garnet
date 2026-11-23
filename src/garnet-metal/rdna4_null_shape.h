@@ -15,6 +15,7 @@
 
 #define RDNA4NS_ABI_LEGACY_MIN 5u
 #define RDNA4NS_ABI_FULL_SHAPE 9u
+#define RDNA4NS_ABI_DYNAMIC_TEXEL 10u
 #define RDNA4NS_REFLECTION_VERSION 65u
 #define RDNA4NS_LEGACY_SHAPES 48u
 #define RDNA4NS_SAMPLED_SHAPES 33u
@@ -214,7 +215,7 @@ static inline rdna4ns_status rdna4ns_registry_build_abi(
         *out = (rdna4ns_registry){0};
         return RDNA4NS_OK;
     }
-    if (table_abi != RDNA4NS_ABI_FULL_SHAPE) return RDNA4NS_UNKNOWN_ABI;
+    if (table_abi > RDNA4NS_ABI_DYNAMIC_TEXEL) return RDNA4NS_UNKNOWN_ABI;
     return rdna4ns_registry_build(words, count, out);
 }
 

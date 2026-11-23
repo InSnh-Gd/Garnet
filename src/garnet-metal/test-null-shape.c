@@ -235,7 +235,17 @@ static void test_abi_gate(void) {
             "legacy ABI has no shape list");
     require(rdna4ns_registry_build_abi(9, NULL, 0, &registry) == RDNA4NS_OK,
             "ABI 9 permits an empty list");
-    require(rdna4ns_registry_build_abi(10, NULL, 0, &registry) ==
+    require(rdna4ns_registry_build_abi(10, NULL, 0, &registry) == RDNA4NS_OK,
+            "ABI 10 permits an empty list");
+    rdna4ns_shape texel =
+        shape(RDNA4NS_DIM_BUFFER, 0, RDNA4NS_COMP_FLOAT, 0, 0,
+              RDNA4NS_ACCESS_UNIFORM_TEXEL);
+    uint32_t texel_word = rdna4ns_shape_encode(&texel);
+    require(rdna4ns_registry_build_abi(10, &texel_word, 1, &registry) ==
+                    RDNA4NS_OK &&
+                registry.count == 1 && registry.words[0] == texel_word,
+            "ABI 10 accepts valid uniform texel shape registry");
+    require(rdna4ns_registry_build_abi(11, NULL, 0, &registry) ==
                 RDNA4NS_UNKNOWN_ABI,
             "future ABI rejected");
     rdna4ns_shape sampled =
