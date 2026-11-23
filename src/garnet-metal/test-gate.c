@@ -18,6 +18,8 @@
 #include <string.h>
 #include <stddef.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "rdna4_gate.h"
 #include "../../src/garnet/src/GarnetNativeABI.h"
 
@@ -264,10 +266,10 @@ int main(int argc, char **argv) {
         const char *ri_end = ri ? strstr(ri, "RDNA4sRefl *rv = NULL, *rf = NULL;") : NULL;
         CHECK("G13: the render miss branch is found", ri && ri_end);
         if (ri && ri_end) {
-            const char *dm = strstr(ri, "(void)rdna4_dump_pipeline(d);"), *wt = strstr(ri, "rdna4_sync_wait(\"render\", want, NO)"), *fbk = strstr(ri, "fb = YES; _fallback = YES;"), *rl = strstr(ri, "vsd = rdna4_spv_lookup(d.vertexFunction, \"vertex\", &e1, &vname, &mv_);\n                    fsd");
+            const char *dm = strstr(ri, "rdna4_dump_pipeline(d,"), *wt = strstr(ri, "rdna4_sync_wait(\"render\", want, NO)"), *fbk = strstr(ri, "fb = YES; _fallback = YES;"), *rl = wt ? strstr(wt, "if (!vsd) vsd = rdna4_spv_lookup(d.vertexFunction, \"vertex\", &e1, &vname, &mv_);") : NULL, *rl2 = rl ? strstr(rl, "if (hasFrag && !fsd) fsd = rdna4_spv_lookup(d.fragmentFunction, \"fragment\", &e2, &fname, &mf_);") : NULL, *nofb_err = strstr(ri, "if (!rdna4_fallback_ok()) {");
             CHECK("G13: render: dump FIRST, then the wait, then (only if still missing) the fallback", dm && wt && fbk && before(dm, wt) && before(wt, fbk));
-            CHECK("G13: render: after a successful wait both stages are looked up again before deciding", rl && before(wt, rl) && before(rl, fbk));
-            CHECK("G13: render: unadmitted processes keep the NSError", has(ri, ri_end, "if (!rdna4_fallback_ok()) { if (err) *err = e; return nil; }"));
+            CHECK("G13: render: after a successful wait both stages are looked up again before deciding", rl && rl2 && before(wt, rl) && before(rl, rl2) && before(rl2, fbk));
+            CHECK("G13: render: unadmitted processes keep the NSError", nofb_err && fbk && has(nofb_err, fbk, "if (err) *err = dumpFailure ?: e;") && has(nofb_err, fbk, "return nil;"));
         }
         const char *cp = fn_start(m2, "- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {");
         const char *cp_end = cp ? strstr(cp, "- (id)newComputePipelineStateWithFunction:(id)fn error:") : NULL;
@@ -330,6 +332,70 @@ int main(int argc, char **argv) {
     { char *pl = slurp(dir, "Info.plist");
       CHECK("G11: Info.plist: bundle version 0.1.1, build 43", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"));
       free(pl); }
+    // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----
+    CHECK("G16: denylist applies only to class OTHER (WindowServer & RDNA4M_ALLOW=1 root immune)",
+          !rdna4g_denylist_applies(RDNA4G_CLASS_WS) && !rdna4g_denylist_applies(RDNA4G_CLASS_ROOT) && rdna4g_denylist_applies(RDNA4G_CLASS_OTHER));
+    CHECK("G16: sandbox fallback covers ENOENT/ENOTDIR/EPERM/EACCES",
+          rdna4g_denylist_open_fallback(ENOENT) && rdna4g_denylist_open_fallback(ENOTDIR) &&
+          rdna4g_denylist_open_fallback(EPERM) && rdna4g_denylist_open_fallback(EACCES));
+    CHECK("G16: exact bundle: and proc: matching ignores comments, blanks, partial/16-char prefix overlaps",
+          rdna4g_denylist_line_matches("# bundle:com.example.App\n", "com.example.App", "App") == RDNA4G_DENY_NONE &&
+          rdna4g_denylist_line_matches("   \r\n", "com.example.App", "App") == RDNA4G_DENY_NONE &&
+          rdna4g_denylist_line_matches("  bundle: com.example.VeryLongNameMainApp\r\n", "com.example.VeryLongNameMainApp", "Helper") == RDNA4G_DENY_BUNDLE &&
+          rdna4g_denylist_line_matches("bundle:com.example.VeryLongNameMainApp\n", "com.example.VeryLongNameHelperApp", "Helper") == RDNA4G_DENY_NONE &&
+          rdna4g_denylist_line_matches("proc:BadRendererTool  \n", "com.example.Other", "BadRendererTool") == RDNA4G_DENY_PROC &&
+          rdna4g_denylist_line_matches("proc:BadRenderer\n", "com.example.Other", "BadRendererTool") == RDNA4G_DENY_NONE);
+    {
+        const char *tmpd = getenv("TMPDIR");
+        if (!tmpd || !tmpd[0]) tmpd = "/tmp";
+        char dpath[512];
+        snprintf(dpath, sizeof dpath, "%s/test-gate-denylist.%d.txt", tmpd, (int)getpid());
+        FILE *fp = fopen(dpath, "w");
+        CHECK("G16: create temp denylist fixture", fp != NULL);
+        if (fp) {
+            fprintf(fp, "# comment\n\nbundle:com.bad.LongBundleIdentifierOne\nproc:BadHelperExact\n");
+            fclose(fp);
+            int openErr = 0;
+            CHECK("G16: bundle match denies class OTHER",
+                  rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.bad.LongBundleIdentifierOne", "GoodName", &openErr) == RDNA4G_DENY_BUNDLE && openErr == 0);
+            CHECK("G16: distinct long bundle sharing 16-char prefix is NOT falsely denied",
+                  rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.bad.LongBundleIdentifierTwo", "GoodName", &openErr) == RDNA4G_DENY_NONE);
+            CHECK("G16: proc match denies class OTHER",
+                  rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.good.App", "BadHelperExact", &openErr) == RDNA4G_DENY_PROC);
+            CHECK("G16: WindowServer and ROOT remain immune even on matching denylist",
+                  rdna4g_denylist_eval(RDNA4G_CLASS_WS, dpath, "com.bad.LongBundleIdentifierOne", "BadHelperExact", &openErr) == RDNA4G_DENY_NONE &&
+                  rdna4g_denylist_eval(RDNA4G_CLASS_ROOT, dpath, "com.bad.LongBundleIdentifierOne", "BadHelperExact", &openErr) == RDNA4G_DENY_NONE);
+            if (geteuid() != 0 && chmod(dpath, 0000) == 0) {
+                int epermErr = 0;
+                const int rc = rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.good.App", "GoodName", &epermErr);
+                CHECK("G16: unreadable denylist (EACCES) safely falls back to NONE for normal apps",
+                      rc == RDNA4G_DENY_NONE && rdna4g_denylist_open_fallback(epermErr));
+                (void)chmod(dpath, 0600);
+            }
+            unlink(dpath);
+        }
+        int missErr = 0;
+        CHECK("G16: missing denylist file (ENOENT) safely falls back to NONE",
+              rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.good.App", "GoodName", &missErr) == RDNA4G_DENY_NONE && missErr == ENOENT);
+    }
+    {
+        char *m6 = slurp(dir, "GarnetDevice.m");
+        CHECK("G16: GarnetDevice.m readable for denylist pins", m6 != NULL);
+        if (m6) {
+            const char *adm = fn_start(m6, "static const char *rdna4_admit(uint32_t port) {");
+            const char *adm_end = adm ? strstr(adm, "\nstatic BOOL rdna4_headless(void)") : NULL;
+            const char *dl = adm ? strstr(adm, "rdna4_denylist_decline(cls)") : NULL;
+            const char *pr = adm ? strstr(adm, "rdna4_app_probe(port)") : NULL;
+            CHECK("G16: rdna4_admit invokes rdna4_denylist_decline(cls) before rdna4_app_probe", adm && adm_end && dl && pr && before(dl, pr));
+            const char *df = fn_start(m6, "static const char *rdna4_denylist_decline(int cls) {");
+            const char *df_end = df ? strstr(df, "\n// NULL = admit") : NULL;
+            CHECK("G16: rdna4_denylist_decline checks rdna4g_denylist_applies & open fallback",
+                  df && df_end && has(df, df_end, "rdna4g_denylist_applies(cls)") &&
+                  has(df, df_end, "bundleIdentifier") && has(df, df_end, "getprogname()") &&
+                  has(df, df_end, "rdna4g_denylist_eval(") && has(df, df_end, "rdna4g_denylist_open_fallback(openErr)"));
+            free(m6);
+        }
+    }
     printf("test-gate: %d checks, %d failed\n", runs, fails);
     return fails ? 1 : 0;
 }

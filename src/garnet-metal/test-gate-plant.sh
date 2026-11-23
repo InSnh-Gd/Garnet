@@ -144,5 +144,10 @@ plant 96 $G "#define RDNA4G_MESA_SETTER      \"radv_darwin_set_service_class\"" 
 plant 97 $M "const int src = setSvc(svcCls);
                 if (src != 0) {" "const int src = setSvc(svcCls); (void)src;
                 if (0) {" "G6 97: a refused service name is ignored"
+plant 98 $G "static inline int rdna4g_denylist_applies(int cls) { return cls == RDNA4G_CLASS_OTHER; }" "static inline int rdna4g_denylist_applies(int cls) { (void)cls; return 1; }" "G16 98: WindowServer & ROOT no longer immune to user denylist"
+plant 99 $G "static inline int rdna4g_denylist_open_fallback(int err) { return err == ENOENT || err == ENOTDIR || err == EPERM || err == EACCES; }" "static inline int rdna4g_denylist_open_fallback(int err) { (void)err; return 0; }" "G16 99: sandbox EPERM/EACCES fallback removed"
+plant 100 $G "if (vlen > 0 && bundleId && bundleId[0] && strlen(bundleId) == vlen && strncmp(bundleId, val, vlen) == 0)" "if (vlen > 0 && bundleId && bundleId[0] && strncmp(bundleId, val, 16) == 0)" "G16 100: bundle: truncates match to 16 chars like p_comm"
+plant 101 $M "        const char *denyWhy = rdna4_denylist_decline(cls);
+        if (denyWhy) return denyWhy;" "        const char *denyWhy = NULL;" "G16 101: rdna4_admit ignores rdna4_denylist_decline"
 echo "test-gate-plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"
 [ $escaped -eq 0 ]

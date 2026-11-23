@@ -38,6 +38,77 @@ static inline int rdna4g_class(int isWs, int allowRoot) { return isWs ? RDNA4G_C
 static inline int rdna4g_declined_by_class(int cls, uint32_t euid) { return cls == RDNA4G_CLASS_OTHER && euid < RDNA4G_APP_MIN_EUID; }
 #define RDNA4G_DECLINE_BY_CLASS_TEXT "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set"
 
+// ---- persistent dual-key application denylist (bundle:<CFBundleIdentifier> & proc:<name>) ----
+#define RDNA4G_DENYLIST_PATH    "/Library/Application Support/RDNA4/native/app-denylist.txt"
+#define RDNA4G_DENY_NONE        0
+#define RDNA4G_DENY_BUILTIN     1
+#define RDNA4G_DENY_BUNDLE      2
+#define RDNA4G_DENY_PROC        3
+static inline int rdna4g_denylist_applies(int cls) { return cls == RDNA4G_CLASS_OTHER; }
+// Strict sandboxed apps get EPERM/EACCES under /Library/Application Support, and clean installs may omit the file (ENOENT).
+// Never fail closed here: fall back to the built-in table and let kernel `appdeny` enforce process-level blocks.
+static inline int rdna4g_denylist_open_fallback(int err) { return err == ENOENT || err == ENOTDIR || err == EPERM || err == EACCES; }
+static inline const char *rdna4g_denylist_builtin_match(const char *bundleId, const char *procName) {
+    static const char *const kBuiltinBundles[] = { (const char *)0 };
+    static const char *const kBuiltinProcs[] = { (const char *)0 };
+    if (bundleId && bundleId[0]) {
+        for (size_t i = 0; kBuiltinBundles[i]; i++) if (strcmp(bundleId, kBuiltinBundles[i]) == 0) return kBuiltinBundles[i];
+    }
+    if (procName && procName[0]) {
+        for (size_t i = 0; kBuiltinProcs[i]; i++) if (strcmp(procName, kBuiltinProcs[i]) == 0) return kBuiltinProcs[i];
+    }
+    return (const char *)0;
+}
+static inline int rdna4g_denylist_line_matches(const char *line, const char *bundleId, const char *procName) {
+    if (!line) return RDNA4G_DENY_NONE;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 0 || *p == '\n' || *p == '\r' || *p == '#') return RDNA4G_DENY_NONE;
+    size_t len = strlen(p);
+    while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+    if (len > 7 && strncmp(p, "bundle:", 7) == 0) {
+        const char *val = p + 7;
+        size_t vlen = len - 7;
+        while (vlen > 0 && (*val == ' ' || *val == '\t')) { val++; vlen--; }
+        if (vlen > 0 && bundleId && bundleId[0] && strlen(bundleId) == vlen && strncmp(bundleId, val, vlen) == 0)
+            return RDNA4G_DENY_BUNDLE;
+    } else if (len > 5 && strncmp(p, "proc:", 5) == 0) {
+        const char *val = p + 5;
+        size_t vlen = len - 5;
+        while (vlen > 0 && (*val == ' ' || *val == '\t')) { val++; vlen--; }
+        if (vlen > 0 && procName && procName[0] && strlen(procName) == vlen && strncmp(procName, val, vlen) == 0)
+            return RDNA4G_DENY_PROC;
+    }
+    return RDNA4G_DENY_NONE;
+}
+static inline int rdna4g_denylist_check_stream(FILE *fp, const char *bundleId, const char *procName) {
+    if (!fp) return RDNA4G_DENY_NONE;
+    char buf[512];
+    while (fgets(buf, sizeof buf, fp) != NULL) {
+        const size_t blen = strlen(buf);
+        if (blen > 0 && buf[blen - 1] != '\n') { int ch; while ((ch = fgetc(fp)) != EOF && ch != '\n') {} }
+        const int m = rdna4g_denylist_line_matches(buf, bundleId, procName);
+        if (m != RDNA4G_DENY_NONE) return m;
+    }
+    return RDNA4G_DENY_NONE;
+}
+static inline int rdna4g_denylist_eval(int cls, const char *path, const char *bundleId, const char *procName, int *openErrOut) {
+    if (openErrOut) *openErrOut = 0;
+    if (!rdna4g_denylist_applies(cls)) return RDNA4G_DENY_NONE;
+    if (rdna4g_denylist_builtin_match(bundleId, procName) != (const char *)0) return RDNA4G_DENY_BUILTIN;
+    if (!path || !path[0]) return RDNA4G_DENY_NONE;
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        const int err = errno;
+        if (openErrOut) *openErrOut = err;
+        (void)rdna4g_denylist_open_fallback(err);
+        return RDNA4G_DENY_NONE;
+    }
+    const int m = rdna4g_denylist_check_stream(fp, bundleId, procName);
+    fclose(fp);
+    return m;
+}
+
 // ---- the kill file ----
 #define RDNA4G_KILL_ABSENT     0
 #define RDNA4G_KILL_PRESENT    1

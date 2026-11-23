@@ -360,6 +360,26 @@ static const char *rdna4_app_probe(uint32_t port) {
     return v == RDNA4G_PROBE_OK ? NULL : rdna4g_probe_text(v);
 }
 
+static const char *rdna4_denylist_decline(int cls) {
+    if (!rdna4g_denylist_applies(cls)) return NULL;
+    NSString *bidStr = [[NSBundle mainBundle] bundleIdentifier];
+    const char *bid = bidStr ? [bidStr UTF8String] : NULL;
+    const char *proc = getprogname();
+    const char *envPath = rdna4_allow() ? getenv("RDNA4M_TEST_DENYLIST") : NULL;
+    const char *path = (envPath && envPath[0]) ? envPath : RDNA4G_DENYLIST_PATH;
+    int openErr = 0;
+    const int hit = rdna4g_denylist_eval(cls, path, bid, proc, &openErr);
+    if (hit != RDNA4G_DENY_NONE) {
+        RDNA4LOG("admit: declined by denylist (%s) bundle=%s proc=%s",
+                 hit == RDNA4G_DENY_BUILTIN ? "builtin" : hit == RDNA4G_DENY_BUNDLE ? "bundle" : "proc",
+                 bid ? bid : "-", proc ? proc : "-");
+        return "application is on the Garnet denylist";
+    }
+    if (openErr != 0 && !rdna4g_denylist_open_fallback(openErr))
+        RDNA4LOG("admit: denylist read errno=%d (%s); falling back to kernel appdeny", openErr, strerror(openErr));
+    return NULL;
+}
+
 // NULL = admit, else the reason for declining (static string).
 static const char *rdna4_admit(uint32_t port) {
     const int cls = rdna4g_class(rdna4_is_ws(), rdna4_allow());
@@ -387,6 +407,8 @@ static const char *rdna4_admit(uint32_t port) {
     int count = 0;
     if (rdna4_counter_tripped(&count)) return "crash counter: >= 3 starts within 300 s";
     if (cls == RDNA4G_CLASS_OTHER) {   // not WindowServer, not an RDNA4M_ALLOW root tool: only the kernel can admit it
+        const char *denyWhy = rdna4_denylist_decline(cls);
+        if (denyWhy) return denyWhy;
         const char *why = rdna4_app_probe(port);
         if (why) return why;
         atomic_store(&rdna4_app_admitted, 1);
