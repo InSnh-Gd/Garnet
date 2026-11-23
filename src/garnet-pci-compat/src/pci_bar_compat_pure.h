@@ -92,7 +92,7 @@ constexpr size_t kStolenPrologueBytes = 17u;
 constexpr size_t kTrampolineMinNops = 32u;
 constexpr size_t kSite1RelOffset = 0x2B2u;
 constexpr size_t kSite2RelOffset = 0x3B7u;
-constexpr size_t kMinProbeFuncLen = 0x3E8u;
+constexpr size_t kMinProbeFuncLen = 0x41Au;
 constexpr uint64_t kExpectedEntryHdrOff = 0x3712Eu;
 
 constexpr size_t kCallSiteRead16 = 0x24u;
@@ -107,6 +107,45 @@ constexpr uint64_t kExpectedRead32HdrOff = 0x2F9E0u;
 constexpr uint64_t kExpectedWrite32HdrOff = 0x32B6Au;
 constexpr uint64_t kExpectedRangeInitHdrOff = 0x3EEBFu;
 
+// Function-local instruction & struct-displacement anchors verified against 25G332 BootKC.
+// Allows shifted __TEXT,__text offsets in sibling macOS 26.x IOPCIFamily builds while
+// failing closed if IOPCIConfigurator / IOPCIDevice / IOPCIRange struct offsets change.
+constexpr uint8_t kCallCtxRead16[7] = { 0xBA, 0x04, 0x00, 0x00, 0x00, 0x31, 0xC9 };
+constexpr uint8_t kCallCtxWrite16[8] = { 0xBA, 0x04, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC0 };
+constexpr uint8_t kCallCtxRead32[8] = { 0x4C, 0x89, 0xEE, 0x44, 0x89, 0xFA, 0x31, 0xC9 };
+constexpr uint8_t kCallCtxWrite32[8] = { 0xB9, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x31, 0xC0 };
+constexpr uint8_t kAnchorClassHigh2E[13] = {
+    0x41, 0x0F, 0xB7, 0x45, 0x2E, 0xC1, 0xE0, 0x10, 0x3D, 0x00, 0x00, 0x03, 0x00
+};
+constexpr uint8_t kAnchorBusNum32[8] = {
+    0x48, 0x8B, 0x45, 0xC8, 0x80, 0x78, 0x32, 0x00
+};
+constexpr uint8_t kAnchorRangesRangeInitCtx[21] = {
+    0x48, 0x8B, 0x55, 0xC8, 0x4C, 0x8B, 0x74, 0xC2, 0x60, 0x4C, 0x89, 0xF7,
+    0x44, 0x89, 0xEE, 0x4C, 0x89, 0xFA, 0x49, 0x89, 0xC8
+};
+constexpr uint8_t kAnchorFinalizeRange[36] = {
+    0x49, 0x89, 0x46, 0x40, 0x41, 0x80, 0xFC, 0x01, 0x75, 0x1A, 0x41, 0x80,
+    0x4E, 0x54, 0x80, 0x48, 0x8B, 0x45, 0xC0, 0xF6, 0x80, 0x91, 0x00, 0x00,
+    0x00, 0x20, 0x74, 0x08, 0x49, 0xC7, 0x46, 0x48, 0xFF, 0xFF, 0xFF, 0xFF
+};
+constexpr uint8_t kHelperPrologue4[4] = { 0x55, 0x48, 0x89, 0xE5 };
+
+enum class MatchMode : uint32_t {
+    kNone = 0,
+    kExactUuid = 1,
+    kStructural = 2,
+};
+
+inline const char *match_mode_name(MatchMode m) {
+    switch (m) {
+    case MatchMode::kNone: return "none";
+    case MatchMode::kExactUuid: return "exact-uuid";
+    case MatchMode::kStructural: return "structural";
+    }
+    return "none";
+}
+
 enum class CompatStatus : uint32_t {
     kNotEvaluated = 0,
     kInstalled = 1,
@@ -120,6 +159,7 @@ enum class CompatStatus : uint32_t {
     kPatternOffsetMismatch = 9,
     kHelperCallMismatch = 10,
     kUninstalled = 11,
+    kStructLayoutMismatch = 12,
 };
 
 inline const char *status_name(CompatStatus s) {
@@ -136,8 +176,27 @@ inline const char *status_name(CompatStatus s) {
     case CompatStatus::kPatternOffsetMismatch: return "pattern-offset-mismatch";
     case CompatStatus::kHelperCallMismatch: return "helper-call-mismatch";
     case CompatStatus::kUninstalled: return "uninstalled";
+    case CompatStatus::kStructLayoutMismatch: return "struct-layout-mismatch";
     }
     return "unknown";
+}
+
+inline bool is_zero_uuid(const uint8_t u[16]) {
+    for (size_t i = 0; i < 16u; ++i) {
+        if (u[i] != 0u) return false;
+    }
+    return true;
+}
+
+inline void format_uuid(const uint8_t u[16], char out[37]) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    size_t pos = 0;
+    for (size_t i = 0; i < 16u; ++i) {
+        if (i == 4u || i == 6u || i == 8u || i == 10u) out[pos++] = '-';
+        out[pos++] = kHex[(u[i] >> 4) & 0xFu];
+        out[pos++] = kHex[u[i] & 0xFu];
+    }
+    out[pos] = '\0';
 }
 
 struct MachHeader64 {
@@ -242,7 +301,10 @@ inline size_t count_pattern_matches(const uint8_t *buf, size_t bufLen,
 
 struct VerifiedTarget {
     CompatStatus status { CompatStatus::kNotEvaluated };
+    MatchMode matchMode { MatchMode::kNone };
     bool uuidVerified { false };
+    bool hasDetectedUuid { false };
+    uint8_t detectedUuid[16] {};
     uintptr_t headerAddr { 0 };
     uintptr_t textStartAddr { 0 };
     uint64_t textSize { 0 };
@@ -300,6 +362,7 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
     size_t off = sizeof(MachHeader64);
     bool haveUuid = false;
     bool uuidMatches = false;
+    uint8_t detectedUuid[16] {};
     bool haveTextSeg = false;
     bool haveTextSect = false;
     uint64_t textHdrOff = 0;
@@ -325,6 +388,7 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
             }
             const UuidCommand uc = read_unaligned<UuidCommand>(base + off);
             haveUuid = true;
+            for (size_t k = 0; k < 16u; ++k) detectedUuid[k] = uc.uuid[k];
             uuidMatches = mem_eq(uc.uuid, kExpectedIopciUuid, sizeof(kExpectedIopciUuid));
         } else if (lc.cmd == kLcSegment64) {
             if (lc.cmdsize < sizeof(SegmentCommand64)) {
@@ -379,10 +443,12 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
         out.status = CompatStatus::kBadMachO;
         return out.status;
     }
-    if (!haveUuid || !uuidMatches) {
+    if (!haveUuid || is_zero_uuid(detectedUuid)) {
         out.status = CompatStatus::kUuidMismatch;
         return out.status;
     }
+    for (size_t k = 0; k < 16u; ++k) out.detectedUuid[k] = detectedUuid[k];
+    out.hasDetectedUuid = true;
 
     const uintptr_t hdrAddr = reinterpret_cast<uintptr_t>(base);
     const uintptr_t textStart = hdrAddr + static_cast<uintptr_t>(textHdrOff);
@@ -392,7 +458,6 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
         return out.status;
     }
 
-    out.uuidVerified = true;
     const uint8_t *textBuf = base + textHdrOff;
     const size_t textLen = static_cast<size_t>(textSize);
 
@@ -416,10 +481,9 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
     if (nSite2 > 1) { out.status = CompatStatus::kPatternDuplicate; return out.status; }
 
     const uint64_t entryHdrOff = textHdrOff + entryTextOff;
-    if (entryTextOff > textLen - kMinProbeFuncLen ||
+    if (textLen < kMinProbeFuncLen || entryTextOff > textLen - kMinProbeFuncLen ||
         site1TextOff != entryTextOff + kSite1RelOffset ||
-        site2TextOff != entryTextOff + kSite2RelOffset ||
-        entryHdrOff != kExpectedEntryHdrOff) {
+        site2TextOff != entryTextOff + kSite2RelOffset) {
         out.status = CompatStatus::kPatternOffsetMismatch;
         return out.status;
     }
@@ -433,15 +497,62 @@ inline CompatStatus verify_iopcifamily_target(const void *mhPtr, size_t maxBytes
         { kCallSiteWrite32, kExpectedWrite32HdrOff, &out.fnConfigWrite32 },
         { kCallSiteRangeInit, kExpectedRangeInitHdrOff, &out.fnRangeInit },
     };
-    for (size_t i = 0; i < 5; ++i) {
-        uint64_t dstHdr = 0;
-        if (!decode_e8_call_hdr_off(entryPtr, calls[i].site, entryHdrOff, dstHdr) ||
-            dstHdr < textHdrOff || dstHdr >= textHdrOff + textSize ||
-            dstHdr != calls[i].expectedHdr) {
-            out.status = CompatStatus::kHelperCallMismatch;
+
+    if (uuidMatches) {
+        if (entryHdrOff != kExpectedEntryHdrOff) {
+            out.status = CompatStatus::kPatternOffsetMismatch;
             return out.status;
         }
-        *calls[i].dst = hdrAddr + static_cast<uintptr_t>(dstHdr);
+        for (size_t i = 0; i < 5; ++i) {
+            uint64_t dstHdr = 0;
+            if (!decode_e8_call_hdr_off(entryPtr, calls[i].site, entryHdrOff, dstHdr) ||
+                dstHdr < textHdrOff || dstHdr >= textHdrOff + textSize ||
+                dstHdr != calls[i].expectedHdr) {
+                out.status = CompatStatus::kHelperCallMismatch;
+                return out.status;
+            }
+            *calls[i].dst = hdrAddr + static_cast<uintptr_t>(dstHdr);
+        }
+        out.uuidVerified = true;
+        out.matchMode = MatchMode::kExactUuid;
+    } else {
+        // Structural cross-26.x path: lock struct displacements & call-site instructions
+        // inside probeBaseAddressRegister and validate 5 distinct __text helper functions.
+        const bool structOk =
+            mem_eq(entryPtr + 0x1Du, kCallCtxRead16, sizeof(kCallCtxRead16)) &&
+            mem_eq(entryPtr + 0x3Eu, kCallCtxWrite16, sizeof(kCallCtxWrite16)) &&
+            mem_eq(entryPtr + 0xBFu, kAnchorClassHigh2E, sizeof(kAnchorClassHigh2E)) &&
+            mem_eq(entryPtr + 0x11Cu, kCallCtxRead32, sizeof(kCallCtxRead32)) &&
+            mem_eq(entryPtr + 0x134u, kCallCtxWrite32, sizeof(kCallCtxWrite32)) &&
+            mem_eq(entryPtr + 0x197u, kAnchorBusNum32, sizeof(kAnchorBusNum32)) &&
+            mem_eq(entryPtr + 0x3CEu, kAnchorRangesRangeInitCtx, sizeof(kAnchorRangesRangeInitCtx)) &&
+            mem_eq(entryPtr + 0x3F6u, kAnchorFinalizeRange, sizeof(kAnchorFinalizeRange));
+        if (!structOk) {
+            out.status = CompatStatus::kStructLayoutMismatch;
+            return out.status;
+        }
+        uint64_t decodedTargets[5] {};
+        for (size_t i = 0; i < 5; ++i) {
+            uint64_t dstHdr = 0;
+            if (!decode_e8_call_hdr_off(entryPtr, calls[i].site, entryHdrOff, dstHdr) ||
+                dstHdr < textHdrOff ||
+                dstHdr > textHdrOff + textSize - sizeof(kHelperPrologue4) ||
+                (dstHdr >= entryHdrOff && dstHdr < entryHdrOff + kMinProbeFuncLen) ||
+                !mem_eq(base + dstHdr, kHelperPrologue4, sizeof(kHelperPrologue4))) {
+                out.status = CompatStatus::kHelperCallMismatch;
+                return out.status;
+            }
+            for (size_t prev = 0; prev < i; ++prev) {
+                if (decodedTargets[prev] == dstHdr) {
+                    out.status = CompatStatus::kHelperCallMismatch;
+                    return out.status;
+                }
+            }
+            decodedTargets[i] = dstHdr;
+            *calls[i].dst = hdrAddr + static_cast<uintptr_t>(dstHdr);
+        }
+        out.uuidVerified = false;
+        out.matchMode = MatchMode::kStructural;
     }
 
     out.headerAddr = hdrAddr;

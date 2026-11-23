@@ -71,12 +71,12 @@ PY
 cp "$SRC_H" "$SCR/pci_bar_compat_pure.h"
 run_case "0 (clean control)" 1
 
-plant 1 "removed UUID verification" \
-    '    if (!haveUuid || !uuidMatches) {
+plant 1 "removed missing/all-zero UUID refusal" \
+    '    if (!haveUuid || is_zero_uuid(detectedUuid)) {
         out.status = CompatStatus::kUuidMismatch;
         return out.status;
     }' \
-    '    if (false && (!haveUuid || !uuidMatches)) {
+    '    if (false && (!haveUuid || is_zero_uuid(detectedUuid))) {
         out.status = CompatStatus::kUuidMismatch;
         return out.status;
     }'
@@ -144,6 +144,30 @@ plant 7 "removed interior &r->end / size==0 sentinel stop (OOB past 0x80 IOPCIRa
                             hitZeroSize = true;
                             break;
                         }'
+
+plant 8 "removed structural struct-layout verification" \
+    '        if (!structOk) {
+            out.status = CompatStatus::kStructLayoutMismatch;
+            return out.status;
+        }' \
+    '        if (false && !structOk) {
+            out.status = CompatStatus::kStructLayoutMismatch;
+            return out.status;
+        }'
+
+plant 9 "removed structural helper non-aliasing verification" \
+    '            for (size_t prev = 0; prev < i; ++prev) {
+                if (decodedTargets[prev] == dstHdr) {
+                    out.status = CompatStatus::kHelperCallMismatch;
+                    return out.status;
+                }
+            }' \
+    '            for (size_t prev = 0; prev < i; ++prev) {
+                if (false && decodedTargets[prev] == dstHdr) {
+                    out.status = CompatStatus::kHelperCallMismatch;
+                    return out.status;
+                }
+            }'
 
 printf 'pci_bar_compat_plant: %d cases run, %d escaped/failed\n' "$total" "$escaped"
 [ "$escaped" -eq 0 ]

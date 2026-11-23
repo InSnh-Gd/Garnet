@@ -86,6 +86,33 @@ void write_e8(uint8_t *buf, uint64_t entryHdr, size_t callSiteOff, uint64_t targ
     write_unaligned<int32_t>(buf + entryHdr + callSiteOff + 1u, static_cast<int32_t>(rel));
 }
 
+void populate_probe_and_helpers(uint8_t *b, uint64_t entryOff,
+                              uint64_t r16, uint64_t w16,
+                              uint64_t r32, uint64_t w32,
+                              uint64_t ri) {
+    std::memcpy(b + entryOff, kPrologueSig, sizeof(kPrologueSig));
+    std::memcpy(b + entryOff + 0x1Du, kCallCtxRead16, sizeof(kCallCtxRead16));
+    std::memcpy(b + entryOff + 0x3Eu, kCallCtxWrite16, sizeof(kCallCtxWrite16));
+    std::memcpy(b + entryOff + 0xBFu, kAnchorClassHigh2E, sizeof(kAnchorClassHigh2E));
+    std::memcpy(b + entryOff + 0x11Cu, kCallCtxRead32, sizeof(kCallCtxRead32));
+    std::memcpy(b + entryOff + 0x134u, kCallCtxWrite32, sizeof(kCallCtxWrite32));
+    std::memcpy(b + entryOff + 0x197u, kAnchorBusNum32, sizeof(kAnchorBusNum32));
+    std::memcpy(b + entryOff + kSite1RelOffset, kSite1Sig, sizeof(kSite1Sig));
+    std::memcpy(b + entryOff + kSite2RelOffset, kSite2Sig, sizeof(kSite2Sig));
+    std::memcpy(b + entryOff + 0x3CEu, kAnchorRangesRangeInitCtx, sizeof(kAnchorRangesRangeInitCtx));
+    std::memcpy(b + entryOff + 0x3F6u, kAnchorFinalizeRange, sizeof(kAnchorFinalizeRange));
+
+    write_e8(b, entryOff, kCallSiteRead16, r16);
+    write_e8(b, entryOff, kCallSiteWrite16, w16);
+    write_e8(b, entryOff, kCallSiteRead32, r32);
+    write_e8(b, entryOff, kCallSiteWrite32, w32);
+    write_e8(b, entryOff, kCallSiteRangeInit, ri);
+
+    for (uint64_t h : { r16, w16, r32, w32, ri }) {
+        std::memcpy(b + h, kHelperPrologue4, sizeof(kHelperPrologue4));
+    }
+}
+
 SyntheticIopci make_valid_synthetic_iopci() {
     SyntheticIopci s;
     const size_t totalSize = 0x54000u;
@@ -125,17 +152,11 @@ SyntheticIopci make_valid_synthetic_iopci() {
     std::memcpy(uc.uuid, kExpectedIopciUuid, sizeof(kExpectedIopciUuid));
     write_unaligned(s.image.data() + sizeof(MachHeader64) + seg.cmdsize, uc);
 
-    // Populate unique signatures and helper calls inside probeBaseAddressRegister.
-    uint8_t *b = s.image.data();
-    std::memcpy(b + s.entryOff, kPrologueSig, sizeof(kPrologueSig));
-    std::memcpy(b + s.entryOff + kSite1RelOffset, kSite1Sig, sizeof(kSite1Sig));
-    std::memcpy(b + s.entryOff + kSite2RelOffset, kSite2Sig, sizeof(kSite2Sig));
-
-    write_e8(b, s.entryOff, kCallSiteRead16, kExpectedRead16HdrOff);
-    write_e8(b, s.entryOff, kCallSiteWrite16, kExpectedWrite16HdrOff);
-    write_e8(b, s.entryOff, kCallSiteRead32, kExpectedRead32HdrOff);
-    write_e8(b, s.entryOff, kCallSiteWrite32, kExpectedWrite32HdrOff);
-    write_e8(b, s.entryOff, kCallSiteRangeInit, kExpectedRangeInitHdrOff);
+    populate_probe_and_helpers(
+        s.image.data(), s.entryOff,
+        kExpectedRead16HdrOff, kExpectedWrite16HdrOff,
+        kExpectedRead32HdrOff, kExpectedWrite32HdrOff,
+        kExpectedRangeInitHdrOff);
     return s;
 }
 
@@ -389,12 +410,19 @@ void test_macho_and_signature_verification() {
     const uintptr_t base = reinterpret_cast<uintptr_t>(syn.image.data());
     const uintptr_t anchor = base + syn.anchorOff;
 
-    // 1. Valid synthetic image + backward scan.
+    // 1. Valid synthetic image + backward scan (exact-uuid fast path).
     CHECK(find_mach_header_backward(anchor, base, base + syn.image.size()) == syn.image.data());
     VerifiedTarget vt {};
     CHECK(verify_iopcifamily_target(syn.image.data(), syn.image.size(), anchor, vt) ==
           CompatStatus::kInstalled);
     CHECK(vt.uuidVerified);
+    CHECK(vt.matchMode == MatchMode::kExactUuid);
+    CHECK(vt.hasDetectedUuid);
+    {
+        char ustr[37] {};
+        format_uuid(vt.detectedUuid, ustr);
+        CHECK(std::strcmp(ustr, "227771C6-ADC2-30C7-8408-263F723CF81C") == 0);
+    }
     CHECK(vt.entryHdrOff == kExpectedEntryHdrOff);
 
     // 2. False-positive 0xFEEDFACF on page 1 before anchor must not fool backward scan.
@@ -414,16 +442,62 @@ void test_macho_and_signature_verification() {
     CHECK(find_mach_header_backward(anchor, base + 0x2000u, base + syn.image.size()) == nullptr);
     CHECK(find_mach_header_backward(base + 0x12000u, base, base + syn.image.size()) == nullptr);
 
-    // 4. Wrong UUID -> kUuidMismatch.
+    // 4a. Sibling macOS 26.x UUID + shifted function & helper offsets -> structural match.
     {
         auto s2 = syn;
         const size_t uuidOff = sizeof(MachHeader64) + sizeof(SegmentCommand64) + sizeof(Section64) + 8u;
         s2.image[uuidOff] ^= 0x01u;
+        std::memset(s2.image.data() + s2.textOff, 0x90, s2.textSize);
+        const uint64_t shifted = s2.entryOff + 0x400u;
+        const uint64_t r16 = kExpectedRead16HdrOff + 0x180u;
+        const uint64_t w16 = kExpectedWrite16HdrOff + 0x180u;
+        const uint64_t r32 = kExpectedRead32HdrOff + 0x180u;
+        const uint64_t w32 = kExpectedWrite32HdrOff + 0x180u;
+        const uint64_t ri = kExpectedRangeInitHdrOff + 0x180u;
+        populate_probe_and_helpers(s2.image.data(), shifted, r16, w16, r32, w32, ri);
+
         VerifiedTarget v2 {};
         CHECK(verify_iopcifamily_target(s2.image.data(), s2.image.size(), 0u, v2) ==
-              CompatStatus::kUuidMismatch);
+              CompatStatus::kInstalled);
         CHECK(!v2.uuidVerified);
-        CHECK(v2.entryAddr == 0u);
+        CHECK(v2.matchMode == MatchMode::kStructural);
+        CHECK(v2.hasDetectedUuid);
+        CHECK(v2.entryHdrOff == shifted);
+        CHECK(v2.fnConfigRead16 - v2.headerAddr == r16);
+        CHECK(v2.fnConfigWrite16 - v2.headerAddr == w16);
+        CHECK(v2.fnConfigRead32 - v2.headerAddr == r32);
+        CHECK(v2.fnConfigWrite32 - v2.headerAddr == w32);
+        CHECK(v2.fnRangeInit - v2.headerAddr == ri);
+
+        // 4b. Structural fails closed if a struct displacement byte changes (e.g. fFlags 0x91 -> 0x99).
+        auto sBadStruct = s2;
+        sBadStruct.image[shifted + 0x3F6u + 21u] = 0x99u;
+        VerifiedTarget vBadStruct {};
+        CHECK(verify_iopcifamily_target(sBadStruct.image.data(), sBadStruct.image.size(), 0u, vBadStruct) ==
+              CompatStatus::kStructLayoutMismatch);
+        CHECK(vBadStruct.entryAddr == 0u);
+
+        // 4c. Structural fails closed if two helpers alias or lack push-rbp prologue.
+        auto sAlias = s2;
+        write_e8(sAlias.image.data(), shifted, kCallSiteWrite16, r16);
+        VerifiedTarget vAlias {};
+        CHECK(verify_iopcifamily_target(sAlias.image.data(), sAlias.image.size(), 0u, vAlias) ==
+              CompatStatus::kHelperCallMismatch);
+
+        auto sNoPro = s2;
+        sNoPro.image[ri] = 0xC3u;
+        VerifiedTarget vNoPro {};
+        CHECK(verify_iopcifamily_target(sNoPro.image.data(), sNoPro.image.size(), 0u, vNoPro) ==
+              CompatStatus::kHelperCallMismatch);
+
+        // 4d. All-zero UUID -> kUuidMismatch.
+        auto sZeroUuid = s2;
+        std::memset(sZeroUuid.image.data() + uuidOff, 0, 16u);
+        VerifiedTarget vZero {};
+        CHECK(verify_iopcifamily_target(sZeroUuid.image.data(), sZeroUuid.image.size(), 0u, vZero) ==
+              CompatStatus::kUuidMismatch);
+        CHECK(!vZero.uuidVerified);
+        CHECK(vZero.entryAddr == 0u);
     }
 
     // 5. Missing UUID -> kUuidMismatch.

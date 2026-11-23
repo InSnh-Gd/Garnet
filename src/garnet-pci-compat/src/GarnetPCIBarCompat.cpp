@@ -219,6 +219,14 @@ OSDefineMetaClassAndStructors(GarnetPCIBarCompat, IOService)
 
 void GarnetPCIBarCompat::publishDiagnostics() {
     setProperty("GarnetPCIBarCompat,Status", garnet_pcibar::status_name(gStatus));
+    setProperty("GarnetPCIBarCompat,MatchMode", garnet_pcibar::match_mode_name(gTarget.matchMode));
+    if (gTarget.hasDetectedUuid) {
+        char uuidStr[37] {};
+        garnet_pcibar::format_uuid(gTarget.detectedUuid, uuidStr);
+        setProperty("GarnetPCIBarCompat,IOPCIFamilyUUID", uuidStr);
+    } else {
+        setProperty("GarnetPCIBarCompat,IOPCIFamilyUUID", "");
+    }
     setProperty("GarnetPCIBarCompat,HookInstalled",
                 __atomic_load_n(&gHookInstalled, __ATOMIC_ACQUIRE));
     setProperty("GarnetPCIBarCompat,TargetUUIDVerified", gTarget.uuidVerified);

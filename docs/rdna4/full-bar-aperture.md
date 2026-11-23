@@ -59,14 +59,14 @@ Every precondition failure leaves `IOPCIFamily` unpatched (zero writes) or tail-
 | :--- | :--- | :--- |
 | Boot-arg override | `garnet-rebar-compat=0` | `disabled-by-boot-arg`, zero writes |
 | Late-load / wrong OC order | `IOPCIDevice` or `IOPCIConfigurator` instance count `> 0` | `refused-late-load` (`LateLoadRefused = true`), zero writes, never forges late descriptors |
-| `IOPCIFamily` identity | Backward page scan (`<= 16` pages from `IOPCIBridge::initialize`), `mach_header_64`, `__TEXT,__text`, `LC_UUID == 227771C6-ADC2-30C7-8408-263F723CF81C` | `header-not-found` / `bad-macho` / `uuid-mismatch`, zero writes |
-| Unique signatures & calls | Unique (`count == 1`) 28 B prologue (`+0x0`), 14 B Site 1 (`+0x2b2`), 17 B Site 2 (`+0x3b7`), plus 5 `e8 rel32` targets (`hdr+0x306d8`, `+0x32ae6`, `+0x2f9e0`, `+0x32b6a`, `+0x3eebf`) | `pattern-*` / `helper-call-mismatch`, zero writes |
+| `IOPCIFamily` identity | Backward page scan (`<= 16` pages from `IOPCIBridge::initialize`), `mach_header_64`, `__TEXT,__text`, non-zero `LC_UUID`; `exact-uuid` fast path for `25G332` (`227771C6-ADC2-30C7-8408-263F723CF81C`) or `structural` verifier for compatible `26.x` builds | `header-not-found` / `bad-macho` / `uuid-mismatch` / `struct-layout-mismatch`, zero writes |
+| Unique signatures, struct displacements & calls | Unique (`count == 1`) 28 B prologue (`+0x0`), 14 B Site 1 (`+0x2b2`), 17 B Site 2 (`+0x3b7`), intra-function struct-displacement bytes (`0x2E`/`0x32`/`0x40`/`0x48`/`0x54`/`0x60`/`0x90`), plus 5 `e8 rel32` call sites (`exact-uuid`: pinned `25G332` targets; `structural`: 5 distinct in-`__text` helpers with `push rbp` prologue outside probe) | `pattern-*` / `struct-layout-mismatch` / `helper-call-mismatch`, zero writes |
 | Device allowlist | Vendor `0x1002`, device ID in `{0x7590 (16 GiB), 0x7550 (16 GiB), 0x7551 (32 GiB)}`, Type-0 endpoint (`lastBarNum >= 5`) | `passthrough` to Apple handler |
 | Bridge PFM64 capacity | `kIOPCIConfiguratorPFM64` (`0x2000`) set and root host-bridge PFM64 free/window capacity `>= size64` (lock-free bounded walk `<= 64` nodes) | `RefusedBridgeCount++`, `passthrough` to Apple handler |
 | BAR0 geometry & BAR0-only step | 64-bit prefetchable (`(maskLo & 0xF) == 0xC`), power-of-two `size64 = -mask64`, `1 GiB < size64 <= deviceLimit`; advances `barNum` from `0 -> 2` | Invalid mask falls back to `passthrough`; BAR2..5 and Expansion ROM (`0x30`, display class `0x030000`) remain capped at `1 GiB` |
 
 The detour handler executes under `mp_rendezvous_no_intrs` with interrupts disabled, so the hook path performs zero locks, zero heap allocations, and zero `IOLog` calls. Read-only `IORegistry` diagnostics are published later in `GarnetPCIBarCompat::start`:
-`GarnetPCIBarCompat,Status`, `HookInstalled`, `TargetUUIDVerified`, `InterceptCount`, `PreservedBar0Bytes`, `DeviceID`, `PassthroughCount`, `RefusedBridgeCount`, and `LateLoadRefused`.
+`GarnetPCIBarCompat,Status`, `MatchMode`, `IOPCIFamilyUUID`, `HookInstalled`, `TargetUUIDVerified`, `InterceptCount`, `PreservedBar0Bytes`, `DeviceID`, `PassthroughCount`, `RefusedBridgeCount`, and `LateLoadRefused`.
 
 ---
 
