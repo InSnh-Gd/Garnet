@@ -45,14 +45,14 @@ int main(void) {
     rdna4_argument_descriptor_usage usage;
     for (unsigned type = 0; type < sizeof types / sizeof types[0]; ++type) {
         memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-        v->bind[0][7] = (RDNA4sBind){1, types[type], 100, 0};
+        v->bind[0][7] = (RDNA4sBind){.used = 1, .type = types[type], .count = 100, .runtime = 0};
         CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) == RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         v->bind[0][7].count = 101;
         CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) != RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         v->bind[0][7].count = 50;
-        f->bind[1][9] = (RDNA4sBind){1, types[type], 50, 0};
+        f->bind[1][9] = (RDNA4sBind){.used = 1, .type = types[type], .count = 50, .runtime = 0};
         CHECK(rdna4_argument_descriptor_scan(v, f, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) == RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         f->bind[1][9].count = 51;
@@ -79,14 +79,14 @@ int main(void) {
     limits = rdna4_argument_descriptor_device_limits(&core, &uab, 1);
     for (unsigned type = 0; type < sizeof types / sizeof types[0]; ++type) {
         memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-        v->bind[0][7] = (RDNA4sBind){1, types[type], 30, 0};
+        v->bind[0][7] = (RDNA4sBind){.used = 1, .type = types[type], .count = 30, .runtime = 0};
         CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) == RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         v->bind[0][7].count = 31;
         CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) != RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         v->bind[0][7].count = 15;
-        f->bind[1][9] = (RDNA4sBind){1, types[type], 15, 0};
+        f->bind[1][9] = (RDNA4sBind){.used = 1, .type = types[type], .count = 15, .runtime = 0};
         CHECK(rdna4_argument_descriptor_scan(v, f, 0, &usage));
         CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) == RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
         f->bind[1][9].count = 16;
@@ -95,7 +95,7 @@ int main(void) {
     }
     limits = rdna4_argument_descriptor_device_limits(&core, &uab, 0);
     memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-    v->bind[0][0] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3, 0};
+    v->bind[0][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .count = 3, .runtime = 0};
     CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
     limits.max_pipeline[RDNA4_ARGUMENT_DESCRIPTOR_GROUP_UNIFORM_BUFFERS_DYNAMIC] = 3;
     CHECK(rdna4_argument_capacity_descriptor_budget(&limits, &usage, NULL) == RDNA4_ARGUMENT_DESCRIPTOR_BUDGET_OK);
@@ -105,8 +105,8 @@ int main(void) {
 
     /* Ordinary texels join their image group; shared ABI9 binding1 is UAB only. */
     memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-    v->bind[0][0] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2, 0};
-    f->bind[1][0] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1, 0};
+    v->bind[0][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .count = 2, .runtime = 0};
+    f->bind[1][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, .count = 1, .runtime = 0};
     CHECK(rdna4_argument_descriptor_scan(v, f, 2, &usage));
     const uint32_t stages[3] = {3, 3, 3}, texel[2] = {3, 3}, rows[3] = {10, 11, 12};
     const uint32_t texel_rows[2] = {RDNA4NS_TEXEL_SHAPES, RDNA4NS_TEXEL_SHAPES};
@@ -122,15 +122,15 @@ int main(void) {
     CHECK(!memcmp(&before, &all, sizeof all));
 
     memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-    v->bind[0][160] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, 0};
-    v->bind[0][736] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, 0};
+    v->bind[0][160] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_SAMPLER, .count = 2, .runtime = 0};
+    v->bind[0][736] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_SAMPLER, .count = 2, .runtime = 0};
     CHECK(rdna4_argument_descriptor_scan(v, NULL, 0, &usage));
     const uint32_t sampler_stages[3] = {0, 0, 1}, no_texel[2] = {0, 0}, sampler_rows[3] = {0, 0, 6};
     const uint32_t no_texel_rows[2] = {0, 0};
     CHECK(rdna4_argument_descriptor_tables(&usage, sampler_stages, no_texel, sampler_rows, no_texel_rows, &all));
     CHECK(usage.pipeline.sampler == 4 && all.pipeline.sampler == 10 && all.per_stage[0].sampler == 10);
     memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
-    f->bind[1][0] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3, 0};
+    f->bind[1][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .count = 3, .runtime = 0};
     f->outmask = 1u << 7;
     CHECK(rdna4_argument_descriptor_scan(v, f, 8, &usage));
     CHECK(usage.fragment_output_attachments == 8);

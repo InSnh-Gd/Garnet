@@ -106,7 +106,7 @@ int main(void) {
         for (unsigned i = 0; i < sizeof types / sizeof types[0]; ++i) {
             limits();
             memset(v, 0, sizeof *v);
-            v->bind[0][0] = (RDNA4sBind){1, types[i], 100, 0};
+            v->bind[0][0] = (RDNA4sBind){.used = 1, .type = types[i], .count = 100, .runtime = 0};
             RDNA4ArgumentTables table = {0}; NSError *error = nil;
             CHECK(rdna4_argument_table_layouts(&table, v, NULL, YES, &error));
             CHECK(!table.active && !error && table.descriptorBudgetReady);
@@ -120,8 +120,8 @@ int main(void) {
         limits();
         memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
         for (unsigned c = 0; c < 2; ++c) {
-            v->bind[2+c][0] = (RDNA4sBind){1, rdna4_argument_descriptor_type(c), 0, 1};
-            v->bind[2+c][1] = (RDNA4sBind){1, c ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, RDNA4NS_TEXEL_SHAPES, 0};
+            v->bind[2+c][0] = (RDNA4sBind){.used = 1, .type = rdna4_argument_descriptor_type(c), .count = 0, .runtime = 1};
+            v->bind[2+c][1] = (RDNA4sBind){.used = 1, .type = c ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .count = RDNA4NS_TEXEL_SHAPES, .runtime = 0};
         }
         *f = *v;
         RDNA4R.descriptorLimits.maxPerStageDescriptorUpdateAfterBindSampledImages = 30;
@@ -159,7 +159,7 @@ int main(void) {
         failAt = 0;
         limits(); memset(v, 0, sizeof *v); memset(f, 0, sizeof *f);
         v->maxset = 2;
-        v->bind[2][0] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0, 1};
+        v->bind[2][0] = (RDNA4sBind){.used = 1, .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .count = 0, .runtime = 1};
         v->bind[2][1] = (RDNA4sBind){1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
             0, 1, 0, 1u << RDNA4NS_COMP_UINT};
         RDNA4ArgumentTables dynamic = {.shapeRegistry = YES, .abi10 = YES,
