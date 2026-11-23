@@ -21,7 +21,7 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0026. The kext ABI header that patches 0002-0004 mirror
+Order matters: 0001 .. 0027. The kext ABI header that patches 0002-0004 mirror
 is src/garnet/src/GarnetNativeABI.h in this repository; Mesa's copy and
 the kext's copy must be the same ABI version (currently 1.11 or newer).
 
@@ -58,6 +58,8 @@ the kext's copy must be the same ABI version (currently 1.11 or newer).
 0025: disable GFX12 color compression on Darwin. Garnet accepts the allocation flag without setting the GPU page table compression bit. Keep image format queries, image creation, and allocation on the uncompressed path. The gfx1200 pipeline probe checks the reported color attachment compression mode.
 
 0026: enable VK_EXT_metal_surface on RADV for Darwin builds (src/amd/vulkan/radv_instance.c) and route WSI Metal swapchains lacking bind_drawable_to_vkimage through the CPU present blit path with explicit fence waits before wsi_metal_layer_blit_and_present (src/vulkan/wsi/wsi_common_metal.c). Absorbed and adapted from RX4Darwin/AMDRadeonRDNA4.kext (commit 6811730c, BSD 3-Clause).
+
+0027: define RADV_USE_WSI_PLATFORM in src/amd/vulkan/radv_wsi.h when VK_USE_PLATFORM_METAL_EXT is enabled, so RADV exposes VK_KHR_surface, VK_KHR_swapchain, and related WSI extensions alongside VK_EXT_metal_surface, and skip the private SDMA blit queue in src/amd/vulkan/radv_wsi.c when ip[AMD_IP_SDMA].num_queues == 0 so WSI CPU-blit swapchains execute on the graphics queue.
 
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"

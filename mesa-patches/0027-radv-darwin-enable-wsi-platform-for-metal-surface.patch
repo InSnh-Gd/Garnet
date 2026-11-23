@@ -1,0 +1,43 @@
+From: Garnet / RDNA4 macOS WSI fix
+Subject: [PATCH 27/27] radv: define RADV_USE_WSI_PLATFORM when VK_USE_PLATFORM_METAL_EXT is set
+
+Patch 0026 enabled VK_EXT_metal_surface in radv_instance.c, but radv_wsi.h
+only defined RADV_USE_WSI_PLATFORM for Wayland/XCB/Xlib/Display. Without
+RADV_USE_WSI_PLATFORM, RADV omitted VK_KHR_surface and VK_KHR_swapchain
+while advertising VK_EXT_metal_surface, breaking swapchain creation and
+crashing vulkaninfo in AppQueueFamilyProperties.
+
+In addition, radv_wsi_get_prime_blit_queue() unconditionally tried to spin
+up a private RADV_QUEUE_TRANSFER (SDMA) queue on GFX9+. On Darwin native
+connections where no SDMA ring is exposed (available_rings == 0,
+ip[AMD_IP_SDMA].num_queues == 0), submitting swapchain CPU-blit copies on
+that SDMA queue fails CS validation (-EINVAL). Gate the private SDMA blit
+queue on pdev->info.ip[AMD_IP_SDMA].num_queues > 0 so WSI swapchains execute
+their blit on the graphics queue instead.
+
+---
+diff --git a/src/amd/vulkan/radv_wsi.h b/src/amd/vulkan/radv_wsi.h
+--- a/src/amd/vulkan/radv_wsi.h
++++ b/src/amd/vulkan/radv_wsi.h
+@@ -14,7 +14,7 @@
+ #include "radv_physical_device.h"
+ 
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||   \
+-   defined(VK_USE_PLATFORM_DISPLAY_KHR)
++   defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(VK_USE_PLATFORM_METAL_EXT)
+ #define RADV_USE_WSI_PLATFORM
+ #endif
+ 
+diff --git a/src/amd/vulkan/radv_wsi.c b/src/amd/vulkan/radv_wsi.c
+--- a/src/amd/vulkan/radv_wsi.c
++++ b/src/amd/vulkan/radv_wsi.c
+@@ -52,7 +52,8 @@ radv_wsi_get_prime_blit_queue(VkDevice _device)
+       return &device->private_sdma_queue->vk;
+    }
+ 
+-   if (pdev->info.gfx_level >= GFX9 && !RADV_DEBUG(instance, NO_DMA_BLIT)) {
++   if (pdev->info.gfx_level >= GFX9 && pdev->info.ip[AMD_IP_SDMA].num_queues > 0 &&
++       !RADV_DEBUG(instance, NO_DMA_BLIT)) {
+ 
+       uint32_t queue_family_index = pdev->num_queues;
+       for (uint32_t i = 0; i < pdev->num_queues; i++) {
