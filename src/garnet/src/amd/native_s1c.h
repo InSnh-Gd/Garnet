@@ -129,8 +129,9 @@ bool n1c_ws_is_open();                          // 0.0.641: a WindowServer sessi
 // 0.0.641: the client class calls this BEFORE n1c_close (apps ON only; a no-op otherwise): remove the CPU mappings IOUserClient still holds for the session's visible-VRAM BOs.
 void n1c_unmap_for_close(const N1cRef &ref, IOUserClient *uc);
 bool n1c_log_gate(uint32_t *suppressed);        // 0.0.641: rate limit for the "open refused" log line (true = log it; *suppressed = lines dropped in the last window)
-// accel action 104 `appallow <add|remove|list|strikes>`: root-only (the legacy user client), exists only with the role enabled. `o` receives rdna4native::g4::kOutN (13) scalars; o[0] is the code.
+// accel action 104 `appallow <add|remove|list|strikes>` and action 110 `appdeny <add|remove|list|clear>`: root-only (the legacy user client), exists only with the role enabled. `o` receives rdna4native::g4::kOutN (13) scalars; o[0] is the code.
 IOReturn n1c_app_verb(uint64_t arg, uint64_t *o);
+IOReturn n1c_app_deny_verb(uint64_t arg, uint64_t *o);
 
 // ---- 0.0.650: GPU-apps stage G5 Stage 1, the application credit (native_g5_pure.h). DEFAULT OFF: boot-arg rdna4-g5=1 AND garnet-multisession=1, latched once. -----------------
 bool n1c_g5_latched_on();                       // both latches ON

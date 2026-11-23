@@ -122,10 +122,10 @@ plant 42 $NB "the self-ring high half is not logged" 'NBIF_LOG("enable_doorbell_
 plant 43 $DP "vramstat is not admitted" 'action == kActM6XStat || action == kActVramStat)); }' 'action == kActM6XStat)); }'
 plant 44 $DP "vramstat takes an argument" '(action == kActVramStat && arg == 0ull) ||' '(action == kActVramStat) ||'
 plant 45 $CLI "the CLI has no vramstat verb" 'else if (what && !strcmp(what, "vramstat")) in = 108;' ''
-plant 46 $CLI "the known list forgets vramstat" 'm6stat m6xstat vramstat bartest\n");' 'm6stat m6xstat\n");'
+plant 46 $CLI "the known list forgets vramstat" 'm6stat m6xstat vramstat bartest appdeny\n");' 'm6stat m6xstat appdeny\n");'
 plant 47 $B "vramstat writes VRAM" 'v[10] = g.visible_vram_size;' 'v[10] = g.visible_vram_size; vramMemset(0, 0, 4);'
 plant 48 $B "vramstat reports used bytes as free" 'v[2] = g.vram_alloc.bytes_free();' 'v[2] = g.vram_alloc.bytes_used();'
-plant 49 $CLI "the CLI usage string forgets vramstat" '|m6xstat [0|1|2]|vramstat|bartest [0|1]|capstream' '|m6xstat [0|1|2]|capstream'
+plant 49 $CLI "the CLI usage string forgets vramstat" '|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream' '|m6xstat [0|1|2]|appdeny add <name>/remove <name>/list [page]/clear|capstream'
 plant 50 $SR/GarnetUserClient.cpp "the user client's table comment forgets the verb" '108 = vramstat' '108 = (removed)'
 # ---- version ----
 plant 51 $K/Info.plist "the version is not bumped" '<key>CFBundleVersion</key>

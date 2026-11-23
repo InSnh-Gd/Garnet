@@ -1276,15 +1276,13 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < rdna4native::g2::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
 	}
-	// action 104 (0.0.640, GPU-apps G4; boot-args garnet-apps=1 AND garnet-multisession=1 only): `appallow add|remove <name>` / `appallow list [page]`, the kernel's APP allow-list
-	// (max 32 entries, empty at every boot). Reachable only through the admin-only legacy user client. It touches no hardware and no register: a 32-slot table in the kext's
-	// data. Like G1 / G2, dispatched before the native-boot refusal as its own exemption (rdna4native::g4::native_exempt); with the role disabled (the default) 104 is BadArgument here
-	// and in the user client, as before 0.0.640. o[0] is the code (rdna4native::g4::AllowCode).
+	// actions 104 (`appallow`) & 110 (`appdeny`): admin-only legacy user client; lock-free static tables in kext data.
 	if (rdna4native::g4::is_g4_action(action)) {
 		if (!rdna4native::g4::native_exempt(amdgpu::n1c_apps_enabled(), action, argScalar)) return kIOReturnBadArgument;
 		uint64_t v[rdna4native::g4::kOutN] = { 0 };
-		const IOReturn kr = amdgpu::n1c_app_verb(argScalar, v);
-		RDNA4LOG("accel-experiment: appallow op %llu -> kr %#x code %llu entries %llu", (unsigned long long)v[2], kr, (unsigned long long)v[0], (unsigned long long)v[1]);
+		const bool isDeny = action == rdna4native::g4::kActAppDeny;
+		const IOReturn kr = isDeny ? amdgpu::n1c_app_deny_verb(argScalar, v) : amdgpu::n1c_app_verb(argScalar, v);
+		RDNA4LOG("accel-experiment: %s op %llu -> kr %#x code %llu entries %llu", isDeny ? "appdeny" : "appallow", (unsigned long long)v[2], kr, (unsigned long long)v[0], (unsigned long long)v[1]);
 		if (outExtra)
 			for (unsigned i = 0; i < rdna4native::g4::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;

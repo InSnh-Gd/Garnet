@@ -19,8 +19,9 @@
 #define RDNA4A_OP_SHIFT   60u
 #define RDNA4A_OP_ADD     1u       /* accel 104: arg = (1 << 60) | key */
 #define RDNA4A_OP_REMOVE  2u       /* arg = (2 << 60) | key */
-#define RDNA4A_OP_LIST    3u       /* arg = (3 << 60) | page (0..3); nine entries per page */
+#define RDNA4A_OP_LIST    3u       /* arg = (3 << 60) | page (0..3 allow, 0..7 deny); nine entries per page */
 #define RDNA4A_OP_STRIKES 4u       /* 0.0.641: arg = (4 << 60) | 0; the per-name strike table (automatic recoveries blamed on an APP session), four (key, count) pairs */
+#define RDNA4A_OP_CLEAR   5u       /* action 110 (appdeny): arg = (5 << 60) | 0; clear every entry on the denylist */
 
 static inline uint64_t rdna4a_comm_key(const char *comm) {
     uint64_t h = 0xcbf29ce484222325ull;

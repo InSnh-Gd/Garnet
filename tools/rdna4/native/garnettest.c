@@ -1593,6 +1593,44 @@ static int cmd_disp2(const char *a1, const char *a2) {
     return r.status == RDNA4D2_OK ? 0 : 3;
 }
 
+static int appdeny_parse_args(const char *arg, const char *arg2, const char *arg3, uint64_t *argOut, int *warnLongOut) {
+    const int isClear = arg && !strcmp(arg, "clear");
+    const int isList = arg && !strcmp(arg, "list");
+    const int isAdd = arg && !strcmp(arg, "add"), isRem = arg && !strcmp(arg, "remove");
+    uint64_t pg = 0;
+    if (warnLongOut) *warnLongOut = 0;
+    if (isList && arg2) {
+        char *end = NULL;
+        pg = strtoull(arg2, &end, 0);
+        if (!arg2[0] || !end || *end != 0 || pg >= 8ull) {
+            fprintf(stderr, "accel appdeny: invalid page \"%s\" (expected 0..7)\n", arg2);
+            return 0;
+        }
+    }
+    if ((!isClear && !isList && !isAdd && !isRem) || ((isClear || isList) && arg3) || (isClear && arg2)) {
+        fprintf(stderr, "accel appdeny: usage: appdeny add <name> | remove <name> | list [page 0..7] | clear\n");
+        return 0;
+    }
+    if (isAdd || isRem) {
+        size_t len = arg2 ? strlen(arg2) : 0;
+        int bad = (!arg2 || len == 0 || len > 255);
+        for (size_t i = 0; !bad && i < len; i++) {
+            const unsigned char ch = (unsigned char)arg2[i];
+            if (ch < 0x20u || ch == 0x7fu || ch == '\n' || ch == '\r') bad = 1;
+        }
+        if (bad || arg3) {
+            fprintf(stderr, "accel appdeny: name must be 1..255 printable bytes with no control/newline characters\n");
+            return 0;
+        }
+        if (warnLongOut && len > RDNA4A_COMM_MAX) *warnLongOut = 1;
+    }
+    if (argOut) {
+        const uint32_t op = isClear ? RDNA4A_OP_CLEAR : isList ? RDNA4A_OP_LIST : (isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE);
+        *argOut = rdna4a_arg(op, isClear ? 0ull : isList ? pg : rdna4a_comm_key(arg2));
+    }
+    return 1;
+}
+
 static int cmd_accel(const char *what, const char *arg, const char *arg2, const char *arg3) {
     // 0 = status, 1 = fire, 2 = re-drive AMDHardware::setMemoryAllocationsEnabled(true)
     // so the 68 MiB page-table VRAM allocation it makes can be traced; see
@@ -1917,6 +1955,8 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "vramstat")) in = 108;
     // 109 - enable-rdna4-16g-bar Task 4.1: `bartest [0|1]` - direct CPU BAR0 <-> GPU (SDMA0 QUEUE0) bidirectional test (0 = 4/8/12 GiB + top valid in full BAR mode; 1 = top valid point of current BAR).
     else if (what && !strcmp(what, "bartest")) in = 109;
+    // 110 - prepare-release-multi26x-driver Task 3.1/3.2: `appdeny add <name>|remove <name>|list [page 0..7]|clear`, kernel 64-slot denylist overriding garnet-apps-all=1.
+    else if (what && !strcmp(what, "appdeny")) in = 110;
     // 51 — 0.0.239, `shadercache [1|2|3]` (milestone 3 step 2, an earlier analysis).
     // Arms the hash-keyed substitution of gfx1201 code for Apple's GFX10 shaders at
     // the residency copy: kernsub's seam, with kernsub's one hard-coded kernel at one
@@ -1992,10 +2032,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         fprintf(stderr, "accel: unknown verb \"%s\"\n", what);
         fprintf(stderr, "  known: status fire memenable synctables enablerings "
                         "startengines ringstate dumpring programqueue ringhooks "
-                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload ddcread dmubring dispcensus region4read region4dump dmubsend dmubmode dmubctx disp2 hangtest hangrecover hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest\n");
+                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload ddcread dmubring dispcensus region4read region4dump dmubsend dmubmode dmubctx disp2 hangtest hangrecover hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\n");
         return 2;
     }
-    const char *verb = in == 109 ? "bartest" : in == 108 ? "vramstat" : in == 107 ? "m6xstat" : in == 106 ? "m6stat" : in == 105 ? "fbpublish" : in == 104 ? "appallow" : in == 103 ? "sessstat" : in == 99 ? "scdcread" : in == 102 ? "hangstat" : in == 101 ? "hangrecover" : in == 100 ? "hangtest" : in == 98 ? "disp2" : in == 97 ? "dmubctx" : in == 96 ? "dmubmode" : in == 95 ? "dmubsend" : in == 94 ? "region4read" : in == 93 ? "dispcensus" : in == 92 ? "dmubring" : in == 91 ? "ddcread" : in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
+    const char *verb = in == 110 ? "appdeny" : in == 109 ? "bartest" : in == 108 ? "vramstat" : in == 107 ? "m6xstat" : in == 106 ? "m6stat" : in == 105 ? "fbpublish" : in == 104 ? "appallow" : in == 103 ? "sessstat" : in == 99 ? "scdcread" : in == 102 ? "hangstat" : in == 101 ? "hangrecover" : in == 100 ? "hangtest" : in == 98 ? "disp2" : in == 97 ? "dmubctx" : in == 96 ? "dmubmode" : in == 95 ? "dmubsend" : in == 94 ? "region4read" : in == 93 ? "dispcensus" : in == 92 ? "dmubring" : in == 91 ? "ddcread" : in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
                      : in == 39 ? "sdmastate" : in == 38 ? "sdmamap"
                      : in == 37 ? "gfxstate" : in == 36 ? "gfxmap"
                      : in == 35 ? "kiqchan" : in == 34 ? "kiqstamp" : in == 33 ? "kiqenable" : in == 32 ? "setvspace" : in == 31 ? "pm4powerup" : in == 30 ? "resume" : in == 29 ? "srbmprobe" : in == 28 ? "xlatregs" : in == 27 ? "runadvance" : in == 26 ? "runcheckts" : in == 25 ? "stampgap" : in == 24 ? "signalstamp" : in == 23 ? "stampstate" : in == 22 ? "schedstate" : in == 21 ? "bindchannel" : in == 20 ? "signalcompletion" : in == 19 ? "pokecompletion" : in == 18 ? "chanstate" : in == 17 ? "neuterpoll" : in == 16 ? "opengate" : in == 15 ? "queuestate" : in == 14 ? "ringrefs" : in == 13 ? "kickdoorbell" : in == 12 ? "enablequeue" : in == 11 ? "rebaseib" : in == 10 ? "dumpib" : in == 9 ? "ringhooks" : in == 8 ? "programqueue" : in == 7 ? "dumpring" : in == 6 ? "ringstate" : in == 5 ? "startengines" : in == 4 ? "enablerings" : in == 3 ? "synctables"
@@ -2049,6 +2089,15 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         }
         in2[1] = isStrikes ? rdna4a_arg(RDNA4A_OP_STRIKES, 0) : isList ? rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0) : rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2));
         if (!isList && !isStrikes) printf("accel appallow: name \"%.16s\" -> key %#llx\n", arg2, (unsigned long long)rdna4a_comm_key(arg2));
+    }
+    if (in == 110) {   // action 110 (G4): `appdeny add <name>|remove <name>|list [page 0..7]|clear` -> (op << 60) | key / page
+        int warnLong = 0;
+        if (!appdeny_parse_args(arg, arg2, arg3, &in2[1], &warnLong)) return 2;
+        if (warnLong)
+            fprintf(stderr, "accel appdeny: note: \"%s\" (%zu chars) exceeds p_comm (%u); kernel matches first %u chars (use GarnetMetal bundle: for exact long IDs)\n",
+                    arg2, strlen(arg2), RDNA4A_COMM_MAX, RDNA4A_COMM_MAX);
+        if (!strcmp(arg, "add") || !strcmp(arg, "remove"))
+            printf("accel appdeny: name \"%.16s\" -> key %#llx\n", arg2, (unsigned long long)rdna4a_comm_key(arg2));
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRDNA4SelAccelExperiment,
                                                  in2, 2, out, &outCnt);
@@ -2404,6 +2453,18 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         if (c == 0 && out[5] == RDNA4A_OP_LIST) {
             printf("  page                    : keys of slots %llu..%llu (0 = empty slot)\n", (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9, (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9 + 8);
             for (unsigned i = 0; i < 9; i++) printf("    slot %2llu              : %#llx\n", (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9 + i, out[7 + i]);
+        }
+        return c == 0 || c == 4 || c == 5 ? 0 : 3;
+    }
+    if (in == 110) {
+        static const char *cn[] = { "ok", "OFF: boot-arg garnet-apps or garnet-multisession is not 1", "bad argument", "FULL (64 entries)", "already on the denylist", "not on the denylist" };
+        const unsigned long long c = out[3];
+        printf("  code                    : %llu (%s)\n", c, c <= 5 ? cn[c] : "?");
+        printf("  entries on the denylist : %llu of %llu\n", out[4], out[6]);
+        if (c == 0 && out[5] == RDNA4A_OP_LIST) {
+            const unsigned long long pg = arg2 ? strtoull(arg2, NULL, 0) : 0;
+            printf("  page                    : keys of slots %llu..%llu (0 = empty slot)\n", pg * 9, pg * 9 + 8);
+            for (unsigned i = 0; i < 9; i++) printf("    slot %2llu              : %#llx\n", pg * 9 + i, out[7 + i]);
         }
         return c == 0 || c == 4 || c == 5 ? 0 : 3;
     }
@@ -3641,7 +3702,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]|ddcread <line 2|3> <block 0..3>|dmubring [0|1..25|0x80]|dispcensus [0|1|2..9]|region4read <off> [1..64]|region4dump|dmubsend detect <ctx>/begin/end/setmode <ctx>/enable <ctx>/disable <0x7000|0x7800>/replay <slot_off>/pclk otg3-on|otg3-off|otg1-on|otg1-off/phyc enable|disable/digc setup|dmubmode save/restore/0x1a6/0x1d4|dmubctx <ctx> status <v>|disp2 [timing|timing1440|connect|off|status [1|2]|plane|show|flipA|flipB|crc|planeoff 2]|hangtest [1]|hangrecover <0..4>|hangstat [0..8]|sessstat [0..9]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|bartest [0|1]|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
+        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]|ddcread <line 2|3> <block 0..3>|dmubring [0|1..25|0x80]|dispcensus [0|1|2..9]|region4read <off> [1..64]|region4dump|dmubsend detect <ctx>/begin/end/setmode <ctx>/enable <ctx>/disable <0x7000|0x7800>/replay <slot_off>/pclk otg3-on|otg3-off|otg1-on|otg1-off/phyc enable|disable/digc setup|dmubmode save/restore/0x1a6/0x1d4|dmubctx <ctx> status <v>|disp2 [timing|timing1440|connect|off|status [1|2]|plane|show|flipA|flipB|crc|planeoff 2]|hangtest [1]|hangrecover <0..4>|hangstat [0..8]|sessstat [0..9]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
         return 2;
     }
     if (!strcmp(argv[1], "accel") && argc > 2 && !strcmp(argv[2], "bartest")) {
@@ -3650,6 +3711,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: accel bartest [0|1]\n");
             return 2;
         }
+    }
+    if (!strcmp(argv[1], "accel") && argc > 2 && !strcmp(argv[2], "appdeny")) {
+        if (argc > 6 || !appdeny_parse_args(argc > 3 ? argv[3] : NULL, argc > 4 ? argv[4] : NULL, argc > 5 ? argv[5] : NULL, NULL, NULL))
+            return 2;
     }
     if (open_service() < 0) return 1;
     int rc = 2;

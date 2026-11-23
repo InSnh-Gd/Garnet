@@ -41,64 +41,83 @@ constexpr bool latch_is_on(uint32_t latch) { return latch == kLatchOn; }
 // The APP role exists only with BOTH latches: the G2 session array is what gives an app its own VMID.
 constexpr bool apps_enabled(bool appsLatchOn, bool multiLatchOn) { return appsLatchOn && multiLatchOn; }
 
-// ---- the allow-list (accel action 104 `appallow`) -------------------------------------------------------------------------------------------------------
-// kMaxEntries slots of 60-bit keys (RDNA4AppKey.h); 0 = an empty slot. The kernel's list is a static array (zero at every boot, never persisted). Lock-free: add claims an
-// empty slot with a compare-and-swap, remove clears every slot holding the key (a racing double add is harmless), contains / list only load.
+// ---- the allow-list (accel action 104 `appallow`) & denylist (accel action 110 `appdeny`) ---------------------------------------------------------------
+// kMaxEntries / kMaxDenyEntries slots of 60-bit keys (GarnetAppKey.h); 0 = an empty slot. Static arrays (zero at boot, reloaded at activation).
+// Lock-free: add claims an empty slot with a compare-and-swap (lowest-slot settle), remove clears every slot holding the key, contains / list only load.
 constexpr uint32_t kMaxEntries = 32u;
 constexpr uint32_t kListPerPage = 9u;    // outputs o[4..12]
 constexpr uint32_t kListPages = (kMaxEntries + kListPerPage - 1u) / kListPerPage;   // 4
 static_assert(kListPages == 4u && kListPages * kListPerPage >= kMaxEntries, "four pages of nine hold the 32 entries");
+constexpr uint32_t kMaxDenyEntries = 64u;
+constexpr uint32_t kDenyListPages = (kMaxDenyEntries + kListPerPage - 1u) / kListPerPage;   // 8
+static_assert(kDenyListPages == 8u && kDenyListPages * kListPerPage >= kMaxDenyEntries, "eight pages of nine hold the 64 deny entries");
 
-inline bool al_contains(const uint64_t *l, uint64_t key) {
+inline bool list_contains(const uint64_t *l, uint32_t cap, uint64_t key) {
     if (key == 0ull) return false;
-    for (uint32_t i = 0; i < kMaxEntries; i++) if (__atomic_load_n(&l[i], __ATOMIC_ACQUIRE) == key) return true;
+    for (uint32_t i = 0; i < cap; i++) if (__atomic_load_n(&l[i], __ATOMIC_ACQUIRE) == key) return true;
     return false;
 }
-inline uint32_t al_count(const uint64_t *l) {
+inline uint32_t list_count(const uint64_t *l, uint32_t cap) {
     uint32_t n = 0;
-    for (uint32_t i = 0; i < kMaxEntries; i++) if (__atomic_load_n(&l[i], __ATOMIC_ACQUIRE) != 0ull) n++;
+    for (uint32_t i = 0; i < cap; i++) if (__atomic_load_n(&l[i], __ATOMIC_ACQUIRE) != 0ull) n++;
     return n;
 }
 enum AllowCode : uint32_t { kAllowOk = 0u, kAllowOff = 1u, kAllowBadArg = 2u, kAllowFull = 3u, kAllowExists = 4u, kAllowNotFound = 5u };
 // The two hooks (test seams, a no-op in the kernel) run where a second adder can interleave: hook(0) after the contains check and before the claim, hook(1) after the claim and before the settle.
 template <class Hook>
-inline uint32_t al_add_h(uint64_t *l, uint64_t key, Hook &&hook) {
+inline uint32_t list_add_h(uint64_t *l, uint32_t cap, uint64_t key, Hook &&hook) {
     if (key == 0ull || (key & ~RDNA4A_KEY_MASK) != 0ull) return kAllowBadArg;
-    if (al_contains(l, key)) return kAllowExists;
+    if (list_contains(l, cap, key)) return kAllowExists;
     // 0.0.642: a slot is claimed with ONE compare-and-swap 0 -> key, so two adders can never write the same slot; a slot that another adder just filled with the SAME key means the key
     // is present (success). Two adders of the same key may still claim two different slots (both passed the contains check): the LOWEST slot wins, every adder settles it after its
     // claim (it retreats from its own slot when a lower slot holds the key, and clears any higher duplicate), so a duplicate never keeps a spare slot and never starves a distinct key.
     // A full scan is retried a few times: the duplicates it saw may be about to retreat.
     hook(0u);
     for (uint32_t attempt = 0; attempt < 4u; attempt++) {
-        for (uint32_t i = 0; i < kMaxEntries; i++) {
+        for (uint32_t i = 0; i < cap; i++) {
             uint64_t e = 0ull;
             if (!__atomic_compare_exchange_n(&l[i], &e, key, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 if (e == key) return kAllowExists;   // another adder of the same key got this slot: the key is present
                 continue;
             }
             hook(1u);
-            for (uint32_t j = 0; j < kMaxEntries; j++) {
+            for (uint32_t j = 0; j < cap; j++) {
                 if (j == i || __atomic_load_n(&l[j], __ATOMIC_ACQUIRE) != key) continue;
                 if (j < i) { uint64_t k2 = key; __atomic_compare_exchange_n(&l[i], &k2, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); return kAllowExists; }
                 uint64_t k3 = key; __atomic_compare_exchange_n(&l[j], &k3, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
             }
             return kAllowOk;
         }
-        if (al_contains(l, key)) return kAllowExists;
+        if (list_contains(l, cap, key)) return kAllowExists;
     }
     return kAllowFull;
 }
-inline uint32_t al_add(uint64_t *l, uint64_t key) { return al_add_h(l, key, [](uint32_t) {}); }
-inline uint32_t al_remove(uint64_t *l, uint64_t key) {
+inline uint32_t list_remove(uint64_t *l, uint32_t cap, uint64_t key) {
     if (key == 0ull || (key & ~RDNA4A_KEY_MASK) != 0ull) return kAllowBadArg;
     bool hit = false;
-    for (uint32_t i = 0; i < kMaxEntries; i++) {
+    for (uint32_t i = 0; i < cap; i++) {
         uint64_t e = key;
         if (__atomic_compare_exchange_n(&l[i], &e, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) hit = true;
     }
     return hit ? kAllowOk : kAllowNotFound;
 }
+inline uint32_t list_clear(uint64_t *l, uint32_t cap) {
+    for (uint32_t i = 0; i < cap; i++) (void)__atomic_exchange_n(&l[i], 0ull, __ATOMIC_ACQ_REL);
+    return kAllowOk;
+}
+inline bool al_contains(const uint64_t *l, uint64_t key) { return list_contains(l, kMaxEntries, key); }
+inline uint32_t al_count(const uint64_t *l) { return list_count(l, kMaxEntries); }
+template <class Hook>
+inline uint32_t al_add_h(uint64_t *l, uint64_t key, Hook &&hook) { return list_add_h(l, kMaxEntries, key, hook); }
+inline uint32_t al_add(uint64_t *l, uint64_t key) { return al_add_h(l, key, [](uint32_t) {}); }
+inline uint32_t al_remove(uint64_t *l, uint64_t key) { return list_remove(l, kMaxEntries, key); }
+inline bool dl_contains(const uint64_t *l, uint64_t key) { return list_contains(l, kMaxDenyEntries, key); }
+inline uint32_t dl_count(const uint64_t *l) { return list_count(l, kMaxDenyEntries); }
+template <class Hook>
+inline uint32_t dl_add_h(uint64_t *l, uint64_t key, Hook &&hook) { return list_add_h(l, kMaxDenyEntries, key, hook); }
+inline uint32_t dl_add(uint64_t *l, uint64_t key) { return dl_add_h(l, key, [](uint32_t) {}); }
+inline uint32_t dl_remove(uint64_t *l, uint64_t key) { return list_remove(l, kMaxDenyEntries, key); }
+inline uint32_t dl_clear(uint64_t *l) { return list_clear(l, kMaxDenyEntries); }
 
 // ---- 0.0.641: the strike table --------------------------------------------------------------------------------------------------------------------------
 // Per executable name (the allow-list key): how many automatic recoveries (G2) were blamed on an APP session of that name this boot. At kStrikeLimit the name is refused at open
@@ -123,46 +142,58 @@ inline uint32_t strike_add(StrikeTab &t, uint64_t key) {
     return kStrikeLimit;
 }
 constexpr bool strike_refused(uint32_t count) { return count >= kStrikeLimit; }
-// Called only with the APP role enabled. The extra opt-in bypasses the list, never the strike limit.
-constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false) { return (onAllowList || appsAll) && !strike_refused(strikes); }
+// Called only with the APP role enabled. The denylist overrides both allow-list and apps-all; strikes always still apply.
+constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false, bool onDenyList = false) { return !onDenyList && (onAllowList || appsAll) && !strike_refused(strikes); }
 
-// ---- the verb ---------------------------------------------------------------------------------------------------------------------------------------------
+// ---- the verbs (104 appallow, 110 appdeny) -----------------------------------------------------------------------------------------------------------------
 constexpr uint32_t kActAppAllow = 104u;
-constexpr bool is_g4_action(uint32_t a) { return a == kActAppAllow; }
+constexpr uint32_t kActAppDeny = 110u;
+constexpr bool is_g4_action(uint32_t a) { return a == kActAppAllow || a == kActAppDeny; }
 constexpr bool action_admitted(bool appsEnabled, uint32_t a) { return appsEnabled && is_g4_action(a); }
 constexpr uint32_t arg_op(uint64_t arg) { return (uint32_t)(arg >> RDNA4A_OP_SHIFT); }
 constexpr uint64_t arg_payload(uint64_t arg) { return arg & RDNA4A_KEY_MASK; }
 constexpr bool args_ok(uint32_t a, uint64_t arg) {
-    return a == kActAppAllow && ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull
+    return a == kActAppAllow ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull
                                                                                                  : arg_op(arg) == RDNA4A_OP_STRIKES ? arg_payload(arg) == 0ull   // 0.0.641
-                                                                                                 : (arg_op(arg) == RDNA4A_OP_LIST && arg_payload(arg) < (uint64_t)kListPages));
+                                                                                                 : (arg_op(arg) == RDNA4A_OP_LIST && arg_payload(arg) < (uint64_t)kListPages))
+         : a == kActAppDeny  ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull
+                                                                                                 : arg_op(arg) == RDNA4A_OP_CLEAR ? arg_payload(arg) == 0ull
+                                                                                                 : (arg_op(arg) == RDNA4A_OP_LIST && arg_payload(arg) < (uint64_t)kDenyListPages))
+         : false;
 }
 constexpr bool native_exempt(bool appsEnabled, uint32_t a, uint64_t arg) { return action_admitted(appsEnabled, a) && args_ok(a, arg); }
 constexpr uint32_t kOutN = 13u;
-// Runs one `appallow` call against list l and fills o[0..12]: o[0] = AllowCode, o[1] = entries after the call, o[2] = the operation, o[3] = max entries (32).
-// add / remove: o[4] = the key. list: o[4..12] = the entries of that page (the slot order; 0 = empty slot). strikes (0.0.641): o[4 + 2i] / o[5 + 2i] = key / strikes of table slot i, o[12] = the limit.
-inline uint32_t verb_run(bool appsEnabled, uint64_t *l, uint64_t arg, uint64_t *o, const StrikeTab *st = nullptr) {
+// Shared executor for appallow (104, 32 slots) and appdeny (110, 64 slots):
+// o[0] = AllowCode, o[1] = entries after, o[2] = op, o[3] = cap, o[4..12] = key / page slots / strike table.
+inline uint32_t list_verb_run(uint32_t action, bool appsEnabled, uint64_t *l, uint32_t cap, uint64_t arg, uint64_t *o, const StrikeTab *st = nullptr) {
     for (uint32_t i = 0; i < kOutN; i++) o[i] = 0ull;
-    o[3] = kMaxEntries;
+    o[3] = cap;
     if (!appsEnabled) { o[0] = kAllowOff; return kAllowOff; }
-    if (!args_ok(kActAppAllow, arg)) { o[0] = kAllowBadArg; return kAllowBadArg; }
+    if (!args_ok(action, arg)) { o[0] = kAllowBadArg; return kAllowBadArg; }
     const uint32_t op = arg_op(arg);
     const uint64_t pl = arg_payload(arg);
     uint32_t rc = kAllowOk;
     o[2] = op;
-    if (op == RDNA4A_OP_ADD) { rc = al_add(l, pl); o[4] = pl; }
-    else if (op == RDNA4A_OP_REMOVE) { rc = al_remove(l, pl); o[4] = pl; }
+    if (op == RDNA4A_OP_ADD) { rc = list_add_h(l, cap, pl, [](uint32_t) {}); o[4] = pl; }
+    else if (op == RDNA4A_OP_REMOVE) { rc = list_remove(l, cap, pl); o[4] = pl; }
+    else if (op == RDNA4A_OP_CLEAR) { rc = list_clear(l, cap); }
     else if (op == RDNA4A_OP_STRIKES) {   // 0.0.641: o[4 + 2i] = the key, o[5 + 2i] = its strikes (slot order, 0 = empty slot); o[12] = the limit
         for (uint32_t i = 0; i < kStrikeSlots && st != nullptr; i++) { o[4 + 2 * i] = __atomic_load_n(&st->key[i], __ATOMIC_ACQUIRE); o[5 + 2 * i] = st->key[i] != 0ull ? __atomic_load_n(&st->n[i], __ATOMIC_ACQUIRE) : 0ull; }
         o[12] = kStrikeLimit;
     } else {
         for (uint32_t i = 0; i < kListPerPage; i++) {
             const uint32_t idx = (uint32_t)pl * kListPerPage + i;
-            o[4 + i] = idx < kMaxEntries ? __atomic_load_n(&l[idx], __ATOMIC_ACQUIRE) : 0ull;
+            o[4 + i] = idx < cap ? __atomic_load_n(&l[idx], __ATOMIC_ACQUIRE) : 0ull;
         }
     }
-    o[0] = rc; o[1] = al_count(l);
+    o[0] = rc; o[1] = list_count(l, cap);
     return rc;
+}
+inline uint32_t verb_run(bool appsEnabled, uint64_t *l, uint64_t arg, uint64_t *o, const StrikeTab *st = nullptr) {
+    return list_verb_run(kActAppAllow, appsEnabled, l, kMaxEntries, arg, o, st);
+}
+inline uint32_t deny_verb_run(bool appsEnabled, uint64_t *l, uint64_t arg, uint64_t *o) {
+    return list_verb_run(kActAppDeny, appsEnabled, l, kMaxDenyEntries, arg, o, nullptr);
 }
 
 // ---- the budget report (QueryInfo, ABI 1.10) ----------------------------------------------------------------------------------------------------------------

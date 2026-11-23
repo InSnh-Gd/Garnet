@@ -103,25 +103,25 @@ plant 26 $B '		if (!rdna4native::g4::native_exempt(amdgpu::n1c_apps_enabled(), a
 plant 27 $U '	if (rdna4native::g4::action_admitted(amdgpu::n1c_apps_enabled(), action)) {' '	if (rdna4native::g4::is_g4_action(action)) {' "SWITCH 27: the user client lets 104 past the old bound with the role disabled"
 plant 28 $P 'constexpr bool action_admitted(bool appsEnabled, uint32_t a) { return appsEnabled && is_g4_action(a); }' 'constexpr bool action_admitted(bool appsEnabled, uint32_t a) { (void)appsEnabled; return is_g4_action(a); }' "SWITCH 28 (pure): action 104 exists without the role"
 # ---- the allow-list ----
-plant 29 $P '    if (al_contains(l, key)) return kAllowExists;
+plant 29 $P '    if (list_contains(l, cap, key)) return kAllowExists;
     // 0.0.642: a slot is claimed' '    // 0.0.642: a slot is claimed' "LIST 29: add does not notice a duplicate"
 plant 30 $P '    return kAllowFull;
 }
-inline uint32_t al_add(' '    return kAllowOk;
+inline uint32_t list_remove(' '    return kAllowOk;
 }
-inline uint32_t al_add(' "LIST 30: a full list pretends the add worked"
+inline uint32_t list_remove(' "LIST 30: a full list pretends the add worked"
 plant 31 $P '        if (__atomic_compare_exchange_n(&l[i], &e, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) hit = true;' '        if (__atomic_compare_exchange_n(&l[i], &e, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { hit = true; break; }' "LIST 31: remove clears only the first matching slot"
 plant 32 $P '    if (!appsEnabled) { o[0] = kAllowOff; return kAllowOff; }' '    (void)appsEnabled;' "LIST 32: the verb works with the role disabled"
-plant 33 $P '    return a == kActAppAllow && ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull' '    return a == kActAppAllow && ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? true' "LIST 33: a zero key is a legal argument"
+plant 33 $P '    return a == kActAppAllow ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull' '    return a == kActAppAllow ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? true' "LIST 33: a zero key is a legal argument"
 plant 34 $P 'static_assert(kListPages == 4u' 'static_assert(kListPages == 3u' "LIST 34: the page count is wrong (compile)"
 plant 35 $P 'constexpr uint32_t kMaxEntries = 32u;' 'constexpr uint32_t kMaxEntries = 64u;' "LIST 35: the list holds 64 entries (brief: max 32)"
 plant 36 $P '    if (key == 0ull || (key & ~RDNA4A_KEY_MASK) != 0ull) return kAllowBadArg;
-    if (al_contains' '    if (key == 0ull) return kAllowBadArg;
-    if (al_contains' "LIST 36: add accepts a key wider than 60 bits"
+    if (list_contains' '    if (key == 0ull) return kAllowBadArg;
+    if (list_contains' "LIST 36: add accepts a key wider than 60 bits"
 plant 37 $KEY '    for (unsigned i = 0; i < RDNA4A_COMM_MAX && comm[i] != 0; i++)' '    for (unsigned i = 0; i < 32u && comm[i] != 0; i++)' "KEY 37: the name key covers 32 characters (p_comm has 16)"
 plant 38 $KEY '#define RDNA4A_KEY_BITS   60u' '#define RDNA4A_KEY_BITS   61u' "KEY 38: the key is 61 bits (collides with the operation nibble)"
 plant 39 $KEY '    return h != 0ull ? h : 1ull;   /* 0 is the empty slot */' '    return h;' "KEY 39: the key can be 0 (the empty slot)"
-plant 40 $C 'rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2))' 'rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg))' "KEY 40: the CLI hashes the wrong token"
+plant 40 $C 'isList ? rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0) : rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2))' 'isList ? rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0) : rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg))' "KEY 40: the CLI hashes the wrong token"
 # ---- the budget report ----
 plant 41 $P '    if (!multi || isWs) return r;' '    (void)isWs; if (!multi) return r;' "BUDGET 41 (pure): WindowServer's session is told it has a budget"
 plant 42 $G2 '    return room < poolFree ? room : poolFree;' '    (void)poolFree; return room;' "BUDGET 42 (pure): the pool's free bytes do not bound the available budget"
@@ -198,9 +198,9 @@ plant 96 $N 'rdna4native::g2::ws_already_open(appsOn, amdgpu::n1c_is_open(), amd
 plant 97 $O 'constexpr uint32_t kWindowServerUid = 88u;' 'constexpr uint32_t kWindowServerUid = 89u;' "SLOT 97: the WindowServer identity rule changed"
 # item 6: the strike count
 plant 98 $P 'constexpr bool strike_refused(uint32_t count) { return count >= kStrikeLimit; }' 'constexpr bool strike_refused(uint32_t count) { return count > kStrikeLimit; }' "STRIKE 98 (pure): a name is refused only at the fourth strike"
-plant 99 $P 'constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false) { return (onAllowList || appsAll) && !strike_refused(strikes); }' 'constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false) { (void)strikes; return onAllowList || appsAll; }' "STRIKE 99 (pure): strikes never refuse an open"
+plant 99 $P 'constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false, bool onDenyList = false) { return !onDenyList && (onAllowList || appsAll) && !strike_refused(strikes); }' 'constexpr bool app_admit(bool onAllowList, uint32_t strikes, bool appsAll = false, bool onDenyList = false) { (void)strikes; return !onDenyList && (onAllowList || appsAll); }' "STRIKE 99 (pure): strikes never refuse an open"
 plant 100 $E '    if (act == kStallRecover && __atomic_load_n(&gs->app, __ATOMIC_ACQUIRE)) {' '    if (false && __atomic_load_n(&gs->app, __ATOMIC_ACQUIRE)) {' "STRIKE 100 (kernel): an automatic recovery blamed on an APP session adds no strike"
-plant 101 $E '    return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all);' '    return listed || all;' "STRIKE 101 (kernel): the open path ignores the strike table"
+plant 101 $E '    return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all, denied);' '    (void)denied; return listed || all;' "STRIKE 101 (kernel): the open path ignores the strike table"
 plant 102 $E '    s->appKey = key;' '    (void)key;' "STRIKE 102 (kernel): an APP session never records its name key (every strike lands on key 0)"
 plant 103 $E 'const uint32_t rc = verb_run(apps_on(), gAppAllow, arg, o, &gStrikes);' 'const uint32_t rc = verb_run(apps_on(), gAppAllow, arg, o, nullptr);' "STRIKE 103 (kernel): the verb cannot show the strike table"
 plant 104 $P '        if (__atomic_load_n(&t.key[i], __ATOMIC_ACQUIRE) == key || __atomic_compare_exchange_n(&t.key[i], &e, key, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || e == key)
@@ -215,5 +215,17 @@ plant 107 $P '            if (!__atomic_compare_exchange_n(&l[i], &e, key, false
 plant 108 $P '                if (j < i) { uint64_t k2 = key; __atomic_compare_exchange_n(&l[i], &k2, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); return kAllowExists; }' '                if (j < i) { return kAllowExists; }' "ALLOW 108 (pure): the higher adder keeps its duplicate slot (no lowest-slot settle)"
 plant 109 $P '                uint64_t k3 = key; __atomic_compare_exchange_n(&l[j], &k3, 0ull, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);' '                (void)j;' "ALLOW 109 (pure): the lower adder leaves the higher duplicate in place"
 plant 110 $P 'constexpr bool appvis_active(bool appsOn, bool fullBar) { return appsOn && !fullBar; }' 'constexpr bool appvis_active(bool appsOn, bool fullBar) { (void)fullBar; return appsOn; }' "VIS 110 (pure): visible-pool sub-cap ignores full-BAR aperture"
+plant 111 $P 'return !onDenyList && (onAllowList || appsAll) && !strike_refused(strikes);' '(void)onDenyList; return (onAllowList || appsAll) && !strike_refused(strikes);' "DENY 111 (pure): onDenyList never refuses an open"
+plant 112 $P 'constexpr uint32_t kMaxDenyEntries = 64u;' 'constexpr uint32_t kMaxDenyEntries = 32u;' "DENY 112 (pure): denylist cap shrinks to 32"
+plant 113 $P 'inline uint32_t list_clear(uint64_t *l, uint32_t cap) {
+    for (uint32_t i = 0; i < cap; i++) (void)__atomic_exchange_n(&l[i], 0ull, __ATOMIC_ACQ_REL);
+    return kAllowOk;
+}' 'inline uint32_t list_clear(uint64_t *l, uint32_t cap) {
+    (void)l; (void)cap;
+    return kAllowOk;
+}' "DENY 113 (pure): clear leaves stale denylist entries active"
+plant 114 $P ': a == kActAppDeny  ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? arg_payload(arg) != 0ull' ': a == kActAppDeny  ? ((arg_op(arg) == RDNA4A_OP_ADD || arg_op(arg) == RDNA4A_OP_REMOVE) ? true' "DENY 114 (pure): appdeny accepts zero key"
+plant 115 $E 'const bool denied = rdna4native::g4::dl_contains(gAppDeny, key);' 'const bool denied = false;' "DENY 115 (kernel): n1c_app_allowed ignores gAppDeny"
+plant 116 $B 'const IOReturn kr = isDeny ? amdgpu::n1c_app_deny_verb(argScalar, v) : amdgpu::n1c_app_verb(argScalar, v);' 'const IOReturn kr = ((void)isDeny, amdgpu::n1c_app_verb(argScalar, v));' "DENY 116 (kernel): action 110 routes to appallow instead of appdeny"
 echo "native_g4_plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"
 [ $escaped -eq 0 ]

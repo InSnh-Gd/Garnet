@@ -195,6 +195,7 @@ static volatile UInt32 gHostPhysLatch;    // 0 = unread, 1 = latched (idempotent
 static uint64_t gFaultPrev;               // 0.0.629 (R5): the fault word at the previous global-page read (0 before the first); written only by n1c_g2_stat, under gCliLock
 // 0.0.640 (G4) state.
 static uint64_t gAppAllow[rdna4native::g4::kMaxEntries];   // the APP allow-list (RDNA4AppKey.h keys, 0 = empty slot); static = zero at every boot, never persisted; lock-free (CAS)
+static uint64_t gAppDeny[rdna4native::g4::kMaxDenyEntries];   // persistent-reloaded APP denylist (GarnetAppKey.h keys, 0 = empty slot); overrides apps-all and allowlist
 static uint64_t gMappedLeakBytes;         // visible-VRAM bytes leaked at a session close because a CPU mapping outlived it (switch ON), under gCliLock; they stay counted in gVramOthers
 static uint32_t gMappedLeakBos;           // ... and how many BOs
 static uint64_t gVisOthers;               // 0.0.641 (G4 review): VISIBLE-pool bytes held by non-WindowServer sessions (apps ON), under gCliLock; leaked bytes stay counted. Cap: appvis_cap()
@@ -2366,9 +2367,10 @@ bool n1c_app_allowed(const char *comm, bool *struckOut) {
     if (!apps_on()) return false;
     const uint64_t key = rdna4a_comm_key(comm);
     const bool listed = rdna4native::g4::al_contains(gAppAllow, key);
+    const bool denied = rdna4native::g4::dl_contains(gAppDeny, key);
     const bool all = apps_all_on();
-    *struckOut = (listed || all) && rdna4native::g4::strike_refused(rdna4native::g4::strike_count(gStrikes, key));
-    return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all);
+    *struckOut = !denied && (listed || all) && rdna4native::g4::strike_refused(rdna4native::g4::strike_count(gStrikes, key));
+    return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all, denied);
 }
 // Mark the session the client was just opened with as an APP. Called by create() right after n1c_open, before the client is returned (so no selector can have run). A stale reference
 // or a disabled role is refused; the client then closes the session again. 0.0.641: `key` = the opener's executable-name key (for the strike count).
@@ -2421,6 +2423,13 @@ IOReturn n1c_app_verb(uint64_t arg, uint64_t *o) {
     using namespace rdna4native::g4;
     const uint32_t rc = verb_run(apps_on(), gAppAllow, arg, o, &gStrikes);
     if (rc == kAllowOk && o[2] != RDNA4A_OP_LIST) N1C_LOG("appallow: %s key %#llx -> %u entr%s on the allow-list", o[2] == RDNA4A_OP_ADD ? "ADDED" : "REMOVED", (unsigned long long)o[4], (unsigned)o[1], o[1] == 1ull ? "y" : "ies");
+    return rc == kAllowOk || rc == kAllowExists || rc == kAllowNotFound ? kIOReturnSuccess : rc == kAllowFull ? kIOReturnNoSpace : rc == kAllowOff ? kIOReturnNotPermitted : kIOReturnBadArgument;
+}
+// accel 110 `appdeny`. Lock-free 64-entry denylist overriding garnet-apps-all=1 and appallow.
+IOReturn n1c_app_deny_verb(uint64_t arg, uint64_t *o) {
+    using namespace rdna4native::g4;
+    const uint32_t rc = deny_verb_run(apps_on(), gAppDeny, arg, o);
+    if (rc == kAllowOk && o[2] != RDNA4A_OP_LIST) N1C_LOG("appdeny: %s key %#llx -> %u entr%s on the denylist", o[2] == RDNA4A_OP_ADD ? "ADDED" : o[2] == RDNA4A_OP_CLEAR ? "CLEARED" : "REMOVED", (unsigned long long)o[4], (unsigned)o[1], o[1] == 1ull ? "y" : "ies");
     return rc == kAllowOk || rc == kAllowExists || rc == kAllowNotFound ? kIOReturnSuccess : rc == kAllowFull ? kIOReturnNoSpace : rc == kAllowOff ? kIOReturnNotPermitted : kIOReturnBadArgument;
 }
 // accel 103 `sessstat <page>`: page 0..7 one session slot, page 8 the global page. Read-only. The caller (accelExperiment) checked the latch and the argument.

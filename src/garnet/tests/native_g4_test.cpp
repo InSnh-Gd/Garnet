@@ -203,9 +203,10 @@ static void t4_allowlist() {
     }
     for (int round = 0; round < 1500; round++) {   // two threads add 20 keys each (10 shared), released together: every distinct key stored exactly once
         std::memset(list, 0, sizeof list);
-        std::atomic<int> go{0};
-        std::thread a([&] { while (!go.load()) {} for (uint64_t k = 1; k <= 20; k++) al_add(list, 500 + k); });
-        std::thread b([&] { while (!go.load()) {} for (uint64_t k = 11; k <= 30; k++) al_add(list, 500 + k); });
+        std::atomic<int> ready{0}, go{0};
+        std::thread a([&] { ready.fetch_add(1); while (!go.load()) {} for (uint64_t k = 1; k <= 20; k++) al_add(list, 500 + k); });
+        std::thread b([&] { ready.fetch_add(1); while (!go.load()) {} for (uint64_t k = 11; k <= 30; k++) al_add(list, 500 + k); });
+        while (ready.load() < 2) {}
         go.store(1); a.join(); b.join();
         bool all = true; for (uint64_t k = 1; k <= 30; k++) if (!al_contains(list, 500 + k)) all = false;
         if (!all || al_count(list) != 30u) { expect(all, "T4: no key was lost"); expect_u("T4: a threaded add stores each distinct key exactly once", al_count(list), 30); break; }
@@ -386,8 +387,8 @@ static void t8_pins(const std::string &root) {
     }
     expect(in_order(fn_body(eng, "IOReturn n1c_read_regs("), { "kCallReadRegs", "regs_allowed(" }) && fn_body(eng, "IOReturn n1c_scan_acquire(").find("kCallScanout") != std::string::npos, "T8: ReadRegs uses its own call class, the scanout calls theirs");
     { const std::string aa = fn_body(eng, "bool n1c_app_allowed(const char *comm, bool *struckOut) {");
-      expect(in_order(aa, { "*struckOut = false;", "if (!apps_on()) return false;", "rdna4native::g4::al_contains(gAppAllow, key)", "const bool all = apps_all_on();", "*struckOut = (listed || all) && rdna4native::g4::strike_refused(rdna4native::g4::strike_count(gStrikes, key));", "return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all);" }),
-             "T8: admission needs both role gates before the opt-in; eligible names report and enforce the strike limit"); }
+      expect(in_order(aa, { "*struckOut = false;", "if (!apps_on()) return false;", "rdna4native::g4::al_contains(gAppAllow, key)", "const bool denied = rdna4native::g4::dl_contains(gAppDeny, key);", "const bool all = apps_all_on();", "*struckOut = !denied && (listed || all) && rdna4native::g4::strike_refused(rdna4native::g4::strike_count(gStrikes, key));", "return rdna4native::g4::app_admit(listed, rdna4native::g4::strike_count(gStrikes, key), all, denied);" }),
+             "T8: admission needs both role gates before the opt-in; denylist overrides allowlist and apps-all; eligible names report and enforce the strike limit"); }
     expect(eng.find("static uint64_t gAppAllow[rdna4native::g4::kMaxEntries];") != std::string::npos, "T8: the list is a static array of kMaxEntries (zero at every boot)");
     expect(slurp(K + "src/GarnetAppKey.h").find("return h != 0ull ? h : 1ull;   /* 0 is the empty slot */") != std::string::npos, "T8: a name key is never 0 (0 is the empty slot)");
     expect(fn_body(eng, "IOReturn n1c_g2_stat(").find("v.ws = s->ws; v.app = s->app;") != std::string::npos && cmd.find("(out[5] & 0x800)") != std::string::npos, "T8: sessstat reports the APP role and rdna4test prints it");
@@ -424,12 +425,12 @@ static void t8_pins(const std::string &root) {
     // the verb (six sites)
     expect(in_order(brg, { "if (rdna4native::g2::is_g2_action(action)) {", "if (rdna4native::g4::is_g4_action(action)) {", "if (!rdna4native::g4::native_exempt(amdgpu::n1c_apps_enabled(), action, argScalar)) return kIOReturnBadArgument;",
                            "amdgpu::n1c_app_verb(argScalar, v);", "if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;" }),
-           "T8: accel 104 is dispatched after 103, before the native-boot refusal, behind its own exemption");
+           "T8: accel 104/110 are dispatched after 103, before the native-boot refusal, behind their own exemption");
     expect(in_order(ucl, { "if (rdna4native::g4::action_admitted(amdgpu::n1c_apps_enabled(), action)) {", "} else", "if (!rdna4native::g1::action_admitted(amdgpu::n1c_g1_latched_on(), action) && !rdna4native::g2::action_admitted(amdgpu::n1c_multi_latched_on(), action)) {",
                            "if (action > 82 && !rdna4disp::action_admitted(rdna4disp_latched_on(), action)) return kIOReturnBadArgument;" }),
            "T8: the user client lets 104 past the old action bound only with the role on");
     expect(slurp(K + "src/GarnetUserClient.cpp").find("kIOClientPrivilegeAdministrator") != std::string::npos, "T8: the verb's user client is the root-only legacy client");
-    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat bartest\\n") != std::string::npos &&
+    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\\n") != std::string::npos &&
            cmd.find("appallow add <name>/remove <name>/list/strikes]") != std::string::npos, "T8: rdna4test: the table line, the name, the known list and the usage");
     expect(cmd.find("rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2))") != std::string::npos && cmd.find("rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0)") != std::string::npos && cmd.find("GarnetAppKey.h") != std::string::npos, "T8: garnettest hashes the name with the kext's own function");
     expect(g4p.find("#include \"../GarnetAppKey.h\"") != std::string::npos && cli.find("#include \"GarnetAppKey.h\"") != std::string::npos, "T8: kext and CLI share one key header");
@@ -778,9 +779,85 @@ static void t15_apps_all(const std::string &root) {
     expect_u("T15: apps_all_on is used only by name admission", count_of(eng, "apps_all_on()"), 2);
 }
 
+// ---- T16: lock-free persistent-reloaded application denylist (action 110 `appdeny`) ----------------------------------------------------------------------
+static void t16_app_denylist(const std::string &root) {
+    using namespace g4;
+    using namespace policy;
+    expect_u("T16: action 110 constant", kActAppDeny, 110u);
+    expect_u("T16: denylist holds 64 entries across 8 pages", kMaxDenyEntries, 64u);
+    expect_u("T16: deny page count is 8", kDenyListPages, 8u);
+    expect(is_g4_action(kActAppDeny) && action_admitted(true, kActAppDeny) && !action_admitted(false, kActAppDeny), "T16: 110 requires APP role enabled");
+    expect(args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_ADD, 5)) && args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_REMOVE, 5)) &&
+           args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_LIST, 0)) && args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_LIST, 7)) &&
+           args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_CLEAR, 0)),
+           "T16: appdeny legal args include add/remove/list(0..7)/clear(0)");
+    expect(!args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_LIST, 8)) && !args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_ADD, 0)) &&
+           !args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_REMOVE, 0)) && !args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_CLEAR, 1)) &&
+           !args_ok(kActAppDeny, rdna4a_arg(RDNA4A_OP_STRIKES, 0)) && !args_ok(kActAppAllow, rdna4a_arg(RDNA4A_OP_CLEAR, 0)),
+           "T16: page 8, zero key, non-zero CLEAR, STRIKES on 110, CLEAR on 104 are refused");
+    expect(native_exempt(true, kActAppDeny, rdna4a_arg(RDNA4A_OP_ADD, 5)) && !native_exempt(false, kActAppDeny, rdna4a_arg(RDNA4A_OP_ADD, 5)), "T16: exemption follows role");
+
+    uint64_t deny[kMaxDenyEntries] = { 0 };
+    uint64_t o[kOutN] = { 0 };
+    expect_u("T16: OFF refuses verb", deny_verb_run(false, deny, rdna4a_arg(RDNA4A_OP_ADD, 7), o), kAllowOff);
+    expect_u("T16: add key", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_ADD, 77), o), kAllowOk);
+    expect(o[1] == 1ull && o[2] == RDNA4A_OP_ADD && o[3] == kMaxDenyEntries && o[4] == 77ull, "T16: add reports count/op/cap(64)/key");
+    expect_u("T16: duplicate add -> exists", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_ADD, 77), o), kAllowExists);
+    expect_u("T16: remove ok", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_REMOVE, 77), o), kAllowOk);
+    expect_u("T16: remove absent", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_REMOVE, 77), o), kAllowNotFound);
+
+    for (uint64_t k = 1; k <= kMaxDenyEntries; k++) expect_u("T16: fill 64 slots", dl_add(deny, 1000 + k), kAllowOk);
+    expect_u("T16: 65th slot refuses full", dl_add(deny, 9999), kAllowFull);
+    std::vector<uint64_t> seen;
+    for (uint64_t pg = 0; pg < kDenyListPages; pg++) {
+        expect_u("T16: list page ok", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_LIST, pg), o), kAllowOk);
+        for (uint32_t i = 0; i < kListPerPage; i++) if (o[4 + i]) seen.push_back(o[4 + i]);
+    }
+    expect_u("T16: 8 pages list all 64 deny entries", seen.size(), kMaxDenyEntries);
+    expect_u("T16: clear resets all entries", deny_verb_run(true, deny, rdna4a_arg(RDNA4A_OP_CLEAR, 0), o), kAllowOk);
+    expect_u("T16: count after clear is 0", o[1], 0ull);
+    expect_u("T16: add works after clear", dl_add(deny, 555), kAllowOk);
+
+    // Denial beats BOTH allow-list and garnet-apps-all=1 while strikes remain enforced and appallow stays intact.
+    for (int onAllow = 0; onAllow <= 1; onAllow++)
+        for (int appsAll = 0; appsAll <= 1; appsAll++)
+            for (int onDeny = 0; onDeny <= 1; onDeny++)
+                for (uint32_t strikes = 0; strikes <= 3; strikes++) {
+                    const bool want = !onDeny && (onAllow || appsAll) && strikes < kStrikeLimit;
+                    expect(app_admit(onAllow != 0, strikes, appsAll != 0, onDeny != 0) == want, "T16: deny precedence over allowlist and apps-all with strike check");
+                }
+    expect(app_admit(true, 0, false, false) && !app_admit(false, 0, false, false), "T16: appallow-only mode without apps-all unchanged");
+
+    // Threaded denylist concurrency (2 threads add 40 keys with 16 overlap = 64 distinct keys).
+    dl_clear(deny);
+    {
+        std::atomic<int> ready{0}, go{0};
+        std::thread ta([&] { ready.fetch_add(1); while (!go.load()) {} for (uint64_t k = 1; k <= 40; k++) dl_add(deny, 2000 + k); });
+        std::thread tb([&] { ready.fetch_add(1); while (!go.load()) {} for (uint64_t k = 25; k <= 64; k++) dl_add(deny, 2000 + k); });
+        while (ready.load() < 2) {}
+        go.store(1); ta.join(); tb.join();
+        bool all = true; for (uint64_t k = 1; k <= 64; k++) if (!dl_contains(deny, 2000 + k)) all = false;
+        expect(all && dl_count(deny) == 64u, "T16: concurrent denylist adds settle deterministically to 64 unique entries");
+    }
+
+    const std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    const std::string drv = slurp(root + "/src/garnet/src/GarnetDriver.cpp");
+    const std::string uc = slurp(root + "/src/garnet/src/GarnetUserClient.cpp");
+    const std::string cli = slurp(root + "/tools/rdna4/native/garnettest.c");
+    expect(eng.find("static uint64_t gAppDeny[rdna4native::g4::kMaxDenyEntries];") != std::string::npos &&
+           eng.find("IOReturn n1c_app_deny_verb(uint64_t arg, uint64_t *o) {") != std::string::npos &&
+           eng.find("deny_verb_run(apps_on(), gAppDeny, arg, o)") != std::string::npos, "T16: kernel gAppDeny & n1c_app_deny_verb pinned");
+    expect(drv.find("n1c_app_deny_verb(argScalar, v)") != std::string::npos && uc.find("110 = appdeny") != std::string::npos, "T16: driver & userclient dispatch 110");
+    expect(cli.find("else if (what && !strcmp(what, \"appdeny\")) in = 110;") != std::string::npos &&
+           cli.find("in == 110 ? \"appdeny\"") != std::string::npos &&
+           cli.find("RDNA4A_OP_CLEAR") != std::string::npos &&
+           cli.find("|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream") != std::string::npos,
+           "T16: garnettest CLI supports accel appdeny");
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
-    t1_switch(); t2_open_policy(); t3_selectors(); t4_allowlist(); t5_budget(); t6_close_path(); t7_defence(); t8_pins(root); t9_close_path(root); t10_log_gate(root); t11_visible_pool(root); t12_slots(root); t13_strikes(root); t14_wording(root); t15_apps_all(root);
+    t1_switch(); t2_open_policy(); t3_selectors(); t4_allowlist(); t5_budget(); t6_close_path(); t7_defence(); t8_pins(root); t9_close_path(root); t10_log_gate(root); t11_visible_pool(root); t12_slots(root); t13_strikes(root); t14_wording(root); t15_apps_all(root); t16_app_denylist(root);
     std::printf("native_g4: %d checks, %d failed\n", gRun, gFail);
     return gFail == 0 ? 0 : 1;
 }
