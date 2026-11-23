@@ -902,11 +902,9 @@ static BOOL rdna4_argument_sampler_scope(
                 [fullyScanned addObject:buffer];
         }
     }
-    if (!needsDeclaredTransports) return YES;
-
     // BDA/dynamic children need not occupy a setBuffer slot. Only this command's
     // declared closure is eligible; typed-only plans keep their sparse scans.
-    for (id object in declaredBuffers) {
+    if (needsDeclaredTransports) for (id object in declaredBuffers) {
         if (![object isKindOfClass:[RDNA4Buffer class]]) continue;
         RDNA4Buffer *buffer = object;
         if (buffer.device != device || [buffer isAliasable] ||
@@ -931,6 +929,14 @@ static BOOL rdna4_argument_sampler_scope(
             (unsigned)work.mode);
         if (!rdna4_argument_sampler_scope_work(device, buffer, &work, &live,
                                                 samplers, writes, why)) return NO;
+    }
+    if (writes.count) {
+        NSSet *allCandidates = [samplers copy];
+        for (NSUInteger i = 0; i < writes.count; ++i) {
+            NSMutableDictionary *entry = [writes[i] mutableCopy];
+            entry[@"candidates"] = allCandidates;
+            writes[i] = [entry copy];
+        }
     }
     return YES;
 }

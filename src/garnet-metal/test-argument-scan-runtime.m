@@ -702,6 +702,70 @@ static void testDeclaredOpaqueRoots(void) {
             "new root schema accepted under old reflection");
 }
 
+static void testCrossBufferSamplerCopyWriteCandidates(id device, NSArray *unrelated) {
+    NSObject *sourceSampler = [NSObject new];
+    uint64_t sourceToken = rdna4_argument_resource_token(sourceSampler, device, NO);
+    uint64_t unrelatedToken =
+        rdna4_argument_resource_token(unrelated.firstObject, device, NO);
+    require(sourceToken && unrelatedToken, "cross-buffer sampler token creation");
+
+    RDNA4ScanTestBuffer *src = newBuffer(device, 64, MTLStorageModeShared);
+    RDNA4ScanTestBuffer *dst = newBuffer(device, 64, MTLStorageModeShared);
+    writeToken(src, 0, unrelatedToken);
+    writeToken(src, 16, sourceToken);
+    memset(dst.contents, 0xa5, dst.length);
+
+    const rdna4_argument_scan_reflection_field fields[] = {
+        {
+            .root = 3,
+            .kind = RDNA4_AS_KIND_SAMPLER,
+            .count_known = 1,
+            .writable = 0,
+            .field_offset = 16,
+            .count = 1,
+            .stride = RDNA4_AS_TOKEN_BYTES,
+        },
+        {
+            .root = 5,
+            .kind = RDNA4_AS_KIND_SAMPLER,
+            .count_known = 1,
+            .writable = 1,
+            .field_offset = 16,
+            .count = 1,
+            .stride = RDNA4_AS_TOKEN_BYTES,
+        },
+    };
+    rdna4_argument_scan_reflection_plan plan = {0};
+    buildPlan(&plan, fields, sizeof(fields) / sizeof(fields[0]));
+    RDNA4StageState state = {0};
+    state.scanPlan = &plan;
+    state.buf[3].b = src;
+    state.buf[5].b = dst;
+    NSSet *writable = [NSSet setWithObject:dst];
+
+    RDNA4ArgumentScanPrepared scan = {0};
+    prepareScan(&scan, &state, writable, device);
+    require(scan.count == 1 && scan.stages[0].count == 2 &&
+                scan.stages[0].stats.fallback_works == 0,
+            "cross-buffer sampler copy scan work count");
+    fallbackWorks += scan.stages[0].stats.fallback_works;
+
+    NSMutableSet *samplers = [NSMutableSet set];
+    NSMutableArray<NSDictionary *> *writes = [NSMutableArray array];
+    ScopeObservation observation = runScope(device, &scan, samplers, writes);
+    require(observation.writes == 1 && writes.count == 1 &&
+                writes[0][@"buffer"] == dst,
+            "cross-buffer sampler copy write target");
+    requireOnlySamplers(writes[0][@"candidates"],
+                        [NSSet setWithObject:sourceSampler],
+                        "cross-buffer copy write did not carry source sampler candidates");
+    require(![writes[0][@"candidates"] containsObject:unrelated.firstObject],
+            "cross-buffer copy write leaked unrelated live sampler");
+
+    rdna4_argument_scan_prepared_destroy(&scan);
+    rdna4_argument_scan_reflection_plan_destroy(&plan);
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && !strcmp(argv[1], "--help")) {
@@ -718,6 +782,9 @@ int main(int argc, const char *argv[]) {
         testLargeSparseTypedAndUnreflectedRoot();
         testAliasableOwnerMetadataWithoutRawRead();
         testDeclaredUnboundChildren();
+        id crossDevice = [NSObject new];
+        NSArray *crossUnrelated = makeLiveSamplers(crossDevice, 16);
+        testCrossBufferSamplerCopyWriteCandidates(crossDevice, crossUnrelated);
 
         require(sharedRounds == 2, "Shared recheck rounds");
         require(managedRounds == 2, "Managed recheck rounds");
