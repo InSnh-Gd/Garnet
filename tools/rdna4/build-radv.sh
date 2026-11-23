@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the x86_64 RADV (libvulkan_radeon.dylib) the GarnetMetal bundle ships, from Mesa f5cb8ee plus mesa-patches/0001..0026.
+# Build the x86_64 RADV (libvulkan_radeon.dylib) the GarnetMetal bundle ships, from Mesa f5cb8ee plus mesa-patches/0001..0027.
 #   build-radv.sh MESA_SRC OUT_DIR
 # MESA_SRC: a pristine Mesa tree at f5cb8ee032adabef599ae892ec4e42d796b84da9 (a git checkout or a plain copy). It is not modified:
 # the patches are applied to a copy in OUT_DIR/src (git apply --check first, so a series that does not apply stops here).
