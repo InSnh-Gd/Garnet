@@ -320,21 +320,36 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
         .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
     if (RDNA4P.on) {   // P1: slab range / recycled allocation; the host-visible memory is mapped once by the pool (zeroed here unless the caller said it will overwrite it)
         r = rdna4_mem_alloc((uint32_t)mt, mr, sm != 2, sm != 2 && !nozero, _vkbuf, VK_NULL_HANDLE, &_pm);
-        if (r != VK_SUCCESS) { if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"vkAllocateMemory = %d (pool)", r]); return nil; }
-        _pooled = YES; atomic_fetch_add(&rdna4_alloc_total, (uint64_t)_asz);
-        r = vkBindBufferMemory(RDNA4R.dev, _vkbuf, _pm.mem, _pm.off);
-        if (r != VK_SUCCESS) { if (err) *err = rdna4_err(23, [NSString stringWithFormat:@"vkBindBufferMemory = %d (pool, offset %llu)", r, (unsigned long long)_pm.off]); return nil; }
-        if (sm != 2) _ptr = _pm.map;
+        if (r == VK_SUCCESS) {
+            _pooled = YES; atomic_fetch_add(&rdna4_alloc_total, (uint64_t)_asz);
+            r = vkBindBufferMemory(RDNA4R.dev, _vkbuf, _pm.mem, _pm.off);
+            if (r != VK_SUCCESS) { if (err) *err = rdna4_err(23, [NSString stringWithFormat:@"vkBindBufferMemory = %d (pool, offset %llu)", r, (unsigned long long)_pm.off]); return nil; }
+            if (sm != 2) _ptr = _pm.map;
+        }
     } else {
-    r = vkAllocateMemory(RDNA4R.dev, &ma, NULL, &_vkmem);
-    if (r != VK_SUCCESS) { if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"vkAllocateMemory = %d", r]); return nil; }
-    atomic_fetch_add(&rdna4_alloc_total, (uint64_t)_asz);
-    r = vkBindBufferMemory(RDNA4R.dev, _vkbuf, _vkmem, 0);
-    if (r != VK_SUCCESS) { if (err) *err = rdna4_err(23, [NSString stringWithFormat:@"vkBindBufferMemory = %d", r]); return nil; }
-    if (sm != 2) {
-        r = vkMapMemory(RDNA4R.dev, _vkmem, 0, VK_WHOLE_SIZE, 0, &_ptr);
-        if (r != VK_SUCCESS) { if (err) *err = rdna4_err(24, [NSString stringWithFormat:@"vkMapMemory = %d", r]); return nil; }
+        r = vkAllocateMemory(RDNA4R.dev, &ma, NULL, &_vkmem);
+        if (r == VK_SUCCESS) {
+            atomic_fetch_add(&rdna4_alloc_total, (uint64_t)_asz);
+            r = vkBindBufferMemory(RDNA4R.dev, _vkbuf, _vkmem, 0);
+            if (r != VK_SUCCESS) { if (err) *err = rdna4_err(23, [NSString stringWithFormat:@"vkBindBufferMemory = %d", r]); return nil; }
+            if (sm != 2) {
+                r = vkMapMemory(RDNA4R.dev, _vkmem, 0, VK_WHOLE_SIZE, 0, &_ptr);
+                if (r != VK_SUCCESS) { if (err) *err = rdna4_err(24, [NSString stringWithFormat:@"vkMapMemory = %d", r]); return nil; }
+            }
+        }
     }
+    if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && !heap && sm < 2 && RDNA4R.hostExt && rdna4_vkGetMHPP) {
+            void *owned = rdna4nc_owned_allocate(len, RDNA4R.hostAlign, &_ownedHostSpan);
+            if (owned) {
+                vkDestroyBuffer(RDNA4R.dev, _vkbuf, NULL);
+                _vkbuf = VK_NULL_HANDLE;
+                _ptr = owned;
+                return [self rdna4ImportHostPointer:owned length:len ownedSpan:_ownedHostSpan deallocator:nil error:err];
+            }
+        }
+        if (err) *err = rdna4_err(22, [NSString stringWithFormat:RDNA4P.on ? @"vkAllocateMemory = %d (pool)" : @"vkAllocateMemory = %d", r]);
+        return nil;
     }
     if (RDNA4R.bufferAddress) {
         VkBufferDeviceAddressInfo address = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = _vkbuf };
