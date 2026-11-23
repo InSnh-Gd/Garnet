@@ -35,7 +35,7 @@
 #include "rdna4_query_caps.h"
 
 // ---- constants ----
-#define RDNA4X_KEY_TAG       "rdna4x-52-indirect-embedded-lod-queries"
+#define RDNA4X_KEY_TAG       "rdna4x-53-opaque-resource-bda-exclusion"
 #define RDNA4X_ABI_VERSION   3u   // capability-aware exports; ABI 2 signatures remain unchanged
 #define RDNA4X_MAX_DEPS      64u   // linked dependencies one pipeline stage may carry (more = no linked translation)
 #define RDNA4X_MAX_DEP_AIR   (8u * 1024u * 1024u)   // total bitcode of all dependencies of one stage

@@ -1,0 +1,244 @@
+diff --git a/src/native/emitter/body/reinterpret_pointer.rs b/src/native/emitter/body/reinterpret_pointer.rs
+index 492f106..e6424d2 100644
+--- a/src/native/emitter/body/reinterpret_pointer.rs
++++ b/src/native/emitter/body/reinterpret_pointer.rs
+@@ -353,10 +353,15 @@ impl Emitter {
+         let Some(key) = self.local_pointer_field_key(ptr)? else {
+             return Ok(false);
+         };
+-        if self.bda_forwards_local_pointer_field(result_name, result_ty)
+-            || (self.large_buffer_addressing
+-                && matches!(result_ty, LlType::Ptr(1 | 2))
+-                && self.local_pointer_fields.contains_key(&key))
++        let stored_addressable = self
++            .local_pointer_fields
++            .get(&key)
++            .is_some_and(|stored| self.bda_phi_value_is_addressable(&stored.value));
++        if !self.opaque_resource_pointers.contains(result_name)
++            && (self.bda_forwards_local_pointer_field(result_name, result_ty)
++                || (self.large_buffer_addressing
++                    && matches!(result_ty, LlType::Ptr(1 | 2))
++                    && stored_addressable))
+         {
+             let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+             self.emit_bda_address_from_field(result_name, result_ty, pointer, &key, instructions)?;
+@@ -377,6 +382,7 @@ impl Emitter {
+         result_ty: &LlType,
+     ) -> bool {
+         self.bda_device_pointers
++            && !self.opaque_resource_pointers.contains(result_name)
+             && matches!(result_ty, LlType::Ptr(1 | 2))
+             && self.bda_forward_addresses.contains(result_name)
+     }
+@@ -847,7 +853,15 @@ impl Emitter {
+         ptr: &TypedValue,
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<bool, String> {
+-        if self.large_buffer_addressing && matches!(result_ty, LlType::Ptr(1 | 2)) {
++        let static_non_addressable = self
++            .local_pointer_field_key(ptr)?
++            .and_then(|key| self.local_pointer_fields.get(&key))
++            .is_some_and(|stored| !self.bda_phi_value_is_addressable(&stored.value));
++        if self.large_buffer_addressing
++            && matches!(result_ty, LlType::Ptr(1 | 2))
++            && !self.opaque_resource_pointers.contains(result_name)
++            && !static_non_addressable
++        {
+             if let Some(slots) = self.local_bda_bounds_slots_for_pointer(ptr, instructions)? {
+                 let bounds = self.emit_local_bda_bounds_slots_load(slots, instructions)?;
+                 let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index 6f70edc..ea18545 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -157,13 +157,19 @@ fn bda_forward_address_values(
+         );
+     }
+ 
++    let grounded_seeds = seeds
++        .iter()
++        .filter(|name| !opaque.contains(*name))
++        .cloned()
++        .collect::<HashSet<_>>();
++
+     // Greatest fixed point: retain cyclic state only when every concrete dependency remains inside
+     // the address-domain graph. Then require a least-fixed-point path to a real address/zero/undef
+     // anchor, excluding an ungrounded phi cycle.
+     let mut valid = nodes
+         .iter()
+         .filter_map(|(name, node)| node.supported.then_some(name.clone()))
+-        .chain(seeds.iter().cloned())
++        .chain(grounded_seeds.iter().cloned())
+         .collect::<HashSet<_>>();
+     loop {
+         let rejected = nodes
+@@ -184,7 +190,7 @@ fn bda_forward_address_values(
+             valid.remove(&name);
+         }
+     }
+-    let mut anchored = seeds.clone();
++    let mut anchored = grounded_seeds;
+     loop {
+         let additions = nodes
+             .iter()
+@@ -1493,9 +1499,23 @@ impl Emitter {
+             }
+         }
+         if self.bda_device_pointers {
++            let entry_function = self.ir.entry_functions.contains(&f.name);
+             let seeds = self
+                 .raw_buffer_params
+                 .iter()
++                .filter(|name| {
++                    if entry_function {
++                        self.data_buffer_params.contains(*name)
++                            || self
++                                .ir
++                                .metadata_fc_buffer_locations
++                                .contains_key(&(f.name.clone(), (*name).clone()))
++                    } else {
++                        self.raw_offsets
++                            .get(*name)
++                            .is_some_and(|raw| raw.device_addr_base.is_some())
++                    }
++                })
+                 .cloned()
+                 .chain(self.bda_inttoptr_sources.keys().cloned())
+                 .chain(self.bda_direct_addresses.keys().cloned())
+@@ -3890,6 +3910,29 @@ mod tests {
+         assert!(!addresses.contains("%orphan.next"), "{addresses:?}");
+     }
+ 
++    #[test]
++    fn bda_forward_addresses_exclude_opaque_resource_seeds() {
++        let lines = [
++            "%alias = bitcast ptr addrspace(1) %tex to ptr addrspace(1)",
++            "%merged = phi ptr addrspace(1) [ %tex, %a ], [ %alias, %b ]",
++            "ret void",
++        ]
++        .into_iter()
++        .map(str::to_string)
++        .collect::<Vec<_>>();
++        let tir = crate::native::tir::build(&lines, "%entry", &HashMap::new()).expect("tir");
++        let addresses = bda_forward_address_values(
++            &tir,
++            &HashSet::from(["%buf".to_string(), "%tex".to_string()]),
++            &HashSet::from(["%tex".to_string()]),
++        );
++
++        assert!(addresses.contains("%buf"), "{addresses:?}");
++        assert!(!addresses.contains("%tex"), "{addresses:?}");
++        assert!(!addresses.contains("%alias"), "{addresses:?}");
++        assert!(!addresses.contains("%merged"), "{addresses:?}");
++    }
++
+     #[test]
+     fn structured_plan_ssa_closure_rejects_renamed_use_without_definition() {
+         let complete = vec![block(
+diff --git a/src/native/emitter/pointers/phi_merge.rs b/src/native/emitter/pointers/phi_merge.rs
+index 209d4a3..760b4c5 100644
+--- a/src/native/emitter/pointers/phi_merge.rs
++++ b/src/native/emitter/pointers/phi_merge.rs
+@@ -95,6 +95,9 @@ impl Emitter {
+         match value {
+             LlValue::Zero | LlValue::Undef => true,
+             LlValue::Local(name) => {
++                if self.opaque_resource_pointers.contains(name) {
++                    return false;
++                }
+                 if self.bda_inttoptr_sources.contains_key(name)
+                     || self.bda_forward_addresses.contains(name)
+                     || self.bda_direct_addresses.contains_key(name)
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index 416974e..8cd7ad4 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -14336,3 +14336,88 @@ exit:
+     );
+     let _ = std::fs::remove_dir_all(tmp);
+ }
++
++#[test]
++fn large_buffer_spliced_helper_stores_opaque_texture_in_local_struct() {
++    let entry_template = r#"
++%"struct.RB::Layer" = type { ptr addrspace(1), [2 x <2 x float>] }
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020489, i64 0], align 8
++
++define <4 x half> @frag(<2 x float> %coord, ptr addrspace(2) noundef %globals, ptr addrspace(1) %fill_tex) {
++entry:
++  %p = getelementptr inbounds float, ptr addrspace(2) %globals, i64 2
++  %res = call <4 x half> @helper(<2 x float> %coord, ptr addrspace(2) %p, ptr addrspace(1) %fill_tex)
++  ret <4 x half> %res
++}
++
++define <4 x half> @helper(<2 x float> %p, ptr addrspace(2) %params, ptr addrspace(1) %tex) {
++entry:
++  %layer = alloca %"struct.RB::Layer", align 8
++  %tex_slot = getelementptr inbounds %"struct.RB::Layer", ptr %layer, i64 0, i32 0
++  store ptr addrspace(1) %tex, ptr %tex_slot, align 8
++  br label %loop
++
++loop:
++  %i = phi i32 [ 0, %entry ], [ %next_i, %loop ]
++  %idx = zext i32 %i to i64
++  %src = getelementptr inbounds float, ptr addrspace(2) %params, i64 %idx
++  %val = load float, ptr addrspace(2) %src, align 4
++  %uv = insertelement <2 x float> poison, float %val, i64 0
++  %uv2 = shufflevector <2 x float> %uv, <2 x float> poison, <2 x i32> zeroinitializer
++  %dst = getelementptr inbounds %"struct.RB::Layer", ptr %layer, i64 0, i32 1, i64 %idx
++  store <2 x float> %uv2, ptr %dst, align 8
++  %next_i = add nuw nsw i32 %i, 1
++  %done = icmp eq i32 %next_i, 2
++  br i1 %done, label %exit, label %loop
++
++exit:
++  %uv_load_ptr = getelementptr inbounds %"struct.RB::Layer", ptr %layer, i64 0, i32 1, i64 0
++  %uv_final = load <2 x float>, ptr %uv_load_ptr, align 8
++  %sample_tex = __SAMPLE_TEX_EXPR__
++  %sampled = call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %sample_tex, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv_final, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %color = extractvalue { <4 x half>, i8 } %sampled, 0
++  ret <4 x half> %color
++}
++
++declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++
++!air.fragment = !{!0}
++!air.sampler_states = !{!1}
++!0 = !{ptr @frag, !2, !3}
++!1 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++!2 = !{!4}
++!3 = !{!5, !6, !7}
++!4 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
++!5 = !{i32 0, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float2"}
++!6 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Globals", !"air.arg_name", !"globals"}
++!7 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"fill_tex"}
++"#;
++    let direct_ll = entry_template.replace(
++        "%sample_tex = __SAMPLE_TEX_EXPR__",
++        "%sample_tex = bitcast ptr addrspace(1) %tex to ptr addrspace(1)",
++    );
++    let reload_ll = entry_template.replace(
++        "%sample_tex = __SAMPLE_TEX_EXPR__",
++        "%sample_tex = load ptr addrspace(1), ptr %tex_slot, align 8",
++    );
++    for (label, ll) in [("direct", direct_ll), ("reload", reload_ll)] {
++        let (spv, reflection) = crate::translate_sanitized_native_reflected_unvalidated(
++            &ll,
++            Stage::Fragment,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .unwrap_or_else(|e| panic!("{label} sample path should translate cleanly: {e}"));
++        let module = load_bytes(&spv).expect("valid SPIR-V bytes");
++        assert!(!module.functions.is_empty(), "{label}: missing function");
++        let has_texture_binding = reflection.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::Texture && b.metal_index == 0
++        });
++        assert!(
++            has_texture_binding,
++            "{label}: expected texture(0) in reflection bindings: {:?}",
++            reflection.bindings
++        );
++    }
++}

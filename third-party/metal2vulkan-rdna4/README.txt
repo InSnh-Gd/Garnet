@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0066).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0067).
 
 Verification and Tier 2 Scope
 =============================
@@ -17,6 +17,15 @@ version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
 translation and metadata invariants only; they do not establish physical RDNA4
 GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
 stays controlled by the native bundle and compatibility runner.
+
+0067-exclude-opaque-and-nonbuffer-roots-from-bda.patch prevents opaque texture/sampler
+handles and non-buffer raw parameters from entering `bda_forward_addresses` and
+`bda_phi_value_is_addressable` when `large_buffer_addressing` is enabled (and guards
+local pointer-field BDA loads against non-addressable opaque resource slots). This fixes
+DockHelper's linked Liquid Glass SDF shader (`ffgea5cia6dheb2a3` + `custom_fn`), which
+stores an opaque `texture2d` parameter into an `alloca` struct field alongside a
+dynamically indexed `constant` buffer pointer. User cache tag:
+rdna4x-53-opaque-resource-bda-exclusion.
 
 0066-indirect-embedded-lod-queries.patch extends the indirect embedded-resource
 gates (`body_uses_texture_intrinsic`, `is_air_sampler_operand`,
