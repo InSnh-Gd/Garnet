@@ -1,6 +1,14 @@
 #include "rdna4_fencewait.h"
 _Static_assert((int)VK_TIMEOUT == RDNA4FW_TIMEOUT, "VK_TIMEOUT == RDNA4FW_TIMEOUT");
 
+@protocol RDNA4ICBInternal <NSObject>
+- (id<MTLDevice>)device;
+- (uint64_t)rdna4EnsureGPUBackingAddress;
+- (id)rdna4GPUBacking;
+- (BOOL)rdna4PrepareForGPUProducerOnCommandBuffer:(id)cb;
+- (BOOL)rdna4RegisterCandidatePipeline:(id)pipeline;
+@end
+
 typedef struct {
     VkFence fence;
     uint64_t cbid;
@@ -745,12 +753,18 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (uint64_t)rdna4SegmentSerial { return _segmentSerial; }
 - (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage {
     if (_encErr) return;
-    if ((!([resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
-        [resource device] != [self device] || !usage || (usage & ~(NSUInteger)7)) {
+    Class icbCls = objc_getClass("RDNA4IndirectCommandBuffer");
+    BOOL isICB = icbCls && [resource isKindOfClass:icbCls];
+    if ((!(isICB || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
+        [(id<MTLResource>)resource device] != [self device] || !usage || (usage & ~(NSUInteger)7)) {
         [self rdna4Fail:@"useResource has an invalid resource, device or usage"];
         return;
     }
     [self rdna4RetainEncoded:resource];
+    if (isICB) {
+        id backing = [(id<RDNA4ICBInternal>)resource rdna4GPUBacking];
+        if (backing) [self rdna4RetainEncoded:backing];
+    }
 }
 - (void)rdna4UseHeap:(id)heap {
     if (_encErr) return;
@@ -1608,11 +1622,12 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 static const uint32_t sets[3] = { 256, 64, 16 }, div[3] = { 1, 4, 16 };
                 VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
                 for (int tier = 0; tier < 3; tier++) {
-                    VkDescriptorPoolSize sz[8] = {
+                    VkDescriptorPoolSize sz[9] = {
                         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_SAMPLER, 512 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 / div[tier] }, { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 256 / div[tier] },
-                        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 256 / div[tier] } };
+                        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 256 / div[tier] },
+                        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256 / div[tier] } };
                     VkDescriptorPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = sets[tier],
                                                       .poolSizeCount = sizeof sz / sizeof *sz, .pPoolSizes = sz };
                     r = vkCreateDescriptorPool(RDNA4R.dev, &pc, NULL, &_pool);

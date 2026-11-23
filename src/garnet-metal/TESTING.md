@@ -717,3 +717,44 @@ clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
 sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
   "$TMPDIR/test-tessellation" /path/to/GarnetMetal.bundle
 ```
+
+## Indirect Command Buffers (7.1–7.3)
+
+Offline SPIR-V expander generator validation and host-only transaction semantics
+(no Vulkan headers or GPU submission required for `test-icb-transactions.sh`):
+
+```sh
+clang -std=c11 -O2 -Wall -Wextra -Werror -I/path/to/mesa-src/include \
+  -Isrc/garnet-metal src/garnet-metal/test-icb-spv.c -o "$TMPDIR/test-icb-spv"
+"$TMPDIR/test-icb-spv"
+
+bash src/garnet-metal/test-icb-transactions.sh "$TMPDIR/icb-tx"
+```
+
+Live RX 9060 XT CPU ICB (draw, indexed draw, direct/indexed patch equivalence,
+deferred commit ordering, sparse large command counts, negative checks), GPU
+compute-encoded ICB (`cpu_readback=0`, indirect range buffer, overlapping blit),
+and lifecycle/heap/event/fence/quarantine suites (test both `-O0` and `-O2` for
+ARC lifetime coverage; note that compute encoders writing a private indirect
+range buffer through an argument buffer must declare `[ce useResource:buf
+usage:MTLResourceUsageWrite]`):
+
+```sh
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-icb.m -o "$TMPDIR/test-icb"
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-icb-gpu.m -o "$TMPDIR/test-icb-gpu"
+clang -arch x86_64 -fobjc-arc -O0 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o0"
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o2"
+
+for b in test-icb test-icb-gpu test-icb-lifecycle-o0 test-icb-lifecycle-o2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

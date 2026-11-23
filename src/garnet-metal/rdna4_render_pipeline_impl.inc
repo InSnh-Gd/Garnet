@@ -10,6 +10,16 @@
     VkVertexInputBindingDescription _vib[32]; VkVertexInputAttributeDescription _via[32]; uint32_t _nvib, _nvia; uint32_t _need[32]; uint32_t _nneed;
     VkPipelineColorBlendAttachmentState _cba[8]; uint32_t _na; char _vep[128], _fep[128];
     NSMutableDictionary *_variants; NSLock *_lock; NSMutableArray *_owned; BOOL _fallback, _icb, _hasFrag, _rastOff;
+    uint64_t _icbToken;
+    NSData *_icbVsSpv, *_icbFsSpv;
+    garnetx_icb_vattr_t _icbVAttrs[32]; uint32_t _nIcbVAttrs;
+    uint32_t _pcs; VkShaderStageFlags _pcf;
+    BOOL _icbGpuReady, _icbHasVsParams;
+    VkShaderModule _icbVs, _icbFs, _icbTes;
+    VkDescriptorSetLayout _icbDsl[2], _icbTessDsl;
+    VkPipelineLayout _icbPl;
+    RDNA4PB *_icbPbV, *_icbPbF; uint32_t _icbNpbV, _icbNpbF;
+    NSMutableDictionary *_icbVariants;
     char _vnm[64], _fnm[64];   // native #12 P1: vertex / fragment function names (CoreDisplay's final pass = fragment "GPUPass")
     rdna4pc_t _pc; MTLPixelFormat _dpf, _spf; VkFormat _dsVk; unsigned _dsAsp;   // bundle 10: fixed config (samples, dynamic states, depth bias), the depth / stencil attachment formats, the attachment's VkFormat (UNDEFINED = none) and aspects
     MTLRenderPipelineDescriptor *_hsDesc; _Atomic(uintptr_t) _realp;   // hot-swap: creation descriptor (fallback only); the published real object (+1, written once)
@@ -25,6 +35,14 @@
 - (VkPipeline)vkPipeline;
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f;
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;   // bundle 10: dk = rdna4DSKey: (0 for a colour-only pipeline)
+- (BOOL)rdna4PrepareICBGPUVariant:(NSError **)err;
+- (VkPipeline)icbPipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;
+- (uint64_t)rdna4ICBToken;
+- (BOOL)rdna4ICBHasVsParams;
+- (VkPipelineLayout)icbLayout;
+- (VkDescriptorSetLayout)icbDsl:(int)i;
+- (VkDescriptorSetLayout)icbTessDsl;
+- (const RDNA4PB *)icbPbV; - (uint32_t)icbNpbV; - (const RDNA4PB *)icbPbF; - (uint32_t)icbNpbF;
 - (uint32_t)rdna4DSKey:(const void *)dsinfo;   // RDNA4DSInfo *, NULL = the default state (Always, no write, no stencil)
 - (BOOL)rdna4HasDS; - (BOOL)rdna4HasDepth; - (BOOL)rdna4HasStencil; - (VkFormat)rdna4DSVk; - (unsigned)rdna4SampleCount;
 - (VkPipelineLayout)layout;
@@ -87,6 +105,7 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
 }
 
 @implementation RDNA4RenderPipelineState
+static _Atomic uint64_t rdna4_icb_pso_seq;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err { return [self initWithDevice:dev descriptor:d noFallback:NO error:err]; }
 - (const char *)rdna4VName { return _vnm; }
 - (const char *)rdna4FName { return _fnm; }
@@ -101,6 +120,7 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     RDNA4RenderPipelineState *r = [[RDNA4RenderPipelineState alloc] initWithDevice:_dev descriptor:_hsDesc noFallback:YES error:&e];
     if (!r) { RDNA4LOG("HOT-SWAP rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
+    r->_icbToken = _icbToken;
     uintptr_t v = (uintptr_t)CFBridgingRetain(r);
     if (!rdna4hs_install(&_realp, v)) { CFRelease((CFTypeRef)v); return NO; }   // lost a race (cannot happen: one watcher): keep the first
     return YES;
@@ -108,8 +128,9 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
-    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
+    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
     _icb = d.supportIndirectCommandBuffers;
+    if (_icb) _icbToken = RDNA4_ICB_PSO_TOKEN_TAG | (atomic_fetch_add(&rdna4_icb_pso_seq, 1) + 1);
     const BOOL hasFrag = d.fragmentFunction != nil;
     _hasFrag = hasFrag;
     _rastOff = !d.isRasterizationEnabled;
@@ -460,6 +481,10 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
             if (err) *err = rdna4_err(42, @"failed to emit tessellation adapter SPIR-V");
             free(rv); free(rf); return nil;
         }
+        if (_icb && !fb) {
+            _icbVsSpv = [NSData dataWithBytes:tesW length:tesNW * 4];
+            if (hasFrag) _icbFsSpv = [fsp copy];
+        }
         _vs = rdna4_spv_module(vsW, vsNW * 4, "tess-vertex", err);
         _tcs = rdna4_spv_module(tcsW, tcsNW * 4, "tess-control", err);
         _tes = rdna4_spv_module(tesW, tesNW * 4, "tess-eval", err);
@@ -469,10 +494,14 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
         VkDescriptorSetLayoutCreateInfo td = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &tb };
         r = vkCreateDescriptorSetLayout(RDNA4R.dev, &td, NULL, &_tessDsl);
         if (r != VK_SUCCESS) { if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout (tess) = %d", r]); free(rv); free(rf); return nil; }
+    } else if (_icb && !fb) {
+        _icbVsSpv = [vsd copy];
+        if (hasFrag) _icbFsSpv = [fsp copy];
     }
     uint32_t pcs = 0; VkShaderStageFlags pcf = 0;
     if (rv && rv->pc_size) { pcs = rv->pc_size; pcf |= vsStage; }
     if (rf && rf->pc_size) { if (rf->pc_size > pcs) pcs = rf->pc_size; pcf |= VK_SHADER_STAGE_FRAGMENT_BIT; }
+    _pcs = pcs; _pcf = pcf;
     if (pcs > 256) { if (err) *err = rdna4_err(48, [NSString stringWithFormat:@"push constant block %u B > 256", pcs]); free(rv); free(rf); return nil; }
     VkPushConstantRange pcr = { pcf, 0, pcs };
     VkDescriptorSetLayout layouts[6] = {_dsl[0], _dsl[1], _argumentTables.active ? _argumentTables.dsl[0] : _tessDsl, _argumentTables.dsl[1], _argumentTables.dsl[2], _tessDsl};
@@ -503,6 +532,23 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
             uint32_t k = 0; for (; k < _nvib; k++) if (_vib[k].binding == (uint32_t)bi) break;
             if (k == _nvib) { _vib[_nvib++] = (VkVertexInputBindingDescription){ (uint32_t)bi, stride, rate }; _need[_nneed++] = (uint32_t)bi; }
             _via[_nvia++] = (VkVertexInputAttributeDescription){ loc, (uint32_t)bi, vf, (uint32_t)a.offset };
+            if (_icb && _nIcbVAttrs < 32) {
+                rdna4_tess_vfmt_t tf = rdna4_tess_vfmt_from_vk((uint32_t)vf);
+                if (tf == RDNA4_TFMT_INVALID) {
+                    if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"ICB vertex attribute %u format %lu has no BDA decoder", loc, (unsigned long)a.format]);
+                    free(rv); free(rf); return nil;
+                }
+                _icbVAttrs[_nIcbVAttrs++] = (garnetx_icb_vattr_t){
+                    .location = loc,
+                    .buffer_index = (uint32_t)bi,
+                    .offset = (uint32_t)a.offset,
+                    .stride = stride,
+                    .vfmt = (uint8_t)tf,
+                    .step_func = (l.stepFunction == MTLVertexStepFunctionConstant) ? 0u : (l.stepFunction == MTLVertexStepFunctionPerInstance) ? 2u : 1u,
+                    .pad = { 0, 0 },
+                    .step_rate = (uint32_t)(l.stepRate ? l.stepRate : 1),
+                };
+            }
         } else {
             RDNA4LOG("pipeline: WARN shader input location %u has no vertex-descriptor attribute: reads a zero-stride null binding", loc);
             if (!dummy) { _vib[_nvib++] = (VkVertexInputBindingDescription){ 31, 0, VK_VERTEX_INPUT_RATE_VERTEX }; _need[_nneed++] = 31; dummy = YES; }
@@ -536,21 +582,214 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
 - (BOOL)rdna4HasStencil { return _spf != MTLPixelFormatInvalid; }
 - (VkFormat)rdna4DSVk { return _dsVk; }
 - (unsigned)rdna4SampleCount { return _pc.samples; }
+static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, const RDNA4sRefl *refl, uint32_t set,
+                                    VkShaderStageFlags stage, BOOL wantVsParams,
+                                    VkDescriptorSetLayout *outDsl, RDNA4PB **outPb, uint32_t *outN, NSError **err) {
+    *outDsl = VK_NULL_HANDLE;
+    *outPb = NULL;
+    *outN = 0;
+    if (!refl) {
+        VkDescriptorSetLayoutCreateInfo empty = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        VkResult r = vkCreateDescriptorSetLayout(RDNA4R.dev, &empty, NULL, outDsl);
+        if (r != VK_SUCCESS && err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout(icb empty) = %d", r]);
+        return r == VK_SUCCESS;
+    }
+    if (!refl->bind[set][RDNA4_ICB_TABLE_BINDING].used ||
+        (wantVsParams && !refl->bind[set][RDNA4_ICB_VS_PARAMS_BINDING].used)) {
+        if (err) *err = rdna4_err(49, @"ICB lowered stage missing required dynamic buffer binding 676/677");
+        return NO;
+    }
+    VkDescriptorSetLayoutBinding *bnd = calloc(RDNA4S_MAXBIND, sizeof *bnd);
+    RDNA4PB *pb = calloc(RDNA4S_MAXBIND, sizeof *pb);
+    if (!bnd || !pb) {
+        free(bnd); free(pb);
+        if (err) *err = rdna4_err(49, @"out of memory building ICB stage layout");
+        return NO;
+    }
+    uint32_t nbnd = 0, npb = 0;
+    for (uint32_t b = 0; b < RDNA4S_MAXBIND; b++) {
+        const RDNA4sBind *a = &refl->bind[set][b];
+        if (!a->used) continue;
+        if (a->runtime) {
+            free(bnd); free(pb);
+            if (err) *err = rdna4_err(49, @"ICB lowered stage contains unexpected runtime descriptor array");
+            return NO;
+        }
+        if (b == RDNA4_ICB_TABLE_BINDING || (wantVsParams && b == RDNA4_ICB_VS_PARAMS_BINDING)) {
+            bnd[nbnd++] = (VkDescriptorSetLayoutBinding){ b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, stage, NULL };
+            continue;
+        }
+        const RDNA4PB *match = NULL;
+        for (uint32_t j = 0; j < origN; j++) {
+            if (origPb[j].binding == b && origPb[j].type == a->type) { match = &origPb[j]; break; }
+        }
+        if (!match) {
+            free(bnd); free(pb);
+            if (err) *err = rdna4_err(49, [NSString stringWithFormat:@"ICB lowered set %u binding %u (type %d) missing original metadata", set, b, (int)a->type]);
+            return NO;
+        }
+        bnd[nbnd++] = (VkDescriptorSetLayoutBinding){ b, match->type, match->count, stage, NULL };
+        pb[npb++] = *match;
+    }
+    VkDescriptorSetLayoutCreateInfo dc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nbnd, .pBindings = bnd };
+    VkResult vr = vkCreateDescriptorSetLayout(RDNA4R.dev, &dc, NULL, outDsl);
+    free(bnd);
+    if (vr != VK_SUCCESS) {
+        free(pb);
+        if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout(icb) = %d", vr]);
+        return NO;
+    }
+    if (npb) { *outPb = realloc(pb, npb * sizeof *pb); if (!*outPb) *outPb = pb; *outN = npb; }
+    else free(pb);
+    return YES;
+}
+- (void)rdna4DestroyICBGPUState {
+    if (RDNA4R.ok) {
+        for (NSValue *v in _icbVariants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
+        if (_icbPl) vkDestroyPipelineLayout(RDNA4R.dev, _icbPl, NULL);
+        for (int i = 0; i < 2; i++) if (_icbDsl[i]) vkDestroyDescriptorSetLayout(RDNA4R.dev, _icbDsl[i], NULL);
+        if (_icbTessDsl) vkDestroyDescriptorSetLayout(RDNA4R.dev, _icbTessDsl, NULL);
+        if (_icbVs) vkDestroyShaderModule(RDNA4R.dev, _icbVs, NULL);
+        if (_icbTes) vkDestroyShaderModule(RDNA4R.dev, _icbTes, NULL);
+        if (_icbFs) vkDestroyShaderModule(RDNA4R.dev, _icbFs, NULL);
+    }
+    [_icbVariants removeAllObjects];
+    _icbPl = VK_NULL_HANDLE;
+    _icbDsl[0] = _icbDsl[1] = _icbTessDsl = VK_NULL_HANDLE;
+    _icbVs = _icbTes = _icbFs = VK_NULL_HANDLE;
+    free(_icbPbV); _icbPbV = NULL; _icbNpbV = 0;
+    free(_icbPbF); _icbPbF = NULL; _icbNpbF = 0;
+    _icbGpuReady = NO;
+    _icbHasVsParams = NO;
+}
+- (BOOL)rdna4PrepareICBGPUVariant:(NSError **)err {
+    [_lock lock];
+    if (_icbGpuReady) { [_lock unlock]; return YES; }
+    if (!_icb || _fallback || !_icbVsSpv) {
+        [_lock unlock];
+        if (err) *err = rdna4_err(49, @"render pipeline does not support GPU indirect command buffers");
+        return NO;
+    }
+    if (!RDNA4R.bufferAddress) {
+        [_lock unlock];
+        if (err) *err = rdna4_err(49, @"GPU indirect command buffers require Vulkan bufferDeviceAddress");
+        return NO;
+    }
+    const rdna4x_xlib *xl = rdna4x_ensure_xlib(err);
+    if (!xl || !xl->lower_icb_stage) {
+        if (xl && err && !*err) *err = rdna4_err(42, @"translator library lacks garnetx_lower_icb_stage");
+        [_lock unlock];
+        return NO;
+    }
+    uint8_t *vspv = NULL, *fspv = NULL; size_t vlen = 0, flen = 0;
+    RDNA4sMod mv = {0}, mf = {0}; BOOL mvOpen = NO, mfOpen = NO;
+    RDNA4sRefl *rv = NULL, *rf = NULL;
+    BOOL ok = NO;
+    do {
+        uint32_t vtbl = 0, vvsp = 0; char xerr[256] = "";
+        uint32_t skind = _isTess ? 2u : 0u;
+        int rc = xl->lower_icb_stage((const uint8_t *)_icbVsSpv.bytes, _icbVsSpv.length, skind, 0u,
+                                     _isTess ? NULL : _icbVAttrs, _isTess ? 0u : _nIcbVAttrs,
+                                     &vspv, &vlen, &vtbl, &vvsp, xerr, sizeof xerr);
+        if (rc != 0 || !vspv || vlen < 20 || (vlen & 3)) {
+            if (err) *err = rdna4_err(42, [NSString stringWithFormat:@"icb lower vertex/tes stage failed (%d): %s", rc, xerr]);
+            break;
+        }
+        if (_hasFrag) {
+            if (!_icbFsSpv) { if (err) *err = rdna4_err(42, @"missing cached fragment SPIR-V for ICB lowering"); break; }
+            uint32_t ftbl = 0, fvsp = 0; xerr[0] = 0;
+            rc = xl->lower_icb_stage((const uint8_t *)_icbFsSpv.bytes, _icbFsSpv.length, 1u, 1u,
+                                     NULL, 0u, &fspv, &flen, &ftbl, &fvsp, xerr, sizeof xerr);
+            if (rc != 0 || !fspv || flen < 20 || (flen & 3)) {
+                if (err) *err = rdna4_err(42, [NSString stringWithFormat:@"icb lower fragment stage failed (%d): %s", rc, xerr]);
+                break;
+            }
+        }
+        char why[256] = "";
+        rv = calloc(1, sizeof *rv);
+        if (!rv) { if (err) *err = rdna4_err(49, @"out of memory reflecting ICB vertex stage"); break; }
+        if (rdna4s_parse((const uint32_t *)vspv, vlen / 4, &mv, why, sizeof why) || rdna4s_reflect(&mv, 0, rv)) {
+            if (mv.id) mvOpen = YES;
+            if (err) *err = rdna4_err(51, [NSString stringWithFormat:@"ICB lowered vertex reflection failed: %s", why[0] ? why : rv->why]);
+            break;
+        }
+        mvOpen = YES;
+        if (_hasFrag) {
+            rf = calloc(1, sizeof *rf);
+            if (!rf) { if (err) *err = rdna4_err(49, @"out of memory reflecting ICB fragment stage"); break; }
+            if (rdna4s_parse((const uint32_t *)fspv, flen / 4, &mf, why, sizeof why) || rdna4s_reflect(&mf, 1, rf)) {
+                if (mf.id) mfOpen = YES;
+                if (err) *err = rdna4_err(52, [NSString stringWithFormat:@"ICB lowered fragment reflection failed: %s", why[0] ? why : rf->why]);
+                break;
+            }
+            mfOpen = YES;
+        }
+        VkShaderStageFlags vsStage = _isTess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        if (!rdna4_icb_build_stage_dsl(_pbV, _npbV, rv, 0, vsStage, !_isTess, &_icbDsl[0], &_icbPbV, &_icbNpbV, err) ||
+            !rdna4_icb_build_stage_dsl(_pbF, _npbF, rf, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NO, &_icbDsl[1], &_icbPbF, &_icbNpbF, err))
+            break;
+        if (_isTess) {
+            VkDescriptorSetLayoutBinding tb = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+                .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT };
+            VkDescriptorSetLayoutCreateInfo td = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &tb };
+            VkResult tr = vkCreateDescriptorSetLayout(RDNA4R.dev, &td, NULL, &_icbTessDsl);
+            if (tr != VK_SUCCESS) { if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout(icb tess) = %d", tr]); break; }
+        }
+        VkPushConstantRange pcr = { _pcf, 0, _pcs };
+        VkDescriptorSetLayout layouts[6] = { _icbDsl[0], _icbDsl[1],
+            _argumentTables.active ? _argumentTables.dsl[0] : _icbTessDsl,
+            _argumentTables.dsl[1], _argumentTables.dsl[2], _icbTessDsl };
+        uint32_t layoutCount = _argumentTables.active ? (_isTess ? 6u : 5u) : (_isTess ? 3u : 2u);
+        VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = layoutCount,
+            .pSetLayouts = layouts, .pushConstantRangeCount = _pcs ? 1 : 0, .pPushConstantRanges = &pcr };
+        VkResult pr = vkCreatePipelineLayout(RDNA4R.dev, &plc, NULL, &_icbPl);
+        if (pr != VK_SUCCESS) { if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout(icb) = %d", pr]); break; }
+        if (_isTess) {
+            _icbTes = rdna4_spv_module(vspv, vlen, "icb-tess-eval", err);
+            if (!_icbTes) break;
+        } else {
+            _icbVs = rdna4_spv_module(vspv, vlen, "icb-vertex", err);
+            if (!_icbVs) break;
+        }
+        if (_hasFrag) {
+            _icbFs = rdna4_spv_module(fspv, flen, "icb-fragment", err);
+            if (!_icbFs) break;
+        }
+        _icbHasVsParams = !_isTess;
+        _icbGpuReady = YES;
+        ok = YES;
+    } while (0);
+    if (mvOpen) rdna4s_free(&mv);
+    if (mfOpen) rdna4s_free(&mf);
+    free(rv); free(rf);
+    if (vspv) xl->freep(vspv, vlen);
+    if (fspv) xl->freep(fspv, flen);
+    if (!ok) [self rdna4DestroyICBGPUState];
+    [_lock unlock];
+    return ok;
+}
 - (VkPipeline)rdna4Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk error:(NSError **)err {
+    return [self rdna4Build:topo cull:cull front:front ds:dk icb:NO error:err];
+}
+- (VkPipeline)rdna4Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk icb:(BOOL)icb error:(NSError **)err {
     VkPipelineShaderStageCreateInfo st[4];
     uint32_t stCount = 0;
+    VkShaderModule vsMod = (icb && !_isTess) ? _icbVs : _vs;
+    VkShaderModule tesMod = (icb && _isTess) ? _icbTes : _tes;
+    VkShaderModule fsMod = (icb && _hasFrag) ? _icbFs : _fs;
     if (_isTess) {
         st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = "main" };
         st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, .module = _tcs, .pName = "main" };
-        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, .module = _tes, .pName = _vep };
-        if (_fs) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep };
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, .module = tesMod, .pName = _vep };
+        if (fsMod) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsMod, .pName = _fep };
     } else {
-        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = _vep };
-        if (_fs) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep };
+        st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vsMod, .pName = _vep };
+        if (fsMod) st[stCount++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsMod, .pName = _fep };
     }
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = _nvib, .pVertexBindingDescriptions = _vib, .vertexAttributeDescriptionCount = _nvia, .pVertexAttributeDescriptions = _via };
-    BOOL strip = topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;   // Metal restarts indexed strips at the max index value
+        .vertexBindingDescriptionCount = icb ? 0 : _nvib, .pVertexBindingDescriptions = icb ? NULL : _vib,
+        .vertexAttributeDescriptionCount = icb ? 0 : _nvia, .pVertexAttributeDescriptions = icb ? NULL : _via };
+    BOOL strip = !icb && (topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP);   // Metal restarts indexed strips at the max index value
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo, .primitiveRestartEnable = strip };
     VkPipelineTessellationDomainOriginStateCreateInfo tdo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO,
@@ -573,7 +812,7 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = _pc.ndyn, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gpc = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = stCount, .pStages = st, .pVertexInputState = &vi,
         .pInputAssemblyState = &ia, .pTessellationState = _isTess ? &ts : NULL, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pColorBlendState = &cb,
-        .pDynamicState = &ds, .layout = _pl, .renderPass = _rp };
+        .pDynamicState = &ds, .layout = icb ? _icbPl : _pl, .renderPass = _rp };
     VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, RDNA4R.pc, 1, &gpc, NULL, &p); rdna4t_add(&T1.gfx, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines = %d", r]); return VK_NULL_HANDLE; }
     return p;
@@ -584,14 +823,28 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
     [_lock lock];
     NSValue *v = _variants[k];
     if (!v) {
-        NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk error:&e];
+        NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk icb:NO error:&e];
         if (!p) RDNA4LOG("pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
         else { v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v; RDNA4LOG("pipeline variant topology %d cull %d front %d created", topo, cull, front); }
     }
     [_lock unlock];
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
+- (VkPipeline)icbPipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk {
+    NSNumber *k = @((uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24));
+    [_lock lock];
+    if (!_icbGpuReady) { [_lock unlock]; return VK_NULL_HANDLE; }
+    NSValue *v = _icbVariants[k];
+    if (!v) {
+        NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk icb:YES error:&e];
+        if (!p) RDNA4LOG("icb pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
+        else { v = [NSValue valueWithPointer:(void *)p]; _icbVariants[k] = v; RDNA4LOG("icb pipeline variant topology %d cull %d front %d created", topo, cull, front); }
+    }
+    [_lock unlock];
+    return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
+}
 - (void)dealloc {
+    [self rdna4DestroyICBGPUState];
     if (RDNA4R.ok) {
         for (NSValue *v in _variants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
         if (_pl) vkDestroyPipelineLayout(RDNA4R.dev, _pl, NULL);
@@ -621,6 +874,12 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (uint64_t)tessCacheKey { return _tessKey; }
 - (VkPipelineLayout)layout { return _pl; }
 - (VkDescriptorSetLayout)dsl:(int)i { return _dsl[i]; }
+- (uint64_t)rdna4ICBToken { return _icbToken; }
+- (BOOL)rdna4ICBHasVsParams { return _icbHasVsParams; }
+- (VkPipelineLayout)icbLayout { return _icbPl; }
+- (VkDescriptorSetLayout)icbDsl:(int)i { return _icbDsl[i]; }
+- (VkDescriptorSetLayout)icbTessDsl { return _icbTessDsl; }
+- (const RDNA4PB *)icbPbV { return _icbPbV; } - (uint32_t)icbNpbV { return _icbNpbV; } - (const RDNA4PB *)icbPbF { return _icbPbF; } - (uint32_t)icbNpbF { return _icbNpbF; }
 - (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlanV { return &_scanV; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlanF { return &_scanF; }
@@ -633,6 +892,6 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (NSUInteger)maxTotalThreadsPerThreadgroup { return 0; }
 - (NSUInteger)threadgroupSizeMatchesTileSize { return 0; }
 - (NSUInteger)imageblockSampleLength { return 0; }
-- (BOOL)supportIndirectCommandBuffers { return _icb; }   // CPU replay is wired below; patch and compute remain gated
+- (BOOL)supportIndirectCommandBuffers { return _icb; }
 @end
 

@@ -35,7 +35,7 @@
 #include "rdna4_query_caps.h"
 
 // ---- constants ----
-#define RDNA4X_KEY_TAG       "rdna4x-53-opaque-resource-bda-exclusion"
+#define RDNA4X_KEY_TAG       "rdna4x-54-gpu-icb-render-lowering"
 #define RDNA4X_ABI_VERSION   3u   // capability-aware exports; ABI 2 signatures remain unchanged
 #define RDNA4X_MAX_DEPS      64u   // linked dependencies one pipeline stage may carry (more = no linked translation)
 #define RDNA4X_MAX_DEP_AIR   (8u * 1024u * 1024u)   // total bitcode of all dependencies of one stage
@@ -760,6 +760,20 @@ static inline int rdna4x_reader_print(const rdna4x_reader *r, const uint8_t *air
 // 12. The translator library (Resources/libgarnetxlate.dylib)
 // ======================================================================================================================================================================
 typedef struct {
+    uint32_t location;
+    uint32_t buffer_index;
+    uint32_t offset;
+    uint32_t stride;
+    uint8_t vfmt;
+    uint8_t step_func;
+    uint8_t pad[2];
+    uint32_t step_rate;
+} garnetx_icb_vattr_t;
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(garnetx_icb_vattr_t) == 24, "garnetx_icb_vattr_t must be 24 bytes");
+#endif
+
+typedef struct {
     void *h;
     uint32_t (*abi_version)(void);
     int (*translate)(const uint8_t *, size_t, const uint32_t *, uint8_t **, size_t *, uint8_t **, size_t *, char *, size_t);
@@ -770,6 +784,7 @@ typedef struct {
     int (*translate_with_capabilities)(const uint8_t *, size_t, const uint32_t *, uint8_t **, size_t *, uint8_t **, size_t *, char *, size_t, const rdna4x_backend_capabilities *);
     int (*translate_linked_with_capabilities)(const uint8_t *, size_t, const uint32_t *, const void *, size_t, uint8_t **, size_t *, uint8_t **, size_t *, char *, size_t, const rdna4x_backend_capabilities *);
     int (*lower_arguments_with_capabilities)(const uint8_t *, size_t, const uint8_t *, size_t, uint8_t **, size_t *, uint8_t **, size_t *, char *, size_t, const rdna4x_backend_capabilities *);
+    int (*lower_icb_stage)(const uint8_t *, size_t, uint32_t, uint32_t, const garnetx_icb_vattr_t *, size_t, uint8_t **, size_t *, uint32_t *, uint32_t *, char *, size_t);
 } rdna4x_xlib;
 static inline int rdna4x_xlib_load(rdna4x_xlib *x, const char *path, char *err, size_t errn) {
     memset(x, 0, sizeof *x);
@@ -783,6 +798,7 @@ static inline int rdna4x_xlib_load(rdna4x_xlib *x, const char *path, char *err, 
     *(void **)&x->translate_with_capabilities = dlsym(h, "garnetx_translate_with_capabilities");
     *(void **)&x->translate_linked_with_capabilities = dlsym(h, "garnetx_translate_linked_with_capabilities");
     *(void **)&x->lower_arguments_with_capabilities = dlsym(h, "garnetx_lower_argument_resources_with_capabilities");
+    *(void **)&x->lower_icb_stage = dlsym(h, "garnetx_lower_icb_stage");
     if (!x->abi_version || !x->translate || !x->freep || !x->translate_linked ||
         !x->translate_with_capabilities || !x->translate_linked_with_capabilities || !x->lower_arguments_with_capabilities) { dlclose(h); memset(x, 0, sizeof *x); rdna4x_set_err(err, errn, "the translator library lacks the garnetx_* entry points: %s", path); return -1; }
     if (x->abi_version() != RDNA4X_ABI_VERSION) { dlclose(h); memset(x, 0, sizeof *x); rdna4x_set_err(err, errn, "the translator library has an unknown ABI version: %s", path); return -1; }

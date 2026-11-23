@@ -3,6 +3,65 @@
 
 #include "rdna4_argument_epochs.h"
 
+@protocol RDNA4ICBInternal;
+@class RDNA4RenderPipelineState;
+
+@interface RDNA4ICBArgOwners : NSObject
+@property NSMutableSet *icbs;
+@property NSMutableSet *pipelines;
+@property NSMutableSet *nestedBuffers;
+@end
+@implementation RDNA4ICBArgOwners
+- (instancetype)init {
+    if ((self = [super init])) {
+        _icbs = [NSMutableSet set];
+        _pipelines = [NSMutableSet set];
+        _nestedBuffers = [NSMutableSet set];
+    }
+    return self;
+}
+@end
+
+static char rdna4_icb_arg_owners_key;
+
+static void rdna4_icb_arg_note(RDNA4Buffer *dst, id icb, id pso, RDNA4Buffer *nestedBuf) {
+    if (!dst || (!icb && !pso && !nestedBuf)) return;
+    @synchronized (dst) {
+        RDNA4ICBArgOwners *owners = objc_getAssociatedObject(dst, &rdna4_icb_arg_owners_key);
+        if (!owners) {
+            owners = [RDNA4ICBArgOwners new];
+            objc_setAssociatedObject(dst, &rdna4_icb_arg_owners_key, owners, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (icb) [owners.icbs addObject:icb];
+        if (pso) [owners.pipelines addObject:pso];
+        if (nestedBuf && nestedBuf != dst) [owners.nestedBuffers addObject:nestedBuf];
+    }
+}
+
+static void rdna4_argbuf_icb_snapshot_walk(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos, NSMutableSet *visited) {
+    if (!buf || [visited containsObject:buf]) return;
+    [visited addObject:buf];
+    NSSet *localIcbs = nil, *localPsos = nil, *localNested = nil;
+    @synchronized (buf) {
+        RDNA4ICBArgOwners *owners = objc_getAssociatedObject(buf, &rdna4_icb_arg_owners_key);
+        if (owners) {
+            localIcbs = [owners.icbs copy];
+            localPsos = [owners.pipelines copy];
+            localNested = [owners.nestedBuffers copy];
+        }
+    }
+    if (localIcbs.count) [icbs unionSet:localIcbs];
+    if (localPsos.count) [psos unionSet:localPsos];
+    for (RDNA4Buffer *nb in localNested)
+        rdna4_argbuf_icb_snapshot_walk(nb, icbs, psos, visited);
+}
+
+static void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos) {
+    if (!buf) return;
+    NSMutableSet *visited = [NSMutableSet set];
+    rdna4_argbuf_icb_snapshot_walk(buf, icbs, psos, visited);
+}
+
 #define RDNA4_REFLECTION_STITCHING 0x20000000u
 
 // Metal's metadata completion ignores status, so errors need readable data too.
@@ -94,7 +153,8 @@ static BOOL rdna4_argument_scalar(MTLDataType type, NSUInteger *size, NSUInteger
         *size = columns * *alignment;
         return YES;
     }
-    if (type == MTLDataTypePointer || type == MTLDataTypeTexture || type == MTLDataTypeSampler) {
+    if (type == MTLDataTypePointer || type == MTLDataTypeTexture || type == MTLDataTypeSampler ||
+        type == MTLDataTypeRenderPipeline || type == MTLDataTypeIndirectCommandBuffer) {
         *size = *alignment = sizeof(uint64_t); return YES;
     }
     return NO;
@@ -207,7 +267,8 @@ static BOOL rdna4_argument_add(NSMutableDictionary *fields, MTLDataType type, MT
 - (NSUInteger)constantOffsetAtIndex:(NSUInteger)index {
     RDNA4ArgumentField *field = [self field:index];
     return field && field.type != MTLDataTypePointer && field.type != MTLDataTypeTexture &&
-        field.type != MTLDataTypeSampler ? field.offset : NSUIntegerMax;
+        field.type != MTLDataTypeSampler && field.type != MTLDataTypeRenderPipeline &&
+        field.type != MTLDataTypeIndirectCommandBuffer ? field.offset : NSUIntegerMax;
 }
 - (id)bufferLayoutForResourceAtIndex:(NSUInteger)index { return [self field:index].nested; }
 @end
@@ -1237,7 +1298,9 @@ static void rdna4_argument_sampler_complete(id token) {
 }
 - (void *)rdna4Destination:(NSUInteger)index type:(MTLDataType)type {
     RDNA4ArgumentField *field = [_layout field:index];
-    BOOL resource = field.type == MTLDataTypePointer || field.type == MTLDataTypeTexture || field.type == MTLDataTypeSampler;
+    BOOL resource = field.type == MTLDataTypePointer || field.type == MTLDataTypeTexture ||
+        field.type == MTLDataTypeSampler || field.type == MTLDataTypeRenderPipeline ||
+        field.type == MTLDataTypeIndirectCommandBuffer;
     if (!_buffer || !field || (type == MTLDataTypeNone ? resource : field.type != type) ||
         field.offset > self.encodedLength || field.size > self.encodedLength - field.offset ||
         (resource && field.size != sizeof(uint64_t)))
@@ -1262,6 +1325,8 @@ static void rdna4_argument_sampler_complete(id token) {
     (void)[self rdna4Destination:index type:MTLDataTypePointer];
     uint64_t address = [self rdna4BufferAddress:buffer offset:offset atIndex:index];
     rdna4_argument_sampler_store(_buffer, _offset + [_layout field:index].offset, address, nil);
+    if (buffer && ([_layout field:index].nested != nil || objc_getAssociatedObject(buffer, &rdna4_icb_arg_owners_key) != nil))
+        rdna4_icb_arg_note(_buffer, nil, nil, (RDNA4Buffer *)buffer);
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained *)buffers offsets:(const NSUInteger *)offsets withRange:(NSRange)range {
     if ((!buffers || !offsets) && range.length)
@@ -1320,6 +1385,56 @@ static void rdna4_argument_sampler_complete(id token) {
     [self rdna4ValidateRange:range type:MTLDataTypeSampler];
     for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4SamplerToken:samplers[n]];
     for (NSUInteger n = 0; n < range.length; ++n) [self setSamplerState:samplers[n] atIndex:range.location + n];
+}
+- (uint64_t)rdna4IndirectCommandBufferAddress:(id<MTLIndirectCommandBuffer>)icb {
+    uint64_t address = 0;
+    if (icb) {
+        Class icbClass = objc_getClass("RDNA4IndirectCommandBuffer");
+        if (!icbClass || ![icb isKindOfClass:icbClass] || icb.device != _device)
+            [NSException raise:NSInvalidArgumentException format:@"Argument indirect command buffer has an invalid class or device"];
+        address = [(id<RDNA4ICBInternal>)icb rdna4EnsureGPUBackingAddress];
+        if (!address)
+            [NSException raise:NSInvalidArgumentException format:@"Argument indirect command buffer backing GPU address is unavailable"];
+    }
+    return address;
+}
+- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer atIndex:(NSUInteger)index {
+    (void)[self rdna4Destination:index type:MTLDataTypeIndirectCommandBuffer];
+    uint64_t address = [self rdna4IndirectCommandBufferAddress:indirectCommandBuffer];
+    rdna4_argument_sampler_store(_buffer, _offset + [_layout field:index].offset, address, nil);
+    if (indirectCommandBuffer) rdna4_icb_arg_note(_buffer, indirectCommandBuffer, nil, nil);
+}
+- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained *)buffers withRange:(NSRange)range {
+    if (!buffers && range.length)
+        [NSException raise:NSInvalidArgumentException format:@"Argument indirect command buffer array is null"];
+    [self rdna4ValidateRange:range type:MTLDataTypeIndirectCommandBuffer];
+    for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4IndirectCommandBufferAddress:buffers[n]];
+    for (NSUInteger n = 0; n < range.length; ++n) [self setIndirectCommandBuffer:buffers[n] atIndex:range.location + n];
+}
+- (uint64_t)rdna4RenderPipelineToken:(id<MTLRenderPipelineState>)pipeline {
+    uint64_t token = 0;
+    if (pipeline) {
+        if (![pipeline isKindOfClass:RDNA4RenderPipelineState.class] || pipeline.device != _device ||
+            ![pipeline supportIndirectCommandBuffers])
+            [NSException raise:NSInvalidArgumentException format:@"Argument render pipeline state is invalid or does not support indirect command buffers"];
+        token = [(RDNA4RenderPipelineState *)pipeline rdna4ICBToken];
+        if (!token)
+            [NSException raise:NSInvalidArgumentException format:@"Argument render pipeline state has no ICB token"];
+    }
+    return token;
+}
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline atIndex:(NSUInteger)index {
+    (void)[self rdna4Destination:index type:MTLDataTypeRenderPipeline];
+    uint64_t token = [self rdna4RenderPipelineToken:pipeline];
+    rdna4_argument_sampler_store(_buffer, _offset + [_layout field:index].offset, token, nil);
+    if (pipeline) rdna4_icb_arg_note(_buffer, nil, pipeline, nil);
+}
+- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __unsafe_unretained *)pipelines withRange:(NSRange)range {
+    if (!pipelines && range.length)
+        [NSException raise:NSInvalidArgumentException format:@"Argument render pipeline array is null"];
+    [self rdna4ValidateRange:range type:MTLDataTypeRenderPipeline];
+    for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4RenderPipelineToken:pipelines[n]];
+    for (NSUInteger n = 0; n < range.length; ++n) [self setRenderPipelineState:pipelines[n] atIndex:range.location + n];
 }
 - (void *)constantDataAtIndex:(NSUInteger)index { return [self rdna4Destination:index type:MTLDataTypeNone]; }
 - (id)newArgumentEncoderForBufferAtIndex:(NSUInteger)index {

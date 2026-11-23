@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0067).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0068).
 
 Verification and Tier 2 Scope
 =============================
@@ -17,6 +17,18 @@ version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
 translation and metadata invariants only; they do not establish physical RDNA4
 GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
 stays controlled by the native bundle and compatibility runner.
+
+0068-gpu-icb-lowering-and-stage-bda.patch adds native AIR->SPIR-V lowering for
+MSL 2.1 render indirect command buffer intrinsics (`air.reset_render_command`,
+`air.set_pipeline_state_render_command`, `air.draw_primitives_render_command`,
+`air.copy_render_command`, plus typed `set_vertex_buffer`, `set_fragment_buffer`,
+`draw_indexed_primitives`, `draw_patches`, and `draw_indexed_patches`) to BDA
+stores against `rdna4_icb_header_t`/`rdna4_icb_slot_t`, while keeping compute ICBs
+and `set_object_buffer_render_command` refused. It also adds
+`passes::icb_stage::lower_icb_stage` (and `garnetx_lower_icb_stage` in
+`garnetxlate/`) to convert stage buffer descriptors and vertex inputs into
+dynamic BDA bindings (`676`/`677`) for strict-order GPU ICB execution. User cache tag:
+rdna4x-54-gpu-icb-render-lowering.
 
 0067-exclude-opaque-and-nonbuffer-roots-from-bda.patch prevents opaque texture/sampler
 handles and non-buffer raw parameters from entering `bda_forward_addresses` and

@@ -131,16 +131,16 @@ or establish target-RDNA4 execution.
 | P01 | Triangle/quad post-tessellation vertex functions, control-point and patch inputs; spec 4.1.1.1 | Existing TES translation fixtures only | Generated VS/TCS + TES validate and execute; identify patch/control-point/instance values | 6.1 |
 | P02 | Packed half factors, per-patch/per-instance strides, partition modes, winding, max factor 64 | Patch adapter missing | Known subdivision geometry for each partition, factor boundaries, culling and malformed layouts | 6.1, 6.2 |
 | P03 | Direct/indexed/indirect patch draws, base instance and control-point stepping | Patch draw path missing | Compute-generated factors then exact geometry/pixel comparison; both index and argument offsets | 6.2 |
-| P04 | Patch draws inside CPU/GPU ICBs | ICB path missing | Equivalent direct and ICB patch output, inherited/explicit state and bounded ranges | 6.2, 7.1..7.3 |
+| P04 | Patch draws inside CPU/GPU ICBs | CPU (`test-icb`) & GPU (`test-icb-gpu`) `drawPatches`/`drawIndexedPatches` verified (`logs/rdna4-metal2/20261123-icb/RESULT.md`) | Equivalent direct and ICB patch output, inherited/explicit state and bounded ranges | 6.2, 7.1..7.3 |
 
 ### 7. Indirect command buffers
 
 | ID | Requirement and fixed source | Existing implementation / case | Required oracle | Tasks |
 | --- | --- | --- | --- | --- |
-| I01 | CPU ICB render commands, descriptor constraints, ranges, reset and reuse | Pipeline support query currently NO | Equivalent direct draw/indexed/patch commands, empty/reset slots and range boundaries | 7.1 |
-| I02 | MSL 2.1 GPU encoding/copying ICB commands; spec 5.16 | GPU ICB lowering missing | GPU producer changes rendered output and parameters; no CPU command-decision readback; slot order preserved | 7.2 |
-| I03 | Pipeline/buffer inheritance, explicit state, barriers and command resource lifetime | Existing direct/indirect encoders are reusable | Mixed dependent draw order, distinct registered states, early release, event and heap interactions | 7.1..7.3 |
-| I04 | Partial-submit failure, error status and retirement | Existing no-replay rule | Inject a later failure; accepted commands are not replayed and their backing remains retained until safe | 7.3 |
+| I01 | CPU ICB render commands, descriptor constraints, ranges, reset and reuse | `RDNA4IndirectCommandBuffer` CPU/patch/reset/copy & compute refusal verified by `test-icb` 21/21 (`logs/rdna4-metal2/20261123-icb/RESULT.md`) | Equivalent direct draw/indexed/patch commands, empty/reset slots and range boundaries | 7.1 |
+| I02 | MSL 2.1 GPU encoding/copying ICB commands; spec 5.16 | `0068` AIR lowering, `garnetx_lower_icb_stage`, SPIR-V expander (`test-icb-spv`), `test-icb-gpu` 5/5 `cpu_readback=0` (`logs/rdna4-metal2/20261123-icb/RESULT.md`) | GPU producer changes rendered output and parameters; no CPU command-decision readback; slot order preserved | 7.2 |
+| I03 | Pipeline/buffer inheritance, explicit state, barriers and command resource lifetime | `test-icb` + `test-icb-gpu` + `test-icb-lifecycle` (`-O0`/`-O2`) + `test-icb-transactions.sh` verified (`logs/rdna4-metal2/20261123-icb/RESULT.md`) | Mixed dependent draw order, distinct registered states, early release, event and heap interactions | 7.1..7.3 |
+| I04 | Partial-submit failure, error status and retirement | Segment quarantine & `rdna4RetainEncoded:` verified by `test-icb-lifecycle` & `test-icb-transactions.sh` (`logs/rdna4-metal2/20261123-icb/RESULT.md`) | Inject a later failure; accepted commands are not replayed and their backing remains retained until safe | 7.3 |
 
 The fixed MSL 2.1 section 5.16 supports ICB **render** commands. Later compute
 ICB command types are an extension and must remain separately gated; ordinary

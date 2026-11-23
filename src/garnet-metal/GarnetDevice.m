@@ -447,6 +447,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_depth_fence_impl.inc"
 #include "rdna4_shader_runtime_impl.inc"
 #include "rdna4_tessellation.h"
+#include "rdna4_icb_abi.h"
 #include "rdna4_render_pipeline_impl.inc"
 #include "rdna4_stage_bindings_impl.inc"
 #include "rdna4_compute_pipeline_impl.inc"
@@ -763,21 +764,34 @@ static void rdna4_census_log(void) {
 // native #12 luma: QuartzCore's CA::OGL::MetalContext::get_compute_pipeline (compute_average_luma, glass backdrop tint, Reduce Transparency off) sends
 // -newComputePipelineStateWithDescriptor:error: (CONFIRMED: selector reference at QuartzCore 0x7ff80d2e6c74 resolves through the cache). That selector was not
 // implemented here, the inherited one returned nil although the spvcache has the kernel, and QuartzCore aborts on nil (abort_with_payload, function=compute_average_luma).
+static BOOL rdna4_compute_desc_wants_icb(MTLComputePipelineDescriptor *d, NSError **error) {
+    if (d && [d respondsToSelector:@selector(supportIndirectCommandBuffers)] && d.supportIndirectCommandBuffers) {
+        if (error) *error = rdna4_err(61, @"compute indirect command buffers are outside the Metal 2 baseline");
+        return YES;
+    }
+    return NO;
+}
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
+    if (rdna4_compute_desc_wants_icb(d, error)) return nil;
     rdna4x_linkage_compute(d); RDNA4LOG("newComputePipelineStateWithDescriptor:error:"); return [self rdna4NewComputePipeline:d.computeFunction error:error]; }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id, NSError *))h {
     if (!h) return;
     MTLComputePipelineDescriptor *saved = [d copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
-        rdna4x_linkage_compute(saved); NSError *e = nil; id p = [self rdna4NewComputePipeline:saved.computeFunction error:&e]; h(p, e);
+        NSError *e = nil;
+        if (rdna4_compute_desc_wants_icb(saved, &e)) { h(nil, e); return; }
+        rdna4x_linkage_compute(saved); id p = [self rdna4NewComputePipeline:saved.computeFunction error:&e]; h(p, e);
     }}); }
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
+    if (rdna4_compute_desc_wants_icb(d, error)) return nil;
     rdna4x_linkage_compute(d); RDNA4LOG("newComputePipelineStateWithDescriptor:options:reflection:error:"); return [self rdna4NewComputePipeline:d.computeFunction stageInputDescriptor:d.stageInputDescriptor options:o reflection:r error:error]; }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o completionHandler:(void (^)(id, id, NSError *))h {
     if (!h) return;
     MTLComputePipelineDescriptor *saved = [d copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
-        rdna4x_linkage_compute(saved); NSError *e = nil; MTLComputePipelineReflection *r = nil;
+        NSError *e = nil; MTLComputePipelineReflection *r = nil;
+        if (rdna4_compute_desc_wants_icb(saved, &e)) { h(nil, nil, e); return; }
+        rdna4x_linkage_compute(saved);
         id p = [self rdna4NewComputePipeline:saved.computeFunction stageInputDescriptor:saved.stageInputDescriptor options:o reflection:&r error:&e]; h(p, r, e);
     }}); }
 
@@ -1226,4 +1240,5 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 // CPU ICB baseline: direct/indexed render commands, inherited/explicit buffers,
 // bounded range execution, and ordered reset/copy transactions. Patch and compute
 // command paths remain explicit refusals until their executable implementations exist.
+#include "rdna4_icb_expand.h"
 #include "rdna4_icb.inc"

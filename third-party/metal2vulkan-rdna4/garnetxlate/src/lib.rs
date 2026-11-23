@@ -16,6 +16,8 @@
 //! C boundary. Return codes of `garnetx_translate`: 0 ok, 1 refused (the translator said no), 2 panic
 //! caught, 3 bad arguments.
 
+mod icb_stage;
+pub use icb_stage::garnetx_lower_icb_stage;
 mod source_proof;
 
 mod query_lod;

@@ -22,7 +22,7 @@ sed -i.bak 's/"validation", //' "$OUT/src/Cargo.toml" && rm -f "$OUT/src/Cargo.t
 LIB="$OUT/src/target/x86_64-apple-darwin/release/libgarnetxlate.dylib"
 [ "$(lipo -archs "$LIB" | tr -d '[:space:]')" = x86_64 ] || { echo "build-xlate.sh: $LIB is not thin x86_64" >&2; exit 1; }
 nm -gU "$LIB" > "$OUT/exports.txt"
-for s in garnetx_abi_version garnetx_translate garnetx_translate_linked garnetx_free garnetx_lower_argument_resources garnetx_translate_with_capabilities garnetx_translate_linked_with_capabilities garnetx_lower_argument_resources_with_capabilities; do
+for s in garnetx_abi_version garnetx_translate garnetx_translate_linked garnetx_free garnetx_lower_argument_resources garnetx_translate_with_capabilities garnetx_translate_linked_with_capabilities garnetx_lower_argument_resources_with_capabilities garnetx_lower_icb_stage; do
     grep -q " _$s\$" "$OUT/exports.txt" || { echo "build-xlate.sh: $LIB does not export $s" >&2; exit 1; }
 done
 echo "$LIB"

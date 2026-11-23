@@ -7,7 +7,6 @@
 // https://developer.apple.com/documentation/metal/mtlrendercommandencoder/executecommandsinbuffer(_:range:)
 static const NSUInteger RDNA4ICB_MAX_EXECUTION_RANGE = 0x4000;
 static const NSUInteger RDNA4ICB_MAX_BUFFER_BINDINGS = 31;
-static const NSUInteger RDNA4ICB_MIN_TESS_FACTOR_BYTES = 16;
 static const MTLIndirectCommandType RDNA4ICB_TYPE_DRAW_PATCHES = (MTLIndirectCommandType)(1u << 2);
 static const MTLIndirectCommandType RDNA4ICB_TYPE_DRAW_INDEXED_PATCHES = (MTLIndirectCommandType)(1u << 3);
 
@@ -28,6 +27,17 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 @interface RDNA4CommandBuffer (RDNA4OrderedHostAction)
 - (id<MTLDevice>)device;
 - (BOOL)rdna4EncodeOrderedHostAction:(BOOL (^)(NSError **))action error:(NSError **)error;
+#ifdef VK_VERSION_1_0
+- (void)rdna4RetainEncoded:(id)object;
+- (VkCommandBuffer)vk;
+- (BOOL)rdna4HasArgumentWrites;
+- (void)rdna4ArgumentCheckpoint;
+- (VkDescriptorSet)rdna4AllocSet:(VkDescriptorSetLayout)l;
+- (BOOL)rdna4FillSet:(VkDescriptorSet)set bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm;
+- (BOOL)rdna4PrepareArguments:(const RDNA4ArgumentTables *)tables resources:(NSSet *)resources writable:(NSSet *)writable scan:(const RDNA4ArgumentScanPrepared *)scan textures:(void (^)(RDNA4Texture *, VkImageLayout, BOOL))prepare;
+- (void)rdna4CopyArgumentSets:(VkDescriptorSet [3])outSets;
+- (BOOL)rdna4Bytes:(const void *)p length:(NSUInteger)n buffer:(RDNA4Buffer * __strong *)ob offset:(NSUInteger *)oo;
+#endif
 @end
 
 @interface RDNA4RenderEncoder (RDNA4IndirectCommands)
@@ -40,6 +50,21 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (void)rdna4ICBClearExplicitBuffers;
 - (void)rdna4ICBRetainResource:(id)resource;
 @end
+
+#ifdef VK_VERSION_1_0
+@interface RDNA4RenderEncoder (RDNA4InternalAccess)
+- (void)rdna4SyncResourceSegment;
+- (void)rdna4SnapshotResources;
+- (void)rdna4EndPass;
+- (void)rdna4BeginPass;
+- (void)rdna4OccDraw;
+- (void)rdna4Need:(RDNA4Texture *)t layout:(VkImageLayout)l;
+- (void)rdna4EachTex:(const RDNA4PB *)pb n:(uint32_t)n state:(const RDNA4StageState *)st dev:(id)dev;
+- (void)setTessellationFactorBuffer:(id)b offset:(NSUInteger)off instanceStride:(NSUInteger)st;
+- (void)drawPatches:(NSUInteger)cp patchStart:(NSUInteger)ps patchCount:(NSUInteger)pc patchIndexBuffer:(id)pib patchIndexBufferOffset:(NSUInteger)pio instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi;
+- (void)drawIndexedPatches:(NSUInteger)cp patchStart:(NSUInteger)ps patchCount:(NSUInteger)pc patchIndexBuffer:(id)pib patchIndexBufferOffset:(NSUInteger)pio controlPointIndexBuffer:(id)cpib controlPointIndexBufferOffset:(NSUInteger)cpio instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi;
+@end
+#endif
 
 @interface RDNA4ICBBind : NSObject
 @property(nonatomic, strong) RDNA4Buffer *buffer;
@@ -159,8 +184,12 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 }
 @end
 
+#ifdef VK_VERSION_1_0
+@interface RDNA4IndirectCommandBuffer : NSObject <RDNA4ICBInternal> {
+#else
 @interface RDNA4IndirectCommandBuffer : NSObject {
-@private
+#endif
+@public
     id _dev;
     NSString *_label;
     MTLResourceOptions _options;
@@ -181,6 +210,16 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
     NSString *_fatalError;
     pthread_mutex_t _mu;
     BOOL _muReady;
+#ifdef VK_VERSION_1_0
+    RDNA4Buffer *_gpuBacking;
+    BOOL _gpuProduced;
+    NSMutableSet<NSNumber *> *_cpuDirtySlots;
+    BOOL _cpuFullReset;
+    NSMutableArray<NSValue *> *_cpuResetRanges;
+    NSMutableArray<RDNA4RenderPipelineState *> *_candidatePipelines;
+    NSMutableSet *_gpuRetained;
+    _Atomic uint64_t _cpuReadbackCount;
+#endif
 }
 - (instancetype)initWithDevice:(id)device
                     descriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
@@ -238,6 +277,10 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
                commandBuffer:(RDNA4CommandBuffer *)commandBuffer
                   reason:(NSString **)reason;
 - (BOOL)rdna4ValidateRange:(NSRange)range reason:(NSString **)reason;
+#ifdef VK_VERSION_1_0
+- (BOOL)rdna4SyncCPUWritesToGPU:(NSError **)err;
+- (uint64_t)rdna4ICBCPUReadbackCount;
+#endif
 - (BOOL)rdna4PublishResetRangeLocked:(NSRange)range error:(NSError **)error;
 - (BOOL)rdna4PublishCopyRangeLocked:(NSRange)sourceRange
                            toBuffer:(RDNA4IndirectCommandBuffer *)destination
@@ -308,19 +351,6 @@ static BOOL rdna4icb_buffer_range_ok(id buffer, id device, NSUInteger offset,
     return offset <= length && elementCount <= (length - offset) / elementSize;
 }
 
-static BOOL rdna4icb_strided_range_ok(id buffer, id device, NSUInteger offset, NSUInteger stride,
-                                     NSUInteger first, NSUInteger count, NSUInteger recordBytes) {
-    if (![buffer isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)buffer device] != device) return NO;
-    NSUInteger length = [(RDNA4Buffer *)buffer length];
-    if (offset > length) return NO;
-    if (!count) return YES;
-    if (stride < recordBytes || !recordBytes || first > (NSUIntegerMax - offset) / stride) return NO;
-    NSUInteger record = offset + first * stride;
-    if (record > length || recordBytes > length - record) return NO;
-    if (count <= 1) return YES;
-    return count - 1 <= (length - record - recordBytes) / stride;
-}
-
 static BOOL rdna4icb_buffer_slot_view_ok(RDNA4Buffer *buffer, NSUInteger offset, BOOL uniform) {
     if (!buffer) return NO;
     uint64_t alignment = 1;
@@ -388,12 +418,11 @@ static BOOL rdna4icb_read_bool(id object, SEL selector, BOOL *value) {
 
 static NSString *rdna4icb_descriptor_problem(MTLIndirectCommandBufferDescriptor *descriptor) {
     if (!descriptor) return @"nil indirect command buffer descriptor";
-    // This object is the CPU draw/indexed baseline. Patch and compute command
-    // types stay unavailable until their execution paths are wired.
-    const MTLIndirectCommandType supported = MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed;
+    const MTLIndirectCommandType supported = MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed |
+                                             RDNA4ICB_TYPE_DRAW_PATCHES | RDNA4ICB_TYPE_DRAW_INDEXED_PATCHES;
     if (!descriptor.commandTypes) return @"descriptor.v1 commandTypes is empty";
     if (descriptor.commandTypes & ~supported)
-        return [NSString stringWithFormat:@"commandTypes 0x%lx include patch, compute, mesh or unknown commands outside the CPU draw/indexed ICB baseline",
+        return [NSString stringWithFormat:@"commandTypes 0x%lx include compute, mesh or unknown commands outside the Metal 2 render ICB baseline",
                 (unsigned long)descriptor.commandTypes];
     if (descriptor.maxVertexBufferBindCount > RDNA4ICB_MAX_BUFFER_BINDINGS ||
         descriptor.maxFragmentBufferBindCount > RDNA4ICB_MAX_BUFFER_BINDINGS)
@@ -638,6 +667,12 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     _inheritBuffers = descriptor.inheritBuffers;
     _maxVertexBufferBindCount = descriptor.inheritBuffers ? 0 : descriptor.maxVertexBufferBindCount;
     _maxFragmentBufferBindCount = descriptor.inheritBuffers ? 0 : descriptor.maxFragmentBufferBindCount;
+#ifdef VK_VERSION_1_0
+    _cpuDirtySlots = [NSMutableSet set];
+    _cpuResetRanges = [NSMutableArray array];
+    _candidatePipelines = [NSMutableArray array];
+    _gpuRetained = [NSMutableSet set];
+#endif
     return self;
 }
 - (void)dealloc {
@@ -729,7 +764,12 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     else if ([(id<MTLRenderPipelineState>)pipeline device] != _dev) problem = @"pipeline belongs to another device";
     else if (!rdna4icb_pipeline_supports_icb(pipeline)) problem = @"pipeline does not support indirect command buffers";
     if (problem) [record reject:problem];
-    else record.pipeline = pipeline;
+    else {
+        record.pipeline = pipeline;
+#ifdef VK_VERSION_1_0
+        if (_gpuBacking) [_cpuDirtySlots addObject:@(index)];
+#endif
+    }
     pthread_mutex_unlock(&_mu);
 }
 - (void)rdna4SetBuffer:(id)buffer
@@ -755,6 +795,9 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         NSMutableDictionary<NSNumber *, RDNA4ICBBind *> *binds = fragment ? record.fragmentBinds : record.vertexBinds;
         @try {
             binds[@(bufferIndex)] = [[RDNA4ICBBind alloc] initWithBuffer:buffer offset:offset];
+#ifdef VK_VERSION_1_0
+            if (_gpuBacking) [_cpuDirtySlots addObject:@(commandIndex)];
+#endif
         } @catch (NSException *exception) {
             [record reject:[NSString stringWithFormat:@"buffer binding allocation failed: %@",
                             exception.reason ?: @"out of memory"]];
@@ -804,6 +847,9 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         record.vertexCount = vertexCount;
         record.instanceCount = instanceCount;
         record.baseInstance = baseInstance;
+#ifdef VK_VERSION_1_0
+        if (_gpuBacking) [_cpuDirtySlots addObject:@(index)];
+#endif
     }
     pthread_mutex_unlock(&_mu);
 }
@@ -851,6 +897,9 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         record.instanceCount = instanceCount;
         record.baseVertex = baseVertex;
         record.baseInstance = baseInstance;
+#ifdef VK_VERSION_1_0
+        if (_gpuBacking) [_cpuDirtySlots addObject:@(index)];
+#endif
     }
     pthread_mutex_unlock(&_mu);
 }
@@ -874,13 +923,13 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     NSString *problem = nil;
     if (![self rdna4RecordCanCommitDraw:record commandType:type problem:&problem]) {
         [record reject:problem];
-    } else if (!patchControlPoints) {
-        problem = @"patch control point count is zero";
+    } else if (patchControlPoints > 32) {
+        problem = @"patch control point count exceeds 32";
     } else if (!rdna4icb_u32_range_ok(patchStart, patchCount) ||
                !rdna4icb_u32_range_ok(baseInstance, instanceCount)) {
         problem = @"patch or instance range exceeds Vulkan's 32-bit draw limits";
     } else {
-        NSUInteger patchEnd = patchStart + patchCount;
+        NSUInteger patchEnd = patchCount ? (patchStart + patchCount) : 0;
         NSUInteger controlPointCount = 0;
         if (indexed && patchEnd && patchControlPoints > NSUIntegerMax / patchEnd) {
             problem = @"control-point index count overflows NSUInteger";
@@ -888,17 +937,14 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
             controlPointCount = patchEnd * patchControlPoints;
         }
         if (!problem && !rdna4icb_buffer_range_ok(patchIndexBuffer, _dev, patchIndexBufferOffset,
-                                                  2, patchEnd, NO))
-            problem = @"patch index buffer, device, range or alignment is invalid";
+                                                  4, patchEnd, NO))
+            problem = @"patch index buffer, device, range or 4-byte alignment is invalid";
         else if (!problem && !rdna4icb_buffer_range_ok(tessellationFactorBuffer, _dev,
                                                        tessellationFactorBufferOffset, 4, 0, YES))
-            problem = @"tessellation factor buffer, device or alignment is invalid";
-        else if (!problem && !rdna4icb_strided_range_ok(tessellationFactorBuffer, _dev,
-                                                        tessellationFactorBufferOffset,
-                                                        tessellationFactorBufferInstanceStride,
-                                                        baseInstance, instanceCount,
-                                                        RDNA4ICB_MIN_TESS_FACTOR_BYTES))
-            problem = @"tessellation factor instance stride or range is outside the logical resource";
+            problem = @"tessellation factor buffer, device or 4-byte alignment is invalid";
+        else if (!problem && ((tessellationFactorBufferInstanceStride & 3) ||
+                              tessellationFactorBufferInstanceStride > UINT32_MAX))
+            problem = @"tessellation factor instance stride is misaligned or exceeds 32 bits";
         else if (!problem && indexed &&
                  !rdna4icb_buffer_range_ok(controlPointIndexBuffer, _dev,
                                            controlPointIndexBufferOffset, 2, controlPointCount, YES))
@@ -920,6 +966,9 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         record.tessellationFactorInstanceStride = tessellationFactorBufferInstanceStride;
         record.controlPointIndexBuffer = controlPointIndexBuffer;
         record.controlPointIndexBufferOffset = controlPointIndexBufferOffset;
+#ifdef VK_VERSION_1_0
+        if (_gpuBacking) [_cpuDirtySlots addObject:@(index)];
+#endif
     }
     pthread_mutex_unlock(&_mu);
 }
@@ -927,6 +976,9 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     pthread_mutex_lock(&_mu);
     RDNA4ICBRecord *record = index < _commandCount ? _records[@(index)] : nil;
     if (record) [record reset];
+#ifdef VK_VERSION_1_0
+    if (_gpuBacking && index < _commandCount) [_cpuDirtySlots addObject:@(index)];
+#endif
     pthread_mutex_unlock(&_mu);
 }
 - (BOOL)rdna4PublishResetRangeLocked:(NSRange)range error:(NSError **)error {
@@ -1038,6 +1090,353 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     return ok;
 }
 
+#ifdef VK_VERSION_1_0
+static void rdna4icb_retain_record_resources(NSMutableSet *set, RDNA4ICBRecord *rec) {
+    if (!set || !rec) return;
+    for (RDNA4ICBBind *b in rec.vertexBinds.allValues) if (b.buffer) [set addObject:b.buffer];
+    for (RDNA4ICBBind *b in rec.fragmentBinds.allValues) if (b.buffer) [set addObject:b.buffer];
+    if (rec.indexBuffer) [set addObject:rec.indexBuffer];
+    if (rec.patchIndexBuffer) [set addObject:rec.patchIndexBuffer];
+    if (rec.controlPointIndexBuffer) [set addObject:rec.controlPointIndexBuffer];
+    if (rec.tessellationFactorBuffer) [set addObject:rec.tessellationFactorBuffer];
+}
+static void rdna4icb_fill_slot_from_record(RDNA4ICBRecord *record, rdna4_icb_slot_t *out, id *outPso) {
+    memset(out, 0, sizeof *out);
+    if (outPso) *outPso = nil;
+    if (!record) return;
+    if (record.error) out->flags |= RDNA4_ICB_SLOT_FLAG_INVALID;
+    if (record.pipeline) {
+        out->flags |= RDNA4_ICB_SLOT_FLAG_PIPELINE_SET;
+        out->pipeline_token = [record.pipeline rdna4ICBToken];
+        if (outPso) *outPso = record.pipeline;
+    }
+    for (NSNumber *slot in record.vertexBinds) {
+        NSUInteger s = slot.unsignedIntegerValue;
+        RDNA4ICBBind *bind = record.vertexBinds[slot];
+        if (s < 31 && bind.buffer && [bind.buffer gpuAddress]) {
+            out->vertex_bda[s] = [bind.buffer gpuAddress] + bind.offset;
+            out->vertex_bind_mask |= (1u << s);
+        }
+    }
+    for (NSNumber *slot in record.fragmentBinds) {
+        NSUInteger s = slot.unsignedIntegerValue;
+        RDNA4ICBBind *bind = record.fragmentBinds[slot];
+        if (s < 31 && bind.buffer && [bind.buffer gpuAddress]) {
+            out->fragment_bda[s] = [bind.buffer gpuAddress] + bind.offset;
+            out->fragment_bind_mask |= (1u << s);
+        }
+    }
+    switch (record.kind) {
+        case RDNA4ICBCommandEmpty:
+            out->kind = RDNA4_ICB_KIND_EMPTY;
+            break;
+        case RDNA4ICBCommandDraw:
+            out->kind = RDNA4_ICB_KIND_DRAW;
+            out->primitive_type = (uint32_t)record.primitiveType;
+            out->count_or_patch_count = (uint32_t)record.vertexCount;
+            out->instance_count = (uint32_t)record.instanceCount;
+            out->first_or_patch_start = (uint32_t)record.vertexStart;
+            out->base_instance = (uint32_t)record.baseInstance;
+            break;
+        case RDNA4ICBCommandDrawIndexed:
+            out->kind = RDNA4_ICB_KIND_DRAW_INDEXED;
+            out->primitive_type = (uint32_t)record.primitiveType;
+            out->index_type = (record.indexType == MTLIndexTypeUInt32) ? RDNA4_ICB_INDEX_UINT32 : RDNA4_ICB_INDEX_UINT16;
+            out->count_or_patch_count = (uint32_t)record.indexCount;
+            out->instance_count = (uint32_t)record.instanceCount;
+            out->first_or_patch_start = 0u;
+            out->base_vertex = (int32_t)record.baseVertex;
+            out->base_instance = (uint32_t)record.baseInstance;
+            if (record.indexBuffer && [record.indexBuffer gpuAddress])
+                out->index_or_cp_bda = [record.indexBuffer gpuAddress] + record.indexBufferOffset;
+            break;
+        case RDNA4ICBCommandDrawPatches:
+        case RDNA4ICBCommandDrawIndexedPatches:
+            out->kind = (record.kind == RDNA4ICBCommandDrawIndexedPatches)
+                ? RDNA4_ICB_KIND_DRAW_INDEXED_PATCHES : RDNA4_ICB_KIND_DRAW_PATCHES;
+            out->patch_control_points = (uint32_t)record.patchControlPoints;
+            out->count_or_patch_count = (uint32_t)record.patchCount;
+            out->instance_count = (uint32_t)record.instanceCount;
+            out->first_or_patch_start = (uint32_t)record.patchStart;
+            out->base_instance = (uint32_t)record.baseInstance;
+            out->tess_instance_stride = (uint32_t)record.tessellationFactorInstanceStride;
+            if (record.patchIndexBuffer && [record.patchIndexBuffer gpuAddress])
+                out->patch_index_bda = [record.patchIndexBuffer gpuAddress] + record.patchIndexBufferOffset;
+            if (record.tessellationFactorBuffer && [record.tessellationFactorBuffer gpuAddress])
+                out->tess_factor_bda = [record.tessellationFactorBuffer gpuAddress] + record.tessellationFactorBufferOffset;
+            if (record.kind == RDNA4ICBCommandDrawIndexedPatches &&
+                record.controlPointIndexBuffer && [record.controlPointIndexBuffer gpuAddress])
+                out->index_or_cp_bda = [record.controlPointIndexBuffer gpuAddress] + record.controlPointIndexBufferOffset;
+            break;
+    }
+}
+
+static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayout *outPl, VkPipeline *outPipe, NSError **err) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static VkDevice dev = VK_NULL_HANDLE;
+    static VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    static VkPipelineLayout pl = VK_NULL_HANDLE;
+    static VkPipeline pipe = VK_NULL_HANDLE;
+    if (!rdna4_radv_open(err)) return NO;
+    pthread_mutex_lock(&mu);
+    if (dev != RDNA4R.dev) {
+        if (dev) {
+            if (pipe) vkDestroyPipeline(dev, pipe, NULL);
+            if (pl) vkDestroyPipelineLayout(dev, pl, NULL);
+            if (dsl) vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+        }
+        dev = RDNA4R.dev; dsl = VK_NULL_HANDLE; pl = VK_NULL_HANDLE; pipe = VK_NULL_HANDLE;
+    }
+    if (!pipe) {
+        VkShaderModule sm = VK_NULL_HANDLE;
+        uint32_t *words = NULL; size_t nwords = 0;
+        BOOL ok = NO;
+        do {
+            VkDescriptorSetLayoutBinding bnd[8];
+            for (uint32_t i = 0; i < 8; i++)
+                bnd[i] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+            VkDescriptorSetLayoutCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 8, .pBindings = bnd };
+            VkResult r = vkCreateDescriptorSetLayout(RDNA4R.dev, &dci, NULL, &dsl);
+            if (r != VK_SUCCESS) { if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout(icb expand) = %d", r]); break; }
+            VkPipelineLayoutCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl };
+            r = vkCreatePipelineLayout(RDNA4R.dev, &pci, NULL, &pl);
+            if (r != VK_SUCCESS) { if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout(icb expand) = %d", r]); break; }
+            if (!rdna4_icb_emit_expand_spv(&words, &nwords)) { if (err) *err = rdna4_err(42, @"failed to emit GPU ICB expander SPIR-V"); break; }
+            sm = rdna4_spv_module(words, nwords * 4, "icb-expand", err);
+            free(words); words = NULL;
+            if (!sm) break;
+            VkComputePipelineCreateInfo cpi = {
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main" },
+                .layout = pl
+            };
+            r = vkCreateComputePipelines(RDNA4R.dev, RDNA4R.pc, 1, &cpi, NULL, &pipe);
+            if (r != VK_SUCCESS) { if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateComputePipelines(icb expand) = %d", r]); break; }
+            ok = YES;
+        } while (0);
+        if (words) free(words);
+        if (sm) vkDestroyShaderModule(RDNA4R.dev, sm, NULL);
+        if (!ok) {
+            if (pipe) { vkDestroyPipeline(RDNA4R.dev, pipe, NULL); pipe = VK_NULL_HANDLE; }
+            if (pl) { vkDestroyPipelineLayout(RDNA4R.dev, pl, NULL); pl = VK_NULL_HANDLE; }
+            if (dsl) { vkDestroyDescriptorSetLayout(RDNA4R.dev, dsl, NULL); dsl = VK_NULL_HANDLE; }
+            pthread_mutex_unlock(&mu);
+            return NO;
+        }
+    }
+    *outDsl = dsl; *outPl = pl; *outPipe = pipe;
+    pthread_mutex_unlock(&mu);
+    return YES;
+}
+
+- (uint64_t)rdna4ICBCPUReadbackCount { return atomic_load(&_cpuReadbackCount); }
+
+- (id)rdna4GPUBacking {
+    pthread_mutex_lock(&_mu);
+    RDNA4Buffer *b = _gpuBacking;
+    pthread_mutex_unlock(&_mu);
+    return b;
+}
+
+- (BOOL)rdna4RegisterCandidatePipelineLocked:(id)pipeline {
+    if (![pipeline isKindOfClass:[RDNA4RenderPipelineState class]]) return NO;
+    RDNA4RenderPipelineState *pso = (RDNA4RenderPipelineState *)pipeline;
+    if ([pso device] != _dev || ![pso supportIndirectCommandBuffers]) return NO;
+    uint64_t tok = [pso rdna4ICBToken];
+    if (!tok) return NO;
+    for (RDNA4RenderPipelineState *existing in _candidatePipelines) {
+        if ([existing rdna4ICBToken] == tok) return YES;
+    }
+    if (_candidatePipelines.count >= RDNA4_ICB_MAX_CANDIDATE_PIPELINES) return NO;
+    [_candidatePipelines addObject:pso];
+    return YES;
+}
+
+- (BOOL)rdna4RegisterCandidatePipeline:(id)pipeline {
+    pthread_mutex_lock(&_mu);
+    BOOL ok = [self rdna4RegisterCandidatePipelineLocked:pipeline];
+    pthread_mutex_unlock(&_mu);
+    return ok;
+}
+
+- (uint64_t)rdna4EnsureGPUBackingAddress {
+    pthread_mutex_lock(&_mu);
+    if (_gpuBacking) {
+        uint64_t addr = [_gpuBacking gpuAddress];
+        pthread_mutex_unlock(&_mu);
+        return addr;
+    }
+    if (_commandCount > RDNA4_ICB_MAX_GPU_SLOTS || !RDNA4R.bufferAddress) {
+        pthread_mutex_unlock(&_mu);
+        return 0;
+    }
+    uint64_t backingBytes = rdna4_icb_backing_bytes((uint32_t)_commandCount);
+    NSError *err = nil;
+    RDNA4Buffer *backing = [[RDNA4Buffer alloc] initWithDevice:_dev
+                                                        length:(NSUInteger)backingBytes
+                                                       options:MTLResourceStorageModePrivate | RDNA4_OPT_NOZERO
+                                                         error:&err];
+    if (!backing || ![backing gpuAddress]) {
+        pthread_mutex_unlock(&_mu);
+        return 0;
+    }
+    NSUInteger recordCount = _records.count;
+    size_t stgBytes = RDNA4_ICB_HEADER_BYTES + (size_t)recordCount * RDNA4_ICB_SLOT_BYTES;
+    RDNA4Buffer *stg = [[RDNA4Buffer alloc] initWithDevice:_dev length:stgBytes options:0 error:&err];
+    if (!stg || !stg.contents) {
+        pthread_mutex_unlock(&_mu);
+        return 0;
+    }
+    uint8_t *dst = (uint8_t *)stg.contents;
+    rdna4_icb_header_t hdr = {0};
+    hdr.magic = RDNA4_ICB_MAGIC;
+    hdr.max_command_count = (uint32_t)_commandCount;
+    hdr.command_types = (uint32_t)(_commandTypes & RDNA4_ICB_CMD_MASK);
+    hdr.flags = (_inheritPipelineState ? RDNA4_ICB_FLAG_INHERIT_PIPELINE : 0u) |
+                (_inheritBuffers ? RDNA4_ICB_FLAG_INHERIT_BUFFERS : 0u);
+    hdr.max_vertex_binds = (uint32_t)_maxVertexBufferBindCount;
+    hdr.max_fragment_binds = (uint32_t)_maxFragmentBufferBindCount;
+    hdr.slot_stride = RDNA4_ICB_SLOT_BYTES;
+    memcpy(dst, &hdr, sizeof hdr);
+
+    NSUInteger nCopies = 1 + recordCount;
+    VkBufferCopy *copies = calloc(nCopies, sizeof *copies);
+    if (!copies) { pthread_mutex_unlock(&_mu); return 0; }
+    copies[0] = (VkBufferCopy){ [stg rdna4VkOffset], [backing rdna4VkOffset], RDNA4_ICB_HEADER_BYTES };
+    NSUInteger ci = 1;
+    BOOL candOk = YES;
+    for (NSNumber *key in _records) {
+        NSUInteger idx = key.unsignedIntegerValue;
+        RDNA4ICBRecord *rec = _records[key];
+        rdna4_icb_slot_t *slotPtr = (rdna4_icb_slot_t *)(dst + RDNA4_ICB_HEADER_BYTES + (ci - 1) * RDNA4_ICB_SLOT_BYTES);
+        id pso = nil;
+        rdna4icb_fill_slot_from_record(rec, slotPtr, &pso);
+        if (pso && ![self rdna4RegisterCandidatePipelineLocked:pso]) { candOk = NO; break; }
+        rdna4icb_retain_record_resources(_gpuRetained, rec);
+        copies[ci] = (VkBufferCopy){
+            [stg rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)(ci - 1) * RDNA4_ICB_SLOT_BYTES,
+            [backing rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)idx * RDNA4_ICB_SLOT_BYTES,
+            RDNA4_ICB_SLOT_BYTES
+        };
+        ci++;
+    }
+    if (!candOk) { free(copies); pthread_mutex_unlock(&_mu); return 0; }
+    BOOL uploaded = rdna4_oneshot(&err, ^(VkCommandBuffer cmd) {
+        vkCmdFillBuffer(cmd, [backing vkBuffer], [backing rdna4VkOffset], backingBytes, 0);
+        rdna4_full_barrier(cmd);
+        vkCmdCopyBuffer(cmd, [stg vkBuffer], [backing vkBuffer], (uint32_t)nCopies, copies);
+        rdna4_full_barrier(cmd);
+    }, NULL);
+    free(copies);
+    if (!uploaded) { pthread_mutex_unlock(&_mu); return 0; }
+    _gpuBacking = backing;
+    [_cpuDirtySlots removeAllObjects];
+    _cpuFullReset = NO;
+    [_cpuResetRanges removeAllObjects];
+    uint64_t addr = [_gpuBacking gpuAddress];
+    pthread_mutex_unlock(&_mu);
+    return addr;
+}
+
+- (BOOL)rdna4SyncCPUWritesToGPU:(NSError **)err {
+    pthread_mutex_lock(&_mu);
+    if (!_gpuBacking || (!_cpuDirtySlots.count && !_cpuFullReset && !_cpuResetRanges.count)) {
+        pthread_mutex_unlock(&_mu);
+        return YES;
+    }
+    RDNA4Buffer *backing = _gpuBacking;
+    BOOL fullReset = _cpuFullReset;
+    NSArray<NSValue *> *resetRanges = [_cpuResetRanges copy];
+    NSArray<NSNumber *> *keys = [_cpuDirtySlots allObjects];
+    NSMutableArray *recs = [NSMutableArray arrayWithCapacity:keys.count];
+    for (NSNumber *k in keys) {
+        RDNA4ICBRecord *rec = _records[k];
+        if (rec) {
+            if (rec.pipeline && ![self rdna4RegisterCandidatePipelineLocked:rec.pipeline]) {
+                pthread_mutex_unlock(&_mu);
+                if (err) *err = rdna4_err(120, @"indirect command buffer exceeds 32 candidate pipelines");
+                return NO;
+            }
+            rdna4icb_retain_record_resources(_gpuRetained, rec);
+            [recs addObject:rec];
+        } else {
+            [recs addObject:[NSNull null]];
+        }
+    }
+    NSUInteger nRec = keys.count;
+    RDNA4Buffer *stg = nil;
+    VkBufferCopy *copies = NULL;
+    if (nRec) {
+        stg = [[RDNA4Buffer alloc] initWithDevice:_dev length:nRec * RDNA4_ICB_SLOT_BYTES options:0 error:err];
+        copies = calloc(nRec, sizeof *copies);
+        if (!stg || !stg.contents || !copies) {
+            free(copies);
+            pthread_mutex_unlock(&_mu);
+            return NO;
+        }
+        uint8_t *dst = (uint8_t *)stg.contents;
+        for (NSUInteger i = 0; i < nRec; i++) {
+            id entry = recs[i];
+            RDNA4ICBRecord *rec = (entry == [NSNull null]) ? nil : (RDNA4ICBRecord *)entry;
+            rdna4icb_fill_slot_from_record(rec, (rdna4_icb_slot_t *)(dst + i * RDNA4_ICB_SLOT_BYTES), NULL);
+            copies[i] = (VkBufferCopy){
+                [stg rdna4VkOffset] + (VkDeviceSize)i * RDNA4_ICB_SLOT_BYTES,
+                [backing rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)keys[i].unsignedIntegerValue * RDNA4_ICB_SLOT_BYTES,
+                RDNA4_ICB_SLOT_BYTES
+            };
+        }
+    }
+    VkDeviceSize totalSlotBytes = (VkDeviceSize)_commandCount * RDNA4_ICB_SLOT_BYTES;
+    BOOL synced = rdna4_oneshot(err, ^(VkCommandBuffer cmd) {
+        if (fullReset && totalSlotBytes) {
+            vkCmdFillBuffer(cmd, [backing vkBuffer], [backing rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES, totalSlotBytes, 0);
+        } else {
+            for (NSValue *v in resetRanges) {
+                NSRange r = v.rangeValue;
+                if (!r.length) continue;
+                vkCmdFillBuffer(cmd, [backing vkBuffer],
+                                [backing rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)r.location * RDNA4_ICB_SLOT_BYTES,
+                                (VkDeviceSize)r.length * RDNA4_ICB_SLOT_BYTES, 0);
+            }
+        }
+        if (fullReset || resetRanges.count) rdna4_full_barrier(cmd);
+        if (nRec) {
+            vkCmdCopyBuffer(cmd, [stg vkBuffer], [backing vkBuffer], (uint32_t)nRec, copies);
+            rdna4_full_barrier(cmd);
+        }
+    }, NULL);
+    free(copies);
+    if (synced) {
+        [_cpuDirtySlots removeAllObjects];
+        _cpuFullReset = NO;
+        [_cpuResetRanges removeAllObjects];
+    }
+    pthread_mutex_unlock(&_mu);
+    return synced;
+}
+
+- (BOOL)rdna4PrepareForGPUProducerOnCommandBuffer:(id)cb {
+    if (!cb || !RDNA4R.bufferAddress) return NO;
+    if (![self rdna4EnsureGPUBackingAddress]) {
+        [(RDNA4CommandBuffer *)cb rdna4Fail:@"cannot allocate GPU backing for indirect command buffer"];
+        return NO;
+    }
+    NSError *err = nil;
+    if (![self rdna4SyncCPUWritesToGPU:&err]) {
+        [(RDNA4CommandBuffer *)cb rdna4Fail:err.localizedDescription ?: @"cannot synchronize ICB CPU writes before compute"];
+        return NO;
+    }
+    pthread_mutex_lock(&_mu);
+    _gpuProduced = YES;
+    RDNA4Buffer *backing = _gpuBacking;
+    pthread_mutex_unlock(&_mu);
+    [(RDNA4CommandBuffer *)cb rdna4RetainEncoded:self];
+    if (backing) [(RDNA4CommandBuffer *)cb rdna4RetainEncoded:backing];
+    return YES;
+}
+#endif
+
 - (BOOL)rdna4RecordResetRange:(NSRange)range
                 commandBuffer:(RDNA4CommandBuffer *)commandBuffer
                        reason:(NSString **)reason {
@@ -1058,6 +1457,40 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     }
     if (!range.length) return YES;
 
+#ifdef VK_VERSION_1_0
+    pthread_mutex_lock(&_mu);
+    BOOL useGPU = (_gpuBacking != nil || _gpuProduced ||
+                   (RDNA4R.bufferAddress && _commandCount <= RDNA4_ICB_MAX_GPU_SLOTS));
+    pthread_mutex_unlock(&_mu);
+    if (useGPU) {
+        if (![self rdna4EnsureGPUBackingAddress]) {
+            if (reason) *reason = @"cannot allocate GPU backing for indirect command buffer reset";
+            return NO;
+        }
+        NSError *syncErr = nil;
+        if (![self rdna4SyncCPUWritesToGPU:&syncErr]) {
+            if (reason) *reason = syncErr.localizedDescription ?: @"cannot synchronize ICB before GPU reset";
+            return NO;
+        }
+        VkCommandBuffer cmd = [commandBuffer vk];
+        if (!cmd) {
+            if (reason) *reason = @"command buffer lacks Vulkan backing for ICB reset";
+            return NO;
+        }
+        pthread_mutex_lock(&_mu);
+        _gpuProduced = YES;
+        RDNA4Buffer *backing = _gpuBacking;
+        pthread_mutex_unlock(&_mu);
+        [commandBuffer rdna4RetainEncoded:self];
+        [commandBuffer rdna4RetainEncoded:backing];
+        VkDeviceSize off = [backing rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)range.location * RDNA4_ICB_SLOT_BYTES;
+        VkDeviceSize bytes = (VkDeviceSize)range.length * RDNA4_ICB_SLOT_BYTES;
+        vkCmdFillBuffer(cmd, [backing vkBuffer], off, bytes, 0);
+        rdna4_full_barrier(cmd);
+        return YES;
+    }
+#endif
+
     NSError *placementError = nil;
     BOOL queued = [commandBuffer rdna4EncodeOrderedHostAction:^BOOL(NSError **error) {
         return [self rdna4ApplyResetRangeAtExecution:range error:error];
@@ -1074,8 +1507,28 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         NSError *transactionError = nil;
         if (![self rdna4PublishResetRangeLocked:range error:&transactionError])
             problem = transactionError.localizedDescription ?: @"reset transaction failed";
-        else
+        else {
             problem = nil;
+#ifdef VK_VERSION_1_0
+            if (_gpuBacking) {
+                if (range.location == 0 && range.length == _commandCount) {
+                    _cpuFullReset = YES;
+                    _gpuProduced = NO;
+                    [_candidatePipelines removeAllObjects];
+                    [_cpuDirtySlots removeAllObjects];
+                    [_cpuResetRanges removeAllObjects];
+                    [_gpuRetained removeAllObjects];
+                } else if (range.length) {
+                    for (NSNumber *k in [_cpuDirtySlots allObjects]) {
+                        NSUInteger idx = k.unsignedIntegerValue;
+                        if (idx >= range.location && idx - range.location < range.length)
+                            [_cpuDirtySlots removeObject:k];
+                    }
+                    [_cpuResetRanges addObject:[NSValue valueWithRange:range]];
+                }
+            }
+#endif
+        }
     } else {
         _fatalError = [problem copy];
     }
@@ -1136,6 +1589,98 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
     if (problem && reason) *reason = problem;
     if (problem || !sourceRange.length) return problem == nil;
 
+#ifdef VK_VERSION_1_0
+    pthread_mutex_lock(&first->_mu);
+    if (second != first) pthread_mutex_lock(&second->_mu);
+    BOOL useGPU = (source->_gpuBacking != nil || source->_gpuProduced ||
+                   destination->_gpuBacking != nil || destination->_gpuProduced ||
+                   (RDNA4R.bufferAddress && source->_commandCount <= RDNA4_ICB_MAX_GPU_SLOTS &&
+                    destination->_commandCount <= RDNA4_ICB_MAX_GPU_SLOTS));
+    if (second != first) pthread_mutex_unlock(&second->_mu);
+    pthread_mutex_unlock(&first->_mu);
+    if (useGPU) {
+        if (![source rdna4EnsureGPUBackingAddress] || ![destination rdna4EnsureGPUBackingAddress]) {
+            if (reason) *reason = @"cannot allocate GPU backing for indirect command buffer copy";
+            return NO;
+        }
+        NSError *syncErr = nil;
+        if (![source rdna4SyncCPUWritesToGPU:&syncErr] ||
+            (destination != source && ![destination rdna4SyncCPUWritesToGPU:&syncErr])) {
+            if (reason) *reason = syncErr.localizedDescription ?: @"cannot synchronize ICB before GPU copy";
+            return NO;
+        }
+        pthread_mutex_lock(&first->_mu);
+        if (second != first) pthread_mutex_lock(&second->_mu);
+        NSMutableArray<RDNA4RenderPipelineState *> *merged = [destination->_candidatePipelines mutableCopy];
+        BOOL candFit = YES;
+        for (RDNA4RenderPipelineState *cand in source->_candidatePipelines) {
+            uint64_t tok = [cand rdna4ICBToken];
+            BOOL seen = NO;
+            for (RDNA4RenderPipelineState *ex in merged) {
+                if ([ex rdna4ICBToken] == tok) { seen = YES; break; }
+            }
+            if (!seen) {
+                if (merged.count >= RDNA4_ICB_MAX_CANDIDATE_PIPELINES) { candFit = NO; break; }
+                [merged addObject:cand];
+            }
+        }
+        if (!candFit) {
+            if (second != first) pthread_mutex_unlock(&second->_mu);
+            pthread_mutex_unlock(&first->_mu);
+            if (reason) *reason = @"copy destination indirect command buffer exceeds 32 candidate pipelines";
+            return NO;
+        }
+        VkCommandBuffer cmd = [commandBuffer vk];
+        if (!cmd) {
+            if (second != first) pthread_mutex_unlock(&second->_mu);
+            pthread_mutex_unlock(&first->_mu);
+            if (reason) *reason = @"command buffer lacks Vulkan backing for ICB copy";
+            return NO;
+        }
+        destination->_candidatePipelines = merged;
+        destination->_gpuProduced = YES;
+        if (destination != source) [destination->_gpuRetained unionSet:source->_gpuRetained];
+        RDNA4Buffer *srcBack = source->_gpuBacking;
+        RDNA4Buffer *dstBack = destination->_gpuBacking;
+        if (second != first) pthread_mutex_unlock(&second->_mu);
+        pthread_mutex_unlock(&first->_mu);
+
+        [commandBuffer rdna4RetainEncoded:source];
+        [commandBuffer rdna4RetainEncoded:destination];
+        [commandBuffer rdna4RetainEncoded:srcBack];
+        [commandBuffer rdna4RetainEncoded:dstBack];
+        VkDeviceSize srcOff = [srcBack rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)sourceRange.location * RDNA4_ICB_SLOT_BYTES;
+        VkDeviceSize dstOff = [dstBack rdna4VkOffset] + RDNA4_ICB_HEADER_BYTES + (VkDeviceSize)destinationIndex * RDNA4_ICB_SLOT_BYTES;
+        VkDeviceSize bytes = (VkDeviceSize)sourceRange.length * RDNA4_ICB_SLOT_BYTES;
+        BOOL overlap = (source == destination) &&
+                       (sourceRange.location < destinationIndex + sourceRange.length) &&
+                       (destinationIndex < sourceRange.location + sourceRange.length);
+        if (overlap) {
+            NSError *scErr = nil;
+            RDNA4Buffer *scratch = [[RDNA4Buffer alloc] initWithDevice:source->_dev
+                                                                length:(NSUInteger)bytes
+                                                               options:MTLResourceStorageModePrivate | RDNA4_OPT_NOZERO
+                                                                 error:&scErr];
+            if (!scratch) {
+                if (reason) *reason = scErr.localizedDescription ?: @"cannot allocate scratch buffer for overlapping ICB copy";
+                return NO;
+            }
+            [commandBuffer rdna4RetainEncoded:scratch];
+            VkBufferCopy c1 = { srcOff, [scratch rdna4VkOffset], bytes };
+            vkCmdCopyBuffer(cmd, [srcBack vkBuffer], [scratch vkBuffer], 1, &c1);
+            rdna4_full_barrier(cmd);
+            VkBufferCopy c2 = { [scratch rdna4VkOffset], dstOff, bytes };
+            vkCmdCopyBuffer(cmd, [scratch vkBuffer], [dstBack vkBuffer], 1, &c2);
+            rdna4_full_barrier(cmd);
+        } else {
+            VkBufferCopy c = { srcOff, dstOff, bytes };
+            vkCmdCopyBuffer(cmd, [srcBack vkBuffer], [dstBack vkBuffer], 1, &c);
+            rdna4_full_barrier(cmd);
+        }
+        return YES;
+    }
+#endif
+
     NSError *placementError = nil;
     BOOL queued = [commandBuffer rdna4EncodeOrderedHostAction:^BOOL(NSError **error) {
         return [source rdna4ApplyCopyRangeAtExecution:sourceRange
@@ -1191,8 +1736,20 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
                     problem = [NSString stringWithFormat:@"slot %lu uses an indexed draw the descriptor did not enable", (unsigned long)slot];
                 break;
             case RDNA4ICBCommandDrawPatches:
+#ifdef VK_VERSION_1_0
+                if (!(_commandTypes & RDNA4ICB_TYPE_DRAW_PATCHES))
+                    problem = [NSString stringWithFormat:@"slot %lu uses drawPatches the descriptor did not enable", (unsigned long)slot];
+#else
+                problem = [NSString stringWithFormat:@"slot %lu uses drawPatches (requires Vulkan runtime)", (unsigned long)slot];
+#endif
+                break;
             case RDNA4ICBCommandDrawIndexedPatches:
-                problem = [NSString stringWithFormat:@"slot %lu is a patch command; tessellation replay is not connected yet", (unsigned long)slot];
+#ifdef VK_VERSION_1_0
+                if (!(_commandTypes & RDNA4ICB_TYPE_DRAW_INDEXED_PATCHES))
+                    problem = [NSString stringWithFormat:@"slot %lu uses drawIndexedPatches the descriptor did not enable", (unsigned long)slot];
+#else
+                problem = [NSString stringWithFormat:@"slot %lu uses drawIndexedPatches (requires Vulkan runtime)", (unsigned long)slot];
+#endif
                 break;
             case RDNA4ICBCommandEmpty:
                 break;
@@ -1208,6 +1765,53 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
             problem = [NSString stringWithFormat:@"slot %lu pipeline is incompatible with the render pass", (unsigned long)slot];
             break;
         }
+#ifdef VK_VERSION_1_0
+        {
+            RDNA4RenderPipelineState *use = [(RDNA4RenderPipelineState *)pipeline rdna4Real] ?: pipeline;
+            BOOL isPatch = (record.kind == RDNA4ICBCommandDrawPatches || record.kind == RDNA4ICBCommandDrawIndexedPatches);
+            if ([use rdna4IsTessellation] != isPatch) {
+                problem = [NSString stringWithFormat:@"slot %lu %s pipeline/command kind mismatch",
+                           (unsigned long)slot, isPatch ? "patch command requires tessellation" : "draw command requires non-tessellation"];
+                break;
+            }
+            if (isPatch) {
+                const rdna4_tess_cfg_t *cfg = [use tessCfg];
+                id device = [encoder rdna4ICBDevice];
+                if (record.patchControlPoints > RDNA4R.maxTessPatchSize) {
+                    problem = [NSString stringWithFormat:@"slot %lu patch control points exceed max (%u)", (unsigned long)slot, RDNA4R.maxTessPatchSize];
+                    break;
+                }
+                if (!record.tessellationFactorBuffer || [record.tessellationFactorBuffer device] != device ||
+                    (record.tessellationFactorBufferOffset & 3) ||
+                    record.tessellationFactorBufferOffset > [record.tessellationFactorBuffer length]) {
+                    problem = [NSString stringWithFormat:@"slot %lu tessellation factor buffer is invalid", (unsigned long)slot];
+                    break;
+                }
+                uint32_t fbytes = rdna4_tess_factor_stride(cfg);
+                if ((cfg->factor_step == RDNA4_TESS_FSTEP_CONST || (record.patchCount && record.instanceCount)) &&
+                    fbytes > [record.tessellationFactorBuffer length] - record.tessellationFactorBufferOffset) {
+                    problem = [NSString stringWithFormat:@"slot %lu tessellation factor buffer range is smaller than %u bytes", (unsigned long)slot, fbytes];
+                    break;
+                }
+                if (record.kind == RDNA4ICBCommandDrawIndexedPatches) {
+                    if (cfg->cp_idx_type == RDNA4_TESS_CPIDX_NONE) {
+                        problem = [NSString stringWithFormat:@"slot %lu indexed patch draw requires tessellationControlPointIndexType != None", (unsigned long)slot];
+                        break;
+                    }
+                    NSUInteger align = cfg->cp_idx_type == RDNA4_TESS_CPIDX_U32 ? 4u : 2u;
+                    NSUInteger patchEnd = record.patchCount ? (record.patchStart + record.patchCount) : 0;
+                    NSUInteger cpCount = patchEnd * record.patchControlPoints;
+                    if (!record.controlPointIndexBuffer || [record.controlPointIndexBuffer device] != device ||
+                        (record.controlPointIndexBufferOffset & (align - 1u)) ||
+                        record.controlPointIndexBufferOffset > [record.controlPointIndexBuffer length] ||
+                        cpCount > ([record.controlPointIndexBuffer length] - record.controlPointIndexBufferOffset) / align) {
+                        problem = [NSString stringWithFormat:@"slot %lu control-point index buffer or alignment is invalid", (unsigned long)slot];
+                        break;
+                    }
+                }
+            }
+        }
+#endif
         if (_inheritBuffers) {
             if (![encoder rdna4ICBInheritedBuffersSatisfyPipeline:pipeline]) {
                 problem = [NSString stringWithFormat:@"slot %lu inherits buffers that do not satisfy its pipeline", (unsigned long)slot];
@@ -1264,6 +1868,37 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
                             indexBufferOffset:record.indexBufferOffset instanceCount:record.instanceCount
                                    baseVertex:record.baseVertex baseInstance:record.baseInstance];
         }
+#ifdef VK_VERSION_1_0
+        else if (record.kind == RDNA4ICBCommandDrawPatches) {
+            if (record.patchCount && record.instanceCount) {
+                [encoder setTessellationFactorBuffer:record.tessellationFactorBuffer
+                                              offset:record.tessellationFactorBufferOffset
+                                      instanceStride:record.tessellationFactorInstanceStride];
+                [encoder drawPatches:record.patchControlPoints
+                          patchStart:record.patchStart
+                          patchCount:record.patchCount
+                    patchIndexBuffer:record.patchIndexBuffer
+              patchIndexBufferOffset:record.patchIndexBufferOffset
+                       instanceCount:record.instanceCount
+                        baseInstance:record.baseInstance];
+            }
+        } else if (record.kind == RDNA4ICBCommandDrawIndexedPatches) {
+            if (record.patchCount && record.instanceCount) {
+                [encoder setTessellationFactorBuffer:record.tessellationFactorBuffer
+                                              offset:record.tessellationFactorBufferOffset
+                                      instanceStride:record.tessellationFactorInstanceStride];
+                [encoder drawIndexedPatches:record.patchControlPoints
+                                 patchStart:record.patchStart
+                                 patchCount:record.patchCount
+                           patchIndexBuffer:record.patchIndexBuffer
+                     patchIndexBufferOffset:record.patchIndexBufferOffset
+                    controlPointIndexBuffer:record.controlPointIndexBuffer
+              controlPointIndexBufferOffset:record.controlPointIndexBufferOffset
+                              instanceCount:record.instanceCount
+                               baseInstance:record.baseInstance];
+            }
+        }
+#endif
         replayed++;
     }
     return replayed;
@@ -1283,14 +1918,30 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
 - (BOOL)rdna4ICBInheritedBuffersSatisfyPipeline:(id)pipeline {
     if (![pipeline isKindOfClass:[RDNA4RenderPipelineState class]]) return NO;
     RDNA4RenderPipelineState *use = [(RDNA4RenderPipelineState *)pipeline rdna4Real] ?: pipeline;
-    const uint32_t *needed = [use needBindings];
-    uint32_t count = [use nNeed];
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t index = needed[i];
-        if (index == 31) continue;
-        if (index >= 31 || !_sv.buf[index].b || _sv.buf[index].off > [_sv.buf[index].b length]) return NO;
-    }
     id device = [self rdna4ICBDevice];
+#ifdef VK_VERSION_1_0
+    if ([use rdna4IsTessellation]) {
+        const rdna4_tess_cfg_t *cfg = [use tessCfg];
+        for (uint32_t i = 0; i < cfg->num_inputs; i++) {
+            const rdna4_tess_input_t *in = &cfg->inputs[i];
+            if (!in->has_attr) continue;
+            RDNA4Buffer *vb = _sv.buf[in->buf_idx].b;
+            NSUInteger vo = _sv.buf[in->buf_idx].off;
+            if (!vb || ![vb isKindOfClass:[RDNA4Buffer class]] || [vb device] != device ||
+                vo > [vb length] || ![vb gpuAddress] || vo > UINT64_MAX - [vb gpuAddress])
+                return NO;
+        }
+    } else
+#endif
+    {
+        const uint32_t *needed = [use needBindings];
+        uint32_t count = [use nNeed];
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t index = needed[i];
+            if (index == 31) continue;
+            if (index >= 31 || !_sv.buf[index].b || _sv.buf[index].off > [_sv.buf[index].b length]) return NO;
+        }
+    }
     return rdna4icb_stage_buffers_ok([use pbV], [use npbV], &_sv, device) &&
            rdna4icb_stage_buffers_ok([use pbF], [use npbF], &_sf, device);
 }
@@ -1318,10 +1969,26 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         fragment.buf[index].b = bind.buffer;
         fragment.buf[index].off = bind.offset;
     }
-    const uint32_t *needed = [use needBindings];
-    uint32_t count = [use nNeed];
-    for (uint32_t i = 0; i < count; ++i)
-        if (needed[i] != 31 && !record.vertexBinds[@(needed[i])]) return NO;
+#ifdef VK_VERSION_1_0
+    if ([use rdna4IsTessellation]) {
+        const rdna4_tess_cfg_t *cfg = [use tessCfg];
+        for (uint32_t i = 0; i < cfg->num_inputs; i++) {
+            const rdna4_tess_input_t *in = &cfg->inputs[i];
+            if (!in->has_attr) continue;
+            RDNA4Buffer *vb = vertex.buf[in->buf_idx].b;
+            NSUInteger vo = vertex.buf[in->buf_idx].off;
+            if (!vb || ![vb isKindOfClass:[RDNA4Buffer class]] || [vb device] != device ||
+                vo > [vb length] || ![vb gpuAddress] || vo > UINT64_MAX - [vb gpuAddress])
+                return NO;
+        }
+    } else
+#endif
+    {
+        const uint32_t *needed = [use needBindings];
+        uint32_t count = [use nNeed];
+        for (uint32_t i = 0; i < count; ++i)
+            if (needed[i] != 31 && !record.vertexBinds[@(needed[i])]) return NO;
+    }
     return rdna4icb_stage_buffers_ok([use pbV], [use npbV], &vertex, device) &&
            rdna4icb_stage_buffers_ok([use pbF], [use npbF], &fragment, device);
 }
@@ -1333,7 +2000,431 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         _sf.buf[i].off = 0;
     }
 }
-- (void)rdna4ICBRetainResource:(id)resource { [_cb rdna4Retain:resource]; }
+- (void)rdna4ICBRetainResource:(id)resource {
+#ifdef VK_VERSION_1_0
+    [_cb rdna4RetainEncoded:resource];
+#else
+    [_cb rdna4Retain:resource];
+#endif
+}
+#ifdef VK_VERSION_1_0
+- (void)rdna4ExecuteICBGPU:(RDNA4IndirectCommandBuffer *)icb
+               directRange:(NSRange)range
+            indirectBuffer:(id)indirectBuf
+            indirectOffset:(NSUInteger)indirectOff
+               useIndirect:(BOOL)useIndirect {
+    if (!vkCmdDrawIndirect || !RDNA4R.indirectFirstInstance || !RDNA4R.bufferAddress) {
+        [_cb rdna4Fail:@"GPU ICB execution requires indirect drawing and bufferDeviceAddress"];
+        return;
+    }
+    id dev = [_cb device];
+    if ([icb device] != dev) {
+        [_cb rdna4Fail:@"indirect command buffer belongs to a different device"];
+        return;
+    }
+    if (useIndirect) {
+        if (![indirectBuf isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)indirectBuf device] != dev ||
+            (indirectOff & 3) || indirectOff > [(RDNA4Buffer *)indirectBuf length] ||
+            8 > [(RDNA4Buffer *)indirectBuf length] - indirectOff) {
+            [_cb rdna4Fail:@"GPU ICB indirect range buffer, alignment or range is invalid"];
+            return;
+        }
+        if (!rdna4nc_vk_offset_ok([(RDNA4Buffer *)indirectBuf rdna4VkOffset] + indirectOff, 4, RDNA4NC_ALIGN_INDIRECT)) {
+            [_cb rdna4Fail:@"GPU ICB indirect range Vulkan offset must be a multiple of 4"];
+            return;
+        }
+    } else {
+        NSString *rangeProblem = rdna4icb_range_problem(range, icb->_commandCount, YES);
+        if (rangeProblem) {
+            [_cb rdna4Fail:[NSString stringWithFormat:@"executeCommandsInBuffer [%lu,+%lu): %@",
+                            (unsigned long)range.location, (unsigned long)range.length, rangeProblem]];
+            return;
+        }
+        if (!range.length) {
+            [_cb rdna4RetainEncoded:icb];
+            id bk = [icb rdna4GPUBacking];
+            if (bk) [_cb rdna4RetainEncoded:bk];
+            return;
+        }
+    }
+    if (![icb rdna4EnsureGPUBackingAddress]) {
+        [_cb rdna4Fail:@"cannot allocate GPU backing for indirect command buffer"];
+        return;
+    }
+    NSError *syncErr = nil;
+    if (![icb rdna4SyncCPUWritesToGPU:&syncErr]) {
+        [_cb rdna4Fail:syncErr.localizedDescription ?: @"cannot synchronize ICB CPU writes to GPU"];
+        return;
+    }
+    pthread_mutex_lock(&icb->_mu);
+    NSString *fatal = icb->_fatalError;
+    RDNA4Buffer *icbBacking = icb->_gpuBacking;
+    NSUInteger maxCommands = icb->_commandCount;
+    BOOL inheritPipe = icb->_inheritPipelineState;
+    BOOL inheritBufs = icb->_inheritBuffers;
+    MTLIndirectCommandType cmdTypes = icb->_commandTypes;
+    NSArray<RDNA4RenderPipelineState *> *rawCands = inheritPipe ? nil : [icb->_candidatePipelines copy];
+    NSArray *retainedRes = [icb->_gpuRetained allObjects];
+    pthread_mutex_unlock(&icb->_mu);
+    if (fatal) { [_cb rdna4Fail:fatal]; return; }
+    if (!icbBacking) { [_cb rdna4Fail:@"indirect command buffer lacks GPU backing"]; return; }
+
+    [_cb rdna4RetainEncoded:icb];
+    [_cb rdna4RetainEncoded:icbBacking];
+    for (id res in retainedRes) [_cb rdna4RetainEncoded:res];
+    if (useIndirect) [_cb rdna4RetainEncoded:indirectBuf];
+
+    uint32_t maxOutSlots = useIndirect ? (uint32_t)MIN(maxCommands, (NSUInteger)RDNA4ICB_MAX_EXECUTION_RANGE) : (uint32_t)range.length;
+    if (!maxOutSlots) return;
+
+    NSMutableArray<RDNA4RenderPipelineState *> *cands = [NSMutableArray array];
+    uint64_t parentToken = 0;
+    if (inheritPipe) {
+        if (!_pso) { [_cb rdna4Fail:@"executeCommandsInBuffer with inheritPipelineState requires a bound render pipeline"]; return; }
+        RDNA4RenderPipelineState *use = [_pso rdna4Real] ?: _pso;
+        if (![use supportIndirectCommandBuffers] || ![self rdna4ICBCompatiblePipeline:use]) {
+            [_cb rdna4Fail:@"inherited pipeline is not ICB-capable or incompatible with the render pass"];
+            return;
+        }
+        parentToken = [use rdna4ICBToken];
+        if (!parentToken) { [_cb rdna4Fail:@"inherited pipeline has no ICB token"]; return; }
+        [cands addObject:use];
+    } else {
+        for (RDNA4RenderPipelineState *raw in rawCands) {
+            RDNA4RenderPipelineState *use = [raw rdna4Real] ?: raw;
+            if (![use supportIndirectCommandBuffers] || ![self rdna4ICBCompatiblePipeline:use] || ![use rdna4ICBToken]) {
+                [_cb rdna4Fail:@"candidate pipeline is not ICB-capable or incompatible with the render pass"];
+                return;
+            }
+            [cands addObject:use];
+        }
+        if (!cands.count) return;
+    }
+
+    BOOL icbFetch = [cands[0] fetch];
+    for (RDNA4RenderPipelineState *P in cands) {
+        if ([P fetch] != icbFetch) {
+            [_cb rdna4Fail:@"mixing framebuffer-fetch and non-fetch pipelines in one ICB execution is not supported"];
+            return;
+        }
+        if ([P fetch] && [P fetchMax] >= _na) {
+            [_cb rdna4Fail:[NSString stringWithFormat:@"ICB pipeline reads [[color(%u)]] but pass has %u attachment(s)", [P fetchMax], _na]];
+            return;
+        }
+        [_cb rdna4RetainEncoded:P];
+    }
+
+    VkCullModeFlags cull = _cull == MTLCullModeFront ? VK_CULL_MODE_FRONT_BIT : _cull == MTLCullModeBack ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    VkFrontFace front = _wind == MTLWindingCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    rdna4_icb_expand_cfg_t cfg = {0};
+    uint32_t bucketCand[RDNA4_ICB_MAX_EXPAND_BUCKETS];
+    VkPipeline bucketVkPipe[RDNA4_ICB_MAX_EXPAND_BUCKETS];
+    uint32_t nb = 0;
+
+    for (uint32_t ci = 0; ci < (uint32_t)cands.count; ci++) {
+        RDNA4RenderPipelineState *P = cands[ci];
+        NSError *prepErr = nil;
+        if (![P rdna4PrepareICBGPUVariant:&prepErr]) {
+            [_cb rdna4Fail:prepErr.localizedDescription ?: @"cannot prepare GPU ICB pipeline variant"];
+            return;
+        }
+        uint32_t dk = [P rdna4DSKey:&_dsi];
+        uint64_t tok = [P rdna4ICBToken];
+        if ([P rdna4IsTessellation]) {
+            if (!(cmdTypes & (RDNA4ICB_TYPE_DRAW_PATCHES | RDNA4ICB_TYPE_DRAW_INDEXED_PATCHES))) continue;
+            VkPipeline vkp = [P icbPipelineForTopology:VK_PRIMITIVE_TOPOLOGY_PATCH_LIST cull:cull front:front ds:dk];
+            if (!vkp) { [_cb rdna4Fail:@"cannot build GPU ICB tessellation pipeline variant"]; return; }
+            if (nb >= RDNA4_ICB_MAX_EXPAND_BUCKETS) { [_cb rdna4Fail:@"GPU ICB bucket overflow"]; return; }
+            cfg.buckets[nb] = (rdna4_icb_bucket_t){ .token = tok, .is_tess = 1u, .prim_type = 0u };
+            bucketCand[nb] = ci; bucketVkPipe[nb] = vkp; nb++;
+        } else {
+            if (!(cmdTypes & (MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed))) continue;
+            for (uint32_t pt = 0; pt < 5; pt++) {
+                VkPipeline vkp = [P icbPipelineForTopology:rdna4_topo((MTLPrimitiveType)pt) cull:cull front:front ds:dk];
+                if (!vkp) { [_cb rdna4Fail:@"cannot build GPU ICB render pipeline variant"]; return; }
+                if (nb >= RDNA4_ICB_MAX_EXPAND_BUCKETS) { [_cb rdna4Fail:@"GPU ICB bucket overflow"]; return; }
+                cfg.buckets[nb] = (rdna4_icb_bucket_t){ .token = tok, .is_tess = 0u, .prim_type = pt };
+                bucketCand[nb] = ci; bucketVkPipe[nb] = vkp; nb++;
+            }
+        }
+    }
+    if (!nb) return;
+    if ((uint64_t)maxOutSlots * (uint64_t)nb > RDNA4_ICB_MAX_GPU_EXPANDED_DRAWS) {
+        [_cb rdna4Fail:@"GPU ICB expanded draw count exceeds limit"];
+        return;
+    }
+
+    cfg.direct_location = useIndirect ? 0u : (uint32_t)range.location;
+    cfg.direct_length = useIndirect ? 0u : (uint32_t)range.length;
+    cfg.use_indirect_range = useIndirect ? 1u : 0u;
+    cfg.max_output_slots = maxOutSlots;
+    cfg.inherit_pipeline = inheritPipe ? 1u : 0u;
+    cfg.inherit_buffers = inheritBufs ? 1u : 0u;
+    cfg.num_buckets = nb;
+    cfg.parent_pipeline_token = parentToken;
+    cfg.parent_tess_factor_scale = _tessFactorScale;
+    if ([_tessFactorBuf isKindOfClass:[RDNA4Buffer class]] && [(RDNA4Buffer *)_tessFactorBuf device] == dev &&
+        _tessFactorOff <= [(RDNA4Buffer *)_tessFactorBuf length] && [(RDNA4Buffer *)_tessFactorBuf gpuAddress]) {
+        cfg.parent_tess_factor_bda = [(RDNA4Buffer *)_tessFactorBuf gpuAddress] + _tessFactorOff;
+        cfg.parent_tess_factor_size = [(RDNA4Buffer *)_tessFactorBuf length] - _tessFactorOff;
+        cfg.parent_tess_factor_stride = (uint32_t)_tessFactorStride;
+        [_cb rdna4RetainEncoded:_tessFactorBuf];
+    }
+    for (uint32_t j = 0; j < 31; j++) {
+        if (_sv.buf[j].b && [_sv.buf[j].b gpuAddress]) {
+            if ([_sv.buf[j].b device] != dev ||
+                !rdna4_buffer_table_set(&cfg.parent_v_table, j, [_sv.buf[j].b gpuAddress],
+                                        _sv.buf[j].b.length, _sv.buf[j].off, [_sv.buf[j].b rdna4HostReadOnly])) {
+                [_cb rdna4Fail:@"parent vertex buffer slot is invalid for ICB execution"];
+                return;
+            }
+            cfg.parent_vb_bda[j] = [_sv.buf[j].b gpuAddress] + _sv.buf[j].off;
+            cfg.parent_vb_size[j] = _sv.buf[j].b.length - _sv.buf[j].off;
+            [_cb rdna4RetainEncoded:_sv.buf[j].b];
+        }
+        if (_sf.buf[j].b && [_sf.buf[j].b gpuAddress]) {
+            if ([_sf.buf[j].b device] != dev ||
+                !rdna4_buffer_table_set(&cfg.parent_f_table, j, [_sf.buf[j].b gpuAddress],
+                                        _sf.buf[j].b.length, _sf.buf[j].off, [_sf.buf[j].b rdna4HostReadOnly])) {
+                [_cb rdna4Fail:@"parent fragment buffer slot is invalid for ICB execution"];
+                return;
+            }
+            [_cb rdna4RetainEncoded:_sf.buf[j].b];
+        }
+    }
+
+    RDNA4Buffer *cfgBuf = nil; NSUInteger cfgOff = 0;
+    if (![_cb rdna4Bytes:&cfg length:sizeof cfg buffer:&cfgBuf offset:&cfgOff]) return;
+    RDNA4Buffer *dummyRangeBuf = nil; NSUInteger dummyRangeOff = 0;
+    if (!useIndirect) {
+        uint32_t zeroRange[2] = { 0u, 0u };
+        if (![_cb rdna4Bytes:zeroRange length:sizeof zeroRange buffer:&dummyRangeBuf offset:&dummyRangeOff]) return;
+    }
+
+    NSUInteger drawsBytes = (NSUInteger)maxOutSlots * (NSUInteger)nb * sizeof(VkDrawIndirectCommand);
+    NSUInteger vsBytes = (NSUInteger)maxOutSlots * RDNA4_ICB_VS_PARAMS_STRIDE;
+    NSUInteger tessBytes = (NSUInteger)maxOutSlots * RDNA4_ICB_TESS_PARAMS_STRIDE;
+    NSUInteger tblBytes = (NSUInteger)maxOutSlots * RDNA4_ICB_TABLE_V2_STRIDE;
+    MTLResourceOptions privOpts = MTLResourceStorageModePrivate | (RDNA4P.on ? RDNA4_OPT_NOZERO : 0);
+    NSError *bErr = nil;
+    RDNA4Buffer *outDraws = [[RDNA4Buffer alloc] initWithDevice:dev length:drawsBytes options:privOpts error:&bErr];
+    RDNA4Buffer *outVsParams = [[RDNA4Buffer alloc] initWithDevice:dev length:vsBytes options:privOpts error:&bErr];
+    RDNA4Buffer *outTessParams = [[RDNA4Buffer alloc] initWithDevice:dev length:tessBytes options:privOpts error:&bErr];
+    RDNA4Buffer *outVTable = [[RDNA4Buffer alloc] initWithDevice:dev length:tblBytes options:privOpts error:&bErr];
+    RDNA4Buffer *outFTable = [[RDNA4Buffer alloc] initWithDevice:dev length:tblBytes options:privOpts error:&bErr];
+    if (!outDraws || !outVsParams || !outTessParams || !outVTable || !outFTable) {
+        [_cb rdna4Fail:bErr.localizedDescription ?: @"cannot allocate GPU ICB expansion buffers"];
+        return;
+    }
+    [_cb rdna4RetainEncoded:cfgBuf];
+    if (dummyRangeBuf) [_cb rdna4RetainEncoded:dummyRangeBuf];
+    [_cb rdna4RetainEncoded:outDraws];
+    [_cb rdna4RetainEncoded:outVsParams];
+    [_cb rdna4RetainEncoded:outTessParams];
+    [_cb rdna4RetainEncoded:outVTable];
+    [_cb rdna4RetainEncoded:outFTable];
+
+    VkDescriptorSetLayout expDsl = VK_NULL_HANDLE;
+    VkPipelineLayout expPl = VK_NULL_HANDLE;
+    VkPipeline expPipe = VK_NULL_HANDLE;
+    NSError *expErr = nil;
+    if (!rdna4_icb_get_expander(&expDsl, &expPl, &expPipe, &expErr)) {
+        [_cb rdna4Fail:expErr.localizedDescription ?: @"cannot build GPU ICB expander pipeline"];
+        return;
+    }
+
+    if ([_cb rdna4HasArgumentWrites]) {
+        if (_inPass) [self rdna4EndPass];
+        [_cb rdna4ArgumentCheckpoint];
+        if ([_cb rdna4Error]) return;
+    }
+    [self rdna4SyncResourceSegment];
+    [self rdna4SnapshotResources];
+    if (_inPass) [self rdna4EndPass];
+
+    VkCommandBuffer cmd = [_cb vk];
+    rdna4_full_barrier(cmd);
+    VkDescriptorSet expSet = [_cb rdna4AllocSet:expDsl];
+    if (!expSet) return;
+    RDNA4Buffer *rangeSrc = useIndirect ? (RDNA4Buffer *)indirectBuf : dummyRangeBuf;
+    NSUInteger rangeSrcOff = useIndirect ? indirectOff : dummyRangeOff;
+    VkDescriptorBufferInfo expBi[8] = {
+        { [icbBacking vkBuffer], [icbBacking rdna4VkOffset], rdna4_icb_backing_bytes((uint32_t)maxCommands) },
+        { [cfgBuf vkBuffer], [cfgBuf rdna4VkOffset] + cfgOff, sizeof cfg },
+        { [rangeSrc vkBuffer], [rangeSrc rdna4VkOffset] + rangeSrcOff, 8u },
+        { [outDraws vkBuffer], [outDraws rdna4VkOffset], drawsBytes },
+        { [outVsParams vkBuffer], [outVsParams rdna4VkOffset], vsBytes },
+        { [outTessParams vkBuffer], [outTessParams rdna4VkOffset], tessBytes },
+        { [outVTable vkBuffer], [outVTable rdna4VkOffset], tblBytes },
+        { [outFTable vkBuffer], [outFTable rdna4VkOffset], tblBytes },
+    };
+    VkWriteDescriptorSet expW[8];
+    for (uint32_t i = 0; i < 8; i++) {
+        expW[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = expSet, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &expBi[i] };
+    }
+    vkUpdateDescriptorSets(RDNA4R.dev, 8, expW, 0, NULL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, expPipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, expPl, 0, 1, &expSet, 0, NULL);
+    vkCmdDispatch(cmd, (maxOutSlots + 63u) / 64u, 1, 1);
+    rdna4_full_barrier(cmd);
+
+    void (^needTex)(RDNA4Texture *, VkImageLayout, BOOL) = ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
+        if ([t rdna4IsIOS]) (void)rdna4_ios_touch(self->_cb, t, YES, writable, ^{
+            if (self->_inPass) [self rdna4EndPass]; });
+        [self->_cb rdna4CBRead:t];
+        if ([t rdna4DispImgOnly]) (void)[self->_cb rdna4IOFirstTouch:t];
+        if (([t rdna4IsIOS] || [t rdna4DispImgOnly]) && writable) {
+            [self->_cb rdna4IOWritten:t];
+            [self->_cb rdna4DispNote:t bits:RDNA4DF_W_COMPUTE pso:nil];
+        }
+        [self rdna4Need:t layout:l];
+    };
+
+    VkDescriptorSet candSet0[RDNA4_ICB_MAX_CANDIDATE_PIPELINES] = {0};
+    VkDescriptorSet candSet1[RDNA4_ICB_MAX_CANDIDATE_PIPELINES] = {0};
+    VkDescriptorSet candTessSet[RDNA4_ICB_MAX_CANDIDATE_PIPELINES] = {0};
+    VkDescriptorSet candArgSets[RDNA4_ICB_MAX_CANDIDATE_PIPELINES][3] = {{0}};
+    BOOL candHasArgs[RDNA4_ICB_MAX_CANDIDATE_PIPELINES] = {NO};
+
+    for (uint32_t ci = 0; ci < (uint32_t)cands.count; ci++) {
+        RDNA4RenderPipelineState *P = cands[ci];
+        MTLRenderPipelineReflection *reflection = [P reflection] ?: _roReflection;
+        BOOL pHasFrag = [P rdna4HasFragment];
+        rdna4_each_tex([P icbPbV], [P icbNpbV], &_sv, dev, needTex);
+        if (pHasFrag) rdna4_each_tex([P icbPbF], [P icbNpbF], &_sf, dev, needTex);
+
+        NSMutableSet *argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
+        NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
+        rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbV], [P icbNpbV], &_sv,
+                                       rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX));
+        if (pHasFrag)
+            rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbF], [P icbNpbF], &_sf,
+                                           rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT));
+        RDNA4ArgumentScanPrepared scan = {0};
+        const RDNA4StageState *scanStages[] = { &_sv, &_sf };
+        NSString *scanError = nil;
+        if (!rdna4_argument_scan_prepare(&scan, scanStages, pHasFrag ? 2 : 1, argumentWritable, dev, &scanError)) {
+            [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
+            return;
+        }
+        BOOL argumentsReady = [_cb rdna4PrepareArguments:[P argumentTables]
+                                               resources:argumentResources
+                                                writable:argumentWritable
+                                                    scan:&scan
+                                                textures:needTex];
+        rdna4_argument_scan_prepared_destroy(&scan);
+        if (!argumentsReady) return;
+        if ([P argumentTables]->active) {
+            candHasArgs[ci] = YES;
+            [_cb rdna4CopyArgumentSets:candArgSets[ci]];
+        }
+
+        candSet0[ci] = [_cb rdna4AllocSet:[P icbDsl:0]];
+        if (!candSet0[ci]) return;
+        if ([P icbNpbV] && ![_cb rdna4FillSet:candSet0[ci] bindings:[P icbPbV] count:[P icbNpbV] state:&_sv stage:"icb-vertex"]) return;
+        VkDescriptorBufferInfo dynBi0[2];
+        VkWriteDescriptorSet dynW0[2];
+        uint32_t nDyn0 = 0;
+        dynBi0[nDyn0] = (VkDescriptorBufferInfo){ [outVTable vkBuffer], [outVTable rdna4VkOffset], sizeof(rdna4_buffer_table) };
+        dynW0[nDyn0] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = candSet0[ci], .dstBinding = RDNA4_ICB_TABLE_BINDING, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &dynBi0[nDyn0] };
+        nDyn0++;
+        if ([P rdna4ICBHasVsParams]) {
+            dynBi0[nDyn0] = (VkDescriptorBufferInfo){ [outVsParams vkBuffer], [outVsParams rdna4VkOffset], sizeof(rdna4_icb_vs_params_t) };
+            dynW0[nDyn0] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = candSet0[ci], .dstBinding = RDNA4_ICB_VS_PARAMS_BINDING, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &dynBi0[nDyn0] };
+            nDyn0++;
+        }
+        vkUpdateDescriptorSets(RDNA4R.dev, nDyn0, dynW0, 0, NULL);
+
+        if (pHasFrag) {
+            candSet1[ci] = [_cb rdna4AllocSet:[P icbDsl:1]];
+            if (!candSet1[ci]) return;
+            if ([P icbNpbF] && ![_cb rdna4FillSet:candSet1[ci] bindings:[P icbPbF] count:[P icbNpbF] state:&_sf stage:"icb-fragment"]) return;
+            VkDescriptorBufferInfo fbi = { [outFTable vkBuffer], [outFTable rdna4VkOffset], sizeof(rdna4_buffer_table) };
+            VkWriteDescriptorSet fw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = candSet1[ci], .dstBinding = RDNA4_ICB_TABLE_BINDING, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &fbi };
+            vkUpdateDescriptorSets(RDNA4R.dev, 1, &fw, 0, NULL);
+        }
+
+        if ([P rdna4IsTessellation]) {
+            candTessSet[ci] = [_cb rdna4AllocSet:[P icbTessDsl]];
+            if (!candTessSet[ci]) return;
+            VkDescriptorBufferInfo tbi = { [outTessParams vkBuffer], [outTessParams rdna4VkOffset], sizeof(rdna4_tess_draw_params_t) };
+            VkWriteDescriptorSet tw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = candTessSet[ci], .dstBinding = 0, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, .pBufferInfo = &tbi };
+            vkUpdateDescriptorSets(RDNA4R.dev, 1, &tw, 0, NULL);
+        }
+    }
+
+    if (icbFetch != _fetch) _fetch = icbFetch;
+    [self rdna4BeginPass];
+    if ([_cb rdna4Error]) return;
+    [self rdna4OccDraw];
+    VkViewport vp = { (float)_vp.originX, (float)(_vp.originY + _vp.height), (float)_vp.width, -(float)_vp.height, (float)_vp.znear, (float)_vp.zfar };
+    VkRect2D sc = { { (int32_t)_sr.x, (int32_t)_sr.y }, { (uint32_t)_sr.width, (uint32_t)_sr.height } };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vkCmdSetBlendConstants(cmd, _blend);
+    if ([cands[0] rdna4HasDS]) {
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead);
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bRead);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fWrite);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, _sref[0]);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, _sref[1]);
+        if ([cands[0] rdna4HasDepth]) vkCmdSetDepthBias(cmd, _bias[0], _bias[1], _bias[2]);
+    }
+
+    VkPipeline curPipe = VK_NULL_HANDLE;
+    uint32_t curArgCand = UINT32_MAX;
+    for (uint32_t k = 0; k < maxOutSlots; k++) {
+        if (_fetch) {
+            VkMemoryBarrier fmb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_DEPENDENCY_BY_REGION_BIT, 1, &fmb, 0, NULL, 0, NULL);
+        }
+        for (uint32_t b = 0; b < nb; b++) {
+            uint32_t ci = bucketCand[b];
+            RDNA4RenderPipelineState *P = cands[ci];
+            VkPipeline vkp = bucketVkPipe[b];
+            if (vkp != curPipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
+                curPipe = vkp;
+                curArgCand = UINT32_MAX;
+            }
+            VkPipelineLayout pl = [P icbLayout];
+            if (candHasArgs[ci] && curArgCand != ci) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 3, candArgSets[ci], 0, NULL);
+                curArgCand = ci;
+            }
+            uint32_t dyn0[2] = { k * RDNA4_ICB_TABLE_V2_STRIDE, k * RDNA4_ICB_VS_PARAMS_STRIDE };
+            uint32_t ndyn0 = [P rdna4ICBHasVsParams] ? 2u : 1u;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &candSet0[ci], ndyn0, dyn0);
+            if ([P rdna4HasFragment]) {
+                uint32_t fdyn = k * RDNA4_ICB_TABLE_V2_STRIDE;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 1, 1, &candSet1[ci], 1, &fdyn);
+            }
+            if ([P rdna4IsTessellation]) {
+                uint32_t tdyn = k * RDNA4_ICB_TESS_PARAMS_STRIDE;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, [P tessSet], 1, &candTessSet[ci], 1, &tdyn);
+            }
+            VkDeviceSize cmdOff = [outDraws rdna4VkOffset] + ((VkDeviceSize)k * (VkDeviceSize)nb + (VkDeviceSize)b) * sizeof(VkDrawIndirectCommand);
+            vkCmdDrawIndirect(cmd, [outDraws vkBuffer], cmdOff, 1, sizeof(VkDrawIndirectCommand));
+        }
+    }
+    if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+}
+#endif
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer withRange:(NSRange)executionRange {
     if (_hostWriteDropped) return;
     if (_ended || [_cb rdna4Error]) {
@@ -1345,17 +2436,38 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         return;
     }
     RDNA4IndirectCommandBuffer *icb = (RDNA4IndirectCommandBuffer *)indirectCommandBuffer;
+#ifdef VK_VERSION_1_0
+    pthread_mutex_lock(&icb->_mu);
+    BOOL useGPU = (icb->_gpuProduced || icb->_gpuBacking != nil);
+    pthread_mutex_unlock(&icb->_mu);
+    if (useGPU) {
+        [self rdna4ExecuteICBGPU:icb directRange:executionRange indirectBuffer:nil indirectOffset:0 useIndirect:NO];
+        return;
+    }
+#endif
     NSString *problem = nil;
     RDNA4RenderPipelineState *parentPipeline = _pso;
     MTLRenderPipelineReflection *parentReflection = _roReflection;
     RDNA4StageState parentVertex = _sv;
     RDNA4StageState parentFragment = _sf;
+#ifdef VK_VERSION_1_0
+    id parentTessBuf = _tessFactorBuf;
+    NSUInteger parentTessOff = _tessFactorOff;
+    NSUInteger parentTessStride = _tessFactorStride;
+    [_cb rdna4RetainEncoded:icb];
+#else
     [_cb rdna4Retain:icb];
+#endif
     NSUInteger replayed = [icb rdna4ExecuteOnEncoder:self range:executionRange reason:&problem];
     _pso = parentPipeline;
     _roReflection = parentReflection;
     _sv = parentVertex;
     _sf = parentFragment;
+#ifdef VK_VERSION_1_0
+    _tessFactorBuf = parentTessBuf;
+    _tessFactorOff = parentTessOff;
+    _tessFactorStride = parentTessStride;
+#endif
     if (problem) {
         [_cb rdna4Fail:[NSString stringWithFormat:@"executeCommandsInBuffer [%lu,+%lu): %@",
                         (unsigned long)executionRange.location, (unsigned long)executionRange.length, problem]];
@@ -1366,9 +2478,25 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                  indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
              indirectBufferOffset:(NSUInteger)indirectBufferOffset {
-    (void)indirectCommandBuffer; (void)indirectRangeBuffer; (void)indirectBufferOffset;
     if (_hostWriteDropped) return;
-    [_cb rdna4Fail:@"GPU-read indirect execution ranges are part of the GPU ICB path and are not implemented"];
+    if (_ended || [_cb rdna4Error]) {
+        [_cb rdna4Fail:@"executeCommandsInBuffer:indirectBuffer: after endEncoding or after an earlier encode error"];
+        return;
+    }
+    if (![indirectCommandBuffer isKindOfClass:[RDNA4IndirectCommandBuffer class]]) {
+        [_cb rdna4Fail:@"executeCommandsInBuffer:indirectBuffer: requires an RDNA4IndirectCommandBuffer"];
+        return;
+    }
+#ifdef VK_VERSION_1_0
+    [self rdna4ExecuteICBGPU:(RDNA4IndirectCommandBuffer *)indirectCommandBuffer
+                 directRange:NSMakeRange(0, 0)
+              indirectBuffer:indirectRangeBuffer
+              indirectOffset:indirectBufferOffset
+                 useIndirect:YES];
+#else
+    (void)indirectRangeBuffer; (void)indirectBufferOffset;
+    [_cb rdna4Fail:@"GPU-read indirect execution ranges require the Vulkan runtime"];
+#endif
 }
 @end
 
@@ -1419,7 +2547,11 @@ tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride {
         [_cb rdna4Fail:@"optimizeIndirectCommandBuffer requires an RDNA4IndirectCommandBuffer"];
         return;
     }
+#ifdef VK_VERSION_1_0
+    [_cb rdna4RetainEncoded:buffer];
+#else
     [_cb rdna4Retain:buffer];
+#endif
     NSString *problem = nil;
     if (![(RDNA4IndirectCommandBuffer *)buffer rdna4ValidateRange:range reason:&problem])
         [_cb rdna4Fail:[NSString stringWithFormat:@"optimizeIndirectCommandBuffer [%lu,+%lu): %@",

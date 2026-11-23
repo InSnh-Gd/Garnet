@@ -1,0 +1,4386 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 5403a90..0c36b72 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -389,22 +389,39 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+ /// sequence of SPIR-V instructions can produce from these operands. This is the single definition
+ /// of that boundary -- translation refuses on it, and validation reports the tooling requirement
+ /// from it.
++/// The AIR families that encode into a Metal render indirect command buffer.
++pub fn is_render_icb_intrinsic(name: &str) -> bool {
++    matches!(
++        name,
++        "air.reset_render_command"
++            | "air.set_pipeline_state_render_command"
++            | "air.draw_primitives_render_command"
++            | "air.copy_render_command"
++    ) || any_typed(
++        name,
++        &[
++            "air.set_vertex_buffer_render_command",
++            "air.set_fragment_buffer_render_command",
++            "air.draw_indexed_primitives_render_command",
++            "air.draw_patches_render_command",
++            "air.draw_indexed_patches_render_command",
++        ],
++    )
++}
++
+ pub fn is_command_encoder_helper(name: &str) -> bool {
+     matches!(
+         name,
+         "air.concurrent_dispatch_threadgroups_compute_command"
+             | "air.concurrent_dispatch_threads_compute_command"
+-            | "air.draw_primitives_render_command"
+             | "air.set_barrier_compute_command"
+             | "air.set_pipeline_state_compute_command"
+             | "air.set_threadgroup_memory_length_compute_command"
+     ) || any_typed(
+         name,
+         &[
+-            "air.set_fragment_buffer_render_command",
+             "air.set_kernel_buffer_compute_command",
+             "air.set_object_buffer_render_command",
+-            "air.set_vertex_buffer_render_command",
+         ],
+     )
+ }
+@@ -550,6 +567,9 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+     // Indirect-command-buffer encoding. Recognised, and refused: see
+     // [`is_command_encoder_helper`]. Do not admit the broad `_command` suffix -- a new sibling must
+     // remain visible until this contract and its handling are decided together.
++    if is_render_icb_intrinsic(name) {
++        return Some(Lowered);
++    }
+     if is_command_encoder_helper(name) {
+         return Some(NoVulkanEquivalent);
+     }
+diff --git a/src/native/emit_tiers.rs b/src/native/emit_tiers.rs
+index 1a7d24c..e7b612d 100644
+--- a/src/native/emit_tiers.rs
++++ b/src/native/emit_tiers.rs
+@@ -956,6 +956,31 @@ pub(super) fn large_buffer_addressing_roots(parsed: &LlModule) -> HashSet<(Strin
+         }
+     }
+ 
++    for function in &parsed.functions {
++        for inst in function.carrier_insts() {
++            let Some(call) = inst.call().as_deref() else {
++                continue;
++            };
++            if !crate::air_intrinsics::is_render_icb_intrinsic(&call.callee) {
++                continue;
++            }
++            for arg in &call.args {
++                let LlValue::Local(arg_name) = &arg.value else {
++                    continue;
++                };
++                if !matches!(arg.ty, LlType::Ptr(1 | 2)) {
++                    continue;
++                }
++                selected.extend(
++                    pointer_parameter_roots(function, arg_name)
++                        .into_iter()
++                        .filter(|index| large_params.contains(&(function.name.clone(), *index)))
++                        .filter_map(|index| function.params.get(index))
++                        .map(|(name, _)| (function.name.clone(), name.clone())),
++                );
++            }
++        }
++    }
+     // A qualifying GEP may live in a helper. The helper parameter is then not a table root, so
+     // select the caller-side roots that reach it as well. This keeps the checked table row attached
+     // across the call (the emitter later inlines that boundary) without physicalizing unrelated
+@@ -1015,6 +1040,15 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
+ /// `inttoptr`, propagate through pointer-preserving SSA nodes, and require the address model only at a
+ /// memory/address consumer (or a stable ABI operation whose contract consumes a device address).
+ fn requires_device_pointer_model(parsed: &LlModule) -> bool {
++    if parsed.functions.iter().any(|function| {
++        function.carrier_insts().any(|inst| {
++            inst.call()
++                .as_deref()
++                .is_some_and(|call| crate::air_intrinsics::is_render_icb_intrinsic(&call.callee))
++        })
++    }) {
++        return true;
++    }
+     fn local_is(value: &LlValue, values: &HashSet<String>) -> bool {
+         matches!(value, LlValue::Local(name) if values.contains(name))
+     }
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+index 2f0b3e9..b0cf8a9 100644
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -2803,6 +2803,45 @@ impl Emitter {
+                 return Ok(());
+             }
+         }
++        if self.bda_device_pointers && !self.opaque_resource_pointers.contains(&name) {
++            if let LlType::Ptr(1 | 2) = result_ty {
++                if let LlValue::Local(ptr_name) = &load.ptr.value {
++                    let stored_in_nested_aggregate =
++                        self.gep_provenance.get(ptr_name).is_some_and(|prov| {
++                            prov.indices.len() > 1
++                                || matches!(
++                                    self.resolve_type(&prov.source_ty).ok(),
++                                    Some(LlType::Struct(_) | LlType::Array(_, _))
++                                )
++                        });
++                    let psb = self.pointer_storage.get(ptr_name)
++                        == Some(&StorageClass::PhysicalStorageBuffer);
++                    if stored_in_nested_aggregate || psb {
++                        let i64_type = self.type_id(&LlType::Int(64))?;
++                        let addr = self.result_id(&bda_address_name(&name), &LlType::Int(64))?;
++                        let mut ops = vec![Operand::IdRef(ptr)];
++                        if psb {
++                            let align = load.align.map(|a| a.min(8) as u32).unwrap_or(8);
++                            ops.push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
++                            ops.push(Operand::LiteralBit32(align));
++                        }
++                        instructions.push(Self::inst(Op::Load, Some(i64_type), Some(addr), ops));
++                        self.bda_address_values.insert(addr);
++                        self.emit_device_address_nullness(&name, addr, instructions)?;
++                        self.used_device_address = true;
++                        let LlType::Ptr(addrspace) = result_ty else {
++                            unreachable!()
++                        };
++                        let mut dev = RawBufferOffset::root(format!(".bda_{addr}"), addrspace);
++                        dev.device_addr_base = Some(addr);
++                        self.raw_offsets.insert(name.clone(), dev);
++                        self.pointer_storage
++                            .insert(name.clone(), StorageClass::PhysicalStorageBuffer);
++                        return Ok(());
++                    }
++                }
++            }
++        }
+         instructions.push(Self::inst(
+             Op::Load,
+             Some(result_type),
+diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
+index d508059..dbbb4ed 100644
+--- a/src/native/emitter/ops/air_calls.rs
++++ b/src/native/emitter/ops/air_calls.rs
+@@ -78,6 +78,10 @@ impl Emitter {
+                 ));
+                 Ok(true)
+             }
++            callee if crate::air_intrinsics::is_render_icb_intrinsic(callee) => {
++                self.emit_icb_void_air_call(call, instructions)?;
++                Ok(true)
++            }
+             callee if is_coherent_air_store(callee) => {
+                 if call.args.len() != 2 {
+                     return Err(format!(
+diff --git a/src/native/emitter/ops/icb.rs b/src/native/emitter/ops/icb.rs
+new file mode 100644
+index 0000000..dc6059f
+--- /dev/null
++++ b/src/native/emitter/ops/icb.rs
+@@ -0,0 +1,1048 @@
++fn typed(name: &str, stem: &str) -> bool {
++    name == stem || name.strip_prefix(stem).is_some_and(|t| t.starts_with('.'))
++}
++
++use super::*;
++
++const RDNA4_ICB_MAGIC: u32 = 0x4943_4231; // ICB1
++const RDNA4_ICB_HEADER_BYTES: i64 = 64;
++const RDNA4_ICB_SLOT_BYTES: i64 = 640;
++
++const RDNA4_ICB_KIND_DRAW: u32 = 1;
++const RDNA4_ICB_KIND_DRAW_INDEXED: u32 = 2;
++const RDNA4_ICB_KIND_DRAW_PATCHES: u32 = 3;
++const RDNA4_ICB_KIND_DRAW_INDEXED_PATCHES: u32 = 4;
++
++const RDNA4_ICB_FLAG_INHERIT_PIPELINE: u32 = 1 << 0;
++const RDNA4_ICB_FLAG_INHERIT_BUFFERS: u32 = 1 << 1;
++
++const RDNA4_ICB_SLOT_FLAG_PIPELINE_SET: u32 = 1 << 0;
++const RDNA4_ICB_SLOT_FLAG_INVALID: u32 = 1 << 1;
++
++const RDNA4_ICB_CMD_BIT_DRAW: u32 = 1 << 0;
++const RDNA4_ICB_CMD_BIT_DRAW_INDEXED: u32 = 1 << 1;
++const RDNA4_ICB_CMD_BIT_DRAW_PATCHES: u32 = 1 << 2;
++const RDNA4_ICB_CMD_BIT_DRAW_INDEXED_PATCHES: u32 = 1 << 3;
++
++impl Emitter {
++    fn resolve_icb_ptr_u64(
++        &mut self,
++        tv: &TypedValue,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        match &tv.value {
++            LlValue::Zero | LlValue::Undef => {
++                self.const_signed_int(64, 0)
++            }
++            LlValue::Local(name) => {
++                if let Some(raw) = self.raw_offsets.get(name).cloned() {
++                    if raw.device_addr_base.is_some() {
++                        return self.materialize_device_address(&raw, instructions);
++                    }
++                    if let Some(base) = self.bda_direct_addresses.get(&raw.root).copied() {
++                        let mut with_base = raw;
++                        with_base.device_addr_base = Some(base);
++                        return self.materialize_device_address(&with_base, instructions);
++                    }
++                }
++                if let Some(&(id, _)) = self.values.get(&bda_address_name(name)) {
++                    return Ok(id);
++                }
++                if let Some(&id) = self.bda_direct_addresses.get(name) {
++                    return Ok(id);
++                }
++                if let Some(&(id, LlType::Int(64))) = self.values.get(name) {
++                    return Ok(id);
++                }
++                Err(format!(
++                    "native emitter: render ICB pointer operand %{name} has no device address"
++                ))
++            }
++            LlValue::IntToPtr { source, .. } => self.value_id_in(&source.value, &source.ty, instructions),
++            _ => Err(format!(
++                "native emitter: unsupported render ICB pointer operand {:?}",
++                tv.value
++            )),
++        }
++    }
++
++    fn emit_icb_add_i64(
++        &mut self,
++        base: Word,
++        byte_offset: i64,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        if byte_offset == 0 {
++            return Ok(base);
++        }
++        let i64_ty = self.type_id(&LlType::Int(64))?;
++        let off = self.const_signed_int(64, byte_offset)?;
++        let res = self.fresh();
++        instructions.push(Self::inst(
++            Op::IAdd,
++            Some(i64_ty),
++            Some(res),
++            vec![Operand::IdRef(base), Operand::IdRef(off)],
++        ));
++        Ok(res)
++    }
++
++    fn emit_icb_load(
++        &mut self,
++        addr: Word,
++        byte_offset: i64,
++        ty: &LlType,
++        align: u32,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        let addr = self.emit_icb_add_i64(addr, byte_offset, instructions)?;
++        let res_ty = self.type_id(ty)?;
++        let ptr_ty = self.ptr_type_id(StorageClass::PhysicalStorageBuffer, ty)?;
++        let ptr = self.fresh();
++        instructions.push(Self::inst(
++            Op::ConvertUToPtr,
++            Some(ptr_ty),
++            Some(ptr),
++            vec![Operand::IdRef(addr)],
++        ));
++        let val = self.fresh();
++        instructions.push(Self::inst(
++            Op::Load,
++            Some(res_ty),
++            Some(val),
++            vec![
++                Operand::IdRef(ptr),
++                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
++                Operand::LiteralBit32(align),
++            ],
++        ));
++        Ok(val)
++    }
++
++    fn emit_icb_store(
++        &mut self,
++        addr: Word,
++        byte_offset: i64,
++        ty: &LlType,
++        align: u32,
++        value: Word,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
++        let addr = self.emit_icb_add_i64(addr, byte_offset, instructions)?;
++        let ptr_ty = self.ptr_type_id(StorageClass::PhysicalStorageBuffer, ty)?;
++        let ptr = self.fresh();
++        instructions.push(Self::inst(
++            Op::ConvertUToPtr,
++            Some(ptr_ty),
++            Some(ptr),
++            vec![Operand::IdRef(addr)],
++        ));
++        instructions.push(Self::inst(
++            Op::Store,
++            None,
++            None,
++            vec![
++                Operand::IdRef(ptr),
++                Operand::IdRef(value),
++                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
++                Operand::LiteralBit32(align),
++            ],
++        ));
++        Ok(())
++    }
++
++    fn emit_icb_if(
++        &mut self,
++        cond: Word,
++        instructions: &mut Vec<Instruction>,
++        then_fn: impl FnOnce(&mut Self, &mut Vec<Instruction>) -> Result<(), String>,
++    ) -> Result<(), String> {
++        let then_lbl = self.fresh();
++        let merge_lbl = self.fresh();
++        instructions.push(Self::inst(
++            Op::SelectionMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(merge_lbl),
++                Operand::SelectionControl(SelectionControl::NONE),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(cond),
++                Operand::IdRef(then_lbl),
++                Operand::IdRef(merge_lbl),
++            ],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(then_lbl), vec![]));
++        then_fn(self, instructions)?;
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(merge_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(merge_lbl), vec![]));
++        Ok(())
++    }
++
++    fn emit_icb_if_else(
++        &mut self,
++        cond: Word,
++        instructions: &mut Vec<Instruction>,
++        then_fn: impl FnOnce(&mut Self, &mut Vec<Instruction>) -> Result<(), String>,
++        else_fn: impl FnOnce(&mut Self, &mut Vec<Instruction>) -> Result<(), String>,
++    ) -> Result<(), String> {
++        let then_lbl = self.fresh();
++        let else_lbl = self.fresh();
++        let merge_lbl = self.fresh();
++        instructions.push(Self::inst(
++            Op::SelectionMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(merge_lbl),
++                Operand::SelectionControl(SelectionControl::NONE),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(cond),
++                Operand::IdRef(then_lbl),
++                Operand::IdRef(else_lbl),
++            ],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(then_lbl), vec![]));
++        then_fn(self, instructions)?;
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(merge_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(else_lbl), vec![]));
++        else_fn(self, instructions)?;
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(merge_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(merge_lbl), vec![]));
++        Ok(())
++    }
++
++    fn emit_icb_mark_invalid(
++        &mut self,
++        slot_addr: Word,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
++        let u32_ty = self.type_id(&LlType::Int(32))?;
++        let cur = self.emit_icb_load(slot_addr, 12, &LlType::Int(32), 4, instructions)?;
++        let inv = self.const_uint(RDNA4_ICB_SLOT_FLAG_INVALID)?;
++        let next = self.fresh();
++        instructions.push(Self::inst(
++            Op::BitwiseOr,
++            Some(u32_ty),
++            Some(next),
++            vec![Operand::IdRef(cur), Operand::IdRef(inv)],
++        ));
++        self.emit_icb_store(slot_addr, 12, &LlType::Int(32), 4, next, instructions)?;
++        let zero = self.const_uint(0)?;
++        self.emit_icb_store(slot_addr, 0, &LlType::Int(32), 4, zero, instructions)
++    }
++
++    fn emit_icb_slot_addr(
++        &mut self,
++        icb_addr: Word,
++        idx_u32: Word,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        let i64_ty = self.type_id(&LlType::Int(64))?;
++        let idx64 = self.fresh();
++        instructions.push(Self::inst(
++            Op::UConvert,
++            Some(i64_ty),
++            Some(idx64),
++            vec![Operand::IdRef(idx_u32)],
++        ));
++        let stride = self.const_signed_int(64, RDNA4_ICB_SLOT_BYTES)?;
++        let off = self.fresh();
++        instructions.push(Self::inst(
++            Op::IMul,
++            Some(i64_ty),
++            Some(off),
++            vec![Operand::IdRef(idx64), Operand::IdRef(stride)],
++        ));
++        let hdr_sz = self.const_signed_int(64, RDNA4_ICB_HEADER_BYTES)?;
++        let rel = self.fresh();
++        instructions.push(Self::inst(
++            Op::IAdd,
++            Some(i64_ty),
++            Some(rel),
++            vec![Operand::IdRef(off), Operand::IdRef(hdr_sz)],
++        ));
++        let slot_addr = self.fresh();
++        instructions.push(Self::inst(
++            Op::IAdd,
++            Some(i64_ty),
++            Some(slot_addr),
++            vec![Operand::IdRef(icb_addr), Operand::IdRef(rel)],
++        ));
++        Ok(slot_addr)
++    }
++
++    fn emit_icb_guarded_slot(
++        &mut self,
++        icb_tv: &TypedValue,
++        idx_tv: &TypedValue,
++        instructions: &mut Vec<Instruction>,
++        body: impl FnOnce(&mut Self, Word, Word, &mut Vec<Instruction>) -> Result<(), String>,
++    ) -> Result<(), String> {
++        self.require_capability(Capability::Int64);
++        self.used_device_address = true;
++        let icb_addr = self.resolve_icb_ptr_u64(icb_tv, instructions)?;
++        let idx = self.value_id_in(&idx_tv.value, &idx_tv.ty, instructions)?;
++        let bool_ty = self.type_id(&LlType::Bool)?;
++        let zero64 = self.const_signed_int(64, 0)?;
++        let non_null = self.fresh();
++        instructions.push(Self::inst(
++            Op::INotEqual,
++            Some(bool_ty),
++            Some(non_null),
++            vec![Operand::IdRef(icb_addr), Operand::IdRef(zero64)],
++        ));
++        self.emit_icb_if(non_null, instructions, |this, instructions| {
++            let magic = this.emit_icb_load(icb_addr, 0, &LlType::Int(32), 4, instructions)?;
++            let max_cmd = this.emit_icb_load(icb_addr, 4, &LlType::Int(32), 4, instructions)?;
++            let expected_magic = this.const_uint(RDNA4_ICB_MAGIC)?;
++            let magic_ok = this.fresh();
++            instructions.push(Self::inst(
++                Op::IEqual,
++                Some(bool_ty),
++                Some(magic_ok),
++                vec![Operand::IdRef(magic), Operand::IdRef(expected_magic)],
++            ));
++            let idx_ok = this.fresh();
++            instructions.push(Self::inst(
++                Op::ULessThan,
++                Some(bool_ty),
++                Some(idx_ok),
++                vec![Operand::IdRef(idx), Operand::IdRef(max_cmd)],
++            ));
++            let valid = this.fresh();
++            instructions.push(Self::inst(
++                Op::LogicalAnd,
++                Some(bool_ty),
++                Some(valid),
++                vec![Operand::IdRef(magic_ok), Operand::IdRef(idx_ok)],
++            ));
++            this.emit_icb_if(valid, instructions, |this, instructions| {
++                let slot_addr = this.emit_icb_slot_addr(icb_addr, idx, instructions)?;
++                body(this, icb_addr, slot_addr, instructions)
++            })
++        })
++    }
++
++    fn emit_icb_draw_gate(
++        &mut self,
++        icb_addr: Word,
++        slot_addr: Word,
++        cmd_bit: u32,
++        extra_ok: Option<Word>,
++        instructions: &mut Vec<Instruction>,
++        write_fn: impl FnOnce(&mut Self, &mut Vec<Instruction>) -> Result<(), String>,
++    ) -> Result<(), String> {
++        let bool_ty = self.type_id(&LlType::Bool)?;
++        let u32_ty = self.type_id(&LlType::Int(32))?;
++        let zero = self.const_uint(0)?;
++        let cmd_types = self.emit_icb_load(icb_addr, 8, &LlType::Int(32), 4, instructions)?;
++        let bit_const = self.const_uint(cmd_bit)?;
++        let cmd_masked = self.fresh();
++        instructions.push(Self::inst(
++            Op::BitwiseAnd,
++            Some(u32_ty),
++            Some(cmd_masked),
++            vec![Operand::IdRef(cmd_types), Operand::IdRef(bit_const)],
++        ));
++        let cmd_ok = self.fresh();
++        instructions.push(Self::inst(
++            Op::INotEqual,
++            Some(bool_ty),
++            Some(cmd_ok),
++            vec![Operand::IdRef(cmd_masked), Operand::IdRef(zero)],
++        ));
++
++        let hdr_flags = self.emit_icb_load(icb_addr, 12, &LlType::Int(32), 4, instructions)?;
++        let inh_bit = self.const_uint(RDNA4_ICB_FLAG_INHERIT_PIPELINE)?;
++        let inh_masked = self.fresh();
++        instructions.push(Self::inst(
++            Op::BitwiseAnd,
++            Some(u32_ty),
++            Some(inh_masked),
++            vec![Operand::IdRef(hdr_flags), Operand::IdRef(inh_bit)],
++        ));
++        let inh_on = self.fresh();
++        instructions.push(Self::inst(
++            Op::INotEqual,
++            Some(bool_ty),
++            Some(inh_on),
++            vec![Operand::IdRef(inh_masked), Operand::IdRef(zero)],
++        ));
++        let slot_flags = self.emit_icb_load(slot_addr, 12, &LlType::Int(32), 4, instructions)?;
++        let pso_bit = self.const_uint(RDNA4_ICB_SLOT_FLAG_PIPELINE_SET)?;
++        let pso_masked = self.fresh();
++        instructions.push(Self::inst(
++            Op::BitwiseAnd,
++            Some(u32_ty),
++            Some(pso_masked),
++            vec![Operand::IdRef(slot_flags), Operand::IdRef(pso_bit)],
++        ));
++        let pso_on = self.fresh();
++        instructions.push(Self::inst(
++            Op::INotEqual,
++            Some(bool_ty),
++            Some(pso_on),
++            vec![Operand::IdRef(pso_masked), Operand::IdRef(zero)],
++        ));
++        let pipe_ok = self.fresh();
++        instructions.push(Self::inst(
++            Op::LogicalOr,
++            Some(bool_ty),
++            Some(pipe_ok),
++            vec![Operand::IdRef(inh_on), Operand::IdRef(pso_on)],
++        ));
++        let inv_bit = self.const_uint(RDNA4_ICB_SLOT_FLAG_INVALID)?;
++        let inv_masked = self.fresh();
++        instructions.push(Self::inst(
++            Op::BitwiseAnd,
++            Some(u32_ty),
++            Some(inv_masked),
++            vec![Operand::IdRef(slot_flags), Operand::IdRef(inv_bit)],
++        ));
++        let not_invalid = self.fresh();
++        instructions.push(Self::inst(
++            Op::IEqual,
++            Some(bool_ty),
++            Some(not_invalid),
++            vec![Operand::IdRef(inv_masked), Operand::IdRef(zero)],
++        ));
++
++        let mut ok = self.fresh();
++        instructions.push(Self::inst(
++            Op::LogicalAnd,
++            Some(bool_ty),
++            Some(ok),
++            vec![Operand::IdRef(cmd_ok), Operand::IdRef(pipe_ok)],
++        ));
++        let ok2 = self.fresh();
++        instructions.push(Self::inst(
++            Op::LogicalAnd,
++            Some(bool_ty),
++            Some(ok2),
++            vec![Operand::IdRef(ok), Operand::IdRef(not_invalid)],
++        ));
++        ok = ok2;
++        if let Some(extra) = extra_ok {
++            let ok3 = self.fresh();
++            instructions.push(Self::inst(
++                Op::LogicalAnd,
++                Some(bool_ty),
++                Some(ok3),
++                vec![Operand::IdRef(ok), Operand::IdRef(extra)],
++            ));
++            ok = ok3;
++        }
++        self.emit_icb_if_else(
++            ok,
++            instructions,
++            |this, instructions| write_fn(this, instructions),
++            |this, instructions| this.emit_icb_mark_invalid(slot_addr, instructions),
++        )
++    }
++
++    pub(in crate::native::emitter) fn emit_icb_void_air_call(
++        &mut self,
++        call: &LlCall,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
++        let callee = call.callee.as_str();
++        if callee == "air.reset_render_command" {
++            if call.args.len() != 2 {
++                return Err(format!("native emitter: {callee} expects 2 operands"));
++            }
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, _icb_addr, slot_addr, instructions| {
++                    let v4_ty = LlType::Vector(Box::new(LlType::Int(32)), 4);
++                    let z4 = this.const_null(&v4_ty)?;
++                    for chunk in 0..40i64 {
++                        this.emit_icb_store(slot_addr, chunk * 16, &v4_ty, 16, z4, instructions)?;
++                    }
++                    Ok(())
++                },
++            );
++        }
++
++        if callee == "air.copy_render_command" {
++            if call.args.len() != 4 {
++                return Err(format!("native emitter: {callee} expects 4 operands"));
++            }
++            self.require_capability(Capability::Int64);
++            self.used_device_address = true;
++            let dst_addr = self.resolve_icb_ptr_u64(&call.args[0], instructions)?;
++            let dst_idx = self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
++            let src_addr = self.resolve_icb_ptr_u64(&call.args[2], instructions)?;
++            let src_idx = self.value_id_in(&call.args[3].value, &call.args[3].ty, instructions)?;
++            let bool_ty = self.type_id(&LlType::Bool)?;
++            let zero64 = self.const_signed_int(64, 0)?;
++            let dst_nn = self.fresh();
++            instructions.push(Self::inst(
++                Op::INotEqual,
++                Some(bool_ty),
++                Some(dst_nn),
++                vec![Operand::IdRef(dst_addr), Operand::IdRef(zero64)],
++            ));
++            let src_nn = self.fresh();
++            instructions.push(Self::inst(
++                Op::INotEqual,
++                Some(bool_ty),
++                Some(src_nn),
++                vec![Operand::IdRef(src_addr), Operand::IdRef(zero64)],
++            ));
++            let both_nn = self.fresh();
++            instructions.push(Self::inst(
++                Op::LogicalAnd,
++                Some(bool_ty),
++                Some(both_nn),
++                vec![Operand::IdRef(dst_nn), Operand::IdRef(src_nn)],
++            ));
++            return self.emit_icb_if(both_nn, instructions, |this, instructions| {
++                let d_mag = this.emit_icb_load(dst_addr, 0, &LlType::Int(32), 4, instructions)?;
++                let d_max = this.emit_icb_load(dst_addr, 4, &LlType::Int(32), 4, instructions)?;
++                let s_mag = this.emit_icb_load(src_addr, 0, &LlType::Int(32), 4, instructions)?;
++                let s_max = this.emit_icb_load(src_addr, 4, &LlType::Int(32), 4, instructions)?;
++                let exp_mag = this.const_uint(RDNA4_ICB_MAGIC)?;
++                let d_mok = this.fresh();
++                instructions.push(Self::inst(
++                    Op::IEqual,
++                    Some(bool_ty),
++                    Some(d_mok),
++                    vec![Operand::IdRef(d_mag), Operand::IdRef(exp_mag)],
++                ));
++                let s_mok = this.fresh();
++                instructions.push(Self::inst(
++                    Op::IEqual,
++                    Some(bool_ty),
++                    Some(s_mok),
++                    vec![Operand::IdRef(s_mag), Operand::IdRef(exp_mag)],
++                ));
++                let d_iok = this.fresh();
++                instructions.push(Self::inst(
++                    Op::ULessThan,
++                    Some(bool_ty),
++                    Some(d_iok),
++                    vec![Operand::IdRef(dst_idx), Operand::IdRef(d_max)],
++                ));
++                let s_iok = this.fresh();
++                instructions.push(Self::inst(
++                    Op::ULessThan,
++                    Some(bool_ty),
++                    Some(s_iok),
++                    vec![Operand::IdRef(src_idx), Operand::IdRef(s_max)],
++                ));
++                let mut ok = this.fresh();
++                instructions.push(Self::inst(
++                    Op::LogicalAnd,
++                    Some(bool_ty),
++                    Some(ok),
++                    vec![Operand::IdRef(d_mok), Operand::IdRef(s_mok)],
++                ));
++                for cond in [d_iok, s_iok] {
++                    let nxt = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(nxt),
++                        vec![Operand::IdRef(ok), Operand::IdRef(cond)],
++                    ));
++                    ok = nxt;
++                }
++                this.emit_icb_if(ok, instructions, |this, instructions| {
++                    let dst_slot = this.emit_icb_slot_addr(dst_addr, dst_idx, instructions)?;
++                    let src_slot = this.emit_icb_slot_addr(src_addr, src_idx, instructions)?;
++                    let v4_ty = LlType::Vector(Box::new(LlType::Int(32)), 4);
++                    for chunk in 0..40i64 {
++                        let v = this.emit_icb_load(src_slot, chunk * 16, &v4_ty, 16, instructions)?;
++                        this.emit_icb_store(dst_slot, chunk * 16, &v4_ty, 16, v, instructions)?;
++                    }
++                    Ok(())
++                })
++            });
++        }
++
++        if callee == "air.set_pipeline_state_render_command" {
++            if call.args.len() != 3 {
++                return Err(format!("native emitter: {callee} expects 3 operands"));
++            }
++            let pso_u64 = self.resolve_icb_ptr_u64(&call.args[2], instructions)?;
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let u32_ty = this.type_id(&LlType::Int(32))?;
++                    let zero = this.const_uint(0)?;
++                    let hdr_flags =
++                        this.emit_icb_load(icb_addr, 12, &LlType::Int(32), 4, instructions)?;
++                    let inh = this.const_uint(RDNA4_ICB_FLAG_INHERIT_PIPELINE)?;
++                    let m = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::BitwiseAnd,
++                        Some(u32_ty),
++                        Some(m),
++                        vec![Operand::IdRef(hdr_flags), Operand::IdRef(inh)],
++                    ));
++                    let can_set = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::IEqual,
++                        Some(bool_ty),
++                        Some(can_set),
++                        vec![Operand::IdRef(m), Operand::IdRef(zero)],
++                    ));
++                    this.emit_icb_if_else(
++                        can_set,
++                        instructions,
++                        |this, instructions| {
++                            this.emit_icb_store(
++                                slot_addr,
++                                16,
++                                &LlType::Int(64),
++                                8,
++                                pso_u64,
++                                instructions,
++                            )?;
++                            let sf =
++                                this.emit_icb_load(slot_addr, 12, &LlType::Int(32), 4, instructions)?;
++                            let pbit = this.const_uint(RDNA4_ICB_SLOT_FLAG_PIPELINE_SET)?;
++                            let nsf = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::BitwiseOr,
++                                Some(u32_ty),
++                                Some(nsf),
++                                vec![Operand::IdRef(sf), Operand::IdRef(pbit)],
++                            ));
++                            this.emit_icb_store(
++                                slot_addr,
++                                12,
++                                &LlType::Int(32),
++                                4,
++                                nsf,
++                                instructions,
++                            )
++                        },
++                        |this, instructions| this.emit_icb_mark_invalid(slot_addr, instructions),
++                    )
++                },
++            );
++        }
++
++        if typed(callee, "air.set_vertex_buffer_render_command")
++            || typed(callee, "air.set_fragment_buffer_render_command")
++        {
++            let is_vert = typed(callee, "air.set_vertex_buffer_render_command");
++            let slot_arg_idx = match call.args.len() {
++                4 => 3,
++                5 => 4,
++                n => {
++                    return Err(format!(
++                        "native emitter: {callee} expects 4 or 5 operands, got {n}"
++                    ));
++                }
++            };
++            let buf_u64 = self.resolve_icb_ptr_u64(&call.args[2], instructions)?;
++            let bind_idx = self.value_id_in(
++                &call.args[slot_arg_idx].value,
++                &call.args[slot_arg_idx].ty,
++                instructions,
++            )?;
++            let max_hdr_off = if is_vert { 16i64 } else { 20i64 };
++            let mask_off = if is_vert { 24i64 } else { 28i64 };
++            let array_off = if is_vert { 96i64 } else { 352i64 };
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let u32_ty = this.type_id(&LlType::Int(32))?;
++                    let i64_ty = this.type_id(&LlType::Int(64))?;
++                    let zero = this.const_uint(0)?;
++                    let hdr_flags =
++                        this.emit_icb_load(icb_addr, 12, &LlType::Int(32), 4, instructions)?;
++                    let inh = this.const_uint(RDNA4_ICB_FLAG_INHERIT_BUFFERS)?;
++                    let m = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::BitwiseAnd,
++                        Some(u32_ty),
++                        Some(m),
++                        vec![Operand::IdRef(hdr_flags), Operand::IdRef(inh)],
++                    ));
++                    let can_bind = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::IEqual,
++                        Some(bool_ty),
++                        Some(can_bind),
++                        vec![Operand::IdRef(m), Operand::IdRef(zero)],
++                    ));
++                    let max_binds =
++                        this.emit_icb_load(icb_addr, max_hdr_off, &LlType::Int(32), 4, instructions)?;
++                    let lt_max = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::ULessThan,
++                        Some(bool_ty),
++                        Some(lt_max),
++                        vec![Operand::IdRef(bind_idx), Operand::IdRef(max_binds)],
++                    ));
++                    let c31 = this.const_uint(31)?;
++                    let lt_31 = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::ULessThan,
++                        Some(bool_ty),
++                        Some(lt_31),
++                        vec![Operand::IdRef(bind_idx), Operand::IdRef(c31)],
++                    ));
++                    let ok1 = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(ok1),
++                        vec![Operand::IdRef(can_bind), Operand::IdRef(lt_max)],
++                    ));
++                    let ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(ok),
++                        vec![Operand::IdRef(ok1), Operand::IdRef(lt_31)],
++                    ));
++                    this.emit_icb_if_else(
++                        ok,
++                        instructions,
++                        |this, instructions| {
++                            let idx64 = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::UConvert,
++                                Some(i64_ty),
++                                Some(idx64),
++                                vec![Operand::IdRef(bind_idx)],
++                            ));
++                            let eight = this.const_signed_int(64, 8)?;
++                            let byte_off = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IMul,
++                                Some(i64_ty),
++                                Some(byte_off),
++                                vec![Operand::IdRef(idx64), Operand::IdRef(eight)],
++                            ));
++                            let base_off = this.const_signed_int(64, array_off)?;
++                            let rel = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IAdd,
++                                Some(i64_ty),
++                                Some(rel),
++                                vec![Operand::IdRef(base_off), Operand::IdRef(byte_off)],
++                            ));
++                            let dst = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IAdd,
++                                Some(i64_ty),
++                                Some(dst),
++                                vec![Operand::IdRef(slot_addr), Operand::IdRef(rel)],
++                            ));
++                            this.emit_icb_store(dst, 0, &LlType::Int(64), 8, buf_u64, instructions)?;
++                            let one = this.const_uint(1)?;
++                            let bit = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::ShiftLeftLogical,
++                                Some(u32_ty),
++                                Some(bit),
++                                vec![Operand::IdRef(one), Operand::IdRef(bind_idx)],
++                            ));
++                            let old_mask = this.emit_icb_load(
++                                slot_addr,
++                                mask_off,
++                                &LlType::Int(32),
++                                4,
++                                instructions,
++                            )?;
++                            let new_mask = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::BitwiseOr,
++                                Some(u32_ty),
++                                Some(new_mask),
++                                vec![Operand::IdRef(old_mask), Operand::IdRef(bit)],
++                            ));
++                            this.emit_icb_store(
++                                slot_addr,
++                                mask_off,
++                                &LlType::Int(32),
++                                4,
++                                new_mask,
++                                instructions,
++                            )
++                        },
++                        |this, instructions| this.emit_icb_mark_invalid(slot_addr, instructions),
++                    )
++                },
++            );
++        }
++
++        if callee == "air.draw_primitives_render_command" {
++            if call.args.len() != 7 {
++                return Err(format!("native emitter: {callee} expects 7 operands"));
++            }
++            let prim = self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
++            let vstart = self.value_id_in(&call.args[3].value, &call.args[3].ty, instructions)?;
++            let vcount = self.value_id_in(&call.args[4].value, &call.args[4].ty, instructions)?;
++            let icount = self.value_id_in(&call.args[5].value, &call.args[5].ty, instructions)?;
++            let binst = self.value_id_in(&call.args[6].value, &call.args[6].ty, instructions)?;
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let c5 = this.const_uint(5)?;
++                    let prim_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::ULessThan,
++                        Some(bool_ty),
++                        Some(prim_ok),
++                        vec![Operand::IdRef(prim), Operand::IdRef(c5)],
++                    ));
++                    this.emit_icb_draw_gate(
++                        icb_addr,
++                        slot_addr,
++                        RDNA4_ICB_CMD_BIT_DRAW,
++                        Some(prim_ok),
++                        instructions,
++                        |this, instructions| {
++                            let kind = this.const_uint(RDNA4_ICB_KIND_DRAW)?;
++                            let zero32 = this.const_uint(0)?;
++                            let zero64 = this.const_signed_int(64, 0)?;
++                            this.emit_icb_store(slot_addr, 0, &LlType::Int(32), 4, kind, instructions)?;
++                            this.emit_icb_store(slot_addr, 4, &LlType::Int(32), 4, prim, instructions)?;
++                            this.emit_icb_store(slot_addr, 8, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 32, &LlType::Int(32), 4, vcount, instructions)?;
++                            this.emit_icb_store(slot_addr, 36, &LlType::Int(32), 4, icount, instructions)?;
++                            this.emit_icb_store(slot_addr, 40, &LlType::Int(32), 4, vstart, instructions)?;
++                            this.emit_icb_store(slot_addr, 44, &LlType::Int(32), 4, binst, instructions)?;
++                            this.emit_icb_store(slot_addr, 48, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 64, &LlType::Int(64), 8, zero64, instructions)?;
++                            this.emit_icb_store(slot_addr, 72, &LlType::Int(64), 8, zero64, instructions)?;
++                            this.emit_icb_store(slot_addr, 80, &LlType::Int(64), 8, zero64, instructions)
++                        },
++                    )
++                },
++            );
++        }
++
++        if typed(callee, "air.draw_indexed_primitives_render_command") {
++            if call.args.len() != 8 {
++                return Err(format!("native emitter: {callee} expects 8 operands"));
++            }
++            let idx_type_val = if callee.contains(".p1i16")
++                || callee.contains(".p2i16")
++                || callee.ends_with(".i16")
++            {
++                0u32
++            } else {
++                1u32
++            };
++            let prim = self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
++            let icount_idx = self.value_id_in(&call.args[3].value, &call.args[3].ty, instructions)?;
++            let ibuf_u64 = self.resolve_icb_ptr_u64(&call.args[4], instructions)?;
++            let inst_count = self.value_id_in(&call.args[5].value, &call.args[5].ty, instructions)?;
++            let bvert = self.value_id_in(&call.args[6].value, &call.args[6].ty, instructions)?;
++            let binst = self.value_id_in(&call.args[7].value, &call.args[7].ty, instructions)?;
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let c5 = this.const_uint(5)?;
++                    let zero64 = this.const_signed_int(64, 0)?;
++                    let prim_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::ULessThan,
++                        Some(bool_ty),
++                        Some(prim_ok),
++                        vec![Operand::IdRef(prim), Operand::IdRef(c5)],
++                    ));
++                    let ib_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::INotEqual,
++                        Some(bool_ty),
++                        Some(ib_ok),
++                        vec![Operand::IdRef(ibuf_u64), Operand::IdRef(zero64)],
++                    ));
++                    let extra_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(extra_ok),
++                        vec![Operand::IdRef(prim_ok), Operand::IdRef(ib_ok)],
++                    ));
++                    this.emit_icb_draw_gate(
++                        icb_addr,
++                        slot_addr,
++                        RDNA4_ICB_CMD_BIT_DRAW_INDEXED,
++                        Some(extra_ok),
++                        instructions,
++                        |this, instructions| {
++                            let kind = this.const_uint(RDNA4_ICB_KIND_DRAW_INDEXED)?;
++                            let itype = this.const_uint(idx_type_val)?;
++                            let zero32 = this.const_uint(0)?;
++                            let zero64 = this.const_signed_int(64, 0)?;
++                            this.emit_icb_store(slot_addr, 0, &LlType::Int(32), 4, kind, instructions)?;
++                            this.emit_icb_store(slot_addr, 4, &LlType::Int(32), 4, prim, instructions)?;
++                            this.emit_icb_store(slot_addr, 8, &LlType::Int(32), 4, itype, instructions)?;
++                            this.emit_icb_store(slot_addr, 32, &LlType::Int(32), 4, icount_idx, instructions)?;
++                            this.emit_icb_store(slot_addr, 36, &LlType::Int(32), 4, inst_count, instructions)?;
++                            this.emit_icb_store(slot_addr, 40, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 44, &LlType::Int(32), 4, binst, instructions)?;
++                            this.emit_icb_store(slot_addr, 48, &LlType::Int(32), 4, bvert, instructions)?;
++                            this.emit_icb_store(slot_addr, 64, &LlType::Int(64), 8, ibuf_u64, instructions)?;
++                            this.emit_icb_store(slot_addr, 72, &LlType::Int(64), 8, zero64, instructions)?;
++                            this.emit_icb_store(slot_addr, 80, &LlType::Int(64), 8, zero64, instructions)
++                        },
++                    )
++                },
++            );
++        }
++
++        if typed(callee, "air.draw_patches_render_command")
++            || typed(callee, "air.draw_indexed_patches_render_command")
++        {
++            let indexed = typed(callee, "air.draw_indexed_patches_render_command");
++            let expected = if indexed { 12 } else { 11 };
++            if call.args.len() != expected {
++                return Err(format!(
++                    "native emitter: {callee} expects {expected} operands"
++                ));
++            }
++            let num_cp = self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
++            let pstart = self.value_id_in(&call.args[3].value, &call.args[3].ty, instructions)?;
++            let pcount = self.value_id_in(&call.args[4].value, &call.args[4].ty, instructions)?;
++            let pib_u64 = self.resolve_icb_ptr_u64(&call.args[5], instructions)?;
++            let cpib_u64 = if indexed {
++                self.resolve_icb_ptr_u64(&call.args[6], instructions)?
++            } else {
++                self.const_signed_int(64, 0)?
++            };
++            let base_arg = if indexed { 7 } else { 6 };
++            let inst_count =
++                self.value_id_in(&call.args[base_arg].value, &call.args[base_arg].ty, instructions)?;
++            let binst = self.value_id_in(
++                &call.args[base_arg + 1].value,
++                &call.args[base_arg + 1].ty,
++                instructions,
++            )?;
++            let tfac_u64 = self.resolve_icb_ptr_u64(&call.args[base_arg + 2], instructions)?;
++            let istride = self.value_id_in(
++                &call.args[base_arg + 3].value,
++                &call.args[base_arg + 3].ty,
++                instructions,
++            )?;
++            let scale = self.value_id_in(
++                &call.args[base_arg + 4].value,
++                &call.args[base_arg + 4].ty,
++                instructions,
++            )?;
++            let cmd_bit = if indexed {
++                RDNA4_ICB_CMD_BIT_DRAW_INDEXED_PATCHES
++            } else {
++                RDNA4_ICB_CMD_BIT_DRAW_PATCHES
++            };
++            let kind_val = if indexed {
++                RDNA4_ICB_KIND_DRAW_INDEXED_PATCHES
++            } else {
++                RDNA4_ICB_KIND_DRAW_PATCHES
++            };
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let zero64 = this.const_signed_int(64, 0)?;
++                    let tf_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::INotEqual,
++                        Some(bool_ty),
++                        Some(tf_ok),
++                        vec![Operand::IdRef(tfac_u64), Operand::IdRef(zero64)],
++                    ));
++                    let extra_ok = if indexed {
++                        let cp_ok = this.fresh();
++                        instructions.push(Self::inst(
++                            Op::INotEqual,
++                            Some(bool_ty),
++                            Some(cp_ok),
++                            vec![Operand::IdRef(cpib_u64), Operand::IdRef(zero64)],
++                        ));
++                        let both = this.fresh();
++                        instructions.push(Self::inst(
++                            Op::LogicalAnd,
++                            Some(bool_ty),
++                            Some(both),
++                            vec![Operand::IdRef(tf_ok), Operand::IdRef(cp_ok)],
++                        ));
++                        both
++                    } else {
++                        tf_ok
++                    };
++                    this.emit_icb_draw_gate(
++                        icb_addr,
++                        slot_addr,
++                        cmd_bit,
++                        Some(extra_ok),
++                        instructions,
++                        |this, instructions| {
++                            let kind = this.const_uint(kind_val)?;
++                            let zero32 = this.const_uint(0)?;
++                            this.emit_icb_store(slot_addr, 0, &LlType::Int(32), 4, kind, instructions)?;
++                            this.emit_icb_store(slot_addr, 4, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 8, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 32, &LlType::Int(32), 4, pcount, instructions)?;
++                            this.emit_icb_store(slot_addr, 36, &LlType::Int(32), 4, inst_count, instructions)?;
++                            this.emit_icb_store(slot_addr, 40, &LlType::Int(32), 4, pstart, instructions)?;
++                            this.emit_icb_store(slot_addr, 44, &LlType::Int(32), 4, binst, instructions)?;
++                            this.emit_icb_store(slot_addr, 48, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 52, &LlType::Int(32), 4, num_cp, instructions)?;
++                            this.emit_icb_store(slot_addr, 56, &LlType::Int(32), 4, istride, instructions)?;
++                            this.emit_icb_store(slot_addr, 60, &LlType::Float, 4, scale, instructions)?;
++                            this.emit_icb_store(slot_addr, 64, &LlType::Int(64), 8, cpib_u64, instructions)?;
++                            this.emit_icb_store(slot_addr, 72, &LlType::Int(64), 8, pib_u64, instructions)?;
++                            this.emit_icb_store(slot_addr, 80, &LlType::Int(64), 8, tfac_u64, instructions)
++                        },
++                    )
++                },
++            );
++        }
++
++        Err(format!("native emitter: unhandled render ICB intrinsic {callee}"))
++    }
++}
+diff --git a/src/native/emitter/ops/mod.rs b/src/native/emitter/ops/mod.rs
+index 60225dc..4c4e171 100644
+--- a/src/native/emitter/ops/mod.rs
++++ b/src/native/emitter/ops/mod.rs
+@@ -4,6 +4,7 @@ mod atomics;
+ mod binary_ops;
+ mod conversions;
+ mod freeze_unary;
++mod icb;
+ mod intrinsics;
+ mod operands;
+ 
+diff --git a/src/native/tests/misc.rs b/src/native/tests/misc.rs
+index 9be402b..29db63b 100644
+--- a/src/native/tests/misc.rs
++++ b/src/native/tests/misc.rs
+@@ -1094,19 +1094,18 @@ target triple = "spirv-unknown-vulkan1.2"
+ define void @main() {
+ entry:
+   tail call void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1) null, i32 0, ptr addrspace(1) null, i32 2)
+-  tail call void @air.draw_primitives_render_command(ptr addrspace(1) null, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5)
++  tail call void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace(1) null, i32 0, <3 x i32> zeroinitializer, <3 x i32> zeroinitializer)
+   ret void
+ }
+-
+ declare void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1), i32, ptr addrspace(1), i32)
+-declare void @air.draw_primitives_render_command(ptr addrspace(1), i32, i32, i32, i32, i32, i32)
++declare void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace(1), i32, <3 x i32>, <3 x i32>)
+ "#;
+     let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+     let error = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+-        .expect_err("an indirect-command-buffer encoder has no Vulkan lowering");
++        .expect_err("a compute/object indirect-command-buffer encoder has no Vulkan lowering");
+     assert!(
+         error.contains("air.set_object_buffer_render_command")
+-            || error.contains("air.draw_primitives_render_command"),
++            || error.contains("air.concurrent_dispatch_threadgroups_compute_command"),
+         "the refusal must name the family it could not lower: {error}"
+     );
+     assert!(
+@@ -1114,16 +1113,15 @@ declare void @air.draw_primitives_render_command(ptr addrspace(1), i32, i32, i32
+         "the refusal must say the family is recognised, not unknown: {error}"
+     );
+ }
+-
+-/// The refusal is not the generic unknown-symbol path: the family is modelled, and says so.
++/// Compute/object command-encoder families stay refused; render ICB intrinsics are lowered.
+ #[test]
+ fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+     use crate::air_intrinsics::{air_intrinsic_disposition, AirIntrinsicDisposition};
+     for name in [
+         "air.set_object_buffer_render_command.p1i8",
+-        "air.draw_primitives_render_command",
+         "air.set_kernel_buffer_compute_command.p2i8",
+         "air.set_threadgroup_memory_length_compute_command",
++        "air.concurrent_dispatch_threadgroups_compute_command",
+     ] {
+         assert_eq!(
+             air_intrinsic_disposition(name),
+@@ -1131,10 +1129,90 @@ fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+             "{name}"
+         );
+     }
++    for name in [
++        "air.reset_render_command",
++        "air.set_pipeline_state_render_command",
++        "air.set_vertex_buffer_render_command.p1i8",
++        "air.set_fragment_buffer_render_command.p2i8",
++        "air.draw_primitives_render_command",
++        "air.draw_indexed_primitives_render_command.p1i16",
++        "air.draw_patches_render_command.p1i32.p1i8",
++        "air.draw_indexed_patches_render_command.p1i32.p1i8.p1i8",
++        "air.copy_render_command",
++    ] {
++        assert_eq!(
++            air_intrinsic_disposition(name),
++            Some(AirIntrinsicDisposition::Lowered),
++            "{name}"
++        );
++    }
+     // A sibling nobody has decided about stays unrecognised, so it cannot arrive silently.
+     assert_eq!(air_intrinsic_disposition("air.future_command"), None);
+ }
+-
++#[test]
++fn native_render_icb_intrinsics_lower_and_validate() {
++    let ll = r#"
++target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.ICBArgs = type { %"struct.metal::command_buffer", %"struct.metal::render_pipeline_state", ptr addrspace(1), ptr addrspace(2), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1) }
++%"struct.metal::command_buffer" = type { ptr addrspace(1) }
++%"struct.metal::render_pipeline_state" = type { ptr addrspace(1) }
++define void @k_icb(ptr addrspace(2) readonly align 8 %a, i32 %gid) {
++entry:
++  %cb_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 0, i32 0
++  %cb = load ptr addrspace(1), ptr addrspace(2) %cb_ptr, align 8
++  %pso_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 1, i32 0
++  %pso = load ptr addrspace(1), ptr addrspace(2) %pso_ptr, align 8
++  %v_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 2
++  %v = load ptr addrspace(1), ptr addrspace(2) %v_ptr, align 8
++  %c_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 3
++  %c = load ptr addrspace(2), ptr addrspace(2) %c_ptr, align 8
++  %ib_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 4
++  %ib = load ptr addrspace(1), ptr addrspace(2) %ib_ptr, align 8
++  %pib_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 5
++  %pib = load ptr addrspace(1), ptr addrspace(2) %pib_ptr, align 8
++  %cpib_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 6
++  %cpib = load ptr addrspace(1), ptr addrspace(2) %cpib_ptr, align 8
++  %tf_ptr = getelementptr inbounds %struct.ICBArgs, ptr addrspace(2) %a, i64 0, i32 7
++  %tf = load ptr addrspace(1), ptr addrspace(2) %tf_ptr, align 8
++  tail call void @air.reset_render_command(ptr addrspace(1) %cb, i32 %gid)
++  tail call void @air.set_pipeline_state_render_command(ptr addrspace(1) %cb, i32 %gid, ptr addrspace(1) %pso)
++  tail call void @air.set_vertex_buffer_render_command.p1i8(ptr addrspace(1) %cb, i32 %gid, ptr addrspace(1) %v, i64 -1, i32 0)
++  tail call void @air.set_fragment_buffer_render_command.p2i8(ptr addrspace(1) %cb, i32 %gid, ptr addrspace(2) %c, i32 0)
++  tail call void @air.draw_primitives_render_command(ptr addrspace(1) %cb, i32 %gid, i32 3, i32 0, i32 3, i32 1, i32 0)
++  tail call void @air.draw_indexed_primitives_render_command.p1i16(ptr addrspace(1) %cb, i32 %gid, i32 3, i32 6, ptr addrspace(1) %ib, i32 1, i32 0, i32 0)
++  tail call void @air.draw_patches_render_command.p1i32.p1i8(ptr addrspace(1) %cb, i32 %gid, i32 3, i32 0, i32 1, ptr addrspace(1) %pib, i32 1, i32 0, ptr addrspace(1) %tf, i32 16, float 1.000000e+00)
++  tail call void @air.draw_indexed_patches_render_command.p1i32.p1i8.p1i8(ptr addrspace(1) %cb, i32 %gid, i32 4, i32 0, i32 1, ptr addrspace(1) %pib, ptr addrspace(1) %cpib, i32 2, i32 1, ptr addrspace(1) %tf, i32 32, float 2.000000e+00)
++  tail call void @air.copy_render_command(ptr addrspace(1) %cb, i32 %gid, ptr addrspace(1) %cb, i32 0)
++  ret void
++}
++declare void @air.reset_render_command(ptr addrspace(1), i32)
++declare void @air.set_pipeline_state_render_command(ptr addrspace(1), i32, ptr addrspace(1))
++declare void @air.set_vertex_buffer_render_command.p1i8(ptr addrspace(1), i32, ptr addrspace(1), i64, i32)
++declare void @air.set_fragment_buffer_render_command.p2i8(ptr addrspace(1), i32, ptr addrspace(2), i32)
++declare void @air.draw_primitives_render_command(ptr addrspace(1), i32, i32, i32, i32, i32, i32)
++declare void @air.draw_indexed_primitives_render_command.p1i16(ptr addrspace(1), i32, i32, i32, ptr addrspace(1), i32, i32, i32)
++declare void @air.draw_patches_render_command.p1i32.p1i8(ptr addrspace(1), i32, i32, i32, i32, ptr addrspace(1), i32, i32, ptr addrspace(1), i32, float)
++declare void @air.draw_indexed_patches_render_command.p1i32.p1i8.p1i8(ptr addrspace(1), i32, i32, i32, i32, ptr addrspace(1), ptr addrspace(1), i32, i32, ptr addrspace(1), i32, float)
++declare void @air.copy_render_command(ptr addrspace(1), i32, ptr addrspace(1), i32)
++!air.kernel = !{!0}
++!0 = !{ptr @k_icb, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 64, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"ICBArgs", !"air.arg_name", !"a"}
++!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
++"#;
++    let tmp = std::env::temp_dir().join(format!("metal2vulkan_icb_render_{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate render ICB");
++    let asm = load_bytes(spv.clone()).expect("load spv").disassemble();
++    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
++    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
++    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++}
+ #[test]
+ fn native_read_depth_2d_array_combines_layer_into_fetch_coord() {
+     // Arrayed depth read: AIR inserts a scalar `layer` operand after the coord
+diff --git a/src/passes/icb_stage.rs b/src/passes/icb_stage.rs
+new file mode 100644
+index 0000000..bbf2dbc
+--- /dev/null
++++ b/src/passes/icb_stage.rs
+@@ -0,0 +1,2989 @@
++//! ICB stage SPIR-V lowering: converts stage StorageBuffer bindings (0..30 / 704..734 and
++//! synthetic buffer-address tables) into PhysicalStorageBuffer64 reads from dynamic SSBO binding
++//! 676 (`rdna4_buffer_table`), and for Vertex stages (`stage_kind == 0`) lowers `BuiltIn
++//! VertexIndex` (including indexed-draw lookup, baseVertex, primitive-restart NaN guard) and all
++//! `Input Location L` variables to BDA fetches from dynamic SSBO binding 677 (`rdna4_icb_vs_params_t`).
++
++use crate::spirv_module::{Block, Function, Instruction, Module, Operand};
++use spirv::{
++    AddressingModel, BuiltIn, Capability, Decoration, FunctionControl, MemoryAccess, MemoryModel,
++    Op, SelectionControl, StorageClass, Word,
++};
++use std::collections::{HashMap, HashSet};
++
++pub const RDNA4_ICB_TABLE_BINDING: u32 = 676;
++pub const RDNA4_ICB_VS_PARAMS_BINDING: u32 = 677;
++pub const RDNA4_ICB_PRIM_LINE_STRIP: u32 = 2;
++pub const RDNA4_ICB_PRIM_TRIANGLE_STRIP: u32 = 4;
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct IcbVertexAttr {
++    pub location: u32,
++    pub buffer_index: u32,
++    pub offset: u32,
++    pub stride: u32,
++    pub vfmt: u8,
++    pub step_func: u8, // 0 = Constant, 1 = PerVertex, 2 = PerInstance
++    pub pad: [u8; 2],
++    pub step_rate: u32,
++}
++
++#[derive(Clone, Copy)]
++enum ScalarKind {
++    U32,
++    S32,
++    F32,
++    F16,
++    U16,
++    S16,
++}
++
++struct SpirvBuilder<'a> {
++    module: &'a mut Module,
++    glsl_ext: Option<Word>,
++    t_void: Option<Word>,
++    t_bool: Option<Word>,
++    t_u32: Option<Word>,
++    t_i32: Option<Word>,
++    t_u64: Option<Word>,
++    t_f32: Option<Word>,
++    t_f16: Option<Word>,
++    t_u16: Option<Word>,
++    t_i16: Option<Word>,
++    t_v2u32: Option<Word>,
++    t_v4f32: Option<Word>,
++    ptrs: HashMap<(StorageClass, Word), Word>,
++    u32_consts: HashMap<u32, Word>,
++    u64_consts: HashMap<u64, Word>,
++    f32_consts: HashMap<u32, Word>,
++    c_false: Option<Word>,
++}
++
++impl<'a> SpirvBuilder<'a> {
++    fn new(module: &'a mut Module) -> Self {
++        let mut s = Self {
++            module,
++            glsl_ext: None,
++            t_void: None,
++            t_bool: None,
++            t_u32: None,
++            t_i32: None,
++            t_u64: None,
++            t_f32: None,
++            t_f16: None,
++            t_u16: None,
++            t_i16: None,
++            t_v2u32: None,
++            t_v4f32: None,
++            ptrs: HashMap::new(),
++            u32_consts: HashMap::new(),
++            u64_consts: HashMap::new(),
++            f32_consts: HashMap::new(),
++            c_false: None,
++        };
++        s.seed_existing();
++        s
++    }
++
++    fn seed_existing(&mut self) {
++        for inst in &self.module.ext_inst_imports {
++            if let (Some(id), [Operand::LiteralString(name)]) =
++                (inst.result_id, inst.operands.as_slice())
++            {
++                if name == "GLSL.std.450" {
++                    self.glsl_ext = Some(id);
++                }
++            }
++        }
++        for inst in &self.module.types_global_values {
++            let Some(id) = inst.result_id else { continue };
++            match inst.class.opcode {
++                Op::TypeVoid => {
++                    self.t_void.get_or_insert(id);
++                }
++                Op::TypeBool => {
++                    self.t_bool.get_or_insert(id);
++                }
++                Op::TypeInt => {
++                    if let [Operand::LiteralBit32(w), Operand::LiteralBit32(sgn)] =
++                        inst.operands.as_slice()
++                    {
++                        match (*w, *sgn) {
++                            (32, 0) => {
++                                self.t_u32.get_or_insert(id);
++                            }
++                            (32, 1) => {
++                                self.t_i32.get_or_insert(id);
++                            }
++                            (64, 0) => {
++                                self.t_u64.get_or_insert(id);
++                            }
++                            (16, 0) => {
++                                self.t_u16.get_or_insert(id);
++                            }
++                            (16, 1) => {
++                                self.t_i16.get_or_insert(id);
++                            }
++                            _ => {}
++                        }
++                    }
++                }
++                Op::TypeFloat => {
++                    if let [Operand::LiteralBit32(w)] = inst.operands.as_slice() {
++                        match *w {
++                            32 => {
++                                self.t_f32.get_or_insert(id);
++                            }
++                            16 => {
++                                self.t_f16.get_or_insert(id);
++                            }
++                            _ => {}
++                        }
++                    }
++                }
++                Op::TypeVector => {
++                    if let [Operand::IdRef(elem), Operand::LiteralBit32(n)] =
++                        inst.operands.as_slice()
++                    {
++                        if Some(*elem) == self.t_u32 && *n == 2 {
++                            self.t_v2u32.get_or_insert(id);
++                        }
++                        if Some(*elem) == self.t_f32 && *n == 4 {
++                            self.t_v4f32.get_or_insert(id);
++                        }
++                    }
++                }
++                Op::TypePointer => {
++                    if let [Operand::StorageClass(sc), Operand::IdRef(pt)] =
++                        inst.operands.as_slice()
++                    {
++                        self.ptrs.entry((*sc, *pt)).or_insert(id);
++                    }
++                }
++                Op::ConstantFalse => {
++                    self.c_false.get_or_insert(id);
++                }
++                Op::Constant => {
++                    if let Some(ty) = inst.result_type {
++                        if Some(ty) == self.t_u32 {
++                            if let [Operand::LiteralBit32(v)] = inst.operands.as_slice() {
++                                self.u32_consts.entry(*v).or_insert(id);
++                            }
++                        } else if Some(ty) == self.t_u64 {
++                            if let [Operand::LiteralBit64(v)] = inst.operands.as_slice() {
++                                self.u64_consts.entry(*v).or_insert(id);
++                            }
++                        } else if Some(ty) == self.t_f32 {
++                            if let [Operand::LiteralBit32(v)] = inst.operands.as_slice() {
++                                self.f32_consts.entry(*v).or_insert(id);
++                            }
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++
++    fn require_capability(&mut self, cap: Capability) {
++        if !self.module.capabilities.iter().any(|i| {
++            matches!(i.operands.as_slice(), [Operand::Capability(c)] if *c == cap)
++        }) {
++            self.module.capabilities.push(Instruction::new(
++                Op::Capability,
++                None,
++                None,
++                vec![Operand::Capability(cap)],
++            ));
++        }
++    }
++
++    fn ensure_glsl(&mut self) -> Word {
++        if let Some(id) = self.glsl_ext {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module.ext_inst_imports.push(Instruction::new(
++            Op::ExtInstImport,
++            None,
++            Some(id),
++            vec![Operand::LiteralString("GLSL.std.450".to_string())],
++        ));
++        self.glsl_ext = Some(id);
++        id
++    }
++
++    fn ty_bool(&mut self) -> Word {
++        if let Some(id) = self.t_bool {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module
++            .types_global_values
++            .push(Instruction::new(Op::TypeBool, None, Some(id), vec![]));
++        self.t_bool = Some(id);
++        id
++    }
++
++    fn ty_u32(&mut self) -> Word {
++        if let Some(id) = self.t_u32 {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeInt,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
++        ));
++        self.t_u32 = Some(id);
++        id
++    }
++
++    fn ty_i32(&mut self) -> Word {
++        if let Some(id) = self.t_i32 {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeInt,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(1)],
++        ));
++        self.t_i32 = Some(id);
++        id
++    }
++
++    fn ty_u64(&mut self) -> Word {
++        if let Some(id) = self.t_u64 {
++            return id;
++        }
++        self.require_capability(Capability::Int64);
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeInt,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
++        ));
++        self.t_u64 = Some(id);
++        id
++    }
++
++    fn ty_f32(&mut self) -> Word {
++        if let Some(id) = self.t_f32 {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeFloat,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(32)],
++        ));
++        self.t_f32 = Some(id);
++        id
++    }
++
++    fn ty_f16(&mut self) -> Word {
++        if let Some(id) = self.t_f16 {
++            return id;
++        }
++        self.require_capability(Capability::Float16);
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeFloat,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(16)],
++        ));
++        self.t_f16 = Some(id);
++        id
++    }
++
++    fn ty_u16(&mut self) -> Word {
++        if let Some(id) = self.t_u16 {
++            return id;
++        }
++        self.require_capability(Capability::Int16);
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeInt,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
++        ));
++        self.t_u16 = Some(id);
++        id
++    }
++
++    fn ty_i16(&mut self) -> Word {
++        if let Some(id) = self.t_i16 {
++            return id;
++        }
++        self.require_capability(Capability::Int16);
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeInt,
++            None,
++            Some(id),
++            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(1)],
++        ));
++        self.t_i16 = Some(id);
++        id
++    }
++
++    fn ty_scalar(&mut self, k: ScalarKind) -> Word {
++        match k {
++            ScalarKind::U32 => self.ty_u32(),
++            ScalarKind::S32 => self.ty_i32(),
++            ScalarKind::F32 => self.ty_f32(),
++            ScalarKind::F16 => self.ty_f16(),
++            ScalarKind::U16 => self.ty_u16(),
++            ScalarKind::S16 => self.ty_i16(),
++        }
++    }
++
++    fn ty_v2u32(&mut self) -> Word {
++        if let Some(id) = self.t_v2u32 {
++            return id;
++        }
++        let u = self.ty_u32();
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeVector,
++            None,
++            Some(id),
++            vec![Operand::IdRef(u), Operand::LiteralBit32(2)],
++        ));
++        self.t_v2u32 = Some(id);
++        id
++    }
++
++    fn ty_v4f32(&mut self) -> Word {
++        if let Some(id) = self.t_v4f32 {
++            return id;
++        }
++        let f = self.ty_f32();
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeVector,
++            None,
++            Some(id),
++            vec![Operand::IdRef(f), Operand::LiteralBit32(4)],
++        ));
++        self.t_v4f32 = Some(id);
++        id
++    }
++
++    fn ty_vec(&mut self, elem: Word, n: u32) -> Word {
++        if n == 1 {
++            return elem;
++        }
++        for inst in &self.module.types_global_values {
++            if inst.class.opcode == Op::TypeVector
++                && inst.operands.as_slice() == [Operand::IdRef(elem), Operand::LiteralBit32(n)]
++            {
++                if let Some(id) = inst.result_id {
++                    return id;
++                }
++            }
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypeVector,
++            None,
++            Some(id),
++            vec![Operand::IdRef(elem), Operand::LiteralBit32(n)],
++        ));
++        id
++    }
++
++    fn ty_ptr(&mut self, sc: StorageClass, pointee: Word) -> Word {
++        if let Some(&id) = self.ptrs.get(&(sc, pointee)) {
++            return id;
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::TypePointer,
++            None,
++            Some(id),
++            vec![Operand::StorageClass(sc), Operand::IdRef(pointee)],
++        ));
++        self.ptrs.insert((sc, pointee), id);
++        id
++    }
++
++    fn const_u32(&mut self, v: u32) -> Word {
++        if let Some(&id) = self.u32_consts.get(&v) {
++            return id;
++        }
++        let t = self.ty_u32();
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::Constant,
++            Some(t),
++            Some(id),
++            vec![Operand::LiteralBit32(v)],
++        ));
++        self.u32_consts.insert(v, id);
++        id
++    }
++
++    fn const_i32(&mut self, v: i32) -> Word {
++        let t = self.ty_i32();
++        let bits = v as u32;
++        for inst in &self.module.types_global_values {
++            if inst.class.opcode == Op::Constant
++                && inst.result_type == Some(t)
++                && inst.operands.as_slice() == [Operand::LiteralBit32(bits)]
++            {
++                if let Some(id) = inst.result_id {
++                    return id;
++                }
++            }
++        }
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::Constant,
++            Some(t),
++            Some(id),
++            vec![Operand::LiteralBit32(bits)],
++        ));
++        id
++    }
++
++    fn const_u64(&mut self, v: u64) -> Word {
++        if let Some(&id) = self.u64_consts.get(&v) {
++            return id;
++        }
++        let t = self.ty_u64();
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::Constant,
++            Some(t),
++            Some(id),
++            vec![Operand::LiteralBit64(v)],
++        ));
++        self.u64_consts.insert(v, id);
++        id
++    }
++
++    fn const_f32(&mut self, f: f32) -> Word {
++        let bits = f.to_bits();
++        if let Some(&id) = self.f32_consts.get(&bits) {
++            return id;
++        }
++        let t = self.ty_f32();
++        let id = self.module.fresh_id();
++        self.module.types_global_values.push(Instruction::new(
++            Op::Constant,
++            Some(t),
++            Some(id),
++            vec![Operand::LiteralBit32(bits)],
++        ));
++        self.f32_consts.insert(bits, id);
++        id
++    }
++
++    fn decorate(&mut self, target: Word, dec: Decoration, args: Vec<Operand>) {
++        let mut ops = vec![Operand::IdRef(target), Operand::Decoration(dec)];
++        ops.extend(args);
++        self.module
++            .annotations
++            .push(Instruction::new(Op::Decorate, None, None, ops));
++    }
++
++    fn member_decorate(&mut self, target: Word, member: u32, dec: Decoration, args: Vec<Operand>) {
++        let mut ops = vec![
++            Operand::IdRef(target),
++            Operand::LiteralBit32(member),
++            Operand::Decoration(dec),
++        ];
++        ops.extend(args);
++        self.module
++            .annotations
++            .push(Instruction::new(Op::MemberDecorate, None, None, ops));
++    }
++
++    fn op(&mut self, out: &mut Vec<Instruction>, op: Op, rt: Word, ops: Vec<Operand>) -> Word {
++        let id = self.module.fresh_id();
++        out.push(Instruction::new(op, Some(rt), Some(id), ops));
++        id
++    }
++
++    fn zero_of_type(&mut self, defs: &HashMap<Word, Instruction>, ty: Word) -> Word {
++        let Some(def) = defs.get(&ty) else {
++            return self.const_f32(0.0);
++        };
++        match def.class.opcode {
++            Op::TypeBool => {
++                if let Some(id) = self.c_false {
++                    return id;
++                }
++                let t = self.ty_bool();
++                let id = self.module.fresh_id();
++                self.module.types_global_values.push(Instruction::new(
++                    Op::ConstantFalse,
++                    Some(t),
++                    Some(id),
++                    vec![],
++                ));
++                self.c_false = Some(id);
++                id
++            }
++            Op::TypeFloat
++            | Op::TypeInt
++            | Op::TypeVector
++            | Op::TypeArray
++            | Op::TypeMatrix
++            | Op::TypeStruct => {
++                let id = self.module.fresh_id();
++                self.module.types_global_values.push(Instruction::new(
++                    Op::ConstantNull,
++                    Some(ty),
++                    Some(id),
++                    vec![],
++                ));
++                id
++            }
++            _ => self.const_f32(0.0),
++        }
++    }
++}
++
++fn defs_map(module: &Module) -> HashMap<Word, Instruction> {
++    module
++        .types_global_values
++        .iter()
++        .filter_map(|i| i.result_id.map(|id| (id, i.clone())))
++        .collect()
++}
++
++fn type_scalar_align(defs: &HashMap<Word, Instruction>, ty: Word) -> u32 {
++    fn inner(defs: &HashMap<Word, Instruction>, ty: Word, depth: u32) -> u32 {
++        if depth > 8 {
++            return 4;
++        }
++        let Some(def) = defs.get(&ty) else { return 4 };
++        match def.class.opcode {
++            Op::TypeBool => 1,
++            Op::TypeInt => match def.operands.first() {
++                Some(Operand::LiteralBit32(w)) => (*w / 8).clamp(1, 8),
++                _ => 4,
++            },
++            Op::TypeFloat => match def.operands.first() {
++                Some(Operand::LiteralBit32(w)) => (*w / 8).clamp(2, 8),
++                _ => 4,
++            },
++            Op::TypeVector | Op::TypeMatrix | Op::TypeArray | Op::TypeRuntimeArray => {
++                match def.operands.first() {
++                    Some(Operand::IdRef(elem)) => inner(defs, *elem, depth + 1),
++                    _ => 4,
++                }
++            }
++            Op::TypeStruct => def
++                .operands
++                .iter()
++                .filter_map(|o| match o {
++                    Operand::IdRef(m) => Some(inner(defs, *m, depth + 1)),
++                    _ => None,
++                })
++                .max()
++                .unwrap_or(4),
++            _ => 4,
++        }
++    }
++    inner(defs, ty, 0)
++}
++
++fn ptr_pointee(defs: &HashMap<Word, Instruction>, ptr_ty: Word) -> Option<(StorageClass, Word)> {
++    let def = defs.get(&ptr_ty)?;
++    if def.class.opcode != Op::TypePointer {
++        return None;
++    }
++    match def.operands.as_slice() {
++        [Operand::StorageClass(sc), Operand::IdRef(pt)] => Some((*sc, *pt)),
++        _ => None,
++    }
++}
++
++fn make_psb_access_operands(
++    ptr: Word,
++    val: Option<Word>,
++    extra: &[Operand],
++    pointee_ty: Word,
++    defs: &HashMap<Word, Instruction>,
++) -> Vec<Operand> {
++    let safe_align = type_scalar_align(defs, pointee_ty);
++    let mut mask = MemoryAccess::ALIGNED;
++    let mut existing_align = None;
++    let mut tail = Vec::new();
++    let mut idx = 0;
++    while idx < extra.len() {
++        match &extra[idx] {
++            Operand::MemoryAccess(ma) => {
++                mask |= *ma;
++                if ma.contains(MemoryAccess::ALIGNED) {
++                    if let Some(Operand::LiteralBit32(a)) = extra.get(idx + 1) {
++                        existing_align = Some(*a);
++                        idx += 2;
++                        continue;
++                    }
++                }
++            }
++            other => tail.push(other.clone()),
++        }
++        idx += 1;
++    }
++    let align = existing_align.map_or(safe_align, |a| a.min(safe_align).max(1));
++    let mut ops = vec![Operand::IdRef(ptr)];
++    if let Some(v) = val {
++        ops.push(Operand::IdRef(v));
++    }
++    ops.push(Operand::MemoryAccess(mask));
++    ops.push(Operand::LiteralBit32(align));
++    ops.extend(tail);
++    ops
++}
++
++fn emit_psb_load32_fn(b: &mut SpirvBuilder<'_>) -> Word {
++    let u32_ty = b.ty_u32();
++    let u64_ty = b.ty_u64();
++    let bool_ty = b.ty_bool();
++    let psb_u32_ptr = b.ty_ptr(StorageClass::PhysicalStorageBuffer, u32_ty);
++
++    let c0_64 = b.const_u64(0);
++    let c3_64 = b.const_u64(3);
++    let c4_64 = b.const_u64(4);
++    let c_not3 = b.const_u64(!3u64);
++
++    let c0 = b.const_u32(0);
++    let c1 = b.const_u32(1);
++    let c2 = b.const_u32(2);
++    let c3 = b.const_u32(3);
++    let c4 = b.const_u32(4);
++    let c8 = b.const_u32(8);
++    let c32 = b.const_u32(32);
++    let c_ff = b.const_u32(0xFF);
++    let c_ffff = b.const_u32(0xFFFF);
++    let c_ffffff = b.const_u32(0x00FF_FFFF);
++    let c_all = b.const_u32(0xFFFF_FFFF);
++
++    let fn_ty = b.module.fresh_id();
++    b.module.types_global_values.push(Instruction::new(
++        Op::TypeFunction,
++        None,
++        Some(fn_ty),
++        vec![
++            Operand::IdRef(u32_ty),
++            Operand::IdRef(u64_ty),
++            Operand::IdRef(u64_ty),
++            Operand::IdRef(u32_ty),
++        ],
++    ));
++
++    let fn_id = b.module.fresh_id();
++    let p_base = b.module.fresh_id();
++    let p_off = b.module.fresh_id();
++    let p_len = b.module.fresh_id();
++
++    let l_entry = b.module.fresh_id();
++    let l_ok = b.module.fresh_id();
++    let l_w1 = b.module.fresh_id();
++    let l_w1m = b.module.fresh_id();
++    let l_unalign = b.module.fresh_id();
++    let l_sm = b.module.fresh_id();
++    let l_ret = b.module.fresh_id();
++
++    let mut e_insts = Vec::new();
++    let ok_base = b.op(
++        &mut e_insts,
++        Op::INotEqual,
++        bool_ty,
++        vec![Operand::IdRef(p_base), Operand::IdRef(c0_64)],
++    );
++    let ok_l1 = b.op(
++        &mut e_insts,
++        Op::UGreaterThanEqual,
++        bool_ty,
++        vec![Operand::IdRef(p_len), Operand::IdRef(c1)],
++    );
++    let ok_l4 = b.op(
++        &mut e_insts,
++        Op::ULessThanEqual,
++        bool_ty,
++        vec![Operand::IdRef(p_len), Operand::IdRef(c4)],
++    );
++    let ok_12 = b.op(
++        &mut e_insts,
++        Op::LogicalAnd,
++        bool_ty,
++        vec![Operand::IdRef(ok_base), Operand::IdRef(ok_l1)],
++    );
++    let inbounds = b.op(
++        &mut e_insts,
++        Op::LogicalAnd,
++        bool_ty,
++        vec![Operand::IdRef(ok_12), Operand::IdRef(ok_l4)],
++    );
++    e_insts.push(Instruction::new(
++        Op::SelectionMerge,
++        None,
++        None,
++        vec![
++            Operand::IdRef(l_ret),
++            Operand::SelectionControl(SelectionControl::NONE),
++        ],
++    ));
++    e_insts.push(Instruction::new(
++        Op::BranchConditional,
++        None,
++        None,
++        vec![
++            Operand::IdRef(inbounds),
++            Operand::IdRef(l_ok),
++            Operand::IdRef(l_ret),
++        ],
++    ));
++
++    let mut ok_insts = Vec::new();
++    let abs = b.op(
++        &mut ok_insts,
++        Op::IAdd,
++        u64_ty,
++        vec![Operand::IdRef(p_base), Operand::IdRef(p_off)],
++    );
++    let rem64 = b.op(
++        &mut ok_insts,
++        Op::BitwiseAnd,
++        u64_ty,
++        vec![Operand::IdRef(abs), Operand::IdRef(c3_64)],
++    );
++    let rem = b.op(&mut ok_insts, Op::UConvert, u32_ty, vec![Operand::IdRef(rem64)]);
++    let a0 = b.op(
++        &mut ok_insts,
++        Op::BitwiseAnd,
++        u64_ty,
++        vec![Operand::IdRef(abs), Operand::IdRef(c_not3)],
++    );
++    let ptr0 = b.op(&mut ok_insts, Op::ConvertUToPtr, psb_u32_ptr, vec![Operand::IdRef(a0)]);
++    let w0 = b.op(
++        &mut ok_insts,
++        Op::Load,
++        u32_ty,
++        vec![
++            Operand::IdRef(ptr0),
++            Operand::MemoryAccess(MemoryAccess::ALIGNED),
++            Operand::LiteralBit32(4),
++        ],
++    );
++    let span = b.op(
++        &mut ok_insts,
++        Op::IAdd,
++        u32_ty,
++        vec![Operand::IdRef(rem), Operand::IdRef(p_len)],
++    );
++    let need_w1 = b.op(
++        &mut ok_insts,
++        Op::UGreaterThan,
++        bool_ty,
++        vec![Operand::IdRef(span), Operand::IdRef(c4)],
++    );
++    ok_insts.push(Instruction::new(
++        Op::SelectionMerge,
++        None,
++        None,
++        vec![
++            Operand::IdRef(l_w1m),
++            Operand::SelectionControl(SelectionControl::NONE),
++        ],
++    ));
++    ok_insts.push(Instruction::new(
++        Op::BranchConditional,
++        None,
++        None,
++        vec![
++            Operand::IdRef(need_w1),
++            Operand::IdRef(l_w1),
++            Operand::IdRef(l_w1m),
++        ],
++    ));
++
++    let mut w1_insts = Vec::new();
++    let a1 = b.op(
++        &mut w1_insts,
++        Op::IAdd,
++        u64_ty,
++        vec![Operand::IdRef(a0), Operand::IdRef(c4_64)],
++    );
++    let ptr1 = b.op(&mut w1_insts, Op::ConvertUToPtr, psb_u32_ptr, vec![Operand::IdRef(a1)]);
++    let w1_val = b.op(
++        &mut w1_insts,
++        Op::Load,
++        u32_ty,
++        vec![
++            Operand::IdRef(ptr1),
++            Operand::MemoryAccess(MemoryAccess::ALIGNED),
++            Operand::LiteralBit32(4),
++        ],
++    );
++    w1_insts.push(Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(l_w1m)]));
++
++    let mut w1m_insts = Vec::new();
++    let w1 = b.op(
++        &mut w1m_insts,
++        Op::Phi,
++        u32_ty,
++        vec![
++            Operand::IdRef(w1_val),
++            Operand::IdRef(l_w1),
++            Operand::IdRef(c0),
++            Operand::IdRef(l_ok),
++        ],
++    );
++    let rem0 = b.op(
++        &mut w1m_insts,
++        Op::IEqual,
++        bool_ty,
++        vec![Operand::IdRef(rem), Operand::IdRef(c0)],
++    );
++    w1m_insts.push(Instruction::new(
++        Op::SelectionMerge,
++        None,
++        None,
++        vec![
++            Operand::IdRef(l_sm),
++            Operand::SelectionControl(SelectionControl::NONE),
++        ],
++    ));
++    w1m_insts.push(Instruction::new(
++        Op::BranchConditional,
++        None,
++        None,
++        vec![
++            Operand::IdRef(rem0),
++            Operand::IdRef(l_sm),
++            Operand::IdRef(l_unalign),
++        ],
++    ));
++
++    let mut unalign_insts = Vec::new();
++    let sh0 = b.op(
++        &mut unalign_insts,
++        Op::IMul,
++        u32_ty,
++        vec![Operand::IdRef(rem), Operand::IdRef(c8)],
++    );
++    let sh1 = b.op(
++        &mut unalign_insts,
++        Op::ISub,
++        u32_ty,
++        vec![Operand::IdRef(c32), Operand::IdRef(sh0)],
++    );
++    let lo = b.op(
++        &mut unalign_insts,
++        Op::ShiftRightLogical,
++        u32_ty,
++        vec![Operand::IdRef(w0), Operand::IdRef(sh0)],
++    );
++    let hi = b.op(
++        &mut unalign_insts,
++        Op::ShiftLeftLogical,
++        u32_ty,
++        vec![Operand::IdRef(w1), Operand::IdRef(sh1)],
++    );
++    let comb = b.op(
++        &mut unalign_insts,
++        Op::BitwiseOr,
++        u32_ty,
++        vec![Operand::IdRef(lo), Operand::IdRef(hi)],
++    );
++    unalign_insts.push(Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(l_sm)]));
++
++    let mut sm_insts = Vec::new();
++    let raw = b.op(
++        &mut sm_insts,
++        Op::Phi,
++        u32_ty,
++        vec![
++            Operand::IdRef(w0),
++            Operand::IdRef(l_w1m),
++            Operand::IdRef(comb),
++            Operand::IdRef(l_unalign),
++        ],
++    );
++    let is1 = b.op(&mut sm_insts, Op::IEqual, bool_ty, vec![Operand::IdRef(p_len), Operand::IdRef(c1)]);
++    let is2 = b.op(&mut sm_insts, Op::IEqual, bool_ty, vec![Operand::IdRef(p_len), Operand::IdRef(c2)]);
++    let is3 = b.op(&mut sm_insts, Op::IEqual, bool_ty, vec![Operand::IdRef(p_len), Operand::IdRef(c3)]);
++    let m34 = b.op(
++        &mut sm_insts,
++        Op::Select,
++        u32_ty,
++        vec![Operand::IdRef(is3), Operand::IdRef(c_ffffff), Operand::IdRef(c_all)],
++    );
++    let m24 = b.op(
++        &mut sm_insts,
++        Op::Select,
++        u32_ty,
++        vec![Operand::IdRef(is2), Operand::IdRef(c_ffff), Operand::IdRef(m34)],
++    );
++    let mask = b.op(
++        &mut sm_insts,
++        Op::Select,
++        u32_ty,
++        vec![Operand::IdRef(is1), Operand::IdRef(c_ff), Operand::IdRef(m24)],
++    );
++    let masked = b.op(
++        &mut sm_insts,
++        Op::BitwiseAnd,
++        u32_ty,
++        vec![Operand::IdRef(raw), Operand::IdRef(mask)],
++    );
++    sm_insts.push(Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(l_ret)]));
++
++    let mut ret_insts = Vec::new();
++    let rphi = b.op(
++        &mut ret_insts,
++        Op::Phi,
++        u32_ty,
++        vec![
++            Operand::IdRef(masked),
++            Operand::IdRef(l_sm),
++            Operand::IdRef(c0),
++            Operand::IdRef(l_entry),
++        ],
++    );
++    ret_insts.push(Instruction::new(Op::ReturnValue, None, None, vec![Operand::IdRef(rphi)]));
++
++    let blocks = [
++        (l_entry, e_insts),
++        (l_ok, ok_insts),
++        (l_w1, w1_insts),
++        (l_w1m, w1m_insts),
++        (l_unalign, unalign_insts),
++        (l_sm, sm_insts),
++        (l_ret, ret_insts),
++    ]
++    .into_iter()
++    .map(|(lbl, insts)| Block {
++        label: Some(Instruction::new(Op::Label, None, Some(lbl), vec![])),
++        instructions: insts,
++    })
++    .collect();
++
++    b.module.functions.push(Function {
++        def: Some(Instruction::new(
++            Op::Function,
++            Some(u32_ty),
++            Some(fn_id),
++            vec![
++                Operand::FunctionControl(FunctionControl::NONE),
++                Operand::IdRef(fn_ty),
++            ],
++        )),
++        parameters: vec![
++            Instruction::new(Op::FunctionParameter, Some(u64_ty), Some(p_base), vec![]),
++            Instruction::new(Op::FunctionParameter, Some(u64_ty), Some(p_off), vec![]),
++            Instruction::new(Op::FunctionParameter, Some(u32_ty), Some(p_len), vec![]),
++        ],
++        blocks,
++        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
++    });
++    fn_id
++}
++
++fn call_load32(b: &mut SpirvBuilder<'_>, out: &mut Vec<Instruction>, fn_load32: Word, base: Word, off: Word, len: u32) -> Word {
++    let u32_ty = b.ty_u32();
++    let len_c = b.const_u32(len);
++    b.op(
++        out,
++        Op::FunctionCall,
++        u32_ty,
++        vec![
++            Operand::IdRef(fn_load32),
++            Operand::IdRef(base),
++            Operand::IdRef(off),
++            Operand::IdRef(len_c),
++        ],
++    )
++}
++
++fn decode_vfmt_lanes(
++    b: &mut SpirvBuilder<'_>,
++    out: &mut Vec<Instruction>,
++    vfmt: u8,
++    w: &[Word; 4],
++) -> Result<(Vec<Word>, ScalarKind), String> {
++    let u32_ty = b.ty_u32();
++    let i32_ty = b.ty_i32();
++    let f32_ty = b.ty_f32();
++    let v2f32_ty = b.ty_vec(f32_ty, 2);
++    let glsl = b.ensure_glsl();
++    let mut lanes = Vec::new();
++    let s = match vfmt {
++        1..=4 => {
++            let n = (vfmt - 1) + 1;
++            let c8 = b.const_u32(8);
++            for c in 0..n {
++                let off = b.const_u32(u32::from(c) * 8);
++                let l = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(w[0]), Operand::IdRef(off), Operand::IdRef(c8)]);
++                lanes.push(l);
++            }
++            ScalarKind::U32
++        }
++        5..=8 => {
++            let n = (vfmt - 5) + 1;
++            let c8 = b.const_u32(8);
++            let w0s = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[0])]);
++            for c in 0..n {
++                let off = b.const_u32(u32::from(c) * 8);
++                let l = b.op(out, Op::BitFieldSExtract, i32_ty, vec![Operand::IdRef(w0s), Operand::IdRef(off), Operand::IdRef(c8)]);
++                lanes.push(l);
++            }
++            ScalarKind::S32
++        }
++        9..=12 => {
++            let n = (vfmt - 9) + 1;
++            let c8 = b.const_u32(8);
++            let scale = b.const_f32(1.0 / 255.0);
++            for c in 0..n {
++                let off = b.const_u32(u32::from(c) * 8);
++                let u = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(w[0]), Operand::IdRef(off), Operand::IdRef(c8)]);
++                let f = b.op(out, Op::ConvertUToF, f32_ty, vec![Operand::IdRef(u)]);
++                let nm = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(scale)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        13..=16 => {
++            let n = (vfmt - 13) + 1;
++            let c8 = b.const_u32(8);
++            let scale = b.const_f32(1.0 / 127.0);
++            let neg1 = b.const_f32(-1.0);
++            let w0s = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[0])]);
++            for c in 0..n {
++                let off = b.const_u32(u32::from(c) * 8);
++                let s = b.op(out, Op::BitFieldSExtract, i32_ty, vec![Operand::IdRef(w0s), Operand::IdRef(off), Operand::IdRef(c8)]);
++                let f = b.op(out, Op::ConvertSToF, f32_ty, vec![Operand::IdRef(s)]);
++                let sc = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(scale)]);
++                let nm = b.op(out, Op::ExtInst, f32_ty, vec![Operand::IdRef(glsl), Operand::LiteralExtInstInteger(40), Operand::IdRef(sc), Operand::IdRef(neg1)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        17 => {
++            let c8 = b.const_u32(8);
++            let scale = b.const_f32(1.0 / 255.0);
++            for byte_idx in [2u32, 1, 0, 3] {
++                let off = b.const_u32(byte_idx * 8);
++                let u = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(w[0]), Operand::IdRef(off), Operand::IdRef(c8)]);
++                let f = b.op(out, Op::ConvertUToF, f32_ty, vec![Operand::IdRef(u)]);
++                let nm = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(scale)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        18..=21 => {
++            let n = (vfmt - 18) + 1;
++            let c16 = b.const_u32(16);
++            for c in 0..n {
++                let word = w[(c / 2) as usize];
++                let off = b.const_u32(u32::from(c & 1) * 16);
++                let u = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(word), Operand::IdRef(off), Operand::IdRef(c16)]);
++                lanes.push(u);
++            }
++            ScalarKind::U32
++        }
++        22..=25 => {
++            let n = (vfmt - 22) + 1;
++            let c16 = b.const_u32(16);
++            for c in 0..n {
++                let ws = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[(c / 2) as usize])]);
++                let off = b.const_u32(u32::from(c & 1) * 16);
++                let s = b.op(out, Op::BitFieldSExtract, i32_ty, vec![Operand::IdRef(ws), Operand::IdRef(off), Operand::IdRef(c16)]);
++                lanes.push(s);
++            }
++            ScalarKind::S32
++        }
++        26..=29 => {
++            let n = (vfmt - 26) + 1;
++            let c16 = b.const_u32(16);
++            let scale = b.const_f32(1.0 / 65535.0);
++            for c in 0..n {
++                let word = w[(c / 2) as usize];
++                let off = b.const_u32(u32::from(c & 1) * 16);
++                let u = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(word), Operand::IdRef(off), Operand::IdRef(c16)]);
++                let f = b.op(out, Op::ConvertUToF, f32_ty, vec![Operand::IdRef(u)]);
++                let nm = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(scale)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        30..=33 => {
++            let n = (vfmt - 30) + 1;
++            let c16 = b.const_u32(16);
++            let scale = b.const_f32(1.0 / 32767.0);
++            let neg1 = b.const_f32(-1.0);
++            for c in 0..n {
++                let ws = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[(c / 2) as usize])]);
++                let off = b.const_u32(u32::from(c & 1) * 16);
++                let s = b.op(out, Op::BitFieldSExtract, i32_ty, vec![Operand::IdRef(ws), Operand::IdRef(off), Operand::IdRef(c16)]);
++                let f = b.op(out, Op::ConvertSToF, f32_ty, vec![Operand::IdRef(s)]);
++                let sc = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(scale)]);
++                let nm = b.op(out, Op::ExtInst, f32_ty, vec![Operand::IdRef(glsl), Operand::LiteralExtInstInteger(40), Operand::IdRef(sc), Operand::IdRef(neg1)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        34..=37 => {
++            let n = (vfmt - 34) + 1;
++            let p0 = b.op(out, Op::ExtInst, v2f32_ty, vec![Operand::IdRef(glsl), Operand::LiteralExtInstInteger(55), Operand::IdRef(w[0])]);
++            let p1 = if n > 2 {
++                Some(b.op(out, Op::ExtInst, v2f32_ty, vec![Operand::IdRef(glsl), Operand::LiteralExtInstInteger(55), Operand::IdRef(w[1])]))
++            } else {
++                None
++            };
++            for c in 0..n {
++                let pair = if c < 2 { p0 } else { p1.unwrap() };
++                let f = b.op(out, Op::CompositeExtract, f32_ty, vec![Operand::IdRef(pair), Operand::LiteralBit32(u32::from(c & 1))]);
++                lanes.push(f);
++            }
++            ScalarKind::F32
++        }
++        38..=41 => {
++            let n = (vfmt - 38) + 1;
++            for c in 0..n {
++                let f = b.op(out, Op::Bitcast, f32_ty, vec![Operand::IdRef(w[c as usize])]);
++                lanes.push(f);
++            }
++            ScalarKind::F32
++        }
++        42..=45 => {
++            let n = (vfmt - 42) + 1;
++            for c in 0..n {
++                let s = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[c as usize])]);
++                lanes.push(s);
++            }
++            ScalarKind::S32
++        }
++        46..=49 => {
++            let n = (vfmt - 46) + 1;
++            for c in 0..n {
++                lanes.push(w[c as usize]);
++            }
++            ScalarKind::U32
++        }
++        50 => {
++            let ws = b.op(out, Op::Bitcast, i32_ty, vec![Operand::IdRef(w[0])]);
++            let c10 = b.const_u32(10);
++            let c2 = b.const_u32(2);
++            let neg1 = b.const_f32(-1.0);
++            let s511 = b.const_f32(1.0 / 511.0);
++            for c in 0..4u32 {
++                let off = b.const_u32(c * 10);
++                let bits = if c < 3 { c10 } else { c2 };
++                let s = b.op(out, Op::BitFieldSExtract, i32_ty, vec![Operand::IdRef(ws), Operand::IdRef(off), Operand::IdRef(bits)]);
++                let f = b.op(out, Op::ConvertSToF, f32_ty, vec![Operand::IdRef(s)]);
++                let sc = if c < 3 {
++                    b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(s511)])
++                } else {
++                    f
++                };
++                let nm = b.op(out, Op::ExtInst, f32_ty, vec![Operand::IdRef(glsl), Operand::LiteralExtInstInteger(40), Operand::IdRef(sc), Operand::IdRef(neg1)]);
++                lanes.push(nm);
++            }
++            ScalarKind::F32
++        }
++        51 => {
++            let c10 = b.const_u32(10);
++            let c2 = b.const_u32(2);
++            let u1023 = b.const_f32(1.0 / 1023.0);
++            let u3 = b.const_f32(1.0 / 3.0);
++            for c in 0..4u32 {
++                let off = b.const_u32(c * 10);
++                let bits = if c < 3 { c10 } else { c2 };
++                let u = b.op(out, Op::BitFieldUExtract, u32_ty, vec![Operand::IdRef(w[0]), Operand::IdRef(off), Operand::IdRef(bits)]);
++                let f = b.op(out, Op::ConvertUToF, f32_ty, vec![Operand::IdRef(u)]);
++                let sc = b.op(out, Op::FMul, f32_ty, vec![Operand::IdRef(f), Operand::IdRef(if c < 3 { u1023 } else { u3 })]);
++                lanes.push(sc);
++            }
++            ScalarKind::F32
++        }
++        other => return Err(format!("icb_stage: unsupported vertex format {other}")),
++    };
++    Ok((lanes, s))
++}
++
++fn vfmt_bytes(vfmt: u8) -> Option<u32> {
++    Some(match vfmt {
++        1 | 5 | 9 | 13 => 1,
++        2 | 6 | 10 | 14 | 18 | 22 | 26 | 30 | 34 => 2,
++        3 | 7 | 11 | 15 => 3,
++        4 | 8 | 12 | 16 | 17 | 19 | 23 | 27 | 31 | 35 | 38 | 42 | 46 | 50 | 51 => 4,
++        20 | 24 | 28 | 32 | 36 => 6,
++        21 | 25 | 29 | 33 | 37 | 39 | 43 | 47 => 8,
++        40 | 44 | 48 => 12,
++        41 | 45 | 49 => 16,
++        _ => return None,
++    })
++}
++
++fn scalar_kind_of_type(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(ScalarKind, u32)> {
++    let mut t = ty;
++    let mut comps = 1u32;
++    if let Some(def) = defs.get(&ty) {
++        if def.class.opcode == Op::TypeVector {
++            let [Operand::IdRef(e), Operand::LiteralBit32(n)] = def.operands.as_slice() else {
++                return None;
++            };
++            t = *e;
++            comps = *n;
++        }
++    }
++    let def = defs.get(&t)?;
++    let kind = match def.class.opcode {
++        Op::TypeFloat => match def.operands.first() {
++            Some(Operand::LiteralBit32(16)) => ScalarKind::F16,
++            Some(Operand::LiteralBit32(32)) => ScalarKind::F32,
++            _ => return None,
++        },
++        Op::TypeInt => match def.operands.as_slice() {
++            [Operand::LiteralBit32(32), Operand::LiteralBit32(0)] => ScalarKind::U32,
++            [Operand::LiteralBit32(32), Operand::LiteralBit32(1)] => ScalarKind::S32,
++            [Operand::LiteralBit32(16), Operand::LiteralBit32(0)] => ScalarKind::U16,
++            [Operand::LiteralBit32(16), Operand::LiteralBit32(1)] => ScalarKind::S16,
++            _ => return None,
++        },
++        _ => return None,
++    };
++    Some((kind, comps))
++}
++
++fn convert_scalar(
++    b: &mut SpirvBuilder<'_>,
++    out: &mut Vec<Instruction>,
++    val: Word,
++    src: ScalarKind,
++    dst: ScalarKind,
++) -> Word {
++    use ScalarKind::*;
++    let dst_ty = b.ty_scalar(dst);
++    match (src, dst) {
++        (U32, U32) | (S32, S32) | (F32, F32) | (F16, F16) | (U16, U16) | (S16, S16) => val,
++        (F32, F16) | (F16, F32) => b.op(out, Op::FConvert, dst_ty, vec![Operand::IdRef(val)]),
++        (U32 | U16, F32 | F16) => b.op(out, Op::ConvertUToF, dst_ty, vec![Operand::IdRef(val)]),
++        (S32 | S16, F32 | F16) => b.op(out, Op::ConvertSToF, dst_ty, vec![Operand::IdRef(val)]),
++        (F32 | F16, U32 | U16) => b.op(out, Op::ConvertFToU, dst_ty, vec![Operand::IdRef(val)]),
++        (F32 | F16, S32 | S16) => b.op(out, Op::ConvertFToS, dst_ty, vec![Operand::IdRef(val)]),
++        (U32, S32) | (S32, U32) | (U16, S16) | (S16, U16) => {
++            b.op(out, Op::Bitcast, dst_ty, vec![Operand::IdRef(val)])
++        }
++        (U32 | S32, U16) | (U16, U32) | (S16, U32) => {
++            b.op(out, Op::UConvert, dst_ty, vec![Operand::IdRef(val)])
++        }
++        (U32 | S32, S16) | (S16, S32) | (U16, S32) => {
++            b.op(out, Op::SConvert, dst_ty, vec![Operand::IdRef(val)])
++        }
++    }
++}
++
++fn pad_scalar_const(b: &mut SpirvBuilder<'_>, dst: ScalarKind, lane: usize) -> Word {
++    use ScalarKind::*;
++    let one = lane == 3;
++    match dst {
++        F32 => b.const_f32(if one { 1.0 } else { 0.0 }),
++        U32 => b.const_u32(u32::from(one)),
++        S32 => b.const_i32(i32::from(one)),
++        F16 | U16 | S16 => {
++            let t = b.ty_scalar(dst);
++            let id = b.module.fresh_id();
++            b.module
++                .types_global_values
++                .push(Instruction::new(Op::ConstantNull, Some(t), Some(id), vec![]));
++            id
++        }
++    }
++}
++
++fn convert_lanes_to_type(
++    b: &mut SpirvBuilder<'_>,
++    out: &mut Vec<Instruction>,
++    lanes: &[Word],
++    src_kind: ScalarKind,
++    dst_kind: ScalarKind,
++    dst_comps: u32,
++) -> Word {
++    let mut conv = Vec::with_capacity(dst_comps as usize);
++    for c in 0..(dst_comps as usize) {
++        let v = if c < lanes.len() {
++            convert_scalar(b, out, lanes[c], src_kind, dst_kind)
++        } else if c == 3 {
++            match dst_kind {
++                ScalarKind::F16 => {
++                    let f1 = b.const_f32(1.0);
++                    convert_scalar(b, out, f1, ScalarKind::F32, ScalarKind::F16)
++                }
++                ScalarKind::U16 => {
++                    let u1 = b.const_u32(1);
++                    convert_scalar(b, out, u1, ScalarKind::U32, ScalarKind::U16)
++                }
++                ScalarKind::S16 => {
++                    let s1 = b.const_i32(1);
++                    convert_scalar(b, out, s1, ScalarKind::S32, ScalarKind::S16)
++                }
++                _ => pad_scalar_const(b, dst_kind, c),
++            }
++        } else {
++            pad_scalar_const(b, dst_kind, c)
++        };
++        conv.push(v);
++    }
++    if dst_comps == 1 {
++        return conv[0];
++    }
++    let st = b.ty_scalar(dst_kind);
++    let vt = b.ty_vec(st, dst_comps);
++    b.op(
++        out,
++        Op::CompositeConstruct,
++        vt,
++        conv.into_iter().map(Operand::IdRef).collect(),
++    )
++}
++
++fn lower_existing_psb_table_load(
++    b: &mut SpirvBuilder<'_>,
++    out: &mut Vec<Instruction>,
++    table_var: Word,
++    table_u64_arr_ptr: Option<(Word, bool)>,
++    slot_u32: u32,
++    word_group_offset: u32,
++) -> Word {
++    let u64_ty = b.ty_u64();
++    let idx = b.const_u32(word_group_offset + slot_u32);
++    let c0 = b.const_u32(0);
++    if let Some((ptr_ty, true)) = table_u64_arr_ptr {
++        let v2_ty = b.ty_v2u32();
++        let ac = b.op(
++            out,
++            Op::AccessChain,
++            ptr_ty,
++            vec![Operand::IdRef(table_var), Operand::IdRef(c0), Operand::IdRef(idx)],
++        );
++        let vec = b.op(out, Op::Load, v2_ty, vec![Operand::IdRef(ac)]);
++        return b.op(out, Op::Bitcast, u64_ty, vec![Operand::IdRef(vec)]);
++    }
++    let ptr_ty = b.ty_ptr(StorageClass::StorageBuffer, u64_ty);
++    let ac = b.op(
++        out,
++        Op::AccessChain,
++        ptr_ty,
++        vec![Operand::IdRef(table_var), Operand::IdRef(c0), Operand::IdRef(idx)],
++    );
++    b.op(out, Op::Load, u64_ty, vec![Operand::IdRef(ac)])
++}
++
++pub fn lower_icb_stage(
++    spv: &[u8],
++    stage_kind: u32,
++    stage_set: u32,
++    vattrs: &[IcbVertexAttr],
++) -> Result<(Vec<u8>, u32, u32), String> {
++    if stage_kind > 2 {
++        return Err(format!("icb_stage: unsupported stage_kind {stage_kind}"));
++    }
++    let mut module = crate::spirv_module::load_bytes(spv)
++        .map_err(|e| format!("icb_stage: invalid SPIR-V: {e:?}"))?;
++    module.sync_id_bound_from_instructions();
++
++    if let Some(hdr) = module.header.as_mut() {
++        if hdr.version() < (1, 5) {
++            hdr.set_version(1, 5);
++        }
++    }
++
++    let ep_idx = 0usize;
++    let entry_fn_id = match module
++        .entry_points
++        .get(ep_idx)
++        .and_then(|ep| ep.operands.get(1))
++    {
++        Some(Operand::IdRef(id)) => *id,
++        _ => return Err("icb_stage: module has no OpEntryPoint".into()),
++    };
++
++    let defs_initial = defs_map(&module);
++    let mut sets: HashMap<Word, u32> = HashMap::new();
++    let mut bindings: HashMap<Word, u32> = HashMap::new();
++    let mut var_builtins: HashMap<Word, BuiltIn> = HashMap::new();
++    let mut var_locs: HashMap<Word, u32> = HashMap::new();
++    let mut member_offsets: HashMap<(Word, u32), u32> = HashMap::new();
++    let mut member_builtins: HashMap<(Word, u32), BuiltIn> = HashMap::new();
++    let mut array_strides: HashMap<Word, u32> = HashMap::new();
++    let mut buffer_block_structs: HashSet<Word> = HashSet::new();
++    let mut const_u32_map: HashMap<Word, u32> = HashMap::new();
++    for inst in &module.types_global_values {
++        if inst.class.opcode == Op::Constant {
++            if let (Some(id), Some(ty), [Operand::LiteralBit32(v)]) =
++                (inst.result_id, inst.result_type, inst.operands.as_slice())
++            {
++                if defs_initial.get(&ty).is_some_and(|t| {
++                    t.class.opcode == Op::TypeInt
++                        && t.operands.first() == Some(&Operand::LiteralBit32(32))
++                }) {
++                    const_u32_map.insert(id, *v);
++                }
++            }
++        }
++    }
++
++    for ann in &module.annotations {
++        match (ann.class.opcode, ann.operands.as_slice()) {
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(s)]) => {
++                sets.insert(*t, *s);
++            }
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(b)]) => {
++                bindings.insert(*t, *b);
++            }
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::BuiltIn), Operand::BuiltIn(bi)]) => {
++                var_builtins.insert(*t, *bi);
++            }
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::Location), Operand::LiteralBit32(l)]) => {
++                var_locs.insert(*t, *l);
++            }
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::ArrayStride), Operand::LiteralBit32(s)]) => {
++                array_strides.insert(*t, *s);
++            }
++            (Op::Decorate, [Operand::IdRef(t), Operand::Decoration(Decoration::BufferBlock)]) => {
++                buffer_block_structs.insert(*t);
++            }
++            (Op::MemberDecorate, [Operand::IdRef(t), Operand::LiteralBit32(m), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(o)]) => {
++                member_offsets.insert((*t, *m), *o);
++            }
++            (Op::MemberDecorate, [Operand::IdRef(t), Operand::LiteralBit32(m), Operand::Decoration(Decoration::BuiltIn), Operand::BuiltIn(bi)]) => {
++                member_builtins.insert((*t, *m), *bi);
++            }
++            _ => {}
++        }
++    }
++
++    let mut replaced_bufs: HashMap<Word, (u32, Word)> = HashMap::new();
++    let mut existing_table_var: Option<(Word, Word)> = None;
++    let mut input_loc_vars: Vec<(Word, u32, Word)> = Vec::new();
++    let mut vertex_index_var: Option<(Word, Word)> = None;
++    let mut instance_index_var: Option<(Word, Word)> = None;
++    let mut position_var: Option<(Word, Word, Option<u32>)> = None;
++
++    for inst in &module.types_global_values {
++        if inst.class.opcode != Op::Variable {
++            continue;
++        }
++        let (Some(vid), Some(pty), Some(Operand::StorageClass(sc))) =
++            (inst.result_id, inst.result_type, inst.operands.first())
++        else {
++            continue;
++        };
++        let Some((_, pointee)) = ptr_pointee(&defs_initial, pty) else {
++            continue;
++        };
++        match *sc {
++            StorageClass::StorageBuffer | StorageClass::Uniform => {
++                if sets.get(&vid) != Some(&stage_set) {
++                    continue;
++                }
++                let Some(&b) = bindings.get(&vid) else { continue };
++                if b <= 30 {
++                    replaced_bufs.insert(vid, (b, pointee));
++                } else if (704..=734).contains(&b) {
++                    replaced_bufs.insert(vid, (b - 704, pointee));
++                } else if (640..=671).contains(&b) && existing_table_var.is_none() {
++                    let is_table_shape = defs_initial.get(&pointee).is_some_and(|s| {
++                        s.class.opcode == Op::TypeStruct
++                            && s.operands.len() == 1
++                            && matches!(s.operands.first(), Some(Operand::IdRef(arr)) if defs_initial.get(arr).is_some_and(|a| {
++                                matches!(a.class.opcode, Op::TypeRuntimeArray | Op::TypeArray)
++                                    && matches!(a.operands.first(), Some(Operand::IdRef(et)) if defs_initial.get(et).is_some_and(|e| {
++                                        (e.class.opcode == Op::TypeInt && e.operands.first() == Some(&Operand::LiteralBit32(64)))
++                                            || (e.class.opcode == Op::TypeVector && e.operands.get(1) == Some(&Operand::LiteralBit32(2)))
++                                    }))
++                            }))
++                    });
++                    if is_table_shape {
++                        existing_table_var = Some((vid, pointee));
++                    }
++                }
++            }
++            StorageClass::Input if stage_kind == 0 => {
++                if let Some(&bi) = var_builtins.get(&vid) {
++                    if bi == BuiltIn::VertexIndex {
++                        vertex_index_var = Some((vid, pointee));
++                    } else if bi == BuiltIn::InstanceIndex {
++                        instance_index_var = Some((vid, pointee));
++                    }
++                } else if let Some(&loc) = var_locs.get(&vid) {
++                    input_loc_vars.push((vid, loc, pointee));
++                }
++            }
++            StorageClass::Output if stage_kind == 0 => {
++                if var_builtins.get(&vid) == Some(&BuiltIn::Position) {
++                    position_var = Some((vid, pointee, None));
++                } else if let Some(sdef) = defs_initial.get(&pointee) {
++                    if sdef.class.opcode == Op::TypeStruct {
++                        for m in 0..(sdef.operands.len() as u32) {
++                            if member_builtins.get(&(pointee, m)) == Some(&BuiltIn::Position) {
++                                position_var = Some((vid, pointee, Some(m)));
++                                break;
++                            }
++                        }
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++
++    let replaced_struct_tys: HashSet<Word> = replaced_bufs.values().map(|(_, s)| *s).collect();
++    for ann in &mut module.annotations {
++        if ann.class.opcode == Op::Decorate {
++            if let [Operand::IdRef(t), Operand::Decoration(Decoration::BufferBlock)] =
++                ann.operands.as_slice()
++            {
++                if replaced_struct_tys.contains(t) {
++                    ann.operands[1] = Operand::Decoration(Decoration::Block);
++                }
++            }
++        }
++    }
++
++    let mut b = SpirvBuilder::new(&mut module);
++    b.require_capability(Capability::PhysicalStorageBufferAddresses);
++    b.require_capability(Capability::Int64);
++    b.module.memory_model = Some(Instruction::new(
++        Op::MemoryModel,
++        None,
++        None,
++        vec![
++            Operand::AddressingModel(AddressingModel::PhysicalStorageBuffer64),
++            Operand::MemoryModel(MemoryModel::GLSL450),
++        ],
++    ));
++
++    let mut existing_is_registry_v3 = false;
++    let mut redirect_existing_direct_ac: HashSet<Word> = HashSet::new();
++    if let Some((existing_var, _)) = existing_table_var {
++        for f in &b.module.functions {
++            for blk in &f.blocks {
++                for inst in &blk.instructions {
++                    match inst.class.opcode {
++                        Op::ArrayLength
++                            if inst.operands.first() == Some(&Operand::IdRef(existing_var)) =>
++                        {
++                            existing_is_registry_v3 = true;
++                        }
++                        Op::AccessChain | Op::InBoundsAccessChain
++                            if inst.operands.first() == Some(&Operand::IdRef(existing_var)) =>
++                        {
++                            let m_ok = matches!(
++                                inst.operands.get(1),
++                                Some(Operand::IdRef(m)) if const_u32_map.get(m) == Some(&0)
++                            );
++                            let elem_const = inst.operands.get(2).and_then(|o| match o {
++                                Operand::IdRef(id) => const_u32_map.get(id).copied(),
++                                _ => None,
++                            });
++                            match (m_ok, elem_const) {
++                                (true, Some(idx)) if idx < 96 => {
++                                    if let Some(res) = inst.result_id {
++                                        redirect_existing_direct_ac.insert(res);
++                                    }
++                                }
++                                _ => existing_is_registry_v3 = true,
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++            }
++        }
++    }
++    let _unused_bb = &buffer_block_structs;
++
++    let (table_var, table_vec2_elem_ptr) = if let Some((existing_var, struct_ty)) =
++        existing_table_var.filter(|_| !existing_is_registry_v3)
++    {
++        for ann in &mut b.module.annotations {
++            if ann.class.opcode == Op::Decorate
++                && ann.operands.first() == Some(&Operand::IdRef(existing_var))
++                && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
++            {
++                ann.operands[2] = Operand::LiteralBit32(RDNA4_ICB_TABLE_BINDING);
++            }
++        }
++        let arr_ty = defs_initial
++            .get(&struct_ty)
++            .and_then(|s| s.operands.first())
++            .and_then(|o| match o {
++                Operand::IdRef(id) => Some(*id),
++                _ => None,
++            });
++        let elem_ty = arr_ty
++            .and_then(|a| defs_initial.get(&a))
++            .and_then(|a| a.operands.first())
++            .and_then(|o| match o {
++                Operand::IdRef(id) => Some(*id),
++                _ => None,
++            });
++        let is_vec2 = elem_ty
++            .and_then(|e| defs_initial.get(&e))
++            .is_some_and(|e| e.class.opcode == Op::TypeVector);
++        let elem_ptr = elem_ty.map(|e| (b.ty_ptr(StorageClass::StorageBuffer, e), is_vec2));
++        (existing_var, elem_ptr)
++    } else {
++        let mut match_vec2_elem: Option<Word> = None;
++        if let Some((_, struct_ty)) = existing_table_var {
++            let elem_ty = defs_initial
++                .get(&struct_ty)
++                .and_then(|s| s.operands.first())
++                .and_then(|o| match o {
++                    Operand::IdRef(id) => defs_initial.get(id),
++                    _ => None,
++                })
++                .and_then(|a| a.operands.first())
++                .and_then(|o| match o {
++                    Operand::IdRef(id) => Some(*id),
++                    _ => None,
++                });
++            if elem_ty
++                .and_then(|e| defs_initial.get(&e))
++                .is_some_and(|e| e.class.opcode == Op::TypeVector)
++            {
++                match_vec2_elem = elem_ty;
++            }
++        }
++        let tbl_elem_ty = match_vec2_elem.unwrap_or_else(|| b.ty_u64());
++        let is_vec2 = match_vec2_elem.is_some();
++        let rt_arr = b.module.fresh_id();
++        b.module.types_global_values.push(Instruction::new(
++            Op::TypeRuntimeArray,
++            None,
++            Some(rt_arr),
++            vec![Operand::IdRef(tbl_elem_ty)],
++        ));
++        b.decorate(rt_arr, Decoration::ArrayStride, vec![Operand::LiteralBit32(8)]);
++        let tbl_struct = b.module.fresh_id();
++        b.module.types_global_values.push(Instruction::new(
++            Op::TypeStruct,
++            None,
++            Some(tbl_struct),
++            vec![Operand::IdRef(rt_arr)],
++        ));
++        b.member_decorate(tbl_struct, 0, Decoration::Offset, vec![Operand::LiteralBit32(0)]);
++        b.decorate(tbl_struct, Decoration::Block, vec![]);
++        let ptr_tbl = b.ty_ptr(StorageClass::StorageBuffer, tbl_struct);
++        let var = b.module.fresh_id();
++        b.module.types_global_values.push(Instruction::new(
++            Op::Variable,
++            Some(ptr_tbl),
++            Some(var),
++            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++        ));
++        b.decorate(var, Decoration::DescriptorSet, vec![Operand::LiteralBit32(stage_set)]);
++        b.decorate(var, Decoration::Binding, vec![Operand::LiteralBit32(RDNA4_ICB_TABLE_BINDING)]);
++        b.decorate(var, Decoration::NonWritable, vec![]);
++        let elem_ptr = is_vec2.then(|| (b.ty_ptr(StorageClass::StorageBuffer, tbl_elem_ty), true));
++        (var, elem_ptr)
++    };
++
++    let vattr_by_loc: HashMap<u32, IcbVertexAttr> =
++        vattrs.iter().map(|a| (a.location, *a)).collect();
++    let needs_instance =
++        stage_kind == 0 && input_loc_vars.iter().any(|(_, loc, _)| {
++            vattr_by_loc.get(loc).is_some_and(|a| a.step_func == 2)
++        });
++
++    let (vs_params_var, fn_load32, vtx_builtin_var, inst_builtin_var, vtx_is_signed) =
++        if stage_kind == 0 {
++            let u32_ty = b.ty_u32();
++            let i32_ty = b.ty_i32();
++            let u64_ty = b.ty_u64();
++            let c32 = b.const_u32(32);
++            let vb_arr = b.module.fresh_id();
++            b.module.types_global_values.push(Instruction::new(
++                Op::TypeArray,
++                None,
++                Some(vb_arr),
++                vec![Operand::IdRef(u64_ty), Operand::IdRef(c32)],
++            ));
++            b.decorate(vb_arr, Decoration::ArrayStride, vec![Operand::LiteralBit32(8)]);
++            let vs_struct = b.module.fresh_id();
++            b.module.types_global_values.push(Instruction::new(
++                Op::TypeStruct,
++                None,
++                Some(vs_struct),
++                vec![
++                    Operand::IdRef(u32_ty),
++                    Operand::IdRef(u32_ty),
++                    Operand::IdRef(i32_ty),
++                    Operand::IdRef(u32_ty),
++                    Operand::IdRef(u64_ty),
++                    Operand::IdRef(u64_ty),
++                    Operand::IdRef(vb_arr),
++                ],
++            ));
++            for (m, off) in [(0, 0), (1, 4), (2, 8), (3, 12), (4, 16), (5, 24), (6, 32)] {
++                b.member_decorate(vs_struct, m, Decoration::Offset, vec![Operand::LiteralBit32(off)]);
++            }
++            b.decorate(vs_struct, Decoration::Block, vec![]);
++            let ptr_vs = b.ty_ptr(StorageClass::StorageBuffer, vs_struct);
++            let vpv = b.module.fresh_id();
++            b.module.types_global_values.push(Instruction::new(
++                Op::Variable,
++                Some(ptr_vs),
++                Some(vpv),
++                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++            ));
++            b.decorate(vpv, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
++            b.decorate(vpv, Decoration::Binding, vec![Operand::LiteralBit32(RDNA4_ICB_VS_PARAMS_BINDING)]);
++            b.decorate(vpv, Decoration::NonWritable, vec![]);
++
++            let load32_fn = emit_psb_load32_fn(&mut b);
++
++            let (vvar, v_signed) = if let Some((v, t)) = vertex_index_var {
++                (v, t == i32_ty)
++            } else {
++                let p_in_u32 = b.ty_ptr(StorageClass::Input, u32_ty);
++                let v = b.module.fresh_id();
++                b.module.types_global_values.push(Instruction::new(
++                    Op::Variable,
++                    Some(p_in_u32),
++                    Some(v),
++                    vec![Operand::StorageClass(StorageClass::Input)],
++                ));
++                b.decorate(v, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
++                (v, false)
++            };
++            let ivar = if !needs_instance {
++                instance_index_var.map(|(v, _)| v)
++            } else if let Some((v, _)) = instance_index_var {
++                Some(v)
++            } else {
++                let p_in_u32 = b.ty_ptr(StorageClass::Input, u32_ty);
++                let v = b.module.fresh_id();
++                b.module.types_global_values.push(Instruction::new(
++                    Op::Variable,
++                    Some(p_in_u32),
++                    Some(v),
++                    vec![Operand::StorageClass(StorageClass::Input)],
++                ));
++                b.decorate(v, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::InstanceIndex)]);
++                Some(v)
++            };
++            (Some(vpv), Some(load32_fn), Some(vvar), ivar, v_signed)
++        } else {
++            (None, None, None, None, false)
++        };
++
++    let u32_ty = b.ty_u32();
++    let i32_ty = b.ty_i32();
++    let u64_ty = b.ty_u64();
++    let bool_ty = b.ty_bool();
++    let v4f32_ty = b.ty_v4f32();
++    let nan_bits = b.const_f32(f32::from_bits(0x7FC0_0000));
++    let c0_u32 = b.const_u32(0);
++    let c1_u32 = b.const_u32(1);
++    let c2_u32 = b.const_u32(2);
++    let c3_u32 = b.const_u32(3);
++    let c4_u32 = b.const_u32(4);
++    let c6_u32 = b.const_u32(6);
++    let c2_64 = b.const_u64(2);
++    let c4_64 = b.const_u64(4);
++    let c_ffff = b.const_u32(0xFFFF);
++    let c_ffffffff = b.const_u32(0xFFFF_FFFF);
++
++    let mut psb_base_ptrs: HashMap<Word, (Word, Word)> = HashMap::new();
++    for (&var_id, &(_slot, struct_ty)) in &replaced_bufs {
++        let psb_ty = b.ty_ptr(StorageClass::PhysicalStorageBuffer, struct_ty);
++        let psb_val = b.module.fresh_id();
++        psb_base_ptrs.insert(var_id, (psb_val, psb_ty));
++    }
++
++    let mut all_result_types: HashMap<Word, Word> = HashMap::new();
++    for inst in &b.module.types_global_values {
++        if let (Some(id), Some(rt)) = (inst.result_id, inst.result_type) {
++            all_result_types.insert(id, rt);
++        }
++    }
++    for f in &b.module.functions {
++        for p in &f.parameters {
++            if let (Some(id), Some(rt)) = (p.result_id, p.result_type) {
++                all_result_types.insert(id, rt);
++            }
++        }
++        for inst in f.all_inst_iter() {
++            if let (Some(id), Some(rt)) = (inst.result_id, inst.result_type) {
++                all_result_types.insert(id, rt);
++            }
++        }
++    }
++
++    let mut ptr_val_map: HashMap<Word, Word> = HashMap::new();
++    let mut psb_values: HashSet<Word> = HashSet::new();
++    for (&var_id, &(psb_val, _)) in &psb_base_ptrs {
++        ptr_val_map.insert(var_id, psb_val);
++        psb_values.insert(psb_val);
++    }
++
++    let mut psb_origin: HashSet<Word> = replaced_bufs.keys().copied().collect();
++    loop {
++        let before = psb_origin.len();
++        for f in &b.module.functions {
++            for blk in &f.blocks {
++                for inst in &blk.instructions {
++                    let Some(res) = inst.result_id else { continue };
++                    if psb_origin.contains(&res) {
++                        continue;
++                    }
++                    let hits = match inst.class.opcode {
++                        Op::AccessChain
++                        | Op::InBoundsAccessChain
++                        | Op::PtrAccessChain
++                        | Op::CopyObject => {
++                            matches!(inst.operands.first(), Some(Operand::IdRef(base)) if psb_origin.contains(base))
++                        }
++                        Op::Select => inst
++                            .operands
++                            .iter()
++                            .skip(1)
++                            .any(|o| matches!(o, Operand::IdRef(x) if psb_origin.contains(x))),
++                        Op::Phi => inst
++                            .operands
++                            .chunks(2)
++                            .any(|p| matches!(p.first(), Some(Operand::IdRef(x)) if psb_origin.contains(x))),
++                        _ => false,
++                    };
++                    if hits {
++                        psb_origin.insert(res);
++                    }
++                }
++            }
++        }
++        if psb_origin.len() == before {
++            break;
++        }
++    }
++
++    let mut psb_ty_map: HashMap<Word, Word> = HashMap::new();
++    for &id in &psb_origin {
++        if let Some(&orig_ptr_ty) = all_result_types.get(&id) {
++            if let Some((_, pt)) = ptr_pointee(&defs_initial, orig_ptr_ty) {
++                let psb_pt = b.ty_ptr(StorageClass::PhysicalStorageBuffer, pt);
++                psb_ty_map.insert(orig_ptr_ty, psb_pt);
++            }
++        }
++    }
++
++    let mut psb_nulls: HashMap<Word, Word> = HashMap::new();
++    let null_psb_id = |b: &mut SpirvBuilder<'_>,
++                       psb_nulls: &mut HashMap<Word, Word>,
++                       psb_ptr_ty: Word,
++                       is_undef: bool| -> Word {
++        let key = if is_undef {
++            psb_ptr_ty | 0x8000_0000
++        } else {
++            psb_ptr_ty
++        };
++        if let Some(&id) = psb_nulls.get(&key) {
++            return id;
++        }
++        let id = b.module.fresh_id();
++        b.module.types_global_values.push(Instruction::new(
++            if is_undef { Op::Undef } else { Op::ConstantNull },
++            Some(psb_ptr_ty),
++            Some(id),
++            vec![],
++        ));
++        psb_nulls.insert(key, id);
++        id
++    };
++    let const_null_or_undef: HashMap<Word, (bool, Word)> = b
++        .module
++        .types_global_values
++        .iter()
++        .filter_map(|i| match (i.class.opcode, i.result_id, i.result_type) {
++            (Op::ConstantNull, Some(id), Some(rt)) => Some((id, (false, rt))),
++            (Op::Undef, Some(id), Some(rt)) => Some((id, (true, rt))),
++            _ => None,
++        })
++        .collect();
++
++    let entry_idx = b
++        .module
++        .functions
++        .iter()
++        .position(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry_fn_id))
++        .ok_or_else(|| "icb_stage: entry function missing".to_string())?;
++
++    let mut prologue = Vec::new();
++    let mut sorted_bufs: Vec<(Word, (u32, Word))> =
++        replaced_bufs.iter().map(|(&v, &p)| (v, p)).collect();
++    sorted_bufs.sort_by_key(|(v, (s, _))| (*s, *v));
++
++    let mut slot_len_cache: HashMap<u32, Word> = HashMap::new();
++    for &(var_id, (slot, _)) in &sorted_bufs {
++        let (psb_val, psb_ty) = psb_base_ptrs[&var_id];
++        let addr = lower_existing_psb_table_load(
++            &mut b,
++            &mut prologue,
++            table_var,
++            table_vec2_elem_ptr,
++            slot,
++            0,
++        );
++        prologue.push(Instruction::new(
++            Op::ConvertUToPtr,
++            Some(psb_ty),
++            Some(psb_val),
++            vec![Operand::IdRef(addr)],
++        ));
++    }
++
++    let mut effective_vid_u32: Option<Word> = None;
++    let mut is_restart_bool: Option<Word> = None;
++    let mut lowered_input_vals: HashMap<Word, (Word, Word)> = HashMap::new();
++
++    if stage_kind == 0 {
++        let vpv = vs_params_var.unwrap();
++        let l32 = fn_load32.unwrap();
++        let vvar = vtx_builtin_var.unwrap();
++
++        let p_sb_u32 = b.ty_ptr(StorageClass::StorageBuffer, u32_ty);
++        let p_sb_i32 = b.ty_ptr(StorageClass::StorageBuffer, i32_ty);
++        let p_sb_u64 = b.ty_ptr(StorageClass::StorageBuffer, u64_ty);
++
++        let load_vp_u32 = |b: &mut SpirvBuilder<'_>, out: &mut Vec<Instruction>, m: Word| -> Word {
++            let ac = b.op(
++                out,
++                Op::AccessChain,
++                p_sb_u32,
++                vec![Operand::IdRef(vpv), Operand::IdRef(m)],
++            );
++            b.op(out, Op::Load, u32_ty, vec![Operand::IdRef(ac)])
++        };
++        let load_vp_i32 = |b: &mut SpirvBuilder<'_>, out: &mut Vec<Instruction>, m: Word| -> Word {
++            let ac = b.op(
++                out,
++                Op::AccessChain,
++                p_sb_i32,
++                vec![Operand::IdRef(vpv), Operand::IdRef(m)],
++            );
++            b.op(out, Op::Load, i32_ty, vec![Operand::IdRef(ac)])
++        };
++        let load_vp_u64 = |b: &mut SpirvBuilder<'_>, out: &mut Vec<Instruction>, m: Word| -> Word {
++            let ac = b.op(
++                out,
++                Op::AccessChain,
++                p_sb_u64,
++                vec![Operand::IdRef(vpv), Operand::IdRef(m)],
++            );
++            b.op(out, Op::Load, u64_ty, vec![Operand::IdRef(ac)])
++        };
++
++        let raw_vtx_loaded = b.op(
++            &mut prologue,
++            Op::Load,
++            if vtx_is_signed { i32_ty } else { u32_ty },
++            vec![Operand::IdRef(vvar)],
++        );
++        let raw_vid = if vtx_is_signed {
++            b.op(
++                &mut prologue,
++                Op::Bitcast,
++                u32_ty,
++                vec![Operand::IdRef(raw_vtx_loaded)],
++            )
++        } else {
++            raw_vtx_loaded
++        };
++
++        let kind = load_vp_u32(&mut b, &mut prologue, c0_u32);
++        let itype = load_vp_u32(&mut b, &mut prologue, c1_u32);
++        let bvert = load_vp_i32(&mut b, &mut prologue, c2_u32);
++        let prim = load_vp_u32(&mut b, &mut prologue, c3_u32);
++        let ibda = load_vp_u64(&mut b, &mut prologue, c4_u32);
++
++        let is_indexed = b.op(
++            &mut prologue,
++            Op::IEqual,
++            bool_ty,
++            vec![Operand::IdRef(kind), Operand::IdRef(c2_u32)],
++        );
++        let is_u16 = b.op(
++            &mut prologue,
++            Op::IEqual,
++            bool_ty,
++            vec![Operand::IdRef(itype), Operand::IdRef(c0_u32)],
++        );
++        let raw_vid64 = b.op(&mut prologue, Op::UConvert, u64_ty, vec![Operand::IdRef(raw_vid)]);
++        let esize64 = b.op(
++            &mut prologue,
++            Op::Select,
++            u64_ty,
++            vec![
++                Operand::IdRef(is_u16),
++                Operand::IdRef(c2_64),
++                Operand::IdRef(c4_64),
++            ],
++        );
++        let ib_off = b.op(
++            &mut prologue,
++            Op::IMul,
++            u64_ty,
++            vec![Operand::IdRef(raw_vid64), Operand::IdRef(esize64)],
++        );
++        let esize32 = b.op(
++            &mut prologue,
++            Op::Select,
++            u32_ty,
++            vec![
++                Operand::IdRef(is_u16),
++                Operand::IdRef(c2_u32),
++                Operand::IdRef(c4_u32),
++            ],
++        );
++        let raw_idx = b.op(
++            &mut prologue,
++            Op::FunctionCall,
++            u32_ty,
++            vec![
++                Operand::IdRef(l32),
++                Operand::IdRef(ibda),
++                Operand::IdRef(ib_off),
++                Operand::IdRef(esize32),
++            ],
++        );
++        let c_ls = b.const_u32(RDNA4_ICB_PRIM_LINE_STRIP);
++        let c_ts = b.const_u32(RDNA4_ICB_PRIM_TRIANGLE_STRIP);
++        let is_ls = b.op(
++            &mut prologue,
++            Op::IEqual,
++            bool_ty,
++            vec![Operand::IdRef(prim), Operand::IdRef(c_ls)],
++        );
++        let is_ts = b.op(
++            &mut prologue,
++            Op::IEqual,
++            bool_ty,
++            vec![Operand::IdRef(prim), Operand::IdRef(c_ts)],
++        );
++        let is_strip = b.op(
++            &mut prologue,
++            Op::LogicalOr,
++            bool_ty,
++            vec![Operand::IdRef(is_ls), Operand::IdRef(is_ts)],
++        );
++        let sent = b.op(
++            &mut prologue,
++            Op::Select,
++            u32_ty,
++            vec![
++                Operand::IdRef(is_u16),
++                Operand::IdRef(c_ffff),
++                Operand::IdRef(c_ffffffff),
++            ],
++        );
++        let eq_sent = b.op(
++            &mut prologue,
++            Op::IEqual,
++            bool_ty,
++            vec![Operand::IdRef(raw_idx), Operand::IdRef(sent)],
++        );
++        let r0 = b.op(
++            &mut prologue,
++            Op::LogicalAnd,
++            bool_ty,
++            vec![Operand::IdRef(is_indexed), Operand::IdRef(is_strip)],
++        );
++        let is_restart = b.op(
++            &mut prologue,
++            Op::LogicalAnd,
++            bool_ty,
++            vec![Operand::IdRef(r0), Operand::IdRef(eq_sent)],
++        );
++
++        let raw_idx_s = b.op(&mut prologue, Op::Bitcast, i32_ty, vec![Operand::IdRef(raw_idx)]);
++        let sum_s = b.op(
++            &mut prologue,
++            Op::IAdd,
++            i32_ty,
++            vec![Operand::IdRef(raw_idx_s), Operand::IdRef(bvert)],
++        );
++        let sum_u = b.op(&mut prologue, Op::Bitcast, u32_ty, vec![Operand::IdRef(sum_s)]);
++        let vid_idxed = b.op(
++            &mut prologue,
++            Op::Select,
++            u32_ty,
++            vec![
++                Operand::IdRef(is_restart),
++                Operand::IdRef(c0_u32),
++                Operand::IdRef(sum_u),
++            ],
++        );
++        let eff_vid = b.op(
++            &mut prologue,
++            Op::Select,
++            u32_ty,
++            vec![
++                Operand::IdRef(is_indexed),
++                Operand::IdRef(vid_idxed),
++                Operand::IdRef(raw_vid),
++            ],
++        );
++
++        effective_vid_u32 = Some(eff_vid);
++        is_restart_bool = Some(is_restart);
++
++        let inst_vid = if let Some(ivar) = inst_builtin_var {
++            Some(b.op(&mut prologue, Op::Load, u32_ty, vec![Operand::IdRef(ivar)]))
++        } else {
++            None
++        };
++
++        input_loc_vars.sort_by_key(|(_, l, _)| *l);
++        for &(ivar_id, loc, pointee_ty) in &input_loc_vars {
++            let val = if let Some(attr) = vattr_by_loc.get(&loc).copied() {
++                if let (Some(total_bytes), Some((dst_kind, dst_comps))) = (
++                    vfmt_bytes(attr.vfmt),
++                    scalar_kind_of_type(&defs_initial, pointee_ty),
++                ) {
++                    if attr.buffer_index < 32 {
++                        let bidx_c = b.const_u32(attr.buffer_index);
++                        let vb_ac = b.op(
++                            &mut prologue,
++                            Op::AccessChain,
++                            p_sb_u64,
++                            vec![
++                                Operand::IdRef(vpv),
++                                Operand::IdRef(c6_u32),
++                                Operand::IdRef(bidx_c),
++                            ],
++                        );
++                        let vb_bda = b.op(&mut prologue, Op::Load, u64_ty, vec![Operand::IdRef(vb_ac)]);
++                        let elem_idx = match attr.step_func {
++                            0 => c0_u32,
++                            1 => eff_vid,
++                            _ => {
++                                let ii = inst_vid.unwrap_or(c0_u32);
++                                if attr.step_rate > 1 {
++                                    let sr = b.const_u32(attr.step_rate);
++                                    b.op(
++                                        &mut prologue,
++                                        Op::UDiv,
++                                        u32_ty,
++                                        vec![Operand::IdRef(ii), Operand::IdRef(sr)],
++                                    )
++                                } else {
++                                    ii
++                                }
++                            }
++                        };
++                        let elem_idx64 = b.op(
++                            &mut prologue,
++                            Op::UConvert,
++                            u64_ty,
++                            vec![Operand::IdRef(elem_idx)],
++                        );
++                        let stride64 = b.const_u64(u64::from(attr.stride));
++                        let off64 = b.const_u64(u64::from(attr.offset));
++                        let mul = b.op(
++                            &mut prologue,
++                            Op::IMul,
++                            u64_ty,
++                            vec![Operand::IdRef(elem_idx64), Operand::IdRef(stride64)],
++                        );
++                        let attr_off = b.op(
++                            &mut prologue,
++                            Op::IAdd,
++                            u64_ty,
++                            vec![Operand::IdRef(mul), Operand::IdRef(off64)],
++                        );
++                        let nw = total_bytes.div_ceil(4);
++                        let mut words = [c0_u32; 4];
++                        for wi in 0..nw {
++                            let rem = total_bytes - wi * 4;
++                            let chunk = rem.min(4);
++                            let coff = if wi == 0 {
++                                attr_off
++                            } else {
++                                let woff = b.const_u64(u64::from(wi) * 4);
++                                b.op(
++                                    &mut prologue,
++                                    Op::IAdd,
++                                    u64_ty,
++                                    vec![Operand::IdRef(attr_off), Operand::IdRef(woff)],
++                                )
++                            };
++                            words[wi as usize] = call_load32(&mut b, &mut prologue, l32, vb_bda, coff, chunk);
++                        }
++                        let (lanes, src_kind) =
++                            decode_vfmt_lanes(&mut b, &mut prologue, attr.vfmt, &words)?;
++                        convert_lanes_to_type(
++                            &mut b,
++                            &mut prologue,
++                            &lanes,
++                            src_kind,
++                            dst_kind,
++                            dst_comps,
++                        )
++                    } else {
++                        b.zero_of_type(&defs_initial, pointee_ty)
++                    }
++                } else {
++                    b.zero_of_type(&defs_initial, pointee_ty)
++                }
++            } else {
++                b.zero_of_type(&defs_initial, pointee_ty)
++            };
++            lowered_input_vals.insert(ivar_id, (val, pointee_ty));
++        }
++    }
++
++    let lowered_vars_set: HashSet<Word> = input_loc_vars.iter().map(|&(v, _, _)| v).collect();
++    let num_fns = b.module.functions.len();
++    for fi in 0..num_fns {
++        if stage_kind == 0 && fi == num_fns - 1 && fn_load32.is_some() {
++            continue;
++        }
++        let is_entry = fi == entry_idx;
++        let num_blks = b.module.functions[fi].blocks.len();
++        for bi in 0..num_blks {
++            let old_insts = std::mem::take(&mut b.module.functions[fi].blocks[bi].instructions);
++            let mut new_insts = Vec::with_capacity(
++                old_insts.len() + if is_entry && bi == 0 { prologue.len() } else { 0 },
++            );
++            if is_entry && bi == 0 {
++                let var_end = old_insts
++                    .iter()
++                    .take_while(|i| i.class.opcode == Op::Variable)
++                    .count();
++                new_insts.extend(old_insts[..var_end].iter().cloned());
++                new_insts.append(&mut prologue);
++                new_insts.extend(old_insts.into_iter().skip(var_end));
++            } else {
++                new_insts = old_insts;
++            }
++
++            let mut rewritten = Vec::with_capacity(new_insts.len() + 8);
++            for mut inst in new_insts {
++                if existing_is_registry_v3
++                    && inst.result_id.is_some_and(|id| redirect_existing_direct_ac.contains(&id))
++                {
++                    if let Some(Operand::IdRef(base)) = inst.operands.first_mut() {
++                        *base = table_var;
++                    }
++                }
++                if !matches!(inst.class.opcode, Op::Load | Op::Store | Op::ArrayLength) {
++                    for op in &mut inst.operands {
++                        if let Operand::IdRef(r) = op {
++                            if let Some(&prep) = ptr_val_map.get(r) {
++                                *r = prep;
++                            } else if let Some(&(is_undef, rt)) = const_null_or_undef.get(r) {
++                                if let Some(&psb_pt) = psb_ty_map.get(&rt) {
++                                    if matches!(inst.class.opcode, Op::Select | Op::Phi)
++                                        && inst.result_id.is_some_and(|id| psb_origin.contains(&id))
++                                    {
++                                        *r = null_psb_id(&mut b, &mut psb_nulls, psb_pt, is_undef);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
++                if inst.class.opcode == Op::Load {
++                    if let (Some(res), Some(res_ty), Some(Operand::IdRef(ptr_op))) = (
++                        inst.result_id,
++                        inst.result_type,
++                        inst.operands.first().cloned(),
++                    ) {
++                        if lowered_vars_set.contains(&ptr_op) {
++                            let (loaded_val, _) = lowered_input_vals[&ptr_op];
++                            rewritten.push(Instruction::new(
++                                Op::CopyObject,
++                                Some(res_ty),
++                                Some(res),
++                                vec![Operand::IdRef(loaded_val)],
++                            ));
++                            continue;
++                        }
++                    }
++                }
++
++                if inst.class.opcode == Op::ArrayLength {
++                    if let (
++                        Some(res),
++                        Some(_rt),
++                        [Operand::IdRef(base), Operand::LiteralBit32(member)],
++                    ) = (
++                        inst.result_id,
++                        inst.result_type,
++                        inst.operands.as_slice(),
++                    ) {
++                        if let Some(&(slot, struct_ty)) = replaced_bufs.get(base) {
++                            let len64 = *slot_len_cache.entry(slot).or_insert_with(|| {
++                                lower_existing_psb_table_load(
++                                    &mut b,
++                                    &mut rewritten,
++                                    table_var,
++                                    table_vec2_elem_ptr,
++                                    slot,
++                                    32,
++                                )
++                            });
++                            let m_off = u64::from(
++                                member_offsets
++                                    .get(&(struct_ty, *member))
++                                    .copied()
++                                    .unwrap_or(0),
++                            );
++                            let rt_arr_ty = defs_initial
++                                .get(&struct_ty)
++                                .and_then(|s| s.operands.get(*member as usize))
++                                .and_then(|o| match o {
++                                    Operand::IdRef(id) => Some(*id),
++                                    _ => None,
++                                });
++                            let stride = u64::from(
++                                rt_arr_ty
++                                    .and_then(|a| array_strides.get(&a).copied())
++                                    .unwrap_or(4)
++                                    .max(1),
++                            );
++                            let c_off = b.const_u64(m_off);
++                            let c_str = b.const_u64(stride);
++                            let c_z64 = b.const_u64(0);
++                            let gt = b.op(
++                                &mut rewritten,
++                                Op::UGreaterThan,
++                                bool_ty,
++                                vec![Operand::IdRef(len64), Operand::IdRef(c_off)],
++                            );
++                            let diff = b.op(
++                                &mut rewritten,
++                                Op::ISub,
++                                u64_ty,
++                                vec![Operand::IdRef(len64), Operand::IdRef(c_off)],
++                            );
++                            let clamped = b.op(
++                                &mut rewritten,
++                                Op::Select,
++                                u64_ty,
++                                vec![
++                                    Operand::IdRef(gt),
++                                    Operand::IdRef(diff),
++                                    Operand::IdRef(c_z64),
++                                ],
++                            );
++                            let elems64 = b.op(
++                                &mut rewritten,
++                                Op::UDiv,
++                                u64_ty,
++                                vec![Operand::IdRef(clamped), Operand::IdRef(c_str)],
++                            );
++                            rewritten.push(Instruction::new(
++                                Op::UConvert,
++                                Some(u32_ty),
++                                Some(res),
++                                vec![Operand::IdRef(elems64)],
++                            ));
++                            continue;
++                        }
++                    }
++                }
++
++                if let Some(res) = inst.result_id {
++                    if psb_origin.contains(&res) {
++                        if let Some(rt) = inst.result_type {
++                            if let Some(&new_rt) = psb_ty_map.get(&rt) {
++                                inst.result_type = Some(new_rt);
++                            }
++                        }
++                        psb_values.insert(res);
++                    }
++                }
++
++                match inst.class.opcode {
++                    Op::Load => {
++                        let ptr_op = match inst.operands.first() {
++                            Some(Operand::IdRef(p)) => ptr_val_map.get(p).copied().unwrap_or(*p),
++                            _ => 0,
++                        };
++                        if let Some(Operand::IdRef(p)) = inst.operands.first_mut() {
++                            *p = ptr_op;
++                        }
++                        if psb_values.contains(&ptr_op) {
++                            let res_ty = inst.result_type.unwrap_or(u32_ty);
++                            let extra = inst.operands[1..].to_vec();
++                            inst.operands = make_psb_access_operands(
++                                ptr_op,
++                                None,
++                                &extra,
++                                res_ty,
++                                &defs_initial,
++                            );
++                        }
++                    }
++                    Op::Store => {
++                        let ptr_op = match inst.operands.first() {
++                            Some(Operand::IdRef(p)) => ptr_val_map.get(p).copied().unwrap_or(*p),
++                            _ => 0,
++                        };
++                        let val_op = match inst.operands.get(1) {
++                            Some(Operand::IdRef(v)) => ptr_val_map.get(v).copied().unwrap_or(*v),
++                            _ => 0,
++                        };
++                        if psb_values.contains(&ptr_op) {
++                            let val_ty = all_result_types
++                                .get(&val_op)
++                                .copied()
++                                .unwrap_or(u32_ty);
++                            let extra = inst.operands[2..].to_vec();
++                            inst.operands = make_psb_access_operands(
++                                ptr_op,
++                                Some(val_op),
++                                &extra,
++                                val_ty,
++                                &defs_initial,
++                            );
++                        } else {
++                            if let Some(Operand::IdRef(p)) = inst.operands.first_mut() {
++                                *p = ptr_op;
++                            }
++                            if let Some(Operand::IdRef(v)) = inst.operands.get_mut(1) {
++                                *v = val_op;
++                            }
++                        }
++                    }
++                    _ => {}
++                }
++                rewritten.push(inst);
++            }
++            b.module.functions[fi].blocks[bi].instructions = rewritten;
++        }
++    }
++
++    if stage_kind == 0 {
++        let ep_end = b.module.functions[entry_idx].blocks[0]
++            .instructions
++            .iter()
++            .position(|i| i.result_id == effective_vid_u32)
++            .unwrap_or(0);
++        if let (Some(vvar), Some(ev)) = (vtx_builtin_var, effective_vid_u32) {
++            let mut body_repls: HashMap<Word, Word> = HashMap::new();
++            let nb = b.module.functions[entry_idx].blocks.len();
++            for bi in 0..nb {
++                let start_i = if bi == 0 { ep_end + 1 } else { 0 };
++                let insts = &mut b.module.functions[entry_idx].blocks[bi].instructions;
++                let mut i = 0;
++                while i < insts.len() {
++                    for op in &mut insts[i].operands {
++                        if let Operand::IdRef(r) = op {
++                            if let Some(&rep) = body_repls.get(r) {
++                                *r = rep;
++                            }
++                        }
++                    }
++                    if i >= start_i && insts[i].class.opcode == Op::Load {
++                        if let (Some(res), Some(rt), Some(Operand::IdRef(p))) = (
++                            insts[i].result_id,
++                            insts[i].result_type,
++                            insts[i].operands.first().cloned(),
++                        ) {
++                            if p == vvar {
++                                if rt == i32_ty {
++                                    insts[i] = Instruction::new(
++                                        Op::Bitcast,
++                                        Some(i32_ty),
++                                        Some(res),
++                                        vec![Operand::IdRef(ev)],
++                                    );
++                                } else {
++                                    insts.remove(i);
++                                    body_repls.insert(res, ev);
++                                    continue;
++                                }
++                            }
++                        }
++                    }
++                    i += 1;
++                }
++            }
++        }
++
++        if let (Some(is_restart), Some((pos_var, _pos_ty, pos_member))) =
++            (is_restart_bool, position_var)
++        {
++            let nan_vec = b.module.fresh_id();
++            b.module.types_global_values.push(Instruction::new(
++                Op::ConstantComposite,
++                Some(v4f32_ty),
++                Some(nan_vec),
++                vec![Operand::IdRef(nan_bits); 4],
++            ));
++            let pos_ptr_ty = b.ty_ptr(StorageClass::Output, v4f32_ty);
++            let nb = b.module.functions[entry_idx].blocks.len();
++            for bi in 0..nb {
++                let is_ret = b.module.functions[entry_idx].blocks[bi]
++                    .instructions
++                    .last()
++                    .is_some_and(|i| i.class.opcode == Op::Return);
++                if !is_ret {
++                    continue;
++                }
++                let then_lbl = b.module.fresh_id();
++                let merge_lbl = b.module.fresh_id();
++                let ret_inst = b.module.functions[entry_idx].blocks[bi]
++                    .instructions
++                    .pop()
++                    .unwrap();
++                b.module.functions[entry_idx].blocks[bi]
++                    .instructions
++                    .extend([
++                        Instruction::new(
++                            Op::SelectionMerge,
++                            None,
++                            None,
++                            vec![
++                                Operand::IdRef(merge_lbl),
++                                Operand::SelectionControl(SelectionControl::NONE),
++                            ],
++                        ),
++                        Instruction::new(
++                            Op::BranchConditional,
++                            None,
++                            None,
++                            vec![
++                                Operand::IdRef(is_restart),
++                                Operand::IdRef(then_lbl),
++                                Operand::IdRef(merge_lbl),
++                            ],
++                        ),
++                    ]);
++                let mut then_insts = Vec::new();
++                let target_ptr = if let Some(m) = pos_member {
++                    let mc = b.const_u32(m);
++                    b.op(
++                        &mut then_insts,
++                        Op::AccessChain,
++                        pos_ptr_ty,
++                        vec![Operand::IdRef(pos_var), Operand::IdRef(mc)],
++                    )
++                } else {
++                    pos_var
++                };
++                then_insts.push(Instruction::new(
++                    Op::Store,
++                    None,
++                    None,
++                    vec![Operand::IdRef(target_ptr), Operand::IdRef(nan_vec)],
++                ));
++                then_insts.push(Instruction::new(
++                    Op::Branch,
++                    None,
++                    None,
++                    vec![Operand::IdRef(merge_lbl)],
++                ));
++                b.module.functions[entry_idx].blocks.push(Block {
++                    label: Some(Instruction::new(Op::Label, None, Some(then_lbl), vec![])),
++                    instructions: then_insts,
++                });
++                b.module.functions[entry_idx].blocks.push(Block {
++                    label: Some(Instruction::new(Op::Label, None, Some(merge_lbl), vec![])),
++                    instructions: vec![ret_inst],
++                });
++            }
++        }
++    }
++
++    let mut removed_vars: HashSet<Word> = replaced_bufs.keys().copied().collect();
++    removed_vars.extend(lowered_vars_set);
++
++    b.module
++        .types_global_values
++        .retain(|i| !i.result_id.is_some_and(|id| removed_vars.contains(&id)));
++    b.module.annotations.retain(|i| {
++        !i.operands
++            .first()
++            .is_some_and(|o| matches!(o, Operand::IdRef(id) if removed_vars.contains(id)))
++    });
++    b.module.debug_names.retain(|i| {
++        !i.operands
++            .first()
++            .is_some_and(|o| matches!(o, Operand::IdRef(id) if removed_vars.contains(id)))
++    });
++
++    if let Some(ep) = b.module.entry_points.get_mut(ep_idx) {
++        let mut interface: Vec<Word> = ep.operands[3..]
++            .iter()
++            .filter_map(|o| match o {
++                Operand::IdRef(id) if !removed_vars.contains(id) => Some(*id),
++                _ => None,
++            })
++            .collect();
++        for add in [
++            Some(table_var),
++            vs_params_var,
++            vtx_builtin_var,
++            inst_builtin_var,
++        ]
++        .into_iter()
++        .flatten()
++        {
++            if !interface.contains(&add) {
++                interface.push(add);
++            }
++        }
++        ep.operands.truncate(3);
++        ep.operands
++            .extend(interface.into_iter().map(Operand::IdRef));
++    }
++
++    let words = module.assemble();
++    let mut out_bytes = Vec::with_capacity(words.len() * 4);
++    for w in words {
++        out_bytes.extend_from_slice(&w.to_le_bytes());
++    }
++    let vs_params_binding = if stage_kind == 0 {
++        RDNA4_ICB_VS_PARAMS_BINDING
++    } else {
++        0
++    };
++    Ok((out_bytes, RDNA4_ICB_TABLE_BINDING, vs_params_binding))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::HashSet;
++
++    fn test_translate(ll: &str, stage: crate::passes::Stage) -> Vec<u8> {
++        let tmp = std::env::temp_dir().join(format!("icb_stage_{}", std::process::id()));
++        let _ = std::fs::create_dir_all(&tmp);
++        let spv = crate::translate_sanitized_native(ll, stage, &tmp).expect("translate");
++        let _ = std::fs::remove_dir_all(&tmp);
++        spv
++    }
++
++    fn input_var_locations(spv: &[u8]) -> Vec<u32> {
++        let m = crate::spirv_module::load_bytes(spv).expect("load spv");
++        let input_vars: HashSet<Word> = m
++            .types_global_values
++            .iter()
++            .filter(|i| {
++                i.class.opcode == Op::Variable
++                    && matches!(i.operands.first(), Some(Operand::StorageClass(StorageClass::Input)))
++            })
++            .filter_map(|i| i.result_id)
++            .collect();
++        m.annotations
++            .iter()
++            .filter_map(|a| {
++                if a.class.opcode == Op::Decorate {
++                    if let [Operand::IdRef(t), Operand::Decoration(Decoration::Location), Operand::LiteralBit32(l)] =
++                        a.operands.as_slice()
++                    {
++                        if input_vars.contains(t) {
++                            return Some(*l);
++                        }
++                    }
++                }
++                None
++            })
++            .collect()
++    }
++
++    #[test]
++    fn icb_stage_lowers_vertex_and_fragment_stages_to_dynamic_bda() {
++        let vs_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%VSOut = type { <4 x float>, <4 x float> }
++define %VSOut @v_main(<4 x float> %pos, <2 x float> %uv, ptr addrspace(2) readonly align 16 %cb, i32 %vid) {
++entry:
++  %vidf = uitofp i32 %vid to float
++  %vidv = insertelement <4 x float> %pos, float %vidf, i32 3
++  %uv0 = extractelement <2 x float> %uv, i32 0
++  %u = load <4 x float>, ptr addrspace(2) %cb, align 16
++  %sum = fadd <4 x float> %vidv, %u
++  %c = insertelement <4 x float> %sum, float %uv0, i32 0
++  %o0 = insertvalue %VSOut undef, <4 x float> %sum, 0
++  %o1 = insertvalue %VSOut %o0, <4 x float> %c, 1
++  ret %VSOut %o1
++}
++!air.vertex = !{!0}
++!0 = !{ptr @v_main, !1, !2}
++!1 = !{!3, !4}
++!2 = !{!5, !6, !7, !8}
++!3 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!4 = !{!"air.vertex_output", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
++!5 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
++!6 = !{i32 1, !"air.vertex_input", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
++!7 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"float4", !"air.arg_name", !"cb"}
++!8 = !{i32 3, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
++"#;
++        let vs_spv = test_translate(vs_ll, crate::passes::Stage::Vertex);
++        assert_eq!(input_var_locations(&vs_spv).len(), 2);
++        let vattrs = [
++            IcbVertexAttr {
++                location: 0,
++                buffer_index: 1,
++                offset: 0,
++                stride: 24,
++                vfmt: 41,
++                step_func: 1,
++                pad: [0; 2],
++                step_rate: 1,
++            },
++            IcbVertexAttr {
++                location: 1,
++                buffer_index: 1,
++                offset: 16,
++                stride: 24,
++                vfmt: 39,
++                step_func: 1,
++                pad: [0; 2],
++                step_rate: 1,
++            },
++        ];
++        let (out_vs, tbl, vsp) = lower_icb_stage(&vs_spv, 0, 0, &vattrs).expect("lower VS");
++        assert_eq!(tbl, 676);
++        assert_eq!(vsp, 677);
++        assert!(input_var_locations(&out_vs).is_empty(), "all vertex Input locations must be removed");
++        let asm = crate::spirv_module::load_bytes(&out_vs)
++            .expect("load lowered VS")
++            .disassemble();
++        assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
++        assert!(asm.contains("Binding 676"), "{asm}");
++        assert!(asm.contains("Binding 677"), "{asm}");
++        assert!(!asm.contains("Binding 0\n"), "old buffer 0 binding must be removed:\n{asm}");
++        assert!(asm.contains("ConvertUToPtr"), "{asm}");
++        assert!(asm.contains("Aligned 4"), "{asm}");
++
++        let fs_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <{ <4 x float> }> @f_main(<4 x float> %col, ptr addrspace(2) readonly align 16 %cb) {
++entry:
++  %u = load <4 x float>, ptr addrspace(2) %cb, align 16
++  %out = fmul <4 x float> %col, %u
++  %r = insertvalue <{ <4 x float> }> undef, <4 x float> %out, 0
++  ret <{ <4 x float> }> %r
++}
++!air.fragment = !{!0}
++!0 = !{ptr @f_main, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
++!4 = !{i32 0, !"air.fragment_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"col"}
++!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"float4", !"air.arg_name", !"cb"}
++"#;
++        let fs_spv = test_translate(fs_ll, crate::passes::Stage::Fragment);
++        let (out_fs, ftbl, fvsp) = lower_icb_stage(&fs_spv, 1, 0, &[]).expect("lower FS set 0");
++        assert_eq!(ftbl, 676);
++        assert_eq!(fvsp, 0);
++        let fasm = crate::spirv_module::load_bytes(&out_fs)
++            .expect("load lowered FS")
++            .disassemble();
++        assert!(fasm.contains("PhysicalStorageBuffer64"), "{fasm}");
++        assert!(fasm.contains("DescriptorSet 0"), "{fasm}");
++        assert!(fasm.contains("Binding 676"), "{fasm}");
++        assert!(!fasm.contains("Binding 0\n"), "{fasm}");
++
++        // Relocate DescriptorSet 0 -> 1 as GarnetMetal does before calling lower_icb_stage(..., 1, 1, ...)
++        let mut fs_set1 = crate::spirv_module::load_bytes(&fs_spv).expect("load fs");
++        for ann in &mut fs_set1.annotations {
++            if ann.class.opcode == Op::Decorate {
++                if let [_, Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(0)] =
++                    ann.operands.as_slice()
++                {
++                    ann.operands[2] = Operand::LiteralBit32(1);
++                }
++            }
++        }
++        let fs_set1_bytes: Vec<u8> = fs_set1
++            .assemble()
++            .into_iter()
++            .flat_map(u32::to_le_bytes)
++            .collect();
++        let (out_fs1, ftbl1, fvsp1) = lower_icb_stage(&fs_set1_bytes, 1, 1, &[]).expect("lower FS set 1");
++        assert_eq!(ftbl1, 676);
++        assert_eq!(fvsp1, 0);
++        let fasm1 = crate::spirv_module::load_bytes(&out_fs1)
++            .expect("load lowered FS set 1")
++            .disassemble();
++        assert!(fasm1.contains("DescriptorSet 1"), "{fasm1}");
++        assert!(fasm1.contains("Binding 676"), "{fasm1}");
++        assert!(!fasm1.contains("Binding 0\n"), "{fasm1}");
++
++        // TES stage (stage_kind = 2) keeps inputs/no vs_params, converts set 0 buffers -> 676
++        let (out_tes, ttbl, tvsp) = lower_icb_stage(&fs_spv, 2, 0, &[]).expect("lower TES");
++        assert_eq!(ttbl, 676);
++        assert_eq!(tvsp, 0);
++        assert!(!out_tes.is_empty());
++    }
++
++    #[test]
++    fn icb_stage_lowers_uniform_block_array_length_arg_root_and_registry_v3() {
++        let mut m = Module::default();
++        let mut hdr = crate::spirv_module::ModuleHeader::new(40);
++        hdr.set_version(1, 5);
++        m.header = Some(hdr);
++        m.capabilities.push(Instruction::new(Op::Capability, None, None, vec![Operand::Capability(Capability::Shader)]));
++        m.capabilities.push(Instruction::new(Op::Capability, None, None, vec![Operand::Capability(Capability::Int64)]));
++        m.capabilities.push(Instruction::new(Op::Capability, None, None, vec![Operand::Capability(Capability::RuntimeDescriptorArray)]));
++        m.memory_model = Some(Instruction::new(
++            Op::MemoryModel,
++            None,
++            None,
++            vec![Operand::AddressingModel(AddressingModel::Logical), Operand::MemoryModel(MemoryModel::GLSL450)],
++        ));
++        let t_void = 1;
++        let t_fn = 2;
++        let t_u32 = 3;
++        let t_u64 = 4;
++        let c_0 = 5;
++        let c_100 = 6;
++        let t_rt_u32 = 7;
++        let t_ssbo_struct = 8;
++        let t_ptr_ssbo = 9;
++        let v_ssbo = 10;
++        let t_ubo_struct = 11;
++        let t_ptr_ubo = 12;
++        let v_ubo = 13;
++        let t_root_struct = 14;
++        let t_ptr_root = 15;
++        let v_root = 16;
++        let t_rt_u64 = 17;
++        let t_reg_struct = 18;
++        let t_ptr_reg = 19;
++        let v_reg = 20;
++        let t_ptr_sb_u32 = 21;
++        let t_ptr_ubo_u32 = 22;
++        let t_ptr_sb_u64 = 23;
++        let t_ptr_out_u32 = 24;
++        let v_out = 25;
++        let fn_main = 26;
++        let lbl = 27;
++        let p_ssbo_0 = 28;
++        let l_ssbo_val = 29;
++        let l_arr_len = 30;
++        let p_ubo_0 = 31;
++        let l_ubo_val = 32;
++        let p_root_0 = 33;
++        let l_root_val = 34;
++        let p_reg_direct = 35;
++        let l_reg_direct = 36;
++        let p_reg_tail = 37;
++        let l_reg_tail = 38;
++        m.types_global_values = vec![
++            Instruction::new(Op::TypeVoid, None, Some(t_void), vec![]),
++            Instruction::new(Op::TypeFunction, None, Some(t_fn), vec![Operand::IdRef(t_void)]),
++            Instruction::new(Op::TypeInt, None, Some(t_u32), vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::TypeInt, None, Some(t_u64), vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Constant, Some(t_u32), Some(c_0), vec![Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Constant, Some(t_u32), Some(c_100), vec![Operand::LiteralBit32(100)]),
++            Instruction::new(Op::TypeRuntimeArray, None, Some(t_rt_u32), vec![Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypeStruct, None, Some(t_ssbo_struct), vec![Operand::IdRef(t_u32), Operand::IdRef(t_rt_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_ssbo), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_ssbo_struct)]),
++            Instruction::new(Op::Variable, Some(t_ptr_ssbo), Some(v_ssbo), vec![Operand::StorageClass(StorageClass::StorageBuffer)]),
++            Instruction::new(Op::TypeStruct, None, Some(t_ubo_struct), vec![Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_ubo), vec![Operand::StorageClass(StorageClass::Uniform), Operand::IdRef(t_ubo_struct)]),
++            Instruction::new(Op::Variable, Some(t_ptr_ubo), Some(v_ubo), vec![Operand::StorageClass(StorageClass::Uniform)]),
++            Instruction::new(Op::TypeStruct, None, Some(t_root_struct), vec![Operand::IdRef(t_u64)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_root), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_root_struct)]),
++            Instruction::new(Op::Variable, Some(t_ptr_root), Some(v_root), vec![Operand::StorageClass(StorageClass::StorageBuffer)]),
++            Instruction::new(Op::TypeRuntimeArray, None, Some(t_rt_u64), vec![Operand::IdRef(t_u64)]),
++            Instruction::new(Op::TypeStruct, None, Some(t_reg_struct), vec![Operand::IdRef(t_rt_u64)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_reg), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_reg_struct)]),
++            Instruction::new(Op::Variable, Some(t_ptr_reg), Some(v_reg), vec![Operand::StorageClass(StorageClass::StorageBuffer)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_sb_u32), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_ubo_u32), vec![Operand::StorageClass(StorageClass::Uniform), Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_sb_u64), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_u64)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_out_u32), vec![Operand::StorageClass(StorageClass::Output), Operand::IdRef(t_u32)]),
++            Instruction::new(Op::Variable, Some(t_ptr_out_u32), Some(v_out), vec![Operand::StorageClass(StorageClass::Output)]),
++        ];
++        m.annotations = vec![
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_rt_u32), Operand::Decoration(Decoration::ArrayStride), Operand::LiteralBit32(4)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_ssbo_struct), Operand::Decoration(Decoration::Block)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_ssbo_struct), Operand::LiteralBit32(0), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_ssbo_struct), Operand::LiteralBit32(1), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(4)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_ubo_struct), Operand::Decoration(Decoration::Block)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_ubo_struct), Operand::LiteralBit32(0), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_root_struct), Operand::Decoration(Decoration::Block)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_root_struct), Operand::LiteralBit32(0), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_rt_u64), Operand::Decoration(Decoration::ArrayStride), Operand::LiteralBit32(8)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_reg_struct), Operand::Decoration(Decoration::Block)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_reg_struct), Operand::LiteralBit32(0), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_ssbo), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(1)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_ssbo), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(2)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_ubo), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(1)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_ubo), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(3)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_root), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(1)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_root), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(704)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_reg), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(1)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_reg), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(640)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_out), Operand::Decoration(Decoration::Location), Operand::LiteralBit32(0)]),
++        ];
++        m.entry_points.push(Instruction::new(
++            Op::EntryPoint,
++            None,
++            None,
++            vec![
++                Operand::ExecutionModel(spirv::ExecutionModel::Fragment),
++                Operand::IdRef(fn_main),
++                Operand::LiteralString("main".into()),
++                Operand::IdRef(v_out),
++                Operand::IdRef(v_ssbo),
++                Operand::IdRef(v_ubo),
++                Operand::IdRef(v_root),
++                Operand::IdRef(v_reg),
++            ],
++        ));
++        m.functions.push(Function {
++            def: Some(Instruction::new(Op::Function, Some(t_void), Some(fn_main), vec![Operand::FunctionControl(FunctionControl::NONE), Operand::IdRef(t_fn)])),
++            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
++            parameters: vec![],
++            blocks: vec![Block {
++                label: Some(Instruction::new(Op::Label, None, Some(lbl), vec![])),
++                instructions: vec![
++                    Instruction::new(Op::AccessChain, Some(t_ptr_sb_u32), Some(p_ssbo_0), vec![Operand::IdRef(v_ssbo), Operand::IdRef(c_0)]),
++                    Instruction::new(Op::Load, Some(t_u32), Some(l_ssbo_val), vec![Operand::IdRef(p_ssbo_0)]),
++                    Instruction::new(Op::ArrayLength, Some(t_u32), Some(l_arr_len), vec![Operand::IdRef(v_ssbo), Operand::LiteralBit32(1)]),
++                    Instruction::new(Op::AccessChain, Some(t_ptr_ubo_u32), Some(p_ubo_0), vec![Operand::IdRef(v_ubo), Operand::IdRef(c_0)]),
++                    Instruction::new(Op::Load, Some(t_u32), Some(l_ubo_val), vec![Operand::IdRef(p_ubo_0)]),
++                    Instruction::new(Op::AccessChain, Some(t_ptr_sb_u64), Some(p_root_0), vec![Operand::IdRef(v_root), Operand::IdRef(c_0)]),
++                    Instruction::new(Op::Load, Some(t_u64), Some(l_root_val), vec![Operand::IdRef(p_root_0)]),
++                    Instruction::new(Op::AccessChain, Some(t_ptr_sb_u64), Some(p_reg_direct), vec![Operand::IdRef(v_reg), Operand::IdRef(c_0), Operand::IdRef(c_0)]),
++                    Instruction::new(Op::Load, Some(t_u64), Some(l_reg_direct), vec![Operand::IdRef(p_reg_direct)]),
++                    Instruction::new(Op::AccessChain, Some(t_ptr_sb_u64), Some(p_reg_tail), vec![Operand::IdRef(v_reg), Operand::IdRef(c_0), Operand::IdRef(c_100)]),
++                    Instruction::new(Op::Load, Some(t_u64), Some(l_reg_tail), vec![Operand::IdRef(p_reg_tail)]),
++                    Instruction::new(Op::Store, None, None, vec![Operand::IdRef(v_out), Operand::IdRef(l_arr_len)]),
++                    Instruction::new(Op::Return, None, None, vec![]),
++                ],
++            }],
++        });
++        let raw_bytes: Vec<u8> = m.assemble().into_iter().flat_map(u32::to_le_bytes).collect();
++        let (out, tbl, vsp) = lower_icb_stage(&raw_bytes, 1, 1, &[]).expect("lower complex FS");
++        assert_eq!(tbl, 676);
++        assert_eq!(vsp, 0);
++        let asm = crate::spirv_module::load_bytes(&out).expect("load lowered").disassemble();
++        assert!(asm.contains("Binding 676"), "{asm}");
++        assert!(asm.contains("Binding 640"), "RegistryV3 must keep binding 640:
++{asm}");
++        assert!(!asm.contains("Binding 2\n"), "{asm}");
++        assert!(!asm.contains("Binding 3\n"), "{asm}");
++        assert!(!asm.contains("Binding 704"), "{asm}");
++        assert!(!asm.contains("ArrayLength"), "ArrayLength must be lowered:
++{asm}");
++    }
++}
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index fa040e7..ab218c5 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1901,6 +1901,7 @@ mod air_calls;
+ mod aliased_imageblock;
+ mod emitted_inline;
+ mod finalize;
++pub mod icb_stage;
+ mod image_facts;
+ mod null_shapes;
+ pub(crate) use image_facts::validate_canonical_null_shape_word;

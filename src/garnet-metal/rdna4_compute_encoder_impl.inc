@@ -1,6 +1,8 @@
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4ComputeEncoder (11e R2)
 // ---------------------------------------------------------------------------------------------------------------
+static void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos);
+
 @interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; }
 - (instancetype)initWithCommandBuffer:(id)cb compute:(int)dummy;
 @end
@@ -188,6 +190,36 @@ RDNA4_ENCODER_SHARED
     rdna4_argument_scan_prepared_destroy(&scan);
     if (!argumentsReady) return;
     rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) { rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE); rdna4_tex_to([self->_cb vk], t, l); });
+    {
+        NSMutableSet *icbRefs = [NSMutableSet set];
+        NSMutableSet *icbPsoRefs = [NSMutableSet set];
+        for (uint32_t i = 0; i < 31; i++) {
+            if (_st.buf[i].b) rdna4_argbuf_icb_snapshot(_st.buf[i].b, icbRefs, icbPsoRefs);
+        }
+        for (id res in _argumentResources) {
+            if ([res isKindOfClass:[RDNA4Buffer class]])
+                rdna4_argbuf_icb_snapshot((RDNA4Buffer *)res, icbRefs, icbPsoRefs);
+        }
+        for (id pso in icbPsoRefs) {
+            [_cb rdna4RetainEncoded:pso];
+        }
+        for (id<RDNA4ICBInternal> icb in icbRefs) {
+            if ([icb device] != dev) {
+                [_cb rdna4Fail:@"compute dispatch references indirect command buffer from another device"];
+                return;
+            }
+            if (![icb rdna4PrepareForGPUProducerOnCommandBuffer:_cb]) return;
+            [_cb rdna4RetainEncoded:icb];
+            id backing = [icb rdna4GPUBacking];
+            if (backing) [_cb rdna4RetainEncoded:backing];
+            for (id pso in icbPsoRefs) {
+                if (![icb rdna4RegisterCandidatePipeline:pso]) {
+                    [_cb rdna4Fail:@"indirect command buffer exceeds 32 candidate pipelines"];
+                    return;
+                }
+            }
+        }
+    }
     VkCommandBuffer cmd = [_cb vk];
     VkDescriptorSet s = VK_NULL_HANDLE;
     if ([_pso npb]) { s = [_cb rdna4AllocSet:[_pso dsl]]; if (!s || ![_cb rdna4FillSet:s bindings:[_pso pb] count:[_pso npb] state:&_st stage:"compute"]) return; }

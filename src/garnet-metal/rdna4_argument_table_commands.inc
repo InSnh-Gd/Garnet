@@ -361,3 +361,6 @@
 - (void)rdna4BindArguments:(const RDNA4ArgumentTables *)tables point:(VkPipelineBindPoint)point layout:(VkPipelineLayout)layout {
     if (tables->active) vkCmdBindDescriptorSets(_vk, point, layout, 2, 3, _argumentSets, 0, NULL);
 }
+- (void)rdna4CopyArgumentSets:(VkDescriptorSet [3])outSets {
+    memcpy(outSets, _argumentSets, sizeof _argumentSets);
+}

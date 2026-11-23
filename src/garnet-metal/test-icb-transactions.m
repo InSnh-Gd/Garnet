@@ -34,6 +34,14 @@ static struct {
 };
 
 static _Atomic uint64_t rdna4_uid_ctr;
+static uint64_t rdna4_resource_uid(_Atomic uint64_t *uid) {
+    uint64_t current = atomic_load_explicit(uid, memory_order_relaxed);
+    if (current) return current;
+    uint64_t candidate = atomic_fetch_add_explicit(&rdna4_uid_ctr, 1, memory_order_relaxed) + 1;
+    uint64_t expected = 0;
+    return atomic_compare_exchange_strong_explicit(uid, &expected, candidate,
+        memory_order_relaxed, memory_order_relaxed) ? candidate : expected;
+}
 
 static void rdna4_log(const char *format, ...) { (void)format; }
 #define RDNA4LOG(...) rdna4_log(__VA_ARGS__)

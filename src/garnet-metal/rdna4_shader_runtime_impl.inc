@@ -19,6 +19,7 @@ static struct {
     char dir[RDNA4X_PATH_MAX];
     NSString *dirNS;
     int engineInit; rdna4x_engine eng;
+    int icbXlibTried; rdna4x_xlib icbXlib; char icbXlibErr[256];
     int sandboxedDone, sandboxed;
 } RDNA4XL = { .mu = PTHREAD_MUTEX_INITIALIZER };
 static NSMutableSet<NSString *> *rdna4x_logged, *rdna4x_touched;   // guarded by RDNA4XL.mu
@@ -207,6 +208,29 @@ static void rdna4x_engine_prepare(void) {
         RDNA4XL.engineInit = 1;
     }
     pthread_mutex_unlock(&RDNA4XL.mu);
+}
+
+// Lazy translator library access for ICB render stage lowering even on spvcache hits.
+static const rdna4x_xlib *rdna4x_ensure_xlib(NSError **err) {
+    pthread_mutex_lock(&RDNA4XL.mu);
+    if (!RDNA4XL.icbXlib.h && !RDNA4XL.icbXlibTried) {
+        char ebuf[256] = "";
+        if (rdna4x_xlib_load(&RDNA4XL.icbXlib, rdna4x_xlib_path().fileSystemRepresentation, ebuf, sizeof ebuf) != 0) {
+            strlcpy(RDNA4XL.icbXlibErr, ebuf[0] ? ebuf : "failed to load libgarnetxlate.dylib", sizeof RDNA4XL.icbXlibErr);
+            memset(&RDNA4XL.icbXlib, 0, sizeof RDNA4XL.icbXlib);
+        }
+        RDNA4XL.icbXlibTried = 1;
+    }
+    const rdna4x_xlib *out = RDNA4XL.icbXlib.h ? &RDNA4XL.icbXlib : NULL;
+    if (!out && err) {
+        *err = rdna4_err(42, [NSString stringWithUTF8String:RDNA4XL.icbXlibErr[0] ? RDNA4XL.icbXlibErr : "libgarnetxlate.dylib unavailable"]);
+    }
+    pthread_mutex_unlock(&RDNA4XL.mu);
+    if (out && !out->lower_icb_stage) {
+        if (err) *err = rdna4_err(42, @"libgarnetxlate.dylib lacks garnetx_lower_icb_stage");
+        return NULL;
+    }
+    return out;
 }
 
 // Both render stages share the app deadline. After timeouts, jobs still run off

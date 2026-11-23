@@ -566,21 +566,344 @@ static void testWholeRangeValidation(id<MTLDevice> device, id<MTLCommandQueue> q
     passCase(@"whole-range-validation-precedes-replay");
 }
 
-static void testPatchRejection(id<MTLDevice> device) {
-    MTLIndirectCommandBufferDescriptor *descriptor =
-        [MTLIndirectCommandBufferDescriptor new];
-    descriptor.commandTypes = MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawPatches;
-    descriptor.inheritPipelineState = NO;
-    descriptor.inheritBuffers = NO;
-    descriptor.maxVertexBufferBindCount = 2;
-    descriptor.maxFragmentBufferBindCount = 1;
-    id<MTLIndirectCommandBuffer> icb =
-        [device newIndirectCommandBufferWithDescriptor:descriptor
-                                       maxCommandCount:2
-                                                options:MTLResourceStorageModePrivate];
-    if (icb)
-        fail(@"patch command type was accepted at indirect command buffer creation");
-    passCase(@"patch-command-type-rejected-at-creation");
+static uint16_t f32_to_f16(float f) {
+    __fp16 h = (__fp16)f;
+    uint16_t bits = 0;
+    memcpy(&bits, &h, 2);
+    return bits;
+}
+
+static id<MTLRenderPipelineState> newTessPipeline(id<MTLDevice> device, id<MTLLibrary> library,
+                                                  NSString *vertName, NSString *fragName,
+                                                  BOOL hasAttr, MTLTessellationControlPointIndexType cpIdxType,
+                                                  MTLTessellationFactorStepFunction fStep) {
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [library newFunctionWithName:vertName];
+    d.fragmentFunction = [library newFunctionWithName:fragName];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+    d.tessellationOutputWindingOrder = MTLWindingClockwise;
+    d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+    d.tessellationFactorStepFunction = fStep;
+    d.tessellationControlPointIndexType = cpIdxType;
+    d.tessellationFactorScaleEnabled = YES;
+    d.maxTessellationFactor = 16;
+    d.supportIndirectCommandBuffers = YES;
+    if (hasAttr) {
+        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+        vd.attributes[0].format = MTLVertexFormatFloat2;
+        vd.attributes[0].offset = 0;
+        vd.attributes[0].bufferIndex = 0;
+        vd.layouts[0].stride = 2 * sizeof(float);
+        vd.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+        vd.layouts[0].stepRate = 1;
+        d.vertexDescriptor = vd;
+    }
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pso) fail([NSString stringWithFormat:@"tess pipeline %@/%@: %@", vertName, fragName, err]);
+    return pso;
+}
+
+static void testCPUPatchEquivalence(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+    NSString *src =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct POut { float4 pos [[position]]; float4 col; };\n"
+         "struct CPIn { float2 xy [[attribute(0)]]; };\n"
+         "struct TriIn { patch_control_point<CPIn> cp; };\n"
+         "[[patch(triangle, 3)]]\n"
+         "vertex POut icb_tri_tes(TriIn in [[stage_in]], float3 b [[position_in_patch]], uint pid [[patch_id]], uint iid [[instance_id]]) {\n"
+         "  POut o;\n"
+         "  float2 p = b.x * in.cp[0].xy + b.y * in.cp[1].xy + b.z * in.cp[2].xy;\n"
+         "  o.pos = float4(p, 0.0, 1.0);\n"
+         "  o.col = float4(b.x, b.y * 0.8 + float(pid) * 0.2, 0.25 + 0.5 * float(iid), 1.0);\n"
+         "  return o;\n"
+         "}\n"
+         "struct QuadIn { patch_control_point<CPIn> cp; };\n"
+         "[[patch(quad, 4)]]\n"
+         "vertex POut icb_quad_tes(QuadIn in [[stage_in]], float2 uv [[position_in_patch]], uint pid [[patch_id]], uint iid [[instance_id]]) {\n"
+         "  POut o;\n"
+         "  float2 bot = mix(in.cp[0].xy, in.cp[1].xy, uv.x);\n"
+         "  float2 top = mix(in.cp[2].xy, in.cp[3].xy, uv.x);\n"
+         "  o.pos = float4(mix(bot, top, uv.y), 0.0, 1.0);\n"
+         "  o.col = float4(uv.x, uv.y, 0.2 + 0.4 * float(pid + iid), 1.0);\n"
+         "  return o;\n"
+         "}\n"
+         "[[patch(triangle, 0)]]\n"
+         "vertex POut icb_zcp_tes(float3 b [[position_in_patch]]) {\n"
+         "  float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };\n"
+         "  POut o;\n"
+         "  o.pos = float4(b.x * p[0] + b.y * p[1] + b.z * p[2], 0.0, 1.0);\n"
+         "  o.col = float4(0.8, 0.3, 0.6, 1.0);\n"
+         "  return o;\n"
+         "}\n"
+         "fragment float4 icb_patch_fs(POut in [[stage_in]], constant float4 &tint [[buffer(0)]]) {\n"
+         "  return in.col * tint;\n"
+         "}\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
+    if (!lib) fail([NSString stringWithFormat:@"patch lib: %@", err]);
+
+    id<MTLRenderPipelineState> triPso = newTessPipeline(device, lib, @"icb_tri_tes", @"icb_patch_fs", YES, MTLTessellationControlPointIndexTypeNone, MTLTessellationFactorStepFunctionPerPatch);
+    id<MTLRenderPipelineState> quadIdx16Pso = newTessPipeline(device, lib, @"icb_quad_tes", @"icb_patch_fs", YES, MTLTessellationControlPointIndexTypeUInt16, MTLTessellationFactorStepFunctionPerPatchAndPerInstance);
+    id<MTLRenderPipelineState> quadIdx32Pso = newTessPipeline(device, lib, @"icb_quad_tes", @"icb_patch_fs", YES, MTLTessellationControlPointIndexTypeUInt32, MTLTessellationFactorStepFunctionPerPatchAndPerInstance);
+    id<MTLRenderPipelineState> zcpPso = newTessPipeline(device, lib, @"icb_zcp_tes", @"icb_patch_fs", NO, MTLTessellationControlPointIndexTypeNone, MTLTessellationFactorStepFunctionConstant);
+
+    const float triVerts[6] = { -1, -1, 3, -1, -1, 3 };
+    const float quadVerts[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    const float white[4] = { 1, 1, 1, 1 };
+    const uint16_t triFactors8B[4] = { f32_to_f16(4), f32_to_f16(4), f32_to_f16(4), f32_to_f16(4) }; // exact 8 bytes (<16B!)
+    const uint16_t quadFactors2x16B[16] = {
+        // instance 0 stride slot (16B): zero factors
+        0, 0, 0, 0, 0, 0, 0, 0,
+        // instance 1 stride slot (at byte 16): valid 12B quad factors
+        f32_to_f16(3), f32_to_f16(3), f32_to_f16(3), f32_to_f16(3), f32_to_f16(3), f32_to_f16(3), 0, 0,
+    };
+    const uint32_t patchIdx[2] = { 99u, 0u }; // 4B uint32 patch indices; offset 4 selects patch 0
+    const uint16_t cp16[4] = { 0, 1, 2, 3 };
+    const uint32_t cp32[4] = { 0, 1, 2, 3 };
+
+    id<MTLBuffer> triVB = newBuffer(device, triVerts, sizeof triVerts);
+    id<MTLBuffer> quadVB = newBuffer(device, quadVerts, sizeof quadVerts);
+    id<MTLBuffer> tintBuf = newBuffer(device, white, sizeof white);
+    id<MTLBuffer> triFB8 = newBuffer(device, triFactors8B, sizeof triFactors8B); // strictly 8 bytes
+    id<MTLBuffer> quadFB = newBuffer(device, quadFactors2x16B, sizeof quadFactors2x16B);
+    id<MTLBuffer> pIdxBuf = newBuffer(device, patchIdx, sizeof patchIdx);
+    id<MTLBuffer> cp16Buf = newBuffer(device, cp16, sizeof cp16);
+    id<MTLBuffer> cp32Buf = newBuffer(device, cp32, sizeof cp32);
+
+    const MTLViewport vp = { 0, 0, 32, 32, 0, 1 };
+    const MTLScissorRect sc = { 0, 0, 32, 32 };
+
+    // 1) drawPatches tri with 8-byte factor buffer + inherit combinations + factorScale inheritance
+    for (NSUInteger ip = 0; ip < 2; ip++) {
+        for (NSUInteger ib = 0; ib < 2; ib++) {
+            id<MTLTexture> dt = newTarget(device), it = newTarget(device);
+            id<MTLCommandBuffer> cb = nil;
+            id<MTLRenderCommandEncoder> enc = beginRender(queue, dt, &cb, @"cpu-patch-tri-direct");
+            [enc setViewport:vp]; [enc setScissorRect:sc];
+            [enc setRenderPipelineState:triPso];
+            [enc setVertexBuffer:triVB offset:0 atIndex:0];
+            [enc setFragmentBuffer:tintBuf offset:0 atIndex:0];
+            [enc setTessellationFactorScale:1.0f];
+            [enc setTessellationFactorBuffer:triFB8 offset:0 instanceStride:0];
+            [enc drawPatches:3 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+            [enc endEncoding];
+            finish(cb, @"cpu-patch-tri-direct");
+
+            id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, ip != 0, ib != 0, 1);
+            id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+            if (!ip) [cmd setRenderPipelineState:triPso];
+            if (!ib) { [cmd setVertexBuffer:triVB offset:0 atIndex:0]; [cmd setFragmentBuffer:tintBuf offset:0 atIndex:0]; }
+            [cmd drawPatches:3 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+                tessellationFactorBuffer:triFB8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+
+            cb = nil;
+            enc = beginRender(queue, it, &cb, @"cpu-patch-tri-icb");
+            [enc setViewport:vp]; [enc setScissorRect:sc];
+            if (ip) [enc setRenderPipelineState:triPso];
+            if (ib) { [enc setVertexBuffer:triVB offset:0 atIndex:0]; [enc setFragmentBuffer:tintBuf offset:0 atIndex:0]; }
+            [enc setTessellationFactorScale:1.0f];
+            [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+            [enc endEncoding];
+            finish(cb, @"cpu-patch-tri-icb");
+            expectSamePixels(readTexture(device, queue, dt, @"tri-d"),
+                             readTexture(device, queue, it, @"tri-i"), @"cpu-patch-tri");
+        }
+    }
+
+    // Inherited tessellationFactorScale = 0.0f must cull the ICB patch draw to clear color
+    {
+        id<MTLTexture> zt = newTarget(device);
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:triPso];
+        [cmd setVertexBuffer:triVB offset:0 atIndex:0];
+        [cmd setFragmentBuffer:tintBuf offset:0 atIndex:0];
+        [cmd drawPatches:3 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:triFB8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, zt, &cb, @"cpu-patch-scale0");
+        [enc setViewport:vp]; [enc setScissorRect:sc];
+        [enc setTessellationFactorScale:0.0f];
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        finish(cb, @"cpu-patch-scale0");
+        expectColor(readTexture(device, queue, zt, @"cpu-patch-scale0"), 0, 0, 0, 255, @"cpu-patch-scale0");
+    }
+
+    // 2) Zero-control-point procedural patch in CPU ICB
+    {
+        id<MTLTexture> dt = newTarget(device), it = newTarget(device);
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, dt, &cb, @"cpu-patch-0cp-d");
+        [enc setViewport:vp]; [enc setScissorRect:sc];
+        [enc setRenderPipelineState:zcpPso];
+        [enc setFragmentBuffer:tintBuf offset:0 atIndex:0];
+        [enc setTessellationFactorBuffer:triFB8 offset:0 instanceStride:0];
+        [enc drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+        [enc endEncoding];
+        finish(cb, @"cpu-patch-0cp-d");
+
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:zcpPso];
+        [cmd setFragmentBuffer:tintBuf offset:0 atIndex:0];
+        [cmd drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:triFB8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        cb = nil;
+        enc = beginRender(queue, it, &cb, @"cpu-patch-0cp-i");
+        [enc setViewport:vp]; [enc setScissorRect:sc];
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        finish(cb, @"cpu-patch-0cp-i");
+        expectSamePixels(readTexture(device, queue, dt, @"0cp-d"), readTexture(device, queue, it, @"0cp-i"), @"cpu-patch-0cp");
+    }
+
+    // 3) drawIndexedPatches: UInt16 & UInt32 with 4B patchIndexBuffer + baseInstance + instanceStride
+    for (int is32 = 0; is32 < 2; is32++) {
+        id<MTLRenderPipelineState> pso = is32 ? quadIdx32Pso : quadIdx16Pso;
+        id<MTLBuffer> cpBuf = is32 ? cp32Buf : cp16Buf;
+        id<MTLTexture> dt = newTarget(device), it = newTarget(device);
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, dt, &cb, @"cpu-idx-patch-d");
+        [enc setViewport:vp]; [enc setScissorRect:sc];
+        [enc setRenderPipelineState:pso];
+        [enc setVertexBuffer:quadVB offset:0 atIndex:0];
+        [enc setFragmentBuffer:tintBuf offset:0 atIndex:0];
+        [enc setTessellationFactorBuffer:quadFB offset:0 instanceStride:16];
+        [enc drawIndexedPatches:4 patchStart:0 patchCount:1 patchIndexBuffer:pIdxBuf patchIndexBufferOffset:4
+            controlPointIndexBuffer:cpBuf controlPointIndexBufferOffset:0 instanceCount:1 baseInstance:1];
+        [enc endEncoding];
+        finish(cb, @"cpu-idx-patch-d");
+
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawIndexedPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:pso];
+        [cmd setVertexBuffer:quadVB offset:0 atIndex:0];
+        [cmd setFragmentBuffer:tintBuf offset:0 atIndex:0];
+        [cmd drawIndexedPatches:4 patchStart:0 patchCount:1 patchIndexBuffer:pIdxBuf patchIndexBufferOffset:4
+            controlPointIndexBuffer:cpBuf controlPointIndexBufferOffset:0 instanceCount:1 baseInstance:1
+            tessellationFactorBuffer:quadFB tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:16];
+        cb = nil;
+        enc = beginRender(queue, it, &cb, @"cpu-idx-patch-i");
+        [enc setViewport:vp]; [enc setScissorRect:sc];
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        finish(cb, @"cpu-idx-patch-i");
+        expectSamePixels(readTexture(device, queue, dt, @"idx-patch-d"),
+                         readTexture(device, queue, it, @"idx-patch-i"),
+                         is32 ? @"cpu-indexed-patch-u32" : @"cpu-indexed-patch-u16");
+    }
+    passCase(@"cpu-patch-and-indexed-patch-equivalence");
+}
+
+static void testCPUPatchAndComputeRefusals(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                                            id<MTLRenderPipelineState> nonTessPipeline) {
+    NSString *src =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct POut { float4 pos [[position]]; };\n"
+         "[[patch(triangle, 0)]]\n"
+         "vertex POut neg_zcp_tes() { POut o; o.pos = float4(0, 0, 0, 1); return o; }\n"
+         "fragment float4 neg_fs() { return float4(1); }\n"
+         "kernel void icb_compute_noop(device uint *out [[buffer(0)]]) { out[0] = 1; }\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
+    if (!lib) fail([NSString stringWithFormat:@"neg lib: %@", err]);
+    id<MTLRenderPipelineState> zcpPso = newTessPipeline(device, lib, @"neg_zcp_tes", @"neg_fs", NO, MTLTessellationControlPointIndexTypeNone, MTLTessellationFactorStepFunctionConstant);
+    const uint16_t tf[4] = { f32_to_f16(2), f32_to_f16(2), f32_to_f16(2), f32_to_f16(2) };
+    const uint32_t pi[2] = { 0, 0 };
+    id<MTLBuffer> fb8 = newBuffer(device, tf, sizeof tf);
+    id<MTLBuffer> fb4 = newBuffer(device, tf, 4);
+    id<MTLBuffer> pib = newBuffer(device, pi, sizeof pi);
+
+    // 1) control points > 32 rejected
+    {
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:zcpPso];
+        [cmd drawPatches:33 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:fb8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, newTarget(device), &cb, @"patch-cp-33");
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        expectCommandError(cb, @"patch-cp-33");
+    }
+
+    // 2) patchIndexBuffer 2-byte misaligned offset (requires 4B uint32) rejected
+    {
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:zcpPso];
+        [cmd drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:pib patchIndexBufferOffset:2 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:fb8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, newTarget(device), &cb, @"patch-idx-misaligned-2");
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        expectCommandError(cb, @"patch-idx-misaligned-2");
+    }
+
+    // 3) tessellationFactorBuffer misaligned offset / stride and undersized factor buffer at execution rejected
+    {
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, NO, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:zcpPso];
+        [cmd drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:fb8 tessellationFactorBufferOffset:2 tessellationFactorBufferInstanceStride:0];
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, newTarget(device), &cb, @"patch-factor-misaligned");
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        expectCommandError(cb, @"patch-factor-misaligned");
+
+        [icb resetWithRange:NSMakeRange(0, 1)];
+        [cmd setRenderPipelineState:zcpPso];
+        [cmd drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:fb4 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        cb = nil;
+        enc = beginRender(queue, newTarget(device), &cb, @"patch-factor-undersized");
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        expectCommandError(cb, @"patch-factor-undersized");
+    }
+
+    // 4) Non-tessellation pipeline with patch command rejected
+    {
+        id<MTLIndirectCommandBuffer> icb = newICB(device, MTLIndirectCommandTypeDrawPatches, NO, YES, 1);
+        id<MTLIndirectRenderCommand> cmd = [icb indirectRenderCommandAtIndex:0];
+        [cmd setRenderPipelineState:nonTessPipeline];
+        [cmd drawPatches:0 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0
+            tessellationFactorBuffer:fb8 tessellationFactorBufferOffset:0 tessellationFactorBufferInstanceStride:0];
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLRenderCommandEncoder> enc = beginRender(queue, newTarget(device), &cb, @"patch-nontess-pso");
+        [enc executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
+        [enc endEncoding];
+        expectCommandError(cb, @"patch-nontess-pso");
+    }
+
+    // 5) Compute ICB descriptor and compute pipeline supportIndirectCommandBuffers = YES refused
+    {
+        MTLIndirectCommandBufferDescriptor *cd = [MTLIndirectCommandBufferDescriptor new];
+        cd.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        id<MTLIndirectCommandBuffer> cicb = [device newIndirectCommandBufferWithDescriptor:cd maxCommandCount:2 options:MTLResourceStorageModePrivate];
+        if (cicb) fail(@"compute indirect command buffer descriptor was accepted unexpectedly");
+
+        MTLComputePipelineDescriptor *cpd = [MTLComputePipelineDescriptor new];
+        cpd.computeFunction = [lib newFunctionWithName:@"icb_compute_noop"];
+        cpd.supportIndirectCommandBuffers = YES;
+        NSError *cerr = nil;
+        id<MTLComputePipelineState> cpso = [device newComputePipelineStateWithDescriptor:cpd options:0 reflection:nil error:&cerr];
+        if (cpso || !cerr) fail(@"compute pipeline with supportIndirectCommandBuffers=YES was accepted unexpectedly");
+
+        id<MTLComputePipelineState> normalCpso = [device newComputePipelineStateWithFunction:cpd.computeFunction error:&cerr];
+        if (!normalCpso || normalCpso.supportIndirectCommandBuffers)
+            fail(@"normal compute pipeline should advertise supportIndirectCommandBuffers == NO");
+    }
+    passCase(@"cpu-patch-validation-and-compute-icb-refusal");
 }
 
 static void testRangeRejection(id<MTLDevice> device, id<MTLCommandQueue> queue) {
@@ -694,8 +1017,11 @@ int main(int argc, const char *argv[]) {
                 testSparseLargeCommandCount(device, queue, pipeline, vertexBuffer, redBuffer);
                 testInvalidIndex(device, queue, pipeline, vertexBuffer, indexBuffer, redBuffer);
                 testWholeRangeValidation(device, queue, pipeline, vertexBuffer, indexBuffer, redBuffer);
-                testPatchRejection(device);
+                testCPUPatchEquivalence(device, queue);
+                testCPUPatchAndComputeRefusals(device, queue, otherPipeline);
                 testRangeRejection(device, queue);
+            } else {
+                testCPUPatchEquivalence(device, queue);
             }
             printf("ICB_SUITE_PASS reference=%u production_bundle=%u\n",
                    referenceMode ? 1u : 0u, referenceMode ? 0u : 1u);
