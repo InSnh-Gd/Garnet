@@ -55,6 +55,8 @@ def trim(m):
             out[key] = fields
     if m.get("argument_resource_tables") is not None:
         out["argument_resource_tables"] = m["argument_resource_tables"]
+    if m.get("tessellation") is not None:
+        out["tessellation"] = m["tessellation"]
     if "normalized_sampler_coordinates" in m:
         out["normalized_sampler_coordinates"] = m["normalized_sampler_coordinates"]
     return out

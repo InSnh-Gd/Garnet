@@ -472,6 +472,9 @@ pub fn trim_meta_with_buffer_address_mode(
     {
         put(&mut out, "argument_resource_tables", tables);
     }
+    if let Some(tessellation) = m.get("tessellation").filter(|t| !t.is_null()) {
+        put(&mut out, "tessellation", tessellation);
+    }
     if let Some(proof) = m
         .get("uniform_control_proof")
         .filter(|proof| !proof.is_null())
@@ -503,5 +506,61 @@ pub fn trim_meta_with_buffer_address_mode(
 
 fn ordered(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metal2vulkan::BufferAddressTableMode;
+    use serde_json::json;
+
+    #[test]
+    fn trim_meta_preserves_non_null_tessellation_and_omits_null() {
+        let base = json!({
+            "reflection_version": 66,
+            "stage": "Vertex",
+            "entry_point": "main",
+            "bindings": [],
+            "vertex_attributes": [],
+            "local_size": null,
+            "max_work_group_size": null,
+            "kernel_dispatch": null,
+            "function_constants": [],
+            "descriptor_layout": {"sets": []},
+            "runtime_sampler_specializations": [],
+            "runtime_storage_image_specializations": [],
+            "tessellation": null
+        });
+        let trimmed_null = trim_meta_with_buffer_address_mode(
+            &base,
+            0,
+            BufferAddressTableMode::LegacyV1,
+        );
+        let parsed_null: Value = serde_json::from_slice(&trimmed_null).unwrap();
+        assert!(parsed_null.get("tessellation").is_none());
+
+        let mut with_tess = base.clone();
+        with_tess["stage"] = json!("TessellationEvaluation");
+        with_tess["tessellation"] = json!({
+            "domain": "Quad",
+            "control_point_count": 4,
+            "control_point_locations": [0, 1],
+            "patch_input_locations": [2],
+            "control_point_attributes": [{"location": 0, "type_name": "float2"}],
+            "patch_attributes": [{"location": 2, "type_name": "float4"}],
+            "instance_id": {"location": 3, "type_name": "uint"},
+            "amplification_id": null,
+            "amplification_count": null
+        });
+        let trimmed_tess = trim_meta_with_buffer_address_mode(
+            &with_tess,
+            0,
+            BufferAddressTableMode::LegacyV1,
+        );
+        let parsed_tess: Value = serde_json::from_slice(&trimmed_tess).unwrap();
+        assert_eq!(parsed_tess["tessellation"]["domain"], json!("Quad"));
+        assert_eq!(parsed_tess["tessellation"]["control_point_count"], json!(4));
+        assert_eq!(parsed_tess["tessellation"]["instance_id"]["location"], json!(3));
+    }
 }
 
