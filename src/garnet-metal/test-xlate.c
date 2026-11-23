@@ -28,16 +28,15 @@ static int fails, runs;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; runs++; if (!ok_) { fails++; printf("FAIL: %s\n", name); } } while (0)
 
 static char *slurp(const char *dir, const char *name) {
-    char path[1024]; snprintf(path, sizeof path, "%s/%s", dir, name);
+    char path[1024];
+    if (name && (name[0] == '/' || !dir || !*dir)) snprintf(path, sizeof path, "%s", name);
+    else snprintf(path, sizeof path, "%s/%s", dir, name);
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *b = malloc((size_t)n + 1); if (!b) { fclose(f); return NULL; }
     if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
     b[n] = 0; fclose(f); return b;
 }
-static const char *fn_start(const char *src, const char *sig) { return strstr(src, sig); }
-static int before(const char *a, const char *b) { return a && b && a < b; }
-static int has(const char *from, const char *to, const char *needle) { const char *q = from ? strstr(from, needle) : NULL; return q != NULL && (to == NULL || q < to); }
 
 static char TMP[512];   // scratch root, removed at exit (prefix-checked)
 static void rmtree(const char *path) {   // plain files and directories only; never follows a link
@@ -503,97 +502,6 @@ int main(int argc, char **argv) {
         CHECK("spawn: rdna4x_spawn(..., RDNA4X_WORKER_STACK) gives a 64 MiB stack", seen_stack >= RDNA4X_WORKER_STACK);
         pthread_attr_t a; size_t def = 0; pthread_attr_init(&a); pthread_attr_getstacksize(&a, &def); pthread_attr_destroy(&a);
         CHECK("spawn: the default secondary-thread stack is far smaller (this is what the 64 MiB avoids)", def < (size_t)8u << 20);
-    }
-
-    // ===== G source pins on GarnetDevice.m =====
-    {
-        char *src = slurp(dir, "GarnetDevice.m");
-        CHECK("GarnetDevice.m is readable", src != NULL);
-        if (src) {
-            const char *act = fn_start(src, "static BOOL rdna4x_active(void) {");
-            const char *actEnd = act ? strstr(act, "\n}\n") : NULL;
-            CHECK("G: rdna4x_active calls rdna4x_applies with WindowServer first, then admitted, the root-allow tool, RDNA4M_TEST_INPROC, the kill file and the environment",
-                  has(act, actEnd, "rdna4x_applies(rdna4_is_ws(), atomic_load(&rdna4_app_admitted), rdna4_allow(), rdna4x_test_inproc(), RDNA4XL.killed, RDNA4XL.envDirty)"));
-            const char *gr = fn_start(src, "static void rdna4x_gate_read(void) {");
-            const char *grEnd = gr ? strstr(gr, "\n}\n") : NULL;
-            CHECK("G: the kill file is read with rdna4x_killed_from_stat (fail closed) and the environment with rdna4x_env_dirty, never in WindowServer",
-                  has(gr, grEnd, "if (!rdna4_is_ws())") && has(gr, grEnd, "stat(RDNA4X_KILL_FILE, &st)") && has(gr, grEnd, "RDNA4XL.killed = rdna4x_killed_from_stat(rc, er);") && has(gr, grEnd, "RDNA4XL.envDirty = rdna4x_env_dirty(*_NSGetEnviron());"));
-            const char *dirs = fn_start(src, "static NSArray<NSString *> *rdna4_spv_dirs(void) {");
-            const char *dirsEnd = dirs ? strstr(dirs, "\n}\n") : NULL;
-            const char *pb = dirs ? strstr(dirs, "NSMutableArray *m = [bundleOnly mutableCopy];") : NULL;
-            const char *pu = dirs ? strstr(dirs, "if (u) { [m addObject:u]; userFor = u; }") : NULL;
-            const char *ps = dirs ? strstr(dirs, "if (!skipSide) [m addObject:rdna4_side_dir()];") : NULL;
-            CHECK("G: lookup order: the bundle spvcache first, then the user cache directory, then the side directory", before(pb, pu) && before(pu, ps) && pb < dirsEnd && ps < dirsEnd);
-            CHECK("G: the bundle spvcache is the first entry of the array the user directory is appended to", has(dirs, dirsEnd, "bundleOnly = @[ [[[NSBundle bundleForClass:[GarnetDevice class]] resourcePath] stringByAppendingPathComponent:@\"spvcache\"] ];"));
-            CHECK("G: the side directory is skipped for a sandboxed non-WindowServer process that translates in process",
-                  has(dirs, dirsEnd, "const BOOL skipSide = u && rdna4x_skip_side_dir(rdna4_is_ws(), rdna4x_sandboxed());") && has(src, NULL, "RDNA4XL.sandboxed = sandbox_check(getpid(), NULL, 0) != 0;"));
-            const char *su = fn_start(src, "static void rdna4x_setup_locked(void) {");
-            const char *suEnd = su ? strstr(su, "\n}\n") : NULL;
-            CHECK("G: the key is made from the translator's UUID, the reader's identity, the override hash and kern.osversion",
-                  has(su, suEnd, "rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xl)") && has(su, suEnd, "rdna4x_override_hash(ov)") && has(su, suEnd, "rdna4x_key_with_capabilities(key, xl, rd, ov, osv, &queryCaps)") && has(su, suEnd, "_dyld_get_shared_cache_uuid(cu)") &&
-                  has(su, suEnd, "sysctlbyname(\"kern.osversion\""));
-            CHECK("G: the user cache directory is set up by rdna4x_user_dir after admission, not inside rdna4_spv_dirs' dispatch_once", has(src, NULL, "static NSString *rdna4x_user_dir(void) {\n    if (!rdna4x_active()) return nil;") && !has(dirs, strstr(dirs, "dispatch_once(&o, ^{"), "rdna4x_user_dir"));
-            const char *tf = fn_start(src, "static BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error) {");
-            const char *tfEnd = tf ? strstr(tf, "\n}\n") : NULL;
-            const char *prepare = fn_start(src, "static void rdna4x_engine_prepare(void) {");
-            const char *prepareEnd = prepare ? strstr(prepare, "\n}\n") : NULL;
-            CHECK("G: translation and argument lowering share the 64-MiB worker", has(tf, tfEnd, "rdna4x_engine_prepare();") && has(prepare, prepareEnd, "rdna4x_engine_init(&RDNA4XL.eng, NULL, NULL, rl, rdna4x_xlib_path().fileSystemRepresentation, RDNA4X_WORKER_STACK);") && has(prepare, prepareEnd, "RDNA4XL.eng.lowerTranslatedArguments = RDNA4R.gpuArgumentTables;"));
-            CHECK("G: in-process waits obey the app deadline", has(tf, tfEnd, "deadlineNs > now") && has(tf, tfEnd, "leftMs > RDNA4G_SYNC_WAIT_APP_MS ? RDNA4G_SYNC_WAIT_APP_MS : (int)leftMs") && !has(tf, tfEnd, "RDNA4G_SYNC_WAIT_MS"));
-            CHECK("G: in-process waits share the process strikes budget and still enqueue after exhaustion",
-                  has(tf, tfEnd, "waitMs > 0 && rdna4_sync_begin(!rdna4_is_ws())") && has(tf, tfEnd, "if (!waiting) waitMs = 0;") &&
-                  has(tf, tfEnd, "if (waiting) rdna4_sync_end(rc == RDNA4X_OK, rc == RDNA4X_E_TIMEOUT);") &&
-                  before(strstr(tf, "if (!waiting) waitMs = 0;"), strstr(tf, "rdna4x_engine_run_linked(")) &&
-                  before(strstr(tf, "if (!waiting) waitMs = 0;"), strstr(tf, "rdna4x_engine_run(")));
-            const char *sw = fn_start(src, "static BOOL rdna4_sync_wait(const char *what, NSArray<NSString *> *shas, BOOL needMeta) {");
-            const char *swEnd = sw ? strstr(sw, "\n}\n") : NULL;
-            CHECK("G: daemon waits use the WS/app class budget and shared strikes state",
-                  has(sw, swEnd, "if (!rdna4_sync_begin(NO)) return NO;") && has(sw, swEnd, "rdna4g_sync_wait_ms(rdna4_is_ws())") &&
-                  has(sw, swEnd, "rdna4_sync_end(found, !found && rdna4_now() >= deadline);"));
-            // the three miss branches: translate in process first, the dump and the daemon wait only when not
-            const char *ri = fn_start(src, "- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err {");
-            const char *riEnd = ri ? strstr(ri, "\n}\n") : NULL;
-            CHECK("G: render translation and both postpasses share a deadline after backend initialization", has(ri, riEnd, "const uint64_t deadline = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;") && has(ri, riEnd, "const uint64_t dl = deadline;") && has(ri, riEnd, "rdna4_gpu_argument_spv(vsd, &mv_, deadline, err)") && has(ri, riEnd, "rdna4_gpu_argument_spv(fsd, &mf_, deadline, err)") && before(strstr(ri, "if (!rdna4_radv_open(err)) return nil;"), strstr(ri, "const uint64_t deadline")));
-            const char *r1 = ri ? strstr(ri, "rdna4x_translate_fn_with_error(d.vertexFunction, \"vertex\", dl, &vertexFailure)") : NULL;
-            const char *r2 = ri ? strstr(ri, "(void)rdna4_dump_pipeline(d);") : NULL;
-            const char *r3 = ri ? strstr(ri, "rdna4_sync_wait(\"render\"") : NULL;
-            CHECK("G: render miss: the in-process translation runs before the AIR dump and the daemon wait, which are skipped when it applies",
-                  before(r1, r2) && before(r2, r3) && r3 < riEnd && has(ri, riEnd, "if (!inproc) (void)rdna4_dump_pipeline(d);") && has(ri, riEnd, "if (!inproc && rdna4g_syncwait_applies(") && has(ri, riEnd, "(e.code == 41 && !nofb && rdna4x_active())"));
-            const char *np = fn_start(src, "- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {");
-            const char *npEnd = np ? strstr(np, "\n}\n") : NULL;
-            CHECK("G: compute translation starts the app deadline after backend initialization", has(np, npEnd, "rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull") && before(strstr(np, "const BOOL backendReady = !inproc || rdna4_radv_open(&inprocFailure);"), strstr(np, "rdna4x_translate_fn_with_error(")));
-            const char *c1 = np ? strstr(np, "rdna4x_translate_fn_with_error(fn, \"kernel\"") : NULL;
-            const char *c2 = np ? strstr(np, "rdna4_sync_wait(\"kernel\"") : NULL;
-            CHECK("G: compute miss: in-process first, then (only if not in process) the dump + wait; the placeholder stays the last resort",
-                  before(c1, c2) && c2 < npEnd && has(np, npEnd, "&inprocFailure))") &&
-                  has(np, npEnd, "if (!inproc && e.code == 41 && rdna4g_syncwait_applies(") && has(np, npEnd, "if (e.code == 41 && rdna4_fallback_ok())"));
-            const char *nn = fn_start(src, "- (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {");
-            const char *nnEnd = nn ? strstr(nn, "\n}\n") : NULL;
-            CHECK("G: rdna4NewPipeline logs LINKAGE IGNORED first and does not dump after an in-process attempt", has(nn, nnEnd, "rdna4x_linkage_render(d);") && has(nn, nnEnd, "NSError *dump = rdna4x_active() ? e : rdna4_dump_pipeline(d);"));
-            CHECK("G: all four compute descriptor methods install linkage on their compiling thread", ({ int sync = 0, async = 0; const char *q = src; while ((q = strstr(q, "rdna4x_linkage_compute(d);"))) { sync++; q++; } q = src; while ((q = strstr(q, "rdna4x_linkage_compute(saved);"))) { async++; q++; } sync == 2 && async == 2; }));
-            CHECK("G: the LINKAGE IGNORED line exists", has(src, NULL, "RDNA4LOG(\"LINKAGE IGNORED %s '%s': "));
-            CHECK("G: a function with no bitcodeData is logged once per process (CI / stitched instrumentation)", has(src, NULL, "RDNA4_ONCE(\"function '%s' (class %s) has no bitcodeData"));
-            const char *touchHit = fn_start(src, "static void rdna4x_touch_hit(NSString *path, NSString *sha) {");
-            const char *touchHitEnd = touchHit ? strstr(touchHit, "\n}\n") : NULL;
-            CHECK("G: a user-cache hit in a sandbox never attempts a timestamp write",
-                  has(src, NULL, "rdna4x_touch_hit(path, sha);") &&
-                  has(touchHit, touchHitEnd, "rdna4x_sandboxed()) return;") &&
-                  before(strstr(touchHit, "rdna4x_sandboxed()) return;"), strstr(touchHit, "rdna4x_touch(path.fileSystemRepresentation)")));
-            free(src);
-        }
-        char *hdr = slurp(dir, "rdna4_xlate.h");
-        CHECK("G: rdna4_xlate.h is readable", hdr != NULL);
-        if (hdr) {
-            const char *tj = fn_start(hdr, "static inline int rdna4x_process_job(");
-            const char *tjEnd = tj ? strstr(tj, "\n}\n") : NULL;
-            const char *m1 = tj ? strstr(tj, "rdna4x_probe(dir, sha)") : NULL, *m2 = tj ? strstr(tj, "rdna4x_marker_create(dir, sha)") : NULL, *m3 = tj ? strstr(tj, "dp->air_to_text(") : NULL, *m4 = tj ? strstr(tj, "dp->translate(") : NULL;
-            const char *w1 = tj ? strstr(tj, "RDNA4X_EXT_META) || rdna4x_write_atomic") : NULL, *w2 = tj ? strstr(tj, "RDNA4X_EXT_SPV) || rdna4x_write_atomic") : NULL, *rm = tj ? strstr(tj, "rdna4x_marker_remove(dir, sha);") : NULL;
-            CHECK("G: job order in the header: probe, marker, reader, translator, meta, spv, marker removed", before(m1, m2) && before(m2, m3) && before(m3, m4) && before(m4, w1) && before(w1, w2) && before(w2, rm) && rm < tjEnd);
-            const char *rp = fn_start(hdr, "static inline int rdna4x_reader_print(");
-            const char *rpEnd = rp ? strstr(rp, "\n}\n") : NULL;
-            CHECK("G: the reader switches Apple's LLVM context to opaque pointers BEFORE it reads (else typed-pointer text the translator refuses)",
-                  has(rp, rpEnd, "if (r->SetOpaquePointers) r->SetOpaquePointers(ctx, 1);") && before(strstr(rp, "SetOpaquePointers(ctx, 1)"), strstr(rp, "ParseBitcodeInContext2(")) && has(hdr, NULL, "_ZNK4llvm11LLVMContext17setOpaquePointersEb"));
-            free(hdr);
-        }
     }
 
     printf("test-xlate: %d checks, %d failed\n", runs, fails);

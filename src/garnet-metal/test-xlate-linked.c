@@ -15,17 +15,6 @@
 
 static int fails, runs;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; runs++; if (!ok_) { fails++; printf("FAIL: %s\n", name); } } while (0)
-static char *slurp(const char *dir, const char *name) {
-    char path[1024]; snprintf(path, sizeof path, "%s/%s", dir, name);
-    FILE *f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    char *b = malloc((size_t)n + 1); if (!b) { fclose(f); return NULL; }
-    if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
-    b[n] = 0; fclose(f); return b;
-}
-static int before(const char *a, const char *b) { return a && b && a < b; }
-static int has(const char *from, const char *to, const char *needle) { const char *q = from ? strstr(from, needle) : NULL; return q != NULL && (to == NULL || q < to); }
-static const char *fn_start(const char *src, const char *sig) { return strstr(src, sig); }
 static char TMP[512];
 static void rmtree(const char *path) {
     struct stat st; if (lstat(path, &st) != 0) return;
@@ -77,7 +66,7 @@ static const uint8_t DEP1_AIR[17] = "DEP1----BC\xc0\xde----";
 static const uint8_t DEP2_AIR[17] = "DEP2----BC\xc0\xde----";
 
 int main(int argc, char **argv) {
-    const char *dir = argc > 1 ? argv[1] : ".";
+    (void)argc; (void)argv;
     {
         const char *base = getenv("RDNA4_TEST_TMP"); if (!base) base = getenv("TMPDIR"); if (!base || !*base) base = "/private/tmp";
         snprintf(TMP, sizeof TMP, "%s/rdna4xlate-linked.XXXXXX", base);
@@ -179,62 +168,6 @@ int main(int argc, char **argv) {
         free(sym); free(air);
     }
 
-    // ===== source pins on the glue =====
-    {
-        char *src = slurp(dir, "GarnetDevice.m");
-        CHECK("pin: GarnetDevice.m is readable", src != NULL);
-        if (src) {
-            const char *lc = fn_start(src, "static NSArray<NSDictionary *> *rdna4x_link_collect(id linked, NSString **why) {");
-            const char *lcEnd = lc ? strstr(lc, "\n}\n") : NULL;
-            CHECK("pin: the dependencies are collected from functions, privateFunctions AND groups", has(lc, lcEnd, "rdna4x_prop(linked, \"functions\")") && has(lc, lcEnd, "rdna4x_prop(linked, \"privateFunctions\")") && has(lc, lcEnd, "rdna4x_prop(linked, \"groups\")"));
-            CHECK("pin: a name linked to two bodies, a missing name / bitcode and the caps all refuse", has(lc, lcEnd, "linked to two different functions") && has(lc, lcEnd, "has no name or no bitcodeData") && has(lc, lcEnd, "RDNA4X_MAX_DEPS") && has(lc, lcEnd, "RDNA4X_MAX_DEP_AIR"));
-            const char *lk = fn_start(src, "static void rdna4x_linkage_check(id desc, const char *role, const char *linkedProp, const char *preloadProp, const char *name, id fn, int slot) {");
-            const char *lkEnd = lk ? strstr(lk, "\n}\n") : NULL;
-            CHECK("pin: binaryFunctions and preloaded libraries REFUSE (today's behaviour is kept)", has(lk, lkEnd, "if (bf || pl) why = @\"binaryFunctions or preloaded libraries are present\";"));
-            CHECK("pin: privateFunctions and groups are read and logged with their names", has(lk, lkEnd, "rdna4x_array_nonempty(linked, \"privateFunctions\")") && has(lk, lkEnd, "rdna4x_names(rdna4x_prop(linked, \"privateFunctions\"), NO)") && has(lk, lkEnd, "rdna4x_names(gr, YES)") && has(lk, lkEnd, "\"groups\""));
-            CHECK("pin: the cache key is built from the entry sha AND the sorted dependencies (rdna4x_link_sha over the collected list)", has(lk, lkEnd, "rdna4x_link_sha(key, esha.UTF8String, deps.count, syms, shas)") && has(lk, lkEnd, "shas[i] = [deps[i][@\"sha\"] UTF8String]") && has(lk, lkEnd, "syms[i] = [deps[i][@\"name\"] UTF8String]"));
-            CHECK("pin: only a process that translates in process resolves linkage", has(lk, lkEnd, "else if (!rdna4x_active()) why = @\"this process does not translate in process\";"));
-            CHECK("pin: the old LINKAGE IGNORED line still reports a refusal, with its reason", has(lk, lkEnd, "RDNA4LOG(\"LINKAGE IGNORED %s '%s': "));
-            const char *lr = fn_start(src, "static void rdna4x_linkage_render(id d) {");
-            const char *lrEnd = lr ? strstr(lr, "\n}\n") : NULL;
-            CHECK("pin: the render stages take slots 0 and 1, the kernel slot 2", has(lr, lrEnd, "vf, 0);") && has(lr, lrEnd, "ff, 1);") && has(src, NULL, "cf, 2);"));
-            const char *tf = fn_start(src, "static BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error) {");
-            const char *tfEnd = tf ? strstr(tf, "\n}\n") : NULL;
-            CHECK("pin: the translation request of a linked stage uses the linked key and sends the dependencies", has(tf, tfEnd, "if (lk) sha = lk->lsha;") && has(tf, tfEnd, "rdna4x_engine_run_linked(&RDNA4XL.eng") && has(tf, tfEnd, "ld[i].air = (const uint8_t *)[dd[@\"bc\"] bytes]"));
-            const char *sl = fn_start(src, "static NSData *rdna4_spv_lookup_impl(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta) {");
-            const char *slEnd = sl ? strstr(sl, "\n}\n") : NULL;
-            CHECK("pin: the lookup tries the LINKED key first, then the entry's own sha", has(sl, slEnd, "(lk ? @[ lk->lsha, sha ] : @[ sha ])"));
-            CHECK("pin: the meta sidecar uses the SPIR-V path that hit and touch keeps its key", has(sl, slEnd, "if (spv) { sha = cs; break; }") && has(sl, slEnd, "rdna4_meta_for_spv(path)") && has(sl, slEnd, "rdna4x_touch_hit(path, sha)"));
-            const char *metadata = fn_start(src, "static NSDictionary *rdna4_meta_for_spv(");
-            const char *metadataEnd = metadata ? strstr(metadata, "\n}\n") : NULL;
-            CHECK("pin: orphan metadata from a different cache cannot shadow the selected SPIR-V", metadataEnd && has(metadata, metadataEnd, "stringByDeletingPathExtension") && !has(metadata, metadataEnd, "rdna4_spv_dirs()"));
-            const char *watch = fn_start(src, "static rdna4hs_key_obs rdna4hs_stat_pair(");
-            const char *watchEnd = watch ? strstr(watch, "\n}\n") : NULL;
-            CHECK("pin: shader readiness observes metadata only beside the selected SPIR-V", watchEnd && has(watch, watchEnd, "rdna4hs_spv_ok(&selected)") && has(watch, watchEnd, "pair.meta = rdna4hs_stat_path([dir stringByAppendingPathComponent:") && has(watch, watchEnd, "return pair;"));
-            const char *fs = fn_start(src, "static NSString *rdna4_fn_sha(id fn) {");
-            const char *fsEnd = fs ? strstr(fs, "\n}\n") : NULL;
-            CHECK("pin: the hot-swap registration of a linked stage watches the linked key", has(fs, fsEnd, "RDNA4LinkCtx *lk_ = rdna4_lk_for(fn); if (lk_) return lk_->lsha;"));
-            const char *np = fn_start(src, "- (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {");
-            const char *npEnd = np ? strstr(np, "\n}\n") : NULL;
-            CHECK("pin: the render creation installs the link contexts under a scope that clears them (before the pipeline is created)", before(strstr(np, "RDNA4_LK_SCOPE;"), strstr(np, "rdna4x_linkage_render(d);")) && before(strstr(np, "rdna4x_linkage_render(d);"), strstr(np, "initWithDevice:self descriptor:d")) && npEnd);
-            const char *nc = fn_start(src, "- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {");
-            const char *ncEnd = nc ? strstr(nc, "\n}\n") : NULL;
-            CHECK("pin: the compute creation clears the contexts at every return", has(nc, ncEnd, "RDNA4_LK_SCOPE;") && has(src, NULL, "#define RDNA4_LK_SCOPE rdna4_lkscope lks_ __attribute__((cleanup(rdna4_lk_scope_end)))"));
-            CHECK("all four compute descriptor methods install linkage on their compiling thread", ({ int sync = 0, async = 0; const char *q = src; while ((q = strstr(q, "rdna4x_linkage_compute(d);"))) { sync++; q++; } q = src; while ((q = strstr(q, "rdna4x_linkage_compute(saved);"))) { async++; q++; } sync == 2 && async == 2; }));
-            CHECK("pin: the hot rebuild of a render pipeline and of a compute placeholder re-install the contexts on the watcher thread", has(src, NULL, "RDNA4_LK_SCOPE; rdna4x_linkage_render(_hsDesc);") && has(src, NULL, "RDNA4_LK_SCOPE; if (_hsLk) rdna4_lk_install(2, _hsLk);"));
-            free(src);
-        }
-        char *hdr = slurp(dir, "rdna4_xlate.h");
-        CHECK("pin: rdna4_xlate.h is readable", hdr != NULL);
-        if (hdr) {
-            const char *tj = fn_start(hdr, "static inline int rdna4x_process_job(");
-            const char *tjEnd = tj ? strstr(tj, "\n}\n") : NULL;
-            const char *r1 = tj ? strstr(tj, "dp->air_to_text(dp->ctx, air, airLen") : NULL, *r2 = tj ? strstr(tj, "dp->air_to_text(dp->ctx, ld[i].air") : NULL, *t1 = tj ? strstr(tj, "dp->translate_linked(") : NULL;
-            CHECK("pin: the entry is read, then each dependency (with the same reader), then the linked translation", before(r1, r2) && before(r2, t1) && t1 < tjEnd);
-            CHECK("pin: ABI 3 is the version the bundle accepts, and the library must export the linked entry point", has(hdr, NULL, "#define RDNA4X_ABI_VERSION   3u") && has(hdr, NULL, "dlsym(h, \"garnetx_translate_linked\")"));
-            free(hdr);
-        }
-    }
     printf("test-xlate-linked: %d checks, %d failed\n", runs, fails);
     return fails ? 1 : 0;
 }

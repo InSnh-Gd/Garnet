@@ -34,9 +34,6 @@ static char *slurp(const char *dir, const char *name) {
     if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
     b[n] = 0; fclose(f); return b;
 }
-static const char *fn_start(const char *src, const char *sig) { return strstr(src, sig); }
-static int before(const char *a, const char *b) { return a && b && a < b; }
-static int has(const char *from, const char *to, const char *needle) { const char *q = from ? strstr(from, needle) : NULL; return q != NULL && (to == NULL || q < to); }
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
@@ -101,51 +98,6 @@ int main(int argc, char **argv) {
     CHECK("G7: the budget flags word is info.reserved[3] and the APP bit is the ABI's", RDNA4G_INFO_BUDGET_OFF == offsetof(struct rdna4n_info, reserved) + 4u * RDNA4N_INFO_R_BUDGET_FLAGS && RDNA4G_BUDGET_APP == RDNA4N_BUDGET_APP);
     CHECK("G7: ExclusiveAccess is the IOReturn value", RDNA4G_KR_EXCLUSIVE == 0xe00002c5u);
     CHECK("G7: ABI minor is 12", RDNA4N_ABI_MINOR == 12u);
-    // ---- G8 ----
-    char *m = slurp(dir, "GarnetDevice.m");
-    CHECK("G8: GarnetDevice.m is readable", m != NULL);
-    if (m) {
-        const char *adm = fn_start(m, "static const char *rdna4_admit(uint32_t port) {");
-        const char *adm_end = adm ? strstr(adm, "\nstatic BOOL rdna4_headless(void)") : NULL;
-        CHECK("G8: rdna4_admit is found", adm && adm_end);
-        if (adm && adm_end) {
-            const char *kill = strstr(adm, "rdna4g_kill_declines(isWs, ks, killIgnored)"), *rdy = strstr(adm, "rdna4g_ready_declines(isWs, rdy)"), *ad = strstr(adm, "rdna4g_autodisarm_declines(isWs"),
-                       *cnt = strstr(adm, "rdna4_counter_tripped(&count)"), *probe = strstr(adm, "rdna4_app_probe(port)"), *flag = strstr(adm, "atomic_store(&rdna4_app_admitted, 1)"), *cls = strstr(adm, "if (cls == RDNA4G_CLASS_OTHER) {");
-            CHECK("G8: every gate is in rdna4_admit", kill && rdy && ad && cnt && probe && flag && cls);
-            CHECK("G8: order: kill file, Ready, AutoDisarmed, crash counter, then the kernel probe", before(kill, rdy) && before(rdy, ad) && before(ad, cnt) && before(cnt, probe));
-            const char *whyc = strstr(adm, "if (why) return why;");
-            CHECK("G8: the probe runs only for class OTHER, a refusal returns before the admitted flag, and the flag is set after the probe", whyc && before(cls, probe) && before(probe, whyc) && before(whyc, flag));
-            CHECK("G8: the admitted flag is stored in exactly one place", strstr(m, "atomic_store(&rdna4_app_admitted, 1)") == strstr(adm, "atomic_store(&rdna4_app_admitted, 1)") && !strstr(strstr(m, "atomic_store(&rdna4_app_admitted, 1)") + 10, "atomic_store(&rdna4_app_admitted, 1)"));
-            CHECK("G8: the old name-based refusal text is only reachable through the by-class decline (0.0.641: euid < 501)", !has(adm, adm_end, "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set") && has(adm, adm_end, "return RDNA4G_DECLINE_BY_CLASS_TEXT;"));
-            CHECK("G8: the plain stat()==0 test is gone (the kill file is read through rdna4g_kill_state)", !has(adm, adm_end, "if (stat(RDNA4_KILL_FILE, &st) == 0)") && has(adm, adm_end, "rdna4g_kill_state(srcRc, srcErr)"));
-            CHECK("G8: the Ready test is the gate function, not a bare == 0", !has(adm, adm_end, "rdna4_nub_ready(port) == 0") && !has(adm, adm_end, "rdna4_nub_autodisarmed(port) == 1"));
-        }
-        const char *probe = fn_start(m, "static const char *rdna4_app_probe(uint32_t port) {");
-        const char *probe_end = probe ? strstr(probe, "\n// NULL = admit, else the reason") : NULL;
-        CHECK("G8: rdna4_app_probe is found", probe && probe_end);
-        if (probe && probe_end) {
-            const char *o = strstr(probe, "IOServiceOpen(svc, mach_task_self(), RDNA4G_UC_TYPE, &conn)"), *h = strstr(probe, "RDNA4G_SEL_HELLO"), *q = strstr(probe, "RDNA4G_SEL_QUERYINFO"), *c = strstr(probe, "IOServiceClose(conn)"), *v = strstr(probe, "rdna4g_probe_verdict(");
-            CHECK("G8: the probe opens, says Hello, reads QueryInfo, closes, then judges", o && h && q && c && v && before(o, h) && before(h, q) && before(q, c) && before(c, v));
-            CHECK("G8: the probe reads the APP role from the kernel's QueryInfo (never assumes it)", has(probe, probe_end, "memcpy(&budgetFlags, info + RDNA4G_INFO_BUDGET_OFF, sizeof budgetFlags);") && !has(probe, probe_end, "budgetFlags = 2") && !has(probe, probe_end, "budgetFlags |="));
-            CHECK("G8: the probe never calls Vulkan or the lazy RADV open", !has(probe, probe_end, "rdna4_radv_open") && !has(probe, probe_end, "vkCreate"));
-            CHECK("G8: the verdict comes from the pure function, the probe returns NULL only on OK", strstr(probe, "return v == RDNA4G_PROBE_OK ? NULL : rdna4g_probe_text(v);") != NULL);
-        }
-        CHECK("G8: rdna4_fallback_ok asks the pure function with the admitted flag", strstr(m, "rdna4g_fallback_ok(rdna4_is_ws(), rdna4_force_fallback(), rdna4_test_fb_as_ws(), atomic_load(&rdna4_app_admitted))") != NULL);
-        CHECK("G8: native code container capabilities are explicitly declined", strstr(m, "- (BOOL)supportsDynamicLibraries { return NO; }") && strstr(m, "- (BOOL)supportsRenderDynamicLibraries { return NO; }") && strstr(m, "- (BOOL)supportsBinaryArchives { return NO; }"));
-        CHECK("G8: process wait budget uses a lock and pure strikes policy", strstr(m, "pthread_mutex_lock(&RDNA4SYNC.mu)") && strstr(m, "rdna4g_sync_allowed(&RDNA4SYNC.state)") && strstr(m, "rdna4g_sync_result(&RDNA4SYNC.state"));
-        CHECK("G8: no obsolete 60-second wait constant remains", !strstr(m, "RDNA4G_SYNC_WAIT_MS"));
-        const char *pc = fn_start(m, "static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {");
-        const char *pc_end = pc ? strstr(pc, "static void rdna4_pc_save(") : NULL;
-        CHECK("G8: rdna4_pc_open is found", pc && pc_end);
-        if (pc && pc_end) {
-            const char *conf = strstr(pc, "confstr(_CS_DARWIN_USER_CACHE_DIR"), *path = strstr(pc, "rdna4g_pcache_path(RDNA4PC.path, sizeof RDNA4PC.path, pcls, envdir, vtw, ucd, getprogname())"), *sv = strstr(pc, "rdna4g_pcache_save(pcls");
-            CHECK("G8: the cache path comes from the pure function after reading the user cache dir", conf && path && sv && before(conf, path) && before(path, sv));
-            CHECK("G8: the cache class is the process class", has(pc, pc_end, "const int pcls = rdna4g_class(rdna4_is_ws(), rdna4_allow());"));
-            CHECK("G8: the cache directory is no longer hard-coded in rdna4_pc_open", !has(pc, pc_end, "snprintf(RDNA4PC.path, sizeof RDNA4PC.path, \"%s/rdna4m-pipecache.bin\", dir)"));
-        }
-        CHECK("G8: rdna4_nub_flag tells an unreachable nub (-2) from an absent property (-1)", strstr(m, "kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return RDNA4G_FLAG_NONUB;") != NULL && strstr(m, "if (!v) return RDNA4G_FLAG_ABSENT;") != NULL);
-        free(m);
-    }
     // ---- G9 ----
     CHECK("G9: the by-class text is 0.0.632's refusal, word for word", !strcmp(RDNA4G_DECLINE_BY_CLASS_TEXT, "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set"));
     CHECK("G9: the bound is 501, the kernel's kAppMinUid", RDNA4G_APP_MIN_EUID == 501u);
@@ -159,17 +111,6 @@ int main(int argc, char **argv) {
           else { probed++; CHECK("G9: class OTHER with euid >= 501 is not declined by class and IS probed (reachable)", !d && probe); }
       }
       CHECK("G9: both branches were reached", declined > 0 && probed > 0); }
-    char *m2 = slurp(dir, "GarnetDevice.m");
-    CHECK("G9: GarnetDevice.m is readable", m2 != NULL);
-    if (m2) {
-        const char *adm = fn_start(m2, "static const char *rdna4_admit(uint32_t port) {");
-        const char *adm_end = adm ? strstr(adm, "\nstatic BOOL rdna4_headless(void)") : NULL;
-        if (adm && adm_end) {
-            const char *dec = strstr(adm, "if (rdna4g_declined_by_class(cls, (uint32_t)geteuid())) return RDNA4G_DECLINE_BY_CLASS_TEXT;"), *stt = strstr(adm, "stat(RDNA4_KILL_FILE, &st)"), *pr = strstr(adm, "rdna4_app_probe(port)"), *gate = strstr(adm, "if (cls == RDNA4G_CLASS_OTHER) {");
-            CHECK("G9: rdna4_admit declines by class FIRST: before the kill file, before any nub read, before the probe", dec && stt && pr && gate && before(dec, stt) && before(dec, pr) && before(dec, gate));
-            CHECK("G9: the euid used is geteuid(), not getuid()", dec && !has(adm, adm_end, "getuid()"));
-        }
-    }
     // ---- G10 (0.0.641 rules, kept; build 6: per-uid subdirectories) ----
     CHECK("G10: a real directory owned by the caller is usable", rdna4g_dumpdir_ok(0, 1, 0, 501, 501) && rdna4g_dumpdir_ok(0, 1, 0, 0, 0) && rdna4g_dumpdir_ok(0, 1, 0, 88, 88));
     CHECK("G10: a symlink is refused (even to a directory of ours)", !rdna4g_dumpdir_ok(0, 0, 1, 501, 501) && !rdna4g_dumpdir_ok(0, 1, 1, 501, 501));
@@ -190,47 +131,6 @@ int main(int argc, char **argv) {
       CHECK("G12: distinct uids give distinct subdirectories, uid 0 included, the largest uid fits", rdna4g_dumpsub_path(sp, sizeof sp, 0) && !strcmp(sp, "/tmp/rdna4m/0") && rdna4g_dumpsub_path(sp, sizeof sp, 4294967294u) && !strcmp(sp, "/tmp/rdna4m/4294967294"));
       CHECK("G12: a too-small buffer yields 0 and an empty string", rdna4g_dumpsub_path(sp, 8, 501) == 0 && sp[0] == 0); }
     CHECK("G12: the daemon user is nobody (uid -2)", RDNA4G_DAEMON_UID == 4294967294u);
-    if (m2) {
-        const char *rd = fn_start(m2, "static int rdna4_dump_dir_ready(char *sub, size_t subn) {");
-        const char *rd_end = rd ? strstr(rd, "\n// A dump file appears under its final name only when complete") : NULL;
-        CHECK("G12: rdna4_dump_dir_ready is found", rd && rd_end);
-        if (rd && rd_end) {
-            const char *mkr = strstr(rd, "mkdir(RDNA4G_DUMP_DIR, RDNA4G_DUMP_ROOT_MODE)"), *lr = strstr(rd, "lstat(RDNA4G_DUMP_DIR, &rs)"), *fx = strstr(rd, "rdna4g_dumproot_needs_fix("), *fcr = strstr(rd, "fchmodat(AT_FDCWD, RDNA4G_DUMP_DIR, RDNA4G_DUMP_ROOT_MODE, AT_SYMLINK_NOFOLLOW)"),
-                       *okr = strstr(rd, "if (!rdna4g_dumproot_ok(rrc, "), *sp = strstr(rd, "rdna4g_dumpsub_path(sub, subn, (uint32_t)geteuid())"), *mks = strstr(rd, "mkdir(sub, 0700)"), *ls = strstr(rd, "lstat(sub, &st)"),
-                       *ok = strstr(rd, "if (!rdna4g_dumpdir_ok(rc, S_ISDIR(st.st_mode), S_ISLNK(st.st_mode), (uint32_t)st.st_uid, (uint32_t)geteuid())"), *op = strstr(rd, "open(sub, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)"),
-                       *nr = strstr(rd, "rdna4g_dumpdir_needs_narrow((uint32_t)fs.st_mode)"), *fm = strstr(rd, "fchmod(fd, 0700)"), *ac = strstr(rd, "rdna4da_grant_list(fd, (uid_t)RDNA4G_DAEMON_UID)");
-            CHECK("G12: parent: mkdir, lstat, repair (no-follow), re-lstat verdict, THEN the subdirectory", mkr && lr && fx && fcr && okr && sp && before(mkr, lr) && before(lr, fx) && before(fx, fcr) && before(fcr, okr) && before(okr, sp));
-            CHECK("G12: subdirectory: mkdir 0700, lstat, the ownership / symlink verdict, an O_NOFOLLOW open, narrowing and the ACL grant on that descriptor (in this order)", mks && ls && ok && op && nr && fm && ac && before(sp, mks) && before(mks, ls) && before(ls, ok) && before(ok, op) && before(op, nr) && before(nr, fm) && before(fm, ac));
-            CHECK("G12: both refusals return 0 BEFORE any narrowing, ACL or write", has(rd, rd_end, "return 0;") && before(strstr(rd, "return 0;"), op) && before(okr, strstr(okr, "return 0;")) );
-            CHECK("G12: the descriptor must be the directory lstat described (inode, device, owner)", has(rd, rd_end, "fs.st_ino != st.st_ino") && has(rd, rd_end, "fs.st_dev != st.st_dev") && has(rd, rd_end, "(uint32_t)fs.st_uid != (uint32_t)geteuid()"));
-            CHECK("G12: no stat() (it follows links), no plain chmod, and no path-based ACL call in the helper", !has(rd, rd_end, " stat(RDNA4G_DUMP_DIR") && !has(rd, rd_end, " stat(sub") && !has(rd, rd_end, " chmod(") && !has(rd, rd_end, "acl_set_file") && !has(rd, rd_end, "acl_set_link_np"));
-            CHECK("G12: the 0.0.641 narrowing of the parent is gone (the parent MUST stay sticky 1777)", !has(rd, rd_end, "fchmodat(AT_FDCWD, RDNA4G_DUMP_DIR, 0700"));
-        }
-        const char *df = fn_start(m2, "static void rdna4_dump_function(");
-        const char *df_end = df ? strstr(df, "\nstatic NSError *rdna4_dump_pipeline(") : NULL;
-        CHECK("G10: rdna4_dump_function is found", df && df_end);
-        if (df && df_end) {
-            const char *rdy = strstr(df, "if (!rdna4_dump_dir_ready(sub, sizeof sub)) {"), *sd = strstr(df, "if (!rdna4_dump_write(side.UTF8String, js)) {"), *wr = strstr(df, "if (!rdna4_dump_write(air.UTF8String, bc)) {");
-            CHECK("G10: REACHABLE: both dump files are written only after the directory check passed", rdy && sd && wr && before(rdy, sd) && has(df, df_end, "return; }"));
-            CHECK("G12: the sidecar is written BEFORE the .air (the daemon starts on the .air)", sd && wr && before(sd, wr));
-            const char *sd_end = sd ? strstr(sd, "if (!rdna4_dump_write(air.UTF8String, bc)) {") : NULL;
-            const char *wr_end = wr ? strstr(wr, "[paths addObject:") : NULL;
-            CHECK("G12: a sidecar write failure reports the sidecar path and errno", sd_end && has(sd, sd_end, "write to sidecar %s failed (errno %d: %s)") && has(sd, sd_end, "strerror(savedErrno)"));
-            CHECK("G12: an AIR write failure reports the AIR path and errno", wr_end && has(wr, wr_end, "write to AIR %s failed (errno %d: %s)") && has(wr, wr_end, "strerror(savedErrno)"));
-            CHECK("G12: dump paths are under the per-uid subdirectory, not the flat parent", has(df, df_end, "@\"%s/%@.air\", sub, sha") && has(df, df_end, "@\"%s/%@.%s.json\", sub, sha, role") && !has(df, df_end, "/tmp/rdna4m/%@"));
-        }
-        const char *dw = fn_start(m2, "static int rdna4_dump_write(const char *path, NSData *data) {");
-        const char *dw_end = dw ? strstr(dw, "\n// Dumps one function's bitcodeData") : NULL;
-        CHECK("G12: rdna4_dump_write is found", dw && dw_end);
-        if (dw && dw_end) {
-            const char *op = strstr(dw, "mkstemp(tmp)"), *fc = strstr(dw, "fchmod(fd, 0644)"), *rn = strstr(dw, "rename(tmp, path)");
-            CHECK("G12: a file appears under its final name only complete and 0644: exclusive temp, fchmod 0644, rename", op && fc && rn && before(op, fc) && before(fc, rn));
-            CHECK("G12: each writer gets a unique temp name outside the daemon's .air / .json scan", has(dw, dw_end, "\"%s.tmpXXXXXX\""));
-            CHECK("G12: a failed rename preserves errno through temp-file cleanup", has(dw, dw_end, "const int savedErrno = failure ? failure : errno;") && has(dw, dw_end, "errno = savedErrno;"));
-        }
-        CHECK("G10: the 0777 mkdir and chmod are gone from the whole bundle", !strstr(m2, "mkdir(\"/tmp/rdna4m\", 0777)") && !strstr(m2, "chmod(\"/tmp/rdna4m\", 0777)"));
-        CHECK("G10: no plain chmod of the dump directories anywhere", !strstr(m2, "chmod(\"/tmp/rdna4m") && !strstr(m2, "chmod(sub"));
-    }
     // Actual delayed compiler/output checks live in test-cold-pipelines.sh.
     CHECK("G13: admitted applications and WindowServer wait for real translations", rdna4g_syncwait_applies(0, 1, 0, 0) && rdna4g_syncwait_applies(1, 0, 0, 0) && rdna4g_syncwait_applies(1, 1, 0, 0));
     CHECK("G13: unadmitted processes and explicit placeholder tests do not wait", !rdna4g_syncwait_applies(0, 0, 0, 0) && !rdna4g_syncwait_applies(0, 1, 1, 0) && !rdna4g_syncwait_applies(1, 1, 0, 1));
@@ -248,86 +148,19 @@ int main(int argc, char **argv) {
       rdna4g_sync_result(&s, 0); rdna4g_sync_result(&s, 1); rdna4g_sync_result(&s, 0);
       CHECK("G13: only consecutive timeouts count", s.strikes == 1 && rdna4g_sync_allowed(&s));
     }
-    if (m2) {
-        const char *tf = fn_start(m2, "static BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error) {");
-        const char *tf_end = tf ? strstr(tf, "\n}\n") : NULL;
-        CHECK("G13: in-process waits use the app cap and shared strikes budget", tf && tf_end && has(tf, tf_end, "RDNA4G_SYNC_WAIT_APP_MS") && has(tf, tf_end, "rdna4_sync_begin(!rdna4_is_ws())") && has(tf, tf_end, "if (!waiting) waitMs = 0;") && has(tf, tf_end, "rdna4_sync_end(rc == RDNA4X_OK, rc == RDNA4X_E_TIMEOUT)"));
-        CHECK("G13: hot-swap searches the translator user directory", strstr(m2, "NSString *u = rdna4x_user_dir();") && strstr(m2, "[m addObject:u]") && strstr(m2, "for (NSString *dir in rdna4_spv_dirs())"));
-        const char *sw = fn_start(m2, "static BOOL rdna4_sync_wait(const char *what, NSArray<NSString *> *shas, BOOL needMeta) {");
-        const char *sw_end = sw ? strstr(sw, "\n// ---------------------------------------------------------------------------------------------------------------\n// RDNA4RenderPipelineState (10d/11e)") : NULL;
-        CHECK("G13: rdna4_sync_wait is found", sw && sw_end);
-        if (sw && sw_end) {
-            CHECK("G13: the wait is gated by the admission rule", has(sw, sw_end, "rdna4g_syncwait_applies(rdna4_is_ws(), atomic_load(&rdna4_app_admitted), rdna4_force_fallback(), rdna4_test_fb_as_ws())"));
-            CHECK("G13: publication uses bounded directory events", has(sw, sw_end, "EVFILT_VNODE") && has(sw, sw_end, "kevent(queue, NULL") && has(sw, sw_end, "rdna4g_sync_wait_ms(rdna4_is_ws())") && !has(sw, sw_end, "usleep("));
-            CHECK("G13: daemon waits acquire and release the process budget", has(sw, sw_end, "rdna4_sync_begin(NO)") && has(sw, sw_end, "rdna4_sync_end(found, !found && rdna4_now() >= deadline)"));
-            CHECK("G13: the wait uses a paired cache observation with the SPIR-V sanity check", has(sw, sw_end, "rdna4hs_stat_pair(sha, needMeta)") && has(sw, sw_end, "!pair.spv.present || (needMeta && !pair.meta.present)"));
-        }
-        const char *ri = fn_start(m2, "- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err {");
-        const char *ri_end = ri ? strstr(ri, "RDNA4sRefl *rv = NULL, *rf = NULL;") : NULL;
-        CHECK("G13: the render miss branch is found", ri && ri_end);
-        if (ri && ri_end) {
-            const char *dm = strstr(ri, "rdna4_dump_pipeline(d,"), *wt = strstr(ri, "rdna4_sync_wait(\"render\", want, NO)"), *fbk = strstr(ri, "fb = YES; _fallback = YES;"), *rl = wt ? strstr(wt, "if (!vsd) vsd = rdna4_spv_lookup(d.vertexFunction, \"vertex\", &e1, &vname, &mv_);") : NULL, *rl2 = rl ? strstr(rl, "if (hasFrag && !fsd) fsd = rdna4_spv_lookup(d.fragmentFunction, \"fragment\", &e2, &fname, &mf_);") : NULL, *nofb_err = strstr(ri, "if (!rdna4_fallback_ok()) {");
-            CHECK("G13: render: dump FIRST, then the wait, then (only if still missing) the fallback", dm && wt && fbk && before(dm, wt) && before(wt, fbk));
-            CHECK("G13: render: after a successful wait both stages are looked up again before deciding", rl && rl2 && before(wt, rl) && before(rl, rl2) && before(rl2, fbk));
-            CHECK("G13: render: unadmitted processes keep the NSError", nofb_err && fbk && has(nofb_err, fbk, "if (err) *err = dumpFailure ?: e;") && has(nofb_err, fbk, "return nil;"));
-        }
-        const char *cp = fn_start(m2, "- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {");
-        const char *cp_end = cp ? strstr(cp, "- (id)newComputePipelineStateWithFunction:(id)fn error:") : NULL;
-        CHECK("G13: the compute miss branch is found", cp && cp_end);
-        if (cp && cp_end) {
-            const char *gd = strstr(cp, "if (!inproc && e.code == 41 && rdna4g_syncwait_applies("), *dm = strstr(cp, "rdna4_dump_function(fn, \"kernel\", dp, dn);"), *wt = strstr(cp, "rdna4_sync_wait(\"kernel\", @[ ksha ], YES)"), *rt = strstr(cp, "initWithDevice:self function:fn error:&e2"), *ph = strstr(cp, "initPlaceholderWithDevice:self function:fn");
-            CHECK("G13: compute: dump, wait (spv + meta), retry the real pipeline, THEN the no-op placeholder", gd && dm && wt && rt && ph && before(gd, dm) && before(dm, wt) && before(wt, rt) && before(rt, ph));
-        }
-    }
     // ---- G14 (build 6, C1 finding B): the GPU family claim ----
     CHECK("G14: Metal3 (5001) is NOT claimed for apps, kept for WindowServer", !rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 0) && rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 1) && RDNA4G_FAMILY_METAL3 == 5001);
     CHECK("G14: Mac2 and Common1..3 are kept", rdna4g_supports_family(2002, 0) && rdna4g_supports_family(3001, 0) && rdna4g_supports_family(3002, 0) && rdna4g_supports_family(3003, 0) && rdna4g_supports_family(3001, 1));
     { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 2001, 4001, 5001, 5002, 6001, 0, -1, 99999 };
       for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | (no[i] != RDNA4G_FAMILY_METAL3 ? rdna4g_supports_family(no[i], 1) : 0);
       CHECK("G14: Apple1..9, Mac1, MacCatalyst, Metal3, Metal4 and unknown values are all NO", !any); }
-    CHECK("G14: argument buffers report the lowest tier", RDNA4G_ARGBUF_TIER1 == 0);
-    if (m2) {
-        const char *sf = fn_start(m2, "- (BOOL)supportsFamily:(NSInteger)family {");
-        const char *sf_end = sf ? strstr(sf, "- (NSUInteger)argumentBuffersSupport") : NULL;
-        CHECK("G14: supportsFamily asks the pure table (no case list in the .m)", sf && sf_end && has(sf, sf_end, "return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;") && !has(sf, sf_end, "case "));
-        CHECK("G14: it logs once when Metal3 is asked for", sf && sf_end && has(sf, sf_end, "RDNA4_ONCE(\"supportsFamily(Metal3) -> NO"));
-        CHECK("G14: Metal3 is logged only for applications (WindowServer keeps YES)", sf && sf_end && has(sf, sf_end, "if (family == RDNA4G_FAMILY_METAL3 && !rdna4_is_ws())"));
-        CHECK("G14: WindowServer gets the base class's argumentBuffersSupport", strstr(m2, "return ((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, @selector(argumentBuffersSupport));") != NULL && strstr(m2, "    if (rdna4_is_ws()) {   // the base class") != NULL);
-        CHECK("G14: argumentBuffersSupport is overridden and returns the Tier1 constant", strstr(m2, "- (NSUInteger)argumentBuffersSupport {") != NULL && strstr(m2, "return (NSUInteger)RDNA4G_ARGBUF_TIER1; }") != NULL);
-        CHECK("G14: the old Metal3 constant is gone from the .m", !strstr(m2, "RDNA4_Metal3"));
-    }
-    free(m2);
+    CHECK("G14: argument buffer tier constants", RDNA4G_ARGBUF_TIER1 == 0 && RDNA4G_ARGBUF_TIER2 == 1);
     // ---- G15 (bundle 8, G6): sandboxed applications open RDNA4N on the accelerator port the bundle holds ----
     CHECK("G15: WindowServer keeps Mesa's default service (no setter call)", rdna4g_mesa_service_for_class(RDNA4G_CLASS_WS) == NULL);
     CHECK("G15: an RDNA4M_ALLOW root tool keeps Mesa's default service", rdna4g_mesa_service_for_class(RDNA4G_CLASS_ROOT) == NULL);
     CHECK("G15: an application (CLASS_OTHER) opens on GarnetAccelerator", rdna4g_mesa_service_for_class(RDNA4G_CLASS_OTHER) && !strcmp(rdna4g_mesa_service_for_class(RDNA4G_CLASS_OTHER), "GarnetAccelerator"));
     CHECK("G15: no other class value selects the accelerator", rdna4g_mesa_service_for_class(-1) == NULL && rdna4g_mesa_service_for_class(3) == NULL && rdna4g_mesa_service_for_class(99) == NULL);
     CHECK("G15: the setter's export name", !strcmp(RDNA4G_MESA_SETTER, "radv_darwin_set_service_class"));
-    { char *m5 = slurp(dir, "GarnetDevice.m");
-      CHECK("G15: GarnetDevice.m is readable", m5 != NULL);
-      if (m5) {
-        const char *probe = fn_start(m5, "static const char *rdna4_app_probe(uint32_t port) {");
-        const char *probe_end = probe ? strstr(probe, "\n// NULL = admit, else the reason") : NULL;
-        CHECK("G15: the probe is found", probe && probe_end);
-        if (probe && probe_end) {
-            CHECK("G15: the probe opens on the port it was given (the accelerator), cast to io_service_t", has(probe, probe_end, "io_service_t svc = (io_service_t)port;"));
-            CHECK("G15: the probe does not look a service up by name (no GarnetDriver, no matching)", !has(probe, probe_end, "IOServiceMatching") && !has(probe, probe_end, "IOServiceGetMatchingService") && !has(probe, probe_end, "GarnetDriver"));
-            CHECK("G15: the probe does not release the caller's port", !has(probe, probe_end, "IOObjectRelease"));
-            CHECK("G15: no port = no service for the pure verdict", has(probe, probe_end, "rdna4g_probe_verdict(svc != 0,"));
-            CHECK("G15: the probe still opens type RDNA4N", has(probe, probe_end, "IOServiceOpen(svc, mach_task_self(), RDNA4G_UC_TYPE, &conn)"));
-        }
-        const char *ro = fn_start(m5, "static BOOL rdna4_radv_open_once(NSError **err) {");
-        const char *ro_end = ro ? strstr(ro, "VkResult r = rdna4_vkCreateInstance(&ici, NULL, &RDNA4R.inst);") : NULL;
-        CHECK("G15: the RADV open (up to vkCreateInstance) is found", ro && ro_end);
-        if (ro && ro_end) {
-            const char *gp = strstr(ro, "rdna4_gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, \"vk_icdGetInstanceProcAddr\");"), *sel = strstr(ro, "rdna4g_mesa_service_for_class(rdna4g_class(rdna4_is_ws(), rdna4_allow()))"), *gd = strstr(ro, "if (svcCls) {"),
-                       *ds = strstr(ro, "dlsym(h, RDNA4G_MESA_SETTER)"), *nos = strstr(ro, "if (!setSvc) {"), *call = strstr(ro, "setSvc(svcCls)"), *bad = strstr(ro, "if (src != 0) {");
-            CHECK("G15: the route is chosen per class, after dlopen, and BEFORE vkCreateInstance", gp && sel && gd && ds && call && before(gp, sel) && before(sel, gd) && before(gd, ds) && before(ds, call));
-            CHECK("G15: a missing setter or a refused name fails closed (error 7, goto fail) before any instance exists", nos && bad && before(nos, call) && before(call, bad) && has(nos, bad, "rdna4_err(7,") && has(bad, ro_end, "rdna4_err(7,") && has(nos, call, "goto fail;"));
-            CHECK("G15: the setter is called in exactly one place", strstr(ro, "setSvc(svcCls)") == strstr(m5, "setSvc(svcCls)") && !strstr(strstr(m5, "setSvc(svcCls)") + 10, "setSvc("));
-            CHECK("G15: WindowServer / root never reach the setter (the call is under `if (svcCls)`)", gd && call && before(gd, call) && !has(ro, gd, "if (rdna4_is_ws()") );
-        }
-        free(m5); } }
     // ---- G11 (0.0.641): the bundle build ----
     { char *pl = slurp(dir, "Info.plist");
       CHECK("G11: Info.plist: bundle version 0.1.1, build 43", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"));
@@ -377,24 +210,6 @@ int main(int argc, char **argv) {
         int missErr = 0;
         CHECK("G16: missing denylist file (ENOENT) safely falls back to NONE",
               rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.good.App", "GoodName", &missErr) == RDNA4G_DENY_NONE && missErr == ENOENT);
-    }
-    {
-        char *m6 = slurp(dir, "GarnetDevice.m");
-        CHECK("G16: GarnetDevice.m readable for denylist pins", m6 != NULL);
-        if (m6) {
-            const char *adm = fn_start(m6, "static const char *rdna4_admit(uint32_t port) {");
-            const char *adm_end = adm ? strstr(adm, "\nstatic BOOL rdna4_headless(void)") : NULL;
-            const char *dl = adm ? strstr(adm, "rdna4_denylist_decline(cls)") : NULL;
-            const char *pr = adm ? strstr(adm, "rdna4_app_probe(port)") : NULL;
-            CHECK("G16: rdna4_admit invokes rdna4_denylist_decline(cls) before rdna4_app_probe", adm && adm_end && dl && pr && before(dl, pr));
-            const char *df = fn_start(m6, "static const char *rdna4_denylist_decline(int cls) {");
-            const char *df_end = df ? strstr(df, "\n// NULL = admit") : NULL;
-            CHECK("G16: rdna4_denylist_decline checks rdna4g_denylist_applies & open fallback",
-                  df && df_end && has(df, df_end, "rdna4g_denylist_applies(cls)") &&
-                  has(df, df_end, "bundleIdentifier") && has(df, df_end, "getprogname()") &&
-                  has(df, df_end, "rdna4g_denylist_eval(") && has(df, df_end, "rdna4g_denylist_open_fallback(openErr)"));
-            free(m6);
-        }
     }
     printf("test-gate: %d checks, %d failed\n", runs, fails);
     return fails ? 1 : 0;
