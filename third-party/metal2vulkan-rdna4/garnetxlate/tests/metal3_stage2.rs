@@ -669,3 +669,45 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     assert!(!ns_asm.contains("OpImageSparseTexelsResident"), "{ns_asm}");
     assert!(!ns_asm.contains("OpImageSparse"), "{ns_asm}");
 }
+
+#[test]
+fn renderbox_visible_ref_accepts_unused_ptr_slots_and_rejects_bad_signatures() {
+    let entry_ll = r#"
+define <4 x half> @fs(<2 x float> %pos, <4 x half> %col, ptr addrspace(2) %u, ptr addrspace(1) %b0) {
+entry:
+  %r = tail call <4 x half> @custom_fn.MTL_VISIBLE_FN_REF(<2 x float> %pos, <4 x half> %col, ptr addrspace(2) %u, ptr addrspace(1) %b0, ptr addrspace(1) undef, ptr addrspace(1) undef, ptr addrspace(1) undef)
+  ret <4 x half> %r
+}
+declare <4 x half> @custom_fn.MTL_VISIBLE_FN_REF(<2 x float>, <4 x half>, ptr addrspace(2), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1)) section "air.externally_defined"
+!air.fragment = !{!0}
+!0 = !{ptr @fs, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6, !7}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.location_index", i32 0, i32 1, !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"pos"}
+!5 = !{i32 1, !"air.fragment_input", !"air.location_index", i32 1, i32 1, !"air.center", !"air.perspective", !"air.arg_type_name", !"half4", !"air.arg_name", !"col"}
+!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"u"}
+!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"b0"}
+!air.visible_function_references = !{!8}
+!8 = !{!"air.visible_function_reference", ptr @custom_fn.MTL_VISIBLE_FN_REF, !"custom_fn"}
+"#;
+    let dep_4_ptr_prefix = r#"
+define <4 x half> @custom_fn(<2 x float> %p, <4 x half> %c, ptr addrspace(2) %u, ptr addrspace(1) %b0) {
+entry:
+  ret <4 x half> %c
+}
+"#;
+    let ok = call_stage2(entry_ll, &[("custom_fn", dep_4_ptr_prefix)], &[], &[]);
+    assert_eq!(ok.rc, RC_OK, "RenderBox 7->4 ptr prefix must link cleanly: {}", ok.msg);
+
+    // Dropping a non-pointer value parameter must still be rejected as a signature mismatch.
+    let dep_missing_value = r#"
+define <4 x half> @custom_fn(<4 x half> %c, ptr addrspace(2) %u, ptr addrspace(1) %b0) {
+entry:
+  ret <4 x half> %c
+}
+"#;
+    let bad = call_stage2(entry_ll, &[("custom_fn", dep_missing_value)], &[], &[]);
+    assert_eq!(bad.rc, RC_REFUSED);
+    assert!(bad.msg.contains("signature mismatch"), "got: {}", bad.msg);
+}

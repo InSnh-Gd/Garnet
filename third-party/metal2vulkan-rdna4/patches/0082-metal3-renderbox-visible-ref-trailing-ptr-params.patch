@@ -1,0 +1,51 @@
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index 2cef249..21af748 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -1018,6 +1018,37 @@ fn parse_definition_signature(
+     Ok((ret, params))
+ }
+ 
++fn visible_ref_params_compatible(
++    exp_params: &[crate::native::ir::LlType],
++    act_params: &[crate::native::ir::LlType],
++) -> bool {
++    if exp_params == act_params {
++        return true;
++    }
++    if act_params.len() > exp_params.len() {
++        return false;
++    }
++    // Apple RenderBox / [[stitchable]] visible-function references declare a fixed superset stub
++    // (including unused pointer slots) while the linked privateFunction defines only the parameters
++    // it uses; `native::emitter::body::calls::function_call_args_for_params` aligns them in order.
++    let mut ei = 0usize;
++    for act in act_params {
++        let Some(off) = exp_params[ei..].iter().position(|exp| exp == act) else {
++            return false;
++        };
++        if !exp_params[ei..ei + off]
++            .iter()
++            .all(|skipped| matches!(skipped, crate::native::ir::LlType::Ptr(_)))
++        {
++            return false;
++        }
++        ei += off + 1;
++    }
++    exp_params[ei..]
++        .iter()
++        .all(|skipped| matches!(skipped, crate::native::ir::LlType::Ptr(_)))
++}
++
+ fn format_signature_mismatch(
+     symbol: &str,
+     exp_ret: &crate::native::ir::LlType,
+@@ -1074,7 +1105,7 @@ fn rewrite_visible_reference_stubs<'a>(
+         let stub_symbol = decode_llvm_global(&reference.stub_global)?;
+         if let Some((exp_ret, exp_params)) = decl_sigs.get(&stub_symbol) {
+             let (act_ret, act_params) = parse_definition_signature(provider_ll, &reference.symbol)?;
+-            if exp_ret != &act_ret || exp_params != &act_params {
++            if exp_ret != &act_ret || !visible_ref_params_compatible(exp_params, &act_params) {
+                 return Err(format_signature_mismatch(
+                     &reference.symbol,
+                     exp_ret,

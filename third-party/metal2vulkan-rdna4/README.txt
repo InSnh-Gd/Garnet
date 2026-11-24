@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0081).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0082).
 
 Verification and Tier 2 Scope
 =============================
@@ -18,6 +18,15 @@ translation, metadata invariants, and software Vulkan 1.4.363 execution only;
 they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
+
+0082-metal3-renderbox-visible-ref-trailing-ptr-params.patch relaxes the direct
+visible-function reference signature check in `src/linked_functions.rs`
+(`rewrite_visible_reference_stubs` / `visible_ref_params_compatible`) to accept
+Apple RenderBox / `[[stitchable]]` superset stubs that pass unused pointer slots
+(`LlType::Ptr(_)`) beyond the linked `privateFunction`'s defined parameter list
+(matching `native::emitter::body::calls::function_call_args_for_params`), while
+preserving strict mismatch rejection on return types, non-pointer parameters,
+extra callee parameters, and `MTLDynamicLibrary` links.
 
 0081-metal3-air-sparse-residency-polarity.patch fixes Apple AIR sparse status
 polarity in `src/passes/air_calls/images/resolve.rs` (`encode_residency_member`
