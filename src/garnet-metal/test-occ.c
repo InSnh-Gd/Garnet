@@ -28,6 +28,25 @@ static void p_resolve(pass *p, uint64_t *buf, int ok) {
 }
 #define SENT 0xABABABABABABABABull
 
+// Count needle occurrences in non-comment code (skipping // line comments).
+static int count_code(const char *src, const char *needle) {
+    const size_t nlen = strlen(needle);
+    if (!nlen) return 0;
+    int total = 0;
+    const char *line = src;
+    while (*line) {
+        const char *eol = strchr(line, '\n');
+        const char *end = eol ? eol : line + strlen(line);
+        const char *cm = strstr(line, "//");
+        if (cm && cm < end) end = cm;
+        for (const char *p = line; p + nlen <= end; p++) {
+            if (memcmp(p, needle, nlen) == 0) total++;
+        }
+        line = eol ? eol + 1 : end;
+    }
+    return total;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
     uint64_t b[16]; pass p;
@@ -154,7 +173,7 @@ int main(int argc, char **argv) {
     CHECK("pin: vkCmdEndRenderPass( is called from rdna4EndPass only", COUNT("vkCmdEndRenderPass(") == 1, "%d", COUNT("vkCmdEndRenderPass("));
     { const char *h = FIND("- (void)rdna4EndPass {", src); const char *e = h ? FIND("\n}\n", h) : NULL; const char *a = h ? FIND("[self rdna4OccEndQuery];", h) : NULL; const char *b2 = h ? FIND("vkCmdEndRenderPass(", h) : NULL;
       CHECK("pin: rdna4EndPass ends the open query BEFORE it ends the render pass", h && e && a && b2 && a < b2 && b2 < e, "helper present %d, order ok %d", h != NULL, (a && b2 && a < b2)); }
-    CHECK("pin: every pass-end site goes through rdna4EndPass (uploads, barriers, framebuffer fetch, indirect-arg sync, endEncoding)", COUNT("[self rdna4EndPass]") == 10, "%d", COUNT("[self rdna4EndPass]"));
+    CHECK("pin: every pass-end site goes through rdna4EndPass (uploads, barriers, framebuffer fetch, indirect-arg sync, counters, amplification, endEncoding)", count_code(src, "[self rdna4EndPass]") == 13, "%d", count_code(src, "[self rdna4EndPass]"));
     { const char *pd = FIND("- (BOOL)rdna4PrepareDraw:", src); const char *bp = pd ? FIND("[self rdna4BeginPass];", pd) : NULL; const char *od = bp ? FIND("[self rdna4OccDraw];", bp) : NULL; const char *dr = FIND("- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)ic baseInstance", src);
       CHECK("pin: the query begins in rdna4PrepareDraw AFTER the render pass has begun, and before the draw is recorded", pd && bp && od && dr && pd < bp && bp < od && od < dr, "ordered %d", (pd && bp && od && dr && pd < bp && bp < od && od < dr)); }
     { const char *pd = FIND("- (void)rdna4PoolDone {", src); const char *e = pd ? FIND("\n}", pd) : NULL; int ok = pd && e; if (ok) { const char *r = FIND("rdna4OccResolve", pd); const char *c = FIND("rdna4_fence_close", pd); ok = r && c && r < e && r < c; }
@@ -162,7 +181,9 @@ int main(int argc, char **argv) {
     { const char *a = FIND("- (void)rdna4DeliverTerminalSuccessWithQueue:", src); const char *p2 = a ? FIND("[self rdna4PoolDone];", a) : NULL; const char *b2 = p2 ? FIND("[queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:self->_encErr];", p2) : NULL;
       CHECK("pin: the resolve (rdna4PoolDone) happens BEFORE commandBufferDidComplete on the normal completion path", p2 && b2 && p2 < b2, "ordered %d", (p2 && b2 && p2 < b2)); }
     CHECK("pin: the write happens through rdna4occ_final (the arithmetic of this header), once per used offset", COUNT("rdna4occ_final(") == 1, "%d", COUNT("rdna4occ_final("));
-    CHECK("pin: the results are read with the availability bit and without VK_QUERY_RESULT_WAIT_BIT", COUNT("VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") == 1 && COUNT("VK_QUERY_RESULT_WAIT_BIT") == 0, "avail %d wait %d", COUNT("VK_QUERY_RESULT_WITH_AVAILABILITY_BIT"), COUNT("VK_QUERY_RESULT_WAIT_BIT"));
+    CHECK("pin: query results are read with the availability bit (1 occlusion + 2 timestamp counters) and never VK_QUERY_RESULT_WAIT_BIT",
+          count_code(src, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") == 3 && count_code(src, "VK_QUERY_RESULT_WAIT_BIT") == 0,
+          "avail %d wait %d", count_code(src, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT"), count_code(src, "VK_QUERY_RESULT_WAIT_BIT"));
     CHECK("pin: the query pool is reset at encoder creation (outside the pass), once", COUNT("vkCmdResetQueryPool([_cb vk]") == 1, "%d", COUNT("vkCmdResetQueryPool([_cb vk]"));
     CHECK("pin: the PRECISE flag is requested only from the Counting decision", COUNT("VK_QUERY_CONTROL_PRECISE_BIT") == 1 && COUNT("(precise && RDNA4R.occPrecise)") == 1, "%d", COUNT("VK_QUERY_CONTROL_PRECISE_BIT"));
     CHECK("pin: the dead-pool case marks the pass for the fail-safe", COUNT("if (*qp == VK_NULL_HANDLE) rdna4occ_dead(o);") == 1, "%d", COUNT("if (*qp == VK_NULL_HANDLE) rdna4occ_dead(o);"));
@@ -177,6 +198,7 @@ int main(int argc, char **argv) {
     CHECK("pin: a visibility buffer that is not a CPU-mapped RDNA4Buffer is never dereferenced", COUNT("if (![vb isKindOfClass:[RDNA4Buffer class]] || ![(RDNA4Buffer *)vb contents]) {") == 1, "%d", COUNT("![vb isKindOfClass:[RDNA4Buffer class]]"));
     CHECK("pin: the raw query results go through rdna4occ_read (availability checked in the tested arithmetic)", COUNT("if (ok && !rdna4occ_read(o, raw, res)) ok = NO;") == 1, "%d", COUNT("rdna4occ_read("));
     CHECK("pin: occlusionQueryPrecise is enabled on the device only when the physical device has it", COUNT(".occlusionQueryPrecise = pf.occlusionQueryPrecise") == 1, "%d", COUNT(".occlusionQueryPrecise = pf.occlusionQueryPrecise"));
+    free(src);
     printf("%s (%d failure(s))\n", fails ? "FAILED" : "all passed", fails);
     return fails ? 1 : 0;
 }

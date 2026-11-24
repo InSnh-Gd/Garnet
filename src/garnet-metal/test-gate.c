@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     CHECK("G7: the HUNG bit", RDNA4G_INFO_HUNG == RDNA4N_INFO_HUNG);
     CHECK("G7: the budget flags word is info.reserved[3] and the APP bit is the ABI's", RDNA4G_INFO_BUDGET_OFF == offsetof(struct rdna4n_info, reserved) + 4u * RDNA4N_INFO_R_BUDGET_FLAGS && RDNA4G_BUDGET_APP == RDNA4N_BUDGET_APP);
     CHECK("G7: ExclusiveAccess is the IOReturn value", RDNA4G_KR_EXCLUSIVE == 0xe00002c5u);
-    CHECK("G7: ABI minor is 12", RDNA4N_ABI_MINOR == 12u);
+    CHECK("G7: ABI minor is 13", RDNA4N_ABI_MINOR == 13u);
     // ---- G9 ----
     CHECK("G9: the by-class text is 0.0.632's refusal, word for word", !strcmp(RDNA4G_DECLINE_BY_CLASS_TEXT, "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set"));
     CHECK("G9: the bound is 501, the kernel's kAppMinUid", RDNA4G_APP_MIN_EUID == 501u);
@@ -151,9 +151,9 @@ int main(int argc, char **argv) {
     // ---- G14 (build 6, C1 finding B): the GPU family claim ----
     CHECK("G14: Metal3 (5001) is NOT claimed for apps, kept for WindowServer", !rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 0) && rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 1) && RDNA4G_FAMILY_METAL3 == 5001);
     CHECK("G14: Mac2 and Common1..3 are kept", rdna4g_supports_family(2002, 0) && rdna4g_supports_family(3001, 0) && rdna4g_supports_family(3002, 0) && rdna4g_supports_family(3003, 0) && rdna4g_supports_family(3001, 1));
-    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 2001, 4001, 5001, 5002, 6001, 0, -1, 99999 };
+    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 2001, 4001, 5001, 5002, 6001, 0, -1, 99999 };
       for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | (no[i] != RDNA4G_FAMILY_METAL3 ? rdna4g_supports_family(no[i], 1) : 0);
-      CHECK("G14: Apple1..9, Mac1, MacCatalyst, Metal3, Metal4 and unknown values are all NO", !any); }
+      CHECK("G14: Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal3 (apps), Metal4 and unknown values are all NO", !any); }
     CHECK("G14: argument buffer tier constants", RDNA4G_ARGBUF_TIER1 == 0 && RDNA4G_ARGBUF_TIER2 == 1);
     { static const unsigned long yes_fs[] = {
           RDNA4G_FS_MACOS_GPUFAMILY1_V1, RDNA4G_FS_MACOS_GPUFAMILY1_V2,
@@ -180,7 +180,10 @@ int main(int argc, char **argv) {
       CHECK("G11: Info.plist: bundle version 0.1.1, build 43", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"));
       free(pl); }
     { char *gm = slurp(dir, "GarnetDevice.m");
-      CHECK("G14: GarnetDevice.m exposes Metal2 capability and out-of-scope selectors",
+      const int assembled = gm && strstr(gm, "@implementation RDNA4RenderPipelineState") != NULL;
+      char *rp = assembled ? NULL : slurp(dir, "rdna4_render_pipeline_impl.inc");
+      const char *rpSrc = assembled ? gm : rp;
+      CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
             gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
                && strstr(gm, "- (BOOL)supportsBCTextureCompression")
                && strstr(gm, "- (BOOL)supports32BitFloatFiltering")
@@ -191,11 +194,31 @@ int main(int argc, char **argv) {
                && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return NO; }")
                && strstr(gm, "- (BOOL)supportsFunctionPointers { return NO; }")
                && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return NO; }")
-               && strstr(gm, "- (BOOL)supportsPullModelInterpolation { return NO; }")
-               && strstr(gm, "- (BOOL)supportsShaderBarycentricCoordinates { return NO; }")
+               && strstr(gm, "- (BOOL)supportsBinaryArchives { return NO; }")
+               && strstr(gm, "- (BOOL)supportsPullModelInterpolation")
+               && strstr(gm, "rdna4dc_metal3_pull_model_ok(&m3)")
+               && strstr(gm, "- (BOOL)supportsShaderBarycentricCoordinates")
+               && strstr(gm, "rdna4dc_metal3_barycentric_ok(&m3)")
                && strstr(gm, "- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf")
                && strstr(gm, "- (BOOL)supportsFeatureSet:(NSUInteger)featureSet")
                && strstr(gm, "- (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet"));
+      CHECK("G14: GarnetDevice.m wires Wave 2A counters, binary archive, IO queue, and residency set factories",
+            gm && rpSrc
+               && (assembled || (strstr(gm, "#include \"rdna4_binary_archive_impl.inc\"")
+                                 && strstr(gm, "#include \"rdna4_counters_impl.inc\"")
+                                 && strstr(gm, "#include \"rdna4_residency_set_impl.inc\"")
+                                 && strstr(gm, "#include \"rdna4_io_queue_impl.inc\"")))
+               && strstr(gm, "[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
+               && strstr(rpSrc, "rdna4_ba_lookup_render(")
+               && strstr(rpSrc, "rdna4_ba_vkcache()")
+               && strstr(gm, "rdna4_device_counter_sets()")
+               && strstr(gm, "rdna4_device_supports_counter_sampling(")
+               && strstr(gm, "rdna4_device_new_counter_sample_buffer(")
+               && strstr(gm, "rdna4_device_sample_timestamps(")
+               && strstr(gm, "[[RDNA4IOFileHandle alloc] initWithDevice:self")
+               && strstr(gm, "[[RDNA4IOCommandQueue alloc] initWithDevice:self descriptor:descriptor error:error]")
+               && strstr(gm, "[[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error]"));
+      free(rp);
       free(gm); }
     // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----
     CHECK("G16: denylist applies only to class OTHER (WindowServer & RDNA4M_ALLOW=1 root immune)",

@@ -844,3 +844,82 @@ for b in test-metal3-swizzle test-metal3-placement-heap-o0 test-metal3-placement
     "$TMPDIR/$b" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Metal 3 Barycentrics/Pull-Model, Counters/Amp, MSL 3 Atomics, Binary Archives, I/O Queue, and Residency Sets (2.4–2.6, 3.1, 4.1–4.2)
+
+Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
+and Clang ASan + UBSan) cover timestamp counter sampling & vertex amplification
+(`test-counters-amp.c`), Garnet binary archive container codec/SHA-256/UUID/miss
+semantics (`test-binary-archive.c`), fast I/O queue state machine/8192-command
+cap & residency set snapshot retention (`test-io-residency.c`), plus Metal 3
+capability probes and wiring pins (`test-devcaps.c`, `test-gate.c`, `test-occ.c`):
+
+```sh
+python3 src/garnet-metal/assemble-device.py \
+  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
+
+for t in test-devcaps test-gate test-occ test-counters-amp test-binary-archive test-io-residency; do
+  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
+    -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
+done
+"$TMPDIR/test-devcaps"
+"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
+"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
+"$TMPDIR/test-counters-amp" "$TMPDIR/src/garnet-metal" src/garnet-metal
+"$TMPDIR/test-binary-archive"
+"$TMPDIR/test-io-residency" src/garnet-metal "$TMPDIR/src/garnet-metal"
+```
+
+Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
+on macOS; compile ARC lifetime suites `test-metal3-binary-archive.m`,
+`test-metal3-io-queue.m`, and `test-metal3-residency-set.m` with both `-O0` and
+`-O2`):
+
+- `test-metal3-bary-pull.m` (Task `2.4`): `[[barycentric_coord]]` (perspective +
+  `center_no_perspective`) and 4x MSAA `interpolant<T>::interpolate_at_{center,centroid,sample,offset}`
+  for `float2` and `half2` vs analytical oracle.
+- `test-metal3-counters-amp.m` (Task `2.5`): `MTLCommonCounterSetTimestamp`
+  sampling across compute/render/blit passes and pass descriptors, timestamp
+  monotonicity & error paths, and `supportsVertexAmplificationCount:` /
+  `setVertexAmplificationCount:viewMappings:` boundary checks.
+- `test-metal3-msl3-atomics.m` (Task `2.6`): `atomic<float>` (device +
+  threadgroup add/sub/exchange/CAS min+max), 64-bit `atomic_ulong` /
+  `atomic<int64_t>` (`Int64Atomics`), `bfloat` / `bfloat4` FMA/math/conversions,
+  storage-texture atomics (`R32Uint` / `R32Sint`), and
+  `simd_shuffle_and_fill_{up,down}` vs race-free CPU oracle.
+- `test-metal3-binary-archive.m` (Task `3.1`): compute + render archive
+  creation, tile refusal, serialization/reload in a fresh archive,
+  `MTLPipelineOptionFailOnBinaryArchiveMiss` hit/miss, bit-exact GPU execution,
+  and corrupt/tampered archive rejection.
+- `test-metal3-io-queue.m` (Task `4.1`): `MTLIOFileHandle`, `MTLIOCommandQueue`,
+  and `MTLIOCommandBuffer` async buffer/texture loads into Private storage,
+  `MTLSharedEvent` handoff, serial barriers, 8,192-command cap, early handle
+  release, and EOF/missing-file/compression/`tryCancel` error paths.
+- `test-metal3-residency-set.m` (Task `4.2`): `MTLResidencySet` staged vs
+  committed snapshots, queue `addResidencySet:` and command-buffer
+  `useResidencySet:`, early ARC release of BDA/heap-backed resources at `-O0`
+  and `-O2`, and leak-free reclamation.
+
+```sh
+for t in test-metal3-bary-pull test-metal3-counters-amp test-metal3-msl3-atomics; do
+  clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+    -framework Foundation -framework Metal \
+    "src/garnet-metal/$t.m" -o "$TMPDIR/$t"
+done
+for t in test-metal3-binary-archive test-metal3-io-queue test-metal3-residency-set; do
+  for opt in O0 O2; do
+    clang -arch x86_64 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
+      -framework Foundation -framework Metal \
+      "src/garnet-metal/$t.m" -o "$TMPDIR/$t-$opt"
+  done
+done
+
+for b in test-metal3-bary-pull test-metal3-counters-amp test-metal3-msl3-atomics \
+         test-metal3-binary-archive-O0 test-metal3-binary-archive-O2 \
+         test-metal3-io-queue-O0 test-metal3-io-queue-O2 \
+         test-metal3-residency-set-O0 test-metal3-residency-set-O2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

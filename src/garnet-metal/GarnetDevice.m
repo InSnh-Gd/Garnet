@@ -448,6 +448,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_shader_runtime_impl.inc"
 #include "rdna4_tessellation.h"
 #include "rdna4_icb_abi.h"
+#include "rdna4_binary_archive_impl.inc"
 #include "rdna4_render_pipeline_impl.inc"
 #include "rdna4_stage_bindings_impl.inc"
 #include "rdna4_compute_pipeline_impl.inc"
@@ -456,10 +457,13 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_surface_capture.inc"
 #include "rdna4_present_capture.inc"
 #include "rdna4_command_buffer_impl.inc"
+#include "rdna4_counters_impl.inc"
 #include "rdna4_render_encoder_impl.inc"
 #include "rdna4_compute_encoder_impl.inc"
 #include "rdna4_blit_encoder_impl.inc"
 #include "rdna4_gl_drawable_impl.inc"
+#include "rdna4_residency_set_impl.inc"
+#include "rdna4_io_queue_impl.inc"
 @implementation RDNA4CommandBuffer (Encoders)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
     (void)[self vk];
@@ -470,9 +474,16 @@ static BOOL rdna4_headless(void) {
     RDNA4LOGR("cb blitCommandEncoder");
     return [[RDNA4BlitEncoder alloc] initWithCommandBuffer:self blit:0];
 }
-- (id)blitCommandEncoderWithDescriptor:(id)d { (void)d; return [self blitCommandEncoder]; }
+- (id)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
+    RDNA4LOGR("cb blitCommandEncoderWithDescriptor:");
+    return [[RDNA4BlitEncoder alloc] initWithCommandBuffer:self descriptor:d];
+}
 - (id)computeCommandEncoder { (void)[self vk]; RDNA4LOGR("cb computeCommandEncoder"); return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self compute:0]; }
-- (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
+- (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
+    (void)[self vk];
+    RDNA4LOGR("cb computeCommandEncoderWithDescriptor:");
+    return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self descriptor:d];
+}
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
 @end
 
@@ -499,12 +510,7 @@ static NSData *rdna4_function_reflection_data(id function) {
     return compiler;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error {
-    // Apple's native-code archive loader asserts on this device; our pipelines compile AIR through RADV.
-    if (error) *error = [NSError errorWithDomain:MTLBinaryArchiveDomain
-        code:descriptor.url ? MTLBinaryArchiveErrorInvalidFile : MTLBinaryArchiveErrorCompilationFailure
-        userInfo:@{ NSLocalizedDescriptionKey: @"Native Metal binary archives are unavailable on this device; compile the pipeline from its library." }];
-    RDNA4_ONCE("native binary archive declined; pipelines use AIR translation");
-    return nil;
+    return [[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error];
 }
 // Metal's archive, dynamic-library and MTL4-archive loaders all call +[MTLLoader sliceIDForDevice:...], which asserts
 // (MTLReportFailure -> abort) when -targetDeviceArchitecture is nil; the _MTLDevice default is nil for a non-Apple
@@ -604,6 +610,10 @@ static NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLFence" }; rdna4_add_protocols([RDNA4Fence class], n, 1, "RDNA4Fence"); }
     { const char *n[] = { "MTLHeap" }; rdna4_add_protocols([RDNA4Heap class], n, 1, "RDNA4Heap"); }
     { const char *n[] = { "MTLArgumentEncoder" }; rdna4_add_protocols([RDNA4ArgumentEncoder class], n, 1, "RDNA4ArgumentEncoder"); }
+    { const char *n[] = { "MTLBinaryArchive" }; rdna4_add_protocols([RDNA4BinaryArchive class], n, 1, "RDNA4BinaryArchive"); }
+    { const char *n[] = { "MTLCounter" }; rdna4_add_protocols([RDNA4Counter class], n, 1, "RDNA4Counter"); }
+    { const char *n[] = { "MTLCounterSet" }; rdna4_add_protocols([RDNA4CounterSet class], n, 1, "RDNA4CounterSet"); }
+    { const char *n[] = { "MTLCounterSampleBuffer" }; rdna4_add_protocols([RDNA4CounterSampleBuffer class], n, 1, "RDNA4CounterSampleBuffer"); }
     {   // build 18: the census (rdna4_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).
         const rdna4cen_pair pairs[] = { { [RDNA4RenderEncoder class], "RDNA4RenderEncoder", "MTLRenderCommandEncoder" }, { [RDNA4ComputeEncoder class], "RDNA4ComputeEncoder", "MTLComputeCommandEncoder" },
             { [RDNA4BlitEncoder class], "RDNA4BlitEncoder", "MTLBlitCommandEncoder" }, { [RDNA4CommandBuffer class], "RDNA4CommandBuffer", "MTLCommandBuffer" }, { self, "GarnetDevice", "MTLDevice" },
@@ -663,13 +673,21 @@ static void rdna4_census_log(void) {
 
 // Compute misses use bounded waits then temporary placeholders for WS/admitted
 // apps. The existing hot-swap registration replaces them when translation arrives.
-- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {
+- (id)rdna4NewComputePipeline:(id)fn descriptor:(MTLComputePipelineDescriptor *)desc options:(NSUInteger)opts error:(NSError **)error {
     NSError *e = nil;
     NSError *inprocFailure = nil;
-    RDNA4_LK_SCOPE;   // build 18 (P3): the descriptor variants install the kernel's link context just before calling this; a plain function-based call must never see an old one
-    if (rdna4_lk_for(fn) == nil) rdna4_lk_install(2, nil);
-    RDNA4ComputePipelineState *p = [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e];
+    RDNA4_LK_SCOPE;   // build 18 (P3): the descriptor variants install the kernel's link context inside this scope; a plain function-based call must never see an old one
+    if (desc) rdna4x_linkage_compute(desc);
+    else if (rdna4_lk_for(fn) == nil) rdna4_lk_install(2, nil);
+    RDNA4ComputePipelineState *p = desc
+        ? [[RDNA4ComputePipelineState alloc] initWithDevice:self descriptor:desc options:opts error:&e]
+        : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e];
     if (p) return p;
+    if ((opts & RDNA4_PIPELINE_OPT_FAIL_ON_ARCHIVE_MISS) || [e.domain isEqualToString:MTLBinaryArchiveDomain]) {
+        RDNA4LOG("compute pipeline binary archive failure: %s", e.localizedDescription.UTF8String);
+        if (error) *error = e;
+        return nil;
+    }
     const BOOL inproc = (e.code == 41 && rdna4x_active()) ? YES : NO;
     // build 16 (P4): the first attempt of an application that translates in process is NOT a failure: it is a miss in the bundle's own cache, followed by "inproc OK" and a created pipeline (0 COMPUTE FALLBACK lines in the b14 trial).
     if (inproc) RDNA4LOG("compute pipeline: not in the bundle's spvcache (%s); trying the in-process translation", e.localizedDescription.UTF8String);
@@ -677,7 +695,9 @@ static void rdna4_census_log(void) {
     const BOOL backendReady = !inproc || rdna4_radv_open(&inprocFailure);
     if (inproc && backendReady && rdna4x_translate_fn_with_error(fn, "kernel", rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull, &inprocFailure)) {   // translate in process first; skip the daemon wait
         NSError *e3 = nil;
-        RDNA4ComputePipelineState *p3 = [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e3];
+        RDNA4ComputePipelineState *p3 = desc
+            ? [[RDNA4ComputePipelineState alloc] initWithDevice:self descriptor:desc options:opts error:&e3]
+            : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e3];
         if (p3) return p3;
         inprocFailure = e3 ?: rdna4_err(100, @"pipeline initializer returned nil without an NSError after in-process translation");
         RDNA4LOG("compute pipeline creation failed after the in-process translation: %s", inprocFailure.localizedDescription.UTF8String);
@@ -689,7 +709,9 @@ static void rdna4_census_log(void) {
         NSString *ksha = rdna4_fn_sha(fn);
         if (ksha && rdna4_sync_wait("kernel", @[ ksha ], YES)) {
             NSError *e2 = nil;
-            RDNA4ComputePipelineState *p2 = [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e2];
+            RDNA4ComputePipelineState *p2 = desc
+                ? [[RDNA4ComputePipelineState alloc] initWithDevice:self descriptor:desc options:opts error:&e2]
+                : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e2];
             if (p2) return p2;
             RDNA4LOG("compute pipeline creation failed after the wait: %s", e2.localizedDescription.UTF8String);
         }
@@ -725,10 +747,13 @@ static void rdna4_census_log(void) {
     if (error) *error = e;
     return nil;
 }
+- (id)rdna4NewComputePipeline:(id)fn error:(NSError **)error {
+    return [self rdna4NewComputePipeline:fn descriptor:nil options:0 error:error];
+}
 - (id)newComputePipelineStateWithFunction:(id)fn error:(NSError **)error { RDNA4LOG("newComputePipelineStateWithFunction:error:"); return [self rdna4NewComputePipeline:fn error:error]; }
-- (id)rdna4NewComputePipeline:(id)fn stageInputDescriptor:(MTLStageInputOutputDescriptor *)descriptor options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
+- (id)rdna4NewComputePipeline:(id)fn descriptor:(MTLComputePipelineDescriptor *)desc stageInputDescriptor:(MTLStageInputOutputDescriptor *)descriptor options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
     if (r) *r = nil;
-    RDNA4ComputePipelineState *pipeline = [self rdna4NewComputePipeline:fn error:error];
+    RDNA4ComputePipelineState *pipeline = [self rdna4NewComputePipeline:fn descriptor:desc options:o error:error];
     if (!pipeline || !(o & 3u)) return pipeline;   // BindingInfo | BufferTypeInfo
     NSData *data = rdna4_function_reflection_data(fn);
     Class factory = NSClassFromString(@"MTLComputePipelineReflectionInternal");
@@ -748,6 +773,9 @@ static void rdna4_census_log(void) {
     if (r) *r = reflection;
     return pipeline;
 }
+- (id)rdna4NewComputePipeline:(id)fn stageInputDescriptor:(MTLStageInputOutputDescriptor *)descriptor options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
+    return [self rdna4NewComputePipeline:fn descriptor:nil stageInputDescriptor:descriptor options:o reflection:r error:error];
+}
 - (id)newComputePipelineStateWithFunction:(id)fn options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
     RDNA4LOG("newComputePipelineStateWithFunction:options:reflection:error:"); return [self rdna4NewComputePipeline:fn stageInputDescriptor:nil options:o reflection:r error:error]; }
 - (void)newComputePipelineStateWithFunction:(id)fn completionHandler:(void (^)(id, NSError *))h {
@@ -765,34 +793,41 @@ static void rdna4_census_log(void) {
 // -newComputePipelineStateWithDescriptor:error: (CONFIRMED: selector reference at QuartzCore 0x7ff80d2e6c74 resolves through the cache). That selector was not
 // implemented here, the inherited one returned nil although the spvcache has the kernel, and QuartzCore aborts on nil (abort_with_payload, function=compute_average_luma).
 static BOOL rdna4_compute_desc_wants_icb(MTLComputePipelineDescriptor *d, NSError **error) {
+#ifndef RDNA4_COMPUTE_ICB_ENABLED
     if (d && [d respondsToSelector:@selector(supportIndirectCommandBuffers)] && d.supportIndirectCommandBuffers) {
         if (error) *error = rdna4_err(61, @"compute indirect command buffers are outside the Metal 2 baseline");
         return YES;
     }
+#else
+    (void)d; (void)error;
+#endif
     return NO;
 }
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
     if (rdna4_compute_desc_wants_icb(d, error)) return nil;
-    rdna4x_linkage_compute(d); RDNA4LOG("newComputePipelineStateWithDescriptor:error:"); return [self rdna4NewComputePipeline:d.computeFunction error:error]; }
+    RDNA4LOG("newComputePipelineStateWithDescriptor:error:");
+    return [self rdna4NewComputePipeline:d.computeFunction descriptor:d options:0 error:error];
+}
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id, NSError *))h {
     if (!h) return;
     MTLComputePipelineDescriptor *saved = [d copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
         NSError *e = nil;
         if (rdna4_compute_desc_wants_icb(saved, &e)) { h(nil, e); return; }
-        rdna4x_linkage_compute(saved); id p = [self rdna4NewComputePipeline:saved.computeFunction error:&e]; h(p, e);
+        id p = [self rdna4NewComputePipeline:saved.computeFunction descriptor:saved options:0 error:&e]; h(p, e);
     }}); }
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o reflection:(MTLComputePipelineReflection **)r error:(NSError **)error {
     if (rdna4_compute_desc_wants_icb(d, error)) return nil;
-    rdna4x_linkage_compute(d); RDNA4LOG("newComputePipelineStateWithDescriptor:options:reflection:error:"); return [self rdna4NewComputePipeline:d.computeFunction stageInputDescriptor:d.stageInputDescriptor options:o reflection:r error:error]; }
+    RDNA4LOG("newComputePipelineStateWithDescriptor:options:reflection:error:");
+    return [self rdna4NewComputePipeline:d.computeFunction descriptor:d stageInputDescriptor:d.stageInputDescriptor options:o reflection:r error:error];
+}
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o completionHandler:(void (^)(id, id, NSError *))h {
     if (!h) return;
     MTLComputePipelineDescriptor *saved = [d copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
         NSError *e = nil; MTLComputePipelineReflection *r = nil;
         if (rdna4_compute_desc_wants_icb(saved, &e)) { h(nil, nil, e); return; }
-        rdna4x_linkage_compute(saved);
-        id p = [self rdna4NewComputePipeline:saved.computeFunction stageInputDescriptor:saved.stageInputDescriptor options:o reflection:&r error:&e]; h(p, r, e);
+        id p = [self rdna4NewComputePipeline:saved.computeFunction descriptor:saved stageInputDescriptor:saved.stageInputDescriptor options:o reflection:&r error:&e]; h(p, r, e);
     }}); }
 
 // ---- 10c: textures ----
@@ -1021,8 +1056,47 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (BOOL)supportsPrimitiveMotionBlur { return NO; }
 - (BOOL)supportsFunctionPointers { return NO; }
 - (BOOL)supportsFunctionPointersFromRender { return NO; }
-- (BOOL)supportsPullModelInterpolation { return NO; }
-- (BOOL)supportsShaderBarycentricCoordinates { return NO; }
+- (BOOL)supportsPullModelInterpolation {
+    const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
+    return rdna4dc_metal3_pull_model_ok(&m3) ? YES : NO;
+}
+- (BOOL)supportsShaderBarycentricCoordinates {
+    const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
+    return rdna4dc_metal3_barycentric_ok(&m3) ? YES : NO;
+}
+- (NSArray<id<MTLCounterSet>> *)counterSets { return rdna4_device_counter_sets(); }
+- (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)samplingPoint {
+    return rdna4_device_supports_counter_sampling(samplingPoint);
+}
+- (id<MTLCounterSampleBuffer>)newCounterSampleBufferWithDescriptor:(MTLCounterSampleBufferDescriptor *)descriptor
+                                                             error:(NSError **)error {
+    return rdna4_device_new_counter_sample_buffer(self, descriptor, error);
+}
+- (void)sampleTimestamps:(MTLTimestamp *)cpuTimestamp gpuTimestamp:(MTLTimestamp *)gpuTimestamp {
+    rdna4_device_sample_timestamps(cpuTimestamp, gpuTimestamp);
+}
+- (id)newIOFileHandleWithURL:(NSURL *)url error:(NSError **)error {
+    return [[RDNA4IOFileHandle alloc] initWithDevice:self url:url
+                                   compressionMethod:RDNA4IO_COMP_NONE
+                                          compressed:NO error:error];
+}
+- (id)newIOFileHandleWithURL:(NSURL *)url compressionMethod:(NSInteger)method error:(NSError **)error {
+    return [[RDNA4IOFileHandle alloc] initWithDevice:self url:url
+                                   compressionMethod:method
+                                          compressed:YES error:error];
+}
+- (id)newIOHandleWithURL:(NSURL *)url error:(NSError **)error {
+    return [self newIOFileHandleWithURL:url error:error];
+}
+- (id)newIOHandleWithURL:(NSURL *)url compressionMethod:(NSInteger)method error:(NSError **)error {
+    return [self newIOFileHandleWithURL:url compressionMethod:method error:error];
+}
+- (id)newIOCommandQueueWithDescriptor:(id)descriptor error:(NSError **)error {
+    return [[RDNA4IOCommandQueue alloc] initWithDevice:self descriptor:descriptor error:error];
+}
+- (id)newResidencySetWithDescriptor:(id)descriptor error:(NSError **)error {
+    return [[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error];
+}
 - (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
     if (!positions) return;
     static const MTLSamplePosition p1[1] = { { 0.5f, 0.5f } };
@@ -1071,16 +1145,19 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 
 // ---- 10d: pipeline creation from the SPIR-V cache; a miss dumps the AIR and returns an NSError (all four forms;
 // MTLCompiler is nil on _MTLDevice, F1) ----
-- (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
+- (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)opts error:(NSError **)error {
     NSError *e = nil;
     RDNA4_LK_SCOPE;   // build 18 (P3): the link contexts live for this creation only
     rdna4x_linkage_render(d);   // bundle 14 (section 3): one LINKAGE IGNORED line per pipeline whose descriptor links functions
-    RDNA4RenderPipelineState *p = [[RDNA4RenderPipelineState alloc] initWithDevice:self descriptor:d error:&e];
+    RDNA4RenderPipelineState *p = [[RDNA4RenderPipelineState alloc] initWithDevice:self descriptor:d options:opts noFallback:NO error:&e];
     if (p) return p;
     if (e.code == 41 && rdna4x_active()) RDNA4LOG("render pipeline: not in the bundle's spvcache (%s); the in-process translation was already tried for its functions", e.localizedDescription.UTF8String);   // build 16 (P4)
     else RDNA4LOG("pipeline creation failed: %s", e.localizedDescription.UTF8String);
     if (error) *error = [e copy];
     return nil;
+}
+- (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
+    return [self rdna4NewPipeline:d options:0 error:error];
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
     RDNA4LOG("newRenderPipelineStateWithDescriptor:error:");
@@ -1088,7 +1165,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 }
 - (id)rdna4NewPipeline:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)opts reflection:(MTLRenderPipelineReflection **)refl error:(NSError **)error {
     if (refl) *refl = nil;
-    RDNA4RenderPipelineState *pipeline = [self rdna4NewPipeline:d error:error];
+    RDNA4RenderPipelineState *pipeline = [self rdna4NewPipeline:d options:opts error:error];
     if (!pipeline || !(opts & 3u)) return pipeline;   // BindingInfo | BufferTypeInfo
     NSData *vertex = rdna4_function_reflection_data(d.vertexFunction);
     NSData *fragment = d.fragmentFunction ? rdna4_function_reflection_data(d.fragmentFunction) : nil;

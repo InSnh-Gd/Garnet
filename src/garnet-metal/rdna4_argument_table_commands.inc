@@ -1,4 +1,6 @@
 - (BOOL)rdna4PrepareArguments:(const RDNA4ArgumentTables *)tables resources:(NSSet *)resources writable:(NSSet *)writable scan:(const RDNA4ArgumentScanPrepared *)scan textures:(void (^)(RDNA4Texture *, VkImageLayout, BOOL))prepare {
+    NSSet *residency = [self rdna4ResidencyDeclaredResources];
+    if (residency.count) resources = resources ? [resources setByAddingObjectsFromSet:residency] : residency;
     NSMutableSet<RDNA4Buffer *> *bufferResources = [NSMutableSet set];
     for (id object in resources) {
         // Declarations remain active when an encoder continues in a new segment.

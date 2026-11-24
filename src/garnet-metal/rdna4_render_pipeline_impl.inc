@@ -31,6 +31,7 @@
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options noFallback:(BOOL)nofb error:(NSError **)err;
 - (RDNA4RenderPipelineState *)rdna4Real;   // the hot-swapped real pipeline, or nil
 - (BOOL)rdna4HotRebuild;
 - (BOOL)rdna4IsRenderFallback;
@@ -110,7 +111,8 @@ static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const cha
 
 @implementation RDNA4RenderPipelineState
 static _Atomic uint64_t rdna4_icb_pso_seq;
-- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err { return [self initWithDevice:dev descriptor:d noFallback:NO error:err]; }
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err { return [self initWithDevice:dev descriptor:d options:0 noFallback:NO error:err]; }
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err { return [self initWithDevice:dev descriptor:d options:0 noFallback:nofb error:err]; }
 - (const char *)rdna4VName { return _vnm; }
 - (const char *)rdna4FName { return _fnm; }
 - (BOOL)rdna4HasFragment { return _hasFrag; }
@@ -130,10 +132,11 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     if (!rdna4hs_install(&_realp, v)) { CFRelease((CFTypeRef)v); return NO; }   // lost a race (cannot happen: one watcher): keep the first
     return YES;
 }
-- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err {
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options noFallback:(BOOL)nofb error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
     _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
+    if (d.label) _lbl = [d.label copy];
     _icb = d.supportIndirectCommandBuffers;
     if (_icb) _icbToken = RDNA4_ICB_PSO_TOKEN_TAG | (atomic_fetch_add(&rdna4_icb_pso_seq, 1) + 1);
     const NSUInteger reqMaxAmp = [d respondsToSelector:@selector(maxVertexAmplificationCount)]
@@ -150,16 +153,38 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     _rastOff = !d.isRasterizationEnabled;
     if (!rdna4_radv_open(err)) return nil;
     const uint64_t deadline = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;
-    // 11e: SPIR-V from the cache; on a miss in WindowServer (or RDNA4M_FORCE_FALLBACK with RDNA4M_ALLOW) build
+    // 11e: SPIR-V from binaryArchives or spvcache; on a miss in WindowServer (or RDNA4M_FORCE_FALLBACK with RDNA4M_ALLOW) build
     // from the built-in no-write shaders instead of failing (the AIR is dumped by the caller-side rdna4_dump_pipeline).
     NSString *vname = nil, *fname = hasFrag ? nil : @"(none)"; NSError *e1 = nil, *e2 = nil; NSDictionary *mv_ = nil, *mf_ = nil;
-    NSData *vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
-    if (vsd && [mv_[@"stage"] isEqual:@"TessellationEvaluation"] &&
-        ![mv_[@"tessellation"] isKindOfClass:[NSDictionary class]] && !nofb && rdna4x_active()) {
-        vsd = nil; mv_ = nil;
-        e1 = rdna4_err(41, @"cached tessellation sidecar lacks tessellation metadata");
+    NSData *vsd = nil, *fsd = nil;
+    BOOL baHit = NO;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    NSData *baVk = nil; rdna4ba_fingerprint_t baFp = {0}; NSError *baErr = nil;
+    if (!rdna4_ba_lookup_render(dev, d, options, &vsd, &mv_, &fsd, &mf_, &baVk, &baFp, &baHit, &baErr)) {
+        if (err) *err = baErr;
+        return nil;
     }
-    NSData *fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
+#else
+    if (options & ((NSUInteger)1u << 2)) {
+        if (err) *err = [NSError errorWithDomain:MTLBinaryArchiveDomain
+            code:(NSInteger)MTLBinaryArchiveErrorCompilationFailure
+            userInfo:@{ NSLocalizedDescriptionKey: @"Render pipeline missed binary archive (MTLPipelineOptionFailOnBinaryArchiveMiss)" }];
+        return nil;
+    }
+#endif
+    if (baHit) {
+        vname = (d.vertexFunction && [d.vertexFunction respondsToSelector:@selector(name)]) ? [d.vertexFunction name] : @"?";
+        if (hasFrag)
+            fname = (d.fragmentFunction && [d.fragmentFunction respondsToSelector:@selector(name)]) ? [d.fragmentFunction name] : @"?";
+    } else {
+        vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
+        if (vsd && [mv_[@"stage"] isEqual:@"TessellationEvaluation"] &&
+            ![mv_[@"tessellation"] isKindOfClass:[NSDictionary class]] && !nofb && rdna4x_active()) {
+            vsd = nil; mv_ = nil;
+            e1 = rdna4_err(41, @"cached tessellation sidecar lacks tessellation metadata");
+        }
+        fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
+    }
     strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm);
     BOOL fb = NO;
     NSError *translationFailure = nil;
@@ -585,7 +610,15 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     free(rv); free(rf);
     uint32_t dk0 = [self rdna4DSKey:NULL];   // bundle 10: 0 for a colour-only pipeline (the key below is then exactly the old one)
     VkPrimitiveTopology topo0 = _isTess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    rdna4_ba_vkcache_scope_t baScope;
+    const BOOL useBaCache = baHit && baVk.length > 0;
+    if (useBaCache) rdna4_ba_vkcache_scope_begin(&baScope, baVk, &baFp);
+#endif
     NSError *ve = nil; VkPipeline p0 = [self rdna4Build:topo0 cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE ds:dk0 error:&ve];
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    if (useBaCache) rdna4_ba_vkcache_scope_end(&baScope);
+#endif
     if (!p0) { if (err) *err = ve; return nil; }
     _variants[@((uint64_t)topo0 | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24))] = [NSValue valueWithPointer:(void *)p0];
     RDNA4LOG("RDNA4RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s%s)", (__bridge void *)self, (void *)p0, na,
@@ -873,7 +906,11 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     VkGraphicsPipelineCreateInfo gpc = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = stCount, .pStages = st, .pVertexInputState = &vi,
         .pInputAssemblyState = &ia, .pTessellationState = _isTess ? &ts : NULL, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pColorBlendState = &cb,
         .pDynamicState = &ds, .layout = icb ? _icbPl : _pl, .renderPass = _rp };
-    VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, RDNA4R.pc, 1, &gpc, NULL, &p); rdna4t_add(&T1.gfx, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
+    VkPipelineCache pc = RDNA4R.pc;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    pc = rdna4_ba_vkcache();
+#endif
+    VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpc, NULL, &p); rdna4t_add(&T1.gfx, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines = %d", r]); return VK_NULL_HANDLE; }
     return p;
 }
