@@ -3,7 +3,18 @@
 // ---------------------------------------------------------------------------------------------------------------
 static void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos);
 
-@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; }
+@protocol RDNA4ComputeICBInternal <RDNA4ICBInternal>
+- (BOOL)rdna4IsComputeICB;
+- (BOOL)rdna4UseGPUExecution;
+- (NSUInteger)rdna4ExecuteComputeOnEncoder:(id)encoder range:(NSRange)range reason:(NSString **)reason;
+- (void)rdna4ExecuteComputeGPUOnEncoder:(id)encoder
+                            directRange:(NSRange)range
+                         indirectBuffer:(id)indirectBuf
+                         indirectOffset:(NSUInteger)indirectOff
+                            useIndirect:(BOOL)useIndirect;
+@end
+
+@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; NSUInteger _tgMemLengths[RDNA4_ICB_MAX_TG_MEM_INDICES]; MTLRegion _stageInRegion; BOOL _hasStageInRegion; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; }
 - (instancetype)initWithCommandBuffer:(id)cb compute:(int)dummy;
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLComputePassDescriptor *)d;
 @end
@@ -78,6 +89,11 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     _st.buf[i].b = b; _st.buf[i].off = o;
     [self rdna4OwnResource:b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
 }
+- (void)setBuffer:(id)b offset:(NSUInteger)o attributeStride:(NSUInteger)stride atIndex:(NSUInteger)i {
+    if (stride != 0 && stride != (NSUInteger)-1)
+        RDNA4LOG("compute setBuffer:attributeStride:%lu atIndex:%lu ignoring dynamic stride", (unsigned long)stride, (unsigned long)i);
+    [self setBuffer:b offset:o atIndex:i];
+}
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < 31) _st.buf[i].off = o; }
 - (void)setBuffers:(const id __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {
@@ -139,8 +155,29 @@ RDNA4_DNR(RDNA4ComputeEncoder)
             override:YES atIndex:r.location + k];
 }
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index {
+    if (index >= RDNA4_ICB_MAX_TG_MEM_INDICES) {
+        RDNA4LOG("compute setThreadgroupMemoryLength at index %lu exceeds limit %u", (unsigned long)index, RDNA4_ICB_MAX_TG_MEM_INDICES);
+        return;
+    }
+    _tgMemLengths[index] = length;
     if (index == 0) _threadgroupBytes = length;
-    else RDNA4LOG("compute setThreadgroupMemoryLength at index %lu is unsupported", (unsigned long)index);
+}
+- (void)setStageInRegion:(MTLRegion)region {
+    _stageInRegion = region;
+    _hasStageInRegion = YES;
+}
+- (void)rdna4ICBComputeBarrier {
+    VkCommandBuffer cmd = [_cb vk];
+    if (!cmd) return;
+    VkMemoryBarrier mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
 }
 - (void)memoryBarrierWithScope:(NSUInteger)s { (void)s; rdna4_full_barrier([_cb vk]); }
 - (void)memoryBarrierWithResources:(const id __unsafe_unretained *)r count:(NSUInteger)n { (void)r; (void)n; rdna4_full_barrier([_cb vk]); }
@@ -265,8 +302,13 @@ RDNA4_ENCODER_SHARED
             id backing = [icb rdna4GPUBacking];
             if (backing) [_cb rdna4RetainEncoded:backing];
             for (id pso in icbPsoRefs) {
+                if ([icb respondsToSelector:@selector(rdna4IsComputeICB)]) {
+                    BOOL wantCompute = [(id<RDNA4ComputeICBInternal>)icb rdna4IsComputeICB];
+                    BOOL isComputePso = [pso isKindOfClass:[RDNA4ComputePipelineState class]];
+                    if (wantCompute != isComputePso && icbRefs.count > 1) continue;
+                }
                 if (![icb rdna4RegisterCandidatePipeline:pso]) {
-                    [_cb rdna4Fail:@"indirect command buffer exceeds 32 candidate pipelines"];
+                    [_cb rdna4Fail:@"indirect command buffer exceeds 32 candidate pipelines or pipeline type mismatch"];
                     return;
                 }
             }
@@ -314,6 +356,78 @@ RDNA4_ENCODER_SHARED
     }
     [_cb rdna4RetainEncoded:buffer];
     [self rdna4Dispatch:MTLSizeMake(0,0,0) tpt:t exactThreads:NO indirect:buffer offset:offset];
+}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer withRange:(NSRange)executionRange {
+    if (_ended || [_cb rdna4Error]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer after endEncoding or after an earlier encode error"];
+        return;
+    }
+    if (!indirectCommandBuffer || ![indirectCommandBuffer respondsToSelector:@selector(rdna4IsComputeICB)]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer requires an RDNA4IndirectCommandBuffer"];
+        return;
+    }
+    id<RDNA4ComputeICBInternal> icb = (id<RDNA4ComputeICBInternal>)indirectCommandBuffer;
+    if (![icb rdna4IsComputeICB]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer cannot execute a render indirect command buffer"];
+        return;
+    }
+    if ([icb rdna4UseGPUExecution]) {
+        [icb rdna4ExecuteComputeGPUOnEncoder:self
+                                 directRange:executionRange
+                              indirectBuffer:nil
+                              indirectOffset:0
+                                 useIndirect:NO];
+        return;
+    }
+    NSString *problem = nil;
+    RDNA4ComputePipelineState *parentPipeline = _pso;
+    MTLComputePipelineReflection *parentReflection = _roReflection;
+    RDNA4StageState parentState = _st;
+    NSUInteger parentTgBytes = _threadgroupBytes;
+    NSUInteger parentTgLengths[RDNA4_ICB_MAX_TG_MEM_INDICES];
+    memcpy(parentTgLengths, _tgMemLengths, sizeof parentTgLengths);
+    MTLRegion parentStageIn = _stageInRegion;
+    BOOL parentHasStageIn = _hasStageInRegion;
+    [_cb rdna4RetainEncoded:icb];
+    NSUInteger replayed = [icb rdna4ExecuteComputeOnEncoder:self range:executionRange reason:&problem];
+    _pso = parentPipeline;
+    _roReflection = parentReflection;
+    _st = parentState;
+    [self rdna4OwnResource:_pso kind:RDNA4_RESOURCE_PIPELINE fragment:NO index:0];
+    for (NSUInteger i = 0; i < 31; ++i)
+        [self rdna4OwnResource:_st.buf[i].b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
+    _threadgroupBytes = parentTgBytes;
+    memcpy(_tgMemLengths, parentTgLengths, sizeof _tgMemLengths);
+    _stageInRegion = parentStageIn;
+    _hasStageInRegion = parentHasStageIn;
+    if (problem) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"compute executeCommandsInBuffer [%lu,+%lu): %@",
+                        (unsigned long)executionRange.location, (unsigned long)executionRange.length, problem]];
+        return;
+    }
+    RDNA4LOGR("compute executeCommandsInBuffer: replayed %lu command(s)", (unsigned long)replayed);
+}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
+                 indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
+           indirectBufferOffset:(NSUInteger)indirectBufferOffset {
+    if (_ended || [_cb rdna4Error]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer:indirectBuffer: after endEncoding or after an earlier encode error"];
+        return;
+    }
+    if (!indirectCommandBuffer || ![indirectCommandBuffer respondsToSelector:@selector(rdna4IsComputeICB)]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer:indirectBuffer: requires an RDNA4IndirectCommandBuffer"];
+        return;
+    }
+    id<RDNA4ComputeICBInternal> icb = (id<RDNA4ComputeICBInternal>)indirectCommandBuffer;
+    if (![icb rdna4IsComputeICB]) {
+        [_cb rdna4Fail:@"compute executeCommandsInBuffer:indirectBuffer: cannot execute a render indirect command buffer"];
+        return;
+    }
+    [icb rdna4ExecuteComputeGPUOnEncoder:self
+                             directRange:NSMakeRange(0, 0)
+                          indirectBuffer:indirectRangeBuffer
+                          indirectOffset:indirectBufferOffset
+                             useIndirect:YES];
 }
 - (void)endEncoding {
     if (_ended) return;

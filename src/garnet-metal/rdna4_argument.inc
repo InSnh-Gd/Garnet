@@ -5,6 +5,7 @@
 
 @protocol RDNA4ICBInternal;
 @class RDNA4RenderPipelineState;
+@class RDNA4ComputePipelineState;
 
 @interface RDNA4ICBArgOwners : NSObject
 @property NSMutableSet *icbs;
@@ -154,7 +155,8 @@ static BOOL rdna4_argument_scalar(MTLDataType type, NSUInteger *size, NSUInteger
         return YES;
     }
     if (type == MTLDataTypePointer || type == MTLDataTypeTexture || type == MTLDataTypeSampler ||
-        type == MTLDataTypeRenderPipeline || type == MTLDataTypeIndirectCommandBuffer) {
+        type == MTLDataTypeRenderPipeline || type == MTLDataTypeComputePipeline ||
+        type == MTLDataTypeIndirectCommandBuffer) {
         *size = *alignment = sizeof(uint64_t); return YES;
     }
     return NO;
@@ -268,6 +270,7 @@ static BOOL rdna4_argument_add(NSMutableDictionary *fields, MTLDataType type, MT
     RDNA4ArgumentField *field = [self field:index];
     return field && field.type != MTLDataTypePointer && field.type != MTLDataTypeTexture &&
         field.type != MTLDataTypeSampler && field.type != MTLDataTypeRenderPipeline &&
+        field.type != MTLDataTypeComputePipeline &&
         field.type != MTLDataTypeIndirectCommandBuffer ? field.offset : NSUIntegerMax;
 }
 - (id)bufferLayoutForResourceAtIndex:(NSUInteger)index { return [self field:index].nested; }
@@ -1300,6 +1303,7 @@ static void rdna4_argument_sampler_complete(id token) {
     RDNA4ArgumentField *field = [_layout field:index];
     BOOL resource = field.type == MTLDataTypePointer || field.type == MTLDataTypeTexture ||
         field.type == MTLDataTypeSampler || field.type == MTLDataTypeRenderPipeline ||
+        field.type == MTLDataTypeComputePipeline ||
         field.type == MTLDataTypeIndirectCommandBuffer;
     if (!_buffer || !field || (type == MTLDataTypeNone ? resource : field.type != type) ||
         field.offset > self.encodedLength || field.size > self.encodedLength - field.offset ||
@@ -1435,6 +1439,31 @@ static void rdna4_argument_sampler_complete(id token) {
     [self rdna4ValidateRange:range type:MTLDataTypeRenderPipeline];
     for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4RenderPipelineToken:pipelines[n]];
     for (NSUInteger n = 0; n < range.length; ++n) [self setRenderPipelineState:pipelines[n] atIndex:range.location + n];
+}
+- (uint64_t)rdna4ComputePipelineToken:(id<MTLComputePipelineState>)pipeline {
+    uint64_t token = 0;
+    if (pipeline) {
+        if (![pipeline isKindOfClass:RDNA4ComputePipelineState.class] || pipeline.device != _device ||
+            ![pipeline supportIndirectCommandBuffers])
+            [NSException raise:NSInvalidArgumentException format:@"Argument compute pipeline state is invalid or does not support indirect command buffers"];
+        token = [(RDNA4ComputePipelineState *)pipeline rdna4ICBToken];
+        if (!token)
+            [NSException raise:NSInvalidArgumentException format:@"Argument compute pipeline state has no ICB token"];
+    }
+    return token;
+}
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)pipeline atIndex:(NSUInteger)index {
+    (void)[self rdna4Destination:index type:MTLDataTypeComputePipeline];
+    uint64_t token = [self rdna4ComputePipelineToken:pipeline];
+    rdna4_argument_sampler_store(_buffer, _offset + [_layout field:index].offset, token, nil);
+    if (pipeline) rdna4_icb_arg_note(_buffer, nil, pipeline, nil);
+}
+- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained *)pipelines withRange:(NSRange)range {
+    if (!pipelines && range.length)
+        [NSException raise:NSInvalidArgumentException format:@"Argument compute pipeline array is null"];
+    [self rdna4ValidateRange:range type:MTLDataTypeComputePipeline];
+    for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4ComputePipelineToken:pipelines[n]];
+    for (NSUInteger n = 0; n < range.length; ++n) [self setComputePipelineState:pipelines[n] atIndex:range.location + n];
 }
 - (void *)constantDataAtIndex:(NSUInteger)index { return [self rdna4Destination:index type:MTLDataTypeNone]; }
 - (id)newArgumentEncoderForBufferAtIndex:(NSUInteger)index {
