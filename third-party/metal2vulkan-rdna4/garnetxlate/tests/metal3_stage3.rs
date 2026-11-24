@@ -1336,3 +1336,115 @@ entry:
     assert!(rt_asm.contains("OpRayQueryGenerateIntersectionKHR"), "{rt_asm}");
     assert!(rt_asm.contains("OpRayQueryConfirmIntersectionKHR"), "{rt_asm}");
 }
+
+#[test]
+fn apple_air_v28_void_atomic_rmw_0080_ffi() {
+    // 1. Exact Apple air64_v28 `k_u64_minmax` shape: void-returning `air.atomic.global.{min,max}.u.i64`.
+    let u64_minmax = r#"
+target triple = "air64_v28-apple-macosx26.7.0"
+%"struct.metal::_atomic" = type { i64 }
+define void @k_u64_minmax(ptr addrspace(1) nocapture noundef "air-buffer-no-alias" %slots, i32 noundef %gid) {
+entry:
+  %mul = mul i32 %gid, 37
+  %add = add i32 %mul, 13
+  %and = and i32 %add, 255
+  %conv = zext i32 %and to i64
+  %shl = shl nuw nsw i64 %conv, 36
+  %xor = xor i32 %gid, 90
+  %conv1 = zext i32 %xor to i64
+  %shl2 = shl nuw nsw i64 %conv1, 8
+  %conv3 = zext i32 %gid to i64
+  %or = or i64 %shl2, %conv3
+  %or4 = or i64 %or, %shl
+  %__s.i24 = getelementptr inbounds %"struct.metal::_atomic", ptr addrspace(1) %slots, i64 0, i32 0
+  tail call void @air.atomic.global.min.u.i64(ptr addrspace(1) nocapture %__s.i24, i64 %or4, i32 0, i32 2, i1 true)
+  %__s.i26 = getelementptr inbounds %"struct.metal::_atomic", ptr addrspace(1) %slots, i64 1, i32 0
+  tail call void @air.atomic.global.max.u.i64(ptr addrspace(1) nocapture %__s.i26, i64 %or4, i32 0, i32 2, i1 true)
+  ret void
+}
+declare void @air.atomic.global.min.u.i64(ptr addrspace(1) nocapture, i64, i32, i32, i1)
+declare void @air.atomic.global.max.u.i64(ptr addrspace(1) nocapture, i64, i32, i32, i1)
+!air.kernel = !{!14}
+!14 = !{ptr @k_u64_minmax, !15, !16}
+!15 = !{}
+!16 = !{!17, !19}
+!17 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !18, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"metal::_atomic", !"air.arg_name", !"slots"}
+!18 = !{i32 0, i32 8, i32 0, !"ulong", !"__s"}
+!19 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+"#;
+    let out_u64 = call_plain(u64_minmax, Some([64, 1, 1]));
+    assert_eq!(out_u64.rc, RC_OK, "void u64 minmax failed: {}", out_u64.msg);
+    let asm_u64 = spv_asm(&out_u64.spv);
+    assert!(asm_u64.contains("OpCapability Int64"), "{asm_u64}");
+    assert!(asm_u64.contains("OpCapability Int64Atomics"), "{asm_u64}");
+    assert!(asm_u64.contains("OpAtomicUMin"), "{asm_u64}");
+    assert!(asm_u64.contains("OpAtomicUMax"), "{asm_u64}");
+    assert!(!asm_u64.contains("air.atomic."), "{asm_u64}");
+
+    // 2. Void-returning signed i64 min/max and add.u.i64/sub.s.i64/xchg.i64.
+    let s64_add = r#"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_s64_void(ptr addrspace(1) %slots, i32 %gid) {
+entry:
+  %v = sext i32 %gid to i64
+  %p0 = getelementptr inbounds i64, ptr addrspace(1) %slots, i64 0
+  %p1 = getelementptr inbounds i64, ptr addrspace(1) %slots, i64 1
+  %p2 = getelementptr inbounds i64, ptr addrspace(1) %slots, i64 2
+  tail call void @air.atomic.global.min.s.i64(ptr addrspace(1) %p0, i64 %v, i32 0, i32 2, i1 true)
+  tail call void @air.atomic.global.max.s.i64(ptr addrspace(1) %p1, i64 %v, i32 0, i32 2, i1 true)
+  tail call void @air.atomic.global.add.u.i64(ptr addrspace(1) %p2, i64 1, i32 0, i32 2, i1 true)
+  ret void
+}
+declare void @air.atomic.global.min.s.i64(ptr addrspace(1), i64, i32, i32, i1)
+declare void @air.atomic.global.max.s.i64(ptr addrspace(1), i64, i32, i32, i1)
+declare void @air.atomic.global.add.u.i64(ptr addrspace(1), i64, i32, i32, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_s64_void, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"long", !"air.arg_name", !"slots"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+"#;
+    let out_s64 = call_plain(s64_add, Some([32, 1, 1]));
+    assert_eq!(out_s64.rc, RC_OK, "void s64/add failed: {}", out_s64.msg);
+    let asm_s64 = spv_asm(&out_s64.spv);
+    assert!(asm_s64.contains("OpAtomicSMin"), "{asm_s64}");
+    assert!(asm_s64.contains("OpAtomicSMax"), "{asm_s64}");
+    assert!(asm_s64.contains("OpAtomicIAdd"), "{asm_s64}");
+    assert!(!asm_s64.contains("air.atomic."), "{asm_s64}");
+
+    // 3. Void-returning f32 native add/sub/xchg and CAS min/max.
+    let f32_void = r#"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_f32_void(ptr addrspace(1) %bf, ptr addrspace(1) %bf_cas, i32 %gid) {
+entry:
+  %v = sitofp i32 %gid to float
+  %idx = zext i32 %gid to i64
+  %pf = getelementptr inbounds float, ptr addrspace(1) %bf, i64 %idx
+  %pc = getelementptr inbounds float, ptr addrspace(1) %bf_cas, i64 %idx
+  tail call void @air.atomic.global.add.f.f32(ptr addrspace(1) %pf, float %v, i32 0, i32 2, i1 true)
+  tail call void @air.atomic.global.sub.f32(ptr addrspace(1) %pf, float 1.0, i32 0, i32 2, i1 true)
+  tail call void @air.atomic.global.min.f.f32(ptr addrspace(1) %pc, float %v, i32 0, i32 2, i1 true)
+  tail call void @air.atomic.global.max.f.f32(ptr addrspace(1) %pc, float %v, i32 0, i32 2, i1 true)
+  ret void
+}
+declare void @air.atomic.global.add.f.f32(ptr addrspace(1), float, i32, i32, i1)
+declare void @air.atomic.global.sub.f32(ptr addrspace(1), float, i32, i32, i1)
+declare void @air.atomic.global.min.f.f32(ptr addrspace(1), float, i32, i32, i1)
+declare void @air.atomic.global.max.f.f32(ptr addrspace(1), float, i32, i32, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_f32_void, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"bf"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"bf_cas"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+"#;
+    let out_f32 = call_plain(f32_void, Some([32, 1, 1]));
+    assert_eq!(out_f32.rc, RC_OK, "void f32 atomic failed: {}", out_f32.msg);
+    let asm_f32 = spv_asm(&out_f32.spv);
+    assert!(asm_f32.contains("OpCapability AtomicFloat32AddEXT"), "{asm_f32}");
+    assert!(asm_f32.contains("OpAtomicFAddEXT"), "{asm_f32}");
+    assert!(asm_f32.contains("OpAtomicCompareExchange"), "{asm_f32}");
+    assert!(!asm_f32.contains("air.atomic."), "{asm_f32}");
+}

@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0079).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0080).
 
 Verification and Tier 2 Scope
 =============================
@@ -18,6 +18,14 @@ translation, metadata invariants, and software Vulkan 1.4.363 execution only;
 they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
+
+0080-metal3-void-atomic-air-calls.patch handles void-returning buffer atomic
+RMW intrinsics emitted by Apple `air64_v28` (`atomic_{min,max}_explicit` and
+dead-result `add`/`sub`/`min`/`max`/`and`/`or`/`xor`/`xchg` across `global`/
+`local` and `i32`/`i64`/`f32`) in `src/native/emitter/ops/air_calls.rs` by
+routing both `emit_void_air_call` and `emit_value_air_call` through the shared
+`emit_atomic_rmw_air_call` helper (discarding the SPIR-V SSA result id on void
+calls), fixing live RX 9060 XT translation of `k_u64_minmax`.
 
 0079-metal3-apple-air-live-fixes.patch fixes four live macOS 26.7.2 Apple AIR
 (`air64_v28`, `metalfe-32023.886.1`) translator gaps captured on RX 9060 XT:
