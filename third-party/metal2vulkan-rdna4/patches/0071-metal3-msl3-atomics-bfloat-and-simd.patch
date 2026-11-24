@@ -1,0 +1,3313 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 4ab8107..013af3a 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -361,7 +361,6 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+             "air.read_texture",
+             "air.read_depth",
+             "air.write_texture",
+-            "air.atomic_fetch_max_explicit_texture_",
+             "air.write_imageblock_slice_to_texture",
+             "air.get_width_texture",
+             "air.get_height_texture",
+@@ -379,7 +378,7 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+             "air.is_null_depth",
+             "air.get_null_texture",
+         ],
+-    )
++    ) || is_texture_atomic_intrinsic(name)
+ }
+ 
+ /// The AIR families that encode into a Metal indirect command buffer.
+@@ -389,6 +388,107 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+ /// sequence of SPIR-V instructions can produce from these operands. This is the single definition
+ /// of that boundary -- translation refuses on it, and validation reports the tooling requirement
+ /// from it.
++pub fn is_texture_atomic_intrinsic(name: &str) -> bool {
++    any_prefix(
++        name,
++        &[
++            "air.atomic_fetch_add_explicit_texture_",
++            "air.atomic_fetch_sub_explicit_texture_",
++            "air.atomic_fetch_min_explicit_texture_",
++            "air.atomic_fetch_max_explicit_texture_",
++            "air.atomic_fetch_and_explicit_texture_",
++            "air.atomic_fetch_or_explicit_texture_",
++            "air.atomic_fetch_xor_explicit_texture_",
++            "air.atomic_exchange_explicit_texture_",
++            "air.atomic_load_explicit_texture_",
++            "air.atomic_store_explicit_texture_",
++            "air.atomic_compare_exchange_weak_explicit_texture_",
++        ],
++    )
++}
++
++pub fn is_float_cas_atomic_intrinsic(name: &str) -> bool {
++    matches!(
++        name,
++        "air.atomic.global.min.f32"
++            | "air.atomic.global.min.f.f32"
++            | "air.atomic.global.max.f32"
++            | "air.atomic.global.max.f.f32"
++            | "air.atomic.global.cmpxchg.weak.f32"
++            | "air.atomic.global.cmpxchg.weak.f.f32"
++            | "air.atomic.local.min.f32"
++            | "air.atomic.local.min.f.f32"
++            | "air.atomic.local.max.f32"
++            | "air.atomic.local.max.f.f32"
++            | "air.atomic.local.cmpxchg.weak.f32"
++            | "air.atomic.local.cmpxchg.weak.f.f32"
++    )
++}
++
++pub fn is_buffer_atomic_intrinsic(name: &str) -> bool {
++    let Some(rest) = name
++        .strip_prefix("air.atomic.global.")
++        .or_else(|| name.strip_prefix("air.atomic.local."))
++    else {
++        return false;
++    };
++    matches!(
++        rest,
++        "load.i32"
++            | "store.i32"
++            | "xchg.i32"
++            | "cmpxchg.weak.i32"
++            | "add.s.i32"
++            | "add.u.i32"
++            | "sub.s.i32"
++            | "sub.u.i32"
++            | "min.s.i32"
++            | "min.u.i32"
++            | "max.s.i32"
++            | "max.u.i32"
++            | "and.u.i32"
++            | "and.s.i32"
++            | "or.u.i32"
++            | "or.s.i32"
++            | "xor.u.i32"
++            | "xor.s.i32"
++            | "load.i64"
++            | "store.i64"
++            | "xchg.i64"
++            | "cmpxchg.weak.i64"
++            | "add.s.i64"
++            | "add.u.i64"
++            | "sub.s.i64"
++            | "sub.u.i64"
++            | "min.s.i64"
++            | "min.u.i64"
++            | "max.s.i64"
++            | "max.u.i64"
++            | "and.u.i64"
++            | "and.s.i64"
++            | "or.u.i64"
++            | "or.s.i64"
++            | "xor.u.i64"
++            | "xor.s.i64"
++            | "load.f32"
++            | "load.f.f32"
++            | "store.f32"
++            | "store.f.f32"
++            | "xchg.f32"
++            | "xchg.f.f32"
++            | "cmpxchg.weak.f32"
++            | "cmpxchg.weak.f.f32"
++            | "add.f32"
++            | "add.f.f32"
++            | "sub.f32"
++            | "sub.f.f32"
++            | "min.f32"
++            | "min.f.f32"
++            | "max.f32"
++            | "max.f.f32"
++    )
++}
++
+ pub fn is_interpolate_at_intrinsic(name: &str) -> bool {
+     any_typed(
+         name,
+@@ -482,6 +582,10 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+         return Some(StaticLinkage);
+     }
+ 
++    if is_buffer_atomic_intrinsic(name) {
++        return Some(Lowered);
++    }
++
+     if matches!(
+         name,
+         "air.simdgroup.barrier"
+diff --git a/src/emitted_effects.rs b/src/emitted_effects.rs
+index f9fcb9e..e65c0e4 100644
+--- a/src/emitted_effects.rs
++++ b/src/emitted_effects.rs
+@@ -46,6 +46,9 @@ const AIR_OBSERVABLE_WRITE_MARKERS: &[&str] = &[
+     "@air.write_texture",
+     "@air.write_imageblock_slice_to_texture",
+     "@air.atomic_fetch_",
++    "@air.atomic_exchange_explicit_texture_",
++    "@air.atomic_store_explicit_texture_",
++    "@air.atomic_compare_exchange_weak_explicit_texture_",
+     "@air.store.device_coherent",
+     "@air.store.system_coherent",
+     // The `llvm.*` half of the same contract. `llvm.agx3.*.with.emask.global.*` is the AGX masked
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index d8e885a..ab49539 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -225,7 +225,7 @@ fn is_air_texture_operation(callee: &str) -> bool {
+         || callee.starts_with("air.read_depth")
+         || callee.starts_with("air.write_texture")
+         || callee.starts_with("air.write_imageblock_slice_to_texture")
+-        || callee.starts_with("air.atomic_fetch_max_explicit_texture_")
++        || crate::air_intrinsics::is_texture_atomic_intrinsic(callee)
+         || callee.starts_with("air.get_width_texture")
+         || callee.starts_with("air.get_height_texture")
+         || callee.starts_with("air.get_depth_texture")
+@@ -2284,6 +2284,10 @@ impl Emitter {
+                 source_exit_labels.insert(source_label_id, exit_label);
+             }
+ 
++            let segment_labels: HashSet<Word> = segments
++                .iter()
++                .filter_map(|block| block.label.as_ref().and_then(|label| label.result_id))
++                .collect();
+             let loop_claims = segments
+                 .iter()
+                 .enumerate()
+@@ -2292,7 +2296,13 @@ impl Emitter {
+                         .instructions
+                         .iter()
+                         .enumerate()
+-                        .filter(|(_, instruction)| instruction.class.opcode == Op::LoopMerge)
++                        .filter(|(_, instruction)| {
++                            instruction.class.opcode == Op::LoopMerge
++                                && !matches!(
++                                    instruction.operands.first(),
++                                    Some(Operand::IdRef(target)) if segment_labels.contains(target)
++                                )
++                        })
+                         .map(move |(instruction_index, _)| (block_index, instruction_index))
+                 })
+                 .collect::<Vec<_>>();
+@@ -2792,7 +2802,9 @@ impl Emitter {
+                     if !global_names.contains(name.as_str()) {
+                         continue;
+                     }
+-                    if call.callee.ends_with(".i32") {
++                    if call.callee.ends_with(".i32")
++                        || crate::air_intrinsics::is_float_cas_atomic_intrinsic(&call.callee)
++                    {
+                         int_atomic.insert(name.clone());
+                     } else if call.callee.ends_with(".f32") {
+                         float_atomic.insert(name.clone());
+@@ -2800,9 +2812,70 @@ impl Emitter {
+                 }
+             }
+         }
++        // Any Workgroup float global touched (directly or through GEP/bitcast aliases) by a float
++        // CAS atomic must be retyped to i32 even if add/sub.f32 also targets it (add/sub fall back
++        // to CAS on the i32 word cleanly).
++        let mut float_cas_globals = HashSet::new();
++        for function in functions {
++            let mut global_aliases: HashMap<String, String> = HashMap::new();
++            let mut changed = true;
++            while changed {
++                changed = false;
++                for inst in function.carrier_insts() {
++                    let Some(res) = inst.result.as_deref() else {
++                        continue;
++                    };
++                    if global_aliases.contains_key(res) {
++                        continue;
++                    }
++                    let origin = if let Some((_, base)) = inst.identity_ptr_bitcast() {
++                        global_aliases.get(base).cloned()
++                    } else if let Some(gep) = inst.gep() {
++                        match &gep.base.value {
++                            LlValue::Global(name) if global_names.contains(name.as_str()) => {
++                                Some(name.clone())
++                            }
++                            LlValue::Local(base) => global_aliases.get(base).cloned(),
++                            _ => None,
++                        }
++                    } else {
++                        None
++                    };
++                    if let Some(root) = origin {
++                        global_aliases.insert(res.to_string(), root);
++                        changed = true;
++                    }
++                }
++            }
++            for block in &function.blocks {
++                let Some(carrier) = &block.typed else {
++                    continue;
++                };
++                for inst in &carrier.insts {
++                    if !matches!(inst.opcode.as_str(), "call" | "tail") {
++                        continue;
++                    }
++                    let Some(call) = &inst.call() else { continue };
++                    if !crate::air_intrinsics::is_float_cas_atomic_intrinsic(&call.callee) {
++                        continue;
++                    }
++                    let root = match call.args.first().map(|a| &a.value) {
++                        Some(LlValue::Global(name)) if global_names.contains(name.as_str()) => {
++                            Some(name.clone())
++                        }
++                        Some(LlValue::Local(local)) => global_aliases.get(local).cloned(),
++                        _ => None,
++                    };
++                    if let Some(name) = root {
++                        int_atomic.insert(name.clone());
++                        float_cas_globals.insert(name);
++                    }
++                }
++            }
++        }
+         int_atomic
+             .into_iter()
+-            .filter(|name| !float_atomic.contains(name))
++            .filter(|name| float_cas_globals.contains(name) || !float_atomic.contains(name))
+             .collect()
+     }
+ 
+@@ -2816,11 +2889,22 @@ impl Emitter {
+     /// (`emit_function` clears `pointer_pointees` and reseeds globals) so both agree.
+     pub(super) fn global_declared_pointee(&mut self, global: &LlGlobal) -> Result<LlType, String> {
+         let ty = self.resolve_type(&global.ty)?;
+-        if global.addrspace == 3
+-            && ty == LlType::Float
+-            && self.int_atomic_reinterpret_globals.contains(&global.name)
+-        {
+-            return Ok(LlType::Int(32));
++        if global.addrspace == 3 && self.int_atomic_reinterpret_globals.contains(&global.name) {
++            match &ty {
++                LlType::Float => return Ok(LlType::Int(32)),
++                LlType::Struct(fields)
++                    if fields.len() == 1
++                        && self.resolve_type(&fields[0]).ok() == Some(LlType::Float) =>
++                {
++                    return Ok(LlType::Struct(vec![LlType::Int(32)]));
++                }
++                LlType::Array(elem, count)
++                    if self.resolve_type(elem).ok() == Some(LlType::Float) =>
++                {
++                    return Ok(LlType::Array(Box::new(LlType::Int(32)), *count));
++                }
++                _ => {}
++            }
+         }
+         // A constant table accessed through a GEP whose source type is NOT the declared type (a
+         // reinterpret view — e.g. a packed byte-table struct addressed as `[16 x [32 x i8]]` with a
+diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
+index dbbb4ed..80f9054 100644
+--- a/src/native/emitter/ops/air_calls.rs
++++ b/src/native/emitter/ops/air_calls.rs
+@@ -1,5 +1,6 @@
+ //! Byte-neutral responsibility split of the former monolith impl; see the parent module.
+ 
++use super::atomics::{AtomicF32Target, FloatCasOp};
+ use super::*;
+ 
+ impl Emitter {
+@@ -110,14 +111,24 @@ impl Emitter {
+                 ));
+                 Ok(true)
+             }
+-            "air.atomic.local.store.i32" | "air.atomic.global.store.i32" => {
++            "air.atomic.local.store.i32"
++            | "air.atomic.global.store.i32"
++            | "air.atomic.local.store.i64"
++            | "air.atomic.global.store.i64" => {
+                 if call.args.len() != 5 {
+                     return Err(format!(
+                         "native emitter: {} expects 5 operands",
+                         call.callee
+                     ));
+                 }
+-                let ptr = self.atomic_i32_pointer_id(&call.args[0], 2, instructions)?;
++                let bits = if call.callee.ends_with(".i64") {
++                    self.require_capability(Capability::Int64);
++                    self.require_capability(Capability::Int64Atomics);
++                    64
++                } else {
++                    32
++                };
++                let ptr = self.atomic_int_pointer_id(&call.args[0], bits, 2, instructions)?;
+                 let value =
+                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
+                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
+@@ -155,6 +166,68 @@ impl Emitter {
+                 }
+                 Ok(true)
+             }
++            "air.atomic.local.store.f32"
++            | "air.atomic.global.store.f32"
++            | "air.atomic.local.store.f.f32"
++            | "air.atomic.global.store.f.f32" => {
++                if call.args.len() != 5 {
++                    return Err(format!(
++                        "native emitter: {} expects 5 operands",
++                        call.callee
++                    ));
++                }
++                let target = self.atomic_f32_target(&call.args[0], false, 2, instructions)?;
++                let value_f32 =
++                    self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                let scope = self.const_uint(scope_kind as u32)?;
++                let semantics = self.const_uint(
++                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::RELEASE).bits(),
++                )?;
++                let (ptr, stored_value) = match target {
++                    AtomicF32Target::FloatPtr(ptr) => (ptr, value_f32),
++                    AtomicF32Target::U32Ptr(ptr) => {
++                        let u32_ty = self.type_id(&LlType::Int(32))?;
++                        let bits = self.fresh();
++                        instructions.push(Self::inst(
++                            Op::Bitcast,
++                            Some(u32_ty),
++                            Some(bits),
++                            vec![Operand::IdRef(value_f32)],
++                        ));
++                        (ptr, bits)
++                    }
++                };
++                if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                    self.emit_guarded_i32_atomic_store(guard, instructions, |instructions| {
++                        instructions.push(Self::inst(
++                            Op::AtomicStore,
++                            None,
++                            None,
++                            vec![
++                                Operand::IdRef(ptr),
++                                Operand::IdScope(scope),
++                                Operand::IdMemorySemantics(semantics),
++                                Operand::IdRef(stored_value),
++                            ],
++                        ));
++                        Ok(())
++                    })?;
++                } else {
++                    instructions.push(Self::inst(
++                        Op::AtomicStore,
++                        None,
++                        None,
++                        vec![
++                            Operand::IdRef(ptr),
++                            Operand::IdScope(scope),
++                            Operand::IdMemorySemantics(semantics),
++                            Operand::IdRef(stored_value),
++                        ],
++                    ));
++                }
++                Ok(true)
++            }
+             _ => Ok(false),
+         }
+     }
+@@ -372,15 +445,25 @@ impl Emitter {
+                 ));
+                 Ok(true)
+             }
+-            "air.atomic.local.load.i32" | "air.atomic.global.load.i32" => {
++            "air.atomic.local.load.i32"
++            | "air.atomic.global.load.i32"
++            | "air.atomic.local.load.i64"
++            | "air.atomic.global.load.i64" => {
+                 if call.args.len() != 4 {
+                     return Err(format!(
+                         "native emitter: {} expects 4 operands",
+                         call.callee
+                     ));
+                 }
++                let bits = if call.callee.ends_with(".i64") {
++                    self.require_capability(Capability::Int64);
++                    self.require_capability(Capability::Int64Atomics);
++                    64
++                } else {
++                    32
++                };
+                 let result_ty = self.resolve_type(&call.ret)?;
+-                if result_ty != LlType::Int(32) {
++                if result_ty != LlType::Int(bits) {
+                     return Err(format!(
+                         "native emitter: {} returned {result_ty:?}",
+                         call.callee
+@@ -388,18 +471,19 @@ impl Emitter {
+                 }
+                 let result_type = self.type_id(&result_ty)?;
+                 let result = self.result_id(name, &result_ty)?;
+-                let ptr = self.atomic_i32_pointer_id(&call.args[0], 1, instructions)?;
++                let ptr = self.atomic_int_pointer_id(&call.args[0], bits, 1, instructions)?;
+                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
+                 let scope = self.const_uint(scope_kind as u32)?;
+                 let semantics_kind =
+                     Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE);
+                 let semantics = self.const_uint(semantics_kind.bits())?;
+                 if let Some(guard) = self.atomic_pointer_guard(ptr) {
+-                    self.emit_guarded_i32_atomic_value(
++                    self.emit_guarded_atomic_value(
+                         result,
++                        &result_ty,
+                         guard,
+                         instructions,
+-                        |atomic_result, instructions| {
++                        |_this, atomic_result, instructions| {
+                             instructions.push(Self::inst(
+                                 Op::AtomicLoad,
+                                 Some(result_type),
+@@ -427,7 +511,238 @@ impl Emitter {
+                 }
+                 Ok(true)
+             }
+-            "air.atomic.global.add.f32" => {
++            "air.atomic.local.load.f32"
++            | "air.atomic.global.load.f32"
++            | "air.atomic.local.load.f.f32"
++            | "air.atomic.global.load.f.f32" => {
++                if call.args.len() != 4 {
++                    return Err(format!(
++                        "native emitter: {} expects 4 operands",
++                        call.callee
++                    ));
++                }
++                let result_ty = self.resolve_type(&call.ret)?;
++                if result_ty != LlType::Float {
++                    return Err(format!(
++                        "native emitter: {} returned {result_ty:?}",
++                        call.callee
++                    ));
++                }
++                let f32_ty = self.type_id(&LlType::Float)?;
++                let result = self.result_id(name, &LlType::Float)?;
++                let target = self.atomic_f32_target(&call.args[0], false, 1, instructions)?;
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                let scope = self.const_uint(scope_kind as u32)?;
++                let semantics = self.const_uint(
++                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE).bits(),
++                )?;
++                match target {
++                    AtomicF32Target::FloatPtr(ptr) => {
++                        if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                            self.emit_guarded_atomic_value(
++                                result,
++                                &LlType::Float,
++                                guard,
++                                instructions,
++                                |_this, atomic_result, instructions| {
++                                    instructions.push(Self::inst(
++                                        Op::AtomicLoad,
++                                        Some(f32_ty),
++                                        Some(atomic_result),
++                                        vec![
++                                            Operand::IdRef(ptr),
++                                            Operand::IdScope(scope),
++                                            Operand::IdMemorySemantics(semantics),
++                                        ],
++                                    ));
++                                    Ok(())
++                                },
++                            )?;
++                        } else {
++                            instructions.push(Self::inst(
++                                Op::AtomicLoad,
++                                Some(f32_ty),
++                                Some(result),
++                                vec![
++                                    Operand::IdRef(ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(semantics),
++                                ],
++                            ));
++                        }
++                    }
++                    AtomicF32Target::U32Ptr(ptr) => {
++                        let u32_ty = self.type_id(&LlType::Int(32))?;
++                        let bits = self.fresh();
++                        if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                            self.emit_guarded_atomic_value(
++                                bits,
++                                &LlType::Int(32),
++                                guard,
++                                instructions,
++                                |_this, atomic_result, instructions| {
++                                    instructions.push(Self::inst(
++                                        Op::AtomicLoad,
++                                        Some(u32_ty),
++                                        Some(atomic_result),
++                                        vec![
++                                            Operand::IdRef(ptr),
++                                            Operand::IdScope(scope),
++                                            Operand::IdMemorySemantics(semantics),
++                                        ],
++                                    ));
++                                    Ok(())
++                                },
++                            )?;
++                        } else {
++                            instructions.push(Self::inst(
++                                Op::AtomicLoad,
++                                Some(u32_ty),
++                                Some(bits),
++                                vec![
++                                    Operand::IdRef(ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(semantics),
++                                ],
++                            ));
++                        }
++                        instructions.push(Self::inst(
++                            Op::Bitcast,
++                            Some(f32_ty),
++                            Some(result),
++                            vec![Operand::IdRef(bits)],
++                        ));
++                    }
++                }
++                Ok(true)
++            }
++            "air.atomic.local.xchg.f32"
++            | "air.atomic.global.xchg.f32"
++            | "air.atomic.local.xchg.f.f32"
++            | "air.atomic.global.xchg.f.f32" => {
++                if call.args.len() != 5 {
++                    return Err(format!(
++                        "native emitter: {} expects 5 operands",
++                        call.callee
++                    ));
++                }
++                let result_ty = self.resolve_type(&call.ret)?;
++                if result_ty != LlType::Float {
++                    return Err(format!(
++                        "native emitter: {} returned {result_ty:?}",
++                        call.callee
++                    ));
++                }
++                let f32_ty = self.type_id(&LlType::Float)?;
++                let result = self.result_id(name, &LlType::Float)?;
++                let target = self.atomic_f32_target(&call.args[0], false, 3, instructions)?;
++                let value_f32 =
++                    self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                let scope = self.const_uint(scope_kind as u32)?;
++                let semantics = self.const_uint(
++                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE)
++                        .bits(),
++                )?;
++                match target {
++                    AtomicF32Target::FloatPtr(ptr) => {
++                        if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                            self.emit_guarded_atomic_value(
++                                result,
++                                &LlType::Float,
++                                guard,
++                                instructions,
++                                |_this, atomic_result, instructions| {
++                                    instructions.push(Self::inst(
++                                        Op::AtomicExchange,
++                                        Some(f32_ty),
++                                        Some(atomic_result),
++                                        vec![
++                                            Operand::IdRef(ptr),
++                                            Operand::IdScope(scope),
++                                            Operand::IdMemorySemantics(semantics),
++                                            Operand::IdRef(value_f32),
++                                        ],
++                                    ));
++                                    Ok(())
++                                },
++                            )?;
++                        } else {
++                            instructions.push(Self::inst(
++                                Op::AtomicExchange,
++                                Some(f32_ty),
++                                Some(result),
++                                vec![
++                                    Operand::IdRef(ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(semantics),
++                                    Operand::IdRef(value_f32),
++                                ],
++                            ));
++                        }
++                    }
++                    AtomicF32Target::U32Ptr(ptr) => {
++                        let u32_ty = self.type_id(&LlType::Int(32))?;
++                        let value_u32 = self.fresh();
++                        instructions.push(Self::inst(
++                            Op::Bitcast,
++                            Some(u32_ty),
++                            Some(value_u32),
++                            vec![Operand::IdRef(value_f32)],
++                        ));
++                        let prev_u32 = self.fresh();
++                        if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                            self.emit_guarded_atomic_value(
++                                prev_u32,
++                                &LlType::Int(32),
++                                guard,
++                                instructions,
++                                |_this, atomic_result, instructions| {
++                                    instructions.push(Self::inst(
++                                        Op::AtomicExchange,
++                                        Some(u32_ty),
++                                        Some(atomic_result),
++                                        vec![
++                                            Operand::IdRef(ptr),
++                                            Operand::IdScope(scope),
++                                            Operand::IdMemorySemantics(semantics),
++                                            Operand::IdRef(value_u32),
++                                        ],
++                                    ));
++                                    Ok(())
++                                },
++                            )?;
++                        } else {
++                            instructions.push(Self::inst(
++                                Op::AtomicExchange,
++                                Some(u32_ty),
++                                Some(prev_u32),
++                                vec![
++                                    Operand::IdRef(ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(semantics),
++                                    Operand::IdRef(value_u32),
++                                ],
++                            ));
++                        }
++                        instructions.push(Self::inst(
++                            Op::Bitcast,
++                            Some(f32_ty),
++                            Some(result),
++                            vec![Operand::IdRef(prev_u32)],
++                        ));
++                    }
++                }
++                Ok(true)
++            }
++            "air.atomic.global.add.f32"
++            | "air.atomic.global.add.f.f32"
++            | "air.atomic.local.add.f32"
++            | "air.atomic.local.add.f.f32"
++            | "air.atomic.global.sub.f32"
++            | "air.atomic.global.sub.f.f32"
++            | "air.atomic.local.sub.f32"
++            | "air.atomic.local.sub.f.f32" => {
+                 if call.args.len() != 5 {
+                     return Err(format!(
+                         "native emitter: {} expects 5 operands",
+@@ -441,32 +756,117 @@ impl Emitter {
+                         call.callee
+                     ));
+                 }
+-                self.require_capability(Capability::AtomicFloat32AddEXT);
+-                self.require_extension("SPV_EXT_shader_atomic_float_add");
++                let is_sub = call.callee.contains(".sub.");
+                 let result_type = self.type_id(&result_ty)?;
+                 let result = self.result_id(name, &result_ty)?;
+-                let ptr = self.atomic_f32_pointer_id(&call.args[0], instructions)?;
++                let target = self.atomic_f32_target(&call.args[0], false, 3, instructions)?;
+                 let value =
+                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
+-                let scope = self.const_uint(Scope::Device as u32)?;
+-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+-                instructions.push(Self::inst(
+-                    Op::AtomicFAddEXT,
+-                    Some(result_type),
+-                    Some(result),
+-                    vec![
+-                        Operand::IdRef(ptr),
+-                        Operand::IdScope(scope),
+-                        Operand::IdMemorySemantics(semantics),
+-                        Operand::IdRef(value),
+-                    ],
+-                ));
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                match target {
++                    AtomicF32Target::FloatPtr(ptr) => {
++                        self.require_capability(Capability::AtomicFloat32AddEXT);
++                        self.require_extension("SPV_EXT_shader_atomic_float_add");
++                        let addend = if is_sub {
++                            let negated = self.fresh();
++                            instructions.push(Self::inst(
++                                Op::FNegate,
++                                Some(result_type),
++                                Some(negated),
++                                vec![Operand::IdRef(value)],
++                            ));
++                            negated
++                        } else {
++                            value
++                        };
++                        let scope = self.const_uint(scope_kind as u32)?;
++                        let semantics = self.const_uint(
++                            Self::atomic_i32_memory_semantics(
++                                scope_kind,
++                                MemorySemantics::ACQUIRE_RELEASE,
++                            )
++                            .bits(),
++                        )?;
++                        if let Some(guard) = self.atomic_pointer_guard(ptr) {
++                            self.emit_guarded_atomic_value(
++                                result,
++                                &LlType::Float,
++                                guard,
++                                instructions,
++                                |_this, atomic_result, instructions| {
++                                    instructions.push(Self::inst(
++                                        Op::AtomicFAddEXT,
++                                        Some(result_type),
++                                        Some(atomic_result),
++                                        vec![
++                                            Operand::IdRef(ptr),
++                                            Operand::IdScope(scope),
++                                            Operand::IdMemorySemantics(semantics),
++                                            Operand::IdRef(addend),
++                                        ],
++                                    ));
++                                    Ok(())
++                                },
++                            )?;
++                        } else {
++                            instructions.push(Self::inst(
++                                Op::AtomicFAddEXT,
++                                Some(result_type),
++                                Some(result),
++                                vec![
++                                    Operand::IdRef(ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(semantics),
++                                    Operand::IdRef(addend),
++                                ],
++                            ));
++                        }
++                    }
++                    AtomicF32Target::U32Ptr(u32_ptr) => {
++                        let cas_op = if is_sub {
++                            FloatCasOp::Sub
++                        } else {
++                            FloatCasOp::Add
++                        };
++                        if let Some(guard) = self.atomic_pointer_guard(u32_ptr) {
++                            self.emit_guarded_atomic_value(
++                                result,
++                                &LlType::Float,
++                                guard,
++                                instructions,
++                                |this, atomic_result, instructions| {
++                                    this.emit_f32_cas_loop(
++                                        atomic_result,
++                                        u32_ptr,
++                                        value,
++                                        cas_op,
++                                        scope_kind,
++                                        instructions,
++                                    )
++                                },
++                            )?;
++                        } else {
++                            self.emit_f32_cas_loop(
++                                result,
++                                u32_ptr,
++                                value,
++                                cas_op,
++                                scope_kind,
++                                instructions,
++                            )?;
++                        }
++                    }
++                }
+                 Ok(true)
+             }
+-            "air.atomic.global.sub.f32" => {
+-                // SPIR-V has no atomic float subtract; an atomic fetch-sub is exactly an atomic
+-                // fetch-add of the negated operand (both return the prior value), so negate then
+-                // AtomicFAddEXT.
++            "air.atomic.global.min.f32"
++            | "air.atomic.global.min.f.f32"
++            | "air.atomic.local.min.f32"
++            | "air.atomic.local.min.f.f32"
++            | "air.atomic.global.max.f32"
++            | "air.atomic.global.max.f.f32"
++            | "air.atomic.local.max.f32"
++            | "air.atomic.local.max.f.f32" => {
+                 if call.args.len() != 5 {
+                     return Err(format!(
+                         "native emitter: {} expects 5 operands",
+@@ -480,44 +880,205 @@ impl Emitter {
+                         call.callee
+                     ));
+                 }
+-                self.require_capability(Capability::AtomicFloat32AddEXT);
+-                self.require_extension("SPV_EXT_shader_atomic_float_add");
+-                let result_type = self.type_id(&result_ty)?;
+-                let result = self.result_id(name, &result_ty)?;
+-                let ptr = self.atomic_f32_pointer_id(&call.args[0], instructions)?;
++                let cas_op = if call.callee.contains(".min.") {
++                    FloatCasOp::Min
++                } else {
++                    FloatCasOp::Max
++                };
++                let result = self.result_id(name, &LlType::Float)?;
++                let target = self.atomic_f32_target(&call.args[0], true, 3, instructions)?;
++                let AtomicF32Target::U32Ptr(u32_ptr) = target else {
++                    return Err(format!(
++                        "native emitter: {} requires a u32-addressable slot for CAS lowering",
++                        call.callee
++                    ));
++                };
+                 let value =
+                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
+-                let negated = self.fresh();
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                if let Some(guard) = self.atomic_pointer_guard(u32_ptr) {
++                    self.emit_guarded_atomic_value(
++                        result,
++                        &LlType::Float,
++                        guard,
++                        instructions,
++                        |this, atomic_result, instructions| {
++                            this.emit_f32_cas_loop(
++                                atomic_result,
++                                u32_ptr,
++                                value,
++                                cas_op,
++                                scope_kind,
++                                instructions,
++                            )
++                        },
++                    )?;
++                } else {
++                    self.emit_f32_cas_loop(
++                        result,
++                        u32_ptr,
++                        value,
++                        cas_op,
++                        scope_kind,
++                        instructions,
++                    )?;
++                }
++                Ok(true)
++            }
++            "air.atomic.local.cmpxchg.weak.f32"
++            | "air.atomic.global.cmpxchg.weak.f32"
++            | "air.atomic.local.cmpxchg.weak.f.f32"
++            | "air.atomic.global.cmpxchg.weak.f.f32" => {
++                if !matches!(call.args.len(), 6 | 7) {
++                    return Err(format!(
++                        "native emitter: {} expects 6 or 7 operands",
++                        call.callee
++                    ));
++                }
++                let result_ty = self.resolve_type(&call.ret)?;
++                if !matches!(result_ty, LlType::Bool | LlType::Float) {
++                    return Err(format!(
++                        "native emitter: {} returned {result_ty:?}",
++                        call.callee
++                    ));
++                }
++                let compare_ptr_ty = self.resolve_type(&call.args[1].ty)?;
++                if !matches!(compare_ptr_ty, LlType::Ptr(_)) {
++                    return Err(format!(
++                        "native emitter: {} compare operand is {compare_ptr_ty:?}",
++                        call.callee
++                    ));
++                }
++                let target = self.atomic_f32_target(&call.args[0], true, 3, instructions)?;
++                let AtomicF32Target::U32Ptr(u32_ptr) = target else {
++                    return Err(format!(
++                        "native emitter: {} requires a u32-addressable slot for CAS lowering",
++                        call.callee
++                    ));
++                };
++                let f32_ty = self.type_id(&LlType::Float)?;
++                let u32_ty = self.type_id(&LlType::Int(32))?;
++                let bool_ty = self.type_id(&LlType::Bool)?;
++                let result = self.result_id(name, &result_ty)?;
++                let compare_ptr = self.value_id(&call.args[1].value, &call.args[1].ty)?;
++                let compare_f32 = self.fresh();
+                 instructions.push(Self::inst(
+-                    Op::FNegate,
+-                    Some(result_type),
+-                    Some(negated),
+-                    vec![Operand::IdRef(value)],
++                    Op::Load,
++                    Some(f32_ty),
++                    Some(compare_f32),
++                    vec![Operand::IdRef(compare_ptr)],
+                 ));
+-                let scope = self.const_uint(Scope::Device as u32)?;
+-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
++                let compare_u32 = self.fresh();
+                 instructions.push(Self::inst(
+-                    Op::AtomicFAddEXT,
+-                    Some(result_type),
+-                    Some(result),
+-                    vec![
+-                        Operand::IdRef(ptr),
+-                        Operand::IdScope(scope),
+-                        Operand::IdMemorySemantics(semantics),
+-                        Operand::IdRef(negated),
+-                    ],
++                    Op::Bitcast,
++                    Some(u32_ty),
++                    Some(compare_u32),
++                    vec![Operand::IdRef(compare_f32)],
+                 ));
++                let desired_f32 =
++                    self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
++                let desired_u32 = self.fresh();
++                instructions.push(Self::inst(
++                    Op::Bitcast,
++                    Some(u32_ty),
++                    Some(desired_u32),
++                    vec![Operand::IdRef(desired_f32)],
++                ));
++                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
++                let scope = self.const_uint(scope_kind as u32)?;
++                let success_semantics = self.const_uint(
++                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE)
++                        .bits(),
++                )?;
++                let failure_semantics = self.const_uint(
++                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE).bits(),
++                )?;
++                let observed_u32 = self.fresh();
++                if let Some(guard) = self.atomic_pointer_guard(u32_ptr) {
++                    self.emit_guarded_atomic_value(
++                        observed_u32,
++                        &LlType::Int(32),
++                        guard,
++                        instructions,
++                        |_this, atomic_result, instructions| {
++                            instructions.push(Self::inst(
++                                Op::AtomicCompareExchange,
++                                Some(u32_ty),
++                                Some(atomic_result),
++                                vec![
++                                    Operand::IdRef(u32_ptr),
++                                    Operand::IdScope(scope),
++                                    Operand::IdMemorySemantics(success_semantics),
++                                    Operand::IdMemorySemantics(failure_semantics),
++                                    Operand::IdRef(desired_u32),
++                                    Operand::IdRef(compare_u32),
++                                ],
++                            ));
++                            Ok(())
++                        },
++                    )?;
++                } else {
++                    instructions.push(Self::inst(
++                        Op::AtomicCompareExchange,
++                        Some(u32_ty),
++                        Some(observed_u32),
++                        vec![
++                            Operand::IdRef(u32_ptr),
++                            Operand::IdScope(scope),
++                            Operand::IdMemorySemantics(success_semantics),
++                            Operand::IdMemorySemantics(failure_semantics),
++                            Operand::IdRef(desired_u32),
++                            Operand::IdRef(compare_u32),
++                        ],
++                    ));
++                }
++                let observed_f32 = if result_ty == LlType::Float {
++                    result
++                } else {
++                    self.fresh()
++                };
++                instructions.push(Self::inst(
++                    Op::Bitcast,
++                    Some(f32_ty),
++                    Some(observed_f32),
++                    vec![Operand::IdRef(observed_u32)],
++                ));
++                instructions.push(Self::inst(
++                    Op::Store,
++                    None,
++                    None,
++                    vec![Operand::IdRef(compare_ptr), Operand::IdRef(observed_f32)],
++                ));
++                if result_ty == LlType::Bool {
++                    instructions.push(Self::inst(
++                        Op::IEqual,
++                        Some(bool_ty),
++                        Some(result),
++                        vec![Operand::IdRef(observed_u32), Operand::IdRef(compare_u32)],
++                    ));
++                }
+                 Ok(true)
+             }
+-            "air.atomic.local.cmpxchg.weak.i32" | "air.atomic.global.cmpxchg.weak.i32" => {
+-                if call.args.len() != 7 {
++            "air.atomic.local.cmpxchg.weak.i32"
++            | "air.atomic.global.cmpxchg.weak.i32"
++            | "air.atomic.local.cmpxchg.weak.i64"
++            | "air.atomic.global.cmpxchg.weak.i64" => {
++                if !matches!(call.args.len(), 6 | 7) {
+                     return Err(format!(
+-                        "native emitter: {} expects 7 operands",
++                        "native emitter: {} expects 6 or 7 operands",
+                         call.callee
+                     ));
+                 }
++                let bits = if call.callee.ends_with(".i64") {
++                    self.require_capability(Capability::Int64);
++                    self.require_capability(Capability::Int64Atomics);
++                    64
++                } else {
++                    32
++                };
++                let int_ll_ty = LlType::Int(bits);
+                 let result_ty = self.resolve_type(&call.ret)?;
+-                if result_ty != LlType::Int(32) {
++                if result_ty != int_ll_ty && result_ty != LlType::Bool {
+                     return Err(format!(
+                         "native emitter: {} returned {result_ty:?}",
+                         call.callee
+@@ -530,14 +1091,19 @@ impl Emitter {
+                         call.callee
+                     ));
+                 }
+-                let result_type = self.type_id(&result_ty)?;
++                let int_type = self.type_id(&int_ll_ty)?;
+                 let result = self.result_id(name, &result_ty)?;
+-                let ptr = self.atomic_i32_pointer_id(&call.args[0], 3, instructions)?;
++                let observed = if result_ty == int_ll_ty {
++                    result
++                } else {
++                    self.fresh()
++                };
++                let ptr = self.atomic_int_pointer_id(&call.args[0], bits, 3, instructions)?;
+                 let compare_ptr = self.value_id(&call.args[1].value, &call.args[1].ty)?;
+                 let compare = self.fresh();
+                 instructions.push(Self::inst(
+                     Op::Load,
+-                    Some(result_type),
++                    Some(int_type),
+                     Some(compare),
+                     vec![Operand::IdRef(compare_ptr)],
+                 ));
+@@ -552,14 +1118,15 @@ impl Emitter {
+                 let success_semantics = self.const_uint(success_semantics_kind.bits())?;
+                 let failure_semantics = self.const_uint(failure_semantics_kind.bits())?;
+                 if let Some(guard) = self.atomic_pointer_guard(ptr) {
+-                    self.emit_guarded_i32_atomic_value(
+-                        result,
++                    self.emit_guarded_atomic_value(
++                        observed,
++                        &int_ll_ty,
+                         guard,
+                         instructions,
+-                        |atomic_result, instructions| {
++                        |_this, atomic_result, instructions| {
+                             instructions.push(Self::inst(
+                                 Op::AtomicCompareExchange,
+-                                Some(result_type),
++                                Some(int_type),
+                                 Some(atomic_result),
+                                 vec![
+                                     Operand::IdRef(ptr),
+@@ -576,8 +1143,8 @@ impl Emitter {
+                 } else {
+                     instructions.push(Self::inst(
+                         Op::AtomicCompareExchange,
+-                        Some(result_type),
+-                        Some(result),
++                        Some(int_type),
++                        Some(observed),
+                         vec![
+                             Operand::IdRef(ptr),
+                             Operand::IdScope(scope),
+@@ -592,8 +1159,17 @@ impl Emitter {
+                     Op::Store,
+                     None,
+                     None,
+-                    vec![Operand::IdRef(compare_ptr), Operand::IdRef(result)],
++                    vec![Operand::IdRef(compare_ptr), Operand::IdRef(observed)],
+                 ));
++                if result_ty == LlType::Bool {
++                    let bool_ty = self.type_id(&LlType::Bool)?;
++                    instructions.push(Self::inst(
++                        Op::IEqual,
++                        Some(bool_ty),
++                        Some(result),
++                        vec![Operand::IdRef(observed), Operand::IdRef(compare)],
++                    ));
++                }
+                 Ok(true)
+             }
+             "air.atomic.local.add.s.i32"
+@@ -604,28 +1180,73 @@ impl Emitter {
+             | "air.atomic.local.max.u.i32"
+             | "air.atomic.local.min.s.i32"
+             | "air.atomic.local.min.u.i32"
++            | "air.atomic.local.and.s.i32"
+             | "air.atomic.local.and.u.i32"
++            | "air.atomic.local.or.s.i32"
+             | "air.atomic.local.or.u.i32"
++            | "air.atomic.local.xor.s.i32"
++            | "air.atomic.local.xor.u.i32"
+             | "air.atomic.local.xchg.i32"
+             | "air.atomic.global.add.s.i32"
+             | "air.atomic.global.add.u.i32"
++            | "air.atomic.global.and.s.i32"
+             | "air.atomic.global.and.u.i32"
++            | "air.atomic.global.or.s.i32"
+             | "air.atomic.global.or.u.i32"
++            | "air.atomic.global.xor.s.i32"
++            | "air.atomic.global.xor.u.i32"
+             | "air.atomic.global.xchg.i32"
+             | "air.atomic.global.max.s.i32"
+             | "air.atomic.global.max.u.i32"
+             | "air.atomic.global.min.s.i32"
+             | "air.atomic.global.min.u.i32"
+             | "air.atomic.global.sub.s.i32"
+-            | "air.atomic.global.sub.u.i32" => {
++            | "air.atomic.global.sub.u.i32"
++            | "air.atomic.local.add.s.i64"
++            | "air.atomic.local.add.u.i64"
++            | "air.atomic.local.sub.s.i64"
++            | "air.atomic.local.sub.u.i64"
++            | "air.atomic.local.max.s.i64"
++            | "air.atomic.local.max.u.i64"
++            | "air.atomic.local.min.s.i64"
++            | "air.atomic.local.min.u.i64"
++            | "air.atomic.local.and.s.i64"
++            | "air.atomic.local.and.u.i64"
++            | "air.atomic.local.or.s.i64"
++            | "air.atomic.local.or.u.i64"
++            | "air.atomic.local.xor.s.i64"
++            | "air.atomic.local.xor.u.i64"
++            | "air.atomic.local.xchg.i64"
++            | "air.atomic.global.add.s.i64"
++            | "air.atomic.global.add.u.i64"
++            | "air.atomic.global.sub.s.i64"
++            | "air.atomic.global.sub.u.i64"
++            | "air.atomic.global.max.s.i64"
++            | "air.atomic.global.max.u.i64"
++            | "air.atomic.global.min.s.i64"
++            | "air.atomic.global.min.u.i64"
++            | "air.atomic.global.and.s.i64"
++            | "air.atomic.global.and.u.i64"
++            | "air.atomic.global.or.s.i64"
++            | "air.atomic.global.or.u.i64"
++            | "air.atomic.global.xor.s.i64"
++            | "air.atomic.global.xor.u.i64"
++            | "air.atomic.global.xchg.i64" => {
+                 if call.args.len() != 5 {
+                     return Err(format!(
+                         "native emitter: {} expects 5 operands",
+                         call.callee
+                     ));
+                 }
++                let bits = if call.callee.ends_with(".i64") {
++                    self.require_capability(Capability::Int64);
++                    self.require_capability(Capability::Int64Atomics);
++                    64
++                } else {
++                    32
++                };
+                 let result_ty = self.resolve_type(&call.ret)?;
+-                if result_ty != LlType::Int(32) {
++                if result_ty != LlType::Int(bits) {
+                     return Err(format!(
+                         "native emitter: {} returned {result_ty:?}",
+                         call.callee
+@@ -633,31 +1254,39 @@ impl Emitter {
+                 }
+                 let result_type = self.type_id(&result_ty)?;
+                 let result = self.result_id(name, &result_ty)?;
+-                let ptr = self.atomic_i32_pointer_id(&call.args[0], 3, instructions)?;
++                let ptr = self.atomic_int_pointer_id(&call.args[0], bits, 3, instructions)?;
+                 let value =
+                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
+-                let op = match call.callee.as_str() {
+-                    "air.atomic.local.add.s.i32" => Op::AtomicIAdd,
+-                    "air.atomic.local.add.u.i32" => Op::AtomicIAdd,
+-                    "air.atomic.local.sub.s.i32" | "air.atomic.local.sub.u.i32" => Op::AtomicISub,
+-                    "air.atomic.local.max.s.i32" => Op::AtomicSMax,
+-                    "air.atomic.local.max.u.i32" => Op::AtomicUMax,
+-                    "air.atomic.local.min.s.i32" => Op::AtomicSMin,
+-                    "air.atomic.local.min.u.i32" => Op::AtomicUMin,
+-                    "air.atomic.local.and.u.i32" => Op::AtomicAnd,
+-                    "air.atomic.global.add.s.i32" => Op::AtomicIAdd,
+-                    "air.atomic.global.add.u.i32" => Op::AtomicIAdd,
+-                    "air.atomic.global.and.u.i32" => Op::AtomicAnd,
+-                    "air.atomic.global.xchg.i32" => Op::AtomicExchange,
+-                    "air.atomic.global.max.s.i32" => Op::AtomicSMax,
+-                    "air.atomic.global.max.u.i32" => Op::AtomicUMax,
+-                    "air.atomic.global.min.s.i32" => Op::AtomicSMin,
+-                    "air.atomic.global.min.u.i32" => Op::AtomicUMin,
+-                    "air.atomic.global.or.u.i32" => Op::AtomicOr,
+-                    "air.atomic.global.sub.s.i32" | "air.atomic.global.sub.u.i32" => Op::AtomicISub,
+-                    "air.atomic.local.or.u.i32" => Op::AtomicOr,
+-                    "air.atomic.local.xchg.i32" => Op::AtomicExchange,
+-                    _ => Op::AtomicIAdd,
++                let suffix = call
++                    .callee
++                    .strip_prefix("air.atomic.local.")
++                    .or_else(|| call.callee.strip_prefix("air.atomic.global."))
++                    .unwrap_or("");
++                let op = if suffix.starts_with("add.") {
++                    Op::AtomicIAdd
++                } else if suffix.starts_with("sub.") {
++                    Op::AtomicISub
++                } else if suffix.starts_with("max.s.") {
++                    Op::AtomicSMax
++                } else if suffix.starts_with("max.u.") {
++                    Op::AtomicUMax
++                } else if suffix.starts_with("min.s.") {
++                    Op::AtomicSMin
++                } else if suffix.starts_with("min.u.") {
++                    Op::AtomicUMin
++                } else if suffix.starts_with("and.") {
++                    Op::AtomicAnd
++                } else if suffix.starts_with("or.") {
++                    Op::AtomicOr
++                } else if suffix.starts_with("xor.") {
++                    Op::AtomicXor
++                } else if suffix.starts_with("xchg.") {
++                    Op::AtomicExchange
++                } else {
++                    return Err(format!(
++                        "native emitter: unhandled integer atomic {}",
++                        call.callee
++                    ));
+                 };
+                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
+                 let scope = self.const_uint(scope_kind as u32)?;
+@@ -665,11 +1294,12 @@ impl Emitter {
+                     Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE);
+                 let semantics = self.const_uint(semantics_kind.bits())?;
+                 if let Some(guard) = self.atomic_pointer_guard(ptr) {
+-                    self.emit_guarded_i32_atomic_value(
++                    self.emit_guarded_atomic_value(
+                         result,
++                        &result_ty,
+                         guard,
+                         instructions,
+-                        |atomic_result, instructions| {
++                        |_this, atomic_result, instructions| {
+                             instructions.push(Self::inst(
+                                 op,
+                                 Some(result_type),
+diff --git a/src/native/emitter/ops/atomics.rs b/src/native/emitter/ops/atomics.rs
+index 43f52c5..c85bb71 100644
+--- a/src/native/emitter/ops/atomics.rs
++++ b/src/native/emitter/ops/atomics.rs
+@@ -2,6 +2,19 @@
+ 
+ use super::*;
+ 
++pub(in crate::native::emitter) enum AtomicF32Target {
++    FloatPtr(Word),
++    U32Ptr(Word),
++}
++
++#[derive(Clone, Copy)]
++pub(in crate::native::emitter) enum FloatCasOp {
++    Add,
++    Sub,
++    Min,
++    Max,
++}
++
+ impl Emitter {
+     /// The scope an atomic on `ptr_arg` is performed over: the storage class of the pointer
+     /// [`Self::atomic_i32_pointer_id`] will emit for the SAME argument.
+@@ -59,17 +72,25 @@ impl Emitter {
+         }
+     }
+ 
+-    pub(in crate::native::emitter) fn atomic_i32_pointer_id(
++    pub(in crate::native::emitter) fn atomic_int_pointer_id(
+         &mut self,
+         ptr_arg: &TypedValue,
++        bits: u32,
+         required_access: u64,
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<Word, String> {
++        let int_ty = LlType::Int(bits);
++        let access_bytes = u64::from(bits / 8);
+         if let LlValue::IntToPtr {
+             source,
+             destination,
+         } = &ptr_arg.value
+         {
++            if bits != 32 {
++                return Err(format!(
++                    "native emitter: {bits}-bit Workgroup atomic inttoptr is unsupported"
++                ));
++            }
+             if self.resolve_type(destination)? != LlType::Ptr(3) {
+                 return Err(format!(
+                     "native emitter: atomic inttoptr constant expression targets {destination:?}, expected Workgroup pointer"
+@@ -93,7 +114,7 @@ impl Emitter {
+                     self.used_device_address = true;
+                     let address = self.materialize_device_address(&raw, instructions)?;
+                     let ptr_type =
+-                        self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &LlType::Int(32))?;
++                        self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &int_ty)?;
+                     let ptr = self.fresh();
+                     instructions.push(Self::inst(
+                         Op::ConvertUToPtr,
+@@ -101,35 +122,44 @@ impl Emitter {
+                         Some(ptr),
+                         vec![Operand::IdRef(address)],
+                     ));
+-                    if let Some(guard) =
+-                        self.bda_access_guard(&raw, address, 4, required_access, instructions)?
+-                    {
++                    if let Some(guard) = self.bda_access_guard(
++                        &raw,
++                        address,
++                        access_bytes,
++                        required_access,
++                        instructions,
++                    )? {
+                         self.atomic_pointer_guards.insert(ptr, guard);
+                     }
+                     return Ok(ptr);
+                 }
+-                return self.emit_raw_word_pointer_for_access(&raw, 0, Some(4), instructions);
++                if bits == 32 {
++                    return self.emit_raw_word_pointer_for_access(&raw, 0, Some(4), instructions);
++                }
++                return Err(format!(
++                    "native emitter: {bits}-bit atomic on raw 32-bit buffer `{name}` requires typed i64 storage or BDA"
++                ));
+             }
+         }
+         if matches!(&ptr_arg.value, LlValue::Local(name) if self.unmodeled_pointers.contains(name))
+         {
+-            return self.unmodeled_atomic_i32_pointer();
++            return self.unmodeled_atomic_int_pointer(bits);
+         }
+         let ptr = self.value_id_in(&ptr_arg.value, &ptr_arg.ty, instructions)?;
+         let Some(pointee) = self.pointer_pointee_for_value(&ptr_arg.value)? else {
+             return Ok(ptr);
+         };
+         let pointee = self.resolve_type(&pointee)?;
+-        if pointee == LlType::Int(32) {
++        if pointee == int_ty {
+             return Ok(ptr);
+         }
+-        if pointee == LlType::Float {
++        if bits == 32 && pointee == LlType::Float {
+             return self.bitcast_pointer_to_atomic_i32(ptr_arg, ptr, instructions);
+         }
+ 
+         let LlType::Struct(fields) = pointee else {
+             return Err(format!(
+-                "native emitter: atomic i32 pointer targets {pointee:?}"
++                "native emitter: atomic i{bits} pointer targets {pointee:?}"
+             ));
+         };
+         let mut field = LlType::Struct(fields);
+@@ -137,7 +167,7 @@ impl Emitter {
+         loop {
+             field = self.resolve_type(&field)?;
+             match field {
+-                LlType::Int(32) => break,
++                LlType::Int(w) if w == bits => break,
+                 LlType::Struct(ref fields) if !fields.is_empty() => {
+                     field = fields[0].clone();
+                     depth += 1;
+@@ -148,18 +178,19 @@ impl Emitter {
+                 }
+                 _ => {
+                     return Err(format!(
+-                        "native emitter: atomic i32 pointer first-field chain targets {field:?}"
++                        "native emitter: atomic i{bits} pointer first-field chain targets {field:?}"
+                     ));
+                 }
+             }
+         }
+         let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
+             return Err(format!(
+-                "native emitter: atomic i32 pointer argument has type {:?}",
++                "native emitter: atomic i{bits} pointer argument has type {:?}",
+                 ptr_arg.ty
+             ));
+         };
+-        let ptr_type = self.ptr_type_id(llvm_pointer_storage(addrspace)?, &LlType::Int(32))?;
++        let storage = self.pointer_storage_for(&ptr_arg.value, addrspace)?;
++        let ptr_type = self.ptr_type_id(storage, &int_ty)?;
+         let zero = self.const_uint(0)?;
+         let result = self.fresh();
+         instructions.push(Self::inst(
+@@ -177,22 +208,27 @@ impl Emitter {
+         self.atomic_pointer_guards.get(&ptr).copied()
+     }
+ 
+-    pub(in crate::native::emitter) fn emit_guarded_i32_atomic_value<F>(
++    pub(in crate::native::emitter) fn emit_guarded_atomic_value<F>(
+         &mut self,
+         result: Word,
++        result_ll_ty: &LlType,
+         guard: Word,
+         instructions: &mut Vec<Instruction>,
+         emit_atomic: F,
+     ) -> Result<(), String>
+     where
+-        F: FnOnce(Word, &mut Vec<Instruction>) -> Result<(), String>,
++        F: FnOnce(&mut Self, Word, &mut Vec<Instruction>) -> Result<(), String>,
+     {
+         let access_label = self.fresh();
+         let zero_label = self.fresh();
+         let merge_label = self.fresh();
+         let atomic_result = self.fresh();
+-        let result_ty = self.type_id(&LlType::Int(32))?;
+-        let zero = self.const_uint(0)?;
++        let result_ty = self.type_id(result_ll_ty)?;
++        let zero = if *result_ll_ty == LlType::Int(32) {
++            self.const_uint(0)?
++        } else {
++            self.const_null(result_ll_ty)?
++        };
+ 
+         instructions.push(Self::inst(
+             Op::SelectionMerge,
+@@ -214,7 +250,15 @@ impl Emitter {
+             ],
+         ));
+         instructions.push(Self::inst(Op::Label, None, Some(access_label), vec![]));
+-        emit_atomic(atomic_result, instructions)?;
++        emit_atomic(self, atomic_result, instructions)?;
++        // If `emit_atomic` introduced local control flow (e.g. a CAS retry loop), the incoming
++        // edge to `merge_label` leaves its exit block rather than `access_label`.
++        let access_exit_label = instructions
++            .iter()
++            .rev()
++            .find(|inst| inst.class.opcode == Op::Label)
++            .and_then(|inst| inst.result_id)
++            .unwrap_or(access_label);
+         instructions.push(Self::inst(
+             Op::Branch,
+             None,
+@@ -237,7 +281,7 @@ impl Emitter {
+                 Operand::IdRef(zero),
+                 Operand::IdRef(zero_label),
+                 Operand::IdRef(atomic_result),
+-                Operand::IdRef(access_label),
++                Operand::IdRef(access_exit_label),
+             ],
+         ));
+         Ok(())
+@@ -309,22 +353,69 @@ impl Emitter {
+         Ok(result)
+     }
+ 
+-    pub(in crate::native::emitter) fn atomic_f32_pointer_id(
++    pub(in crate::native::emitter) fn atomic_f32_target(
+         &mut self,
+         ptr_arg: &TypedValue,
++        prefer_u32: bool,
++        required_access: u64,
+         instructions: &mut Vec<Instruction>,
+-    ) -> Result<Word, String> {
++    ) -> Result<AtomicF32Target, String> {
++        if let LlValue::Local(name) = &ptr_arg.value {
++            if let Some(raw) = self.raw_offsets.get(name).cloned() {
++                if raw.device_addr_base.is_some() {
++                    self.used_device_address = true;
++                    let address = self.materialize_device_address(&raw, instructions)?;
++                    let leaf_ty = if prefer_u32 {
++                        LlType::Int(32)
++                    } else {
++                        LlType::Float
++                    };
++                    let ptr_type =
++                        self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &leaf_ty)?;
++                    let ptr = self.fresh();
++                    instructions.push(Self::inst(
++                        Op::ConvertUToPtr,
++                        Some(ptr_type),
++                        Some(ptr),
++                        vec![Operand::IdRef(address)],
++                    ));
++                    if let Some(guard) =
++                        self.bda_access_guard(&raw, address, 4, required_access, instructions)?
++                    {
++                        self.atomic_pointer_guards.insert(ptr, guard);
++                    }
++                    return Ok(if prefer_u32 {
++                        AtomicF32Target::U32Ptr(ptr)
++                    } else {
++                        AtomicF32Target::FloatPtr(ptr)
++                    });
++                }
++                let ptr = self.emit_raw_word_pointer_for_access(&raw, 0, Some(4), instructions)?;
++                return Ok(AtomicF32Target::U32Ptr(ptr));
++            }
++        }
+         if matches!(&ptr_arg.value, LlValue::Local(name) if self.unmodeled_pointers.contains(name))
+         {
+-            return self.unmodeled_atomic_f32_pointer();
++            return Ok(if prefer_u32 {
++                AtomicF32Target::U32Ptr(self.unmodeled_atomic_i32_pointer()?)
++            } else {
++                AtomicF32Target::FloatPtr(self.unmodeled_atomic_f32_pointer()?)
++            });
+         }
+         let ptr = self.value_id_in(&ptr_arg.value, &ptr_arg.ty, instructions)?;
+         let Some(pointee) = self.pointer_pointee_for_value(&ptr_arg.value)? else {
+-            return Ok(ptr);
++            return Ok(if prefer_u32 {
++                AtomicF32Target::U32Ptr(ptr)
++            } else {
++                AtomicF32Target::FloatPtr(ptr)
++            });
+         };
+         let pointee = self.resolve_type(&pointee)?;
+         if pointee == LlType::Float {
+-            return Ok(ptr);
++            return Ok(AtomicF32Target::FloatPtr(ptr));
++        }
++        if pointee == LlType::Int(32) {
++            return Ok(AtomicF32Target::U32Ptr(ptr));
+         }
+ 
+         let LlType::Struct(fields) = pointee else {
+@@ -332,53 +423,238 @@ impl Emitter {
+                 "native emitter: atomic f32 pointer targets {pointee:?}"
+             ));
+         };
+-        let [field] = fields.as_slice() else {
+-            return Err(format!(
+-                "native emitter: atomic f32 pointer targets struct with {} fields",
+-                fields.len()
+-            ));
++        let mut field = LlType::Struct(fields);
++        let mut depth = 0usize;
++        let leaf_ty = loop {
++            field = self.resolve_type(&field)?;
++            match field {
++                LlType::Float => break LlType::Float,
++                LlType::Int(32) => break LlType::Int(32),
++                LlType::Struct(ref fields) if !fields.is_empty() => {
++                    field = fields[0].clone();
++                    depth += 1;
++                }
++                LlType::Array(ref element, count) if count > 0 => {
++                    field = element.as_ref().clone();
++                    depth += 1;
++                }
++                _ => {
++                    return Err(format!(
++                        "native emitter: atomic f32 pointer first-field chain targets {field:?}"
++                    ));
++                }
++            }
+         };
+-        let field = self.resolve_type(field)?;
+-        if field != LlType::Float {
+-            return Err(format!(
+-                "native emitter: atomic f32 pointer targets struct field {field:?}"
+-            ));
+-        }
+         let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
+             return Err(format!(
+                 "native emitter: atomic f32 pointer argument has type {:?}",
+                 ptr_arg.ty
+             ));
+         };
+-        let ptr_type = self.ptr_type_id(llvm_pointer_storage(addrspace)?, &LlType::Float)?;
++        let storage = self.pointer_storage_for(&ptr_arg.value, addrspace)?;
++        let ptr_type = self.ptr_type_id(storage, &leaf_ty)?;
+         let zero = self.const_uint(0)?;
+         let result = self.fresh();
+         instructions.push(Self::inst(
+             Op::InBoundsAccessChain,
+             Some(ptr_type),
+             Some(result),
+-            vec![Operand::IdRef(ptr), Operand::IdRef(zero)],
++            std::iter::once(Operand::IdRef(ptr))
++                .chain(std::iter::repeat_n(Operand::IdRef(zero), depth))
++                .collect(),
+         ));
+-        Ok(result)
++        Ok(if leaf_ty == LlType::Int(32) {
++            AtomicF32Target::U32Ptr(result)
++        } else {
++            AtomicF32Target::FloatPtr(result)
++        })
+     }
+ 
+-    /// The atomic slot for a pointer that has no addressing at all -- neither a raw offset nor a
+-    /// modelled pointee. Both callers reach `raw_offsets` first, so this is the placeholder with
+-    /// nothing behind it, and the atomic it carries writes into a threadgroup word nothing reads.
+-    ///
+-    /// **Measured dead: 0 of the 706 corpus sources that name any `air.atomic.*` reach either this
+-    /// or [`Self::unmodeled_atomic_f32_pointer`].** Deleting them looks like an easy win and is
+-    /// not: without them an f32 atomic on a placeholder falls through to the Private placeholder
+-    /// ID itself and the pointer-storage-class check refuses the module. What reaches them is
+-    /// UNDERSPECIFIED AIR, not anything the Metal frontend emits -- `device atomic_float*` carries
+-    /// `air.struct_type_info` and `air.arg_type_name "metal::_atomic"`, and with those the buffer
+-    /// is modelled as an array of its own struct and the atomic lands on the real slot. Drop the
+-    /// struct info, as a hand-written fixture easily does, and the buffer collapses to a word view
+-    /// the float GEP cannot be typed through. Keep these as the floor for that input.
+-    pub(in crate::native::emitter) fn unmodeled_atomic_i32_pointer(
++    /// Structured CAS retry loop performing float32 RMW (`add`/`sub`/`min`/`max`) over a `u32`
++    /// atomic word pointer. Emits a canonical `do { ... } while (actual != expected)` loop where
++    /// the latch (`cont_lbl`) carries the conditional back-edge to `hdr_lbl` / `exit_lbl`.
++    pub(in crate::native::emitter) fn emit_f32_cas_loop(
++        &mut self,
++        result: Word,
++        u32_ptr: Word,
++        operand_f32: Word,
++        op: FloatCasOp,
++        scope_kind: Scope,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
++        let u32_ty = self.type_id(&LlType::Int(32))?;
++        let f32_ty = self.type_id(&LlType::Float)?;
++        let bool_ty = self.type_id(&LlType::Bool)?;
++        let scope = self.const_uint(scope_kind as u32)?;
++        let load_sem = self.const_uint(
++            Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE).bits(),
++        )?;
++        let succ_sem = self.const_uint(
++            Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE).bits(),
++        )?;
++        let fail_sem = load_sem;
++
++        let init_bits = self.fresh();
++        let pre_lbl = self.fresh();
++        let hdr_lbl = self.fresh();
++        let body_lbl = self.fresh();
++        let cont_lbl = self.fresh();
++        let exit_lbl = self.fresh();
++        let expected = self.fresh();
++        let expected_f = self.fresh();
++        let desired_f = self.fresh();
++        let desired = self.fresh();
++        let actual = self.fresh();
++        let retry = self.fresh();
++
++        instructions.push(Self::inst(
++            Op::AtomicLoad,
++            Some(u32_ty),
++            Some(init_bits),
++            vec![
++                Operand::IdRef(u32_ptr),
++                Operand::IdScope(scope),
++                Operand::IdMemorySemantics(load_sem),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(pre_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(pre_lbl), vec![]));
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(hdr_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(hdr_lbl), vec![]));
++        instructions.push(Self::inst(
++            Op::Phi,
++            Some(u32_ty),
++            Some(expected),
++            vec![
++                Operand::IdRef(init_bits),
++                Operand::IdRef(pre_lbl),
++                Operand::IdRef(actual),
++                Operand::IdRef(cont_lbl),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::LoopMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(exit_lbl),
++                Operand::IdRef(cont_lbl),
++                Operand::LoopControl(spirv::LoopControl::NONE),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(body_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(body_lbl), vec![]));
++        instructions.push(Self::inst(
++            Op::Bitcast,
++            Some(f32_ty),
++            Some(expected_f),
++            vec![Operand::IdRef(expected)],
++        ));
++        match op {
++            FloatCasOp::Add => instructions.push(Self::inst(
++                Op::FAdd,
++                Some(f32_ty),
++                Some(desired_f),
++                vec![Operand::IdRef(expected_f), Operand::IdRef(operand_f32)],
++            )),
++            FloatCasOp::Sub => instructions.push(Self::inst(
++                Op::FSub,
++                Some(f32_ty),
++                Some(desired_f),
++                vec![Operand::IdRef(expected_f), Operand::IdRef(operand_f32)],
++            )),
++            FloatCasOp::Min | FloatCasOp::Max => {
++                let glsl = self.glsl_ext_inst_import();
++                let ext_op = if matches!(op, FloatCasOp::Min) {
++                    GlslStd450Op::NMin
++                } else {
++                    GlslStd450Op::NMax
++                };
++                instructions.push(Self::inst(
++                    Op::ExtInst,
++                    Some(f32_ty),
++                    Some(desired_f),
++                    vec![
++                        Operand::IdRef(glsl),
++                        Operand::LiteralExtInstInteger(ext_op as u32),
++                        Operand::IdRef(expected_f),
++                        Operand::IdRef(operand_f32),
++                    ],
++                ));
++            }
++        }
++        instructions.push(Self::inst(
++            Op::Bitcast,
++            Some(u32_ty),
++            Some(desired),
++            vec![Operand::IdRef(desired_f)],
++        ));
++        instructions.push(Self::inst(
++            Op::AtomicCompareExchange,
++            Some(u32_ty),
++            Some(actual),
++            vec![
++                Operand::IdRef(u32_ptr),
++                Operand::IdScope(scope),
++                Operand::IdMemorySemantics(succ_sem),
++                Operand::IdMemorySemantics(fail_sem),
++                Operand::IdRef(desired),
++                Operand::IdRef(expected),
++            ],
++        ));
++        instructions.push(Self::inst(
++            Op::INotEqual,
++            Some(bool_ty),
++            Some(retry),
++            vec![Operand::IdRef(actual), Operand::IdRef(expected)],
++        ));
++        instructions.push(Self::inst(
++            Op::Branch,
++            None,
++            None,
++            vec![Operand::IdRef(cont_lbl)],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(cont_lbl), vec![]));
++        instructions.push(Self::inst(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(retry),
++                Operand::IdRef(hdr_lbl),
++                Operand::IdRef(exit_lbl),
++            ],
++        ));
++        instructions.push(Self::inst(Op::Label, None, Some(exit_lbl), vec![]));
++        instructions.push(Self::inst(
++            Op::Bitcast,
++            Some(f32_ty),
++            Some(result),
++            vec![Operand::IdRef(expected)],
++        ));
++        Ok(())
++    }
++
++    pub(in crate::native::emitter) fn unmodeled_atomic_int_pointer(
+         &mut self,
++        bits: u32,
+     ) -> Result<Word, String> {
+-        let ptr_type = self.ptr_type_id(StorageClass::Workgroup, &LlType::Int(32))?;
++        let ptr_type = self.ptr_type_id(StorageClass::Workgroup, &LlType::Int(bits))?;
+         let result = self.fresh();
+         self.module.types_global_values.push(Self::inst(
+             Op::Variable,
+@@ -389,6 +665,12 @@ impl Emitter {
+         Ok(result)
+     }
+ 
++    pub(in crate::native::emitter) fn unmodeled_atomic_i32_pointer(
++        &mut self,
++    ) -> Result<Word, String> {
++        self.unmodeled_atomic_int_pointer(32)
++    }
++
+     fn workgroup_i32_pointer_for_address(&mut self, address: u64) -> Result<Word, String> {
+         if let Some(pointer) = self.workgroup_i32_addresses.get(&address) {
+             return Ok(*pointer);
+diff --git a/src/native/emitter/ops/conversions.rs b/src/native/emitter/ops/conversions.rs
+index cf2cdd4..2db64a6 100644
+--- a/src/native/emitter/ops/conversions.rs
++++ b/src/native/emitter/ops/conversions.rs
+@@ -263,6 +263,11 @@ impl Emitter {
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<(), String> {
+         let src_ty = self.resolve_type(&src.ty)?;
++        let half_lanes = |ty: &LlType| match ty {
++            LlType::Half => Some(1u32),
++            LlType::Vector(elem, n) if **elem == LlType::Half => Some(*n),
++            _ => None,
++        };
+         if let (Some(src_lanes), Some(dst_lanes)) = (bfloat_lanes(&src_ty), float_lanes(&dst_ty)) {
+             if src_lanes == dst_lanes {
+                 let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
+@@ -282,6 +287,41 @@ impl Emitter {
+                 );
+             }
+         }
++        if let (Some(src_lanes), Some(dst_lanes)) = (bfloat_lanes(&src_ty), half_lanes(&dst_ty)) {
++            if src_lanes == dst_lanes {
++                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
++                let as_f32 = self.bfloat_bits_to_float_shaped_id(src_id, src_lanes, instructions)?;
++                let result_type = self.type_id(&dst_ty)?;
++                let result = self.result_id(&name, &dst_ty)?;
++                instructions.push(Self::inst(
++                    Op::FConvert,
++                    Some(result_type),
++                    Some(result),
++                    vec![Operand::IdRef(as_f32)],
++                ));
++                return Ok(());
++            }
++        }
++        if let (Some(src_lanes), Some(dst_lanes)) = (half_lanes(&src_ty), bfloat_lanes(&dst_ty)) {
++            if src_lanes == dst_lanes {
++                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
++                let f32_ty = self.type_id(&shaped_type(LlType::Float, src_lanes))?;
++                let as_f32 = self.fresh();
++                instructions.push(Self::inst(
++                    Op::FConvert,
++                    Some(f32_ty),
++                    Some(as_f32),
++                    vec![Operand::IdRef(src_id)],
++                ));
++                let result = self.result_id(&name, &dst_ty)?;
++                return self.emit_float_to_bfloat_bits_shaped(
++                    as_f32,
++                    result,
++                    src_lanes,
++                    instructions,
++                );
++            }
++        }
+         if !float_convert_supported(&src_ty, &dst_ty) {
+             return Err(format!(
+                 "native emitter: float conversion needs matching float/half shapes, got {src_ty:?} to {dst_ty:?}"
+@@ -317,6 +357,23 @@ impl Emitter {
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<(), String> {
+         let src_ty = self.resolve_type(&src.ty)?;
++        let resolved_dst = self.resolve_type(&dst_ty)?;
++        if let Some(lanes) = bfloat_lanes(&resolved_dst) {
++            let f32_dst = shaped_type(LlType::Float, lanes);
++            if int_to_float_convert_supported(&src_ty, &f32_dst) {
++                let f32_type = self.type_id(&f32_dst)?;
++                let as_f32 = self.fresh();
++                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
++                instructions.push(Self::inst(
++                    op,
++                    Some(f32_type),
++                    Some(as_f32),
++                    vec![Operand::IdRef(src_id)],
++                ));
++                let result = self.result_id(&name, &dst_ty)?;
++                return self.emit_float_to_bfloat_bits_shaped(as_f32, result, lanes, instructions);
++            }
++        }
+         if !int_to_float_convert_supported(&src_ty, &dst_ty) {
+             return Err(format!(
+                 "native emitter: integer-to-float conversion needs matching integer-to-float shapes, got {src_ty:?} to {dst_ty:?}"
+@@ -346,6 +403,22 @@ impl Emitter {
+     ) -> Result<(), String> {
+         let src_ty = self.resolve_type(&src.ty)?;
+         let resolved_dst = self.resolve_type(&dst_ty)?;
++        if let Some(lanes) = bfloat_lanes(&src_ty) {
++            let f32_src = shaped_type(LlType::Float, lanes);
++            if int_to_float_convert_supported(&resolved_dst, &f32_src) {
++                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
++                let as_f32 = self.bfloat_bits_to_float_shaped_id(src_id, lanes, instructions)?;
++                let result_type = self.type_id(&dst_ty)?;
++                let result = self.result_id(&name, &dst_ty)?;
++                instructions.push(Self::inst(
++                    op,
++                    Some(result_type),
++                    Some(result),
++                    vec![Operand::IdRef(as_f32)],
++                ));
++                return Ok(());
++            }
++        }
+         if !int_to_float_convert_supported(&resolved_dst, &src_ty) {
+             return Err(format!(
+                 "native emitter: float-to-integer conversion needs matching float-to-integer shapes, got {src_ty:?} to {resolved_dst:?}"
+diff --git a/src/native/ir/raw_buffer.rs b/src/native/ir/raw_buffer.rs
+index 94f93f1..a269e85 100644
+--- a/src/native/ir/raw_buffer.rs
++++ b/src/native/ir/raw_buffer.rs
+@@ -123,6 +123,15 @@ impl LlModule {
+                                 }
+                             }
+                         }
++                        if crate::air_intrinsics::is_float_cas_atomic_intrinsic(&call.callee) {
++                            if let Some(LlValue::Local(arg_name)) =
++                                call.args.first().map(|arg| &arg.value)
++                            {
++                                if let Some(root) = roots.get(arg_name) {
++                                    byte_reinterpret_roots.insert(root.clone());
++                                }
++                            }
++                        }
+                         if call.callee.starts_with("llvm.memcpy.")
+                             && call.args.len() == 4
+                             && matches!(call.args[3].value, LlValue::Bool(false))
+diff --git a/src/native/owned_cfg.rs b/src/native/owned_cfg.rs
+index 399cec7..acbf102 100644
+--- a/src/native/owned_cfg.rs
++++ b/src/native/owned_cfg.rs
+@@ -2082,9 +2082,14 @@ fn atomic_value_contract_error(
+             instruction.class.opcode
+         ));
+     };
++    let allow_f32_scalar = matches!(
++        instruction.class.opcode,
++        Op::AtomicLoad | Op::AtomicStore | Op::AtomicExchange
++    );
+     if !matches!(
+         numeric_type_shape(pointee, definitions),
+-        Some((opcode, _, 1)) if opcode == scalar_opcode
++        Some((opcode, width, 1))
++            if opcode == scalar_opcode || (allow_f32_scalar && opcode == Op::TypeFloat && width == 32)
+     ) {
+         return Some(format!(
+             "native emitter: owned {:?} pointer does not target the required scalar type class",
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index 8cd7ad4..e69fe7d 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -14421,3 +14421,287 @@ declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr ad
+         );
+     }
+ }
++
++#[test]
++fn native_metal3_atomic_float_all_ops_lower_cleanly() {
++    // Part A: native FloatPtr path (add, sub, load, store, xchg)
++    let ll_native = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k_f32_native(ptr addrspace(1) %buf, i32 %tid) {
++entry:
++  %idx = zext i32 %tid to i64
++  %slot = getelementptr inbounds float, ptr addrspace(1) %buf, i64 %idx
++  %a = call float @air.atomic.global.add.f32(ptr addrspace(1) %slot, float 1.5, i32 0, i32 2, i1 false)
++  %s = call float @air.atomic.global.sub.f32(ptr addrspace(1) %slot, float 0.5, i32 0, i32 2, i1 false)
++  %l = call float @air.atomic.global.load.f32(ptr addrspace(1) %slot, i32 0, i32 2, i1 false)
++  %sum = fadd float %a, %s
++  %x = call float @air.atomic.global.xchg.f32(ptr addrspace(1) %slot, float %sum, i32 0, i32 2, i1 false)
++  %final = fadd float %x, %l
++  call void @air.atomic.global.store.f32(ptr addrspace(1) %slot, float %final, i32 0, i32 2, i1 false)
++  ret void
++}
++declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)
++declare float @air.atomic.global.sub.f32(ptr addrspace(1), float, i32, i32, i1)
++declare float @air.atomic.global.load.f32(ptr addrspace(1), i32, i32, i1)
++declare float @air.atomic.global.xchg.f32(ptr addrspace(1), float, i32, i32, i1)
++declare void @air.atomic.global.store.f32(ptr addrspace(1), float, i32, i32, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @k_f32_native, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
++!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++"#;
++    let (spv_native, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll_native,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("native atomic<float> should translate");
++    let asm_native = disassemble(&spv_native).expect("disassemble native f32");
++    assert!(asm_native.contains("OpCapability AtomicFloat32AddEXT"), "{asm_native}");
++    assert!(
++        asm_native.contains("OpExtension \"SPV_EXT_shader_atomic_float_add\""),
++        "{asm_native}"
++    );
++    assert!(asm_native.contains("OpAtomicFAddEXT"), "{asm_native}");
++    assert!(asm_native.contains("OpAtomicLoad"), "{asm_native}");
++    assert!(asm_native.contains("OpAtomicExchange"), "{asm_native}");
++    assert!(asm_native.contains("OpAtomicStore"), "{asm_native}");
++
++    // Part B: CAS path (min, max, cmpxchg.weak + add/sub sharing the same buffer + Workgroup global)
++    let ll_cas = r#"
++target triple = "spirv-unknown-vulkan1.2"
++@tg_f = internal addrspace(3) global float undef, align 4
++define void @k_f32_cas(ptr addrspace(1) %buf, i32 %tid) {
++entry:
++  %exp = alloca float, align 4
++  store float 2.0, ptr %exp, align 4
++  %idx = zext i32 %tid to i64
++  %slot = getelementptr inbounds float, ptr addrspace(1) %buf, i64 %idx
++  %mn = call float @air.atomic.global.min.f.f32(ptr addrspace(1) %slot, float 3.0, i32 0, i32 2, i1 false)
++  %mx = call float @air.atomic.global.max.f.f32(ptr addrspace(1) %slot, float %mn, i32 0, i32 2, i1 false)
++  %ok = call i1 @air.atomic.global.cmpxchg.weak.f32(ptr addrspace(1) %slot, ptr %exp, float %mx, i32 0, i32 0, i32 2, i1 false)
++  %lmn = call float @air.atomic.local.min.f.f32(ptr addrspace(3) @tg_f, float %mx, i32 0, i32 1, i1 false)
++  %add = call float @air.atomic.global.add.f32(ptr addrspace(1) %slot, float %lmn, i32 0, i32 2, i1 false)
++  %sel = select i1 %ok, float %add, float %lmn
++  call void @air.atomic.global.store.f32(ptr addrspace(1) %slot, float %sel, i32 0, i32 2, i1 false)
++  ret void
++}
++declare float @air.atomic.global.min.f.f32(ptr addrspace(1), float, i32, i32, i1)
++declare float @air.atomic.global.max.f.f32(ptr addrspace(1), float, i32, i32, i1)
++declare i1 @air.atomic.global.cmpxchg.weak.f32(ptr addrspace(1), ptr, float, i32, i32, i32, i1)
++declare float @air.atomic.local.min.f.f32(ptr addrspace(3), float, i32, i32, i1)
++declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)
++declare void @air.atomic.global.store.f32(ptr addrspace(1), float, i32, i32, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @k_f32_cas, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
++!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++"#;
++    let (spv_cas, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll_cas,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("CAS atomic<float> should translate");
++    let asm_cas = disassemble(&spv_cas).expect("disassemble cas f32");
++    assert!(asm_cas.contains("OpLoopMerge"), "{asm_cas}");
++    assert!(asm_cas.contains("OpAtomicCompareExchange"), "{asm_cas}");
++    assert!(asm_cas.contains("NMin"), "{asm_cas}");
++    assert!(asm_cas.contains("NMax"), "{asm_cas}");
++    assert!(!asm_cas.contains("AtomicFloat32MinMaxEXT"), "{asm_cas}");
++}
++
++#[test]
++fn native_metal3_atomic_i64_all_ops_lower_cleanly() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++@tg64 = internal addrspace(3) global i64 undef, align 8
++define void @k_i64(ptr addrspace(1) %buf, i32 %tid) {
++entry:
++  %exp = alloca i64, align 8
++  store i64 7, ptr %exp, align 8
++  %idx = zext i32 %tid to i64
++  %slot = getelementptr inbounds i64, ptr addrspace(1) %buf, i64 %idx
++  %a = call i64 @air.atomic.global.add.s.i64(ptr addrspace(1) %slot, i64 5, i32 0, i32 2, i1 false)
++  %s = call i64 @air.atomic.global.sub.u.i64(ptr addrspace(1) %slot, i64 1, i32 0, i32 2, i1 false)
++  %mn = call i64 @air.atomic.global.min.s.i64(ptr addrspace(1) %slot, i64 %a, i32 0, i32 2, i1 false)
++  %mx = call i64 @air.atomic.global.max.u.i64(ptr addrspace(1) %slot, i64 %s, i32 0, i32 2, i1 false)
++  %an = call i64 @air.atomic.global.and.u.i64(ptr addrspace(1) %slot, i64 %mn, i32 0, i32 2, i1 false)
++  %or = call i64 @air.atomic.global.or.u.i64(ptr addrspace(1) %slot, i64 %mx, i32 0, i32 2, i1 false)
++  %xr = call i64 @air.atomic.global.xor.u.i64(ptr addrspace(1) %slot, i64 %an, i32 0, i32 2, i1 false)
++  %xg = call i64 @air.atomic.global.xchg.i64(ptr addrspace(1) %slot, i64 %or, i32 0, i32 2, i1 false)
++  %ld = call i64 @air.atomic.global.load.i64(ptr addrspace(1) %slot, i32 0, i32 2, i1 false)
++  %ok = call i1 @air.atomic.global.cmpxchg.weak.i64(ptr addrspace(1) %slot, ptr %exp, i64 %xr, i32 0, i32 0, i32 2, i1 false)
++  %tg = call i64 @air.atomic.local.add.u.i64(ptr addrspace(3) @tg64, i64 %xg, i32 0, i32 1, i1 false)
++  %out = select i1 %ok, i64 %tg, i64 %ld
++  call void @air.atomic.global.store.i64(ptr addrspace(1) %slot, i64 %out, i32 0, i32 2, i1 false)
++  ret void
++}
++declare i64 @air.atomic.global.add.s.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.sub.u.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.min.s.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.max.u.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.and.u.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.or.u.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.xor.u.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.xchg.i64(ptr addrspace(1), i64, i32, i32, i1)
++declare i64 @air.atomic.global.load.i64(ptr addrspace(1), i32, i32, i1)
++declare i1 @air.atomic.global.cmpxchg.weak.i64(ptr addrspace(1), ptr, i64, i32, i32, i32, i1)
++declare i64 @air.atomic.local.add.u.i64(ptr addrspace(3), i64, i32, i32, i1)
++declare void @air.atomic.global.store.i64(ptr addrspace(1), i64, i32, i32, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @k_i64, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"buf"}
++!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++"#;
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("atomic<int64_t> should translate");
++    let asm = disassemble(&spv).expect("disassemble i64 atomics");
++    assert!(asm.contains("OpCapability Int64"), "{asm}");
++    assert!(asm.contains("OpCapability Int64Atomics"), "{asm}");
++    for op in [
++        "OpAtomicIAdd",
++        "OpAtomicISub",
++        "OpAtomicSMin",
++        "OpAtomicUMax",
++        "OpAtomicAnd",
++        "OpAtomicOr",
++        "OpAtomicXor",
++        "OpAtomicExchange",
++        "OpAtomicLoad",
++        "OpAtomicStore",
++        "OpAtomicCompareExchange",
++    ] {
++        assert!(asm.contains(op), "missing {op} in:\n{asm}");
++    }
++}
++
++#[test]
++fn native_metal3_bfloat_conversions_fma_and_math_lower_cleanly() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k_bf16(ptr addrspace(1) %in_b, ptr addrspace(1) %out_u, i32 %tid) {
++entry:
++  %idx = zext i32 %tid to i64
++  %p = getelementptr inbounds <4 x bfloat>, ptr addrspace(1) %in_b, i64 %idx
++  %v = load <4 x bfloat>, ptr addrspace(1) %p, align 8
++  %fma = call <4 x bfloat> @llvm.fmuladd.v4bf16(<4 x bfloat> %v, <4 x bfloat> %v, <4 x bfloat> %v)
++  %s0 = extractelement <4 x bfloat> %fma, i32 0
++  %h = fpext bfloat %s0 to half
++  %b_back = fptrunc half %h to bfloat
++  %e = call bfloat @air.exp.bf16(bfloat %b_back)
++  %sat = call bfloat @air.saturate.bf16(bfloat %e)
++  %from_i = sitofp i32 %tid to bfloat
++  %sum = fadd bfloat %sat, %from_i
++  %as_u = fptoui bfloat %sum to i32
++  %op = getelementptr inbounds i32, ptr addrspace(1) %out_u, i64 %idx
++  store i32 %as_u, ptr addrspace(1) %op, align 4
++  ret void
++}
++declare <4 x bfloat> @llvm.fmuladd.v4bf16(<4 x bfloat>, <4 x bfloat>, <4 x bfloat>)
++declare bfloat @air.exp.bf16(bfloat)
++declare bfloat @air.saturate.bf16(bfloat)
++!air.kernel = !{!0}
++!0 = !{ptr @k_bf16, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"bfloat4", !"air.arg_name", !"in_b"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out_u"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++"#;
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("bfloat math/fma/conversions should translate");
++    let asm = disassemble(&spv).expect("disassemble bf16");
++    assert!(!asm.contains("air.exp.bf16"), "{asm}");
++    assert!(!asm.contains("air.saturate.bf16"), "{asm}");
++    assert!(!asm.contains("llvm.fmuladd"), "{asm}");
++    assert!(asm.contains("Fma"), "{asm}");
++    assert!(asm.contains("Exp"), "{asm}");
++    assert!(asm.contains("NClamp"), "{asm}");
++    assert!(asm.contains("OpConvertSToF"), "{asm}");
++    assert!(asm.contains("OpConvertFToU"), "{asm}");
++    assert!(asm.contains("OpFConvert"), "{asm}");
++}
++
++#[test]
++fn native_metal3_texture_atomics_and_shuffle_fill_lower_cleanly() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct._texture_2d_t = type opaque
++%struct._texture_2d_array_t = type opaque
++define void @k_tex_atom(ptr addrspace(1) %tex2d, ptr addrspace(1) %texarr, ptr addrspace(1) %out, <2 x i32> %gid) {
++entry:
++  %exp = alloca <4 x i32>, align 16
++  store <4 x i32> <i32 10, i32 0, i32 0, i32 0>, ptr %exp, align 16
++  %a = call <4 x i32> @air.atomic_fetch_add_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1) %tex2d, <2 x i32> %gid, <2 x i32> zeroinitializer, <4 x i32> <i32 1, i32 0, i32 0, i32 0>, i32 0, i32 0)
++  %m = call <4 x i32> @air.atomic_fetch_min_explicit_texture_2d_array.i32.s.v4i32(ptr addrspace(1) %texarr, <2 x i32> %gid, i32 0, <2 x i32> zeroinitializer, <4 x i32> <i32 -5, i32 0, i32 0, i32 0>, i32 0, i32 0)
++  %l = call <4 x i32> @air.atomic_load_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1) %tex2d, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 0)
++  %ok = call i1 @air.atomic_compare_exchange_weak_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1) %tex2d, <2 x i32> %gid, <2 x i32> zeroinitializer, ptr %exp, <4 x i32> %a, i32 0, i32 0, i32 0)
++  call void @air.atomic_store_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1) %tex2d, <2 x i32> %gid, <2 x i32> zeroinitializer, <4 x i32> %l, i32 0, i32 0)
++  %a0 = extractelement <4 x i32> %a, i32 0
++  %m0 = extractelement <4 x i32> %m, i32 0
++  %up = call i32 @air.simd_shuffle_and_fill_up.i32(i32 %a0, i32 %m0, i16 1)
++  %dn = call i32 @air.simd_shuffle_and_fill_down.i32(i32 %up, i32 %m0, i16 1)
++  %res = select i1 %ok, i32 %dn, i32 %up
++  store i32 %res, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare <4 x i32> @air.atomic_fetch_add_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1), <2 x i32>, <2 x i32>, <4 x i32>, i32, i32)
++declare <4 x i32> @air.atomic_fetch_min_explicit_texture_2d_array.i32.s.v4i32(ptr addrspace(1), <2 x i32>, i32, <2 x i32>, <4 x i32>, i32, i32)
++declare <4 x i32> @air.atomic_load_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1), <2 x i32>, <2 x i32>, i32, i32)
++declare i1 @air.atomic_compare_exchange_weak_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1), <2 x i32>, <2 x i32>, ptr, <4 x i32>, i32, i32, i32)
++declare void @air.atomic_store_explicit_texture_2d.i32.u.v4i32(ptr addrspace(1), <2 x i32>, <2 x i32>, <4 x i32>, i32, i32)
++declare i32 @air.simd_shuffle_and_fill_up.i32(i32, i32, i16)
++declare i32 @air.simd_shuffle_and_fill_down.i32(i32, i32, i16)
++!air.kernel = !{!0}
++!0 = !{ptr @k_tex_atom, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<uint, read_write>", !"air.arg_name", !"tex2d"}
++!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d_array<int, read_write>", !"air.arg_name", !"texarr"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
++!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
++"#;
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("texture atomics and 3-arg shuffle_and_fill should translate");
++    let asm = disassemble(&spv).expect("disassemble texture atomics");
++    assert!(asm.contains("OpImageTexelPointer"), "{asm}");
++    assert!(asm.contains("R32ui"), "{asm}");
++    assert!(asm.contains("R32i"), "{asm}");
++    assert!(asm.contains("OpAtomicIAdd"), "{asm}");
++    assert!(asm.contains("OpAtomicSMin"), "{asm}");
++    assert!(asm.contains("OpAtomicLoad"), "{asm}");
++    assert!(asm.contains("OpAtomicStore"), "{asm}");
++    assert!(asm.contains("OpAtomicCompareExchange"), "{asm}");
++    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
++    assert!(!asm.contains("air.atomic_"), "{asm}");
++    assert!(!asm.contains("air.simd_shuffle_and_fill_"), "{asm}");
++}
+diff --git a/src/native/tir/pointee.rs b/src/native/tir/pointee.rs
+index b0e862b..39a25ff 100644
+--- a/src/native/tir/pointee.rs
++++ b/src/native/tir/pointee.rs
+@@ -238,11 +238,11 @@ pub(in crate::native) fn atomic_call_pointees(inst: &TirInst) -> Vec<(String, Ll
+     {
+         return Vec::new();
+     }
+-    // Element type: the call's result for a value-returning atomic; else (void `store`) the first
+-    // non-pointer argument's type — the stored value.
++    // Element type: the call's result for a value-returning atomic; else (void `store` or bool
++    // `cmpxchg.weak`) the first non-pointer argument's type — the stored/desired value.
+     let element = match &inst.result_ty {
+-        Some(t) => t.clone(),
+-        None => match call.args.iter().find(|tv| !matches!(tv.ty, LlType::Ptr(_))) {
++        Some(t) if !matches!(t, LlType::Bool) => t.clone(),
++        _ => match call.args.iter().find(|tv| !matches!(tv.ty, LlType::Ptr(_))) {
+             Some(tv) => tv.ty.clone(),
+             None => return Vec::new(),
+         },
+diff --git a/src/passes/air_calls/bfloat_glsl.rs b/src/passes/air_calls/bfloat_glsl.rs
+index 70bb293..6e1e6cf 100644
+--- a/src/passes/air_calls/bfloat_glsl.rs
++++ b/src/passes/air_calls/bfloat_glsl.rs
+@@ -6,6 +6,21 @@ pub(in crate::passes) fn is_llvm_bfloat_fmuladd(name: &str) -> bool {
+     name.starts_with("llvm.fmuladd.") && name.contains("bf16")
+ }
+ 
++fn bfloat_storage_lanes(ctx: &Ctx, ty: Word) -> Option<u32> {
++    if is_u16_scalar(ctx, ty) {
++        return Some(1);
++    }
++    let (elem, lanes) = vector_type_shape(ctx, ty)?;
++    (is_u16_scalar(ctx, elem) && (2..=4).contains(&lanes)).then_some(lanes)
++}
++
++pub(in crate::passes) fn is_bfloat_glsl_math(name: &str) -> bool {
++    name.contains("bf16")
++        && (glsl_extinst(name).is_some()
++            || name.contains("saturate")
++            || is_llvm_bfloat_fmuladd(name))
++}
++
+ pub(in crate::passes) fn lower_bfloat_fmuladd(
+     ctx: &mut Ctx,
+     name: &str,
+@@ -16,31 +31,28 @@ pub(in crate::passes) fn lower_bfloat_fmuladd(
+     if args.len() != 3 {
+         return Err(format!("{name} expects 3 operands"));
+     }
+-    if !is_u16_scalar(ctx, rty) {
+-        return Err(format!(
+-            "{name} currently expects a scalar u16 bfloat storage result"
+-        ));
+-    }
++    let n = bfloat_storage_lanes(ctx, rty)
++        .ok_or_else(|| format!("{name} expects scalar or v2..v4 u16 bfloat storage result"))?;
+     for arg in args {
+         let arg_ty = value_result_type(ctx, *arg)
+             .ok_or_else(|| format!("{name} has an operand with no result type"))?;
+-        if !is_u16_scalar(ctx, arg_ty) {
++        if bfloat_storage_lanes(ctx, arg_ty) != Some(n) {
+             return Err(format!(
+-                "{name} currently expects scalar u16 bfloat storage operands"
++                "{name} expects matching u16 bfloat storage operands"
+             ));
+         }
+     }
+ 
+     let mut out = vec![];
+-    let a = widen_bf16_to_f32(ctx, &mut out, args[0], 1);
+-    let b = widen_bf16_to_f32(ctx, &mut out, args[1], 1);
+-    let c = widen_bf16_to_f32(ctx, &mut out, args[2], 1);
++    let a = widen_bf16_to_f32(ctx, &mut out, args[0], n);
++    let b = widen_bf16_to_f32(ctx, &mut out, args[1], n);
++    let c = widen_bf16_to_f32(ctx, &mut out, args[2], n);
+     let fma = ctx.module.fresh_id();
+     let ext = ctx.glsl();
+-    let float = ctx.ty_float();
++    let f32_ty = ty_f32_shaped(ctx, n);
+     out.push(Instruction::new(
+         Op::ExtInst,
+-        Some(float),
++        Some(f32_ty),
+         Some(fma),
+         vec![
+             Operand::IdRef(ext),
+@@ -50,7 +62,72 @@ pub(in crate::passes) fn lower_bfloat_fmuladd(
+             Operand::IdRef(c),
+         ],
+     ));
+-    narrow_f32_to_bf16(ctx, &mut out, fma, 1, rty, res);
++    narrow_f32_to_bf16(ctx, &mut out, fma, n, rty, res);
++    Ok(out)
++}
++
++pub(in crate::passes) fn lower_bfloat_glsl_math(
++    ctx: &mut Ctx,
++    name: &str,
++    res: Word,
++    rty: Word,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    if is_llvm_bfloat_fmuladd(name) {
++        return lower_bfloat_fmuladd(ctx, name, res, rty, args);
++    }
++    let n = bfloat_storage_lanes(ctx, rty)
++        .ok_or_else(|| format!("{name} expects scalar or v2..v4 u16 bfloat storage result"))?;
++    let f32_ty = ty_f32_shaped(ctx, n);
++    let mut out = Vec::new();
++    let mut widened_args = Vec::with_capacity(args.len());
++    for arg in args {
++        let arg_ty = value_result_type(ctx, *arg)
++            .ok_or_else(|| format!("{name} has an operand with no result type"))?;
++        if bfloat_storage_lanes(ctx, arg_ty) != Some(n) {
++            return Err(format!(
++                "{name} expects matching u16 bfloat storage operands"
++            ));
++        }
++        widened_args.push(widen_bf16_to_f32(ctx, &mut out, *arg, n));
++    }
++    let ext = ctx.glsl();
++    let f32_res = ctx.module.fresh_id();
++    if name.contains("saturate") && widened_args.len() == 1 {
++        let clamp = nan_aware_if_precise(name, GLSLstd450::FClamp);
++        let zero = ctx.const_float(0.0);
++        let one = ctx.const_float(1.0);
++        let (lo, hi) = clamp_edges(ctx, f32_ty, zero, one);
++        out.push(Instruction::new(
++            Op::ExtInst,
++            Some(f32_ty),
++            Some(f32_res),
++            vec![
++                Operand::IdRef(ext),
++                Operand::LiteralExtInstInteger(clamp as u32),
++                Operand::IdRef(widened_args[0]),
++                Operand::IdRef(lo),
++                Operand::IdRef(hi),
++            ],
++        ));
++    } else if let Some(glsl_op) = glsl_extinst(name) {
++        let mut ops = vec![
++            Operand::IdRef(ext),
++            Operand::LiteralExtInstInteger(glsl_op as u32),
++        ];
++        for a in widened_args {
++            ops.push(Operand::IdRef(a));
++        }
++        out.push(Instruction::new(
++            Op::ExtInst,
++            Some(f32_ty),
++            Some(f32_res),
++            ops,
++        ));
++    } else {
++        return Err(format!("unhandled bfloat math intrinsic: {name}"));
++    }
++    narrow_f32_to_bf16(ctx, &mut out, f32_res, n, rty, res);
+     Ok(out)
+ }
+ 
+diff --git a/src/passes/air_calls/float_imageblock.rs b/src/passes/air_calls/float_imageblock.rs
+index 7c9949e..e8c2349 100644
+--- a/src/passes/air_calls/float_imageblock.rs
++++ b/src/passes/air_calls/float_imageblock.rs
+@@ -632,8 +632,8 @@ pub(in crate::passes) fn lower_float_math(
+             ),
+         ]);
+     }
+-    if is_llvm_bfloat_fmuladd(name) {
+-        return lower_bfloat_fmuladd(ctx, name, res, rty, args);
++    if is_bfloat_glsl_math(name) {
++        return lower_bfloat_glsl_math(ctx, name, res, rty, args);
+     }
+     if is_air_math(name, "ldexp") && args.len() == 2 {
+         return lower_fast_ldexp(ctx, name, res, rty, args);
+diff --git a/src/passes/air_calls/images/atomic.rs b/src/passes/air_calls/images/atomic.rs
+index 81d81e4..6d515ac 100644
+--- a/src/passes/air_calls/images/atomic.rs
++++ b/src/passes/air_calls/images/atomic.rs
+@@ -2,35 +2,221 @@
+ 
+ use super::*;
+ 
+-/// Lower the stable unsigned 2D texture fetch-max ABI to an image texel pointer plus `OpAtomicUMax`.
+-/// Metal exposes texture atomics through a four-lane ABI value, but the texture format is the scalar
+-/// `R32ui` atomic format: lane zero carries the operand/result and the remaining result lanes stay
+-/// undefined. The coordinate offset is applied before the 16-bit AIR coordinate is widened.
+-pub(in crate::passes) fn lower_atomic_texture_fetch_max(
++#[derive(Clone, Copy)]
++enum TextureAtomicOp {
++    Add,
++    Sub,
++    Min,
++    Max,
++    And,
++    Or,
++    Xor,
++    Exchange,
++    Load,
++    Store,
++    CompareExchangeWeak,
++}
++
++fn classify_texture_atomic(name: &str) -> Option<TextureAtomicOp> {
++    if name.starts_with("air.atomic_fetch_add_explicit_texture_") {
++        Some(TextureAtomicOp::Add)
++    } else if name.starts_with("air.atomic_fetch_sub_explicit_texture_") {
++        Some(TextureAtomicOp::Sub)
++    } else if name.starts_with("air.atomic_fetch_min_explicit_texture_") {
++        Some(TextureAtomicOp::Min)
++    } else if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
++        Some(TextureAtomicOp::Max)
++    } else if name.starts_with("air.atomic_fetch_and_explicit_texture_") {
++        Some(TextureAtomicOp::And)
++    } else if name.starts_with("air.atomic_fetch_or_explicit_texture_") {
++        Some(TextureAtomicOp::Or)
++    } else if name.starts_with("air.atomic_fetch_xor_explicit_texture_") {
++        Some(TextureAtomicOp::Xor)
++    } else if name.starts_with("air.atomic_exchange_explicit_texture_") {
++        Some(TextureAtomicOp::Exchange)
++    } else if name.starts_with("air.atomic_load_explicit_texture_") {
++        Some(TextureAtomicOp::Load)
++    } else if name.starts_with("air.atomic_store_explicit_texture_") {
++        Some(TextureAtomicOp::Store)
++    } else if name.starts_with("air.atomic_compare_exchange_weak_explicit_texture_") {
++        Some(TextureAtomicOp::CompareExchangeWeak)
++    } else {
++        None
++    }
++}
++
++fn image_sampled_scalar_type(ctx: &Ctx, image: Word) -> Option<Word> {
++    let mut ty = value_result_type(ctx, image)?;
++    let def = type_def_of(ctx, ty)?;
++    if def.class.opcode == Op::TypePointer {
++        ty = match def.operands.get(1)? {
++            Operand::IdRef(pt) => *pt,
++            _ => return None,
++        };
++    }
++    let img_def = type_def_of(ctx, ty)?;
++    if img_def.class.opcode != Op::TypeImage {
++        return None;
++    }
++    match img_def.operands.first()? {
++        Operand::IdRef(sampled) => Some(*sampled),
++        _ => None,
++    }
++}
++
++fn scalar_int_width(ctx: &Ctx, ty: Word) -> Option<u32> {
++    let def = type_def_of(ctx, ty)?;
++    if def.class.opcode != Op::TypeInt {
++        return None;
++    }
++    match def.operands.first() {
++        Some(Operand::LiteralBit32(bits)) => Some(*bits),
++        _ => None,
++    }
++}
++
++fn coerce_to_scalar_type(
++    ctx: &mut Ctx,
++    val: Word,
++    val_ty: Word,
++    target_ty: Word,
++    out: &mut Vec<Instruction>,
++) -> Word {
++    if val_ty == target_ty {
++        return val;
++    }
++    let cast = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::Bitcast,
++        Some(target_ty),
++        Some(cast),
++        vec![Operand::IdRef(val)],
++    ));
++    cast
++}
++
++fn extract_atomic_scalar(
++    ctx: &mut Ctx,
++    name: &str,
++    arg: Word,
++    target_ty: Word,
++    target_bits: u32,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    let arg_ty = value_result_type(ctx, arg).ok_or_else(|| format!("{name} value untyped"))?;
++    match resolve::integer_shape(ctx, arg_ty) {
++        Some((bits, 1)) if bits == target_bits => {
++            Ok(coerce_to_scalar_type(ctx, arg, arg_ty, target_ty, out))
++        }
++        Some((bits, 4)) if bits == target_bits => {
++            let elem_ty = type_def_of(ctx, arg_ty)
++                .and_then(|d| match d.operands.first() {
++                    Some(Operand::IdRef(e)) => Some(*e),
++                    _ => None,
++                })
++                .unwrap_or(target_ty);
++            let extracted = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::CompositeExtract,
++                Some(elem_ty),
++                Some(extracted),
++                vec![Operand::IdRef(arg), Operand::LiteralBit32(0)],
++            ));
++            Ok(coerce_to_scalar_type(ctx, extracted, elem_ty, target_ty, out))
++        }
++        _ => Err(format!(
++            "{name} value must be a scalar or four-lane i{target_bits} integer"
++        )),
++    }
++}
++
++fn pack_atomic_result(
++    ctx: &mut Ctx,
++    name: &str,
++    res: Word,
++    rty: Word,
++    scalar_val: Word,
++    scalar_ty: Word,
++    target_bits: u32,
++    out: &mut Vec<Instruction>,
++) -> Result<(), String> {
++    match resolve::integer_shape(ctx, rty) {
++        Some((bits, 1)) if bits == target_bits => {
++            if rty == scalar_ty {
++                out.push(Instruction::new(
++                    Op::CopyObject,
++                    Some(rty),
++                    Some(res),
++                    vec![Operand::IdRef(scalar_val)],
++                ));
++            } else {
++                out.push(Instruction::new(
++                    Op::Bitcast,
++                    Some(rty),
++                    Some(res),
++                    vec![Operand::IdRef(scalar_val)],
++                ));
++            }
++            Ok(())
++        }
++        Some((bits, 4)) if bits == target_bits => {
++            let elem_ty = type_def_of(ctx, rty)
++                .and_then(|d| match d.operands.first() {
++                    Some(Operand::IdRef(e)) => Some(*e),
++                    _ => None,
++                })
++                .unwrap_or(scalar_ty);
++            let lane0 = coerce_to_scalar_type(ctx, scalar_val, scalar_ty, elem_ty, out);
++            let undefined = ctx.module.fresh_id();
++            out.push(Instruction::new(Op::Undef, Some(rty), Some(undefined), vec![]));
++            out.push(Instruction::new(
++                Op::CompositeInsert,
++                Some(rty),
++                Some(res),
++                vec![
++                    Operand::IdRef(lane0),
++                    Operand::IdRef(undefined),
++                    Operand::LiteralBit32(0),
++                ],
++            ));
++            Ok(())
++        }
++        _ => Err(format!(
++            "{name} result type must be scalar or four-lane i{target_bits}"
++        )),
++    }
++}
++
++/// Lower Metal 3.1/3.2 storage-texture atomic intrinsics (`air.atomic_*_explicit_texture_<dim>`)
++/// to `OpImageTexelPointer` + `OpAtomic*`. Supports 1D/1D_array/2D/2D_array/3D/buffer_1d, signed
++/// and unsigned 32/64-bit scalar atomic formats (`R32ui`, `R32i`, `R64ui`, `R64i`), optional
++/// integer coordinate offsets, and both 4-lane vector and scalar AIR operand/result ABIs.
++pub(in crate::passes) fn lower_atomic_texture(
+     ctx: &mut Ctx,
+     name: &str,
+     res: Option<Word>,
+     rty: Option<Word>,
+     args: &[Word],
+ ) -> Result<Vec<Instruction>, String> {
+-    if name != "air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32" {
+-        return Err(format!("unsupported texture atomic intrinsic: {name}"));
++    let op_kind = classify_texture_atomic(name)
++        .ok_or_else(|| format!("unsupported texture atomic intrinsic: {name}"))?;
++    let (dim, arrayed) = intrinsic_texture_shape(name)
++        .ok_or_else(|| format!("unsupported texture atomic shape: {name}"))?;
++    if args.len() < 4 {
++        return Err(format!("{name} has too few operands ({})", args.len()));
+     }
+-    if args.len() != 6 {
+-        return Err(format!("{name} expects 6 operands"));
+-    }
+-    let res = res.ok_or_else(|| format!("{name} has no result"))?;
+-    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
++
+     let mut image = resolve_image_value(ctx, args[0]);
+     if !image_is_storage(ctx, image) {
+-        // The one intrinsic this arm accepts is `..._texture_2d`, so the recovered image has to be
+-        // a non-arrayed 2D storage image.
+         image = recovered_image_for_private_operand(ctx, image, name, ImageOperandUse::Storage)
+             .ok_or_else(|| format!("{name} on non-storage image id {image}"))?;
+     }
+     let (_, _, comp) = image_shape_or_recorded(ctx, image);
+-    if comp != crate::passes::ImageComp::Uint {
+-        return Err(format!("{name} requires an unsigned integer storage image"));
++    if !matches!(
++        comp,
++        crate::passes::ImageComp::Uint | crate::passes::ImageComp::Sint
++    ) {
++        return Err(format!("{name} requires an integer storage image"));
+     }
+     ctx.require_runtime_storage_image_use(image, RuntimeStorageImageUse::Atomic)?;
+     let image_pointer = if value_is_pointer(ctx, image) {
+@@ -46,36 +232,64 @@ pub(in crate::passes) fn lower_atomic_texture_fetch_max(
+             .ok_or_else(|| format!("{name} image has no descriptor pointer"))?
+     };
+ 
++    let scalar_ty = image_sampled_scalar_type(ctx, image_pointer).unwrap_or_else(|| match comp {
++        crate::passes::ImageComp::Sint => ctx.ty_sint(),
++        _ => ctx.ty_uint(),
++    });
++    let target_bits = scalar_int_width(ctx, scalar_ty)
++        .ok_or_else(|| format!("{name} image sampled type is not an integer"))?;
++
+     let mut out = Vec::new();
+-    let (coord, coord_ty) =
++    let (coord0, coord_ty) =
+         coerce_image_coord32_typed(ctx, args[1], &mut out, "texture atomic coordinate")?;
+-    let (offset, offset_ty) =
+-        coerce_image_coord32_typed(ctx, args[2], &mut out, "texture atomic offset")?;
+-    if offset_ty != coord_ty {
+-        return Err(format!("{name} coordinate and offset shapes differ"));
+-    }
+-    let offset_coord = ctx.module.fresh_id();
+-    out.push(Instruction::new(
+-        Op::IAdd,
+-        Some(coord_ty),
+-        Some(offset_coord),
+-        vec![Operand::IdRef(coord), Operand::IdRef(offset)],
+-    ));
++    let (layer, rest) = if arrayed {
++        (Some(args[2]), &args[3..])
++    } else {
++        (None, &args[2..])
++    };
+ 
+-    let uint = ctx.ty_uint();
+-    let value_ty =
+-        value_result_type(ctx, args[3]).ok_or_else(|| format!("{name} value untyped"))?;
+-    if resolve::integer_shape(ctx, value_ty) != Some((32, 4)) {
+-        return Err(format!("{name} value must be a four-lane i32 vector"));
+-    }
+-    let value = ctx.module.fresh_id();
+-    out.push(Instruction::new(
+-        Op::CompositeExtract,
+-        Some(uint),
+-        Some(value),
+-        vec![Operand::IdRef(args[3]), Operand::LiteralBit32(0)],
+-    ));
+-    let pointer_ty = ctx.ty_ptr(StorageClass::Image, uint);
++    let (offset_arg, payload_args) = match op_kind {
++        TextureAtomicOp::Load => match rest.len() {
++            2 => (None, &rest[..0]),
++            3 => (Some(rest[0]), &rest[1..1]),
++            _ => return Err(format!("{name} unexpected operand count {}", args.len())),
++        },
++        TextureAtomicOp::CompareExchangeWeak => match rest.len() {
++            5 => (None, &rest[..2]),
++            6 => (Some(rest[0]), &rest[1..3]),
++            _ => return Err(format!("{name} unexpected operand count {}", args.len())),
++        },
++        _ => match rest.len() {
++            3 => (None, &rest[..1]),
++            4 => (Some(rest[0]), &rest[1..2]),
++            _ => return Err(format!("{name} unexpected operand count {}", args.len())),
++        },
++    };
++
++    let spatial_coord = if let Some(off_raw) = offset_arg {
++        let (offset, offset_ty) =
++            coerce_image_coord32_typed(ctx, off_raw, &mut out, "texture atomic offset")?;
++        if offset_ty != coord_ty {
++            return Err(format!("{name} coordinate and offset shapes differ"));
++        }
++        let added = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::IAdd,
++            Some(coord_ty),
++            Some(added),
++            vec![Operand::IdRef(coord0), Operand::IdRef(offset)],
++        ));
++        added
++    } else {
++        coord0
++    };
++    let final_coord = if arrayed || dim == Dim::DimCube {
++        build_fetch_coord(ctx, dim, arrayed, spatial_coord, layer, &mut out)?
++    } else {
++        spatial_coord
++    };
++
++    let pointer_ty = ctx.ty_ptr(StorageClass::Image, scalar_ty);
+     let pointer = ctx.module.fresh_id();
+     let sample = ctx.const_uint(0);
+     out.push(Instruction::new(
+@@ -84,16 +298,204 @@ pub(in crate::passes) fn lower_atomic_texture_fetch_max(
+         Some(pointer),
+         vec![
+             Operand::IdRef(image_pointer),
+-            Operand::IdRef(offset_coord),
++            Operand::IdRef(final_coord),
+             Operand::IdRef(sample),
+         ],
+     ));
+-    let previous = ctx.module.fresh_id();
++
+     let scope = ctx.const_uint(Scope::Device as u32);
+     let semantics = ctx.const_uint(MemorySemantics::RELAXED.bits());
++    let is_signed = comp == crate::passes::ImageComp::Sint || name.contains(".s.");
++
++    match op_kind {
++        TextureAtomicOp::Store => {
++            let value =
++                extract_atomic_scalar(ctx, name, payload_args[0], scalar_ty, target_bits, &mut out)?;
++            out.push(Instruction::new(
++                Op::AtomicStore,
++                None,
++                None,
++                vec![
++                    Operand::IdRef(pointer),
++                    Operand::IdScope(scope),
++                    Operand::IdMemorySemantics(semantics),
++                    Operand::IdRef(value),
++                ],
++            ));
++            return Ok(out);
++        }
++        TextureAtomicOp::Load => {
++            let res = res.ok_or_else(|| format!("{name} has no result"))?;
++            let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
++            let direct = rty == scalar_ty;
++            let loaded = if direct { res } else { ctx.module.fresh_id() };
++            out.push(Instruction::new(
++                Op::AtomicLoad,
++                Some(scalar_ty),
++                Some(loaded),
++                vec![
++                    Operand::IdRef(pointer),
++                    Operand::IdScope(scope),
++                    Operand::IdMemorySemantics(semantics),
++                ],
++            ));
++            if !direct {
++                pack_atomic_result(ctx, name, res, rty, loaded, scalar_ty, target_bits, &mut out)?;
++            }
++            return Ok(out);
++        }
++        TextureAtomicOp::CompareExchangeWeak => {
++            let res = res.ok_or_else(|| format!("{name} has no result"))?;
++            let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
++            let expected_arg = payload_args[0];
++            let desired =
++                extract_atomic_scalar(ctx, name, payload_args[1], scalar_ty, target_bits, &mut out)?;
++
++            let (expected_ptr_info, expected_scalar) = if value_is_pointer(ctx, expected_arg) {
++                let ptr_ty = value_result_type(ctx, expected_arg)
++                    .ok_or_else(|| format!("{name} expected pointer untyped"))?;
++                let pointee_ty = match type_def_of(ctx, ptr_ty) {
++                    Some(def) if def.class.opcode == Op::TypePointer => match def.operands.get(1) {
++                        Some(Operand::IdRef(pt)) => *pt,
++                        _ => return Err(format!("{name} malformed expected pointer")),
++                    },
++                    _ => return Err(format!("{name} expected operand is not a pointer")),
++                };
++                let loaded_exp = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::Load,
++                    Some(pointee_ty),
++                    Some(loaded_exp),
++                    vec![Operand::IdRef(expected_arg)],
++                ));
++                let scalar = match resolve::integer_shape(ctx, pointee_ty) {
++                    Some((bits, 1)) if bits == target_bits => {
++                        coerce_to_scalar_type(ctx, loaded_exp, pointee_ty, scalar_ty, &mut out)
++                    }
++                    Some((bits, 4)) if bits == target_bits => {
++                        let elem_ty = type_def_of(ctx, pointee_ty)
++                            .and_then(|d| match d.operands.first() {
++                                Some(Operand::IdRef(e)) => Some(*e),
++                                _ => None,
++                            })
++                            .unwrap_or(scalar_ty);
++                        let extracted = ctx.module.fresh_id();
++                        out.push(Instruction::new(
++                            Op::CompositeExtract,
++                            Some(elem_ty),
++                            Some(extracted),
++                            vec![Operand::IdRef(loaded_exp), Operand::LiteralBit32(0)],
++                        ));
++                        coerce_to_scalar_type(ctx, extracted, elem_ty, scalar_ty, &mut out)
++                    }
++                    _ => {
++                        return Err(format!(
++                            "{name} expected pointee must be scalar or v4 i{target_bits}"
++                        ));
++                    }
++                };
++                (Some((expected_arg, pointee_ty)), scalar)
++            } else {
++                let scalar = extract_atomic_scalar(
++                    ctx,
++                    name,
++                    expected_arg,
++                    scalar_ty,
++                    target_bits,
++                    &mut out,
++                )?;
++                (None, scalar)
++            };
++
++            let observed = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::AtomicCompareExchange,
++                Some(scalar_ty),
++                Some(observed),
++                vec![
++                    Operand::IdRef(pointer),
++                    Operand::IdScope(scope),
++                    Operand::IdMemorySemantics(semantics),
++                    Operand::IdMemorySemantics(semantics),
++                    Operand::IdRef(desired),
++                    Operand::IdRef(expected_scalar),
++                ],
++            ));
++
++            if let Some((exp_ptr, pointee_ty)) = expected_ptr_info {
++                let to_store = if pointee_ty == scalar_ty {
++                    observed
++                } else {
++                    let packed = ctx.module.fresh_id();
++                    pack_atomic_result(
++                        ctx,
++                        name,
++                        packed,
++                        pointee_ty,
++                        observed,
++                        scalar_ty,
++                        target_bits,
++                        &mut out,
++                    )?;
++                    packed
++                };
++                out.push(Instruction::new(
++                    Op::Store,
++                    None,
++                    None,
++                    vec![Operand::IdRef(exp_ptr), Operand::IdRef(to_store)],
++                ));
++            }
++
++            if type_def_of(ctx, rty).is_some_and(|d| d.class.opcode == Op::TypeBool) {
++                out.push(Instruction::new(
++                    Op::IEqual,
++                    Some(rty),
++                    Some(res),
++                    vec![Operand::IdRef(observed), Operand::IdRef(expected_scalar)],
++                ));
++            } else {
++                pack_atomic_result(ctx, name, res, rty, observed, scalar_ty, target_bits, &mut out)?;
++            }
++            return Ok(out);
++        }
++        _ => {}
++    }
++
++    let res = res.ok_or_else(|| format!("{name} has no result"))?;
++    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
++    let value =
++        extract_atomic_scalar(ctx, name, payload_args[0], scalar_ty, target_bits, &mut out)?;
++    let atomic_op = match op_kind {
++        TextureAtomicOp::Add => Op::AtomicIAdd,
++        TextureAtomicOp::Sub => Op::AtomicISub,
++        TextureAtomicOp::Min => {
++            if is_signed {
++                Op::AtomicSMin
++            } else {
++                Op::AtomicUMin
++            }
++        }
++        TextureAtomicOp::Max => {
++            if is_signed {
++                Op::AtomicSMax
++            } else {
++                Op::AtomicUMax
++            }
++        }
++        TextureAtomicOp::And => Op::AtomicAnd,
++        TextureAtomicOp::Or => Op::AtomicOr,
++        TextureAtomicOp::Xor => Op::AtomicXor,
++        TextureAtomicOp::Exchange => Op::AtomicExchange,
++        TextureAtomicOp::Load
++        | TextureAtomicOp::Store
++        | TextureAtomicOp::CompareExchangeWeak => unreachable!(),
++    };
++    let direct = rty == scalar_ty;
++    let previous = if direct { res } else { ctx.module.fresh_id() };
+     out.push(Instruction::new(
+-        Op::AtomicUMax,
+-        Some(uint),
++        atomic_op,
++        Some(scalar_ty),
+         Some(previous),
+         vec![
+             Operand::IdRef(pointer),
+@@ -102,22 +504,8 @@ pub(in crate::passes) fn lower_atomic_texture_fetch_max(
+             Operand::IdRef(value),
+         ],
+     ));
+-    let undefined = ctx.module.fresh_id();
+-    out.push(Instruction::new(
+-        Op::Undef,
+-        Some(rty),
+-        Some(undefined),
+-        vec![],
+-    ));
+-    out.push(Instruction::new(
+-        Op::CompositeInsert,
+-        Some(rty),
+-        Some(res),
+-        vec![
+-            Operand::IdRef(previous),
+-            Operand::IdRef(undefined),
+-            Operand::LiteralBit32(0),
+-        ],
+-    ));
++    if !direct {
++        pack_atomic_result(ctx, name, res, rty, previous, scalar_ty, target_bits, &mut out)?;
++    }
+     Ok(out)
+ }
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+index 42b07d5..0c11e9f 100644
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1281,10 +1281,10 @@ pub(in crate::passes) fn lower_simd_op(
+     if name.starts_with("air.simd_shuffle_rotate_up.") && args.len() == 2 {
+         return lower_simd_shuffle_rotate_up(ctx, res, rty, args).map(Some);
+     }
+-    if name.starts_with("air.simd_shuffle_and_fill_down.") && args.len() == 4 {
++    if name.starts_with("air.simd_shuffle_and_fill_down.") && matches!(args.len(), 3 | 4) {
+         return lower_simd_shuffle_and_fill_down(ctx, res, rty, args).map(Some);
+     }
+-    if name.starts_with("air.simd_shuffle_and_fill_up.") && args.len() == 4 {
++    if name.starts_with("air.simd_shuffle_and_fill_up.") && matches!(args.len(), 3 | 4) {
+         return lower_simd_shuffle_and_fill_up(ctx, res, rty, args).map(Some);
+     }
+     if name.starts_with("air.simd_shuffle_up.") && args.len() == 2 {
+@@ -1568,8 +1568,8 @@ pub(in crate::passes) fn lower_one(
+     if name.starts_with("air.write_texture") {
+         return lower_write(ctx, name, args, v4);
+     }
+-    if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
+-        return lower_atomic_texture_fetch_max(ctx, name, res, rty, args);
++    if crate::air_intrinsics::is_texture_atomic_intrinsic(name) {
++        return lower_atomic_texture(ctx, name, res, rty, args);
+     }
+     if crate::air_intrinsics::is_interpolate_at_intrinsic(name) {
+         return lower_interpolate_at(ctx, name, res, rty, args);
+diff --git a/src/passes/air_calls/shuffle.rs b/src/passes/air_calls/shuffle.rs
+index 4e89075..a76425f 100644
+--- a/src/passes/air_calls/shuffle.rs
++++ b/src/passes/air_calls/shuffle.rs
+@@ -476,7 +476,11 @@ pub(in crate::passes) fn lower_simd_shuffle_and_fill_down(
+     let scope = ctx.const_uint(Scope::Subgroup as u32);
+     let mut insts = Vec::new();
+     let delta = subgroup_shuffle_index_u32(ctx, args[2], &mut insts)?;
+-    let modulo = subgroup_shuffle_index_u32(ctx, args[3], &mut insts)?;
++    let modulo = if let Some(&arg) = args.get(3) {
++        subgroup_shuffle_index_u32(ctx, arg, &mut insts)?
++    } else {
++        ctx.const_uint(32)
++    };
+     let uint = ctx.ty_uint();
+     let modulo_is_zero = ctx.module.fresh_id();
+     insts.push(Instruction::new(
+@@ -623,7 +627,11 @@ pub(in crate::passes) fn lower_simd_shuffle_and_fill_up(
+     let bool_ty = ctx.ty_bool();
+     let mut insts = Vec::new();
+     let delta = subgroup_shuffle_index_u32(ctx, args[2], &mut insts)?;
+-    let modulo = subgroup_shuffle_index_u32(ctx, args[3], &mut insts)?;
++    let modulo = if let Some(&arg) = args.get(3) {
++        subgroup_shuffle_index_u32(ctx, arg, &mut insts)?
++    } else {
++        ctx.const_uint(32)
++    };
+     // safe_modulo = modulo == 0 ? 1 : modulo (avoid UMod-by-zero).
+     let modulo_is_zero = ctx.module.fresh_id();
+     insts.push(Instruction::new(
+diff --git a/src/passes/image_facts.rs b/src/passes/image_facts.rs
+index 688f8b1..beeeaa8 100644
+--- a/src/passes/image_facts.rs
++++ b/src/passes/image_facts.rs
+@@ -1383,7 +1383,7 @@ fn intrinsic_access(
+     let write = name.starts_with("air.write_texture")
+         || name.starts_with("air.write_depth")
+         || name.starts_with("air.write_imageblock_slice_to_texture")
+-        || name.starts_with("air.atomic_fetch_")
++        || crate::air_intrinsics::is_texture_atomic_intrinsic(name)
+             && (name.contains("_texture_") || name.contains("_depth_"));
+     if write {
+         return Ok(storage());
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index d015030..ab37725 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1598,10 +1598,20 @@ impl Ctx {
+         fmt: ImageFormat,
+         comp: ImageComp,
+     ) -> Word {
+-        let sampled = match comp {
+-            ImageComp::Float => self.ty_float(),
+-            ImageComp::Uint => self.ty_uint(),
+-            ImageComp::Sint => self.ty_sint(),
++        let sampled = match (fmt, comp) {
++            (ImageFormat::R64ui, _) => self.get_or_create(
++                Op::TypeInt,
++                None,
++                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
++            ),
++            (ImageFormat::R64i, _) => self.get_or_create(
++                Op::TypeInt,
++                None,
++                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(1)],
++            ),
++            (_, ImageComp::Float) => self.ty_float(),
++            (_, ImageComp::Uint) => self.ty_uint(),
++            (_, ImageComp::Sint) => self.ty_sint(),
+         };
+         self.get_or_create(
+             Op::TypeImage,
+diff --git a/src/passes/module_cleanup.rs b/src/passes/module_cleanup.rs
+index e34d88a..419cfcf 100644
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -1003,6 +1003,97 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
+     if has_atomic_fadd {
+         want.push(Capability::AtomicFloat32AddEXT);
+     }
++    // 64-bit integer atomic ops require `Capability::Int64Atomics` (and `Int64`).
++    let i64_types: HashSet<Word> = ctx
++        .module
++        .types_global_values
++        .iter()
++        .filter(|i| {
++            i.class.opcode == Op::TypeInt
++                && i.operands.first() == Some(&Operand::LiteralBit32(64))
++        })
++        .filter_map(|i| i.result_id)
++        .collect();
++    let i64_ptrs: HashSet<Word> = ctx
++        .module
++        .types_global_values
++        .iter()
++        .filter(|i| {
++            i.class.opcode == Op::TypePointer
++                && matches!(i.operands.get(1), Some(Operand::IdRef(pt)) if i64_types.contains(pt))
++        })
++        .filter_map(|i| i.result_id)
++        .collect();
++    let has_i64_atomic = !i64_types.is_empty() && {
++        let mut val_tys: HashMap<Word, Word> = HashMap::new();
++        for inst in &ctx.module.types_global_values {
++            if let (Some(id), Some(ty)) = (inst.result_id, inst.result_type) {
++                val_tys.insert(id, ty);
++            }
++        }
++        for f in &ctx.module.functions {
++            for p in &f.parameters {
++                if let (Some(id), Some(ty)) = (p.result_id, p.result_type) {
++                    val_tys.insert(id, ty);
++                }
++            }
++            for b in &f.blocks {
++                for inst in &b.instructions {
++                    if let (Some(id), Some(ty)) = (inst.result_id, inst.result_type) {
++                        val_tys.insert(id, ty);
++                    }
++                }
++            }
++        }
++        ctx.module
++            .functions
++            .iter()
++            .flat_map(|f| f.blocks.iter())
++            .flat_map(|b| b.instructions.iter())
++            .any(|i| {
++                let is_int_atomic = matches!(
++                    i.class.opcode,
++                    Op::AtomicLoad
++                        | Op::AtomicStore
++                        | Op::AtomicExchange
++                        | Op::AtomicCompareExchange
++                        | Op::AtomicCompareExchangeWeak
++                        | Op::AtomicIIncrement
++                        | Op::AtomicIDecrement
++                        | Op::AtomicIAdd
++                        | Op::AtomicISub
++                        | Op::AtomicSMin
++                        | Op::AtomicUMin
++                        | Op::AtomicSMax
++                        | Op::AtomicUMax
++                        | Op::AtomicAnd
++                        | Op::AtomicOr
++                        | Op::AtomicXor
++                );
++                is_int_atomic
++                    && (i.result_type.is_some_and(|rt| i64_types.contains(&rt))
++                        || i.operands.first().is_some_and(|op| match op {
++                            Operand::IdRef(ptr) => {
++                                val_tys.get(ptr).is_some_and(|pty| i64_ptrs.contains(pty))
++                            }
++                            _ => false,
++                        }))
++            })
++    };
++    if has_i64_atomic {
++        want.push(Capability::Int64);
++        want.push(Capability::Int64Atomics);
++    }
++    let has_i64_image = ctx.module.types_global_values.iter().any(|i| {
++        i.class.opcode == Op::TypeImage
++            && matches!(
++                i.operands.get(6),
++                Some(Operand::ImageFormat(ImageFormat::R64ui | ImageFormat::R64i))
++            )
++    });
++    if has_i64_image {
++        want.push(Capability::Int64ImageEXT);
++    }
+     // Width-based scalar capabilities: a `half` (OpTypeFloat 16) needs Float16; an 8-/16-bit int
+     // needs Int8/Int16. Lowering can synthesize narrow constants and types (saturate edges, FConvert
+     // results, and flat-buffer extracts), so assert the corresponding capabilities here.
+@@ -1059,6 +1150,10 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
+         let ext = "SPV_KHR_fragment_shader_barycentric";
+         require_extension(ctx, ext);
+     }
++    if want.contains(&Capability::Int64ImageEXT) {
++        let ext = "SPV_EXT_shader_image_int64";
++        require_extension(ctx, ext);
++    }
+     if want.contains(&Capability::StencilExportEXT) {
+         let ext = "SPV_EXT_shader_stencil_export";
+         require_extension(ctx, ext);
+diff --git a/src/passes/resources/discovery.rs b/src/passes/resources/discovery.rs
+index e273415..625b13d 100644
+--- a/src/passes/resources/discovery.rs
++++ b/src/passes/resources/discovery.rs
+@@ -732,18 +732,26 @@ pub(in crate::passes) fn write_texture_dims(
+             let Some(name) = names.get(callee) else {
+                 continue;
+             };
+-            if !is_write_texture_name(name)
+-                && !name.starts_with("air.atomic_fetch_max_explicit_texture_")
+-            {
++            let is_tex_atomic = crate::air_intrinsics::is_texture_atomic_intrinsic(name);
++            if !is_write_texture_name(name) && !is_tex_atomic {
+                 continue;
+             }
+             let Some(Operand::IdRef(tex)) = inst.operands.get(1) else {
+                 continue;
+             };
+             let (dim, arrayed) = sample_dim(name);
+-            let (fmt, comp) = if name.starts_with("air.atomic_fetch_max_explicit_texture_")
+-                && name.contains(".u.")
++            let (fmt, comp) = if is_tex_atomic && (name.contains(".v4i64") || name.ends_with(".i64"))
+             {
++                if name.contains(".s.") {
++                    (ImageFormat::R64i, ImageComp::Sint)
++                } else {
++                    (ImageFormat::R64ui, ImageComp::Uint)
++                }
++            } else if is_tex_atomic && name.contains(".s.") {
++                (ImageFormat::R32i, ImageComp::Sint)
++            } else if is_tex_atomic && name.contains(".u.") {
++                (ImageFormat::R32ui, ImageComp::Uint)
++            } else if is_tex_atomic {
+                 (ImageFormat::R32ui, ImageComp::Uint)
+             } else if name.contains(".u.") && name.contains(".v4i16") {
+                 (ImageFormat::Rgba16ui, ImageComp::Uint)
+@@ -758,7 +766,7 @@ pub(in crate::passes) fn write_texture_dims(
+             } else {
+                 (ImageFormat::Rgba32f, ImageComp::Float)
+             };
+-            if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
++            if is_tex_atomic {
+                 out.insert(*tex, (dim, arrayed, fmt, comp));
+             } else {
+                 out.entry(*tex).or_insert((dim, arrayed, fmt, comp));
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index c8dfc33..feb79fe 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -444,7 +444,10 @@ pub(super) fn build_stage_input(
+     // resource is a storage-image `OpImageRead` and can share this binding.
+     let mut wtex_candidates = texture_storage_hints(&params, stage, frag, vert, kern);
+     for (pid, shape) in write_texture_dims(ctx, entry_idx) {
+-        if shape.2 == ImageFormat::R32ui {
++        if matches!(
++            shape.2,
++            ImageFormat::R32ui | ImageFormat::R32i | ImageFormat::R64ui | ImageFormat::R64i
++        ) {
+             // Image atomics require one of Vulkan's scalar atomic storage formats; the call-site ABI
+             // is more specific than the broad metadata `texture2d<uint, read_write>` spelling.
+             wtex_candidates.insert(pid, shape);

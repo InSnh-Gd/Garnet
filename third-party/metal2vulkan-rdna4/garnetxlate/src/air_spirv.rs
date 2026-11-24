@@ -265,6 +265,42 @@ pub fn patch_storage_formats(b: &[u8], meta: &Value) -> (Vec<u8>, usize) {
             }
         }
     }
+    // Vulkan forbids ImageFormat::Unknown (0) on any storage image targeted by
+    // OpImageTexelPointer (texture atomics). Collect the OpTypeImage ids referenced by
+    // OpImageTexelPointer so their explicit atomic format (R32ui/R32i/R64ui/R64i) stays intact.
+    let mut ptr_pointee = std::collections::HashMap::<u32, u32>::new();
+    let mut val_type = std::collections::HashMap::<u32, u32>::new();
+    let mut texel_ptr_images = std::collections::HashSet::<u32>::new();
+    {
+        let mut scan = 5usize;
+        while scan < w.len() {
+            let op = w[scan] & 0xffff;
+            let wc = (w[scan] >> 16) as usize;
+            if wc == 0 || scan + wc > w.len() {
+                break;
+            }
+            match op {
+                32 if wc >= 4 => {
+                    // OpTypePointer: [hdr, result_id, storage_class, pointee_type]
+                    ptr_pointee.insert(w[scan + 1], w[scan + 3]);
+                }
+                55 | 59 | 65 | 66 | 67 | 70 | 83 if wc >= 3 => {
+                    // OpFunctionParameter / OpVariable / Op*AccessChain / OpCopyObject
+                    val_type.insert(w[scan + 2], w[scan + 1]);
+                }
+                60 if wc >= 4 => {
+                    // OpImageTexelPointer: [hdr, result_type, result_id, image_ptr, coord, sample]
+                    if let Some(&ptr_ty) = val_type.get(&w[scan + 3]) {
+                        if let Some(&img_ty) = ptr_pointee.get(&ptr_ty) {
+                            texel_ptr_images.insert(img_ty);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            scan += wc;
+        }
+    }
     let has = |n: &str| acc.contains(&n);
     let acc_empty = acc.is_empty();
     let mut p = 5usize;
@@ -283,7 +319,12 @@ pub fn patch_storage_formats(b: &[u8], meta: &Value) -> (Vec<u8>, usize) {
             lastcap = Some(p + wc);
             have.push(w[p + 1]);
         }
-        if op == 25 && p + 8 < w.len() && w[p + 7] == 2 && w[p + 8] != 0 {
+        if op == 25
+            && p + 8 < w.len()
+            && w[p + 7] == 2
+            && w[p + 8] != 0
+            && !texel_ptr_images.contains(&w[p + 1])
+        {
             w[p + 8] = 0;
             patched += 1;
             if (has("ReadOnly") || has("ReadWrite") || acc_empty) && !need.contains(&55) {

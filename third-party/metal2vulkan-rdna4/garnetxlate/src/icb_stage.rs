@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! C ABI entry point for lowering render stage SPIR-V to ICB dynamic BDA bindings.
+//! C ABI entry point for lowering render and compute stage SPIR-V to ICB dynamic BDA bindings.
+//! `stage_kind`: 0 = Vertex, 1 = Fragment, 2 = TessellationEvaluation, 3 = Compute (`GLCompute`).
 
 use crate::{leak, put_err, RC_BAD_ARGS, RC_OK, RC_PANIC, RC_REFUSED};
 use metal2vulkan::passes::icb_stage::{lower_icb_stage, IcbVertexAttr};

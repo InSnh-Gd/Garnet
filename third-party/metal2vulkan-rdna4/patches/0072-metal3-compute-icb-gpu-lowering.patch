@@ -1,0 +1,823 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 013af3a..6c98d27 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -521,23 +521,38 @@ pub fn is_render_icb_intrinsic(name: &str) -> bool {
+     )
+ }
+ 
+-pub fn is_command_encoder_helper(name: &str) -> bool {
++/// The AIR families that encode into a Metal compute indirect command buffer.
++pub fn is_compute_icb_intrinsic(name: &str) -> bool {
+     matches!(
+         name,
+-        "air.concurrent_dispatch_threadgroups_compute_command"
+-            | "air.concurrent_dispatch_threads_compute_command"
+-            | "air.set_barrier_compute_command"
++        "air.reset_compute_command"
++            | "air.copy_compute_command"
+             | "air.set_pipeline_state_compute_command"
++            | "air.set_barrier_compute_command"
++            | "air.clear_barrier_compute_command"
+             | "air.set_threadgroup_memory_length_compute_command"
++            | "air.set_stage_in_region_compute_command"
++            | "air.concurrent_dispatch_threadgroups_compute_command"
++            | "air.concurrent_dispatch_threads_compute_command"
+     ) || any_typed(
+         name,
+         &[
+             "air.set_kernel_buffer_compute_command",
+-            "air.set_object_buffer_render_command",
++            "air.concurrent_dispatch_threadgroups_compute_command",
++            "air.concurrent_dispatch_threads_compute_command",
++            "air.set_stage_in_region_compute_command",
+         ],
+     )
+ }
+ 
++pub fn is_icb_intrinsic(name: &str) -> bool {
++    is_render_icb_intrinsic(name) || is_compute_icb_intrinsic(name)
++}
++
++pub fn is_command_encoder_helper(name: &str) -> bool {
++    any_typed(name, &["air.set_object_buffer_render_command"])
++}
++
+ /// Return the product contract for one complete `air.*` ABI symbol.
+ ///
+ /// Broad namespaces such as `air.simdgroup_matrix_` are deliberately not accepted. Every admitted
+@@ -685,7 +700,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+     // Indirect-command-buffer encoding. Recognised, and refused: see
+     // [`is_command_encoder_helper`]. Do not admit the broad `_command` suffix -- a new sibling must
+     // remain visible until this contract and its handling are decided together.
+-    if is_render_icb_intrinsic(name) {
++    if is_icb_intrinsic(name) {
+         return Some(Lowered);
+     }
+     if is_command_encoder_helper(name) {
+@@ -863,6 +878,10 @@ mod tests {
+         assert_eq!(air_intrinsic_disposition("air.future_command"), None);
+         assert_eq!(
+             air_intrinsic_disposition("air.set_kernel_buffer_compute_command.p1i8"),
++            Some(AirIntrinsicDisposition::Lowered)
++        );
++        assert_eq!(
++            air_intrinsic_disposition("air.set_object_buffer_render_command.p1i8"),
+             Some(AirIntrinsicDisposition::NoVulkanEquivalent)
+         );
+     }
+diff --git a/src/native/emit_tiers.rs b/src/native/emit_tiers.rs
+index e7b612d..3ce0f58 100644
+--- a/src/native/emit_tiers.rs
++++ b/src/native/emit_tiers.rs
+@@ -961,7 +961,7 @@ pub(super) fn large_buffer_addressing_roots(parsed: &LlModule) -> HashSet<(Strin
+             let Some(call) = inst.call().as_deref() else {
+                 continue;
+             };
+-            if !crate::air_intrinsics::is_render_icb_intrinsic(&call.callee) {
++            if !crate::air_intrinsics::is_icb_intrinsic(&call.callee) {
+                 continue;
+             }
+             for arg in &call.args {
+@@ -1044,7 +1044,7 @@ fn requires_device_pointer_model(parsed: &LlModule) -> bool {
+         function.carrier_insts().any(|inst| {
+             inst.call()
+                 .as_deref()
+-                .is_some_and(|call| crate::air_intrinsics::is_render_icb_intrinsic(&call.callee))
++                .is_some_and(|call| crate::air_intrinsics::is_icb_intrinsic(&call.callee))
+         })
+     }) {
+         return true;
+diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
+index 80f9054..bdd3c46 100644
+--- a/src/native/emitter/ops/air_calls.rs
++++ b/src/native/emitter/ops/air_calls.rs
+@@ -79,7 +79,7 @@ impl Emitter {
+                 ));
+                 Ok(true)
+             }
+-            callee if crate::air_intrinsics::is_render_icb_intrinsic(callee) => {
++            callee if crate::air_intrinsics::is_icb_intrinsic(callee) => {
+                 self.emit_icb_void_air_call(call, instructions)?;
+                 Ok(true)
+             }
+diff --git a/src/native/emitter/ops/icb.rs b/src/native/emitter/ops/icb.rs
+index dc6059f..3df9363 100644
+--- a/src/native/emitter/ops/icb.rs
++++ b/src/native/emitter/ops/icb.rs
+@@ -12,17 +12,23 @@ const RDNA4_ICB_KIND_DRAW: u32 = 1;
+ const RDNA4_ICB_KIND_DRAW_INDEXED: u32 = 2;
+ const RDNA4_ICB_KIND_DRAW_PATCHES: u32 = 3;
+ const RDNA4_ICB_KIND_DRAW_INDEXED_PATCHES: u32 = 4;
++const RDNA4_ICB_KIND_CONCURRENT_DISPATCH: u32 = 5;
++const RDNA4_ICB_KIND_CONCURRENT_DISPATCH_THREADS: u32 = 6;
+ 
+ const RDNA4_ICB_FLAG_INHERIT_PIPELINE: u32 = 1 << 0;
+ const RDNA4_ICB_FLAG_INHERIT_BUFFERS: u32 = 1 << 1;
+ 
+ const RDNA4_ICB_SLOT_FLAG_PIPELINE_SET: u32 = 1 << 0;
+ const RDNA4_ICB_SLOT_FLAG_INVALID: u32 = 1 << 1;
++const RDNA4_ICB_SLOT_FLAG_BARRIER: u32 = 1 << 2;
++const RDNA4_ICB_SLOT_FLAG_STAGE_IN_REGION: u32 = 1 << 3;
+ 
+ const RDNA4_ICB_CMD_BIT_DRAW: u32 = 1 << 0;
+ const RDNA4_ICB_CMD_BIT_DRAW_INDEXED: u32 = 1 << 1;
+ const RDNA4_ICB_CMD_BIT_DRAW_PATCHES: u32 = 1 << 2;
+ const RDNA4_ICB_CMD_BIT_DRAW_INDEXED_PATCHES: u32 = 1 << 3;
++const RDNA4_ICB_CMD_BIT_CONCURRENT_DISPATCH: u32 = 1 << 5;
++const RDNA4_ICB_CMD_BIT_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
+ 
+ impl Emitter {
+     fn resolve_icb_ptr_u64(
+@@ -468,13 +474,110 @@ impl Emitter {
+         )
+     }
+ 
++    fn emit_icb_u32_value(
++        &mut self,
++        tv: &TypedValue,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<Word, String> {
++        let raw = self.value_id_in(&tv.value, &tv.ty, instructions)?;
++        match self.resolve_type(&tv.ty)? {
++            LlType::Int(32) => Ok(raw),
++            LlType::Int(_) => {
++                let u32_ty = self.type_id(&LlType::Int(32))?;
++                let conv = self.fresh();
++                instructions.push(Self::inst(
++                    Op::UConvert,
++                    Some(u32_ty),
++                    Some(conv),
++                    vec![Operand::IdRef(raw)],
++                ));
++                Ok(conv)
++            }
++            other => Err(format!(
++                "native emitter: compute ICB integer operand has non-integer type {other:?}"
++            )),
++        }
++    }
++
++    fn emit_icb_u32x3_pair(
++        &mut self,
++        args: &[TypedValue],
++        callee: &str,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<([Word; 3], [Word; 3]), String> {
++        let extract_vec3 = |this: &mut Self,
++                            tv: &TypedValue,
++                            instructions: &mut Vec<Instruction>|
++         -> Result<[Word; 3], String> {
++            let resolved = this.resolve_type(&tv.ty)?;
++            let LlType::Vector(elem, 3) = resolved else {
++                return Err(format!(
++                    "native emitter: {callee} expected 3-lane integer vector, got {resolved:?}"
++                ));
++            };
++            let elem = this.resolve_type(&elem)?;
++            let LlType::Int(bits) = elem else {
++                return Err(format!(
++                    "native emitter: {callee} expected integer vector element, got {elem:?}"
++                ));
++            };
++            let vec_val = this.value_id_in(&tv.value, &tv.ty, instructions)?;
++            let elem_ty = this.type_id(&elem)?;
++            let u32_ty = this.type_id(&LlType::Int(32))?;
++            let mut lanes = [0u32; 3];
++            for i in 0..3u32 {
++                let lane = this.fresh();
++                instructions.push(Self::inst(
++                    Op::CompositeExtract,
++                    Some(elem_ty),
++                    Some(lane),
++                    vec![Operand::IdRef(vec_val), Operand::LiteralBit32(i)],
++                ));
++                lanes[i as usize] = if bits == 32 {
++                    lane
++                } else {
++                    let conv = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::UConvert,
++                        Some(u32_ty),
++                        Some(conv),
++                        vec![Operand::IdRef(lane)],
++                    ));
++                    conv
++                };
++            }
++            Ok(lanes)
++        };
++        match args.len() {
++            4 => Ok((
++                extract_vec3(self, &args[2], instructions)?,
++                extract_vec3(self, &args[3], instructions)?,
++            )),
++            8 => Ok((
++                [
++                    self.emit_icb_u32_value(&args[2], instructions)?,
++                    self.emit_icb_u32_value(&args[3], instructions)?,
++                    self.emit_icb_u32_value(&args[4], instructions)?,
++                ],
++                [
++                    self.emit_icb_u32_value(&args[5], instructions)?,
++                    self.emit_icb_u32_value(&args[6], instructions)?,
++                    self.emit_icb_u32_value(&args[7], instructions)?,
++                ],
++            )),
++            n => Err(format!(
++                "native emitter: {callee} expects 4 (vec3) or 8 (scalar) operands, got {n}"
++            )),
++        }
++    }
++
+     pub(in crate::native::emitter) fn emit_icb_void_air_call(
+         &mut self,
+         call: &LlCall,
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<(), String> {
+         let callee = call.callee.as_str();
+-        if callee == "air.reset_render_command" {
++        if callee == "air.reset_render_command" || callee == "air.reset_compute_command" {
+             if call.args.len() != 2 {
+                 return Err(format!("native emitter: {callee} expects 2 operands"));
+             }
+@@ -493,7 +596,7 @@ impl Emitter {
+             );
+         }
+ 
+-        if callee == "air.copy_render_command" {
++        if callee == "air.copy_render_command" || callee == "air.copy_compute_command" {
+             if call.args.len() != 4 {
+                 return Err(format!("native emitter: {callee} expects 4 operands"));
+             }
+@@ -590,7 +693,9 @@ impl Emitter {
+             });
+         }
+ 
+-        if callee == "air.set_pipeline_state_render_command" {
++        if callee == "air.set_pipeline_state_render_command"
++            || callee == "air.set_pipeline_state_compute_command"
++        {
+             if call.args.len() != 3 {
+                 return Err(format!("native emitter: {callee} expects 3 operands"));
+             }
+@@ -659,8 +764,10 @@ impl Emitter {
+ 
+         if typed(callee, "air.set_vertex_buffer_render_command")
+             || typed(callee, "air.set_fragment_buffer_render_command")
++            || typed(callee, "air.set_kernel_buffer_compute_command")
+         {
+-            let is_vert = typed(callee, "air.set_vertex_buffer_render_command");
++            let is_primary = typed(callee, "air.set_vertex_buffer_render_command")
++                || typed(callee, "air.set_kernel_buffer_compute_command");
+             let slot_arg_idx = match call.args.len() {
+                 4 => 3,
+                 5 => 4,
+@@ -671,14 +778,10 @@ impl Emitter {
+                 }
+             };
+             let buf_u64 = self.resolve_icb_ptr_u64(&call.args[2], instructions)?;
+-            let bind_idx = self.value_id_in(
+-                &call.args[slot_arg_idx].value,
+-                &call.args[slot_arg_idx].ty,
+-                instructions,
+-            )?;
+-            let max_hdr_off = if is_vert { 16i64 } else { 20i64 };
+-            let mask_off = if is_vert { 24i64 } else { 28i64 };
+-            let array_off = if is_vert { 96i64 } else { 352i64 };
++            let bind_idx = self.emit_icb_u32_value(&call.args[slot_arg_idx], instructions)?;
++            let max_hdr_off = if is_primary { 16i64 } else { 20i64 };
++            let mask_off = if is_primary { 24i64 } else { 28i64 };
++            let array_off = if is_primary { 96i64 } else { 352i64 };
+             return self.emit_icb_guarded_slot(
+                 &call.args[0],
+                 &call.args[1],
+@@ -1043,6 +1146,247 @@ impl Emitter {
+             );
+         }
+ 
+-        Err(format!("native emitter: unhandled render ICB intrinsic {callee}"))
++        if callee == "air.set_barrier_compute_command"
++            || callee == "air.clear_barrier_compute_command"
++        {
++            if call.args.len() != 2 {
++                return Err(format!("native emitter: {callee} expects 2 operands"));
++            }
++            let set_flag = callee == "air.set_barrier_compute_command";
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, _icb_addr, slot_addr, instructions| {
++                    let u32_ty = this.type_id(&LlType::Int(32))?;
++                    let sf = this.emit_icb_load(slot_addr, 12, &LlType::Int(32), 4, instructions)?;
++                    let nsf = this.fresh();
++                    if set_flag {
++                        let bbit = this.const_uint(RDNA4_ICB_SLOT_FLAG_BARRIER)?;
++                        instructions.push(Self::inst(
++                            Op::BitwiseOr,
++                            Some(u32_ty),
++                            Some(nsf),
++                            vec![Operand::IdRef(sf), Operand::IdRef(bbit)],
++                        ));
++                    } else {
++                        let mask = this.const_uint(!RDNA4_ICB_SLOT_FLAG_BARRIER)?;
++                        instructions.push(Self::inst(
++                            Op::BitwiseAnd,
++                            Some(u32_ty),
++                            Some(nsf),
++                            vec![Operand::IdRef(sf), Operand::IdRef(mask)],
++                        ));
++                    }
++                    this.emit_icb_store(slot_addr, 12, &LlType::Int(32), 4, nsf, instructions)
++                },
++            );
++        }
++
++        if callee == "air.set_threadgroup_memory_length_compute_command" {
++            if call.args.len() != 4 {
++                return Err(format!("native emitter: {callee} expects 4 operands"));
++            }
++            let length_u32 = self.emit_icb_u32_value(&call.args[2], instructions)?;
++            let tg_idx = self.emit_icb_u32_value(&call.args[3], instructions)?;
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, _icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let u32_ty = this.type_id(&LlType::Int(32))?;
++                    let i64_ty = this.type_id(&LlType::Int(64))?;
++                    let c32 = this.const_uint(32)?;
++                    let idx_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::ULessThan,
++                        Some(bool_ty),
++                        Some(idx_ok),
++                        vec![Operand::IdRef(tg_idx), Operand::IdRef(c32)],
++                    ));
++                    this.emit_icb_if_else(
++                        idx_ok,
++                        instructions,
++                        |this, instructions| {
++                            let idx64 = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::UConvert,
++                                Some(i64_ty),
++                                Some(idx64),
++                                vec![Operand::IdRef(tg_idx)],
++                            ));
++                            let four = this.const_signed_int(64, 4)?;
++                            let byte_off = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IMul,
++                                Some(i64_ty),
++                                Some(byte_off),
++                                vec![Operand::IdRef(idx64), Operand::IdRef(four)],
++                            ));
++                            let base_off = this.const_signed_int(64, 352)?;
++                            let rel = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IAdd,
++                                Some(i64_ty),
++                                Some(rel),
++                                vec![Operand::IdRef(base_off), Operand::IdRef(byte_off)],
++                            ));
++                            let dst = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::IAdd,
++                                Some(i64_ty),
++                                Some(dst),
++                                vec![Operand::IdRef(slot_addr), Operand::IdRef(rel)],
++                            ));
++                            this.emit_icb_store(
++                                dst,
++                                0,
++                                &LlType::Int(32),
++                                4,
++                                length_u32,
++                                instructions,
++                            )?;
++                            let one = this.const_uint(1)?;
++                            let bit = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::ShiftLeftLogical,
++                                Some(u32_ty),
++                                Some(bit),
++                                vec![Operand::IdRef(one), Operand::IdRef(tg_idx)],
++                            ));
++                            let old_mask =
++                                this.emit_icb_load(slot_addr, 28, &LlType::Int(32), 4, instructions)?;
++                            let new_mask = this.fresh();
++                            instructions.push(Self::inst(
++                                Op::BitwiseOr,
++                                Some(u32_ty),
++                                Some(new_mask),
++                                vec![Operand::IdRef(old_mask), Operand::IdRef(bit)],
++                            ));
++                            this.emit_icb_store(
++                                slot_addr,
++                                28,
++                                &LlType::Int(32),
++                                4,
++                                new_mask,
++                                instructions,
++                            )
++                        },
++                        |this, instructions| this.emit_icb_mark_invalid(slot_addr, instructions),
++                    )
++                },
++            );
++        }
++
++        if typed(callee, "air.set_stage_in_region_compute_command") {
++            let (origin, size) = self.emit_icb_u32x3_pair(&call.args, callee, instructions)?;
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, _icb_addr, slot_addr, instructions| {
++                    let u32_ty = this.type_id(&LlType::Int(32))?;
++                    this.emit_icb_store(slot_addr, 56, &LlType::Int(32), 4, origin[0], instructions)?;
++                    this.emit_icb_store(slot_addr, 60, &LlType::Int(32), 4, origin[1], instructions)?;
++                    this.emit_icb_store(slot_addr, 64, &LlType::Int(32), 4, origin[2], instructions)?;
++                    this.emit_icb_store(slot_addr, 68, &LlType::Int(32), 4, size[0], instructions)?;
++                    this.emit_icb_store(slot_addr, 72, &LlType::Int(32), 4, size[1], instructions)?;
++                    this.emit_icb_store(slot_addr, 76, &LlType::Int(32), 4, size[2], instructions)?;
++                    let sf = this.emit_icb_load(slot_addr, 12, &LlType::Int(32), 4, instructions)?;
++                    let sbit = this.const_uint(RDNA4_ICB_SLOT_FLAG_STAGE_IN_REGION)?;
++                    let nsf = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::BitwiseOr,
++                        Some(u32_ty),
++                        Some(nsf),
++                        vec![Operand::IdRef(sf), Operand::IdRef(sbit)],
++                    ));
++                    this.emit_icb_store(slot_addr, 12, &LlType::Int(32), 4, nsf, instructions)
++                },
++            );
++        }
++
++        if typed(callee, "air.concurrent_dispatch_threadgroups_compute_command")
++            || typed(callee, "air.concurrent_dispatch_threads_compute_command")
++        {
++            let is_threads = typed(callee, "air.concurrent_dispatch_threads_compute_command");
++            let (grid, tg) = self.emit_icb_u32x3_pair(&call.args, callee, instructions)?;
++            let cmd_bit = if is_threads {
++                RDNA4_ICB_CMD_BIT_CONCURRENT_DISPATCH_THREADS
++            } else {
++                RDNA4_ICB_CMD_BIT_CONCURRENT_DISPATCH
++            };
++            let kind_val = if is_threads {
++                RDNA4_ICB_KIND_CONCURRENT_DISPATCH_THREADS
++            } else {
++                RDNA4_ICB_KIND_CONCURRENT_DISPATCH
++            };
++            return self.emit_icb_guarded_slot(
++                &call.args[0],
++                &call.args[1],
++                instructions,
++                |this, icb_addr, slot_addr, instructions| {
++                    let bool_ty = this.type_id(&LlType::Bool)?;
++                    let zero32 = this.const_uint(0)?;
++                    let tx_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::INotEqual,
++                        Some(bool_ty),
++                        Some(tx_ok),
++                        vec![Operand::IdRef(tg[0]), Operand::IdRef(zero32)],
++                    ));
++                    let ty_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::INotEqual,
++                        Some(bool_ty),
++                        Some(ty_ok),
++                        vec![Operand::IdRef(tg[1]), Operand::IdRef(zero32)],
++                    ));
++                    let tz_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::INotEqual,
++                        Some(bool_ty),
++                        Some(tz_ok),
++                        vec![Operand::IdRef(tg[2]), Operand::IdRef(zero32)],
++                    ));
++                    let txy = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(txy),
++                        vec![Operand::IdRef(tx_ok), Operand::IdRef(ty_ok)],
++                    ));
++                    let tg_ok = this.fresh();
++                    instructions.push(Self::inst(
++                        Op::LogicalAnd,
++                        Some(bool_ty),
++                        Some(tg_ok),
++                        vec![Operand::IdRef(txy), Operand::IdRef(tz_ok)],
++                    ));
++                    this.emit_icb_draw_gate(
++                        icb_addr,
++                        slot_addr,
++                        cmd_bit,
++                        Some(tg_ok),
++                        instructions,
++                        |this, instructions| {
++                            let kind = this.const_uint(kind_val)?;
++                            this.emit_icb_store(slot_addr, 0, &LlType::Int(32), 4, kind, instructions)?;
++                            this.emit_icb_store(slot_addr, 4, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 8, &LlType::Int(32), 4, zero32, instructions)?;
++                            this.emit_icb_store(slot_addr, 32, &LlType::Int(32), 4, grid[0], instructions)?;
++                            this.emit_icb_store(slot_addr, 36, &LlType::Int(32), 4, grid[1], instructions)?;
++                            this.emit_icb_store(slot_addr, 40, &LlType::Int(32), 4, grid[2], instructions)?;
++                            this.emit_icb_store(slot_addr, 44, &LlType::Int(32), 4, tg[0], instructions)?;
++                            this.emit_icb_store(slot_addr, 48, &LlType::Int(32), 4, tg[1], instructions)?;
++                            this.emit_icb_store(slot_addr, 52, &LlType::Int(32), 4, tg[2], instructions)
++                        },
++                    )
++                },
++            );
++        }
++
++        Err(format!("native emitter: unhandled ICB intrinsic {callee}"))
+     }
+ }
+diff --git a/src/native/tests/misc.rs b/src/native/tests/misc.rs
+index 29db63b..a992f8c 100644
+--- a/src/native/tests/misc.rs
++++ b/src/native/tests/misc.rs
+@@ -1113,16 +1113,11 @@ declare void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace
+         "the refusal must say the family is recognised, not unknown: {error}"
+     );
+ }
+-/// Compute/object command-encoder families stay refused; render ICB intrinsics are lowered.
++/// Object command-encoder families stay refused; render and compute ICB intrinsics are lowered.
+ #[test]
+ fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+     use crate::air_intrinsics::{air_intrinsic_disposition, AirIntrinsicDisposition};
+-    for name in [
+-        "air.set_object_buffer_render_command.p1i8",
+-        "air.set_kernel_buffer_compute_command.p2i8",
+-        "air.set_threadgroup_memory_length_compute_command",
+-        "air.concurrent_dispatch_threadgroups_compute_command",
+-    ] {
++    for name in ["air.set_object_buffer_render_command.p1i8"] {
+         assert_eq!(
+             air_intrinsic_disposition(name),
+             Some(AirIntrinsicDisposition::NoVulkanEquivalent),
+@@ -1139,6 +1134,17 @@ fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+         "air.draw_patches_render_command.p1i32.p1i8",
+         "air.draw_indexed_patches_render_command.p1i32.p1i8.p1i8",
+         "air.copy_render_command",
++        "air.reset_compute_command",
++        "air.copy_compute_command",
++        "air.set_pipeline_state_compute_command",
++        "air.set_kernel_buffer_compute_command.p1i8",
++        "air.set_kernel_buffer_compute_command.p2i8",
++        "air.set_barrier_compute_command",
++        "air.clear_barrier_compute_command",
++        "air.set_threadgroup_memory_length_compute_command",
++        "air.set_stage_in_region_compute_command",
++        "air.concurrent_dispatch_threadgroups_compute_command",
++        "air.concurrent_dispatch_threads_compute_command",
+     ] {
+         assert_eq!(
+             air_intrinsic_disposition(name),
+@@ -1149,6 +1155,61 @@ fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+     // A sibling nobody has decided about stays unrecognised, so it cannot arrive silently.
+     assert_eq!(air_intrinsic_disposition("air.future_command"), None);
+ }
++
++#[test]
++fn native_metal3_compute_icb_encoding_lowers_cleanly() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.ArgBuf = type { ptr addrspace(1), ptr addrspace(1), ptr addrspace(1) }
++define void @encode_compute_icb(ptr addrspace(1) %args, i32 %tid) {
++entry:
++  %icb_ptr = getelementptr inbounds %struct.ArgBuf, ptr addrspace(1) %args, i64 0, i32 0
++  %icb = load ptr addrspace(1), ptr addrspace(1) %icb_ptr, align 8
++  %pso_ptr = getelementptr inbounds %struct.ArgBuf, ptr addrspace(1) %args, i64 0, i32 1
++  %pso = load ptr addrspace(1), ptr addrspace(1) %pso_ptr, align 8
++  %buf_ptr = getelementptr inbounds %struct.ArgBuf, ptr addrspace(1) %args, i64 0, i32 2
++  %buf = load ptr addrspace(1), ptr addrspace(1) %buf_ptr, align 8
++  call void @air.reset_compute_command(ptr addrspace(1) %icb, i32 %tid)
++  call void @air.set_pipeline_state_compute_command(ptr addrspace(1) %icb, i32 %tid, ptr addrspace(1) %pso)
++  call void @air.set_kernel_buffer_compute_command.p1i8(ptr addrspace(1) %icb, i32 %tid, ptr addrspace(1) %buf, i32 0)
++  call void @air.set_threadgroup_memory_length_compute_command(ptr addrspace(1) %icb, i32 %tid, i32 256, i32 1)
++  call void @air.set_barrier_compute_command(ptr addrspace(1) %icb, i32 %tid)
++  call void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace(1) %icb, i32 %tid, <3 x i32> <i32 4, i32 1, i32 1>, <3 x i32> <i32 64, i32 1, i32 1>)
++  %next = add i32 %tid, 1
++  call void @air.copy_compute_command(ptr addrspace(1) %icb, i32 %next, ptr addrspace(1) %icb, i32 %tid)
++  call void @air.clear_barrier_compute_command(ptr addrspace(1) %icb, i32 %next)
++  call void @air.concurrent_dispatch_threads_compute_command(ptr addrspace(1) %icb, i32 %next, i32 256, i32 1, i32 1, i32 64, i32 1, i32 1)
++  ret void
++}
++declare void @air.reset_compute_command(ptr addrspace(1), i32)
++declare void @air.copy_compute_command(ptr addrspace(1), i32, ptr addrspace(1), i32)
++declare void @air.set_pipeline_state_compute_command(ptr addrspace(1), i32, ptr addrspace(1))
++declare void @air.set_kernel_buffer_compute_command.p1i8(ptr addrspace(1), i32, ptr addrspace(1), i32)
++declare void @air.set_threadgroup_memory_length_compute_command(ptr addrspace(1), i32, i32, i32)
++declare void @air.set_barrier_compute_command(ptr addrspace(1), i32)
++declare void @air.clear_barrier_compute_command(ptr addrspace(1), i32)
++declare void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace(1), i32, <3 x i32>, <3 x i32>)
++declare void @air.concurrent_dispatch_threads_compute_command(ptr addrspace(1), i32, i32, i32, i32, i32, i32, i32)
++!air.kernel = !{!0}
++!0 = !{ptr @encode_compute_icb, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ArgBuf", !"air.arg_name", !"args"}
++!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++"#;
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        std::path::Path::new(""),
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("compute ICB GPU encoder should translate cleanly");
++    let asm = disassemble(&spv).expect("disassemble compute icb");
++    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
++    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
++    assert!(!asm.contains("_compute_command"), "{asm}");
++}
+ #[test]
+ fn native_render_icb_intrinsics_lower_and_validate() {
+     let ll = r#"
+diff --git a/src/passes/icb_stage.rs b/src/passes/icb_stage.rs
+index bbf2dbc..d65f669 100644
+--- a/src/passes/icb_stage.rs
++++ b/src/passes/icb_stage.rs
+@@ -1386,13 +1386,16 @@ fn lower_existing_psb_table_load(
+     b.op(out, Op::Load, u64_ty, vec![Operand::IdRef(ac)])
+ }
+ 
++/// Lower an ICB stage module so buffers in `stage_set` read through the dynamic BDA table at
++/// binding 676 (`rdna4_buffer_table`).
++/// `stage_kind`: 0 = Vertex, 1 = Fragment, 2 = TessellationEvaluation, 3 = Compute (`GLCompute`).
+ pub fn lower_icb_stage(
+     spv: &[u8],
+     stage_kind: u32,
+     stage_set: u32,
+     vattrs: &[IcbVertexAttr],
+ ) -> Result<(Vec<u8>, u32, u32), String> {
+-    if stage_kind > 2 {
++    if stage_kind > 3 {
+         return Err(format!("icb_stage: unsupported stage_kind {stage_kind}"));
+     }
+     let mut module = crate::spirv_module::load_bytes(spv)
+@@ -1406,14 +1409,24 @@ pub fn lower_icb_stage(
+     }
+ 
+     let ep_idx = 0usize;
+-    let entry_fn_id = match module
+-        .entry_points
+-        .get(ep_idx)
+-        .and_then(|ep| ep.operands.get(1))
+-    {
+-        Some(Operand::IdRef(id)) => *id,
++    let (entry_exec_model, entry_fn_id) = match (
++        module
++            .entry_points
++            .get(ep_idx)
++            .and_then(|ep| ep.operands.first()),
++        module
++            .entry_points
++            .get(ep_idx)
++            .and_then(|ep| ep.operands.get(1)),
++    ) {
++        (Some(Operand::ExecutionModel(em)), Some(Operand::IdRef(id))) => (*em, *id),
+         _ => return Err("icb_stage: module has no OpEntryPoint".into()),
+     };
++    if stage_kind == 3 && entry_exec_model != spirv::ExecutionModel::GLCompute {
++        return Err(format!(
++            "icb_stage: stage_kind 3 requires GLCompute entry point, found {entry_exec_model:?}"
++        ));
++    }
+ 
+     let defs_initial = defs_map(&module);
+     let mut sets: HashMap<Word, u32> = HashMap::new();
+@@ -2986,4 +2999,123 @@ entry:
+         assert!(!asm.contains("ArrayLength"), "ArrayLength must be lowered:
+ {asm}");
+     }
++
++    #[test]
++    fn lower_icb_stage_compute_rewrites_buffers_and_atomics_to_table_676() {
++        let mut m = Module::new();
++        m.header = Some(crate::spirv_module::ModuleHeader::new(64));
++        m.capabilities.push(Instruction::new(
++            Op::Capability,
++            None,
++            None,
++            vec![Operand::Capability(Capability::Shader)],
++        ));
++        m.memory_model = Some(Instruction::new(
++            Op::MemoryModel,
++            None,
++            None,
++            vec![
++                Operand::AddressingModel(AddressingModel::Logical),
++                Operand::MemoryModel(MemoryModel::GLSL450),
++            ],
++        ));
++        let t_void = 1;
++        let t_fn = 2;
++        let t_u32 = 3;
++        let t_v3u32 = 4;
++        let t_rt_u32 = 5;
++        let t_ssbo = 6;
++        let t_ptr_sb_ssbo = 7;
++        let t_ptr_sb_u32 = 8;
++        let t_ptr_in_v3 = 9;
++        let t_ptr_in_u32 = 10;
++        let c_0 = 11;
++        let c_1 = 12;
++        let v_buf = 13;
++        let v_gid = 14;
++        let fn_main = 15;
++        let lbl = 16;
++        let p_gid_x = 17;
++        let gid_x = 18;
++        let p_elem = 19;
++        let old = 20;
++        let next = 21;
++        m.types_global_values = vec![
++            Instruction::new(Op::TypeVoid, None, Some(t_void), vec![]),
++            Instruction::new(Op::TypeFunction, None, Some(t_fn), vec![Operand::IdRef(t_void)]),
++            Instruction::new(Op::TypeInt, None, Some(t_u32), vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::TypeVector, None, Some(t_v3u32), vec![Operand::IdRef(t_u32), Operand::LiteralBit32(3)]),
++            Instruction::new(Op::TypeRuntimeArray, None, Some(t_rt_u32), vec![Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypeStruct, None, Some(t_ssbo), vec![Operand::IdRef(t_rt_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_sb_ssbo), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_ssbo)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_sb_u32), vec![Operand::StorageClass(StorageClass::StorageBuffer), Operand::IdRef(t_u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_in_v3), vec![Operand::StorageClass(StorageClass::Input), Operand::IdRef(t_v3u32)]),
++            Instruction::new(Op::TypePointer, None, Some(t_ptr_in_u32), vec![Operand::StorageClass(StorageClass::Input), Operand::IdRef(t_u32)]),
++            Instruction::new(Op::Constant, Some(t_u32), Some(c_0), vec![Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Constant, Some(t_u32), Some(c_1), vec![Operand::LiteralBit32(1)]),
++            Instruction::new(Op::Variable, Some(t_ptr_sb_ssbo), Some(v_buf), vec![Operand::StorageClass(StorageClass::StorageBuffer)]),
++            Instruction::new(Op::Variable, Some(t_ptr_in_v3), Some(v_gid), vec![Operand::StorageClass(StorageClass::Input)]),
++        ];
++        m.annotations = vec![
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_rt_u32), Operand::Decoration(Decoration::ArrayStride), Operand::LiteralBit32(4)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(t_ssbo), Operand::Decoration(Decoration::Block)]),
++            Instruction::new(Op::MemberDecorate, None, None, vec![Operand::IdRef(t_ssbo), Operand::LiteralBit32(0), Operand::Decoration(Decoration::Offset), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_buf), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_buf), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(0)]),
++            Instruction::new(Op::Decorate, None, None, vec![Operand::IdRef(v_gid), Operand::Decoration(Decoration::BuiltIn), Operand::BuiltIn(BuiltIn::GlobalInvocationId)]),
++        ];
++        m.entry_points.push(Instruction::new(
++            Op::EntryPoint,
++            None,
++            None,
++            vec![
++                Operand::ExecutionModel(spirv::ExecutionModel::GLCompute),
++                Operand::IdRef(fn_main),
++                Operand::LiteralString("main".into()),
++                Operand::IdRef(v_gid),
++                Operand::IdRef(v_buf),
++            ],
++        ));
++        m.execution_modes.push(Instruction::new(
++            Op::ExecutionMode,
++            None,
++            None,
++            vec![
++                Operand::IdRef(fn_main),
++                Operand::ExecutionMode(spirv::ExecutionMode::LocalSize),
++                Operand::LiteralBit32(64),
++                Operand::LiteralBit32(1),
++                Operand::LiteralBit32(1),
++            ],
++        ));
++        m.functions.push(Function {
++            def: Some(Instruction::new(Op::Function, Some(t_void), Some(fn_main), vec![Operand::FunctionControl(FunctionControl::NONE), Operand::IdRef(t_fn)])),
++            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
++            parameters: vec![],
++            blocks: vec![Block {
++                label: Some(Instruction::new(Op::Label, None, Some(lbl), vec![])),
++                instructions: vec![
++                    Instruction::new(Op::AccessChain, Some(t_ptr_in_u32), Some(p_gid_x), vec![Operand::IdRef(v_gid), Operand::IdRef(c_0)]),
++                    Instruction::new(Op::Load, Some(t_u32), Some(gid_x), vec![Operand::IdRef(p_gid_x)]),
++                    Instruction::new(Op::AccessChain, Some(t_ptr_sb_u32), Some(p_elem), vec![Operand::IdRef(v_buf), Operand::IdRef(c_0), Operand::IdRef(gid_x)]),
++                    Instruction::new(Op::AtomicIAdd, Some(t_u32), Some(old), vec![Operand::IdRef(p_elem), Operand::IdScope(c_1), Operand::IdMemorySemantics(c_0), Operand::IdRef(c_1)]),
++                    Instruction::new(Op::IAdd, Some(t_u32), Some(next), vec![Operand::IdRef(old), Operand::IdRef(c_1)]),
++                    Instruction::new(Op::Store, None, None, vec![Operand::IdRef(p_elem), Operand::IdRef(next)]),
++                    Instruction::new(Op::Return, None, None, vec![]),
++                ],
++            }],
++        });
++        let raw_bytes: Vec<u8> = m.assemble().into_iter().flat_map(u32::to_le_bytes).collect();
++        let (out, tbl, vsp) = lower_icb_stage(&raw_bytes, 3, 0, &[]).expect("lower compute stage");
++        assert_eq!(tbl, 676);
++        assert_eq!(vsp, 0);
++        let asm = crate::spirv_module::load_bytes(&out).expect("load lowered compute").disassemble();
++        assert!(asm.contains("OpEntryPoint GLCompute"), "{asm}");
++        assert!(asm.contains("BuiltIn GlobalInvocationId"), "{asm}");
++        assert!(asm.contains("Binding 676"), "{asm}");
++        assert!(!asm.contains("Binding 0\n"), "{asm}");
++        assert!(asm.contains("OpAtomicIAdd"), "{asm}");
++        assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
++        assert!(lower_icb_stage(&raw_bytes, 4, 0, &[]).is_err());
++    }
+ }

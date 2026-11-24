@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0068).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0072).
 
 Verification and Tier 2 Scope
 =============================
@@ -17,6 +17,40 @@ version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
 translation and metadata invariants only; they do not establish physical RDNA4
 GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
 stays controlled by the native bundle and compatibility runner.
+
+0072-metal3-compute-icb-gpu-lowering.patch extends GPU ICB lowering in
+`ops/icb.rs` and `air_intrinsics.rs` to lower Compute ICB intrinsics
+(`reset_compute_command`, `copy_compute_command`,
+`set_pipeline_state_compute_command`, `set_kernel_buffer_compute_command.*`,
+`set_barrier_compute_command`, `clear_barrier_compute_command`,
+`set_threadgroup_memory_length_compute_command`,
+`set_stage_in_region_compute_command`,
+`concurrent_dispatch_threadgroups_compute_command`, and
+`concurrent_dispatch_threads_compute_command`) into the 640-byte
+`rdna4_icb_slot_t` layout (keeping `set_object_buffer_render_command` refused),
+and extends `passes::icb_stage::lower_icb_stage` / `garnetx_lower_icb_stage` to
+accept `stage_kind == 3` (`GLCompute`), rewriting compute buffer descriptors to
+the dynamic BDA table at binding 676 (`vs_params_binding = 0`).
+
+0071-metal3-msl3-atomics-bfloat-and-simd.patch adds MSL 2.2-3.2 `atomic<float>`
+(`add`/`sub`/`load`/`store`/`xchg` via `VK_EXT_shader_atomic_float`
+`AtomicFloat32AddEXT`/float atomics, plus structured CAS loops over `u32` words
+for `min`/`max`/`cmpxchg.weak` and shared logical buffers), 64-bit integer
+atomics (`atomic<int64_t>`/`atomic<uint64_t>` with `Int64Atomics`), `bfloat`
+conversions (`bfloat <-> half`, `int <-> bfloat`), vector `llvm.fmuladd.*bf16`,
+`bf16` GLSL math/saturate, generalized storage texture atomics
+(`air.atomic_*_explicit_texture_*` across 1D/1D_array/2D/2D_array/3D/buffer_1d,
+32/64-bit signed/unsigned, scalar & 4-lane ABIs, preserving explicit atomic
+image formats in `garnetxlate`'s `patch_storage_formats`), and 3-arg
+`air.simd_shuffle_and_fill_{up,down}` (default `modulo=32`).
+
+0070-metal3-barycentrics-and-pull-model-interpolation.patch completes fragment
+`[[barycentric_coord]]` (`SPV_KHR_fragment_shader_barycentric`,
+`BaryCoordKHR`/`BaryCoordNoPerspKHR`) and adds pull-model fragment
+interpolation (`interpolant<T>::interpolate_at_{center,centroid,sample,offset}`
+-> `OpLoad` / `GLSL.std.450` `InterpolateAt{Centroid,Sample,Offset}` with
+`InterpolationFunction`, `NoPerspective` preservation, Metal `[0,1)` to Vulkan
+`[-0.5,+0.5)` offset shift, and `half` result conversion).
 
 0068-gpu-icb-lowering-and-stage-bda.patch adds native AIR->SPIR-V lowering for
 MSL 2.1 render indirect command buffer intrinsics (`air.reset_render_command`,

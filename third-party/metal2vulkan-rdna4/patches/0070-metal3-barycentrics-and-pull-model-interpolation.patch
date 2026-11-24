@@ -1,0 +1,710 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 802c335..4ab8107 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -389,6 +389,18 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+ /// sequence of SPIR-V instructions can produce from these operands. This is the single definition
+ /// of that boundary -- translation refuses on it, and validation reports the tooling requirement
+ /// from it.
++pub fn is_interpolate_at_intrinsic(name: &str) -> bool {
++    any_typed(
++        name,
++        &[
++            "air.interpolate_at_center",
++            "air.interpolate_at_centroid",
++            "air.interpolate_at_sample",
++            "air.interpolate_at_offset",
++        ],
++    )
++}
++
+ /// The AIR families that encode into a Metal render indirect command buffer.
+ pub fn is_render_icb_intrinsic(name: &str) -> bool {
+     matches!(
+@@ -530,6 +542,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+     }
+ 
+     if air_image_intrinsic(name)
++        || is_interpolate_at_intrinsic(name)
+         || any_prefix(
+             name,
+             &[
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index a0214b9..3635767 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -159,6 +159,9 @@ pub struct VaryingInterpolation {
+     pub no_perspective: bool,
+     /// Where in the pixel the interpolated value is taken from.
+     pub sampling: VaryingSampling,
++    /// `air.pull_mode` / `air.interpolant` — pull-model fragment input evaluated explicitly via
++    /// `air.interpolate_at_{center,centroid,sample,offset}`.
++    pub pull_mode: bool,
+ }
+ 
+ impl VaryingInterpolation {
+@@ -175,6 +178,7 @@ impl VaryingInterpolation {
+             } else {
+                 VaryingSampling::Center
+             },
++            pull_mode: has("pull_mode") || has("interpolant"),
+         }
+     }
+ }
+@@ -2608,6 +2612,7 @@ pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
+     "front_facing",
+     "imageblock_data",
+     "indirect_buffer",
++    "interpolant",
+     "intersection_function_table",
+     "point_coord",
+     "position",
+@@ -3073,7 +3078,7 @@ fn parse_air_fragment_meta_with_nodes(
+                 "render_target_array_index" => FragRole::RenderTargetArrayIndex,
+                 "amplification_id" => FragRole::AmplificationId,
+                 "amplification_count" => FragRole::AmplificationCount,
+-                "fragment_input" => {
++                "fragment_input" | "interpolant" => {
+                     let l = varying_loc;
+                     varying_loc += 1;
+                     if let Some(name) = arg_type_name(node) {
+@@ -3082,7 +3087,9 @@ fn parse_air_fragment_meta_with_nodes(
+                     if let Some(name) = arg_name(node) {
+                         varying_names.insert(l, name);
+                     }
+-                    if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
++                    if let Some(semantic) = string_after_marker(node, "air.fragment_input")
++                        .or_else(|| string_after_marker(node, "air.interpolant"))
++                    {
+                         varying_user_semantics.insert(l, semantic);
+                     }
+                     varying_interpolation.insert(l, VaryingInterpolation::from_role_strings(&strs));
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index ea18545..d8e885a 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -292,14 +292,20 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+             let Some(call) = instruction.call().as_deref() else {
+                 continue;
+             };
+-            if !is_air_texture_operation(&call.callee) {
++            if !is_air_texture_operation(&call.callee)
++                && !crate::air_intrinsics::is_interpolate_at_intrinsic(&call.callee)
++            {
+                 continue;
+             }
+             for (argument_index, argument) in call.args.iter().enumerate() {
+                 let LlValue::Local(name) = &argument.value else {
+                     continue;
+                 };
+-                if matches!(argument.ty, LlType::Ptr(1))
++                let is_interp_handle = argument_index == 0
++                    && crate::air_intrinsics::is_interpolate_at_intrinsic(&call.callee)
++                    && matches!(argument.ty, LlType::Ptr(_));
++                if is_interp_handle
++                    || matches!(argument.ty, LlType::Ptr(1))
+                     || (matches!(argument.ty, LlType::Ptr(2))
+                         && is_air_sampler_operand(&call.callee, argument_index))
+                 {
+diff --git a/src/native/owned_cfg.rs b/src/native/owned_cfg.rs
+index 155bbf4..399cec7 100644
+--- a/src/native/owned_cfg.rs
++++ b/src/native/owned_cfg.rs
+@@ -2138,11 +2138,17 @@ enum GlslExtInstContract {
+     Ldexp,
+     Pack { lanes: u32 },
+     Unpack { lanes: u32 },
++    InterpolateCentroid,
++    InterpolateSample,
++    InterpolateOffset,
+ }
+ 
+ fn glsl_ext_inst_contract(number: u32) -> Option<GlslExtInstContract> {
+     use spirv::GlslStd450Op as Glsl;
+-    use GlslExtInstContract::{FloatSame, IntegerShapeSame, Ldexp, Pack, Unpack};
++    use GlslExtInstContract::{
++        FloatSame, IntegerShapeSame, InterpolateCentroid, InterpolateOffset, InterpolateSample,
++        Ldexp, Pack, Unpack,
++    };
+ 
+     match Glsl::from_u32(number)? {
+         Glsl::Round
+@@ -2212,6 +2218,9 @@ fn glsl_ext_inst_contract(number: u32) -> Option<GlslExtInstContract> {
+             arity: 1,
+             width_32: true,
+         }),
++        Glsl::InterpolateAtCentroid => Some(InterpolateCentroid),
++        Glsl::InterpolateAtSample => Some(InterpolateSample),
++        Glsl::InterpolateAtOffset => Some(InterpolateOffset),
+         _ => None,
+     }
+ }
+@@ -2320,6 +2329,44 @@ fn owned_glsl_ext_inst_error(
+                     Some((Op::TypeFloat, 32, result_lanes)) if result_lanes == lanes
+                 )
+         }
++        GlslExtInstContract::InterpolateCentroid
++        | GlslExtInstContract::InterpolateSample
++        | GlslExtInstContract::InterpolateOffset => {
++            let input_ptr_ok = argument_types.first().and_then(|ty| definitions.get(ty)).is_some_and(
++                |def| {
++                    def.class.opcode == Op::TypePointer
++                        && def.operands.as_slice()
++                            == [
++                                Operand::StorageClass(spirv::StorageClass::Input),
++                                Operand::IdRef(result_type),
++                            ]
++                },
++            );
++            let res_ok = matches!(
++                numeric_type_shape(result_type, definitions),
++                Some((Op::TypeFloat, 32, 1..=4))
++            );
++            input_ptr_ok
++                && res_ok
++                && match contract {
++                    GlslExtInstContract::InterpolateCentroid => arguments.len() == 1,
++                    GlslExtInstContract::InterpolateSample => {
++                        arguments.len() == 2
++                            && matches!(
++                                numeric_type_shape(argument_types[1], definitions),
++                                Some((Op::TypeInt, 32, 1))
++                            )
++                    }
++                    GlslExtInstContract::InterpolateOffset => {
++                        arguments.len() == 2
++                            && matches!(
++                                numeric_type_shape(argument_types[1], definitions),
++                                Some((Op::TypeFloat, 32, 2))
++                            )
++                    }
++                    _ => false,
++                }
++        }
+     };
+     (!valid).then(|| {
+         format!(
+diff --git a/src/native/tests/interface.rs b/src/native/tests/interface.rs
+index 2bf5129..a30b225 100644
+--- a/src/native/tests/interface.rs
++++ b/src/native/tests/interface.rs
+@@ -2787,3 +2787,105 @@ entry:
+     assert!(err.to_string().contains("raster_order_group(8)"), "{err}");
+     let _ = std::fs::remove_dir_all(&tmp);
+ }
++
++#[test]
++fn native_fragment_barycentric_and_pull_model_interpolation_lower_cleanly() {
++    let bary_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @f(<3 x float> %bc_persp, <3 x float> %bc_nopersp) {
++entry:
++  %sum = fadd <3 x float> %bc_persp, %bc_nopersp
++  %x = extractelement <3 x float> %sum, i32 0
++  %y = extractelement <3 x float> %sum, i32 1
++  %z = extractelement <3 x float> %sum, i32 2
++  %v0 = insertelement <4 x float> undef, float %x, i32 0
++  %v1 = insertelement <4 x float> %v0, float %y, i32 1
++  %v2 = insertelement <4 x float> %v1, float %z, i32 2
++  %v3 = insertelement <4 x float> %v2, float 1.0, i32 3
++  ret <4 x float> %v3
++}
++
++!air.fragment = !{!0}
++!0 = !{ptr @f, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.barycentric_coord", !"air.center", !"air.perspective", !"air.arg_type_name", !"float3"}
++!5 = !{i32 1, !"air.barycentric_coord", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float3"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_bary_pull_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (bary_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        bary_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("barycentric");
++    let bary_asm = disassemble(&bary_spv).expect("disassemble bary");
++    assert!(bary_asm.contains("OpCapability FragmentBarycentricKHR"), "{bary_asm}");
++    assert!(
++        bary_asm.contains("OpExtension \"SPV_KHR_fragment_shader_barycentric\""),
++        "{bary_asm}"
++    );
++    assert!(bary_asm.contains("BuiltIn BaryCoordKHR"), "{bary_asm}");
++    assert!(bary_asm.contains("BuiltIn BaryCoordNoPerspKHR"), "{bary_asm}");
++
++    let pull_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @f(ptr addrspace(1) %uv_p, ptr addrspace(1) %uv_np, i32 %sid) {
++entry:
++  %c = tail call <2 x float> @air.interpolate_at_center.v2f32(ptr addrspace(1) %uv_p)
++  %cen = tail call <2 x float> @air.interpolate_at_centroid.v2f32(ptr addrspace(1) %uv_p)
++  %smp = tail call <2 x float> @air.interpolate_at_sample.v2f32(ptr addrspace(1) %uv_p, i32 %sid)
++  %off = tail call <2 x half> @air.interpolate_at_offset.v2f16(ptr addrspace(1) %uv_np, <2 x float> <float 0.25, float 0.75>)
++  %off32 = fpext <2 x half> %off to <2 x float>
++  %a = fadd <2 x float> %c, %cen
++  %b = fadd <2 x float> %smp, %off32
++  %x = extractelement <2 x float> %a, i32 0
++  %y = extractelement <2 x float> %a, i32 1
++  %z = extractelement <2 x float> %b, i32 0
++  %w = extractelement <2 x float> %b, i32 1
++  %v0 = insertelement <4 x float> undef, float %x, i32 0
++  %v1 = insertelement <4 x float> %v0, float %y, i32 1
++  %v2 = insertelement <4 x float> %v1, float %z, i32 2
++  %v3 = insertelement <4 x float> %v2, float %w, i32 3
++  ret <4 x float> %v3
++}
++
++declare <2 x float> @air.interpolate_at_center.v2f32(ptr addrspace(1))
++declare <2 x float> @air.interpolate_at_centroid.v2f32(ptr addrspace(1))
++declare <2 x float> @air.interpolate_at_sample.v2f32(ptr addrspace(1), i32)
++declare <2 x half> @air.interpolate_at_offset.v2f16(ptr addrspace(1), <2 x float>)
++
++!air.fragment = !{!0}
++!0 = !{ptr @f, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"user(uv0)", !"air.pull_mode", !"air.perspective", !"air.arg_type_name", !"float2"}
++!5 = !{i32 1, !"air.interpolant", !"user(uv1)", !"air.no_perspective", !"air.arg_type_name", !"half2"}
++!6 = !{i32 2, !"air.sample_id", !"air.arg_type_name", !"uint"}
++"#;
++    let (pull_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        pull_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("pull-model");
++    let pull_asm = disassemble(&pull_spv).expect("disassemble pull");
++    assert!(pull_asm.contains("OpCapability InterpolationFunction"), "{pull_asm}");
++    assert!(pull_asm.contains("NoPerspective"), "{pull_asm}");
++    assert!(pull_asm.contains("InterpolateAtCentroid"), "{pull_asm}");
++    assert!(pull_asm.contains("InterpolateAtSample"), "{pull_asm}");
++    assert!(pull_asm.contains("InterpolateAtOffset"), "{pull_asm}");
++    assert!(pull_asm.contains("OpFSub"), "{pull_asm}");
++    assert!(!pull_asm.contains("OpFunctionCall"), "{pull_asm}");
++    let _ = std::fs::remove_dir_all(&tmp);
++}
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+index f6a2e45..42b07d5 100644
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1571,6 +1571,9 @@ pub(in crate::passes) fn lower_one(
+     if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
+         return lower_atomic_texture_fetch_max(ctx, name, res, rty, args);
+     }
++    if crate::air_intrinsics::is_interpolate_at_intrinsic(name) {
++        return lower_interpolate_at(ctx, name, res, rty, args);
++    }
+     if name == "air.calculate_unclamped_lod_texture_2d" {
+         return lower_calculate_lod_texture_2d(ctx, name, res, rty, args, 1);
+     }
+@@ -1832,6 +1835,202 @@ pub(in crate::passes) fn lower_one(
+     lower_float_math(ctx, name, res, rty, args)
+ }
+ 
++fn lower_interpolate_at(
++    ctx: &mut Ctx,
++    name: &str,
++    res: Option<Word>,
++    rty: Option<Word>,
++    args: &[Word],
++) -> Result<Vec<Instruction>, String> {
++    let res = res.ok_or_else(|| format!("{name} has no result"))?;
++    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
++    if args.is_empty() {
++        return Err(format!("{name} expects at least 1 operand"));
++    }
++    // Unwrap OpCopyObject chains to recover the Input OpVariable.
++    let mut var = args[0];
++    while let Some(inst) = value_inst(ctx, var) {
++        if inst.class.opcode == Op::CopyObject {
++            if let Some(Operand::IdRef(src)) = inst.operands.first() {
++                var = *src;
++                continue;
++            }
++        }
++        break;
++    }
++    let var_inst = ctx
++        .new_globals
++        .iter()
++        .chain(ctx.module.types_global_values.iter())
++        .find(|i| i.result_id == Some(var) && i.class.opcode == Op::Variable)
++        .cloned()
++        .ok_or_else(|| format!("{name}: interpolant operand {var} is not an Input variable"))?;
++    if var_inst.operands.first() != Some(&Operand::StorageClass(StorageClass::Input)) {
++        return Err(format!("{name}: interpolant variable {var} is not in Input storage class"));
++    }
++    let ptr_ty = var_inst
++        .result_type
++        .ok_or_else(|| format!("{name}: interpolant variable {var} has no pointer type"))?;
++    let var_ty = match type_def_of(ctx, ptr_ty) {
++        Some(def) if def.class.opcode == Op::TypePointer => match def.operands.get(1) {
++            Some(Operand::IdRef(pt)) => *pt,
++            _ => return Err(format!("{name}: malformed Input pointer type")),
++        },
++        _ => return Err(format!("{name}: interpolant pointer type missing")),
++    };
++    let is_valid_ret = is_f32_scalar_or_vector(ctx, rty) || is_half_scalar_or_vector(ctx, rty);
++    if !is_valid_ret || vector_len(ctx, rty) != vector_len(ctx, var_ty) {
++        return Err(format!("{name}: result type does not match interpolant variable shape"));
++    }
++    if name.contains(".no_perspective") {
++        let already = ctx.module.annotations.iter().any(|a| {
++            a.class.opcode == Op::Decorate
++                && a.operands.as_slice()
++                    == [
++                        Operand::IdRef(var),
++                        Operand::Decoration(Decoration::NoPerspective),
++                    ]
++        });
++        if !already {
++            ctx.module.annotations.push(Instruction::new(
++                Op::Decorate,
++                None,
++                None,
++                vec![
++                    Operand::IdRef(var),
++                    Operand::Decoration(Decoration::NoPerspective),
++                ],
++            ));
++        }
++    }
++
++    let mut out = Vec::new();
++    let eval_id = if rty == var_ty {
++        res
++    } else {
++        ctx.module.fresh_id()
++    };
++    if name == "air.interpolate_at_center" || name.starts_with("air.interpolate_at_center.") {
++        if args.len() != 1 {
++            return Err(format!("{name} expects 1 operand"));
++        }
++        out.push(Instruction::new(
++            Op::Load,
++            Some(var_ty),
++            Some(eval_id),
++            vec![Operand::IdRef(var)],
++        ));
++    } else if name == "air.interpolate_at_centroid"
++        || name.starts_with("air.interpolate_at_centroid.")
++    {
++        if args.len() != 1 {
++            return Err(format!("{name} expects 1 operand"));
++        }
++        let glsl = ctx.glsl();
++        out.push(Instruction::new(
++            Op::ExtInst,
++            Some(var_ty),
++            Some(eval_id),
++            vec![
++                Operand::IdRef(glsl),
++                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtCentroid as u32),
++                Operand::IdRef(var),
++            ],
++        ));
++    } else if name == "air.interpolate_at_sample" || name.starts_with("air.interpolate_at_sample.")
++    {
++        if args.len() != 2 {
++            return Err(format!("{name} expects 2 operands"));
++        }
++        let sample_ty = value_result_type(ctx, args[1])
++            .ok_or_else(|| format!("{name}: sample operand has no type"))?;
++        let width = int_scalar_width(ctx, sample_ty)
++            .ok_or_else(|| format!("{name}: sample operand must be a scalar integer"))?;
++        let sample_id = if width == 32 {
++            args[1]
++        } else {
++            let uint = ctx.ty_uint();
++            let converted = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::UConvert,
++                Some(uint),
++                Some(converted),
++                vec![Operand::IdRef(args[1])],
++            ));
++            converted
++        };
++        let glsl = ctx.glsl();
++        out.push(Instruction::new(
++            Op::ExtInst,
++            Some(var_ty),
++            Some(eval_id),
++            vec![
++                Operand::IdRef(glsl),
++                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtSample as u32),
++                Operand::IdRef(var),
++                Operand::IdRef(sample_id),
++            ],
++        ));
++    } else if name == "air.interpolate_at_offset" || name.starts_with("air.interpolate_at_offset.")
++    {
++        if args.len() != 2 {
++            return Err(format!("{name} expects 2 operands"));
++        }
++        let v2f32 = ctx.ty_vecf(2);
++        let off_ty = value_result_type(ctx, args[1])
++            .ok_or_else(|| format!("{name}: offset operand has no type"))?;
++        let off_f32 = if off_ty == v2f32 {
++            args[1]
++        } else if is_half_scalar_or_vector(ctx, off_ty) && vector_len(ctx, off_ty) == 2 {
++            let converted = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::FConvert,
++                Some(v2f32),
++                Some(converted),
++                vec![Operand::IdRef(args[1])],
++            ));
++            converted
++        } else {
++            return Err(format!("{name}: offset operand must be float2 or half2"));
++        };
++        // Metal interpolate_at_offset uses [0, 1) from pixel top-left; SPIR-V InterpolateAtOffset
++        // uses [-0.5, +0.5) from pixel center.
++        let half_c = ctx.const_float(0.5);
++        let half2 = splat(ctx, v2f32, half_c, 2);
++        let vk_off = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::FSub,
++            Some(v2f32),
++            Some(vk_off),
++            vec![Operand::IdRef(off_f32), Operand::IdRef(half2)],
++        ));
++        let glsl = ctx.glsl();
++        out.push(Instruction::new(
++            Op::ExtInst,
++            Some(var_ty),
++            Some(eval_id),
++            vec![
++                Operand::IdRef(glsl),
++                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtOffset as u32),
++                Operand::IdRef(var),
++                Operand::IdRef(vk_off),
++            ],
++        ));
++    } else {
++        return Err(format!("unhandled pull-model interpolation intrinsic: {name}"));
++    }
++
++    if eval_id != res {
++        out.push(Instruction::new(
++            Op::FConvert,
++            Some(rty),
++            Some(res),
++            vec![Operand::IdRef(eval_id)],
++        ));
++    }
++    Ok(out)
++}
++
+ fn lower_dot(
+     ctx: &Ctx,
+     name: &str,
+diff --git a/src/passes/module_cleanup.rs b/src/passes/module_cleanup.rs
+index 2718982..e34d88a 100644
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -771,6 +771,36 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
+     if has_barycentric {
+         want.push(Capability::FragmentBarycentricKHR);
+     }
++    // Pull-model interpolation (`InterpolateAt{Centroid,Sample,Offset}` in GLSL.std.450) requires
++    // `Capability::InterpolationFunction`.
++    let glsl_ext_id = ctx.module.ext_inst_imports.iter().find_map(|inst| {
++        if inst.operands.as_slice() == [Operand::LiteralString("GLSL.std.450".to_string())] {
++            inst.result_id
++        } else {
++            None
++        }
++    });
++    let has_interpolation_fn = glsl_ext_id.is_some_and(|glsl| {
++        ctx.module
++            .functions
++            .iter()
++            .flat_map(|f| f.blocks.iter())
++            .flat_map(|b| b.instructions.iter())
++            .any(|i| {
++                i.class.opcode == Op::ExtInst
++                    && i.operands.first() == Some(&Operand::IdRef(glsl))
++                    && matches!(
++                        i.operands.get(1),
++                        Some(Operand::LiteralExtInstInteger(op))
++                            if *op == spirv::GlslStd450Op::InterpolateAtCentroid as u32
++                                || *op == spirv::GlslStd450Op::InterpolateAtSample as u32
++                                || *op == spirv::GlslStd450Op::InterpolateAtOffset as u32
++                    )
++            })
++    });
++    if has_interpolation_fn {
++        want.push(Capability::InterpolationFunction);
++    }
+     let has_stencil_export = ctx.module.annotations.iter().any(|instruction| {
+         instruction.class.opcode == Op::Decorate
+             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index fdacdb5..c8dfc33 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -1519,7 +1519,43 @@ pub(super) fn build_stage_input(
+             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
+             buffer_structs.push((var, struct_ty));
+         } else if role_is("varying") {
+-            if matches!(stage, Stage::Fragment) && is_scalar_bool(&defs, *pty) {
++            let frag_interp = frag
++                .map(|m| m.varying_interpolation(loc))
++                .unwrap_or_default();
++            let pull_call_ty = if matches!(stage, Stage::Fragment) {
++                pull_model_interpolant_call_type(ctx, entry_idx, *pid)
++            } else {
++                None
++            };
++            if matches!(stage, Stage::Fragment) && (frag_interp.pull_mode || pull_call_ty.is_some())
++            {
++                if frag_interp.flat {
++                    return Err(format!(
++                        "pull-model interpolant at location {loc} cannot be flat"
++                    ));
++                }
++                let interface_ty = pull_model_interface_type(
++                    ctx,
++                    &defs,
++                    pull_call_ty,
++                    *pty,
++                    frag.and_then(|m| m.varying_types.get(&loc).map(String::as_str)),
++                )?;
++                let pptr = ctx.ty_ptr(StorageClass::Input, interface_ty);
++                let var = ctx.module.fresh_id();
++                ctx.new_globals.push(Instruction::new(
++                    Op::Variable,
++                    Some(pptr),
++                    Some(var),
++                    vec![Operand::StorageClass(StorageClass::Input)],
++                ));
++                decorate_location(&mut ctx.module, var, loc);
++                if frag_interp.no_perspective {
++                    decorate_with(&mut ctx.module, var, Decoration::NoPerspective);
++                }
++                ctx.interface.push(var);
++                bindings.push((*pid, ParamBinding::Value { val: var }));
++            } else if matches!(stage, Stage::Fragment) && is_scalar_bool(&defs, *pty) {
+                 let uint_ty = ctx.ty_uint();
+                 let pptr = ctx.ty_ptr(StorageClass::Input, uint_ty);
+                 let var = ctx.module.fresh_id();
+@@ -2500,6 +2536,106 @@ fn integer_component_width(ctx: &Ctx, ty: Word) -> Option<u32> {
+     }
+ }
+ 
++fn pull_model_interpolant_call_type(ctx: &Ctx, entry_idx: usize, pid: Word) -> Option<Word> {
++    let names = air_names(&ctx.module);
++    let mut aliases = HashSet::from([pid]);
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for block in &ctx.module.functions[entry_idx].blocks {
++            for inst in &block.instructions {
++                if inst.class.opcode == Op::CopyObject {
++                    if let (Some(res), Some(Operand::IdRef(src))) =
++                        (inst.result_id, inst.operands.first())
++                    {
++                        if aliases.contains(src) && aliases.insert(res) {
++                            changed = true;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    for block in &ctx.module.functions[entry_idx].blocks {
++        for inst in &block.instructions {
++            if inst.class.opcode != Op::FunctionCall {
++                continue;
++            }
++            let Some(Operand::IdRef(callee)) = inst.operands.first() else {
++                continue;
++            };
++            if !names
++                .get(callee)
++                .is_some_and(|name| crate::air_intrinsics::is_interpolate_at_intrinsic(name))
++            {
++                continue;
++            }
++            if matches!(inst.operands.get(1), Some(Operand::IdRef(arg0)) if aliases.contains(arg0))
++            {
++                if let Some(rty) = inst.result_type {
++                    return Some(rty);
++                }
++            }
++        }
++    }
++    None
++}
++
++fn pull_model_f32_type(ctx: &mut Ctx, defs: &HashMap<Word, Instruction>, ty: Word) -> Option<Word> {
++    let (comp, lanes) = scalar_or_vector_component(defs, ty)?;
++    let def = defs.get(&comp)?;
++    if def.class.opcode != Op::TypeFloat {
++        return None;
++    }
++    let width = match def.operands.first() {
++        Some(Operand::LiteralBit32(w)) => *w,
++        _ => return None,
++    };
++    if !matches!(width, 16 | 32) {
++        return None;
++    }
++    Some(match lanes {
++        None => ctx.ty_float(),
++        Some(n @ 2..=4) => ctx.ty_vecf(n),
++        _ => return None,
++    })
++}
++
++fn pull_model_interface_type(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    call_ret_ty: Option<Word>,
++    param_ty: Word,
++    air_type_name: Option<&str>,
++) -> Result<Word, String> {
++    if let Some(rty) = call_ret_ty {
++        return pull_model_f32_type(ctx, defs, rty)
++            .ok_or_else(|| "pull-model interpolant must evaluate to a float/half scalar or vector".into());
++    }
++    if let Some(ty) = pull_model_f32_type(ctx, defs, param_ty) {
++        return Ok(ty);
++    }
++    if let Some(raw) = air_type_name {
++        let inner = raw
++            .trim()
++            .strip_prefix("interpolant<")
++            .and_then(|s| s.split(',').next())
++            .unwrap_or(raw)
++            .trim();
++        let ty = match inner {
++            "float" | "half" => Some(ctx.ty_float()),
++            "float2" | "half2" => Some(ctx.ty_vecf(2)),
++            "float3" | "half3" => Some(ctx.ty_vecf(3)),
++            "float4" | "half4" => Some(ctx.ty_vecf(4)),
++            _ => None,
++        };
++        if let Some(ty) = ty {
++            return Ok(ty);
++        }
++    }
++    Ok(ctx.ty_float())
++}
++
+ fn tess_coord_prefix_lanes(
+     defs: &HashMap<Word, Instruction>,
+     param_ty: Word,
