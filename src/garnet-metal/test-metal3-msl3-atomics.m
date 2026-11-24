@@ -438,12 +438,12 @@ static void runBfloat(id<MTLDevice> dev, id<MTLCommandQueue> q) {
          "    bfloat4 a = inA[i];\n"
          "    bfloat4 b = inB[i];\n"
          "    bfloat4 c = inC[i];\n"
-         "    bfloat4 f = fma(a, b, c);\n"
+         "    bfloat4 f = a * b + c;\n"
          "    outFma[i] = f;\n"
          "    half h = half(f.x);\n"
          "    bfloat back = bfloat(h);\n"
-         "    bfloat e = exp(bfloat(clamp(float(a.x), -2.0f, 2.0f)));\n"
-         "    bfloat sat = saturate(a.y);\n"
+         "    bfloat e = bfloat(exp(clamp(float(a.x), -2.0f, 2.0f)));\n"
+         "    bfloat sat = bfloat(saturate(float(a.y)));\n"
          "    bfloat fi = bfloat(int(i) - 32);\n"
          "    outAux[i] = ushort4(as_type<ushort>(back), as_type<ushort>(e), as_type<ushort>(sat), as_type<ushort>(fi));\n"
          "    outUint[i] = uint(bfloat(float(i + 5u)));\n"
@@ -508,11 +508,15 @@ static void runBfloat(id<MTLDevice> dev, id<MTLCommandQueue> q) {
             float fa = bf16_to_f32(pA[i * 4 + c]);
             float fb = bf16_to_f32(pB[i * 4 + c]);
             float fc = bf16_to_f32(pC[i * 4 + c]);
+            // MSL 3.1/3.2 lacks fma(bfloat4, ...), so k_bfloat computes a * b + c;
+            // allow either unfused bf16 mul+add (separate bf16 roundings) or fast-math fused FMA.
+            uint16_t expMulAdd = f32_to_bf16(bf16_to_f32(f32_to_bf16(fa * fb)) + fc);
             uint16_t expFma = f32_to_bf16(fmaf(fa, fb, fc));
             uint16_t g = gotFma[i * 4 + c];
-            require(bf16_ulp_dist(g, expFma) <= 1u,
-                    [NSString stringWithFormat:@"bfloat fma[%lu][%d] got=0x%04x(%g) exp=0x%04x(%g)",
-                     (unsigned long)i, c, g, bf16_to_f32(g), expFma, bf16_to_f32(expFma)]);
+            require(bf16_ulp_dist(g, expMulAdd) <= 1u || bf16_ulp_dist(g, expFma) <= 1u,
+                    [NSString stringWithFormat:@"bfloat muladd[%lu][%d] got=0x%04x(%g) expMulAdd=0x%04x(%g) expFma=0x%04x(%g)",
+                     (unsigned long)i, c, g, bf16_to_f32(g),
+                     expMulAdd, bf16_to_f32(expMulAdd), expFma, bf16_to_f32(expFma)]);
         }
         // back = bfloat(half(fma.x)): since fma.x is well within half range, bf16 -> fp16 -> bf16 stays within 1 ULP.
         uint16_t expBack = gotFma[i * 4 + 0];

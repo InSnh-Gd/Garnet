@@ -516,7 +516,12 @@ int main(int argc, char **argv) {
                                         [NSString stringWithFormat:@"pull pOffA (%d,%d) s=%d", x, y, s]);
                             float expSmpNP[3] = {0}, expSmpP[3] = {0};
                             analyticalBary(ps->pos[0], ps->pos[1], expSmpNP, expSmpP);
-                            checkFloat2(ps->pSample, expSmpP[2], expSmpP[1], 2e-3f,
+                            // RADV GFX12 lowers GLSL.std.450 InterpolateAtSample via coarse-quad
+                            // derivatives (persp_center + ddx_coarse*dx + ddy_coarse*dy); on this
+                            // 12px 4:1 w-ratio triangle, curvature error is ~0.0022 at (3,3) s=0
+                            // and peaks at ~0.0115 at (7,5) s=3 (still well below pSample vs
+                            // pCenter 0.058 and perspective vs linear 0.302).
+                            checkFloat2(ps->pSample, expSmpP[2], expSmpP[1], 1.5e-2f,
                                         [NSString stringWithFormat:@"pull pSample (%d,%d) s=%d", x, y, s]);
 
                             float fx = ps->npSample[0] - (float)x;
