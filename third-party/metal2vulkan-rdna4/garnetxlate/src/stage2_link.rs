@@ -16,15 +16,26 @@ use crate::{
 };
 use metal2vulkan::linked_functions::{
     exported_symbols, visible_function_reference_symbols, DynamicLibraryModule,
-    LinkedFunctionLinkage, LinkedFunctionReference, RuntimeVisibleFunctionTableInfo,
+    IntersectionFunctionKind, LinkedFunctionLinkage, LinkedFunctionReference,
+    LinkedIntersectionFunction, RuntimeIntersectionFunctionTableInfo,
+    RuntimeVisibleFunctionTableInfo,
 };
-use metal2vulkan::passes::{QueryLodReplay, TransformOptions};
+use metal2vulkan::passes::{QueryLodReplay, Stage, TransformOptions};
 use metal2vulkan::tools::sanitize_ll_text_with_datalayout;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+
+pub const GARNETX_STAGE_VERTEX: u32 = 0;
+pub const GARNETX_STAGE_FRAGMENT: u32 = 1;
+pub const GARNETX_STAGE_KERNEL: u32 = 2;
+pub const GARNETX_STAGE_OBJECT: u32 = 3;
+pub const GARNETX_STAGE_MESH: u32 = 4;
+
+pub const GARNETX_IFT_KIND_BOUNDING_BOX: u32 = 0;
+pub const GARNETX_IFT_KIND_TRIANGLE_ANY_HIT: u32 = 1;
 
 /// One preloaded dynamic library (`MTLDynamicLibrary` / `binaryFunctions`) as LLVM AIR text.
 #[repr(C)]
@@ -33,6 +44,73 @@ pub struct RDNA4xDynamicLibrary {
     pub name_len: usize,
     pub ll: *const u8,
     pub ll_len: usize,
+}
+
+/// One pipeline-linked Metal 3 intersection function (`[[intersection(bounding_box|triangle)]]`)
+/// for runtime `MTLIntersectionFunctionTable` dispatch inside `OpRayQueryProceedKHR`.
+#[repr(C)]
+pub struct RDNA4xIntersectionFunction {
+    pub symbol: *const u8,
+    pub symbol_len: usize,
+    pub ll: *const u8,
+    pub ll_len: usize,
+    /// `GARNETX_IFT_KIND_BOUNDING_BOX` (0) or `GARNETX_IFT_KIND_TRIANGLE_ANY_HIT` (1).
+    pub kind: u32,
+}
+
+/// C FFI: detect the Metal shader stage from AIR text (`GARNETX_STAGE_*`).
+///
+/// # Safety
+/// `ll` must be readable for `ll_len` bytes; `out_stage_kind` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn garnetx_detect_stage(
+    ll: *const u8,
+    ll_len: usize,
+    out_stage_kind: *mut u32,
+    err: *mut c_char,
+    err_len: usize,
+) -> c_int {
+    if !err.is_null() && err_len > 0 {
+        *err = 0;
+    }
+    if ll.is_null() || ll_len == 0 || ll_len > MAX_LL_BYTES || out_stage_kind.is_null() {
+        put_err(err, err_len, "bad arguments");
+        return RC_BAD_ARGS;
+    }
+    let bytes = std::slice::from_raw_parts(ll, ll_len);
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<u32, String> {
+        let text = std::str::from_utf8(bytes).map_err(|e| format!("LLVM text is not UTF-8: {e}"))?;
+        let (san, _) = sanitize_ll_text_with_datalayout(text);
+        let stage = detect_stage_text(&san)?;
+        Ok(match stage {
+            Stage::Vertex => GARNETX_STAGE_VERTEX,
+            Stage::Fragment => GARNETX_STAGE_FRAGMENT,
+            Stage::Kernel => GARNETX_STAGE_KERNEL,
+            Stage::Object => GARNETX_STAGE_OBJECT,
+            Stage::Mesh => GARNETX_STAGE_MESH,
+        })
+    }));
+    match outcome {
+        Ok(Ok(kind)) => {
+            *out_stage_kind = kind;
+            RC_OK
+        }
+        Ok(Err(e)) => {
+            put_err(err, err_len, &e);
+            RC_REFUSED
+        }
+        Err(p) => {
+            let why = if let Some(s) = p.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = p.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            put_err(err, err_len, &format!("panic: {why}"));
+            RC_PANIC
+        }
+    }
 }
 
 /// Enumerate exported (non-internal, non-private, non-intrinsic) symbols in an AIR module.
@@ -152,15 +230,93 @@ fn enrich_vft_metadata(vft: &RuntimeVisibleFunctionTableInfo, reflection_json: &
     })
 }
 
+fn enrich_ift_metadata(
+    ift: &RuntimeIntersectionFunctionTableInfo,
+    reflection_json: &Value,
+) -> Value {
+    let bindings = reflection_json.get("bindings").and_then(Value::as_array);
+    let tables: Vec<Value> = ift
+        .tables
+        .iter()
+        .map(|tbl| {
+            let descriptor = bindings.and_then(|bs| {
+                bs.iter()
+                    .find(|b| {
+                        b.get("kind").and_then(Value::as_str) == Some("Buffer")
+                            && b.get("param_index").and_then(Value::as_u64)
+                                == Some(tbl.param_index as u64)
+                    })
+                    .or_else(|| {
+                        bs.iter().find(|b| {
+                            b.get("kind").and_then(Value::as_str) == Some("Buffer")
+                                && b.get("metal_index").and_then(Value::as_u64)
+                                    == Some(tbl.metal_index as u64)
+                        })
+                    })
+                    .and_then(|b| b.get("descriptor"))
+                    .cloned()
+            });
+            json!({
+                "param_index": tbl.param_index,
+                "metal_index": tbl.metal_index,
+                "descriptor": descriptor,
+            })
+        })
+        .collect();
+    let handles: Vec<Value> = ift
+        .handles
+        .iter()
+        .map(|h| {
+            json!({
+                "handle_id": h.handle_id,
+                "symbol": h.symbol,
+                "kind": match h.kind {
+                    IntersectionFunctionKind::BoundingBox => "BoundingBox",
+                    IntersectionFunctionKind::TriangleAnyHit => "TriangleAnyHit",
+                },
+            })
+        })
+        .collect();
+    json!({
+        "abi_version": ift.abi_version,
+        "header_words": ift.header_words,
+        "tables": tables,
+        "handles": handles,
+    })
+}
+
 /// Pure-Rust Metal 3 modularity translation supporting direct visible-function deps, preloaded
 /// dynamic libraries (`MTLDynamicLibrary`), and runtime `MTLVisibleFunctionTable` dispatch across
-/// compute, vertex, and fragment stages.
+/// compute, vertex, fragment, object, and mesh stages.
 pub fn translate_bytes_stage2(
     ll: &[u8],
     local: [u32; 3],
     deps: &[(String, Vec<u8>)],
     dynlibs: &[(String, Vec<u8>)],
     visible_functions: &[(String, Vec<u8>)],
+    capabilities: Option<RDNA4xBackendCapabilities>,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    translate_bytes_stage3(
+        ll,
+        local,
+        deps,
+        dynlibs,
+        visible_functions,
+        &[],
+        capabilities,
+    )
+}
+
+/// Pure-Rust Metal 3 Stage 3 translation: all Stage 2 modularity plus Object/Mesh shaders,
+/// hardware `SPV_KHR_ray_query`, and runtime `MTLIntersectionFunctionTable` dispatch across
+/// compute and render (vertex/fragment/object/mesh) stages.
+pub fn translate_bytes_stage3(
+    ll: &[u8],
+    local: [u32; 3],
+    deps: &[(String, Vec<u8>)],
+    dynlibs: &[(String, Vec<u8>)],
+    visible_functions: &[(String, Vec<u8>)],
+    intersection_functions: &[(String, IntersectionFunctionKind, Vec<u8>)],
     capabilities: Option<RDNA4xBackendCapabilities>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let caps = capabilities.map(RDNA4xBackendCapabilities::validate).transpose()?;
@@ -241,8 +397,40 @@ pub fn translate_bytes_stage2(
         linkage.runtime_visible_tables = true;
     }
 
-    let (san_ll, vft_info) =
-        metal2vulkan::specialize_linked_module_with_vft(&san_entry, stage, &linkage)?;
+    // 4. Runtime `MTLIntersectionFunctionTable` linked intersection functions.
+    let mut seen_ift: BTreeMap<&str, (IntersectionFunctionKind, String)> = BTreeMap::new();
+    for (sym, kind, bytes) in intersection_functions {
+        let ift_text = std::str::from_utf8(bytes)
+            .map_err(|e| format!("intersection function {sym:?}: LLVM text is not UTF-8: {e}"))?;
+        let (san_ift, _) = sanitize_ll_text_with_datalayout(ift_text);
+        match seen_ift.get(sym.as_str()) {
+            Some((prev_kind, prev_ll)) if *prev_kind != *kind || *prev_ll != san_ift => {
+                return Err(format!(
+                    "intersection function {sym:?} is authored twice with conflicting definitions"
+                ));
+            }
+            Some(_) => continue,
+            None => {
+                seen_ift.insert(sym.as_str(), (*kind, san_ift.clone()));
+                linkage
+                    .runtime_intersection_functions
+                    .push(LinkedIntersectionFunction {
+                        symbol: sym.clone(),
+                        kind: *kind,
+                        module_ll: san_ift,
+                    });
+            }
+        }
+    }
+    if !intersection_functions.is_empty()
+        || san_entry.contains("air.intersection_function_table")
+        || san_entry.contains("@air.intersect.intersection_function_buffer")
+    {
+        linkage.runtime_intersection_tables = true;
+    }
+
+    let (san_ll, vft_info, ift_info) =
+        metal2vulkan::specialize_linked_module_with_tables(&san_entry, stage, &linkage)?;
 
     let replay = caps.map_or(QueryLodReplay::UniformOnly, RDNA4xBackendCapabilities::replay);
     let mut options = TransformOptions {
@@ -254,7 +442,8 @@ pub fn translate_bytes_stage2(
     };
     options = options
         .with_normalized_sampler_coordinates()
-        .with_query_lod_replay(replay);
+        .with_query_lod_replay(replay)
+        .with_hardware_ray_query();
 
     let tmp = Path::new("");
     let (spv, reflection, buffer_address_mode, uniform_control_proof) =
@@ -282,6 +471,9 @@ pub fn translate_bytes_stage2(
     }
     if let Some(ref vft) = vft_info {
         reflection_json["visible_function_tables"] = enrich_vft_metadata(vft, &reflection_json);
+    }
+    if let Some(ref ift) = ift_info {
+        reflection_json["intersection_function_tables"] = enrich_ift_metadata(ift, &reflection_json);
     }
     let meta = trim_meta_with_buffer_address_mode(&reflection_json, patched, buffer_address_mode);
 
@@ -471,6 +663,168 @@ pub unsafe extern "C" fn garnetx_translate_linked_libraries(
             &owned_deps,
             &owned_dynlibs,
             &owned_vis,
+            caps,
+        )
+    }));
+    finish(outcome, spv, spv_len, meta, meta_len, err, err_len)
+}
+
+unsafe fn read_ift_array(
+    ptr: *const RDNA4xIntersectionFunction,
+    count: usize,
+    total: &mut usize,
+) -> Result<Vec<(String, IntersectionFunctionKind, Vec<u8>)>, String> {
+    if count > MAX_DEPS || (count > 0 && ptr.is_null()) {
+        return Err("bad arguments: invalid intersection function array".into());
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let item = &*ptr.add(i);
+        if item.symbol.is_null() || item.symbol_len == 0 || item.ll.is_null() || item.ll_len == 0 {
+            return Err("bad arguments: empty intersection function entry".into());
+        }
+        let kind = match item.kind {
+            GARNETX_IFT_KIND_BOUNDING_BOX => IntersectionFunctionKind::BoundingBox,
+            GARNETX_IFT_KIND_TRIANGLE_ANY_HIT => IntersectionFunctionKind::TriangleAnyHit,
+            other => {
+                return Err(format!(
+                    "bad arguments: unknown intersection function kind {other}"
+                ));
+            }
+        };
+        *total = total.saturating_add(item.ll_len);
+        if *total > MAX_LL_BYTES {
+            return Err("bad arguments: intersection function modules too large".into());
+        }
+        let sym = std::str::from_utf8(std::slice::from_raw_parts(item.symbol, item.symbol_len))
+            .map_err(|_| "bad arguments: intersection function symbol is not UTF-8")?
+            .to_string();
+        out.push((
+            sym,
+            kind,
+            std::slice::from_raw_parts(item.ll, item.ll_len).to_vec(),
+        ));
+    }
+    Ok(out)
+}
+
+/// C FFI: translate AIR text with full Metal 3 Stage 3 support — dynamic libraries, direct
+/// visible-function refs, runtime `MTLVisibleFunctionTable`, Object/Mesh shaders, hardware
+/// `SPV_KHR_ray_query`, and runtime `MTLIntersectionFunctionTable` dispatch across compute and
+/// render stages.
+///
+/// `capabilities` may be NULL. Outputs and return codes follow `garnetx_translate`.
+///
+/// # Safety
+/// All pointers must be valid for their stated lengths; output pointers must be writable.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn garnetx_translate_stage3(
+    ll: *const u8,
+    ll_len: usize,
+    local_xyz: *const u32,
+    deps: *const RDNA4xDep,
+    ndeps: usize,
+    dynlibs: *const RDNA4xDynamicLibrary,
+    ndynlibs: usize,
+    visible_fns: *const RDNA4xDep,
+    nvisible_fns: usize,
+    intersection_fns: *const RDNA4xIntersectionFunction,
+    nintersection_fns: usize,
+    capabilities: *const RDNA4xBackendCapabilities,
+    spv: *mut *mut u8,
+    spv_len: *mut usize,
+    meta: *mut *mut u8,
+    meta_len: *mut usize,
+    err: *mut c_char,
+    err_len: usize,
+) -> c_int {
+    if !spv.is_null() {
+        *spv = std::ptr::null_mut();
+    }
+    if !spv_len.is_null() {
+        *spv_len = 0;
+    }
+    if !meta.is_null() {
+        *meta = std::ptr::null_mut();
+    }
+    if !meta_len.is_null() {
+        *meta_len = 0;
+    }
+    if !err.is_null() && err_len > 0 {
+        *err = 0;
+    }
+    if ll.is_null()
+        || ll_len == 0
+        || ll_len > MAX_LL_BYTES
+        || spv.is_null()
+        || spv_len.is_null()
+        || meta.is_null()
+        || meta_len.is_null()
+    {
+        put_err(err, err_len, "bad arguments");
+        return RC_BAD_ARGS;
+    }
+    let caps = if capabilities.is_null() {
+        None
+    } else {
+        match (*capabilities).validate() {
+            Ok(valid) => Some(valid),
+            Err(msg) => {
+                put_err(err, err_len, &msg);
+                return RC_BAD_ARGS;
+            }
+        }
+    };
+    let local = if local_xyz.is_null() {
+        [64u32, 1, 1]
+    } else {
+        let l = [*local_xyz, *local_xyz.add(1), *local_xyz.add(2)];
+        if l.contains(&0) {
+            put_err(err, err_len, "bad arguments: --local has a zero dimension");
+            return RC_BAD_ARGS;
+        }
+        l
+    };
+    let mut total = ll_len;
+    let owned_deps = match read_dep_array(deps, ndeps, &mut total, "dependency") {
+        Ok(v) => v,
+        Err(msg) => {
+            put_err(err, err_len, &msg);
+            return RC_BAD_ARGS;
+        }
+    };
+    let owned_dynlibs = match read_dynlib_array(dynlibs, ndynlibs, &mut total) {
+        Ok(v) => v,
+        Err(msg) => {
+            put_err(err, err_len, &msg);
+            return RC_BAD_ARGS;
+        }
+    };
+    let owned_vis = match read_dep_array(visible_fns, nvisible_fns, &mut total, "visible function")
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            put_err(err, err_len, &msg);
+            return RC_BAD_ARGS;
+        }
+    };
+    let owned_ift = match read_ift_array(intersection_fns, nintersection_fns, &mut total) {
+        Ok(v) => v,
+        Err(msg) => {
+            put_err(err, err_len, &msg);
+            return RC_BAD_ARGS;
+        }
+    };
+    let bytes = std::slice::from_raw_parts(ll, ll_len);
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        translate_bytes_stage3(
+            bytes,
+            local,
+            &owned_deps,
+            &owned_dynlibs,
+            &owned_vis,
+            &owned_ift,
             caps,
         )
     }));

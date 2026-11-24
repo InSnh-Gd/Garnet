@@ -7,16 +7,68 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0075).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0077).
 
 Verification and Tier 2 Scope
 =============================
 Unless explicitly stated in a section below, wire contracts remain at the
 current baseline (C ABI 3, reflection 66, argument-table ABI 9, source-proof
-version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
-translation and metadata invariants only; they do not establish physical RDNA4
-GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
-stays controlled by the native bundle and compatibility runner.
+version 2). Patch-level SPIR-V, wrapper, and host/LavaPipe checks verify
+translation, metadata invariants, and software Vulkan 1.4.363 execution only;
+they do not establish physical RDNA4 GPU execution or complete Tier 2
+acceptance. Runtime capability/execution gating stays controlled by the native
+bundle and compatibility runner.
+
+0077-metal3-ray-query-and-intersection-tables.patch adds hardware
+`SPV_KHR_ray_query` lowering (`OpCapability RayQueryKHR`, `OpExtension
+"SPV_KHR_ray_query"`) across `native/ray_query_air.rs`, `passes/ray_query.rs`,
+`passes/stage_input/mod.rs`, `passes/resources/collapse.rs`,
+`passes/module_cleanup.rs`, `meta/{embedded,mod}.rs`, `linked_functions.rs`,
+`reflect/{mod,tests}.rs`, and `lib.rs` (opt-in via
+`TransformOptions::with_hardware_ray_query()`, enabled by `garnetxlate` while
+preserving legacy default fallback behavior). Top-level Metal
+`primitive_acceleration_structure` / `instance_acceleration_structure` bindings
+map to `OpTypeAccelerationStructureKHR` (`VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR`
+at `BUFFER_BINDING_BASE + n`), and argument-buffer acceleration structures lower
+64-bit GPU device addresses via `OpConvertUToAccelerationStructureKHR`
+(`bda_abi: "u64_device_address"`). Lowers `air.intersect.*` families to
+`OpRayQueryInitializeKHR`, `OpRayQueryProceedKHR`, `OpRayQueryTerminateKHR`,
+`OpRayQueryConfirmIntersectionKHR`, `OpRayQueryGenerateIntersectionKHR`, and
+committed/candidate getters (`Type`, `T`, `Barycentrics`, `FrontFace`,
+`InstanceId`, `InstanceCustomIndex`, `PrimitiveIndex`, `GeometryIndex`,
+`ObjectToWorld`, `WorldToObject`, `WorldRayOrigin`, `WorldRayDirection`,
+`ObjectRayOrigin`, `ObjectRayDirection`) across compute, vertex, fragment,
+object, and mesh stages. Adds runtime `MTLIntersectionFunctionTable` dispatch
+(`specialize_linked_module_with_tables`, `RuntimeIntersectionFunctionTableInfo`)
+inside `OpRayQueryProceedKHR` via bounded `OpSwitch` reading the shared
+`uint32_t[]` table buffer ABI (`word[0] = slot_count`, `word[1 + slot] =
+handle_id`, `slot = sbt_offset + geometry_index + max(0, function_table_offset)`)
+for custom bounding-box (`IntersectionFunctionKind::BoundingBox`) and triangle
+any-hit (`IntersectionFunctionKind::TriangleAnyHit`) functions with safe
+handle-0/OOB fallback (confirm for triangles, miss for bounding boxes).
+`garnetxlate` keeps `garnetx_abi_version() == 3` and adds `garnetx_detect_stage`
+(`GARNETX_STAGE_*`) and `garnetx_translate_stage3` (`RDNA4xIntersectionFunction`),
+exposing `"acceleration_structures"` and `"intersection_function_tables"` in
+trimmed reflection JSON when present.
+
+0076-metal3-mesh-and-object-shaders.patch adds Metal 3 Object (`Stage::Object`,
+`OpEntryPoint TaskEXT`) and Mesh (`Stage::Mesh`, `OpEntryPoint MeshEXT`) shader
+lowering (`OpCapability MeshShadingEXT`, `OpExtension "SPV_EXT_mesh_shader"`)
+across `passes/mesh_stage.rs`, `air_intrinsics.rs`, `meta/{mod,types}.rs`,
+`native/{emit_tiers,emitter/{functions,helpers},ir/metadata_pointees,owned_cfg,
+tir/storage}.rs`, `passes/{mod,finalize,module_cleanup,stage_input/*,
+stage_output/mod,resources/*,workgroup/*,access/raw_byte}.rs`,
+`emitted_effects.rs`, `linked_functions.rs`, `reflect/{mod,tests}.rs`, and
+`lib.rs`. Supports `TaskPayloadWorkgroupEXT` payloads `>= 16,384` bytes
+(`addrspace(3|6|7)`), `air.set_mesh_properties` / `set_threadgroups_per_grid`
+-> `OpEmitMeshTasksEXT`, `LocalSize`, `OutputVertices`, `OutputPrimitivesEXT`,
+`OutputPoints`/`OutputLinesEXT`/`OutputTrianglesEXT`, `OpSetMeshOutputsEXT`
+(including late primitive-count culling via `CullPrimitiveEXT`), per-vertex
+output arrays, `PerPrimitiveEXT` primitive output arrays and fragment inputs,
+`Primitive{Point,Line,Triangle}IndicesEXT`, `CullPrimitiveEXT`, `Layer`, and
+`ViewportIndex`. Trimmed reflection JSON exposes `"object"`, `"mesh"`, and
+`PerPrimitiveEXT` `"varyings"` when present while leaving non-mesh shaders
+unchanged.
 
 0075-metal3-sparse-prt-residency.patch adds Sparse / PRT residency predicate
 lowering across `passes/air_calls/images/{resolve,sample,sample_depth,read,

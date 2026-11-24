@@ -52,11 +52,15 @@ pub fn detect_stage_text(san_ll: &str) -> Result<Stage, String> {
         Ok(Stage::Vertex)
     } else if san_ll.contains("!air.fragment =") {
         Ok(Stage::Fragment)
+    } else if san_ll.contains("!air.object =") {
+        Ok(Stage::Object)
+    } else if san_ll.contains("!air.mesh =") {
+        Ok(Stage::Mesh)
     } else if san_ll.contains("!air.kernel =") {
         Ok(Stage::Kernel)
     } else {
         Err(
-            "metal2vulkan: no !air.vertex/!air.fragment/!air.kernel stage metadata in module"
+            "metal2vulkan: no !air.vertex/!air.fragment/!air.kernel/!air.object/!air.mesh stage metadata in module"
                 .to_string(),
         )
     }
@@ -211,7 +215,9 @@ pub(crate) fn translate_text_with_options(
     if normalized_sampler_coordinates {
         options = options.with_normalized_sampler_coordinates();
     }
-    options = options.with_query_lod_replay(query_lod_replay);
+    options = options
+        .with_query_lod_replay(query_lod_replay)
+        .with_hardware_ray_query();
     // Never used on the Skip path (it reaches only the scratch-file helpers, which never run).
     let tmp = Path::new("");
     let (spv, reflection, buffer_address_mode, uniform_control_proof) =
@@ -516,11 +522,41 @@ pub fn trim_meta_with_buffer_address_mode(
     if let Some(tessellation) = m.get("tessellation").filter(|t| !t.is_null()) {
         put(&mut out, "tessellation", tessellation);
     }
+    if let Some(object) = m.get("object").filter(|o| !o.is_null()) {
+        put(&mut out, "object", object);
+    }
+    if let Some(mesh) = m.get("mesh").filter(|v| !v.is_null()) {
+        put(&mut out, "mesh", mesh);
+    }
+    let has_mesh = m.get("mesh").is_some_and(|v| !v.is_null());
+    if let Some(varyings) = m.get("varyings").filter(|v| {
+        v.as_array().is_some_and(|arr| {
+            !arr.is_empty()
+                && (has_mesh
+                    || arr
+                        .iter()
+                        .any(|item| item.get("per_primitive").and_then(Value::as_bool) == Some(true)))
+        })
+    }) {
+        put(&mut out, "varyings", varyings);
+    }
+    if let Some(accel) = m
+        .get("acceleration_structures")
+        .filter(|a| a.as_array().is_some_and(|arr| !arr.is_empty()))
+    {
+        put(&mut out, "acceleration_structures", accel);
+    }
     if let Some(vft) = m
         .get("visible_function_tables")
         .filter(|vft| !vft.is_null())
     {
         put(&mut out, "visible_function_tables", vft);
+    }
+    if let Some(ift) = m
+        .get("intersection_function_tables")
+        .filter(|ift| !ift.is_null())
+    {
+        put(&mut out, "intersection_function_tables", ift);
     }
     if let Some(proof) = m
         .get("uniform_control_proof")

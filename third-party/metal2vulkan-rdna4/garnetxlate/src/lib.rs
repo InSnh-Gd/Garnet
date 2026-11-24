@@ -20,8 +20,11 @@ mod icb_stage;
 pub use icb_stage::garnetx_lower_icb_stage;
 mod stage2_link;
 pub use stage2_link::{
-    garnetx_list_exported_symbols, garnetx_translate_linked_libraries, list_exported_symbols,
-    translate_bytes_stage2, RDNA4xDynamicLibrary,
+    garnetx_detect_stage, garnetx_list_exported_symbols, garnetx_translate_linked_libraries,
+    garnetx_translate_stage3, list_exported_symbols, translate_bytes_stage2,
+    translate_bytes_stage3, RDNA4xDynamicLibrary, RDNA4xIntersectionFunction,
+    GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT, GARNETX_STAGE_FRAGMENT,
+    GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT, GARNETX_STAGE_VERTEX,
 };
 mod source_proof;
 

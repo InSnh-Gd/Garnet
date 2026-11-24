@@ -142,13 +142,39 @@ int garnetx_lower_icb_stage(
     char *err,
     size_t err_len);
 
-/* Metal 3 Stage 2 extensions: MTLDynamicLibrary + MTLVisibleFunctionTable. */
+/* Metal 3 Stage 2/3 extensions: MTLDynamicLibrary, MTLVisibleFunctionTable,
+ * Object/Mesh stage detection, and hardware Ray Query + MTLIntersectionFunctionTable.
+ * All additions preserve GARNETX_ABI_VERSION == 3u and every existing symbol. */
+
+#define GARNETX_STAGE_VERTEX   0u
+#define GARNETX_STAGE_FRAGMENT 1u
+#define GARNETX_STAGE_KERNEL   2u
+#define GARNETX_STAGE_OBJECT   3u
+#define GARNETX_STAGE_MESH     4u
+
+#define GARNETX_IFT_KIND_BOUNDING_BOX     0u
+#define GARNETX_IFT_KIND_TRIANGLE_ANY_HIT 1u
+
+typedef struct RDNA4xIntersectionFunction {
+    const uint8_t *symbol;
+    size_t symbol_len;
+    const uint8_t *ll;
+    size_t ll_len;
+    uint32_t kind; /* GARNETX_IFT_KIND_* */
+} RDNA4xIntersectionFunction;
 
 int garnetx_list_exported_symbols(
     const uint8_t *ll,
     size_t ll_len,
     uint8_t **out_json,
     size_t *out_json_len,
+    char *err,
+    size_t err_len);
+
+int garnetx_detect_stage(
+    const uint8_t *ll,
+    size_t ll_len,
+    uint32_t *out_stage_kind,
     char *err,
     size_t err_len);
 
@@ -162,6 +188,26 @@ int garnetx_translate_linked_libraries(
     size_t ndynlibs,
     const RDNA4xDep *visible_fns,
     size_t nvisible_fns,
+    const RDNA4xBackendCapabilities *capabilities,
+    uint8_t **spv,
+    size_t *spv_len,
+    uint8_t **meta,
+    size_t *meta_len,
+    char *err,
+    size_t err_len);
+
+int garnetx_translate_stage3(
+    const uint8_t *ll,
+    size_t ll_len,
+    const uint32_t *local_xyz,
+    const RDNA4xDep *deps,
+    size_t ndeps,
+    const RDNA4xDynamicLibrary *dynlibs,
+    size_t ndynlibs,
+    const RDNA4xDep *visible_fns,
+    size_t nvisible_fns,
+    const RDNA4xIntersectionFunction *intersection_fns,
+    size_t nintersection_fns,
     const RDNA4xBackendCapabilities *capabilities,
     uint8_t **spv,
     size_t *spv_len,
