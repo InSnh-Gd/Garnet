@@ -356,6 +356,7 @@ pub fn translate_bytes_stage3(
         }
     }
     let mut need: Vec<String> = visible_function_reference_symbols(&san_entry)?;
+    need.extend(metal2vulkan::linked_functions::external_symbol_references(&san_entry)?);
     let mut done: BTreeSet<String> = BTreeSet::new();
     while let Some(sym) = need.pop() {
         if !done.insert(sym.clone()) {
@@ -365,6 +366,7 @@ pub fn translate_bytes_stage3(
             continue;
         };
         need.extend(visible_function_reference_symbols(module)?);
+        need.extend(metal2vulkan::linked_functions::external_symbol_references(module)?);
         linkage.visible_references.push(LinkedFunctionReference {
             symbol: sym,
             module_ll: module.clone(),

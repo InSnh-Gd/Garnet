@@ -1149,3 +1149,190 @@ declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
     assert!(!nb.iter().any(|b| b["kind"] == "MeshEmulatedPayload"));
     assert!(nb.iter().any(|b| b["kind"] == "MeshEmulatedIndirect" && b["descriptor"]["binding"] == 675));
 }
+
+#[test]
+fn apple_air_v28_live_fixes_0079_ffi() {
+    let emul_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // 1. Real Apple AIR mesh_only_per_prim + obj_payload_16k + mesh_payload_16k + helper_add_blue.MTL_VISIBLE_FN_REF.
+    let obj_16k = r#"
+%struct.Payload16K = type { [4096 x i32] }
+define void @obj_payload_16k(ptr addrspace(6) nocapture writeonly align 4 dereferenceable(16384) %payload, ptr addrspace(3) %mgp.0, ptr addrspace(2) nocapture readonly "air-buffer-no-alias" %cfg, i32 %tid, i32 %tgid) {
+entry:
+  %is0 = icmp eq i32 %tid, 0
+  br i1 %is0, label %w, label %done
+w:
+  %c = load <4 x i32>, ptr addrspace(2) %cfg, align 16
+  %cx = extractelement <4 x i32> %c, i32 0
+  %cy = extractelement <4 x i32> %c, i32 1
+  %cz = extractelement <4 x i32> %c, i32 2
+  %w0 = add i32 %cx, %tgid
+  %p0 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
+  store i32 %w0, ptr addrspace(6) %p0, align 4
+  %p4095 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i32 0, i32 0, i32 4095
+  store i32 %cy, ptr addrspace(6) %p4095, align 4
+  %g = insertelement <3 x i32> <i32 poison, i32 1, i32 1>, i32 %cz, i32 0
+  tail call void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) nocapture %mgp.0, <3 x i32> %g)
+  br label %done
+done:
+  ret void
+}
+declare void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) nocapture, <3 x i32>)
+!air.object = !{!14}
+!14 = !{ptr @obj_payload_16k, !15, !16, !23}
+!15 = !{}
+!16 = !{!17, !19, !20, !21, !22}
+!17 = !{i32 0, !"air.payload", !"air.struct_type_info", !18, !"air.arg_type_size", i32 16384, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload16K", !"air.arg_name", !"payload"}
+!18 = !{i32 0, i32 16384, i32 4, !"uint", !"words", i32 4096}
+!19 = !{i32 1, !"air.mesh_grid_properties", !"air.arg_type_name", !"mesh_grid_properties", !"air.arg_name", !"mgp"}
+!20 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"cfg"}
+!21 = !{i32 3, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+!22 = !{i32 4, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint"}
+!23 = !{!"air.max_mesh_work_groups", i32 4}
+"#;
+    let obj_emul = call_stage3_with_caps(obj_16k, Some([32, 1, 1]), &[], Some(emul_caps));
+    assert_eq!(obj_emul.rc, RC_OK, "apple AIR obj_payload_16k failed: {}", obj_emul.msg);
+    let obj_meta: Value = serde_json::from_slice(&obj_emul.meta).unwrap();
+    assert_eq!(obj_meta["object"]["emulated_payload"], true);
+    assert_eq!(obj_meta["object"]["max_total_threadgroups_per_mesh_grid"], 4);
+
+    let mesh_helper = r#"
+define void @mesh_with_private_helper(ptr addrspace(7) %out.coerce, i32 %tid) {
+entry:
+  %is0 = icmp eq i32 %tid, 0
+  br i1 %is0, label %emit, label %done
+emit:
+  %c = tail call <4 x float> @helper_add_blue.MTL_VISIBLE_FN_REF(<4 x float> <float 5.0e-01, float 2.5e-01, float 0.0, float 1.0>)
+  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 0, <4 x float> <float -1.0, float -1.0, float 0.0, float 1.0>)
+  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 1, <4 x float> <float 1.0, float -1.0, float 0.0, float 1.0>)
+  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 2, <4 x float> <float 0.0, float 1.0, float 0.0, float 1.0>)
+  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 0, <4 x float> %c)
+  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 1, <4 x float> %c)
+  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 2, <4 x float> %c)
+  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 0, i8 0)
+  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 1, i8 1)
+  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 2, i8 2)
+  tail call void @air.set_primitive_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 0, <4 x float> <float 0.0, float 5.0e-01, float 2.5e-01, float 0.0>)
+  tail call void @air.set_primitive_count_mesh(ptr addrspace(7) nocapture %out.coerce, i32 1)
+  br label %done
+done:
+  ret void
+}
+declare void @air.set_position_mesh(ptr addrspace(7) nocapture, i32, <4 x float>)
+declare void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture, i32, i32, <4 x float>)
+declare void @air.set_primitive_data_mesh.v4f32(ptr addrspace(7) nocapture, i32, i32, <4 x float>)
+declare void @air.set_index_mesh(ptr addrspace(7) nocapture, i32, i8)
+declare void @air.set_primitive_count_mesh(ptr addrspace(7) nocapture, i32)
+declare <4 x float> @helper_add_blue.MTL_VISIBLE_FN_REF(<4 x float>) section "air.externally_defined"
+!air.mesh = !{!14}
+!14 = !{ptr @mesh_with_private_helper, !15, !16}
+!15 = !{}
+!16 = !{!17, !24}
+!17 = !{i32 0, !"air.mesh", !18, !"air.arg_type_name", !"mesh<VertOut, PrimOut, 4, 2, triangle>", !"air.arg_name", !"out"}
+!18 = !{!"air.mesh_type_info", !19, !22, i32 4, i32 2, !"air.triangle"}
+!19 = !{!20, !21}
+!20 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!21 = !{!"air.mesh_vertex_data", i32 0, !"user(locn0)", !"air.arg_type_name", !"float4", !"air.arg_name", !"vcolor"}
+!22 = !{!23}
+!23 = !{!"air.mesh_primitive_data", i32 0, !"user(locn1)", !"air.arg_type_name", !"float4", !"air.arg_name", !"pcolor"}
+!24 = !{i32 1, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+    let helper_ll = r#"
+define <4 x float> @helper_add_blue(<4 x float> %c) {
+entry:
+  %r = insertelement <4 x float> %c, float 1.0, i32 2
+  ret <4 x float> %r
+}
+"#;
+    let (spv_mh, meta_mh) = garnetxlate::translate_bytes_stage3(
+        mesh_helper.as_bytes(),
+        [32, 1, 1],
+        &[("helper_add_blue".to_string(), helper_ll.as_bytes().to_vec())],
+        &[],
+        &[],
+        &[],
+        Some(emul_caps),
+    )
+    .expect("mesh_with_private_helper via stage3");
+    let mh_asm = spv_asm(&spv_mh);
+    assert!(mh_asm.contains("OpEntryPoint MeshEXT"), "{mh_asm}");
+    assert!(mh_asm.contains("PerPrimitiveEXT"), "{mh_asm}");
+    let mh_meta: Value = serde_json::from_slice(&meta_mh).unwrap();
+    assert_eq!(mh_meta["mesh"]["vertex_outputs"][0]["location"], 0);
+    assert_eq!(mh_meta["mesh"]["primitive_outputs"][0]["location"], 1);
+    assert_eq!(mh_meta["mesh"]["primitive_outputs"][0]["per_primitive"], true);
+
+    // 2. Real Apple AIR trace_ift + aabb_sphere (<{ i1, float }>) + tri_anyhit_filter (i1) via FFI.
+    let trace_ift = r#"
+define void @trace_ift(ptr addrspace(1) %rays, ptr addrspace(1) %out, ptr addrspace(1) readonly %scene.coerce, ptr addrspace(1) readonly %ift.coerce, i32 %tid) {
+entry:
+  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 0.0, float 0.0, float 0.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %ht = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 0
+  %dst = getelementptr inbounds i32, ptr addrspace(1) %out, i32 %tid
+  store i32 %ht, ptr addrspace(1) %dst, align 4
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @trace_ift, !1, !2}
+!1 = !{}
+!2 = !{!19, !20, !21, !22, !23}
+!19 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
+!20 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
+!21 = !{i32 2, !"air.instance_acceleration_structure", !"air.location_index", i32 2, i32 1, !"air.read"}
+!22 = !{i32 3, !"air.intersection_function_table", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
+!23 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let aabb_sphere = r#"
+define <{ i1, float }> @aabb_sphere(<3 x float> %origin, <3 x float> %dir, float %tmin, float %tmax) {
+entry:
+  %r0 = insertvalue <{ i1, float }> poison, i1 true, 0
+  %r1 = insertvalue <{ i1, float }> %r0, float 3.500000e+00, 1
+  ret <{ i1, float }> %r1
+}
+!air.intersection = !{!14}
+!14 = !{ptr @aabb_sphere, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{}
+!18 = !{!19, !20, !21, !22}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+"#;
+    let tri_anyhit = r#"
+define i1 @tri_anyhit_filter(<2 x float> %bary) {
+entry:
+  %bx = extractelement <2 x float> %bary, i32 0
+  %ok = fcmp oge float %bx, 3.000000e-01
+  ret i1 %ok
+}
+!air.intersection = !{!14}
+!14 = !{ptr @tri_anyhit_filter, !15, !17, !"air.triangle", !"air.instancing", !"air.triangle_data"}
+!15 = !{}
+!17 = !{!18}
+!18 = !{i32 0, !"air.barycentric_coord", !"air.arg_type_name", !"float2"}
+"#;
+    let rt_res = call_stage3(
+        trace_ift,
+        Some([4, 1, 1]),
+        &[],
+        &[],
+        &[],
+        &[
+            ("aabb_sphere", GARNETX_IFT_KIND_BOUNDING_BOX, aabb_sphere),
+            ("tri_anyhit_filter", GARNETX_IFT_KIND_TRIANGLE_ANY_HIT, tri_anyhit),
+        ],
+    );
+    assert_eq!(rt_res.rc, RC_OK, "apple AIR trace_ift failed: {}", rt_res.msg);
+    let rt_asm = spv_asm(&rt_res.spv);
+    assert!(rt_asm.contains("OpSwitch"), "{rt_asm}");
+    assert!(rt_asm.contains("OpRayQueryGenerateIntersectionKHR"), "{rt_asm}");
+    assert!(rt_asm.contains("OpRayQueryConfirmIntersectionKHR"), "{rt_asm}");
+}

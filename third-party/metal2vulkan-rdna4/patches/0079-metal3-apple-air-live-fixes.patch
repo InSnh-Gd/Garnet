@@ -1,0 +1,2023 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 0a36043..f210fda 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -605,29 +605,40 @@ pub fn is_object_mesh_intrinsic(name: &str) -> bool {
+         &[
+             "air.set_mesh_properties",
+             "air.set_threadgroups_per_grid",
++            "air.set_threadgroups_per_grid_mesh_properties",
+             "air.mesh_grid_properties.set_threadgroups_per_grid",
+             "air.set_mesh_primitive_count",
++            "air.set_primitive_count_mesh",
+             "air.mesh.set_primitive_count",
+             "air.set_mesh_outputs",
+             "air.set_mesh_index",
++            "air.set_index_mesh",
+             "air.set_mesh_primitive_indices",
+             "air.set_mesh_vertex",
+             "air.set_mesh_vertex_position",
+             "air.set_mesh_position",
++            "air.set_position_mesh",
+             "air.set_mesh_vertex_point_size",
+             "air.set_mesh_point_size",
++            "air.set_point_size_mesh",
+             "air.set_mesh_vertex_attribute",
+             "air.set_mesh_vertex_output",
++            "air.set_vertex_data_mesh",
+             "air.set_mesh_primitive",
+             "air.set_mesh_primitive_attribute",
+             "air.set_mesh_primitive_output",
++            "air.set_primitive_data_mesh",
+             "air.set_mesh_primitive_culled",
+             "air.set_mesh_cull_primitive",
++            "air.set_primitive_culled_mesh",
+             "air.set_mesh_render_target_array_index",
+             "air.set_mesh_layer",
++            "air.set_render_target_array_index_mesh",
+             "air.set_mesh_viewport_array_index",
+             "air.set_mesh_viewport_index",
++            "air.set_viewport_array_index_mesh",
+             "air.set_mesh_primitive_id",
++            "air.set_primitive_id_mesh",
+         ],
+     )
+ }
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index b4bab41..2cef249 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -1145,6 +1145,31 @@ fn air_visible_function_references(
+             symbol,
+         });
+     }
++    // Real Apple AIR (`metalfe` for `MTLLinkedFunctions.privateFunctions` / `[[visible]]`) can
++    // emit `declare ... @<name>.MTL_VISIBLE_FN_REF(...) section "air.externally_defined"` without
++    // a companion `!{!"air.visible_function_reference", ...}` node; map those stubs directly to
++    // `<name>` when not already mapped by metadata.
++    for line in module.lines() {
++        let trimmed = line.trim_start();
++        if !trimmed.starts_with("declare ") {
++            continue;
++        }
++        let Some((global, _)) = declaration_global(trimmed) else {
++            continue;
++        };
++        let decoded = decode_llvm_global(global)?;
++        let Some(logical) = decoded.strip_suffix(".MTL_VISIBLE_FN_REF") else {
++            continue;
++        };
++        if logical.is_empty() || stubs.contains_key(global) {
++            continue;
++        }
++        stubs.insert(global.to_string(), logical.to_string());
++        references.push(AirVisibleFunctionReference {
++            stub_global: global.to_string(),
++            symbol: logical.to_string(),
++        });
++    }
+     Ok(references)
+ }
+ 
+@@ -2030,7 +2055,11 @@ pub fn specialize_runtime_intersection_function_tables(
+     }
+ 
+     let tables = discover_intersection_function_table_bindings(entry_ll, stage);
+-    if tables.is_empty() && !entry_ll.contains("@air.intersect.intersection_function_buffer") {
++    if tables.is_empty()
++        && !entry_ll.contains("@air.intersect.intersection_function_buffer")
++        && !(entry_ll.contains("@air.intersect.")
++            && !linkage.runtime_intersection_functions.is_empty())
++    {
+         return Ok((entry_ll.to_string(), None));
+     }
+     let table_param_indices: HashSet<u32> = tables.iter().map(|t| t.param_index).collect();
+@@ -2279,6 +2308,17 @@ fn rewrite_ift_metadata_line(line: &str, table_param_indices: &HashSet<u32>) ->
+     let mut new_body = body
+         .replace("!\"air.intersection_function_table\"", "!\"air.buffer\"")
+         .replace("!\"intersection_function_table\"", "!\"uint\"");
++    // Also rewrite parameterized Apple AIR type names such as
++    // `!"intersection_function_table<instancing, triangle_data>"` -> `!"uint"`.
++    while let Some(pos) = new_body.find("!\"intersection_function_table<") {
++        let after = &new_body[pos + 2..];
++        if let Some(end_q) = after.find('"') {
++            let end = pos + 2 + end_q + 1;
++            new_body.replace_range(pos..end, "!\"uint\"");
++        } else {
++            break;
++        }
++    }
+     if !new_body.contains("!\"air.read\"")
+         && !new_body.contains("!\"air.write\"")
+         && !new_body.contains("!\"air.read_write\"")
+@@ -2474,23 +2514,104 @@ fn parse_callback_signature(
+ 
+ fn decode_callback_param_roles(
+     module_ll: &str,
+-    _symbol: &str,
++    symbol: &str,
+     kind: IntersectionFunctionKind,
+     param_types: &[String],
+ ) -> Vec<crate::native::ray_query_air::CallbackParamRole> {
+     use crate::native::ray_query_air::CallbackParamRole as Role;
+ 
+-    // First look for AIR parameter role metadata (`!{i32 idx, !"air.<role>", ...}`).
+-    let mut by_idx: HashMap<usize, Role> = HashMap::new();
++    // Collect metadata nodes so we can scope role lookup strictly to the `!air.intersection`
++    // entry for `symbol` (preventing cross-contamination in single-MTLLibrary modules with
++    // multiple intersection functions).
++    let mut md_nodes = HashMap::<u32, &str>::new();
++    let mut isect_roots = Vec::<u32>::new();
++    let parse_refs = |body: &str| -> Vec<u32> {
++        body.split(',')
++            .filter_map(|p| {
++                p.trim()
++                    .strip_prefix('!')
++                    .and_then(|d| d.trim_end_matches('}').trim().parse::<u32>().ok())
++            })
++            .collect()
++    };
+     for line in module_ll.lines() {
+         let trimmed = line.trim();
+-        if !trimmed.starts_with('!') || !trimmed.contains("!{") {
++        let Some((lhs, rhs)) = trimmed.split_once(" = ") else {
+             continue;
+-        }
+-        let Some(open) = trimmed.find("!{") else {
++        };
++        let Some(body) = rhs
++            .trim()
++            .strip_prefix("!{")
++            .and_then(|s| s.strip_suffix('}'))
++        else {
+             continue;
+         };
+-        let body = &trimmed[open + 2..];
++        if let Some(id) = lhs.trim().strip_prefix('!').and_then(|d| d.parse::<u32>().ok()) {
++            md_nodes.insert(id, body);
++        } else if lhs.trim() == "!air.intersection" {
++            isect_roots.extend(parse_refs(body));
++        }
++    }
++    let sym_global = llvm_global(symbol).ok();
++    let mut scoped_param_bodies: Vec<&str> = Vec::new();
++    if let Some(ref global) = sym_global {
++        for root_id in isect_roots {
++            let Some(&root_body) = md_nodes.get(&root_id) else {
++                continue;
++            };
++            let matches_sym = root_body
++                .find('@')
++                .and_then(|at| {
++                    let end = llvm_metadata_global_end(root_body, at).unwrap_or(root_body.len());
++                    Some(&root_body[at..end])
++                })
++                .is_some_and(|tok| tok == global.as_str());
++            if !matches_sym {
++                continue;
++            }
++            let refs = parse_refs(root_body);
++            // `!14 = !{ptr @fn, !outputs, !inputs, ...}` -> inputs list is the 2nd ref.
++            if let Some(&in_list_id) = refs.get(1) {
++                if let Some(&in_list_body) = md_nodes.get(&in_list_id) {
++                    for pref in parse_refs(in_list_body) {
++                        if let Some(&pbody) = md_nodes.get(&pref) {
++                            scoped_param_bodies.push(pbody);
++                        }
++                    }
++                }
++            }
++            break;
++        }
++    }
++
++    let role_matches_param_type = |role: Role, ty: &str| -> bool {
++        let t = ty.trim();
++        match role {
++            Role::Origin
++            | Role::WorldOrigin
++            | Role::Direction
++            | Role::WorldDirection
++            | Role::ObjectToWorldCol(_)
++            | Role::WorldToObjectCol(_) => t == "<3 x float>",
++            Role::MinDistance | Role::MaxDistance => t == "float",
++            Role::Barycentrics => t == "<2 x float>",
++            Role::FrontFacing => t == "i1",
++            Role::PrimitiveId | Role::GeometryId | Role::InstanceId | Role::UserInstanceId => {
++                t == "i32"
++            }
++            Role::PayloadPtr | Role::UserDataPtr => t.starts_with("ptr"),
++            Role::ZeroFallback => true,
++        }
++    };
++
++    // First look for AIR parameter role metadata (`!{i32 idx, !"air.<role>", ...}`).
++    let mut by_idx: HashMap<usize, Role> = HashMap::new();
++    let candidate_bodies: Vec<&str> = if !scoped_param_bodies.is_empty() {
++        scoped_param_bodies
++    } else {
++        md_nodes.values().copied().collect()
++    };
++    for body in candidate_bodies {
+         let Some(first) = body.split(',').next() else {
+             continue;
+         };
+@@ -2506,17 +2627,19 @@ fn decode_callback_param_roles(
+         }
+         let role = if body.contains("!\"air.world_space_origin\"") {
+             Some(Role::WorldOrigin)
+-        } else if body.contains("!\"air.origin\"") {
++        } else if body.contains("!\"air.origin\"") || body.contains("!\"air.ray_origin\"") {
+             Some(Role::Origin)
+         } else if body.contains("!\"air.world_space_direction\"") {
+             Some(Role::WorldDirection)
+-        } else if body.contains("!\"air.direction\"") {
++        } else if body.contains("!\"air.direction\"") || body.contains("!\"air.ray_direction\"") {
+             Some(Role::Direction)
+         } else if body.contains("!\"air.min_distance\"") {
+             Some(Role::MinDistance)
+         } else if body.contains("!\"air.max_distance\"") || body.contains("!\"air.distance\"") {
+             Some(Role::MaxDistance)
+-        } else if body.contains("!\"air.barycentric_coord\"") {
++        } else if body.contains("!\"air.barycentric_coord\"")
++            || body.contains("!\"air.barycentrics\"")
++        {
+             Some(Role::Barycentrics)
+         } else if body.contains("!\"air.front_facing\"") {
+             Some(Role::FrontFacing)
+@@ -2539,7 +2662,9 @@ fn decode_callback_param_roles(
+             None
+         };
+         if let Some(r) = role {
+-            by_idx.entry(idx).or_insert(r);
++            if role_matches_param_type(r, &param_types[idx]) {
++                by_idx.entry(idx).or_insert(r);
++            }
+         }
+     }
+ 
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index b51aa5d..fc9f380 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -816,11 +816,13 @@ pub enum MeshOutputKind {
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct MeshOutputMember {
+     /// Struct field index within `VertexOut` or `PrimOut` (for whole-struct `air.set_mesh_vertex`
+-    /// / `air.set_mesh_primitive`).
++    /// / `air.set_mesh_primitive`), or Apple AIR `attrIdx` (for `air.set_vertex_data_mesh.*` /
++    /// `air.set_primitive_data_mesh.*`).
+     pub member_index: u32,
+     pub kind: MeshOutputKind,
+     pub type_name: Option<String>,
+     pub name: Option<String>,
++    pub user_semantic: Option<String>,
+     pub interpolation: VaryingInterpolation,
+ }
+ 
+@@ -1235,7 +1237,8 @@ fn parse_air_kernel_meta_with_nodes(
+ 
+ fn parse_mesh_topology_str(s: &str) -> Option<MeshTopology> {
+     let lower = s.trim().to_ascii_lowercase();
+-    let lower = lower.strip_prefix("topology::").unwrap_or(&lower);
++    let lower = lower.strip_prefix("air.").unwrap_or(&lower);
++    let lower = lower.strip_prefix("topology::").unwrap_or(lower);
+     let lower = lower.strip_prefix("metal::topology::").unwrap_or(lower);
+     match lower {
+         "point" | "points" => Some(MeshTopology::Point),
+@@ -1245,6 +1248,57 @@ fn parse_mesh_topology_str(s: &str) -> Option<MeshTopology> {
+     }
+ }
+ 
++fn parse_mesh_type_info(
++    body: &str,
++) -> (
++    Option<u32>,
++    Option<u32>,
++    Option<u32>,
++    Option<u32>,
++    Option<MeshTopology>,
++) {
++    let ops = split_top_level_commas(body);
++    let parse_ref = |s: &str| {
++        s.trim()
++            .strip_prefix('!')
++            .and_then(|d| d.parse::<u32>().ok())
++    };
++    let vert_ref = ops.get(1).and_then(|s| parse_ref(s));
++    let prim_ref = ops.get(2).and_then(|s| parse_ref(s));
++    let mut nums = Vec::new();
++    let mut topo = None;
++    for op in ops.iter().skip(1) {
++        let t = op.trim();
++        if let Some(n) = t.strip_prefix("i32 ").and_then(|v| v.trim().parse::<u32>().ok()) {
++            nums.push(n);
++        } else if let Some(s) = t.strip_prefix("!\"").and_then(|v| v.strip_suffix('"')) {
++            if topo.is_none() {
++                topo = parse_mesh_topology_str(s);
++            }
++        }
++    }
++    (
++        vert_ref,
++        prim_ref,
++        nums.first().copied(),
++        nums.get(1).copied(),
++        topo,
++    )
++}
++
++fn mesh_user_semantic(node: &str) -> Option<String> {
++    for op in split_top_level_commas(node) {
++        let t = op.trim();
++        if let Some(s) = t.strip_prefix("!\"").and_then(|v| v.strip_suffix('"')) {
++            if s.starts_with("user(") || s.starts_with("generated") {
++                return Some(s.to_string());
++            }
++        }
++    }
++    string_after_marker(node, "air.vertex_output")
++        .or_else(|| string_after_marker(node, "air.primitive_output"))
++}
++
+ /// Parse `mesh<VertexOut, PrimOut, MaxV, MaxP, topology::triangle>` parameter type names.
+ fn parse_mesh_type_name(name: &str) -> (Option<u32>, Option<u32>, Option<MeshTopology>) {
+     let Some(start) = name.find('<') else {
+@@ -1345,6 +1399,7 @@ fn parse_mesh_output_list(
+                 primary.as_str(),
+                 "primitive_output"
+                     | "mesh_primitive_output"
++                    | "mesh_primitive_data"
+                     | "primitive_data"
+                     | "primitive_culled"
+                     | "cull_primitive"
+@@ -1352,7 +1407,9 @@ fn parse_mesh_output_list(
+                     | "viewport_array_index"
+                     | "primitive_id"
+             )
+-            || strs.iter().any(|s| s == "per_primitive" || s == "primitive_data");
++            || strs
++                .iter()
++                .any(|s| s == "per_primitive" || s == "primitive_data" || s == "mesh_primitive_data");
+         if is_prim {
+             pending_prim.push((r, primary, strs));
+             continue;
+@@ -1361,7 +1418,7 @@ fn parse_mesh_output_list(
+             "position" => MeshOutputKind::Position,
+             "point_size" => MeshOutputKind::PointSize,
+             "clip_distance" => MeshOutputKind::ClipDistance,
+-            "vertex_output" | "mesh_vertex_output" | "fragment_input" => {
++            "vertex_output" | "mesh_vertex_output" | "mesh_vertex_data" | "fragment_input" => {
+                 let loc = if node.contains("!\"air.location_index\"") {
+                     location_index_with_static(node, next_vert_loc, static_int_globals)
+                 } else {
+@@ -1372,13 +1429,16 @@ fn parse_mesh_output_list(
+             }
+             _ => continue,
+         };
+-        let member_index = leading_i32(node).unwrap_or(vert_member_idx);
++        let member_index = i32_after_marker(node, "air.mesh_vertex_data")
++            .or_else(|| leading_i32(node))
++            .unwrap_or(vert_member_idx);
+         vert_member_idx = vert_member_idx.max(member_index + 1);
+         vertex_outputs.push(MeshOutputMember {
+             member_index,
+             kind,
+             type_name: arg_type_name(node),
+             name: arg_name(node),
++            user_semantic: mesh_user_semantic(node),
+             interpolation: VaryingInterpolation::from_role_strings(&strs),
+         });
+     }
+@@ -1390,7 +1450,11 @@ fn parse_mesh_output_list(
+             "render_target_array_index" => MeshOutputKind::Layer,
+             "viewport_array_index" => MeshOutputKind::ViewportIndex,
+             "primitive_id" => MeshOutputKind::PrimitiveId,
+-            "primitive_output" | "mesh_primitive_output" | "primitive_data" | "vertex_output" => {
++            "primitive_output"
++            | "mesh_primitive_output"
++            | "mesh_primitive_data"
++            | "primitive_data"
++            | "vertex_output" => {
+                 let base = next_prim_loc.unwrap_or(next_vert_loc);
+                 let loc = if node.contains("!\"air.location_index\"") {
+                     location_index_with_static(node, base, static_int_globals)
+@@ -1402,7 +1466,9 @@ fn parse_mesh_output_list(
+             }
+             _ => continue,
+         };
+-        let member_index = leading_i32(node).unwrap_or(prim_member_idx);
++        let member_index = i32_after_marker(node, "air.mesh_primitive_data")
++            .or_else(|| leading_i32(node))
++            .unwrap_or(prim_member_idx);
+         prim_member_idx = prim_member_idx.max(member_index + 1);
+         let mut interp = VaryingInterpolation::from_role_strings(&strs);
+         interp.per_primitive = true;
+@@ -1412,6 +1478,7 @@ fn parse_mesh_output_list(
+             kind,
+             type_name: arg_type_name(node),
+             name: arg_name(node),
++            user_semantic: mesh_user_semantic(node),
+             interpolation: interp,
+         });
+     }
+@@ -1563,6 +1630,28 @@ fn parse_air_threadgroup_stage_meta_with_nodes(
+             }
+             "mesh_grid_properties" if stage == Stage::Object => KernRole::MeshGridProperties,
+             "mesh" if stage == Stage::Mesh => {
++                if let Some(info_ref) = ref_after_marker(node, "air.mesh") {
++                    if let Some(info_body) = nodes.get(&info_ref) {
++                        if info_body.contains("!\"air.mesh_type_info\"") {
++                            let (vr, pr, mv, mp, topo) = parse_mesh_type_info(info_body);
++                            if mesh_vertex_out_ref.is_none() {
++                                mesh_vertex_out_ref = vr;
++                            }
++                            if mesh_prim_out_ref.is_none() {
++                                mesh_prim_out_ref = pr;
++                            }
++                            if mesh_max_vertices.is_none() {
++                                mesh_max_vertices = mv;
++                            }
++                            if mesh_max_primitives.is_none() {
++                                mesh_max_primitives = mp;
++                            }
++                            if mesh_topology.is_none() {
++                                mesh_topology = topo;
++                            }
++                        }
++                    }
++                }
+                 if let Some(name) = arg_type_name(node) {
+                     let (mv, mp, topo) = parse_mesh_type_name(&name);
+                     if mesh_max_vertices.is_none() {
+@@ -2226,8 +2315,13 @@ fn stage_root_attributes(rootc: &str, nodes: &HashMap<u32, String>) -> Vec<Stage
+                         ),
+                     }
+                 }
+-                Some(node) if node.contains("!\"air.max_total_threadgroups_per_mesh_grid\"") => {
+-                    match i32_after_marker(node, "air.max_total_threadgroups_per_mesh_grid") {
++                Some(node)
++                    if node.contains("!\"air.max_total_threadgroups_per_mesh_grid\"")
++                        || node.contains("!\"air.max_mesh_work_groups\"") =>
++                {
++                    match i32_after_marker(node, "air.max_total_threadgroups_per_mesh_grid")
++                        .or_else(|| i32_after_marker(node, "air.max_mesh_work_groups"))
++                    {
+                         Some(grid) => StageAttribute::MaxMeshGrid(grid),
+                         None => StageAttribute::Unrecognized(format!("!{{{node}}}")),
+                     }
+diff --git a/src/native/emitter/ops/atomics.rs b/src/native/emitter/ops/atomics.rs
+index c85bb71..87b18c1 100644
+--- a/src/native/emitter/ops/atomics.rs
++++ b/src/native/emitter/ops/atomics.rs
+@@ -157,17 +157,18 @@ impl Emitter {
+             return self.bitcast_pointer_to_atomic_i32(ptr_arg, ptr, instructions);
+         }
+ 
+-        let LlType::Struct(fields) = pointee else {
++        if !matches!(pointee, LlType::Struct(_) | LlType::Array(_, _)) {
+             return Err(format!(
+                 "native emitter: atomic i{bits} pointer targets {pointee:?}"
+             ));
+-        };
+-        let mut field = LlType::Struct(fields);
++        }
++        let mut field = pointee;
+         let mut depth = 0usize;
+-        loop {
++        let leaf_ty = loop {
+             field = self.resolve_type(&field)?;
+             match field {
+-                LlType::Int(w) if w == bits => break,
++                LlType::Int(w) if w == bits => break int_ty.clone(),
++                LlType::Float if bits == 32 => break LlType::Float,
+                 LlType::Struct(ref fields) if !fields.is_empty() => {
+                     field = fields[0].clone();
+                     depth += 1;
+@@ -182,7 +183,7 @@ impl Emitter {
+                     ));
+                 }
+             }
+-        }
++        };
+         let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
+             return Err(format!(
+                 "native emitter: atomic i{bits} pointer argument has type {:?}",
+@@ -190,7 +191,7 @@ impl Emitter {
+             ));
+         };
+         let storage = self.pointer_storage_for(&ptr_arg.value, addrspace)?;
+-        let ptr_type = self.ptr_type_id(storage, &int_ty)?;
++        let ptr_type = self.ptr_type_id(storage, &leaf_ty)?;
+         let zero = self.const_uint(0)?;
+         let result = self.fresh();
+         instructions.push(Self::inst(
+@@ -201,6 +202,9 @@ impl Emitter {
+                 .chain(std::iter::repeat_n(Operand::IdRef(zero), depth))
+                 .collect(),
+         ));
++        if leaf_ty == LlType::Float {
++            return self.bitcast_pointer_to_atomic_i32(ptr_arg, result, instructions);
++        }
+         Ok(result)
+     }
+ 
+@@ -418,12 +422,12 @@ impl Emitter {
+             return Ok(AtomicF32Target::U32Ptr(ptr));
+         }
+ 
+-        let LlType::Struct(fields) = pointee else {
++        if !matches!(pointee, LlType::Struct(_) | LlType::Array(_, _)) {
+             return Err(format!(
+                 "native emitter: atomic f32 pointer targets {pointee:?}"
+             ));
+-        };
+-        let mut field = LlType::Struct(fields);
++        }
++        let mut field = pointee;
+         let mut depth = 0usize;
+         let leaf_ty = loop {
+             field = self.resolve_type(&field)?;
+diff --git a/src/native/ir/pointer_pointees.rs b/src/native/ir/pointer_pointees.rs
+index 2a77b1c..39ce3d9 100644
+--- a/src/native/ir/pointer_pointees.rs
++++ b/src/native/ir/pointer_pointees.rs
+@@ -79,6 +79,7 @@ impl LlModule {
+                 roots
+             };
+ 
++            let mut load_store_seeded: HashSet<(String, String)> = HashSet::new();
+             for inst in f.carrier_insts() {
+                 if let Some(gep) = &inst.gep() {
+                     if let LlValue::Local(name) = &gep.base.value {
+@@ -89,9 +90,15 @@ impl LlModule {
+                         if let Some(arms) = pointer_select_arms.get(name) {
+                             voters.extend(merge_arm_params(arms));
+                         }
++                        let gep_is_composite = matches!(
++                            self.resolve_known_type(&gep.source_ty),
++                            LlType::Struct(_) | LlType::Array(_, _)
++                        );
+                         for voter in voters {
+                             let key = (f.name.clone(), voter);
+-                            if self.gep_source_should_override(&key, &gep.source_ty) {
++                            if self.gep_source_should_override(&key, &gep.source_ty)
++                                || (gep_is_composite && load_store_seeded.remove(&key))
++                            {
+                                 self.metadata_pointee_params.remove(&key);
+                                 self.ptr_pointees.insert(key, gep.source_ty.clone());
+                             } else {
+@@ -106,9 +113,11 @@ impl LlModule {
+                 if let Some(load) = &inst.load() {
+                     if let LlValue::Local(name) = &load.ptr.value {
+                         if params.contains(name) {
+-                            self.ptr_pointees
+-                                .entry((f.name.clone(), name.clone()))
+-                                .or_insert_with(|| load.result_ty.clone());
++                            let key = (f.name.clone(), name.clone());
++                            if !self.ptr_pointees.contains_key(&key) {
++                                self.ptr_pointees.insert(key.clone(), load.result_ty.clone());
++                                load_store_seeded.insert(key);
++                            }
+                         }
+                     }
+                     continue;
+@@ -116,9 +125,11 @@ impl LlModule {
+                 if let Some((object, pointer)) = inst.store().as_deref() {
+                     if let LlValue::Local(name) = &pointer.value {
+                         if params.contains(name) {
+-                            self.ptr_pointees
+-                                .entry((f.name.clone(), name.clone()))
+-                                .or_insert_with(|| object.ty.clone());
++                            let key = (f.name.clone(), name.clone());
++                            if !self.ptr_pointees.contains_key(&key) {
++                                self.ptr_pointees.insert(key.clone(), object.ty.clone());
++                                load_store_seeded.insert(key);
++                            }
+                         }
+                     }
+                 }
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+index a5011d0..28d6940 100644
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -62,6 +62,7 @@ struct PendingCall {
+     bda_source_load_ptr: Option<String>,
+     bda_source_val: Option<String>,
+     bda_dead_load_line: Option<usize>,
++    has_active_table: bool,
+     air_result_type: String,
+     lowered_result_type: String,
+     slot_id: u32,
+@@ -161,9 +162,51 @@ fn split_typed_arg(arg: &str) -> Option<(String, String)> {
+     let split = last_ws?;
+     let mut ty = arg[..split].trim();
+     let val = arg[split..].trim();
+-    // Strip trailing parameter attributes on the type if any (e.g. `noundef`, `nonnull`, `nocapture`).
++    // Strip trailing parameter attributes on the type if any (e.g. `noundef`, `nonnull`,
++    // `nocapture`, `readonly`, `align N`, `dereferenceable(N)`, quoted `"air-..."`).
+     loop {
+         let trimmed = ty.trim_end();
++        if let Some(without_quote) = trimmed.strip_suffix('"') {
++            if let Some(open_q) = without_quote.rfind('"') {
++                let before = without_quote[..open_q].trim_end();
++                if !before.is_empty() {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
++        if let Some(without_paren) = trimmed.strip_suffix(')') {
++            if let Some(open_p) = without_paren.rfind('(') {
++                let attr_name = without_paren[..open_p].trim_end();
++                if let Some(before) = ["dereferenceable_or_null", "dereferenceable", "align"]
++                    .iter()
++                    .find_map(|kw| {
++                        attr_name
++                            .strip_suffix(kw)
++                            .filter(|r| r.ends_with(char::is_whitespace))
++                            .map(str::trim_end)
++                    })
++                {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
++        // Strip `align N` (two tokens).
++        if let Some(ws) = trimmed.rfind(char::is_whitespace) {
++            let last = trimmed[ws..].trim();
++            if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
++                let prefix = trimmed[..ws].trim_end();
++                if let Some(before) = prefix
++                    .strip_suffix("align")
++                    .filter(|r| r.ends_with(char::is_whitespace))
++                    .map(str::trim_end)
++                {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
+         let stripped = [
+             "noundef",
+             "nonnull",
+@@ -436,6 +479,48 @@ fn classify_accel_operand(
+     (false, None, None, None)
+ }
+ 
++fn table_operand_is_non_null(
++    scoped_lines: &[(&str, usize)],
++    scope: usize,
++    table_val: &str,
++) -> bool {
++    let mut cur = table_val.trim().to_string();
++    for _ in 0..8 {
++        if matches!(cur.as_str(), "null" | "undef" | "poison" | "zeroinitializer") {
++            return false;
++        }
++        if !cur.starts_with('%') {
++            return true;
++        }
++        let def_rhs = scoped_lines.iter().find_map(|&(line, s)| {
++            if s != scope {
++                return None;
++            }
++            let (lhs, rhs) = line.trim_start().split_once(" = ")?;
++            (lhs.trim() == cur).then_some(rhs.trim())
++        });
++        let Some(rhs) = def_rhs else {
++            return true;
++        };
++        if rhs.contains("@air.get_null_intersection_function_table") {
++            return false;
++        }
++        if let Some(rest) = rhs
++            .strip_prefix("bitcast ")
++            .or_else(|| rhs.strip_prefix("addrspacecast "))
++        {
++            if let Some((src, _)) = rest.split_once(" to ") {
++                if let Some((_, next_val)) = split_typed_arg(src) {
++                    cur = next_val;
++                    continue;
++                }
++            }
++        }
++        return true;
++    }
++    true
++}
++
+ fn lowered_result_type(family: &AirIntersectionFamily) -> String {
+     format!(
+         "{{ {} }}",
+@@ -511,6 +596,13 @@ pub(crate) fn lower_air_ray_queries(
+                 accel_val,
+                 &descriptor_as_params,
+             );
++        let table_idx = family.intersection_table_argument_index();
++        let has_active_table = family.intersection_function_buffer
++            || raw_args
++                .get(table_idx)
++                .is_some_and(|(_, table_val)| {
++                    table_operand_is_non_null(&scoped_lines, scope, table_val)
++                });
+         let ordinal = pending.len();
+         pending.push(PendingCall {
+             scope,
+@@ -525,6 +617,7 @@ pub(crate) fn lower_air_ray_queries(
+             bda_source_load_ptr,
+             bda_source_val,
+             bda_dead_load_line,
++            has_active_table,
+             slot_id: ordinal as u32,
+         });
+     }
+@@ -769,12 +862,16 @@ fn param_indices(family: &AirIntersectionFamily) -> ParsedParamIndices {
+         } else {
+             (None, None)
+         };
+-    // Trailing intersection_params block (9 i32s + 1 or 2 i1s, followed by 2 IFT dispatch controls).
++    // Trailing Apple AIR intersection_params block (9 i32s + 1 or 2 i1s):
++    //   cur+0: front_facing_winding, cur+1: triangle_cull_mode, cur+2: geometry_cull_mode,
++    //   cur+3: opacity_cull_mode, cur+4: force_opacity, cur+5: geometry_type (3 = tri|aabb),
++    //   cur+6..cur+7: default tri/aabb fn indices, cur+8: function_table_offset,
++    //   cur+9: accept_any_intersection.
+     let front_facing_winding = cur;
+     let triangle_cull_mode = cur + 1;
+-    let opacity_cull_mode = cur + 2;
+-    let force_opacity = cur + 3;
+-    let function_table_offset = cur + 5;
++    let opacity_cull_mode = cur + 3;
++    let force_opacity = cur + 4;
++    let function_table_offset = cur + 8;
+     let accept_any_intersection = cur + 9;
+     ParsedParamIndices {
+         instance_mask,
+@@ -883,7 +980,7 @@ fn emit_ray_query_helper(
+         ));
+     }
+ 
+-    let active_callbacks: Vec<&LinkedRayCallback> = if family.intersection_function_buffer {
++    let active_callbacks: Vec<&LinkedRayCallback> = if p.has_active_table {
+         linked_callbacks.iter().collect()
+     } else {
+         Vec::new()
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index e69fe7d..e255fc6 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -6243,6 +6243,76 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
+     }
+ }
+ 
++#[test]
++fn native_threadgroup_atomic_array_of_struct_peels_index_zero() {
++    // Exact Apple AIR pattern from #169 (`k_float_atomics`): opaque-pointer index-0 GEP folds
++    // away, passing `[4 x %"struct.metal::_atomic.0"]` directly to `@air.atomic.local.*.i32` / `.f32`.
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%"struct.metal::_atomic.0" = type { i32 }
++%"struct.metal::_atomic.1" = type { float }
++@tgU = internal addrspace(3) global [4 x %"struct.metal::_atomic.0"] zeroinitializer, align 4
++@tgF = internal addrspace(3) global [4 x %"struct.metal::_atomic.1"] zeroinitializer, align 4
++
++define void @k(ptr addrspace(1) %out) {
++entry:
++  tail call void @air.atomic.local.store.i32(ptr addrspace(3) nocapture @tgU, i32 0, i32 0, i32 1, i1 true)
++  tail call void @air.atomic.local.store.i32(ptr addrspace(3) nocapture getelementptr inbounds ([4 x %"struct.metal::_atomic.0"], ptr addrspace(3) @tgU, i64 0, i64 1, i32 0), i32 5000, i32 0, i32 1, i1 true)
++  tail call void @air.atomic.local.store.f32(ptr addrspace(3) nocapture @tgF, float 1.5, i32 0, i32 1, i1 true)
++  tail call void @air.wg.barrier(i32 2, i32 1)
++  %u0 = tail call i32 @air.atomic.local.add.u.i32(ptr addrspace(3) nocapture @tgU, i32 7, i32 0, i32 1, i1 true)
++  %u1 = tail call i32 @air.atomic.local.load.i32(ptr addrspace(3) nocapture @tgU, i32 0, i32 1, i1 true)
++  %f0 = tail call float @air.atomic.local.add.f32(ptr addrspace(3) nocapture @tgF, float 2.25, i32 0, i32 1, i1 true)
++  %f1 = tail call float @air.atomic.local.load.f32(ptr addrspace(3) nocapture @tgF, i32 0, i32 1, i1 true)
++  %fi = bitcast float %f1 to i32
++  %sum = add i32 %u1, %fi
++  store i32 %sum, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++declare void @air.atomic.local.store.i32(ptr addrspace(3), i32, i32, i32, i1)
++declare i32 @air.atomic.local.load.i32(ptr addrspace(3), i32, i32, i1)
++declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
++declare void @air.atomic.local.store.f32(ptr addrspace(3), float, i32, i32, i1)
++declare float @air.atomic.local.load.f32(ptr addrspace(3), i32, i32, i1)
++declare float @air.atomic.local.add.f32(ptr addrspace(3), float, i32, i32, i1)
++declare void @air.wg.barrier(i32, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_threadgroup_atomic_array_struct_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        ll,
++        Stage::Kernel,
++        &tmp,
++        whole_workgroup_options(),
++        None,
++    )
++    .expect("translate [4 x { i32 }] and [4 x { float }] local atomics");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
++    assert!(asm.contains("OpAtomicStore"), "{asm}");
++    assert!(asm.contains("OpAtomicLoad"), "{asm}");
++    assert!(asm.contains("OpAtomicIAdd"), "{asm}");
++    assert!(asm.contains("OpAtomicFAddEXT") || asm.contains("OpAtomicCompareExchange"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++}
++
+ #[test]
+ fn native_threadgroup_atomic_multifield_global_peels_first_atomic_field() {
+     let ll = r#"
+diff --git a/src/native/tests/interface.rs b/src/native/tests/interface.rs
+index 2f378cd..1b540e6 100644
+--- a/src/native/tests/interface.rs
++++ b/src/native/tests/interface.rs
+@@ -2975,3 +2975,113 @@ declare half @air.interpolate_offset_perspective.f16(half, <2 x float>)
+     assert!(!asm.contains("OpFunctionCall"), "{asm}");
+     let _ = std::fs::remove_dir_all(&tmp);
+ }
++
++#[test]
++fn native_half_varyings_match_f32_across_vs_fs_pull_and_non_pull() {
++    let vs_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define { <4 x float>, <2 x float>, <2 x float>, <2 x half> } @vs_pull(i32 %vid) {
++entry:
++  %h = fptrunc <2 x float> <float 2.0, float 4.0> to <2 x half>
++  %s0 = insertvalue { <4 x float>, <2 x float>, <2 x float>, <2 x half> } undef, <4 x float> <float 0.0, float 0.0, float 0.5, float 1.0>, 0
++  %s1 = insertvalue { <4 x float>, <2 x float>, <2 x float>, <2 x half> } %s0, <2 x float> <float 0.0, float 0.0>, 1
++  %s2 = insertvalue { <4 x float>, <2 x float>, <2 x float>, <2 x half> } %s1, <2 x float> <float 2.0, float 4.0>, 2
++  %s3 = insertvalue { <4 x float>, <2 x float>, <2 x float>, <2 x half> } %s2, <2 x half> %h, 3
++  ret { <4 x float>, <2 x float>, <2 x float>, <2 x half> } %s3
++}
++!air.vertex = !{!0}
++!0 = !{ptr @vs_pull, !1, !2}
++!1 = !{!3, !4, !5, !6}
++!2 = !{!7}
++!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
++!4 = !{!"air.vertex_output", !"user(uv_p)", !"air.arg_type_name", !"float2"}
++!5 = !{!"air.vertex_output", !"user(uv_np)", !"air.arg_type_name", !"float2"}
++!6 = !{!"air.vertex_output", !"user(uv_h)", !"air.arg_type_name", !"half2"}
++!7 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint"}
++"#;
++    let fs_pull_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @fs_pull(<2 x half> %uv_h) {
++entry:
++  %h = tail call <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half> %uv_h, <2 x float> <float 0.25, float 0.75>)
++  %f = fpext <2 x half> %h to <2 x float>
++  %x = extractelement <2 x float> %f, i32 0
++  %y = extractelement <2 x float> %f, i32 1
++  %r0 = insertelement <4 x float> <float poison, float poison, float 0.0, float 1.0>, float %x, i32 0
++  %r1 = insertelement <4 x float> %r0, float %y, i32 1
++  ret <4 x float> %r1
++}
++declare <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half>, <2 x float>)
++!air.fragment = !{!0}
++!0 = !{ptr @fs_pull, !1, !2}
++!1 = !{!3}
++!2 = !{!4}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"user(uv_h)", !"air.interpolation_function", !"air.no_perspective", !"air.arg_type_name", !"half2"}
++"#;
++    let fs_regular_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @fs_reg(<2 x half> %uv_h) {
++entry:
++  %f = fpext <2 x half> %uv_h to <2 x float>
++  %x = extractelement <2 x float> %f, i32 0
++  %y = extractelement <2 x float> %f, i32 1
++  %r0 = insertelement <4 x float> <float poison, float poison, float 0.0, float 1.0>, float %x, i32 0
++  %r1 = insertelement <4 x float> %r0, float %y, i32 1
++  ret <4 x float> %r1
++}
++!air.fragment = !{!0}
++!0 = !{ptr @fs_reg, !1, !2}
++!1 = !{!3}
++!2 = !{!4}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"user(uv_h)", !"air.arg_type_name", !"half2"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_half_varying_match_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (vs_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        vs_ll,
++        Stage::Vertex,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("vs_pull");
++    let vs_asm = disassemble(&vs_spv).expect("dis vs");
++    assert!(
++        !vs_asm.contains("OpTypePointer Output %v2half"),
++        "VS half2 output must widen to v2float: {vs_asm}"
++    );
++    assert!(vs_asm.contains("OpFConvert"), "{vs_asm}");
++
++    let (fs_pull_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        fs_pull_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("fs_pull");
++    let fs_pull_asm = disassemble(&fs_pull_spv).expect("dis fs_pull");
++    assert!(!fs_pull_asm.contains("OpTypePointer Input %v2half"), "{fs_pull_asm}");
++    assert!(fs_pull_asm.contains("InterpolateAtOffset"), "{fs_pull_asm}");
++
++    let (fs_reg_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        fs_regular_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("fs_reg");
++    let fs_reg_asm = disassemble(&fs_reg_spv).expect("dis fs_reg");
++    assert!(
++        !fs_reg_asm.contains("OpTypePointer Input %v2half"),
++        "non-pull FS half2 input must widen to v2float to match VS: {fs_reg_asm}"
++    );
++    assert!(fs_reg_asm.contains("OpFConvert"), "{fs_reg_asm}");
++    let _ = std::fs::remove_dir_all(&tmp);
++}
+diff --git a/src/passes/mesh_stage.rs b/src/passes/mesh_stage.rs
+index a259072..5321305 100644
+--- a/src/passes/mesh_stage.rs
++++ b/src/passes/mesh_stage.rs
+@@ -21,6 +21,8 @@ fn is_object_grid_setter(name: &str) -> bool {
+         || name.starts_with("air.set_mesh_properties.")
+         || name == "air.set_threadgroups_per_grid"
+         || name.starts_with("air.set_threadgroups_per_grid.")
++        || name == "air.set_threadgroups_per_grid_mesh_properties"
++        || name.starts_with("air.set_threadgroups_per_grid_mesh_properties.")
+         || name == "air.mesh_grid_properties.set_threadgroups_per_grid"
+         || name.starts_with("air.mesh_grid_properties.set_threadgroups_per_grid.")
+ }
+@@ -28,6 +30,8 @@ fn is_object_grid_setter(name: &str) -> bool {
+ fn is_mesh_count_setter(name: &str) -> bool {
+     name == "air.set_mesh_primitive_count"
+         || name.starts_with("air.set_mesh_primitive_count.")
++        || name == "air.set_primitive_count_mesh"
++        || name.starts_with("air.set_primitive_count_mesh.")
+         || name == "air.mesh.set_primitive_count"
+         || name.starts_with("air.mesh.set_primitive_count.")
+         || name == "air.set_mesh_outputs"
+@@ -101,6 +105,12 @@ fn coerce_to_uint(
+                 Some(Operand::LiteralBit32(b)) => *b,
+                 _ => 32,
+             };
++            if bits < 32 {
++                if let Some(c) = extract_const_u32(defs, val) {
++                    let mask = (1u32 << bits) - 1;
++                    return ctx.const_uint(c & mask);
++                }
++            }
+             let res = ctx.module.fresh_id();
+             let op = if bits == 32 { Op::Bitcast } else { Op::UConvert };
+             out.push(Instruction::new(
+@@ -192,6 +202,46 @@ fn coerce_to_bool(
+     val
+ }
+ 
++fn is_half_type(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<Option<u32>> {
++    let def = defs.get(&ty)?;
++    match def.class.opcode {
++        Op::TypeFloat if def.operands.first() == Some(&Operand::LiteralBit32(16)) => Some(None),
++        Op::TypeVector => {
++            let (Some(Operand::IdRef(comp)), Some(Operand::LiteralBit32(lanes))) =
++                (def.operands.first(), def.operands.get(1))
++            else {
++                return None;
++            };
++            let comp_def = defs.get(comp)?;
++            (comp_def.class.opcode == Op::TypeFloat
++                && comp_def.operands.first() == Some(&Operand::LiteralBit32(16))
++                && (2..=4).contains(lanes))
++            .then_some(Some(*lanes))
++        }
++        _ => None,
++    }
++}
++
++fn mesh_varying_interface_type(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    src_ty: Word,
++) -> Word {
++    if defs
++        .get(&src_ty)
++        .is_some_and(|d| d.class.opcode == Op::TypeBool)
++    {
++        return ctx.ty_uint();
++    }
++    if let Some(lanes) = is_half_type(defs, src_ty) {
++        return match lanes {
++            None => ctx.ty_float(),
++            Some(n) => ctx.ty_vecf(n),
++        };
++    }
++    src_ty
++}
++
+ fn coerce_store_value(
+     ctx: &mut Ctx,
+     defs: &HashMap<Word, Instruction>,
+@@ -219,6 +269,16 @@ fn coerce_store_value(
+         ));
+         return res;
+     }
++    if is_half_type(defs, src_ty).is_some() {
++        let res = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::FConvert,
++            Some(dst_ty),
++            Some(res),
++            vec![Operand::IdRef(val)],
++        ));
++        return res;
++    }
+     let res = ctx.module.fresh_id();
+     out.push(Instruction::new(
+         Op::Bitcast,
+@@ -643,14 +703,7 @@ impl MeshOutputs {
+         if let Some(&entry) = self.vertex_loc_vars.get(&loc) {
+             return entry;
+         }
+-        let elem_ty = if defs
+-            .get(&src_ty)
+-            .is_some_and(|d| d.class.opcode == Op::TypeBool)
+-        {
+-            ctx.ty_uint()
+-        } else {
+-            src_ty
+-        };
++        let elem_ty = mesh_varying_interface_type(ctx, defs, src_ty);
+         let arr_ty = ctx.ty_array(elem_ty, self.max_vertices);
+         let ptr_ty = ctx.ty_ptr(StorageClass::Output, arr_ty);
+         let var = ctx.module.fresh_id();
+@@ -688,14 +741,7 @@ impl MeshOutputs {
+         if let Some(&entry) = self.primitive_loc_vars.get(&loc) {
+             return entry;
+         }
+-        let elem_ty = if defs
+-            .get(&src_ty)
+-            .is_some_and(|d| d.class.opcode == Op::TypeBool)
+-        {
+-            ctx.ty_uint()
+-        } else {
+-            src_ty
+-        };
++        let elem_ty = mesh_varying_interface_type(ctx, defs, src_ty);
+         let arr_ty = ctx.ty_array(elem_ty, self.max_primitives);
+         let ptr_ty = ctx.ty_ptr(StorageClass::Output, arr_ty);
+         let var = ctx.module.fresh_id();
+@@ -1008,6 +1054,7 @@ fn lower_mesh_stage(
+                         Operand::IdRef(c) => names.get(c).is_some_and(|n| {
+                             n.starts_with("air.set_mesh_point_size")
+                                 || n.starts_with("air.set_mesh_vertex_point_size")
++                                || n.starts_with("air.set_point_size_mesh")
+                         }),
+                         _ => false,
+                     })
+@@ -1499,7 +1546,11 @@ fn lower_mesh_output_call(
+     explicit_cull_written: &mut bool,
+     out: &mut Vec<Instruction>,
+ ) -> Result<(), String> {
+-    if name == "air.set_mesh_index" || name.starts_with("air.set_mesh_index.") {
++    if name == "air.set_mesh_index"
++        || name.starts_with("air.set_mesh_index.")
++        || name == "air.set_index_mesh"
++        || name.starts_with("air.set_index_mesh.")
++    {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+         }
+@@ -1544,6 +1595,8 @@ fn lower_mesh_output_call(
+         || name.starts_with("air.set_mesh_position.")
+         || name == "air.set_mesh_vertex_position"
+         || name.starts_with("air.set_mesh_vertex_position.")
++        || name == "air.set_position_mesh"
++        || name.starts_with("air.set_position_mesh.")
+     {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+@@ -1556,6 +1609,8 @@ fn lower_mesh_output_call(
+         || name.starts_with("air.set_mesh_point_size.")
+         || name == "air.set_mesh_vertex_point_size"
+         || name.starts_with("air.set_mesh_vertex_point_size.")
++        || name == "air.set_point_size_mesh"
++        || name.starts_with("air.set_point_size_mesh.")
+     {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+@@ -1568,6 +1623,8 @@ fn lower_mesh_output_call(
+         || name.starts_with("air.set_mesh_primitive_culled.")
+         || name == "air.set_mesh_cull_primitive"
+         || name.starts_with("air.set_mesh_cull_primitive.")
++        || name == "air.set_primitive_culled_mesh"
++        || name.starts_with("air.set_primitive_culled_mesh.")
+     {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+@@ -1597,6 +1654,8 @@ fn lower_mesh_output_call(
+         || name.starts_with("air.set_mesh_render_target_array_index.")
+         || name == "air.set_mesh_layer"
+         || name.starts_with("air.set_mesh_layer.")
++        || name == "air.set_render_target_array_index_mesh"
++        || name.starts_with("air.set_render_target_array_index_mesh.")
+     {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+@@ -1625,6 +1684,8 @@ fn lower_mesh_output_call(
+         || name.starts_with("air.set_mesh_viewport_array_index.")
+         || name == "air.set_mesh_viewport_index"
+         || name.starts_with("air.set_mesh_viewport_index.")
++        || name == "air.set_viewport_array_index_mesh"
++        || name.starts_with("air.set_viewport_array_index_mesh.")
+     {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+@@ -1649,7 +1710,11 @@ fn lower_mesh_output_call(
+         ));
+         return Ok(());
+     }
+-    if name == "air.set_mesh_primitive_id" || name.starts_with("air.set_mesh_primitive_id.") {
++    if name == "air.set_mesh_primitive_id"
++        || name.starts_with("air.set_mesh_primitive_id.")
++        || name == "air.set_primitive_id_mesh"
++        || name.starts_with("air.set_primitive_id_mesh.")
++    {
+         if args.len() < 2 {
+             return Err(format!("{name} expects at least 2 operands"));
+         }
+@@ -1673,6 +1738,91 @@ fn lower_mesh_output_call(
+         ));
+         return Ok(());
+     }
++    if name == "air.set_vertex_data_mesh" || name.starts_with("air.set_vertex_data_mesh.") {
++        if args.len() < 3 {
++            return Err(format!("{name} expects (attr_idx, vertex_idx, value)"));
++        }
++        let attr_idx = extract_const_u32(defs, args[0])
++            .ok_or_else(|| format!("{name} requires a constant vertex attribute index"))?;
++        let vidx = coerce_to_uint(ctx, defs, val_tys, args[1], out);
++        let val = args[2];
++        let src_ty = val_tys
++            .get(&val)
++            .copied()
++            .ok_or_else(|| format!("{name} value operand has no type"))?;
++        let loc = meta
++            .vertex_outputs
++            .iter()
++            .find_map(|m| match m.kind {
++                MeshOutputKind::VertexVarying(l) if m.member_index == attr_idx => Some(l),
++                _ => None,
++            })
++            .unwrap_or(attr_idx);
++        let (var, elem_ty) = outputs.ensure_vertex_loc_var(ctx, defs, loc, src_ty, meta);
++        let coerced = coerce_store_value(ctx, defs, val, src_ty, elem_ty, out);
++        let ptr_ty = ctx.ty_ptr(StorageClass::Output, elem_ty);
++        let p = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::AccessChain,
++            Some(ptr_ty),
++            Some(p),
++            vec![Operand::IdRef(var), Operand::IdRef(vidx)],
++        ));
++        out.push(Instruction::new(
++            Op::Store,
++            None,
++            None,
++            vec![Operand::IdRef(p), Operand::IdRef(coerced)],
++        ));
++        return Ok(());
++    }
++    if name == "air.set_primitive_data_mesh" || name.starts_with("air.set_primitive_data_mesh.") {
++        if args.len() < 3 {
++            return Err(format!("{name} expects (attr_idx, primitive_idx, value)"));
++        }
++        let attr_idx = extract_const_u32(defs, args[0])
++            .ok_or_else(|| format!("{name} requires a constant primitive attribute index"))?;
++        let pidx = coerce_to_uint(ctx, defs, val_tys, args[1], out);
++        let val = args[2];
++        let src_ty = val_tys
++            .get(&val)
++            .copied()
++            .ok_or_else(|| format!("{name} value operand has no type"))?;
++        let base_prim_loc = meta
++            .vertex_outputs
++            .iter()
++            .filter_map(|m| match m.kind {
++                MeshOutputKind::VertexVarying(l) => Some(l + 1),
++                _ => None,
++            })
++            .max()
++            .unwrap_or(0);
++        let loc = meta
++            .primitive_outputs
++            .iter()
++            .find_map(|m| match m.kind {
++                MeshOutputKind::PrimitiveVarying(l) if m.member_index == attr_idx => Some(l),
++                _ => None,
++            })
++            .unwrap_or(base_prim_loc + attr_idx);
++        let (var, elem_ty) = outputs.ensure_primitive_loc_var(ctx, defs, loc, src_ty);
++        let coerced = coerce_store_value(ctx, defs, val, src_ty, elem_ty, out);
++        let ptr_ty = ctx.ty_ptr(StorageClass::Output, elem_ty);
++        let p = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::AccessChain,
++            Some(ptr_ty),
++            Some(p),
++            vec![Operand::IdRef(var), Operand::IdRef(pidx)],
++        ));
++        out.push(Instruction::new(
++            Op::Store,
++            None,
++            None,
++            vec![Operand::IdRef(p), Operand::IdRef(coerced)],
++        ));
++        return Ok(());
++    }
+     if name == "air.set_mesh_vertex_output"
+         || name.starts_with("air.set_mesh_vertex_output.")
+         || name == "air.set_mesh_vertex_attribute"
+@@ -5050,4 +5200,372 @@ declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
+                 && b.descriptor.as_ref().is_some_and(|d| d.binding == 675)
+         }));
+     }
++
++    #[test]
++    fn apple_air_v28_mesh_object_intrinsics_metadata_emulated_and_visible_ref() {
++        // Exact Apple `air64_v28` (`metalfe-32023.886.1`) mesh/object IR patterns from #169:
++        // `air.set_position_mesh`, `air.set_vertex_data_mesh.*`, `air.set_primitive_data_mesh.*`,
++        // `air.set_index_mesh` (with `i8` vertex index), `air.set_primitive_count_mesh`,
++        // `air.set_threadgroups_per_grid_mesh_properties`, `!air.mesh_type_info`,
++        // `!air.mesh_vertex_data` / `!air.mesh_primitive_data`, `!air.max_mesh_work_groups`,
++        // and `@helper_add_blue.MTL_VISIBLE_FN_REF` without companion metadata.
++        let obj_ll = r#"
++%struct.Payload16K = type { [4096 x i32] }
++
++define void @obj_payload_16k(ptr addrspace(6) nocapture writeonly align 4 dereferenceable(16384) %payload, ptr addrspace(3) %mgp.0, ptr addrspace(2) nocapture readonly "air-buffer-no-alias" %cfg, i32 %tid, i32 %tgid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %w, label %done
++w:
++  %c = load <4 x i32>, ptr addrspace(2) %cfg, align 16
++  %cx = extractelement <4 x i32> %c, i32 0
++  %cy = extractelement <4 x i32> %c, i32 1
++  %cz = extractelement <4 x i32> %c, i32 2
++  %w0 = add i32 %cx, %tgid
++  %p0 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
++  store i32 %w0, ptr addrspace(6) %p0, align 4
++  %p4095 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i32 0, i32 0, i32 4095
++  store i32 %cy, ptr addrspace(6) %p4095, align 4
++  %g0 = insertelement <3 x i32> <i32 poison, i32 1, i32 1>, i32 %cz, i32 0
++  tail call void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) nocapture %mgp.0, <3 x i32> %g0)
++  br label %done
++done:
++  ret void
++}
++declare void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) nocapture, <3 x i32>)
++!air.object = !{!14}
++!14 = !{ptr @obj_payload_16k, !15, !16, !23}
++!15 = !{}
++!16 = !{!17, !19, !20, !21, !22}
++!17 = !{i32 0, !"air.payload", !"air.struct_type_info", !18, !"air.arg_type_size", i32 16384, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload16K", !"air.arg_name", !"payload"}
++!18 = !{i32 0, i32 16384, i32 4, !"uint", !"words", i32 4096}
++!19 = !{i32 1, !"air.mesh_grid_properties", !"air.arg_type_name", !"mesh_grid_properties", !"air.arg_name", !"mgp"}
++!20 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"cfg"}
++!21 = !{i32 3, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
++!22 = !{i32 4, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint"}
++!23 = !{!"air.max_mesh_work_groups", i32 4}
++"#;
++        // Native TaskEXT mode:
++        let (nat_obj, nat_obj_refl) = translate_unvalidated(obj_ll, Stage::Object, [32, 1, 1]);
++        assert!(nat_obj.entry_points.iter().any(|e| {
++            e.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::TaskEXT))
++        }));
++        assert!(nat_obj
++            .functions
++            .iter()
++            .flat_map(|f| f.blocks.iter())
++            .flat_map(|b| b.instructions.iter())
++            .any(|i| i.class.opcode == Op::EmitMeshTasksEXT));
++        let obj_meta = nat_obj_refl.object.expect("object meta");
++        assert_eq!(obj_meta.max_total_threadgroups_per_mesh_grid, Some(4));
++        assert_eq!(obj_meta.payload_size, Some(16384));
++
++        // Emulated Object mode (GLCompute + bindings 673/674/675):
++        let mut emul_opts = TransformOptions::default().with_emulated_mesh_payload();
++        emul_opts.kernel_local_size = [32, 1, 1];
++        let (emul_obj_spv, emul_obj_refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            obj_ll,
++            Stage::Object,
++            Path::new(""),
++            emul_opts.clone(),
++            None,
++        )
++        .expect("emulated Apple AIR object");
++        let emul_obj_m = load_bytes(&emul_obj_spv).expect("parse emulated obj");
++        assert!(emul_obj_m.entry_points.iter().any(|e| {
++            e.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::GLCompute))
++        }));
++        assert!(emul_obj_refl.object.as_ref().is_some_and(|o| o.emulated_payload));
++
++        let mesh_ll = r#"
++%struct.Payload16K = type { [4096 x i32] }
++
++define void @mesh_payload_16k(ptr addrspace(7) %out.coerce, ptr addrspace(6) nocapture readonly align 4 dereferenceable(16384) %payload, i32 %tid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %emit, label %done
++emit:
++  %p0 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
++  %w0 = load i32, ptr addrspace(6) %p0, align 4
++  %rf = uitofp i32 %w0 to float
++  %vc0 = insertelement <4 x float> <float poison, float 0.25, float 0.0, float 1.0>, float %rf, i32 0
++  %vc = call <4 x float> @helper_add_blue.MTL_VISIBLE_FN_REF(<4 x float> %vc0)
++  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 0, <4 x float> <float -1.0, float -1.0, float 0.0, float 1.0>)
++  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 1, <4 x float> <float 1.0, float -1.0, float 0.0, float 1.0>)
++  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 2, <4 x float> <float -1.0, float 1.0, float 0.0, float 1.0>)
++  tail call void @air.set_position_mesh(ptr addrspace(7) nocapture %out.coerce, i32 3, <4 x float> <float 1.0, float 1.0, float 0.0, float 1.0>)
++  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 0, <4 x float> %vc)
++  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 1, <4 x float> %vc)
++  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 2, <4 x float> %vc)
++  tail call void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 3, <4 x float> %vc)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 0, i8 0)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 1, i8 1)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 2, i8 3)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 3, i8 0)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 4, i8 3)
++  tail call void @air.set_index_mesh(ptr addrspace(7) nocapture %out.coerce, i32 5, i8 2)
++  tail call void @air.set_primitive_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 0, <4 x float> <float 0.0, float 0.5, float 0.25, float 0.0>)
++  tail call void @air.set_primitive_data_mesh.v4f32(ptr addrspace(7) nocapture %out.coerce, i32 0, i32 1, <4 x float> <float 0.0, float 0.5, float 0.25, float 0.0>)
++  tail call void @air.set_primitive_count_mesh(ptr addrspace(7) nocapture %out.coerce, i32 2)
++  br label %done
++done:
++  ret void
++}
++declare void @air.set_position_mesh(ptr addrspace(7) nocapture, i32, <4 x float>)
++declare void @air.set_vertex_data_mesh.v4f32(ptr addrspace(7) nocapture, i32, i32, <4 x float>)
++declare void @air.set_primitive_data_mesh.v4f32(ptr addrspace(7) nocapture, i32, i32, <4 x float>)
++declare void @air.set_index_mesh(ptr addrspace(7) nocapture, i32, i8)
++declare void @air.set_primitive_count_mesh(ptr addrspace(7) nocapture, i32)
++declare <4 x float> @helper_add_blue.MTL_VISIBLE_FN_REF(<4 x float>) section "air.externally_defined"
++
++!air.mesh = !{!14}
++!14 = !{ptr @mesh_payload_16k, !15, !16}
++!15 = !{}
++!16 = !{!17, !24, !26}
++!17 = !{i32 0, !"air.mesh", !18, !"air.arg_type_name", !"mesh<VertOut, PrimOut, 4, 2, triangle>", !"air.arg_name", !"out"}
++!18 = !{!"air.mesh_type_info", !19, !22, i32 4, i32 2, !"air.triangle"}
++!19 = !{!20, !21}
++!20 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!21 = !{!"air.mesh_vertex_data", i32 0, !"user(locn0)", !"air.arg_type_name", !"float4", !"air.arg_name", !"vcolor"}
++!22 = !{!23}
++!23 = !{!"air.mesh_primitive_data", i32 0, !"user(locn1)", !"air.arg_type_name", !"float4", !"air.arg_name", !"pcolor"}
++!24 = !{i32 1, !"air.payload", !"air.struct_type_info", !25, !"air.arg_type_size", i32 16384, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload16K", !"air.arg_name", !"payload"}
++!25 = !{i32 0, i32 16384, i32 4, !"uint", !"words", i32 4096}
++!26 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
++"#;
++        let helper_ll = r#"
++define <4 x float> @helper_add_blue(<4 x float> %c) {
++entry:
++  %r = insertelement <4 x float> %c, float 1.0, i32 2
++  ret <4 x float> %r
++}
++"#;
++        assert_eq!(
++            crate::linked_functions::visible_function_reference_symbols(mesh_ll).unwrap(),
++            vec!["helper_add_blue".to_string()]
++        );
++        let linkage = crate::linked_functions::LinkedFunctionLinkage {
++            visible_references: vec![crate::linked_functions::LinkedFunctionReference {
++                symbol: "helper_add_blue".to_string(),
++                module_ll: helper_ll.to_string(),
++            }],
++            ..Default::default()
++        };
++        let (linked_mesh, _, _) =
++            crate::specialize_linked_module_with_tables(mesh_ll, Stage::Mesh, &linkage)
++                .expect("link helper_add_blue.MTL_VISIBLE_FN_REF");
++        assert!(!linked_mesh.contains("MTL_VISIBLE_FN_REF"));
++
++        // Native MeshEXT:
++        let (nat_m, nat_m_refl) = translate_unvalidated(&linked_mesh, Stage::Mesh, [32, 1, 1]);
++        assert!(has_exec_mode(&nat_m, ExecutionMode::OutputTrianglesEXT, None));
++        assert!(has_exec_mode(&nat_m, ExecutionMode::OutputVertices, Some(4)));
++        assert!(has_exec_mode(&nat_m, ExecutionMode::OutputPrimitivesEXT, Some(2)));
++        let mm = nat_m_refl.mesh.expect("mesh reflection");
++        assert_eq!(mm.topology, MeshTopology::Triangle);
++        assert_eq!(mm.max_vertices, 4);
++        assert_eq!(mm.max_primitives, 2);
++        assert_eq!(mm.vertex_outputs.len(), 1);
++        assert_eq!(mm.vertex_outputs[0].location, 0);
++        assert_eq!(mm.vertex_outputs[0].user_semantic.as_deref(), Some("user(locn0)"));
++        assert_eq!(mm.primitive_outputs.len(), 1);
++        assert_eq!(mm.primitive_outputs[0].location, 1);
++        assert!(mm.primitive_outputs[0].per_primitive);
++        assert_eq!(mm.primitive_outputs[0].user_semantic.as_deref(), Some("user(locn1)"));
++
++        // Emulated MeshEXT (DrawIndex + bindings 673/674):
++        let (emul_m_spv, emul_m_refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            &linked_mesh,
++            Stage::Mesh,
++            Path::new(""),
++            emul_opts,
++            None,
++        )
++        .expect("emulated Apple AIR mesh");
++        let emul_m = load_bytes(&emul_m_spv).expect("parse emulated mesh");
++        assert!(has_builtin(&emul_m, BuiltIn::DrawIndex));
++        assert!(emul_m_refl.mesh.as_ref().is_some_and(|m| m.emulated_payload));
++    }
++
++    #[test]
++    fn apple_air_v28_mesh_type_variants_topologies_and_folded_payload_gep() {
++        // 1) All scalar/vector type variants on air.set_{vertex,primitive}_data_mesh.<ty>,
++        //    dynamic i8/i16/i32 indices on air.set_index_mesh, and air.line / air.point topologies.
++        let line_mesh_ll = r#"
++target triple = "air64-apple-macosx26.0.0"
++
++declare void @air.set_position_mesh(ptr addrspace(7) nocapture, i32, <4 x float>)
++declare void @air.set_vertex_data_mesh.f32(ptr addrspace(7) nocapture, i32, i32, float)
++declare void @air.set_vertex_data_mesh.v2f32(ptr addrspace(7) nocapture, i32, i32, <2 x float>)
++declare void @air.set_vertex_data_mesh.v3f32(ptr addrspace(7) nocapture, i32, i32, <3 x float>)
++declare void @air.set_vertex_data_mesh.f16(ptr addrspace(7) nocapture, i32, i32, half)
++declare void @air.set_vertex_data_mesh.v2f16(ptr addrspace(7) nocapture, i32, i32, <2 x half>)
++declare void @air.set_vertex_data_mesh.v4f16(ptr addrspace(7) nocapture, i32, i32, <4 x half>)
++declare void @air.set_vertex_data_mesh.i32(ptr addrspace(7) nocapture, i32, i32, i32)
++declare void @air.set_vertex_data_mesh.v2i32(ptr addrspace(7) nocapture, i32, i32, <2 x i32>)
++declare void @air.set_vertex_data_mesh.v4i32(ptr addrspace(7) nocapture, i32, i32, <4 x i32>)
++declare void @air.set_primitive_data_mesh.f32(ptr addrspace(7) nocapture, i32, i32, float)
++declare void @air.set_primitive_data_mesh.v2f16(ptr addrspace(7) nocapture, i32, i32, <2 x half>)
++declare void @air.set_primitive_data_mesh.v4i32(ptr addrspace(7) nocapture, i32, i32, <4 x i32>)
++declare void @air.set_index_mesh.i8(ptr addrspace(7) nocapture, i32, i8)
++declare void @air.set_index_mesh.i16(ptr addrspace(7) nocapture, i32, i16)
++declare void @air.set_primitive_count_mesh(ptr addrspace(7) nocapture, i32)
++
++define void @mesh_variants(ptr addrspace(7) %out.coerce, i32 %tid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %emit, label %done
++emit:
++  %i8v = trunc i32 %tid to i8
++  %i16v = trunc i32 %tid to i16
++  %i16_next = add i16 %i16v, 1
++  tail call void @air.set_position_mesh(ptr addrspace(7) %out.coerce, i32 0, <4 x float> <float -1.0, float 0.0, float 0.0, float 1.0>)
++  tail call void @air.set_position_mesh(ptr addrspace(7) %out.coerce, i32 1, <4 x float> <float 1.0, float 0.0, float 0.0, float 1.0>)
++  tail call void @air.set_vertex_data_mesh.f32(ptr addrspace(7) %out.coerce, i32 0, i32 0, float 1.0)
++  tail call void @air.set_vertex_data_mesh.v2f32(ptr addrspace(7) %out.coerce, i32 1, i32 0, <2 x float> <float 1.0, float 2.0>)
++  tail call void @air.set_vertex_data_mesh.v3f32(ptr addrspace(7) %out.coerce, i32 2, i32 0, <3 x float> <float 1.0, float 2.0, float 3.0>)
++  tail call void @air.set_vertex_data_mesh.f16(ptr addrspace(7) %out.coerce, i32 3, i32 0, half 0xH3C00)
++  tail call void @air.set_vertex_data_mesh.v2f16(ptr addrspace(7) %out.coerce, i32 4, i32 0, <2 x half> <half 0xH3C00, half 0xH4000>)
++  tail call void @air.set_vertex_data_mesh.v4f16(ptr addrspace(7) %out.coerce, i32 5, i32 0, <4 x half> <half 0xH3C00, half 0xH4000, half 0xH4200, half 0xH4400>)
++  tail call void @air.set_vertex_data_mesh.i32(ptr addrspace(7) %out.coerce, i32 6, i32 0, i32 7)
++  tail call void @air.set_vertex_data_mesh.v2i32(ptr addrspace(7) %out.coerce, i32 7, i32 0, <2 x i32> <i32 1, i32 2>)
++  tail call void @air.set_vertex_data_mesh.v4i32(ptr addrspace(7) %out.coerce, i32 8, i32 0, <4 x i32> <i32 1, i32 2, i32 3, i32 4>)
++  tail call void @air.set_primitive_data_mesh.f32(ptr addrspace(7) %out.coerce, i32 0, i32 0, float 0.5)
++  tail call void @air.set_primitive_data_mesh.v2f16(ptr addrspace(7) %out.coerce, i32 1, i32 0, <2 x half> <half 0xH3800, half 0xH3C00>)
++  tail call void @air.set_primitive_data_mesh.v4i32(ptr addrspace(7) %out.coerce, i32 2, i32 0, <4 x i32> <i32 9, i32 8, i32 7, i32 6>)
++  tail call void @air.set_index_mesh.i8(ptr addrspace(7) %out.coerce, i32 0, i8 %i8v)
++  tail call void @air.set_index_mesh.i16(ptr addrspace(7) %out.coerce, i32 1, i16 %i16_next)
++  tail call void @air.set_primitive_count_mesh(ptr addrspace(7) %out.coerce, i32 1)
++  br label %done
++done:
++  ret void
++}
++
++!air.mesh = !{!1}
++!1 = !{ptr @mesh_variants, !2, !3}
++!2 = !{}
++!3 = !{!4, !5}
++!4 = !{i32 0, !"air.mesh", !6, !"air.arg_type_name", !"mesh<V, P, 2, 1, line>", !"air.arg_name", !"out"}
++!5 = !{i32 1, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
++!6 = !{!"air.mesh_type_info", !7, !18, i32 2, i32 1, !"air.line"}
++!7 = !{!8, !9, !10, !11, !12, !13, !14, !15, !16, !17}
++!8 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!9 = !{!"air.mesh_vertex_data", i32 0, !"user(locn0)", !"air.arg_type_name", !"float", !"air.arg_name", !"v0"}
++!10 = !{!"air.mesh_vertex_data", i32 1, !"user(locn1)", !"air.arg_type_name", !"float2", !"air.arg_name", !"v1"}
++!11 = !{!"air.mesh_vertex_data", i32 2, !"user(locn2)", !"air.arg_type_name", !"float3", !"air.arg_name", !"v2"}
++!12 = !{!"air.mesh_vertex_data", i32 3, !"user(locn3)", !"air.arg_type_name", !"half", !"air.arg_name", !"v3"}
++!13 = !{!"air.mesh_vertex_data", i32 4, !"user(locn4)", !"air.arg_type_name", !"half2", !"air.arg_name", !"v4"}
++!14 = !{!"air.mesh_vertex_data", i32 5, !"user(locn5)", !"air.arg_type_name", !"half4", !"air.arg_name", !"v5"}
++!15 = !{!"air.mesh_vertex_data", i32 6, !"user(locn6)", !"air.arg_type_name", !"int", !"air.arg_name", !"v6"}
++!16 = !{!"air.mesh_vertex_data", i32 7, !"user(locn7)", !"air.arg_type_name", !"int2", !"air.arg_name", !"v7"}
++!17 = !{!"air.mesh_vertex_data", i32 8, !"user(locn8)", !"air.arg_type_name", !"int4", !"air.arg_name", !"v8"}
++!18 = !{!19, !20, !21}
++!19 = !{!"air.mesh_primitive_data", i32 0, !"user(locn9)", !"air.arg_type_name", !"float", !"air.arg_name", !"p0"}
++!20 = !{!"air.mesh_primitive_data", i32 1, !"user(locn10)", !"air.arg_type_name", !"half2", !"air.arg_name", !"p1"}
++!21 = !{!"air.mesh_primitive_data", i32 2, !"user(locn11)", !"air.arg_type_name", !"int4", !"air.arg_name", !"p2"}
++"#;
++        let (lm, lrefl) = translate_unvalidated(line_mesh_ll, Stage::Mesh, [1, 1, 1]);
++        assert!(has_exec_mode(&lm, ExecutionMode::OutputLinesEXT, None));
++        let lmm = lrefl.mesh.expect("line mesh refl");
++        assert_eq!(lmm.topology, MeshTopology::Line);
++        assert_eq!(lmm.vertex_outputs.len(), 9);
++        assert_eq!(lmm.primitive_outputs.len(), 3);
++        // Verify half mesh varyings widened cleanly to f32 (no StorageInputOutput16 needed).
++        let has_f16_output_var = lm.types_global_values.iter().any(|i| {
++            i.class.opcode == Op::Variable
++                && i.operands.first() == Some(&Operand::StorageClass(StorageClass::Output))
++                && i.result_type.is_some_and(|pty| {
++                    // Check for Output array of f16 / vec<f16>
++                    let pointee = lm.types_global_values.iter().find_map(|d| {
++                        (d.result_id == Some(pty) && d.class.opcode == Op::TypePointer)
++                            .then(|| match d.operands.get(1) {
++                                Some(Operand::IdRef(t)) => Some(*t),
++                                _ => None,
++                            })
++                            .flatten()
++                    });
++                    let elem = pointee.and_then(|at| {
++                        lm.types_global_values.iter().find_map(|d| {
++                            (d.result_id == Some(at) && d.class.opcode == Op::TypeArray)
++                                .then(|| match d.operands.first() {
++                                    Some(Operand::IdRef(e)) => Some(*e),
++                                    _ => None,
++                                })
++                                .flatten()
++                        })
++                    });
++                    let scalar = elem.and_then(|et| {
++                        lm.types_global_values.iter().find_map(|d| {
++                            if d.result_id != Some(et) {
++                                return None;
++                            }
++                            if d.class.opcode == Op::TypeVector {
++                                match d.operands.first() {
++                                    Some(Operand::IdRef(s)) => Some(*s),
++                                    _ => None,
++                                }
++                            } else {
++                                Some(et)
++                            }
++                        })
++                    });
++                    scalar.is_some_and(|st| {
++                        lm.types_global_values.iter().any(|d| {
++                            d.result_id == Some(st)
++                                && d.class.opcode == Op::TypeFloat
++                                && d.operands.first() == Some(&Operand::LiteralBit32(16))
++                        })
++                    })
++                })
++        });
++        assert!(!has_f16_output_var, "half mesh outputs must widen to f32");
++
++        // 2) Opaque-pointer index-0 folded store/load directly on %payload (before GEP on %struct.Payload16K).
++        let folded_obj_ll = r#"
++target triple = "air64-apple-macosx26.0.0"
++%struct.Payload16K = type { [4096 x i32] }
++declare void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) nocapture, <3 x i32>)
++
++define void @obj_folded(ptr addrspace(6) nocapture writeonly align 4 dereferenceable(16384) %payload, ptr addrspace(3) %mgp.0) {
++entry:
++  store i32 42, ptr addrspace(6) %payload, align 4
++  %p1 = getelementptr inbounds %struct.Payload16K, ptr addrspace(6) %payload, i64 0, i32 0, i64 4095
++  store i32 99, ptr addrspace(6) %p1, align 4
++  tail call void @air.set_threadgroups_per_grid_mesh_properties(ptr addrspace(3) %mgp.0, <3 x i32> <i32 2, i32 1, i32 1>)
++  ret void
++}
++
++!air.object = !{!1}
++!1 = !{ptr @obj_folded, !2, !3, !6}
++!2 = !{}
++!3 = !{!4, !5}
++!4 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 16384, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload16K", !"air.arg_name", !"payload"}
++!5 = !{i32 1, !"air.mesh_grid_properties", !"air.arg_type_name", !"mesh_grid_properties", !"air.arg_name", !"mgp"}
++!6 = !{!"air.max_mesh_work_groups", i32 4}
++"#;
++        let emul_opts = TransformOptions {
++            kernel_local_size: [1, 1, 1],
++            emulated_mesh_payload: true,
++            ..Default::default()
++        };
++        let (nat_obj, _) = translate_unvalidated(folded_obj_ll, Stage::Object, [1, 1, 1]);
++        assert!(nat_obj.functions.iter().any(|f| {
++            f.blocks
++                .iter()
++                .any(|b| b.instructions.iter().any(|i| i.class.opcode == Op::EmitMeshTasksEXT))
++        }));
++        let (emul_spv, emul_refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            folded_obj_ll,
++            Stage::Object,
++            Path::new(""),
++            emul_opts,
++            None,
++        )
++        .expect("emulated folded payload object");
++        assert!(emul_refl.object.as_ref().is_some_and(|o| o.emulated_payload));
++        let emul_mod = load_bytes(&emul_spv).expect("parse emul folded obj");
++        assert!(emul_mod.entry_points.iter().any(|ep| {
++            ep.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::GLCompute))
++        }));
++    }
+ }
+diff --git a/src/passes/ray_query.rs b/src/passes/ray_query.rs
+index 4d9e6cf..70245a9 100644
+--- a/src/passes/ray_query.rs
++++ b/src/passes/ray_query.rs
+@@ -1103,4 +1103,175 @@ entry:
+                 .expect_err("conflicting @sphere_hit definition must fail");
+         assert!(err.contains("conflicts"), "{err}");
+     }
++
++    #[test]
++    fn apple_air_v28_ift_dispatch_packed_bbox_and_triangle_anyhit() {
++        // Exact Apple `air64_v28` `trace_ift` + `aabb_sphere` (`<{ i1, float }>`) +
++        // `tri_anyhit_filter` (`i1`) pattern from #169 #4:
++        // 20-arg `@air.intersect.instancing.triangle_data` with `%ift.coerce` and `i32 3` at arg 14.
++        let trace_ift_ll = r#"
++define void @trace_ift(ptr addrspace(1) %rays, ptr addrspace(1) %out, ptr addrspace(1) readonly %scene.coerce, ptr addrspace(1) readonly %ift.coerce, i32 %tid) {
++entry:
++  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 0.0, float 0.0, float 0.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  %ht = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 0
++  %dst = getelementptr inbounds i32, ptr addrspace(1) %out, i32 %tid
++  store i32 %ht, ptr addrspace(1) %dst, align 4
++  ret void
++}
++declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @trace_ift, !1, !2}
++!1 = !{}
++!2 = !{!19, !20, !21, !22, !23}
++!19 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++!20 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++!21 = !{i32 2, !"air.instance_acceleration_structure", !"air.location_index", i32 2, i32 1, !"air.read"}
++!22 = !{i32 3, !"air.intersection_function_table", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
++!23 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++"#;
++        let aabb_sphere_ll = r#"
++define <{ i1, float }> @aabb_sphere(<3 x float> %origin, <3 x float> %dir, float %tmin, float %tmax) {
++entry:
++  %r0 = insertvalue <{ i1, float }> poison, i1 true, 0
++  %r1 = insertvalue <{ i1, float }> %r0, float 3.500000e+00, 1
++  ret <{ i1, float }> %r1
++}
++!air.intersection = !{!14}
++!14 = !{ptr @aabb_sphere, !15, !18, !"air.bounding_box", !"air.instancing"}
++!15 = !{}
++!18 = !{!19, !20, !21, !22}
++!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
++!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
++!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
++!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
++"#;
++        let tri_anyhit_ll = r#"
++define i1 @tri_anyhit_filter(<2 x float> %bary) {
++entry:
++  %bx = extractelement <2 x float> %bary, i32 0
++  %ok = fcmp oge float %bx, 3.000000e-01
++  ret i1 %ok
++}
++!air.intersection = !{!14}
++!14 = !{ptr @tri_anyhit_filter, !15, !17, !"air.triangle", !"air.instancing", !"air.triangle_data"}
++!15 = !{}
++!17 = !{!18}
++!18 = !{i32 0, !"air.barycentric_coord", !"air.arg_type_name", !"float2"}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            runtime_intersection_functions: vec![
++                LinkedIntersectionFunction {
++                    symbol: "aabb_sphere".to_string(),
++                    kind: IntersectionFunctionKind::BoundingBox,
++                    module_ll: aabb_sphere_ll.to_string(),
++                },
++                LinkedIntersectionFunction {
++                    symbol: "tri_anyhit_filter".to_string(),
++                    kind: IntersectionFunctionKind::TriangleAnyHit,
++                    module_ll: tri_anyhit_ll.to_string(),
++                },
++            ],
++            runtime_intersection_tables: true,
++            ..Default::default()
++        };
++        let (linked_ll, _, ift_info) =
++            crate::specialize_linked_module_with_tables(trace_ift_ll, Stage::Kernel, &linkage)
++                .expect("specialize real Apple AIR trace_ift");
++        let ift = ift_info.expect("IFT metadata");
++        assert_eq!(ift.handles.len(), 2);
++        assert_eq!(ift.handles[0].symbol, "aabb_sphere");
++        assert_eq!(ift.handles[0].handle_id, 1);
++        assert_eq!(ift.handles[1].symbol, "tri_anyhit_filter");
++        assert_eq!(ift.handles[1].handle_id, 2);
++        // Must use arg 17 (`%p17`, 0), NOT arg 14 (`%p14`, geometry_type = 3)!
++        assert!(
++            linked_ll.contains("%fto_neg = icmp slt i32 %p17, 0"),
++            "IFT offset must read arg 17, not geometry_type arg 14:\n{linked_ll}"
++        );
++        assert!(
++            !linked_ll.contains("intersection_function_table<"),
++            "parameterized IFT type name must rewrite to uint:\n{linked_ll}"
++        );
++
++        let (m, refl) = translate_rq(&linked_ll, Stage::Kernel);
++        assert!(has_cap(&m, Capability::RayQueryKHR));
++        assert!(has_op(&m, Op::Switch));
++        assert!(has_op(&m, Op::RayQueryGenerateIntersectionKHR));
++        assert!(has_op(&m, Op::RayQueryConfirmIntersectionKHR));
++        assert!(refl
++            .bindings
++            .iter()
++            .any(|b| b.kind == ResourceKind::Buffer && b.metal_index == 3));
++
++        // Also test single-MTLLibrary combined module where both `!air.intersection` roots coexist
++        // (verifies per-symbol scoped param role decoding doesn't cross-contaminate param 0).
++        let combined_ll = r#"
++define <{ i1, float }> @aabb_sphere(<3 x float> %origin, <3 x float> %dir, float %tmin, float %tmax) {
++entry:
++  %r0 = insertvalue <{ i1, float }> poison, i1 true, 0
++  %r1 = insertvalue <{ i1, float }> %r0, float 3.500000e+00, 1
++  ret <{ i1, float }> %r1
++}
++define i1 @tri_anyhit_filter(<2 x float> %bary) {
++entry:
++  %bx = extractelement <2 x float> %bary, i32 0
++  %ok = fcmp oge float %bx, 3.000000e-01
++  ret i1 %ok
++}
++define void @trace_ift(ptr addrspace(1) %rays, ptr addrspace(1) %out, ptr addrspace(1) readonly %scene.coerce, ptr addrspace(1) readonly %ift.coerce, i32 %tid) {
++entry:
++  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 0.0, float 0.0, float 0.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  %ht = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 0
++  %dst = getelementptr inbounds i32, ptr addrspace(1) %out, i32 %tid
++  store i32 %ht, ptr addrspace(1) %dst, align 4
++  ret void
++}
++declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @trace_ift, !1, !2}
++!1 = !{}
++!2 = !{!19, !20, !21, !22, !23}
++!19 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++!20 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++!21 = !{i32 2, !"air.instance_acceleration_structure", !"air.location_index", i32 2, i32 1, !"air.read"}
++!22 = !{i32 3, !"air.intersection_function_table", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
++!23 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++!air.intersection = !{!30, !40}
++!30 = !{ptr @aabb_sphere, !1, !31, !"air.bounding_box", !"air.instancing"}
++!31 = !{!32, !33, !34, !35}
++!32 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
++!33 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
++!34 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
++!35 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
++!40 = !{ptr @tri_anyhit_filter, !1, !41, !"air.triangle", !"air.instancing", !"air.triangle_data"}
++!41 = !{!42}
++!42 = !{i32 0, !"air.barycentric_coord", !"air.arg_type_name", !"float2"}
++"#;
++        let combined_linkage = LinkedFunctionLinkage {
++            runtime_intersection_functions: vec![
++                LinkedIntersectionFunction {
++                    symbol: "aabb_sphere".to_string(),
++                    kind: IntersectionFunctionKind::BoundingBox,
++                    module_ll: combined_ll.to_string(),
++                },
++                LinkedIntersectionFunction {
++                    symbol: "tri_anyhit_filter".to_string(),
++                    kind: IntersectionFunctionKind::TriangleAnyHit,
++                    module_ll: combined_ll.to_string(),
++                },
++            ],
++            runtime_intersection_tables: true,
++            ..Default::default()
++        };
++        let (comb_linked, _, _) =
++            crate::specialize_linked_module_with_tables(combined_ll, Stage::Kernel, &combined_linkage)
++                .expect("single-library multi-intersection specialization");
++        assert!(
++            comb_linked.contains("call <2 x float> @__m2v.rq.get_barycentrics"),
++            "tri_anyhit_filter must receive barycentrics, not aabb_sphere origin:\n{comb_linked}"
++        );
++        let (cm, _) = translate_rq(&comb_linked, Stage::Kernel);
++        assert!(has_op(&cm, Op::Switch));
++        assert!(has_op(&cm, Op::RayQueryGenerateIntersectionKHR));
++    }
+ }
+diff --git a/src/passes/resources/collapse.rs b/src/passes/resources/collapse.rs
+index d09e54c..cdf0dc9 100644
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -101,6 +101,28 @@ pub(in crate::passes) fn apply_bindings(
+                 ));
+                 splices.push((pid, cid));
+             }
++            ParamBinding::LoadVarFConvert {
++                var,
++                load_ty,
++                param_ty,
++            } => {
++                // load the widened 32-bit float varying, then FConvert down to the body's half type.
++                let lid = ctx.module.fresh_id();
++                loads.push(Instruction::new(
++                    Op::Load,
++                    Some(load_ty),
++                    Some(lid),
++                    vec![Operand::IdRef(var)],
++                ));
++                let cid = ctx.module.fresh_id();
++                loads.push(Instruction::new(
++                    Op::FConvert,
++                    Some(param_ty),
++                    Some(cid),
++                    vec![Operand::IdRef(lid)],
++                ));
++                splices.push((pid, cid));
++            }
+             ParamBinding::LoadVarBitcast {
+                 var,
+                 load_ty,
+diff --git a/src/passes/stage_input/air_layout.rs b/src/passes/stage_input/air_layout.rs
+index 9e63aeb..ecefeaa 100644
+--- a/src/passes/stage_input/air_layout.rs
++++ b/src/passes/stage_input/air_layout.rs
+@@ -57,6 +57,17 @@ pub(in crate::passes) fn fragment_varying_interface_type(
+     ty: Word,
+     defs: &HashMap<Word, Instruction>,
+ ) -> Word {
++    // Widen half varyings to 32-bit float to match widened VS/Mesh outputs and pull-model inputs
++    // without requiring `StorageInputOutput16`.
++    if let Some((component, lanes)) = scalar_or_vector_component(defs, ty) {
++        if type_float_width(defs, component) == Some(16) {
++            return match lanes {
++                Some(n @ 2..=4) => ctx.ty_vecf(n),
++                None => ctx.ty_float(),
++                _ => ty,
++            };
++        }
++    }
+     let Some(name) = frag.and_then(|meta| meta.varying_type(loc)) else {
+         return ty;
+     };
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index b81fc4f..0b391d2 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -163,6 +163,13 @@ pub(in crate::passes) enum ParamBinding {
+         load_ty: Word,
+         param_ty: Word,
+     },
++    /// A half fragment varying widened to 32-bit float on the stage interface: load f32 then
++    /// `OpFConvert` down to the body's f16 scalar/vector type.
++    LoadVarFConvert {
++        var: Word,
++        load_ty: Word,
++        param_ty: Word,
++    },
+     /// A loadable interface var whose signedness was recovered from AIR metadata while the LLVM body
+     /// still uses the original signless integer type id. Load the interface type, then bitcast to the
+     /// body's parameter type.
+@@ -1756,6 +1763,18 @@ pub(super) fn build_stage_input(
+                 ctx.interface.push(var);
+                 if interface_ty == *pty {
+                     bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
++                } else if matches!(stage, Stage::Fragment)
++                    && scalar_or_vector_component(&defs, *pty)
++                        .is_some_and(|(comp, _)| type_float_width(&defs, comp) == Some(16))
++                {
++                    bindings.push((
++                        *pid,
++                        ParamBinding::LoadVarFConvert {
++                            var,
++                            load_ty: interface_ty,
++                            param_ty: *pty,
++                        },
++                    ));
+                 } else if matches!(stage, Stage::Vertex)
+                     && (type_int_shape(&defs, *pty).is_some()
+                         || defs.get(pty).is_some_and(|definition| {
+diff --git a/src/passes/stage_output/mod.rs b/src/passes/stage_output/mod.rs
+index 43cb0a2..43c69f2 100644
+--- a/src/passes/stage_output/mod.rs
++++ b/src/passes/stage_output/mod.rs
+@@ -65,6 +65,15 @@ fn fragment_output_type(
+ fn user_location_output_type(ctx: &mut Ctx, ty: Word) -> Word {
+     if type_def_of(ctx, ty).is_some_and(|definition| definition.class.opcode == Op::TypeBool) {
+         ctx.ty_uint()
++    } else if let Some(lanes) = float_shape(ctx, ty, 16) {
++        // Widen half user varyings to 32-bit float so VS/Mesh outputs match FS inputs
++        // (including pull-model `InterpolateAt*`, which requires 32-bit float) without
++        // requiring `StorageInputOutput16`.
++        if lanes == 1 {
++            ctx.ty_float()
++        } else {
++            ctx.ty_vecf(lanes)
++        }
+     } else {
+         ty
+     }
+diff --git a/src/passes/workgroup/pointers.rs b/src/passes/workgroup/pointers.rs
+index 27c09f2..3cb0aed 100644
+--- a/src/passes/workgroup/pointers.rs
++++ b/src/passes/workgroup/pointers.rs
+@@ -32,6 +32,51 @@ pub(in crate::passes) fn rewrite_workgroup_root_access(
+     let Some(array_ty) = ptr_pointee(&types, var_ptr_ty) else {
+         return;
+     };
++    // Access chains emitted by native aggregate-prefix reinterpret loads/stores on a bare pointer
++    // parameter descend directly into the parameter's pointee (`element_ty`) without the leading
++    // element-0 index of the outer `OpTypeArray(element_ty, N)` wrapper that `stage_input` wraps
++    // around `WorkgroupMemory` / `TaskPayload` variables. Prepend `0` whenever walking from
++    // `array_ty` misses the chain's target pointee while walking from `element_ty` matches it.
++    if let Some(element_ty) = types.get(&array_ty).and_then(|definition| {
++        if definition.class.opcode != Op::TypeArray {
++            return None;
++        }
++        match definition.operands.first()? {
++            Operand::IdRef(elem) => Some(*elem),
++            _ => None,
++        }
++    }) {
++        let mut chains_to_prepend: Vec<(usize, usize)> = vec![];
++        for (bi, blk) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
++            for (ii, inst) in blk.instructions.iter().enumerate() {
++                if !matches!(
++                    inst.class.opcode,
++                    Op::AccessChain | Op::InBoundsAccessChain
++                ) || inst.operands.first() != Some(&Operand::IdRef(var))
++                {
++                    continue;
++                }
++                let Some(want_ty) = inst.result_type.and_then(|ty| ptr_pointee(&types, ty)) else {
++                    continue;
++                };
++                let indices = &inst.operands[1..];
++                if crate::passes::access::walk_into_type(ctx, array_ty, indices) != Some(want_ty)
++                    && crate::passes::access::walk_into_type(ctx, element_ty, indices)
++                        == Some(want_ty)
++                {
++                    chains_to_prepend.push((bi, ii));
++                }
++            }
++        }
++        if !chains_to_prepend.is_empty() {
++            let u0 = ctx.const_uint(0);
++            for (bi, ii) in chains_to_prepend {
++                ctx.module.functions[entry_idx].blocks[bi].instructions[ii]
++                    .operands
++                    .insert(1, Operand::IdRef(u0));
++            }
++        }
++    }
+     let raw_byte_element = types.get(&array_ty).and_then(|definition| {
+         if definition.class.opcode != Op::TypeArray {
+             return None;
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+index ec09641..2036fdc 100644
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -4739,13 +4739,13 @@ impl ShaderReflection {
+                             per_primitive: false,
+                             type_name: member.type_name.clone(),
+                             name: member.name.clone(),
+-                            user_semantic: None,
++                            user_semantic: member.user_semantic.clone(),
+                         });
+                         varyings.push(Varying {
+                             location: loc,
+                             type_name: member.type_name.clone(),
+                             name: member.name.clone(),
+-                            user_semantic: None,
++                            user_semantic: member.user_semantic.clone(),
+                             per_primitive: false,
+                         });
+                     }
+@@ -4763,13 +4763,13 @@ impl ShaderReflection {
+                             per_primitive: true,
+                             type_name: member.type_name.clone(),
+                             name: member.name.clone(),
+-                            user_semantic: None,
++                            user_semantic: member.user_semantic.clone(),
+                         });
+                         varyings.push(Varying {
+                             location: loc,
+                             type_name: member.type_name.clone(),
+                             name: member.name.clone(),
+-                            user_semantic: None,
++                            user_semantic: member.user_semantic.clone(),
+                             per_primitive: true,
+                         });
+                     }

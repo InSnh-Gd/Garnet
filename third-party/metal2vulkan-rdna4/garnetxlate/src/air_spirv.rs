@@ -129,6 +129,7 @@ pub fn linkage_for(
     }
     let mut need: Vec<String> =
         metal2vulkan::linked_functions::visible_function_reference_symbols(san_entry)?;
+    need.extend(metal2vulkan::linked_functions::external_symbol_references(san_entry)?);
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut linkage = LinkedFunctionLinkage::default();
     while let Some(sym) = need.pop() {
@@ -139,6 +140,7 @@ pub fn linkage_for(
             continue; // specialize_linked_module names it
         };
         need.extend(metal2vulkan::linked_functions::visible_function_reference_symbols(module)?);
+        need.extend(metal2vulkan::linked_functions::external_symbol_references(module)?);
         linkage.visible_references.push(LinkedFunctionReference {
             symbol: sym,
             module_ll: module.clone(),

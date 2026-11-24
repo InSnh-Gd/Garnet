@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0078).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0079).
 
 Verification and Tier 2 Scope
 =============================
@@ -18,6 +18,49 @@ translation, metadata invariants, and software Vulkan 1.4.363 execution only;
 they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
+
+0079-metal3-apple-air-live-fixes.patch fixes four live macOS 26.7.2 Apple AIR
+(`air64_v28`, `metalfe-32023.886.1`) translator gaps captured on RX 9060 XT:
+1. Real Apple AIR Mesh & Object shaders + `.MTL_VISIBLE_FN_REF`
+   (`air_intrinsics.rs`, `meta/mod.rs`, `reflect/mod.rs`, `passes/mesh_stage.rs`,
+   `native/ir/pointer_pointees.rs`, `passes/workgroup/pointers.rs`,
+   `linked_functions.rs`, `garnetxlate/src/{stage2_link,air_spirv}.rs`):
+   supports Apple's `air.set_position_mesh`, `air.set_vertex_data_mesh.<ty>`,
+   `air.set_primitive_data_mesh.<ty>`, `air.set_index_mesh` (`i8`/`i16`/`i32`),
+   `air.set_primitive_count_mesh`, `air.set_point_size_mesh`,
+   `air.set_primitive_culled_mesh`, `air.set_{render_target,viewport}_array_index_mesh`,
+   `air.set_primitive_id_mesh`, and `air.set_threadgroups_per_grid_mesh_properties`;
+   parses `!air.mesh_type_info` (`!verts`, `!prims`, `maxV`, `maxP`,
+   `!"air.triangle"|"air.line"|"air.point"`), `!air.mesh_{vertex,primitive}_data`
+   `attrIdx -> Location`/`user_semantic` mappings, and `!air.max_mesh_work_groups`;
+   handles opaque-pointer index-0 folded payload loads/stores before GEPs on
+   `addrspace(6)` payloads in both native `TaskEXT`+`MeshEXT` and
+   `GARNETX_CAP_MESH_EMULATED_PAYLOAD` (`GLCompute`+`MeshEXT` `DrawIndex`
+   673/674/675); and links `@<sym>.MTL_VISIBLE_FN_REF` declarations against
+   `MTLLinkedFunctions.privateFunctions` (`deps`).
+2. Pull-model & non-pull `half` VS/Mesh/FS varying width consistency
+   (`passes/stage_output/mod.rs`, `passes/mesh_stage.rs`,
+   `passes/stage_input/{air_layout,mod}.rs`, `passes/resources/collapse.rs`):
+   widens `half[1..4]` inter-stage user varyings consistently to `f32` (`OpFConvert`
+   at VS/Mesh stores and non-pull FS loads, matching `InterpolateAt*` `f32` pull
+   inputs) so `half2` pull-model and regular varyings match without requiring
+   `StorageInputOutput16`.
+3. Opaque-pointer index-0 `Array`/`Struct` GEP folding in local atomics
+   (`native/emitter/ops/atomics.rs`): peels leading zero indices via
+   `OpInBoundsAccessChain` when an atomic pointer directly targets an
+   `Array`/`Struct` aggregate (e.g. `[4 x %"struct.metal::_atomic.0"]` / `{ float }`).
+4. Real Apple AIR `air.intersect.*` + `MTLIntersectionFunctionTable` dispatch
+   (`native/ray_query_air.rs`, `linked_functions.rs`): enables IFT lowering on
+   Apple's 20-arg `@air.intersect.*` calls whenever the table operand is non-null
+   (without requiring `.intersection_function_buffer.`), fixes trailing
+   `intersection_params` operand indices (`opacity_cull_mode = cur+3`,
+   `force_opacity = cur+4`, `function_table_offset = cur+8`), strips LLVM
+   parameter attributes (`align N`, `dereferenceable(N)`, quoted attributes),
+   rewrites parameterized `!"intersection_function_table<...>"` metadata to
+   `!"uint"`, scopes callback parameter role decoding to each callback's own
+   `!air.intersection` metadata node, and wires runtime `OpSwitch` dispatch for
+   packed `<{ i1, float }>` bounding-box (`OpRayQueryGenerateIntersectionKHR`)
+   and `i1` triangle any-hit (`OpRayQueryConfirmIntersectionKHR`) callbacks.
 
 0078-metal3-live-air-fixes-and-gfx-object-mesh.patch fixes two live macOS
 26.7.2 Apple AIR translator bugs and adds GFX-ring emulated Object+Mesh payload
