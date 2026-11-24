@@ -54,11 +54,22 @@
 }
 @end
 
+@protocol RDNA4ResidencySnapshotInternal <NSObject>
+- (NSArray *)rdna4Allocations;
+- (void)rdna4AddBuffersToSet:(NSMutableSet *)buffers device:(id)device;
+@end
+
+@protocol RDNA4ResidencySetInternal <NSObject>
+- (id)device;
+- (id<RDNA4ResidencySnapshotInternal>)rdna4CommittedSnapshot;
+@end
+
 @class RDNA4CommandBuffer;
 @interface RDNA4CommandQueue : _MTLCommandQueue {
     VkCommandPool _pool; dispatch_queue_t _cq; id _ndev;
     NSUInteger _gprio, _bprio; id _compQ;   // gap census: SkyLight's priority / completion-queue setters (recorded only)
     NSMutableArray<RDNA4CommandBuffer *> *_pending;
+    NSMutableArray *_residencySets;
     pthread_mutex_t _qmu;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
@@ -67,6 +78,11 @@
 - (void)rdna4Kick;
 - (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb;
 - (BOOL)rdna4AdvanceHead;
+- (void)addResidencySet:(id)residencySet;
+- (void)addResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count;
+- (void)removeResidencySet:(id)residencySet;
+- (void)removeResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count;
+- (NSArray *)rdna4ResidencySetSnapshots;
 @end
 
 // CRC diagnostic, completion time (fence done, the copy ran): A1, B, A2. Returns the record the present step uses for C (nil when the check cannot run).
@@ -136,6 +152,8 @@ static rdna4crc_rec_t *rdna4s_crc_check(RDNA4Texture *dt, int slot, uint64_t seq
     struct rdna4ojob { rdna4occ *o; VkQueryPool qp; uint32_t base; } *_oj; uint32_t _noj, _coj; NSMutableArray *_ojb; NSMutableArray *_qpools; uint32_t _qpUsed; VkQueryPool _qpCur;   // build 18 (P2): per-pass occlusion jobs (+ their visibility buffers), the query pools of this command buffer, the chunk cursor of the newest one
     rdna4uc_list _uc; BOOL _ucLive; rdna4ia _ia;   // build 16: F3 the surfaces this command buffer use-counts while in flight (rdna4UCRelease gives them back, exactly once); P1 the per-range aliasing state
     RDNA4NativeJournal _native;
+    NSMutableArray *_residencySnapshots;
+    NSMutableSet *_residencyHeapResources;
 }
 - (VkCommandBuffer)rdna4BlitVK;
 - (void)rdna4NativeRecord:(RDNA4NativeOp)op;
@@ -204,6 +222,11 @@ static rdna4crc_rec_t *rdna4s_crc_check(RDNA4Texture *dt, int slot, uint64_t seq
 - (uint64_t)rdna4SegmentSerial;
 - (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage;
 - (void)rdna4UseHeap:(id)heap;
+- (void)useResidencySet:(id)residencySet;
+- (void)useResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count;
+- (void)rdna4AttachResidencySnapshot:(id)snapshot;
+- (void)rdna4AttachQueueResidencySnapshots;
+- (NSSet *)rdna4ResidencyDeclaredResources;
 - (void)rdna4Fail:(NSString *)why;
 - (NSError *)rdna4Error;
 - (BOOL)rdna4Bytes:(const void *)p length:(NSUInteger)n buffer:(RDNA4Buffer * __strong *)ob offset:(NSUInteger *)oo;
@@ -347,6 +370,7 @@ static void rdna4_schedule_kick(void) {
     if (!self) { if (err) *err = rdna4_err(50, @"_MTLCommandQueue initWithDevice:descriptor: returned nil"); return nil; }
     pthread_mutex_init(&_qmu, NULL);
     _pending = [NSMutableArray array];
+    _residencySets = [NSMutableArray array];
     // The base deallocator needs its dispatch objects even when RADV is unavailable.
     if (!rdna4_radv_open(err)) return nil;
     VkCommandPoolCreateInfo cpc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = RDNA4R.qfi,
@@ -393,17 +417,63 @@ RDNA4_DNR(RDNA4CommandQueue)
 - (NSUInteger)getGPUPriority { return _gprio; }
 - (NSUInteger)getBackgroundGPUPriority { return _bprio; }
 - (void)setCompletionQueue:(id)q { _compQ = q; RDNA4_ONCE("queue setCompletionQueue: recorded only (completion handlers run on the bundle's completion thread)"); }
+- (void)addResidencySet:(id)residencySet {
+    if (!residencySet) return;
+    if (![residencySet respondsToSelector:@selector(rdna4CommittedSnapshot)] ||
+        ![residencySet respondsToSelector:@selector(device)] ||
+        [residencySet device] != _ndev) {
+        RDNA4_ONCE("queue addResidencySet: invalid residency set or device mismatch; ignored");
+        return;
+    }
+    pthread_mutex_lock(&_qmu);
+    if ([_residencySets indexOfObjectIdenticalTo:residencySet] == NSNotFound)
+        [_residencySets addObject:residencySet];
+    pthread_mutex_unlock(&_qmu);
+}
+- (void)addResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count {
+    if (!residencySets || !count) return;
+    for (NSUInteger i = 0; i < count; i++) [self addResidencySet:residencySets[i]];
+}
+- (void)removeResidencySet:(id)residencySet {
+    if (!residencySet) return;
+    pthread_mutex_lock(&_qmu);
+    [_residencySets removeObjectIdenticalTo:residencySet];
+    pthread_mutex_unlock(&_qmu);
+}
+- (void)removeResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count {
+    if (!residencySets || !count) return;
+    for (NSUInteger i = 0; i < count; i++) [self removeResidencySet:residencySets[i]];
+}
+- (NSArray *)rdna4ResidencySetSnapshots {
+    NSArray *sets = nil;
+    pthread_mutex_lock(&_qmu);
+    if (_residencySets.count) sets = [_residencySets copy];
+    pthread_mutex_unlock(&_qmu);
+    if (!sets.count) return @[];
+    NSMutableArray *snaps = [NSMutableArray arrayWithCapacity:sets.count];
+    for (id<RDNA4ResidencySetInternal> rs in sets) {
+        id<RDNA4ResidencySnapshotInternal> snap = [rs rdna4CommittedSnapshot];
+        if (snap) [snaps addObject:snap];
+    }
+    return snaps;
+}
 - (id)commandBuffer {
     RDNA4LOGR("queue commandBuffer");
-    return [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:YES];
+    RDNA4CommandBuffer *cb = [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:YES];
+    [cb rdna4AttachQueueResidencySnapshots];
+    return cb;
 }
 - (id)commandBufferWithUnretainedReferences {
     RDNA4LOGR("queue commandBufferWithUnretainedReferences");
-    return [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:NO];
+    RDNA4CommandBuffer *cb = [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:NO];
+    [cb rdna4AttachQueueResidencySnapshots];
+    return cb;
 }
 - (id)commandBufferWithDescriptor:(id)d {
     (void)d; RDNA4LOGR("queue commandBufferWithDescriptor:");
-    return [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:YES];
+    RDNA4CommandBuffer *cb = [[RDNA4CommandBuffer alloc] initWithQueue:self retainedReferences:YES];
+    [cb rdna4AttachQueueResidencySnapshots];
+    return cb;
 }
 - (void)submitCommandBuffers:(id __unsafe_unretained const *)cbs count:(NSUInteger)n {
     RDNA4LOGR("queue submitCommandBuffers:count:%lu", (unsigned long)n);

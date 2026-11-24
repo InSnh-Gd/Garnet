@@ -138,6 +138,7 @@ static void rdna4_fence_wait_pending(void *ctx, int slices) {
 }
 // Stage 0b. -commit is stamped, logged, then handed to Metal's own implementation unchanged.
 - (void)commit {
+    [self rdna4AttachQueueResidencySnapshots];
     _tcommit = rdna4_now();
     [self rdna4DisplayCommit];
     if (rdna4cbl_on()) {
@@ -274,6 +275,8 @@ static void rdna4_fence_wait_pending(void *ctx, int slices) {
     pthread_mutex_init(&_smu, NULL);
     _cbid = atomic_fetch_add(&rdna4cb_ids, 1) + 1; rdna4cbl_start();
     _dslot = -1; _nq = q; _refs = [NSMutableArray array];
+    _residencySnapshots = [NSMutableArray array];
+    _residencyHeapResources = [NSMutableSet set];
     _segments = [NSMutableArray array];
     NSError *segmentError = nil;
     if (![self rdna4OpenSegment:&segmentError]) {
@@ -773,6 +776,53 @@ RDNA4_DNR(RDNA4CommandBuffer)
     }
     [self rdna4RetainEncoded:heap];
     for (id resource in [heap rdna4LiveResources]) if (![resource isAliasable]) [self rdna4RetainEncoded:resource];
+}
+- (void)rdna4AttachResidencySnapshot:(id)snapshot {
+    if (!snapshot || ![snapshot respondsToSelector:@selector(rdna4Allocations)]) return;
+    if (!_residencySnapshots) _residencySnapshots = [NSMutableArray array];
+    if (!_residencyHeapResources) _residencyHeapResources = [NSMutableSet set];
+    if ([_residencySnapshots indexOfObjectIdenticalTo:snapshot] == NSNotFound)
+        [_residencySnapshots addObject:snapshot];
+    for (id alloc in [(id<RDNA4ResidencySnapshotInternal>)snapshot rdna4Allocations]) {
+        if ([alloc isKindOfClass:[RDNA4Heap class]]) {
+            for (id resource in [(RDNA4Heap *)alloc rdna4LiveResources]) {
+                if (![resource isAliasable]) [_residencyHeapResources addObject:resource];
+            }
+        }
+    }
+}
+- (void)rdna4AttachQueueResidencySnapshots {
+    if (!_nq) return;
+    for (id snap in [_nq rdna4ResidencySetSnapshots])
+        [self rdna4AttachResidencySnapshot:snap];
+}
+- (void)useResidencySet:(id)residencySet {
+    if (_encErr || !residencySet) return;
+    if (![residencySet respondsToSelector:@selector(rdna4CommittedSnapshot)] ||
+        ![residencySet respondsToSelector:@selector(device)] ||
+        [residencySet device] != [self device]) {
+        [self rdna4Fail:@"useResidencySet has an invalid residency set or device"];
+        return;
+    }
+    [self rdna4AttachResidencySnapshot:[(id<RDNA4ResidencySetInternal>)residencySet rdna4CommittedSnapshot]];
+}
+- (void)useResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count {
+    if (_encErr || !count) return;
+    if (!residencySets) {
+        [self rdna4Fail:@"useResidencySets:count: has a NULL array"];
+        return;
+    }
+    for (NSUInteger i = 0; i < count; i++) [self useResidencySet:residencySets[i]];
+}
+- (NSSet *)rdna4ResidencyDeclaredResources {
+    [self rdna4AttachQueueResidencySnapshots];
+    if (!_residencySnapshots.count && !_residencyHeapResources.count) return [NSSet set];
+    NSMutableSet *out = [NSMutableSet set];
+    for (id<RDNA4ResidencySnapshotInternal> snap in _residencySnapshots) {
+        for (id obj in [snap rdna4Allocations]) [out addObject:obj];
+    }
+    for (id obj in _residencyHeapResources) [out addObject:obj];
+    return out;
 }
 - (void)rdna4Fail:(NSString *)why {
     RDNA4LOG("ENCODE ERROR (command buffer will complete with an error): %s", why.UTF8String);
@@ -1584,6 +1634,8 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
 - (void)rdna4PoolDone {
     [self rdna4UCRelease]; [self rdna4OccResolve]; if (_pser) rdna4_fence_close(_pser);
     [_refs removeAllObjects];
+    [_residencySnapshots removeAllObjects];
+    [_residencyHeapResources removeAllObjects];
     _ring = nil;
     _argumentTable = nil;
     _ringUsed = 0;
@@ -1770,9 +1822,19 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 size_t tableBytes = p->addressTableVersion == RDNA4_BUFFER_TABLE_VERSION ? sizeof addresses : sizeof addresses.address;
                 NSData *registry = nil;
                 if (p->addressTableVersion == RDNA4_BUFFER_REGISTRY_VERSION) {
+                    [self rdna4AttachQueueResidencySnapshots];
                     NSMutableSet *resources = [_bufferAddressResources mutableCopy] ?: [NSMutableSet set];
                     for (uint32_t j = 0; j < 31; ++j)
                         if (st->buf[j].b) [resources addObject:st->buf[j].b];
+                    for (id snap in _residencySnapshots) {
+                        if ([snap respondsToSelector:@selector(rdna4AddBuffersToSet:device:)])
+                            [(id<RDNA4ResidencySnapshotInternal>)snap rdna4AddBuffersToSet:resources device:dev];
+                    }
+                    for (id obj in _residencyHeapResources) {
+                        if ([obj isKindOfClass:[RDNA4Buffer class]] && [(RDNA4Buffer *)obj device] == dev &&
+                            ![obj isAliasable])
+                            [resources addObject:obj];
+                    }
                     if (!rdna4_buffer_registry_size(resources.count,
                             RDNA4R.lim.maxStorageBufferRange, &tableBytes)) {
                         [self rdna4Fail:@"buffer-address registry exceeds the backend buffer range or host allocation extent"];
