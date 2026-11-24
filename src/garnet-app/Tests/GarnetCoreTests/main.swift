@@ -849,6 +849,89 @@ struct GarnetCoreTestsRunner {
         try verifyCase("bad-increase-pci-bar", makeOCPlist(increasePciBar: true), mode: .mode16g, expectValid: false)
     }
 
+    static func runOpenCoreConfigureTests(tempRoot: URL) throws {
+        let fm = FileManager.default
+        let payloadDir = tempRoot.appendingPathComponent("dummy-oc-payload")
+        let compatSrc = payloadDir.appendingPathComponent("optional/GarnetPCIBarCompat.kext/Contents/MacOS")
+        try fm.createDirectory(at: compatSrc, withIntermediateDirectories: true)
+        try Data("<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>org.garnet.pcibarcompat</string></dict></plist>".utf8)
+            .write(to: payloadDir.appendingPathComponent("optional/GarnetPCIBarCompat.kext/Contents/Info.plist"))
+        try Data("dummy-pcibar".utf8).write(to: compatSrc.appendingPathComponent("GarnetPCIBarCompat"))
+
+        // 1. 16G directory auto-configure
+        let efi16 = tempRoot.appendingPathComponent("efi16")
+        let ocDir = efi16.appendingPathComponent("EFI/OC")
+        try fm.createDirectory(at: ocDir, withIntermediateDirectories: true)
+        let cfgURL = ocDir.appendingPathComponent("config.plist")
+        let initialPlist = makeOCPlist(
+            exts: [("Lilu.kext", true), ("VirtualSMC.kext", true), ("Garnet.kext", true)],
+            resizeApple: 0,
+            resizeUefi: 0,
+            increasePciBar: true,
+            secureBoot: "Default",
+            csrHex: "00000000",
+            bootArgs: "-v alcid=11 -radvesa npci=0x2000 rdna4-foo=1",
+            deleteKeys: []
+        )
+        try writePlist(initialPlist, to: cfgURL)
+        let origSHA = try PayloadVerifier.sha256Hex(fileURL: cfgURL)
+
+        let res16 = try OpenCoreValidator.configure(targetURL: efi16, mode: .mode16g, payloadURL: payloadDir)
+        let backupSHA = try PayloadVerifier.sha256Hex(fileURL: URL(fileURLWithPath: res16.backupPath))
+        check("OC configure 16g backup exists with original SHA", fm.fileExists(atPath: res16.backupPath) && backupSHA == origSHA)
+        check("OC configure 16g copied GarnetPCIBarCompat.kext", fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/GarnetPCIBarCompat.kext/Contents/MacOS/GarnetPCIBarCompat").path))
+        check("OC configure 16g valid with 0 warnings", res16.report.valid && res16.report.warnCount == 0)
+
+        let configuredData = try Data(contentsOf: cfgURL)
+        let configuredRoot = try PropertyListSerialization.propertyList(from: configuredData, options: [], format: nil) as? [String: Any] ?? [:]
+        let kernelAdd = ((configuredRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let compatEntries = kernelAdd.filter { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }
+        let garnetEntry = kernelAdd.first { (($0["BundlePath"] as? String) ?? "") == "Garnet.kext" }
+        let liluEnabled = (kernelAdd.first { (($0["BundlePath"] as? String) ?? "") == "Lilu.kext" }?["Enabled"] as? Bool) ?? false
+        let smcEnabled = (kernelAdd.first { (($0["BundlePath"] as? String) ?? "") == "VirtualSMC.kext" }?["Enabled"] as? Bool) ?? false
+        let nvramAdd = (((configuredRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any]) ?? [:]
+        let argsTokens = ((nvramAdd["boot-args"] as? String) ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        check(
+            "OC configure 16g preserves user flags/kexts and disables Garnet.kext",
+            compatEntries.count == 1 && liluEnabled && smcEnabled && ((garnetEntry?["Enabled"] as? Bool) == false)
+                && argsTokens.contains("-v") && argsTokens.contains("alcid=11")
+                && !argsTokens.contains("-radvesa") && !argsTokens.contains("npci=0x2000") && !argsTokens.contains("rdna4-foo=1")
+        )
+
+        // 2. Idempotency
+        let res16Again = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .mode16g, payloadURL: payloadDir)
+        let againRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgURL), options: [], format: nil) as? [String: Any] ?? [:]
+        let againAdd = ((againRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let againCompatCount = againAdd.filter { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }.count
+        let againArgs = ((((againRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any])?["boot-args"] as? String ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        check("OC configure 16g is idempotent", res16Again.report.valid && againCompatCount == 1 && Set(againArgs).count == againArgs.count)
+
+        // 3. Switch to 256 MiB Small-BAR
+        let resSmall = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .modeSmall, payloadURL: nil)
+        let smallRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgURL), options: [], format: nil) as? [String: Any] ?? [:]
+        let smallAdd = ((smallRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let smallCompatEnabled = (smallAdd.first { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }?["Enabled"] as? Bool) ?? true
+        let smallArgs = ((((smallRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any])?["boot-args"] as? String ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let smallResizeApple = ((smallRoot["Booter"] as? [String: Any])?["Quirks"] as? [String: Any])?["ResizeAppleGpuBars"] as? Int
+        let smallResizeUefi = ((smallRoot["UEFI"] as? [String: Any])?["Quirks"] as? [String: Any])?["ResizeGpuBars"] as? Int
+        check(
+            "OC configure switches cleanly to small-bar",
+            resSmall.report.valid && !smallCompatEnabled && !smallArgs.contains("garnet-full-bar=1")
+                && smallArgs.contains("npci=0x2000") && smallResizeApple == 0 && smallResizeUefi == 0
+        )
+
+        // 4. Symlink refusal
+        let symTarget = tempRoot.appendingPathComponent("real-target.plist")
+        try writePlist(makeOCPlist(), to: symTarget)
+        let targetPreSHA = try PayloadVerifier.sha256Hex(fileURL: symTarget)
+        let symLink = tempRoot.appendingPathComponent("link-config.plist")
+        try fm.createSymbolicLink(at: symLink, withDestinationURL: symTarget)
+        var refusedSym = false
+        do { _ = try OpenCoreValidator.configure(targetURL: symLink, mode: .mode16g, payloadURL: payloadDir) } catch { refusedSym = true }
+        let targetPostSHA = try PayloadVerifier.sha256Hex(fileURL: symTarget)
+        check("OC configure refuses symlink and leaves target untouched", refusedSym && targetPreSHA == targetPostSHA)
+    }
+
     static func runDenylistInstallerDiagTests(tempRoot: URL) throws {
         let fm = FileManager.default
         let sysRoot = tempRoot.appendingPathComponent("sysroot")
@@ -1009,6 +1092,7 @@ struct GarnetCoreTestsRunner {
             runPCIBarCompatTests()
             try runMachOAndPreflightTests(tempRoot: tempRoot)
             try runOpenCoreValidatorTests(tempRoot: tempRoot)
+            try runOpenCoreConfigureTests(tempRoot: tempRoot)
             try runDenylistInstallerDiagTests(tempRoot: tempRoot)
             try runOptionalReal25G332Checks()
         } catch {

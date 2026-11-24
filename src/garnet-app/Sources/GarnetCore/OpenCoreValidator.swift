@@ -27,6 +27,24 @@ public struct OpenCoreReport: Codable, Equatable, Sendable {
     public let readOnlyVerified: Bool
 }
 
+public enum OpenCoreConfigureError: Error, CustomStringConvertible {
+    case failed(String)
+
+    public var description: String {
+        switch self {
+        case .failed(let message): return message
+        }
+    }
+}
+
+public struct OpenCoreConfigureResult: Codable, Equatable, Sendable {
+    public let configPath: String
+    public let backupPath: String
+    public let kextInstalledPath: String?
+    public let mode: OpenCoreMode
+    public let report: OpenCoreReport
+}
+
 public enum OpenCoreValidator {
     public static let nvramBootGUID = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
 
@@ -276,6 +294,234 @@ public enum OpenCoreValidator {
             findings: findings,
             readOnlyVerified: true
         )
+    }
+
+    /// Resolve a user-selected EFI/OC directory or config.plist file without touching symlinks.
+    public static func resolveConfigURL(from targetURL: URL) throws -> URL {
+        let std = targetURL.standardizedFileURL
+        try rejectSymlink(at: std)
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: std.path, isDirectory: &isDir) else {
+            throw OpenCoreConfigureError.failed("Path does not exist: \(std.path)")
+        }
+
+        let configURL: URL
+        if isDir.boolValue {
+            let candidates = [
+                std.appendingPathComponent("config.plist"),
+                std.appendingPathComponent("OC/config.plist"),
+                std.appendingPathComponent("EFI/OC/config.plist")
+            ]
+            guard let found = candidates.first(where: { candidate in
+                var subIsDir: ObjCBool = false
+                return FileManager.default.fileExists(atPath: candidate.path, isDirectory: &subIsDir) && !subIsDir.boolValue
+            }) else {
+                throw OpenCoreConfigureError.failed("Could not find config.plist, OC/config.plist, or EFI/OC/config.plist under \(std.path)")
+            }
+            configURL = found
+        } else {
+            configURL = std
+        }
+
+        try rejectSymlink(at: configURL)
+        return configURL
+    }
+
+    /// Back up config.plist, export GarnetPCIBarCompat.kext (16G mode), apply Garnet OpenCore settings, and verify.
+    public static func configure(targetURL: URL, mode: OpenCoreMode, payloadURL: URL?) throws -> OpenCoreConfigureResult {
+        let configURL = try resolveConfigURL(from: targetURL)
+        let rawData = try Data(contentsOf: configURL)
+        let plistAny = try PropertyListSerialization.propertyList(from: rawData, options: [], format: nil)
+        guard var root = plistAny as? [String: Any] else {
+            throw OpenCoreConfigureError.failed("Root object of \(configURL.path) must be a dictionary")
+        }
+
+        if mode == .mode16g && payloadURL == nil {
+            throw OpenCoreConfigureError.failed("16 GiB Full-BAR mode requires a valid payload to copy GarnetPCIBarCompat.kext")
+        }
+
+        let backupURL = try writeTimestampedBackup(rawData: rawData, nextTo: configURL)
+
+        var kextInstalledPath: String?
+        if mode == .mode16g, let payloadURL {
+            let kextsDir = configURL.deletingLastPathComponent().appendingPathComponent("Kexts")
+            try rejectSymlink(at: kextsDir)
+            let dst = try SystemDiskInstaller.exportPCIBarCompat(fromPayload: payloadURL, toDestination: kextsDir)
+            kextInstalledPath = dst.path
+        }
+
+        applyKernelSettings(to: &root, mode: mode)
+        applyQuirks(to: &root, mode: mode)
+        applySecurityAndNVRAM(to: &root, mode: mode)
+
+        let newData = try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+        try newData.write(to: configURL, options: .atomic)
+
+        let report = try validate(configURL: configURL, mode: mode)
+        guard report.valid else {
+            try? rawData.write(to: configURL, options: .atomic)
+            let issues = report.findings.filter { $0.severity == .error }.map { "\($0.keyPath): \($0.message)" }.joined(separator: "; ")
+            throw OpenCoreConfigureError.failed("Post-write validation failed (restored original config.plist): \(issues)")
+        }
+
+        return OpenCoreConfigureResult(
+            configPath: configURL.path,
+            backupPath: backupURL.path,
+            kextInstalledPath: kextInstalledPath,
+            mode: mode,
+            report: report
+        )
+    }
+
+    private static func rejectSymlink(at url: URL) throws {
+        var st = stat()
+        if lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK {
+            throw OpenCoreConfigureError.failed("Refusing symbolic link path: \(url.path)")
+        }
+    }
+
+    private static func writeTimestampedBackup(rawData: Data, nextTo configURL: URL) throws -> URL {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        let baseName = "\(configURL.lastPathComponent).garnet-backup-\(df.string(from: Date()))"
+        let dir = configURL.deletingLastPathComponent()
+
+        var backupURL = dir.appendingPathComponent(baseName)
+        var suffix = 1
+        while FileManager.default.fileExists(atPath: backupURL.path) {
+            backupURL = dir.appendingPathComponent("\(baseName)-\(suffix)")
+            suffix += 1
+        }
+        try rawData.write(to: backupURL, options: .atomic)
+        return backupURL
+    }
+
+    private static func applyKernelSettings(to root: inout [String: Any], mode: OpenCoreMode) {
+        var kernel = (root["Kernel"] as? [String: Any]) ?? [:]
+        var kernelAdd = (kernel["Add"] as? [[String: Any]]) ?? []
+        var foundCompat = false
+
+        for idx in kernelAdd.indices {
+            let bundlePath = (kernelAdd[idx]["BundlePath"] as? String) ?? ""
+            let baseName = (bundlePath as NSString).lastPathComponent
+
+            if forbiddenSystemKexts.contains(where: { baseName == $0.pattern }) || baseName.hasPrefix("Navi48") {
+                kernelAdd[idx]["Enabled"] = false
+            }
+
+            if baseName == "GarnetPCIBarCompat.kext" {
+                switch mode {
+                case .mode16g:
+                    if !foundCompat {
+                        kernelAdd[idx]["BundlePath"] = "GarnetPCIBarCompat.kext"
+                        kernelAdd[idx]["Enabled"] = true
+                        kernelAdd[idx]["ExecutablePath"] = "Contents/MacOS/GarnetPCIBarCompat"
+                        kernelAdd[idx]["PlistPath"] = "Contents/Info.plist"
+                        if (kernelAdd[idx]["MinKernel"] as? String ?? "").isEmpty {
+                            kernelAdd[idx]["MinKernel"] = "25.0.0"
+                        }
+                        foundCompat = true
+                    } else {
+                        kernelAdd[idx]["Enabled"] = false
+                    }
+                case .modeSmall:
+                    kernelAdd[idx]["Enabled"] = false
+                }
+            }
+        }
+
+        if mode == .mode16g && !foundCompat {
+            kernelAdd.append([
+                "Arch": "x86_64",
+                "BundlePath": "GarnetPCIBarCompat.kext",
+                "Comment": "Garnet 16 GiB Full-BAR compatibility",
+                "Enabled": true,
+                "ExecutablePath": "Contents/MacOS/GarnetPCIBarCompat",
+                "MaxKernel": "",
+                "MinKernel": "25.0.0",
+                "PlistPath": "Contents/Info.plist"
+            ])
+        }
+
+        var quirks = (kernel["Quirks"] as? [String: Any]) ?? [:]
+        quirks["IncreasePciBarSize"] = false
+        kernel["Add"] = kernelAdd
+        kernel["Quirks"] = quirks
+        root["Kernel"] = kernel
+    }
+
+    private static func applyQuirks(to root: inout [String: Any], mode: OpenCoreMode) {
+        let wantResize = (mode == .mode16g) ? -1 : 0
+
+        var booter = (root["Booter"] as? [String: Any]) ?? [:]
+        var booterQuirks = (booter["Quirks"] as? [String: Any]) ?? [:]
+        booterQuirks["ResizeAppleGpuBars"] = wantResize
+        booter["Quirks"] = booterQuirks
+        root["Booter"] = booter
+
+        var uefi = (root["UEFI"] as? [String: Any]) ?? [:]
+        var uefiQuirks = (uefi["Quirks"] as? [String: Any]) ?? [:]
+        uefiQuirks["ResizeGpuBars"] = wantResize
+        uefi["Quirks"] = uefiQuirks
+        root["UEFI"] = uefi
+    }
+
+    private static func applySecurityAndNVRAM(to root: inout [String: Any], mode: OpenCoreMode) {
+        var misc = (root["Misc"] as? [String: Any]) ?? [:]
+        var security = (misc["Security"] as? [String: Any]) ?? [:]
+        security["SecureBootModel"] = "Disabled"
+        misc["Security"] = security
+        root["Misc"] = misc
+
+        var nvram = (root["NVRAM"] as? [String: Any]) ?? [:]
+        var nvramAdd = (nvram["Add"] as? [String: Any]) ?? [:]
+        var bootDict = (nvramAdd[nvramBootGUID] as? [String: Any]) ?? [:]
+
+        bootDict["csr-active-config"] = Data([0x03, 0x08, 0x00, 0x00])
+        let existingArgs = (bootDict["boot-args"] as? String) ?? ""
+        bootDict["boot-args"] = updatedBootArgs(from: existingArgs, mode: mode)
+        nvramAdd[nvramBootGUID] = bootDict
+        nvram["Add"] = nvramAdd
+
+        var nvramDelete = (nvram["Delete"] as? [String: Any]) ?? [:]
+        var deleteKeys = (nvramDelete[nvramBootGUID] as? [String]) ?? []
+        for key in ["boot-args", "csr-active-config"] where !deleteKeys.contains(key) {
+            deleteKeys.append(key)
+        }
+        nvramDelete[nvramBootGUID] = deleteKeys
+        nvram["Delete"] = nvramDelete
+        root["NVRAM"] = nvram
+    }
+
+    private static func updatedBootArgs(from existing: String, mode: OpenCoreMode) -> String {
+        let managedPrefixes = [
+            "garnet=", "garnet-interrupts=", "garnet-stage=", "garnet-native=",
+            "garnet-metal=", "garnet-metal-disp=", "garnet-metal-ws=", "garnet-multisession=",
+            "garnet-apps=", "garnet-apps-all=", "garnet-full-bar=", "garnet-aux=",
+            "garnet-rebar-compat=", "amfi=", "rdna4-", "rdna4bringup", "navi48-", "navi48bringup"
+        ]
+        var kept: [String] = []
+        for raw in existing.split(whereSeparator: { $0.isWhitespace }) {
+            let tok = String(raw)
+            if tok == "-radvesa" { continue }
+            if mode == .mode16g && (tok == "npci=0x2000" || tok == "npci=0x3000") { continue }
+            if managedPrefixes.contains(where: { tok.hasPrefix($0) }) { continue }
+            kept.append(tok)
+        }
+
+        kept.append(contentsOf: requiredBootArgs)
+        kept.append("garnet-apps-all=1")
+        switch mode {
+        case .mode16g:
+            kept.append("garnet-full-bar=1")
+        case .modeSmall:
+            if !kept.contains("npci=0x2000") && !kept.contains("npci=0x3000") {
+                kept.append("npci=0x2000")
+            }
+        }
+        return kept.joined(separator: " ")
     }
 
     public static func sampleConfigSnippet(mode: OpenCoreMode) -> String {
