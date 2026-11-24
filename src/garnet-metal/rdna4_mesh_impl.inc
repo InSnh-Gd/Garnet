@@ -1193,6 +1193,25 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
 
     // Reflect SPIR-V descriptors for Object, Mesh, and Fragment stages.
     NSData *fsp = _hasFrag ? rdna4_spv_set(fsd, 1u) : nil;
+    if (_hasFrag) {
+        uint64_t perPrimMask = (_meshRefl.has_mesh ? _meshRefl.mesh.primitive_out_mask : 0u) |
+                               meshSpvInfo.per_prim_out_mask;
+        if (perPrimMask != 0u) {
+            uint32_t *patched = NULL;
+            size_t patchedWords = 0u;
+            rdna4mesh_status_t pst = rdna4_mesh_patch_frag_per_primitive(
+                (const uint32_t *)fsp.bytes, fsp.length / 4u, perPrimMask,
+                &patched, &patchedWords);
+            if (pst != RDNA4MESH_OK) {
+                if (err) *err = rdna4_err(52, [NSString stringWithFormat:@"fragment SPIR-V PerPrimitiveEXT pairing patch failed: %s",
+                                               rdna4mesh_status_str(pst)]);
+                return nil;
+            }
+            if (patched) {
+                fsp = [NSData dataWithBytesNoCopy:patched length:patchedWords * 4u freeWhenDone:YES];
+            }
+        }
+    }
     RDNA4sRefl *ro = _hasObject ? calloc(1, sizeof *ro) : NULL;
     RDNA4sRefl *rm = calloc(1, sizeof *rm);
     RDNA4sRefl *rf = _hasFrag ? calloc(1, sizeof *rf) : NULL;

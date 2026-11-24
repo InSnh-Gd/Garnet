@@ -539,7 +539,7 @@ int main(int argc, char **argv) {
         // -----------------------------------------------------------------------------------------
         // Test 5: Footnote 10 positive — MTLLinkedFunctions.privateFunctions IS ALLOWED in mesh PSO
         // -----------------------------------------------------------------------------------------
-        {
+        if (@available(macOS 14.0, *)) {
             MTLMeshRenderPipelineDescriptor *dp = [MTLMeshRenderPipelineDescriptor new];
             dp.meshFunction = fnMeshPriv;
             dp.fragmentFunction = fnFrag;
@@ -573,28 +573,31 @@ int main(int argc, char **argv) {
         // Test 6: Negative checks (Footnote 10 fn-ptr refusal, >16 KiB payload, grid limit, indirect OOB)
         // -----------------------------------------------------------------------------------------
         if (!reference) {
-            // 6a. Footnote 10: meshLinkedFunctions.functions (public render fn ptrs) rejected.
-            MTLMeshRenderPipelineDescriptor *badFn10 = [MTLMeshRenderPipelineDescriptor new];
-            badFn10.meshFunction = fnMeshOnly;
-            badFn10.fragmentFunction = fnFrag;
-            MTLLinkedFunctions *badLf = [MTLLinkedFunctions linkedFunctions];
-            badLf.functions = @[ fnHelper ];
-            badFn10.meshLinkedFunctions = badLf;
-            badFn10.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
             NSError *ne = nil;
-            id<MTLRenderPipelineState> badPso =
-                [dev newRenderPipelineStateWithMeshDescriptor:badFn10 options:0 reflection:nil error:&ne];
-            require(badPso == nil && ne != nil, @"Footnote 10: meshLinkedFunctions.functions must fail");
+            id<MTLRenderPipelineState> badPso = nil;
+            if (@available(macOS 14.0, *)) {
+                // 6a. Footnote 10: meshLinkedFunctions.functions (public render fn ptrs) rejected.
+                MTLMeshRenderPipelineDescriptor *badFn10 = [MTLMeshRenderPipelineDescriptor new];
+                badFn10.meshFunction = fnMeshOnly;
+                badFn10.fragmentFunction = fnFrag;
+                MTLLinkedFunctions *badLf = [MTLLinkedFunctions linkedFunctions];
+                badLf.functions = @[ fnHelper ];
+                badFn10.meshLinkedFunctions = badLf;
+                badFn10.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                ne = nil;
+                badPso = [dev newRenderPipelineStateWithMeshDescriptor:badFn10 options:0 reflection:nil error:&ne];
+                require(badPso == nil && ne != nil, @"Footnote 10: meshLinkedFunctions.functions must fail");
 
-            // 6b. Footnote 10: fragmentLinkedFunctions.functions rejected on mesh PSO.
-            MTLMeshRenderPipelineDescriptor *badFragFn10 = [MTLMeshRenderPipelineDescriptor new];
-            badFragFn10.meshFunction = fnMeshOnly;
-            badFragFn10.fragmentFunction = fnFrag;
-            badFragFn10.fragmentLinkedFunctions = badLf;
-            badFragFn10.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-            ne = nil;
-            badPso = [dev newRenderPipelineStateWithMeshDescriptor:badFragFn10 options:0 reflection:nil error:&ne];
-            require(badPso == nil && ne != nil, @"Footnote 10: fragmentLinkedFunctions.functions must fail");
+                // 6b. Footnote 10: fragmentLinkedFunctions.functions rejected on mesh PSO.
+                MTLMeshRenderPipelineDescriptor *badFragFn10 = [MTLMeshRenderPipelineDescriptor new];
+                badFragFn10.meshFunction = fnMeshOnly;
+                badFragFn10.fragmentFunction = fnFrag;
+                badFragFn10.fragmentLinkedFunctions = badLf;
+                badFragFn10.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                ne = nil;
+                badPso = [dev newRenderPipelineStateWithMeshDescriptor:badFragFn10 options:0 reflection:nil error:&ne];
+                require(badPso == nil && ne != nil, @"Footnote 10: fragmentLinkedFunctions.functions must fail");
+            }
 
             // 6c. Payload > 16,384 bytes rejected.
             MTLMeshRenderPipelineDescriptor *badPay = [MTLMeshRenderPipelineDescriptor new];

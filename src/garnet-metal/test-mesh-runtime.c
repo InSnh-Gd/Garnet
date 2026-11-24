@@ -5,7 +5,25 @@
 //   gcc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Wshadow -Wsign-conversion -Werror -Isrc/garnet-metal src/garnet-metal/test-mesh-runtime.c -o "$TMPDIR/test-mesh-runtime-gcc"
 // Compile & run (Clang ASan+UBSan -Werror):
 //   clang -std=c11 -D_GNU_SOURCE -fsanitize=address,undefined -Wall -Wextra -Wshadow -Wsign-conversion -Werror -Isrc/garnet-metal src/garnet-metal/test-mesh-runtime.c -o "$TMPDIR/test-mesh-runtime-clang"
+#if defined(__has_include)
+#if __has_include(<vulkan/vulkan.h>)
+#define RDNA4_TEST_HAS_VULKAN 1
+#include <vulkan/vulkan.h>
+#endif
+#endif
+
 #include "rdna4_mesh.h"
+
+#ifdef RDNA4_TEST_HAS_VULKAN
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+#endif
+#include "rdna4_spvrefl.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -493,11 +511,24 @@ static void test_spv_inspector_and_stage_linkage(void) {
     CHECK(rdna4mesh_validate_stage_linkage(RDNA4MESH_MODE_EMULATED_OBJECT_MESH, &caps_emul, &desc,
                                            &orefl, &comp_info, &mrefl, &mesh_info, &frefl, &frag_info,
                                            &linked, &why) == RDNA4MESH_ERR_STAGE_LINKAGE);
-    // Fragment per-vertex input conflicting with mesh per-primitive-only output rejected.
+    // Standalone Apple AIR fragment input (per_primitive == 0) at mesh primitive-only location is
+    // allowed so pipeline creation reaches rdna4_mesh_patch_frag_per_primitive().
     frefl.varyings[1] = (rdna4mesh_varying_t){ 1u, 0 };
     CHECK(rdna4mesh_validate_stage_linkage(RDNA4MESH_MODE_EMULATED_OBJECT_MESH, &caps_emul, &desc,
                                            &orefl, &comp_info, &mrefl, &mesh_info, &frefl, &frag_info,
+                                           &linked, &why) == RDNA4MESH_OK);
+    // Overlapping mesh per-vertex and PerPrimitiveEXT output locations rejected.
+    mrefl.mesh.vertex_out_mask |= (UINT64_C(1) << 1);
+    CHECK(rdna4mesh_validate_stage_linkage(RDNA4MESH_MODE_EMULATED_OBJECT_MESH, &caps_emul, &desc,
+                                           &orefl, &comp_info, &mrefl, &mesh_info, &frefl, &frag_info,
                                            &linked, &why) == RDNA4MESH_ERR_STAGE_LINKAGE);
+    mrefl.mesh.vertex_out_mask = UINT64_C(1) << 0;
+    // Also reject overlap between mesh SPIR-V per_prim_out_mask and reflection vertex_out_mask.
+    mesh_info.per_prim_out_mask = UINT64_C(1) << 0;
+    CHECK(rdna4mesh_validate_stage_linkage(RDNA4MESH_MODE_EMULATED_OBJECT_MESH, &caps_emul, &desc,
+                                           &orefl, &comp_info, &mrefl, &mesh_info, &frefl, &frag_info,
+                                           &linked, &why) == RDNA4MESH_ERR_STAGE_LINKAGE);
+    mesh_info.per_prim_out_mask = 0u;
     frefl.varyings[1] = (rdna4mesh_varying_t){ 1u, 1 };
 
     // Descriptor payloadMemoryLength smaller than shader payload_size rejected.
@@ -625,6 +656,341 @@ static void test_emulated_scratch_planner(void) {
           RDNA4MESH_ERR_BOUNDS);
 }
 
+static size_t spv_push_str(uint32_t *buf, size_t n, const char *s) {
+    size_t len = strlen(s) + 1u;
+    size_t words = (len + 3u) / 4u;
+    for (size_t i = 0u; i < words; i++) {
+        uint32_t w = 0u;
+        for (size_t b = 0u; b < 4u; b++) {
+            size_t idx = i * 4u + b;
+            uint32_t ch = idx < len ? (uint32_t)(unsigned char)s[idx] : 0u;
+            w |= ch << (b * 8u);
+        }
+        buf[n++] = w;
+    }
+    return n;
+}
+
+static size_t build_frag_spv(uint32_t *buf, size_t cap,
+                             uint32_t spv_version,
+                             int with_mesh_cap,
+                             int with_other_ext,
+                             int with_mesh_ext,
+                             int loc1_has_per_prim) {
+    size_t n = 0u;
+    CHECK(cap >= 192u);
+    buf[n++] = RDNA4MESH_SPV_MAGIC;
+    buf[n++] = spv_version;
+    buf[n++] = 0u;
+    buf[n++] = 17u; // id_bound (IDs 1..16)
+    buf[n++] = 0u;
+
+    // Section 1: Capabilities
+    buf[n++] = (2u << 16) | 17u; // OpCapability Shader
+    buf[n++] = 1u;
+    if (with_mesh_cap) {
+        buf[n++] = (2u << 16) | 17u;
+        buf[n++] = RDNA4MESH_SPV_CAP_MESH_SHADING;
+    }
+
+    // Section 2: Extensions
+    if (with_other_ext) {
+        size_t start = n++;
+        n = spv_push_str(buf, n, "SPV_KHR_storage_buffer_storage_class");
+        buf[start] = ((uint32_t)(n - start) << 16) | 10u;
+    }
+    if (with_mesh_ext) {
+        size_t start = n++;
+        n = spv_push_str(buf, n, "SPV_EXT_mesh_shader");
+        buf[start] = ((uint32_t)(n - start) << 16) | 10u;
+    }
+
+    // Section 4: MemoryModel Logical GLSL450
+    buf[n++] = (3u << 16) | 14u;
+    buf[n++] = 0u;
+    buf[n++] = 1u;
+
+    // Section 5: OpEntryPoint Fragment %2 "frag_per_prim" %10 %11 %12 %13 %14 %15
+    {
+        size_t start = n++;
+        buf[n++] = RDNA4MESH_SPV_EM_FRAGMENT;
+        buf[n++] = 2u;
+        n = spv_push_str(buf, n, "frag_per_prim");
+        buf[n++] = 10u;
+        buf[n++] = 11u;
+        buf[n++] = 12u;
+        buf[n++] = 13u;
+        buf[n++] = 14u;
+        buf[n++] = 15u;
+        buf[start] = ((uint32_t)(n - start) << 16) | 15u;
+    }
+
+    // Section 6: OpExecutionMode %2 OriginUpperLeft (7)
+    buf[n++] = (3u << 16) | 16u;
+    buf[n++] = 2u;
+    buf[n++] = 7u;
+
+    // Section 8: Annotations
+    // %10: Input Location 0 (per-vertex)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 10u; buf[n++] = RDNA4MESH_SPV_DEC_LOCATION; buf[n++] = 0u;
+    // %11: Input Location 1 + Flat (paired with mesh primitive output)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 11u; buf[n++] = RDNA4MESH_SPV_DEC_LOCATION; buf[n++] = 1u;
+    buf[n++] = (3u << 16) | 71u; buf[n++] = 11u; buf[n++] = RDNA4MESH_SPV_DEC_FLAT;
+    if (loc1_has_per_prim) {
+        buf[n++] = (3u << 16) | 71u; buf[n++] = 11u; buf[n++] = RDNA4MESH_SPV_DEC_PER_PRIMITIVE;
+    }
+    // %12: Input Location 3 + Flat (second primitive output)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 12u; buf[n++] = RDNA4MESH_SPV_DEC_LOCATION; buf[n++] = 3u;
+    buf[n++] = (3u << 16) | 71u; buf[n++] = 12u; buf[n++] = RDNA4MESH_SPV_DEC_FLAT;
+    // %13: Input BuiltIn FragCoord (15)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 13u; buf[n++] = RDNA4MESH_SPV_DEC_BUILTIN; buf[n++] = 15u;
+    // %14: Output Location 0 (color attachment 0)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 14u; buf[n++] = RDNA4MESH_SPV_DEC_LOCATION; buf[n++] = 0u;
+    // %15: Output Location 1 (color attachment 1 - same Location 1 as %11, must NEVER get PerPrimitiveEXT)
+    buf[n++] = (4u << 16) | 71u; buf[n++] = 15u; buf[n++] = RDNA4MESH_SPV_DEC_LOCATION; buf[n++] = 1u;
+
+    // Section 9: Types & Global Variables
+    buf[n++] = (2u << 16) | 19u; buf[n++] = 3u;                              // OpTypeVoid %3
+    buf[n++] = (3u << 16) | 33u; buf[n++] = 4u; buf[n++] = 3u;               // OpTypeFunction %4 %3
+    buf[n++] = (3u << 16) | 22u; buf[n++] = 5u; buf[n++] = 32u;              // OpTypeFloat %5 32
+    buf[n++] = (4u << 16) | 23u; buf[n++] = 6u; buf[n++] = 5u; buf[n++] = 4u;// OpTypeVector %6 %5 4
+    buf[n++] = (4u << 16) | 32u; buf[n++] = 7u; buf[n++] = RDNA4MESH_SPV_SC_INPUT;  buf[n++] = 6u;
+    buf[n++] = (4u << 16) | 32u; buf[n++] = 8u; buf[n++] = RDNA4MESH_SPV_SC_OUTPUT; buf[n++] = 6u;
+
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 7u; buf[n++] = 10u; buf[n++] = RDNA4MESH_SPV_SC_INPUT;
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 7u; buf[n++] = 11u; buf[n++] = RDNA4MESH_SPV_SC_INPUT;
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 7u; buf[n++] = 12u; buf[n++] = RDNA4MESH_SPV_SC_INPUT;
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 7u; buf[n++] = 13u; buf[n++] = RDNA4MESH_SPV_SC_INPUT;
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 8u; buf[n++] = 14u; buf[n++] = RDNA4MESH_SPV_SC_OUTPUT;
+    buf[n++] = (4u << 16) | 59u; buf[n++] = 8u; buf[n++] = 15u; buf[n++] = RDNA4MESH_SPV_SC_OUTPUT;
+
+    // Section 10: Function definition
+    buf[n++] = (5u << 16) | 54u; buf[n++] = 3u; buf[n++] = 2u; buf[n++] = 0u; buf[n++] = 4u; // OpFunction
+    buf[n++] = (2u << 16) | 248u; buf[n++] = 16u;                                            // OpLabel %16
+    buf[n++] = (1u << 16) | 253u;                                                            // OpReturn
+    buf[n++] = (1u << 16) | 56u;                                                             // OpFunctionEnd
+
+    CHECK(n <= cap);
+    return n;
+}
+
+typedef struct {
+    unsigned mesh_caps;
+    unsigned mesh_exts;
+    unsigned other_exts;
+    unsigned flat_on[17];
+    unsigned per_prim_on[17];
+} frag_patch_audit_t;
+
+static void verify_patched_frag_spv(const uint32_t *w, size_t nw,
+                                    uint32_t expected_bound,
+                                    frag_patch_audit_t *audit) {
+    memset(audit, 0, sizeof *audit);
+    CHECK(w != NULL && nw >= 5u);
+    CHECK(w[0] == RDNA4MESH_SPV_MAGIC);
+    CHECK(w[3] == expected_bound);
+
+    unsigned section = 0u;
+    for (size_t p = 5u; p < nw;) {
+        uint32_t op = w[p] & 0xFFFFu;
+        uint32_t wc = w[p] >> 16;
+        CHECK(wc > 0u && (size_t)wc <= nw - p);
+        const uint32_t *a = w + p + 1u;
+
+        unsigned cur_sec = section;
+        if (op == 17u) cur_sec = 1u;
+        else if (op == 10u) cur_sec = 2u;
+        else if (op == 11u || op == 14u || op == 15u || op == 16u) cur_sec = 3u;
+        else if (rdna4mesh_spv_is_annotation_op(op)) cur_sec = 4u;
+        else if (op == 54u || op == 56u || op == 248u || op == 253u) cur_sec = 6u;
+        else cur_sec = 5u;
+        CHECK(cur_sec >= section);
+        section = cur_sec;
+
+        if (op == 17u && wc == 2u && a[0] == RDNA4MESH_SPV_CAP_MESH_SHADING) {
+            audit->mesh_caps++;
+        } else if (op == 10u && wc >= 2u) {
+            char name[64];
+            size_t len = 0u;
+            for (uint32_t wi = 0u; wi < wc - 1u && len + 1u < sizeof name; wi++) {
+                uint32_t word = a[wi];
+                for (unsigned b = 0u; b < 4u && len + 1u < sizeof name; b++) {
+                    char ch = (char)((word >> (b * 8u)) & 0xFFu);
+                    if (!ch) { wi = wc; break; }
+                    name[len++] = ch;
+                }
+            }
+            name[len] = '\0';
+            if (strcmp(name, "SPV_EXT_mesh_shader") == 0) audit->mesh_exts++;
+            else if (strcmp(name, "SPV_KHR_storage_buffer_storage_class") == 0) audit->other_exts++;
+        } else if (op == 71u && wc >= 3u && a[0] < 17u) {
+            if (a[1] == RDNA4MESH_SPV_DEC_PER_PRIMITIVE) audit->per_prim_on[a[0]]++;
+            else if (a[1] == RDNA4MESH_SPV_DEC_FLAT) audit->flat_on[a[0]]++;
+        }
+        p += (size_t)wc;
+    }
+
+#ifdef RDNA4_TEST_HAS_VULKAN
+    RDNA4sMod mod;
+    RDNA4sRefl refl;
+    char why[256] = "";
+    CHECK(rdna4s_parse(w, nw, &mod, why, sizeof why) == 0);
+    CHECK(mod.bound == expected_bound);
+    CHECK(mod.has_ep && mod.ep_model == RDNA4MESH_SPV_EM_FRAGMENT);
+    CHECK(strcmp(mod.ep_name, "frag_per_prim") == 0);
+    CHECK(mod.id[10].loc == 0 && mod.id[11].loc == 1 && mod.id[12].loc == 3);
+    CHECK(mod.id[13].builtin == 15);
+    CHECK(rdna4s_reflect(&mod, 1, &refl) == 0);
+    CHECK(refl.nout == 2 && refl.outmask == 0x3u);
+    rdna4s_free(&mod);
+#endif
+}
+
+static void test_frag_per_primitive_patcher(void) {
+    uint32_t spv[192];
+    size_t nw = build_frag_spv(spv, 192u, 0x00010300u, 0, 0, 0, 0);
+    uint32_t *out = NULL;
+    size_t out_nw = 0u;
+    frag_patch_audit_t audit;
+    rdna4mesh_spv_info_t info;
+
+    // 1. No-op when per_prim_loc_mask == 0.
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, 0u, &out, &out_nw) == RDNA4MESH_OK);
+    CHECK(out == NULL && out_nw == 0u);
+
+    // 2. No-op when mask targets locations not read as fragment Inputs.
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, (UINT64_C(1) << 2) | (UINT64_C(1) << 7),
+                                              &out, &out_nw) == RDNA4MESH_OK);
+    CHECK(out == NULL && out_nw == 0u);
+
+    // 3. Single PerPrimitiveEXT injection at Location 1 (SPIR-V 1.3 -> 1.4, Flat preserved, Output %15 untouched).
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_OK);
+    CHECK(out != NULL && out_nw == nw + 11u); // +2 cap + 6 ext + 3 dec
+    CHECK(out[1] == RDNA4MESH_SPV_VERSION_1_4);
+    verify_patched_frag_spv(out, out_nw, 17u, &audit);
+    CHECK(audit.mesh_caps == 1u && audit.mesh_exts == 1u && audit.other_exts == 0u);
+    CHECK(audit.per_prim_on[11] == 1u && audit.flat_on[11] == 1u);
+    CHECK(audit.per_prim_on[10] == 0u && audit.per_prim_on[12] == 0u &&
+          audit.per_prim_on[13] == 0u && audit.per_prim_on[14] == 0u && audit.per_prim_on[15] == 0u);
+    CHECK(rdna4mesh_inspect_spv(out, out_nw, &info) == RDNA4MESH_OK);
+    CHECK(info.has_mesh_shading_cap && info.has_mesh_shading_ext);
+    CHECK(info.per_prim_in_mask == (UINT64_C(1) << 1) && info.per_prim_out_mask == 0u);
+
+    // 4. Idempotence: re-patching already-patched SPIR-V with same mask is a no-op.
+    uint32_t *out2 = NULL;
+    size_t out2_nw = 0u;
+    CHECK(rdna4_mesh_patch_frag_per_primitive(out, out_nw, UINT64_C(1) << 1, &out2, &out2_nw) == RDNA4MESH_OK);
+    CHECK(out2 == NULL && out2_nw == 0u);
+
+    // 5. Incremental injection: cap+ext+loc1 already present -> adds ONLY +3 words for loc3.
+    CHECK(rdna4_mesh_patch_frag_per_primitive(out, out_nw, (UINT64_C(1) << 1) | (UINT64_C(1) << 3),
+                                              &out2, &out2_nw) == RDNA4MESH_OK);
+    CHECK(out2 != NULL && out2_nw == out_nw + 3u);
+    verify_patched_frag_spv(out2, out2_nw, 17u, &audit);
+    CHECK(audit.mesh_caps == 1u && audit.mesh_exts == 1u);
+    CHECK(audit.per_prim_on[11] == 1u && audit.per_prim_on[12] == 1u);
+    CHECK(audit.per_prim_on[10] == 0u && audit.per_prim_on[15] == 0u);
+    CHECK(rdna4mesh_inspect_spv(out2, out2_nw, &info) == RDNA4MESH_OK);
+    CHECK(info.per_prim_in_mask == ((UINT64_C(1) << 1) | (UINT64_C(1) << 3)));
+    free(out2);
+    free(out);
+    out = out2 = NULL;
+
+    // 6. Multi-location injection on SPIR-V 1.5 preserving version and pre-existing OpExtension.
+    nw = build_frag_spv(spv, 192u, 0x00010500u, 0, 1, 0, 0);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, (UINT64_C(1) << 1) | (UINT64_C(1) << 3),
+                                              &out, &out_nw) == RDNA4MESH_OK);
+    CHECK(out != NULL && out_nw == nw + 14u); // +2 cap + 6 ext + 2*3 dec
+    CHECK(out[1] == 0x00010500u);
+    verify_patched_frag_spv(out, out_nw, 17u, &audit);
+    CHECK(audit.mesh_caps == 1u && audit.mesh_exts == 1u && audit.other_exts == 1u);
+    CHECK(audit.per_prim_on[11] == 1u && audit.per_prim_on[12] == 1u &&
+          audit.flat_on[11] == 1u && audit.flat_on[12] == 1u);
+    CHECK(audit.per_prim_on[10] == 0u && audit.per_prim_on[15] == 0u);
+    free(out);
+    out = NULL;
+
+    // 7. Already capable, extended, and decorated fragment shader -> no-op.
+    nw = build_frag_spv(spv, 192u, 0x00010400u, 1, 1, 1, 1);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_OK);
+    CHECK(out == NULL && out_nw == 0u);
+
+    // 8. MeshEXT SPIR-V per_prim_out_mask detection in rdna4mesh_inspect_spv.
+    {
+        uint32_t mspv[96];
+        size_t mn = 0u;
+        mspv[mn++] = RDNA4MESH_SPV_MAGIC;
+        mspv[mn++] = RDNA4MESH_SPV_VERSION_1_4;
+        mspv[mn++] = 0u;
+        mspv[mn++] = 12u;
+        mspv[mn++] = 0u;
+        mspv[mn++] = (2u << 16) | 17u; mspv[mn++] = RDNA4MESH_SPV_CAP_MESH_SHADING;
+        {
+            size_t s = mn++;
+            mn = spv_push_str(mspv, mn, "SPV_EXT_mesh_shader");
+            mspv[s] = ((uint32_t)(mn - s) << 16) | 10u;
+        }
+        mspv[mn++] = (5u << 16) | 15u; mspv[mn++] = RDNA4MESH_SPV_EM_MESH_EXT; mspv[mn++] = 1u;
+        mspv[mn++] = 0x6E69616Du; mspv[mn++] = 0u;
+        mspv[mn++] = (4u << 16) | 71u; mspv[mn++] = 10u; mspv[mn++] = RDNA4MESH_SPV_DEC_LOCATION; mspv[mn++] = 0u;
+        mspv[mn++] = (4u << 16) | 71u; mspv[mn++] = 11u; mspv[mn++] = RDNA4MESH_SPV_DEC_LOCATION; mspv[mn++] = 1u;
+        mspv[mn++] = (3u << 16) | 71u; mspv[mn++] = 11u; mspv[mn++] = RDNA4MESH_SPV_DEC_PER_PRIMITIVE;
+        mspv[mn++] = (4u << 16) | 59u; mspv[mn++] = 7u; mspv[mn++] = 10u; mspv[mn++] = RDNA4MESH_SPV_SC_OUTPUT;
+        mspv[mn++] = (4u << 16) | 59u; mspv[mn++] = 7u; mspv[mn++] = 11u; mspv[mn++] = RDNA4MESH_SPV_SC_OUTPUT;
+        CHECK(rdna4mesh_inspect_spv(mspv, mn, &info) == RDNA4MESH_OK);
+        CHECK(info.ep_model == RDNA4MESH_SPV_EM_MESH_EXT && info.has_mesh_shading_cap && info.has_mesh_shading_ext);
+        CHECK(info.per_prim_out_mask == (UINT64_C(1) << 1) && info.per_prim_in_mask == 0u);
+        // Reject non-Fragment entry point in fragment patcher.
+        CHECK(rdna4_mesh_patch_frag_per_primitive(mspv, mn, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+        CHECK(out == NULL && out_nw == 0u);
+    }
+
+    // 9. Malformed / truncated / out-of-order SPIR-V rejection.
+    nw = build_frag_spv(spv, 192u, 0x00010400u, 0, 0, 0, 0);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, 1u, NULL, &out_nw) == RDNA4MESH_ERR_INVALID_ARG);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw, 1u, &out, NULL) == RDNA4MESH_ERR_INVALID_ARG);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(NULL, nw, 1u, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, 4u, 1u, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+    CHECK(rdna4_mesh_patch_frag_per_primitive(spv, nw - 1u, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+    {
+        uint32_t bad[192];
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[0] = 0xDEADBEEFu;
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[3] = 0u; // zero id_bound
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[5] = 0u; // wc == 0
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[5] = (999u << 16) | 17u; // truncated
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        // Out-of-order OpCapability appended at end.
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[nw] = (2u << 16) | 17u;
+        bad[nw + 1u] = 1u;
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw + 2u, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        // Out-of-order OpDecorate appended after OpVariable/OpFunction.
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[nw] = (3u << 16) | 71u;
+        bad[nw + 1u] = 11u;
+        bad[nw + 2u] = RDNA4MESH_SPV_DEC_FLAT;
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw + 3u, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+
+        // Out-of-range id_bound (Input OpVariable ID 15 >= bound 12).
+        memcpy(bad, spv, nw * sizeof(uint32_t));
+        bad[3] = 12u;
+        CHECK(rdna4_mesh_patch_frag_per_primitive(bad, nw, UINT64_C(1) << 1, &out, &out_nw) == RDNA4MESH_ERR_SPIRV);
+        CHECK(out == NULL && out_nw == 0u);
+    }
+}
+
 static char *slurp_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -675,6 +1041,7 @@ static void test_source_pins(void) {
         "rdna4_mesh_max_draw_indirect_count",
         "rdna4_mesh_cift_fn",
         "rdna4_mesh_translate_stage3_fn",
+        "rdna4_mesh_patch_frag_per_primitive",
         "Wave 3E integration checklist",
     };
     for (size_t i = 0; i < sizeof(impl_pins) / sizeof(impl_pins[0]); i++) {
@@ -685,6 +1052,13 @@ static void test_source_pins(void) {
     CHECK(strstr(impl, "rdna4x_cift_fn") == NULL);
     CHECK(strstr(impl, "rdna4x_translate_stage3_fn") == NULL);
     free(impl);
+
+    char *sr = slurp_file("src/garnet-metal/rdna4_shader_runtime_impl.inc");
+    if (!sr) sr = slurp_file("rdna4_shader_runtime_impl.inc");
+    CHECK(sr != NULL);
+    CHECK(strstr(sr, "MTLFunctionTypeIntersection") != NULL);
+    CHECK(strstr(sr, "RDNA4RTR_MTL_FN_TYPE_INTERSECTION") == NULL);
+    free(sr);
 
     char *live = slurp_file("src/garnet-metal/test-metal3-mesh-shaders.m");
     if (!live) live = slurp_file("test-metal3-mesh-shaders.m");
@@ -699,6 +1073,7 @@ static void test_source_pins(void) {
         "setObjectThreadgroupMemoryLength:",
         "16384",
         "privateFunctions",
+        "@available(macOS 14.0, *)",
         "MTLGPUFamilyApple6",
         "respondsToSelector:@selector(newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)",
         "METAL3_MESH_PASS",
@@ -718,6 +1093,7 @@ int main(void) {
     test_spv_inspector_and_stage_linkage();
     test_draw_validators_and_tg_memory();
     test_emulated_scratch_planner();
+    test_frag_per_primitive_patcher();
     test_source_pins();
     printf("test-mesh-runtime: OK (%d checks)\n", g_checks);
     return 0;

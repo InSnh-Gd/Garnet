@@ -1244,7 +1244,7 @@ static BOOL rdna4x_collect_fn_list(NSArray *fns, NSMutableArray<NSDictionary *> 
 static BOOL rdna4x_is_intersection_fn(id f) {
     if (!f || ![f respondsToSelector:@selector(functionType)]) return NO;
     return ((NSUInteger (*)(id, SEL))objc_msgSend)(f, @selector(functionType)) ==
-           (NSUInteger)RDNA4RTR_MTL_FN_TYPE_INTERSECTION;
+           (NSUInteger)MTLFunctionTypeIntersection;
 }
 static int rdna4x_stage3_link_sha(
     char out[65],

@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "rdna4_devcaps.h"
@@ -55,10 +56,17 @@
 
 // SPIR-V 1.4+ numeric constants (verified against spirv 1.4.341 registry).
 #define RDNA4MESH_SPV_MAGIC               UINT32_C(0x07230203)
+#define RDNA4MESH_SPV_VERSION_1_4         UINT32_C(0x00010400)
 #define RDNA4MESH_SPV_EM_FRAGMENT         UINT32_C(4)
 #define RDNA4MESH_SPV_EM_GLCOMPUTE        UINT32_C(5)
 #define RDNA4MESH_SPV_EM_TASK_EXT         UINT32_C(5364)
 #define RDNA4MESH_SPV_EM_MESH_EXT         UINT32_C(5365)
+#define RDNA4MESH_SPV_SC_INPUT            UINT32_C(1)
+#define RDNA4MESH_SPV_SC_OUTPUT           UINT32_C(3)
+#define RDNA4MESH_SPV_DEC_BUILTIN         UINT32_C(11)
+#define RDNA4MESH_SPV_DEC_FLAT            UINT32_C(14)
+#define RDNA4MESH_SPV_DEC_LOCATION        UINT32_C(30)
+#define RDNA4MESH_SPV_DEC_PER_PRIMITIVE   UINT32_C(5271)
 #define RDNA4MESH_SPV_MODE_LOCAL_SIZE     UINT32_C(17)
 #define RDNA4MESH_SPV_MODE_OUT_VERTICES   UINT32_C(26)
 #define RDNA4MESH_SPV_MODE_OUT_POINTS     UINT32_C(27)
@@ -1010,15 +1018,48 @@ typedef struct {
     uint32_t output_primitives;
     rdna4mesh_topology_t topology;
     int has_mesh_shading_cap;
+    int has_mesh_shading_ext;
     int has_draw_params_cap;
     int has_raytracing_cap;
+    uint64_t per_prim_out_mask;
+    uint64_t per_prim_in_mask;
 } rdna4mesh_spv_info_t;
+
+static inline const uint32_t *rdna4mesh_spv_ext_mesh_shader_words(void) {
+    static const uint32_t ext[6] = {
+        (UINT32_C(6) << 16) | UINT32_C(10), // OpExtension (wc=6, op=10)
+        UINT32_C(0x5F565053),               // "SPV_"
+        UINT32_C(0x5F545845),               // "EXT_"
+        UINT32_C(0x6873656D),               // "mesh"
+        UINT32_C(0x6168735F),               // "_sha"
+        UINT32_C(0x00726564),               // "der\0"
+    };
+    return ext;
+}
+
+static inline int rdna4mesh_spv_is_annotation_op(uint32_t op) {
+    return op == 71u || op == 72u || op == 73u || op == 74u ||
+           op == 75u || op == 332u || op == 5632u || op == 5633u;
+}
+
+static inline int rdna4mesh_spv_is_post_annotation_op(uint32_t op) {
+    return op == 1u || (op >= 19u && op <= 52u) ||
+           op == 54u || op == 59u || op == 5341u;
+}
 
 static inline rdna4mesh_status_t rdna4mesh_inspect_spv(const uint32_t *words, size_t word_count,
                                                        rdna4mesh_spv_info_t *out) {
     if (!words || word_count < 5u || !out) return RDNA4MESH_ERR_SPIRV;
     memset(out, 0, sizeof *out);
     if (words[0] != RDNA4MESH_SPV_MAGIC) return RDNA4MESH_ERR_SPIRV;
+
+    struct {
+        uint32_t id;
+        uint32_t loc;
+        uint8_t flags; // bit 0: Location, bit 1: PerPrimitiveEXT, bit 2: BuiltIn
+    } decs[RDNA4MESH_MAX_VARYINGS];
+    size_t ndecs = 0u;
+    int in_func = 0;
 
     size_t p = 5u;
     while (p < word_count) {
@@ -1034,6 +1075,9 @@ static inline rdna4mesh_status_t rdna4mesh_inspect_spv(const uint32_t *words, si
                      a[0] == RDNA4MESH_SPV_CAP_RAY_TRACING_KHR ||
                      a[0] == RDNA4MESH_SPV_CAP_RAY_CULL_KHR)
                 out->has_raytracing_cap = 1;
+        } else if (op == 10u && wc == 6u) { // OpExtension
+            if (memcmp(words + p, rdna4mesh_spv_ext_mesh_shader_words(), 6u * sizeof(uint32_t)) == 0)
+                out->has_mesh_shading_ext = 1;
         } else if (op == 15u && wc >= 4u) { // OpEntryPoint
             if (!out->has_ep) {
                 out->has_ep = 1;
@@ -1058,10 +1102,260 @@ static inline rdna4mesh_status_t rdna4mesh_inspect_spv(const uint32_t *words, si
             } else if (mode == RDNA4MESH_SPV_MODE_OUT_TRIS_EXT) {
                 out->topology = RDNA4MESH_TOPO_TRIANGLE;
             }
+        } else if (op == 71u && wc >= 3u) { // OpDecorate
+            int want_loc = (a[1] == RDNA4MESH_SPV_DEC_LOCATION && wc >= 4u && a[2] < 64u);
+            int want_pp = (a[1] == RDNA4MESH_SPV_DEC_PER_PRIMITIVE);
+            int want_bi = (a[1] == RDNA4MESH_SPV_DEC_BUILTIN && wc >= 4u);
+            if (want_loc || want_pp || want_bi) {
+                size_t k = 0u;
+                while (k < ndecs && decs[k].id != a[0]) k++;
+                if (k == ndecs && ndecs < RDNA4MESH_MAX_VARYINGS) {
+                    decs[ndecs].id = a[0];
+                    decs[ndecs].loc = 0u;
+                    decs[ndecs].flags = 0u;
+                    ndecs++;
+                }
+                if (k < ndecs) {
+                    if (want_loc) { decs[k].loc = a[2]; decs[k].flags |= 1u; }
+                    if (want_pp)  decs[k].flags |= 2u;
+                    if (want_bi)  decs[k].flags |= 4u;
+                }
+            }
+        } else if (op == 54u) { // OpFunction
+            in_func = 1;
+        } else if (op == 56u) { // OpFunctionEnd
+            in_func = 0;
+        } else if (!in_func && op == 59u && wc >= 4u &&
+                   (a[2] == RDNA4MESH_SPV_SC_INPUT || a[2] == RDNA4MESH_SPV_SC_OUTPUT)) {
+            for (size_t k = 0u; k < ndecs; k++) {
+                if (decs[k].id == a[1] && (decs[k].flags & 7u) == 3u) {
+                    uint64_t bit = UINT64_C(1) << decs[k].loc;
+                    if (a[2] == RDNA4MESH_SPV_SC_OUTPUT) out->per_prim_out_mask |= bit;
+                    else out->per_prim_in_mask |= bit;
+                    break;
+                }
+            }
         }
         p += wc;
     }
     return out->has_ep ? RDNA4MESH_OK : RDNA4MESH_ERR_SPIRV;
+}
+
+// Standalone Metal fragment shaders carry only `!"air.flat"` on primitive inputs; when paired with
+// a MeshEXT shader whose primitive outputs populate `per_prim_loc_mask`, inject PerPrimitiveEXT
+// (plus MeshShadingEXT capability and SPV_EXT_mesh_shader extension) in SPIR-V logical order.
+// Returns RDNA4MESH_OK with *out_words == NULL if no patching is needed.
+static inline rdna4mesh_status_t rdna4_mesh_patch_frag_per_primitive(
+    const uint32_t *words,
+    size_t word_count,
+    uint64_t per_prim_loc_mask,
+    uint32_t **out_words,
+    size_t *out_word_count)
+{
+    if (out_words) *out_words = NULL;
+    if (out_word_count) *out_word_count = 0u;
+    if (!out_words || !out_word_count) return RDNA4MESH_ERR_INVALID_ARG;
+    if (!words || word_count < 5u || words[0] != RDNA4MESH_SPV_MAGIC || words[3] == 0u)
+        return RDNA4MESH_ERR_SPIRV;
+
+    const uint32_t id_bound = words[3];
+    size_t cap_end = 5u;
+    size_t ext_end = 5u;
+    size_t ann_end = 0u;
+    int seen_non_cap = 0;
+    int seen_non_ext = 0;
+    int seen_post_ann = 0;
+    int in_func = 0;
+    int has_ep = 0;
+    uint32_t ep_model = 0u;
+    int has_mesh_cap = 0;
+    int has_mesh_ext = 0;
+    size_t n_inputs = 0u;
+
+    for (size_t p = 5u; p < word_count;) {
+        uint32_t hdr = words[p];
+        uint32_t op = hdr & 0xFFFFu;
+        uint32_t wc = hdr >> 16;
+        if (wc == 0u || (size_t)wc > word_count - p) return RDNA4MESH_ERR_SPIRV;
+        const uint32_t *a = words + p + 1u;
+
+        if (op == 17u) { // OpCapability
+            if (wc != 2u || seen_non_cap) return RDNA4MESH_ERR_SPIRV;
+            if (a[0] == RDNA4MESH_SPV_CAP_MESH_SHADING) has_mesh_cap = 1;
+            cap_end = p + (size_t)wc;
+            ext_end = cap_end;
+        } else if (op == 10u) { // OpExtension
+            seen_non_cap = 1;
+            if (wc < 2u || seen_non_ext) return RDNA4MESH_ERR_SPIRV;
+            if (wc == 6u &&
+                memcmp(words + p, rdna4mesh_spv_ext_mesh_shader_words(), 6u * sizeof(uint32_t)) == 0)
+                has_mesh_ext = 1;
+            ext_end = p + (size_t)wc;
+        } else {
+            seen_non_cap = 1;
+            seen_non_ext = 1;
+            if (op == 15u) { // OpEntryPoint
+                if (wc < 4u) return RDNA4MESH_ERR_SPIRV;
+                if (!has_ep) {
+                    has_ep = 1;
+                    ep_model = a[0];
+                }
+            } else if (rdna4mesh_spv_is_annotation_op(op)) {
+                if (seen_post_ann) return RDNA4MESH_ERR_SPIRV;
+                if (op == 71u && wc < 3u) return RDNA4MESH_ERR_SPIRV;
+                ann_end = p + (size_t)wc;
+            } else {
+                if (rdna4mesh_spv_is_post_annotation_op(op)) seen_post_ann = 1;
+                if (op == 54u) {
+                    in_func = 1;
+                } else if (op == 56u) {
+                    in_func = 0;
+                } else if (!in_func && op == 59u) { // global OpVariable
+                    if (wc < 4u) return RDNA4MESH_ERR_SPIRV;
+                    if (a[2] == RDNA4MESH_SPV_SC_INPUT) {
+                        if (a[1] == 0u || a[1] >= id_bound) return RDNA4MESH_ERR_SPIRV;
+                        n_inputs++;
+                    }
+                }
+            }
+        }
+        p += (size_t)wc;
+    }
+
+    if (in_func || !has_ep || ep_model != RDNA4MESH_SPV_EM_FRAGMENT)
+        return RDNA4MESH_ERR_SPIRV;
+    if (per_prim_loc_mask == 0u || n_inputs == 0u || ann_end < ext_end)
+        return RDNA4MESH_OK;
+
+    typedef struct {
+        uint32_t id;
+        uint8_t flags; // bit 0: matches mask, bit 1: already PerPrimitiveEXT, bit 2: BuiltIn
+    } rdna4mesh_spv_var_t;
+
+    rdna4mesh_spv_var_t *vars = (rdna4mesh_spv_var_t *)calloc(n_inputs, sizeof *vars);
+    if (!vars) return RDNA4MESH_ERR_BOUNDS;
+
+    size_t n_vars = 0u;
+    in_func = 0;
+    for (size_t p = ann_end; p < word_count;) {
+        uint32_t hdr = words[p];
+        uint32_t op = hdr & 0xFFFFu;
+        uint32_t wc = hdr >> 16;
+        const uint32_t *a = words + p + 1u;
+        if (op == 54u) {
+            in_func = 1;
+        } else if (op == 56u) {
+            in_func = 0;
+        } else if (!in_func && op == 59u && wc >= 4u && a[2] == RDNA4MESH_SPV_SC_INPUT) {
+            for (size_t k = 0u; k < n_vars; k++) {
+                if (vars[k].id == a[1]) {
+                    free(vars);
+                    return RDNA4MESH_ERR_SPIRV;
+                }
+            }
+            vars[n_vars++].id = a[1];
+        }
+        p += (size_t)wc;
+    }
+
+    for (size_t p = ext_end; p < ann_end;) {
+        uint32_t hdr = words[p];
+        uint32_t op = hdr & 0xFFFFu;
+        uint32_t wc = hdr >> 16;
+        const uint32_t *a = words + p + 1u;
+        if (op == 71u && wc >= 3u) {
+            uint32_t target = a[0];
+            uint32_t dec = a[1];
+            uint8_t add_flag = 0u;
+            if (dec == RDNA4MESH_SPV_DEC_LOCATION && wc >= 4u && a[2] < 64u) {
+                if ((per_prim_loc_mask & (UINT64_C(1) << a[2])) != 0u) add_flag = 1u;
+            } else if (dec == RDNA4MESH_SPV_DEC_PER_PRIMITIVE) {
+                add_flag = 2u;
+            } else if (dec == RDNA4MESH_SPV_DEC_BUILTIN && wc >= 4u) {
+                add_flag = 4u;
+            }
+            if (add_flag != 0u) {
+                for (size_t k = 0u; k < n_vars; k++) {
+                    if (vars[k].id == target) {
+                        vars[k].flags |= add_flag;
+                        break;
+                    }
+                }
+            }
+        }
+        p += (size_t)wc;
+    }
+
+    size_t n_patch = 0u;
+    for (size_t k = 0u; k < n_vars; k++) {
+        if ((vars[k].flags & 7u) == 1u) n_patch++;
+    }
+    if (n_patch == 0u) {
+        free(vars);
+        return RDNA4MESH_OK;
+    }
+
+    const size_t cap_words = has_mesh_cap ? 0u : 2u;
+    const size_t ext_words = has_mesh_ext ? 0u : 6u;
+    if (n_patch > (SIZE_MAX / sizeof(uint32_t) - cap_words - ext_words) / 3u) {
+        free(vars);
+        return RDNA4MESH_ERR_OVERFLOW;
+    }
+    const size_t extra_words = cap_words + ext_words + n_patch * 3u;
+    if (extra_words > SIZE_MAX / sizeof(uint32_t) - word_count) {
+        free(vars);
+        return RDNA4MESH_ERR_OVERFLOW;
+    }
+    const size_t total_words = word_count + extra_words;
+    uint32_t *out = (uint32_t *)malloc(total_words * sizeof(uint32_t));
+    if (!out) {
+        free(vars);
+        return RDNA4MESH_ERR_BOUNDS;
+    }
+
+    size_t dst = 0u;
+    memcpy(out, words, 5u * sizeof(uint32_t));
+    if (out[1] < RDNA4MESH_SPV_VERSION_1_4) out[1] = RDNA4MESH_SPV_VERSION_1_4;
+    dst += 5u;
+
+    if (cap_end > 5u) {
+        memcpy(out + dst, words + 5u, (cap_end - 5u) * sizeof(uint32_t));
+        dst += cap_end - 5u;
+    }
+    if (!has_mesh_cap) {
+        out[dst++] = (UINT32_C(2) << 16) | UINT32_C(17);
+        out[dst++] = RDNA4MESH_SPV_CAP_MESH_SHADING;
+    }
+
+    if (ext_end > cap_end) {
+        memcpy(out + dst, words + cap_end, (ext_end - cap_end) * sizeof(uint32_t));
+        dst += ext_end - cap_end;
+    }
+    if (!has_mesh_ext) {
+        memcpy(out + dst, rdna4mesh_spv_ext_mesh_shader_words(), 6u * sizeof(uint32_t));
+        dst += 6u;
+    }
+
+    if (ann_end > ext_end) {
+        memcpy(out + dst, words + ext_end, (ann_end - ext_end) * sizeof(uint32_t));
+        dst += ann_end - ext_end;
+    }
+    for (size_t k = 0u; k < n_vars; k++) {
+        if ((vars[k].flags & 7u) != 1u) continue;
+        out[dst++] = (UINT32_C(3) << 16) | UINT32_C(71);
+        out[dst++] = vars[k].id;
+        out[dst++] = RDNA4MESH_SPV_DEC_PER_PRIMITIVE;
+    }
+
+    if (word_count > ann_end) {
+        memcpy(out + dst, words + ann_end, (word_count - ann_end) * sizeof(uint32_t));
+        dst += word_count - ann_end;
+    }
+    free(vars);
+
+    *out_words = out;
+    *out_word_count = dst;
+    return RDNA4MESH_OK;
 }
 
 // =================================================================================================
@@ -1234,25 +1528,26 @@ static inline rdna4mesh_status_t rdna4mesh_validate_stage_linkage(
     }
 
     // Fragment PerPrimitiveEXT vs per-vertex varying linkage check.
-    if (desc->has_fragment_function && frag_refl && frag_refl->varying_count > 0u &&
-        mesh_refl && mesh_refl->has_mesh) {
+    uint64_t prim_mask = (mesh_refl && mesh_refl->has_mesh ? mesh_refl->mesh.primitive_out_mask : 0u) |
+                         (mesh_spv ? mesh_spv->per_prim_out_mask : 0u);
+    if (mesh_refl && mesh_refl->has_mesh && (prim_mask & mesh_refl->mesh.vertex_out_mask) != 0u) {
+        if (why_out) *why_out = "mesh shader declares overlapping per-vertex and PerPrimitiveEXT output locations";
+        return RDNA4MESH_ERR_STAGE_LINKAGE;
+    }
+    if (desc->has_fragment_function && frag_refl && frag_refl->varying_count > 0u) {
         for (uint32_t i = 0; i < frag_refl->varying_count; i++) {
             uint32_t loc = frag_refl->varyings[i].location;
             if (loc >= 64u) continue;
             uint64_t bit = UINT64_C(1) << loc;
             if (frag_refl->varyings[i].per_primitive) {
-                if (!(mesh_refl->mesh.primitive_out_mask & bit)) {
+                if (!(prim_mask & bit)) {
                     if (why_out) *why_out = "fragment PerPrimitiveEXT input location is not emitted as a mesh primitive output";
                     return RDNA4MESH_ERR_STAGE_LINKAGE;
                 }
-            } else {
-                // Reject if fragment expects a per-vertex input at a location the mesh emits ONLY as per-primitive.
-                if ((mesh_refl->mesh.primitive_out_mask & bit) &&
-                    !(mesh_refl->mesh.vertex_out_mask & bit)) {
-                    if (why_out) *why_out = "fragment per-vertex input location conflicts with mesh PerPrimitiveEXT output";
-                    return RDNA4MESH_ERR_STAGE_LINKAGE;
-                }
             }
+            // Standalone Apple AIR fragment shaders emit !"air.flat" (per_primitive == 0) at mesh
+            // primitive-output locations; rdna4_mesh_patch_frag_per_primitive() upgrades them to
+            // PerPrimitiveEXT when creating the paired pipeline.
         }
     }
 
