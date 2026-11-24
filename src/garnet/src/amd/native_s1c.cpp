@@ -1506,12 +1506,13 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
                 rc = kIOReturnNoMemory; break;
             }
             VRAMAllocation a {};
-            // 0.0.641 (G4 review), apps ON: a non-WindowServer session's NO_CPU_ACCESS BO goes to the hi pool FIRST (the visible pool is WindowServer's), and a CPU-visible placement of such a
-            // session must fit under the shared cap (appvis_cap(), default 64 MiB) or the request fails like any other out-of-memory. Everything else is as 0.0.640.
-            // On a full-BAR (> 1 GiB) boot, visible pool is nearly all usable VRAM (hi pool is tiny), so appvis_active disables the small-BAR 64 MiB choke while g2::app_vram_budget_ok still binds.
-            const bool appsNow = rdna4native::g4::appvis_active(apps_on(), rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit));
+            // 0.0.641 (G4 review) + small-BAR WS fix: on small BAR (!fullBar), ALL NO_CPU_ACCESS BOs (WindowServer and apps alike) go to the hi pool FIRST so ~200 MiB visible VRAM
+            // stays free for scanout, CPU-mapped BOs, descriptor pools and GPU page tables (PtMem); with apps ON, non-WindowServer CPU-visible placements stay under appvis_cap() (default 64 MiB).
+            // On a full-BAR (> 1 GiB) boot, visible pool is nearly all usable VRAM (hi pool is tiny), so hi_first and appvis_active both stay OFF while g2::app_vram_budget_ok still binds.
+            const bool fullBar = rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit);
+            const bool appsNow = rdna4native::g4::appvis_active(apps_on(), fullBar);
             bool got = false;
-            bool hiDone = rdna4native::g4::hi_first(appsNow, s->ws, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a);
+            bool hiDone = rdna4native::g4::hi_first(fullBar, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a);
             if (!hiDone) {
                 if (!rdna4native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)) {
                     N1C_LOG("BoCreate refused (NoMemory): slot %u is over the visible-VRAM cap for non-WindowServer sessions (%llu KiB held of %llu MiB, %llu KiB asked)", s->slot,

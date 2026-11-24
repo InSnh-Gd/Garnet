@@ -237,17 +237,19 @@ constexpr uint32_t unmap_attempts(bool appsOn, bool isVisVram, bool hasDescripto
 }
 
 // ---- 0.0.641 (G4 review): the visible-VRAM pool -------------------------------------------------------------------------------------------------------------
-// The visible pool (BAR0, about 217 MiB after the carve-outs) is what WindowServer's scanout and CPU-mapped BOs need. With apps ON a non-WindowServer session (an APP, a root tool) may hold at
-// most kAppVis*MiB of it TOGETHER (a cap on top of the shared allowance, which is measured against visible + hi VRAM), and a NO_CPU_ACCESS BO (place_decide's hiOk) is tried in the hi pool first.
+// The visible pool (BAR0, about 200-217 MiB after the carve-outs on a small BAR) is what scanout, GPU page tables (PtMem), descriptor pools and CPU-mapped BOs need.
+// On small BAR (!fullBar), ANY NO_CPU_ACCESS BO (place_decide's hiOk) — including WindowServer's — tries the hi pool first so GPU-only textures/slabs never starve visible VRAM
+// or page-table allocations; with apps ON a non-WindowServer session may also hold at most kAppVis*MiB of visible VRAM TOGETHER (a cap on top of the shared allowance, which is measured against visible + hi VRAM).
 constexpr uint32_t kAppVisDefaultMiB = 64u, kAppVisMinMiB = 16u, kAppVisMaxMiB = 128u;
 // boot-arg rdna4-appvis=<MiB>: in range 16..128 it is the cap; absent or out of range, the default (64 MiB).
 constexpr uint64_t appvis_cap_bytes(bool present, uint32_t mib) { return (uint64_t)((present && mib >= kAppVisMinMiB && mib <= kAppVisMaxMiB) ? mib : kAppVisDefaultMiB) << 20; }
-// The small-BAR visible-pool sub-cap and hi-first spill apply only when BAR0 is <= 1 GiB;
+// The small-BAR visible-pool sub-cap applies only when apps are ON and BAR0 is <= 1 GiB;
 // on a full-BAR (> 1 GiB) boot the visible pool IS almost all usable VRAM and non-WindowServer
 // sessions remain bounded by g2::app_vram_budget_ok.
 constexpr bool appvis_active(bool appsOn, bool fullBar) { return appsOn && !fullBar; }
 constexpr bool appvis_ok(bool appsOn, bool isWs, uint64_t held, uint64_t add, uint64_t cap) { return !appsOn || isWs || !s1c::would_exceed(held, add, cap); }
-constexpr bool hi_first(bool appsOn, bool isWs, bool hiOk) { return appsOn && !isWs && hiOk; }
+// On small BAR (!fullBar), route ALL NO_CPU_ACCESS BOs (WindowServer and non-WS alike, apps ON or OFF) to the hi pool first so visible VRAM stays free for scanout, CPU-mapped BOs, and page tables.
+constexpr bool hi_first(bool fullBar, bool hiOk) { return !fullBar && hiOk; }
 // Does a non-WindowServer BO count against the visible cap? Yes when it was placed in the visible pool (not hi, not GTT) with apps ON.
 constexpr bool appvis_counts(bool appsOn, bool isWs, bool placedVisible) { return appsOn && !isWs && placedVisible; }
 

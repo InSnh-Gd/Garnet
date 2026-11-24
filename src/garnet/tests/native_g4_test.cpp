@@ -535,13 +535,14 @@ static void t10_log_gate(const std::string &root) {
 
 // ---- T11 (0.0.641, review MEDIUM): the visible-VRAM pool -----------------------------------------------------------------------------------------------------
 namespace {
-// The placement decision of n1c_bo_create for a VRAM request, in the very order the kernel asks the pure functions: hi first (apps, non-WindowServer, NO_CPU_ACCESS), the visible cap, the
-// visible pool, the hi fallback. visFree / hiFree: whether the pool can satisfy the request.
+// The placement decision of n1c_bo_create for a VRAM request, in the very order the kernel asks the pure functions: hi first (small BAR + NO_CPU_ACCESS, including WindowServer),
+// the visible cap (small BAR + apps ON + non-WindowServer), the visible pool, the hi fallback. visFree / hiFree: whether the pool can satisfy the request.
 enum Where { kWhereNone, kWhereVis, kWhereHi };
-Where place_sim(bool apps, bool isWs, bool hiOk, bool hiFree, bool visFree, uint64_t held, uint64_t add, uint64_t cap) {
-    bool hiDone = g4::hi_first(apps, isWs, hiOk) && hiFree;
+Where place_sim(bool appsOn, bool fullBar, bool isWs, bool hiOk, bool hiFree, bool visFree, uint64_t held, uint64_t add, uint64_t cap) {
+    const bool appsNow = g4::appvis_active(appsOn, fullBar);
+    bool hiDone = g4::hi_first(fullBar, hiOk) && hiFree;
     if (!hiDone) {
-        if (!g4::appvis_ok(apps, isWs, held, add, cap)) return kWhereNone;
+        if (!g4::appvis_ok(appsNow, isWs, held, add, cap)) return kWhereNone;
         if (visFree) return kWhereVis;
     }
     if (hiDone || (hiOk && hiFree)) return kWhereHi;
@@ -556,20 +557,24 @@ static void t11_visible_pool(const std::string &root) {
     const uint64_t cap = 64ull << 20;
     expect(appvis_ok(true, false, 0, cap, cap) && !appvis_ok(true, false, 1, cap, cap) && appvis_ok(true, false, cap - 4096, 4096, cap) && !appvis_ok(true, false, cap - 4096, 8192, cap), "T11: non-WindowServer: held + add must stay within the cap");
     expect(appvis_ok(true, true, cap * 10, cap * 10, cap) && appvis_ok(false, false, cap * 10, cap * 10, cap), "T11: WindowServer is never capped, and apps OFF has no cap (0.0.632)");
-    expect(hi_first(true, false, true) && !hi_first(true, true, true) && !hi_first(true, false, false) && !hi_first(false, false, true), "T11: hi first only for apps ON, non-WindowServer, NO_CPU_ACCESS");
+    expect(hi_first(false, true) && !hi_first(true, true) && !hi_first(false, false) && !hi_first(true, false), "T11: hi first for all NO_CPU_ACCESS BOs on small BAR, never on full BAR or CPU-visible");
     expect(appvis_counts(true, false, true) && !appvis_counts(true, true, true) && !appvis_counts(false, false, true) && !appvis_counts(true, false, false), "T11: only a non-WindowServer visible placement with apps ON counts");
-    expect(appvis_active(true, false) && !appvis_active(true, true) && !appvis_active(false, false) && !appvis_active(false, true), "T11: visible-pool sub-cap and hi-first apply only with apps ON and small BAR (<= 1 GiB)");
+    expect(appvis_active(true, false) && !appvis_active(true, true) && !appvis_active(false, false) && !appvis_active(false, true), "T11: visible-pool sub-cap applies only with apps ON and small BAR (<= 1 GiB)");
     // placement decisions (small BAR vs full BAR)
-    expect(place_sim(appvis_active(true, true), false, true, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS NO_CPU_ACCESS BO goes to visible pool past 64 MiB");
-    expect(place_sim(appvis_active(true, true), false, false, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS CPU-visible BO goes to visible pool past 64 MiB");
-    expect(place_sim(true, false, true, true, true, 0, 4096, cap) == kWhereHi, "T11: apps ON, NO_CPU_ACCESS, both pools free: the hi pool");
-    expect(place_sim(true, false, true, false, true, 0, 4096, cap) == kWhereVis, "T11: ... the hi pool full: falls back to visible (under the cap)");
-    expect(place_sim(true, false, true, false, true, cap, 4096, cap) == kWhereNone, "T11: ... the hi pool full and the cap reached: out of memory");
-    expect(place_sim(true, false, false, true, true, 0, 4096, cap) == kWhereVis, "T11: apps ON, CPU access wanted: visible");
-    expect(place_sim(true, false, false, true, true, cap, 4096, cap) == kWhereNone, "T11: ... over the cap: the existing out-of-memory status, although the hi pool is free (it is not CPU-mappable)");
-    expect(place_sim(true, true, true, true, true, cap, 4096, cap) == kWhereVis, "T11: WindowServer is placed visible first and is not capped");
-    expect(place_sim(false, false, true, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: apps OFF: visible first, as 0.0.632 (also for a NO_CPU_ACCESS BO)");
-    expect(place_sim(false, false, true, true, false, 0, 4096, cap) == kWhereHi, "T11: apps OFF: the old hi fallback");
+    expect(place_sim(true, true, false, true, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS NO_CPU_ACCESS BO goes to visible pool past 64 MiB");
+    expect(place_sim(true, true, false, false, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR non-WS CPU-visible BO goes to visible pool past 64 MiB");
+    expect(place_sim(true, true, true, true, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: full-BAR WindowServer NO_CPU_ACCESS BO goes to visible pool");
+    expect(place_sim(true, false, false, true, true, true, 0, 4096, cap) == kWhereHi, "T11: small-BAR apps ON, non-WS NO_CPU_ACCESS, both pools free: the hi pool");
+    expect(place_sim(true, false, false, true, false, true, 0, 4096, cap) == kWhereVis, "T11: ... the hi pool full: falls back to visible (under the cap)");
+    expect(place_sim(true, false, false, true, false, true, cap, 4096, cap) == kWhereNone, "T11: ... the hi pool full and the cap reached: out of memory");
+    expect(place_sim(true, false, false, false, true, true, 0, 4096, cap) == kWhereVis, "T11: small-BAR apps ON, non-WS CPU access wanted: visible");
+    expect(place_sim(true, false, false, false, true, true, cap, 4096, cap) == kWhereNone, "T11: ... over the cap: out of memory, although the hi pool is free (not CPU-mappable)");
+    expect(place_sim(true, false, true, true, true, true, cap, 4096, cap) == kWhereHi, "T11: small-BAR WindowServer NO_CPU_ACCESS BO goes to hi pool first so visible pool stays free for scanout/PT");
+    expect(place_sim(true, false, true, true, false, true, cap * 4, 4096, cap) == kWhereVis, "T11: small-BAR WindowServer NO_CPU_ACCESS falls back to visible (uncapped) if hi pool is full");
+    expect(place_sim(true, false, true, false, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: small-BAR WindowServer CPU-visible BO goes to visible pool and is not capped");
+    expect(place_sim(false, false, false, true, true, true, cap * 4, 4096, cap) == kWhereHi, "T11: small-BAR apps OFF NO_CPU_ACCESS BO also prefers hi pool to preserve visible VRAM/PT");
+    expect(place_sim(false, false, false, false, true, true, cap * 4, 4096, cap) == kWhereVis, "T11: small-BAR apps OFF CPU-visible BO goes to visible pool uncapped");
+    expect(place_sim(false, true, false, true, true, false, 0, 4096, cap) == kWhereHi, "T11: full-BAR apps OFF visible full: still falls back to hi pool");
     // sessstat 8
     g2::GlobalView gv {}; gv.open = 2; uint64_t o[g2::kOutN];
     g2::global_out(gv, o);
@@ -585,10 +590,10 @@ static void t11_visible_pool(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
     const std::string bc = fn_body(eng, "IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64_t out[4]) {");
-    expect(in_order(bc, { "app_vram_budget_ok(multi, s->ws, gVramOthers, p.size, poolTotal, poolFree, ptHeld)", "const bool appsNow = rdna4native::g4::appvis_active(apps_on(), rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit));", "rdna4native::g4::hi_first(appsNow, s->ws, p.hiOk)", "vram_alloc_hi.alloc(p.size, p.align, &a)", "if (!hiDone) {",
+    expect(in_order(bc, { "app_vram_budget_ok(multi, s->ws, gVramOthers, p.size, poolTotal, poolFree, ptHeld)", "const bool fullBar = rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit);", "const bool appsNow = rdna4native::g4::appvis_active(apps_on(), fullBar);", "rdna4native::g4::hi_first(fullBar, p.hiOk)", "vram_alloc_hi.alloc(p.size, p.align, &a)", "if (!hiDone) {",
                           "rdna4native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)", "rc = kIOReturnNoMemory; break;", "got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);",
                           "rdna4native::g4::appvis_counts(appsNow, s->ws, true)) { b.visCounted = 1u; gVisOthers += p.size; }", "} else if (hiDone || (p.hiOk &&", "b.kind = kBoHi;" }),
-           "T11: REACHABLE, in this order: the shared allowance, hi first for a non-WindowServer NO_CPU_ACCESS BO, the visible cap (the existing NoMemory), the visible pool, the count, the hi fallback");
+           "T11: REACHABLE, in this order: the shared allowance, hi first on small BAR for any NO_CPU_ACCESS BO, the visible cap (the existing NoMemory), the visible pool, the count, the hi fallback");
     expect(in_order(eng, { "static inline void budget_release(Bo &b) {", "if (b.visCounted != 0u) { gVisOthers =", "b.visCounted = 0u;" }), "T11: freeing a visible BO takes it off the visible counter (a leaked one is never released, so it stays counted)");
     expect_u("T11: garnet-appvis is read in exactly one place", count_of(eng, "PE_parse_boot_argn(\"garnet-appvis\""), 1);
     expect(in_order(fn_body(eng, "static uint64_t appvis_cap() {"), { "PE_parse_boot_argn(\"garnet-appvis\"", "rdna4native::g4::appvis_cap_bytes(present, v)", "__atomic_store_n(&gAppVisLatch, 1u" }), "T11: the cap comes from the pure function, latched once");
