@@ -86,6 +86,7 @@ final class GarnetAppModel: ObservableObject {
 
     @Published var selectedOCMode: OpenCoreMode = .mode16g
     @Published var ocReport: OpenCoreReport?
+    @Published var ocConfigureResult: OpenCoreConfigureResult?
     @Published var ocError: String?
 
     private let env = HostEnvironment()
@@ -203,11 +204,24 @@ final class GarnetAppModel: ObservableObject {
 
     func validateOpenCoreConfig(at url: URL) {
         ocError = nil
+        ocConfigureResult = nil
         do {
             ocReport = try OpenCoreValidator.validate(configURL: url, mode: selectedOCMode)
         } catch {
             ocReport = nil
             ocError = "Failed to inspect plist read-only: \(error)"
+        }
+    }
+
+    func configureOpenCore(at url: URL) {
+        ocError = nil
+        ocConfigureResult = nil
+        do {
+            let result = try OpenCoreValidator.configure(targetURL: url, mode: selectedOCMode, payloadURL: payloadURL)
+            ocConfigureResult = result
+            ocReport = result.report
+        } catch {
+            ocError = "Failed to configure OpenCore: \(error)"
         }
     }
 
