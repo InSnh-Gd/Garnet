@@ -29,7 +29,10 @@ static BOOL rdna4_residency_alloc_valid(id obj, id dev, uint64_t *sizeOut) {
                      [obj isKindOfClass:[RDNA4Heap class]];
     if (!knownType) {
         Class asCls = objc_getClass("RDNA4AccelerationStructure");
-        if (asCls && [obj isKindOfClass:asCls]) knownType = YES;
+        Class spCls = objc_getClass("RDNA4SparseHeap");
+        if ((asCls && [obj isKindOfClass:asCls]) ||
+            (spCls && [obj isKindOfClass:spCls]))
+            knownType = YES;
     }
     if (!knownType) {
         Protocol *pAlloc = objc_getProtocol("MTLAllocation");
@@ -43,12 +46,6 @@ static BOOL rdna4_residency_alloc_valid(id obj, id dev, uint64_t *sizeOut) {
             knownType = YES;
     }
     if (!knownType) return NO;
-    SEL sparseSel = sel_registerName("isSparse");
-    if ([obj respondsToSelector:sparseSel] &&
-        ((BOOL (*)(id, SEL))objc_msgSend)(obj, sparseSel)) {
-        RDNA4_ONCE("residency set: sparse textures/heaps are not supported; ignored");
-        return NO;
-    }
     if (sizeOut) {
         if ([obj respondsToSelector:@selector(allocatedSize)])
             *sizeOut = (uint64_t)((NSUInteger (*)(id, SEL))objc_msgSend)(obj, @selector(allocatedSize));

@@ -449,6 +449,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_tessellation.h"
 #include "rdna4_icb_abi.h"
 #include "rdna4_binary_archive_impl.inc"
+#include "rdna4_dynlib_vft_impl.inc"
 #include "rdna4_render_pipeline_impl.inc"
 #include "rdna4_stage_bindings_impl.inc"
 #include "rdna4_compute_pipeline_impl.inc"
@@ -528,7 +529,7 @@ static NSData *rdna4_function_reflection_data(id function) {
     return compiler;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error {
-    return [[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error];
+    return (id<MTLBinaryArchive>)[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error];
 }
 // Metal's archive, dynamic-library and MTL4-archive loaders all call +[MTLLoader sliceIDForDevice:...], which asserts
 // (MTLReportFailure -> abort) when -targetDeviceArchitecture is nil; the _MTLDevice default is nil for a non-Apple
@@ -556,21 +557,14 @@ static NSData *rdna4_function_reflection_data(id function) {
     const rdna4x_backend_capabilities caps = rdna4_query_caps();
     return rdna4x_query_supported(&caps) ? YES : NO;
 }
-- (BOOL)supportsDynamicLibraries { return NO; }
-- (BOOL)supportsRenderDynamicLibraries { return NO; }
+- (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }
+- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }
 - (BOOL)supportsBinaryArchives { return NO; }
-// Native dynamic libraries and MTL4 archives are machine-code containers too: decline them like binary archives.
-- (id)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {
-    if (error) *error = [NSError errorWithDomain:MTLDynamicLibraryDomain code:MTLDynamicLibraryErrorUnsupported
-        userInfo:@{ NSLocalizedDescriptionKey: @"Native Metal dynamic libraries are unavailable on this device." }];
-    RDNA4_ONCE("native dynamic library (URL) declined");
-    return nil;
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {
+    return (id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error];
 }
-- (id)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error {
-    if (error) *error = [NSError errorWithDomain:MTLDynamicLibraryDomain code:MTLDynamicLibraryErrorUnsupported
-        userInfo:@{ NSLocalizedDescriptionKey: @"Native Metal dynamic libraries are unavailable on this device." }];
-    RDNA4_ONCE("native dynamic library declined");
-    return nil;
+- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error {
+    return (id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self library:library error:error];
 }
 - (id)newArchiveWithURL:(NSURL *)url error:(NSError **)error {
     if (error) *error = [NSError errorWithDomain:MTLBinaryArchiveDomain code:MTLBinaryArchiveErrorInvalidFile
@@ -629,6 +623,9 @@ static NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLHeap" }; rdna4_add_protocols([RDNA4Heap class], n, 1, "RDNA4Heap"); }
     { const char *n[] = { "MTLArgumentEncoder" }; rdna4_add_protocols([RDNA4ArgumentEncoder class], n, 1, "RDNA4ArgumentEncoder"); }
     { const char *n[] = { "MTLBinaryArchive" }; rdna4_add_protocols([RDNA4BinaryArchive class], n, 1, "RDNA4BinaryArchive"); }
+    { const char *n[] = { "MTLDynamicLibrary" }; rdna4_add_protocols([RDNA4DynamicLibrary class], n, 1, "RDNA4DynamicLibrary"); }
+    { const char *n[] = { "MTLFunctionHandle" }; rdna4_add_protocols([RDNA4FunctionHandle class], n, 1, "RDNA4FunctionHandle"); }
+    { const char *n[] = { "MTLVisibleFunctionTable", "MTLResource" }; rdna4_add_protocols([RDNA4VisibleFunctionTable class], n, 2, "RDNA4VisibleFunctionTable"); }
     { const char *n[] = { "MTLCounter" }; rdna4_add_protocols([RDNA4Counter class], n, 1, "RDNA4Counter"); }
     { const char *n[] = { "MTLCounterSet" }; rdna4_add_protocols([RDNA4CounterSet class], n, 1, "RDNA4CounterSet"); }
     { const char *n[] = { "MTLCounterSampleBuffer" }; rdna4_add_protocols([RDNA4CounterSampleBuffer class], n, 1, "RDNA4CounterSampleBuffer"); }
@@ -738,7 +735,9 @@ static void rdna4_census_log(void) {
             RDNA4LOG("compute pipeline creation failed after the wait: %s", e2.localizedDescription.UTF8String);
         }
     }
-    if (e.code == 41 && rdna4_fallback_ok()) {
+    RDNA4LinkCtx *lk = rdna4_lk_for(fn);
+    const BOOL noStage2Fallback = (lk && lk->requireStage2) ? YES : NO;
+    if (e.code == 41 && !noStage2Fallback && rdna4_fallback_ok()) {
         // WS/admitted apps need a valid pipeline to avoid MPS/Metal aborts.
         // Its dispatches are temporary no-ops until hot-swap installs the real shader.
         NSMutableArray *paths = [NSMutableArray array], *notes = [NSMutableArray array];
@@ -1077,8 +1076,8 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (BOOL)supportsRaytracing { return NO; }
 - (BOOL)supportsRaytracingFromRender { return NO; }
 - (BOOL)supportsPrimitiveMotionBlur { return NO; }
-- (BOOL)supportsFunctionPointers { return NO; }
-- (BOOL)supportsFunctionPointersFromRender { return NO; }
+- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }
+- (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }
 - (BOOL)supportsPullModelInterpolation {
     const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
     return rdna4dc_metal3_pull_model_ok(&m3) ? YES : NO;

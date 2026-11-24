@@ -555,12 +555,13 @@ static void test_source_pins(const char *src_dir, const char *asm_dir) {
               "no +1 ARC leak on scratchBufferAllocator");
     }
 
-    CHECK("pin: residency_set_impl documents Wave 2B integration & enforces snapshot/sparse rules",
+    CHECK("pin: residency_set_impl documents Wave 2B integration & accepts sparse heaps/textures",
           strstr(rs_inc, "newResidencySetWithDescriptor:(id)descriptor error:") != NULL &&
           strstr(rs_inc, "rdna4rs_commit(&_state, &diff)") != NULL &&
           strstr(rs_inc, "@implementation RDNA4ResidencySnapshot") != NULL &&
           strstr(rs_inc, "@implementation RDNA4ResidencySet") != NULL &&
-          strstr(rs_inc, "sel_registerName(\"isSparse\")") != NULL &&
+          strstr(rs_inc, "objc_getClass(\"RDNA4SparseHeap\")") != NULL &&
+          strstr(rs_inc, "sparse textures/heaps are not supported") == NULL &&
           strstr(rs_inc, "RDNA4_DNR(RDNA4ResidencySet)") != NULL,
           "residency set impl complete");
 

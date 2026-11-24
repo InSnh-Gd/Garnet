@@ -27,6 +27,12 @@ static void require(BOOL cond, NSString *msg) {
     if (!cond) failf(msg);
 }
 
+static BOOL resourceAliases(id<MTLResource> a, id<MTLResource> b) {
+    SEL sel = sel_registerName("doesAliasResource:");
+    require([a respondsToSelector:sel], @"resource missing doesAliasResource:");
+    return ((BOOL (*)(id, SEL, id))objc_msgSend)(a, sel, b);
+}
+
 static NSUInteger alignUp(NSUInteger value, NSUInteger alignment) {
     require(alignment > 0 && !(alignment & (alignment - 1)), @"non-power-of-two alignment");
     require(value <= NSUIntegerMax - (alignment - 1), @"alignUp overflow");
@@ -154,7 +160,7 @@ int main(int argc, char **argv) {
             require(b0.heap == heap && b1.heap == heap && tex.heap == heap, @"resource.heap mismatch");
             require(b0.heapOffset == off0 && b1.heapOffset == off1 && tex.heapOffset == off2, @"resource.heapOffset mismatch");
             if (!reference) {
-                require(![b0 doesAliasResource:b1] && ![b0 doesAliasResource:tex] && ![b1 doesAliasResource:tex],
+                require(!resourceAliases(b0, b1) && !resourceAliases(b0, tex) && !resourceAliases(b1, tex),
                         @"disjoint placement resources reported aliasing");
                 require(dev.currentAllocatedSize == baseAlloc + heap.size, @"placement resources double-counted device allocation");
             }
@@ -189,7 +195,7 @@ int main(int argc, char **argv) {
             // Explicit aliasing at off0 after completed GPU sync.
             id<MTLBuffer> bAlias = [heap newBufferWithLength:bufBytes options:privOpts offset:off0];
             require(bAlias != nil && bAlias.heapOffset == off0, @"explicit alias placement failed");
-            if (!reference) require([b0 doesAliasResource:bAlias] && [bAlias doesAliasResource:b0], @"alias predicate false");
+            if (!reference) require(resourceAliases(b0, bAlias) && resourceAliases(bAlias, b0), @"alias predicate false");
             fillBufferGPU(q, fillPso, bAlias, 0xCAFE0000u, count, @"fill_bAlias");
             uint32_t outAlias[kPrivCount];
             readBufferGPU(dev, q, bAlias, outAlias, bufBytes, @"read_bAlias");

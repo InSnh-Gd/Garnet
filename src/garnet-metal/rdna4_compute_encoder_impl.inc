@@ -101,6 +101,26 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     RDNA4Buffer *b = nil; NSUInteger off = 0;
     if ([_cb rdna4Bytes:p length:n buffer:&b offset:&off]) [self setBuffer:b offset:off atIndex:i];
 }
+- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    if ([_cb rdna4Error]) return;
+    if (i >= 31) { [_cb rdna4Fail:@"compute setVisibleFunctionTable: buffer index >= 31"]; return; }
+    if (!t) { [self setBuffer:nil offset:0 atIndex:i]; return; }
+    if (![t isKindOfClass:[RDNA4VisibleFunctionTable class]] || [t device] != [_cb device]) {
+        [_cb rdna4Fail:@"compute setVisibleFunctionTable: not an RDNA4VisibleFunctionTable for this device"];
+        return;
+    }
+    RDNA4VisibleFunctionTable *vft = (RDNA4VisibleFunctionTable *)t;
+    [vft rdna4RetainIntoCommandBuffer:_cb];
+    [self setBuffer:[vft rdna4BackingBuffer] offset:0 atIndex:i];
+}
+- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if (r.length == 0) return;
+    if (!t || r.location > 31 || r.length > 31 - r.location) {
+        [_cb rdna4Fail:@"compute setVisibleFunctionTables: invalid range or NULL array"];
+        return;
+    }
+    for (NSUInteger k = 0; k < r.length; k++) [self setVisibleFunctionTable:t[k] atBufferIndex:r.location + k];
+}
 - (void)setTexture:(id)t atIndex:(NSUInteger)i {
     if (i >= 128 || (t && ![t isKindOfClass:[RDNA4Texture class]])) { [_cb rdna4Fail:@"compute setTexture: bad index or class"]; return; }
     _st.tex[i] = t;

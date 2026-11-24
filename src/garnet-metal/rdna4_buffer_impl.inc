@@ -171,7 +171,8 @@ static VkBufferCreateInfo rdna4_heap_buffer_create_info(NSUInteger len, VkExtern
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                 (RDNA4R.bufferAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0) };
+                 (RDNA4R.bufferAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0) |
+                 (RDNA4R.accelStruct ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0) };
 }
 static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *span) {
     long page = sysconf(_SC_PAGESIZE);

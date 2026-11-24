@@ -996,3 +996,57 @@ for b in test-metal3-compute-icb test-metal3-sparse-prt \
     "$TMPDIR/$b" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Metal 3 Dynamic Libraries & Visible Function Tables (3.2, 3.3)
+
+Host pure-C suite (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
+and Clang ASan + UBSan with `-Wshadow -Wsign-conversion`) validates the `.grdl`
+dynamic library container codec (atomic roundtrip, magic/version/SHA-256/truncation/tamper
+rejection), Stage 2 linked cache-key determinism, patch `0074` VFT buffer encoding &
+OOB-clamping simulation, `visible_function_tables` JSON reflection parsing, Footnote 10
+mesh vs render function-pointer/RT exclusion, and source pins (`test-dynlib-vft.c`,
+plus assembled `GarnetDevice.m` Wave 3B wiring pins in `test-gate.c`):
+
+```sh
+python3 src/garnet-metal/assemble-device.py \
+  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
+
+cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Wshadow -Wsign-conversion \
+  -Isrc/garnet-metal -o "$TMPDIR/test-dynlib-vft" src/garnet-metal/test-dynlib-vft.c
+"$TMPDIR/test-dynlib-vft" src/garnet-metal
+cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
+  -o "$TMPDIR/test-gate" src/garnet-metal/test-gate.c
+"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
+```
+
+Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
+on macOS at both `-O0` and `-O2` for early ARC release coverage):
+
+- `test-metal3-dynamic-lib.m` (Task `3.2`): `newDynamicLibrary:error:`,
+  `serializeToURL:error:` (`.grdl` container on Garnet), `newDynamicLibraryWithURL:error:`
+  reload, compute + vertex + fragment dynamic library linking via
+  `preloadedLibraries`, `MTLLinkedFunctions.binaryFunctions`, and non-dynamic /
+  missing-symbol / corrupt / truncated / foreign `.metallib` rejection.
+- `test-metal3-function-tables.m` (Task `3.3`): compute and fragment
+  `functionHandleWithFunction:` / `newVisibleFunctionTableWithDescriptor:`,
+  `setVisibleFunctionTable:atBufferIndex:` / `setFragmentVisibleFunctionTable:atBufferIndex:`,
+  dynamic handle swaps on the same PSO without recreation, null & OOB slot safe
+  fallback without GPU hang, ARC early-release lifetime test, and Footnote 10
+  mesh + render function-pointer rejection.
+
+```sh
+for t in test-metal3-dynamic-lib test-metal3-function-tables; do
+  for opt in O0 O2; do
+    clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
+      -framework Foundation -framework Metal \
+      "src/garnet-metal/$t.m" -o "$TMPDIR/$t-$opt"
+  done
+done
+
+for b in test-metal3-dynamic-lib-O0 test-metal3-dynamic-lib-O2 \
+         test-metal3-function-tables-O0 test-metal3-function-tables-O2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

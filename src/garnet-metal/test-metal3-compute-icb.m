@@ -198,7 +198,7 @@ static void testCPUEncodedComputeICB(id<MTLDevice> dev, id<MTLCommandQueue> queu
                                      id<MTLComputePipelineState> psoA,
                                      id<MTLComputePipelineState> psoB,
                                      id<MTLComputePipelineState> psoTG) {
-    const uint32_t N = 128;
+    enum : uint32_t { N = 128u };
     id<MTLBuffer> bIn = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bMid = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bTG = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
@@ -253,10 +253,14 @@ static void testCPUEncodedComputeICB(id<MTLDevice> dev, id<MTLCommandQueue> queu
     [c2 concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
     /* Verify CPU-side command inspection getters */
-    if ([c1 respondsToSelector:@selector(hasBarrier)] && ![c1 hasBarrier]) fail(@"c1 hasBarrier expected YES");
-    if ([c2 respondsToSelector:@selector(hasBarrier)] && [c2 hasBarrier]) fail(@"c2 clearBarrier expected NO");
-    if ([c2 respondsToSelector:@selector(getThreadgroupMemoryLengthAtIndex:)] &&
-        [c2 getThreadgroupMemoryLengthAtIndex:0] != 32 * sizeof(uint32_t))
+    SEL hasBarrierSel = sel_registerName("hasBarrier");
+    if ([c1 respondsToSelector:hasBarrierSel] && !((BOOL (*)(id, SEL))objc_msgSend)(c1, hasBarrierSel))
+        fail(@"c1 hasBarrier expected YES");
+    if ([c2 respondsToSelector:hasBarrierSel] && ((BOOL (*)(id, SEL))objc_msgSend)(c2, hasBarrierSel))
+        fail(@"c2 clearBarrier expected NO");
+    SEL getTgLenSel = sel_registerName("getThreadgroupMemoryLengthAtIndex:");
+    if ([c2 respondsToSelector:getTgLenSel] &&
+        ((NSUInteger (*)(id, SEL, NSUInteger))objc_msgSend)(c2, getTgLenSel, 0) != 32 * sizeof(uint32_t))
         fail(@"c2 threadgroup memory length getter mismatch");
 
     /* Slot 3: encode then reset to verify resetWithRange clears it */
@@ -304,12 +308,11 @@ static void testGPUEncodedComputeICB(id<MTLDevice> dev, id<MTLCommandQueue> queu
                                      BOOL isRef) {
     id<MTLFunction> fnEnc = [lib newFunctionWithName:@"k_gpu_encode_compute_icb"];
     id<MTLFunction> fnInh = [lib newFunctionWithName:@"k_gpu_encode_inherit_icb"];
-    id<MTLFunction> fnRng = [lib newFunctionWithName:@"k_write_range"];
     id<MTLComputePipelineState> psoEnc = newComputePSO(dev, lib, @"k_gpu_encode_compute_icb", NO);
     id<MTLComputePipelineState> psoInh = newComputePSO(dev, lib, @"k_gpu_encode_inherit_icb", NO);
     id<MTLComputePipelineState> psoRng = newComputePSO(dev, lib, @"k_write_range", NO);
 
-    const uint32_t N = 128;
+    enum : uint32_t { N = 128u };
     id<MTLBuffer> bIn = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bMid = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bAux = [dev newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];

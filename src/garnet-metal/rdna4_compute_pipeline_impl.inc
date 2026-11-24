@@ -20,7 +20,7 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     NSMutableArray *out = [NSMutableArray array];
     pthread_mutex_lock(&rdna4_icb_compute_reg_mu);
     for (id obj in rdna4_icb_compute_reg) {
-        if ([obj device] == dev && [obj supportIndirectCommandBuffers]) {
+        if ([obj device] == dev && [(id<MTLComputePipelineState>)obj supportIndirectCommandBuffers]) {
             [out addObject:obj];
             if (out.count >= RDNA4_ICB_MAX_CANDIDATE_PIPELINES) break;
         }
@@ -51,6 +51,8 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     NSMutableDictionary *_icbVariants;
     uint32_t _compiledLocals[32][3];
     uint32_t _nCompiledLocals;
+    uint64_t _vftOwnerToken;
+    rdna4vft_reflection_t _vft;
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err;
@@ -78,6 +80,8 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
 - (const uint32_t *)nominalLocal; - (int)mode; - (uint32_t)pcOffset; - (uint32_t)pcSize;
 - (id)reflection;
 - (void)rdna4SetReflection:(MTLComputePipelineReflection *)reflection;
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function;
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor;
 @end
 
 @implementation RDNA4ComputePipelineState
@@ -139,6 +143,12 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
         rdna4x_linkage_compute(descriptor);
         installedLk = (rdna4_lk_for(fn) != nil);
     }
+    NSError *lkErr = rdna4_lk_error(fn);
+    if (lkErr) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = lkErr;
+        return nil;
+    }
 #ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
     NSData *baSpv = nil, *baVk = nil;
     NSDictionary *baMeta = nil;
@@ -196,6 +206,9 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     NSDictionary *preMeta = meta;
     spv = rdna4_gpu_argument_spv(spv, &meta, deadline, err);
     if (!spv) return nil;
+    _vftOwnerToken = rdna4_vft_next_owner_token();
+    NSDictionary *vftMeta = (meta && meta[@"visible_function_tables"]) ? meta : preMeta;
+    if (!rdna4x_parse_vft_from_meta(vftMeta, &_vft, err)) return nil;
     if (!meta || !meta[@"kernel_dispatch"] || ![meta[@"local_size"] isKindOfClass:[NSArray class]] || [meta[@"local_size"] count] != 3) {
         if (err) *err = rdna4_err(62, [NSString stringWithFormat:@"compute function '%@': spvcache has no .meta.json with kernel_dispatch/local_size (run add-air.py)", fname]); return nil; }
     id kd = meta[@"kernel_dispatch"];
@@ -468,6 +481,7 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
         if (_sm) vkDestroyShaderModule(RDNA4R.dev, _sm, NULL);
     }
     rdna4_argument_scan_reflection_plan_destroy(&_scan);
+    rdna4vft_refl_destroy(&_vft);
     free(_pb);
     uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);
 }
@@ -507,6 +521,16 @@ RDNA4_DNR(RDNA4ComputePipelineState)
 - (NSUInteger)staticThreadgroupMemoryLength { return 0; }
 - (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { (void)d; return 0; }
 - (BOOL)supportIndirectCommandBuffers { return _icb; }
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real functionHandleWithFunction:function];
+    return rdna4_vft_pipeline_handle(self, _dev, _vftOwnerToken, &_vft, function, 0);
+}
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real newVisibleFunctionTableWithDescriptor:descriptor];
+    return rdna4_vft_pipeline_new_table(self, _dev, _vftOwnerToken, &_vft, descriptor, 0);
+}
 - (uint64_t)uniqueIdentifier { return rdna4_resource_uid(&_uid); }
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130000
 - (MTLResourceID)gpuResourceID API_AVAILABLE(macos(13.0)) {

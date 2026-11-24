@@ -26,9 +26,9 @@ enum {
     kH = 16,
     kGuardBytes = 256,
     kGuardWords = kGuardBytes / 4,
-    kHeadGuard = 0xDEADBEEFu,
-    kTailGuard = 0xCAFEBABEu,
 };
+static const uint32_t kHeadGuard = 0xDEADBEEFu;
+static const uint32_t kTailGuard = 0xCAFEBABEu;
 
 typedef struct {
     float bcP[4];

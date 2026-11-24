@@ -182,8 +182,18 @@ int main(int argc, char **argv) {
     { char *gm = slurp(dir, "GarnetDevice.m");
       const int assembled = gm && strstr(gm, "@implementation RDNA4RenderPipelineState") != NULL;
       char *rp = assembled ? NULL : slurp(dir, "rdna4_render_pipeline_impl.inc");
+      char *cp = assembled ? NULL : slurp(dir, "rdna4_compute_pipeline_impl.inc");
+      char *re = assembled ? NULL : slurp(dir, "rdna4_render_encoder_impl.inc");
+      char *ce = assembled ? NULL : slurp(dir, "rdna4_compute_encoder_impl.inc");
+      char *bf = assembled ? NULL : slurp(dir, "rdna4_buffer_impl.inc");
+      char *rs = assembled ? NULL : slurp(dir, "rdna4_residency_set_impl.inc");
       char *cb = assembled ? NULL : slurp(dir, "rdna4_command_buffer_impl.inc");
       const char *rpSrc = assembled ? gm : rp;
+      const char *cpSrc = assembled ? gm : cp;
+      const char *reSrc = assembled ? gm : re;
+      const char *ceSrc = assembled ? gm : ce;
+      const char *bfSrc = assembled ? gm : bf;
+      const char *rsSrc = assembled ? gm : rs;
       const char *cbSrc = assembled ? gm : cb;
       CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
             gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
@@ -194,8 +204,10 @@ int main(int argc, char **argv) {
                && strstr(gm, "- (BOOL)supportsRaytracing { return NO; }")
                && strstr(gm, "- (BOOL)supportsRaytracingFromRender { return NO; }")
                && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return NO; }")
-               && strstr(gm, "- (BOOL)supportsFunctionPointers { return NO; }")
-               && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return NO; }")
+               && strstr(gm, "- (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(gm, "- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(gm, "- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }")
                && strstr(gm, "- (BOOL)supportsBinaryArchives { return NO; }")
                && strstr(gm, "- (BOOL)supportsPullModelInterpolation")
                && strstr(gm, "rdna4dc_metal3_pull_model_ok(&m3)")
@@ -210,7 +222,7 @@ int main(int argc, char **argv) {
                                  && strstr(gm, "#include \"rdna4_counters_impl.inc\"")
                                  && strstr(gm, "#include \"rdna4_residency_set_impl.inc\"")
                                  && strstr(gm, "#include \"rdna4_io_queue_impl.inc\"")))
-               && strstr(gm, "[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
+               && strstr(gm, "(id<MTLBinaryArchive>)[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
                && strstr(rpSrc, "rdna4_ba_lookup_render(")
                && strstr(rpSrc, "rdna4_ba_vkcache()")
                && strstr(gm, "rdna4_device_counter_sets()")
@@ -246,7 +258,45 @@ int main(int argc, char **argv) {
                && strstr(cbSrc, "objc_getClass(\"RDNA4AccelerationStructure\")")
                && strstr(cbSrc, "rdna4CurrentHandle")
                && strstr(cbSrc, "objc_getClass(\"RDNA4SparseHeap\")"));
+      CHECK("G14: GarnetDevice.m wires Wave 3B dynlib/VFT, AS buffer build-input bit, and sparse residency",
+            gm && rpSrc && cpSrc && reSrc && ceSrc && bfSrc && rsSrc
+               && (assembled ? (strstr(gm, "@implementation RDNA4DynamicLibrary")
+                                && strstr(gm, "@implementation RDNA4FunctionHandle")
+                                && strstr(gm, "@implementation RDNA4VisibleFunctionTable"))
+                             : (strstr(gm, "#include \"rdna4_dynlib_vft_impl.inc\"") != NULL))
+               && strstr(gm, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self library:library error:error]")
+               && strstr(gm, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error]")
+               && strstr(gm, "\"MTLDynamicLibrary\"")
+               && strstr(gm, "\"MTLFunctionHandle\"")
+               && strstr(gm, "\"MTLVisibleFunctionTable\"")
+               && strstr(cpSrc, "[(id<MTLComputePipelineState>)obj supportIndirectCommandBuffers]")
+               && strstr(cpSrc, "rdna4_lk_error(fn)")
+               && strstr(cpSrc, "rdna4x_parse_vft_from_meta(")
+               && strstr(cpSrc, "- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function")
+               && strstr(cpSrc, "- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor")
+               && strstr(gm, "!noStage2Fallback && rdna4_fallback_ok()")
+               && strstr(rpSrc, "rdna4_vft_validate_render_footnote10(")
+               && strstr(rpSrc, "rdna4x_parse_vft_from_meta(")
+               && strstr(rpSrc, "stage2Only")
+               && strstr(rpSrc, "noStage2Fallback || !rdna4_fallback_ok()")
+               && strstr(rpSrc, "- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage")
+               && strstr(rpSrc, "- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage")
+               && strstr(ceSrc, "- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(ceSrc, "- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r")
+               && strstr(reSrc, "- (void)setVertexVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "- (void)setVertexVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r")
+               && strstr(reSrc, "- (void)setFragmentVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "- (void)setFragmentVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r")
+               && strstr(reSrc, "setFragmentVisibleFunctionTable:atBufferIndex: ignored") == NULL
+               && strstr(bfSrc, "VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR")
+               && strstr(rsSrc, "objc_getClass(\"RDNA4SparseHeap\")")
+               && strstr(rsSrc, "sparse textures/heaps are not supported") == NULL);
       free(cb);
+      free(rs);
+      free(bf);
+      free(ce);
+      free(re);
+      free(cp);
       free(rp);
       free(gm); }
     // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----

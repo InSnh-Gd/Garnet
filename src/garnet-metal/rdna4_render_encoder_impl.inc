@@ -472,11 +472,6 @@ RDNA4_DNR(RDNA4RenderEncoder)
     [self rdna4OccEndQuery];
     vkCmdEndRenderPass([_cb vk]); _inPass = NO;
 }
-// ---- build 18: the VETTED list (void / scalar selectors only; everything else keeps today's crash, logged first by RDNA4_DNR) ----
-// V1 setFragmentVisibleFunctionTable:atBufferIndex: (named by the P3 evidence: RenderBox's __TEXT carries this selector). Safe value: NO-OP. Why that is safe: a fragment function that CALLS through a visible
-// function table uses the air.get_function_pointer_visible_function_table intrinsics, which the translator accepts only inside a linkage translation (air_intrinsics.rs "StaticLinkage"); this bundle's pipeline
-// creation never supplies a table linkage, so such a pipeline is refused at creation and can never read the binding; for every other pipeline the binding is irrelevant. (SUSPECTED, not run on a real app.)
-- (void)setFragmentVisibleFunctionTable:(id)t atBufferIndex:(NSUInteger)i { (void)t; (void)i; RDNA4_ONCE("setFragmentVisibleFunctionTable:atBufferIndex: ignored (vetted no-op: pipelines that call through a function table are refused at creation)"); }
 - (void)setVisibilityResultMode:(NSUInteger)mode offset:(NSUInteger)offset {
     if (!_occ) { RDNA4_ONCE("setVisibilityResultMode:offset: on a pass without a (usable) visibility result buffer: ignored"); return; }
     int endq = 0; int rc = rdna4occ_set(_occ, mode, offset, &endq);
@@ -906,6 +901,45 @@ RDNA4_ENCODER_SHARED
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < 31) _sf.buf[i].off = o; }
 - (void)setVertexBuffers:(const id __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetBuffer:b[k] offset:o[k] index:r.location + k frag:NO]; }
 - (void)setFragmentBuffers:(const id __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetBuffer:b[k] offset:o[k] index:r.location + k frag:YES]; }
+- (void)rdna4SetVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i frag:(BOOL)f {
+    if ([_cb rdna4Error]) return;
+    if (i >= 31) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"%s setVisibleFunctionTable: buffer index %lu >= 31",
+                        f ? "fragment" : "vertex", (unsigned long)i]];
+        return;
+    }
+    if (!t) { [self rdna4SetBuffer:nil offset:0 index:i frag:f]; return; }
+    if (![t isKindOfClass:[RDNA4VisibleFunctionTable class]] || [t device] != [_cb device]) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"%s setVisibleFunctionTable: not an RDNA4VisibleFunctionTable for this device",
+                        f ? "fragment" : "vertex"]];
+        return;
+    }
+    RDNA4VisibleFunctionTable *vft = (RDNA4VisibleFunctionTable *)t;
+    [vft rdna4RetainIntoCommandBuffer:_cb];
+    [self rdna4SetBuffer:[vft rdna4BackingBuffer] offset:0 index:i frag:f];
+}
+- (void)setVertexVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    [self rdna4SetVisibleFunctionTable:t atBufferIndex:i frag:NO];
+}
+- (void)setVertexVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if (r.length == 0) return;
+    if (!t || r.location > 31 || r.length > 31 - r.location) {
+        [_cb rdna4Fail:@"vertex setVisibleFunctionTables: invalid range or NULL array"];
+        return;
+    }
+    for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetVisibleFunctionTable:t[k] atBufferIndex:r.location + k frag:NO];
+}
+- (void)setFragmentVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    [self rdna4SetVisibleFunctionTable:t atBufferIndex:i frag:YES];
+}
+- (void)setFragmentVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if (r.length == 0) return;
+    if (!t || r.location > 31 || r.length > 31 - r.location) {
+        [_cb rdna4Fail:@"fragment setVisibleFunctionTables: invalid range or NULL array"];
+        return;
+    }
+    for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetVisibleFunctionTable:t[k] atBufferIndex:r.location + k frag:YES];
+}
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self rdna4SetBytes:p length:n index:i frag:NO]; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self rdna4SetBytes:p length:n index:i frag:YES]; }
 - (void)setVertexTexture:(id)t atIndex:(NSUInteger)i { [self rdna4SetTexture:t index:i frag:NO]; }

@@ -28,6 +28,8 @@
     RDNA4ArgumentTables _argumentTables;
     rdna4_argument_scan_reflection_plan _scanV, _scanF;
     uint32_t _maxAmp;
+    uint64_t _vftOwnerToken;
+    rdna4vft_reflection_t _vftV, _vftF;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
@@ -66,6 +68,8 @@
 - (uint32_t)tessSet;
 - (uint64_t)tessCacheKey;
 - (uint32_t)rdna4MaxVertexAmplificationCount;
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage;
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
 @end
 static VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
@@ -81,8 +85,14 @@ static NSData *rdna4_spv_lookup_impl(id fn, const char *role, NSError **err, NSS
     if (rdna4_force_fallback()) { if (err) *err = rdna4_err(41, [NSString stringWithFormat:@"RDNA4M_FORCE_FALLBACK: %s treated as a spvcache miss", role]); return nil; }
     NSString *sha = rdna4_sha256hex(bc);
     NSString *path = nil; NSData *spv = nil;
-    RDNA4LinkCtx *lk = rdna4_lk_for(fn);   // build 18 (P3): a linked stage looks under the linked key first, then under the entry's own sha (an entry that needs none of its dependencies translates alone)
-    for (NSString *cs in (lk ? @[ lk->lsha, sha ] : @[ sha ])) {
+    RDNA4LinkCtx *lk = rdna4_lk_for(fn);   // build 18 (P3) + Metal 3 Stage 2 linkage
+    if (lk && lk->linkageError) {
+        if (err) *err = lk->linkageError;
+        return nil;
+    }
+    const BOOL stage2Only = lk && lk->useStage2 && (lk->requireStage2 || rdna4x_stage2_symbols_available());
+    NSArray<NSString *> *keys = lk ? (stage2Only ? @[ lk->lsha ] : @[ lk->lsha, sha ]) : @[ sha ];
+    for (NSString *cs in keys) {
         for (NSString *dir in rdna4_spv_dirs()) {   // H2: bundle spvcache first, then the side directory
             path = [dir stringByAppendingPathComponent:[cs stringByAppendingString:@".spv"]];
             spv = [NSData dataWithContentsOfFile:path];
@@ -148,6 +158,11 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         return nil;
     }
     _maxAmp = (uint32_t)reqMaxAmp;
+    if (!rdna4_vft_validate_render_footnote10(d, NO, NO, NO, err)) return nil;
+    NSError *vlkErr = rdna4_lk_error(d.vertexFunction);
+    if (vlkErr) { if (err) *err = vlkErr; return nil; }
+    NSError *flkErr = d.fragmentFunction ? rdna4_lk_error(d.fragmentFunction) : nil;
+    if (flkErr) { if (err) *err = flkErr; return nil; }
     const BOOL hasFrag = d.fragmentFunction != nil;
     _hasFrag = hasFrag;
     _rastOff = !d.isRasterizationEnabled;
@@ -223,7 +238,10 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                 }
             }
             if (!vsd || (hasFrag && !fsd)) {
-                if (!rdna4_fallback_ok()) {
+                RDNA4LinkCtx *vlk = rdna4_lk_for(d.vertexFunction);
+                RDNA4LinkCtx *flk = hasFrag ? rdna4_lk_for(d.fragmentFunction) : nil;
+                const BOOL noStage2Fallback = ((vlk && vlk->requireStage2) || (flk && flk->requireStage2)) ? YES : NO;
+                if (noStage2Fallback || !rdna4_fallback_ok()) {
                     if (translationFailure) {
                         NSMutableDictionary *info = [e.userInfo mutableCopy];
                         info[NSUnderlyingErrorKey] = translationFailure;
@@ -246,6 +264,13 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         vsd = rdna4_gpu_argument_spv(vsd, &mv_, deadline, err);
         if (hasFrag) fsd = rdna4_gpu_argument_spv(fsd, &mf_, deadline, err);
         if (!vsd || (hasFrag && !fsd)) return nil;
+        _vftOwnerToken = rdna4_vft_next_owner_token();
+        NSDictionary *vftMetaV = (mv_ && mv_[@"visible_function_tables"]) ? mv_ : preV;
+        if (!rdna4x_parse_vft_from_meta(vftMetaV, &_vftV, err)) return nil;
+        if (hasFrag) {
+            NSDictionary *vftMetaF = (mf_ && mf_[@"visible_function_tables"]) ? mf_ : preF;
+            if (!rdna4x_parse_vft_from_meta(vftMetaF, &_vftF, err)) return nil;
+        }
         char why[256] = "";
         fsp = hasFrag ? rdna4_spv_set(fsd, 1) : nil;   // fragment descriptors live in set 1 (binding-model comment above)
         rv = calloc(1, sizeof *rv); rf = hasFrag ? calloc(1, sizeof *rf) : NULL;
@@ -958,6 +983,8 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     }
     rdna4_argument_scan_reflection_plan_destroy(&_scanV);
     rdna4_argument_scan_reflection_plan_destroy(&_scanF);
+    rdna4vft_refl_destroy(&_vftV);
+    rdna4vft_refl_destroy(&_vftF);
     free(_pbV); free(_pbF);
     uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);   // the published real object
 }
@@ -992,5 +1019,19 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (NSUInteger)imageblockSampleLength { return 0; }
 - (BOOL)supportIndirectCommandBuffers { return _icb; }
 - (uint32_t)rdna4MaxVertexAmplificationCount { return _maxAmp ? _maxAmp : 1u; }
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage {
+    RDNA4RenderPipelineState *real = [self rdna4Real];
+    if (real) return [real functionHandleWithFunction:function stage:stage];
+    const rdna4vft_reflection_t *r = (stage == MTLRenderStageVertex) ? &_vftV :
+        (stage == MTLRenderStageFragment) ? &_vftF : NULL;
+    return rdna4_vft_pipeline_handle(self, _dev, _vftOwnerToken, r, function, (NSUInteger)stage);
+}
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage {
+    RDNA4RenderPipelineState *real = [self rdna4Real];
+    if (real) return [real newVisibleFunctionTableWithDescriptor:descriptor stage:stage];
+    if (stage != MTLRenderStageVertex && stage != MTLRenderStageFragment) return nil;
+    const rdna4vft_reflection_t *r = (stage == MTLRenderStageVertex) ? &_vftV : &_vftF;
+    return rdna4_vft_pipeline_new_table(self, _dev, _vftOwnerToken, r, descriptor, (NSUInteger)stage);
+}
 @end
 
