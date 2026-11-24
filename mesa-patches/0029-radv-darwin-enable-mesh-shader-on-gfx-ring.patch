@@ -1,0 +1,88 @@
+From: Garnet local integration
+Subject: [PATCH 29/29] radv/darwin: enable meshShader on GFX ring when no async compute queue exists
+
+Split radv_mesh_enabled() from radv_taskmesh_enabled() in
+radv_physical_device.c so GFX10.3+ / GFX12 hardware can expose
+VK_EXT_mesh_shader with meshShader=true on GFX ring 0 even when
+ip[AMD_IP_COMPUTE].num_queues == 0 (such as Darwin's RDNA4N backend,
+where patch 0011 hides async compute rings because Garnet's Submit
+parser accepts only GFX instance 0, ring 0).
+
+Keep taskShader and meshAndTaskShaderDerivatives gated on
+radv_taskmesh_enabled() (which still requires radv_compute_queue_enabled()),
+and omit VK_SHADER_STAGE_TASK_BIT_EXT from taskmesh_stages when no compute
+queue is available. Mesh-only pipelines execute on GFX ring 0 via
+PKT3_DISPATCH_MESH_DIRECT without initializing an ACE gang command buffer.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 + patches 0001..0028.
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -75,17 +75,23 @@
+ }
+ 
+ static bool
+-radv_taskmesh_enabled(const struct radv_physical_device *pdev)
++radv_mesh_enabled(const struct radv_physical_device *pdev)
+ {
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+    if (RADV_DEBUG(instance, NO_MESH_SHADER))
+       return false;
+ 
+-   return pdev->use_ngg && !pdev->use_llvm && pdev->info.gfx_level >= GFX10_3 && radv_compute_queue_enabled(pdev) &&
++   return pdev->use_ngg && !pdev->use_llvm && pdev->info.gfx_level >= GFX10_3 &&
+           !pdev->info.has_taskmesh_indirect0_bug;
+ }
+ 
++static bool
++radv_taskmesh_enabled(const struct radv_physical_device *pdev)
++{
++   return radv_mesh_enabled(pdev) && radv_compute_queue_enabled(pdev);
++}
++
+ bool
+ radv_spm_trace_enabled(const struct radv_physical_device *pdev)
+ {
+@@ -934,7 +940,7 @@
+       .EXT_map_memory_placed = true,
+       .EXT_memory_budget = true,
+       .EXT_memory_priority = true,
+-      .EXT_mesh_shader = radv_taskmesh_enabled(pdev),
++      .EXT_mesh_shader = radv_mesh_enabled(pdev),
+       .EXT_multi_draw = true,
+       .EXT_multisampled_render_to_single_sampled = radv_msrtss_enabled(pdev),
+       .EXT_mutable_descriptor_type = true, /* Trivial promotion from VALVE. */
+@@ -1035,6 +1041,7 @@
+ radv_physical_device_get_features(const struct radv_physical_device *pdev, struct vk_features *features)
+ {
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
++   bool mesh_en = radv_mesh_enabled(pdev);
+    bool taskmesh_en = radv_taskmesh_enabled(pdev);
+    bool has_perf_query = radv_perf_query_supported(pdev);
+    bool has_shader_image_float_minmax = pdev->info.gfx_level <= GFX7 || pdev->info.gfx_level == GFX10 ||
+@@ -1391,10 +1398,10 @@
+       .minLod = true,
+ 
+       /* VK_EXT_mesh_shader */
+-      .meshShader = taskmesh_en,
++      .meshShader = mesh_en,
+       .taskShader = taskmesh_en,
+-      .multiviewMeshShader = taskmesh_en,
+-      .primitiveFragmentShadingRateMeshShader = taskmesh_en,
++      .multiviewMeshShader = mesh_en,
++      .primitiveFragmentShadingRateMeshShader = mesh_en,
+       .meshShaderQueries = false,
+ 
+       /* VK_EXT_depth_clip_control */
+@@ -1818,7 +1825,8 @@
+    const bool enable_sparse = radv_sparse_enabled(pdev);
+ 
+    VkShaderStageFlags taskmesh_stages =
+-      radv_taskmesh_enabled(pdev) ? VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT : 0;
++      (radv_mesh_enabled(pdev) ? VK_SHADER_STAGE_MESH_BIT_EXT : 0) |
++      (radv_taskmesh_enabled(pdev) ? VK_SHADER_STAGE_TASK_BIT_EXT : 0);
+    VkShaderStageFlags rt_stages = radv_enable_rt(pdev) ? RADV_RT_STAGE_BITS : 0;
+ 
+    bool accel_dot = pdev->info.compiler_info.has_accelerated_dot_product;

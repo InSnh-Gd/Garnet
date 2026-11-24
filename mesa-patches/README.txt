@@ -21,7 +21,7 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0028. The kext ABI header that patches 0002-0004 and
+Order matters: 0001 .. 0029. The kext ABI header that patches 0002-0004 and
 0028 mirror is src/garnet/src/GarnetNativeABI.h in this repository; Mesa's copy
 and the kext's copy must stay ABI-compatible (currently 1.13; older ABI <= 1.12
 kernels remain compatible with sparse/PRT disabled).
@@ -64,6 +64,8 @@ kernels remain compatible with sparse/PRT disabled).
 
 0028: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.13 (RDNA4N_CAP_VM_PRT = 1u << 4, RDNA4N_VA_OP_CLEAR/REPLACE, RDNA4N_VM_PAGE_PRT), enable CLEAR/REPLACE/PRT VA operations in the Darwin winsys and mock when QueryInfo.flags advertises RDNA4N_CAP_VM_PRT (continuing to reject them with -EOPNOTSUPP on older ABI <= 1.12 kernels and HOST_BO), replace 0021's unconditional false in radv_sparse_enabled() with a runtime RDNA4N_CAP_VM_PRT capability check that preserves Mesa's sparse disable flags, and reject composite child-backed BOs as sparse backing targets.
 
+0029: split radv_mesh_enabled() from radv_taskmesh_enabled() in src/amd/vulkan/radv_physical_device.c so GFX10.3+ / GFX12 hardware exposes VK_EXT_mesh_shader (meshShader=true, multiviewMeshShader=true, primitiveFragmentShadingRateMeshShader=true, meshShaderQueries=false) on GFX ring 0 when ip[AMD_IP_COMPUTE].num_queues == 0, while keeping taskShader, meshAndTaskShaderDerivatives, and VK_SHADER_STAGE_TASK_BIT_EXT gated on radv_compute_queue_enabled(). Zero kext/ABI changes; mesh-only draws run on GFX ring 0 via PKT3_DISPATCH_MESH_DIRECT.
+
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
     python3 mesa-patches/test-host-composite.py /path/to/patched-mesa "$TMPDIR/host-test"
@@ -94,6 +96,16 @@ and compiles and runs the real post-0028 Darwin kext/mock marshaller and
 radv_sparse_enabled() gating harness under -Wall -Wextra -Werror with ASan+UBSan.
 Pass `--mesa-archive /path/to/mesa.tar.gz` when the pinned Mesa archive is
 available to replay the full 0001..0028 series end-to-end.
+
+Mesh shader series and host check (no Mesa tarball, IOKit, or GPU needed):
+    python3 mesa-patches/test-radv-darwin-mesh-series.py "$TMPDIR/mesh-test"
+This verifies contiguous 0001..0029 patch integrity, validates 0029 with
+`patch -p1 --fuzz=0` and `git apply --check` against exact post-0028
+`radv_physical_device.c` context (or a full Mesa archive via `--mesa-archive`),
+and compiles and runs the extracted `radv_mesh_enabled()` /
+`radv_taskmesh_enabled()` feature and stage-mask harness under
+`-Wall -Wextra -Werror` (both `-O2` and ASan+UBSan). Full `mesa@f5cb8ee` build
+and live RX 9060 XT execution remain separate.
 
 Standalone Vulkan sparse/PRT execution test (buffer + 2D/3D/MSAA residency,
 non-resident zero-read / discard-write, and rebinding; ready for RX 9060 XT
