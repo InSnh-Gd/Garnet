@@ -1,6 +1,57 @@
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4RenderEncoder / RDNA4ComputeEncoder / RDNA4BlitEncoder (10c, 10d, 11e)
 // ---------------------------------------------------------------------------------------------------------------
+#include "rdna4_counters.h"
+
+#ifndef RDNA4_COUNTER_INTERNAL_PROTO
+#define RDNA4_COUNTER_INTERNAL_PROTO
+@protocol RDNA4CounterSampleBufferInternal <NSObject>
+- (id)device;
+- (NSUInteger)sampleCount;
+- (MTLStorageMode)rdna4StorageMode;
+- (BOOL)rdna4SampleOnCommandBuffer:(RDNA4CommandBuffer *)cb
+                   vkCommandBuffer:(VkCommandBuffer)cmd
+                       sampleIndex:(NSUInteger)sampleIndex
+                           barrier:(BOOL)barrier
+                        stageFlags:(VkPipelineStageFlagBits)stage
+                               who:(const char *)who;
+- (BOOL)rdna4ResolveRange:(NSRange)range
+                intoBytes:(uint64_t *)dst
+                    error:(NSError **)err;
+@end
+#endif
+
+static id<RDNA4CounterSampleBufferInternal> rdna4_counter_buffer_check(
+    id sampleBuffer, id expectedDevice, NSUInteger sampleIndex,
+    BOOL checkIndex, NSString **whyOut) {
+    const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
+    if (!rdna4dc_metal3_timestamps_supported(&m3)) {
+        if (whyOut) *whyOut = @"GPU timestamp counters are unsupported on this device";
+        return nil;
+    }
+    Class cls = objc_getClass("RDNA4CounterSampleBuffer");
+    if (!cls || !sampleBuffer || ![sampleBuffer isKindOfClass:cls]) {
+        if (whyOut) *whyOut = @"invalid counter sample buffer";
+        return nil;
+    }
+    id<RDNA4CounterSampleBufferInternal> csb = (id<RDNA4CounterSampleBufferInternal>)sampleBuffer;
+    if ([csb device] != expectedDevice) {
+        if (whyOut) *whyOut = @"counter sample buffer belongs to another device";
+        return nil;
+    }
+    if (checkIndex && !rdna4cnt_index_ok((uint64_t)[csb sampleCount], (uint64_t)sampleIndex)) {
+        if (whyOut) *whyOut = [NSString stringWithFormat:@"sampleIndex %lu out of range (sampleCount %lu)",
+                               (unsigned long)sampleIndex, (unsigned long)[csb sampleCount]];
+        return nil;
+    }
+    return csb;
+}
+
+static BOOL rdna4_counter_pass_index_valid(id<RDNA4CounterSampleBufferInternal> csb, NSUInteger index) {
+    return index == MTLCounterDontSample ||
+           rdna4cnt_index_ok((uint64_t)[csb sampleCount], (uint64_t)index);
+}
+
 static void rdna4_full_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
@@ -103,6 +154,12 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     NSMutableSet *_argumentResources, *_argumentWritable;
     RDNA4ResourceBindings *_resourceBindings;
     uint64_t _resourceSegmentSerial;
+    uint32_t _ampCount, _ampLayerOff, _activeLayerOff;
+    BOOL _ampHasMappings;
+    rdna4amp_mapping _ampMappings[RDNA4AMP_MAX_SUPPORTED_COUNT];
+    id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS];
+    NSUInteger _csbEndV[RDNA4CNT_MAX_PASS_ATTACHMENTS], _csbEndF[RDNA4CNT_MAX_PASS_ATTACHMENTS];
+    uint32_t _nCsbEnd;
 }
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d;
 - (void)rdna4ReleaseRenderHandles;
@@ -153,6 +210,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     if (!self) return nil;
     _cb = cb; _wind = MTLWindingClockwise; _tessFactorScale = 1.0f;
     _fillMode = MTLTriangleFillModeFill; _depthClipMode = MTLDepthClipModeClip;
+    _ampCount = 1u; _ampHasMappings = NO; _ampLayerOff = 0u; _activeLayerOff = 0u;
     _resourceBindings = [RDNA4ResourceBindings new];
     _resourceSegmentSerial = [_cb rdna4SegmentSerial];
     NSUInteger reqLayers = [d respondsToSelector:@selector(renderTargetArrayLength)] ? d.renderTargetArrayLength : 0;
@@ -305,6 +363,25 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
             _hasSamplePos = YES;
         }
     }
+    if ([d respondsToSelector:@selector(sampleBufferAttachments)]) {
+        MTLRenderPassSampleBufferAttachmentDescriptorArray *sbas = d.sampleBufferAttachments;
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLRenderPassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            NSString *cwhy = nil;
+            id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(att.sampleBuffer, [_cb device], 0, NO, &cwhy);
+            if (!csb || !rdna4_counter_pass_index_valid(csb, att.startOfVertexSampleIndex) ||
+                !rdna4_counter_pass_index_valid(csb, att.endOfVertexSampleIndex) ||
+                !rdna4_counter_pass_index_valid(csb, att.startOfFragmentSampleIndex) ||
+                !rdna4_counter_pass_index_valid(csb, att.endOfFragmentSampleIndex)) {
+                RDNA4LOG("render pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                _ended = YES;
+                [super endEncoding];
+                return nil;
+            }
+        }
+    }
     _na = na;
     for (uint32_t i = 0; i < na + _nd; i++) _curLay[i] = _ads[i].initialLayout;
     _rp1 = rdna4_mk_rp_c(_ads, na, _nd, NO, &_rp1c); if (!_rp1) return nil;
@@ -317,6 +394,30 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     _vp = (MTLViewport){ 0, 0, _w, _h, 0, 1 }; _sr = (MTLScissorRect){ 0, 0, _w, _h };
     _vps[0] = _vp; _nvp = 1; _srs[0] = _sr; _nsr = 1;
     RDNA4LOGR("RDNA4RenderEncoder %p: %u x %u x %u, %u attachment(s); the Vulkan render pass begins at the first draw (or at endEncoding)", (__bridge void *)self, _w, _h, _layers, na);
+    if ([d respondsToSelector:@selector(sampleBufferAttachments)]) {
+        MTLRenderPassSampleBufferAttachmentDescriptorArray *sbas = d.sampleBufferAttachments;
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLRenderPassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            id<RDNA4CounterSampleBufferInternal> csb = (id<RDNA4CounterSampleBufferInternal>)att.sampleBuffer;
+            if (att.startOfVertexSampleIndex != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                    sampleIndex:att.startOfVertexSampleIndex barrier:NO
+                                     stageFlags:VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT who:"render-pass-start-vertex"];
+            if (att.startOfFragmentSampleIndex != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                    sampleIndex:att.startOfFragmentSampleIndex barrier:NO
+                                     stageFlags:VK_PIPELINE_STAGE_VERTEX_SHADER_BIT who:"render-pass-start-fragment"];
+            if ((att.endOfVertexSampleIndex != MTLCounterDontSample ||
+                 att.endOfFragmentSampleIndex != MTLCounterDontSample) &&
+                _nCsbEnd < RDNA4CNT_MAX_PASS_ATTACHMENTS) {
+                _csbEnd[_nCsbEnd] = csb;
+                _csbEndV[_nCsbEnd] = att.endOfVertexSampleIndex;
+                _csbEndF[_nCsbEnd] = att.endOfFragmentSampleIndex;
+                _nCsbEnd++;
+            }
+        }
+    }
     [self rdna4OccInit:d];   // build 18 (P2): outside any render pass (the previous encoder has ended), so the query reset is legal
     return self;
 }
@@ -518,7 +619,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     VkRenderPass rp = _rp1; VkFramebuffer fb = _fb; uint32_t ncv = _begun ? 0 : _na + _nd;
     BOOL rpc = _rp1c;
     RDNA4RenderHandles *continuationHandles = nil;
-    if (_begun || _fetch) {   // continuation/fetch passes use the attachments' current layouts
+    if (_begun || _fetch || _ampLayerOff) {   // continuation/fetch/shifted-layer passes use the attachments' current layouts
         VkAttachmentDescription a2[9];
         for (uint32_t i = 0; i < _na; i++) {
             a2[i] = _ads[i]; a2[i].initialLayout = _curLay[i];
@@ -531,7 +632,41 @@ RDNA4_DNR(RDNA4RenderEncoder)
         }
         rp = rdna4_mk_rp_c(a2, _na, _nd, _fetch, &rpc);
         if (!rp) { [_cb rdna4Fail:@"cannot create the continuation / framebuffer-fetch render pass"]; return; }
-        if (_fetch) {
+        if (_ampLayerOff && _ampLayerOff < _layers) {
+            VkImageView ampViews[9];
+            uint32_t ampLayers = _layers - _ampLayerOff;
+            for (uint32_t i = 0; i < _na; i++) {
+                ampViews[i] = ampLayers > 1
+                    ? [_tex[i] rdna4AttViewLevel:_slvl[i] layer:_sslice[i] + _ampLayerOff layerCount:ampLayers]
+                    : [_tex[i] rdna4AttViewLevel:_slvl[i] layer:_sslice[i] + _ampLayerOff];
+            }
+            if (_nd) {
+                ampViews[_na] = ampLayers > 1
+                    ? [_tex[_na] rdna4AttViewLevel:_dlvl layer:_dslice + _ampLayerOff layerCount:ampLayers]
+                    : [_tex[_na] rdna4AttViewLevel:_dlvl layer:_dslice + _ampLayerOff];
+            }
+            BOOL viewsOk = YES;
+            for (uint32_t i = 0; i < _na + _nd; i++) {
+                if (ampViews[i] == VK_NULL_HANDLE) { viewsOk = NO; break; }
+            }
+            if (!viewsOk) {
+                if (!rpc) vkDestroyRenderPass(RDNA4R.dev, rp, NULL);
+                [_cb rdna4Fail:@"amplification layer offset: attachment image view unavailable"];
+                return;
+            }
+            VkFramebuffer ampFb = VK_NULL_HANDLE;
+            VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp,
+                .attachmentCount = _na + _nd, .pAttachments = ampViews, .width = _w, .height = _h, .layers = ampLayers };
+            VkResult r = vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &ampFb);
+            if (r != VK_SUCCESS) {
+                if (!rpc) vkDestroyRenderPass(RDNA4R.dev, rp, NULL);
+                [_cb rdna4Fail:[NSString stringWithFormat:@"vkCreateFramebuffer (amplification layer offset) = %d", r]];
+                return;
+            }
+            continuationHandles = [[RDNA4RenderHandles alloc]
+                initWithRenderPass:rpc ? VK_NULL_HANDLE : rp framebuffer:ampFb];
+            fb = ampFb;
+        } else if (_fetch) {
             if (!_fbf) {   // the fetch framebuffer: same views, a fetch-shaped (input-attachment) render pass for compatibility
                 VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = _na + _nd, .pAttachments = _views, .width = _w, .height = _h, .layers = _layers };
                 VkResult r = vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &_fbf);
@@ -567,7 +702,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     if (!_begun) for (uint32_t index = 0; index < _na; index++)
         if (_ads[index].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
             [_cb rdna4NoteSurfaceOverwrite:_tex[index] width:_w height:_h level:_slvl[index]];
-    _inPass = YES; _begun = YES;
+    _inPass = YES; _begun = YES; _activeLayerOff = _ampLayerOff;
 }
 - (void)rdna4Need:(RDNA4Texture *)t layout:(VkImageLayout)l {
     l = rdna4_use_layout(t, l);
@@ -606,6 +741,51 @@ RDNA4_DNR(RDNA4RenderEncoder)
     }
     for (NSUInteger i = 0; i < n; i++) _srs[i] = r[i];
     _nsr = (uint32_t)n; _sr = r[0];
+}
+- (void)setVertexAmplificationCount:(NSUInteger)count
+                       viewMappings:(const MTLVertexAmplificationViewMapping *)viewMappings {
+    if (_hostWriteDropped) return;
+    if (_ended) { [_cb rdna4Fail:@"render setVertexAmplificationCount after endEncoding"]; return; }
+    if ([_cb rdna4Error]) return;
+    rdna4amp_mapping tmp[RDNA4AMP_MAX_SUPPORTED_COUNT];
+    const rdna4amp_mapping *mp = NULL;
+    if (viewMappings && count >= 1u && count <= RDNA4AMP_MAX_SUPPORTED_COUNT) {
+        for (NSUInteger i = 0; i < count; i++) {
+            tmp[i].viewport_offset = viewMappings[i].viewportArrayIndexOffset;
+            tmp[i].layer_offset = viewMappings[i].renderTargetArrayIndexOffset;
+        }
+        mp = tmp;
+    }
+    const char *why = NULL;
+    if (!rdna4amp_validate_encoder_set((uint64_t)count, mp, RDNA4AMP_MAX_SUPPORTED_COUNT,
+                                       RDNA4R.maxViewports ?: 1u, _layers, &why)) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"setVertexAmplificationCount:%lu: %s",
+                        (unsigned long)count, why ?: "invalid"]];
+        return;
+    }
+    _ampCount = (uint32_t)count;
+    _ampHasMappings = (viewMappings != NULL);
+    if (_ampHasMappings) memcpy(_ampMappings, tmp, count * sizeof(rdna4amp_mapping));
+    else memset(_ampMappings, 0, sizeof _ampMappings);
+    _ampLayerOff = _ampHasMappings ? _ampMappings[0].layer_offset : 0u;
+}
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier {
+    if (_hostWriteDropped) return;
+    if (_ended) { [_cb rdna4Fail:@"render sampleCountersInBuffer after endEncoding"]; return; }
+    if ([_cb rdna4Error]) return;
+    NSString *why = nil;
+    id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(sampleBuffer, [_cb device], sampleIndex, YES, &why);
+    if (!csb) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"render sampleCountersInBuffer: %@", why ?: @"invalid"]];
+        return;
+    }
+    // vkCmdResetQueryPool is forbidden inside an active Vulkan render pass; split cleanly first.
+    if (_inPass) [self rdna4EndPass];
+    [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:sampleIndex barrier:barrier
+                         stageFlags:(barrier ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                who:"render"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { _fillMode = m; }
@@ -875,8 +1055,15 @@ RDNA4_ENCODER_SHARED
     VkFrontFace front = _wind == MTLWindingCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;   // both are window-space (y down) senses
     if ([_pso rdna4DSVk] != _dsVkFmt || [_pso rdna4SampleCount] != _encSamples) {   // bundle 10: the pipeline's attachments must be the pass's (Metal validation; a Vulkan render-pass compatibility rule)
         [_cb rdna4Fail:[NSString stringWithFormat:@"the render pipeline's depth/stencil format (vk %d) or sample count (%u) differs from the pass's (vk %d, %u)", (int)[_pso rdna4DSVk], [_pso rdna4SampleCount], (int)_dsVkFmt, _encSamples]]; return NO; }
+    const char *ampWhy = NULL;
+    if (!rdna4amp_draw_ok(_ampCount, [_pso rdna4MaxVertexAmplificationCount],
+                          _ampHasMappings ? _ampMappings : NULL, _nvp, _layers, &ampWhy)) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"render draw vertex amplification invalid: %s", ampWhy ?: "unsupported"]];
+        return NO;
+    }
     uint32_t dk = [_pso rdna4DSKey:&_dsi];   // bundle 10: 0 for a colour-only pipeline
-    uint32_t vpCount = MAX(1u, MIN(MAX(_nvp, _nsr), 16u));
+    uint32_t vpOff = _ampHasMappings ? _ampMappings[0].viewport_offset : 0u;
+    uint32_t vpCount = rdna4amp_viewport_count(_nvp, _nsr, vpOff, RDNA4R.maxViewports ?: 1u);
     uint32_t rflags = ((_fillMode == MTLTriangleFillModeLines) ? 1u : 0u) |
                       ((_depthClipMode == MTLDepthClipModeClamp) ? 2u : 0u) |
                       (_hasSamplePos ? 4u : 0u) | ((vpCount - 1u) << 3);
@@ -930,6 +1117,16 @@ RDNA4_ENCODER_SHARED
         if (_inPass) { [self rdna4EndPass]; RDNA4LOGR("render pass split: framebuffer fetch %s", [_pso fetch] ? "on" : "off"); }
         _fetch = [_pso fetch];
     }
+    if (_ampLayerOff && !_begun) {
+        // Ensure initial Clear/Load runs across all pass layers before starting a layer-shifted continuation pass.
+        uint32_t savedLayerOff = _ampLayerOff;
+        _ampLayerOff = 0u;
+        [self rdna4BeginPass];
+        if ([_cb rdna4Error]) { _ampLayerOff = savedLayerOff; return NO; }
+        [self rdna4EndPass];
+        _ampLayerOff = savedLayerOff;
+    }
+    if (_inPass && _activeLayerOff != _ampLayerOff) [self rdna4EndPass];
     [self rdna4BeginPass];
     if ([_cb rdna4Error]) return NO;
     [self rdna4OccDraw];   // build 18 (P2): the first draw after a visibility mode / offset change (or pass split) begins its query interval
@@ -974,8 +1171,9 @@ RDNA4_ENCODER_SHARED
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
     VkViewport vps[16]; VkRect2D scs[16];
     for (uint32_t i = 0; i < vpCount; i++) {
-        MTLViewport mv = i < _nvp ? _vps[i] : _vps[_nvp - 1];
-        MTLScissorRect ms = i < _nsr ? _srs[i] : (MTLScissorRect){ 0, 0, _w, _h };
+        uint32_t vi = i + vpOff, si = i + vpOff;
+        MTLViewport mv = vi < _nvp ? _vps[vi] : _vps[_nvp - 1];
+        MTLScissorRect ms = si < _nsr ? _srs[si] : (MTLScissorRect){ 0, 0, _w, _h };
         vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
         scs[i] = (VkRect2D){ { (int32_t)ms.x, (int32_t)ms.y }, { (uint32_t)ms.width, (uint32_t)ms.height } };
     }
@@ -1283,7 +1481,7 @@ RDNA4_ENCODER_SHARED
     if (_hostWriteDropped) { _ended = YES; [super endEncoding]; return; }
     [self rdna4SyncResourceSegment];
     [self rdna4SnapshotResources];
-    if (!_begun && ![_cb rdna4Error]) [self rdna4BeginPass];   // a clear-only encoder still has to run its load action
+    if (!_begun && ![_cb rdna4Error]) { _ampLayerOff = 0u; [self rdna4BeginPass]; }   // a clear-only encoder still has to run its load action across all layers
     _ended = YES;
     if (_dcOn) {   // P5b: fold this encoder's counters into the device totals
         atomic_fetch_add(&RDNA4DO.draws, _dc.draws); atomic_fetch_add(&RDNA4DO.setsReused, _dc.setsReused); atomic_fetch_add(&RDNA4DO.setsAlloc, _dc.setsAllocated);
@@ -1292,6 +1490,22 @@ RDNA4_ENCODER_SHARED
     if (_inPass) { [self rdna4EndPass]; }
     [self rdna4ResolveAll];   // bundle 10: multisample resolve, outside the pass
     rdna4_full_barrier([_cb vk]);
+    if (_nCsbEnd) {
+        BOOL cbOk = ![_cb rdna4Error];
+        for (uint32_t k = 0; k < _nCsbEnd; k++) {
+            id<RDNA4CounterSampleBufferInternal> csb = _csbEnd[k];
+            if (cbOk && csb && _csbEndV[k] != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:_csbEndV[k]
+                                        barrier:NO stageFlags:VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT
+                                            who:"render-pass-end-vertex"];
+            if (cbOk && csb && _csbEndF[k] != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:_csbEndF[k]
+                                        barrier:NO stageFlags:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                            who:"render-pass-end-fragment"];
+            _csbEnd[k] = nil;
+        }
+        _nCsbEnd = 0u;
+    }
     [_cb rdna4ArgumentCheckpoint];
     [self rdna4ReleaseRenderHandles];
     RDNA4LOGR("RDNA4RenderEncoder endEncoding (render pass ended)");

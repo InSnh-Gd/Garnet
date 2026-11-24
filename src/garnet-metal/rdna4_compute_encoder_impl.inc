@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------------------------------------------
 static void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos);
 
-@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; }
+@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; }
 - (instancetype)initWithCommandBuffer:(id)cb compute:(int)dummy;
+- (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLComputePassDescriptor *)d;
 @end
 
 @implementation RDNA4ComputeEncoder
@@ -14,6 +15,42 @@ static void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMu
     _cb = cb;
     _resourceBindings = [RDNA4ResourceBindings new];
     RDNA4LOGR("RDNA4ComputeEncoder %p", (__bridge void *)self);
+    return self;
+}
+- (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLComputePassDescriptor *)d {
+    self = [self initWithCommandBuffer:cb compute:0];
+    if (!self || !d) return self;
+    if ([d respondsToSelector:@selector(sampleBufferAttachments)]) {
+        MTLComputePassSampleBufferAttachmentDescriptorArray *sbas = d.sampleBufferAttachments;
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLComputePassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            NSString *cwhy = nil;
+            id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(att.sampleBuffer, [_cb device], 0, NO, &cwhy);
+            if (!csb || !rdna4_counter_pass_index_valid(csb, att.startOfEncoderSampleIndex) ||
+                !rdna4_counter_pass_index_valid(csb, att.endOfEncoderSampleIndex)) {
+                RDNA4LOG("compute pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                _ended = YES;
+                [super endEncoding];
+                return nil;
+            }
+        }
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLComputePassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            id<RDNA4CounterSampleBufferInternal> csb = (id<RDNA4CounterSampleBufferInternal>)att.sampleBuffer;
+            if (att.startOfEncoderSampleIndex != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                    sampleIndex:att.startOfEncoderSampleIndex barrier:NO
+                                     stageFlags:VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT who:"compute-pass-start"];
+            if (att.endOfEncoderSampleIndex != MTLCounterDontSample && _nCsbEnd < RDNA4CNT_MAX_PASS_ATTACHMENTS) {
+                _csbEnd[_nCsbEnd] = csb;
+                _csbEndIdx[_nCsbEnd] = att.endOfEncoderSampleIndex;
+                _nCsbEnd++;
+            }
+        }
+    }
     return self;
 }
 RDNA4_DNR(RDNA4ComputeEncoder)
@@ -116,6 +153,21 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     if (_ended) { [_cb rdna4Fail:@"compute waitForFence after endEncoding"]; return; }
     if ([_cb rdna4Error]) return;
     [_cb rdna4WaitForFence:f];
+}
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier {
+    if (_ended) { [_cb rdna4Fail:@"compute sampleCountersInBuffer after endEncoding"]; return; }
+    if ([_cb rdna4Error]) return;
+    NSString *why = nil;
+    id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(sampleBuffer, [_cb device], sampleIndex, YES, &why);
+    if (!csb) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"compute sampleCountersInBuffer: %@", why ?: @"invalid"]];
+        return;
+    }
+    [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:sampleIndex barrier:barrier
+                         stageFlags:(barrier ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                who:"compute"];
 }
 RDNA4_ENCODER_SHARED
 - (void)pushDebugGroup:(NSString *)s { (void)s; }
@@ -267,6 +319,18 @@ RDNA4_ENCODER_SHARED
     if (_ended) return;
     _ended = YES;
     rdna4_full_barrier([_cb vk]);
+    if (_nCsbEnd) {
+        BOOL cbOk = ![_cb rdna4Error];
+        for (uint32_t k = 0; k < _nCsbEnd; k++) {
+            if (cbOk && _csbEnd[k] && _csbEndIdx[k] != MTLCounterDontSample)
+                [_csbEnd[k] rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                           sampleIndex:_csbEndIdx[k] barrier:NO
+                                            stageFlags:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                                   who:"compute-pass-end"];
+            _csbEnd[k] = nil;
+        }
+        _nCsbEnd = 0u;
+    }
     [_cb rdna4ArgumentCheckpoint];
     RDNA4LOGR("RDNA4ComputeEncoder endEncoding");
     [super endEncoding];

@@ -1,5 +1,6 @@
-@interface RDNA4BlitEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; NSMutableSet *_argumentResources, *_argumentWritable; }
+@interface RDNA4BlitEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; NSMutableSet *_argumentResources, *_argumentWritable; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; }
 - (instancetype)initWithCommandBuffer:(id)cb blit:(int)dummy;
+- (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLBlitPassDescriptor *)d;
 - (void)copyFromBuffer:(id)src sourceOffset:(NSUInteger)so toBuffer:(id)dst destinationOffset:(NSUInteger)doff size:(NSUInteger)size;
 @end
 
@@ -107,6 +108,42 @@ static void rdna4_blit_note_overwrite(RDNA4CommandBuffer *cb, RDNA4Texture *text
     if (!self) return nil;
     _cb = cb;
     RDNA4LOGR("RDNA4BlitEncoder %p", (__bridge void *)self);
+    return self;
+}
+- (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLBlitPassDescriptor *)d {
+    self = [self initWithCommandBuffer:cb blit:0];
+    if (!self || !d) return self;
+    if ([d respondsToSelector:@selector(sampleBufferAttachments)]) {
+        MTLBlitPassSampleBufferAttachmentDescriptorArray *sbas = d.sampleBufferAttachments;
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLBlitPassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            NSString *cwhy = nil;
+            id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(att.sampleBuffer, [_cb device], 0, NO, &cwhy);
+            if (!csb || !rdna4_counter_pass_index_valid(csb, att.startOfEncoderSampleIndex) ||
+                !rdna4_counter_pass_index_valid(csb, att.endOfEncoderSampleIndex)) {
+                RDNA4LOG("blit pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                _ended = YES;
+                [super endEncoding];
+                return nil;
+            }
+        }
+        for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
+            MTLBlitPassSampleBufferAttachmentDescriptor *att = sbas[k];
+            if (!att || !att.sampleBuffer) continue;
+            id<RDNA4CounterSampleBufferInternal> csb = (id<RDNA4CounterSampleBufferInternal>)att.sampleBuffer;
+            if (att.startOfEncoderSampleIndex != MTLCounterDontSample)
+                [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                    sampleIndex:att.startOfEncoderSampleIndex barrier:NO
+                                     stageFlags:VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT who:"blit-pass-start"];
+            if (att.endOfEncoderSampleIndex != MTLCounterDontSample && _nCsbEnd < RDNA4CNT_MAX_PASS_ATTACHMENTS) {
+                _csbEnd[_nCsbEnd] = csb;
+                _csbEndIdx[_nCsbEnd] = att.endOfEncoderSampleIndex;
+                _nCsbEnd++;
+            }
+        }
+    }
     return self;
 }
 RDNA4_DNR(RDNA4BlitEncoder)
@@ -313,6 +350,95 @@ RDNA4_DNR(RDNA4BlitEncoder)
     if ([_cb rdna4Error]) return;
     [_cb rdna4WaitForFence:f];
 }
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier {
+    if (_ended) { [_cb rdna4Fail:@"blit sampleCountersInBuffer after endEncoding"]; return; }
+    if ([_cb rdna4Error]) return;
+    NSString *why = nil;
+    id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(sampleBuffer, [_cb device], sampleIndex, YES, &why);
+    if (!csb) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"blit sampleCountersInBuffer: %@", why ?: @"invalid"]];
+        return;
+    }
+    // Use [_cb vk] (not rdna4BlitVK) so the native blit fast path cannot bypass timestamp writes.
+    [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:sampleIndex barrier:barrier
+                         stageFlags:(barrier ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                who:"blit"];
+}
+- (void)resolveCounters:(id<MTLCounterSampleBuffer>)sampleBuffer
+                inRange:(NSRange)range
+      destinationBuffer:(id<MTLBuffer>)destinationBuffer
+      destinationOffset:(NSUInteger)destinationOffset {
+    if (_ended) { [_cb rdna4Fail:@"blit resolveCounters after endEncoding"]; return; }
+    if ([_cb rdna4Error]) return;
+    NSString *why = nil;
+    id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(sampleBuffer, [_cb device], 0, NO, &why);
+    if (!csb) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"blit resolveCounters: %@", why ?: @"invalid"]];
+        return;
+    }
+    if (!rdna4cnt_range_ok((uint64_t)[csb sampleCount], (uint64_t)range.location, (uint64_t)range.length)) {
+        [_cb rdna4Fail:@"blit resolveCounters: range out of bounds"];
+        return;
+    }
+    if (![destinationBuffer isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)destinationBuffer device] != [_cb device]) {
+        [_cb rdna4Fail:@"blit resolveCounters: destinationBuffer is invalid"];
+        return;
+    }
+    if (rdna4nc_drop_write(destinationBuffer, RDNA4NC_COPY_BUFFER, "resolveCounters:", "BlitCommandEncoder")) {
+        [_cb rdna4Fail:@"blit resolveCounters: destination is read-only"];
+        return;
+    }
+    RDNA4Buffer *dst = (RDNA4Buffer *)destinationBuffer;
+    const uint64_t bytes = (uint64_t)range.length * sizeof(uint64_t);
+    if ((destinationOffset & 3u) || !rdna4_buffer_range(dst.length, destinationOffset, bytes)) {
+        [_cb rdna4Fail:@"blit resolveCounters: destinationBuffer range or alignment is invalid"];
+        return;
+    }
+    [_cb rdna4RetainEncoded:csb];
+    [_cb rdna4RetainEncoded:dst];
+    [_cb rdna4ArgumentWrite:dst range:NSMakeRange(destinationOffset, (NSUInteger)bytes) candidates:nil fillOnly:YES];
+    NSError *queueErr = nil;
+    if (![_cb rdna4EncodeOrderedHostAction:^BOOL(NSError **actionErr) {
+        uint64_t *tmp = (uint64_t *)malloc((size_t)bytes);
+        if (!tmp) {
+            if (actionErr) *actionErr = rdna4_err(66, @"blit resolveCounters: out of memory");
+            return NO;
+        }
+        BOOL ok = [csb rdna4ResolveRange:range intoBytes:tmp error:actionErr];
+        if (ok) {
+            if ([dst contents]) {
+                memcpy((uint8_t *)[dst contents] + destinationOffset, tmp, (size_t)bytes);
+            } else {
+                RDNA4Buffer *stg = [[RDNA4Buffer alloc] initWithDevice:[dst device]
+                                                                length:(NSUInteger)bytes
+                                                               options:MTLResourceStorageModeShared
+                                                                 error:actionErr];
+                if (!stg || ![stg contents]) {
+                    if (actionErr && !*actionErr) *actionErr = rdna4_err(66, @"blit resolveCounters: staging buffer allocation failed");
+                    ok = NO;
+                } else {
+                    memcpy([stg contents], tmp, (size_t)bytes);
+                    BOOL unresolved = NO;
+                    ok = rdna4_oneshot(actionErr, ^(VkCommandBuffer cmd) {
+                        VkBufferCopy bc = { [stg rdna4VkOffset], [dst rdna4VkOffset] + destinationOffset, bytes };
+                        vkCmdCopyBuffer(cmd, [stg vkBuffer], [dst vkBuffer], 1u, &bc);
+                        rdna4_full_barrier(cmd);
+                    }, &unresolved);
+                    if (unresolved) {
+                        (void)CFBridgingRetain(stg);
+                        (void)CFBridgingRetain(dst);
+                    }
+                }
+            }
+        }
+        free(tmp);
+        return ok;
+    } error:&queueErr]) {
+        if (![_cb rdna4Error]) [_cb rdna4Fail:queueErr.localizedDescription ?: @"blit resolveCounters failed"];
+    }
+}
 RDNA4_ENCODER_SHARED
 // m11h9: a box-filtered chain, level L-1 -> L with vkCmdBlitImage (linear filter when RADV can filter the format, else nearest) inside one GENERAL-layout image (source and
 // destination are different levels, so the regions never overlap); each blit is ordered after the previous by a full memory barrier.
@@ -417,7 +543,21 @@ RDNA4_ENCODER_SHARED
 - (void)endEncoding {
     if (_ended) return;
     _ended = YES;
-    rdna4_full_barrier([_cb rdna4BlitVK]);
+    if (_nCsbEnd) {
+        rdna4_full_barrier([_cb vk]);
+        BOOL cbOk = ![_cb rdna4Error];
+        for (uint32_t k = 0; k < _nCsbEnd; k++) {
+            if (cbOk && _csbEnd[k] && _csbEndIdx[k] != MTLCounterDontSample)
+                [_csbEnd[k] rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
+                                           sampleIndex:_csbEndIdx[k] barrier:NO
+                                            stageFlags:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                                   who:"blit-pass-end"];
+            _csbEnd[k] = nil;
+        }
+        _nCsbEnd = 0u;
+    } else {
+        rdna4_full_barrier([_cb rdna4BlitVK]);
+    }
     [_cb rdna4ArgumentCheckpoint];
     RDNA4LOG("RDNA4BlitEncoder endEncoding");
     [super endEncoding];

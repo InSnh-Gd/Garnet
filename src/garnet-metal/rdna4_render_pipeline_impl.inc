@@ -2,6 +2,7 @@
 // RDNA4RenderPipelineState (10d/11e): SPIR-V from Resources/spvcache/<sha256(bitcodeData)>.spv -> VkPipeline variants.
 // ---------------------------------------------------------------------------------------------------------------
 #include "rdna4_fragment_output.h"
+#include "rdna4_counters.h"
 
 @interface RDNA4RenderPipelineState : _MTLRenderPipelineState {
     id _dev; NSString *_lbl; VkShaderModule _vs, _tcs, _tes, _fs; VkPipelineLayout _pl; VkRenderPass _rp; VkDescriptorSetLayout _dsl[2], _tessDsl;
@@ -26,6 +27,7 @@
     MTLRenderPipelineReflection *_reflection;
     RDNA4ArgumentTables _argumentTables;
     rdna4_argument_scan_reflection_plan _scanV, _scanF;
+    uint32_t _maxAmp;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
@@ -62,6 +64,7 @@
 - (VkDescriptorSetLayout)tessDsl;
 - (uint32_t)tessSet;
 - (uint64_t)tessCacheKey;
+- (uint32_t)rdna4MaxVertexAmplificationCount;
 @end
 static VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
@@ -122,6 +125,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     if (!r) { RDNA4LOG("HOT-SWAP rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
     r->_icbToken = _icbToken;
+    r->_maxAmp = _maxAmp;
     uintptr_t v = (uintptr_t)CFBridgingRetain(r);
     if (!rdna4hs_install(&_realp, v)) { CFRelease((CFTypeRef)v); return NO; }   // lost a race (cannot happen: one watcher): keep the first
     return YES;
@@ -132,6 +136,15 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
     _icb = d.supportIndirectCommandBuffers;
     if (_icb) _icbToken = RDNA4_ICB_PSO_TOKEN_TAG | (atomic_fetch_add(&rdna4_icb_pso_seq, 1) + 1);
+    const NSUInteger reqMaxAmp = [d respondsToSelector:@selector(maxVertexAmplificationCount)]
+        ? d.maxVertexAmplificationCount : 1u;
+    const char *ampWhy = NULL;
+    if (!rdna4amp_pipeline_count_ok((uint64_t)reqMaxAmp, RDNA4AMP_MAX_SUPPORTED_COUNT, 0, &ampWhy)) {
+        if (err) *err = rdna4_err(57, [NSString stringWithFormat:@"maxVertexAmplificationCount %lu: %s",
+                                       (unsigned long)reqMaxAmp, ampWhy ?: "unsupported"]);
+        return nil;
+    }
+    _maxAmp = (uint32_t)reqMaxAmp;
     const BOOL hasFrag = d.fragmentFunction != nil;
     _hasFrag = hasFrag;
     _rastOff = !d.isRasterizationEnabled;
@@ -254,7 +267,8 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                     if (err) *err = rdna4_err(51, @"tessellation SPIR-V metadata is missing (stale spvcache sidecar)");
                     bad = YES;
                 } else if ([tessMeta[@"amplification_id"] isKindOfClass:[NSDictionary class]] ||
-                           [tessMeta[@"amplification_count"] isKindOfClass:[NSDictionary class]]) {
+                           [tessMeta[@"amplification_count"] isKindOfClass:[NSDictionary class]] ||
+                           !rdna4amp_pipeline_count_ok((uint64_t)_maxAmp, RDNA4AMP_MAX_SUPPORTED_COUNT, 1, &ampWhy)) {
                     if (err) *err = rdna4_err(57, @"vertex amplification in tessellation pipelines is not supported");
                     bad = YES;
                 }
@@ -940,5 +954,6 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (NSUInteger)threadgroupSizeMatchesTileSize { return 0; }
 - (NSUInteger)imageblockSampleLength { return 0; }
 - (BOOL)supportIndirectCommandBuffers { return _icb; }
+- (uint32_t)rdna4MaxVertexAmplificationCount { return _maxAmp ? _maxAmp : 1u; }
 @end
 
