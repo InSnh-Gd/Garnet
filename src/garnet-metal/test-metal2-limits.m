@@ -89,13 +89,17 @@ static void testCapabilityQueries(id<MTLDevice> dev) {
           callBoolInt(dev, @selector(supportsFamily:), 3002 /* Common2 */) &&
           callBoolInt(dev, @selector(supportsFamily:), 3003 /* Common3 */),
           @"query supportsFamily:Common1..3 == YES");
-    check(!callBoolInt(dev, @selector(supportsFamily:), 1001 /* Apple1 */) &&
-          !callBoolInt(dev, @selector(supportsFamily:), 1008 /* Apple8 */) &&
+    check(callBoolInt(dev, @selector(supportsFamily:), 5001 /* Metal3 */),
+          @"query supportsFamily:Metal3 == YES");
+    BOOL badFam = NO;
+    for (NSInteger af = 1001; af <= 1010; af++) badFam |= callBoolInt(dev, @selector(supportsFamily:), af);
+    check(!badFam &&
           !callBoolInt(dev, @selector(supportsFamily:), 2001 /* Mac1 */) &&
-          !callBoolInt(dev, @selector(supportsFamily:), 5001 /* Metal3 */) &&
+          !callBoolInt(dev, @selector(supportsFamily:), 4001 /* MacCatalyst1 */) &&
+          !callBoolInt(dev, @selector(supportsFamily:), 4002 /* MacCatalyst2 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 5002 /* Metal4 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 0),
-          @"query out-of-scope families == NO");
+          @"query out-of-scope families (Apple1..10 incl. Apple6, Mac1, MacCatalyst, Metal4) == NO");
 
     check(callBool1(dev, @selector(supportsFeatureSet:), 10000) &&
           callBool1(dev, @selector(supportsFeatureSet:), 10001) &&
@@ -147,19 +151,20 @@ static void testCapabilityQueries(id<MTLDevice> dev) {
     }
     check(nonzero, @"query getDefaultSamplePositions:count:4 returns valid pattern");
 
-    // Explicit out-of-scope NO overrides
-    check(!callBool0(dev, @selector(supportsRaytracing)), @"query supportsRaytracing == NO");
-    check(!callBool0(dev, @selector(supportsRaytracingFromRender)), @"query supportsRaytracingFromRender == NO");
+    // Metal 3 parity capability queries & explicit discrete-GPU / unimplemented NO overrides
+    check(callBool0(dev, @selector(supportsRaytracing)), @"query supportsRaytracing == YES");
+    check(callBool0(dev, @selector(supportsRaytracingFromRender)), @"query supportsRaytracingFromRender == YES");
     check(!callBool0(dev, @selector(supportsPrimitiveMotionBlur)), @"query supportsPrimitiveMotionBlur == NO");
-    check(!callBool0(dev, @selector(supportsFunctionPointers)), @"query supportsFunctionPointers == NO");
-    check(!callBool0(dev, @selector(supportsFunctionPointersFromRender)), @"query supportsFunctionPointersFromRender == NO");
-    check(!callBool0(dev, @selector(supportsPullModelInterpolation)), @"query supportsPullModelInterpolation == NO");
-    check(!callBool0(dev, @selector(supportsShaderBarycentricCoordinates)), @"query supportsShaderBarycentricCoordinates == NO");
-    check(!callBool0(dev, @selector(supportsDynamicLibraries)) &&
-          !callBool0(dev, @selector(supportsRenderDynamicLibraries)) &&
-          !callBool0(dev, @selector(supportsBinaryArchives)),
-          @"query dynamic libraries & binary archives == NO");
-    check(!dev.hasUnifiedMemory, @"query hasUnifiedMemory == NO");
+    check(callBool0(dev, @selector(supportsFunctionPointers)), @"query supportsFunctionPointers == YES");
+    check(callBool0(dev, @selector(supportsFunctionPointersFromRender)), @"query supportsFunctionPointersFromRender == YES");
+    check(callBool0(dev, @selector(supportsPullModelInterpolation)), @"query supportsPullModelInterpolation == YES");
+    check(callBool0(dev, @selector(supportsShaderBarycentricCoordinates)), @"query supportsShaderBarycentricCoordinates == YES");
+    check(callBool0(dev, @selector(supportsDynamicLibraries)) &&
+          callBool0(dev, @selector(supportsRenderDynamicLibraries)) &&
+          callBool0(dev, @selector(supportsBinaryArchives)),
+          @"query dynamic libraries & binary archives == YES");
+    check(!dev.hasUnifiedMemory && !dev.isLowPower && !dev.isRemovable,
+          @"query discrete GPU flags (hasUnifiedMemory/isLowPower/isRemovable) == NO");
 
     // Alignment & size properties (L07, L14, L22)
     check(dev.maxThreadgroupMemoryLength >= 32768, @"L07 maxThreadgroupMemoryLength >= 32768");

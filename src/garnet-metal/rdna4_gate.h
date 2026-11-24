@@ -259,11 +259,11 @@ static inline void rdna4g_sync_result(rdna4g_sync *s, int found) {
     else if (s->strikes < RDNA4G_SYNC_STRIKES) s->strikes++;
 }
 
-// ---- the GPU family claim (bundle build 6, C1 finding B) ----
-// Tier 2 argument buffers are now implemented and verified for applications
-// (MTLArgumentBuffersTier2 == 1); MTLGPUFamilyMetal3 stays gated (NO for apps,
-// YES for WindowServer) until tessellation, ICB, and remaining Metal 2 work
-// complete. Mac2 and Common1..3 stay (what the compositor and apps' base paths use).
+// ---- the GPU family claim (bundle build 6, C1 finding B; Metal 3 parity Task 8.2) ----
+// Mac2, Common1..3, and Metal3 (AMD 6000-series parity) are advertised for both
+// applications and WindowServer. Apple Silicon families (Apple1..10, explicitly
+// including Apple6 despite GFX12 Sparse/PRT), Mac1, MacCatalyst, Metal4, and
+// unknown values remain strictly NO.
 #define RDNA4G_FAMILY_MAC2     2002
 #define RDNA4G_FAMILY_COMMON1  3001
 #define RDNA4G_FAMILY_COMMON2  3002
@@ -271,12 +271,12 @@ static inline void rdna4g_sync_result(rdna4g_sync *s, int found) {
 #define RDNA4G_FAMILY_METAL3   5001
 #define RDNA4G_ARGBUF_TIER1    0
 #define RDNA4G_ARGBUF_TIER2    1
-// WindowServer keeps the pre-build-6 answer for Metal3 (YES): the GPU desktop has run with it since #11 and nothing it uses needs argument buffers; changing it there is an untested display-path risk (reviewer. Apps get NO.
 static inline int rdna4g_supports_family(long family, int isWs) {
+    (void)isWs;
     switch (family) {
-    case RDNA4G_FAMILY_MAC2: case RDNA4G_FAMILY_COMMON1: case RDNA4G_FAMILY_COMMON2: case RDNA4G_FAMILY_COMMON3: return 1;
-    case RDNA4G_FAMILY_METAL3: return isWs ? 1 : 0;
-    default: return 0;    // Apple1..9, Mac1, MacCatalyst, Metal4, unknown
+    case RDNA4G_FAMILY_MAC2: case RDNA4G_FAMILY_COMMON1: case RDNA4G_FAMILY_COMMON2: case RDNA4G_FAMILY_COMMON3:
+    case RDNA4G_FAMILY_METAL3: return 1;
+    default: return 0;    // Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal4, unknown
     }
 }
 

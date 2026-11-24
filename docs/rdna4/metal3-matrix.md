@@ -17,7 +17,7 @@ not close RX 9060 XT execution. No feature is marked complete by this document.
 | Official feature anchor | Apple `Metal-Feature-Set-Tables` (2025-10 / 2026-05 editions), Intel Mac `AMD 6000-series` (`Mac2` + `Metal3`), MSL 2.2–3.2 |
 | Preserved Metal 2 gates | All rows of [metal2-matrix.md](metal2-matrix.md) (`C01..C07`, `K01..K07`, `T01..T07`, `R01..R09`, `A01..A05`, `P01..P04`, `I01..I04`, `H01..H05`, `L01..L23`, `F01..F33`, `M01..M08`) and compatibility/execution suites (`47/95/18/8`, B1, ICB, Tessellation, Tier 2, 8 GiB) remain non-regression gates |
 | Independent boundary | Zero Apple `AMDRadeonX6000` binary reuse or substitution; zero `Lilu`, `AMDRadeonRDNA4.kext`, or `AppleParavirtGPU`; no closed-source `MetalFX` internal protocols |
-| Public family gate | Application `supportsFamily:(MTLGPUFamilyMetal3)` (`5001`) stays `NO` until all required Metal 3 entries (`X01..X08`, `D01..D03`, `Q01..Q02`, `G01..G03`, `RT01..RT03`, `Z01`) pass live execution with zero Metal 2 or desktop regressions (Task `8.2`). WindowServer preserves its compatibility `YES`. |
+| Public family gate | Task `8.2` certified: application and WindowServer `supportsFamily:(MTLGPUFamilyMetal3)` (`5001`) both return `YES` after live RX 9060 XT verification of `X01..X08`, `D01..D03`, `Q01..Q02`, `S01..S03`, `G01..G03`, and `RT01..RT03`; `EX01..EX08` (`Apple1..10` incl. `Apple6`, `Mac1`, `MacCatalyst`, `Metal4`, TBDR/`simdgroup_matrix`) remain strictly `NO`. |
 
 ## Required acceptance entries
 
@@ -49,7 +49,7 @@ regions, and validate rejected error paths.
 
 | ID | Feature / requirement | Capability query / selector | Vulkan / stack dependency | Required oracle & negative checks | Tasks |
 | --- | --- | --- | --- | --- | --- |
-| D01 | `MTLBinaryArchive` (`newBinaryArchiveWithDescriptor:error:`, `addComputePipelineFunctionsWithDescriptor:error:`, `addRenderPipelineFunctionsWithDescriptor:error:`, `serializeToURL:error:`, pipeline `binaryArchives`) | `supportsBinaryArchives` (stays `NO` until verified) | Versioned Garnet container (magic, ABI/RADV `pipelineCacheUUID`, SHA-256, normalized descriptor key -> SPIR-V + reflection JSON + `VkPipelineCache`) | Serialize + reload in fresh instance hits archive and produces bit-identical GPU output; tampered header/hash, UUID mismatch, foreign Apple `.metallib` slice, or unsupported tile pipeline returns `MTLBinaryArchiveError` without crash (`test-metal3-binary-archive.m`, host C codec tests) | 3.1, 8.1, 9.1 |
+| D01 | `MTLBinaryArchive` (`newBinaryArchiveWithDescriptor:error:`, `addComputePipelineFunctionsWithDescriptor:error:`, `addRenderPipelineFunctionsWithDescriptor:error:`, `serializeToURL:error:`, pipeline `binaryArchives`) | `supportsBinaryArchives` (`rdna4x_active()`: `YES` for admitted Metal 3 applications/inproc tests, `NO` for WindowServer) | Versioned Garnet container (magic, ABI/RADV `pipelineCacheUUID`, SHA-256, normalized descriptor key -> SPIR-V + reflection JSON + `VkPipelineCache`) | Serialize + reload in fresh instance hits archive and produces bit-identical GPU output; tampered header/hash, UUID mismatch, foreign Apple `.metallib` slice, or unsupported tile pipeline returns `MTLBinaryArchiveError` without crash (`test-metal3-binary-archive.m`, host C codec tests) | 3.1, 8.1, 8.2, 9.1 |
 | D02 | `MTLDynamicLibrary` (`newDynamicLibrary:error:`, `newDynamicLibraryWithURL:error:`, `serializeToURL:error:`, `preloadedLibraries`, `binaryFunctions`) | `supportsDynamicLibraries` (compute), `supportsRenderDynamicLibraries` (vertex/fragment) | Garnet dynamic library container (sanitized AIR + export table) + `garnetx_translate_linked` symbol linking in `rdna4_shader_runtime_impl.inc` | Compute, vertex, and fragment pipelines invoke exported dynamic-library functions with exact GPU output; missing symbol or invalid file returns `NSError` at creation (`test-metal3-dynamic-lib.m`, Rust link tests) | 3.2, 8.1, 9.1 |
 | D03 | `MTLVisibleFunctionTable` and function pointers (`newVisibleFunctionTableWithDescriptor:`, `newVisibleFunctionTableWithDescriptor:stage:`, `functionHandleWithFunction:`, `setFunction:atIndex:`, `setFunctions:withRange:`, `visible_function_table<...>`) | `supportsFunctionPointers` (compute), `supportsFunctionPointersFromRender` (render) | Compile-time `MTLLinkedFunctions` closure + bounded `OpSwitch` dispatch lowering in `metal2vulkan-rdna4` + device slot-ID buffer; Footnote 10 mesh-pipeline exclusion check | Per-thread/per-pixel runtime table index invokes distinct linked functions (including nested resource access); out-of-bounds/empty slot is isolated without GPU hang; Mesh pipeline requesting incompatible render function pointers fails creation with `NSError` (`test-metal3-function-tables.m`, Rust + LavaPipe) | 3.3, 6.2, 8.1, 9.1 |
 
@@ -163,18 +163,22 @@ after `MTLGPUFamilyMetal3` is enabled in Task `8.2`:
 
 ## Current verification boundary and closure discipline
 
-- **Pre-certification state (Wave 1 baseline)**:
-  - Pre-open `rdna4_metal3_caps()` returns all `0`/`false`.
+- **Certified Metal 3 state (Task `8.2`)**:
+  - Pre-open `rdna4_metal3_caps()` still returns all `0`/`false` (fail-closed before RADV opens).
   - Application `MTLDevice` selectors `supportsFamily:(MTLGPUFamilyMetal3)`,
     `supportsRaytracing`, `supportsRaytracingFromRender`,
-    `supportsPrimitiveMotionBlur`, `supportsFunctionPointers`,
-    `supportsFunctionPointersFromRender`, `supportsPullModelInterpolation`,
-    `supportsShaderBarycentricCoordinates`, `supportsDynamicLibraries`,
-    `supportsRenderDynamicLibraries`, and `supportsBinaryArchives` remain `NO`
-    until their respective tasks pass live execution and Task `8.2` flips the
-    public gates.
-  - WindowServer retains its legacy `supportsFamily:(MTLGPUFamilyMetal3) == YES`
-    compatibility behavior.
+    `supportsFunctionPointers`, `supportsFunctionPointersFromRender`,
+    `supportsPullModelInterpolation`, `supportsShaderBarycentricCoordinates`,
+    `supportsDynamicLibraries`, `supportsRenderDynamicLibraries`, and
+    `supportsBinaryArchives` now reflect verified runtime capabilities (`YES` on
+    RX 9060 XT once RADV / `garnetxlate` are active);
+    `supportsPrimitiveMotionBlur` remains honestly `NO` until verified.
+  - `EX01..EX08` (`Apple1..10` including `Apple6`, `Mac1`, `MacCatalyst`,
+    `Metal4`, TBDR/tile/imageblock/memoryless/`simdgroup_matrix`,
+    `Depth24Stencil8`, `hasUnifiedMemory`, `isLowPower`, `isRemovable`) remain
+    strictly `NO`.
+  - WindowServer retains its `supportsFamily:(MTLGPUFamilyMetal3) == YES` and
+    `supportsBinaryArchives == NO` compatibility behavior unchanged.
 - **Evidence rules**: Every future closure record under
   `logs/rdna4-metal3/<run>/RESULT.md` must record row ID, build provenance and
   SHA-256, backend (`host-c`, `rust-unit`, `lavapipe-1.4`, or

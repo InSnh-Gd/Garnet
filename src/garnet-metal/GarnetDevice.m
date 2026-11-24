@@ -561,7 +561,7 @@ static NSData *rdna4_function_reflection_data(id function) {
 }
 - (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }
 - (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }
-- (BOOL)supportsBinaryArchives { return NO; }
+- (BOOL)supportsBinaryArchives { return rdna4x_active(); }
 - (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {
     return (id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error];
 }
@@ -1382,9 +1382,8 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 
 #if RDNA4_9D
 - (BOOL)supportsFamily:(NSInteger)family {
-    // Argument-buffer encoding and shader translation still gate Metal3.
-    if (family == RDNA4G_FAMILY_METAL3 && !rdna4_is_ws()) RDNA4_ONCE("supportsFamily(Metal3) -> NO for this application: argument-buffer support is incomplete (WindowServer keeps YES)");
-    return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;   // Apple1..9 (1001..1009), Mac1, MacCatalyst, Metal3, Metal4, unknown -> NO
+    // Mac2, Common1..3, and Metal3 -> YES; Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal4, unknown -> NO.
+    return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;
 }
 - (BOOL)supportsFeatureSet:(NSUInteger)featureSet { return rdna4g_supports_feature_set((unsigned long)featureSet) ? YES : NO; }
 - (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet { return [self supportsFeatureSet:featureSet]; }

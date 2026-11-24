@@ -148,12 +148,12 @@ int main(int argc, char **argv) {
       rdna4g_sync_result(&s, 0); rdna4g_sync_result(&s, 1); rdna4g_sync_result(&s, 0);
       CHECK("G13: only consecutive timeouts count", s.strikes == 1 && rdna4g_sync_allowed(&s));
     }
-    // ---- G14 (build 6, C1 finding B): the GPU family claim ----
-    CHECK("G14: Metal3 (5001) is NOT claimed for apps, kept for WindowServer", !rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 0) && rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 1) && RDNA4G_FAMILY_METAL3 == 5001);
+    // ---- G14 (build 6, C1 finding B; Metal 3 parity Task 8.2): the GPU family claim ----
+    CHECK("G14: Metal3 (5001) is claimed for apps and WindowServer", rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 0) && rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 1) && RDNA4G_FAMILY_METAL3 == 5001);
     CHECK("G14: Mac2 and Common1..3 are kept", rdna4g_supports_family(2002, 0) && rdna4g_supports_family(3001, 0) && rdna4g_supports_family(3002, 0) && rdna4g_supports_family(3003, 0) && rdna4g_supports_family(3001, 1));
-    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 2001, 4001, 5001, 5002, 6001, 0, -1, 99999 };
-      for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | (no[i] != RDNA4G_FAMILY_METAL3 ? rdna4g_supports_family(no[i], 1) : 0);
-      CHECK("G14: Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal3 (apps), Metal4 and unknown values are all NO", !any); }
+    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 2001, 4001, 4002, 5002, 6001, 0, -1, 99999 };
+      for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | rdna4g_supports_family(no[i], 1);
+      CHECK("G14: Apple1..10 (incl. Apple6), Mac1, MacCatalyst1..2, Metal4 and unknown values are all NO", !any); }
     CHECK("G14: argument buffer tier constants", RDNA4G_ARGBUF_TIER1 == 0 && RDNA4G_ARGBUF_TIER2 == 1);
     { static const unsigned long yes_fs[] = {
           RDNA4G_FS_MACOS_GPUFAMILY1_V1, RDNA4G_FS_MACOS_GPUFAMILY1_V2,
@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
                && strstr(gm, "- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
                && strstr(gm, "- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }")
                && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }")
-               && strstr(gm, "- (BOOL)supportsBinaryArchives { return NO; }")
+               && strstr(gm, "- (BOOL)supportsBinaryArchives { return rdna4x_active(); }")
                && strstr(gm, "- (BOOL)supportsPullModelInterpolation")
                && strstr(gm, "rdna4dc_metal3_pull_model_ok(&m3)")
                && strstr(gm, "- (BOOL)supportsShaderBarycentricCoordinates")
