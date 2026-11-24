@@ -1073,9 +1073,24 @@ RDNA4_DNR(RDNA4Texture)
 - (NSUInteger)arrayLength { return rdna4td_array_length(_tdk, (unsigned)_layers); }
 - (NSUInteger)usage { return _usage; }
 - (BOOL)isFramebufferOnly { return NO; }
-- (NSUInteger)firstMipmapInTail { return 0; }
-- (NSUInteger)tailSizeInBytes { return 0; }
-- (BOOL)isSparse { return NO; }
+- (NSUInteger)firstMipmapInTail {
+    if (!_root) return 0;
+    RDNA4Texture *root = [self rdna4ImageRoot];
+    if (![root isSparse]) return 0;
+    NSUInteger rootFirst = [root firstMipmapInTail];
+    if (_baseLevel >= rootFirst) return 0;
+    NSUInteger rel = rootFirst - _baseLevel;
+    NSUInteger lv = [self mipmapLevelCount];
+    return rel < lv ? rel : lv;
+}
+- (NSUInteger)tailSizeInBytes {
+    if (!_root) return 0;
+    RDNA4Texture *root = [self rdna4ImageRoot];
+    if (![root isSparse]) return 0;
+    NSUInteger rootFirst = [root firstMipmapInTail];
+    return (_baseLevel + [self mipmapLevelCount] > rootFirst) ? [root tailSizeInBytes] : 0;
+}
+- (BOOL)isSparse { return _root ? [[self rdna4ImageRoot] isSparse] : NO; }
 - (BOOL)allowGPUOptimizedContents { return YES; }
 - (id)parentTexture { return _root; }
 - (NSUInteger)parentRelativeLevel { return _root ? _baseLevel - _root->_baseLevel : 0; }

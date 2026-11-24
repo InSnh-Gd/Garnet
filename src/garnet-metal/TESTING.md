@@ -923,3 +923,76 @@ for b in test-metal3-bary-pull test-metal3-counters-amp test-metal3-msl3-atomics
     "$TMPDIR/$b" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Metal 3 Compute ICBs, Sparse/PRT Textures, and Ray Tracing Acceleration Structures (2.3, 5.3, 7.1)
+
+Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
+and Clang ASan + UBSan) cover compute ICB 640-byte ABI, command validation,
+expander SPIR-V, and optional LavaPipe GPU replay (`test-compute-icb.c`), 64 KiB
+sparse tile geometry/conversions, mip-tail layouts, tile pool, atomic bind/unbind
+planning, indirect mapping validation, and `Apple6 == NO` pins
+(`test-sparse-metal.c`), ray-tracing AS capability gating, scratch alignment,
+triangle/AABB BLAS validation, 4x3->3x4 transpose & Default/UserID/Motion
+instance conversion, and lifecycle state machine (`test-rt-accel.c`), plus
+assembled `GarnetDevice.m` wiring pins (`test-gate.c`, `test-occ.c`):
+
+```sh
+python3 src/garnet-metal/assemble-device.py \
+  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
+
+for t in test-compute-icb test-sparse-metal test-rt-accel test-gate test-occ; do
+  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
+    -o "$TMPDIR/$t" "src/garnet-metal/$t.c" -lm
+done
+"$TMPDIR/test-compute-icb"
+"$TMPDIR/test-sparse-metal" src/garnet-metal
+"$TMPDIR/test-rt-accel"
+"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
+"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
+```
+
+Pass `-DRDNA4_SPARSE_TEST_VK -DVK_NO_PROTOTYPES -I/path/to/vulkan/include` to
+`test-sparse-metal.c` to validate real Vulkan 1.4 `VkBindSparseInfo` struct
+builders, or `-DRDNA4_TEST_LAVAPIPE -I/path/to/vulkan/include -ldl` to
+`test-compute-icb.c` for software Vulkan LavaPipe execution.
+
+Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
+on macOS; compile `test-metal3-rt-accel.m` with both `-O0` and `-O2` for early
+ARC release coverage):
+
+- `test-metal3-compute-icb.m` (Task `2.3`): CPU-encoded and GPU-encoded
+  multi-pipeline compute ICBs (`ConcurrentDispatch` + `ConcurrentDispatchThreads`),
+  per-slot `setBarrier`, threadgroup memory, `stageInRegion`, indirect execution
+  ranges, zero CPU readback, and negative error paths.
+- `test-metal3-sparse-prt.m` (Task `5.3`): 64 KiB sparse tile queries &
+  pixel/tile region conversions, `MTLHeapTypeSparse` + mipmapped sparse texture
+  creation, `MTLResourceStateCommandEncoder` direct/batch/indirect map & unmap
+  with `MTLFence`, MSL `sparse_color<float4>::resident()` / non-resident
+  zero-read & write-discard, negative rejections, and `MTLGPUFamilyApple6 == NO`.
+- `test-metal3-rt-accel.m` (Task `7.1`): `accelerationStructureSizesWithDescriptor:`,
+  triangle & AABB BLAS builds, compacted size readback (`UInt32` / `UInt64`) +
+  `copyAndCompactAccelerationStructure:`, clone copies, in-place/out-of-place
+  refit, Default & UserID TLAS build + refit, early ARC release safety, and
+  controlled negative rejections (`supportsRaytracing` remains `NO` until
+  Tasks `7.2`–`7.3` land).
+
+```sh
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal -framework QuartzCore \
+  src/garnet-metal/test-metal3-compute-icb.m -o "$TMPDIR/test-metal3-compute-icb"
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-metal3-sparse-prt.m -o "$TMPDIR/test-metal3-sparse-prt"
+for opt in O0 O2; do
+  clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
+    -framework Foundation -framework Metal \
+    src/garnet-metal/test-metal3-rt-accel.m -o "$TMPDIR/test-metal3-rt-accel-$opt"
+done
+
+for b in test-metal3-compute-icb test-metal3-sparse-prt \
+         test-metal3-rt-accel-O0 test-metal3-rt-accel-O2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

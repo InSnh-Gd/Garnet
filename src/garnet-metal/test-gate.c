@@ -182,7 +182,9 @@ int main(int argc, char **argv) {
     { char *gm = slurp(dir, "GarnetDevice.m");
       const int assembled = gm && strstr(gm, "@implementation RDNA4RenderPipelineState") != NULL;
       char *rp = assembled ? NULL : slurp(dir, "rdna4_render_pipeline_impl.inc");
+      char *cb = assembled ? NULL : slurp(dir, "rdna4_command_buffer_impl.inc");
       const char *rpSrc = assembled ? gm : rp;
+      const char *cbSrc = assembled ? gm : cb;
       CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
             gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
                && strstr(gm, "- (BOOL)supportsBCTextureCompression")
@@ -218,6 +220,33 @@ int main(int argc, char **argv) {
                && strstr(gm, "[[RDNA4IOFileHandle alloc] initWithDevice:self")
                && strstr(gm, "[[RDNA4IOCommandQueue alloc] initWithDevice:self descriptor:descriptor error:error]")
                && strstr(gm, "[[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error]"));
+      CHECK("G14: GarnetDevice.m wires Wave 3A sparse/PRT and ray-tracing acceleration structure modules",
+            gm && cbSrc
+               && (assembled ? (strstr(gm, "@implementation RDNA4ResourceStateEncoder")
+                                && strstr(gm, "@implementation RDNA4AccelerationStructureCommandEncoder"))
+                             : (strstr(gm, "#include \"rdna4_sparse_impl.inc\"")
+                                && strstr(gm, "#include \"rdna4_rt_accel_impl.inc\"")))
+               && strstr(gm, "rdna4_sparse_heap_new(self, d, NULL)")
+               && strstr(gm, "rdna4_device_sparse_tile_size_in_bytes()")
+               && strstr(gm, "rdna4_device_sparse_tile_size_for_page_size(")
+               && strstr(gm, "rdna4_device_sparse_tile_size(")
+               && strstr(gm, "rdna4_device_sparse_tile_size_with_page_size(")
+               && strstr(gm, "rdna4_device_convert_sparse_pixel_regions(")
+               && strstr(gm, "rdna4_device_convert_sparse_tile_regions(")
+               && strstr(gm, "rdna4_cb_new_resource_state_encoder(self, nil)")
+               && strstr(gm, "rdna4_cb_new_resource_state_encoder(self, d)")
+               && strstr(gm, "rdna4_rt_device_sizes(self, d)")
+               && strstr(gm, "rdna4_rt_device_new_with_size(self, size)")
+               && strstr(gm, "rdna4_rt_device_new_with_descriptor(self, d)")
+               && strstr(gm, "[[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil]")
+               && strstr(gm, "[[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d]")
+               && strstr(gm, "\"MTLResourceStateCommandEncoder\"")
+               && strstr(gm, "\"MTLAccelerationStructure\"")
+               && strstr(gm, "\"MTLAccelerationStructureCommandEncoder\"")
+               && strstr(cbSrc, "objc_getClass(\"RDNA4AccelerationStructure\")")
+               && strstr(cbSrc, "rdna4CurrentHandle")
+               && strstr(cbSrc, "objc_getClass(\"RDNA4SparseHeap\")"));
+      free(cb);
       free(rp);
       free(gm); }
     // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----

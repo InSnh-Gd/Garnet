@@ -181,9 +181,27 @@ int main(int argc, char **argv) {
     { const char *a = FIND("- (void)rdna4DeliverTerminalSuccessWithQueue:", src); const char *p2 = a ? FIND("[self rdna4PoolDone];", a) : NULL; const char *b2 = p2 ? FIND("[queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:self->_encErr];", p2) : NULL;
       CHECK("pin: the resolve (rdna4PoolDone) happens BEFORE commandBufferDidComplete on the normal completion path", p2 && b2 && p2 < b2, "ordered %d", (p2 && b2 && p2 < b2)); }
     CHECK("pin: the write happens through rdna4occ_final (the arithmetic of this header), once per used offset", COUNT("rdna4occ_final(") == 1, "%d", COUNT("rdna4occ_final("));
-    CHECK("pin: query results are read with the availability bit (1 occlusion + 2 timestamp counters) and never VK_QUERY_RESULT_WAIT_BIT",
-          count_code(src, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") == 3 && count_code(src, "VK_QUERY_RESULT_WAIT_BIT") == 0,
-          "avail %d wait %d", count_code(src, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT"), count_code(src, "VK_QUERY_RESULT_WAIT_BIT"));
+    {
+        int getq = 0, getq_avail = 0, getq_wait = 0;
+        for (const char *p = src; (p = strstr(p, "vkGetQueryPoolResults(")); p += 22) {
+            const char *semi = strchr(p, ';');
+            if (!semi) break;
+            getq++;
+            const char *av = strstr(p, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT");
+            const char *wt = strstr(p, "VK_QUERY_RESULT_WAIT_BIT");
+            if (av && av < semi) getq_avail++;
+            if (wt && wt < semi) getq_wait++;
+        }
+        CHECK("pin: host vkGetQueryPoolResults reads use AVAILABILITY_BIT (1 occlusion + 2 timestamp counters) and never WAIT_BIT; only the 2 GPU-side cmdCopyQueryPoolResults calls use WAIT_BIT",
+              getq == 3 && getq_avail == 3 && getq_wait == 0 &&
+              count_code(src, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") == 3 &&
+              count_code(src, "VK_QUERY_RESULT_WAIT_BIT") == 2 &&
+              count_code(src, "cmdCopyQueryPoolResults(cmd,") == 2,
+              "getq %d avail %d wait %d total_wait %d gpu_copy %d",
+              getq, getq_avail, getq_wait,
+              count_code(src, "VK_QUERY_RESULT_WAIT_BIT"),
+              count_code(src, "cmdCopyQueryPoolResults(cmd,"));
+    }
     CHECK("pin: the query pool is reset at encoder creation (outside the pass), once", COUNT("vkCmdResetQueryPool([_cb vk]") == 1, "%d", COUNT("vkCmdResetQueryPool([_cb vk]"));
     CHECK("pin: the PRECISE flag is requested only from the Counting decision", COUNT("VK_QUERY_CONTROL_PRECISE_BIT") == 1 && COUNT("(precise && RDNA4R.occPrecise)") == 1, "%d", COUNT("VK_QUERY_CONTROL_PRECISE_BIT"));
     CHECK("pin: the dead-pool case marks the pass for the fail-safe", COUNT("if (*qp == VK_NULL_HANDLE) rdna4occ_dead(o);") == 1, "%d", COUNT("if (*qp == VK_NULL_HANDLE) rdna4occ_dead(o);"));

@@ -464,6 +464,8 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_gl_drawable_impl.inc"
 #include "rdna4_residency_set_impl.inc"
 #include "rdna4_io_queue_impl.inc"
+#include "rdna4_sparse_impl.inc"
+#include "rdna4_rt_accel_impl.inc"
 @implementation RDNA4CommandBuffer (Encoders)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
     (void)[self vk];
@@ -485,6 +487,22 @@ static BOOL rdna4_headless(void) {
     return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
+- (id)resourceStateCommandEncoder {
+    return rdna4_cb_new_resource_state_encoder(self, nil);
+}
+- (id)resourceStateCommandEncoderWithDescriptor:(id)d {
+    return rdna4_cb_new_resource_state_encoder(self, d);
+}
+- (id)accelerationStructureCommandEncoder {
+    (void)[self vk];
+    RDNA4LOGR("cb accelerationStructureCommandEncoder");
+    return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
+}
+- (id)accelerationStructureCommandEncoderWithDescriptor:(id)d {
+    (void)[self vk];
+    RDNA4LOGR("cb accelerationStructureCommandEncoderWithDescriptor:");
+    return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
+}
 @end
 
 // MTLGPUFamily values: rdna4_gate.h (RDNA4G_FAMILY_*, rdna4g_supports_family).
@@ -614,6 +632,10 @@ static NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLCounter" }; rdna4_add_protocols([RDNA4Counter class], n, 1, "RDNA4Counter"); }
     { const char *n[] = { "MTLCounterSet" }; rdna4_add_protocols([RDNA4CounterSet class], n, 1, "RDNA4CounterSet"); }
     { const char *n[] = { "MTLCounterSampleBuffer" }; rdna4_add_protocols([RDNA4CounterSampleBuffer class], n, 1, "RDNA4CounterSampleBuffer"); }
+    { const char *n[] = { "MTLHeap" }; rdna4_add_protocols([RDNA4SparseHeap class], n, 1, "RDNA4SparseHeap"); }
+    { const char *n[] = { "MTLResourceStateCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4ResourceStateEncoder class], n, 2, "RDNA4ResourceStateEncoder"); }
+    { const char *n[] = { "MTLAccelerationStructure", "MTLResource" }; rdna4_add_protocols([RDNA4AccelerationStructure class], n, 2, "RDNA4AccelerationStructure"); }
+    { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4AccelerationStructureCommandEncoder class], n, 2, "RDNA4AccelerationStructureCommandEncoder"); }
     {   // build 18: the census (rdna4_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).
         const rdna4cen_pair pairs[] = { { [RDNA4RenderEncoder class], "RDNA4RenderEncoder", "MTLRenderCommandEncoder" }, { [RDNA4ComputeEncoder class], "RDNA4ComputeEncoder", "MTLComputeCommandEncoder" },
             { [RDNA4BlitEncoder class], "RDNA4BlitEncoder", "MTLBlitCommandEncoder" }, { [RDNA4CommandBuffer class], "RDNA4CommandBuffer", "MTLCommandBuffer" }, { self, "GarnetDevice", "MTLDevice" },
@@ -997,9 +1019,10 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     return YES;
 }
 
-// ---- m11 H1: heaps (see RDNA4Heap) ----
+// ---- m11 H1: heaps (see RDNA4Heap / RDNA4SparseHeap) ----
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
     RDNA4LOG("newHeapWithDescriptor: size %lu storage %lu cache %lu hazard %lu type %lu", (unsigned long)d.size, (unsigned long)d.storageMode, (unsigned long)d.cpuCacheMode, (unsigned long)d.hazardTrackingMode, (unsigned long)d.type);
+    if (d && (NSInteger)d.type == RDNA4SP_HEAP_SPARSE) return rdna4_sparse_heap_new(self, d, NULL);
     return [[RDNA4Heap alloc] initWithDevice:self descriptor:d];
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)len options:(MTLResourceOptions)o {
@@ -1096,6 +1119,43 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 }
 - (id)newResidencySetWithDescriptor:(id)descriptor error:(NSError **)error {
     return [[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error];
+}
+- (NSUInteger)sparseTileSizeInBytes { return rdna4_device_sparse_tile_size_in_bytes(); }
+- (NSUInteger)sparseTileSizeInBytesForSparsePageSize:(NSInteger)sparsePageSize {
+    return rdna4_device_sparse_tile_size_for_page_size(sparsePageSize);
+}
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
+                             pixelFormat:(MTLPixelFormat)pixelFormat
+                             sampleCount:(NSUInteger)sampleCount {
+    return rdna4_device_sparse_tile_size(textureType, pixelFormat, sampleCount);
+}
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
+                             pixelFormat:(MTLPixelFormat)pixelFormat
+                             sampleCount:(NSUInteger)sampleCount
+                          sparsePageSize:(NSInteger)sparsePageSize {
+    return rdna4_device_sparse_tile_size_with_page_size(textureType, pixelFormat, sampleCount, sparsePageSize);
+}
+- (void)convertSparsePixelRegions:(const MTLRegion *)pixelRegions
+                    toTileRegions:(MTLRegion *)tileRegions
+                     withTileSize:(MTLSize)tileSize
+                    alignmentMode:(MTLSparseTextureRegionAlignmentMode)mode
+                       numRegions:(NSUInteger)numRegions {
+    rdna4_device_convert_sparse_pixel_regions(pixelRegions, tileRegions, tileSize, mode, numRegions);
+}
+- (void)convertSparseTileRegions:(const MTLRegion *)tileRegions
+                  toPixelRegions:(MTLRegion *)pixelRegions
+                    withTileSize:(MTLSize)tileSize
+                      numRegions:(NSUInteger)numRegions {
+    rdna4_device_convert_sparse_tile_regions(tileRegions, pixelRegions, tileSize, numRegions);
+}
+- (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
+    return rdna4_rt_device_sizes(self, d);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size {
+    return rdna4_rt_device_new_with_size(self, size);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
+    return rdna4_rt_device_new_with_descriptor(self, d);
 }
 - (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
     if (!positions) return;

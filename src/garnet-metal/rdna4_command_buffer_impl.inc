@@ -9,6 +9,11 @@ _Static_assert((int)VK_TIMEOUT == RDNA4FW_TIMEOUT, "VK_TIMEOUT == RDNA4FW_TIMEOU
 - (BOOL)rdna4RegisterCandidatePipeline:(id)pipeline;
 @end
 
+@class RDNA4AccelHandle;
+@protocol RDNA4AccelInternal <NSObject>
+- (RDNA4AccelHandle *)rdna4CurrentHandle;
+@end
+
 typedef struct {
     VkFence fence;
     uint64_t cbid;
@@ -758,7 +763,9 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (_encErr) return;
     Class icbCls = objc_getClass("RDNA4IndirectCommandBuffer");
     BOOL isICB = icbCls && [resource isKindOfClass:icbCls];
-    if ((!(isICB || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
+    Class asCls = objc_getClass("RDNA4AccelerationStructure");
+    BOOL isAS = asCls && [resource isKindOfClass:asCls];
+    if ((!(isICB || isAS || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
         [(id<MTLResource>)resource device] != [self device] || !usage || (usage & ~(NSUInteger)7)) {
         [self rdna4Fail:@"useResource has an invalid resource, device or usage"];
         return;
@@ -767,15 +774,22 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (isICB) {
         id backing = [(id<RDNA4ICBInternal>)resource rdna4GPUBacking];
         if (backing) [self rdna4RetainEncoded:backing];
+    } else if (isAS) {
+        id handle = [(id<RDNA4AccelInternal>)resource rdna4CurrentHandle];
+        if (handle) [self rdna4RetainEncoded:handle];
     }
 }
 - (void)rdna4UseHeap:(id)heap {
     if (_encErr) return;
-    if (![heap isKindOfClass:[RDNA4Heap class]] || [heap device] != [self device]) {
+    Class spHeapCls = objc_getClass("RDNA4SparseHeap");
+    BOOL isSparseHeap = spHeapCls && [heap isKindOfClass:spHeapCls];
+    if ((!(isSparseHeap || [heap isKindOfClass:[RDNA4Heap class]])) || [heap device] != [self device]) {
         [self rdna4Fail:@"useHeap has an invalid heap or device"]; return;
     }
     [self rdna4RetainEncoded:heap];
-    for (id resource in [heap rdna4LiveResources]) if (![resource isAliasable]) [self rdna4RetainEncoded:resource];
+    if (!isSparseHeap) {
+        for (id resource in [heap rdna4LiveResources]) if (![resource isAliasable]) [self rdna4RetainEncoded:resource];
+    }
 }
 - (void)rdna4AttachResidencySnapshot:(id)snapshot {
     if (!snapshot || ![snapshot respondsToSelector:@selector(rdna4Allocations)]) return;
@@ -1982,5 +1996,9 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d;
 - (id)blitCommandEncoder;
 - (id)computeCommandEncoder;
+- (id)resourceStateCommandEncoder;
+- (id)resourceStateCommandEncoderWithDescriptor:(id)d;
+- (id)accelerationStructureCommandEncoder;
+- (id)accelerationStructureCommandEncoderWithDescriptor:(id)d;
 @end
 
