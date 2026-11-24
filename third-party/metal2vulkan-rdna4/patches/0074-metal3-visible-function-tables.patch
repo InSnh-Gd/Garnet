@@ -1,0 +1,1512 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 9b0e03b..da6c4b7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -693,14 +693,25 @@ pub fn translate_sanitized_native_linked_with_options(
+     translate_sanitized_native_with_options(&specialized, stage, tmp, options)
+ }
+ 
+-/// Resolve exact direct references and function-table contents into one ordinary AIR module.
+-/// Consumers that need to inspect or diagnose the pre-emission linked program use the same
+-/// specialization contract as linked translation.
++/// Resolve exact direct references, dynamic libraries, and function-table contents into one
++/// ordinary AIR module. Consumers that need to inspect or diagnose the pre-emission linked program
++/// use the same specialization contract as linked translation.
+ pub fn specialize_linked_module(
+     san_ll: &str,
+     stage: passes::Stage,
+     linkage: &linked_functions::LinkedFunctionLinkage,
+ ) -> Result<String, String> {
++    specialize_linked_module_with_vft(san_ll, stage, linkage).map(|(ll, _)| ll)
++}
++
++/// Like [`specialize_linked_module`], also returning deterministic runtime
++/// `MTLVisibleFunctionTable` metadata (table parameter/Metal buffer bindings and 1-based handle ID
++/// mapping) when runtime visible function tables were lowered.
++pub fn specialize_linked_module_with_vft(
++    san_ll: &str,
++    stage: passes::Stage,
++    linkage: &linked_functions::LinkedFunctionLinkage,
++) -> Result<(String, Option<linked_functions::RuntimeVisibleFunctionTableInfo>), String> {
+     let stage_name = match stage {
+         passes::Stage::Kernel => "kernel",
+         passes::Stage::Vertex => "vertex",
+@@ -708,8 +719,14 @@ pub fn specialize_linked_module(
+     };
+     let entry_name = meta::entry_name(san_ll, stage_name)
+         .ok_or_else(|| format!("linked translation found no AIR {stage_name} entry"))?;
++    let (specialized, vft_info) = linked_functions::specialize_runtime_visible_function_tables(
++        san_ll,
++        stage,
++        &entry_name,
++        linkage,
++    )?;
+     let specialized =
+-        linked_functions::specialize_visible_function_tables(san_ll, &entry_name, linkage)?;
++        linked_functions::specialize_visible_function_tables(&specialized, &entry_name, linkage)?;
+     let specialized =
+         linked_functions::specialize_visible_function_references(&specialized, linkage)?;
+     let specialized = linked_functions::link_dynamic_libraries(&specialized, linkage)?;
+@@ -718,7 +735,7 @@ pub fn specialize_linked_module(
+         &entry_name,
+         linkage,
+     )?;
+-    Ok(specialized)
++    Ok((specialized, vft_info))
+ }
+ 
+ /// Linked translation with AIR-level function-constant specialization.
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index d6107fe..4dac360 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -19,6 +19,12 @@ pub struct LinkedFunctionLinkage {
+     /// Preloaded dynamic-library AIR modules (`MTLDynamicLibrary` / `preloadedLibraries`)
+     /// exporting one or more external symbols resolved across compute, vertex, and fragment stages.
+     pub dynamic_libraries: Vec<DynamicLibraryModule>,
++    /// Pipeline-level `[[visible]]` functions linked for runtime `MTLVisibleFunctionTable`
++    /// switch-table dispatch. Assigned deterministic 1-based handle IDs (`1..=N`, `0` = null).
++    pub runtime_visible_functions: Vec<LinkedFunctionReference>,
++    /// Explicitly enable runtime `MTLVisibleFunctionTable` buffer lowering even when
++    /// `runtime_visible_functions` is empty (e.g., all-null table size/nullness queries).
++    pub runtime_visible_tables: bool,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -29,6 +35,35 @@ pub struct DynamicLibraryModule {
+     pub module_ll: String,
+ }
+ 
++/// Deterministic metadata describing runtime `MTLVisibleFunctionTable` lowering for a translated
++/// stage so the Metal runtime can bind table buffers and populate handle IDs.
++///
++/// GPU buffer layout (`uint32_t[]`, read-only `StorageBuffer` at the table's Metal buffer index):
++/// - `word[0]`: `slot_count` (`0` for an empty/null table; at least 4 bytes must be bound)
++/// - `word[1 + slot]`: 1-based `handle_id` (`0` = null/unbound slot -> safe zero/no-op default)
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct RuntimeVisibleFunctionTableInfo {
++    pub abi_version: u32,
++    pub header_words: u32,
++    pub tables: Vec<RuntimeVisibleFunctionTableBinding>,
++    pub handles: Vec<RuntimeVisibleFunctionHandle>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct RuntimeVisibleFunctionTableBinding {
++    pub param_index: u32,
++    pub metal_index: u32,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct RuntimeVisibleFunctionHandle {
++    pub handle_id: u32,
++    pub symbol: String,
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct LinkedFunctionReference {
+     /// Logical Metal function name recorded in the AIR reference metadata.
+@@ -130,6 +165,8 @@ impl LinkedFunctionLinkage {
+             && self.visible_tables.is_empty()
+             && self.intersection_tables.is_empty()
+             && self.dynamic_libraries.is_empty()
++            && self.runtime_visible_functions.is_empty()
++            && !self.runtime_visible_tables
+     }
+ }
+ 
+@@ -1453,19 +1490,1003 @@ pub fn specialize_visible_function_tables(
+         output.push_str(&trimmed[callee_end + 1..]);
+         output.push('\n');
+     }
+-    for dispatcher in dispatchers {
+-        output.push('\n');
+-        output.push_str(&dispatcher_definition(
+-            &dispatcher.name,
+-            &dispatcher.entries,
+-            &dispatcher.return_type,
+-            &dispatcher.argument_types,
+-        )?);
++    for dispatcher in dispatchers {
++        output.push('\n');
++        output.push_str(&dispatcher_definition(
++            &dispatcher.name,
++            &dispatcher.entries,
++            &dispatcher.return_type,
++            &dispatcher.argument_types,
++        )?);
++    }
++    for module in linked_modules {
++        output.push('\n');
++        let resolved = specialize_visible_function_references(module, linkage)?;
++        append_dependency_module(&mut output, &resolved)?;
++    }
++    Ok(output)
++}
++
++/// Lower runtime `MTLVisibleFunctionTable` parameters and indirect function-pointer calls across
++/// compute, vertex, and fragment stages into runtime table-buffer handle loads plus bounded
++/// `OpSwitch` dispatchers with safe zero/no-op out-of-bounds and null-slot handling.
++///
++/// Activated when `linkage.visible_tables` is empty and either `linkage.runtime_visible_functions`
++/// is non-empty or `linkage.runtime_visible_tables` is true. Returns `(rewritten_ll, Some(info))`
++/// when any visible function table parameter or runtime visible function lookup was lowered, or
++/// `(entry_ll, None)` when the stage has no visible function tables.
++pub fn specialize_runtime_visible_function_tables(
++    entry_ll: &str,
++    stage: crate::passes::Stage,
++    entry_name: &str,
++    linkage: &LinkedFunctionLinkage,
++) -> Result<(String, Option<RuntimeVisibleFunctionTableInfo>), String> {
++    if !linkage.visible_tables.is_empty()
++        || (linkage.runtime_visible_functions.is_empty() && !linkage.runtime_visible_tables)
++    {
++        return Ok((entry_ll.to_string(), None));
++    }
++    let tables = discover_visible_function_table_bindings(entry_ll, stage);
++    if tables.is_empty()
++        && !entry_ll.contains("@air.get_function_pointer_visible_function_table(")
++        && !entry_ll.contains("@air.get_size_visible_function_table(")
++        && !entry_ll.contains("@air.is_null_visible_function_table(")
++    {
++        return Ok((entry_ll.to_string(), None));
++    }
++    validate_linkage(linkage)?;
++
++    // Build deterministic 1-based handle table sorted by symbol name (0 is reserved for null).
++    let mut pool_map = std::collections::BTreeMap::<String, String>::new();
++    for reference in &linkage.runtime_visible_functions {
++        if !module_defines(&reference.module_ll, &reference.symbol) {
++            return Err(format!(
++                "runtime visible function {:?} is not defined by its linked module",
++                reference.symbol
++            ));
++        }
++        if let Some(prev) = pool_map.get(&reference.symbol) {
++            if prev != &reference.module_ll {
++                return Err(format!(
++                    "runtime visible function {:?} is defined by multiple distinct modules",
++                    reference.symbol
++                ));
++            }
++        } else {
++            pool_map.insert(reference.symbol.clone(), reference.module_ll.clone());
++        }
++    }
++    let mut pool_entries = Vec::<LinkedFunction>::with_capacity(pool_map.len());
++    let mut handle_info = Vec::<RuntimeVisibleFunctionHandle>::with_capacity(pool_map.len());
++    let mut symbol_to_handle = HashMap::<String, u32>::with_capacity(pool_map.len());
++    for (ordinal, (symbol, module_ll)) in pool_map.into_iter().enumerate() {
++        let handle_id = u32::try_from(ordinal + 1)
++            .map_err(|_| "runtime visible function count exceeded u32::MAX".to_string())?;
++        symbol_to_handle.insert(symbol.clone(), handle_id);
++        handle_info.push(RuntimeVisibleFunctionHandle {
++            handle_id,
++            symbol: symbol.clone(),
++        });
++        pool_entries.push(LinkedFunction {
++            index: handle_id,
++            symbol,
++            module_ll,
++        });
++    }
++
++    let signatures = function_signatures(entry_ll)?;
++    let entry_blocks = normalized_function_blocks(entry_ll);
++    let entry_global = llvm_global(entry_name)?;
++    let entry_sig = signatures.get(&entry_global).ok_or_else(|| {
++        format!("runtime visible function-table entry function {entry_name:?} is not defined")
++    })?;
++    let mut table_params = HashSet::<(String, usize)>::new();
++    let mut table_param_indices = HashSet::<u32>::new();
++    for binding in &tables {
++        if (binding.param_index as usize) >= entry_sig.parameters.len() {
++            return Err(format!(
++                "visible function table parameter {} exceeds entry {:?} arity {}",
++                binding.param_index,
++                entry_name,
++                entry_sig.parameters.len()
++            ));
++        }
++        table_params.insert((entry_global.clone(), binding.param_index as usize));
++        table_param_indices.insert(binding.param_index);
++    }
++
++    let mut ptr_params = HashSet::<(String, usize)>::new();
++    propagate_runtime_vft_flow(entry_ll, &signatures, &mut table_params, &mut ptr_params)?;
++
++    struct RuntimeDispatcher<'a> {
++        name: String,
++        entries: Vec<&'a LinkedFunction>,
++        return_type: String,
++        argument_types: Vec<String>,
++    }
++
++    let mut output = String::with_capacity(entry_ll.len() + 1024);
++    let mut linked_modules = Vec::<&str>::new();
++    let mut linked_module_set = HashSet::<&str>::new();
++    let mut dispatchers = Vec::<RuntimeDispatcher<'_>>::new();
++    let mut dispatcher_names = HashMap::<String, String>::new();
++    let mut temp_counter = 0usize;
++    let mut current_function = None::<String>;
++    let mut current_tables = HashSet::<String>::new();
++    // Map tracked function-pointer SSA -> runtime i32 handle SSA (or literal like "0"/"1").
++    let mut ptr_handles = HashMap::<String, String>::new();
++    let mut sentinel_integers = HashSet::<String>::new();
++
++    for raw_line in entry_ll.lines() {
++        let mut line = raw_line.to_string();
++        let trimmed_start = line.trim_start();
++        if current_function.is_none()
++            && trimmed_start.starts_with('!')
++            && trimmed_start.contains(" = !{")
++            && trimmed_start.contains("!\"air.visible_function_table\"")
++        {
++            if let Some(rewritten_md) =
++                rewrite_vft_metadata_line(&line, &table_param_indices)
++            {
++                output.push_str(&rewritten_md);
++                output.push('\n');
++                continue;
++            }
++        }
++        if let Some(global) = definition_global(trimmed_start) {
++            let closes_inline = trimmed_start.ends_with('}');
++            current_function = Some(global.clone());
++            current_tables.clear();
++            ptr_handles.clear();
++            sentinel_integers.clear();
++            let sig = signatures
++                .get(&global)
++                .ok_or_else(|| format!("missing parsed signature for {global}"))?;
++            for (ordinal, param) in sig.parameters.iter().enumerate() {
++                if table_params.contains(&(global.clone(), ordinal)) {
++                    current_tables.insert(param.clone());
++                }
++                if ptr_params.contains(&(global.clone(), ordinal)) {
++                    ptr_handles.insert(
++                        param.clone(),
++                        runtime_ptr_handle_param(ordinal, sig),
++                    );
++                }
++            }
++            line = append_runtime_ptr_handle_params(&line, &global, &signatures, &ptr_params)?;
++            output.push_str(&line);
++            output.push('\n');
++            if closes_inline {
++                current_function = None;
++            }
++            continue;
++        }
++        if trimmed_start == "}" {
++            output.push_str(&line);
++            output.push('\n');
++            current_function = None;
++            current_tables.clear();
++            ptr_handles.clear();
++            sentinel_integers.clear();
++            continue;
++        }
++        let Some(current_global) = current_function.as_deref() else {
++            // Drop declarations for visible-function-table intrinsics we lower away.
++            if let Some((decl_glob, _)) = declaration_global(trimmed_start) {
++                if matches!(
++                    decl_glob,
++                    "@air.get_function_pointer_visible_function_table"
++                        | "@air.get_size_visible_function_table"
++                        | "@air.is_null_visible_function_table"
++                ) {
++                    continue;
++                }
++            }
++            output.push_str(&line);
++            output.push('\n');
++            continue;
++        };
++
++        // Thread runtime i32 handle arguments into internal helpers that take tracked ptr params.
++        if let Some(rewritten_call) = append_runtime_ptr_handle_args(
++            &line,
++            current_global,
++            &signatures,
++            &ptr_params,
++            &ptr_handles,
++        )? {
++            output.push_str(&rewritten_call);
++            output.push('\n');
++            continue;
++        }
++
++        let trimmed = line.trim_start();
++        let leading = &line[..line.len() - trimmed.len()];
++        if let Some((result, instruction)) = trimmed.split_once(" = ") {
++            let result = result.trim();
++            if instruction.contains("@air.get_function_pointer_visible_function_table(") {
++                let arguments = call_arguments(instruction)?;
++                if arguments.len() < 2 {
++                    return Err(format!(
++                        "visible function-table lookup has {} arguments: {trimmed}",
++                        arguments.len()
++                    ));
++                }
++                let table_val = value_operand(arguments[0]);
++                if current_tables.contains(table_val) {
++                    if !arguments[1].trim_start().starts_with("i32 ") {
++                        return Err(format!(
++                            "runtime visible function-table lookup has non-i32 slot operand {:?}",
++                            arguments[1]
++                        ));
++                    }
++                    let slot_val = value_operand(arguments[1]);
++                    let id = temp_counter;
++                    temp_counter += 1;
++                    let sz = format!("%m2v.vft.sz.{id}");
++                    let ok = format!("%m2v.vft.ok.{id}");
++                    let i1 = format!("%m2v.vft.i1.{id}");
++                    let ix = format!("%m2v.vft.ix.{id}");
++                    let z = format!("%m2v.vft.z.{id}");
++                    let ptr_el = format!("%m2v.vft.p.{id}");
++                    let raw = format!("%m2v.vft.raw.{id}");
++                    let hdl = format!("%m2v.vft.hdl.{id}");
++                    // Safe bounds-checked handle load: word[0] = slot_count, word[1 + slot] = handle.
++                    // When out-of-bounds or slot_count == 0, index clamps to 0 (always in-bounds) and
++                    // select forces handle = 0 (null -> safe default).
++                    writeln!(output, "{leading}{sz} = load i32, ptr addrspace(1) {table_val}, align 4").unwrap();
++                    writeln!(output, "{leading}{ok} = icmp ult i32 {slot_val}, {sz}").unwrap();
++                    writeln!(output, "{leading}{i1} = add i32 {slot_val}, 1").unwrap();
++                    writeln!(output, "{leading}{ix} = select i1 {ok}, i32 {i1}, i32 0").unwrap();
++                    writeln!(output, "{leading}{z} = zext i32 {ix} to i64").unwrap();
++                    writeln!(output, "{leading}{ptr_el} = getelementptr inbounds i32, ptr addrspace(1) {table_val}, i64 {z}").unwrap();
++                    writeln!(output, "{leading}{raw} = load i32, ptr addrspace(1) {ptr_el}, align 4").unwrap();
++                    writeln!(output, "{leading}{hdl} = select i1 {ok}, i32 {raw}, i32 0").unwrap();
++                    writeln!(output, "{leading}{result} = inttoptr i64 0 to ptr").unwrap();
++                    ptr_handles.insert(result.to_string(), hdl);
++                    continue;
++                }
++            } else if instruction.contains("@air.get_size_visible_function_table(") {
++                let arguments = call_arguments(instruction)?;
++                if let Some(table_val) = arguments
++                    .first()
++                    .map(|a| value_operand(a))
++                    .filter(|v| current_tables.contains(*v))
++                {
++                    writeln!(
++                        output,
++                        "{leading}{result} = load i32, ptr addrspace(1) {table_val}, align 4"
++                    )
++                    .unwrap();
++                    continue;
++                }
++            } else if instruction.contains("@air.is_null_visible_function_table(") {
++                let arguments = call_arguments(instruction)?;
++                if let Some(table_val) = arguments
++                    .first()
++                    .map(|a| value_operand(a))
++                    .filter(|v| current_tables.contains(*v))
++                {
++                    let id = temp_counter;
++                    temp_counter += 1;
++                    let sz = format!("%m2v.vft.nsz.{id}");
++                    writeln!(
++                        output,
++                        "{leading}{sz} = load i32, ptr addrspace(1) {table_val}, align 4"
++                    )
++                    .unwrap();
++                    writeln!(output, "{leading}{result} = icmp eq i32 {sz}, 0").unwrap();
++                    continue;
++                }
++            } else if let Some((pointer_value, equal_to_null)) =
++                null_pointer_comparison(instruction)
++            {
++                if let Some(hdl) = ptr_handles.get(pointer_value) {
++                    let pred = if equal_to_null { "eq" } else { "ne" };
++                    writeln!(output, "{leading}{result} = icmp {pred} i32 {hdl}, 0").unwrap();
++                    continue;
++                }
++            } else if instruction.starts_with("ptrtoint ") {
++                if let Some(source) = cast_source_value(instruction) {
++                    if ptr_handles.contains_key(source) {
++                        sentinel_integers.insert(result.to_string());
++                    }
++                }
++            } else if instruction.starts_with("trunc ") {
++                if let Some(source) = cast_source_value(instruction) {
++                    if sentinel_integers.contains(source) {
++                        sentinel_integers.insert(result.to_string());
++                    }
++                }
++            } else if let Some((integer, equal_to_sentinel)) =
++                opaque_sentinel_comparison(instruction)
++            {
++                if sentinel_integers.contains(integer) {
++                    writeln!(
++                        output,
++                        "{leading}{result} = or i1 false, {}",
++                        !equal_to_sentinel
++                    )
++                    .unwrap();
++                    continue;
++                }
++            } else if instruction.starts_with("bitcast ")
++                || instruction.starts_with("addrspacecast ")
++            {
++                if let Some(source) = cast_source_value(instruction) {
++                    if let Some(hdl) = ptr_handles.get(source).cloned() {
++                        ptr_handles.insert(result.to_string(), hdl);
++                    }
++                }
++            } else if instruction.starts_with("select ") {
++                if let Some((hdl_name, hdl_line)) = rewrite_runtime_vft_select(
++                    instruction,
++                    &ptr_handles,
++                    &symbol_to_handle,
++                    &mut temp_counter,
++                ) {
++                    writeln!(output, "{leading}{hdl_line}").unwrap();
++                    ptr_handles.insert(result.to_string(), hdl_name);
++                }
++            } else if instruction.starts_with("phi ") {
++                if let Some((hdl_name, hdl_line)) = rewrite_runtime_vft_phi(
++                    instruction,
++                    &ptr_handles,
++                    &symbol_to_handle,
++                    &mut temp_counter,
++                ) {
++                    writeln!(output, "{leading}{hdl_line}").unwrap();
++                    ptr_handles.insert(result.to_string(), hdl_name);
++                }
++            }
++        }
++
++        let Some((callee_start, callee_end, callee)) = indirect_call_callee(trimmed) else {
++            output.push_str(&line);
++            output.push('\n');
++            continue;
++        };
++        let Some(handle_val) = ptr_handles.get(callee).cloned() else {
++            output.push_str(&line);
++            output.push('\n');
++            continue;
++        };
++        let call = indirect_call_shape(trimmed, callee_start, callee_end)?;
++        let key = format!("{}|{}", call.return_type, call.argument_types.join(","));
++        let disp_name = if let Some(existing) = dispatcher_names.get(&key) {
++            existing.clone()
++        } else {
++            let name = format!("metal2vulkan.vft.dispatch.{}", dispatchers.len());
++            let mut entries = Vec::new();
++            for function in &pool_entries {
++                if linked_function_matches_call(function, &call)? {
++                    entries.push(function);
++                }
++            }
++            if entries.is_empty() {
++                return Err(format!(
++                    "runtime visible function table indirect call ({}) -> {} has no matching linked visible function",
++                    call.argument_types.join(", "),
++                    call.return_type
++                ));
++            }
++            for function in &entries {
++                let fn_global = llvm_global(&function.symbol)?;
++                if let Some(entry_body) = entry_blocks.get(&fn_global) {
++                    let mod_blocks = normalized_function_blocks(&function.module_ll);
++                    if let Some(mod_body) = mod_blocks.get(&fn_global) {
++                        if mod_body != entry_body {
++                            return Err(format!(
++                                "runtime visible function {:?} conflicts with existing definition in entry module",
++                                function.symbol
++                            ));
++                        }
++                    }
++                    // Already identically defined in `entry_ll` (single-MTLLibrary shader +
++                    // [[visible]] function); keep it in dispatchers/handles without re-appending.
++                    continue;
++                }
++                if linked_module_set.insert(function.module_ll.as_str()) {
++                    linked_modules.push(&function.module_ll);
++                }
++            }
++            dispatcher_names.insert(key, name.clone());
++            dispatchers.push(RuntimeDispatcher {
++                name: name.clone(),
++                entries,
++                return_type: call.return_type,
++                argument_types: call.argument_types,
++            });
++            name
++        };
++        let disp_global = llvm_global(&disp_name)?;
++        output.push_str(leading);
++        output.push_str(&trimmed[..callee_start]);
++        output.push_str(&disp_global);
++        output.push('(');
++        output.push_str("i32 ");
++        output.push_str(&handle_val);
++        if trimmed.as_bytes().get(callee_end + 1) != Some(&b')') {
++            output.push_str(", ");
++        }
++        output.push_str(&trimmed[callee_end + 1..]);
++        output.push('\n');
++    }
++
++    for dispatcher in dispatchers {
++        output.push('\n');
++        output.push_str(&runtime_vft_dispatcher_definition(
++            &dispatcher.name,
++            &dispatcher.entries,
++            &dispatcher.return_type,
++            &dispatcher.argument_types,
++        )?);
++    }
++    for module in linked_modules {
++        let resolved = specialize_visible_function_references(module, linkage)?;
++        let trimmed_dep = strip_matching_defined_functions(&output, &resolved)?;
++        let newly_defined: HashSet<String> = trimmed_dep
++            .lines()
++            .filter_map(|line| {
++                let t = line.trim_start();
++                t.starts_with("define ").then(|| definition_global(t)).flatten()
++            })
++            .collect();
++        if !newly_defined.is_empty() {
++            // Drop any redundant `declare` in `output` for symbols we are about to define.
++            let mut stripped_output = String::with_capacity(output.len());
++            for line in output.lines() {
++                if let Some((global, _)) = declaration_global(line.trim_start()) {
++                    if newly_defined.contains(global) {
++                        continue;
++                    }
++                }
++                stripped_output.push_str(line);
++                stripped_output.push('\n');
++            }
++            output = stripped_output;
++            output.push('\n');
++            append_dependency_module(&mut output, &trimmed_dep)?;
++        }
++    }
++
++    let info = RuntimeVisibleFunctionTableInfo {
++        abi_version: 1,
++        header_words: 1,
++        tables,
++        handles: handle_info,
++    };
++    Ok((output, Some(info)))
++}
++
++fn normalized_function_blocks(module_ll: &str) -> HashMap<String, String> {
++    let mut blocks = HashMap::new();
++    let mut current: Option<(String, Vec<String>)> = None;
++    for line in module_ll.lines() {
++        let trimmed = line.trim();
++        if current.is_none() {
++            if let Some(global) = definition_global(trimmed) {
++                if trimmed.ends_with('}') {
++                    blocks.insert(global, trimmed.to_string());
++                } else {
++                    current = Some((global, vec![trimmed.to_string()]));
++                }
++            }
++            continue;
++        }
++        if let Some((global, mut lines)) = current.take() {
++            if !trimmed.is_empty() {
++                lines.push(trimmed.to_string());
++            }
++            if trimmed == "}" {
++                blocks.insert(global, lines.join("\n"));
++            } else {
++                current = Some((global, lines));
++            }
++        }
++    }
++    blocks
++}
++
++fn strip_matching_defined_functions(
++    output_ll: &str,
++    dependency_ll: &str,
++) -> Result<String, String> {
++    let existing = normalized_function_blocks(output_ll);
++    let dep_blocks = normalized_function_blocks(dependency_ll);
++    let mut skip_globals = HashSet::<String>::new();
++    for (global, dep_body) in &dep_blocks {
++        let header = dep_body.lines().next().unwrap_or("");
++        let at = header.find(global.as_str()).unwrap_or(0);
++        let is_local = header[..at]
++            .split_whitespace()
++            .any(|tok| matches!(tok, "internal" | "private"));
++        if is_local {
++            continue;
++        }
++        if let Some(existing_body) = existing.get(global) {
++            if existing_body != dep_body {
++                return Err(format!(
++                    "runtime visible function {global} conflicts with existing definition in entry module"
++                ));
++            }
++            skip_globals.insert(global.clone());
++        }
++    }
++    if skip_globals.is_empty() {
++        return Ok(dependency_ll.to_string());
++    }
++    let mut filtered = String::with_capacity(dependency_ll.len());
++    let mut skipping = false;
++    for line in dependency_ll.lines() {
++        let trimmed = line.trim();
++        if !skipping {
++            if let Some(global) = definition_global(trimmed) {
++                if skip_globals.contains(&global) {
++                    if !trimmed.ends_with('}') {
++                        skipping = true;
++                    }
++                    continue;
++                }
++            }
++            filtered.push_str(line);
++            filtered.push('\n');
++        } else if trimmed == "}" {
++            skipping = false;
++        }
++    }
++    Ok(filtered)
++}
++
++fn discover_visible_function_table_bindings(
++    entry_ll: &str,
++    stage: crate::passes::Stage,
++) -> Vec<RuntimeVisibleFunctionTableBinding> {
++    let mut bindings: Vec<RuntimeVisibleFunctionTableBinding> = match stage {
++        crate::passes::Stage::Kernel => crate::meta::parse_air_kernel_meta(entry_ll)
++            .map(|m| {
++                m.roles
++                    .into_iter()
++                    .filter_map(|(param_index, role)| match role {
++                        crate::meta::KernRole::VisibleFunctionTable(metal_index) => {
++                            Some(RuntimeVisibleFunctionTableBinding {
++                                param_index,
++                                metal_index,
++                            })
++                        }
++                        _ => None,
++                    })
++                    .collect()
++            })
++            .unwrap_or_default(),
++        crate::passes::Stage::Vertex => crate::meta::parse_air_vertex_meta(entry_ll)
++            .map(|m| {
++                m.roles
++                    .into_iter()
++                    .filter_map(|(param_index, role)| match role {
++                        crate::meta::VertRole::VisibleFunctionTable(metal_index) => {
++                            Some(RuntimeVisibleFunctionTableBinding {
++                                param_index,
++                                metal_index,
++                            })
++                        }
++                        _ => None,
++                    })
++                    .collect()
++            })
++            .unwrap_or_default(),
++        crate::passes::Stage::Fragment => crate::meta::parse_air_fragment_meta(entry_ll)
++            .map(|m| {
++                m.roles
++                    .into_iter()
++                    .filter_map(|(param_index, role)| match role {
++                        crate::meta::FragRole::VisibleFunctionTable(metal_index) => {
++                            Some(RuntimeVisibleFunctionTableBinding {
++                                param_index,
++                                metal_index,
++                            })
++                        }
++                        _ => None,
++                    })
++                    .collect()
++            })
++            .unwrap_or_default(),
++    };
++    bindings.sort_by_key(|b| b.param_index);
++    bindings
++}
++
++fn rewrite_vft_metadata_line(
++    line: &str,
++    table_param_indices: &HashSet<u32>,
++) -> Option<String> {
++    let open = line.find("!{")?;
++    let close = line.rfind('}')?;
++    if close <= open + 2 {
++        return None;
++    }
++    let body = &line[open + 2..close];
++    let first_field = body.split(',').next()?.trim();
++    let param_idx: u32 = first_field.strip_prefix("i32 ")?.trim().parse().ok()?;
++    if !table_param_indices.contains(&param_idx) {
++        return None;
++    }
++    let mut new_body = body
++        .replace("!\"air.visible_function_table\"", "!\"air.buffer\"")
++        .replace("!\"visible_function_table\"", "!\"uint\"");
++    if !new_body.contains("!\"air.read\"")
++        && !new_body.contains("!\"air.write\"")
++        && !new_body.contains("!\"air.read_write\"")
++    {
++        new_body.push_str(", !\"air.read\"");
++    }
++    if !new_body.contains("!\"air.address_space\"") {
++        new_body.push_str(", !\"air.address_space\", i32 1");
++    }
++    if !new_body.contains("!\"air.arg_type_size\"") {
++        new_body.push_str(", !\"air.arg_type_size\", i32 4");
++    }
++    if !new_body.contains("!\"air.arg_type_align_size\"") {
++        new_body.push_str(", !\"air.arg_type_align_size\", i32 4");
++    }
++    if !new_body.contains("!\"air.arg_type_name\"") {
++        new_body.push_str(", !\"air.arg_type_name\", !\"uint\"");
++    }
++    Some(format!("{}{}{}", &line[..open + 2], new_body, &line[close..]))
++}
++
++fn propagate_runtime_vft_flow(
++    ll: &str,
++    signatures: &HashMap<String, FunctionSignature>,
++    table_params: &mut HashSet<(String, usize)>,
++    ptr_params: &mut HashSet<(String, usize)>,
++) -> Result<(), String> {
++    loop {
++        let mut changed = false;
++        let mut current = None::<String>;
++        let mut tables = HashSet::<String>::new();
++        let mut pointers = HashSet::<String>::new();
++        for line in ll.lines() {
++            let trimmed = line.trim_start();
++            if let Some(global) = definition_global(trimmed) {
++                current = Some(global.clone());
++                tables.clear();
++                pointers.clear();
++                let sig = signatures
++                    .get(&global)
++                    .ok_or_else(|| format!("missing parsed signature for {global}"))?;
++                for (ordinal, param) in sig.parameters.iter().enumerate() {
++                    if table_params.contains(&(global.clone(), ordinal)) {
++                        tables.insert(param.clone());
++                    }
++                    if ptr_params.contains(&(global.clone(), ordinal)) {
++                        pointers.insert(param.clone());
++                    }
++                }
++                continue;
++            }
++            if trimmed == "}" {
++                current = None;
++                continue;
++            }
++            if current.is_none() {
++                continue;
++            }
++            if let Some((result, instruction)) = trimmed.split_once(" = ") {
++                let result = result.trim();
++                if instruction.contains("@air.get_function_pointer_visible_function_table(") {
++                    let arguments = call_arguments(instruction)?;
++                    if arguments
++                        .first()
++                        .is_some_and(|a| tables.contains(value_operand(a)))
++                    {
++                        pointers.insert(result.to_string());
++                    }
++                } else if instruction.starts_with("bitcast ")
++                    || instruction.starts_with("addrspacecast ")
++                {
++                    if let Some(source) = cast_source_value(instruction) {
++                        if pointers.contains(source) {
++                            pointers.insert(result.to_string());
++                        }
++                    }
++                } else if instruction.starts_with("phi ") || instruction.starts_with("select ") {
++                    if pointers.iter().any(|p| contains_llvm_value(instruction, p)) {
++                        pointers.insert(result.to_string());
++                    }
++                }
++            }
++            let Some((callee, _, _, arguments)) = named_call(trimmed) else {
++                continue;
++            };
++            let Some(callee_sig) = signatures.get(callee) else {
++                continue;
++            };
++            for (ordinal, argument) in arguments
++                .iter()
++                .take(callee_sig.parameters.len())
++                .enumerate()
++            {
++                let value = value_operand(argument);
++                if tables.contains(value)
++                    && table_params.insert((callee.to_string(), ordinal))
++                {
++                    changed = true;
++                }
++                if pointers.contains(value)
++                    && ptr_params.insert((callee.to_string(), ordinal))
++                {
++                    changed = true;
++                }
++            }
++        }
++        if !changed {
++            return Ok(());
++        }
++    }
++}
++
++fn runtime_ptr_handle_param(ordinal: usize, signature: &FunctionSignature) -> String {
++    let base = format!("%m2v.vft.param{ordinal}.hdl");
++    if !signature.parameters.contains(&base) {
++        return base;
++    }
++    for suffix in 1usize.. {
++        let candidate = format!("{base}.{suffix}");
++        if !signature.parameters.contains(&candidate) {
++            return candidate;
++        }
++    }
++    unreachable!()
++}
++
++fn runtime_ptr_param_ordinals(
++    ptr_params: &HashSet<(String, usize)>,
++    global: &str,
++) -> Vec<usize> {
++    let mut ordinals: Vec<usize> = ptr_params
++        .iter()
++        .filter_map(|(f, o)| (f == global).then_some(*o))
++        .collect();
++    ordinals.sort_unstable();
++    ordinals
++}
++
++fn append_runtime_ptr_handle_params(
++    line: &str,
++    global: &str,
++    signatures: &HashMap<String, FunctionSignature>,
++    ptr_params: &HashSet<(String, usize)>,
++) -> Result<String, String> {
++    let ordinals = runtime_ptr_param_ordinals(ptr_params, global);
++    if ordinals.is_empty() {
++        return Ok(line.to_string());
++    }
++    let sig = signatures
++        .get(global)
++        .ok_or_else(|| format!("missing parsed signature for {global}"))?;
++    let at = line
++        .find(global)
++        .ok_or_else(|| format!("definition line does not contain {global}"))?;
++    let open = line[at + global.len()..]
++        .find('(')
++        .map(|o| o + at + global.len())
++        .ok_or_else(|| format!("definition {global} has no parameter list"))?;
++    let close = matching_paren(line, open)
++        .ok_or_else(|| format!("multiline definition parameters for {global} are unsupported"))?;
++    let additions = ordinals
++        .into_iter()
++        .map(|o| format!("i32 {}", runtime_ptr_handle_param(o, sig)))
++        .collect::<Vec<_>>()
++        .join(", ");
++    let sep = if line[open + 1..close].trim().is_empty() {
++        ""
++    } else {
++        ", "
++    };
++    Ok(format!(
++        "{}{}{}{}",
++        &line[..close],
++        sep,
++        additions,
++        &line[close..]
++    ))
++}
++
++fn append_runtime_ptr_handle_args(
++    line: &str,
++    caller: &str,
++    signatures: &HashMap<String, FunctionSignature>,
++    ptr_params: &HashSet<(String, usize)>,
++    ptr_handles: &HashMap<String, String>,
++) -> Result<Option<String>, String> {
++    let Some((callee, open, close, arguments)) = named_call(line) else {
++        return Ok(None);
++    };
++    let ordinals = runtime_ptr_param_ordinals(ptr_params, callee);
++    if ordinals.is_empty() || !signatures.contains_key(callee) {
++        return Ok(None);
++    }
++    let mut additions = Vec::new();
++    for ordinal in ordinals {
++        let arg = arguments.get(ordinal).ok_or_else(|| {
++            format!("call from {caller} to {callee} omits runtime VFT pointer param {ordinal}")
++        })?;
++        let val = value_operand(arg);
++        let hdl = if val == "null" {
++            "0".to_string()
++        } else {
++            ptr_handles.get(val).cloned().ok_or_else(|| {
++                format!("call from {caller} to {callee} passes untraced VFT pointer param {ordinal}: {val}")
++            })?
++        };
++        additions.push(format!("i32 {hdl}"));
++    }
++    let sep = if line[open + 1..close].trim().is_empty() {
++        ""
++    } else {
++        ", "
++    };
++    Ok(Some(format!(
++        "{}{}{}{}",
++        &line[..close],
++        sep,
++        additions.join(", "),
++        &line[close..]
++    )))
++}
++
++fn resolve_ptr_handle_operand(
++    val: &str,
++    ptr_handles: &HashMap<String, String>,
++    symbol_to_handle: &HashMap<String, u32>,
++) -> Option<(String, bool)> {
++    if let Some(hdl) = ptr_handles.get(val) {
++        return Some((hdl.clone(), true));
++    }
++    if val == "null" {
++        return Some(("0".to_string(), false));
++    }
++    if val.starts_with('@') {
++        if let Ok(sym) = decode_llvm_global(val) {
++            if let Some(&id) = symbol_to_handle.get(&sym) {
++                return Some((id.to_string(), true));
++            }
++        }
++    }
++    None
++}
++
++fn rewrite_runtime_vft_select(
++    instruction: &str,
++    ptr_handles: &HashMap<String, String>,
++    symbol_to_handle: &HashMap<String, u32>,
++    counter: &mut usize,
++) -> Option<(String, String)> {
++    let rest = instruction.strip_prefix("select ")?;
++    let parts = split_top_level(rest, ',');
++    if parts.len() != 3 {
++        return None;
++    }
++    let (ht, t_tracked) =
++        resolve_ptr_handle_operand(value_operand(parts[1]), ptr_handles, symbol_to_handle)?;
++    let (hf, f_tracked) =
++        resolve_ptr_handle_operand(value_operand(parts[2]), ptr_handles, symbol_to_handle)?;
++    if !t_tracked && !f_tracked {
++        return None;
++    }
++    let id = *counter;
++    *counter += 1;
++    let hdl = format!("%m2v.vft.sel.{id}");
++    let line = format!("{hdl} = select {}, i32 {ht}, i32 {hf}", parts[0].trim());
++    Some((hdl, line))
++}
++
++fn rewrite_runtime_vft_phi(
++    instruction: &str,
++    ptr_handles: &HashMap<String, String>,
++    symbol_to_handle: &HashMap<String, u32>,
++    counter: &mut usize,
++) -> Option<(String, String)> {
++    let first_bracket = instruction.find('[')?;
++    let arms = split_top_level(&instruction[first_bracket..], ',');
++    let mut new_arms = Vec::with_capacity(arms.len());
++    let mut any_tracked = false;
++    for arm in arms {
++        let arm = arm.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
++        let (val_part, label_part) = arm.split_once(',')?;
++        let (h, tracked) =
++            resolve_ptr_handle_operand(val_part.trim(), ptr_handles, symbol_to_handle)?;
++        any_tracked |= tracked;
++        new_arms.push(format!("[ {h}, {} ]", label_part.trim()));
++    }
++    if !any_tracked {
++        return None;
++    }
++    let id = *counter;
++    *counter += 1;
++    let hdl = format!("%m2v.vft.phi.{id}");
++    let line = format!("{hdl} = phi i32 {}", new_arms.join(", "));
++    Some((hdl, line))
++}
++
++fn llvm_zero_literal(ty: &str) -> &'static str {
++    let ty = ty.trim();
++    if ty == "i1" {
++        "false"
++    } else if ty.starts_with('i') && ty[1..].bytes().all(|b| b.is_ascii_digit()) {
++        "0"
++    } else if matches!(ty, "half" | "bfloat" | "float" | "double") {
++        "0.0"
++    } else if ty == "ptr" || ty.starts_with("ptr ") {
++        "null"
++    } else {
++        "zeroinitializer"
++    }
++}
++
++/// Emit a bounded `OpSwitch` dispatcher with safe zero/no-op default handling for null (0) or
++/// out-of-bounds runtime handles (never emits `unreachable`).
++fn runtime_vft_dispatcher_definition(
++    name: &str,
++    entries: &[&LinkedFunction],
++    return_type: &str,
++    argument_types: &[String],
++) -> Result<String, String> {
++    let global = llvm_global(name)?;
++    let parameters = argument_types
++        .iter()
++        .enumerate()
++        .map(|(index, ty)| format!("{ty} %arg{index}"))
++        .collect::<Vec<_>>();
++    let forwarded = argument_types
++        .iter()
++        .enumerate()
++        .map(|(index, ty)| format!("{ty} %arg{index}"))
++        .collect::<Vec<_>>()
++        .join(", ");
++    let parameter_separator = if parameters.is_empty() { "" } else { ", " };
++    let mut output = format!(
++        "define internal {return_type} {global}(i32 %metal2vulkan_handle{}{}) {{\nentry:\n  switch i32 %metal2vulkan_handle, label %default [",
++        parameter_separator,
++        parameters.join(", ")
++    );
++    for entry in entries {
++        output.push_str(&format!(
++            " i32 {}, label %case_{}",
++            entry.index, entry.index
++        ));
++    }
++    output.push_str(" ]\n\n");
++    let is_void = return_type == "void";
++    for entry in entries {
++        output.push_str(&format!("case_{}:\n", entry.index));
++        let target = llvm_global(&entry.symbol)?;
++        if is_void {
++            output.push_str(&format!(
++                "  call void {target}({forwarded})\n  ret void\n\n"
++            ));
++        } else {
++            output.push_str(&format!(
++                "  %result_{} = call {return_type} {target}({forwarded})\n  br label %exit\n\n",
++                entry.index
++            ));
++        }
+     }
+-    for module in linked_modules {
+-        output.push('\n');
+-        let resolved = specialize_visible_function_references(module, linkage)?;
+-        append_dependency_module(&mut output, &resolved)?;
++    if is_void {
++        output.push_str("default:\n  ret void\n}\n");
++    } else {
++        let zero = llvm_zero_literal(return_type);
++        output.push_str("default:\n  br label %exit\n\nexit:\n  %result = phi ");
++        output.push_str(return_type);
++        output.push(' ');
++        for entry in entries {
++            output.push_str(&format!(
++                "[ %result_{}, %case_{} ], ",
++                entry.index, entry.index
++            ));
++        }
++        output.push_str(&format!("[ {zero}, %default ]\n  ret {return_type} %result\n}}\n"));
+     }
+     Ok(output)
+ }
+@@ -3497,4 +4518,375 @@ declare i32 @foo.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+         let err = link_dynamic_libraries(entry, &conflict).unwrap_err();
+         assert!(err.contains("exported by multiple libraries"), "{err}");
+     }
++
++    #[test]
++    fn runtime_vft_compute_fragment_and_vertex_lower_to_bounded_switch_dispatch() {
++        let vis_fns = vec![
++            LinkedFunctionReference {
++                symbol: "op_mul".into(),
++                module_ll: "define i32 @op_mul(i32 %x) {\nentry:\n  %r = mul i32 %x, 3\n  ret i32 %r\n}\n".into(),
++            },
++            LinkedFunctionReference {
++                symbol: "op_add".into(),
++                module_ll: "define i32 @op_add(i32 %x) {\nentry:\n  %r = add i32 %x, 10\n  ret i32 %r\n}\n".into(),
++            },
++            LinkedFunctionReference {
++                symbol: "shade_red".into(),
++                module_ll: "define <4 x float> @shade_red(<4 x float> %c) {\nentry:\n  %r = fmul <4 x float> %c, <float 1.0, float 0.0, float 0.0, float 1.0>\n  ret <4 x float> %r\n}\n".into(),
++            },
++            LinkedFunctionReference {
++                symbol: "shade_blue".into(),
++                module_ll: "define <4 x float> @shade_blue(<4 x float> %c) {\nentry:\n  %r = fmul <4 x float> %c, <float 0.0, float 0.0, float 1.0, float 1.0>\n  ret <4 x float> %r\n}\n".into(),
++            },
++        ];
++        let linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vis_fns,
++            ..Default::default()
++        };
++
++        // Compute stage with runtime slot, null check, table size query, and indirect call
++        let comp_entry = r#"
++define void @main(ptr addrspace(1) %output, ptr addrspace(1) %table, ptr addrspace(1) %slots, i32 %tid) {
++entry:
++  %idx = zext i32 %tid to i64
++  %sp = getelementptr inbounds i32, ptr addrspace(1) %slots, i64 %idx
++  %slot = load i32, ptr addrspace(1) %sp, align 4
++  %sz = call i32 @air.get_size_visible_function_table(ptr addrspace(1) %table)
++  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 %slot)
++  %is_null = icmp eq ptr %fp, null
++  %val = call i32 %fp(i32 7)
++  %final = select i1 %is_null, i32 %sz, i32 %val
++  %op = getelementptr inbounds i32, ptr addrspace(1) %output, i64 %idx
++  store i32 %final, ptr addrspace(1) %op, align 4
++  ret void
++}
++declare i32 @air.get_size_visible_function_table(ptr addrspace(1))
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint"}
++!4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint"}
++!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++"#;
++        let (comp_spec, vft_info) = crate::specialize_linked_module_with_vft(
++            comp_entry,
++            crate::passes::Stage::Kernel,
++            &linkage,
++        )
++        .expect("specialize compute runtime VFT");
++        let info = vft_info.expect("vft metadata");
++        assert_eq!(info.abi_version, 1);
++        assert_eq!(info.header_words, 1);
++        assert_eq!(info.tables.len(), 1);
++        assert_eq!(info.tables[0].param_index, 1);
++        assert_eq!(info.tables[0].metal_index, 1);
++        // Sorted deterministically by symbol name: op_add=1, op_mul=2, shade_blue=3, shade_red=4
++        assert_eq!(info.handles[0].handle_id, 1);
++        assert_eq!(info.handles[0].symbol, "op_add");
++        assert_eq!(info.handles[1].handle_id, 2);
++        assert_eq!(info.handles[1].symbol, "op_mul");
++        assert!(!comp_spec.contains("unreachable"), "must have safe default:\n{comp_spec}");
++        assert!(comp_spec.contains("i32 1, label %case_1"), "{comp_spec}");
++        assert!(comp_spec.contains("i32 2, label %case_2"), "{comp_spec}");
++        assert!(!comp_spec.contains("label %case_3"), "incompatible signature must be excluded:\n{comp_spec}");
++
++        let (comp_spv, comp_refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            &comp_spec,
++            crate::passes::Stage::Kernel,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate compute runtime VFT");
++        let comp_asm = crate::disassemble(&comp_spv).unwrap();
++        assert!(comp_asm.contains("OpSwitch"), "{comp_asm}");
++        assert!(!comp_asm.contains("OpUnreachable"), "{comp_asm}");
++        assert!(
++            comp_refl.bindings.iter().any(|b| b.metal_index == 1 && b.descriptor.is_some()),
++            "VFT buffer must be bound at metal_index 1: {comp_refl:?}"
++        );
++
++        // Fragment stage with runtime VFT
++        let frag_entry = r#"
++define <4 x float> @fs_vft(<4 x float> %col, ptr addrspace(1) %table, ptr addrspace(1) %slot_buf) {
++entry:
++  %slot = load i32, ptr addrspace(1) %slot_buf, align 4
++  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 %slot)
++  %out = call <4 x float> %fp(<4 x float> %col)
++  ret <4 x float> %out
++}
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.fragment = !{!0}
++!0 = !{ptr @fs_vft, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"col", !"air.perspective", !"air.arg_type_name", !"float4"}
++!5 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint"}
++"#;
++        let (frag_spec, frag_vft) = crate::specialize_linked_module_with_vft(
++            frag_entry,
++            crate::passes::Stage::Fragment,
++            &linkage,
++        )
++        .expect("specialize fragment runtime VFT");
++        assert_eq!(frag_vft.unwrap().tables[0].metal_index, 0);
++        let (frag_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &frag_spec,
++            crate::passes::Stage::Fragment,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate fragment runtime VFT");
++        let frag_asm = crate::disassemble(&frag_spv).unwrap();
++        assert!(frag_asm.contains("OpEntryPoint Fragment"), "{frag_asm}");
++        assert!(frag_asm.contains("OpSwitch"), "{frag_asm}");
++        assert!(!frag_asm.contains("OpUnreachable"), "{frag_asm}");
++
++        // Vertex stage with runtime VFT
++        let vert_entry = r#"
++define <4 x float> @vs_vft(<4 x float> %pos, ptr addrspace(1) %table) {
++entry:
++  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
++  %out = call <4 x float> %fp(<4 x float> %pos)
++  ret <4 x float> %out
++}
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.vertex = !{!0}
++!0 = !{ptr @vs_vft, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5}
++!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float4"}
++!5 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++"#;
++        let (vert_spec, _) = crate::specialize_linked_module_with_vft(
++            vert_entry,
++            crate::passes::Stage::Vertex,
++            &linkage,
++        )
++        .expect("specialize vertex runtime VFT");
++        let (vert_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &vert_spec,
++            crate::passes::Stage::Vertex,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate vertex runtime VFT");
++        let vert_asm = crate::disassemble(&vert_spv).unwrap();
++        assert!(vert_asm.contains("OpEntryPoint Vertex"), "{vert_asm}");
++        assert!(vert_asm.contains("OpSwitch"), "{vert_asm}");
++    }
++
++    #[test]
++    fn runtime_vft_rejects_unmatched_indirect_call_signature() {
++        let entry = r#"
++define void @main(ptr addrspace(1) %out, ptr addrspace(1) %table) {
++entry:
++  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
++  %v = call i32 %fp(i32 1, i32 2)
++  store i32 %v, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
++!4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![LinkedFunctionReference {
++                symbol: "only_float".into(),
++                module_ll: "define float @only_float(float %x) {\n  ret float %x\n}\n".into(),
++            }],
++            ..Default::default()
++        };
++        let err = crate::specialize_linked_module_with_vft(
++            entry,
++            crate::passes::Stage::Kernel,
++            &linkage,
++        )
++        .unwrap_err();
++        assert!(err.contains("no matching linked visible function"), "{err}");
++    }
++
++    #[test]
++    fn runtime_vft_supports_select_helper_threading_is_null_and_void_buffer_callbacks() {
++        let entry = r#"
++define void @main(ptr addrspace(1) %out, ptr addrspace(1) %table, i32 %tid) {
++entry:
++  %tbl_null = call i1 @air.is_null_visible_function_table(ptr addrspace(1) %table)
++  %fp0 = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
++  %fp1 = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 1)
++  %sel = select i1 %tbl_null, ptr %fp0, ptr %fp1
++  call void @invoke_writer(ptr %sel, ptr addrspace(1) %out, i32 %tid)
++  ret void
++}
++define internal void @invoke_writer(ptr %cb, ptr addrspace(1) %dst, i32 %idx) {
++entry:
++  call void %cb(ptr addrspace(1) %dst, i32 %idx)
++  ret void
++}
++declare i1 @air.is_null_visible_function_table(ptr addrspace(1))
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint"}
++!4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![
++                LinkedFunctionReference {
++                    symbol: "write_a".into(),
++                    module_ll: "define void @write_a(ptr addrspace(1) %dst, i32 %idx) {\nentry:\n  %z = zext i32 %idx to i64\n  %p = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %z\n  store i32 111, ptr addrspace(1) %p, align 4\n  ret void\n}\n".into(),
++                },
++                LinkedFunctionReference {
++                    symbol: "write_b".into(),
++                    module_ll: "define void @write_b(ptr addrspace(1) %dst, i32 %idx) {\nentry:\n  %z = zext i32 %idx to i64\n  %p = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %z\n  store i32 222, ptr addrspace(1) %p, align 4\n  ret void\n}\n".into(),
++                },
++            ],
++            ..Default::default()
++        };
++        let (spec, info) = crate::specialize_linked_module_with_vft(
++            entry,
++            crate::passes::Stage::Kernel,
++            &linkage,
++        )
++        .expect("specialize helper-threaded VFT");
++        assert_eq!(info.unwrap().handles.len(), 2);
++        let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &spec,
++            crate::passes::Stage::Kernel,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate helper-threaded VFT");
++        let asm = crate::disassemble(&spv).unwrap();
++        assert!(asm.contains("OpSwitch"), "{asm}");
++        assert!(!asm.contains("OpUnreachable"), "{asm}");
++    }
++
++    #[test]
++    fn runtime_vft_supports_same_library_visible_functions_and_rejects_conflicts() {
++        let same_lib_entry = r#"
++define i32 @vis_inc(i32 %x) {
++entry:
++  %y = add i32 %x, 1
++  ret i32 %y
++}
++define i32 @vis_dbl(i32 %x) {
++entry:
++  %y = mul i32 %x, 2
++  ret i32 %y
++}
++define void @main(ptr addrspace(1) %out, ptr addrspace(1) %table, i32 %tid) {
++entry:
++  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 %tid)
++  %v = call i32 %fp(i32 %tid)
++  store i32 %v, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
++!4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
++!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
++"#;
++        // Case 1: whole single-MTLLibrary passed for every visible function.
++        let whole_linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![
++                LinkedFunctionReference {
++                    symbol: "vis_inc".into(),
++                    module_ll: same_lib_entry.into(),
++                },
++                LinkedFunctionReference {
++                    symbol: "vis_dbl".into(),
++                    module_ll: same_lib_entry.into(),
++                },
++            ],
++            ..Default::default()
++        };
++        let (spec_whole, info_whole) = crate::specialize_linked_module_with_vft(
++            same_lib_entry,
++            crate::passes::Stage::Kernel,
++            &whole_linkage,
++        )
++        .expect("whole single-MTLLibrary VFT");
++        assert_eq!(info_whole.unwrap().handles.len(), 2);
++        let (spv_whole, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &spec_whole,
++            crate::passes::Stage::Kernel,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate whole-library VFT");
++        assert!(crate::disassemble(&spv_whole).unwrap().contains("OpSwitch"));
++
++        // Case 2: split single-function module matching entry definition + external new function.
++        let split_inc = "define i32 @vis_inc(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n";
++        let ext_add5 = "define i32 @vis_add5(i32 %x) {\nentry:\n  %y = add i32 %x, 5\n  ret i32 %y\n}\n";
++        let split_linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![
++                LinkedFunctionReference {
++                    symbol: "vis_inc".into(),
++                    module_ll: split_inc.into(),
++                },
++                LinkedFunctionReference {
++                    symbol: "vis_add5".into(),
++                    module_ll: ext_add5.into(),
++                },
++            ],
++            ..Default::default()
++        };
++        let (spec_split, info_split) = crate::specialize_linked_module_with_vft(
++            same_lib_entry,
++            crate::passes::Stage::Kernel,
++            &split_linkage,
++        )
++        .expect("split same-library + external VFT");
++        assert_eq!(info_split.unwrap().handles.len(), 2);
++        let (spv_split, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &spec_split,
++            crate::passes::Stage::Kernel,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate split same-library VFT");
++        assert!(crate::disassemble(&spv_split).unwrap().contains("OpSwitch"));
++
++        // Case 3: conflicting body for same-named visible function must be refused.
++        let conflicting_inc =
++            "define i32 @vis_inc(i32 %x) {\nentry:\n  %y = add i32 %x, 99\n  ret i32 %y\n}\n";
++        let conflict_linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![LinkedFunctionReference {
++                symbol: "vis_inc".into(),
++                module_ll: conflicting_inc.into(),
++            }],
++            ..Default::default()
++        };
++        let err = crate::specialize_linked_module_with_vft(
++            same_lib_entry,
++            crate::passes::Stage::Kernel,
++            &conflict_linkage,
++        )
++        .unwrap_err();
++        assert!(err.contains("conflicts") && err.contains("vis_inc"), "{err}");
++    }
+ }

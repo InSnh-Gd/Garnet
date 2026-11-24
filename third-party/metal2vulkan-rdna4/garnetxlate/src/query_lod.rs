@@ -16,14 +16,14 @@ pub struct RDNA4xBackendCapabilities {
 }
 
 impl RDNA4xBackendCapabilities {
-    fn validate(self) -> Result<Self, String> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         if self.struct_size != 24 || self.version != 1 || self.flags & !3 != 0 {
             return Err("invalid ABI 3 backend capabilities".into());
         }
         Ok(self)
     }
 
-    fn replay(self) -> QueryLodReplay {
+    pub(crate) fn replay(self) -> QueryLodReplay {
         if self.subgroup_size >= 4
             && self.subgroup_supported_stages & 0x10 != 0
             && self.subgroup_supported_operations & 0x80 != 0
@@ -35,7 +35,10 @@ impl RDNA4xBackendCapabilities {
     }
 }
 
-fn gate_query_lod(spv: &[u8], capabilities: RDNA4xBackendCapabilities) -> Result<bool, String> {
+pub(crate) fn gate_query_lod(
+    spv: &[u8],
+    capabilities: RDNA4xBackendCapabilities,
+) -> Result<bool, String> {
     if spv.len() < 20 || !spv.len().is_multiple_of(4) || spv[..4] != [3, 2, 35, 7] {
         return Err("invalid query LOD SPIR-V".into());
     }
@@ -305,7 +308,7 @@ pub unsafe extern "C" fn garnetx_lower_argument_resources_with_capabilities(
     finish(outcome, spv, spv_len, meta, meta_len, err, err_len)
 }
 
-fn source_language_version(source: &str) -> Option<[u32; 3]> {
+pub(crate) fn source_language_version(source: &str) -> Option<[u32; 3]> {
     let reference = source
         .lines()
         .find_map(|line| {
@@ -342,7 +345,7 @@ fn query_replay_name(replay: QueryLodReplay) -> &'static str {
     }
 }
 
-fn gate_query_metadata(metadata: &Value) -> Result<(), String> {
+pub(crate) fn gate_query_metadata(metadata: &Value) -> Result<(), String> {
     let version = metadata["source_language_version"]
         .as_array()
         .and_then(|components| {
@@ -360,7 +363,7 @@ fn gate_query_metadata(metadata: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn stamp_query_policy(metadata: &mut Value, capabilities: RDNA4xBackendCapabilities) {
+pub(crate) fn stamp_query_policy(metadata: &mut Value, capabilities: RDNA4xBackendCapabilities) {
     metadata["query_lod_policy"] = serde_json::json!(1);
     metadata["query_lod_replay"] = serde_json::json!(query_replay_name(capabilities.replay()));
 }

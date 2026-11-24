@@ -18,6 +18,11 @@
 
 mod icb_stage;
 pub use icb_stage::garnetx_lower_icb_stage;
+mod stage2_link;
+pub use stage2_link::{
+    garnetx_list_exported_symbols, garnetx_translate_linked_libraries, list_exported_symbols,
+    translate_bytes_stage2, RDNA4xDynamicLibrary,
+};
 mod source_proof;
 
 mod query_lod;

@@ -1,0 +1,1051 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e3d24b9..9b0e03b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -712,6 +712,7 @@ pub fn specialize_linked_module(
+         linked_functions::specialize_visible_function_tables(san_ll, &entry_name, linkage)?;
+     let specialized =
+         linked_functions::specialize_visible_function_references(&specialized, linkage)?;
++    let specialized = linked_functions::link_dynamic_libraries(&specialized, linkage)?;
+     let specialized = linked_functions::specialize_opaque_triangle_intersection_tables(
+         &specialized,
+         &entry_name,
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index 0058512..d6107fe 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -16,6 +16,17 @@ pub struct LinkedFunctionLinkage {
+     pub visible_references: Vec<LinkedFunctionReference>,
+     pub visible_tables: Vec<LinkedFunctionTable>,
+     pub intersection_tables: Vec<IntersectionFunctionTable>,
++    /// Preloaded dynamic-library AIR modules (`MTLDynamicLibrary` / `preloadedLibraries`)
++    /// exporting one or more external symbols resolved across compute, vertex, and fragment stages.
++    pub dynamic_libraries: Vec<DynamicLibraryModule>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DynamicLibraryModule {
++    /// Diagnostic library name (e.g., install name or index label).
++    pub name: String,
++    /// Sanitized AIR LLVM module defining exported functions and any private helpers.
++    pub module_ll: String,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -118,6 +129,7 @@ impl LinkedFunctionLinkage {
+         self.visible_references.is_empty()
+             && self.visible_tables.is_empty()
+             && self.intersection_tables.is_empty()
++            && self.dynamic_libraries.is_empty()
+     }
+ }
+ 
+@@ -518,32 +530,57 @@ pub fn specialize_visible_function_references(
+     linkage: &LinkedFunctionLinkage,
+ ) -> Result<String, String> {
+     validate_linkage(linkage)?;
+-    let authored = linkage
+-        .visible_references
+-        .iter()
+-        .map(|reference| (reference.symbol.as_str(), reference))
+-        .collect::<HashMap<_, _>>();
+-    let mut used = HashSet::<&str>::new();
++    let mut authored = HashMap::<String, &str>::new();
++    for reference in &linkage.visible_references {
++        authored.insert(reference.symbol.clone(), reference.module_ll.as_str());
++    }
++    let mut dynlib_conflicts = HashMap::<String, (String, String)>::new();
++    let mut dynlib_owners = HashMap::<String, String>::new();
++    for library in &linkage.dynamic_libraries {
++        for symbol in exported_symbols(&library.module_ll)? {
++            if let Some(&prev_ll) = authored.get(&symbol) {
++                if prev_ll != library.module_ll {
++                    if let Some(prev_name) = dynlib_owners.get(&symbol) {
++                        dynlib_conflicts.insert(symbol, (prev_name.clone(), library.name.clone()));
++                    }
++                }
++            } else {
++                authored.insert(symbol.clone(), library.module_ll.as_str());
++                dynlib_owners.insert(symbol, library.name.clone());
++            }
++        }
++    }
++    let mut used = HashSet::<String>::new();
+     let mut appended_modules = HashSet::<&str>::new();
+-    let mut pending = Vec::<&LinkedFunctionReference>::new();
+-    let mut output = rewrite_visible_reference_stubs(entry_ll, &authored, &mut used, &mut pending)?;
++    let mut pending = Vec::<(String, &str)>::new();
++    let mut output = rewrite_visible_reference_stubs(
++        entry_ll,
++        &authored,
++        &dynlib_conflicts,
++        &mut used,
++        &mut pending,
++    )?;
+ 
+-    while let Some(reference) = pending.pop() {
+-        if !appended_modules.insert(reference.module_ll.as_str()) {
++    while let Some((_symbol, module_ll)) = pending.pop() {
++        if !appended_modules.insert(module_ll) {
+             continue;
+         }
+         let rewritten = rewrite_visible_reference_stubs(
+-            &reference.module_ll,
++            module_ll,
+             &authored,
++            &dynlib_conflicts,
+             &mut used,
+             &mut pending,
+         )?;
+         append_dependency_module(&mut output, &rewritten)?;
+     }
+     let direct_functions = used
+-        .into_iter()
+-        .map(llvm_global)
++        .iter()
++        .map(|s| llvm_global(s))
+         .collect::<Result<HashSet<_>, _>>()?;
++    if !direct_functions.is_empty() {
++        output = strip_resolved_declarations(&output, &direct_functions);
++    }
+     Ok(crate::native::inline_direct_function_pointer_consumers(
+         &output,
+         &direct_functions,
+@@ -570,23 +607,393 @@ pub fn visible_function_reference_symbols(module: &str) -> Result<Vec<String>, S
+     })
+ }
+ 
++/// Enumerate all exported (non-`internal`, non-`private`, non-intrinsic) defined function symbols
++/// in an AIR LLVM-IR module, in deterministic source order.
++pub fn exported_symbols(module_ll: &str) -> Result<Vec<String>, String> {
++    let mut symbols = Vec::new();
++    let mut seen = HashSet::new();
++    let mut signature = String::new();
++    let mut collecting = false;
++    for line in module_ll.lines() {
++        let trimmed = line.trim_start();
++        if !collecting && trimmed.starts_with("define ") {
++            collecting = true;
++            signature.clear();
++        }
++        if collecting {
++            signature.push_str(trimmed);
++            signature.push(' ');
++            if trimmed.contains('{') {
++                collecting = false;
++                let global = definition_global(&signature).ok_or_else(|| {
++                    format!("dynamic library function definition has no global: {signature}")
++                })?;
++                let symbol = decode_llvm_global(&global)?;
++                let at = signature.find(&global).unwrap_or(0);
++                let prefix_tokens: Vec<&str> = signature[..at].split_whitespace().collect();
++                let is_private = prefix_tokens
++                    .iter()
++                    .any(|tok| matches!(*tok, "internal" | "private"));
++                if !seen.insert(symbol.clone()) {
++                    return Err(format!(
++                        "dynamic library module contains duplicate function definition {symbol:?}"
++                    ));
++                }
++                if !is_private && !is_compiler_intrinsic_symbol(&symbol) {
++                    symbols.push(symbol);
++                }
++            }
++        }
++    }
++    if collecting {
++        return Err("dynamic library module has an unterminated function definition header".into());
++    }
++    Ok(symbols)
++}
++
++/// Enumerate external non-intrinsic function symbols declared and referenced in `module_ll`.
++pub fn external_symbol_references(module_ll: &str) -> Result<Vec<String>, String> {
++    let defined: HashSet<String> = function_signatures(module_ll)?
++        .into_keys()
++        .collect();
++    let mut body_text = String::new();
++    let mut in_body = false;
++    let mut declared = Vec::<(String, String)>::new();
++    let mut seen_decl = HashSet::new();
++    for line in module_ll.lines() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with("define ") {
++            in_body = !trimmed.ends_with('}');
++            continue;
++        }
++        if trimmed == "}" {
++            in_body = false;
++            continue;
++        }
++        if in_body {
++            body_text.push_str(line);
++            body_text.push('\n');
++            continue;
++        }
++        if trimmed.starts_with("declare ") {
++            if let Some((global, _)) = declaration_global(trimmed) {
++                let symbol = decode_llvm_global(global)?;
++                if !defined.contains(global)
++                    && !is_compiler_intrinsic_symbol(&symbol)
++                    && !symbol.ends_with(".MTL_VISIBLE_FN_REF")
++                    && !symbol.ends_with(".MTL_CONTROL_POINT_FN")
++                    && seen_decl.insert(symbol.clone())
++                {
++                    declared.push((global.to_string(), symbol));
++                }
++            }
++        }
++    }
++    let mut referenced = Vec::new();
++    for (global, symbol) in declared {
++        if contains_llvm_value(&body_text, &global) {
++            referenced.push(symbol);
++        }
++    }
++    Ok(referenced)
++}
++
++/// Resolve direct external symbol declarations (`MTLDynamicLibrary` / `preloadedLibraries` /
++/// `binaryFunctions`) across compute, vertex, and fragment stages, validating every declaration
++/// signature against its provider definition and transitively linking library dependencies.
++pub fn link_dynamic_libraries(
++    entry_ll: &str,
++    linkage: &LinkedFunctionLinkage,
++) -> Result<String, String> {
++    let initial_refs = external_symbol_references(entry_ll)?;
++    if initial_refs.is_empty() {
++        return Ok(entry_ll.to_string());
++    }
++    validate_linkage(linkage)?;
++
++    // Map exported symbol -> (provider_name, module_ll). Track conflicting definitions across libraries.
++    let mut providers = HashMap::<String, (&str, &str)>::new();
++    let mut conflicts = HashMap::<String, (String, String)>::new();
++    for reference in &linkage.visible_references {
++        providers.insert(
++            reference.symbol.clone(),
++            ("linked_function", reference.module_ll.as_str()),
++        );
++    }
++    for library in &linkage.dynamic_libraries {
++        for symbol in exported_symbols(&library.module_ll)? {
++            if let Some(&(prev_name, prev_ll)) = providers.get(&symbol) {
++                if prev_ll != library.module_ll {
++                    conflicts.insert(symbol, (prev_name.to_string(), library.name.clone()));
++                }
++            } else {
++                providers.insert(symbol, (library.name.as_str(), library.module_ll.as_str()));
++            }
++        }
++    }
++
++    let mut output = entry_ll.to_string();
++    let mut defined_symbols: HashSet<String> = function_signatures(&output)?
++        .into_keys()
++        .map(|g| decode_llvm_global(&g))
++        .collect::<Result<HashSet<_>, _>>()?;
++    let mut appended_modules = HashSet::<&str>::new();
++    let mut resolved_globals = HashSet::<String>::new();
++    let mut pending_symbols: Vec<(String, Option<(crate::native::ir::LlType, Vec<crate::native::ir::LlType>)>)> = {
++        let decl_sigs = parse_declaration_signatures(entry_ll)?;
++        initial_refs
++            .into_iter()
++            .map(|sym| {
++                let sig = decl_sigs.get(&sym).cloned();
++                (sym, sig)
++            })
++            .collect()
++    };
++
++    while let Some((symbol, expected_sig)) = pending_symbols.pop() {
++        if let Some((first, second)) = conflicts.get(&symbol) {
++            return Err(format!(
++                "dynamic library symbol {symbol:?} is exported by multiple libraries ({first:?} and {second:?})"
++            ));
++        }
++        if defined_symbols.contains(&symbol) {
++            if let Some((exp_ret, exp_params)) = expected_sig {
++                let (act_ret, act_params) = parse_definition_signature(&output, &symbol)?;
++                if exp_ret != act_ret || exp_params != act_params {
++                    return Err(format_signature_mismatch(
++                        &symbol,
++                        &exp_ret,
++                        &exp_params,
++                        &act_ret,
++                        &act_params,
++                    ));
++                }
++            }
++            resolved_globals.insert(llvm_global(&symbol)?);
++            continue;
++        }
++        let Some(&(_provider_name, provider_ll)) = providers.get(&symbol) else {
++            return Err(format!(
++                "unresolved external dynamic library symbol {symbol:?}"
++            ));
++        };
++        let (act_ret, act_params) = parse_definition_signature(provider_ll, &symbol)?;
++        if let Some((exp_ret, exp_params)) = expected_sig {
++            if exp_ret != act_ret || exp_params != act_params {
++                return Err(format_signature_mismatch(
++                    &symbol,
++                    &exp_ret,
++                    &exp_params,
++                    &act_ret,
++                    &act_params,
++                ));
++            }
++        }
++        resolved_globals.insert(llvm_global(&symbol)?);
++        if appended_modules.insert(provider_ll) {
++            // Resolve any `.MTL_VISIBLE_FN_REF` references inside the dynamic library first.
++            let lib_ll = if provider_ll.contains(".MTL_VISIBLE_FN_REF")
++                || provider_ll.contains("!air.visible_function_references")
++            {
++                specialize_visible_function_references(provider_ll, linkage)?
++            } else {
++                provider_ll.to_string()
++            };
++            let lib_ext = external_symbol_references(&lib_ll)?;
++            let lib_decls = parse_declaration_signatures(&lib_ll)?;
++            for dep_sym in lib_ext {
++                let sig = lib_decls.get(&dep_sym).cloned();
++                pending_symbols.push((dep_sym, sig));
++            }
++            for exported in exported_symbols(&lib_ll)? {
++                defined_symbols.insert(exported);
++            }
++            defined_symbols.insert(symbol);
++            append_dependency_module(&mut output, &lib_ll)?;
++        }
++    }
++
++    if !resolved_globals.is_empty() {
++        output = strip_resolved_declarations(&output, &resolved_globals);
++        output = crate::native::inline_direct_function_pointer_consumers(&output, &resolved_globals);
++    }
++    Ok(output)
++}
++
++fn is_compiler_intrinsic_symbol(symbol: &str) -> bool {
++    symbol.starts_with("air.") || symbol.starts_with("llvm.")
++}
++
++fn decode_llvm_global(global: &str) -> Result<String, String> {
++    let raw = global
++        .strip_prefix('@')
++        .ok_or_else(|| format!("malformed LLVM global {global:?}"))?;
++    if let Some(quoted) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
++        decode_llvm_string(quoted)
++    } else {
++        Ok(raw.to_string())
++    }
++}
++
++fn declaration_global(line: &str) -> Option<(&str, usize)> {
++    let trimmed = line.trim_start();
++    if !trimmed.starts_with("declare ") {
++        return None;
++    }
++    let at = trimmed.find('@')?;
++    global_token(trimmed, at)
++}
++
++fn parse_declaration_signatures(
++    module: &str,
++) -> Result<HashMap<String, (crate::native::ir::LlType, Vec<crate::native::ir::LlType>)>, String> {
++    let mut sigs = HashMap::new();
++    for line in module.lines() {
++        let trimmed = line.trim_start();
++        if !trimmed.starts_with("declare ") {
++            continue;
++        }
++        let Some((global, open)) = declaration_global(trimmed) else {
++            continue;
++        };
++        let Some(close) = matching_paren(trimmed, open) else {
++            continue;
++        };
++        let symbol = decode_llvm_global(global)?;
++        if is_compiler_intrinsic_symbol(&symbol) {
++            continue;
++        }
++        let at = trimmed.find(global).unwrap_or(0);
++        let ret = crate::native::parse_llvm_return_type(&trimmed["declare".len()..at])?;
++        let params_text = trimmed[open + 1..close].trim();
++        let params = if params_text.is_empty() {
++            Vec::new()
++        } else {
++            split_top_level(params_text, ',')
++                .into_iter()
++                .map(crate::native::parse_llvm_type_prefix)
++                .collect::<Result<Vec<_>, _>>()?
++        };
++        sigs.insert(symbol, (ret, params));
++    }
++    Ok(sigs)
++}
++
++fn parse_definition_signature(
++    module: &str,
++    symbol: &str,
++) -> Result<(crate::native::ir::LlType, Vec<crate::native::ir::LlType>), String> {
++    let global = llvm_global(symbol)?;
++    let mut signature = String::new();
++    let mut collecting = false;
++    for line in module.lines() {
++        let trimmed = line.trim_start();
++        if !collecting && trimmed.starts_with("define ") && trimmed.contains(&format!("{global}("))
++        {
++            collecting = true;
++        }
++        if collecting {
++            signature.push_str(trimmed);
++            signature.push(' ');
++            if trimmed.contains('{') {
++                break;
++            }
++        }
++    }
++    if signature.is_empty() {
++        return Err(format!(
++            "linked module does not define authored function {symbol:?}"
++        ));
++    }
++    let at = signature
++        .find(&global)
++        .ok_or_else(|| format!("linked function {symbol:?} has no global"))?;
++    let open = signature[at + global.len()..]
++        .find('(')
++        .map(|offset| offset + at + global.len())
++        .ok_or_else(|| format!("linked function {symbol:?} has no parameters"))?;
++    let close = matching_paren(&signature, open)
++        .ok_or_else(|| format!("linked function {symbol:?} has unterminated parameters"))?;
++    let ret = crate::native::parse_llvm_return_type(&signature[..at])?;
++    let params = if signature[open + 1..close].trim().is_empty() {
++        Vec::new()
++    } else {
++        split_top_level(&signature[open + 1..close], ',')
++            .into_iter()
++            .map(crate::native::parse_llvm_type_prefix)
++            .collect::<Result<Vec<_>, _>>()?
++    };
++    Ok((ret, params))
++}
++
++fn format_signature_mismatch(
++    symbol: &str,
++    exp_ret: &crate::native::ir::LlType,
++    exp_params: &[crate::native::ir::LlType],
++    act_ret: &crate::native::ir::LlType,
++    act_params: &[crate::native::ir::LlType],
++) -> String {
++    format!(
++        "signature mismatch for linked symbol {symbol:?}: expected ({exp_params:?}) -> {exp_ret:?}, defined ({act_params:?}) -> {act_ret:?}"
++    )
++}
++
++fn strip_resolved_declarations(module: &str, resolved_globals: &HashSet<String>) -> String {
++    let mut out = String::with_capacity(module.len());
++    for line in module.lines() {
++        if let Some((global, _)) = declaration_global(line) {
++            if resolved_globals.contains(global) {
++                continue;
++            }
++        }
++        out.push_str(line);
++        out.push('\n');
++    }
++    out
++}
++
+ fn rewrite_visible_reference_stubs<'a>(
+     module: &str,
+-    authored: &HashMap<&str, &'a LinkedFunctionReference>,
+-    used: &mut HashSet<&'a str>,
+-    pending: &mut Vec<&'a LinkedFunctionReference>,
++    authored: &HashMap<String, &'a str>,
++    dynlib_conflicts: &HashMap<String, (String, String)>,
++    used: &mut HashSet<String>,
++    pending: &mut Vec<(String, &'a str)>,
+ ) -> Result<String, String> {
+     let references = air_visible_function_references(module)?;
++    let decl_sigs = if references.is_empty() {
++        HashMap::new()
++    } else {
++        parse_declaration_signatures(module)?
++    };
+     let mut replacements = Vec::new();
+     for reference in references {
+-        let dependency = authored.get(reference.symbol.as_str()).ok_or_else(|| {
++        if let Some((first, second)) = dynlib_conflicts.get(&reference.symbol) {
++            return Err(format!(
++                "dynamic library symbol {:?} is exported by multiple libraries ({first:?} and {second:?})",
++                reference.symbol
++            ));
++        }
++        let &provider_ll = authored.get(&reference.symbol).ok_or_else(|| {
+             format!(
+                 "AIR visible function reference {:?} has no authored linked module",
+                 reference.symbol
+             )
+         })?;
+-        used.insert(dependency.symbol.as_str());
+-        pending.push(dependency);
++        let stub_symbol = decode_llvm_global(&reference.stub_global)?;
++        if let Some((exp_ret, exp_params)) = decl_sigs.get(&stub_symbol) {
++            let (act_ret, act_params) = parse_definition_signature(provider_ll, &reference.symbol)?;
++            if exp_ret != &act_ret || exp_params != &act_params {
++                return Err(format_signature_mismatch(
++                    &reference.symbol,
++                    exp_ret,
++                    exp_params,
++                    &act_ret,
++                    &act_params,
++                ));
++            }
++        }
++        used.insert(reference.symbol.clone());
++        pending.push((reference.symbol.clone(), provider_ll));
+         replacements.push((reference.stub_global, llvm_global(&reference.symbol)?));
+     }
+     let mut output = String::with_capacity(module.len());
+@@ -1182,9 +1589,28 @@ fn contains_llvm_value(text: &str, value: &str) -> bool {
+ /// The sampler-state root is reconstructed from dependency globals with fresh node IDs.
+ fn append_dependency_module(output: &mut String, module: &str) -> Result<(), String> {
+     let samplers = static_sampler_metadata_globals(module)?;
+-    let mut renames = HashMap::new();
++    let mut renames = HashMap::<String, String>::new();
+     let mut added = Vec::new();
+     let mut suffix = 0usize;
++    let mut reserve_rename = |token: &str, renames: &mut HashMap<String, String>| {
++        if renames.contains_key(token) || !contains_llvm_value(output, token) {
++            return;
++        }
++        loop {
++            suffix += 1;
++            let candidate = if let Some(inner) =
++                token.strip_prefix("@\"").and_then(|s| s.strip_suffix('"'))
++            {
++                format!("@\"{inner}.{suffix}\"")
++            } else {
++                format!("{token}.{suffix}")
++            };
++            if !contains_llvm_value(output, &candidate) && !contains_llvm_value(module, &candidate) {
++                renames.insert(token.to_string(), candidate);
++                break;
++            }
++        }
++    };
+     for sampler in samplers {
+         if !crate::meta::is_static_sampler_global(sampler) {
+             return Err(format!("unrecognized AIR sampler-state global {sampler}"));
+@@ -1192,20 +1618,55 @@ fn append_dependency_module(output: &mut String, module: &str) -> Result<(), Str
+         if added.contains(&sampler) {
+             continue;
+         }
+-        if contains_llvm_value(output, sampler) {
+-            loop {
+-                suffix += 1;
+-                let candidate = format!("{sampler}.{suffix}");
+-                if !contains_llvm_value(output, &candidate)
+-                    && !contains_llvm_value(module, &candidate)
++        reserve_rename(sampler, &mut renames);
++        added.push(sampler);
++    }
++    // Rename colliding `internal` / `private` helper functions and globals in the dependency so
++    // multiple dynamic libraries can safely carry private helpers with the same name.
++    for line in module.lines() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with("define ") {
++            if let Some(global) = definition_global(trimmed) {
++                let at = trimmed.find(&global).unwrap_or(0);
++                if trimmed[..at]
++                    .split_whitespace()
++                    .any(|tok| matches!(tok, "internal" | "private"))
+                 {
+-                    renames.insert(sampler, candidate);
+-                    break;
++                    reserve_rename(&global, &mut renames);
++                }
++            }
++        } else if trimmed.starts_with('@') {
++            if let Some((lhs, rhs)) = trimmed.split_once(" = ") {
++                let token = lhs.trim();
++                if rhs
++                    .split_whitespace()
++                    .take(3)
++                    .any(|tok| matches!(tok, "internal" | "private"))
++                {
++                    reserve_rename(token, &mut renames);
+                 }
+             }
+         }
+-        added.push(sampler);
+     }
++    let existing_decls_or_defs: HashSet<String> = output
++        .lines()
++        .filter_map(|line| {
++            let trimmed = line.trim_start();
++            if trimmed.starts_with("define ") {
++                definition_global(trimmed)
++            } else if trimmed.starts_with("declare ") {
++                declaration_global(trimmed).map(|(g, _)| g.to_string())
++            } else {
++                None
++            }
++        })
++        .collect();
++    let existing_type_lines: HashSet<String> = output
++        .lines()
++        .map(str::trim)
++        .filter(|line| line.starts_with('%') && line.contains(" = type "))
++        .map(str::to_string)
++        .collect();
+     for line in module.lines() {
+         let trimmed = line.trim_start();
+         if trimmed.starts_with("; ModuleID =")
+@@ -1217,6 +1678,17 @@ fn append_dependency_module(output: &mut String, module: &str) -> Result<(), Str
+         {
+             continue;
+         }
++        if trimmed.starts_with('%')
++            && trimmed.contains(" = type ")
++            && existing_type_lines.contains(trimmed.trim_end())
++        {
++            continue;
++        }
++        if let Some((global, _)) = declaration_global(trimmed) {
++            if existing_decls_or_defs.contains(global) {
++                continue;
++            }
++        }
+         if renames.is_empty() {
+             output.push_str(line);
+         } else {
+@@ -1255,7 +1727,7 @@ fn append_dependency_module(output: &mut String, module: &str) -> Result<(), Str
+     Ok(())
+ }
+ 
+-fn append_with_sampler_renames(output: &mut String, mut line: &str, renames: &HashMap<&str, String>) {
++fn append_with_sampler_renames(output: &mut String, mut line: &str, renames: &HashMap<String, String>) {
+     while let Some(start) = line.find(['@', '"', ';']) {
+         let tail = &line[start..];
+         let end = match tail.as_bytes()[0] {
+@@ -2038,6 +2510,7 @@ declare i32 @base.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+             ],
+             visible_tables: vec![],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+ 
+         let specialized = specialize_visible_function_references(entry, &linkage).unwrap();
+@@ -2072,6 +2545,7 @@ declare i32 @linked.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+             }],
+             visible_tables: vec![],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+ 
+         let specialized = specialize_visible_function_references(entry, &linkage).unwrap();
+@@ -2092,6 +2566,7 @@ declare i32 @linked.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+                 visible_references: vec![],
+                 visible_tables: vec![],
+                 intersection_tables: vec![],
++            ..Default::default()
+             },
+         )
+         .unwrap_err();
+@@ -2123,6 +2598,7 @@ entry:
+                     module_ll: "define i1 @intersection() { ret i1 true }".into(),
+                 })],
+             }],
++            ..Default::default()
+         };
+         assert!(!linkage.is_empty());
+         assert_eq!(
+@@ -2156,6 +2632,7 @@ declare void @air.set_buffer_intersection_function_table.p1i8(ptr addrspace(1),
+             visible_references: vec![],
+             visible_tables: vec![],
+             intersection_tables: vec![table(parameter_index)],
++            ..Default::default()
+         };
+ 
+         let specialized =
+@@ -2199,6 +2676,7 @@ entry:
+                     ],
+                 }],
+             }],
++            ..Default::default()
+         };
+         let specialized =
+             specialize_opaque_triangle_intersection_tables(entry, "main", &linkage).unwrap();
+@@ -2235,6 +2713,7 @@ entry:
+                     size: 1,
+                     entries,
+                 }],
++                ..Default::default()
+             };
+             assert_eq!(
+                 specialize_opaque_triangle_intersection_tables(entry, "main", &linkage).unwrap(),
+@@ -2267,6 +2746,7 @@ entry:
+                     ],
+                 }],
+             }],
++            ..Default::default()
+         };
+         let specialized =
+             specialize_opaque_triangle_intersection_tables(entry, "main", &linkage).unwrap();
+@@ -2311,6 +2791,7 @@ entry:
+                     ],
+                 }],
+             }],
++            ..Default::default()
+         };
+         let specialized =
+             specialize_opaque_triangle_intersection_tables(entry, "main", &linkage).unwrap();
+@@ -2332,6 +2813,7 @@ entry:
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(ENTRY, "main", &linked).unwrap();
+         assert!(specialized.contains("%value = call i32 @add_one(i32 41)"));
+@@ -2360,6 +2842,7 @@ entry:
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(&entry, "main", &linked).unwrap();
+         assert!(specialized
+@@ -2395,6 +2878,7 @@ entry:
+                 ],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(&entry, "main", &linked).unwrap();
+         assert!(specialized.contains("i32 0, label %case_0"));
+@@ -2420,6 +2904,7 @@ entry:
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let entry = entry.replace("i32 0)", "i32 3)");
+         let specialized = specialize_visible_function_tables(&entry, "main", &linked).unwrap();
+@@ -2446,6 +2931,7 @@ entry:
+                 entries: vec![],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(entry, "main", &linked).unwrap();
+         assert!(specialized.contains("%size = add i32 0, 6"));
+@@ -2483,6 +2969,7 @@ entry:
+                 ],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(&entry, "main", &linked).unwrap();
+         assert!(specialized.contains("icmp eq i32 %slot, 2"));
+@@ -2515,6 +3002,7 @@ entry:
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let specialized = specialize_visible_function_tables(&entry, "main", &linked).unwrap();
+         assert!(specialized.contains("%is_opaque = or i1 false, false"));
+@@ -2552,6 +3040,7 @@ entry:
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         let traced = trace_visible_function_table_parameters(entry, "main", &[1]).unwrap();
+         assert_eq!(traced["@main"], HashSet::from(["%table".to_string()]));
+@@ -2611,6 +3100,7 @@ declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i
+                 }],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         struct Scratch(std::path::PathBuf);
+         impl Drop for Scratch {
+@@ -2665,6 +3155,7 @@ declare i32 @add_one.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+             }],
+             visible_tables: vec![],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         struct Scratch(std::path::PathBuf);
+         impl Drop for Scratch {
+@@ -2729,6 +3220,7 @@ declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i
+                 ],
+             }],
+             intersection_tables: vec![],
++            ..Default::default()
+         };
+         struct Scratch(std::path::PathBuf);
+         impl Drop for Scratch {
+@@ -2754,4 +3246,255 @@ declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i
+         assert!(asm.contains("OpSwitch"), "{asm}");
+         assert!(!asm.contains("Binding 1"), "{asm}");
+     }
++
++    #[test]
++    fn exported_symbols_lists_non_internal_definitions_and_rejects_duplicates() {
++        let lib = r#"
++define internal i32 @priv_helper(i32 %x) {
++entry:
++  ret i32 %x
++}
++define dso_local i32 @add_bias(i32 %x) {
++entry:
++  %h = call i32 @priv_helper(i32 %x)
++  %y = add i32 %h, 7
++  ret i32 %y
++}
++define <4 x float> @"shade::tint"(<4 x float> %c) {
++entry:
++  ret <4 x float> %c
++}
++"#;
++        assert_eq!(
++            exported_symbols(lib).unwrap(),
++            vec!["add_bias".to_string(), "shade::tint".to_string()]
++        );
++
++        let dup = "define i32 @f(i32 %x) {\n  ret i32 %x\n}\ndefine i32 @f(i32 %x) {\n  ret i32 %x\n}\n";
++        let err = exported_symbols(dup).unwrap_err();
++        assert!(err.contains("duplicate function definition"), "{err}");
++    }
++
++    #[test]
++    fn dynamic_library_links_compute_vertex_and_fragment_stages_transitively() {
++        let lib_a = r#"
++define internal i32 @helper(i32 %x) {
++entry:
++  %t = mul i32 %x, 2
++  ret i32 %t
++}
++define i32 @scale_and_bias(i32 %x) {
++entry:
++  %s = call i32 @helper(i32 %x)
++  %r = call i32 @extra_bias(i32 %s)
++  ret i32 %r
++}
++declare i32 @extra_bias(i32)
++"#;
++        let lib_b = r#"
++define internal i32 @helper(i32 %x) {
++entry:
++  %t = add i32 %x, 5
++  ret i32 %t
++}
++define i32 @extra_bias(i32 %x) {
++entry:
++  %r = call i32 @helper(i32 %x)
++  ret i32 %r
++}
++define <4 x float> @tint_rgba(<4 x float> %c) {
++entry:
++  %r = fmul <4 x float> %c, <float 0.5, float 0.25, float 1.0, float 1.0>
++  ret <4 x float> %r
++}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            dynamic_libraries: vec![
++                DynamicLibraryModule {
++                    name: "libA.metallib".into(),
++                    module_ll: lib_a.into(),
++                },
++                DynamicLibraryModule {
++                    name: "libB.metallib".into(),
++                    module_ll: lib_b.into(),
++                },
++            ],
++            ..Default::default()
++        };
++
++        // Compute stage
++        let comp_entry = r#"
++define void @main(ptr addrspace(1) %out) {
++entry:
++  %v = call i32 @scale_and_bias(i32 10)
++  store i32 %v, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare i32 @scale_and_bias(i32) section "air.externally_defined"
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
++"#;
++        let comp_spec =
++            crate::specialize_linked_module(comp_entry, crate::passes::Stage::Kernel, &linkage)
++                .expect("specialize compute dynlib");
++        assert!(comp_spec.contains("define i32 @scale_and_bias"), "{comp_spec}");
++        assert!(comp_spec.contains("define i32 @extra_bias"), "{comp_spec}");
++        assert!(comp_spec.contains("@helper.1"), "colliding internal helper must be renamed:\n{comp_spec}");
++        let (comp_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &comp_spec,
++            crate::passes::Stage::Kernel,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate compute dynlib");
++        let comp_asm = crate::disassemble(&comp_spv).unwrap();
++        assert!(comp_asm.contains("OpIMul") && comp_asm.contains("OpIAdd"), "{comp_asm}");
++
++        // Vertex stage
++        let vert_entry = r#"
++define <4 x float> @vs_main(<4 x float> %pos) {
++entry:
++  %p = call <4 x float> @tint_rgba(<4 x float> %pos)
++  ret <4 x float> %p
++}
++declare <4 x float> @tint_rgba(<4 x float>) section "air.externally_defined"
++!air.vertex = !{!0}
++!0 = !{ptr @vs_main, !1, !2}
++!1 = !{!3}
++!2 = !{!4}
++!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float4"}
++"#;
++        let vert_spec =
++            crate::specialize_linked_module(vert_entry, crate::passes::Stage::Vertex, &linkage)
++                .expect("specialize vertex dynlib");
++        let (vert_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &vert_spec,
++            crate::passes::Stage::Vertex,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate vertex dynlib");
++        let vert_asm = crate::disassemble(&vert_spv).unwrap();
++        assert!(vert_asm.contains("OpEntryPoint Vertex"), "{vert_asm}");
++        assert!(vert_asm.contains("OpFMul"), "{vert_asm}");
++
++        // Fragment stage
++        let frag_entry = r#"
++define <4 x float> @fs_main(<4 x float> %in_col) {
++entry:
++  %c = call <4 x float> @tint_rgba(<4 x float> %in_col)
++  ret <4 x float> %c
++}
++declare <4 x float> @tint_rgba(<4 x float>) section "air.externally_defined"
++!air.fragment = !{!0}
++!0 = !{ptr @fs_main, !1, !2}
++!1 = !{!3}
++!2 = !{!4}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"in_col", !"air.perspective", !"air.arg_type_name", !"float4"}
++"#;
++        let frag_spec =
++            crate::specialize_linked_module(frag_entry, crate::passes::Stage::Fragment, &linkage)
++                .expect("specialize fragment dynlib");
++        let (frag_spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &frag_spec,
++            crate::passes::Stage::Fragment,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate fragment dynlib");
++        let frag_asm = crate::disassemble(&frag_spv).unwrap();
++        assert!(frag_asm.contains("OpEntryPoint Fragment"), "{frag_asm}");
++        assert!(frag_asm.contains("OpFMul"), "{frag_asm}");
++    }
++
++    #[test]
++    fn dynamic_library_rejects_missing_mismatched_and_conflicting_symbols() {
++        let entry = r#"
++define void @main(ptr addrspace(1) %out) {
++entry:
++  %v = call i32 @ext_op(i32 7)
++  store i32 %v, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare i32 @ext_op(i32) section "air.externally_defined"
++!air.kernel = !{!0}
++!0 = !{ptr @main, !1, !2}
++!1 = !{}
++!2 = !{!3}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
++"#;
++        // Missing symbol
++        let err = link_dynamic_libraries(entry, &LinkedFunctionLinkage::default()).unwrap_err();
++        assert!(err.contains("unresolved external dynamic library symbol"), "{err}");
++        assert!(err.contains("ext_op"), "{err}");
++
++        // Signature mismatch (return type)
++        let bad_ret = LinkedFunctionLinkage {
++            dynamic_libraries: vec![DynamicLibraryModule {
++                name: "bad.metallib".into(),
++                module_ll: "define float @ext_op(i32 %x) {\n  ret float 1.0\n}\n".into(),
++            }],
++            ..Default::default()
++        };
++        let err = link_dynamic_libraries(entry, &bad_ret).unwrap_err();
++        assert!(err.contains("signature mismatch"), "{err}");
++        assert!(err.contains("ext_op"), "{err}");
++
++        // Signature mismatch (parameter arity/type)
++        let bad_arg = LinkedFunctionLinkage {
++            dynamic_libraries: vec![DynamicLibraryModule {
++                name: "bad.metallib".into(),
++                module_ll: "define i32 @ext_op(i32 %x, i32 %y) {\n  %z = add i32 %x, %y\n  ret i32 %z\n}\n".into(),
++            }],
++            ..Default::default()
++        };
++        let err = link_dynamic_libraries(entry, &bad_arg).unwrap_err();
++        assert!(err.contains("signature mismatch"), "{err}");
++
++        // Signature mismatch on direct visible reference stub
++        let vis_entry = r#"
++define void @main() {
++entry:
++  %v = call i32 @foo.MTL_VISIBLE_FN_REF(i32 1)
++  ret void
++}
++declare i32 @foo.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
++!air.visible_function_references = !{!0}
++!0 = !{!"air.visible_function_reference", ptr @foo.MTL_VISIBLE_FN_REF, !"foo"}
++"#;
++        let bad_vis = LinkedFunctionLinkage {
++            visible_references: vec![LinkedFunctionReference {
++                symbol: "foo".into(),
++                module_ll: "define float @foo(float %x) {\n  ret float %x\n}\n".into(),
++            }],
++            ..Default::default()
++        };
++        let err = specialize_visible_function_references(vis_entry, &bad_vis).unwrap_err();
++        assert!(err.contains("signature mismatch"), "{err}");
++
++        // Conflicting exports across two dynamic libraries
++        let conflict = LinkedFunctionLinkage {
++            dynamic_libraries: vec![
++                DynamicLibraryModule {
++                    name: "lib1".into(),
++                    module_ll: "define i32 @ext_op(i32 %x) {\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n".into(),
++                },
++                DynamicLibraryModule {
++                    name: "lib2".into(),
++                    module_ll: "define i32 @ext_op(i32 %x) {\n  %y = add i32 %x, 2\n  ret i32 %y\n}\n".into(),
++                },
++            ],
++            ..Default::default()
++        };
++        let err = link_dynamic_libraries(entry, &conflict).unwrap_err();
++        assert!(err.contains("exported by multiple libraries"), "{err}");
++    }
+ }

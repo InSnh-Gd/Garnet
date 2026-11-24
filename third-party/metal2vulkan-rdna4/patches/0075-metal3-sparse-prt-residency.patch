@@ -1,0 +1,2122 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index da6c4b7..7f9de8e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1534,6 +1534,8 @@ fn finish_module(
+                             i.class.opcode,
+                             spirv::Op::ImageSampleImplicitLod
+                                 | spirv::Op::ImageSampleDrefImplicitLod
++                                | spirv::Op::ImageSparseSampleImplicitLod
++                                | spirv::Op::ImageSparseSampleDrefImplicitLod
+                         )
+                     }) && definitions.contains_key(&fact.coordinate)
+                 })
+diff --git a/src/passes/air_calls/images/cube_read.rs b/src/passes/air_calls/images/cube_read.rs
+index 77c4487..10b50b1 100644
+--- a/src/passes/air_calls/images/cube_read.rs
++++ b/src/passes/air_calls/images/cube_read.rs
+@@ -16,14 +16,15 @@ pub(in crate::passes) struct CubeReadTexel {
+ ///   +X:( 1,-t,-s)  -X:(-1,-t, s)  +Y:( s, 1, t)  -Y:( s,-1,-t)  +Z:( s,-t, 1)  -Z:(-s,-t,-1).
+ /// MSL 2.1 §7.7 requires read coordinates inside the texture. Within that domain, a texel-center
+ /// direction is interior to the named texel, so nearest sampling returns exactly that texel.
+-pub(in crate::passes) fn cube_fetch_as_center_sample(
++pub(in crate::passes) fn cube_fetch_as_center_sample_maybe_sparse(
+     ctx: &mut Ctx,
+     out: &mut Vec<Instruction>,
+     img: Word,
+     texel: CubeReadTexel,
+     fetch_v4: Word,
+-    color: Word,
+-) -> Result<(), String> {
++    non_sparse_color: Option<Word>,
++    sparse: bool,
++) -> Result<(Word, Option<Word>), String> {
+     let img = load_image_if_pointer(ctx, img, out);
+     let float = ctx.ty_float();
+     let v3f = ctx.ty_vecf(3);
+@@ -220,16 +221,30 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
+         vec![Operand::IdRef(img), Operand::IdRef(sampler)],
+     ));
+     let lod = to_float(lod32, ctx, out);
++    let ops = vec![
++        Operand::IdRef(si),
++        Operand::IdRef(coord),
++        Operand::ImageOperands(spirv::ImageOperands::LOD),
++        Operand::IdRef(lod),
++    ];
++    if sparse {
++        let sparse_ty = ctx.ty_sparse_result(fetch_v4);
++        let sparse_res = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ImageSparseSampleExplicitLod,
++            Some(sparse_ty),
++            Some(sparse_res),
++            ops,
++        ));
++        let (texel, resident_bool) = emit_sparse_unpack(ctx, out, sparse_res, fetch_v4);
++        return Ok((texel, Some(resident_bool)));
++    }
++    let color = non_sparse_color.unwrap_or_else(|| ctx.module.fresh_id());
+     out.push(Instruction::new(
+         Op::ImageSampleExplicitLod,
+         Some(fetch_v4),
+         Some(color),
+-        vec![
+-            Operand::IdRef(si),
+-            Operand::IdRef(coord),
+-            Operand::ImageOperands(spirv::ImageOperands::LOD),
+-            Operand::IdRef(lod),
+-        ],
++        ops,
+     ));
+-    Ok(())
++    Ok((color, None))
+ }
+diff --git a/src/passes/air_calls/images/gather.rs b/src/passes/air_calls/images/gather.rs
+index 5c47bcb..f4f07c7 100644
+--- a/src/passes/air_calls/images/gather.rs
++++ b/src/passes/air_calls/images/gather.rs
+@@ -16,6 +16,7 @@ struct GatherRequest {
+     component: Word,
+     depth_image: bool,
+     gather_v4: Word,
++    sparse: bool,
+ }
+ 
+ /// Parse the stable AIR shape token shared by every gather family. The fixed MSL 2.1 text defines
+@@ -188,6 +189,7 @@ pub(in crate::passes) fn lower_gather(
+         }
+         _ => unreachable!("gather_shape filters unsupported dimensions"),
+     };
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let component = gather_component(ctx, component)?;
+     let samp = args[1];
+     let mut img = resolve_image_value(ctx, args[0]);
+@@ -197,7 +199,7 @@ pub(in crate::passes) fn lower_gather(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     lower_gather_image(
+@@ -215,6 +217,7 @@ pub(in crate::passes) fn lower_gather(
+             component,
+             depth_image: false,
+             gather_v4: v4,
++            sparse,
+         },
+     )
+ }
+@@ -261,6 +264,7 @@ pub(in crate::passes) fn lower_gather_depth(
+         }
+         _ => unreachable!("gather_shape filters unsupported dimensions"),
+     };
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let samp = args[1];
+     let mut img = resolve_image_value(ctx, args[0]);
+     if texture_operand_is_absent(ctx, img) {
+@@ -269,7 +273,7 @@ pub(in crate::passes) fn lower_gather_depth(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     let component = ctx.const_uint(0);
+@@ -288,6 +292,7 @@ pub(in crate::passes) fn lower_gather_depth(
+             component,
+             depth_image: true,
+             gather_v4: v4,
++            sparse,
+         },
+     )
+ }
+@@ -351,6 +356,7 @@ pub(in crate::passes) fn lower_gather_compare_depth(
+         }
+         _ => unreachable!("gather_shape filters unsupported dimensions"),
+     };
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let samp = args[1];
+     let coord = args[3];
+     let mut img = resolve_image_value(ctx, args[0]);
+@@ -360,7 +366,7 @@ pub(in crate::passes) fn lower_gather_compare_depth(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+ 
+@@ -411,7 +417,6 @@ pub(in crate::passes) fn lower_gather_compare_depth(
+         vec![Operand::IdRef(img), Operand::IdRef(valid_sampler)],
+     ));
+ 
+-    let color = ctx.module.fresh_id();
+     let mut ops = vec![
+         Operand::IdRef(si),
+         Operand::IdRef(coord_for_gather),
+@@ -423,14 +428,29 @@ pub(in crate::passes) fn lower_gather_compare_depth(
+             ops.push(Operand::IdRef(const_sint_vec(ctx, &offset)));
+         }
+     }
+-    out.push(Instruction::new(
+-        Op::ImageDrefGather,
+-        Some(v4),
+-        Some(color),
+-        ops,
+-    ));
++    let (color, resident_bool) = if sparse {
++        let sparse_ty = ctx.ty_sparse_result(v4);
++        let sparse_res = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ImageSparseDrefGather,
++            Some(sparse_ty),
++            Some(sparse_res),
++            ops,
++        ));
++        let (texel, res_b) = emit_sparse_unpack(ctx, &mut out, sparse_res, v4);
++        (texel, Some(res_b))
++    } else {
++        let color = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ImageDrefGather,
++            Some(v4),
++            Some(color),
++            ops,
++        ));
++        (color, None)
++    };
+ 
+-    finish_sample_result(ctx, res, rty, color, v4, out)
++    finish_sample_result_with_residency(ctx, res, rty, color, v4, resident_bool, out)
+ }
+ 
+ fn lower_gather_image(ctx: &mut Ctx, request: GatherRequest) -> Result<Vec<Instruction>, String> {
+@@ -500,6 +520,7 @@ fn lower_gather_image(ctx: &mut Ctx, request: GatherRequest) -> Result<Vec<Instr
+             request.offset,
+             request.component,
+             gather_v4,
++            request.sparse,
+             out,
+         );
+     }
+@@ -543,7 +564,6 @@ fn lower_gather_image(ctx: &mut Ctx, request: GatherRequest) -> Result<Vec<Instr
+         )?;
+     }
+ 
+-    let color = ctx.module.fresh_id();
+     let mut ops = vec![
+         Operand::IdRef(si),
+         Operand::IdRef(coord_for_gather),
+@@ -558,19 +578,35 @@ fn lower_gather_image(ctx: &mut Ctx, request: GatherRequest) -> Result<Vec<Instr
+     }
+     // MSL and Vulkan both number gather lanes counter-clockwise from the lower-left texel:
+     // (-,+), (+,+), (+,-), (-,-). There is no order conversion to perform.
+-    out.push(Instruction::new(
+-        Op::ImageGather,
+-        Some(gather_v4),
+-        Some(color),
+-        ops,
+-    ));
++    let (color, resident_bool) = if request.sparse {
++        let sparse_ty = ctx.ty_sparse_result(gather_v4);
++        let sparse_res = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ImageSparseGather,
++            Some(sparse_ty),
++            Some(sparse_res),
++            ops,
++        ));
++        let (texel, res_b) = emit_sparse_unpack(ctx, &mut out, sparse_res, gather_v4);
++        (texel, Some(res_b))
++    } else {
++        let color = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::ImageGather,
++            Some(gather_v4),
++            Some(color),
++            ops,
++        ));
++        (color, None)
++    };
+ 
+-    finish_sample_result(
++    finish_sample_result_with_residency(
+         ctx,
+         request.result,
+         request.result_ty,
+         color,
+         gather_v4,
++        resident_bool,
+         out,
+     )
+ }
+@@ -647,6 +683,7 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
+     offset: Option<Word>,
+     component: Word,
+     v4: Word,
++    sparse: bool,
+     mut out: Vec<Instruction>,
+ ) -> Result<Vec<Instruction>, String> {
+     let component = gather_component(ctx, component)?;
+@@ -667,7 +704,9 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
+     // floor(p) = p, the same texel the old no-bias path produced. So the static footprint_bias /
+     // half-pixel-center heuristic is no longer needed.
+     let coord = subtract_half_from_gather_coord(ctx, coord, &mut out);
++    let bool_ty = ctx.ty_bool();
+     let mut values = Vec::with_capacity(4);
++    let mut all_resident: Option<Word> = None;
+     for texel_offset in [[0, 1], [1, 1], [1, 0], [0, 0]] {
+         let (fetch_offset, dynamic_fetch_offset) = pixel_gather_fetch_offset(
+             ctx,
+@@ -690,8 +729,36 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
+             lod,
+             &mut out,
+         )?;
+-        let color = ctx.module.fresh_id();
+-        push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
++        let (color, tap_res) = push_image_read_or_fetch_maybe_sparse(
++            ctx,
++            &mut out,
++            img,
++            fetch.coord,
++            Some(lod),
++            sample_v4,
++            sparse,
++        )?;
++        if let Some(mut tap_res) = tap_res {
++            if let Some(in_bounds) = fetch.in_bounds {
++                let true_c = ctx.const_bool_of(bool_ty, true);
++                let guarded_res = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::Select,
++                    Some(bool_ty),
++                    Some(guarded_res),
++                    vec![
++                        Operand::IdRef(in_bounds),
++                        Operand::IdRef(tap_res),
++                        Operand::IdRef(true_c),
++                    ],
++                ));
++                tap_res = guarded_res;
++            }
++            all_resident = Some(match all_resident {
++                None => tap_res,
++                Some(prev) => logical_and(ctx, prev, tap_res, &mut out),
++            });
++        }
+         let mut selected = ctx.module.fresh_id();
+         out.push(Instruction::new(
+             Op::CompositeExtract,
+@@ -723,7 +790,7 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
+         Some(color),
+         values,
+     ));
+-    finish_sample_result(ctx, res, rty, color, v4, out)
++    finish_sample_result_with_residency(ctx, res, rty, color, v4, all_resident, out)
+ }
+ 
+ /// Subtract 0.5 from each spatial component of a 2D gather's pixel coordinate, so a subsequent
+diff --git a/src/passes/air_calls/images/mod.rs b/src/passes/air_calls/images/mod.rs
+index 33c84f0..9e8aa55 100644
+--- a/src/passes/air_calls/images/mod.rs
++++ b/src/passes/air_calls/images/mod.rs
+@@ -327,4 +327,319 @@ mod coord_tests {
+         assert_eq!(out_s.len(), out_g.len());
+         let _ = (sample, gather);
+     }
++
++    fn translate_sparse_asm(ll: &str, stage: Stage) -> String {
++        let tmp = std::env::temp_dir().join(format!(
++            "metal2vulkan_sparse_test_{}",
++            std::process::id()
++        ));
++        let _ = std::fs::create_dir_all(&tmp);
++        let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            ll,
++            stage,
++            &tmp,
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate sparse module");
++        crate::disassemble(&spv).expect("disassemble SPIR-V")
++    }
++
++    #[test]
++    fn sparse_sample_implicit_and_explicit_lod_emit_sparse_ops_and_capability() {
++        let frag_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv) {
++entry:
++  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv)
++  %color = extractvalue { <4 x float>, i8 } %sample, 0
++  %res = extractvalue { <4 x float>, i8 } %sample, 1
++  %is_res = icmp ne i8 %res, 0
++  %alpha = select i1 %is_res, float 1.000000e+00, float 0.000000e+00
++  %out = insertelement <4 x float> %color, float %alpha, i32 3
++  ret <4 x float> %out
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
++
++!air.fragment = !{!0}
++!0 = !{ptr @frag, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!5 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!6 = !{i32 2, !"air.fragment_input", !"air.location_index", i32 0, i32 1, !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
++"#;
++        let frag_asm = translate_sparse_asm(frag_ll, Stage::Fragment);
++        assert!(frag_asm.contains("OpCapability SparseResidency"), "{frag_asm}");
++        assert!(frag_asm.contains("OpImageSparseSampleImplicitLod"), "{frag_asm}");
++        assert!(frag_asm.contains("OpImageSparseTexelsResident"), "{frag_asm}");
++        assert!(!frag_asm.contains("OpImageSampleImplicitLod"), "{frag_asm}");
++
++        let compute_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
++entry:
++  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e-01, float 7.500000e-01>)
++  %color = extractvalue { <4 x float>, i8 } %sample, 0
++  %res = extractvalue { <4 x float>, i8 } %sample, 1
++  %is_res = icmp ne i8 %res, 0
++  %alpha = select i1 %is_res, float 1.000000e+00, float 0.000000e+00
++  %packed = insertelement <4 x float> %color, float %alpha, i32 3
++  store <4 x float> %packed, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++"#;
++        let comp_asm = translate_sparse_asm(compute_ll, Stage::Kernel);
++        assert!(comp_asm.contains("OpCapability SparseResidency"), "{comp_asm}");
++        assert!(comp_asm.contains("OpImageSparseSampleExplicitLod"), "{comp_asm}");
++        assert!(comp_asm.contains("OpImageSparseTexelsResident"), "{comp_asm}");
++        assert!(!comp_asm.contains("OpImageSampleExplicitLod"), "{comp_asm}");
++    }
++
++    #[test]
++    fn sparse_read_fetch_and_gather_emit_sparse_ops() {
++        let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(ptr addrspace(1) %sampled_tex, ptr addrspace(1) %storage_tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out, <2 x i32> %tid) {
++entry:
++  %r0 = tail call { <4 x float>, i8 } @air.read_texture_2d.sparse.v4f32(ptr addrspace(1) %sampled_tex, <2 x i32> %tid, i32 0, i32 1)
++  %r1 = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %storage_tex, <2 x i32> %tid, i32 0, i32 3)
++  %g0 = tail call { <4 x float>, i8 } @air.gather_texture_2d.sparse.v4f32(ptr addrspace(1) %sampled_tex, ptr addrspace(2) %sampler, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 false, <2 x i32> zeroinitializer, i32 0, i32 0)
++  %c0 = extractvalue { <4 x float>, i8 } %r0, 0
++  %b0 = extractvalue { <4 x float>, i8 } %r0, 1
++  %c1 = extractvalue { <4 x float>, i8 } %r1, 0
++  %b1 = extractvalue { <4 x float>, i8 } %r1, 1
++  %cg = extractvalue { <4 x float>, i8 } %g0, 0
++  %bg = extractvalue { <4 x float>, i8 } %g0, 1
++  %sum0 = fadd <4 x float> %c0, %c1
++  %sum1 = fadd <4 x float> %sum0, %cg
++  %b01 = and i8 %b0, %b1
++  %ball = and i8 %b01, %bg
++  %is_res = icmp ne i8 %ball, 0
++  %flag = select i1 %is_res, float 1.000000e+00, float 0.000000e+00
++  %packed = insertelement <4 x float> %sum1, float %flag, i32 3
++  store <4 x float> %packed, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.read_texture_2d.sparse.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare { <4 x float>, i8 } @air.gather_texture_2d.sparse.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6, !7}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"sampled_tex"}
++!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<float, read_write>", !"air.arg_name", !"storage_tex"}
++!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
++"#;
++        let asm = translate_sparse_asm(ll, Stage::Kernel);
++        assert!(asm.contains("OpCapability SparseResidency"), "{asm}");
++        assert!(asm.contains("OpImageSparseFetch"), "{asm}");
++        assert!(asm.contains("OpImageSparseRead"), "{asm}");
++        assert!(asm.contains("OpImageSparseGather"), "{asm}");
++        assert_eq!(asm.matches("OpImageSparseTexelsResident").count(), 3, "{asm}");
++    }
++
++    #[test]
++    fn sparse_color_struct_propagates_through_select_and_alloca() {
++        let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out, <2 x i32> %tid) {
++entry:
++  %slot = alloca { <4 x float>, i8 }, align 16
++  %s0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 1.250000e-01, float 1.250000e-01>)
++  %s1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 8.750000e-01, float 8.750000e-01>)
++  %x = extractelement <2 x i32> %tid, i32 0
++  %pick = icmp eq i32 %x, 0
++  %chosen = select i1 %pick, { <4 x float>, i8 } %s0, { <4 x float>, i8 } %s1
++  store { <4 x float>, i8 } %chosen, ptr %slot, align 16
++  %loaded = load { <4 x float>, i8 }, ptr %slot, align 16
++  %val = extractvalue { <4 x float>, i8 } %loaded, 0
++  %res = extractvalue { <4 x float>, i8 } %loaded, 1
++  %ok = icmp ne i8 %res, 0
++  %w = select i1 %ok, float 1.000000e+00, float 0.000000e+00
++  %packed = insertelement <4 x float> %val, float %w, i32 3
++  store <4 x float> %packed, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
++"#;
++        let asm = translate_sparse_asm(ll, Stage::Kernel);
++        assert!(asm.contains("OpCapability SparseResidency"), "{asm}");
++        assert_eq!(asm.matches("OpImageSparseSampleExplicitLod").count(), 2, "{asm}");
++        assert_eq!(asm.matches("OpImageSparseTexelsResident").count(), 2, "{asm}");
++    }
++
++    #[test]
++    fn non_sparse_texture_ops_omit_sparse_residency_capability() {
++        let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out, <2 x i32> %tid) {
++entry:
++  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e-01, float 7.500000e-01>)
++  %r = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %tex, <2 x i32> %tid, i32 0, i32 1)
++  %g = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 false, <2 x i32> zeroinitializer, i32 0, i32 0)
++  %cs = extractvalue { <4 x float>, i8 } %s, 0
++  %cr = extractvalue { <4 x float>, i8 } %r, 0
++  %cg = extractvalue { <4 x float>, i8 } %g, 0
++  %a = fadd <4 x float> %cs, %cr
++  %b = fadd <4 x float> %a, %cg
++  store <4 x float> %b, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
++declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
++declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
++"#;
++        let asm = translate_sparse_asm(ll, Stage::Kernel);
++        assert!(!asm.contains("OpCapability SparseResidency"), "{asm}");
++        assert!(!asm.contains("OpImageSparseSampleExplicitLod"), "{asm}");
++        assert!(!asm.contains("OpImageSparseFetch"), "{asm}");
++        assert!(!asm.contains("OpImageSparseGather"), "{asm}");
++        assert!(!asm.contains("OpImageSparseTexelsResident"), "{asm}");
++        assert!(asm.contains("OpImageSampleExplicitLod"), "{asm}");
++        assert!(asm.contains("OpImageFetch"), "{asm}");
++        assert!(asm.contains("OpImageGather"), "{asm}");
++    }
++
++    #[test]
++    fn sparse_fragment_implicit_sample_preserves_uniform_control_sampling_coordinates() {
++        let frag_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv) {
++entry:
++  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv)
++  %color = extractvalue { <4 x float>, i8 } %sample, 0
++  %res = extractvalue { <4 x float>, i8 } %sample, 1
++  %is_res = icmp ne i8 %res, 0
++  %alpha = select i1 %is_res, float 1.000000e+00, float 0.000000e+00
++  %out = insertelement <4 x float> %color, float %alpha, i32 3
++  ret <4 x float> %out
++}
++
++declare { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
++
++!air.fragment = !{!0}
++!0 = !{ptr @frag, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!5 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
++!6 = !{i32 2, !"air.fragment_input", !"air.location_index", i32 0, i32 1, !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
++"#;
++        let tmp = std::env::temp_dir().join(format!(
++            "metal2vulkan_sparse_proof_{}",
++            std::process::id()
++        ));
++        let _ = std::fs::create_dir_all(&tmp);
++        let (spv, _, _, proof) =
++            crate::translate_sanitized_native_reflected_unvalidated_with_uniform_control_proof(
++                frag_ll,
++                Stage::Fragment,
++                &tmp,
++                crate::passes::TransformOptions::default().with_normalized_sampler_coordinates(),
++                None,
++            )
++            .expect("translate sparse fragment with uniform control proof");
++        let asm = crate::disassemble(&spv).expect("disassemble");
++        assert!(asm.contains("OpImageSparseSampleImplicitLod"), "{asm}");
++        assert!(
++            !proof.sampling_coordinates.is_empty(),
++            "sparse implicit sample must retain uniform_control_proof.sampling_coordinates:\n{asm}"
++        );
++    }
++
++    #[test]
++    fn sparse_pixel_nearest_clamp_to_zero_guards_residency_with_in_bounds() {
++        // Static sampler word 32768 = bit 15 (coord::pixel), filter::nearest, address::clamp_to_zero.
++        let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 32768, i64 0], align 8
++define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
++entry:
++  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> <float -1.000000e+00, float 0.500000e+00>, i1 false, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %color = extractvalue { <4 x float>, i8 } %sample, 0
++  %res = extractvalue { <4 x float>, i8 } %sample, 1
++  %is_res = icmp ne i8 %res, 0
++  %w = select i1 %is_res, float 1.000000e+00, float 0.000000e+00
++  %packed = insertelement <4 x float> %color, float %w, i32 3
++  store <4 x float> %packed, ptr addrspace(1) %out, align 16
++  ret void
++}
++declare { <4 x float>, i8 } @air.sample_texture_2d.sparse.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++!air.kernel = !{!0}
++!air.sampler_states = !{!5}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
++!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
++"#;
++        let asm = translate_sparse_asm(ll, Stage::Kernel);
++        assert!(asm.contains("OpImageSparseFetch"), "{asm}");
++        assert!(asm.contains("OpImageSparseTexelsResident"), "{asm}");
++        // Must guard the residency boolean with OpSelect <bool> <in_bounds> <res_id> <const_true>.
++        let bool_ty = asm
++            .lines()
++            .find_map(|l| l.strip_suffix(" = OpTypeBool"))
++            .expect("OpTypeBool");
++        let true_id = asm
++            .lines()
++            .find_map(|l| l.contains("OpConstantTrue").then(|| l.split_whitespace().next()).flatten())
++            .expect("OpConstantTrue");
++        let res_id = asm
++            .lines()
++            .find_map(|l| {
++                l.contains("OpImageSparseTexelsResident")
++                    .then(|| l.split_whitespace().next())
++                    .flatten()
++            })
++            .expect("OpImageSparseTexelsResident");
++        assert!(
++            asm.lines().any(|l| {
++                l.contains(&format!("OpSelect  {bool_ty} "))
++                    && l.contains(res_id)
++                    && l.contains(true_id)
++            }),
++            "pixel-nearest clamp_to_zero sparse fetch must guard residency with OpSelect {bool_ty} ... {res_id} {true_id}:\n{asm}"
++        );
++    }
+ }
+diff --git a/src/passes/air_calls/images/query_offset.rs b/src/passes/air_calls/images/query_offset.rs
+index 47b5851..ba774cc 100644
+--- a/src/passes/air_calls/images/query_offset.rs
++++ b/src/passes/air_calls/images/query_offset.rs
+@@ -49,6 +49,38 @@ pub(in crate::passes) fn push_image_read_or_fetch(
+     Ok(())
+ }
+ 
++pub(in crate::passes) fn push_image_read_or_fetch_maybe_sparse(
++    ctx: &mut Ctx,
++    out: &mut Vec<Instruction>,
++    img: Word,
++    coord: Word,
++    lod: Option<Word>,
++    result_ty: Word,
++    sparse: bool,
++) -> Result<(Word, Option<Word>), String> {
++    if !sparse {
++        let result = ctx.module.fresh_id();
++        push_image_read_or_fetch(ctx, out, img, coord, lod, result_ty, result)?;
++        return Ok((result, None));
++    }
++    let mut ops = vec![Operand::IdRef(img), Operand::IdRef(coord)];
++    let op = if image_is_storage(ctx, img) {
++        ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Read)?;
++        Op::ImageSparseRead
++    } else {
++        if let Some(lod) = lod {
++            ops.push(Operand::ImageOperands(spirv::ImageOperands::LOD));
++            ops.push(Operand::IdRef(lod));
++        }
++        Op::ImageSparseFetch
++    };
++    let sparse_ty = ctx.ty_sparse_result(result_ty);
++    let sparse_res = ctx.module.fresh_id();
++    out.push(Instruction::new(op, Some(sparse_ty), Some(sparse_res), ops));
++    let (texel, resident_bool) = emit_sparse_unpack(ctx, out, sparse_res, result_ty);
++    Ok((texel, Some(resident_bool)))
++}
++
+ pub(in crate::passes) fn image_size_component(
+     ctx: &mut Ctx,
+     size: Word,
+diff --git a/src/passes/air_calls/images/read.rs b/src/passes/air_calls/images/read.rs
+index 4c3d816..a29cd14 100644
+--- a/src/passes/air_calls/images/read.rs
++++ b/src/passes/air_calls/images/read.rs
+@@ -26,6 +26,7 @@ pub(in crate::passes) fn lower_read(
+     if args.len() < 2 {
+         return Err("air.read_texture missing texture/coord".into());
+     }
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     // AIR `read_texture_<dim>` comes in several arg shapes:
+     //   * no-sampler: (texture, coord, lod, access)                       -> coord=a1, lod=a2
+     //   * array no-sampler: (texture, coord, layer, lod, access)          -> coord=a1, layer=a2, lod=a3
+@@ -41,7 +42,7 @@ pub(in crate::passes) fn lower_read(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     if image_is_storage(ctx, img) {
+@@ -92,15 +93,14 @@ pub(in crate::passes) fn lower_read(
+     }
+     let mut out = vec![];
+     let fetch_v4 = image_fetch_v4(ctx, img, v4);
+-    let color = ctx.module.fresh_id();
+-    if cube && !image_is_storage(ctx, img) {
++    let (color, resident_bool) = if cube && !image_is_storage(ctx, img) {
+         let texel = CubeReadTexel {
+             coord,
+             face: layer.ok_or("air.read_texture cube read missing face")?,
+             slice,
+             lod: lod.ok_or("air.read_texture cube read missing LOD")?,
+         };
+-        cube_fetch_as_center_sample(ctx, &mut out, img, texel, fetch_v4, color)?;
++        cube_fetch_as_center_sample_maybe_sparse(ctx, &mut out, img, texel, fetch_v4, None, sparse)?
+     } else {
+         let layer = match (layer, slice) {
+             (Some(face), Some(slice)) => Some(combine_cube_array_layer(
+@@ -113,9 +113,9 @@ pub(in crate::passes) fn lower_read(
+             (layer, _) => layer,
+         };
+         let coord32 = build_fetch_coord(ctx, dim, arrayed, coord, layer, &mut out)?;
+-        read_texel(ctx, &mut out, img, dim, coord32, lod, fetch_v4, color)?;
+-    }
+-    finish_read(ctx, out, res, rty, v4, fetch_v4, color)
++        read_texel(ctx, &mut out, img, dim, coord32, lod, fetch_v4, sparse)?
++    };
++    finish_read(ctx, out, res, rty, v4, fetch_v4, color, resident_bool)
+ }
+ 
+ /// Parse the non-cube-array read ABIs; cube faces occupy the ordinary array-layer slot.
+@@ -161,15 +161,20 @@ fn read_texel(
+     coord32: Word,
+     lod: Option<Word>,
+     fetch_v4: Word,
+-    color: Word,
+-) -> Result<(), String> {
++    sparse: bool,
++) -> Result<(Word, Option<Word>), String> {
+     let lod32 = match lod {
+         Some(lod) => Some(coerce_image_coord32(ctx, lod, out, "air.read_texture lod")?),
+         None => None,
+     };
+     let mut ops = vec![Operand::IdRef(img), Operand::IdRef(coord32)];
+-    let op = if image_is_storage(ctx, img) {
+-        Op::ImageRead
++    let is_storage = image_is_storage(ctx, img);
++    let op = if is_storage {
++        if sparse {
++            Op::ImageSparseRead
++        } else {
++            Op::ImageRead
++        }
+     } else {
+         if image_value_is_multisampled(ctx, img) {
+             if let Some(sample) = lod32 {
+@@ -182,12 +187,25 @@ fn read_texel(
+                 ops.push(Operand::IdRef(lod));
+             }
+         }
+-        Op::ImageFetch
++        if sparse {
++            Op::ImageSparseFetch
++        } else {
++            Op::ImageFetch
++        }
+     };
++    if sparse {
++        let sparse_ty = ctx.ty_sparse_result(fetch_v4);
++        let sparse_res = ctx.module.fresh_id();
++        out.push(Instruction::new(op, Some(sparse_ty), Some(sparse_res), ops));
++        let (texel, resident_bool) = emit_sparse_unpack(ctx, out, sparse_res, fetch_v4);
++        return Ok((texel, Some(resident_bool)));
++    }
++    let color = ctx.module.fresh_id();
+     out.push(Instruction::new(op, Some(fetch_v4), Some(color), ops));
+-    Ok(())
++    Ok((color, None))
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn finish_read(
+     ctx: &mut Ctx,
+     mut out: Vec<Instruction>,
+@@ -196,6 +214,7 @@ fn finish_read(
+     v4: Word,
+     fetch_v4: Word,
+     color: Word,
++    resident_bool: Option<Word>,
+ ) -> Result<Vec<Instruction>, String> {
+     // Result shape: bare `<4 x half>` -> FConvert; `{<4 x half>, i8}` struct -> build; v4float -> copy.
+     let rdef = type_def_of(ctx, rty);
+@@ -225,14 +244,12 @@ fn finish_read(
+             Some(m) => coerce_same_shape_integer(ctx, &mut out, color, fetch_v4, m)?,
+             _ => color,
+         };
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        out.push(Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]));
++        let res_field = encode_residency_member(ctx, &mut out, rdef.as_ref(), resident_bool);
+         out.push(Instruction::new(
+             Op::CompositeConstruct,
+             Some(rty),
+             Some(res),
+-            vec![Operand::IdRef(c), Operand::IdRef(undef8)],
++            vec![Operand::IdRef(c), Operand::IdRef(res_field)],
+         ));
+     } else if rty != v4 && is_half_vector(ctx, rty) {
+         out.push(Instruction::new(
+@@ -297,6 +314,7 @@ pub(in crate::passes) fn lower_read_depth(
+     if args.len() < 3 {
+         return Err("air.read_depth missing texture/coord".into());
+     }
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let mut img = resolve_image_value(ctx, args[0]);
+     if texture_operand_is_absent(ctx, img) {
+         if let Some(sampled_img) =
+@@ -304,7 +322,7 @@ pub(in crate::passes) fn lower_read_depth(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     let (dim, arrayed) = ctx
+@@ -321,8 +339,7 @@ pub(in crate::passes) fn lower_read_depth(
+         return Err("air.read_depth on non-float texture".into());
+     }
+     let mut out = vec![];
+-    let color = ctx.module.fresh_id();
+-    if dim == Dim::DimCube {
++    let (color, resident_bool) = if dim == Dim::DimCube {
+         let base = if value_is_int_or_intvec(ctx, args[1]) {
+             if vector_shape(ctx, args[1]).is_some() {
+                 1
+@@ -350,7 +367,7 @@ pub(in crate::passes) fn lower_read_depth(
+                 .get(base + 2 + usize::from(arrayed))
+                 .ok_or("air.read_depth cube missing LOD")?,
+         };
+-        cube_fetch_as_center_sample(ctx, &mut out, img, texel, v4, color)?;
++        cube_fetch_as_center_sample_maybe_sparse(ctx, &mut out, img, texel, v4, None, sparse)?
+     } else {
+         // AIR read_depth forms mirror read_texture behind one extra scalar operand that sits between the
+         // texture (or sampler) and the coordinate. That operand is NOT the sample index: it is `1` at
+@@ -428,8 +445,23 @@ pub(in crate::passes) fn lower_read_depth(
+             ops.push(Operand::ImageOperands(spirv::ImageOperands::LOD));
+             ops.push(Operand::IdRef(lod));
+         }
+-        out.push(Instruction::new(Op::ImageFetch, Some(v4), Some(color), ops));
+-    }
++        if sparse {
++            let sparse_ty = ctx.ty_sparse_result(v4);
++            let sparse_res = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::ImageSparseFetch,
++                Some(sparse_ty),
++                Some(sparse_res),
++                ops,
++            ));
++            let (texel, res_b) = emit_sparse_unpack(ctx, &mut out, sparse_res, v4);
++            (texel, Some(res_b))
++        } else {
++            let color = ctx.module.fresh_id();
++            out.push(Instruction::new(Op::ImageFetch, Some(v4), Some(color), ops));
++            (color, None)
++        }
++    };
+     let depth = ctx.module.fresh_id();
+     out.push(Instruction::new(
+         Op::CompositeExtract,
+@@ -444,14 +476,12 @@ pub(in crate::passes) fn lower_read_depth(
+         .map(|d| d.class.opcode == Op::TypeStruct)
+         .unwrap_or(false);
+     if is_struct {
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        out.push(Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]));
++        let res_field = encode_residency_member(ctx, &mut out, rdef.as_ref(), resident_bool);
+         out.push(Instruction::new(
+             Op::CompositeConstruct,
+             Some(rty),
+             Some(res),
+-            vec![Operand::IdRef(depth), Operand::IdRef(undef8)],
++            vec![Operand::IdRef(depth), Operand::IdRef(res_field)],
+         ));
+     } else {
+         out.push(Instruction::new(
+diff --git a/src/passes/air_calls/images/resolve.rs b/src/passes/air_calls/images/resolve.rs
+index 54511a8..3b522d9 100644
+--- a/src/passes/air_calls/images/resolve.rs
++++ b/src/passes/air_calls/images/resolve.rs
+@@ -416,10 +416,11 @@ pub(in crate::passes) fn lower_absent_texture_write(ctx: &Ctx) -> Result<Vec<Ins
+     Ok(vec![])
+ }
+ 
+-pub(in crate::passes) fn lower_null_texture_result(
++pub(in crate::passes) fn lower_null_texture_result_with_sparse(
+     ctx: &mut Ctx,
+     res: Word,
+     rty: Word,
++    sparse: bool,
+ ) -> Result<Vec<Instruction>, String> {
+     absent_texture_operand_is_certain(ctx)?;
+     let rdef = type_def_of(ctx, rty);
+@@ -436,18 +437,30 @@ pub(in crate::passes) fn lower_null_texture_result(
+                 _ => None,
+             })
+             .ok_or("null texture result struct missing member 0")?;
++        let member1 = rdef
++            .as_ref()
++            .and_then(|d| d.operands.get(1))
++            .and_then(|o| match o {
++                Operand::IdRef(m) => Some(*m),
++                _ => None,
++            })
++            .unwrap_or_else(|| ctx.ty_int8());
+         let zero_color = const_null_of(ctx, member0);
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        return Ok(vec![
+-            Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]),
+-            Instruction::new(
+-                Op::CompositeConstruct,
+-                Some(rty),
+-                Some(res),
+-                vec![Operand::IdRef(zero_color), Operand::IdRef(undef8)],
+-            ),
+-        ]);
++        let mut out = Vec::new();
++        let res_field = if sparse {
++            const_null_of(ctx, member1)
++        } else {
++            let undef = ctx.module.fresh_id();
++            out.push(Instruction::new(Op::Undef, Some(member1), Some(undef), vec![]));
++            undef
++        };
++        out.push(Instruction::new(
++            Op::CompositeConstruct,
++            Some(rty),
++            Some(res),
++            vec![Operand::IdRef(zero_color), Operand::IdRef(res_field)],
++        ));
++        return Ok(out);
+     }
+ 
+     let zero = const_null_of(ctx, rty);
+@@ -459,6 +472,243 @@ pub(in crate::passes) fn lower_null_texture_result(
+     )])
+ }
+ 
++/// Decide whether a texture `sample`/`read`/`gather` call must lower to `OpImageSparse*` +
++/// `OpImageSparseTexelsResident` (emitting `OpCapability SparseResidency`).
++///
++/// Triggers either when the AIR intrinsic explicitly names `.sparse` (e.g.,
++/// `air.sample_texture_2d.sparse.v4f32`) OR when the call returns Metal's `{ texel, i8 }`
++/// `sparse_color<T>` struct and member 1 (the residency flag) is actually read/escaped in the
++/// function body. Ordinary non-sparse calls that only extract member 0 stay non-sparse so
++/// `SparseResidency` is never requested unless needed.
++pub(in crate::passes) fn is_sparse_texture_call(
++    ctx: &Ctx,
++    name: &str,
++    res: Word,
++    rty: Word,
++) -> bool {
++    let explicit_sparse = name.split('.').any(|tok| tok == "sparse") || name.contains("_sparse_");
++    let Some(rdef) = type_def_of(ctx, rty) else {
++        return false;
++    };
++    if rdef.class.opcode != Op::TypeStruct || rdef.operands.len() < 2 {
++        return false;
++    }
++    if explicit_sparse {
++        return true;
++    }
++    residency_member_is_used(ctx, res)
++}
++
++fn residency_member_is_used(ctx: &Ctx, root: Word) -> bool {
++    let Some(body) = ctx.air_call_body.as_ref() else {
++        return false;
++    };
++    let Some(function) = ctx.module.functions.get(body.function) else {
++        return false;
++    };
++    let mut function_vars = HashSet::<Word>::new();
++    for block in &function.blocks {
++        for inst in &block.instructions {
++            if inst.class.opcode == Op::Variable
++                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Function))
++            {
++                if let Some(id) = inst.result_id {
++                    function_vars.insert(id);
++                }
++            }
++        }
++    }
++
++    let mut worklist = vec![root];
++    let mut visited = HashSet::from([root]);
++    let mut tracked_ptrs = HashSet::<Word>::new();
++    while let Some(val) = worklist.pop() {
++        for block in &function.blocks {
++            for inst in &block.instructions {
++                match inst.class.opcode {
++                    Op::CompositeExtract => {
++                        if inst.operands.first() == Some(&Operand::IdRef(val)) {
++                            if inst.operands.get(1) != Some(&Operand::LiteralBit32(0)) {
++                                return true;
++                            }
++                        }
++                    }
++                    Op::CopyObject | Op::Phi | Op::Select => {
++                        let uses_val = inst
++                            .operands
++                            .iter()
++                            .any(|op| op == &Operand::IdRef(val));
++                        if uses_val {
++                            if let Some(rid) = inst.result_id {
++                                if visited.insert(rid) {
++                                    worklist.push(rid);
++                                }
++                            }
++                        }
++                    }
++                    Op::Store => {
++                        if inst.operands.get(1) == Some(&Operand::IdRef(val)) {
++                            if let Some(Operand::IdRef(ptr)) = inst.operands.first() {
++                                if function_vars.contains(ptr) {
++                                    if tracked_ptrs.insert(*ptr) {
++                                        for blk in &function.blocks {
++                                            for use_inst in &blk.instructions {
++                                                match use_inst.class.opcode {
++                                                    Op::Load
++                                                        if use_inst.operands.first()
++                                                            == Some(&Operand::IdRef(*ptr)) =>
++                                                    {
++                                                        if let Some(lid) = use_inst.result_id {
++                                                            if visited.insert(lid) {
++                                                                worklist.push(lid);
++                                                            }
++                                                        }
++                                                    }
++                                                    Op::AccessChain | Op::InBoundsAccessChain
++                                                        if use_inst.operands.first()
++                                                            == Some(&Operand::IdRef(*ptr)) =>
++                                                    {
++                                                        let idx_is_zero = use_inst
++                                                            .operands
++                                                            .get(1)
++                                                            .and_then(|op| match op {
++                                                                Operand::IdRef(id) => Some(
++                                                                    integer_operand_is_constant_zero(
++                                                                        ctx, *id,
++                                                                    ),
++                                                                ),
++                                                                _ => None,
++                                                            })
++                                                            .unwrap_or(false);
++                                                        if !idx_is_zero {
++                                                            return true;
++                                                        }
++                                                    }
++                                                    _ => {}
++                                                }
++                                            }
++                                        }
++                                    }
++                                } else {
++                                    // Stored to Output / StorageBuffer / Private: whole struct escapes.
++                                    return true;
++                                }
++                            }
++                        }
++                    }
++                    Op::ReturnValue | Op::FunctionCall | Op::CompositeConstruct | Op::CompositeInsert => {
++                        if inst.operands.iter().any(|op| op == &Operand::IdRef(val)) {
++                            return true;
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++    }
++    false
++}
++
++/// Unpack a SPIR-V `OpImageSparse*` result `{ u32 residency_code, texel }` into
++/// `(texel, resident_bool)` using `OpImageSparseTexelsResident`.
++pub(in crate::passes) fn emit_sparse_unpack(
++    ctx: &mut Ctx,
++    out: &mut Vec<Instruction>,
++    sparse_result: Word,
++    texel_ty: Word,
++) -> (Word, Word) {
++    let uint_ty = ctx.ty_uint();
++    let bool_ty = ctx.ty_bool();
++    let res_code = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::CompositeExtract,
++        Some(uint_ty),
++        Some(res_code),
++        vec![Operand::IdRef(sparse_result), Operand::LiteralBit32(0)],
++    ));
++    let texel = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::CompositeExtract,
++        Some(texel_ty),
++        Some(texel),
++        vec![Operand::IdRef(sparse_result), Operand::LiteralBit32(1)],
++    ));
++    let resident_bool = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::ImageSparseTexelsResident,
++        Some(bool_ty),
++        Some(resident_bool),
++        vec![Operand::IdRef(res_code)],
++    ));
++    (texel, resident_bool)
++}
++
++/// Guard a sparse residency boolean for a clamped-to-border out-of-bounds fetch: an out-of-bounds
++/// border texel is synthesized as zero by the sampler (resident = true) rather than reflecting an
++/// unbound tile at a clamped coordinate.
++pub(in crate::passes) fn guard_residency_in_bounds(
++    ctx: &mut Ctx,
++    out: &mut Vec<Instruction>,
++    resident_bool: Option<Word>,
++    in_bounds: Word,
++) -> Option<Word> {
++    let res_b = resident_bool?;
++    let bool_ty = ctx.ty_bool();
++    let true_c = ctx.const_bool_of(bool_ty, true);
++    let guarded = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::Select,
++        Some(bool_ty),
++        Some(guarded),
++        vec![
++            Operand::IdRef(in_bounds),
++            Operand::IdRef(res_b),
++            Operand::IdRef(true_c),
++        ],
++    ));
++    Some(guarded)
++}
++
++/// Materialize member 1 of AIR's `{ texel, residency }` struct: `OpUndef` on non-sparse ops, or
++/// the converted residency boolean (`bool` directly, or `OpSelect` 1/0 for `i8`/`i32`) on sparse.
++pub(in crate::passes) fn encode_residency_member(
++    ctx: &mut Ctx,
++    out: &mut Vec<Instruction>,
++    rdef: Option<&Instruction>,
++    resident_bool: Option<Word>,
++) -> Word {
++    let member1_ty = rdef
++        .and_then(|d| d.operands.get(1))
++        .and_then(|o| match o {
++            Operand::IdRef(m) => Some(*m),
++            _ => None,
++        })
++        .unwrap_or_else(|| ctx.ty_int8());
++    let Some(is_res) = resident_bool else {
++        let undef = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::Undef,
++            Some(member1_ty),
++            Some(undef),
++            vec![],
++        ));
++        return undef;
++    };
++    if type_def_of(ctx, member1_ty).is_some_and(|d| d.class.opcode == Op::TypeBool) {
++        return is_res;
++    }
++    let one = ctx.const_int_of(member1_ty, 1);
++    let zero = ctx.const_int_of(member1_ty, 0);
++    let flag = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::Select,
++        Some(member1_ty),
++        Some(flag),
++        vec![Operand::IdRef(is_res), Operand::IdRef(one), Operand::IdRef(zero)],
++    ));
++    flag
++}
++
+ /// One null per type, not one per call. `OpConstantNull` has no operands, so a per-call `fresh_id`
+ /// mints a byte-identical global every time -- ten call sites across the image lowerings share this
+ /// helper, and one corpus module ended up with 33 `OpConstantNull %v4float` where one would do.
+diff --git a/src/passes/air_calls/images/sample.rs b/src/passes/air_calls/images/sample.rs
+index 38afe6f..c7ad94f 100644
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -79,6 +79,7 @@ pub(in crate::passes) fn lower_sample(
+     if args.len() < 3 {
+         return Err("air.sample missing texture/sampler/coord".into());
+     }
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let (mut img, samp, coord) = (resolve_image_value(ctx, args[0]), args[1], args[2]);
+     if texture_operand_is_absent(ctx, img) {
+         if let Some(sampled_img) =
+@@ -86,7 +87,7 @@ pub(in crate::passes) fn lower_sample(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     let mut out = vec![];
+@@ -141,7 +142,7 @@ pub(in crate::passes) fn lower_sample(
+                 None => ctx.const_uint(0),
+             };
+             if pixel_linear {
+-                let color = lower_pixel_linear_sample(
++                let (color, resident_bool) = lower_pixel_linear_sample_maybe_sparse(
+                     ctx,
+                     sampler_state,
+                     img,
+@@ -151,12 +152,21 @@ pub(in crate::passes) fn lower_sample(
+                     args,
+                     lod,
+                     sample_v4,
++                    sparse,
+                     &mut out,
+                 )?;
+-                return finish_sample_result(ctx, res, rty, color, sample_v4, out);
++                return finish_sample_result_with_residency(
++                    ctx,
++                    res,
++                    rty,
++                    color,
++                    sample_v4,
++                    resident_bool,
++                    out,
++                );
+             }
+             if pixel_bicubic {
+-                let color = lower_pixel_bicubic_sample(
++                let (color, resident_bool) = lower_pixel_bicubic_sample_maybe_sparse(
+                     ctx,
+                     sampler_state,
+                     img,
+@@ -167,9 +177,18 @@ pub(in crate::passes) fn lower_sample(
+                     lod,
+                     sample_v4,
+                     false,
++                    sparse,
+                     &mut out,
+                 )?;
+-                return finish_sample_result(ctx, res, rty, color, sample_v4, out);
++                return finish_sample_result_with_residency(
++                    ctx,
++                    res,
++                    rty,
++                    color,
++                    sample_v4,
++                    resident_bool,
++                    out,
++                );
+             }
+             let fetch = build_pixel_fetch_coord(
+                 ctx,
+@@ -182,8 +201,15 @@ pub(in crate::passes) fn lower_sample(
+                 lod,
+                 &mut out,
+             )?;
+-            let mut color = ctx.module.fresh_id();
+-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
++            let (mut color, mut resident_bool) = push_image_read_or_fetch_maybe_sparse(
++                ctx,
++                &mut out,
++                img,
++                fetch.coord,
++                Some(lod),
++                sample_v4,
++                sparse,
++            )?;
+             if let Some(in_bounds) = fetch.in_bounds {
+                 let guarded = ctx.module.fresh_id();
+                 let zero_color = const_null_of(ctx, sample_v4);
+@@ -198,8 +224,17 @@ pub(in crate::passes) fn lower_sample(
+                     ],
+                 ));
+                 color = guarded;
++                resident_bool = guard_residency_in_bounds(ctx, &mut out, resident_bool, in_bounds);
+             }
+-            return finish_sample_result(ctx, res, rty, color, sample_v4, out);
++            return finish_sample_result_with_residency(
++                ctx,
++                res,
++                rty,
++                color,
++                sample_v4,
++                resident_bool,
++                out,
++            );
+         }
+         return Err(format!(
+             "pixel-coordinate sampling does not support {dim:?} with {:?} filtering",
+@@ -217,7 +252,7 @@ pub(in crate::passes) fn lower_sample(
+                 Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+                 None => ctx.const_uint(0),
+             };
+-            let color = lower_pixel_bicubic_sample(
++            let (color, resident_bool) = lower_pixel_bicubic_sample_maybe_sparse(
+                 ctx,
+                 sampler_state,
+                 img,
+@@ -228,9 +263,18 @@ pub(in crate::passes) fn lower_sample(
+                 lod,
+                 sample_v4,
+                 true,
++                sparse,
+                 &mut out,
+             )?;
+-            return finish_sample_result(ctx, res, rty, color, sample_v4, out);
++            return finish_sample_result_with_residency(
++                ctx,
++                res,
++                rty,
++                color,
++                sample_v4,
++                resident_bool,
++                out,
++            );
+         }
+         return Err(
+             "air.sample_texture bicubic filtering is supported only for 1D/2D float textures"
+@@ -260,8 +304,15 @@ pub(in crate::passes) fn lower_sample(
+                 lod,
+                 &mut out,
+             )?;
+-            let mut color = ctx.module.fresh_id();
+-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
++            let (mut color, mut resident_bool) = push_image_read_or_fetch_maybe_sparse(
++                ctx,
++                &mut out,
++                img,
++                fetch.coord,
++                Some(lod),
++                sample_v4,
++                sparse,
++            )?;
+             if let Some(in_bounds) = fetch.in_bounds {
+                 let guarded = ctx.module.fresh_id();
+                 let zero_color = const_null_of(ctx, sample_v4);
+@@ -276,14 +327,22 @@ pub(in crate::passes) fn lower_sample(
+                     ],
+                 ));
+                 color = guarded;
++                resident_bool = guard_residency_in_bounds(ctx, &mut out, resident_bool, in_bounds);
+             }
+-            return finish_sample_result(ctx, res, rty, color, sample_v4, out);
++            return finish_sample_result_with_residency(
++                ctx,
++                res,
++                rty,
++                color,
++                sample_v4,
++                resident_bool,
++                out,
++            );
+         }
+     }
+ 
+     let si_ty = ctx.ty_sampled_image(img_ty);
+     let si = ctx.module.fresh_id();
+-    let color = ctx.module.fresh_id();
+     let samp = valid_sampler_value(ctx, samp, &mut out)?;
+     out.push(Instruction::new(
+         Op::SampledImage,
+@@ -333,11 +392,10 @@ pub(in crate::passes) fn lower_sample(
+             &mut out,
+         )?;
+     }
+-    push_image_sample(
++    let (color, sample_inst_id, resident_bool) = push_image_sample_maybe_sparse(
+         ctx,
+         &mut out,
+         sample_v4,
+-        color,
+         si,
+         coord_for_sample,
+         None,
+@@ -345,13 +403,15 @@ pub(in crate::passes) fn lower_sample(
+         is_int_tex,
+         const_offset,
+         grad,
++        sparse,
+     );
+-    record_source_sample_coordinate(ctx, &out, color, args[2]);
++    record_source_sample_coordinate(ctx, &out, sample_inst_id, args[2]);
+ 
+-    finish_sample_result(ctx, res, rty, color, sample_v4, out)
++    finish_sample_result_with_residency(ctx, res, rty, color, sample_v4, resident_bool, out)
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
++#[cfg_attr(not(test), allow(dead_code))]
+ fn lower_pixel_bicubic_sample(
+     ctx: &mut Ctx,
+     sampler_state: StaticSamplerState,
+@@ -365,6 +425,38 @@ fn lower_pixel_bicubic_sample(
+     normalized_coordinates: bool,
+     out: &mut Vec<Instruction>,
+ ) -> Result<Word, String> {
++    lower_pixel_bicubic_sample_maybe_sparse(
++        ctx,
++        sampler_state,
++        img,
++        dim,
++        arrayed,
++        coord,
++        args,
++        lod,
++        sample_v4,
++        normalized_coordinates,
++        false,
++        out,
++    )
++    .map(|(color, _)| color)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn lower_pixel_bicubic_sample_maybe_sparse(
++    ctx: &mut Ctx,
++    sampler_state: StaticSamplerState,
++    img: Word,
++    dim: Dim,
++    arrayed: bool,
++    coord: Word,
++    args: &[Word],
++    lod: Word,
++    sample_v4: Word,
++    normalized_coordinates: bool,
++    sparse: bool,
++    out: &mut Vec<Instruction>,
++) -> Result<(Word, Option<Word>), String> {
+     let spatial = match dim {
+         Dim::Dim1D => 1,
+         Dim::Dim2D => 2,
+@@ -500,6 +592,7 @@ fn lower_pixel_bicubic_sample(
+ 
+     let zero_color = const_null_of(ctx, sample_v4);
+     let mut acc = zero_color;
++    let mut all_resident: Option<Word> = None;
+     for tap in 0..4usize.pow(spatial as u32) {
+         let tap_indices = (0..spatial)
+             .map(|axis| (tap / 4usize.pow(axis as u32)) % 4)
+@@ -519,16 +612,36 @@ fn lower_pixel_bicubic_sample(
+             size,
+             out,
+         )?;
+-        let fetched = ctx.module.fresh_id();
+-        push_image_read_or_fetch(
++        let (fetched, tap_res) = push_image_read_or_fetch_maybe_sparse(
+             ctx,
+             out,
+             img,
+             tap_coord.coord,
+             Some(lod),
+             sample_v4,
+-            fetched,
++            sparse,
+         )?;
++        if let Some(mut tap_res) = tap_res {
++            if let Some(in_bounds) = tap_coord.in_bounds {
++                let true_c = ctx.const_bool_of(bool_ty, true);
++                let guarded_res = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::Select,
++                    Some(bool_ty),
++                    Some(guarded_res),
++                    vec![
++                        Operand::IdRef(in_bounds),
++                        Operand::IdRef(tap_res),
++                        Operand::IdRef(true_c),
++                    ],
++                ));
++                tap_res = guarded_res;
++            }
++            all_resident = Some(match all_resident {
++                None => tap_res,
++                Some(prev) => logical_and(ctx, prev, tap_res, out),
++            });
++        }
+         let color = if let Some(in_bounds) = tap_coord.in_bounds {
+             let guarded = ctx.module.fresh_id();
+             out.push(Instruction::new(
+@@ -593,7 +706,7 @@ fn lower_pixel_bicubic_sample(
+         ));
+         acc = sum;
+     }
+-    Ok(acc)
++    Ok((acc, all_resident))
+ }
+ 
+ fn catmull_rom_weights(ctx: &mut Ctx, t: Word, out: &mut Vec<Instruction>) -> [Word; 4] {
+@@ -789,7 +902,7 @@ fn nclamp_float(ctx: &mut Ctx, x: Word, lo: Word, hi: Word, out: &mut Vec<Instru
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+-pub(in crate::passes) fn lower_pixel_linear_sample(
++pub(in crate::passes) fn lower_pixel_linear_sample_maybe_sparse(
+     ctx: &mut Ctx,
+     sampler_state: StaticSamplerState,
+     img: Word,
+@@ -799,8 +912,9 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
+     args: &[Word],
+     lod: Word,
+     sample_v4: Word,
++    sparse: bool,
+     out: &mut Vec<Instruction>,
+-) -> Result<Word, String> {
++) -> Result<(Word, Option<Word>), String> {
+     let spatial: usize = match dim {
+         Dim::Dim1D => 1,
+         Dim::Dim2D => 2,
+@@ -921,6 +1035,7 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
+     }
+     let zero_color = const_null_of(ctx, sample_v4);
+     let mut acc = zero_color;
++    let mut all_resident: Option<Word> = None;
+     for tap in 0..(1usize << spatial) {
+         let tap_offset: Vec<i32> = (0..spatial)
+             .map(|axis| ((tap >> axis) & 1) as i32)
+@@ -936,16 +1051,36 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
+             size,
+             out,
+         )?;
+-        let fetched = ctx.module.fresh_id();
+-        push_image_read_or_fetch(
++        let (fetched, tap_res) = push_image_read_or_fetch_maybe_sparse(
+             ctx,
+             out,
+             img,
+             tap_coord.coord,
+             Some(lod),
+             sample_v4,
+-            fetched,
++            sparse,
+         )?;
++        if let Some(mut tap_res) = tap_res {
++            if let Some(in_bounds) = tap_coord.in_bounds {
++                let true_c = ctx.const_bool_of(bool_ty, true);
++                let guarded_res = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::Select,
++                    Some(bool_ty),
++                    Some(guarded_res),
++                    vec![
++                        Operand::IdRef(in_bounds),
++                        Operand::IdRef(tap_res),
++                        Operand::IdRef(true_c),
++                    ],
++                ));
++                tap_res = guarded_res;
++            }
++            all_resident = Some(match all_resident {
++                None => tap_res,
++                Some(prev) => logical_and(ctx, prev, tap_res, out),
++            });
++        }
+         let color = if let Some(in_bounds) = tap_coord.in_bounds {
+             let guarded = ctx.module.fresh_id();
+             out.push(Instruction::new(
+@@ -1010,15 +1145,16 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
+         ));
+         acc = sum;
+     }
+-    Ok(acc)
++    Ok((acc, all_resident))
+ }
+ 
+-pub(in crate::passes) fn finish_sample_result(
++pub(in crate::passes) fn finish_sample_result_with_residency(
+     ctx: &mut Ctx,
+     res: Word,
+     rty: Word,
+     color: Word,
+     color_ty: Word,
++    resident_bool: Option<Word>,
+     mut out: Vec<Instruction>,
+ ) -> Result<Vec<Instruction>, String> {
+     // The AIR sample result shape varies by texture component type:
+@@ -1055,14 +1191,12 @@ pub(in crate::passes) fn finish_sample_result(
+             Some(m) => coerce_same_shape_integer(ctx, &mut out, color, color_ty, m)?,
+             _ => color,
+         };
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        out.push(Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]));
++        let res_field = encode_residency_member(ctx, &mut out, rdef.as_ref(), resident_bool);
+         out.push(Instruction::new(
+             Op::CompositeConstruct,
+             Some(rty),
+             Some(res),
+-            vec![Operand::IdRef(color_for_struct), Operand::IdRef(undef8)],
++            vec![Operand::IdRef(color_for_struct), Operand::IdRef(res_field)],
+         ));
+     } else if rty != color_ty && is_half_vector(ctx, rty) {
+         // Bare half-vector result: FConvert the v4float sample to v4half.
+diff --git a/src/passes/air_calls/images/sample_depth.rs b/src/passes/air_calls/images/sample_depth.rs
+index e07dcac..eeeeb82 100644
+--- a/src/passes/air_calls/images/sample_depth.rs
++++ b/src/passes/air_calls/images/sample_depth.rs
+@@ -18,6 +18,7 @@ pub(in crate::passes) fn lower_sample_depth(
+     if args.len() < 4 {
+         return Err("air.sample_depth missing texture/sampler/coord".into());
+     }
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let (mut img, samp, coord) = (resolve_image_value(ctx, args[0]), args[1], args[3]);
+     if texture_operand_is_absent(ctx, img) {
+         if let Some(sampled_img) =
+@@ -25,7 +26,7 @@ pub(in crate::passes) fn lower_sample_depth(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     let mut out = vec![];
+@@ -61,6 +62,7 @@ pub(in crate::passes) fn lower_sample_depth(
+         .then(|| ctx.sampler_states.get(&samp).copied())
+         .flatten()
+         .filter(|state| state.uses_pixel_coordinates());
++    let resident_bool;
+     let color = if let Some(state) = pixel_state {
+         if grad.is_some() {
+             return Err("pixel-coordinate depth gradients are unsupported".into());
+@@ -73,7 +75,7 @@ pub(in crate::passes) fn lower_sample_depth(
+             None => ctx.const_uint(0),
+         };
+         if state.uses_linear_filter() && matches!(dim, Dim::Dim1D | Dim::Dim2D | Dim::Dim3D) {
+-            lower_pixel_linear_sample(
++            let (fetched, res_b) = lower_pixel_linear_sample_maybe_sparse(
+                 ctx,
+                 state,
+                 img,
+@@ -83,8 +85,11 @@ pub(in crate::passes) fn lower_sample_depth(
+                 &sample_args,
+                 lod,
+                 v4,
++                sparse,
+                 &mut out,
+-            )?
++            )?;
++            resident_bool = res_b;
++            fetched
+         } else if state.uses_pixel_nearest() {
+             let fetch = build_pixel_fetch_coord(
+                 ctx,
+@@ -97,9 +102,10 @@ pub(in crate::passes) fn lower_sample_depth(
+                 lod,
+                 &mut out,
+             )?;
+-            let fetched = ctx.module.fresh_id();
+-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched)?;
++            let (fetched, res_b) =
++                push_image_read_or_fetch_maybe_sparse(ctx, &mut out, img, fetch.coord, Some(lod), v4, sparse)?;
+             if let Some(in_bounds) = fetch.in_bounds {
++                resident_bool = guard_residency_in_bounds(ctx, &mut out, res_b, in_bounds);
+                 let guarded = ctx.module.fresh_id();
+                 let zero = const_null_of(ctx, v4);
+                 out.push(Instruction::new(
+@@ -114,6 +120,7 @@ pub(in crate::passes) fn lower_sample_depth(
+                 ));
+                 guarded
+             } else {
++                resident_bool = res_b;
+                 fetched
+             }
+         } else {
+@@ -125,7 +132,6 @@ pub(in crate::passes) fn lower_sample_depth(
+     } else {
+         let si_ty = ctx.ty_sampled_image(img_ty);
+         let si = ctx.module.fresh_id();
+-        let color = ctx.module.fresh_id();
+         let samp = valid_sampler_value(ctx, samp, &mut out)?;
+         out.push(Instruction::new(
+             Op::SampledImage,
+@@ -185,11 +191,10 @@ pub(in crate::passes) fn lower_sample_depth(
+                 &mut out,
+             )?;
+         }
+-        push_image_sample(
++        let (color, sample_inst_id, res_b) = push_image_sample_maybe_sparse(
+             ctx,
+             &mut out,
+             v4,
+-            color,
+             si,
+             coord_for_sample,
+             None,
+@@ -197,8 +202,10 @@ pub(in crate::passes) fn lower_sample_depth(
+             false,
+             const_offset,
+             grad,
++            sparse,
+         );
+-        record_source_sample_coordinate(ctx, &out, color, args[3]);
++        resident_bool = res_b;
++        record_source_sample_coordinate(ctx, &out, sample_inst_id, args[3]);
+         color
+     };
+     let depth = ctx.module.fresh_id();
+@@ -215,14 +222,12 @@ pub(in crate::passes) fn lower_sample_depth(
+         .map(|d| d.class.opcode == Op::TypeStruct)
+         .unwrap_or(false);
+     if is_struct {
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        out.push(Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]));
++        let res_field = encode_residency_member(ctx, &mut out, rdef.as_ref(), resident_bool);
+         out.push(Instruction::new(
+             Op::CompositeConstruct,
+             Some(rty),
+             Some(res),
+-            vec![Operand::IdRef(depth), Operand::IdRef(undef8)],
++            vec![Operand::IdRef(depth), Operand::IdRef(res_field)],
+         ));
+     } else {
+         out.push(Instruction::new(
+@@ -252,6 +257,7 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+     if args.len() < 5 {
+         return Err("air.sample_compare_depth missing texture/sampler/coord/reference".into());
+     }
++    let sparse = is_sparse_texture_call(ctx, name, res, rty);
+     let (mut img, samp, coord) = (resolve_image_value(ctx, args[0]), args[1], args[3]);
+     if texture_operand_is_absent(ctx, img) {
+         if let Some(sampled_img) =
+@@ -259,7 +265,7 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+         {
+             img = sampled_img;
+         } else {
+-            return lower_null_texture_result(ctx, res, rty);
++            return lower_null_texture_result_with_sparse(ctx, res, rty, sparse);
+         }
+     }
+     let mut out = vec![];
+@@ -327,13 +333,14 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+         .then_some(sampler_state)
+         .flatten()
+         .filter(|state| state.uses_pixel_coordinates());
++    let resident_bool;
+     let sampled = if let Some(state) = pixel_state {
+         let lod = match find_sample_lod(ctx, arrayed, &sample_args, &mut out) {
+             Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+             None => ctx.const_uint(0),
+         };
+         if state.uses_linear_filter() && matches!(dim, Dim::Dim2D | Dim::Dim3D) {
+-            lower_pixel_linear_sample(
++            let (fetched, res_b) = lower_pixel_linear_sample_maybe_sparse(
+                 ctx,
+                 state,
+                 img,
+@@ -343,8 +350,11 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+                 &sample_args,
+                 lod,
+                 v4,
++                sparse,
+                 &mut out,
+-            )?
++            )?;
++            resident_bool = res_b;
++            fetched
+         } else if state.uses_pixel_nearest() {
+             let fetch = build_pixel_fetch_coord(
+                 ctx,
+@@ -357,9 +367,17 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+                 lod,
+                 &mut out,
+             )?;
+-            let fetched = ctx.module.fresh_id();
+-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched)?;
++            let (fetched, res_b) = push_image_read_or_fetch_maybe_sparse(
++                ctx,
++                &mut out,
++                img,
++                fetch.coord,
++                Some(lod),
++                v4,
++                sparse,
++            )?;
+             if let Some(in_bounds) = fetch.in_bounds {
++                resident_bool = guard_residency_in_bounds(ctx, &mut out, res_b, in_bounds);
+                 let guarded = ctx.module.fresh_id();
+                 let zero_color = const_null_of(ctx, v4);
+                 out.push(Instruction::new(
+@@ -374,6 +392,7 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+                 ));
+                 guarded
+             } else {
++                resident_bool = res_b;
+                 fetched
+             }
+         } else {
+@@ -385,7 +404,6 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+     } else {
+         let si_ty = ctx.ty_sampled_image(img_ty);
+         let si = ctx.module.fresh_id();
+-        let shadow = ctx.module.fresh_id();
+         let valid_sampler = valid_sampler_value(ctx, samp, &mut out)?;
+         out.push(Instruction::new(
+             Op::SampledImage,
+@@ -423,11 +441,10 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+                 &mut out,
+             )?;
+         }
+-        push_image_sample(
++        let (shadow, sample_inst_id, res_b) = push_image_sample_maybe_sparse(
+             ctx,
+             &mut out,
+             float_ty,
+-            shadow,
+             si,
+             coord_for_sample,
+             Some(reference),
+@@ -435,8 +452,10 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+             false,
+             const_offset,
+             None,
++            sparse,
+         );
+-        record_source_sample_coordinate(ctx, &out, shadow, args[3]);
++        resident_bool = res_b;
++        record_source_sample_coordinate(ctx, &out, sample_inst_id, args[3]);
+         shadow
+     };
+     let shadow = if let Some(state) = pixel_state {
+@@ -501,14 +520,12 @@ pub(in crate::passes) fn lower_sample_compare_depth(
+         .map(|d| d.class.opcode == Op::TypeStruct)
+         .unwrap_or(false);
+     if is_struct {
+-        let i8u = ctx.ty_int8();
+-        let undef8 = ctx.module.fresh_id();
+-        out.push(Instruction::new(Op::Undef, Some(i8u), Some(undef8), vec![]));
++        let res_field = encode_residency_member(ctx, &mut out, rdef.as_ref(), resident_bool);
+         out.push(Instruction::new(
+             Op::CompositeConstruct,
+             Some(rty),
+             Some(res),
+-            vec![Operand::IdRef(shadow), Operand::IdRef(undef8)],
++            vec![Operand::IdRef(shadow), Operand::IdRef(res_field)],
+         ));
+     } else {
+         out.push(Instruction::new(
+@@ -673,15 +690,13 @@ pub(in crate::passes) fn validate_cube_sample_operands(
+     Ok(())
+ }
+ 
+-/// Emit the sample. `grad` is Metal's `gradient2d(dPdx, dPdy)`: it selects the mip level the same
+-/// way an explicit level does, so it takes the place of one rather than joining it -- SPIR-V forbids
+-/// `Lod` and `Grad` on the same instruction.
++/// Emit a regular or sparse sample (`OpImageSample*` or `OpImageSparseSample*` +
++/// `OpImageSparseTexelsResident`). Returns `(texel_id, sample_inst_id, Option<resident_bool>)`.
+ #[allow(clippy::too_many_arguments)]
+-pub(in crate::passes) fn push_image_sample(
++pub(in crate::passes) fn push_image_sample_maybe_sparse(
+     ctx: &mut Ctx,
+     out: &mut Vec<Instruction>,
+     result_ty: Word,
+-    result: Word,
+     sampled_image: Word,
+     coord: Word,
+     dref: Option<Word>,
+@@ -689,7 +704,8 @@ pub(in crate::passes) fn push_image_sample(
+     force_lod0: bool,
+     const_offset: Option<Word>,
+     grad: Option<(Word, Word)>,
+-) {
++    sparse: bool,
++) -> (Word, Word, Option<Word>) {
+     let lod = if grad.is_some() {
+         None
+     } else {
+@@ -702,9 +718,6 @@ pub(in crate::passes) fn push_image_sample(
+             }
+         }
+     };
+-    // A bias shifts the level the derivatives give, so it survives only where they are what picks
+-    // the level: a gradient sample, an explicit level, and the forced base level above each choose
+-    // one without them, and SPIR-V accepts `Bias` on implicit-LOD instructions alone.
+     let bias = match level {
+         Some(SampleLevel::Bias(bias)) if lod.is_none() && grad.is_none() => Some(bias),
+         _ => None,
+@@ -728,7 +741,6 @@ pub(in crate::passes) fn push_image_sample(
+     }
+     if !image_operands.is_empty() {
+         operands.push(Operand::ImageOperands(image_operands));
+-        // Image operands are written in increasing bit order: Bias, Lod, Grad, then ConstOffset.
+         if let Some(bias) = bias {
+             operands.push(Operand::IdRef(bias));
+         }
+@@ -743,17 +755,38 @@ pub(in crate::passes) fn push_image_sample(
+             operands.push(Operand::IdRef(offset));
+         }
+     }
+-    out.push(Instruction::new(
+-        match (dref.is_some(), lod.is_some() || grad.is_some()) {
+-            (true, true) => Op::ImageSampleDrefExplicitLod,
+-            (true, false) => Op::ImageSampleDrefImplicitLod,
+-            (false, true) => Op::ImageSampleExplicitLod,
+-            (false, false) => Op::ImageSampleImplicitLod,
+-        },
+-        Some(result_ty),
+-        Some(result),
+-        operands,
+-    ));
++    let explicit = lod.is_some() || grad.is_some();
++    if sparse {
++        let sparse_ty = ctx.ty_sparse_result(result_ty);
++        let sparse_id = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            match (dref.is_some(), explicit) {
++                (true, true) => Op::ImageSparseSampleDrefExplicitLod,
++                (true, false) => Op::ImageSparseSampleDrefImplicitLod,
++                (false, true) => Op::ImageSparseSampleExplicitLod,
++                (false, false) => Op::ImageSparseSampleImplicitLod,
++            },
++            Some(sparse_ty),
++            Some(sparse_id),
++            operands,
++        ));
++        let (texel, resident_bool) = emit_sparse_unpack(ctx, out, sparse_id, result_ty);
++        (texel, sparse_id, Some(resident_bool))
++    } else {
++        let result = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            match (dref.is_some(), explicit) {
++                (true, true) => Op::ImageSampleDrefExplicitLod,
++                (true, false) => Op::ImageSampleDrefImplicitLod,
++                (false, true) => Op::ImageSampleExplicitLod,
++                (false, false) => Op::ImageSampleImplicitLod,
++            },
++            Some(result_ty),
++            Some(result),
++            operands,
++        ));
++        (result, result, None)
++    }
+ }
+ 
+ pub(in crate::passes) fn sample_lod_as_f32(
+diff --git a/src/passes/air_calls/images/sampler_coordinates.rs b/src/passes/air_calls/images/sampler_coordinates.rs
+index ec64e67..512f0ae 100644
+--- a/src/passes/air_calls/images/sampler_coordinates.rs
++++ b/src/passes/air_calls/images/sampler_coordinates.rs
+@@ -14,7 +14,10 @@ pub(in crate::passes) fn record_source_sample_coordinate(
+             instruction.result_id == Some(sample)
+                 && matches!(
+                     instruction.class.opcode,
+-                    Op::ImageSampleImplicitLod | Op::ImageSampleDrefImplicitLod
++                    Op::ImageSampleImplicitLod
++                        | Op::ImageSampleDrefImplicitLod
++                        | Op::ImageSparseSampleImplicitLod
++                        | Op::ImageSparseSampleDrefImplicitLod
+                 )
+         })
+     {
+diff --git a/src/passes/image_facts.rs b/src/passes/image_facts.rs
+index beeeaa8..fd50f0a 100644
+--- a/src/passes/image_facts.rs
++++ b/src/passes/image_facts.rs
+@@ -1412,7 +1412,7 @@ fn intrinsic_access(
+ }
+ 
+ pub(in crate::passes) fn intrinsic_component(name: &str) -> Option<ImageComp> {
+-    let suffix = name.rsplit('.').next()?;
++    let suffix = name.rsplit('.').find(|&part| part != "sparse")?;
+     match suffix {
+         "v4f16" | "v4f32" | "f16" | "f32" => Some(ImageComp::Float),
+         "v4i16" | "v4i32" | "i16" | "i32" => Some(if name.split('.').any(|part| part == "u") {
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index ab37725..7fd8f98 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -636,6 +636,8 @@ struct Ctx {
+     fragment_imageblock_coord_var: Option<Word>,
+     /// Fragment output rewrite created a `BuiltIn FragDepth` Output variable.
+     writes_frag_depth: bool,
++    /// Undecorated `{ u32, texel_ty }` struct types cached for `OpImageSparse*` instructions.
++    sparse_result_types: HashMap<Word, Word>,
+ }
+ 
+ impl Ctx {
+@@ -731,9 +733,27 @@ impl Ctx {
+             uses_raster_order_groups: false,
+             fragment_imageblock_coord_var: None,
+             writes_frag_depth: false,
++            sparse_result_types: HashMap::new(),
+         }
+     }
+ 
++    /// Return a dedicated undecorated `OpTypeStruct %uint %texel_ty` for `OpImageSparse*`.
++    pub(in crate::passes) fn ty_sparse_result(&mut self, texel_ty: Word) -> Word {
++        if let Some(&id) = self.sparse_result_types.get(&texel_ty) {
++            return id;
++        }
++        let uint_ty = self.ty_uint();
++        let id = self.module.fresh_id();
++        self.new_globals.push(Instruction::new(
++            Op::TypeStruct,
++            None,
++            Some(id),
++            vec![Operand::IdRef(uint_ty), Operand::IdRef(texel_ty)],
++        ));
++        self.sparse_result_types.insert(texel_ty, id);
++        id
++    }
++
+     pub(in crate::passes) fn needs_pixel_interlock(&self) -> bool {
+         self.uses_fragment_imageblock || self.uses_raster_order_groups
+     }
+diff --git a/src/passes/module_cleanup.rs b/src/passes/module_cleanup.rs
+index 419cfcf..b859baf 100644
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -613,6 +613,33 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
+     if has_demote {
+         want.push(Capability::DemoteToHelperInvocation);
+     }
++    let has_sparse_residency = ctx
++        .module
++        .functions
++        .iter()
++        .flat_map(|f| f.blocks.iter())
++        .flat_map(|b| b.instructions.iter())
++        .any(|i| {
++            matches!(
++                i.class.opcode,
++                Op::ImageSparseSampleImplicitLod
++                    | Op::ImageSparseSampleExplicitLod
++                    | Op::ImageSparseSampleDrefImplicitLod
++                    | Op::ImageSparseSampleDrefExplicitLod
++                    | Op::ImageSparseSampleProjImplicitLod
++                    | Op::ImageSparseSampleProjExplicitLod
++                    | Op::ImageSparseSampleProjDrefImplicitLod
++                    | Op::ImageSparseSampleProjDrefExplicitLod
++                    | Op::ImageSparseFetch
++                    | Op::ImageSparseGather
++                    | Op::ImageSparseDrefGather
++                    | Op::ImageSparseRead
++                    | Op::ImageSparseTexelsResident
++            )
++        });
++    if has_sparse_residency {
++        want.push(Capability::SparseResidency);
++    }
+     // `Sampled1D`/`SampledBuffer` cover a SAMPLED image of that dimensionality; `Image1D`/
+     // `ImageBuffer` cover a storage one. They are separate capabilities, so a module holding only a
+     // storage image of that shape needs only the storage one. Asking for the sampled capability
+diff --git a/src/passes/resources/gpu_arguments.rs b/src/passes/resources/gpu_arguments.rs
+index 590e160..63efe7d 100644
+--- a/src/passes/resources/gpu_arguments.rs
++++ b/src/passes/resources/gpu_arguments.rs
+@@ -379,7 +379,10 @@ fn uniform_control_sidecar(
+             .ok_or("source sampling coordinate names an unknown sample")?;
+         if !matches!(
+             sample.class.opcode,
+-            Op::ImageSampleImplicitLod | Op::ImageSampleDrefImplicitLod
++            Op::ImageSampleImplicitLod
++                | Op::ImageSampleDrefImplicitLod
++                | Op::ImageSparseSampleImplicitLod
++                | Op::ImageSparseSampleDrefImplicitLod
+         ) {
+             return Err("source sampling coordinate does not name an implicit sample".into());
+         }
+diff --git a/src/passes/resources/quad_sampling.rs b/src/passes/resources/quad_sampling.rs
+index 5f95979..5e196c6 100644
+--- a/src/passes/resources/quad_sampling.rs
++++ b/src/passes/resources/quad_sampling.rs
+@@ -128,7 +128,14 @@ pub(in crate::passes) fn lower_argument_implicit_lod(ctx: &mut Ctx) -> Result<()
+                 let (opcode, operands) = match inst.class.opcode {
+                     Op::ImageSampleImplicitLod => (Op::ImageSampleExplicitLod, 2),
+                     Op::ImageSampleDrefImplicitLod => (Op::ImageSampleDrefExplicitLod, 3),
+-                    Op::ImageSampleProjImplicitLod | Op::ImageSampleProjDrefImplicitLod
++                    Op::ImageSparseSampleImplicitLod => (Op::ImageSparseSampleExplicitLod, 2),
++                    Op::ImageSparseSampleDrefImplicitLod => {
++                        (Op::ImageSparseSampleDrefExplicitLod, 3)
++                    }
++                    Op::ImageSampleProjImplicitLod
++                    | Op::ImageSampleProjDrefImplicitLod
++                    | Op::ImageSparseSampleProjImplicitLod
++                    | Op::ImageSparseSampleProjDrefImplicitLod
+                         if inst.operands.first().is_some_and(|operand| {
+                             matches!(operand, Operand::IdRef(sampled) if nonuniform.contains(sampled))
+                         }) =>
+diff --git a/src/passes/resources/query_select.rs b/src/passes/resources/query_select.rs
+index 1aa546f..523de3f 100644
+--- a/src/passes/resources/query_select.rs
++++ b/src/passes/resources/query_select.rs
+@@ -281,6 +281,14 @@ fn is_duplicable_resource_use(inst: &Instruction, id: Word) -> bool {
+             | Op::ImageSampleDrefImplicitLod
+             | Op::ImageSampleDrefExplicitLod
+             | Op::ImageRead
++            | Op::ImageSparseFetch
++            | Op::ImageSparseGather
++            | Op::ImageSparseDrefGather
++            | Op::ImageSparseSampleImplicitLod
++            | Op::ImageSparseSampleExplicitLod
++            | Op::ImageSparseSampleDrefImplicitLod
++            | Op::ImageSparseSampleDrefExplicitLod
++            | Op::ImageSparseRead
+     ) && inst.operands.first() == Some(&Operand::IdRef(id))
+         && inst
+             .operands

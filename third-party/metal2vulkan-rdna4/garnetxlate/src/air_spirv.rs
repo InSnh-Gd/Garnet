@@ -516,6 +516,12 @@ pub fn trim_meta_with_buffer_address_mode(
     if let Some(tessellation) = m.get("tessellation").filter(|t| !t.is_null()) {
         put(&mut out, "tessellation", tessellation);
     }
+    if let Some(vft) = m
+        .get("visible_function_tables")
+        .filter(|vft| !vft.is_null())
+    {
+        put(&mut out, "visible_function_tables", vft);
+    }
     if let Some(proof) = m
         .get("uniform_control_proof")
         .filter(|proof| !proof.is_null())

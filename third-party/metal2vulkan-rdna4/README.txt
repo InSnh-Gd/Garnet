@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0072).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0075).
 
 Verification and Tier 2 Scope
 =============================
@@ -17,6 +17,43 @@ version 2). Patch-level SPIR-V, wrapper, and host/mock checks verify
 translation and metadata invariants only; they do not establish physical RDNA4
 GPU execution or complete Tier 2 acceptance. Runtime capability/execution gating
 stays controlled by the native bundle and compatibility runner.
+
+0075-metal3-sparse-prt-residency.patch adds Sparse / PRT residency predicate
+lowering across `passes/air_calls/images/{resolve,sample,sample_depth,read,
+cube_read,gather,query_offset,sampler_coordinates,mod}.rs`, `passes/mod.rs`,
+`passes/image_facts.rs`, `passes/module_cleanup.rs`, and
+`passes/resources/query_select.rs`. MSL `sparse_color<T>` texture
+`sample`/`read`/`gather` (explicit `.sparse.` AIR names OR live member-1
+residency uses on `{ texel, i8 }` structs, including propagation through
+`select`/`phi`/`alloca`) lower to SPIR-V `OpImageSparseSampleImplicitLod`,
+`OpImageSparseSampleExplicitLod`, `OpImageSparseSampleDref*`,
+`OpImageSparseFetch`, `OpImageSparseRead`, `OpImageSparseGather`, and
+`OpImageSparseDrefGather` paired with `OpImageSparseTexelsResident`, emitting
+`OpCapability SparseResidency` only when sparse residency is actually used.
+
+0074-metal3-visible-function-tables.patch adds runtime `MTLVisibleFunctionTable`
+bounded switch-table dispatch in `linked_functions.rs` and `lib.rs` across
+compute, vertex, and fragment stages (`specialize_linked_module_with_vft`,
+`RuntimeVisibleFunctionTableInfo`). Table parameters (`!"air.visible_function_table"`)
+lower to read-only `StorageBuffer` (`uint32_t[]`: `word[0] = slot_count`,
+`word[1 + slot] = handle_id` with `0` = null and `1..=N` sorted deterministically
+by symbol name), bounds-checking negative/OOB/empty indices safely to handle `0`
+and lowering indirect calls to `@metal2vulkan.vft.dispatch.<k>` bounded
+`OpSwitch` with safe zero/`ret void` default (never `OpUnreachable`).
+`garnetxlate` exposes the resolved descriptor binding and deterministic handle
+map in trimmed reflection JSON under `"visible_function_tables"` (`abi_version=1`,
+`header_words=1`) only when runtime VFTs are present.
+
+0073-metal3-dynamic-library-linking.patch adds `MTLDynamicLibrary` external
+symbol enumeration (`exported_symbols`) and transitive multi-library linking
+(`link_dynamic_libraries`, `DynamicLibraryModule`) across compute, vertex, and
+fragment stages in `linked_functions.rs` and `lib.rs`, renaming colliding
+`internal`/`private` helpers and globals, validating caller `declare` vs
+provider `define` signatures, and refusing missing, mismatched, or conflicting
+exports with descriptive errors naming the symbol. `garnetxlate` exports
+`garnetx_list_exported_symbols` and `garnetx_translate_linked_libraries`
+(declared in `garnetxlate/garnetxlate.h`, keeping `garnetx_abi_version() == 3`
+and all ABI 2/3 entry points unchanged).
 
 0072-metal3-compute-icb-gpu-lowering.patch extends GPU ICB lowering in
 `ops/icb.rs` and `air_intrinsics.rs` to lower Compute ICB intrinsics
