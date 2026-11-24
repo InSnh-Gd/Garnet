@@ -6,30 +6,146 @@ import GarnetCore
 #endif
 
 @main
-struct GarnetInstallerApp: App {
-    @StateObject private var model = GarnetAppModel()
+@MainActor
+final class GarnetAppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
+    private var window: NSWindow?
+    private var splitViewController: NSSplitViewController?
+    private let model = GarnetAppModel()
 
-    var body: some Scene {
-        WindowGroup("Garnet RDNA 4 Driver Manager") {
-            MainContentView(model: model)
-                .frame(minWidth: 880, minHeight: 620)
-        }
-        .windowResizability(.contentSize)
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = GarnetAppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        app.run()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildMainMenu()
+        showMainWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        model.refreshAll()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    private func showMainWindow() {
+        let sidebarVC = NSHostingController(rootView: SidebarView(model: model))
+        sidebarVC.sizingOptions = []
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
+        sidebarItem.minimumThickness = 190
+        sidebarItem.maximumThickness = 260
+        sidebarItem.preferredThicknessFraction = 0.22
+        sidebarItem.canCollapse = true
+        sidebarItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView
+        sidebarItem.allowsFullHeightLayout = true
+        sidebarItem.titlebarSeparatorStyle = .none
+
+        let detailVC = NSHostingController(rootView: DetailView(model: model))
+        detailVC.sizingOptions = []
+        let detailItem = NSSplitViewItem(viewController: detailVC)
+        detailItem.minimumThickness = 520
+        detailItem.titlebarSeparatorStyle = .automatic
+
+        let svc = NSSplitViewController()
+        svc.addSplitViewItem(sidebarItem)
+        svc.addSplitViewItem(detailItem)
+        self.splitViewController = svc
+
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "Garnet"
+        win.minSize = NSSize(width: 760, height: 580)
+        win.toolbarStyle = .unified
+        win.contentViewController = svc
+
+        let toolbar = NSToolbar(identifier: "GarnetMainToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        win.toolbar = toolbar
+
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        self.window = win
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.toggleSidebar, .sidebarTrackingSeparator]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.toggleSidebar, .sidebarTrackingSeparator]
+    }
+
+    private func buildMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About Garnet", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Garnet", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Garnet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        let viewMenuItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        let toggleItem = viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(NSSplitViewController.toggleSidebar(_:)), keyEquivalent: "s")
+        toggleItem.keyEquivalentModifierMask = [.command, .control]
+        viewMenuItem.submenu = viewMenu
+        mainMenu.addItem(viewMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
     }
 }
 
-struct MainContentView: View {
+struct SidebarView: View {
     @ObservedObject var model: GarnetAppModel
 
     var body: some View {
-        NavigationSplitView {
-            List(GarnetSection.allCases, selection: $model.selectedSection) { sec in
-                Label(sec.title, systemImage: sec.systemImage)
-                    .tag(sec)
-            }
-            .navigationTitle("Garnet")
-            .frame(minWidth: 210)
-        } detail: {
+        List(GarnetSection.allCases, selection: $model.selectedSection) { sec in
+            Label(sec.title, systemImage: sec.systemImage)
+                .tag(sec)
+        }
+        .listStyle(.sidebar)
+    }
+}
+
+struct DetailView: View {
+    @ObservedObject var model: GarnetAppModel
+
+    var body: some View {
+        Group {
             switch model.selectedSection ?? .install {
             case .install:
                 InstallView(model: model)
@@ -39,9 +155,7 @@ struct MainContentView: View {
                 StatusTroubleshootView(model: model)
             }
         }
-        .onAppear {
-            model.refreshAll()
-        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
