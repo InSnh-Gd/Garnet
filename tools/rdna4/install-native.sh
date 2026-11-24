@@ -401,7 +401,7 @@ remove_legacy "$backup"
 ensure_dir "$R/private/tmp/rdna4m"
 ensure_dir "$R/private/var/tmp/rdna4m-spv"
 chown root:wheel "$R/private/tmp/rdna4m"; chmod 1777 "$R/private/tmp/rdna4m"
-chown nobody:nobody "$R/private/var/tmp/rdna4m-spv"; chmod 755 "$R/private/var/tmp/rdna4m-spv"
+chown -hR nobody:nobody "$R/private/var/tmp/rdna4m-spv"; chmod 755 "$R/private/var/tmp/rdna4m-spv"
 for path in "$R/Library/Logs/RDNA4Translate/translate.stdout" "$R/Library/Logs/RDNA4Translate/translate.stderr"; do
     [ ! -L "$path" ] || fail "Refusing symbolic-link translator log: $path"
     touch "$path"; chown nobody:nobody "$path"; chmod 644 "$path"

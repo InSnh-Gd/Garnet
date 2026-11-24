@@ -461,7 +461,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "output must be a real directory owned by the service uid\n"); return 1;
         }
         close(out);
-        if (!privateDirectory(STATE)) return 1;
+        if (!privateDirectory(STATE)) {
+            fprintf(stderr, "private state directory %s/%s must be mode 0700 owned by service uid\n", output, STATE);
+            return 1;
+        }
         int lock = open(STATE "/service.lock", O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
         struct stat st;
         if (lock < 0 || fstat(lock, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
