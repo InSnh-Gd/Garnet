@@ -1,4 +1,5 @@
 // cc -std=c11 -O2 -Wall -Wextra -Werror test-devcaps.c -o /tmp/test-devcaps && /tmp/test-devcaps
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "rdna4_devcaps.h"
@@ -186,6 +187,165 @@ int main(void) {
                 }
     }
     CHECK("2,883,584 asymmetric workgroup shapes match independent axis/product bounds", violations == 0);
+
+    // ---- Metal 3 capability defaults, gating, and limit clamping ----
+    {
+        rdna4dc_metal3_caps zero = rdna4dc_metal3_fallback();
+        CHECK("pre-open fallback keeps all Metal 3 capabilities conservatively off",
+            memcmp(&fallback.metal3, &zero, sizeof zero) == 0 &&
+            memcmp(&cold.metal3, &zero, sizeof zero) == 0 &&
+            !rdna4dc_metal3_barycentric_ok(&fallback.metal3) &&
+            !rdna4dc_metal3_pull_model_ok(&fallback.metal3) &&
+            !rdna4dc_metal3_atomic_float_ok(&fallback.metal3) &&
+            !rdna4dc_metal3_atomic_int64_ok(&fallback.metal3) &&
+            !rdna4dc_metal3_mesh_supported(&fallback.metal3) &&
+            !rdna4dc_metal3_mesh_payload_ok(&fallback.metal3, 0) &&
+            !rdna4dc_metal3_mesh_grid_ok(&fallback.metal3, 1, 1, 1) &&
+            !rdna4dc_metal3_object_grid_ok(&fallback.metal3, 1, 1, 1) &&
+            !rdna4dc_metal3_raytracing_supported(&fallback.metal3) &&
+            !rdna4dc_metal3_timestamps_supported(&fallback.metal3) &&
+            !rdna4dc_metal3_sparse_buffer_ok(&fallback.metal3) &&
+            !rdna4dc_metal3_sparse_texture_ok(&fallback.metal3));
+        CHECK("NULL probe and unprobed properties stay conservatively off",
+            memcmp(&(rdna4dc_metal3_caps){0}, &(rdna4dc_caps){0}.metal3, sizeof zero) == 0 &&
+            !rdna4dc_metal3_mesh_supported(NULL) && !rdna4dc_metal3_raytracing_supported(NULL) &&
+            !rdna4dc_metal3_timestamps_supported(NULL) && !rdna4dc_metal3_sparse_texture_ok(NULL) &&
+            memcmp(&c.metal3, &zero, sizeof zero) == 0);
+
+        rdna4dc_metal3_probe mp = {
+            .api_1_2 = 1, .shader_int64 = 1, .buffer_device_address = 1, .sample_rate_shading = 1,
+            .ext_barycentric = 1, .feat_barycentric = 1,
+            .ext_atomic_float = 1, .feat_atomic_float_buffer = 1, .feat_atomic_float_buffer_add = 1,
+            .feat_atomic_float_shared = 1, .feat_atomic_float_shared_add = 1,
+            .feat_atomic_float_image = 1, .feat_atomic_float_image_add = 1,
+            .ext_atomic_float2 = 1, .feat_atomic_float_buffer_minmax = 1, .feat_atomic_float_shared_minmax = 1,
+            .ext_atomic_int64 = 1, .feat_atomic_int64_buffer = 1, .feat_atomic_int64_shared = 1,
+            .ext_mesh_shader = 1, .feat_task_shader = 1, .feat_mesh_shader = 1,
+            .mesh_max_payload_bytes = 65536u,
+            .object_max_workgroup_count = { 65535u, 65535u, 65535u },
+            .object_max_workgroup_total_count = 4194304u, .object_max_workgroup_invocations = 2048u,
+            .mesh_max_workgroup_count = { 65535u, 65535u, 65535u },
+            .mesh_max_workgroup_total_count = 4194304u, .mesh_max_workgroup_invocations = 2048u,
+            .mesh_max_output_vertices = 512u, .mesh_max_output_primitives = 1024u,
+            .ext_deferred_host_ops = 1, .ext_accel_struct = 1, .feat_accel_struct = 1,
+            .feat_accel_indirect_build = 1, .feat_accel_uab = 1,
+            .rt_min_scratch_alignment = 128u, .rt_max_geometries = 1u << 24,
+            .rt_max_instances = 1u << 24, .rt_max_primitives = 1u << 29,
+            .ext_ray_query = 1, .feat_ray_query = 1,
+            .timestamp_query_funcs = 1, .timestamp_compute_and_graphics = 1,
+            .timestamp_period_ns = 10.0f, .timestamp_valid_bits = 64u,
+            .sparse_queue = 1, .sparse_bind_func = 1,
+            .sparse_binding = 1, .sparse_residency_buffer = 1,
+            .sparse_residency_image_2d = 1, .sparse_residency_image_3d = 1,
+            .sparse_residency_2_samples = 1, .sparse_residency_4_samples = 1,
+            .sparse_residency_8_samples = 1, .sparse_residency_aliased = 1
+        };
+        p.metal3 = &mp;
+        rdna4dc_caps m3c = rdna4dc_from_properties(&p);
+        const rdna4dc_metal3_caps *m = &m3c.metal3;
+        CHECK("probed Metal 3 features gate on cleanly",
+            rdna4dc_metal3_barycentric_ok(m) && rdna4dc_metal3_pull_model_ok(m) &&
+            rdna4dc_metal3_atomic_float_ok(m) && m->atomic_float_image && m->atomic_float_minmax &&
+            rdna4dc_metal3_atomic_int64_ok(m) && rdna4dc_metal3_mesh_supported(m) &&
+            rdna4dc_metal3_raytracing_supported(m) && m->accel_indirect_build && m->accel_uab &&
+            m->rt_min_scratch_alignment == 128u && rdna4dc_metal3_timestamps_supported(m) &&
+            m->timestamp_compute_and_graphics && m->timestamp_valid_bits == 64u &&
+            m->timestamp_period_ns == 10.0f && rdna4dc_metal3_sparse_buffer_ok(m) &&
+            rdna4dc_metal3_sparse_texture_ok(m) && m->sparse_residency_image_3d && m->sparse_residency_aliased);
+        CHECK("oversized mesh payload, invocations, vertices, and primitives clamp to Metal 3 ceilings",
+            m->mesh_max_payload_bytes == RDNA4DC_MESH_MAX_PAYLOAD_BYTES &&
+            m->object_max_workgroup_invocations == RDNA4DC_MESH_MAX_INVOCATIONS &&
+            m->mesh_max_workgroup_invocations == RDNA4DC_MESH_MAX_INVOCATIONS &&
+            m->mesh_max_output_vertices == RDNA4DC_MESH_MAX_VERTICES &&
+            m->mesh_max_output_primitives == RDNA4DC_MESH_MAX_PRIMITIVES);
+        CHECK("mesh payload and grid bounds check exact edges without overflow",
+            rdna4dc_metal3_mesh_payload_ok(m, 0) &&
+            rdna4dc_metal3_mesh_payload_ok(m, RDNA4DC_MESH_MAX_PAYLOAD_BYTES) &&
+            !rdna4dc_metal3_mesh_payload_ok(m, RDNA4DC_MESH_MAX_PAYLOAD_BYTES + 1u) &&
+            rdna4dc_metal3_mesh_grid_ok(m, 1024, 1, 1) &&
+            rdna4dc_metal3_object_grid_ok(m, 64, 64, 1024) &&
+            !rdna4dc_metal3_mesh_grid_ok(m, 0, 1, 1) &&
+            !rdna4dc_metal3_mesh_grid_ok(m, 65536, 1, 1) &&
+            !rdna4dc_metal3_mesh_grid_ok(m, UINT64_MAX, UINT64_MAX, UINT64_MAX));
+
+        rdna4dc_metal3_probe sub = mp;
+        sub.mesh_max_payload_bytes = 8192u;
+        rdna4dc_metal3_caps mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("undersized mesh payload is preserved honestly and fails Metal 3 mesh gate",
+            mc.mesh_max_payload_bytes == 8192u && !rdna4dc_metal3_mesh_supported(&mc) &&
+            rdna4dc_metal3_mesh_payload_ok(&mc, 8192u) && !rdna4dc_metal3_mesh_payload_ok(&mc, 8193u));
+
+        sub = mp; sub.mesh_max_workgroup_total_count = 512u;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("mesh axes clamp to total count and grids < 1024 fail Metal 3 mesh gate",
+            mc.mesh_max_workgroup_count[0] == 512u && !rdna4dc_metal3_mesh_supported(&mc) &&
+            rdna4dc_metal3_mesh_grid_ok(&mc, 512, 1, 1) && !rdna4dc_metal3_mesh_grid_ok(&mc, 513, 1, 1));
+
+        sub = mp; sub.feat_task_shader = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("missing taskShader zeroes object/payload limits while keeping mesh-only grid",
+            mc.mesh_shader && !mc.object_shader && !mc.mesh_max_payload_bytes &&
+            !mc.object_max_workgroup_total_count && !rdna4dc_metal3_mesh_supported(&mc) &&
+            !rdna4dc_metal3_mesh_payload_ok(&mc, 0) && rdna4dc_metal3_mesh_grid_ok(&mc, 1024, 1, 1));
+
+        sub = mp; sub.ext_mesh_shader = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("missing VK_EXT_mesh_shader zeroes every mesh and object limit",
+            !mc.mesh_shader && !mc.object_shader && !mc.mesh_max_payload_bytes &&
+            !mc.mesh_max_workgroup_total_count && !mc.mesh_max_output_vertices);
+
+        sub = mp; sub.ext_deferred_host_ops = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("ray tracing fails closed without VK_KHR_deferred_host_operations",
+            !mc.deferred_host_ops && !mc.acceleration_structure && !mc.ray_query &&
+            !mc.rt_min_scratch_alignment && !rdna4dc_metal3_raytracing_supported(&mc));
+
+        sub = mp; sub.buffer_device_address = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("ray tracing fails closed without bufferDeviceAddress",
+            !mc.acceleration_structure && !mc.ray_query && !rdna4dc_metal3_raytracing_supported(&mc));
+
+        sub = mp; sub.feat_accel_struct = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("ray_query fails closed without accelerationStructure",
+            !mc.acceleration_structure && !mc.ray_query && !rdna4dc_metal3_raytracing_supported(&mc));
+
+        sub = mp; sub.ext_barycentric = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("barycentric requires both extension and feature", !rdna4dc_metal3_barycentric_ok(&mc));
+        sub = mp; sub.feat_atomic_float_buffer_add = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("atomic_float_buffer requires both atomics and atomicAdd", !mc.atomic_float_buffer && !rdna4dc_metal3_atomic_float_ok(&mc));
+        sub = mp; sub.ext_atomic_float = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("atomic_float2 minmax fails closed without VK_EXT_shader_atomic_float", !mc.atomic_float_minmax && !rdna4dc_metal3_atomic_float_ok(&mc));
+        sub = mp; sub.shader_int64 = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("atomic_int64 fails closed without shaderInt64", !rdna4dc_metal3_atomic_int64_ok(&mc));
+
+        const float bad_periods[] = { 0.0f, -1.0f, 1e9f, (float)NAN, (float)INFINITY };
+        int bad_ts_ok = 1;
+        for (size_t i = 0; i < sizeof bad_periods / sizeof bad_periods[0]; i++) {
+            sub = mp; sub.timestamp_period_ns = bad_periods[i];
+            mc = rdna4dc_metal3_from_probe(&sub);
+            if (rdna4dc_metal3_timestamps_supported(&mc) || mc.timestamp_valid_bits) bad_ts_ok = 0;
+        }
+        sub = mp; sub.timestamp_valid_bits = 0u; mc = rdna4dc_metal3_from_probe(&sub);
+        bad_ts_ok &= !rdna4dc_metal3_timestamps_supported(&mc);
+        sub = mp; sub.timestamp_valid_bits = 65u; mc = rdna4dc_metal3_from_probe(&sub);
+        bad_ts_ok &= !rdna4dc_metal3_timestamps_supported(&mc);
+        sub = mp; sub.timestamp_query_funcs = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        bad_ts_ok &= !rdna4dc_metal3_timestamps_supported(&mc);
+        CHECK("invalid timestamp period, validBits, or missing query funcs fail closed", bad_ts_ok);
+
+        sub = mp; sub.sparse_binding = 0;
+        mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("sparse residency flags fail closed when sparseBinding is false",
+            !mc.sparse_binding && !mc.sparse_residency_buffer && !mc.sparse_residency_image_2d &&
+            !mc.sparse_residency_image_3d && !mc.sparse_residency_aliased);
+        sub = mp; sub.sparse_queue = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("sparse fails closed without a sparse-capable queue", !mc.sparse_binding && !rdna4dc_metal3_sparse_texture_ok(&mc));
+        sub = mp; sub.sparse_bind_func = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("sparse fails closed without vkQueueBindSparse", !mc.sparse_binding && !rdna4dc_metal3_sparse_buffer_ok(&mc));
+        p.metal3 = NULL;
+    }
+
     printf("%u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }

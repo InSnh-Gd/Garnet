@@ -61,6 +61,13 @@ static struct {
     BOOL uniformTexelBuffers, storageTexelBuffers;
     VkPhysicalDeviceVulkan12Properties descriptorLimits;
     uint32_t maxPerSetDescriptors;
+    BOOL barycentric, atomicFloat, atomicFloat2, atomicInt64;
+    BOOL meshShader, objectShader;
+    BOOL deferredHostOps, accelStruct, rayQuery;
+    BOOL timestampQuery, timestampComputeAndGraphics;
+    float timestampPeriod;
+    uint32_t timestampValidBits;
+    BOOL sparseBinding, sparseResidencyBuffer, sparseResidencyImage2D, sparseResidencyImage3D;
 } RDNA4R;
 
 /*
@@ -230,6 +237,9 @@ static rdna4x_backend_capabilities rdna4_query_caps(void) {
 static rdna4dc_caps rdna4_device_caps(void) {
     if (atomic_load_explicit(&rdna4_caps_ready, memory_order_acquire)) return RDNA4Caps;
     return rdna4dc_fallback();
+}
+static inline rdna4dc_metal3_caps rdna4_metal3_caps(void) {
+    return rdna4_device_caps().metal3;
 }
 static rdna4_gather_caps RDNA4GatherCaps;
 static _Atomic int rdna4_gather_caps_ready;
@@ -544,6 +554,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .shaderDemoteToHelperInvocation = supported13.shaderDemoteToHelperInvocation };
         VkPhysicalDeviceVulkan12Features enabled12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &enabled13,
             .samplerMirrorClampToEdge = supported12.samplerMirrorClampToEdge,
+            .shaderBufferInt64Atomics = pf.shaderInt64 && supported12.shaderBufferInt64Atomics,
+            .shaderSharedInt64Atomics = pf.shaderInt64 && supported12.shaderSharedInt64Atomics,
             .shaderFloat16 = supported12.shaderFloat16, .shaderInt8 = supported12.shaderInt8,
             .storageBuffer8BitAccess = supported12.storageBuffer8BitAccess,
             .uniformAndStorageBuffer8BitAccess = supported12.uniformAndStorageBuffer8BitAccess,
@@ -667,8 +679,26 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
         VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragInterlockFeat = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT };
+        VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR baryFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR };
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloatFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT };
+        VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomicFloat2Feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT };
+        VkPhysicalDeviceMeshShaderFeaturesEXT meshFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+        VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+        VkPhysicalDeviceMeshShaderPropertiesEXT meshProps = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR accelProps = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
         const char *orderedColorExt = NULL;
         BOOL hasDrmMod = NO, hasMemoryBudget = NO, hasSampleLoc = NO, hasInterlock = NO;
+        BOOL hasBarycentric = NO, hasAtomicFloat = NO, hasAtomicFloat2 = NO, hasAtomicInt64 = NO;
+        BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO;
         {
             uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, NULL);
             VkExtensionProperties *ex = calloc(ne ? ne : 1, sizeof *ex); vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, ex);
@@ -684,6 +714,14 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasSampleLoc |= !strcmp(ex[i].extensionName, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
                 hasInterlock |= !strcmp(ex[i].extensionName, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
                 hasNull |= !strcmp(ex[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+                hasBarycentric |= !strcmp(ex[i].extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+                hasAtomicFloat |= !strcmp(ex[i].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+                hasAtomicFloat2 |= !strcmp(ex[i].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
+                hasAtomicInt64 |= !strcmp(ex[i].extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+                hasMeshShader |= !strcmp(ex[i].extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+                hasDeferredHostOps |= !strcmp(ex[i].extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+                hasAccelStruct |= !strcmp(ex[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+                hasRayQuery |= !strcmp(ex[i].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME);
                 hasRO |= !strcmp(ex[i].extensionName, "VK_EXT_rasterization_order_attachment_access") || !strcmp(ex[i].extensionName, "VK_ARM_rasterization_order_attachment_access");
                 if (!strcmp(ex[i].extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
                 else if (!orderedColorExt && !strcmp(ex[i].extensionName, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
@@ -692,23 +730,40 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasDR |= !strcmp(ex[i].extensionName, "VK_KHR_dynamic_rendering");
             }
             free(ex);
-            if (hasInterlock) supportedNull.pNext = &fragInterlockFeat;
-            if (hasNull) orderedColor.pNext = &supportedNull;
-            else if (hasInterlock) orderedColor.pNext = &fragInterlockFeat;
             VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &orderedColor };
-            VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &flr };
+            void *f2Next = &flr;
+            if (hasNull) { supportedNull.pNext = f2Next; f2Next = &supportedNull; }
+            if (hasInterlock) { fragInterlockFeat.pNext = f2Next; f2Next = &fragInterlockFeat; }
+            if (hasBarycentric) { baryFeat.pNext = f2Next; f2Next = &baryFeat; }
+            if (hasAtomicFloat) { atomicFloatFeat.pNext = f2Next; f2Next = &atomicFloatFeat; }
+            if (hasAtomicFloat2) { atomicFloat2Feat.pNext = f2Next; f2Next = &atomicFloat2Feat; }
+            if (hasMeshShader) { meshFeat.pNext = f2Next; f2Next = &meshFeat; }
+            if (hasAccelStruct) { accelFeat.pNext = f2Next; f2Next = &accelFeat; }
+            if (hasRayQuery) { rayQueryFeat.pNext = f2Next; f2Next = &rayQueryFeat; }
+            VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = f2Next };
             if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(RDNA4R.pd, &f2);
             RDNA4LOG("radv: framebuffer-fetch support: rasterization_order_attachment_access ext %d (color feature %d, depth %d, stencil %d); dynamic_rendering_local_read ext %d (feature %d); attachment_feedback_loop_layout ext %d; dynamic_rendering ext %d; classic render-pass input attachments: core 1.0",
                    hasRO, orderedColor.rasterizationOrderColorAttachmentAccess, orderedColor.rasterizationOrderDepthAttachmentAccess, orderedColor.rasterizationOrderStencilAttachmentAccess, hasLR, flr.dynamicRenderingLocalRead, hasFL, hasDR);
             orderedColor.pNext = NULL;
             supportedNull.pNext = NULL;
             fragInterlockFeat.pNext = NULL;
+            baryFeat.pNext = NULL;
+            atomicFloatFeat.pNext = NULL;
+            atomicFloat2Feat.pNext = NULL;
+            meshFeat.pNext = NULL;
+            accelFeat.pNext = NULL;
+            rayQueryFeat.pNext = NULL;
             if (vkGetPhysicalDeviceProperties2 && pp.apiVersion >= VK_API_VERSION_1_2) {
                 VkPhysicalDeviceSampleLocationsPropertiesEXT slp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT };
-                VkPhysicalDeviceDepthStencilResolveProperties dsr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES,
-                    .pNext = hasSampleLoc ? &slp : NULL };
-                VkPhysicalDeviceProperties2 p2b = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dsr };
+                VkPhysicalDeviceDepthStencilResolveProperties dsr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES };
+                void *p2bNext = &dsr;
+                if (hasSampleLoc) { slp.pNext = p2bNext; p2bNext = &slp; }
+                if (hasMeshShader) { meshProps.pNext = p2bNext; p2bNext = &meshProps; }
+                if (hasAccelStruct) { accelProps.pNext = p2bNext; p2bNext = &accelProps; }
+                VkPhysicalDeviceProperties2 p2b = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = p2bNext };
                 vkGetPhysicalDeviceProperties2(RDNA4R.pd, &p2b);
+                meshProps.pNext = NULL;
+                accelProps.pNext = NULL;
                 RDNA4R.depthResolveModes = dsr.supportedDepthResolveModes;
                 RDNA4R.stencilResolveModes = dsr.supportedStencilResolveModes;
                 RDNA4R.dsResolveIndep = dsr.independentResolve != VK_FALSE;
@@ -722,7 +777,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 }
             }
         }
-        const char *devExts[12]; uint32_t devExtCount = 0;
+        const char *devExts[24]; uint32_t devExtCount = 0;
         if (RDNA4R.hostExt) devExts[devExtCount++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
         if (hasSampleLoc) devExts[devExtCount++] = VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
         RDNA4R.orderedColorAccess = orderedColorExt && orderedColor.rasterizationOrderColorAttachmentAccess;
@@ -750,6 +805,87 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             fragInterlockFeat.pNext = enabled13.pNext;
             enabled13.pNext = &fragInterlockFeat;
             devExts[devExtCount++] = VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR enabledBary = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
+            .fragmentShaderBarycentric = hasBarycentric && baryFeat.fragmentShaderBarycentric };
+        if (enabledBary.fragmentShaderBarycentric) {
+            enabledBary.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledBary;
+            devExts[devExtCount++] = VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enabledAtomicFloat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+            .shaderBufferFloat32Atomics = hasAtomicFloat && atomicFloatFeat.shaderBufferFloat32Atomics,
+            .shaderBufferFloat32AtomicAdd = hasAtomicFloat && atomicFloatFeat.shaderBufferFloat32AtomicAdd,
+            .shaderSharedFloat32Atomics = hasAtomicFloat && atomicFloatFeat.shaderSharedFloat32Atomics,
+            .shaderSharedFloat32AtomicAdd = hasAtomicFloat && atomicFloatFeat.shaderSharedFloat32AtomicAdd,
+            .shaderImageFloat32Atomics = hasAtomicFloat && atomicFloatFeat.shaderImageFloat32Atomics,
+            .shaderImageFloat32AtomicAdd = hasAtomicFloat && atomicFloatFeat.shaderImageFloat32AtomicAdd };
+        BOOL enableAtomicFloat = enabledAtomicFloat.shaderBufferFloat32Atomics ||
+            enabledAtomicFloat.shaderBufferFloat32AtomicAdd || enabledAtomicFloat.shaderSharedFloat32Atomics ||
+            enabledAtomicFloat.shaderSharedFloat32AtomicAdd || enabledAtomicFloat.shaderImageFloat32Atomics ||
+            enabledAtomicFloat.shaderImageFloat32AtomicAdd;
+        if (enableAtomicFloat) {
+            enabledAtomicFloat.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledAtomicFloat;
+            devExts[devExtCount++] = VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT enabledAtomicFloat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
+            .shaderBufferFloat32AtomicMinMax = enableAtomicFloat && hasAtomicFloat2 && atomicFloat2Feat.shaderBufferFloat32AtomicMinMax,
+            .shaderSharedFloat32AtomicMinMax = enableAtomicFloat && hasAtomicFloat2 && atomicFloat2Feat.shaderSharedFloat32AtomicMinMax,
+            .shaderImageFloat32AtomicMinMax = enableAtomicFloat && hasAtomicFloat2 && atomicFloat2Feat.shaderImageFloat32AtomicMinMax };
+        BOOL enableAtomicFloat2 = enabledAtomicFloat2.shaderBufferFloat32AtomicMinMax ||
+            enabledAtomicFloat2.shaderSharedFloat32AtomicMinMax || enabledAtomicFloat2.shaderImageFloat32AtomicMinMax;
+        if (enableAtomicFloat2) {
+            enabledAtomicFloat2.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledAtomicFloat2;
+            devExts[devExtCount++] = VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceMeshShaderFeaturesEXT enabledMesh = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+            .taskShader = pp.apiVersion >= VK_API_VERSION_1_2 && hasMeshShader && meshFeat.meshShader && meshFeat.taskShader,
+            .meshShader = pp.apiVersion >= VK_API_VERSION_1_2 && hasMeshShader && meshFeat.meshShader };
+        if (enabledMesh.meshShader) {
+            enabledMesh.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledMesh;
+            devExts[devExtCount++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+        }
+        BOOL enableAccel = pp.apiVersion >= VK_API_VERSION_1_2 && enabled12.bufferDeviceAddress &&
+            hasDeferredHostOps && hasAccelStruct && accelFeat.accelerationStructure;
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR enabledAccel = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+            .accelerationStructure = enableAccel,
+            .accelerationStructureIndirectBuild = enableAccel && accelFeat.accelerationStructureIndirectBuild,
+            .descriptorBindingAccelerationStructureUpdateAfterBind = enableAccel && enabled12.descriptorIndexing &&
+                accelFeat.descriptorBindingAccelerationStructureUpdateAfterBind };
+        if (enableAccel) {
+            enabledAccel.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledAccel;
+            devExts[devExtCount++] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+            devExts[devExtCount++] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceRayQueryFeaturesKHR enabledRayQuery = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+            .rayQuery = enableAccel && hasRayQuery && rayQueryFeat.rayQuery };
+        if (enabledRayQuery.rayQuery) {
+            enabledRayQuery.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledRayQuery;
+            devExts[devExtCount++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+        }
+        BOOL hasSparseQueue = (qf[qfi].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
+        BOOL hasBindSparse = rdna4_gipa(RDNA4R.inst, "vkQueueBindSparse") != NULL;
+        if (pf.sparseBinding && hasSparseQueue && hasBindSparse) {
+            ef.sparseBinding = VK_TRUE;
+            ef.sparseResidencyBuffer = pf.sparseResidencyBuffer;
+            ef.sparseResidencyImage2D = pf.sparseResidencyImage2D;
+            ef.sparseResidencyImage3D = pf.sparseResidencyImage3D;
+            ef.sparseResidency2Samples = pf.sparseResidency2Samples;
+            ef.sparseResidency4Samples = pf.sparseResidency4Samples;
+            ef.sparseResidency8Samples = pf.sparseResidency8Samples;
+            ef.sparseResidency16Samples = pf.sparseResidency16Samples;
+            ef.sparseResidencyAliased = pf.sparseResidencyAliased;
         }
         RDNA4LOG("radv: fragment shader pixel interlock %s", RDNA4R.fragInterlock ? "enabled" : "unavailable");
         RDNA4LOG("radv: null descriptors %s", RDNA4R.nullDescriptors ? "enabled" : "unavailable (typed dummy images)");
@@ -796,11 +932,73 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             heaps[i].size = RDNA4R.mp.memoryHeaps[i].size;
             heaps[i].device_local = (RDNA4R.mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
         }
+        BOOL hasWriteTimestamp = (rdna4_gipa(RDNA4R.inst, "vkCmdWriteTimestamp2") != NULL ||
+                                  rdna4_gipa(RDNA4R.inst, "vkCmdWriteTimestamp") != NULL);
+        rdna4dc_metal3_probe m3probe = {
+            .api_1_2 = pp.apiVersion >= VK_API_VERSION_1_2,
+            .shader_int64 = ef.shaderInt64 != VK_FALSE,
+            .buffer_device_address = RDNA4R.bufferAddress ? 1 : 0,
+            .sample_rate_shading = ef.sampleRateShading != VK_FALSE,
+            .ext_barycentric = enabledBary.fragmentShaderBarycentric != VK_FALSE,
+            .feat_barycentric = enabledBary.fragmentShaderBarycentric != VK_FALSE,
+            .ext_atomic_float = enableAtomicFloat ? 1 : 0,
+            .feat_atomic_float_buffer = enabledAtomicFloat.shaderBufferFloat32Atomics != VK_FALSE,
+            .feat_atomic_float_buffer_add = enabledAtomicFloat.shaderBufferFloat32AtomicAdd != VK_FALSE,
+            .feat_atomic_float_shared = enabledAtomicFloat.shaderSharedFloat32Atomics != VK_FALSE,
+            .feat_atomic_float_shared_add = enabledAtomicFloat.shaderSharedFloat32AtomicAdd != VK_FALSE,
+            .feat_atomic_float_image = enabledAtomicFloat.shaderImageFloat32Atomics != VK_FALSE,
+            .feat_atomic_float_image_add = enabledAtomicFloat.shaderImageFloat32AtomicAdd != VK_FALSE,
+            .ext_atomic_float2 = enableAtomicFloat2 ? 1 : 0,
+            .feat_atomic_float_buffer_minmax = enabledAtomicFloat2.shaderBufferFloat32AtomicMinMax != VK_FALSE,
+            .feat_atomic_float_shared_minmax = enabledAtomicFloat2.shaderSharedFloat32AtomicMinMax != VK_FALSE,
+            .ext_atomic_int64 = (pp.apiVersion >= VK_API_VERSION_1_2 && hasAtomicInt64) ? 1 : 0,
+            .feat_atomic_int64_buffer = enabled12.shaderBufferInt64Atomics != VK_FALSE,
+            .feat_atomic_int64_shared = enabled12.shaderSharedInt64Atomics != VK_FALSE,
+            .ext_mesh_shader = enabledMesh.meshShader != VK_FALSE,
+            .feat_task_shader = enabledMesh.taskShader != VK_FALSE,
+            .feat_mesh_shader = enabledMesh.meshShader != VK_FALSE,
+            .mesh_max_payload_bytes = meshProps.maxTaskPayloadSize,
+            .object_max_workgroup_count = { meshProps.maxTaskWorkGroupCount[0], meshProps.maxTaskWorkGroupCount[1], meshProps.maxTaskWorkGroupCount[2] },
+            .object_max_workgroup_total_count = meshProps.maxTaskWorkGroupTotalCount,
+            .object_max_workgroup_invocations = meshProps.maxTaskWorkGroupInvocations,
+            .mesh_max_workgroup_count = { meshProps.maxMeshWorkGroupCount[0], meshProps.maxMeshWorkGroupCount[1], meshProps.maxMeshWorkGroupCount[2] },
+            .mesh_max_workgroup_total_count = meshProps.maxMeshWorkGroupTotalCount,
+            .mesh_max_workgroup_invocations = meshProps.maxMeshWorkGroupInvocations,
+            .mesh_max_output_vertices = meshProps.maxMeshOutputVertices,
+            .mesh_max_output_primitives = meshProps.maxMeshOutputPrimitives,
+            .ext_deferred_host_ops = enableAccel ? 1 : 0,
+            .ext_accel_struct = enableAccel ? 1 : 0,
+            .feat_accel_struct = enabledAccel.accelerationStructure != VK_FALSE,
+            .feat_accel_indirect_build = enabledAccel.accelerationStructureIndirectBuild != VK_FALSE,
+            .feat_accel_uab = enabledAccel.descriptorBindingAccelerationStructureUpdateAfterBind != VK_FALSE,
+            .rt_min_scratch_alignment = accelProps.minAccelerationStructureScratchOffsetAlignment,
+            .rt_max_geometries = accelProps.maxGeometryCount,
+            .rt_max_instances = accelProps.maxInstanceCount,
+            .rt_max_primitives = accelProps.maxPrimitiveCount,
+            .ext_ray_query = enabledRayQuery.rayQuery != VK_FALSE,
+            .feat_ray_query = enabledRayQuery.rayQuery != VK_FALSE,
+            .timestamp_query_funcs = (RDNA4R.occOK && hasWriteTimestamp) ? 1 : 0,
+            .timestamp_compute_and_graphics = pp.limits.timestampComputeAndGraphics != VK_FALSE,
+            .timestamp_period_ns = pp.limits.timestampPeriod,
+            .timestamp_valid_bits = qf[qfi].timestampValidBits,
+            .sparse_queue = hasSparseQueue ? 1 : 0,
+            .sparse_bind_func = hasBindSparse ? 1 : 0,
+            .sparse_binding = ef.sparseBinding != VK_FALSE,
+            .sparse_residency_buffer = ef.sparseResidencyBuffer != VK_FALSE,
+            .sparse_residency_image_2d = ef.sparseResidencyImage2D != VK_FALSE,
+            .sparse_residency_image_3d = ef.sparseResidencyImage3D != VK_FALSE,
+            .sparse_residency_2_samples = ef.sparseResidency2Samples != VK_FALSE,
+            .sparse_residency_4_samples = ef.sparseResidency4Samples != VK_FALSE,
+            .sparse_residency_8_samples = ef.sparseResidency8Samples != VK_FALSE,
+            .sparse_residency_16_samples = ef.sparseResidency16Samples != VK_FALSE,
+            .sparse_residency_aliased = ef.sparseResidencyAliased != VK_FALSE
+        };
         rdna4dc_properties caps = { .name = pp.deviceName, .storage_buffer_range = pp.limits.maxStorageBufferRange,
             .allocation_size = maxAllocation, .heaps = heaps, .heap_count = heapCount,
             .workgroup_size = {pp.limits.maxComputeWorkGroupSize[0], pp.limits.maxComputeWorkGroupSize[1], pp.limits.maxComputeWorkGroupSize[2]},
             .invocations = pp.limits.maxComputeWorkGroupInvocations, .shared_memory = pp.limits.maxComputeSharedMemorySize, .subgroup_size = subgroupSize,
-            .logical_buffer_size = maxBuffer, .addressing64 = RDNA4R.bufferAddress && ef.shaderInt64 };
+            .logical_buffer_size = maxBuffer, .addressing64 = RDNA4R.bufferAddress && ef.shaderInt64,
+            .metal3 = &m3probe };
         PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)
             rdna4_gipa(RDNA4R.inst, "vkGetPhysicalDeviceMemoryProperties2");
         if (hasMemoryBudget && memoryProperties2) {
@@ -818,6 +1016,32 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             queryCaps.flags |= RDNA4X_CAP_QUERY_DEVICE;
         RDNA4QueryCaps = queryCaps;
         RDNA4Caps = rdna4dc_from_properties(&caps);
+        const rdna4dc_metal3_caps m3 = RDNA4Caps.metal3;
+        RDNA4R.barycentric = m3.barycentric ? YES : NO;
+        RDNA4R.atomicFloat = (m3.atomic_float_buffer || m3.atomic_float_shared || m3.atomic_float_image) ? YES : NO;
+        RDNA4R.atomicFloat2 = m3.atomic_float_minmax ? YES : NO;
+        RDNA4R.atomicInt64 = (m3.atomic_int64_buffer || m3.atomic_int64_shared) ? YES : NO;
+        RDNA4R.meshShader = m3.mesh_shader ? YES : NO;
+        RDNA4R.objectShader = m3.object_shader ? YES : NO;
+        RDNA4R.deferredHostOps = m3.deferred_host_ops ? YES : NO;
+        RDNA4R.accelStruct = m3.acceleration_structure ? YES : NO;
+        RDNA4R.rayQuery = m3.ray_query ? YES : NO;
+        RDNA4R.timestampQuery = m3.timestamp_supported ? YES : NO;
+        RDNA4R.timestampComputeAndGraphics = m3.timestamp_compute_and_graphics ? YES : NO;
+        RDNA4R.timestampPeriod = m3.timestamp_period_ns;
+        RDNA4R.timestampValidBits = m3.timestamp_valid_bits;
+        RDNA4R.sparseBinding = m3.sparse_binding ? YES : NO;
+        RDNA4R.sparseResidencyBuffer = m3.sparse_residency_buffer ? YES : NO;
+        RDNA4R.sparseResidencyImage2D = m3.sparse_residency_image_2d ? YES : NO;
+        RDNA4R.sparseResidencyImage3D = m3.sparse_residency_image_3d ? YES : NO;
+        RDNA4LOG("radv: metal3 probe: bary=%d pull=%d atomicF32=%d/%d/%d(mm=%d) atomicI64=%d/%d mesh=%d/%d(payload=%u grid=%u) rt=%d/%d ts=%d(%.2fns,%ub) sparse=%d(buf=%d 2d=%d 3d=%d)",
+                 m3.barycentric, m3.pull_model_interpolation,
+                 m3.atomic_float_buffer, m3.atomic_float_shared, m3.atomic_float_image, m3.atomic_float_minmax,
+                 m3.atomic_int64_buffer, m3.atomic_int64_shared,
+                 m3.object_shader, m3.mesh_shader, m3.mesh_max_payload_bytes, m3.mesh_max_workgroup_total_count,
+                 m3.acceleration_structure, m3.ray_query,
+                 m3.timestamp_supported, (double)m3.timestamp_period_ns, m3.timestamp_valid_bits,
+                 m3.sparse_binding, m3.sparse_residency_buffer, m3.sparse_residency_image_2d, m3.sparse_residency_image_3d);
         atomic_store_explicit(&rdna4_caps_ready, 1, memory_order_release);
         RDNA4GatherCaps = gatherCaps;
         atomic_store_explicit(&rdna4_gather_caps_ready, 1, memory_order_release);
