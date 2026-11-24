@@ -21,9 +21,10 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0027. The kext ABI header that patches 0002-0004 mirror
-is src/garnet/src/GarnetNativeABI.h in this repository; Mesa's copy and
-the kext's copy must be the same ABI version (currently 1.11 or newer).
+Order matters: 0001 .. 0028. The kext ABI header that patches 0002-0004 and
+0028 mirror is src/garnet/src/GarnetNativeABI.h in this repository; Mesa's copy
+and the kext's copy must stay ABI-compatible (currently 1.13; older ABI <= 1.12
+kernels remain compatible with sparse/PRT disabled).
 
 0010: Navi 44 (RX 9060 XT, gfx1200) canned device entry; the chip is chosen at runtime from the kext QueryInfo gc_version (0x0c0001 gfx1201 / 0x0c0000 gfx1200, 0 = old kext -> gfx1201). Env: RADV_DARWIN_CHIP=gfx1200|gfx1201 forces the chip (also the HOST_BO stand-in choice); RADV_DARWIN_MOCK_GC=gfx1200 makes the mock report GC 12.0.0. The gfx1200 device fields are confirmed by the target's Linux amdgpu DRM_INFO dump, preserved in `.omo/evidence/navi44-topology/linux-amdgpu-dump.txt`.
 
@@ -61,6 +62,8 @@ the kext's copy must be the same ABI version (currently 1.11 or newer).
 
 0027: define RADV_USE_WSI_PLATFORM in src/amd/vulkan/radv_wsi.h when VK_USE_PLATFORM_METAL_EXT is enabled, so RADV exposes VK_KHR_surface, VK_KHR_swapchain, and related WSI extensions alongside VK_EXT_metal_surface, and skip the private SDMA blit queue in src/amd/vulkan/radv_wsi.c when ip[AMD_IP_SDMA].num_queues == 0 so WSI CPU-blit swapchains execute on the graphics queue.
 
+0028: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.13 (RDNA4N_CAP_VM_PRT = 1u << 4, RDNA4N_VA_OP_CLEAR/REPLACE, RDNA4N_VM_PAGE_PRT), enable CLEAR/REPLACE/PRT VA operations in the Darwin winsys and mock when QueryInfo.flags advertises RDNA4N_CAP_VM_PRT (continuing to reject them with -EOPNOTSUPP on older ABI <= 1.12 kernels and HOST_BO), replace 0021's unconditional false in radv_sparse_enabled() with a runtime RDNA4N_CAP_VM_PRT capability check that preserves Mesa's sparse disable flags, and reject composite child-backed BOs as sparse backing targets.
+
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
     python3 mesa-patches/test-host-composite.py /path/to/patched-mesa "$TMPDIR/host-test"
@@ -81,6 +84,22 @@ pinned archive:
       --expected-archive-sha256 4bc5830a77c420e6fcd1d13d8edf12c8b17c95fa5c689ed27370b19c47cbae1d
 This extracts a fresh tree, applies 0001..0022 with `patch -p1 --fuzz=0`,
 rejects any `.rej`/`.orig`, and runs the optimized and ASan+UBSan export tests.
+
+Sparse / PRT series and host check (no Mesa tarball, IOKit, or GPU needed):
+    python3 mesa-patches/test-radv-darwin-sparse-prt-series.py "$TMPDIR/sparse-prt-test"
+This verifies contiguous 0001..0028 patch integrity, replays 0001..0028 with
+`patch -p1 --fuzz=0` on all Darwin-added files plus post-0027 upstream anchors,
+checks ABI 1.13 constants against src/garnet/src/GarnetNativeABI.h bit-for-bit,
+and compiles and runs the real post-0028 Darwin kext/mock marshaller and
+radv_sparse_enabled() gating harness under -Wall -Wextra -Werror with ASan+UBSan.
+Pass `--mesa-archive /path/to/mesa.tar.gz` when the pinned Mesa archive is
+available to replay the full 0001..0028 series end-to-end.
+
+Standalone Vulkan sparse/PRT execution test (buffer + 2D/3D/MSAA residency,
+non-resident zero-read / discard-write, and rebinding; ready for RX 9060 XT
+and Vulkan 1.4 ICDs exposing sparseBinding):
+    cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/vulkan_sparse_prt_test.c -lvulkan -o "$TMPDIR/vulkan_sparse_prt_test"
+    "$TMPDIR/vulkan_sparse_prt_test"
 
 Memory and topology audit (offline, 2026-11-01):
     The gfx1200 .mem values are synthetic HOST_BO/drm-shim inputs, copied from
