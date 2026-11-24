@@ -242,7 +242,7 @@ int main(int argc, char **argv) {
       CHECK("G14: GarnetDevice.m wires Wave 3A sparse/PRT and ray-tracing acceleration structure modules",
             gm && cbSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4ResourceStateEncoder")
-                                && strstr(gm, "@implementation RDNA4AccelerationStructureCommandEncoder"))
+                                && strstr(gm, "@implementation GarnetAccelerationStructureCommandEncoder"))
                              : (strstr(gm, "#include \"rdna4_sparse_impl.inc\"")
                                 && strstr(gm, "#include \"rdna4_rt_accel_impl.inc\"")))
                && strstr(gm, "rdna4_sparse_heap_new(self, d, NULL)")
@@ -257,12 +257,12 @@ int main(int argc, char **argv) {
                && strstr(gm, "rdna4_rt_device_sizes(self, d)")
                && strstr(gm, "rdna4_rt_device_new_with_size(self, size)")
                && strstr(gm, "rdna4_rt_device_new_with_descriptor(self, d)")
-               && strstr(gm, "[[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil]")
-               && strstr(gm, "[[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d]")
+               && strstr(gm, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil]")
+               && strstr(gm, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d]")
                && strstr(gm, "\"MTLResourceStateCommandEncoder\"")
                && strstr(gm, "\"MTLAccelerationStructure\"")
                && strstr(gm, "\"MTLAccelerationStructureCommandEncoder\"")
-               && strstr(cbSrc, "objc_getClass(\"RDNA4AccelerationStructure\")")
+               && strstr(cbSrc, "objc_getClass(\"GarnetAccelerationStructure\")")
                && strstr(cbSrc, "rdna4CurrentHandle")
                && strstr(cbSrc, "objc_getClass(\"RDNA4SparseHeap\")"));
       CHECK("G14: GarnetDevice.m wires Wave 3B dynlib/VFT, AS buffer build-input bit, and sparse residency",

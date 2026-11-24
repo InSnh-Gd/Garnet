@@ -9,9 +9,9 @@ _Static_assert((int)VK_TIMEOUT == RDNA4FW_TIMEOUT, "VK_TIMEOUT == RDNA4FW_TIMEOU
 - (BOOL)rdna4RegisterCandidatePipeline:(id)pipeline;
 @end
 
-@class RDNA4AccelHandle;
-@protocol RDNA4AccelInternal <NSObject>
-- (RDNA4AccelHandle *)rdna4CurrentHandle;
+@class GarnetASHandle;
+@protocol GarnetASInternal <NSObject>
+- (GarnetASHandle *)rdna4CurrentHandle;
 @end
 
 typedef struct {
@@ -763,7 +763,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (_encErr) return;
     Class icbCls = objc_getClass("RDNA4IndirectCommandBuffer");
     BOOL isICB = icbCls && [resource isKindOfClass:icbCls];
-    Class asCls = objc_getClass("RDNA4AccelerationStructure");
+    Class asCls = objc_getClass("GarnetAccelerationStructure");
     BOOL isAS = asCls && [resource isKindOfClass:asCls];
     if ((!(isICB || isAS || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
         [(id<MTLResource>)resource device] != [self device] || !usage || (usage & ~(NSUInteger)7)) {
@@ -775,7 +775,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
         id backing = [(id<RDNA4ICBInternal>)resource rdna4GPUBacking];
         if (backing) [self rdna4RetainEncoded:backing];
     } else if (isAS) {
-        id handle = [(id<RDNA4AccelInternal>)resource rdna4CurrentHandle];
+        id handle = [(id<GarnetASInternal>)resource rdna4CurrentHandle];
         if (handle) [self rdna4RetainEncoded:handle];
     }
 }

@@ -1,5 +1,5 @@
 // test-metal3-rt-accel.m: live macOS / RX 9060 XT verification for Task 7.1
-// (RDNA4AccelerationStructure & MTLAccelerationStructureCommandEncoder:
+// (GarnetAccelerationStructure & MTLAccelerationStructureCommandEncoder:
 //  size queries, triangle/AABB BLAS build, Default & UserID TLAS build,
 //  compacted size readback UInt32/UInt64 + copyAndCompact, in-place/out-of-place
 //  refit, clone copy, early ARC release safety, and controlled negative rejections).

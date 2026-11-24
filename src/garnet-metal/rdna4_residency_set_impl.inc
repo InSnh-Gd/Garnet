@@ -28,7 +28,7 @@ static BOOL rdna4_residency_alloc_valid(id obj, id dev, uint64_t *sizeOut) {
                      [obj isKindOfClass:[RDNA4Texture class]] ||
                      [obj isKindOfClass:[RDNA4Heap class]];
     if (!knownType) {
-        Class asCls = objc_getClass("RDNA4AccelerationStructure");
+        Class asCls = objc_getClass("GarnetAccelerationStructure");
         Class spCls = objc_getClass("RDNA4SparseHeap");
         if ((asCls && [obj isKindOfClass:asCls]) ||
             (spCls && [obj isKindOfClass:spCls]))

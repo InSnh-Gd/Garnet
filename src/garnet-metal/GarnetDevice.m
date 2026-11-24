@@ -499,12 +499,12 @@ static BOOL rdna4_headless(void) {
 - (id)accelerationStructureCommandEncoder {
     (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoder");
-    return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
+    return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
 }
 - (id)accelerationStructureCommandEncoderWithDescriptor:(id)d {
     (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoderWithDescriptor:");
-    return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
+    return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
 @end
 
@@ -633,8 +633,8 @@ static NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLCounterSampleBuffer" }; rdna4_add_protocols([RDNA4CounterSampleBuffer class], n, 1, "RDNA4CounterSampleBuffer"); }
     { const char *n[] = { "MTLHeap" }; rdna4_add_protocols([RDNA4SparseHeap class], n, 1, "RDNA4SparseHeap"); }
     { const char *n[] = { "MTLResourceStateCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4ResourceStateEncoder class], n, 2, "RDNA4ResourceStateEncoder"); }
-    { const char *n[] = { "MTLAccelerationStructure", "MTLResource" }; rdna4_add_protocols([RDNA4AccelerationStructure class], n, 2, "RDNA4AccelerationStructure"); }
-    { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4AccelerationStructureCommandEncoder class], n, 2, "RDNA4AccelerationStructureCommandEncoder"); }
+    { const char *n[] = { "MTLAccelerationStructure", "MTLResource" }; rdna4_add_protocols([GarnetAccelerationStructure class], n, 2, "GarnetAccelerationStructure"); }
+    { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([GarnetAccelerationStructureCommandEncoder class], n, 2, "GarnetAccelerationStructureCommandEncoder"); }
     { const char *n[] = { "MTLIntersectionFunctionTable", "MTLResource" }; rdna4_add_protocols([RDNA4IntersectionFunctionTable class], n, 2, "RDNA4IntersectionFunctionTable"); }
     { const char *n[] = { "MTLRenderPipelineState" }; rdna4_add_protocols([RDNA4MeshRenderPipelineState class], n, 1, "RDNA4MeshRenderPipelineState"); }
     {   // build 18: the census (rdna4_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).

@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------------------------------------------
 // Hardware Ray Tracing Acceleration Structures (Task 7.1):
-//   RDNA4AccelerationStructure (MTLAccelerationStructure + MTLResource)
-//   RDNA4AccelerationStructureCommandEncoder (MTLAccelerationStructureCommandEncoder + MTLCommandEncoder)
+//   GarnetAccelerationStructure (MTLAccelerationStructure + MTLResource)
+//   GarnetAccelerationStructureCommandEncoder (MTLAccelerationStructureCommandEncoder + MTLCommandEncoder)
 //   Backed by VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations.
 //
 // Wave 3 integration checklist (GarnetDevice.m, rdna4_command_buffer_impl.inc, rdna4_buffer_impl.inc):
@@ -10,19 +10,19 @@
 //        #include "rdna4_rt_accel_impl.inc"
 //   2. GarnetDevice.m +load protocol registration & census (also auto-registered in +initialize):
 //        { const char *n[] = { "MTLAccelerationStructure", "MTLResource" };
-//          rdna4_add_protocols([RDNA4AccelerationStructure class], n, 2, "RDNA4AccelerationStructure"); }
+//          rdna4_add_protocols([GarnetAccelerationStructure class], n, 2, "GarnetAccelerationStructure"); }
 //        { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" };
-//          rdna4_add_protocols([RDNA4AccelerationStructureCommandEncoder class], n, 2, "RDNA4AccelerationStructureCommandEncoder"); }
+//          rdna4_add_protocols([GarnetAccelerationStructureCommandEncoder class], n, 2, "GarnetAccelerationStructureCommandEncoder"); }
 //   3. GarnetDevice.m @implementation RDNA4CommandBuffer (Encoders):
 //        - (id)accelerationStructureCommandEncoder {
 //            (void)[self vk];
 //            RDNA4LOGR("cb accelerationStructureCommandEncoder");
-//            return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
+//            return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
 //        }
 //        - (id)accelerationStructureCommandEncoderWithDescriptor:(id)d {
 //            (void)[self vk];
 //            RDNA4LOGR("cb accelerationStructureCommandEncoderWithDescriptor:");
-//            return [[RDNA4AccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
+//            return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
 //        }
 //   4. GarnetDevice.m @implementation GarnetDevice selectors:
 //        - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
@@ -41,7 +41,7 @@
 //      OR `(RDNA4R.accelStruct ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0)`
 //      into `.usage` so user vertex/index/AABB/transform buffers carry Vulkan AS build-input usage bits.
 //   6. rdna4_command_buffer_impl.inc (`rdna4UseResource:usage:`):
-//      Accept `RDNA4AccelerationStructure` alongside `RDNA4IndirectCommandBuffer` and retain both
+//      Accept `GarnetAccelerationStructure` alongside `RDNA4IndirectCommandBuffer` and retain both
 //      the acceleration structure and `[as rdna4CurrentHandle]` via `rdna4RetainEncoded:`.
 // ---------------------------------------------------------------------------------------------------------------
 #ifndef RDNA4_RT_ACCEL_IMPL_INC
@@ -305,9 +305,9 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 }
 @end
 
-// Backing Private VkBuffer + VkDeviceMemory. Held strongly by RDNA4AccelHandle so Vulkan
+// Backing Private VkBuffer + VkDeviceMemory. Held strongly by GarnetASHandle so Vulkan
 // always destroys VkAccelerationStructureKHR before its storage VkBuffer and VkDeviceMemory.
-@interface RDNA4AccelStorage : NSObject {
+@interface GarnetASStorage : NSObject {
 @public
     VkBuffer _buf;
     VkDeviceMemory _mem;
@@ -317,7 +317,7 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 - (instancetype)initWithBackingSize:(uint64_t)backingSize error:(NSError **)err;
 @end
 
-@implementation RDNA4AccelStorage
+@implementation GarnetASStorage
 - (instancetype)initWithBackingSize:(uint64_t)backingSize error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
@@ -378,18 +378,18 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 }
 @end
 
-@interface RDNA4AccelHandle : NSObject {
+@interface GarnetASHandle : NSObject {
 @public
-    RDNA4AccelStorage *_storage;
+    GarnetASStorage *_storage;
     VkAccelerationStructureKHR _vkAS;
     VkDeviceAddress _deviceAddress;
     rdna4rt_kind_t _kind;
 }
-- (instancetype)initWithStorage:(RDNA4AccelStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err;
+- (instancetype)initWithStorage:(GarnetASStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err;
 @end
 
-@implementation RDNA4AccelHandle
-- (instancetype)initWithStorage:(RDNA4AccelStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err {
+@implementation GarnetASHandle
+- (instancetype)initWithStorage:(GarnetASStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
     if (!storage || !storage->_buf || (kind != RDNA4RT_KIND_BLAS && kind != RDNA4RT_KIND_TLAS)) {
@@ -438,22 +438,22 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 @end
 
 // ---------------------------------------------------------------------------------------------------------------
-// RDNA4AccelerationStructure (MTLAccelerationStructure + MTLResource)
+// GarnetAccelerationStructure (MTLAccelerationStructure + MTLResource)
 // ---------------------------------------------------------------------------------------------------------------
-@interface RDNA4AccelerationStructure : _MTLResource {
+@interface GarnetAccelerationStructure : _MTLResource {
     id _dev;
     NSString *_lbl;
     NSUInteger _size;
-    RDNA4AccelStorage *_storage;
-    RDNA4AccelHandle *_handle;
+    GarnetASStorage *_storage;
+    GarnetASHandle *_handle;
     rdna4rt_accel_meta_t _meta;
     pthread_mutex_t _mu;
     BOOL _muInit;
     RDNA4_RES_IVARS
 }
 - (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind error:(NSError **)err;
-- (RDNA4AccelHandle *)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
-- (RDNA4AccelHandle *)rdna4CurrentHandle;
+- (GarnetASHandle *)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
+- (GarnetASHandle *)rdna4CurrentHandle;
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure;
 - (VkDeviceAddress)rdna4DeviceAddress;
 - (rdna4rt_accel_meta_t)rdna4MetaSnapshot;
@@ -469,17 +469,17 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 - (BOOL)rdna4ResourceAliases:(id)other;
 @end
 
-@implementation RDNA4AccelerationStructure
+@implementation GarnetAccelerationStructure
 + (void)initialize {
-    if (self == [RDNA4AccelerationStructure class]) {
+    if (self == [GarnetAccelerationStructure class]) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
             const char *n[] = { "MTLAccelerationStructure", "MTLResource" };
-            rdna4_add_protocols(self, n, 2, "RDNA4AccelerationStructure");
+            rdna4_add_protocols(self, n, 2, "GarnetAccelerationStructure");
         });
     }
 }
-RDNA4_DNR(RDNA4AccelerationStructure)
+RDNA4_DNR(GarnetAccelerationStructure)
 
 - (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind error:(NSError **)err {
     self = [super init];
@@ -503,11 +503,11 @@ RDNA4_DNR(RDNA4AccelerationStructure)
         if (err) *err = rdna4_err(144, @"acceleration structure size exceeds device buffer limit");
         return nil;
     }
-    RDNA4AccelStorage *storage = [[RDNA4AccelStorage alloc] initWithBackingSize:backingSize error:err];
+    GarnetASStorage *storage = [[GarnetASStorage alloc] initWithBackingSize:backingSize error:err];
     if (!storage) return nil;
-    RDNA4AccelHandle *handle = nil;
+    GarnetASHandle *handle = nil;
     if (kind == RDNA4RT_KIND_BLAS || kind == RDNA4RT_KIND_TLAS) {
-        handle = [[RDNA4AccelHandle alloc] initWithStorage:storage kind:kind error:err];
+        handle = [[GarnetASHandle alloc] initWithStorage:storage kind:kind error:err];
         if (!handle) return nil;
     }
     pthread_mutex_init(&_mu, NULL);
@@ -517,7 +517,7 @@ RDNA4_DNR(RDNA4AccelerationStructure)
     _storage = storage;
     _handle = handle;
     rdna4rt_meta_init(&_meta, (uint64_t)size, kind);
-    RDNA4LOGR("RDNA4AccelerationStructure %p: size %lu (backing %llu, alloc %llu, kind %u)",
+    RDNA4LOGR("GarnetAccelerationStructure %p: size %lu (backing %llu, alloc %llu, kind %u)",
               (__bridge void *)self, (unsigned long)size,
               (unsigned long long)backingSize, (unsigned long long)storage->_allocatedSize, (unsigned)kind);
     return self;
@@ -529,42 +529,42 @@ RDNA4_DNR(RDNA4AccelerationStructure)
     if (_muInit) pthread_mutex_destroy(&_mu);
 }
 
-- (RDNA4AccelHandle *)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err {
+- (GarnetASHandle *)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err {
     if (kind != RDNA4RT_KIND_BLAS && kind != RDNA4RT_KIND_TLAS) {
         if (err) *err = rdna4_err(144, @"invalid acceleration structure kind");
         return nil;
     }
     pthread_mutex_lock(&_mu);
     if (_handle && _handle->_kind == kind) {
-        RDNA4AccelHandle *existing = _handle;
+        GarnetASHandle *existing = _handle;
         pthread_mutex_unlock(&_mu);
         return existing;
     }
-    RDNA4AccelStorage *storage = _storage;
+    GarnetASStorage *storage = _storage;
     pthread_mutex_unlock(&_mu);
-    RDNA4AccelHandle *created = [[RDNA4AccelHandle alloc] initWithStorage:storage kind:kind error:err];
+    GarnetASHandle *created = [[GarnetASHandle alloc] initWithStorage:storage kind:kind error:err];
     if (!created) return nil;
     pthread_mutex_lock(&_mu);
     if (!_handle || _handle->_kind != kind) _handle = created;
-    RDNA4AccelHandle *result = _handle;
+    GarnetASHandle *result = _handle;
     pthread_mutex_unlock(&_mu);
     return result;
 }
 
-- (RDNA4AccelHandle *)rdna4CurrentHandle {
+- (GarnetASHandle *)rdna4CurrentHandle {
     pthread_mutex_lock(&_mu);
-    RDNA4AccelHandle *h = _handle;
+    GarnetASHandle *h = _handle;
     pthread_mutex_unlock(&_mu);
     return h;
 }
 
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure {
-    RDNA4AccelHandle *h = [self rdna4CurrentHandle];
+    GarnetASHandle *h = [self rdna4CurrentHandle];
     return h ? h->_vkAS : VK_NULL_HANDLE;
 }
 
 - (VkDeviceAddress)rdna4DeviceAddress {
-    RDNA4AccelHandle *h = [self rdna4CurrentHandle];
+    GarnetASHandle *h = [self rdna4CurrentHandle];
     return h ? h->_deviceAddress : 0u;
 }
 
@@ -1081,14 +1081,14 @@ static BOOL rdna4_rt_build_plan_make(
             }
             for (NSUInteger bi = 0; bi < blasCount; bi++) {
                 id obj = blasList[bi];
-                if (![obj isKindOfClass:[RDNA4AccelerationStructure class]] || [(RDNA4AccelerationStructure *)obj device] != dev) {
+                if (![obj isKindOfClass:[GarnetAccelerationStructure class]] || [(GarnetAccelerationStructure *)obj device] != dev) {
                     free(blasAddrs); rdna4_rt_plan_free(plan);
-                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"instancedAccelerationStructures[%lu] is not an RDNA4AccelerationStructure on this device", (unsigned long)bi]);
+                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"instancedAccelerationStructures[%lu] is not an GarnetAccelerationStructure on this device", (unsigned long)bi]);
                     return NO;
                 }
-                RDNA4AccelerationStructure *blas = (RDNA4AccelerationStructure *)obj;
+                GarnetAccelerationStructure *blas = (GarnetAccelerationStructure *)obj;
                 rdna4rt_accel_meta_t bmeta = [blas rdna4MetaSnapshot];
-                RDNA4AccelHandle *bhandle = [blas rdna4CurrentHandle];
+                GarnetASHandle *bhandle = [blas rdna4CurrentHandle];
                 if (bmeta.kind != RDNA4RT_KIND_BLAS || bmeta.state == RDNA4RT_STATE_UNBUILT ||
                     !bhandle || !bhandle->_deviceAddress) {
                     free(blasAddrs); rdna4_rt_plan_free(plan);
@@ -1182,9 +1182,9 @@ static BOOL rdna4_rt_build_plan_make(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// RDNA4AccelerationStructureCommandEncoder (MTLAccelerationStructureCommandEncoder + MTLCommandEncoder)
+// GarnetAccelerationStructureCommandEncoder (MTLAccelerationStructureCommandEncoder + MTLCommandEncoder)
 // ---------------------------------------------------------------------------------------------------------------
-@interface RDNA4AccelerationStructureCommandEncoder : _MTLCommandEncoder {
+@interface GarnetAccelerationStructureCommandEncoder : _MTLCommandEncoder {
     RDNA4CommandBuffer *_cb;
     BOOL _ended;
     NSString *_lbl;
@@ -1195,17 +1195,17 @@ static BOOL rdna4_rt_build_plan_make(
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(id)d;
 @end
 
-@implementation RDNA4AccelerationStructureCommandEncoder
+@implementation GarnetAccelerationStructureCommandEncoder
 + (void)initialize {
-    if (self == [RDNA4AccelerationStructureCommandEncoder class]) {
+    if (self == [GarnetAccelerationStructureCommandEncoder class]) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
             const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" };
-            rdna4_add_protocols(self, n, 2, "RDNA4AccelerationStructureCommandEncoder");
+            rdna4_add_protocols(self, n, 2, "GarnetAccelerationStructureCommandEncoder");
         });
     }
 }
-RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
+RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
 
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(id)d {
     self = [super initWithCommandBuffer:cb];
@@ -1257,7 +1257,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
             }
         }
     }
-    RDNA4LOGR("RDNA4AccelerationStructureCommandEncoder %p", (__bridge void *)self);
+    RDNA4LOGR("GarnetAccelerationStructureCommandEncoder %p", (__bridge void *)self);
     return self;
 }
 
@@ -1285,8 +1285,8 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
                scratchBufferOffset:(NSUInteger)scratchBufferOffset {
     if (![self rdna4GuardReady:"buildAccelerationStructure"]) return;
     id dev = [_cb device];
-    if (![accelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)accelerationStructure device] != dev) {
+    if (![accelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)accelerationStructure device] != dev) {
         [_cb rdna4Fail:@"buildAccelerationStructure: invalid destination acceleration structure"];
         return;
     }
@@ -1305,7 +1305,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         return;
     }
 
-    RDNA4AccelerationStructure *dstAS = (RDNA4AccelerationStructure *)accelerationStructure;
+    GarnetAccelerationStructure *dstAS = (GarnetAccelerationStructure *)accelerationStructure;
     rdna4rt_accel_meta_t dstMeta = [dstAS rdna4MetaSnapshot];
     rdna4rt_err_t ce = rdna4rt_state_can_build(&dstMeta, plan.metalSizes.acceleration_structure_size);
     if (ce != RDNA4RT_OK) {
@@ -1331,7 +1331,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         return;
     }
 
-    RDNA4AccelHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:plan.kind error:&err];
+    GarnetASHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:plan.kind error:&err];
     if (!dstHandle) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: failed to create Vulkan AS handle"];
@@ -1392,10 +1392,10 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
     if (![self rdna4GuardReady:"refitAccelerationStructure"]) return;
     id dev = [_cb device];
     id<MTLAccelerationStructure> effectiveDst = destinationAccelerationStructure ?: sourceAccelerationStructure;
-    if (![sourceAccelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)sourceAccelerationStructure device] != dev ||
-        ![effectiveDst isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)effectiveDst device] != dev) {
+    if (![sourceAccelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)sourceAccelerationStructure device] != dev ||
+        ![effectiveDst isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)effectiveDst device] != dev) {
         [_cb rdna4Fail:@"refitAccelerationStructure: invalid source or destination acceleration structure"];
         return;
     }
@@ -1415,8 +1415,8 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         return;
     }
 
-    RDNA4AccelerationStructure *srcAS = (RDNA4AccelerationStructure *)sourceAccelerationStructure;
-    RDNA4AccelerationStructure *dstAS = (RDNA4AccelerationStructure *)effectiveDst;
+    GarnetAccelerationStructure *srcAS = (GarnetAccelerationStructure *)sourceAccelerationStructure;
+    GarnetAccelerationStructure *dstAS = (GarnetAccelerationStructure *)effectiveDst;
     rdna4rt_accel_meta_t srcMeta = [srcAS rdna4MetaSnapshot];
     if (srcMeta.state != RDNA4RT_STATE_BUILT || !srcMeta.allow_refit) {
         [_cb rdna4Fail:@"refitAccelerationStructure: source acceleration structure was not built with MTLAccelerationStructureUsageRefit or was compacted"];
@@ -1441,7 +1441,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         return;
     }
 
-    RDNA4AccelHandle *srcHandle = [srcAS rdna4CurrentHandle];
+    GarnetASHandle *srcHandle = [srcAS rdna4CurrentHandle];
     if (!srcHandle || srcHandle->_vkAS == VK_NULL_HANDLE) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:@"refitAccelerationStructure: source acceleration structure has no Vulkan handle"];
@@ -1463,7 +1463,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         return;
     }
 
-    RDNA4AccelHandle *dstHandle = (dstAS == srcAS) ? srcHandle : [dstAS rdna4EnsureHandleForKind:plan.kind error:&err];
+    GarnetASHandle *dstHandle = (dstAS == srcAS) ? srcHandle : [dstAS rdna4EnsureHandleForKind:plan.kind error:&err];
     if (!dstHandle) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: failed to create destination Vulkan AS handle"];
@@ -1511,15 +1511,15 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
           toAccelerationStructure:(id<MTLAccelerationStructure>)destinationAccelerationStructure {
     if (![self rdna4GuardReady:"copyAccelerationStructure"]) return;
     id dev = [_cb device];
-    if (![sourceAccelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)sourceAccelerationStructure device] != dev ||
-        ![destinationAccelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)destinationAccelerationStructure device] != dev) {
+    if (![sourceAccelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)sourceAccelerationStructure device] != dev ||
+        ![destinationAccelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)destinationAccelerationStructure device] != dev) {
         [_cb rdna4Fail:@"copyAccelerationStructure: invalid source or destination acceleration structure"];
         return;
     }
-    RDNA4AccelerationStructure *srcAS = (RDNA4AccelerationStructure *)sourceAccelerationStructure;
-    RDNA4AccelerationStructure *dstAS = (RDNA4AccelerationStructure *)destinationAccelerationStructure;
+    GarnetAccelerationStructure *srcAS = (GarnetAccelerationStructure *)sourceAccelerationStructure;
+    GarnetAccelerationStructure *dstAS = (GarnetAccelerationStructure *)destinationAccelerationStructure;
     rdna4rt_accel_meta_t srcMeta = [srcAS rdna4MetaSnapshot];
     rdna4rt_accel_meta_t dstMeta = [dstAS rdna4MetaSnapshot];
     rdna4rt_err_t ce = rdna4rt_state_can_copy(&srcMeta, &dstMeta, srcAS == dstAS ? 1 : 0);
@@ -1527,9 +1527,9 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         [_cb rdna4Fail:[NSString stringWithFormat:@"copyAccelerationStructure: %s", rdna4rt_err_str(ce)]];
         return;
     }
-    RDNA4AccelHandle *srcHandle = [srcAS rdna4CurrentHandle];
+    GarnetASHandle *srcHandle = [srcAS rdna4CurrentHandle];
     NSError *err = nil;
-    RDNA4AccelHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:srcMeta.kind error:&err];
+    GarnetASHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:srcMeta.kind error:&err];
     if (!srcHandle || !srcHandle->_vkAS || !dstHandle) {
         [_cb rdna4Fail:err.localizedDescription ?: @"copyAccelerationStructure: missing Vulkan AS handle"];
         return;
@@ -1570,8 +1570,8 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
                                    sizeDataType:(MTLDataType)sizeDataType {
     if (![self rdna4GuardReady:"writeCompactedAccelerationStructureSize"]) return;
     id dev = [_cb device];
-    if (![accelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)accelerationStructure device] != dev) {
+    if (![accelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)accelerationStructure device] != dev) {
         [_cb rdna4Fail:@"writeCompactedAccelerationStructureSize: invalid acceleration structure"];
         return;
     }
@@ -1587,14 +1587,14 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         [_cb rdna4Fail:[NSString stringWithFormat:@"writeCompactedAccelerationStructureSize: %s", rdna4rt_err_str(we)]];
         return;
     }
-    RDNA4AccelerationStructure *srcAS = (RDNA4AccelerationStructure *)accelerationStructure;
+    GarnetAccelerationStructure *srcAS = (GarnetAccelerationStructure *)accelerationStructure;
     rdna4rt_accel_meta_t srcMeta = [srcAS rdna4MetaSnapshot];
     rdna4rt_err_t se = rdna4rt_state_can_write_compacted_size(&srcMeta);
     if (se != RDNA4RT_OK) {
         [_cb rdna4Fail:[NSString stringWithFormat:@"writeCompactedAccelerationStructureSize: %s", rdna4rt_err_str(se)]];
         return;
     }
-    RDNA4AccelHandle *srcHandle = [srcAS rdna4CurrentHandle];
+    GarnetASHandle *srcHandle = [srcAS rdna4CurrentHandle];
     if (!srcHandle || !srcHandle->_vkAS) {
         [_cb rdna4Fail:@"writeCompactedAccelerationStructureSize: acceleration structure has no Vulkan handle"];
         return;
@@ -1663,15 +1663,15 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
                     toAccelerationStructure:(id<MTLAccelerationStructure>)destinationAccelerationStructure {
     if (![self rdna4GuardReady:"copyAndCompactAccelerationStructure"]) return;
     id dev = [_cb device];
-    if (![sourceAccelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)sourceAccelerationStructure device] != dev ||
-        ![destinationAccelerationStructure isKindOfClass:[RDNA4AccelerationStructure class]] ||
-        [(RDNA4AccelerationStructure *)destinationAccelerationStructure device] != dev) {
+    if (![sourceAccelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)sourceAccelerationStructure device] != dev ||
+        ![destinationAccelerationStructure isKindOfClass:[GarnetAccelerationStructure class]] ||
+        [(GarnetAccelerationStructure *)destinationAccelerationStructure device] != dev) {
         [_cb rdna4Fail:@"copyAndCompactAccelerationStructure: invalid source or destination acceleration structure"];
         return;
     }
-    RDNA4AccelerationStructure *srcAS = (RDNA4AccelerationStructure *)sourceAccelerationStructure;
-    RDNA4AccelerationStructure *dstAS = (RDNA4AccelerationStructure *)destinationAccelerationStructure;
+    GarnetAccelerationStructure *srcAS = (GarnetAccelerationStructure *)sourceAccelerationStructure;
+    GarnetAccelerationStructure *dstAS = (GarnetAccelerationStructure *)destinationAccelerationStructure;
     rdna4rt_accel_meta_t srcMeta = [srcAS rdna4MetaSnapshot];
     rdna4rt_accel_meta_t dstMeta = [dstAS rdna4MetaSnapshot];
     rdna4rt_err_t ce = rdna4rt_state_can_compact(&srcMeta, &dstMeta, srcAS == dstAS ? 1 : 0, 0u);
@@ -1679,9 +1679,9 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
         [_cb rdna4Fail:[NSString stringWithFormat:@"copyAndCompactAccelerationStructure: %s", rdna4rt_err_str(ce)]];
         return;
     }
-    RDNA4AccelHandle *srcHandle = [srcAS rdna4CurrentHandle];
+    GarnetASHandle *srcHandle = [srcAS rdna4CurrentHandle];
     NSError *err = nil;
-    RDNA4AccelHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:srcMeta.kind error:&err];
+    GarnetASHandle *dstHandle = [dstAS rdna4EnsureHandleForKind:srcMeta.kind error:&err];
     if (!srcHandle || !srcHandle->_vkAS || !dstHandle) {
         [_cb rdna4Fail:err.localizedDescription ?: @"copyAndCompactAccelerationStructure: missing Vulkan AS handle"];
         return;
@@ -1722,14 +1722,14 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage {
     if (_ended) { [_cb rdna4Fail:@"accel useResource after endEncoding"]; return; }
     if ([_cb rdna4Error]) return;
-    if ([resource isKindOfClass:[RDNA4AccelerationStructure class]]) {
-        if ([(RDNA4AccelerationStructure *)resource device] != [_cb device] ||
+    if ([resource isKindOfClass:[GarnetAccelerationStructure class]]) {
+        if ([(GarnetAccelerationStructure *)resource device] != [_cb device] ||
             !usage || ((NSUInteger)usage & ~(NSUInteger)7)) {
             [_cb rdna4Fail:@"accel useResource: invalid acceleration structure device or usage"];
             return;
         }
         [_cb rdna4RetainEncoded:resource];
-        RDNA4AccelHandle *h = [(RDNA4AccelerationStructure *)resource rdna4CurrentHandle];
+        GarnetASHandle *h = [(GarnetAccelerationStructure *)resource rdna4CurrentHandle];
         if (h) [_cb rdna4RetainEncoded:h];
         return;
     }
@@ -1790,7 +1790,7 @@ RDNA4_DNR(RDNA4AccelerationStructureCommandEncoder)
     } else if (![_cb rdna4Error]) {
         rdna4_rt_barrier([_cb vk]);
     }
-    RDNA4LOGR("RDNA4AccelerationStructureCommandEncoder endEncoding");
+    RDNA4LOGR("GarnetAccelerationStructureCommandEncoder endEncoding");
     [super endEncoding];
 }
 @end
@@ -1836,7 +1836,7 @@ static __attribute__((unused)) MTLAccelerationStructureSizes rdna4_rt_device_siz
 static __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_device_new_with_size(
     id dev, NSUInteger size) {
     NSError *err = nil;
-    RDNA4AccelerationStructure *as = [[RDNA4AccelerationStructure alloc]
+    GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
         initWithDevice:dev size:size initialKind:RDNA4RT_KIND_UNKNOWN error:&err];
     if (!as) RDNA4LOG("newAccelerationStructureWithSize:%lu failed: %s",
                       (unsigned long)size, err.localizedDescription.UTF8String);
@@ -1861,7 +1861,7 @@ static __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_device_new_
     rdna4rt_kind_t kind = plan.kind;
     NSUInteger reqSize = (NSUInteger)plan.metalSizes.acceleration_structure_size;
     rdna4_rt_plan_free(&plan);
-    RDNA4AccelerationStructure *as = [[RDNA4AccelerationStructure alloc]
+    GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
         initWithDevice:dev size:reqSize initialKind:kind error:&err];
     if (!as) RDNA4LOG("newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
                       (unsigned long)reqSize, err.localizedDescription.UTF8String);

@@ -89,10 +89,10 @@ _Static_assert((int)RDNA4RTR_AS_KIND_PRIMITIVE == (int)RDNA4RT_KIND_BLAS,
 _Static_assert((int)RDNA4RTR_AS_KIND_INSTANCE == (int)RDNA4RT_KIND_TLAS,
                "AS kind INSTANCE mismatch with RDNA4RT_KIND_TLAS");
 
-// Internal selector contract matching RDNA4AccelerationStructure (rdna4_rt_accel_impl.inc).
+// Internal selector contract matching GarnetAccelerationStructure (rdna4_rt_accel_impl.inc).
 #ifndef RDNA4_RT_ACCEL_RUNTIME_PROTO
 #define RDNA4_RT_ACCEL_RUNTIME_PROTO
-@protocol RDNA4AccelerationStructureRuntimeInternal <NSObject>
+@protocol GarnetAccelerationStructureRuntimeInternal <NSObject>
 - (id)device;
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure;
 - (VkDeviceAddress)rdna4DeviceAddress;
@@ -653,7 +653,7 @@ RDNA4_RESOURCE_SPI
 // Stage Binding State, Descriptor Pool, Descriptor Set Fill, and Descriptor Cache Helpers
 // =================================================================================================
 
-// Parallel to RDNA4StageState.buf[31]: holds __unsafe_unretained RDNA4AccelerationStructure*
+// Parallel to RDNA4StageState.buf[31]: holds __unsafe_unretained GarnetAccelerationStructure*
 // (strong lifetime owned via RDNA4ResourceBindings + command-buffer retirement retention).
 typedef struct {
     __unsafe_unretained id as[RDNA4RTR_MAX_BUFFER_SLOTS];
@@ -679,16 +679,16 @@ __attribute__((unused)) static uint32_t rdna4_rt_descriptor_pool_append(
     return count + 1u;
 }
 
-static id<RDNA4AccelerationStructureRuntimeInternal> rdna4_rt_validate_accel(
+static id<GarnetAccelerationStructureRuntimeInternal> rdna4_rt_validate_accel(
     id accel, id expectedDevice, NSString **whyOut)
 {
     if (!accel) return nil;
-    Class cls = objc_getClass("RDNA4AccelerationStructure");
+    Class cls = objc_getClass("GarnetAccelerationStructure");
     if (!cls || ![accel isKindOfClass:cls]) {
-        if (whyOut) *whyOut = @"acceleration structure is not an RDNA4AccelerationStructure";
+        if (whyOut) *whyOut = @"acceleration structure is not an GarnetAccelerationStructure";
         return nil;
     }
-    id<RDNA4AccelerationStructureRuntimeInternal> as = (id<RDNA4AccelerationStructureRuntimeInternal>)accel;
+    id<GarnetAccelerationStructureRuntimeInternal> as = (id<GarnetAccelerationStructureRuntimeInternal>)accel;
     if (expectedDevice && [as device] != expectedDevice) {
         if (whyOut) *whyOut = @"acceleration structure belongs to another MTLDevice";
         return nil;
@@ -718,7 +718,7 @@ __attribute__((unused)) static BOOL rdna4_rt_encoder_bind_accel(
         return YES;
     }
     NSString *why = nil;
-    id<RDNA4AccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(accel, dev, &why);
+    id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(accel, dev, &why);
     if (!as) {
         rdna4_rt_cb_fail(cb, [NSString stringWithFormat:@"%s setAccelerationStructure: %@",
                               stageName ?: "rt", why ?: @"invalid object"]);
@@ -830,7 +830,7 @@ __attribute__((unused)) static BOOL rdna4_rt_fill_accel_descriptor(
             return NO;
         }
         NSString *why = nil;
-        id<RDNA4AccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(raw, dev, &why);
+        id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(raw, dev, &why);
         if (!as) {
             rdna4_rt_cb_fail(cb, [NSString stringWithFormat:@"%s accelerationStructure(%u): %@",
                                   stageName ?: "rt", metalIdx, why ?: @"invalid"]);
@@ -884,7 +884,7 @@ __attribute__((unused)) static void rdna4_rt_dc_push_accel_sig(
         VkAccelerationStructureKHR vkAS = VK_NULL_HANDLE;
         VkDeviceAddress bda = 0u;
         if (raw) {
-            id<RDNA4AccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(raw, nil, NULL);
+            id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(raw, nil, NULL);
             if (as) {
                 vkAS = [as rdna4VkAccelerationStructure];
                 bda = [as rdna4DeviceAddress];
@@ -948,7 +948,7 @@ static void rdna4_rt_retain_argbuf_walk(RDNA4Buffer *buf, id cb, NSMutableSet *v
     }
     for (id asObj in localAS) {
         rdna4_rt_cb_retain(cb, asObj);
-        id<RDNA4AccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(asObj, nil, NULL);
+        id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(asObj, nil, NULL);
         id h = as ? [as rdna4CurrentHandle] : nil;
         if (h) rdna4_rt_cb_retain(cb, h);
     }
@@ -996,7 +996,7 @@ __attribute__((unused)) static uint64_t rdna4_rt_arg_resolve_as_address(
     rdna4rtr_as_kind_t asKind = RDNA4RTR_AS_KIND_UNKNOWN;
     if (accel) {
         NSString *why = nil;
-        id<RDNA4AccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(accel, device, &why);
+        id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(accel, device, &why);
         if (!as)
             [NSException raise:NSInvalidArgumentException
                         format:@"Argument acceleration structure invalid: %@", why ?: @"bad class/device"];
