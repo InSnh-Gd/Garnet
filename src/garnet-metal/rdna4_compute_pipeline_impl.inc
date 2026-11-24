@@ -14,6 +14,8 @@
     VkDescriptorSetLayout _emptySet;
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLComputePipelineDescriptor *)descriptor options:(NSUInteger)options error:(NSError **)err;
 - (instancetype)initPlaceholderWithDevice:(id)dev function:(id)fn;   // #12 R1: valid state whose dispatches encode nothing (hot-swapped when the .spv + .meta.json appear)
 - (RDNA4ComputePipelineState *)rdna4Real;
 - (BOOL)rdna4HotRebuild;
@@ -57,12 +59,69 @@
 - (BOOL)noop { return _noop; }
 - (BOOL)rdna4LumaWorkgroup { return _lumaWorkgroup; }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err {
-    self = [super init]; if (!self) return nil;
-    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
     // #12 R1: the cache lookup comes first, so a miss (placeholder case) needs no Vulkan device.
     NSString *fname = nil; NSDictionary *meta = nil; NSError *e = nil;
     NSData *spv = rdna4_spv_lookup(fn, "kernel", &e, &fname, &meta);
     if (!spv) { if (err) *err = e; return nil; }
+    return [self initWithDevice:dev function:fn spv:spv meta:meta fname:fname error:err];
+}
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLComputePipelineDescriptor *)descriptor options:(NSUInteger)options error:(NSError **)err {
+    if (!descriptor || !descriptor.computeFunction) {
+        if (err) *err = rdna4_err(61, @"compute pipeline descriptor has no computeFunction");
+        return nil;
+    }
+    id fn = descriptor.computeFunction;
+    BOOL installedLk = NO;
+    if (rdna4_lk_for(fn) == nil) {
+        rdna4x_linkage_compute(descriptor);
+        installedLk = (rdna4_lk_for(fn) != nil);
+    }
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    NSData *baSpv = nil, *baVk = nil;
+    NSDictionary *baMeta = nil;
+    rdna4ba_fingerprint_t baFp = {0};
+    BOOL baHit = NO;
+    NSError *baErr = nil;
+    if (!rdna4_ba_lookup_compute(dev, descriptor, options, &baSpv, &baMeta, &baVk, &baFp, &baHit, &baErr)) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = baErr;
+        return nil;
+    }
+    if (baHit) {
+        if (!rdna4_radv_open(err)) {
+            if (installedLk) rdna4_lk_install(2, nil);
+            return nil;
+        }
+        NSString *fname = [fn respondsToSelector:@selector(name)] ? [fn name] : @"?";
+        rdna4_ba_vkcache_scope_t vcScope;
+        rdna4_ba_vkcache_scope_begin(&vcScope, baVk, &baFp);
+        self = [self initWithDevice:dev function:fn spv:baSpv meta:baMeta fname:fname error:err];
+        rdna4_ba_vkcache_scope_end(&vcScope);
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (self && descriptor.label) _lbl = [descriptor.label copy];
+        return self;
+    }
+#else
+    if (options & ((NSUInteger)1u << 2)) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = [NSError errorWithDomain:MTLBinaryArchiveDomain
+            code:(NSInteger)MTLBinaryArchiveErrorCompilationFailure
+            userInfo:@{ NSLocalizedDescriptionKey: @"Compute pipeline missed binary archive (MTLPipelineOptionFailOnBinaryArchiveMiss)" }];
+        return nil;
+    }
+#endif
+    self = [self initWithDevice:dev function:fn error:err];
+    if (installedLk) rdna4_lk_install(2, nil);
+    if (self && descriptor.label) _lbl = [descriptor.label copy];
+    return self;
+}
+- (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err {
+    (void)fn;
+    self = [super init]; if (!self) return nil;
+    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
+    if (!spv) { if (err) *err = rdna4_err(41, @"compute function SPIR-V is nil"); return nil; }
+    if (!fname) fname = @"?";
+    NSError *e = nil;
     if (!rdna4_radv_open(err)) return nil;
     const uint64_t deadline = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;
     NSDictionary *preMeta = meta;
@@ -153,7 +212,11 @@
         VkSpecializationInfo si = { bytes ? 4u : 3u, me, bytes ? sizeof data : 3 * sizeof(*data), data };
         VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = _pl,
             .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = _ep, .pSpecializationInfo = _mode ? &si : NULL } };
-        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateComputePipelines(RDNA4R.dev, RDNA4R.pc, 1, &ci, NULL, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
+        VkPipelineCache pc = RDNA4R.pc;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+        pc = rdna4_ba_vkcache();
+#endif
+        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateComputePipelines(RDNA4R.dev, pc, 1, &ci, NULL, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
         if (module != _sm) vkDestroyShaderModule(RDNA4R.dev, module, NULL);
         if (r != VK_SUCCESS) RDNA4LOG("vkCreateComputePipelines(local %u,%u,%u) = %d", l[0], l[1], l[2], r);
         else { v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v; }
@@ -194,4 +257,9 @@ RDNA4_DNR(RDNA4ComputePipelineState)
 - (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { (void)d; return 0; }
 - (BOOL)supportIndirectCommandBuffers { return NO; }
 @end
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+static id rdna4_ba_compile_compute_state(id dev, id fn, NSData *spv, NSDictionary *meta, NSString *fname, NSError **err) {
+    return [[RDNA4ComputePipelineState alloc] initWithDevice:dev function:fn spv:spv meta:meta fname:fname error:err];
+}
+#endif
 
