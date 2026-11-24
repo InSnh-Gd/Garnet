@@ -292,6 +292,11 @@ namespace PTEFlags {
     // scrambled bytes into the signature check and made every
     // GART-bound LOAD_IP_FW reject with resp=0x11.
     constexpr uint64_t MTYPE_GFX12_UC = (2ULL << 54);
+    // GFX12 / RDNA4 PRT leaf bit: AMDGPU_PTE_PRT_GFX12 (amdgpu_vm.h).
+    // gmc_v12_0_get_vm_pte sets PRT_GFX12 | SNOOPED | SYSTEM | IS_PTE and clears VALID.
+    constexpr uint64_t PRT_GFX12 = (1ULL << 56);
+    constexpr uint64_t PRT_LEAF  = PRT_GFX12 | SNOOPED | SYSTEM | IS_PTE;
+    static_assert((PRT_LEAF & VALID) == 0ULL, "GFX12 PRT leaf clears VALID");
     // Standard sysmem mapping for PSP-readable buffers. Adds IS_PTE
     // (mandatory on GFX12) + EXECUTABLE + MTYPE_GFX12_UC to match
     // upstream gart_pte_flags defaults (amdgpu_vm.h:97-106,

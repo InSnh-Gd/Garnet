@@ -80,27 +80,47 @@ constexpr uint32_t kVmFlagsMapOk = RDNA4N_VM_DELAY_UPDATE | RDNA4N_VM_PAGE_READA
 constexpr bool vm_mtype_known(uint32_t flags) { return ((flags & RDNA4N_VM_MTYPE_MASK) >> 5) <= 5u; }
 // Everything that can be judged from the struct alone (the BO is looked up afterwards). The range must sit inside one half of the
 // canonical space, the stripped start must be >= 0x10000, everything 4 KiB aligned, and the timeline fields zero.
+// ABI 1.13: supports CLEAR, REPLACE, and PRT (handle == 0, offset_in_bo == 0); invalid combinations return kBadArg.
 constexpr VaReq gemva_check(uint32_t operation, uint32_t handle, uint32_t pad, uint32_t flags, uint64_t va, uint64_t off, uint64_t size,
                             uint64_t tlPoint, uint32_t tlSyncobj, uint32_t nSyncobj, uint64_t inFence) {
     if (operation != RDNA4N_VA_OP_MAP && operation != RDNA4N_VA_OP_UNMAP && operation != RDNA4N_VA_OP_CLEAR && operation != RDNA4N_VA_OP_REPLACE)
         return VaReq{ kBadArg, 0 };
     if (pad != 0u || tlPoint != 0ull || tlSyncobj != 0u || nSyncobj != 0u || inFence != 0ull) return VaReq{ kBadArg, 0 };
-    if (operation == RDNA4N_VA_OP_CLEAR || operation == RDNA4N_VA_OP_REPLACE) return VaReq{ kUnsupported, 0 };
-    if (handle == 0u || (flags & RDNA4N_VM_PAGE_PRT) != 0u) return VaReq{ kUnsupported, 0 };
-    if (operation == RDNA4N_VA_OP_MAP && ((flags & ~kVmFlagsMapOk) != 0u || !vm_mtype_known(flags))) return VaReq{ kBadArg, 0 };
+    const bool prt = (flags & RDNA4N_VM_PAGE_PRT) != 0u;
+    if (operation == RDNA4N_VA_OP_MAP || operation == RDNA4N_VA_OP_REPLACE) {
+        if ((flags & ~kVmFlagsMapOk) != 0u || !vm_mtype_known(flags)) return VaReq{ kBadArg, 0 };
+        if (prt) {
+            if (handle != 0u || off != 0ull) return VaReq{ kBadArg, 0 };
+        } else {
+            if (handle == 0u) return VaReq{ kBadArg, 0 };
+        }
+    } else if (operation == RDNA4N_VA_OP_CLEAR) {
+        if ((flags & ~kVmFlagsMapOk) != 0u || !vm_mtype_known(flags)) return VaReq{ kBadArg, 0 };
+        if ((prt && handle != 0u) || off != 0ull) return VaReq{ kBadArg, 0 };
+    } else {
+        // UNMAP: non-PRT keeps ignoring R/W/X flags (legacy contract); PRT requires handle == 0 and offset == 0.
+        if (prt) {
+            if (handle != 0u || off != 0ull) return VaReq{ kBadArg, 0 };
+        } else {
+            if (handle == 0u) return VaReq{ kBadArg, 0 };
+        }
+    }
     if (((va | off | size) & (kPage - 1ull)) != 0ull || size == 0ull) return VaReq{ kBadArg, 0 };
     if (!va_canonical(va)) return VaReq{ kBadArg, 0 };
     const uint64_t s = va_strip(va);
     if (s < kVaFirst) return VaReq{ kBadArg, 0 };
-    if (size > kVaMask48 + 1ull || s + size > kVaMask48 + 1ull) return VaReq{ kBadArg, 0 };
+    if (size > kVaMask48 + 1ull || s > (kVaMask48 + 1ull) - size) return VaReq{ kBadArg, 0 };
     if ((s >> 47) != ((s + size - 1ull) >> 47)) return VaReq{ kBadArg, 0 };      // never straddle the sign-extension seam
     return VaReq{ kOk, s };
 }
 constexpr bool range_in_bo(uint64_t off, uint64_t size, uint64_t boSize) { return off <= boSize && size <= boSize - off; }
 
-// The leaf flags of a mapping (pte_encode adds IS_PTE): READ/WRITE/EXEC from the vm flags, MTYPE UC when the vm flags say UC or the
-// BO was created UNCACHED (upstream gmc_v12_0_get_vm_pte), every other MTYPE = NC = 0; a GTT page adds SYSTEM|SNOOPED.
+// The leaf flags of a mapping (pte_encode adds IS_PTE):
+//   - PRT (RDNA4N_VM_PAGE_PRT): AMDGPU_PTE_PRT_GFX12 (1<<56) | SNOOPED | SYSTEM (VALID cleared; pte_encode sets IS_PTE).
+//   - BO: READ/WRITE/EXEC from the vm flags, MTYPE UC when the vm flags say UC or the BO was created UNCACHED
+//         (upstream gmc_v12_0_get_vm_pte), every other MTYPE = NC = 0; a GTT/host page adds SYSTEM|SNOOPED.
 constexpr uint64_t leaf_flags(uint32_t vmflags, bool boUncached, bool system) {
+    if ((vmflags & RDNA4N_VM_PAGE_PRT) != 0u) return kPtePrt | kPteSnooped | kPteSystem;
     return kPteValid | ((vmflags & RDNA4N_VM_PAGE_READABLE) ? kPteRead : 0ull) | ((vmflags & RDNA4N_VM_PAGE_WRITEABLE) ? kPteWrite : 0ull) |
            ((vmflags & RDNA4N_VM_PAGE_EXECUTABLE) ? kPteExec : 0ull) |
            (((vmflags & RDNA4N_VM_MTYPE_MASK) == RDNA4N_VM_MTYPE_UC || boUncached) ? kPteMtypeUC : 0ull) |
@@ -112,6 +132,8 @@ static_assert(leaf_flags(0xa, false, false) == (kPteValid | kPteRead | kPteExec)
 static_assert(leaf_flags(0x8a, false, false) == (kPteValid | kPteRead | kPteExec | kPteMtypeUC), "0x8a = R|X|UC");
 static_assert(leaf_flags(0xe, false, true) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteSystem | kPteSnooped), "GTT adds SYSTEM|SNOOPED");
 static_assert(leaf_flags(0xe, true, false) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteMtypeUC), "BO UNCACHED forces UC");
+static_assert(pte_encode(0ull, leaf_flags(RDNA4N_VM_PAGE_PRT, false, false)) == kPtePrtLeaf, "PRT leaf = bit56 | SNOOPED | SYSTEM | IS_PTE, VALID clear");
+static_assert(pte_encode(0ull, leaf_flags(RDNA4N_VM_PAGE_PRT | 0xeu, true, true)) == kPtePrtLeaf, "PRT overrides BO/RWX/VALID bits");
 
 // ---- the VA map ---------------------------------------------------------------------------------------------------------------
 struct VaEnt { uint64_t start; uint64_t size; uint64_t off; uint32_t handle; uint32_t flags; };   // stripped start; size 0 = free slot
@@ -157,10 +179,93 @@ inline bool va_exec_covered(const VaEnt *t, uint32_t n, uint64_t start, uint64_t
         int hit = -1;
         for (uint32_t i = 0; i < n; i++)
             if (va_ent_used(t[i]) && t[i].start <= cur && cur < t[i].start + t[i].size) { hit = (int)i; break; }
-        if (hit < 0 || (t[hit].flags & kIbNeedFlags) != kIbNeedFlags) return false;   // an IB fetch needs READ and EXEC
+        if (hit < 0 || t[hit].handle == 0u || (t[hit].flags & RDNA4N_VM_PAGE_PRT) != 0u || (t[hit].flags & kIbNeedFlags) != kIbNeedFlags) return false;   // an IB fetch needs a real READ+EXEC BO mapping (never PRT)
         cur = t[hit].start + t[hit].size;
     }
     return cur >= end;
+}
+
+// ---- PRT tracking and partial-overlap interval splitting (ABI 1.13) -----------------------------------------------------------
+constexpr bool va_ent_is_prt(const VaEnt &e) {
+    return va_ent_used(e) && e.handle == 0u && (e.flags & RDNA4N_VM_PAGE_PRT) != 0u;
+}
+struct PrtStats { uint32_t maps; uint64_t pages; };
+inline PrtStats va_prt_stats(const VaEnt *t, uint32_t n) {
+    PrtStats st{ 0u, 0ull };
+    for (uint32_t i = 0; i < n; i++) {
+        if (va_ent_is_prt(t[i])) { st.maps++; st.pages += t[i].size / kPage; }
+    }
+    return st;
+}
+// Capacity & overlap analysis for CLEAR / REPLACE on [start, start + size) (stripped, validated).
+// Because live entries are pairwise disjoint, at most one entry strictly contains [start, end) (middle split).
+struct VaRangePlan {
+    uint32_t freeSlots;
+    uint32_t overlapping;
+    uint32_t covered;      // completely inside [start, end) -> removed
+    uint32_t splits;       // strictly contains [start, end) -> 0 or 1 (needs +1 slot)
+    bool     hasPrtOverlap;
+};
+inline VaRangePlan va_range_plan(const VaEnt *t, uint32_t n, uint64_t start, uint64_t size) {
+    VaRangePlan p{ 0u, 0u, 0u, 0u, false };
+    const uint64_t end = start + size;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!va_ent_used(t[i])) { p.freeSlots++; continue; }
+        const uint64_t es = t[i].start, ee = es + t[i].size;
+        if (end <= es || start >= ee) continue;
+        p.overlapping++;
+        if (va_ent_is_prt(t[i])) p.hasPrtOverlap = true;
+        if (es >= start && ee <= end) p.covered++;
+        else if (es < start && ee > end) p.splits++;
+    }
+    return p;
+}
+constexpr bool va_clear_fits(const VaRangePlan &p) { return p.freeSlots + p.covered >= p.splits; }
+constexpr bool va_replace_fits(const VaRangePlan &p) { return p.freeSlots + p.covered >= p.splits + 1u; }
+// Carve [start, start + size) out of `t[0..n)`: removes completely covered entries, trims head/tail overlaps,
+// and splits a strictly containing entry into left [es, start) and right [end, ee). Atomic on capacity failure.
+inline bool va_carve(VaEnt *t, uint32_t n, uint64_t start, uint64_t size) {
+    const VaRangePlan plan = va_range_plan(t, n, start, size);
+    if (!va_clear_fits(plan)) return false;
+    const uint64_t end = start + size;
+    VaEnt splitRight{ 0, 0, 0, 0, 0 };
+    bool haveSplit = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!va_ent_used(t[i])) continue;
+        const uint64_t es = t[i].start, ee = es + t[i].size;
+        if (end <= es || start >= ee) continue;
+        if (es >= start && ee <= end) {
+            t[i] = VaEnt{ 0, 0, 0, 0, 0 };
+        } else if (es < start && ee > end) {
+            const uint64_t rightOff = (t[i].handle != 0u) ? (t[i].off + (end - es)) : 0ull;
+            splitRight = VaEnt{ end, ee - end, rightOff, t[i].handle, t[i].flags };
+            haveSplit = true;
+            t[i].size = start - es;
+        } else if (es < start) {
+            t[i].size = start - es;
+        } else {
+            const uint64_t trim = end - es;
+            t[i].start = end;
+            t[i].size = ee - end;
+            if (t[i].handle != 0u) t[i].off += trim;
+        }
+    }
+    if (haveSplit && va_insert(t, n, splitRight) < 0) return false;
+    return true;
+}
+// Atomically carve [e.start, e.start + e.size) and insert `e`. Atomic on capacity failure.
+inline bool va_replace_apply(VaEnt *t, uint32_t n, const VaEnt &e) {
+    if (!va_ent_used(e)) return false;
+    const VaRangePlan plan = va_range_plan(t, n, e.start, e.size);
+    if (!va_replace_fits(plan)) return false;
+    if (!va_carve(t, n, e.start, e.size)) return false;
+    return va_insert(t, n, e) >= 0;
+}
+// Remove all PRT entries (handle == 0, RDNA4N_VM_PAGE_PRT) on session teardown.
+inline uint32_t va_remove_prt(VaEnt *t, uint32_t n) {
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < n; i++) if (va_ent_is_prt(t[i])) { t[i] = VaEnt{ 0, 0, 0, 0, 0 }; r++; }
+    return r;
 }
 
 // ---- the page-table tree over an abstract memory ------------------------------------------------------------------------------
@@ -210,6 +315,26 @@ inline uint32_t pt_map(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t fi
         if (ptb == 0ull) return kNoMemory;
         const uint64_t run = 512ull - idx_ptb(v) < pages - p ? 512ull - idx_ptb(v) : pages - p;
         for (uint64_t k = 0; k < run; k++) m.wr(ptb, idx_ptb(v) + (uint32_t)k, pte_encode(firstPa + (p + k) * kPage, leafFlags));
+        p += run;
+    }
+    return kOk;
+}
+// Fill `pages` 4 KiB leaves at `va` with a constant leaf PTE (e.g. GFX12 PRT kPtePrtLeaf, PA == 0).
+// Two passes: ensure every PTB first (so kNoMemory writes zero leaves), then overwrite leaves in place.
+template <class M>
+inline uint32_t pt_fill(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t leafPte, M &m) {
+    if (pages == 0ull) return kBadArg;
+    for (uint64_t p = 0; p < pages;) {
+        const uint64_t v = va + p * kPage;
+        if (pt_ensure_ptb(rootPa, v, m) == 0ull) return kNoMemory;
+        p += 512ull - idx_ptb(v);
+    }
+    for (uint64_t p = 0; p < pages;) {
+        const uint64_t v = va + p * kPage;
+        const uint64_t ptb = pt_ensure_ptb(rootPa, v, m);
+        if (ptb == 0ull) return kNoMemory;
+        const uint64_t run = 512ull - idx_ptb(v) < pages - p ? 512ull - idx_ptb(v) : pages - p;
+        for (uint64_t k = 0; k < run; k++) m.wr(ptb, idx_ptb(v) + (uint32_t)k, leafPte);
         p += run;
     }
     return kOk;
@@ -308,6 +433,27 @@ inline uint32_t pt_map_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t
         pt_unmap(rootPa, va, pages, m);
         m.rollback(snap, rootPa, va, pages);
     }
+    return rc;
+}
+// Transactional constant-leaf fill (PRT MAP and PRT REPLACE) and contiguous BO REPLACE:
+// Pass 1 allocates all missing PTBs before Pass 2 writes any leaf, so a failure never overwrites
+// pre-existing overlapping leaves; rollback detaches newly allocated tables only (no pt_unmap).
+template <class M>
+inline uint32_t pt_fill_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t leafPte, M &m) {
+    uint32_t rc = pt_va_precheck(va, pages);
+    if (rc != kOk) return rc;
+    auto snap = m.snapshot();
+    rc = pt_fill(rootPa, va, pages, leafPte, m);
+    if (rc != kOk) m.rollback(snap, rootPa, va, pages);
+    return rc;
+}
+template <class M>
+inline uint32_t pt_replace_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m) {
+    uint32_t rc = pt_va_precheck(va, pages);
+    if (rc != kOk) return rc;
+    auto snap = m.snapshot();
+    rc = pt_map(rootPa, va, pages, firstPa, leafFlags, m);
+    if (rc != kOk) m.rollback(snap, rootPa, va, pages);
     return rc;
 }
 

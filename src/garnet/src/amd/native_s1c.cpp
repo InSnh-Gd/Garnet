@@ -76,6 +76,8 @@ static_assert(rdna4scan::kOk == (uint32_t)kIOReturnSuccess && rdna4scan::kBadArg
               rdna4scan::kNotReady == (uint32_t)kIOReturnNotReady && rdna4scan::kBusy == (uint32_t)kIOReturnBusy &&
               rdna4scan::kNotPermitted == (uint32_t)kIOReturnNotPermitted && rdna4scan::kNoDevice == (uint32_t)kIOReturnNoDevice,
               "the scanout pure header's codes are the IOReturn.h values");
+static_assert(PTEFlags::PRT_GFX12 == kPtePrt && PTEFlags::PRT_LEAF == kPtePrtLeaf && (PTEFlags::PRT_LEAF & PTEFlags::VALID) == 0ULL,
+              "GFX12 PRT PTE encoding matches Linux amdgpu_vm.h/gmc_v12_0.c");
 
 // ---- state --------------------------------------------------------------------------------------------------------------------
 enum : uint8_t { kBoNone = 0, kBoVis = 1, kBoHi = 2, kBoGtt = 3, kBoHost = 4 };   // kBoHost: 0.0.612, an import of the caller's memory (hmd / hpages)
@@ -136,6 +138,8 @@ struct Session {
     volatile UInt32 poisoned;  // 1 once an automatic recovery named this session guilty (switch ON): Submit refused, waits and GPU calls Aborted
     uint64_t  faultAtOpen;     // 0.0.629 (R5): rdna4native::g2::fault_word read (never cleared) at this session's open, for sessstat
     uint64_t  tlbSeq;          // monotonically bumped on PT mutations / unmaps; synced into gVmidPool boundSeq
+    uint32_t  prtMaps;         // ABI 1.13: active PRT VA entries in s->maps (refcount)
+    uint64_t  prtPages;        // ABI 1.13: active 4 KiB PRT pages in s->maps
 };
 static Session gSess;          // slot 0: STATIC and never freed: a selector racing a close can never touch freed memory
 // 0.0.627 (G2): the session slots. Slot 0 is gSess; slots 1..63 (switch ON only) are allocated on first use and NEVER freed, for the same reason.
@@ -217,6 +221,7 @@ static uint64_t gG5Since[rdna4native::g2::kMaxSessions];   // per slot: when tha
 static rdna4native::g5::Stat gG5;           // the counters of sessstat page 9; guarded by gRingLock
 static rdna4native::g5::AdmitIn gG5In;     // ring_submit_app_g5's verdict inputs, rebuilt on every try; guarded by gRingLock (a file-scope static keeps the Submit path's stack frame small)
 static uint64_t gLogGate;                 // 0.0.641: the "open refused" log rate limiter (rdna4native::g4::log_gate_step); a log-only word
+static uint64_t gPrtTotalMaps;            // ABI 1.13: total live PRT VA entries across all open sessions (atomic delta under session lock)
 
 // ---- helpers ------------------------------------------------------------------------------------------------------------------
 static IOLock *lazy_lock(IOLock **slot) {
@@ -299,6 +304,15 @@ static Session *sess_lock(const N1cRef &r, bool needHello) {
 }
 static inline void sess_unlock(Session *s) { IOLockUnlock(s->lock); }
 static inline bool sess_poisoned(const Session *s) { return __atomic_load_n(&s->poisoned, __ATOMIC_SEQ_CST) != 0u; }
+// Sync session PRT refcount (maps + pages) and global atomic PRT count from s->maps. Caller holds s->lock.
+static void session_sync_prt(Session *s) {
+    const PrtStats st = va_prt_stats(s->maps, kMaxMaps);
+    const int64_t delta = (int64_t)st.maps - (int64_t)s->prtMaps;
+    s->prtMaps = st.maps;
+    s->prtPages = st.pages;
+    if (delta > 0) __atomic_add_fetch(&gPrtTotalMaps, (uint64_t)delta, __ATOMIC_RELAXED);
+    else if (delta < 0) __atomic_sub_fetch(&gPrtTotalMaps, (uint64_t)(-delta), __ATOMIC_RELAXED);
+}
 // 0.0.640 (G4): defence in depth. The client class already keeps an APP session off ReadRegs, the scanout set and selectors 15..20 (native_open_policy_pure.h
 // selector_allowed_for_app); each engine function behind them asks again, so a future mistake in the dispatch cannot open them. True = refuse (NotPrivileged).
 static inline bool app_refused(const N1cRef &r, uint32_t call) {
@@ -1184,6 +1198,8 @@ void n1c_close(const N1cRef &ref, const char *how) {
     }
     if (!leak) {
         for (uint32_t h = 1; h < RDNA4N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);
+        (void)va_remove_prt(s->maps, kMaxMaps);
+        session_sync_prt(s);
         bool slots = false;
         const FenceWindow &win = gWin[s->slot];
         if (win.reserved) {
@@ -1201,6 +1217,8 @@ void n1c_close(const N1cRef &ref, const char *how) {
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) unmapped, then completed and released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
     } else {
         // HUNG (or this slot's own work not proven retired): nothing the GPU might still read is freed; the context stays as it is, and the slot is DEAD.
+        (void)va_remove_prt(s->maps, kMaxMaps);
+        session_sync_prt(s);
         N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, LEAKED (HUNG)", how, s->slot, closeVmid, nBos,
                 (unsigned long long)(vramB >> 20), (unsigned long long)(gttB >> 20), ptPages, (unsigned long long)seqs);
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) LEAKED (HUNG): pages stay wired, never completed or released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
@@ -1380,7 +1398,7 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
     const IPVersion v = c.dev->ip.getVersion(IPBlock::GC);
     const uint64_t em = emitted_now();
     o->abi_version = RDNA4N_ABI_VERSION; o->kext_build = kN1cKextBuild;
-    o->flags = RDNA4N_INFO_BUFFER_OPS | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
+    o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
     o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));
@@ -1965,37 +1983,55 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOReturn rc = kIOReturnSuccess;
     do {
+        const bool prt = (in->flags & RDNA4N_VM_PAGE_PRT) != 0u;
         if (in->operation == RDNA4N_VA_OP_UNMAP && hung_now()) {
             // HUNG: skip the wait and the tables; forget the software mapping (its PTEs are leaked with the BO).
             const int hit = va_find_exact(s->maps, kMaxMaps, in->handle, q.stripped, in->map_size);
-            if (hit >= 0) s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 };
+            if (hit >= 0) { s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 }; session_sync_prt(s); }
+            break;
+        }
+        if (in->operation == RDNA4N_VA_OP_CLEAR && hung_now()) {
+            if (!va_carve(s->maps, kMaxMaps, q.stripped, in->map_size)) { rc = kIOReturnNoResources; break; }
+            session_sync_prt(s);
             break;
         }
         const uint32_t gate = gpu_gate(s);
         if (gate != kOk) { rc = (IOReturn)gate; break; }
-        if (!id_live(s->boUsed, RDNA4N_MAX_BOS - 1, in->handle)) { rc = kIOReturnNotFound; break; }
-        Bo &b = s->bo[in->handle];
-        if (!range_in_bo(in->offset_in_bo, in->map_size, b.size)) { rc = kIOReturnBadArgument; break; }
+        Bo *bp = nullptr;
+        if (in->operation != RDNA4N_VA_OP_CLEAR && !prt) {
+            if (!id_live(s->boUsed, RDNA4N_MAX_BOS - 1, in->handle)) { rc = kIOReturnNotFound; break; }
+            bp = &s->bo[in->handle];
+            if (!range_in_bo(in->offset_in_bo, in->map_size, bp->size)) { rc = kIOReturnBadArgument; break; }
+        }
         PtMem mem{ s };
+        const uint64_t pages = in->map_size / kPage;
+        const uint64_t vaCanon = va_canonicalize(q.stripped);
         if (in->operation == RDNA4N_VA_OP_MAP) {
             if (va_overlap(s->maps, kMaxMaps, q.stripped, in->map_size) >= 0) { rc = kIOReturnBadArgument; break; }
-            const bool host = b.kind == kBoHost;                      // 0.0.612: scattered pages (b.hpages), mapped SYSTEM|SNOOPED like a GTT BO
-            const bool scattered = host || b.kind == kBoGtt;        // Fix A: kBoGtt also stores non-contiguous pages in b.hpages
-            const bool sys = scattered;
-            const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
-            const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
             uint32_t slot = 0xFFFFFFFFu;
             for (uint32_t i = 0; i < kMaxMaps; i++) if (!va_ent_used(s->maps[i])) { slot = i; break; }
             if (slot == 0xFFFFFFFFu) { rc = kIOReturnNoResources; break; }
+            if (!prt && (bp->kind == kBoHost || bp->kind == kBoGtt) &&
+                (bp->hpages == nullptr || (in->offset_in_bo / kPage) + pages > bp->hpageCount)) { rc = kIOReturnBadArgument; break; }
             IOLockLock(gCliLock);   // 0.0.627: the page-table reserve is shared
             // 3.1: transactional maps at the canonical form of q.stripped (48-bit high for the
             // high half would otherwise fail pt_va_precheck's strict canonical check; the
             // public gemva_check stays strict). s->maps keeps q.stripped. Quota gates only in
             // alloc_page per new block; upper-bound helpers never gate reuse. Failure returns
             // blocks to the pt reserve, never to vram_alloc.
-            const uint64_t vaCanon = va_canonicalize(q.stripped);
-            uint32_t r = scattered ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
-                                   : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys), mem);
+            uint32_t r = kOk;
+            if (prt) {
+                r = pt_fill_tx(s->rootPa, vaCanon, pages, gmc_vm_pte_flags(0ull, true), mem);
+            } else {
+                Bo &b = *bp;
+                const bool host = b.kind == kBoHost;                      // 0.0.612: scattered pages (b.hpages), mapped SYSTEM|SNOOPED like a GTT BO
+                const bool scattered = host || b.kind == kBoGtt;        // Fix A: kBoGtt also stores non-contiguous pages in b.hpages
+                const bool sys = scattered;
+                const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
+                const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
+                r = scattered ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
+                              : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys), mem);
+            }
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
                 const uint32_t f = session_flush_if_bound_locked(s);   // gCliLock prevents reserve reuse until the directory invalidation completes
@@ -2003,9 +2039,55 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             }
             IOLockUnlock(gCliLock);
             if (r != kOk) { rc = (IOReturn)r; break; }
-            s->maps[slot] = VaEnt{ q.stripped, in->map_size, in->offset_in_bo, in->handle, in->flags };
+            s->maps[slot] = VaEnt{ q.stripped, in->map_size, prt ? 0ull : in->offset_in_bo, prt ? 0u : in->handle, prt ? RDNA4N_VM_PAGE_PRT : in->flags };
+            if (prt) session_sync_prt(s);
             amdgpu_hdp_flush(*gCtx->dev);
             const uint32_t f = session_pt_flush(s);      // synchronous when bound; otherwise recorded in tlbSeq
+            if (f != kOk) rc = (IOReturn)f;
+        } else if (in->operation == RDNA4N_VA_OP_REPLACE) {
+            const VaRangePlan plan = va_range_plan(s->maps, kMaxMaps, q.stripped, in->map_size);
+            if (!va_replace_fits(plan)) { rc = kIOReturnNoResources; break; }
+            if (!prt && (bp->kind == kBoHost || bp->kind == kBoGtt) &&
+                (bp->hpages == nullptr || (in->offset_in_bo / kPage) + pages > bp->hpageCount)) { rc = kIOReturnBadArgument; break; }
+            if (plan.overlapping > 0u && !own_wait(s)) { rc = kIOReturnTimeout; break; }
+            IOLockLock(gCliLock);
+            uint32_t r = kOk;
+            if (prt) {
+                r = pt_fill_tx(s->rootPa, vaCanon, pages, gmc_vm_pte_flags(0ull, true), mem);
+            } else {
+                Bo &b = *bp;
+                const bool host = b.kind == kBoHost;
+                const bool scattered = host || b.kind == kBoGtt;
+                const bool sys = scattered;
+                const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
+                const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
+                r = scattered ? pt_replace_pages_tx(s->rootPa, vaCanon, pages, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
+                              : pt_replace_tx(s->rootPa, vaCanon, pages, basePa, leaf_flags(vmf, b.uc, sys), mem);
+            }
+            if (r == kNoMemory) {
+                amdgpu_hdp_flush(*gCtx->dev);
+                const uint32_t f = session_flush_if_bound_locked(s);
+                if (f != kOk) { mem.quarantine_rollback(); r = f; }
+            }
+            IOLockUnlock(gCliLock);
+            if (r != kOk) { rc = (IOReturn)r; break; }
+            const VaEnt newEnt{ q.stripped, in->map_size, prt ? 0ull : in->offset_in_bo, prt ? 0u : in->handle, prt ? RDNA4N_VM_PAGE_PRT : in->flags };
+            (void)va_replace_apply(s->maps, kMaxMaps, newEnt);
+            session_sync_prt(s);
+            amdgpu_hdp_flush(*gCtx->dev);
+            const uint32_t f = session_pt_flush(s);
+            if (f != kOk) rc = (IOReturn)f;
+        } else if (in->operation == RDNA4N_VA_OP_CLEAR) {
+            const VaRangePlan plan = va_range_plan(s->maps, kMaxMaps, q.stripped, in->map_size);
+            if (!va_clear_fits(plan)) { rc = kIOReturnNoResources; break; }
+            if (plan.overlapping > 0u && !own_wait(s)) { rc = kIOReturnTimeout; break; }
+            if (plan.overlapping > 0u) {
+                pt_unmap(s->rootPa, q.stripped, pages, mem);
+                (void)va_carve(s->maps, kMaxMaps, q.stripped, in->map_size);
+                session_sync_prt(s);
+            }
+            amdgpu_hdp_flush(*gCtx->dev);
+            const uint32_t f = session_pt_flush(s);
             if (f != kOk) rc = (IOReturn)f;
         } else {
             const int hit = va_find_exact(s->maps, kMaxMaps, in->handle, q.stripped, in->map_size);
@@ -2017,6 +2099,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             }
             pt_unmap(s->rootPa, q.stripped, in->map_size / kPage, mem);
             s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 };
+            session_sync_prt(s);
             amdgpu_hdp_flush(*gCtx->dev);
             const uint32_t f = session_pt_flush(s);
             if (f != kOk) rc = (IOReturn)f;

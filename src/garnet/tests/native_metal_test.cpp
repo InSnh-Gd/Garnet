@@ -348,7 +348,7 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect_u("selector count 1.8", RDNA4N_SEL_COUNT_1_8, 21); expect_u("selector count 1.9", RDNA4N_SEL_COUNT_1_9, 22); expect_u("BoImportHost is selector 21", RDNA4N_SEL_BO_IMPORT_HOST, 21);
     expect_u("selector count 1.7 unchanged", RDNA4N_SEL_COUNT_1_7, 19);
     expect_u("ABI major unchanged", RDNA4N_ABI_VERSION, 1);
-    expect_u("ABI minor 12 (1.12 since 0.0.662: instance 1 behind garnet-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", RDNA4N_ABI_MINOR, 12);
+    expect_u("ABI minor 13 (1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662: instance 1 behind garnet-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", RDNA4N_ABI_MINOR, 13);
     expect(cli.find("case RDNA4N_SEL_METAL_NUB_PUBLISH:\n\t\tif (!shape(1, 4, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "publish: shape 1 scalar in, 4 out, no structs");
     expect(cli.find("case RDNA4N_SEL_METAL_NUB_WITHDRAW:\n\t\tif (!shape(1, 1, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "withdraw: shape 1 in, 1 out, no structs");
     {   // the selectors sit behind the same guard as every other native selector

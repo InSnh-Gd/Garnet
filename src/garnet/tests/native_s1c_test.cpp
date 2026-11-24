@@ -142,11 +142,12 @@ static void u3_gemva() {
     expect_u("a range straddling the sign-extension seam -> BadArg", chk(RDNA4N_VA_OP_MAP, 1, 0xe, 0x00007FFFFFFFF000ull, 0, 0x2000).rc, kBadArg);
     expect_u("a range running past 2^48 -> BadArg", chk(RDNA4N_VA_OP_MAP, 1, 0xe, 0xFFFFFFFFFFFFF000ull, 0, 0x2000).rc, kBadArg);
     expect_u("the very last page of the space is fine", chk(RDNA4N_VA_OP_MAP, 1, 0xe, 0xFFFFFFFFFFFFF000ull, 0, 0x1000).rc, kOk);
-    expect_u("PRT -> Unsupported", chk(RDNA4N_VA_OP_MAP, 1, 0xe | RDNA4N_VM_PAGE_PRT, HI, 0, 0x1000).rc, kUnsupported);
-    expect_u("PRT on UNMAP too -> Unsupported", chk(RDNA4N_VA_OP_UNMAP, 1, RDNA4N_VM_PAGE_PRT, HI, 0, 0x1000).rc, kUnsupported);
-    expect_u("handle 0 -> Unsupported", chk(RDNA4N_VA_OP_MAP, 0, 0xe, HI, 0, 0x1000).rc, kUnsupported);
-    expect_u("CLEAR -> Unsupported", chk(RDNA4N_VA_OP_CLEAR, 1, 0xe, HI, 0, 0x1000).rc, kUnsupported);
-    expect_u("REPLACE -> Unsupported", chk(RDNA4N_VA_OP_REPLACE, 1, 0xe, HI, 0, 0x1000).rc, kUnsupported);
+    expect_u("PRT with non-zero handle -> BadArg", chk(RDNA4N_VA_OP_MAP, 1, 0xe | RDNA4N_VM_PAGE_PRT, HI, 0, 0x1000).rc, kBadArg);
+    expect_u("PRT on UNMAP with non-zero handle -> BadArg", chk(RDNA4N_VA_OP_UNMAP, 1, RDNA4N_VM_PAGE_PRT, HI, 0, 0x1000).rc, kBadArg);
+    expect_u("non-PRT handle 0 -> BadArg", chk(RDNA4N_VA_OP_MAP, 0, 0xe, HI, 0, 0x1000).rc, kBadArg);
+    expect_u("PRT with handle 0 -> Ok (ABI 1.13)", chk(RDNA4N_VA_OP_MAP, 0, RDNA4N_VM_PAGE_PRT, HI, 0, 0x1000).rc, kOk);
+    expect_u("CLEAR -> Ok (ABI 1.13)", chk(RDNA4N_VA_OP_CLEAR, 0, 0, HI, 0, 0x1000).rc, kOk);
+    expect_u("REPLACE -> Ok (ABI 1.13)", chk(RDNA4N_VA_OP_REPLACE, 1, 0xe, HI, 0, 0x1000).rc, kOk);
     expect_u("op 0 -> BadArg", chk(0, 1, 0xe, HI, 0, 0x1000).rc, kBadArg);
     expect_u("op 5 -> BadArg", chk(5, 1, 0xe, HI, 0, 0x1000).rc, kBadArg);
     expect_u("MTYPE 6 (unknown) on MAP -> BadArg", chk(RDNA4N_VA_OP_MAP, 1, 0xe | (6u << 5), HI, 0, 0x1000).rc, kBadArg);

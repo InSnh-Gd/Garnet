@@ -185,6 +185,7 @@ static_assert(kGMCScratchVRAMOffset + kAMDGPUGPUPageSize <= 0x00e00000,
 //   AMDGPU_PTE_WRITEABLE  1<<6    amdgpu_vm.h:68
 //   AMDGPU_PTE_FRAG(x)    (x&0x1f)<<7                     amdgpu_vm.h:70
 //   AMDGPU_PTE_MTYPE_GFX12_SHIFT(m)  (m)<<54              amdgpu_vm.h:126
+//   AMDGPU_PTE_PRT_GFX12             1ULL<<56             amdgpu_vm.h
 //   AMDGPU_PDE_BFS_GFX12(a)          ((a)&0x1f)<<58       amdgpu_vm.h:138
 //   AMDGPU_PTE_IS_PTE / AMDGPU_PDE_PTE_GFX12  1<<63       amdgpu_vm.h:134/141
 //   pte_addr_mask for IP_VERSION(12,0,1)  0x0000FFFFFFFFF000  gmc_v12_0.c:841
@@ -1761,6 +1762,14 @@ gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
                 (unsigned)hub.ip, (unsigned)vmid, (unsigned)flush_type,
                 (unsigned)req, (unsigned long long)call_start_us, (unsigned long long)elapsed_us);
     return kIOReturnSuccess;
+}
+
+uint64_t
+gmc_vm_pte_flags(uint64_t flags, bool prt)
+{
+    if (prt)
+        return (flags & ~PTEFlags::VALID) | PTEFlags::PRT_LEAF;
+    return flags;
 }
 
 //============================================================

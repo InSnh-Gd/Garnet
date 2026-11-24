@@ -255,7 +255,7 @@ static void t5_budget() {
     }
     expect(RDNA4N_INFO_R_BUDGET_FLAGS == 3u && RDNA4N_INFO_R_BUDGET_CAP_LO == 4u && RDNA4N_INFO_R_BUDGET_CAP_HI == 5u && RDNA4N_INFO_R_BUDGET_AVAIL_LO == 6u && RDNA4N_INFO_R_BUDGET_AVAIL_HI == 7u, "T5: the ABI indices");
     expect(sizeof(((rdna4n_info *)nullptr)->reserved) / sizeof(uint32_t) == 8, "T5: reserved[] has eight words (the struct size is unchanged)");
-    expect_u("T5: ABI minor 12", RDNA4N_ABI_MINOR, 12);
+    expect_u("T5: ABI minor 13", RDNA4N_ABI_MINOR, 13);
 }
 
 // ---- T6 -------------------------------------------------------------------------------------------------------------------------------------------------
@@ -342,7 +342,7 @@ static void t8_pins(const std::string &root) {
     // version and ABI
     expect(count_of(plist, "<string>0.0.673</string>") == 2 && plist.find("0.0.632") == std::string::npos, "T8: Info.plist is 0.0.673, carried twice");
     expect(engh.find("constexpr uint32_t kN1cKextBuild = 673;") != std::string::npos, "T8: the native client reports build 673");
-    expect(abi.find("#define RDNA4N_ABI_MINOR     12u ") != std::string::npos, "T8: ABI minor 12");
+    expect(abi.find("#define RDNA4N_ABI_MINOR     13u ") != std::string::npos, "T8: ABI minor 13");
     expect(abi.find("#define RDNA4N_BUDGET_VALID (1u << 0)") != std::string::npos && abi.find("#define RDNA4N_BUDGET_APP   (1u << 1)") != std::string::npos, "T8: the budget flags are in the ABI header");
     // the latch: one reader, latched once, needs multi
     expect_u("T8: boot-arg garnet-apps is read in exactly one place in the whole kext", count_of(eng, "PE_parse_boot_argn(\"garnet-apps\""), 1);

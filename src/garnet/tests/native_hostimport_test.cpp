@@ -321,7 +321,7 @@ static void h5_pins(const std::string &root) {
     const std::string pure = slurp(K + "src/amd/native_hostimport_pure.h"), plist = slurp(K + "Info.plist");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !abi.empty() && !pure.empty(), "the sources are readable from the root given");
     // the selector: number, shape, task
-    expect_u("BoImportHost is the next free selector, 21", RDNA4N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 12", RDNA4N_ABI_MINOR, 12); expect_u("selector count 1.9", RDNA4N_SEL_COUNT_1_9, 22);
+    expect_u("BoImportHost is the next free selector, 21", RDNA4N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 13", RDNA4N_ABI_MINOR, 13); expect_u("selector count 1.9", RDNA4N_SEL_COUNT_1_9, 22);
     expect_u("the ABI major is unchanged", RDNA4N_ABI_VERSION, 1);
     { const size_t c = cli.find("case RDNA4N_SEL_BO_IMPORT_HOST:\n\t\tif (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;\n"), r = cli.find("\t\treturn amdgpu::n1c_bo_import_host(r, task, si[0], si[1], si[2], si[3], so);", c == std::string::npos ? 0 : c);
       expect(c != std::string::npos && r != std::string::npos && cli.substr(c, r - c).find("import_caller_ok(current_task(), task)") != std::string::npos,

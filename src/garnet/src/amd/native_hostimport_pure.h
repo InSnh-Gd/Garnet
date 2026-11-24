@@ -128,6 +128,16 @@ inline uint32_t pt_map_pages_tx(uint64_t rootPa, uint64_t va, uint64_t pages, co
     }
     return rc;
 }
+// Scattered-page REPLACE twin: preserves pre-existing overlapping leaves on Pass-1 quota failure.
+template <class M>
+inline uint32_t pt_replace_pages_tx(uint64_t rootPa, uint64_t va, uint64_t pages, const uint64_t *pagePa, uint64_t leafFlagsIn, M &m) {
+    uint32_t rc = pt_va_precheck(va, pages);
+    if (rc != kOk) return rc;
+    auto snap = m.snapshot();
+    rc = pt_map_pages(rootPa, va, pages, pagePa, leafFlagsIn, m);
+    if (rc != kOk) m.rollback(snap, rootPa, va, pages);
+    return rc;
+}
 
 // ---- device memory refusal (0.0.612 review item A) -----------------------------------------------------------------------------------------
 // A caller could wire a range of ITS OWN address space that is really device memory (a mapped PCI BAR: ours, or another device's), and BoImportHost would then hand the GPU a PTE that

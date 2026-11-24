@@ -457,6 +457,11 @@ kern_return_t gmc_bind_at(DeviceContext &dev, GMCContext &gmc,
                           uint64_t gartOffset, uint64_t busAddr,
                           uint64_t sizeBytes);
 
+// GFX12 VM leaf PTE flag helper (mirrors Linux gmc_v12_0_get_vm_pte):
+// when `prt` is true, sets AMDGPU_PTE_PRT_GFX12 (1ULL << 56) | SNOOPED | SYSTEM | IS_PTE
+// and clears AMDGPU_PTE_VALID (0x1).
+uint64_t gmc_vm_pte_flags(uint64_t flags, bool prt);
+
 // 0.0.368: how many of those overlap refusals happened this boot.
 // Must remain zero so fixed bindings never collide with driver-owned pages.
 // Latched, never cleared.

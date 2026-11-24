@@ -21,15 +21,17 @@ TESTS += $(BUILD)/primary_vbl_test
 TESTS += $(BUILD)/dcn41_cursor_test
 TESTS += $(BUILD)/vmid_pool_test
 TESTS += $(BUILD)/dcn41_ddc_sleep_test
+PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
 TLB83_ARGS := $(SRC)/amd/gmc_v12_0.cpp $(SRC)/amd/amdgpu_regs.h $(SRC)/GarnetDriver.cpp $(SRC)/amd
 TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_v14_0.cpp \
   sdma_v7_0.cpp amdgpu_init.cpp amdgpu_gart.cpp mes_v12_1.cpp cp_v12_0.cpp rlc_v12_0.cpp compute_test.cpp)
 SCANOUT_FULL_ARGS := $(SRC)/dcn/scanout_sdma.cpp $(SRC)/dcn/dcn.cpp $(SRC)/GarnetUserClient.cpp
 
-all: $(TESTS)
+all: $(TESTS) $(PRT_SPARSE_TEST)
 	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST),$(TESTS)); do "$$test"; done
 	$(TLB83_TEST) $(TLB83_ARGS)
 	$(SCANOUT_FULL_TEST) $(SCANOUT_FULL_ARGS)
+	$(PRT_SPARSE_TEST) "$(abspath ../../..)"
 
 $(BUILD):
 	mkdir -p $@
@@ -178,4 +180,12 @@ $(BUILD)/native_systemmemory_test: native_systemmemory_test.cpp $(SRC)/amd/nativ
 system-memory: $(BUILD)/native_systemmemory_test
 	$(BUILD)/native_systemmemory_test "$(abspath ../../..)"
 
-.PHONY: all gfx-golden smu-setup init-gart mes-resources gmc-resources large-pt system-memory
+$(PRT_SPARSE_TEST): native_prt_sparse_test.cpp $(PTMEM_INC) $(SRC)/amd/native_s1b_pure.h \
+  $(SRC)/amd/native_s1c_pure.h $(SRC)/amd/native_hostimport_pure.h $(SRC)/amd/native_g2_pure.h \
+  $(SRC)/GarnetNativeABI.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD) $< -o $@
+
+prt-sparse: $(PRT_SPARSE_TEST)
+	$(PRT_SPARSE_TEST) "$(abspath ../../..)"
+
+.PHONY: all gfx-golden smu-setup init-gart mes-resources gmc-resources large-pt system-memory prt-sparse
