@@ -188,6 +188,7 @@ int main(int argc, char **argv) {
       char *bf = assembled ? NULL : slurp(dir, "rdna4_buffer_impl.inc");
       char *rs = assembled ? NULL : slurp(dir, "rdna4_residency_set_impl.inc");
       char *cb = assembled ? NULL : slurp(dir, "rdna4_command_buffer_impl.inc");
+      char *sr = assembled ? NULL : slurp(dir, "rdna4_shader_runtime_impl.inc");
       const char *rpSrc = assembled ? gm : rp;
       const char *cpSrc = assembled ? gm : cp;
       const char *reSrc = assembled ? gm : re;
@@ -195,6 +196,7 @@ int main(int argc, char **argv) {
       const char *bfSrc = assembled ? gm : bf;
       const char *rsSrc = assembled ? gm : rs;
       const char *cbSrc = assembled ? gm : cb;
+      const char *srSrc = assembled ? gm : sr;
       CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
             gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
                && strstr(gm, "- (BOOL)supportsBCTextureCompression")
@@ -259,7 +261,7 @@ int main(int argc, char **argv) {
                && strstr(cbSrc, "rdna4CurrentHandle")
                && strstr(cbSrc, "objc_getClass(\"RDNA4SparseHeap\")"));
       CHECK("G14: GarnetDevice.m wires Wave 3B dynlib/VFT, AS buffer build-input bit, and sparse residency",
-            gm && rpSrc && cpSrc && reSrc && ceSrc && bfSrc && rsSrc
+            gm && rpSrc && cpSrc && reSrc && ceSrc && bfSrc && rsSrc && srSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4DynamicLibrary")
                                 && strstr(gm, "@implementation RDNA4FunctionHandle")
                                 && strstr(gm, "@implementation RDNA4VisibleFunctionTable"))
@@ -274,6 +276,7 @@ int main(int argc, char **argv) {
                && strstr(cpSrc, "rdna4x_parse_vft_from_meta(")
                && strstr(cpSrc, "- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function")
                && strstr(cpSrc, "- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor")
+               && strstr(srSrc, "const BOOL requireStage2 = (dynlibs.count > 0 || visFns.count > 0 || deps.count > 0 || f || bf || pf || gg || pl || addBin);")
                && strstr(gm, "!noStage2Fallback && rdna4_fallback_ok()")
                && strstr(rpSrc, "rdna4_vft_validate_render_footnote10(")
                && strstr(rpSrc, "rdna4x_parse_vft_from_meta(")
@@ -291,6 +294,7 @@ int main(int argc, char **argv) {
                && strstr(bfSrc, "VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR")
                && strstr(rsSrc, "objc_getClass(\"RDNA4SparseHeap\")")
                && strstr(rsSrc, "sparse textures/heaps are not supported") == NULL);
+      free(sr);
       free(cb);
       free(rs);
       free(bf);

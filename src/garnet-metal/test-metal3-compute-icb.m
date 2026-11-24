@@ -14,11 +14,44 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+@interface NSObject (GarnetTestAccelInit)
+- (instancetype)initWithAcceleratorPort:(uint32_t)port;
+@end
+
+static id<MTLDevice> createGarnetDevice(Class cls) {
+    id<MTLDevice> dev = nil;
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (iokit) {
+        typedef void *(*io_matching_fn)(const char *);
+        typedef uint32_t (*io_get_svc_fn)(uint32_t, void *);
+        typedef int (*io_rel_fn)(uint32_t);
+        io_matching_fn matchFn = (io_matching_fn)dlsym(iokit, "IOServiceMatching");
+        io_get_svc_fn getSvcFn = (io_get_svc_fn)dlsym(iokit, "IOServiceGetMatchingService");
+        io_rel_fn relFn = (io_rel_fn)dlsym(iokit, "IOObjectRelease");
+        if (matchFn && getSvcFn) {
+            void *matching = matchFn("GarnetAccelerator");
+            uint32_t port = matching ? getSvcFn(0u /* kIOMainPortDefault */, matching) : 0u;
+            if (port) {
+                if ([cls instancesRespondToSelector:@selector(initWithAcceleratorPort:)])
+                    dev = [[cls alloc] initWithAcceleratorPort:port];
+                if (relFn) relFn(port);
+            }
+        }
+    }
+    if (!dev) {
+        dev = [[cls alloc] init];
+        if (dev && [dev respondsToSelector:sel_registerName("initLimits")])
+            ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+    }
+    return dev;
+}
 
 #ifndef MTLAttributeStrideStatic
 #define MTLAttributeStrideStatic ((NSUInteger)NSUIntegerMax)
@@ -543,12 +576,11 @@ static void testComputeICBNegativePaths(id<MTLDevice> dev, id<MTLCommandQueue> q
 
 int main(int argc, const char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
-        puts("Usage: sudo test-metal3-compute-icb BUNDLE|--reference");
+        puts("Usage: test-metal3-compute-icb BUNDLE|--reference");
         return 0;
     }
     if (argc != 2) return 2;
     BOOL ref = !strcmp(argv[1], "--reference");
-    if (!ref && geteuid() != 0) return 2;
     setvbuf(stdout, NULL, _IONBF, 0);
     alarm(180);
     @autoreleasepool {
@@ -561,8 +593,9 @@ int main(int argc, const char **argv) {
             NSError *err = nil;
             if (![[NSBundle bundleWithPath:@(argv[1])] loadAndReturnError:&err])
                 fail(err.description);
-            dev = [[objc_getClass("GarnetDevice") alloc] init];
-            ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+            Class cls = objc_getClass("GarnetDevice");
+            if (cls == Nil) fail(@"GarnetDevice missing");
+            dev = createGarnetDevice(cls);
         }
         if (!dev) fail(@"device nil");
         id<MTLCommandQueue> queue = [dev newCommandQueue];

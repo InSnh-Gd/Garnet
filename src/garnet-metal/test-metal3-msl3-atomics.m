@@ -1,26 +1,57 @@
 // test-metal3-msl3-atomics.m: live RX 9060 XT / reference Metal verification for Task 2.6
-// (MSL 2.2-3.2: atomic<float> device + threadgroup add/sub/exchange/CAS min+max,
-// 64-bit integer atomics atomic<uint64_t>/atomic<int64_t> via Int64Atomics,
-// bfloat / bfloat4 FMA, math & conversions, storage-texture atomics on R32Uint/R32Sint,
-// and simd_shuffle_and_fill_{up,down} with default and explicit modulo vs race-free CPU oracle).
+// (MSL 2.2-3.2: device atomic<float> add/sub/exchange/load/store/CAS min+max,
+// threadgroup atomic_uint/atomic_int, 64-bit integer atomics atomic_ulong/atomic<int64_t>
+// via Int64Atomics, bfloat / bfloat4 FMA, math & conversions, storage-texture atomics on
+// R32Uint/R32Sint, and simd_shuffle_and_fill_{up,down} with default and explicit modulo vs CPU oracle).
 // Build on macOS:
-//   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal \
-//     src/garnet-metal/test-metal3-msl3-atomics.m -o "$TMPDIR/test-metal3-msl3-atomics"
+//   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal src/garnet-metal/test-metal3-msl3-atomics.m -o "$TMPDIR/test-metal3-msl3-atomics"
 // Run:
-//   sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
-//     "$TMPDIR/test-metal3-msl3-atomics" /path/to/GarnetMetal.bundle
+//   "$TMPDIR/test-metal3-msl3-atomics" /path/to/GarnetMetal.bundle
 //   "$TMPDIR/test-metal3-msl3-atomics" --reference
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+@interface NSObject (GarnetTestAccelInit)
+- (instancetype)initWithAcceleratorPort:(uint32_t)port;
+@end
+
+static id<MTLDevice> createGarnetDevice(Class cls) {
+    id<MTLDevice> dev = nil;
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (iokit) {
+        typedef void *(*io_matching_fn)(const char *);
+        typedef uint32_t (*io_get_svc_fn)(uint32_t, void *);
+        typedef int (*io_rel_fn)(uint32_t);
+        io_matching_fn matchFn = (io_matching_fn)dlsym(iokit, "IOServiceMatching");
+        io_get_svc_fn getSvcFn = (io_get_svc_fn)dlsym(iokit, "IOServiceGetMatchingService");
+        io_rel_fn relFn = (io_rel_fn)dlsym(iokit, "IOObjectRelease");
+        if (matchFn && getSvcFn) {
+            void *matching = matchFn("GarnetAccelerator");
+            uint32_t port = matching ? getSvcFn(0u /* kIOMainPortDefault */, matching) : 0u;
+            if (port) {
+                if ([cls instancesRespondToSelector:@selector(initWithAcceleratorPort:)])
+                    dev = [[cls alloc] initWithAcceleratorPort:port];
+                if (relFn) relFn(port);
+            }
+        }
+    }
+    if (!dev) {
+        dev = [[cls alloc] init];
+        if (dev && [dev respondsToSelector:sel_registerName("initLimits")])
+            ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+    }
+    return dev;
+}
 
 enum {
     kGuardBytes = 256,
@@ -117,30 +148,28 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
          "    float cur = atomic_load_explicit(p, memory_order_relaxed);\n"
          "    while (v < cur && !atomic_compare_exchange_weak_explicit(p, &cur, v, memory_order_relaxed, memory_order_relaxed)) {}\n"
          "}\n"
-         "static inline void atomic_max_f32_tg(threadgroup atomic_float *p, float v) {\n"
-         "    float cur = atomic_load_explicit(p, memory_order_relaxed);\n"
-         "    while (v > cur && !atomic_compare_exchange_weak_explicit(p, &cur, v, memory_order_relaxed, memory_order_relaxed)) {}\n"
-         "}\n"
-         "static inline void atomic_min_f32_tg(threadgroup atomic_float *p, float v) {\n"
-         "    float cur = atomic_load_explicit(p, memory_order_relaxed);\n"
-         "    while (v < cur && !atomic_compare_exchange_weak_explicit(p, &cur, v, memory_order_relaxed, memory_order_relaxed)) {}\n"
-         "}\n"
          "kernel void k_float_atomics(device atomic_float *devSlots [[buffer(0)]],\n"
          "                            device float *xchgOld [[buffer(1)]],\n"
-         "                            device float *tgOut [[buffer(2)]],\n"
+         "                            device uint *tgOutU [[buffer(2)]],\n"
+         "                            device int *tgOutS [[buffer(3)]],\n"
          "                            uint gid [[thread_position_in_grid]],\n"
          "                            uint lid [[thread_position_in_threadgroup]],\n"
          "                            uint tgid [[threadgroup_position_in_grid]]) {\n"
-         "    threadgroup atomic_float tg[4];\n"
+         "    threadgroup atomic_uint tgU[4];\n"
+         "    threadgroup atomic_int tgS[4];\n"
          "    if (lid == 0u) {\n"
-         "        atomic_store_explicit(&tg[0], 0.0f, memory_order_relaxed);\n"
-         "        atomic_store_explicit(&tg[1], 5000.0f, memory_order_relaxed);\n"
-         "        atomic_store_explicit(&tg[2], -1000.0f, memory_order_relaxed);\n"
-         "        atomic_store_explicit(&tg[3],  1000.0f, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgU[0], 0u, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgU[1], 5000u, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgU[2], 0u, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgU[3], 0xFFFFFFFFu, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgS[0], 0, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgS[1], 1000, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgS[2], -1000, memory_order_relaxed);\n"
+         "        atomic_store_explicit(&tgS[3], 1000, memory_order_relaxed);\n"
          "    }\n"
          "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
          "\n"
-         "    // Contended device atomic<float> ops across 256 threads.\n"
+         "    // Contended device atomic<float> ops across 256 threads (MSL 3.0 atomic<float> is device-only).\n"
          "    atomic_fetch_add_explicit(&devSlots[0], float(gid + 1u), memory_order_relaxed);\n"
          "    atomic_fetch_sub_explicit(&devSlots[1], 0.5f * float(gid + 1u), memory_order_relaxed);\n"
          "    xchgOld[gid] = atomic_exchange_explicit(&devSlots[2], float(gid + 1001u), memory_order_relaxed);\n"
@@ -148,19 +177,30 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
          "    atomic_max_f32_dev(&devSlots[3], cand);\n"
          "    atomic_min_f32_dev(&devSlots[4], cand);\n"
          "\n"
-         "    // Contended threadgroup atomic<float> ops across 64 threads per group.\n"
-         "    atomic_fetch_add_explicit(&tg[0], float(lid + 1u), memory_order_relaxed);\n"
-         "    atomic_fetch_sub_explicit(&tg[1], 0.25f * float(lid + 1u), memory_order_relaxed);\n"
-         "    float tcand = float(int(lid) - 30) * 0.5f;\n"
-         "    atomic_max_f32_tg(&tg[2], tcand);\n"
-         "    atomic_min_f32_tg(&tg[3], tcand);\n"
+         "    // Contended threadgroup atomic_uint / atomic_int ops across 64 threads per group.\n"
+         "    atomic_fetch_add_explicit(&tgU[0], lid + 1u, memory_order_relaxed);\n"
+         "    atomic_fetch_sub_explicit(&tgU[1], lid + 1u, memory_order_relaxed);\n"
+         "    atomic_fetch_max_explicit(&tgU[2], lid * 3u + 5u, memory_order_relaxed);\n"
+         "    atomic_fetch_min_explicit(&tgU[3], 500u - lid * 5u, memory_order_relaxed);\n"
+         "    atomic_fetch_add_explicit(&tgS[0], int(lid) - 30, memory_order_relaxed);\n"
+         "    atomic_fetch_sub_explicit(&tgS[1], int(lid) - 20, memory_order_relaxed);\n"
+         "    atomic_fetch_max_explicit(&tgS[2], int(lid) * 2 - 50, memory_order_relaxed);\n"
+         "    atomic_fetch_min_explicit(&tgS[3], int(lid) * 2 - 50, memory_order_relaxed);\n"
          "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
          "    if (lid == 0u) {\n"
-         "        tgOut[tgid * 4u + 0u] = atomic_load_explicit(&tg[0], memory_order_relaxed);\n"
-         "        tgOut[tgid * 4u + 1u] = atomic_load_explicit(&tg[1], memory_order_relaxed);\n"
-         "        tgOut[tgid * 4u + 2u] = atomic_load_explicit(&tg[2], memory_order_relaxed);\n"
-         "        tgOut[tgid * 4u + 3u] = atomic_load_explicit(&tg[3], memory_order_relaxed);\n"
-         "        if (tgid == 0u) atomic_store_explicit(&devSlots[5], tgOut[0], memory_order_relaxed);\n"
+         "        uint sumU = atomic_load_explicit(&tgU[0], memory_order_relaxed);\n"
+         "        tgOutU[tgid * 4u + 0u] = sumU;\n"
+         "        tgOutU[tgid * 4u + 1u] = atomic_load_explicit(&tgU[1], memory_order_relaxed);\n"
+         "        tgOutU[tgid * 4u + 2u] = atomic_load_explicit(&tgU[2], memory_order_relaxed);\n"
+         "        tgOutU[tgid * 4u + 3u] = atomic_load_explicit(&tgU[3], memory_order_relaxed);\n"
+         "        tgOutS[tgid * 4u + 0u] = atomic_load_explicit(&tgS[0], memory_order_relaxed);\n"
+         "        tgOutS[tgid * 4u + 1u] = atomic_load_explicit(&tgS[1], memory_order_relaxed);\n"
+         "        tgOutS[tgid * 4u + 2u] = atomic_load_explicit(&tgS[2], memory_order_relaxed);\n"
+         "        tgOutS[tgid * 4u + 3u] = atomic_load_explicit(&tgS[3], memory_order_relaxed);\n"
+         "        if (tgid == 0u) {\n"
+         "            float base = atomic_load_explicit(&devSlots[6], memory_order_relaxed);\n"
+         "            atomic_store_explicit(&devSlots[5], base + float(sumU), memory_order_relaxed);\n"
+         "        }\n"
          "    }\n"
          "}\n";
     NSError *err = nil;
@@ -173,15 +213,18 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
     const NSUInteger kNumTg = kThreads / kTgSize;
     const NSUInteger devBytes = 8 * sizeof(float);
     const NSUInteger xchgBytes = kThreads * sizeof(float);
-    const NSUInteger tgBytes = kNumTg * 4 * sizeof(float);
+    const NSUInteger tgUBytes = kNumTg * 4 * sizeof(uint32_t);
+    const NSUInteger tgSBytes = kNumTg * 4 * sizeof(int32_t);
 
     id<MTLBuffer> devBuf = [dev newBufferWithLength:devBytes + 2 * kGuardBytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> xchgBuf = [dev newBufferWithLength:xchgBytes + 2 * kGuardBytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> tgBuf = [dev newBufferWithLength:tgBytes + 2 * kGuardBytes options:MTLResourceStorageModeShared];
-    require(devBuf && xchgBuf && tgBuf, @"float_atomics buffers nil");
+    id<MTLBuffer> tgBufU = [dev newBufferWithLength:tgUBytes + 2 * kGuardBytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> tgBufS = [dev newBufferWithLength:tgSBytes + 2 * kGuardBytes options:MTLResourceStorageModeShared];
+    require(devBuf && xchgBuf && tgBufU && tgBufS, @"float_atomics buffers nil");
     initGuardedBuffer(devBuf, devBytes);
     initGuardedBuffer(xchgBuf, xchgBytes);
-    initGuardedBuffer(tgBuf, tgBytes);
+    initGuardedBuffer(tgBufU, tgUBytes);
+    initGuardedBuffer(tgBufS, tgSBytes);
 
     float *initDev = (float *)((uint8_t *)devBuf.contents + kGuardBytes);
     initDev[0] = 0.0f;
@@ -190,6 +233,7 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
     initDev[3] = -1000.0f;
     initDev[4] = 1000.0f;
     initDev[5] = -999.0f;
+    initDev[6] = 42.5f;
 
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -197,24 +241,28 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
     [ce setComputePipelineState:pso];
     [ce setBuffer:devBuf offset:kGuardBytes atIndex:0];
     [ce setBuffer:xchgBuf offset:kGuardBytes atIndex:1];
-    [ce setBuffer:tgBuf offset:kGuardBytes atIndex:2];
+    [ce setBuffer:tgBufU offset:kGuardBytes atIndex:2];
+    [ce setBuffer:tgBufS offset:kGuardBytes atIndex:3];
     [ce dispatchThreadgroups:MTLSizeMake(kNumTg, 1, 1) threadsPerThreadgroup:MTLSizeMake(kTgSize, 1, 1)];
     [ce endEncoding];
     finishOK(cb, @"float_atomics");
 
     checkGuards(devBuf, devBytes, @"float_atomics dev");
     checkGuards(xchgBuf, xchgBytes, @"float_atomics xchg");
-    checkGuards(tgBuf, tgBytes, @"float_atomics tg");
+    checkGuards(tgBufU, tgUBytes, @"float_atomics tgU");
+    checkGuards(tgBufS, tgSBytes, @"float_atomics tgS");
 
     const float *gotDev = (const float *)((const uint8_t *)devBuf.contents + kGuardBytes);
     const float *gotXchg = (const float *)((const uint8_t *)xchgBuf.contents + kGuardBytes);
-    const float *gotTg = (const float *)((const uint8_t *)tgBuf.contents + kGuardBytes);
+    const uint32_t *gotTgU = (const uint32_t *)((const uint8_t *)tgBufU.contents + kGuardBytes);
+    const int32_t *gotTgS = (const int32_t *)((const uint8_t *)tgBufS.contents + kGuardBytes);
 
     require(gotDev[0] == 32896.0f, [NSString stringWithFormat:@"float dev add=%g exp=32896", gotDev[0]]);
     require(gotDev[1] == 33552.0f, [NSString stringWithFormat:@"float dev sub=%g exp=33552", gotDev[1]]);
     require(gotDev[3] == 33.75f, [NSString stringWithFormat:@"float dev max=%g exp=33.75", gotDev[3]]);
     require(gotDev[4] == -30.0f, [NSString stringWithFormat:@"float dev min=%g exp=-30", gotDev[4]]);
-    require(gotDev[5] == 2080.0f, [NSString stringWithFormat:@"float dev store=%g exp=2080", gotDev[5]]);
+    require(gotDev[5] == 2122.5f && gotDev[6] == 42.5f,
+            [NSString stringWithFormat:@"float dev load/store=(%g,%g) exp=(2122.5,42.5)", gotDev[5], gotDev[6]]);
 
     // Every value in {1000..1256} must appear exactly once across xchgOld[0..255] + final devSlots[2].
     uint8_t seen[257] = {0};
@@ -233,10 +281,14 @@ static void runFloatAtomics(id<MTLDevice> dev, id<MTLCommandQueue> q) {
     }
 
     for (NSUInteger g = 0; g < kNumTg; g++) {
-        require(gotTg[g * 4 + 0] == 2080.0f && gotTg[g * 4 + 1] == 4480.0f &&
-                gotTg[g * 4 + 2] == 16.5f && gotTg[g * 4 + 3] == -15.0f,
-                [NSString stringWithFormat:@"float tg[%lu]=(%g,%g,%g,%g) exp=(2080,4480,16.5,-15)",
-                 (unsigned long)g, gotTg[g * 4 + 0], gotTg[g * 4 + 1], gotTg[g * 4 + 2], gotTg[g * 4 + 3]]);
+        require(gotTgU[g * 4 + 0] == 2080u && gotTgU[g * 4 + 1] == 2920u &&
+                gotTgU[g * 4 + 2] == 194u && gotTgU[g * 4 + 3] == 185u,
+                [NSString stringWithFormat:@"tgU[%lu]=(%u,%u,%u,%u) exp=(2080,2920,194,185)",
+                 (unsigned long)g, gotTgU[g * 4 + 0], gotTgU[g * 4 + 1], gotTgU[g * 4 + 2], gotTgU[g * 4 + 3]]);
+        require(gotTgS[g * 4 + 0] == 96 && gotTgS[g * 4 + 1] == 264 &&
+                gotTgS[g * 4 + 2] == 76 && gotTgS[g * 4 + 3] == -50,
+                [NSString stringWithFormat:@"tgS[%lu]=(%d,%d,%d,%d) exp=(96,264,76,-50)",
+                 (unsigned long)g, gotTgS[g * 4 + 0], gotTgS[g * 4 + 1], gotTgS[g * 4 + 2], gotTgS[g * 4 + 3]]);
     }
     puts("METAL3_MSL3_ATOMICS_CASE_PASS atomic_float");
 }
@@ -867,9 +919,7 @@ int main(int argc, char **argv) {
                 failf([NSString stringWithFormat:@"bundle load: %@", err]);
             Class cls = objc_getClass("GarnetDevice");
             require(cls != Nil, @"GarnetDevice missing");
-            dev = [[cls alloc] init];
-            if ([dev respondsToSelector:sel_registerName("initLimits")])
-                ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+            dev = createGarnetDevice(cls);
         }
         require(dev != nil, @"device unavailable");
         id<MTLCommandQueue> q = [dev newCommandQueue];

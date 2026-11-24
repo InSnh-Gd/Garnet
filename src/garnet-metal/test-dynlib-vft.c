@@ -664,12 +664,27 @@ static void test_source_pins(const char *src_dir) {
               "runtime refuses binaryFunctions cap overflow instead of truncating");
         CHECK(strstr(rt, "out of memory copying Stage 2 translation outputs") != NULL,
               "runtime fails cleanly on Stage 2 output copy OOM");
+        CHECK(strstr(rt, "const BOOL requireStage2 = (dynlibs.count > 0 || visFns.count > 0 || deps.count > 0 || f || bf || pf || gg || pl || addBin);") != NULL,
+              "runtime sets requireStage2 for all linkedFunctions (visible/binary/private/groups) and preloadedLibraries");
+        CHECK(strstr(rt, "if (!ctx && why && fn && (f || bf || pf || gg || pl || addBin) && rdna4x_active())") != NULL,
+              "runtime preserves deterministic linkageError for all linkedFunctions categories on admitted apps");
         free(rt);
     }
 
     char *impl = read_entire_text_file(p2);
     CHECK(impl != NULL, "read rdna4_dynlib_vft_impl.inc");
     if (impl) {
+        const char *libBcPos = strstr(impl, "rdna4_dl_objc_prop(library, \"bitcodeData\")");
+        const char *extFnPos = strstr(impl, "\"newExternFunctionWithName:\"");
+        CHECK(libBcPos != NULL && extFnPos != NULL && libBcPos < extFnPos,
+              "newDynamicLibrary extracts library.bitcodeData BEFORE any newExternFunctionWithName: probe");
+        CHECK(strstr(impl, "for (NSString *fnName in externNames)") != NULL &&
+              strstr(impl, "for (NSString *fnName in funcNames)") != NULL &&
+              strstr(impl, "nameProps") == NULL,
+              "newExternFunctionWithName: is restricted strictly to externFunctionNames (never functionNames)");
+        CHECK(strstr(impl, "RDNA4DL_PAYLOAD_METALLIB") != NULL &&
+              strstr(impl, "rdna4x_list_exported_symbols_for_module") != NULL,
+              "newDynamicLibrary handles metallib fallback and enumerates exported symbols from bitcode");
         CHECK(strstr(impl, "rdna4_dl_objc_new1") != NULL && strstr(impl, "CFBridgingRelease(raw)") != NULL,
               "dynamic new* selector transfers +1 ownership via CFBridgingRelease");
         CHECK(strstr(impl, "MTLLibrary belongs to a different MTLDevice") != NULL,

@@ -3,23 +3,54 @@
 // and Pull-Model Interpolation: interpolant<T>::interpolate_at_{center,centroid,sample,offset}
 // at 4x MSAA for float2 perspective/no_perspective and half2 no_perspective vs analytical oracle).
 // Build on macOS:
-//   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal \
-//     src/garnet-metal/test-metal3-bary-pull.m -o "$TMPDIR/test-metal3-bary-pull"
+//   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal src/garnet-metal/test-metal3-bary-pull.m -o "$TMPDIR/test-metal3-bary-pull"
 // Run:
-//   sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
-//     "$TMPDIR/test-metal3-bary-pull" /path/to/GarnetMetal.bundle
+//   "$TMPDIR/test-metal3-bary-pull" /path/to/GarnetMetal.bundle
 //   "$TMPDIR/test-metal3-bary-pull" --reference
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+@interface NSObject (GarnetTestAccelInit)
+- (instancetype)initWithAcceleratorPort:(uint32_t)port;
+@end
+
+static id<MTLDevice> createGarnetDevice(Class cls) {
+    id<MTLDevice> dev = nil;
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (iokit) {
+        typedef void *(*io_matching_fn)(const char *);
+        typedef uint32_t (*io_get_svc_fn)(uint32_t, void *);
+        typedef int (*io_rel_fn)(uint32_t);
+        io_matching_fn matchFn = (io_matching_fn)dlsym(iokit, "IOServiceMatching");
+        io_get_svc_fn getSvcFn = (io_get_svc_fn)dlsym(iokit, "IOServiceGetMatchingService");
+        io_rel_fn relFn = (io_rel_fn)dlsym(iokit, "IOObjectRelease");
+        if (matchFn && getSvcFn) {
+            void *matching = matchFn("GarnetAccelerator");
+            uint32_t port = matching ? getSvcFn(0u /* kIOMainPortDefault */, matching) : 0u;
+            if (port) {
+                if ([cls instancesRespondToSelector:@selector(initWithAcceleratorPort:)])
+                    dev = [[cls alloc] initWithAcceleratorPort:port];
+                if (relFn) relFn(port);
+            }
+        }
+    }
+    if (!dev) {
+        dev = [[cls alloc] init];
+        if (dev && [dev respondsToSelector:sel_registerName("initLimits")])
+            ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+    }
+    return dev;
+}
 
 enum {
     kW = 16,
@@ -150,9 +181,7 @@ int main(int argc, char **argv) {
                 failf([NSString stringWithFormat:@"bundle load: %@", err]);
             Class cls = objc_getClass("GarnetDevice");
             require(cls != Nil, @"GarnetDevice missing");
-            dev = [[cls alloc] init];
-            if ([dev respondsToSelector:sel_registerName("initLimits")])
-                ((void (*)(id, SEL))objc_msgSend)(dev, sel_registerName("initLimits"));
+            dev = createGarnetDevice(cls);
         }
         require(dev != nil, @"device unavailable");
         id<MTLCommandQueue> q = [dev newCommandQueue];

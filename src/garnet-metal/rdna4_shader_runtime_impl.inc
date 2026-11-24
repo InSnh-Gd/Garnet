@@ -1176,7 +1176,7 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
         if (!esha) why = @"the entry function has no bitcodeData";
         else {
             const BOOL useStage2 = (dynlibs.count > 0 || visFns.count > 0 || bf || pl || addBin);
-            const BOOL requireStage2 = (dynlibs.count > 0 || bf || pl);
+            const BOOL requireStage2 = (dynlibs.count > 0 || visFns.count > 0 || deps.count > 0 || f || bf || pf || gg || pl || addBin);
             char key[65];
             int krc = -1;
             if (useStage2) {
@@ -1208,8 +1208,8 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
             }
         }
     }
-    if (!ctx && why && fn && (bf || pl) && rdna4x_active()) {
-        // Preserve deterministic linkage errors for preloadedLibraries/binaryFunctions instead of silently ignoring.
+    if (!ctx && why && fn && (f || bf || pf || gg || pl || addBin) && rdna4x_active()) {
+        // Preserve deterministic linkage errors for linkedFunctions/preloadedLibraries instead of silently falling back.
         ctx = [RDNA4LinkCtx new];
         ctx->fn = fn;
         ctx->lsha = @"0000000000000000000000000000000000000000000000000000000000000000";

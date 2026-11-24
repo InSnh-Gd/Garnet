@@ -235,42 +235,79 @@ static BOOL rdna4_dl_append_unique_module(rdna4dl_container_t *container,
         return nil;
     }
 
-    NSMutableArray<NSString *> *candidateNames = [NSMutableArray array];
+    NSMutableArray<NSString *> *externNames = [NSMutableArray array];
+    NSMutableArray<NSString *> *funcNames = [NSMutableArray array];
+    NSMutableArray<NSString *> *allNames = [NSMutableArray array];
     NSMutableSet<NSString *> *seenNames = [NSMutableSet set];
-    static const char *const nameProps[2] = { "externFunctionNames", "functionNames" };
-    for (size_t pi = 0; pi < 2u; pi++) {
-        id arr = rdna4_dl_objc_prop(library, nameProps[pi]);
-        if (![arr isKindOfClass:[NSArray class]]) continue;
-        for (id item in (NSArray *)arr) {
-            if ([item isKindOfClass:[NSString class]] && [(NSString *)item length] && ![seenNames containsObject:item]) {
-                [seenNames addObject:item];
-                [candidateNames addObject:item];
+    {
+        id extArr = rdna4_dl_objc_prop(library, "externFunctionNames");
+        if ([extArr isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)extArr) {
+                if ([item isKindOfClass:[NSString class]] && [(NSString *)item length] && ![seenNames containsObject:item]) {
+                    [seenNames addObject:item];
+                    [externNames addObject:item];
+                    [allNames addObject:item];
+                }
+            }
+        }
+        id fnArr = rdna4_dl_objc_prop(library, "functionNames");
+        if ([fnArr isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)fnArr) {
+                if ([item isKindOfClass:[NSString class]] && [(NSString *)item length] && ![seenNames containsObject:item]) {
+                    [seenNames addObject:item];
+                    [funcNames addObject:item];
+                    [allNames addObject:item];
+                }
             }
         }
     }
 
     NSMutableSet<NSString *> *seenShas = [NSMutableSet set];
-    for (NSString *fnName in candidateNames) {
-        id fn = rdna4_dl_objc_new1(library, "newExternFunctionWithName:", fnName);
-        if (!fn && [library respondsToSelector:@selector(newFunctionWithName:)])
-            fn = [library newFunctionWithName:fnName];
-        id bcObj = rdna4_dl_objc_prop(fn, "bitcodeData");
-        if (![bcObj isKindOfClass:[NSData class]]) continue;
-        NSData *bc = (NSData *)bcObj;
-        uint32_t kind = rdna4_dl_detect_payload_kind(bc);
-        if (kind == RDNA4DL_PAYLOAD_AIR_BITCODE || kind == RDNA4DL_PAYLOAD_LLVM_IR) {
-            if (!rdna4_dl_append_unique_module(&_container, seenShas, bc, kind, error)) return nil;
-        }
-    }
+    NSData *metallibFallback = nil;
 
-    // Also inspect whole-library bitcodeData (if exposed by Metal or test harness).
+    // Extract whole-library bitcodeData FIRST: on macOS 26+, MTLLibraryTypeDynamic carries the full
+    // AIR bitcode here while calling newExternFunctionWithName: on a [[visible]] functionNames entry
+    // aborts inside Metal.framework (validateMTLFunctionType).
     id libBcObj = rdna4_dl_objc_prop(library, "bitcodeData");
     if ([libBcObj isKindOfClass:[NSData class]]) {
         NSData *libBc = (NSData *)libBcObj;
         uint32_t kind = rdna4_dl_detect_payload_kind(libBc);
         if (kind == RDNA4DL_PAYLOAD_AIR_BITCODE || kind == RDNA4DL_PAYLOAD_LLVM_IR) {
             if (!rdna4_dl_append_unique_module(&_container, seenShas, libBc, kind, error)) return nil;
+        } else if (kind == RDNA4DL_PAYLOAD_METALLIB) {
+            metallibFallback = libBc;
         }
+    }
+
+    // Only probe per-function bitcode when whole-library AIR/IR bitcode was not already extracted.
+    // Call newExternFunctionWithName: strictly on externFunctionNames (NEVER on functionNames).
+    if (_container.module_count == 0u) {
+        for (NSString *fnName in externNames) {
+            id fn = rdna4_dl_objc_new1(library, "newExternFunctionWithName:", fnName);
+            id bcObj = rdna4_dl_objc_prop(fn, "bitcodeData");
+            if (![bcObj isKindOfClass:[NSData class]]) continue;
+            NSData *bc = (NSData *)bcObj;
+            uint32_t kind = rdna4_dl_detect_payload_kind(bc);
+            if (kind == RDNA4DL_PAYLOAD_AIR_BITCODE || kind == RDNA4DL_PAYLOAD_LLVM_IR) {
+                if (!rdna4_dl_append_unique_module(&_container, seenShas, bc, kind, error)) return nil;
+            }
+        }
+        if ([library respondsToSelector:@selector(newFunctionWithName:)]) {
+            for (NSString *fnName in funcNames) {
+                id fn = [library newFunctionWithName:fnName];
+                id bcObj = rdna4_dl_objc_prop(fn, "bitcodeData");
+                if (![bcObj isKindOfClass:[NSData class]]) continue;
+                NSData *bc = (NSData *)bcObj;
+                uint32_t kind = rdna4_dl_detect_payload_kind(bc);
+                if (kind == RDNA4DL_PAYLOAD_AIR_BITCODE || kind == RDNA4DL_PAYLOAD_LLVM_IR) {
+                    if (!rdna4_dl_append_unique_module(&_container, seenShas, bc, kind, error)) return nil;
+                }
+            }
+        }
+    }
+
+    if (_container.module_count == 0u && metallibFallback) {
+        if (!rdna4_dl_append_unique_module(&_container, seenShas, metallibFallback, RDNA4DL_PAYLOAD_METALLIB, error)) return nil;
     }
 
     if (_container.module_count == 0u) {
@@ -307,7 +344,7 @@ static BOOL rdna4_dl_append_unique_module(rdna4dl_container_t *container,
         }
     }
     if (!translatorEnumerated) {
-        for (NSString *nm in candidateNames) {
+        for (NSString *nm in allNames) {
             const char *u = nm.UTF8String;
             if (u && u[0]) (void)rdna4dl_add_symbol_len(&_container, u, strlen(u), 0);
         }
