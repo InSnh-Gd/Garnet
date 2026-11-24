@@ -20,8 +20,12 @@ struct rdna4x_backend_capabilities {
 ```
 
 Flag bit 0 means the actual platform compiler exposes the optional query-LOD language
-extension. Bit 1 means the actual backend device supports that extension. Unknown flag bits,
-record sizes, or record versions are bad arguments. Query shaders require both bits, a fragment
+extension. Bit 1 means the actual backend device supports that extension. Bit 8
+(`GARNETX_CAP_MESH_EMULATED_PAYLOAD`) selects GFX-ring emulated Object+Mesh payload lowering
+(`Stage::Object` -> `GLCompute` writing set-0 `StorageBuffer` bindings 674/675 using grid/stride
+params at 673; `Stage::Mesh` with payload -> `MeshEXT` reading 673/674 via `BuiltIn DrawIndex`;
+mesh-only stages without payload remain pure hardware `MeshEXT`). Unknown flag bits,
+record sizes, or record versions are bad arguments. Query shaders require both bits 0 and 1, a fragment
 entry, and explicit `!air.language_version` metadata for Metal 2.2 or newer on macOS. The query
 functions are outside the fixed Metal 2.0/2.1 contract. Other shaders do not require these bits.
 

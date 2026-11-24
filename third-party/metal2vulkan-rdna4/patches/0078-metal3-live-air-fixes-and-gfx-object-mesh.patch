@@ -1,0 +1,4022 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index 0b98264..0a36043 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -489,16 +489,65 @@ pub fn is_buffer_atomic_intrinsic(name: &str) -> bool {
+     )
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum InterpolateAtMode {
++    Center,
++    Centroid,
++    Sample,
++    Offset,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct InterpolateAtIntrinsic {
++    pub mode: InterpolateAtMode,
++    pub no_perspective: bool,
++}
++
++/// Parse all Apple AIR pull-model interpolation intrinsic naming variants:
++/// - `air.interpolate_{center,centroid,sample,offset}_{no_perspective,perspective}.*`
++/// - `air.interpolate_{center,centroid,sample,offset}.*`
++/// - `air.interpolate_at_{center,centroid,sample,offset}[_{no_perspective,perspective}|.{no_perspective,perspective}].*`
++pub fn parse_interpolate_at_intrinsic(name: &str) -> Option<InterpolateAtIntrinsic> {
++    let rest = name
++        .strip_prefix("air.interpolate_at_")
++        .or_else(|| name.strip_prefix("air.interpolate_"))?;
++    let (mode, tail) = if let Some(t) = rest.strip_prefix("center") {
++        (InterpolateAtMode::Center, t)
++    } else if let Some(t) = rest.strip_prefix("centroid") {
++        (InterpolateAtMode::Centroid, t)
++    } else if let Some(t) = rest.strip_prefix("sample") {
++        (InterpolateAtMode::Sample, t)
++    } else if let Some(t) = rest.strip_prefix("offset") {
++        (InterpolateAtMode::Offset, t)
++    } else {
++        return None;
++    };
++    let (no_perspective, after_persp) = if let Some(t) = tail.strip_prefix("_no_perspective") {
++        (true, t)
++    } else if let Some(t) = tail.strip_prefix("_perspective") {
++        (false, t)
++    } else if let Some(t) = tail.strip_prefix(".no_perspective") {
++        (true, t)
++    } else if let Some(t) = tail.strip_prefix(".perspective") {
++        (false, t)
++    } else {
++        (
++            tail.contains(".no_perspective") || tail.contains("_no_perspective"),
++            tail,
++        )
++    };
++    if after_persp.is_empty() || after_persp.starts_with('.') {
++        Some(InterpolateAtIntrinsic {
++            mode,
++            no_perspective,
++        })
++    } else {
++        None
++    }
++}
++
+ pub fn is_interpolate_at_intrinsic(name: &str) -> bool {
+-    any_typed(
+-        name,
+-        &[
+-            "air.interpolate_at_center",
+-            "air.interpolate_at_centroid",
+-            "air.interpolate_at_sample",
+-            "air.interpolate_at_offset",
+-        ],
+-    )
++    parse_interpolate_at_intrinsic(name).is_some()
+ }
+ 
+ /// The AIR families that encode into a Metal render indirect command buffer.
+diff --git a/src/lib.rs b/src/lib.rs
+index ef983a9..2df5002 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -480,6 +480,22 @@ fn build_reflection(
+         ),
+     };
+     reflection.normalized_sampler_coordinates = options.normalized_sampler_coordinates;
++    if options.emulated_mesh_payload {
++        if let Some(obj) = reflection.object.as_mut() {
++            obj.emulated_payload = true;
++            obj.payload_stride = obj
++                .has_payload
++                .then(|| reflect::align_up_emulated_payload_stride(obj.payload_size.unwrap_or(0)));
++        }
++        if let Some(mesh) = reflection.mesh.as_mut() {
++            if mesh.has_payload {
++                mesh.emulated_payload = true;
++                mesh.payload_stride = Some(reflect::align_up_emulated_payload_stride(
++                    mesh.payload_size.unwrap_or(0),
++                ));
++            }
++        }
++    }
+     if matches!(stage, passes::Stage::Kernel) {
+         reflection.kernel_dispatch = Some(
+             options
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index 486d151..b4bab41 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -3904,12 +3904,19 @@ fn cast_source_value(instruction: &str) -> Option<&str> {
+ fn indirect_call_callee(line: &str) -> Option<(usize, usize, &str)> {
+     let call = line.find("call ")?;
+     let after_call = &line[call + 5..];
+-    let open = after_call.find('(')? + call + 5;
+-    let head = &line[..open];
+-    let end = head.len();
+-    let start = head.rfind(char::is_whitespace).map_or(0, |index| index + 1);
+-    let callee = &line[start..end];
+-    callee.starts_with('%').then_some((start, end, callee))
++    let mut search_from = 0usize;
++    while let Some(rel) = after_call[search_from..].find('(') {
++        let open = call + 5 + search_from + rel;
++        let head = &line[..open];
++        let start = head.rfind(char::is_whitespace).map_or(0, |index| index + 1);
++        let callee = &line[start..open];
++        if callee.starts_with('%') {
++            return Some((start, open, callee));
++        }
++        let close = matching_paren(line, open)?;
++        search_from = close + 1 - (call + 5);
++    }
++    None
+ }
+ 
+ struct IndirectCallShape {
+@@ -3925,20 +3932,12 @@ fn indirect_call_shape(
+     let call = line[..callee_start]
+         .rfind("call ")
+         .ok_or_else(|| format!("indirect call has no call opcode: {line}"))?;
+-    let mut return_type = line[call + 5..callee_start].trim();
+-    while let Some((first, rest)) = return_type.split_once(' ') {
+-        if matches!(
+-            first,
+-            "fast" | "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc"
+-        ) {
+-            return_type = rest.trim_start();
+-        } else {
+-            break;
+-        }
+-    }
+-    if return_type.is_empty() {
++    let return_prefix = line[call + 5..callee_start].trim();
++    if return_prefix.is_empty() {
+         return Err(format!("indirect call has no return type: {line}"));
+     }
++    let return_type = crate::native::parse_llvm_return_type_text(return_prefix)
++        .map_err(|_| format!("indirect call has no return type: {line}"))?;
+     let close = matching_paren(line, callee_end)
+         .ok_or_else(|| format!("indirect call has an unterminated argument list: {line}"))?;
+     let arguments = &line[callee_end + 1..close];
+@@ -3951,24 +3950,13 @@ fn indirect_call_shape(
+             .collect::<Result<Vec<_>, _>>()?
+     };
+     Ok(IndirectCallShape {
+-        return_type: return_type.to_string(),
++        return_type,
+         argument_types,
+     })
+ }
+ 
+ fn argument_type(argument: &str) -> Result<String, String> {
+-    let value = value_operand(argument);
+-    let type_end = argument
+-        .rfind(value)
+-        .filter(|index| *index > 0)
+-        .ok_or_else(|| format!("linked indirect-call argument has no typed value: {argument}"))?;
+-    let ty = argument[..type_end].trim_end();
+-    if ty.is_empty() {
+-        return Err(format!(
+-            "linked indirect-call argument has no type: {argument}"
+-        ));
+-    }
+-    Ok(ty.to_string())
++    crate::native::parse_llvm_typed_value_type_text(argument)
+ }
+ 
+ fn linked_function_matches_call(
+@@ -5560,4 +5548,95 @@ declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i
+         .unwrap_err();
+         assert!(err.contains("conflicts") && err.contains("vis_inc"), "{err}");
+     }
++
++    #[test]
++    fn runtime_vft_fragment_constant_vector_and_attributed_args_lower_cleanly() {
++        // Reproduces macOS 26.7.2 Apple AIR from `test-metal3-function-tables` (`vft_fs`):
++        // indirect VFT call passing an inline `<4 x float>` constant vector literal (plus `noundef`
++        // and multi-arg scalar + constant vector variants).
++        let frag_lib = r#"
++define <4 x float> @color_red(<4 x float> %c) {
++entry:
++  %a = extractelement <4 x float> %c, i32 3
++  %r = insertelement <4 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float poison>, float %a, i32 3
++  ret <4 x float> %r
++}
++define <4 x float> @color_green(<4 x float> %c) {
++entry:
++  %a = extractelement <4 x float> %c, i32 3
++  %r = insertelement <4 x float> <float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float poison>, float %a, i32 3
++  ret <4 x float> %r
++}
++define <4 x float> @mix_color(float %scale, <4 x float> %base) {
++entry:
++  %s0 = insertelement <4 x float> poison, float %scale, i32 0
++  %sv = shufflevector <4 x float> %s0, <4 x float> poison, <4 x i32> zeroinitializer
++  %r = fmul <4 x float> %base, %sv
++  ret <4 x float> %r
++}
++define <4 x float> @vft_fs(<4 x float> %pos, ptr addrspace(1) %table, ptr addrspace(2) %slot_buf) {
++entry:
++  %slot = load i32, ptr addrspace(2) %slot_buf, align 4
++  %fp = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 %slot)
++  %c0 = tail call <4 x float> %fp(<4 x float> <float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>)
++  %fp2 = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 2)
++  %c1 = tail call noundef <4 x float> %fp2(float noundef 5.000000e-01, <4 x float> noundef <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>)
++  %sum = fadd <4 x float> %c0, %c1
++  ret <4 x float> %sum
++}
++declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
++!air.fragment = !{!0}
++!0 = !{ptr @vft_fs, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4"}
++!5 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table<float4(float4)>"}
++!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint"}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            runtime_visible_functions: vec![
++                LinkedFunctionReference {
++                    symbol: "color_red".into(),
++                    module_ll: frag_lib.into(),
++                },
++                LinkedFunctionReference {
++                    symbol: "color_green".into(),
++                    module_ll: frag_lib.into(),
++                },
++                LinkedFunctionReference {
++                    symbol: "mix_color".into(),
++                    module_ll: frag_lib.into(),
++                },
++            ],
++            ..Default::default()
++        };
++        let (spec, vft_info) = crate::specialize_linked_module_with_vft(
++            frag_lib,
++            crate::passes::Stage::Fragment,
++            &linkage,
++        )
++        .expect("specialize fragment VFT with constant vector args");
++        assert!(vft_info.is_some());
++        assert!(
++            spec.contains("define internal <4 x float> @metal2vulkan.vft.dispatch.0(i32 %metal2vulkan_handle, <4 x float> %arg0)"),
++            "{spec}"
++        );
++        assert!(
++            spec.contains("define internal <4 x float> @metal2vulkan.vft.dispatch.1(i32 %metal2vulkan_handle, float %arg0, <4 x float> %arg1)"),
++            "{spec}"
++        );
++        let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++            &spec,
++            crate::passes::Stage::Fragment,
++            std::path::Path::new(""),
++            crate::passes::TransformOptions::default(),
++            None,
++        )
++        .expect("translate fragment VFT with constant vector args");
++        let asm = crate::disassemble(&spv).expect("disassemble fragment VFT");
++        assert!(asm.contains("OpEntryPoint Fragment"), "{asm}");
++        assert!(asm.contains("OpSwitch "), "{asm}");
++        assert!(!asm.contains("OpUnreachable"), "{asm}");
++    }
+ }
+diff --git a/src/native/mod.rs b/src/native/mod.rs
+index f134f36..74beab6 100644
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -104,7 +104,10 @@ pub(crate) use owned_cfg::{
+     owned_module_failure, owned_module_failures, scalar_width_capability, OwnedModuleFailure,
+ };
+ pub(crate) use parse::{
+-    parse_return_type as parse_llvm_return_type, parse_type_prefix as parse_llvm_type_prefix,
++    parse_return_type as parse_llvm_return_type,
++    parse_return_type_text as parse_llvm_return_type_text,
++    parse_type_prefix as parse_llvm_type_prefix,
++    parse_typed_value_type_text as parse_llvm_typed_value_type_text,
+ };
+ pub(crate) use rewrites::close_private_vector_word_views_module;
+ #[cfg(test)]
+diff --git a/src/native/parse.rs b/src/native/parse.rs
+index a1e4b2a..40e42c4 100644
+--- a/src/native/parse.rs
++++ b/src/native/parse.rs
+@@ -275,6 +275,26 @@ pub(crate) fn parse_return_type(prefix: &str) -> Result<LlType, String> {
+     ))
+ }
+ 
++pub(crate) fn parse_return_type_text(prefix: &str) -> Result<String, String> {
++    let mut toks = split_top_level_whitespace(prefix);
++    if toks
++        .last()
++        .is_some_and(|tok| tok.starts_with('(') && tok.ends_with(')'))
++    {
++        toks.pop();
++    }
++    for i in (0..toks.len()).rev() {
++        let candidate = toks[i..].join(" ");
++        if parse_type(&candidate).is_ok() {
++            return Ok(candidate);
++        }
++    }
++    Err(format!(
++        "native emitter: could not parse function return type from `{}`",
++        prefix.trim()
++    ))
++}
++
+ pub(super) fn parse_params(
+     s: &str,
+ ) -> Result<(Vec<(String, LlType)>, Vec<Option<LlType>>), String> {
+@@ -319,6 +339,24 @@ pub(crate) fn parse_type_prefix(s: &str) -> Result<LlType, String> {
+     ))
+ }
+ 
++/// Extract the clean LLVM type prefix of a typed call argument (stripping parameter attributes
++/// like `noundef`/`align N` and aggregate/vector constant literals like `<float 0.0, ...>`).
++pub(crate) fn parse_typed_value_type_text(s: &str) -> Result<String, String> {
++    let toks = split_top_level_whitespace(s.trim());
++    if toks.len() < 2 {
++        return Err(format!(
++            "linked indirect-call argument has no typed value: {s}"
++        ));
++    }
++    for i in (1..toks.len()).rev() {
++        let candidate = toks[..i].join(" ");
++        if parse_type(&candidate).is_ok() {
++            return Ok(candidate);
++        }
++    }
++    Err(format!("linked indirect-call argument has no type: {s}"))
++}
++
+ pub(super) fn parse_typed_value(s: &str) -> Result<TypedValue, String> {
+     let s = s.trim();
+     let toks = split_top_level_whitespace(s);
+diff --git a/src/native/tests/interface.rs b/src/native/tests/interface.rs
+index a30b225..2f378cd 100644
+--- a/src/native/tests/interface.rs
++++ b/src/native/tests/interface.rs
+@@ -2889,3 +2889,89 @@ declare <2 x half> @air.interpolate_at_offset.v2f16(ptr addrspace(1), <2 x float
+     assert!(!pull_asm.contains("OpFunctionCall"), "{pull_asm}");
+     let _ = std::fs::remove_dir_all(&tmp);
+ }
++
++#[test]
++fn native_fragment_apple_air_pull_model_perspective_and_no_perspective_variants() {
++    // Reproduces macOS 26.7.2 Apple AIR pull-model naming (`air.interpolate_{center,centroid,sample,offset}_{no_perspective,perspective}.*`)
++    // across scalar/v2/v3/v4 f32/f16 and verifies NoPerspective is applied ONLY to _no_perspective inputs
++    // even when AIR metadata omits `!"air.no_perspective"`.
++    let apple_pull_ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <4 x float> @fs_apple_pull(<2 x float> %uv_np, <2 x half> %uv_h_np, float %s_p, <3 x float> %v3_p, <4 x float> %v4_p, half %h1_p, i32 %sid) {
++entry:
++  %c_np = tail call <2 x float> @air.interpolate_center_no_perspective.v2f32(<2 x float> %uv_np)
++  %cen_np = tail call <2 x float> @air.interpolate_centroid_no_perspective.v2f32(<2 x float> %uv_np)
++  %smp_np = tail call <2 x float> @air.interpolate_sample_no_perspective.v2f32(<2 x float> %uv_np, i32 %sid)
++  %off_np = tail call <2 x float> @air.interpolate_offset_no_perspective.v2f32(<2 x float> %uv_np, <2 x float> <float 0.25, float 0.75>)
++  %off_h = tail call <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half> %uv_h_np, <2 x float> <float 0.25, float 0.75>)
++  %off_h32 = fpext <2 x half> %off_h to <2 x float>
++  %s_c = tail call float @air.interpolate_center_perspective.f32(float %s_p)
++  %v3_cen = tail call <3 x float> @air.interpolate_centroid_perspective.v3f32(<3 x float> %v3_p)
++  %v4_smp = tail call <4 x float> @air.interpolate_sample_perspective.v4f32(<4 x float> %v4_p, i32 %sid)
++  %h1_off = tail call half @air.interpolate_offset_perspective.f16(half %h1_p, <2 x float> <float 0.75, float 0.25>)
++  %h1_32 = fpext half %h1_off to float
++  %sum_np0 = fadd <2 x float> %c_np, %cen_np
++  %sum_np1 = fadd <2 x float> %smp_np, %off_np
++  %sum_np = fadd <2 x float> %sum_np0, %sum_np1
++  %sum_np_h = fadd <2 x float> %sum_np, %off_h32
++  %nx = extractelement <2 x float> %sum_np_h, i32 0
++  %ny = extractelement <2 x float> %sum_np_h, i32 1
++  %v3x = extractelement <3 x float> %v3_cen, i32 0
++  %v4w = extractelement <4 x float> %v4_smp, i32 3
++  %r0 = fadd float %nx, %s_c
++  %r1 = fadd float %ny, %v3x
++  %r2 = fadd float %v4w, %h1_32
++  %o0 = insertelement <4 x float> undef, float %r0, i32 0
++  %o1 = insertelement <4 x float> %o0, float %r1, i32 1
++  %o2 = insertelement <4 x float> %o1, float %r2, i32 2
++  %o3 = insertelement <4 x float> %o2, float 1.0, i32 3
++  ret <4 x float> %o3
++}
++
++declare <2 x float> @air.interpolate_center_no_perspective.v2f32(<2 x float>)
++declare <2 x float> @air.interpolate_centroid_no_perspective.v2f32(<2 x float>)
++declare <2 x float> @air.interpolate_sample_no_perspective.v2f32(<2 x float>, i32)
++declare <2 x float> @air.interpolate_offset_no_perspective.v2f32(<2 x float>, <2 x float>)
++declare <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half>, <2 x float>)
++declare float @air.interpolate_center_perspective.f32(float)
++declare <3 x float> @air.interpolate_centroid_perspective.v3f32(<3 x float>)
++declare <4 x float> @air.interpolate_sample_perspective.v4f32(<4 x float>, i32)
++declare half @air.interpolate_offset_perspective.f16(half, <2 x float>)
++
++!air.fragment = !{!0}
++!0 = !{ptr @fs_apple_pull, !1, !2}
++!1 = !{!3}
++!2 = !{!4, !5, !6, !7, !8, !9, !10}
++!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!4 = !{i32 0, !"air.fragment_input", !"user(uv_np)", !"air.pull_mode", !"air.arg_type_name", !"float2"}
++!5 = !{i32 1, !"air.fragment_input", !"user(uv_h_np)", !"air.pull_mode", !"air.arg_type_name", !"half2"}
++!6 = !{i32 2, !"air.fragment_input", !"user(s_p)", !"air.pull_mode", !"air.arg_type_name", !"float"}
++!7 = !{i32 3, !"air.fragment_input", !"user(v3_p)", !"air.pull_mode", !"air.arg_type_name", !"float3"}
++!8 = !{i32 4, !"air.fragment_input", !"user(v4_p)", !"air.pull_mode", !"air.arg_type_name", !"float4"}
++!9 = !{i32 5, !"air.fragment_input", !"user(h1_p)", !"air.pull_mode", !"air.arg_type_name", !"half"}
++!10 = !{i32 6, !"air.sample_id", !"air.arg_type_name", !"uint"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_apple_pull_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let (spv, _) = crate::translate_sanitized_native_reflected_unvalidated(
++        apple_pull_ll,
++        Stage::Fragment,
++        &tmp,
++        crate::passes::TransformOptions::default(),
++        None,
++    )
++    .expect("apple pull-model variants");
++    let asm = disassemble(&spv).expect("disassemble apple pull");
++    assert!(asm.contains("OpCapability InterpolationFunction"), "{asm}");
++    // Exactly locations 0 and 1 (uv_np and uv_h_np) carry NoPerspective; locations 2..5 stay perspective.
++    assert_eq!(asm.matches("NoPerspective").count(), 2, "{asm}");
++    assert_eq!(asm.matches("InterpolateAtCentroid").count(), 2, "{asm}");
++    assert_eq!(asm.matches("InterpolateAtSample").count(), 2, "{asm}");
++    assert_eq!(asm.matches("InterpolateAtOffset").count(), 3, "{asm}");
++    assert_eq!(asm.matches("OpFConvert").count(), 4, "{asm}");
++    assert!(!asm.contains("OpFunctionCall"), "{asm}");
++    let _ = std::fs::remove_dir_all(&tmp);
++}
+diff --git a/src/passes/air_calls/integer_simd.rs b/src/passes/air_calls/integer_simd.rs
+index 0c11e9f..56aeab4 100644
+--- a/src/passes/air_calls/integer_simd.rs
++++ b/src/passes/air_calls/integer_simd.rs
+@@ -1882,7 +1882,9 @@ fn lower_interpolate_at(
+     if !is_valid_ret || vector_len(ctx, rty) != vector_len(ctx, var_ty) {
+         return Err(format!("{name}: result type does not match interpolant variable shape"));
+     }
+-    if name.contains(".no_perspective") {
++    let parsed = crate::air_intrinsics::parse_interpolate_at_intrinsic(name)
++        .ok_or_else(|| format!("unhandled pull-model interpolation intrinsic: {name}"))?;
++    if parsed.no_perspective {
+         let already = ctx.module.annotations.iter().any(|a| {
+             a.class.opcode == Op::Decorate
+                 && a.operands.as_slice()
+@@ -1910,114 +1912,113 @@ fn lower_interpolate_at(
+     } else {
+         ctx.module.fresh_id()
+     };
+-    if name == "air.interpolate_at_center" || name.starts_with("air.interpolate_at_center.") {
+-        if args.len() != 1 {
+-            return Err(format!("{name} expects 1 operand"));
+-        }
+-        out.push(Instruction::new(
+-            Op::Load,
+-            Some(var_ty),
+-            Some(eval_id),
+-            vec![Operand::IdRef(var)],
+-        ));
+-    } else if name == "air.interpolate_at_centroid"
+-        || name.starts_with("air.interpolate_at_centroid.")
+-    {
+-        if args.len() != 1 {
+-            return Err(format!("{name} expects 1 operand"));
+-        }
+-        let glsl = ctx.glsl();
+-        out.push(Instruction::new(
+-            Op::ExtInst,
+-            Some(var_ty),
+-            Some(eval_id),
+-            vec![
+-                Operand::IdRef(glsl),
+-                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtCentroid as u32),
+-                Operand::IdRef(var),
+-            ],
+-        ));
+-    } else if name == "air.interpolate_at_sample" || name.starts_with("air.interpolate_at_sample.")
+-    {
+-        if args.len() != 2 {
+-            return Err(format!("{name} expects 2 operands"));
+-        }
+-        let sample_ty = value_result_type(ctx, args[1])
+-            .ok_or_else(|| format!("{name}: sample operand has no type"))?;
+-        let width = int_scalar_width(ctx, sample_ty)
+-            .ok_or_else(|| format!("{name}: sample operand must be a scalar integer"))?;
+-        let sample_id = if width == 32 {
+-            args[1]
+-        } else {
+-            let uint = ctx.ty_uint();
+-            let converted = ctx.module.fresh_id();
++    match parsed.mode {
++        crate::air_intrinsics::InterpolateAtMode::Center => {
++            if args.len() != 1 {
++                return Err(format!("{name} expects 1 operand"));
++            }
+             out.push(Instruction::new(
+-                Op::UConvert,
+-                Some(uint),
+-                Some(converted),
+-                vec![Operand::IdRef(args[1])],
++                Op::Load,
++                Some(var_ty),
++                Some(eval_id),
++                vec![Operand::IdRef(var)],
+             ));
+-            converted
+-        };
+-        let glsl = ctx.glsl();
+-        out.push(Instruction::new(
+-            Op::ExtInst,
+-            Some(var_ty),
+-            Some(eval_id),
+-            vec![
+-                Operand::IdRef(glsl),
+-                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtSample as u32),
+-                Operand::IdRef(var),
+-                Operand::IdRef(sample_id),
+-            ],
+-        ));
+-    } else if name == "air.interpolate_at_offset" || name.starts_with("air.interpolate_at_offset.")
+-    {
+-        if args.len() != 2 {
+-            return Err(format!("{name} expects 2 operands"));
+         }
+-        let v2f32 = ctx.ty_vecf(2);
+-        let off_ty = value_result_type(ctx, args[1])
+-            .ok_or_else(|| format!("{name}: offset operand has no type"))?;
+-        let off_f32 = if off_ty == v2f32 {
+-            args[1]
+-        } else if is_half_scalar_or_vector(ctx, off_ty) && vector_len(ctx, off_ty) == 2 {
+-            let converted = ctx.module.fresh_id();
++        crate::air_intrinsics::InterpolateAtMode::Centroid => {
++            if args.len() != 1 {
++                return Err(format!("{name} expects 1 operand"));
++            }
++            let glsl = ctx.glsl();
+             out.push(Instruction::new(
+-                Op::FConvert,
++                Op::ExtInst,
++                Some(var_ty),
++                Some(eval_id),
++                vec![
++                    Operand::IdRef(glsl),
++                    Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtCentroid as u32),
++                    Operand::IdRef(var),
++                ],
++            ));
++        }
++        crate::air_intrinsics::InterpolateAtMode::Sample => {
++            if args.len() != 2 {
++                return Err(format!("{name} expects 2 operands"));
++            }
++            let sample_ty = value_result_type(ctx, args[1])
++                .ok_or_else(|| format!("{name}: sample operand has no type"))?;
++            let width = int_scalar_width(ctx, sample_ty)
++                .ok_or_else(|| format!("{name}: sample operand must be a scalar integer"))?;
++            let sample_id = if width == 32 {
++                args[1]
++            } else {
++                let uint = ctx.ty_uint();
++                let converted = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::UConvert,
++                    Some(uint),
++                    Some(converted),
++                    vec![Operand::IdRef(args[1])],
++                ));
++                converted
++            };
++            let glsl = ctx.glsl();
++            out.push(Instruction::new(
++                Op::ExtInst,
++                Some(var_ty),
++                Some(eval_id),
++                vec![
++                    Operand::IdRef(glsl),
++                    Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtSample as u32),
++                    Operand::IdRef(var),
++                    Operand::IdRef(sample_id),
++                ],
++            ));
++        }
++        crate::air_intrinsics::InterpolateAtMode::Offset => {
++            if args.len() != 2 {
++                return Err(format!("{name} expects 2 operands"));
++            }
++            let v2f32 = ctx.ty_vecf(2);
++            let off_ty = value_result_type(ctx, args[1])
++                .ok_or_else(|| format!("{name}: offset operand has no type"))?;
++            let off_f32 = if off_ty == v2f32 {
++                args[1]
++            } else if is_half_scalar_or_vector(ctx, off_ty) && vector_len(ctx, off_ty) == 2 {
++                let converted = ctx.module.fresh_id();
++                out.push(Instruction::new(
++                    Op::FConvert,
++                    Some(v2f32),
++                    Some(converted),
++                    vec![Operand::IdRef(args[1])],
++                ));
++                converted
++            } else {
++                return Err(format!("{name}: offset operand must be float2 or half2"));
++            };
++            // Metal interpolate_at_offset uses [0, 1) from pixel top-left; SPIR-V InterpolateAtOffset
++            // uses [-0.5, +0.5) from pixel center.
++            let half_c = ctx.const_float(0.5);
++            let half2 = splat(ctx, v2f32, half_c, 2);
++            let vk_off = ctx.module.fresh_id();
++            out.push(Instruction::new(
++                Op::FSub,
+                 Some(v2f32),
+-                Some(converted),
+-                vec![Operand::IdRef(args[1])],
++                Some(vk_off),
++                vec![Operand::IdRef(off_f32), Operand::IdRef(half2)],
+             ));
+-            converted
+-        } else {
+-            return Err(format!("{name}: offset operand must be float2 or half2"));
+-        };
+-        // Metal interpolate_at_offset uses [0, 1) from pixel top-left; SPIR-V InterpolateAtOffset
+-        // uses [-0.5, +0.5) from pixel center.
+-        let half_c = ctx.const_float(0.5);
+-        let half2 = splat(ctx, v2f32, half_c, 2);
+-        let vk_off = ctx.module.fresh_id();
+-        out.push(Instruction::new(
+-            Op::FSub,
+-            Some(v2f32),
+-            Some(vk_off),
+-            vec![Operand::IdRef(off_f32), Operand::IdRef(half2)],
+-        ));
+-        let glsl = ctx.glsl();
+-        out.push(Instruction::new(
+-            Op::ExtInst,
+-            Some(var_ty),
+-            Some(eval_id),
+-            vec![
+-                Operand::IdRef(glsl),
+-                Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtOffset as u32),
+-                Operand::IdRef(var),
+-                Operand::IdRef(vk_off),
+-            ],
+-        ));
+-    } else {
+-        return Err(format!("unhandled pull-model interpolation intrinsic: {name}"));
++            let glsl = ctx.glsl();
++            out.push(Instruction::new(
++                Op::ExtInst,
++                Some(var_ty),
++                Some(eval_id),
++                vec![
++                    Operand::IdRef(glsl),
++                    Operand::LiteralExtInstInteger(GLSLstd450::InterpolateAtOffset as u32),
++                    Operand::IdRef(var),
++                    Operand::IdRef(vk_off),
++                ],
++            ));
++        }
+     }
+ 
+     if eval_id != res {
+diff --git a/src/passes/finalize.rs b/src/passes/finalize.rs
+index 8fcbacc..7fffdf6 100644
+--- a/src/passes/finalize.rs
++++ b/src/passes/finalize.rs
+@@ -84,6 +84,7 @@ pub(in crate::passes) fn finalize(
+         (Stage::Vertex, None) => spirv::ExecutionModel::Vertex,
+         (Stage::Fragment, _) => spirv::ExecutionModel::Fragment,
+         (Stage::Kernel, _) => spirv::ExecutionModel::GLCompute,
++        (Stage::Object, _) if ctx.emulated_mesh_payload => spirv::ExecutionModel::GLCompute,
+         (Stage::Object, _) => spirv::ExecutionModel::TaskEXT,
+         (Stage::Mesh, _) => spirv::ExecutionModel::MeshEXT,
+     };
+diff --git a/src/passes/mesh_stage.rs b/src/passes/mesh_stage.rs
+index 33b9004..a259072 100644
+--- a/src/passes/mesh_stage.rs
++++ b/src/passes/mesh_stage.rs
+@@ -402,7 +402,7 @@ fn lower_object_stage(ctx: &mut Ctx, entry_idx: usize) -> Result<(), String> {
+                     }
+                 }
+             }
+-            if inst.class.opcode == Op::Return {
++            if inst.class.opcode == Op::Return && !ctx.emulated_mesh_payload {
+                 emit_workgroup_barrier(ctx, &mut rewritten);
+                 let mut loaded = [c0; 3];
+                 for (i, idx_const) in [c0, c1, c2].into_iter().enumerate() {
+@@ -1985,6 +1985,2128 @@ fn lower_mesh_output_call(
+     Err(format!("unsupported mesh/object intrinsic: {name}"))
+ }
+ 
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum PayloadCopyDir {
++    WorkgroupToSsbo,
++    SsboToWorkgroup,
++}
++
++struct CfgBuilder {
++    blocks: Vec<Block>,
++    cur_label: Word,
++    cur_insts: Vec<Instruction>,
++}
++
++impl CfgBuilder {
++    fn new(start_label: Word, initial_insts: Vec<Instruction>) -> Self {
++        Self {
++            blocks: Vec::new(),
++            cur_label: start_label,
++            cur_insts: initial_insts,
++        }
++    }
++
++    fn push(&mut self, inst: Instruction) {
++        self.cur_insts.push(inst);
++    }
++
++    fn terminate_and_start(&mut self, term: Instruction, next_label: Word) {
++        self.cur_insts.push(term);
++        let insts = std::mem::take(&mut self.cur_insts);
++        let label = self.cur_label;
++        self.blocks.push(Block {
++            label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
++            instructions: insts,
++        });
++        self.cur_label = next_label;
++    }
++
++    fn finish(mut self) -> Vec<Block> {
++        let insts = std::mem::take(&mut self.cur_insts);
++        self.blocks.push(Block {
++            label: Some(Instruction::new(
++                Op::Label,
++                None,
++                Some(self.cur_label),
++                vec![],
++            )),
++            instructions: insts,
++        });
++        self.blocks
++    }
++}
++
++fn ensure_input_builtin_var(ctx: &mut Ctx, builtin: BuiltIn, ty: Word) -> Word {
++    let want_ptr = ctx.ty_ptr(StorageClass::Input, ty);
++    let existing = ctx.module.annotations.iter().find_map(|ann| {
++        if ann.class.opcode == Op::Decorate
++            && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
++            && ann.operands.get(2) == Some(&Operand::BuiltIn(builtin))
++        {
++            if let Some(&Operand::IdRef(id)) = ann.operands.first() {
++                let matches_var = ctx
++                    .module
++                    .types_global_values
++                    .iter()
++                    .chain(ctx.new_globals.iter())
++                    .any(|g| {
++                        g.result_id == Some(id)
++                            && g.class.opcode == Op::Variable
++                            && g.result_type == Some(want_ptr)
++                            && g.operands.first() == Some(&Operand::StorageClass(StorageClass::Input))
++                    });
++                if matches_var {
++                    return Some(id);
++                }
++            }
++        }
++        None
++    });
++    if let Some(var) = existing {
++        return var;
++    }
++    let var = ctx.module.fresh_id();
++    ctx.new_globals.push(Instruction::new(
++        Op::Variable,
++        Some(want_ptr),
++        Some(var),
++        vec![Operand::StorageClass(StorageClass::Input)],
++    ));
++    decorate_builtin(&mut ctx.module, var, builtin);
++    ctx.interface.push(var);
++    var
++}
++
++fn check_emulated_binding_free(ctx: &Ctx, binding: u32) -> Result<(), String> {
++    let target_set = ctx.descriptor_layout.set;
++    let mut sets = HashMap::new();
++    let mut bindings = HashMap::new();
++    for ann in &ctx.module.annotations {
++        if ann.class.opcode != Op::Decorate {
++            continue;
++        }
++        match ann.operands.as_slice() {
++            [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(s)] =>
++            {
++                sets.insert(*id, *s);
++            }
++            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(b)] =>
++            {
++                bindings.insert(*id, *b);
++            }
++            _ => {}
++        }
++    }
++    let live_vars: HashSet<Word> = ctx
++        .module
++        .types_global_values
++        .iter()
++        .chain(ctx.new_globals.iter())
++        .filter(|i| i.class.opcode == Op::Variable)
++        .filter_map(|i| i.result_id)
++        .collect();
++    if live_vars
++        .into_iter()
++        .any(|id| sets.get(&id) == Some(&target_set) && bindings.get(&id) == Some(&binding))
++    {
++        return Err(format!(
++            "emulated Object/Mesh reserved binding (set {target_set}, binding {binding}) collides with an existing stage resource binding"
++        ));
++    }
++    Ok(())
++}
++
++fn make_emulated_grid_params_ssbo(ctx: &mut Ctx) -> Result<Word, String> {
++    check_emulated_binding_free(ctx, crate::reflect::MESH_EMULATED_GRID_PARAMS_BINDING)?;
++    let uint_ty = ctx.ty_uint();
++    let struct_ty = ctx.module.fresh_id();
++    ctx.new_globals.push(type_inst(
++        Op::TypeStruct,
++        struct_ty,
++        vec![
++            Operand::IdRef(uint_ty),
++            Operand::IdRef(uint_ty),
++            Operand::IdRef(uint_ty),
++            Operand::IdRef(uint_ty),
++        ],
++    ));
++    decorate_with(&mut ctx.module, struct_ty, Decoration::Block);
++    for m in 0u32..4 {
++        ctx.module.annotations.push(Instruction::new(
++            Op::MemberDecorate,
++            None,
++            None,
++            vec![
++                Operand::IdRef(struct_ty),
++                Operand::LiteralBit32(m),
++                Operand::Decoration(Decoration::Offset),
++                Operand::LiteralBit32(m * 4),
++            ],
++        ));
++    }
++    let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, struct_ty);
++    let var = ctx.module.fresh_id();
++    ctx.new_globals.push(Instruction::new(
++        Op::Variable,
++        Some(ptr_ty),
++        Some(var),
++        vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++    ));
++    super::decorate_binding(
++        &mut ctx.module,
++        var,
++        ctx.descriptor_layout.set,
++        crate::reflect::MESH_EMULATED_GRID_PARAMS_BINDING,
++    );
++    decorate_with(&mut ctx.module, var, Decoration::NonWritable);
++    ctx.interface_buffer_var(var);
++    ctx.bound_buffer_vars.insert(var);
++    Ok(var)
++}
++
++fn make_emulated_u32_ssbo(ctx: &mut Ctx, binding: u32, non_writable: bool) -> Result<Word, String> {
++    check_emulated_binding_free(ctx, binding)?;
++    let uint_ty = ctx.ty_uint();
++    let rt_arr = ctx.module.fresh_id();
++    ctx.new_globals.push(type_inst(
++        Op::TypeRuntimeArray,
++        rt_arr,
++        vec![Operand::IdRef(uint_ty)],
++    ));
++    ctx.module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(rt_arr),
++            Operand::Decoration(Decoration::ArrayStride),
++            Operand::LiteralBit32(4),
++        ],
++    ));
++    let struct_ty = ctx.module.fresh_id();
++    ctx.new_globals
++        .push(type_inst(Op::TypeStruct, struct_ty, vec![Operand::IdRef(rt_arr)]));
++    decorate_with(&mut ctx.module, struct_ty, Decoration::Block);
++    ctx.module.annotations.push(Instruction::new(
++        Op::MemberDecorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(struct_ty),
++            Operand::LiteralBit32(0),
++            Operand::Decoration(Decoration::Offset),
++            Operand::LiteralBit32(0),
++        ],
++    ));
++    let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, struct_ty);
++    let var = ctx.module.fresh_id();
++    ctx.new_globals.push(Instruction::new(
++        Op::Variable,
++        Some(ptr_ty),
++        Some(var),
++        vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++    ));
++    super::decorate_binding(
++        &mut ctx.module,
++        var,
++        ctx.descriptor_layout.set,
++        binding,
++    );
++    if non_writable {
++        decorate_with(&mut ctx.module, var, Decoration::NonWritable);
++    }
++    ctx.interface_buffer_var(var);
++    ctx.bound_buffer_vars.insert(var);
++    Ok(var)
++}
++
++fn ssbo_u32_load(ctx: &mut Ctx, cfg: &mut CfgBuilder, ssbo_var: Word, word_idx: Word) -> Word {
++    let uint_ty = ctx.ty_uint();
++    let sb_u32_ptr = ctx.ty_ptr(StorageClass::StorageBuffer, uint_ty);
++    let c0 = ctx.const_uint(0);
++    let ptr = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::AccessChain,
++        Some(sb_u32_ptr),
++        Some(ptr),
++        vec![
++            Operand::IdRef(ssbo_var),
++            Operand::IdRef(c0),
++            Operand::IdRef(word_idx),
++        ],
++    ));
++    let val = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::Load,
++        Some(uint_ty),
++        Some(val),
++        vec![Operand::IdRef(ptr)],
++    ));
++    val
++}
++
++fn ssbo_u32_store(
++    ctx: &mut Ctx,
++    cfg: &mut CfgBuilder,
++    ssbo_var: Word,
++    word_idx: Word,
++    val: Word,
++) {
++    let uint_ty = ctx.ty_uint();
++    let sb_u32_ptr = ctx.ty_ptr(StorageClass::StorageBuffer, uint_ty);
++    let c0 = ctx.const_uint(0);
++    let ptr = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::AccessChain,
++        Some(sb_u32_ptr),
++        Some(ptr),
++        vec![
++            Operand::IdRef(ssbo_var),
++            Operand::IdRef(c0),
++            Operand::IdRef(word_idx),
++        ],
++    ));
++    cfg.push(Instruction::new(
++        Op::Store,
++        None,
++        None,
++        vec![Operand::IdRef(ptr), Operand::IdRef(val)],
++    ));
++}
++
++fn grid_params_load_field(ctx: &mut Ctx, cfg: &mut CfgBuilder, grid_params_var: Word, field: u32) -> Word {
++    let uint_ty = ctx.ty_uint();
++    let sb_u32_ptr = ctx.ty_ptr(StorageClass::StorageBuffer, uint_ty);
++    let cf = ctx.const_uint(field);
++    let ptr = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::AccessChain,
++        Some(sb_u32_ptr),
++        Some(ptr),
++        vec![Operand::IdRef(grid_params_var), Operand::IdRef(cf)],
++    ));
++    let val = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::Load,
++        Some(uint_ty),
++        Some(val),
++        vec![Operand::IdRef(ptr)],
++    ));
++    val
++}
++
++fn wg_access_ptr(
++    ctx: &mut Ctx,
++    cfg: &mut CfgBuilder,
++    wg_var: Word,
++    indices: &[Word],
++    leaf_ty: Word,
++) -> Word {
++    if indices.is_empty() {
++        return wg_var;
++    }
++    let ptr_ty = ctx.ty_ptr(StorageClass::Workgroup, leaf_ty);
++    let ptr = ctx.module.fresh_id();
++    let mut ops = Vec::with_capacity(indices.len() + 1);
++    ops.push(Operand::IdRef(wg_var));
++    for &idx in indices {
++        ops.push(Operand::IdRef(idx));
++    }
++    cfg.push(Instruction::new(
++        Op::AccessChain,
++        Some(ptr_ty),
++        Some(ptr),
++        ops,
++    ));
++    ptr
++}
++
++fn scalar_to_u32_bits(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    cfg: &mut CfgBuilder,
++    ty: Word,
++    val: Word,
++) -> Option<(u32, Word)> {
++    let uint_ty = ctx.ty_uint();
++    let def = defs.get(&ty)?;
++    match def.class.opcode {
++        Op::TypeBool => {
++            let c1 = ctx.const_uint(1);
++            let c0 = ctx.const_uint(0);
++            let u = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::Select,
++                Some(uint_ty),
++                Some(u),
++                vec![Operand::IdRef(val), Operand::IdRef(c1), Operand::IdRef(c0)],
++            ));
++            Some((8, u))
++        }
++        Op::TypeInt => {
++            let bits = match def.operands.first() {
++                Some(Operand::LiteralBit32(b)) => *b,
++                _ => 32,
++            };
++            match bits {
++                8 | 16 => {
++                    let u = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::UConvert,
++                        Some(uint_ty),
++                        Some(u),
++                        vec![Operand::IdRef(val)],
++                    ));
++                    Some((bits, u))
++                }
++                32 => {
++                    let u = if ty == uint_ty {
++                        val
++                    } else {
++                        let b = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::Bitcast,
++                            Some(uint_ty),
++                            Some(b),
++                            vec![Operand::IdRef(val)],
++                        ));
++                        b
++                    };
++                    Some((32, u))
++                }
++                _ => None,
++            }
++        }
++        Op::TypeFloat => {
++            let bits = match def.operands.first() {
++                Some(Operand::LiteralBit32(b)) => *b,
++                _ => 32,
++            };
++            match bits {
++                16 => {
++                    let u16_ty = ctx.ty_air_scalar(AirScalar::UShort);
++                    let raw16 = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(u16_ty),
++                        Some(raw16),
++                        vec![Operand::IdRef(val)],
++                    ));
++                    let u = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::UConvert,
++                        Some(uint_ty),
++                        Some(u),
++                        vec![Operand::IdRef(raw16)],
++                    ));
++                    Some((16, u))
++                }
++                32 => {
++                    let b = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(uint_ty),
++                        Some(b),
++                        vec![Operand::IdRef(val)],
++                    ));
++                    Some((32, b))
++                }
++                _ => None,
++            }
++        }
++        _ => None,
++    }
++}
++
++fn u32_bits_to_scalar(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    cfg: &mut CfgBuilder,
++    ty: Word,
++    raw_u32: Word,
++) -> Option<Word> {
++    let uint_ty = ctx.ty_uint();
++    let def = defs.get(&ty)?;
++    match def.class.opcode {
++        Op::TypeBool => {
++            let bool_ty = ctx.ty_bool();
++            let c1 = ctx.const_uint(1);
++            let c0 = ctx.const_uint(0);
++            let bit = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::BitwiseAnd,
++                Some(uint_ty),
++                Some(bit),
++                vec![Operand::IdRef(raw_u32), Operand::IdRef(c1)],
++            ));
++            let b = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::INotEqual,
++                Some(bool_ty),
++                Some(b),
++                vec![Operand::IdRef(bit), Operand::IdRef(c0)],
++            ));
++            Some(b)
++        }
++        Op::TypeInt => {
++            let bits = match def.operands.first() {
++                Some(Operand::LiteralBit32(b)) => *b,
++                _ => 32,
++            };
++            let signed = matches!(def.operands.get(1), Some(Operand::LiteralBit32(1)));
++            match bits {
++                8 => {
++                    let u8_ty = ctx.ty_air_scalar(AirScalar::UChar);
++                    let u8v = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::UConvert,
++                        Some(u8_ty),
++                        Some(u8v),
++                        vec![Operand::IdRef(raw_u32)],
++                    ));
++                    if signed || u8_ty != ty {
++                        let s = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::Bitcast,
++                            Some(ty),
++                            Some(s),
++                            vec![Operand::IdRef(u8v)],
++                        ));
++                        Some(s)
++                    } else {
++                        Some(u8v)
++                    }
++                }
++                16 => {
++                    let u16_ty = ctx.ty_air_scalar(AirScalar::UShort);
++                    let u16v = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::UConvert,
++                        Some(u16_ty),
++                        Some(u16v),
++                        vec![Operand::IdRef(raw_u32)],
++                    ));
++                    if signed || u16_ty != ty {
++                        let s = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::Bitcast,
++                            Some(ty),
++                            Some(s),
++                            vec![Operand::IdRef(u16v)],
++                        ));
++                        Some(s)
++                    } else {
++                        Some(u16v)
++                    }
++                }
++                32 => {
++                    if ty == uint_ty {
++                        Some(raw_u32)
++                    } else {
++                        let b = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::Bitcast,
++                            Some(ty),
++                            Some(b),
++                            vec![Operand::IdRef(raw_u32)],
++                        ));
++                        Some(b)
++                    }
++                }
++                _ => None,
++            }
++        }
++        Op::TypeFloat => {
++            let bits = match def.operands.first() {
++                Some(Operand::LiteralBit32(b)) => *b,
++                _ => 32,
++            };
++            match bits {
++                16 => {
++                    let u16_ty = ctx.ty_air_scalar(AirScalar::UShort);
++                    let u16v = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::UConvert,
++                        Some(u16_ty),
++                        Some(u16v),
++                        vec![Operand::IdRef(raw_u32)],
++                    ));
++                    let f = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(ty),
++                        Some(f),
++                        vec![Operand::IdRef(u16v)],
++                    ));
++                    Some(f)
++                }
++                32 => {
++                    let f = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(ty),
++                        Some(f),
++                        vec![Operand::IdRef(raw_u32)],
++                    ));
++                    Some(f)
++                }
++                _ => None,
++            }
++        }
++        _ => None,
++    }
++}
++
++fn copy_subword_or_word_scalar(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    cfg: &mut CfgBuilder,
++    dir: PayloadCopyDir,
++    wg_var: Word,
++    indices: &[Word],
++    ty: Word,
++    byte_off: Word,
++    ssbo_var: Word,
++    base_word: Word,
++) -> Result<(), String> {
++    let uint_ty = ctx.ty_uint();
++    let c2 = ctx.const_uint(2);
++    let c3 = ctx.const_uint(3);
++    let word_off = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::ShiftRightLogical,
++        Some(uint_ty),
++        Some(word_off),
++        vec![Operand::IdRef(byte_off), Operand::IdRef(c2)],
++    ));
++    let word_idx = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::IAdd,
++        Some(uint_ty),
++        Some(word_idx),
++        vec![Operand::IdRef(base_word), Operand::IdRef(word_off)],
++    ));
++    let def = defs
++        .get(&ty)
++        .ok_or_else(|| format!("emulated payload: missing type def {ty}"))?;
++    let is_64 = matches!(def.class.opcode, Op::TypeInt | Op::TypeFloat)
++        && def.operands.first() == Some(&Operand::LiteralBit32(64));
++    let wg_ptr = wg_access_ptr(ctx, cfg, wg_var, indices, ty);
++    if is_64 {
++        let u64_ty = ctx.ty_ulong();
++        let c1 = ctx.const_uint(1);
++        let c32_64 = ctx.const_int_of(u64_ty, 32);
++        let word_idx_hi = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IAdd,
++            Some(uint_ty),
++            Some(word_idx_hi),
++            vec![Operand::IdRef(word_idx), Operand::IdRef(c1)],
++        ));
++        match dir {
++            PayloadCopyDir::WorkgroupToSsbo => {
++                let raw = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::Load,
++                    Some(ty),
++                    Some(raw),
++                    vec![Operand::IdRef(wg_ptr)],
++                ));
++                let v64 = if ty == u64_ty {
++                    raw
++                } else {
++                    let b = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(u64_ty),
++                        Some(b),
++                        vec![Operand::IdRef(raw)],
++                    ));
++                    b
++                };
++                let lo = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::UConvert,
++                    Some(uint_ty),
++                    Some(lo),
++                    vec![Operand::IdRef(v64)],
++                ));
++                let shifted = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftRightLogical,
++                    Some(u64_ty),
++                    Some(shifted),
++                    vec![Operand::IdRef(v64), Operand::IdRef(c32_64)],
++                ));
++                let hi = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::UConvert,
++                    Some(uint_ty),
++                    Some(hi),
++                    vec![Operand::IdRef(shifted)],
++                ));
++                ssbo_u32_store(ctx, cfg, ssbo_var, word_idx, lo);
++                ssbo_u32_store(ctx, cfg, ssbo_var, word_idx_hi, hi);
++            }
++            PayloadCopyDir::SsboToWorkgroup => {
++                let lo = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx);
++                let hi = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx_hi);
++                let lo64 = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::UConvert,
++                    Some(u64_ty),
++                    Some(lo64),
++                    vec![Operand::IdRef(lo)],
++                ));
++                let hi64_low = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::UConvert,
++                    Some(u64_ty),
++                    Some(hi64_low),
++                    vec![Operand::IdRef(hi)],
++                ));
++                let hi64 = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftLeftLogical,
++                    Some(u64_ty),
++                    Some(hi64),
++                    vec![Operand::IdRef(hi64_low), Operand::IdRef(c32_64)],
++                ));
++                let v64 = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseOr,
++                    Some(u64_ty),
++                    Some(v64),
++                    vec![Operand::IdRef(lo64), Operand::IdRef(hi64)],
++                ));
++                let final_val = if ty == u64_ty {
++                    v64
++                } else {
++                    let b = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::Bitcast,
++                        Some(ty),
++                        Some(b),
++                        vec![Operand::IdRef(v64)],
++                    ));
++                    b
++                };
++                cfg.push(Instruction::new(
++                    Op::Store,
++                    None,
++                    None,
++                    vec![Operand::IdRef(wg_ptr), Operand::IdRef(final_val)],
++                ));
++            }
++        }
++        return Ok(());
++    }
++
++    match dir {
++        PayloadCopyDir::WorkgroupToSsbo => {
++            let loaded = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::Load,
++                Some(ty),
++                Some(loaded),
++                vec![Operand::IdRef(wg_ptr)],
++            ));
++            let (bits, uval) = scalar_to_u32_bits(ctx, defs, cfg, ty, loaded)
++                .ok_or_else(|| format!("emulated payload: unsupported scalar leaf type {ty}"))?;
++            if bits == 32 {
++                ssbo_u32_store(ctx, cfg, ssbo_var, word_idx, uval);
++            } else {
++                let mask = ctx.const_uint(if bits == 8 { 0xff } else { 0xffff });
++                let sub = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseAnd,
++                    Some(uint_ty),
++                    Some(sub),
++                    vec![Operand::IdRef(byte_off), Operand::IdRef(c3)],
++                ));
++                let shift = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftLeftLogical,
++                    Some(uint_ty),
++                    Some(shift),
++                    vec![Operand::IdRef(sub), Operand::IdRef(c3)],
++                ));
++                let old_word = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx);
++                let shifted_mask = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftLeftLogical,
++                    Some(uint_ty),
++                    Some(shifted_mask),
++                    vec![Operand::IdRef(mask), Operand::IdRef(shift)],
++                ));
++                let inv_mask = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::Not,
++                    Some(uint_ty),
++                    Some(inv_mask),
++                    vec![Operand::IdRef(shifted_mask)],
++                ));
++                let cleared = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseAnd,
++                    Some(uint_ty),
++                    Some(cleared),
++                    vec![Operand::IdRef(old_word), Operand::IdRef(inv_mask)],
++                ));
++                let masked_val = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseAnd,
++                    Some(uint_ty),
++                    Some(masked_val),
++                    vec![Operand::IdRef(uval), Operand::IdRef(mask)],
++                ));
++                let placed = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftLeftLogical,
++                    Some(uint_ty),
++                    Some(placed),
++                    vec![Operand::IdRef(masked_val), Operand::IdRef(shift)],
++                ));
++                let merged = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseOr,
++                    Some(uint_ty),
++                    Some(merged),
++                    vec![Operand::IdRef(cleared), Operand::IdRef(placed)],
++                ));
++                ssbo_u32_store(ctx, cfg, ssbo_var, word_idx, merged);
++            }
++        }
++        PayloadCopyDir::SsboToWorkgroup => {
++            let loaded_word = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx);
++            let bits = match def.class.opcode {
++                Op::TypeBool => 8,
++                Op::TypeInt | Op::TypeFloat => match def.operands.first() {
++                    Some(Operand::LiteralBit32(b)) => *b,
++                    _ => 32,
++                },
++                _ => 32,
++            };
++            let raw = if bits == 32 {
++                loaded_word
++            } else {
++                let sub = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::BitwiseAnd,
++                    Some(uint_ty),
++                    Some(sub),
++                    vec![Operand::IdRef(byte_off), Operand::IdRef(c3)],
++                ));
++                let shift = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftLeftLogical,
++                    Some(uint_ty),
++                    Some(shift),
++                    vec![Operand::IdRef(sub), Operand::IdRef(c3)],
++                ));
++                let shifted = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftRightLogical,
++                    Some(uint_ty),
++                    Some(shifted),
++                    vec![Operand::IdRef(loaded_word), Operand::IdRef(shift)],
++                ));
++                shifted
++            };
++            let val = u32_bits_to_scalar(ctx, defs, cfg, ty, raw)
++                .ok_or_else(|| format!("emulated payload: unsupported scalar leaf type {ty}"))?;
++            cfg.push(Instruction::new(
++                Op::Store,
++                None,
++                None,
++                vec![Operand::IdRef(wg_ptr), Operand::IdRef(val)],
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn type_has_parallel_array(
++    ctx: &Ctx,
++    defs: &HashMap<Word, Instruction>,
++    ty: Word,
++    field_offset: u32,
++) -> bool {
++    let Some(def) = defs.get(&ty) else {
++        return false;
++    };
++    match def.class.opcode {
++        Op::TypeArray => {
++            let Some(Operand::IdRef(elem)) = def.operands.first() else {
++                return false;
++            };
++            let len = def
++                .operands
++                .get(1)
++                .and_then(|o| match o {
++                    Operand::IdRef(c) => extract_const_u32(defs, *c),
++                    _ => None,
++                })
++                .unwrap_or(0);
++            if len <= 1 {
++                return len == 1 && type_has_parallel_array(ctx, defs, *elem, field_offset);
++            }
++            let (elem_sz, elem_al) = crate::passes::stage_input::layout_ty_size_align(ctx, *elem, defs);
++            let stride = crate::passes::stage_input::round_up(elem_sz, elem_al);
++            let elem_def = defs.get(elem);
++            let elem_is_u8 = elem_def.is_some_and(|d| {
++                d.class.opcode == Op::TypeInt
++                    && d.operands.first() == Some(&Operand::LiteralBit32(8))
++            });
++            let elem_is_16 = elem_def.is_some_and(|d| {
++                matches!(d.class.opcode, Op::TypeInt | Op::TypeFloat)
++                    && d.operands.first() == Some(&Operand::LiteralBit32(16))
++            });
++            field_offset % 4 == 0
++                && ((elem_is_u8 && len >= 4)
++                    || (elem_is_16 && len >= 2)
++                    || (stride >= 4 && stride % 4 == 0))
++        }
++        Op::TypeStruct => {
++            let rule = crate::layout::SpirvLayout::air_offsets(
++                &ctx.air_struct_offsets,
++                ctx.air_data_layout.as_ref(),
++            );
++            (0..def.operands.len()).any(|mi| {
++                crate::layout::spirv_struct_member(ty, mi, defs, rule).is_some_and(
++                    |(off, fty)| type_has_parallel_array(ctx, defs, fty, field_offset + off),
++                )
++            })
++        }
++        _ => false,
++    }
++}
++
++fn emit_lane0_guard<F>(
++    ctx: &mut Ctx,
++    cfg: &mut CfgBuilder,
++    lid: Word,
++    body_fn: F,
++) -> Result<(), String>
++where
++    F: FnOnce(&mut Ctx, &mut CfgBuilder) -> Result<(), String>,
++{
++    let bool_ty = ctx.ty_bool();
++    let c0 = ctx.const_uint(0);
++    let is0 = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::IEqual,
++        Some(bool_ty),
++        Some(is0),
++        vec![Operand::IdRef(lid), Operand::IdRef(c0)],
++    ));
++    let then_lbl = ctx.module.fresh_id();
++    let merge_lbl = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::SelectionMerge,
++        None,
++        None,
++        vec![
++            Operand::IdRef(merge_lbl),
++            Operand::SelectionControl(spirv::SelectionControl::NONE),
++        ],
++    ));
++    cfg.terminate_and_start(
++        Instruction::new(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(is0),
++                Operand::IdRef(then_lbl),
++                Operand::IdRef(merge_lbl),
++            ],
++        ),
++        then_lbl,
++    );
++    body_fn(ctx, cfg)?;
++    cfg.terminate_and_start(
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(merge_lbl)]),
++        merge_lbl,
++    );
++    Ok(())
++}
++
++fn emit_u32_for_loop<F>(
++    ctx: &mut Ctx,
++    cfg: &mut CfgBuilder,
++    start: Word,
++    limit: Word,
++    step: Word,
++    body_fn: F,
++) -> Result<(), String>
++where
++    F: FnOnce(&mut Ctx, &mut CfgBuilder, Word) -> Result<(), String>,
++{
++    let uint_ty = ctx.ty_uint();
++    let bool_ty = ctx.ty_bool();
++    let pre_lbl = cfg.cur_label;
++    let hdr_lbl = ctx.module.fresh_id();
++    let body_lbl = ctx.module.fresh_id();
++    let cont_lbl = ctx.module.fresh_id();
++    let after_lbl = ctx.module.fresh_id();
++    let i_phi = ctx.module.fresh_id();
++    let i_next = ctx.module.fresh_id();
++    let cond = ctx.module.fresh_id();
++
++    cfg.terminate_and_start(
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(hdr_lbl)]),
++        hdr_lbl,
++    );
++    cfg.push(Instruction::new(
++        Op::Phi,
++        Some(uint_ty),
++        Some(i_phi),
++        vec![
++            Operand::IdRef(start),
++            Operand::IdRef(pre_lbl),
++            Operand::IdRef(i_next),
++            Operand::IdRef(cont_lbl),
++        ],
++    ));
++    cfg.push(Instruction::new(
++        Op::ULessThan,
++        Some(bool_ty),
++        Some(cond),
++        vec![Operand::IdRef(i_phi), Operand::IdRef(limit)],
++    ));
++    cfg.push(Instruction::new(
++        Op::LoopMerge,
++        None,
++        None,
++        vec![
++            Operand::IdRef(after_lbl),
++            Operand::IdRef(cont_lbl),
++            Operand::LoopControl(spirv::LoopControl::NONE),
++        ],
++    ));
++    cfg.terminate_and_start(
++        Instruction::new(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(cond),
++                Operand::IdRef(body_lbl),
++                Operand::IdRef(after_lbl),
++            ],
++        ),
++        body_lbl,
++    );
++    body_fn(ctx, cfg, i_phi)?;
++    cfg.terminate_and_start(
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(cont_lbl)]),
++        cont_lbl,
++    );
++    cfg.push(Instruction::new(
++        Op::IAdd,
++        Some(uint_ty),
++        Some(i_next),
++        vec![Operand::IdRef(i_phi), Operand::IdRef(step)],
++    ));
++    cfg.terminate_and_start(
++        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(hdr_lbl)]),
++        after_lbl,
++    );
++    Ok(())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn emit_payload_copy_at(
++    ctx: &mut Ctx,
++    defs: &HashMap<Word, Instruction>,
++    cfg: &mut CfgBuilder,
++    dir: PayloadCopyDir,
++    wg_var: Word,
++    indices: &mut Vec<Word>,
++    ty: Word,
++    byte_off: Word,
++    const_byte_off: Option<u32>,
++    ssbo_var: Word,
++    base_word: Word,
++    lid: Word,
++    local_total: u32,
++    in_lane_scope: bool,
++) -> Result<(), String> {
++    let uint_ty = ctx.ty_uint();
++    let c0 = ctx.const_uint(0);
++    let c1 = ctx.const_uint(1);
++    let c2 = ctx.const_uint(2);
++    let def = defs
++        .get(&ty)
++        .ok_or_else(|| format!("emulated payload: missing type def {ty}"))?
++        .clone();
++
++    match def.class.opcode {
++        Op::TypeArray => {
++            let Some(&Operand::IdRef(elem_ty)) = def.operands.first() else {
++                return Err("emulated payload: malformed OpTypeArray".into());
++            };
++            let len = def
++                .operands
++                .get(1)
++                .and_then(|o| match o {
++                    Operand::IdRef(c) => extract_const_u32(defs, *c),
++                    _ => None,
++                })
++                .unwrap_or(0);
++            if len == 0 {
++                return Ok(());
++            }
++            if len == 1 {
++                indices.push(c0);
++                let res = emit_payload_copy_at(
++                    ctx,
++                    defs,
++                    cfg,
++                    dir,
++                    wg_var,
++                    indices,
++                    elem_ty,
++                    byte_off,
++                    const_byte_off,
++                    ssbo_var,
++                    base_word,
++                    lid,
++                    local_total,
++                    in_lane_scope,
++                );
++                indices.pop();
++                return res;
++            }
++            let (elem_sz, elem_al) =
++                crate::passes::stage_input::layout_ty_size_align(ctx, elem_ty, defs);
++            let elem_stride = crate::passes::stage_input::round_up(elem_sz, elem_al).max(1);
++            let elem_def = defs.get(&elem_ty);
++            let elem_is_u8 = elem_def.is_some_and(|d| {
++                d.class.opcode == Op::TypeInt && d.operands.first() == Some(&Operand::LiteralBit32(8))
++            });
++            let elem_is_16 = elem_def.is_some_and(|d| {
++                matches!(d.class.opcode, Op::TypeInt | Op::TypeFloat)
++                    && d.operands.first() == Some(&Operand::LiteralBit32(16))
++            });
++            let aligned4 = const_byte_off.is_some_and(|o| o % 4 == 0);
++
++            if elem_is_u8 && aligned4 && len >= 4 {
++                let n_words = len / 4;
++                let base_off_words = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftRightLogical,
++                    Some(uint_ty),
++                    Some(base_off_words),
++                    vec![Operand::IdRef(byte_off), Operand::IdRef(c2)],
++                ));
++                let loop_start = if in_lane_scope { c0 } else { lid };
++                let loop_step = if in_lane_scope {
++                    c1
++                } else {
++                    ctx.const_uint(local_total)
++                };
++                let limit = ctx.const_uint(n_words);
++                let c4 = ctx.const_uint(4);
++                let c8 = ctx.const_uint(8);
++                let c16 = ctx.const_uint(16);
++                let c24 = ctx.const_uint(24);
++                emit_u32_for_loop(ctx, cfg, loop_start, limit, loop_step, |ctx, cfg, w| {
++                    let word_idx_0 = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(word_idx_0),
++                        vec![Operand::IdRef(base_word), Operand::IdRef(base_off_words)],
++                    ));
++                    let word_idx = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(word_idx),
++                        vec![Operand::IdRef(word_idx_0), Operand::IdRef(w)],
++                    ));
++                    let elem_base = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IMul,
++                        Some(uint_ty),
++                        Some(elem_base),
++                        vec![Operand::IdRef(w), Operand::IdRef(c4)],
++                    ));
++                    match dir {
++                        PayloadCopyDir::WorkgroupToSsbo => {
++                            let mut acc = c0;
++                            for (lane, sh) in [c0, c8, c16, c24].into_iter().enumerate() {
++                                let idx_lane = if lane == 0 {
++                                    elem_base
++                                } else {
++                                    let cl = ctx.const_uint(lane as u32);
++                                    let id = ctx.module.fresh_id();
++                                    cfg.push(Instruction::new(
++                                        Op::IAdd,
++                                        Some(uint_ty),
++                                        Some(id),
++                                        vec![Operand::IdRef(elem_base), Operand::IdRef(cl)],
++                                    ));
++                                    id
++                                };
++                                indices.push(idx_lane);
++                                let ptr = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                                indices.pop();
++                                let b = ctx.module.fresh_id();
++                                cfg.push(Instruction::new(
++                                    Op::Load,
++                                    Some(elem_ty),
++                                    Some(b),
++                                    vec![Operand::IdRef(ptr)],
++                                ));
++                                let u = ctx.module.fresh_id();
++                                cfg.push(Instruction::new(
++                                    Op::UConvert,
++                                    Some(uint_ty),
++                                    Some(u),
++                                    vec![Operand::IdRef(b)],
++                                ));
++                                let part = if lane == 0 {
++                                    u
++                                } else {
++                                    let s = ctx.module.fresh_id();
++                                    cfg.push(Instruction::new(
++                                        Op::ShiftLeftLogical,
++                                        Some(uint_ty),
++                                        Some(s),
++                                        vec![Operand::IdRef(u), Operand::IdRef(sh)],
++                                    ));
++                                    s
++                                };
++                                acc = if lane == 0 {
++                                    part
++                                } else {
++                                    let o = ctx.module.fresh_id();
++                                    cfg.push(Instruction::new(
++                                        Op::BitwiseOr,
++                                        Some(uint_ty),
++                                        Some(o),
++                                        vec![Operand::IdRef(acc), Operand::IdRef(part)],
++                                    ));
++                                    o
++                                };
++                            }
++                            ssbo_u32_store(ctx, cfg, ssbo_var, word_idx, acc);
++                        }
++                        PayloadCopyDir::SsboToWorkgroup => {
++                            let word = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx);
++                            for (lane, sh) in [c0, c8, c16, c24].into_iter().enumerate() {
++                                let shifted = if lane == 0 {
++                                    word
++                                } else {
++                                    let s = ctx.module.fresh_id();
++                                    cfg.push(Instruction::new(
++                                        Op::ShiftRightLogical,
++                                        Some(uint_ty),
++                                        Some(s),
++                                        vec![Operand::IdRef(word), Operand::IdRef(sh)],
++                                    ));
++                                    s
++                                };
++                                let bv = u32_bits_to_scalar(ctx, defs, cfg, elem_ty, shifted)
++                                    .ok_or_else(|| "emulated payload: u8 unpack failed".to_string())?;
++                                let idx_lane = if lane == 0 {
++                                    elem_base
++                                } else {
++                                    let cl = ctx.const_uint(lane as u32);
++                                    let id = ctx.module.fresh_id();
++                                    cfg.push(Instruction::new(
++                                        Op::IAdd,
++                                        Some(uint_ty),
++                                        Some(id),
++                                        vec![Operand::IdRef(elem_base), Operand::IdRef(cl)],
++                                    ));
++                                    id
++                                };
++                                indices.push(idx_lane);
++                                let ptr = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                                indices.pop();
++                                cfg.push(Instruction::new(
++                                    Op::Store,
++                                    None,
++                                    None,
++                                    vec![Operand::IdRef(ptr), Operand::IdRef(bv)],
++                                ));
++                            }
++                        }
++                    }
++                    Ok(())
++                })?;
++                if len % 4 != 0 {
++                    let emit_tail = |ctx: &mut Ctx, cfg: &mut CfgBuilder, indices: &mut Vec<Word>| -> Result<(), String> {
++                        for k in (n_words * 4)..len {
++                            let ck = ctx.const_uint(k);
++                            let off_k = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::IAdd,
++                                Some(uint_ty),
++                                Some(off_k),
++                                vec![Operand::IdRef(byte_off), Operand::IdRef(ck)],
++                            ));
++                            indices.push(ck);
++                            let r = copy_subword_or_word_scalar(
++                                ctx, defs, cfg, dir, wg_var, indices, elem_ty, off_k, ssbo_var, base_word,
++                            );
++                            indices.pop();
++                            r?;
++                        }
++                        Ok(())
++                    };
++                    if in_lane_scope {
++                        emit_tail(ctx, cfg, indices)?;
++                    } else {
++                        emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| emit_tail(ctx, cfg, indices))?;
++                    }
++                }
++                return Ok(());
++            }
++
++            if elem_is_16 && aligned4 && len >= 2 {
++                let n_words = len / 2;
++                let base_off_words = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::ShiftRightLogical,
++                    Some(uint_ty),
++                    Some(base_off_words),
++                    vec![Operand::IdRef(byte_off), Operand::IdRef(c2)],
++                ));
++                let loop_start = if in_lane_scope { c0 } else { lid };
++                let loop_step = if in_lane_scope {
++                    c1
++                } else {
++                    ctx.const_uint(local_total)
++                };
++                let limit = ctx.const_uint(n_words);
++                let c16 = ctx.const_uint(16);
++                emit_u32_for_loop(ctx, cfg, loop_start, limit, loop_step, |ctx, cfg, w| {
++                    let word_idx_0 = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(word_idx_0),
++                        vec![Operand::IdRef(base_word), Operand::IdRef(base_off_words)],
++                    ));
++                    let word_idx = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(word_idx),
++                        vec![Operand::IdRef(word_idx_0), Operand::IdRef(w)],
++                    ));
++                    let elem0 = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IMul,
++                        Some(uint_ty),
++                        Some(elem0),
++                        vec![Operand::IdRef(w), Operand::IdRef(c2)],
++                    ));
++                    let elem1 = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(elem1),
++                        vec![Operand::IdRef(elem0), Operand::IdRef(c1)],
++                    ));
++                    match dir {
++                        PayloadCopyDir::WorkgroupToSsbo => {
++                            indices.push(elem0);
++                            let p0 = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                            indices.pop();
++                            let v0 = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::Load,
++                                Some(elem_ty),
++                                Some(v0),
++                                vec![Operand::IdRef(p0)],
++                            ));
++                            let (_, u0) = scalar_to_u32_bits(ctx, defs, cfg, elem_ty, v0)
++                                .ok_or_else(|| "emulated payload: 16-bit pack failed".to_string())?;
++                            indices.push(elem1);
++                            let p1 = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                            indices.pop();
++                            let v1 = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::Load,
++                                Some(elem_ty),
++                                Some(v1),
++                                vec![Operand::IdRef(p1)],
++                            ));
++                            let (_, u1) = scalar_to_u32_bits(ctx, defs, cfg, elem_ty, v1)
++                                .ok_or_else(|| "emulated payload: 16-bit pack failed".to_string())?;
++                            let hi = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::ShiftLeftLogical,
++                                Some(uint_ty),
++                                Some(hi),
++                                vec![Operand::IdRef(u1), Operand::IdRef(c16)],
++                            ));
++                            let packed = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::BitwiseOr,
++                                Some(uint_ty),
++                                Some(packed),
++                                vec![Operand::IdRef(u0), Operand::IdRef(hi)],
++                            ));
++                            ssbo_u32_store(ctx, cfg, ssbo_var, word_idx, packed);
++                        }
++                        PayloadCopyDir::SsboToWorkgroup => {
++                            let word = ssbo_u32_load(ctx, cfg, ssbo_var, word_idx);
++                            let hi = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::ShiftRightLogical,
++                                Some(uint_ty),
++                                Some(hi),
++                                vec![Operand::IdRef(word), Operand::IdRef(c16)],
++                            ));
++                            let v0 = u32_bits_to_scalar(ctx, defs, cfg, elem_ty, word)
++                                .ok_or_else(|| "emulated payload: 16-bit unpack failed".to_string())?;
++                            let v1 = u32_bits_to_scalar(ctx, defs, cfg, elem_ty, hi)
++                                .ok_or_else(|| "emulated payload: 16-bit unpack failed".to_string())?;
++                            indices.push(elem0);
++                            let p0 = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                            indices.pop();
++                            cfg.push(Instruction::new(
++                                Op::Store,
++                                None,
++                                None,
++                                vec![Operand::IdRef(p0), Operand::IdRef(v0)],
++                            ));
++                            indices.push(elem1);
++                            let p1 = wg_access_ptr(ctx, cfg, wg_var, indices, elem_ty);
++                            indices.pop();
++                            cfg.push(Instruction::new(
++                                Op::Store,
++                                None,
++                                None,
++                                vec![Operand::IdRef(p1), Operand::IdRef(v1)],
++                            ));
++                        }
++                    }
++                    Ok(())
++                })?;
++                if len % 2 != 0 {
++                    let last = len - 1;
++                    let emit_tail = |ctx: &mut Ctx, cfg: &mut CfgBuilder, indices: &mut Vec<Word>| -> Result<(), String> {
++                        let cl = ctx.const_uint(last);
++                        let c_off = ctx.const_uint(last * 2);
++                        let off_k = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::IAdd,
++                            Some(uint_ty),
++                            Some(off_k),
++                            vec![Operand::IdRef(byte_off), Operand::IdRef(c_off)],
++                        ));
++                        indices.push(cl);
++                        let r = copy_subword_or_word_scalar(
++                            ctx, defs, cfg, dir, wg_var, indices, elem_ty, off_k, ssbo_var, base_word,
++                        );
++                        indices.pop();
++                        r
++                    };
++                    if in_lane_scope {
++                        emit_tail(ctx, cfg, indices)?;
++                    } else {
++                        emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| emit_tail(ctx, cfg, indices))?;
++                    }
++                }
++                return Ok(());
++            }
++
++            // General array: parallel across workgroup only when element stride is a multiple of 4
++            // bytes at a 4-byte-aligned offset so distinct lanes never share an SSBO u32 word.
++            let can_parallelize =
++                !in_lane_scope && elem_stride >= 4 && elem_stride % 4 == 0 && aligned4;
++            let emit_loop = |ctx: &mut Ctx, cfg: &mut CfgBuilder, indices: &mut Vec<Word>, parallel: bool| -> Result<(), String> {
++                let loop_start = if parallel { lid } else { c0 };
++                let loop_step = if parallel {
++                    ctx.const_uint(local_total)
++                } else {
++                    c1
++                };
++                let limit = ctx.const_uint(len);
++                let c_stride = ctx.const_uint(elem_stride);
++                emit_u32_for_loop(ctx, cfg, loop_start, limit, loop_step, |ctx, cfg, i| {
++                    let delta = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IMul,
++                        Some(uint_ty),
++                        Some(delta),
++                        vec![Operand::IdRef(i), Operand::IdRef(c_stride)],
++                    ));
++                    let elem_off = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(elem_off),
++                        vec![Operand::IdRef(byte_off), Operand::IdRef(delta)],
++                    ));
++                    indices.push(i);
++                    let r = emit_payload_copy_at(
++                        ctx,
++                        defs,
++                        cfg,
++                        dir,
++                        wg_var,
++                        indices,
++                        elem_ty,
++                        elem_off,
++                        None,
++                        ssbo_var,
++                        base_word,
++                        lid,
++                        local_total,
++                        true,
++                    );
++                    indices.pop();
++                    r
++                })
++            };
++            if can_parallelize {
++                emit_loop(ctx, cfg, indices, true)
++            } else if in_lane_scope {
++                emit_loop(ctx, cfg, indices, false)
++            } else {
++                emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| {
++                    emit_loop(ctx, cfg, indices, false)
++                })
++            }
++        }
++        Op::TypeStruct => {
++            let rule = crate::layout::SpirvLayout::air_offsets(
++                &ctx.air_struct_offsets,
++                ctx.air_data_layout.as_ref(),
++            );
++            let mut fields = Vec::with_capacity(def.operands.len());
++            for mi in 0..def.operands.len() {
++                if let Some((off, fty)) = crate::layout::spirv_struct_member(ty, mi, defs, rule) {
++                    fields.push((mi as u32, off, fty));
++                }
++            }
++            if in_lane_scope {
++                for (mi, off, fty) in fields {
++                    let f_off = if off == 0 {
++                        byte_off
++                    } else {
++                        let c_off = ctx.const_uint(off);
++                        let id = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::IAdd,
++                            Some(uint_ty),
++                            Some(id),
++                            vec![Operand::IdRef(byte_off), Operand::IdRef(c_off)],
++                        ));
++                        id
++                    };
++                    indices.push(ctx.const_uint(mi));
++                    let r = emit_payload_copy_at(
++                        ctx,
++                        defs,
++                        cfg,
++                        dir,
++                        wg_var,
++                        indices,
++                        fty,
++                        f_off,
++                        const_byte_off.map(|b| b + off),
++                        ssbo_var,
++                        base_word,
++                        lid,
++                        local_total,
++                        true,
++                    );
++                    indices.pop();
++                    r?;
++                }
++                return Ok(());
++            }
++            let base_const = const_byte_off.unwrap_or(0);
++            let mut lane0_fields = Vec::new();
++            let mut parallel_fields = Vec::new();
++            for (mi, off, fty) in fields {
++                if type_has_parallel_array(ctx, defs, fty, base_const + off) {
++                    parallel_fields.push((mi, off, fty));
++                } else {
++                    lane0_fields.push((mi, off, fty));
++                }
++            }
++            if !lane0_fields.is_empty() {
++                emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| {
++                    for (mi, off, fty) in lane0_fields {
++                        let f_off = if off == 0 {
++                            byte_off
++                        } else {
++                            let c_off = ctx.const_uint(off);
++                            let id = ctx.module.fresh_id();
++                            cfg.push(Instruction::new(
++                                Op::IAdd,
++                                Some(uint_ty),
++                                Some(id),
++                                vec![Operand::IdRef(byte_off), Operand::IdRef(c_off)],
++                            ));
++                            id
++                        };
++                        indices.push(ctx.const_uint(mi));
++                        let r = emit_payload_copy_at(
++                            ctx,
++                            defs,
++                            cfg,
++                            dir,
++                            wg_var,
++                            indices,
++                            fty,
++                            f_off,
++                            const_byte_off.map(|b| b + off),
++                            ssbo_var,
++                            base_word,
++                            lid,
++                            local_total,
++                            true,
++                        );
++                        indices.pop();
++                        r?;
++                    }
++                    Ok(())
++                })?;
++            }
++            for (mi, off, fty) in parallel_fields {
++                let f_off = if off == 0 {
++                    byte_off
++                } else {
++                    let c_off = ctx.const_uint(off);
++                    let id = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(id),
++                        vec![Operand::IdRef(byte_off), Operand::IdRef(c_off)],
++                    ));
++                    id
++                };
++                indices.push(ctx.const_uint(mi));
++                let r = emit_payload_copy_at(
++                    ctx,
++                    defs,
++                    cfg,
++                    dir,
++                    wg_var,
++                    indices,
++                    fty,
++                    f_off,
++                    const_byte_off.map(|b| b + off),
++                    ssbo_var,
++                    base_word,
++                    lid,
++                    local_total,
++                    false,
++                );
++                indices.pop();
++                r?;
++            }
++            Ok(())
++        }
++        Op::TypeVector => {
++            let Some(&Operand::IdRef(comp_ty)) = def.operands.first() else {
++                return Err("emulated payload: malformed OpTypeVector".into());
++            };
++            let lanes = match def.operands.get(1) {
++                Some(Operand::LiteralBit32(n)) => *n,
++                _ => return Err("emulated payload: malformed vector lane count".into()),
++            };
++            let (comp_sz, _) =
++                crate::passes::stage_input::layout_ty_size_align(ctx, comp_ty, defs);
++            let do_vec = |ctx: &mut Ctx, cfg: &mut CfgBuilder, indices: &mut Vec<Word>| -> Result<(), String> {
++                for lane in 0..lanes {
++                    let c_lane = ctx.const_uint(lane);
++                    let lane_off = if lane == 0 {
++                        byte_off
++                    } else {
++                        let c_delta = ctx.const_uint(lane * comp_sz);
++                        let id = ctx.module.fresh_id();
++                        cfg.push(Instruction::new(
++                            Op::IAdd,
++                            Some(uint_ty),
++                            Some(id),
++                            vec![Operand::IdRef(byte_off), Operand::IdRef(c_delta)],
++                        ));
++                        id
++                    };
++                    indices.push(c_lane);
++                    let r = copy_subword_or_word_scalar(
++                        ctx, defs, cfg, dir, wg_var, indices, comp_ty, lane_off, ssbo_var, base_word,
++                    );
++                    indices.pop();
++                    r?;
++                }
++                Ok(())
++            };
++            if in_lane_scope {
++                do_vec(ctx, cfg, indices)
++            } else {
++                emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| do_vec(ctx, cfg, indices))
++            }
++        }
++        _ => {
++            if in_lane_scope {
++                copy_subword_or_word_scalar(
++                    ctx, defs, cfg, dir, wg_var, indices, ty, byte_off, ssbo_var, base_word,
++                )
++            } else {
++                emit_lane0_guard(ctx, cfg, lid, |ctx, cfg| {
++                    copy_subword_or_word_scalar(
++                        ctx, defs, cfg, dir, wg_var, indices, ty, byte_off, ssbo_var, base_word,
++                    )
++                })
++            }
++        }
++    }
++}
++
++fn find_variable_pointee_type(ctx: &Ctx, var: Word) -> Option<Word> {
++    let ptr_ty = ctx
++        .module
++        .types_global_values
++        .iter()
++        .chain(ctx.new_globals.iter())
++        .find(|i| i.result_id == Some(var) && i.class.opcode == Op::Variable)?
++        .result_type?;
++    let ptr_def = ctx
++        .module
++        .types_global_values
++        .iter()
++        .chain(ctx.new_globals.iter())
++        .find(|i| i.result_id == Some(ptr_ty) && i.class.opcode == Op::TypePointer)?;
++    match ptr_def.operands.get(1) {
++        Some(Operand::IdRef(pt)) => Some(*pt),
++        _ => None,
++    }
++}
++
++/// Finalize GFX-ring emulated Object+Mesh stages after Workgroup passes and zero-initialization:
++/// - `Stage::Object`: replaces each `OpReturn` with a barrier, `ogid` calculation from
++///   `WorkgroupId` + binding 673 (`grid_params`), parallel `Workgroup -> SSBO` copy to binding
++///   674 (`payload`), barrier, and lane-0 write of `grid_var[0..2]` to binding 675 (`indirect`).
++/// - `Stage::Mesh` (only when `task_payload_var` is present): splices a prologue after entry
++///   Workgroup zero-init reading `BuiltIn DrawIndex` + binding 673 (`payload_stride_bytes`),
++///   copying binding 674 (`payload`) -> `Workgroup` payload in parallel, and synchronizing via a
++///   Workgroup barrier before any mesh shader instruction reads the payload.
++pub(in crate::passes) fn finalize_emulated_object_mesh_stage(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++    stage: &Stage,
++) -> Result<(), String> {
++    match stage {
++        Stage::Object => finalize_emulated_object_stage(ctx, entry_idx),
++        Stage::Mesh => finalize_emulated_mesh_stage(ctx, entry_idx),
++        _ => Ok(()),
++    }
++}
++
++fn finalize_emulated_object_stage(ctx: &mut Ctx, entry_idx: usize) -> Result<(), String> {
++    let Some(grid_var) = ctx.task_mesh_grid_var else {
++        return Err("emulated object stage missing workgroup mesh grid variable".into());
++    };
++    let uint_ty = ctx.ty_uint();
++    let v3u_ty = ctx.ty_vec_uint(3);
++    let wg_u32_ptr_ty = ctx.ty_ptr(StorageClass::Workgroup, uint_ty);
++    let grid_params_var = make_emulated_grid_params_ssbo(ctx)?;
++    let indirect_var = make_emulated_u32_ssbo(
++        ctx,
++        crate::reflect::MESH_EMULATED_INDIRECT_BINDING,
++        false,
++    )?;
++    let payload_info = if let Some(wg_payload_var) = ctx.task_payload_var {
++        let pointee = find_variable_pointee_type(ctx, wg_payload_var)
++            .ok_or_else(|| "emulated object payload variable has no pointee type".to_string())?;
++        let payload_ssbo_var = make_emulated_u32_ssbo(
++            ctx,
++            crate::reflect::MESH_EMULATED_PAYLOAD_BINDING,
++            false,
++        )?;
++        Some((wg_payload_var, pointee, payload_ssbo_var))
++    } else {
++        None
++    };
++    let wg_id_var = ensure_input_builtin_var(ctx, BuiltIn::WorkgroupId, v3u_ty);
++    let lid_var = ensure_input_builtin_var(ctx, BuiltIn::LocalInvocationIndex, uint_ty);
++    let (defs, _) = collect_defs_and_value_types(ctx, entry_idx);
++    let local_total = ctx.kernel_local_size[0]
++        .saturating_mul(ctx.kernel_local_size[1])
++        .saturating_mul(ctx.kernel_local_size[2])
++        .max(1);
++
++    let return_blocks: Vec<usize> = ctx.module.functions[entry_idx]
++        .blocks
++        .iter()
++        .enumerate()
++        .filter_map(|(bi, blk)| {
++            blk.instructions
++                .iter()
++                .any(|i| i.class.opcode == Op::Return)
++                .then_some(bi)
++        })
++        .collect();
++
++    let c0 = ctx.const_uint(0);
++    let c1 = ctx.const_uint(1);
++    let c2 = ctx.const_uint(2);
++    let c3 = ctx.const_uint(3);
++
++    for bi in return_blocks.into_iter().rev() {
++        let Some(orig_label) = ctx.module.functions[entry_idx].blocks[bi]
++            .label
++            .as_ref()
++            .and_then(|l| l.result_id)
++        else {
++            continue;
++        };
++        let Some(ret_pos) = ctx.module.functions[entry_idx].blocks[bi]
++            .instructions
++            .iter()
++            .position(|i| i.class.opcode == Op::Return)
++        else {
++            continue;
++        };
++        let prefix = ctx.module.functions[entry_idx].blocks[bi].instructions[..ret_pos].to_vec();
++        let mut cfg = CfgBuilder::new(orig_label, prefix);
++
++        // Ensure all object-workgroup stores to payload and grid_var complete before reading.
++        emit_workgroup_barrier(ctx, &mut cfg.cur_insts);
++
++        let wg_vec = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::Load,
++            Some(v3u_ty),
++            Some(wg_vec),
++            vec![Operand::IdRef(wg_id_var)],
++        ));
++        let wg_x = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::CompositeExtract,
++            Some(uint_ty),
++            Some(wg_x),
++            vec![Operand::IdRef(wg_vec), Operand::LiteralBit32(0)],
++        ));
++        let wg_y = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::CompositeExtract,
++            Some(uint_ty),
++            Some(wg_y),
++            vec![Operand::IdRef(wg_vec), Operand::LiteralBit32(1)],
++        ));
++        let wg_z = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::CompositeExtract,
++            Some(uint_ty),
++            Some(wg_z),
++            vec![Operand::IdRef(wg_vec), Operand::LiteralBit32(2)],
++        ));
++        let grid_x = grid_params_load_field(ctx, &mut cfg, grid_params_var, 0);
++        let grid_y = grid_params_load_field(ctx, &mut cfg, grid_params_var, 1);
++        let grid_xy = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IMul,
++            Some(uint_ty),
++            Some(grid_xy),
++            vec![Operand::IdRef(grid_x), Operand::IdRef(grid_y)],
++        ));
++        let z_term = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IMul,
++            Some(uint_ty),
++            Some(z_term),
++            vec![Operand::IdRef(wg_z), Operand::IdRef(grid_xy)],
++        ));
++        let y_term = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IMul,
++            Some(uint_ty),
++            Some(y_term),
++            vec![Operand::IdRef(wg_y), Operand::IdRef(grid_x)],
++        ));
++        let z_plus_y = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IAdd,
++            Some(uint_ty),
++            Some(z_plus_y),
++            vec![Operand::IdRef(z_term), Operand::IdRef(y_term)],
++        ));
++        let ogid = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::IAdd,
++            Some(uint_ty),
++            Some(ogid),
++            vec![Operand::IdRef(z_plus_y), Operand::IdRef(wg_x)],
++        ));
++        let lid = ctx.module.fresh_id();
++        cfg.push(Instruction::new(
++            Op::Load,
++            Some(uint_ty),
++            Some(lid),
++            vec![Operand::IdRef(lid_var)],
++        ));
++
++        if let Some((wg_payload_var, payload_pointee, payload_ssbo_var)) = payload_info {
++            let stride_bytes = grid_params_load_field(ctx, &mut cfg, grid_params_var, 3);
++            let stride_words = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::ShiftRightLogical,
++                Some(uint_ty),
++                Some(stride_words),
++                vec![Operand::IdRef(stride_bytes), Operand::IdRef(c2)],
++            ));
++            let base_word = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::IMul,
++                Some(uint_ty),
++                Some(base_word),
++                vec![Operand::IdRef(ogid), Operand::IdRef(stride_words)],
++            ));
++            let mut indices = Vec::new();
++            emit_payload_copy_at(
++                ctx,
++                &defs,
++                &mut cfg,
++                PayloadCopyDir::WorkgroupToSsbo,
++                wg_payload_var,
++                &mut indices,
++                payload_pointee,
++                c0,
++                Some(0),
++                payload_ssbo_var,
++                base_word,
++                lid,
++                local_total,
++                false,
++            )?;
++            let wg_scope = ctx.const_uint(Scope::Workgroup as u32);
++            let sem = ctx.const_uint(
++                (MemorySemantics::ACQUIRE_RELEASE
++                    | MemorySemantics::WORKGROUP_MEMORY
++                    | MemorySemantics::UNIFORM_MEMORY)
++                    .bits(),
++            );
++            cfg.push(Instruction::new(
++                Op::ControlBarrier,
++                None,
++                None,
++                vec![
++                    Operand::IdScope(wg_scope),
++                    Operand::IdScope(wg_scope),
++                    Operand::IdMemorySemantics(sem),
++                ],
++            ));
++        }
++
++        emit_lane0_guard(ctx, &mut cfg, lid, |ctx, cfg| {
++            let ind_base = ctx.module.fresh_id();
++            cfg.push(Instruction::new(
++                Op::IMul,
++                Some(uint_ty),
++                Some(ind_base),
++                vec![Operand::IdRef(ogid), Operand::IdRef(c3)],
++            ));
++            for (lane, idx_const) in [c0, c1, c2].into_iter().enumerate() {
++                let p = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::AccessChain,
++                    Some(wg_u32_ptr_ty),
++                    Some(p),
++                    vec![Operand::IdRef(grid_var), Operand::IdRef(idx_const)],
++                ));
++                let dim = ctx.module.fresh_id();
++                cfg.push(Instruction::new(
++                    Op::Load,
++                    Some(uint_ty),
++                    Some(dim),
++                    vec![Operand::IdRef(p)],
++                ));
++                let dst_idx = if lane == 0 {
++                    ind_base
++                } else {
++                    let id = ctx.module.fresh_id();
++                    cfg.push(Instruction::new(
++                        Op::IAdd,
++                        Some(uint_ty),
++                        Some(id),
++                        vec![Operand::IdRef(ind_base), Operand::IdRef(idx_const)],
++                    ));
++                    id
++                };
++                ssbo_u32_store(ctx, cfg, indirect_var, dst_idx, dim);
++            }
++            Ok(())
++        })?;
++        cfg.push(Instruction::new(Op::Return, None, None, vec![]));
++
++        let new_blocks = cfg.finish();
++        ctx.module.functions[entry_idx]
++            .blocks
++            .splice(bi..=bi, new_blocks);
++    }
++    Ok(())
++}
++
++fn finalize_emulated_mesh_stage(ctx: &mut Ctx, entry_idx: usize) -> Result<(), String> {
++    let Some(wg_payload_var) = ctx.task_payload_var else {
++        // Mesh-only stage without payload: keep 100% pure hardware MeshEXT with no 673..675 bindings.
++        return Ok(());
++    };
++    let payload_pointee = find_variable_pointee_type(ctx, wg_payload_var)
++        .ok_or_else(|| "emulated mesh payload variable has no pointee type".to_string())?;
++    let uint_ty = ctx.ty_uint();
++    let sint_ty = ctx.ty_sint();
++    let grid_params_var = make_emulated_grid_params_ssbo(ctx)?;
++    let payload_ssbo_var = make_emulated_u32_ssbo(
++        ctx,
++        crate::reflect::MESH_EMULATED_PAYLOAD_BINDING,
++        true,
++    )?;
++    let draw_id_var = ensure_input_builtin_var(ctx, BuiltIn::DrawIndex, sint_ty);
++    let lid_var = ensure_input_builtin_var(ctx, BuiltIn::LocalInvocationIndex, uint_ty);
++    let (defs, _) = collect_defs_and_value_types(ctx, entry_idx);
++    let local_total = ctx.kernel_local_size[0]
++        .saturating_mul(ctx.kernel_local_size[1])
++        .saturating_mul(ctx.kernel_local_size[2])
++        .max(1);
++
++    let Some(orig_label) = ctx.module.functions[entry_idx]
++        .blocks
++        .first()
++        .and_then(|b| b.label.as_ref())
++        .and_then(|l| l.result_id)
++    else {
++        return Ok(());
++    };
++    let old_insts = ctx.module.functions[entry_idx].blocks[0].instructions.clone();
++    // Split right after leading OpVariables + zero_initialize_workgroup_memory's stores & barrier.
++    let wg_vars: HashSet<Word> = ctx
++        .module
++        .types_global_values
++        .iter()
++        .chain(ctx.new_globals.iter())
++        .filter(|i| {
++            i.class.opcode == Op::Variable
++                && i.operands.first() == Some(&Operand::StorageClass(StorageClass::Workgroup))
++        })
++        .filter_map(|i| i.result_id)
++        .collect();
++    let first_non_var = old_insts
++        .iter()
++        .position(|i| i.class.opcode != Op::Variable)
++        .unwrap_or(old_insts.len());
++    let mut split_at = first_non_var;
++    {
++        let mut cursor = first_non_var;
++        while cursor < old_insts.len()
++            && old_insts[cursor].class.opcode == Op::Store
++            && matches!(
++                old_insts[cursor].operands.first(),
++                Some(Operand::IdRef(dst)) if wg_vars.contains(dst)
++            )
++        {
++            cursor += 1;
++        }
++        if cursor > first_non_var
++            && cursor < old_insts.len()
++            && old_insts[cursor].class.opcode == Op::ControlBarrier
++        {
++            split_at = cursor + 1;
++        }
++    }
++
++    let prefix = old_insts[..split_at].to_vec();
++    let suffix = old_insts[split_at..].to_vec();
++    let c0 = ctx.const_uint(0);
++    let c2 = ctx.const_uint(2);
++
++    let mut cfg = CfgBuilder::new(orig_label, prefix);
++    let draw_id_s = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::Load,
++        Some(sint_ty),
++        Some(draw_id_s),
++        vec![Operand::IdRef(draw_id_var)],
++    ));
++    let draw_id = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::Bitcast,
++        Some(uint_ty),
++        Some(draw_id),
++        vec![Operand::IdRef(draw_id_s)],
++    ));
++    let stride_bytes = grid_params_load_field(ctx, &mut cfg, grid_params_var, 3);
++    let stride_words = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::ShiftRightLogical,
++        Some(uint_ty),
++        Some(stride_words),
++        vec![Operand::IdRef(stride_bytes), Operand::IdRef(c2)],
++    ));
++    let base_word = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::IMul,
++        Some(uint_ty),
++        Some(base_word),
++        vec![Operand::IdRef(draw_id), Operand::IdRef(stride_words)],
++    ));
++    let lid = ctx.module.fresh_id();
++    cfg.push(Instruction::new(
++        Op::Load,
++        Some(uint_ty),
++        Some(lid),
++        vec![Operand::IdRef(lid_var)],
++    ));
++    let mut indices = Vec::new();
++    emit_payload_copy_at(
++        ctx,
++        &defs,
++        &mut cfg,
++        PayloadCopyDir::SsboToWorkgroup,
++        wg_payload_var,
++        &mut indices,
++        payload_pointee,
++        c0,
++        Some(0),
++        payload_ssbo_var,
++        base_word,
++        lid,
++        local_total,
++        false,
++    )?;
++    emit_workgroup_barrier(ctx, &mut cfg.cur_insts);
++    let tail_label = cfg.cur_label;
++    cfg.cur_insts.extend(suffix);
++    let new_blocks = cfg.finish();
++    let new_block_count = new_blocks.len();
++
++    ctx.module.functions[entry_idx]
++        .blocks
++        .splice(0..=0, new_blocks);
++    // Remap any OpPhi predecessor in original successor blocks referencing block 0's original
++    // label to the split tail label (never rewrite OpPhis inside the newly spliced prologue blocks!).
++    if tail_label != orig_label {
++        for blk in &mut ctx.module.functions[entry_idx].blocks[new_block_count..] {
++            for inst in &mut blk.instructions {
++                if inst.class.opcode == Op::Phi {
++                    for pair in inst.operands.chunks_exact_mut(2) {
++                        if pair[1] == Operand::IdRef(orig_label) {
++                            pair[1] = Operand::IdRef(tail_label);
++                        }
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::meta::MeshTopology;
+@@ -2341,4 +4463,591 @@ entry:
+         assert!(!refl.varyings[0].per_primitive);
+         assert!(refl.varyings[1].per_primitive);
+     }
++
++    fn translate_emulated(
++        ll: &str,
++        stage: Stage,
++        local_size: [u32; 3],
++    ) -> (crate::spirv_module::Module, crate::reflect::ShaderReflection) {
++        let mut opts = TransformOptions::default().with_emulated_mesh_payload();
++        opts.kernel_local_size = local_size;
++        let (bytes, refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            ll,
++            stage,
++            Path::new(""),
++            opts,
++            None,
++        )
++        .expect("translate emulated mesh/object shader");
++        let module = load_bytes(&bytes).expect("parse emitted SPIR-V");
++        (module, refl)
++    }
++
++    fn has_binding(m: &crate::spirv_module::Module, binding: u32) -> bool {
++        m.annotations.iter().any(|i| {
++            i.class.opcode == Op::Decorate
++                && i.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
++                && i.operands.get(2) == Some(&Operand::LiteralBit32(binding))
++        })
++    }
++
++    #[test]
++    fn emulated_object_stage_16kib_payload_emits_glcompute_and_ssbo_bindings() {
++        let ll = r#"
++%struct.Payload = type { <4 x float>, [4092 x i32] }
++
++define void @obj_main(ptr addrspace(6) %payload, ptr addrspace(1) %mgp, i32 %tid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %do_emit, label %done
++
++do_emit:
++  %p0 = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 0
++  store <4 x float> <float 0.25, float -0.25, float 0.0, float 1.0>, ptr addrspace(6) %p0
++  %p_last = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 1, i32 4091
++  store i32 42, ptr addrspace(6) %p_last
++  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> <i32 2, i32 1, i32 1>)
++  br label %done
++
++done:
++  ret void
++}
++
++declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
++
++!air.object = !{!0}
++!0 = !{ptr @obj_main, !1, !2, !6}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 16384, !"air.arg_type_name", !"Payload"}
++!4 = !{i32 1, !"air.mesh_grid_properties"}
++!5 = !{i32 2, !"air.thread_index_in_threadgroup"}
++!6 = !{!"air.max_total_threadgroups_per_mesh_grid", i32 64}
++"#;
++        let (module, refl) = translate_emulated(ll, Stage::Object, [32, 1, 1]);
++        assert!(
++            !has_capability(&module, Capability::MeshShadingEXT),
++            "emulated Object stage must NOT require MeshShadingEXT"
++        );
++        assert!(!has_extension(&module, "SPV_EXT_mesh_shader"));
++        assert!(module.entry_points.iter().any(|e| {
++            e.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::GLCompute))
++        }));
++        assert!(has_exec_mode(&module, ExecutionMode::LocalSize, Some(32)));
++        assert!(!module
++            .all_inst_iter()
++            .any(|i| i.class.opcode == Op::EmitMeshTasksEXT));
++        assert!(!module.types_global_values.iter().any(|i| {
++            i.class.opcode == Op::Variable
++                && i.operands.first()
++                    == Some(&Operand::StorageClass(StorageClass::TaskPayloadWorkgroupEXT))
++        }));
++        assert!(has_builtin(&module, BuiltIn::WorkgroupId));
++        assert!(has_builtin(&module, BuiltIn::LocalInvocationIndex));
++        assert!(has_binding(&module, 673));
++        assert!(has_binding(&module, 674));
++        assert!(has_binding(&module, 675));
++
++        assert_eq!(refl.stage, ShaderStage::Object);
++        let obj = refl.object.expect("object reflection");
++        assert!(obj.has_payload);
++        assert_eq!(obj.payload_size, Some(16384));
++        assert!(obj.emulated_payload);
++        assert_eq!(obj.payload_stride, Some(16384));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedGridParams
++                && b.descriptor
++                    .as_ref()
++                    .is_some_and(|d| d.set == 0 && d.binding == 673)
++        }));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedPayload
++                && b.descriptor
++                    .as_ref()
++                    .is_some_and(|d| d.set == 0 && d.binding == 674)
++        }));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedIndirect
++                && b.descriptor
++                    .as_ref()
++                    .is_some_and(|d| d.set == 0 && d.binding == 675)
++        }));
++    }
++
++    #[test]
++    fn emulated_object_stage_without_payload_emits_673_and_675_only() {
++        let ll = r#"
++define void @obj_nopayload(ptr addrspace(1) %mgp) {
++entry:
++  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> <i32 1, i32 1, i32 1>)
++  ret void
++}
++declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
++!air.object = !{!0}
++!0 = !{ptr @obj_nopayload, !1, !2}
++!1 = !{}
++!2 = !{!3}
++!3 = !{i32 0, !"air.mesh_grid_properties"}
++"#;
++        let (module, refl) = translate_emulated(ll, Stage::Object, [1, 1, 1]);
++        assert!(!has_capability(&module, Capability::MeshShadingEXT));
++        assert!(module.entry_points.iter().any(|e| {
++            e.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::GLCompute))
++        }));
++        assert!(has_binding(&module, 673));
++        assert!(!has_binding(&module, 674));
++        assert!(has_binding(&module, 675));
++        let obj = refl.object.expect("object reflection");
++        assert!(!obj.has_payload);
++        assert!(obj.emulated_payload);
++        assert_eq!(obj.payload_stride, None);
++    }
++
++    #[test]
++    fn emulated_mesh_stage_with_payload_uses_draw_index_and_ssbo_and_mesh_only_unchanged() {
++        let ll_with_payload = r#"
++%struct.Payload = type { <4 x float>, [4092 x i32] }
++
++define void @mesh_main(ptr addrspace(6) %payload, ptr addrspace(1) %out_mesh, i32 %tid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %emit, label %done
++
++emit:
++  call void @air.set_mesh_primitive_count(ptr addrspace(1) %out_mesh, i32 1)
++  %p0 = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 0
++  %off = load <4 x float>, ptr addrspace(6) %p0
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 0, <4 x float> %off)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 1, <4 x float> <float 0.5, float -0.5, float 0.0, float 1.0>)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 2, <4 x float> <float 0.0, float 0.5, float 0.0, float 1.0>)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 0, i32 0)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 1, i32 1)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 2, i32 2)
++  br label %done
++
++done:
++  ret void
++}
++declare void @air.set_mesh_primitive_count(ptr addrspace(1), i32)
++declare void @air.set_mesh_vertex_position(ptr addrspace(1), i32, <4 x float>)
++declare void @air.set_mesh_index(ptr addrspace(1), i32, i32)
++!air.mesh = !{!0}
++!0 = !{ptr @mesh_main, !1, !2, !7}
++!1 = !{!6}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 16384, !"air.arg_type_name", !"Payload"}
++!4 = !{i32 1, !"air.mesh", !"air.arg_type_name", !"mesh<V, void, 3, 1, topology::triangle>"}
++!5 = !{i32 2, !"air.thread_index_in_threadgroup"}
++!6 = !{i32 0, !"air.position"}
++!7 = !{!"air.mesh_topology", !"triangle", !"air.max_vertices", i32 3, !"air.max_primitives", i32 1}
++"#;
++        let (module, refl) = translate_emulated(ll_with_payload, Stage::Mesh, [32, 1, 1]);
++        assert!(has_capability(&module, Capability::MeshShadingEXT));
++        assert!(has_capability(&module, Capability::DrawParameters));
++        assert!(has_extension(&module, "SPV_EXT_mesh_shader"));
++        assert!(module.entry_points.iter().any(|e| {
++            e.operands.first() == Some(&Operand::ExecutionModel(ExecutionModel::MeshEXT))
++        }));
++        assert!(has_builtin(&module, BuiltIn::DrawIndex));
++        assert!(!module.types_global_values.iter().any(|i| {
++            i.class.opcode == Op::Variable
++                && i.operands.first()
++                    == Some(&Operand::StorageClass(StorageClass::TaskPayloadWorkgroupEXT))
++        }));
++        assert!(has_binding(&module, 673));
++        assert!(has_binding(&module, 674));
++        assert!(!has_binding(&module, 675));
++        assert_no_output_loads(&module);
++
++        let mesh = refl.mesh.expect("mesh reflection");
++        assert!(mesh.has_payload);
++        assert!(mesh.emulated_payload);
++        assert_eq!(mesh.payload_stride, Some(16384));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedGridParams
++                && b.descriptor
++                    .as_ref()
++                    .is_some_and(|d| d.set == 0 && d.binding == 673)
++        }));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedPayload
++                && b.descriptor
++                    .as_ref()
++                    .is_some_and(|d| d.set == 0 && d.binding == 674)
++        }));
++
++        // Mesh-only (no payload) must stay pure hardware MeshEXT with no 673..675 or DrawParameters.
++        let ll_no_payload = r#"
++define void @mesh_only(ptr addrspace(1) %out_mesh) {
++entry:
++  call void @air.set_mesh_primitive_count(ptr addrspace(1) %out_mesh, i32 1)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 0, <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 0, i32 0)
++  ret void
++}
++declare void @air.set_mesh_primitive_count(ptr addrspace(1), i32)
++declare void @air.set_mesh_vertex_position(ptr addrspace(1), i32, <4 x float>)
++declare void @air.set_mesh_index(ptr addrspace(1), i32, i32)
++!air.mesh = !{!0}
++!0 = !{ptr @mesh_only, !1, !2, !5}
++!1 = !{!4}
++!2 = !{!3}
++!3 = !{i32 0, !"air.mesh", !"air.arg_type_name", !"mesh<V, void, 1, 1, topology::point>"}
++!4 = !{i32 0, !"air.position"}
++!5 = !{!"air.mesh_topology", !"point", !"air.max_vertices", i32 1, !"air.max_primitives", i32 1}
++"#;
++        let (mo_mod, mo_refl) = translate_emulated(ll_no_payload, Stage::Mesh, [1, 1, 1]);
++        assert!(has_capability(&mo_mod, Capability::MeshShadingEXT));
++        assert!(!has_capability(&mo_mod, Capability::DrawParameters));
++        assert!(!has_builtin(&mo_mod, BuiltIn::DrawIndex));
++        assert!(!has_binding(&mo_mod, 673));
++        assert!(!has_binding(&mo_mod, 674));
++        assert!(!has_binding(&mo_mod, 675));
++        let mo = mo_refl.mesh.expect("mesh-only reflection");
++        assert!(!mo.has_payload);
++        assert!(!mo.emulated_payload);
++        assert_eq!(mo.payload_stride, None);
++    }
++
++    #[test]
++    fn emulated_object_and_mesh_subword_and_mixed_struct_payloads_lower_cleanly() {
++        let ll_obj = r#"
++%struct.Mixed = type { i8, i16, half, i32, i64, <3 x float>, [8 x i8], [4 x half] }
++
++define void @obj_mixed(ptr addrspace(6) %payload, ptr addrspace(1) %mgp) {
++entry:
++  %p0 = getelementptr inbounds %struct.Mixed, ptr addrspace(6) %payload, i32 0, i32 0
++  store i8 7, ptr addrspace(6) %p0
++  %p4 = getelementptr inbounds %struct.Mixed, ptr addrspace(6) %payload, i32 0, i32 4
++  store i64 123456789012345, ptr addrspace(6) %p4
++  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> <i32 1, i32 1, i32 1>)
++  ret void
++}
++declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
++!air.object = !{!0}
++!0 = !{ptr @obj_mixed, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 64, !"air.arg_type_name", !"Mixed"}
++!4 = !{i32 1, !"air.mesh_grid_properties"}
++"#;
++        let (omod, orefl) = translate_emulated(ll_obj, Stage::Object, [4, 1, 1]);
++        assert!(has_binding(&omod, 673) && has_binding(&omod, 674) && has_binding(&omod, 675));
++        assert_eq!(orefl.object.unwrap().payload_stride, Some(64));
++
++        let ll_mesh = r#"
++%struct.Mixed = type { i8, i16, half, i32, i64, <3 x float>, [8 x i8], [4 x half] }
++
++define void @mesh_mixed(ptr addrspace(6) %payload, ptr addrspace(1) %out_mesh) {
++entry:
++  %p0 = getelementptr inbounds %struct.Mixed, ptr addrspace(6) %payload, i32 0, i32 0
++  %b = load i8, ptr addrspace(6) %p0
++  %bi = zext i8 %b to i32
++  %bf = uitofp i32 %bi to float
++  %pos = insertelement <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, float %bf, i32 0
++  call void @air.set_mesh_primitive_count(ptr addrspace(1) %out_mesh, i32 1)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 0, <4 x float> %pos)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 0, i32 0)
++  ret void
++}
++declare void @air.set_mesh_primitive_count(ptr addrspace(1), i32)
++declare void @air.set_mesh_vertex_position(ptr addrspace(1), i32, <4 x float>)
++declare void @air.set_mesh_index(ptr addrspace(1), i32, i32)
++!air.mesh = !{!0}
++!0 = !{ptr @mesh_mixed, !1, !2, !6}
++!1 = !{!5}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 64, !"air.arg_type_name", !"Mixed"}
++!4 = !{i32 1, !"air.mesh", !"air.arg_type_name", !"mesh<V, void, 1, 1, topology::point>"}
++!5 = !{i32 0, !"air.position"}
++!6 = !{!"air.mesh_topology", !"point", !"air.max_vertices", i32 1, !"air.max_primitives", i32 1}
++"#;
++        let (mmod, mrefl) = translate_emulated(ll_mesh, Stage::Mesh, [4, 1, 1]);
++        assert!(has_capability(&mmod, Capability::DrawParameters));
++        assert!(has_binding(&mmod, 673) && has_binding(&mmod, 674));
++        assert_eq!(mrefl.mesh.unwrap().payload_stride, Some(64));
++    }
++
++    #[test]
++    fn emulated_mesh_array_first_payload_preserves_phi_seeded_by_local_invocation_index() {
++        let ll = r#"
++%struct.Payload16K = type { [4096 x i32] }
++
++define void @mesh_arr_first(ptr addrspace(7) %payload, ptr addrspace(1) %out_mesh, i32 %tid) {
++entry:
++  %is0 = icmp eq i32 %tid, 0
++  br i1 %is0, label %emit, label %done
++
++emit:
++  call void @air.set_mesh_primitive_count(ptr addrspace(1) %out_mesh, i32 1)
++  %p0 = getelementptr inbounds %struct.Payload16K, ptr addrspace(7) %payload, i32 0, i32 0, i32 0
++  %p31 = getelementptr inbounds %struct.Payload16K, ptr addrspace(7) %payload, i32 0, i32 0, i32 31
++  %plast = getelementptr inbounds %struct.Payload16K, ptr addrspace(7) %payload, i32 0, i32 0, i32 4095
++  %w0 = load i32, ptr addrspace(7) %p0, align 4
++  %w31 = load i32, ptr addrspace(7) %p31, align 4
++  %wl = load i32, ptr addrspace(7) %plast, align 4
++  %s0 = add i32 %w0, %w31
++  %s1 = add i32 %s0, %wl
++  %sf = sitofp i32 %s1 to float
++  %pos = insertelement <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, float %sf, i32 0
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 0, <4 x float> %pos)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 1, <4 x float> <float 1.0, float 0.0, float 0.0, float 1.0>)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 2, <4 x float> <float 0.0, float 1.0, float 0.0, float 1.0>)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 0, i32 0)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 1, i32 1)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 2, i32 2)
++  br label %done
++
++done:
++  ret void
++}
++declare void @air.set_mesh_primitive_count(ptr addrspace(1), i32)
++declare void @air.set_mesh_vertex_position(ptr addrspace(1), i32, <4 x float>)
++declare void @air.set_mesh_index(ptr addrspace(1), i32, i32)
++!air.mesh = !{!0}
++!0 = !{ptr @mesh_arr_first, !1, !2, !7}
++!1 = !{!6}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 16384, !"air.arg_type_name", !"Payload16K"}
++!4 = !{i32 1, !"air.mesh", !"air.arg_type_name", !"mesh<V, void, 3, 1, topology::triangle>"}
++!5 = !{i32 2, !"air.thread_index_in_threadgroup"}
++!6 = !{i32 0, !"air.position"}
++!7 = !{!"air.mesh_topology", !"triangle", !"air.max_vertices", i32 3, !"air.max_primitives", i32 1}
++"#;
++        let (module, refl) = translate_emulated(ll, Stage::Mesh, [32, 1, 1]);
++        assert!(refl.mesh.as_ref().is_some_and(|m| m.emulated_payload));
++        let lid_var = module
++            .annotations
++            .iter()
++            .find_map(|a| {
++                (a.class.opcode == Op::Decorate
++                    && a.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
++                    && a.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::LocalInvocationIndex)))
++                .then(|| match a.operands.first() {
++                    Some(Operand::IdRef(id)) => *id,
++                    _ => 0,
++                })
++            })
++            .expect("BuiltIn LocalInvocationIndex variable");
++        let entry = &module.functions[0];
++        let mut preds: std::collections::HashMap<u32, std::collections::HashSet<u32>> =
++            std::collections::HashMap::new();
++        let mut lid_loads: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
++        for blk in &entry.blocks {
++            let lbl = blk.label.as_ref().and_then(|l| l.result_id).unwrap();
++            for inst in &blk.instructions {
++                if inst.class.opcode == Op::Load
++                    && inst.operands.first() == Some(&Operand::IdRef(lid_var))
++                {
++                    if let Some(res) = inst.result_id {
++                        lid_loads.insert(res, lbl);
++                    }
++                }
++            }
++            if let Some(term) = blk.instructions.last() {
++                match term.class.opcode {
++                    Op::Branch => {
++                        if let Some(&Operand::IdRef(dst)) = term.operands.first() {
++                            preds.entry(dst).or_default().insert(lbl);
++                        }
++                    }
++                    Op::BranchConditional => {
++                        for idx in [1, 2] {
++                            if let Some(&Operand::IdRef(dst)) = term.operands.get(idx) {
++                                preds.entry(dst).or_default().insert(lbl);
++                            }
++                        }
++                    }
++                    Op::Switch => {
++                        if let Some(&Operand::IdRef(def)) = term.operands.get(1) {
++                            preds.entry(def).or_default().insert(lbl);
++                        }
++                        for pair in term.operands.iter().skip(2).collect::<Vec<_>>().chunks_exact(2)
++                        {
++                            if let Operand::IdRef(dst) = pair[1] {
++                                preds.entry(*dst).or_default().insert(lbl);
++                            }
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++        let mut saw_lid_seeded_phi = false;
++        for blk in &entry.blocks {
++            let lbl = blk.label.as_ref().and_then(|l| l.result_id).unwrap();
++            let blk_preds = preds.get(&lbl);
++            for inst in &blk.instructions {
++                if inst.class.opcode == Op::Phi {
++                    for pair in inst.operands.chunks_exact(2) {
++                        let (Operand::IdRef(val), Operand::IdRef(pred_lbl)) = (&pair[0], &pair[1])
++                        else {
++                            panic!("malformed OpPhi operands");
++                        };
++                        assert!(
++                            blk_preds.is_some_and(|p| p.contains(pred_lbl)),
++                            "OpPhi in block {lbl} references non-predecessor {pred_lbl}"
++                        );
++                        if lid_loads.get(val) == Some(pred_lbl) {
++                            saw_lid_seeded_phi = true;
++                        }
++                    }
++                }
++            }
++        }
++        assert!(
++            saw_lid_seeded_phi,
++            "array-first emulated Mesh payload loop must keep an OpPhi seeded by LocalInvocationIndex from its real preheader"
++        );
++    }
++
++    #[test]
++    fn emulated_object_and_mesh_binding_674_collision_and_payloadless_dynamic_sampler() {
++        let obj_payload_sampler = r#"
++%struct.Payload = type { [16 x i32] }
++%struct._texture_2d_t = type opaque
++%struct._sampler_t = type opaque
++
++define void @obj_samp_payload(ptr addrspace(6) %payload, ptr addrspace(1) %mgp, ptr addrspace(1) %tex, ptr addrspace(2) %samp) {
++entry:
++  %c = call <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %samp, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %x = extractelement <4 x float> %c, i32 0
++  %xi = fptosi float %x to i32
++  %p0 = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
++  store i32 %xi, ptr addrspace(6) %p0, align 4
++  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> <i32 1, i32 1, i32 1>)
++  ret void
++}
++declare <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
++!air.object = !{!0}
++!0 = !{ptr @obj_samp_payload, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 64, !"air.arg_type_name", !"Payload"}
++!4 = !{i32 1, !"air.mesh_grid_properties"}
++!5 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, access::sample>"}
++!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler"}
++"#;
++        let mut opts = TransformOptions::default()
++            .with_normalized_sampler_coordinates()
++            .with_emulated_mesh_payload();
++        opts.kernel_local_size = [4, 1, 1];
++        let err = crate::translate_sanitized_native_reflected_unvalidated(
++            obj_payload_sampler,
++            Stage::Object,
++            Path::new(""),
++            opts.clone(),
++            None,
++        )
++        .expect_err("emulated object with payload + dynamic sampler must refuse binding 674 collision");
++        assert!(err.contains("674"), "expected binding 674 collision error, got: {err}");
++
++        let mesh_payload_sampler = r#"
++%struct.Payload = type { [16 x i32] }
++%struct._texture_2d_t = type opaque
++%struct._sampler_t = type opaque
++
++define void @mesh_samp_payload(ptr addrspace(6) %payload, ptr addrspace(1) %out_mesh, ptr addrspace(1) %tex, ptr addrspace(2) %samp) {
++entry:
++  %c = call <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %samp, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %p0 = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
++  %w = load i32, ptr addrspace(6) %p0, align 4
++  %wf = sitofp i32 %w to float
++  %pos = insertelement <4 x float> %c, float %wf, i32 0
++  call void @air.set_mesh_primitive_count(ptr addrspace(1) %out_mesh, i32 1)
++  call void @air.set_mesh_vertex_position(ptr addrspace(1) %out_mesh, i32 0, <4 x float> %pos)
++  call void @air.set_mesh_index(ptr addrspace(1) %out_mesh, i32 0, i32 0)
++  ret void
++}
++declare <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare void @air.set_mesh_primitive_count(ptr addrspace(1), i32)
++declare void @air.set_mesh_vertex_position(ptr addrspace(1), i32, <4 x float>)
++declare void @air.set_mesh_index(ptr addrspace(1), i32, i32)
++!air.mesh = !{!0}
++!0 = !{ptr @mesh_samp_payload, !1, !2, !8}
++!1 = !{!7}
++!2 = !{!3, !4, !5, !6}
++!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 64, !"air.arg_type_name", !"Payload"}
++!4 = !{i32 1, !"air.mesh", !"air.arg_type_name", !"mesh<V, void, 1, 1, topology::point>"}
++!5 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, access::sample>"}
++!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler"}
++!7 = !{i32 0, !"air.position"}
++!8 = !{!"air.mesh_topology", !"point", !"air.max_vertices", i32 1, !"air.max_primitives", i32 1}
++"#;
++        let merr = crate::translate_sanitized_native_reflected_unvalidated(
++            mesh_payload_sampler,
++            Stage::Mesh,
++            Path::new(""),
++            opts.clone(),
++            None,
++        )
++        .expect_err("emulated mesh with payload + dynamic sampler must refuse binding 674 collision");
++        assert!(merr.contains("674"), "expected binding 674 collision error, got: {merr}");
++
++        // Payload-less emulated Object + dynamic sampler: 673=GridParams, 674=StageResourceMetadata, 675=Indirect.
++        let obj_nopayload_sampler = r#"
++%struct._texture_2d_t = type opaque
++%struct._sampler_t = type opaque
++
++define void @obj_samp_nopayload(ptr addrspace(1) %mgp, ptr addrspace(1) %tex, ptr addrspace(2) %samp) {
++entry:
++  %c = call <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %samp, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
++  %x = extractelement <4 x float> %c, i32 0
++  %gt = fcmp ogt float %x, 0.0
++  %cnt = select i1 %gt, i32 1, i32 0
++  %g = insertelement <3 x i32> <i32 1, i32 1, i32 1>, i32 %cnt, i32 0
++  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> %g)
++  ret void
++}
++declare <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
++declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
++!air.object = !{!0}
++!0 = !{ptr @obj_samp_nopayload, !1, !2}
++!1 = !{}
++!2 = !{!3, !4, !5}
++!3 = !{i32 0, !"air.mesh_grid_properties"}
++!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, access::sample>"}
++!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler"}
++"#;
++        let (bytes, refl) = crate::translate_sanitized_native_reflected_unvalidated(
++            obj_nopayload_sampler,
++            Stage::Object,
++            Path::new(""),
++            opts,
++            None,
++        )
++        .expect("payload-less emulated object with dynamic sampler must succeed");
++        let module = load_bytes(&bytes).expect("parse SPIR-V");
++        let b674_count = module
++            .annotations
++            .iter()
++            .filter(|a| {
++                a.class.opcode == Op::Decorate
++                    && a.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
++                    && a.operands.get(2) == Some(&Operand::LiteralBit32(674))
++            })
++            .count();
++        assert_eq!(b674_count, 1, "must have exactly one binding 674 variable");
++        let obj = refl.object.expect("object reflection");
++        assert!(obj.emulated_payload);
++        assert!(!obj.has_payload, "dynamic sampler at 674 must not set has_payload=true");
++        assert_eq!(obj.payload_stride, None);
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedGridParams
++                && b.descriptor.as_ref().is_some_and(|d| d.binding == 673)
++        }));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::StageResourceMetadata
++                && b.descriptor.as_ref().is_some_and(|d| d.binding == 674)
++        }));
++        assert!(!refl
++            .bindings
++            .iter()
++            .any(|b| b.kind == crate::reflect::ResourceKind::MeshEmulatedPayload));
++        assert!(refl.bindings.iter().any(|b| {
++            b.kind == crate::reflect::ResourceKind::MeshEmulatedIndirect
++                && b.descriptor.as_ref().is_some_and(|d| d.binding == 675)
++        }));
++    }
+ }
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index e924bcd..9e7e236 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -117,6 +117,14 @@ pub struct TransformOptions {
+     /// `SPV_KHR_ray_query` (`OpTypeAccelerationStructureKHR`, `OpTypeRayQueryKHR`,
+     /// `OpRayQuery*KHR`) instead of the legacy software StorageBuffer shadow.
+     pub hardware_ray_query: bool,
++    /// Lower Metal 3 Object+Mesh pipelines for GFX-ring emulation when the Vulkan device exposes
++    /// `meshShader=true && taskShader=false`:
++    /// - `Stage::Object` emits `GLCompute` reading grid params (set 0, binding 673), writing
++    ///   payload words to SSBO (set 0, binding 674), and writing `VkDrawMeshTasksIndirectCommandEXT`
++    ///   to SSBO (set 0, binding 675).
++    /// - `Stage::Mesh` with a payload emits `MeshEXT` with `DrawParameters` + `BuiltIn DrawIndex`
++    ///   reading its payload from set 0 bindings 673/674 instead of `TaskPayloadWorkgroupEXT`.
++    pub emulated_mesh_payload: bool,
+ }
+ 
+ impl Default for TransformOptions {
+@@ -134,6 +142,7 @@ impl Default for TransformOptions {
+             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
+             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+             hardware_ray_query: false,
++            emulated_mesh_payload: false,
+         }
+     }
+ }
+@@ -145,6 +154,12 @@ impl TransformOptions {
+         self
+     }
+ 
++    /// Enable GFX-ring emulated Object+Mesh payload mode (bindings 673/674/675).
++    pub fn with_emulated_mesh_payload(mut self) -> Self {
++        self.emulated_mesh_payload = true;
++        self
++    }
++
+     /// Select the ABI 8 normalized sampler-coordinate contract described on the field.
+     pub fn with_normalized_sampler_coordinates(mut self) -> Self {
+         self.normalized_sampler_coordinates = true;
+@@ -655,12 +670,16 @@ struct Ctx {
+     writes_frag_depth: bool,
+     /// Undecorated `{ u32, texel_ty }` struct types cached for `OpImageSparse*` instructions.
+     sparse_result_types: HashMap<Word, Word>,
+-    /// `TaskPayloadWorkgroupEXT` variable synthesized for `Stage::Object` / `Stage::Mesh`.
++    /// `TaskPayloadWorkgroupEXT` (or `Workgroup` when `emulated_mesh_payload`) variable for `Stage::Object` / `Stage::Mesh`.
+     pub(in crate::passes) task_payload_var: Option<Word>,
++    /// Declared/inferred byte size of `task_payload_var`, when present.
++    pub(in crate::passes) task_payload_byte_size: Option<u32>,
+     /// Workgroup `[3 x uint]` variable holding `set_threadgroups_per_grid` in `Stage::Object`.
+     pub(in crate::passes) task_mesh_grid_var: Option<Word>,
+     /// Whether hardware `SPV_KHR_ray_query` lowering is enabled.
+     pub(in crate::passes) hardware_ray_query: bool,
++    /// Whether GFX-ring emulated Object+Mesh payload mode (bindings 673/674/675) is enabled.
++    pub(in crate::passes) emulated_mesh_payload: bool,
+ }
+ 
+ impl Ctx {
+@@ -762,8 +781,10 @@ impl Ctx {
+             writes_frag_depth: false,
+             sparse_result_types: HashMap::new(),
+             task_payload_var: None,
++            task_payload_byte_size: None,
+             task_mesh_grid_var: None,
+             hardware_ray_query: options.hardware_ray_query,
++            emulated_mesh_payload: options.emulated_mesh_payload,
+         }
+     }
+ 
+@@ -3639,6 +3660,10 @@ pub(crate) fn transform_with_options_and_sidecar(
+         workgroup::unroll_small_workgroup_atomic_loops(&mut ctx, entry_idx);
+         workgroup::zero_initialize_workgroup_memory(&mut ctx, entry_idx);
+     }
++    if ctx.emulated_mesh_payload && matches!(stage, Stage::Object | Stage::Mesh) {
++        mesh_stage::finalize_emulated_object_mesh_stage(&mut ctx, entry_idx, &stage)?;
++        ctx.module.types_global_values.append(&mut ctx.new_globals);
++    }
+     // 2f) Drop blocks made unreachable by typed pruning and specialization. spirv-val tolerates
+     //     them; SPIRV-Cross (MoltenVK) throws on them at pipeline creation. See `prune.rs`.
+     prune_unreachable_blocks(&mut ctx.module);
+diff --git a/src/passes/module_cleanup.rs b/src/passes/module_cleanup.rs
+index e757e0b..7a0b9d4 100644
+--- a/src/passes/module_cleanup.rs
++++ b/src/passes/module_cleanup.rs
+@@ -628,6 +628,14 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
+             }
+         }
+     }
++    let has_draw_index = ctx.module.annotations.iter().any(|instruction| {
++        instruction.class.opcode == Op::Decorate
++            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
++            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::DrawIndex))
++    });
++    if has_draw_index {
++        want.push(Capability::DrawParameters);
++    }
+     let has_demote = ctx
+         .module
+         .functions
+diff --git a/src/passes/resources/bindings.rs b/src/passes/resources/bindings.rs
+index 1ffd4ec..2deef17 100644
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -338,6 +338,25 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
+         let coordinate_flags = set == layout.set
+             && binding == crate::reflect::SAMPLER_COORDINATE_FLAGS_BINDING
+             && class == DescriptorClass::StorageBuffer;
++        // Emulated GFX-ring Object (`GLCompute`) and Mesh (`MeshEXT`) stages use set-0
++        // StorageBuffer bindings 673 (grid params), 674 (payload), and 675 (indirect dims).
++        let is_compute_or_mesh_stage = module.entry_points.iter().any(|ep| {
++            matches!(
++                ep.operands.first(),
++                Some(Operand::ExecutionModel(
++                    spirv::ExecutionModel::GLCompute | spirv::ExecutionModel::MeshEXT
++                ))
++            )
++        });
++        let emulated_mesh_binding = is_compute_or_mesh_stage
++            && set == layout.set
++            && matches!(
++                binding,
++                crate::reflect::MESH_EMULATED_GRID_PARAMS_BINDING
++                    | crate::reflect::MESH_EMULATED_PAYLOAD_BINDING
++                    | crate::reflect::MESH_EMULATED_INDIRECT_BINDING
++            )
++            && class == DescriptorClass::StorageBuffer;
+         let null_array = coordinate_metadata
+             && runtime
+             && matches!(
+@@ -347,7 +366,12 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
+                     | (2, 1, DescriptorClass::UniformTexelBuffer)
+                     | (3, 1, DescriptorClass::StorageTexelBuffer)
+             );
+-        if !graph_binding && !null_array && !coordinate_flags && (set != layout.set || !allowed) {
++        if !graph_binding
++            && !null_array
++            && !coordinate_flags
++            && !emulated_mesh_binding
++            && (set != layout.set || !allowed)
++        {
+             return Err(format!(
+                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
+                 label(id)
+diff --git a/src/passes/resources/collapse.rs b/src/passes/resources/collapse.rs
+index 0d44300..d09e54c 100644
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -1008,13 +1008,15 @@ pub(in crate::passes) fn apply_bindings(
+         for var in &task_payload_vars {
+             rewrite_workgroup_root_access(ctx, entry_idx, *var, defs);
+         }
+-        rewrite_pointer_storage(
+-            ctx,
+-            entry_idx,
+-            &task_payload_vars,
+-            StorageClass::TaskPayloadWorkgroupEXT,
+-            defs,
+-        )?;
++        let payload_sc = if ctx.emulated_mesh_payload {
++            StorageClass::Workgroup
++        } else {
++            StorageClass::TaskPayloadWorkgroupEXT
++        };
++        rewrite_pointer_storage(ctx, entry_idx, &task_payload_vars, payload_sc, defs)?;
++        if ctx.emulated_mesh_payload {
++            rewrite_flattened_workgroup_leaf_accesses(ctx, entry_idx, &task_payload_vars, defs);
++        }
+     }
+     rewrite_structural_result_types(ctx, entry_idx, defs);
+     rewrite_ulong_uint2_memory_reinterprets(ctx, entry_idx, defs);
+diff --git a/src/passes/stage_input/mod.rs b/src/passes/stage_input/mod.rs
+index 4dd111b..b81fc4f 100644
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -1211,15 +1211,23 @@ pub(super) fn build_stage_input(
+                 };
+                 ctx.ty_array(element_ty, elements)
+             };
+-            let ptr_ty = ctx.ty_ptr(StorageClass::TaskPayloadWorkgroupEXT, array_ty);
++            let payload_sc = if ctx.emulated_mesh_payload {
++                StorageClass::Workgroup
++            } else {
++                StorageClass::TaskPayloadWorkgroupEXT
++            };
++            let (arr_bytes, _) = layout_ty_size_align(ctx, array_ty, &merged_defs);
++            let payload_bytes = declared_byte_size.unwrap_or(arr_bytes).max(arr_bytes);
++            let ptr_ty = ctx.ty_ptr(payload_sc, array_ty);
+             let var = ctx.module.fresh_id();
+             ctx.new_globals.push(Instruction::new(
+                 Op::Variable,
+                 Some(ptr_ty),
+                 Some(var),
+-                vec![Operand::StorageClass(StorageClass::TaskPayloadWorkgroupEXT)],
++                vec![Operand::StorageClass(payload_sc)],
+             ));
+             ctx.task_payload_var = Some(var);
++            ctx.task_payload_byte_size = Some(payload_bytes);
+             ctx.interface_buffer_var(var);
+             bindings.push((*pid, ParamBinding::TaskPayload { var }));
+         } else if role_is("mesh_grid_properties") || role_is("mesh_output") {
+@@ -1684,7 +1692,10 @@ pub(super) fn build_stage_input(
+                     vec![Operand::StorageClass(StorageClass::Input)],
+                 ));
+                 decorate_location(&mut ctx.module, var, loc);
+-                if frag_interp.no_perspective {
++                let air_ty_no_persp = frag
++                    .and_then(|m| m.varying_types.get(&loc))
++                    .is_some_and(|t| t.contains("no_perspective"));
++                if frag_interp.no_perspective || air_ty_no_persp {
+                     decorate_with(&mut ctx.module, var, Decoration::NoPerspective);
+                 }
+                 ctx.interface.push(var);
+@@ -2762,6 +2773,8 @@ fn pull_model_interface_type(
+             .strip_prefix("interpolant<")
+             .and_then(|s| s.split(',').next())
+             .unwrap_or(raw)
++            .trim()
++            .trim_end_matches('>')
+             .trim();
+         let ty = match inner {
+             "float" | "half" => Some(ctx.ty_float()),
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+index 0ed5ff8..ec09641 100644
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -477,6 +477,18 @@ pub const COMPARISON_SAMPLER_BINDING_RANGE: DescriptorBindingRange = DescriptorB
+ };
+ /// Stage-local read-only SSBO carrying one runtime coordinate-flag word per sampler-band entry.
+ pub const SAMPLER_COORDINATE_FLAGS_BINDING: u32 = 674;
++/// GFX-ring emulated Object+Mesh set-0 read-only SSBO: `{ obj_grid_x, obj_grid_y, obj_grid_z, payload_stride_bytes }`.
++pub const MESH_EMULATED_GRID_PARAMS_BINDING: u32 = 673;
++/// GFX-ring emulated Object+Mesh set-0 SSBO holding `N * (payload_stride_bytes / 4)` payload words.
++pub const MESH_EMULATED_PAYLOAD_BINDING: u32 = 674;
++/// GFX-ring emulated Object set-0 write-only SSBO holding `N` `VkDrawMeshTasksIndirectCommandEXT` (3x u32) entries.
++pub const MESH_EMULATED_INDIRECT_BINDING: u32 = 675;
++
++/// Align an emulated Object+Mesh payload size up to a 16-byte stride (minimum 16 bytes).
++pub const fn align_up_emulated_payload_stride(byte_size: u32) -> u32 {
++    let min_bytes = if byte_size < 16 { 16 } else { byte_size };
++    (min_bytes + 15) & !15
++}
+ /// Number of sampler argument-table entries exposed by the Metal ABI. The remainder of
+ /// [`SAMPLER_BINDING_RANGE`] is reserved for synthesized static samplers.
+ pub const SAMPLER_ARGUMENT_COUNT: u32 = 16;
+@@ -854,6 +866,12 @@ pub enum ResourceKind {
+     /// the sampler-less `texture.read(coord)`, and it is reported only when something consumes that
+     /// value -- otherwise it is retracted during translation. A consumer must bind a sampler here.
+     SynthesizedReadSampler,
++    /// Emulated GFX-ring Object+Mesh read-only grid/stride parameters SSBO (set 0, binding 673).
++    MeshEmulatedGridParams,
++    /// Emulated GFX-ring Object+Mesh payload SSBO (set 0, binding 674).
++    MeshEmulatedPayload,
++    /// Emulated GFX-ring Object indirect draw command SSBO (set 0, binding 675).
++    MeshEmulatedIndirect,
+ }
+ 
+ /// The descriptor location the interface pass decorates a resource with. Absent for resources that
+@@ -1643,7 +1661,12 @@ pub struct Varying {
+     pub per_primitive: bool,
+ }
+ 
+-/// Object (`TaskEXT`) stage reflection metadata.
++#[cfg(feature = "serde")]
++fn is_false(v: &bool) -> bool {
++    !*v
++}
++
++/// Object (`TaskEXT`, or `GLCompute` when `emulated_payload` is enabled) stage reflection metadata.
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct ObjectReflection {
+@@ -1667,6 +1690,15 @@ pub struct ObjectReflection {
+         serde(default, skip_serializing_if = "Option::is_none")
+     )]
+     pub max_total_threadgroups_per_mesh_grid: Option<u32>,
++    /// True when compiled for GFX-ring emulated Object+Mesh (`GLCompute`, set-0 SSBO bindings 673/674/675).
++    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
++    pub emulated_payload: bool,
++    /// 16-byte-aligned per-object-group payload stride in bytes when `emulated_payload && has_payload`.
++    #[cfg_attr(
++        feature = "serde",
++        serde(default, skip_serializing_if = "Option::is_none")
++    )]
++    pub payload_stride: Option<u32>,
+ }
+ 
+ /// One vertex or primitive output location emitted by a mesh shader (`MeshEXT`).
+@@ -1727,6 +1759,15 @@ pub struct MeshReflection {
+     pub vertex_outputs: Vec<MeshOutputLocation>,
+     /// Per-primitive (`PerPrimitiveEXT`) output locations (match fragment per-primitive inputs).
+     pub primitive_outputs: Vec<MeshOutputLocation>,
++    /// True when compiled for GFX-ring emulated payload mode (`DrawParameters`/`DrawIndex` + bindings 673/674).
++    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
++    pub emulated_payload: bool,
++    /// 16-byte-aligned per-object-group payload stride in bytes when `emulated_payload && has_payload`.
++    #[cfg_attr(
++        feature = "serde",
++        serde(default, skip_serializing_if = "Option::is_none")
++    )]
++    pub payload_stride: Option<u32>,
+ }
+ 
+ /// Kind of a Metal 3 ray-tracing acceleration structure.
+@@ -2444,9 +2485,12 @@ impl ShaderReflection {
+         let has_table = bindings
+             .iter()
+             .any(|(id, binding)| *binding == 672 && sets.get(id) == Some(&0));
+-        let has_metadata = bindings
+-            .iter()
+-            .any(|(id, binding)| *binding == 674 && sets.get(id) == Some(&0));
++        let emulated_mesh = self.is_emulated_mesh_stage();
++        let emulated_payload_ssbo = self.has_emulated_payload_ssbo();
++        let has_metadata = !emulated_payload_ssbo
++            && bindings
++                .iter()
++                .any(|(id, binding)| *binding == 674 && sets.get(id) == Some(&0));
+         if !has_table && !has_metadata && null_shapes.is_empty() {
+             return Ok(());
+         }
+@@ -2459,10 +2503,11 @@ impl ShaderReflection {
+         categories.dedup();
+         let comparison_sampler =
+             categories.contains(&2) && module_has_comparison_sampler_operation(module);
+-        let image_query_binding = bindings
+-            .iter()
+-            .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0))
+-            .then_some(673);
++        let image_query_binding = (!emulated_mesh
++            && bindings
++                .iter()
++                .any(|(id, binding)| *binding == 673 && sets.get(id) == Some(&0)))
++        .then_some(673);
+         if categories.is_empty()
+             && image_query_binding.is_none()
+             && null_shapes.is_empty()
+@@ -2500,10 +2545,29 @@ impl ShaderReflection {
+     ///
+     /// The pass that creates binding 674 knows why the buffer exists; reflection derives the exact
+     /// descriptor from the module so a cached or linked result cannot carry a stale metadata claim.
++    pub(crate) fn is_emulated_mesh_stage(&self) -> bool {
++        self.object.as_ref().is_some_and(|o| o.emulated_payload)
++            || self.mesh.as_ref().is_some_and(|m| m.emulated_payload)
++    }
++
++    pub(crate) fn has_emulated_payload_ssbo(&self) -> bool {
++        self.object
++            .as_ref()
++            .is_some_and(|o| o.emulated_payload && o.has_payload)
++            || self
++                .mesh
++                .as_ref()
++                .is_some_and(|m| m.emulated_payload && m.has_payload)
++    }
++
+     pub(crate) fn reconcile_sampler_coordinate_flags(&mut self, module: &Module) {
+         use crate::spirv_module::Operand;
+         use std::collections::HashMap;
+ 
++        if self.has_emulated_payload_ssbo() {
++            return;
++        }
++
+         let mut sets = HashMap::new();
+         let mut bindings = HashMap::new();
+         for instruction in &module.annotations {
+@@ -2697,7 +2761,10 @@ impl ShaderReflection {
+                 | ResourceKind::StageResourceMetadata
+                 | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+-                | ResourceKind::SynthesizedReadSampler => {
++                | ResourceKind::SynthesizedReadSampler
++                | ResourceKind::MeshEmulatedGridParams
++                | ResourceKind::MeshEmulatedPayload
++                | ResourceKind::MeshEmulatedIndirect => {
+                     return Err(format!(
+                         "cannot reconfigure reflection after synthesized {:?} resources were added",
+                         resource.kind
+@@ -2816,7 +2883,11 @@ impl ShaderReflection {
+                 || (table.comparison_sampler && !table.categories.contains(&2))
+                 || self.bindings.iter().any(|binding| {
+                     binding.descriptor.is_some_and(|location| {
+-                        location.binding == 672 || location.binding == 673 || location.set >= 2
++                        location.binding == 672
++                            || (location.binding == 673
++                                && (binding.kind != ResourceKind::MeshEmulatedGridParams
++                                    || table.image_query_binding.is_some()))
++                            || location.set >= 2
+                     })
+                 })
+             {
+@@ -2935,7 +3006,10 @@ impl ShaderReflection {
+                 | ResourceKind::PrimitiveAccelerationStructure
+                 | ResourceKind::BufferAddressTable
+                 | ResourceKind::StageResourceMetadata
+-                | ResourceKind::SamplerCoordinateFlags => DescriptorClass::StorageBuffer,
++                | ResourceKind::SamplerCoordinateFlags
++                | ResourceKind::MeshEmulatedGridParams
++                | ResourceKind::MeshEmulatedPayload
++                | ResourceKind::MeshEmulatedIndirect => DescriptorClass::StorageBuffer,
+                 ResourceKind::AccelerationStructure => DescriptorClass::AccelerationStructure,
+                 ResourceKind::Texture
+                 | ResourceKind::TextureArray
+@@ -3001,7 +3075,10 @@ impl ShaderReflection {
+                 | ResourceKind::StageResourceMetadata
+                 | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::SynthesizedNullTexture
+-                | ResourceKind::SynthesizedReadSampler => None,
++                | ResourceKind::SynthesizedReadSampler
++                | ResourceKind::MeshEmulatedGridParams
++                | ResourceKind::MeshEmulatedPayload
++                | ResourceKind::MeshEmulatedIndirect => None,
+                 ResourceKind::ThreadgroupBuffer
+                 | ResourceKind::PrimitiveAccelerationStructure
+                 | ResourceKind::VisibleFunctionTable
+@@ -3102,6 +3179,33 @@ impl ShaderReflection {
+                 record(location, owner, class)?;
+                 continue;
+             }
++            if matches!(
++                resource.kind,
++                ResourceKind::MeshEmulatedGridParams
++                    | ResourceKind::MeshEmulatedPayload
++                    | ResourceKind::MeshEmulatedIndirect
++            ) {
++                let expected_binding = match resource.kind {
++                    ResourceKind::MeshEmulatedGridParams => MESH_EMULATED_GRID_PARAMS_BINDING,
++                    ResourceKind::MeshEmulatedPayload => MESH_EMULATED_PAYLOAD_BINDING,
++                    ResourceKind::MeshEmulatedIndirect => MESH_EMULATED_INDIRECT_BINDING,
++                    _ => unreachable!(),
++                };
++                let location = resource
++                    .descriptor
++                    .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
++                if location.set != self.descriptor_layout.set
++                    || location.binding != expected_binding
++                    || location.count != 1
++                {
++                    return Err(format!(
++                        "{owner} must be one descriptor at set {} binding {expected_binding}",
++                        self.descriptor_layout.set
++                    ));
++                }
++                record(location, owner, class)?;
++                continue;
++            }
+             let expected = expected
+                 .flatten()
+                 .ok_or_else(|| format!("{owner} exceeds its descriptor ABI band"))?;
+@@ -3391,15 +3495,126 @@ impl ShaderReflection {
+                 _ => {}
+             }
+         }
++        let mut desc_sets = std::collections::HashMap::new();
++        let mut desc_bindings = std::collections::HashMap::new();
++        for inst in &module.annotations {
++            if inst.class.opcode == spirv::Op::Decorate {
++                match inst.operands.as_slice() {
++                    [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::DescriptorSet), Operand::LiteralBit32(set)] =>
++                    {
++                        desc_sets.insert(*id, *set);
++                    }
++                    [Operand::IdRef(id), Operand::Decoration(spirv::Decoration::Binding), Operand::LiteralBit32(binding)] =>
++                    {
++                        desc_bindings.insert(*id, *binding);
++                    }
++                    _ => {}
++                }
++            }
++        }
++        let stage_set = self.descriptor_layout.set;
++        let has_emulated_binding = |b: u32| {
++            desc_bindings
++                .iter()
++                .any(|(id, binding)| *binding == b && desc_sets.get(id) == Some(&stage_set))
++        };
++        let has_grid_params_ssbo = self.is_emulated_mesh_stage()
++            && has_emulated_binding(MESH_EMULATED_GRID_PARAMS_BINDING);
++        let has_payload_ssbo = self.has_emulated_payload_ssbo()
++            && has_emulated_binding(MESH_EMULATED_PAYLOAD_BINDING);
++        let has_indirect_ssbo =
++            self.is_emulated_mesh_stage() && has_emulated_binding(MESH_EMULATED_INDIRECT_BINDING);
++        self.bindings.retain(|resource| {
++            !matches!(
++                resource.kind,
++                ResourceKind::MeshEmulatedGridParams
++                    | ResourceKind::MeshEmulatedPayload
++                    | ResourceKind::MeshEmulatedIndirect
++            )
++        });
++        let push_emulated_binding = |bindings: &mut Vec<ResourceBinding>,
++                                     kind: ResourceKind,
++                                     binding: u32,
++                                     access: ResourceAccess,
++                                     fixed_bytes: Option<u32>| {
++            bindings.push(ResourceBinding {
++                kind,
++                metal_index: 0,
++                descriptor: Some(DescriptorLocation {
++                    set: stage_set,
++                    binding,
++                    count: 1,
++                }),
++                comparison_descriptor: None,
++                param_index: None,
++                stage_input_location: None,
++                address_space: None,
++                declared_size: fixed_bytes,
++                extent: fixed_bytes.map(|bytes| BufferExtent::Object { bytes }),
++                footprint: None,
++                type_layout: None,
++                type_name: None,
++                texture_shape: None,
++                embedded_source: None,
++                access: Some(access),
++                static_sampler: None,
++            });
++        };
++        if has_grid_params_ssbo {
++            push_emulated_binding(
++                &mut self.bindings,
++                ResourceKind::MeshEmulatedGridParams,
++                MESH_EMULATED_GRID_PARAMS_BINDING,
++                ResourceAccess::ReadOnly,
++                Some(16),
++            );
++        }
++        if has_payload_ssbo {
++            let access = if self.object.is_some() {
++                ResourceAccess::ReadWrite
++            } else {
++                ResourceAccess::ReadOnly
++            };
++            push_emulated_binding(
++                &mut self.bindings,
++                ResourceKind::MeshEmulatedPayload,
++                MESH_EMULATED_PAYLOAD_BINDING,
++                access,
++                None,
++            );
++        }
++        if has_indirect_ssbo {
++            push_emulated_binding(
++                &mut self.bindings,
++                ResourceKind::MeshEmulatedIndirect,
++                MESH_EMULATED_INDIRECT_BINDING,
++                ResourceAccess::WriteOnly,
++                None,
++            );
++        }
++
+         if let Some(obj) = self.object.as_mut() {
+-            if has_payload_var {
++            if has_payload_var || has_payload_ssbo {
+                 obj.has_payload = true;
+             }
++            if obj.emulated_payload {
++                obj.payload_stride = obj
++                    .has_payload
++                    .then(|| align_up_emulated_payload_stride(obj.payload_size.unwrap_or(0)));
++            }
+         }
+         if let Some(mesh) = self.mesh.as_mut() {
+-            if has_payload_var {
++            if has_payload_var || has_payload_ssbo {
+                 mesh.has_payload = true;
+             }
++            if mesh.emulated_payload && !has_payload_ssbo {
++                mesh.emulated_payload = false;
++                mesh.payload_stride = None;
++            } else if mesh.emulated_payload {
++                mesh.payload_stride = Some(align_up_emulated_payload_stride(
++                    mesh.payload_size.unwrap_or(0),
++                ));
++            }
+             mesh.writes_position |= writes_position;
+             mesh.writes_cull_primitive |= writes_cull_primitive;
+             mesh.writes_layer |= writes_layer;
+@@ -4502,6 +4717,8 @@ impl ShaderReflection {
+                 object_grid_dims: om.and_then(|m| m.object_grid_dims),
+                 max_total_threadgroups_per_mesh_grid: om
+                     .and_then(|m| m.max_total_threadgroups_per_mesh_grid),
++                emulated_payload: false,
++                payload_stride: None,
+             }
+         });
+         let mut varyings = Vec::new();
+@@ -4573,6 +4790,8 @@ impl ShaderReflection {
+                 writes_viewport_index,
+                 vertex_outputs,
+                 primitive_outputs,
++                emulated_payload: false,
++                payload_stride: None,
+             }
+         });
+         let acceleration_structures = collect_embedded_acceleration_structures(

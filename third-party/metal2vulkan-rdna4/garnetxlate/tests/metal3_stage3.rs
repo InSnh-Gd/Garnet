@@ -9,10 +9,13 @@
 
 use garnetxlate::{
     garnetx_abi_version, garnetx_detect_stage, garnetx_free, garnetx_translate,
-    garnetx_translate_stage3, RDNA4xDep, RDNA4xDynamicLibrary, RDNA4xIntersectionFunction,
-    GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT, GARNETX_STAGE_FRAGMENT,
-    GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT, GARNETX_STAGE_VERTEX,
-    RC_BAD_ARGS, RC_OK, RC_REFUSED,
+    garnetx_translate_linked_libraries, garnetx_translate_stage3,
+    garnetx_translate_with_capabilities, RDNA4xBackendCapabilities, RDNA4xDep,
+    RDNA4xDynamicLibrary, RDNA4xIntersectionFunction, GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+    GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
+    GARNETX_MESH_GRID_PARAMS_BINDING, GARNETX_MESH_INDIRECT_BINDING, GARNETX_MESH_PAYLOAD_BINDING,
+    GARNETX_STAGE_FRAGMENT, GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT,
+    GARNETX_STAGE_VERTEX, RC_BAD_ARGS, RC_OK, RC_REFUSED,
 };
 use serde_json::Value;
 use std::os::raw::c_char;
@@ -743,4 +746,406 @@ entry:
     );
     assert_eq!(conflict.rc, RC_REFUSED);
     assert!(conflict.msg.contains("conflicts"), "{}", conflict.msg);
+}
+
+fn call_stage3_with_caps(
+    ll: &str,
+    local: Option<[u32; 3]>,
+    vis_fns: &[(&str, &str)],
+    caps: Option<RDNA4xBackendCapabilities>,
+) -> Out {
+    let c_vis: Vec<RDNA4xDep> = vis_fns
+        .iter()
+        .map(|(s, t)| RDNA4xDep {
+            symbol: s.as_ptr(),
+            symbol_len: s.len(),
+            ll: t.as_ptr(),
+            ll_len: t.len(),
+        })
+        .collect();
+    let mut spv: *mut u8 = std::ptr::null_mut();
+    let mut spv_len = 0usize;
+    let mut meta: *mut u8 = std::ptr::null_mut();
+    let mut meta_len = 0usize;
+    let mut err = [0 as c_char; 512];
+    let local_ptr = local.as_ref().map_or(std::ptr::null(), |l| l.as_ptr());
+    let caps_ptr = caps.as_ref().map_or(std::ptr::null(), |c| c as *const _);
+    let rc = unsafe {
+        garnetx_translate_stage3(
+            ll.as_ptr(),
+            ll.len(),
+            local_ptr,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            c_vis.as_ptr(),
+            c_vis.len(),
+            std::ptr::null(),
+            0,
+            caps_ptr,
+            &mut spv,
+            &mut spv_len,
+            &mut meta,
+            &mut meta_len,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let (mut s, mut m) = (Vec::new(), Vec::new());
+    if rc == RC_OK {
+        unsafe {
+            s = std::slice::from_raw_parts(spv, spv_len).to_vec();
+            m = std::slice::from_raw_parts(meta, meta_len).to_vec();
+            garnetx_free(spv, spv_len);
+            garnetx_free(meta, meta_len);
+        }
+    } else {
+        assert!(spv.is_null() && meta.is_null() && spv_len == 0 && meta_len == 0);
+    }
+    Out {
+        rc,
+        msg,
+        spv: s,
+        meta: m,
+    }
+}
+
+#[test]
+fn apple_air_pull_model_perspective_and_no_perspective_ffi() {
+    let ll = r#"
+define <4 x float> @fs_apple_pull(<2 x float> %np_uv, <2 x float> %p_uv, <2 x half> %np_h) {
+entry:
+  %c = call <2 x float> @air.interpolate_center_no_perspective.v2f32(<2 x float> %np_uv)
+  %ce = call <2 x float> @air.interpolate_centroid_no_perspective.v2f32(<2 x float> %np_uv)
+  %sa = call <2 x float> @air.interpolate_sample_perspective.v2f32(<2 x float> %p_uv, i32 0)
+  %of = call <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half> %np_h, <2 x float> <float 0.75, float 0.25>)
+  %of32 = fpext <2 x half> %of to <2 x float>
+  %s0 = fadd <2 x float> %c, %ce
+  %s1 = fadd <2 x float> %sa, %of32
+  %x = extractelement <2 x float> %s0, i32 0
+  %y = extractelement <2 x float> %s0, i32 1
+  %z = extractelement <2 x float> %s1, i32 0
+  %w = extractelement <2 x float> %s1, i32 1
+  %r0 = insertelement <4 x float> poison, float %x, i32 0
+  %r1 = insertelement <4 x float> %r0, float %y, i32 1
+  %r2 = insertelement <4 x float> %r1, float %z, i32 2
+  %r3 = insertelement <4 x float> %r2, float %w, i32 3
+  ret <4 x float> %r3
+}
+declare <2 x float> @air.interpolate_center_no_perspective.v2f32(<2 x float>)
+declare <2 x float> @air.interpolate_centroid_no_perspective.v2f32(<2 x float>)
+declare <2 x float> @air.interpolate_sample_perspective.v2f32(<2 x float>, i32)
+declare <2 x half> @air.interpolate_offset_no_perspective.v2f16(<2 x half>, <2 x float>)
+
+!air.fragment = !{!0}
+!0 = !{ptr @fs_apple_pull, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.location_index", i32 0, i32 1, !"air.pull_mode", !"air.arg_type_name", !"interpolant<float2, interpolation::no_perspective>"}
+!5 = !{i32 1, !"air.fragment_input", !"air.location_index", i32 1, i32 1, !"air.pull_mode", !"air.arg_type_name", !"interpolant<float2, interpolation::perspective>"}
+!6 = !{i32 2, !"air.fragment_input", !"air.location_index", i32 2, i32 1, !"air.pull_mode", !"air.arg_type_name", !"interpolant<half2, interpolation::no_perspective>"}
+"#;
+    let out = call_plain(ll, None);
+    assert_eq!(out.rc, RC_OK, "apple pull-model FFI failed: {}", out.msg);
+    let asm = spv_asm(&out.spv);
+    assert!(asm.contains("OpCapability InterpolationFunction"), "{asm}");
+    assert!(asm.contains("NoPerspective"), "{asm}");
+    assert!(asm.contains("InterpolateAtCentroid"), "{asm}");
+    assert!(asm.contains("InterpolateAtSample"), "{asm}");
+    assert!(asm.contains("InterpolateAtOffset"), "{asm}");
+    assert!(asm.contains("OpFConvert"), "{asm}");
+}
+
+#[test]
+fn fragment_vft_constant_vector_literal_regression_ffi() {
+    let red_ll = r#"
+define <4 x float> @color_red(<4 x float> %base) {
+entry:
+  %r = insertelement <4 x float> %base, float 1.000000e+00, i32 0
+  ret <4 x float> %r
+}
+"#;
+    let green_ll = r#"
+define <4 x float> @color_green(<4 x float> %base) {
+entry:
+  %r = insertelement <4 x float> %base, float 1.000000e+00, i32 1
+  ret <4 x float> %r
+}
+"#;
+    let vft_fs_ll = r#"
+define <4 x float> @vft_fs(ptr addrspace(1) %table, ptr addrspace(2) %slot_buf) {
+entry:
+  %slot = load i32, ptr addrspace(2) %slot_buf, align 4
+  %fp = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 %slot)
+  %col = tail call <4 x float> %fp(<4 x float> <float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>)
+  ret <4 x float> %col
+}
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @vft_fs, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.visible_function_table", !"air.location_index", i32 0, i32 1, !"air.read"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"uint"}
+"#;
+    let vis = [("color_red", red_ll), ("color_green", green_ll)];
+    // Stage 3 path
+    let out3 = call_stage3_with_caps(vft_fs_ll, None, &vis, None);
+    assert_eq!(out3.rc, RC_OK, "vft_fs stage3 failed: {}", out3.msg);
+    let asm3 = spv_asm(&out3.spv);
+    assert!(asm3.contains("OpSwitch"), "{asm3}");
+    let meta3: Value = serde_json::from_slice(&out3.meta).unwrap();
+    let handles = meta3["visible_function_tables"]["handles"]
+        .as_array()
+        .expect("vft handles");
+    assert_eq!(handles.len(), 2);
+    assert_eq!(handles[0]["symbol"], "color_green");
+    assert_eq!(handles[1]["symbol"], "color_red");
+
+    // Stage 2 path (`garnetx_translate_linked_libraries`)
+    let c_vis: Vec<RDNA4xDep> = vis
+        .iter()
+        .map(|(s, t)| RDNA4xDep {
+            symbol: s.as_ptr(),
+            symbol_len: s.len(),
+            ll: t.as_ptr(),
+            ll_len: t.len(),
+        })
+        .collect();
+    let mut spv: *mut u8 = std::ptr::null_mut();
+    let mut spv_len = 0usize;
+    let mut meta: *mut u8 = std::ptr::null_mut();
+    let mut meta_len = 0usize;
+    let mut err = [0 as c_char; 512];
+    let rc2 = unsafe {
+        garnetx_translate_linked_libraries(
+            vft_fs_ll.as_ptr(),
+            vft_fs_ll.len(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            c_vis.as_ptr(),
+            c_vis.len(),
+            std::ptr::null(),
+            &mut spv,
+            &mut spv_len,
+            &mut meta,
+            &mut meta_len,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    assert_eq!(rc2, RC_OK);
+    unsafe {
+        garnetx_free(spv, spv_len);
+        garnetx_free(meta, meta_len);
+    }
+}
+
+#[test]
+fn emulated_object_and_mesh_payload_ffi() {
+    assert_eq!(garnetx_abi_version(), 3);
+    assert_eq!(GARNETX_CAP_MESH_EMULATED_PAYLOAD, 1 << 8);
+    assert_eq!(GARNETX_MESH_GRID_PARAMS_BINDING, 673);
+    assert_eq!(GARNETX_MESH_PAYLOAD_BINDING, 674);
+    assert_eq!(GARNETX_MESH_INDIRECT_BINDING, 675);
+
+    let emul_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // 1. Emulated Object via garnetx_translate_stage3
+    let obj = call_stage3_with_caps(OBJECT_16K_LL, Some([32, 1, 1]), &[], Some(emul_caps));
+    assert_eq!(obj.rc, RC_OK, "emulated object failed: {}", obj.msg);
+    let obj_asm = spv_asm(&obj.spv);
+    assert!(obj_asm.contains("OpEntryPoint GLCompute"), "{obj_asm}");
+    assert!(!obj_asm.contains("MeshShadingEXT"), "{obj_asm}");
+    assert!(!obj_asm.contains("OpEmitMeshTasksEXT"), "{obj_asm}");
+    assert!(!obj_asm.contains("TaskPayloadWorkgroupEXT"), "{obj_asm}");
+    assert!(obj_asm.contains("Binding 673"), "{obj_asm}");
+    assert!(obj_asm.contains("Binding 674"), "{obj_asm}");
+    assert!(obj_asm.contains("Binding 675"), "{obj_asm}");
+    let obj_meta: Value = serde_json::from_slice(&obj.meta).unwrap();
+    assert_eq!(obj_meta["stage"], "Object");
+    assert_eq!(obj_meta["object"]["emulated_payload"], true);
+    assert_eq!(obj_meta["object"]["payload_stride"], 16384);
+    let obj_bindings = obj_meta["bindings"].as_array().unwrap();
+    assert!(obj_bindings
+        .iter()
+        .any(|b| b["kind"] == "MeshEmulatedGridParams" && b["descriptor"]["binding"] == 673));
+    assert!(obj_bindings
+        .iter()
+        .any(|b| b["kind"] == "MeshEmulatedPayload" && b["descriptor"]["binding"] == 674));
+    assert!(obj_bindings
+        .iter()
+        .any(|b| b["kind"] == "MeshEmulatedIndirect" && b["descriptor"]["binding"] == 675));
+
+    // 2. Emulated Mesh with payload via garnetx_translate_with_capabilities
+    let mut spv: *mut u8 = std::ptr::null_mut();
+    let mut spv_len = 0usize;
+    let mut meta: *mut u8 = std::ptr::null_mut();
+    let mut meta_len = 0usize;
+    let mut err = [0 as c_char; 512];
+    let local = [32u32, 1, 1];
+    let rc = unsafe {
+        garnetx_translate_with_capabilities(
+            MESH_TRI_PAYLOAD_LL.as_ptr(),
+            MESH_TRI_PAYLOAD_LL.len(),
+            local.as_ptr(),
+            &mut spv,
+            &mut spv_len,
+            &mut meta,
+            &mut meta_len,
+            err.as_mut_ptr(),
+            err.len(),
+            &emul_caps,
+        )
+    };
+    assert_eq!(rc, RC_OK, "emulated mesh failed: {}", unsafe {
+        std::ffi::CStr::from_ptr(err.as_ptr()).to_string_lossy()
+    });
+    let mesh_spv = unsafe { std::slice::from_raw_parts(spv, spv_len).to_vec() };
+    let mesh_meta_bytes = unsafe { std::slice::from_raw_parts(meta, meta_len).to_vec() };
+    unsafe {
+        garnetx_free(spv, spv_len);
+        garnetx_free(meta, meta_len);
+    }
+    let mesh_asm = spv_asm(&mesh_spv);
+    assert!(mesh_asm.contains("OpEntryPoint MeshEXT"), "{mesh_asm}");
+    assert!(mesh_asm.contains("OpCapability DrawParameters"), "{mesh_asm}");
+    assert!(mesh_asm.contains("BuiltIn DrawIndex"), "{mesh_asm}");
+    assert!(
+        mesh_asm.contains("OpPhi") && mesh_asm.contains("BuiltIn LocalInvocationIndex"),
+        "array-first emulated Mesh payload must preserve LocalInvocationIndex-seeded OpPhi:\n{mesh_asm}"
+    );
+    assert!(!mesh_asm.contains("TaskPayloadWorkgroupEXT"), "{mesh_asm}");
+    assert!(mesh_asm.contains("Binding 673"), "{mesh_asm}");
+    assert!(mesh_asm.contains("Binding 674"), "{mesh_asm}");
+    assert!(!mesh_asm.contains("Binding 675"), "{mesh_asm}");
+    let mesh_meta: Value = serde_json::from_slice(&mesh_meta_bytes).unwrap();
+    assert_eq!(mesh_meta["stage"], "Mesh");
+    assert_eq!(mesh_meta["mesh"]["emulated_payload"], true);
+    assert_eq!(mesh_meta["mesh"]["payload_stride"], 16384);
+    let mesh_bindings = mesh_meta["bindings"].as_array().unwrap();
+    assert!(mesh_bindings
+        .iter()
+        .any(|b| b["kind"] == "MeshEmulatedGridParams" && b["descriptor"]["binding"] == 673));
+    assert!(mesh_bindings
+        .iter()
+        .any(|b| b["kind"] == "MeshEmulatedPayload" && b["descriptor"]["binding"] == 674));
+
+    // 3. Mesh-only (no payload) with GARNETX_CAP_MESH_EMULATED_PAYLOAD stays pure hardware MeshEXT.
+    let mesh_only = call_stage3_with_caps(MESH_POINT_LL, Some([4, 1, 1]), &[], Some(emul_caps));
+    assert_eq!(mesh_only.rc, RC_OK, "mesh-only failed: {}", mesh_only.msg);
+    let mo_asm = spv_asm(&mesh_only.spv);
+    assert!(mo_asm.contains("OpEntryPoint MeshEXT"), "{mo_asm}");
+    assert!(!mo_asm.contains("DrawParameters"), "{mo_asm}");
+    assert!(!mo_asm.contains("Binding 673"), "{mo_asm}");
+    assert!(!mo_asm.contains("Binding 674"), "{mo_asm}");
+    let mo_meta: Value = serde_json::from_slice(&mesh_only.meta).unwrap();
+    assert!(mo_meta["mesh"].get("emulated_payload").is_none());
+    assert!(mo_meta["mesh"].get("payload_stride").is_none());
+
+    // 4. Native mode (flags = 0) stays 100% unchanged TaskEXT + TaskPayloadWorkgroupEXT.
+    let native_caps = RDNA4xBackendCapabilities {
+        flags: 0,
+        ..emul_caps
+    };
+    let nat_obj = call_stage3_with_caps(OBJECT_16K_LL, Some([32, 1, 1]), &[], Some(native_caps));
+    assert_eq!(nat_obj.rc, RC_OK, "native object failed: {}", nat_obj.msg);
+    let nat_asm = spv_asm(&nat_obj.spv);
+    assert!(nat_asm.contains("OpEntryPoint TaskEXT"), "{nat_asm}");
+    assert!(nat_asm.contains("TaskPayloadWorkgroupEXT"), "{nat_asm}");
+    assert!(nat_asm.contains("OpEmitMeshTasksEXT"), "{nat_asm}");
+    let nat_meta: Value = serde_json::from_slice(&nat_obj.meta).unwrap();
+    assert!(nat_meta["object"].get("emulated_payload").is_none());
+    assert!(nat_meta["object"].get("payload_stride").is_none());
+
+    // 5. Unknown capability flag bit still rejected with RC_BAD_ARGS.
+    let bad_caps = RDNA4xBackendCapabilities {
+        flags: 1 << 9,
+        ..emul_caps
+    };
+    let bad = call_stage3_with_caps(OBJECT_16K_LL, Some([32, 1, 1]), &[], Some(bad_caps));
+    assert_eq!(bad.rc, RC_BAD_ARGS);
+
+    // 6. Binding 674 collision (emulated payload + dynamic sampler) must return RC_REFUSED,
+    //    while payload-less emulated Object + dynamic sampler succeeds with StageResourceMetadata.
+    let obj_payload_sampler = r#"
+%struct.Payload = type { [16 x i32] }
+%struct._texture_2d_t = type opaque
+%struct._sampler_t = type opaque
+define void @obj_sp(ptr addrspace(6) %payload, ptr addrspace(1) %mgp, ptr addrspace(1) %tex, ptr addrspace(2) %samp) {
+entry:
+  %c = call <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %samp, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %x = extractelement <4 x float> %c, i32 0
+  %xi = fptosi float %x to i32
+  %p0 = getelementptr inbounds %struct.Payload, ptr addrspace(6) %payload, i32 0, i32 0, i32 0
+  store i32 %xi, ptr addrspace(6) %p0, align 4
+  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> <i32 1, i32 1, i32 1>)
+  ret void
+}
+declare <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
+!air.object = !{!0}
+!0 = !{ptr @obj_sp, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.payload", !"air.arg_type_size", i32 64, !"air.arg_type_name", !"Payload"}
+!4 = !{i32 1, !"air.mesh_grid_properties"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, access::sample>"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler"}
+"#;
+    let collide = call_stage3_with_caps(obj_payload_sampler, Some([4, 1, 1]), &[], Some(emul_caps));
+    assert_eq!(collide.rc, RC_REFUSED, "expected RC_REFUSED on binding 674 collision");
+    assert!(collide.msg.contains("674"), "{}", collide.msg);
+
+    let obj_nopayload_sampler = r#"
+%struct._texture_2d_t = type opaque
+%struct._sampler_t = type opaque
+define void @obj_s_nopay(ptr addrspace(1) %mgp, ptr addrspace(1) %tex, ptr addrspace(2) %samp) {
+entry:
+  %c = call <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %samp, <2 x float> <float 0.5, float 0.5>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %x = extractelement <4 x float> %c, i32 0
+  %gt = fcmp ogt float %x, 0.0
+  %cnt = select i1 %gt, i32 1, i32 0
+  %g = insertelement <3 x i32> <i32 1, i32 1, i32 1>, i32 %cnt, i32 0
+  call void @air.set_mesh_properties(ptr addrspace(1) %mgp, <3 x i32> %g)
+  ret void
+}
+declare <4 x float> @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.set_mesh_properties(ptr addrspace(1), <3 x i32>)
+!air.object = !{!0}
+!0 = !{ptr @obj_s_nopay, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.mesh_grid_properties"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, access::sample>"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler"}
+"#;
+    let nopay = call_stage3_with_caps(obj_nopayload_sampler, Some([4, 1, 1]), &[], Some(emul_caps));
+    assert_eq!(nopay.rc, RC_OK, "payload-less emulated object + sampler failed: {}", nopay.msg);
+    let nopay_meta: Value = serde_json::from_slice(&nopay.meta).unwrap();
+    assert_eq!(nopay_meta["object"]["emulated_payload"], true);
+    assert_eq!(nopay_meta["object"]["has_payload"], false);
+    assert!(nopay_meta["object"].get("payload_stride").is_none());
+    let nb = nopay_meta["bindings"].as_array().unwrap();
+    assert!(nb.iter().any(|b| b["kind"] == "MeshEmulatedGridParams" && b["descriptor"]["binding"] == 673));
+    assert!(nb.iter().any(|b| b["kind"] == "StageResourceMetadata" && b["descriptor"]["binding"] == 674));
+    assert!(!nb.iter().any(|b| b["kind"] == "MeshEmulatedPayload"));
+    assert!(nb.iter().any(|b| b["kind"] == "MeshEmulatedIndirect" && b["descriptor"]["binding"] == 675));
 }

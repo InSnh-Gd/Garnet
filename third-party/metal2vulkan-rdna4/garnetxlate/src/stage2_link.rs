@@ -444,6 +444,9 @@ pub fn translate_bytes_stage3(
         .with_normalized_sampler_coordinates()
         .with_query_lod_replay(replay)
         .with_hardware_ray_query();
+    if caps.is_some_and(RDNA4xBackendCapabilities::emulated_mesh_payload) {
+        options = options.with_emulated_mesh_payload();
+    }
 
     let tmp = Path::new("");
     let (spv, reflection, buffer_address_mode, uniform_control_proof) =

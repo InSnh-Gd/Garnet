@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0077).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0078).
 
 Verification and Tier 2 Scope
 =============================
@@ -18,6 +18,42 @@ translation, metadata invariants, and software Vulkan 1.4.363 execution only;
 they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
+
+0078-metal3-live-air-fixes-and-gfx-object-mesh.patch fixes two live macOS
+26.7.2 Apple AIR translator bugs and adds GFX-ring emulated Object+Mesh payload
+mode (for RADV `meshShader=1 && taskShader=0`):
+1. Pull-model interpolation (`air_intrinsics.rs`,
+   `passes/air_calls/integer_simd.rs`, `passes/stage_input/mod.rs`): recognizes
+   all Apple AIR naming variants (`air.interpolate_{center,centroid,sample,offset}_{no_perspective,perspective}.*`,
+   `air.interpolate_{center,centroid,sample,offset}.*`, and
+   `air.interpolate_at_{center,centroid,sample,offset}*`) across scalar/v2/v3/v4
+   `f32`/`f16`, ensures `NoPerspective` decoration on `_no_perspective` inputs,
+   and preserves Metal `[0,1)` -> Vulkan `[-0.5,+0.5)` offset shift.
+2. Runtime VFT indirect-call parsing (`native/{parse,mod}.rs`,
+   `linked_functions.rs`): replaces naive `split_whitespace().last()`/`rfind()`
+   argument/return type splitting with top-level LLVM type parsing so constant
+   vector/aggregate literals (e.g. `<4 x float> <float 0.0, ...>`) and
+   attributed/fast-math indirect calls emit valid `@metal2vulkan.vft.dispatch.*`
+   signatures.
+3. GFX-ring emulated Object+Mesh payload mode (`passes/{mod,finalize,
+   mesh_stage,module_cleanup,stage_input/mod,resources/{bindings,collapse}}.rs`,
+   `reflect/mod.rs`, `lib.rs`, `garnetxlate/{garnetxlate.h,src/*}`): opt-in via
+   `TransformOptions::with_emulated_mesh_payload()` and C ABI flag
+   `GARNETX_CAP_MESH_EMULATED_PAYLOAD` (`1u << 8`, keeping `GARNETX_ABI_VERSION
+   == 3u`). Reserves set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings
+   `GARNETX_MESH_GRID_PARAMS_BINDING` (`673`, `{obj_grid_x, obj_grid_y,
+   obj_grid_z, payload_stride_bytes}`), `GARNETX_MESH_PAYLOAD_BINDING` (`674`,
+   `uint32_t[]` payload words at `group_id * (payload_stride_bytes / 4)`), and
+   `GARNETX_MESH_INDIRECT_BINDING` (`675`, `VkDrawMeshTasksIndirectCommandEXT`
+   triples). Lowers `Stage::Object` to `GLCompute` (no `MeshShadingEXT`), copies
+   `object_data` payload to binding `674` and indirect dims to binding `675`;
+   lowers `Stage::Mesh` with payload to `MeshEXT` + `OpCapability
+   DrawParameters` (`BuiltIn DrawIndex`) reading bindings `673`/`674` (leaving
+   mesh-only stages without payload as pure hardware `MeshEXT`, and leaving
+   native `TaskEXT`/`TaskPayloadWorkgroupEXT` unchanged when bit 8 is unset).
+   Reflection JSON exposes `"emulated_payload": true`, 16-byte-aligned
+   `"payload_stride"`, and distinct `"MeshEmulatedGridParams"`,
+   `"MeshEmulatedPayload"`, and `"MeshEmulatedIndirect"` binding kinds.
 
 0077-metal3-ray-query-and-intersection-tables.patch adds hardware
 `SPV_KHR_ray_query` lowering (`OpCapability RayQueryKHR`, `OpExtension

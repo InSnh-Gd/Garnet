@@ -2,13 +2,26 @@
 
 use super::*;
 
+/// Capability flag enabling GFX-ring emulated Object+Mesh payload mode (`GARNETX_CAP_MESH_EMULATED_PAYLOAD`).
+pub const GARNETX_CAP_MESH_EMULATED_PAYLOAD: u32 = 1 << 8;
+
+/// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages.
+pub const GARNETX_MESH_GRID_PARAMS_BINDING: u32 =
+    metal2vulkan::reflect::MESH_EMULATED_GRID_PARAMS_BINDING;
+pub const GARNETX_MESH_PAYLOAD_BINDING: u32 = metal2vulkan::reflect::MESH_EMULATED_PAYLOAD_BINDING;
+pub const GARNETX_MESH_INDIRECT_BINDING: u32 =
+    metal2vulkan::reflect::MESH_EMULATED_INDIRECT_BINDING;
+
+const KNOWN_CAPABILITY_FLAGS: u32 = 3 | GARNETX_CAP_MESH_EMULATED_PAYLOAD;
+
 /// Caller-proven language/device support and actual Vulkan subgroup properties (ABI 3).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RDNA4xBackendCapabilities {
     pub struct_size: u32,
     pub version: u32,
-    /// Bit 0: actual platform compiler exposes the extension; bit 1: actual device support.
+    /// Bit 0: actual platform compiler exposes query LOD; bit 1: actual device support;
+    /// bit 8: `GARNETX_CAP_MESH_EMULATED_PAYLOAD` (GFX-ring emulated Object+Mesh mode).
     pub flags: u32,
     pub subgroup_size: u32,
     pub subgroup_supported_stages: u32,
@@ -17,10 +30,17 @@ pub struct RDNA4xBackendCapabilities {
 
 impl RDNA4xBackendCapabilities {
     pub(crate) fn validate(self) -> Result<Self, String> {
-        if self.struct_size != 24 || self.version != 1 || self.flags & !3 != 0 {
+        if self.struct_size != 24
+            || self.version != 1
+            || self.flags & !KNOWN_CAPABILITY_FLAGS != 0
+        {
             return Err("invalid ABI 3 backend capabilities".into());
         }
         Ok(self)
+    }
+
+    pub(crate) fn emulated_mesh_payload(self) -> bool {
+        self.flags & GARNETX_CAP_MESH_EMULATED_PAYLOAD != 0
     }
 
     pub(crate) fn replay(self) -> QueryLodReplay {
@@ -56,7 +76,7 @@ pub(crate) fn gate_query_lod(
         // SPIR-V core opcode 105 is OpImageQueryLod.
         if words[cursor] & 0xffff == 105 {
             has_query = true;
-            if capabilities.flags != 3 {
+            if (capabilities.flags & 3) != 3 {
                 return Err(
                     "query texture LOD extension requires actual language and device support"
                         .into(),
@@ -395,12 +415,13 @@ fn translate_bytes_with_capabilities(
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
-    let (spv, meta) = translate_text_with_options(
+    let (spv, meta) = translate_text_with_mesh_options(
         text,
         local,
         dependencies.as_deref(),
         true,
         capabilities.replay(),
+        capabilities.emulated_mesh_payload(),
     )?;
     let has_query = gate_query_lod(&spv, capabilities)?;
     let mut metadata: Value = serde_json::from_slice(&meta).map_err(|error| error.to_string())?;

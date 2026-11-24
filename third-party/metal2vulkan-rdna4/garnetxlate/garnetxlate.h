@@ -41,6 +41,27 @@ typedef struct RDNA4xBackendCapabilities {
     uint32_t subgroup_supported_operations;
 } RDNA4xBackendCapabilities;
 
+/* RDNA4xBackendCapabilities::flags bits:
+ *   bit 0 (1u << 0): platform compiler exposes query texture LOD extension
+ *   bit 1 (1u << 1): Vulkan device supports query texture LOD extension
+ *   bit 8 (1u << 8): GFX-ring emulated Object+Mesh payload mode
+ *                    (Stage::Object -> GLCompute writing payload + indirect SSBOs;
+ *                     Stage::Mesh with payload -> MeshEXT reading payload SSBO via DrawIndex)
+ */
+#define GARNETX_CAP_MESH_EMULATED_PAYLOAD (1u << 8)
+
+/* Set 0 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER bindings reserved for
+ * GARNETX_CAP_MESH_EMULATED_PAYLOAD stages:
+ *   673 (ReadOnly):  { uint32_t obj_grid_x, obj_grid_y, obj_grid_z, payload_stride_bytes; }
+ *   674 (ReadWrite on Object / ReadOnly on Mesh): uint32_t[] payload words at
+ *                    group_id * (payload_stride_bytes / 4)
+ *   675 (WriteOnly on Object): uint32_t[] VkDrawMeshTasksIndirectCommandEXT triples
+ *                    { groupCountX, groupCountY, groupCountZ } at group_id * 3 + 0..2
+ */
+#define GARNETX_MESH_GRID_PARAMS_BINDING 673u
+#define GARNETX_MESH_PAYLOAD_BINDING     674u
+#define GARNETX_MESH_INDIRECT_BINDING    675u
+
 typedef struct GarnetxIcbVertexAttr {
     uint32_t location;
     uint32_t buffer_index;

@@ -325,7 +325,30 @@ pub(crate) fn lower_gpu_arguments_with_table_version_and_replay(
     {
         metadata["argument_resource_tables"]["image_query_binding"] = serde_json::json!(binding);
     }
-    if has_image_query_table(&spv) {
+    let is_emulated_mesh_stage = metadata
+        .get("object")
+        .and_then(|o| o.get("emulated_payload"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || metadata
+            .get("mesh")
+            .and_then(|m| m.get("emulated_payload"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    let has_emulated_payload_ssbo = metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+        .is_some_and(|bs| {
+            bs.iter()
+                .any(|b| b.get("kind").and_then(Value::as_str) == Some("MeshEmulatedPayload"))
+        });
+    if has_emulated_payload_ssbo && has_metadata {
+        return Err(
+            "GPU argument resource metadata (binding 674) collides with emulated Object/Mesh payload binding 674"
+                .into(),
+        );
+    }
+    if !is_emulated_mesh_stage && has_image_query_table(&spv) {
         metadata["argument_resource_tables"]["image_query_binding"] = serde_json::json!(673);
     }
     if table_version >= 9 {

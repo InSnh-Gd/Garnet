@@ -35,6 +35,10 @@ pub use query_lod::{
     garnetx_translate_with_capabilities,
     lower_gpu_arguments_with_capabilities,
     RDNA4xBackendCapabilities,
+    GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+    GARNETX_MESH_GRID_PARAMS_BINDING,
+    GARNETX_MESH_INDIRECT_BINDING,
+    GARNETX_MESH_PAYLOAD_BINDING,
 };
 
 mod air_spirv;
@@ -44,7 +48,7 @@ pub use air_spirv::{
     translate_text_gpu_arguments_abi8_with_query_lod_replay, translate_text_linked, trim_meta,
     trim_meta_with_buffer_address_mode,
 };
-pub(crate) use air_spirv::translate_text_with_options;
+pub(crate) use air_spirv::translate_text_with_mesh_options;
 
 mod device_caps;
 pub use device_caps::lower_gpu_arguments;

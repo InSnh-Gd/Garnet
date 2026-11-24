@@ -187,6 +187,24 @@ pub(crate) fn translate_text_with_options(
     normalized_sampler_coordinates: bool,
     query_lod_replay: QueryLodReplay,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    translate_text_with_mesh_options(
+        ll_text,
+        local,
+        deps,
+        normalized_sampler_coordinates,
+        query_lod_replay,
+        false,
+    )
+}
+
+pub(crate) fn translate_text_with_mesh_options(
+    ll_text: &str,
+    local: [u32; 3],
+    deps: Option<&[(&str, &str)]>,
+    normalized_sampler_coordinates: bool,
+    query_lod_replay: QueryLodReplay,
+    emulated_mesh_payload: bool,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (san_entry, datalayout) = sanitize_ll_text_with_datalayout(ll_text);
     let stage = detect_stage_text(&san_entry)?;
     let san_ll = match deps {
@@ -218,6 +236,9 @@ pub(crate) fn translate_text_with_options(
     options = options
         .with_query_lod_replay(query_lod_replay)
         .with_hardware_ray_query();
+    if emulated_mesh_payload {
+        options = options.with_emulated_mesh_payload();
+    }
     // Never used on the Skip path (it reaches only the scratch-file helpers, which never run).
     let tmp = Path::new("");
     let (spv, reflection, buffer_address_mode, uniform_control_proof) =
