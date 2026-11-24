@@ -27,6 +27,8 @@ struct GarnetCLI {
                 return try cmdPreflight(rest)
             case "validate-oc":
                 return try cmdValidateOC(rest)
+            case "configure-oc":
+                return try cmdConfigureOC(rest)
             case "install":
                 return try cmdInstall(rest)
             case "uninstall":
@@ -194,6 +196,33 @@ struct GarnetCLI {
             }
         }
         return report.valid ? 0 : 5
+    }
+
+    private static func cmdConfigureOC(_ args: [String]) throws -> Int32 {
+        let parsed = try parse(args, valueFlags: ["--config", "--mode", "--payload"], boolFlags: ["--json"])
+        guard let targetPath = parsed.options["--config"] ?? parsed.positional.first else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "configure-oc requires --config <EFI-or-config.plist>"])
+        }
+        let modeStr = parsed.options["--mode"] ?? "16g"
+        guard let mode = OpenCoreMode(rawValue: modeStr) else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected 16g or small)"])
+        }
+        let payloadURL: URL? = (mode == .mode16g) ? try resolvePayloadURL(explicit: parsed.options["--payload"]) : nil
+        let result = try OpenCoreValidator.configure(
+            targetURL: URL(fileURLWithPath: targetPath),
+            mode: mode,
+            payloadURL: payloadURL
+        )
+        if parsed.flags.contains("--json") {
+            try emitJSON(result)
+        } else {
+            print("Configured OpenCore: \(result.configPath) (mode=\(result.mode.rawValue), valid=\(result.report.valid))")
+            print("  Backup: \(result.backupPath)")
+            if let kextPath = result.kextInstalledPath {
+                print("  Kext: \(kextPath)")
+            }
+        }
+        return result.report.valid ? 0 : 5
     }
 
     private static func cmdInstall(_ args: [String]) throws -> Int32 {
@@ -402,6 +431,7 @@ struct GarnetCLI {
         Usage: garnetctl <command> [options]
           preflight [--payload <dir>] [--sysroot <dir>] [--json]
           validate-oc --config <config.plist> [--mode 16g|small] [--json]
+          configure-oc --config <EFI-or-config.plist> [--mode 16g|small] [--payload <dir>] [--json]
           install [--payload <dir>] [--with-vulkan] [--dry-run] [--json]
           uninstall [--remove-denylist] [--dry-run] [--json]
           status [--json]
