@@ -611,7 +611,7 @@ static void test_source_pins(const char *dir) {
     CHECK("source pins: read rdna4_sparse_impl.inc and test-metal3-sparse-prt.m",
           impl != NULL && live != NULL, "dir=%s", dir);
     if (impl) {
-        CHECK("pin: RDNA4ResourceStateEncoder implements all 5 sparse/fence selectors & vkQueueBindSparse semaphore handoff",
+        CHECK("pin: RDNA4ResourceStateEncoder implements all 5 sparse/fence selectors & vkQueueBindSparse fence wait",
               strstr(impl, "updateTextureMappings:") != NULL &&
               strstr(impl, "updateTextureMapping:") != NULL &&
               strstr(impl, "indirectBufferOffset:") != NULL &&
@@ -623,13 +623,12 @@ static void test_source_pins(const char *dir) {
               strstr(impl, "__builtin_add_overflow") != NULL &&
               strstr(impl, "propCount == 0u") != NULL &&
               strstr(impl, "aspectMask & fi->aspect_mask") != NULL &&
-              strstr(impl, "pSignalSemaphores") != NULL &&
-              strstr(impl, "pWaitSemaphores") != NULL &&
+              strstr(impl, "rdna4fw_wait_bounded") != NULL &&
               strstr(impl, "RDNA4SparseTexture : RDNA4Texture") != NULL &&
               strstr(impl, "RDNA4SparseHeap") != NULL &&
               strstr(impl, "RDNA4Heap (RDNA4SparseBacking)") != NULL &&
               strstr(impl, "Wave 3 integration notes") != NULL,
-              "encoder + sparse texture/heap + semaphore handoff + safety guards present");
+              "encoder + sparse texture/heap + fence wait + safety guards present");
         CHECK("pin: rdna4_sparse_impl.inc never enables MTLGPUFamilyApple6",
               strstr(impl, "RDNA4G_FAMILY_APPLE6") == NULL &&
               strstr(impl, "- (BOOL)supportsFamily:") == NULL &&

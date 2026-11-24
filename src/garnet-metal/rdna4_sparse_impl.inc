@@ -165,13 +165,11 @@ _Static_assert((unsigned)MTLPixelFormatA8Unorm == RDNA4SP_PF_A8Unorm &&
                (unsigned)MTLPixelFormatStencil8 == RDNA4SP_PF_Stencil8,
                "MTLPixelFormat sparse table values");
 
-// Lazy Vulkan sparse & semaphore entry point resolution (mirrors rdna4_counters_impl.inc).
+// Lazy Vulkan sparse entry point resolution (mirrors rdna4_counters_impl.inc).
 typedef struct {
     PFN_vkQueueBindSparse queueBindSparse;
     PFN_vkGetImageSparseMemoryRequirements getImageSparseMemReqs;
     PFN_vkGetPhysicalDeviceSparseImageFormatProperties getPhysSparseImageFormatProps;
-    PFN_vkCreateSemaphore createSemaphore;
-    PFN_vkDestroySemaphore destroySemaphore;
 } rdna4_sparse_vk_fn_t;
 
 static const rdna4_sparse_vk_fn_t *rdna4_sparse_vk_fns(void) {
@@ -182,18 +180,12 @@ static const rdna4_sparse_vk_fn_t *rdna4_sparse_vk_fns(void) {
         if (vkGetDeviceProcAddr) {
             fns.queueBindSparse = (PFN_vkQueueBindSparse)vkGetDeviceProcAddr(RDNA4R.dev, "vkQueueBindSparse");
             fns.getImageSparseMemReqs = (PFN_vkGetImageSparseMemoryRequirements)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetImageSparseMemoryRequirements");
-            fns.createSemaphore = (PFN_vkCreateSemaphore)vkGetDeviceProcAddr(RDNA4R.dev, "vkCreateSemaphore");
-            fns.destroySemaphore = (PFN_vkDestroySemaphore)vkGetDeviceProcAddr(RDNA4R.dev, "vkDestroySemaphore");
         }
         if (rdna4_gipa && RDNA4R.inst) {
             if (!fns.queueBindSparse)
                 fns.queueBindSparse = (PFN_vkQueueBindSparse)rdna4_gipa(RDNA4R.inst, "vkQueueBindSparse");
             if (!fns.getImageSparseMemReqs)
                 fns.getImageSparseMemReqs = (PFN_vkGetImageSparseMemoryRequirements)rdna4_gipa(RDNA4R.inst, "vkGetImageSparseMemoryRequirements");
-            if (!fns.createSemaphore)
-                fns.createSemaphore = (PFN_vkCreateSemaphore)rdna4_gipa(RDNA4R.inst, "vkCreateSemaphore");
-            if (!fns.destroySemaphore)
-                fns.destroySemaphore = (PFN_vkDestroySemaphore)rdna4_gipa(RDNA4R.inst, "vkDestroySemaphore");
             fns.getPhysSparseImageFormatProps = (PFN_vkGetPhysicalDeviceSparseImageFormatProperties)
                 rdna4_gipa(RDNA4R.inst, "vkGetPhysicalDeviceSparseImageFormatProperties");
         }
@@ -201,7 +193,7 @@ static const rdna4_sparse_vk_fn_t *rdna4_sparse_vk_fns(void) {
     return &fns;
 }
 
-// Execute vkQueueBindSparse synchronized onto RDNA4R.q via binary VkSemaphore -> vkQueueSubmit -> bounded VkFence.
+// Execute vkQueueBindSparse on RDNA4R.q with direct VkFence completion + bounded wait.
 // Never holds RDNA4R.qlock while waiting. Sets *unresolvedOut = YES on timeout/device-lost without destroying in-flight handles.
 static BOOL rdna4_sparse_submit_bind(const VkBindSparseInfo *baseInfo, NSError **err, BOOL *unresolvedOut) {
     if (unresolvedOut) *unresolvedOut = NO;
@@ -211,9 +203,8 @@ static BOOL rdna4_sparse_submit_bind(const VkBindSparseInfo *baseInfo, NSError *
         return NO;
     }
     const rdna4_sparse_vk_fn_t *vk = rdna4_sparse_vk_fns();
-    if (!vk || !vk->queueBindSparse || !vk->createSemaphore || !vk->destroySemaphore ||
-        !vkCreateFence || !vkDestroyFence || !vkWaitForFences || !vkQueueSubmit) {
-        if (err) *err = rdna4_err(140, @"Vulkan sparse bind or semaphore/fence entry points unavailable");
+    if (!vk || !vk->queueBindSparse || !vkCreateFence || !vkDestroyFence || !vkWaitForFences) {
+        if (err) *err = rdna4_err(140, @"Vulkan sparse bind or fence entry points unavailable");
         return NO;
     }
     if (atomic_load(&rdna4_submit_fault) != VK_SUCCESS) {
@@ -221,49 +212,28 @@ static BOOL rdna4_sparse_submit_bind(const VkBindSparseInfo *baseInfo, NSError *
         return NO;
     }
 
-    VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    VkSemaphore bindSem = VK_NULL_HANDLE;
-    VkResult vr = vk->createSemaphore(RDNA4R.dev, &sci, NULL, &bindSem);
-    if (vr != VK_SUCCESS || bindSem == VK_NULL_HANDLE) {
-        if (err) *err = rdna4_err(141, [NSString stringWithFormat:@"vkCreateSemaphore(sparse) = %d", vr]);
-        return NO;
-    }
-
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence fence = VK_NULL_HANDLE;
-    vr = vkCreateFence(RDNA4R.dev, &fci, NULL, &fence);
+    VkResult vr = vkCreateFence(RDNA4R.dev, &fci, NULL, &fence);
     if (vr != VK_SUCCESS || fence == VK_NULL_HANDLE) {
-        vk->destroySemaphore(RDNA4R.dev, bindSem, NULL);
         if (err) *err = rdna4_err(141, [NSString stringWithFormat:@"vkCreateFence(sparse) = %d", vr]);
         return NO;
     }
 
     VkBindSparseInfo bi = *baseInfo;
     bi.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO;
-    bi.signalSemaphoreCount = 1u;
-    bi.pSignalSemaphores = &bindSem;
+    bi.waitSemaphoreCount = 0u;
+    bi.pWaitSemaphores = NULL;
+    bi.signalSemaphoreCount = 0u;
+    bi.pSignalSemaphores = NULL;
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkSubmitInfo handoff = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1u,
-        .pWaitSemaphores = &bindSem,
-        .pWaitDstStageMask = &waitStage,
-    };
-
-    BOOL bindSubmitted = NO, handoffSubmitted = NO, deviceLost = NO;
+    BOOL bindSubmitted = NO, deviceLost = NO;
     rdna4_qlock();
     vr = (VkResult)atomic_load(&rdna4_submit_fault);
     if (vr == VK_SUCCESS) {
-        vr = vk->queueBindSparse(RDNA4R.q, 1u, &bi, VK_NULL_HANDLE);
+        vr = vk->queueBindSparse(RDNA4R.q, 1u, &bi, fence);
         if (vr == VK_SUCCESS) {
             bindSubmitted = YES;
-            vr = vkQueueSubmit(RDNA4R.q, 1u, &handoff, fence);
-            if (vr == VK_SUCCESS) {
-                handoffSubmitted = YES;
-            } else {
-                atomic_store(&rdna4_submit_fault, (int)vr);
-            }
         } else if (vr == VK_ERROR_DEVICE_LOST) {
             deviceLost = YES;
             atomic_store(&rdna4_submit_fault, (int)vr);
@@ -271,16 +241,13 @@ static BOOL rdna4_sparse_submit_bind(const VkBindSparseInfo *baseInfo, NSError *
     }
     pthread_mutex_unlock(&RDNA4R.qlock);
 
-    if (!handoffSubmitted) {
-        if (bindSubmitted || deviceLost) {
-            // Unresolved GPU state (bind submitted without fence handoff, or VK_ERROR_DEVICE_LOST):
-            // do not destroy synchronization handles or release backing memory while GPU state is unknown.
+    if (!bindSubmitted) {
+        if (deviceLost) {
+            // Unresolved GPU state on VK_ERROR_DEVICE_LOST: do not destroy fence or release backing memory.
             if (unresolvedOut) *unresolvedOut = YES;
-            if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"%s = %d",
-                                            bindSubmitted ? "sparse semaphore handoff vkQueueSubmit" : "vkQueueBindSparse", vr]);
+            if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"vkQueueBindSparse = %d", vr]);
         } else {
             vkDestroyFence(RDNA4R.dev, fence, NULL);
-            vk->destroySemaphore(RDNA4R.dev, bindSem, NULL);
             if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"vkQueueBindSparse = %d", vr]);
         }
         return NO;
@@ -299,7 +266,6 @@ static BOOL rdna4_sparse_submit_bind(const VkBindSparseInfo *baseInfo, NSError *
     }
 
     vkDestroyFence(RDNA4R.dev, fence, NULL);
-    vk->destroySemaphore(RDNA4R.dev, bindSem, NULL);
     return YES;
 }
 
@@ -685,7 +651,7 @@ static __attribute__((unused)) id rdna4_sparse_heap_new(id dev, MTLHeapDescripto
     if (!pool) return nil;
 
     const rdna4_sparse_vk_fn_t *vk = rdna4_sparse_vk_fns();
-    if (!vk || !vk->queueBindSparse || !vk->getImageSparseMemReqs || !vk->createSemaphore || !vk->destroySemaphore) {
+    if (!vk || !vk->queueBindSparse || !vk->getImageSparseMemReqs) {
         if (err) *err = rdna4_err(146, @"Vulkan sparse image entry points are unavailable");
         return nil;
     }

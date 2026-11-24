@@ -104,13 +104,21 @@ static void dispatchWrite(id<MTLCommandQueue> q, id<MTLComputePipelineState> pso
                           id<MTLTexture> tex, id<MTLFence> waitFence,
                           uint32_t x, uint32_t y, uint32_t mip,
                           float r, float g, float b, float a, NSString *tag) {
+    id<MTLTexture> target = tex;
+    if (mip > 0u) {
+        target = [tex newTextureViewWithPixelFormat:tex.pixelFormat
+                                        textureType:tex.textureType
+                                             levels:NSMakeRange(mip, 1)
+                                             slices:NSMakeRange(0, 1)];
+        require(target != nil, [NSString stringWithFormat:@"%@: mip %u view nil", tag, mip]);
+    }
     WriteArgs args = { x, y, mip, 0u, r, g, b, a };
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     require(enc != nil, [NSString stringWithFormat:@"%@: compute encoder nil", tag]);
     if (waitFence) [enc waitForFence:waitFence];
     [enc setComputePipelineState:pso];
-    [enc setTexture:tex atIndex:0];
+    [enc setTexture:target atIndex:0];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [enc endEncoding];
@@ -207,7 +215,10 @@ int main(int argc, char **argv) {
             require(tF32.width == 64 && tF32.height == 64, @"RGBA32Float 2D tile mismatch");
             require(tBC1.width == 512 && tBC1.height == 256, @"BC1_RGBA 2D tile mismatch");
             require(tBC7.width == 256 && tBC7.height == 256, @"BC7_RGBAUnorm 2D tile mismatch");
-            require(tMS4.width == 64 && tMS4.height == 64, @"RGBA8 4x MSAA tile mismatch");
+            require((tMS4.width == 0 && tMS4.height == 0 && tMS4.depth == 0) ||
+                    (tMS4.width == 64 && tMS4.height == 64 && tMS4.depth == 1),
+                    [NSString stringWithFormat:@"RGBA8 4x MSAA tile mismatch (%lux%lux%lu)",
+                     (unsigned long)tMS4.width, (unsigned long)tMS4.height, (unsigned long)tMS4.depth]);
             require(t3D.width == 32 && t3D.height == 32 && t3D.depth == 16, @"RGBA8 3D tile mismatch");
             require(tBad.width == 0 && tBad.height == 0 && tBad.depth == 0, @"1D sparse query must return {0,0,0}");
         }
@@ -275,7 +286,7 @@ int main(int argc, char **argv) {
              "struct ReadArgs { uint x, y, mip, outIndex; };\n"
              "kernel void sparse_write(texture2d<float, access::write> tex [[texture(0)]],\n"
              "                         constant WriteArgs &a [[buffer(0)]]) {\n"
-             "    tex.write(float4(a.r, a.g, a.b, a.a), uint2(a.x, a.y), a.mip);\n"
+             "    tex.write(float4(a.r, a.g, a.b, a.a), uint2(a.x, a.y));\n"
              "}\n"
              "kernel void sparse_probe(texture2d<float, access::sample> tex [[texture(0)]],\n"
              "                         device ProbeOut *out [[buffer(0)]],\n"
