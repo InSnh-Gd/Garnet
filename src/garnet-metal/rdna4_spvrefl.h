@@ -118,6 +118,7 @@ static int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, s
       case 32: { RDNA4sId *t = ID(a[0]); t->op = op; t->sc = a[1]; t->elem = a[2]; break; }
       case 43: /* OpConstant type id value */ { RDNA4sId *t = ID(a[1]); t->op = op; t->cval = a[2]; break; }
       case 59: /* OpVariable type id sc */ { RDNA4sId *t = ID(a[1]); t->op = op; t->elem = a[0]; t->sc = a[2]; break; }
+      case 5341: /* OpTypeAccelerationStructureKHR */ { RDNA4sId *t = ID(a[0]); t->op = op; break; }
       }
       p += wc;
    }
@@ -280,6 +281,7 @@ static int rdna4s_reflect(RDNA4sMod *m, int stage /* 0 v, 1 f, 2 k */, RDNA4sRef
          }
          else if (x->op == 26) dt = VK_DESCRIPTOR_TYPE_SAMPLER;
          else if (x->op == 27) dt = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+         else if (x->op == 5341) dt = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
          else { snprintf(r->why, sizeof r->why, "unrecognised descriptor variable %%%u (sc %u, pointee op %u)", i, v->sc, x->op); return 1; }
          int set = v->set < 0 ? 0 : v->set, b = v->bind < 0 ? 0 : v->bind;
          if (set >= RDNA4S_MAXSET) { snprintf(r->why, sizeof r->why, "set %d >= %d", set, RDNA4S_MAXSET); return 1; }

@@ -62,13 +62,14 @@ static struct {
     VkPhysicalDeviceVulkan12Properties descriptorLimits;
     uint32_t maxPerSetDescriptors;
     BOOL barycentric, atomicFloat, atomicFloat2, atomicInt64;
-    BOOL meshShader, objectShader;
+    BOOL meshShader, objectShader, multiDrawIndirect;
     BOOL deferredHostOps, accelStruct, rayQuery;
     BOOL timestampQuery, timestampComputeAndGraphics;
     float timestampPeriod;
     uint32_t timestampValidBits;
     BOOL sparseBinding, sparseResidencyBuffer, sparseResidencyImage2D, sparseResidencyImage3D;
 } RDNA4R;
+#define RDNA4_HAS_MULTI_DRAW_INDIRECT 1
 
 /*
  * One immutable pre-open limit source, independent of RDNA4R. Preparing it
@@ -604,11 +605,13 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                                         .shaderUniformBufferArrayDynamicIndexing = pf.shaderUniformBufferArrayDynamicIndexing,
                                         .shaderStorageBufferArrayDynamicIndexing = pf.shaderStorageBufferArrayDynamicIndexing,
                                         .depthBiasClamp = pf.depthBiasClamp,   // bundle 10: setDepthBias:slopeScale:clamp:
+                                        .multiDrawIndirect = pf.multiDrawIndirect,
                                         .drawIndirectFirstInstance = pf.drawIndirectFirstInstance,
                                         .imageCubeArray = pf.imageCubeArray,
                                         .samplerAnisotropy = pf.samplerAnisotropy,
                                         .shaderImageGatherExtended = gatherCaps.supported ? VK_TRUE : VK_FALSE,
                                         .occlusionQueryPrecise = pf.occlusionQueryPrecise };   // build 18 (P2): Counting visibility mode
+        RDNA4R.multiDrawIndirect = ef.multiDrawIndirect != VK_FALSE;
         RDNA4R.dualSrcBlend = ef.dualSrcBlend;
         RDNA4R.depthClamp = ef.depthClamp;
         RDNA4R.fillModeNonSolid = ef.fillModeNonSolid;

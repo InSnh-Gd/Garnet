@@ -618,6 +618,7 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
 // 4. RDNA4MeshRenderPipelineState (subclass of RDNA4RenderPipelineState)
 // =================================================================================================
 
+#ifndef RDNA4_HAS_MESH_PIPELINE_QUERY
 @interface RDNA4RenderPipelineState (RDNA4MeshQuery)
 - (BOOL)rdna4IsMeshPipeline;
 @end
@@ -625,6 +626,7 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
 @implementation RDNA4RenderPipelineState (RDNA4MeshQuery)
 - (BOOL)rdna4IsMeshPipeline { return NO; }
 @end
+#endif
 
 @interface RDNA4MeshRenderPipelineState : RDNA4RenderPipelineState {
     rdna4mesh_exec_mode_t _meshExecMode;
@@ -733,7 +735,7 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
     (void)descriptor; (void)stage;
     return nil;
 }
-- (id)newIntersectionFunctionTableWithDescriptor:(id)descriptor stage:(MTLRenderStages)stage {
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage {
     (void)descriptor; (void)stage;
     return nil;
 }

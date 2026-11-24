@@ -189,6 +189,9 @@ int main(int argc, char **argv) {
       char *rs = assembled ? NULL : slurp(dir, "rdna4_residency_set_impl.inc");
       char *cb = assembled ? NULL : slurp(dir, "rdna4_command_buffer_impl.inc");
       char *sr = assembled ? NULL : slurp(dir, "rdna4_shader_runtime_impl.inc");
+      char *bk = assembled ? NULL : slurp(dir, "rdna4_backend_impl.inc");
+      char *sb = assembled ? NULL : slurp(dir, "rdna4_stage_bindings_impl.inc");
+      char *ag = assembled ? NULL : slurp(dir, "rdna4_argument.inc");
       const char *rpSrc = assembled ? gm : rp;
       const char *cpSrc = assembled ? gm : cp;
       const char *reSrc = assembled ? gm : re;
@@ -197,15 +200,17 @@ int main(int argc, char **argv) {
       const char *rsSrc = assembled ? gm : rs;
       const char *cbSrc = assembled ? gm : cb;
       const char *srSrc = assembled ? gm : sr;
+      const char *bkSrc = assembled ? gm : bk;
+      const char *sbSrc = assembled ? gm : sb;
       CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
             gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
                && strstr(gm, "- (BOOL)supportsBCTextureCompression")
                && strstr(gm, "- (BOOL)supports32BitFloatFiltering")
                && strstr(gm, "- (BOOL)supports32BitMSAA")
                && strstr(gm, "- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }")
-               && strstr(gm, "- (BOOL)supportsRaytracing { return NO; }")
-               && strstr(gm, "- (BOOL)supportsRaytracingFromRender { return NO; }")
-               && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return NO; }")
+               && strstr(gm, "- (BOOL)supportsRaytracing { return rdna4_rt_runtime_supports_raytracing(); }")
+               && strstr(gm, "- (BOOL)supportsRaytracingFromRender { return rdna4_rt_runtime_supports_raytracing_from_render(); }")
+               && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return rdna4_rt_runtime_supports_primitive_motion_blur(); }")
                && strstr(gm, "- (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
                && strstr(gm, "- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
                && strstr(gm, "- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }")
@@ -294,6 +299,55 @@ int main(int argc, char **argv) {
                && strstr(bfSrc, "VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR")
                && strstr(rsSrc, "objc_getClass(\"RDNA4SparseHeap\")")
                && strstr(rsSrc, "sparse textures/heaps are not supported") == NULL);
+      CHECK("G14: GarnetDevice.m wires Wave 3E mesh shaders and ray-tracing runtime/IFT",
+            gm && rpSrc && cpSrc && reSrc && ceSrc && cbSrc && srSrc && bkSrc && sbSrc
+               && (assembled ? (strstr(gm, "@implementation RDNA4IntersectionFunctionTable")
+                                && strstr(gm, "@implementation RDNA4MeshRenderPipelineState")
+                                && strstr(gm, "#include \"rdna4_argument.inc\""))
+                             : (strstr(gm, "#include \"rdna4_rt_runtime_impl.inc\"") != NULL
+                                && strstr(gm, "#include \"rdna4_mesh_impl.inc\"") != NULL
+                                && ag != NULL
+                                && strstr(ag, "rdna4_rt_arg_is_rt_data_type(") != NULL
+                                && strstr(ag, "- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure atIndex:(NSUInteger)index") != NULL
+                                && strstr(ag, "- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)intersectionFunctionTable atIndex:(NSUInteger)index") != NULL
+                                && strstr(ag, "- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)intersectionFunctionTables withRange:(NSRange)range") != NULL))
+               && strstr(bkSrc, "#define RDNA4_HAS_MULTI_DRAW_INDIRECT 1")
+               && strstr(bkSrc, ".multiDrawIndirect = pf.multiDrawIndirect")
+               && strstr(bkSrc, "RDNA4R.multiDrawIndirect = ef.multiDrawIndirect")
+               && strstr(srSrc, "garnetx_detect_stage")
+               && strstr(srSrc, "garnetx_translate_stage3")
+               && strstr(srSrc, "rdna4rtr_infer_ift_kind_from_ir(")
+               && strstr(gm, "\"MTLIntersectionFunctionTable\"")
+               && strstr(gm, "RDNA4MeshRenderPipelineState")
+               && strstr(gm, "- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:")
+               && strstr(gm, "rdna4_mesh_device_new_pipeline(self, d, opts, refl, error)")
+               && strstr(gm, "rdna4_mesh_device_new_pipeline_async(self, d, opts, h)")
+               && strstr(sbSrc, "RDNA4RTStageSlots rt;")
+               && strstr(cbSrc, "rdna4_rt_descriptor_pool_append(")
+               && strstr(cbSrc, "VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:")
+               && strstr(cbSrc, "rdna4_rt_fill_accel_descriptor(")
+               && strstr(cpSrc, "rdna4_rt_parse_meta(")
+               && strstr(cpSrc, "rdna4_rt_pipeline_function_handle(")
+               && strstr(cpSrc, "rdna4_rt_pipeline_new_ift(")
+               && strstr(rpSrc, "#define RDNA4_HAS_MESH_PIPELINE_QUERY 1")
+               && strstr(rpSrc, "rdna4_rt_parse_meta(")
+               && strstr(rpSrc, "rdna4rtr_refl_uses_raytracing(")
+               && strstr(rpSrc, "rdna4_rt_pipeline_function_handle(")
+               && strstr(rpSrc, "rdna4_rt_pipeline_new_ift(")
+               && strstr(ceSrc, "- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i")
+               && strstr(ceSrc, "- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(ceSrc, "- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r")
+               && strstr(ceSrc, "rdna4_rt_retain_argbuf_resources(")
+               && strstr(reSrc, "- (void)setVertexAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "- (void)setFragmentAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "- (void)setVertexIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "- (void)setFragmentIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i")
+               && strstr(reSrc, "rdna4_rt_dc_push_accel_sig(")
+               && strstr(reSrc, "if ([_pso rdna4IsMeshPipeline])")
+               && strstr(reSrc, "rdna4_rt_retain_argbuf_resources("));
+      free(ag);
+      free(sb);
+      free(bk);
       free(sr);
       free(cb);
       free(rs);

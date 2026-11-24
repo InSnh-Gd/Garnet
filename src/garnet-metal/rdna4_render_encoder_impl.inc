@@ -712,6 +712,8 @@ RDNA4_DNR(RDNA4RenderEncoder)
     _pso = pso; _roReflection = [_pso reflection];
     _sv.scanPlan = [_pso scanPlanV];
     _sf.scanPlan = [_pso scanPlanF];
+    _sv.rtAsRefl = [_pso rdna4RtAsReflV];
+    _sf.rtAsRefl = [_pso rdna4RtAsReflF];
     [self rdna4OwnResource:pso kind:RDNA4_RESOURCE_PIPELINE
                   fragment:NO index:0];
 }
@@ -846,6 +848,8 @@ RDNA4_ENCODER_SHARED
     if (i >= 31) { [_cb rdna4Fail:[NSString stringWithFormat:@"buffer index %lu >= 31", (unsigned long)i]]; return; }
     if (buf && ![buf isKindOfClass:[RDNA4Buffer class]]) { [_cb rdna4Fail:@"setBuffer: not an RDNA4Buffer"]; return; }
     RDNA4StageState *s = [self rdna4Stage:f]; s->buf[i].b = buf; s->buf[i].off = off;
+    s->rt.as[i] = nil;
+    [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
     [self rdna4OwnResource:buf kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
 }
 - (void)rdna4SetBytes:(const void *)p length:(NSUInteger)n index:(NSUInteger)i frag:(BOOL)f {
@@ -939,6 +943,47 @@ RDNA4_ENCODER_SHARED
         return;
     }
     for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetVisibleFunctionTable:t[k] atBufferIndex:r.location + k frag:YES];
+}
+- (void)rdna4SetAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i frag:(BOOL)f {
+    if ([_cb rdna4Error]) return;
+    RDNA4StageState *s = [self rdna4Stage:f];
+    if (!rdna4_rt_encoder_bind_accel(_cb, [_cb device], f ? "fragment" : "vertex", &s->rt, accel, i)) return;
+    s->buf[i] = (RDNA4BufSlot){ nil, 0 };
+    [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
+    [self rdna4OwnResource:accel kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
+}
+- (void)setVertexAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i {
+    [self rdna4SetAccelerationStructure:accel atBufferIndex:i frag:NO];
+}
+- (void)setFragmentAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i {
+    [self rdna4SetAccelerationStructure:accel atBufferIndex:i frag:YES];
+}
+- (void)rdna4SetIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i frag:(BOOL)f {
+    if ([_cb rdna4Error]) return;
+    RDNA4StageState *s = [self rdna4Stage:f];
+    RDNA4Buffer *backing = nil;
+    if (!rdna4_rt_encoder_bind_ift(_cb, [_cb device], f ? "fragment" : "vertex", &s->rt, t, i, &backing)) return;
+    [self rdna4SetBuffer:backing offset:0 index:i frag:f];
+}
+- (void)setVertexIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    [self rdna4SetIntersectionFunctionTable:t atBufferIndex:i frag:NO];
+}
+- (void)setVertexIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if ([_cb rdna4Error]) return;
+    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "vertex", &_sv.rt, t, r,
+                                     ^(RDNA4Buffer *buf, NSUInteger idx) {
+                                         [self rdna4SetBuffer:buf offset:0 index:idx frag:NO];
+                                     });
+}
+- (void)setFragmentIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    [self rdna4SetIntersectionFunctionTable:t atBufferIndex:i frag:YES];
+}
+- (void)setFragmentIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if ([_cb rdna4Error]) return;
+    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "fragment", &_sf.rt, t, r,
+                                     ^(RDNA4Buffer *buf, NSUInteger idx) {
+                                         [self rdna4SetBuffer:buf offset:0 index:idx frag:YES];
+                                     });
 }
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self rdna4SetBytes:p length:n index:i frag:NO]; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self rdna4SetBytes:p length:n index:i frag:YES]; }
@@ -1041,6 +1086,9 @@ RDNA4_ENCODER_SHARED
                     : ((p->binding >= (inp ? 192u : 480u) && ix < (inp ? 8u : 128u)) ? (inp ? st->att[ix] : st->tex[ix]) : nil);
                 rdna4dc_sig_push(&sig, (uint64_t)(uintptr_t)(__bridge void *)t); rdna4dc_sig_push(&sig, t ? (uint64_t)(uintptr_t)(inp ? [t rdna4AttViewLevel:0] : [t rdna4StorageView]) : 0); }
             break; }
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+            rdna4_rt_dc_push_accel_sig(&sig, p->binding, p->count, &st->rt);
+            break;
         default: sig.over = 1; break;   // unsupported type: let rdna4FillSet refuse it as before
         }
         if (sig.over) break;
@@ -1068,10 +1116,16 @@ RDNA4_ENCODER_SHARED
           _pso = r;
           _sv.scanPlan = [_pso scanPlanV];
           _sf.scanPlan = [_pso scanPlanF];
+          _sv.rtAsRefl = [_pso rdna4RtAsReflV];
+          _sf.rtAsRefl = [_pso rdna4RtAsReflF];
           [self rdna4OwnResource:r kind:RDNA4_RESOURCE_PIPELINE
                         fragment:NO index:0];
           RDNA4LOGR("HOT-SWAP: render encoder now uses the real pipeline %p", (__bridge void *)r);
       } }
+    if ([_pso rdna4IsMeshPipeline]) {
+        [_cb rdna4Fail:@"drawPrimitives/drawPatches called with a mesh render pipeline"];
+        return NO;
+    }
     if ([_pso rdna4IsTessellation] != (topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST)) {
         [_cb rdna4Fail:[_pso rdna4IsTessellation]
             ? @"drawPrimitives called with a tessellation render pipeline"
@@ -1133,6 +1187,14 @@ RDNA4_ENCODER_SHARED
     NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
     rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbV], [_pso npbV], &_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX));
     if (hasFrag) rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbF], [_pso npbF], &_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT));
+    for (uint32_t i = 0; i < 31; i++) {
+        if (_sv.buf[i].b) rdna4_rt_retain_argbuf_resources(_sv.buf[i].b, _cb);
+        if (hasFrag && _sf.buf[i].b) rdna4_rt_retain_argbuf_resources(_sf.buf[i].b, _cb);
+    }
+    for (id res in argumentResources) {
+        if ([res isKindOfClass:[RDNA4Buffer class]])
+            rdna4_rt_retain_argbuf_resources((RDNA4Buffer *)res, _cb);
+    }
     RDNA4ArgumentScanPrepared scan = {0};
     const RDNA4StageState *scanStages[] = {&_sv, &_sf};
     NSString *scanError = nil;

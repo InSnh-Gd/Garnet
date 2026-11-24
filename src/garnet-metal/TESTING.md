@@ -1050,3 +1050,66 @@ for b in test-metal3-dynamic-lib-O0 test-metal3-dynamic-lib-O2 \
     "$TMPDIR/$b" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Metal 3 Mesh Shaders & Ray Tracing Runtime / IFT (6.2, 7.3, Wave 3E)
+
+Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
+and Clang ASan + UBSan) validate mesh descriptor/threadgroup/emulated-payload
+planning, SPIR-V mesh execution-model inspection, and Footnote 10 rules
+(`test-mesh-runtime.c`), plus ray-tracing reflection JSON parsing, patch `0077`
+IFT storage-buffer ABI encoding/dispatch simulation, direct-AS vs 64-bit BDA
+argument-buffer planning, AIR intersection kind inference, and honest capability
+gating (`test-rt-runtime.c`), alongside assembled `GarnetDevice.m` Wave 3E
+wiring pins (`test-gate.c`, `test-occ.c`):
+
+```sh
+python3 src/garnet-metal/assemble-device.py \
+  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
+
+for t in test-mesh-runtime test-rt-runtime test-gate test-occ; do
+  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
+    -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
+done
+"$TMPDIR/test-mesh-runtime"
+"$TMPDIR/test-rt-runtime"
+"$TMPDIR/test-gate" src/garnet-metal
+"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
+"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
+```
+
+Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
+on macOS; compile `test-metal3-raytracing.m` with both `-O0` and `-O2` for early
+ARC release coverage):
+
+- `test-metal3-mesh-shaders.m` (Task `6.2`): mesh-only and object+mesh pipelines
+  (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`),
+  `drawMeshThreadgroups:`, `drawMeshThreads:`,
+  `drawMeshThreadgroupsWithIndirectBuffer:`, `setObjectThreadgroupMemoryLength:`
+  (up to 16 KiB), object/mesh buffer/texture/sampler binding, `privateFunctions`
+  linkage, Footnote 10 mesh + function-pointer rejection, and `MTLGPUFamilyApple6 == NO`.
+- `test-metal3-raytracing.m` (Task `7.3`): honest capability assertions
+  (`supportsRaytracing`, `supportsRaytracingFromRender`,
+  `supportsPrimitiveMotionBlur == NO`), compute & fragment ray-query traversal
+  against triangle/AABB BLAS + compacted/refit TLAS via direct
+  `setAccelerationStructure:` / `setFragmentAccelerationStructure:` and Tier 2
+  argument-buffer 64-bit BDA (`setAccelerationStructure:atIndex:`),
+  `MTLIntersectionFunctionTable` creation/binding/opaque-triangle signatures/null
+  slots, and early ARC release safety under `-O0` and `-O2`.
+
+```sh
+clang -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-metal3-mesh-shaders.m -o "$TMPDIR/test-metal3-mesh-shaders"
+for opt in O0 O2; do
+  clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
+    -framework Foundation -framework Metal \
+    src/garnet-metal/test-metal3-raytracing.m -o "$TMPDIR/test-metal3-raytracing-$opt"
+done
+
+for b in test-metal3-mesh-shaders \
+         test-metal3-raytracing-O0 test-metal3-raytracing-O2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

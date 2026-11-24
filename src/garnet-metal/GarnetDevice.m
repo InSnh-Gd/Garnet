@@ -450,6 +450,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_icb_abi.h"
 #include "rdna4_binary_archive_impl.inc"
 #include "rdna4_dynlib_vft_impl.inc"
+#include "rdna4_rt_runtime_impl.inc"
 #include "rdna4_render_pipeline_impl.inc"
 #include "rdna4_stage_bindings_impl.inc"
 #include "rdna4_compute_pipeline_impl.inc"
@@ -467,6 +468,7 @@ static BOOL rdna4_headless(void) {
 #include "rdna4_io_queue_impl.inc"
 #include "rdna4_sparse_impl.inc"
 #include "rdna4_rt_accel_impl.inc"
+#include "rdna4_mesh_impl.inc"
 @implementation RDNA4CommandBuffer (Encoders)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
     (void)[self vk];
@@ -633,6 +635,8 @@ static NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLResourceStateCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4ResourceStateEncoder class], n, 2, "RDNA4ResourceStateEncoder"); }
     { const char *n[] = { "MTLAccelerationStructure", "MTLResource" }; rdna4_add_protocols([RDNA4AccelerationStructure class], n, 2, "RDNA4AccelerationStructure"); }
     { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([RDNA4AccelerationStructureCommandEncoder class], n, 2, "RDNA4AccelerationStructureCommandEncoder"); }
+    { const char *n[] = { "MTLIntersectionFunctionTable", "MTLResource" }; rdna4_add_protocols([RDNA4IntersectionFunctionTable class], n, 2, "RDNA4IntersectionFunctionTable"); }
+    { const char *n[] = { "MTLRenderPipelineState" }; rdna4_add_protocols([RDNA4MeshRenderPipelineState class], n, 1, "RDNA4MeshRenderPipelineState"); }
     {   // build 18: the census (rdna4_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).
         const rdna4cen_pair pairs[] = { { [RDNA4RenderEncoder class], "RDNA4RenderEncoder", "MTLRenderCommandEncoder" }, { [RDNA4ComputeEncoder class], "RDNA4ComputeEncoder", "MTLComputeCommandEncoder" },
             { [RDNA4BlitEncoder class], "RDNA4BlitEncoder", "MTLBlitCommandEncoder" }, { [RDNA4CommandBuffer class], "RDNA4CommandBuffer", "MTLCommandBuffer" }, { self, "GarnetDevice", "MTLDevice" },
@@ -1073,9 +1077,9 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (BOOL)supports32BitFloatFiltering { return YES; }
 - (BOOL)supports32BitMSAA { return YES; }
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }
-- (BOOL)supportsRaytracing { return NO; }
-- (BOOL)supportsRaytracingFromRender { return NO; }
-- (BOOL)supportsPrimitiveMotionBlur { return NO; }
+- (BOOL)supportsRaytracing { return rdna4_rt_runtime_supports_raytracing(); }
+- (BOOL)supportsRaytracingFromRender { return rdna4_rt_runtime_supports_raytracing_from_render(); }
+- (BOOL)supportsPrimitiveMotionBlur { return rdna4_rt_runtime_supports_primitive_motion_blur(); }
 - (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }
 - (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }
 - (BOOL)supportsPullModelInterpolation {
@@ -1264,6 +1268,14 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
         NSError *e = nil; MTLRenderPipelineReflection *r = nil;
         id p = [self rdna4NewPipeline:saved options:opts reflection:&r error:&e]; h(p, r, e);
     }});
+}
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:(id)d options:(NSUInteger)opts reflection:(MTLRenderPipelineReflection **)refl error:(NSError **)error {
+    RDNA4LOG("newRenderPipelineStateWithMeshDescriptor:options:reflection:error:");
+    return (id<MTLRenderPipelineState>)rdna4_mesh_device_new_pipeline(self, d, opts, refl, error);
+}
+- (void)newRenderPipelineStateWithMeshDescriptor:(id)d options:(NSUInteger)opts completionHandler:(void (^)(id, id, NSError *))h {
+    RDNA4LOG("newRenderPipelineStateWithMeshDescriptor:options:completionHandler:");
+    rdna4_mesh_device_new_pipeline_async(self, d, opts, h);
 }
 
 // Diagnostic: name any selector Metal sends that we (and our superclasses) do not implement, before the

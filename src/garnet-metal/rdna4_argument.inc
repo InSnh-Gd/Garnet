@@ -156,7 +156,7 @@ static BOOL rdna4_argument_scalar(MTLDataType type, NSUInteger *size, NSUInteger
     }
     if (type == MTLDataTypePointer || type == MTLDataTypeTexture || type == MTLDataTypeSampler ||
         type == MTLDataTypeRenderPipeline || type == MTLDataTypeComputePipeline ||
-        type == MTLDataTypeIndirectCommandBuffer) {
+        type == MTLDataTypeIndirectCommandBuffer || rdna4_rt_arg_is_rt_data_type(type)) {
         *size = *alignment = sizeof(uint64_t); return YES;
     }
     return NO;
@@ -271,7 +271,8 @@ static BOOL rdna4_argument_add(NSMutableDictionary *fields, MTLDataType type, MT
     return field && field.type != MTLDataTypePointer && field.type != MTLDataTypeTexture &&
         field.type != MTLDataTypeSampler && field.type != MTLDataTypeRenderPipeline &&
         field.type != MTLDataTypeComputePipeline &&
-        field.type != MTLDataTypeIndirectCommandBuffer ? field.offset : NSUIntegerMax;
+        field.type != MTLDataTypeIndirectCommandBuffer &&
+        !rdna4_rt_arg_is_rt_data_type(field.type) ? field.offset : NSUIntegerMax;
 }
 - (id)bufferLayoutForResourceAtIndex:(NSUInteger)index { return [self field:index].nested; }
 @end
@@ -1304,7 +1305,8 @@ static void rdna4_argument_sampler_complete(id token) {
     BOOL resource = field.type == MTLDataTypePointer || field.type == MTLDataTypeTexture ||
         field.type == MTLDataTypeSampler || field.type == MTLDataTypeRenderPipeline ||
         field.type == MTLDataTypeComputePipeline ||
-        field.type == MTLDataTypeIndirectCommandBuffer;
+        field.type == MTLDataTypeIndirectCommandBuffer ||
+        rdna4_rt_arg_is_rt_data_type(field.type);
     if (!_buffer || !field || (type == MTLDataTypeNone ? resource : field.type != type) ||
         field.offset > self.encodedLength || field.size > self.encodedLength - field.offset ||
         (resource && field.size != sizeof(uint64_t)))
@@ -1331,6 +1333,8 @@ static void rdna4_argument_sampler_complete(id token) {
     rdna4_argument_sampler_store(_buffer, _offset + [_layout field:index].offset, address, nil);
     if (buffer && ([_layout field:index].nested != nil || objc_getAssociatedObject(buffer, &rdna4_icb_arg_owners_key) != nil))
         rdna4_icb_arg_note(_buffer, nil, nil, (RDNA4Buffer *)buffer);
+    if (buffer && ([_layout field:index].nested != nil || objc_getAssociatedObject(buffer, &rdna4_rt_arg_owners_key) != nil))
+        rdna4_rt_arg_note(_buffer, nil, nil, (RDNA4Buffer *)buffer);
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained *)buffers offsets:(const NSUInteger *)offsets withRange:(NSRange)range {
     if ((!buffers || !offsets) && range.length)
@@ -1464,6 +1468,36 @@ static void rdna4_argument_sampler_complete(id token) {
     [self rdna4ValidateRange:range type:MTLDataTypeComputePipeline];
     for (NSUInteger n = 0; n < range.length; ++n) (void)[self rdna4ComputePipelineToken:pipelines[n]];
     for (NSUInteger n = 0; n < range.length; ++n) [self setComputePipelineState:pipelines[n] atIndex:range.location + n];
+}
+- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure atIndex:(NSUInteger)index {
+    RDNA4ArgumentField *field = [_layout field:index];
+    if (!field || (field.type != MTLDataTypeInstanceAccelerationStructure && field.type != MTLDataTypePrimitiveAccelerationStructure))
+        [NSException raise:NSInvalidArgumentException format:@"Argument ID %lu is not an acceleration structure destination", (unsigned long)index];
+    (void)[self rdna4Destination:index type:field.type];
+    uint64_t address = rdna4_rt_arg_resolve_as_address(_device, accelerationStructure, field.type,
+                                                       _offset + field.offset, field.size, [_buffer length]);
+    rdna4_argument_sampler_store(_buffer, _offset + field.offset, address, nil);
+    if (accelerationStructure) rdna4_rt_arg_note(_buffer, accelerationStructure, nil, nil);
+}
+- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)intersectionFunctionTable atIndex:(NSUInteger)index {
+    (void)[self rdna4Destination:index type:MTLDataTypeIntersectionFunctionTable];
+    RDNA4ArgumentField *field = [_layout field:index];
+    uint64_t address = rdna4_rt_arg_resolve_ift_address(_device, intersectionFunctionTable, field.type,
+                                                        _offset + field.offset, field.size, [_buffer length]);
+    rdna4_argument_sampler_store(_buffer, _offset + field.offset, address, nil);
+    if (intersectionFunctionTable) rdna4_rt_arg_note(_buffer, nil, (RDNA4IntersectionFunctionTable *)intersectionFunctionTable, nil);
+}
+- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)intersectionFunctionTables withRange:(NSRange)range {
+    if (!intersectionFunctionTables && range.length)
+        [NSException raise:NSInvalidArgumentException format:@"Argument intersection function table array is null"];
+    [self rdna4ValidateRange:range type:MTLDataTypeIntersectionFunctionTable];
+    for (NSUInteger n = 0; n < range.length; ++n) {
+        RDNA4ArgumentField *field = [_layout field:range.location + n];
+        (void)rdna4_rt_arg_resolve_ift_address(_device, intersectionFunctionTables[n], field.type,
+                                               _offset + field.offset, field.size, [_buffer length]);
+    }
+    for (NSUInteger n = 0; n < range.length; ++n)
+        [self setIntersectionFunctionTable:intersectionFunctionTables[n] atIndex:range.location + n];
 }
 - (void *)constantDataAtIndex:(NSUInteger)index { return [self rdna4Destination:index type:MTLDataTypeNone]; }
 - (id)newArgumentEncoderForBufferAtIndex:(NSUInteger)index {

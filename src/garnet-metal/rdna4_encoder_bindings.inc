@@ -8,6 +8,7 @@ enum {
     RDNA4_RESOURCE_RESOLVE = 4,
     RDNA4_RESOURCE_BUFFER = 5,
     RDNA4_RESOURCE_TEXTURE = 6,
+    RDNA4_RESOURCE_ACCEL = 7,
 };
 
 static NSNumber *rdna4_resource_slot(uint32_t kind, BOOL fragment,

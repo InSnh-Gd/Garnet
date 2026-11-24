@@ -4,6 +4,7 @@
 #include "rdna4_fragment_output.h"
 #include "rdna4_counters.h"
 
+#define RDNA4_HAS_MESH_PIPELINE_QUERY 1
 @interface RDNA4RenderPipelineState : _MTLRenderPipelineState {
     id _dev; NSString *_lbl; VkShaderModule _vs, _tcs, _tes, _fs; VkPipelineLayout _pl; VkRenderPass _rp; VkDescriptorSetLayout _dsl[2], _tessDsl;
     BOOL _isTess; uint32_t _tessSet; rdna4_tess_cfg_t _tessCfg; uint64_t _tessKey;
@@ -30,6 +31,8 @@
     uint32_t _maxAmp;
     uint64_t _vftOwnerToken;
     rdna4vft_reflection_t _vftV, _vftF;
+    uint64_t _iftOwnerToken;
+    rdna4rtr_reflection_t _rtV, _rtF;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
@@ -68,8 +71,12 @@
 - (uint32_t)tessSet;
 - (uint64_t)tessCacheKey;
 - (uint32_t)rdna4MaxVertexAmplificationCount;
+- (BOOL)rdna4IsMeshPipeline;
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflV;
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflF;
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage;
 - (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
 @end
 static VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
@@ -271,6 +278,16 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
             NSDictionary *vftMetaF = (mf_ && mf_[@"visible_function_tables"]) ? mf_ : preF;
             if (!rdna4x_parse_vft_from_meta(vftMetaF, &_vftF, err)) return nil;
         }
+        _iftOwnerToken = rdna4_vft_next_owner_token();
+        NSDictionary *rtMetaV = (mv_ && (mv_[@"acceleration_structures"] || mv_[@"intersection_function_tables"])) ? mv_ : preV;
+        if (!rdna4_rt_parse_meta(rtMetaV, &_rtV, err)) return nil;
+        if (hasFrag) {
+            NSDictionary *rtMetaF = (mf_ && (mf_[@"acceleration_structures"] || mf_[@"intersection_function_tables"])) ? mf_ : preF;
+            if (!rdna4_rt_parse_meta(rtMetaF, &_rtF, err)) return nil;
+        }
+        BOOL hasVftMeta = (_vftV.present || _vftF.present) ? YES : NO;
+        BOOL hasRenderRT = (rdna4rtr_refl_uses_raytracing(&_rtV) || rdna4rtr_refl_uses_raytracing(&_rtF)) ? YES : NO;
+        if ((hasVftMeta || hasRenderRT) && !rdna4_vft_validate_render_footnote10(d, NO, hasVftMeta, hasRenderRT, err)) return nil;
         char why[256] = "";
         fsp = hasFrag ? rdna4_spv_set(fsd, 1) : nil;   // fragment descriptors live in set 1 (binding-model comment above)
         rv = calloc(1, sizeof *rv); rf = hasFrag ? calloc(1, sizeof *rf) : NULL;
@@ -985,6 +1002,8 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     rdna4_argument_scan_reflection_plan_destroy(&_scanF);
     rdna4vft_refl_destroy(&_vftV);
     rdna4vft_refl_destroy(&_vftF);
+    rdna4rtr_refl_destroy(&_rtV);
+    rdna4rtr_refl_destroy(&_rtF);
     free(_pbV); free(_pbF);
     uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);   // the published real object
 }
@@ -1019,9 +1038,18 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (NSUInteger)imageblockSampleLength { return 0; }
 - (BOOL)supportIndirectCommandBuffers { return _icb; }
 - (uint32_t)rdna4MaxVertexAmplificationCount { return _maxAmp ? _maxAmp : 1u; }
+- (BOOL)rdna4IsMeshPipeline { return NO; }
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflV { return &_rtV.as; }
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflF { return &_rtF.as; }
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage {
     RDNA4RenderPipelineState *real = [self rdna4Real];
     if (real) return [real functionHandleWithFunction:function stage:stage];
+    if (function && [function respondsToSelector:@selector(functionType)] &&
+        [function functionType] == MTLFunctionTypeIntersection) {
+        const rdna4rtr_ift_reflection_t *ir = (stage == MTLRenderStageVertex) ? &_rtV.ift :
+            (stage == MTLRenderStageFragment) ? &_rtF.ift : NULL;
+        return rdna4_rt_pipeline_function_handle(self, _dev, _iftOwnerToken, ir, function, (NSUInteger)stage);
+    }
     const rdna4vft_reflection_t *r = (stage == MTLRenderStageVertex) ? &_vftV :
         (stage == MTLRenderStageFragment) ? &_vftF : NULL;
     return rdna4_vft_pipeline_handle(self, _dev, _vftOwnerToken, r, function, (NSUInteger)stage);
@@ -1032,6 +1060,13 @@ RDNA4_DNR(RDNA4RenderPipelineState)
     if (stage != MTLRenderStageVertex && stage != MTLRenderStageFragment) return nil;
     const rdna4vft_reflection_t *r = (stage == MTLRenderStageVertex) ? &_vftV : &_vftF;
     return rdna4_vft_pipeline_new_table(self, _dev, _vftOwnerToken, r, descriptor, (NSUInteger)stage);
+}
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage {
+    RDNA4RenderPipelineState *real = [self rdna4Real];
+    if (real) return [real newIntersectionFunctionTableWithDescriptor:descriptor stage:stage];
+    if (stage != MTLRenderStageVertex && stage != MTLRenderStageFragment) return nil;
+    const rdna4rtr_ift_reflection_t *ir = (stage == MTLRenderStageVertex) ? &_rtV.ift : &_rtF.ift;
+    return rdna4_rt_pipeline_new_ift(self, _dev, _iftOwnerToken, ir, descriptor, (NSUInteger)stage);
 }
 @end
 

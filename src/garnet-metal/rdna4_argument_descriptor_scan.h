@@ -20,6 +20,9 @@ static inline int rdna4_argument_descriptor_add(
     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: value = &counts->storage_buffer; break;
     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: value = &counts->storage_buffer_dynamic; break;
     case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: value = &counts->input_attachment; break;
+#ifdef VK_KHR_acceleration_structure
+    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return 1;
+#endif
     default: return 0;
     }
     return rdna4_argument_capacity_add_u64(*value, count, value);

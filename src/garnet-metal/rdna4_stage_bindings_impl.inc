@@ -4,6 +4,8 @@
 typedef struct { __unsafe_unretained RDNA4Buffer *b; NSUInteger off; } RDNA4BufSlot;
 typedef struct {
     RDNA4BufSlot buf[31]; __unsafe_unretained RDNA4Texture *tex[128]; __unsafe_unretained RDNA4SamplerBinding *smp[16]; __unsafe_unretained RDNA4Texture *att[8];   // att: the colour attachments (input attachments, 11e-2)
+    RDNA4RTStageSlots rt;
+    const rdna4rtr_as_reflection_t *rtAsRefl;
     const rdna4_argument_scan_reflection_plan *scanPlan;
 } RDNA4StageState;
 

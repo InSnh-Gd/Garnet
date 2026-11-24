@@ -1688,14 +1688,15 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 static const uint32_t sets[3] = { 256, 64, 16 }, div[3] = { 1, 4, 16 };
                 VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
                 for (int tier = 0; tier < 3; tier++) {
-                    VkDescriptorPoolSize sz[9] = {
+                    VkDescriptorPoolSize sz[10] = {
                         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_SAMPLER, 512 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 / div[tier] }, { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 256 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024 / div[tier] }, { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 256 / div[tier] },
                         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256 / div[tier] } };
+                    uint32_t nsz = rdna4_rt_descriptor_pool_append(sz, 9u, 10u, div[tier]);
                     VkDescriptorPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = sets[tier],
-                                                      .poolSizeCount = sizeof sz / sizeof *sz, .pPoolSizes = sz };
+                                                      .poolSizeCount = nsz, .pPoolSizes = sz };
                     r = vkCreateDescriptorPool(RDNA4R.dev, &pc, NULL, &_pool);
                     if (r == VK_SUCCESS) break;
                     _pool = VK_NULL_HANDLE;
@@ -1729,6 +1730,9 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     if (n > MAXW) { [self rdna4Fail:[NSString stringWithFormat:@"%s stage has %u descriptors (> %d)", nm, n, MAXW]]; return NO; }
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXI]; VkDescriptorImageInfo ii[MAXI];
     VkBufferView texelViews[MAXI]; uint32_t nbi = 0, nii = 0, ntv = 0; id dev = [self device];
+    VkWriteDescriptorSetAccelerationStructureKHR asw[MAXW]; VkAccelerationStructureKHR ash[MAXI]; uint32_t nash = 0;
+    const rdna4rtr_stage_t rtStage = (nm && strstr(nm, "fragment") != NULL) ? RDNA4RTR_STAGE_FRAGMENT
+        : (nm && strcmp(nm, "vertex") == 0) ? RDNA4RTR_STAGE_VERTEX : RDNA4RTR_STAGE_COMPUTE;
     for (uint32_t i = 0; i < n; i++) {
         const RDNA4PB *p = &pb[i];
         if (p->count > MAXI - nbi || p->count > MAXI - nii || p->count > MAXI - ntv) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
@@ -1984,6 +1988,11 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 [self rdna4RetainEncoded:t];
                 ii[nii++] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, [t rdna4AttViewLevel:0], VK_IMAGE_LAYOUT_GENERAL };
             }
+            break;
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+            if (!rdna4_rt_fill_accel_descriptor(self, dev, nm, rtStage, p->binding, p->count,
+                                                &st->rt, st->rtAsRefl, &w[i], &asw[i], ash, &nash, MAXI))
+                return NO;
             break;
         default: [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: descriptor type %d not supported (texel buffer)", nm, p->binding, p->type]]; return NO;
         }

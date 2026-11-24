@@ -10,6 +10,7 @@
 //   RDNA4M_TEST_USERCACHE=<dir>       (root + RDNA4M_ALLOW=1) -> replaces confstr(_CS_DARWIN_USER_CACHE_DIR) as the parent of org.garnet.xlate
 // ---------------------------------------------------------------------------------------------------------------
 #include "rdna4_dynlib_vft.h"
+#include "rdna4_rt_runtime.h"
 
 #ifndef RDNA4_DYNLIB_INTERNAL_PROTO
 #define RDNA4_DYNLIB_INTERNAL_PROTO
@@ -21,13 +22,25 @@
 @end
 #endif
 
-// Exact C ABI match for third-party/metal2vulkan-rdna4/garnetxlate/garnetxlate.h Stage 2 exports.
+// Exact C ABI match for third-party/metal2vulkan-rdna4/garnetxlate/garnetxlate.h Stage 2 & Stage 3 exports.
+#define RDNA4X_STAGE3_FFI_DEFINED 1
 typedef struct {
     const uint8_t *name;
     size_t name_len;
     const uint8_t *ll;
     size_t ll_len;
 } rdna4x_cdynlib;
+typedef struct {
+    const uint8_t *symbol;
+    size_t symbol_len;
+    const uint8_t *ll;
+    size_t ll_len;
+    uint32_t kind;
+} rdna4x_cift_fn;
+typedef int (*rdna4x_detect_stage_fn)(
+    const uint8_t *ll, size_t ll_len,
+    uint32_t *out_stage_kind,
+    char *err, size_t err_len);
 typedef int (*rdna4x_list_exported_symbols_fn)(
     const uint8_t *ll, size_t ll_len,
     uint8_t **out_json, size_t *out_json_len,
@@ -38,6 +51,17 @@ typedef int (*rdna4x_translate_linked_libraries_fn)(
     const rdna4x_cdep *deps, size_t ndeps,
     const rdna4x_cdynlib *dynlibs, size_t ndynlibs,
     const rdna4x_cdep *visible_fns, size_t nvisible_fns,
+    const rdna4x_backend_capabilities *capabilities,
+    uint8_t **spv, size_t *spv_len,
+    uint8_t **meta, size_t *meta_len,
+    char *err, size_t err_len);
+typedef int (*rdna4x_translate_stage3_fn)(
+    const uint8_t *ll, size_t ll_len,
+    const uint32_t *local_xyz,
+    const rdna4x_cdep *deps, size_t ndeps,
+    const rdna4x_cdynlib *dynlibs, size_t ndynlibs,
+    const rdna4x_cdep *visible_fns, size_t nvisible_fns,
+    const rdna4x_cift_fn *intersection_fns, size_t nintersection_fns,
     const rdna4x_backend_capabilities *capabilities,
     uint8_t **spv, size_t *spv_len,
     uint8_t **meta, size_t *meta_len,
@@ -54,8 +78,10 @@ static struct {
     NSString *dirNS;
     int engineInit; rdna4x_engine eng;
     int icbXlibTried; rdna4x_xlib icbXlib; char icbXlibErr[256];
+    rdna4x_detect_stage_fn detectStage;
     rdna4x_list_exported_symbols_fn listExportedSymbols;
     rdna4x_translate_linked_libraries_fn translateLinkedLibraries;
+    rdna4x_translate_stage3_fn translateStage3;
     int stage2ReaderTried; rdna4x_reader stage2Reader; char stage2ReaderErr[256];
     int sandboxedDone, sandboxed;
 } RDNA4XL = { .mu = PTHREAD_MUTEX_INITIALIZER };
@@ -162,7 +188,9 @@ static void rdna4x_touch_hit(NSString *path, NSString *sha) {
     NSArray<NSDictionary *> *deps;
     NSArray<NSDictionary *> *dynlibs;
     NSArray<NSDictionary *> *visibleFns;
+    NSArray<NSDictionary *> *intersectionFns;
     BOOL useStage2;
+    BOOL useStage3;
     BOOL requireStage2;
     NSError *linkageError;
 }
@@ -268,8 +296,10 @@ static const rdna4x_xlib *rdna4x_ensure_xlib_raw(NSError **err) {
             strlcpy(RDNA4XL.icbXlibErr, ebuf[0] ? ebuf : "failed to load libgarnetxlate.dylib", sizeof RDNA4XL.icbXlibErr);
             memset(&RDNA4XL.icbXlib, 0, sizeof RDNA4XL.icbXlib);
         } else {
+            *(void **)&RDNA4XL.detectStage = dlsym(RDNA4XL.icbXlib.h, "garnetx_detect_stage");
             *(void **)&RDNA4XL.listExportedSymbols = dlsym(RDNA4XL.icbXlib.h, "garnetx_list_exported_symbols");
             *(void **)&RDNA4XL.translateLinkedLibraries = dlsym(RDNA4XL.icbXlib.h, "garnetx_translate_linked_libraries");
+            *(void **)&RDNA4XL.translateStage3 = dlsym(RDNA4XL.icbXlib.h, "garnetx_translate_stage3");
         }
         RDNA4XL.icbXlibTried = 1;
     }
@@ -315,6 +345,53 @@ static BOOL rdna4x_stage2_symbols_available(void) {
     rdna4x_list_exported_symbols_fn listFn = NULL;
     rdna4x_translate_linked_libraries_fn xlatFn = NULL;
     return rdna4x_ensure_stage2_xlib(&xl, &listFn, &xlatFn, NULL);
+}
+
+// Resolves garnetx_translate_stage3 from libgarnetxlate.dylib without opening RADV.
+__attribute__((unused)) static BOOL rdna4x_ensure_stage3_xlib(
+    const rdna4x_xlib **xlibOut,
+    rdna4x_translate_stage3_fn *translateOut,
+    NSError **err)
+{
+    const rdna4x_xlib *xl = rdna4x_ensure_xlib_raw(err);
+    if (!xl) return NO;
+    pthread_mutex_lock(&RDNA4XL.mu);
+    rdna4x_translate_stage3_fn fn = RDNA4XL.translateStage3;
+    pthread_mutex_unlock(&RDNA4XL.mu);
+    if (translateOut && !fn) {
+        if (err) *err = rdna4_err(42, @"libgarnetxlate.dylib lacks garnetx_translate_stage3 (Stage 3 RT/IFT/Mesh)");
+        return NO;
+    }
+    if (xlibOut) *xlibOut = xl;
+    if (translateOut) *translateOut = fn;
+    return fn != NULL;
+}
+
+__attribute__((unused)) static BOOL rdna4x_ensure_detect_stage_xlib(
+    const rdna4x_xlib **xlibOut,
+    rdna4x_detect_stage_fn *detectOut,
+    NSError **err)
+{
+    const rdna4x_xlib *xl = rdna4x_ensure_xlib_raw(err);
+    if (!xl) return NO;
+    pthread_mutex_lock(&RDNA4XL.mu);
+    rdna4x_detect_stage_fn fn = RDNA4XL.detectStage;
+    pthread_mutex_unlock(&RDNA4XL.mu);
+    if (detectOut && !fn) {
+        if (err) *err = rdna4_err(42, @"libgarnetxlate.dylib lacks garnetx_detect_stage");
+        return NO;
+    }
+    if (xlibOut) *xlibOut = xl;
+    if (detectOut) *detectOut = fn;
+    return fn != NULL;
+}
+
+__attribute__((unused)) static BOOL rdna4x_stage3_symbols_available(void) {
+    const rdna4x_xlib *xl = NULL;
+    rdna4x_translate_stage3_fn xlatFn = NULL;
+    rdna4x_detect_stage_fn detFn = NULL;
+    return rdna4x_ensure_stage3_xlib(&xl, &xlatFn, NULL) &&
+           rdna4x_ensure_detect_stage_xlib(NULL, &detFn, NULL);
 }
 
 static const rdna4x_reader *rdna4x_ensure_stage2_reader(char *errBuf, size_t errCap) {
@@ -493,6 +570,64 @@ __attribute__((unused)) static BOOL rdna4x_parse_vft_from_meta(NSDictionary *met
 }
 
 typedef struct {
+    const rdna4x_xlib *xlib;
+    rdna4x_detect_stage_fn detectFn;
+    const uint8_t *bytes;
+    size_t len;
+    uint32_t payloadKind;
+    uint32_t stageKind;
+    int rc;
+    char err[512];
+} rdna4x_detect_stage_work_t;
+
+static void *rdna4x_detect_stage_worker(void *opaque) {
+    rdna4x_detect_stage_work_t *w = (rdna4x_detect_stage_work_t *)opaque;
+    char *ll = NULL;
+    size_t llLen = 0;
+    int mrc = rdna4x_module_to_llvm_text(w->bytes, w->len, w->payloadKind, &ll, &llLen, w->err, sizeof w->err);
+    if (mrc != RDNA4X_OK) {
+        w->rc = mrc;
+        return NULL;
+    }
+    int drc = w->detectFn((const uint8_t *)ll, llLen, &w->stageKind, w->err, sizeof w->err);
+    free(ll);
+    if (drc != 0) {
+        if (!w->err[0]) snprintf(w->err, sizeof w->err, "garnetx_detect_stage returned %d", drc);
+        w->rc = RDNA4X_E_REFUSED;
+        return NULL;
+    }
+    w->rc = RDNA4X_OK;
+    return NULL;
+}
+
+__attribute__((unused)) static BOOL rdna4x_detect_stage_for_module(const uint8_t *bytes, size_t len, uint32_t payloadKind,
+                                                                   uint32_t *outStageKind, NSError **err) {
+    if (outStageKind) *outStageKind = 0u;
+    if (err) *err = nil;
+    const rdna4x_xlib *xl = NULL;
+    rdna4x_detect_stage_fn detectFn = NULL;
+    if (!rdna4x_ensure_detect_stage_xlib(&xl, &detectFn, err)) return NO;
+
+    rdna4x_detect_stage_work_t work;
+    memset(&work, 0, sizeof work);
+    work.xlib = xl;
+    work.detectFn = detectFn;
+    work.bytes = bytes;
+    work.len = len;
+    work.payloadKind = payloadKind;
+    if (rdna4x_run_on_worker_stack(rdna4x_detect_stage_worker, &work) != 0) {
+        if (err) *err = rdna4_err(42, @"failed to spawn worker thread for stage detection");
+        return NO;
+    }
+    if (work.rc != RDNA4X_OK) {
+        if (err) *err = rdna4_err(42, [NSString stringWithUTF8String:work.err[0] ? work.err : "failed to detect shader stage"]);
+        return NO;
+    }
+    if (outStageKind) *outStageKind = work.stageKind;
+    return YES;
+}
+
+typedef struct {
     const char *name;
     const uint8_t *bytes;
     size_t len;
@@ -502,6 +637,7 @@ typedef struct {
 typedef struct {
     const rdna4x_xlib *xlib;
     rdna4x_translate_linked_libraries_fn translateFn;
+    rdna4x_translate_stage3_fn translateStage3Fn;
     const char *dir;
     const char *sha;
     const char *fname;
@@ -513,6 +649,9 @@ typedef struct {
     size_t ndynlibs;
     const rdna4x_stage2_in_t *vis;
     size_t nvis;
+    const rdna4x_stage2_in_t *ift;
+    size_t nift;
+    int useStage3;
     rdna4x_backend_capabilities caps;
     int lowerArgs;
     uint8_t *outSpv;
@@ -538,8 +677,8 @@ static void *rdna4x_stage2_worker(void *opaque) {
         w->rc = RDNA4X_E_IO;
         return NULL;
     }
-    if (w->ndeps > RDNA4X_MAX_DEPS || w->ndynlibs > RDNA4X_MAX_DEPS || w->nvis > RDNA4X_MAX_DEPS) {
-        snprintf(w->err, sizeof w->err, "Stage 2 linkage count exceeds cap (%u)", RDNA4X_MAX_DEPS);
+    if (w->ndeps > RDNA4X_MAX_DEPS || w->ndynlibs > RDNA4X_MAX_DEPS || w->nvis > RDNA4X_MAX_DEPS || w->nift > RDNA4X_MAX_DEPS) {
+        snprintf(w->err, sizeof w->err, "Stage 2/3 linkage count exceeds cap (%u)", RDNA4X_MAX_DEPS);
         w->rc = RDNA4X_E_CAP;
         return NULL;
     }
@@ -588,9 +727,10 @@ static void *rdna4x_stage2_worker(void *opaque) {
     (void)rdna4x_file_path(failPath, sizeof failPath, w->dir, w->sha, RDNA4X_EXT_FAIL);
 
     char *entryLl = NULL; size_t entryLlLen = 0;
-    char **depTexts = NULL, **libTexts = NULL, **visTexts = NULL;
+    char **depTexts = NULL, **libTexts = NULL, **visTexts = NULL, **iftTexts = NULL;
     rdna4x_cdep *cdeps = NULL, *cvis = NULL;
     rdna4x_cdynlib *clibs = NULL;
+    rdna4x_cift_fn *cift = NULL;
     uint8_t *spv = NULL, *meta = NULL;
     size_t spvLen = 0, metaLen = 0;
     int rc = RDNA4X_OK;
@@ -664,20 +804,62 @@ static void *rdna4x_stage2_worker(void *opaque) {
             cvis[i].ll_len = tlen;
         }
     }
+    if (w->nift) {
+        iftTexts = (char **)calloc(w->nift, sizeof *iftTexts);
+        cift = (rdna4x_cift_fn *)calloc(w->nift, sizeof *cift);
+        if (!iftTexts || !cift) { snprintf(w->err, sizeof w->err, "out of memory"); rc = RDNA4X_E_IO; goto done; }
+        for (size_t i = 0; i < w->nift; i++) {
+            size_t tlen = 0;
+            rc = rdna4x_module_to_llvm_text(w->ift[i].bytes, w->ift[i].len, w->ift[i].kind,
+                                            &iftTexts[i], &tlen, w->err, sizeof w->err);
+            if (rc != RDNA4X_OK) goto refused;
+            totalLl += tlen;
+            if (totalLl > RDNA4X_MAX_LL) {
+                snprintf(w->err, sizeof w->err, "Stage 3 intersection function LLVM IR exceeds cap");
+                rc = RDNA4X_E_CAP;
+                goto refused;
+            }
+            uint32_t iftKind = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
+            if (!rdna4rtr_infer_ift_kind_from_ir(iftTexts[i], tlen, w->ift[i].name, &iftKind)) {
+                snprintf(w->err, sizeof w->err, "cannot infer intersection function kind (bounding_box vs triangle) for '%s'",
+                         w->ift[i].name ? w->ift[i].name : "?");
+                rc = RDNA4X_E_REFUSED;
+                goto refused;
+            }
+            cift[i].symbol = (const uint8_t *)w->ift[i].name;
+            cift[i].symbol_len = strlen(w->ift[i].name);
+            cift[i].ll = (const uint8_t *)iftTexts[i];
+            cift[i].ll_len = tlen;
+            cift[i].kind = iftKind;
+        }
+    }
 
     {
         const uint32_t *loc = rdna4x_local_for(w->fname);
-        int tr = w->translateFn((const uint8_t *)entryLl, entryLlLen, loc,
+        int tr;
+        if (w->useStage3 || w->nift > 0) {
+            if (!w->translateStage3Fn) {
+                snprintf(w->err, sizeof w->err, "libgarnetxlate.dylib lacks garnetx_translate_stage3");
+                rc = RDNA4X_E_UNAVAILABLE;
+                goto refused;
+            }
+            tr = w->translateStage3Fn((const uint8_t *)entryLl, entryLlLen, loc,
+                                      cdeps, w->ndeps, clibs, w->ndynlibs, cvis, w->nvis,
+                                      cift, w->nift, &w->caps, &spv, &spvLen, &meta, &metaLen, w->err, sizeof w->err);
+        } else {
+            tr = w->translateFn((const uint8_t *)entryLl, entryLlLen, loc,
                                 cdeps, w->ndeps, clibs, w->ndynlibs, cvis, w->nvis,
                                 &w->caps, &spv, &spvLen, &meta, &metaLen, w->err, sizeof w->err);
+        }
         if (tr != 0) {
-            if (!w->err[0]) snprintf(w->err, sizeof w->err, "garnetx_translate_linked_libraries returned %d", tr);
+            if (!w->err[0]) snprintf(w->err, sizeof w->err, "%s returned %d",
+                                     (w->useStage3 || w->nift > 0) ? "garnetx_translate_stage3" : "garnetx_translate_linked_libraries", tr);
             rc = RDNA4X_E_REFUSED;
             goto refused;
         }
     }
     if (!spv || !meta || !rdna4x_spv_size_ok(spvLen) || !rdna4x_meta_size_ok(metaLen)) {
-        snprintf(w->err, sizeof w->err, "Stage 2 SPIR-V (%zu B) / meta (%zu B) outside caps", spvLen, metaLen);
+        snprintf(w->err, sizeof w->err, "Stage 2/3 SPIR-V (%zu B) / meta (%zu B) outside caps", spvLen, metaLen);
         rc = RDNA4X_E_CAP;
         goto refused;
     }
@@ -734,7 +916,8 @@ done:
     if (depTexts) { for (size_t i = 0; i < w->ndeps; i++) free(depTexts[i]); free(depTexts); }
     if (libTexts) { for (size_t i = 0; i < w->ndynlibs; i++) free(libTexts[i]); free(libTexts); }
     if (visTexts) { for (size_t i = 0; i < w->nvis; i++) free(visTexts[i]); free(visTexts); }
-    free(cdeps); free(clibs); free(cvis);
+    if (iftTexts) { for (size_t i = 0; i < w->nift; i++) free(iftTexts[i]); free(iftTexts); }
+    free(cdeps); free(clibs); free(cvis); free(cift);
     if (spv) w->xlib->freep(spv, spvLen);
     if (meta) w->xlib->freep(meta, metaLen);
     rdna4x_marker_remove(w->dir, w->sha);
@@ -794,10 +977,17 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         if (outVft) rdna4vft_refl_destroy(outVft);
     }
 
+    const BOOL wantStage3 = (lk && (lk->useStage3 || lk->intersectionFns.count > 0));
     const rdna4x_xlib *xl = NULL;
     rdna4x_translate_linked_libraries_fn translateFn = NULL;
+    rdna4x_translate_stage3_fn translateStage3Fn = NULL;
     NSError *xerr = nil;
-    if (!rdna4x_ensure_stage2_xlib(&xl, NULL, &translateFn, &xerr)) {
+    if (wantStage3) {
+        if (!rdna4x_ensure_stage3_xlib(&xl, &translateStage3Fn, &xerr)) {
+            rdna4x_translation_error(error, role, name, sha, RDNA4X_E_UNAVAILABLE, xerr.localizedDescription);
+            return NO;
+        }
+    } else if (!rdna4x_ensure_stage2_xlib(&xl, NULL, &translateFn, &xerr)) {
         rdna4x_translation_error(error, role, name, sha, RDNA4X_E_UNAVAILABLE, xerr.localizedDescription);
         return NO;
     }
@@ -805,12 +995,14 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     NSUInteger nd = lk ? lk->deps.count : 0;
     NSUInteger nl = lk ? lk->dynlibs.count : 0;
     NSUInteger nv = lk ? lk->visibleFns.count : 0;
+    NSUInteger ni = lk ? lk->intersectionFns.count : 0;
     rdna4x_stage2_in_t *inDeps = nd ? (rdna4x_stage2_in_t *)calloc(nd, sizeof *inDeps) : NULL;
     rdna4x_stage2_in_t *inLibs = nl ? (rdna4x_stage2_in_t *)calloc(nl, sizeof *inLibs) : NULL;
     rdna4x_stage2_in_t *inVis  = nv ? (rdna4x_stage2_in_t *)calloc(nv, sizeof *inVis)  : NULL;
-    if ((nd && !inDeps) || (nl && !inLibs) || (nv && !inVis)) {
-        free(inDeps); free(inLibs); free(inVis);
-        rdna4x_translation_error(error, role, name, sha, RDNA4X_E_IO, @"out of memory preparing Stage 2 linkage");
+    rdna4x_stage2_in_t *inIft  = ni ? (rdna4x_stage2_in_t *)calloc(ni, sizeof *inIft)  : NULL;
+    if ((nd && !inDeps) || (nl && !inLibs) || (nv && !inVis) || (ni && !inIft)) {
+        free(inDeps); free(inLibs); free(inVis); free(inIft);
+        rdna4x_translation_error(error, role, name, sha, RDNA4X_E_IO, @"out of memory preparing Stage 2/3 linkage");
         return NO;
     }
     for (NSUInteger i = 0; i < nd; i++) {
@@ -828,12 +1020,18 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         NSData *bc = d[@"bc"];
         inVis[i] = (rdna4x_stage2_in_t){ [d[@"name"] UTF8String], (const uint8_t *)bc.bytes, bc.length, RDNA4DL_PAYLOAD_AIR_BITCODE };
     }
+    for (NSUInteger i = 0; i < ni; i++) {
+        NSDictionary *d = lk->intersectionFns[i];
+        NSData *bc = d[@"bc"];
+        inIft[i] = (rdna4x_stage2_in_t){ [d[@"name"] UTF8String], (const uint8_t *)bc.bytes, bc.length, RDNA4DL_PAYLOAD_AIR_BITCODE };
+    }
 
     const uint64_t t0 = rdna4_now();
     rdna4x_stage2_work_t work;
     memset(&work, 0, sizeof work);
     work.xlib = xl;
     work.translateFn = translateFn;
+    work.translateStage3Fn = translateStage3Fn;
     work.dir = dir.fileSystemRepresentation;
     work.sha = sha.UTF8String;
     work.fname = name.UTF8String;
@@ -842,6 +1040,8 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     work.deps = inDeps; work.ndeps = nd;
     work.dynlibs = inLibs; work.ndynlibs = nl;
     work.vis = inVis; work.nvis = nv;
+    work.ift = inIft; work.nift = ni;
+    work.useStage3 = wantStage3 ? 1 : 0;
     work.caps = rdna4_query_caps();
     work.lowerArgs = RDNA4R.gpuArgumentTables ? 1 : 0;
 
@@ -852,21 +1052,21 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         work.err[0] = 0;
         work.dir = dir.fileSystemRepresentation;
         if (rdna4x_run_on_worker_stack(rdna4x_stage2_worker, &work) != 0) {
-            snprintf(work.err, sizeof work.err, "failed to spawn Stage 2 translation worker thread");
+            snprintf(work.err, sizeof work.err, "failed to spawn Stage 2/3 translation worker thread");
             rc = RDNA4X_E_IO;
             break;
         }
         rc = work.rc;
         if (rc != RDNA4X_E_IO || !rdna4x_dir_recheck()) break;
         dir = rdna4x_user_dir() ?: dir;
-        RDNA4LOG("inproc Stage 2 RETRY %s '%s' %s: cache directory rebuilt after: %s", role, name.UTF8String, sha.UTF8String, work.err);
+        RDNA4LOG("inproc Stage 2/3 RETRY %s '%s' %s: cache directory rebuilt after: %s", role, name.UTF8String, sha.UTF8String, work.err);
     }
-    free(inDeps); free(inLibs); free(inVis);
+    free(inDeps); free(inLibs); free(inVis); free(inIft);
 
     const double ms = (double)(rdna4_now() - t0) / 1e6;
     if (rc == RDNA4X_OK) {
-        RDNA4LOG("inproc Stage 2 OK %s '%s' %s: translated in %.0f ms (deps=%lu dynlibs=%lu visible=%lu)",
-                 role, name.UTF8String, sha.UTF8String, ms, (unsigned long)nd, (unsigned long)nl, (unsigned long)nv);
+        RDNA4LOG("inproc Stage %d OK %s '%s' %s: translated in %.0f ms (deps=%lu dynlibs=%lu visible=%lu intersection=%lu)",
+                 wantStage3 ? 3 : 2, role, name.UTF8String, sha.UTF8String, ms, (unsigned long)nd, (unsigned long)nl, (unsigned long)nv, (unsigned long)ni);
         BOOL okOut = YES;
         NSData *spvObj = nil;
         NSDictionary *metaDict = nil;
@@ -954,7 +1154,7 @@ static BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t dea
         rdna4x_translation_error(error, role, name, sha, RDNA4X_E_UNAVAILABLE, backendError.localizedDescription);
         return NO;
     }
-    if (lk && lk->useStage2 && (lk->requireStage2 || rdna4x_stage2_symbols_available())) {
+    if (lk && (lk->useStage2 || lk->useStage3) && (lk->requireStage2 || rdna4x_stage2_symbols_available())) {
         return rdna4x_translate_stage2_to_cache(dir, sha, name, role, bc, lk, NULL, NULL, NULL, error);
     }
     rdna4x_engine_prepare();
@@ -1041,30 +1241,129 @@ static BOOL rdna4x_collect_fn_list(NSArray *fns, NSMutableArray<NSDictionary *> 
     }
     return YES;
 }
-// Collects stage linkage: deps (all linked/binary/private), visibleFns (public functions/groups/binaryFunctions),
-// and dynlibs (preloadedLibraries + binaryFunctions for direct external linking).
-static BOOL rdna4x_stage2_link_collect(id linked, id preloaded,
+static BOOL rdna4x_is_intersection_fn(id f) {
+    if (!f || ![f respondsToSelector:@selector(functionType)]) return NO;
+    return ((NSUInteger (*)(id, SEL))objc_msgSend)(f, @selector(functionType)) ==
+           (NSUInteger)RDNA4RTR_MTL_FN_TYPE_INTERSECTION;
+}
+static int rdna4x_stage3_link_sha(
+    char out[65],
+    const char *entry_sha,
+    size_t ndeps, const char *const *dep_names, const char *const *dep_shas,
+    size_t ndynlibs, const char *const *dynlib_names, const char *const *dynlib_shas,
+    size_t nvis, const char *const *vis_names, const char *const *vis_shas,
+    size_t nift, const char *const *ift_names, const char *const *ift_shas)
+{
+    if (!out) return -1;
+    out[0] = '\0';
+    if (!rdna4dl_hex_sha_ok(entry_sha)) return -1;
+    if (ndeps > 4096u || ndynlibs > 4096u || nvis > 4096u || nift > 4096u) return -1;
+    if ((ndeps && (!dep_names || !dep_shas)) ||
+        (ndynlibs && (!dynlib_names || !dynlib_shas)) ||
+        (nvis && (!vis_names || !vis_shas)) ||
+        (nift && (!ift_names || !ift_shas)))
+        return -1;
+
+    size_t total = ndeps + ndynlibs + nvis + nift;
+    rdna4dl_key_item_t *items = (rdna4dl_key_item_t *)calloc(total ? total : 1u, sizeof *items);
+    if (!items) return -1;
+
+    size_t pos = 0;
+    for (size_t i = 0; i < ndeps; i++) {
+        if (!dep_names[i] || !dep_names[i][0] || !rdna4dl_hex_sha_ok(dep_shas[i])) { free(items); return -1; }
+        items[pos++] = (rdna4dl_key_item_t){ 1u, dep_names[i], dep_shas[i] };
+    }
+    for (size_t i = 0; i < ndynlibs; i++) {
+        if (!dynlib_names[i] || !dynlib_names[i][0] || !rdna4dl_hex_sha_ok(dynlib_shas[i])) { free(items); return -1; }
+        items[pos++] = (rdna4dl_key_item_t){ 2u, dynlib_names[i], dynlib_shas[i] };
+    }
+    for (size_t i = 0; i < nvis; i++) {
+        if (!vis_names[i] || !vis_names[i][0] || !rdna4dl_hex_sha_ok(vis_shas[i])) { free(items); return -1; }
+        items[pos++] = (rdna4dl_key_item_t){ 3u, vis_names[i], vis_shas[i] };
+    }
+    for (size_t i = 0; i < nift; i++) {
+        if (!ift_names[i] || !ift_names[i][0] || !rdna4dl_hex_sha_ok(ift_shas[i])) { free(items); return -1; }
+        items[pos++] = (rdna4dl_key_item_t){ 4u, ift_names[i], ift_shas[i] };
+    }
+    if (total > 1u) qsort(items, total, sizeof *items, rdna4dl_key_item_cmp);
+
+    rdna4dl_sha256_ctx ctx;
+    rdna4dl_sha256_init(&ctx);
+    static const char tag[] = "rdna4x-stage3-v1\n";
+    rdna4dl_sha256_update(&ctx, tag, sizeof tag - 1u);
+    rdna4dl_sha256_update(&ctx, entry_sha, 64u);
+    rdna4dl_sha256_update(&ctx, "\n", 1u);
+    for (size_t i = 0; i < total; i++) {
+        if (i > 0 && rdna4dl_key_item_cmp(&items[i], &items[i - 1u]) == 0) continue;
+        uint8_t sec = items[i].section;
+        rdna4dl_sha256_update(&ctx, &sec, 1u);
+        rdna4dl_sha256_update(&ctx, items[i].name, strlen(items[i].name));
+        rdna4dl_sha256_update(&ctx, "\0", 1u);
+        rdna4dl_sha256_update(&ctx, items[i].sha, 64u);
+        rdna4dl_sha256_update(&ctx, "\n", 1u);
+    }
+    free(items);
+
+    uint8_t digest[32];
+    rdna4dl_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32u; i++) {
+        out[i * 2u] = hex[digest[i] >> 4];
+        out[i * 2u + 1u] = hex[digest[i] & 0x0Fu];
+    }
+    out[64] = '\0';
+    return 0;
+}
+// Collects stage linkage: deps (non-intersection linked/binary/private), visibleFns (non-intersection public/groups/binary),
+// intersectionFns (MTLFunctionTypeIntersection functions for Stage 3 IFT), and dynlibs (preloadedLibraries + non-intersection binaryFunctions).
+static BOOL rdna4x_stage3_link_collect(id linked, id preloaded,
                                        NSArray<NSDictionary *> **depsOut,
                                        NSArray<NSDictionary *> **visibleOut,
+                                       NSArray<NSDictionary *> **intersectionOut,
                                        NSArray<NSDictionary *> **dynlibsOut,
                                        NSString **why) {
     NSMutableArray<id> *pubFns = [NSMutableArray array];
     NSMutableArray<id> *privFns = [NSMutableArray array];
     NSMutableArray<id> *binFns = [NSMutableArray array];
+    NSMutableArray<id> *iftRaw = [NSMutableArray array];
     {
         id v = rdna4x_prop(linked, "functions");
-        if ([v isKindOfClass:[NSArray class]]) [pubFns addObjectsFromArray:v];
+        if ([v isKindOfClass:[NSArray class]]) {
+            for (id fnObj in (NSArray *)v) {
+                if (rdna4x_is_intersection_fn(fnObj)) [iftRaw addObject:fnObj];
+                else [pubFns addObject:fnObj];
+            }
+        }
         v = rdna4x_prop(linked, "binaryFunctions");
-        if ([v isKindOfClass:[NSArray class]]) { [pubFns addObjectsFromArray:v]; [binFns addObjectsFromArray:v]; }
+        if ([v isKindOfClass:[NSArray class]]) {
+            for (id fnObj in (NSArray *)v) {
+                if (rdna4x_is_intersection_fn(fnObj)) [iftRaw addObject:fnObj];
+                else { [pubFns addObject:fnObj]; [binFns addObject:fnObj]; }
+            }
+        }
         v = rdna4x_prop(linked, "privateFunctions");
-        if ([v isKindOfClass:[NSArray class]]) [privFns addObjectsFromArray:v];
+        if ([v isKindOfClass:[NSArray class]]) {
+            for (id fnObj in (NSArray *)v) {
+                if (rdna4x_is_intersection_fn(fnObj)) [iftRaw addObject:fnObj];
+                else [privFns addObject:fnObj];
+            }
+        }
     }
     id gr = rdna4x_prop(linked, "groups");
     if ([gr isKindOfClass:[NSDictionary class]]) {
         for (id k in [(NSDictionary *)gr allKeys]) {
             id v = ((NSDictionary *)gr)[k];
-            if ([v isKindOfClass:[NSArray class]]) [pubFns addObjectsFromArray:v];
+            if ([v isKindOfClass:[NSArray class]]) {
+                for (id fnObj in (NSArray *)v) {
+                    if (rdna4x_is_intersection_fn(fnObj)) [iftRaw addObject:fnObj];
+                    else [pubFns addObject:fnObj];
+                }
+            }
         }
+    }
+    if (!intersectionOut && iftRaw.count > 0) {
+        if (why) *why = @"intersection functions are not permitted on this pipeline stage";
+        return NO;
     }
 
     NSMutableArray<NSDictionary *> *visArr = [NSMutableArray array];
@@ -1076,6 +1375,11 @@ static BOOL rdna4x_stage2_link_collect(id linked, id preloaded,
     NSMutableDictionary<NSString *, NSString *> *depByName = [visByName mutableCopy];
     NSUInteger depBytes = visBytes;
     if (!rdna4x_collect_fn_list(privFns, depArr, depByName, &depBytes, why)) return NO;
+
+    NSMutableArray<NSDictionary *> *iftArr = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSString *> *iftByName = [NSMutableDictionary dictionary];
+    NSUInteger iftBytes = 0;
+    if (!rdna4x_collect_fn_list(iftRaw, iftArr, iftByName, &iftBytes, why)) return NO;
 
     NSMutableArray<NSDictionary *> *libArr = [NSMutableArray array];
     NSMutableSet<NSString *> *seenMods = [NSMutableSet set];
@@ -1137,8 +1441,16 @@ static BOOL rdna4x_stage2_link_collect(id linked, id preloaded,
 
     if (depsOut) *depsOut = depArr;
     if (visibleOut) *visibleOut = visArr;
+    if (intersectionOut) *intersectionOut = iftArr;
     if (dynlibsOut) *dynlibsOut = libArr;
     return YES;
+}
+static BOOL rdna4x_stage2_link_collect(id linked, id preloaded,
+                                       NSArray<NSDictionary *> **depsOut,
+                                       NSArray<NSDictionary *> **visibleOut,
+                                       NSArray<NSDictionary *> **dynlibsOut,
+                                       NSString **why) {
+    return rdna4x_stage3_link_collect(linked, preloaded, depsOut, visibleOut, NULL, dynlibsOut, why);
 }
 static NSString *rdna4x_names(id arr, BOOL groups) {   // a short, bounded list of function names for the log
     NSMutableArray<NSString *> *n = [NSMutableArray array];
@@ -1162,12 +1474,12 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
                         (slot == 2 && rdna4x_bool_prop(desc, "supportAddingBinaryFunctions"));
     if (!(f || bf || pf || gg || pl || addBin)) return;
     NSString *why = nil; RDNA4LinkCtx *ctx = nil;
-    NSArray<NSDictionary *> *deps = nil, *visFns = nil, *dynlibs = nil;
+    NSArray<NSDictionary *> *deps = nil, *visFns = nil, *iftFns = nil, *dynlibs = nil;
     if (!rdna4x_active()) {
         why = @"this process does not translate in process";
-    } else if (!rdna4x_stage2_link_collect(linked, preloaded, &deps, &visFns, &dynlibs, &why)) {
+    } else if (!rdna4x_stage3_link_collect(linked, preloaded, &deps, &visFns, &iftFns, &dynlibs, &why)) {
         if (!why) why = @"invalid stage linkage";
-    } else if (!deps.count && !dynlibs.count && !visFns.count && !addBin) {
+    } else if (!deps.count && !dynlibs.count && !visFns.count && !iftFns.count && !addBin) {
         why = @"nothing to link";
     }
     if (!why && fn) {
@@ -1175,11 +1487,26 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
         NSString *esha = ebc.length ? rdna4_sha256hex(ebc) : nil;
         if (!esha) why = @"the entry function has no bitcodeData";
         else {
-            const BOOL useStage2 = (dynlibs.count > 0 || visFns.count > 0 || bf || pl || addBin);
+            const BOOL useStage3 = (iftFns.count > 0);
+            const BOOL useStage2 = (useStage3 || dynlibs.count > 0 || visFns.count > 0 || bf || pl || addBin);
             const BOOL requireStage2 = (dynlibs.count > 0 || visFns.count > 0 || deps.count > 0 || f || bf || pf || gg || pl || addBin);
             char key[65];
             int krc = -1;
-            if (useStage2) {
+            if (useStage3) {
+                const char *depN[RDNA4X_MAX_DEPS], *depS[RDNA4X_MAX_DEPS];
+                const char *libN[RDNA4X_MAX_DEPS], *libS[RDNA4X_MAX_DEPS];
+                const char *visN[RDNA4X_MAX_DEPS], *visS[RDNA4X_MAX_DEPS];
+                const char *iftN[RDNA4X_MAX_DEPS], *iftS[RDNA4X_MAX_DEPS];
+                for (NSUInteger i = 0; i < deps.count; i++) { depN[i] = [deps[i][@"name"] UTF8String]; depS[i] = [deps[i][@"sha"] UTF8String]; }
+                for (NSUInteger i = 0; i < dynlibs.count; i++) { libN[i] = [dynlibs[i][@"name"] UTF8String]; libS[i] = [dynlibs[i][@"sha"] UTF8String]; }
+                for (NSUInteger i = 0; i < visFns.count; i++) { visN[i] = [visFns[i][@"name"] UTF8String]; visS[i] = [visFns[i][@"sha"] UTF8String]; }
+                for (NSUInteger i = 0; i < iftFns.count; i++) { iftN[i] = [iftFns[i][@"name"] UTF8String]; iftS[i] = [iftFns[i][@"sha"] UTF8String]; }
+                krc = rdna4x_stage3_link_sha(key, esha.UTF8String,
+                                             deps.count, depN, depS,
+                                             dynlibs.count, libN, libS,
+                                             visFns.count, visN, visS,
+                                             iftFns.count, iftN, iftS);
+            } else if (useStage2) {
                 const char *depN[RDNA4X_MAX_DEPS], *depS[RDNA4X_MAX_DEPS];
                 const char *libN[RDNA4X_MAX_DEPS], *libS[RDNA4X_MAX_DEPS];
                 const char *visN[RDNA4X_MAX_DEPS], *visS[RDNA4X_MAX_DEPS];
@@ -1203,8 +1530,10 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
                 ctx->deps = deps;
                 ctx->dynlibs = dynlibs;
                 ctx->visibleFns = visFns;
+                ctx->intersectionFns = iftFns;
                 ctx->useStage2 = useStage2;
-                ctx->requireStage2 = requireStage2;
+                ctx->useStage3 = useStage3;
+                ctx->requireStage2 = requireStage2 || useStage3;
             }
         }
     }

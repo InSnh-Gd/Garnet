@@ -104,6 +104,7 @@ _Static_assert((int)RDNA4RTR_AS_KIND_INSTANCE == (int)RDNA4RT_KIND_TLAS,
 #endif
 
 // Exact C ABI match for third-party/metal2vulkan-rdna4/garnetxlate/garnetxlate.h Stage 3 export.
+#ifndef RDNA4X_STAGE3_FFI_DEFINED
 typedef struct {
     const uint8_t *symbol;
     size_t symbol_len;
@@ -153,6 +154,7 @@ __attribute__((unused)) static BOOL rdna4x_ensure_stage3_xlib(
     if (translateOut) *translateOut = fn;
     return fn != NULL;
 }
+#endif /* RDNA4X_STAGE3_FFI_DEFINED */
 
 __attribute__((unused)) static BOOL rdna4_rt_runtime_translator_stage3_ready(void) {
     if (!rdna4x_active()) return NO;

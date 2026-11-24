@@ -81,12 +81,15 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     if (![p isKindOfClass:[RDNA4ComputePipelineState class]]) { [_cb rdna4Fail:@"setComputePipelineState: not an RDNA4ComputePipelineState"]; return; }
     _pso = p; _roReflection = [_pso reflection];
     _st.scanPlan = [_pso scanPlan];
+    _st.rtAsRefl = [_pso rdna4RtAsRefl];
     [self rdna4OwnResource:p kind:RDNA4_RESOURCE_PIPELINE
                   fragment:NO index:0];
 }
 - (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
     if (i >= 31 || (b && ![b isKindOfClass:[RDNA4Buffer class]])) { [_cb rdna4Fail:@"compute setBuffer: bad index or class"]; return; }
     _st.buf[i].b = b; _st.buf[i].off = o;
+    _st.rt.as[i] = nil;
+    [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
     [self rdna4OwnResource:b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
 }
 - (void)setBuffer:(id)b offset:(NSUInteger)o attributeStride:(NSUInteger)stride atIndex:(NSUInteger)i {
@@ -120,6 +123,26 @@ RDNA4_DNR(RDNA4ComputeEncoder)
         return;
     }
     for (NSUInteger k = 0; k < r.length; k++) [self setVisibleFunctionTable:t[k] atBufferIndex:r.location + k];
+}
+- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i {
+    if ([_cb rdna4Error]) return;
+    if (!rdna4_rt_encoder_bind_accel(_cb, [_cb device], "compute", &_st.rt, accel, i)) return;
+    _st.buf[i] = (RDNA4BufSlot){ nil, 0 };
+    [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
+    [self rdna4OwnResource:accel kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
+}
+- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i {
+    if ([_cb rdna4Error]) return;
+    RDNA4Buffer *backing = nil;
+    if (!rdna4_rt_encoder_bind_ift(_cb, [_cb device], "compute", &_st.rt, t, i, &backing)) return;
+    [self setBuffer:backing offset:0 atIndex:i];
+}
+- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
+    if ([_cb rdna4Error]) return;
+    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "compute", &_st.rt, t, r,
+                                     ^(RDNA4Buffer *buf, NSUInteger idx) {
+                                         [self setBuffer:buf offset:0 atIndex:idx];
+                                     });
 }
 - (void)setTexture:(id)t atIndex:(NSUInteger)i {
     if (i >= 128 || (t && ![t isKindOfClass:[RDNA4Texture class]])) { [_cb rdna4Fail:@"compute setTexture: bad index or class"]; return; }
@@ -241,6 +264,7 @@ RDNA4_ENCODER_SHARED
       if (r) {
           _pso = r;
           _st.scanPlan = [_pso scanPlan];
+          _st.rtAsRefl = [_pso rdna4RtAsRefl];
           [self rdna4OwnResource:r kind:RDNA4_RESOURCE_PIPELINE
                         fragment:NO index:0];
           RDNA4LOGR("HOT-SWAP: compute encoder now uses the real pipeline %p", (__bridge void *)r);
@@ -303,11 +327,18 @@ RDNA4_ENCODER_SHARED
         NSMutableSet *icbRefs = [NSMutableSet set];
         NSMutableSet *icbPsoRefs = [NSMutableSet set];
         for (uint32_t i = 0; i < 31; i++) {
-            if (_st.buf[i].b) rdna4_argbuf_icb_snapshot(_st.buf[i].b, icbRefs, icbPsoRefs);
+            if (_st.buf[i].b) {
+                rdna4_argbuf_icb_snapshot(_st.buf[i].b, icbRefs, icbPsoRefs);
+                rdna4_rt_retain_argbuf_resources(_st.buf[i].b, _cb);
+            }
         }
         for (id res in _argumentResources) {
             if ([res isKindOfClass:[RDNA4Buffer class]])
                 rdna4_argbuf_icb_snapshot((RDNA4Buffer *)res, icbRefs, icbPsoRefs);
+        }
+        for (id res in argumentResources) {
+            if ([res isKindOfClass:[RDNA4Buffer class]])
+                rdna4_rt_retain_argbuf_resources((RDNA4Buffer *)res, _cb);
         }
         for (id pso in icbPsoRefs) {
             [_cb rdna4RetainEncoded:pso];
@@ -414,8 +445,10 @@ RDNA4_ENCODER_SHARED
     _roReflection = parentReflection;
     _st = parentState;
     [self rdna4OwnResource:_pso kind:RDNA4_RESOURCE_PIPELINE fragment:NO index:0];
-    for (NSUInteger i = 0; i < 31; ++i)
+    for (NSUInteger i = 0; i < 31; ++i) {
         [self rdna4OwnResource:_st.buf[i].b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
+        [self rdna4OwnResource:_st.rt.as[i] kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
+    }
     _threadgroupBytes = parentTgBytes;
     memcpy(_tgMemLengths, parentTgLengths, sizeof _tgMemLengths);
     _stageInRegion = parentStageIn;

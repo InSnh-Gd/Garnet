@@ -53,6 +53,8 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     uint32_t _nCompiledLocals;
     uint64_t _vftOwnerToken;
     rdna4vft_reflection_t _vft;
+    uint64_t _iftOwnerToken;
+    rdna4rtr_reflection_t _rt;
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err;
@@ -80,8 +82,10 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
 - (const uint32_t *)nominalLocal; - (int)mode; - (uint32_t)pcOffset; - (uint32_t)pcSize;
 - (id)reflection;
 - (void)rdna4SetReflection:(MTLComputePipelineReflection *)reflection;
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsRefl;
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function;
 - (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor;
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor;
 @end
 
 @implementation RDNA4ComputePipelineState
@@ -209,6 +213,9 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     _vftOwnerToken = rdna4_vft_next_owner_token();
     NSDictionary *vftMeta = (meta && meta[@"visible_function_tables"]) ? meta : preMeta;
     if (!rdna4x_parse_vft_from_meta(vftMeta, &_vft, err)) return nil;
+    _iftOwnerToken = rdna4_vft_next_owner_token();
+    NSDictionary *rtMeta = (meta && (meta[@"acceleration_structures"] || meta[@"intersection_function_tables"])) ? meta : preMeta;
+    if (!rdna4_rt_parse_meta(rtMeta, &_rt, err)) return nil;
     if (!meta || !meta[@"kernel_dispatch"] || ![meta[@"local_size"] isKindOfClass:[NSArray class]] || [meta[@"local_size"] count] != 3) {
         if (err) *err = rdna4_err(62, [NSString stringWithFormat:@"compute function '%@': spvcache has no .meta.json with kernel_dispatch/local_size (run add-air.py)", fname]); return nil; }
     id kd = meta[@"kernel_dispatch"];
@@ -482,6 +489,7 @@ static NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     }
     rdna4_argument_scan_reflection_plan_destroy(&_scan);
     rdna4vft_refl_destroy(&_vft);
+    rdna4rtr_refl_destroy(&_rt);
     free(_pb);
     uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);
 }
@@ -521,15 +529,24 @@ RDNA4_DNR(RDNA4ComputePipelineState)
 - (NSUInteger)staticThreadgroupMemoryLength { return 0; }
 - (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { (void)d; return 0; }
 - (BOOL)supportIndirectCommandBuffers { return _icb; }
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsRefl { return &_rt.as; }
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function {
     RDNA4ComputePipelineState *real = [self rdna4Real];
     if (real) return [real functionHandleWithFunction:function];
+    if (function && [function respondsToSelector:@selector(functionType)] &&
+        [function functionType] == MTLFunctionTypeIntersection)
+        return rdna4_rt_pipeline_function_handle(self, _dev, _iftOwnerToken, &_rt.ift, function, 0);
     return rdna4_vft_pipeline_handle(self, _dev, _vftOwnerToken, &_vft, function, 0);
 }
 - (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor {
     RDNA4ComputePipelineState *real = [self rdna4Real];
     if (real) return [real newVisibleFunctionTableWithDescriptor:descriptor];
     return rdna4_vft_pipeline_new_table(self, _dev, _vftOwnerToken, &_vft, descriptor, 0);
+}
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real newIntersectionFunctionTableWithDescriptor:descriptor];
+    return rdna4_rt_pipeline_new_ift(self, _dev, _iftOwnerToken, &_rt.ift, descriptor, 0);
 }
 - (uint64_t)uniqueIdentifier { return rdna4_resource_uid(&_uid); }
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130000
