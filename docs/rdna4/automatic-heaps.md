@@ -1,10 +1,11 @@
-# Automatic heaps
+# Automatic and placement heaps
 
 `newHeapWithDescriptor:` reserves capacity without opening RADV or allocating
-GPU memory. Automatic heaps support Private, Shared and Managed storage;
-placement, sparse and Memoryless heaps remain unsupported. Resource storage,
-cache and hazard modes must match the heap. The default hazard mode becomes
-Untracked, so applications must encode the required dependencies.
+GPU memory. Both `MTLHeapTypeAutomatic` and `MTLHeapTypePlacement` support
+Private, Shared and Managed storage; sparse and Memoryless heaps remain
+unsupported. Resource storage, cache and hazard modes must match the heap. The
+default hazard mode becomes Untracked, so applications must encode the required
+dependencies.
 
 Ask the device for each resource's `MTLSizeAndAlign` before choosing heap
 capacity. These queries open RADV, create a temporary unbound Vulkan resource,
@@ -54,10 +55,41 @@ staging path, including images in Shared/Managed heaps.
 | `device.currentAllocatedSize` | Counts each heap's reserved capacity once; heap resources do not add it again |
 
 Automatic resources report `heapOffset == 0`; this is not their internal Vulkan
-bind offset. Private probes used by tests distinguish actual backing bytes from
-reserved capacity. Purgeable state remains a tracked hint and does not discard
-resource contents. Texture views retain their root and expose its heap metadata;
-make the root aliasable when it is safe to retire its allocation.
+bind offset. Placement resources report the explicit `heapOffset` requested at
+creation (and texture views of a placed texture expose their root's
+`heapOffset`). Private probes used by tests distinguish actual backing bytes
+from reserved capacity. Purgeable state remains a tracked hint and does not
+discard resource contents. Texture views retain their root and expose its heap
+metadata; make the root aliasable when it is safe to retire its allocation.
+
+## Placement heaps (`MTLHeapTypePlacement`)
+
+Placement heaps accept `newBufferWithLength:options:offset:` and
+`newTextureWithDescriptor:offset:` (and return `nil` for the non-offset
+automatic selectors; automatic heaps continue to return `nil` for the offset
+selectors). Each placement heap allocates a single contiguous heap-sized
+`VkDeviceMemory` block on first use (retained for the heap's lifetime and freed
+on heap teardown) so resources bind directly at their requested byte offset:
+
+- Offsets must satisfy the alignment and `bufferImageGranularity` returned by
+  `heapBufferSizeAndAlignWithLength:options:` or
+  `heapTextureSizeAndAlignWithDescriptor:`, and `[offset, offset + extent)` must
+  fit within `heap.size` without overflow. Misaligned, out-of-bounds,
+  dedicated-required, or mismatched-option requests return `nil` without
+  mutating accounting.
+- Overlapping explicit offsets are permitted on placement heaps; applications
+  must synchronize GPU uses across aliased ranges with fences, events, or
+  command-buffer ordering. `doesAliasResource:` reflects actual backing-range
+  overlap.
+- `heap.usedSize` reports the merged union length of active (non-aliasable)
+  placed ranges (bounded by `heap.size`, never double-counting overlapping
+  aliases), and `maxAvailableSizeWithAlignment:` reports the largest aligned
+  uncovered gap bounded by device budget. Calling `makeAliasable` retires the
+  resource's accounting immediately while deferred lease cleanup waits for GPU
+  completion.
+- `device.currentAllocatedSize` counts a placement heap's reserved capacity
+  once at heap creation and releases it at heap teardown; placed resources do
+  not add to it again.
 
 ## Reuse and lifetime
 
@@ -102,7 +134,11 @@ backing policy on system Metal.
 `test-heap-execution.sh` additionally executes production resource constructors
 with simulated Vulkan boundaries: requirements2, dedicated allocations, memory
 types, failure rollback, pool-off retirement, views, host imports and quarantine.
-`test-heap-backing.c` checks allocation policy with host sanitizers. These checks
-do not establish target-RDNA4 GPU execution or physical large-memory capacity.
-Evidence is under `logs/rdna4-metal2/20261105-110230/heaps/`; real hardware
-acceptance remains in the final task group.
+`test-heap-backing.c` checks automatic allocation policy and
+`test-swizzle-placement.c` checks placement validation, overlap aliasing,
+interval accounting and source pins with host sanitizers.
+`test-metal3-placement-heap.m` is the live RX 9060 XT / `--reference`
+placement-heap GPU oracle (see `src/garnet-metal/TESTING.md`); these host
+checks do not establish target-RDNA4 GPU execution or physical large-memory
+capacity. Evidence is under `logs/rdna4-metal2/20261105-110230/heaps/`; real
+hardware acceptance remains in the final task group.

@@ -30,18 +30,20 @@ typedef struct {
     unsigned dedicated : 1;
     unsigned exclusive : 1;
     unsigned owned_host : 1;
+    unsigned placement : 1;
     void *mem, *map;
     rdna4hb_rng *rng;
     size_t nrng, crng;
 } rdna4hb_block;
 
 typedef struct {
-    uint64_t id, block, off, size, stamp;
+    uint64_t id, block, off, size, charge, stamp;
     void *owner;   // dedicated leases: retained Objective-C handle owner, released by the heap
     unsigned pending : 1;
     unsigned dedicated : 1;
     unsigned retired : 1;
     unsigned finalizing : 1;
+    unsigned placement : 1;
 } rdna4hb_lease;
 
 typedef struct {
@@ -103,6 +105,11 @@ static inline rdna4hb_lease *rdna4hb_find_lease(rdna4hb_heap *h, uint64_t id) {
     return NULL;
 }
 
+static inline const rdna4hb_lease *rdna4hb_find_lease_const(const rdna4hb_heap *h, uint64_t id) {
+    for (size_t i = 0; i < h->nlease; i++) if (h->lease[i].id == id) return &h->lease[i];
+    return NULL;
+}
+
 static inline int rdna4hb_block_has_lease(const rdna4hb_heap *h, uint64_t block_id) {
     for (size_t i = 0; i < h->nlease; i++) if (h->lease[i].block == block_id) return 1;
     return 0;
@@ -110,7 +117,7 @@ static inline int rdna4hb_block_has_lease(const rdna4hb_heap *h, uint64_t block_
 
 static inline int rdna4hb_has_reclaimable(const rdna4hb_heap *h) {
     for (size_t i = 0; i < h->nblk; i++)
-        if (!h->blk[i].nrng && !h->blk[i].handles && !rdna4hb_block_has_lease(h, h->blk[i].id)) return 1;
+        if (!h->blk[i].placement && !h->blk[i].nrng && !h->blk[i].handles && !rdna4hb_block_has_lease(h, h->blk[i].id)) return 1;
     return 0;
 }
 
@@ -213,7 +220,7 @@ static inline uint64_t rdna4hb_max_available(const rdna4hb_heap *h, uint64_t ali
     uint64_t best = 0;
     for (size_t i = 0; i < h->nblk; i++) {
         const rdna4hb_block *b = &h->blk[i];
-        if (b->dedicated || b->host_mapped != (host_mapped != 0)) continue;
+        if (b->placement || b->dedicated || b->host_mapped != (host_mapped != 0)) continue;
         if (b->exclusive && b->nrng) continue;
         uint64_t prev = 0;
         for (size_t r = 0; r <= b->nrng; r++) {
@@ -272,6 +279,7 @@ static inline int rdna4hb_alloc(rdna4hb_heap *h, uint64_t size, uint64_t alignme
 
     for (size_t i = 0; i < h->nblk; i++) {
         rdna4hb_block *b = &h->blk[i];
+        if (b->placement) continue;
         if (dedicated) {
             if (!b->dedicated || b->nrng) continue;
         } else if (b->dedicated) continue;
@@ -401,7 +409,7 @@ static inline int rdna4hb_take_reclaimable(rdna4hb_heap *h, rdna4hb_reclaim *out
     if (!h || !out) return 0;
     for (size_t i = 0; i < h->nblk; i++) {
         rdna4hb_block *b = &h->blk[i];
-        if (b->nrng || b->handles) continue;
+        if (b->placement || b->nrng || b->handles) continue;
         if (rdna4hb_block_has_lease(h, b->id)) continue;
         *out = (rdna4hb_reclaim){ b->id, b->size, b->mem, b->map, b->host_mapped, b->owned_host };
         free(b->rng);
@@ -427,6 +435,165 @@ static inline uint64_t rdna4hb_live_bytes(const rdna4hb_heap *h) {
     uint64_t n = 0;
     for (size_t i = 0; i < h->nlease; i++) if (!h->lease[i].retired) n += h->lease[i].size;
     return n;
+}
+
+// ---- Placement heap helpers (MTLHeapTypePlacement) ----
+
+static inline int rdna4hb_add_placement_block(rdna4hb_heap *h, uint64_t size, uint32_t memory_type,
+                                              int host_mapped, int owned_host, void *mem, void *map,
+                                              uint64_t *id) {
+    uint64_t bid = 0;
+    if (!rdna4hb_add_block(h, size, memory_type, host_mapped, 0, 0, owned_host, mem, map, &bid))
+        return 0;
+    rdna4hb_block *b = rdna4hb_find_block(h, bid);
+    if (b) b->placement = 1;
+    if (id) *id = bid;
+    return 1;
+}
+
+static inline int rdna4hb_lease_add_placement(rdna4hb_heap *h, rdna4hb_block *b, uint64_t off,
+                                              uint64_t extent, uint64_t charge, uint64_t *lease_id) {
+    if (h->ctr == UINT64_MAX) return 0;
+    if (h->nlease == h->clease) {
+        size_t cap = h->clease ? h->clease * 2 : 16;
+        if (cap < h->clease || cap > SIZE_MAX / sizeof *h->lease) return 0;
+        rdna4hb_lease *leases = (rdna4hb_lease *)realloc(h->lease, cap * sizeof *h->lease);
+        if (!leases) return 0;
+        h->lease = leases;
+        h->clease = cap;
+    }
+    uint64_t id = ++h->ctr;
+    if (!rdna4hb_range_insert(b, off, extent, id)) return 0;
+    h->lease[h->nlease++] = (rdna4hb_lease){
+        .id = id, .block = b->id, .off = off, .size = extent, .charge = charge, .placement = 1,
+    };
+    if (lease_id) *lease_id = id;
+    return 1;
+}
+
+// Validates explicit placement offset, alignment, granularity and bounds without mutating state.
+static inline int rdna4hb_place_check(uint64_t heap_size, uint64_t offset, uint64_t size,
+                                      uint64_t alignment, uint64_t granularity,
+                                      int requires_dedicated, uint64_t *extent_out) {
+    if (extent_out) *extent_out = 0;
+    if (!heap_size || !size || !alignment || requires_dedicated) return RDNA4HB_R_INVALID;
+    uint64_t gran = granularity ? granularity : 1;
+    if (gran & (gran - 1)) return RDNA4HB_R_INVALID;
+    if ((offset % alignment) != 0 || (offset % gran) != 0) return RDNA4HB_R_INVALID;
+    uint64_t extent = rdna4hb_alup(size, gran);
+    if (extent == UINT64_MAX || extent < size) return RDNA4HB_R_INVALID;
+    if (offset > heap_size || extent > heap_size - offset) return RDNA4HB_R_NO_SPACE;
+    if (extent_out) *extent_out = extent;
+    return RDNA4HB_R_OK;
+}
+
+// Places a resource at an explicit offset in a placement heap; overlapping ranges are allowed.
+static inline int rdna4hb_place(rdna4hb_heap *h, uint64_t offset, uint64_t size, uint64_t alignment,
+                                uint64_t granularity, uint32_t memory_type_bits, int need_host_map,
+                                int host_import, int requires_dedicated, rdna4hb_res *out) {
+    if (!out) return RDNA4HB_R_INVALID;
+    memset(out, 0, sizeof *out);
+    if (!h || !memory_type_bits) return RDNA4HB_R_INVALID;
+    uint64_t extent = 0;
+    int chk = rdna4hb_place_check(h->size, offset, size, alignment, granularity, requires_dedicated, &extent);
+    if (chk != RDNA4HB_R_OK) return chk;
+
+    for (size_t i = 0; i < h->nblk; i++) {
+        rdna4hb_block *b = &h->blk[i];
+        if (!b->placement || b->dedicated || b->size < h->size) continue;
+        if (need_host_map && !b->host_mapped) continue;
+        if (host_import ? !b->owned_host : b->owned_host) continue;
+        if (!(memory_type_bits & (1u << b->memory_type))) continue;
+        if (!rdna4hb_lease_add_placement(h, b, offset, extent, size, &out->lease))
+            return RDNA4HB_R_NO_SPACE;
+        out->block = b->id;
+        out->offset = offset;
+        out->block_size = b->size;
+        out->range_size = extent;
+        return RDNA4HB_R_OK;
+    }
+
+    uint64_t remaining = h->backing < h->size ? h->size - h->backing : 0;
+    if (remaining < h->size) return RDNA4HB_R_NO_SPACE;
+    out->block_size = h->size;
+    out->offset = offset;
+    out->range_size = extent;
+    return RDNA4HB_R_NEED_BLOCK;
+}
+
+// Union length of active (non-aliasable) placed ranges; bounded in [0, h->size] even under aliasing.
+static inline uint64_t rdna4hb_placement_used(const rdna4hb_heap *h) {
+    if (!h) return 0;
+    uint64_t total = 0;
+    for (size_t bi = 0; bi < h->nblk; bi++) {
+        const rdna4hb_block *b = &h->blk[bi];
+        if (!b->placement) continue;
+        uint64_t cur_start = 0, cur_end = 0;
+        int have = 0;
+        for (size_t r = 0; r < b->nrng; r++) {
+            const rdna4hb_lease *l = rdna4hb_find_lease_const(h, b->rng[r].lease);
+            if (!l || l->pending || l->retired || !l->charge) continue;
+            uint64_t s = l->off;
+            uint64_t e = l->charge > h->size - s ? h->size : s + l->charge;
+            if (!have) {
+                cur_start = s; cur_end = e; have = 1;
+            } else if (s <= cur_end) {
+                if (e > cur_end) cur_end = e;
+            } else {
+                total += cur_end - cur_start;
+                cur_start = s; cur_end = e;
+            }
+        }
+        if (have) total += cur_end - cur_start;
+    }
+    return total > h->size ? h->size : total;
+}
+
+// Largest aligned contiguous gap not covered by active (non-aliasable) placement extents.
+static inline uint64_t rdna4hb_placement_max_available(const rdna4hb_heap *h, uint64_t alignment,
+                                                       uint64_t granularity) {
+    if (!h || !h->size || !alignment || alignment > (UINT64_C(1) << 63)) return 0;
+    uint64_t gran = granularity ? granularity : 1;
+    if (gran & (gran - 1)) return 0;
+    if (alignment & (alignment - 1)) {
+        uint64_t p = 1;
+        while (p < alignment) p <<= 1;
+        alignment = p;
+    }
+    uint64_t align = alignment > gran ? alignment : gran;
+    const rdna4hb_block *pb = NULL;
+    for (size_t bi = 0; bi < h->nblk; bi++)
+        if (h->blk[bi].placement) { pb = &h->blk[bi]; break; }
+    if (!pb) {
+        uint64_t avail = h->size;
+        avail -= avail % gran;
+        return avail;
+    }
+    uint64_t best = 0, prev = 0;
+    for (size_t r = 0; r < pb->nrng; r++) {
+        const rdna4hb_lease *l = rdna4hb_find_lease_const(h, pb->rng[r].lease);
+        if (!l || l->pending || l->retired) continue;
+        uint64_t s = pb->rng[r].off;
+        uint64_t e = pb->rng[r].size > pb->size - s ? pb->size : s + pb->rng[r].size;
+        if (s > prev) {
+            uint64_t at = rdna4hb_alup(prev, align);
+            if (at != UINT64_MAX && at <= s) {
+                uint64_t avail = s - at;
+                avail -= avail % gran;
+                if (avail > best) best = avail;
+            }
+        }
+        if (e > prev) prev = e;
+    }
+    if (pb->size > prev) {
+        uint64_t at = rdna4hb_alup(prev, align);
+        if (at != UINT64_MAX && at <= pb->size) {
+            uint64_t avail = pb->size - at;
+            avail -= avail % gran;
+            if (avail > best) best = avail;
+        }
+    }
+    return best;
 }
 
 #endif

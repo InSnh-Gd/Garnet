@@ -2,13 +2,14 @@
 // m11 H1: MTLHeap (automatic heaps). SkyLight's MetalCompositor sends -[MTLDevice newHeapWithDescriptor:] through MPSSupportsMTLDevice -> MPSDevice::MPSDevice
 // (MPSCore 0x7ff810821b40: setSize: / setStorageMode: / setCpuCacheMode: / setResourceOptions: / setProtectionOptions: / newHeapWithDescriptor:, then
 // -setPurgeableState:3 and -size on the heap; CONFIRMED against the carved MPSCore and the WindowServer crash report of an earlier run).
-// Design: the heap has a first-fit logical allocator and owns physical backing
-// blocks allocated on demand. Every buffer/texture is still an ordinary
-// RDNA4Buffer / RDNA4Texture, bound at its real VkMemoryRequirements within a
-// compatible block. -heapOffset is the logical offset; release or -makeAliasable
-// frees that logical range and fence-gates physical reuse. Placement heaps are
-// refused. The heap's size is added to currentAllocatedSize at creation and its
-// resources are not counted again.
+// Design: automatic heaps use a first-fit logical allocator and on-demand
+// physical backing blocks; placement heaps (MTLHeapTypePlacement) bind
+// resources directly at caller-specified offsets inside a contiguous
+// heap-sized physical block, allowing explicit-offset aliasing. Every
+// buffer/texture is still an ordinary RDNA4Buffer / RDNA4Texture, validated
+// against its real VkMemoryRequirements and bufferImageGranularity. The heap's
+// size is added to currentAllocatedSize at creation and its resources are not
+// counted again.
 // Values below were measured on an Apple-silicon Mac first (mtlprobe heap): size rounds up to 16 KiB; usedSize = sum of the requested sizes (not rounded);
 // maxAvailableSizeWithAlignment = largest free gap after aligning its start; automatic heaps return nil for the offset variants; hazardTrackingMode
 // Default becomes Untracked; resourceOptions = storage << 4 | cpuCache | hazard << 8; setPurgeableState: returns the previous state (initially NonVolatile).
@@ -37,14 +38,14 @@ static uint64_t rdna4_heap_completed_serial(void) {
     return serial;
 }
 @implementation RDNA4Heap {
-    id _dev; NSString *_lbl; NSUInteger _size, _purge; unsigned _st, _cc, _hz; RDNA4HeapAlloc _ha; rdna4hb_heap _hb;
+    id _dev; NSString *_lbl; NSUInteger _size, _purge; MTLHeapType _type; unsigned _st, _cc, _hz; RDNA4HeapAlloc _ha; rdna4hb_heap _hb;
     NSHashTable *_members;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLHeapDescriptor *)d {
     self = [super init]; if (!self) return nil;
     NSUInteger sz = d.size; unsigned st = (unsigned)d.storageMode, cc = (unsigned)d.cpuCacheMode, hz = (unsigned)d.hazardTrackingMode;
     #define HFAIL(...) do { RDNA4LOG("newHeapWithDescriptor: NIL: " __VA_ARGS__); return nil; } while (0)
-    if (d.type != MTLHeapTypeAutomatic) HFAIL("heap type %lu: only automatic heaps are supported (no placement)", (unsigned long)d.type);
+    if (d.type != MTLHeapTypeAutomatic && d.type != MTLHeapTypePlacement) HFAIL("heap type %lu: only automatic and placement heaps are supported", (unsigned long)d.type);
     if (!sz) HFAIL("size 0");
     if (st > 2) HFAIL("storage mode %u (Memoryless) not supported", st);
     if (hz > 2) HFAIL("hazard tracking mode %u", hz);
@@ -53,10 +54,10 @@ static uint64_t rdna4_heap_completed_serial(void) {
     if (!sz) HFAIL("size %lu exceeds the rounded Vulkan heap budget %llu", (unsigned long)d.size, (unsigned long long)caps.allocation_budget);
     if (!rdna4_heap_reserve_capacity(sz, caps.allocation_budget)) HFAIL("size %lu exceeds the capacity not already promised to live heaps (budget %llu)", (unsigned long)sz, (unsigned long long)caps.allocation_budget);
     #undef HFAIL
-    _dev = dev; _size = sz; _st = st; _cc = cc; _hz = hz ? hz : 1; _purge = 2; rdna4ha_init(&_ha, sz); rdna4hb_init(&_hb, sz, RDNA4HB_MAX_NORMAL);
+    _dev = dev; _size = sz; _type = d.type; _st = st; _cc = cc; _hz = hz ? hz : 1; _purge = 2; rdna4ha_init(&_ha, sz); rdna4hb_init(&_hb, sz, RDNA4HB_MAX_NORMAL);
     _members = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
     atomic_fetch_add(&rdna4_alloc_total, (uint64_t)_size);
-    RDNA4LOG("RDNA4Heap %p: %lu bytes storage %u cache %u hazard %u (reserved capacity; VkDeviceMemory created on demand)", (__bridge void *)self, (unsigned long)_size, _st, _cc, _hz);
+    RDNA4LOG("RDNA4Heap %p: %lu bytes type %lu storage %u cache %u hazard %u (reserved capacity; VkDeviceMemory created on demand)", (__bridge void *)self, (unsigned long)_size, (unsigned long)_type, _st, _cc, _hz);
     return self;
 }
 - (void)dealloc {
@@ -292,6 +293,147 @@ static uint64_t rdna4_heap_completed_serial(void) {
         return NO;
     }
 }
+- (BOOL)rdna4AcquirePlacementBackingForBuffer:(VkBuffer)buffer image:(VkImage)image requirements:(VkMemoryRequirements)mr
+                                       offset:(NSUInteger)placeOffset hostImport:(BOOL)hostImport
+                            requiresDedicated:(BOOL)requiresDedicated
+                                          mem:(VkDeviceMemory *)mem offset:(uint64_t *)offset map:(uint8_t **)map
+                                        block:(uint64_t *)block lease:(uint64_t *)lease rangeSize:(uint64_t *)rangeSize
+                                        error:(NSError **)err {
+    if (!mem || !offset || !map || !block || !lease || !rangeSize || (!buffer && !image) || (buffer && image) || !mr.size ||
+        (hostImport && !buffer) || _type != MTLHeapTypePlacement) {
+        if (err) *err = rdna4_err(22, @"invalid placement heap backing request");
+        return NO;
+    }
+    @synchronized (self) {
+        [self rdna4CollectLocked];
+        const BOOL needHostMap = buffer && _st < 2;
+        uint64_t granularity = RDNA4R.lim.bufferImageGranularity ? RDNA4R.lim.bufferImageGranularity : 1;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            rdna4hb_res res = {0};
+            int action = rdna4hb_place(&_hb, (uint64_t)placeOffset, mr.size, mr.alignment, granularity,
+                                       mr.memoryTypeBits, needHostMap ? 1 : 0, hostImport ? 1 : 0,
+                                       requiresDedicated ? 1 : 0, &res);
+            if (action == RDNA4HB_R_OK) {
+                rdna4hb_block *found = rdna4hb_find_block(&_hb, res.block);
+                if (!found || (needHostMap && !found->host_mapped) || (hostImport ? !found->owned_host : found->owned_host)) {
+                    rdna4hb_release(&_hb, res.lease, 0);
+                    rdna4hb_reap(&_hb, 0);
+                    if (err) *err = rdna4_err(22, @"placement heap backing class mismatch");
+                    return NO;
+                }
+                *mem = (VkDeviceMemory)found->mem;
+                *map = needHostMap ? (uint8_t *)found->map : NULL;
+                *offset = res.offset;
+                *block = res.block;
+                *lease = res.lease;
+                *rangeSize = res.range_size;
+                return YES;
+            }
+            if (action != RDNA4HB_R_NEED_BLOCK) {
+                if (err) *err = rdna4_err(22, action == RDNA4HB_R_INVALID
+                    ? [NSString stringWithFormat:@"placement offset %lu violates alignment %llu / granularity %llu or dedicated requirements",
+                       (unsigned long)placeOffset, (unsigned long long)mr.alignment, (unsigned long long)granularity]
+                    : [NSString stringWithFormat:@"placement range [%lu, +%llu) exceeds heap size %llu or incompatible backing",
+                       (unsigned long)placeOffset, (unsigned long long)mr.size, (unsigned long long)_hb.size]);
+                return NO;
+            }
+
+            uint64_t blockSize = res.block_size;
+            VkDeviceMemory newMemory = VK_NULL_HANDLE;
+            uint8_t *newMap = NULL;
+            void *ownedHost = NULL;
+            uint64_t allocationSize = blockSize;
+            uint32_t memoryType = 0;
+            int fallbackMt = -1;
+            BOOL blockHostMapped = NO;
+            VkMemoryHostPointerPropertiesEXT hostProps = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+            if (hostImport) {
+                uint64_t hostSpan = 0;
+                ownedHost = rdna4nc_owned_allocate(blockSize, RDNA4R.hostAlign, &hostSpan);
+                if (!ownedHost || !hostSpan || hostSpan > _hb.size - _hb.backing) {
+                    if (ownedHost && hostSpan) (void)munmap(ownedHost, (size_t)hostSpan);
+                    if (err) *err = rdna4_err(22, @"cannot reserve owned CPU memory for placement heap backing");
+                    return NO;
+                }
+                allocationSize = hostSpan;
+                VkResult hr = rdna4_vkGetMHPP(RDNA4R.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ownedHost, &hostProps);
+                int mt = hr == VK_SUCCESS && hostProps.memoryTypeBits
+                    ? rdna4_find_mem(hostProps.memoryTypeBits & mr.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : -1;
+                if (mt < 0) {
+                    (void)munmap(ownedHost, (size_t)hostSpan);
+                    if (err) *err = rdna4_err(22, @"host import has no coherent memory type for placement heap");
+                    return NO;
+                }
+                memoryType = (uint32_t)mt;
+                newMap = ownedHost;
+                blockHostMapped = YES;
+            } else if (_st < 2) {
+                int mt = rdna4_find_mem(mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                int hostMt = rdna4_find_mem(mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (mt >= 0 && hostMt >= 0 && hostMt != mt) fallbackMt = hostMt;
+                if (mt < 0) mt = hostMt;
+                blockHostMapped = mt >= 0;
+                if (mt < 0 && !needHostMap) mt = rdna4_find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (mt < 0) {
+                    if (err) *err = rdna4_err(22, @"no compatible host-visible or device-local memory type for placement heap");
+                    return NO;
+                }
+                memoryType = (uint32_t)mt;
+            } else {
+                int mt = rdna4_find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (mt < 0) {
+                    if (err) *err = rdna4_err(22, @"no device-local memory type for placement heap");
+                    return NO;
+                }
+                memoryType = (uint32_t)mt;
+            }
+
+            VkImportMemoryHostPointerInfoEXT importInfo = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = ownedHost };
+            VkMemoryAllocateFlagsInfo flags = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                .pNext = hostImport ? &importInfo : NULL,
+                .flags = RDNA4R.bufferAddress ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT : 0 };
+            VkMemoryAllocateInfo allocation = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &flags,
+                .allocationSize = allocationSize, .memoryTypeIndex = memoryType };
+            VkResult vr = vkAllocateMemory(RDNA4R.dev, &allocation, NULL, &newMemory);
+            if (vr != VK_SUCCESS && fallbackMt >= 0) {
+                memoryType = (uint32_t)fallbackMt;
+                allocation.memoryTypeIndex = memoryType;
+                vr = vkAllocateMemory(RDNA4R.dev, &allocation, NULL, &newMemory);
+            }
+            if (vr != VK_SUCCESS) {
+                if (ownedHost) (void)munmap(ownedHost, (size_t)allocationSize);
+                if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"vkAllocateMemory(placement heap %llu) = %d",
+                                               (unsigned long long)allocationSize, vr]);
+                return NO;
+            }
+            if (blockHostMapped && !hostImport) {
+                vr = vkMapMemory(RDNA4R.dev, newMemory, 0, VK_WHOLE_SIZE, 0, (void **)&newMap);
+                if (vr != VK_SUCCESS) {
+                    vkFreeMemory(RDNA4R.dev, newMemory, NULL);
+                    if (err) *err = rdna4_err(24, [NSString stringWithFormat:@"vkMapMemory(placement heap) = %d", vr]);
+                    return NO;
+                }
+            }
+            uint64_t newBlock = 0;
+            if (!rdna4hb_add_placement_block(&_hb, allocationSize, memoryType, blockHostMapped ? 1 : 0,
+                                             hostImport ? 1 : 0, newMemory, newMap, &newBlock)) {
+                if (blockHostMapped && !hostImport) vkUnmapMemory(RDNA4R.dev, newMemory);
+                vkFreeMemory(RDNA4R.dev, newMemory, NULL);
+                if (ownedHost) (void)munmap(ownedHost, (size_t)allocationSize);
+                if (err) *err = rdna4_err(22, @"placement heap metadata rejected the Vulkan allocation");
+                return NO;
+            }
+            if (hostImport) @synchronized ([GarnetDevice class]) { RDNA4R.impTotal += allocationSize; }
+        }
+        if (err) *err = rdna4_err(22, @"placement heap backing allocator did not converge");
+        return NO;
+    }
+}
 - (BOOL)rdna4BindSucceeded:(uint64_t)block lease:(uint64_t)lease owner:(id)owner {
     @synchronized (self) {
         if (!rdna4hb_handle_open(&_hb, block)) {
@@ -361,7 +503,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (void)rdna4RetireResource:(id)resource logical:(uint64_t)bid lease:(uint64_t)lease {
     (void)resource;
     @synchronized (self) {
-        rdna4ha_free(&_ha, bid);
+        if (bid) rdna4ha_free(&_ha, bid);
         if (lease) rdna4hb_release(&_hb, lease, rdna4_heap_release_serial());
         [self rdna4CollectLocked];
     }
@@ -396,6 +538,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
     return YES;
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o {
+    if (_type != MTLHeapTypeAutomatic) { RDNA4_ONCE("heap newBufferWithLength:options: on a placement heap: nil (use offset:)"); return nil; }
     if (!len || len > _size || ![self rdna4OptionsOK:o what:"newBufferWithLength:options:"]) { if (!len || len > _size) RDNA4LOG("heap newBufferWithLength: NIL: length %lu (heap %lu)", (unsigned long)len, (unsigned long)_size); return nil; }
     NSError *e = nil; NSUInteger ro = ((NSUInteger)_st << 4) | _cc | ((NSUInteger)_hz << 8);
     RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:_dev length:len options:ro heap:self error:&e];
@@ -404,7 +547,8 @@ static uint64_t rdna4_heap_completed_serial(void) {
     return b;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)td {
-    if (![self rdna4OptionsOK:((NSUInteger)td.storageMode << 4) | (NSUInteger)td.cpuCacheMode | ((NSUInteger)td.hazardTrackingMode << 8) what:"newTextureWithDescriptor:"]) return nil;
+    if (_type != MTLHeapTypeAutomatic) { RDNA4_ONCE("heap newTextureWithDescriptor: on a placement heap: nil (use offset:)"); return nil; }
+    if (!td || ![self rdna4OptionsOK:((NSUInteger)td.storageMode << 4) | (NSUInteger)td.cpuCacheMode | ((NSUInteger)td.hazardTrackingMode << 8) what:"newTextureWithDescriptor:"]) return nil;
     MTLTextureDescriptor *c = [td copy]; c.hazardTrackingMode = (MTLHazardTrackingMode)_hz;
     NSError *e = nil; RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:_dev descriptor:c heap:self
                                                                              error:&e];
@@ -412,11 +556,33 @@ static uint64_t rdna4_heap_completed_serial(void) {
     [self rdna4TrackResource:t];
     return t;
 }
-// offset (placement) variants: an Apple-silicon Mac returns nil for them on an automatic heap
-- (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o offset:(NSUInteger)off { (void)l; (void)o; (void)off; RDNA4_ONCE("heap newBufferWithLength:options:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
-- (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o atOffset:(NSUInteger)off { (void)l; (void)o; (void)off; RDNA4_ONCE("heap newBufferWithLength:options:atOffset: on an automatic heap: nil"); return nil; }
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off { (void)d; (void)off; RDNA4_ONCE("heap newTextureWithDescriptor:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d atOffset:(NSUInteger)off { (void)d; (void)off; RDNA4_ONCE("heap newTextureWithDescriptor:atOffset: on an automatic heap: nil"); return nil; }
+// offset (placement) variants: valid only on MTLHeapTypePlacement; nil on MTLHeapTypeAutomatic.
+- (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o offset:(NSUInteger)off {
+    if (_type != MTLHeapTypePlacement) { RDNA4_ONCE("heap newBufferWithLength:options:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
+    if (!l || off >= _size || l > _size - off || ![self rdna4OptionsOK:o what:"newBufferWithLength:options:offset:"]) {
+        if (!l || off >= _size || l > _size - off) RDNA4LOG("placement heap newBuffer: NIL: length %lu offset %lu (heap %lu)", (unsigned long)l, (unsigned long)off, (unsigned long)_size);
+        return nil;
+    }
+    NSError *e = nil; NSUInteger ro = ((NSUInteger)_st << 4) | _cc | ((NSUInteger)_hz << 8);
+    RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:_dev length:l options:ro heap:self offset:off error:&e];
+    if (!b) { RDNA4LOG("placement heap newBuffer: failed: %s", e.localizedDescription.UTF8String); return nil; }
+    [self rdna4TrackResource:b];
+    return b;
+}
+- (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o atOffset:(NSUInteger)off { return [self newBufferWithLength:l options:o offset:off]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off {
+    if (_type != MTLHeapTypePlacement) { RDNA4_ONCE("heap newTextureWithDescriptor:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
+    if (!d || off >= _size || ![self rdna4OptionsOK:((NSUInteger)d.storageMode << 4) | (NSUInteger)d.cpuCacheMode | ((NSUInteger)d.hazardTrackingMode << 8) what:"newTextureWithDescriptor:offset:"]) {
+        if (!d || off >= _size) RDNA4LOG("placement heap newTexture: NIL: offset %lu (heap %lu)", (unsigned long)off, (unsigned long)_size);
+        return nil;
+    }
+    MTLTextureDescriptor *c = [d copy]; c.hazardTrackingMode = (MTLHazardTrackingMode)_hz;
+    NSError *e = nil; RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:_dev descriptor:c heap:self offset:off error:&e];
+    if (!t) { RDNA4LOG("placement heap newTexture NIL: pf %lu %lux%lu offset %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)off, e.localizedDescription.UTF8String); return nil; }
+    [self rdna4TrackResource:t];
+    return t;
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d atOffset:(NSUInteger)off { return [self newTextureWithDescriptor:d offset:off]; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)al {
     @synchronized (self) {
         // Query correctness is part of the allocation contract: retire cleared
@@ -425,6 +591,11 @@ static uint64_t rdna4_heap_completed_serial(void) {
         [self rdna4CollectLocked];
         rdna4dc_caps caps = rdna4_device_caps();
         uint64_t granularity = RDNA4R.lim.bufferImageGranularity ? RDNA4R.lim.bufferImageGranularity : 1;
+        if (_type == MTLHeapTypePlacement) {
+            uint64_t avail = rdna4hb_placement_max_available(&_hb, al, granularity);
+            uint64_t budget = rdna4dc_heap_available(&caps, rdna4hb_placement_used(&_hb));
+            return (NSUInteger)rdna4dc_min(avail, budget);
+        }
         uint64_t logical = rdna4ha_maxavail(&_ha, al);
         uint64_t budget = rdna4dc_heap_available(&caps, _ha.used);
         // A Shared/Managed heap has two backing classes: host-mapped buffers and
@@ -444,7 +615,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
 - (NSUInteger)size { return _size; }
-- (NSUInteger)usedSize { @synchronized (self) { return (NSUInteger)_ha.used; } }
+- (NSUInteger)usedSize { @synchronized (self) { return _type == MTLHeapTypePlacement ? (NSUInteger)rdna4hb_placement_used(&_hb) : (NSUInteger)_ha.used; } }
 - (NSUInteger)currentAllocatedSize { return _size; }
 - (NSUInteger)allocatedSize { return _size; }
 - (MTLStorageMode)storageMode { return (MTLStorageMode)_st; }
@@ -452,11 +623,11 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (MTLHazardTrackingMode)hazardTrackingMode { return (MTLHazardTrackingMode)_hz; }
 - (NSUInteger)resourceOptions { return ((NSUInteger)_st << 4) | _cc | ((NSUInteger)_hz << 8); }
 - (NSUInteger)unfilteredResourceOptions { return [self resourceOptions]; }
-- (MTLHeapType)type { return MTLHeapTypeAutomatic; }
+- (MTLHeapType)type { return _type; }
 - (NSUInteger)protectionOptions { return 0; }
 - (uint64_t)gpuAddress { RDNA4_ONCE("heap gpuAddress: no GPU virtual address is exported; 0"); return 0; }
 - (uint64_t)memoryPoolId { return 0; }
 // -[_MTLHeap description] calls -formattedDescription: (found on an Apple-silicon Mac: it sends -usedSize and more); a plain string here, NOT [self description] (recursion)
-- (NSString *)formattedDescription:(NSUInteger)indent { (void)indent; return [NSString stringWithFormat:@"<RDNA4Heap: %p> size %lu used %lu storage %u cache %u hazard %u label %@", (__bridge void *)self, (unsigned long)_size, (unsigned long)[self usedSize], _st, _cc, _hz, _lbl]; }
+- (NSString *)formattedDescription:(NSUInteger)indent { (void)indent; return [NSString stringWithFormat:@"<RDNA4Heap: %p> size %lu used %lu type %lu storage %u cache %u hazard %u label %@", (__bridge void *)self, (unsigned long)_size, (unsigned long)[self usedSize], (unsigned long)_type, _st, _cc, _hz, _lbl]; }
 @end
 

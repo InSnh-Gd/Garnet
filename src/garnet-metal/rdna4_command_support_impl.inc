@@ -1,3 +1,111 @@
+// Pure-C texture swizzle helpers (shared by GarnetDevice.m and host C unit tests).
+#ifndef RDNA4_SWIZZLE_PURE_H
+#define RDNA4_SWIZZLE_PURE_H
+#include <stddef.h>
+#include <stdint.h>
+
+enum {
+    RDNA4SWZ_ZERO  = 0,
+    RDNA4SWZ_ONE   = 1,
+    RDNA4SWZ_RED   = 2,
+    RDNA4SWZ_GREEN = 3,
+    RDNA4SWZ_BLUE  = 4,
+    RDNA4SWZ_ALPHA = 5,
+};
+enum {
+    RDNA4VKSWZ_IDENTITY = 0,
+    RDNA4VKSWZ_ZERO     = 1,
+    RDNA4VKSWZ_ONE      = 2,
+    RDNA4VKSWZ_R        = 3,
+    RDNA4VKSWZ_G        = 4,
+    RDNA4VKSWZ_B        = 5,
+    RDNA4VKSWZ_A        = 6,
+};
+enum {
+    RDNA4SWZ_USE_READ  = 1u,
+    RDNA4SWZ_USE_WRITE = 2u,
+    RDNA4SWZ_USE_RT    = 4u,
+    RDNA4SWZ_USE_PFV   = 16u,
+};
+#define RDNA4SWZ_FMT_A8    1u
+#define RDNA4SWZ_FMT_TEXEL 4u
+
+typedef struct { uint8_t r, g, b, a; } rdna4swz_t;
+typedef struct { uint32_t r, g, b, a; } rdna4swz_vk_t;
+
+static inline rdna4swz_t rdna4swz_identity(void) {
+    return (rdna4swz_t){ RDNA4SWZ_RED, RDNA4SWZ_GREEN, RDNA4SWZ_BLUE, RDNA4SWZ_ALPHA };
+}
+static inline int rdna4swz_valid(rdna4swz_t s) {
+    return s.r <= RDNA4SWZ_ALPHA && s.g <= RDNA4SWZ_ALPHA &&
+           s.b <= RDNA4SWZ_ALPHA && s.a <= RDNA4SWZ_ALPHA;
+}
+static inline int rdna4swz_is_identity(rdna4swz_t s) {
+    return s.r == RDNA4SWZ_RED && s.g == RDNA4SWZ_GREEN &&
+           s.b == RDNA4SWZ_BLUE && s.a == RDNA4SWZ_ALPHA;
+}
+static inline int rdna4swz_compose(rdna4swz_t parent, rdna4swz_t view, rdna4swz_t *out) {
+    if (!out || !rdna4swz_valid(parent) || !rdna4swz_valid(view)) return 0;
+    const uint8_t p[4] = { parent.r, parent.g, parent.b, parent.a };
+    const uint8_t v[4] = { view.r, view.g, view.b, view.a };
+    uint8_t r[4];
+    for (int i = 0; i < 4; i++)
+        r[i] = v[i] >= RDNA4SWZ_RED ? p[v[i] - RDNA4SWZ_RED] : v[i];
+    *out = (rdna4swz_t){ r[0], r[1], r[2], r[3] };
+    return 1;
+}
+static inline int rdna4swz_to_vk(uint32_t fmt_flags, rdna4swz_t swz, rdna4swz_vk_t *out) {
+    static const uint32_t base[6] = {
+        RDNA4VKSWZ_ZERO, RDNA4VKSWZ_ONE,
+        RDNA4VKSWZ_R, RDNA4VKSWZ_G, RDNA4VKSWZ_B, RDNA4VKSWZ_A
+    };
+    static const uint32_t a8[6] = {
+        RDNA4VKSWZ_ZERO, RDNA4VKSWZ_ONE,
+        RDNA4VKSWZ_ZERO, RDNA4VKSWZ_ZERO, RDNA4VKSWZ_ZERO, RDNA4VKSWZ_R
+    };
+    if (!out || !rdna4swz_valid(swz)) return 0;
+    const uint32_t *m = (fmt_flags & RDNA4SWZ_FMT_A8) ? a8 : base;
+    *out = (rdna4swz_vk_t){ m[swz.r], m[swz.g], m[swz.b], m[swz.a] };
+    return 1;
+}
+static inline int rdna4swz_vk_is_identity(rdna4swz_vk_t m) {
+    return (m.r == RDNA4VKSWZ_R || m.r == RDNA4VKSWZ_IDENTITY) &&
+           (m.g == RDNA4VKSWZ_G || m.g == RDNA4VKSWZ_IDENTITY) &&
+           (m.b == RDNA4VKSWZ_B || m.b == RDNA4VKSWZ_IDENTITY) &&
+           (m.a == RDNA4VKSWZ_A || m.a == RDNA4VKSWZ_IDENTITY);
+}
+static inline uint32_t rdna4swz_key(rdna4swz_t s) {
+    return (uint32_t)s.r | ((uint32_t)s.g << 8) | ((uint32_t)s.b << 16) | ((uint32_t)s.a << 24);
+}
+static inline int rdna4swz_check(rdna4swz_t swz, unsigned long usage, uint32_t fmt_flags,
+                                 int is_view, const char **why) {
+    if (why) *why = NULL;
+    if (!rdna4swz_valid(swz)) {
+        if (why) *why = "invalid MTLTextureSwizzle channel enum";
+        return 0;
+    }
+    if (rdna4swz_is_identity(swz)) return 1;
+    if (fmt_flags & RDNA4SWZ_FMT_TEXEL) {
+        if (why) *why = "non-identity swizzle is not supported on texture buffers";
+        return 0;
+    }
+    if (usage & RDNA4SWZ_USE_WRITE) {
+        if (why) *why = "non-identity swizzle is incompatible with MTLTextureUsageShaderWrite";
+        return 0;
+    }
+    if (!is_view && (usage & RDNA4SWZ_USE_RT)) {
+        if (why) *why = "non-identity descriptor swizzle is incompatible with MTLTextureUsageRenderTarget";
+        return 0;
+    }
+    if (!(usage & RDNA4SWZ_USE_READ)) {
+        if (why) *why = "non-identity swizzle requires MTLTextureUsageShaderRead";
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+#ifndef RDNA4_SWIZZLE_PURE_ONLY
 // ---------------------------------------------------------------------------------------------------------------
 // Common helpers for the 10b-10d classes.
 // ---------------------------------------------------------------------------------------------------------------
@@ -108,17 +216,31 @@ static BOOL rdna4_nouint(void) {
     return v;
 }
 // The component mapping of a view of format f whose client swizzle is swz: client channel -> (format's own mapping of that channel). Identity for every format but A8.
+_Static_assert(RDNA4SWZ_FMT_A8 == RDNA4F_A8, "RDNA4SWZ_FMT_A8 matches RDNA4F_A8");
+_Static_assert((int)MTLTextureSwizzleZero == RDNA4SWZ_ZERO && (int)MTLTextureSwizzleOne == RDNA4SWZ_ONE &&
+               (int)MTLTextureSwizzleRed == RDNA4SWZ_RED && (int)MTLTextureSwizzleGreen == RDNA4SWZ_GREEN &&
+               (int)MTLTextureSwizzleBlue == RDNA4SWZ_BLUE && (int)MTLTextureSwizzleAlpha == RDNA4SWZ_ALPHA, "MTLTextureSwizzle values");
+_Static_assert((int)VK_COMPONENT_SWIZZLE_IDENTITY == RDNA4VKSWZ_IDENTITY && (int)VK_COMPONENT_SWIZZLE_ZERO == RDNA4VKSWZ_ZERO &&
+               (int)VK_COMPONENT_SWIZZLE_ONE == RDNA4VKSWZ_ONE && (int)VK_COMPONENT_SWIZZLE_R == RDNA4VKSWZ_R &&
+               (int)VK_COMPONENT_SWIZZLE_G == RDNA4VKSWZ_G && (int)VK_COMPONENT_SWIZZLE_B == RDNA4VKSWZ_B &&
+               (int)VK_COMPONENT_SWIZZLE_A == RDNA4VKSWZ_A, "VkComponentSwizzle values");
+_Static_assert((unsigned)MTLTextureUsageShaderRead == RDNA4SWZ_USE_READ && (unsigned)MTLTextureUsageShaderWrite == RDNA4SWZ_USE_WRITE &&
+               (unsigned)MTLTextureUsageRenderTarget == RDNA4SWZ_USE_RT && (unsigned)MTLTextureUsagePixelFormatView == RDNA4SWZ_USE_PFV, "MTLTextureUsage swizzle values");
+static inline rdna4swz_t rdna4_swz_from_mtl(MTLTextureSwizzleChannels swz) {
+    return (rdna4swz_t){ (uint8_t)swz.red, (uint8_t)swz.green, (uint8_t)swz.blue, (uint8_t)swz.alpha };
+}
+static inline MTLTextureSwizzleChannels rdna4_swz_to_mtl(rdna4swz_t swz) {
+    return (MTLTextureSwizzleChannels){ (MTLTextureSwizzle)swz.r, (MTLTextureSwizzle)swz.g, (MTLTextureSwizzle)swz.b, (MTLTextureSwizzle)swz.a };
+}
 static VkComponentMapping rdna4_view_map(const RDNA4Fmt *f, MTLTextureSwizzleChannels swz) {
-    static const VkComponentSwizzle base[6] = { VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
-    static const VkComponentSwizzle a8[6] = { VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R };
-    const VkComponentSwizzle *m = (f && (f->flags & RDNA4F_A8)) ? a8 : base;
-    unsigned c[4] = { swz.red, swz.green, swz.blue, swz.alpha };
-    VkComponentSwizzle o[4]; for (int i = 0; i < 4; i++) o[i] = c[i] < 6 ? m[c[i]] : VK_COMPONENT_SWIZZLE_IDENTITY;
-    return (VkComponentMapping){ o[0], o[1], o[2], o[3] };
+    rdna4swz_vk_t v;
+    if (!rdna4swz_to_vk(f ? f->flags : 0u, rdna4_swz_from_mtl(swz), &v))
+        return (VkComponentMapping){ VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+    return (VkComponentMapping){ (VkComponentSwizzle)v.r, (VkComponentSwizzle)v.g, (VkComponentSwizzle)v.b, (VkComponentSwizzle)v.a };
 }
 static BOOL rdna4_is_identity_map(const VkComponentMapping *m) {
-    return (m->r == VK_COMPONENT_SWIZZLE_R || m->r == VK_COMPONENT_SWIZZLE_IDENTITY) && (m->g == VK_COMPONENT_SWIZZLE_G || m->g == VK_COMPONENT_SWIZZLE_IDENTITY) &&
-           (m->b == VK_COMPONENT_SWIZZLE_B || m->b == VK_COMPONENT_SWIZZLE_IDENTITY) && (m->a == VK_COMPONENT_SWIZZLE_A || m->a == VK_COMPONENT_SWIZZLE_IDENTITY);
+    if (!m) return YES;
+    return rdna4swz_vk_is_identity((rdna4swz_vk_t){ (uint32_t)m->r, (uint32_t)m->g, (uint32_t)m->b, (uint32_t)m->a }) ? YES : NO;
 }
 static const RDNA4Fmt *rdna4_fmt(MTLPixelFormat f) {
     for (size_t i = 0; i < sizeof rdna4_fmts / sizeof *rdna4_fmts; i++) if (rdna4_fmts[i].mtl == f) return ((rdna4_fmts[i].flags & (RDNA4F_UINT | RDNA4F_SINT)) && rdna4_nouint()) ? NULL : &rdna4_fmts[i];
@@ -187,4 +309,5 @@ static void rdna4_add_protocols(Class c, const char **names, unsigned n, const c
 
 @class RDNA4CommandBuffer;
 @class RDNA4Texture;
+#endif // !RDNA4_SWIZZLE_PURE_ONLY
 

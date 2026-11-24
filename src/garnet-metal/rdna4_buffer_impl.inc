@@ -23,12 +23,20 @@ static _Atomic uint64_t rdna4_heap_reserved;   // heap capacity promises; not de
 - (void)destroyHandles;
 @end
 @interface RDNA4Heap : _MTLHeap
+- (MTLHeapType)type;
+- (NSUInteger)size;
 - (void)rdna4Free:(uint64_t)bid;
 - (BOOL)rdna4AcquireBackingForBuffer:(VkBuffer)buffer image:(VkImage)image requirements:(VkMemoryRequirements)mr
                            dedicated:(BOOL)dedicated hostImport:(BOOL)hostImport
                                  mem:(VkDeviceMemory *)mem offset:(uint64_t *)offset map:(uint8_t **)map
                                block:(uint64_t *)block lease:(uint64_t *)lease rangeSize:(uint64_t *)rangeSize
                                error:(NSError **)err;
+- (BOOL)rdna4AcquirePlacementBackingForBuffer:(VkBuffer)buffer image:(VkImage)image requirements:(VkMemoryRequirements)mr
+                                       offset:(NSUInteger)placeOffset hostImport:(BOOL)hostImport
+                            requiresDedicated:(BOOL)requiresDedicated
+                                          mem:(VkDeviceMemory *)mem offset:(uint64_t *)offset map:(uint8_t **)map
+                                        block:(uint64_t *)block lease:(uint64_t *)lease rangeSize:(uint64_t *)rangeSize
+                                        error:(NSError **)err;
 - (BOOL)rdna4BindSucceeded:(uint64_t)block lease:(uint64_t)lease owner:(id)owner;
 - (void)rdna4AbandonBacking:(uint64_t)lease;
 - (void)rdna4CloseBackingHandle:(uint64_t)block;
@@ -46,7 +54,7 @@ static _Atomic uint64_t rdna4_heap_reserved;   // heap capacity promises; not de
 @end
 #define RDNA4_RES_IVARS NSUInteger _prot; int _respPid; BOOL _respSet; _Atomic uint64_t _uid; RDNA4Heap *_hpHeap; NSUInteger _hpOff, _hpSize; uint64_t _hpId; BOOL _hpAl; \
     uint64_t _hpBlk, _hpLease, _hpBindOff, _hpPhysSize; BOOL _hpDedicated; RDNA4HeapBacking *_hpBacking;
-#define RDNA4_HEAP_RETIRE do { if (_hpHeap && _hpId && !_hpAl) { _hpAl = YES; [_hpHeap rdna4RetireResource:self logical:_hpId lease:_hpLease]; } } while (0)
+#define RDNA4_HEAP_RETIRE do { if (_hpHeap && (_hpId || _hpLease) && !_hpAl) { _hpAl = YES; [_hpHeap rdna4RetireResource:self logical:_hpId lease:_hpLease]; } } while (0)
 // Detach decides whether Vulkan handles can die now (shared block) or must stay
 // with the dedicated lease's retained owner until its retirement completes.
 #define RDNA4_HEAP_DEALLOC do { \
@@ -60,7 +68,7 @@ static _Atomic uint64_t rdna4_heap_reserved;   // heap capacity promises; not de
 } while (0)
 #define RDNA4_RESOURCE_SPI \
     - (id)heap { return [self rdna4ResourceHeap]; } \
-    - (NSUInteger)heapOffset { return 0; } /* Apple-silicon: 0 for every resource of an automatic heap, although gpuAddress differs by the real offsets (measured) */ \
+    - (NSUInteger)heapOffset { return [self rdna4ResourceHeapOffset]; } \
     - (BOOL)isAliasable { return [self rdna4ResourceAliasable]; } \
     - (void)makeAliasable { [self rdna4ResourceMakeAliasable]; } \
     - (NSUInteger)setPurgeableState:(NSUInteger)st { (void)st; return 2; } \
@@ -94,7 +102,9 @@ static _Atomic uint64_t rdna4_heap_reserved;   // heap capacity promises; not de
 }
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts heap:(RDNA4Heap *)heap error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts heap:(RDNA4Heap *)heap offset:(NSUInteger)offset error:(NSError **)err;
 - (RDNA4Heap *)rdna4ResourceHeap;
+- (NSUInteger)rdna4ResourceHeapOffset;
 - (BOOL)rdna4ResourceAliasable;
 - (void)rdna4ResourceMakeAliasable;
 - (BOOL)rdna4ResourceAliases:(id)other;
@@ -231,6 +241,12 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
     return [self initWithDevice:dev length:len options:opts heap:nil error:err];
 }
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts heap:(RDNA4Heap *)heap error:(NSError **)err {
+    return [self initWithDevice:dev length:len options:opts heap:heap offset:0 hasOffset:NO error:err];
+}
+- (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts heap:(RDNA4Heap *)heap offset:(NSUInteger)offset error:(NSError **)err {
+    return [self initWithDevice:dev length:len options:opts heap:heap offset:offset hasOffset:YES error:err];
+}
+- (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts heap:(RDNA4Heap *)heap offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
     _dev = dev; _len = len; BOOL nozero = (opts & RDNA4_OPT_NOZERO) != 0; _opts = opts & ~RDNA4_OPT_NOZERO;   // P1: the marker never leaves this init
@@ -248,7 +264,7 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
         return [self rdna4ImportHostPointer:_ptr length:len ownedSpan:_ownedHostSpan deallocator:nil error:err];
     }
     BOOL heapHost = heap && sm < 2;
-    BOOL heapImport = heapHost && len > (64ull << 20);
+    BOOL heapImport = heapHost && (hasOffset ? ([heap size] > (64ull << 20)) : (len > (64ull << 20)));
     if (heapImport && (!RDNA4R.hostExt || !rdna4_vkGetMHPP)) { if (err) *err = rdna4_err(112, @"large Shared/Managed heap buffers require coherent host import"); return nil; }
     VkExternalMemoryBufferCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
@@ -264,17 +280,30 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
     BOOL dedicated = prefersDedicated || requiresDedicated;
     _asz = (NSUInteger)mr.size;
     if (heap) {
-        if (![heap rdna4ReserveRequirements:mr offset:&_hpOff id:&_hpId]) {
-            if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"heap has no logical range for a %llu-byte buffer requirement", (unsigned long long)mr.size]);
-            [self rdna4AbortHeapConstruction];
-            return nil;
-        }
-        _hpSize = (NSUInteger)mr.size;
         VkDeviceMemory hmem = VK_NULL_HANDLE; uint64_t bindOff = 0, rangeSize = 0; uint8_t *map = NULL;
-        if (![heap rdna4AcquireBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr dedicated:dedicated hostImport:heapImport
-                                            mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
-            [self rdna4AbortHeapConstruction];
-            return nil;
+        if (hasOffset) {
+            _hpOff = offset;
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquirePlacementBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr offset:offset
+                                                  hostImport:heapImport requiresDedicated:requiresDedicated
+                                                         mem:&hmem offset:&bindOff map:&map block:&_hpBlk
+                                                       lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+            dedicated = NO;
+        } else {
+            if (![heap rdna4ReserveRequirements:mr offset:&_hpOff id:&_hpId]) {
+                if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"heap has no logical range for a %llu-byte buffer requirement", (unsigned long long)mr.size]);
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquireBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr dedicated:dedicated hostImport:heapImport
+                                                mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
         }
         _hpBindOff = bindOff; _hpPhysSize = rangeSize; _hpDedicated = dedicated; _noacct = YES;
         r = vkBindBufferMemory(RDNA4R.dev, _vkbuf, hmem, bindOff);
@@ -299,7 +328,7 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
             [self rdna4AbortHeapConstruction];
             return nil;
         }
-        if (sm == 2 && len > RDNA4_BUFFER_LEGACY_MAX && !nozero) {
+        if (!hasOffset && sm == 2 && len > RDNA4_BUFFER_LEGACY_MAX && !nozero) {
             BOOL unresolved = NO;
             if (![self rdna4ZeroLargePrivate:len unresolved:&unresolved error:err]) {
                 if (!unresolved) [self rdna4AbortHeapConstruction];
@@ -562,6 +591,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
 - (VkBuffer)vkBuffer { return _vkbuf; }
 - (VkDeviceSize)rdna4VkOffset { return _vkoff; }
 - (RDNA4Heap *)rdna4ResourceHeap { return _hpHeap; }
+- (NSUInteger)rdna4ResourceHeapOffset { return (_hpHeap && [_hpHeap type] == MTLHeapTypePlacement) ? _hpOff : 0; }
 - (BOOL)rdna4ResourceAliasable { return _hpAl; }
 - (void)rdna4ResourceMakeAliasable { RDNA4_HEAP_RETIRE; }
 - (BOOL)rdna4ResourceAliases:(id)other {

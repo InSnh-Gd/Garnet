@@ -807,3 +807,40 @@ for t in test-metal2-formats-render test-metal2-msl-probe test-metal2-limits; do
     "$TMPDIR/$t" /path/to/GarnetMetal.bundle
 done
 ```
+
+## Metal 3 Texture Swizzle and Placement Heaps (2.1–2.2)
+
+Host pure-C checks (`host-cpu`, ASan + UBSan) cover swizzle composition
+(including the Apple doc parent/view composition rule, `Zero`/`One` constants,
+`BGRA`, `A8Unorm`, depth swizzles, and descriptor/view usage refusal),
+placement-heap offset/alignment/granularity/overflow validation, explicit
+overlap aliasing, interval-union `usedSize` / `maxAvailableSizeWithAlignment:`
+accounting, and assembled `GarnetDevice.m` source pins:
+
+```sh
+python3 src/garnet-metal/assemble-device.py --output "$TMPDIR/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
+cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
+  -o "$TMPDIR/test-swizzle-placement" src/garnet-metal/test-swizzle-placement.c
+"$TMPDIR/test-swizzle-placement" "$TMPDIR"
+```
+
+Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
+on macOS; compile `test-metal3-placement-heap.m` with both `-O0` and `-O2` for
+ARC teardown accounting):
+
+```sh
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-metal3-swizzle.m -o "$TMPDIR/test-metal3-swizzle"
+clang -arch x86_64 -fobjc-arc -O0 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o0"
+clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
+  -framework Foundation -framework Metal \
+  src/garnet-metal/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o2"
+
+for b in test-metal3-swizzle test-metal3-placement-heap-o0 test-metal3-placement-heap-o2; do
+  sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
+    "$TMPDIR/$b" /path/to/GarnetMetal.bundle
+done
+```

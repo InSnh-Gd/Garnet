@@ -11,6 +11,11 @@
         !format || (format->flags & (RDNA4F_A8 | RDNA4F_BC)) ||
         __builtin_mul_overflow(d.width, (NSUInteger)format->bpp, &bytes))
         TBFAIL(@"invalid texture-buffer geometry, format, or usage");
+    {
+        const char *swzWhy = NULL;
+        if (!rdna4swz_check(rdna4_swz_from_mtl(d.swizzle), (unsigned long)d.usage, RDNA4SWZ_FMT_TEXEL, 0, &swzWhy))
+            TBFAIL(@"%s", swzWhy);
+    }
     if (buffer && (![buffer isKindOfClass:[RDNA4Buffer class]] || [buffer device] != dev ||
         [buffer isAliasable] || !rdna4_buffer_range(buffer.length, off, bytes)))
         TBFAIL(@"texture-buffer backing is foreign, aliasable, or too small");

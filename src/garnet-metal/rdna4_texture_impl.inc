@@ -37,8 +37,10 @@ _Static_assert((int)MTLTextureTypeTextureBuffer == RDNA4TD_MTL_BUFFER, "MTLTextu
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap offset:(NSUInteger)offset error:(NSError **)err;
 - (RDNA4Texture *)rdna4ImageRoot;
 - (RDNA4Heap *)rdna4ResourceHeap;
+- (NSUInteger)rdna4ResourceHeapOffset;
 - (BOOL)rdna4ResourceAliasable;
 - (void)rdna4ResourceMakeAliasable;
 - (BOOL)rdna4ResourceAliases:(id)other;
@@ -222,6 +224,13 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
         if (err) *err = rdna4_err(44, @"A8Unorm render targets are not supported (an R8 attachment cannot take the fragment's alpha)");
         return NO;
     }
+    {
+        const char *swzWhy = NULL;
+        if (!rdna4swz_check(rdna4_swz_from_mtl(d.swizzle), (unsigned long)d.usage, 0, 0, &swzWhy)) {
+            if (err) *err = rdna4_err(44, [NSString stringWithFormat:@"%s", swzWhy]);
+            return NO;
+        }
+    }
     if (rdna4_fmt_is_bc(p->fmt)) {
         if (p->is1D || p->samples > 1 || (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) {
             if (err) *err = rdna4_err(44, @"block-compressed textures do not support 1D, multisample, render-target, or ShaderWrite usage");
@@ -277,6 +286,7 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
             (unsigned long)d.pixelFormat, p->fmt->vk, (unsigned long)d.textureType, ff]);
         return NO;
     }
+    if (!rdna4swz_is_identity(rdna4_swz_from_mtl(d.swizzle))) p->canRT = NO;
     p->wantSt = (d.usage & MTLTextureUsageShaderWrite) != 0;
     if (p->wantSt && !(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
         if (err) *err = rdna4_err(40, [NSString stringWithFormat:@"pixel format %lu (vk %d) has no storage-image support on RADV (features 0x%x)",
@@ -343,11 +353,17 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
     return [self initWithDevice:dev descriptor:d heap:nil error:err];
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap error:(NSError **)err {
+    return [self initWithDevice:dev descriptor:d heap:heap offset:0 hasOffset:NO error:err];
+}
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap offset:(NSUInteger)offset error:(NSError **)err {
+    return [self initWithDevice:dev descriptor:d heap:heap offset:offset hasOffset:YES error:err];
+}
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
     _dev = dev; _w = d.width; _h = d.height; _pf = d.pixelFormat; _usage = d.usage; _layout = VK_IMAGE_LAYOUT_UNDEFINED;
     _hpHeap = heap;
-    _swz = (MTLTextureSwizzleChannels){ MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha };
+    _swz = d.swizzle;
     _opts = ((NSUInteger)d.storageMode << 4) | ((NSUInteger)d.cpuCacheMode) | ((NSUInteger)d.hazardTrackingMode << 8);
     rdna4_heap_image_plan plan;
     if (!rdna4_heap_image_plan_make(d, heap != nil, &plan, err)) return nil;
@@ -369,17 +385,30 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
     BOOL dedicated = prefersDedicated || requiresDedicated;
     int mt = -1;
     if (heap) {
-        if (![heap rdna4ReserveRequirements:mr offset:&_hpOff id:&_hpId]) {
-            if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"heap has no logical range for a %llu-byte image requirement", (unsigned long long)mr.size]);
-            [self rdna4AbortHeapConstruction];
-            return nil;
-        }
-        _hpSize = (NSUInteger)mr.size;
         VkDeviceMemory hmem = VK_NULL_HANDLE; uint64_t bindOff = 0, rangeSize = 0; uint8_t *map = NULL;
-        if (![heap rdna4AcquireBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr dedicated:dedicated hostImport:NO
-                                            mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
-            [self rdna4AbortHeapConstruction];
-            return nil;
+        if (hasOffset) {
+            _hpOff = offset;
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquirePlacementBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr offset:offset
+                                                  hostImport:NO requiresDedicated:requiresDedicated
+                                                         mem:&hmem offset:&bindOff map:&map block:&_hpBlk
+                                                       lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+            dedicated = NO;
+        } else {
+            if (![heap rdna4ReserveRequirements:mr offset:&_hpOff id:&_hpId]) {
+                if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"heap has no logical range for a %llu-byte image requirement", (unsigned long long)mr.size]);
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquireBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr dedicated:dedicated hostImport:NO
+                                                mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
         }
         (void)map;
         _hpBindOff = bindOff; _hpPhysSize = rangeSize; _hpDedicated = dedicated;
@@ -485,6 +514,12 @@ static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, 
     return root;
 }
 - (RDNA4Heap *)rdna4ResourceHeap { RDNA4Texture *root = [self rdna4ImageRoot]; return root->_hpHeap ?: [root->_hostBuf rdna4ResourceHeap]; }
+- (NSUInteger)rdna4ResourceHeapOffset {
+    if (_texel) return [_hostBuf rdna4ResourceHeapOffset];
+    RDNA4Texture *root = [self rdna4ImageRoot];
+    if (root->_hpHeap) return [root->_hpHeap type] == MTLHeapTypePlacement ? root->_hpOff : 0;
+    return root->_hostBuf ? [root->_hostBuf rdna4ResourceHeapOffset] : 0;
+}
 - (BOOL)rdna4ResourceAliasable { return _texel ? [_hostBuf isAliasable] : _root ? [_root rdna4ResourceAliasable] : _hpAl; }
 - (void)rdna4ResourceMakeAliasable {
     if (_root) {
@@ -554,7 +589,7 @@ RDNA4_DNR(RDNA4Texture)
     #define IOSFAIL(code, ...) do { NSString *m_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG("newTexture(iosurface): refused: %s", m_.UTF8String); if (err) *err = rdna4_err(code, m_); return nil; } while (0)
     if (!s) IOSFAIL(70, @"NULL IOSurface");
     _dev = dev; _w = d.width; _h = d.height; _pf = d.pixelFormat; _usage = d.usage; _layout = VK_IMAGE_LAYOUT_UNDEFINED; _iosPlane = plane;
-    _swz = (MTLTextureSwizzleChannels){ MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha };
+    _swz = d.swizzle;
     _opts = ((NSUInteger)d.storageMode << 4) | ((NSUInteger)d.cpuCacheMode) | ((NSUInteger)d.hazardTrackingMode << 8);
     _fmt = rdna4_fmt(_pf);
     // m11h9: any pixel format of the table whose bytes per pixel equal the surface's bytes per element (BGR10A2Unorm 'l10r' and RGBA16Float 'RGhA' are what the compositor's
@@ -562,6 +597,11 @@ RDNA4_DNR(RDNA4Texture)
     if (!_fmt) IOSFAIL(71, @"pixel format %lu is not in the format table", (unsigned long)_pf);
     if (rdna4_fmt_is_bc(_fmt)) IOSFAIL(71, @"block-compressed IOSurface textures are not supported");
     if ((_fmt->flags & RDNA4F_A8) && (d.usage & MTLTextureUsageRenderTarget)) IOSFAIL(71, @"A8Unorm render targets are not supported");
+    {
+        const char *swzWhy = NULL;
+        if (!rdna4swz_check(rdna4_swz_from_mtl(_swz), (unsigned long)d.usage, 0, 0, &swzWhy))
+            IOSFAIL(71, @"%s", swzWhy);
+    }
     if (d.textureType != MTLTextureType2D || d.depth != 1 || d.arrayLength != 1 || d.mipmapLevelCount != 1 || d.sampleCount != 1) IOSFAIL(72, @"only single 2D textures (no mips/array/MSAA)");
     size_t pc = IOSurfaceGetPlaneCount(s);
     // P2: a plane p < planeCount of a 2- or 3-plane surface is accepted (CoreAnimation makes one texture per plane of a bi-planar YUV surface). The kill file
@@ -821,7 +861,7 @@ RDNA4_DNR(RDNA4Texture)
     self = [super init]; if (!self) return nil;
     #define BFAIL(code, ...) do { if (err) *err = rdna4_err(code, [NSString stringWithFormat:__VA_ARGS__]); return nil; } while (0)
     _dev = dev; _w = d.width; _h = d.height; _pf = d.pixelFormat; _usage = d.usage; _layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    _swz = (MTLTextureSwizzleChannels){ MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha };
+    _swz = d.swizzle;
     _opts = ((NSUInteger)d.storageMode << 4) | ((NSUInteger)d.cpuCacheMode) | ((NSUInteger)d.hazardTrackingMode << 8);
     _fmt = rdna4_fmt(_pf);
     if (!_fmt) BFAIL(120, @"pixel format %lu not supported", (unsigned long)_pf);
@@ -1063,7 +1103,7 @@ RDNA4_RESOURCE_SPI
 - (void)didModifyData {}
 - (BOOL)canGenerateMipmapLevels { return _levels > 1; }
 - (void)generateMipmapLevel:(NSUInteger)l slice:(NSUInteger)s { (void)l; (void)s; }
-- (uint32_t)swizzleKey { return 0; }
+- (uint32_t)swizzleKey { return rdna4swz_key(rdna4_swz_from_mtl(_swz)); }
 - (NSUInteger)numFaces { return 1; }
 - (NSUInteger)resourceIndex { return 0; }
 - (void *)virtualAddress { return [self rdna4IsIOS] ? (void *)[self rdna4IBase] : NULL; }
@@ -1123,10 +1163,16 @@ RDNA4_RESOURCE_SPI
     _root = root; _baseLevel = [root rdna4MipLevel:levels.location]; _baseSlice = [root rdna4Slice:slices.location]; _parentSlice = (uint32_t)slices.location; _dev = root->_dev;
     _imageFlags = imageRoot->_imageFlags; _tdk = view.kind; _layers = view.layersIvar;
     _w = MAX((NSUInteger)1, root->_w >> levels.location); _h = MAX((NSUInteger)1, root->_h >> levels.location);
-    _pf = pf; _fmt = f; _usage = root->_usage; _opts = root->_opts; _swz = swz;
-    if (swz.red > 5 || swz.green > 5 || swz.blue > 5 || swz.alpha > 5) VFAIL(97, @"bad swizzle");
+    _pf = pf; _fmt = f; _usage = root->_usage; _opts = root->_opts;
+    rdna4swz_t composed;
+    if (!rdna4swz_compose(rdna4_swz_from_mtl(root->_swz), rdna4_swz_from_mtl(swz), &composed))
+        VFAIL(97, @"bad swizzle");
+    const char *swzWhy = NULL;
+    if (!rdna4swz_check(composed, (unsigned long)root->_usage, 0, 1, &swzWhy))
+        VFAIL(97, @"%s", swzWhy);
+    _swz = rdna4_swz_to_mtl(composed);
     if (root->_is3D) VFAIL(99, @"views of 3D textures are not implemented");
-    VkComponentMapping vcm = rdna4_view_map(f, swz);   // composes the client swizzle with the format's own (A8: (0,0,0,R))
+    VkComponentMapping vcm = rdna4_view_map(f, _swz);   // composes the client swizzle with the format's own (A8: (0,0,0,R))
     // Attachments and storage images require identity mapping, including views.
     _levels = levels.length; _depth = 1; _aspects = viewAspects; _viewSwz = !rdna4_is_identity_map(&vcm);
     VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = [root vkImage], .viewType = (VkImageViewType)view.viewType, .format = f->vk,
