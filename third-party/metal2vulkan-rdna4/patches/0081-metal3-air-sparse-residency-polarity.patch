@@ -1,0 +1,57 @@
+diff --git a/src/passes/air_calls/images/resolve.rs b/src/passes/air_calls/images/resolve.rs
+index 3b522d9..8baccd2 100644
+--- a/src/passes/air_calls/images/resolve.rs
++++ b/src/passes/air_calls/images/resolve.rs
+@@ -448,7 +448,12 @@ pub(in crate::passes) fn lower_null_texture_result_with_sparse(
+         let zero_color = const_null_of(ctx, member0);
+         let mut out = Vec::new();
+         let res_field = if sparse {
+-            const_null_of(ctx, member1)
++            // Apple AIR `{ texel, i8 }` uses TFE polarity: 0 = resident, 1 = non-resident.
++            if type_def_of(ctx, member1).is_some_and(|d| d.class.opcode == Op::TypeBool) {
++                ctx.const_bool_of(member1, true)
++            } else {
++                ctx.const_int_of(member1, 1)
++            }
+         } else {
+             let undef = ctx.module.fresh_id();
+             out.push(Instruction::new(Op::Undef, Some(member1), Some(undef), vec![]));
+@@ -669,8 +674,9 @@ pub(in crate::passes) fn guard_residency_in_bounds(
+     Some(guarded)
+ }
+ 
+-/// Materialize member 1 of AIR's `{ texel, residency }` struct: `OpUndef` on non-sparse ops, or
+-/// the converted residency boolean (`bool` directly, or `OpSelect` 1/0 for `i8`/`i32`) on sparse.
++/// Materialize member 1 of AIR's `{ texel, sparse_status }` struct: `OpUndef` on non-sparse ops,
++/// or Apple AIR's TFE-polarity status flag (`0`/`false` = resident, `1`/`true` = non-resident;
++/// Apple's `<metal_texture>` `sparse_color::resident()` computes `((status & 1) ^ 1)`).
+ pub(in crate::passes) fn encode_residency_member(
+     ctx: &mut Ctx,
+     out: &mut Vec<Instruction>,
+@@ -695,16 +701,23 @@ pub(in crate::passes) fn encode_residency_member(
+         return undef;
+     };
+     if type_def_of(ctx, member1_ty).is_some_and(|d| d.class.opcode == Op::TypeBool) {
+-        return is_res;
++        let not_res = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::LogicalNot,
++            Some(member1_ty),
++            Some(not_res),
++            vec![Operand::IdRef(is_res)],
++        ));
++        return not_res;
+     }
+-    let one = ctx.const_int_of(member1_ty, 1);
+     let zero = ctx.const_int_of(member1_ty, 0);
++    let one = ctx.const_int_of(member1_ty, 1);
+     let flag = ctx.module.fresh_id();
+     out.push(Instruction::new(
+         Op::Select,
+         Some(member1_ty),
+         Some(flag),
+-        vec![Operand::IdRef(is_res), Operand::IdRef(one), Operand::IdRef(zero)],
++        vec![Operand::IdRef(is_res), Operand::IdRef(zero), Operand::IdRef(one)],
+     ));
+     flag
+ }

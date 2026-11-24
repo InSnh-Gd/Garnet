@@ -573,6 +573,41 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.sparse.v4f32(ptr addrspace(1)
     assert!(c_asm.contains("OpImageSparseRead"), "{c_asm}");
     assert!(c_asm.contains("OpImageSparseGather"), "{c_asm}");
     assert_eq!(c_asm.matches("OpImageSparseTexelsResident").count(), 4, "{c_asm}");
+    // Apple AIR `{ texel, i8 }` uses TFE polarity: 0 = resident, 1 = non-resident
+    // (`sparse_color::resident()` compiles to `((status & 1) ^ 1)`).
+    let mut i8_ty = None;
+    let mut i8_zero = None;
+    let mut i8_one = None;
+    let mut resident_ids = Vec::new();
+    let mut selects = Vec::new();
+    for line in c_asm.lines() {
+        let tok: Vec<&str> = line.split_whitespace().collect();
+        if tok.as_slice() == [tok.first().copied().unwrap_or(""), "=", "OpTypeInt", "8", "0"] {
+            i8_ty = Some(tok[0].to_string());
+        } else if tok.len() == 5 && tok[1] == "=" && tok[2] == "OpConstant" {
+            if Some(tok[3]) == i8_ty.as_deref() {
+                if tok[4] == "0" {
+                    i8_zero = Some(tok[0].to_string());
+                } else if tok[4] == "1" {
+                    i8_one = Some(tok[0].to_string());
+                }
+            }
+        } else if tok.len() >= 5 && tok[1] == "=" && tok[2] == "OpImageSparseTexelsResident" {
+            resident_ids.push(tok[0].to_string());
+        } else if tok.len() == 7 && tok[1] == "=" && tok[2] == "OpSelect" {
+            selects.push((tok[3].to_string(), tok[4].to_string(), tok[5].to_string(), tok[6].to_string()));
+        }
+    }
+    let ty = i8_ty.unwrap_or_else(|| panic!("missing OpTypeInt 8 0:\n{c_asm}"));
+    let z = i8_zero.unwrap_or_else(|| panic!("missing {ty} 0 constant:\n{c_asm}"));
+    let o = i8_one.unwrap_or_else(|| panic!("missing {ty} 1 constant:\n{c_asm}"));
+    assert_eq!(resident_ids.len(), 4, "{c_asm}");
+    for rid in &resident_ids {
+        assert!(
+            selects.iter().any(|(t, c, tv, fv)| t == &ty && c == rid && tv == &z && fv == &o),
+            "expected Apple AIR TFE polarity OpSelect {ty} {rid} {z} {o} (0=resident, 1=non-resident):\n{c_asm}"
+        );
+    }
 
     let sparse_frag = r#"
 define <4 x float> @fs(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv) {

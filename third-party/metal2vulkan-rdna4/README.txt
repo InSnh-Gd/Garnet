@@ -7,7 +7,7 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0080).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0081).
 
 Verification and Tier 2 Scope
 =============================
@@ -18,6 +18,15 @@ translation, metadata invariants, and software Vulkan 1.4.363 execution only;
 they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
+
+0081-metal3-air-sparse-residency-polarity.patch fixes Apple AIR sparse status
+polarity in `src/passes/air_calls/images/resolve.rs` (`encode_residency_member`
+and `lower_null_texture_result_with_sparse`). Apple's `<metal_texture>`
+`sparse_color<T>::resident()` computes `((status & 1) ^ 1)` on member 1 of
+`{ texel, i8 }` (TFE convention: `0` = resident, `1` = non-resident), so
+`encode_residency_member` selects `0` when `OpImageSparseTexelsResident` is true
+and `1` when false (and absent/null sparse textures materialize status `1`),
+fixing live RX 9060 XT `test-metal3-sparse-prt` residency detection.
 
 0080-metal3-void-atomic-air-calls.patch handles void-returning buffer atomic
 RMW intrinsics emitted by Apple `air64_v28` (`atomic_{min,max}_explicit` and
