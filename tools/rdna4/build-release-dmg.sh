@@ -82,14 +82,14 @@ Garnet RDNA 4 Driver v${VERSION} — Release 1 (Radeon RX 9060 XT / Navi 44, mac
 3. Strict Kext Separation (DO NOT mix these paths!)
    - OpenCore EFI/OC/Kexts/:  ONLY GarnetPCIBarCompat.kext (enabled for 16 GiB Full-BAR default; disable/omit in 256 MiB Small-BAR fallback).
    - macOS /Library/Extensions/ (AuxKC): ONLY Garnet.kext + GarnetAccel.kext (installed & managed by Garnet.app / garnetctl).
-   - Garnet never auto-mounts or edits your EFI System Partition.
+   - Garnet never auto-mounts your EFI System Partition; OpenCore Assistant only updates a config.plist you explicitly pick (with automatic backup).
 
 4. Quick Install Steps
    a) Open Garnet.app -> "Install / Uninstall" -> check Preflight (and 16G vs 256M recommendation).
-   b) If "SIP SETUP NEEDED": in OpenCore config.plist set Misc -> Security -> SecureBootModel = Disabled,
-      NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82 -> csr-active-config = <03080000>, add it to NVRAM -> Delete, then reboot.
-   c) Use Garnet.app -> "OpenCore Assistant" to export GarnetPCIBarCompat.kext to your EFI/OC/Kexts/ (for 16G mode)
-      and validate your config.plist read-only before rebooting.
+   b) Mount your EFI partition, then open Garnet.app -> "OpenCore Assistant": select the recommended mode and click
+      "Auto-Configure OpenCore..." (or use read-only Validate / Export Kext). It backs up config.plist, copies
+      GarnetPCIBarCompat.kext for 16G mode, sets SecureBootModel = Disabled and csr-active-config = <03080000>, and validates the result.
+   c) If Preflight showed "SIP SETUP NEEDED", reboot once so the updated csr-active-config takes effect.
    d) Click "Install / Upgrade Driver..." (Vulkan ICD stays OFF by default unless checked), then reboot.
 
 5. Emergency OpenCore boot-arg Kill-Switches
@@ -104,7 +104,8 @@ Garnet RDNA 4 Driver v${VERSION} — Release 1 (Radeon RX 9060 XT / Navi 44, mac
 - 首次打开如遇 Gatekeeper 提示，执行：xattr -dr com.apple.quarantine /Applications/Garnet.app 或右键“打开”。
 - 严格区分路径：GarnetPCIBarCompat.kext 仅放 EFI/OC/Kexts/（默认 16G 模式启用，256M 小 BAR 回退模式不启用）；
   Garnet.kext 与 GarnetAccel.kext 仅由 Garnet.app 装入系统盘 /Library/Extensions/ 并重建 AuxKC，严禁放入 OpenCore EFI。
-- 安装前可在“OpenCore Assistant”只读拖拽检验 config.plist，确认无误后再点击安装并重启；程序绝不自动挂载或改写 ESP。
+- 手动挂载 EFI 分区后，可在“OpenCore Assistant”点击“Auto-Configure OpenCore...”自动备份并配置 config.plist（或仅只读校验），
+  若预检提示 SIP SETUP NEEDED 先重启一次，再点击安装并重启；程序绝不自动挂载 ESP。
 EOF
 
 find "$DMG_ROOT" \( -name '.DS_Store' -o -name '._*' \) -delete
