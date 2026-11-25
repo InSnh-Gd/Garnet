@@ -79,10 +79,13 @@ for p in "/Library/Application Support/Garnet/native/garnettest" "/Library/Appli
     if [ -x "$p" ]; then GARNETTEST="$p"; break; fi
 done
 
-ORIG_INFO=$("$BENCH" --display-info)
+ORIG_INFO=$("$BENCH" --display-info 2>/dev/null || printf 'refresh_hz=current\ndisplay_session=loginwindow\n')
 ORIG_HZ=$(printf '%s\n' "$ORIG_INFO" | awk -F= '$1=="refresh_hz"{print $2; exit}')
+if [ "$ORIG_HZ" = "current" ]; then
+    MODES="current"
+fi
 restore_mode() {
-    if [ -n "${ORIG_HZ:-}" ]; then
+    if [ -n "${ORIG_HZ:-}" ] && [ "$ORIG_HZ" != "current" ]; then
         "$BENCH" --set-refresh "$ORIG_HZ" >/dev/null 2>&1 || true
     fi
 }
@@ -104,14 +107,17 @@ fi
 
 for hz in $MODES; do
     echo "=== MODE_BEGIN hz=$hz ==="
-    if "$BENCH" --set-refresh "$hz" 2>&1; then
+    if [ "$hz" = "current" ]; then
+        echo "refresh_hz=current"
+        echo "display_session=loginwindow"
+    elif "$BENCH" --set-refresh "$hz" 2>&1; then
         sleep 3
+        "$BENCH" --display-info
     else
         echo "mode_switch_status=FAILED"
         echo "=== MODE_END hz=$hz ==="
         continue
     fi
-    "$BENCH" --display-info
 
     # Capture pipestat before idle window.
     if [ -n "$GARNETTEST" ]; then
@@ -153,12 +159,12 @@ for hz in $MODES; do
 
     echo "--- METAL_BENCH ---"
     cdir="$HOME/rdna4-build/perf-bench/tmp/cache-$hz"
-    rm -rf "$cdir" && mkdir -p "$cdir"
+    sudo rm -rf "$cdir" && mkdir -p "$cdir"
     sudo env GARNET_ALLOW=1 RDNA4M_ALLOW=1 GARNET_TEST_INPROC=1 RDNA4M_TEST_INPROC=1 \
         GARNET_TEST_USERCACHE="$cdir" RDNA4M_TEST_USERCACHE="$cdir" \
         GARNET_NOPCACHE=1 RDNA4M_NOPCACHE=1 \
         "$BENCH" --run-bench 2>&1 || echo "metal_bench_error=1"
-    rm -rf "$cdir"
+    sudo rm -rf "$cdir"
 
     echo "--- RECENT_SCANOUT_LOG ---"
     log show --last 25s --predicate '(eventMessage CONTAINS "GarnetMetal" OR eventMessage CONTAINS "Garnet:") AND (eventMessage CONTAINS "scanout: counters:" OR eventMessage CONTAINS "F1:")' --style compact 2>/dev/null | tail -n 10 || true
