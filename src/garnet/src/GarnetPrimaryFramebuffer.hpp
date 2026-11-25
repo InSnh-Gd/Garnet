@@ -9,6 +9,7 @@
 
 #include "dcn/dcn41_cursor_pure.h"
 #include "dcn/dcn41_ddc_pad_pure.h"
+#include "dcn/dcn41_det_pure.h"
 #include "dcn/dcn41_vbl_irq_pure.h"
 #include "dcn/dp_edid_aux.h"
 #include "dcn/primary_fb_pure.h"
@@ -95,6 +96,10 @@ private:
 	                             bool forceRetrain = false,
 	                             GarnetDriver *knownDriver = nullptr);
 	bool applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver = nullptr);
+	void updateUclkPolicyLocked(GarnetDriver *driver, const rdna4det::Hw &detHw,
+	                            uint32_t hActive, uint32_t hTotal,
+	                            uint32_t vActive, uint32_t vTotal,
+	                            uint64_t pixelClockHz, bool dscEnabled);
 	void optimizeDet0AndUclkLocked(GarnetDriver *driver);
 	bool captureConsoleAndBar0(IOPCIDevice *pci);
 	bool ensureVblTimer();

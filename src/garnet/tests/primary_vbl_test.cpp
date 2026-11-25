@@ -22,6 +22,8 @@ struct IOLock { bool held = false; };
 void IOLockLock(IOLock *lock) { lock->held = true; }
 void IOLockUnlock(IOLock *lock) { lock->held = false; }
 #define OSDynamicCast(type, object) static_cast<type *>(object)
+static inline void rdna4_test_log(const char *, ...) {}
+#define RDNA4LOG(...) rdna4_test_log(__VA_ARGS__)
 
 struct IOTimerEventSource {
 	bool enabled = false;
@@ -44,11 +46,14 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	void *fVblRef = nullptr;
 	bool fVblEnabled = false;
 	bool fVblHwArmed = false;
+	bool fDpmsOff = false;
 	bool fStopping = false;
 	bool timerAvailable = true;
 	bool hwVblAvailable = false;
+	uint32_t fVblOtg = 0u;
 	uint64_t fakeNowNs = 1000000000ULL;
 	uint64_t fVblLastHwNs = 0u;
+	uint64_t fVblHwCount = 0u;
 	uint64_t fVblTimerCount = 0u;
 	unsigned hwSyncCalls = 0u;
 	unsigned ackRecoverCalls = 0u;
@@ -58,7 +63,8 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	unsigned vblPeriodUs() const { return 16667; }
 	uint64_t vblNowNs() const { return fakeNowNs; }
 	bool vblHwActive() const { return hwVblAvailable && __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE); }
-	uint32_t vblInitialTimeoutUs() const { return rdna4vbl::initial_timer_us(vblPeriodUs(), vblHwActive()); }
+	uint32_t vblInitialTimeoutUs() const;
+	void onHardwareVbl(uint32_t otg);
 	void syncHardwareVbl(bool want) {
 		++hwSyncCalls;
 		__atomic_store_n(&fVblHwArmed, want && hwVblAvailable && !fStopping, __ATOMIC_RELEASE);
@@ -177,32 +183,46 @@ int main() {
 	expect(rejected.registerForInterruptType(kIOFBVBLInterruptType, callback, &target, &state, &interrupt) == kIOReturnNoMemory,
 	       "timer setup failure is reported");
 
-	// Stage 3A: hardware VBL mode suppresses timer callbacks while HW VBL is fresh,
-	// and falls back seamlessly to timer cadence if HW VBL stalls.
+	// Stage 3A: hardware VBL mode uses full refresh cadence while cold/stalled,
+	// suppresses timer callbacks while HW VBL is fresh, and falls back cleanly on stall.
 	AMDGarnetPrimaryFramebuffer hwFb;
 	hwFb.hwVblAvailable = true;
 	CallbackState hwState { &hwFb, &target };
 	expect(hwFb.registerForInterruptType(kIOFBVBLInterruptType, callback, &target,
 	                                     &hwState, &hwState.interrupt) == kIOReturnSuccess,
 	       "HW VBL registration succeeds");
-	expect(hwFb.fVblHwArmed && hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
-	       "HW VBL schedules timer at low-rate watchdog cadence");
-	hwFb.fVblLastHwNs = hwFb.fakeNowNs;
+	expect(hwFb.fVblHwArmed && hwFb.timer.period == 16667u,
+	       "cold HW VBL (no IRQ received yet) arms full refresh period instead of 100ms stall");
+	hwFb.onHardwareVbl(0u);
+	expect(hwState.calls == 1u && hwFb.fVblHwCount == 1u,
+	       "hardware VBL delivers callback and stamps fVblLastHwNs");
 	hwFb.fakeNowNs += 10000000ULL; // 10 ms < 2 * 16.667 ms
 	hwFb.fire();
-	expect(hwState.calls == 0u && hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
-	       "fresh HW VBL suppresses duplicate timer callback and preserves watchdog cadence");
+	expect(hwState.calls == 1u && hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
+	       "fresh HW VBL suppresses duplicate timer callback and switches to watchdog cadence");
 	hwFb.fakeNowNs += 50000000ULL; // 60 ms >= 2 * 16.667 ms -> HW VBL stalled
 	hwFb.fire();
-	expect(hwState.calls == 1u && hwFb.timer.period == 16667u && hwFb.ackRecoverCalls == 1u,
+	expect(hwState.calls == 2u && hwFb.timer.period == 16667u && hwFb.ackRecoverCalls == 1u,
 	       "stalled HW VBL falls back to timer callback at full refresh cadence and probes ACK recovery");
 	const unsigned syncBeforeToggle = hwFb.hwSyncCalls;
 	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess &&
 	       hwFb.fVblHwArmed && hwFb.hwSyncCalls == syncBeforeToggle,
 	       "disabling VBL cancels timer without churning hardware VBL arm state");
+	// Re-enabling while HW VBL is still stalled must arm periodUs, NOT 100 ms.
 	expect(hwFb.setInterruptState(hwState.interrupt, kEnabledInterruptState) == kIOReturnSuccess &&
-	       hwFb.hwSyncCalls == syncBeforeToggle,
-	       "re-enabling VBL reuses armed hardware VBL without redundant MMIO sync");
+	       hwFb.hwSyncCalls == syncBeforeToggle && hwFb.timer.period == 16667u,
+	       "re-enabling VBL while HW VBL is stalled keeps full refresh cadence (no 100ms stall)");
+	// A hardware VBL arriving while fVblEnabled == false must still refresh fVblLastHwNs without firing callback.
+	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess,
+	       "disable VBL before background HW VBL tick");
+	const unsigned callsBeforeBgHw = hwState.calls;
+	hwFb.onHardwareVbl(0u);
+	expect(hwState.calls == callsBeforeBgHw && hwFb.fVblLastHwNs == hwFb.fakeNowNs,
+	       "background HW VBL refreshes freshness timestamp without invoking disabled callback");
+	hwFb.fakeNowNs += 5000000ULL; // 5 ms < 2 * 16.667 ms
+	expect(hwFb.setInterruptState(hwState.interrupt, kEnabledInterruptState) == kIOReturnSuccess &&
+	       hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
+	       "re-enabling VBL after fresh background HW VBL uses low-rate watchdog cadence");
 	expect(hwFb.unregisterInterrupt(hwState.interrupt) == kIOReturnSuccess &&
 	       !hwFb.fVblHwArmed && hwFb.drainCalls == 1u,
 	       "unregisterInterrupt disarms hardware VBL and invokes synchronous dispatch drain barrier");

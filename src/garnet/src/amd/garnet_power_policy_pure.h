@@ -29,6 +29,44 @@ inline bool gfxoff_opt_in(bool present, uint32_t value) {
 	return present && value != 0u;
 }
 
+// Minimum DET0 buffer time and VBLANK duration required to safely absorb GDDR6 UCLK
+// P-state switch blackouts (~150-250 us) without DMUB FAMS2 / DML2 watermark programming.
+// Live RX 9060 XT verification:
+//   4K@60Hz  (533.25 MHz, non-DSC, 576 KiB DET0): detBuf=288 us, vblank=465 us -> 0 underflows
+//   4K@160Hz (1479 MHz,   DSC,     576 KiB DET0): detBuf=103 us, vblank=108 us -> OPTC0 underflow
+constexpr uint32_t kUclkUnpinMinDetBufUs = 250u;
+constexpr uint32_t kUclkUnpinMinVblankUs = 350u;
+constexpr uint32_t kDet0ExpandedBytes    = 9u * 65536u; // 576 KiB (9 x 64 KiB CRB segments)
+
+inline uint32_t det0_buffer_us(uint32_t detBytes, uint32_t hActive, uint32_t hTotal,
+                               uint64_t pixelClockHz, uint32_t bppBytes = 4u) {
+	if (detBytes == 0u || hActive == 0u || hTotal < hActive || pixelClockHz == 0u || bppBytes == 0u)
+		return 0u;
+	const uint64_t num = static_cast<uint64_t>(detBytes) * static_cast<uint64_t>(hTotal);
+	if (num > (UINT64_MAX / 1000000ULL)) return 0u;
+	const uint64_t rowBytes = static_cast<uint64_t>(hActive) * static_cast<uint64_t>(bppBytes);
+	if (rowBytes == 0u || pixelClockHz > (UINT64_MAX / rowBytes)) return 0u;
+	const uint64_t denom = rowBytes * pixelClockHz;
+	const uint64_t us = (num * 1000000ULL) / denom;
+	return us > 0xFFFFFFFFULL ? 0xFFFFFFFFu : static_cast<uint32_t>(us);
+}
+
+inline uint32_t vblank_us(uint32_t vActive, uint32_t vTotal, uint32_t hTotal,
+                          uint64_t pixelClockHz) {
+	if (vActive == 0u || vTotal <= vActive || hTotal == 0u || pixelClockHz == 0u) return 0u;
+	const uint64_t blankPx = static_cast<uint64_t>(vTotal - vActive) * static_cast<uint64_t>(hTotal);
+	if (blankPx > (UINT64_MAX / 1000000ULL)) return 0u;
+	const uint64_t us = (blankPx * 1000000ULL) / pixelClockHz;
+	return us > 0xFFFFFFFFULL ? 0xFFFFFFFFu : static_cast<uint32_t>(us);
+}
+
+inline bool uclk_unpin_safe_for_mode(bool uclkForcePin, bool det0Expanded, bool dscEnabled,
+                                     uint32_t detBufUs, uint32_t vblankUs) {
+	return !uclkForcePin && det0Expanded && !dscEnabled &&
+	       detBufUs >= kUclkUnpinMinDetBufUs &&
+	       vblankUs >= kUclkUnpinMinVblankUs;
+}
+
 // RLC_SAFE_MODE (GC BASE_IDX 1, offset 0x0980)
 constexpr uint32_t kRlcSafeModeCmdMask    = 0x00000001u;
 constexpr uint32_t kRlcSafeModeMsgShift   = 1u;

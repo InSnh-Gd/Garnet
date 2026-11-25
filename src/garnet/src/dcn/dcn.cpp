@@ -1092,19 +1092,38 @@ bool primaryVblIrqActive() {
 	       !__atomic_load_n(&gDcn.primaryVblStorm.tripped, __ATOMIC_ACQUIRE);
 }
 
-void primaryVblRecoverAckIfNeeded(uint32_t otg) {
+void recoverVupdateAckUnderTxn(uint32_t otg, bool checkHwStatus) {
 	if (otg >= DCN41_NUM_PIPES) return;
 	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
-	if (!__atomic_load_n(&gDcn.irqAckRecoveryNeeded, __ATOMIC_ACQUIRE)) return;
-	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
-	if (!txn.ok) return;
-	if (!__atomic_load_n(&gDcn.irqAckRecoveryNeeded, __ATOMIC_ACQUIRE)) return;
+	if (!rdna4displaytxn::held()) return;
+	bool need = __atomic_load_n(&gDcn.irqAckRecoveryNeeded, __ATOMIC_ACQUIRE);
+	if (!need && checkHwStatus) {
+		struct dcn41_otg_irq_status st {};
+		if (dcn41_otg_irq_status(&gDcn.d, otg, &st) == DCN41_OK &&
+		    st.vupdate_no_lock_int_en && st.vupdate_no_lock_int_status) {
+			need = true;
+		}
+	}
+	if (!need) return;
 	struct dcn41_irq irq { DCN41_IRQ_VUPDATE_NO_LOCK, static_cast<uint8_t>(otg) };
 	gDcn.tag = "irqrecov";
 	if (dcn41_irq_ack(&gDcn.d, irq) == DCN41_OK) {
 		__atomic_store_n(&gDcn.irqAckRecoveryNeeded, false, __ATOMIC_RELEASE);
-		RDNA4LOG("dcn-irq: watchdog cleared latched VUPDATE_NO_LOCK ACK on OTG %u", otg);
+		if (checkHwStatus) {
+			RDNA4LOG("dcn-irq: watchdog cleared latched VUPDATE_NO_LOCK ACK on OTG %u", otg);
+		}
 	}
+}
+
+void primaryVblRecoverAckIfNeeded(uint32_t otg) {
+	if (otg >= DCN41_NUM_PIPES) return;
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
+	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+	if (!txn.ok) return;
+	IOLock *l = (otg == 0u) ? gScan.lock : nullptr;
+	if (l != nullptr) IOLockLock(l);
+	recoverVupdateAckUnderTxn(otg, /*checkHwStatus=*/true);
+	if (l != nullptr) IOLockUnlock(l);
 }
 
 void primaryVblShutdown() {

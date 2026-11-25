@@ -46,16 +46,6 @@ static void scan_read_exact(ScanExact *x) {
 // One observation of HUBP0: resolves a pending Present into a latch. Caller holds gScan.lock. The latch is the RAW DCSURF_FLIP_CONTROL.SURFACE_FLIP_PENDING
 // bit clearing (a VUPDATE accepted the address); EARLIEST_INUSE is read too but only feeds the reuse rule (see rdna4scan::latch_observe).
 static bool scan_poll_locked(bool byIrq) {
-	// Self-heal a latched DCN level-triggered VUPDATE_NO_LOCK interrupt if ihEntry()
-	// ever hit a transient rdna4_display_txn collision and dropped an ACK.
-	if (!byIrq && __atomic_load_n(&gDcn.irqAckRecoveryNeeded, __ATOMIC_ACQUIRE) &&
-	    __atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) {
-		struct dcn41_irq vup { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
-		gDcn.tag = "irqrecov";
-		if (dcn41_irq_ack(&gDcn.d, vup) == DCN41_OK) {
-			__atomic_store_n(&gDcn.irqAckRecoveryNeeded, false, __ATOMIC_RELEASE);
-		}
-	}
 	uint32_t raw = 0;
 	const uint64_t fcNow = dcn41_otg_get_frame_count(&gDcn.d, 0u, &raw) == DCN41_OK ? rdna4scan::fc_extend(gScan.fc, raw) : gScan.fc.v;
 	if (!gScan.tbl.pendActive) return false;
@@ -194,6 +184,8 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 // requests. It ends when its acquisition ends. (The pattern is the kext's other pollers: kernel_thread_start, IOSleep, fall off the end.)
 static void scan_watchdog_loop(uint32_t myGen) {
 	uint32_t refusals = 0;
+	uint64_t lastVupdates = 0;
+	bool haveLastVupdates = false;
 	for (;;) {
 		IOSleep(50);
 		// Acquire before the scan lock: every hardware read in this round,
@@ -211,6 +203,10 @@ static void scan_watchdog_loop(uint32_t myGen) {
 		IOLockLock(l);
 		if (!gScan.acquired || gScan.gen != myGen) { IOLockUnlock(l); break; }
 		if (gScan.restoring) { IOLockUnlock(l); continue; }
+		const bool vupdateStalled = haveLastVupdates && (gScan.vupdates == lastVupdates);
+		lastVupdates = gScan.vupdates;
+		haveLastVupdates = true;
+		recoverVupdateAckUnderTxn(0u, vupdateStalled);
 		(void)scan_poll_locked(false);
 		// The live plane must still be the one acquired (covers --hold, where no Present would notice): every 50 ms.
 		ScanGeom g {};
@@ -577,6 +573,8 @@ uint32_t scanPresent(uint64_t slotIn, uint64_t flags, uint64_t out[3]) {
 		gScan.presentSeq = id;
 		out[0] = id; out[1] = target; out[2] = gScan.vupdates;
 	} while (false);
+	// Heal any transient ihEntry() collision that raced with this held display lease immediately.
+	recoverVupdateAckUnderTxn(0u, false);
 	IOLockUnlock(l);
 	return rc;
 }

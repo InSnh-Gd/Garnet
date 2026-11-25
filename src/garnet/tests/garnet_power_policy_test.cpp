@@ -57,6 +57,49 @@ int main() {
 	expect(gfx12_sdma_rlc_cgcg_ctrl(0x00010002u, false) == 0x00010000u,
 	       "SDMA*_RLC_CGCG_CTRL disable clears bit 1");
 
+	// Mode-aware UCLK unpin timing margin policy (prevents OPTC0 underflow on 4K@160Hz DSC).
+	const uint32_t det4k60 = det0_buffer_us(kDet0ExpandedBytes, 3840u, 4000u, 533250000ULL);
+	const uint32_t vb4k60  = vblank_us(2160u, 2222u, 4000u, 533250000ULL);
+	expect(det4k60 >= 280u && det4k60 <= 295u, "4K@60Hz 576 KiB DET0 holds ~288 us");
+	expect(vb4k60 >= 460u && vb4k60 <= 470u, "4K@60Hz VBLANK is ~465 us");
+	expect(uclk_unpin_safe_for_mode(false, true, false, det4k60, vb4k60),
+	       "4K@60Hz non-DSC with 576 KiB DET0 is safe to unpin UCLK");
+	expect(!uclk_unpin_safe_for_mode(true, true, false, det4k60, vb4k60),
+	       "garnet-uclk-pin=1 blocks UCLK unpin even on 4K@60Hz");
+	expect(!uclk_unpin_safe_for_mode(false, false, false, det4k60, vb4k60),
+	       "unexpanded DET0 blocks UCLK unpin");
+
+	const uint32_t det4k160 = det0_buffer_us(kDet0ExpandedBytes, 3840u, 4000u, 1479000000ULL);
+	const uint32_t vb4k160  = vblank_us(2160u, 2200u, 4000u, 1479000000ULL);
+	expect(det4k160 >= 100u && det4k160 <= 110u, "4K@160Hz DSC 576 KiB DET0 holds only ~103 us");
+	expect(vb4k160 >= 105u && vb4k160 <= 112u, "4K@160Hz DSC VBLANK is only ~108 us");
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160),
+	       "4K@160Hz DSC stays pinned at top UCLK to prevent top-1/10th OPTC0 underflow");
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k60, vb4k60),
+	       "DSC always forces UCLK pinned even with wide timing margins");
+
+	const uint32_t det4k120 = det0_buffer_us(kDet0ExpandedBytes, 3840u, 4000u, 1066500000ULL);
+	const uint32_t vb4k120  = vblank_us(2160u, 2222u, 4000u, 1066500000ULL);
+	expect(!uclk_unpin_safe_for_mode(false, true, false, det4k120, vb4k120),
+	       "4K@120Hz stays pinned (DET0 ~144 us, VBLANK ~232 us)");
+
+	const uint32_t det1440p120 = det0_buffer_us(kDet0ExpandedBytes, 2560u, 2720u, 497750000ULL);
+	const uint32_t vb1440p120  = vblank_us(1440u, 1525u, 2720u, 497750000ULL);
+	expect(uclk_unpin_safe_for_mode(false, true, false, det1440p120, vb1440p120),
+	       "1440p@120Hz non-DSC has sufficient DET0 (~314 us) and VBLANK (~464 us)");
+
+	const uint32_t det1440p144 = det0_buffer_us(kDet0ExpandedBytes, 2560u, 2720u, 580000000ULL);
+	const uint32_t vb1440p144  = vblank_us(1440u, 1481u, 2720u, 580000000ULL);
+	expect(!uclk_unpin_safe_for_mode(false, true, false, det1440p144, vb1440p144),
+	       "1440p@144Hz short VBLANK (~192 us) keeps UCLK pinned");
+
+	// Degenerate / overflow bounds fail closed (return 0 -> keep pinned).
+	expect(det0_buffer_us(0u, 3840u, 4000u, 533250000ULL) == 0u, "zero DET fails closed");
+	expect(det0_buffer_us(kDet0ExpandedBytes, 3840u, 3000u, 533250000ULL) == 0u, "hTotal < hActive fails closed");
+	expect(det0_buffer_us(kDet0ExpandedBytes, 3840u, 4000u, 0ULL) == 0u, "zero pixel clock fails closed");
+	expect(vblank_us(2160u, 2160u, 4000u, 533250000ULL) == 0u, "zero vblank fails closed");
+	expect(vblank_us(2160u, 2222u, 4000u, 0ULL) == 0u, "zero pixel clock vblank fails closed");
+
 	std::printf("garnet_power_policy_test: %d checks, %d failed\n", gChecks, gFail);
 	return gFail ? 1 : 0;
 }

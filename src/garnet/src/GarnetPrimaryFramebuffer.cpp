@@ -810,26 +810,16 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareModeLocked(const rdna4edidmodes::
 	    hw, fActiveOutput, fDpcdCaps, target, fMaxDispClkKhz, fMaxDppClkKhz,
 	    /*allowRetrain=*/true, /*allowDsc=*/true, forceRetrain);
 
-	if (r.status == rdna4modeset::kOk && fDet0Expanded && !fUclkForcePin && smuDev && smuDev->smuOnline) {
-		if (amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
-			const rdna4det::Hw detHw { &ctx->mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
-			uint32_t optcReg = 0u;
-			if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
-				uint32_t topMhz = 0u;
-				(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
-				fUclkUnpinned = false;
-				RDNA4LOG("primaryfb: post-modeset UCLK unpin saw OPTC0 underflow (0x%08x); auto-repinned UCLK to %u MHz",
-				         optcReg, topMhz);
-			} else {
-				fUclkUnpinned = true;
-			}
-		}
-	}
-
 	if (r.status == rdna4modeset::kOk) {
 		(void)rdna4aux::readDpcdCaps(hw.auxIo, fActiveOutput.aux, fActiveOutput.hpd, &fDpcdCaps);
 		fActiveLinkRate = fDpcdCaps.curLinkBwSet;
-		fActiveDscOn = (fDpcdCaps.curDscEnable & 1u) != 0u;
+		fActiveDscOn = ((fDpcdCaps.curDscEnable & 1u) != 0u) ||
+		               (r.tierUsed == rdna4modeset::LinkTier::Hbr3_Dsc12);
+		const rdna4det::Hw detHw { &ctx->mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
+		updateUclkPolicyLocked(driver, detHw,
+		                       target.width, static_cast<uint32_t>(target.hTotal()),
+		                       target.height, static_cast<uint32_t>(target.vTotal()),
+		                       target.pixelClockHz, fActiveDscOn);
 		const uint32_t db = fActiveOutput.dig * rdna4modeset::kSeg2DigStride;
 		const uint32_t link = (fActiveOutput.link < 4u) ? fActiveOutput.link : fActiveOutput.dig;
 		const uint32_t be = link * rdna4modeset::kSeg2DigStride;
@@ -1029,6 +1019,48 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 }
 
 __attribute__((noinline))
+void AMDGarnetPrimaryFramebuffer::updateUclkPolicyLocked(GarnetDriver *driver,
+                                                         const rdna4det::Hw &detHw,
+                                                         uint32_t hActive, uint32_t hTotal,
+                                                         uint32_t vActive, uint32_t vTotal,
+                                                         uint64_t pixelClockHz, bool dscEnabled) {
+	amdgpu::DeviceContext *smuDev = driver ? driver->deviceContext() : nullptr;
+	if (!smuDev || !smuDev->smuOnline) return;
+
+	const uint32_t detBufUs =
+	    rdna4pwr::det0_buffer_us(rdna4pwr::kDet0ExpandedBytes, hActive, hTotal, pixelClockHz);
+	const uint32_t vbUs = rdna4pwr::vblank_us(vActive, vTotal, hTotal, pixelClockHz);
+	const bool safe =
+	    rdna4pwr::uclk_unpin_safe_for_mode(fUclkForcePin, fDet0Expanded, dscEnabled, detBufUs, vbUs);
+
+	if (!safe) {
+		uint32_t topMhz = 0u;
+		if (amdgpu::smu_pin_uclk_top(*smuDev, &topMhz) == kIOReturnSuccess) {
+			fUclkUnpinned = false;
+			RDNA4LOG("primaryfb: UCLK pinned at %u MHz for %ux%u (dsc=%u, detBuf=%u us, vblank=%u us, det0=%u, forcePin=%u)",
+			         topMhz, hActive, vActive, dscEnabled ? 1u : 0u, detBufUs, vbUs,
+			         fDet0Expanded ? 1u : 0u, fUclkForcePin ? 1u : 0u);
+		}
+		return;
+	}
+
+	if (!fUclkUnpinned && amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
+		uint32_t optcReg = 0u;
+		if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
+			uint32_t topMhz = 0u;
+			(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
+			fUclkUnpinned = false;
+			RDNA4LOG("primaryfb: UCLK unpin underflowed OPTC0 (0x%08x); auto-repinned UCLK to %u MHz",
+			         optcReg, topMhz);
+		} else {
+			fUclkUnpinned = true;
+			RDNA4LOG("primaryfb: UCLK unpinned cleanly with 576 KiB DET0 (%ux%u, detBuf=%u us, vblank=%u us, 0 OPTC0 underflows over 250 ms)",
+			         hActive, vActive, detBufUs, vbUs);
+		}
+	}
+}
+
+__attribute__((noinline))
 void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclkLocked(GarnetDriver *driver) {
 	if (!driver || !fPci || fStopping) return;
 	MmioAccess mmio {};
@@ -1048,22 +1080,16 @@ void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclkLocked(GarnetDriver *driver
 		}
 	}
 
-	amdgpu::DeviceContext *smuDev = driver->deviceContext();
-	if (fDet0Expanded && !fUclkForcePin && !fUclkUnpinned && smuDev && smuDev->smuOnline) {
-		if (amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
-			uint32_t optcReg = 0u;
-			if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
-				uint32_t topMhz = 0u;
-				(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
-				fUclkUnpinned = false;
-				RDNA4LOG("primaryfb: UCLK unpin underflowed OPTC0 (0x%08x); auto-repinned UCLK to %u MHz",
-				         optcReg, topMhz);
-			} else {
-				fUclkUnpinned = true;
-				RDNA4LOG("primaryfb: UCLK unpinned cleanly with 576 KiB DET0 (0 OPTC0 underflows over 250 ms)");
-			}
-		}
-	}
+	rdna4fbprimary::TimingSpec ts {};
+	const bool haveTs = rdna4fbprimary::timingSpecForMode(fModeTable, fCurrentMode, &ts);
+	const bool dscEnabled = fActiveDscOn || ((fDpcdCaps.curDscEnable & 1u) != 0u);
+	updateUclkPolicyLocked(driver, detHw,
+	                       haveTs ? ts.hActive : 0u,
+	                       haveTs ? (ts.hActive + ts.hBlank) : 0u,
+	                       haveTs ? ts.vActive : 0u,
+	                       haveTs ? (ts.vActive + ts.vBlank) : 0u,
+	                       haveTs ? ts.pixelClockHz : 0ull,
+	                       dscEnabled);
 	release_mmio(mmio);
 }
 
@@ -1387,7 +1413,10 @@ bool AMDGarnetPrimaryFramebuffer::vblHwActive() const {
 }
 
 uint32_t AMDGarnetPrimaryFramebuffer::vblInitialTimeoutUs() const {
-	return rdna4vbl::initial_timer_us(vblPeriodUs(), vblHwActive());
+	const uint32_t periodUs = vblPeriodUs();
+	const uint64_t lastHwNs = __atomic_load_n(&fVblLastHwNs, __ATOMIC_ACQUIRE);
+	const bool hwFresh = rdna4vbl::should_suppress_timer(vblHwActive(), vblNowNs(), lastHwNs, periodUs);
+	return rdna4vbl::initial_timer_us(periodUs, hwFresh);
 }
 
 void AMDGarnetPrimaryFramebuffer::vblDispatchEnter() {
@@ -1464,18 +1493,20 @@ void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
 	uint64_t timerCount = 0u;
 
 	if (fVblLock) IOLockLock(fVblLock);
-	if (fVblEnabled && !fStopping &&
+	if (!fStopping &&
 	    !__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) &&
 	    __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE) &&
-	    otg == fVblOtg && fVblProc) {
-		fVblLastHwNs = vblNowNs();
-		hwCount = ++fVblHwCount;
-		timerCount = fVblTimerCount;
-		proc = fVblProc;
-		target = fVblTarget;
-		ref = fVblRef;
-		vblRetainTarget(target);
-		deliver = true;
+	    otg == fVblOtg) {
+		__atomic_store_n(&fVblLastHwNs, vblNowNs(), __ATOMIC_RELEASE);
+		if (fVblEnabled && fVblProc) {
+			hwCount = ++fVblHwCount;
+			timerCount = fVblTimerCount;
+			proc = fVblProc;
+			target = fVblTarget;
+			ref = fVblRef;
+			vblRetainTarget(target);
+			deliver = true;
+		}
 	}
 	if (fVblLock) IOLockUnlock(fVblLock);
 
@@ -1510,8 +1541,9 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 	enabled = self->fVblEnabled && !self->fStopping;
 	if (enabled) {
 		const bool hwActive = self->vblHwActive();
+		const uint64_t lastHwNs = __atomic_load_n(&self->fVblLastHwNs, __ATOMIC_ACQUIRE);
 		suppressed = rdna4vbl::should_suppress_timer(hwActive, self->vblNowNs(),
-		                                             self->fVblLastHwNs, periodUs);
+		                                             lastHwNs, periodUs);
 		if (!suppressed) {
 			needAckRecover = hwActive;
 			self->fVblTimerCount++;

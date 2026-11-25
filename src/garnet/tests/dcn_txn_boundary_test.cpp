@@ -109,6 +109,8 @@ static uint32_t gMtWdAlive;
 static uint32_t gMtHoldAlive;
 static uint32_t gScanPollCalls;
 static uint32_t gScanGeomCalls;
+static uint32_t gAckRecovCalls;
+static uint32_t gAckRecovHwChecks;
 static bool gScanActive;
 static uint32_t gMtWatchdogBodies;
 static constexpr int DCN41_OK = 0;
@@ -179,6 +181,7 @@ struct ScanGlobals {
 	uint32_t width, height, pitchPx;
 	uint64_t lastActivityNs;
 	uint64_t wdRestores;
+	uint64_t vupdates;
 	rdna4scan::Table tbl;
 	volatile uint32_t watchdogAlive;
 };
@@ -189,6 +192,12 @@ static IOLock *gSXLock[3];
 static bool sx_latched_inst(uint32_t inst) { return inst == 1u || inst == 2u; }
 static bool scanActive() { return gScanActive; }
 static uint64_t now_ns() { return 1000u; }
+static void recoverVupdateAckUnderTxn(uint32_t otg, bool checkHwStatus) {
+	expect(rdna4displaytxn::held(), "recoverVupdateAckUnderTxn only runs under a held display transaction");
+	expect(otg == 0u, "scan watchdog recovers VUPDATE ACK on OTG 0");
+	gAckRecovCalls++;
+	if (checkHwStatus) gAckRecovHwChecks++;
+}
 static void scan_poll_locked(bool) { gScanPollCalls++; }
 static void scan_read_geom(ScanGeom *g) {
 	gScanGeomCalls++;
@@ -214,7 +223,7 @@ static void reset_world() {
 	gRestoreCalls = gMtShutdownCalls = gXReleaseCalls = gXBoGoneCalls = gXWatchdogSteps = 0;
 	gXWatchdogStepResult = false;
 	gMtWdAlive = gMtHoldAlive = gSleepCalls = 0;
-	gScanPollCalls = gScanGeomCalls = 0;
+	gScanPollCalls = gScanGeomCalls = gAckRecovCalls = gAckRecovHwChecks = 0;
 	gScanActive = false;
 	gMtWatchdogBodies = 0;
 	gLockCalls = 0;
@@ -420,8 +429,27 @@ static void scan_watchdog_checks() {
 	       "an admitted scan watchdog round owns one transaction");
 	expect(gScanPollCalls == 1u && gScanGeomCalls == 1u && gRestoreCalls == 1u,
 	       "the scan watchdog holds that transaction across poll, geometry read and restore");
+	expect(gAckRecovCalls == 1u && gAckRecovHwChecks == 0u,
+	       "first watchdog round checks ACK recovery flag under lease without assuming stall");
 	expect(rdna4dcn::gScan.watchdogAlive == 0u,
 	       "the admitted scan watchdog publishes its exit for the stop join");
+
+	// Regression for permanent 0x5048 wedge: when vupdates stops advancing across two 50 ms
+	// watchdog ticks, the watchdog must invoke hardware-status ACK recovery under the lease.
+	reset_world();
+	gScanActive = true;
+	rdna4dcn::gScan.lock = &gLock;
+	rdna4dcn::gScan.acquired = true;
+	rdna4dcn::gScan.gen = 9u;
+	rdna4dcn::gScan.vupdates = 42u;
+	rdna4dcn::gScan.watchdogAlive = 1u;
+	gSleepHookPersistent = true;
+	gSleepHook = [] {
+		if (gSleepCalls >= 3u) rdna4dcn::gScan.acquired = false;
+	};
+	rdna4dcn::scan_watchdog((void *)9u, 0);
+	expect(gAckRecovCalls == 2u && gAckRecovHwChecks == 1u,
+	       "stalled vupdates across watchdog ticks triggers leased hardware-status ACK recovery");
 }
 
 int main() {

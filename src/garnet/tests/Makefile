@@ -117,6 +117,7 @@ $(BUILD)/dcn_irq_contract_test: dcn_irq_contract_test.cpp $(DCN_IRQ_INC) | $(BUI
 DCN_TXN_INC := $(BUILD)/dcn_txn_boundaries_actual.inc
 $(DCN_TXN_INC): $(SRC)/dcn/dcn_scanout_mt.cpp $(SRC)/dcn/dcn_disp2_scanx.cpp Makefile | $(BUILD)
 	python3 -c 'import sys; from pathlib import Path; mt=Path(sys.argv[1]).read_text(); dx=Path(sys.argv[2]).read_text(); \
+	a=mt.index("static bool scan_poll_locked("); b=mt.index("\n// The interrupt path", a); assert "dcn41_irq_ack" not in mt[a:b], "scan_poll_locked must stay read-only (called by unleased scanStatus)"; \
 	a=mt.index("uint32_t scanBoGone("); b=mt.index("\n// ---- build 0.0.605", a); p1=mt[a:b]; \
 	a=mt.index("static void scan_watchdog_loop("); b=mt.index("uint32_t scanGeneration(", a); p1a=mt[a:b]; \
 	a=mt.index("static void mt_watchdog("); b=mt.index("static bool mt_start_watchdog(", a); p1b=mt[a:b]; \

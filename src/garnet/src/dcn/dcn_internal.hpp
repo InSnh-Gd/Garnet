@@ -180,6 +180,7 @@ uint32_t hubp_reg(uint32_t off0, uint32_t hubp);
 IOLock *scan_lock();
 void scan_read_geom(ScanGeom *g);
 bool scanIrq(const struct dcn41_irq &irq, uint64_t nowNs, int *ar);
+void recoverVupdateAckUnderTxn(uint32_t otg, bool checkHwStatus);
 void mt_golden_at_bind();
 bool mt_emergency_restore(const char *why);
 
