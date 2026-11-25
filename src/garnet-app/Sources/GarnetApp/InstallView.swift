@@ -77,7 +77,7 @@ struct InstallView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
 
-                    Toggle("Also install optional Vulkan ICD (/Library/Vulkan/icd.d/radeon_icd.x86_64.json & radv-app)", isOn: $model.installVulkanICD)
+                    Toggle("Also install optional Vulkan ICD (\(GarnetPaths.vulkanICDPath) & radv-app)", isOn: $model.installVulkanICD)
                     Text("Default OFF: Metal and OpenGL apps use GarnetMetal directly without exposing an unrequested Vulkan ICD.")
                         .font(.caption2)
                         .foregroundColor(.secondary)
@@ -124,15 +124,6 @@ struct InstallView: View {
                         Spacer()
                     }
                 }
-                .confirmationDialog(
-                    "Remove Garnet from macOS system disk and rebuild AuxKC?",
-                    isPresented: $showUninstallConfirm
-                ) {
-                    Button("Uninstall Garnet", role: .destructive) {
-                        model.runUninstall(dryRun: false)
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
 
                 Section("Execution Log") {
                     ScrollView {
@@ -145,6 +136,15 @@ struct InstallView: View {
                 }
             }
             .formStyle(.grouped)
+            .confirmationDialog(
+                "Remove Garnet from macOS system disk and rebuild AuxKC?",
+                isPresented: $showUninstallConfirm
+            ) {
+                Button("Uninstall Garnet", role: .destructive) {
+                    model.runUninstall(dryRun: false)
+                }
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
 

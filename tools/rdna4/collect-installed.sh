@@ -166,7 +166,7 @@ for pid in $(mac /usr/bin/awk '
     done
 done
 capture "$bundle/diskutil" 30 /usr/sbin/diskutil list || :
-GARNET_ALLOW=1 capture "$bundle/displays" 30 /usr/sbin/system_profiler SPDisplaysDataType -timeout 20 || :
+GARNET_ALLOW=1 RDNA4M_ALLOW=1 capture "$bundle/displays" 30 /usr/sbin/system_profiler SPDisplaysDataType -timeout 20 || :
 for trace in "$tool_root"/private/var/tmp/garnet-cblog.[0-9]*.txt "$tool_root"/private/var/tmp/rdna4m-cblog.[0-9]*.txt; do
     [ -f "$trace" ] && [ ! -L "$trace" ] || continue
     trace_name=${trace##*/}

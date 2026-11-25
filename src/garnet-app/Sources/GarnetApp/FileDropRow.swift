@@ -55,8 +55,8 @@ struct FileDropRow: View {
                 return false
             }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                guard let data = item as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                guard let url else { return }
                 Task { @MainActor in
                     onDropURL(url)
                 }

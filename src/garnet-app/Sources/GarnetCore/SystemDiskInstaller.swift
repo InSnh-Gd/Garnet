@@ -485,14 +485,12 @@ public enum SystemDiskInstaller {
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: radvDst.path)
             }
 
-            // Permissions & ownership on real system root
+            // Permissions & ownership on real system root (set permissions AFTER chown so special bits like 01777 stick)
             let execNames = ["activate-native.sh", "garnettest", "native-translate", "native-bundle-check", "publish-metal", "mtlprobe-direct"]
             for name in execNames {
                 let p = env.url(forSystemPath: "\(nativeSupportDir)/\(name)").path
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: p)
             }
-            try fm.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: env.url(forSystemPath: GarnetPaths.xlateDumpDir).path)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: env.url(forSystemPath: GarnetPaths.spvCacheDir).path)
             if !isSandbox && env.effectiveUID == 0 {
                 var chownPaths = [garnetDst.path, accelDst.path, metalDst.path,
                                   env.url(forSystemPath: "\(launchDaemonsDir)/com.garnet.native.plist").path,
@@ -516,9 +514,17 @@ public enum SystemDiskInstaller {
                 for ld in ["com.garnet.native.plist", "com.garnet.native-translate.plist"] {
                     try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: env.url(forSystemPath: "\(launchDaemonsDir)/\(ld)").path)
                 }
-                _ = env.runner.run("/usr/sbin/chown", ["-hR", "nobody:nobody", GarnetPaths.spvCacheDir])
-                _ = env.runner.run("/usr/sbin/chown", ["nobody:nobody", GarnetPaths.translateLogsDir])
+                let chSpv = env.runner.run("/usr/sbin/chown", ["-hR", "nobody:nobody", GarnetPaths.spvCacheDir])
+                if chSpv.exitCode != 0 {
+                    throw SystemInstallError.transactionFailed("chown nobody:nobody \(GarnetPaths.spvCacheDir) failed: \(chSpv.stderr)")
+                }
+                let chLog = env.runner.run("/usr/sbin/chown", ["nobody:nobody", GarnetPaths.translateLogsDir])
+                if chLog.exitCode != 0 {
+                    throw SystemInstallError.transactionFailed("chown nobody:nobody \(GarnetPaths.translateLogsDir) failed: \(chLog.stderr)")
+                }
             }
+            try fm.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: env.url(forSystemPath: GarnetPaths.xlateDumpDir).path)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: env.url(forSystemPath: GarnetPaths.spvCacheDir).path)
 
             // Build temporary AuxKC with preserved foreign kexts + Garnet.kext + GarnetAccel.kext
             let tmpAuxURL = stageDir.appendingPathComponent("AuxiliaryKernelExtensions.kc")
@@ -621,6 +627,31 @@ public enum SystemDiskInstaller {
         managedPaths.append(contentsOf: GarnetPaths.legacyRuntimeCleanupPaths)
 
         let fm = FileManager.default
+        // Enumerate runtime/kill-switch markers under /private/tmp and /private/var/tmp matching garnet-* or rdna4m-*
+        var seenPaths = Set(managedPaths)
+        for tmpDir in ["/private/tmp", "/private/var/tmp"] {
+            let tmpURL = env.url(forSystemPath: tmpDir)
+            if let names = try? fm.contentsOfDirectory(atPath: tmpURL.path) {
+                for name in names.sorted() where name.hasPrefix("garnet-") || name.hasPrefix("rdna4m-") {
+                    let candidate = "\(tmpDir)/\(name)"
+                    let candURL = env.url(forSystemPath: candidate)
+                    if let attrs = try? fm.attributesOfItem(atPath: candURL.path),
+                       (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+                        continue
+                    }
+                    if seenPaths.insert(candidate).inserted {
+                        managedPaths.append(candidate)
+                    }
+                }
+            }
+        }
+
+        let newDenylistURL = env.url(forSystemPath: DenylistManager.denylistPath)
+        let legacyDenylistURL = env.url(forSystemPath: GarnetPaths.legacyDenylistPath)
+        let migrateLegacyDenylistBeforeCleanup = !options.removeDenylist
+            && !fm.fileExists(atPath: newDenylistURL.path)
+            && fm.fileExists(atPath: legacyDenylistURL.path)
+
         let existingTargets = managedPaths.filter { fm.fileExists(atPath: env.url(forSystemPath: $0).path) }
         let auxRemoved = foreignKexts.isEmpty
 
@@ -639,6 +670,10 @@ public enum SystemDiskInstaller {
 
         for abs in existingTargets + [auxKCPath] {
             try assertNotSymlink(url: env.url(forSystemPath: abs))
+        }
+        if migrateLegacyDenylistBeforeCleanup {
+            try assertNotSymlink(url: legacyDenylistURL)
+            try assertNotSymlink(url: newDenylistURL)
         }
 
         if !isSandbox {
@@ -671,6 +706,14 @@ public enum SystemDiskInstaller {
                     try fm.copyItem(at: u, to: bak)
                     journal.append((u, bak))
                 }
+            }
+
+            // Preserve unmigrated v0.1.0 denylist before deleting legacy RDNA4/native directory
+            if migrateLegacyDenylistBeforeCleanup {
+                try fm.createDirectory(at: newDenylistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.copyItem(at: legacyDenylistURL, to: newDenylistURL)
+                try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: newDenylistURL.path)
+                journal.append((newDenylistURL, nil))
             }
 
             for abs in existingTargets {

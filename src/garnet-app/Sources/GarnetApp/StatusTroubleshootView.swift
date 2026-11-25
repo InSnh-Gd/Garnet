@@ -9,6 +9,7 @@ struct StatusTroubleshootView: View {
     @ObservedObject var model: GarnetAppModel
     @State private var manualProcName: String = ""
     @State private var diagExportMessage: String = ""
+    @State private var diagExportFailed: Bool = false
     @State private var showClearDenylistConfirm: Bool = false
 
     var body: some View {
@@ -108,15 +109,6 @@ struct StatusTroubleshootView: View {
                         }
                     }
                 }
-                .confirmationDialog(
-                    "Remove all \(model.denylistEntries.count) denylist \(model.denylistEntries.count == 1 ? "entry" : "entries")?",
-                    isPresented: $showClearDenylistConfirm
-                ) {
-                    Button("Clear All", role: .destructive) {
-                        model.clearDenylist()
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
 
                 Section("Troubleshooting Diagnostics") {
                     Text("Exports a .tar.gz archive with preflight JSON, driver/PCI ioregistry dumps, kmutil showloaded output, and recent Garnet kernel logs (username, home paths, serial number, and IOPlatformUUID scrubbed).")
@@ -130,12 +122,21 @@ struct StatusTroubleshootView: View {
                             Label("Export Diagnostics Bundle…", systemImage: "square.and.arrow.up")
                         }
                         if !diagExportMessage.isEmpty {
-                            Text(diagExportMessage).font(.caption).foregroundColor(.green)
+                            Text(diagExportMessage).font(.caption).foregroundColor(diagExportFailed ? .red : .green)
                         }
                     }
                 }
             }
             .formStyle(.grouped)
+            .confirmationDialog(
+                "Remove all \(model.denylistEntries.count) denylist \(model.denylistEntries.count == 1 ? "entry" : "entries")?",
+                isPresented: $showClearDenylistConfirm
+            ) {
+                Button("Clear All", role: .destructive) {
+                    model.clearDenylist()
+                }
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
 
@@ -161,8 +162,10 @@ struct StatusTroubleshootView: View {
                     env: HostEnvironment(),
                     payloadURL: model.payloadURL
                 )
+                diagExportFailed = false
                 diagExportMessage = "Saved \(saved.lastPathComponent)"
             } catch {
+                diagExportFailed = true
                 diagExportMessage = "Failed: \(error)"
             }
         }

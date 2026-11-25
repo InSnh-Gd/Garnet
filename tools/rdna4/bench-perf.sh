@@ -16,7 +16,7 @@ Usage: bench-perf.sh <label> [--modes "60 160"] [--idle-secs 15] [--host user@ip
   <label>           Run label (e.g. stage1-baseline, stage1-post, stage2-post)
   --modes           Space-separated refresh rates to sample (default: "60 160")
   --idle-secs       Idle sampling duration per mode in seconds (default: 15)
-  --host            SSH target (default: ${RDNA4_TEST_HOST:-insnh-gd@172.29.3.138})
+  --host            SSH target (default: ${RDNA4_TEST_HOST:-${RDNA4_SSH_TARGET:-insnh-gd@172.29.5.214}})
   --key             SSH key path (default: ${RDNA4_SSH_KEY:-$HOME/.ssh/id_ed25519})
 EOF
 }
@@ -30,7 +30,7 @@ LABEL=$1
 shift
 MODES="60 160"
 IDLE_SECS=15
-HOST="${RDNA4_TEST_HOST:-insnh-gd@172.29.3.138}"
+HOST="${RDNA4_TEST_HOST:-${RDNA4_SSH_TARGET:-insnh-gd@172.29.5.214}}"
 SSH_KEY="${RDNA4_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 
 while [ "$#" -gt 0 ]; do
@@ -57,7 +57,7 @@ REMOTE_DIR='$HOME/rdna4-build/perf-bench'
 
 echo "bench-perf: staging and compiling isolated microbench on $HOST..."
 ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $REMOTE_DIR/tmp"
-scp -q -i "$SSH_KEY" "$BENCH_SRC" "$HOST:~/rdna4-build/perf-bench/garnet_perf_bench.m"
+scp -q "${SSH_OPTS[@]}" "$BENCH_SRC" "$HOST:~/rdna4-build/perf-bench/garnet_perf_bench.m"
 
 ssh "${SSH_OPTS[@]}" "$HOST" '
 set -euo pipefail
@@ -152,7 +152,13 @@ for hz in $MODES; do
     fi
 
     echo "--- METAL_BENCH ---"
-    sudo env GARNET_ALLOW=1 RDNA4M_ALLOW=1 GARNET_TEST_INPROC=1 RDNA4M_TEST_INPROC=1 "$BENCH" --run-bench 2>&1 || echo "metal_bench_error=1"
+    cdir="$HOME/rdna4-build/perf-bench/tmp/cache-$hz"
+    rm -rf "$cdir" && mkdir -p "$cdir"
+    sudo env GARNET_ALLOW=1 RDNA4M_ALLOW=1 GARNET_TEST_INPROC=1 RDNA4M_TEST_INPROC=1 \
+        GARNET_TEST_USERCACHE="$cdir" RDNA4M_TEST_USERCACHE="$cdir" \
+        GARNET_NOPCACHE=1 RDNA4M_NOPCACHE=1 \
+        "$BENCH" --run-bench 2>&1 || echo "metal_bench_error=1"
+    rm -rf "$cdir"
 
     echo "--- RECENT_SCANOUT_LOG ---"
     log show --last 25s --predicate '(eventMessage CONTAINS "GarnetMetal" OR eventMessage CONTAINS "Garnet:") AND (eventMessage CONTAINS "scanout: counters:" OR eventMessage CONTAINS "F1:")' --style compact 2>/dev/null | tail -n 10 || true
@@ -194,11 +200,13 @@ sec=="mode" && subsec=="" && /=/ {
 }
 sec=="mode" && subsec=="pb" && /handled/ {
     # hook calls 267/277/278/279: a / b / c / d; handled e / f / g / h
-    if (match($0, /handled [0-9]+ \/ [0-9]+ \/ [0-9]+ \/ ([0-9]+)/, a)) pb_handled[cur]=a[1]+0
+    v=$0; sub(/^.*handled[[:space:]]+/, "", v)
+    if (split(v, a, /[[:space:]]*\/[[:space:]]*/) >= 4) pb_handled[cur]=a[4]+0
     next
 }
 sec=="mode" && subsec=="pa" && /handled/ {
-    if (match($0, /handled [0-9]+ \/ [0-9]+ \/ [0-9]+ \/ ([0-9]+)/, a)) pa_handled[cur]=a[1]+0
+    v=$0; sub(/^.*handled[[:space:]]+/, "", v)
+    if (split(v, a, /[[:space:]]*\/[[:space:]]*/) >= 4) pa_handled[cur]=a[4]+0
     next
 }
 sec=="mode" && subsec=="idle" {

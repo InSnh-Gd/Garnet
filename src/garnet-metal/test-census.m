@@ -61,7 +61,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     // a long list is continued on further lines, never truncated
     { NSMutableString *p = [NSMutableString string]; (void)p; }
 
-    NSString *src = slurp(dir, @"GarnetDevice.m");
+    NSMutableString *srcBuf = [NSMutableString string];
+    NSString *gd = slurp(dir, @"GarnetDevice.m");
+    if (gd.length) [srcBuf appendString:gd];
+    if ([srcBuf containsString:@"#include \"garnet_device.m\""]) {
+        for (NSString *part in @[ @"garnet_metal_internal.h", @"garnet_device.m", @"garnet_backend.m", @"garnet_commands.m" ]) {
+            NSString *s = slurp(dir, part);
+            if (s.length) { [srcBuf appendString:@"\n"]; [srcBuf appendString:s]; }
+        }
+    }
+    NSString *src = srcBuf;
     CHECK("pin: GarnetDevice.m is readable", src.length > 0);
     if (src.length) {
         NSRange l = [src rangeOfString:@"+ (void)load {"], lEnd = [src rangeOfString:@"// lazyInitialize: log, then run the base"];
@@ -72,7 +81,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             CHECK(nm.UTF8String, okp);
         }
         CHECK("pin: +load calls rdna4cen_run (the census is not silenced)", [load containsString:@"unsigned total = rdna4cen_run(pairs);"]);
-        CHECK("pin: RDNA4M_CENSUS=1 prints the lines at +load (the host Mac harness)", [load containsString:@"getenv(\"RDNA4M_CENSUS\")"] && [load containsString:@"fprintf(stderr, \"%s\\n\", l.UTF8String)"]);
+        CHECK("pin: GARNET_CENSUS=1 (or legacy RDNA4M_CENSUS=1) prints the lines at +load (the host Mac harness)", [load containsString:@"garnet_getenv(\"GARNET_CENSUS\", \"RDNA4M_CENSUS\")"] && [load containsString:@"fprintf(stderr, \"%s\\n\", l.UTF8String)"]);
         NSRange cl = [src rangeOfString:@"static void rdna4_census_log(void) {"];
         NSString *clb = cl.location != NSNotFound ? [src substringWithRange:NSMakeRange(cl.location, MIN((NSUInteger)700, src.length - cl.location))] : @"";
         CHECK("pin: the census is logged once per process (atomic flag) through RDNA4LOG, every line", [clb containsString:@"atomic_exchange(&done_, 1)"] && [clb containsString:@"RDNA4LOG(\"%s\", l.UTF8String)"]);

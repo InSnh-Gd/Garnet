@@ -1135,6 +1135,47 @@ struct GarnetCoreTestsRunner {
               && !fm.fileExists(atPath: legacyNativeDir.path))
         check("Hardware-test backup survives repeated install and uninstall",
               (try? String(contentsOf: hwBackupDir.appendingPathComponent("sentinel.txt"), encoding: .utf8)) == "hardware-test-backup-sentinel\n")
+        let xlatePerms = (try? fm.attributesOfItem(atPath: migRoot.appendingPathComponent("private/tmp/garnet-xlate").path)[.posixPermissions] as? Int) ?? 0
+        let spvPerms = (try? fm.attributesOfItem(atPath: migRoot.appendingPathComponent("private/var/tmp/garnet-spv").path)[.posixPermissions] as? Int) ?? 0
+        check("Garnet xlate (01777) and spv (0755) runtime permissions applied",
+              (xlatePerms & 0o7777) == 0o1777 && (spvPerms & 0o777) == 0o755)
+
+        // Critical #2 + Important #1 regression: uninstalling an unmigrated v0.1.0 host with
+        // removeDenylist=false preserves app-denylist.txt by migrating it to Garnet/native and
+        // removes stale /private/tmp/{garnet,rdna4m}-* and /private/var/tmp/{garnet,rdna4m}-* markers.
+        let unmigRoot = tempRoot.appendingPathComponent("v010-uninstall-root")
+        try fm.createDirectory(at: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/native"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/keep"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: unmigRoot.appendingPathComponent("private/tmp"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: unmigRoot.appendingPathComponent("private/var/tmp"), withIntermediateDirectories: true)
+        try Data("bundle:com.example.KeepOnUninstall\n".utf8).write(
+            to: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/native/app-denylist.txt")
+        )
+        try Data("keep-hw-bak\n".utf8).write(
+            to: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/keep/sentinel.txt")
+        )
+        let markerGarnetOff = unmigRoot.appendingPathComponent("private/tmp/garnet-off")
+        let markerLegacyOff = unmigRoot.appendingPathComponent("private/tmp/rdna4m-off")
+        let markerPcache = unmigRoot.appendingPathComponent("private/var/tmp/garnet-pipecache.bin")
+        try Data("1\n".utf8).write(to: markerGarnetOff)
+        try Data("1\n".utf8).write(to: markerLegacyOff)
+        try Data("pc\n".utf8).write(to: markerPcache)
+        let unmigEnv = HostEnvironment(sysRoot: unmigRoot, bootKCPath: "/kcs/BootKernelExtensions.kc", systemKCPath: "/kcs/SystemKernelExtensions.kc", runner: migMock, effectiveUID: 501)
+        let unmigRes = try SystemDiskInstaller.uninstall(
+            options: UninstallOptions(removeDenylist: false, dryRun: false, allowNonRootSandbox: true),
+            env: unmigEnv
+        )
+        check("v0.1.0 uninstall with removeDenylist=false migrates and preserves custom denylist",
+              unmigRes.executed && unmigRes.preservedDenylist
+              && !fm.fileExists(atPath: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/native").path)
+              && fm.fileExists(atPath: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/app-denylist.txt").path)
+              && ((try? String(contentsOf: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/app-denylist.txt"), encoding: .utf8)) ?? "").contains("com.example.KeepOnUninstall"))
+        check("Uninstall cleans /private/tmp and /private/var/tmp garnet-* and rdna4m-* markers while preserving hardware-test backups",
+              !fm.fileExists(atPath: markerGarnetOff.path)
+              && !fm.fileExists(atPath: markerLegacyOff.path)
+              && !fm.fileExists(atPath: markerPcache.path)
+              && (try? String(contentsOf: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/keep/sentinel.txt"), encoding: .utf8)) == "keep-hw-bak\n")
+
         check("OpenCoreMode displayName uses human-readable labels",
               OpenCoreMode.full.displayName == "Full-BAR (8/16 GiB)"
               && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")

@@ -8,6 +8,7 @@ import GarnetCore
 struct OpenCoreAssistantView: View {
     @ObservedObject var model: GarnetAppModel
     @State private var exportStatus: String = ""
+    @State private var exportFailed: Bool = false
     @State private var copiedBanner: String?
 
     var body: some View {
@@ -91,7 +92,7 @@ struct OpenCoreAssistantView: View {
                         if !exportStatus.isEmpty {
                             Text(exportStatus)
                                 .font(.caption)
-                                .foregroundColor(.green)
+                                .foregroundColor(exportFailed ? .red : .green)
                         }
 
                         Spacer()
@@ -179,8 +180,10 @@ struct OpenCoreAssistantView: View {
         if panel.runModal() == .OK, let dstDir = panel.url {
             do {
                 let dst = try SystemDiskInstaller.exportPCIBarCompat(fromPayload: pURL, toDestination: dstDir)
+                exportFailed = false
                 exportStatus = "Exported to \(dst.path)"
             } catch {
+                exportFailed = true
                 exportStatus = "Export failed: \(error)"
             }
         }

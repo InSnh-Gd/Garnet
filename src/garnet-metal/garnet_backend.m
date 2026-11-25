@@ -17,7 +17,9 @@ GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
 }
 GARNET_INTERNAL const char *garnet_getenv(const char *newName, const char *legacyName) {
     int usedLegacy = 0;
-    const char *v = rdna4g_getenv_pair(newName ? getenv(newName) : NULL, legacyName ? getenv(legacyName) : NULL, &usedLegacy);
+    const char *nv = newName ? getenv(newName) : NULL;
+    const char *lv = (!nv && legacyName) ? getenv(legacyName) : NULL;
+    const char *v = rdna4g_getenv_pair(nv, lv, &usedLegacy);
     if (usedLegacy && legacyName && newName) {
         static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
         static char seen[32][48];
