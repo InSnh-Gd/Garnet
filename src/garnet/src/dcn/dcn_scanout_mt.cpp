@@ -46,6 +46,16 @@ static void scan_read_exact(ScanExact *x) {
 // One observation of HUBP0: resolves a pending Present into a latch. Caller holds gScan.lock. The latch is the RAW DCSURF_FLIP_CONTROL.SURFACE_FLIP_PENDING
 // bit clearing (a VUPDATE accepted the address); EARLIEST_INUSE is read too but only feeds the reuse rule (see rdna4scan::latch_observe).
 static bool scan_poll_locked(bool byIrq) {
+	// Self-heal a latched DCN level-triggered VUPDATE_NO_LOCK interrupt if ihEntry()
+	// ever hit a transient rdna4_display_txn collision and dropped an ACK.
+	if (!byIrq && __atomic_load_n(&gDcn.irqAckRecoveryNeeded, __ATOMIC_ACQUIRE) &&
+	    __atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) {
+		struct dcn41_irq vup { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
+		gDcn.tag = "irqrecov";
+		if (dcn41_irq_ack(&gDcn.d, vup) == DCN41_OK) {
+			__atomic_store_n(&gDcn.irqAckRecoveryNeeded, false, __ATOMIC_RELEASE);
+		}
+	}
 	uint32_t raw = 0;
 	const uint64_t fcNow = dcn41_otg_get_frame_count(&gDcn.d, 0u, &raw) == DCN41_OK ? rdna4scan::fc_extend(gScan.fc, raw) : gScan.fc.v;
 	if (!gScan.tbl.pendActive) return false;
