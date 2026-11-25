@@ -1014,7 +1014,7 @@ struct GarnetCoreTestsRunner {
         check("Vulkan ICD & radv-app installed when enabled", fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Vulkan/icd.d/radeon_icd.x86_64.json").path) && fm.isExecutableFile(atPath: sysRoot.appendingPathComponent("usr/local/bin/radv-app").path))
 
         // Rollback test on injected kmutil failure (mark manifest temporarily to confirm restore!)
-        let manifestSysURL = sysRoot.appendingPathComponent("Library/Application Support/RDNA4/native/MANIFEST.txt")
+        let manifestSysURL = sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/MANIFEST.txt")
         let sentinelText = try String(contentsOf: manifestSysURL, encoding: .utf8) + "# SENTINEL_PRE_ROLLBACK\n"
         try sentinelText.write(to: manifestSysURL, atomically: true, encoding: .utf8)
         mock.failKmutilCreate = true
@@ -1071,6 +1071,70 @@ struct GarnetCoreTestsRunner {
         let nulPaddedXML = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>_PrelinkInfoDictionary</key><array><dict><key>CFBundleIdentifier</key><string>com.apple.driver.AppleMobileDevice</string><key>_PrelinkBundlePath</key><string>/Library/Apple/System/Library/Extensions/AppleMobileDevice.kext</string></dict></array></dict></plist>" + String(repeating: "\0", count: 512)
         let parsedNul = try SystemDiskInstaller.parsePrelinkInfoEntries(from: nulPaddedXML)
         check("Prelink plist parser handles trailing NUL padding", parsedNul.count == 1 && parsedNul[0].bundleID == "com.apple.driver.AppleMobileDevice")
+
+        // v0.1.0 -> Garnet idempotent migration & legacy runtime cleanup (preserving RDNA4/hardware-test/backups/)
+        let migRoot = tempRoot.appendingPathComponent("sysroot-v010-mig")
+        try fm.createDirectory(at: migRoot, withIntermediateDirectories: true)
+        let migFix = try buildSyntheticKCsAndPayload(root: migRoot, iopciData: iopci)
+        let legacyNativeDir = migRoot.appendingPathComponent("Library/Application Support/RDNA4/native")
+        let hwBackupDir = migRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/20261125T000000Z")
+        let legacyXlate = migRoot.appendingPathComponent("private/tmp/rdna4m")
+        let legacySpv = migRoot.appendingPathComponent("private/var/tmp/rdna4m-spv")
+        try fm.createDirectory(at: legacyNativeDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: hwBackupDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: legacyXlate, withIntermediateDirectories: true)
+        try fm.createDirectory(at: legacySpv, withIntermediateDirectories: true)
+        try Data("# v0.1.0 custom denylist\nbundle:com.example.MigratedApp\nproc:MigratedTool\n".utf8)
+            .write(to: legacyNativeDir.appendingPathComponent("app-denylist.txt"))
+        try Data("hardware-test-backup-sentinel\n".utf8)
+            .write(to: hwBackupDir.appendingPathComponent("sentinel.txt"))
+        try Data("stale-air\n".utf8).write(to: legacyXlate.appendingPathComponent("old.air"))
+        try Data("stale-spv\n".utf8).write(to: legacySpv.appendingPathComponent("old.spv"))
+
+        let migMock = MockCommandRunner()
+        let migEnv = HostEnvironment(sysRoot: migRoot, bootKCPath: "/kcs/BootKernelExtensions.kc", systemKCPath: "/kcs/SystemKernelExtensions.kc", runner: migMock, effectiveUID: 501)
+        let preEntries = try DenylistManager.load(env: migEnv)
+        check("DenylistManager falls back to reading legacy v0.1.0 denylist before migration", preEntries.contains(where: { $0.kind == .bundle && $0.value == "com.example.MigratedApp" }))
+
+        let migRes1 = try SystemDiskInstaller.install(
+            payloadURL: migFix.payloadDir,
+            options: InstallOptions(installVulkanICD: false, dryRun: false, verifyCodeSignatures: false, allowNonRootSandbox: true),
+            env: migEnv
+        )
+        check("v0.1.0 migration reports denylist preserved", migRes1.executed && migRes1.denylistPreservedOnUpgrade)
+        let postEntries = try DenylistManager.load(env: migEnv)
+        check("v0.1.0 custom denylist migrated to Garnet/native",
+              fm.fileExists(atPath: migRoot.appendingPathComponent("Library/Application Support/Garnet/native/app-denylist.txt").path)
+              && postEntries.contains(where: { $0.kind == .bundle && $0.value == "com.example.MigratedApp" })
+              && postEntries.contains(where: { $0.kind == .proc && $0.value == "MigratedTool" }))
+        check("v0.1.0 legacy runtime dirs removed",
+              !fm.fileExists(atPath: legacyNativeDir.path)
+              && !fm.fileExists(atPath: legacyXlate.path)
+              && !fm.fileExists(atPath: legacySpv.path))
+        check("RDNA4 hardware-test backup preserved untouched",
+              (try? String(contentsOf: hwBackupDir.appendingPathComponent("sentinel.txt"), encoding: .utf8)) == "hardware-test-backup-sentinel\n")
+        check("New Garnet runtime dirs created",
+              fm.fileExists(atPath: migRoot.appendingPathComponent("private/tmp/garnet-xlate").path)
+              && fm.fileExists(atPath: migRoot.appendingPathComponent("private/var/tmp/garnet-spv").path)
+              && fm.fileExists(atPath: migRoot.appendingPathComponent("Library/Logs/Garnet").path)
+              && fm.fileExists(atPath: migRoot.appendingPathComponent("Library/Logs/GarnetTranslate").path))
+
+        // Idempotent second install: preserve edits to new Garnet denylist even if legacy dir reappears
+        _ = try DenylistManager.add(kind: .proc, value: "PostMigrationTool", env: migEnv, syncLiveKernel: false)
+        try fm.createDirectory(at: legacyNativeDir, withIntermediateDirectories: true)
+        try Data("proc:StaleShouldNotOverwrite\n".utf8).write(to: legacyNativeDir.appendingPathComponent("app-denylist.txt"))
+        _ = try SystemDiskInstaller.install(
+            payloadURL: migFix.payloadDir,
+            options: InstallOptions(installVulkanICD: false, dryRun: false, verifyCodeSignatures: false, allowNonRootSandbox: true),
+            env: migEnv
+        )
+        let postEntries2 = try DenylistManager.load(env: migEnv)
+        check("Repeated install idempotently preserves new Garnet denylist",
+              postEntries2.contains(where: { $0.kind == .proc && $0.value == "PostMigrationTool" })
+              && !postEntries2.contains(where: { $0.kind == .proc && $0.value == "StaleShouldNotOverwrite" })
+              && !fm.fileExists(atPath: legacyNativeDir.path))
+        check("Hardware-test backup survives repeated install and uninstall",
+              (try? String(contentsOf: hwBackupDir.appendingPathComponent("sentinel.txt"), encoding: .utf8)) == "hardware-test-backup-sentinel\n")
     }
 
     static func runOptionalReal25G332Checks() throws {

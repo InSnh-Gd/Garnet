@@ -15,10 +15,10 @@ if [ "${RDNA4_TEST_MODE:-}" = 1 ]; then
 fi
 mac() { local path=$1; shift; "$tool_root$path" "$@"; }
 [ "$#" -le 1 ] || { printf 'Usage: %s [output-directory]\n' "$0" >&2; exit 2; }
-base=${1:-/Library/Logs/RDNA4}
+base=${1:-/Library/Logs/Garnet}
 case "$base" in /*) ;; *) base="$PWD/$base";; esac
 mac /bin/mkdir -p "$base" && mac /bin/chmod 700 "$base" || exit 1
-bundle=$(mac /usr/bin/mktemp -d "$base/RDNA4.XXXXXXXX") || exit 1
+bundle=$(mac /usr/bin/mktemp -d "$base/Garnet.XXXXXXXX") || exit 1
 status="$bundle/status.tsv"
 printf 'capture\texit_status\n' > "$status"
 active='' timer=''
@@ -76,7 +76,8 @@ cold_shader_file() {
         [ -n "$(mac /usr/bin/find "$1" -type f -links 1 -size +0c -size "-$2c" -print)" ]
 }
 capture_cold_shaders() {
-    local keys=$1 cache="$tool_root/private/var/tmp/rdna4m-spv" key
+    local keys=$1 cache="$tool_root/private/var/tmp/garnet-spv" key
+    [ -d "$cache" ] && [ ! -L "$cache" ] || cache="$tool_root/private/var/tmp/rdna4m-spv"
     local files=()
     [ -d "$cache" ] && [ ! -L "$cache" ] || return 0
     while IFS= read -r key; do
@@ -89,7 +90,8 @@ capture_cold_shaders() {
     capture "$bundle/cold-shaders" 15 /usr/bin/tar -cf "$bundle/cold-shaders.tar" -C "$cache" "${files[@]}"
 }
 capture_cold_air() {
-    local keys=$1 uid=$2 dump="$tool_root/private/tmp/rdna4m" key sidecar
+    local keys=$1 uid=$2 dump="$tool_root/private/tmp/garnet-xlate" key sidecar
+    [ ! -L "$dump" ] && [ -d "$dump/$uid" ] && [ ! -L "$dump/$uid" ] || dump="$tool_root/private/tmp/rdna4m"
     local files=()
     [ ! -L "$dump" ] && [ -d "$dump/$uid" ] && [ ! -L "$dump/$uid" ] || return 0
     while IFS= read -r key; do
@@ -111,7 +113,10 @@ capture "$bundle/osversion" 5 /usr/sbin/sysctl -n kern.osversion || :
 capture "$bundle/boot-session-uuid" 5 /usr/sbin/sysctl -n kern.bootsessionuuid || :
 boot_ok=0
 capture "$bundle/boottime" 5 /usr/sbin/sysctl -n kern.boottime && boot_ok=1
-probe='/Library/Application Support/RDNA4/native/garnettest'
+probe='/Library/Application Support/Garnet/native/garnettest'
+if [ ! -x "$tool_root$probe" ]; then
+    probe='/Library/Application Support/RDNA4/native/garnettest'
+fi
 if [ ! -x "$tool_root$probe" ]; then
     probe='/Library/Application Support/RDNA4/garnettest'
 fi
@@ -144,7 +149,8 @@ for pid in $(mac /usr/bin/awk '
 ' "$bundle/processes.txt"); do
     capture "$bundle/windowserver-sample-$pid" 10 /usr/bin/sample "$pid" 1 10 -file /dev/stdout || :
     for uid in 88 0; do
-        pixels="$tool_root/private/tmp/rdna4m/$uid"
+        pixels="$tool_root/private/tmp/garnet-xlate/$uid"
+        [ -d "$pixels" ] && [ ! -L "$pixels" ] || pixels="$tool_root/private/tmp/rdna4m/$uid"
         [ -d "$pixels" ] && [ ! -L "$pixels" ] || continue
         capture "$bundle/present-top-$pid-$uid" 20 /bin/bash -c '
             directory=$1 pid=$2 tar=$3 output=$4
@@ -160,13 +166,14 @@ for pid in $(mac /usr/bin/awk '
     done
 done
 capture "$bundle/diskutil" 30 /usr/sbin/diskutil list || :
-RDNA4M_ALLOW=1 capture "$bundle/displays" 30 /usr/sbin/system_profiler SPDisplaysDataType -timeout 20 || :
-for trace in "$tool_root"/private/var/tmp/rdna4m-cblog.[0-9]*.txt; do
+GARNET_ALLOW=1 capture "$bundle/displays" 30 /usr/sbin/system_profiler SPDisplaysDataType -timeout 20 || :
+for trace in "$tool_root"/private/var/tmp/garnet-cblog.[0-9]*.txt "$tool_root"/private/var/tmp/rdna4m-cblog.[0-9]*.txt; do
     [ -f "$trace" ] && [ ! -L "$trace" ] || continue
     trace_name=${trace##*/}
     capture "$bundle/${trace_name%.txt}" 10 /usr/bin/tail -c 52428800 "$trace" || :
 done
-translator_logs="$tool_root/Library/Logs/RDNA4Translate"
+translator_logs="$tool_root/Library/Logs/GarnetTranslate"
+[ -d "$translator_logs" ] && [ ! -L "$translator_logs" ] || translator_logs="$tool_root/Library/Logs/RDNA4Translate"
 if [ -d "$translator_logs" ] && [ ! -L "$translator_logs" ]; then
     for stream in stdout stderr; do
         trace="$translator_logs/translate.$stream"

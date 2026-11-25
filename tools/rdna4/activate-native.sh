@@ -65,7 +65,7 @@ wait_for_bringup() {
 wait_for_bringup || { printf 'GarnetDriver IOService did not appear\n' >&2; exit 1; }
 "$root/native-translate" --wait-ready 30
 rid=$("$root/publish-metal")
-export RDNA4_METAL_BUNDLE=/Library/GPUBundles/GarnetMetal.bundle RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1
+export RDNA4_METAL_BUNDLE=/Library/GPUBundles/GarnetMetal.bundle GARNET_ALLOW=1 GARNET_TEST_INPROC=1
 "$root/mtlprobe-direct" compute --registry-id "$rid"
 # Successful compute and fences do not establish that the render backend writes pixels.
 "$root/mtlprobe-direct" quad --registry-id "$rid"
@@ -120,7 +120,7 @@ if [ -n "$deny_file" ]; then
     done < "$deny_file"
 fi
 # /tmp is cleared at boot; an owned persistent opt-in restores observational diagnostics.
-if [ -f /private/var/tmp/rdna4m-observe ] && [ ! -L /private/var/tmp/rdna4m-observe ] && [ -O /private/var/tmp/rdna4m-observe ]; then
+if [ -f /private/var/tmp/garnet-observe ] && [ ! -L /private/var/tmp/garnet-observe ] && [ -O /private/var/tmp/garnet-observe ]; then
     observe_flag() {
         local path=$1 content=$2
         if [ -e "$path" ] || [ -L "$path" ]; then
@@ -130,15 +130,15 @@ if [ -f /private/var/tmp/rdna4m-observe ] && [ ! -L /private/var/tmp/rdna4m-obse
         fi
         chmod 644 "$path"
     }
-    observe_flag /private/tmp/rdna4m-crc '128 noslot'
-    observe_flag /private/tmp/rdna4m-cblog ''
-    observe_flag /private/tmp/rdna4m-surfaces ''
-    printf 'RDNA4 render observation enabled for this boot.\n'
+    observe_flag /private/tmp/garnet-crc '128 noslot'
+    observe_flag /private/tmp/garnet-cblog ''
+    observe_flag /private/tmp/garnet-surfaces ''
+    printf 'Garnet render observation enabled for this boot.\n'
 fi
 step 'status +: 0 \(OK\)|status 0 \(OK\)' pipeadopt
 step 'agdc status +: 0 \(PUBLISHED\)' pipeagdc 1
-touch /private/tmp/rdna4m-headless-no
-chmod 644 /private/tmp/rdna4m-headless-no
+touch /private/tmp/garnet-headless-no
+chmod 644 /private/tmp/garnet-headless-no
 step '0xccf now +: 1' pipearm 1
 step '[Rr]estart [Ww]indow' pipereload
 if pgrep -x WindowServer >/dev/null; then

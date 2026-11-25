@@ -43,7 +43,7 @@ case "$name" in
     kmutil) [ "$*" = showloaded ] || exit 99; printf 'kmutil unavailable\n' >&2; exit 7;;
     diskutil) [ "$*" = list ] || exit 99; printf 'diskutil diagnostic\n';;
     system_profiler)
-        [ "${RDNA4M_ALLOW:-}" = 1 ] || exit 96
+        [ "${GARNET_ALLOW:-}" = 1 ] || exit 96
         printf 'partial display information\n'
         # A delayed child exposes timers that kill only the parent shell.
         (sleep 3; printf 'escaped\n' > "$ESCAPED") &
@@ -71,7 +71,7 @@ case "$name" in
             *) exit 99;;
         esac
         if [ "$SCENARIO" = native-probe ]; then
-            case "$0" in */RDNA4/native/garnettest) ;; *) printf 'obsolete probe used\n' >&2; exit 97;; esac
+            case "$0" in */Garnet/native/garnettest) ;; *) printf 'obsolete probe used\n' >&2; exit 97;; esac
         fi
         [ "$SCENARIO" != no-service ] || { printf 'GarnetDriver not found\n' >&2; exit 1; }
         printf 'driver-ring-%s-sentinel\n' "$1";;
@@ -92,7 +92,7 @@ export SHADER_KEY=3b5c3b282f057ab872028db2598f50cfa633280af773ccc7d2dc65351b9cb0
 export SYMLINK_KEY=1111111111111111111111111111111111111111111111111111111111111111
 export AIR_ONLY_KEY=8934b558f252a86f23a970a823e6adec543346c3c1486580f149a5e803476432
 extra_key=2222222222222222222222222222222222222222222222222222222222222222
-shader_cache="$root/private/var/tmp/rdna4m-spv"
+shader_cache="$root/private/var/tmp/garnet-spv"
 mkdir -p "$shader_cache"
 printf 'compiled-fragment\n' > "$shader_cache/$SHADER_KEY.spv"
 printf '{"stage":"fragment"}\n' > "$shader_cache/$SHADER_KEY.meta.json"
@@ -100,30 +100,30 @@ printf 'unreferenced\n' > "$shader_cache/$extra_key.spv"
 printf '{}\n' > "$shader_cache/$extra_key.meta.json"
 ln -s "$shader_cache/$SHADER_KEY.spv" "$shader_cache/$SYMLINK_KEY.spv"
 printf '{}\n' > "$shader_cache/$SYMLINK_KEY.meta.json"
-printf 'current-frame-trace-sentinel\n' > "$root/private/var/tmp/rdna4m-cblog.123.txt"
-ln -s "$root/private/var/tmp/rdna4m-cblog.123.txt" "$root/private/var/tmp/rdna4m-cblog.124.txt"
-mkdir -p "$root/private/tmp/rdna4m/88"
-printf 'untranslated-fragment\n' > "$root/private/tmp/rdna4m/88/$AIR_ONLY_KEY.air"
-printf '{"function":"fixture-fragment"}\n' > "$root/private/tmp/rdna4m/88/$AIR_ONLY_KEY.fragment.json"
-ln -s "$AIR_ONLY_KEY.air" "$root/private/tmp/rdna4m/88/$SYMLINK_KEY.air"
-printf 'unreferenced-fragment\n' > "$root/private/tmp/rdna4m/88/$extra_key.air"
-mkdir -p "$root/Library/Logs/RDNA4Translate"
-printf 'translator-worker-start\n' > "$root/Library/Logs/RDNA4Translate/translate.stdout"
-ln -s translate.stdout "$root/Library/Logs/RDNA4Translate/translate.stderr"
-printf 'present-metadata-sentinel\n' > "$root/private/tmp/rdna4m/88/present-10-1-100.json"
-printf 'present-pixels-sentinel\n' > "$root/private/tmp/rdna4m/88/present-10-1-100.raw"
-printf 'obsolete-process\n' > "$root/private/tmp/rdna4m/88/present-9-1-100.raw"
-ln -s "$root/private/tmp/rdna4m/88/present-10-1-100.raw" "$root/private/tmp/rdna4m/88/present-10-2-200.raw"
+printf 'current-frame-trace-sentinel\n' > "$root/private/var/tmp/garnet-cblog.123.txt"
+ln -s "$root/private/var/tmp/garnet-cblog.123.txt" "$root/private/var/tmp/garnet-cblog.124.txt"
+mkdir -p "$root/private/tmp/garnet-xlate/88"
+printf 'untranslated-fragment\n' > "$root/private/tmp/garnet-xlate/88/$AIR_ONLY_KEY.air"
+printf '{"function":"fixture-fragment"}\n' > "$root/private/tmp/garnet-xlate/88/$AIR_ONLY_KEY.fragment.json"
+ln -s "$AIR_ONLY_KEY.air" "$root/private/tmp/garnet-xlate/88/$SYMLINK_KEY.air"
+printf 'unreferenced-fragment\n' > "$root/private/tmp/garnet-xlate/88/$extra_key.air"
+mkdir -p "$root/Library/Logs/GarnetTranslate"
+printf 'translator-worker-start\n' > "$root/Library/Logs/GarnetTranslate/translate.stdout"
+ln -s translate.stdout "$root/Library/Logs/GarnetTranslate/translate.stderr"
+printf 'present-metadata-sentinel\n' > "$root/private/tmp/garnet-xlate/88/present-10-1-100.json"
+printf 'present-pixels-sentinel\n' > "$root/private/tmp/garnet-xlate/88/present-10-1-100.raw"
+printf 'obsolete-process\n' > "$root/private/tmp/garnet-xlate/88/present-9-1-100.raw"
+ln -s "$root/private/tmp/garnet-xlate/88/present-10-1-100.raw" "$root/private/tmp/garnet-xlate/88/present-10-2-200.raw"
 export RDNA4_TEST_MODE=1 RDNA4_TEST_ROOT="$root" RDNA4_TEST_TIMEOUT=1
 export CALLS ESCAPED SCENARIO
 for SCENARIO in recent-boot old-boot boot-failure no-service native-probe missing-probe; do
     if [ "$SCENARIO" = native-probe ]; then
-        mkdir -p "$root/Library/Application Support/RDNA4/native"
-        ln -s "$root/stub" "$root/Library/Application Support/RDNA4/native/garnettest"
+        mkdir -p "$root/Library/Application Support/Garnet/native"
+        ln -s "$root/stub" "$root/Library/Application Support/Garnet/native/garnettest"
     fi
     if [ "$SCENARIO" = missing-probe ]; then
         rm "$root/Library/Application Support/RDNA4/garnettest"
-        rm "$root/Library/Application Support/RDNA4/native/garnettest"
+        rm "$root/Library/Application Support/Garnet/native/garnettest"
     fi
     CALLS="$evidence/$SCENARIO.calls"
     ESCAPED="$evidence/$SCENARIO.escaped"
@@ -176,9 +176,9 @@ for SCENARIO in recent-boot old-boot boot-failure no-service native-probe missin
     fi
     ! grep -q 'unrelated-process' "$saved/processes.txt"
     grep -q 'CURRENT-BOOT-UUID' "$saved/boot-session-uuid.txt"
-    grep -qx 'current-frame-trace-sentinel' "$saved/rdna4m-cblog.123.txt"
-    grep -qx "$(printf 'rdna4m-cblog.123\t0')" "$saved/status.tsv"
-    [ ! -e "$saved/rdna4m-cblog.124.txt" ]
+    grep -qx 'current-frame-trace-sentinel' "$saved/garnet-cblog.123.txt"
+    grep -qx "$(printf 'garnet-cblog.123\t0')" "$saved/status.tsv"
+    [ ! -e "$saved/garnet-cblog.124.txt" ]
     case "$SCENARIO" in
         missing-probe)
             ! grep -q '^garnettest ' "$CALLS"

@@ -59,7 +59,9 @@ public enum DiagnosticsManager {
             }
         }
 
-        let manifestURL = env.url(forSystemPath: "/Library/Application Support/RDNA4/native/MANIFEST.txt")
+        let primaryManifestURL = env.url(forSystemPath: GarnetPaths.manifestPath)
+        let legacyManifestURL = env.url(forSystemPath: GarnetPaths.legacyManifestPath)
+        let manifestURL = FileManager.default.fileExists(atPath: primaryManifestURL.path) ? primaryManifestURL : legacyManifestURL
         var manifestPath: String?
         var instVer: String?
         if FileManager.default.fileExists(atPath: manifestURL.path),
@@ -68,12 +70,14 @@ public enum DiagnosticsManager {
             instVer = kv["GARNET_VERSION"]
         }
 
-        let vulkanURL = env.url(forSystemPath: "/Library/Vulkan/icd.d/radeon_icd.x86_64.json")
+        let vulkanURL = env.url(forSystemPath: GarnetPaths.vulkanICDPath)
         let vulkanInstalled = FileManager.default.fileExists(atPath: vulkanURL.path)
 
         let sip = env.readSIPStatus()
         var vramSummary: String?
-        let garnettest = env.url(forSystemPath: "/Library/Application Support/RDNA4/native/garnettest")
+        let primaryTest = env.url(forSystemPath: GarnetPaths.garnetTestPath)
+        let legacyTest = env.url(forSystemPath: GarnetPaths.legacyGarnetTestPath)
+        let garnettest = FileManager.default.isExecutableFile(atPath: primaryTest.path) ? primaryTest : legacyTest
         if env.effectiveUID == 0 && FileManager.default.isExecutableFile(atPath: garnettest.path) {
             let vr = env.runner.run(garnettest.path, ["accel", "vramstat"])
             if vr.exitCode == 0 && !vr.stdout.isEmpty {
@@ -154,10 +158,15 @@ public enum DiagnosticsManager {
         let logShow = env.runner.run("/usr/bin/log", ["show", "--last", "15m", "--predicate", "eventMessage CONTAINS 'garnet' OR eventMessage CONTAINS 'Garnet' OR eventMessage CONTAINS 'RDNA4'"]).stdout
         try sanitizeText(logShow).data(using: .utf8)?.write(to: stageDir.appendingPathComponent("kernel-logs-15m.txt"))
 
-        if let manifest = try? String(contentsOf: env.url(forSystemPath: "/Library/Application Support/RDNA4/native/MANIFEST.txt"), encoding: .utf8) {
+        let diagManifestURL: URL = {
+            let u = env.url(forSystemPath: GarnetPaths.manifestPath)
+            return FileManager.default.fileExists(atPath: u.path) ? u : env.url(forSystemPath: GarnetPaths.legacyManifestPath)
+        }()
+        if let manifest = try? String(contentsOf: diagManifestURL, encoding: .utf8) {
             try sanitizeText(manifest).data(using: .utf8)?.write(to: stageDir.appendingPathComponent("installed-MANIFEST.txt"))
         }
-        if let deny = try? String(contentsOf: env.url(forSystemPath: DenylistManager.denylistPath), encoding: .utf8) {
+        if let denyURL = DenylistManager.resolvedReadURL(env: env),
+           let deny = try? String(contentsOf: denyURL, encoding: .utf8) {
             try sanitizeText(deny).data(using: .utf8)?.write(to: stageDir.appendingPathComponent("app-denylist.txt"))
         }
 

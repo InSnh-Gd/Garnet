@@ -38,8 +38,32 @@ public enum DenylistError: Error, CustomStringConvertible {
 }
 
 public enum DenylistManager {
-    public static let denylistPath = "/Library/Application Support/RDNA4/native/app-denylist.txt"
-    public static let garnetTestPath = "/Library/Application Support/RDNA4/native/garnettest"
+    public static let denylistPath = GarnetPaths.denylistPath
+    public static let garnetTestPath = GarnetPaths.garnetTestPath
+
+    public static func resolvedReadURL(env: HostEnvironment) -> URL? {
+        let primary = env.url(forSystemPath: denylistPath)
+        if FileManager.default.fileExists(atPath: primary.path) {
+            return primary
+        }
+        let legacy = env.url(forSystemPath: GarnetPaths.legacyDenylistPath)
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            return legacy
+        }
+        return nil
+    }
+
+    private static func resolvedGarnetTestURL(env: HostEnvironment) -> URL? {
+        let primary = env.url(forSystemPath: garnetTestPath)
+        if FileManager.default.isExecutableFile(atPath: primary.path) {
+            return primary
+        }
+        let legacy = env.url(forSystemPath: GarnetPaths.legacyGarnetTestPath)
+        if FileManager.default.isExecutableFile(atPath: legacy.path) {
+            return legacy
+        }
+        return nil
+    }
 
     public static func inspectAppBundle(at appURL: URL) throws -> AppBundleMetadata {
         let resolved = appURL.standardizedFileURL.resolvingSymlinksInPath()
@@ -72,8 +96,7 @@ public enum DenylistManager {
     }
 
     public static func load(env: HostEnvironment) throws -> [DenylistEntry] {
-        let url = env.url(forSystemPath: denylistPath)
-        guard FileManager.default.fileExists(atPath: url.path) else {
+        guard let url = resolvedReadURL(env: env) else {
             return []
         }
         let text = try String(contentsOf: url, encoding: .utf8)
@@ -114,7 +137,7 @@ public enum DenylistManager {
         }
         var lines = [
             "# Garnet Application Denylist (managed by Garnet / garnetctl)",
-            "# WindowServer and RDNA4M_ALLOW=1 root tools remain unconditionally immune.",
+            "# WindowServer and GARNET_ALLOW=1 root tools remain unconditionally immune.",
             ""
         ]
         for e in entries {
@@ -174,17 +197,13 @@ public enum DenylistManager {
 
     public static func clear(env: HostEnvironment, syncLiveKernel: Bool = true) throws {
         try save([], env: env)
-        if syncLiveKernel {
-            let toolURL = env.url(forSystemPath: garnetTestPath)
-            if FileManager.default.isExecutableFile(atPath: toolURL.path) {
-                _ = env.runner.run(toolURL.path, ["accel", "appdeny", "clear"])
-            }
+        if syncLiveKernel, let toolURL = resolvedGarnetTestURL(env: env) {
+            _ = env.runner.run(toolURL.path, ["accel", "appdeny", "clear"])
         }
     }
 
     public static func syncAllToLiveKernel(env: HostEnvironment) {
-        let toolURL = env.url(forSystemPath: garnetTestPath)
-        guard FileManager.default.isExecutableFile(atPath: toolURL.path),
+        guard let toolURL = resolvedGarnetTestURL(env: env),
               let entries = try? load(env: env) else {
             return
         }
@@ -195,8 +214,7 @@ public enum DenylistManager {
     }
 
     private static func syncProcEntry(action: String, name: String, env: HostEnvironment) {
-        let toolURL = env.url(forSystemPath: garnetTestPath)
-        guard FileManager.default.isExecutableFile(atPath: toolURL.path) else { return }
+        guard let toolURL = resolvedGarnetTestURL(env: env) else { return }
         _ = env.runner.run(toolURL.path, ["accel", "appdeny", action, name])
     }
 }

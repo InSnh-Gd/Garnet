@@ -5,7 +5,7 @@
     <key>Label</key><string>com.garnet.native-translate</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/Application Support/RDNA4/native/native-translate</string>
+        <string>/Library/Application Support/Garnet/native/native-translate</string>
     </array>
     <key>UserName</key><string>nobody</string>
     <key>GroupName</key><string>nobody</string>
@@ -18,7 +18,7 @@
     <key>SoftResourceLimits</key>
     <dict><key>NumberOfFiles</key><integer>256</integer><key>Core</key><integer>0</integer></dict>
     <key>ExitTimeOut</key><integer>5</integer>
-    <key>StandardOutPath</key><string>/Library/Logs/RDNA4Translate/translate.stdout</string>
-    <key>StandardErrorPath</key><string>/Library/Logs/RDNA4Translate/translate.stderr</string>
+    <key>StandardOutPath</key><string>/Library/Logs/GarnetTranslate/translate.stdout</string>
+    <key>StandardErrorPath</key><string>/Library/Logs/GarnetTranslate/translate.stderr</string>
 </dict>
 </plist>

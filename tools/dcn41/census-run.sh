@@ -21,7 +21,7 @@
 set -eu
 P=${0:A:h:h:h}
 HOST=${GARNET_HOST:-${RDNA4_HOST:-garnet}}
-GARNETTEST=${GARNETTEST:-"/Library/Application Support/RDNA4/native/garnettest"}
+GARNETTEST=${GARNETTEST:-"/Library/Application Support/Garnet/native/garnettest"}
 RUN=${1:-t1}
 GAP=${PASS_GAP:-10}
 TSV="$P/src/dcn41/dcn41_census.tsv"

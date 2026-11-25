@@ -102,14 +102,14 @@ public enum SystemDiskInstaller {
         "com.navi48.bringup"
     ]
 
-    public static let auxKCPath = "/Library/KernelCollections/AuxiliaryKernelExtensions.kc"
-    public static let extensionsDir = "/Library/Extensions"
-    public static let gpuBundlesDir = "/Library/GPUBundles"
-    public static let launchDaemonsDir = "/Library/LaunchDaemons"
-    public static let nativeSupportDir = "/Library/Application Support/RDNA4/native"
-    public static let vulkanICDDir = "/Library/Vulkan/icd.d"
-    public static let vulkanICDPath = "/Library/Vulkan/icd.d/radeon_icd.x86_64.json"
-    public static let radvAppBinPath = "/usr/local/bin/radv-app"
+    public static let auxKCPath = GarnetPaths.auxKCPath
+    public static let extensionsDir = GarnetPaths.extensionsDir
+    public static let gpuBundlesDir = GarnetPaths.gpuBundlesDir
+    public static let launchDaemonsDir = GarnetPaths.launchDaemonsDir
+    public static let nativeSupportDir = GarnetPaths.nativeSupportDir
+    public static let vulkanICDDir = GarnetPaths.vulkanICDDir
+    public static let vulkanICDPath = GarnetPaths.vulkanICDPath
+    public static let radvAppBinPath = GarnetPaths.radvAppBinPath
 
     private static let legacyDaemonLabels: [String] = [
         "com.garnet.native",
@@ -258,7 +258,10 @@ public enum SystemDiskInstaller {
 
         let foreignKexts = try inspectAuxKCForeignKexts(env: env, allowUnreadableInDryRun: options.dryRun)
         let denylistURL = env.url(forSystemPath: DenylistManager.denylistPath)
+        let legacyDenylistURL = env.url(forSystemPath: GarnetPaths.legacyDenylistPath)
         let denylistExists = FileManager.default.fileExists(atPath: denylistURL.path)
+        let legacyDenylistExists = FileManager.default.fileExists(atPath: legacyDenylistURL.path)
+        let willPreserveOrMigrateDenylist = denylistExists || legacyDenylistExists
 
         var planned = [
             "\(extensionsDir)/Garnet.kext",
@@ -292,7 +295,7 @@ public enum SystemDiskInstaller {
                 preservedForeignAuxKexts: foreignKexts,
                 plannedPaths: planned,
                 vulkanICDInstalled: options.installVulkanICD,
-                denylistPreservedOnUpgrade: denylistExists,
+                denylistPreservedOnUpgrade: willPreserveOrMigrateDenylist,
                 backupDirectory: nil,
                 message: "Dry-run verified payload \(verified.garnetVersion) and layout \(matchedShortId); ESP untouched; \(foreignKexts.count) foreign AuxKC kext(s) preserved"
             )
@@ -304,7 +307,9 @@ public enum SystemDiskInstaller {
         // Verify all parent directories & target paths are not symlinks
         for abs in [
             extensionsDir, gpuBundlesDir, launchDaemonsDir,
-            "/Library/Application Support/RDNA4", nativeSupportDir,
+            GarnetPaths.supportRoot, nativeSupportDir, GarnetPaths.backupsDir,
+            GarnetPaths.logsDir, GarnetPaths.translateLogsDir,
+            GarnetPaths.xlateDumpDir, GarnetPaths.spvCacheDir,
             "/Library/KernelCollections"
         ] {
             try assertNotSymlink(url: env.url(forSystemPath: abs))
@@ -314,8 +319,11 @@ public enum SystemDiskInstaller {
                 try assertNotSymlink(url: env.url(forSystemPath: abs))
             }
         }
-        for abs in planned + retiredSystemPaths {
+        for abs in planned + retiredSystemPaths + GarnetPaths.legacyRuntimeCleanupPaths {
             try assertNotSymlink(url: env.url(forSystemPath: abs))
+        }
+        if legacyDenylistExists {
+            try assertNotSymlink(url: legacyDenylistURL)
         }
 
         // Stage extracted GarnetMetal.bundle outside target paths first and verify codesign before mutating disk
@@ -349,7 +357,7 @@ public enum SystemDiskInstaller {
         }
 
         // Create backup directory for atomic rollback
-        let backupsRoot = env.url(forSystemPath: "\(nativeSupportDir)/backups")
+        let backupsRoot = env.url(forSystemPath: GarnetPaths.backupsDir)
         let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
         let backupDir = backupsRoot.appendingPathComponent("install-\(timestamp)-\(UUID().uuidString.prefix(6))")
         try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
@@ -384,7 +392,8 @@ public enum SystemDiskInstaller {
             if !denylistExists {
                 targetsToTrack.append(DenylistManager.denylistPath)
             }
-            for retired in retiredSystemPaths where fm.fileExists(atPath: env.url(forSystemPath: retired).path) {
+            for retired in retiredSystemPaths + GarnetPaths.legacyRuntimeCleanupPaths
+                where fm.fileExists(atPath: env.url(forSystemPath: retired).path) {
                 targetsToTrack.append(retired)
             }
             for abs in targetsToTrack {
@@ -393,7 +402,13 @@ public enum SystemDiskInstaller {
             }
 
             // Ensure target directories exist
-            for dirAbs in [extensionsDir, gpuBundlesDir, launchDaemonsDir, nativeSupportDir, "\(nativeSupportDir)/variants", "/Library/KernelCollections", "/Library/Logs/RDNA4", "/Library/Logs/RDNA4Translate"] {
+            for dirAbs in [
+                extensionsDir, gpuBundlesDir, launchDaemonsDir,
+                nativeSupportDir, "\(nativeSupportDir)/variants",
+                "/Library/KernelCollections",
+                GarnetPaths.logsDir, GarnetPaths.translateLogsDir,
+                GarnetPaths.xlateDumpDir, GarnetPaths.spvCacheDir
+            ] {
                 try fm.createDirectory(at: env.url(forSystemPath: dirAbs), withIntermediateDirectories: true)
             }
             if options.installVulkanICD {
@@ -431,9 +446,22 @@ public enum SystemDiskInstaller {
             let varIdxDst = env.url(forSystemPath: "\(nativeSupportDir)/variants/index.json")
             try replaceItem(from: payloadRoot.appendingPathComponent("variants/index.json"), to: varIdxDst)
 
-            // Seed default app-denylist ONLY if user does not already have one
+            // Idempotent v0.1.0 -> Garnet app-denylist migration BEFORE cleaning legacy RDNA4/native:
+            // preserve existing Garnet denylist; else migrate legacy RDNA4 denylist; else seed default.
             if !denylistExists {
-                try replaceItem(from: payloadRoot.appendingPathComponent("default-app-denylist.txt"), to: denylistURL)
+                if legacyDenylistExists {
+                    try replaceItem(from: legacyDenylistURL, to: denylistURL)
+                } else {
+                    try replaceItem(from: payloadRoot.appendingPathComponent("default-app-denylist.txt"), to: denylistURL)
+                }
+            }
+
+            // Clean legacy v0.1.0 runtime dirs (NEVER touches RDNA4/hardware-test or its backups)
+            for legacyAbs in GarnetPaths.legacyRuntimeCleanupPaths {
+                let legURL = env.url(forSystemPath: legacyAbs)
+                if fm.fileExists(atPath: legURL.path) {
+                    try fm.removeItem(at: legURL)
+                }
             }
 
             // Copy LaunchDaemons
@@ -463,11 +491,14 @@ public enum SystemDiskInstaller {
                 let p = env.url(forSystemPath: "\(nativeSupportDir)/\(name)").path
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: p)
             }
+            try fm.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: env.url(forSystemPath: GarnetPaths.xlateDumpDir).path)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: env.url(forSystemPath: GarnetPaths.spvCacheDir).path)
             if !isSandbox && env.effectiveUID == 0 {
                 var chownPaths = [garnetDst.path, accelDst.path, metalDst.path,
                                   env.url(forSystemPath: "\(launchDaemonsDir)/com.garnet.native.plist").path,
                                   env.url(forSystemPath: "\(launchDaemonsDir)/com.garnet.native-translate.plist").path,
-                                  env.url(forSystemPath: "/Library/Application Support/RDNA4").path]
+                                  env.url(forSystemPath: GarnetPaths.supportRoot).path,
+                                  env.url(forSystemPath: GarnetPaths.xlateDumpDir).path]
                 if options.installVulkanICD {
                     chownPaths.append(env.url(forSystemPath: vulkanICDPath).path)
                     chownPaths.append(env.url(forSystemPath: radvAppBinPath).path)
@@ -485,7 +516,8 @@ public enum SystemDiskInstaller {
                 for ld in ["com.garnet.native.plist", "com.garnet.native-translate.plist"] {
                     try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: env.url(forSystemPath: "\(launchDaemonsDir)/\(ld)").path)
                 }
-                _ = env.runner.run("/usr/sbin/chown", ["nobody:wheel", "/Library/Logs/RDNA4Translate"])
+                _ = env.runner.run("/usr/sbin/chown", ["-hR", "nobody:nobody", GarnetPaths.spvCacheDir])
+                _ = env.runner.run("/usr/sbin/chown", ["nobody:nobody", GarnetPaths.translateLogsDir])
             }
 
             // Build temporary AuxKC with preserved foreign kexts + Garnet.kext + GarnetAccel.kext
@@ -548,7 +580,7 @@ public enum SystemDiskInstaller {
             preservedForeignAuxKexts: foreignKexts,
             plannedPaths: planned,
             vulkanICDInstalled: options.installVulkanICD,
-            denylistPreservedOnUpgrade: denylistExists,
+            denylistPreservedOnUpgrade: willPreserveOrMigrateDenylist,
             backupDirectory: backupDir.path,
             message: "Installed Garnet \(verified.garnetVersion) (layout \(matchedShortId)) to system disk & AuxKC; reboot required to activate. ESP was not modified."
         )
@@ -580,10 +612,13 @@ public enum SystemDiskInstaller {
             managedPaths.append("\(nativeSupportDir)/\(rel)")
         }
         managedPaths.append("\(nativeSupportDir)/variants/index.json")
+        managedPaths.append(GarnetPaths.xlateDumpDir)
+        managedPaths.append(GarnetPaths.spvCacheDir)
         if options.removeDenylist {
             managedPaths.append(DenylistManager.denylistPath)
         }
         managedPaths.append(contentsOf: retiredSystemPaths)
+        managedPaths.append(contentsOf: GarnetPaths.legacyRuntimeCleanupPaths)
 
         let fm = FileManager.default
         let existingTargets = managedPaths.filter { fm.fileExists(atPath: env.url(forSystemPath: $0).path) }
@@ -612,7 +647,7 @@ public enum SystemDiskInstaller {
             }
         }
 
-        let backupsRoot = env.url(forSystemPath: "\(nativeSupportDir)/backups")
+        let backupsRoot = env.url(forSystemPath: GarnetPaths.backupsDir)
         let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
         let backupDir = backupsRoot.appendingPathComponent("uninstall-\(timestamp)-\(UUID().uuidString.prefix(6))")
         try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)

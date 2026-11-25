@@ -13,7 +13,7 @@ Exit 0 and prints "OK sha name bytes" on success; prints "FAIL ..." and exits 1 
 import glob, hashlib, json, os, signal, struct, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 a = sys.argv[1:]
-f = a[0]; out = "/private/var/tmp/rdna4m-spv"; m2v = os.path.join(HERE, "metal2vulkan"); ovf = os.path.join(HERE, "overrides.txt")
+f = a[0]; out = "/private/var/tmp/garnet-spv"; m2v = os.path.join(HERE, "metal2vulkan"); ovf = os.path.join(HERE, "overrides.txt")
 validator = os.path.join(HERE, "rdna4-spirv-val-stub"); timeout = 20.0; maxb = 4 * 1024 * 1024; max_rss_kb = 1048576
 i = 1
 while i < len(a):

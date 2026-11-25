@@ -4,7 +4,16 @@
 R=${RDNA4_DEPLOY_ROOT:-}
 buddy=${RDNA4_PLISTBUDDY:-/usr/libexec/PlistBuddy}
 guid=7C436110-AB2A-4BBB-A880-FE41995C9F82
-support="$R/Library/Application Support/RDNA4/native"
+GARNET_SUPPORT_ROOT="$R/Library/Application Support/Garnet"
+support="$GARNET_SUPPORT_ROOT/native"
+GARNET_BACKUPS_DIR="$GARNET_SUPPORT_ROOT/backups"
+GARNET_LOGS_DIR="$R/Library/Logs/Garnet"
+GARNET_TRANSLATE_LOGS_DIR="$R/Library/Logs/GarnetTranslate"
+GARNET_XLATE_DUMP_DIR="$R/private/tmp/garnet-xlate"
+GARNET_SPV_CACHE_DIR="$R/private/var/tmp/garnet-spv"
+LEGACY_RDNA4_SUPPORT_DIR="$R/Library/Application Support/RDNA4/native"
+LEGACY_RDNA4_XLATE_DUMP_DIR="$R/private/tmp/rdna4m"
+LEGACY_RDNA4_SPV_CACHE_DIR="$R/private/var/tmp/rdna4m-spv"
 aux="$R/Library/KernelCollections/AuxiliaryKernelExtensions.kc"
 
 # The standalone Garnet components this delivery owns:
@@ -103,11 +112,13 @@ legacy_moves() {
         "$R/usr/local/navi48" \
         "$R/usr/local/rdna4" \
         "$R/Library/Application Support/Navi44/native" \
-        "$R/Library/Application Support/RDNA4/native/rdna4test"
+        "$LEGACY_RDNA4_SUPPORT_DIR"
 }
 legacy_deletes() {
     local p
-    for p in "$R"/private/tmp/n48m* "$R"/private/var/tmp/n48m*; do
+    for p in "$R"/private/tmp/n48m* "$R"/private/var/tmp/n48m* \
+        "$LEGACY_RDNA4_XLATE_DUMP_DIR" \
+        "$R"/private/tmp/rdna4m-* "$R"/private/var/tmp/rdna4m-*; do
         [ -e "$p" ] || [ -L "$p" ] && printf '%s\n' "$p"
     done
     return 0
@@ -137,6 +148,7 @@ remove_legacy() {  # $1 backup dir
     done < <(legacy_moves)
     while IFS= read -r p; do
         [ -n "$p" ] || continue
+        [ -e "$p" ] || [ -L "$p" ] || continue
         n=$((n+1))
         dest="$1/legacy-cache/$n-${p##*/}"
         mkdir -p "${dest%/*}"

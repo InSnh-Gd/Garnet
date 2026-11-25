@@ -6,10 +6,10 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Library/Application Support/RDNA4/native/activate-native.sh</string>
+        <string>/Library/Application Support/Garnet/native/activate-native.sh</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>StandardOutPath</key><string>/Library/Logs/RDNA4/native-activation.stdout</string>
-    <key>StandardErrorPath</key><string>/Library/Logs/RDNA4/native-activation.stderr</string>
+    <key>StandardOutPath</key><string>/Library/Logs/Garnet/native-activation.stdout</string>
+    <key>StandardErrorPath</key><string>/Library/Logs/Garnet/native-activation.stderr</string>
 </dict>
 </plist>

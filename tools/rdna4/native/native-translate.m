@@ -414,7 +414,7 @@ static BOOL scanSlice(Scan *s, const char *executable, const char *library, cons
 static void usage(void) {
     puts("Usage: native-translate [--once] [--source ABS] [--output ABS] [--library ABS] [--timeout 1..120]\n"
          "       native-translate --wait-ready 1..120 [--output ABS]\n"
-         "Defaults: /private/tmp/rdna4m -> /private/var/tmp/rdna4m-spv; timeout 20 seconds.\n"
+         "Defaults: /private/tmp/garnet-xlate -> /private/var/tmp/garnet-spv; timeout 20 seconds.\n"
          "Library: /Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libgarnetxlate.dylib\n"
          "Input: <source>/<uid>/<64 lowercase SHA256>.air plus .vertex/.fragment/.kernel.json\n"
          "with function, sha256, bytes; legacy .txt first token is supported.\n"
@@ -430,7 +430,7 @@ static void usage(void) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc > 1 && !strcmp(argv[1], "--request")) return request(argc, argv);
-        const char *source = "/private/tmp/rdna4m", *output = "/private/var/tmp/rdna4m-spv", *library = libraryDefault;
+        const char *source = "/private/tmp/garnet-xlate", *output = "/private/var/tmp/garnet-spv", *library = libraryDefault;
         BOOL once = NO; int seconds = 20, waitSeconds = 0;
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--help")) { usage(); return 0; }

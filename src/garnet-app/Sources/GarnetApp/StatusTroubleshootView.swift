@@ -57,9 +57,9 @@ struct StatusTroubleshootView: View {
                     }
                 }
 
-                GroupBox("2. Metal Application Denylist (/Library/Application Support/RDNA4/native/app-denylist.txt)") {
+                GroupBox("2. Metal Application Denylist (\(GarnetPaths.denylistPath))") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("By default (`garnet-apps-all=1`), desktop Metal apps use Garnet GPU acceleration with 3-strike timeout fallback. Add misbehaving apps below; WindowServer and `RDNA4M_ALLOW=1` root tools are always immune.")
+                        Text("By default (`garnet-apps-all=1`), desktop Metal apps use Garnet GPU acceleration with 3-strike timeout fallback. Add misbehaving apps below; WindowServer and `GARNET_ALLOW=1` root tools are always immune.")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

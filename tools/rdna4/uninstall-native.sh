@@ -137,8 +137,8 @@ for d in $LEGACY_DAEMONS com.garnet.native com.garnet.native-translate; do
     launch_job_loaded "$d" && prior_loaded_jobs+=("$d")
 done
 
-mkdir -p "$R/Library/Application Support/RDNA4-backups"
-backup=$(mktemp -d "$R/Library/Application Support/RDNA4-backups/uninstall.XXXXXXXX")
+mkdir -p "$GARNET_BACKUPS_DIR"
+backup=$(mktemp -d "$GARNET_BACKUPS_DIR/uninstall.XXXXXXXX")
 cp -p "$config" "$backup/config-before.plist"
 [ ! -f "$aux" ] || cp -p "$aux" "$backup/AuxiliaryKernelExtensions.kc"
 removed_map="$backup/removed.tsv"
@@ -239,7 +239,8 @@ while IFS= read -r p; do
     remove_item "$p"
 done < <(current_paths)
 if [ "$legacy_only" -eq 0 ]; then
-    for p in "$R/private/tmp/rdna4m" "$R/private/var/tmp/rdna4m-spv" \
+    for p in "$R"/private/tmp/garnet-* "$R"/private/var/tmp/garnet-* \
+        "$LEGACY_RDNA4_XLATE_DUMP_DIR" \
         "$R"/private/tmp/rdna4m-* "$R"/private/var/tmp/rdna4m-*; do
         [ -e "$p" ] || [ -L "$p" ] || continue
         remove_item "$p"

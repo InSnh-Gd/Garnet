@@ -34,6 +34,7 @@ guid=7C436110-AB2A-4BBB-A880-FE41995C9F82
 unset RDNA4_DEPLOY_STUB_FAIL RDNA4_DEPLOY_TEST_VMM RDNA4_DEPLOY_TEST_LOADED_JOBS
 
 cat > "$work/check.py" <<'PY'
+import fnmatch
 import hashlib
 import os
 from pathlib import Path
@@ -47,7 +48,8 @@ root, payload = base_arg / "root", base_arg / "payload"
 esp = root / "ESP/EFI/OC"
 config_path = esp / "config.plist"
 guid = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
-support = root / "Library/Application Support/RDNA4/native"
+support = root / "Library/Application Support/Garnet/native"
+backups_root = root / "Library/Application Support/Garnet/backups"
 aux = root / "Library/KernelCollections/AuxiliaryKernelExtensions.kc"
 
 garnet = "Garnet.kext"
@@ -71,13 +73,13 @@ installed_paths = [
     "Library/Extensions/Garnet.kext",
     "Library/Extensions/GarnetAccel.kext",
     "Library/GPUBundles/GarnetMetal.bundle",
-    "Library/Application Support/RDNA4/native/activate-native.sh",
-    "Library/Application Support/RDNA4/native/native-bundle-check",
-    "Library/Application Support/RDNA4/native/publish-metal",
-    "Library/Application Support/RDNA4/native/mtlprobe-direct",
-    "Library/Application Support/RDNA4/native/garnettest",
-    "Library/Application Support/RDNA4/native/native-translate",
-    "Library/Application Support/RDNA4/native/profile",
+    "Library/Application Support/Garnet/native/activate-native.sh",
+    "Library/Application Support/Garnet/native/native-bundle-check",
+    "Library/Application Support/Garnet/native/publish-metal",
+    "Library/Application Support/Garnet/native/mtlprobe-direct",
+    "Library/Application Support/Garnet/native/garnettest",
+    "Library/Application Support/Garnet/native/native-translate",
+    "Library/Application Support/Garnet/native/profile",
 ]
 legacy_paths = [
     "Library/LaunchDaemons/com.navi44.native.plist",
@@ -97,9 +99,15 @@ legacy_paths = [
     "usr/local/navi48",
     "usr/local/rdna4",
     "Library/Application Support/Navi44/native",
-    "Library/Application Support/RDNA4/native/rdna4test",
+    "Library/Application Support/RDNA4/native",
 ]
-caches = ["private/tmp/n48m", "private/tmp/n48m-headless-no", "private/var/tmp/n48m-spv"]
+caches = [
+    "private/tmp/n48m",
+    "private/tmp/n48m-headless-no",
+    "private/var/tmp/n48m-spv",
+    "private/tmp/rdna4m",
+    "private/var/tmp/rdna4m-spv",
+]
 
 
 def dump(path, data):
@@ -180,11 +188,23 @@ def write_manifest(payload_dir, garnet_standalone="true", accel_standalone="true
     )
 
 
+def _path_excluded(rel, excludes):
+    for item in excludes:
+        if rel == item or rel.startswith(item + "/") or fnmatch.fnmatch(rel, item):
+            return True
+        if "*" in item or "?" in item:
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                if fnmatch.fnmatch("/".join(parts[:i]), item):
+                    return True
+    return False
+
+
 def snapshot(excludes=(), metadata=False):
     rows = []
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
-        if any(rel == item or rel.startswith(item + "/") for item in excludes):
+        if _path_excluded(rel, excludes):
             continue
         digest = sha(path) if path.is_file() else "-"
         info = path.lstat()
@@ -325,9 +345,12 @@ def fixture():
         path.write_text("old userspace fixture\n")
         path.chmod(0o755)
     (support / "profile").write_text("native\n")
-    (root / "Library/Logs/RDNA4Translate").mkdir(parents=True)
-    (root / "Library/Logs/RDNA4Translate/translate.stdout").write_text("old stdout\n")
-    (root / "Library/Logs/RDNA4Translate/translate.stderr").write_text("old stderr\n")
+    (root / "Library/Logs/GarnetTranslate").mkdir(parents=True)
+    (root / "Library/Logs/GarnetTranslate/translate.stdout").write_text("old stdout\n")
+    (root / "Library/Logs/GarnetTranslate/translate.stderr").write_text("old stderr\n")
+    hw_bak = root / "Library/Application Support/RDNA4/hardware-test/backups/20261125T000000Z"
+    hw_bak.mkdir(parents=True, exist_ok=True)
+    (hw_bak / "sentinel.txt").write_text("preserve-hardware-test-backup\n")
 
     write_manifest(payload)
     write_checksums(payload)
@@ -406,8 +429,11 @@ elif mode == "installed":
         assert (root / rel).exists(), ("missing installed path", rel)
     assert support.stat().st_mode & 0o777 == 0o755
     assert support.parent.stat().st_mode & 0o777 == 0o755, "nobody cannot traverse the support parent"
-    assert (root / "Library/Logs/RDNA4").stat().st_mode & 0o777 == 0o755
-    assert (root / "Library/Logs/RDNA4Translate").stat().st_mode & 0o777 == 0o755
+    assert (root / "Library/Logs/Garnet").stat().st_mode & 0o777 == 0o755
+    assert (root / "Library/Logs/GarnetTranslate").stat().st_mode & 0o777 == 0o755
+    assert (root / "private/tmp/garnet-xlate").stat().st_mode & 0o1777 == 0o1777
+    assert (root / "private/var/tmp/garnet-spv").stat().st_mode & 0o777 == 0o755
+    assert (root / "Library/Application Support/RDNA4/hardware-test/backups/20261125T000000Z/sentinel.txt").read_text() == "preserve-hardware-test-backup\n"
     for gone in (esp / "Kexts" / garnet, esp / "Kexts" / old_display, esp / "Kexts" / old_fb,
                  esp / "Kexts" / old_bringup, esp / "Kexts/Navi48Bringup.kext",
                  root / "Library/LaunchDaemons/com.garnet.native.plist",
@@ -419,7 +445,7 @@ elif mode == "installed":
     ids = aux_ids()
     assert set(ids) == {garnet_id, accel_id, "com.example.foreign"}, ids
     assert (root / "Library/Extensions/Foreign.kext/Contents/Info.plist").is_file()
-    backup, = (support / "backups").glob("install.*")
+    backup, = backups_root.glob("install.*")
     assert (backup / "config-before.plist").read_bytes() == (base_arg / "config-before.plist").read_bytes()
     assert (backup / "AuxiliaryKernelExtensions.kc").read_bytes() == (base_arg / "aux-before.kc").read_bytes()
     assert any(path.name.endswith("-" + old_display) for path in backup.rglob("*"))
@@ -451,7 +477,8 @@ elif mode == "uninstalled":
     assert (esp / "Kexts/WhateverGreen.kext").is_dir()
     assert (root / "Library/Extensions/Foreign.kext").is_dir()
     assert set(aux_ids()) == {"com.example.foreign"}
-    backup, = (root / "Library/Application Support/RDNA4-backups").glob("uninstall.*")
+    assert (root / "Library/Application Support/RDNA4/hardware-test/backups/20261125T000000Z/sentinel.txt").read_text() == "preserve-hardware-test-backup\n"
+    backup, = backups_root.glob("uninstall.*")
     assert any(path.name.endswith("-" + garnet) for path in backup.rglob("*"))
     assert any(path.name.endswith("-" + accel) for path in backup.rglob("*"))
     assert sha(esp / "Kexts/Lilu.kext/Contents/MacOS/Lilu") == \
@@ -466,7 +493,7 @@ elif mode == "legacy-only":
     assert config["NVRAM"]["Add"][guid]["boot-args"] == "-v garnet=1 garnet-stage=17 garnet-metal=1"
     for rel in legacy_paths + caches:
         assert not (root / rel).exists(), ("legacy remains", rel)
-    backup, = (root / "Library/Application Support/RDNA4-backups").glob("uninstall.*")
+    backup, = backups_root.glob("uninstall.*")
     assert (backup / "config-before.plist").is_file()
 elif mode == "foreign-current":
     component = sys.argv[3]
@@ -579,7 +606,7 @@ case_install_uncommitted_exit() {
     check uncommitted-exit install
     before
     expect_failure 'Installation failed (exit 1)' deploy install --controlled
-    check rollback 'Library/Application Support/RDNA4/native/backups'
+    check rollback 'Library/Application Support/Garnet/backups'
 }
 case_uninstall_uncommitted_exit() {
     fresh uninstall-uncommitted-exit
@@ -587,7 +614,7 @@ case_uninstall_uncommitted_exit() {
     check uncommitted-exit uninstall
     before
     expect_failure 'Uninstall failed (exit 1)' deploy uninstall
-    check rollback 'Library/Application Support/RDNA4-backups'
+    check rollback 'Library/Application Support/Garnet/backups/uninstall.*'
 }
 case_missing_garnet() {
     fresh missing-garnet
@@ -627,7 +654,7 @@ case_install_rollback() {
     export RDNA4_DEPLOY_STUB_FAIL=sync
     expect_failure 'Installation failed (exit 9)' deploy install --controlled
     unset RDNA4_DEPLOY_STUB_FAIL
-    check rollback 'Library/Application Support/RDNA4/native/backups'
+    check rollback 'Library/Application Support/Garnet/backups'
     grep -Fq 'ESP, config, boot-args, Aux KC and userspace restored' "$base/output"
 }
 case_aux_inspect_rollback() {
@@ -637,7 +664,7 @@ case_aux_inspect_rollback() {
     expect_failure 'Aux KC inspect failed; no existing extension was discarded' \
         deploy install --controlled
     unset RDNA4_DEPLOY_STUB_FAIL
-    check rollback 'Library/Application Support/RDNA4/native/backups'
+    check rollback 'Library/Application Support/Garnet/backups'
     grep -Fq 'ESP, config, boot-args, Aux KC and userspace restored' "$base/output"
     [ "$(cat "$base/trace.inspect-count")" = 2 ]
     [ -f "$base/root/Library/Extensions/Foreign.kext/Contents/Info.plist" ]
@@ -649,7 +676,7 @@ case_loaded_job_rollback() {
     export RDNA4_DEPLOY_STUB_FAIL=sync
     expect_failure 'Installation failed (exit 9)' deploy install --controlled
     unset RDNA4_DEPLOY_STUB_FAIL RDNA4_DEPLOY_TEST_LOADED_JOBS
-    check rollback 'Library/Application Support/RDNA4/native/backups'
+    check rollback 'Library/Application Support/Garnet/backups'
     grep -Fq 'launchctl bootout system/com.garnet.native' "$base/trace"
     grep -Fq 'launchctl bootout system/com.rdna4.native' "$base/trace"
     grep -Fq 'launchctl bootout system/com.navi44.native' "$base/trace"
@@ -740,7 +767,7 @@ case_aux_preservation() {
     expect_failure 'Aux KC rebuild did not preserve the requested extension set' \
         deploy install --controlled
     unset RDNA4_DEPLOY_STUB_FAIL
-    check rollback 'Library/Application Support/RDNA4/native/backups'
+    check rollback 'Library/Application Support/Garnet/backups'
     [ -f "$base/root/Library/Extensions/Foreign.kext/Contents/Info.plist" ]
 
     fresh aux-drop-foreign-uninstall
@@ -753,7 +780,7 @@ case_aux_preservation() {
         deploy uninstall
     unset RDNA4_DEPLOY_STUB_FAIL RDNA4_DEPLOY_TEST_LOADED_JOBS
     ! grep -Fq 'launchctl bootout system/com.garnet.native' "$base/trace"
-    check rollback 'Library/Application Support/RDNA4-backups'
+    check rollback 'Library/Application Support/Garnet/backups/uninstall.*'
     [ -f "$base/root/Library/Extensions/Foreign.kext/Contents/Info.plist" ]
 }
 case_uninstall_check() {
@@ -778,7 +805,7 @@ case_uninstall_rollback() {
     export RDNA4_DEPLOY_STUB_FAIL=sync
     expect_failure 'Uninstall failed (exit 9)' deploy uninstall
     unset RDNA4_DEPLOY_STUB_FAIL
-    check rollback 'Library/Application Support/RDNA4-backups'
+    check rollback 'Library/Application Support/Garnet/backups/uninstall.*'
 }
 case_uninstall_preboot_failure() {
     fresh uninstall-preboot
@@ -790,7 +817,7 @@ case_uninstall_preboot_failure() {
     expect_failure 'Aux KC rebuild failed (9)' deploy uninstall
     unset RDNA4_DEPLOY_STUB_FAIL RDNA4_DEPLOY_TEST_LOADED_JOBS
     ! grep -Fq 'launchctl bootout system/com.garnet.native' "$base/trace"
-    check rollback 'Library/Application Support/RDNA4-backups'
+    check rollback 'Library/Application Support/Garnet/backups/uninstall.*'
 }
 case_vm_refusal() {
     fresh vm-refusal
@@ -816,6 +843,31 @@ with open(path, "wb") as stream:
 PY
     deploy uninstall --legacy-only
     check legacy-only
+}
+
+case_v010_migration_idempotent() {
+    fresh v010-migration
+    # Seed legacy v0.1.0 custom app-denylist.txt; remove new Garnet dir to simulate pure v0.1.0 upgrade
+    rm -rf "$base/root/Library/Application Support/Garnet"
+    printf '# custom v0.1.0\nbundle:com.example.LegacyBlocked\nproc:LegacyTool\n' \
+        > "$base/root/Library/Application Support/RDNA4/native/app-denylist.txt"
+    deploy install --controlled
+    [ -f "$base/root/Library/Application Support/Garnet/native/app-denylist.txt" ]
+    grep -Fxq 'bundle:com.example.LegacyBlocked' "$base/root/Library/Application Support/Garnet/native/app-denylist.txt"
+    grep -Fxq 'proc:LegacyTool' "$base/root/Library/Application Support/Garnet/native/app-denylist.txt"
+    [ ! -e "$base/root/Library/Application Support/RDNA4/native" ]
+    [ ! -e "$base/root/private/tmp/rdna4m" ]
+    [ ! -e "$base/root/private/var/tmp/rdna4m-spv" ]
+    grep -qx 'preserve-hardware-test-backup' \
+        "$base/root/Library/Application Support/RDNA4/hardware-test/backups/20261125T000000Z/sentinel.txt"
+    # Second install must be idempotent and preserve user edits to the new denylist
+    printf 'proc:EditedAfterMigration\n' >> "$base/root/Library/Application Support/Garnet/native/app-denylist.txt"
+    mkdir -p "$base/root/Library/Application Support/RDNA4/native"
+    printf 'proc:ShouldNotOverwrite\n' > "$base/root/Library/Application Support/RDNA4/native/app-denylist.txt"
+    deploy install --controlled
+    grep -Fxq 'proc:EditedAfterMigration' "$base/root/Library/Application Support/Garnet/native/app-denylist.txt"
+    ! grep -Fxq 'proc:ShouldNotOverwrite' "$base/root/Library/Application Support/Garnet/native/app-denylist.txt"
+    [ ! -e "$base/root/Library/Application Support/RDNA4/native" ]
 }
 
 base=
@@ -860,5 +912,6 @@ run_case p-legacy-only case_legacy_only
 run_case q-manifest-inputs case_manifest_inputs
 run_case r-payload-identity case_bad_payload_identity
 run_case s-aux-preservation case_aux_preservation
-printf 'DEPLOY_SUITE cases=22 filter=%s failures=%s hardware_commands=stubbed installation=not_performed\n' "${RDNA4_DEPLOY_TEST_CASE:-all}" "$failures"
+run_case t-v010-migration-idempotent case_v010_migration_idempotent
+printf 'DEPLOY_SUITE cases=23 filter=%s failures=%s hardware_commands=stubbed installation=not_performed\n' "${RDNA4_DEPLOY_TEST_CASE:-all}" "$failures"
 [ "$failures" -eq 0 ]

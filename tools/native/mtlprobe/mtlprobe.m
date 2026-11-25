@@ -422,7 +422,8 @@ static int cmd_timeout(uint64_t rid, int haveRid, int passes) {
     id<MTLCommandQueue> q = [dev newCommandQueue];
     if (!tex || !buf || !q) { printf("mtlprobe: FAIL alloc\n"); return 2; }
     memset(buf.contents, 0xEE, W * H * 4);
-    printf("mtlprobe: RDNA4M_TEST_TIMEOUT_MS=%s passes=%d\n", getenv("RDNA4M_TEST_TIMEOUT_MS") ?: "(unset)", passes);
+    const char *timeoutEnv = getenv("GARNET_TEST_TIMEOUT_MS") ?: getenv("RDNA4M_TEST_TIMEOUT_MS");
+    printf("mtlprobe: GARNET_TEST_TIMEOUT_MS=%s passes=%d\n", timeoutEnv ?: "(unset)", passes);
     id<MTLCommandBuffer> A = encode_frame(q, pso, tex, buf, passes);
     id<MTLCommandBuffer> B = encode_frame(q, pso, tex, buf, 1);
     if (!A || !B) { printf("mtlprobe: FAIL encode\n"); return 2; }
@@ -435,7 +436,7 @@ static int cmd_timeout(uint64_t rid, int haveRid, int passes) {
     if (B.error) perr("B", B.error);
     int diff = px_diff(buf.contents);
     printf("mtlprobe: %d of 65536 pixels differ\n", diff);
-    int expectErr = getenv("RDNA4M_TEST_TIMEOUT_MS") != NULL;
+    int expectErr = (getenv("GARNET_TEST_TIMEOUT_MS") ?: getenv("RDNA4M_TEST_TIMEOUT_MS")) != NULL;
     int ok = (expectErr ? (A.status == MTLCommandBufferStatusError && A.error != nil) : A.status == MTLCommandBufferStatusCompleted)
              && B.status == MTLCommandBufferStatusCompleted && !diff;
     printf(ok ? "mtlprobe: PASS timeout (A error path ok, B exact)\n" : "mtlprobe: FAIL timeout\n");
@@ -1773,7 +1774,7 @@ static void io_expect_blend(uint8_t *exp, int w, int h, const uint8_t clear[4] /
 static uint64_t df_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static double df_num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
 static int cmd_dispflip(uint64_t rid, int haveRid, int seconds) {
-    setenv("RDNA4M_TEST_DISPFLIP", "1", 1);   // read by the bundle (honoured only as root with RDNA4M_ALLOW=1)
+    setenv("GARNET_TEST_DISPFLIP", "1", 1);   // read by the bundle (honoured only as root with GARNET_ALLOW=1)
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
     if (![(NSObject *)dev respondsToSelector:NSSelectorFromString(@"rdna4ScanoutStats")]) {
         printf("mtlprobe: dispflip: REFUSED (clean): device '%s' has no scanout path (no rdna4ScanoutStats: not the GarnetMetal bundle; scanout is native-kext-only, the bundle's own query answers -ENOSYS elsewhere)\n", [dev.name UTF8String]);
@@ -2102,8 +2103,8 @@ static int cmd_ioalias(uint64_t rid, int haveRid) {
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
     id<MTLCommandQueue> q = [dev newCommandQueue];
     const int IW = 64, IH = 64, S1 = 11, S2 = 77; int fails = 0;
-    const char *force = getenv("RDNA4M_IOS_PATH");
-    printf("mtlprobe: ioalias: %dx%d BGRA IOSurface, RDNA4M_IOS_PATH=%s\n", IW, IH, force ? force : "(natural)");
+    const char *force = getenv("GARNET_IOS_PATH") ?: getenv("RDNA4M_IOS_PATH");
+    printf("mtlprobe: ioalias: %dx%d BGRA IOSurface, GARNET_IOS_PATH=%s\n", IW, IH, force ? force : "(natural)");
     // (1) write via A, read via B, one command buffer
     IOSurfaceRef s = io_make(IW, IH); if (!s) { printf("mtlprobe: FAIL ioalias IOSurfaceCreate\n"); return 2; }
     io_fill(s, IW, IH, 0);
@@ -2140,11 +2141,11 @@ static int cmd_ioalias(uint64_t rid, int haveRid) {
         int bad = io_buf_matches(got, IW, IH, S2 + 5); printf("mtlprobe: ioalias (3b) write via C then read via an earlier-used B in one command buffer: %d of %d pixels differ\n", bad, IW * IH); fails += bad != 0;
     }
     // (4) F1
-    const char *fe = getenv("RDNA4M_TEST_IMPORT_FAIL_EVERY");
+    const char *fe = getenv("GARNET_TEST_IMPORT_FAIL_EVERY") ?: getenv("RDNA4M_TEST_IMPORT_FAIL_EVERY");
     if (fe && atoi(fe) > 0) {
         int nilc = 0; for (int i = 0; i < 8; i++) { IOSurfaceRef s2 = io_make(IW, IH); id<MTLTexture> t = io_tex(dev, s2, IW, IH, MTLTextureUsageShaderRead); if (!t) nilc++; }
-        printf("mtlprobe: ioalias (4) F1: RDNA4M_TEST_IMPORT_FAIL_EVERY=%s, 8 textures over fresh surfaces: %d nil\n", fe, nilc); fails += nilc != 0;
-    } else printf("mtlprobe: ioalias (4) F1 skipped (RDNA4M_TEST_IMPORT_FAIL_EVERY not set)\n");
+        printf("mtlprobe: ioalias (4) F1: GARNET_TEST_IMPORT_FAIL_EVERY=%s, 8 textures over fresh surfaces: %d nil\n", fe, nilc); fails += nilc != 0;
+    } else printf("mtlprobe: ioalias (4) F1 skipped (GARNET_TEST_IMPORT_FAIL_EVERY not set)\n");
     printf(fails == 0 ? "mtlprobe: PASS ioalias\n" : "mtlprobe: FAIL ioalias (%d)\n", fails);
     return fails != 0;
 }
@@ -3623,7 +3624,8 @@ static int rb_fill(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLComputePipeli
 static int cmd_robust(const char *sub, uint64_t rid, int haveRid) {
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) { printf("mtlprobe: robust: no device (declined?)\n"); return 2; }
     id<MTLLibrary> lib = n_lib(dev); if (!lib) return 2;
-    NSError *err = nil; BOOL fb = getenv("RDNA4M_FORCE_FALLBACK") && !strcmp(getenv("RDNA4M_FORCE_FALLBACK"), "1");
+    const char *fbEnv = getenv("GARNET_FORCE_FALLBACK") ?: getenv("RDNA4M_FORCE_FALLBACK");
+    NSError *err = nil; BOOL fb = fbEnv && !strcmp(fbEnv, "1");
     int fails = 0;
     #define RB(cond, ...) do { int ok_ = (cond) ? 1 : 0; printf("mtlprobe: robust %s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
     if (!strcmp(sub, "open")) {
@@ -3736,12 +3738,13 @@ static int hs_diff(const uint8_t *got, const uint8_t *exp) { int n = 0; for (int
 
 static int cmd_hotswap(uint64_t rid, int haveRid, double waitS, const char *spvSrc, const char *sideDirArg) {
     char sidebuf[256]; const char *side = sideDirArg;
-    if (!side) { snprintf(sidebuf, sizeof sidebuf, "/private/var/tmp/rdna4m-spv-probe.%d", (int)getpid()); side = sidebuf; }
-    setenv("RDNA4M_TEST_FALLBACK_AS_WS", "1", 1); setenv("RDNA4M_TEST_HIDE_BUNDLE_SPV", "1", 1); setenv("RDNA4M_TEST_SIDE_DIR", side, 1);   // read by the bundle at its first lookup (root + RDNA4M_ALLOW=1 only)
+    if (!side) { snprintf(sidebuf, sizeof sidebuf, "/private/var/tmp/garnet-spv-probe.%d", (int)getpid()); side = sidebuf; }
+    setenv("GARNET_TEST_FALLBACK_AS_WS", "1", 1); setenv("GARNET_TEST_HIDE_BUNDLE_SPV", "1", 1); setenv("GARNET_TEST_SIDE_DIR", side, 1);   // read by the bundle at its first lookup (root + GARNET_ALLOW=1 only)
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
-    if (![dev.name containsString:@"9070"]) { printf("mtlprobe: SKIP hotswap: %s is not the RDNA4 device (the oracle needs the bundle with RDNA4M_ALLOW=1 as root); nothing was run\n", dev.name.UTF8String); return 3; }
-    if (geteuid() != 0 || !getenv("RDNA4M_ALLOW")) { printf("mtlprobe: SKIP hotswap: needs root and RDNA4M_ALLOW=1 (the bundle ignores the test hooks otherwise)\n"); return 3; }
-    NSString *src = @(spvSrc ? spvSrc : getenv("RDNA4M_PROBE_SPVSRC") ? getenv("RDNA4M_PROBE_SPVSRC") : "/Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/spvcache");
+    if (![dev.name containsString:@"9070"] && ![dev.name containsString:@"9060"] && ![dev.name containsString:@"Garnet"]) { printf("mtlprobe: SKIP hotswap: %s is not the Garnet device (the oracle needs the bundle with GARNET_ALLOW=1 as root); nothing was run\n", dev.name.UTF8String); return 3; }
+    if (geteuid() != 0 || !(getenv("GARNET_ALLOW") ?: getenv("RDNA4M_ALLOW"))) { printf("mtlprobe: SKIP hotswap: needs root and GARNET_ALLOW=1 (the bundle ignores the test hooks otherwise)\n"); return 3; }
+    const char *envSpv = getenv("GARNET_PROBE_SPVSRC") ?: getenv("RDNA4M_PROBE_SPVSRC");
+    NSString *src = @(spvSrc ? spvSrc : envSpv ? envSpv : "/Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/spvcache");
     id<MTLLibrary> lib = n_lib(dev); if (!lib) return 2;
     id<MTLFunction> vs = [lib newFunctionWithName:@"quad_vs"], fs = [lib newFunctionWithName:@"quad_fs"];
     NSData *bv = hs_sha_file_bytes(vs), *bf = hs_sha_file_bytes(fs);

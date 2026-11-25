@@ -226,8 +226,8 @@ for d in $LEGACY_DAEMONS com.garnet.native com.garnet.native-translate; do
     launch_job_loaded "$d" && prior_loaded_jobs+=("$d")
 done
 
-mkdir -p "$support/backups"
-backup=$(mktemp -d "$support/backups/install.XXXXXXXX")
+mkdir -p "$GARNET_BACKUPS_DIR"
+backup=$(mktemp -d "$GARNET_BACKUPS_DIR/install.XXXXXXXX")
 cp -p "$config" "$backup/config-before.plist"
 [ ! -f "$aux" ] || cp -p "$aux" "$backup/AuxiliaryKernelExtensions.kc"
 cp "$manifest" "$backup/build-manifest.txt"
@@ -280,13 +280,13 @@ record_path "$oc/Kexts/Navi48Bringup.kext"
 record_path "$R/Library/Extensions/$GARNET_BUNDLE"
 record_path "$R/Library/Extensions/$ACCEL_BUNDLE"
 record_path "$R/Library/GPUBundles/$METAL_BUNDLE"
-for name in activate-native.sh native-bundle-check publish-metal mtlprobe-direct garnettest native-translate profile; do
+for name in activate-native.sh native-bundle-check publish-metal mtlprobe-direct garnettest native-translate profile app-denylist.txt; do
     record_path "$support/$name"
 done
 record_path "$R/Library/LaunchDaemons/com.garnet.native.plist"
 record_path "$R/Library/LaunchDaemons/com.garnet.native-translate.plist"
-for path in "$R/private/tmp/rdna4m" "$R/private/var/tmp/rdna4m-spv" \
-    "$R/Library/Logs/RDNA4Translate/translate.stdout" "$R/Library/Logs/RDNA4Translate/translate.stderr"; do
+for path in "$GARNET_XLATE_DUMP_DIR" "$GARNET_SPV_CACHE_DIR" \
+    "$GARNET_TRANSLATE_LOGS_DIR/translate.stdout" "$GARNET_TRANSLATE_LOGS_DIR/translate.stderr"; do
     record_path "$path"
 done
 
@@ -337,8 +337,8 @@ committed=0
 trap rollback EXIT
 
 ensure_dir "$support"
-ensure_dir "$R/Library/Logs/RDNA4"
-ensure_dir "$R/Library/Logs/RDNA4Translate"
+ensure_dir "$GARNET_LOGS_DIR"
+ensure_dir "$GARNET_TRANSLATE_LOGS_DIR"
 ensure_dir "$R/Library/GPUBundles"
 ensure_dir "$R/Library/LaunchDaemons"
 ensure_dir "$R/Library/Extensions"
@@ -355,8 +355,22 @@ done
 printf '%s\n' "$profile" > "$stage/profile"
 install_item "$stage/profile" "$support/profile"
 chmod 644 "$support/profile"
+# Idempotent v0.1.0 -> Garnet app-denylist.txt migration (runs BEFORE remove_legacy moves RDNA4/native).
+if [ ! -e "$support/app-denylist.txt" ]; then
+    if [ -L "$LEGACY_RDNA4_SUPPORT_DIR/app-denylist.txt" ]; then
+        fail "Refusing symbolic-link legacy denylist: $LEGACY_RDNA4_SUPPORT_DIR/app-denylist.txt"
+    elif [ -f "$LEGACY_RDNA4_SUPPORT_DIR/app-denylist.txt" ]; then
+        cp -p "$LEGACY_RDNA4_SUPPORT_DIR/app-denylist.txt" "$support/app-denylist.txt"
+        chown root:wheel "$support/app-denylist.txt"
+        chmod 644 "$support/app-denylist.txt"
+        note "migrated: $LEGACY_RDNA4_SUPPORT_DIR/app-denylist.txt -> $support/app-denylist.txt"
+    elif [ -f "$work/default-app-denylist.txt" ] && [ ! -L "$work/default-app-denylist.txt" ]; then
+        install_item "$work/default-app-denylist.txt" "$support/app-denylist.txt"
+        chmod 644 "$support/app-denylist.txt"
+    fi
+fi
 chmod -R a+rX "$R/Library/GPUBundles/$METAL_BUNDLE"
-chmod 755 "${support%/*}" "$support" "$R/Library/Logs/RDNA4" "$R/Library/Logs/RDNA4Translate" \
+chmod 755 "${support%/*}" "$support" "$GARNET_LOGS_DIR" "$GARNET_TRANSLATE_LOGS_DIR" \
     "$support/activate-native.sh" "$support/native-bundle-check" "$support/publish-metal" \
     "$support/mtlprobe-direct" "$support/garnettest" "$support/native-translate"
 
@@ -398,11 +412,11 @@ mv "$oc/config-native-next.plist" "$config"
 validate_kernel_config "$config" "$GARNET_BUNDLE"
 
 remove_legacy "$backup"
-ensure_dir "$R/private/tmp/rdna4m"
-ensure_dir "$R/private/var/tmp/rdna4m-spv"
-chown root:wheel "$R/private/tmp/rdna4m"; chmod 1777 "$R/private/tmp/rdna4m"
-chown -hR nobody:nobody "$R/private/var/tmp/rdna4m-spv"; chmod 755 "$R/private/var/tmp/rdna4m-spv"
-for path in "$R/Library/Logs/RDNA4Translate/translate.stdout" "$R/Library/Logs/RDNA4Translate/translate.stderr"; do
+ensure_dir "$GARNET_XLATE_DUMP_DIR"
+ensure_dir "$GARNET_SPV_CACHE_DIR"
+chown root:wheel "$GARNET_XLATE_DUMP_DIR"; chmod 1777 "$GARNET_XLATE_DUMP_DIR"
+chown -hR nobody:nobody "$GARNET_SPV_CACHE_DIR"; chmod 755 "$GARNET_SPV_CACHE_DIR"
+for path in "$GARNET_TRANSLATE_LOGS_DIR/translate.stdout" "$GARNET_TRANSLATE_LOGS_DIR/translate.stderr"; do
     [ ! -L "$path" ] || fail "Refusing symbolic-link translator log: $path"
     touch "$path"; chown nobody:nobody "$path"; chmod 644 "$path"
 done

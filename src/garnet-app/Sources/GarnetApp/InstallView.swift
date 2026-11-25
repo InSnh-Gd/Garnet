@@ -107,7 +107,7 @@ struct InstallView: View {
                 GroupBox("3. Uninstall from System Disk") {
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle("Also remove saved app-denylist.txt", isOn: $model.removeDenylistOnUninstall)
-                        Text("Removes Garnet components from /Library/Extensions, /Library/GPUBundles, /Library/LaunchDaemons, /Library/Application Support/RDNA4/native, and rebuilds AuxKC preserving third-party extensions. Reboot afterwards and disable Garnet OpenCore entries if reverting.")
+                        Text("Removes Garnet components from /Library/Extensions, /Library/GPUBundles, /Library/LaunchDaemons, \(GarnetPaths.nativeSupportDir), and rebuilds AuxKC preserving third-party extensions. Reboot afterwards and disable Garnet OpenCore entries if reverting.")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

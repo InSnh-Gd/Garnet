@@ -11,9 +11,9 @@
 # spv last, pc-translate.py), so a hot-swapping app never sees a half-written or missing file. If the new translation FAILs the old outputs are dropped from OUT (the backup keeps them). An ok entry whose AIR is gone (/tmp cleared) keeps its outputs and is logged once
 # as "stale-kept (no AIR)" (state file $STATE/stale-logged).
 # Env overrides (tests): RDNA4_SRC RDNA4_OUT RDNA4_STATE RDNA4_BUNDLE RDNA4_HERE RDNA4_ONCE=1 (one pass, then exit) RDNA4_NO_SANDBOX=1 RDNA4_SKIP_OWNER=1 (skip the uid-ownership rule) RDNA4_POLL (seconds).
-SRC=${RDNA4_SRC:-/private/tmp/rdna4m}
-OUT=${RDNA4_OUT:-/private/var/tmp/rdna4m-spv}
-STATE=${RDNA4_STATE:-/private/var/tmp/rdna4m-translate-state}
+SRC=${RDNA4_SRC:-/private/tmp/garnet-xlate}
+OUT=${RDNA4_OUT:-/private/var/tmp/garnet-spv}
+STATE=${RDNA4_STATE:-/private/var/tmp/garnet-translate-state}
 BUNDLE=${RDNA4_BUNDLE:-/Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/spvcache}
 HERE=${RDNA4_HERE:-$(cd "$(dirname "$0")" && pwd)}
 DONE=$STATE/done
