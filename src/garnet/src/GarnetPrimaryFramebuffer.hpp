@@ -8,6 +8,7 @@
 
 #include "dcn/dcn41_cursor_pure.h"
 #include "dcn/dcn41_ddc_pad_pure.h"
+#include "dcn/dcn41_vbl_irq_pure.h"
 #include "dcn/dp_edid_aux.h"
 #include "dcn/primary_fb_pure.h"
 
@@ -18,6 +19,7 @@ class GarnetDriver;
 
 void garnet_primary_fb_notify_driver_ready(GarnetDriver *driver);
 void garnet_primary_fb_notify_wake(GarnetDriver *driver);
+void garnet_primary_fb_notify_vbl(uint32_t otg);
 IOMemoryDescriptor *rdna4_scanout_descriptor(bool viaFramebuffer);
 
 // Primary IOFramebuffer matched directly against the AMD RDNA4 PCI device (score 200000).
@@ -80,6 +82,7 @@ public:
 
 	void onDriverReady(GarnetDriver *driver);
 	void onSystemWake(GarnetDriver *driver);
+	void onHardwareVbl(uint32_t otg);
 
 private:
 	void initForPM();
@@ -92,6 +95,10 @@ private:
 	bool ensureVblTimer();
 	void teardownVblTimer();
 	uint32_t vblPeriodUs() const;
+	uint64_t vblNowNs() const;
+	bool vblHwActive() const;
+	uint32_t vblInitialTimeoutUs() const;
+	void syncHardwareVbl(bool want);
 	static void onVblTimer(OSObject *owner, IOTimerEventSource *sender);
 	void initCursorSlot(GarnetDriver *driver);
 	void teardownCursorSlot();
@@ -126,6 +133,12 @@ private:
 	OSObject *fVblTarget { nullptr };
 	void *fVblRef { nullptr };
 	bool fVblEnabled { false };
+	bool fVblIrqAllowed { true };
+	bool fVblHwArmed { false };
+	uint32_t fVblOtg { 0u };
+	uint64_t fVblLastHwNs { 0u };
+	uint64_t fVblHwCount { 0u };
+	uint64_t fVblTimerCount { 0u };
 	bool fStopping { false };
 
 	IOLock *fCursorLock { nullptr };

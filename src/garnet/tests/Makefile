@@ -22,6 +22,7 @@ TESTS += $(BUILD)/dcn41_cursor_test
 TESTS += $(BUILD)/vmid_pool_test
 TESTS += $(BUILD)/dcn41_ddc_sleep_test
 TESTS += $(BUILD)/garnet_irq_wait_test
+TESTS += $(BUILD)/dcn41_vbl_irq_test
 PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
 TLB83_ARGS := $(SRC)/amd/gmc_v12_0.cpp $(SRC)/amd/amdgpu_regs.h $(SRC)/GarnetDriver.cpp $(SRC)/amd
 TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_v14_0.cpp \
@@ -81,6 +82,9 @@ $(BUILD)/dcn41_ddc_sleep_test: dcn41_ddc_sleep_test.cpp $(SRC)/dcn/dcn41_ddc_pad
 
 $(BUILD)/garnet_irq_wait_test: garnet_irq_wait_test.cpp $(SRC)/amd/garnet_irq_wait_pure.h $(SRC)/amd/garnet_submit_pure.h $(SRC)/amd/amdgpu_pm4.h $(SRC)/amd/cp_pm4_gfx12.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) garnet_irq_wait_test.cpp -o $@
+
+$(BUILD)/dcn41_vbl_irq_test: dcn41_vbl_irq_test.cpp $(SRC)/dcn/dcn41_vbl_irq_pure.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) dcn41_vbl_irq_test.cpp -o $@
 
 $(BUILD)/primary_fb_test: primary_fb_test.cpp $(SRC)/dcn/primary_fb_pure.h $(SRC)/dcn/edid_modes_pure.h $(SRC)/dcn/display_state_pure.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) primary_fb_test.cpp -o $@

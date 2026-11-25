@@ -18,7 +18,10 @@
 #include "amd/native_disp_pure.h"
 #include "amd/native_disp.h"
 #include "modetrial_pure.h"
+#include "dcn41_vbl_irq_pure.h"
 #include "GarnetDisplayOps.h"
+
+void garnet_primary_fb_notify_vbl(uint32_t otg);
 
 extern "C" {
 #include "dcn41.h"
@@ -63,6 +66,11 @@ struct DcnState {
 	uint64_t enabledAtNs { 0 };
 	uint64_t entriesAtEnable { 0 };
 	bool     stormTripped { false };
+
+	// Stage 3A: primary framebuffer VSTARTUP IRQ state (rate-guarded, independent of `dcnvbl`)
+	bool     primaryVblEnabled { false };
+	uint8_t  primaryVblOtg     { 0 };
+	rdna4vbl::RateStormGuard primaryVblStorm {};
 
 	// IH counters
 	uint64_t dceEntries { 0 };

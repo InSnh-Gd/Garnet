@@ -1,3 +1,4 @@
+#include "dcn/dcn41_vbl_irq_pure.h"
 #include <cstdint>
 #include <cstdio>
 
@@ -38,10 +39,23 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	OSObject *fVblTarget = nullptr;
 	void *fVblRef = nullptr;
 	bool fVblEnabled = false;
+	bool fVblHwArmed = false;
 	bool fStopping = false;
 	bool timerAvailable = true;
+	bool hwVblAvailable = false;
+	uint64_t fakeNowNs = 1000000000ULL;
+	uint64_t fVblLastHwNs = 0u;
+	uint64_t fVblTimerCount = 0u;
+	unsigned hwSyncCalls = 0u;
 	bool ensureVblTimer() { return timerAvailable; }
 	unsigned vblPeriodUs() const { return 16667; }
+	uint64_t vblNowNs() const { return fakeNowNs; }
+	bool vblHwActive() const { return hwVblAvailable && fVblHwArmed; }
+	uint32_t vblInitialTimeoutUs() const { return rdna4vbl::initial_timer_us(vblPeriodUs(), vblHwActive()); }
+	void syncHardwareVbl(bool want) {
+		++hwSyncCalls;
+		fVblHwArmed = want && hwVblAvailable && !fStopping;
+	}
 	static void onVblTimer(OSObject *, IOTimerEventSource *);
 	IOReturn registerForInterruptType(IOSelect, IOFBInterruptProc, OSObject *, void *, void **);
 	IOReturn unregisterInterrupt(void *);
@@ -144,6 +158,29 @@ int main() {
 	rejected.timerAvailable = false;
 	expect(rejected.registerForInterruptType(kIOFBVBLInterruptType, callback, &target, &state, &interrupt) == kIOReturnNoMemory,
 	       "timer setup failure is reported");
+
+	// Stage 3A: hardware VBL mode suppresses timer callbacks while HW VBL is fresh,
+	// and falls back seamlessly to timer cadence if HW VBL stalls.
+	AMDGarnetPrimaryFramebuffer hwFb;
+	hwFb.hwVblAvailable = true;
+	CallbackState hwState { &hwFb, &target };
+	expect(hwFb.registerForInterruptType(kIOFBVBLInterruptType, callback, &target,
+	                                     &hwState, &hwState.interrupt) == kIOReturnSuccess,
+	       "HW VBL registration succeeds");
+	expect(hwFb.fVblHwArmed && hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
+	       "HW VBL schedules timer at low-rate watchdog cadence");
+	hwFb.fVblLastHwNs = hwFb.fakeNowNs;
+	hwFb.fakeNowNs += 10000000ULL; // 10 ms < 2 * 16.667 ms
+	hwFb.fire();
+	expect(hwState.calls == 0u && hwFb.timer.period == rdna4vbl::kWatchdogMinUs,
+	       "fresh HW VBL suppresses duplicate timer callback and preserves watchdog cadence");
+	hwFb.fakeNowNs += 50000000ULL; // 60 ms >= 2 * 16.667 ms -> HW VBL stalled
+	hwFb.fire();
+	expect(hwState.calls == 1u && hwFb.timer.period == 16667u,
+	       "stalled HW VBL falls back to timer callback at full refresh cadence");
+	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess && !hwFb.fVblHwArmed,
+	       "disabling VBL disarms hardware VBL source");
+
 	std::printf("primary_vbl_test: %d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

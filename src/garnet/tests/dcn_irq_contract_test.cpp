@@ -3,6 +3,7 @@
 // here.  A successful call must hold the local-display lease while the
 // watchdog restore, scanIrq(), fallback ACK and storm disable run.  A refused
 // lease must consume the entry without any of those paths or ACK statistics.
+#include "dcn/dcn41_vbl_irq_pure.h"
 #include <cstdint>
 #include <cstdio>
 
@@ -81,6 +82,9 @@ struct DcnState {
 	uint8_t srcKind { 0 };
 	uint8_t srcInst { 0 };
 	uint64_t entriesAtEnable { 0 };
+	bool primaryVblEnabled { false };
+	uint8_t primaryVblOtg { 0 };
+	rdna4vbl::RateStormGuard primaryVblStorm {};
 	const char *tag { "?" };
 };
 
@@ -93,11 +97,21 @@ static uint32_t gScanCalls;
 static uint32_t gWatchdogCalls;
 static uint32_t gAckCalls;
 static uint32_t gIrqSetCalls;
+static uint32_t gPrimaryVblCalls;
+static uint32_t gPrimaryVblLastOtg;
+static uint64_t gFakeNowNs = 42u;
+static struct dcn41_irq gFakeIrq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 
-static uint64_t now_ns() { return 42u; }
+static uint64_t now_ns() { return gFakeNowNs; }
+
+static void garnet_primary_fb_notify_vbl(uint32_t otg) {
+	gPrimaryVblCalls++;
+	gPrimaryVblLastOtg = otg;
+	expect(!gLeaseActive, "primary FB VBL notification runs AFTER releasing the display lease");
+}
 
 static struct dcn41_irq dcn41_ih_to_irq(uint32_t, uint32_t, uint32_t) {
-	return dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
+	return gFakeIrq;
 }
 
 static void flip_restore(const char *) {
@@ -133,6 +147,9 @@ static void reset_world() {
 	gDcn = DcnState {};
 	gScan.active = 0;
 	gScanCalls = gWatchdogCalls = gAckCalls = gIrqSetCalls = 0;
+	gPrimaryVblCalls = gPrimaryVblLastOtg = 0;
+	gFakeNowNs = 42u;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 	gTxnAllowed = true;
 	gLeaseActive = false;
 	gTxnBegins = gTxnEnds = 0;
@@ -216,6 +233,33 @@ static void contract_checks() {
 	expect(gDcn.dceVupdate[0] == 0u && gDcn.dceVstartup[1] == 0u &&
 	       gDcn.dceUnclassified == 0u,
 	       "a refused lease does not increment per-source or unclassified ACK counters");
+
+	// Stage 3A: primary VBL VSTARTUP dispatches AFTER releasing rdna4_display_txn.
+	reset_world();
+	gDcn.armed = true;
+	gDcn.primaryVblEnabled = true;
+	gDcn.primaryVblOtg = 0u;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VSTARTUP, 0u };
+	gFakeNowNs = 1000000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, 42u, 0u), "VSTARTUP entry is consumed");
+	expect(gAckCalls == 1u && gPrimaryVblCalls == 1u && gPrimaryVblLastOtg == 0u,
+	       "primary VBL VSTARTUP ACKs under lease and notifies FB outside lease");
+	expect(gTxnBegins == 1u && gTxnEnds == 1u && !gLeaseActive,
+	       "primary VBL path releases the display lease cleanly");
+
+	// Stage 3A: primary VBL rate-based storm guard (> 1000/s) disables inside lease and skips notify.
+	reset_world();
+	gDcn.armed = true;
+	gDcn.primaryVblEnabled = true;
+	gDcn.primaryVblOtg = 0u;
+	gDcn.primaryVblStorm.windowStartNs = 2000000000ULL;
+	gDcn.primaryVblStorm.windowCount = rdna4vbl::kStormWindowMaxIrqs;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VSTARTUP, 0u };
+	gFakeNowNs = 2100000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, 42u, 0u), "storm-tripping VSTARTUP is consumed");
+	expect(gIrqSetCalls == 1u && !gDcn.primaryVblEnabled && gDcn.primaryVblStorm.tripped,
+	       "primary VBL storm guard disables DCN41_IRQ_VSTARTUP inside lease");
+	expect(gPrimaryVblCalls == 0u, "storm-tripping VSTARTUP suppresses FB notification");
 }
 
 int main() {

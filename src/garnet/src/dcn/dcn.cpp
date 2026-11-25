@@ -645,93 +645,115 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 		gDcn.dceUnclassified++;
 		return true;
 	}
-	// The work-loop entry is a complete, non-blocking attempt at the same local
-	// display transaction every other DCN write path takes.  If another thread
-	// owns the transaction, consume the entry without touching DCN registers:
-	// no ACK, no plane write and no source disable.  Returning true only says
-	// this DCE entry was consumed rather than falling through to the generic IH
-	// accounting; it is not an ACK-success result.
-	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
-	if (!txn.ok) {
-		gDcn.dceEntries++;
-		gDcn.irqRefusals++;
-		if (gDcn.irqRefusalLogs < 8u) {
-			gDcn.irqRefusalLogs++;
-			RDNA4LOG("dcn-irq: REFUSED src %u data %08x: no display transaction; entry consumed without ACK or register write",
-			       srcId, srcData0);
+	bool notifyPrimaryVbl = false;
+	uint32_t notifyPrimaryOtg = 0u;
+	{
+		// The work-loop entry is a complete, non-blocking attempt at the same local
+		// display transaction every other DCN write path takes.  If another thread
+		// owns the transaction, consume the entry without touching DCN registers:
+		// no ACK, no plane write and no source disable.  Returning true only says
+		// this DCE entry was consumed rather than falling through to the generic IH
+		// accounting; it is not an ACK-success result.
+		rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+		if (!txn.ok) {
+			gDcn.dceEntries++;
+			gDcn.irqRefusals++;
+			if (gDcn.irqRefusalLogs < 8u) {
+				gDcn.irqRefusalLogs++;
+				RDNA4LOG("dcn-irq: REFUSED src %u data %08x: no display transaction; entry consumed without ACK or register write",
+				       srcId, srcData0);
+			}
+			return true;
 		}
-		return true;
-	}
 
-	const struct dcn41_irq irq = dcn41_ih_to_irq(clientId, srcId, srcData0);
-	const uint64_t t = now_ns();
-	gDcn.dceEntries++;
-	if (gDcn.firstEntryNs == 0) gDcn.firstEntryNs = t;
-	gDcn.lastEntryNs = t;
+		const struct dcn41_irq irq = dcn41_ih_to_irq(clientId, srcId, srcData0);
+		const uint64_t t = now_ns();
+		gDcn.dceEntries++;
+		if (gDcn.firstEntryNs == 0) gDcn.firstEntryNs = t;
+		gDcn.lastEntryNs = t;
 
-	if (irq.kind == DCN41_IRQ_NONE) {
-		gDcn.dceUnclassified++;
+		if (irq.kind == DCN41_IRQ_NONE) {
+			gDcn.dceUnclassified++;
+			if (gDcn.logBudget > 0) {
+				gDcn.logBudget--;
+				RDNA4LOG("dcn-irq: DCE entry src %u data %08x did not classify", srcId, srcData0);
+			}
+			return true;
+		}
+
+		if (irq.kind < DCN41_IRQ_KIND_COUNT) gDcn.dceByKind[irq.kind]++;
+		if (irq.kind == DCN41_IRQ_VUPDATE_NO_LOCK && irq.inst < DCN41_NUM_PIPES)
+			gDcn.dceVupdate[irq.inst]++;
+		if (irq.kind == DCN41_IRQ_VSTARTUP && irq.inst < DCN41_NUM_PIPES)
+			gDcn.dceVstartup[irq.inst]++;
+
+		// T3-FLIP's INDEPENDENT WATCHDOG. While our test plane is on screen the flip enables
+		// VUPDATE_NO_LOCK, so this runs once per frame on the work loop: past the cap the handler
+		// reprograms the console address itself, without any userspace call. This is the answer to
+		// "a wedged step still restores the original plane address".
+		if (gDcn.flipHeld && irq.kind == DCN41_IRQ_VUPDATE_NO_LOCK) {
+			gDcn.heldFrames++;
+			if (gDcn.heldFrames > gDcn.heldFrameCap) {
+				gDcn.watchdogRestores++;
+				RDNA4LOG("dcn-flip: WATCHDOG — held %u frames, cap %u; restoring the console plane from "
+				       "the interrupt handler", gDcn.heldFrames, gDcn.heldFrameCap);
+				flip_restore("interrupt watchdog");
+			}
+		}
+
+		// Acknowledge BEFORE anything else, as amdgpu_dm_irq_handler does (it calls
+		// dc_interrupt_ack first for every DCN source). The ack is a register write and goes
+		// through the allowlist like every other.
+		// build 0.0.603: while a native client holds the plane, the ack AND the scanout bookkeeping run under the scanout lock (the
+		// ack is a read-modify-write of OTG_GLOBAL_SYNC_STATUS, which Acquire / restore also modify); otherwise exactly the old two lines.
+		int ar = 0;
+		if (__atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u || !scanIrq(irq, t, &ar)) {
+			gDcn.tag = "irqack";
+			ar = dcn41_irq_ack(&gDcn.d, irq);
+		}
+		if (ar != DCN41_OK) gDcn.ackFailures++;
+
 		if (gDcn.logBudget > 0) {
 			gDcn.logBudget--;
-			RDNA4LOG("dcn-irq: DCE entry src %u data %08x did not classify", srcId, srcData0);
+			RDNA4LOG("dcn-irq: kind %u inst %u (src %u data %08x) ack %d — entry %llu at %llu ns",
+			       irq.kind, irq.inst, srcId, srcData0, ar,
+			       (unsigned long long)gDcn.dceEntries, (unsigned long long)t);
 		}
-		return true;
-	}
 
-	if (irq.kind < DCN41_IRQ_KIND_COUNT) gDcn.dceByKind[irq.kind]++;
-	if (irq.kind == DCN41_IRQ_VUPDATE_NO_LOCK && irq.inst < DCN41_NUM_PIPES)
-		gDcn.dceVupdate[irq.inst]++;
-	if (irq.kind == DCN41_IRQ_VSTARTUP && irq.inst < DCN41_NUM_PIPES)
-		gDcn.dceVstartup[irq.inst]++;
+		// Stage 3A: primary framebuffer VBLANK delivery with rate-based storm guard (> 1000/s).
+		if (irq.kind == DCN41_IRQ_VSTARTUP && gDcn.primaryVblEnabled &&
+		    irq.inst == gDcn.primaryVblOtg) {
+			if (rdna4vbl::record_irq(gDcn.primaryVblStorm, t)) {
+				struct dcn41_irq off { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
+				gDcn.tag = "vblstorm";
+				(void)dcn41_irq_set(&gDcn.d, off, false);
+				gDcn.primaryVblEnabled = false;
+				RDNA4LOG("dcn-irq: PRIMARY VBL STORM GUARD — > %u VSTARTUP/s on OTG %u; hardware VBL DISABLED (falling back to timer)",
+				         rdna4vbl::kStormWindowMaxIrqs, off.inst);
+			} else {
+				notifyPrimaryVbl = true;
+				notifyPrimaryOtg = irq.inst;
+			}
+		}
 
-	// T3-FLIP's INDEPENDENT WATCHDOG. While our test plane is on screen the flip enables
-	// VUPDATE_NO_LOCK, so this runs once per frame on the work loop: past the cap the handler
-	// reprograms the console address itself, without any userspace call. This is the answer to
-	// "a wedged step still restores the original plane address".
-	if (gDcn.flipHeld && irq.kind == DCN41_IRQ_VUPDATE_NO_LOCK) {
-		gDcn.heldFrames++;
-		if (gDcn.heldFrames > gDcn.heldFrameCap) {
-			gDcn.watchdogRestores++;
-			RDNA4LOG("dcn-flip: WATCHDOG — held %u frames, cap %u; restoring the console plane from "
-			       "the interrupt handler", gDcn.heldFrames, gDcn.heldFrameCap);
-			flip_restore("interrupt watchdog");
+		// Storm guard: disable what we enabled rather than let it spin the work loop.
+		// build 0.0.603: not while a native client holds the plane - that path has the RATE guard (scanIrq), because the cumulative
+		// cap trips after ~28 minutes at 120 Hz.
+		if (gDcn.srcEnabled && !gDcn.stormTripped && __atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u &&
+		    gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap) {
+			struct dcn41_irq off { gDcn.srcKind, gDcn.srcInst };
+			gDcn.tag = "stormoff";
+			(void)dcn41_irq_set(&gDcn.d, off, false);
+			gDcn.srcEnabled = false;
+			gDcn.stormTripped = true;
+			RDNA4LOG("dcn-irq: STORM GUARD — %llu entries since the enable exceeded the cap %llu; "
+			       "kind %u inst %u DISABLED by the handler",
+			       (unsigned long long)(gDcn.dceEntries - gDcn.entriesAtEnable),
+			       (unsigned long long)kDceStormCap, off.kind, off.inst);
 		}
 	}
-
-	// Acknowledge BEFORE anything else, as amdgpu_dm_irq_handler does (it calls
-	// dc_interrupt_ack first for every DCN source). The ack is a register write and goes
-	// through the allowlist like every other.
-	// build 0.0.603: while a native client holds the plane, the ack AND the scanout bookkeeping run under the scanout lock (the
-	// ack is a read-modify-write of OTG_GLOBAL_SYNC_STATUS, which Acquire / restore also modify); otherwise exactly the old two lines.
-	int ar = 0;
-	if (__atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u || !scanIrq(irq, t, &ar)) {
-		gDcn.tag = "irqack";
-		ar = dcn41_irq_ack(&gDcn.d, irq);
-	}
-	if (ar != DCN41_OK) gDcn.ackFailures++;
-
-	if (gDcn.logBudget > 0) {
-		gDcn.logBudget--;
-		RDNA4LOG("dcn-irq: kind %u inst %u (src %u data %08x) ack %d — entry %llu at %llu ns",
-		       irq.kind, irq.inst, srcId, srcData0, ar,
-		       (unsigned long long)gDcn.dceEntries, (unsigned long long)t);
-	}
-
-	// Storm guard: disable what we enabled rather than let it spin the work loop.
-	// build 0.0.603: not while a native client holds the plane - that path has the RATE guard (scanIrq), because the cumulative
-	// cap trips after ~28 minutes at 120 Hz.
-	if (gDcn.srcEnabled && !gDcn.stormTripped && __atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u &&
-	    gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap) {
-		struct dcn41_irq off { gDcn.srcKind, gDcn.srcInst };
-		gDcn.tag = "stormoff";
-		(void)dcn41_irq_set(&gDcn.d, off, false);
-		gDcn.srcEnabled = false;
-		gDcn.stormTripped = true;
-		RDNA4LOG("dcn-irq: STORM GUARD — %llu entries since the enable exceeded the cap %llu; "
-		       "kind %u inst %u DISABLED by the handler",
-		       (unsigned long long)(gDcn.dceEntries - gDcn.entriesAtEnable),
-		       (unsigned long long)kDceStormCap, off.kind, off.inst);
-	}
+	// Dispatch primary FB VBL callback AFTER releasing rdna4_display_txn (zero DCN locks held).
+	if (notifyPrimaryVbl) garnet_primary_fb_notify_vbl(notifyPrimaryOtg);
 	return true;
 }
 
@@ -814,13 +836,15 @@ uint32_t state(uint64_t arg, uint64_t *out, unsigned outCount) {
 	       (unsigned long long)gDcn.dceByKind[DCN41_IRQ_VLINE0],
 	       (unsigned long long)gDcn.dceByKind[DCN41_IRQ_DMCUB_OUTBOX]);
 	RDNA4LOG("dcn-state: per-OTG VUPDATE %llu %llu %llu %llu; VSTARTUP %llu %llu %llu %llu; "
-	       "source %s (kind %u inst %u), storm guard %s",
+	       "source %s (kind %u inst %u), storm guard %s; primaryVbl %s (OTG %u, storm %s)",
 	       (unsigned long long)gDcn.dceVupdate[0], (unsigned long long)gDcn.dceVupdate[1],
 	       (unsigned long long)gDcn.dceVupdate[2], (unsigned long long)gDcn.dceVupdate[3],
 	       (unsigned long long)gDcn.dceVstartup[0], (unsigned long long)gDcn.dceVstartup[1],
 	       (unsigned long long)gDcn.dceVstartup[2], (unsigned long long)gDcn.dceVstartup[3],
 	       gDcn.srcEnabled ? "ENABLED" : "off", gDcn.srcKind, gDcn.srcInst,
-	       gDcn.stormTripped ? "TRIPPED" : "clear");
+	       gDcn.stormTripped ? "TRIPPED" : "clear",
+	       gDcn.primaryVblEnabled ? "ENABLED" : "off", gDcn.primaryVblOtg,
+	       gDcn.primaryVblStorm.tripped ? "TRIPPED" : "clear");
 
 	scanLogState();   // build 0.0.603: one line, and only when a native client has ever taken the plane
 
@@ -971,6 +995,51 @@ uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount) {
 		if (outCount > 12) out[12] = gDcn.srcEnabled ? gDcn.enabledAtNs : 0;
 	}
 	return (rc == DCN41_OK) ? 0u : (0x80u | ((uint32_t)(-rc) & 0x7fu));
+}
+
+bool primaryVblIrqSet(GarnetDriver *owner, uint32_t otg, bool enable) {
+	if (otg >= DCN41_NUM_PIPES) return false;
+	if (enable) {
+		if (!owner || !owner->interruptsArmed()) return false;
+		if (!gDcn.armed && bind(owner) != 0u) return false;
+	}
+	if (!gDcn.armed) return false;
+	if (enable && gDcn.primaryVblStorm.tripped) return false;
+
+	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+	if (!txn.ok) return false;
+
+	if (enable) {
+		// If switching OTG while previously enabled, disable old OTG first.
+		if (gDcn.primaryVblEnabled && gDcn.primaryVblOtg != otg) {
+			struct dcn41_irq prev { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
+			gDcn.tag = "pvbloff";
+			(void)dcn41_irq_set(&gDcn.d, prev, false);
+			gDcn.primaryVblEnabled = false;
+		}
+		rdna4vbl::reset_storm(gDcn.primaryVblStorm);
+		struct dcn41_irq on { DCN41_IRQ_VSTARTUP, static_cast<uint8_t>(otg) };
+		gDcn.tag = "pvblon";
+		const int rc = dcn41_irq_set(&gDcn.d, on, true);
+		if (rc != DCN41_OK) return false;
+		gDcn.primaryVblOtg = static_cast<uint8_t>(otg);
+		__atomic_store_n(&gDcn.primaryVblEnabled, true, __ATOMIC_RELEASE);
+		return true;
+	}
+
+	if (gDcn.primaryVblEnabled) {
+		struct dcn41_irq off { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
+		gDcn.tag = "pvbloff";
+		(void)dcn41_irq_set(&gDcn.d, off, false);
+		__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+	}
+	return true;
+}
+
+bool primaryVblIrqActive() {
+	return __atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) &&
+	       __atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) &&
+	       !gDcn.primaryVblStorm.tripped;
 }
 
 
