@@ -132,7 +132,7 @@ def main() -> int:
           and "rdna4_vs_report(tick); rdna4_vs_tick();" in be_m)
     check("B: DisplaySurface in VRAM uses layout-preserving rdna4s_record_copy_img_preserve in dispCopyVk while preserving test-m6x pin",
           "const BOOL vramImgSrc = imgsrc || [dt rdna4VramSurfCached];" in cmd_m
-          and "if (vramImgSrc) rdna4s_record_copy_img_preserve(dcvk, dt, &pl, savedDispLayout);" in cmd_m
+          and "rdna4s_record_copy_img_preserve(dcvk, dcTex, &segment->dispCopyPlan, segment->dispCopySavedLayout);" in cmd_m
           and "if (take && !((imgsrc ? rdna4df_img_ok(gw_, gh_, gp_, 4) : (BOOL)YES)" in cmd_m)
     check("B: rdna4s_late_run copies VRAM-cached display textures directly from optImg (guarded for GARNET_DISPLAY_LATE_ONLY)",
           "rdna4s_record_copy_img_preserve(cmd, frame->texture, &plan, vramLateLayout);" in surf_m
@@ -153,6 +153,27 @@ def main() -> int:
           "IOSurfaceLock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL)" in res_m
           and "IOSurfaceUnlock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL)" in res_m
           and "IOSurfaceLock(s, kIOSurfaceLockAvoidSync, NULL)" not in res_m)
+
+    # --- Wave 7: Sync commit, lazy dispCopyVk, VK_KHR_push_descriptor, CB render scratch ---
+    shd_m = read(GM / "garnet_shaders.m")
+    pipe_m = read(GM / "garnet_pipelines.m")
+    check("W7A: synchronous queue commit enabled with /private/tmp/garnet-async-commit kill switch",
+          'setValue:@YES forKey:@"commitSynchronously"' in cmd_m
+          and '"/private/tmp/garnet-async-commit"' in cmd_m)
+    check("W7A: dispCopyVk recorded lazily after superseded-elision check via rdna4TakeCmdBufLocked:",
+          "segment->dispCopyPending" in cmd_m
+          and "rdna4TakeCmdBufLocked:" in cmd_m
+          and "elidedDispCopy && segment->dispCopyPending" in cmd_m)
+    check("W7B: VK_KHR_push_descriptor enabled and guarded against audit/hook/non-standard bindings",
+          "VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME" in be_m
+          and "VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR" in shd_m
+          and "rdna4_stage_dsl_ex(" in pipe_m
+          and "RDNA4R.cmdPushDescSet(" in cmd_m)
+    check("W7C: RDNA4RenderEncoder borrows CB-owned RDNA4RenderScratch and RDNA4ResourceBindings",
+          "RDNA4RenderScratch *_sc;" in int_h
+          and "rdna4_stage_reset(" in int_h
+          and "rdna4AcquireRenderScratch:" in cmd_m
+          and "rdna4AcquireResourceBindings:" in cmd_m)
 
     print(f"test-160fps-contracts: {checks} checks, {fails} failed")
     return 1 if fails else 0

@@ -2783,18 +2783,28 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
     RDNA4RenderPipelineState *use = real ?: pipeline;
     return [use rdna4DSVk] == _dsVkFmt && [use rdna4SampleCount] == _encSamples;
 }
+#ifdef VK_VERSION_1_0
+#define RDNA4_ICB_STAGE_DECL() RDNA4RenderScratch *const icbSc = [self rdna4EnsureScratch]
+#define RDNA4_ICB_SV (icbSc->sv)
+#define RDNA4_ICB_SF (icbSc->sf)
+#else
+#define RDNA4_ICB_STAGE_DECL() ((void)0)
+#define RDNA4_ICB_SV (_sv)
+#define RDNA4_ICB_SF (_sf)
+#endif
 - (BOOL)rdna4ICBInheritedBuffersSatisfyPipeline:(id)pipeline {
     if (![pipeline isKindOfClass:[RDNA4RenderPipelineState class]]) return NO;
     RDNA4RenderPipelineState *use = [(RDNA4RenderPipelineState *)pipeline rdna4Real] ?: pipeline;
     id device = [self rdna4ICBDevice];
+    RDNA4_ICB_STAGE_DECL();
 #ifdef VK_VERSION_1_0
     if ([use rdna4IsTessellation]) {
         const rdna4_tess_cfg_t *cfg = [use tessCfg];
         for (uint32_t i = 0; i < cfg->num_inputs; i++) {
             const rdna4_tess_input_t *in = &cfg->inputs[i];
             if (!in->has_attr) continue;
-            RDNA4Buffer *vb = _sv.buf[in->buf_idx].b;
-            NSUInteger vo = _sv.buf[in->buf_idx].off;
+            RDNA4Buffer *vb = RDNA4_ICB_SV.buf[in->buf_idx].b;
+            NSUInteger vo = RDNA4_ICB_SV.buf[in->buf_idx].off;
             if (!vb || ![vb isKindOfClass:[RDNA4Buffer class]] || [vb device] != device ||
                 vo > [vb length] || ![vb gpuAddress] || vo > UINT64_MAX - [vb gpuAddress])
                 return NO;
@@ -2807,11 +2817,11 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t index = needed[i];
             if (index == 31) continue;
-            if (index >= 31 || !_sv.buf[index].b || _sv.buf[index].off > [_sv.buf[index].b length]) return NO;
+            if (index >= 31 || !RDNA4_ICB_SV.buf[index].b || RDNA4_ICB_SV.buf[index].off > [RDNA4_ICB_SV.buf[index].b length]) return NO;
         }
     }
-    return rdna4icb_stage_buffers_ok([use pbV], [use npbV], &_sv, device) &&
-           rdna4icb_stage_buffers_ok([use pbF], [use npbF], &_sf, device);
+    return rdna4icb_stage_buffers_ok([use pbV], [use npbV], &RDNA4_ICB_SV, device) &&
+           rdna4icb_stage_buffers_ok([use pbF], [use npbF], &RDNA4_ICB_SF, device);
 }
 - (BOOL)rdna4ICBExplicitBuffersSatisfyRecord:(RDNA4ICBRecord *)record pipeline:(id)pipeline {
     if (![pipeline isKindOfClass:[RDNA4RenderPipelineState class]]) return NO;
@@ -2859,14 +2869,11 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
            rdna4icb_stage_buffers_ok([use pbF], [use npbF], &fragment, device);
 }
 - (void)rdna4ICBClearExplicitBuffers {
+    RDNA4_ICB_STAGE_DECL();
     for (NSUInteger i = 0; i < 31; ++i) {
-        _sv.buf[i].b = nil;
-        _sv.buf[i].off = 0;
-        _sf.buf[i].b = nil;
-        _sf.buf[i].off = 0;
+        rdna4_stage_set_buf(&RDNA4_ICB_SV, i, nil, 0);
+        rdna4_stage_set_buf(&RDNA4_ICB_SF, i, nil, 0);
     }
-    _sv.roBufMask = 0;
-    _sf.roBufMask = 0;
 }
 - (void)rdna4ICBRetainResource:(id)resource {
 #ifdef VK_VERSION_1_0
@@ -3042,26 +3049,27 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         cfg.parent_tess_factor_stride = (uint32_t)_tessFactorStride;
         [_cb rdna4RetainEncoded:_tessFactorBuf];
     }
+    RDNA4RenderScratch *icbSc = [self rdna4EnsureScratch];
     for (uint32_t j = 0; j < 31; j++) {
-        if (_sv.buf[j].b && [_sv.buf[j].b gpuAddress]) {
-            if ([_sv.buf[j].b device] != dev ||
-                !rdna4_buffer_table_set(&cfg.parent_v_table, j, [_sv.buf[j].b gpuAddress],
-                                        _sv.buf[j].b.length, _sv.buf[j].off, [_sv.buf[j].b rdna4HostReadOnly])) {
+        if (icbSc->sv.buf[j].b && [icbSc->sv.buf[j].b gpuAddress]) {
+            if ([icbSc->sv.buf[j].b device] != dev ||
+                !rdna4_buffer_table_set(&cfg.parent_v_table, j, [icbSc->sv.buf[j].b gpuAddress],
+                                        icbSc->sv.buf[j].b.length, icbSc->sv.buf[j].off, [icbSc->sv.buf[j].b rdna4HostReadOnly])) {
                 [_cb rdna4Fail:@"parent vertex buffer slot is invalid for ICB execution"];
                 return;
             }
-            cfg.parent_vb_bda[j] = [_sv.buf[j].b gpuAddress] + _sv.buf[j].off;
-            cfg.parent_vb_size[j] = _sv.buf[j].b.length - _sv.buf[j].off;
-            [_cb rdna4RetainEncoded:_sv.buf[j].b];
+            cfg.parent_vb_bda[j] = [icbSc->sv.buf[j].b gpuAddress] + icbSc->sv.buf[j].off;
+            cfg.parent_vb_size[j] = icbSc->sv.buf[j].b.length - icbSc->sv.buf[j].off;
+            [_cb rdna4RetainEncoded:icbSc->sv.buf[j].b];
         }
-        if (_sf.buf[j].b && [_sf.buf[j].b gpuAddress]) {
-            if ([_sf.buf[j].b device] != dev ||
-                !rdna4_buffer_table_set(&cfg.parent_f_table, j, [_sf.buf[j].b gpuAddress],
-                                        _sf.buf[j].b.length, _sf.buf[j].off, [_sf.buf[j].b rdna4HostReadOnly])) {
+        if (icbSc->sf.buf[j].b && [icbSc->sf.buf[j].b gpuAddress]) {
+            if ([icbSc->sf.buf[j].b device] != dev ||
+                !rdna4_buffer_table_set(&cfg.parent_f_table, j, [icbSc->sf.buf[j].b gpuAddress],
+                                        icbSc->sf.buf[j].b.length, icbSc->sf.buf[j].off, [icbSc->sf.buf[j].b rdna4HostReadOnly])) {
                 [_cb rdna4Fail:@"parent fragment buffer slot is invalid for ICB execution"];
                 return;
             }
-            [_cb rdna4RetainEncoded:_sf.buf[j].b];
+            [_cb rdna4RetainEncoded:icbSc->sf.buf[j].b];
         }
     }
 
@@ -3164,18 +3172,18 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         RDNA4RenderPipelineState *P = cands[ci];
         MTLRenderPipelineReflection *reflection = [P reflection] ?: _roReflection;
         BOOL pHasFrag = [P rdna4HasFragment];
-        rdna4_each_tex([P icbPbV], [P icbNpbV], &_sv, dev, needTex);
-        if (pHasFrag) rdna4_each_tex([P icbPbF], [P icbNpbF], &_sf, dev, needTex);
+        rdna4_each_tex([P icbPbV], [P icbNpbV], &icbSc->sv, dev, needTex);
+        if (pHasFrag) rdna4_each_tex([P icbPbF], [P icbNpbF], &icbSc->sf, dev, needTex);
 
         NSMutableSet *argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
         NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
-        rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbV], [P icbNpbV], &_sv,
+        rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbV], [P icbNpbV], &icbSc->sv,
                                        rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX));
         if (pHasFrag)
-            rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbF], [P icbNpbF], &_sf,
+            rdna4_argument_stage_resources(argumentResources, argumentWritable, [P icbPbF], [P icbNpbF], &icbSc->sf,
                                            rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT));
         RDNA4ArgumentScanPrepared scan = {0};
-        const RDNA4StageState *scanStages[] = { &_sv, &_sf };
+        const RDNA4StageState *scanStages[] = { &icbSc->sv, &icbSc->sf };
         NSString *scanError = nil;
         if (!rdna4_argument_scan_prepare(&scan, scanStages, pHasFrag ? 2 : 1, argumentWritable, dev, &scanError)) {
             [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
@@ -3195,7 +3203,7 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
 
         candSet0[ci] = [_cb rdna4AllocSet:[P icbDsl:0]];
         if (!candSet0[ci]) return;
-        if ([P icbNpbV] && ![_cb rdna4FillSet:candSet0[ci] bindings:[P icbPbV] count:[P icbNpbV] state:&_sv stage:"icb-vertex"]) return;
+        if ([P icbNpbV] && ![_cb rdna4FillSet:candSet0[ci] bindings:[P icbPbV] count:[P icbNpbV] state:&icbSc->sv stage:"icb-vertex"]) return;
         VkDescriptorBufferInfo dynBi0[2];
         VkWriteDescriptorSet dynW0[2];
         uint32_t nDyn0 = 0;
@@ -3216,7 +3224,7 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         if (pHasFrag) {
             candSet1[ci] = [_cb rdna4AllocSet:[P icbDsl:1]];
             if (!candSet1[ci]) return;
-            if ([P icbNpbF] && ![_cb rdna4FillSet:candSet1[ci] bindings:[P icbPbF] count:[P icbNpbF] state:&_sf stage:"icb-fragment"]) return;
+            if ([P icbNpbF] && ![_cb rdna4FillSet:candSet1[ci] bindings:[P icbPbF] count:[P icbNpbF] state:&icbSc->sf stage:"icb-fragment"]) return;
             VkDescriptorBufferInfo fbi = { [outFTable vkBuffer], [outFTable rdna4VkOffset], sizeof(rdna4_buffer_table) };
             VkWriteDescriptorSet fw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = candSet1[ci], .dstBinding = RDNA4_ICB_TABLE_BINDING, .descriptorCount = 1,
@@ -3294,7 +3302,7 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
             vkCmdDrawIndirect(cmd, [outDraws vkBuffer], cmdOff, 1, sizeof(VkDrawIndirectCommand));
         }
     }
-    if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+    if (_dcOn) rdna4dc_enc_reset_bound(&icbSc->dc);
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
     _vbDirtyMask = ~0u;
@@ -3325,10 +3333,11 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
     }
 #endif
     NSString *problem = nil;
+    RDNA4_ICB_STAGE_DECL();
     RDNA4RenderPipelineState *parentPipeline = _pso;
     MTLRenderPipelineReflection *parentReflection = _roReflection;
-    RDNA4StageState parentVertex = _sv;
-    RDNA4StageState parentFragment = _sf;
+    RDNA4StageState parentVertex = RDNA4_ICB_SV;
+    RDNA4StageState parentFragment = RDNA4_ICB_SF;
 #ifdef VK_VERSION_1_0
     id parentTessBuf = _tessFactorBuf;
     NSUInteger parentTessOff = _tessFactorOff;
@@ -3340,9 +3349,20 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
     NSUInteger replayed = [icb rdna4ExecuteOnEncoder:self range:executionRange reason:&problem];
     _pso = parentPipeline;
     _roReflection = parentReflection;
-    _sv = parentVertex;
-    _sf = parentFragment;
+    RDNA4_ICB_SV = parentVertex;
+    RDNA4_ICB_SF = parentFragment;
 #ifdef VK_VERSION_1_0
+    if (parentPipeline) {
+        [parentPipeline rdna4FillFast:&_psoFast];
+        [self rdna4OwnResource:parentPipeline kind:RDNA4_RESOURCE_PIPELINE fragment:NO index:0];
+    }
+    for (uint32_t bi = 0; bi < 31; bi++) {
+        if (parentVertex.buf[bi].b) [self rdna4OwnResource:parentVertex.buf[bi].b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:bi];
+        if (parentFragment.buf[bi].b) [self rdna4OwnResource:parentFragment.buf[bi].b kind:RDNA4_RESOURCE_BUFFER fragment:YES index:bi];
+    }
+    _drawDirty = GARNET_DRAW_DIRTY_ALL;
+    _cleanFastOk = NO;
+    _vbDirtyMask = ~0u;
     _tessFactorBuf = parentTessBuf;
     _tessFactorOff = parentTessOff;
     _tessFactorStride = parentTessStride;

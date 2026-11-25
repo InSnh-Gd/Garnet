@@ -93,6 +93,8 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     out->isTess = _isTess ? 1u : 0u;
     out->isMesh = [self rdna4IsMeshPipeline] ? 1u : 0u;
     out->hasAddrReg = _hasAddressRegistry ? 1u : 0u;
+    out->pushStage[0] = _pushStage[0];
+    out->pushStage[1] = _pushStage[1];
 }
 - (RDNA4RenderPipelineState *)rdna4Real { uintptr_t p = rdna4hs_load(&_realp); return p ? (__bridge RDNA4RenderPipelineState *)(void *)p : nil; }
 // Runs on the watcher queue. Builds a complete NEW pipeline object from the recorded descriptor (no fallback allowed, no AIR dump) and publishes it.
@@ -496,11 +498,16 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(45, [NSString stringWithFormat:@"vkCreateRenderPass = %d", r]); free(rv); free(rf); return nil; }
     }
     // Layouts: vertex/TES = set 0, fragment = set 1 (both always exist, possibly empty) + push constants when a stage declares a block.
+    // Vulkan allows at most one push-descriptor set per VkPipelineLayout: prefer fragment (set 1) where textures+samplers+uniforms churn most, else vertex (set 0).
     NSError *le = nil;
     VkShaderStageFlags vsStage = _isTess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-    if (!rdna4_stage_dsl(rv, 0, vsStage, mv_, &_dsl[0], &_pbV, &_npbV, _owned, &le) ||
-        !rdna4_stage_dsl(rf, 1, VK_SHADER_STAGE_FRAGMENT_BIT, mf_, &_dsl[1], &_pbF, &_npbF, _owned, &le)) {
+    const BOOL allowPush = !_icb && (mv_[@"argument_resource_tables"] == nil && mf_[@"argument_resource_tables"] == nil);
+    BOOL pushF = NO, pushV = NO;
+    if (!rdna4_stage_dsl_ex(rf, 1, VK_SHADER_STAGE_FRAGMENT_BIT, mf_, &_dsl[1], &_pbF, &_npbF, _owned, allowPush, &pushF, &le) ||
+        !rdna4_stage_dsl_ex(rv, 0, vsStage, mv_, &_dsl[0], &_pbV, &_npbV, _owned, allowPush && !pushF, &pushV, &le)) {
         if (err) *err = le; free(rv); free(rf); return nil; }
+    _pushStage[0] = pushV ? 1u : 0u;
+    _pushStage[1] = pushF ? 1u : 0u;
     if (!rdna4_argument_table_stages_compatible(mv_, mf_)) {
         if (err) *err = rdna4_err(49,
             @"vertex and fragment GPU argument tables use different ABI tails");

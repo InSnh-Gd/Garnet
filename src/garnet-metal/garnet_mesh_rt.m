@@ -4913,19 +4913,20 @@ static BOOL rdna4_mesh_update_emul_descriptors(VkDescriptorSet ds, uint32_t emul
     }
 
     // 5. Transition textures for native Object, Mesh, and Fragment stages outside the render pass.
+    RDNA4RenderScratch *encSc = [self rdna4EnsureScratch];
     if (mode == RDNA4MESH_MODE_NATIVE_TASK_MESH && [mpso rdna4NpbO])
         rdna4_each_tex([mpso rdna4PbO], [mpso rdna4NpbO], &ms->objState, dev, needTex);
     if ([mpso rdna4NpbM])
         rdna4_each_tex([mpso rdna4PbM], [mpso rdna4NpbM], &ms->meshState, dev, needTex);
     if (hasFrag && [mpso npbF])
-        rdna4_each_tex([mpso pbF], [mpso npbF], &_sf, dev, needTex);
+        rdna4_each_tex([mpso pbF], [mpso npbF], &encSc->sf, dev, needTex);
 
     if (hasFrag && [mpso argumentTables]->active) {
         NSMutableSet *argRes = [_argumentResources mutableCopy] ?: [NSMutableSet set];
         NSMutableSet *argW = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
-        rdna4_argument_stage_resources(argRes, argW, [mpso pbF], [mpso npbF], &_sf, nil);
+        rdna4_argument_stage_resources(argRes, argW, [mpso pbF], [mpso npbF], &encSc->sf, nil);
         RDNA4ArgumentScanPrepared scan = {0};
-        const RDNA4StageState *scanStages[1] = { &_sf };
+        const RDNA4StageState *scanStages[1] = { &encSc->sf };
         NSString *scanErr = nil;
         if (!rdna4_argument_scan_prepare(&scan, scanStages, 1u, argW, dev, &scanErr)) {
             [_cb rdna4Fail:scanErr ?: @"mesh fragment argument scan failed"];
@@ -4960,7 +4961,7 @@ static BOOL rdna4_mesh_update_emul_descriptors(VkDescriptorSet ds, uint32_t emul
                              VK_DEPENDENCY_BY_REGION_BIT, 1u, &mb, 0u, NULL, 0u, NULL);
     }
 
-    if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+    if (_dcOn) rdna4dc_enc_reset_bound(&encSc->dc);
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
     _vbDirtyMask = ~0u;
@@ -5013,7 +5014,7 @@ static BOOL rdna4_mesh_update_emul_descriptors(VkDescriptorSet ds, uint32_t emul
     }
     if (hasFrag && [mpso npbF]) {
         VkDescriptorSet fragDs = [_cb rdna4AllocSet:[mpso dsl:1]];
-        if (!fragDs || ![_cb rdna4FillSet:fragDs bindings:[mpso pbF] count:[mpso npbF] state:&_sf stage:"mesh-fragment"])
+        if (!fragDs || ![_cb rdna4FillSet:fragDs bindings:[mpso pbF] count:[mpso npbF] state:&encSc->sf stage:"mesh-fragment"])
             return;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [mpso layout], 1u, 1u, &fragDs, 0u, NULL);
     }

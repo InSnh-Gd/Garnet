@@ -349,7 +349,7 @@ static void signalSegment(
     _resourceBindings = [RDNA4ResourceBindings new];
     _resourceSegmentSerial = [_cb rdna4SegmentSerial];
     _dcOn = drawCache;
-    if (_dcOn) rdna4dc_enc_init(&_dc);
+    if (_dcOn) rdna4dc_enc_init(&[self rdna4EnsureScratch]->dc);
 }
 - (void)rdna4TestSetVertexBuffer:(id)buffer index:(NSUInteger)index {
     [self rdna4SetBuffer:buffer offset:0 index:index frag:NO];
@@ -384,19 +384,20 @@ static void signalSegment(
 }
 - (void)rdna4TestPrimeDrawCachePipeline:(uint64_t)pipeline
                                  layout:(uint64_t)layout {
-    _dc.layout = layout;
-    _dc.lastPipe = pipeline;
-    _dc.st[0].valid = 1;
-    _dc.st[1].valid = 1;
+    RDNA4RenderScratch *sc = [self rdna4EnsureScratch];
+    sc->dc.layout = layout;
+    sc->dc.lastPipe = pipeline;
+    sc->dc.st[0].valid = 1;
+    sc->dc.st[1].valid = 1;
 }
 - (uint64_t)rdna4TestLastPipeline {
-    return _dc.lastPipe;
+    return [self rdna4EnsureScratch]->dc.lastPipe;
 }
 - (uint64_t)rdna4TestDrawCacheLayout {
-    return _dc.layout;
+    return [self rdna4EnsureScratch]->dc.layout;
 }
 - (BOOL)rdna4TestVertexSetValid {
-    return _dc.st[0].valid != 0;
+    return [self rdna4EnsureScratch]->dc.st[0].valid != 0;
 }
 - (VkRenderPass)rdna4TestCreateRenderHandlesCached:(BOOL)cached {
     _rp1 = rdna4_mk_rp(NULL, 0, 0, NO);

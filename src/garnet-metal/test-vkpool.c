@@ -65,7 +65,7 @@ static void test_stage2_command_invariants(void) {
     if (buf) {
         size_t nr = fread(buf, 1, (size_t)len, f);
         buf[nr] = '\0';
-        const char *bind = strstr(buf, "if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp))");
+        const char *bind = strstr(buf, "if (!rdna4dc_enc_pipe_same(&sc->dc, (uint64_t)(uintptr_t)vkp))");
         const char *dirty = bind ? strstr(bind, "_dynDirty = GARNET_DYN_ALL;") : NULL;
         check(bind != NULL && dirty != NULL && (dirty - bind) < 200,
               "pipeline switch re-dirties all dynamic state (prevents vpCount/depthBias/mesh stale leaks)");

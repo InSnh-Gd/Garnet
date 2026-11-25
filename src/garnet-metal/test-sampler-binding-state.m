@@ -83,8 +83,8 @@ static unsigned wrappedRejects;
 - (void)rdna4BindingTestInstallCommandBuffer:(id)commandBuffer {
     _cb = (RDNA4CommandBuffer *)commandBuffer;
 }
-- (RDNA4StageState *)rdna4BindingTestFragmentStage { return &_sf; }
-- (RDNA4StageState *)rdna4BindingTestVertexStage { return &_sv; }
+- (RDNA4StageState *)rdna4BindingTestFragmentStage { return [self rdna4Stage:YES]; }
+- (RDNA4StageState *)rdna4BindingTestVertexStage { return [self rdna4Stage:NO]; }
 - (NSUInteger)rdna4BindingTestBindingCount { return _samplerBindings.count; }
 @end
 

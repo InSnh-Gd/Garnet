@@ -92,6 +92,11 @@ typedef struct {
     RDNA4BufSlot buf[31];
 } RDNA4StageState;
 
+static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Buffer *b, NSUInteger off) {
+    s->buf[i].b = b;
+    s->buf[i].off = off;
+}
+
 @interface RDNA4RenderPipelineState : NSObject
 - (id)rdna4Real;
 - (int)rdna4DSVk;

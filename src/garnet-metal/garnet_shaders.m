@@ -2176,7 +2176,11 @@ static NSDictionary *rdna4_stage_meta_relocate(NSDictionary *meta, int set) {
 // One stage's descriptor-set layout for set `set` from its reflection; pb/npb = the stage's binding list (malloc'd). r may be NULL (no stage).
 GARNET_INTERNAL BOOL rdna4_stage_dsl(const RDNA4sRefl *r, int set, VkShaderStageFlags stage, NSDictionary *meta, VkDescriptorSetLayout *dsl, RDNA4PB **pbOut, uint32_t *npb,
                           NSMutableArray *ownedSamplers, NSError **err) {
-    *pbOut = NULL; *npb = 0;
+    return rdna4_stage_dsl_ex(r, set, stage, meta, dsl, pbOut, npb, ownedSamplers, NO, NULL, err);
+}
+GARNET_INTERNAL BOOL rdna4_stage_dsl_ex(const RDNA4sRefl *r, int set, VkShaderStageFlags stage, NSDictionary *meta, VkDescriptorSetLayout *dsl, RDNA4PB **pbOut, uint32_t *npb,
+                          NSMutableArray *ownedSamplers, BOOL allowPush, BOOL *usedPush, NSError **err) {
+    *pbOut = NULL; *npb = 0; if (usedPush) *usedPush = NO;
     if (r && (r->descriptor_features & RDNA4S_IMAGE_GATHER_EXTENDED) &&
         !rdna4_device_gather_caps().supported) {
         if (err) *err = rdna4_err(49,
@@ -2467,10 +2471,32 @@ GARNET_INTERNAL BOOL rdna4_stage_dsl(const RDNA4sRefl *r, int set, VkShaderStage
             RDNA4LOG("static sampler at binding %u: min %d mag %d mip %d addr %d/%d/%d %s", bn, c.minF, c.magF, c.mipF, c.as, c.at, c.ar, c.unnorm ? "unnormalized (coord::pixel)" : "normalized");
         }
     }
-    VkDescriptorSetLayoutCreateInfo dc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nb, .pBindings = bnd };
+    BOOL usePush = NO;
+    if (allowPush && RDNA4DO.on && RDNA4R.pushDescExt && RDNA4R.cmdPushDescSet &&
+        !RDNA4P.auditSubmit && RDNA4R.realAllocDesc && vkAllocateDescriptorSets == RDNA4R.realAllocDesc &&
+        nb > 0 && nb <= 16u) {
+        uint32_t totalDesc = 0u;
+        BOOL okPush = YES;
+        for (uint32_t i = 0; i < nb; i++) {
+            const RDNA4PB *p = &pb[i];
+            if (p->addressTable || p->samplerCoordinateFlags || p->argumentTable ||
+                (p->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && p->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                 p->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && p->type != VK_DESCRIPTOR_TYPE_SAMPLER &&
+                 p->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && p->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) {
+                okPush = NO; break;
+            }
+            totalDesc += p->count;
+        }
+        if (okPush && totalDesc > 0u && totalDesc <= RDNA4R.maxPushDesc && totalDesc <= 24u)
+            usePush = YES;
+    }
+    VkDescriptorSetLayoutCreateInfo dc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .flags = usePush ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0u,
+        .bindingCount = nb, .pBindings = bnd };
     VkResult vr = vkCreateDescriptorSetLayout(RDNA4R.dev, &dc, NULL, dsl);
     free(bnd);
     if (vr != VK_SUCCESS) { free(pb); if (err) *err = rdna4_err(50, [NSString stringWithFormat:@"vkCreateDescriptorSetLayout = %d", vr]); return NO; }
+    if (usedPush) *usedPush = usePush;
     if (nb) { *pbOut = realloc(pb, nb * sizeof *pb); *npb = nb; } else free(pb);
     return YES;
 }

@@ -1467,6 +1467,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.realFreeMem = vkFreeMemory;
         RDNA4R.realCreateFB = vkCreateFramebuffer;
         RDNA4R.realDestroyFB = vkDestroyFramebuffer;
+        RDNA4R.realAllocDesc = vkAllocateDescriptorSets;
         rdna4_vkQueueWaitIdle = (PFN_vkQueueWaitIdle)rdna4_gipa(RDNA4R.inst, "vkQueueWaitIdle");
         rdna4_native_bridge.copy = (void *)dlsym(h, "radv_darwin_buffer_copy");
         rdna4_native_bridge.fill = (void *)dlsym(h, "radv_darwin_buffer_fill");
@@ -1673,7 +1674,9 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         const char *orderedColorExt = NULL;
         BOOL hasDrmMod = NO, hasMemoryBudget = NO, hasSampleLoc = NO, hasInterlock = NO;
         BOOL hasBarycentric = NO, hasAtomicFloat = NO, hasAtomicFloat2 = NO, hasAtomicInt64 = NO;
-        BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO;
+        BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO, hasPushDesc = NO;
+        VkPhysicalDevicePushDescriptorPropertiesKHR pushDescProps = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR };
         {
             uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, NULL);
             VkExtensionProperties *ex = calloc(ne ? ne : 1, sizeof *ex); vkEnumerateDeviceExtensionProperties(RDNA4R.pd, NULL, &ne, ex);
@@ -1697,6 +1700,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasDeferredHostOps |= !strcmp(ex[i].extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
                 hasAccelStruct |= !strcmp(ex[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
                 hasRayQuery |= !strcmp(ex[i].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+                hasPushDesc |= !strcmp(ex[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
                 hasRO |= !strcmp(ex[i].extensionName, "VK_EXT_rasterization_order_attachment_access") || !strcmp(ex[i].extensionName, "VK_ARM_rasterization_order_attachment_access");
                 if (!strcmp(ex[i].extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
                 else if (!orderedColorExt && !strcmp(ex[i].extensionName, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
@@ -1735,10 +1739,13 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 if (hasSampleLoc) { slp.pNext = p2bNext; p2bNext = &slp; }
                 if (hasMeshShader) { meshProps.pNext = p2bNext; p2bNext = &meshProps; }
                 if (hasAccelStruct) { accelProps.pNext = p2bNext; p2bNext = &accelProps; }
+                if (hasPushDesc) { pushDescProps.pNext = p2bNext; p2bNext = &pushDescProps; }
                 VkPhysicalDeviceProperties2 p2b = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = p2bNext };
                 vkGetPhysicalDeviceProperties2(RDNA4R.pd, &p2b);
                 meshProps.pNext = NULL;
                 accelProps.pNext = NULL;
+                pushDescProps.pNext = NULL;
+                if (hasPushDesc) RDNA4R.maxPushDesc = pushDescProps.maxPushDescriptors;
                 RDNA4R.depthResolveModes = dsr.supportedDepthResolveModes;
                 RDNA4R.stencilResolveModes = dsr.supportedStencilResolveModes;
                 RDNA4R.dsResolveIndep = dsr.independentResolve != VK_FALSE;
@@ -1868,11 +1875,17 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4LOG("radv: GPU argument tables %s", RDNA4R.gpuArgumentTables ? "enabled" : "unavailable");
         RDNA4R.drmModExt = hasDrmMod && vkGetPhysicalDeviceImageFormatProperties2;
         if (RDNA4R.drmModExt) devExts[devExtCount++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
+        if (hasPushDesc) devExts[devExtCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
         RDNA4LOG("radv: VK_EXT_image_drm_format_modifier %s (VK_KHR_image_format_list is core at API 1.2; device API is 1.3)", RDNA4R.drmModExt ? "enabled" : "unavailable");
         VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &enabled11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &dq, .pEnabledFeatures = &ef,
                                    .enabledExtensionCount = devExtCount, .ppEnabledExtensionNames = devExts };
         r = vkCreateDevice(RDNA4R.pd, &dci, NULL, &RDNA4R.dev);
         if (r != VK_SUCCESS) { RDNA4R.err = rdna4_err(7, [NSString stringWithFormat:@"vkCreateDevice = %d", r]); goto fail; }
+        if (hasPushDesc && vkGetDeviceProcAddr) {
+            RDNA4R.cmdPushDescSet = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdPushDescriptorSetKHR");
+            RDNA4R.pushDescExt = (RDNA4R.cmdPushDescSet != NULL && RDNA4R.maxPushDesc >= 8u);
+        }
+        RDNA4LOG("radv: VK_KHR_push_descriptor %s (maxPushDescriptors %u)", RDNA4R.pushDescExt ? "enabled" : "unavailable", RDNA4R.maxPushDesc);
         if (enabled12.bufferDeviceAddress && vkGetDeviceProcAddr) {
             rdna4_vkGetBufferAddress = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetBufferDeviceAddress");
             RDNA4R.bufferAddress = rdna4_vkGetBufferAddress != NULL;

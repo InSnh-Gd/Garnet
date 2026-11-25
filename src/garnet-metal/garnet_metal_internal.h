@@ -434,10 +434,22 @@ typedef struct { MTLPixelFormat mtl; VkFormat vk; uint32_t bpp; uint32_t flags; 
 typedef struct {
     __unsafe_unretained id as[RDNA4RTR_MAX_BUFFER_SLOTS];
 } RDNA4RTStageSlots;
-typedef struct { __unsafe_unretained RDNA4Buffer *b; NSUInteger off; } RDNA4BufSlot;
+typedef struct {
+    __unsafe_unretained RDNA4Buffer *b;
+    NSUInteger off;
+    VkBuffer vkBuf;
+    VkDeviceSize vkOff;
+    NSUInteger len;
+    __unsafe_unretained id dev;
+} RDNA4BufSlot;
 typedef struct {
     RDNA4BufSlot buf[31]; __unsafe_unretained RDNA4Texture *tex[128]; __unsafe_unretained RDNA4SamplerBinding *smp[16]; __unsafe_unretained RDNA4Texture *att[8];   // att: the colour attachments (input attachments, 11e-2)
     uint32_t roBufMask;   // bit i set iff buf[i].b is a host-read-only no-copy buffer
+    uint32_t bufMask;     // bit i set iff buf[i].b != nil
+    uint64_t texMaskLo, texMaskHi; // bit i set iff tex[i] != nil
+    uint16_t smpMask;     // bit i set iff smp[i] != nil
+    uint8_t attMask;      // bit i set iff att[i] != nil
+    uint32_t asMask;      // bit i set iff rt.as[i] != nil
     RDNA4RTStageSlots rt;
     const rdna4rtr_as_reflection_t *rtAsRefl;
     const rdna4_argument_scan_reflection_plan *scanPlan;
@@ -645,6 +657,10 @@ typedef struct {
     PFN_vkFreeMemory realFreeMem;
     PFN_vkCreateFramebuffer realCreateFB;
     PFN_vkDestroyFramebuffer realDestroyFB;
+    PFN_vkAllocateDescriptorSets realAllocDesc;
+    BOOL pushDescExt;
+    uint32_t maxPushDesc;
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescSet;
     garnet_bar_policy_t barPolicy;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
@@ -754,6 +770,8 @@ typedef struct {
 - (void)rdna4AdoptHeap:(RDNA4Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid;
 - (VkBuffer)vkBuffer;
 - (VkDeviceSize)rdna4VkOffset;
+- (id)device;
+- (NSUInteger)length;
 - (uint64_t)gpuAddress;
 - (uint64_t)rdna4BackingBlock;
 - (uint64_t)rdna4BackingOffset;
@@ -766,9 +784,100 @@ typedef struct {
 static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Buffer *b, NSUInteger off) {
     s->buf[i].b = b;
     s->buf[i].off = off;
-    if (b && [b rdna4HostReadOnly]) s->roBufMask |= (1u << i);
-    else s->roBufMask &= ~(1u << i);
+    if (b) {
+        s->buf[i].vkBuf = [b vkBuffer];
+        s->buf[i].vkOff = [b rdna4VkOffset];
+        s->buf[i].len = [b length];
+        s->buf[i].dev = [b device];
+        s->bufMask |= (1u << i);
+        if ([b rdna4HostReadOnly]) s->roBufMask |= (1u << i);
+        else s->roBufMask &= ~(1u << i);
+    } else {
+        s->buf[i].vkBuf = VK_NULL_HANDLE;
+        s->buf[i].vkOff = 0;
+        s->buf[i].len = 0;
+        s->buf[i].dev = nil;
+        s->bufMask &= ~(1u << i);
+        s->roBufMask &= ~(1u << i);
+    }
 }
+static inline void rdna4_stage_set_tex(RDNA4StageState *s, NSUInteger i, RDNA4Texture *t) {
+    s->tex[i] = t;
+    if (i < 64u) {
+        if (t) s->texMaskLo |= (1ULL << i); else s->texMaskLo &= ~(1ULL << i);
+    } else {
+        const unsigned bit = (unsigned)(i - 64u);
+        if (t) s->texMaskHi |= (1ULL << bit); else s->texMaskHi &= ~(1ULL << bit);
+    }
+}
+static inline void rdna4_stage_set_smp(RDNA4StageState *s, NSUInteger i, RDNA4SamplerBinding *b) {
+    s->smp[i] = b;
+    if (b) s->smpMask |= (uint16_t)(1u << i);
+    else s->smpMask &= (uint16_t)~(1u << i);
+}
+static inline void rdna4_stage_set_att(RDNA4StageState *s, uint32_t i, RDNA4Texture *t) {
+    s->att[i] = t;
+    if (t) s->attMask |= (uint8_t)(1u << i);
+    else s->attMask &= (uint8_t)~(1u << i);
+}
+static inline void rdna4_stage_reset(RDNA4StageState *s) {
+    uint32_t bm = s->bufMask;
+    while (bm) {
+        unsigned i = (unsigned)__builtin_ctz(bm);
+        bm &= bm - 1u;
+        s->buf[i] = (RDNA4BufSlot){ 0 };
+    }
+    s->bufMask = 0u;
+    s->roBufMask = 0u;
+    uint64_t tlo = s->texMaskLo;
+    while (tlo) {
+        unsigned i = (unsigned)__builtin_ctzll(tlo);
+        tlo &= tlo - 1ULL;
+        s->tex[i] = nil;
+    }
+    s->texMaskLo = 0ULL;
+    uint64_t thi = s->texMaskHi;
+    while (thi) {
+        unsigned i = (unsigned)__builtin_ctzll(thi);
+        thi &= thi - 1ULL;
+        s->tex[64u + i] = nil;
+    }
+    s->texMaskHi = 0ULL;
+    uint16_t sm = s->smpMask;
+    while (sm) {
+        unsigned i = (unsigned)__builtin_ctz((unsigned)sm);
+        sm &= (uint16_t)(sm - 1u);
+        s->smp[i] = nil;
+    }
+    s->smpMask = 0u;
+    uint8_t am = s->attMask;
+    while (am) {
+        unsigned i = (unsigned)__builtin_ctz((unsigned)am);
+        am &= (uint8_t)(am - 1u);
+        s->att[i] = nil;
+    }
+    s->attMask = 0u;
+    uint32_t asm_ = s->asMask;
+    while (asm_) {
+        unsigned i = (unsigned)__builtin_ctz(asm_);
+        asm_ &= asm_ - 1u;
+        s->rt.as[i] = nil;
+    }
+    s->asMask = 0u;
+    s->rtAsRefl = NULL;
+    s->scanPlan = NULL;
+}
+
+typedef struct {
+    RDNA4StageState sv, sf;
+    rdna4dc_enc dc;
+    VkClearValue cvs[9];
+    VkAttachmentDescription ads[9];
+    VkImageView views[9];
+    VkImageLayout curLay[9];
+    uint32_t slvl[8], sslice[8], rlvl[8], rslice[8];
+    NSUInteger sact[8];
+} RDNA4RenderScratch;
 
 typedef struct {
     VkRenderPass rp;
@@ -788,6 +897,7 @@ typedef struct {
     VkFormat dsVk;
     uint32_t sampleCount, maxAmp, drawBits, fetchMax;
     uint8_t hasFrag, hasDS, hasDepth, fetch, isFallback, isTess, isMesh, hasAddrReg;
+    uint8_t pushStage[2];
 } RDNA4RenderPSOFast;
 
 @interface RDNA4Texture : _MTLResource {
@@ -1157,6 +1267,7 @@ typedef struct {
     uint64_t _iftOwnerToken;
     rdna4rtr_reflection_t _rtV, _rtF;
     BOOL _hasAddressRegistry;
+    uint8_t _pushStage[2];
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
@@ -1289,6 +1400,10 @@ typedef struct {
 @interface RDNA4CommandSegment : NSObject {
 @public
     VkCommandBuffer vk, linearInit, dispCopyVk;
+    BOOL dispCopyPending, dispCopyVramImg;
+    rdna4df_plan_t dispCopyPlan;
+    RDNA4Texture *dispCopyTex;
+    VkImageLayout dispCopySavedLayout;
     VkFence fence;
     NSMutableArray *waits;
     NSMutableArray *signals;
@@ -1331,6 +1446,7 @@ typedef struct {
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
 - (VkCommandPool)pool;
 - (VkCommandBuffer)rdna4TakeCmdBuf:(NSError **)err;
+- (VkCommandBuffer)rdna4TakeCmdBufLocked:(NSError **)err;
 - (void)rdna4GiveCmdBuf:(VkCommandBuffer)cmd;
 - (BOOL)rdna4HasResidencySets;
 - (dispatch_queue_t)rdna4CompletionQueue;
@@ -1381,6 +1497,9 @@ typedef struct {
     rdna4dc_cbcache _dcCache;
     NSMutableArray *_residencySnapshots;
     NSMutableSet *_residencyHeapResources;
+    RDNA4RenderScratch *_renderScratch;
+    RDNA4ResourceBindings *_reusableBindings;
+    BOOL _renderScratchInUse, _reusableBindingsInUse;
 @public
     BOOL _launchedAsBarrier, _fifoDoneFailed;
     void (^_fifoDoneBlock)(void);
@@ -1471,6 +1590,11 @@ typedef struct {
 - (VkDescriptorSet)rdna4AllocSet:(VkDescriptorSetLayout)l;
 - (rdna4dc_cbcache *)rdna4DrawCache;
 - (BOOL)rdna4FillSet:(VkDescriptorSet)set bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm;
+- (BOOL)rdna4FillOrPushSet:(VkDescriptorSet)set pushCmd:(VkCommandBuffer)pushCmd pushLayout:(VkPipelineLayout)pushLayout pushSet:(uint32_t)pushSet bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm fromRender:(BOOL)fromRender;
+- (RDNA4RenderScratch *)rdna4AcquireRenderScratch:(BOOL *)ownedOut;
+- (void)rdna4ReleaseRenderScratch:(RDNA4RenderScratch *)sc owned:(BOOL)owned;
+- (RDNA4ResourceBindings *)rdna4AcquireResourceBindings:(BOOL *)borrowedOut;
+- (void)rdna4ReleaseResourceBindings:(RDNA4ResourceBindings *)rb borrowed:(BOOL)borrowed;
 @end
 
 @interface RDNA4Counter : NSObject {
@@ -1516,21 +1640,22 @@ typedef struct {
 
 @interface RDNA4RenderEncoder : _MTLCommandEncoder {
     RDNA4CommandBuffer *_cb; BOOL _ended, _inPass, _begun, _hostWriteDropped; uint32_t _roWarnV, _roWarnF; uint32_t _w, _h, _na, _layers; NSString *_lbl;
-    VkRenderPass _rp1; BOOL _rp1c; VkFramebuffer _fb, _fbf; VkClearValue _cvs[9]; VkAttachmentDescription _ads[9];
+    VkRenderPass _rp1; BOOL _rp1c; VkFramebuffer _fb, _fbf;
     RDNA4RenderHandles *_baseHandles, *_fetchHandles;
-    VkImageView _views[9]; RDNA4Texture *_tex[9]; VkImageLayout _curLay[9]; BOOL _fetch;   // bundle 10: slot [_na] is the depth/stencil attachment when _nd == 1; 11e-2: _fetch = the current/next pass is the framebuffer-fetch shape
+    RDNA4Texture *_tex[9]; BOOL _fetch;   // bundle 10: slot [_na] is the depth/stencil attachment when _nd == 1; 11e-2: _fetch = the current/next pass is the framebuffer-fetch shape
     uint32_t _nd; VkFormat _dsVkFmt; unsigned _encSamples;   // bundle 10: depth/stencil attachment present; its VkFormat (UNDEFINED = none); the pass's sample count (0 until the first attachment, then >= 1)
-    id _rtex[8]; uint32_t _slvl[8], _sslice[8], _rlvl[8], _rslice[8]; NSUInteger _sact[8];   // bundle 10: per colour attachment the resolve texture (+ level, slice), its source level / slice and the store action
+    id _rtex[8];   // bundle 10: per colour attachment the resolve texture
     id _drtex, _srtex; uint32_t _dlvl, _dslice, _drlvl, _drslice, _srlvl, _srslice; NSUInteger _dsact, _ssact, _dresFilter, _sresFilter;
     RDNA4DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
-    RDNA4RenderPipelineState *_pso; RDNA4RenderPSOFast _psoFast; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf;
+    RDNA4RenderPipelineState *_pso; RDNA4RenderPSOFast _psoFast; MTLRenderPipelineReflection *_roReflection;
+    RDNA4RenderScratch *_sc; BOOL _scOwned, _rbBorrowed;
     MTLViewport _vp, *_extraVps; uint32_t _nvp; MTLScissorRect _sr, *_extraSrs; uint32_t _nsr;
     MTLTriangleFillMode _fillMode; MTLDepthClipMode _depthClipMode;
     BOOL _hasSamplePos; MTLSamplePosition _samplePos[8]; uint32_t _samplePosCount;
     float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
     id _tessFactorBuf; NSUInteger _tessFactorOff, _tessFactorStride; float _tessFactorScale;
     NSMutableSet *_samplerBindings;
-    rdna4dc_enc _dc; rdna4dc_cbcache *_dcCB; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcCB = CB-wide segment cache)
+    rdna4dc_cbcache *_dcCB; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcCB = CB-wide segment cache)
     rdna4occ *_occ; VkQueryPool _qp; uint32_t _qbase;   // build 18 (P2): this pass's occlusion bookkeeping (owned by the command buffer), its query pool and the first of its RDNA4OCC_MAXQ reserved query indices
     uint32_t _clrm; NSUInteger _dvc;   // #12 D2: attachments whose load action was Clear and not yet consumed by a presentable draw; vertex/index count of the draw being prepared (diagnostic)
     NSMutableSet *_argumentResources, *_argumentWritable;
@@ -1554,6 +1679,7 @@ typedef struct {
     __unsafe_unretained id _snapBaseHandles, _snapFetchHandles;
 }
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d;
+- (RDNA4RenderScratch *)rdna4EnsureScratch;
 - (void)rdna4ReleaseRenderHandles;
 @end
 
@@ -3363,6 +3489,8 @@ GARNET_INTERNAL_EXTERN RDNA4CoordinateFlagResult rdna4_coordinate_flag_merge(
 GARNET_INTERNAL_EXTERN NSData *rdna4_spv_set(NSData *spv, uint32_t set);
 GARNET_INTERNAL_EXTERN BOOL rdna4_stage_dsl(const RDNA4sRefl *r, int set, VkShaderStageFlags stage, NSDictionary *meta, VkDescriptorSetLayout *dsl, RDNA4PB **pbOut, uint32_t *npb,
                           NSMutableArray *ownedSamplers, NSError **err);
+GARNET_INTERNAL_EXTERN BOOL rdna4_stage_dsl_ex(const RDNA4sRefl *r, int set, VkShaderStageFlags stage, NSDictionary *meta, VkDescriptorSetLayout *dsl, RDNA4PB **pbOut, uint32_t *npb,
+                          NSMutableArray *ownedSamplers, BOOL allowPush, BOOL *usedPush, NSError **err);
 GARNET_INTERNAL_EXTERN VkFormat rdna4_vkvfmt(MTLVertexFormat f);
 GARNET_INTERNAL_EXTERN VkBlendFactor rdna4_bf(MTLBlendFactor f, BOOL *bad);
 GARNET_INTERNAL_EXTERN VkBlendOp rdna4_bo(MTLBlendOperation o, BOOL *bad);
