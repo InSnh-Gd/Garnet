@@ -156,7 +156,7 @@ static bool mt_armed'
 plant 48 $D "the trial accepts a second lit OTG" '	if (lit != 1u || mask != 1u) return false;' '	if (lit == 0u) return false;'
 plant 50 $SR/dcn/scanout_pure.h "the native exemption is broadened to any argument" 'return arg == 0ull && (action == 74u || action == 76u || action == 77u);' 'return (action == 74u || action == 76u || action == 77u);'
 plant 51 $SR/GarnetNativeClient.cpp "the selector shape is wrong (2 scalars)" 'shape(3, 0, 0, sizeof(rdna4n_mode_result))' 'shape(2, 0, 0, sizeof(rdna4n_mode_result))'
-plant 52 $SR/amd/native_s1c.cpp "the selector body ignores non-zero flags" '    if ((flags & ~(uint64_t)RDNA4N_MODE_TF_MASK) != 0ull || out == nullptr) return kIOReturnBadArgument;   // 0.0.606: the flags word carries RDNA4N_MODE_TF_* (0.0.605 required 0)
+plant 52 $SR/amd/garnet_session_vm.cpp "the selector body ignores non-zero flags" '    if ((flags & ~(uint64_t)RDNA4N_MODE_TF_MASK) != 0ull || out == nullptr) return kIOReturnBadArgument;   // 0.0.606: the flags word carries RDNA4N_MODE_TF_* (0.0.605 required 0)
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);' '    if (out == nullptr) return kIOReturnBadArgument;
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);'
 plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 606;'
@@ -436,19 +436,19 @@ plant 228 $D 'hold: the runner runs row 50 instead of 120' 'RDNA4N_MODE_ROW_120,
 plant 229 $D 'hold: the ModeRelease wait does not wait for the runner' '	if (rdna4mt::hold_request_release(gMt)) RDNA4LOG("mode-hold: RELEASE requested");
 	for (uint32_t i = 0; i < 4000u; i++) {' '	if (rdna4mt::hold_request_release(gMt)) RDNA4LOG("mode-hold: RELEASE requested");
 	for (uint32_t i = 0; i < 0u; i++) {'
-plant 230 $SR/amd/native_s1c.cpp 'hold: the client'\''s close tells the hold BEFORE the console plane is back' '    if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
+plant 230 $SR/amd/garnet_session_vm.cpp 'hold: the client'\''s close tells the hold BEFORE the console plane is back' '    if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
     rdna4dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
 ' '    rdna4dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
     if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
 '
-plant 231 $SR/amd/native_s1c.cpp 'hold: the client'\''s close never tells the hold' '    rdna4dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
+plant 231 $SR/amd/garnet_session_vm.cpp 'hold: the client'\''s close never tells the hold' '    rdna4dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
 ' ''
-plant 232 $SR/amd/native_s1c.cpp 'hold: Acquire passes no session id' 'rdna4dcn::scanAcquire(out, s->id)' 'rdna4dcn::scanAcquire(out, 0u)'
-plant 233 $SR/amd/native_s1c.cpp 'hold: n1c_mode_release takes the client lock' 'IOReturn n1c_mode_release(const N1cRef &ref, uint64_t flags, rdna4n_mode_result *out) {
+plant 232 $SR/amd/garnet_session_vm.cpp 'hold: Acquire passes no session id' 'rdna4dcn::scanAcquire(out, s->id)' 'rdna4dcn::scanAcquire(out, 0u)'
+plant 233 $SR/amd/garnet_session_vm.cpp 'hold: n1c_mode_release takes the client lock' 'IOReturn n1c_mode_release(const N1cRef &ref, uint64_t flags, rdna4n_mode_result *out) {
     if (!sess_hello(ref)) return kIOReturnNotReady;' 'IOReturn n1c_mode_release(const N1cRef &ref, uint64_t flags, rdna4n_mode_result *out) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
     IOLockLock(gCliLock); IOLockUnlock(gCliLock);'
-plant 234 $SR/amd/native_s1c.cpp 'hold: every open gets the same session id' '__atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);' '__atomic_store_n(&s->id, 1u, __ATOMIC_SEQ_CST);'
+plant 234 $SR/amd/garnet_session_vm.cpp 'hold: every open gets the same session id' '__atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);' '__atomic_store_n(&s->id, 1u, __ATOMIC_SEQ_CST);'
 plant 235 $SR/GarnetNativeClient.cpp 'hold: selector 17 is dispatched without a shape check' 'case RDNA4N_SEL_MODE_HOLD:
 		if (!shape(2, 0, 0, sizeof(rdna4n_mode_result))) return kIOReturnBadArgument;' 'case RDNA4N_SEL_MODE_HOLD:'
 plant 236 tools/native/rdna4mode.c 'hold: rdna4mode --run keeps its (exclusive) session open while the command runs' '        IOServiceClose(c);

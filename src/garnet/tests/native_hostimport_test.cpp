@@ -318,7 +318,7 @@ static void h4_lifecycle() {
 // ---- H5 ------------------------------------------------------------------------------------------------------------------------------------------------
 static void h5_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), abi = slurp(K + "src/GarnetNativeABI.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), abi = slurp(K + "src/GarnetNativeABI.h");
     const std::string pure = slurp(K + "src/amd/native_hostimport_pure.h"), plist = slurp(K + "Info.plist");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !abi.empty() && !pure.empty(), "the sources are readable from the root given");
     // the selector: number, shape, task
@@ -370,7 +370,7 @@ static void h5_pins(const std::string &root) {
     expect(count_of(imp, "IOFree(pages") >= 2, "the page list is freed on the failure paths");
     expect(imp.find("RDNA4N_PLACED_HOST_IMPORT") != std::string::npos && imp.find("va_canonicalize(c.gpuStripped)") != std::string::npos, "the outputs: handle, size, canonical GPU VA, placed bit");
     // release: bo_release
-    const std::string rel = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string rel = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     expect(!rel.empty(), "bo_release is found");
     {
         const size_t nrm = at(rel, "} else if (mode == kRelNormal) {"), lk = at(rel, "} else {\n        // Leak:");
@@ -550,7 +550,7 @@ static void h7_session_ordering() {
 }
 static void h5_pins2(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), br = slurp(K + "src/GarnetDriver.cpp"), hook = slurp(K + "src/amd/amdgpu_sysmem.cpp"), engh = slurp(K + "src/amd/native_s1c.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), br = slurp(K + "src/GarnetDriver.cpp"), hook = slurp(K + "src/amd/amdgpu_sysmem.cpp"), engh = slurp(K + "src/amd/native_s1c.h");
     const std::string imp = fn_body(eng, "IOReturn n1c_bo_import_host(");
     expect(!imp.empty(), "n1c_bo_import_host is found (H6 pins)");
     // C: the sequence is read FIRST and re-checked under the lock, before the gate, the cap, the map and the record
@@ -592,7 +592,7 @@ static void h5_pins2(const std::string &root) {
     }
     expect(hook.find("uint64_t sysmem_ramtop_derived_or_zero() {\n    return (gRamTopDone != 0u && gRamTopRes.reason == RDNA4_RT_OK) ? gRamTopDerived : 0ull;\n}") != std::string::npos, "A: the accessor returns the derived top only when the map was read cleanly, else 0");
     // D: bo_release Normal
-    const std::string rel = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string rel = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     {
         const size_t nrm = at(rel, "} else if (mode == kRelNormal) {"), lk = at(rel, "} else {\n        // Leak:");
         expect(nrm != std::string::npos && lk != std::string::npos, "D: bo_release branches are found");

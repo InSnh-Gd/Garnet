@@ -386,7 +386,7 @@ static void g8_helpers() {
 // ---- G9: source pins --------------------------------------------------------------------------------------------------------------------------------
 static void g9_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), hdr = slurp(K + "src/amd/native_s1c.h"), brg = slurp(K + "src/GarnetDriver.cpp"),
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), hdr = slurp(K + "src/amd/native_s1c.h"), brg = slurp(K + "src/GarnetDriver.cpp"),
                       ucl = slurp(K + "src/GarnetUserClient.cpp"), ncl = slurp(K + "src/GarnetNativeClient.cpp"), mes = slurp(K + "src/amd/mes_v12_1.cpp"),
                       mesh = slurp(K + "src/amd/amdgpu_mes.h"), plist = slurp(K + "Info.plist"), pure = slurp(K + "src/amd/native_g1_pure.h");
     expect(!eng.empty() && !brg.empty() && !ucl.empty() && !ncl.empty() && !mes.empty() && !mesh.empty() && !plist.empty() && !pure.empty(), "the sources were read");

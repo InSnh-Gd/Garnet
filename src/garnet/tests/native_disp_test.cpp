@@ -1463,7 +1463,7 @@ int main(int argc, char **argv) {
     // =========================================================================================================================================================
     {
         const std::string fbp = slurp(K + "src/amd/native_fb_pure.h"), dop = slurp(K + "src/GarnetDisplayOps.h"), dnub = slurp(K + "src/GarnetDisplayNub.cpp"), dnubh = slurp(K + "src/GarnetDisplayNub.hpp"), mk = slurp(K + "Makefile"),
-                          s1cc = slurp(K + "src/amd/native_s1c.cpp"), mpure = slurp(K + "src/amd/native_metal_pure.h");
+                          s1cc = garnet_test_ver::read_native_engine(K + "src/amd"), mpure = slurp(K + "src/amd/native_metal_pure.h");
         expect(!fbp.empty() && !dop.empty() && !dnub.empty() && !dnubh.empty() && !mk.empty(), "M: the new files are readable");
         // ---- statuses
         { std::set<std::string> names; for (uint32_t st = 0; st < rdna4fb::kStatusCount; st++) { const std::string n = rdna4fb::status_name(st); expect(n != "unknown", "M: every fbpublish status has a name"); names.insert(n); expect(n == garnetdisp_fbp_name(st), "M: the pure and the shared text table agree"); }

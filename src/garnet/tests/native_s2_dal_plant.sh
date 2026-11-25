@@ -149,7 +149,7 @@ plant 64 $S '    SmuSeq seq;   // the shared mailbox lock (held = false only whe
 plant 65 $S 'if (__atomic_load_n(&gSmuOwner, __ATOMIC_ACQUIRE) == me) { gSmuDepth++; return true; }' ';' "the shared lock is not recursive (deadlock)"
 plant 66 $SR/GarnetUserClient.cpp '	amdgpu::SmuSeq smuSeq;   // 0.0.604: the whole table-transfer sequence under the shared mailbox lock (PPSMC and DAL)' ';' "doMetrics does not hold the shared lock"
 plant 67 $SR/GarnetUserClient.cpp '	amdgpu::SmuSeq smuSeq;   // 0.0.604: both clock messages of the power state under the shared mailbox lock' ';' "doPowerState does not hold the shared lock"
-plant 68 $SR/amd/native_s1c.cpp '    if (!sess_hello(ref)) return kIOReturnNotReady;
+plant 68 $SR/amd/garnet_session_vm.cpp '    if (!sess_hello(ref)) return kIOReturnNotReady;
     if (app_refused(ref, rdna4native::g4::kCallScanout)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): the display plane / mode / DAL belong to WindowServer and the administrator
     if (flags != 0ull || step < RDNA4N_DAL_STEP_E1B' '    if (app_refused(ref, rdna4native::g4::kCallScanout)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): the display plane / mode / DAL belong to WindowServer and the administrator
     if (flags != 0ull || step < RDNA4N_DAL_STEP_E1B' "selector 15 does not need Hello"
@@ -163,7 +163,7 @@ plant 72 an internal design note '## ABI 1.2 addendum' '## ABI 1.2 notes' "the c
 plant 73 tools/native/rdna4dal.c '{ RDNA4N_ABI_VERSION, RDNA4N_HELLO_F_MINOR }' '{ RDNA4N_ABI_VERSION, 0 }' "the tool does not ask for the minor"
 plant 74 $SR/GarnetDriver.cpp 'rdna4dcn::scanShutdown();' 'rdna4dcn::scanShutdown(); amdgpu::smu_dal_send(*mDev, 2, 0, nullptr);' "the interrupt handler's file calls the DAL sender"
 plant 75 $SR/GarnetNativeABI.h '#define RDNA4N_DAL_V_GLITCH    5u' '#define RDNA4N_DAL_V_GLITCH    6u' "the ABI verdict value differs from the kernel's"
-plant 76 $SR/amd/native_s1c.cpp '    return dal_run_step(*gCtx->dev, (uint32_t)step, out);' '    IOLockLock(gCliLock); IOReturn r = dal_run_step(*gCtx->dev, (uint32_t)step, out); IOLockUnlock(gCliLock); return r;' "selector 15 holds the client lock across the step"
+plant 76 $SR/amd/garnet_session_vm.cpp '    return dal_run_step(*gCtx->dev, (uint32_t)step, out);' '    IOLockLock(gCliLock); IOReturn r = dal_run_step(*gCtx->dev, (uint32_t)step, out); IOLockUnlock(gCliLock); return r;' "selector 15 holds the client lock across the step"
 # ---- the 0.0.604 review fixes ----
 plant 77 $P 'constexpr uint32_t level_count(uint32_t r) { return (r & 0x80000000u) != 0u ? 2u : (r & 0xFFu); }' 'constexpr uint32_t level_count(uint32_t r) { return (r & 0xFFu); }' "E1b: the fine-grained bit 31 of the level count is ignored"
 plant 78 $P 'constexpr uint32_t level_mhz(uint32_t r) { return r & 0xFFFFu; }' 'constexpr uint32_t level_mhz(uint32_t r) { return r; }' "E1b: per-level replies are not masked to 16 bits"

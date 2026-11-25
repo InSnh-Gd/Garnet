@@ -13,6 +13,7 @@
 //   O5  who may call what (review items B and E): selector_allowed over every selector for admin / uid-88 clients, import_caller_ok, source pins of the dispatch;
 //   O4  Ready: ready_at_publish / ready_sticky_after truth tables; a REACHABILITY model that drives the real HUNG state machine (hang_detect / hang_latch_wait) into the announce and
 //       shows Ready goes 1 -> 0 and never back; source pins of the real wiring (both latch sites announce after the latch, hang_log has one caller, hungLatched writes the property).
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -101,7 +102,7 @@ static void o3_pins(const std::string &root) {
     expect(clih.find("class IOAccelGarnetNativeClient : public IOUserClient {") != std::string::npos && clih.find("OSDeclareDefaultStructors(IOAccelGarnetNativeClient)") != std::string::npos, "the header declares the renamed class");
     expect(std::string("IOAccelGarnetNativeClient").compare(0, 7, "IOAccel") == 0, "the class name starts with the sandbox's IOAccel prefix");
     {   // the old class name is gone as a C++ token in every kext source (file names and header guards keep it)
-        const char *files[] = { "src/GarnetNativeClient.cpp", "src/GarnetNativeClient.hpp", "src/GarnetDriver.cpp", "src/GarnetMetalNub.cpp", "src/amd/native_s1c.cpp" };
+        const char *files[] = { "src/GarnetNativeClient.cpp", "src/GarnetNativeClient.hpp", "src/GarnetDriver.cpp", "src/GarnetMetalNub.cpp", "src/amd/garnet_submit_internal.hpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp" };
         for (const char *f : files) {
             std::string s = slurp(K + f);
             size_t bad = 0;
@@ -149,7 +150,7 @@ static void o3_pins(const std::string &root) {
     expect_u("the refuse line is the only refusal exit", count_of(init, "return false;"), 2);   // super::initWithTask failing + the refusal
     // the boot-arg: ONE reader, latched once (compare-and-swap from Unset), read nowhere else
     expect_u("boot-arg garnet-metal-ws is read in exactly one place in the whole kext", count_of(cli, "PE_parse_boot_argn(\"garnet-metal-ws\""), 1);
-    for (const char *f : { "src/GarnetDriver.cpp", "src/GarnetMetalNub.cpp", "src/amd/native_s1c.cpp", "src/dcn/dcn.cpp", "src/GarnetUserClient.cpp" })
+    for (const char *f : { "src/GarnetDriver.cpp", "src/GarnetMetalNub.cpp", "src/amd/garnet_submit_internal.hpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp", "src/dcn/dcn.cpp", "src/GarnetUserClient.cpp" })
         expect(slurp(K + f).find("garnet-metal-ws") == std::string::npos || std::string(f) == "src/GarnetDriver.cpp", "no other source reads garnet-metal-ws");
     expect(cli.find("(void)OSCompareAndSwap(rdna4native::policy::kLatchUnset, rdna4native::policy::latch_value(present, v), &gMetalWsLatch);") != std::string::npos, "the latch is a compare-and-swap from Unset (first writer wins, never re-read)");
     expect_u("the latch is written only in latchBootArgs", count_of(cli, "&gMetalWsLatch"), 1);
@@ -222,10 +223,10 @@ static void o4_ready() {
 }
 static void o4_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), nub = slurp(K + "src/GarnetMetalNub.cpp"), nubh = slurp(K + "src/GarnetMetalNub.hpp");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), nub = slurp(K + "src/GarnetMetalNub.cpp"), nubh = slurp(K + "src/GarnetMetalNub.hpp");
     expect(!eng.empty() && !nub.empty() && !nubh.empty(), "the sources are readable from the root given");
     const std::string ann = fn_body(eng, "static void hang_announce(");
-    const std::string poll = fn_body(eng, "static bool hang_poll()"), wait = fn_body(eng, "static void hang_from_wait()");
+    const std::string poll = fn_body(eng, "static bool hang_poll()"), wait = fn_body(eng, "void hang_from_wait()");
     expect(!ann.empty() && !poll.empty() && !wait.empty(), "hang_announce, hang_poll and hang_from_wait are found");
     // where the latch is set: hang_detect / hang_latch_wait; the property write is reached right after, and ONLY after
     expect(poll.find("hang_detect(gHang") != std::string::npos && poll.find("if (det) hang_announce(em, re);") != std::string::npos && poll.find("hang_detect(gHang") < poll.find("hang_announce("), "hang_poll: the latch is set, then announced");
@@ -253,7 +254,7 @@ static void o4_pins(const std::string &root) {
     expect(nubh.find("static void hungLatched();") != std::string::npos, "the header declares hungLatched");
     expect(nub.find("volatile uint32_t      gReadyNo = 0;") != std::string::npos, "the sticky word is initialised usable");
     {   // nothing else in the kext can set the property back to 1
-        for (const char *f : { "src/GarnetNativeClient.cpp", "src/GarnetDriver.cpp", "src/amd/native_s1c.cpp", "src/dcn/dcn.cpp" })
+        for (const char *f : { "src/GarnetNativeClient.cpp", "src/GarnetDriver.cpp", "src/amd/garnet_submit_internal.hpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp", "src/dcn/dcn.cpp" })
             expect(slurp(K + f).find("setProperty(\"Garnet,Ready\"") == std::string::npos, "no other source writes Garnet,Ready");
     }
 }

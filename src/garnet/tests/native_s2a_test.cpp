@@ -495,7 +495,7 @@ static bool sleeps_only_unlocked(const std::string &body, const std::string &unl
 
 static void s11_pins(const std::string &root) {
     const std::string src = root + "/src/garnet/src/";
-    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = slurp(src + "amd/native_s1c.cpp"), engh = slurp(src + "amd/native_s1c.h"),
+    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = garnet_test_ver::read_native_engine(src + "amd"), engh = slurp(src + "amd/native_s1c.h"),
                       cli = slurp(src + "GarnetNativeClient.cpp"), boot = slurp(src + "GarnetDriver.cpp") + "\n" + slurp(src + "GarnetDriverStages.cpp"), pure = slurp(src + "dcn/scanout_pure.h"),
                       abi = slurp(src + "GarnetNativeABI.h"), plist = slurp(root + "/src/garnet/Info.plist"), tool = slurp(root + "/tools/native/rdna4scan.c"),
                       mk = slurp(root + "/src/garnet/Makefile");
@@ -525,14 +525,14 @@ static void s11_pins(const std::string &root) {
            "close: the console goes back BEFORE the own wait and the HUNG decision");
     expect(ecl.find("IOLockLock(gCliLock);") < ecl.find("scan_teardown(s, how, tr)"), "close: ... under gCliLock (lock order gCliLock -> DCN)");
     expect(ecl.find("scan_teardown(s, how, tr)") < ecl.find("bo_release(s, h, kRelClosing)"), "close: ... and before any BO memory is freed");
-    const std::string ebo = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string ebo = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     expect(ebo.find("if (b.pinMask != 0u && scan_unpin(h, b, mode)) b.pinLeak = 1u;") != std::string::npos, "bo_release unpins in EVERY mode");
     expect(ebo.find("if (b.pinLeak != 0u) mode = kRelLeak;") > ebo.find("scan_unpin(h, b, mode)") && ebo.find("if (b.pinLeak != 0u) mode = kRelLeak;") < ebo.find("if (mode == kRelClosing) {"),
            "a BO whose console restore did NOT verify is LEAKED (mode forced to Leak before any branch frees it)");
     expect(eng.find("void mark_leak(uint32_t h) { s->bo[h].pinLeak = 1u; }") != std::string::npos && fn_body(eng, "static void scan_teardown(").find("teardown_all(te, how, r, r1, r2)") != std::string::npos && fn_body(eng, "static void scan_teardown(").find("r[0] == 0ull") != std::string::npos, "close / Release: an unverified restore marks the pinned BOs leak");
     expect(ebo.find("scan_unpin(h, b, mode)") < ebo.find("if (mode == kRelClosing) {") && ebo.find("scan_unpin(h, b, mode)") < ebo.find("sysmem_free(") && ebo.find("scan_unpin(h, b, mode)") < ebo.find("vram_alloc.free(b.a)"),
            "bo_release: the pin is dealt with BEFORE the Closing / Normal / Leak branches free or leak anything");
-    const std::string eun = fn_body(eng, "static bool scan_unpin(");
+    const std::string eun = fn_body(eng, "bool scan_unpin(");
     expect(eun.find("rdna4dcn::scanBoGone(b.pinMask, b.pinGen, mode != kRelNormal, r)") != std::string::npos, "Leak and Closing ask for the full restore (alwaysFull = mode != Normal)");
     expect(fn_body(eng, "IOReturn n1c_bo_free(").find("if (hung_now()) m = kRelLeak;") != std::string::npos && fn_body(eng, "IOReturn n1c_bo_free(").find("bo_release(s, h, m);") != std::string::npos, "BoFree under HUNG goes through bo_release(Leak), hence the restore first");
     // BoFree: the pin lives on the Bo, set under gCliLock only

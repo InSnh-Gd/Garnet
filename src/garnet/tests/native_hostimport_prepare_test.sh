@@ -6,7 +6,7 @@ if [ "${1:-}" = --help ]; then
 fi
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || exit 2
 tests=$(cd "$(dirname "$0")" && pwd)
-source_file=${2:-"$tests/../src/amd/native_s1c.cpp"}
+source_file=${2:-"$tests/../src/amd/garnet_vram_alloc.cpp"}
 mkdir -p "$1"
 out=$(cd "$1" && pwd)
 awk '/IOMemoryDescriptor \*md = IOMemoryDescriptor::withAddressRange/ { copying=1 }

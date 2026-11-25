@@ -336,7 +336,7 @@ static void t7_defence() {
 // ---- T8 -------------------------------------------------------------------------------------------------------------------------------------------------
 static void t8_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), clih = slurp(K + "src/GarnetNativeClient.hpp");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), clih = slurp(K + "src/GarnetNativeClient.hpp");
     const std::string brg = slurp(K + "src/GarnetDriver.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp"), abi = slurp(K + "src/GarnetNativeABI.h"), plist = slurp(K + "Info.plist");
     const std::string cmd = slurp(root + "/tools/rdna4/native/garnettest.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/native_g4_pure.h"), g2p = slurp(K + "src/amd/native_g2_pure.h");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !clih.empty() && !brg.empty() && !ucl.empty() && !abi.empty() && !plist.empty() && !cmd.empty() && !pol.empty() && !g4p.empty() && !g2p.empty(), "T8: every source is readable");
@@ -349,7 +349,7 @@ static void t8_pins(const std::string &root) {
     expect_u("T8: boot-arg garnet-apps is read in exactly one place in the whole kext", count_of(eng, "PE_parse_boot_argn(\"garnet-apps\""), 1);
     for (const char *f : { "src/GarnetDriver.cpp", "src/GarnetNativeClient.cpp", "src/GarnetUserClient.cpp", "src/GarnetMetalNub.cpp", "src/dcn/dcn.cpp" })
         expect(slurp(K + f).find("PE_parse_boot_argn(\"garnet-apps\"") == std::string::npos, "T8: no other source reads garnet-apps");
-    const std::string ap = fn_body(eng, "static bool apps_on() {");
+    const std::string ap = fn_body(eng, "bool apps_on() {");
     expect(!ap.empty() && ap.find("OSCompareAndSwap(rdna4native::g4::kLatchUnset") != std::string::npos && ap.find("return rdna4native::g4::apps_enabled(rdna4native::g4::latch_is_on(l), multi_on());") != std::string::npos,
            "T8: the latch is a compare-and-swap from Unset and the role also needs the multi-session latch");
     // the open policy wiring
@@ -408,7 +408,7 @@ static void t8_pins(const std::string &root) {
       expect(sh.find("const bool ws = user && __atomic_load_n(&gs->ws, __ATOMIC_ACQUIRE);") != std::string::npos && count_of(sh, "&gs->app,") == 1 &&
              in_order(sh, { "const uint32_t act = stall_action_budgeted(", "if (act == kStallRecover && __atomic_load_n(&gs->app, __ATOMIC_ACQUIRE)) {", "rdna4native::g4::strike_add(gStrikes, gs->appKey)", "if (act == kStallRecover && g2_recover(g, gs)) {" }),
              "T8: the recovery decision keys on WindowServer's flag only (an APP session is recovered like any other non-WindowServer user session); the APP flag is read once, only to COUNT the strike, after the decision and before the recovery runs"); }
-    const std::string rl = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string rl = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     const size_t ck = rl.find("if (mode == kRelClosing) {"), nk = rl.find("} else if (mode == kRelNormal) {");
     expect(ck != std::string::npos && nk != std::string::npos, "T8: bo_release's closing branch is found");
     if (ck != std::string::npos && nk != std::string::npos) {
@@ -483,7 +483,7 @@ static void t9_close_path(const std::string &root) {
     expect(nOff > 0 && nFreedAfterSweep > 0 && nLeaked > 0, "T9: every branch of the model was reached");
     // the retain-count arithmetic of the real kernel path (pins)
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g4p = slurp(K + "src/amd/native_g4_pure.h"), engh = slurp(K + "src/amd/native_s1c.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g4p = slurp(K + "src/amd/native_g4_pure.h"), engh = slurp(K + "src/amd/native_s1c.h");
     const std::string sw = fn_body(eng, "void n1c_unmap_for_close(const N1cRef &ref, IOUserClient *uc) {");
     expect(!sw.empty(), "T9: n1c_unmap_for_close is found");
     expect(in_order(sw, { "if (uc == nullptr || !apps_on()) return;", "Session *s = sess_lock(ref, false);", "rdna4native::g4::unmap_attempts(true,", "(uint32_t)vmd->getRetainCount()", "if (n != 0u) vmd->retain();",
@@ -524,7 +524,7 @@ static void t10_log_gate(const std::string &root) {
     w = log_gate_step(w, 6, &ad, &sup);
     expect(ad && sup == 0xFFFFu, "T10: ... and is reported as saturated");
     const std::string K = root + "/src/garnet/";
-    const std::string cli = slurp(K + "src/GarnetNativeClient.cpp"), eng = slurp(K + "src/amd/native_s1c.cpp");
+    const std::string cli = slurp(K + "src/GarnetNativeClient.cpp"), eng = garnet_test_ver::read_native_engine(K + "src/amd");
     const std::string init = fn_body(cli, "bool IOAccelGarnetNativeClient::initWithTask(");
     expect_u("T10: the 'open refused' line has exactly one call site, behind the gate", count_of(cli, "NCLOG(\"open refused: uid %u"), 1);
     expect(in_order(init, { "if (!d.admit) {", "if (d.reason != rdna4native::policy::kReasonAppNotAllowed) {", "if (amdgpu::n1c_log_gate(&suppressed)) {", "suppressed by the rate limit", "NCLOG(\"open refused: uid %u" }),
@@ -589,7 +589,7 @@ static void t11_visible_pool(const std::string &root) {
     expect(((o[2] >> 36) & 0xFFFFFull) == (128ull << 10) && (o[2] >> 56) == 128ull, "T11: the largest cap (128 MiB) fits its fields");
     // the real kernel
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
     const std::string bc = fn_body(eng, "IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64_t out[4]) {");
     expect(in_order(bc, { "app_vram_budget_ok(multi, s->ws, gVramOthers, p.size, poolTotal, poolFree, ptHeld)", "const bool fullBar = rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit);", "const bool appsNow = rdna4native::g4::appvis_active(apps_on(), fullBar);", "rdna4native::g4::hi_first(fullBar, p.hiOk)", "vram_alloc_hi.alloc(p.size, p.align, &a)", "if (!hiDone) {",
                           "rdna4native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)", "rc = kIOReturnNoMemory; break;", "got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);",
@@ -597,7 +597,7 @@ static void t11_visible_pool(const std::string &root) {
            "T11: REACHABLE, in this order: the shared allowance, hi first on small BAR for any NO_CPU_ACCESS BO, the visible cap (the existing NoMemory), the visible pool, the count, the hi fallback");
     expect(in_order(eng, { "static inline void budget_release(Bo &b) {", "if (b.visCounted != 0u) { gVisOthers =", "b.visCounted = 0u;" }), "T11: freeing a visible BO takes it off the visible counter (a leaked one is never released, so it stays counted)");
     expect_u("T11: garnet-appvis is read in exactly one place", count_of(eng, "PE_parse_boot_argn(\"garnet-appvis\""), 1);
-    expect(in_order(fn_body(eng, "static uint64_t appvis_cap() {"), { "PE_parse_boot_argn(\"garnet-appvis\"", "rdna4native::g4::appvis_cap_bytes(present, v)", "__atomic_store_n(&gAppVisLatch, 1u" }), "T11: the cap comes from the pure function, latched once");
+    expect(in_order(fn_body(eng, "uint64_t appvis_cap() {"), { "PE_parse_boot_argn(\"garnet-appvis\"", "rdna4native::g4::appvis_cap_bytes(present, v)", "__atomic_store_n(&gAppVisLatch, 1u" }), "T11: the cap comes from the pure function, latched once");
     expect(in_order(fn_body(eng, "IOReturn n1c_g2_stat("), { "if (rdna4native::g4::appvis_active(apps_on(), fullBar)) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }", "global_out(g, o);" }), "T11: sessstat 8 reports the use and the cap (apps ON), under the lock that guards the counter");
     expect(cmd.find("(out[5] >> 36) & 0xfffff, (out[5] >> 56));") != std::string::npos && cmd.find("if ((out[5] >> 56) != 0)") != std::string::npos, "T11: rdna4test prints the non-WindowServer visible use and its cap");
 }
@@ -678,7 +678,7 @@ static void t12_slots(const std::string &root) {
     expect(ws_already_open(false, true, false) && !ws_already_open(false, false, true) && ws_already_open(true, false, true) && !ws_already_open(true, true, false), "T12: alreadyOpen: any native client with apps OFF, only a WindowServer session with apps ON");
     // the real kernel
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g2p = slurp(K + "src/amd/native_g2_pure.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g2p = slurp(K + "src/amd/native_g2_pure.h");
     expect(in_order(fn_body(eng, "IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {"), { "const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;",
                           "const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);", "if (pk.rc != kOk) {", "if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);" }),
            "T12: REACHABLE: n1c_open hands open_pick the live apps flag and the live WindowServer flag (gSessWs, written with the open itself) under gCliLock");
@@ -720,7 +720,7 @@ static void t13_strikes(const std::string &root) {
       expect(verb_run(true, l, rdna4a_arg(RDNA4A_OP_LIST, 0), o) == kAllowOk && o[2] == RDNA4A_OP_LIST, "T13: list still works without a strike table argument"); }
     // the real kernel
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cli = slurp(K + "src/GarnetNativeClient.cpp"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), cmd = slurp(root + "/tools/rdna4/native/garnettest.c");
     const std::string sh = fn_body(eng, "static bool stall_handle(uint64_t em, uint64_t re) {");
     expect(in_order(sh, { "if (act == kStallRecover && __atomic_load_n(&gs->app, __ATOMIC_ACQUIRE)) {", "rdna4native::g4::strike_add(gStrikes, gs->appKey)", "N1C_LOG(\"stall: strike %u of %u", "if (act == kStallRecover && g2_recover(g, gs)) {" }),
            "T13: REACHABLE: an automatic recovery blamed on an APP session adds a strike for its name before the recovery runs");
@@ -777,7 +777,7 @@ static void t15_apps_all(const std::string &root) {
             expect(strike_count(strikes, key == listed ? unlisted : listed) == 0u, "T15: strikes remain per name for listed and unlisted applications");
         }
     }
-    const std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     expect_u("T15: garnet-apps-all has exactly one boot-arg reader", count_of(eng, "PE_parse_boot_argn(\"garnet-apps-all\""), 1);
     expect(eng.find("static volatile UInt32 gAppsAllLatch = rdna4native::g4::kLatchUnset;") != std::string::npos &&
            in_order(fn_body(eng, "static bool apps_all_on() {"), { "UInt32 l = gAppsAllLatch;", "if (l == rdna4native::g4::kLatchUnset)", "uint32_t v = 0;", "PE_parse_boot_argn(\"garnet-apps-all\", &v, sizeof(v))", "OSCompareAndSwap(rdna4native::g4::kLatchUnset, rdna4native::g4::latch_value(present, v), &gAppsAllLatch)", "l = gAppsAllLatch;", "return rdna4native::g4::latch_is_on(l);" }),
@@ -846,7 +846,7 @@ static void t16_app_denylist(const std::string &root) {
         expect(all && dl_count(deny) == 64u, "T16: concurrent denylist adds settle deterministically to 64 unique entries");
     }
 
-    const std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     const std::string drv = slurp(root + "/src/garnet/src/GarnetDriver.cpp");
     const std::string uc = slurp(root + "/src/garnet/src/GarnetUserClient.cpp");
     const std::string cli = slurp(root + "/tools/rdna4/native/garnettest.c");

@@ -11,6 +11,7 @@
 //   S4  normal frees decrement the wired/committed total while HUNG quarantine keeps it counted;
 //   S5  source pins: KernelSDK boot_args physical memory, reserve before pinning, no shared lock across prepare, rollback,
 //       old ABI layout/selectors, and the GTT/import shared gSysHeld ledger.
+#include "garnet_version_check.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -243,7 +244,7 @@ static void s4_free_leak() {
 // ---- S5: source pins --------------------------------------------------------------------------------------------------------------
 static void s5_source_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd");
     const std::string g2h = slurp(K + "src/amd/native_g2_pure.h");
     const std::string hi = slurp(K + "src/amd/native_hostimport_pure.h");
     const std::string abi = slurp(K + "src/GarnetNativeABI.h");
@@ -321,7 +322,7 @@ static void s5_source_pins(const std::string &root) {
     expect(!release.empty() && release.find("gSysHeld = gSysHeld >= b.size ? gSysHeld - b.size : 0ull") != std::string::npos &&
            release.find("b.sysCounted = 0u") != std::string::npos,
            "sys_release decrements the real held total and clears the per-BO count");
-    const std::string bo = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string bo = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     const size_t pNormal = at(bo, "} else if (mode == kRelNormal) {");
     const size_t pLeak = at(bo, "} else {\n        // Leak:");
     expect(pNormal != std::string::npos && pLeak != std::string::npos, "bo_release has Normal and Leak branches");

@@ -17,6 +17,7 @@
 //   L7 production form: stripped (48-bit high) -> canonicalize -> tx succeeds; raw stripped
 //      fails precheck (proves the canonicalize step); partial-block fail -> rollback -> retry
 //      reuses zeroed tables; pre-existing sibling mappings survive failed tx.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -299,7 +300,7 @@ static void l5_protect() {
 static void l6_pins(const std::string &root) {
     std::string pure = slurp(root + "/src/garnet/src/amd/native_s1c_pure.h");
     std::string himp = slurp(root + "/src/garnet/src/amd/native_hostimport_pure.h");
-    std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     expect(!pure.empty() && !himp.empty() && !eng.empty(), "sources readable");
     expect(pure.find("pt_map_tx") != std::string::npos, "pure carries pt_map_tx");
     expect(himp.find("pt_map_pages_tx") != std::string::npos, "hostimport pure carries pt_map_pages_tx");

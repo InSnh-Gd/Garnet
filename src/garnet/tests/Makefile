@@ -160,8 +160,8 @@ gmc-resources: $(BUILD)/gmc_resources_test
 	$<
 
 PTMEM_INC := $(BUILD)/native_ptmem_actual.inc
-$(PTMEM_INC): test-native-ptmem-production.py $(SRC)/amd/native_s1c.cpp | $(BUILD)
-	python3 $< "$@" "$(SRC)/amd/native_s1c.cpp"
+$(PTMEM_INC): test-native-ptmem-production.py $(SRC)/amd/garnet_submit_internal.hpp | $(BUILD)
+	python3 $< "$@" "$(SRC)/amd/garnet_submit_internal.hpp"
 
 $(BUILD)/native_ptmem_production_test: native_ptmem_production_test.cpp $(PTMEM_INC) $(SRC)/amd/native_s1c_pure.h $(SRC)/amd/native_g2_pure.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD) $< -o $@

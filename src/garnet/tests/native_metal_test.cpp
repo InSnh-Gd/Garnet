@@ -311,7 +311,7 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect_u("GarnetDriver.cpp never publishes the nub", count_of(br, "selectorPublish"), 0);
     expect(br.find("GarnetMetalNub::shutdown();") != std::string::npos && count_of(br, "GarnetMetalNub::") == 1, "GarnetDriver.cpp's only use of the nub is the shutdown hook in stop()");
     {   // 0.0.612: native_s1c.cpp names the nub exactly once, for the HUNG latch's Ready write, and never publishes it
-        const std::string e = slurp(K + "src/amd/native_s1c.cpp");
+        const std::string e = garnet_test_ver::read_native_engine(K + "src/amd");
         expect_u("native_s1c.cpp calls GarnetMetalNub::hungLatched() exactly once (hang_announce)", count_of(e, "GarnetMetalNub::hungLatched()"), 1);
         expect_u("native_s1c.cpp never publishes the nub", count_of(e, "selectorPublish"), 0);
         expect_u("native_s1c.cpp names GarnetMetalNub exactly TWICE in total (the include of its header and the one hungLatched call): a third reference is a new use of the nub", count_of(e, "GarnetMetalNub"), 2);

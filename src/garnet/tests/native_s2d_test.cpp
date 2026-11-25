@@ -1516,7 +1516,7 @@ static void t12_row120() {
 
 static void s_pins(const std::string &root) {
     const std::string src = root + "/src/garnet/src/";
-    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = slurp(src + "amd/native_s1c.cpp"), engh = slurp(src + "amd/native_s1c.h"),
+    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = garnet_test_ver::read_native_engine(src + "amd"), engh = slurp(src + "amd/native_s1c.h"),
                       cli = slurp(src + "GarnetNativeClient.cpp"), boot = slurp(src + "GarnetDriver.cpp") + "\n" + slurp(src + "GarnetDriverStages.cpp"), pure = slurp(src + "dcn/modetrial_pure.h"), tabh = slurp(src + "dcn/modetrial_tables.h"),
                       abi = slurp(src + "GarnetNativeABI.h"), plist = slurp(root + "/src/garnet/Info.plist"), tool = slurp(root + "/tools/native/rdna4mode.c"), bs = slurp(root + "/tools/native/build.sh"),
                       gen = slurp(root + "/tools/native/gen_modetrial_tables.py"), gi = slurp(root + "/.gitignore");
@@ -2001,7 +2001,7 @@ static void t14_hold() {
 static bool ord(size_t a, size_t b) { return a != std::string::npos && b != std::string::npos && a < b; }
 static void s_pins_hold(const std::string &root) {
     const std::string src = root + "/src/garnet/src/";
-    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = slurp(src + "amd/native_s1c.cpp"), engh = slurp(src + "amd/native_s1c.h"), cli = slurp(src + "GarnetNativeClient.cpp"),
+    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp"), dcnh = slurp(src + "dcn/dcn.hpp"), eng = garnet_test_ver::read_native_engine(src + "amd"), engh = slurp(src + "amd/native_s1c.h"), cli = slurp(src + "GarnetNativeClient.cpp"),
                       pure = slurp(src + "dcn/modetrial_pure.h"), abi = slurp(src + "GarnetNativeABI.h"), mode = slurp(root + "/tools/native/rdna4mode.c"), scan = slurp(root + "/tools/native/rdna4scan.c");
     expect(!dcn.empty() && !eng.empty() && !pure.empty() && !abi.empty() && !cli.empty(), "hold pins: the sources are readable");
     // ABI 1.7

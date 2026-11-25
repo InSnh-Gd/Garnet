@@ -274,7 +274,7 @@ static void p4_high() {
 
 static void p5_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/src/";
-    const std::string b = slurp(K + "GarnetDriver.cpp") + "\n" + slurp(K + "GarnetDriverStages.cpp"), hpp = slurp(K + "GarnetDriver.hpp"), gmc = slurp(K + "amd/gmc_v12_0.cpp"), s1c = slurp(K + "amd/native_s1c.cpp"), s1ch = slurp(K + "amd/native_s1c.h");
+    const std::string b = slurp(K + "GarnetDriver.cpp") + "\n" + slurp(K + "GarnetDriverStages.cpp"), hpp = slurp(K + "GarnetDriver.hpp"), gmc = slurp(K + "amd/gmc_v12_0.cpp"), s1c = garnet_test_ver::read_native_engine(K + "amd"), s1ch = slurp(K + "amd/native_s1c.h");
     const std::string nbif = slurp(K + "amd/nbif_v6_3_1.cpp"), regs = slurp(K + "amd/amdgpu_regs.h");
     expect(!b.empty() && !gmc.empty() && !s1c.empty() && !nbif.empty(), "P5: sources read");
     // item 1
@@ -755,7 +755,7 @@ static void p13_bartest(const std::string &root) {
     // 5) Source pins for Tasks 3.1 / 3.2 / 3.3 / 4.1
     const std::string K = root + "/src/garnet/src/";
     const std::string b = slurp(K + "GarnetDriver.cpp");
-    const std::string s1c = slurp(K + "amd/native_s1c.cpp");
+    const std::string s1c = garnet_test_ver::read_native_engine(K + "amd");
     const std::string pfb = slurp(K + "GarnetPrimaryFramebuffer.cpp");
     const std::string gate = slurp(K + "GarnetDisplayGate.cpp");
     const std::string mv = between(b, "bool GarnetDriver::mapVramAperture() {", "// The plan again, now that the console is located");
@@ -769,7 +769,7 @@ static void p13_bartest(const std::string &root) {
            "P13 pin 4.1: runHighBarBidirTest checks n1c_hung and uses exclusive alloc_at + direct BAR0 + HDP flush + SDMA");
     expect(!has(bt, "RVRAM32_via_mm") && !has(bt, "WVRAM32_via_mm") && !has(bt, "vramRead32") && !has(bt, "vramWrite32"),
            "P13 pin 4.1: runHighBarBidirTest NEVER falls back to MM_INDEX");
-    const std::string mfh = between(s1c, "IOReturn n1c_memory_for_handle(", "// ==== 0.0.627:");
+    const std::string mfh = between(s1c, "IOReturn n1c_memory_for_handle(", "\n}\n");
     expect(has(mfh, "if (!gCtx || !gCtx->dev ||\n                    !rdna4rebar::cpu_map_vram_ok(") && at(mfh, "rdna4rebar::cpu_map_vram_ok(") < at(mfh, "IODeviceMemory::withRange("),
            "P13 pin 3.2: n1c_memory_for_handle validates full 64-bit CPU map bounds BEFORE withRange");
     expect(has(pfb, "rdna4rebar::bar_addr_agree(bar0Phys, cfgBar0Phys)") && has(pfb, "rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)"),

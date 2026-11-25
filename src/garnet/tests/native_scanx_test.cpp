@@ -792,7 +792,7 @@ static void suite_pins(const std::string &root) {
     const std::string K = "src/garnet/src/";
     const std::string flow = slurp(root, (K + "dcn/scanx_flow.h").c_str());
     const std::string glue = slurp(root, (K + "dcn/dcn.cpp").c_str()) + "\n" + slurp(root, (K + "dcn/dcn_scanout_mt.cpp").c_str()) + "\n" + slurp(root, (K + "dcn/dcn_disp2_scanx.cpp").c_str());
-    const std::string s1c = slurp(root, (K + "amd/native_s1c.cpp").c_str());
+    const std::string s1c = garnet_test_ver::read_native_engine(root + "/" + K + "amd");
     const std::string abi = slurp(root, (K + "GarnetNativeABI.h").c_str());
     const std::string cli = slurp(root, (K + "GarnetNativeClient.cpp").c_str());
     const std::string pol = slurp(root, (K + "amd/native_open_policy_pure.h").c_str());
@@ -878,7 +878,7 @@ static void suite_pins(const std::string &root) {
     EXPECT(has(s1c, "static inline bool scanx_inst_ok(uint64_t inst) { return rdna4scanx::inst_admitted(inst, rdna4m6flip1_latched_on()); }"), "X11: the instance admission is inst_admitted with the third latch");
     EXPECT(has(s1c, "const uint32_t gen = rdna4dcn::scanXGeneration((uint32_t)inst);") && has(s1c, "uint8_t &mask = inst == 1ull ? b.pinMask1 : b.pinMask2;") && has(s1c, "uint32_t &pgen = inst == 1ull ? b.pinGen1 : b.pinGen2;") && has(s1c, "mask = rdna4scanx::pins_live(mask, pgen, gen);"),
            "X11 (S4 / test 15): Register judges a BO's pins against THAT instance's generation (pinGen1 against scanXGeneration(1))");
-    EXPECT(has(s1c, "const uint32_t res = rdna4dcn::scanXBoGone(inst, mask, pgen, mode != kRelNormal, r);") && has(s1c, "static bool scan_unpin1(uint32_t h, Bo &b, RelMode mode) { return scan_unpinx(1u, h, b, mode); }") && has(s1c, "static bool scan_unpin2(uint32_t h, Bo &b, RelMode mode) { return scan_unpinx(2u, h, b, mode); }"), "X11: scan_unpin1 / 2 judge their own instance with its pin mask and generation");
+    EXPECT(has(s1c, "const uint32_t res = rdna4dcn::scanXBoGone(inst, mask, pgen, mode != kRelNormal, r);") && has(s1c, "bool scan_unpin1(uint32_t h, Bo &b, RelMode mode) { return scan_unpinx(1u, h, b, mode); }") && has(s1c, "bool scan_unpin2(uint32_t h, Bo &b, RelMode mode) { return scan_unpinx(2u, h, b, mode); }"), "X11: scan_unpin1 / 2 judge their own instance with its pin mask and generation");
     EXPECT(has(s1c, "uint8_t &mask = inst == 1ull ? s->bo[h].pinMask1 : s->bo[h].pinMask2;"), "X11: Release judges and clears ONLY the released instance's pins");
     EXPECT(has(s1c, "if (xd == nullptr || !rdna4scanx::id_ok(*xd, o2[0])) {"), "X11: Register checks the returned slot id carries THIS instance's tag before pinning");
     EXPECT(count_of(s1c, "scanx_owner(s)") == 3 && has(s1c, "if (scan_foreign(s) || !scanx_owner(s)) return kIOReturnNotPermitted;\n    return (IOReturn)rdna4dcn::scanXPresent((uint32_t)inst, slot, flags, out);"), "X11: Register, Present and Acquire need the session to hold instance 0");

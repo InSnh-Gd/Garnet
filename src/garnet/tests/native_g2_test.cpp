@@ -403,7 +403,7 @@ static void t10_close_disarm() {
 // ---- T11: source pins -------------------------------------------------------------------------------------------------------------------------------------------
 static void t11_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), hdr = slurp(K + "src/amd/native_s1c.h"), ncl = slurp(K + "src/GarnetNativeClient.cpp"), nclh = slurp(K + "src/GarnetNativeClient.hpp"),
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), hdr = slurp(K + "src/amd/native_s1c.h"), ncl = slurp(K + "src/GarnetNativeClient.cpp"), nclh = slurp(K + "src/GarnetNativeClient.hpp"),
                       brg = slurp(K + "src/GarnetDriver.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp"), pure = slurp(K + "src/amd/native_g2_pure.h"), dpure = slurp(K + "src/amd/native_disp_pure.h"),
                       plist = slurp(K + "Info.plist"), cli = slurp(root + "/tools/rdna4/native/garnettest.c");
     expect(!eng.empty() && !hdr.empty() && !ncl.empty() && !nclh.empty() && !brg.empty() && !ucl.empty() && !pure.empty() && !dpure.empty() && !plist.empty() && !cli.empty(), "the sources were read");
@@ -419,14 +419,14 @@ static void t11_pins(const std::string &root) {
                           "if (pinnedVmid && program_root(vmid, s->rootPa) != kOk)", "gSlotState[slot] = kSlotOpen;", "IOLockUnlock(gCliLock);" }),
            "n1c_open: HUNG gate, the OFF compare-and-swap, the lock, open_pick, pinned VMID 8 vs unbound pooled session, the slot marked open");
     expect(op.find("const uint32_t openNow = multi ? __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST) : 0u;") != std::string::npos, "OFF feeds open_pick an open count of 0 (the CAS already made it exclusive)");
-    { const std::string cp = fn_body(eng, "static __attribute__((noinline)) uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok) {");
+    { const std::string cp = fn_body(eng, "__attribute__((noinline)) uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok) {");
       expect(in_order(cp, { "const CtxRegs r = ctx_regs(vmid);", "if (vmid != kNativeVmid && !ctx_geometry_ok(cntl)) {", "WREG32(dev, r.cntl, cntl_native(before));", "cntl = RREG32(dev, r.cntl);", "*ok = ctx_geometry_ok(cntl);" }),
              "pooled VMID contexts (9..15) get cntl_native once (never CONTEXT8), then geometry is checked by read-back before use"); }
     expect_u("the only CNTL write is that one", count_of(eng, "WREG32(dev, r.cntl,"), 1);
     expect(in_order(op, { "if (openNow == 0u) {", "(*cp.rptr_cpu & cp.ring_ptr_mask) == cp.wptr" }) && in_order(op, { "if (openNow == 0u) {", "*seq_slot() = 0ull;", "__atomic_store_n(&gEmitted, 0ull, __ATOMIC_RELEASE);" }),
            "only the FIRST session waits for an idle ring and restarts the seqno");
     expect(count_of(eng, "IOMalloc(sizeof(Session))") == 1 && eng.find("IOFree(ns") == std::string::npos && eng.find("IOFree(s, sizeof(Session))") == std::string::npos, "slots 1..7 are allocated once and never freed");
-    expect(eng.find("static Session gSess;") != std::string::npos && eng.find("static Session *gSlot[kMaxSessions]") != std::string::npos, "slot 0 is the static gSess (VMID 8), with a kMaxSessions-sized slot table");
+    expect(eng.find("static Session gSess;") != std::string::npos && eng.find("Session *gSlot[kMaxSessions]") != std::string::npos, "slot 0 is the static gSess (VMID 8), with a kMaxSessions-sized slot table");
     // close: the own wait, the park of the session's own VMID, the slot's next state
     const std::string cl = fn_body(eng, "void n1c_close(const N1cRef &ref, const char *how) {");
     expect(in_order(cl, { "Session *s = sess_lock(ref, false);", "bool leak = hung_now();", "if (!leak && !own_wait(s)) leak = true;", "const bool ownIdle = !leak;", "IOLockLock(gCliLock);",
@@ -435,7 +435,7 @@ static void t11_pins(const std::string &root) {
     expect(cl.find("own_wait(s)") < cl.find("IOLockLock(gCliLock);", cl.find("bool leak = hung_now();")), "close: the own wait runs WITHOUT gCliLock");
     expect(in_order(cl, { "if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr);" }), "close: with the switch ON only the scanout owner restores the console (OFF: always, as before)");
     // the own wait: THIS session's last seqno, never the global count
-    const std::string ow = fn_body(eng, "static bool own_wait(Session *s, bool *noBlame = nullptr) {");
+    const std::string ow = fn_body(eng, "bool own_wait(Session *s, bool *noBlame) {");
     expect(!ow.empty() && ow.find("const uint64_t own = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE);") != std::string::npos && ow.find("rdna4native::g2::own_idle(retired_now(emitted_now()), own)") != std::string::npos,
            "own_wait waits for retired >= the session's OWN last seqno");
     expect(ow.find("IOLockLock") == std::string::npos && ow.find("if (!multi_on()) { hang_from_wait(); return false; }") != std::string::npos, "own_wait takes no lock; OFF is exactly the 0.0.626 idle wait (latch, not idle)");
@@ -470,7 +470,7 @@ static void t11_pins(const std::string &root) {
            "the automatic recovery sends no REMOVE_QUEUE / ADD_QUEUE (G1 review condition 1: never `auto`), writes no register, never touches the HUNG flag");
     expect_u("the HUNG flag is still cleared in exactly one place (G1's clear_latch)", count_of(eng, "gHang.hung = false"), 1);
     // poison: the gate, the wait, QUERY_STATE2
-    const std::string gg = fn_body(eng, "static uint32_t gpu_gate(const Session *s) {");
+    const std::string gg = fn_body(eng, "uint32_t gpu_gate(const Session *s) {");
     expect(in_order(gg, { "if (hung_now()) return hang_rc(true, false);", "if (s != nullptr && sess_poisoned(s)) return rdna4native::g2::poison_rc(true);", "hang_poll()", "sess_poisoned(s)" }), "gpu_gate: HUNG, then the poison, then the stall poll (and the poison again)");
     expect(fn_body(eng, "IOReturn n1c_submit(").find("const uint32_t gate = gpu_gate(s);") != std::string::npos, "Submit is gated per session");
     const std::string wt = fn_body(eng, "IOReturn n1c_wait(");
@@ -492,7 +492,7 @@ static void t11_pins(const std::string &root) {
     }
     // the lock map is written down
     expect(eng.find("// THE LOCK MAP (0.0.627, G2). Order: a session's own lock -> gCliLock -> gRingLock -> gHangLock; gTlbLock is a leaf") != std::string::npos, "the lock map comment");
-    expect(in_order(fn_body(eng, "static uint32_t flush_vmid(uint32_t vmid) {"), { "IOLockLock(gTlbLock);", "gmc_flush_gpu_tlb(", "IOLockUnlock(gTlbLock);", "hang_from_wait();" }), "TLB flushes are serialised (gTlbLock is a leaf: the latch runs after it is dropped)");
+    expect(in_order(fn_body(eng, "uint32_t flush_vmid(uint32_t vmid) {"), { "IOLockLock(gTlbLock);", "gmc_flush_gpu_tlb(", "IOLockUnlock(gTlbLock);", "hang_from_wait();" }), "TLB flushes are serialised (gTlbLock is a leaf: the latch runs after it is dropped)");
     // the client: the session reference and the WindowServer flag
     expect(ncl.find("wsSession = d.reason == rdna4native::policy::kReasonWindowServer;") != std::string::npos && ncl.find("const amdgpu::N1cRef r { sessSlot, sessId };") != std::string::npos, "the client keeps its session reference and the WindowServer flag");
     expect(count_of(ncl, "(r, ") >= 20 && ncl.find("amdgpu::n1c_hello(si[0]") == std::string::npos, "every selector carries the client's own session");
@@ -631,7 +631,7 @@ static void t12_r6_mapped() {
 }
 static void t12_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cli = slurp(root + "/tools/rdna4/native/garnettest.c");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(root + "/tools/rdna4/native/garnettest.c");
     // R1
     const std::string cl = fn_body(eng, "void n1c_close(const N1cRef &ref, const char *how) {");
     const size_t lastCli = cl.rfind("IOLockUnlock(gCliLock);");
@@ -646,13 +646,13 @@ static void t12_pins(const std::string &root) {
     expect_u("R1: the lock field is stored in exactly one place (its creation)", count_of(eng, "__atomic_store_n(&s->lock, "), 1);
     expect(eng.find("s->lock = ") == std::string::npos, "R1: ... and never by a plain assignment");
     // R2
-    const std::string sf = fn_body(eng, "static uint32_t stall_from_wait() {");
+    const std::string sf = fn_body(eng, "uint32_t stall_from_wait() {");
     expect(in_order(sf, { "if (!multi_on()) { hang_from_wait(); return rdna4native::g2::kBoundStalled; }", "const bool busy = gHang.hung || __atomic_load_n(&gRecovering, __ATOMIC_SEQ_CST) != 0u;", "if (!busy) {",
                           "hang_note(gHang, re, em, now);", "mine = hang_expired(gHang, re, em, now);", "if (mine) __atomic_store_n(&gRecovering, 1u, __ATOMIC_SEQ_CST);", "IOLockUnlock(gHangLock);",
                           "if (mine) (void)stall_handle(em, re);", "return rdna4native::g2::bound_verdict(busy, mine);" }),
            "R2: a ring wait's bound blames only when the hang clock (last progress) expired; otherwise no blame");
     expect_u("R2: gRecovering is claimed by stall_from_wait only under `mine`", count_of(sf, "__atomic_store_n(&gRecovering, 1u"), 1);
-    const std::string ow = fn_body(eng, "static bool own_wait(Session *s, bool *noBlame = nullptr) {");
+    const std::string ow = fn_body(eng, "bool own_wait(Session *s, bool *noBlame) {");
     expect(in_order(ow, { "if (!multi_on()) { hang_from_wait(); return false; }", "if (stall_from_wait() == rdna4native::g2::kBoundNoBlame) { if (noBlame != nullptr) *noBlame = true; return false; }", "stalled = true; continue;" }),
            "R2: own_wait returns Timeout (not idle, no blame) when the bound blamed nobody");
     expect(fn_body(eng, "static uint32_t ring_submit(").find("if (er == kTimeout) { (void)stall_from_wait(); return kTimeout; }") != std::string::npos, "R2: the ring-space wait goes through the same check");
@@ -681,12 +681,12 @@ static void t12_pins(const std::string &root) {
     expect(im.find("sys_pending_rollback(reserved, size)") != std::string::npos &&
            pendingRollback.find("host_pending_release(gSysPending, size)") != std::string::npos,
            "R4: every wiring/authoritative failure rolls the reservation back through the idempotent helper (pending -= size, held untouched)");
-    const std::string rl = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
+    const std::string rl = fn_body(eng, "void bo_release(Session *s, uint32_t h, RelMode mode) {");
     const size_t lk = rl.find("} else {\n        // Leak:");
     expect_u("R4: the total drops in exactly the four places memory is really freed", count_of(rl, "sys_release(b)"), 4);
     expect(lk != std::string::npos && rl.substr(lk).find("sys_release") == std::string::npos, "R4: a leak keeps its bytes counted");
     // R5
-    const std::string fs = fn_body(eng, "static __attribute__((noinline)) uint64_t fault_snap(const char *when, uint32_t slot) {");
+    const std::string fs = fn_body(eng, "__attribute__((noinline)) uint64_t fault_snap(const char *when, uint32_t slot) {");
     expect(in_order(fs, { "hub_rd(0x15d0)", "hub_rd(0x15d1)", "hub_rd(0x15d2)", "hub_rd(0x15d3)", "return rdna4native::g2::fault_word(sLo, aLo);" }), "R5: the four GCVM L2 protection-fault registers the S1b fault leg reads");
     expect(fs.find("WREG") == std::string::npos && fs.find("wr(") == std::string::npos && eng.find("vm_l2_protection_fault_cntl") == std::string::npos && eng.find("faultclear") == std::string::npos,
            "R5: read only: nothing here writes or clears a fault register");

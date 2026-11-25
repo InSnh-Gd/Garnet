@@ -186,8 +186,8 @@ plant 73 $N "op_vhook ignores the pure handler" 'garnetmetal::vhook_handle(mask,
 plant 74 $N "op_vhook passes a zero kernel base (a user pointer is written)" 'garnetmetal::vhook_handle(mask, cls, slot, args, nargs, ret, garnetmetal::kKernelMin)' 'garnetmetal::vhook_handle(mask, cls, slot, args, nargs, ret, 0)'
 
 # ---- review round: the total count of GarnetMetalNub references in native_s1c.cpp is pinned at 2 (include + hungLatched) ----
-plant 90 $SR/amd/native_s1c.cpp "native_s1c.cpp gains a third reference to the nub (a new use)" '    GarnetMetalNub::hungLatched();' '    GarnetMetalNub::hungLatched(); (void)sizeof(GarnetMetalNub);'
-plant 91 $SR/amd/native_s1c.cpp "native_s1c.cpp drops the hungLatched call (Ready would never go to 0)" '    GarnetMetalNub::hungLatched();' '    (void)0;'
+plant 90 $SR/amd/garnet_ring_submit.cpp "native_s1c.cpp gains a third reference to the nub (a new use)" '    GarnetMetalNub::hungLatched();' '    GarnetMetalNub::hungLatched(); (void)sizeof(GarnetMetalNub);'
+plant 91 $SR/amd/garnet_ring_submit.cpp "native_s1c.cpp drops the hungLatched call (Ready would never go to 0)" '    GarnetMetalNub::hungLatched();' '    (void)0;'
 
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

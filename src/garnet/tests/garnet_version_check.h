@@ -83,6 +83,13 @@ inline bool all_match(const std::string &root) {
     return plist_matches_version(root, plist) && header_and_sources_match(root, s1ch);
 }
 
+inline std::string read_native_engine(const std::string &amdDir) {
+    return read_all(amdDir + "/garnet_ring_submit.cpp") + "\n" +
+           read_all(amdDir + "/garnet_session_vm.cpp") + "\n" +
+           read_all(amdDir + "/garnet_vram_alloc.cpp") + "\n" +
+           read_all(amdDir + "/garnet_submit_internal.hpp");
+}
+
 }  // namespace garnet_test_ver
 
 #endif  // GARNET_VERSION_CHECK_H

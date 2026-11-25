@@ -38,7 +38,15 @@ plant() {   # plant <id> <file relative to repo root> <description> <old1> <new1
   while [ $# -ge 2 ]; do pairs="${pairs}${1}"$'\x1e'"${2}"$'\x1d'; shift 2; done
   PAIRS="$pairs" FILE="$SCR/$file" python3 - <<'PY'
 import os,sys
-p=os.environ['FILE']; s=open(p).read()
+p=os.environ['FILE']
+pairs=[pair.split('\x1e') for pair in os.environ['PAIRS'].split('\x1d') if pair]
+if p.endswith("/native_s1c.cpp") and not os.path.exists(p):
+    d=os.path.dirname(p)
+    cands=[os.path.join(d,f) for f in ("garnet_submit_internal.hpp","garnet_ring_submit.cpp","garnet_session_vm.cpp","garnet_vram_alloc.cpp") if os.path.exists(os.path.join(d,f))]
+    hits=[c for c in cands if all(open(c).read().count(o)==1 for o,_ in pairs)]
+    if len(hits)!=1: print("PLANT TEXT NOT FOUND UNIQUELY ACROSS SPLIT ENGINE (%d hits)" % len(hits)); sys.exit(3)
+    p=hits[0]
+s=open(p).read()
 for pair in os.environ['PAIRS'].split('\x1d'):
     if not pair: continue
     o,n=pair.split('\x1e')

@@ -433,7 +433,7 @@ static const char *kRingSubmit642 =
 "    *seqOut = seq;\n"
 "    return kOk;";
 static void t10_pins(const std::string &root) {
-    const std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp"), pure = slurp(root + "/src/garnet/src/amd/native_g5_pure.h"),
+    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd"), pure = slurp(root + "/src/garnet/src/amd/native_g5_pure.h"),
         hdr = slurp(root + "/src/garnet/src/amd/native_s1c.h"), brg = slurp(root + "/src/garnet/src/GarnetDriver.cpp"),
         cli = slurp(root + "/tools/rdna4/native/garnettest.c"), plist = slurp(root + "/src/garnet/Info.plist");
     expect(!eng.empty() && !pure.empty() && !hdr.empty() && !brg.empty() && !cli.empty() && !plist.empty(), "T10: the sources were read");

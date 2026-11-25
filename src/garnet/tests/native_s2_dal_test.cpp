@@ -1194,7 +1194,7 @@ static std::string fn_body(const std::string &s, const std::string &head) {
 static void s_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
-    const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), uc = slurp(K + "src/GarnetUserClient.cpp");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), uc = slurp(K + "src/GarnetUserClient.cpp");
     const std::string abi = slurp(K + "src/GarnetNativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/an internal design note");
     const std::string tool = slurp(root + "/tools/native/rdna4dal.c"), bld = slurp(root + "/tools/native/build.sh"), dcnc = slurp(K + "src/dcn/dcn.cpp") + "\n" + slurp(K + "src/dcn/dcn_internal.hpp") + "\n" + slurp(K + "src/dcn/dcn_scanout_mt.cpp"), bringup = slurp(K + "src/GarnetDriver.cpp") + "\n" + slurp(K + "src/GarnetDriverStages.cpp");
     expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty(), "every source file the pins read exists (and the repo root argument is right)");
@@ -1253,8 +1253,8 @@ static void s_pins(const std::string &root) {
     // who calls what
     {
         size_t senders = 0; std::string other;
-        const char *files[] = { "src/GarnetDriver.cpp", "src/GarnetDriverStages.cpp", "src/GarnetUserClient.cpp", "src/GarnetNativeClient.cpp", "src/amd/native_s1c.cpp", "src/dcn/dcn.cpp", "src/dcn/dcn_scanout_mt.cpp", "src/dcn/dcn_dmub_telemetry.cpp", "src/dcn/dcn_disp2_scanx.cpp", "src/GarnetPrimaryFramebuffer.cpp", "src/amd/amdgpu_init.cpp", "src/amd/smu_v14_0.cpp" };
-        for (const char *f : files) { const std::string t = slurp(K + f); senders += count_of(t, "smu_dal_send("); if (t.find("dal_run_step(") != std::string::npos && std::string(f) != "src/amd/native_s1c.cpp") other = f; }
+        const char *files[] = { "src/GarnetDriver.cpp", "src/GarnetDriverStages.cpp", "src/GarnetUserClient.cpp", "src/GarnetNativeClient.cpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp", "src/dcn/dcn.cpp", "src/dcn/dcn_scanout_mt.cpp", "src/dcn/dcn_dmub_telemetry.cpp", "src/dcn/dcn_disp2_scanx.cpp", "src/GarnetPrimaryFramebuffer.cpp", "src/amd/amdgpu_init.cpp", "src/amd/smu_v14_0.cpp" };
+        for (const char *f : files) { const std::string t = slurp(K + f); senders += count_of(t, "smu_dal_send("); if (t.find("dal_run_step(") != std::string::npos && std::string(f) != "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp") other = f; }
         expect_u("nobody outside smu_dal.cpp calls smu_dal_send", senders, 0);
         expect(other.empty(), "dal_run_step is called only from native_s1c.cpp");
         expect_u("dal_run_step has one caller (n1c_dal_step)", count_of(eng, "dal_run_step("), 1);

@@ -17,13 +17,20 @@ plant() {   # plant <id> <file relative to repo root> <old text> <new text> <des
   rm -rf "$SCR"; mkdir -p "$SCR/$SR/dcn" "$SCR/$SR/amd" "$SCR/$K/tests" "$SCR/tools/native"
   cp "$ROOT/$SR/GarnetNativeABI.h" "$ROOT/$SR/GarnetNativeClient.cpp" "$ROOT/$SR/GarnetDriver.cpp" "$ROOT/$SR/GarnetMetalNub.cpp" "$ROOT/$SR/GarnetDisplayNub.cpp" "$ROOT/$SR/kmod_info.c" "$ROOT/$SR/garnet_version.h" "$SCR/$SR/"
   cp "$ROOT/$SR/dcn/"scanout_pure.h "$ROOT/$SR/dcn/"dcn.cpp "$ROOT/$SR/dcn/"dcn.hpp "$SCR/$SR/dcn/"
-  cp "$ROOT/$SR/amd/"native_s1c.cpp "$ROOT/$SR/amd/"native_s1c.h "$SCR/$SR/amd/"
+  cp "$ROOT/$SR/amd/"garnet_submit_internal.hpp "$ROOT/$SR/amd/"garnet_ring_submit.cpp "$ROOT/$SR/amd/"garnet_session_vm.cpp "$ROOT/$SR/amd/"garnet_vram_alloc.cpp "$ROOT/$SR/amd/"native_s1c.h "$SCR/$SR/amd/"
   cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
   cp "$ROOT/$K/tests/native_s2a_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/rdna4scan.c" "$SCR/tools/native/"
   OLD="$old" NEW="$new" FILE="$SCR/$file" python3 - <<'PY'
 import os,sys
-p=os.environ['FILE']; s=open(p).read(); o=os.environ['OLD']; n=os.environ['NEW']
+p=os.environ['FILE']; o=os.environ['OLD']; n=os.environ['NEW']
+if p.endswith("/native_s1c.cpp") and not os.path.exists(p):
+    d=os.path.dirname(p)
+    cands=[os.path.join(d,f) for f in ("garnet_submit_internal.hpp","garnet_ring_submit.cpp","garnet_session_vm.cpp","garnet_vram_alloc.cpp") if os.path.exists(os.path.join(d,f))]
+    hits=[c for c in cands if open(c).read().count(o)==1]
+    if len(hits)!=1: print("PLANT TEXT NOT FOUND UNIQUELY ACROSS SPLIT ENGINE (%d hits): %r" % (len(hits), o[:70])); sys.exit(3)
+    p=hits[0]
+s=open(p).read()
 if s.count(o)!=1:
     print("PLANT TEXT NOT FOUND EXACTLY ONCE (%d): %r" % (s.count(o), o[:70])); sys.exit(3)
 open(p,'w').write(s.replace(o,n))

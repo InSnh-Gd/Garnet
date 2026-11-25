@@ -8,6 +8,7 @@
 //   P6  PT quota exhaustion atomic rollback over TestMem AND production PtMem (pre-existing overlapping BO/PRT leaves preserved).
 //   P7  PRT refcount, BoFree of split BOs, and session exit cleanup (zero leaks under ASan/UBSan).
 //   P8  Production source pins on GarnetNativeABI.h, amdgpu_ip.h, amdgpu_gmc.h, gmc_v12_0.cpp, native_s1c.cpp.
+#include "garnet_version_check.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -800,7 +801,7 @@ static void p8_source_pins(const std::string &root) {
     const std::string abi = slurp(root + "/src/garnet/src/GarnetNativeABI.h");
     const std::string iph = slurp(root + "/src/garnet/src/amd/amdgpu_ip.h");
     const std::string gmc = slurp(root + "/src/garnet/src/amd/gmc_v12_0.cpp");
-    const std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     expect(!abi.empty() && !iph.empty() && !gmc.empty() && !eng.empty(), "production sources readable");
 
     expect(abi.find("#define RDNA4N_ABI_MINOR     13u ") != std::string::npos, "GarnetNativeABI.h sets RDNA4N_ABI_MINOR = 13u");

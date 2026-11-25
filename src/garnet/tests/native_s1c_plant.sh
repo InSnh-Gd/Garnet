@@ -14,7 +14,7 @@ escaped=0; total=0
 fresh() {   # the scratch tree: exactly the files native_s1c_test.cpp reads
   rm -rf "$SCR"; mkdir -p "$SCR/$K/src/amd" "$SCR/$K/tests"
   cp "$ROOT/$K/src/GarnetNativeABI.h" "$ROOT/$K/src/GarnetNativeClient.cpp" "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$ROOT/$K/src/GarnetMetalNub.cpp" "$ROOT/$K/src/GarnetDisplayNub.cpp" "$ROOT/$K/src/kmod_info.c" "$ROOT/$K/src/garnet_version.h" "$SCR/$K/src/"
-  cp "$ROOT/$K/src/amd/"native_s1b_pure.h "$ROOT/$K/src/amd/"native_s1c_pure.h "$ROOT/$K/src/amd/"native_s1c.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"cp_pm4_gfx12.h "$ROOT/$K/src/amd/"amdgpu_pm4.h "$SCR/$K/src/amd/"
+  cp "$ROOT/$K/src/amd/"native_s1b_pure.h "$ROOT/$K/src/amd/"native_s1c_pure.h "$ROOT/$K/src/amd/"garnet_submit_internal.hpp "$ROOT/$K/src/amd/"garnet_ring_submit.cpp "$ROOT/$K/src/amd/"garnet_session_vm.cpp "$ROOT/$K/src/amd/"garnet_vram_alloc.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"cp_pm4_gfx12.h "$ROOT/$K/src/amd/"amdgpu_pm4.h "$SCR/$K/src/amd/"
   cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
   cp "$ROOT/$K/tests/native_s1c_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
 }
@@ -31,7 +31,14 @@ plant() {   # plant <id> <file relative to repo root> <old text> <new text> <des
   fresh
   OLD="$old" NEW="$new" FILE="$SCR/$file" python3 - <<'PY'
 import os,sys
-p=os.environ['FILE']; s=open(p).read(); o=os.environ['OLD']; n=os.environ['NEW']
+p=os.environ['FILE']; o=os.environ['OLD']; n=os.environ['NEW']
+if p.endswith("/native_s1c.cpp") and not os.path.exists(p):
+    d=os.path.dirname(p)
+    cands=[os.path.join(d,f) for f in ("garnet_submit_internal.hpp","garnet_ring_submit.cpp","garnet_session_vm.cpp","garnet_vram_alloc.cpp") if os.path.exists(os.path.join(d,f))]
+    hits=[c for c in cands if open(c).read().count(o)==1]
+    if len(hits)!=1: print("PLANT TEXT NOT FOUND UNIQUELY ACROSS SPLIT ENGINE (%d hits): %r" % (len(hits), o[:70])); sys.exit(3)
+    p=hits[0]
+s=open(p).read()
 if s.count(o)!=1:
     print("PLANT TEXT NOT FOUND EXACTLY ONCE (%d): %r" % (s.count(o), o[:70])); sys.exit(3)
 open(p,'w').write(s.replace(o,n))

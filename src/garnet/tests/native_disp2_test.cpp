@@ -2012,7 +2012,7 @@ static void plane_off2_and_pack() {
 
 static void plane_source_pins() {
     const std::string src = g_root + "/src/garnet/src/";
-    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp") + "\n" + slurp(src + "dcn/dcn_disp2_scanx.cpp"), s1c = slurp(src + "amd/native_s1c.cpp"), s1h = slurp(src + "amd/native_s1c.h"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")),
+    const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp") + "\n" + slurp(src + "dcn/dcn_disp2_scanx.cpp"), s1c = garnet_test_ver::read_native_engine(src + "amd"), s1h = slurp(src + "amd/native_s1c.h"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")),
                       cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"), brg = slurp(src + "GarnetDriver.cpp") + "\n" + slurp(src + "GarnetDriverStages.cpp");
     expect(!dcn.empty() && !s1c.empty() && !s1h.empty() && !flow.empty() && !hdr.empty() && !cli.empty() && !brg.empty(), "0.0.635: the sources are readable");
     // ---- the glue: allocate BEFORE the busy flag, run, release the flag, free AFTER it
@@ -2045,7 +2045,7 @@ static void plane_source_pins() {
         const size_t lk2 = fr.find("IOLockLock(gCliLock);"), fc = fr.find("vram_alloc.free("), ul2 = fr.rfind("IOLockUnlock(gCliLock);");     // 0.0.652: the LAST unlock (the first one belongs to the pinned early return)
         expect(lk2 != std::string::npos && fc != std::string::npos && ul2 != std::string::npos && lk2 < fc && fc < ul2, "0.0.635 helper: the free happens strictly inside the same lock");
         for (const char *bad : { "RREG32", "WREG32", "bar0_memset_vram", "WBAR0_", "MM_INDEX", "hub_rd" }) expect(al.find(bad) == std::string::npos && fr.find(bad) == std::string::npos, (std::string("0.0.635 helper: never uses ") + bad).c_str());
-        expect(al.find("(a[k].gpu_va - ctx.gmc.vram_start) + a[k].size <= ctx.dev->bar0Size") != std::string::npos && al.find("(a[k].gpu_va & 0xFFFFull) == 0") != std::string::npos && al.find("if (rdna4d2pin::alloc_refused(gD2Held[sl])) { rc = kIOReturnExclusiveAccess; break; }") != std::string::npos, "0.0.635 helper: 64 KiB aligned, inside the BAR0 aperture, one pair at a time");
+        expect(al.find("rdna4rebar::vis_vram_range_ok(a[k].gpu_va, a[k].size, ctx.gmc.vram_start, ctx.dev->vramLimit, ctx.dev->bar0Size, ctx.dev->vramSizeBytes)") != std::string::npos && al.find("(a[k].gpu_va & 0xFFFFull) == 0") != std::string::npos && al.find("if (rdna4d2pin::alloc_refused(gD2Held[sl])) { rc = kIOReturnExclusiveAccess; break; }") != std::string::npos, "0.0.635 helper: 64 KiB aligned, inside the BAR0 aperture, one pair at a time");
         expect(s1h.find("IOReturn n1c_d2_alloc(BringupContext &ctx, uint32_t inst, uint64_t bytes, uint64_t mc[2], uint64_t off[2]);") != std::string::npos && s1h.find("void n1c_d2_free(uint32_t inst);") != std::string::npos, "0.0.635 helper: exported from native_s1c.h");
         expect(brg.find("rdna4dcn::disp2(argScalar, v, 13, &gBringup)") != std::string::npos, "0.0.635: the dispatcher hands disp2 the bring-up context (the allocator)");
     }
@@ -2874,7 +2874,7 @@ static void plane_652_tests() {
       expect(o.status == RDNA4D2_DP_DISTURBED && (o.dp_changed & 0x80u) != 0u && o.auto_off == 0u && m.plane.stage == RDNA4D2_PL_HELD && m.clockOn, "HELD crc: OTG0 stopping is reported, NO rollback"); }
     // ---- the glue (dcn.cpp), the allocator (native_s1c.cpp / .h) and the DMUB template refusals: source pins on the real files
     { const std::string src = g_root + "/src/garnet/src/";
-      const std::string glue = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp") + "\n" + slurp(src + "dcn/dcn_disp2_scanx.cpp"), s1c = slurp(src + "amd/native_s1c.cpp"), s1h = slurp(src + "amd/native_s1c.h"), dh = slurp(src + "dcn/dmubcmd.h");
+      const std::string glue = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp") + "\n" + slurp(src + "dcn/dcn_disp2_scanx.cpp"), s1c = garnet_test_ver::read_native_engine(src + "amd"), s1h = slurp(src + "amd/native_s1c.h"), dh = slurp(src + "dcn/dmubcmd.h");
       const size_t d0 = glue.find("uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx) {"), d1 = glue.find("\n}\n", d0); const std::string fn = d0 == std::string::npos ? "" : glue.substr(d0, d1 - d0);
       const size_t held = fn.find("if (rdna4d2_held_refuses(op, inst) && disp2HeldInst(inst)) {"), alloc = fn.find("amdgpu::n1c_d2_alloc("), busy = fn.find("__atomic_exchange_n(&gD2Busy, 1u, __ATOMIC_ACQ_REL)"), arg = fn.find("if (!rdna4d2_arg_ok(arg))"), dev = fn.find("if (!gDcn.dev ||");
       expect(!fn.empty() && held != std::string::npos && alloc != std::string::npos && busy != std::string::npos && arg != std::string::npos && dev != std::string::npos, "0.0.652 glue: the disp2() function and its HELD refusal are found");
@@ -3821,7 +3821,7 @@ static void mona_instance_tests() {
 static void mona_source_pins() {
     const std::string src = g_root + "/src/garnet/src/";
     const std::string dcn = slurp(src + "dcn/dcn.cpp") + slurp(src + "dcn/dcn_internal.hpp") + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + slurp(src + "dcn/dcn_scanout_mt.cpp") + slurp(src + "dcn/dcn_disp2_scanx.cpp"),
-                      s1c = slurp(src + "amd/native_s1c.cpp"), s1h = slurp(src + "amd/native_s1c.h"), hpp = slurp(src + "dcn/dcn.hpp"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")),
+                      s1c = garnet_test_ver::read_native_engine(src + "amd"), s1h = slurp(src + "amd/native_s1c.h"), hpp = slurp(src + "dcn/dcn.hpp"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")),
                       cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"), brg = slurp(src + "GarnetDriver.cpp") + slurp(src + "GarnetDriverStages.cpp");
     expect(!dcn.empty() && !s1c.empty() && !s1h.empty() && !hpp.empty() && !flow.empty() && !hdr.empty() && !cli.empty() && !brg.empty(), "0.0.655: the sources are readable");
     const size_t g0 = dcn.find("build 0.0.631 (multi-monitor stage M4d; an internal design note");

@@ -14,6 +14,7 @@
 // over host memory. Covers with the ACTUAL object: partial-block fail->rollback->retry
 // (zeroed reuse), global-cap-first exhaustion with reserve reuse (no new visible bytes),
 // client exact cap (32MiB), existing mappings preserved (high-half via canonicalize).
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -143,7 +144,7 @@ using amdgpu::gPtN;
 using amdgpu::gPtFreeN;
 
 static void l0_generated(const std::string &root, const std::string &fragment) {
-    std::string eng = slurp(root + "/src/garnet/src/amd/native_s1c.cpp");
+    std::string eng = slurp(root + "/src/garnet/src/amd/garnet_submit_internal.hpp");
     std::string gen = slurp(fragment);
     expect(!eng.empty() && !gen.empty(), "sources + generated fragment readable");
     size_t si = eng.find("struct PtSnap {");

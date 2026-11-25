@@ -593,7 +593,7 @@ static void u13_review() {
 // ---- source pins ---------------------------------------------------------------------------------------------------------------
 static void u12_pins(const std::string &root) {
     const std::string src = root + "/src/garnet/src/";
-    const std::string eng = slurp(src + "amd/native_s1c.cpp"), cli = slurp(src + "GarnetNativeClient.cpp"), boot = slurp(src + "GarnetDriver.cpp"),
+    const std::string eng = garnet_test_ver::read_native_engine(src + "amd"), cli = slurp(src + "GarnetNativeClient.cpp"), boot = slurp(src + "GarnetDriver.cpp"),
                       uc = slurp(src + "GarnetUserClient.cpp"), mk = slurp(root + "/src/garnet/Makefile"), plist = slurp(root + "/src/garnet/Info.plist"),
                       pure = slurp(src + "amd/native_s1c_pure.h"), abi = slurp(src + "GarnetNativeABI.h");
     expect(!eng.empty() && !cli.empty() && !boot.empty() && !uc.empty() && !mk.empty() && !plist.empty() && !pure.empty() && !abi.empty(), "the sources are readable");
@@ -689,7 +689,7 @@ static void u12_pins(const std::string &root) {
     expect_u("the descriptor is released in exactly two places (BoFree path, close path), each nulling the pointer", count_of(eng, "if (b.vmd != nullptr) { b.vmd->release(); b.vmd = nullptr; }"), 2);
     expect_u("no other release of the descriptor (0.0.641: plus the close-time unmap sweep's release of its OWN reference, n1c_unmap_for_close, which retains first)", count_of(eng, "vmd->release()"), 3);
     {
-        const size_t bo = eng.find("static void bo_release(Session *s, uint32_t h, RelMode mode) {"), cl = eng.find("if (mode == kRelClosing) {", bo), nm = eng.find("mode == kRelNormal", bo), lk = eng.find("} else {\n        // Leak:", bo);
+        const size_t bo = eng.find("void bo_release(Session *s, uint32_t h, RelMode mode) {"), cl = eng.find("if (mode == kRelClosing) {", bo), nm = eng.find("mode == kRelNormal", bo), lk = eng.find("} else {\n        // Leak:", bo);
         const size_t r1 = eng.find("b.vmd->release()", bo), r2 = eng.find("b.vmd->release()", r1 + 1);
         expect(cl < r1 && r1 < nm && nm < r2 && r2 < lk, "one release in the closing branch, one in the normal branch, none in the leak branch (leaked with the BO)");
         expect(eng.find("b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed\n        if (b.kind == kBoGtt) { gtt_release(b); sys_release(b); }", bo) != std::string::npos, "released before the memory it names is freed");
