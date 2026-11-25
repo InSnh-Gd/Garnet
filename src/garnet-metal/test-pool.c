@@ -308,6 +308,29 @@ int main(void) {
           "backoff failed");
     rdna4p_destroy(&p);
 
+    // ---- whole-BO 1/4-power-of-2 bucketing --------------------------------------------------------------------------------------
+    {
+        int badB = 0;
+        CHECK("bucket: <= SUB_MAX and > REC_MAX unchanged",
+              rdna4p_bucket_size(0) == 0 && rdna4p_bucket_size(1) == 1 &&
+              rdna4p_bucket_size(RDNA4P_SUB_MAX) == RDNA4P_SUB_MAX &&
+              rdna4p_bucket_size(RDNA4P_REC_MAX + 4096) == RDNA4P_REC_MAX + 4096, "edges");
+        CHECK("bucket: exact powers of 2 stay exact, intermediates round to 1/4-pow2",
+              rdna4p_bucket_size(512 * KIB) == 512 * KIB &&
+              rdna4p_bucket_size(1 * MIB) == 1 * MIB &&
+              rdna4p_bucket_size(64 * MIB) == 64 * MIB &&
+              rdna4p_bucket_size(256 * KIB + 1) == 320 * KIB &&
+              rdna4p_bucket_size(1 * MIB + 1) == 1280 * KIB &&
+              rdna4p_bucket_size(10 * MIB + 1) == 12 * MIB &&
+              rdna4p_bucket_size(64 * MIB - 1) == 64 * MIB, "samples");
+        for (uint64_t sz = RDNA4P_SUB_MAX + 1; sz <= RDNA4P_REC_MAX; sz += (sz >> 5) + 4093) {
+            uint64_t b = rdna4p_bucket_size(sz);
+            if (b < sz || b > RDNA4P_REC_MAX || b - sz >= (sz >> 2) ||
+                rdna4p_bucket_size(b) != b || (b & (64 * KIB - 1)) != 0) badB++;
+        }
+        CHECK("bucket: sweep satisfies <25% overhead, idempotency, 64 KiB alignment", badB == 0, "%d violations", badB);
+    }
+
     // ---- stats line -----------------------------------------------------------------------------------------------------------
     rdna4p_init(&p, 1); fill_slab(&p, 7, 0, off); char line[512]; rdna4p_fmt(&p, line, sizeof line);
     CHECK("stats: the T1 line names slabs per key, live sub-allocations, recycle, descriptor pools, deferred, avoided", strstr(line, "slabs(key:n)=[7:1]") && strstr(line, "live_sub=16") && strstr(line, "kernel_allocs_avoided="), "%s", line);

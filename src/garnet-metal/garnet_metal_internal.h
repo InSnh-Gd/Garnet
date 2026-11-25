@@ -641,6 +641,7 @@ typedef struct {
     PFN_vkAllocateCommandBuffers realAllocCmd;
     PFN_vkFreeCommandBuffers realFreeCmd;
     PFN_vkResetCommandBuffer realResetCmd;
+    PFN_vkFreeMemory realFreeMem;
     garnet_bar_policy_t barPolicy;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
@@ -1494,7 +1495,7 @@ typedef struct {
     id _drtex, _srtex; uint32_t _dlvl, _dslice, _drlvl, _drslice, _srlvl, _srslice; NSUInteger _dsact, _ssact, _dresFilter, _sresFilter;
     RDNA4DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
     RDNA4RenderPipelineState *_pso; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf;
-    MTLViewport _vp, _vps[16]; uint32_t _nvp; MTLScissorRect _sr, _srs[16]; uint32_t _nsr;
+    MTLViewport _vp, *_extraVps; uint32_t _nvp; MTLScissorRect _sr, *_extraSrs; uint32_t _nsr;
     MTLTriangleFillMode _fillMode; MTLDepthClipMode _depthClipMode;
     BOOL _hasSamplePos; MTLSamplePosition _samplePos[8]; uint32_t _samplePosCount;
     float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
@@ -1512,12 +1513,11 @@ typedef struct {
     id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS];
     NSUInteger _csbEndV[RDNA4CNT_MAX_PASS_ATTACHMENTS], _csbEndF[RDNA4CNT_MAX_PASS_ATTACHMENTS];
     uint32_t _nCsbEnd;
-    uint32_t _dynDirty;
+    uint32_t _dynDirty, _dynReqMask;
     uint32_t _drawDirty;
     BOOL _hasDispAtt, _cleanFastOk;
     VkPrimitiveTopology _lastTopo;
-    VkBuffer _boundVBuf[31];
-    VkDeviceSize _boundVOff[31];
+    uint32_t _vbDirtyMask;
     VkBuffer _boundIBuf;
     VkDeviceSize _boundIOff;
     VkIndexType _boundIType;

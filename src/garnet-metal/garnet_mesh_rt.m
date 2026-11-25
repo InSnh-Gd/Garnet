@@ -4961,13 +4961,16 @@ static BOOL rdna4_mesh_update_emul_descriptors(VkDescriptorSet ds, uint32_t emul
     }
 
     if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+    _drawDirty = GARNET_DRAW_DIRTY_ALL;
+    _cleanFastOk = NO;
+    _vbDirtyMask = ~0u;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gfxPipe);
 
     VkViewport vps[16]; VkRect2D scs[16];
     for (uint32_t i = 0; i < vpCount; i++) {
         uint32_t vi = i + vpOff, si = i + vpOff;
-        MTLViewport mv = vi < _nvp ? _vps[vi] : _vps[_nvp - 1];
-        MTLScissorRect sc = si < _nsr ? _srs[si] : (MTLScissorRect){ 0, 0, _w, _h };
+        MTLViewport mv = (_nvp <= 1u || !_extraVps) ? _vp : (vi < _nvp ? _extraVps[vi] : _extraVps[_nvp - 1u]);
+        MTLScissorRect sc = si < _nsr ? ((_nsr <= 1u || !_extraSrs) ? _sr : _extraSrs[si]) : (MTLScissorRect){ 0, 0, _w, _h };
         vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
         scs[i] = (VkRect2D){ { (int32_t)sc.x, (int32_t)sc.y }, { (uint32_t)sc.width, (uint32_t)sc.height } };
     }

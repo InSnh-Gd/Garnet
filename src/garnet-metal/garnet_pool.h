@@ -95,6 +95,15 @@ static inline void rdna4p_done(rdna4p_pool *p, uint64_t serial) {   // idempoten
 
 // ---- (b) slabs ------------------------------------------------------------------------------------------------------------------
 static inline uint64_t rdna4p_alup(uint64_t v, uint64_t a) { if (a <= 1) return v; if (!(a & (a - 1))) return (v + a - 1) & ~(a - 1); return ((v + a - 1) / a) * a; }
+// Quantize recyclable whole allocations (256 KiB..64 MiB) to 1/4-power-of-2 buckets (<25% max overhead,
+// ~32 discrete sizes) so smoothly resizing transient render targets (e.g. Genie minimize) hit the recycle cache.
+static inline uint64_t rdna4p_bucket_size(uint64_t size) {
+    if (size <= RDNA4P_SUB_MAX || size > RDNA4P_REC_MAX) return size;
+    const uint64_t msb = 1ULL << (63 - __builtin_clzll(size));
+    const uint64_t step = msb >> 2;
+    const uint64_t rounded = (size + step - 1ULL) & ~(step - 1ULL);
+    return rounded > RDNA4P_REC_MAX ? RDNA4P_REC_MAX : rounded;
+}
 static inline rdna4p_slab *rdna4p_find_slab(rdna4p_pool *p, uint64_t id) { for (size_t i = 0; i < p->nsl; i++) if (p->sl[i]->id == id) return p->sl[i]; return NULL; }
 static inline uint64_t rdna4p_add_slab(rdna4p_pool *p, uint32_t key, uint64_t size, void *mem, void *map, uint64_t now) {
     rdna4p_slab *s = (rdna4p_slab *)calloc(1, sizeof *s);

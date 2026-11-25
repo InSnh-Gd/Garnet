@@ -42,12 +42,46 @@ GARNET_INTERNAL void rdna4_pool_latch(void) {
 // Frees what the pool has given up (called with the pool mutex NOT held: vkFreeMemory is the slow kernel call).
 static unsigned rdna4_pool_drain(void) {
     unsigned freed = 0;
+    if (!RDNA4R.ok) return 0;
     for (;;) {
         rdna4p_rel o; pthread_mutex_lock(&RDNA4P.mu); int got = rdna4p_pop_release(&RDNA4P.p, &o); pthread_mutex_unlock(&RDNA4P.mu);
         if (!got) return freed;
         vkFreeMemory(RDNA4R.dev, (VkDeviceMemory)o.mem, NULL);
         freed++;
     }
+}
+static _Atomic int rdna4_pool_drain_scheduled;
+static dispatch_queue_t rdna4_pool_drain_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+        q = dispatch_queue_create("rdna4.pool-drain", attr);
+    });
+    return q;
+}
+static void rdna4_pool_drain_async(void) {
+    if (!RDNA4P.on || RDNA4P.auditSubmit || !RDNA4R.ok ||
+        RDNA4R.realFreeMem == NULL || vkFreeMemory != RDNA4R.realFreeMem) {
+        rdna4_pool_drain();
+        return;
+    }
+    pthread_mutex_lock(&RDNA4P.mu);
+    const size_t pending = RDNA4P.p.nrl;
+    pthread_mutex_unlock(&RDNA4P.mu);
+    if (!pending) return;
+    if (atomic_exchange(&rdna4_pool_drain_scheduled, 1) != 0) return;
+    dispatch_async(rdna4_pool_drain_queue(), ^{
+        for (;;) {
+            atomic_store(&rdna4_pool_drain_scheduled, 0);
+            (void)rdna4_pool_drain();
+            pthread_mutex_lock(&RDNA4P.mu);
+            const size_t more = RDNA4P.p.nrl;
+            pthread_mutex_unlock(&RDNA4P.mu);
+            if (!more || atomic_exchange(&rdna4_pool_drain_scheduled, 1) != 0) break;
+        }
+    });
 }
 GARNET_INTERNAL void rdna4_pool_tick(void) {
     if (!RDNA4P.on) return;
@@ -97,6 +131,8 @@ static VkResult rdna4_mem_alloc(uint32_t mt, VkMemoryRequirements mr, BOOL map, 
     const int devLocal = (mt < RDNA4R.mp.memoryTypeCount &&
                           (RDNA4R.mp.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ? 1 : 0;
     BOOL ded = rdna4_pool_dedicated(b, i), newSlab = NO;
+    if (RDNA4P.on && !ded && devLocal && !map && sz > RDNA4P_SUB_MAX && sz <= RDNA4P_REC_MAX)
+        sz = rdna4p_alup(rdna4p_bucket_size(sz), gran);
     for (int tries = 0; tries < 4 && !ded; tries++) {
         const uint64_t now = rdna4_now();
         rdna4p_res r; pthread_mutex_lock(&RDNA4P.mu); int k = rdna4p_alloc(&RDNA4P.p, key, sz, align, now, &r);
@@ -167,7 +203,7 @@ static void rdna4_mem_free(RDNA4Mem *m) {
     if (now - RDNA4P.lastTrim > 250000000ULL) { RDNA4P.lastTrim = now; rdna4p_trim(&RDNA4P.p, now); }
     pthread_mutex_unlock(&RDNA4P.mu);
     if (own) vkFreeMemory(RDNA4R.dev, m->mem, NULL);   // an own allocation, or one the pool declined (over the deferred-bytes bound)
-    rdna4_pool_drain();
+    rdna4_pool_drain_async();
     memset(m, 0, sizeof *m);
 }
 GARNET_INTERNAL uint64_t rdna4_fence_open(void) {

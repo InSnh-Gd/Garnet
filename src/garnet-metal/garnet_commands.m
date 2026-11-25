@@ -1129,13 +1129,14 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     // WindowServer, CA Whippet, or CPU capture consumer may read the surface as
     // soon as scheduled is visible. The /private/tmp/garnet-early-schedule kill
     // file restores early scheduling.
-    // WindowServer Class 1 DisplaySurfaces resident in Phase B OPTIMAL VRAM stay
-    // on the single RDNA4R.q queue (scanout waits on the terminal fence in
-    // rdna4DispDone, and CPU getBytes/synchronizeResource waits on active_cbs).
-    // Skipping deferred didSchedule for those writes lets WindowServer overlap
-    // CPU encoding of the next pass with GPU execution of the previous one.
-    const BOOL wsVramDisp = rdna4_is_ws() && [t rdna4IsDisp] && [t rdna4VramSurfCached] && !rdna4_vs_sync_wb_on();
-    if ([t rdna4IsIOS] && !wsVramDisp &&
+    // WindowServer Class 1/2 surfaces resident in Phase B OPTIMAL VRAM stay on
+    // the single RDNA4R.q queue (scanout waits on the terminal fence in
+    // rdna4DispDone, capture stacks are excluded by garnet_vs_symbol_is_capture,
+    // and CPU getBytes/synchronizeResource waits on active_cbs). Skipping
+    // deferred didSchedule lets WindowServer overlap CPU encoding of the next
+    // pass with GPU execution of the previous one.
+    const BOOL wsVram = rdna4_is_ws() && [t rdna4VramSurfCached] && !rdna4_vs_sync_wb_on();
+    if ([t rdna4IsIOS] && !wsVram &&
         !rdna4_cb_kill_flags().earlySchedule && !_scheduleAfterPublish) {
         _scheduleAfterPublish = YES;
         RDNA4_ONCE("scheduled publication deferred until IOSurface write completes");
@@ -1221,10 +1222,19 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
 // surface safe for scanout. Wait for the terminal fence in WindowServer; apps
 // keep Metal's normal submit-only contract. The kill file preserves the old
 // behaviour for A/B diagnosis without another source change.
+- (void)waitUntilScheduled {
+    const BOOL wasSync = __atomic_exchange_n(&_syncCommit, YES, __ATOMIC_ACQ_REL);
+    if (!wasSync && _nq && rdna4_is_ws() &&
+        atomic_load_explicit(&_scheduledDelivered, memory_order_acquire) == 0 &&
+        _prepared && _dslot >= 0 && _dcls == RDNA4DF_C_FINAL) {
+        rdna4_schedule_kick();
+    }
+    [super waitUntilScheduled];
+}
 - (BOOL)commitAndWaitUntilSubmitted {
     const BOOL ws = rdna4_is_ws();
     const RDNA4CBKillFlags kf = ws ? rdna4_cb_kill_flags() : (RDNA4CBKillFlags){0};
-    _syncCommit = YES;
+    __atomic_store_n(&_syncCommit, YES, __ATOMIC_RELEASE);
     [self commit];
     if (ws && !kf.noWsCompletion &&
         ([self rdna4IsFrame] || kf.wsCompletionAll)) {
@@ -2093,7 +2103,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (BOOL)rdna4HasEvents { return _hasEvents; }
 - (BOOL)rdna4MayDeferFinal {
     RDNA4CommandSegment *seg = (_segments.count == 1) ? _segments.firstObject : nil;
-    return rdna4_is_ws() && !_syncCommit && _dslot >= 0 && _dcls == RDNA4DF_C_FINAL &&
+    return rdna4_is_ws() && !__atomic_load_n(&_syncCommit, __ATOMIC_ACQUIRE) && _dslot >= 0 && _dcls == RDNA4DF_C_FINAL &&
            seg && seg->dispCopyVk != VK_NULL_HANDLE;
 }
 - (uint64_t)rdna4FinalDeferNs {
@@ -3867,6 +3877,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     _cb = cb; _wind = MTLWindingClockwise; _tessFactorScale = 1.0f;
     _fillMode = MTLTriangleFillModeFill; _depthClipMode = MTLDepthClipModeClip;
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
+    _vbDirtyMask = ~0u;
     _ampCount = 1u; _ampHasMappings = NO; _ampLayerOff = 0u; _activeLayerOff = 0u;
     _resourceBindings = [RDNA4ResourceBindings new];
     _resourceSegmentSerial = [_cb rdna4SegmentSerial];
@@ -4060,7 +4071,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         initWithRenderPass:_rp1c ? VK_NULL_HANDLE : _rp1 framebuffer:_fb];
     // Metal's default viewport = the attachment, y down; translated shaders do not flip clip Y (F6): the viewport is emitted with a negative height.
     _vp = (MTLViewport){ 0, 0, _w, _h, 0, 1 }; _sr = (MTLScissorRect){ 0, 0, _w, _h };
-    _vps[0] = _vp; _nvp = 1; _srs[0] = _sr; _nsr = 1;
+    _nvp = 1; _nsr = 1;
     RDNA4LOGR("RDNA4RenderEncoder %p: %u x %u x %u, %u attachment(s); the Vulkan render pass begins at the first draw (or at endEncoding)", (__bridge void *)self, _w, _h, _layers, na);
     if ([d respondsToSelector:@selector(sampleBufferAttachments)]) {
         MTLRenderPassSampleBufferAttachmentDescriptorArray *sbas = d.sampleBufferAttachments;
@@ -4089,6 +4100,10 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     [self rdna4OccInit:d];   // build 18 (P2): outside any render pass (the previous encoder has ended), so the query reset is legal
     return self;
 }
+- (void)dealloc {
+    free(_extraVps);
+    free(_extraSrs);
+}
 RDNA4_DNR(RDNA4RenderEncoder)
 - (void)rdna4OwnResource:(id)object kind:(uint32_t)kind
                 fragment:(BOOL)fragment index:(NSUInteger)index {
@@ -4101,7 +4116,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
         return;
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
-    memset(_boundVBuf, 0, sizeof _boundVBuf);
+    _vbDirtyMask = ~0u;
     _boundIBuf = VK_NULL_HANDLE;
     if (_dcOn) {
         rdna4dc_enc_reset_bound(&_dc);
@@ -4160,7 +4175,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     vkCmdEndRenderPass([_cb vk]); _inPass = NO;
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
-    memset(_boundVBuf, 0, sizeof _boundVBuf);
+    _vbDirtyMask = ~0u;
     _boundIBuf = VK_NULL_HANDLE;
 }
 - (void)setVisibilityResultMode:(NSUInteger)mode offset:(NSUInteger)offset {
@@ -4309,7 +4324,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     _dynDirty = GARNET_DYN_ALL;
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
-    memset(_boundVBuf, 0, sizeof _boundVBuf);
+    _vbDirtyMask = ~0u;
     _boundIBuf = VK_NULL_HANDLE;
     VkRenderPass rp = _rp1; VkFramebuffer fb = _fb; uint32_t ncv = _begun ? 0 : _na + _nd;
     BOOL rpc = _rp1c;
@@ -4421,25 +4436,37 @@ RDNA4_DNR(RDNA4RenderEncoder)
 }
 - (void)setCullMode:(MTLCullMode)m { _cull = m; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
 - (void)setFrontFacingWinding:(MTLWinding)w { _wind = w; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
-- (void)setViewport:(MTLViewport)v { _vp = v; _vps[0] = v; _nvp = 1; _dynDirty |= GARNET_DYN_VIEWPORT; }
+- (void)setViewport:(MTLViewport)v { _vp = v; _nvp = 1; _dynDirty |= GARNET_DYN_VIEWPORT; }
 - (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
     if (!n || !v) return;
-    if (n > (RDNA4R.maxViewports ?: 1u)) {
-        [_cb rdna4Fail:[NSString stringWithFormat:@"setViewports: count %lu > maxViewports %u", (unsigned long)n, RDNA4R.maxViewports ?: 1u]];
+    const uint32_t maxV = RDNA4R.maxViewports ?: 1u;
+    if (n > maxV || n > 16u) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"setViewports: count %lu > maxViewports %u", (unsigned long)n, maxV]];
         return;
     }
-    for (NSUInteger i = 0; i < n; i++) _vps[i] = v[i];
-    _nvp = (uint32_t)n; _vp = v[0]; _dynDirty |= GARNET_DYN_VIEWPORT; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO;
+    _vp = v[0];
+    if (n > 1) {
+        if (!_extraVps) _extraVps = (MTLViewport *)malloc(16u * sizeof *_extraVps);
+        if (!_extraVps) { [_cb rdna4Fail:@"setViewports: out of memory"]; return; }
+        memcpy(_extraVps, v, n * sizeof *_extraVps);
+    }
+    _nvp = (uint32_t)n; _dynDirty |= GARNET_DYN_VIEWPORT; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO;
 }
-- (void)setScissorRect:(MTLScissorRect)r { _sr = r; _srs[0] = r; _nsr = 1; _dynDirty |= GARNET_DYN_SCISSOR; }
+- (void)setScissorRect:(MTLScissorRect)r { _sr = r; _nsr = 1; _dynDirty |= GARNET_DYN_SCISSOR; }
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n {
     if (!n || !r) return;
-    if (n > (RDNA4R.maxViewports ?: 1u)) {
-        [_cb rdna4Fail:[NSString stringWithFormat:@"setScissorRects: count %lu > maxViewports %u", (unsigned long)n, RDNA4R.maxViewports ?: 1u]];
+    const uint32_t maxV = RDNA4R.maxViewports ?: 1u;
+    if (n > maxV || n > 16u) {
+        [_cb rdna4Fail:[NSString stringWithFormat:@"setScissorRects: count %lu > maxViewports %u", (unsigned long)n, maxV]];
         return;
     }
-    for (NSUInteger i = 0; i < n; i++) _srs[i] = r[i];
-    _nsr = (uint32_t)n; _sr = r[0]; _dynDirty |= GARNET_DYN_SCISSOR; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO;
+    _sr = r[0];
+    if (n > 1) {
+        if (!_extraSrs) _extraSrs = (MTLScissorRect *)malloc(16u * sizeof *_extraSrs);
+        if (!_extraSrs) { [_cb rdna4Fail:@"setScissorRects: out of memory"]; return; }
+        memcpy(_extraSrs, r, n * sizeof *_extraSrs);
+    }
+    _nsr = (uint32_t)n; _dynDirty |= GARNET_DYN_SCISSOR; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO;
 }
 - (void)setVertexAmplificationCount:(NSUInteger)count
                        viewMappings:(const MTLVertexAmplificationViewMapping *)viewMappings {
@@ -4563,6 +4590,7 @@ RDNA4_ENCODER_SHARED
     RDNA4StageState *s = [self rdna4Stage:f]; rdna4_stage_set_buf(s, i, buf, off);
     s->rt.as[i] = nil;
     _drawDirty |= f ? GARNET_DRAW_DIRTY_FSTAGE : (GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VB);
+    if (!f) _vbDirtyMask |= (1u << i);
     _cleanFastOk = NO;
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
     [self rdna4OwnResource:buf kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
@@ -4620,7 +4648,7 @@ RDNA4_ENCODER_SHARED
 }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self rdna4SetBuffer:b offset:o index:i frag:NO]; }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self rdna4SetBuffer:b offset:o index:i frag:YES]; }
-- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < 31) { _sv.buf[i].off = o; _drawDirty |= GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VB; _cleanFastOk = NO; } }
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < 31) { _sv.buf[i].off = o; _drawDirty |= GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VB; _vbDirtyMask |= (1u << i); _cleanFastOk = NO; } }
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < 31) { _sf.buf[i].off = o; _drawDirty |= GARNET_DRAW_DIRTY_FSTAGE; _cleanFastOk = NO; } }
 - (void)setVertexBuffers:(const id __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetBuffer:b[k] offset:o[k] index:r.location + k frag:NO]; }
 - (void)setFragmentBuffers:(const id __unsafe_unretained *)b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self rdna4SetBuffer:b[k] offset:o[k] index:r.location + k frag:YES]; }
@@ -4669,6 +4697,7 @@ RDNA4_ENCODER_SHARED
     if (!rdna4_rt_encoder_bind_accel(_cb, [_cb device], f ? "fragment" : "vertex", &s->rt, accel, i)) return;
     rdna4_stage_set_buf(s, i, nil, 0);
     _drawDirty |= f ? GARNET_DRAW_DIRTY_FSTAGE : (GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VB);
+    if (!f && i < 31) _vbDirtyMask |= (1u << i);
     _cleanFastOk = NO;
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
     [self rdna4OwnResource:accel kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
@@ -4839,7 +4868,7 @@ RDNA4_ENCODER_SHARED
 - (BOOL)rdna4PrepareDraw:(VkPrimitiveTopology)topo {
     if (_hostWriteDropped) return NO;
     if (_ended) { [_cb rdna4Fail:@"draw after endEncoding"]; return NO; }
-    if (rdna4dc_clean_draw_ready(_cleanFastOk, _drawDirty, _dynDirty, _lastTopo == topo, _inPass,
+    if (rdna4dc_clean_draw_ready(_cleanFastOk, _drawDirty, _dynDirty & _dynReqMask, _lastTopo == topo, _inPass,
                                  [_cb rdna4Error] != nil, [_cb rdna4HasArgumentWrites],
                                  _argumentResources != nil || _argumentWritable != nil,
                                  [_cb rdna4SegmentSerial] == _resourceSegmentSerial)) {
@@ -5042,11 +5071,11 @@ RDNA4_ENCODER_SHARED
         for (uint32_t i = 0; i < vpCount; i++) {
             uint32_t vi = i + vpOff, si = i + vpOff;
             if (dynEmit & GARNET_DYN_VIEWPORT) {
-                MTLViewport mv = vi < _nvp ? _vps[vi] : _vps[_nvp - 1];
+                MTLViewport mv = (_nvp <= 1u || !_extraVps) ? _vp : (vi < _nvp ? _extraVps[vi] : _extraVps[_nvp - 1u]);
                 vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
             }
             if (dynEmit & GARNET_DYN_SCISSOR) {
-                MTLScissorRect ms = si < _nsr ? _srs[si] : (MTLScissorRect){ 0, 0, _w, _h };
+                MTLScissorRect ms = si < _nsr ? ((_nsr <= 1u || !_extraSrs) ? _sr : _extraSrs[si]) : (MTLScissorRect){ 0, 0, _w, _h };
                 scs[i] = (VkRect2D){ { (int32_t)ms.x, (int32_t)ms.y }, { (uint32_t)ms.width, (uint32_t)ms.height } };
             }
         }
@@ -5080,18 +5109,19 @@ RDNA4_ENCODER_SHARED
     }
     if (!_dcOn || (_drawDirty & (GARNET_DRAW_DIRTY_VB | GARNET_DRAW_DIRTY_PASS))) {
         for (uint32_t i = 0; i < nn; i++) {
+            const uint32_t slot = need[i];
+            const uint32_t bit = slot < 32u ? (1u << slot) : 0u;
+            if (_dcOn && bit && !(_vbDirtyMask & bit)) continue;
             RDNA4Buffer *b; NSUInteger off;
-            if (need[i] == 31) { b = rdna4_dummy_buffer(dev); off = 0; if (!b) { [_cb rdna4Fail:@"no dummy buffer"]; return NO; } [_cb rdna4RetainEncoded:b]; }
-            else { b = _sv.buf[need[i]].b; off = _sv.buf[need[i]].off; }
+            if (slot == 31) { b = rdna4_dummy_buffer(dev); off = 0; if (!b) { [_cb rdna4Fail:@"no dummy buffer"]; return NO; } [_cb rdna4RetainEncoded:b]; }
+            else { b = _sv.buf[slot].b; off = _sv.buf[slot].off; }
             uint64_t vo, viewSize;
             if ([b device] != dev || !rdna4_buffer_view(b.length, off, [b rdna4VkOffset], 1, UINT32_MAX, &vo, &viewSize)) {
                 [_cb rdna4Fail:@"vertex buffer window is outside the logical resource"]; return NO;
             }
             VkBuffer vb = [b vkBuffer];
-            if (!_dcOn || need[i] >= 31 || _boundVBuf[need[i]] != vb || _boundVOff[need[i]] != vo) {
-                vkCmdBindVertexBuffers(cmd, need[i], 1, &vb, &vo);
-                if (need[i] < 31) { _boundVBuf[need[i]] = vb; _boundVOff[need[i]] = vo; }
-            }
+            vkCmdBindVertexBuffers(cmd, slot, 1, &vb, &vo);
+            _vbDirtyMask &= ~bit;
         }
     }
     [_cb rdna4BindArguments:[_pso argumentTables] point:VK_PIPELINE_BIND_POINT_GRAPHICS layout:[_pso layout]];
@@ -5109,11 +5139,15 @@ RDNA4_ENCODER_SHARED
             else if (![self rdna4DcStage:1 pb:[_pso pbF] n:[_pso npbF] state:&_sf dsl:[_pso dsl:1] name:"fragment" cmd:cmd])
                 return NO;
         }
+        const uint32_t reqDyn = GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR | GARNET_DYN_BLEND |
+                                ([_pso rdna4HasDS] ? (GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R |
+                                                      ([_pso rdna4HasDepth] ? GARNET_DYN_DEPTHBIAS : 0u)) : 0u);
+        _dynReqMask = reqDyn;
         _drawDirty = 0u;
         _lastTopo = topo;
         _cleanFastOk = _inPass && !_fetch && !_hasDispAtt && !_occ && !needArgPrep &&
-                       !fallback && ![_pso rdna4IsTessellation] && ![_pso rdna4IsMeshPipeline] &&
-                       !_hasSamplePos && _dynDirty == 0u && !_argumentResources && !_argumentWritable;
+                       !fallback && ![_pso rdna4Real] && ![_pso rdna4IsTessellation] && ![_pso rdna4IsMeshPipeline] &&
+                       !_hasSamplePos && (_dynDirty & reqDyn) == 0u && !_argumentResources && !_argumentWritable;
         return YES;
     }
     if (_dcOn) rdna4dc_enc_layout(&_dc, 0);

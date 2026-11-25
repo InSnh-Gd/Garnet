@@ -3295,6 +3295,9 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         }
     }
     if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+    _drawDirty = GARNET_DRAW_DIRTY_ALL;
+    _cleanFastOk = NO;
+    _vbDirtyMask = ~0u;
 }
 #endif
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer withRange:(NSRange)executionRange {

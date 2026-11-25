@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RDNA4DC_MAXW     64    // longest cacheable signature (words); keeps RDNA4RenderEncoder slim (~1.3 KiB vs 8.7 KiB)
+#define RDNA4DC_MAXW     36    // longest cacheable signature (words); keeps RDNA4RenderEncoder slim (~6.3 KiB vs 8.5 KiB)
 #define RDNA4DC_PC_CAP   8u    // pipelineForTopology cache slots
 #define RDNA4DC_LRU_CAP  16u   // per-stage same-segment descriptor-set reuse slots (owned by RDNA4CommandBuffer)
 #define RDNA4DC_LRU_MAXW 32u   // max signature words kept in the segment LRU (covers layout+dsl+15 bindings)
@@ -39,14 +39,27 @@ static inline void rdna4dc_sig_push(rdna4dc_sig *s, uint64_t v) { if (s->n >= RD
 
 typedef struct { int valid; uint32_t n; uint64_t w[RDNA4DC_MAXW]; uint64_t set; } rdna4dc_stage;
 static inline void rdna4dc_stage_reset(rdna4dc_stage *t) { t->valid = 0; t->n = 0; t->set = 0; }
+// Inline word copy/compare: avoids PLT calls to _platform_memmove/memcmp on short 4..16 word signatures.
+static inline void rdna4dc_copy_words(uint64_t *dst, const uint64_t *src, uint32_t n) {
+    uint32_t i = 0;
+    for (; i + 4u <= n; i += 4u) {
+        dst[i] = src[i]; dst[i + 1u] = src[i + 1u]; dst[i + 2u] = src[i + 2u]; dst[i + 3u] = src[i + 3u];
+    }
+    if (i + 2u <= n) { dst[i] = src[i]; dst[i + 1u] = src[i + 1u]; i += 2u; }
+    if (i < n) dst[i] = src[i];
+}
+static inline int rdna4dc_eq_words(const uint64_t *a, const uint64_t *b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
 // YES when the stage holds a set built from exactly this signature (then *set is that set).
 static inline int rdna4dc_stage_match(const rdna4dc_stage *t, const rdna4dc_sig *s, uint64_t *set) {
-    if (s->over || !t->valid || t->n != s->n || memcmp(t->w, s->w, (size_t)s->n * sizeof s->w[0]) != 0) return 0;
+    if (s->over || !t->valid || t->n != s->n || !rdna4dc_eq_words(t->w, s->w, s->n)) return 0;
     *set = t->set; return 1;
 }
 static inline void rdna4dc_stage_store(rdna4dc_stage *t, const rdna4dc_sig *s, uint64_t set) {
     if (s->over) { rdna4dc_stage_reset(t); return; }
-    t->valid = 1; t->n = s->n; memcpy(t->w, s->w, (size_t)s->n * sizeof s->w[0]); t->set = set;
+    t->valid = 1; t->n = s->n; rdna4dc_copy_words(t->w, s->w, s->n); t->set = set;
 }
 
 typedef struct { uint32_t topo, cull, front; const void *pso; uint64_t pipe; } rdna4dc_pce;
@@ -95,11 +108,12 @@ static inline void rdna4dc_cb_pc_put(rdna4dc_cbcache *c, uint32_t topo, uint32_t
 static inline int rdna4dc_cb_lru_find(const rdna4dc_cbcache *c, int idx, const rdna4dc_sig *s, uint64_t *set) {
     if (s->over || s->n < 2u || s->n > RDNA4DC_LRU_MAXW || (unsigned)idx >= 2u) return 0;
     const uint8_t n = c->lruN[idx];
+    const uint32_t sn = s->n;
     const rdna4dc_lru_ent *arr = c->lru[idx];
     for (uint8_t i = 0; i < n; i++) {
         const rdna4dc_lru_ent *ent = &arr[i];
-        if (ent->n == s->n && ent->w[0] == s->w[0] && ent->w[1] == s->w[1] &&
-            (s->n == 2u || memcmp(ent->w + 2, s->w + 2, (size_t)(s->n - 2u) * sizeof s->w[0]) == 0)) {
+        if (ent->n == sn && ent->w[0] == s->w[0] && ent->w[1] == s->w[1] &&
+            (sn == 2u || rdna4dc_eq_words(ent->w + 2, s->w + 2, sn - 2u))) {
             *set = ent->set; return 1;
         }
     }
@@ -111,7 +125,7 @@ static inline void rdna4dc_cb_lru_put(rdna4dc_cbcache *c, int idx, const rdna4dc
     if (c->lruN[idx] < RDNA4DC_LRU_CAP) slot = c->lruN[idx]++;
     else { slot = c->lruNext[idx]; c->lruNext[idx] = (uint8_t)((slot + 1u) & (RDNA4DC_LRU_CAP - 1u)); }
     rdna4dc_lru_ent *ent = &c->lru[idx][slot];
-    ent->n = s->n; ent->set = set; memcpy(ent->w, s->w, (size_t)s->n * sizeof s->w[0]);
+    ent->n = s->n; ent->set = set; rdna4dc_copy_words(ent->w, s->w, s->n);
 }
 
 typedef struct {
