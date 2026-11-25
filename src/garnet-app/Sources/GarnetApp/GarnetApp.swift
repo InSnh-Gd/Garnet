@@ -198,7 +198,7 @@ final class GarnetAppModel: ObservableObject {
     @Published var isBusy: Bool = false
     @Published var actionLog: String = ""
 
-    @Published var selectedOCMode: OpenCoreMode = .mode16g
+    @Published var selectedOCMode: OpenCoreMode = .full
     @Published var ocReport: OpenCoreReport?
     @Published var ocConfigureResult: OpenCoreConfigureResult?
     @Published var ocError: String?
@@ -274,7 +274,7 @@ final class GarnetAppModel: ObservableObject {
             self.runtimeStatus = snap.st
             self.denylistEntries = snap.dl
             if let pf = snap.pf {
-                self.selectedOCMode = (pf.barRecommendation == .full16G) ? .mode16g : .modeSmall
+                self.selectedOCMode = (pf.barRecommendation == .fullBar) ? .full : .modeSmall
             }
         }
     }

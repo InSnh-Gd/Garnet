@@ -11,7 +11,8 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 
 | 核心代号 | 对应型号 | PCI 设备 ID | LLVM / IP 版本 | 当前状态 |
 | --- | --- | --- | --- | --- |
-| Navi 44 | Radeon RX 9060 XT | `1002:7590` | `gfx1200`、`GC 12.0.0`、`MP0 14.0.2`、`SDMA 7.0.0` | 主要开发与实机验证目标 |
+| Navi 44 | Radeon RX 9060 XT **16GB** | `1002:7590` | `gfx1200`、`GC 12.0.0`、`MP0 14.0.2`、`SDMA 7.0.0` | 主要开发与实机已验证目标 |
+| Navi 44 | Radeon RX 9060 XT **8GB** | `1002:7590` | `gfx1200`、`GC 12.0.0`、`MP0 14.0.2`、`SDMA 7.0.0` | 代码已就绪（离线与隔离测试通过），待物理机实机验证 |
 | Navi 48 | Radeon RX 9070 / RX 9070 XT / AI PRO R9700 | `1002:7550`、`1002:7551` | `gfx1201`、`GC 12.0.1`、`MP0 14.0.3`、`SDMA 7.0.1` | 保留来自 Cobalt64 的分芯片表、固件路径与 Mesa 条目，未在物理机验证 |
 
 共享接口、启动参数和通用文件统一使用 `RDNA4` 与 `Garnet` 命名；仅在存在硬件、固件或 PCI ID 差异处使用 `Navi 44` 与 `Navi 48`。`GarnetAccel.kext` 通过内核集合指纹匹配支持 x86_64 macOS `26.x`（以 `25G332` 为验证基线）；Release 1 二进制包仅面向物理机 Navi 44（`1002:7590`）。
@@ -32,11 +33,11 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
         ▼
   Garnet.kext（org.garnet.driver，系统盘 /Library/Extensions AuxKC）
         ▲
-        │  早期 PCI 64 位 16 GiB BAR 分配支持（仅 16G 模式）
+        │  早期 PCI 64 位 Full-BAR（8/16 GiB）分配支持（仅 Full-BAR 模式）
   GarnetPCIBarCompat.kext（org.garnet.pcibarcompat，OpenCore EFI/OC/Kexts/）
 ```
 
-- `GarnetPCIBarCompat.kext`（`src/garnet-pci-compat/`）：面向 16 GiB Full-BAR 模式的可选早期 OpenCore 驱动。在跨 `26.x` 对 `com.apple.iokit.IOPCIFamily` 完成 `exact-uuid`（`25G332`）或 `structural` 校验后开启大内存 BAR。
+- `GarnetPCIBarCompat.kext`（`src/garnet-pci-compat/`）：面向 Full-BAR（8GB 卡 8 GiB / 16GB 卡 16 GiB）模式的可选早期 OpenCore 驱动。在跨 `26.x` 对 `com.apple.iokit.IOPCIFamily` 完成 `exact-uuid`（`25G332`）或 `structural` 校验后开启大内存 BAR。
 - `Garnet.kext`（`src/garnet/`）：负责 PCIe BAR 映射、片上 IP 发现、固件加载、VMID 与稀疏页表管理、无 Lilu S3 休眠唤醒与 DP DDC/AUX 恢复、`AMDGarnetPrimaryFramebuffer` 模式设置与 128x128 硬件光标，以及 `'GRNT'` 用户客户端（`IOAccelGarnetNativeClient`）。
 - `GarnetAccel.kext`（`src/garnet-accel/`）：在 Auxiliary Kernel Collection 中对接 `IOAcceleratorFamily2`，通过版本化布局指纹匹配虚表偏移与实例大小（`tools/ioaccel-layout/`）。
 - Mesa RADV Darwin（`mesa-patches/`）：基于 Mesa 提交 `f5cb8ee032adabef599ae892ec4e42d796b84da9` 的补丁系列，编译仅启用 ACO 的 `libvulkan_radeon.dylib`，支持 `'GRNT'` 传输、`VK_EXT_metal_surface` 及 `tools/rdna4/radv-app.sh`。
@@ -46,7 +47,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 ## 安装指南（RX 9060 XT / Navi 44）
 
 > [!IMPORTANT]
-> Release 1 仅支持 **x86_64 macOS 26.x 物理机** 与 **AMD Radeon RX 9060 XT（`1002:7590`，Navi 44）**，虚拟机、Apple Silicon 和 Navi 48 会被预检直接拦截。安装器不会自动挂载或修改你的 EFI 分区。
+> Release 1 仅支持 **x86_64 macOS 26.x 物理机** 与 **AMD Radeon RX 9060 XT（`1002:7590`，Navi 44）**，虚拟机、Apple Silicon 和 Navi 48 会被预检直接拦截。安装器不会自动挂载或修改你的 EFI 分区。RX 9060 XT **16GB** 已完成实机验证；**8GB** 版本代码已就绪、尚待物理机实机验证（详见 [docs/rdna4/full-bar-aperture.md](docs/rdna4/full-bar-aperture.md)）。
 
 ### 第一步：BIOS 设置与启动应用
 
@@ -61,7 +62,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 ### 第二步：自动配置 OpenCore
 
 1. 手动挂载你的 EFI 分区。
-2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择模式（`16 GiB Full-BAR` 或 `256 MiB Small-BAR`），点击 **Auto-Configure OpenCore…**，选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode 16g --config /Volumes/EFI/EFI/OC/config.plist`）。程序会自动备份原 `config.plist`、在 16G 模式下写入 `GarnetPCIBarCompat.kext`、更新所需键值并立即完成校验。
+2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择模式（`Full-BAR (8/16 GiB)` 或 `256 MiB Small-BAR`），点击 **Auto-Configure OpenCore…**，选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`）。程序会自动备份原 `config.plist`、在 Full-BAR 模式下写入 `GarnetPCIBarCompat.kext`、更新所需键值并立即完成校验。
 3. 若预检显示 `SIP SETUP NEEDED`，先重启一次让新的 `csr-active-config` 生效。
 
 ### 第三步：安装并重启
@@ -74,7 +75,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 - 应用 Metal 黑名单：将 `.app` 拖入 **Garnet.app -> Status & Denylist**，或执行 `sudo /Applications/Garnet.app/Contents/Resources/garnetctl denylist add-app /Applications/ProblemApp.app`。
 - 导出脱敏诊断：在 **Status & Denylist** 导出，或执行 `garnetctl export-diag --out ~/Desktop/garnet-diag.tar.gz`。
 - 完整卸载：在 **Garnet.app -> Install / Uninstall** 点击 **Uninstall Garnet…**（或执行 `sudo garnetctl uninstall`），随后在 OpenCore 中禁用 `GarnetPCIBarCompat.kext` 与 `garnet*` 启动参数并重启。
-- 应急启动参数（可在 OpenCore 启动菜单临时追加）：`garnet=0` 禁用 `Garnet.kext`，`garnet-aux=0` 禁用 `GarnetAccel.kext`，`garnet-rebar-compat=0` 禁用 16 GiB BAR 补丁，`garnet-apps-all=0` 关闭普通桌面应用 Metal 加速。
+- 应急启动参数（可在 OpenCore 启动菜单临时追加）：`garnet=0` 禁用 `Garnet.kext`，`garnet-aux=0` 禁用 `GarnetAccel.kext`，`garnet-rebar-compat=0` 禁用 Full-BAR 补丁，`garnet-apps-all=0` 关闭普通桌面应用 Metal 加速。
 
 ## 目录结构
 
@@ -82,7 +83,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 | --- | --- |
 | `src/garnet` | 主驱动 `Garnet.kext`、DCN 4.01 模式设置与光标代码、VM/休眠纯逻辑模块、着色器及宿主测试 |
 | `src/garnet-accel` | 辅助内核集合驱动 `GarnetAccel.kext` 与布局守卫测试 |
-| `src/garnet-pci-compat` | OpenCore 早期 16 GiB BAR 扩展 `GarnetPCIBarCompat.kext` 与 `IOPCIFamily` 校验测试 |
+| `src/garnet-pci-compat` | OpenCore 早期 Full-BAR 扩展 `GarnetPCIBarCompat.kext` 与 `IOPCIFamily` 校验测试 |
 | `src/garnet-metal` | `GarnetMetal.bundle`、纯 C 不变量模块、`spvcache` 元数据与兼容测试 |
 | `src/garnet-app` | Swift `Garnet.app`、`garnetctl` CLI、KC/OpenCore 校验与配置器及 `GarnetCoreTests` |
 | `src/dcn41` | DCN 4.01 寄存器定义与生成的写入白名单 |

@@ -24,7 +24,7 @@ struct OpenCoreAssistantView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Picker("Target Mode", selection: $model.selectedOCMode) {
-                                Text("16 GiB Full-BAR (Default)").tag(OpenCoreMode.mode16g)
+                                Text("Full-BAR (8/16 GiB, Default)").tag(OpenCoreMode.full)
                                 Text("256 MiB Small-BAR Fallback").tag(OpenCoreMode.modeSmall)
                             }
                             .pickerStyle(.segmented)
@@ -37,10 +37,10 @@ struct OpenCoreAssistantView: View {
                             } label: {
                                 Label("Auto-Configure OpenCore…", systemImage: "wand.and.stars")
                             }
-                            .disabled(model.selectedOCMode == .mode16g && model.payloadURL == nil)
+                            .disabled(model.selectedOCMode == .full && model.payloadURL == nil)
                         }
 
-                        Text("Creates a timestamped config.plist backup, copies GarnetPCIBarCompat.kext to OC/Kexts (16G mode), updates required OpenCore keys, and validates the output.")
+                        Text("Creates a timestamped config.plist backup, copies GarnetPCIBarCompat.kext to OC/Kexts (Full-BAR mode), updates required OpenCore keys, and validates the output.")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

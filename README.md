@@ -11,7 +11,8 @@ Garnet is an experimental open-source macOS GPU and display driver stack for AMD
 
 | Silicon | Models | PCI device IDs | LLVM / IP targets | Status |
 | --- | --- | --- | --- | --- |
-| Navi 44 | Radeon RX 9060 XT | `1002:7590` | `gfx1200`, `GC 12.0.0`, `MP0 14.0.2`, `SDMA 7.0.0` | Primary verified target |
+| Navi 44 | Radeon RX 9060 XT **16GB** | `1002:7590` | `gfx1200`, `GC 12.0.0`, `MP0 14.0.2`, `SDMA 7.0.0` | Primary physically verified target |
+| Navi 44 | Radeon RX 9060 XT **8GB** | `1002:7590` | `gfx1200`, `GC 12.0.0`, `MP0 14.0.2`, `SDMA 7.0.0` | Code-ready, pending physical hardware verification |
 | Navi 48 | Radeon RX 9070 / RX 9070 XT / AI PRO R9700 | `1002:7550`, `1002:7551` | `gfx1201`, `GC 12.0.1`, `MP0 14.0.3`, `SDMA 7.0.1` | Chip table, firmware path, and Mesa entry retained from Cobalt64; unverified on physical hardware |
 
 Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Navi 44` and `Navi 48` appear only where chip hardware, firmware blobs, or PCI IDs differ. `GarnetAccel.kext` kernel-collection fingerprinting targets x86_64 macOS `26.x` (`25G332` verified baseline), and Release 1 binaries target bare-metal Navi 44 (`1002:7590`) only.
@@ -32,11 +33,11 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
         ▼
   Garnet.kext (org.garnet.driver, Auxiliary Kernel Collection in /Library/Extensions)
         ▲
-        │  Early PCI 64-bit 16 GiB BAR enumeration (16G mode only)
+        │  Early PCI 64-bit Full-BAR (8/16 GiB) enumeration (Full-BAR mode only)
   GarnetPCIBarCompat.kext (org.garnet.pcibarcompat, OpenCore EFI/OC/Kexts/)
 ```
 
-- `GarnetPCIBarCompat.kext` (`src/garnet-pci-compat/`): Optional early OpenCore kext for 16 GiB Full-BAR mode. It verifies `com.apple.iokit.IOPCIFamily` via `exact-uuid` (`25G332`) or `structural` checks across macOS `26.x` before enabling large GPU BAR allocation.
+- `GarnetPCIBarCompat.kext` (`src/garnet-pci-compat/`): Optional early OpenCore kext for Full-BAR (`8 GiB` on 8GB, `16 GiB` on 16GB) mode. It verifies `com.apple.iokit.IOPCIFamily` via `exact-uuid` (`25G332`) or `structural` checks across macOS `26.x` before enabling large GPU BAR allocation.
 - `Garnet.kext` (`src/garnet/`): Initializes PCIe BARs and IP discovery, loads GPU firmware, manages VMIDs and sparse page tables, handles S3 sleep/wake and DP DDC/AUX recovery, drives DCN 4.01 modesetting and 128x128 hardware cursors via `AMDGarnetPrimaryFramebuffer`, and exposes the `'GRNT'` user client (`IOAccelGarnetNativeClient`).
 - `GarnetAccel.kext` (`src/garnet-accel/`): Integrates with `IOAcceleratorFamily2` in the Auxiliary Kernel Collection by matching versioned layout fingerprints (`tools/ioaccel-layout/`).
 - Mesa RADV Darwin (`mesa-patches/`): Patch series on Mesa `f5cb8ee032adabef599ae892ec4e42d796b84da9` building `libvulkan_radeon.dylib` with ACO over `'GRNT'`, `VK_EXT_metal_surface`, and `tools/rdna4/radv-app.sh`.
@@ -46,7 +47,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 ## Installation (RX 9060 XT / Navi 44)
 
 > [!IMPORTANT]
-> Release 1 supports **bare-metal x86_64 macOS 26.x** with an **AMD Radeon RX 9060 XT (`1002:7590`, Navi 44)**. Virtual machines, Apple Silicon hosts, and Navi 48 GPUs are blocked by preflight. Garnet never mounts your EFI partition automatically.
+> Release 1 supports **bare-metal x86_64 macOS 26.x** with an **AMD Radeon RX 9060 XT (`1002:7590`, Navi 44)**. Virtual machines, Apple Silicon hosts, and Navi 48 GPUs are blocked by preflight. Garnet never mounts your EFI partition automatically. RX 9060 XT **16GB** is physically verified; **8GB** support is code-ready and pending physical hardware verification (see [docs/rdna4/full-bar-aperture.md](docs/rdna4/full-bar-aperture.md)).
 
 ### Step 1: BIOS and app launch
 
@@ -61,7 +62,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 ### Step 2: Configure OpenCore
 
 1. Mount your EFI partition.
-2. In **Garnet.app -> OpenCore Assistant**, select the mode recommended on the main screen (`16 GiB Full-BAR` or `256 MiB Small-BAR`), click **Auto-Configure OpenCore…**, and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode 16g --config /Volumes/EFI/EFI/OC/config.plist`). Garnet backs up `config.plist`, copies `GarnetPCIBarCompat.kext` for 16G mode, updates the required settings, and validates the file.
+2. In **Garnet.app -> OpenCore Assistant**, select the mode recommended on the main screen (`Full-BAR (8/16 GiB)` or `256 MiB Small-BAR`), click **Auto-Configure OpenCore…**, and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`). Garnet backs up `config.plist`, copies `GarnetPCIBarCompat.kext` for Full-BAR mode, updates the required settings, and validates the file.
 3. If preflight shows `SIP SETUP NEEDED`, reboot once so the updated `csr-active-config` takes effect.
 
 ### Step 3: Install and reboot
@@ -74,7 +75,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 - To exclude an app from Metal acceleration, drop it onto **Garnet.app -> Status & Denylist** or run `sudo /Applications/Garnet.app/Contents/Resources/garnetctl denylist add-app /Applications/ProblemApp.app`.
 - To export redacted diagnostics, use **Status & Denylist** or run `garnetctl export-diag --out ~/Desktop/garnet-diag.tar.gz`.
 - To uninstall, click **Garnet.app -> Install / Uninstall -> Uninstall Garnet…** (or run `sudo garnetctl uninstall`), then reboot and disable `GarnetPCIBarCompat.kext` and `garnet*` boot-args in OpenCore.
-- Emergency boot-arg kill-switches for OpenCore: `garnet=0` disables `Garnet.kext`, `garnet-aux=0` disables `GarnetAccel.kext`, `garnet-rebar-compat=0` disables the 16 GiB BAR hook, and `garnet-apps-all=0` restricts desktop app Metal acceleration.
+- Emergency boot-arg kill-switches for OpenCore: `garnet=0` disables `Garnet.kext`, `garnet-aux=0` disables `GarnetAccel.kext`, `garnet-rebar-compat=0` disables the Full-BAR hook, and `garnet-apps-all=0` restricts desktop app Metal acceleration.
 
 ## Repository layout
 
@@ -82,7 +83,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 | --- | --- |
 | `src/garnet` | Primary kext (`Garnet.kext`), DCN 4.01 modeset/cursor code, VM/sleep helpers, shaders, and host tests |
 | `src/garnet-accel` | Auxiliary Kernel Collection kext (`GarnetAccel.kext`) and layout gate tests |
-| `src/garnet-pci-compat` | Early OpenCore 16 GiB BAR kext (`GarnetPCIBarCompat.kext`) and `IOPCIFamily` tests |
+| `src/garnet-pci-compat` | Early OpenCore Full-BAR kext (`GarnetPCIBarCompat.kext`) and `IOPCIFamily` tests |
 | `src/garnet-metal` | `GarnetMetal.bundle`, pure-C modules, `spvcache` metadata, and tests |
 | `src/garnet-app` | Swift `Garnet.app`, `garnetctl` CLI, KC/OpenCore validator and configurator, and `GarnetCoreTests` |
 | `src/dcn41` | DCN 4.01 register headers and generated write allowlist |

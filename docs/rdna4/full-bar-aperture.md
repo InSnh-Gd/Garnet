@@ -1,6 +1,6 @@
 # RDNA4 Full PCIe BAR0 Aperture & VRAM Ownership
 
-This document specifies the pre-PCI-configuration BAR0 compatibility layer (`GarnetPCIBarCompat.kext`, Task 2.2) and the single-owner VRAM / aperture boundaries (Task 3.3) for `enable-rdna4-16g-bar`.
+This document specifies the pre-PCI-configuration BAR0 compatibility layer (`GarnetPCIBarCompat.kext`, Task 2.2), the single-owner VRAM / aperture boundaries (Task 3.3), and RX 9060 XT 8GB bring-up verification requirements.
 
 ---
 
@@ -78,7 +78,7 @@ The detour handler executes under `mp_rendezvous_no_intrs` with interrupts disab
 - **`GarnetAccel.kext` (`org.garnet.accel`)**: Thin client communicating strictly through `rdna4.display.peer.v1`. Holds zero direct BAR mappings, `writeRegister` calls, or raw descriptor ownership over the GPU aperture.
 - **`GarnetPCIBarCompat.kext` (`org.garnet.pcibarcompat`)**: Operates strictly at PCI enumeration (`IOPCIFamily` `IOPCIRange` sizing) and owns zero VRAM allocations, MMIO mappings, or runtime GPU state.
 
-### 16 GiB BAR0 Aperture vs. Validated VRAM vs. Reserves
+### Full-BAR Aperture (8 / 16 GiB) vs. Validated VRAM vs. Reserves
 
 ```text
 0x0000_0000_0000 ──┬─────────────────────────────────────────────────────────┐
@@ -92,11 +92,32 @@ The detour handler executes under `mp_rendezvous_no_intrs` with interrupts disab
                    │   - kVramHiTailReserve       = 512 MiB                  │
                    │   - kAppleArenaCarveReserve  = 256 MiB                  │
                    │   - kVramHiTotalReserve      = 768 MiB                  │
-~16304 MiB (HW) ───┼─────────────────────────────────────────────────────────┤
+~8112 / 16304 MiB ─┼─────────────────────────────────────────────────────────┤
                    │ Unbacked High Aperture Tail (clamped / excluded)        │
-16 GiB (BAR0 End) ─┴─────────────────────────────────────────────────────────┘
+8 / 16 GiB (End) ──┴─────────────────────────────────────────────────────────┘
 ```
 
-- **BAR0 aperture (`16 GiB` = `16384 MiB`)**: Full PCIe MMIO decode range exposed by `probeBaseAddressRegister` on RX 9060 XT (`0x7590`) / RX 9070 (`0x7550`), or up to `32 GiB` on `0x7551`.
-- **Validated physical VRAM (`16304 MiB` on RX 9060 XT 16 GiB)**: Firmware-reported/backed VRAM ceiling within BAR0. Addresses above validated VRAM constitute an unbacked high tail and must be excluded from host/GPU allocation.
+- **BAR0 aperture (`8 GiB` on 8GB / `16 GiB` on 16GB)**: Full PCIe MMIO decode range exposed by `probeBaseAddressRegister` on RX 9060 XT (`0x7590`) / RX 9070 (`0x7550`), or up to `32 GiB` on `0x7551`.
+- **Validated physical VRAM (`~8112 MiB` on RX 9060 XT 8GB, `~16304 MiB` on RX 9060 XT 16GB)**: Firmware-reported/backed VRAM ceiling within BAR0. Addresses above validated VRAM constitute an unbacked high tail and must be excluded from host/GPU allocation.
 - **`vramLimit` & protected regions**: `Garnet.kext` preserves early boot console/framebuffer regions, firmware/PSP/SMU/GART reserves, and the high-tail reserves (`kVramHiTotalReserve = 768 MiB`: `512 MiB` high tail + `256 MiB` Apple arena carveout), exposing only the verified allocatable span up to `vramLimit` to `GarnetAccel.kext` and userland clients.
+
+---
+
+## 5. RX 9060 XT 8GB Physical Verification & Diagnostic Checklist
+
+> **Current Status**: RX 9060 XT **16GB** (`1002:7590`) is physically verified. RX 9060 XT **8GB** (`1002:7590`, Navi 44 XT, 8 GiB VRAM / 8 GiB Full-BAR) is **code-ready** (verified via offline/isolated host suites and compilation) and **pending physical hardware verification** — no live 8GB execution is claimed until this checklist completes on real hardware.
+
+Before accepting live 8GB operation on a physical RX 9060 XT 8GB card:
+
+1. **Kernel VRAM Size & `Garnet,MemoryCaps`**:
+   - Confirm `RCC_CONFIG_MEMSIZE` / `gmc.real_vram_size` (`~8112–8192 MiB`) and verify `Garnet,MemoryCaps` publishes `physical >= pool`, `pool = visible + high` (~`7280–7360 MiB`), and zero reserve overlap (`garnettest accel vramstat`).
+2. **ReBAR BAR0 & `GarnetPCIBarCompat`**:
+   - Verify firmware ReBAR census reports `8 GiB` (ReBAR code `13`) and `GarnetPCIBarCompat` reports `PreservedBar0Bytes = 0x200000000` (`8 GiB`) alongside intact BAR2 doorbell probing in Full-BAR (`--mode full`) boots.
+   - Verify `--mode small` (`256 MiB` Small-BAR) recovery boot still exposes usable `visible` + `high` VRAM without `GarnetPCIBarCompat.kext`.
+3. **Direct CPU BAR <-> GPU Transfers**:
+   - In 8 GiB Full-BAR mode, run `garnettest accel bartest 0` and verify all **2 targets** (`4 GiB - 64 KiB` straddling block and top block below `vramLimit`) pass bidirectional CPU/GPU checks with intact guards and low-address canary.
+   - In Small-BAR mode, verify `garnettest accel bartest 1` passes.
+4. **Hardware `GB_ADDR_CONFIG` Register Triage (Mesa RADV)**:
+   - Mesa RADV Darwin enforces `GB_ADDR_CONFIG == 0x08200545` (matching 128-bit / 4-channel Navi 44). If an 8GB board SKU boots with a different `GB_ADDR_CONFIG` value, record the exact register readback from `Garnet` / RADV logs and run initial diagnostics with `RADV_DARWIN_ALLOW_ADDRCFG=1` before making any Mesa patch decision.
+5. **GarnetMetal Pre-Open vs. Full-Open Crosscheck**:
+   - Inspect unified/Metal logs on first RADV open and confirm `argument limits: full-open identity and all raw limits MATCH the pre-open snapshot` (aligning `nativeMemory->pool`, ~`7424 MiB`, with zero `CROSSCHECK_LIMIT_MISMATCH`) so `gpuArgumentTables` and Tier 2 argument samplers stay enabled.

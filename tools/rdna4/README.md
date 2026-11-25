@@ -98,7 +98,7 @@ enforces completeness):
 - `Garnet.kext` (`CHIPS=navi44` only, embedded Navi 44 firmware) + `LICENSE.amdgpu`
 - `variants/index.json` (`garnet-accel-variants-v1`), top-level `layout-fingerprint.json`, and
   `variants/<shortId>/{GarnetAccel.kext,layout-fingerprint.json}`
-- `optional/GarnetPCIBarCompat.kext` (users install into OpenCore `EFI/OC/Kexts/` for 16G Full-BAR)
+- `optional/GarnetPCIBarCompat.kext` (users install into OpenCore `EFI/OC/Kexts/` for Full-BAR (8/16 GiB))
 - `optional/vulkan/radeon_icd.x86_64.json` and `optional/vulkan/radv-app.sh` (optional, default OFF)
 - `default-app-denylist.txt` (template initialized to `/Library/Application Support/RDNA4/native/app-denylist.txt`)
 - `MANIFEST.txt` includes `RELEASE_MODE=1`, `TARGET_SILICON=navi44`, `TARGET_PCI_IDS=1002:7590`,

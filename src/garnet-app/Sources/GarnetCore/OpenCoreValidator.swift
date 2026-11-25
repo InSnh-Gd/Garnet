@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OpenCoreMode: String, Codable, CaseIterable, Sendable {
-    case mode16g = "16g"
+    case full = "full"
     case modeSmall = "small"
 }
 
@@ -120,7 +120,7 @@ public enum OpenCoreValidator {
         }
 
         switch mode {
-        case .mode16g:
+        case .full:
             if let compat = pciCompatEntry, ((compat["Enabled"] as? Bool) ?? false) {
                 let execPath = (compat["ExecutablePath"] as? String) ?? ""
                 let plistPath = (compat["PlistPath"] as? String) ?? ""
@@ -128,7 +128,7 @@ public enum OpenCoreValidator {
                     findings.append(OpenCoreFinding(
                         severity: .pass,
                         keyPath: "Kernel.Add[GarnetPCIBarCompat.kext]",
-                        message: "GarnetPCIBarCompat.kext present and enabled for 16 GiB Full-BAR"
+                        message: "GarnetPCIBarCompat.kext present and enabled for Full-BAR (8/16 GiB)"
                     ))
                 } else {
                     findings.append(OpenCoreFinding(
@@ -141,7 +141,7 @@ public enum OpenCoreValidator {
                 findings.append(OpenCoreFinding(
                     severity: .error,
                     keyPath: "Kernel.Add[GarnetPCIBarCompat.kext]",
-                    message: "16 GiB Full-BAR mode requires GarnetPCIBarCompat.kext in EFI/OC/Kexts/ and Enabled = true"
+                    message: "Full-BAR (8/16 GiB) mode requires GarnetPCIBarCompat.kext in EFI/OC/Kexts/ and Enabled = true"
                 ))
             }
         case .modeSmall:
@@ -212,17 +212,17 @@ public enum OpenCoreValidator {
         }
 
         switch mode {
-        case .mode16g:
+        case .full:
             if argSet.contains("garnet-full-bar=1") {
                 findings.append(OpenCoreFinding(severity: .pass, keyPath: "NVRAM.boot-args[garnet-full-bar]", message: "garnet-full-bar=1 present"))
             } else {
-                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[garnet-full-bar]", message: "16 GiB Full-BAR requires garnet-full-bar=1"))
+                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[garnet-full-bar]", message: "Full-BAR (8/16 GiB) requires garnet-full-bar=1"))
             }
             if argSet.contains("npci=0x2000") || argSet.contains("npci=0x3000") {
-                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[npci]", message: "Remove npci=0x2000/0x3000 in 16 GiB Full-BAR mode (forces PCI resources below 4 GiB)"))
+                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[npci]", message: "Remove npci=0x2000/0x3000 in Full-BAR (8/16 GiB) mode (forces PCI resources below 4 GiB)"))
             }
             if argSet.contains("garnet-rebar-compat=0") {
-                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[garnet-rebar-compat]", message: "Remove kill-switch garnet-rebar-compat=0 for normal 16 GiB Full-BAR operation"))
+                findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.boot-args[garnet-rebar-compat]", message: "Remove kill-switch garnet-rebar-compat=0 for normal Full-BAR (8/16 GiB) operation"))
             }
         case .modeSmall:
             if argSet.contains("garnet-full-bar=1") {
@@ -264,7 +264,7 @@ public enum OpenCoreValidator {
         let resizeUefi = (uefiQuirks["ResizeGpuBars"] as? Int) ?? 0
         let incPciBar = (kernelQuirks["IncreasePciBarSize"] as? Bool) ?? false
 
-        let wantResize = (mode == .mode16g) ? -1 : 0
+        let wantResize = (mode == .full) ? -1 : 0
         if resizeApple == wantResize {
             findings.append(OpenCoreFinding(severity: .pass, keyPath: "Booter.Quirks.ResizeAppleGpuBars", message: "ResizeAppleGpuBars = \(wantResize)"))
         } else {
@@ -328,7 +328,7 @@ public enum OpenCoreValidator {
         return configURL
     }
 
-    /// Back up config.plist, export GarnetPCIBarCompat.kext (16G mode), apply Garnet OpenCore settings, and verify.
+    /// Back up config.plist, export GarnetPCIBarCompat.kext (Full-BAR mode), apply Garnet OpenCore settings, and verify.
     public static func configure(targetURL: URL, mode: OpenCoreMode, payloadURL: URL?) throws -> OpenCoreConfigureResult {
         let configURL = try resolveConfigURL(from: targetURL)
         let rawData = try Data(contentsOf: configURL)
@@ -337,14 +337,14 @@ public enum OpenCoreValidator {
             throw OpenCoreConfigureError.failed("Root object of \(configURL.path) must be a dictionary")
         }
 
-        if mode == .mode16g && payloadURL == nil {
-            throw OpenCoreConfigureError.failed("16 GiB Full-BAR mode requires a valid payload to copy GarnetPCIBarCompat.kext")
+        if mode == .full && payloadURL == nil {
+            throw OpenCoreConfigureError.failed("Full-BAR (8/16 GiB) mode requires a valid payload to copy GarnetPCIBarCompat.kext")
         }
 
         let backupURL = try writeTimestampedBackup(rawData: rawData, nextTo: configURL)
 
         var kextInstalledPath: String?
-        if mode == .mode16g, let payloadURL {
+        if mode == .full, let payloadURL {
             let kextsDir = configURL.deletingLastPathComponent().appendingPathComponent("Kexts")
             try rejectSymlink(at: kextsDir)
             let dst = try SystemDiskInstaller.exportPCIBarCompat(fromPayload: payloadURL, toDestination: kextsDir)
@@ -413,7 +413,7 @@ public enum OpenCoreValidator {
 
             if baseName == "GarnetPCIBarCompat.kext" {
                 switch mode {
-                case .mode16g:
+                case .full:
                     if !foundCompat {
                         kernelAdd[idx]["BundlePath"] = "GarnetPCIBarCompat.kext"
                         kernelAdd[idx]["Enabled"] = true
@@ -432,11 +432,11 @@ public enum OpenCoreValidator {
             }
         }
 
-        if mode == .mode16g && !foundCompat {
+        if mode == .full && !foundCompat {
             kernelAdd.append([
                 "Arch": "x86_64",
                 "BundlePath": "GarnetPCIBarCompat.kext",
-                "Comment": "Garnet 16 GiB Full-BAR compatibility",
+                "Comment": "Garnet Full-BAR (8/16 GiB) compatibility",
                 "Enabled": true,
                 "ExecutablePath": "Contents/MacOS/GarnetPCIBarCompat",
                 "MaxKernel": "",
@@ -453,7 +453,7 @@ public enum OpenCoreValidator {
     }
 
     private static func applyQuirks(to root: inout [String: Any], mode: OpenCoreMode) {
-        let wantResize = (mode == .mode16g) ? -1 : 0
+        let wantResize = (mode == .full) ? -1 : 0
 
         var booter = (root["Booter"] as? [String: Any]) ?? [:]
         var booterQuirks = (booter["Quirks"] as? [String: Any]) ?? [:]
@@ -506,7 +506,7 @@ public enum OpenCoreValidator {
         for raw in existing.split(whereSeparator: { $0.isWhitespace }) {
             let tok = String(raw)
             if tok == "-radvesa" { continue }
-            if mode == .mode16g && (tok == "npci=0x2000" || tok == "npci=0x3000") { continue }
+            if mode == .full && (tok == "npci=0x2000" || tok == "npci=0x3000") { continue }
             if managedPrefixes.contains(where: { tok.hasPrefix($0) }) { continue }
             kept.append(tok)
         }
@@ -514,7 +514,7 @@ public enum OpenCoreValidator {
         kept.append(contentsOf: requiredBootArgs)
         kept.append("garnet-apps-all=1")
         switch mode {
-        case .mode16g:
+        case .full:
             kept.append("garnet-full-bar=1")
         case .modeSmall:
             if !kept.contains("npci=0x2000") && !kept.contains("npci=0x3000") {
@@ -526,9 +526,9 @@ public enum OpenCoreValidator {
 
     public static func sampleConfigSnippet(mode: OpenCoreMode) -> String {
         switch mode {
-        case .mode16g:
+        case .full:
             return """
-            # 16 GiB Full-BAR OpenCore Checklist
+            # Full-BAR (8/16 GiB) OpenCore Checklist
             1. Copy `GarnetPCIBarCompat.kext` to `EFI/OC/Kexts/` and add & Enable in `Kernel -> Add`
                (Place AFTER Lilu/WEG/VirtualSMC; set MaxKernel="" MinKernel="25.0.0").
             2. NEVER put Garnet.kext or GarnetAccel.kext inside `EFI/OC/Kexts/`.
@@ -564,7 +564,7 @@ public enum OpenCoreValidator {
         Emergency OpenCore boot-arg kill-switches (add to boot-args at OpenCore Picker / config.plist):
           - `garnet=0`              Disables Garnet.kext primary driver & GPU init completely (boots on VESA/fallback display).
           - `garnet-aux=0`          Disables GarnetAccel.kext / GarnetFramebuffer while keeping bringup diagnostics accessible.
-          - `garnet-rebar-compat=0` Disables GarnetPCIBarCompat.kext 16 GiB BAR hook without removing it from EFI/OC/Kexts/.
+          - `garnet-rebar-compat=0` Disables GarnetPCIBarCompat.kext Full-BAR hook without removing it from EFI/OC/Kexts/.
           - `garnet-apps-all=0`     Disables global desktop app Metal access while preserving core compositor & allowlisted tools.
         """
     }

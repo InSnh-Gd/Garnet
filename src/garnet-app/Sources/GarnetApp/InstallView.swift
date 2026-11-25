@@ -45,10 +45,10 @@ struct InstallView: View {
                             Divider()
                             VStack(alignment: .leading, spacing: 4) {
                                 Label(
-                                    pf.barRecommendation == .full16G
-                                        ? "OpenCore Mode Recommendation: 16 GiB Full-BAR (Default)"
+                                    pf.barRecommendation == .fullBar
+                                        ? "OpenCore Mode Recommendation: Full-BAR (8/16 GiB, Default)"
                                         : "OpenCore Mode Recommendation: 256 MiB Small-BAR Fallback",
-                                    systemImage: pf.barRecommendation == .full16G ? "checkmark.shield" : "exclamationmark.triangle"
+                                    systemImage: pf.barRecommendation == .fullBar ? "checkmark.shield" : "exclamationmark.triangle"
                                 )
                                 .fontWeight(.semibold)
                                 Text(pf.barReason).font(.caption).foregroundColor(.secondary)

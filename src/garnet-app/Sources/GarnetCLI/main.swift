@@ -182,9 +182,9 @@ struct GarnetCLI {
         guard let cfgPath = parsed.options["--config"] ?? parsed.positional.first else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "validate-oc requires --config <path>"])
         }
-        let modeStr = parsed.options["--mode"] ?? "16g"
+        let modeStr = parsed.options["--mode"] ?? "full"
         guard let mode = OpenCoreMode(rawValue: modeStr) else {
-            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected 16g or small)"])
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected full or small)"])
         }
         let report = try OpenCoreValidator.validate(configURL: URL(fileURLWithPath: cfgPath), mode: mode)
         if parsed.flags.contains("--json") {
@@ -203,11 +203,11 @@ struct GarnetCLI {
         guard let targetPath = parsed.options["--config"] ?? parsed.positional.first else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "configure-oc requires --config <EFI-or-config.plist>"])
         }
-        let modeStr = parsed.options["--mode"] ?? "16g"
+        let modeStr = parsed.options["--mode"] ?? "full"
         guard let mode = OpenCoreMode(rawValue: modeStr) else {
-            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected 16g or small)"])
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected full or small)"])
         }
-        let payloadURL: URL? = (mode == .mode16g) ? try resolvePayloadURL(explicit: parsed.options["--payload"]) : nil
+        let payloadURL: URL? = (mode == .full) ? try resolvePayloadURL(explicit: parsed.options["--payload"]) : nil
         let result = try OpenCoreValidator.configure(
             targetURL: URL(fileURLWithPath: targetPath),
             mode: mode,
@@ -430,8 +430,8 @@ struct GarnetCLI {
         print("""
         Usage: garnetctl <command> [options]
           preflight [--payload <dir>] [--sysroot <dir>] [--json]
-          validate-oc --config <config.plist> [--mode 16g|small] [--json]
-          configure-oc --config <EFI-or-config.plist> [--mode 16g|small] [--payload <dir>] [--json]
+          validate-oc --config <config.plist> [--mode full|small] [--json]
+          configure-oc --config <EFI-or-config.plist> [--mode full|small] [--payload <dir>] [--json]
           install [--payload <dir>] [--with-vulkan] [--dry-run] [--json]
           uninstall [--remove-denylist] [--dry-run] [--json]
           status [--json]

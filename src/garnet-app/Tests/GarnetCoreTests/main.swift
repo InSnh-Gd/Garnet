@@ -721,7 +721,7 @@ struct GarnetCoreTestsRunner {
         let env = HostEnvironment(sysRoot: tempRoot, bootKCPath: "/kcs/BootKernelExtensions.kc", systemKCPath: "/kcs/SystemKernelExtensions.kc", runner: mock, effectiveUID: 0)
         // Copy synthetic kcs under tempRoot/kcs already in fix.dir! Notice fix.dir IS tempRoot/kcs!
         let readyRep = PreflightChecker.run(env: env, payloadURL: fix.payloadDir)
-        check("Preflight ready Navi 44", readyRep.overallStatus == .ready && readyRep.canInstall && readyRep.barRecommendation == .full16G)
+        check("Preflight ready Navi 44", readyRep.overallStatus == .ready && readyRep.canInstall && readyRep.barRecommendation == .fullBar)
 
         // Preflight SIP required
         mock.csrutilStatus = "System Integrity Protection status: enabled."
@@ -822,7 +822,12 @@ struct GarnetCoreTestsRunner {
             }
         }
 
-        try verifyCase("valid-16g", makeOCPlist(), mode: .mode16g, expectValid: true, expectWarn: false)
+        check("OpenCoreMode rejects legacy '16g'", OpenCoreMode(rawValue: "16g") == nil)
+        check("OpenCoreMode accepts 'full'", OpenCoreMode(rawValue: "full") == .full)
+        check("BARRecommendation rejects legacy '16g-full-bar'", BARRecommendation(rawValue: "16g-full-bar") == nil)
+        check("BARRecommendation accepts 'full-bar'", BARRecommendation(rawValue: "full-bar") == .fullBar)
+
+        try verifyCase("valid-full", makeOCPlist(), mode: .full, expectValid: true, expectWarn: false)
         try verifyCase("valid-small", makeOCPlist(
             exts: [("Lilu.kext", true), ("GarnetPCIBarCompat.kext", false)],
             resizeApple: 0, resizeUefi: 0,
@@ -830,23 +835,23 @@ struct GarnetCoreTestsRunner {
         ), mode: .modeSmall, expectValid: true)
 
         // 10+ invalid config cases
-        try verifyCase("bad-garnet-in-oc", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("Garnet.kext", true)]), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-accel-in-oc", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("GarnetAccel.kext", true)]), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-legacy-kext", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("AMDRadeonRDNA4.kext", true)]), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-missing-pcibar-16g", makeOCPlist(exts: [("Lilu.kext", true)]), mode: .mode16g, expectValid: false)
+        try verifyCase("bad-garnet-in-oc", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("Garnet.kext", true)]), mode: .full, expectValid: false)
+        try verifyCase("bad-accel-in-oc", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("GarnetAccel.kext", true)]), mode: .full, expectValid: false)
+        try verifyCase("bad-legacy-kext", makeOCPlist(exts: [("GarnetPCIBarCompat.kext", true), ("AMDRadeonRDNA4.kext", true)]), mode: .full, expectValid: false)
+        try verifyCase("bad-missing-pcibar-16g", makeOCPlist(exts: [("Lilu.kext", true)]), mode: .full, expectValid: false)
         try verifyCase("bad-pcibar-enabled-small", makeOCPlist(
             exts: [("GarnetPCIBarCompat.kext", true)],
             resizeApple: 0, resizeUefi: 0,
             bootArgs: "-v npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80"
         ), mode: .modeSmall, expectValid: false)
-        try verifyCase("bad-secureboot", makeOCPlist(secureBoot: "Default"), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-csr-config", makeOCPlist(csrHex: "00000000"), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-missing-delete", makeOCPlist(deleteKeys: ["boot-args"]), mode: .mode16g, expectValid: false)
-        try verifyCase("warn-missing-apps-all", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80 garnet-full-bar=1"), mode: .mode16g, expectValid: true, expectWarn: true)
-        try verifyCase("bad-missing-required-boot-arg", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-npci-with-16g", makeOCPlist(bootArgs: "npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-resize-apple-16g", makeOCPlist(resizeApple: 0), mode: .mode16g, expectValid: false)
-        try verifyCase("bad-increase-pci-bar", makeOCPlist(increasePciBar: true), mode: .mode16g, expectValid: false)
+        try verifyCase("bad-secureboot", makeOCPlist(secureBoot: "Default"), mode: .full, expectValid: false)
+        try verifyCase("bad-csr-config", makeOCPlist(csrHex: "00000000"), mode: .full, expectValid: false)
+        try verifyCase("bad-missing-delete", makeOCPlist(deleteKeys: ["boot-args"]), mode: .full, expectValid: false)
+        try verifyCase("warn-missing-apps-all", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: true, expectWarn: true)
+        try verifyCase("bad-missing-required-boot-arg", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
+        try verifyCase("bad-npci-with-16g", makeOCPlist(bootArgs: "npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
+        try verifyCase("bad-resize-apple-16g", makeOCPlist(resizeApple: 0), mode: .full, expectValid: false)
+        try verifyCase("bad-increase-pci-bar", makeOCPlist(increasePciBar: true), mode: .full, expectValid: false)
     }
 
     static func runOpenCoreConfigureTests(tempRoot: URL) throws {
@@ -876,7 +881,7 @@ struct GarnetCoreTestsRunner {
         try writePlist(initialPlist, to: cfgURL)
         let origSHA = try PayloadVerifier.sha256Hex(fileURL: cfgURL)
 
-        let res16 = try OpenCoreValidator.configure(targetURL: efi16, mode: .mode16g, payloadURL: payloadDir)
+        let res16 = try OpenCoreValidator.configure(targetURL: efi16, mode: .full, payloadURL: payloadDir)
         let backupSHA = try PayloadVerifier.sha256Hex(fileURL: URL(fileURLWithPath: res16.backupPath))
         check("OC configure 16g backup exists with original SHA", fm.fileExists(atPath: res16.backupPath) && backupSHA == origSHA)
         check("OC configure 16g copied GarnetPCIBarCompat.kext", fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/GarnetPCIBarCompat.kext/Contents/MacOS/GarnetPCIBarCompat").path))
@@ -899,7 +904,7 @@ struct GarnetCoreTestsRunner {
         )
 
         // 2. Idempotency
-        let res16Again = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .mode16g, payloadURL: payloadDir)
+        let res16Again = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .full, payloadURL: payloadDir)
         let againRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgURL), options: [], format: nil) as? [String: Any] ?? [:]
         let againAdd = ((againRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
         let againCompatCount = againAdd.filter { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }.count
@@ -927,7 +932,7 @@ struct GarnetCoreTestsRunner {
         let symLink = tempRoot.appendingPathComponent("link-config.plist")
         try fm.createSymbolicLink(at: symLink, withDestinationURL: symTarget)
         var refusedSym = false
-        do { _ = try OpenCoreValidator.configure(targetURL: symLink, mode: .mode16g, payloadURL: payloadDir) } catch { refusedSym = true }
+        do { _ = try OpenCoreValidator.configure(targetURL: symLink, mode: .full, payloadURL: payloadDir) } catch { refusedSym = true }
         let targetPostSHA = try PayloadVerifier.sha256Hex(fileURL: symTarget)
         check("OC configure refuses symlink and leaves target untouched", refusedSym && targetPreSHA == targetPostSHA)
     }
@@ -1035,6 +1040,10 @@ struct GarnetCoreTestsRunner {
         // Status & sanitized diagnostics export
         let st = DiagnosticsManager.collectStatus(env: env)
         check("Status parses driver/BAR/compat/denylist", st.driverLoaded && st.accelLoaded && st.pciBarCompatLoaded && st.bar0CurrentMB == 16384 && st.iopciCompatMatchMode == "exact-uuid" && st.vulkanInstalled && st.denylistCount >= 2)
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 8192\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
+        let st8g = DiagnosticsManager.collectStatus(env: env)
+        check("Status parses 8 GiB BAR0 CurrentMB", st8g.bar0CurrentMB == 8192)
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
         let diagOut = tempRoot.appendingPathComponent("diag.tar.gz")
         _ = try DiagnosticsManager.exportSanitizedDiagnostics(toArchive: diagOut, env: env, payloadURL: fix.payloadDir)
         check("Diagnostics archive created", fm.fileExists(atPath: diagOut.path))

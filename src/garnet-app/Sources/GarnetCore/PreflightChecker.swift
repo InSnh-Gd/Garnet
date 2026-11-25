@@ -7,7 +7,7 @@ public enum PreflightStatus: String, Codable, Equatable, Sendable {
 }
 
 public enum BARRecommendation: String, Codable, Equatable, Sendable {
-    case full16G = "16g-full-bar"
+    case fullBar = "full-bar"
     case small256M = "256m-small-bar"
 }
 
@@ -121,7 +121,7 @@ public enum PreflightChecker {
             ))
         }
 
-        // IOPCIFamily compatibility + PFM64 check -> 16 GiB Full-BAR vs 256 MiB Small-BAR recommendation
+        // IOPCIFamily compatibility + PFM64 check -> Full-BAR (8/16 GiB) vs 256 MiB Small-BAR recommendation
         let bootKCFile = env.url(forSystemPath: env.bootKCPath).path
         let compat = PCIBarCompatCheck.checkBootKC(path: bootKCFile)
         checks.append(PreflightCheckItem(
@@ -130,7 +130,7 @@ public enum PreflightChecker {
             level: compat.compatible ? "PASS" : "WARN",
             detail: compat.compatible
                 ? "Compatible via \(compat.mode.rawValue) (UUID \(compat.iopciFamilyUUID ?? "?"), entry \(compat.entryHdrOffsetHex ?? "?"))"
-                : "Not compatible for 16G hook (\(compat.status), UUID \(compat.iopciFamilyUUID ?? "?")); recommend 256 MiB Small-BAR fallback"
+                : "Not compatible for Full-BAR hook (\(compat.status), UUID \(compat.iopciFamilyUUID ?? "?")); recommend 256 MiB Small-BAR fallback"
         ))
 
         // Check if current running session has GarnetDriver/PFM64 hints or small-BAR fallback indicator
@@ -141,12 +141,12 @@ public enum PreflightChecker {
         let barRec: BARRecommendation
         let barReason: String
         if compat.compatible && !pfm64Insufficient {
-            barRec = .full16G
-            barReason = "Recommended default: 16 GiB Full-BAR (IOPCIFamily verified via \(compat.mode.rawValue)); confirm BIOS Above 4G Decoding & Re-Size BAR are Enabled."
+            barRec = .fullBar
+            barReason = "Recommended default: Full-BAR (8/16 GiB; IOPCIFamily verified via \(compat.mode.rawValue)); confirm BIOS Above 4G Decoding & Re-Size BAR are Enabled."
         } else {
             barRec = .small256M
             if pfm64Insufficient {
-                barReason = "Fallback to 256 MiB Small-BAR recommended: host bridge 64-bit PFM64 window insufficient for 16 GiB aperture."
+                barReason = "Fallback to 256 MiB Small-BAR recommended: host bridge 64-bit PFM64 window insufficient for Full-BAR aperture."
             } else {
                 barReason = "Fallback to 256 MiB Small-BAR recommended: IOPCIFamily (\(compat.status)) did not match structural/exact-uuid gates."
             }
