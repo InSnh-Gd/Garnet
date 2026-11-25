@@ -11,6 +11,7 @@
 #include "amd/rdna4_log.h"
 #include "amd/smu_dal_pure.h"
 #include "dcn/dcn.hpp"
+#include "dcn/dcn41_dpms_pure.h"
 #include "dcn/dcn41_modeset.h"
 #include "dcn/dispread_flow.h"
 #include "dcn41_allow_ranges.h"
@@ -751,7 +752,8 @@ bool AMDGarnetPrimaryFramebuffer::readLiveHardwareEdid(IOPCIDevice *pci, GarnetD
 }
 
 __attribute__((noinline))
-bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::DetailedTiming &target) {
+bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::DetailedTiming &target,
+                                                    bool forceRetrain) {
 	if (!fPci || !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid || !fDpcdCaps.valid)
 		return false;
 	GarnetDriver *driver = retain_driver();
@@ -794,7 +796,7 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 
 	const rdna4modeset::ApplyResult r = rdna4modeset::applyMode(
 	    hw, fActiveOutput, fDpcdCaps, target, fMaxDispClkKhz, fMaxDppClkKhz,
-	    /*allowRetrain=*/true, /*allowDsc=*/true);
+	    /*allowRetrain=*/true, /*allowDsc=*/true, forceRetrain);
 
 	if (r.status == rdna4modeset::kOk) {
 		(void)rdna4aux::readDpcdCaps(hw.auxIo, fActiveOutput.aux, fActiveOutput.hpd, &fDpcdCaps);
@@ -842,6 +844,154 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 	return r.status == rdna4modeset::kOk;
 }
 
+__attribute__((noinline))
+bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriver) {
+	if (!fDpmsAllowed || fStopping || !fPci || !fDpmsLock ||
+	    !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid) {
+		return false;
+	}
+	IOLockLock(fDpmsLock);
+	if (wantOn && !fDpmsOff) {
+		IOLockUnlock(fDpmsLock);
+		return true;
+	}
+	if (!wantOn && fDpmsOff) {
+		IOLockUnlock(fDpmsLock);
+		return true;
+	}
+
+	GarnetDriver *driver = knownDriver ? knownDriver : retain_driver();
+	const bool ownDriver = (knownDriver == nullptr && driver != nullptr);
+
+	if (!wantOn) {
+		// Pause hardware VBL IRQ + timer while display sleeps.
+		syncHardwareVbl(false);
+		if (fVblTimer) {
+			fVblTimer->disable();
+			fVblTimer->cancelTimeout();
+		}
+		if (fCursorLock) {
+			IOLockLock(fCursorLock);
+			fDpmsSavedCursorVisible = fCursorVisible;
+			if (fCursorHwAvailable) {
+				disableCursorLocked(driver);
+				fCursorNeedsProgram = true;
+			}
+			IOLockUnlock(fCursorLock);
+		}
+
+		bool ok = false;
+		auto *ctx = static_cast<ModesetCtx *>(IOMalloc(sizeof(ModesetCtx)));
+		if (ctx) {
+			bzero(ctx, sizeof(*ctx));
+			if (acquire_mmio(fPci, driver, &ctx->mmio)) {
+				ctx->out = fActiveOutput;
+				rdna4modeset::Hw hw {};
+				hw.cookie = ctx;
+				hw.rdSeg = modeset_rd_seg;
+				hw.wrSeg = modeset_wr_seg;
+				hw.phyControl = modeset_phy_control;
+				hw.nowUs = aux_now_us;
+				hw.delayUs = aux_delay_us;
+				hw.auxIo = rdna4aux::Io { &ctx->mmio, aux_mmio_read, aux_mmio_write,
+				                          aux_now_us, aux_delay_us };
+				const rdna4dpms::OffResult off = rdna4dpms::dpmsOff(hw, fActiveOutput);
+				ok = off.streamBlanked || off.phyDisabled;
+				RDNA4LOG("primaryfb: DPMS OFF (blank=%u phyOff=%u d3=%u, OTG%u DIG%u AUX%u)",
+				         off.streamBlanked ? 1u : 0u, off.phyDisabled ? 1u : 0u,
+				         off.sinkD3Written ? 1u : 0u,
+				         fActiveOutput.otg, fActiveOutput.dig, fActiveOutput.aux);
+				release_mmio(ctx->mmio);
+			}
+			IOFree(ctx, sizeof(ModesetCtx));
+		}
+		if (ok) fDpmsOff = true;
+		if (ownDriver) driver->release();
+		IOLockUnlock(fDpmsLock);
+		return ok;
+	}
+
+	// DPMS ON: restore AUX pads -> DPCD D0 -> forced link/DSC retrain -> restore cursor & VBL.
+	auto *ctx = static_cast<ModesetCtx *>(IOMalloc(sizeof(ModesetCtx)));
+	if (ctx) {
+		bzero(ctx, sizeof(*ctx));
+		if (acquire_mmio(fPci, driver, &ctx->mmio)) {
+			ctx->out = fActiveOutput;
+			rdna4modeset::Hw hw {};
+			hw.cookie = ctx;
+			hw.rdSeg = modeset_rd_seg;
+			hw.wrSeg = modeset_wr_seg;
+			hw.nowUs = aux_now_us;
+			hw.delayUs = aux_delay_us;
+			hw.auxIo = rdna4aux::Io { &ctx->mmio, aux_mmio_read, aux_mmio_write,
+			                          aux_now_us, aux_delay_us };
+			const rdna4ddcpad::DdcPadHw padHw { &ctx->mmio, cursor_rd_seg2, cursor_wr_seg2, ddcpad_sleep_ms };
+			const rdna4dpms::WakePrepResult prep = rdna4dpms::dpmsWakePrepare(hw, fActiveOutput, &padHw);
+			RDNA4LOG("primaryfb: DPMS ON wake prep (auxPad=%u d0=%u)",
+			         prep.auxPadRestored ? 1u : 0u, prep.sinkD0Written ? 1u : 0u);
+			release_mmio(ctx->mmio);
+		}
+		IOFree(ctx, sizeof(ModesetCtx));
+	}
+
+	rdna4edidmodes::DetailedTiming curTiming {};
+	bool woke = false;
+	if (rdna4fbprimary::modeForId(fModeTable, fCurrentMode, &curTiming)) {
+		woke = applyHardwareMode(curTiming, /*forceRetrain=*/true);
+	}
+	fDpmsOff = false;
+	if (woke) {
+		RDNA4LOG("primaryfb: DPMS ON retrain OK (%ux%u@%u.%03uHz, rate=0x%02x, dsc=%u)",
+		         curTiming.width, curTiming.height,
+		         curTiming.refreshMilliHz() / 1000u, curTiming.refreshMilliHz() % 1000u,
+		         fActiveLinkRate, fActiveDscOn ? 1u : 0u);
+	} else {
+		RDNA4LOG("primaryfb: DPMS ON retrain FAILED (modeId=%d)", static_cast<int>(fCurrentMode));
+	}
+
+	if (fCursorLock) {
+		IOLockLock(fCursorLock);
+		if (fCursorHwAvailable) {
+			fCursorNeedsProgram = true;
+			if (fDpmsSavedCursorVisible && fCursorW > 0u && fCursorH > 0u) {
+				MmioAccess mmio {};
+				if (acquire_mmio(fPci, driver, &mmio)) {
+					const rdna4cursor::CursorHw hw { &mmio, cursor_rd_seg2, cursor_wr_seg2 };
+					const rdna4cursor::CursorPlaneConfig cfg {
+						fCursorPipe, fCursorMcAddr, fCursorW, fCursorH,
+						fCursorX, fCursorY, fCursorHotX, fCursorHotY,
+						currentPixelClockKhz(), true,
+					};
+					if (rdna4cursor::program_cursor_plane(hw, cfg)) {
+						fCursorVisible = true;
+						fCursorNeedsProgram = false;
+					}
+					release_mmio(mmio);
+				}
+			}
+		}
+		IOLockUnlock(fCursorLock);
+	}
+
+	bool vblWanted = false;
+	if (fVblLock) {
+		IOLockLock(fVblLock);
+		vblWanted = fVblEnabled && !fStopping;
+		IOLockUnlock(fVblLock);
+	}
+	if (vblWanted) {
+		syncHardwareVbl(true);
+		if (fVblTimer) {
+			fVblTimer->enable();
+			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+		}
+	}
+
+	if (ownDriver) driver->release();
+	IOLockUnlock(fDpmsLock);
+	return woke;
+}
+
 void AMDGarnetPrimaryFramebuffer::readProviderEdid(IOService *provider) {
 	fEdidLen = 0u;
 	bzero(fEdid, sizeof(fEdid));
@@ -877,6 +1027,10 @@ void AMDGarnetPrimaryFramebuffer::free() {
 	if (fCursorLock) {
 		IOLockFree(fCursorLock);
 		fCursorLock = nullptr;
+	}
+	if (fDpmsLock) {
+		IOLockFree(fDpmsLock);
+		fDpmsLock = nullptr;
 	}
 	super::free();
 }
@@ -921,6 +1075,16 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 
 	fPowerState = 2u;
 	fConnPower = 1u;
+	fDpmsOff = false;
+	fDpmsSavedCursorVisible = false;
+	{
+		uint32_t dpmsArg = 1u;
+		const bool present = PE_parse_boot_argn("garnet-dpms", &dpmsArg, sizeof(dpmsArg));
+		fDpmsAllowed = rdna4dpms::boot_arg_enabled(present, dpmsArg);
+		if (!fDpmsAllowed) {
+			RDNA4LOG("primaryfb: hardware DPMS disabled by boot-arg garnet-dpms=0");
+		}
+	}
 	fPmRegistered = false;
 	fPeerRegistered = false;
 	fPeerGeneration = 0u;
@@ -954,6 +1118,10 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 	if (!fCursorLock) {
 		fCursorLock = IOLockAlloc();
 		if (!fCursorLock) return false;
+	}
+	if (!fDpmsLock) {
+		fDpmsLock = IOLockAlloc();
+		if (!fDpmsLock) return false;
 	}
 	{
 		GarnetDriver *cursorDriver = retain_driver();
@@ -1112,7 +1280,7 @@ uint32_t AMDGarnetPrimaryFramebuffer::vblInitialTimeoutUs() const {
 }
 
 void AMDGarnetPrimaryFramebuffer::syncHardwareVbl(bool want) {
-	if (!want || !fVblIrqAllowed || fStopping) {
+	if (!want || !fVblIrqAllowed || fStopping || fDpmsOff) {
 		uint32_t otg = 0u;
 		if (fVblLock) IOLockLock(fVblLock);
 		otg = fVblOtg;
@@ -1398,12 +1566,18 @@ IOReturn AMDGarnetPrimaryFramebuffer::getStartupDisplayMode(IODisplayModeID *dis
 IOReturn AMDGarnetPrimaryFramebuffer::setAttribute(IOSelect attribute, uintptr_t value) {
 	if (attribute == kIOPowerAttribute) {
 		const uint32_t next = static_cast<uint32_t>(value);
-		if (next < 2u && fPowerState >= 2u) {
+		const uint32_t prev = fPowerState;
+		if (next < 2u && prev >= 2u) {
 			handleEvent(kIOFBNotifyWillPowerOff, nullptr);
-		} else if (next >= 2u && fPowerState < 2u) {
+			fPowerState = next;
+			(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
+		} else if (next >= 2u && prev < 2u) {
+			fPowerState = next;
+			(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
 			handleEvent(kIOFBNotifyDidPowerOn, nullptr);
+		} else {
+			fPowerState = next;
 		}
-		fPowerState = next;
 		return kIOReturnSuccess;
 	}
 	return super::setAttribute(attribute, value);
@@ -1457,6 +1631,7 @@ IOReturn AMDGarnetPrimaryFramebuffer::setAttributeForConnection(IOIndex connectI
 	if (connectIndex != 0) return kIOReturnBadArgument;
 	if (attribute == kConnectionPower) {
 		fConnPower = static_cast<uint32_t>(value);
+		(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
 		return kIOReturnSuccess;
 	}
 	return super::setAttributeForConnection(connectIndex, attribute, value);
@@ -1855,6 +2030,10 @@ IOReturn AMDGarnetPrimaryFramebuffer::setCursorState(SInt32 x, SInt32 y, bool vi
 
 void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
 	if (fStopping) return;
+	if (fDpmsOff && rdna4dpms::should_be_on(fPowerState, fConnPower)) {
+		(void)applyDpms(true, driver);
+		return;
+	}
 	if (fPci && fActiveOutput.found && fActiveOutput.isDp && fActiveOutput.auxValid &&
 	    fActiveOutput.aux < rdna4ddcpad::kMaxDdcLines) {
 		MmioAccess mmio {};

@@ -621,6 +621,27 @@ void testFailureRollbacksRestoreExactState() {
 		assert(mock.dpcd[0x0160u] == 0x00u);
 		assert(mock.deniedWrites == 0u);
 	}
+
+	// Case D (Stage 3B): forceRetrain=true retrains DP link & rebinds DIG even on same rate (DPMS wake)
+	{
+		MockDcn mock;
+		mock.initLiveMiMonitor4k60();
+		const auto t60 = rdna4edidmodes::makeCvtRb2Timing(3840u, 2160u, 60u, 352000u, 1420000000ULL);
+		const uint32_t db = out.dig * rdna4modeset::kSeg2DigStride;
+		// Simulate post-DPMS-off blanked stream & cleared DIG enables
+		mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0VidStreamCntl + db] = 0x00000200u;
+		mock.regs[kSeg2 + rdna4modeset::kSeg2Dig0BeEnCntl + db] = 0u;
+		mock.regs[kSeg2 + rdna4modeset::kSeg2Dig0FeEnCntl + db] = 0u;
+		const auto r = rdna4modeset::applyMode(mock.makeHw(), out, dpcd, t60, 1900000u, 1800000u,
+		                                       /*allowRetrain=*/true, /*allowDsc=*/true,
+		                                       /*forceRetrain=*/true);
+		assert(r.status == rdna4modeset::kOk && !r.rolledBack);
+		assert(mock.phyEnableCalls == 1u && mock.lastPhyRate == 0x14u);
+		assert((mock.regs[kSeg2 + rdna4modeset::kSeg2Dig0BeEnCntl + db] & 1u) != 0u);
+		assert((mock.regs[kSeg2 + rdna4modeset::kSeg2Dig0FeEnCntl + db] & 1u) != 0u);
+		assert((mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0VidStreamCntl + db] & 0x10001u) == 0x10001u);
+		assert(mock.deniedWrites == 0u);
+	}
 }
 
 }  // namespace

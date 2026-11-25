@@ -1075,7 +1075,8 @@ inline ApplyResult applyMode(const Hw &hw, const rdna4aux::ActiveOutput &out,
                              const rdna4aux::DpcdCaps &dpcd,
                              const rdna4edidmodes::DetailedTiming &target,
                              uint32_t maxDispClkKhz, uint32_t maxDppClkKhz,
-                             bool allowRetrain = true, bool allowDsc = true) {
+                             bool allowRetrain = true, bool allowDsc = true,
+                             bool forceRetrain = false) {
 	ApplyResult res { kInvalid, 0u, LinkTier::Unsupported, false };
 	if (!hw.rdSeg || !hw.wrSeg || !hw.nowUs || !hw.delayUs || !out.found || !out.isDp || out.otg >= 4u || out.dig >= 4u)
 		return res;
@@ -1359,8 +1360,8 @@ inline ApplyResult applyMode(const Hw &hw, const rdna4aux::ActiveOutput &out,
 	}
 	stopOtg();
 
-	// 3. Retrain DP link if rate or FEC state changed, then re-bind DIG FE <-> BE.
-	if (plan.targetLinkRate != snap.linkRate || plan.useFec != snap.fecWasOn) {
+	// 3. Retrain DP link if rate or FEC state changed, or when forced (e.g. DPMS wake), then re-bind DIG FE <-> BE.
+	if (forceRetrain || plan.targetLinkRate != snap.linkRate || plan.useFec != snap.fecWasOn) {
 		if (!trainDpLink(hw, out, dpcd, plan.targetLinkRate, plan.targetLanes, plan.useFec)) {
 			res.status = kLinkTrainFailed;
 			rollback();

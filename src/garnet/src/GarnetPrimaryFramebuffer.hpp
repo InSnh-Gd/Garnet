@@ -90,7 +90,8 @@ private:
 	bool readLiveHardwareEdid(IOPCIDevice *pci, GarnetDriver *driver);
 	void queryClockCaps(IOPCIDevice *pci, GarnetDriver *driver);
 	void rebuildModeTable(uint32_t w, uint32_t h, uint32_t rb);
-	bool applyHardwareMode(const rdna4edidmodes::DetailedTiming &target);
+	bool applyHardwareMode(const rdna4edidmodes::DetailedTiming &target, bool forceRetrain = false);
+	bool applyDpms(bool wantOn, GarnetDriver *knownDriver = nullptr);
 	bool captureConsoleAndBar0(IOPCIDevice *pci);
 	bool ensureVblTimer();
 	void teardownVblTimer();
@@ -123,6 +124,10 @@ private:
 	IOIndex fCurrentDepth { 0 };
 	uint32_t fPowerState { 2u };
 	uint32_t fConnPower { 1u };
+	IOLock *fDpmsLock { nullptr };
+	bool fDpmsAllowed { true };
+	bool fDpmsOff { false };
+	bool fDpmsSavedCursorVisible { false };
 	bool fPmRegistered { false };
 	bool fPeerRegistered { false };
 	uint64_t fPeerGeneration { 0u };
