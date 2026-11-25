@@ -796,11 +796,17 @@ __attribute__((unused)) GARNET_INTERNAL void rdna4_rt_dc_push_accel_sig(
 @end
 
 GARNET_INTERNAL char rdna4_rt_arg_owners_key;
+static _Atomic uint32_t rdna4_rt_arg_owners_seen;
+
+GARNET_INTERNAL BOOL rdna4_rt_any_arg_owners(void) {
+    return atomic_load_explicit(&rdna4_rt_arg_owners_seen, memory_order_acquire) != 0u;
+}
 
 __attribute__((unused)) GARNET_INTERNAL void rdna4_rt_arg_note(
     RDNA4Buffer *dst, id accelStruct, RDNA4IntersectionFunctionTable *ift, RDNA4Buffer *nestedBuf)
 {
     if (!dst || (!accelStruct && !ift && !nestedBuf)) return;
+    atomic_store_explicit(&rdna4_rt_arg_owners_seen, 1u, memory_order_release);
     @synchronized (dst) {
         RDNA4RTArgOwners *owners = objc_getAssociatedObject(dst, &rdna4_rt_arg_owners_key);
         if (!owners) {
@@ -838,7 +844,7 @@ static void rdna4_rt_retain_argbuf_walk(RDNA4Buffer *buf, id cb, NSMutableSet *v
 }
 
 __attribute__((unused)) GARNET_INTERNAL void rdna4_rt_retain_argbuf_resources(RDNA4Buffer *buf, id cb) {
-    if (!buf || !cb) return;
+    if (!buf || !cb || !rdna4_rt_any_arg_owners()) return;
     NSMutableSet *visited = [NSMutableSet set];
     rdna4_rt_retain_argbuf_walk(buf, cb, visited);
 }

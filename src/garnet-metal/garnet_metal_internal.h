@@ -63,6 +63,7 @@
 #include "garnet_argument_descriptor_scan.h"
 #include "garnet_argument_capacity.h"
 #include "garnet_argument_epochs.h"
+#include "garnet_vkpool.h"
 #include "garnet_argument_summary.h"
 #include "garnet_plane.h"
 #include "garnet_pitch.h"
@@ -172,7 +173,7 @@ typedef struct { uint64_t bits; } RDNA4ReflectionFlags;
 
 // ---- Shared internal macros ----
 #define RDNA4LOG(fmt, ...) rdna4_log(fmt, ##__VA_ARGS__)
-#define RDNA4LOGR(fmt, ...) do { static _Atomic uint64_t n_; uint64_t k_ = atomic_fetch_add(&n_, 1); if (k_ < 8 || (k_ & 1023) == 0) rdna4_log(fmt, ##__VA_ARGS__); } while (0)
+#define RDNA4LOGR(fmt, ...) do { static _Atomic uint64_t n_; uint64_t k_ = atomic_fetch_add_explicit(&n_, 1, memory_order_relaxed); if (k_ < 8 || (k_ & 1023) == 0) rdna4_log(fmt, ##__VA_ARGS__); } while (0)
 #define RDNA4_ONCE(fmt, ...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) RDNA4LOG(fmt, ##__VA_ARGS__); } while (0)
 #define RDNA4_DNR(cls) \
     - (void)doesNotRecognizeSelector:(SEL)sel { \
@@ -251,7 +252,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
     X(vkCreateBufferView) X(vkDestroyBufferView) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
-    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) \
+    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) X(vkResetCommandBuffer) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateRenderPass) X(vkDestroyRenderPass) \
@@ -629,10 +630,18 @@ typedef struct {
     float timestampPeriod;
     uint32_t timestampValidBits;
     BOOL sparseBinding, sparseResidencyBuffer, sparseResidencyImage2D, sparseResidencyImage3D;
+    // Stage 2B: real Vulkan entry points captured at radv open; pooling bypasses when test hooks override them.
+    PFN_vkCreateFence realCreateFence;
+    PFN_vkDestroyFence realDestroyFence;
+    PFN_vkResetFences realResetFences;
+    PFN_vkAllocateCommandBuffers realAllocCmd;
+    PFN_vkFreeCommandBuffers realFreeCmd;
+    PFN_vkResetCommandBuffer realResetCmd;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
-typedef struct { BOOL on; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;
-    PFN_vkGetBufferMemoryRequirements2 bmr2; PFN_vkGetImageMemoryRequirements2 imr2; PFN_vkResetDescriptorPool rdp; } RDNA4PoolState;
+typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;
+    PFN_vkGetBufferMemoryRequirements2 bmr2; PFN_vkGetImageMemoryRequirements2 imr2; PFN_vkResetDescriptorPool rdp;
+    garnet_vkpool_t fences; garnet_vkpool_t oneshotCmds; } RDNA4PoolState;
 typedef struct { BOOL on; pthread_mutex_t mu; rdna4dc_rpcache *rp; _Atomic uint64_t draws, setsReused, setsAlloc, pipesSkipped, pipesBound, pcHits, rpHits, rpCreated, rpUncached; uint64_t lastSig; } RDNA4DrawOptState;
 typedef struct { pthread_mutex_t mu; rdna4l L; int ucMode, iaActs; _Atomic uint64_t iaFlush, iaReup, iaWsFlush, iaWsReup, f1Fallbacks, ucTake, ucRelease; uint64_t lastSig; } RDNA4LedgerState;
 typedef struct {
@@ -1095,6 +1104,7 @@ typedef struct {
     rdna4vft_reflection_t _vftV, _vftF;
     uint64_t _iftOwnerToken;
     rdna4rtr_reflection_t _rtV, _rtF;
+    BOOL _hasAddressRegistry;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
@@ -1121,6 +1131,7 @@ typedef struct {
 - (const RDNA4ArgumentTables *)argumentTables;
 - (const rdna4_argument_scan_reflection_plan *)scanPlanV;
 - (const rdna4_argument_scan_reflection_plan *)scanPlanF;
+- (BOOL)rdna4HasAddressRegistry;
 - (const RDNA4PB *)pbV; - (uint32_t)npbV; - (const RDNA4PB *)pbF; - (uint32_t)npbF;
 - (const uint32_t *)needBindings; - (uint32_t)nNeed;
 - (BOOL)fetch; - (uint32_t)fetchMax;
@@ -1167,6 +1178,7 @@ typedef struct {
     rdna4vft_reflection_t _vft;
     uint64_t _iftOwnerToken;
     rdna4rtr_reflection_t _rt;
+    BOOL _hasAddressRegistry;
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err;
@@ -1191,6 +1203,7 @@ typedef struct {
 - (VkPipelineLayout)layout; - (VkDescriptorSetLayout)dsl; - (const RDNA4PB *)pb; - (uint32_t)npb;
 - (const RDNA4ArgumentTables *)argumentTables;
 - (const rdna4_argument_scan_reflection_plan *)scanPlan;
+- (BOOL)rdna4HasAddressRegistry;
 - (const uint32_t *)nominalLocal; - (int)mode; - (uint32_t)pcOffset; - (uint32_t)pcSize;
 - (id)reflection;
 - (void)rdna4SetReflection:(MTLComputePipelineReflection *)reflection;
@@ -1200,10 +1213,20 @@ typedef struct {
 - (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor;
 @end
 
+typedef struct {
+    uint64_t key;
+    CFTypeRef obj;
+    uint8_t snapshotted;
+} RDNA4ResBindEntry;
+
 @interface RDNA4ResourceBindings : NSObject {
-    NSMutableDictionary<NSNumber *, id> *_objects;
+    RDNA4ResBindEntry *_entries;
+    uint32_t _count, _cap;
+    uint64_t _lastCBId, _lastSegmentSerial;
+    BOOL _hasUnsnapshotted;
 }
 - (void)setObject:(id)object slot:(NSNumber *)slot;
+- (void)setObject:(id)object key:(uint64_t)key;
 - (void)clear;
 - (NSUInteger)count;
 - (void)snapshotToCommandBuffer:(RDNA4CommandBuffer *)commandBuffer;
@@ -1242,9 +1265,14 @@ typedef struct {
     NSMutableArray<RDNA4CommandBuffer *> *_pending;
     NSMutableArray *_residencySets;
     pthread_mutex_t _qmu;
+    garnet_vkpool_t _cmdPool;
+    _Atomic uint32_t _residencySetCount;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
 - (VkCommandPool)pool;
+- (VkCommandBuffer)rdna4TakeCmdBuf:(NSError **)err;
+- (void)rdna4GiveCmdBuf:(VkCommandBuffer)cmd;
+- (BOOL)rdna4HasResidencySets;
 - (dispatch_queue_t)rdna4CompletionQueue;
 - (void)rdna4Kick;
 - (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb;
@@ -1353,6 +1381,8 @@ typedef struct {
 - (void)rdna4RetainArgument:(id)object;
 - (void)rdna4RetainEncoded:(id)object;
 - (uint64_t)rdna4SegmentSerial;
+- (uint64_t)rdna4CBId;
+- (BOOL)rdna4HasResidency;
 - (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage;
 - (void)rdna4UseHeap:(id)heap;
 - (void)useResidencySet:(id)residencySet;
@@ -1436,6 +1466,9 @@ typedef struct {
     id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS];
     NSUInteger _csbEndV[RDNA4CNT_MAX_PASS_ATTACHMENTS], _csbEndF[RDNA4CNT_MAX_PASS_ATTACHMENTS];
     uint32_t _nCsbEnd;
+    uint32_t _dynDirty;
+    uint64_t _handlesSnapCBId, _handlesSnapSegSer;
+    __unsafe_unretained id _snapBaseHandles, _snapFetchHandles;
 }
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d;
 - (void)rdna4ReleaseRenderHandles;
@@ -3110,6 +3143,15 @@ GARNET_INTERNAL_EXTERN void rdna4_fence_close(uint64_t s);
 GARNET_INTERNAL_EXTERN BOOL rdna4_dp_give(VkDescriptorPool dp);
 GARNET_INTERNAL_EXTERN void rdna4_dp_created(void);
 GARNET_INTERNAL_EXTERN VkDescriptorPool rdna4_dp_take(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_cmd_pool_active(void);
+GARNET_INTERNAL_EXTERN VkResult rdna4_fence_take(VkFence *out);
+GARNET_INTERNAL_EXTERN void rdna4_fence_give(VkFence f);
+GARNET_INTERNAL_EXTERN VkResult rdna4_oneshot_cmd_take(VkCommandBuffer *out);
+GARNET_INTERNAL_EXTERN void rdna4_oneshot_cmd_give(VkCommandBuffer cmd);
+GARNET_INTERNAL_EXTERN void rdna4nc_note_readonly_buffer(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4nc_any_readonly_buffer(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_icb_any_arg_owners(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_any_arg_owners(void);
 GARNET_INTERNAL_EXTERN void rdna4_drawopt_latch(void);
 GARNET_INTERNAL_EXTERN void rdna4_drawopt_report(unsigned tick);
 GARNET_INTERNAL_EXTERN void rdna4_imp_latch(void);
@@ -3276,7 +3318,7 @@ GARNET_INTERNAL_EXTERN VkBufferView rdna4_dummy_null_texel(id dev, const rdna4ns
 GARNET_INTERNAL_EXTERN RDNA4SamplerState *rdna4_dummy_sampler(id dev);
 GARNET_INTERNAL_EXTERN void rdna4_each_tex(const RDNA4PB *pb, uint32_t n, const RDNA4StageState *st, id dev, void (^fn)(RDNA4Texture *t, VkImageLayout l, BOOL writable));
 GARNET_INTERNAL_EXTERN int rdna4_plan(const uint32_t threads[3], const uint32_t nom[3], RDNA4Region *out);
-GARNET_INTERNAL_EXTERN NSNumber *rdna4_resource_slot(uint32_t kind, BOOL fragment,
+GARNET_INTERNAL_EXTERN uint64_t rdna4_resource_slot_key(uint32_t kind, BOOL fragment,
                                      NSUInteger index);
 GARNET_INTERNAL_EXTERN BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
                                               uint64_t current);

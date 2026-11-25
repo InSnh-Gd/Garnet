@@ -25,7 +25,10 @@ GARNET_INTERNAL RDNA4PoolState RDNA4P = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_pool_latch(void) {
     static int done; if (done) return; done = 1;
     RDNA4P.on = access(RDNA4_POOL_FILE, F_OK) == 0 || access(RDNA4_POOL_FILE "-off", F_OK) != 0;   //: DEFAULT ON; /private/tmp/rdna4m-pool-off disables
+    RDNA4P.auditSubmit = getenv("RDNA4_AUDIT_SUBMIT") != NULL;
     rdna4p_init(&RDNA4P.p, RDNA4P.on);
+    garnet_vkpool_init(&RDNA4P.fences, GARNET_VKPOOL_FENCE_CAP);
+    garnet_vkpool_init(&RDNA4P.oneshotCmds, GARNET_VKPOOL_ONESHOT_CAP);
     RDNA4P.bmr2 = (PFN_vkGetBufferMemoryRequirements2)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetBufferMemoryRequirements2");
     RDNA4P.imr2 = (PFN_vkGetImageMemoryRequirements2)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetImageMemoryRequirements2");
     RDNA4P.rdp = (PFN_vkResetDescriptorPool)vkGetDeviceProcAddr(RDNA4R.dev, "vkResetDescriptorPool");
@@ -217,6 +220,93 @@ GARNET_INTERNAL VkDescriptorPool rdna4_dp_take(void) {   // VK_NULL_HANDLE: none
     if (!dp) return VK_NULL_HANDLE;
     if (RDNA4P.rdp(RDNA4R.dev, dp, 0) != VK_SUCCESS) { vkDestroyDescriptorPool(RDNA4R.dev, dp, NULL); return VK_NULL_HANDLE; }
     return dp;
+}
+
+static BOOL rdna4_fence_pool_active(void) {
+    return RDNA4P.on && !RDNA4P.auditSubmit && RDNA4R.ok && RDNA4R.realCreateFence != NULL &&
+        vkCreateFence == RDNA4R.realCreateFence &&
+        vkDestroyFence == RDNA4R.realDestroyFence &&
+        vkResetFences == RDNA4R.realResetFences;
+}
+
+GARNET_INTERNAL BOOL rdna4_cmd_pool_active(void) {
+    return RDNA4P.on && !RDNA4P.auditSubmit && RDNA4R.ok && RDNA4R.realAllocCmd != NULL &&
+        vkAllocateCommandBuffers == RDNA4R.realAllocCmd &&
+        vkFreeCommandBuffers == RDNA4R.realFreeCmd &&
+        RDNA4R.realResetCmd != NULL &&
+        vkResetCommandBuffer == RDNA4R.realResetCmd;
+}
+
+GARNET_INTERNAL VkResult rdna4_fence_take(VkFence *out) {
+    if (rdna4_fence_pool_active()) {
+        pthread_mutex_lock(&RDNA4P.mu);
+        VkFence cached = (VkFence)(uintptr_t)garnet_vkpool_pop(&RDNA4P.fences);
+        pthread_mutex_unlock(&RDNA4P.mu);
+        if (cached != VK_NULL_HANDLE) {
+            if (vkResetFences(RDNA4R.dev, 1, &cached) == VK_SUCCESS) {
+                *out = cached;
+                return VK_SUCCESS;
+            }
+            vkDestroyFence(RDNA4R.dev, cached, NULL);
+        }
+    }
+    VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    return vkCreateFence(RDNA4R.dev, &fc, NULL, out);
+}
+
+GARNET_INTERNAL void rdna4_fence_give(VkFence f) {
+    if (!f || !RDNA4R.ok) return;
+    if (rdna4_fence_pool_active()) {
+        pthread_mutex_lock(&RDNA4P.mu);
+        int kept = garnet_vkpool_push(&RDNA4P.fences, (uint64_t)(uintptr_t)f);
+        pthread_mutex_unlock(&RDNA4P.mu);
+        if (kept) return;
+    }
+    vkDestroyFence(RDNA4R.dev, f, NULL);
+}
+
+GARNET_INTERNAL VkResult rdna4_oneshot_cmd_take(VkCommandBuffer *out) {
+    if (rdna4_cmd_pool_active()) {
+        pthread_mutex_lock(&RDNA4P.mu);
+        VkCommandBuffer cached = (VkCommandBuffer)(uintptr_t)garnet_vkpool_pop(&RDNA4P.oneshotCmds);
+        pthread_mutex_unlock(&RDNA4P.mu);
+        if (cached != VK_NULL_HANDLE) {
+            *out = cached;
+            return VK_SUCCESS;
+        }
+    }
+    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = RDNA4R.opool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    rdna4_qlock();
+    VkResult r = vkAllocateCommandBuffers(RDNA4R.dev, &ai, out);
+    pthread_mutex_unlock(&RDNA4R.qlock);
+    return r;
+}
+
+GARNET_INTERNAL void rdna4_oneshot_cmd_give(VkCommandBuffer cmd) {
+    if (!cmd || !RDNA4R.ok) return;
+    if (rdna4_cmd_pool_active()) {
+        rdna4_qlock();
+        VkResult rr = vkResetCommandBuffer(cmd, 0);
+        pthread_mutex_unlock(&RDNA4R.qlock);
+        if (rr == VK_SUCCESS) {
+            pthread_mutex_lock(&RDNA4P.mu);
+            int kept = garnet_vkpool_push(&RDNA4P.oneshotCmds, (uint64_t)(uintptr_t)cmd);
+            pthread_mutex_unlock(&RDNA4P.mu);
+            if (kept) return;
+        }
+    }
+    rdna4_qlock();
+    vkFreeCommandBuffers(RDNA4R.dev, RDNA4R.opool, 1, &cmd);
+    pthread_mutex_unlock(&RDNA4R.qlock);
+}
+
+static _Atomic uint32_t rdna4nc_ro_buffers_seen;
+GARNET_INTERNAL void rdna4nc_note_readonly_buffer(void) {
+    atomic_store_explicit(&rdna4nc_ro_buffers_seen, 1u, memory_order_release);
+}
+GARNET_INTERNAL BOOL rdna4nc_any_readonly_buffer(void) {
+    return atomic_load_explicit(&rdna4nc_ro_buffers_seen, memory_order_acquire) != 0u;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -805,6 +895,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
     // A mapping that cannot be inspected is conservatively treated as non-writable.
     int protection = rdna4nc_host_readonly(p, len);
     _hostReadOnly = protection != 0;
+    if (_hostReadOnly) rdna4nc_note_readonly_buffer();
     if (protection < 0) RDNA4LOG("RDNA4Buffer %p: NO-COPY protection unknown, treating as read-only", (__bridge void *)self);
     if (_hostReadOnly) RDNA4LOG("RDNA4Buffer %p: NO-COPY %lu bytes at %p imported READ-ONLY (GPU writes will be dropped)",
                                (__bridge void *)self, (unsigned long)len, p);

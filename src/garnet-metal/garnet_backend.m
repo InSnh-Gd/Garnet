@@ -1433,6 +1433,12 @@ static BOOL rdna4_radv_open_once(NSError **err) {
 #define X(n) n = (PFN_##n)rdna4_gipa(RDNA4R.inst, #n); if (!n) RDNA4LOG("radv: %s not exposed", #n);
         RDNA4_VK_FUNCS(X)
 #undef X
+        RDNA4R.realCreateFence = vkCreateFence;
+        RDNA4R.realDestroyFence = vkDestroyFence;
+        RDNA4R.realResetFences = vkResetFences;
+        RDNA4R.realAllocCmd = vkAllocateCommandBuffers;
+        RDNA4R.realFreeCmd = vkFreeCommandBuffers;
+        RDNA4R.realResetCmd = vkResetCommandBuffer;
         rdna4_vkQueueWaitIdle = (PFN_vkQueueWaitIdle)rdna4_gipa(RDNA4R.inst, "vkQueueWaitIdle");
         rdna4_native_bridge.copy = (void *)dlsym(h, "radv_darwin_buffer_copy");
         rdna4_native_bridge.fill = (void *)dlsym(h, "radv_darwin_buffer_fill");

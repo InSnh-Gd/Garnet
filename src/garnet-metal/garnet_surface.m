@@ -77,17 +77,12 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
     }
     VkCommandBuffer c = VK_NULL_HANDLE; VkFence f = VK_NULL_HANDLE; VkResult r;
     BOOL submitAttempted = NO;
-    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = RDNA4R.opool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    rdna4_qlock();
-    r = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &c);
-    pthread_mutex_unlock(&RDNA4R.qlock);
+    r = rdna4_oneshot_cmd_take(&c);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(60, [NSString stringWithFormat:@"one-shot vkAllocateCommandBuffers = %d", r]); return NO; }
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     r = vkBeginCommandBuffer(c, &bi);
     if (r == VK_SUCCESS) { rec(c); r = vkEndCommandBuffer(c); }
-    VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    if (r == VK_SUCCESS) r = vkCreateFence(RDNA4R.dev, &fc, NULL, &f);
+    if (r == VK_SUCCESS) r = rdna4_fence_take(&f);
     if (r == VK_SUCCESS) {
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c };
         rdna4_qlock();
@@ -108,8 +103,12 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
         if (unresolved) *unresolved = YES;
     }
     else {
-        if (f) vkDestroyFence(RDNA4R.dev, f, NULL);
-        rdna4_qlock(); vkFreeCommandBuffers(RDNA4R.dev, RDNA4R.opool, 1, &c); pthread_mutex_unlock(&RDNA4R.qlock);
+        if (f) {
+            if (r == VK_SUCCESS || !submitAttempted) rdna4_fence_give(f);
+            else vkDestroyFence(RDNA4R.dev, f, NULL);
+        }
+        if (r == VK_SUCCESS || !submitAttempted) rdna4_oneshot_cmd_give(c);
+        else { rdna4_qlock(); vkFreeCommandBuffers(RDNA4R.dev, RDNA4R.opool, 1, &c); pthread_mutex_unlock(&RDNA4R.qlock); }
     }
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(61, [NSString stringWithFormat:@"one-shot submit/wait = %d%s", r, r == VK_ERROR_DEVICE_LOST ? " (DEVICE_LOST)" : r == VK_TIMEOUT ? " (TIMEOUT: HUNG?)" : ""]); return NO; }
     return YES;

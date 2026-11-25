@@ -493,6 +493,10 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         !rdna4_argument_stage_remap(&_argumentTables, _pbV, _npbV, &le) ||
         !rdna4_argument_stage_remap(&_argumentTables, _pbF, _npbF, &le)) {
         if (err) *err = le; free(rv); free(rf); return nil; }
+    for (uint32_t i = 0; i < _npbV; i++)
+        if (_pbV[i].addressTable && _pbV[i].addressTableVersion == RDNA4_BUFFER_REGISTRY_VERSION) _hasAddressRegistry = YES;
+    for (uint32_t i = 0; i < _npbF; i++)
+        if (_pbF[i].addressTable && _pbF[i].addressTableVersion == RDNA4_BUFFER_REGISTRY_VERSION) _hasAddressRegistry = YES;
     NSError *scanError = nil;
     if (!rdna4_argument_scan_plan_build(&_scanV, preV, mv_, "vertex", &scanError) ||
         !rdna4_argument_scan_plan_build(&_scanF, preF, mf_, "fragment", &scanError)) {
@@ -964,6 +968,7 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 - (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlanV { return &_scanV; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlanF { return &_scanF; }
+- (BOOL)rdna4HasAddressRegistry { return _hasAddressRegistry; }
 - (BOOL)fetch { return _fetch; } - (uint32_t)fetchMax { return _fetchMax; }
 - (const RDNA4PB *)pbV { return _pbV; } - (uint32_t)npbV { return _npbV; } - (const RDNA4PB *)pbF { return _pbF; } - (uint32_t)npbF { return _npbF; }
 - (const uint32_t *)needBindings { return _need; } - (uint32_t)nNeed { return _nneed; }
@@ -1194,6 +1199,8 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     }
     free(r);
     if (!ok) { if (err) *err = e; return nil; }
+    for (uint32_t i = 0; i < _npb; i++)
+        if (_pb[i].addressTable && _pb[i].addressTableVersion == RDNA4_BUFFER_REGISTRY_VERSION) _hasAddressRegistry = YES;
     if (!rdna4_argument_scan_plan_build(&_scan, preMeta, meta, "compute", &e)) {
         if (err) *err = e;
         return nil;
@@ -1465,6 +1472,7 @@ RDNA4_DNR(RDNA4ComputePipelineState)
 }
 - (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlan { return &_scan; }
+- (BOOL)rdna4HasAddressRegistry { return _hasAddressRegistry; }
 - (const uint32_t *)nominalLocal { return _local; } - (int)mode { return _mode; } - (uint32_t)pcOffset { return _pcOff; } - (uint32_t)pcSize { return _pcSize; }
 - (id)reflection { return _reflection; }
 - (void)rdna4SetReflection:(MTLComputePipelineReflection *)reflection { _reflection = reflection; }
@@ -1711,10 +1719,11 @@ GARNET_INTERNAL NSArray *rdna4nc_stage_arguments(id reflection, RDNA4NCOp stage)
 }
 GARNET_INTERNAL BOOL rdna4nc_stage_writes(const RDNA4StageState *state, NSArray *arguments, RDNA4NCOp op,
                                  const char *stage, uint32_t *warned) {
+    if (!rdna4nc_any_readonly_buffer()) return NO;
     BOOL drop = NO;
     for (unsigned i = 0; i < 31; i++) {
         RDNA4Buffer *buffer = state->buf[i].b;
-        if (![buffer rdna4HostReadOnly]) continue;
+        if (!buffer || ![buffer rdna4HostReadOnly]) continue;
         BOOL known = NO;
         for (MTLArgument *argument in arguments) {
             if (argument.type != MTLArgumentTypeBuffer || argument.index != i) continue;
@@ -2177,11 +2186,10 @@ GARNET_INTERNAL int rdna4_plan(const uint32_t threads[3], const uint32_t nom[3],
 #define RDNA4_ENCODER_BINDINGS_INC
 
 
-GARNET_INTERNAL NSNumber *rdna4_resource_slot(uint32_t kind, BOOL fragment,
+GARNET_INTERNAL uint64_t rdna4_resource_slot_key(uint32_t kind, BOOL fragment,
                                      NSUInteger index) {
-    uint64_t value = ((uint64_t)kind << 56) |
+    return ((uint64_t)kind << 56) |
         ((uint64_t)(fragment ? 1u : 0u) << 48) | (uint64_t)index;
-    return @(value);
 }
 
 GARNET_INTERNAL BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
@@ -2192,34 +2200,100 @@ GARNET_INTERNAL BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
 }
 
 /*
- * Current encoder state is bounded by the descriptor bands. The dictionary
- * owns only objects still bound to a slot; it is not a command-buffer history.
- * Every draw/dispatch snapshots these objects into the current segment.
+ * Current encoder state is bounded by the descriptor bands. The flat unboxed
+ * table owns only objects still bound to a slot; it is not a command-buffer
+ * history. Every draw/dispatch incrementally snapshots dirty entries into the
+ * current segment, and snapshots all entries when the command buffer or
+ * segment serial changes.
  */
 
 @implementation RDNA4ResourceBindings
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
-    _objects = [NSMutableDictionary dictionary];
     return self;
+}
+- (void)dealloc {
+    for (uint32_t i = 0; i < _count; i++) {
+        if (_entries[i].obj) CFRelease(_entries[i].obj);
+    }
+    free(_entries);
+}
+- (void)setObject:(id)object key:(uint64_t)key {
+    for (uint32_t i = 0; i < _count; i++) {
+        if (_entries[i].key != key) continue;
+        if (!object) {
+            CFRelease(_entries[i].obj);
+            _count--;
+            if (i < _count) _entries[i] = _entries[_count];
+            return;
+        }
+        if (_entries[i].obj == (__bridge CFTypeRef)object) return;
+        CFRelease(_entries[i].obj);
+        _entries[i].obj = (__bridge_retained CFTypeRef)object;
+        _entries[i].snapshotted = 0u;
+        _hasUnsnapshotted = YES;
+        return;
+    }
+    if (!object) return;
+    if (_count == _cap) {
+        uint32_t nextCap = _cap ? _cap * 2u : 16u;
+        RDNA4ResBindEntry *grown = realloc(_entries, (size_t)nextCap * sizeof(*grown));
+        if (!grown) return;
+        _entries = grown;
+        _cap = nextCap;
+    }
+    _entries[_count++] = (RDNA4ResBindEntry){
+        .key = key,
+        .obj = (__bridge_retained CFTypeRef)object,
+        .snapshotted = 0u,
+    };
+    _hasUnsnapshotted = YES;
 }
 - (void)setObject:(id)object slot:(NSNumber *)slot {
     if (!slot) return;
-    if (object) _objects[slot] = object;
-    else [_objects removeObjectForKey:slot];
+    [self setObject:object key:slot.unsignedLongLongValue];
 }
 - (void)clear {
-    [_objects removeAllObjects];
+    for (uint32_t i = 0; i < _count; i++) {
+        if (_entries[i].obj) CFRelease(_entries[i].obj);
+    }
+    _count = 0u;
+    _lastCBId = 0u;
+    _lastSegmentSerial = 0u;
+    _hasUnsnapshotted = NO;
 }
 - (NSUInteger)count {
-    return _objects.count;
+    return (NSUInteger)_count;
 }
 - (void)snapshotToCommandBuffer:(RDNA4CommandBuffer *)commandBuffer {
-    if (!commandBuffer) return;
-    @autoreleasepool {
-        for (id object in _objects.allValues)
-            [commandBuffer rdna4RetainEncoded:object];
+    if (!commandBuffer || !_count) return;
+    const uint64_t cbid = [commandBuffer rdna4CBId];
+    const uint64_t segSer = [commandBuffer rdna4SegmentSerial];
+    const BOOL canCache = (cbid != 0u && segSer != 0u);
+    if (canCache && cbid == _lastCBId && segSer == _lastSegmentSerial) {
+        if (!_hasUnsnapshotted) return;
+        for (uint32_t i = 0; i < _count; i++) {
+            if (!_entries[i].snapshotted) {
+                [commandBuffer rdna4RetainEncoded:(__bridge id)_entries[i].obj];
+                _entries[i].snapshotted = 1u;
+            }
+        }
+        _hasUnsnapshotted = NO;
+        return;
+    }
+    for (uint32_t i = 0; i < _count; i++) {
+        [commandBuffer rdna4RetainEncoded:(__bridge id)_entries[i].obj];
+        _entries[i].snapshotted = 1u;
+    }
+    if (canCache) {
+        _lastCBId = cbid;
+        _lastSegmentSerial = segSer;
+        _hasUnsnapshotted = NO;
+    } else {
+        _lastCBId = 0u;
+        _lastSegmentSerial = 0u;
+        _hasUnsnapshotted = YES;
     }
 }
 @end

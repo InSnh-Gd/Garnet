@@ -1693,9 +1693,15 @@ static _Atomic uint64_t rdna4_argument_pool_descriptors;
 @end
 
 static char rdna4_icb_arg_owners_key;
+static _Atomic uint32_t rdna4_icb_arg_owners_seen;
+
+GARNET_INTERNAL BOOL rdna4_icb_any_arg_owners(void) {
+    return atomic_load_explicit(&rdna4_icb_arg_owners_seen, memory_order_acquire) != 0u;
+}
 
 static void rdna4_icb_arg_note(RDNA4Buffer *dst, id icb, id pso, RDNA4Buffer *nestedBuf) {
     if (!dst || (!icb && !pso && !nestedBuf)) return;
+    atomic_store_explicit(&rdna4_icb_arg_owners_seen, 1u, memory_order_release);
     @synchronized (dst) {
         RDNA4ICBArgOwners *owners = objc_getAssociatedObject(dst, &rdna4_icb_arg_owners_key);
         if (!owners) {
@@ -1727,7 +1733,7 @@ static void rdna4_argbuf_icb_snapshot_walk(RDNA4Buffer *buf, NSMutableSet *icbs,
 }
 
 GARNET_INTERNAL void rdna4_argbuf_icb_snapshot(RDNA4Buffer *buf, NSMutableSet *icbs, NSMutableSet *psos) {
-    if (!buf) return;
+    if (!buf || !rdna4_icb_any_arg_owners()) return;
     NSMutableSet *visited = [NSMutableSet set];
     rdna4_argbuf_icb_snapshot_walk(buf, icbs, psos, visited);
 }

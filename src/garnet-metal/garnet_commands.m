@@ -387,6 +387,7 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
     self = [super initWithDevice:dev descriptor:qd];
     if (!self) { if (err) *err = rdna4_err(50, @"_MTLCommandQueue initWithDevice:descriptor: returned nil"); return nil; }
     pthread_mutex_init(&_qmu, NULL);
+    garnet_vkpool_init(&_cmdPool, GARNET_VKPOOL_CMD_CAP);
     _pending = [NSMutableArray array];
     _residencySets = [NSMutableArray array];
     // The base deallocator needs its dispatch objects even when RADV is unavailable.
@@ -402,11 +403,51 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
 }
 - (void)dealloc {
     rdna4_schedule_unregister(self);
+    garnet_vkpool_drain(&_cmdPool, NULL, GARNET_VKPOOL_CMD_CAP);
     if (RDNA4R.ok && _pool) vkDestroyCommandPool(RDNA4R.dev, _pool, NULL);
     pthread_mutex_destroy(&_qmu);
 }
 RDNA4_DNR(RDNA4CommandQueue)
 - (VkCommandPool)pool { return _pool; }
+- (VkCommandBuffer)rdna4TakeCmdBuf:(NSError **)err {
+    if (rdna4_cmd_pool_active()) {
+        pthread_mutex_lock(&_qmu);
+        VkCommandBuffer cached = (VkCommandBuffer)(uintptr_t)garnet_vkpool_pop(&_cmdPool);
+        pthread_mutex_unlock(&_qmu);
+        if (cached != VK_NULL_HANDLE) return cached;
+    }
+    VkCommandBuffer vk = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = _pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    rdna4_qlock();
+    VkResult r = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &vk);
+    pthread_mutex_unlock(&RDNA4R.qlock);
+    if (r != VK_SUCCESS) {
+        if (err) *err = rdna4_err(55, [NSString stringWithFormat:@"vkAllocateCommandBuffers(segment) = %d", r]);
+        return VK_NULL_HANDLE;
+    }
+    return vk;
+}
+- (void)rdna4GiveCmdBuf:(VkCommandBuffer)cmd {
+    if (!cmd || !RDNA4R.ok) return;
+    if (rdna4_cmd_pool_active()) {
+        rdna4_qlock();
+        VkResult rr = vkResetCommandBuffer(cmd, 0);
+        pthread_mutex_unlock(&RDNA4R.qlock);
+        if (rr == VK_SUCCESS) {
+            pthread_mutex_lock(&_qmu);
+            int kept = garnet_vkpool_push(&_cmdPool, (uint64_t)(uintptr_t)cmd);
+            pthread_mutex_unlock(&_qmu);
+            if (kept) return;
+        }
+    }
+    rdna4_qlock();
+    vkFreeCommandBuffers(RDNA4R.dev, _pool, 1, &cmd);
+    pthread_mutex_unlock(&RDNA4R.qlock);
+}
+- (BOOL)rdna4HasResidencySets {
+    return atomic_load_explicit(&_residencySetCount, memory_order_relaxed) != 0u;
+}
 - (id)device { return _ndev; }
 - (dispatch_queue_t)rdna4CompletionQueue { return _cq; }
 - (void)rdna4Kick { rdna4_schedule_kick(); }
@@ -444,8 +485,10 @@ RDNA4_DNR(RDNA4CommandQueue)
         return;
     }
     pthread_mutex_lock(&_qmu);
-    if ([_residencySets indexOfObjectIdenticalTo:residencySet] == NSNotFound)
+    if ([_residencySets indexOfObjectIdenticalTo:residencySet] == NSNotFound) {
         [_residencySets addObject:residencySet];
+        atomic_store_explicit(&_residencySetCount, (uint32_t)_residencySets.count, memory_order_release);
+    }
     pthread_mutex_unlock(&_qmu);
 }
 - (void)addResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count {
@@ -456,6 +499,7 @@ RDNA4_DNR(RDNA4CommandQueue)
     if (!residencySet) return;
     pthread_mutex_lock(&_qmu);
     [_residencySets removeObjectIdenticalTo:residencySet];
+    atomic_store_explicit(&_residencySetCount, (uint32_t)_residencySets.count, memory_order_release);
     pthread_mutex_unlock(&_qmu);
 }
 - (void)removeResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count {
@@ -463,6 +507,7 @@ RDNA4_DNR(RDNA4CommandQueue)
     for (NSUInteger i = 0; i < count; i++) [self removeResidencySet:residencySets[i]];
 }
 - (NSArray *)rdna4ResidencySetSnapshots {
+    if (atomic_load_explicit(&_residencySetCount, memory_order_acquire) == 0u) return @[];
     NSArray *sets = nil;
     pthread_mutex_lock(&_qmu);
     if (_residencySets.count) sets = [_residencySets copy];
@@ -671,6 +716,23 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
              (unsigned long long)w->cbid, (unsigned long long)elapsedMs, slices);
 }
 
+typedef struct {
+    BOOL earlySchedule;
+    BOOL noWsCompletion;
+    BOOL wsCompletionAll;
+} RDNA4CBKillFlags;
+
+static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
+    static RDNA4CBKillFlags flags;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        flags.earlySchedule = access("/private/tmp/garnet-early-schedule", F_OK) == 0;
+        flags.noWsCompletion = access("/private/tmp/garnet-no-ws-completion", F_OK) == 0;
+        flags.wsCompletionAll = access("/private/tmp/garnet-ws-completion-all", F_OK) == 0;
+    });
+    return flags;
+}
+
 @implementation RDNA4CommandBuffer
 - (BOOL)rdna4IOFirstTouch:(RDNA4Texture *)t {
     RDNA4Texture *backing = [t rootResource];
@@ -736,7 +798,7 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
     // soon as scheduled is visible. The /private/tmp/garnet-early-schedule kill
     // file restores early scheduling.
     if ([t rdna4IsIOS] &&
-        access("/private/tmp/garnet-early-schedule", F_OK) != 0 && !_scheduleAfterPublish) {
+        !rdna4_cb_kill_flags().earlySchedule && !_scheduleAfterPublish) {
         _scheduleAfterPublish = YES;
         RDNA4_ONCE("scheduled publication deferred until IOSurface write completes");
     }
@@ -808,9 +870,10 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
 // behaviour for A/B diagnosis without another source change.
 - (BOOL)commitAndWaitUntilSubmitted {
     const BOOL ws = rdna4_is_ws();
+    const RDNA4CBKillFlags kf = ws ? rdna4_cb_kill_flags() : (RDNA4CBKillFlags){0};
     [self commit];
-    if (ws && access("/private/tmp/garnet-no-ws-completion", F_OK) != 0 &&
-        ([self rdna4IsFrame] || access("/private/tmp/garnet-ws-completion-all", F_OK) == 0)) {
+    if (ws && !kf.noWsCompletion &&
+        ([self rdna4IsFrame] || kf.wsCompletionAll)) {
         RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: waiting for GPU completion on display frames");
         // A display frame's completion wait is on WindowServer's frame path: when it
         // takes long, the picture on the monitor stops changing for exactly that long.
@@ -823,7 +886,7 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
                                             (double)waited / 1e6, (unsigned long long)_cbid, (unsigned long)_segments.count,
                                             (unsigned long)[self status]);
     } else {
-        if (ws && access("/private/tmp/garnet-no-ws-completion", F_OK) == 0)
+        if (ws && kf.noWsCompletion)
             RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: completion wait disabled");
         [self waitUntilScheduled];
     }
@@ -942,14 +1005,28 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
             }
         for (NSValue *v in _qpools) vkDestroyQueryPool(RDNA4R.dev, (VkQueryPool)v.pointerValue, NULL);   // build 18 (P2)
         if (_dslot >= 0) { int s = _dslot; _dslot = -1; rdna4s_complete(_dinst, s, VK_ERROR_UNKNOWN, 0, 0, NULL, 0, 0); }   // never presented
-        for (RDNA4CommandSegment *segment in _segments) if (segment->fence) vkDestroyFence(RDNA4R.dev, segment->fence, NULL);
+        for (RDNA4CommandSegment *segment in _segments) {
+            if (!segment->fence) continue;
+            if ((!segment->submitted || segment->done) && !segment->retirementUnknown)
+                rdna4_fence_give(segment->fence);
+            else
+                vkDestroyFence(RDNA4R.dev, segment->fence, NULL);
+            segment->fence = VK_NULL_HANDLE;
+        }
         if (_segments.count && _nq) {
             VkCommandBuffer *commands = calloc(_segments.count, 2 * sizeof *commands);
             if (commands) {
                 uint32_t count = 0;
                 for (RDNA4CommandSegment *segment in _segments) {
-                    if (segment->vk) commands[count++] = segment->vk;
-                    if (segment->linearInit) commands[count++] = segment->linearInit;
+                    const BOOL reusable = (!segment->submitted || segment->done) && !segment->retirementUnknown;
+                    if (segment->vk) {
+                        if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->vk];
+                        else commands[count++] = segment->vk;
+                    }
+                    if (segment->linearInit) {
+                        if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->linearInit];
+                        else commands[count++] = segment->linearInit;
+                    }
                 }
                 if (count) {
                     rdna4_qlock();
@@ -965,21 +1042,26 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
 RDNA4_DNR(RDNA4CommandBuffer)
 - (BOOL)rdna4OpenSegment:(NSError **)err {
     VkCommandBuffer vk = VK_NULL_HANDLE;
-    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = [_nq pool],
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    rdna4_qlock();
-    VkResult r = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &vk);
-    pthread_mutex_unlock(&RDNA4R.qlock);
-    if (r != VK_SUCCESS) {
-        if (err) *err = rdna4_err(55, [NSString stringWithFormat:@"vkAllocateCommandBuffers(segment) = %d", r]);
-        return NO;
+    if (_nq) {
+        vk = [_nq rdna4TakeCmdBuf:err];
+    } else {
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = VK_NULL_HANDLE, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        rdna4_qlock();
+        VkResult ar = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &vk);
+        pthread_mutex_unlock(&RDNA4R.qlock);
+        if (ar != VK_SUCCESS) {
+            if (err) *err = rdna4_err(55, [NSString stringWithFormat:@"vkAllocateCommandBuffers(segment) = %d", ar]);
+            return NO;
+        }
     }
+    if (!vk) return NO;
     RDNA4CommandSegment *segment = [RDNA4CommandSegment new];
     segment->vk = vk;
     [_segments addObject:segment];
     _curSegment = segment; _vk = vk;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    r = vkBeginCommandBuffer(vk, &bi);
+    VkResult r = vkBeginCommandBuffer(vk, &bi);
     if (r != VK_SUCCESS) {
         if (err) *err = rdna4_err(55, [NSString stringWithFormat:@"vkBeginCommandBuffer(segment) = %d", r]);
         return NO;
@@ -1279,6 +1361,9 @@ RDNA4_DNR(RDNA4CommandBuffer)
 }
 
 - (void)rdna4SignalSegment:(RDNA4CommandSegment *)segment {
+    [self rdna4SignalSegment:segment releaseRefs:YES];
+}
+- (void)rdna4SignalSegment:(RDNA4CommandSegment *)segment releaseRefs:(BOOL)releaseRefs {
     if ((segment->hostWritebackCopies || segment->hostLinearWrites) && rdna4cbl_on()) {
         pthread_mutex_lock(&RDNA4CB.mu);
         rdna4cbl_line_locked("W t=%llu cb=%llu dseq=%llu copies=%lu linear=%lu", (unsigned long long)rdna4_now(),
@@ -1303,16 +1388,23 @@ RDNA4_DNR(RDNA4CommandBuffer)
     segment->argumentSummaryAttempts = nil;
     // These immutable descriptor snapshots are used only by this segment.
     [segment->argumentPools removeAllObjects];
-    [segment->argumentRefs removeAllObjects];
-    [segment->commandRefs removeAllObjects];
+    if (releaseRefs) {
+        [segment->argumentRefs removeAllObjects];
+        [segment->commandRefs removeAllObjects];
+    }
     if (segment->vk || segment->linearInit) {
-        VkCommandBuffer commands[2];
-        uint32_t count = 0;
-        if (segment->vk) commands[count++] = segment->vk;
-        if (segment->linearInit) commands[count++] = segment->linearInit;
-        rdna4_qlock();
-        vkFreeCommandBuffers(RDNA4R.dev, [_nq pool], count, commands);
-        pthread_mutex_unlock(&RDNA4R.qlock);
+        if (rdna4_cmd_pool_active() && _nq) {
+            if (segment->vk) [_nq rdna4GiveCmdBuf:segment->vk];
+            if (segment->linearInit) [_nq rdna4GiveCmdBuf:segment->linearInit];
+        } else {
+            VkCommandBuffer commands[2];
+            uint32_t count = 0;
+            if (segment->vk) commands[count++] = segment->vk;
+            if (segment->linearInit) commands[count++] = segment->linearInit;
+            rdna4_qlock();
+            vkFreeCommandBuffers(RDNA4R.dev, [_nq pool], count, commands);
+            pthread_mutex_unlock(&RDNA4R.qlock);
+        }
         if (_vk == segment->vk) _vk = VK_NULL_HANDLE;
         segment->vk = VK_NULL_HANDLE;
         segment->linearInit = VK_NULL_HANDLE;
@@ -1386,6 +1478,10 @@ RDNA4_DNR(RDNA4CommandBuffer)
     [_curSegment->commandRefs addObject:object];
 }
 - (uint64_t)rdna4SegmentSerial { return _segmentSerial; }
+- (uint64_t)rdna4CBId { return _cbid; }
+- (BOOL)rdna4HasResidency {
+    return _residencySnapshots.count != 0 || _residencyHeapResources.count != 0 || [_nq rdna4HasResidencySets];
+}
 - (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage {
     if (_encErr) return;
     Class icbCls = objc_getClass("RDNA4IndirectCommandBuffer");
@@ -1677,6 +1773,19 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (BOOL)rdna4ClaimTerminal {
     return atomic_exchange(&_terminalClaimed, 1) == 0;
 }
+- (void)rdna4ReleaseCompletionRefs {
+    // Release retained resources AFTER commandBufferDidComplete: so Metal
+    // completion handlers still observe live resources during callback execution.
+    [_refs removeAllObjects];
+    [_residencySnapshots removeAllObjects];
+    [_residencyHeapResources removeAllObjects];
+    for (RDNA4CommandSegment *segment in _segments) {
+        if (!segment->retirementUnknown) {
+            [segment->argumentRefs removeAllObjects];
+            [segment->commandRefs removeAllObjects];
+        }
+    }
+}
 - (void)rdna4DeliverTerminalSuccessWithQueue:(RDNA4CommandQueue *)queue {
     rdna4_capture_surfaces(_iot, _cbid);
     [self rdna4ClearHostActions];
@@ -1687,6 +1796,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
         [self rdna4DispDone:VK_SUCCESS];
         [self rdna4PoolDone];
         [queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:self->_encErr];
+        [self rdna4ReleaseCompletionRefs];
         [queue rdna4DidComplete:self];
         rdna4_mark_clean();
     });
@@ -1709,6 +1819,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
             [self rdna4CBFence:(int)fault];
         }
         [queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:err];
+        if (!unresolved) [self rdna4ReleaseCompletionRefs];
         [queue rdna4DidComplete:self];
     });
 }
@@ -1738,11 +1849,12 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (!delivered && (r != VK_SUCCESS || terminal)) terminalClaimed = [self rdna4ClaimTerminal];
     pthread_mutex_unlock(&self->_smu);
     if (r == VK_SUCCESS) {
-        [self rdna4SignalSegment:segment];
+        [self rdna4SignalSegment:segment releaseRefs:(delivered || !terminal)];
         if (delivered) {
             [self rdna4CBFence:VK_SUCCESS];
             [self rdna4DispDone:VK_SUCCESS];
             [self rdna4PoolDone];
+            [self rdna4ReleaseCompletionRefs];
             [queue rdna4DidComplete:self];
             rdna4_mark_clean();
         } else if (terminalClaimed) {
@@ -1844,12 +1956,18 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     if (!saved) return NO;
     [segment->commandRefs addObject:saved];
 
-    VkCommandBufferAllocateInfo allocation = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = [_nq pool], .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     VkCommandBuffer init = VK_NULL_HANDLE;
-    rdna4_qlock();
-    VkResult result = vkAllocateCommandBuffers(RDNA4R.dev, &allocation, &init);
-    pthread_mutex_unlock(&RDNA4R.qlock);
+    VkResult result = VK_SUCCESS;
+    if (_nq) {
+        init = [_nq rdna4TakeCmdBuf:error];
+        if (!init) result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    } else {
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = VK_NULL_HANDLE, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        rdna4_qlock();
+        result = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &init);
+        pthread_mutex_unlock(&RDNA4R.qlock);
+    }
     if (result == VK_SUCCESS) {
         segment->linearInit = init;
         VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2001,9 +2119,8 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         return NO;
     }
 
-    VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence fence = VK_NULL_HANDLE;
-    VkResult r = vkCreateFence(RDNA4R.dev, &fc, NULL, &fence);
+    VkResult r = rdna4_fence_take(&fence);
     if (r != VK_SUCCESS) {
         error = rdna4_err(52, [NSString stringWithFormat:@"vkCreateFence = %d", r]);
         BOOL claimed = [self rdna4ClaimTerminal];
@@ -2274,9 +2391,14 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
 }
 - (void)rdna4PoolDone {
     [self rdna4UCRelease]; [self rdna4OccResolve]; if (_pser) rdna4_fence_close(_pser);
-    [_refs removeAllObjects];
-    [_residencySnapshots removeAllObjects];
-    [_residencyHeapResources removeAllObjects];
+    for (RDNA4CommandSegment *segment in _segments) {
+        if (segment->fence && segment->done && !segment->retirementUnknown) {
+            VkFence f = segment->fence;
+            segment->fence = VK_NULL_HANDLE;
+            if (_fence == f) _fence = VK_NULL_HANDLE;
+            rdna4_fence_give(f);
+        }
+    }
     _ring = nil;
     _argumentTable = nil;
     _ringUsed = 0;
@@ -3365,7 +3487,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
 - (void)rdna4OwnResource:(id)object kind:(uint32_t)kind
                 fragment:(BOOL)fragment index:(NSUInteger)index {
     [_resourceBindings setObject:object
-                            slot:rdna4_resource_slot(kind, fragment, index)];
+                             key:rdna4_resource_slot_key(kind, fragment, index)];
 }
 - (void)rdna4SyncResourceSegment {
     uint64_t serial = [_cb rdna4SegmentSerial];
@@ -3375,8 +3497,16 @@ RDNA4_DNR(RDNA4RenderEncoder)
 }
 - (void)rdna4SnapshotResources {
     [_resourceBindings snapshotToCommandBuffer:_cb];
+    const uint64_t cbid = [_cb rdna4CBId], segSer = [_cb rdna4SegmentSerial];
+    if (cbid && segSer && cbid == _handlesSnapCBId && segSer == _handlesSnapSegSer &&
+        _snapBaseHandles == _baseHandles && _snapFetchHandles == _fetchHandles)
+        return;
     [_cb rdna4RetainEncoded:_baseHandles];
     [_cb rdna4RetainEncoded:_fetchHandles];
+    _handlesSnapCBId = cbid;
+    _handlesSnapSegSer = segSer;
+    _snapBaseHandles = _baseHandles;
+    _snapFetchHandles = _fetchHandles;
 }
 - (void)rdna4ReleaseRenderHandles {
     _baseHandles = nil;
@@ -3551,6 +3681,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     if (_hostWriteDropped) return;
     if (_inPass) return;
     if (_dcOn) rdna4dc_enc_reset_bound(&_dc);   // P5b: a new Vulkan render pass starts: forget the bound pipeline and the cached descriptor sets
+    _dynDirty = GARNET_DYN_ALL;
     VkRenderPass rp = _rp1; VkFramebuffer fb = _fb; uint32_t ncv = _begun ? 0 : _na + _nd;
     BOOL rpc = _rp1c;
     RDNA4RenderHandles *continuationHandles = nil;
@@ -3659,7 +3790,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
 }
 - (void)setCullMode:(MTLCullMode)m { _cull = m; }
 - (void)setFrontFacingWinding:(MTLWinding)w { _wind = w; }
-- (void)setViewport:(MTLViewport)v { _vp = v; _vps[0] = v; _nvp = 1; }
+- (void)setViewport:(MTLViewport)v { _vp = v; _vps[0] = v; _nvp = 1; _dynDirty |= GARNET_DYN_VIEWPORT; }
 - (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
     if (!n || !v) return;
     if (n > (RDNA4R.maxViewports ?: 1u)) {
@@ -3667,9 +3798,9 @@ RDNA4_DNR(RDNA4RenderEncoder)
         return;
     }
     for (NSUInteger i = 0; i < n; i++) _vps[i] = v[i];
-    _nvp = (uint32_t)n; _vp = v[0];
+    _nvp = (uint32_t)n; _vp = v[0]; _dynDirty |= GARNET_DYN_VIEWPORT;
 }
-- (void)setScissorRect:(MTLScissorRect)r { _sr = r; _srs[0] = r; _nsr = 1; }
+- (void)setScissorRect:(MTLScissorRect)r { _sr = r; _srs[0] = r; _nsr = 1; _dynDirty |= GARNET_DYN_SCISSOR; }
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n {
     if (!n || !r) return;
     if (n > (RDNA4R.maxViewports ?: 1u)) {
@@ -3677,7 +3808,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
         return;
     }
     for (NSUInteger i = 0; i < n; i++) _srs[i] = r[i];
-    _nsr = (uint32_t)n; _sr = r[0];
+    _nsr = (uint32_t)n; _sr = r[0]; _dynDirty |= GARNET_DYN_SCISSOR;
 }
 - (void)setVertexAmplificationCount:(NSUInteger)count
                        viewMappings:(const MTLVertexAmplificationViewMapping *)viewMappings {
@@ -3705,6 +3836,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     if (_ampHasMappings) memcpy(_ampMappings, tmp, count * sizeof(rdna4amp_mapping));
     else memset(_ampMappings, 0, sizeof _ampMappings);
     _ampLayerOff = _ampHasMappings ? _ampMappings[0].layer_offset : 0u;
+    _dynDirty |= GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR;
 }
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
                  atSampleIndex:(NSUInteger)sampleIndex
@@ -3724,20 +3856,22 @@ RDNA4_DNR(RDNA4RenderEncoder)
                          stageFlags:(barrier ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
                                 who:"render"];
 }
-- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; }
+- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; _dynDirty |= GARNET_DYN_BLEND; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { _fillMode = m; }
 - (void)setDepthClipMode:(NSUInteger)m { _depthClipMode = (MTLDepthClipMode)m; }
-- (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { _bias[0] = a; _bias[1] = RDNA4R.dbClamp ? c : 0.0f; _bias[2] = b; if (c != 0.0f && !RDNA4R.dbClamp) RDNA4_ONCE("setDepthBias: a non-zero clamp is ignored (the device lacks depthBiasClamp)"); }   // bundle 10
-- (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; }
+- (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { _bias[0] = a; _bias[1] = RDNA4R.dbClamp ? c : 0.0f; _bias[2] = b; _dynDirty |= GARNET_DYN_DEPTHBIAS; if (c != 0.0f && !RDNA4R.dbClamp) RDNA4_ONCE("setDepthBias: a non-zero clamp is ignored (the device lacks depthBiasClamp)"); }   // bundle 10
+- (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; _dynDirty |= GARNET_DYN_STENCIL_R; }
 - (void)setDepthStencilState:(id)s {   // bundle 10: recorded; read at every draw of a pipeline that has a depth/stencil attachment (a colour-only pipeline never looks at it)
     if (!s) {
         _dsi = rdna4_dsinfo_default();
+        _dynDirty |= GARNET_DYN_STENCIL_M;
         [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_DEPTH_STENCIL
                       fragment:NO index:0];
         return;
     }
     if (![s isKindOfClass:[RDNA4DepthStencilState class]]) { RDNA4LOG("setDepthStencilState: not an RDNA4DepthStencilState"); return; }
     _dsi = [(RDNA4DepthStencilState *)s rdna4Info];
+    _dynDirty |= GARNET_DYN_STENCIL_M;
     [self rdna4OwnResource:s kind:RDNA4_RESOURCE_DEPTH_STENCIL
                   fragment:NO index:0];
 }
@@ -3776,7 +3910,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
 - (void)setDepthStoreActionOptions:(NSUInteger)a { (void)a; }
 - (void)setStencilStoreAction:(NSUInteger)a { if (_nd) _ssact = a; }
 - (void)setStencilStoreActionOptions:(NSUInteger)a { (void)a; }
-- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _sref[0] = f; _sref[1] = b; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _sref[0] = f; _sref[1] = b; _dynDirty |= GARNET_DYN_STENCIL_R; }
 - (void)setLineWidth:(float)w { (void)w; }
 RDNA4_ENCODER_SHARED
 - (void)pushDebugGroup:(NSString *)s { (void)s; }
@@ -4072,11 +4206,14 @@ RDNA4_ENCODER_SHARED
             : @"drawPatches called with a non-tessellation render pipeline"];
         return NO;
     }
-    MTLRenderPipelineReflection *reflection = [_pso reflection] ?: _roReflection;
+    MTLRenderPipelineReflection *reflection = nil;
     const BOOL hasFrag = [_pso rdna4HasFragment];
-    BOOL roV = rdna4nc_stage_writes(&_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX), RDNA4NC_VERTEX, "vertex draw", &_roWarnV);
-    BOOL roF = hasFrag ? rdna4nc_stage_writes(&_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT), RDNA4NC_FRAGMENT, "fragment draw", &_roWarnF) : NO;
-    if (roV || roF) { [_cb rdna4Fail:@"render draw writes a read-only no-copy buffer"]; return NO; }
+    if (rdna4nc_any_readonly_buffer()) {
+        reflection = [_pso reflection] ?: _roReflection;
+        BOOL roV = rdna4nc_stage_writes(&_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX), RDNA4NC_VERTEX, "vertex draw", &_roWarnV);
+        BOOL roF = hasFrag ? rdna4nc_stage_writes(&_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT), RDNA4NC_FRAGMENT, "fragment draw", &_roWarnF) : NO;
+        if (roV || roF) { [_cb rdna4Fail:@"render draw writes a read-only no-copy buffer"]; return NO; }
+    }
     [self rdna4SyncResourceSegment];
     [self rdna4SnapshotResources];
     VkCullModeFlags cull = _cull == MTLCullModeFront ? VK_CULL_MODE_FRONT_BIT : _cull == MTLCullModeBack ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
@@ -4123,31 +4260,46 @@ RDNA4_ENCODER_SHARED
     rdna4_each_tex([_pso pbV], [_pso npbV], &_sv, dev, needTex);
     if (hasFrag) rdna4_each_tex([_pso pbF], [_pso npbF], &_sf, dev, needTex);
     }
-    NSMutableSet *argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
-    NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
-    rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbV], [_pso npbV], &_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX));
-    if (hasFrag) rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbF], [_pso npbF], &_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT));
-    for (uint32_t i = 0; i < 31; i++) {
-        if (_sv.buf[i].b) rdna4_rt_retain_argbuf_resources(_sv.buf[i].b, _cb);
-        if (hasFrag && _sf.buf[i].b) rdna4_rt_retain_argbuf_resources(_sf.buf[i].b, _cb);
+    const RDNA4ArgumentTables *argTables = [_pso argumentTables];
+    const BOOL needArgPrep =
+        (argTables && argTables->active) ||
+        [_pso rdna4HasAddressRegistry] ||
+        (_sv.scanPlan && _sv.scanPlan->plan.count) ||
+        (hasFrag && _sf.scanPlan && _sf.scanPlan->plan.count) ||
+        _argumentResources.count != 0 ||
+        _argumentWritable.count != 0 ||
+        [_cb rdna4HasResidency] ||
+        rdna4_rt_any_arg_owners();
+    if (needArgPrep) {
+        if (!reflection) reflection = [_pso reflection] ?: _roReflection;
+        NSMutableSet *argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
+        NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
+        rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbV], [_pso npbV], &_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX));
+        if (hasFrag) rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pbF], [_pso npbF], &_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT));
+        if (rdna4_rt_any_arg_owners()) {
+            for (uint32_t i = 0; i < 31; i++) {
+                if (_sv.buf[i].b) rdna4_rt_retain_argbuf_resources(_sv.buf[i].b, _cb);
+                if (hasFrag && _sf.buf[i].b) rdna4_rt_retain_argbuf_resources(_sf.buf[i].b, _cb);
+            }
+            for (id res in argumentResources) {
+                if ([res isKindOfClass:[RDNA4Buffer class]])
+                    rdna4_rt_retain_argbuf_resources((RDNA4Buffer *)res, _cb);
+            }
+        }
+        RDNA4ArgumentScanPrepared scan = {0};
+        const RDNA4StageState *scanStages[] = {&_sv, &_sf};
+        NSString *scanError = nil;
+        if (!rdna4_argument_scan_prepare(&scan, scanStages, hasFrag ? 2 : 1, argumentWritable, dev,
+                                         &scanError)) {
+            [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
+            return NO;
+        }
+        BOOL argumentsReady = [_cb rdna4PrepareArguments:argTables
+            resources:argumentResources writable:argumentWritable scan:&scan
+            textures:needTex];
+        rdna4_argument_scan_prepared_destroy(&scan);
+        if (!argumentsReady) return NO;
     }
-    for (id res in argumentResources) {
-        if ([res isKindOfClass:[RDNA4Buffer class]])
-            rdna4_rt_retain_argbuf_resources((RDNA4Buffer *)res, _cb);
-    }
-    RDNA4ArgumentScanPrepared scan = {0};
-    const RDNA4StageState *scanStages[] = {&_sv, &_sf};
-    NSString *scanError = nil;
-    if (!rdna4_argument_scan_prepare(&scan, scanStages, hasFrag ? 2 : 1, argumentWritable, dev,
-                                     &scanError)) {
-        [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
-        return NO;
-    }
-    BOOL argumentsReady = [_cb rdna4PrepareArguments:[_pso argumentTables]
-        resources:argumentResources writable:argumentWritable scan:&scan
-        textures:needTex];
-    rdna4_argument_scan_prepared_destroy(&scan);
-    if (!argumentsReady) return NO;
     if ([_pso fetch] != _fetch) {   // 11e-2: framebuffer-fetch draws need the input-attachment render-pass shape; a change of shape is a pass split (LOAD continuation)
         if ([_pso fetch] && [_pso fetchMax] >= _na) { [_cb rdna4Fail:[NSString stringWithFormat:@"pipeline reads [[color(%u)]] but the encoder has %u colour attachment(s)", [_pso fetchMax], _na]]; return NO; }
         if (_inPass) { [self rdna4EndPass]; RDNA4LOGR("render pass split: framebuffer fetch %s", [_pso fetch] ? "on" : "off"); }
@@ -4205,15 +4357,24 @@ RDNA4_ENCODER_SHARED
         if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp)) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
     } else
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
-    VkViewport vps[16]; VkRect2D scs[16];
-    for (uint32_t i = 0; i < vpCount; i++) {
-        uint32_t vi = i + vpOff, si = i + vpOff;
-        MTLViewport mv = vi < _nvp ? _vps[vi] : _vps[_nvp - 1];
-        MTLScissorRect ms = si < _nsr ? _srs[si] : (MTLScissorRect){ 0, 0, _w, _h };
-        vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
-        scs[i] = (VkRect2D){ { (int32_t)ms.x, (int32_t)ms.y }, { (uint32_t)ms.width, (uint32_t)ms.height } };
+    const uint32_t dynEmit = _dcOn ? _dynDirty : GARNET_DYN_ALL;
+    if (dynEmit & (GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR)) {
+        VkViewport vps[16]; VkRect2D scs[16];
+        for (uint32_t i = 0; i < vpCount; i++) {
+            uint32_t vi = i + vpOff, si = i + vpOff;
+            if (dynEmit & GARNET_DYN_VIEWPORT) {
+                MTLViewport mv = vi < _nvp ? _vps[vi] : _vps[_nvp - 1];
+                vps[i] = (VkViewport){ (float)mv.originX, (float)(mv.originY + mv.height), (float)mv.width, -(float)mv.height, (float)mv.znear, (float)mv.zfar };
+            }
+            if (dynEmit & GARNET_DYN_SCISSOR) {
+                MTLScissorRect ms = si < _nsr ? _srs[si] : (MTLScissorRect){ 0, 0, _w, _h };
+                scs[i] = (VkRect2D){ { (int32_t)ms.x, (int32_t)ms.y }, { (uint32_t)ms.width, (uint32_t)ms.height } };
+            }
+        }
+        if (dynEmit & GARNET_DYN_VIEWPORT) { vkCmdSetViewport(cmd, 0, vpCount, vps); _dynDirty &= ~GARNET_DYN_VIEWPORT; }
+        if (dynEmit & GARNET_DYN_SCISSOR)  { vkCmdSetScissor(cmd, 0, vpCount, scs);  _dynDirty &= ~GARNET_DYN_SCISSOR; }
     }
-    vkCmdSetViewport(cmd, 0, vpCount, vps); vkCmdSetScissor(cmd, 0, vpCount, scs); vkCmdSetBlendConstants(cmd, _blend);
+    if (dynEmit & GARNET_DYN_BLEND) { vkCmdSetBlendConstants(cmd, _blend); _dynDirty &= ~GARNET_DYN_BLEND; }
     if (_hasSamplePos && rdna4_vkCmdSetSampleLocationsEXT) {
         VkSampleLocationEXT vkSL[8];
         for (uint32_t s = 0; s < _samplePosCount && s < 8; s++) vkSL[s] = (VkSampleLocationEXT){ _samplePos[s].x, _samplePos[s].y };
@@ -4224,10 +4385,19 @@ RDNA4_ENCODER_SHARED
         rdna4_vkCmdSetSampleLocationsEXT(cmd, &slInfo);
     }
     if ([_pso rdna4HasDS]) {   // bundle 10: the dynamic depth/stencil state (masks and reference per face; the bias when the pipeline has depth)
-        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead); vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bRead);
-        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fWrite); vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, _sref[0]); vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, _sref[1]);
-        if ([_pso rdna4HasDepth]) vkCmdSetDepthBias(cmd, _bias[0], _bias[1], _bias[2]);
+        if (dynEmit & GARNET_DYN_STENCIL_M) {
+            vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead); vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bRead);
+            vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fWrite); vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite);
+            _dynDirty &= ~GARNET_DYN_STENCIL_M;
+        }
+        if (dynEmit & GARNET_DYN_STENCIL_R) {
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, _sref[0]); vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, _sref[1]);
+            _dynDirty &= ~GARNET_DYN_STENCIL_R;
+        }
+        if ([_pso rdna4HasDepth] && (dynEmit & GARNET_DYN_DEPTHBIAS)) {
+            vkCmdSetDepthBias(cmd, _bias[0], _bias[1], _bias[2]);
+            _dynDirty &= ~GARNET_DYN_DEPTHBIAS;
+        }
     }
     for (uint32_t i = 0; i < nn; i++) {
         RDNA4Buffer *b; NSUInteger off;
@@ -4605,7 +4775,7 @@ RDNA4_DNR(RDNA4ComputeEncoder)
 - (void)rdna4OwnResource:(id)object kind:(uint32_t)kind
                 fragment:(BOOL)fragment index:(NSUInteger)index {
     [_resourceBindings setObject:object
-                            slot:rdna4_resource_slot(kind, fragment, index)];
+                             key:rdna4_resource_slot_key(kind, fragment, index)];
 }
 - (void)rdna4SnapshotResources {
     [_resourceBindings snapshotToCommandBuffer:_cb];
@@ -4840,27 +5010,39 @@ RDNA4_ENCODER_SHARED
     uint32_t g[3] = { (uint32_t)grid.width, (uint32_t)grid.height, (uint32_t)grid.depth };
     if (!indirect && (!g[0] || !g[1] || !g[2])) return;
     id dev = [_cb device];
-    NSMutableSet *argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
-    NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
-    rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pb], [_pso npb], &_st, rdna4nc_stage_arguments(reflection, RDNA4NC_COMPUTE));
-    RDNA4ArgumentScanPrepared scan = {0};
-    const RDNA4StageState *scanStages[] = {&_st};
-    NSString *scanError = nil;
-    if (!rdna4_argument_scan_prepare(&scan, scanStages, 1, argumentWritable, dev,
-                                     &scanError)) {
-        [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
-        return;
+    const RDNA4ArgumentTables *argTables = [_pso argumentTables];
+    const BOOL needArgPrep =
+        (argTables && argTables->active) ||
+        [_pso rdna4HasAddressRegistry] ||
+        (_st.scanPlan && _st.scanPlan->plan.count) ||
+        _argumentResources.count != 0 ||
+        _argumentWritable.count != 0 ||
+        [_cb rdna4HasResidency] ||
+        rdna4_rt_any_arg_owners();
+    NSMutableSet *argumentResources = nil;
+    if (needArgPrep) {
+        argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
+        NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
+        rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pb], [_pso npb], &_st, rdna4nc_stage_arguments(reflection, RDNA4NC_COMPUTE));
+        RDNA4ArgumentScanPrepared scan = {0};
+        const RDNA4StageState *scanStages[] = {&_st};
+        NSString *scanError = nil;
+        if (!rdna4_argument_scan_prepare(&scan, scanStages, 1, argumentWritable, dev,
+                                         &scanError)) {
+            [_cb rdna4Fail:scanError ?: @"argument scan preparation failed"];
+            return;
+        }
+        BOOL argumentsReady = [_cb rdna4PrepareArguments:argTables
+            resources:argumentResources writable:argumentWritable scan:&scan
+            textures:^(RDNA4Texture *t, VkImageLayout layout, BOOL writable) {
+            rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE);
+            rdna4_tex_to([self->_cb vk], t, layout);
+        }];
+        rdna4_argument_scan_prepared_destroy(&scan);
+        if (!argumentsReady) return;
     }
-    BOOL argumentsReady = [_cb rdna4PrepareArguments:[_pso argumentTables]
-        resources:argumentResources writable:argumentWritable scan:&scan
-        textures:^(RDNA4Texture *t, VkImageLayout layout, BOOL writable) {
-        rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE);
-        rdna4_tex_to([self->_cb vk], t, layout);
-    }];
-    rdna4_argument_scan_prepared_destroy(&scan);
-    if (!argumentsReady) return;
     rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) { rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE); rdna4_tex_to([self->_cb vk], t, l); });
-    {
+    if (rdna4_icb_any_arg_owners() || rdna4_rt_any_arg_owners()) {
         NSMutableSet *icbRefs = [NSMutableSet set];
         NSMutableSet *icbPsoRefs = [NSMutableSet set];
         for (uint32_t i = 0; i < 31; i++) {
