@@ -879,7 +879,7 @@ uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount) {
 	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
 	if (!txn.ok) {
 		if (out && outCount > 0) out[0] = 0;
-		return kIOReturnNotPermitted;
+		return (uint32_t)kIOReturnNotPermitted;
 	}
 	if (gDcn.initStatus == 0xFFFFFFFFu && gDcn.owner) (void)bind(gDcn.owner);
 	flip_restore_if_held("entry to dcnvbl");
@@ -970,7 +970,7 @@ uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount) {
 		                             (uint64_t)gDcn.srcKind << 4 | (uint64_t)gDcn.srcInst;
 		if (outCount > 12) out[12] = gDcn.srcEnabled ? gDcn.enabledAtNs : 0;
 	}
-	return (rc == DCN41_OK) ? 0u : (uint32_t)(0x80u | (uint32_t)(-rc & 0x7fu));
+	return (rc == DCN41_OK) ? 0u : (0x80u | ((uint32_t)(-rc) & 0x7fu));
 }
 
 
@@ -989,7 +989,7 @@ uint32_t flip(uint64_t arg, uint64_t *out, unsigned outCount) {
 	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
 	if (!txn.ok) {
 		if (out && outCount > 0) out[0] = 0;
-		return kIOReturnNotPermitted;
+		return (uint32_t)kIOReturnNotPermitted;
 	}
 	if (gDcn.initStatus == 0xFFFFFFFFu && gDcn.owner) (void)bind(gDcn.owner);
 	flip_restore_if_held("entry to dcnflip");
@@ -1168,7 +1168,7 @@ uint32_t mode(uint64_t arg, uint64_t *out, unsigned outCount) {
 	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
 	if (!txn.ok) {
 		if (out && outCount > 0) out[0] = 0;
-		return kIOReturnNotPermitted;
+		return (uint32_t)kIOReturnNotPermitted;
 	}
 	if (gDcn.initStatus == 0xFFFFFFFFu && gDcn.owner) (void)bind(gDcn.owner);
 	flip_restore_if_held("entry to dcnmode");

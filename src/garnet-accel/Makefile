@@ -59,7 +59,7 @@ $(BUILD)/accel.o: src/GarnetAccel.cpp src/garnet_accel_display_impl.inc src/garn
 	$(CXX) $(CXXFLAGS) -c src/GarnetAccel.cpp -o $@
 $(BUILD)/kmod_info.o: src/kmod_info.c
 	@mkdir -p $(BUILD)
-	$(CC) $(COMMON) -c src/kmod_info.c -o $@
+	$(CC) $(filter-out -fapple-kext,$(COMMON)) -c src/kmod_info.c -o $@
 
 $(KEXT): $(BUILD)/accel.o $(BUILD)/kmod_info.o Info.plist
 	@mkdir -p $(KEXT)/Contents/MacOS

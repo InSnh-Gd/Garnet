@@ -87,7 +87,7 @@ static void describe(id<MTLDevice> d, const char *tag) {
         {"Apple1",MTLGPUFamilyApple1},{"Apple2",MTLGPUFamilyApple2},{"Apple3",MTLGPUFamilyApple3},{"Apple4",MTLGPUFamilyApple4},
         {"Apple5",MTLGPUFamilyApple5},{"Apple6",MTLGPUFamilyApple6},{"Apple7",MTLGPUFamilyApple7},{"Apple8",MTLGPUFamilyApple8},
         {"Apple9",MTLGPUFamilyApple9},{"Mac1",MTLGPUFamilyMac1},{"Mac2",MTLGPUFamilyMac2},
-        {"Common1",MTLGPUFamilyCommon1},{"Common2",MTLGPUFamilyCommon2},{"Common3",MTLGPUFamilyCommon3},{"Metal3",MTLGPUFamilyMetal3} };
+        {"Common1",MTLGPUFamilyCommon1},{"Common2",MTLGPUFamilyCommon2},{"Common3",MTLGPUFamilyCommon3},{"Metal3",(MTLGPUFamily)5001} };
     printf("    supportsFamily:");
     for (size_t i = 0; i < sizeof fam / sizeof *fam; i++) printf(" %s=%d", fam[i].n, [d supportsFamily:fam[i].f]);
     printf("\n");
@@ -1087,6 +1087,7 @@ static id<MTLLibrary> rg_lib(id<MTLDevice> dev) {
     return lib;
 }
 static BOOL rg_clear_only(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLTexture> t, double a, double b) {
+    (void)dev;
     id<MTLCommandBuffer> cb = [q commandBuffer];
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(a, b, 0, 0);
@@ -2332,7 +2333,8 @@ static void ag_res_one(const char *what, id res, BOOL isBuf) {
     if ([res respondsToSelector:sWait]) ((void (*)(id, SEL))objc_msgSend)(res, sWait);
     if (isBuf) { snprintf(t, sizeof t, "%s allocatedSize", what); AG_CHECK(t, [(id<MTLBuffer>)res allocatedSize] >= 4096, "%lu >= 4096", (unsigned long)[(id<MTLBuffer>)res allocatedSize]); }
     snprintf(t, sizeof t, "%s setOwnerWithIdentity", what);
-    if ([res respondsToSelector:@selector(setOwnerWithIdentity:)]) { int rc = [res setOwnerWithIdentity:0]; AG_CHECK(t, rc == (int)0xE00002C2, "returns kIOReturnBadArgument 0x%x for a non-heap resource (Apple Apple-silicon)", (unsigned)rc); }
+    SEL sOwner = sel_registerName("setOwnerWithIdentity:");
+    if ([res respondsToSelector:sOwner]) { int rc = ((int (*)(id, SEL, task_id_token_t))objc_msgSend)(res, sOwner, 0); AG_CHECK(t, rc == (int)0xE00002C2, "returns kIOReturnBadArgument 0x%x for a non-heap resource (Apple Apple-silicon)", (unsigned)rc); }
 }
 static void ag_res(id<MTLDevice> dev) {
     id<MTLBuffer> b = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
@@ -2350,6 +2352,7 @@ static void ag_res(id<MTLDevice> dev) {
 
 // (3) queue SPI + command buffer protection options
 static void ag_queue(id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    (void)dev;
     SEL sGP = sel_registerName("setGPUPriority:"), sBGP = sel_registerName("setBackgroundGPUPriority:"), sGet = sel_registerName("getGPUPriority"), sCQ = sel_registerName("setCompletionQueue:"), sBoth = sel_registerName("_setGPUPriority:backgroundPriority:");
     if ([(id)q respondsToSelector:sGP]) { BOOL r = ((BOOL (*)(id, SEL, NSUInteger))objc_msgSend)(q, sGP, 2); AG_CHECK("queue setGPUPriority:2", r == YES, "returned %d (Apple Apple-silicon: YES); class %s", r, class_getName(object_getClass(q))); } else AG_INFO("queue setGPUPriority:", "not implemented by %s", class_getName(object_getClass(q)));
     if ([(id)q respondsToSelector:sBGP]) { BOOL r = ((BOOL (*)(id, SEL, NSUInteger))objc_msgSend)(q, sBGP, 1); AG_CHECK("queue setBackgroundGPUPriority:1", r == NO, "returned %d (Apple Apple-silicon: NO)", r); }
@@ -2382,7 +2385,8 @@ static void ag_barrier(id<MTLDevice> dev, id<MTLLibrary> lib, id<MTLCommandQueue
     ag_draw_quad(re, &qs[0]);
     [re memoryBarrierWithScope:MTLBarrierScopeRenderTargets afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageVertex];
     ag_draw_quad(re, &qs[1]);
-    if ([(id)re respondsToSelector:@selector(textureBarrier)]) { [re textureBarrier]; AG_INFO("textureBarrier", "called"); }
+    SEL sTB = sel_registerName("textureBarrier");
+    if ([(id)re respondsToSelector:sTB]) { ((void (*)(id, SEL))objc_msgSend)(re, sTB); AG_INFO("textureBarrier", "called"); }
     [re memoryBarrierWithResources:(id<MTLResource> __unsafe_unretained[]){ tgt } count:1 afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageVertex];
     ag_draw_quad(re, &qs[2]);
     if (fence) [re updateFence:fence afterStages:MTLRenderStageFragment];
@@ -3506,6 +3510,7 @@ static int cmd_heap(const char *only, uint64_t rid, int haveRid) {
         big = nil; HP_CHECK("reuse after free", h.usedSize == 0 && [h newBufferWithLength:4096 options:MTLResourceStorageModePrivate] != nil, "ok");
         // The free logical prefix need not join the remaining physical blocks.
         id<MTLBuffer> a = [h newBufferWithLength:1000 options:MTLResourceStorageModePrivate], c = [h newBufferWithLength:1000 options:MTLResourceStorageModePrivate];
+        (void)a;
         NSUInteger co = c.heapOffset; a = nil;
         HP_CHECK("fragmentation", c && co == 0 && h.usedSize == c.allocatedSize && hp_available_fits(h, 256), "heapOffset %lu (automatic heaps report 0) used %lu max(256) %lu (reported range fits beside the live buffer)", (unsigned long)co, (unsigned long)h.usedSize, (unsigned long)[h maxAvailableSizeWithAlignment:256]);
         id<MTLBuffer> e = [h newBufferWithLength:64 * HP_MIB - 1000 options:MTLResourceStorageModePrivate]; HP_CHECK("no gap large enough", e == nil, "nil");

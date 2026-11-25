@@ -553,17 +553,17 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         // queue but QUEUE0 inert. A slot whose instance is absent or not inited
         // is skipped and left with ran=false, which sdmamap reads as UNPROVEN.
         if (ctx.sdmaQnTestWant) {
-            for (uint32_t s = 0; s < kSDMAExtSlotCount; s++) {
-                const SDMAExtQueueSlot &sl = kSDMAExtSlots[s];
+            for (uint32_t slot = 0; slot < kSDMAExtSlotCount; slot++) {
+                const SDMAExtQueueSlot &sl = kSDMAExtSlots[slot];
                 if (sl.instance >= kSDMAInstanceCount ||
                     !ctx.sdma.instance_present[sl.instance]) {
                     INIT_LOG("SDMAInit: qn-test slot %u (SDMA%u QUEUE%u db %#x) "
-                             "skipped — instance not present", s, sl.instance,
+                             "skipped — instance not present", slot, sl.instance,
                              sl.queue, sl.doorbell_dword);
                     continue;
                 }
                 (void)sdma_q1_selftest(dev, ctx.gmc, ctx.sdma.instance[sl.instance],
-                                       sl.doorbell_dword, &ctx.sdmaQnTest[s],
+                                       sl.doorbell_dword, &ctx.sdmaQnTest[slot],
                                        sl.queue);
             }
         }
@@ -701,14 +701,14 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
                     ctx.gmc.vram_alloc.alloc(4096, 4096, &tgt)) {
                     const uint64_t ib_off  = ib.gpu_va  - ctx.gmc.vram_start;
                     const uint64_t tgt_off = tgt.gpu_va - ctx.gmc.vram_start;
-                    const uint32_t magic = 0x4B435121u;   // 'KCQ!'
+                    const uint32_t kcqMagic = 0x4B435121u;   // 'KCQ!'
                     bar0_memset_vram(dev, tgt_off, 0xDEADBEEFu, 64);
                     uint32_t dw[5];
                     dw[0] = pm4_header(kPM4OpWriteData, 3);
                     dw[1] = pm4_write_data_control(kPM4WriteDataEngineME, kPM4WriteDataDstSelMemory, true);
                     dw[2] = (uint32_t)(tgt.gpu_va & 0xFFFFFFFFu);
                     dw[3] = (uint32_t)(tgt.gpu_va >> 32);
-                    dw[4] = magic;
+                    dw[4] = kcqMagic;
                     bar0_memcpy_to_vram(dev, ib_off, dw, sizeof(dw));
                     (void)gmc_hdp_flush(dev);
                     uint32_t f = 0;
@@ -716,12 +716,12 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
                     uint64_t obs = 0, el = 0;
                     if (sr == kIOReturnSuccess)
                         sr = cp_compute_wait_fence(ctx.kcq, f, 2000000, &obs, &el);
-                    const uint32_t got = RVRAM32_via_mm(dev, tgt_off);
-                    ctx.kcqTestPassed = (sr == kIOReturnSuccess) && (got == magic);
+                    const uint32_t kcqGot = RVRAM32_via_mm(dev, tgt_off);
+                    ctx.kcqTestPassed = (sr == kIOReturnSuccess) && (kcqGot == kcqMagic);
                     INIT_LOG("PM4Test: compute-ring WRITE_DATA %s — kr=%#x fence %llu/%u after %llu us, "
                              "readback %#010x (want %#010x)",
                              ctx.kcqTestPassed ? "PASSED — the MEC executed our packet" : "FAILED",
-                             sr, (unsigned long long)obs, f, (unsigned long long)el, got, magic);
+                             sr, (unsigned long long)obs, f, (unsigned long long)el, kcqGot, kcqMagic);
                     if (!ctx.kcqTestPassed) {
                         cp_dump_compute_hqd(dev, ctx.kcq, "compute-ring test failure");
                         // Do not leave a queue mapped that the MEC is not

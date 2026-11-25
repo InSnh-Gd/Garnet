@@ -118,7 +118,7 @@ static inline uint32_t rdna4_aux_end(rdna4_aux_session *s) {
 static inline int rdna4_aux_transaction(rdna4_aux_session *s, uint8_t action, uint32_t address,
                                      const uint8_t *data, uint8_t len,
                                      uint8_t *reply, uint8_t cap, uint8_t *received) {
-    uint32_t sw, sts, value, n, i;
+    uint32_t sw, sts = 0, value, n, i;
     int code;
     const int writing = (action & 0x10u) == 0u;
     if (received) *received = 0;

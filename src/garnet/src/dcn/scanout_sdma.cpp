@@ -1588,10 +1588,10 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			       cols, rows, cw, chh, g.width, g.height);
 			for (uint32_t r = 0; r < rows; r++) {
 				char hex[cols * 6 + 1];
-				for (uint32_t c = 0; c < cols; c++) {
+				for (uint32_t col = 0; col < cols; col++) {
 					uint64_t sr = 0, sg = 0, sb = 0, n = 0;
 					for (uint32_t y = r * chh; y < (r + 1) * chh; y += 3)
-						for (uint32_t x = c * cw; x < (c + 1) * cw; x += 3) {
+						for (uint32_t x = col * cw; x < (col + 1) * cw; x += 3) {
 							const uint32_t px = amdgpu::RBAR0_32(dev, fbOff + (uint64_t)y * g.rowBytes + (uint64_t)x * 4u);
 							sr += (px >> 16) & 0xffu; sg += (px >> 8) & 0xffu; sb += px & 0xffu; n++;
 						}
@@ -1603,7 +1603,7 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 					if (cell) lit++;
 					if (luma > maxLuma) maxLuma = luma;
 					static const char hx[] = "0123456789abcdef";
-					for (unsigned k = 0; k < 6; k++) hex[c * 6 + k] = hx[(cell >> (20 - 4 * k)) & 0xfu];
+					for (unsigned k = 0; k < 6; k++) hex[col * 6 + k] = hx[(cell >> (20 - 4 * k)) & 0xfu];
 				}
 				hex[cols * 6] = 0;
 				RDNA4LOG("scanout-thumb: #%llu row %02u %s", (unsigned long long)thumbSeq, r, hex);
