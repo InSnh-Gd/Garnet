@@ -9,6 +9,7 @@
 #include "amd/amdgpu_asic.h"
 #include "amd/amdgpu_discovery.h"
 #include "amd/amdgpu_init.h"
+#include "amd/garnet_power_policy_pure.h"
 #include "amd/native_s1b.h"
 #include "fw/fw_table.h"
 #include "psp.hpp"
@@ -499,9 +500,9 @@ void GarnetDriver::runStages(uint32_t target) {
 	// The kernel compute queue is proven as of 0.0.29 (MES maps it, the MEC
 	// executes indirect buffers on it, fences land in ~78 us), so it is on by
 	// default; rdna4-kcq=0 turns it off.
-	uint32_t clamp = 1;
-	PE_parse_boot_argn("garnet-idle-clamp", &clamp, sizeof(clamp));
-	ctx.idleClamp = (clamp != 0);
+	uint32_t clamp = 0;
+	const bool clampPresent = PE_parse_boot_argn("garnet-idle-clamp", &clamp, sizeof(clamp));
+	ctx.idleClamp = rdna4pwr::idle_clamp_enabled(clampPresent, clamp);
 	uint32_t kcq = 1;
 	PE_parse_boot_argn("garnet-kcq", &kcq, sizeof(kcq));
 	ctx.wantKcq = (kcq != 0);

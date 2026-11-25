@@ -16,6 +16,7 @@ namespace rdna4pwr {
 //   garnet-det0=0       disables single-pipe DCN41 DET0 expansion (default ON)
 //   garnet-uclk-pin=1   forces UCLK pinned at top DPM (default AUTO after DET0 expand)
 //   garnet-gfxoff=1     opt-in SMU AllowGfxOff (default OFF)
+//   garnet-idle-clamp=1 opt-in 200 MHz GFXCLK Low clamp at boot (default OFF: SMUPowerState::Auto)
 inline bool gfx_cg_enabled(bool present, uint32_t value) {
 	return !present || value != 0u;
 }
@@ -26,6 +27,9 @@ inline bool uclk_force_pin(bool present, uint32_t value) {
 	return present && value == 1u;
 }
 inline bool gfxoff_opt_in(bool present, uint32_t value) {
+	return present && value != 0u;
+}
+inline bool idle_clamp_enabled(bool present, uint32_t value) {
 	return present && value != 0u;
 }
 

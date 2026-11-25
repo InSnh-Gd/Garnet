@@ -131,7 +131,7 @@ struct BringupContext {
     bool tornDown { false };         // bringup_teardown() has run
     bool kgqMapped { false };        // PM4Test: MES acked ADD_QUEUE(map_legacy_kq) for the kernel GFX ring
     bool cpRingTestPassed { false }; // PM4Test: gfx_v12_0_ring_test_ring (SET_UCONFIG_REG SCRATCH_REG0) landed
-    bool idleClamp { true };         // rdna4-idle-clamp=0 to disable: clamp GFXCLK after the ladder
+    bool idleClamp { false };        // garnet-idle-clamp=1 to clamp GFXCLK to 200 MHz Low (default OFF: Auto)
     bool gfxOffAllowed { false };    // Stage 3C: opt-in garnet-gfxoff=1 enabled AllowGfxOff
     bool wantKcq { false };
     // rdna4-hsa-abi=1: dispatch the LLVM-compiled kernel (shaders/store_magic_hsa.s)

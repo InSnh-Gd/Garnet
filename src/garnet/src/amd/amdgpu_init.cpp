@@ -905,20 +905,16 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
         }
     }
 
-    // Leave the card idling cool. Enabling all SMU features powers the GFX
-    // core, but nothing here gates it again, so with no work queued the board
-    // sat at its full 304 W limit with the hotspot at 86 C and the fan ramping
-    // — measured, the first thing telemetry showed. Clamping
-    // PPCLK_GFXCLK to the low state drops that to ~32 W and 50 C with every
-    // test still passing (the suite runs perhaps 2x slower). Only GFXCLK is
-    // touched; display scanout runs off DISPCLK/DCFCLK and is unaffected.
-    // `rdna4test power 0` restores the automatic state for benchmarking.
+    // With Stage 3C GFX12 CGCG/CGLS active, SMUPowerState::Auto idles cool (~34 W at
+    // 4K@160Hz DSC, ~17 W at 4K@60Hz) while delivering full shader/compute boost clocks.
+    // Opt-in `garnet-idle-clamp=1` (or runtime `garnettest power 1`) clamps GFXCLK to 200 MHz.
     if (ctx.idleClamp && ctx.smuOnline && ctx.dev) {
         kern_return_t pr = smu_set_power_state(*ctx.dev, SMUPowerState::Low);
-        INIT_LOG("idle clamp: GFXCLK -> low %s (%#x) — the GFX core is powered but "
-                 "ungated, so an unclamped idle burns full board power. "
-                 "`rdna4test power 0` to unclamp.",
+        INIT_LOG("idle clamp: GFXCLK -> low %s (%#x) (garnet-idle-clamp=1 active; "
+                 "`garnettest power 0` to restore Auto).",
                  pr == kIOReturnSuccess ? "applied" : "FAILED", pr);
+    } else if (ctx.smuOnline && ctx.dev) {
+        INIT_LOG("GFXCLK auto (Stage 3C CGCG/CGLS active); pass garnet-idle-clamp=1 to clamp to 200 MHz.");
     }
     return kIOReturnSuccess;
 }

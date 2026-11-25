@@ -33,6 +33,12 @@ int main() {
 	expect(!gfxoff_opt_in(true, 0u), "garnet-gfxoff=0 stays OFF");
 	expect(gfxoff_opt_in(true, 1u), "garnet-gfxoff=1 opts into GFXOFF");
 
+	expect(!idle_clamp_enabled(false, 0u), "garnet-idle-clamp absent defaults OFF (SMUPowerState::Auto)");
+	expect(!idle_clamp_enabled(false, 1u), "garnet-idle-clamp absent ignores uninitialized value");
+	expect(!idle_clamp_enabled(true, 0u), "garnet-idle-clamp=0 stays OFF (Auto)");
+	expect(idle_clamp_enabled(true, 1u), "garnet-idle-clamp=1 clamps GFXCLK to 200 MHz Low");
+	expect(idle_clamp_enabled(true, 2u), "garnet-idle-clamp nonzero opts into Low clamp");
+
 	// Exact live RX 9060 XT defaults -> upstream GFX12 gated values
 	expect(gfx12_cgtt_mgcg_override(0x000007FFu, true) == 0x00000040u,
 	       "RLC_CGTT_MGCG_OVERRIDE 0x7FF -> 0x40 (all upstream GFX12 overrides cleared, MGLS untouched)");
