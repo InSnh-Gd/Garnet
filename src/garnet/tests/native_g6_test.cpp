@@ -11,6 +11,7 @@
 //       owner / registered-accelerator identities, externalMethod's route check precedes the role checks, GarnetDriver::newUserClient passes the Bringup route with itself, the hook creates the
 //       client on the accelerator route, returns an IOReturn (never `rc == kIOReturnSuccess` as a bool), takes gLock only around the nub read; both ops tables end with op_native_open; the class
 //       keeps its name and never derives from IOAccelerationUserClient (WebKit's GPU process denies that class by name).
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -173,13 +174,13 @@ static void r4_pins(const std::string &root) {
     // both tables
     expect_u("both tables end with op_native_open", count_of(nub, "\top_native_open,\n};"), 2u);
     expect(nub.find("const GarnetMetalOps gOps = {") != std::string::npos && nub.find("const GarnetMetalOps gOpsOff = {") != std::string::npos && nub.find("gOpsV1") == std::string::npos, "the tables are gOps (display on) and gOpsOff (display off): both ABI 3");
-    expect_u("both tables are built at 673", count_of(nub, "(uint32_t)sizeof(GarnetMetalOps), 673u,"), 2u);
+    expect_u("both tables use GARNET_KEXT_BUILD", count_of(nub, "(uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD,"), 2u);
     expect(nub.find("rdna4disp::ops_shape(rdna4disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out gOps only with the display latch ON");
     expect(nub.find("static_assert(GARNET_METAL_UC_GARNETN == GARNETN_UC_TYPE,") != std::string::npos, "the type constants are tied at compile time");
     // the Info.plist version
     const std::string plist = slurp(root + "/src/garnet/Info.plist");
-    expect(plist.find("<string>0.0.673</string>") != std::string::npos && plist.find("0.0.654") == std::string::npos, "Info.plist says 0.0.673");
-    expect(slurp(K + "amd/native_s1c.h").find("kN1cKextBuild = 673;") != std::string::npos, "Hello / QueryInfo report build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION");
+    expect(garnet_test_ver::header_and_sources_match(root, slurp(K + "amd/native_s1c.h")), "Hello / QueryInfo match single version source");
 }
 
 int main(int argc, char **argv) {

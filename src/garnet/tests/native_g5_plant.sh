@@ -15,8 +15,8 @@ escaped=0; total=0
 fresh() {   # the scratch tree: the kext sources, the plist, the test and the CLI
   find "$SCR" -mindepth 1 -delete; mkdir -p "$SCR/$K/tests" "$SCR/tools/rdna4/native"
   cp -R "$ROOT/$K/src" "$SCR/$K/"
-  cp "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_g5_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_g5_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/rdna4/native/garnettest.c" "$SCR/tools/rdna4/native/"
 }
 build_run() {   # -> sets OUT, returns 0 pass / 1 test failed / 2 compile failed
@@ -152,9 +152,10 @@ plant 63 $E '        if (el < 5000000ull) IODelay(1); else IOSleep(1);
 # ---- the CLI, the version ----
 plant 70 $C 'hangstat [0..8]|sessstat [0..9]|' 'hangstat [0..8]|sessstat [0..8]|' "CLI 70: the usage does not offer G5 page 9"
 plant 71 $C '        } else if (c == 0 && out[4] == 9) {' '        } else if (c == 0 && out[4] == 99) {' "CLI 71: G5 page 9 is not printed"
-plant 72 $PL '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < src/garnet/VERSION)
+plant 72 $PL "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.642</string>' "VERSION 72: Info.plist is not bumped"
-plant 73 $H 'kN1cKextBuild = 673;' 'kN1cKextBuild = 642;' "VERSION 73: the native client build number is stale"
+plant 73 $H 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 642;' "VERSION 73: the native client build number is stale"
 echo "native_g5_plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"
 [ $escaped -eq 0 ]

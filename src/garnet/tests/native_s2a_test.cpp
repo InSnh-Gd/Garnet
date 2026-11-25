@@ -19,6 +19,7 @@
 //   S11 source pins: the shared restore function, the single console writer, restore-before-free on every BO path, lock order and no sleep
 //       under the scanout lock, the exemption placed before the refusal, the golden copy at bind, the rate guard replacing the cumulative cap,
 //       the version, the banned strings.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -643,13 +644,9 @@ static void s11_pins(const std::string &root) {
     expect(fn_body(eng, "IOReturn n1c_hello(").find("(flags & ~(uint64_t)RDNA4N_HELLO_F_MINOR) != 0ull") != std::string::npos, "Hello accepts only the minor flag");
     expect(fn_body(eng, "IOReturn n1c_query_info(").find("o->reserved[2] = RDNA4N_ABI_MINOR;") != std::string::npos, "QueryInfo reports the minor");
     {
-        const size_t p = engh.find("kN1cKextBuild = ");
-        const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
-        const size_t v = plist.find("<string>0.0.");
-        const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version (Hello can no longer print a stale build)");
-        expect_u("Info.plist is 0.0.673", (uint64_t)ver, 673);
-        expect_u("the plist carries the version twice", count_of(plist, "0.0.673"), 2);
+        const uint32_t build = garnet_test_ver::parse_build(garnet_test_ver::read_version(root));
+        expect(build > 0 && garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+        expect(garnet_test_ver::header_and_sources_match(root, engh), "kN1cKextBuild matches single version source");
     }
     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
     // -- the tool --

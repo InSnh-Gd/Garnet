@@ -15,6 +15,7 @@
 //      leg ran), the latched stop, the polarity fallback once, a refused fault leg, the verdict;
 //   U9 source pins: the kext calls the driver and the builder, the run sits after the ladder behind the gate, the file writes exactly
 //      the registers it claims, nothing on MMHUB, the MES mask and the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -393,9 +394,7 @@ static void u9_pins(const std::string &root) {
     const std::string plist = slurp(root + "/src/garnet/Info.plist");
     expect(!nat.empty() && !boot.empty() && !mes.empty() && !plist.empty(), "the source files were read (run from the repo root)");
     expect(mes.find("in.vmid_mask_gfxhub = 0xFE;") != std::string::npos, "mes_v12_1.cpp still sets vmid_mask_gfxhub = 0xFE (kMesVmidMaskGfxhub)");
-    int plistVer = 0;
-    { const size_t vp = plist.find("<string>0.0."); if (vp != std::string::npos) plistVer = std::atoi(plist.c_str() + vp + 12); }
-    expect(plistVer >= 600 && plist.find("0.0.555") == std::string::npos, "Info.plist is 0.0.600 or its successors (0.0.673+)");
+    expect(garnet_test_ver::all_match(root) && garnet_test_ver::parse_build(garnet_test_ver::read_version(root)) >= 600, "Info.plist and version sources match VERSION (>= 600)");
     // U4b: no log line can be cut by the 512-byte logger.
     {
         const std::vector<std::string> nl = log_formats(nat, "NAT_LOG");

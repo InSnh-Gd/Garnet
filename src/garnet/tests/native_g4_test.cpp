@@ -17,6 +17,7 @@
 //   T9..T14 (kext 0.0.641, the G4 review fixes): T9 the close path (gated on apps_on(), the close-time unmap sweep, never free while mapped), T10 the "open refused" log rate limit,
 //       T11 the visible-VRAM pool (hi-first, the non-WindowServer cap, sessstat), T12 WindowServer always gets a slot (open_pick / ws_already_open, exhaustive), T13 the strike table,
 //       T14 wording and the one ungated change.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -340,8 +341,8 @@ static void t8_pins(const std::string &root) {
     const std::string cmd = slurp(root + "/tools/rdna4/native/garnettest.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/native_g4_pure.h"), g2p = slurp(K + "src/amd/native_g2_pure.h");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !clih.empty() && !brg.empty() && !ucl.empty() && !abi.empty() && !plist.empty() && !cmd.empty() && !pol.empty() && !g4p.empty() && !g2p.empty(), "T8: every source is readable");
     // version and ABI
-    expect(count_of(plist, "<string>0.0.673</string>") == 2 && plist.find("0.0.632") == std::string::npos, "T8: Info.plist is 0.0.673, carried twice");
-    expect(engh.find("constexpr uint32_t kN1cKextBuild = 673;") != std::string::npos, "T8: the native client reports build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "T8: Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, engh), "T8: native client matches single version source");
     expect(abi.find("#define RDNA4N_ABI_MINOR     13u ") != std::string::npos, "T8: ABI minor 13");
     expect(abi.find("#define RDNA4N_BUDGET_VALID (1u << 0)") != std::string::npos && abi.find("#define RDNA4N_BUDGET_APP   (1u << 1)") != std::string::npos, "T8: the budget flags are in the ABI header");
     // the latch: one reader, latched once, needs multi

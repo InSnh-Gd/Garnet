@@ -17,6 +17,7 @@
 //   G8  helpers: the live-range test (wrap), remove_queue_after_reset gating, the WAIT_REG_MEM encoding, probe magics, the status pages;
 //   G9  source pins (reachability and order) on the kernel code: the gate inputs, the single latch-clear site, the remap order, no register writes and no
 //       unbounded loop in the G1 block, the WindowServer note, the dispatch before the native refusal, the MES frames, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -479,8 +480,8 @@ static void g9_pins(const std::string &root) {
     // 0.0.626: the register-write claim of 0.0.623 was wrong and is corrected where it was made
     expect(eng.find("No MMIO register write.") == std::string::npos && eng.find("\"No MMIO register write\", which was wrong") != std::string::npos, "the false 'No MMIO register write' comment is corrected");
     // the version
-    expect(count_of(plist, "<string>0.0.673</string>") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.673, carried twice");
-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 673;") != std::string::npos, "the native client reports build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, hdr), "the native client matches single version source");
 }
 
 int main(int argc, char **argv) {

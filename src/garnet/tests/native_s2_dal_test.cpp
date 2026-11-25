@@ -19,6 +19,7 @@
 //   B4  the latch, the busy flag, the level ordering, the allowlist inside a step;
 //   B5  lock sharing: PPSMC and DAL serialise, recursion, allocation failure;
 //   S   source pins: three WREG32 only, callers, IOSleep in every wait, bounded loops, the ABI 1.2 contract text, the tool, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -1295,9 +1296,8 @@ static void s_pins(const std::string &root) {
     }
     // version
     {
-        const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
-        const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.673", (uint64_t)ver, 673); expect_u("the plist carries the version twice", count_of(plist, "0.0.673"), 2);
+        const uint32_t build = garnet_test_ver::parse_build(garnet_test_ver::read_version(root));
+        expect(build > 0 && garnet_test_ver::plist_matches_version(root, plist) && garnet_test_ver::header_and_sources_match(root, engh), "Info.plist and kN1cKextBuild match single version source");
     }
     expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
     // the tool

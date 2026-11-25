@@ -15,6 +15,7 @@
 //       writes (VidMemory 43/61, Resource 60/61/62) only with their factory bit, pointer-checked before any write;
 //   M5  source pins: the only caller of the publish code is the native client's selector (never at boot), the verdict precedes the allocation and the registration, the
 //       selectors' shapes, the hooks are wired to the pure code, no register access in the nub, version 0.0.610, the ABI text, banned strings.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -363,8 +364,8 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect(nub.find("garnetmetal::task_window(kind, size, reserve)") != std::string::npos, "task_window is the pure one");
     expect(nub.find("garnetmetal::factory_mask(present, v)") != std::string::npos && nub.find("\"garnet-metal-fact\"") != std::string::npos, "factory_mask is the pure one behind garnet-metal-fact");
     expect(nub.find("return (int)kIOReturnUnsupported;") != std::string::npos, "mm_hook refuses (no map entry point before #10)");
-    expect(count_of(nub, "GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 673u, garnetmetal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, garnetmetal::kOpsCaps, 0,") != std::string::npos && nub.find("GARNET_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 673, flags, the generic hook and the caps, the display flag and the two display members, native_open");
-    expect(nub.find("const GarnetMetalOps gOpsOff = {\n\tGARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 673u, garnetmetal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
+    expect(count_of(nub, "GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD, garnetmetal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, garnetmetal::kOpsCaps, 0,") != std::string::npos && nub.find("GARNET_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, GARNET_KEXT_BUILD, flags, the generic hook and the caps, the display flag and the two display members, native_open");
+    expect(nub.find("const GarnetMetalOps gOpsOff = {\n\tGARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD, garnetmetal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
     expect(nub.find("functionName->isEqualTo(GARNET_METAL_FN_SYMBOL)") != std::string::npos && nub.find("*(const GarnetMetalOps **)param1 = rdna4disp::ops_shape(rdna4disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction garnet.metal.ops hands out the static table the latch chooses (the display-OFF ABI-3 table unless boot-arg garnet-metal-disp=1)");
     expect(nub.find("if (!d || d != gDev || d->magic != kDevMagic) return;") != std::string::npos, "device_close is idempotent and identity-checked");
     // -- 0.0.611: the vhook and the config are the pure code --
@@ -383,11 +384,10 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     for (const char *t : { "WREG32", "RREG32", "bar0", "bar2", "->dev", "MMIO", "WREG64" }) expect(nub.find(t) == std::string::npos, "the nub source names no register access");
     // -- the version --
     {
-        const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
-        const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version");
-        expect_u("Info.plist is 0.0.673", (uint64_t)ver, 673); expect_u("the plist carries the version twice", count_of(plist, "0.0.673"), 2);
-        expect(nub.find("673u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 673");
+        const std::string verStr = garnet_test_ver::read_version(root);
+        const uint32_t build = garnet_test_ver::parse_build(verStr);
+        expect(build > 0 && garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+        expect(garnet_test_ver::header_and_sources_match(root, engh), "kN1cKextBuild and ops tables match single version source");
     }
     expect(mk.find("src/GarnetMetalNub.cpp") != std::string::npos, "the Makefile builds GarnetMetalNub.cpp");
     expect(abi.find("RDNA4N_SEL_METAL_NUB_PUBLISH") != std::string::npos && abi.find("Never done at boot") != std::string::npos, "the ABI header documents the publish selector");

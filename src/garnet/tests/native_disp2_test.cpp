@@ -14,6 +14,7 @@
 //   E  the flow over the model: the exact (address, value) write sequence of timing, connect and off from the measured firmware state; every precheck refusal writes nothing; ORDER (timing before connect,
 //      off reverses); the DP watch (OTG0 stopping / DIG1 changing triggers off); an allowlist refusal part-way runs off; wait timeouts; WAITIF; status reads only; off from any partial state;
 //   S  source pins: the OFF switch first (no read before it), the dispatcher asks the latch before bind(), the glue's WREG32 follows the guard AND the allowlist, the admission, the CLI, the version, the banned strings.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -4764,8 +4765,8 @@ int main(int argc, char **argv) {
         expect(cli.find("accel disp2 timing1440 2") != std::string::npos && cli.find("INSTANCE 2 at 2560x1440@60 (0.0.634") != std::string::npos, "0.0.634 CLI: the printed run script carries the 1440p sequence");
     }
     {   // 5. the version, the banned strings
-        expect(count_of(plist, "0.0.673") == 2 && plist.find("0.0.630") == std::string::npos, "Info.plist is 0.0.673, carried twice");
-        expect(s1c.find("kN1cKextBuild = 673;") != std::string::npos && count_of(nub, "673u") == 2, "the native client and both ops tables report build 673");
+        expect(garnet_test_ver::plist_matches_version(g_root, plist), "Info.plist matches VERSION, carried twice");
+        expect(garnet_test_ver::header_and_sources_match(g_root, s1c) && count_of(nub, "GARNET_KEXT_BUILD") >= 2, "the native client and both ops tables match single version source");
         const std::string p1 = std::string("pipe+") + "0x280", p2 = std::string("+") + "0x282", p3 = std::string("+") + "0x299";
         const size_t c0 = cli.find("// ---- 0.0.631 (multi-monitor stage M4d)"), c1 = cli.find("static int cmd_accel(const char *what", c0 == std::string::npos ? 0 : c0);
         const std::string cliNew = (c0 == std::string::npos || c1 == std::string::npos) ? std::string("missing") : cli.substr(c0, c1 - c0);

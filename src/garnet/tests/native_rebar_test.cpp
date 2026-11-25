@@ -14,6 +14,7 @@
 //   P6  vramstat: the six sites (pure admission, the kext branch, the CLI), read-only;
 //   P8  the identity at 256 MiB: the 0.0.662 arithmetic against the plan over a sweep of VRAM sizes;
 //   P7  Mesa (no change): with the kernel's 985 / 14512 MiB figures RADV keeps a separate VRAM heap and the largest allocation is 738 MiB (the same formulas, pinned against the Mesa tree when present).
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -324,8 +325,8 @@ static void p5_pins(const std::string &root) {
     expect(has(nbif, "writing BASE_LOW %#010x") && has(nbif, "writing BASE_HIGH %#010x") && at(nbif, "writing BASE_HIGH") < at(nbif, "kRegSelfringBaseHigh, aHigh, beforeHigh, high"), "P5 item 7: the self-ring low and high halves are logged before they are written");
     // version
     const std::string plist = slurp(root + "/src/garnet/Info.plist");
-    expect(count_of(plist, "<string>0.0.673</string>") == 2, "P5: Info.plist is 0.0.673, carried twice");
-    expect(has(s1ch, "constexpr uint32_t kN1cKextBuild = 673;"), "P5: the native client reports build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "P5: Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, s1ch), "P5: native client and nubs match single version source");
 }
 
 static void p6_vramstat(const std::string &root) {

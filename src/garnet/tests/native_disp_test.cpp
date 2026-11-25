@@ -15,6 +15,7 @@
 //      the interlocks (pipeadopt / pipearm 1 / the Metal-nub publish refuse while the nub exists; fbpublish refuses an adopted pipe and a WindowServer session), admission of action 105, the ORDER inside GarnetDisplayNub.cpp
 //      (software refusals < live gates < DDC < snapshot < attach < register), the byte-identity of the ops header with the aux kext's copy, the variant;
 //   F  the project rule: the three forbidden pipe-offset spellings appear in no file of the tree.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -1355,7 +1356,7 @@ int main(int argc, char **argv) {
         expect(nub.find("op_disp_hook") != std::string::npos && nub.find("op_pci_device") != std::string::npos, "the ABI-2 members are wired");
         expect(nub.find("*(const GarnetMetalOps **)param1 = rdna4disp::ops_shape(rdna4disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out the display-OFF table (display members zero) unless the latch is ON (the table the aux kext sees decides display off)");
         expect(nub.find("OSNumber *abi = OSNumber::withNumber((uint64_t)shape.abi, 32);") != std::string::npos && nub.find("out[2] = shape.abi; out[3] = (uint64_t)shape.size;") != std::string::npos, "the published ABI / size properties follow the latch-chosen shape");
-        expect(nub.find("673u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "the ops table carries the build 673");
+        expect(nub.find("GARNET_KEXT_BUILD") != std::string::npos, "the ops table carries GARNET_KEXT_BUILD");
         expect(nub.find("rdna4disp_pci_device(ctx)") != std::string::npos, "P1: op_pci_device is the gated hook");
         expect(nub.find("rdna4disp::fact_mask(") != std::string::npos, "the factory mask goes through rdna4disp::fact_mask (OFF: the boot-arg's mask unchanged)");
         expect(nub.find("rdna4disp_res62(") != std::string::npos, "slot 62 is handled by the display glue");
@@ -1445,8 +1446,8 @@ int main(int argc, char **argv) {
     if (!brg.empty()) expect(brg.find("pci->setProperty(\"VRAM,totalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos && brg.find("pci->setProperty(\"VRAM,totalsize\", d);") != std::string::npos && brg.find("setProperty(\"VRAM,TotalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos &&
                               count_of(brg, "publishNativeVramOn(") == 2 && brg.find("if (amdgpu::native_s1b_latched()) publishNativeVramOn(pciDevice, vramMB);") != std::string::npos && brg.find("const uint64_t bytes = static_cast<uint64_t>(vramMB) << 20;") != std::string::npos,
                               "K5: native boots only (inside the native latch) the IOPCIDevice also gets VRAM,totalMB (32-bit) and VRAM,totalsize (8-byte OSData, bytes); the old VRAM,TotalMB stays");
-    expect(count_of(plist, "0.0.673") == 2 && plist.find("0.0.612") == std::string::npos, "Info.plist is 0.0.673, carried twice");
-    expect(s1ch.find("kN1cKextBuild = 673;") != std::string::npos, "the native client reports build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, s1ch), "the native client matches single version source");
     expect(ops.find("#define GARNET_METAL_ABI         3u") != std::string::npos && ops.find("GARNET_VC_DISPLAYPIPE    7u") != std::string::npos, "the ops header is ABI 3 (since 0.0.656) with the display class");
     expect(pure.find("kNeedFacts") != std::string::npos && flow.find("e.facts_add(kNeedFacts)") != std::string::npos, "adopt adds the needed facts");
     expect(count_of(flow, "e.md_prepare(") == 1 && count_of(flow, "mdc_teardown(e);") == 5 && flow.find("if (inst == rdna4m6::kInstDp) (void)submit_prepare(e, args[0]);") != std::string::npos && count_of(flow, "mdc_acquire(e.mdc(), md)") == 1, "0.0.616: ONE prepare in the whole flow (mdc_ensure, from submit), teardown after every disarm path, submit prepares, perform acquires");
@@ -1566,7 +1567,7 @@ int main(int argc, char **argv) {
                "M: ONE creation site (the verb), no selector, NO withdraw in M5");
         expect(dnub.find("nub->attach(pci)") != std::string::npos && dnub.find("IOService *pci = garnet_driver_pci();") != std::string::npos && dnub.find("setProperty(GARNET_DISP_INDEX_KEY, idx)") != std::string::npos && dnub.find("OSNumber::withNumber((uint64_t)index, 32)") != std::string::npos,
                "M: the nub attaches to the GPU's IOPCIDevice (NOT to GarnetDriver) with GarnetDisplayIndex = the instance's index (0.0.658: 1 = the monitor B, 2 = the monitor A)");
-        expect(dnub.find("GARNET_METAL_OPS_MAGIC") == std::string::npos && dnub.find("GARNET_DISP_OPS_MAGIC, GARNET_DISP_ABI, (uint32_t)sizeof(GarnetDispOps), 673u, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, build 673, the three hooks, the M6 members NULL");
+        expect(dnub.find("GARNET_METAL_OPS_MAGIC") == std::string::npos && dnub.find("GARNET_DISP_OPS_MAGIC, GARNET_DISP_ABI, (uint32_t)sizeof(GarnetDispOps), GARNET_KEXT_BUILD, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, GARNET_KEXT_BUILD, the three hooks, the M6 members NULL");
         expect(dnub.find("functionName->isEqualTo(GARNET_DISP_FN_SYMBOL)") != std::string::npos && dnub.find("*(const GarnetDispOps **)param1 = &gDispOps;") != std::string::npos, "M: callPlatformFunction(\"garnet.disp.ops\") answers the table");
         expect(dnub.find("rdna4fb::snapshot_hook_verdict(slot >= 0, slot >= 0 && __atomic_load_n(&gHaveSnap[slot], __ATOMIC_ACQUIRE) != 0u, out != nullptr) == 0") != std::string::npos && dnub.find("*out = gSnap[slot];") != std::string::npos && dnub.find("if (nub != nullptr && nub == (void *)gNub[i]) slot = (int)i;") != std::string::npos, "M: the snapshot hook answers only for A nub of ours, with ITS OWN index's snapshot, once published");
         { const std::string mnub = slurp(K + "src/GarnetMetalNub.cpp"), dh2 = slurp(K + "src/amd/native_disp.h");

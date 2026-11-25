@@ -14,6 +14,7 @@
 #include <mach/mach_types.h>   // task_t (0.0.612: n1c_bo_import_host)
 
 #include "../GarnetNativeABI.h"
+#include "../garnet_version.h"
 #include "amdgpu_init.h"
 #include "native_s1b.h"
 #include "native_s1c_pure.h"
@@ -23,7 +24,7 @@ class IOUserClient;       // 0.0.641: n1c_unmap_for_close
 
 namespace amdgpu {
 
-constexpr uint32_t kN1cKextBuild = 673;   // Hello / QueryInfo must match the bundle and nub build
+constexpr uint32_t kN1cKextBuild = GARNET_KEXT_BUILD;   // Hello / QueryInfo must match the bundle and nub build
 
 // Legacy-client sites refused once the native VM self-test has touched the GPU (contract 6.2). The legacy ring writers and the pool
 // users that share vram_alloc without a lock.

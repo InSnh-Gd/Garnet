@@ -15,11 +15,11 @@ escaped=0; total=0
 plant() {   # plant <id> <file relative to repo root> <old text> <new text> <description>
   local id="$1" file="$2" old="$3" new="$4" desc="$5"
   rm -rf "$SCR"; mkdir -p "$SCR/$SR/dcn" "$SCR/$SR/amd" "$SCR/$K/tests" "$SCR/tools/native"
-  cp "$ROOT/$SR/GarnetNativeABI.h" "$ROOT/$SR/GarnetNativeClient.cpp" "$ROOT/$SR/GarnetDriver.cpp" "$SCR/$SR/"
+  cp "$ROOT/$SR/GarnetNativeABI.h" "$ROOT/$SR/GarnetNativeClient.cpp" "$ROOT/$SR/GarnetDriver.cpp" "$ROOT/$SR/GarnetMetalNub.cpp" "$ROOT/$SR/GarnetDisplayNub.cpp" "$ROOT/$SR/kmod_info.c" "$ROOT/$SR/garnet_version.h" "$SCR/$SR/"
   cp "$ROOT/$SR/dcn/"scanout_pure.h "$ROOT/$SR/dcn/"dcn.cpp "$ROOT/$SR/dcn/"dcn.hpp "$SCR/$SR/dcn/"
   cp "$ROOT/$SR/amd/"native_s1c.cpp "$ROOT/$SR/amd/"native_s1c.h "$SCR/$SR/amd/"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_s2a_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_s2a_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/rdna4scan.c" "$SCR/tools/native/"
   OLD="$old" NEW="$new" FILE="$SCR/$file" python3 - <<'PY'
 import os,sys
@@ -93,7 +93,7 @@ plant 38 $D '__atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u &&
 	    gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' 'gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' "the cumulative storm cap still trips while the plane is taken"
 plant 39 $D 'if (!gDcn.goldenValid && amdgpu::native_s1b_state().gate == rdna4native::kGateOn) {' 'if (false) {' "no dcnmode golden copy at bind"
 plant 40 $D 'scanEscape("explicit dcnflip 0");' ';' "dcnflip 0 does nothing on a native boot"
-plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = 673;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
+plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
 plant 42 $E '    Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);

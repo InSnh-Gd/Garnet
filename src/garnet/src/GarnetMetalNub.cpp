@@ -7,6 +7,7 @@
 #include "GarnetMetalNub.hpp"
 #include "GarnetDriver.hpp"
 #include "GarnetMetalOps.h"
+#include "garnet_version.h"
 #include "GarnetNativeClient.hpp"   // 0.0.656 (G6): op_native_open creates the client on the accelerator route
 #include "amd/native_metal_pure.h"
 #include "amd/native_s1b.h"
@@ -180,7 +181,7 @@ void *op_pci_device(void *ctx) { return rdna4disp_pci_device(ctx); }
 // TWO tables, the one published chosen by the latch (rdna4disp::ops_shape): with the display flag ONLY with boot-arg garnet-metal-disp=1 (gOps); otherwise gOpsOff, whose display members are zero (the aux kext then takes every
 // 0.0.2 display default). Both are ABI 3 / 152 bytes since 0.0.656 (G6): native_open is the last member and carries its own capability bit.
 const GarnetMetalOps gOps = {
-	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 673u, garnetmetal::kOpsFlags, 0u,
+	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD, garnetmetal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, garnetmetal::kOpsCaps, 0,
@@ -189,7 +190,7 @@ const GarnetMetalOps gOps = {
 };
 // 0.0.656: the OFF table is ABI 3 too (native_open must exist with the display OFF, the normal case): the display members are zero (flags 0, no hook, no PCI getter), which is "display off" to every aux kext.
 const GarnetMetalOps gOpsOff = {
-	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 673u, garnetmetal::kOpsFlags, 0u,
+	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD, garnetmetal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, garnetmetal::kOpsCaps, 0,

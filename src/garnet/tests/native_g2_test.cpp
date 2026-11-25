@@ -19,6 +19,7 @@
 //   T9  the VRAM allowance (pools minus WindowServer / kernel use and growth headroom for non-WindowServer sessions together; OFF and WindowServer unlimited) and the stat pages' layout;
 //   T10 the close-disarm rule: keyed on the closing session being WindowServer's (an admin and a future non-admin app session never disarm);
 //   T11 source pins (reachability and order) on the kernel code, the lock map, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -512,8 +513,8 @@ static void t11_pins(const std::string &root) {
     // banned strings, the version
     const std::string b1 = std::string("pipe+0x2") + "80", b2 = std::string("+0x2") + "82", b3 = std::string("+0x2") + "99";
     for (const std::string *f : { &eng, &pure, &ncl, &hdr }) expect(f->find(b1) == std::string::npos && f->find(b2) == std::string::npos && f->find(b3) == std::string::npos, "no banned pipe offsets");
-    expect(count_of(plist, "<string>0.0.673</string>") == 2 && plist.find("0.0.626") == std::string::npos, "Info.plist is 0.0.673, carried twice");
-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 673;") != std::string::npos, "the native client reports build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, hdr), "the native client matches single version source");
 }
 
 // ---- T12: the G2 review fixes (0.0.629) -------------------------------------------------------------------------------------------------------------------------

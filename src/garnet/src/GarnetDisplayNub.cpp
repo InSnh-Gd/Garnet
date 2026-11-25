@@ -12,6 +12,7 @@
 #include "GarnetDisplayNub.hpp"
 #include "GarnetDriver.hpp"
 #include "GarnetDisplayOps.h"
+#include "garnet_version.h"
 #include "amd/native_display_identity.h"   // the canonical retained primary on this GPU
 #include "amd/native_edid_map_pure.h"      // proven connector -> local DDC line / head table
 #include "amd/native_fb_pure.h"
@@ -83,7 +84,7 @@ void op_trace(uint32_t ev, uint64_t a, uint64_t b) {
 	FBLOG("framebuffer trace: event %u a %#llx b %#llx", ev, (unsigned long long)a, (unsigned long long)b);
 }
 const GarnetDispOps gDispOps = {
-	GARNET_DISP_OPS_MAGIC, GARNET_DISP_ABI, (uint32_t)sizeof(GarnetDispOps), 673u, 0u, 0u,
+	GARNET_DISP_OPS_MAGIC, GARNET_DISP_ABI, (uint32_t)sizeof(GarnetDispOps), GARNET_KEXT_BUILD, 0u, 0u,
 	op_snapshot, op_power, op_trace,
 	nullptr, nullptr, nullptr,
 };

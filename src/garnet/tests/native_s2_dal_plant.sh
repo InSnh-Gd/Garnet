@@ -18,11 +18,11 @@ plant() {   # plant <id> <file relative to repo root> <old text> <new text> <des
   local id="$1" file="$2" old="$3" new="$4" desc="$5"
   if [ "$id" -lt "$FIRST" ] || [ "$id" -gt "$LAST" ]; then return; fi
   rm -rf "$SCR"; mkdir -p "$SCR/$SR" "$SCR/$K/tests" "$SCR/tools/native" "$SCR/notes/design"
-  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$SCR/$SR/"
+  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$ROOT/$SR/"*.c "$SCR/$SR/"
   cp -R "$ROOT/$SR/amd" "$ROOT/$SR/dcn" "$ROOT/$SR/apple" "$SCR/$SR/"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
   cp -R "$ROOT/$K/tests/dalshim" "$SCR/$K/tests/"
-  cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/rdna4dal.c" "$ROOT/tools/native/build.sh" "$SCR/tools/native/"
   cp "$ROOT/an internal design note" "$SCR/notes/design/"
   OLD="$old" NEW="$new" FILE="$SCR/$file" python3 - <<'PY'
@@ -50,11 +50,11 @@ PY
 
 control() {
   rm -rf "$SCR"; mkdir -p "$SCR/$SR" "$SCR/$K/tests" "$SCR/tools/native" "$SCR/notes/design"
-  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$SCR/$SR/"
+  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$ROOT/$SR/"*.c "$SCR/$SR/"
   cp -R "$ROOT/$SR/amd" "$ROOT/$SR/dcn" "$ROOT/$SR/apple" "$SCR/$SR/"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
   cp -R "$ROOT/$K/tests/dalshim" "$SCR/$K/tests/"
-  cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/rdna4dal.c" "$ROOT/tools/native/build.sh" "$SCR/tools/native/"
   cp "$ROOT/an internal design note" "$SCR/notes/design/"
   local out
@@ -155,8 +155,9 @@ plant 68 $SR/amd/native_s1c.cpp '    if (!sess_hello(ref)) return kIOReturnNotRe
     if (flags != 0ull || step < RDNA4N_DAL_STEP_E1B' "selector 15 does not need Hello"
 plant 69 $SR/GarnetNativeClient.cpp 'if (!shape(2, 0, 0, sizeof(rdna4n_dal_result))) return kIOReturnBadArgument;' 'if (!shape(2, 0, 0, 0)) return kIOReturnBadArgument;' "selector 15's output shape is not checked"
 plant 70 $SR/GarnetNativeABI.h '#define RDNA4N_ABI_MINOR     13u ' '#define RDNA4N_ABI_MINOR     1u ' "the ABI minor is not raised"
-plant 71 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 71 $K/Info.plist "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.603</string>' "Info.plist version is stale"
 plant 72 an internal design note '## ABI 1.2 addendum' '## ABI 1.2 notes' "the contract addendum is missing"
 plant 73 tools/native/rdna4dal.c '{ RDNA4N_ABI_VERSION, RDNA4N_HELLO_F_MINOR }' '{ RDNA4N_ABI_VERSION, 0 }' "the tool does not ask for the minor"

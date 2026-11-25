@@ -16,6 +16,7 @@
 //   T5  the watchdog thread: a hung trial thread is restored by the watchdog (stale heartbeat and deadline), once, never twice, the trial answers WATCHDOG; started before the first write;
 //   T6  restore_from_golden (`dcnmode 0`): puts back exactly the drifted registers in reverse order, no copy = no write;
 //   S   source pins: the ABI 1.3 text, the exemption table, the single WREG32 behind the allowlist, golden at bind, dcnmode 0, scanAcquire, shutdown, the selector wiring, the tool, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -1608,9 +1609,8 @@ static void s_pins(const std::string &root) {
     }
     // version
     {
-        const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
-        const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.673", (uint64_t)ver, 673); expect_u("the plist carries the version twice", count_of(plist, "0.0.673"), 2);
+        const uint32_t build = garnet_test_ver::parse_build(garnet_test_ver::read_version(root));
+        expect(build > 0 && garnet_test_ver::plist_matches_version(root, plist) && garnet_test_ver::header_and_sources_match(root, engh), "Info.plist and kN1cKextBuild match single version source");
     }
     // no log line of the glue can be cut by the 512-byte logger: literal length + 12 bytes per conversion at the widest
     {

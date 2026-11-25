@@ -13,10 +13,10 @@ escaped=0; total=0
 
 fresh() {   # the scratch tree: exactly the files native_s1c_test.cpp reads
   rm -rf "$SCR"; mkdir -p "$SCR/$K/src/amd" "$SCR/$K/tests"
-  cp "$ROOT/$K/src/GarnetNativeABI.h" "$ROOT/$K/src/GarnetNativeClient.cpp" "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$SCR/$K/src/"
-  cp "$ROOT/$K/src/amd/"native_s1b_pure.h "$ROOT/$K/src/amd/"native_s1c_pure.h "$ROOT/$K/src/amd/"native_s1c.cpp "$ROOT/$K/src/amd/"cp_pm4_gfx12.h "$ROOT/$K/src/amd/"amdgpu_pm4.h "$SCR/$K/src/amd/"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_s1c_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/src/GarnetNativeABI.h" "$ROOT/$K/src/GarnetNativeClient.cpp" "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$ROOT/$K/src/GarnetMetalNub.cpp" "$ROOT/$K/src/GarnetDisplayNub.cpp" "$ROOT/$K/src/kmod_info.c" "$ROOT/$K/src/garnet_version.h" "$SCR/$K/src/"
+  cp "$ROOT/$K/src/amd/"native_s1b_pure.h "$ROOT/$K/src/amd/"native_s1c_pure.h "$ROOT/$K/src/amd/"native_s1c.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"cp_pm4_gfx12.h "$ROOT/$K/src/amd/"amdgpu_pm4.h "$SCR/$K/src/amd/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_s1c_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
 }
 # BASELINE (review 0.0.612): the UNMODIFIED scratch copy must compile and PASS. Without this a broken scratch copy (a missing file, a stale header) would make every plant "CAUGHT at compile time".
 baseline() {

@@ -15,10 +15,10 @@ FIRST=${1:-0}; LAST=${2:-9999}
 
 fresh() {
   rm -rf "$SCR"; mkdir -p "$SCR/$SR" "$SCR/$K/tests" "$SCR/tools/native" "$SCR/src/dcn41" "$SCR/notes/design"
-  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$SCR/$SR/"
+  cp "$ROOT/$SR/"*.h "$ROOT/$SR/"*.hpp "$ROOT/$SR/"*.cpp "$ROOT/$SR/"*.c "$SCR/$SR/"
   cp -R "$ROOT/$SR/amd" "$ROOT/$SR/dcn" "$ROOT/$SR/apple" "$SCR/$SR/"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_s2d_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_s2d_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/rdna4mode.c" "$ROOT/tools/native/rdna4scan.c" "$ROOT/tools/native/build.sh" "$ROOT/tools/native/gen_modetrial_tables.py" "$SCR/tools/native/"
   cp "$ROOT/src/dcn41/"*.c "$ROOT/src/dcn41/"*.h "$SCR/src/dcn41/"
   cp "$ROOT/.gitignore" "$SCR/.gitignore"
@@ -159,7 +159,7 @@ plant 51 $SR/GarnetNativeClient.cpp "the selector shape is wrong (2 scalars)" 's
 plant 52 $SR/amd/native_s1c.cpp "the selector body ignores non-zero flags" '    if ((flags & ~(uint64_t)RDNA4N_MODE_TF_MASK) != 0ull || out == nullptr) return kIOReturnBadArgument;   // 0.0.606: the flags word carries RDNA4N_MODE_TF_* (0.0.605 required 0)
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);' '    if (out == nullptr) return kIOReturnBadArgument;
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);'
-plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = 673;' 'kN1cKextBuild = 606;'
+plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 606;'
 plant 54 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     13u' '#define RDNA4N_ABI_MINOR     4u'
 plant 55 $SR/amd/smu_dal_pure.h "the DID table: divider of DID 0x40..0x5F is 4-stepped" 'did < 0x60u ? 64u + 2u * (did - 0x40u)' 'did < 0x60u ? 64u + 4u * (did - 0x40u)'
 plant 56 tools/native/rdna4mode.c "the tool does not print the watch warning" '; WATCH THE MONITOR)' ')'

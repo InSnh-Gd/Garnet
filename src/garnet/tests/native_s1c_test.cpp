@@ -21,6 +21,7 @@
 //       control words, canonical VAs untouched, refusals; the fence-window picker and addresses;
 //   U12 source pins on the kext: the gate order, the ring path (space check before the write, emitted before the doorbell, one helper),
 //       exclusivity, the legacy refusals, the client's exact-shape checks, no native_s1b_refuse, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -695,7 +696,7 @@ static void u12_pins(const std::string &root) {
     }
     // build plumbing
     expect(mk.find("src/GarnetNativeClient.cpp") != std::string::npos, "the Makefile builds the client");
-    expect(plist.find("<string>0.0.673</string>") != std::string::npos && count_of(plist, "0.0.673") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.673");
+    expect(garnet_test_ver::plist_matches_version(root, plist) && garnet_test_ver::all_match(root), "Info.plist and version sources match VERSION");
     expect(pure.find("kWbOffsetNativeSeq = 0x0C0u") != std::string::npos, "the native seqno slot offset");
     // banned strings in the new files
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens

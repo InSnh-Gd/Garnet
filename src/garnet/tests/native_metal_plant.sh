@@ -16,8 +16,8 @@ FIRST=${1:-0}; LAST=${2:-9999}
 fresh() {
   rm -rf "$SCR"; mkdir -p "$SCR/$K/tests" "$SCR/tools/rdna4/native"
   cp -R "$ROOT/$SR" "$SCR/$SR"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_metal_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_metal_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/rdna4/native/publish-metal.c" "$SCR/tools/rdna4/native/"
   cp "$ROOT/tools/rdna4/build-native-tools.sh" "$SCR/tools/rdna4/"
 }
@@ -127,7 +127,7 @@ plant 31 $N "the gate ignores HUNG" 'g.hung = amdgpu::n1c_hung();' 'g.hung = fal
 plant 32 $N "the gate does not read the Hello state" 'g.hello = amdgpu::n1c_hello_done();' 'g.hello = true;'
 plant 33 $N "the populate hook is not the pure config_populate" 'garnetmetal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName)' '0'
 plant 34 $N "the ops table carries the wrong build" 'const GarnetMetalOps gOps = {
-	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 673u,' 'const GarnetMetalOps gOps = {
+	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), GARNET_KEXT_BUILD,' 'const GarnetMetalOps gOps = {
 	GARNET_METAL_OPS_MAGIC, GARNET_METAL_ABI, (uint32_t)sizeof(GarnetMetalOps), 610u,'
 plant 35 $N "the memory-map hook claims success" 'return (int)kIOReturnUnsupported;' 'return 0;'
 plant 36 $N "the nub source touches a register" '	MNLOG("device_close");' '	MNLOG("device_close"); (void)"WREG32";'
@@ -136,9 +136,10 @@ plant 38 $C "the publish selector accepts the wrong shape" 'if (!shape(1, 4, 0, 
 		return GarnetMetalNub::selectorPublish' 'if (!shape(1, 3, 0, 0)) return kIOReturnBadArgument;
 		return GarnetMetalNub::selectorPublish'
 plant 39 $C "the withdraw selector is not dispatched" 'case RDNA4N_SEL_METAL_NUB_WITHDRAW:' 'case 20 + 100:'
-plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = 673;' 'kN1cKextBuild = 610;'
-plant 41 $K/Info.plist "the plist is not bumped (one occurrence)" '<key>CFBundleShortVersionString</key>
-	<string>0.0.673</string>' '<key>CFBundleShortVersionString</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 610;'
+plant 41 $K/Info.plist "the plist is not bumped (one occurrence)" "<key>CFBundleShortVersionString</key>
+	<string>$VER</string>" '<key>CFBundleShortVersionString</key>
 	<string>0.0.610</string>'
 plant 42 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     13u ' '#define RDNA4N_ABI_MINOR     7u '
 plant 43 $SR/GarnetNativeABI.h "the withdraw selector moves" 'RDNA4N_SEL_METAL_NUB_WITHDRAW = 20,' 'RDNA4N_SEL_METAL_NUB_WITHDRAW = 21,'

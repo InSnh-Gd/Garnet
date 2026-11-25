@@ -113,12 +113,17 @@ LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) 
 
 all: $(KEXT)
 
-$(OBJS): | check-firmware
+$(OBJS): | check-firmware check-version
+check-version:
+	@ver=$$(tr -d ' \t\r\n' < VERSION); \
+	 grep -q "GARNET_KEXT_VERSION_STR \"$$ver\"" src/garnet_version.h || { echo "error: src/garnet_version.h does not match VERSION ($$ver)"; exit 1; }; \
+	 cnt=$$(grep -c "<string>$$ver</string>" Info.plist || true); \
+	 [ "$$cnt" -eq 2 ] || { echo "error: Info.plist must carry <string>$$ver</string> twice (got $$cnt)"; exit 1; }
 check-firmware:
 	@if [ -n "$(FW_MISSING)" ]; then \
 	  echo "error: missing required firmware in firmware/: $(addsuffix .bin,$(FW_MISSING))"; \
 	  echo "       copy them from a linux-firmware checkout: tools/fetch-firmware.sh <path> (see BUILDING.md)"; exit 1; fi
-.PHONY: check-firmware
+.PHONY: check-firmware check-version
 
 # Header dependency tracking (-MMD): a struct change in a shared header (e.g. DeviceContext
 # in amdgpu_regs.h) must rebuild EVERY module, or the kext links objects with mismatched

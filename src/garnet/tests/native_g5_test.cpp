@@ -17,6 +17,7 @@
 //       the ring reserve, WindowServer silent = no throttling, WindowServer on slot 1;
 //   T9  OFF identity: with the switch off (on=false) the simulation equals a model with no gate; the kernel's OFF path is the 0.0.642 text;
 //   T10 source pins (order, reachability, lock discipline) on the kernel code, the CLI, the version.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -529,9 +530,9 @@ static void t10_pins(const std::string &root) {
     // banned strings (the pieces are joined here so this file does not carry them; tools/rdna4/native/garnettest.c already carries two lines from before 0.0.642: not checked here), the version
     const std::string b1 = std::string("pipe+0x2") + "80", b2 = std::string("+0x2") + "82", b3 = std::string("+0x2") + "99";
     for (const std::string *f : { &eng, &pure, &hdr, &brg }) expect(f->find(b1) == std::string::npos && f->find(b2) == std::string::npos && f->find(b3) == std::string::npos, "T10: no banned pipe offsets");
-    expect(count_of(plist, "<string>0.0.673</string>") == 2 && plist.find("0.0.642") == std::string::npos, "T10: Info.plist is 0.0.673, carried twice");
-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 673;") != std::string::npos, "T10: the native client reports build 673");
-    expect(plist.find("<string>0.0.673</string>") != std::string::npos && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "T10: Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, hdr), "T10: native client matches single version source");
+    expect(garnet_test_ver::plist_matches_version(root, plist) && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
 }
 
 int main(int argc, char **argv) {

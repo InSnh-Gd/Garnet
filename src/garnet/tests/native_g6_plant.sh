@@ -16,8 +16,8 @@ FIRST=${1:-0}; LAST=${2:-9999}
 fresh() {
   rm -rf "$SCR"; mkdir -p "$SCR/$K/tests" "$SCR/tools"
   cp -R "$ROOT/$SR" "$SCR/$SR"
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_g6_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_g6_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp -R "$ROOT/tools/native" "$SCR/tools/native"
 }
 build_run() {   # $1 = test name; prints the verdict line; returns 0 if the suite PASSED, 1 if it failed, 2 if it did not compile
@@ -130,6 +130,6 @@ plant 41 $T $O "native_open moves (inserted before disp_flags)" '    int32_t (*n
 plant 42 $T $O "the capability bit collides with VHOOK" '#define GARNET_CAP_NATIVE_OPEN   (1ull << 1)' '#define GARNET_CAP_NATIVE_OPEN   (1ull << 0)'
 plant 43 $T $O "the ops ABI stays 2" '#define GARNET_METAL_ABI         3u ' '#define GARNET_METAL_ABI         2u '
 plant 44 $T $O "the type constant is not 'GRNT'" '#define GARNET_METAL_UC_GARNETN  0x47524E54u ' '#define GARNET_METAL_UC_GARNETN  0x47524E55u '
-plant 45 $T $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 673;' 'constexpr uint32_t kN1cKextBuild = 654;'
+plant 45 $T $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = GARNET_KEXT_BUILD;' 'constexpr uint32_t kN1cKextBuild = 654;'
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

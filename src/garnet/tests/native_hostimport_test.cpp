@@ -13,6 +13,7 @@
 //   H6  review items A / C / D: import_page_verdict (BAR edges, 64-bit BAR above 4 GiB, unaligned and wrapping BARs, DRAM top, unknown = 0, fail closed), the session-sequence ordering model against
 //       close / close+open while the range is wired, memory_may_free_after_flush, and the source pins of the wiring;
 //   H5  source pins of the REAL code: the ordering inside n1c_bo_import_host, bo_release, host_release and n1c_close; the selector wiring and shape; the refusals; the stack rule (no big local).
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -412,7 +413,7 @@ static void h5_pins(const std::string &root) {
     expect(imp.find("IOReturn prepareRc = md->prepare();") != std::string::npos && imp.find("if (prepareRc != kIOReturnSuccess) {") != std::string::npos, "b43: the InOut prepare result decides the fallback");
     expect(eng.find("static_assert(kRelNormal == kHostRelNormal && kRelLeak == kHostRelLeak && kRelClosing == kHostRelClosing") != std::string::npos, "the pure release modes are the kernel's RelMode");
     expect(pure.find("constexpr uint64_t kImportMaxBo   = 64ull << 20;") != std::string::npos && pure.find("constexpr uint64_t kImportCap     = 4096ull << 20;") != std::string::npos, "the limits in the pure header");
-    expect(plist.find("<string>0.0.673</string>") != std::string::npos, "Info.plist is 0.0.673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION");
     expect(imp.find("BoImportHost refused at withAddressRange:") != std::string::npos &&
            imp.find("BoImportHost refused at prepare: IOReturn") != std::string::npos &&
            imp.find("BoImportHost refused at page-list allocation:") != std::string::npos,

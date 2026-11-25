@@ -16,8 +16,8 @@ FIRST=${1:-0}; LAST=${2:-9999}
 fresh() {
   rm -rf "$SCR"; mkdir -p "$SCR/$K/tests" "$SCR/tools/rdna4/native"
   rsync -a --exclude fw "$ROOT/$SR/" "$SCR/$SR/"          # the generated firmware arrays are not read by any pin
-  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_rebar_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_rebar_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/rdna4/native/garnettest.c" "$SCR/tools/rdna4/native/"
 }
 build_run() {   # prints the verdict line; returns 0 if the suite PASSED, 1 if it failed, 2 if it did not compile
@@ -128,10 +128,11 @@ plant 48 $B "vramstat reports used bytes as free" 'v[2] = g.vram_alloc.bytes_fre
 plant 49 $CLI "the CLI usage string forgets vramstat" '|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream' '|m6xstat [0|1|2]|appdeny add <name>/remove <name>/list [page]/clear|capstream'
 plant 50 $SR/GarnetUserClient.cpp "the user client's table comment forgets the verb" '108 = vramstat' '108 = (removed)'
 # ---- version ----
-plant 51 $K/Info.plist "the version is not bumped" '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 51 $K/Info.plist "the version is not bumped" "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.662</string>'
-plant 52 $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 673;' 'constexpr uint32_t kN1cKextBuild = 662;'
+plant 52 $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = GARNET_KEXT_BUILD;' 'constexpr uint32_t kN1cKextBuild = 662;'
 # ---- 0.0.664 (F2 F3 F4 F5 F7 + the vramstat census) ----
 plant 58 $PURE "F3: a length above the 1 GiB cap is planned (capped)" '    if (in.ioLen > in.mapCap) { r.reason = kLenTooBig; return r; }' ''
 plant 59 $NB "F2: the self-ring aperture is enabled even when a base read-back mismatched" 'const bool selfringOn = enable && kr == kIOReturnSuccess;' 'const bool selfringOn = enable;'

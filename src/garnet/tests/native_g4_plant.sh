@@ -14,8 +14,8 @@ escaped=0; total=0
 fresh() {   # the scratch tree: the kext sources, the plist, the test and the CLI
   rm -rf "$SCR"; mkdir -p "$SCR/$K/tests" "$SCR/tools/rdna4/native"
   cp -R "$ROOT/$K/src" "$SCR/$K/"
-  cp "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_g4_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_g4_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/rdna4/native/garnettest.c" "$SCR/tools/rdna4/native/"
 }
 build_run() {   # -> sets OUT, returns 0 pass / 1 test failed / 2 compile failed
@@ -147,10 +147,11 @@ plant 57 $E '        g.mappedLeakBos = gMappedLeakBos;   // 0.0.640 (G4): BOs le
 ' '' "CLOSE 57 (kernel): sessstat 8 never reports the leaked BOs"
 plant 58 $E '        const uint32_t mrc = hung_now() ? kOk : rdna4native::g2::bofree_mapping_rc(' '        const uint32_t mrc = kOk; (void)rdna4native::g2::bofree_mapping_rc(' "R6 58: BoFree of a mapped BO is no longer refused (0.0.629's rule lost)"
 # ---- version ----
-plant 59 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 59 $K/Info.plist "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.632</string>' "the version is not bumped"
-plant 60 $K/src/amd/native_s1c.h 'kN1cKextBuild = 673;' 'kN1cKextBuild = 632;' "the native client build number is stale"
+plant 60 $K/src/amd/native_s1c.h 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 632;' "the native client build number is stale"
 
 plant 61 $N '		if (gAppSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gAppSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for an APP (user application) client", selector);
 		return kIOReturnNotPrivileged;' '		if (gAppSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gAppSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for an APP (user application) client", selector);

@@ -14,8 +14,8 @@ escaped=0; total=0
 fresh() {   # the scratch tree: the kext sources, the plist, the test and the CLI
   rm -rf "$SCR"; mkdir -p "$SCR/$K/tests" "$SCR/tools/rdna4/native"
   cp -R "$ROOT/$K/src" "$SCR/$K/"
-  cp "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_g2_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_g2_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
   cp "$ROOT/tools/rdna4/native/garnettest.c" "$SCR/tools/rdna4/native/"
 }
 build_run() {   # -> sets OUT, returns 0 pass / 1 test failed / 2 compile failed
@@ -115,8 +115,9 @@ plant 42 $P 'o[11] = g.faultNow; o[12] = g.faultPrev;' 'o[11] = g.faultNow; o[12
 plant 43 $E '        if (mrc != kOk) {' '        if (false) {' "R6: BoFree frees a CPU-mapped visible-VRAM BO"
 plant 44 $P 'descriptorRefs > 1u) ? kBusy : kOk;' 'descriptorRefs > 2u) ? kBusy : kOk;' "R6 (pure): one live mapping is not seen"
 plant 45 $E '    if (!multi_on()) { hang_from_wait(); return rdna4native::g2::kBoundStalled; }' '    if (!multi_on()) { return rdna4native::g2::kBoundNoBlame; }' "R2: the switch OFF no longer latches at the ring-wait bound"
-plant 25 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 25 $K/Info.plist "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.626</string>' "the version is not bumped"
 
 echo "native_g2_plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"

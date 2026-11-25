@@ -19,6 +19,7 @@
 //      values (measured card, refusals: disabled / below the FB base / unaligned / outside VRAM / zero, other FB bases so a hard-coded base fails), the flow over a memory model (exactly ONE read at base + offset, refusals
 //      read nothing, a failed read is its own status), the page layout round trip;
 //   S  source pins: dispatch order, bind only for ddcread, the single register write behind the allowlist, no MM_INDEX / DMUB command / GPINT / ring submit in the new glue, the exemption and the bound, the CLI, the version, the project rule.
+#include "garnet_version_check.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -1162,9 +1163,9 @@ static void s_pins(const std::string &root) {
       expect(cli.find("verbs 91..99") != std::string::npos, "the CLI's admission hint names verbs 91..99");
     }
     // 7. the version
-    expect(count_of(plist, "0.0.673") == 2 && plist.find("0.0.622") == std::string::npos, "Info.plist is 0.0.673, carried twice");
-    expect(s1c.find("kN1cKextBuild = 673;") != std::string::npos, "the native client reports build 673");
-    expect(count_of(nub, "673u") == 2 && nub.find("622u") == std::string::npos, "both ops tables carry the build 673");
+    expect(garnet_test_ver::plist_matches_version(root, plist), "Info.plist matches VERSION, carried twice");
+    expect(garnet_test_ver::header_and_sources_match(root, s1c), "the native client matches single version source");
+    expect(count_of(nub, "GARNET_KEXT_BUILD") >= 2, "both ops tables carry GARNET_KEXT_BUILD");
     // 8. the project rule: the banned strings appear in none of the new files
     const std::string banned[3] = { std::string("pipe") + "+0x2" + "80", std::string("+0x2") + "82", std::string("+0x2") + "99" };
     for (const std::string &b : banned) for (const std::string *f : { &flow, &hdr, &glue }) expect(f->find(b) == std::string::npos, "the project rule: no forbidden pipe-offset spelling in the new code");

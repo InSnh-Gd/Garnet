@@ -13,10 +13,10 @@ escaped=0; total=0
 
 fresh() {   # the scratch tree: exactly the files native_g1_test.cpp reads
   rm -rf "$SCR"; mkdir -p "$SCR/$K/src/amd" "$SCR/$K/tests"
-  cp "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$ROOT/$K/src/GarnetNativeClient.cpp" "$SCR/$K/src/"
+  cp "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$ROOT/$K/src/GarnetNativeClient.cpp" "$ROOT/$K/src/GarnetMetalNub.cpp" "$ROOT/$K/src/GarnetDisplayNub.cpp" "$ROOT/$K/src/kmod_info.c" "$ROOT/$K/src/garnet_version.h" "$SCR/$K/src/"
   cp "$ROOT/$K/src/amd/"native_g1_pure.h "$ROOT/$K/src/amd/"native_s1c.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"mes_v12_1.cpp "$ROOT/$K/src/amd/"amdgpu_mes.h "$SCR/$K/src/amd/"
-  cp "$ROOT/$K/Info.plist" "$SCR/$K/"
-  cp "$ROOT/$K/tests/native_g1_test.cpp" "$SCR/$K/tests/"
+  cp "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
+  cp "$ROOT/$K/tests/native_g1_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
 }
 build_run() {   # -> sets OUT, returns 0 pass / 1 test failed / 2 compile failed
   OUT=$(cd "$SCR" && clang++ -std=c++17 -Wall -Wextra -Werror -O0 -I $K/src -I $K/src/amd $K/tests/native_g1_test.cpp -o "$SCR/t" 2>&1) || return 2
@@ -134,8 +134,9 @@ plant 34 $MH 'constexpr uint32_t kResetFlag_reset_legacy_gfx = 1u << 3;' 'conste
 plant 35 $M '    return mes_remove_hw_queue_flags(dev, mes, queue_type, pipe_id, queue_id, doorbell_offset,
                                      kRemoveQueueFlag_unmap_legacy_queue);' '    return mes_remove_hw_queue_flags(dev, mes, queue_type, pipe_id, queue_id, doorbell_offset,
                                      kRemoveQueueFlag_preempt_legacy_gfx);' "the teardown REMOVE_QUEUE frame changes"
-plant 36 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.673</string>' '<key>CFBundleVersion</key>
+VER=$(tr -d ' \t\r\n' < "$K/VERSION")
+plant 36 $K/Info.plist "<key>CFBundleVersion</key>
+	<string>$VER</string>" '<key>CFBundleVersion</key>
 	<string>0.0.621</string>' "the version is not bumped"
 plant 37 $P '    o[4] = kWaitRefNever;' '    o[4] = 0u;' "the WAIT_REG_MEM reference is the zero the poll dword holds (the test IB would not hang)"
 
