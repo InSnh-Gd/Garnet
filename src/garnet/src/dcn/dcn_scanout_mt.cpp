@@ -76,6 +76,10 @@ bool scanIrq(const struct dcn41_irq &irq, uint64_t nowNs, int *ar) {
 		(void)dcn41_irq_set(&gDcn.d, off, false);
 		gDcn.srcEnabled = false;
 		gDcn.stormTripped = true;
+		if (off.kind == DCN41_IRQ_VUPDATE_NO_LOCK && off.inst == gDcn.primaryVblOtg) {
+			__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+			__atomic_store_n(&gDcn.primaryVblStorm.tripped, true, __ATOMIC_RELEASE);
+		}
 		gScan.stormTrips++;
 		gScan.wantRestore = true; gScan.wantWhy = "IRQ storm guard (rate)";
 		RDNA4LOG("rdna4scan: STORM GUARD - more than %u DCE interrupts in %llu ms; source disabled by the handler, console restore requested from the watchdog",
@@ -150,9 +154,11 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 	const bool rd = dcn41_hubp_is_flip_pending(&gDcn.d, 0u, &pend, &early) == DCN41_OK && dcn41_hubp_read_primary_addr(&gDcn.d, 0u, &cur) == DCN41_OK;
 	verified = rd && restore_verified(cur, early, pend, consoleMc);
 	if (gDcn.srcEnabled && gDcn.srcKind == (uint8_t)DCN41_IRQ_VUPDATE_NO_LOCK && gDcn.srcInst == 0u) {
-		struct dcn41_irq off { gDcn.srcKind, gDcn.srcInst };
-		gDcn.tag = "scanirqoff";
-		(void)dcn41_irq_set(&gDcn.d, off, false);
+		if (!(__atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) && gDcn.primaryVblOtg == 0u)) {
+			struct dcn41_irq off { gDcn.srcKind, gDcn.srcInst };
+			gDcn.tag = "scanirqoff";
+			(void)dcn41_irq_set(&gDcn.d, off, false);
+		}
 		gDcn.srcEnabled = false;
 	}
 	table_init(gScan.tbl, consoleMc, gScan.consoleBytes);

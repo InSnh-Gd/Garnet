@@ -104,6 +104,7 @@ private:
 	bool vblHwActive() const;
 	uint32_t vblInitialTimeoutUs() const;
 	void syncHardwareVbl(bool want);
+	void recoverHardwareVblAckIfNeeded();
 	void vblDispatchEnter();
 	void vblDispatchExit();
 	void vblDispatchDrain();

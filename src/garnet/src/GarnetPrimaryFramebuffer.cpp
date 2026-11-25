@@ -912,18 +912,18 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 	};
 
 	auto restoreVblAfterDpms = [&]() {
+		if (!__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE)) {
+			syncHardwareVbl(true);
+		}
 		bool vblWanted = false;
 		if (fVblLock) {
 			IOLockLock(fVblLock);
 			vblWanted = fVblEnabled && !fStopping;
 			IOLockUnlock(fVblLock);
 		}
-		if (vblWanted) {
-			syncHardwareVbl(true);
-			if (fVblTimer) {
-				fVblTimer->enable();
-				fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
-			}
+		if (vblWanted && fVblTimer) {
+			fVblTimer->enable();
+			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 		}
 	};
 
@@ -1267,13 +1267,13 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 			initCursorSlot(driver);
 		}
 		optimizeDet0AndUclkLocked(driver);
+		syncHardwareVbl(true);
 		if (fVblLock) {
 			IOLockLock(fVblLock);
 			const bool wantVbl = fVblEnabled && !fStopping;
 			IOLockUnlock(fVblLock);
-			if (wantVbl) {
-				syncHardwareVbl(true);
-				if (fVblTimer) fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+			if (wantVbl && fVblTimer) {
+				fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 			}
 		}
 	}
@@ -1437,17 +1437,21 @@ void AMDGarnetPrimaryFramebuffer::syncHardwareVbl(bool want) {
 	if (fVblLock) IOLockLock(fVblLock);
 	const bool prev = __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE);
 	fVblOtg = otg;
-	const bool nextArmed = armed && fVblEnabled && !fStopping &&
-	                       !__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE);
+	const bool nextArmed = armed && !fStopping && !__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE);
 	__atomic_store_n(&fVblHwArmed, nextArmed, __ATOMIC_RELEASE);
 	const bool disarmNow = armed && !nextArmed;
 	if (fVblLock) IOLockUnlock(fVblLock);
 	if (disarmNow) {
 		(void)rdna4dcn::primaryVblIrqSet(nullptr, otg, false);
 	} else if (nextArmed && !prev) {
-		RDNA4LOG("primaryfb: hardware DCN41 VBLANK IRQ armed on OTG%u (watchdog %u us)",
+		RDNA4LOG("primaryfb: hardware DCN41 VBLANK IRQ armed on OTG%u (VUPDATE_NO_LOCK, watchdog %u us)",
 		         otg, rdna4vbl::initial_timer_us(vblPeriodUs(), true));
 	}
+}
+
+void AMDGarnetPrimaryFramebuffer::recoverHardwareVblAckIfNeeded() {
+	const uint32_t otg = fActiveOutput.found ? fActiveOutput.otg : 0u;
+	rdna4dcn::primaryVblRecoverAckIfNeeded(otg);
 }
 
 void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
@@ -1456,6 +1460,8 @@ void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
 	OSObject *target = nullptr;
 	void *ref = nullptr;
 	bool deliver = false;
+	uint64_t hwCount = 0u;
+	uint64_t timerCount = 0u;
 
 	if (fVblLock) IOLockLock(fVblLock);
 	if (fVblEnabled && !fStopping &&
@@ -1463,7 +1469,8 @@ void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
 	    __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE) &&
 	    otg == fVblOtg && fVblProc) {
 		fVblLastHwNs = vblNowNs();
-		fVblHwCount++;
+		hwCount = ++fVblHwCount;
+		timerCount = fVblTimerCount;
 		proc = fVblProc;
 		target = fVblTarget;
 		ref = fVblRef;
@@ -1472,6 +1479,11 @@ void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
 	}
 	if (fVblLock) IOLockUnlock(fVblLock);
 
+	if (deliver && (hwCount == 1u || hwCount == 100u)) {
+		RDNA4LOG("primaryfb: hardware DCN41 VBLANK delivered %llu callbacks on OTG%u (timer fallbacks %llu)",
+		         static_cast<unsigned long long>(hwCount), otg,
+		         static_cast<unsigned long long>(timerCount));
+	}
 	if (deliver && proc) {
 		proc(target, ref);
 	}
@@ -1491,6 +1503,7 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 	void *ref = nullptr;
 	bool enabled = false;
 	bool suppressed = false;
+	bool needAckRecover = false;
 	const uint32_t periodUs = self->vblPeriodUs();
 
 	if (self->fVblLock) IOLockLock(self->fVblLock);
@@ -1500,6 +1513,7 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 		suppressed = rdna4vbl::should_suppress_timer(hwActive, self->vblNowNs(),
 		                                             self->fVblLastHwNs, periodUs);
 		if (!suppressed) {
+			needAckRecover = hwActive;
 			self->fVblTimerCount++;
 			proc = self->fVblProc;
 			target = self->fVblTarget;
@@ -1509,6 +1523,9 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 	}
 	if (self->fVblLock) IOLockUnlock(self->fVblLock);
 
+	if (needAckRecover) {
+		self->recoverHardwareVblAckIfNeeded();
+	}
 	if (!enabled) {
 		self->vblDispatchExit();
 		return;
@@ -1567,7 +1584,9 @@ void AMDGarnetPrimaryFramebuffer::initForPM() {
 	};
 	registerPowerDriver(this, powerStates, 3);
 	temporaryPowerClampOn();
-	changePowerStateTo(2);
+	// Mirror IONDRVFramebuffer: hold at Doze (1) so AppleDisplay sleep/wake drives state 2 <-> 1
+	// (DPMS off/on) without dropping to system-sleep state 0; garnet-dpms=0 clamps at state 2.
+	changePowerStateTo(fDpmsAllowed ? 1 : 2);
 	IOService *p = getProvider();
 	if (p) p->setProperty("IOPMIsPowerManaged", true);
 }
@@ -1705,27 +1724,21 @@ IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode
 	         target.width, target.height,
 	         target.refreshMilliHz() / 1000u, target.refreshMilliHz() % 1000u,
 	         static_cast<unsigned long long>(target.pixelClockHz));
-	bool vblWasEnabled = false;
-	if (fVblLock) {
-		IOLockLock(fVblLock);
-		vblWasEnabled = fVblEnabled && !fStopping;
-		IOLockUnlock(fVblLock);
-	}
-	if (vblWasEnabled) syncHardwareVbl(false);
+	syncHardwareVbl(false);
 	if (!applyHardwareModeLocked(target)) {
-		if (vblWasEnabled) syncHardwareVbl(true);
+		syncHardwareVbl(true);
 		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnError;
 	}
 	fCurrentMode = displayMode;
 	fCurrentDepth = depth;
+	syncHardwareVbl(true);
 	if (fVblTimer) {
 		bool enabled = false;
 		if (fVblLock) IOLockLock(fVblLock);
 		enabled = fVblEnabled && !fStopping;
 		if (fVblLock) IOLockUnlock(fVblLock);
 		if (enabled) {
-			syncHardwareVbl(true);
 			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 		}
 	}
@@ -1942,11 +1955,12 @@ IOReturn AMDGarnetPrimaryFramebuffer::setInterruptState(void *interruptRef, UInt
 
 	if (want) {
 		if (!ensureVblTimer()) return kIOReturnNoMemory;
-		syncHardwareVbl(true);
+		// Keep hardware VUPDATE_NO_LOCK armed across WindowServer's frequent setInterruptState(1/0)
+		// toggles so we never churn DCN MMIO or contend with ihEntry() on rdna4_display_txn.
+		if (!vblHwActive()) syncHardwareVbl(true);
 		fVblTimer->enable();
 		fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 	} else {
-		syncHardwareVbl(false);
 		if (fVblTimer) {
 			fVblTimer->disable();
 			fVblTimer->cancelTimeout();

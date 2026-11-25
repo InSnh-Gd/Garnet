@@ -67,9 +67,10 @@ struct DcnState {
 	uint64_t entriesAtEnable { 0 };
 	bool     stormTripped { false };
 
-	// Stage 3A: primary framebuffer VSTARTUP IRQ state (rate-guarded, independent of `dcnvbl`)
+	// Stage 3A: primary framebuffer VUPDATE_NO_LOCK IRQ state (rate-guarded, shared with `rdna4scan`)
 	bool     primaryVblEnabled { false };
 	uint8_t  primaryVblOtg     { 0 };
+	bool     irqAckRecoveryNeeded { false };
 	rdna4vbl::RateStormGuard primaryVblStorm {};
 
 	// IH counters

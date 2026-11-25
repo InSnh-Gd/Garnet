@@ -51,6 +51,7 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	uint64_t fVblLastHwNs = 0u;
 	uint64_t fVblTimerCount = 0u;
 	unsigned hwSyncCalls = 0u;
+	unsigned ackRecoverCalls = 0u;
 	bool dispatchHeld = false;
 	unsigned drainCalls = 0u;
 	bool ensureVblTimer() { return timerAvailable; }
@@ -61,6 +62,9 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	void syncHardwareVbl(bool want) {
 		++hwSyncCalls;
 		__atomic_store_n(&fVblHwArmed, want && hwVblAvailable && !fStopping, __ATOMIC_RELEASE);
+	}
+	void recoverHardwareVblAckIfNeeded() {
+		++ackRecoverCalls;
 	}
 	void vblDispatchEnter() { dispatchHeld = true; }
 	void vblDispatchExit() { dispatchHeld = false; }
@@ -190,12 +194,18 @@ int main() {
 	       "fresh HW VBL suppresses duplicate timer callback and preserves watchdog cadence");
 	hwFb.fakeNowNs += 50000000ULL; // 60 ms >= 2 * 16.667 ms -> HW VBL stalled
 	hwFb.fire();
-	expect(hwState.calls == 1u && hwFb.timer.period == 16667u,
-	       "stalled HW VBL falls back to timer callback at full refresh cadence");
-	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess && !hwFb.fVblHwArmed,
-	       "disabling VBL disarms hardware VBL source");
-	expect(hwFb.unregisterInterrupt(hwState.interrupt) == kIOReturnSuccess && hwFb.drainCalls == 1u,
-	       "unregisterInterrupt invokes synchronous dispatch drain barrier");
+	expect(hwState.calls == 1u && hwFb.timer.period == 16667u && hwFb.ackRecoverCalls == 1u,
+	       "stalled HW VBL falls back to timer callback at full refresh cadence and probes ACK recovery");
+	const unsigned syncBeforeToggle = hwFb.hwSyncCalls;
+	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess &&
+	       hwFb.fVblHwArmed && hwFb.hwSyncCalls == syncBeforeToggle,
+	       "disabling VBL cancels timer without churning hardware VBL arm state");
+	expect(hwFb.setInterruptState(hwState.interrupt, kEnabledInterruptState) == kIOReturnSuccess &&
+	       hwFb.hwSyncCalls == syncBeforeToggle,
+	       "re-enabling VBL reuses armed hardware VBL without redundant MMIO sync");
+	expect(hwFb.unregisterInterrupt(hwState.interrupt) == kIOReturnSuccess &&
+	       !hwFb.fVblHwArmed && hwFb.drainCalls == 1u,
+	       "unregisterInterrupt disarms hardware VBL and invokes synchronous dispatch drain barrier");
 	expect(target.retainCount == 1 && !hwFb.dispatchHeld && !framebuffer.dispatchHeld,
 	       "target retain/release and dispatch lock stay balanced across normal and re-entrant paths");
 

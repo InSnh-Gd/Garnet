@@ -51,10 +51,11 @@ uint32_t state(uint64_t arg, uint64_t *out, unsigned outCount);
 // the source's own enable/ack bits, and both are inside the allowlist.
 uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount);
 
-// Stage 3A: primary framebuffer hardware VBLANK (DCN41_IRQ_VSTARTUP) control,
-// isolated from `accel dcnvbl` and guarded by a 1000/s rate storm guard.
+// Stage 3A: primary framebuffer hardware VBLANK (DCN41_IRQ_VUPDATE_NO_LOCK, matching Linux amdgpu_dm),
+// refcounted cleanly alongside `rdna4scan` and guarded by a 1000/s rate storm guard.
 bool primaryVblIrqSet(GarnetDriver *owner, uint32_t otg, bool enable);
 bool primaryVblIrqActive();
+void primaryVblRecoverAckIfNeeded(uint32_t otg);
 void primaryVblShutdown();
 
 // `accel dcnflip <n>` — T3-FLIP. 0 restore the console plane unconditionally (the escape hatch,

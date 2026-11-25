@@ -84,6 +84,7 @@ struct DcnState {
 	uint64_t entriesAtEnable { 0 };
 	bool primaryVblEnabled { false };
 	uint8_t primaryVblOtg { 0 };
+	bool irqAckRecoveryNeeded { false };
 	rdna4vbl::RateStormGuard primaryVblStorm {};
 	const char *tag { "?" };
 };
@@ -233,19 +234,36 @@ static void contract_checks() {
 	expect(gDcn.dceVupdate[0] == 0u && gDcn.dceVstartup[1] == 0u &&
 	       gDcn.dceUnclassified == 0u,
 	       "a refused lease does not increment per-source or unclassified ACK counters");
+	expect(gDcn.irqAckRecoveryNeeded,
+	       "a refused lease arms the watchdog ACK-recovery flag");
 
-	// Stage 3A: primary VBL VSTARTUP dispatches AFTER releasing rdna4_display_txn.
+	// Stage 3A: primary VBL on VUPDATE_NO_LOCK dispatches AFTER releasing rdna4_display_txn
+	// and works both standalone (gScan.active == 0) and shared with native scanout (gScan.active == 1).
 	reset_world();
 	gDcn.armed = true;
 	gDcn.primaryVblEnabled = true;
 	gDcn.primaryVblOtg = 0u;
-	gFakeIrq = dcn41_irq { DCN41_IRQ_VSTARTUP, 0u };
+	gDcn.irqAckRecoveryNeeded = true;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 	gFakeNowNs = 1000000000ULL;
-	expect(ihEntry(DCN41_IH_CLIENT_DCE, 42u, 0u), "VSTARTUP entry is consumed");
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, 87u, 0u), "VUPDATE_NO_LOCK entry is consumed");
 	expect(gAckCalls == 1u && gPrimaryVblCalls == 1u && gPrimaryVblLastOtg == 0u,
-	       "primary VBL VSTARTUP ACKs under lease and notifies FB outside lease");
+	       "primary VBL VUPDATE_NO_LOCK ACKs under lease and notifies FB outside lease");
+	expect(!gDcn.irqAckRecoveryNeeded,
+	       "successful VUPDATE_NO_LOCK ACK clears the ACK-recovery flag");
 	expect(gTxnBegins == 1u && gTxnEnds == 1u && !gLeaseActive,
 	       "primary VBL path releases the display lease cleanly");
+
+	reset_world();
+	gDcn.armed = true;
+	gScan.active = 1u;
+	gDcn.primaryVblEnabled = true;
+	gDcn.primaryVblOtg = 0u;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
+	gFakeNowNs = 1500000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, 87u, 0u), "shared scanout+primary VUPDATE_NO_LOCK is consumed");
+	expect(gScanCalls == 1u && gAckCalls == 0u && gPrimaryVblCalls == 1u && gPrimaryVblLastOtg == 0u,
+	       "shared VUPDATE_NO_LOCK serves scanIrq under lease AND notifies primary FB outside lease");
 
 	// Stage 3A: primary VBL rate-based storm guard (> 1000/s) disables inside lease and skips notify.
 	reset_world();
@@ -254,12 +272,12 @@ static void contract_checks() {
 	gDcn.primaryVblOtg = 0u;
 	gDcn.primaryVblStorm.windowStartNs = 2000000000ULL;
 	gDcn.primaryVblStorm.windowCount = rdna4vbl::kStormWindowMaxIrqs;
-	gFakeIrq = dcn41_irq { DCN41_IRQ_VSTARTUP, 0u };
+	gFakeIrq = dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 	gFakeNowNs = 2100000000ULL;
-	expect(ihEntry(DCN41_IH_CLIENT_DCE, 42u, 0u), "storm-tripping VSTARTUP is consumed");
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, 87u, 0u), "storm-tripping VUPDATE_NO_LOCK is consumed");
 	expect(gIrqSetCalls == 1u && !gDcn.primaryVblEnabled && gDcn.primaryVblStorm.tripped,
-	       "primary VBL storm guard disables DCN41_IRQ_VSTARTUP inside lease");
-	expect(gPrimaryVblCalls == 0u, "storm-tripping VSTARTUP suppresses FB notification");
+	       "primary VBL storm guard disables DCN41_IRQ_VUPDATE_NO_LOCK inside lease when scanout is inactive");
+	expect(gPrimaryVblCalls == 0u, "storm-tripping VUPDATE_NO_LOCK suppresses FB notification");
 }
 
 int main() {
