@@ -56,7 +56,8 @@ static NSData *rdna4_spv_lookup(NSString *shader, const char *role, NSError **er
     return nil;
 }
 OBJC
-    awk '/^static NSError \*rdna4_dump_pipeline\(/ {emit=1} emit {print} emit && /^}/ {exit}' "$source_dir/rdna4_shader_dump_impl.inc"
+    echo '#define GARNET_INTERNAL static'
+    awk '/^GARNET_INTERNAL NSError \*rdna4_dump_pipeline\(/ {emit=1} emit {print} emit && /^}/ {exit}' "$source_dir/garnet_shaders.m"
     cat <<'OBJC'
 static BOOL check(const char *label, BOOL vertexHit, BOOL fragmentHit, BOOL hasFrag, BOOL inproc,
                   NSArray<NSString *> *expected) {
@@ -73,7 +74,7 @@ static BOOL check(const char *label, BOOL vertexHit, BOOL fragmentHit, BOOL hasF
     waited = @[];
     ready = [NSSet setWithArray:expected];
 OBJC
-    awk '/rdna4_dump_pipeline\(d/ {emit=1} emit {print} /NSError \*dumpFailure =/ {print "    (void)dumpFailure;"} emit && /^            }$/ {exit}' "$source_dir/rdna4_render_pipeline_impl.inc"
+    awk '/rdna4_dump_pipeline\(d/ {emit=1} emit {print} /NSError \*dumpFailure =/ {print "    (void)dumpFailure;"} emit && /^            }$/ {exit}' "$source_dir/garnet_pipelines.m"
     cat <<'OBJC'
     BOOL okay = [queued isEqualToArray:expected] && [waited isEqualToArray:expected] &&
         (inproc || (vsd && (!hasFrag || fsd)));

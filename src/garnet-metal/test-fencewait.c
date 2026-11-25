@@ -1,6 +1,6 @@
 // test-fencewait.c: host test of rdna4_fencewait.h (bounded-slice fence wait,
 // sub-ms wakeup, non-blocking serial completion queue) plus source pins on
-// rdna4_command_buffer_impl.inc and rdna4_command_queue_impl.inc.
+// garnet_commands.m and garnet_commands.m.
 // Build/run: cc -O1 -Wall -Wextra -Werror -pthread -o /tmp/test-fencewait test-fencewait.c && /tmp/test-fencewait .
 #include <pthread.h>
 #include <stdatomic.h>
@@ -289,8 +289,8 @@ int main(int argc, char **argv) {
     }
 
     // ---- 4. production source pins ----
-    char *cb = slurp(dir, "rdna4_command_buffer_impl.inc");
-    char *cq = slurp(dir, "rdna4_command_queue_impl.inc");
+    char *cb = slurp(dir, "garnet_commands.m");
+    char *cq = slurp(dir, "garnet_commands.m");
     CHECK("sources readable", cb != NULL && cq != NULL, "%s", dir);
     if (cb && cq) {
         CHECK("pin: rdna4FencePoll removed from command buffer and queue",

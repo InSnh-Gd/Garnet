@@ -8,7 +8,7 @@
  */
 
 #define RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST 1
-#include "rdna4_argument_summary.inc"
+#include "garnet_arguments.m"
 
 #include <stdio.h>
 #include <stdlib.h>

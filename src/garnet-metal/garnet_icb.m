@@ -1,3 +1,15 @@
+// garnet_icb.m - GarnetMetal modular compilation unit.
+#if !defined(GARNET_INTERNAL) && !defined(GARNET_METAL_MODULAR_BUILD)
+#define GARNET_INTERNAL static
+#endif
+#ifdef GARNET_METAL_MODULAR_BUILD
+#include "garnet_metal_internal.h"
+#endif
+#ifdef GARNET_METAL_INTERNAL_H
+#include "rdna4_luma_workgroup.h"
+#include "rdna4_icb_expand.h"
+#endif
+
 #ifndef RDNA4_ICB_INC
 #define RDNA4_ICB_INC
 
@@ -35,6 +47,7 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 @class RDNA4IndirectComputeCommand;
 @class RDNA4CommandBuffer;
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4CommandBuffer (RDNA4OrderedHostAction)
 - (id<MTLDevice>)device;
 - (BOOL)rdna4EncodeOrderedHostAction:(BOOL (^)(NSError **))action error:(NSError **)error;
@@ -50,7 +63,9 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (BOOL)rdna4Bytes:(const void *)p length:(NSUInteger)n buffer:(RDNA4Buffer * __strong *)ob offset:(NSUInteger *)oo;
 #endif
 @end
+#endif
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4RenderEncoder (RDNA4IndirectCommands)
 - (id)rdna4ICBDevice;
 - (RDNA4CommandBuffer *)rdna4ICBCommandBuffer;
@@ -61,8 +76,10 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (void)rdna4ICBClearExplicitBuffers;
 - (void)rdna4ICBRetainResource:(id)resource;
 @end
+#endif
 
 #ifdef VK_VERSION_1_0
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4RenderEncoder (RDNA4InternalAccess)
 - (void)rdna4SyncResourceSegment;
 - (void)rdna4SnapshotResources;
@@ -75,13 +92,17 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (void)drawPatches:(NSUInteger)cp patchStart:(NSUInteger)ps patchCount:(NSUInteger)pc patchIndexBuffer:(id)pib patchIndexBufferOffset:(NSUInteger)pio instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi;
 - (void)drawIndexedPatches:(NSUInteger)cp patchStart:(NSUInteger)ps patchCount:(NSUInteger)pc patchIndexBuffer:(id)pib patchIndexBufferOffset:(NSUInteger)pio controlPointIndexBuffer:(id)cpib controlPointIndexBufferOffset:(NSUInteger)cpio instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi;
 @end
+#endif
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4ComputeEncoder (RDNA4InternalAccess)
 - (void)rdna4SnapshotResources;
 - (void)rdna4OwnResource:(id)object kind:(uint32_t)kind fragment:(BOOL)fragment index:(NSUInteger)index;
 - (void)rdna4ICBComputeBarrier;
 @end
+#endif
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4ComputeEncoder (RDNA4IndirectCommands)
 - (id)rdna4ICBDevice;
 - (RDNA4CommandBuffer *)rdna4ICBCommandBuffer;
@@ -97,6 +118,7 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
                    indirectOffset:(NSUInteger)indirectOff
                       useIndirect:(BOOL)useIndirect;
 @end
+#endif
 #endif
 
 @interface RDNA4ICBBind : NSObject
@@ -3808,8 +3830,10 @@ static void rdna4_icb_add_local(const rdna4dc_caps *caps, uint32_t (*locals)[3],
 @end
 #endif
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4BlitEncoder (RDNA4IndirectCommands)
 @end
+#endif
 
 @implementation RDNA4BlitEncoder (RDNA4IndirectCommands)
 - (void)resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)buffer withRange:(NSRange)range {
@@ -3868,11 +3892,13 @@ static void rdna4_icb_add_local(const rdna4dc_caps *caps, uint32_t (*locals)[3],
 }
 @end
 
+#ifndef GARNET_METAL_INTERNAL_H
 @interface GarnetDevice (RDNA4IndirectCommandBuffers)
 - (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
                                                        maxCommandCount:(NSUInteger)maxCommandCount
                                                                 options:(MTLResourceOptions)options;
 @end
+#endif
 
 @implementation GarnetDevice (RDNA4IndirectCommandBuffers)
 - (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor

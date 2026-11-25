@@ -255,7 +255,7 @@ static BOOL rdna4_buffer_table_set(rdna4_buffer_table *table, uint32_t slot,
     return YES;
 }
 
-#include "rdna4_icb.inc"
+#include "garnet_icb.m"
 
 static _Atomic unsigned rdna4_tx_copy_calls;
 static _Atomic unsigned rdna4_tx_fail_copy_at;

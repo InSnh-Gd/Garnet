@@ -1,75 +1,956 @@
+// garnet_backend.m - GarnetMetal modular compilation unit.
+#if !defined(GARNET_INTERNAL) && !defined(GARNET_METAL_MODULAR_BUILD)
+#define GARNET_INTERNAL static
+#endif
+#if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
+#ifdef GARNET_METAL_MODULAR_BUILD
+#include "garnet_metal_internal.h"
+#endif
+#endif
+
+#if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
+
+GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
+    char buf[2048]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    os_log(OS_LOG_DEFAULT, "GarnetMetal: %{public}s", buf);
+    fprintf(stderr, "GarnetMetal: %s\n", buf);
+}
+// #12 R5: per-command-buffer / per-encoder lines are rate limited per call site: the first 8, then every 1024th (errors and WARN lines stay RDNA4LOG).
+
+// ---------------------------------------------------------------------------------------------------------------
+// Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
+// tool that opts in with RDNA4M_ALLOW=1, or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
+// successful RDNA4N open + QueryInfo, never by name; rdna4_gate.h) may get a device. All test hooks are honoured only with RDNA4M_ALLOW=1 as root.
+// Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see rdna4_gate.h.
+//   /private/tmp/rdna4m-off              exists -> decline (L1 kill file); outside WindowServer also when the stat is denied (anything but ENOENT / ENOTDIR)
+//   /private/tmp/rdna4m-starts           one epoch-seconds line per WindowServer init; >= 3 within 300 s -> decline (L2)
+//   nub property "Garnet,Ready" = 0    -> decline (L3); WindowServer: absent (old kexts) -> proceed; elsewhere it must be present and 1
+//   nub property "Garnet,AutoDisarmed" = 1 -> decline (#12); absent -> ignored (the kext does not publish it today)
+//   /private/tmp/rdna4m-headless-no      exists -> isHeadless NO (default YES); read once per process
+//   /private/tmp/rdna4m-noplanes         exists -> P2: multi-plane IOSurfaces refused as before (default: plane p of a 2/3-plane surface is accepted); read once per process
+//   /private/tmp/rdna4m-noflip           exists -> S5.2a D-copy present OFF for the process (the kernel v1 copy continues); read once per process
+//   RDNA4M_TEST_IGNORE_KILL=1            (root + RDNA4M_ALLOW=1, NOT WindowServer) -> rdna4m-off is IGNORED in that process only (S5.2b test bypass)
+//   RDNA4M_TEST_FALLBACK_AS_WS=1         (root + RDNA4M_ALLOW=1) -> a spvcache miss gives a FALLBACK pipeline as in WindowServer (hot-swap oracle: mtlprobe hotswap)
+//   RDNA4M_TEST_HIDE_BUNDLE_SPV=1        (root + RDNA4M_ALLOW=1) -> the bundle's Resources/spvcache is NOT consulted (only the side directory)
+//   RDNA4M_TEST_SIDE_DIR=<dir>           (root + RDNA4M_ALLOW=1) -> replaces the side spvcache directory /private/var/tmp/rdna4m-spv
+//   RDNA4M_TEST_DISPFLIP=1               (root + RDNA4M_ALLOW=1) -> a surface may be accepted as a display surface without the CoreDisplay backtrace signal (mtlprobe dispflip sets it)
+// ---------------------------------------------------------------------------------------------------------------
+
+GARNET_INTERNAL BOOL rdna4_is_ws(void) {
+    static int v = -1;
+    if (v < 0) { const char *p = getprogname(); v = (p && !strcmp(p, "WindowServer")) ? 1 : 0; }
+    return v == 1;
+}
+GARNET_INTERNAL BOOL rdna4_allow(void) {
+    const char *e = getenv("RDNA4M_ALLOW");
+    return e && !strcmp(e, "1") && geteuid() == 0;
+}
+GARNET_INTERNAL BOOL rdna4_force_fallback(void) {
+    const char *e = getenv("RDNA4M_FORCE_FALLBACK");
+    return rdna4_allow() && e && !strcmp(e, "1");
+}
+// Test hook (root + RDNA4M_ALLOW=1): this process takes the WindowServer branch of the fallback rule (a spvcache miss yields a fallback pipeline,
+// not an error) while the lookup stays real, so the hot-swap can be exercised from mtlprobe.
+GARNET_INTERNAL BOOL rdna4_test_fb_as_ws(void) {
+    const char *e = getenv("RDNA4M_TEST_FALLBACK_AS_WS");
+    return rdna4_allow() && e && !strcmp(e, "1");
+}
+// GPU-apps G4: 1 once the kernel admitted this (non-WindowServer, non-RDNA4M_ALLOW) process as an allow-listed application (rdna4_admit's probe succeeded).
+GARNET_INTERNAL _Atomic int rdna4_app_admitted;
+GARNET_INTERNAL BOOL rdna4_fallback_ok(void) { return rdna4g_fallback_ok(rdna4_is_ws(), rdna4_force_fallback(), rdna4_test_fb_as_ws(), atomic_load(&rdna4_app_admitted)) ? YES : NO; }
+
+// Crash counter (#12 R3): counts only ABNORMAL ends. One line per instance start: "<epoch> <pid>". An instance that committed a
+// first successful command buffer appends "<pid> <start epoch> <now>" to RDNA4_OK_FILE (rdna4_mark_clean) and no longer counts: normal
+// logouts, logins and restarts do not trip the rule; >= 3 instances within 300 s that never got clean still decline.
+// Old-format lines (no pid) count as before. Paths are RDNA4_STARTS_FILE / RDNA4_OK_FILE, or (test hook, needs RDNA4M_ALLOW)
+// RDNA4M_TEST_COUNTER=<path> (ok file <path>.ok), which also enables the counter outside WindowServer.
+static char rdna4_ok_path[1100]; static long long rdna4_start_epoch; static _Atomic int rdna4_counter_on, rdna4_clean_done;
+static BOOL rdna4_counter_tripped(int *countOut) {
+    const char *path = RDNA4_STARTS_FILE;
+    const char *tp = getenv("RDNA4M_TEST_COUNTER");
+    if (rdna4_allow() && tp && tp[0]) { path = tp; snprintf(rdna4_ok_path, sizeof rdna4_ok_path, "%s.ok", tp); }
+    else if (!rdna4_is_ws()) return NO;
+    else snprintf(rdna4_ok_path, sizeof rdna4_ok_path, "%s", RDNA4_OK_FILE);
+    time_t now = time(NULL); int count = 1, cleaned = 0;
+    NSMutableSet *clean = [NSMutableSet set];
+    FILE *f = fopen(rdna4_ok_path, "r");
+    if (f) { char line[96]; while (fgets(line, sizeof line, f)) { long long pid = 0, st = 0; if (sscanf(line, "%lld %lld", &pid, &st) == 2) [clean addObject:[NSString stringWithFormat:@"%lld/%lld", pid, st]]; } fclose(f); }
+    f = fopen(path, "r");
+    if (f) { char line[64]; while (fgets(line, sizeof line, f)) {
+        long long t = 0, pid = 0; int n = sscanf(line, "%lld %lld", &t, &pid);
+        if (n < 1 || t <= 0 || now - t < 0 || now - t > 300) continue;
+        if (n == 2 && [clean containsObject:[NSString stringWithFormat:@"%lld/%lld", pid, t]]) { cleaned++; continue; }
+        count++; }
+        fclose(f); }
+    rdna4_start_epoch = (long long)now;
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd >= 0) { char b[48]; int n = snprintf(b, sizeof b, "%lld %d\n", (long long)now, (int)getpid()); (void)!write(fd, b, (size_t)n); close(fd); }
+    else RDNA4LOG("counter: cannot append to %s (errno %d)", path, errno);
+    atomic_store(&rdna4_counter_on, 1);
+    RDNA4LOG("counter: %d abnormal start(s) in the last 300 s including this one (%d earlier instance(s) reached clean and are not counted)", count, cleaned);
+    if (countOut) *countOut = count;
+    return count >= 3;
+}
+// Called after the first successfully completed command buffer of an admitted instance that is counted.
+GARNET_INTERNAL void rdna4_mark_clean(void) {
+    if (!atomic_load(&rdna4_counter_on) || atomic_exchange(&rdna4_clean_done, 1)) return;
+    int fd = open(rdna4_ok_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) { RDNA4LOG("clean marker: cannot append to %s (errno %d)", rdna4_ok_path, errno); return; }
+    char b[96]; int n = snprintf(b, sizeof b, "%d %lld %lld\n", (int)getpid(), rdna4_start_epoch, (long long)time(NULL)); (void)!write(fd, b, (size_t)n); close(fd);
+    RDNA4LOG("clean marker written to %s (first completed command buffer)", rdna4_ok_path);
+}
+
+// RDNA4G_FLAG_ABSENT (-1) = property absent (or filtered by a sandbox: the registry cannot tell), RDNA4G_FLAG_NONUB (-2) = the nub could not be reached, 0 = false/zero, 1 = true.
+// Reads a numeric/boolean property from the accelerator's parent (the nub). WindowServer treats -1 and -2 alike (proceed); everything else declines on them (rdna4_gate.h).
+static int rdna4_nub_flag(uint32_t port, CFStringRef name) {
+    io_registry_entry_t parent = 0;
+    if (IORegistryEntryGetParentEntry((io_registry_entry_t)port, kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return RDNA4G_FLAG_NONUB;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(parent, name, kCFAllocatorDefault, 0);
+    IOObjectRelease(parent);
+    if (!v) return RDNA4G_FLAG_ABSENT;
+    int r = RDNA4G_FLAG_ABSENT;
+    if (CFGetTypeID(v) == CFNumberGetTypeID()) { int x = 0; CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &x); r = x ? 1 : 0; }
+    else if (CFGetTypeID(v) == CFBooleanGetTypeID()) r = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
+    CFRelease(v);
+    return r;
+}
+
+GARNET_INTERNAL NSString *rdna4_model_name(uint32_t port) {
+    id value = CFBridgingRelease(IORegistryEntrySearchCFProperty(port, kIOServicePlane, CFSTR("model"),
+        kCFAllocatorDefault, kIORegistryIterateRecursively | kIORegistryIterateParents));
+    NSString *model = nil;
+    if ([value isKindOfClass:NSString.class]) model = value;
+    else if ([value isKindOfClass:NSData.class] && [value length] > 0 && [value length] <= 1024) {
+        NSData *data = value;
+        const char *end = memchr(data.bytes, 0, data.length);
+        model = [[NSString alloc] initWithBytes:data.bytes length:end ? (NSUInteger)(end - (const char *)data.bytes) : data.length
+            encoding:NSUTF8StringEncoding];
+    }
+    model = [model stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return model.length ? [model copy] : [NSString stringWithUTF8String:rdna4dc_fallback().name];
+}
+
+GARNET_INTERNAL BOOL rdna4_number_u64(CFTypeRef field, uint64_t *out) {
+    int64_t number = 0;
+    if (!field || CFGetTypeID(field) != CFNumberGetTypeID() || CFNumberIsFloatType((CFNumberRef)field) ||
+        !CFNumberGetValue((CFNumberRef)field, kCFNumberSInt64Type, &number) || number < 0) return NO;
+    *out = (uint64_t)number;
+    return YES;
+}
+GARNET_INTERNAL rdna4dc_native_memory rdna4_nub_memory(uint32_t port) {
+    rdna4dc_native_memory m = {0};
+    CFTypeRef value = IORegistryEntrySearchCFProperty(port, kIOServicePlane, CFSTR(RDNA4DC_MEMORY_CAPS_PROPERTY),
+        kCFAllocatorDefault, kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (!value) return m;
+    if (CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+        const CFStringRef keys[] = {CFSTR("version"), CFSTR("physical"), CFSTR("pool"),
+            CFSTR("visible"), CFSTR("applicationBudget"), CFSTR("maxBuffer")};
+        uint64_t fields[6] = {0};
+        BOOL valid = YES;
+        for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+            CFTypeRef field = CFDictionaryGetValue((CFDictionaryRef)value, keys[i]);
+            if (!rdna4_number_u64(field, &fields[i])) {
+                valid = NO; break;
+            }
+        }
+        if (valid) {
+            m = (rdna4dc_native_memory){.version = fields[0], .physical = fields[1], .pool = fields[2],
+                .visible = fields[3], .application_budget = fields[4], .max_buffer = fields[5]};
+            CFTypeRef composite = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("compositeMaxBuffer"));
+            (void)rdna4_number_u64(composite, &m.composite_max_buffer);
+        }
+    }
+    CFRelease(value);
+    return m;
+}
+// "Garnet,Ready": absent (old kexts) -> proceed. RDNA4M_TEST_READY overrides.
+static int rdna4_nub_ready(uint32_t port) {
+    const char *th = getenv("RDNA4M_TEST_READY");
+    if (rdna4_allow() && th && th[0]) return atoi(th) ? 1 : 0;
+    return rdna4_nub_flag(port, CFSTR("Garnet,Ready"));
+}
+// #12 R3: "Garnet,AutoDisarmed" = 1 (kernel disarmed the display pipe after a fault) -> decline; absent -> ignore. RDNA4M_TEST_AUTODISARMED overrides.
+static int rdna4_nub_autodisarmed(uint32_t port) {
+    const char *th = getenv("RDNA4M_TEST_AUTODISARMED");
+    if (rdna4_allow() && th && th[0]) return atoi(th) ? 1 : 0;
+    return rdna4_nub_flag(port, CFSTR("Garnet,AutoDisarmed"));
+}
+
+// The kernel probe (GPU-apps G4): for a process that is neither WindowServer nor an RDNA4M_ALLOW root tool the ONLY way in is the kernel's own decision. Open an RDNA4N connection exactly
+// as Mesa's winsys does (IOServiceOpen type 'GRNT'), say Hello, read QueryInfo (HUNG), and close it again at once; the real, lazy RADV connection is opened later by the same process.
+// G6 (bundle 8): the connection is opened on the ACCELERATOR PORT this bundle holds (the GarnetAccelerator the aux kext published), not on a GarnetDriver looked up by name: a sandboxed application's profile
+// admits user clients only on an IOAccelerator service, and the accelerator's newUserClient hands out the same native client. The port is the caller's (Metal's) object: it is NOT released here.
+// A successful open IS the allow-list verdict (uid >= 501, rdna4-apps=1, rdna4-multisession=1, the process on the kernel's list); any failure - including a sandbox that denies the service
+// lookup or the open - declines. Returns NULL = admitted.
+static const char *rdna4_app_probe(uint32_t port) {
+    io_service_t svc = (io_service_t)port;   // G6: the accelerator port (0 = none); never released here
+    io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE, hk = KERN_FAILURE, ik = KERN_FAILURE; uint32_t infoFlags = 0, budgetFlags = 0;
+    if (svc) {
+        for (int tries = 0;; tries++) {
+            kr = IOServiceOpen(svc, mach_task_self(), RDNA4G_UC_TYPE, &conn);
+            if (!rdna4g_probe_retry((uint32_t)kr, tries)) break;
+            usleep(10000);
+        }
+        if (kr == KERN_SUCCESS) {
+            uint64_t in[2] = { 1ull, RDNA4G_HELLO_F_MINOR }, out[4] = { 0 }; uint32_t outCnt = 4;
+            hk = IOConnectCallScalarMethod(conn, RDNA4G_SEL_HELLO, in, 2, out, &outCnt);
+            if (hk == KERN_SUCCESS) {
+                uint8_t info[RDNA4G_INFO_SIZE]; size_t isz = sizeof info; memset(info, 0, sizeof info);
+                ik = IOConnectCallStructMethod(conn, RDNA4G_SEL_QUERYINFO, NULL, 0, info, &isz);
+                if (ik == KERN_SUCCESS && isz == sizeof info) { memcpy(&infoFlags, info + RDNA4G_INFO_FLAGS_OFF, sizeof infoFlags); memcpy(&budgetFlags, info + RDNA4G_INFO_BUDGET_OFF, sizeof budgetFlags); } else if (ik == KERN_SUCCESS) ik = KERN_FAILURE;
+            }
+            IOServiceClose(conn);   // the session is released at once; Mesa opens its own later
+        }
+    }
+    const int v = rdna4g_probe_verdict(svc != 0, (uint32_t)kr, (uint32_t)hk, (uint32_t)ik, infoFlags, budgetFlags);
+    if (v != RDNA4G_PROBE_OK) RDNA4LOG("APP probe: declined (%s): open 0x%x hello 0x%x info 0x%x flags 0x%x budget 0x%x", rdna4g_probe_text(v), (unsigned)kr, (unsigned)hk, (unsigned)ik, infoFlags, budgetFlags);
+    else RDNA4LOG("APP probe: the kernel admitted this process (allow-listed application): GPU path enabled for %s", getprogname());
+    return v == RDNA4G_PROBE_OK ? NULL : rdna4g_probe_text(v);
+}
+
+static const char *rdna4_denylist_decline(int cls) {
+    if (!rdna4g_denylist_applies(cls)) return NULL;
+    NSString *bidStr = [[NSBundle mainBundle] bundleIdentifier];
+    const char *bid = bidStr ? [bidStr UTF8String] : NULL;
+    const char *proc = getprogname();
+    const char *envPath = rdna4_allow() ? getenv("RDNA4M_TEST_DENYLIST") : NULL;
+    const char *path = (envPath && envPath[0]) ? envPath : RDNA4G_DENYLIST_PATH;
+    int openErr = 0;
+    const int hit = rdna4g_denylist_eval(cls, path, bid, proc, &openErr);
+    if (hit != RDNA4G_DENY_NONE) {
+        RDNA4LOG("admit: declined by denylist (%s) bundle=%s proc=%s",
+                 hit == RDNA4G_DENY_BUILTIN ? "builtin" : hit == RDNA4G_DENY_BUNDLE ? "bundle" : "proc",
+                 bid ? bid : "-", proc ? proc : "-");
+        return "application is on the Garnet denylist";
+    }
+    if (openErr != 0 && !rdna4g_denylist_open_fallback(openErr))
+        RDNA4LOG("admit: denylist read errno=%d (%s); falling back to kernel appdeny", openErr, strerror(openErr));
+    return NULL;
+}
+
+// NULL = admit, else the reason for declining (static string).
+GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
+    const int cls = rdna4g_class(rdna4_is_ws(), rdna4_allow());
+    const int isWs = cls == RDNA4G_CLASS_WS;
+    // 0.0.641 (G4 review HIGH 2): root and daemons (euid < 501) that are neither WindowServer nor an RDNA4M_ALLOW tool are declined BY CLASS, first of all, exactly as in 0.0.632: no kernel open for them.
+    if (rdna4g_declined_by_class(cls, (uint32_t)geteuid())) return RDNA4G_DECLINE_BY_CLASS_TEXT;
+    // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (rdna4_gate.h).
+    struct stat st;
+    const int srcRc = stat(RDNA4_KILL_FILE, &st), srcErr = errno;
+    const int ks = rdna4g_kill_state(srcRc, srcErr);
+    int killIgnored = 0;
+    if (ks == RDNA4G_KILL_PRESENT) {
+        // S5.2b root test path: ignored ONLY by a non-WindowServer root process with RDNA4M_ALLOW=1 and RDNA4M_TEST_IGNORE_KILL=1 (WindowServer never is).
+        killIgnored = rdna4df_off_file_ignored((int)geteuid(), getenv("RDNA4M_ALLOW"), getenv("RDNA4M_TEST_IGNORE_KILL"), rdna4_is_ws());
+        if (!killIgnored) return "kill file " RDNA4_KILL_FILE " exists";
+        RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " exists but is IGNORED (root test bypass RDNA4M_ALLOW=1 + RDNA4M_TEST_IGNORE_KILL=1, not WindowServer)");
+    }
+    if (rdna4g_kill_declines(isWs, ks, killIgnored)) {
+        RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", srcErr);
+        return "kill file " RDNA4_KILL_FILE " could not be read (fail closed outside WindowServer)";
+    }
+    const int rdy = rdna4_nub_ready(port);
+    if (rdna4g_ready_declines(isWs, rdy)) return rdy == 0 ? "nub property Garnet,Ready is 0" : "nub property Garnet,Ready is absent or unreadable (fail closed outside WindowServer)";
+    if (rdna4g_autodisarm_declines(isWs, rdna4_nub_autodisarmed(port))) return "nub property Garnet,AutoDisarmed is 1";
+    int count = 0;
+    if (rdna4_counter_tripped(&count)) return "crash counter: >= 3 starts within 300 s";
+    if (cls == RDNA4G_CLASS_OTHER) {   // not WindowServer, not an RDNA4M_ALLOW root tool: only the kernel can admit it
+        const char *denyWhy = rdna4_denylist_decline(cls);
+        if (denyWhy) return denyWhy;
+        const char *why = rdna4_app_probe(port);
+        if (why) return why;
+        atomic_store(&rdna4_app_admitted, 1);
+    }
+    return NULL;
+}
+GARNET_INTERNAL BOOL rdna4_headless(void) {
+    static BOOL v; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct stat st;
+        int result = stat(RDNA4_HEADLESS_NO, &st);
+        int error = result ? errno : 0;
+        v = result != 0;
+        RDNA4LOG("[DEBUG-render] isHeadless=%d markerResult=%d errno=%d process=%s",
+                 v, result, error, getprogname());
+    });
+    return v;
+}
+#endif // !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
+#ifndef RDNA4_ARGUMENT_LIMIT_SNAPSHOT_INC
+#define RDNA4_ARGUMENT_LIMIT_SNAPSHOT_INC
+
+#include "rdna4_argument_limit_snapshot.h"
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+/*
+ * st_mtime is the portable POSIX spelling on both Darwin and Linux.  Apple
+ * clang exposes the same seconds through st_mtimespec, but strict C modes and
+ * cross-sysroot checks do not guarantee that member name.  The inode, size and
+ * same-handle re-export carry the identity proof; seconds are a metadata
+ * backstop, so resetting the nanosecond component keeps this source portable.
+ */
+#define RDNA4_ARGUMENT_LIMIT_MTIME_SEC(st) ((st).st_mtime)
+#define RDNA4_ARGUMENT_LIMIT_MTIME_NSEC(st) (0)
+
+static void rdna4_argument_limit_copy_string(char *dst, size_t capacity,
+                                             const char *src) {
+    if (!dst || !capacity) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    snprintf(dst, capacity, "%s", src);
+}
+
+static void rdna4_argument_limit_record_source(
+    rdna4_argument_limit_snapshot *snapshot, const char *path) {
+    if (!snapshot || !path || !path[0] || strlen(path) >= sizeof(snapshot->source_path))
+        return;
+    rdna4_argument_limit_copy_string(snapshot->source_path,
+                                     sizeof(snapshot->source_path), path);
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    snapshot->source_stat_valid = 1;
+    snapshot->source_device = (uint64_t)(uintmax_t)st.st_dev;
+    snapshot->source_inode = (uint64_t)(uintmax_t)st.st_ino;
+    snapshot->source_size = (uint64_t)(uintmax_t)st.st_size;
+    snapshot->source_mtime_seconds =
+        (uint64_t)RDNA4_ARGUMENT_LIMIT_MTIME_SEC(st);
+    snapshot->source_mtime_nanoseconds =
+        (uint64_t)RDNA4_ARGUMENT_LIMIT_MTIME_NSEC(st);
+}
+
+static int rdna4_argument_limit_policy_valid(
+    const rdna4_argument_limit_policy *policy) {
+    if (!policy ||
+        (policy->comparison_samplers != 0 &&
+         policy->comparison_samplers != 1) ||
+        policy->objects_per_configuration == 0 ||
+        policy->objects_per_configuration >
+            RDNA4_ARGUMENT_LIMIT_DEFAULT_OBJECTS_PER_CONFIG)
+        return 0;
+    const uint32_t required_dummy =
+        policy->comparison_samplers
+            ? RDNA4_ARGUMENT_LIMIT_DEFAULT_DUMMY_OBJECTS
+            : 1u;
+    return policy->reserve_sampler_objects >= required_dummy;
+}
+
+static int rdna4_argument_limit_raw_valid(
+    const rdna4_radv_darwin_argument_limits_v1 *raw,
+    const rdna4_radv_darwin_host_facts_v1 *facts) {
+    const uint32_t known_flags =
+        RDNA4_RADV_DARWIN_LIMITS_READ_ONLY |
+        RDNA4_RADV_DARWIN_LIMITS_NO_VULKAN_OBJECT |
+        RDNA4_RADV_DARWIN_LIMITS_NO_PIPELINE_UUID;
+    const uint32_t required_flags = known_flags;
+    const uint32_t known_valid =
+        RDNA4_RADV_DARWIN_LIMITS_VALID_STABLE_CORE |
+        RDNA4_RADV_DARWIN_LIMITS_VALID_MEMORY;
+    if (!raw || raw->struct_size != RDNA4_ARGUMENT_LIMIT_RAW_SIZE ||
+        raw->abi_version != RDNA4_ARGUMENT_LIMIT_SOURCE_ABI ||
+        raw->flags != required_flags || (raw->flags & ~known_flags) ||
+        !(raw->valid_flags & RDNA4_RADV_DARWIN_LIMITS_VALID_STABLE_CORE) ||
+        (raw->valid_flags & ~known_valid))
+        return 0;
+    if (!raw->build_identity[0] ||
+        !memchr(raw->build_identity, '\0', sizeof(raw->build_identity)) ||
+        strncmp(raw->build_identity, "rdal-v1 ", 8) != 0 ||
+        raw->build_identity[8] == '\0')
+        return 0;
+    if (!raw->api_version || !raw->driver_version || !raw->driver_id ||
+        !raw->max_descriptor_set_size || !raw->max_sampler_allocations ||
+        raw->max_bound_descriptor_sets < 5u ||
+        !raw->max_per_set_descriptors || !raw->max_storage_buffer_range ||
+        !raw->max_uab_descriptors_all_pools ||
+        !raw->max_per_stage_descriptor_update_after_bind_samplers ||
+        !raw->max_descriptor_set_update_after_bind_samplers ||
+        !raw->max_update_after_bind_descriptors_in_all_pools)
+        return 0;
+
+    const int wants_memory =
+        facts && (facts->valid_flags & RDNA4_RADV_DARWIN_FACT_VRAM_BYTES);
+    const int has_memory =
+        (raw->valid_flags & RDNA4_RADV_DARWIN_LIMITS_VALID_MEMORY) != 0;
+    if (has_memory != wants_memory) return 0;
+    if (has_memory &&
+        (!raw->max_memory_allocation_size || !raw->max_buffer_size))
+        return 0;
+    if (!has_memory &&
+        (raw->max_memory_allocation_size || raw->max_buffer_size))
+        return 0;
+    return 1;
+}
+
+static rdna4_argument_limit_result
+rdna4_argument_limit_begin(rdna4_argument_limit_snapshot *snapshot,
+                           const char *path,
+                           const rdna4_radv_darwin_host_facts_v1 *facts,
+                           const rdna4_argument_limit_policy *policy) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->initialized)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_ALREADY_FIXED;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->struct_size = sizeof(*snapshot);
+    snapshot->source_abi_version = RDNA4_ARGUMENT_LIMIT_SOURCE_ABI;
+    snapshot->state = RDNA4_ARGUMENT_LIMIT_STATE_UNAVAILABLE;
+    snapshot->initialized = 1;
+    snapshot->policy = policy ? *policy
+                              : rdna4_argument_limit_default_policy();
+    if (facts) {
+        snapshot->facts_present = 1;
+        snapshot->input_facts = *facts;
+    }
+    rdna4_argument_limit_record_source(snapshot, path);
+    if (!rdna4_argument_limit_policy_valid(&snapshot->policy)) {
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_POLICY_INVALID;
+        return snapshot->init_result;
+    }
+    return RDNA4_ARGUMENT_LIMIT_RESULT_OK;
+}
+
+static rdna4_argument_limit_result
+rdna4_argument_limit_finish_export(
+    rdna4_argument_limit_snapshot *snapshot, rdna4_argument_limit_export_fn fn,
+    const rdna4_radv_darwin_host_facts_v1 *facts) {
+    if (!fn) {
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MISSING;
+        return snapshot->init_result;
+    }
+    snapshot->export_present = 1;
+    memset(&snapshot->raw, 0, sizeof(snapshot->raw));
+    snapshot->export_result = fn(facts, &snapshot->raw);
+    snapshot->export_errno = errno;
+    if (snapshot->export_result != 0) {
+        snapshot->init_result =
+            RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_CALL_FAILED;
+        return snapshot->init_result;
+    }
+    snapshot->result_struct_size = snapshot->raw.struct_size;
+    snapshot->result_abi_version = snapshot->raw.abi_version;
+    snapshot->result_flags = snapshot->raw.flags;
+    snapshot->result_valid_flags = snapshot->raw.valid_flags;
+    memcpy(snapshot->build_identity, snapshot->raw.build_identity,
+           sizeof(snapshot->build_identity));
+    if (snapshot->raw.abi_version != RDNA4_ARGUMENT_LIMIT_SOURCE_ABI) {
+        snapshot->init_result =
+            RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_ABI_MISMATCH;
+        return snapshot->init_result;
+    }
+    if (!rdna4_argument_limit_raw_valid(&snapshot->raw, facts)) {
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MALFORMED;
+        return snapshot->init_result;
+    }
+
+    snapshot->descriptor_capacity =
+        snapshot->raw.max_descriptor_set_update_after_bind_samplers <
+                snapshot->raw.max_per_stage_descriptor_update_after_bind_samplers
+            ? snapshot->raw.max_descriptor_set_update_after_bind_samplers
+            : snapshot->raw.max_per_stage_descriptor_update_after_bind_samplers;
+    const rdna4_argument_public_sampler_status plan_status =
+        rdna4_argument_public_sampler_limit(
+            (int)snapshot->policy.comparison_samplers,
+            snapshot->descriptor_capacity,
+            snapshot->raw.max_sampler_allocations,
+            snapshot->policy.reserve_sampler_objects,
+            snapshot->policy.objects_per_configuration,
+            &snapshot->sampler_plan);
+    if (plan_status == RDNA4_ARGUMENT_PUBLIC_SAMPLER_OVERFLOW) {
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MALFORMED;
+        return snapshot->init_result;
+    }
+    if (plan_status != RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK) {
+        snapshot->init_result =
+            RDNA4_ARGUMENT_LIMIT_RESULT_CAPACITY_UNAVAILABLE;
+        return snapshot->init_result;
+    }
+
+    snapshot->public_sampler_limit = snapshot->sampler_plan.public_limit;
+    snapshot->public_sampler_limit_available = 1;
+    snapshot->state = RDNA4_ARGUMENT_LIMIT_STATE_READY;
+    snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_OK;
+    return snapshot->init_result;
+}
+
+static rdna4_argument_limit_result
+rdna4_argument_limit_finish_handle(
+    rdna4_argument_limit_snapshot *snapshot, void *handle,
+    const rdna4_radv_darwin_host_facts_v1 *facts) {
+    if (!handle) {
+        snapshot->init_result =
+            RDNA4_ARGUMENT_LIMIT_RESULT_LIBRARY_OPEN_FAILED;
+        return snapshot->init_result;
+    }
+
+    void *symbol = NULL;
+    dlerror();
+    symbol = dlsym(handle, RDNA4_ARGUMENT_LIMIT_EXPORT_NAME);
+    const char *error = dlerror();
+    if (error) {
+        rdna4_argument_limit_copy_string(
+            snapshot->loader_error, sizeof(snapshot->loader_error), error);
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MISSING;
+        return snapshot->init_result;
+    }
+    if (!symbol) {
+        snapshot->init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MISSING;
+        return snapshot->init_result;
+    }
+    rdna4_argument_limit_export_fn fn = NULL;
+    _Static_assert(sizeof(fn) == sizeof(symbol),
+                   "POSIX function and object pointers differ");
+    memcpy(&fn, &symbol, sizeof(fn));
+    return rdna4_argument_limit_finish_export(snapshot, fn, facts);
+}
+
+rdna4_argument_limit_policy rdna4_argument_limit_default_policy(void) {
+    return (rdna4_argument_limit_policy){
+        .comparison_samplers = 1,
+        .reserve_sampler_objects =
+            RDNA4_ARGUMENT_LIMIT_DEFAULT_DUMMY_OBJECTS,
+        .objects_per_configuration =
+            RDNA4_ARGUMENT_LIMIT_DEFAULT_OBJECTS_PER_CONFIG,
+    };
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_init_from_path(
+    rdna4_argument_limit_snapshot *snapshot, const char *path,
+    const rdna4_radv_darwin_host_facts_v1 *facts,
+    const rdna4_argument_limit_policy *policy) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->initialized)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_ALREADY_FIXED;
+    if (!path || !path[0]) {
+        rdna4_argument_limit_snapshot staged;
+        memset(&staged, 0, sizeof(staged));
+        rdna4_argument_limit_begin(&staged, path, facts, policy);
+        staged.init_result = RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+        *snapshot = staged;
+        return staged.init_result;
+    }
+
+    /*
+     * Keep a private copy of the policy so the loader path and explicit
+     * export path share one immutability rule.
+     */
+    rdna4_argument_limit_snapshot staged;
+    memset(&staged, 0, sizeof(staged));
+    rdna4_argument_limit_result result =
+        rdna4_argument_limit_begin(&staged, path, facts, policy);
+    if (result != RDNA4_ARGUMENT_LIMIT_RESULT_OK) {
+        *snapshot = staged;
+        return result;
+    }
+
+    dlerror();
+    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    const char *error = handle ? NULL : dlerror();
+    if (!handle) {
+        rdna4_argument_limit_copy_string(
+            staged.loader_error, sizeof(staged.loader_error), error);
+        staged.init_result = RDNA4_ARGUMENT_LIMIT_RESULT_LIBRARY_OPEN_FAILED;
+        *snapshot = staged;
+        return staged.init_result;
+    }
+    result = rdna4_argument_limit_finish_handle(&staged, handle, facts);
+    dlclose(handle);
+    *snapshot = staged;
+    return result;
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_init_from_handle(
+    rdna4_argument_limit_snapshot *snapshot, void *handle, const char *path,
+    const rdna4_radv_darwin_host_facts_v1 *facts,
+    const rdna4_argument_limit_policy *policy) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->initialized)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_ALREADY_FIXED;
+    rdna4_argument_limit_snapshot staged;
+    memset(&staged, 0, sizeof(staged));
+    rdna4_argument_limit_result result =
+        rdna4_argument_limit_begin(&staged, path, facts, policy);
+    if (result == RDNA4_ARGUMENT_LIMIT_RESULT_OK)
+        result = rdna4_argument_limit_finish_handle(&staged, handle, facts);
+    *snapshot = staged;
+    return result;
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_init_from_loader(
+    rdna4_argument_limit_snapshot *snapshot,
+    const rdna4_argument_limit_loader *loader, const char *path,
+    const rdna4_radv_darwin_host_facts_v1 *facts,
+    const rdna4_argument_limit_policy *policy) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->initialized)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_ALREADY_FIXED;
+    if (!loader || !loader->open_library || !loader->close_library ||
+        !loader->resolve_symbol || !path || !path[0]) {
+        rdna4_argument_limit_snapshot staged;
+        memset(&staged, 0, sizeof(staged));
+        rdna4_argument_limit_begin(&staged, path, facts, policy);
+        staged.init_result = RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+        *snapshot = staged;
+        return staged.init_result;
+    }
+
+    rdna4_argument_limit_snapshot staged;
+    memset(&staged, 0, sizeof(staged));
+    rdna4_argument_limit_result result =
+        rdna4_argument_limit_begin(&staged, path, facts, policy);
+    if (result != RDNA4_ARGUMENT_LIMIT_RESULT_OK) {
+        *snapshot = staged;
+        return result;
+    }
+
+    void *handle = loader->open_library(loader->context, path);
+    if (!handle) {
+        staged.init_result =
+            RDNA4_ARGUMENT_LIMIT_RESULT_LIBRARY_OPEN_FAILED;
+        *snapshot = staged;
+        return staged.init_result;
+    }
+    void *symbol = loader->resolve_symbol(loader->context, handle,
+                                          RDNA4_ARGUMENT_LIMIT_EXPORT_NAME);
+    if (!symbol) {
+        staged.init_result = RDNA4_ARGUMENT_LIMIT_RESULT_EXPORT_MISSING;
+    } else {
+        rdna4_argument_limit_export_fn fn = NULL;
+        _Static_assert(sizeof(fn) == sizeof(symbol),
+                       "POSIX function and object pointers differ");
+        memcpy(&fn, &symbol, sizeof(fn));
+        result = rdna4_argument_limit_finish_export(&staged, fn, facts);
+        if (result != RDNA4_ARGUMENT_LIMIT_RESULT_OK)
+            staged.init_result = result;
+    }
+    loader->close_library(loader->context, handle);
+    *snapshot = staged;
+    return staged.init_result;
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_init_from_export(
+    rdna4_argument_limit_snapshot *snapshot,
+    rdna4_argument_limit_export_fn export_fn,
+    const rdna4_radv_darwin_host_facts_v1 *facts,
+    const rdna4_argument_limit_policy *policy) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->initialized)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_ALREADY_FIXED;
+    rdna4_argument_limit_snapshot staged;
+    memset(&staged, 0, sizeof(staged));
+    rdna4_argument_limit_result result =
+        rdna4_argument_limit_begin(&staged, NULL, facts, policy);
+    if (result == RDNA4_ARGUMENT_LIMIT_RESULT_OK)
+        result = rdna4_argument_limit_finish_export(&staged, export_fn, facts);
+    *snapshot = staged;
+    return result;
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_public_limit(
+    const rdna4_argument_limit_snapshot *snapshot, uint32_t *out_limit) {
+    if (!snapshot || !out_limit)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CAPACITY_UNAVAILABLE;
+    *out_limit = snapshot->public_sampler_limit;
+    return RDNA4_ARGUMENT_LIMIT_RESULT_OK;
+}
+
+rdna4_argument_public_sampler_status rdna4_argument_limit_snapshot_admit(
+    const rdna4_argument_limit_snapshot *snapshot,
+    uint32_t live_unique_configurations, int new_unique_configuration,
+    uint64_t live_sampler_objects, uint64_t requested_objects, int *admitted) {
+    if (!snapshot || !admitted)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    return rdna4_argument_public_sampler_admit(
+        snapshot->public_sampler_limit, live_unique_configurations,
+        new_unique_configuration, live_sampler_objects, requested_objects,
+        snapshot->raw.max_sampler_allocations, admitted);
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_committed(
+    const rdna4_argument_sampler_budget *budget,
+    uint64_t live_actual_objects, uint64_t *committed) {
+    if (!budget || !committed ||
+        budget->reserved_objects < budget->reserved_actual_objects)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    const uint64_t unused =
+        budget->reserved_objects - budget->reserved_actual_objects;
+    if (live_actual_objects > UINT64_MAX - unused)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OVERFLOW;
+    *committed = live_actual_objects + unused;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_reserve_configuration(
+    const rdna4_argument_limit_snapshot *snapshot,
+    rdna4_argument_sampler_budget *budget,
+    uint32_t live_unique_configurations, uint32_t existing_actual_handles,
+    uint64_t live_actual_objects, int *admitted) {
+    if (!snapshot || !budget || !admitted)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    *admitted = 0;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    const uint32_t objects_per_configuration =
+        snapshot->policy.objects_per_configuration;
+    if (!objects_per_configuration ||
+        existing_actual_handles > objects_per_configuration)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+
+    uint64_t committed = 0;
+    rdna4_argument_public_sampler_status status =
+        rdna4_argument_limit_snapshot_budget_committed(
+            budget, live_actual_objects, &committed);
+    if (status != RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK) return status;
+    const uint64_t requested =
+        objects_per_configuration - existing_actual_handles;
+    status = rdna4_argument_limit_snapshot_admit(
+        snapshot, live_unique_configurations, 1, committed, requested,
+        admitted);
+    if (status != RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK || !*admitted)
+        return status;
+    if (UINT64_MAX - budget->reserved_objects <
+            objects_per_configuration ||
+        UINT64_MAX - budget->reserved_actual_objects <
+            existing_actual_handles)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OVERFLOW;
+    budget->reserved_objects += objects_per_configuration;
+    budget->reserved_actual_objects += existing_actual_handles;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_charge_reserved(
+    const rdna4_argument_limit_snapshot *snapshot,
+    rdna4_argument_sampler_budget *budget, int *charged) {
+    if (!snapshot || !budget || !charged)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    *charged = 0;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    if (budget->reserved_objects < budget->reserved_actual_objects)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    if (budget->reserved_actual_objects == budget->reserved_objects)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OBJECT_LIMIT;
+    ++budget->reserved_actual_objects;
+    *charged = 1;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_release_reserved(
+    const rdna4_argument_limit_snapshot *snapshot,
+    rdna4_argument_sampler_budget *budget, int *released) {
+    if (!snapshot || !budget || !released)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    *released = 0;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    if (!budget->reserved_actual_objects ||
+        budget->reserved_objects < budget->reserved_actual_objects)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    --budget->reserved_actual_objects;
+    *released = 1;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_release_configuration(
+    const rdna4_argument_limit_snapshot *snapshot,
+    rdna4_argument_sampler_budget *budget, uint32_t actual_handles,
+    int *released) {
+    if (!snapshot || !budget || !released)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    *released = 0;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    const uint64_t reserved = snapshot->policy.objects_per_configuration;
+    if (!reserved || actual_handles > reserved ||
+        budget->reserved_objects < reserved ||
+        budget->reserved_actual_objects < actual_handles)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    budget->reserved_objects -= reserved;
+    budget->reserved_actual_objects -= actual_handles;
+    *released = 1;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+rdna4_argument_public_sampler_status
+rdna4_argument_limit_snapshot_budget_can_charge_direct(
+    const rdna4_argument_limit_snapshot *snapshot,
+    const rdna4_argument_sampler_budget *budget,
+    uint64_t live_actual_objects, uint64_t requested_objects,
+    int *admitted) {
+    if (!snapshot || !budget || !admitted)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_INVALID;
+    *admitted = 0;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY ||
+        !snapshot->public_sampler_limit_available)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_LIMIT_UNAVAILABLE;
+    uint64_t committed = 0;
+    rdna4_argument_public_sampler_status status =
+        rdna4_argument_limit_snapshot_budget_committed(
+            budget, live_actual_objects, &committed);
+    if (status != RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK) return status;
+    if (requested_objects > UINT64_MAX - committed)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OVERFLOW;
+    if (committed + requested_objects >
+        snapshot->raw.max_sampler_allocations)
+        return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OBJECT_LIMIT;
+    *admitted = 1;
+    return RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK;
+}
+
+static int rdna4_argument_limit_core_matches(
+    const rdna4_radv_darwin_argument_limits_v1 *raw,
+    const rdna4_argument_limit_open_observation *o) {
+#define RDNA4_ARG_LIMIT_EQ(field) (raw->field == o->field)
+    return RDNA4_ARG_LIMIT_EQ(max_descriptor_set_size) &&
+           RDNA4_ARG_LIMIT_EQ(max_sampler_allocations) &&
+           RDNA4_ARG_LIMIT_EQ(max_bound_descriptor_sets) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_set_descriptors) &&
+           RDNA4_ARG_LIMIT_EQ(max_storage_buffer_range) &&
+           RDNA4_ARG_LIMIT_EQ(max_uab_descriptors_all_pools) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_samplers) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_uniform_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_storage_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_sampled_images) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_storage_images) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_descriptor_input_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_resources) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_samplers) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_uniform_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_uniform_buffers_dynamic) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_storage_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_storage_buffers_dynamic) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_sampled_images) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_storage_images) &&
+           RDNA4_ARG_LIMIT_EQ(max_descriptor_set_input_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_samplers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_uniform_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_storage_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_sampled_images) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_storage_images) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_per_stage_descriptor_update_after_bind_input_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(max_per_stage_update_after_bind_resources) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_samplers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_uniform_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_uniform_buffers_dynamic) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_storage_buffers) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_storage_buffers_dynamic) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_sampled_images) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_storage_images) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_descriptor_set_update_after_bind_input_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(
+               max_update_after_bind_descriptors_in_all_pools) &&
+           RDNA4_ARG_LIMIT_EQ(max_fragment_combined_output_resources) &&
+           RDNA4_ARG_LIMIT_EQ(max_color_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(max_fragment_output_attachments) &&
+           RDNA4_ARG_LIMIT_EQ(max_fragment_dual_src_attachments);
+#undef RDNA4_ARG_LIMIT_EQ
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_crosscheck(
+    const rdna4_argument_limit_snapshot *snapshot,
+    const rdna4_argument_limit_open_observation *observation) {
+    if (!snapshot || !observation)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (snapshot->state != RDNA4_ARGUMENT_LIMIT_STATE_READY)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_UNAVAILABLE;
+    if (observation->struct_size != sizeof(*observation))
+        return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if ((observation->observed_flags &
+         RDNA4_ARGUMENT_LIMIT_OBSERVED_CORE_MASK) !=
+        RDNA4_ARGUMENT_LIMIT_OBSERVED_CORE_MASK)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_UNAVAILABLE;
+    if (snapshot->raw.api_version != observation->api_version ||
+        snapshot->raw.driver_version != observation->driver_version ||
+        snapshot->raw.driver_id != observation->driver_id)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_IDENTITY_MISMATCH;
+    if (!rdna4_argument_limit_core_matches(&snapshot->raw, observation))
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_LIMIT_MISMATCH;
+    if ((snapshot->raw.valid_flags &
+         RDNA4_RADV_DARWIN_LIMITS_VALID_MEMORY) &&
+        (!(observation->observed_flags &
+           RDNA4_ARGUMENT_LIMIT_OBSERVED_MEMORY_LIMITS) ||
+         snapshot->raw.max_memory_allocation_size !=
+             observation->max_memory_allocation_size ||
+         snapshot->raw.max_buffer_size != observation->max_buffer_size))
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_LIMIT_MISMATCH;
+    return RDNA4_ARGUMENT_LIMIT_RESULT_OK;
+}
+
+rdna4_argument_limit_result rdna4_argument_limit_snapshot_source_matches_path(
+    const rdna4_argument_limit_snapshot *snapshot, const char *path) {
+    if (!snapshot) return RDNA4_ARGUMENT_LIMIT_RESULT_INVALID_ARGUMENT;
+    if (!snapshot->initialized || !snapshot->source_stat_valid)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_UNAVAILABLE;
+    const char *use = path && path[0] ? path : snapshot->source_path;
+    if (!use || !use[0])
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_UNAVAILABLE;
+    struct stat st;
+    if (stat(use, &st) != 0)
+        return RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_UNAVAILABLE;
+    if (snapshot->source_device != (uint64_t)(uintmax_t)st.st_dev ||
+        snapshot->source_inode != (uint64_t)(uintmax_t)st.st_ino ||
+        snapshot->source_size != (uint64_t)(uintmax_t)st.st_size ||
+        snapshot->source_mtime_seconds !=
+            (uint64_t)RDNA4_ARGUMENT_LIMIT_MTIME_SEC(st) ||
+        snapshot->source_mtime_nanoseconds !=
+            (uint64_t)RDNA4_ARGUMENT_LIMIT_MTIME_NSEC(st))
+        return RDNA4_ARGUMENT_LIMIT_RESULT_SOURCE_CHANGED;
+    return RDNA4_ARGUMENT_LIMIT_RESULT_OK;
+}
+
+#endif
+#if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
 // Lazy in-process RADV (NATIVE-S4-M10 route a', F5). Opened on the first resource/queue request, NEVER in
 // initWithAcceleratorPort: (every Metal-enumerating process loads this bundle). RDNA4N is root-only and exclusive:
 // a refusal (non-root, second client) becomes nil + NSError, never an abort.
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_VK_FUNCS(X) \
-    X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) \
-    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) \
-    X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
-    X(vkCreateBufferView) X(vkDestroyBufferView) \
-    X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
-    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) \
-    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) \
-    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
-    X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateRenderPass) X(vkDestroyRenderPass) \
-    X(vkCreateFramebuffer) X(vkDestroyFramebuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
-    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkGetDescriptorSetLayoutSupport) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdSetViewport) X(vkCmdSetScissor) \
-    X(vkCmdDraw) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdPipelineBarrier) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) \
-    X(vkCreateSampler) X(vkDestroySampler) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
-    X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdCopyBufferToImage) X(vkCmdPushConstants) \
-    X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCreateComputePipelines) X(vkCmdSetBlendConstants) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkResetFences) \
-    X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) \
-    X(vkGetImageSubresourceLayout) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceImageFormatProperties2) X(vkGetDeviceProcAddr) \
-    X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) \
-    X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
-    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults) X(vkGetFenceStatus) /* build 18 (P2) */ \
-    X(vkCmdResolveImage) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) \
-    X(vkCreateRenderPass2) X(vkCmdBeginRenderPass2) X(vkCmdEndRenderPass2)
-#define X(n) static PFN_##n n;
+#define X(n) GARNET_INTERNAL PFN_##n n;
 RDNA4_VK_FUNCS(X)
 #undef X
 static PFN_vkCreateInstance rdna4_vkCreateInstance;
-static PFN_vkGetInstanceProcAddr rdna4_gipa;
-static PFN_vkGetMemoryHostPointerPropertiesEXT rdna4_vkGetMHPP;   // 11h.6: VK_EXT_external_memory_host
-static PFN_vkGetBufferDeviceAddress rdna4_vkGetBufferAddress;
-static PFN_vkCmdSetSampleLocationsEXT rdna4_vkCmdSetSampleLocationsEXT;
-static PFN_vkQueueWaitIdle rdna4_vkQueueWaitIdle;
-static RDNA4NativeBridge rdna4_native_bridge;
+GARNET_INTERNAL PFN_vkGetInstanceProcAddr rdna4_gipa;
+GARNET_INTERNAL PFN_vkGetMemoryHostPointerPropertiesEXT rdna4_vkGetMHPP;   // 11h.6: VK_EXT_external_memory_host
+GARNET_INTERNAL PFN_vkGetBufferDeviceAddress rdna4_vkGetBufferAddress;
+GARNET_INTERNAL PFN_vkCmdSetSampleLocationsEXT rdna4_vkCmdSetSampleLocationsEXT;
+GARNET_INTERNAL PFN_vkQueueWaitIdle rdna4_vkQueueWaitIdle;
+GARNET_INTERNAL RDNA4NativeBridge rdna4_native_bridge;
 
-static struct {
-    BOOL tried; BOOL ok; NSError *err;
-    void *lib; VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qfi;
-    VkPhysicalDeviceMemoryProperties mp; pthread_mutex_t qlock; VkPhysicalDeviceLimits lim; VkCommandPool opool; VkPipelineCache pc;   // pc: T2 persisted pipeline cache (VK_NULL_HANDLE = none)
-    BOOL occPrecise, occOK;   // build 18 (P2): occlusionQueryPrecise enabled on the device; every query entry point resolved
-    BOOL dbClamp;   // bundle 10: depthBiasClamp enabled on the device (a non-zero clamp in setDepthBias is passed on only then)
-    BOOL hostExt, drmModExt; uint64_t hostAlign; uint64_t impTotal;   // host pointer import and explicit DRM-modifier linear images
-    BOOL orderedColorAccess, indirectFirstInstance, cubeArray, bufferAddress;
-    BOOL fragInterlock;
-    BOOL dualSrcBlend, depthClamp, fillModeNonSolid, multiViewport, bcCompression, sampleRateShading;
-    BOOL storageImageExtFormats, storageImageMultisample;
-    BOOL sampleLocationsExt, variableSampleLocations;
-    VkSampleCountFlags sampleLocationCounts; VkExtent2D sampleLocationGrid; float sampleLocationRange[2];
-    VkResolveModeFlags depthResolveModes, stencilResolveModes;
-    BOOL dsResolveIndep, dsResolveIndepNone;
-    uint32_t maxViewports;
-    BOOL tessellation; uint32_t maxTessGenLevel, maxTessPatchSize;
-    BOOL descriptorIndexing, nonUniformSampledImages, nonUniformStorageImages, nonUniformBuffers;
-    BOOL gpuArgumentTables, nullDescriptors, samplerAnisotropy, samplerMirrorClamp;
-    BOOL robustTexelBuffers;
-    BOOL uniformTexelBuffers, storageTexelBuffers;
-    VkPhysicalDeviceVulkan12Properties descriptorLimits;
-    uint32_t maxPerSetDescriptors;
-    BOOL barycentric, atomicFloat, atomicFloat2, atomicInt64;
-    BOOL meshShader, objectShader, multiDrawIndirect;
-    BOOL deferredHostOps, accelStruct, rayQuery;
-    BOOL timestampQuery, timestampComputeAndGraphics;
-    float timestampPeriod;
-    uint32_t timestampValidBits;
-    BOOL sparseBinding, sparseResidencyBuffer, sparseResidencyImage2D, sparseResidencyImage3D;
-} RDNA4R;
-#define RDNA4_HAS_MULTI_DRAW_INDIRECT 1
+GARNET_INTERNAL RDNA4BackendState RDNA4R;
 
 /*
  * One immutable pre-open limit source, independent of RDNA4R. Preparing it
@@ -77,9 +958,9 @@ static struct {
  * changes RDNA4R.tried/RDNA4R.ok. Getter and admission code only read the
  * frozen snapshot below.
  */
-static rdna4_argument_limit_snapshot RDNA4ALS;
+GARNET_INTERNAL rdna4_argument_limit_snapshot RDNA4ALS;
 static dispatch_once_t rdna4_argument_limit_once;
-static _Atomic int rdna4_argument_limit_full_open_state; /* -1 fail, 0 pending, 1 match */
+GARNET_INTERNAL _Atomic int rdna4_argument_limit_full_open_state; /* -1 fail, 0 pending, 1 match */
 
 static const char *rdna4_argument_limit_state_name(rdna4_argument_limit_state state) {
     switch (state) {
@@ -102,7 +983,7 @@ static const rdna4_radv_darwin_host_facts_v1 *rdna4_argument_limit_host_facts(
     return facts;
 }
 
-static void rdna4_argument_limit_prepare(const rdna4dc_native_memory *nativeMemory) {
+GARNET_INTERNAL void rdna4_argument_limit_prepare(const rdna4dc_native_memory *nativeMemory) {
     dispatch_once(&rdna4_argument_limit_once, ^{
         NSString *path = [[[NSBundle bundleForClass:[GarnetDevice class]] resourcePath]
             stringByAppendingPathComponent:@"libvulkan_radeon.dylib"];
@@ -228,39 +1109,37 @@ static int rdna4_argument_limit_verify_open(
     return 1;
 }
 
-static _Atomic int rdna4_submit_fault;
+GARNET_INTERNAL _Atomic int rdna4_submit_fault;
 // A failed submit or fence wait does not prove GPU work stopped. Keep its objects
 // until process exit and reject new submissions; there is no in-process reset.
 static NSMutableArray *rdna4_unresolved_commands;
 
 // Published once, only after a successful lazy open. Getters never open RADV or
 // wait for its class lock, and cannot observe a failed/partially initialized try.
-static rdna4dc_caps RDNA4Caps;
-static _Atomic int rdna4_caps_ready;
+GARNET_INTERNAL rdna4dc_caps RDNA4Caps;
+GARNET_INTERNAL _Atomic int rdna4_caps_ready;
 static rdna4x_backend_capabilities RDNA4QueryCaps;
-static rdna4x_backend_capabilities rdna4_query_caps(void) {
+GARNET_INTERNAL rdna4x_backend_capabilities rdna4_query_caps(void) {
     if (atomic_load_explicit(&rdna4_caps_ready, memory_order_acquire)) return RDNA4QueryCaps;
     return rdna4x_query_caps(0, 0, 0, 0, 0);
 }
-static rdna4dc_caps rdna4_device_caps(void) {
+GARNET_INTERNAL rdna4dc_caps rdna4_device_caps(void) {
     if (atomic_load_explicit(&rdna4_caps_ready, memory_order_acquire)) return RDNA4Caps;
     return rdna4dc_fallback();
 }
-static inline rdna4dc_metal3_caps rdna4_metal3_caps(void) {
-    return rdna4_device_caps().metal3;
-}
+
 static rdna4_gather_caps RDNA4GatherCaps;
 static _Atomic int rdna4_gather_caps_ready;
-static rdna4_gather_caps rdna4_device_gather_caps(void) {
+GARNET_INTERNAL rdna4_gather_caps rdna4_device_gather_caps(void) {
     if (atomic_load_explicit(&rdna4_gather_caps_ready, memory_order_acquire)) return RDNA4GatherCaps;
     return (rdna4_gather_caps){0};
 }
 
-static NSError *rdna4_err(NSInteger code, NSString *msg) {
+GARNET_INTERNAL NSError *rdna4_err(NSInteger code, NSString *msg) {
     return [NSError errorWithDomain:@"GarnetMetal" code:code userInfo:@{ NSLocalizedDescriptionKey: msg }];
 }
 
-static uint64_t rdna4_now(void);
+
 
 // ---------------------------------------------------------------------------------------------------------------
 // native #12 bundle work (lag investigation).
@@ -275,10 +1154,10 @@ static uint64_t rdna4_now(void);
 //   fgpu  = submit -> fence for frame command buffers
 // T2: a VkPipelineCache created at device open from /private/var/tmp (or /private/tmp) and saved there (WindowServer only).
 // ---------------------------------------------------------------------------------------------------------------
-static struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } T1;
-static _Atomic uint64_t rdna4_t1_frames, rdna4_t1_lastframe, rdna4_pipes_new;
-static inline void rdna4_qlock(void) { uint64_t t_ = rdna4_now(); pthread_mutex_lock(&(RDNA4R.qlock)); rdna4t_add(&T1.qlk, rdna4_now() - t_); }
-static void rdna4_quarantine(id resources, VkResult fault) {
+GARNET_INTERNAL RDNA4T1State T1;
+GARNET_INTERNAL _Atomic uint64_t rdna4_t1_frames, rdna4_t1_lastframe, rdna4_pipes_new;
+
+GARNET_INTERNAL void rdna4_quarantine(id resources, VkResult fault) {
     rdna4_qlock();
     atomic_store(&rdna4_submit_fault, (int)fault);
     if (!rdna4_unresolved_commands) rdna4_unresolved_commands = [NSMutableArray array];
@@ -378,16 +1257,16 @@ static void rdna4_pc_save(const char *why) {
 }
 static void rdna4_pc_atexit(void) { rdna4_pc_save("exit"); }
 
-static void rdna4_pool_latch(void);
-static void rdna4_m6_report(void);
-static void rdna4_imp_latch(void);
-static void rdna4_imp_tick(void);
-static void rdna4_imp_report(unsigned tick);
-static void rdna4_led_report(unsigned tick);
-static void rdna4_pool_tick(void);
-static void rdna4_pool_report(unsigned tick);
-static void rdna4_drawopt_latch(void);
-static void rdna4_drawopt_report(unsigned tick);
+
+
+
+
+
+
+
+
+
+
 static void rdna4_t1_report(void) {
     static unsigned tick;
     struct { const char *n; rdna4t_hist *h; rdna4t_snap s; } m[] = { { "spvcache_read", &T1.spv, {0} }, { "shader_module", &T1.shm, {0} }, { "gfx_pipeline", &T1.gfx, {0} }, { "comp_pipeline", &T1.cmp, {0} }, { "import", &T1.imp, {0} },
@@ -440,7 +1319,7 @@ static int rdna4_csv_has_token(const char *csv, const char *tok) {
     }
     return 0;
 }
-static void rdna4s_prebind_on_radv_open(void);
+
 // One open attempt (#12 R4: the retry policy is in rdna4_radv_open). Returns YES when the RADV device + queue are up; on failure *err
 // is set. Called with the class lock held.
 static BOOL rdna4_radv_open_once(NSError **err) {
@@ -1070,7 +1949,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
 // (0.1, 0.2, 0.4, 0.8, 1.5 s, bounded to 3 s from the first attempt) before giving up, logging every attempt; after that, a later request retries ONCE if the
 // last failure is >= 2 s old (so a lazy open that lost a race with a closing client is not lost for the life of the process).
 // Any other failure (no dylib, vkCreateDevice, ...) is permanent for the process, as before.
-static BOOL rdna4_radv_open(NSError **err) {
+GARNET_INTERNAL BOOL rdna4_radv_open(NSError **err) {
     @synchronized ([GarnetDevice class]) {
         if (RDNA4R.ok) return YES;
         static uint64_t lastFail;
@@ -1098,9 +1977,10 @@ static BOOL rdna4_radv_open(NSError **err) {
     }
 }
 
-static int rdna4_find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
+GARNET_INTERNAL int rdna4_find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < RDNA4R.mp.memoryTypeCount; i++)
         if ((bits & (1u << i)) && (RDNA4R.mp.memoryTypes[i].propertyFlags & want) == want) return (int)i;
     return -1;
 }
 
+#endif // !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)

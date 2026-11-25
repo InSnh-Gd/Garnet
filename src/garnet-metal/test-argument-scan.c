@@ -3,7 +3,7 @@
 //   /tmp/test-argument-scan
 
 #include "rdna4_argument_scan.h"
-#include "rdna4_argument_scan.inc"
+#include "rdna4_argument_scan.h"
 
 #include <math.h>
 #include <stdio.h>

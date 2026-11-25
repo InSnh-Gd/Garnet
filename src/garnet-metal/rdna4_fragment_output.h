@@ -7,14 +7,14 @@ typedef struct {
     size_t declaration;
 } RDNA4FragmentOutput;
 
-static uint32_t rdna4s_fragment_output_lanes(const RDNA4FragmentOutput *outputs, size_t count, uint32_t id)
+static inline uint32_t rdna4s_fragment_output_lanes(const RDNA4FragmentOutput *outputs, size_t count, uint32_t id)
 {
     for (size_t idx = 0; idx < count; idx++)
         if (outputs[idx].id == id) return outputs[idx].lanes;
     return 0;
 }
 
-static int rdna4s_widen_fragment_output(const uint32_t *words, size_t *count, const RDNA4sMod *module,
+static inline int rdna4s_widen_fragment_output(const uint32_t *words, size_t *count, const RDNA4sMod *module,
                                        uint32_t **normalized)
 {
     *normalized = NULL;

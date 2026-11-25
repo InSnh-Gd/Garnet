@@ -6,7 +6,8 @@
 static NSString *captureFlag;
 #define RDNA4_SHADER_CAPTURE_FLAG captureFlag.fileSystemRepresentation
 #include "dump-write.inc"
-#include "rdna4_shader_request_capture.inc"
+#define GARNET_SHADER_REQUEST_CAPTURE_ONLY 1
+#include "garnet_shaders.m"
 
 static unsigned failures;
 #define CHECK(label, expression) do { BOOL okay = (expression); printf("%s %s\n", okay ? "PASS" : "FAIL", label); failures += !okay; } while (0)

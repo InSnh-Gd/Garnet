@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
         CHECK("source: the gate is rdna4ia_enabled(rdna4_is_ws(), <kill file>)", strstr(m, "rdna4ia_enabled(rdna4_is_ws() ? 1 : 0, ") != NULL && strstr(m, "/private/tmp/rdna4m-noioalias") != NULL, "gate + kill file");
         CHECK("source: both render-encoder sampling sites and the generic site go through rdna4_ios_touch", count(m, "rdna4_ios_touch(") >= 4, "%d call sites/definition", count(m, "rdna4_ios_touch("));
         CHECK("source: neither render-encoder site still uploads on the bare first-touch test", count(m, "if ([t rdna4IsIOS] && [_cb rdna4IOFirstTouch:t]) {") == 0 && count(m, "if ([t rdna4IsIOS] && [self->_cb rdna4IOFirstTouch:t]) {") == 0, "legacy first-touch upload blocks");
-        const char *f = strstr(m, "static BOOL rdna4_ios_touch(");
+        const char *f = strstr(m, "GARNET_INTERNAL BOOL rdna4_ios_touch(");
         const char *fe = f ? strstr(f, "\n}\n") : NULL;
         CHECK("source: rdna4_ios_touch exists", f && fe, "found");
         if (f && fe) {

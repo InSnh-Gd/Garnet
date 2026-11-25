@@ -7,7 +7,8 @@
  */
 
 #define RDNA4_ARGUMENT_SUMMARY_OWNERS_TEST 1
-#include "rdna4_argument_summary_owners.inc"
+#define GARNET_ARGUMENT_SUMMARY_OWNERS_ONLY 1
+#include "garnet_arguments.m"
 
 #include <stdio.h>
 

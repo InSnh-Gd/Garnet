@@ -585,8 +585,8 @@ static char *read_source_file(const char *rel_a, const char *rel_b) {
 }
 
 static void test_source_pins(void) {
-    char *impl = read_source_file("src/garnet-metal/rdna4_rt_runtime_impl.inc", "rdna4_rt_runtime_impl.inc");
-    CHECK(impl != NULL, "read rdna4_rt_runtime_impl.inc for source pins");
+    char *impl = read_source_file("src/garnet-metal/garnet_mesh_rt.m", "garnet_mesh_rt.m");
+    CHECK(impl != NULL, "read garnet_mesh_rt.m for source pins");
     if (impl) {
         CHECK(strstr(impl, "RDNA4IntersectionFunctionTable") != NULL, "impl defines RDNA4IntersectionFunctionTable");
         CHECK(strstr(impl, "rdna4VkAccelerationStructure") != NULL, "impl uses real rdna4VkAccelerationStructure selector");

@@ -1,45 +1,34 @@
 # Native Metal implementation
 
-`GarnetDevice.m` is the bundle entry point and the Metal device facade. It includes
-private `*_impl.inc` modules in dependency order. Build it once; do not compile
-the includes separately. This keeps private Objective-C classes and static
-helpers available to the production implementation and the existing mock
-fixtures without exporting a new runtime interface.
+`GarnetMetal.bundle` is built from 11 independent Objective-C compilation units
+compiled in parallel with `-DGARNET_METAL_MODULAR_BUILD=1 -fvisibility=hidden
+-Wall -Wextra -Werror` (see `build.sh`). Shared internal declarations live in
+`garnet_metal_internal.h`.
 
-| Responsibility | Implementation |
+`GarnetDevice.m` is a thin single-TU compatibility bridge (`#ifndef
+GARNET_METAL_MODULAR_BUILD`) that includes `garnet_metal_internal.h` and the 11
+`garnet_*.m` units in dependency order so existing mock fixtures that `#include
+"GarnetDevice.m"` continue to compile without exporting a new runtime ABI.
+
+| Responsibility | Compilation unit |
 | --- | --- |
-| Lazy RADV loading, immutable limits, device open and pipeline cache | `rdna4_backend_impl.inc` |
-| Memory pool, draw and import caches | `rdna4_resource_caches_impl.inc` |
-| IOSurface ownership, scanout, presentation and diagnostics | `rdna4_surface_impl.inc` |
-| QuartzCore 25G332 software import tracking compatibility | `rdna4_ca_sw_compat.h` |
-| Version-independent CoreDisplay verification for `AMDGarnetPrimaryFramebuffer` | `rdna4_coredisplay_compat.h` |
-| Temporary 25G332 desktop selection observations (read-only, UUID checked) | `rdna4_compositor_observation.h` |
-| Atomic AIR dump publication and dump-directory policy | `rdna4_shader_dump_impl.inc` |
-| Buffer backing, resource identity and shared heap declarations | `rdna4_buffer_impl.inc` |
-| Shared command helpers and event objects | `rdna4_command_support_impl.inc` |
-| Texture allocation, views, IOSurface import and CPU access | `rdna4_texture_impl.inc` |
-| Texture-buffer views sharing Vulkan buffer storage | `rdna4_texture_buffer_impl.inc` |
-| Heap capacity, placement, aliasing and resource creation | `rdna4_heap_impl.inc` |
-| Sampler configuration, admission, shared handles and LOD bindings | `rdna4_sampler_runtime_impl.inc` |
-| Depth/stencil state and fences | `rdna4_depth_fence_impl.inc` |
-| Translation, linked functions, reflection, descriptor layouts and hot-swap | `rdna4_shader_runtime_impl.inc` |
-| Render and compute pipelines | `rdna4_render_pipeline_impl.inc`, `rdna4_compute_pipeline_impl.inc` |
-| Bound stage resources, argument scan preparation and dispatch regions | `rdna4_stage_bindings_impl.inc` |
-| Queue scheduling, segment declarations and IOSurface command preparation | `rdna4_command_queue_impl.inc` |
-| Deferred scanout copy when a display write initially has no reusable slot | `rdna4_display_late_impl.inc` |
-| Bounded compositor input and accepted scanout pixel observation | `rdna4_surface_capture.inc`, `rdna4_present_capture.inc` |
-| Committed display updates awaiting GPU submission | `rdna4_display_commits.h` |
-| System Profiler association with the verified native accelerator | `rdna4_system_report_impl.inc` |
-| Command recording, submission, completion and descriptor snapshots | `rdna4_command_buffer_impl.inc` |
-| Render, compute and blit encoding | `rdna4_render_encoder_impl.inc`, `rdna4_compute_encoder_impl.inc`, `rdna4_blit_encoder_impl.inc` |
-| Standalone OpenGL-on-Metal surface table and drawable bridge | `rdna4_gl_surface_pure.h`, `rdna4_gl_drawable_impl.inc` |
+| Admission gates, immutable limits, lazy RADV open, Vulkan dispatch, pipeline cache | `garnet_backend.m` |
+| Memory pool, draw/import caches, buffers, textures, heaps, samplers, fences, residency sets | `garnet_resources.m` |
+| IOSurface ledger, scanout D-copy/HDMI routing, late-present, surface/present capture | `garnet_surface.m` |
+| Atomic AIR dumps, in-process shader translation, linked functions, binary archives, dynlibs/VFT | `garnet_shaders.m` |
+| Render/compute pipelines, stage bindings, argument scan prep, encoder bindings | `garnet_pipelines.m` |
+| Format table, command queues, command buffers, counters, render/compute/blit encoders | `garnet_commands.m` |
+| Argument table layouts, descriptor pools, command materialization, argument encoders, summary | `garnet_arguments.m` |
+| Indirect command buffers (render & compute CPU/GPU paths, reset/copy transactions) | `garnet_icb.m` |
+| Metal 3 IO command queues and sparse/PRT heaps, textures, and resource-state encoders | `garnet_sparse_io.m` |
+| Ray tracing acceleration structures, IFT/runtime, and mesh/object shader pipelines | `garnet_mesh_rt.m` |
+| `GarnetDevice` facade, System Profiler registration, GL-on-Metal drawable bridge | `garnet_device.m` |
 
-The existing argument includes keep their roles: `rdna4_argument_tables.inc`
-owns table layouts, `rdna4_argument_pool.inc` owns descriptor pool budgets,
-`rdna4_argument_table_commands.inc` materializes command descriptors, and
-`rdna4_argument.inc` plus the summary includes manage argument encoders and
-sampler-owner evidence. This split preserves their include positions and the
-shader ABI. Cross-module dependencies are still private to one translation unit.
+Single-TU headers with process-local compatibility state remain included only by
+the compilation unit that owns them (`rdna4_ca_sw_compat.h`,
+`rdna4_coredisplay_compat.h`, `rdna4_compositor_observation.h`,
+`rdna4_census.h` in `garnet_device.m`; `rdna4_stitch_reflection.h` in
+`garnet_arguments.m`; `rdna4_icb_expand.h` in `garnet_icb.m`).
 
 Sampler callers acquire and release canonical storage through
 `rdna4_sampler_storage_acquire` and `rdna4_sampler_storage_release`. Those two
@@ -48,8 +37,7 @@ rollback and last-public-owner release. Callers adapt Metal descriptors or LOD
 overrides; they do not update storage counters. Handle creation retains the
 existing budget rule `committed = actual + reserved - reservedActual`.
 
-Tests that include `GarnetDevice.m` compile normally. Tests that extract or mutate
-production source use `assemble-device.py` to expand only the private
-`*_impl.inc` includes. Ordinary includes remain intact, so historical source
-guards can compare the same implementation text. The compatibility runner's
-source metadata already includes every top-level `.inc` file.
+Tests that include `GarnetDevice.m` compile normally via the single-TU bridge.
+Tests that extract or inspect full production source use `assemble-device.py` to
+expand `garnet_metal_internal.h` and `garnet_*.m` (plus legacy `*_impl.inc`
+fixtures in `test-validation-runner.py`).

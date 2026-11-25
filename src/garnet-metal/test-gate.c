@@ -181,17 +181,21 @@ int main(int argc, char **argv) {
       free(pl); }
     { char *gm = slurp(dir, "GarnetDevice.m");
       const int assembled = gm && strstr(gm, "@implementation RDNA4RenderPipelineState") != NULL;
-      char *rp = assembled ? NULL : slurp(dir, "rdna4_render_pipeline_impl.inc");
-      char *cp = assembled ? NULL : slurp(dir, "rdna4_compute_pipeline_impl.inc");
-      char *re = assembled ? NULL : slurp(dir, "rdna4_render_encoder_impl.inc");
-      char *ce = assembled ? NULL : slurp(dir, "rdna4_compute_encoder_impl.inc");
-      char *bf = assembled ? NULL : slurp(dir, "rdna4_buffer_impl.inc");
-      char *rs = assembled ? NULL : slurp(dir, "rdna4_residency_set_impl.inc");
-      char *cb = assembled ? NULL : slurp(dir, "rdna4_command_buffer_impl.inc");
-      char *sr = assembled ? NULL : slurp(dir, "rdna4_shader_runtime_impl.inc");
-      char *bk = assembled ? NULL : slurp(dir, "rdna4_backend_impl.inc");
-      char *sb = assembled ? NULL : slurp(dir, "rdna4_stage_bindings_impl.inc");
-      char *ag = assembled ? NULL : slurp(dir, "rdna4_argument.inc");
+      char *gd = assembled ? NULL : slurp(dir, "garnet_device.m");
+      char *gh = assembled ? NULL : slurp(dir, "garnet_metal_internal.h");
+      char *rp = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
+      char *cp = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
+      char *re = assembled ? NULL : slurp(dir, "garnet_commands.m");
+      char *ce = assembled ? NULL : slurp(dir, "garnet_commands.m");
+      char *bf = assembled ? NULL : slurp(dir, "garnet_resources.m");
+      char *rs = assembled ? NULL : slurp(dir, "garnet_resources.m");
+      char *cb = assembled ? NULL : slurp(dir, "garnet_commands.m");
+      char *sr = assembled ? NULL : slurp(dir, "garnet_shaders.m");
+      char *bk = assembled ? NULL : slurp(dir, "garnet_backend.m");
+      char *sb = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
+      char *ag = assembled ? NULL : slurp(dir, "garnet_arguments.m");
+      const char *devSrc = assembled ? gm : gd;
+      const char *hdrSrc = assembled ? gm : gh;
       const char *rpSrc = assembled ? gm : rp;
       const char *cpSrc = assembled ? gm : cp;
       const char *reSrc = assembled ? gm : re;
@@ -203,86 +207,86 @@ int main(int argc, char **argv) {
       const char *bkSrc = assembled ? gm : bk;
       const char *sbSrc = assembled ? gm : sb;
       CHECK("G14: GarnetDevice.m exposes Metal2/Metal3 capability and out-of-scope selectors",
-            gm && strstr(gm, "- (BOOL)areRasterOrderGroupsSupported")
-               && strstr(gm, "- (BOOL)supportsBCTextureCompression")
-               && strstr(gm, "- (BOOL)supports32BitFloatFiltering")
-               && strstr(gm, "- (BOOL)supports32BitMSAA")
-               && strstr(gm, "- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }")
-               && strstr(gm, "- (BOOL)supportsRaytracing { return rdna4_rt_runtime_supports_raytracing(); }")
-               && strstr(gm, "- (BOOL)supportsRaytracingFromRender { return rdna4_rt_runtime_supports_raytracing_from_render(); }")
-               && strstr(gm, "- (BOOL)supportsPrimitiveMotionBlur { return rdna4_rt_runtime_supports_primitive_motion_blur(); }")
-               && strstr(gm, "- (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
-               && strstr(gm, "- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
-               && strstr(gm, "- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }")
-               && strstr(gm, "- (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }")
-               && strstr(gm, "- (BOOL)supportsBinaryArchives { return rdna4x_active(); }")
-               && strstr(gm, "- (BOOL)supportsPullModelInterpolation")
-               && strstr(gm, "rdna4dc_metal3_pull_model_ok(&m3)")
-               && strstr(gm, "- (BOOL)supportsShaderBarycentricCoordinates")
-               && strstr(gm, "rdna4dc_metal3_barycentric_ok(&m3)")
-               && strstr(gm, "- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf")
-               && strstr(gm, "- (BOOL)supportsFeatureSet:(NSUInteger)featureSet")
-               && strstr(gm, "- (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet"));
+            devSrc && strstr(devSrc, "- (BOOL)areRasterOrderGroupsSupported")
+               && strstr(devSrc, "- (BOOL)supportsBCTextureCompression")
+               && strstr(devSrc, "- (BOOL)supports32BitFloatFiltering")
+               && strstr(devSrc, "- (BOOL)supports32BitMSAA")
+               && strstr(devSrc, "- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count == 1; }")
+               && strstr(devSrc, "- (BOOL)supportsRaytracing { return rdna4_rt_runtime_supports_raytracing(); }")
+               && strstr(devSrc, "- (BOOL)supportsRaytracingFromRender { return rdna4_rt_runtime_supports_raytracing_from_render(); }")
+               && strstr(devSrc, "- (BOOL)supportsPrimitiveMotionBlur { return rdna4_rt_runtime_supports_primitive_motion_blur(); }")
+               && strstr(devSrc, "- (BOOL)supportsDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(devSrc, "- (BOOL)supportsRenderDynamicLibraries { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(devSrc, "- (BOOL)supportsFunctionPointers { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(devSrc, "- (BOOL)supportsFunctionPointersFromRender { return rdna4_dynlib_vft_translator_ready(); }")
+               && strstr(devSrc, "- (BOOL)supportsBinaryArchives { return rdna4x_active(); }")
+               && strstr(devSrc, "- (BOOL)supportsPullModelInterpolation")
+               && strstr(devSrc, "rdna4dc_metal3_pull_model_ok(&m3)")
+               && strstr(devSrc, "- (BOOL)supportsShaderBarycentricCoordinates")
+               && strstr(devSrc, "rdna4dc_metal3_barycentric_ok(&m3)")
+               && strstr(devSrc, "- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf")
+               && strstr(devSrc, "- (BOOL)supportsFeatureSet:(NSUInteger)featureSet")
+               && strstr(devSrc, "- (BOOL)deviceSupportsFeatureSet:(NSUInteger)featureSet"));
       CHECK("G14: GarnetDevice.m wires Wave 2A counters, binary archive, IO queue, and residency set factories",
-            gm && rpSrc
-               && (assembled || (strstr(gm, "#include \"rdna4_binary_archive_impl.inc\"")
-                                 && strstr(gm, "#include \"rdna4_counters_impl.inc\"")
-                                 && strstr(gm, "#include \"rdna4_residency_set_impl.inc\"")
-                                 && strstr(gm, "#include \"rdna4_io_queue_impl.inc\"")))
-               && strstr(gm, "(id<MTLBinaryArchive>)[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
+            gm && devSrc && rpSrc
+               && (assembled || (strstr(gm, "#include \"garnet_shaders.m\"")
+                                 && strstr(gm, "#include \"garnet_commands.m\"")
+                                 && strstr(gm, "#include \"garnet_resources.m\"")
+                                 && strstr(gm, "#include \"garnet_sparse_io.m\"")))
+               && strstr(devSrc, "(id<MTLBinaryArchive>)[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
                && strstr(rpSrc, "rdna4_ba_lookup_render(")
                && strstr(rpSrc, "rdna4_ba_vkcache()")
-               && strstr(gm, "rdna4_device_counter_sets()")
-               && strstr(gm, "rdna4_device_supports_counter_sampling(")
-               && strstr(gm, "rdna4_device_new_counter_sample_buffer(")
-               && strstr(gm, "rdna4_device_sample_timestamps(")
-               && strstr(gm, "[[RDNA4IOFileHandle alloc] initWithDevice:self")
-               && strstr(gm, "[[RDNA4IOCommandQueue alloc] initWithDevice:self descriptor:descriptor error:error]")
-               && strstr(gm, "[[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error]"));
+               && strstr(devSrc, "rdna4_device_counter_sets()")
+               && strstr(devSrc, "rdna4_device_supports_counter_sampling(")
+               && strstr(devSrc, "rdna4_device_new_counter_sample_buffer(")
+               && strstr(devSrc, "rdna4_device_sample_timestamps(")
+               && strstr(devSrc, "[[RDNA4IOFileHandle alloc] initWithDevice:self")
+               && strstr(devSrc, "[[RDNA4IOCommandQueue alloc] initWithDevice:self descriptor:descriptor error:error]")
+               && strstr(devSrc, "[[RDNA4ResidencySet alloc] initWithDevice:self descriptor:descriptor error:error]"));
       CHECK("G14: GarnetDevice.m wires Wave 3A sparse/PRT and ray-tracing acceleration structure modules",
-            gm && cbSrc
+            gm && devSrc && cbSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4ResourceStateEncoder")
                                 && strstr(gm, "@implementation GarnetAccelerationStructureCommandEncoder"))
-                             : (strstr(gm, "#include \"rdna4_sparse_impl.inc\"")
-                                && strstr(gm, "#include \"rdna4_rt_accel_impl.inc\"")))
-               && strstr(gm, "rdna4_sparse_heap_new(self, d, NULL)")
-               && strstr(gm, "rdna4_device_sparse_tile_size_in_bytes()")
-               && strstr(gm, "rdna4_device_sparse_tile_size_for_page_size(")
-               && strstr(gm, "rdna4_device_sparse_tile_size(")
-               && strstr(gm, "rdna4_device_sparse_tile_size_with_page_size(")
-               && strstr(gm, "rdna4_device_convert_sparse_pixel_regions(")
-               && strstr(gm, "rdna4_device_convert_sparse_tile_regions(")
-               && strstr(gm, "rdna4_cb_new_resource_state_encoder(self, nil)")
-               && strstr(gm, "rdna4_cb_new_resource_state_encoder(self, d)")
-               && strstr(gm, "rdna4_rt_device_sizes(self, d)")
-               && strstr(gm, "rdna4_rt_device_new_with_size(self, size)")
-               && strstr(gm, "rdna4_rt_device_new_with_descriptor(self, d)")
-               && strstr(gm, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil]")
-               && strstr(gm, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d]")
-               && strstr(gm, "\"MTLResourceStateCommandEncoder\"")
-               && strstr(gm, "\"MTLAccelerationStructure\"")
-               && strstr(gm, "\"MTLAccelerationStructureCommandEncoder\"")
+                             : (strstr(gm, "#include \"garnet_sparse_io.m\"")
+                                && strstr(gm, "#include \"garnet_mesh_rt.m\"")))
+               && strstr(devSrc, "rdna4_sparse_heap_new(self, d, NULL)")
+               && strstr(devSrc, "rdna4_device_sparse_tile_size_in_bytes()")
+               && strstr(devSrc, "rdna4_device_sparse_tile_size_for_page_size(")
+               && strstr(devSrc, "rdna4_device_sparse_tile_size(")
+               && strstr(devSrc, "rdna4_device_sparse_tile_size_with_page_size(")
+               && strstr(devSrc, "rdna4_device_convert_sparse_pixel_regions(")
+               && strstr(devSrc, "rdna4_device_convert_sparse_tile_regions(")
+               && strstr(devSrc, "rdna4_cb_new_resource_state_encoder(self, nil)")
+               && strstr(devSrc, "rdna4_cb_new_resource_state_encoder(self, d)")
+               && strstr(devSrc, "rdna4_rt_device_sizes(self, d)")
+               && strstr(devSrc, "rdna4_rt_device_new_with_size(self, size)")
+               && strstr(devSrc, "rdna4_rt_device_new_with_descriptor(self, d)")
+               && strstr(devSrc, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil]")
+               && strstr(devSrc, "[[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d]")
+               && strstr(devSrc, "\"MTLResourceStateCommandEncoder\"")
+               && strstr(devSrc, "\"MTLAccelerationStructure\"")
+               && strstr(devSrc, "\"MTLAccelerationStructureCommandEncoder\"")
                && strstr(cbSrc, "objc_getClass(\"GarnetAccelerationStructure\")")
                && strstr(cbSrc, "rdna4CurrentHandle")
                && strstr(cbSrc, "objc_getClass(\"RDNA4SparseHeap\")"));
       CHECK("G14: GarnetDevice.m wires Wave 3B dynlib/VFT, AS buffer build-input bit, and sparse residency",
-            gm && rpSrc && cpSrc && reSrc && ceSrc && bfSrc && rsSrc && srSrc
+            gm && devSrc && rpSrc && cpSrc && reSrc && ceSrc && bfSrc && rsSrc && srSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4DynamicLibrary")
                                 && strstr(gm, "@implementation RDNA4FunctionHandle")
                                 && strstr(gm, "@implementation RDNA4VisibleFunctionTable"))
-                             : (strstr(gm, "#include \"rdna4_dynlib_vft_impl.inc\"") != NULL))
-               && strstr(gm, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self library:library error:error]")
-               && strstr(gm, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error]")
-               && strstr(gm, "\"MTLDynamicLibrary\"")
-               && strstr(gm, "\"MTLFunctionHandle\"")
-               && strstr(gm, "\"MTLVisibleFunctionTable\"")
+                             : (strstr(gm, "#include \"garnet_shaders.m\"") != NULL))
+               && strstr(devSrc, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self library:library error:error]")
+               && strstr(devSrc, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error]")
+               && strstr(devSrc, "\"MTLDynamicLibrary\"")
+               && strstr(devSrc, "\"MTLFunctionHandle\"")
+               && strstr(devSrc, "\"MTLVisibleFunctionTable\"")
                && strstr(cpSrc, "[(id<MTLComputePipelineState>)obj supportIndirectCommandBuffers]")
                && strstr(cpSrc, "rdna4_lk_error(fn)")
                && strstr(cpSrc, "rdna4x_parse_vft_from_meta(")
                && strstr(cpSrc, "- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function")
                && strstr(cpSrc, "- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor")
                && strstr(srSrc, "const BOOL requireStage2 = (dynlibs.count > 0 || visFns.count > 0 || deps.count > 0 || f || bf || pf || gg || pl || addBin);")
-               && strstr(gm, "!noStage2Fallback && rdna4_fallback_ok()")
+               && strstr(devSrc, "!noStage2Fallback && rdna4_fallback_ok()")
                && strstr(rpSrc, "rdna4_vft_validate_render_footnote10(")
                && strstr(rpSrc, "rdna4x_parse_vft_from_meta(")
                && strstr(rpSrc, "stage2Only")
@@ -300,36 +304,35 @@ int main(int argc, char **argv) {
                && strstr(rsSrc, "objc_getClass(\"RDNA4SparseHeap\")")
                && strstr(rsSrc, "sparse textures/heaps are not supported") == NULL);
       CHECK("G14: GarnetDevice.m wires Wave 3E mesh shaders and ray-tracing runtime/IFT",
-            gm && rpSrc && cpSrc && reSrc && ceSrc && cbSrc && srSrc && bkSrc && sbSrc
+            gm && devSrc && hdrSrc && rpSrc && cpSrc && reSrc && ceSrc && cbSrc && srSrc && bkSrc && sbSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4IntersectionFunctionTable")
                                 && strstr(gm, "@implementation RDNA4MeshRenderPipelineState")
-                                && strstr(gm, "#include \"rdna4_argument.inc\""))
-                             : (strstr(gm, "#include \"rdna4_rt_runtime_impl.inc\"") != NULL
-                                && strstr(gm, "#include \"rdna4_mesh_impl.inc\"") != NULL
+                                && strstr(gm, "rdna4_rt_arg_is_rt_data_type(") != NULL)
+                             : (strstr(gm, "#include \"garnet_mesh_rt.m\"") != NULL
                                 && ag != NULL
                                 && strstr(ag, "rdna4_rt_arg_is_rt_data_type(") != NULL
                                 && strstr(ag, "- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure atIndex:(NSUInteger)index") != NULL
                                 && strstr(ag, "- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)intersectionFunctionTable atIndex:(NSUInteger)index") != NULL
                                 && strstr(ag, "- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)intersectionFunctionTables withRange:(NSRange)range") != NULL))
-               && strstr(bkSrc, "#define RDNA4_HAS_MULTI_DRAW_INDIRECT 1")
+               && strstr(hdrSrc, "#define RDNA4_HAS_MULTI_DRAW_INDIRECT 1")
                && strstr(bkSrc, ".multiDrawIndirect = pf.multiDrawIndirect")
                && strstr(bkSrc, "RDNA4R.multiDrawIndirect = ef.multiDrawIndirect")
                && strstr(srSrc, "garnetx_detect_stage")
                && strstr(srSrc, "garnetx_translate_stage3")
                && strstr(srSrc, "rdna4rtr_infer_ift_kind_from_ir(")
-               && strstr(gm, "\"MTLIntersectionFunctionTable\"")
-               && strstr(gm, "RDNA4MeshRenderPipelineState")
-               && strstr(gm, "- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:")
-               && strstr(gm, "rdna4_mesh_device_new_pipeline(self, d, opts, refl, error)")
-               && strstr(gm, "rdna4_mesh_device_new_pipeline_async(self, d, opts, h)")
-               && strstr(sbSrc, "RDNA4RTStageSlots rt;")
+               && strstr(devSrc, "\"MTLIntersectionFunctionTable\"")
+               && strstr(devSrc, "RDNA4MeshRenderPipelineState")
+               && strstr(devSrc, "- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:")
+               && strstr(devSrc, "rdna4_mesh_device_new_pipeline(self, d, opts, refl, error)")
+               && strstr(devSrc, "rdna4_mesh_device_new_pipeline_async(self, d, opts, h)")
+               && strstr(hdrSrc, "RDNA4RTStageSlots rt;")
                && strstr(cbSrc, "rdna4_rt_descriptor_pool_append(")
                && strstr(cbSrc, "VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:")
                && strstr(cbSrc, "rdna4_rt_fill_accel_descriptor(")
                && strstr(cpSrc, "rdna4_rt_parse_meta(")
                && strstr(cpSrc, "rdna4_rt_pipeline_function_handle(")
                && strstr(cpSrc, "rdna4_rt_pipeline_new_ift(")
-               && strstr(rpSrc, "#define RDNA4_HAS_MESH_PIPELINE_QUERY 1")
+               && strstr(hdrSrc, "#define RDNA4_HAS_MESH_PIPELINE_QUERY 1")
                && strstr(rpSrc, "rdna4_rt_parse_meta(")
                && strstr(rpSrc, "rdna4rtr_refl_uses_raytracing(")
                && strstr(rpSrc, "rdna4_rt_pipeline_function_handle(")
@@ -345,6 +348,8 @@ int main(int argc, char **argv) {
                && strstr(reSrc, "rdna4_rt_dc_push_accel_sig(")
                && strstr(reSrc, "if ([_pso rdna4IsMeshPipeline])")
                && strstr(reSrc, "rdna4_rt_retain_argbuf_resources("));
+      free(gd);
+      free(gh);
       free(ag);
       free(sb);
       free(bk);

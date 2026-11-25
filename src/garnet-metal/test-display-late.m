@@ -94,7 +94,8 @@ static void rdna4s_complete(int inst, int slot, VkResult r, uint64_t seq, uint32
     rdna4s_complete_run(inst, slot, r, seq, sid, crc, cls, commit, 0);
 }
 #ifndef TEST_LEGACY
-#include "rdna4_display_late_impl.inc"
+#define GARNET_DISPLAY_LATE_ONLY 1
+#include "garnet_surface.m"
 #else
 static void rdna4s_late_complete(RDNA4Texture *t, int i, uint64_t s, uint32_t sid, int c, uint64_t commit) {
     (void)t; (void)i; (void)s; (void)sid; (void)c; (void)commit;

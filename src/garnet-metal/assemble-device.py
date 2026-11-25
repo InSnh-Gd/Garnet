@@ -14,7 +14,7 @@ def assemble(source: Path, include_dir: Path) -> str:
         if path in parents:
             raise ValueError(f"cyclic device module include: {path.name}")
         return re.sub(
-            r'^#include "(rdna4_[a-z0-9_]+_impl\.inc)"\n',
+            r'^#include "(garnet_metal_internal\.h|garnet_[a-z0-9_]+\.m|rdna4_[a-z0-9_]+_impl\.inc)"\n',
             lambda match: expand(include_dir / match[1], (*parents, path)),
             path.read_text(),
             flags=re.MULTILINE,

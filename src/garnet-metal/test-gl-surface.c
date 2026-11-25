@@ -202,7 +202,8 @@ static void test_source_pins(const char *assembled_path, const char *dir) {
         CHECK(install_fn != NULL && strstr(install_fn, "if (rdna4_is_ws()) return;") != NULL,
               "pin: rdna4_gl_surfaces_install guards against WindowServer");
 
-        const char *lookup = strstr(asm_src, "- (IOSurfaceRef)lookupIOSurfaceAtIndex:");
+        const char *gl_impl = strstr(asm_src, "@implementation GarnetGLDrawable");
+        const char *lookup = gl_impl ? strstr(gl_impl, "- (IOSurfaceRef)lookupIOSurfaceAtIndex:") : NULL;
         const char *width_m = lookup ? strstr(lookup, "- (unsigned)width") : NULL;
         const char *retain = lookup ? strstr(lookup, "CFRetain") : NULL;
         CHECK(lookup && width_m && retain && retain < width_m,
@@ -235,16 +236,22 @@ static void test_source_pins(const char *assembled_path, const char *dir) {
         free(pure_src);
     }
 
-    snprintf(path, sizeof path, "%s/rdna4_gl_drawable_impl.inc", dir);
+    snprintf(path, sizeof path, "%s/garnet_device.m", dir);
     char *impl_src = slurp_path(path);
-    CHECK(impl_src != NULL, "source: rdna4_gl_drawable_impl.inc readable");
+    CHECK(impl_src != NULL, "source: garnet_device.m readable");
     if (impl_src) {
-        CHECK(strstr(impl_src, "AppleParavirt") == NULL,
-              "boundary: rdna4_gl_drawable_impl.inc has zero AppleParavirt references");
-        CHECK(strstr(impl_src, "glProgramAir") == NULL,
-              "boundary: rdna4_gl_drawable_impl.inc has zero glProgramAir references");
-        CHECK(strstr(impl_src, "GarnetAccelerator") != NULL,
+        const char *gl_begin = strstr(impl_src, "rdna4_gl_surfaces");
+        const char *gl_end = gl_begin ? strstr(gl_begin, "@implementation GarnetDevice") : NULL;
+        size_t gl_len = (gl_begin && gl_end && gl_end > gl_begin) ? (size_t)(gl_end - gl_begin) : 0;
+        char *gl_sec = gl_len ? (char *)calloc(1, gl_len + 1) : NULL;
+        if (gl_sec) memcpy(gl_sec, gl_begin, gl_len);
+        CHECK(gl_sec != NULL && strstr(gl_sec, "AppleParavirt") == NULL,
+              "boundary: GL section in garnet_device.m has zero AppleParavirt references");
+        CHECK(gl_sec != NULL && strstr(gl_sec, "glProgramAir") == NULL,
+              "boundary: GL section in garnet_device.m has zero glProgramAir references");
+        CHECK(gl_sec != NULL && strstr(gl_sec, "GarnetAccelerator") != NULL,
               "pin: rdna4_gl_create_surface filters for GarnetAccelerator");
+        free(gl_sec);
         free(impl_src);
     }
 }

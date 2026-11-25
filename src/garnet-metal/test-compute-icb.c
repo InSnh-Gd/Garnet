@@ -627,7 +627,6 @@ static void assert_file_contains(const char *path, const char *const *needles, s
 
 static void test_source_pins(void) {
     static const char *const pipe_pins[] = {
-        "RDNA4_COMPUTE_ICB_ENABLED",
         "rdna4PrepareICBGPUVariant:",
         "lower_icb_stage",
         "rdna4s_icb_compute_indirect",
@@ -637,7 +636,6 @@ static void test_source_pins(void) {
         "gpuResourceID",
     };
     static const char *const enc_pins[] = {
-        "RDNA4ComputeICBInternal",
         "executeCommandsInBuffer:",
         "indirectBufferOffset:",
         "rdna4ICBComputeBarrier",
@@ -664,17 +662,22 @@ static void test_source_pins(void) {
         "vkCmdDispatchIndirect",
         "cannot mix render and compute commands",
     };
-    assert_file_contains("src/garnet-metal/rdna4_compute_pipeline_impl.inc", pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
-    assert_file_contains("src/garnet-metal/rdna4_compute_encoder_impl.inc", enc_pins, sizeof enc_pins / sizeof enc_pins[0]);
-    assert_file_contains("src/garnet-metal/rdna4_argument.inc", arg_pins, sizeof arg_pins / sizeof arg_pins[0]);
-    assert_file_contains("src/garnet-metal/rdna4_icb.inc", icb_pins, sizeof icb_pins / sizeof icb_pins[0]);
+    static const char *const hdr_pins[] = {
+        "RDNA4_COMPUTE_ICB_ENABLED",
+        "RDNA4ComputeICBInternal",
+    };
+    assert_file_contains("src/garnet-metal/garnet_metal_internal.h", hdr_pins, sizeof hdr_pins / sizeof hdr_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_pipelines.m", pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_commands.m", enc_pins, sizeof enc_pins / sizeof enc_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_arguments.m", arg_pins, sizeof arg_pins / sizeof arg_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_icb.m", icb_pins, sizeof icb_pins / sizeof icb_pins[0]);
 
     const char *assembled = getenv("RDNA4_TEST_ASSEMBLED_DEVICE");
     if (assembled && assembled[0]) {
         static const char *const asm_inc_pins[] = {
             "#include \"rdna4_icb_abi.h\"",
-            "#include \"rdna4_argument.inc\"",
-            "#include \"rdna4_icb.inc\"",
+            "#include \"garnet_arguments.m\"",
+            "#include \"garnet_icb.m\"",
         };
         assert_file_contains(assembled, pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
         assert_file_contains(assembled, enc_pins, sizeof enc_pins / sizeof enc_pins[0]);

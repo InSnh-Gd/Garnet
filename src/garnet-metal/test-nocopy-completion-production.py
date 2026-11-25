@@ -3,11 +3,11 @@ import re
 from pathlib import Path
 
 root = Path(__file__).parent
-blit = (root / "rdna4_blit_encoder_impl.inc").read_text()
-compute = (root / "rdna4_compute_encoder_impl.inc").read_text()
-render = (root / "rdna4_render_encoder_impl.inc").read_text()
-queue = (root / "rdna4_command_queue_impl.inc").read_text()
-command_buffer = (root / "rdna4_command_buffer_impl.inc").read_text()
+blit = (root / "garnet_commands.m").read_text()
+compute = (root / "garnet_commands.m").read_text()
+render = (root / "garnet_commands.m").read_text()
+queue = (root / "garnet_commands.m").read_text()
+command_buffer = (root / "garnet_commands.m").read_text()
 runtime_test = (root / "test-nocopy-readonly.m").read_text()
 
 compute_rejection = compute[compute.index("if (rdna4nc_stage_writes("):].split("return;", 1)[0]

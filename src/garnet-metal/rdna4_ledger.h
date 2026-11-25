@@ -1,3 +1,4 @@
+#pragma once
 // rdna4_ledger.h: bundle build 16, app-fix round 1 (an internal design note section P5): pure C, no Foundation, no Vulkan, no IOSurface (host test: test-ledger.c).
 //  (A) THE LIVE-IMPORT LEDGER (Step 0, logging only). One entry per live IOSurface-backed texture: its surface id, the import bytes it stands for, pixel format, plane count, birth time and the
 //      number of command buffers that have touched it and not finished yet. A snapshot gives: live textures, distinct live surface ids, bytes (per texture and per distinct surface), textures
@@ -49,8 +50,8 @@ static inline void rdna4l_untouch(rdna4l *L, uintptr_t key) {
     size_t i = rdna4l_find(L, key);
     if (i == (size_t)-1) L->untouchMissing++; else if (L->e[i].inflight <= 0) L->untouchUnder++; else L->e[i].inflight--;
 }
-static int rdna4l_cmp_sid(const void *a, const void *b) { const rdna4l_ent *x = (const rdna4l_ent *)a, *y = (const rdna4l_ent *)b; return x->sid < y->sid ? -1 : x->sid > y->sid ? 1 : x->bytes < y->bytes ? -1 : x->bytes > y->bytes; }
-static int rdna4l_cmp_grp(const void *a, const void *b) {
+static inline int rdna4l_cmp_sid(const void *a, const void *b) { const rdna4l_ent *x = (const rdna4l_ent *)a, *y = (const rdna4l_ent *)b; return x->sid < y->sid ? -1 : x->sid > y->sid ? 1 : x->bytes < y->bytes ? -1 : x->bytes > y->bytes; }
+static inline int rdna4l_cmp_grp(const void *a, const void *b) {
     const rdna4l_ent *x = (const rdna4l_ent *)a, *y = (const rdna4l_ent *)b;
     if (x->bytes != y->bytes) return x->bytes < y->bytes ? -1 : 1;
     if (x->pf != y->pf) return x->pf < y->pf ? -1 : 1;

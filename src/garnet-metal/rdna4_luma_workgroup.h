@@ -3,7 +3,7 @@
 
 enum { RDNA4_LUMA_WORKGROUP_SPEC = 3, RDNA4_LUMA_ELEMENT_BYTES = 16 };
 
-static int rdna4_luma_workgroup(const char *kernel, const RDNA4sMod *module, const uint32_t *words,
+static inline int rdna4_luma_workgroup(const char *kernel, const RDNA4sMod *module, const uint32_t *words,
                                 size_t count, uint32_t **output) {
     *output = NULL;
     if (!kernel || (strcmp(kernel, "compute_average_luma") && strcmp(kernel, "compute_sum_luma"))) return 0;

@@ -1,3 +1,4 @@
+#pragma once
 // rdna4_census.h: bundle build 18 (app-fix round 2), the unimplemented-selector CENSUS (an internal design note "Unimplemented-selector policy").
 //
 // WHY. Every selector a client sends that none of our classes (or their Apple superclasses) implements ends in -doesNotRecognizeSelector: and the process dies (Maps: -setVisibilityResultMode:offset:). We do not

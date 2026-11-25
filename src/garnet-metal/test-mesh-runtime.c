@@ -1,5 +1,5 @@
 // test-mesh-runtime.c: pure-C host test suite for rdna4_mesh.h and source pins for
-// rdna4_mesh_impl.inc / test-metal3-mesh-shaders.m (Wave 3D Task 6.2).
+// garnet_mesh_rt.m / test-metal3-mesh-shaders.m (Wave 3D Task 6.2).
 //
 // Compile & run (GCC -Werror):
 //   gcc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Wshadow -Wsign-conversion -Werror -Isrc/garnet-metal src/garnet-metal/test-mesh-runtime.c -o "$TMPDIR/test-mesh-runtime-gcc"
@@ -1007,8 +1007,8 @@ static char *slurp_file(const char *path) {
 }
 
 static void test_source_pins(void) {
-    char *impl = slurp_file("src/garnet-metal/rdna4_mesh_impl.inc");
-    if (!impl) impl = slurp_file("rdna4_mesh_impl.inc");
+    char *impl = slurp_file("src/garnet-metal/garnet_mesh_rt.m");
+    if (!impl) impl = slurp_file("garnet_mesh_rt.m");
     CHECK(impl != NULL);
 
     const char *impl_pins[] = {
@@ -1047,14 +1047,16 @@ static void test_source_pins(void) {
     for (size_t i = 0; i < sizeof(impl_pins) / sizeof(impl_pins[0]); i++) {
         CHECK(strstr(impl, impl_pins[i]) != NULL);
     }
-    // Regression pins: no 656 KiB stack RDNA4sRefl, no unprefixed Stage 3 typedef collisions.
-    CHECK(strstr(impl, "RDNA4sRefl userR;") == NULL);
-    CHECK(strstr(impl, "rdna4x_cift_fn") == NULL);
-    CHECK(strstr(impl, "rdna4x_translate_stage3_fn") == NULL);
+    // Regression pins: no 656 KiB stack RDNA4sRefl, no unprefixed Stage 3 typedef collisions in mesh section.
+    const char *mesh_sec = strstr(impl, "RDNA4_MESH_IMPL_INC");
+    CHECK(mesh_sec != NULL);
+    CHECK(strstr(mesh_sec, "RDNA4sRefl userR;") == NULL);
+    CHECK(strstr(mesh_sec, "rdna4x_cift_fn") == NULL);
+    CHECK(strstr(mesh_sec, "rdna4x_translate_stage3_fn") == NULL);
     free(impl);
 
-    char *sr = slurp_file("src/garnet-metal/rdna4_shader_runtime_impl.inc");
-    if (!sr) sr = slurp_file("rdna4_shader_runtime_impl.inc");
+    char *sr = slurp_file("src/garnet-metal/garnet_shaders.m");
+    if (!sr) sr = slurp_file("garnet_shaders.m");
     CHECK(sr != NULL);
     CHECK(strstr(sr, "MTLFunctionTypeIntersection") != NULL);
     CHECK(strstr(sr, "RDNA4RTR_MTL_FN_TYPE_INTERSECTION") == NULL);

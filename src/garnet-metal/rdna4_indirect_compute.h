@@ -4,7 +4,7 @@
 #include "rdna4_spvrefl.h"
 
 /* Whole-group indirect dispatch gets its grid from the GPU, without CPU argument reads. */
-static int rdna4s_indirect_compute(const uint32_t *words, size_t count, uint32_t offset,
+static inline int rdna4s_indirect_compute(const uint32_t *words, size_t count, uint32_t offset,
                                 const uint32_t local[3], uint32_t **output, size_t *output_count,
                                 char *why, size_t why_size) {
     RDNA4sMod module = {0};

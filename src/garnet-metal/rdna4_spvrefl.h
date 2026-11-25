@@ -1,3 +1,4 @@
+#pragma once
 /* rdna4_spvrefl.h - minimal SPIR-V reflection for GarnetMetal pipeline creation (native #11 step 11e).
  * Ported from tools/native/shader-compile-census/compile-census.c (validated on 274/274 compositor-set modules):
  * descriptor sets/bindings from OpVariable + Decoration, push-constant size from member Offsets, vertex inputs from Location,
@@ -45,7 +46,7 @@ typedef struct {
 } RDNA4sMod;
 
 
-static int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, size_t whyn)
+static inline int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, size_t whyn)
 {
    memset(m, 0, sizeof *m);
    if (w[0] != 0x07230203) { snprintf(why, whyn, "bad SPIR-V magic"); return 1; }
@@ -126,7 +127,7 @@ static int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, s
    return 0;
 }
 
-static uint32_t rdna4s_tsize(RDNA4sMod *m, uint32_t t, int depth)
+static inline uint32_t rdna4s_tsize(RDNA4sMod *m, uint32_t t, int depth)
 {
    if (depth > 32 || t > m->bound) return 0;
    RDNA4sId *x = &m->id[t];
@@ -170,7 +171,7 @@ typedef struct {
    char why[256];
 } RDNA4sRefl;
 
-static int rdna4s_null_shape_from_image(RDNA4sMod *m, const RDNA4sId *image,
+static inline int rdna4s_null_shape_from_image(RDNA4sMod *m, const RDNA4sId *image,
                                         rdna4ns_shape *shape)
 {
    if (!m || !image || !shape || image->op != 25 ||
@@ -210,7 +211,7 @@ static int rdna4s_null_shape_from_image(RDNA4sMod *m, const RDNA4sId *image,
    return rdna4ns_shape_valid(shape);
 }
 
-static void rdna4s_null_shape_add(RDNA4sRefl *r, const rdna4ns_shape *shape)
+static inline void rdna4s_null_shape_add(RDNA4sRefl *r, const rdna4ns_shape *shape)
 {
    if (!r || !shape) return;
    uint32_t word = rdna4ns_shape_encode(shape);
@@ -233,7 +234,7 @@ static void rdna4s_null_shape_add(RDNA4sRefl *r, const rdna4ns_shape *shape)
    ++r->argumentNullShapeCount;
 }
 
-static VkFormat rdna4s_fmt(RDNA4sMod *m, uint32_t ty, uint32_t *ncomp)
+static inline VkFormat rdna4s_fmt(RDNA4sMod *m, uint32_t ty, uint32_t *ncomp)
 {
    RDNA4sId *x = &m->id[ty]; uint32_t n = 1;
    if (x->op == 23) { n = x->n; x = &m->id[x->elem]; }
@@ -251,7 +252,7 @@ static VkFormat rdna4s_fmt(RDNA4sMod *m, uint32_t ty, uint32_t *ncomp)
 }
 
 /* returns 0 ok, 1 = layout failure (reason in r->why) */
-static int rdna4s_reflect(RDNA4sMod *m, int stage /* 0 v, 1 f, 2 k */, RDNA4sRefl *r)
+static inline int rdna4s_reflect(RDNA4sMod *m, int stage /* 0 v, 1 f, 2 k */, RDNA4sRefl *r)
 {
    memset(r, 0, sizeof *r);
    r->descriptor_features = m->descriptor_features;
@@ -347,7 +348,7 @@ static int rdna4s_reflect(RDNA4sMod *m, int stage /* 0 v, 1 f, 2 k */, RDNA4sRef
 }
 
 
-static void rdna4s_free(RDNA4sMod *m)
+static inline void rdna4s_free(RDNA4sMod *m)
 {
    if (!m->id) return;
    for (uint32_t k = 0; k <= m->bound; k++) { free(m->id[k].mem); free(m->id[k].moff); free(m->id[k].mstride); }

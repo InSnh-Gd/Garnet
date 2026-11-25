@@ -64,7 +64,8 @@ static void captureAsync(dispatch_queue_t queue, dispatch_block_t block) {
 }
 #define dispatch_async captureAsync
 #include "dump-write.inc"
-#include "rdna4_present_capture.inc"
+#define GARNET_PRESENT_CAPTURE_ONLY 1
+#include "garnet_surface.m"
 static unsigned failures;
 #define CHECK(name, cond) do { BOOL ok = (cond); printf("%s %s\n", ok ? "PASS" : "FAIL", name); failures += !ok; } while (0)
 static void drain(void) {

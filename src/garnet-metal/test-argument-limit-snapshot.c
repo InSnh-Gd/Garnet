@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "rdna4_argument_limit_snapshot.inc"
+#define GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY 1
+#include "garnet_backend.m"
 
 #include <errno.h>
 #include <fcntl.h>

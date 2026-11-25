@@ -501,10 +501,10 @@ static void test_residency_set(void) {
 }
 
 static void test_source_pins(const char *src_dir, const char *asm_dir) {
-    char *io_inc = slurp(src_dir, "rdna4_io_queue_impl.inc");
-    char *rs_inc = slurp(src_dir, "rdna4_residency_set_impl.inc");
-    char *cq_inc = slurp(src_dir, "rdna4_command_queue_impl.inc");
-    char *cb_inc = slurp(src_dir, "rdna4_command_buffer_impl.inc");
+    char *io_inc = slurp(src_dir, "garnet_sparse_io.m");
+    char *rs_inc = slurp(src_dir, "garnet_resources.m");
+    char *cq_inc = slurp(src_dir, "garnet_commands.m");
+    char *cb_inc = slurp(src_dir, "garnet_commands.m");
     char *dev_m  = slurp(asm_dir, "GarnetDevice.m");
 
     CHECK("source files and assembled GarnetDevice.m readable",

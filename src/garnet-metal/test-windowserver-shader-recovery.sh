@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 source_dir=$(cd "$(dirname "$0")" && pwd)
-runtime="$source_dir/rdna4_shader_runtime_impl.inc"
+runtime="$source_dir/garnet_shaders.m"
 out=$(mktemp -d "${TMPDIR:-/tmp}/windowserver-shader-recovery.XXXXXXXX")
 trap 'rm -rf "$out"' EXIT
 {
@@ -14,6 +14,7 @@ trap 'rm -rf "$out"' EXIT
 #include "rdna4_hotswap.h"
 
 typedef bool BOOL;
+#define GARNET_INTERNAL static
 static BOOL isWindowServer = true;
 static inline BOOL rdna4_is_ws(void) { return isWindowServer; }
 C

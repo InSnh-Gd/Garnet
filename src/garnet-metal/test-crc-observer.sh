@@ -9,11 +9,11 @@ python3 - "$source_dir" "$out" <<'PY'
 from pathlib import Path
 import sys
 source, out = map(Path, sys.argv[1:])
-text = (source / 'rdna4_command_queue_impl.inc').read_text()
+text = (source / 'garnet_commands.m').read_text()
 start = text.index('static rdna4crc_rec_t *rdna4s_crc_check(')
 end = text.index('\n}', start) + 2
 (out / 'crc-check.inc').write_text(text[start:end] + '\n')
-text = (source / 'rdna4_surface_impl.inc').read_text()
+text = (source / 'garnet_metal_internal.h').read_text()
 start = text.index('typedef struct { IOSurfaceRef ios;')
 end = text.index('\n', start)
 (out / 'crc-record.inc').write_text(text[start:end] + '\n')

@@ -1,3 +1,4 @@
+#pragma once
 /* rdna4_stitch_reflection.h - AIRR -> MTLPSBIN stitching-reflection adapter.
  *
  * RDNA4's pipelines compile from AIR, so [function reflectionData] carries

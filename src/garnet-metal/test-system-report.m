@@ -55,7 +55,8 @@ static const char *reportProcess(void) { return process; }
 #define IORegistryEntryGetPath reportPath
 #define IORegistryEntryGetRegistryEntryID reportRegistry
 #define IORegistryEntryCreateCFProperty reportProperty
-#include "rdna4_system_report_impl.inc"
+#define GARNET_SYSTEM_REPORT_ONLY 1
+#include "garnet_device.m"
 @interface ReportDevice : NSObject
 @end
 @implementation ReportDevice

@@ -40,7 +40,8 @@ __attribute__((objc_root_class))
 
 #endif
 
-#include "rdna4_argument_limit_snapshot.inc"
+#define GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY 1
+#include "garnet_backend.m"
 
 #include <stdio.h>
 #include <stdlib.h>

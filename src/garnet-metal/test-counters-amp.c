@@ -374,8 +374,8 @@ static void test_source_pins(const char *assembled_dir, const char *src_dir) {
         free(m);
     }
     if (src_dir && src_dir[0]) {
-        char *c = slurp(src_dir, "rdna4_counters_impl.inc");
-        CHECK("rdna4_counters_impl.inc readable", c != NULL, "%s/rdna4_counters_impl.inc", src_dir);
+        char *c = slurp(src_dir, "garnet_commands.m");
+        CHECK("garnet_commands.m readable", c != NULL, "%s/garnet_commands.m", src_dir);
         if (c) {
             CHECK("pin: counters impl uses Vulkan 1.0 vkCmdWriteTimestamp and not synchronization2 vkCmdWriteTimestamp2",
                   strstr(c, "VK_QUERY_TYPE_TIMESTAMP") != NULL &&

@@ -1,3 +1,14 @@
+// garnet_surface.m - GarnetMetal modular compilation unit.
+#if !defined(GARNET_INTERNAL) && !defined(GARNET_METAL_MODULAR_BUILD)
+#define GARNET_INTERNAL static
+#endif
+#if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
+#ifdef GARNET_METAL_MODULAR_BUILD
+#include "garnet_metal_internal.h"
+#endif
+#endif
+
+#if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
 // Build 16 (app-fix round 1; an internal design note P5 + P1). rdna4_ledger.h / rdna4_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
 //  * Step 0, the LIVE-IMPORT LEDGER: every IOSurface texture is entered when it comes alive and removed in -dealloc; the T1 tick logs "T1 ledger: ..." (live textures, distinct surface ids, bytes, textures with no
@@ -8,8 +19,8 @@
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_NOUSECOUNT_FILE "/private/tmp/rdna4m-nousecount"
 #define RDNA4_NOIOALIAS_FILE  "/private/tmp/rdna4m-noioalias"
-static struct { pthread_mutex_t mu; rdna4l L; int ucMode, iaActs; _Atomic uint64_t iaFlush, iaReup, iaWsFlush, iaWsReup, f1Fallbacks, ucTake, ucRelease; uint64_t lastSig; } RDNA4LED = { .mu = PTHREAD_MUTEX_INITIALIZER };
-static void rdna4_led_latch(void) {
+GARNET_INTERNAL RDNA4LedgerState RDNA4LED = { .mu = PTHREAD_MUTEX_INITIALIZER };
+GARNET_INTERNAL void rdna4_led_latch(void) {
     static dispatch_once_t o;
     dispatch_once(&o, ^{
         rdna4l_init(&RDNA4LED.L);
@@ -19,20 +30,20 @@ static void rdna4_led_latch(void) {
                RDNA4LED.ucMode == RDNA4UC_INFLIGHT ? "absent" : "PRESENT", RDNA4LED.iaActs ? "ACTS" : "OFF", rdna4_is_ws() ? "WindowServer: counted only" : "application", rdna4_is_ws() ? "" : RDNA4LED.iaActs ? "" : ", kill file " RDNA4_NOIOALIAS_FILE " present");
     });
 }
-static void rdna4_led_add(id t, IOSurfaceRef s, uint64_t bytes, uint32_t pf, uint32_t planes, BOOL nobase) {
+GARNET_INTERNAL void rdna4_led_add(id t, IOSurfaceRef s, uint64_t bytes, uint32_t pf, uint32_t planes, BOOL nobase) {
     rdna4_led_latch();
     pthread_mutex_lock(&RDNA4LED.mu); rdna4l_add(&RDNA4LED.L, (uintptr_t)(__bridge void *)t, (uint32_t)IOSurfaceGetID(s), bytes, pf, planes, nobase ? 1 : 0, rdna4_now()); pthread_mutex_unlock(&RDNA4LED.mu);
 }
-static void rdna4_led_del(id t) { pthread_mutex_lock(&RDNA4LED.mu); rdna4l_del(&RDNA4LED.L, (uintptr_t)(__bridge void *)t); pthread_mutex_unlock(&RDNA4LED.mu); }
-static void rdna4_led_touch(id t, int delta) {   // +1: a command buffer touched it for the first time; -1: that command buffer is finished
+GARNET_INTERNAL void rdna4_led_del(id t) { pthread_mutex_lock(&RDNA4LED.mu); rdna4l_del(&RDNA4LED.L, (uintptr_t)(__bridge void *)t); pthread_mutex_unlock(&RDNA4LED.mu); }
+GARNET_INTERNAL void rdna4_led_touch(id t, int delta) {   // +1: a command buffer touched it for the first time; -1: that command buffer is finished
     pthread_mutex_lock(&RDNA4LED.mu);
     if (delta > 0) rdna4l_touch(&RDNA4LED.L, (uintptr_t)(__bridge void *)t); else rdna4l_untouch(&RDNA4LED.L, (uintptr_t)(__bridge void *)t);
     pthread_mutex_unlock(&RDNA4LED.mu);
 }
-static void rdna4_uc_inc(void *s, void *c) { (void)c; CFRetain(s); IOSurfaceIncrementUseCount((IOSurfaceRef)s); atomic_fetch_add(&RDNA4LED.ucTake, 1); }
-static void rdna4_uc_dec(void *s, void *c) { (void)c; IOSurfaceDecrementUseCount((IOSurfaceRef)s); CFRelease(s); atomic_fetch_add(&RDNA4LED.ucRelease, 1); }
-static BOOL rdna4_ioalias_acts(void) { rdna4_led_latch(); return RDNA4LED.iaActs ? YES : NO; }
-static void rdna4_led_report(unsigned tick) {
+GARNET_INTERNAL void rdna4_uc_inc(void *s, void *c) { (void)c; CFRetain(s); IOSurfaceIncrementUseCount((IOSurfaceRef)s); atomic_fetch_add(&RDNA4LED.ucTake, 1); }
+GARNET_INTERNAL void rdna4_uc_dec(void *s, void *c) { (void)c; IOSurfaceDecrementUseCount((IOSurfaceRef)s); CFRelease(s); atomic_fetch_add(&RDNA4LED.ucRelease, 1); }
+GARNET_INTERNAL BOOL rdna4_ioalias_acts(void) { rdna4_led_latch(); return RDNA4LED.iaActs ? YES : NO; }
+GARNET_INTERNAL void rdna4_led_report(unsigned tick) {
     rdna4_led_latch();
     rdna4l_snap sn; char line[1400]; uint64_t imp; unsigned long long tk = atomic_load(&RDNA4LED.ucTake), rl = atomic_load(&RDNA4LED.ucRelease);
     @synchronized ([GarnetDevice class]) { imp = RDNA4R.impTotal; }
@@ -56,7 +67,7 @@ static void rdna4_led_report(unsigned tick) {
 // One-shot command buffer on the device queue, waited to completion (11e: replaceRegion:, getBytes:). The pool and the queue are
 // externally synchronised by RDNA4R.qlock. A failed wait retains the recording
 // block's resources as well as its command buffer until process exit.
-static BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cmd),
+GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cmd),
                           BOOL *unresolved) {
     if (unresolved) *unresolved = NO;
     if (!rdna4_radv_open(err)) return NO;
@@ -111,55 +122,19 @@ static BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cmd),
 // test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/rdna4m-noflip (read once per process); one mutex around every scanout call.
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_NOFLIP_FILE "/private/tmp/rdna4m-noflip"
-#define RDNA4_NOPLANES_FILE "/private/tmp/rdna4m-noplanes"
 #define RDNA4_PRESENTALL_FILE "/private/tmp/rdna4m-presentall"   // native #12 P2 kill switch: present EVERY display write (the pre-final-pass-rule behaviour); polled every 1 s
 #define RDNA4_DAMAGE_FILE "/private/tmp/rdna4m-damage"   // native #12 D2: partial-update emulation + SkyLight composite passes count as frames; DEFAULT OFF; polled every 1 s
 #define RDNA4_HOLD_FILE "/private/tmp/rdna4m-hold"   // native #12 P3 present hold: present = ALL mode, content "1".."8" = H in ms, else 3; polled every 1 s
 #define RDNA4_NOHOLD_FILE "/private/tmp/rdna4m-nohold"   // kill switch disabling default FINAL present hold; polled every 1 s
 static struct { _Atomic int mode, ms; uint64_t held, held_sup, held_pres, hold_ns; } RDNA4H = { .mode = RDNA4DF_HOLD_MODE_FINAL, .ms = RDNA4DF_HOLD_DEFAULT_MS };   // switch state (atomics); counters are written by the present queue under RDNA4S.mu
-#define RDNA4S_FOURCC_BGRA 0x42475241u   // 'BGRA'
 
-typedef int (*rdna4s_query_t)(VkDevice, struct rdna4n_scan_query *);
-typedef int (*rdna4s_acquire_t)(VkDevice, uint64_t *, uint64_t *);
-typedef int (*rdna4s_register_t)(VkDevice, VkDeviceMemory, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t *, uint64_t *);
-typedef int (*rdna4s_present_t)(VkDevice, uint32_t, uint64_t[3]);
-typedef int (*rdna4s_status_t)(VkDevice, struct rdna4n_scan_status *);
-typedef int (*rdna4s_release_t)(VkDevice, uint64_t[2]);
 
-static struct {
-    pthread_mutex_t mu; rdna4df_t sm; int bound;
-    rdna4_display_commit *commits;
-    NSMutableIndexSet *incompleteSources;
-    NSHashTable *incompleteImages;
-    uint64_t incompleteSinceNs, incompleteLastFallbackNs;
-    BOOL incompleteCapLogged;
-    rdna4s_query_t fq; rdna4s_acquire_t fa; rdna4s_register_t fg; rdna4s_present_t fp; rdna4s_status_t fs; rdna4s_release_t fr;
-    uint32_t pw, ph, pitch; uint64_t slotBytes, preallocBytes; int vtype;
-    VkDeviceMemory mem[RDNA4DF_MAX_SLOTS]; VkBuffer buf[RDNA4DF_MAX_SLOTS]; uint32_t sid[RDNA4DF_MAX_SLOTS];
-    uint64_t allocBytes[RDNA4DF_MAX_SLOTS], reqBytes[RDNA4DF_MAX_SLOTS], alignBytes[RDNA4DF_MAX_SLOTS]; int memType[RDNA4DF_MAX_SLOTS];
-    rdna4cc cc; int ndisp, ncand; dispatch_source_t timer; uint64_t tStart, tLog; int exitSet;
-    struct rdna4n_scan_status st;
-    void *map[RDNA4DF_MAX_SLOTS];   // CRC diagnostic: persistent CPU mapping of each (host-visible) slot, made on first use
-    dispatch_queue_t pq; _Atomic uint64_t seq, multi, cbno;   // ONE serial present queue; the frame sequence counter (taken under the submit lock)
-    rdna4m6_t m6;   // bundle 11 (M6 Stage 1a): the kernel latch and its IOSurface ID -> display table; written under mu
-    struct { uint32_t sid, w, h, bpr; } sg[64]; unsigned sgi;   // bundle 15: the geometry of every classified display surface (written by the classifier, read by the size gate); under mu
-} RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER };
+GARNET_INTERNAL RDNA4ScanoutState RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER };
 // ---- bundle 13 (M6 Stage 1b) + bundle 15 (M6 Stage 2): the HDMI instances (1 = the monitor A, 2 = the monitor B) beside the DP's RDNA4S, as an ARRAY indexed by the kernel instance number ([0] is never used: the DP is RDNA4S). Same locking (RDNA4S.mu protects everything
 // below), same state machine type (rdna4_dispflip.h, a FULL-COPY machine: damage mode is the DP's alone), each with its own 3 slots in visible VRAM, registered and presented through Mesa's radv_darwin_rdna4n_call (selectors 22..26). The decisions
 // are rdna4_m6x.h (host-tested). An instance is enabled only when rdna4x_enabled(); acquired lazily; ANY failure leaves THAT instance OFF with the DP (and the other display) untouched. Slot size, copy rectangle and geometry come from the
 // instance's DESCRIPTOR (rdna4x_desc), never from the DP's plane.
-typedef int (*rdna4x_call_t)(VkDevice, uint32_t, const uint64_t *, uint32_t, const void *, size_t, uint64_t *, uint32_t *, void *, size_t *);
-typedef int (*rdna4x_bohandle_t)(VkDevice, VkDeviceMemory, uint32_t *);
-typedef struct {
-    rdna4df_t sm;
-    int enabled;                                     // decided at bind (rdna4x_enabled)
-    VkDeviceMemory mem[RDNA4DF_MAX_SLOTS]; VkBuffer buf[RDNA4DF_MAX_SLOTS]; uint32_t sid[RDNA4DF_MAX_SLOTS];   // sid = the TAGGED kernel slot id (tag | k)
-    struct rdna4n_scan_status st; uint32_t gen; int gen_known;      // the last Status and its table generation
-    rdna4x_stats_t xs;
-    uint64_t plan_count, presents_seen;
-} rdna4xi_t;
-static struct { rdna4x_call_t call; rdna4x_bohandle_t bohandle; rdna4xi_t i[3]; } RDNA4X;   // RDNA4X.i[inst]
-#define RDNA4XI(inst) (RDNA4X.i[(inst)])
+GARNET_INTERNAL RDNA4XScanoutState RDNA4X;   // RDNA4X.i[inst]
 static const char *rdna4s_reason_name(int r);
 static BOOL rdna4x_status_locked(int inst, struct rdna4n_scan_status *st);
 // the enable MASK the routing decisions take: bit i = instance i is enabled and not OFF. RDNA4S.mu held.
@@ -207,7 +182,7 @@ static void rdna4x_off_locked(int inst, int reason, const char *why) {
     if (rel) { x->sm.released = 0; rdna4x_do_release_locked(inst); }
 }
 
-static uint32_t rdna4_acc_port;   // bundle 11: the accelerator port WindowServer's admitted device was created with (the table is a property of its parent, the Metal nub); set once, never released here
+GARNET_INTERNAL uint32_t rdna4_acc_port;   // bundle 11: the accelerator port WindowServer's admitted device was created with (the table is a property of its parent, the Metal nub); set once, never released here
 
 // ---- bundle 11 (M6 Stage 1a): the kernel's IOSurface ID -> display table (decisions: rdna4_m6route.h) --------------------------------------------------------------------------------------------------
 // The table is the registry property "Garnet,M6Surf" of the Metal nub (the accelerator's parent: the channel Garnet,Ready already uses in WindowServer). Read OUTSIDE RDNA4S.mu (a registry read is an IPC), stored under it.
@@ -257,7 +232,7 @@ static void rdna4s_m6_skip_locked(int slot, uint32_t sid, int plan, rdna4df_t *s
     rdna4df_skip_content(sm, slot);
     static int lg; if (lg < 12) { lg++; RDNA4LOG("m6: frame for IOSurface %u NOT presented (%s)", sid, plan == RDNA4M6_C_DROP ? "the kernel has not seen it on any pipe (or the table stayed stale)" : v == RDNA4M6_SKIP_OTHER ? "the kernel maps it to another display" : "the kernel saw it on two pipes: AMBIGUOUS"); }
 }
-static void rdna4_m6_report(void) {
+GARNET_INTERNAL void rdna4_m6_report(void) {
     pthread_mutex_lock(&RDNA4S.mu);
     const int on = RDNA4S.m6.latch;
     if (on) rdna4s_m6_refresh_locked();
@@ -274,7 +249,7 @@ static const char *rdna4s_reason_name(int r) {
     static const char *n[] = { "none/released-on-request", "kill-file", "missing-export", "ENOSYS", "plane-geometry", "scanout-error", "plane-lost", "slot-alloc" };
     return r >= 0 && r < (int)(sizeof n / sizeof n[0]) ? n[r] : "?";
 }
-static BOOL rdna4s_testmode(void) { const char *e = getenv("RDNA4M_TEST_DISPFLIP"); return rdna4_allow() && e && !strcmp(e, "1"); }
+GARNET_INTERNAL BOOL rdna4s_testmode(void) { const char *e = getenv("RDNA4M_TEST_DISPFLIP"); return rdna4_allow() && e && !strcmp(e, "1"); }
 
 // Release the plane (idempotent in the kernel) and stop the keep-alive. Called with the mutex held, at most once per process by the state machine's rule.
 static void rdna4s_do_release_locked(void) {
@@ -388,10 +363,10 @@ static BOOL rdna4s_bt_signal(BOOL logframes) {
 
 // Called at the end of -initWithDevice:descriptor:iosurface:plane: (RADV is open). YES = this texture is one of CoreDisplay's display surfaces.
 // P4: the verdict (positive and negative) is cached per IOSurface id (key id + base + size + pitch + alloc, 64 entries, LRU) so the backtrace test (dladdr per frame) runs once per surface.
-static void rdna4_scan_cc_counters(uint64_t *h, uint64_t *m, uint64_t *mm) {
+GARNET_INTERNAL void rdna4_scan_cc_counters(uint64_t *h, uint64_t *m, uint64_t *mm) {
     pthread_mutex_lock(&RDNA4S.mu); *h = RDNA4S.cc.hits; *m = RDNA4S.cc.misses; *mm = RDNA4S.cc.mismatches; pthread_mutex_unlock(&RDNA4S.mu);
 }
-static BOOL rdna4s_classify(size_t w, size_t h, uint32_t spf, NSUInteger usage, size_t bpr, size_t alloc, unsigned sid, const void *base) {
+GARNET_INTERNAL BOOL rdna4s_classify(size_t w, size_t h, uint32_t spf, NSUInteger usage, size_t bpr, size_t alloc, unsigned sid, const void *base) {
     if (spf != RDNA4S_FOURCC_BGRA || !(usage & MTLTextureUsageRenderTarget) || w < 1024 || h < 600) return NO;   // cheap prefilter: no lock, no log
     BOOL ok = NO;
     pthread_mutex_lock(&RDNA4S.mu);
@@ -430,14 +405,14 @@ static BOOL rdna4s_status_locked(struct rdna4n_scan_status *st) {
         rdna4s_off_locked(RDNA4DF_R_PLANELOST, m); return NO; }
     return YES;
 }
-static _Atomic uint64_t rdna4s_imgcopies;   // P6: display copies recorded from an image source (a display surface with no CPU mapping)
+GARNET_INTERNAL _Atomic uint64_t rdna4s_imgcopies;   // P6: display copies recorded from an image source (a display surface with no CPU mapping)
 static void rdna4s_log_counters_locked(const struct rdna4n_scan_status *st) {
     RDNA4LOG("scanout: counters: presents %llu (kernel presents %llu) latched %llu replaced %llu repeats %llu refused %llu watchdog_restores %llu drops %llu gpu_fail %llu stale_skipped %llu superseded_skipped %llu multi_disp_cbs %llu inflight %d display_surfaces %d hold %s H %d held %llu held_superseded %llu held_presented %llu hold_total_ms %.1f hold_mean_ms %.3f image_source_copies %llu present_busy %llu retry_presented %llu retry_dropped %llu",
            (unsigned long long)RDNA4S.sm.presents, (unsigned long long)st->presents, (unsigned long long)st->latched, (unsigned long long)st->replaced, (unsigned long long)st->repeats,
            (unsigned long long)st->refused, (unsigned long long)st->watchdog_restores, (unsigned long long)RDNA4S.sm.drops, (unsigned long long)RDNA4S.sm.gpu_fail, (unsigned long long)RDNA4S.sm.stale, (unsigned long long)RDNA4S.sm.superseded, (unsigned long long)atomic_load(&RDNA4S.multi), rdna4df_inflight_count(&RDNA4S.sm), RDNA4S.ndisp,
            rdna4s_hold_mode_name(atomic_load(&RDNA4H.mode)), atomic_load(&RDNA4H.ms), (unsigned long long)RDNA4H.held, (unsigned long long)RDNA4H.held_sup, (unsigned long long)RDNA4H.held_pres, (double)RDNA4H.hold_ns / 1e6, RDNA4H.held ? (double)RDNA4H.hold_ns / 1e6 / (double)RDNA4H.held : 0.0, (unsigned long long)atomic_load(&rdna4s_imgcopies), (unsigned long long)RDNA4S.sm.present_busy, (unsigned long long)RDNA4S.sm.retry_presented, (unsigned long long)RDNA4S.sm.retry_dropped);
 }
-static BOOL rdna4s_crc_on(void);
+
 static void rdna4s_crc_summary(void);
 // native #12 P1: write-class summary of the last 10 s (interval = cumulative minus the previous snapshot), plus the cumulative nonfinal_skipped. Called with the mutex held.
 static void rdna4s_class_summary_locked(void) {
@@ -449,7 +424,7 @@ static void rdna4s_class_summary_locked(void) {
 }
 // native #12 P1/P2 + D1: called from -rdna4Finish for the command buffer's chosen display write. Counts its class and its extents, logs the first 20 with the pipeline names and the
 // first 30 extent samples, and returns whether it may take a slot.
-static BOOL rdna4s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const rdna4df_wr_t *wr, int *pinst, int *ptent) {
+GARNET_INTERNAL BOOL rdna4s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const rdna4df_wr_t *wr, int *pinst, int *ptent) {
     pthread_mutex_lock(&RDNA4S.mu);
     int pi = RDNA4X_PLAN_DP, tent = 0;
     if (RDNA4S.m6.latch) {   // bundle 11: a surface the kernel maps to another display (or saw on two pipes) takes no slot and is never copied; an unknown one is let through TENTATIVELY (the completion path decides)
@@ -628,7 +603,7 @@ static BOOL rdna4s_alloc_slots_locked(char *why, size_t whylen) {
     RDNA4S.preallocBytes = RDNA4S.slotBytes;
     return YES;
 }
-static void rdna4s_prebind_on_radv_open(void) {
+GARNET_INTERNAL void rdna4s_prebind_on_radv_open(void) {
     if (!rdna4_is_ws() && !rdna4s_testmode()) return;
     pthread_mutex_lock(&RDNA4S.mu);
     if (!RDNA4S.bound && RDNA4S.sm.state == RDNA4DF_UNBOUND && !RDNA4S.preallocBytes) {
@@ -774,10 +749,10 @@ static BOOL rdna4x_acquire_locked(int inst) {
     const rdna4x_ops_t ops = { .ctx = &acq, .pool_verdict = rdna4x_op_pool, .k_acquire = rdna4x_op_acquire, .mark_acquired = rdna4x_op_mark, .geom_verdict = rdna4x_op_geom, .alloc_slot = rdna4x_op_alloc, .register_slot = rdna4x_op_register, .off = rdna4x_op_off, .free_slots = rdna4x_op_free, .activate = rdna4x_op_activate };
     return rdna4x_acquire_run(&ops) == 0;
 }
-static int rdna4s_damage_on(void) { pthread_mutex_lock(&RDNA4S.mu); int d = RDNA4S.sm.damage; pthread_mutex_unlock(&RDNA4S.mu); return d; }
+GARNET_INTERNAL int rdna4s_damage_on(void) { pthread_mutex_lock(&RDNA4S.mu); int d = RDNA4S.sm.damage; pthread_mutex_unlock(&RDNA4S.mu); return d; }
 // At command-buffer encode: a free slot (fresh kernel status says REUSABLE, none in flight, not pinned, not the chain head while damage is on) or -1 (drop counted, or D-copy off).
 // `wr` = what this cb wrote to the display surface (for the D2 rectangle). The plan says full copy or base slot + region.
-static int rdna4s_plan(const rdna4df_wr_t *wr, int inst, int tent, rdna4df_plan_t *pl) {
+GARNET_INTERNAL int rdna4s_plan(const rdna4df_wr_t *wr, int inst, int tent, rdna4df_plan_t *pl) {
     int slot = -1; pl->slot = -1; pl->base = -1; pl->id = pl->baseid = 0; pl->kind = RDNA4DF_K_FULL; pl->inst = (inst == RDNA4X_PLAN_MONA || inst == RDNA4X_PLAN_MONB) ? inst : 0; pl->tent = tent ? 1 : 0;
     pthread_mutex_lock(&RDNA4S.mu);
     if (inst == RDNA4X_PLAN_MONA || inst == RDNA4X_PLAN_MONB) {   // bundle 13/15: an HDMI display: its own machine, its own slots, always a FULL copy of the whole surface, in THE INSTANCE'S geometry
@@ -808,7 +783,7 @@ static int rdna4s_plan(const rdna4df_wr_t *wr, int inst, int tent, rdna4df_plan_
     pthread_mutex_unlock(&RDNA4S.mu);
     return slot;
 }
-static void rdna4s_record_copy(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize srcOffset, const rdna4df_plan_t *pl) {
+GARNET_INTERNAL void rdna4s_record_copy(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize srcOffset, const rdna4df_plan_t *pl) {
     int slot = pl->slot;
     const rdna4x_desc_t *const xd = rdna4x_desc((uint32_t)pl->inst);   // bundle 15: an HDMI plan copies the INSTANCE'S rectangle (its pitch x height), never the DP's
     VkDeviceSize all = xd ? (VkDeviceSize)rdna4x_frame_bytes(xd) : (VkDeviceSize)RDNA4S.pitch * RDNA4S.ph;
@@ -831,9 +806,8 @@ static void rdna4s_record_copy(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize s
 // file may hold a row step (default 64) and the word "noslot" = skip the slot read, which is the expensive part: the slot is write-combined BAR memory). Per frame that carries a copy: A1 = sampled CRC of the display surface's import memory after the fence, B = the same rows of the
 // slot, A2 = the surface again after B, C = the surface again just before scanout_present. Reads only; nothing here changes what is copied or presented.
 #define RDNA4_CRC_FILE "/private/tmp/rdna4m-crc"
-typedef struct { IOSurfaceRef ios; const uint8_t *base; size_t pitch, rowbytes; uint32_t h, step, sid; int slot, unst; uint64_t seq; rdna4crc_samp_t a1; } rdna4crc_rec_t;
-static struct { pthread_mutex_t mu; rdna4crc_stats_t st; _Atomic int on; _Atomic uint32_t step; _Atomic uint64_t next; _Atomic uint64_t logged_p; _Atomic int noslot; int warmed, mapfail; struct { uint32_t sid; uint64_t seq; } surf[8]; } RDNA4C = { .mu = PTHREAD_MUTEX_INITIALIZER };
-static BOOL rdna4s_crc_on(void) {
+GARNET_INTERNAL RDNA4CRCState RDNA4C = { .mu = PTHREAD_MUTEX_INITIALIZER };
+GARNET_INTERNAL BOOL rdna4s_crc_on(void) {
     if (!rdna4_is_ws()) return NO;
     uint64_t now = rdna4_now(), nx = atomic_load(&RDNA4C.next);
     if (now >= nx && atomic_compare_exchange_strong(&RDNA4C.next, &nx, now + 2000000000ull)) {
@@ -856,7 +830,7 @@ static void rdna4s_crc_summary(void) {
     pthread_mutex_unlock(&RDNA4C.mu);
 }
 // Per display surface: the highest submission sequence of any command buffer that wrote it (called under the submit lock).. A frame is "later-overwritten" when this holds a higher sequence than its own.
-static void rdna4s_crc_note(uint32_t sid, uint64_t seq) {
+GARNET_INTERNAL void rdna4s_crc_note(uint32_t sid, uint64_t seq) {
     pthread_mutex_lock(&RDNA4C.mu); int k = -1;
     for (int i = 0; i < 8; i++) if (RDNA4C.surf[i].sid == sid) { k = i; break; }
     if (k < 0) for (int i = 0; i < 8; i++) if (!RDNA4C.surf[i].sid) { k = i; RDNA4C.surf[i].sid = sid; break; }
@@ -892,11 +866,10 @@ static void rdna4s_crc_free(rdna4crc_rec_t *r) { if (!r) return; if (r->ios) CFR
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_CBLOG_FLAG "/private/tmp/rdna4m-cblog"
 #define RDNA4_CBLOG_CAP (50ull << 20)
-#define RDNA4_CBLOG_INV_LOGGED 20
-static struct { _Atomic int on; int fd; uint64_t bytes; int capped; uint64_t inv_logged; unsigned tick; pthread_mutex_t mu; rdna4cb_t trk; rdna4cba_t activity; } RDNA4CB = { .fd = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
-static _Atomic uint64_t rdna4cb_ids;
-static void rdna4cbl_line_locked(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void rdna4cbl_line_locked(const char *fmt, ...) {
+GARNET_INTERNAL RDNA4CBLogState RDNA4CB = { .fd = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
+GARNET_INTERNAL _Atomic uint64_t rdna4cb_ids;
+
+GARNET_INTERNAL void rdna4cbl_line_locked(const char *fmt, ...) {
     if (RDNA4CB.fd < 0) return;
     char b[1024]; va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, ap); va_end(ap);
     if (n <= 0) return;
@@ -910,7 +883,7 @@ static void rdna4cbl_line_locked(const char *fmt, ...) {
     }
     ssize_t w = write(RDNA4CB.fd, b, (size_t)n); if (w > 0) RDNA4CB.bytes += (uint64_t)w;
 }
-static void rdna4cbl_sids(char *o, size_t cap, const uint32_t *a, uint32_t k) {
+GARNET_INTERNAL void rdna4cbl_sids(char *o, size_t cap, const uint32_t *a, uint32_t k) {
     size_t l = 0; o[0] = 0;
     if (!k) { snprintf(o, cap, "-"); return; }
     for (uint32_t i = 0; i < k && l + 12 < cap; i++) l += (size_t)snprintf(o + l, cap - l, i ? ",%u" : "%u", a[i]);
@@ -948,7 +921,7 @@ static void rdna4cbl_poll(void) {   // 1 s timer
     pthread_mutex_unlock(&RDNA4CB.mu);
 }
 static dispatch_source_t rdna4cbl_timer;   // kept alive for the process (a local would be released by ARC and the timer would never fire)
-static void rdna4cbl_start(void) {
+GARNET_INTERNAL void rdna4cbl_start(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
@@ -958,7 +931,7 @@ static void rdna4cbl_start(void) {
         dispatch_resume(t);
     });
 }
-static inline int rdna4cbl_on(void) { return atomic_load_explicit(&RDNA4CB.on, memory_order_relaxed); }
+
 static void rdna4cbl_present(uint64_t t0, uint64_t t1, uint32_t sid, uint64_t seq, int slot, int rc) {   // caller: the present queue, around scanout_present
     if (!rdna4cbl_on()) return;
     pthread_mutex_lock(&RDNA4CB.mu);
@@ -966,7 +939,7 @@ static void rdna4cbl_present(uint64_t t0, uint64_t t1, uint32_t sid, uint64_t se
     rdna4cbl_line_locked("P t0=%llu t1=%llu sid=%u seq=%llu slot=%d rc=%d", (unsigned long long)t0, (unsigned long long)t1, sid, (unsigned long long)seq, slot, rc);
     pthread_mutex_unlock(&RDNA4CB.mu);
 }
-static void rdna4cbl_skip(uint32_t sid, uint64_t seq, int slot, const char *why, int vr) {
+GARNET_INTERNAL void rdna4cbl_skip(uint32_t sid, uint64_t seq, int slot, const char *why, int vr) {
     if (!rdna4cbl_on()) return;
     pthread_mutex_lock(&RDNA4CB.mu);
     rdna4cba_skip(&RDNA4CB.activity);
@@ -1061,7 +1034,7 @@ static dispatch_queue_t rdna4s_present_queue(void) {
     static dispatch_once_t once; dispatch_once(&once, ^{ RDNA4S.pq = dispatch_queue_create("rdna4.present", DISPATCH_QUEUE_SERIAL); });
     return RDNA4S.pq;
 }
-static void rdna4s_complete(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, rdna4crc_rec_t *rec, int cls, uint64_t tcommit) {
+GARNET_INTERNAL void rdna4s_complete(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, rdna4crc_rec_t *rec, int cls, uint64_t tcommit) {
     // All presents go through ONE serial queue (completions arrive from one serial queue PER Metal command queue, so across queues their order is arbitrary);
     // the sequence check under the mutex then makes the present order equal the submission order: an older frame is skipped, never shown after a newer one.
     dispatch_async(rdna4s_present_queue(), ^{ rdna4s_complete_run(inst, slot, r, seq, sid, rec, cls, tcommit, 0); });
@@ -1144,7 +1117,7 @@ static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, ui
     }
 }
 // Device selectors for mtlprobe dispflip (root test path; the stats read is one status call).
-static NSDictionary *rdna4s_stats(void) {
+GARNET_INTERNAL NSDictionary *rdna4s_stats(void) {
     pthread_mutex_lock(&RDNA4S.mu);
     struct rdna4n_scan_status st; memset(&st, 0, sizeof st); BOOL fresh = NO;
     if (RDNA4S.sm.state == RDNA4DF_ACTIVE) fresh = rdna4s_status_locked(&st);
@@ -1165,7 +1138,7 @@ static NSDictionary *rdna4s_stats(void) {
     pthread_mutex_unlock(&RDNA4S.mu);
     return md;
 }
-static NSDictionary *rdna4s_release_request(void) {
+GARNET_INTERNAL NSDictionary *rdna4s_release_request(void) {
     pthread_mutex_lock(&RDNA4S.mu);
     uint64_t o[2] = { 0, 0 }; int rc = -1;
     for (int xi = 1; xi <= 2; xi++) if (RDNA4XI(xi).sm.acquired) { RDNA4XI(xi).sm.state = RDNA4DF_OFF; rdna4x_do_release_locked(xi); }   // bundle 13/15: the HDMI instances' A go back first
@@ -1177,3 +1150,332 @@ static NSDictionary *rdna4s_release_request(void) {
     return d;
 }
 
+#endif // !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
+#if defined(GARNET_DISPLAY_LATE_ONLY) || (!defined(GARNET_PRESENT_CAPTURE_ONLY))
+// A display write can finish encoding while every scanout slot is still busy.
+// Keep only the newest completed source per display and copy it after a slot becomes reusable.
+@interface RDNA4LateFrame : NSObject {
+@public
+    RDNA4Texture *texture;
+    IOSurfaceRef surface;
+    uint64_t seq, commit;
+    uint32_t sid;
+    int inst, cls;
+    unsigned tries;
+}
+@end
+@implementation RDNA4LateFrame
+- (void)dealloc { if (surface) { IOSurfaceDecrementUseCount(surface); CFRelease(surface); } }
+@end
+
+static RDNA4LateFrame *rdna4late_pending[3];   // present queue only
+static void rdna4s_late_run(RDNA4LateFrame *frame) {
+    if (rdna4late_pending[frame->inst] != frame) return;
+    pthread_mutex_lock(&RDNA4S.mu);
+    rdna4df_t *sm = frame->inst ? &RDNA4XI(frame->inst).sm : &RDNA4S.sm;
+    const BOOL current = rdna4df_late_current(sm, frame->seq) &&
+        !rdna4dc_commit_newer(RDNA4S.commits, frame->sid, frame->commit);
+    pthread_mutex_unlock(&RDNA4S.mu);
+    if (!current) { rdna4late_pending[frame->inst] = nil; return; }
+
+    rdna4df_plan_t plan;
+    // A deferred source contains the complete current surface; never chain it onto an older slot.
+    int slot = rdna4s_plan(NULL, frame->inst, 1, &plan);
+    if (slot < 0) {
+        if (++frame->tries < RDNA4DF_RETRY_MAX_ATTEMPTS) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), rdna4s_present_queue(), ^{ rdna4s_late_run(frame); });
+        } else {
+            rdna4cbl_skip(frame->sid, frame->seq, -1, "late-no-slot", 0);
+            rdna4late_pending[frame->inst] = nil;
+        }
+        return;
+    }
+    rdna4late_pending[frame->inst] = nil;
+    pthread_mutex_lock(&RDNA4S.mu);
+    const rdna4x_desc_t *xd = rdna4x_desc((uint32_t)frame->inst);
+    const uint32_t w = xd ? xd->w : RDNA4S.pw, h = xd ? xd->h : RDNA4S.ph, pitch = xd ? xd->pitch_bytes : RDNA4S.pitch;
+    const BOOL valid = rdna4df_late_current(sm, frame->seq) &&
+        !rdna4dc_commit_newer(RDNA4S.commits, frame->sid, frame->commit) &&
+        [frame->texture width] == w && [frame->texture height] == h &&
+        [frame->texture bytesPerPixel] == 4 && [frame->texture rdna4IOSBytesPerRow] == pitch &&
+        [frame->texture rdna4DispBuf] != VK_NULL_HANDLE;
+    if (valid) {
+        rdna4df_submit(sm, slot, frame->sid, frame->seq);
+        sm->sub_commit[slot] = frame->commit;
+        sm->deferred_copy[slot] = 1;
+    } else rdna4df_skip_content(sm, slot);
+    pthread_mutex_unlock(&RDNA4S.mu);
+    if (!valid) return;
+
+    NSError *error = nil; BOOL unresolved = NO;
+    BOOL ok = rdna4_oneshot(&error, ^(VkCommandBuffer cmd) {
+        // Capturing frame also retains the source/use-count if the GPU submission is quarantined.
+        rdna4_full_barrier(cmd);
+        rdna4s_record_copy(cmd, [frame->texture rdna4DispBuf], [frame->texture rdna4IOSOffset], &plan);
+        rdna4_full_barrier(cmd);
+    }, &unresolved);
+    if (unresolved) {
+        pthread_mutex_lock(&RDNA4S.mu);
+        if (rdna4df_fail(sm, RDNA4DF_R_ERROR)) {
+            if (frame->inst) rdna4x_do_release_locked(frame->inst); else rdna4s_do_release_locked();
+        }
+        pthread_mutex_unlock(&RDNA4S.mu);
+        RDNA4LOG("scanout: deferred copy unresolved: %s", error.localizedDescription.UTF8String);
+        return;   // The slot and source stay retained; never reuse memory the GPU may still write.
+    }
+    rdna4s_complete_run(frame->inst, slot, ok ? VK_SUCCESS : VK_ERROR_UNKNOWN, frame->seq, frame->sid, NULL, frame->cls, frame->commit, 0);
+}
+
+GARNET_INTERNAL void rdna4s_late_complete(RDNA4Texture *texture, int inst, uint64_t seq, uint32_t sid, int cls, uint64_t commit) {
+    if (!texture || inst < 0 || inst > 2 || !seq || !sid) return;
+    RDNA4LateFrame *frame = [RDNA4LateFrame new];
+    frame->texture = texture; frame->inst = inst; frame->seq = seq; frame->sid = sid; frame->cls = cls; frame->commit = commit;
+    IOSurfaceRef surface = [texture rdna4UCSurface];
+    if (surface) { frame->surface = (IOSurfaceRef)CFRetain(surface); IOSurfaceIncrementUseCount(surface); }
+    dispatch_async(rdna4s_present_queue(), ^{
+        RDNA4LateFrame *old = rdna4late_pending[inst];
+        if (old && old->seq > seq) return;
+        rdna4late_pending[inst] = frame;
+        rdna4s_late_run(frame);
+    });
+}
+#endif // GARNET_DISPLAY_LATE_ONLY
+#if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
+// Opt-in snapshots of compositor inputs after GPU completion, before their use counts are released.
+#define RDNA4_CAPTURE_FLAG "/private/tmp/rdna4m-surfaces"
+static BOOL rdna4_capture_on(void) {
+    if (!rdna4_is_ws() && !rdna4_allow()) return NO;
+    static _Atomic uint64_t next;
+    static _Atomic int enabled;
+    uint64_t now = rdna4_now(), due = atomic_load(&next);
+    if (now >= due && atomic_compare_exchange_strong(&next, &due, now + NSEC_PER_SEC)) {
+        struct stat st;
+        atomic_store(&enabled, lstat(RDNA4_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
+            (st.st_uid == 0 || st.st_uid == geteuid()));
+    }
+    return atomic_load(&enabled) != 0;
+}
+GARNET_INTERNAL void rdna4_capture_surfaces(NSArray *textures, uint64_t cbid) {
+    if (!rdna4_capture_on()) return;
+    const uint64_t now = rdna4_now();
+    static NSLock *lock;
+    static NSMutableDictionary *seen;
+    static dispatch_queue_t writer;
+    static uint64_t used;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        lock = [NSLock new]; seen = [NSMutableDictionary dictionary];
+        writer = dispatch_queue_create("org.garnet.surface-capture", DISPATCH_QUEUE_SERIAL);
+    });
+    [lock lock];
+    for (RDNA4Texture *view in textures) {
+        RDNA4Texture *t = [view rootResource];
+        IOSurfaceRef surface = [t rdna4IOSRef];
+        if (!surface || [t rdna4IsDisp] || ![t rdna4IBase]) continue;
+        size_t w = t.width, h = t.height, row = [t rdna4IOSBytesPerRow], bpp = [t bytesPerPixel];
+        if (!w || !h || !bpp || w > SIZE_MAX / bpp || row < w * bpp ||
+            h - 1 > (SIZE_MAX - w * bpp) / row) continue;
+        size_t bytes = (h - 1) * row + w * bpp;
+        if (bytes > 12u * 1024u * 1024u || used + bytes > 64u * 1024u * 1024u) continue;
+        NSString *key = [NSString stringWithFormat:@"%u-%lu-%zux%zu-%lu", IOSurfaceGetID(surface),
+            (unsigned long)t.pixelFormat, w, h, (unsigned long)t.iosurfacePlane];
+        NSArray *prior = seen[key];
+        if (!prior && seen.count >= 128) continue;
+        unsigned ordinal = prior ? [prior[0] unsignedIntValue] : 0;
+        if (ordinal >= 2 || (prior && now - [prior[1] unsignedLongLongValue] < 3 * NSEC_PER_SEC)) continue;
+        char directory[1024];
+        if (!rdna4_dump_dir_ready(directory, sizeof directory)) continue;
+        uint32_t before = IOSurfaceGetSeed(surface);
+        NSData *pixels = [NSData dataWithBytes:[t rdna4IBase] length:bytes];
+        uint32_t after = IOSurfaceGetSeed(surface);
+        if (!pixels) continue;
+        NSDictionary *metadata = @{ @"surface": @(IOSurfaceGetID(surface)), @"pixel_format": @(t.pixelFormat),
+            @"iosurface_format": @(IOSurfaceGetPixelFormat(surface)), @"width": @(w), @"height": @(h),
+            @"bytes_per_row": @(row), @"bytes_per_pixel": @(bpp), @"plane": @(t.iosurfacePlane),
+            @"bytes": @(bytes), @"command_buffer": @(cbid), @"time_ns": @(now),
+            @"seed_before": @(before), @"seed_after": @(after), @"linear": @([t rdna4IOSLinear]) };
+        NSData *json = [NSJSONSerialization dataWithJSONObject:metadata options:0 error:NULL];
+        if (!json) continue;
+        seen[key] = @[@(ordinal + 1), @(now)]; used += bytes;
+        NSString *stem = [NSString stringWithFormat:@"%s/surface-%d-%@-%u", directory, getpid(), key, ordinal];
+        dispatch_async(writer, ^{
+            @autoreleasepool {
+                BOOL okay = rdna4_dump_write([[stem stringByAppendingString:@".raw"] fileSystemRepresentation], pixels) &&
+                    rdna4_dump_write([[stem stringByAppendingString:@".json"] fileSystemRepresentation], json);
+                RDNA4LOG("surface capture: %s bytes=%lu status=%s seed=%u/%u", stem.UTF8String,
+                    (unsigned long)pixels.length, okay ? "saved" : "failed", before, after);
+            }
+        });
+    }
+    [lock unlock];
+}
+#endif // !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
+#if defined(GARNET_PRESENT_CAPTURE_ONLY) || (!defined(GARNET_DISPLAY_LATE_ONLY))
+#ifndef RDNA4_PRESENT_CAPTURE_FLAG
+#define RDNA4_PRESENT_CAPTURE_FLAG "/private/tmp/rdna4m-present-capture"
+#endif
+#ifndef RDNA4_PRESENT_FULL_FLAG
+#define RDNA4_PRESENT_FULL_FLAG "/private/tmp/rdna4m-present-full"
+#endif
+static BOOL rdna4_capture_scan_matches(const struct rdna4n_scan_status *status, int slot, uint64_t presentId) {
+    return status->acquired && !status->flags && status->presents == presentId &&
+        status->front_slot == (uint32_t)slot &&
+        status->pending_slot == RDNA4N_SCAN_NO_SLOT && status->slot[slot].mc &&
+        status->earliest_mc == status->slot[slot].mc && status->plane_mc == status->earliest_mc;
+}
+static BOOL rdna4_present_capture_on(void) {
+    static _Atomic uint64_t next;
+    static _Atomic int enabled;
+    uint64_t now = rdna4_now(), due = atomic_load(&next);
+    if (now >= due && atomic_compare_exchange_strong(&next, &due, now + NSEC_PER_SEC)) {
+        struct stat st;
+        atomic_store(&enabled, lstat(RDNA4_PRESENT_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
+            (st.st_uid == 0 || st.st_uid == geteuid()));
+    }
+    return atomic_load(&enabled) != 0;
+}
+static BOOL rdna4_capture_scan_status(struct rdna4n_scan_status *status) {
+    pthread_mutex_lock(&RDNA4S.mu);
+    const BOOL ready = RDNA4S.fs && RDNA4S.sm.state == RDNA4DF_ACTIVE && !RDNA4S.fs(RDNA4R.dev, status);
+    pthread_mutex_unlock(&RDNA4S.mu);
+    return ready;
+}
+
+static const uint8_t *rdna4_capture_source_plane(IOSurfaceRef source, uint32_t width,
+                                                  uint32_t height, size_t pitch) {
+    if (!source || IOSurfaceGetPixelFormat(source) != RDNA4S_FOURCC_BGRA) return NULL;
+    const size_t planes = IOSurfaceGetPlaneCount(source);
+    if (planes > 1) return NULL;
+    const size_t planeWidth = planes ? IOSurfaceGetWidthOfPlane(source, 0) : IOSurfaceGetWidth(source);
+    const size_t planeHeight = planes ? IOSurfaceGetHeightOfPlane(source, 0) : IOSurfaceGetHeight(source);
+    const size_t element = planes ? IOSurfaceGetBytesPerElementOfPlane(source, 0) : IOSurfaceGetBytesPerElement(source);
+    const size_t rowPitch = planes ? IOSurfaceGetBytesPerRowOfPlane(source, 0) : IOSurfaceGetBytesPerRow(source);
+    if (planeWidth != width || planeHeight != height || element != 4 || rowPitch != pitch) return NULL;
+    const uint8_t *allocation = IOSurfaceGetBaseAddress(source);
+    const uint8_t *plane = planes ? IOSurfaceGetBaseAddressOfPlane(source, 0) : allocation;
+    if (!allocation || (uintptr_t)plane < (uintptr_t)allocation) return NULL;
+    const rdna4pl_in geometry = { .pbpe = element, .pbpr = pitch, .ph = height,
+        .poff = (uintptr_t)plane - (uintptr_t)allocation, .alloc = IOSurfaceGetAllocSize(source) };
+    rdna4pl_out bounds;
+    return rdna4pl_bound(&geometry, &bounds) ? plane : NULL;
+}
+
+static void rdna4_capture_present(int inst, int slot, uint32_t sid, uint64_t seq, int rc, uint64_t presentId) {
+    if (rc || inst || slot < 0 || slot >= RDNA4DF_MAX_SLOTS || !rdna4_is_ws() || !rdna4_present_capture_on()) return;
+    static _Atomic uint64_t next;
+    static _Atomic int writing;
+    const uint64_t now = rdna4_now();
+    if (now < atomic_load(&next) || atomic_exchange(&writing, 1)) return;
+    struct stat flagStat;
+    const BOOL full = lstat(RDNA4_PRESENT_FULL_FLAG, &flagStat) == 0 && S_ISREG(flagStat.st_mode) &&
+        (flagStat.st_uid == 0 || flagStat.st_uid == geteuid());
+    atomic_store(&next, now + (full ? 5 * NSEC_PER_SEC : NSEC_PER_SEC / 2));
+    const uint32_t width = RDNA4S.pw, height = RDNA4S.ph, kernelSlot = RDNA4S.sid[slot];
+    const VkBuffer slotBuffer = RDNA4S.buf[slot];
+    const size_t pitch = RDNA4S.pitch, row = (size_t)width * 4;
+    const size_t budget = (full ? 64u : 3u) * 1024u * 1024u;
+    const size_t copies = full ? 1u : 3u;
+    if (!slotBuffer || kernelSlot >= RDNA4N_SCAN_MAX_SLOTS || !row || pitch < row || row > budget / copies) {
+        atomic_store(&writing, 0);
+        return;
+    }
+    size_t rows = full ? height : MIN(height, 64u);
+    const size_t maxRows = MIN(budget / (copies * row), 1 + (budget - row) / pitch);
+    if (!rows || (full && rows > maxRows)) { atomic_store(&writing, 0); return; }
+    rows = MIN(rows, maxRows);
+    RDNA4S.sm.pin[slot]++;
+    static dispatch_queue_t writer;
+    static NSMutableArray *saved;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        writer = dispatch_queue_create("org.garnet.present-capture", DISPATCH_QUEUE_SERIAL);
+        saved = [NSMutableArray array];
+    });
+    dispatch_async(writer, ^{
+        @autoreleasepool {
+            const uint64_t start = rdna4_now();
+            char path[1024];
+            const BOOL directoryReady = rdna4_dump_dir_ready(path, sizeof path);
+            IOSurfaceRef source = directoryReady && sid ? IOSurfaceLookup(sid) : NULL;
+            const uint8_t *base = rdna4_capture_source_plane(source, width, height, pitch);
+            const BOOL sourceValid = base != NULL;
+            const BOOL captureSource = sourceValid && !full;
+            const size_t bytes = rows * row, slotOffset = captureSource ? bytes : 0;
+            NSMutableData *data = directoryReady ? [NSMutableData dataWithLength:bytes * (captureSource ? 3 : 1)] : nil;
+            uint8_t *out = data.mutableBytes;
+            const uint32_t seedBefore = source ? IOSurfaceGetSeed(source) : 0;
+            if (out && captureSource) for (size_t y = 0; y < rows; y++) memcpy(out + y * row, base + y * pitch, row);
+            struct rdna4n_scan_status scanBefore = {0}, scanAfter = {0};
+            BOOL scanReady = NO;
+            const uint64_t pollStart = rdna4_now();
+            if (out && presentId) for (unsigned attempt = 0; attempt < 100; attempt++) {
+                if (!rdna4_capture_scan_status(&scanBefore)) break;
+                if (rdna4_capture_scan_matches(&scanBefore, kernelSlot, presentId)) { scanReady = YES; break; }
+                const BOOL awaitingFetch = scanBefore.pending_slot == RDNA4N_SCAN_NO_SLOT &&
+                    scanBefore.front_slot == kernelSlot && scanBefore.slot[kernelSlot].mc &&
+                    scanBefore.plane_mc == scanBefore.slot[kernelSlot].mc;
+                if (!scanBefore.acquired || scanBefore.flags || scanBefore.presents != presentId ||
+                    (scanBefore.pending_slot != kernelSlot && !awaitingFetch)) break;
+                usleep(1000);
+            }
+            const uint64_t pollCost = rdna4_now() - pollStart;
+            BOOL unresolved = NO;
+            const BOOL copied = out && rdna4_capture_readback(slotBuffer, row, pitch, rows, out + slotOffset, &unresolved);
+            const BOOL scanVerified = copied && scanReady && rdna4_capture_scan_status(&scanAfter) &&
+                rdna4_capture_scan_matches(&scanAfter, kernelSlot, presentId) && scanBefore.earliest_mc == scanAfter.earliest_mc &&
+                scanBefore.slot[kernelSlot].latched_frame &&
+                scanBefore.slot[kernelSlot].latched_frame == scanAfter.slot[kernelSlot].latched_frame;
+            if (copied && captureSource) for (size_t y = 0; y < rows; y++) memcpy(out + 2 * bytes + y * row, base + y * pitch, row);
+            const uint32_t seedAfter = source ? IOSurfaceGetSeed(source) : 0;
+            if (source) CFRelease(source);
+            pthread_mutex_lock(&RDNA4S.mu);
+            const uint64_t submission = RDNA4S.sm.submit_hi;
+            if (!unresolved) RDNA4S.sm.pin[slot]--;
+            pthread_mutex_unlock(&RDNA4S.mu);
+            const uint64_t cost = rdna4_now() - start;
+            const uint64_t copyCost = cost - pollCost;
+            if (!full && copyCost > NSEC_PER_SEC / 200)
+                atomic_store(&next, now + 100 * MIN(NSEC_PER_SEC / 10, copyCost));
+            BOOL okay = NO;
+            if (copied) {
+                NSString *stem = [NSString stringWithFormat:@"%s/present-%d-%llu-%llu", path, getpid(),
+                    (unsigned long long)seq, (unsigned long long)now];
+                NSMutableDictionary *record = [@{ @"sequence": @(seq), @"surface": @(sid), @"slot": @(slot),
+                    @"present_id": @(presentId), @"capture_mode": full ? @"full" : @"top",
+                    @"time_ns": @(now), @"cost_ns": @(cost), @"latest_submission": @(submission),
+                    @"width": @(width), @"height": @(height), @"captured_rows": @(rows), @"bytes_per_row": @(row),
+                    @"pixel_format": @"BGRA8", @"source_valid": @(sourceValid), @"slot_offset": @(slotOffset),
+                    @"source_before_offset": @0, @"source_after_offset": @(2 * bytes),
+                    @"source_unchanged": @(captureSource && !memcmp(out, out + 2 * bytes, bytes)),
+                    @"source_matches_slot": @(captureSource && !memcmp(out, out + slotOffset, bytes)),
+                    @"full_frame": rows == height ? @YES : @NO, @"scanout_verified": @(scanVerified),
+                    @"scanout_before_present": @(scanBefore.presents), @"scanout_after_present": @(scanAfter.presents),
+                    @"scanout_before_mc": @(scanBefore.earliest_mc), @"scanout_after_mc": @(scanAfter.earliest_mc),
+                    @"scanout_slot_mc": @(scanBefore.slot[kernelSlot].mc),
+                    @"scanout_latched_frame": @(scanBefore.slot[kernelSlot].latched_frame),
+                    @"seed_before": @(seedBefore), @"seed_after": @(seedAfter),
+                    @"raw_file": [[stem lastPathComponent] stringByAppendingString:@".raw"] } mutableCopy];
+                char boot[64] = {0};
+                size_t bootSize = sizeof boot - 1;
+                if (sysctlbyname("kern.bootsessionuuid", boot, &bootSize, NULL, 0) == 0)
+                    record[@"boot_uuid"] = [NSString stringWithUTF8String:boot];
+                if (full) record[@"slot_sha256"] = rdna4_sha256hex(data);
+                NSData *json = [NSJSONSerialization dataWithJSONObject:record options:0 error:NULL];
+                okay = json && rdna4_dump_write([[stem stringByAppendingString:@".raw"] fileSystemRepresentation], data) &&
+                    rdna4_dump_write([[stem stringByAppendingString:@".json"] fileSystemRepresentation], json);
+                if (okay) [saved addObject:stem];
+                else { unlink([[stem stringByAppendingString:@".raw"] fileSystemRepresentation]); unlink([[stem stringByAppendingString:@".json"] fileSystemRepresentation]); }
+                while (saved.count > (full ? 2u : 16u)) {
+                    NSString *old = saved.firstObject;
+                    unlink([[old stringByAppendingString:@".raw"] fileSystemRepresentation]);
+                    unlink([[old stringByAppendingString:@".json"] fileSystemRepresentation]);
+                    [saved removeObjectAtIndex:0];
+                }
+            }
+            RDNA4LOG("scanout: %s capture seq %llu slot %d id %llu status=%s bytes=%lu cost=%.1f us verified=%d", full ? "full" : "top", (unsigned long long)seq,
+                slot, (unsigned long long)presentId, okay ? "saved" : "failed", (unsigned long)data.length, cost / 1000.0, scanVerified);
+            if (!unresolved) atomic_store(&writing, 0);
+        }
+    });
+}
+#endif // GARNET_PRESENT_CAPTURE_ONLY

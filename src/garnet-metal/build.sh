@@ -41,16 +41,47 @@ for f in "${cache_files[@]}"; do cat "$f" > "$APP/Contents/Resources/spvcache/${
 if [ ${#cache_files[@]} -eq 0 ]; then
   echo "build.sh: no precompiled shader cache; applications need in-process translation, WindowServer cache is unprimed" >&2
 fi
-clang $VKINC -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
-      -DRDNA4_LAZY=$LAZY -DRDNA4_9D=$F9D -I"$D" -bundle -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
-      -o "$APP/Contents/MacOS/GarnetMetal" "$D/GarnetDevice.m"
+GARNET_UNITS=(
+  garnet_backend
+  garnet_resources
+  garnet_surface
+  garnet_shaders
+  garnet_pipelines
+  garnet_commands
+  garnet_arguments
+  garnet_icb
+  garnet_sparse_io
+  garnet_mesh_rt
+  garnet_device
+)
+compile_modular() {
+  local arch="$1" objdir="$2" out="$3" minver_flag="$4"
+  mkdir -p "$objdir"
+  local pids=() objs=()
+  for u in "${GARNET_UNITS[@]}"; do
+    local obj="$objdir/$u.o"
+    objs+=("$obj")
+    clang $VKINC -arch "$arch" ${=minver_flag} -fobjc-arc -O2 -Wall -Wextra -Werror \
+          -fvisibility=hidden -DGARNET_METAL_MODULAR_BUILD=1 -DRDNA4_LAZY=$LAZY -DRDNA4_9D=$F9D \
+          -I"$D" -c "$D/$u.m" -o "$obj" &
+    pids+=($!)
+  done
+  local fail=0
+  for p in "${pids[@]}"; do
+    wait "$p" || fail=1
+  done
+  [ "$fail" -eq 0 ] || { echo "build.sh: modular compile failed for arch=$arch" >&2; exit 1; }
+  clang -arch "$arch" ${=minver_flag} -fobjc-arc -bundle \
+        -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
+        -o "$out" "${objs[@]}"
+}
+compile_modular x86_64 "$W/obj-x86_64" "$APP/Contents/MacOS/GarnetMetal" "-mmacosx-version-min=12.0"
 xattr -cr "$APP"
 codesign --force --sign - "$APP/Contents/Resources/libvulkan_radeon.dylib"
 codesign --force --sign - "$APP/Contents/Resources/libgarnetxlate.dylib"
 codesign --force --sign - "$APP"
 # arm64 build of the same source: compile/link sanity only (there is no Rosetta here to load x86_64); never install it.
-clang $VKINC -arch arm64 -fobjc-arc -O2 -Wall -Wextra -Werror -DRDNA4_LAZY=$LAZY -DRDNA4_9D=$F9D \
-      -I"$D" -bundle -framework Foundation -framework Metal -framework IOKit -framework IOSurface -o "$B/sanity/GarnetMetal-arm64.NOT-SHIPPED" "$D/GarnetDevice.m"
+compile_modular arm64 "$W/obj-arm64" "$B/sanity/GarnetMetal-arm64.NOT-SHIPPED" ""
 codesign --verify --strict -v "$APP"
 tar --no-xattrs --no-mac-metadata -C "$W" -cf "$B/GarnetMetal.bundle.tar" GarnetMetal.bundle 2>/dev/null || \
   tar --no-xattrs -C "$W" -cf "$B/GarnetMetal.bundle.tar" GarnetMetal.bundle

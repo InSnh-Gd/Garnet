@@ -171,7 +171,7 @@ int main(int argc, char **argv) {
     CHECK(m != NULL, "GarnetDevice.m is readable");
     if (m) {
         CHECK(strstr(m, "#include \"rdna4_texdesc.h\"") != NULL, "GarnetDevice.m includes rdna4_texdesc.h");
-        const char *plan = strstr(m, "static BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, rdna4_heap_image_plan *p, NSError **err)");
+        const char *plan = strstr(m, "GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, rdna4_heap_image_plan *p, NSError **err)");
         const char *plan_end = plan ? strstr(plan, "\n@implementation RDNA4Texture") : NULL;
         CHECK(plan && plan_end, "the shared heap image plan is found");
         if (plan && plan_end) {
@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
                   "TextureSizeAndAlign creates a temporary image, queries requirements2, destroys it and returns the Vulkan requirements");
             CHECK(!strstr(size_align, "rdna4td_heap_layers"), "TextureSizeAndAlign does not use the old tight pixel-byte estimate");
         }
-        const char *requirements = strstr(m, "static BOOL rdna4_requirements2(VkBuffer buffer, VkImage image, VkMemoryRequirements *mr,");
+        const char *requirements = strstr(m, "GARNET_INTERNAL BOOL rdna4_requirements2(VkBuffer buffer, VkImage image, VkMemoryRequirements *mr,");
         const char *requirements_end = requirements ? strstr(requirements, "\n// One source of truth for the heap buffer's create info.") : NULL;
         CHECK(requirements && requirements_end, "the shared requirements2 helper is found");
         if (requirements && requirements_end) {

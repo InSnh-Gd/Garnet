@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
       free(kp); free(ka); }
     // ---- the glue in GarnetDevice.m, in the order that makes the decisions reachable
     { char *m = slurp(dir, "GarnetDevice.m"), *pl = slurp(dir, "Info.plist"), *ins = slurp(dir, "../../CHANGES.md");
-      const char *ga = strstr(m, "static BOOL rdna4s_disp_account("); const char *fa = ga ? strstr(ga, "int nf0 = am->nflag_log, ok = rdna4df_account_sid(") : NULL; const char *gg = ga ? strstr(ga, "rdna4x_plan_inst(&RDNA4S.m6, sid, xon, &tent)") : NULL;
+      const char *ga = strstr(m, "GARNET_INTERNAL BOOL rdna4s_disp_account("); const char *fa = ga ? strstr(ga, "int nf0 = am->nflag_log, ok = rdna4df_account_sid(") : NULL; const char *gg = ga ? strstr(ga, "rdna4x_plan_inst(&RDNA4S.m6, sid, xon, &tent)") : NULL;
       CHECK("glue (bundle 20, F1): the account call passes known = latch on and NOT tentative", ga && strstr(ga, "rdna4df_account_sid(am, mask, sid, RDNA4S.m6.latch && !tent)") != NULL);
       CHECK("glue: the gate runs inside rdna4s_disp_account, under the lock, BEFORE the frame is accounted (before it can take a slot)", ga && fa && gg && gg < fa && strstr(ga, "if (pi == RDNA4X_PLAN_SKIP) { pthread_mutex_unlock(&RDNA4S.mu); return NO; }") && strstr(ga, "if (RDNA4S.m6.latch) {") < gg);
       const char *ca = strstr(m, "static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, rdna4crc_rec_t *rec, int cls, uint64_t tcommit, int tries) {");

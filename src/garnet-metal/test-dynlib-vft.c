@@ -641,14 +641,16 @@ static char *read_entire_text_file(const char *path) {
 }
 
 static void test_source_pins(const char *src_dir) {
-    char p1[512], p2[512];
-    snprintf(p1, sizeof(p1), "%s/rdna4_shader_runtime_impl.inc", src_dir);
-    snprintf(p2, sizeof(p2), "%s/rdna4_dynlib_vft_impl.inc", src_dir);
+    char p1[512], p2[512], ph[512];
+    snprintf(p1, sizeof(p1), "%s/garnet_shaders.m", src_dir);
+    snprintf(p2, sizeof(p2), "%s/garnet_shaders.m", src_dir);
+    snprintf(ph, sizeof(ph), "%s/garnet_metal_internal.h", src_dir);
 
     char *rt = read_entire_text_file(p1);
-    CHECK(rt != NULL, "read rdna4_shader_runtime_impl.inc");
-    if (rt) {
-        CHECK(strstr(rt, "#include \"rdna4_dynlib_vft.h\"") != NULL, "runtime includes rdna4_dynlib_vft.h");
+    char *hdr = read_entire_text_file(ph);
+    CHECK(rt != NULL && hdr != NULL, "read garnet_shaders.m and garnet_metal_internal.h");
+    if (rt && hdr) {
+        CHECK(strstr(hdr, "#include \"rdna4_dynlib_vft.h\"") != NULL, "internal header includes rdna4_dynlib_vft.h");
         CHECK(strstr(rt, "\"garnetx_list_exported_symbols\"") != NULL, "runtime dlsym garnetx_list_exported_symbols");
         CHECK(strstr(rt, "\"garnetx_translate_linked_libraries\"") != NULL, "runtime dlsym garnetx_translate_linked_libraries");
         CHECK(strstr(rt, "rdna4x_list_exported_symbols_for_module") != NULL, "runtime symbol enumeration helper");
@@ -668,11 +670,12 @@ static void test_source_pins(const char *src_dir) {
               "runtime sets requireStage2 for all linkedFunctions (visible/binary/private/groups) and preloadedLibraries");
         CHECK(strstr(rt, "if (!ctx && why && fn && (f || bf || pf || gg || pl || addBin) && rdna4x_active())") != NULL,
               "runtime preserves deterministic linkageError for all linkedFunctions categories on admitted apps");
-        free(rt);
     }
+    free(rt);
+    free(hdr);
 
     char *impl = read_entire_text_file(p2);
-    CHECK(impl != NULL, "read rdna4_dynlib_vft_impl.inc");
+    CHECK(impl != NULL, "read garnet_shaders.m");
     if (impl) {
         const char *libBcPos = strstr(impl, "rdna4_dl_objc_prop(library, \"bitcodeData\")");
         const char *extFnPos = strstr(impl, "\"newExternFunctionWithName:\"");

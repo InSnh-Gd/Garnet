@@ -9,7 +9,7 @@ python3 - "$source_dir" "$out" <<'PY'
 from pathlib import Path
 import sys
 source, out = map(Path, sys.argv[1:])
-text = (source / 'rdna4_backend_impl.inc').read_text()
+text = (source / 'garnet_backend.m').read_text()
 start = text.index(' rdna4_pc_derive_key(void) {')
 start = text.rfind('\n', 0, start) + 1
 end = text.index('\n}', start) + 2

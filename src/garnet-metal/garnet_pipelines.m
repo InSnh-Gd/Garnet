@@ -1,84 +1,21 @@
+// garnet_pipelines.m - GarnetMetal modular compilation unit.
+#if !defined(GARNET_INTERNAL) && !defined(GARNET_METAL_MODULAR_BUILD)
+#define GARNET_INTERNAL static
+#endif
+#ifdef GARNET_METAL_MODULAR_BUILD
+#include "garnet_metal_internal.h"
+#endif
+#include "rdna4_indirect_compute.h"
+#include "rdna4_luma_workgroup.h"
+#include "rdna4_fragment_output.h"
+#include "rdna4_fallback_spv.h"
+
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4RenderPipelineState (10d/11e): SPIR-V from Resources/spvcache/<sha256(bitcodeData)>.spv -> VkPipeline variants.
 // ---------------------------------------------------------------------------------------------------------------
 #include "rdna4_fragment_output.h"
-#include "rdna4_counters.h"
 
-#define RDNA4_HAS_MESH_PIPELINE_QUERY 1
-@interface RDNA4RenderPipelineState : _MTLRenderPipelineState {
-    id _dev; NSString *_lbl; VkShaderModule _vs, _tcs, _tes, _fs; VkPipelineLayout _pl; VkRenderPass _rp; VkDescriptorSetLayout _dsl[2], _tessDsl;
-    BOOL _isTess; uint32_t _tessSet; rdna4_tess_cfg_t _tessCfg; uint64_t _tessKey;
-    RDNA4PB *_pbV, *_pbF; uint32_t _npbV, _npbF; BOOL _fetch; uint32_t _fetchMax;   // 11e-2: fragment reads [[color(n)]] (input attachments 0.._fetchMax)
-    VkVertexInputBindingDescription _vib[32]; VkVertexInputAttributeDescription _via[32]; uint32_t _nvib, _nvia; uint32_t _need[32]; uint32_t _nneed;
-    VkPipelineColorBlendAttachmentState _cba[8]; uint32_t _na; char _vep[128], _fep[128];
-    NSMutableDictionary *_variants; NSLock *_lock; NSMutableArray *_owned; BOOL _fallback, _icb, _hasFrag, _rastOff;
-    uint64_t _icbToken;
-    NSData *_icbVsSpv, *_icbFsSpv;
-    garnetx_icb_vattr_t _icbVAttrs[32]; uint32_t _nIcbVAttrs;
-    uint32_t _pcs; VkShaderStageFlags _pcf;
-    BOOL _icbGpuReady, _icbHasVsParams;
-    VkShaderModule _icbVs, _icbFs, _icbTes;
-    VkDescriptorSetLayout _icbDsl[2], _icbTessDsl;
-    VkPipelineLayout _icbPl;
-    RDNA4PB *_icbPbV, *_icbPbF; uint32_t _icbNpbV, _icbNpbF;
-    NSMutableDictionary *_icbVariants;
-    char _vnm[64], _fnm[64];   // native #12 P1: vertex / fragment function names (CoreDisplay's final pass = fragment "GPUPass")
-    rdna4pc_t _pc; MTLPixelFormat _dpf, _spf; VkFormat _dsVk; unsigned _dsAsp;   // bundle 10: fixed config (samples, dynamic states, depth bias), the depth / stencil attachment formats, the attachment's VkFormat (UNDEFINED = none) and aspects
-    MTLRenderPipelineDescriptor *_hsDesc; _Atomic(uintptr_t) _realp;   // hot-swap: creation descriptor (fallback only); the published real object (+1, written once)
-    MTLRenderPipelineReflection *_reflection;
-    RDNA4ArgumentTables _argumentTables;
-    rdna4_argument_scan_reflection_plan _scanV, _scanF;
-    uint32_t _maxAmp;
-    uint64_t _vftOwnerToken;
-    rdna4vft_reflection_t _vftV, _vftF;
-    uint64_t _iftOwnerToken;
-    rdna4rtr_reflection_t _rtV, _rtF;
-}
-- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
-- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;
-- (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options noFallback:(BOOL)nofb error:(NSError **)err;
-- (RDNA4RenderPipelineState *)rdna4Real;   // the hot-swapped real pipeline, or nil
-- (BOOL)rdna4HotRebuild;
-- (BOOL)rdna4IsRenderFallback;
-- (VkPipeline)vkPipeline;
-- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f;
-- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;   // bundle 10: dk = rdna4DSKey: (0 for a colour-only pipeline)
-- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk rflags:(uint32_t)rf;
-- (BOOL)rdna4PrepareICBGPUVariant:(NSError **)err;
-- (VkPipeline)icbPipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;
-- (uint64_t)rdna4ICBToken;
-- (BOOL)rdna4ICBHasVsParams;
-- (VkPipelineLayout)icbLayout;
-- (VkDescriptorSetLayout)icbDsl:(int)i;
-- (VkDescriptorSetLayout)icbTessDsl;
-- (const RDNA4PB *)icbPbV; - (uint32_t)icbNpbV; - (const RDNA4PB *)icbPbF; - (uint32_t)icbNpbF;
-- (uint32_t)rdna4DSKey:(const void *)dsinfo;   // RDNA4DSInfo *, NULL = the default state (Always, no write, no stencil)
-- (BOOL)rdna4HasDS; - (BOOL)rdna4HasDepth; - (BOOL)rdna4HasStencil; - (VkFormat)rdna4DSVk; - (unsigned)rdna4SampleCount;
-- (VkPipelineLayout)layout;
-- (VkDescriptorSetLayout)dsl:(int)i;
-- (const RDNA4ArgumentTables *)argumentTables;
-- (const rdna4_argument_scan_reflection_plan *)scanPlanV;
-- (const rdna4_argument_scan_reflection_plan *)scanPlanF;
-- (const RDNA4PB *)pbV; - (uint32_t)npbV; - (const RDNA4PB *)pbF; - (uint32_t)npbF;
-- (const uint32_t *)needBindings; - (uint32_t)nNeed;
-- (BOOL)fetch; - (uint32_t)fetchMax;
-- (const char *)rdna4VName; - (const char *)rdna4FName; - (BOOL)rdna4HasFragment;
-- (id)reflection;
-- (void)rdna4SetReflection:(MTLRenderPipelineReflection *)reflection;
-- (BOOL)rdna4IsTessellation;
-- (const rdna4_tess_cfg_t *)tessCfg;
-- (VkDescriptorSetLayout)tessDsl;
-- (uint32_t)tessSet;
-- (uint64_t)tessCacheKey;
-- (uint32_t)rdna4MaxVertexAmplificationCount;
-- (BOOL)rdna4IsMeshPipeline;
-- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflV;
-- (const rdna4rtr_as_reflection_t *)rdna4RtAsReflF;
-- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage;
-- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
-- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
-@end
-static VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
+   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
 // Returns the cached SPIR-V for fn, or nil with *err code 40 (no bitcodeData) / 41 (miss, or RDNA4M_FORCE_FALLBACK).
 // *fname gets the function name for logs; *meta the <sha>.meta.json sidecar when present. Reflection reads the entry-point name out of the SPIR-V itself.
@@ -115,11 +52,11 @@ static NSData *rdna4_spv_lookup_impl(id fn, const char *role, NSError **err, NSS
     return spv;
 }
 
-static NSData *rdna4_spv_lookup(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta) {
+GARNET_INTERNAL NSData *rdna4_spv_lookup(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta) {
     uint64_t t_ = rdna4_now(); NSData *d = rdna4_spv_lookup_impl(fn, role, err, fname, meta); rdna4t_add(&T1.spv, rdna4_now() - t_); return d;
 }
 
-static VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const char *role, NSError **err) {
+GARNET_INTERNAL VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const char *role, NSError **err) {
     VkShaderModuleCreateInfo smc = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = code };
     VkShaderModule m = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateShaderModule(RDNA4R.dev, &smc, NULL, &m); rdna4t_add(&T1.shm, rdna4_now() - t_);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(42, [NSString stringWithFormat:@"vkCreateShaderModule(%s) = %d", role, r]); return VK_NULL_HANDLE; }
@@ -1070,3 +1007,1221 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 }
 @end
 
+// ---------------------------------------------------------------------------------------------------------------
+// RDNA4ComputePipelineState (11e R2): SPIR-V + meta sidecar from spvcache; ThreadsDynamic modules take the local size as spec ids 0..2.
+// ---------------------------------------------------------------------------------------------------------------
+
+static _Atomic uint64_t rdna4_icb_compute_pso_seq;
+static pthread_mutex_t rdna4_icb_compute_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static NSHashTable *rdna4_icb_compute_reg;
+
+static void rdna4_icb_compute_reg_add(id pso) {
+    if (!pso) return;
+    pthread_mutex_lock(&rdna4_icb_compute_reg_mu);
+    if (!rdna4_icb_compute_reg) rdna4_icb_compute_reg = [NSHashTable weakObjectsHashTable];
+    [rdna4_icb_compute_reg addObject:pso];
+    pthread_mutex_unlock(&rdna4_icb_compute_reg_mu);
+}
+
+GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
+    if (!dev) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    pthread_mutex_lock(&rdna4_icb_compute_reg_mu);
+    for (id obj in rdna4_icb_compute_reg) {
+        if ([obj device] == dev && [(id<MTLComputePipelineState>)obj supportIndirectCommandBuffers]) {
+            [out addObject:obj];
+            if (out.count >= RDNA4_ICB_MAX_CANDIDATE_PIPELINES) break;
+        }
+    }
+    pthread_mutex_unlock(&rdna4_icb_compute_reg_mu);
+    return out;
+}
+
+
+@implementation RDNA4ComputePipelineState
+- (instancetype)initPlaceholderWithDevice:(id)dev function:(id)fn {
+    self = [super init]; if (!self) return nil;
+    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array]; _noop = YES;
+    NSString *sha = rdna4_fn_sha(fn);
+    if (sha) {
+        _hsFn = fn; _hsLk = rdna4_lk_for(fn);
+        rdna4hs_register(self, @[ sha ], YES, [NSString stringWithFormat:@"kernel %@", [fn respondsToSelector:@selector(name)] ? [fn name] : @"?"], ^BOOL(id o) { return [(RDNA4ComputePipelineState *)o rdna4HotRebuild]; });
+    }
+    return self;
+}
+- (RDNA4ComputePipelineState *)rdna4Real { uintptr_t p = rdna4hs_load(&_realp); return p ? (__bridge RDNA4ComputePipelineState *)(void *)p : nil; }
+// Runs on the watcher queue: a NEW pipeline object through the normal init (a miss or an unusable .meta.json fails it, nothing is published).
+- (BOOL)rdna4HotRebuild {
+    if (!_hsFn) return NO;
+    NSError *e = nil;
+    RDNA4_LK_SCOPE; if (_hsLk) rdna4_lk_install(2, _hsLk);   // build 18 (P3)
+    RDNA4ComputePipelineState *r = [[RDNA4ComputePipelineState alloc] initWithDevice:_dev function:_hsFn error:&e];
+    if (!r) { RDNA4LOG("HOT-SWAP kernel rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
+    r->_lbl = _lbl;
+    r->_icb = _icb;
+    r->_icbToken = _icbToken;
+    if (r->_icb) rdna4_icb_compute_reg_add(r);
+    uintptr_t v = (uintptr_t)CFBridgingRetain(r);
+    if (!rdna4hs_install(&_realp, v)) { CFRelease((CFTypeRef)v); return NO; }
+    return YES;
+}
+- (void)rdna4EnableICBForDescriptor:(MTLComputePipelineDescriptor *)descriptor {
+    if (!descriptor || ![descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)] ||
+        !descriptor.supportIndirectCommandBuffers)
+        return;
+    _icb = YES;
+    if (!_icbToken) {
+        uint64_t seq = (atomic_fetch_add(&rdna4_icb_compute_pso_seq, 1) % UINT64_C(0x7FFFFFFF)) + 1ull;
+        _icbToken = RDNA4_ICB_PSO_TOKEN_TAG | RDNA4_ICB_COMPUTE_PSO_BIT | seq;
+    }
+    if (!_icbVariants) _icbVariants = [NSMutableDictionary dictionary];
+    rdna4_icb_compute_reg_add(self);
+}
+- (BOOL)noop { return _noop; }
+- (BOOL)rdna4LumaWorkgroup { return _lumaWorkgroup; }
+- (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err {
+    // #12 R1: the cache lookup comes first, so a miss (placeholder case) needs no Vulkan device.
+    NSString *fname = nil; NSDictionary *meta = nil; NSError *e = nil;
+    NSData *spv = rdna4_spv_lookup(fn, "kernel", &e, &fname, &meta);
+    if (!spv) { if (err) *err = e; return nil; }
+    return [self initWithDevice:dev function:fn spv:spv meta:meta fname:fname error:err];
+}
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLComputePipelineDescriptor *)descriptor options:(NSUInteger)options error:(NSError **)err {
+    if (!descriptor || !descriptor.computeFunction) {
+        if (err) *err = rdna4_err(61, @"compute pipeline descriptor has no computeFunction");
+        return nil;
+    }
+    id fn = descriptor.computeFunction;
+    BOOL installedLk = NO;
+    if (rdna4_lk_for(fn) == nil) {
+        rdna4x_linkage_compute(descriptor);
+        installedLk = (rdna4_lk_for(fn) != nil);
+    }
+    NSError *lkErr = rdna4_lk_error(fn);
+    if (lkErr) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = lkErr;
+        return nil;
+    }
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    NSData *baSpv = nil, *baVk = nil;
+    NSDictionary *baMeta = nil;
+    rdna4ba_fingerprint_t baFp = {0};
+    BOOL baHit = NO;
+    NSError *baErr = nil;
+    if (!rdna4_ba_lookup_compute(dev, descriptor, options, &baSpv, &baMeta, &baVk, &baFp, &baHit, &baErr)) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = baErr;
+        return nil;
+    }
+    if (baHit) {
+        if (!rdna4_radv_open(err)) {
+            if (installedLk) rdna4_lk_install(2, nil);
+            return nil;
+        }
+        NSString *fname = [fn respondsToSelector:@selector(name)] ? [fn name] : @"?";
+        rdna4_ba_vkcache_scope_t vcScope;
+        rdna4_ba_vkcache_scope_begin(&vcScope, baVk, &baFp);
+        self = [self initWithDevice:dev function:fn spv:baSpv meta:baMeta fname:fname error:err];
+        rdna4_ba_vkcache_scope_end(&vcScope);
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (self) {
+            if (descriptor.label) _lbl = [descriptor.label copy];
+            [self rdna4EnableICBForDescriptor:descriptor];
+        }
+        return self;
+    }
+#else
+    if (options & ((NSUInteger)1u << 2)) {
+        if (installedLk) rdna4_lk_install(2, nil);
+        if (err) *err = [NSError errorWithDomain:MTLBinaryArchiveDomain
+            code:(NSInteger)MTLBinaryArchiveErrorCompilationFailure
+            userInfo:@{ NSLocalizedDescriptionKey: @"Compute pipeline missed binary archive (MTLPipelineOptionFailOnBinaryArchiveMiss)" }];
+        return nil;
+    }
+#endif
+    self = [self initWithDevice:dev function:fn error:err];
+    if (installedLk) rdna4_lk_install(2, nil);
+    if (self) {
+        if (descriptor.label) _lbl = [descriptor.label copy];
+        [self rdna4EnableICBForDescriptor:descriptor];
+    }
+    return self;
+}
+- (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err {
+    (void)fn;
+    self = [super init]; if (!self) return nil;
+    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
+    if (!spv) { if (err) *err = rdna4_err(41, @"compute function SPIR-V is nil"); return nil; }
+    if (!fname) fname = @"?";
+    NSError *e = nil;
+    if (!rdna4_radv_open(err)) return nil;
+    const uint64_t deadline = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;
+    NSDictionary *preMeta = meta;
+    spv = rdna4_gpu_argument_spv(spv, &meta, deadline, err);
+    if (!spv) return nil;
+    _vftOwnerToken = rdna4_vft_next_owner_token();
+    NSDictionary *vftMeta = (meta && meta[@"visible_function_tables"]) ? meta : preMeta;
+    if (!rdna4x_parse_vft_from_meta(vftMeta, &_vft, err)) return nil;
+    _iftOwnerToken = rdna4_vft_next_owner_token();
+    NSDictionary *rtMeta = (meta && (meta[@"acceleration_structures"] || meta[@"intersection_function_tables"])) ? meta : preMeta;
+    if (!rdna4_rt_parse_meta(rtMeta, &_rt, err)) return nil;
+    if (!meta || !meta[@"kernel_dispatch"] || ![meta[@"local_size"] isKindOfClass:[NSArray class]] || [meta[@"local_size"] count] != 3) {
+        if (err) *err = rdna4_err(62, [NSString stringWithFormat:@"compute function '%@': spvcache has no .meta.json with kernel_dispatch/local_size (run add-air.py)", fname]); return nil; }
+    id kd = meta[@"kernel_dispatch"];
+    if ([kd isEqual:@"Workgroups"]) _mode = 0;
+    else if ([kd isKindOfClass:[NSDictionary class]] && kd[@"ThreadsDynamic"]) { _mode = 1; _pcOff = (uint32_t)[kd[@"ThreadsDynamic"][@"offset"] unsignedIntValue]; }
+    else { if (err) *err = rdna4_err(63, [NSString stringWithFormat:@"compute function '%@': kernel_dispatch %@ not supported (ThreadsFixed)", fname, kd]); return nil; }
+    for (int i = 0; i < 3; i++) _local[i] = (uint32_t)[meta[@"local_size"][i] unsignedIntValue];
+    RDNA4sRefl *r = calloc(1, sizeof *r); RDNA4sMod m = {0}; char why[256] = "";
+    if (rdna4s_parse(spv.bytes, spv.length / 4, &m, why, sizeof why) || !m.has_ep || m.ep_model != 5 || rdna4s_reflect(&m, 2, r)) {
+        if (err) *err = rdna4_err(64, [NSString stringWithFormat:@"kernel SPIR-V reflection: %s", why[0] ? why : r->why[0] ? r->why : "no/wrong entry point"]); rdna4s_free(&m); free(r); return nil; }
+    strlcpy(_ep, m.ep_name, sizeof _ep);
+    uint32_t *lumaWords = NULL;
+    if (_mode && rdna4_luma_workgroup(fname.UTF8String, &m, spv.bytes, spv.length / 4, &lumaWords)) {
+        spv = [NSData dataWithBytesNoCopy:lumaWords length:spv.length + 8 * sizeof(*lumaWords)];
+        _lumaWorkgroup = YES;
+    }
+    rdna4s_free(&m);
+    _pcSize = r->pc_size;
+    BOOL ok = rdna4_stage_dsl(r, 0, VK_SHADER_STAGE_COMPUTE_BIT, meta, &_dsl, &_pb, &_npb, _owned, &e);
+    if (ok) {
+        _argumentTables.comparisonSamplers = [meta[@"argument_resource_tables"][@"comparison_sampler"] boolValue];
+        _argumentTables.samplerCoordinates = [meta[@"normalized_sampler_coordinates"] boolValue];
+        ok = rdna4_argument_table_metadata_apply(&_argumentTables, r, 0, meta, &e) &&
+            rdna4_argument_table_layouts(&_argumentTables, r, NULL, YES, &e) &&
+            rdna4_argument_stage_remap(&_argumentTables, _pb, _npb, &e);
+    }
+    free(r);
+    if (!ok) { if (err) *err = e; return nil; }
+    if (!rdna4_argument_scan_plan_build(&_scan, preMeta, meta, "compute", &e)) {
+        if (err) *err = e;
+        return nil;
+    }
+    _sm = rdna4_spv_module(spv.bytes, spv.length, "kernel", err); if (!_sm) return nil;
+    _spv = spv;
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, _pcSize };
+    if (_argumentTables.active) {
+        VkDescriptorSetLayoutCreateInfo empty = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        VkResult result = vkCreateDescriptorSetLayout(RDNA4R.dev, &empty, NULL, &_emptySet);
+        if (result != VK_SUCCESS) { if (err) *err = rdna4_err(49, @"cannot create the empty compute descriptor set"); return nil; }
+    }
+    VkDescriptorSetLayout layouts[5] = {_dsl, _emptySet, _argumentTables.dsl[0], _argumentTables.dsl[1], _argumentTables.dsl[2]};
+    VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = _argumentTables.active ? 5 : 1, .pSetLayouts = layouts,
+        .pushConstantRangeCount = _pcSize ? 1 : 0, .pPushConstantRanges = &pcr };
+    VkResult vr = vkCreatePipelineLayout(RDNA4R.dev, &plc, NULL, &_pl);
+    if (vr != VK_SUCCESS) { if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout(compute) = %d", vr]); return nil; }
+    VkPipeline p = [self pipelineForLocal:_local];
+    if (!p) { if (err) *err = rdna4_err(65, @"vkCreateComputePipelines failed"); return nil; }
+    RDNA4LOG("RDNA4ComputePipelineState %p '%s': local %u,%u,%u, %s, %u bindings, push constants %u B", (__bridge void *)self, fname.UTF8String, _local[0], _local[1], _local[2],
+           _mode ? "ThreadsDynamic" : "Workgroups", _npb, _pcSize);
+    return self;
+}
+- (VkPipeline)pipelineForLocal:(const uint32_t *)l {
+    return [self pipelineForLocal:l indirect:NO];
+}
+- (VkPipeline)pipelineForLocal:(const uint32_t *)l indirect:(BOOL)indirect {
+    return [self pipelineForLocal:l indirect:indirect threadgroupBytes:0];
+}
+- (VkPipeline)pipelineForLocal:(const uint32_t *)l indirect:(BOOL)indirect threadgroupBytes:(NSUInteger)bytes {
+    rdna4dc_caps caps = rdna4_device_caps();
+    if (!rdna4dc_workgroup_ok(&caps, l[0], l[1], l[2])) {
+        RDNA4LOG("compute pipeline: local size %u,%u,%u exceeds device limits", l[0], l[1], l[2]); return VK_NULL_HANDLE;
+    }
+    uint64_t key = _mode ? ((uint64_t)l[0] | ((uint64_t)l[1] << 20) | ((uint64_t)l[2] << 40)) : 0;
+    if (_mode && indirect) key |= UINT64_C(1) << 63;
+    if (bytes && (!_lumaWorkgroup || !rdna4_luma_workgroup_bytes_ok(bytes, caps.shared_memory) ||
+        !rdna4_luma_workgroup_fits(bytes, l))) return VK_NULL_HANDLE;
+    id<NSCopying> k = bytes ? (id<NSCopying>)@[ @(key), @(bytes) ] : @(key);
+    [_lock lock];
+    NSValue *v = _variants[k];
+    if (!v) {
+        VkShaderModule module = _sm;
+        if (_mode && indirect) {
+            uint32_t *words = NULL; size_t count = 0; char why[256] = "";
+            if (rdna4s_indirect_compute(_spv.bytes, _spv.length / 4, _pcOff, l, &words, &count, why, sizeof why)) {
+                RDNA4LOG("indirect compute transformation: %s", why); [_lock unlock]; return VK_NULL_HANDLE;
+            }
+            module = rdna4_spv_module(words, count * 4, "indirect kernel", NULL);
+            free(words);
+            if (!module) { [_lock unlock]; return VK_NULL_HANDLE; }
+        }
+        VkSpecializationMapEntry me[] = { { 0, 0, 4 }, { 1, 4, 4 }, { 2, 8, 4 }, { RDNA4_LUMA_WORKGROUP_SPEC, 12, 4 } };
+        uint32_t data[] = { l[0], l[1], l[2], (uint32_t)(bytes / RDNA4_LUMA_ELEMENT_BYTES) };
+        VkSpecializationInfo si = { bytes ? 4u : 3u, me, bytes ? sizeof data : 3 * sizeof(*data), data };
+        VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = _pl,
+            .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = _ep, .pSpecializationInfo = _mode ? &si : NULL } };
+        VkPipelineCache pc = RDNA4R.pc;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+        pc = rdna4_ba_vkcache();
+#endif
+        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateComputePipelines(RDNA4R.dev, pc, 1, &ci, NULL, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
+        if (module != _sm) vkDestroyShaderModule(RDNA4R.dev, module, NULL);
+        if (r != VK_SUCCESS) RDNA4LOG("vkCreateComputePipelines(local %u,%u,%u) = %d", l[0], l[1], l[2], r);
+        else {
+            v = [NSValue valueWithPointer:(void *)p];
+            _variants[k] = v;
+            if (_nCompiledLocals < 32u) {
+                BOOL seen = NO;
+                for (uint32_t ci = 0; ci < _nCompiledLocals; ci++) {
+                    if (_compiledLocals[ci][0] == l[0] && _compiledLocals[ci][1] == l[1] && _compiledLocals[ci][2] == l[2]) {
+                        seen = YES;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    _compiledLocals[_nCompiledLocals][0] = l[0];
+                    _compiledLocals[_nCompiledLocals][1] = l[1];
+                    _compiledLocals[_nCompiledLocals][2] = l[2];
+                    _nCompiledLocals++;
+                }
+            }
+        }
+    }
+    [_lock unlock];
+    return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
+}
+- (void)rdna4DestroyICBGPUState {
+    if (RDNA4R.ok) {
+        for (NSValue *v in _icbVariants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
+        if (_icbPl) vkDestroyPipelineLayout(RDNA4R.dev, _icbPl, NULL);
+        if (_icbDsl) vkDestroyDescriptorSetLayout(RDNA4R.dev, _icbDsl, NULL);
+    }
+    [_icbVariants removeAllObjects];
+    _icbPl = VK_NULL_HANDLE;
+    _icbDsl = VK_NULL_HANDLE;
+    free(_icbPb); _icbPb = NULL; _icbNpb = 0;
+    _icbSpv = nil;
+    _icbGpuReady = NO;
+    _icbAllowFallback = NO;
+}
+- (BOOL)rdna4PrepareICBGPUVariant:(NSError **)err {
+    [_lock lock];
+    if (_icbGpuReady) { [_lock unlock]; return YES; }
+    if (!_icb || _noop || !_spv) {
+        [_lock unlock];
+        if (err) *err = rdna4_err(49, @"compute pipeline does not support GPU indirect command buffers");
+        return NO;
+    }
+    if (!RDNA4R.bufferAddress) {
+        [_lock unlock];
+        if (err) *err = rdna4_err(49, @"GPU compute indirect command buffers require Vulkan bufferDeviceAddress");
+        return NO;
+    }
+    const rdna4x_xlib *xl = rdna4x_ensure_xlib(err);
+    if (!xl || !xl->lower_icb_stage) {
+        if (xl && err && !*err) *err = rdna4_err(42, @"translator library lacks garnetx_lower_icb_stage");
+        [_lock unlock];
+        return NO;
+    }
+    uint8_t *cspv = NULL; size_t clen = 0;
+    RDNA4sMod mc = {0}; BOOL mcOpen = NO;
+    RDNA4sRefl *rcRefl = NULL;
+    BOOL ok = NO;
+    do {
+        uint32_t ctbl = 0, cvsp = 0; char xerr[256] = "";
+        int rc = xl->lower_icb_stage((const uint8_t *)_spv.bytes, _spv.length, 3u, 0u,
+                                     NULL, 0u, &cspv, &clen, &ctbl, &cvsp, xerr, sizeof xerr);
+        if (rc != 0 || !cspv || clen < 20 || (clen & 3)) {
+            if (err) *err = rdna4_err(42, [NSString stringWithFormat:@"icb lower compute stage failed (%d): %s", rc, xerr]);
+            break;
+        }
+        if (ctbl != RDNA4_ICB_TABLE_BINDING || cvsp != 0u) {
+            if (err) *err = rdna4_err(42, [NSString stringWithFormat:@"icb lower compute stage returned unexpected bindings tbl=%u vsp=%u", ctbl, cvsp]);
+            break;
+        }
+        char why[256] = "";
+        rcRefl = calloc(1, sizeof *rcRefl);
+        if (!rcRefl) { if (err) *err = rdna4_err(49, @"out of memory reflecting ICB compute stage"); break; }
+        if (rdna4s_parse((const uint32_t *)cspv, clen / 4, &mc, why, sizeof why) ||
+            !mc.has_ep || mc.ep_model != 5u || rdna4s_reflect(&mc, 2, rcRefl)) {
+            if (mc.id) mcOpen = YES;
+            if (err) *err = rdna4_err(64, [NSString stringWithFormat:@"ICB lowered compute reflection failed: %s",
+                                           why[0] ? why : rcRefl->why[0] ? rcRefl->why : "wrong entry point"]);
+            break;
+        }
+        mcOpen = YES;
+        if (!rdna4_icb_build_stage_dsl(_pb, _npb, rcRefl, 0, VK_SHADER_STAGE_COMPUTE_BIT, NO,
+                                       &_icbDsl, &_icbPb, &_icbNpb, err))
+            break;
+        VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, _pcSize };
+        VkDescriptorSetLayout layouts[5] = { _icbDsl, _emptySet, _argumentTables.dsl[0], _argumentTables.dsl[1], _argumentTables.dsl[2] };
+        VkPipelineLayoutCreateInfo plc = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = _argumentTables.active ? 5u : 1u,
+            .pSetLayouts = layouts,
+            .pushConstantRangeCount = _pcSize ? 1u : 0u,
+            .pPushConstantRanges = &pcr,
+        };
+        VkResult pr = vkCreatePipelineLayout(RDNA4R.dev, &plc, NULL, &_icbPl);
+        if (pr != VK_SUCCESS) {
+            if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout(icb compute) = %d", pr]);
+            break;
+        }
+        int allowFallback = 0;
+        rdna4s_icb_compute_inspect((const uint32_t *)cspv, clen / 4, NULL, &allowFallback);
+        _icbAllowFallback = allowFallback ? YES : NO;
+        _icbSpv = [NSData dataWithBytes:cspv length:clen];
+        if (!_icbSpv) {
+            if (err) *err = rdna4_err(49, @"out of memory copying ICB lowered compute SPIR-V");
+            break;
+        }
+        _icbGpuReady = YES;
+        ok = YES;
+    } while (0);
+    if (mcOpen) rdna4s_free(&mc);
+    free(rcRefl);
+    if (cspv) xl->freep(cspv, clen);
+    if (!ok) [self rdna4DestroyICBGPUState];
+    [_lock unlock];
+    return ok;
+}
+- (VkPipeline)icbPipelineForLocal:(const uint32_t *)l {
+    if (!l) return VK_NULL_HANDLE;
+    rdna4dc_caps caps = rdna4_device_caps();
+    if (!rdna4dc_workgroup_ok(&caps, l[0], l[1], l[2])) return VK_NULL_HANDLE;
+    if (!_mode && (l[0] != _local[0] || l[1] != _local[1] || l[2] != _local[2])) return VK_NULL_HANDLE;
+    uint64_t key = _mode ? ((uint64_t)l[0] | ((uint64_t)l[1] << 20) | ((uint64_t)l[2] << 40)) : 0u;
+    [_lock lock];
+    if (!_icbGpuReady || !_icbSpv) { [_lock unlock]; return VK_NULL_HANDLE; }
+    NSValue *v = _icbVariants[@(key)];
+    if (!v) {
+        uint32_t *words = NULL; size_t count = 0; char why[256] = "";
+        if (rdna4s_icb_compute_indirect((const uint32_t *)_icbSpv.bytes, _icbSpv.length / 4,
+                                        _pcOff, _mode, l, &words, &count, why, sizeof why)) {
+            RDNA4LOG("icb compute indirect transformation: %s", why);
+            [_lock unlock];
+            return VK_NULL_HANDLE;
+        }
+        VkShaderModule module = rdna4_spv_module(words, count * 4, "icb-compute", NULL);
+        free(words);
+        if (!module) { [_lock unlock]; return VK_NULL_HANDLE; }
+        VkSpecializationMapEntry me[3] = { { 0, 0, 4 }, { 1, 4, 4 }, { 2, 8, 4 } };
+        uint32_t data[3] = { l[0], l[1], l[2] };
+        VkSpecializationInfo si = { 3u, me, sizeof data, data };
+        VkComputePipelineCreateInfo ci = {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .layout = _icbPl,
+            .stage = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = module,
+                .pName = _ep,
+                .pSpecializationInfo = _mode ? &si : NULL,
+            },
+        };
+        VkPipelineCache pc = RDNA4R.pc;
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+        pc = rdna4_ba_vkcache();
+#endif
+        VkPipeline p = VK_NULL_HANDLE;
+        uint64_t t_ = rdna4_now();
+        VkResult r = vkCreateComputePipelines(RDNA4R.dev, pc, 1, &ci, NULL, &p);
+        rdna4t_add(&T1.cmp, rdna4_now() - t_);
+        atomic_fetch_add(&rdna4_pipes_new, 1);
+        vkDestroyShaderModule(RDNA4R.dev, module, NULL);
+        if (r != VK_SUCCESS) RDNA4LOG("vkCreateComputePipelines(icb local %u,%u,%u) = %d", l[0], l[1], l[2], r);
+        else { v = [NSValue valueWithPointer:(void *)p]; _icbVariants[@(key)] = v; }
+    }
+    [_lock unlock];
+    return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
+}
+- (void)dealloc {
+    [self rdna4DestroyICBGPUState];
+    if (RDNA4R.ok) {
+        for (NSValue *v in _variants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
+        if (_pl) vkDestroyPipelineLayout(RDNA4R.dev, _pl, NULL);
+        if (_dsl) vkDestroyDescriptorSetLayout(RDNA4R.dev, _dsl, NULL);
+        if (_emptySet) vkDestroyDescriptorSetLayout(RDNA4R.dev, _emptySet, NULL);
+        rdna4_argument_tables_destroy(&_argumentTables);
+        for (NSValue *v in _owned) rdna4_destroy_sampler((VkSampler)v.pointerValue, NULL);
+        if (_sm) vkDestroyShaderModule(RDNA4R.dev, _sm, NULL);
+    }
+    rdna4_argument_scan_reflection_plan_destroy(&_scan);
+    rdna4vft_refl_destroy(&_vft);
+    rdna4rtr_refl_destroy(&_rt);
+    free(_pb);
+    uintptr_t rp = rdna4hs_load(&_realp); if (rp) CFRelease((CFTypeRef)rp);
+}
+RDNA4_DNR(RDNA4ComputePipelineState)
+- (VkPipelineLayout)layout { return _pl; } - (VkDescriptorSetLayout)dsl { return _dsl; } - (const RDNA4PB *)pb { return _pb; } - (uint32_t)npb { return _npb; }
+- (uint64_t)rdna4ICBToken { return _icbToken; }
+- (BOOL)rdna4ICBAllowFallback { return _icbAllowFallback; }
+- (VkPipelineLayout)icbLayout { return _icbPl; }
+- (VkDescriptorSetLayout)icbDsl { return _icbDsl; }
+- (const RDNA4PB *)icbPb { return _icbPb; }
+- (uint32_t)icbNpb { return _icbNpb; }
+- (uint32_t)rdna4CopyCompiledLocals:(uint32_t (*)[3])outLocals maxCount:(uint32_t)maxCount {
+    if (!outLocals || !maxCount) return 0u;
+    [_lock lock];
+    uint32_t n = _nCompiledLocals < maxCount ? _nCompiledLocals : maxCount;
+    for (uint32_t i = 0; i < n; i++) {
+        outLocals[i][0] = _compiledLocals[i][0];
+        outLocals[i][1] = _compiledLocals[i][1];
+        outLocals[i][2] = _compiledLocals[i][2];
+    }
+    [_lock unlock];
+    return n;
+}
+- (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }
+- (const rdna4_argument_scan_reflection_plan *)scanPlan { return &_scan; }
+- (const uint32_t *)nominalLocal { return _local; } - (int)mode { return _mode; } - (uint32_t)pcOffset { return _pcOff; } - (uint32_t)pcSize { return _pcSize; }
+- (id)reflection { return _reflection; }
+- (void)rdna4SetReflection:(MTLComputePipelineReflection *)reflection { _reflection = reflection; }
+- (id)device { return _dev; }
+- (NSString *)label { return _lbl; }
+- (void)setLabel:(NSString *)l { _lbl = [l copy]; }
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return rdna4_device_caps().invocations; }
+- (NSUInteger)threadExecutionWidth {
+    rdna4dc_caps caps = rdna4_device_caps();
+    return rdna4dc_thread_execution_width(&caps);
+}
+- (NSUInteger)staticThreadgroupMemoryLength { return 0; }
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { (void)d; return 0; }
+- (BOOL)supportIndirectCommandBuffers { return _icb; }
+- (const rdna4rtr_as_reflection_t *)rdna4RtAsRefl { return &_rt.as; }
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real functionHandleWithFunction:function];
+    if (function && [function respondsToSelector:@selector(functionType)] &&
+        [function functionType] == MTLFunctionTypeIntersection)
+        return rdna4_rt_pipeline_function_handle(self, _dev, _iftOwnerToken, &_rt.ift, function, 0);
+    return rdna4_vft_pipeline_handle(self, _dev, _vftOwnerToken, &_vft, function, 0);
+}
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real newVisibleFunctionTableWithDescriptor:descriptor];
+    return rdna4_vft_pipeline_new_table(self, _dev, _vftOwnerToken, &_vft, descriptor, 0);
+}
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor {
+    RDNA4ComputePipelineState *real = [self rdna4Real];
+    if (real) return [real newIntersectionFunctionTableWithDescriptor:descriptor];
+    return rdna4_rt_pipeline_new_ift(self, _dev, _iftOwnerToken, &_rt.ift, descriptor, 0);
+}
+- (uint64_t)uniqueIdentifier { return rdna4_resource_uid(&_uid); }
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130000
+- (MTLResourceID)gpuResourceID API_AVAILABLE(macos(13.0)) {
+    MTLResourceID identifier;
+    identifier._impl = _icbToken ? _icbToken : self.uniqueIdentifier;
+    return identifier;
+}
+#endif
+@end
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+GARNET_INTERNAL id rdna4_ba_compile_compute_state(id dev, id fn, NSData *spv, NSDictionary *meta, NSString *fname, NSError **err) {
+    return [[RDNA4ComputePipelineState alloc] initWithDevice:dev function:fn spv:spv meta:meta fname:fname error:err];
+}
+#endif
+
+// ---------------------------------------------------------------------------------------------------------------
+// Bound-resource state shared by the render and compute encoders, descriptor-set filling, dummy resources (11e).
+// ---------------------------------------------------------------------------------------------------------------
+
+GARNET_INTERNAL VkSampler rdna4_sampler_object_handle(id object, BOOL comparison,
+                                             BOOL normalized, NSError **err) {
+    if ([object isKindOfClass:[RDNA4SamplerBinding class]])
+        return [(RDNA4SamplerBinding *)object rdna4SamplerComparison:comparison
+            normalizedCoordinates:normalized error:err];
+    if ([object isKindOfClass:[RDNA4SamplerState class]])
+        return normalized
+            ? [(RDNA4SamplerState *)object rdna4SamplerComparison:comparison
+                normalizedCoordinates:YES error:err]
+            : [(RDNA4SamplerState *)object rdna4SamplerComparison:comparison error:err];
+    if (object && err) *err = rdna4_err(71, @"bound sampler has an invalid class");
+    return VK_NULL_HANDLE;
+}
+
+GARNET_INTERNAL BOOL rdna4_sampler_object_pixel(id object) {
+    if ([object isKindOfClass:[RDNA4SamplerBinding class]])
+        return [(RDNA4SamplerBinding *)object rdna4PixelCoordinates];
+    if ([object isKindOfClass:[RDNA4SamplerState class]])
+        return [(RDNA4SamplerState *)object rdna4PixelCoordinates];
+    return NO;
+}
+
+
+
+GARNET_INTERNAL void rdna4_argument_scan_prepared_destroy(RDNA4ArgumentScanPrepared *prepared) {
+    if (!prepared) return;
+    for (size_t i = 0; i < prepared->count; ++i)
+        free(prepared->stages[i].works);
+    memset(prepared, 0, sizeof(*prepared));
+}
+
+GARNET_INTERNAL uint8_t rdna4_argument_scan_storage(MTLStorageMode mode) {
+    switch (mode) {
+    case MTLStorageModeShared: return RDNA4_AS_STORAGE_SHARED;
+    case MTLStorageModeManaged: return RDNA4_AS_STORAGE_MANAGED;
+    case MTLStorageModePrivate: return RDNA4_AS_STORAGE_PRIVATE;
+    case MTLStorageModeMemoryless: return RDNA4_AS_STORAGE_MEMORYLESS;
+    default: return RDNA4_AS_STORAGE_UNKNOWN;
+    }
+}
+
+GARNET_INTERNAL BOOL rdna4_argument_scan_writable(NSSet *writable, RDNA4Buffer *buffer) {
+    if (!writable || !buffer) return NO;
+    if ([writable containsObject:buffer]) return YES;
+    id heap = buffer.heap;
+    return heap && [writable containsObject:heap];
+}
+
+static void rdna4_argument_scan_bounds(rdna4_as_bound bounds[RDNA4_AS_ROOTS],
+                                       const RDNA4StageState *state,
+                                       NSSet *writable, id device) {
+    memset(bounds, 0, RDNA4_AS_ROOTS * sizeof(*bounds));
+    for (uint32_t root = 0; root < RDNA4_AS_ROOTS; ++root) {
+        RDNA4Buffer *buffer = state->buf[root].b;
+        if (!buffer) continue;
+        rdna4_as_bound *bound = &bounds[root];
+        bound->present = true;
+        bound->length = (uint64_t)buffer.length;
+        bound->binding_offset = (uint64_t)state->buf[root].off;
+        bound->writable = rdna4_argument_scan_writable(writable, buffer);
+        bound->storage = rdna4_argument_scan_storage(buffer.storageMode);
+        bound->mapped = buffer.contents != NULL && buffer.device == device &&
+            ![buffer isAliasable];
+        if ([buffer isAliasable]) {
+            bound->mapped = false;
+            bound->storage = RDNA4_AS_STORAGE_UNKNOWN;
+        }
+    }
+}
+
+static BOOL rdna4_argument_scan_prepare_stage(RDNA4ArgumentScanStage *prepared,
+                                              const RDNA4StageState *state,
+                                              NSSet *writable, id device,
+                                              NSString **why) {
+    if (!prepared || !state || !state->scanPlan ||
+        !state->scanPlan->plan.count) return YES;
+    size_t capacity = 0;
+    rdna4_as_status status = rdna4_as_work_capacity(&state->scanPlan->plan, 0,
+                                                     &capacity);
+    if (status != RDNA4_AS_OK || !capacity) {
+        if (why) *why = [NSString stringWithFormat:
+            @"argument scan work capacity: %s",
+            rdna4_argument_scan_status_name(status)];
+        return NO;
+    }
+    if (capacity > SIZE_MAX / sizeof(rdna4_as_work)) {
+        if (why) *why = @"argument scan work capacity overflows host size";
+        return NO;
+    }
+    rdna4_as_work *works = calloc(capacity, sizeof *works);
+    if (!works) {
+        if (why) *why = @"argument scan work allocation failed";
+        return NO;
+    }
+    rdna4_as_bound bounds[RDNA4_AS_ROOTS];
+    rdna4_argument_scan_bounds(bounds, state, writable, device);
+    rdna4_as_work_stats stats;
+    size_t count = 0;
+    status = rdna4_argument_scan_reflection_plan_materialize(
+        state->scanPlan, bounds, NULL, 0, works, capacity, &count, &stats);
+    if (status != RDNA4_AS_OK) {
+        free(works);
+        if (why) *why = [NSString stringWithFormat:
+            @"argument scan materialization: %s",
+            rdna4_argument_scan_status_name(status)];
+        return NO;
+    }
+    prepared->state = state;
+    if (!count) {
+        free(works);
+        return YES;
+    }
+    prepared->works = works;
+    prepared->count = count;
+    prepared->stats = stats;
+    RDNA4LOGR("argscan work: %llu work, %llu CPU/%llu GPU/%llu opaque, %llu element, %llu touched B over %llu B, fallback %llu, unknown %llu, missing-root %llu, invalid-span %llu, capacity %llu%s",
+        (unsigned long long)stats.works,
+        (unsigned long long)stats.cpu_works,
+        (unsigned long long)stats.gpu_works,
+        (unsigned long long)stats.opaque_works,
+        (unsigned long long)stats.elements,
+        (unsigned long long)stats.touched_bytes,
+        (unsigned long long)stats.extent_bytes,
+        (unsigned long long)stats.fallback_works,
+        (unsigned long long)stats.unknown_works,
+        (unsigned long long)stats.missing_roots,
+        (unsigned long long)stats.invalid_spans,
+        (unsigned long long)stats.capacity_rejections,
+        stats.saturated ? " (saturated)" : "");
+    return YES;
+}
+
+GARNET_INTERNAL BOOL rdna4_argument_scan_prepare(RDNA4ArgumentScanPrepared *out,
+                                        const RDNA4StageState *const stages[],
+                                        size_t stageCount, NSSet *writable,
+                                        id device, NSString **why) {
+    if (!out || (!stages && stageCount) || stageCount > 2) return NO;
+    memset(out, 0, sizeof(*out));
+    for (size_t i = 0; i < stageCount; ++i) {
+        RDNA4ArgumentScanStage stage = {0};
+        if (!rdna4_argument_scan_prepare_stage(&stage, stages[i], writable,
+                                               device, why)) {
+            rdna4_argument_scan_prepared_destroy(out);
+            return NO;
+        }
+        if (stage.state) out->stages[out->count++] = stage;
+    }
+    return YES;
+}
+
+
+
+static BOOL rdna4_embedded_token(const RDNA4PB *p, uint32_t element, const RDNA4StageState *st, id device, uint64_t *token) {
+    *token = 0;
+    if (!p->embedded || element >= p->count || p->embeddedBuffer >= 31) return NO;
+    RDNA4BufSlot slot = st->buf[p->embeddedBuffer];
+    RDNA4Buffer *buffer = slot.b;
+    if (!buffer || buffer.device != device || ![buffer contents] || slot.off > buffer.length || p->embeddedOffset > NSUIntegerMax - slot.off) return NO;
+    NSUInteger start = slot.off + p->embeddedOffset;
+    if ((start & (sizeof(uint64_t) - 1)) != 0 || element > (NSUIntegerMax - start) / sizeof(uint64_t)) return NO;
+    NSUInteger at = start + (NSUInteger)element * sizeof(uint64_t);
+    if (at > buffer.length || sizeof(uint64_t) > buffer.length - at) return NO;
+    memcpy(token, (const uint8_t *)[buffer contents] + at, sizeof *token);
+    return YES;
+}
+
+GARNET_INTERNAL id rdna4_embedded_resource(const RDNA4PB *p, uint32_t element, const RDNA4StageState *st, BOOL texture, id device) {
+    uint64_t token = 0;
+    if (!rdna4_embedded_token(p, element, st, device, &token) || !token) return nil;
+    return rdna4_argument_resource_for_token(token, texture, device);
+}
+
+GARNET_INTERNAL BOOL rdna4nc_drop_write(id resource, RDNA4NCOp op, const char *operation, const char *encoder) {
+    if (![resource rdna4HostReadOnly]) return NO;
+    static _Atomic uint64_t dropped[RDNA4NC_OP_COUNT];
+    uint64_t n = atomic_fetch_add(&dropped[op], 1);
+    if (n < 8 || (n & 1023u) == 0) {
+        NSString *label = [resource label];
+        RDNA4LOG("-[MTLDebug%s ] validation: %s writes read-only no-copy buffer %p (%s) — command dropped",
+                 encoder, operation, (__bridge void *)resource, label ? label.UTF8String : "unlabeled");
+    }
+    return YES;
+}
+
+// Use existing optional Metal argument reflection. Descriptor types alone do not prove write access.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+GARNET_INTERNAL NSArray *rdna4nc_stage_arguments(id reflection, RDNA4NCOp stage) {
+    if (stage == RDNA4NC_COMPUTE) return [(MTLComputePipelineReflection *)reflection arguments];
+    if (stage == RDNA4NC_VERTEX) return [(MTLRenderPipelineReflection *)reflection vertexArguments];
+    return [(MTLRenderPipelineReflection *)reflection fragmentArguments];
+}
+GARNET_INTERNAL BOOL rdna4nc_stage_writes(const RDNA4StageState *state, NSArray *arguments, RDNA4NCOp op,
+                                 const char *stage, uint32_t *warned) {
+    BOOL drop = NO;
+    for (unsigned i = 0; i < 31; i++) {
+        RDNA4Buffer *buffer = state->buf[i].b;
+        if (![buffer rdna4HostReadOnly]) continue;
+        BOOL known = NO;
+        for (MTLArgument *argument in arguments) {
+            if (argument.type != MTLArgumentTypeBuffer || argument.index != i) continue;
+            known = YES;
+            if (argument.access == MTLArgumentAccessWriteOnly || argument.access == MTLArgumentAccessReadWrite)
+                drop |= rdna4nc_drop_write(buffer, op, stage, op == RDNA4NC_COMPUTE ? "ComputeCommandEncoder" : "RenderCommandEncoder");
+            break;
+        }
+        if (!known && !(*warned & (1u << i))) {
+            *warned |= 1u << i;
+            RDNA4LOG("%s: cannot tell if binding %u writes a read-only buffer %p", stage, i, (__bridge void *)buffer);
+        }
+    }
+    return drop;
+}
+
+GARNET_INTERNAL void rdna4_argument_stage_resources(NSMutableSet *resources, NSMutableSet *writable,
+        const RDNA4PB *bindings, uint32_t count, const RDNA4StageState *state, NSArray *arguments) {
+    uint32_t known = 0;
+    for (MTLArgument *argument in arguments) {
+        if (argument.type != MTLArgumentTypeBuffer || !argument.active || argument.index >= 31) continue;
+        uint32_t index = (uint32_t)argument.index;
+        known |= 1u << index;
+        RDNA4Buffer *buffer = state->buf[index].b;
+        if (!buffer) continue;
+        [resources addObject:buffer];
+        if (argument.access != MTLArgumentAccessReadOnly) [writable addObject:buffer];
+    }
+    for (uint32_t n = 0; n < count; ++n) {
+        const RDNA4PB *binding = &bindings[n];
+        uint32_t textureBase = binding->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 32 : 480;
+        if (!binding->embedded && (binding->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || binding->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) &&
+            binding->binding >= textureBase && binding->binding < textureBase + 128) {
+            uint32_t first = binding->binding - textureBase;
+            for (uint32_t k = 0; k < binding->count && k < 128 - first; ++k)
+                if (state->tex[first + k]) [resources addObject:state->tex[first + k]];
+        }
+        if (binding->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) continue;
+        uint32_t first = binding->argumentRoot ? binding->embeddedBuffer : binding->binding;
+        for (uint32_t k = 0; first < 31 && k < binding->count && k < 31 - first; ++k) {
+            uint32_t index = first + k;
+            RDNA4Buffer *buffer = state->buf[index].b;
+            if (!buffer) continue;
+            [resources addObject:buffer];
+            if (!(known & (1u << index))) [writable addObject:buffer];
+        }
+    }
+}
+
+#pragma clang diagnostic pop
+
+// Fallbacks for slots a shader reads but the client never bound. Metal reads zeros / a black texel there; a garbage descriptor could
+// fault the GPU, so a zero-filled buffer, a 1x1 texel and a default sampler stand in (each use is logged as a WARN).
+GARNET_INTERNAL RDNA4Buffer *rdna4_dummy_buffer(id dev) {
+    static RDNA4Buffer *b;
+    @synchronized ([GarnetDevice class]) {
+        if (!b) { NSError *e = nil; b = [[RDNA4Buffer alloc] initWithDevice:dev length:65536 options:MTLResourceStorageModeShared error:&e];
+                  if (b) memset([b contents], 0, 65536); else RDNA4LOG("dummy buffer failed: %s", e.localizedDescription.UTF8String); }
+    }
+    return b;
+}
+GARNET_INTERNAL RDNA4Texture *rdna4_dummy_texture(id dev) {
+    static RDNA4Texture *t;
+    static id owner;
+    @synchronized ([GarnetDevice class]) {
+        if (!t || owner != dev) {
+            owner = dev;
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+            NSError *e = nil; t = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
+            if (t) { uint32_t z = 0; [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&z bytesPerRow:4]; }
+            else RDNA4LOG("dummy texture failed: %s", e.localizedDescription.UTF8String);
+        }
+    }
+    return t;
+}
+static const RDNA4Fmt *rdna4_dummy_storage_format(void) {
+    static const MTLPixelFormat formats[] = {
+        MTLPixelFormatR32Uint, MTLPixelFormatR32Sint, MTLPixelFormatR32Float, MTLPixelFormatRGBA8Unorm
+    };
+    for (size_t i = 0; i < sizeof formats / sizeof *formats; ++i) {
+        const RDNA4Fmt *f = rdna4_fmt(formats[i]);
+        if (f && (rdna4_fmt_feats(f) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return f;
+    }
+    return NULL;
+}
+GARNET_INTERNAL RDNA4Texture *rdna4_dummy_texture_write(id dev) {
+    static RDNA4Texture *t;
+    static id owner;
+    @synchronized ([GarnetDevice class]) {
+        if (!t || owner != dev) {
+            owner = dev;
+            const RDNA4Fmt *f = rdna4_dummy_storage_format();
+            if (!f) {
+                RDNA4LOG("dummy shader-write texture unavailable: no storage-image format is supported");
+                t = nil;
+                return t;
+            }
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->mtl width:1 height:1 mipmapped:NO];
+            td.usage = MTLTextureUsageShaderWrite; td.storageMode = MTLStorageModePrivate;
+            NSError *e = nil; t = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
+            if (!t) RDNA4LOG("dummy shader-write texture failed: %s", e.localizedDescription.UTF8String);
+        }
+    }
+    return t;
+}
+
+typedef struct {
+    MTLTextureType textureType;
+    MTLPixelFormat pixelFormat;
+    MTLTextureUsage usage;
+    MTLStorageMode storageMode;
+    NSUInteger sampleCount;
+    BOOL depth;
+    BOOL storage;
+} RDNA4DummyImagePlan;
+
+// The 48 ABI-5 shape descriptors describe float/uint/int, dimension/array, and depth.
+// Sample count is a separate axis because the ABI-5 shape word has no MS bit.
+static BOOL rdna4_dummy_image_plan_make(uint32_t shape, BOOL storage, uint32_t samples,
+                                        RDNA4DummyImagePlan *p, const char **why) {
+    if (!p) return NO;
+    memset(p, 0, sizeof *p);
+    if (why) *why = NULL;
+    BOOL depth = NO;
+    if (!rdna4_argument_shape(shape, NULL, &depth)) {
+        if (why) *why = "not a legal ABI-5 image shape";
+        return NO;
+    }
+    if (!samples) samples = 1;
+    if (samples != 1 && samples != 2 && samples != 4 && samples != 8) {
+        if (why) *why = "sample count must be 1, 2, 4, or 8";
+        return NO;
+    }
+    uint32_t component = shape / 16, dim = (shape & 7u) >> 1, arrayed = shape & 1u;
+    if (depth && dim != 1 && dim != 3) {
+        if (why) *why = "depth formats are 2D or cube, including arrays";
+        return NO;
+    }
+    if (storage && depth) {
+        if (why) *why = "depth images cannot be storage images";
+        return NO;
+    }
+    if (samples > 1 && dim != 1) {
+        if (why) *why = "multisample dummies are 2D, including arrays";
+        return NO;
+    }
+    if (storage && samples > 1) {
+        if (why) *why = "storage images cannot be multisampled";
+        return NO;
+    }
+    MTLTextureType type = samples > 1 ? (arrayed ? (MTLTextureType)RDNA4TD_MTL_2DMSARRAY : MTLTextureType2DMultisample) :
+        dim == 0 ? (arrayed ? MTLTextureType1DArray : MTLTextureType1D) :
+        dim == 1 ? (arrayed ? MTLTextureType2DArray : MTLTextureType2D) :
+        dim == 2 ? MTLTextureType3D : (arrayed ? MTLTextureTypeCubeArray : MTLTextureTypeCube);
+    MTLPixelFormat pixelFormat = depth ? MTLPixelFormatDepth32Float :
+        component == 1 ? MTLPixelFormatR32Uint : component == 2 ? MTLPixelFormatR32Sint : MTLPixelFormatR32Float;
+    if (storage) {
+        const RDNA4Fmt *f = rdna4_fmt(pixelFormat);
+        if (!f || !(rdna4_fmt_feats(f) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            if (why) *why = "the selected format has no storage-image feature";
+            return NO;
+        }
+    }
+    p->textureType = type;
+    p->pixelFormat = pixelFormat;
+    p->usage = storage ? MTLTextureUsageShaderWrite : MTLTextureUsageShaderRead;
+    p->storageMode = (depth || storage || samples > 1) ? MTLStorageModePrivate : MTLStorageModeShared;
+    p->sampleCount = samples;
+    p->depth = depth;
+    p->storage = storage;
+    return YES;
+}
+
+static void rdna4_dummy_zero_texture(RDNA4Texture *t) {
+    if (!t || [t storageMode] != MTLStorageModeShared) return;
+    uint32_t z = 0;
+    MTLTextureType type = [t textureType];
+    if (type == MTLTextureType1D)
+        [t replaceRegion:MTLRegionMake1D(0, 1) mipmapLevel:0 withBytes:&z bytesPerRow:4];
+    else if (type == MTLTextureType3D)
+        [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&z bytesPerRow:4 bytesPerImage:4];
+    else if (type == MTLTextureType1DArray || type == MTLTextureType2DArray ||
+             type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) {
+        MTLRegion region = type == MTLTextureType1DArray ? MTLRegionMake1D(0, 1) : MTLRegionMake2D(0, 0, 1, 1);
+        for (uint32_t slice = 0; slice < [t rdna4Layers]; ++slice)
+            [t replaceRegion:region mipmapLevel:0 slice:slice withBytes:&z bytesPerRow:4 bytesPerImage:4];
+    }
+    else
+        [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&z bytesPerRow:4];
+}
+
+typedef struct {
+    RDNA4Texture *texture;
+    uintptr_t owner;
+} RDNA4DummyImageSlot;
+
+#define RDNA4_DUMMY_SAMPLE_VARIANTS 4u
+static RDNA4DummyImageSlot rdna4_dummy_null_read[RDNA4_ARGUMENT_NULL_IMAGES][RDNA4_DUMMY_SAMPLE_VARIANTS];
+static RDNA4DummyImageSlot rdna4_dummy_null_write[RDNA4_ARGUMENT_NULL_IMAGES];
+
+// Shape-specific read and write caches are separate. A null store therefore
+// cannot overwrite a shared read dummy. Each cache is a fixed ABI-sized array.
+// The shaped descriptor must use [texture vkView]; rdna4AttViewLevel:0 is a
+// single-layer view for array storage and does not preserve the array shape.
+static RDNA4Texture *rdna4_dummy_null_image_legacy(id dev, uint32_t shape, BOOL writable, uint32_t samples) {
+    if (!dev || shape >= RDNA4_ARGUMENT_NULL_IMAGES) return nil;
+    if (!samples) samples = 1;
+    if (writable && samples != 1) return nil;
+    unsigned sampleSlot = samples == 1 ? 0 : samples == 2 ? 1 : samples == 4 ? 2 : samples == 8 ? 3 : UINT32_MAX;
+    if (sampleSlot == UINT32_MAX) return nil;
+    RDNA4DummyImagePlan plan;
+    const char *why = NULL;
+    if (!rdna4_dummy_image_plan_make(shape, writable, samples, &plan, &why)) {
+        RDNA4LOG("dummy %s texture shape %u samples %u rejected: %s", writable ? "storage" : "sampled",
+                 shape, samples, why ?: "invalid descriptor");
+        return nil;
+    }
+    RDNA4DummyImageSlot *slot = writable ? &rdna4_dummy_null_write[shape] : &rdna4_dummy_null_read[shape][sampleSlot];
+    uintptr_t owner = (uintptr_t)(__bridge void *)dev;
+    @synchronized ([GarnetDevice class]) {
+        if (slot->owner != owner) { slot->owner = owner; slot->texture = nil; }
+        if (slot->texture) return slot->texture;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+        td.textureType = plan.textureType;
+        td.pixelFormat = plan.pixelFormat;
+        td.width = 1; td.height = 1; td.depth = 1; td.arrayLength = 1;
+        td.mipmapLevelCount = 1; td.sampleCount = plan.sampleCount;
+        td.usage = plan.usage; td.storageMode = plan.storageMode;
+        NSError *e = nil;
+        slot->texture = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
+        if (!slot->texture) {
+            RDNA4LOG("dummy %s texture shape %u samples %u failed: %s", writable ? "storage" : "sampled",
+                     shape, samples, e.localizedDescription.UTF8String);
+        } else if (!plan.storage && !plan.depth && plan.sampleCount == 1) {
+            rdna4_dummy_zero_texture(slot->texture);
+        }
+    }
+    return slot->texture;
+}
+
+// Legacy entry point: all 48 ABI-5 values retain their previous acceptance or
+// rejection, and every legal single-sample shape follows the old read-only path.
+GARNET_INTERNAL RDNA4Texture *rdna4_dummy_null_texture(id dev, uint32_t shape) {
+    return rdna4_dummy_null_image_legacy(dev, shape, NO, 1);
+}
+
+GARNET_INTERNAL RDNA4Texture *rdna4_dummy_null_image(id dev, const rdna4ns_shape *shape) {
+    uint32_t legacy = 0;
+    if (rdna4ns_shape_image_legacy(shape, &legacy) != RDNA4NS_OK) return nil;
+    if (!shape->multisampled)
+        return rdna4_dummy_null_image_legacy(dev, legacy,
+            shape->access == RDNA4NS_ACCESS_STORAGE, 1);
+    VkSampleCountFlags counts = shape->depth
+        ? RDNA4R.lim.sampledImageDepthSampleCounts
+        : shape->component == RDNA4NS_COMP_FLOAT
+            ? RDNA4R.lim.sampledImageColorSampleCounts
+            : RDNA4R.lim.sampledImageIntegerSampleCounts;
+    for (uint32_t samples = 2; samples <= 8; samples *= 2) {
+        if (!(counts & samples)) continue;
+        RDNA4Texture *texture = rdna4_dummy_null_image_legacy(dev, legacy, NO, samples);
+        if (texture) return texture;
+    }
+    return nil;
+}
+
+// Texel dummies use real VkBufferView descriptors, never image views.
+typedef struct {
+    VkBufferCreateInfo buffer;
+    VkBufferViewCreateInfo view;
+    VkDeviceSize offset;
+    VkDeviceSize range;
+} RDNA4DummyTexelPlan;
+
+static inline uint32_t rdna4_dummy_texel_bytes(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT: return 4;
+    default: return 0;
+    }
+}
+
+static inline BOOL rdna4_dummy_texel_plan(BOOL storage, VkFormat format,
+                                          VkFormatFeatureFlags bufferFeatures, BOOL featureEnabled,
+                                          VkDeviceSize offset, VkDeviceSize range,
+                                          VkDeviceSize offsetAlignment, uint64_t maxElements,
+                                          RDNA4DummyTexelPlan *plan, const char **why) {
+    if (why) *why = NULL;
+    uint32_t texel = rdna4_dummy_texel_bytes(format);
+    if (!texel || !plan) {
+        if (why) *why = "texel dummies support R32 UINT/SINT/SFLOAT";
+        return NO;
+    }
+    if (!featureEnabled) {
+        if (why) *why = storage ? "storageTexelBuffer is not enabled" : "uniformTexelBuffer is not enabled";
+        return NO;
+    }
+    VkFormatFeatureFlagBits required = storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT
+                                               : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+    if (!(bufferFeatures & required)) {
+        if (why) *why = storage ? "format lacks VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT"
+                                : "format lacks VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT";
+        return NO;
+    }
+    if (!offsetAlignment || (offsetAlignment & (offsetAlignment - 1))) {
+        if (why) *why = "minTexelBufferOffsetAlignment is not a power of two";
+        return NO;
+    }
+    if (offset % offsetAlignment) {
+        if (why) *why = "buffer view offset violates minTexelBufferOffsetAlignment";
+        return NO;
+    }
+    if (!maxElements) {
+        if (why) *why = "maxTexelBufferElements is zero";
+        return NO;
+    }
+    if (range == VK_WHOLE_SIZE) range = texel;
+    if (!range || (range % texel)) {
+        if (why) *why = "texel buffer view range must be a nonzero whole number of texels";
+        return NO;
+    }
+    if (range / texel > maxElements) {
+        if (why) *why = "texel buffer view exceeds maxTexelBufferElements";
+        return NO;
+    }
+    if (offset > UINT64_MAX - range) {
+        if (why) *why = "texel buffer size overflows VkDeviceSize";
+        return NO;
+    }
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        (storage ? VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT : VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT);
+    *plan = (RDNA4DummyTexelPlan){
+        .buffer = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = offset + range, .usage = usage },
+        .view = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+                  .buffer = VK_NULL_HANDLE, .format = format, .offset = offset, .range = range },
+        .offset = offset, .range = range
+    };
+    return YES;
+}
+
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkBufferView view;
+} RDNA4DummyTexelSlot;
+
+// One device owns RADV for the process; bounded caches have process lifetime,
+// like the image dummies. Failed construction never publishes a partial slot.
+static RDNA4DummyTexelSlot rdna4_dummy_texels[2][RDNA4NS_TEXEL_SHAPES];
+
+GARNET_INTERNAL VkBufferView rdna4_dummy_null_texel(id dev, const rdna4ns_shape *shape,
+                                          const char **why) {
+    if (why) *why = NULL;
+    if (!dev || !shape || !rdna4ns_shape_valid(shape) ||
+        !rdna4ns_access_is_texel(shape->access)) {
+        if (why) *why = "invalid null texel shape";
+        return VK_NULL_HANDLE;
+    }
+    BOOL storage = shape->access == RDNA4NS_ACCESS_STORAGE_TEXEL;
+    const VkFormat formats[] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
+    RDNA4DummyTexelSlot *slot = &rdna4_dummy_texels[storage][shape->component];
+    @synchronized ([GarnetDevice class]) {
+        if (slot->view) return slot->view;
+        VkFormatProperties properties = {0};
+        vkGetPhysicalDeviceFormatProperties(RDNA4R.pd, formats[shape->component], &properties);
+        RDNA4DummyTexelPlan plan;
+        if (!rdna4_dummy_texel_plan(storage, formats[shape->component], properties.bufferFeatures,
+                storage ? RDNA4R.storageTexelBuffers : RDNA4R.uniformTexelBuffers,
+                0, 4, RDNA4R.lim.minTexelBufferOffsetAlignment,
+                RDNA4R.lim.maxTexelBufferElements, &plan, why)) return VK_NULL_HANDLE;
+        RDNA4DummyTexelSlot built = {0};
+        VkResult result = vkCreateBuffer(RDNA4R.dev, &plan.buffer, NULL, &built.buffer);
+        if (result == VK_SUCCESS) {
+            VkMemoryRequirements requirements = {0};
+            vkGetBufferMemoryRequirements(RDNA4R.dev, built.buffer, &requirements);
+            uint32_t memoryType = UINT32_MAX;
+            VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t i = 0; i < RDNA4R.mp.memoryTypeCount; ++i)
+                if ((requirements.memoryTypeBits & (1u << i)) &&
+                    (RDNA4R.mp.memoryTypes[i].propertyFlags & flags) == flags) {
+                    memoryType = i;
+                    break;
+                }
+            if (memoryType == UINT32_MAX) result = VK_ERROR_FEATURE_NOT_PRESENT;
+            else {
+                VkMemoryAllocateInfo info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    .allocationSize = requirements.size, .memoryTypeIndex = memoryType};
+                result = vkAllocateMemory(RDNA4R.dev, &info, NULL, &built.memory);
+            }
+        }
+        if (result == VK_SUCCESS)
+            result = vkBindBufferMemory(RDNA4R.dev, built.buffer, built.memory, 0);
+        if (result == VK_SUCCESS) {
+            void *bytes = NULL;
+            result = vkMapMemory(RDNA4R.dev, built.memory, 0, VK_WHOLE_SIZE, 0, &bytes);
+            if (result == VK_SUCCESS) {
+                memset(bytes, 0, 4);
+                vkUnmapMemory(RDNA4R.dev, built.memory);
+            }
+        }
+        if (result == VK_SUCCESS) {
+            plan.view.buffer = built.buffer;
+            result = vkCreateBufferView(RDNA4R.dev, &plan.view, NULL, &built.view);
+        }
+        if (result != VK_SUCCESS) {
+            if (built.buffer) vkDestroyBuffer(RDNA4R.dev, built.buffer, NULL);
+            if (built.memory) vkFreeMemory(RDNA4R.dev, built.memory, NULL);
+            if (why) *why = "null texel buffer allocation, zeroing or view creation failed";
+            return VK_NULL_HANDLE;
+        }
+        *slot = built;
+        return slot->view;
+    }
+}
+
+GARNET_INTERNAL RDNA4SamplerState *rdna4_dummy_sampler(id dev) {
+    static RDNA4SamplerState *s;
+    @synchronized ([GarnetDevice class]) {
+        if (!s) { NSError *e = nil; s = [[RDNA4SamplerState alloc] initWithDevice:dev descriptor:[MTLSamplerDescriptor new] error:&e];
+                  if (!s) RDNA4LOG("dummy sampler failed: %s", e.localizedDescription.UTF8String); }
+    }
+    return s;
+}
+
+// Visits every image a stage's bindings will read or write, with the layout the descriptor needs (SHADER_READ_ONLY for sampled images,
+// GENERAL for storage images), so the encoder can transition them BEFORE the draw/dispatch (never inside a render pass).
+GARNET_INTERNAL void rdna4_each_tex(const RDNA4PB *pb, uint32_t n, const RDNA4StageState *st, id dev, void (^fn)(RDNA4Texture *t, VkImageLayout l, BOOL writable)) {
+    for (uint32_t i = 0; i < n; i++) {
+        if ((pb[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || pb[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) && pb[i].binding >= 32 && pb[i].binding < 160) {
+            for (uint32_t k = 0; k < pb[i].count; k++) { uint32_t ix = pb[i].binding - 32 + k;
+                RDNA4Texture *t = pb[i].embedded ? (RDNA4Texture *)rdna4_embedded_resource(&pb[i], k, st, YES, dev) : (ix < 128 ? st->tex[ix] : nil);
+                if (!t && !pb[i].embedded) t = rdna4_dummy_texture(dev); if (t) fn(t, pb[i].gpuArguments ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, NO); }
+        } else if ((pb[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || pb[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) && pb[i].binding >= 480 && pb[i].binding < 608) {
+            for (uint32_t k = 0; k < pb[i].count; k++) {
+                uint32_t ix = pb[i].binding - 480 + k;
+                RDNA4Texture *t = pb[i].embedded ? (RDNA4Texture *)rdna4_embedded_resource(&pb[i], k, st, YES, dev) : (ix < 128 ? st->tex[ix] : nil);
+                if (t) fn(t, VK_IMAGE_LAYOUT_GENERAL, YES);
+            }
+        }
+    }
+}
+
+// KernelDispatchPlan::new (metal2vulkan src/reflect/mod.rs): a dispatchThreads grid becomes <= 8 rectangular regions (full groups + boundary tails).
+GARNET_INTERNAL int rdna4_plan(const uint32_t threads[3], const uint32_t nom[3], RDNA4Region *out) {
+    int n = 0;
+    for (int mask = 0; mask < 8; mask++) {
+        RDNA4Region r = { { nom[0], nom[1], nom[2] }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }; BOOL nonempty = YES;
+        for (int d = 0; d < 3; d++) {
+            uint32_t full = threads[d] / nom[d], tail = threads[d] % nom[d];
+            if (!(mask & (1 << d))) r.groups[d] = full;
+            else if (tail == 0) nonempty = NO;
+            else { r.local[d] = tail; r.groups[d] = 1; r.tbase[d] = full * nom[d]; r.gbase[d] = full; }
+            nonempty = nonempty && r.groups[d] != 0;
+        }
+        if (nonempty) out[n++] = r;
+    }
+    return n;
+}
+
+#ifndef RDNA4_ENCODER_BINDINGS_INC
+#define RDNA4_ENCODER_BINDINGS_INC
+
+
+GARNET_INTERNAL NSNumber *rdna4_resource_slot(uint32_t kind, BOOL fragment,
+                                     NSUInteger index) {
+    uint64_t value = ((uint64_t)kind << 56) |
+        ((uint64_t)(fragment ? 1u : 0u) << 48) | (uint64_t)index;
+    return @(value);
+}
+
+GARNET_INTERNAL BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
+                                              uint64_t current) {
+    if (!tracked || *tracked == current) return NO;
+    *tracked = current;
+    return YES;
+}
+
+/*
+ * Current encoder state is bounded by the descriptor bands. The dictionary
+ * owns only objects still bound to a slot; it is not a command-buffer history.
+ * Every draw/dispatch snapshots these objects into the current segment.
+ */
+
+@implementation RDNA4ResourceBindings
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    _objects = [NSMutableDictionary dictionary];
+    return self;
+}
+- (void)setObject:(id)object slot:(NSNumber *)slot {
+    if (!slot) return;
+    if (object) _objects[slot] = object;
+    else [_objects removeObjectForKey:slot];
+}
+- (void)clear {
+    [_objects removeAllObjects];
+}
+- (NSUInteger)count {
+    return _objects.count;
+}
+- (void)snapshotToCommandBuffer:(RDNA4CommandBuffer *)commandBuffer {
+    if (!commandBuffer) return;
+    @autoreleasepool {
+        for (id object in _objects.allValues)
+            [commandBuffer rdna4RetainEncoded:object];
+    }
+}
+@end
+
+#endif

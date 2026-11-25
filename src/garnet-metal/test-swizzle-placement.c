@@ -8,8 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RDNA4_SWIZZLE_PURE_ONLY
-#include "rdna4_command_support_impl.inc"
+#include "rdna4_swizzle.h"
 #include "rdna4_heap_backing.h"
 
 static int fails, checks;
