@@ -24,7 +24,7 @@ typedef void *VkDeviceMemory;
 typedef struct { uint64_t allocationSize; } VkMemoryAllocateInfo;
 typedef struct { uint32_t id; int retains; } test_surface;
 typedef test_surface *IOSurfaceRef;
-static struct { pthread_mutex_t mu; rdna4ic_cache c; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static struct { pthread_mutex_t mu; rdna4ic_cache c; rdna4li_cache li; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 static struct { void *dev; uint64_t impTotal; } RDNA4R;
 static test_surface competing;
 static VkDeviceMemory competing_mem;

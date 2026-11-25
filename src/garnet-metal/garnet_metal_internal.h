@@ -64,6 +64,9 @@
 #include "garnet_argument_capacity.h"
 #include "garnet_argument_epochs.h"
 #include "garnet_vkpool.h"
+#include "garnet_queue_pipe.h"
+#include "garnet_bar_policy.h"
+#include "garnet_vram_surf.h"
 #include "garnet_argument_summary.h"
 #include "garnet_plane.h"
 #include "garnet_pitch.h"
@@ -637,6 +640,7 @@ typedef struct {
     PFN_vkAllocateCommandBuffers realAllocCmd;
     PFN_vkFreeCommandBuffers realFreeCmd;
     PFN_vkResetCommandBuffer realResetCmd;
+    garnet_bar_policy_t barPolicy;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
 typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;
@@ -645,7 +649,7 @@ typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; B
 typedef struct { BOOL on; pthread_mutex_t mu; rdna4dc_rpcache *rp; _Atomic uint64_t draws, setsReused, setsAlloc, pipesSkipped, pipesBound, pcHits, rpHits, rpCreated, rpUncached; uint64_t lastSig; } RDNA4DrawOptState;
 typedef struct { pthread_mutex_t mu; rdna4l L; int ucMode, iaActs; _Atomic uint64_t iaFlush, iaReup, iaWsFlush, iaWsReup, f1Fallbacks, ucTake, ucRelease; uint64_t lastSig; } RDNA4LedgerState;
 typedef struct {
-    pthread_mutex_t mu; rdna4df_t sm; int bound;
+    pthread_mutex_t mu; pthread_cond_t holdCond; rdna4df_hold_adapt_t holdAdapt; rdna4df_t sm; int bound;
     rdna4_display_commit *commits;
     NSMutableIndexSet *incompleteSources;
     NSHashTable *incompleteImages;
@@ -776,6 +780,9 @@ typedef struct {
     BOOL _impShared, _iosNoBase;   // P4: _imem is a shared import-cache entry (give it back with rdna4_imp_put, never vkFreeMemory); _iosNoBase = a protected IOSurface with no CPU mapping: a GPU-only texture (no _imem/_ibuf/_ibase, rdna4IsIOS is NO)
     BOOL _disp;   // S5.2a: CoreDisplay display surface (D-copy source)
     BOOL _iosLinearSubmitted;
+    BOOL _iosLinearCached;   // Phase A4: _img is borrowed from RDNA4IC.li (release via rdna4_linimg_put, never vkDestroyImage)
+    BOOL _vramSurfCached;    // Phase B: _img/_ibuf are borrowed from RDNA4VS (320 GB/s OPTIMAL hi-pool VRAM)
+    uint64_t _vramSurfId;
     BOOL _led;   // build 16 (P5 Step 0): entered in the live-import ledger (removed in -dealloc)
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err;
@@ -811,6 +818,8 @@ typedef struct {
 - (BOOL)rdna4IOSLinear;
 - (BOOL)rdna4IOSLinearNeedsInit;
 - (void)rdna4IOSLinearDidSubmit;
+- (BOOL)rdna4VramSurfCached;
+- (uint64_t)rdna4VramSurfId;
 - (BOOL)rdna4HostReadOnly;
 - (VkBuffer)rdna4IOSBuffer;
 - (size_t)rdna4IOSBytesPerRow;
@@ -1234,7 +1243,7 @@ typedef struct {
 
 @interface RDNA4CommandSegment : NSObject {
 @public
-    VkCommandBuffer vk, linearInit;
+    VkCommandBuffer vk, linearInit, dispCopyVk;
     VkFence fence;
     NSMutableArray *waits;
     NSMutableArray *signals;
@@ -1266,6 +1275,8 @@ typedef struct {
     NSMutableArray *_residencySets;
     pthread_mutex_t _qmu;
     garnet_vkpool_t _cmdPool;
+    garnet_qp_t _qp;
+    NSUInteger _launchedCount;
     _Atomic uint32_t _residencySetCount;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
@@ -1276,6 +1287,10 @@ typedef struct {
 - (dispatch_queue_t)rdna4CompletionQueue;
 - (void)rdna4Kick;
 - (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb;
+- (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb failed:(BOOL)failed;
+- (void)rdna4EnqueueOrderedCompletion:(RDNA4CommandBuffer *)cb failed:(BOOL)failed block:(void (^)(void))block;
+- (void)rdna4NoteElidedDCopy;
+- (BOOL)rdna4PendingHasNewerSid:(uint32_t)sid after:(RDNA4CommandBuffer *)cb;
 - (BOOL)rdna4AdvanceHead;
 - (void)addResidencySet:(id)residencySet;
 - (void)addResidencySets:(const id __unsafe_unretained *)residencySets count:(NSUInteger)count;
@@ -1312,9 +1327,13 @@ typedef struct {
     uint64_t _pser;   // P1: fence serial taken when this command buffer was created (0 = pool OFF); closed when its fence completed / it failed to submit / it was dropped unsubmitted
     struct rdna4ojob { rdna4occ *o; VkQueryPool qp; uint32_t base; } *_oj; uint32_t _noj, _coj; NSMutableArray *_ojb; NSMutableArray *_qpools; uint32_t _qpUsed; VkQueryPool _qpCur;   // build 18 (P2): per-pass occlusion jobs (+ their visibility buffers), the query pools of this command buffer, the chunk cursor of the newest one
     rdna4uc_list _uc; BOOL _ucLive; rdna4ia _ia;   // build 16: F3 the surfaces this command buffer use-counts while in flight (rdna4UCRelease gives them back, exactly once); P1 the per-range aliasing state
+    NSMutableArray<NSNumber *> *_vsActive;   // Phase B: active RDNA4VS entry IDs held by this CB until completion/dealloc
     RDNA4NativeJournal _native;
     NSMutableArray *_residencySnapshots;
     NSMutableSet *_residencyHeapResources;
+@public
+    BOOL _launchedAsBarrier, _fifoDoneFailed;
+    void (^_fifoDoneBlock)(void);
 }
 - (VkCommandBuffer)rdna4BlitVK;
 - (void)rdna4NativeRecord:(RDNA4NativeOp)op;
@@ -1328,6 +1347,8 @@ typedef struct {
 - (rdna4occ *)rdna4OccNew:(RDNA4Buffer *)vb accumulate:(int)acc pool:(VkQueryPool *)qp base:(uint32_t *)base;   // build 18 (P2)
 - (void)rdna4OccResolve;   // build 18 (P2): called from rdna4PoolDone
 - (void)rdna4PrepareForSubmission;
+- (BOOL)rdna4PipelineEligible;
+- (uint32_t)rdna4DisplayTargetSid;
 - (BOOL)rdna4AdvanceWithQueue:(RDNA4CommandQueue *)queue;
 - (BOOL)rdna4OpenSegment:(NSError **)err;
 - (BOOL)rdna4EndCurrentSegment:(NSError **)err;
@@ -3157,6 +3178,22 @@ GARNET_INTERNAL_EXTERN void rdna4_drawopt_report(unsigned tick);
 GARNET_INTERNAL_EXTERN void rdna4_imp_latch(void);
 GARNET_INTERNAL_EXTERN void rdna4_imp_tick(void);
 GARNET_INTERNAL_EXTERN void rdna4_imp_report(unsigned tick);
+GARNET_INTERNAL_EXTERN void rdna4_vs_latch(void);
+GARNET_INTERNAL_EXTERN void rdna4_vs_tick(void);
+GARNET_INTERNAL_EXTERN void rdna4_vs_report(unsigned tick);
+GARNET_INTERNAL_EXTERN BOOL rdna4_vs_sync_wb_on(void);
+GARNET_INTERNAL_EXTERN VkImageLayout rdna4_vs_get_layout(uint64_t vsId);
+GARNET_INTERNAL_EXTERN void rdna4_vs_set_layout(uint64_t vsId, VkImageLayout l);
+GARNET_INTERNAL_EXTERN void rdna4_vs_cb_begin(uint64_t vsId);
+GARNET_INTERNAL_EXTERN void rdna4_vs_cb_end(uint64_t vsId);
+GARNET_INTERNAL_EXTERN BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed);
+GARNET_INTERNAL_EXTERN BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite);
+GARNET_INTERNAL_EXTERN void rdna4_vs_note_full_clear(uint64_t vsId, uint32_t seed);
+GARNET_INTERNAL_EXTERN void rdna4_vs_note_write(uint64_t vsId, uint32_t seed, BOOL syncWriteback);
+GARNET_INTERNAL_EXTERN void rdna4_vs_invalidate_cpu(uint64_t vsId);
+GARNET_INTERNAL_EXTERN void rdna4_vs_observe_ws_write(RDNA4Texture *t);
+GARNET_INTERNAL_EXTERN BOOL rdna4_vs_flush_entry_sync(uint64_t vsId);
+GARNET_INTERNAL_EXTERN void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4Texture *t, const rdna4df_plan_t *pl, VkImageLayout savedLayout);
 GARNET_INTERNAL_EXTERN uint64_t rdna4_resource_uid(_Atomic uint64_t *uid);
 GARNET_INTERNAL_EXTERN BOOL rdna4nc_vk_offset_ok(VkDeviceSize off, VkDeviceSize align, unsigned use);
 GARNET_INTERNAL_EXTERN BOOL rdna4_requirements2(VkBuffer buffer, VkImage image, VkMemoryRequirements *mr,

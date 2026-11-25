@@ -128,7 +128,7 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
 static struct { _Atomic int mode, ms; uint64_t held, held_sup, held_pres, hold_ns; } RDNA4H = { .mode = RDNA4DF_HOLD_MODE_FINAL, .ms = RDNA4DF_HOLD_DEFAULT_MS };   // switch state (atomics); counters are written by the present queue under RDNA4S.mu
 
 
-GARNET_INTERNAL RDNA4ScanoutState RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER };
+GARNET_INTERNAL RDNA4ScanoutState RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER, .holdCond = PTHREAD_COND_INITIALIZER };
 // ---- bundle 13 (M6 Stage 1b) + bundle 15 (M6 Stage 2): the HDMI instances (1 = the monitor A, 2 = the monitor B) beside the DP's RDNA4S, as an ARRAY indexed by the kernel instance number ([0] is never used: the DP is RDNA4S). Same locking (RDNA4S.mu protects everything
 // below), same state machine type (garnet_dispflip.h, a FULL-COPY machine: damage mode is the DP's alone), each with its own 3 slots in visible VRAM, registered and presented through Mesa's radv_darwin_rdna4n_call (selectors 22..26). The decisions
 // are garnet_m6x.h (host-tested). An instance is enabled only when rdna4x_enabled(); acquired lazily; ANY failure leaves THAT instance OFF with the DP (and the other display) untouched. Slot size, copy rectangle and geometry come from the
@@ -303,6 +303,7 @@ static void rdna4s_bind_locked(void) {
     struct stat sb;
     BOOL killed = stat(RDNA4_NOFLIP_FILE, &sb) == 0;
     rdna4df_init(&RDNA4S.sm, killed);
+    rdna4df_hold_adapt_init(&RDNA4S.holdAdapt);
     RDNA4S.sm.presentall = stat(RDNA4_PRESENTALL_FILE, &sb) == 0;
     if (RDNA4S.sm.presentall) RDNA4LOG("scanout: final-pass rule DISABLED at bind: " RDNA4_PRESENTALL_FILE " exists (every display write is copied and presented)");
     if (killed) { rdna4s_free_slots(); RDNA4LOG("scanout: D-copy OFF: kill switch " RDNA4_NOFLIP_FILE " exists (read once per process)"); return; }
@@ -945,13 +946,19 @@ GARNET_INTERNAL void rdna4cbl_skip(uint32_t sid, uint64_t seq, int slot, const c
     rdna4cbl_line_locked("X t=%llu sid=%u seq=%llu slot=%d why=%s vk=%d", (unsigned long long)rdna4_now(), sid, (unsigned long long)seq, slot, why, vr);
     pthread_mutex_unlock(&RDNA4CB.mu);
 }
-typedef struct { uint64_t slept; } rdna4h_ctx;
-static void rdna4h_wait(void *c, uint64_t ns) {   // runs on the present queue with RDNA4S.mu held: drop it for the sleep so the submit path (rdna4DispSeq) and the tick never block on the hold
-    uint64_t t0 = rdna4_now();
-    pthread_mutex_unlock(&RDNA4S.mu);
-    struct timespec ts = { (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) }; nanosleep(&ts, NULL);
-    pthread_mutex_lock(&RDNA4S.mu);
-    ((rdna4h_ctx *)c)->slept = rdna4_now() - t0;
+typedef struct { rdna4df_t *sm; int slot; uint64_t slept; } rdna4h_ctx;
+static void rdna4h_wait(void *c, uint64_t ns) {   // runs on the present queue with RDNA4S.mu held: condvar atomically drops RDNA4S.mu and wakes in <50 us when a trailing commit/submit supersedes this slot
+    rdna4h_ctx *ctx = (rdna4h_ctx *)c;
+    const uint64_t t0 = rdna4_now(), deadline = t0 + ns;
+    for (;;) {
+        if (ctx->sm && rdna4df_is_superseded(ctx->sm, ctx->slot)) break;
+        const uint64_t now = rdna4_now();
+        if (now >= deadline) break;
+        const uint64_t rem = deadline - now;
+        struct timespec ts = { (time_t)(rem / 1000000000ull), (long)(rem % 1000000000ull) };
+        (void)pthread_cond_timedwait_relative_np(&RDNA4S.holdCond, &RDNA4S.mu, &ts);
+    }
+    ctx->slept = rdna4_now() - t0;
 }
 static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, rdna4crc_rec_t *rec, int cls, uint64_t tcommit, int tries);
 static BOOL rdna4_capture_readback(VkBuffer slotBuffer, size_t row, size_t pitch, size_t rows,
@@ -1075,10 +1082,12 @@ static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, ui
             }
         }
         uint64_t stale0 = sm->stale, sup0 = sm->superseded, inv0 = sm->chain_invalid;
-        rdna4h_ctx hc = { 0 }; uint64_t hw = 0;
+        rdna4h_ctx hc = { .sm = sm, .slot = slot, .slept = 0 }; uint64_t hw = 0;
         int hmode = atomic_load_explicit(&RDNA4H.mode, memory_order_relaxed);
-        int hon = rdna4df_hold_effective(hmode, cls);
+        int hon = rdna4df_hold_adapt_effective(&RDNA4S.holdAdapt, hmode, cls);
         int hok = rdna4df_complete_held(sm, slot, r == VK_SUCCESS ? 0 : 1, seq, sid, hon, atomic_load_explicit(&RDNA4H.ms, memory_order_relaxed), tcommit, rdna4_now(), rdna4h_wait, &hc, &hw);
+        if (cls == RDNA4DF_C_FINAL && r == VK_SUCCESS)
+            rdna4df_hold_adapt_note_final(&RDNA4S.holdAdapt, sid, tcommit, sm->superseded != sup0);
         if (hw) { RDNA4H.held++; RDNA4H.hold_ns += hc.slept; if (sm->superseded != sup0) RDNA4H.held_sup++; }
         if (hok) {
             uint64_t o[3] = { 0, 0, 0 };
@@ -1206,13 +1215,27 @@ static void rdna4s_late_run(RDNA4LateFrame *frame) {
     pthread_mutex_unlock(&RDNA4S.mu);
     if (!valid) return;
 
+#ifndef GARNET_DISPLAY_LATE_ONLY
+    const BOOL vramLate = [frame->texture rdna4VramSurfCached];
+    const uint64_t vramLateId = vramLate ? [frame->texture rdna4VramSurfId] : 0;
+    if (vramLate && vramLateId) rdna4_vs_cb_begin(vramLateId);
+    const VkImageLayout vramLateLayout = (vramLate && vramLateId) ? [frame->texture layout] : VK_IMAGE_LAYOUT_UNDEFINED;
+#endif
     NSError *error = nil; BOOL unresolved = NO;
     BOOL ok = rdna4_oneshot(&error, ^(VkCommandBuffer cmd) {
         // Capturing frame also retains the source/use-count if the GPU submission is quarantined.
         rdna4_full_barrier(cmd);
+#ifndef GARNET_DISPLAY_LATE_ONLY
+        if (vramLate && vramLateLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+            rdna4s_record_copy_img_preserve(cmd, frame->texture, &plan, vramLateLayout);
+        else
+#endif
         rdna4s_record_copy(cmd, [frame->texture rdna4DispBuf], [frame->texture rdna4IOSOffset], &plan);
         rdna4_full_barrier(cmd);
     }, &unresolved);
+#ifndef GARNET_DISPLAY_LATE_ONLY
+    if (vramLate && vramLateId) rdna4_vs_cb_end(vramLateId);
+#endif
     if (unresolved) {
         pthread_mutex_lock(&RDNA4S.mu);
         if (rdna4df_fail(sm, RDNA4DF_R_ERROR)) {

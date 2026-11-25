@@ -758,6 +758,42 @@ int main(void) {
         for (int k = 0; k < 3; k++) if (held[k] != z.inflight[k]) bad++;
     }
     CHECK("soak 200000 steps", bad == 0 && z.presents == presented && z.state == RDNA4DF_ACTIVE, "%llu violations, %llu presents, %llu drops, %llu gpu failures", (unsigned long long)bad, (unsigned long long)z.presents, (unsigned long long)z.drops, (unsigned long long)z.gpu_fail);
+
+    // ---- Phase A2: adaptive Present Hold with 3 ms dual-pass ceiling and post-hoc re-arm ----
+    {
+        rdna4df_hold_adapt_t ad;
+        rdna4df_hold_adapt_init(&ad);
+        CHECK("A2: adaptive hold starts armed (conservative boot default)", ad.armed == 1 && rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_FINAL, RDNA4DF_C_FINAL) == 1 && rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_FINAL, RDNA4DF_C_RENDER_COMP) == 0, "armed %d", ad.armed);
+        CHECK("A2: OFF mode always disables hold, ALL mode always enables", rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_OFF, RDNA4DF_C_FINAL) == 0 && rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_ALL, RDNA4DF_C_RENDER_COMP) == 1, "mode overrides");
+        for (unsigned k = 0; k < RDNA4DF_HOLD_ADAPT_DECAY_FRAMES - 1; k++) {
+            rdna4df_hold_adapt_note_final(&ad, 7, (k + 1) * 6250000ULL, 0);
+            CHECK("A2: stays armed before 8 consecutive clean FINAL frames", ad.armed == 1, "frame %u armed=%d", k + 1, ad.armed);
+        }
+        rdna4df_hold_adapt_note_final(&ad, 7, 8 * 6250000ULL, 0);
+        CHECK("A2: disarms to 0 ms hold after 8 consecutive clean FINAL frames", ad.armed == 0 && rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_FINAL, RDNA4DF_C_FINAL) == 0, "armed=%d", ad.armed);
+        rdna4df_hold_adapt_note_final(&ad, 7, 9 * 6250000ULL, 0);
+        CHECK("A2: clean FINAL while disarmed increments zero_skips and stays disarmed", ad.armed == 0 && ad.zero_skips == 1, "zero_skips=%llu", (unsigned long long)ad.zero_skips);
+        // Unrelated surface or stale gap (> 3 ms) must NOT re-arm
+        rdna4df_hold_adapt_note_comp(&ad, 99, 9 * 6250000ULL + 500000ULL);
+        CHECK("A2: RENDER_COMP for different sid does not re-arm", ad.armed == 0 && ad.rearms == 0, "armed=%d", ad.armed);
+        rdna4df_hold_adapt_note_comp(&ad, 7, 9 * 6250000ULL + 3500000ULL);
+        CHECK("A2: RENDER_COMP > 3 ms after FINAL does not re-arm", ad.armed == 0 && ad.rearms == 0, "armed=%d", ad.armed);
+        // Real 2.58 ms G->C gap on same sid MUST post-hoc re-arm immediately!
+        rdna4df_hold_adapt_note_comp(&ad, 7, 9 * 6250000ULL + 2580000ULL);
+        CHECK("A2: post-hoc RENDER_COMP within 3 ms (2.58 ms real gap) re-arms immediately", ad.armed == 1 && ad.rearms == 1 && ad.clean_streak == 0 && ad.pair_gap_ns == 2580000ULL, "armed=%d rearms=%llu gap=%llu", ad.armed, (unsigned long long)ad.rearms, (unsigned long long)ad.pair_gap_ns);
+        // Superseded FINAL resets clean_streak and keeps armed
+        rdna4df_hold_adapt_note_final(&ad, 7, 10 * 6250000ULL, 0);
+        rdna4df_hold_adapt_note_final(&ad, 7, 11 * 6250000ULL, 1);
+        CHECK("A2: superseded FINAL keeps armed and resets clean_streak", ad.armed == 1 && ad.clean_streak == 0, "streak=%u", ad.clean_streak);
+        // ALL mode stays enabled even when disarmed
+        for (unsigned k = 0; k < RDNA4DF_HOLD_ADAPT_DECAY_FRAMES; k++) rdna4df_hold_adapt_note_final(&ad, 7, (20 + k) * 6250000ULL, 0);
+        CHECK("A2: ALL mode ignores adaptive disarm", ad.armed == 0 && rdna4df_hold_adapt_effective(&ad, RDNA4DF_HOLD_MODE_ALL, RDNA4DF_C_FINAL) == 1, "all mode");
+        // Cold-start A2+A3 interaction: FINAL commits on new swapchain buffer sid 8, COMP commits 0.07 ms later before FINAL completes
+        rdna4df_hold_adapt_note_final_commit(&ad, 8, 30 * 6250000ULL);
+        rdna4df_hold_adapt_note_comp(&ad, 8, 30 * 6250000ULL + 70000ULL);
+        CHECK("A2+A3: early FINAL commit note lets trailing COMP re-arm even before FINAL completes", ad.armed == 1 && ad.rearms == 2 && ad.pair_gap_ns == 70000ULL, "armed=%d rearms=%llu", ad.armed, (unsigned long long)ad.rearms);
+    }
+
     printf(fails ? "FAIL test-dispflip (%d)\n" : "PASS test-dispflip\n", fails);
     return fails ? 1 : 0;
 }

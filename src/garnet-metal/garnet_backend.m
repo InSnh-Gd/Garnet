@@ -1337,6 +1337,7 @@ static void rdna4_t1_report(void) {
     rdna4_m6_report();   // bundle 11: one line when the kernel latch garnet-m6 is ON (nothing when OFF)
     rdna4_pool_tick();
     rdna4_imp_report(tick); rdna4_imp_tick();   // P4
+    rdna4_vs_report(tick); rdna4_vs_tick();     // Phase B: WindowServer OPTIMAL VRAM surface cache
     rdna4_led_report(tick);   // build 16 (P5 Step 0): the live-import ledger, one line per tick while any surface texture is alive
     if (++tick % 3 == 0) rdna4_pc_save("periodic");
 }
@@ -1415,18 +1416,42 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         if (!rdna4_vkCreateInstance) { RDNA4R.err = rdna4_err(3, @"no vkCreateInstance"); goto fail; }
         VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "garnetmetal", .apiVersion = VK_API_VERSION_1_3 };
         VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai };
-        {   // P5a: /private/tmp/garnet-nosam -> RADV_PERFTEST gains "nosam" (read by RADV at instance creation): command buffers and RADV's upload buffer go to GTT
-            // (system memory, CPU-cached, GPU-snooped) instead of the BAR, whose uncached stores stalled radv_emit_* during desktop drags (P5 study, ws-p1.txt). Absent = unchanged.
+        {   // Phase A4: auto-adapt nosam and Phase B VRAM cache budget to Small-BAR (256 MiB) vs Full-BAR (>= 4 GiB).
+            // Probe GarnetDriver's IORegistry properties via port 0 (kIOMasterPortDefault / kIOMainPortDefault); fail-closed to Small-BAR.
+            int bar0FullMode = 0;
+            uint64_t bar0MB = 0;
+            io_service_t drv = IOServiceGetMatchingService(0, IOServiceMatching("GarnetDriver"));
+            if (drv) {
+                CFTypeRef fm = IORegistryEntryCreateCFProperty(drv, CFSTR("BAR0,FullMode"), kCFAllocatorDefault, 0);
+                if (fm) {
+                    if (CFGetTypeID(fm) == CFBooleanGetTypeID()) bar0FullMode = CFBooleanGetValue((CFBooleanRef)fm) ? 1 : 0;
+                    else if (CFGetTypeID(fm) == CFNumberGetTypeID()) { int v = 0; if (CFNumberGetValue((CFNumberRef)fm, kCFNumberIntType, &v)) bar0FullMode = v ? 1 : 0; }
+                    CFRelease(fm);
+                }
+                CFTypeRef sz = IORegistryEntryCreateCFProperty(drv, CFSTR("BAR0,SizeMB"), kCFAllocatorDefault, 0);
+                if (!sz) sz = IORegistryEntryCreateCFProperty(drv, CFSTR("ReBAR,BAR0,CurrentMB"), kCFAllocatorDefault, 0);
+                if (sz) {
+                    (void)rdna4_number_u64(sz, &bar0MB);
+                    CFRelease(sz);
+                }
+                IOObjectRelease(drv);
+            }
             struct stat sb_;
-            if (stat("/private/tmp/garnet-nosam", &sb_) == 0 || stat("/private/tmp/garnet-nosam-off", &sb_) != 0) {   //: DEFAULT ON (60 fps under drag measured); /private/tmp/garnet-nosam-off disables
+            const int forceNosam = (stat("/private/tmp/garnet-nosam", &sb_) == 0) ? 1 : 0;
+            const int forceNosamOff = (stat("/private/tmp/garnet-nosam-off", &sb_) == 0) ? 1 : 0;
+            RDNA4R.barPolicy = garnet_bar_choose_policy(bar0FullMode, bar0MB, forceNosam, forceNosamOff);
+            if (RDNA4R.barPolicy.enable_nosam) {
                 const char *pt = getenv("RADV_PERFTEST");
                 if (!rdna4_csv_has_token(pt, "nosam")) {
                     char v[256];
                     snprintf(v, sizeof v, "%s%snosam", pt && *pt ? pt : "", pt && *pt ? "," : "");
                     setenv("RADV_PERFTEST", v, 1);
-                    RDNA4LOG("radv open: P5a /private/tmp/garnet-nosam present: RADV_PERFTEST=%s (command buffers in GTT)", v);
                 }
             }
+            RDNA4LOG("radv open: BAR policy: fullMode=%d bar0=%llu MiB -> %s, nosam=%s (RADV_PERFTEST=%s), vram_surf_cap=%llu MiB",
+                     bar0FullMode, (unsigned long long)bar0MB, RDNA4R.barPolicy.full_bar ? "FULL-BAR" : "SMALL-BAR",
+                     RDNA4R.barPolicy.enable_nosam ? "ON" : "OFF", getenv("RADV_PERFTEST") ?: "-",
+                     (unsigned long long)(RDNA4R.barPolicy.vram_surf_cap_bytes >> 20));
         }
         VkResult r = rdna4_vkCreateInstance(&ici, NULL, &RDNA4R.inst);
         if (r != VK_SUCCESS) { RDNA4R.err = rdna4_err(4, [NSString stringWithFormat:@"vkCreateInstance = %d", r]); goto fail; }
@@ -1871,6 +1896,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         rdna4_pc_open(&pp);
         rdna4_pool_latch();   // P1: reads /private/tmp/rdna4m-pool ONCE
         rdna4_imp_latch();    // P4: reads the kill file /private/tmp/rdna4m-noimpcache ONCE (build 16: the cache is ON by default)
+        rdna4_vs_latch();     // Phase B: WindowServer OPTIMAL VRAM surface cache (kill file /private/tmp/garnet-no-vram-surf)
         rdna4_drawopt_latch();   // P5b: reads /private/tmp/rdna4m-drawopt ONCE
         RDNA4R.ok = YES;
         rdna4dc_heap heaps[VK_MAX_MEMORY_HEAPS] = {0};

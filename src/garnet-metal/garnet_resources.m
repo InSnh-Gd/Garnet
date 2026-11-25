@@ -345,14 +345,15 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 //  * An import given up is vkFreeMemory'd only once the P1 fence has cleared the serial taken when it was given up (stamp 0 / completed 0 when the pool is OFF = as today).
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_IMPCACHE_KILL_FILE "/private/tmp/garnet-noimpcache"   // build 16 (F2): the cache is ON by default; this file switches it OFF (latched once per process).
-static struct { BOOL on; pthread_mutex_t mu; rdna4ic_cache c; _Atomic uint64_t baseless; uint64_t lastSig; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static struct { BOOL on; pthread_mutex_t mu; rdna4ic_cache c; rdna4li_cache li; _Atomic uint64_t baseless; uint64_t lastSig; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_imp_latch(void) {
     static int done; if (done) return; done = 1;
     RDNA4IC.on = rdna4ic_default_on(access(RDNA4_IMPCACHE_KILL_FILE, F_OK) == 0) ? YES : NO;   // build 16 (F2): default ON
     rdna4ic_init(&RDNA4IC.c, RDNA4IC.on);
     rdna4ic_set_cap(&RDNA4IC.c, rdna4ic_cap_for_process(rdna4_is_ws() ? 1 : 0));
-    if (RDNA4IC.on) RDNA4LOG("P4 impcache: ON (default since build 16; kill file %s absent at device creation; latched for the life of this process): one shared import per IOSurface, kept %llu ms after its last texture, <= %llu MiB unused, frees fence-gated (%s)",
-        RDNA4_IMPCACHE_KILL_FILE, (unsigned long long)(RDNA4IC_IDLE_NS / 1000000ULL), (unsigned long long)(RDNA4IC.c.capBytes >> 20), RDNA4P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
+    rdna4li_init(&RDNA4IC.li, RDNA4IC.on ? 1 : 0, rdna4_is_ws() ? 128 : 64);
+    if (RDNA4IC.on) RDNA4LOG("P4 impcache: ON (default since build 16; kill file %s absent at device creation; latched for the life of this process): one shared import per IOSurface, kept %llu ms after its last texture, <= %llu MiB unused, linear VkImage reuse <= %zu unused, frees fence-gated (%s)",
+        RDNA4_IMPCACHE_KILL_FILE, (unsigned long long)(RDNA4IC_IDLE_NS / 1000000ULL), (unsigned long long)(RDNA4IC.c.capBytes >> 20), RDNA4IC.li.maxUnused, RDNA4P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
     else RDNA4LOG("P4 impcache: OFF (kill file %s present at device creation; latched for the life of this process)", RDNA4_IMPCACHE_KILL_FILE);
 }
 static void rdna4_imp_fence(uint64_t *stamp, uint64_t *completed) {
@@ -360,10 +361,18 @@ static void rdna4_imp_fence(uint64_t *stamp, uint64_t *completed) {
     if (!RDNA4P.on) return;
     pthread_mutex_lock(&RDNA4P.mu); *stamp = RDNA4P.p.submitted; *completed = RDNA4P.p.completed; pthread_mutex_unlock(&RDNA4P.mu);
 }
-// Frees every released import the fence allows (vkFreeMemory is the slow kernel call: no mutex held).
+// Frees every released linear VkImage FIRST, then released import memory, that the fence allows (no mutex held across Vulkan calls).
 static BOOL rdna4_imp_drain(void) {
     if (!RDNA4IC.on) return NO;
     uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    for (;;) {
+        void *relImg = NULL;
+        pthread_mutex_lock(&RDNA4IC.mu);
+        int gotImg = rdna4li_pop(&RDNA4IC.li, comp, &relImg);
+        pthread_mutex_unlock(&RDNA4IC.mu);
+        if (!gotImg) break;
+        if (relImg) vkDestroyImage(RDNA4R.dev, (VkImage)relImg, NULL);
+    }
     BOOL reclaimed = NO;
     for (;;) {
         rdna4ic_rel o; pthread_mutex_lock(&RDNA4IC.mu); int got = rdna4ic_pop(&RDNA4IC.c, comp, &o); pthread_mutex_unlock(&RDNA4IC.mu);
@@ -377,7 +386,12 @@ static BOOL rdna4_imp_drain(void) {
 GARNET_INTERNAL void rdna4_imp_tick(void) {
     if (!RDNA4IC.on) return;
     uint64_t st, comp; rdna4_imp_fence(&st, &comp);
-    pthread_mutex_lock(&RDNA4IC.mu); rdna4ic_trim(&RDNA4IC.c, rdna4_now(), st); pthread_mutex_unlock(&RDNA4IC.mu);
+    uint64_t now = rdna4_now();
+    pthread_mutex_lock(&RDNA4IC.mu);
+    rdna4ic_trim(&RDNA4IC.c, now, st);
+    rdna4li_trim(&RDNA4IC.li, now, st);
+    rdna4li_retire_orphans(&RDNA4IC.li, &RDNA4IC.c, st);
+    pthread_mutex_unlock(&RDNA4IC.mu);
     rdna4_imp_drain();
 }
 // Every import allocation goes through here so the F1 test hook can refuse it: RDNA4M_TEST_IMPORT_FAIL_EVERY=<n> (root + RDNA4M_ALLOW=1) fails every n-th attempt like a kernel that is out of import budget.
@@ -391,28 +405,88 @@ static VkResult rdna4_import_alloc(const VkMemoryAllocateInfo *ma, VkDeviceMemor
 static VkResult rdna4_imp_get(IOSurfaceRef s, void *base, size_t ialloc, const VkMemoryAllocateInfo *ma, VkDeviceMemory *out, BOOL *hit) {
     uint64_t st, comp; rdna4_imp_fence(&st, &comp); *hit = NO;
     uint32_t id = IOSurfaceGetID(s); void *m = NULL;
-    pthread_mutex_lock(&RDNA4IC.mu); int h = rdna4ic_acquire(&RDNA4IC.c, id, (uint64_t)(uintptr_t)base, ialloc, rdna4_now(), st, &m); pthread_mutex_unlock(&RDNA4IC.mu);
+    pthread_mutex_lock(&RDNA4IC.mu);
+    int h = rdna4ic_acquire(&RDNA4IC.c, id, (uint64_t)(uintptr_t)base, ialloc, rdna4_now(), st, &m);
+    rdna4li_retire_orphans(&RDNA4IC.li, &RDNA4IC.c, st);
+    pthread_mutex_unlock(&RDNA4IC.mu);
     if (h) { *out = (VkDeviceMemory)m; *hit = YES; return VK_SUCCESS; }
     VkDeviceMemory mem = VK_NULL_HANDLE; VkResult r = rdna4_import_alloc(ma, &mem);
     if (r != VK_SUCCESS) {   // out of kernel imports (256 MiB per client): give back the unused cached ones the fence has cleared, once (F1: the caller then falls back to a GPU-only texture, never nil)
+        rdna4_imp_fence(&st, &comp);
         pthread_mutex_lock(&RDNA4IC.mu);
         rdna4ic_flush(&RDNA4IC.c, st);
+        rdna4li_retire_orphans(&RDNA4IC.li, &RDNA4IC.c, st);
         pthread_mutex_unlock(&RDNA4IC.mu);
         if (rdna4_imp_drain()) r = rdna4_import_alloc(ma, &mem);
     }
     if (r != VK_SUCCESS) { *out = VK_NULL_HANDLE; return r; }
     // Another wrapper may have imported the same surface while allocation ran without the mutex.
+    rdna4_imp_fence(&st, &comp);
     pthread_mutex_lock(&RDNA4IC.mu);
     h = rdna4ic_acquire(&RDNA4IC.c, id, (uint64_t)(uintptr_t)base, ialloc, rdna4_now(), st, &m);
     if (!h) rdna4ic_add(&RDNA4IC.c, id, (uint64_t)(uintptr_t)base, ialloc, (void *)mem, (void *)CFRetain(s));
+    rdna4li_retire_orphans(&RDNA4IC.li, &RDNA4IC.c, st);
     pthread_mutex_unlock(&RDNA4IC.mu);
     if (h) { vkFreeMemory(RDNA4R.dev, mem, NULL); *out = (VkDeviceMemory)m; *hit = YES; return VK_SUCCESS; }
     *out = mem; return VK_SUCCESS;
 }
 static void rdna4_imp_put(VkDeviceMemory mem) {
     uint64_t st, comp; rdna4_imp_fence(&st, &comp);
-    pthread_mutex_lock(&RDNA4IC.mu); rdna4ic_unref(&RDNA4IC.c, (void *)mem, rdna4_now(), st); pthread_mutex_unlock(&RDNA4IC.mu);
+    pthread_mutex_lock(&RDNA4IC.mu);
+    rdna4ic_unref(&RDNA4IC.c, (void *)mem, rdna4_now(), st);
+    rdna4li_retire_orphans(&RDNA4IC.li, &RDNA4IC.c, st);
+    pthread_mutex_unlock(&RDNA4IC.mu);
     rdna4_imp_drain();
+}
+static BOOL rdna4_linimg_get(const rdna4li_key *k, VkImage *outImg, int *outInited) {
+    if (!RDNA4IC.on) return NO;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    void *img = NULL; int inited = 0;
+    pthread_mutex_lock(&RDNA4IC.mu);
+    int hit = rdna4li_acquire(&RDNA4IC.li, k, rdna4_now(), st, &img, &inited);
+    pthread_mutex_unlock(&RDNA4IC.mu);
+    if (!hit) return NO;
+    *outImg = (VkImage)img;
+    if (outInited) *outInited = inited;
+    return YES;
+}
+static VkImage rdna4_linimg_add(const rdna4li_key *k, VkImage freshImg, int *outInited) {
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    void *existing = NULL; int inited = 0;
+    pthread_mutex_lock(&RDNA4IC.mu);
+    int hit = rdna4li_acquire(&RDNA4IC.li, k, rdna4_now(), st, &existing, &inited);
+    if (!hit) rdna4li_add(&RDNA4IC.li, k, (void *)freshImg, 0);
+    pthread_mutex_unlock(&RDNA4IC.mu);
+    if (hit) {
+        vkDestroyImage(RDNA4R.dev, freshImg, NULL);
+        if (outInited) *outInited = inited;
+        return (VkImage)existing;
+    }
+    if (outInited) *outInited = 0;
+    return freshImg;
+}
+static void rdna4_linimg_mark_inited(VkImage img) {
+    if (!RDNA4IC.on || !img) return;
+    pthread_mutex_lock(&RDNA4IC.mu);
+    rdna4li_mark_inited(&RDNA4IC.li, (void *)img);
+    pthread_mutex_unlock(&RDNA4IC.mu);
+}
+static BOOL rdna4_linimg_is_inited(VkImage img) {
+    if (!RDNA4IC.on || !img) return NO;
+    pthread_mutex_lock(&RDNA4IC.mu);
+    int v = rdna4li_is_inited(&RDNA4IC.li, (void *)img);
+    pthread_mutex_unlock(&RDNA4IC.mu);
+    return v != 0;
+}
+
+static void rdna4_linimg_put(VkImage img) {
+    if (!img) return;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4IC.mu);
+    int found = rdna4li_unref(&RDNA4IC.li, (void *)img, rdna4_now(), st);
+    pthread_mutex_unlock(&RDNA4IC.mu);
+    if (!found) vkDestroyImage(RDNA4R.dev, img, NULL);
+    else rdna4_imp_drain();
 }
 // Base-less (protected) IOSurfaces: log once per id (a ring of the last 64 ids), count every texture.
 static void rdna4_baseless_note(uint32_t id) {
@@ -439,6 +513,566 @@ GARNET_INTERNAL void rdna4_imp_report(unsigned tick) {
         else if (bl || ch || cm) RDNA4LOG("T1 impcache OFF; baseless_textures=%llu; classify cache hit/miss/mismatch=%llu/%llu/%llu [%s pid %d, cumulative]", (unsigned long long)bl, (unsigned long long)ch, (unsigned long long)cm, (unsigned long long)cmm, getprogname(), (int)getpid());
     }
     pthread_mutex_unlock(&RDNA4IC.mu);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Phase B: WindowServer 320 GB/s OPTIMAL VRAM surface cache (garnet_vram_surf.h decides; this block owns
+// Vulkan hi-pool allocations, GFX12 DCC-preserving VkImageFormatListCreateInfo, 50 ms idle quiescence writeback,
+// synchronous flush fallbacks, and capture-stack exclusion). Kill file: /private/tmp/garnet-no-vram-surf.
+// Lock order: RDNA4Q._qmu -> RDNA4R.qlock -> RDNA4VS.mu (leaf O(1) lock; NEVER held across Vulkan/IOSurface/RDNA4IC calls).
+// ---------------------------------------------------------------------------------------------------------------
+_Static_assert((uint32_t)VK_FORMAT_R8G8B8A8_UNORM == GARNET_VS_VK_RGBA8_UNORM &&
+               (uint32_t)VK_FORMAT_R8G8B8A8_SRGB == GARNET_VS_VK_RGBA8_SRGB &&
+               (uint32_t)VK_FORMAT_B8G8R8A8_UNORM == GARNET_VS_VK_BGRA8_UNORM &&
+               (uint32_t)VK_FORMAT_B8G8R8A8_SRGB == GARNET_VS_VK_BGRA8_SRGB &&
+               (uint32_t)VK_FORMAT_A2B10G10R10_UNORM_PACK32 == GARNET_VS_VK_A2B10G10R10_UNORM &&
+               (uint32_t)VK_FORMAT_A2R10G10B10_UNORM_PACK32 == GARNET_VS_VK_A2R10G10B10_UNORM &&
+               (uint32_t)VK_FORMAT_R16G16B16A16_SFLOAT == GARNET_VS_VK_RGBA16_SFLOAT,
+               "GARNET_VS_VK_* format values must match Vulkan VkFormat");
+
+static struct {
+    BOOL on;
+    pthread_mutex_t mu;
+    pthread_cond_t flushCond;
+    dispatch_queue_t flushQ;
+    dispatch_source_t timer;
+    BOOL timerArmed;
+    _Atomic int syncWb;
+    garnet_vs_cache_t c;
+    uint64_t lastSig;
+} RDNA4VS = { .mu = PTHREAD_MUTEX_INITIALIZER, .flushCond = PTHREAD_COND_INITIALIZER };
+
+// Prefer pure DEVICE_LOCAL hi-pool (non-HOST_VISIBLE) on Small-BAR so 256 MiB BAR stays free for scanout slots;
+// fall back to any DEVICE_LOCAL type (covers Full-BAR where the entire 16 GiB VRAM is DEVICE_LOCAL|HOST_VISIBLE).
+static int rdna4_find_vram_hipool_mem(uint32_t bits) {
+    for (uint32_t i = 0; i < RDNA4R.mp.memoryTypeCount; i++) {
+        const VkMemoryPropertyFlags f = RDNA4R.mp.memoryTypes[i].propertyFlags;
+        if ((bits & (1u << i)) && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            return (int)i;
+    }
+    return rdna4_find_mem(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+static void rdna4_vs_idle_timer_fire(void);
+
+GARNET_INTERNAL void rdna4_vs_latch(void) {
+    static int done; if (done) return; done = 1;
+    const int killPresent = access(GARNET_VS_KILL_FILE, F_OK) == 0 ? 1 : 0;
+    const char *testEnv = garnet_getenv("GARNET_TEST_VRAM_SURF", NULL);
+    const int testOptIn = (rdna4_allow() && testEnv && !strcmp(testEnv, "1")) ? 1 : 0;
+    const int on = garnet_vs_should_enable(rdna4_is_ws() ? 1 : 0, testOptIn, killPresent);
+    const uint64_t cap = RDNA4R.barPolicy.vram_surf_cap_bytes ? RDNA4R.barPolicy.vram_surf_cap_bytes : GARNET_VRAM_SURF_CAP_SMALL_BAR;
+    RDNA4VS.on = on ? YES : NO;
+    atomic_store_explicit(&RDNA4VS.syncWb, access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0 ? 1 : 0, memory_order_relaxed);
+    garnet_vs_init(&RDNA4VS.c, on, cap);
+    if (RDNA4VS.on) {
+        RDNA4VS.flushQ = dispatch_queue_create("rdna4.vs-flush", DISPATCH_QUEUE_SERIAL);
+        RDNA4VS.timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, RDNA4VS.flushQ);
+        dispatch_source_set_event_handler(RDNA4VS.timer, ^{ rdna4_vs_idle_timer_fire(); });
+        dispatch_source_set_timer(RDNA4VS.timer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+        dispatch_resume(RDNA4VS.timer);
+        RDNA4LOG("Phase B vram_surf: ON (%s, cap=%llu MiB, idle_flush=%llu ms, sync_wb=%d; kill file %s absent)",
+                 RDNA4R.barPolicy.full_bar ? "FULL-BAR" : "SMALL-BAR", (unsigned long long)(cap >> 20),
+                 (unsigned long long)(GARNET_VS_IDLE_FLUSH_NS / 1000000ULL),
+                 atomic_load_explicit(&RDNA4VS.syncWb, memory_order_relaxed), GARNET_VS_KILL_FILE);
+    } else {
+        RDNA4LOG("Phase B vram_surf: OFF (ws=%d kill=%d)", rdna4_is_ws() ? 1 : 0, killPresent);
+    }
+}
+
+GARNET_INTERNAL BOOL rdna4_vs_sync_wb_on(void) {
+    return atomic_load_explicit(&RDNA4VS.syncWb, memory_order_relaxed) != 0;
+}
+
+static void rdna4_vs_arm_timer_locked(void) {
+    if (!RDNA4VS.timer) return;
+    if (RDNA4VS.c.dirty_count > 0 && !RDNA4VS.timerArmed) {
+        RDNA4VS.timerArmed = YES;
+        dispatch_source_set_timer(RDNA4VS.timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)GARNET_VS_IDLE_FLUSH_NS),
+                                  25 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+    } else if (RDNA4VS.c.dirty_count == 0 && RDNA4VS.timerArmed) {
+        RDNA4VS.timerArmed = NO;
+        dispatch_source_set_timer(RDNA4VS.timer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    }
+}
+
+static void rdna4_vs_drain(void) {
+    if (!RDNA4VS.on) return;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    for (;;) {
+        garnet_vs_rel_t rel;
+        pthread_mutex_lock(&RDNA4VS.mu);
+        int got = garnet_vs_pop_release(&RDNA4VS.c, comp, &rel);
+        pthread_mutex_unlock(&RDNA4VS.mu);
+        if (!got) break;
+        if (rel.opt_img) vkDestroyImage(RDNA4R.dev, (VkImage)rel.opt_img, NULL);
+        if (rel.opt_mem) {
+            vkFreeMemory(RDNA4R.dev, (VkDeviceMemory)rel.opt_mem, NULL);
+            atomic_fetch_sub(&rdna4_alloc_total, rel.vram_bytes);
+        }
+        if (rel.ibuf) vkDestroyBuffer(RDNA4R.dev, (VkBuffer)rel.ibuf, NULL);
+        if (rel.imem) rdna4_imp_put((VkDeviceMemory)rel.imem);
+        if (rel.owner) CFRelease((IOSurfaceRef)rel.owner);
+    }
+}
+
+static BOOL rdna4_vs_run_flush(uint64_t vsId, uint64_t snapGen, VkImage optImg, VkBuffer ibuf,
+                               VkImageLayout savedLayout, uint32_t w, uint32_t h, uint32_t bpp,
+                               uint64_t poff, uint64_t bpr) {
+    NSError *err = nil;
+    BOOL unresolved = NO;
+    BOOL ok = NO;
+    if (optImg && ibuf && w && h && bpp && savedLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        ok = rdna4_oneshot(&err, ^(VkCommandBuffer cmd) {
+            VkImageMemoryBarrier toSrc = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .oldLayout = savedLayout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = optImg, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &toSrc);
+            VkBufferImageCopy bic = { .bufferOffset = poff, .bufferRowLength = (uint32_t)(bpr / bpp), .bufferImageHeight = 0,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { w, h, 1 } };
+            vkCmdCopyImageToBuffer(cmd, optImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ibuf, 1, &bic);
+            VkMemoryBarrier host = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                 0, 1, &host, 0, NULL, 0, NULL);
+            VkImageMemoryBarrier back = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = savedLayout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = optImg, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &back);
+        }, &unresolved);
+    }
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4VS.mu);
+    if (unresolved) {
+        // Quarantine entry permanently if GPU timed out so handles are never freed while in flight.
+        garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, vsId);
+        if (e) { e->stale = 1; e->refs++; }
+    }
+    garnet_vs_finish_flush(&RDNA4VS.c, vsId, snapGen, ok ? 1 : 0);
+    garnet_vs_retire_stale_ready(&RDNA4VS.c, st);
+    rdna4_vs_arm_timer_locked();
+    pthread_cond_broadcast(&RDNA4VS.flushCond);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    rdna4_vs_drain();
+    return ok;
+}
+
+static void rdna4_vs_wait_flush_done(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return;
+    const uint64_t deadline = rdna4_now() + 2000000000ULL;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    while (garnet_vs_is_flushing(&RDNA4VS.c, vsId) &&
+           atomic_load(&rdna4_submit_fault) == VK_SUCCESS &&
+           rdna4_now() < deadline) {
+        struct timespec ts = { 0, 50000000 };
+        (void)pthread_cond_timedwait_relative_np(&RDNA4VS.flushCond, &RDNA4VS.mu, &ts);
+    }
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL BOOL rdna4_vs_flush_entry_sync(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return YES;
+    const uint64_t deadline = rdna4_now() + 2000000000ULL;
+    uint64_t snapGen = 0;
+    VkImage optImg = VK_NULL_HANDLE;
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    VkImageLayout savedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t w = 0, h = 0, bpp = 4;
+    uint64_t poff = 0, bpr = 0;
+    BOOL doFlush = NO, clean = NO;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    for (;;) {
+        garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, vsId);
+        if (!e) { clean = YES; break; }
+        if (e->flushing || e->active_cbs > 0) {
+            if (atomic_load(&rdna4_submit_fault) != VK_SUCCESS || rdna4_now() >= deadline) {
+                clean = NO;
+                break;
+            }
+            struct timespec ts = { 0, 50000000 }; // 50 ms slice inside 2 s total deadline
+            (void)pthread_cond_timedwait_relative_np(&RDNA4VS.flushCond, &RDNA4VS.mu, &ts);
+            continue;
+        }
+        if (garnet_vs_begin_sync_flush(&RDNA4VS.c, vsId, &snapGen)) {
+            optImg = (VkImage)e->opt_img;
+            ibuf = (VkBuffer)e->ibuf;
+            savedLayout = (VkImageLayout)e->layout;
+            w = e->range.w; h = e->range.h; bpp = e->bpp ? e->bpp : 4u;
+            poff = e->range.poff; bpr = e->range.bpr;
+            doFlush = YES;
+        } else {
+            if (e->layout == 0) garnet_vs_clear_dirty(&RDNA4VS.c, e);
+            clean = !e->host_dirty;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    if (doFlush) return rdna4_vs_run_flush(vsId, snapGen, optImg, ibuf, savedLayout, w, h, bpp, poff, bpr);
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4VS.mu);
+    garnet_vs_retire_stale_ready(&RDNA4VS.c, st);
+    rdna4_vs_arm_timer_locked();
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    rdna4_vs_drain();
+    return clean;
+}
+
+static void rdna4_vs_idle_timer_fire(void) {
+    if (!RDNA4VS.on || !RDNA4R.ok) return;
+    if (atomic_load(&rdna4_submit_fault) != VK_SUCCESS) {
+        pthread_mutex_lock(&RDNA4VS.mu);
+        if (RDNA4VS.timer && RDNA4VS.timerArmed) {
+            RDNA4VS.timerArmed = NO;
+            dispatch_source_set_timer(RDNA4VS.timer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+        }
+        pthread_mutex_unlock(&RDNA4VS.mu);
+        return;
+    }
+    pthread_mutex_lock(&RDNA4VS.mu);
+    const size_t maxIter = RDNA4VS.c.n < 256 ? RDNA4VS.c.n + 1 : 256;
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    for (size_t iter = 0; iter < maxIter; iter++) {
+        if (atomic_load(&rdna4_submit_fault) != VK_SUCCESS) break;
+        uint64_t fid = 0, fgen = 0;
+        VkImage optImg = VK_NULL_HANDLE;
+        VkBuffer ibuf = VK_NULL_HANDLE;
+        VkImageLayout savedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        uint32_t w = 0, h = 0, bpp = 4;
+        uint64_t poff = 0, bpr = 0;
+        pthread_mutex_lock(&RDNA4VS.mu);
+        int picked = garnet_vs_pick_idle_flush(&RDNA4VS.c, rdna4_now(), &fid, &fgen);
+        if (picked) {
+            garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, fid);
+            if (e) {
+                optImg = (VkImage)e->opt_img;
+                ibuf = (VkBuffer)e->ibuf;
+                savedLayout = (VkImageLayout)e->layout;
+                w = e->range.w; h = e->range.h; bpp = e->bpp ? e->bpp : 4u;
+                poff = e->range.poff; bpr = e->range.bpr;
+            }
+        } else {
+            rdna4_vs_arm_timer_locked();
+        }
+        pthread_mutex_unlock(&RDNA4VS.mu);
+        if (!picked) break;
+        if (!rdna4_vs_run_flush(fid, fgen, optImg, ibuf, savedLayout, w, h, bpp, poff, bpr)) break;
+    }
+}
+
+static void rdna4_vs_evict_if_needed(void) {
+    if (!RDNA4VS.on) return;
+    for (;;) {
+        uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+        uint64_t evId = 0; int needsFlush = 0;
+        pthread_mutex_lock(&RDNA4VS.mu);
+        int got = garnet_vs_pick_evict_candidate(&RDNA4VS.c, &evId, &needsFlush);
+        if (got && !needsFlush) (void)garnet_vs_retire(&RDNA4VS.c, evId, st);
+        pthread_mutex_unlock(&RDNA4VS.mu);
+        if (!got) break;
+        if (needsFlush) {
+            if (!rdna4_vs_flush_entry_sync(evId)) break;
+            rdna4_imp_fence(&st, &comp);
+            pthread_mutex_lock(&RDNA4VS.mu);
+            int retired = garnet_vs_retire(&RDNA4VS.c, evId, st);
+            pthread_mutex_unlock(&RDNA4VS.mu);
+            if (!retired) break;
+        }
+    }
+    rdna4_vs_drain();
+}
+
+static BOOL rdna4_vs_bt_is_capture(void) {
+    NSArray<NSNumber *> *frames = [NSThread callStackReturnAddresses];
+    for (NSUInteger i = 0; i < frames.count; i++) {
+        Dl_info di;
+        void *p = (void *)(uintptr_t)frames[i].unsignedLongLongValue;
+        if (!dladdr(p, &di)) continue;
+        if (garnet_vs_symbol_is_capture(di.dli_sname)) return YES;
+    }
+    return NO;
+}
+
+GARNET_INTERNAL void rdna4_vs_observe_ws_write(RDNA4Texture *t) {
+    if (!RDNA4VS.on || !t) return;
+    t = [t rootResource];
+    if ([t rdna4IsDisp] || [t rdna4VramSurfCached] || [t rdna4HostReadOnly]) return;
+    IOSurfaceRef s = [t rdna4IOSRef];
+    if (!s || IOSurfaceGetPlaneCount(s) > 1) return;
+    const uint32_t sid = IOSurfaceGetID(s);
+    const uint32_t w = (uint32_t)[t width], h = (uint32_t)[t height];
+    if (!sid || w < GARNET_VS_CLASS2_MIN_DIM || h < GARNET_VS_CLASS2_MIN_DIM) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    const int needBt = garnet_vs_obs_needs_bt(&RDNA4VS.c, sid);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    const int isCap = needBt ? (rdna4_vs_bt_is_capture() ? 1 : 0) : 0;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    (void)garnet_vs_note_ws_write(&RDNA4VS.c, sid, w, h, 0, isCap, rdna4_now());
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL VkImageLayout rdna4_vs_get_layout(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return VK_IMAGE_LAYOUT_UNDEFINED;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    VkImageLayout l = (VkImageLayout)garnet_vs_get_layout(&RDNA4VS.c, vsId);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    return l;
+}
+
+GARNET_INTERNAL void rdna4_vs_set_layout(uint64_t vsId, VkImageLayout l) {
+    if (!RDNA4VS.on || !vsId) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    garnet_vs_set_layout(&RDNA4VS.c, vsId, (uint32_t)l);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL void rdna4_vs_cb_begin(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    while (garnet_vs_is_flushing(&RDNA4VS.c, vsId)) {
+        struct timespec ts = { 0, 50000000 };
+        (void)pthread_cond_timedwait_relative_np(&RDNA4VS.flushCond, &RDNA4VS.mu, &ts);
+    }
+    garnet_vs_cb_begin(&RDNA4VS.c, vsId);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL void rdna4_vs_cb_end(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4VS.mu);
+    garnet_vs_cb_end(&RDNA4VS.c, vsId);
+    garnet_vs_retire_stale_ready(&RDNA4VS.c, st);
+    pthread_cond_broadcast(&RDNA4VS.flushCond);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed) {
+    if (!RDNA4VS.on || !vsId) return YES;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    const int up = garnet_vs_peek_needs_upload(&RDNA4VS.c, vsId, seed);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    return up != 0;
+}
+
+GARNET_INTERNAL BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite) {
+    if (!RDNA4VS.on || !vsId) return needContents;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    const int up = garnet_vs_begin_access(&RDNA4VS.c, vsId, seed, needContents ? 1 : 0, willWrite ? 1 : 0, fullOverwrite ? 1 : 0);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    return up != 0;
+}
+
+GARNET_INTERNAL void rdna4_vs_note_full_clear(uint64_t vsId, uint32_t seed) {
+    if (!RDNA4VS.on || !vsId) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    (void)garnet_vs_begin_access(&RDNA4VS.c, vsId, seed, 0, 1, 1);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL void rdna4_vs_note_write(uint64_t vsId, uint32_t seed, BOOL syncWriteback) {
+    if (!RDNA4VS.on || !vsId) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    garnet_vs_note_gpu_write(&RDNA4VS.c, vsId, seed, rdna4_now(), syncWriteback ? 1 : 0);
+    rdna4_vs_arm_timer_locked();
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+GARNET_INTERNAL void rdna4_vs_invalidate_cpu(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    garnet_vs_invalidate_cpu_write(&RDNA4VS.c, vsId);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
+static void rdna4_vs_put(uint64_t vsId) {
+    if (!RDNA4VS.on || !vsId) return;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4VS.mu);
+    (void)garnet_vs_unref(&RDNA4VS.c, vsId, rdna4_now(), st);
+    pthread_mutex_unlock(&RDNA4VS.mu);
+    rdna4_vs_evict_if_needed();
+}
+
+static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t alloc, NSUInteger poff,
+                              NSUInteger w, NSUInteger h, size_t bpr, const RDNA4Fmt *fmt,
+                              NSUInteger mtlUsage, VkImageUsageFlags reqUse, VkFormatFeatureFlags offs,
+                              BOOL attOK, BOOL isDisp, BOOL hostReadOnly, const VkMemoryAllocateInfo *ma,
+                              VkImage *outImg, VkBuffer *outIbuf, uint64_t *outId) {
+    if (!RDNA4VS.on || !RDNA4IC.on || !s || !fmt) return NO;
+    uint64_t st, comp; rdna4_imp_fence(&st, &comp);
+    const garnet_vs_range_t vr = { .sid = IOSurfaceGetID(s), .base = (uint64_t)(uintptr_t)base,
+        .ialloc = ialloc, .poff = poff, .w = (uint32_t)w, .h = (uint32_t)h, .bpr = bpr };
+    const uint64_t now = rdna4_now();
+    uint64_t hitId = 0;
+    VkImage hitImg = VK_NULL_HANDLE;
+    VkBuffer hitBuf = VK_NULL_HANDLE;
+    int probe = GARNET_VS_PROBE_MISS;
+    int promote = 0;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    probe = garnet_vs_probe(&RDNA4VS.c, &vr, (uint32_t)fmt->vk, (uint32_t)reqUse, now, st, &hitId);
+    if (probe == GARNET_VS_PROBE_HIT) {
+        garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, hitId);
+        if (e) { hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf; }
+    } else if (probe == GARNET_VS_PROBE_MISS) {
+        const int wantWrite = (mtlUsage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) ? 1 : 0;
+        promote = garnet_vs_should_promote(&RDNA4VS.c, vr.sid, vr.w, vr.h, isDisp ? 1 : 0, hostReadOnly ? 1 : 0, 1, wantWrite);
+    }
+    pthread_mutex_unlock(&RDNA4VS.mu);
+
+    if (probe == GARNET_VS_PROBE_HIT && hitImg && hitBuf) {
+        *outImg = hitImg; *outIbuf = hitBuf; *outId = hitId;
+        return YES;
+    }
+    if (probe == GARNET_VS_PROBE_INCOMPAT_FLUSH) {
+        if (hitId) rdna4_vs_flush_entry_sync(hitId);
+        rdna4_vs_drain();
+        return NO;
+    }
+    if (!promote) return NO;
+
+    // Also inspect creation backtrace before Class 2 promotion so CreateCompositeDestination / capture
+    // surfaces allocated on newTexture(iosurface:) are permanently excluded from deferred writeback.
+    if (!isDisp && rdna4_vs_bt_is_capture()) {
+        pthread_mutex_lock(&RDNA4VS.mu);
+        garnet_vs_mark_capture_excluded(&RDNA4VS.c, vr.sid);
+        pthread_mutex_unlock(&RDNA4VS.mu);
+        return NO;
+    }
+
+    const VkFormatFeatureFlags needOpt = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                         VK_FORMAT_FEATURE_TRANSFER_DST_BIT | (attOK ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : 0);
+    if ((offs & needOpt) != needOpt) return NO;
+
+    uint32_t baseFmt = (uint32_t)fmt->vk, fmtListU32[2] = { 0, 0 }, fmtListCnt = 0;
+    (void)garnet_vs_format_family((uint32_t)fmt->vk, &baseFmt, fmtListU32, &fmtListCnt);
+    // Avoid VUID/DCC hazards: never combine STORAGE_BIT with sRGB-mutable format list, and never promote
+    // PixelFormatView surfaces whose format has no mutable view list (flags=0).
+    const BOOL wantStorage = (reqUse & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+    if (wantStorage && fmtListCnt == 2) return NO;
+    if ((mtlUsage & MTLTextureUsagePixelFormatView) && fmtListCnt == 0) return NO;
+
+    const VkFormat vkFmtList[2] = { (VkFormat)fmtListU32[0], (VkFormat)fmtListU32[1] };
+    VkImageFormatListCreateInfo flci = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = fmtListCnt, .pViewFormats = vkFmtList };
+    const VkImageUsageFlags superUse = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT |
+        (attOK ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |
+        (wantStorage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = fmtListCnt == 2 ? &flci : NULL,
+        .flags = fmtListCnt == 2 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
+        .imageType = VK_IMAGE_TYPE_2D, .format = (VkFormat)baseFmt,
+        .extent = { (uint32_t)w, (uint32_t)h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = superUse, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkImage optImg = VK_NULL_HANDLE;
+    if (vkCreateImage(RDNA4R.dev, &ic, NULL, &optImg) != VK_SUCCESS) return NO;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(RDNA4R.dev, optImg, &mr);
+    const int mt = rdna4_find_vram_hipool_mem(mr.memoryTypeBits);
+    if (mt < 0) { vkDestroyImage(RDNA4R.dev, optImg, NULL); return NO; }
+    VkMemoryAllocateInfo vma = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    VkDeviceMemory optMem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(RDNA4R.dev, &vma, NULL, &optMem) != VK_SUCCESS) {
+        vkDestroyImage(RDNA4R.dev, optImg, NULL); return NO;
+    }
+    if (vkBindImageMemory(RDNA4R.dev, optImg, optMem, 0) != VK_SUCCESS) {
+        vkDestroyImage(RDNA4R.dev, optImg, NULL); vkFreeMemory(RDNA4R.dev, optMem, NULL); return NO;
+    }
+    VkDeviceMemory entryImem = VK_NULL_HANDLE; BOOL entryImpHit = NO;
+    if (rdna4_imp_get(s, base, ialloc, ma, &entryImem, &entryImpHit) != VK_SUCCESS || !entryImem) {
+        vkDestroyImage(RDNA4R.dev, optImg, NULL); vkFreeMemory(RDNA4R.dev, optMem, NULL); return NO;
+    }
+    if (!entryImpHit) @synchronized ([GarnetDevice class]) { RDNA4R.impTotal += ialloc; }
+    VkExternalMemoryBufferCreateInfo emb = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &emb,
+        .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    VkBuffer entryIbuf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(RDNA4R.dev, &bc, NULL, &entryIbuf) != VK_SUCCESS ||
+        vkBindBufferMemory(RDNA4R.dev, entryIbuf, entryImem, 0) != VK_SUCCESS) {
+        if (entryIbuf) vkDestroyBuffer(RDNA4R.dev, entryIbuf, NULL);
+        rdna4_imp_put(entryImem);
+        vkDestroyImage(RDNA4R.dev, optImg, NULL);
+        vkFreeMemory(RDNA4R.dev, optMem, NULL);
+        return NO;
+    }
+
+    IOSurfaceRef owner = (IOSurfaceRef)CFRetain(s);
+    uint64_t finalId = 0;
+    BOOL raced = NO, abortInsert = NO;
+    uint64_t incompatId = 0;
+    rdna4_imp_fence(&st, &comp);
+    pthread_mutex_lock(&RDNA4VS.mu);
+    int reProbe = garnet_vs_probe(&RDNA4VS.c, &vr, (uint32_t)fmt->vk, (uint32_t)reqUse, rdna4_now(), st, &hitId);
+    if (reProbe == GARNET_VS_PROBE_HIT) {
+        garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, hitId);
+        if (e) { hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf; finalId = hitId; raced = YES; }
+    } else if (reProbe == GARNET_VS_PROBE_INCOMPAT_FLUSH) {
+        abortInsert = YES;
+        incompatId = hitId;
+    }
+    if (!raced && !abortInsert) {
+        finalId = garnet_vs_add(&RDNA4VS.c, &vr, (uint32_t)fmt->vk, (uint32_t)superUse, mr.size,
+                                (void *)optImg, (void *)optMem, (void *)entryIbuf, (void *)entryImem, (void *)owner, rdna4_now());
+        if (finalId) {
+            garnet_vs_set_bpp(&RDNA4VS.c, finalId, fmt->bpp);
+            atomic_fetch_add(&rdna4_alloc_total, mr.size);
+        } else {
+            abortInsert = YES;
+        }
+    }
+    pthread_mutex_unlock(&RDNA4VS.mu);
+
+    if (raced || abortInsert) {
+        vkDestroyImage(RDNA4R.dev, optImg, NULL);
+        vkFreeMemory(RDNA4R.dev, optMem, NULL);
+        vkDestroyBuffer(RDNA4R.dev, entryIbuf, NULL);
+        rdna4_imp_put(entryImem);
+        CFRelease(owner);
+        if (abortInsert) {
+            if (incompatId) rdna4_vs_flush_entry_sync(incompatId);
+            rdna4_vs_drain();
+            return NO;
+        }
+        *outImg = hitImg; *outIbuf = hitBuf; *outId = finalId;
+        return YES;
+    }
+    rdna4_vs_evict_if_needed();
+    *outImg = optImg; *outIbuf = entryIbuf; *outId = finalId;
+    return YES;
+}
+
+GARNET_INTERNAL void rdna4_vs_tick(void) {
+    if (!RDNA4VS.on) return;
+    atomic_store_explicit(&RDNA4VS.syncWb, access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0 ? 1 : 0, memory_order_relaxed);
+    rdna4_vs_evict_if_needed();
+}
+
+GARNET_INTERNAL void rdna4_vs_report(unsigned tick) {
+    if (!RDNA4VS.on) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    const garnet_vs_cache_t *c = &RDNA4VS.c;
+    const uint64_t sig = c->created + c->hits + c->uploads + c->uploads_skipped + c->lazy_writes + c->idle_flushes + c->evictions;
+    if (sig != RDNA4VS.lastSig || tick % 6 == 5) {
+        RDNA4VS.lastSig = sig;
+        RDNA4LOG("T1 vram_surf ON: live=%llu MiB (%zu entries) unused=%llu MiB dirty=%zu created=%llu hits=%llu misses=%llu uploads=%llu skipped=%llu lazy_wb=%llu sync_wb=%llu idle_flush=%llu incompat=%llu evict=%llu cap_excl=%llu [%s pid %d]",
+                 (unsigned long long)(c->live_bytes >> 20), c->n, (unsigned long long)(c->unused_bytes >> 20), c->dirty_count,
+                 (unsigned long long)c->created, (unsigned long long)c->hits, (unsigned long long)c->misses,
+                 (unsigned long long)c->uploads, (unsigned long long)c->uploads_skipped, (unsigned long long)c->lazy_writes,
+                 (unsigned long long)c->sync_writes, (unsigned long long)c->idle_flushes, (unsigned long long)c->incompat_flushes,
+                 (unsigned long long)c->evictions, (unsigned long long)c->capture_excluded_sids, getprogname(), (int)getpid());
+    }
+    pthread_mutex_unlock(&RDNA4VS.mu);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1501,7 +2135,15 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
     else if (RDNA4R.ok) {
         for (NSNumber *lvv in _lvViews.allValues) vkDestroyImageView(RDNA4R.dev, (VkImageView)(uintptr_t)lvv.unsignedLongLongValue, NULL);
         if (_view) vkDestroyImageView(RDNA4R.dev, _view, NULL);
-        if (_img && !_root) vkDestroyImage(RDNA4R.dev, _img, NULL);
+        if (_vramSurfCached) {
+            uint64_t vsId = _vramSurfId;
+            _vramSurfCached = NO; _vramSurfId = 0; _img = VK_NULL_HANDLE; _ibuf = VK_NULL_HANDLE;
+            rdna4_vs_put(vsId);
+        } else if (_img && !_root) {
+            if (_iosLinearCached) rdna4_linimg_put(_img);
+            else vkDestroyImage(RDNA4R.dev, _img, NULL);
+        }
+        _iosLinearCached = NO;
     }
     [_lvViews removeAllObjects];
     _view = VK_NULL_HANDLE; if (!_root) _img = VK_NULL_HANDLE;
@@ -1513,10 +2155,20 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
         if (_texelView) vkDestroyBufferView(RDNA4R.dev, _texelView, NULL);
         for (NSNumber *lvv in _lvViews.allValues) vkDestroyImageView(RDNA4R.dev, (VkImageView)(uintptr_t)lvv.unsignedLongLongValue, NULL);
         if (_view) vkDestroyImageView(RDNA4R.dev, _view, NULL);
-        if (_img && !_root) vkDestroyImage(RDNA4R.dev, _img, NULL);
-        if (_pooled) { rdna4_mem_free(&_pm); atomic_fetch_sub(&rdna4_alloc_total, _acct); }   // P1
-        else if (_mem) { vkFreeMemory(RDNA4R.dev, _mem, NULL); atomic_fetch_sub(&rdna4_alloc_total, _acct); }
-        if (_ibuf) vkDestroyBuffer(RDNA4R.dev, _ibuf, NULL);
+        if (_vramSurfCached) {
+            uint64_t vsId = _vramSurfId;
+            _vramSurfCached = NO; _vramSurfId = 0; _img = VK_NULL_HANDLE; _ibuf = VK_NULL_HANDLE;
+            rdna4_vs_put(vsId);
+        } else {
+            if (_img && !_root) {
+                if (_iosLinearCached) rdna4_linimg_put(_img);
+                else vkDestroyImage(RDNA4R.dev, _img, NULL);
+            }
+            _iosLinearCached = NO;
+            if (_pooled) { rdna4_mem_free(&_pm); atomic_fetch_sub(&rdna4_alloc_total, _acct); }   // P1
+            else if (_mem) { vkFreeMemory(RDNA4R.dev, _mem, NULL); atomic_fetch_sub(&rdna4_alloc_total, _acct); }
+            if (_ibuf) vkDestroyBuffer(RDNA4R.dev, _ibuf, NULL);
+        }
         if (_imem && _impShared) rdna4_imp_put(_imem);   // P4: the shared import goes back to the cache (kept 2 s; freed later through the fence)
         else if (_imem) { vkFreeMemory(RDNA4R.dev, _imem, NULL); @synchronized ([GarnetDevice class]) { RDNA4R.impTotal -= _ialloc; } }
     }
@@ -1656,14 +2308,23 @@ RDNA4_DNR(RDNA4Texture)
     if (impHit) { static _Atomic int nlog; if (atomic_fetch_add(&nlog, 1) < 8) RDNA4LOG("newTexture(iosurface): id %u import REUSED from the cache (%zu B)", IOSurfaceGetID(s), ialloc); }
     else @synchronized ([GarnetDevice class]) { RDNA4R.impTotal += ialloc; RDNA4LOG("newTexture(iosurface): imported %zu B (host memory type %d, bits 0x%x); running import total %llu B", ialloc, hmt, hp.memoryTypeBits, (unsigned long long)RDNA4R.impTotal); }
     _ialloc = ialloc; _ibase = (uint8_t *)base + poff; _ioff = poff; _ibpr = bpr; _ios = (IOSurfaceRef)CFRetain(s); rdna4_led_add(self, s, ialloc, spf, (uint32_t)pc, NO); _led = YES; _size = ialloc;   // F3: retained, not use-counted for its life; entered in the ledger
+    // S5.2a: classify display surfaces BEFORE Phase B VRAM cache lookup so Class 1 (_disp) promotes directly into hi-pool VRAM.
+    if (pc <= 1 && _w == sw && _h == sh && rdna4s_classify(sw, sh, spf, d.usage, bpr, alloc, IOSurfaceGetID(s), base)) {   // build 7: only an exact-size texture can be a display surface
+        _disp = YES;
+    }
     VkFormatFeatureFlags offs = rdna4_fmt_feats(_fmt);
     BOOL attOK = !(_fmt->flags & RDNA4F_A8) && (offs & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
     VkImageUsageFlags use = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (attOK ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |
                             ((d.usage & MTLTextureUsageShaderWrite) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
     const char *force = garnet_getenv("GARNET_IOS_PATH", "RDNA4M_IOS_PATH");   // test hook: "b" forces the copy path
+    if (RDNA4VS.on && RDNA4IC.on && _impShared && pc <= 1 && !(force && force[0] == 'a') &&
+        rdna4_vs_try_bind(s, base, ialloc, alloc, poff, _w, _h, bpr, _fmt, d.usage, use, offs, attOK, _disp, _hostReadOnly, &ma, &_img, &_ibuf, &_vramSurfId)) {
+        _vramSurfCached = YES;
+        _iosLinear = NO;
+    }
     // The first submitted segment restores the first-use snapshot with vkCmdCopyBufferToImage into the
     // LINEAR image bound to these host pages, even for a sampled-only use. RO imports need path (b).
-    BOOL tryA = !_hostReadOnly && !(force && force[0] == 'b');
+    BOOL tryA = !_vramSurfCached && !_hostReadOnly && !(force && force[0] == 'b');
     if (tryA) {   // path (a) needs the LINEAR-tiling features for every usage asked for (RADV does not check at vkCreateImage); otherwise the copy path (b)
         VkFormatProperties lfp = {0}; vkGetPhysicalDeviceFormatProperties(RDNA4R.pd, _fmt->vk, &lfp);
         VkFormatFeatureFlags lneed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
@@ -1672,8 +2333,20 @@ RDNA4_DNR(RDNA4Texture)
         else RDNA4LOG("newTexture(iosurface): LINEAR features 0x%x cover 0x%x for vk format %d", lfp.linearTilingFeatures, lneed, _fmt->vk);
     }
     if (tryA) {
+        const VkImageCreateFlags liFlags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        const rdna4li_key lk = { .id = IOSurfaceGetID(s), .base = (uint64_t)(uintptr_t)base, .size = ialloc, .poff = poff,
+                                 .w = (uint32_t)_w, .h = (uint32_t)_h, .bpr = bpr,
+                                 .vk_fmt = (uint32_t)_fmt->vk, .usage = (uint32_t)use, .flags = (uint32_t)liFlags,
+                                 .mem = (void *)_imem };
+        VkImage cachedImg = VK_NULL_HANDLE; int cachedInited = 0;
+        if (RDNA4IC.on && _impShared && rdna4_linimg_get(&lk, &cachedImg, &cachedInited)) {
+            _img = cachedImg;
+            _iosLinear = YES;
+            _iosLinearCached = YES;
+            if (cachedInited) { _iosLinearSubmitted = YES; _layout = VK_IMAGE_LAYOUT_GENERAL; }
+        } else {
         VkExternalMemoryImageCreateInfo emi = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
-        VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &emi, .flags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
+        VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &emi, .flags = liFlags, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
         VkImage li = VK_NULL_HANDLE; r = vkCreateImage(RDNA4R.dev, &ic, NULL, &li);
         if (r != VK_SUCCESS) RDNA4LOG("newTexture(iosurface): path (a) unavailable: linear vkCreateImage = %d", r);
@@ -1743,10 +2416,21 @@ RDNA4_DNR(RDNA4Texture)
             if (pitchOK && !fits && poff) RDNA4LOG("newTexture(iosurface): plane offset %lu: LINEAR bind at that offset not possible (image align %llu size %llu, import %zu) -> copy path (b)", (unsigned long)poff, (unsigned long long)mr.alignment, (unsigned long long)mr.size, ialloc);
             if (pitchOK && !fits) RDNA4LOG("newTexture(iosurface): path (a) unavailable: image requirements do not fit the import (size/alignment/memory type)");
             if (fits && !alreadyBound) { r = vkBindImageMemory(RDNA4R.dev, li, _imem, poff); if (r != VK_SUCCESS) { RDNA4LOG("newTexture(iosurface): path (a) unavailable: vkBindImageMemory = %d", r); fits = NO; } }
-            if (fits && li) { _img = li; _iosLinear = YES; } else if (li) vkDestroyImage(RDNA4R.dev, li, NULL);
+            if (fits && li) {
+                _iosLinear = YES;
+                if (RDNA4IC.on && _impShared) {
+                    int racedInited = 0;
+                    _img = rdna4_linimg_add(&lk, li, &racedInited);
+                    _iosLinearCached = YES;
+                    if (racedInited) { _iosLinearSubmitted = YES; _layout = VK_IMAGE_LAYOUT_GENERAL; }
+                } else {
+                    _img = li;
+                }
+            } else if (li) vkDestroyImage(RDNA4R.dev, li, NULL);
+        }
         }
     }
-    if (!_iosLinear) {   // path (b): optimal device-local image + a VkBuffer over the import
+    if (!_vramSurfCached && !_iosLinear) {   // path (b): optimal device-local image + a VkBuffer over the import
         VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
         r = vkCreateImage(RDNA4R.dev, &ic, NULL, &_img);
@@ -1769,27 +2453,27 @@ RDNA4_DNR(RDNA4Texture)
         if (r != VK_SUCCESS) IOSFAIL(88, @"vkBindImageMemory = %d", r);
         }
     }
-    // Both paths need a buffer alias: first-use preservation and scanout for (a), uploads/writeback for (b).
-    VkExternalMemoryBufferCreateInfo emb = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
-    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &emb,
-        .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
-    r = vkCreateBuffer(RDNA4R.dev, &bc, NULL, &_ibuf);
-    if (r != VK_SUCCESS) { _ibuf = VK_NULL_HANDLE; IOSFAIL(89, @"vkCreateBuffer(import) = %d", r); }
-    r = vkBindBufferMemory(RDNA4R.dev, _ibuf, _imem, 0);
-    if (r != VK_SUCCESS) IOSFAIL(90, @"vkBindBufferMemory(import) = %d", r);
+    // Both paths (a) and (b) need a buffer alias; Phase B VRAM-cached entries already borrow entry->ibuf.
+    if (!_vramSurfCached) {
+        VkExternalMemoryBufferCreateInfo emb = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+        VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &emb,
+            .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+        r = vkCreateBuffer(RDNA4R.dev, &bc, NULL, &_ibuf);
+        if (r != VK_SUCCESS) { _ibuf = VK_NULL_HANDLE; IOSFAIL(89, @"vkCreateBuffer(import) = %d", r); }
+        r = vkBindBufferMemory(RDNA4R.dev, _ibuf, _imem, 0);
+        if (r != VK_SUCCESS) IOSFAIL(90, @"vkBindBufferMemory(import) = %d", r);
+    }
     _levels = 1; _depth = 1;
     VkComponentMapping icm = rdna4_view_map(_fmt, _swz); _viewSwz = !rdna4_is_identity_map(&icm);
     VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = _img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
         .format = _fmt->vk, .components = icm, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     r = vkCreateImageView(RDNA4R.dev, &vc, NULL, &_view);
     if (r != VK_SUCCESS) IOSFAIL(91, @"vkCreateImageView = %d", r);
-    RDNA4LOGR("newTexture(iosurface) %p: plane %lu offset %lu %zux%zu bpr %zu pf %lu -> PATH (%s): %s", (__bridge void *)self, (unsigned long)plane, (unsigned long)poff, sw, sh, bpr, (unsigned long)_pf, _iosLinear ? "a" : "b",
-           _iosLinear ? "LINEAR VkImage bound directly to the imported IOSurface pages" : "optimal VkImage + copies to/from a VkBuffer over the imported pages (bufferRowLength = bytesPerRow/4)");
-    // S5.2a: is this one of CoreDisplay's display surfaces (D-copy source)? Both mapped paths have the import-buffer alias.
-    if (pc <= 1 && _w == sw && _h == sh && rdna4s_classify(sw, sh, spf, d.usage, bpr, alloc, IOSurfaceGetID(s), base)) {   // build 7: only an exact-size texture can be a display surface
-        _disp = YES;
-    }
+    RDNA4LOGR("newTexture(iosurface) %p: plane %lu offset %lu %zux%zu bpr %zu pf %lu -> PATH (%s): %s", (__bridge void *)self, (unsigned long)plane, (unsigned long)poff, sw, sh, bpr, (unsigned long)_pf,
+           _vramSurfCached ? "vram" : (_iosLinear ? "a" : "b"),
+           _vramSurfCached ? "OPTIMAL hi-pool VRAM cached surface (shared optImg, lazy writeback)" :
+           (_iosLinear ? "LINEAR VkImage bound directly to the imported IOSurface pages" : "optimal VkImage + copies to/from a VkBuffer over the imported pages (bufferRowLength = bytesPerRow/4)"));
     #undef IOSFAIL
     return self;
 }
@@ -1871,8 +2555,18 @@ RDNA4_DNR(RDNA4Texture)
 }
 - (BOOL)rdna4HostReadOnly { return _root ? [_root rdna4HostReadOnly] : (_hostReadOnly || [_hostBuf rdna4HostReadOnly]); }
 - (BOOL)rdna4IOSLinear { return _root ? [_root rdna4IOSLinear] : _iosLinear; }
-- (BOOL)rdna4IOSLinearNeedsInit { return _iosLinear && !_iosLinearSubmitted; }
-- (void)rdna4IOSLinearDidSubmit { _iosLinearSubmitted = YES; }
+- (BOOL)rdna4IOSLinearNeedsInit {
+    if (!_iosLinear || _iosLinearSubmitted) return NO;
+    if (_iosLinearCached && _img && rdna4_linimg_is_inited(_img)) {
+        _iosLinearSubmitted = YES;
+        _layout = VK_IMAGE_LAYOUT_GENERAL;
+        return NO;
+    }
+    return YES;
+}
+- (void)rdna4IOSLinearDidSubmit { _iosLinearSubmitted = YES; if (_iosLinearCached && _img) rdna4_linimg_mark_inited(_img); }
+- (BOOL)rdna4VramSurfCached { return _root ? [_root rdna4VramSurfCached] : _vramSurfCached; }
+- (uint64_t)rdna4VramSurfId { return _root ? [_root rdna4VramSurfId] : _vramSurfId; }
 - (VkBuffer)rdna4IOSBuffer { return _root ? [_root rdna4IOSBuffer] : (_hostBuf ? [_hostBuf vkBuffer] : _ibuf); }
 - (size_t)rdna4IOSBytesPerRow { return _root ? [_root rdna4IOSBytesPerRow] : _ibpr; }
 // 11e CPU access. Shared and Managed textures accept replaceRegion:/getBytes: (Managed has no separate CPU copy here: both are the one
@@ -1901,8 +2595,15 @@ RDNA4_DNR(RDNA4Texture)
         return;
     }
     if ([self rdna4IsIOS]) {   // 11h.6: the IOSurface (or no-copy buffer) memory IS the CPU copy; the GPU copy (path b) is re-uploaded at the first use in each command buffer
+        if ([self rdna4VramSurfCached]) {
+            const uint64_t vsId = [self rdna4VramSurfId];
+            const BOOL fullRegion = (r.origin.x == 0 && r.origin.y == 0 && r.size.width == _w && r.size.height == _h);
+            if (!fullRegion) (void)rdna4_vs_flush_entry_sync(vsId);
+            else rdna4_vs_wait_flush_done(vsId);
+        }
         uint8_t *base = (uint8_t *)[self rdna4IBase]; size_t stride = [self rdna4IOSBytesPerRow];
         for (NSUInteger y = 0; y < r.size.height; y++) memcpy(base + (r.origin.y + y) * stride + r.origin.x * _fmt->bpp, (const uint8_t *)bytes + y * bpr, rowBytes);
+        if ([self rdna4VramSurfCached]) rdna4_vs_invalidate_cpu([self rdna4VramSurfId]);
         RDNA4LOGR("replaceRegion: %lux%lu into the IOSurface memory", (unsigned long)r.size.width, (unsigned long)r.size.height); return;
     }
     if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG("replaceRegion: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
@@ -1953,6 +2654,7 @@ RDNA4_DNR(RDNA4Texture)
         return;
     }
     if ([self rdna4IsIOS]) {   // 11h.6: contents are current in the IOSurface / buffer memory once the writing command buffer has completed
+        if ([self rdna4VramSurfCached]) rdna4_vs_flush_entry_sync([self rdna4VramSurfId]);
         const uint8_t *base = [self rdna4IBase]; size_t stride = [self rdna4IOSBytesPerRow];
         for (NSUInteger y = 0; y < r.size.height; y++) memcpy((uint8_t *)dst + y * bpr, base + (r.origin.y + y) * stride + r.origin.x * _fmt->bpp, rowBytes);
         return;
@@ -2002,8 +2704,8 @@ RDNA4_DNR(RDNA4Texture)
 - (unsigned)rdna4CopyAspect { return [self rdna4IsDS] ? rdna4dp_copy_aspect([self rdna4Aspects]) : RDNA4DP_ASP_COLOR; }
 - (VkFormat)vkFormat { return _fmt->vk; }
 - (uint32_t)bytesPerPixel { return _fmt->bpp; }
-- (VkImageLayout)layout { return _root ? [_root layout] : _iosLinear ? VK_IMAGE_LAYOUT_GENERAL : _layout; }
-- (void)setLayout:(VkImageLayout)l { if (_root) [_root setLayout:l]; else if (!_iosLinear) _layout = l; }
+- (VkImageLayout)layout { return _root ? [_root layout] : _iosLinear ? VK_IMAGE_LAYOUT_GENERAL : _vramSurfCached ? rdna4_vs_get_layout(_vramSurfId) : _layout; }
+- (void)setLayout:(VkImageLayout)l { if (_root) [_root setLayout:l]; else if (_vramSurfCached) rdna4_vs_set_layout(_vramSurfId, l); else if (!_iosLinear) _layout = l; }
 - (id)device { return _dev; }
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
@@ -2118,6 +2820,12 @@ RDNA4_RESOURCE_SPI
         if (rdna4_fmt_is_bc(f) != rdna4_fmt_is_bc(root->_fmt)) VFAIL(95, @"cannot reinterpret between block-compressed and uncompressed formats (%lu -> %lu)", (unsigned long)root->_pf, (unsigned long)pf);
         if (f->bpp != root->_fmt->bpp) VFAIL(95, @"view pixel format %lu has %u bytes per pixel, the texture has %u", (unsigned long)pf, f->bpp, root->_fmt->bpp);
         if (!(root->_usage & MTLTextureUsagePixelFormatView)) VFAIL(96, @"the texture was not created with MTLTextureUsagePixelFormatView");
+        if (imageRoot->_vramSurfCached) {
+            uint32_t rootBase = (uint32_t)imageRoot->_fmt->vk;
+            const uint32_t rootFam = garnet_vs_format_family((uint32_t)imageRoot->_fmt->vk, &rootBase, NULL, NULL);
+            if (!garnet_vs_format_compatible(rootFam, rootBase, (uint32_t)f->vk))
+                VFAIL(96, @"view pixel format %lu is not in the cached VRAM image's mutable format list", (unsigned long)pf);
+        }
     }
     _root = root; _baseLevel = [root rdna4MipLevel:levels.location]; _baseSlice = [root rdna4Slice:slices.location]; _parentSlice = (uint32_t)slices.location; _dev = root->_dev;
     _imageFlags = imageRoot->_imageFlags; _tdk = view.kind; _layers = view.layersIvar;

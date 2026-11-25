@@ -138,4 +138,209 @@ static inline void rdna4cc_put(rdna4cc *c, uint32_t id, uint64_t base, uint64_t 
     if (v < 0) { v = 0; for (int i = 1; i < RDNA4CC_N; i++) if (c->e[i].use < c->e[v].use) v = i; }
     c->e[v] = (rdna4cc_ent){ 1, verdict, id, base, w, h, bpr, alloc, ++c->tick };
 }
+
+// ---- (C) linear VkImage reuse cache (Phase A4) ---------------------------------------------------------------------------------
+// Reuses PATH (a) LINEAR VkImage handles bound to shared RDNA4IC imports across short-lived RDNA4Texture wrappers,
+// preserving `inited` (already transitioned UNDEFINED -> GENERAL) so re-wrapped surfaces skip the 66 MB rdna4_ios_linear_init
+// copy round-trip. Always locked under RDNA4IC.mu and drained BEFORE rdna4ic_pop so vkDestroyImage precedes vkFreeMemory.
+typedef struct {
+    uint32_t id;
+    uint64_t base, size, poff;
+    uint32_t w, h;
+    uint64_t bpr;
+    uint32_t vk_fmt, usage, flags;
+    void *mem;   // exact VkDeviceMemory backing handle (prevents UAF across remaps at identical address)
+} rdna4li_key;
+
+typedef struct {
+    rdna4li_key k;
+    void *img;
+    int refs, stale, inited;
+    uint64_t lastUnref;
+} rdna4li_ent;
+
+typedef struct {
+    void *img;
+    uint64_t stamp;
+} rdna4li_rel;
+
+typedef struct {
+    int on;
+    size_t maxUnused;
+    rdna4li_ent *e;
+    size_t n, c, unused;
+    rdna4li_rel *rl;
+    size_t nrl, crl;
+    uint64_t created, reused, evIdle, evCap, evStale, mismatches;
+} rdna4li_cache;
+
+static inline void rdna4li_init(rdna4li_cache *c, int on, size_t maxUnused) {
+    memset(c, 0, sizeof *c);
+    c->on = on;
+    c->maxUnused = maxUnused ? maxUnused : 64;
+}
+
+static inline void rdna4li_destroy(rdna4li_cache *c) {
+    free(c->e);
+    free(c->rl);
+    const int on = c->on;
+    const size_t maxU = c->maxUnused;
+    memset(c, 0, sizeof *c);
+    c->on = on;
+    c->maxUnused = maxU;
+}
+
+static inline void rdna4li_release_ent(rdna4li_cache *c, size_t i, uint64_t stamp) {
+    if (c->nrl == c->crl) {
+        c->crl = c->crl ? c->crl * 2 : 16;
+        c->rl = (rdna4li_rel *)realloc(c->rl, c->crl * sizeof *c->rl);
+    }
+    c->rl[c->nrl++] = (rdna4li_rel){ c->e[i].img, stamp };
+    memmove(&c->e[i], &c->e[i + 1], (c->n - i - 1) * sizeof *c->e);
+    c->n--;
+}
+
+static inline void rdna4li_trim(rdna4li_cache *c, uint64_t now, uint64_t stamp) {
+    if (!c->on) return;
+    for (size_t i = 0; i < c->n;) {
+        if (c->e[i].refs == 0 && !c->e[i].stale && now > c->e[i].lastUnref && now - c->e[i].lastUnref > RDNA4IC_IDLE_NS) {
+            if (c->unused > 0) c->unused--;
+            c->evIdle++;
+            rdna4li_release_ent(c, i, stamp);
+        } else {
+            i++;
+        }
+    }
+}
+
+// Retire any unused cached linear VkImage whose bound VkDeviceMemory (or id/base/size when mem==NULL) is no longer active in `ic`.
+// Must be called under RDNA4IC.mu after rdna4ic_unref/trim/flush so vkDestroyImage always runs before vkFreeMemory.
+static inline void rdna4li_retire_orphans(rdna4li_cache *li, const rdna4ic_cache *ic, uint64_t stamp) {
+    if (!li->on) return;
+    for (size_t i = 0; i < li->n;) {
+        if (li->e[i].refs != 0 || li->e[i].stale) { i++; continue; }
+        int found = 0;
+        for (size_t j = 0; j < ic->n; j++) {
+            if (ic->e[j].stale) continue;
+            if (li->e[i].k.mem) {
+                if (ic->e[j].mem == li->e[i].k.mem) { found = 1; break; }
+            } else if (ic->e[j].id == li->e[i].k.id &&
+                       ic->e[j].base == li->e[i].k.base && ic->e[j].size == li->e[i].k.size) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (li->unused > 0) li->unused--;
+            li->evStale++;
+            rdna4li_release_ent(li, i, stamp);
+        } else {
+            i++;
+        }
+    }
+}
+
+static inline int rdna4li_key_eq(const rdna4li_key *a, const rdna4li_key *b) {
+    return a->id == b->id && a->base == b->base && a->size == b->size &&
+           a->poff == b->poff && a->w == b->w && a->h == b->h && a->bpr == b->bpr &&
+           a->vk_fmt == b->vk_fmt && a->usage == b->usage && a->flags == b->flags &&
+           a->mem == b->mem;
+}
+
+static inline int rdna4li_acquire(rdna4li_cache *c, const rdna4li_key *k, uint64_t now, uint64_t stamp,
+                                  void **imgOut, int *initedOut) {
+    if (!c->on) return 0;
+    rdna4li_trim(c, now, stamp);
+    int hit = 0;
+    for (size_t i = 0; i < c->n;) {
+        rdna4li_ent *e = &c->e[i];
+        if (e->k.id != k->id || e->stale) { i++; continue; }
+        if (e->k.base != k->base || e->k.size != k->size) {
+            c->mismatches++;
+            if (e->refs == 0) {
+                if (c->unused > 0) c->unused--;
+                c->evStale++;
+                rdna4li_release_ent(c, i, stamp);
+            } else {
+                e->stale = 1;
+                i++;
+            }
+            continue;
+        }
+        if (!hit && rdna4li_key_eq(&e->k, k)) {
+            if (e->refs == 0 && c->unused > 0) c->unused--;
+            e->refs++;
+            if (imgOut) *imgOut = e->img;
+            if (initedOut) *initedOut = e->inited;
+            c->reused++;
+            hit = 1;
+        }
+        i++;
+    }
+    return hit;
+}
+
+static inline void rdna4li_add(rdna4li_cache *c, const rdna4li_key *k, void *img, int inited) {
+    if (c->n == c->c) {
+        c->c = c->c ? c->c * 2 : 16;
+        c->e = (rdna4li_ent *)realloc(c->e, c->c * sizeof *c->e);
+    }
+    c->e[c->n++] = (rdna4li_ent){ *k, img, 1, 0, inited ? 1 : 0, 0 };
+    c->created++;
+}
+
+static inline void rdna4li_mark_inited(rdna4li_cache *c, void *img) {
+    for (size_t i = 0; i < c->n; i++) {
+        if (c->e[i].img == img) { c->e[i].inited = 1; return; }
+    }
+}
+
+static inline int rdna4li_is_inited(const rdna4li_cache *c, void *img) {
+    for (size_t i = 0; i < c->n; i++) {
+        if (c->e[i].img == img) return c->e[i].inited ? 1 : 0;
+    }
+    return 0;
+}
+
+static inline int rdna4li_unref(rdna4li_cache *c, void *img, uint64_t now, uint64_t stamp) {
+    for (size_t i = 0; i < c->n; i++) {
+        if (c->e[i].img != img) continue;
+        if (c->e[i].refs > 0) c->e[i].refs--;
+        if (c->e[i].refs == 0) {
+            if (c->e[i].stale) {
+                c->evStale++;
+                rdna4li_release_ent(c, i, stamp);
+            } else {
+                const size_t cap = c->maxUnused ? c->maxUnused : 64;
+                c->e[i].lastUnref = now;
+                c->unused++;
+                while (c->unused > cap) {
+                    size_t o = c->n;
+                    for (size_t k = 0; k < c->n; k++) {
+                        if (c->e[k].refs == 0 && !c->e[k].stale &&
+                            (o == c->n || c->e[k].lastUnref < c->e[o].lastUnref)) o = k;
+                    }
+                    if (o == c->n) break;
+                    c->unused--;
+                    c->evCap++;
+                    rdna4li_release_ent(c, o, stamp);
+                }
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static inline int rdna4li_pop(rdna4li_cache *c, uint64_t completed, void **imgOut) {
+    for (size_t i = 0; i < c->nrl; i++) {
+        if (c->rl[i].stamp <= completed) {
+            if (imgOut) *imgOut = c->rl[i].img;
+            memmove(&c->rl[i], &c->rl[i + 1], (c->nrl - i - 1) * sizeof *c->rl);
+            c->nrl--;
+            return 1;
+        }
+    }
+    return 0;
+}
 #endif

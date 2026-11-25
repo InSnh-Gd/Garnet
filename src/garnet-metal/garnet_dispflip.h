@@ -226,10 +226,57 @@ static inline int rdna4df_complete_surf(rdna4df_t *s, int slot, int vkres, uint6
 #define RDNA4DF_HOLD_MODE_OFF   0
 #define RDNA4DF_HOLD_MODE_FINAL 1
 #define RDNA4DF_HOLD_MODE_ALL   2
+#define RDNA4DF_HOLD_ADAPT_DECAY_FRAMES 8u
+#define RDNA4DF_HOLD_ADAPT_WINDOW_NS    (3000000ULL)   // covers observed 2.0-2.6 ms CoreDisplay G->C commit gaps
+typedef struct {
+    int armed;
+    uint32_t clean_streak;
+    uint32_t last_final_sid;
+    uint64_t last_final_tcommit;
+    uint64_t pair_gap_ns;
+    uint64_t zero_skips, rearms;
+} rdna4df_hold_adapt_t;
+static inline void rdna4df_hold_adapt_init(rdna4df_hold_adapt_t *a) {
+    memset(a, 0, sizeof *a);
+    a->armed = 1;
+}
 static inline int rdna4df_hold_effective(int mode, int cls) {
     if (mode == RDNA4DF_HOLD_MODE_ALL) return 1;
     if (mode == RDNA4DF_HOLD_MODE_FINAL) return cls == RDNA4DF_C_FINAL;
     return 0;
+}
+static inline int rdna4df_hold_adapt_effective(const rdna4df_hold_adapt_t *a, int mode, int cls) {
+    if (mode == RDNA4DF_HOLD_MODE_ALL) return 1;
+    if (mode == RDNA4DF_HOLD_MODE_FINAL) return cls == RDNA4DF_C_FINAL && (!a || a->armed);
+    return 0;
+}
+static inline void rdna4df_hold_adapt_note_final_commit(rdna4df_hold_adapt_t *a, uint32_t sid, uint64_t tcommit) {
+    if (!a || !sid || !tcommit) return;
+    a->last_final_sid = sid;
+    a->last_final_tcommit = tcommit;
+}
+static inline void rdna4df_hold_adapt_note_final(rdna4df_hold_adapt_t *a, uint32_t sid, uint64_t tcommit, int superseded) {
+    if (!a) return;
+    if (sid && tcommit) { a->last_final_sid = sid; a->last_final_tcommit = tcommit; }
+    if (superseded) {
+        a->armed = 1;
+        a->clean_streak = 0;
+    } else if (!a->armed) {
+        a->zero_skips++;
+    } else if (++a->clean_streak >= RDNA4DF_HOLD_ADAPT_DECAY_FRAMES) {
+        a->armed = 0;
+        a->clean_streak = 0;
+    }
+}
+static inline void rdna4df_hold_adapt_note_comp(rdna4df_hold_adapt_t *a, uint32_t sid, uint64_t tcommit) {
+    if (!a || !sid || !a->last_final_tcommit || a->last_final_sid != sid || tcommit < a->last_final_tcommit) return;
+    const uint64_t gap = tcommit - a->last_final_tcommit;
+    if (gap <= RDNA4DF_HOLD_ADAPT_WINDOW_NS) {
+        if (!a->armed) a->rearms++;
+        a->armed = 1;
+        a->clean_streak = 0;
+        a->pair_gap_ns = gap;
+    }
 }
 // File content -> H in ms: a decimal integer 1..8 (surrounding white space allowed) is H, anything else (empty, text, 0, 9, negative, 1.5) is the default 3.
 static inline int rdna4df_hold_parse(const char *buf, int n) {

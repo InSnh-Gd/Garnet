@@ -28,7 +28,7 @@ static void drain(void) {
 }
 static uint64_t testClockNs = 1000000000ull;
 static uint64_t rdna4_now(void) { return testClockNs; }
-static struct { pthread_mutex_t mu; rdna4df_t sm; _Atomic uint64_t seq; uint32_t pw, ph, pitch; rdna4_display_commit *commits; NSMutableIndexSet *incompleteSources; NSHashTable *incompleteImages; uint64_t incompleteSinceNs, incompleteLastFallbackNs; BOOL incompleteCapLogged; } RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static struct { pthread_mutex_t mu; pthread_cond_t holdCond; rdna4df_hold_adapt_t holdAdapt; rdna4df_t sm; _Atomic uint64_t seq; uint32_t pw, ph, pitch; rdna4_display_commit *commits; NSMutableIndexSet *incompleteSources; NSHashTable *incompleteImages; uint64_t incompleteSinceNs, incompleteLastFallbackNs; BOOL incompleteCapLogged; } RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER, .holdCond = PTHREAD_COND_INITIALIZER };
 static struct { rdna4df_t sm; } instances[3];
 #define RDNA4XI(i) instances[i]
 typedef struct { unsigned w, h, pitch_bytes; } rdna4x_desc_t;

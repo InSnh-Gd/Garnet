@@ -388,6 +388,10 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
     if (!self) { if (err) *err = rdna4_err(50, @"_MTLCommandQueue initWithDevice:descriptor: returned nil"); return nil; }
     pthread_mutex_init(&_qmu, NULL);
     garnet_vkpool_init(&_cmdPool, GARNET_VKPOOL_CMD_CAP);
+    const unsigned maxInFlight = (access(GARNET_SERIAL_QUEUE_FILE, F_OK) == 0)
+        ? GARNET_QP_SERIAL_MAX_INFLIGHT : GARNET_QP_DEFAULT_MAX_INFLIGHT;
+    garnet_qp_init(&_qp, maxInFlight);
+    _launchedCount = 0;
     _pending = [NSMutableArray array];
     _residencySets = [NSMutableArray array];
     // The base deallocator needs its dispatch objects even when RADV is unavailable.
@@ -451,20 +455,113 @@ RDNA4_DNR(RDNA4CommandQueue)
 - (id)device { return _ndev; }
 - (dispatch_queue_t)rdna4CompletionQueue { return _cq; }
 - (void)rdna4Kick { rdna4_schedule_kick(); }
+- (void)rdna4DrainOrderedCompletionsOnCQ {
+    for (;;) {
+        RDNA4CommandBuffer *head = nil;
+        void (^run)(void) = nil;
+        BOOL headFailed = NO;
+        pthread_mutex_lock(&self->_qmu);
+        if (self->_pending.count) {
+            RDNA4CommandBuffer *first = self->_pending.firstObject;
+            if (first->_fifoDoneBlock) {
+                head = first;
+                run = first->_fifoDoneBlock;
+                headFailed = first->_fifoDoneFailed;
+                first->_fifoDoneBlock = nil;
+                [self->_pending removeObjectAtIndex:0];
+                if (self->_launchedCount > 0) self->_launchedCount--;
+                garnet_qp_on_complete(&self->_qp, head->_launchedAsBarrier ? 1 : 0, headFailed ? 1 : 0);
+                head->_launchedAsBarrier = NO;
+            }
+        }
+        pthread_mutex_unlock(&self->_qmu);
+        if (!run) break;
+        run();
+        rdna4_schedule_kick();
+    }
+}
 - (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb {
-    BOOL removed = NO;
+    [self rdna4DidComplete:cb failed:NO];
+}
+- (void)rdna4DidComplete:(RDNA4CommandBuffer *)cb failed:(BOOL)failed {
+    BOOL removed = NO, drainNext = NO;
     pthread_mutex_lock(&_qmu);
-    if (_pending.firstObject == cb) { [_pending removeObjectAtIndex:0]; removed = YES; }
+    if (_pending.firstObject == cb) {
+        [_pending removeObjectAtIndex:0];
+        if (_launchedCount > 0) _launchedCount--;
+        garnet_qp_on_complete(&_qp, cb->_launchedAsBarrier ? 1 : 0, failed ? 1 : 0);
+        cb->_launchedAsBarrier = NO;
+        removed = YES;
+        if (_pending.count && _pending.firstObject->_fifoDoneBlock) drainNext = YES;
+    }
     pthread_mutex_unlock(&_qmu);
     if (!removed) RDNA4LOG("completion for a command buffer that is no longer this queue's head");
+    if (drainNext) dispatch_async(_cq, ^{ [self rdna4DrainOrderedCompletionsOnCQ]; });
     rdna4_schedule_kick();
 }
-- (BOOL)rdna4AdvanceHead {
-    RDNA4CommandBuffer *head = nil;
+- (void)rdna4EnqueueOrderedCompletion:(RDNA4CommandBuffer *)cb failed:(BOOL)failed block:(void (^)(void))block {
+    void (^copied)(void) = [block copy];
+    dispatch_async(_cq, ^{
+        cb->_fifoDoneBlock = copied;
+        cb->_fifoDoneFailed = failed;
+        [self rdna4DrainOrderedCompletionsOnCQ];
+    });
+}
+- (void)rdna4NoteElidedDCopy {
     pthread_mutex_lock(&_qmu);
-    if (_pending.count) head = _pending.firstObject;
+    _qp.elided_dcopies++;
     pthread_mutex_unlock(&_qmu);
-    return head ? [head rdna4AdvanceWithQueue:self] : NO;
+}
+- (BOOL)rdna4PendingHasNewerSid:(uint32_t)sid after:(RDNA4CommandBuffer *)cb {
+    if (!sid || !cb) return NO;
+    BOOL found = NO;
+    pthread_mutex_lock(&_qmu);
+    NSUInteger idx = [_pending indexOfObjectIdenticalTo:cb];
+    if (idx != NSNotFound) {
+        for (NSUInteger i = idx + 1; i < _pending.count; i++) {
+            if ([_pending[i] rdna4DisplayTargetSid] == sid) { found = YES; break; }
+        }
+    }
+    pthread_mutex_unlock(&_qmu);
+    return found;
+}
+- (BOOL)rdna4AdvanceHead {
+    for (;;) {
+        RDNA4CommandBuffer *cb = nil;
+        BOOL reAdvanceBarrier = NO;
+        BOOL eligible = NO;
+        pthread_mutex_lock(&_qmu);
+        if (_qp.barrier_active && _launchedCount > 0 && _pending.count > 0) {
+            cb = _pending.firstObject;
+            reAdvanceBarrier = YES;
+        } else if (_launchedCount < _pending.count) {
+            RDNA4CommandBuffer *cand = _pending[_launchedCount];
+            eligible = [cand rdna4PipelineEligible];
+            if (garnet_qp_can_launch(&_qp, eligible ? 1 : 0)) {
+                cb = cand;
+                garnet_qp_on_launch(&_qp, eligible ? 1 : 0);
+                cand->_launchedAsBarrier = !eligible;
+                _launchedCount++;
+            }
+        }
+        pthread_mutex_unlock(&_qmu);
+        if (!cb) return NO;
+        BOOL waiting = [cb rdna4AdvanceWithQueue:self];
+        if (waiting) {
+            if (!reAdvanceBarrier) {
+                pthread_mutex_lock(&_qmu);
+                if (_launchedCount > 0 && _pending[_launchedCount - 1] == cb) {
+                    _launchedCount--;
+                    garnet_qp_on_complete(&_qp, !eligible, 0);
+                    cb->_launchedAsBarrier = NO;
+                }
+                pthread_mutex_unlock(&_qmu);
+            }
+            return YES;
+        }
+        if (reAdvanceBarrier || !eligible) return NO;
+        if (atomic_load(&rdna4_submit_fault) != VK_SUCCESS) return NO;
+    }
 }
 // ---- gap census: MTLCommandQueueSPI, sent by SkyLight right after -newCommandQueue (census rdt1). Priorities are recorded; there is one hardware queue. ----
 // Return values as measured on an Apple-silicon Mac (mtlprobe apigaps): setGPUPriority: YES, the background setters NO.
@@ -582,6 +679,18 @@ static void rdna4_ios_linear_init(VkCommandBuffer cmd, RDNA4Texture *texture, RD
 }
 static void rdna4_ios_upload(RDNA4CommandBuffer *cb, RDNA4Texture *t) {
     VkCommandBuffer cmd = [cb vk];
+    if ([t rdna4VramSurfCached]) {
+        IOSurfaceRef ios = [t rdna4IOSRef];
+        const uint32_t seed = ios ? IOSurfaceGetSeed(ios) : 0u;
+        if (!rdna4_vs_needs_upload([t rdna4VramSurfId], seed, YES, NO, NO)) return;
+        rdna4_full_barrier(cmd);
+        rdna4_tex_to(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy bic = { .bufferOffset = [t rdna4IOSOffset], .bufferRowLength = (uint32_t)([t rdna4IOSBytesPerRow] / [t bytesPerPixel]), .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { (uint32_t)[t width], (uint32_t)[t height], 1 } };
+        vkCmdCopyBufferToImage(cmd, [t rdna4IOSBuffer], [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        rdna4_full_barrier(cmd);
+        return;
+    }
     rdna4_full_barrier(cmd);
     if ([t rdna4IOSLinear]) return;
     rdna4_image_transition(cmd, t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -590,9 +699,26 @@ static void rdna4_ios_upload(RDNA4CommandBuffer *cb, RDNA4Texture *t) {
     vkCmdCopyBufferToImage(cmd, [t rdna4IOSBuffer], [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     rdna4_full_barrier(cmd);
 }
-static BOOL rdna4_ios_writeback(VkCommandBuffer cmd, RDNA4Texture *t) {
+static BOOL rdna4_ios_writeback_ex(VkCommandBuffer cmd, RDNA4Texture *t, BOOL forceSync) {
     if (rdna4nc_drop_write(t, RDNA4NC_WRITEBACK, "IOSurface write-back", "BlitCommandEncoder")) return NO;
     if (![t rdna4IsIOS]) return YES;   // P6: a base-less display texture is in _iow but has no host copy
+    if ([t rdna4VramSurfCached]) {
+        IOSurfaceRef ios = [t rdna4IOSRef];
+        const uint32_t seed = ios ? IOSurfaceGetSeed(ios) : 0u;
+        const BOOL doSync = forceSync || rdna4_vs_sync_wb_on() || rdna4s_crc_on();
+        if (!doSync) {
+            rdna4_vs_note_write([t rdna4VramSurfId], seed, NO);
+            return YES;   // Phase B: stays resident in 320 GB/s OPTIMAL VRAM; 50 ms idle timer handles host quiescence
+        }
+        rdna4_tex_to(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy bic = { .bufferOffset = [t rdna4IOSOffset], .bufferRowLength = (uint32_t)([t rdna4IOSBytesPerRow] / [t bytesPerPixel]), .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { (uint32_t)[t width], (uint32_t)[t height], 1 } };
+        vkCmdCopyImageToBuffer(cmd, [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, [t rdna4IOSBuffer], 1, &bic);
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        rdna4_vs_note_write([t rdna4VramSurfId], seed, YES);
+        return YES;
+    }
     if (![t rdna4IOSLinear]) {
         rdna4_tex_to(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy bic = { .bufferOffset = [t rdna4IOSOffset], .bufferRowLength = (uint32_t)([t rdna4IOSBytesPerRow] / [t bytesPerPixel]), .bufferImageHeight = 0,
@@ -602,6 +728,9 @@ static BOOL rdna4_ios_writeback(VkCommandBuffer cmd, RDNA4Texture *t) {
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     return YES;
+}
+static BOOL rdna4_ios_writeback(VkCommandBuffer cmd, RDNA4Texture *t) {
+    return rdna4_ios_writeback_ex(cmd, t, NO);
 }
 static void rdna4_host_visibility_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -644,7 +773,13 @@ GARNET_INTERNAL BOOL rdna4_ios_touch(RDNA4CommandBuffer *cb, RDNA4Texture *t, BO
     if (!rdna4_ioalias_acts()) {
         if (d.flush) atomic_fetch_add(&RDNA4LED.iaWsFlush, 1);
         if (d.reupload) atomic_fetch_add(&RDNA4LED.iaWsReup, 1);
-        if (first && need) { if (endPass) endPass(); rdna4_ios_upload(cb, t); did = YES; }
+        if (first && need) {
+            if ([t rdna4VramSurfCached]) {
+                IOSurfaceRef ios = [t rdna4IOSRef];
+                if (!rdna4_vs_peek_needs_upload([t rdna4VramSurfId], ios ? IOSurfaceGetSeed(ios) : 0u)) return did;
+            }
+            if (endPass) endPass(); rdna4_ios_upload(cb, t); did = YES;
+        }
         return did;
     }
     if (d.flush) {
@@ -681,6 +816,10 @@ GARNET_INTERNAL void rdna4_ios_usek(RDNA4CommandBuffer *cb, RDNA4Texture *t, BOO
         return;
     }
     (void)rdna4_ios_touch(cb, t, needContents, write, NULL);   // build 16 (P1): the upload / flush decision; was: first touch && needContents -> upload
+    if (write && !needContents && [t rdna4VramSurfCached]) {
+        IOSurfaceRef ios = [t rdna4IOSRef];
+        rdna4_vs_note_full_clear([t rdna4VramSurfId], ios ? IOSurfaceGetSeed(ios) : 0u);
+    }
     if (needContents) [cb rdna4CBRead:t];
     if (write) { [cb rdna4IOWritten:t]; if (kind) [cb rdna4DispNote:t bits:kind pso:nil]; }
 }
@@ -742,6 +881,14 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     if (_curSegment) {
         if (!_curSegment->touches) _curSegment->touches = [NSMutableArray array];
         first = [_curSegment->touches indexOfObjectIdenticalTo:t] == NSNotFound;
+        if (first && [t rdna4VramSurfCached]) {
+            const uint64_t vsId = [t rdna4VramSurfId];
+            if (vsId) {
+                for (RDNA4Texture *prev in _curSegment->touches) {
+                    if ([prev rdna4VramSurfCached] && [prev rdna4VramSurfId] == vsId) { first = NO; break; }
+                }
+            }
+        }
         if (first) [_curSegment->touches addObject:t];
     }
     if (!_iot) { _iot = [NSMutableArray array]; _iow = [NSMutableArray array]; }
@@ -751,6 +898,17 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
         if ([t rdna4UCSurface]) {   // F3: from the first touch until the command buffer is finished with the GPU the surface is use-counted (rdna4UCRelease); a buffer-backed texture has no surface and no ledger entry
             (void)rdna4uc_take(&_uc, RDNA4LED.ucMode, (void *)[t rdna4UCSurface], rdna4_uc_inc, NULL);
             rdna4_led_touch(t, 1); _ucLive = YES;
+        }
+        if ([t rdna4VramSurfCached]) {
+            const uint64_t vsId = [t rdna4VramSurfId];
+            if (vsId) {
+                if (!_vsActive) _vsActive = [NSMutableArray array];
+                NSNumber *num = @(vsId);
+                if ([_vsActive indexOfObject:num] == NSNotFound) {
+                    [_vsActive addObject:num];
+                    rdna4_vs_cb_begin(vsId);
+                }
+            }
         }
     }
     return first;
@@ -767,7 +925,14 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
 }   // P1: flushed (copied back) mid-command-buffer: a later write-back must not copy the older image over a newer writer
 // F3: release each use count once after completion, device loss, or no submission.
 // Unresolved submissions remain retained and cannot reach dealloc.
+- (void)rdna4VSRelease {
+    if (!_vsActive.count) return;
+    NSArray<NSNumber *> *ids = [_vsActive copy];
+    [_vsActive removeAllObjects];
+    for (NSNumber *n in ids) rdna4_vs_cb_end(n.unsignedLongLongValue);
+}
 - (void)rdna4UCRelease {
+    [self rdna4VSRelease];
     if (!_ucLive) return;
     _ucLive = NO;
     rdna4uc_release(&_uc, rdna4_uc_dec, NULL);
@@ -848,6 +1013,7 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
 - (void)commitAndHold { [self commit]; }
 - (void)rdna4DisplayCommit {
     pthread_mutex_lock(&RDNA4S.mu);
+    BOOL woke = NO;
     for (int i = 0; i < _ndw; i++) {
         if (!_shaderFallback && !(_dw[i].mask & (RDNA4DF_W_DRAW_FINAL | RDNA4DF_W_DRAW_COMP))) continue;
         const uint32_t sid = [_dw[i].t rdna4DispSid];
@@ -855,7 +1021,13 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
         rdna4dc_commit_add(&RDNA4S.commits, &_displayCommits[i], sid, _tcommit);
         rdna4dc_commit_invalidate(&RDNA4S.sm, sid, _tcommit);
         for (int inst = 1; inst <= 2; inst++) rdna4dc_commit_invalidate(&RDNA4XI(inst).sm, sid, _tcommit);
+        if (_dw[i].mask & RDNA4DF_W_DRAW_FINAL)
+            rdna4df_hold_adapt_note_final_commit(&RDNA4S.holdAdapt, sid, _tcommit);
+        else if (_dw[i].mask & RDNA4DF_W_DRAW_COMP)
+            rdna4df_hold_adapt_note_comp(&RDNA4S.holdAdapt, sid, _tcommit);
+        woke = YES;
     }
+    if (woke) pthread_cond_broadcast(&RDNA4S.holdCond);
     pthread_mutex_unlock(&RDNA4S.mu);
 }
 - (void)rdna4DisplayUncommit {
@@ -1014,7 +1186,7 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
             segment->fence = VK_NULL_HANDLE;
         }
         if (_segments.count && _nq) {
-            VkCommandBuffer *commands = calloc(_segments.count, 2 * sizeof *commands);
+            VkCommandBuffer *commands = calloc(_segments.count, 3 * sizeof *commands);
             if (commands) {
                 uint32_t count = 0;
                 for (RDNA4CommandSegment *segment in _segments) {
@@ -1027,6 +1199,10 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
                         if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->linearInit];
                         else commands[count++] = segment->linearInit;
                     }
+                    if (segment->dispCopyVk) {
+                        if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->dispCopyVk];
+                        else commands[count++] = segment->dispCopyVk;
+                    }
                 }
                 if (count) {
                     rdna4_qlock();
@@ -1037,6 +1213,7 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
             }
         }
     }
+    [self rdna4VSRelease];
     pthread_mutex_destroy(&_smu);
 }
 RDNA4_DNR(RDNA4CommandBuffer)
@@ -1227,7 +1404,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     // cannot wait for terminal completion. Make the pages current before the fence.
     RDNA4LOGR("segment boundary: host write-back for %lu IOSurface texture(s)", (unsigned long)_eventDirty.count);
     for (RDNA4Texture *t in _eventDirty) {
-        if (!rdna4_ios_writeback(vk, t)) {
+        if (!rdna4_ios_writeback_ex(vk, t, _hasEvents)) {
             [self rdna4CBTraceSurface:t use:"writeback-refused"];
             [self rdna4Fail:@"IOSurface write-back destination is read-only"];
             return;
@@ -1392,15 +1569,17 @@ RDNA4_DNR(RDNA4CommandBuffer)
         [segment->argumentRefs removeAllObjects];
         [segment->commandRefs removeAllObjects];
     }
-    if (segment->vk || segment->linearInit) {
+    if (segment->vk || segment->linearInit || segment->dispCopyVk) {
         if (rdna4_cmd_pool_active() && _nq) {
             if (segment->vk) [_nq rdna4GiveCmdBuf:segment->vk];
             if (segment->linearInit) [_nq rdna4GiveCmdBuf:segment->linearInit];
+            if (segment->dispCopyVk) [_nq rdna4GiveCmdBuf:segment->dispCopyVk];
         } else {
-            VkCommandBuffer commands[2];
+            VkCommandBuffer commands[3];
             uint32_t count = 0;
             if (segment->vk) commands[count++] = segment->vk;
             if (segment->linearInit) commands[count++] = segment->linearInit;
+            if (segment->dispCopyVk) commands[count++] = segment->dispCopyVk;
             rdna4_qlock();
             vkFreeCommandBuffers(RDNA4R.dev, [_nq pool], count, commands);
             pthread_mutex_unlock(&RDNA4R.qlock);
@@ -1408,6 +1587,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
         if (_vk == segment->vk) _vk = VK_NULL_HANDLE;
         segment->vk = VK_NULL_HANDLE;
         segment->linearInit = VK_NULL_HANDLE;
+        segment->dispCopyVk = VK_NULL_HANDLE;
     }
     [self rdna4ReleaseSegmentDescriptorPools:segment];
     for (RDNA4FenceCheckpoint *checkpoint in segment->fenceUpdates) [checkpoint rdna4Ready];
@@ -1697,6 +1877,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
             if (rdna4dc_commit_newer(RDNA4S.commits, _dsid, _tcommit)) dsm->commit_sup[_dslot] = 1;
         }
         rdna4df_chain_submit(dsm, _dslot, _dcid, _dbid);
+        if (_dsid) pthread_cond_broadcast(&RDNA4S.holdCond);
         pthread_mutex_unlock(&RDNA4S.mu);
     }
     if (_dcrc && _dtex && [_dtex rdna4IOSRef]) rdna4s_crc_note(IOSurfaceGetID([_dtex rdna4IOSRef]), _dseq);   // CRC diagnostic: which surface this submission wrote
@@ -1708,6 +1889,65 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (![self rdna4Finish:&error]) _prepareErr = error ?: _encErr ?: rdna4_err(55, @"command buffer preparation failed");
     _prepared = YES;
 }
+- (BOOL)rdna4PipelineEligible {
+    RDNA4CommandSegment *seg = (_segments.count == 1) ? _segments.firstObject : nil;
+    const BOOL hostOnly = seg ? (seg->hostOnly || seg->argumentIntents.count != 0) : YES;
+    return garnet_qp_eligible(_hasEvents ? 1 : 0, (unsigned)_segments.count, hostOnly ? 1 : 0,
+                              [self rdna4NativeEligible] ? 1 : 0, _prepared ? 1 : 0,
+                              _prepareErr != nil ? 1 : 0) != 0;
+}
+- (uint32_t)rdna4DisplayTargetSid {
+    return _dsid;
+}
+// Layout-preserving image -> scanout slot copy for elidable dispCopyVk and deferred late copies:
+// transitions savedLayout -> TRANSFER_SRC_OPTIMAL and restores savedLayout inside the same command buffer
+// without mutating [t layout], so eliding dispCopyVk never causes VkImageLayout divergence or DCC UB.
+GARNET_INTERNAL void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4Texture *t, const rdna4df_plan_t *pl, VkImageLayout savedLayout) {
+    const int slot = pl->slot;
+    rdna4df_imgreg_t g;
+    const rdna4x_desc_t *const xd = rdna4x_desc((uint32_t)pl->inst);
+    const uint32_t gw = xd ? xd->w : RDNA4S.pw, gh = xd ? xd->h : RDNA4S.ph, gp = xd ? xd->pitch_bytes : RDNA4S.pitch;
+    VkBuffer *const slotBufs = xd ? RDNA4XI(pl->inst).buf : RDNA4S.buf;
+    const VkDeviceSize all = (VkDeviceSize)gp * gh;
+    const rdna4df_rect_t full = { 0, 0, (int32_t)gw, (int32_t)gh };
+    const VkImage img = [t vkImage];
+    if (savedLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        VkImageMemoryBarrier toSrc = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = savedLayout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &toSrc);
+    }
+    if (pl->base >= 0) {
+        VkBufferCopy bc = { .srcOffset = 0, .dstOffset = 0, .size = all };
+        vkCmdCopyBuffer(cmd, slotBufs[pl->base], slotBufs[slot], 1, &bc);
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    if (rdna4df_img_region(pl->base >= 0 ? pl->rect : full, gw, gh, gp, 4, &g)) {
+        VkBufferImageCopy bic = { .bufferOffset = g.buf_off, .bufferRowLength = g.row_len, .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { (int32_t)g.x, (int32_t)g.y, 0 }, .imageExtent = { g.w, g.h, 1 } };
+        vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slotBufs[slot], 1, &bic);
+        atomic_fetch_add(&rdna4s_imgcopies, 1);
+    }
+    if (savedLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        VkImageMemoryBarrier back = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = savedLayout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &back);
+    }
+}
+
 - (BOOL)rdna4Finish:(NSError **)err {
     if (_ended) return _encErr == nil;
     _ended = YES;
@@ -1739,11 +1979,41 @@ RDNA4_DNR(RDNA4CommandBuffer)
             if (take && !((imgsrc ? rdna4df_img_ok(gw_, gh_, gp_, 4) : (BOOL)YES) && [dt bytesPerPixel] == 4 && [dt width] == gw_ && [dt height] == gh_ && [dt rdna4Levels] == 1 && (imgsrc || [dt rdna4IOSBytesPerRow] == gp_))) {   // refuse before a slot is taken
                 static _Atomic int rl; if (atomic_fetch_add(&rl, 1) < 8) RDNA4LOG("scanout: display surface %u cannot be copied to the slot (%lux%lu bpp %lu bpr %lu, %s; plan %ux%u pitch %u): frame not copied", [dt rdna4DispSid], (unsigned long)[dt width], (unsigned long)[dt height], (unsigned long)[dt bytesPerPixel], (unsigned long)(imgsrc ? 0 : [dt rdna4IOSBytesPerRow]), imgsrc ? "no CPU mapping" : "buffer source", gw_, gh_, gp_);
                 take = NO; }
+            const BOOL vramImgSrc = imgsrc || [dt rdna4VramSurfCached];
+            if (take && vramImgSrc && !imgsrc && !rdna4df_img_ok(gw_, gh_, gp_, 4)) take = NO;
             int sl = take ? rdna4s_plan(dwr, pinst, ptent, &pl) : -1;
             // A mapped display copy reads the IOSurface pages (whether path (a) or (b)), so a CPU update
-            // after the signal is visible without touching the texture. Only a protected, base-less
-            // display surface copies from its image, and it has no CPU mapping to refresh.
-            if (sl >= 0) { rdna4_full_barrier(_vk); if (imgsrc) rdna4s_record_copy_img(_vk, dt, &pl); else rdna4s_record_copy(_vk, [dt rdna4DispBuf], [dt rdna4IOSOffset], &pl); rdna4_full_barrier(_vk); _dtex = dt; _dslot = sl; _dinst = pl.inst; _dcls = rdna4df_class(dmask); _dcid = pl.id; _dbid = pl.baseid; _dsid = [dt rdna4DispSid]; }
+            // after the signal is visible without touching the texture. A protected display surface or a
+            // Phase B VRAM-resident display surface copies directly from its OPTIMAL VkImage into the scanout slot.
+            if (sl >= 0) {
+                const VkImageLayout savedDispLayout = vramImgSrc ? [dt layout] : VK_IMAGE_LAYOUT_UNDEFINED;
+                VkCommandBuffer dcvk = (_nq && (!vramImgSrc || savedDispLayout != VK_IMAGE_LAYOUT_UNDEFINED))
+                    ? [_nq rdna4TakeCmdBuf:NULL] : VK_NULL_HANDLE;
+                VkCommandBufferBeginInfo dcbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+                if (dcvk && vkBeginCommandBuffer(dcvk, &dcbi) == VK_SUCCESS) {
+                    rdna4_full_barrier(dcvk);
+                    if (vramImgSrc) rdna4s_record_copy_img_preserve(dcvk, dt, &pl, savedDispLayout);
+                    else rdna4s_record_copy(dcvk, [dt rdna4DispBuf], [dt rdna4IOSOffset], &pl);
+                    rdna4_full_barrier(dcvk);
+                    if (vkEndCommandBuffer(dcvk) == VK_SUCCESS) {
+                        _curSegment->dispCopyVk = dcvk;
+                    } else {
+                        [_nq rdna4GiveCmdBuf:dcvk];
+                        dcvk = VK_NULL_HANDLE;
+                    }
+                } else if (dcvk) {
+                    [_nq rdna4GiveCmdBuf:dcvk];
+                    dcvk = VK_NULL_HANDLE;
+                }
+                if (!dcvk) {
+                    rdna4_full_barrier(_vk);
+                    if (vramImgSrc) rdna4s_record_copy_img(_vk, dt, &pl);
+                    else rdna4s_record_copy(_vk, [dt rdna4DispBuf], [dt rdna4IOSOffset], &pl);
+                    rdna4_full_barrier(_vk);
+                }
+                _dtex = dt; _dslot = sl; _dinst = pl.inst; _dcls = rdna4df_class(dmask); _dcid = pl.id; _dbid = pl.baseid; _dsid = [dt rdna4DispSid];
+            }
             else if (take && !imgsrc) { _dlate = YES; _dtex = dt; _dinst = pinst; _dcls = rdna4df_class(dmask); _dsid = [dt rdna4DispSid]; }
             if (rdna4s_crc_on() && pinst == RDNA4X_PLAN_DP) { _dcrc = YES; _dtex = dt; }   // bundle 13: the CRC diagnostic reads the DP's slot: never a monitor B frame
         }
@@ -1789,7 +2059,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (void)rdna4DeliverTerminalSuccessWithQueue:(RDNA4CommandQueue *)queue {
     rdna4_capture_surfaces(_iot, _cbid);
     [self rdna4ClearHostActions];
-    dispatch_async([queue rdna4CompletionQueue], ^{
+    void (^done)(void) = ^{
         self->_scheduleAfterPublish = NO;
         [self rdna4EnsureScheduledWithError:nil];
         [self rdna4CBFence:VK_SUCCESS];
@@ -1797,9 +2067,12 @@ RDNA4_DNR(RDNA4CommandBuffer)
         [self rdna4PoolDone];
         [queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:self->_encErr];
         [self rdna4ReleaseCompletionRefs];
-        [queue rdna4DidComplete:self];
         rdna4_mark_clean();
-    });
+    };
+    if ([queue respondsToSelector:@selector(rdna4EnqueueOrderedCompletion:failed:block:)])
+        [queue rdna4EnqueueOrderedCompletion:self failed:NO block:done];
+    else
+        dispatch_async([queue rdna4CompletionQueue], ^{ done(); [queue rdna4DidComplete:self]; });
 }
 
 - (void)rdna4DeliverTerminalFailure:(NSError *)err queue:(RDNA4CommandQueue *)queue unresolved:(BOOL)unresolved fault:(VkResult)fault {
@@ -1808,7 +2081,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     [self rdna4FailPendingFenceUpdates:fault];
     [self rdna4FailPendingSignals];
     if (unresolved) rdna4_quarantine(self, fault == VK_SUCCESS ? VK_ERROR_UNKNOWN : fault);
-    dispatch_async([queue rdna4CompletionQueue], ^{
+    void (^done)(void) = ^{
         [self rdna4EnsureScheduledWithError:err];
         if (!unresolved) {
             [self rdna4PoolDone];
@@ -1820,8 +2093,11 @@ RDNA4_DNR(RDNA4CommandBuffer)
         }
         [queue commandBufferDidComplete:self startTime:self->_startTime completionTime:rdna4_now() error:err];
         if (!unresolved) [self rdna4ReleaseCompletionRefs];
-        [queue rdna4DidComplete:self];
-    });
+    };
+    if ([queue respondsToSelector:@selector(rdna4EnqueueOrderedCompletion:failed:block:)])
+        [queue rdna4EnqueueOrderedCompletion:self failed:YES block:done];
+    else
+        dispatch_async([queue rdna4CompletionQueue], ^{ done(); [queue rdna4DidComplete:self]; });
 }
 - (void)rdna4TerminalSuccessWithQueue:(RDNA4CommandQueue *)queue {
     if (![self rdna4ClaimTerminal]) return;
@@ -1870,7 +2146,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (delivered) {
         [self rdna4FailPendingFenceUpdates:r];
         rdna4_quarantine(self, r);
-        [queue rdna4DidComplete:self];
+        if ([queue respondsToSelector:@selector(rdna4DidComplete:failed:)]) [queue rdna4DidComplete:self failed:YES];
+        else [queue rdna4DidComplete:self];
         return;
     }
     if (terminalClaimed) [self rdna4DeliverTerminalFailure:werr queue:queue unresolved:YES fault:r];
@@ -2130,10 +2407,9 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     }
     segment->fence = fence;
     _fence = fence;
-    VkCommandBuffer commands[] = { segment->linearInit, segment->vk };
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = segment->linearInit ? 2 : 1, .pCommandBuffers = segment->linearInit ? commands : commands + 1 };
-    BOOL submitAttempted = NO, nativeDone = NO;
+    const BOOL pendingNewerSameSid = (segment->dispCopyVk && _dslot >= 0 && _dsid)
+        ? [queue rdna4PendingHasNewerSid:_dsid after:self] : NO;
+    BOOL submitAttempted = NO, nativeDone = NO, elidedDispCopy = NO;
     uint64_t argumentSubmissionEpoch = 0;
     uint64_t tLock = rdna4_now(); rdna4_qlock(); tLock = rdna4_now() - tLock;
     if (tLock > 250000000ull) RDNA4LOG("SUBMIT STALL: the queue lock was held for %.1f ms before command buffer %llu (a frame thread waits here: the display freezes)", (double)tLock / 1e6, (unsigned long long)_cbid);
@@ -2143,6 +2419,28 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         if (_shaderFallback || (segment->terminal && !_dispSeqLogged)) {
             [self rdna4DispSeq];
             _dispSeqLogged = YES;
+        }
+        if (segment->dispCopyVk && _dslot >= 0) {
+            int elidedSlot = -1;
+            pthread_mutex_lock(&RDNA4S.mu);
+            rdna4df_t *const dsm = rdna4x_desc((uint32_t)_dinst) ? &RDNA4XI(_dinst).sm : &RDNA4S.sm;
+            if (garnet_qp_should_elide_dcopy(1, _dslot, dsm->damage,
+                                             rdna4df_is_superseded(dsm, _dslot),
+                                             pendingNewerSameSid ? 1 : 0) &&
+                dsm->inflight[_dslot]) {
+                elidedSlot = _dslot;
+                rdna4df_unsupersede(dsm, _dslot);
+                rdna4df_release_slot(dsm, _dslot);
+                dsm->superseded++;
+                if (_dcls == RDNA4DF_C_FINAL)
+                    rdna4df_hold_adapt_note_final(&RDNA4S.holdAdapt, _dsid, _tcommit, 1);
+                _dslot = -1; _dcid = 0; _dbid = 0;
+            }
+            pthread_mutex_unlock(&RDNA4S.mu);
+            if (elidedSlot >= 0) {
+                elidedDispCopy = YES;
+                rdna4cbl_skip(_dsid, _dseq, elidedSlot, "superseded-elided", 0);
+            }
         }
         if (!_cbSubmitLogged) {
             [self rdna4CBSubmit:_startTime];
@@ -2168,6 +2466,13 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
             }
         }
         if (r == VK_SUCCESS && !nativeDone) {
+            VkCommandBuffer commands[3];
+            uint32_t cmdCount = 0;
+            if (segment->linearInit) commands[cmdCount++] = segment->linearInit;
+            commands[cmdCount++] = segment->vk;
+            if (segment->dispCopyVk && !elidedDispCopy) commands[cmdCount++] = segment->dispCopyVk;
+            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = cmdCount, .pCommandBuffers = commands };
             submitAttempted = YES;
             r = vkQueueSubmit(RDNA4R.q, 1, &si, fence);
             if (r != VK_SUCCESS) atomic_store(&rdna4_submit_fault, (int)r);
@@ -2180,6 +2485,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         }
     }
     pthread_mutex_unlock(&RDNA4R.qlock);
+    if (elidedDispCopy && [queue respondsToSelector:@selector(rdna4NoteElidedDCopy)]) [queue rdna4NoteElidedDCopy];
     RDNA4LOGR("GPU segment submission result = %d (route=%s)", r, nativeDone ? "native-buffer" : "vulkan");
     if (submitAttempted || nativeDone) _submitAttempted = YES;
     if (r != VK_SUCCESS && !error) error = rdna4_err(53, [NSString stringWithFormat:@"GPU submission = %d", r]);
@@ -3315,6 +3621,12 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         const BOOL preserveOutsideClear = ca.loadAction == MTLLoadActionClear && [t rdna4IsIOS] &&
             (_w < attachmentWidth || _h < attachmentHeight);
         rdna4_ios_use(_cb, t, ca.loadAction != MTLLoadActionClear || preserveOutsideClear, YES);
+        if ([t rdna4VramSurfCached] && ca.loadAction == MTLLoadActionClear && !preserveOutsideClear) {
+            IOSurfaceRef ios = [t rdna4IOSRef];
+            rdna4_vs_note_full_clear([t rdna4VramSurfId], ios ? IOSurfaceGetSeed(ios) : 0u);
+        } else if ([t rdna4IsIOS] && ![t rdna4IsDisp] && ![t rdna4VramSurfCached]) {
+            rdna4_vs_observe_ws_write(t);
+        }
         [_cb rdna4DispNote:t bits:(RDNA4DF_W_PASS | (ca.loadAction == MTLLoadActionClear ? RDNA4DF_W_CLEAR : 0)) pso:nil];   // native #12 P1
         BOOL load = (ca.loadAction == MTLLoadActionLoad || ([t rdna4IsIOS] && ca.loadAction != MTLLoadActionClear)) && [t layout] != VK_IMAGE_LAYOUT_UNDEFINED;
         // The layout of a texture is tracked for the WHOLE image. A render pass only transitions its attachment's level, so a multi-level texture is moved to the attachment layout
@@ -5763,8 +6075,22 @@ RDNA4_ENCODER_SHARED
     if (o) { [_cb rdna4Fail:@"blit copyFromTexture:toTexture:options: blit options are not supported"]; return; }
     [self copyFromTexture:src sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:sz toTexture:dst destinationSlice:ds destinationLevel:dl destinationOrigin:dorg];
 }
-- (void)synchronizeResource:(id)r { (void)r; }   // Managed resources: host-visible coherent memory, nothing to flush
-- (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
+- (void)synchronizeResource:(id)r {
+    if (_ended || [_cb rdna4Error]) return;
+    if ([r isKindOfClass:[RDNA4Texture class]] && [(RDNA4Texture *)r rdna4VramSurfCached]) {
+        RDNA4Texture *t = [(RDNA4Texture *)r rootResource];
+        (void)[_cb rdna4IOFirstTouch:t];
+        if ([t layout] != VK_IMAGE_LAYOUT_UNDEFINED) {
+            rdna4_full_barrier([_cb vk]);
+            if (rdna4_ios_writeback_ex([_cb vk], t, YES)) {
+                [_cb rdna4NoteHostWriteback:t];
+                [_cb rdna4IOUnwrite:t];
+            }
+            rdna4_full_barrier([_cb vk]);
+        }
+    }
+}
+- (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)s; (void)l; [self synchronizeResource:t]; }
 - (void)pushDebugGroup:(NSString *)s { (void)s; }
 - (void)popDebugGroup {}
 - (void)endEncoding {
