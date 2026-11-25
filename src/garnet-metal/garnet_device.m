@@ -606,7 +606,7 @@ GARNET_INTERNAL NSData *rdna4_function_reflection_data(id function) {
             { [RDNA4CommandQueue class], "RDNA4CommandQueue", "MTLCommandQueue" }, { [RDNA4SamplerState class], "RDNA4SamplerState", "MTLSamplerState" }, { [RDNA4DepthStencilState class], "RDNA4DepthStencilState", "MTLDepthStencilState" },
             { [RDNA4Fence class], "RDNA4Fence", "MTLFence" }, { [RDNA4Heap class], "RDNA4Heap", "MTLHeap" }, { Nil, NULL, NULL } };
         unsigned total = rdna4cen_run(pairs);
-        if (getenv("RDNA4M_CENSUS")) { for (NSString *l in rdna4cen_lines) fprintf(stderr, "%s\n", l.UTF8String); fprintf(stderr, "census: %u selector(s) missing in all\n", total); }
+        if (garnet_getenv("GARNET_CENSUS", "RDNA4M_CENSUS")) { for (NSString *l in rdna4cen_lines) fprintf(stderr, "%s\n", l.UTF8String); fprintf(stderr, "census: %u selector(s) missing in all\n", total); }
     }
 }
 // build 18: the census lines saved by +load, logged once by a process that got a device.

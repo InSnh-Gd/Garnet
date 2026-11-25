@@ -92,16 +92,16 @@ int main(int argc, const char *argv[]) {
         if (!scratchRoot || !scratchRoot[0]) scratchRoot = "/private/tmp";
         int length = snprintf(scratch, sizeof scratch, "%s/rdna4-cold.XXXXXX", scratchRoot);
         if (length < 0 || (size_t)length >= sizeof scratch || !mkdtemp(scratch)) fail(@"mkdtemp");
-        setenv("RDNA4M_ALLOW", "1", 1);
-        setenv("RDNA4M_TEST_INPROC", "1", 1);
-        setenv("RDNA4M_TEST_USERCACHE", scratch, 1);
-        setenv("RDNA4M_TEST_SIDE_DIR", scratch, 1);
-        setenv("RDNA4M_TEST_HIDE_BUNDLE_SPV", "1", 1);
+        setenv("GARNET_ALLOW", "1", 1);
+        setenv("GARNET_TEST_INPROC", "1", 1);
+        setenv("GARNET_TEST_USERCACHE", scratch, 1);
+        setenv("GARNET_TEST_SIDE_DIR", scratch, 1);
+        setenv("GARNET_TEST_HIDE_BUNDLE_SPV", "1", 1);
         // Reproduce the admitted application's former fallback policy.
-        if (!refuse && !daemon && !timeout && !concurrent) setenv("RDNA4M_TEST_FALLBACK_AS_WS", "1", 1);
-        else if (concurrent) { unsetenv("RDNA4M_TEST_FALLBACK_AS_WS"); unsetenv("RDNA4M_FORCE_FALLBACK"); }
+        if (!refuse && !daemon && !timeout && !concurrent) setenv("GARNET_TEST_FALLBACK_AS_WS", "1", 1);
+        else if (concurrent) { unsetenv("GARNET_TEST_FALLBACK_AS_WS"); unsetenv("GARNET_FORCE_FALLBACK"); unsetenv("RDNA4M_TEST_FALLBACK_AS_WS"); unsetenv("RDNA4M_FORCE_FALLBACK"); }
         if (daemon) {
-            char *args[] = { (char *)argv[4], "--source", "/private/tmp/rdna4m", "--output", scratch,
+            char *args[] = { (char *)argv[4], "--source", "/private/tmp/garnet-xlate", "--output", scratch,
                 "--library", (char *)argv[2], NULL };
             if (posix_spawn(&daemonPid, argv[4], NULL, NULL, args, environ)) fail(@"spawn translator daemon");
             setprogname("WindowServer");

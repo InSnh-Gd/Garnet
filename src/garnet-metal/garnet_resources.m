@@ -16,7 +16,7 @@
 //  * Descriptor pools of a command buffer go to a fence-gated free list (cap 32) instead of being destroyed.
 // IOSurface / host-pointer imports, the scanout slots (RDNA4S.mem) and heaps' budgets are untouched.
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_POOL_FILE "/private/tmp/rdna4m-pool"
+#define RDNA4_POOL_FILE "/private/tmp/garnet-pool"
 // The heap needs retirement serials even when the memory pool is OFF. Keep a second
 // fence-only timeline under the same mutex, while the pool timeline remains gated by
 // its own switch.
@@ -226,7 +226,7 @@ GARNET_INTERNAL VkDescriptorPool rdna4_dp_take(void) {   // VK_NULL_HANDLE: none
 //    already bound in the current render pass; remembers the last (topology, cull, front, pso) -> VkPipeline answer.
 //  * Render passes are cached device-wide by their attachment descriptions (<= 64, never destroyed while the device lives; beyond the cap created / destroyed as before).
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_DRAWOPT_FILE "/private/tmp/rdna4m-drawopt"
+#define RDNA4_DRAWOPT_FILE "/private/tmp/garnet-drawopt"
 GARNET_INTERNAL RDNA4DrawOptState RDNA4DO = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL _Atomic int rdna4_dw_logged;   // P5b: how many "scanout: display write" lines rdna4s_disp_account has printed (it prints the pipeline-name list of the first 20 only)
 GARNET_INTERNAL void rdna4_drawopt_latch(void) {
@@ -254,7 +254,7 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
 //  * An import given up is vkFreeMemory'd only once the P1 fence has cleared the serial taken when it was given up (stamp 0 / completed 0 when the pool is OFF = as today).
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_IMPCACHE_KILL_FILE "/private/tmp/rdna4m-noimpcache"   // build 16 (F2): the cache is ON by default; this file switches it OFF (latched once per process). The old presence file rdna4m-impcache is no longer read.
+#define RDNA4_IMPCACHE_KILL_FILE "/private/tmp/garnet-noimpcache"   // build 16 (F2): the cache is ON by default; this file switches it OFF (latched once per process).
 static struct { BOOL on; pthread_mutex_t mu; rdna4ic_cache c; _Atomic uint64_t baseless; uint64_t lastSig; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_imp_latch(void) {
     static int done; if (done) return; done = 1;
@@ -293,7 +293,7 @@ GARNET_INTERNAL void rdna4_imp_tick(void) {
 // Every import allocation goes through here so the F1 test hook can refuse it: RDNA4M_TEST_IMPORT_FAIL_EVERY=<n> (root + RDNA4M_ALLOW=1) fails every n-th attempt like a kernel that is out of import budget.
 static unsigned long rdna4f1_ctr; static unsigned rdna4f1_every = (unsigned)-1;
 static VkResult rdna4_import_alloc(const VkMemoryAllocateInfo *ma, VkDeviceMemory *out) {
-    if (rdna4f1_every == (unsigned)-1) { const char *e = getenv("RDNA4M_TEST_IMPORT_FAIL_EVERY"); rdna4f1_every = (rdna4_allow() && e) ? (unsigned)atoi(e) : 0; }
+    if (rdna4f1_every == (unsigned)-1) { const char *e = garnet_getenv("GARNET_TEST_IMPORT_FAIL_EVERY", "RDNA4M_TEST_IMPORT_FAIL_EVERY"); rdna4f1_every = (rdna4_allow() && e) ? (unsigned)atoi(e) : 0; }
     if (rdna4f1_inject(rdna4f1_every, &rdna4f1_ctr)) { *out = VK_NULL_HANDLE; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
     return vkAllocateMemory(RDNA4R.dev, ma, NULL, out);
 }
@@ -1569,7 +1569,7 @@ RDNA4_DNR(RDNA4Texture)
     BOOL attOK = !(_fmt->flags & RDNA4F_A8) && (offs & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
     VkImageUsageFlags use = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (attOK ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |
                             ((d.usage & MTLTextureUsageShaderWrite) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
-    const char *force = getenv("RDNA4M_IOS_PATH");   // test hook: "b" forces the copy path
+    const char *force = garnet_getenv("GARNET_IOS_PATH", "RDNA4M_IOS_PATH");   // test hook: "b" forces the copy path
     // The first submitted segment restores the first-use snapshot with vkCmdCopyBufferToImage into the
     // LINEAR image bound to these host pages, even for a sampled-only use. RO imports need path (b).
     BOOL tryA = !_hostReadOnly && !(force && force[0] == 'b');

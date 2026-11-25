@@ -86,7 +86,7 @@ static const RDNA4Fmt rdna4_fmts[] = {
 };
 
 
-#define RDNA4_NOUINT_FILE "/private/tmp/rdna4m-nouint"   // bundle 19: exists -> the integer formats are refused as before (nil), read ONCE per process
+#define RDNA4_NOUINT_FILE "/private/tmp/garnet-nouint"   // bundle 19: exists -> the integer formats are refused as before (nil), read ONCE per process
 static BOOL rdna4_nouint(void) {
     static BOOL v; static dispatch_once_t once;
     dispatch_once(&once, ^{ struct stat st; v = stat(RDNA4_NOUINT_FILE, &st) == 0; if (v) RDNA4LOG("integer colour formats (RG16Uint) OFF: kill file " RDNA4_NOUINT_FILE " exists (read once per process)"); });
@@ -733,10 +733,10 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
     // outside IOAccelerator fence tracking. Do not publish the command buffer as
     // scheduled until its GPU fence and host-visibility barrier complete; a
     // WindowServer, CA Whippet, or CPU capture consumer may read the surface as
-    // soon as scheduled is visible. The /private/tmp/rdna4m-early-schedule kill
+    // soon as scheduled is visible. The /private/tmp/garnet-early-schedule kill
     // file restores early scheduling.
     if ([t rdna4IsIOS] &&
-        access("/private/tmp/rdna4m-early-schedule", F_OK) != 0 && !_scheduleAfterPublish) {
+        access("/private/tmp/garnet-early-schedule", F_OK) != 0 && !_scheduleAfterPublish) {
         _scheduleAfterPublish = YES;
         RDNA4_ONCE("scheduled publication deferred until IOSurface write completes");
     }
@@ -809,8 +809,8 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
 - (BOOL)commitAndWaitUntilSubmitted {
     const BOOL ws = rdna4_is_ws();
     [self commit];
-    if (ws && access("/private/tmp/rdna4m-no-ws-completion", F_OK) != 0 &&
-        ([self rdna4IsFrame] || access("/private/tmp/rdna4m-ws-completion-all", F_OK) == 0)) {
+    if (ws && access("/private/tmp/garnet-no-ws-completion", F_OK) != 0 &&
+        ([self rdna4IsFrame] || access("/private/tmp/garnet-ws-completion-all", F_OK) == 0)) {
         RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: waiting for GPU completion on display frames");
         // A display frame's completion wait is on WindowServer's frame path: when it
         // takes long, the picture on the monitor stops changing for exactly that long.
@@ -823,7 +823,7 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
                                             (double)waited / 1e6, (unsigned long long)_cbid, (unsigned long)_segments.count,
                                             (unsigned long)[self status]);
     } else {
-        if (ws && access("/private/tmp/rdna4m-no-ws-completion", F_OK) == 0)
+        if (ws && access("/private/tmp/garnet-no-ws-completion", F_OK) == 0)
             RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: completion wait disabled");
         [self waitUntilScheduled];
     }
@@ -1769,7 +1769,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (void)rdna4FenceWait:(RDNA4CommandSegment *)segment queue:(RDNA4CommandQueue *)queue {
     static _Atomic int testUsed;
     static long testMs = -1;
-    if (testMs < 0) { const char *e = getenv("RDNA4M_TEST_TIMEOUT_MS"); testMs = e ? atol(e) : 0; }
+    if (testMs < 0) { const char *e = garnet_getenv("GARNET_TEST_TIMEOUT_MS", "RDNA4M_TEST_TIMEOUT_MS"); testMs = e ? atol(e) : 0; }
     BOOL testWait = testMs > 0 && atomic_exchange(&testUsed, 1) == 0;
     long tms = testMs;
     uint64_t t1 = _readyTime;

@@ -12,8 +12,9 @@ python3 "$D/assemble-device.py" "$D/GarnetDevice.m" --output "$W/device.m"
 python3 - "$W/device.m" "$W/t.c" <<'PY'
 import sys
 s=open(sys.argv[1]).read()
-a=s.index('static int rdna4_dump_dir_ready(char *sub, size_t subn) {'); b=s.index('// A dump file appears under its final name only when complete')
-h='''#include <stdio.h>
+a=s.index('GARNET_INTERNAL int rdna4_dump_dir_ready(char *sub, size_t subn) {'); b=s.index('// A dump file appears under its final name only when complete')
+h='''#define GARNET_INTERNAL static
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>

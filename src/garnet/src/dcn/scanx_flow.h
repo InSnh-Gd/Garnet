@@ -59,7 +59,7 @@ inline constexpr XDesc kDescMonB = {
     RDNA4D2_HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS, RDNA4D2_HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, 0x3c8au, RDNA4D2_HUBPREQ2_DCSURF_FLIP_CONTROL,
     RDNA4D2_HUBPREQ2_DCSURF_SURFACE_EARLIEST_INUSE, RDNA4D2_HUBPREQ2_DCSURF_SURFACE_EARLIEST_INUSE_HIGH,
     RDNA4D2_DCN_VM_FAULT_STATUS, RDNA4D2_OTG2_FRAME_COUNT, RDNA4D2_OTG2_OTG_MASTER_UPDATE_LOCK, RDNA4D2_ODM2_OPTC_INPUT_GLOBAL_CONTROL, RDNA4D2_OTG2_CONTROL,
-    "/private/tmp/rdna4m-noflip2", "monitor B" };
+    "/private/tmp/garnet-noflip2", "monitor B" };
 // the monitor A: 1920x1080, pitch 7680 B (0x77f), A/B = 127 x 64 KiB = 8,323,072 B each (Run B), HUBP1 / OTG1. 0x3b81 / 0x3b83 / 0x3b85 / 0x3bae have no RDNA4D2_ names yet (their expected values are the census table in disp2.h).
 inline constexpr XDesc kDescMonA = {
     1u, 1u, 0u, 0x10u, 1920u, 1080u, 1920u, 0x77Fu, 8294400ull, 8323072ull,
@@ -67,7 +67,7 @@ inline constexpr XDesc kDescMonA = {
     RDNA4D2_HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS, RDNA4D2_HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, 0x3baeu, RDNA4D2_HUBPREQ1_DCSURF_FLIP_CONTROL,
     RDNA4D2_HUBPREQ1_DCSURF_SURFACE_EARLIEST_INUSE, RDNA4D2_HUBPREQ1_DCSURF_SURFACE_EARLIEST_INUSE_HIGH,
     RDNA4D2_DCN_VM_FAULT_STATUS, RDNA4D2_OTG1_FRAME_COUNT, RDNA4D2_OTG1_OTG_MASTER_UPDATE_LOCK, RDNA4D2_ODM1_OPTC_INPUT_GLOBAL_CONTROL, RDNA4D2_OTG1_CONTROL,
-    "/private/tmp/rdna4m-noflip1", "monitor A" };
+    "/private/tmp/garnet-noflip1", "monitor A" };
 // THE lookup: nullptr for any instance this file does not own (0 = the DP is instance-0 code, anything else is unknown).
 constexpr const XDesc *desc_of(uint32_t inst) { return inst == 1u ? &kDescMonA : inst == 2u ? &kDescMonB : nullptr; }
 // which instance a TAGGED slot id belongs to (0 = none): the glue's cross-instance defence and the tests

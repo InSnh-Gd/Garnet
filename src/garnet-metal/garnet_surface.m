@@ -17,8 +17,8 @@
 //    until the command buffer is finished with the GPU (rdna4PoolDone / dealloc). Kill file /private/tmp/rdna4m-nousecount = never (Apple-identical), latched once per process.
 //  * P1, the ALIAS GATE: applications act on the per-command-buffer aliasing decisions; WindowServer only counts them (it keeps build 14's behaviour exactly). Kill file /private/tmp/rdna4m-noioalias.
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_NOUSECOUNT_FILE "/private/tmp/rdna4m-nousecount"
-#define RDNA4_NOIOALIAS_FILE  "/private/tmp/rdna4m-noioalias"
+#define RDNA4_NOUSECOUNT_FILE "/private/tmp/garnet-nousecount"
+#define RDNA4_NOIOALIAS_FILE  "/private/tmp/garnet-noioalias"
 GARNET_INTERNAL RDNA4LedgerState RDNA4LED = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_led_latch(void) {
     static dispatch_once_t o;
@@ -121,11 +121,11 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
 // the six radv_darwin_scanout_* exports of the loaded RADV (same per-process RDNA4N connection). The state machine is the pure garnet_dispflip.h (host test:
 // test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/rdna4m-noflip (read once per process); one mutex around every scanout call.
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_NOFLIP_FILE "/private/tmp/rdna4m-noflip"
-#define RDNA4_PRESENTALL_FILE "/private/tmp/rdna4m-presentall"   // native #12 P2 kill switch: present EVERY display write (the pre-final-pass-rule behaviour); polled every 1 s
-#define RDNA4_DAMAGE_FILE "/private/tmp/rdna4m-damage"   // native #12 D2: partial-update emulation + SkyLight composite passes count as frames; DEFAULT OFF; polled every 1 s
-#define RDNA4_HOLD_FILE "/private/tmp/rdna4m-hold"   // native #12 P3 present hold: present = ALL mode, content "1".."8" = H in ms, else 3; polled every 1 s
-#define RDNA4_NOHOLD_FILE "/private/tmp/rdna4m-nohold"   // kill switch disabling default FINAL present hold; polled every 1 s
+#define RDNA4_NOFLIP_FILE "/private/tmp/garnet-noflip"
+#define RDNA4_PRESENTALL_FILE "/private/tmp/garnet-presentall"   // native #12 P2 kill switch: present EVERY display write (the pre-final-pass-rule behaviour); polled every 1 s
+#define RDNA4_DAMAGE_FILE "/private/tmp/garnet-damage"   // native #12 D2: partial-update emulation + SkyLight composite passes count as frames; DEFAULT OFF; polled every 1 s
+#define RDNA4_HOLD_FILE "/private/tmp/garnet-hold"   // native #12 P3 present hold: present = ALL mode, content "1".."8" = H in ms, else 3; polled every 1 s
+#define RDNA4_NOHOLD_FILE "/private/tmp/garnet-nohold"   // kill switch disabling default FINAL present hold; polled every 1 s
 static struct { _Atomic int mode, ms; uint64_t held, held_sup, held_pres, hold_ns; } RDNA4H = { .mode = RDNA4DF_HOLD_MODE_FINAL, .ms = RDNA4DF_HOLD_DEFAULT_MS };   // switch state (atomics); counters are written by the present queue under RDNA4S.mu
 
 
@@ -249,7 +249,7 @@ static const char *rdna4s_reason_name(int r) {
     static const char *n[] = { "none/released-on-request", "kill-file", "missing-export", "ENOSYS", "plane-geometry", "scanout-error", "plane-lost", "slot-alloc" };
     return r >= 0 && r < (int)(sizeof n / sizeof n[0]) ? n[r] : "?";
 }
-GARNET_INTERNAL BOOL rdna4s_testmode(void) { const char *e = getenv("RDNA4M_TEST_DISPFLIP"); return rdna4_allow() && e && !strcmp(e, "1"); }
+GARNET_INTERNAL BOOL rdna4s_testmode(void) { const char *e = garnet_getenv("GARNET_TEST_DISPFLIP", "RDNA4M_TEST_DISPFLIP"); return rdna4_allow() && e && !strcmp(e, "1"); }
 
 // Release the plane (idempotent in the kernel) and stop the keep-alive. Called with the mutex held, at most once per process by the state machine's rule.
 static void rdna4s_do_release_locked(void) {
@@ -805,7 +805,7 @@ GARNET_INTERNAL void rdna4s_record_copy(VkCommandBuffer cmd, VkBuffer src, VkDev
 // ---- opt-in per-frame CRC diagnostic (NATIVE-S5-FLIP.md "Tearing diagnostic (CRC)"). Off unless /private/tmp/rdna4m-crc exists (polled every 2 s, WindowServer only; the
 // file may hold a row step (default 64) and the word "noslot" = skip the slot read, which is the expensive part: the slot is write-combined BAR memory). Per frame that carries a copy: A1 = sampled CRC of the display surface's import memory after the fence, B = the same rows of the
 // slot, A2 = the surface again after B, C = the surface again just before scanout_present. Reads only; nothing here changes what is copied or presented.
-#define RDNA4_CRC_FILE "/private/tmp/rdna4m-crc"
+#define RDNA4_CRC_FILE "/private/tmp/garnet-crc"
 GARNET_INTERNAL RDNA4CRCState RDNA4C = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL BOOL rdna4s_crc_on(void) {
     if (!rdna4_is_ws()) return NO;
@@ -864,7 +864,7 @@ static void rdna4s_crc_free(rdna4crc_rec_t *r) { if (!r) return; if (r->ios) CFR
 //   C commit      S submit      F fence done      P present attempt (rc=0 means accepted)      X present skipped
 //   I inversion case (first 20 per enable)       E end
 // ---------------------------------------------------------------------------------------------------------------
-#define RDNA4_CBLOG_FLAG "/private/tmp/rdna4m-cblog"
+#define RDNA4_CBLOG_FLAG "/private/tmp/garnet-cblog"
 #define RDNA4_CBLOG_CAP (50ull << 20)
 GARNET_INTERNAL RDNA4CBLogState RDNA4CB = { .fd = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL _Atomic uint64_t rdna4cb_ids;
@@ -893,7 +893,7 @@ static void rdna4cbl_poll(void) {   // 1 s timer
     struct stat sb; int want = stat(RDNA4_CBLOG_FLAG, &sb) == 0;
     pthread_mutex_lock(&RDNA4CB.mu);
     if (want && !atomic_load(&RDNA4CB.on) && !RDNA4CB.capped) {
-        char path[96]; snprintf(path, sizeof path, "/private/var/tmp/rdna4m-cblog.%d.txt", (int)getpid());
+        char path[96]; snprintf(path, sizeof path, "/private/var/tmp/garnet-cblog.%d.txt", (int)getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0) { static int warned; if (!warned) { warned = 1; RDNA4LOG("cblog: cannot open %s: errno %d", path, errno); } }
         else {
@@ -1242,7 +1242,7 @@ GARNET_INTERNAL void rdna4s_late_complete(RDNA4Texture *texture, int inst, uint6
 #endif // GARNET_DISPLAY_LATE_ONLY
 #if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
 // Opt-in snapshots of compositor inputs after GPU completion, before their use counts are released.
-#define RDNA4_CAPTURE_FLAG "/private/tmp/rdna4m-surfaces"
+#define RDNA4_CAPTURE_FLAG "/private/tmp/garnet-surfaces"
 static BOOL rdna4_capture_on(void) {
     if (!rdna4_is_ws() && !rdna4_allow()) return NO;
     static _Atomic uint64_t next;
@@ -1312,10 +1312,10 @@ GARNET_INTERNAL void rdna4_capture_surfaces(NSArray *textures, uint64_t cbid) {
 #endif // !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
 #if defined(GARNET_PRESENT_CAPTURE_ONLY) || (!defined(GARNET_DISPLAY_LATE_ONLY))
 #ifndef RDNA4_PRESENT_CAPTURE_FLAG
-#define RDNA4_PRESENT_CAPTURE_FLAG "/private/tmp/rdna4m-present-capture"
+#define RDNA4_PRESENT_CAPTURE_FLAG "/private/tmp/garnet-present-capture"
 #endif
 #ifndef RDNA4_PRESENT_FULL_FLAG
-#define RDNA4_PRESENT_FULL_FLAG "/private/tmp/rdna4m-present-full"
+#define RDNA4_PRESENT_FULL_FLAG "/private/tmp/garnet-present-full"
 #endif
 static BOOL rdna4_capture_scan_matches(const struct rdna4n_scan_status *status, int slot, uint64_t presentId) {
     return status->acquired && !status->flags && status->presents == presentId &&

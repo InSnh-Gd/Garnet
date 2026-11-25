@@ -72,16 +72,16 @@ int main(int argc, char **argv) {
     { int ok = 1; for (int v = 0; v <= 6; v++) ok &= strcmp(rdna4g_probe_text(v), "?") != 0; CHECK("G4: every verdict has a text", ok); }
     // ---- G5 ----
     { char p[300];
-      CHECK("G5: WindowServer: /private/var/tmp when writable", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_WS, NULL, 1, "/var/folders/xx/C/", "WindowServer") && !strcmp(p, "/private/var/tmp/rdna4m-pipecache.bin"));
-      CHECK("G5: WindowServer: /private/tmp when /private/var/tmp is not writable", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_WS, NULL, 0, "/x/", "WindowServer") && !strcmp(p, "/private/tmp/rdna4m-pipecache.bin"));
-      CHECK("G5: a root tool honours the test directory", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_ROOT, "/tmp/t", 1, "/x/", "mtlprobe") && !strcmp(p, "/tmp/t/rdna4m-pipecache.bin"));
-      CHECK("G5: an application gets its OWN file in the user cache dir", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/var/folders/xx/C/", "mpv") && !strcmp(p, "/var/folders/xx/C/rdna4m-pipecache.mpv.bin"));
-      CHECK("G5: ... even if /private/var/tmp is writable and a test dir is offered", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, "/tmp/t", 1, "/c/", "app") && !strcmp(p, "/c/rdna4m-pipecache.app.bin"));
-      CHECK("G5: the cache dir without a trailing slash still works", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 0, "/c", "app") && !strcmp(p, "/c/rdna4m-pipecache.app.bin"));
+      CHECK("G5: WindowServer: /private/var/tmp when writable", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_WS, NULL, 1, "/var/folders/xx/C/", "WindowServer") && !strcmp(p, "/private/var/tmp/garnet-pipecache.bin"));
+      CHECK("G5: WindowServer: /private/tmp when /private/var/tmp is not writable", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_WS, NULL, 0, "/x/", "WindowServer") && !strcmp(p, "/private/tmp/garnet-pipecache.bin"));
+      CHECK("G5: a root tool honours the test directory", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_ROOT, "/tmp/t", 1, "/x/", "mtlprobe") && !strcmp(p, "/tmp/t/garnet-pipecache.bin"));
+      CHECK("G5: an application gets its OWN file in the user cache dir", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/var/folders/xx/C/", "mpv") && !strcmp(p, "/var/folders/xx/C/garnet-pipecache.mpv.bin"));
+      CHECK("G5: ... even if /private/var/tmp is writable and a test dir is offered", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, "/tmp/t", 1, "/c/", "app") && !strcmp(p, "/c/garnet-pipecache.app.bin"));
+      CHECK("G5: the cache dir without a trailing slash still works", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 0, "/c", "app") && !strcmp(p, "/c/garnet-pipecache.app.bin"));
       CHECK("G5: an application with no user cache dir has NO cache (never /private/var/tmp)", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "", "mpv") == 0 && p[0] == 0 && rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, NULL, "mpv") == 0);
-      CHECK("G5: path separators and odd characters in the program name are neutralised", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "../a b/c") && !strcmp(p, "/c/rdna4m-pipecache..._a_b_c.bin") && strchr(p + 3, '/') == NULL);
-      CHECK("G5: an empty program name becomes app", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "") && !strcmp(p, "/c/rdna4m-pipecache.app.bin"));
-      CHECK("G5: a long program name is cut to 40 characters", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "0123456789012345678901234567890123456789ZZZZ") && !strcmp(p, "/c/rdna4m-pipecache.0123456789012345678901234567890123456789.bin"));
+      CHECK("G5: path separators and odd characters in the program name are neutralised", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "../a b/c") && !strcmp(p, "/c/garnet-pipecache..._a_b_c.bin") && strchr(p + 3, '/') == NULL);
+      CHECK("G5: an empty program name becomes app", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "") && !strcmp(p, "/c/garnet-pipecache.app.bin"));
+      CHECK("G5: a long program name is cut to 40 characters", rdna4g_pcache_path(p, sizeof p, RDNA4G_CLASS_OTHER, NULL, 1, "/c/", "0123456789012345678901234567890123456789ZZZZ") && !strcmp(p, "/c/garnet-pipecache.0123456789012345678901234567890123456789.bin"));
       CHECK("G5: a buffer too small -> no cache, empty path", rdna4g_pcache_path(p, 20, RDNA4G_CLASS_WS, NULL, 1, "", "x") == 0 && p[0] == 0);
       CHECK("G5: who saves: WindowServer yes, root only with the switch, an application yes", rdna4g_pcache_save(RDNA4G_CLASS_WS, 0) == 1 && rdna4g_pcache_save(RDNA4G_CLASS_ROOT, 0) == 0 && rdna4g_pcache_save(RDNA4G_CLASS_ROOT, 1) == 1 && rdna4g_pcache_save(RDNA4G_CLASS_OTHER, 0) == 1);
     }
@@ -99,7 +99,23 @@ int main(int argc, char **argv) {
     CHECK("G7: ExclusiveAccess is the IOReturn value", RDNA4G_KR_EXCLUSIVE == 0xe00002c5u);
     CHECK("G7: ABI minor is 13", RDNA4N_ABI_MINOR == 13u);
     // ---- G9 ----
-    CHECK("G9: the by-class text is 0.0.632's refusal, word for word", !strcmp(RDNA4G_DECLINE_BY_CLASS_TEXT, "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set"));
+    CHECK("G9: the by-class text names GARNET_ALLOW=1", !strcmp(RDNA4G_DECLINE_BY_CLASS_TEXT, "process is not WindowServer and GARNET_ALLOW=1 (as root) is not set"));
+    // ---- G9b (1D migration): GARNET_* priority + 1-release RDNA4M_* fallback & kill-file pair ----
+    { int leg = -1;
+      const char *v = rdna4g_getenv_pair("1", "0", &leg);
+      CHECK("G9b: GARNET_* takes priority over RDNA4M_*", v && !strcmp(v, "1") && leg == 0);
+      v = rdna4g_getenv_pair("0", "1", &leg);
+      CHECK("G9b: explicit GARNET_*=0 overrides legacy RDNA4M_*=1", v && !strcmp(v, "0") && leg == 0);
+      v = rdna4g_getenv_pair(NULL, "1", &leg);
+      CHECK("G9b: unset GARNET_* falls back to RDNA4M_* and flags deprecation", v && !strcmp(v, "1") && leg == 1);
+      v = rdna4g_getenv_pair(NULL, NULL, &leg);
+      CHECK("G9b: both unset returns NULL", v == NULL && leg == 0);
+      CHECK("G9b: new kill file present wins without legacy flag", rdna4g_kill_state_pair(0, 0, -1, ENOENT, &leg) == RDNA4G_KILL_PRESENT && leg == 0);
+      CHECK("G9b: legacy kill file present when new absent triggers kill + legacy flag", rdna4g_kill_state_pair(-1, ENOENT, 0, 0, &leg) == RDNA4G_KILL_PRESENT && leg == 1);
+      CHECK("G9b: new kill file unreadable fails closed immediately", rdna4g_kill_state_pair(-1, EPERM, -1, ENOENT, &leg) == RDNA4G_KILL_UNREADABLE && leg == 0);
+      CHECK("G9b: legacy kill file unreadable when new absent fails closed", rdna4g_kill_state_pair(-1, ENOENT, -1, EPERM, &leg) == RDNA4G_KILL_UNREADABLE && leg == 0);
+      CHECK("G9b: both kill files absent -> ABSENT", rdna4g_kill_state_pair(-1, ENOENT, -1, ENOENT, &leg) == RDNA4G_KILL_ABSENT && leg == 0);
+    }
     CHECK("G9: the bound is 501, the kernel's kAppMinUid", RDNA4G_APP_MIN_EUID == 501u);
     { static const uint32_t euids[] = { 0, 1, 88, 89, 200, 499, 500, 501, 502, 1000, 65534, 0xFFFFFFFFu };
       int declined = 0, probed = 0;
@@ -117,7 +133,7 @@ int main(int argc, char **argv) {
     CHECK("G10: a directory owned by someone else is refused (a planted one)", !rdna4g_dumpdir_ok(0, 1, 0, 88, 501) && !rdna4g_dumpdir_ok(0, 1, 0, 501, 0) && !rdna4g_dumpdir_ok(0, 1, 0, 0, 501));
     CHECK("G10: a failed lstat or a plain file is refused", !rdna4g_dumpdir_ok(-1, 1, 0, 501, 501) && !rdna4g_dumpdir_ok(0, 0, 0, 501, 501));
     CHECK("G10: any group / other bit is narrowed, 0700 is left alone", rdna4g_dumpdir_needs_narrow(0777) && rdna4g_dumpdir_needs_narrow(0770) && rdna4g_dumpdir_needs_narrow(0707) && rdna4g_dumpdir_needs_narrow(0755) && rdna4g_dumpdir_needs_narrow(01777) && !rdna4g_dumpdir_needs_narrow(0700) && !rdna4g_dumpdir_needs_narrow(0500));
-    CHECK("G10: the parent is /tmp/rdna4m", !strcmp(RDNA4G_DUMP_DIR, "/tmp/rdna4m"));
+    CHECK("G10: the parent is /private/tmp/garnet-xlate", !strcmp(RDNA4G_DUMP_DIR, "/private/tmp/garnet-xlate"));
     // ---- G12 (build 6, C1 finding A): the parent (sticky 01777) and the per-uid subdirectory ----
     CHECK("G12: parent: a real sticky-1777 directory owned by root, by the caller or by the daemon user is usable", rdna4g_dumproot_ok(0, 1, 0, 0, 041777, 501) && rdna4g_dumproot_ok(0, 1, 0, 501, 041777, 501) && rdna4g_dumproot_ok(0, 1, 0, 88, 01777, 88) && rdna4g_dumproot_ok(0, 1, 0, RDNA4G_DAEMON_UID, 01777, 501));
     CHECK("G12: parent: a symlink, a failed lstat or a plain file is refused", !rdna4g_dumproot_ok(0, 0, 1, 0, 01777, 501) && !rdna4g_dumproot_ok(-1, 1, 0, 0, 01777, 501) && !rdna4g_dumproot_ok(0, 0, 0, 0, 01777, 501));
@@ -126,9 +142,9 @@ int main(int argc, char **argv) {
     CHECK("G12: parent: extra setuid / setgid bits are refused", !rdna4g_dumproot_ok(0, 1, 0, 0, 03777, 501) && !rdna4g_dumproot_ok(0, 1, 0, 0, 05777, 501));
     CHECK("G12: parent repair: only a parent that is OURS and not 1777 is repaired", rdna4g_dumproot_needs_fix(88, 88, 0700) && rdna4g_dumproot_needs_fix(501, 501, 01755) && !rdna4g_dumproot_needs_fix(501, 501, 01777) && !rdna4g_dumproot_needs_fix(0, 501, 0700) && !rdna4g_dumproot_needs_fix(88, 501, 0700));
     { char sp[64];
-      CHECK("G12: the subdirectory is /tmp/rdna4m/<euid>", rdna4g_dumpsub_path(sp, sizeof sp, 501) && !strcmp(sp, "/tmp/rdna4m/501"));
-      CHECK("G12: WindowServer (88) keeps ITS OWN subdirectory", rdna4g_dumpsub_path(sp, sizeof sp, 88) && !strcmp(sp, "/tmp/rdna4m/88"));
-      CHECK("G12: distinct uids give distinct subdirectories, uid 0 included, the largest uid fits", rdna4g_dumpsub_path(sp, sizeof sp, 0) && !strcmp(sp, "/tmp/rdna4m/0") && rdna4g_dumpsub_path(sp, sizeof sp, 4294967294u) && !strcmp(sp, "/tmp/rdna4m/4294967294"));
+      CHECK("G12: the subdirectory is /private/tmp/garnet-xlate/<euid>", rdna4g_dumpsub_path(sp, sizeof sp, 501) && !strcmp(sp, "/private/tmp/garnet-xlate/501"));
+      CHECK("G12: WindowServer (88) keeps ITS OWN subdirectory", rdna4g_dumpsub_path(sp, sizeof sp, 88) && !strcmp(sp, "/private/tmp/garnet-xlate/88"));
+      CHECK("G12: distinct uids give distinct subdirectories, uid 0 included, the largest uid fits", rdna4g_dumpsub_path(sp, sizeof sp, 0) && !strcmp(sp, "/private/tmp/garnet-xlate/0") && rdna4g_dumpsub_path(sp, sizeof sp, 4294967294u) && !strcmp(sp, "/private/tmp/garnet-xlate/4294967294"));
       CHECK("G12: a too-small buffer yields 0 and an empty string", rdna4g_dumpsub_path(sp, 8, 501) == 0 && sp[0] == 0); }
     CHECK("G12: the daemon user is nobody (uid -2)", RDNA4G_DAEMON_UID == 4294967294u);
     // Actual delayed compiler/output checks live in test-cold-pipelines.sh.
@@ -404,9 +420,24 @@ int main(int argc, char **argv) {
             }
             unlink(dpath);
         }
-        int missErr = 0;
+        int missErr = 0, usedLeg = 0;
         CHECK("G16: missing denylist file (ENOENT) safely falls back to NONE",
               rdna4g_denylist_eval(RDNA4G_CLASS_OTHER, dpath, "com.good.App", "GoodName", &missErr) == RDNA4G_DENY_NONE && missErr == ENOENT);
+        char lpath[512];
+        snprintf(lpath, sizeof lpath, "%s/test-gate-denylist-legacy.%d.txt", tmpd, (int)getpid());
+        FILE *lfp = fopen(lpath, "w");
+        if (lfp) {
+            fprintf(lfp, "proc:LegacyDeniedProc\n");
+            fclose(lfp);
+            CHECK("G16: missing primary denylist falls back to legacy denylist and flags deprecation",
+                  rdna4g_denylist_eval_with_fallback(RDNA4G_CLASS_OTHER, dpath, lpath, "com.good.App", "LegacyDeniedProc", &missErr, &usedLeg) == RDNA4G_DENY_PROC && usedLeg == 1);
+            FILE *pfp = fopen(dpath, "w");
+            if (pfp) { fprintf(pfp, "# empty primary\n"); fclose(pfp); }
+            CHECK("G16: existing primary denylist takes precedence and does NOT read legacy denylist",
+                  rdna4g_denylist_eval_with_fallback(RDNA4G_CLASS_OTHER, dpath, lpath, "com.good.App", "LegacyDeniedProc", &missErr, &usedLeg) == RDNA4G_DENY_NONE && usedLeg == 0);
+            unlink(dpath);
+            unlink(lpath);
+        }
     }
     printf("test-gate: %d checks, %d failed\n", runs, fails);
     return fails ? 1 : 0;

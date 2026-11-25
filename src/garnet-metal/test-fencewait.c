@@ -322,10 +322,11 @@ int main(int argc, char **argv) {
               strstr(fw_body, "(__bridge_transfer RDNA4CommandQueue *)qRef") != NULL &&
               strstr(fw_body, "dispatch_async(completionQueue, ^{") != NULL,
               "CFBridgingRetain -> __bridge_transfer on completionQueue");
-        CHECK("pin: FENCE PENDING, FENCE STALL, and RDNA4M_TEST_TIMEOUT_MS preserved",
+        CHECK("pin: FENCE PENDING, FENCE STALL, and GARNET_TEST_TIMEOUT_MS preserved",
               strstr(cb, "FENCE PENDING:") != NULL &&
               strstr(cb, "FENCE STALL:") != NULL &&
-              fw_body != NULL && strstr(fw_body, "RDNA4M_TEST_TIMEOUT_MS") != NULL &&
+              fw_body != NULL && strstr(fw_body, "GARNET_TEST_TIMEOUT_MS") != NULL &&
+              strstr(fw_body, "RDNA4M_TEST_TIMEOUT_MS") != NULL &&
               strstr(fw_body, "TEST_TIMEOUT:") != NULL,
               "diagnostics and test hook intact");
         const char *iow = strstr(cb, "- (void)rdna4IOWritten:");

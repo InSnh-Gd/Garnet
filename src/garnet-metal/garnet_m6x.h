@@ -33,8 +33,8 @@
 
 #define RDNA4X_INST_MONA     1u
 #define RDNA4X_INST_MONB     2u
-#define RDNA4X_NOFLIP1_FILE  "/private/tmp/rdna4m-noflip1"
-#define RDNA4X_NOFLIP2_FILE  "/private/tmp/rdna4m-noflip2"
+#define RDNA4X_NOFLIP1_FILE  "/private/tmp/garnet-noflip1"
+#define RDNA4X_NOFLIP2_FILE  "/private/tmp/garnet-noflip2"
 #define RDNA4X_SCANQ_M6FLIP  (1u << 6)       /* == RDNA4N_SCANQ_M6FLIP (garnet_scanabi.h); the host test checks the equality */
 #define RDNA4X_SCANQ_M6FLIP1 (1u << 7)       /* == RDNA4N_SCANQ_M6FLIP1: all three kernel latches are on (bundle 15) */
 /* THE DESCRIPTORS: one row per HDMI instance, ONE lookup. slot_bytes = pitch * h rounded up to 64 KiB (the monitor A's 8,323,072 B, the monitor B's 14,745,600 B). */

@@ -45,7 +45,7 @@
 #define RDNA4X_MAX_META      (8u * 1024u * 1024u)        // trimmed meta JSON
 #define RDNA4X_CACHE_CAP     (256ull * 1024ull * 1024ull)   // per application; trimmed to 80% when exceeded
 #define RDNA4X_WORKER_STACK  ((size_t)64u * 1024u * 1024u)   // a default secondary thread has 512 KiB; the command-line tool's 8 MiB main stack is the only depth anyone has measured
-#define RDNA4X_KILL_FILE     "/private/tmp/rdna4m-noinproc"
+#define RDNA4X_KILL_FILE     "/private/tmp/garnet-noinproc"
 #define RDNA4X_CACHE_SUB     "org.garnet.xlate"
 #define RDNA4X_ENV_PREFIX    "METAL2VULKAN_"
 #define RDNA4X_LIB_NAME      "libgarnetxlate.dylib"

@@ -15,25 +15,51 @@ GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
     os_log(OS_LOG_DEFAULT, "GarnetMetal: %{public}s", buf);
     fprintf(stderr, "GarnetMetal: %s\n", buf);
 }
+GARNET_INTERNAL const char *garnet_getenv(const char *newName, const char *legacyName) {
+    int usedLegacy = 0;
+    const char *v = rdna4g_getenv_pair(newName ? getenv(newName) : NULL, legacyName ? getenv(legacyName) : NULL, &usedLegacy);
+    if (usedLegacy && legacyName && newName) {
+        static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+        static char seen[32][48];
+        static unsigned nseen = 0;
+        int shouldLog = 0;
+        pthread_mutex_lock(&mu);
+        int found = 0;
+        for (unsigned i = 0; i < nseen; i++) {
+            if (strcmp(seen[i], legacyName) == 0) { found = 1; break; }
+        }
+        if (!found) {
+            if (nseen < 32) {
+                snprintf(seen[nseen], sizeof seen[nseen], "%s", legacyName);
+                nseen++;
+            }
+            shouldLog = 1;
+        }
+        pthread_mutex_unlock(&mu);
+        if (shouldLog)
+            RDNA4LOG("DEPRECATED env %s used; migrate to %s (legacy fallback will be removed in a future release)", legacyName, newName);
+    }
+    return v;
+}
 // #12 R5: per-command-buffer / per-encoder lines are rate limited per call site: the first 8, then every 1024th (errors and WARN lines stay RDNA4LOG).
 
 // ---------------------------------------------------------------------------------------------------------------
 // Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
-// tool that opts in with RDNA4M_ALLOW=1, or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
-// successful RDNA4N open + QueryInfo, never by name; garnet_gate.h) may get a device. All test hooks are honoured only with RDNA4M_ALLOW=1 as root.
+// tool that opts in with GARNET_ALLOW=1 (or legacy RDNA4M_ALLOW=1), or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
+// successful RDNA4N open + QueryInfo, never by name; garnet_gate.h) may get a device. All test hooks are honoured only with GARNET_ALLOW=1 as root.
 // Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see garnet_gate.h.
-//   /private/tmp/rdna4m-off              exists -> decline (L1 kill file); outside WindowServer also when the stat is denied (anything but ENOENT / ENOTDIR)
-//   /private/tmp/rdna4m-starts           one epoch-seconds line per WindowServer init; >= 3 within 300 s -> decline (L2)
+//   /private/tmp/garnet-off              exists -> decline (L1 kill file; legacy /private/tmp/rdna4m-off also checked); outside WindowServer also when stat is denied
+//   /private/tmp/garnet-starts           one epoch-seconds line per WindowServer init; >= 3 within 300 s -> decline (L2)
 //   nub property "Garnet,Ready" = 0    -> decline (L3); WindowServer: absent (old kexts) -> proceed; elsewhere it must be present and 1
 //   nub property "Garnet,AutoDisarmed" = 1 -> decline (#12); absent -> ignored (the kext does not publish it today)
-//   /private/tmp/rdna4m-headless-no      exists -> isHeadless NO (default YES); read once per process
-//   /private/tmp/rdna4m-noplanes         exists -> P2: multi-plane IOSurfaces refused as before (default: plane p of a 2/3-plane surface is accepted); read once per process
-//   /private/tmp/rdna4m-noflip           exists -> S5.2a D-copy present OFF for the process (the kernel v1 copy continues); read once per process
-//   RDNA4M_TEST_IGNORE_KILL=1            (root + RDNA4M_ALLOW=1, NOT WindowServer) -> rdna4m-off is IGNORED in that process only (S5.2b test bypass)
-//   RDNA4M_TEST_FALLBACK_AS_WS=1         (root + RDNA4M_ALLOW=1) -> a spvcache miss gives a FALLBACK pipeline as in WindowServer (hot-swap oracle: mtlprobe hotswap)
-//   RDNA4M_TEST_HIDE_BUNDLE_SPV=1        (root + RDNA4M_ALLOW=1) -> the bundle's Resources/spvcache is NOT consulted (only the side directory)
-//   RDNA4M_TEST_SIDE_DIR=<dir>           (root + RDNA4M_ALLOW=1) -> replaces the side spvcache directory /private/var/tmp/rdna4m-spv
-//   RDNA4M_TEST_DISPFLIP=1               (root + RDNA4M_ALLOW=1) -> a surface may be accepted as a display surface without the CoreDisplay backtrace signal (mtlprobe dispflip sets it)
+//   /private/tmp/garnet-headless-no      exists -> isHeadless NO (default YES); read once per process (legacy /private/tmp/rdna4m-headless-no fallback)
+//   /private/tmp/garnet-noplanes         exists -> P2: multi-plane IOSurfaces refused as before (default: plane p of a 2/3-plane surface is accepted); read once per process
+//   /private/tmp/garnet-noflip           exists -> S5.2a D-copy present OFF for the process (the kernel v1 copy continues); read once per process
+//   GARNET_TEST_IGNORE_KILL=1            (root + GARNET_ALLOW=1, NOT WindowServer) -> garnet-off is IGNORED in that process only (S5.2b test bypass)
+//   GARNET_TEST_FALLBACK_AS_WS=1         (root + GARNET_ALLOW=1) -> a spvcache miss gives a FALLBACK pipeline as in WindowServer (hot-swap oracle: mtlprobe hotswap)
+//   GARNET_TEST_HIDE_BUNDLE_SPV=1        (root + GARNET_ALLOW=1) -> the bundle's Resources/spvcache is NOT consulted (only the side directory)
+//   GARNET_TEST_SIDE_DIR=<dir>           (root + GARNET_ALLOW=1) -> replaces the side spvcache directory /private/var/tmp/garnet-spv
+//   GARNET_TEST_DISPFLIP=1               (root + GARNET_ALLOW=1) -> a surface may be accepted as a display surface without the CoreDisplay backtrace signal (mtlprobe dispflip sets it)
 // ---------------------------------------------------------------------------------------------------------------
 
 GARNET_INTERNAL BOOL rdna4_is_ws(void) {
@@ -42,32 +68,32 @@ GARNET_INTERNAL BOOL rdna4_is_ws(void) {
     return v == 1;
 }
 GARNET_INTERNAL BOOL rdna4_allow(void) {
-    const char *e = getenv("RDNA4M_ALLOW");
+    const char *e = garnet_getenv("GARNET_ALLOW", "RDNA4M_ALLOW");
     return e && !strcmp(e, "1") && geteuid() == 0;
 }
 GARNET_INTERNAL BOOL rdna4_force_fallback(void) {
-    const char *e = getenv("RDNA4M_FORCE_FALLBACK");
+    const char *e = garnet_getenv("GARNET_FORCE_FALLBACK", "RDNA4M_FORCE_FALLBACK");
     return rdna4_allow() && e && !strcmp(e, "1");
 }
-// Test hook (root + RDNA4M_ALLOW=1): this process takes the WindowServer branch of the fallback rule (a spvcache miss yields a fallback pipeline,
+// Test hook (root + GARNET_ALLOW=1): this process takes the WindowServer branch of the fallback rule (a spvcache miss yields a fallback pipeline,
 // not an error) while the lookup stays real, so the hot-swap can be exercised from mtlprobe.
 GARNET_INTERNAL BOOL rdna4_test_fb_as_ws(void) {
-    const char *e = getenv("RDNA4M_TEST_FALLBACK_AS_WS");
+    const char *e = garnet_getenv("GARNET_TEST_FALLBACK_AS_WS", "RDNA4M_TEST_FALLBACK_AS_WS");
     return rdna4_allow() && e && !strcmp(e, "1");
 }
-// GPU-apps G4: 1 once the kernel admitted this (non-WindowServer, non-RDNA4M_ALLOW) process as an allow-listed application (rdna4_admit's probe succeeded).
+// GPU-apps G4: 1 once the kernel admitted this (non-WindowServer, non-GARNET_ALLOW) process as an allow-listed application (rdna4_admit's probe succeeded).
 GARNET_INTERNAL _Atomic int rdna4_app_admitted;
 GARNET_INTERNAL BOOL rdna4_fallback_ok(void) { return rdna4g_fallback_ok(rdna4_is_ws(), rdna4_force_fallback(), rdna4_test_fb_as_ws(), atomic_load(&rdna4_app_admitted)) ? YES : NO; }
 
 // Crash counter (#12 R3): counts only ABNORMAL ends. One line per instance start: "<epoch> <pid>". An instance that committed a
 // first successful command buffer appends "<pid> <start epoch> <now>" to RDNA4_OK_FILE (rdna4_mark_clean) and no longer counts: normal
 // logouts, logins and restarts do not trip the rule; >= 3 instances within 300 s that never got clean still decline.
-// Old-format lines (no pid) count as before. Paths are RDNA4_STARTS_FILE / RDNA4_OK_FILE, or (test hook, needs RDNA4M_ALLOW)
-// RDNA4M_TEST_COUNTER=<path> (ok file <path>.ok), which also enables the counter outside WindowServer.
+// Old-format lines (no pid) count as before. Paths are RDNA4_STARTS_FILE / RDNA4_OK_FILE, or (test hook, needs GARNET_ALLOW)
+// GARNET_TEST_COUNTER=<path> (ok file <path>.ok), which also enables the counter outside WindowServer.
 static char rdna4_ok_path[1100]; static long long rdna4_start_epoch; static _Atomic int rdna4_counter_on, rdna4_clean_done;
 static BOOL rdna4_counter_tripped(int *countOut) {
     const char *path = RDNA4_STARTS_FILE;
-    const char *tp = getenv("RDNA4M_TEST_COUNTER");
+    const char *tp = garnet_getenv("GARNET_TEST_COUNTER", "RDNA4M_TEST_COUNTER");
     if (rdna4_allow() && tp && tp[0]) { path = tp; snprintf(rdna4_ok_path, sizeof rdna4_ok_path, "%s.ok", tp); }
     else if (!rdna4_is_ws()) return NO;
     else snprintf(rdna4_ok_path, sizeof rdna4_ok_path, "%s", RDNA4_OK_FILE);
@@ -163,15 +189,15 @@ GARNET_INTERNAL rdna4dc_native_memory rdna4_nub_memory(uint32_t port) {
     CFRelease(value);
     return m;
 }
-// "Garnet,Ready": absent (old kexts) -> proceed. RDNA4M_TEST_READY overrides.
+// "Garnet,Ready": absent (old kexts) -> proceed. GARNET_TEST_READY overrides.
 static int rdna4_nub_ready(uint32_t port) {
-    const char *th = getenv("RDNA4M_TEST_READY");
+    const char *th = garnet_getenv("GARNET_TEST_READY", "RDNA4M_TEST_READY");
     if (rdna4_allow() && th && th[0]) return atoi(th) ? 1 : 0;
     return rdna4_nub_flag(port, CFSTR("Garnet,Ready"));
 }
-// #12 R3: "Garnet,AutoDisarmed" = 1 (kernel disarmed the display pipe after a fault) -> decline; absent -> ignore. RDNA4M_TEST_AUTODISARMED overrides.
+// #12 R3: "Garnet,AutoDisarmed" = 1 (kernel disarmed the display pipe after a fault) -> decline; absent -> ignore. GARNET_TEST_AUTODISARMED overrides.
 static int rdna4_nub_autodisarmed(uint32_t port) {
-    const char *th = getenv("RDNA4M_TEST_AUTODISARMED");
+    const char *th = garnet_getenv("GARNET_TEST_AUTODISARMED", "RDNA4M_TEST_AUTODISARMED");
     if (rdna4_allow() && th && th[0]) return atoi(th) ? 1 : 0;
     return rdna4_nub_flag(port, CFSTR("Garnet,AutoDisarmed"));
 }
@@ -213,10 +239,13 @@ static const char *rdna4_denylist_decline(int cls) {
     NSString *bidStr = [[NSBundle mainBundle] bundleIdentifier];
     const char *bid = bidStr ? [bidStr UTF8String] : NULL;
     const char *proc = getprogname();
-    const char *envPath = rdna4_allow() ? getenv("RDNA4M_TEST_DENYLIST") : NULL;
-    const char *path = (envPath && envPath[0]) ? envPath : RDNA4G_DENYLIST_PATH;
-    int openErr = 0;
-    const int hit = rdna4g_denylist_eval(cls, path, bid, proc, &openErr);
+    const char *envPath = rdna4_allow() ? garnet_getenv("GARNET_TEST_DENYLIST", "RDNA4M_TEST_DENYLIST") : NULL;
+    int openErr = 0, usedLegacy = 0;
+    const int hit = (envPath && envPath[0])
+        ? rdna4g_denylist_eval(cls, envPath, bid, proc, &openErr)
+        : rdna4g_denylist_eval_with_fallback(cls, RDNA4G_DENYLIST_PATH, RDNA4G_LEGACY_DENYLIST_PATH, bid, proc, &openErr, &usedLegacy);
+    if (usedLegacy)
+        RDNA4_ONCE("DEPRECATED denylist path %s read; migrate to %s", RDNA4G_LEGACY_DENYLIST_PATH, RDNA4G_DENYLIST_PATH);
     if (hit != RDNA4G_DENY_NONE) {
         RDNA4LOG("admit: declined by denylist (%s) bundle=%s proc=%s",
                  hit == RDNA4G_DENY_BUILTIN ? "builtin" : hit == RDNA4G_DENY_BUNDLE ? "bundle" : "proc",
@@ -232,21 +261,33 @@ static const char *rdna4_denylist_decline(int cls) {
 GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
     const int cls = rdna4g_class(rdna4_is_ws(), rdna4_allow());
     const int isWs = cls == RDNA4G_CLASS_WS;
-    // 0.0.641 (G4 review HIGH 2): root and daemons (euid < 501) that are neither WindowServer nor an RDNA4M_ALLOW tool are declined BY CLASS, first of all, exactly as in 0.0.632: no kernel open for them.
+    // 0.0.641 (G4 review HIGH 2): root and daemons (euid < 501) that are neither WindowServer nor a GARNET_ALLOW tool are declined BY CLASS, first of all, exactly as in 0.0.632: no kernel open for them.
     if (rdna4g_declined_by_class(cls, (uint32_t)geteuid())) return RDNA4G_DECLINE_BY_CLASS_TEXT;
     // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (garnet_gate.h).
     struct stat st;
     const int srcRc = stat(RDNA4_KILL_FILE, &st), srcErr = errno;
-    const int ks = rdna4g_kill_state(srcRc, srcErr);
+    int legRc = -1, legErr = ENOENT, usedLegacyKill = 0;
+    if (rdna4g_kill_state(srcRc, srcErr) == RDNA4G_KILL_ABSENT) {
+        legRc = stat(RDNA4_LEGACY_KILL_FILE, &st);
+        legErr = errno;
+    }
+    const int ks = rdna4g_kill_state_pair(srcRc, srcErr, legRc, legErr, &usedLegacyKill);
+    if (usedLegacyKill)
+        RDNA4_ONCE("DEPRECATED kill file %s detected; migrate to %s", RDNA4_LEGACY_KILL_FILE, RDNA4_KILL_FILE);
     int killIgnored = 0;
     if (ks == RDNA4G_KILL_PRESENT) {
-        // S5.2b root test path: ignored ONLY by a non-WindowServer root process with RDNA4M_ALLOW=1 and RDNA4M_TEST_IGNORE_KILL=1 (WindowServer never is).
-        killIgnored = rdna4df_off_file_ignored((int)geteuid(), getenv("RDNA4M_ALLOW"), getenv("RDNA4M_TEST_IGNORE_KILL"), rdna4_is_ws());
-        if (!killIgnored) return "kill file " RDNA4_KILL_FILE " exists";
-        RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " exists but is IGNORED (root test bypass RDNA4M_ALLOW=1 + RDNA4M_TEST_IGNORE_KILL=1, not WindowServer)");
+        // S5.2b root test path: ignored ONLY by a non-WindowServer root process with GARNET_ALLOW=1 and GARNET_TEST_IGNORE_KILL=1 (WindowServer never is).
+        killIgnored = rdna4df_off_file_ignored((int)geteuid(),
+            garnet_getenv("GARNET_ALLOW", "RDNA4M_ALLOW"),
+            garnet_getenv("GARNET_TEST_IGNORE_KILL", "RDNA4M_TEST_IGNORE_KILL"),
+            rdna4_is_ws());
+        if (!killIgnored) return usedLegacyKill ? "kill file " RDNA4_LEGACY_KILL_FILE " exists" : "kill file " RDNA4_KILL_FILE " exists";
+        RDNA4LOG("admit: kill file %s exists but is IGNORED (root test bypass GARNET_ALLOW=1 + GARNET_TEST_IGNORE_KILL=1, not WindowServer)",
+                 usedLegacyKill ? RDNA4_LEGACY_KILL_FILE : RDNA4_KILL_FILE);
     }
     if (rdna4g_kill_declines(isWs, ks, killIgnored)) {
-        RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", srcErr);
+        const int failErr = rdna4g_kill_state(srcRc, srcErr) == RDNA4G_KILL_ABSENT ? legErr : srcErr;
+        RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", failErr);
         return "kill file " RDNA4_KILL_FILE " could not be read (fail closed outside WindowServer)";
     }
     const int rdy = rdna4_nub_ready(port);
@@ -254,7 +295,7 @@ GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
     if (rdna4g_autodisarm_declines(isWs, rdna4_nub_autodisarmed(port))) return "nub property Garnet,AutoDisarmed is 1";
     int count = 0;
     if (rdna4_counter_tripped(&count)) return "crash counter: >= 3 starts within 300 s";
-    if (cls == RDNA4G_CLASS_OTHER) {   // not WindowServer, not an RDNA4M_ALLOW root tool: only the kernel can admit it
+    if (cls == RDNA4G_CLASS_OTHER) {   // not WindowServer, not a GARNET_ALLOW root tool: only the kernel can admit it
         const char *denyWhy = rdna4_denylist_decline(cls);
         if (denyWhy) return denyWhy;
         const char *why = rdna4_app_probe(port);
@@ -269,6 +310,14 @@ GARNET_INTERNAL BOOL rdna4_headless(void) {
         struct stat st;
         int result = stat(RDNA4_HEADLESS_NO, &st);
         int error = result ? errno : 0;
+        if (result != 0 && (error == ENOENT || error == ENOTDIR)) {
+            int leg = stat(RDNA4_LEGACY_HEADLESS_NO, &st);
+            if (leg == 0) {
+                result = 0;
+                error = 0;
+                RDNA4_ONCE("DEPRECATED marker %s used; migrate to %s", RDNA4_LEGACY_HEADLESS_NO, RDNA4_HEADLESS_NO);
+            }
+        }
         v = result != 0;
         RDNA4LOG("isHeadless=%d markerResult=%d errno=%d process=%s",
                  v, result, error, getprogname());
@@ -1184,18 +1233,19 @@ static BOOL rdna4_pc_derive_key(void) {
 // Called from rdna4_radv_open_once after the device exists (class lock held). Never fails the open: no cache = pipelines compile as before.
 static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     if (!vkCreatePipelineCache || !vkGetPipelineCacheData) { RDNA4LOG("T2 pipeline cache: entry points not exposed by RADV, running without"); return; }
-    if (access("/private/tmp/rdna4m-nopcache", F_OK) == 0 || (rdna4_allow() && getenv("RDNA4M_NOPCACHE"))) { RDNA4LOG("T2 pipeline cache: disabled (kill file /private/tmp/rdna4m-nopcache or RDNA4M_NOPCACHE)"); return; }
+    if (access("/private/tmp/garnet-nopcache", F_OK) == 0 || (rdna4_allow() && garnet_getenv("GARNET_NOPCACHE", "RDNA4M_NOPCACHE"))) { RDNA4LOG("T2 pipeline cache: disabled (kill file /private/tmp/garnet-nopcache or GARNET_NOPCACHE)"); return; }
     memcpy(RDNA4PC.uuid, pp->pipelineCacheUUID, 16); RDNA4PC.vendor = pp->vendorID; RDNA4PC.device = pp->deviceID;
     if (!rdna4_pc_derive_key()) { RDNA4LOG("T2 pipeline cache: backend identity unavailable, running without"); return; }
-    // GPU-apps G4: WindowServer and RDNA4M_ALLOW root tools use /private/var/tmp/rdna4m-pipecache.bin as before; any other (admitted application) process uses a file of its OWN under the
+    // GPU-apps G4: WindowServer and GARNET_ALLOW root tools use /private/var/tmp/garnet-pipecache.bin; any other (admitted application) process uses a file of its OWN under the
     // user's cache directory (confstr _CS_DARWIN_USER_CACHE_DIR, the one cache directory a sandboxed GPU process may write) and has NO cache if that directory is unavailable (garnet_gate.h).
     const int pcls = rdna4g_class(rdna4_is_ws(), rdna4_allow());
     char ucd[1024]; ucd[0] = 0;
     if (pcls == RDNA4G_CLASS_OTHER) { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
-    const char *envdir = (rdna4_allow() && getenv("RDNA4M_PCACHE_DIR")) ? getenv("RDNA4M_PCACHE_DIR") : NULL;
+    const char *envdirVal = rdna4_allow() ? garnet_getenv("GARNET_PCACHE_DIR", "RDNA4M_PCACHE_DIR") : NULL;
+    const char *envdir = envdirVal ? envdirVal : NULL;
     const int vtw = (pcls != RDNA4G_CLASS_OTHER) ? (access("/private/var/tmp", W_OK) == 0) : 0;
     if (!rdna4g_pcache_path(RDNA4PC.path, sizeof RDNA4PC.path, pcls, envdir, vtw, ucd, getprogname())) { RDNA4LOG("T2 pipeline cache: no cache directory for this process (user cache dir unavailable), running without"); return; }
-    RDNA4PC.save = rdna4g_pcache_save(pcls, (rdna4_allow() && getenv("RDNA4M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with RDNA4M_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
+    RDNA4PC.save = rdna4g_pcache_save(pcls, (rdna4_allow() && garnet_getenv("GARNET_PCACHE_SAVE", "RDNA4M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with GARNET_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
     char marker[sizeof RDNA4PC.path + 16]; snprintf(marker, sizeof marker, "%s.loading", RDNA4PC.path);
     if (access(marker, F_OK) == 0) { unlink(RDNA4PC.path); unlink(marker); RDNA4LOG("T2 pipeline cache: a previous load never finished (%s present): cache file discarded", marker); }
     void *buf = NULL; size_t flen = 0; const void *payload = NULL; size_t plen = 0; int c = -1;
@@ -1298,10 +1348,10 @@ static void rdna4_t1_start(void) {
     atexit(rdna4_pc_atexit);
     RDNA4LOG("T1 timing: summaries every 10 s (pid %d %s)", (int)getpid(), getprogname());
 }
-// RDNA4M_TEST_OPEN_REFUSE=<n> (needs RDNA4M_ALLOW): the first n open attempts fail like a refused RDNA4N open, without touching Vulkan.
+// GARNET_TEST_OPEN_REFUSE=<n> (needs GARNET_ALLOW): the first n open attempts fail like a refused RDNA4N open, without touching Vulkan.
 static BOOL rdna4_test_refuse(void) {
     static long left = -1;
-    if (left < 0) { const char *e = getenv("RDNA4M_TEST_OPEN_REFUSE"); left = (rdna4_allow() && e) ? atol(e) : 0; }
+    if (left < 0) { const char *e = garnet_getenv("GARNET_TEST_OPEN_REFUSE", "RDNA4M_TEST_OPEN_REFUSE"); left = (rdna4_allow() && e) ? atol(e) : 0; }
     if (left > 0) { left--; return YES; }
     return NO;
 }
@@ -1363,16 +1413,16 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         if (!rdna4_vkCreateInstance) { RDNA4R.err = rdna4_err(3, @"no vkCreateInstance"); goto fail; }
         VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "garnetmetal", .apiVersion = VK_API_VERSION_1_3 };
         VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai };
-        {   // P5a: /private/tmp/rdna4m-nosam -> RADV_PERFTEST gains "nosam" (read by RADV at instance creation): command buffers and RADV's upload buffer go to GTT
+        {   // P5a: /private/tmp/garnet-nosam -> RADV_PERFTEST gains "nosam" (read by RADV at instance creation): command buffers and RADV's upload buffer go to GTT
             // (system memory, CPU-cached, GPU-snooped) instead of the BAR, whose uncached stores stalled radv_emit_* during desktop drags (P5 study, ws-p1.txt). Absent = unchanged.
             struct stat sb_;
-            if (stat("/private/tmp/rdna4m-nosam", &sb_) == 0 || stat("/private/tmp/rdna4m-nosam-off", &sb_) != 0) {   //: DEFAULT ON (60 fps under drag measured); /private/tmp/rdna4m-nosam-off disables
+            if (stat("/private/tmp/garnet-nosam", &sb_) == 0 || stat("/private/tmp/garnet-nosam-off", &sb_) != 0) {   //: DEFAULT ON (60 fps under drag measured); /private/tmp/garnet-nosam-off disables
                 const char *pt = getenv("RADV_PERFTEST");
                 if (!rdna4_csv_has_token(pt, "nosam")) {
                     char v[256];
                     snprintf(v, sizeof v, "%s%snosam", pt && *pt ? pt : "", pt && *pt ? "," : "");
                     setenv("RADV_PERFTEST", v, 1);
-                    RDNA4LOG("radv open: P5a /private/tmp/rdna4m-nosam present: RADV_PERFTEST=%s (command buffers in GTT)", v);
+                    RDNA4LOG("radv open: P5a /private/tmp/garnet-nosam present: RADV_PERFTEST=%s (command buffers in GTT)", v);
                 }
             }
         }

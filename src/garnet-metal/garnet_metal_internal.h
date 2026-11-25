@@ -178,11 +178,14 @@ typedef struct { uint64_t bits; } RDNA4ReflectionFlags;
     - (void)doesNotRecognizeSelector:(SEL)sel { \
         RDNA4LOG("UNRECOGNIZED selector %s on " #cls, sel_getName(sel)); \
         [super doesNotRecognizeSelector:sel]; }
-#define RDNA4_KILL_FILE      "/private/tmp/rdna4m-off"
-#define RDNA4_STARTS_FILE    "/private/tmp/rdna4m-starts"
-#define RDNA4_OK_FILE        "/private/tmp/rdna4m-ok"
-#define RDNA4_HEADLESS_NO    "/private/tmp/rdna4m-headless-no"
-#define RDNA4_NOPLANES_FILE "/private/tmp/rdna4m-noplanes"
+#define RDNA4_KILL_FILE          "/private/tmp/garnet-off"
+#define RDNA4_LEGACY_KILL_FILE   "/private/tmp/rdna4m-off"
+#define RDNA4_STARTS_FILE        "/private/tmp/garnet-starts"
+#define RDNA4_OK_FILE            "/private/tmp/garnet-ok"
+#define RDNA4_HEADLESS_NO        "/private/tmp/garnet-headless-no"
+#define RDNA4_LEGACY_HEADLESS_NO "/private/tmp/rdna4m-headless-no"
+#define RDNA4_NOPLANES_FILE      "/private/tmp/garnet-noplanes"
+GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char *legacyName);
 #define RDNA4_CBLOG_INV_LOGGED 20
 #define RDNA4S_FOURCC_BGRA 0x42475241u   // 'BGRA'
 #define RDNA4_OPT_NOZERO (1ULL << 40)   // internal marker in RDNA4Buffer's options: the contents need not be zeroed (the upload ring)

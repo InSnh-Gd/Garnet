@@ -39,7 +39,11 @@ int main(int argc, const char *argv[]) {
         setenv("RADV_DARWIN_MOCK_GC", "gfx1200", 1);
         setenv("RADV_DEBUG", "nocache", 1);
         setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
-        const char *const testKeys[] = { "RDNA4M_ALLOW", "RDNA4M_TEST_INPROC",
+        const char *const testKeys[] = {
+                "GARNET_ALLOW", "GARNET_TEST_INPROC",
+                "GARNET_TEST_SIDE_DIR", "GARNET_TEST_USERCACHE", "GARNET_TEST_HIDE_BUNDLE_SPV",
+                "GARNET_FORCE_FALLBACK", "GARNET_TEST_FALLBACK_AS_WS",
+                "RDNA4M_ALLOW", "RDNA4M_TEST_INPROC",
                 "RDNA4M_TEST_SIDE_DIR", "RDNA4M_TEST_USERCACHE", "RDNA4M_TEST_HIDE_BUNDLE_SPV",
                 "RDNA4M_FORCE_FALLBACK", "RDNA4M_TEST_FALLBACK_AS_WS" };
         for (size_t i = 0; i < sizeof testKeys / sizeof testKeys[0]; ++i) unsetenv(testKeys[i]);
@@ -81,9 +85,9 @@ int main(int argc, const char *argv[]) {
         if (apply(profile.UTF8String, 0, parameters, &sandboxError))
             fail([NSString stringWithFormat:@"cannot apply OS profile: %s", sandboxError ?: "unknown"]);
         int active = sandbox_check(getpid(), NULL, 0);
-        int sideRead = sandbox_check(getpid(), "file-read-data", 1, "/private/var/tmp/rdna4m-spv");
+        int sideRead = sandbox_check(getpid(), "file-read-data", 1, "/private/var/tmp/garnet-spv");
         int mapBundle = sandbox_check(getpid(), "file-map-executable", 1, bundle.executablePath.fileSystemRepresentation);
-        int outsideWrite = sandbox_check(getpid(), "file-write-data", 1, "/Library/Logs/RDNA4Translate");
+        int outsideWrite = sandbox_check(getpid(), "file-write-data", 1, "/Library/Logs/GarnetTranslate");
         printf("WS_SANDBOX_CONTROLS active=%d side_read=%d bundle_map=%d outside_write=%d\n",
                active, sideRead, mapBundle, outsideWrite);
         if (!active || sideRead || mapBundle || !outsideWrite)

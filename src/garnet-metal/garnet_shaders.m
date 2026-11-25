@@ -147,7 +147,7 @@ GARNET_INTERNAL NSError *rdna4_dump_pipeline(MTLRenderPipelineDescriptor *d, BOO
 
 #endif // !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 #ifndef RDNA4_SHADER_CAPTURE_FLAG
-#define RDNA4_SHADER_CAPTURE_FLAG "/private/tmp/rdna4m-shader-capture"
+#define RDNA4_SHADER_CAPTURE_FLAG "/private/tmp/garnet-shader-capture"
 #endif
 static int rdna4x_capture_request(NSString *directory, NSString *sha, NSString *name,
     const char *role, NSData *air, NSArray *dependencies) {
@@ -190,7 +190,7 @@ extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);   // libdyld (dyld_priv.h): the UUID of the running dyld shared cache; it pins every library in it
 GARNET_INTERNAL RDNA4XlateState RDNA4XL = { .mu = PTHREAD_MUTEX_INITIALIZER };
 static NSMutableSet<NSString *> *rdna4x_logged, *rdna4x_touched;   // guarded by RDNA4XL.mu
-static BOOL rdna4x_test_inproc(void) { const char *e = getenv("RDNA4M_TEST_INPROC"); return rdna4_allow() && e && !strcmp(e, "1"); }
+static BOOL rdna4x_test_inproc(void) { const char *e = garnet_getenv("GARNET_TEST_INPROC", "RDNA4M_TEST_INPROC"); return rdna4_allow() && e && !strcmp(e, "1"); }
 static void rdna4x_gate_read(void) {
     pthread_mutex_lock(&RDNA4XL.mu);
     if (!RDNA4XL.gateDone) {
@@ -216,7 +216,7 @@ static NSString *rdna4x_xlib_path(void) { return [rdna4x_resources() stringByApp
 static void rdna4x_setup_locked(void) {
     uint8_t xl[16], rd[16]; memset(rd, 0, sizeof rd);
     if (!rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xl)) { RDNA4XL.dirState = -1; RDNA4LOG("inproc: %s is missing or has no LC_UUID: in-process translation is unavailable", RDNA4X_LIB_NAME); return; }
-    const char *rl = rdna4_allow() ? getenv("RDNA4M_TEST_LLVM_LIB") : NULL;
+    const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
     if (rl && rl[0]) { if (!rdna4x_file_uuid(rl, rd)) memset(rd, 0, sizeof rd); }
     else { uuid_t cu; if (_dyld_get_shared_cache_uuid(cu)) memcpy(rd, cu, 16); }   // the reader lives in the dyld shared cache (no file, not loaded yet): the cache's UUID pins it
     char osv[64] = ""; size_t osn = sizeof osv; if (sysctlbyname("kern.osversion", osv, &osn, NULL, 0) != 0) osv[0] = 0;
@@ -224,7 +224,7 @@ static void rdna4x_setup_locked(void) {
     const rdna4x_backend_capabilities queryCaps = rdna4_query_caps();
     char key[17]; rdna4x_key_with_capabilities(key, xl, rd, ov, osv, &queryCaps);
     char ucd[1024]; ucd[0] = 0;
-    const char *tu = rdna4_allow() ? getenv("RDNA4M_TEST_USERCACHE") : NULL;
+    const char *tu = rdna4_allow() ? garnet_getenv("GARNET_TEST_USERCACHE", "RDNA4M_TEST_USERCACHE") : NULL;
     if (tu && tu[0]) snprintf(ucd, sizeof ucd, "%s", tu);
     else { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
     char parent[RDNA4X_PATH_MAX];
@@ -365,7 +365,7 @@ GARNET_INTERNAL NSString *rdna4x_cached_refusal(NSString *dir, NSString *sha) {
 GARNET_INTERNAL void rdna4x_engine_prepare(void) {
     pthread_mutex_lock(&RDNA4XL.mu);
     if (!RDNA4XL.engineInit) {
-        const char *rl = rdna4_allow() ? getenv("RDNA4M_TEST_LLVM_LIB") : NULL;
+        const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
         rdna4x_engine_init(&RDNA4XL.eng, NULL, NULL, rl, rdna4x_xlib_path().fileSystemRepresentation, RDNA4X_WORKER_STACK);
         RDNA4XL.eng.lowerTranslatedArguments = RDNA4R.gpuArgumentTables;
         RDNA4XL.eng.capabilities = rdna4_query_caps();
@@ -484,7 +484,7 @@ __attribute__((unused)) static BOOL rdna4x_stage3_symbols_available(void) {
 static const rdna4x_reader *rdna4x_ensure_stage2_reader(char *errBuf, size_t errCap) {
     pthread_mutex_lock(&RDNA4XL.mu);
     if (!RDNA4XL.stage2Reader.h && !RDNA4XL.stage2ReaderTried) {
-        const char *rl = rdna4_allow() ? getenv("RDNA4M_TEST_LLVM_LIB") : NULL;
+        const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
         char ebuf[256] = "";
         if (rdna4x_reader_load(&RDNA4XL.stage2Reader, RDNA4X_GPUC_BASE, (rl && rl[0]) ? rl : NULL, ebuf, sizeof ebuf) != 0) {
             strlcpy(RDNA4XL.stage2ReaderErr, ebuf[0] ? ebuf : "failed to load GPUCompiler LLVM bitcode reader",
@@ -1687,18 +1687,18 @@ __attribute__((unused)) static BOOL rdna4x_compile_stage_with_linkage(id desc, i
 
 // ---- spvcache sidecars (<sha>.meta.json, add-air.py) ----
 // Hot-swap H2: the lookup directories, in order: the bundle's Resources/spvcache (read-only in practice), then (bundle 14, applications that translate in process) the user cache directory K,
-// then the side directory /private/var/tmp/rdna4m-spv (WindowServer-sandbox readable; the profile allows /private/var/tmp; the translator installs new <sha>.meta.json then
+// then the side directory /private/var/tmp/garnet-spv (WindowServer-sandbox readable; the profile allows /private/var/tmp; the translator installs new <sha>.meta.json then
 // <sha>.spv there by atomic rename, .spv LAST). A sandboxed application does not look in the side directory (the sandbox denies it and logs every try).
-// Test hooks (root + RDNA4M_ALLOW=1): RDNA4M_TEST_SIDE_DIR replaces the side dir, RDNA4M_TEST_HIDE_BUNDLE_SPV=1 drops the bundle dir.
+// Test hooks (root + GARNET_ALLOW=1): GARNET_TEST_SIDE_DIR replaces the side dir, GARNET_TEST_HIDE_BUNDLE_SPV=1 drops the bundle dir.
 static NSString *rdna4_side_dir(void) {
     static NSString *d; static dispatch_once_t o;
-    dispatch_once(&o, ^{ const char *t = getenv("RDNA4M_TEST_SIDE_DIR"); d = (rdna4_allow() && t && *t) ? @(t) : @"/private/var/tmp/rdna4m-spv"; });
+    dispatch_once(&o, ^{ const char *t = garnet_getenv("GARNET_TEST_SIDE_DIR", "RDNA4M_TEST_SIDE_DIR"); d = (rdna4_allow() && t && *t) ? @(t) : @"/private/var/tmp/garnet-spv"; });
     return d;
 }
 GARNET_INTERNAL NSArray<NSString *> *rdna4_spv_dirs(void) {
     static NSArray *bundleOnly, *a[4]; static dispatch_once_t o; static NSString *userFor;
     dispatch_once(&o, ^{
-        const char *h = getenv("RDNA4M_TEST_HIDE_BUNDLE_SPV");
+        const char *h = garnet_getenv("GARNET_TEST_HIDE_BUNDLE_SPV", "RDNA4M_TEST_HIDE_BUNDLE_SPV");
         if (!(rdna4_allow() && h && !strcmp(h, "1"))) bundleOnly = @[ [[[NSBundle bundleForClass:[GarnetDevice class]] resourcePath] stringByAppendingPathComponent:@"spvcache"] ];
         else bundleOnly = @[];
     });

@@ -36,10 +36,22 @@ static inline int rdna4g_class(int isWs, int allowRoot) { return isWs ? RDNA4G_C
 // session as root for every Metal-enumerating daemon (stalling WindowServer's exclusive open with the switches off, resetting the seqno as first opener).
 #define RDNA4G_APP_MIN_EUID 501u
 static inline int rdna4g_declined_by_class(int cls, uint32_t euid) { return cls == RDNA4G_CLASS_OTHER && euid < RDNA4G_APP_MIN_EUID; }
-#define RDNA4G_DECLINE_BY_CLASS_TEXT "process is not WindowServer and RDNA4M_ALLOW=1 (as root) is not set"
+#define RDNA4G_DECLINE_BY_CLASS_TEXT "process is not WindowServer and GARNET_ALLOW=1 (as root) is not set"
+
+// ---- environment variable fallback (1-release compatibility: GARNET_* primary, RDNA4M_* fallback) ----
+static inline const char *rdna4g_getenv_pair(const char *newVal, const char *legacyVal, int *usedLegacyOut) {
+    if (usedLegacyOut) *usedLegacyOut = 0;
+    if (newVal != (const char *)0) return newVal;
+    if (legacyVal != (const char *)0) {
+        if (usedLegacyOut) *usedLegacyOut = 1;
+        return legacyVal;
+    }
+    return (const char *)0;
+}
 
 // ---- persistent dual-key application denylist (bundle:<CFBundleIdentifier> & proc:<name>) ----
-#define RDNA4G_DENYLIST_PATH    "/Library/Application Support/RDNA4/native/app-denylist.txt"
+#define RDNA4G_DENYLIST_PATH        "/Library/Application Support/Garnet/native/app-denylist.txt"
+#define RDNA4G_LEGACY_DENYLIST_PATH "/Library/Application Support/RDNA4/native/app-denylist.txt"
 #define RDNA4G_DENY_NONE        0
 #define RDNA4G_DENY_BUILTIN     1
 #define RDNA4G_DENY_BUNDLE      2
@@ -108,6 +120,24 @@ static inline int rdna4g_denylist_eval(int cls, const char *path, const char *bu
     fclose(fp);
     return m;
 }
+static inline int rdna4g_denylist_eval_with_fallback(int cls, const char *primaryPath, const char *legacyPath, const char *bundleId, const char *procName, int *openErrOut, int *usedLegacyOut) {
+    if (usedLegacyOut) *usedLegacyOut = 0;
+    int primaryErr = 0;
+    const int m = rdna4g_denylist_eval(cls, primaryPath, bundleId, procName, &primaryErr);
+    if (m != RDNA4G_DENY_NONE) {
+        if (openErrOut) *openErrOut = 0;
+        return m;
+    }
+    if ((primaryErr == ENOENT || primaryErr == ENOTDIR) && legacyPath && legacyPath[0]) {
+        int legacyErr = 0;
+        const int lm = rdna4g_denylist_eval(cls, legacyPath, bundleId, procName, &legacyErr);
+        if (legacyErr == 0 && usedLegacyOut) *usedLegacyOut = 1;
+        if (openErrOut) *openErrOut = (legacyErr == ENOENT || legacyErr == ENOTDIR) ? primaryErr : legacyErr;
+        return lm;
+    }
+    if (openErrOut) *openErrOut = primaryErr;
+    return RDNA4G_DENY_NONE;
+}
 
 // ---- the kill file ----
 #define RDNA4G_KILL_ABSENT     0
@@ -116,6 +146,14 @@ static inline int rdna4g_denylist_eval(int cls, const char *path, const char *bu
 static inline int rdna4g_kill_state(int statRc, int err) {
     if (statRc == 0) return RDNA4G_KILL_PRESENT;
     return (err == ENOENT || err == ENOTDIR) ? RDNA4G_KILL_ABSENT : RDNA4G_KILL_UNREADABLE;
+}
+static inline int rdna4g_kill_state_pair(int newRc, int newErr, int legacyRc, int legacyErr, int *usedLegacyOut) {
+    if (usedLegacyOut) *usedLegacyOut = 0;
+    const int ns = rdna4g_kill_state(newRc, newErr);
+    if (ns != RDNA4G_KILL_ABSENT) return ns;
+    const int ls = rdna4g_kill_state(legacyRc, legacyErr);
+    if (ls == RDNA4G_KILL_PRESENT && usedLegacyOut) *usedLegacyOut = 1;
+    return ls;
 }
 // ignored: the root test bypass (RDNA4M_TEST_IGNORE_KILL) applied to a PRESENT file. WindowServer: only a present file declines (today). Everyone else: anything but a clean "absent" declines.
 static inline int rdna4g_kill_declines(int isWs, int state, int ignored) {
@@ -171,12 +209,12 @@ static inline int rdna4g_probe_verdict(int haveSvc, uint32_t openRc, uint32_t he
 static inline const char *rdna4g_probe_text(int v) {
     switch (v) {
     case RDNA4G_PROBE_OK:    return "the kernel admitted this process";
-    case RDNA4G_PROBE_NOSVC: return "process is not WindowServer or an RDNA4M_ALLOW=1 root tool, and the GarnetDriver service was not found (or the sandbox denied the lookup)";
-    case RDNA4G_PROBE_OPEN:  return "process is not WindowServer or an RDNA4M_ALLOW=1 root tool, and the kernel refused its RDNA4N open (not allow-listed, or the user-application role is off)";
+    case RDNA4G_PROBE_NOSVC: return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the GarnetDriver service was not found (or the sandbox denied the lookup)";
+    case RDNA4G_PROBE_OPEN:  return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the kernel refused its RDNA4N open (not allow-listed, or the user-application role is off)";
     case RDNA4G_PROBE_HELLO: return "the kernel probe's Hello failed";
     case RDNA4G_PROBE_INFO:  return "the kernel probe's QueryInfo could not be read";
     case RDNA4G_PROBE_HUNG:  return "the kernel reports the GPU HUNG";
-    case RDNA4G_PROBE_NOTAPP: return "the kernel admitted this process as root, not as an allow-listed application (a root tool needs RDNA4M_ALLOW=1)";
+    case RDNA4G_PROBE_NOTAPP: return "the kernel admitted this process as root, not as an allow-listed application (a root tool needs GARNET_ALLOW=1)";
     default:               return "?";
     }
 }
@@ -199,10 +237,10 @@ static inline size_t rdna4g_pcache_path(char *out, size_t n, int cls, const char
         if (k == 0) { memcpy(nm, "app", 3); k = 3; }
         nm[k] = 0;
         const size_t dl = strlen(userCacheDir);
-        w = snprintf(out, n, "%s%srdna4m-pipecache.%s.bin", userCacheDir, (userCacheDir[dl - 1] == '/') ? "" : "/", nm);
+        w = snprintf(out, n, "%s%sgarnet-pipecache.%s.bin", userCacheDir, (userCacheDir[dl - 1] == '/') ? "" : "/", nm);
     } else {
         const char *dir = (envDirAllowed && envDirAllowed[0]) ? envDirAllowed : (varTmpWritable ? "/private/var/tmp" : "/private/tmp");
-        w = snprintf(out, n, "%s/rdna4m-pipecache.bin", dir);
+        w = snprintf(out, n, "%s/garnet-pipecache.bin", dir);
     }
     if (w <= 0 || (size_t)w >= n) { out[0] = 0; return 0; }
     return (size_t)w;
@@ -227,7 +265,7 @@ static inline int rdna4g_fallback_ok(int isWs, int force, int testAsWs, int appA
 //                                    The daemon's user is granted list+search on it by an ACL entry (garnet_dumpacl.h), so the mode stays 0700 for everyone else.
 // The daemon scans every numeric subdirectory and trusts a file only when the directory AND the file are owned by the uid in the directory's name (pc-translate.sh).
 #ifndef RDNA4G_DUMP_DIR
-#define RDNA4G_DUMP_DIR "/tmp/rdna4m"   // tests (test-dumpdir.sh) compile the real helper with -DRDNA4G_DUMP_DIR pointing into a scratch directory
+#define RDNA4G_DUMP_DIR "/private/tmp/garnet-xlate"   // tests (test-dumpdir.sh) compile the real helper with -DRDNA4G_DUMP_DIR pointing into a scratch directory
 #endif
 #define RDNA4G_DAEMON_UID 4294967294u   // `nobody` (uid -2): the unprivileged account org.garnet.translate runs as (INSTALL.md "translate daemon")
 static inline int rdna4g_dumpdir_ok(int lstatRc, int isDir, int isLnk, uint32_t ownerUid, uint32_t callerUid) { return lstatRc == 0 && isDir && !isLnk && ownerUid == callerUid; }
