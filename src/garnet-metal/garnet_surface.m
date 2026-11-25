@@ -10,7 +10,7 @@
 
 #if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Build 16 (app-fix round 1; an internal design note P5 + P1). rdna4_ledger.h / rdna4_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
+// Build 16 (app-fix round 1; an internal design note P5 + P1). garnet_ledger.h / garnet_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
 //  * Step 0, the LIVE-IMPORT LEDGER: every IOSurface texture is entered when it comes alive and removed in -dealloc; the T1 tick logs "T1 ledger: ..." (live textures, distinct surface ids, bytes, textures with no
 //    command buffer in flight, the top 5 by size / format / planes with the age of the oldest). Logging only.
 //  * F3, the USE-COUNT POLICY: a texture NO LONGER holds IOSurfaceIncrementUseCount for its life (Apple's Metal does not: measured on the host Mac). A command buffer use-counts a surface from the first touch of a texture of it
@@ -118,7 +118,7 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
 // ---------------------------------------------------------------------------------------------------------------
 // S5.2a D-copy present (an internal design note section 3, native #12). CoreDisplay's GPUPass renders into 3 IOSurfaces; at the end of each command buffer
 // that wrote one, rdna4Finish appends a GPU copy (import -> a visible-VRAM scanout slot) and the completion block presents that slot (VUPDATE-latched flip) through
-// the six radv_darwin_scanout_* exports of the loaded RADV (same per-process RDNA4N connection). The state machine is the pure rdna4_dispflip.h (host test:
+// the six radv_darwin_scanout_* exports of the loaded RADV (same per-process RDNA4N connection). The state machine is the pure garnet_dispflip.h (host test:
 // test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/rdna4m-noflip (read once per process); one mutex around every scanout call.
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_NOFLIP_FILE "/private/tmp/rdna4m-noflip"
@@ -131,8 +131,8 @@ static struct { _Atomic int mode, ms; uint64_t held, held_sup, held_pres, hold_n
 
 GARNET_INTERNAL RDNA4ScanoutState RDNA4S = { .mu = PTHREAD_MUTEX_INITIALIZER };
 // ---- bundle 13 (M6 Stage 1b) + bundle 15 (M6 Stage 2): the HDMI instances (1 = the monitor A, 2 = the monitor B) beside the DP's RDNA4S, as an ARRAY indexed by the kernel instance number ([0] is never used: the DP is RDNA4S). Same locking (RDNA4S.mu protects everything
-// below), same state machine type (rdna4_dispflip.h, a FULL-COPY machine: damage mode is the DP's alone), each with its own 3 slots in visible VRAM, registered and presented through Mesa's radv_darwin_rdna4n_call (selectors 22..26). The decisions
-// are rdna4_m6x.h (host-tested). An instance is enabled only when rdna4x_enabled(); acquired lazily; ANY failure leaves THAT instance OFF with the DP (and the other display) untouched. Slot size, copy rectangle and geometry come from the
+// below), same state machine type (garnet_dispflip.h, a FULL-COPY machine: damage mode is the DP's alone), each with its own 3 slots in visible VRAM, registered and presented through Mesa's radv_darwin_rdna4n_call (selectors 22..26). The decisions
+// are garnet_m6x.h (host-tested). An instance is enabled only when rdna4x_enabled(); acquired lazily; ANY failure leaves THAT instance OFF with the DP (and the other display) untouched. Slot size, copy rectangle and geometry come from the
 // instance's DESCRIPTOR (rdna4x_desc), never from the DP's plane.
 GARNET_INTERNAL RDNA4XScanoutState RDNA4X;   // RDNA4X.i[inst]
 static const char *rdna4s_reason_name(int r);
@@ -184,7 +184,7 @@ static void rdna4x_off_locked(int inst, int reason, const char *why) {
 
 GARNET_INTERNAL uint32_t rdna4_acc_port;   // bundle 11: the accelerator port WindowServer's admitted device was created with (the table is a property of its parent, the Metal nub); set once, never released here
 
-// ---- bundle 11 (M6 Stage 1a): the kernel's IOSurface ID -> display table (decisions: rdna4_m6route.h) --------------------------------------------------------------------------------------------------
+// ---- bundle 11 (M6 Stage 1a): the kernel's IOSurface ID -> display table (decisions: garnet_m6route.h) --------------------------------------------------------------------------------------------------
 // The table is the registry property "Garnet,M6Surf" of the Metal nub (the accelerator's parent: the channel Garnet,Ready already uses in WindowServer). Read OUTSIDE RDNA4S.mu (a registry read is an IPC), stored under it.
 static int rdna4s_m6_read(rdna4m6_t *tmp) {
     const uint32_t port = rdna4_acc_port;
@@ -687,7 +687,7 @@ static void rdna4x_free_slots(int inst) {
         if (X->mem[i]) { vkFreeMemory(RDNA4R.dev, X->mem[i], NULL); X->mem[i] = VK_NULL_HANDLE; }
     }
 }
-// Lazy acquire of an HDMI instance at the first frame the table maps to it: rdna4x_acquire_run (rdna4_m6x.h, host-tested with failure injection at every step) over the real operations below: SCANX_ACQUIRE (+ the geometry cross-check),
+// Lazy acquire of an HDMI instance at the first frame the table maps to it: rdna4x_acquire_run (garnet_m6x.h, host-tested with failure injection at every step) over the real operations below: SCANX_ACQUIRE (+ the geometry cross-check),
 // the pool budget (the kernel's FREE visible-VRAM figure), 3 slots of THE INSTANCE'S slot size in visible VRAM, SCANX_REGISTER each. Mutex held. Instance 0 must be ACTIVE (the kernel requires the session to hold it). ANY failure leaves
 // THAT instance OFF and releases what it took; NO operation here touches the DP (instance 0 is only ever ACQUIRED first, through its own rdna4s_acquire_locked) or the other display. The slots are freed only while nothing was submitted.
 typedef struct { int inst; uint64_t ao[5]; uint32_t nout; char why[160]; } rdna4x_acq_t;

@@ -1,4 +1,4 @@
-// test-binary-archive.c: pure-C host unit tests for rdna4_binary_archive.h (Task 3.1).
+// test-binary-archive.c: pure-C host unit tests for garnet_binary_archive.h (Task 3.1).
 // Build/run (GCC -Werror & Clang ASan+UBSan):
 //   gcc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal -o "$TMPDIR/test-binary-archive" src/garnet-metal/test-binary-archive.c && "$TMPDIR/test-binary-archive"
 //   clang -std=c11 -D_GNU_SOURCE -O1 -g -fsanitize=address,undefined -Wall -Wextra -Werror -Isrc/garnet-metal -o "$TMPDIR/test-binary-archive-asan" src/garnet-metal/test-binary-archive.c && "$TMPDIR/test-binary-archive-asan"
@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "rdna4_binary_archive.h"
+#include "garnet_binary_archive.h"
 
 static int fails, checks;
 #define CHECK(name, cond, ...) do { \

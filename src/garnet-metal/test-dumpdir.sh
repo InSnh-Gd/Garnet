@@ -20,8 +20,8 @@ h='''#include <stdio.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "rdna4_gate.h"
-#include "rdna4_dumpacl.h"
+#include "garnet_gate.h"
+#include "garnet_dumpacl.h"
 #define RDNA4LOG(fmt, ...) printf("LOG: " fmt "\\n", ##__VA_ARGS__)
 #define RDNA4_ONCE(fmt, ...) RDNA4LOG(fmt, ##__VA_ARGS__)
 '''

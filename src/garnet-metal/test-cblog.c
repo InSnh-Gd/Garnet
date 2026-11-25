@@ -1,7 +1,7 @@
-// test-cblog.c: host test of rdna4_cblog.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-cblog test-cblog.c && /tmp/test-cblog
+// test-cblog.c: host test of garnet_cblog.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-cblog test-cblog.c && /tmp/test-cblog
 #include <stdio.h>
 #include <stdlib.h>
-#include "rdna4_cblog.h"
+#include "garnet_cblog.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 static rdna4cb_t T;

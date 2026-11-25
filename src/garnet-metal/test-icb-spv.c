@@ -1,14 +1,14 @@
-// Offline SPIR-V and ABI layout self-check for rdna4_icb_abi.h + rdna4_icb_expand.h.
+// Offline SPIR-V and ABI layout self-check for garnet_icb_abi.h + garnet_icb_expand.h.
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "rdna4_spvrefl.h"
-#include "rdna4_tessellation.h"
-#include "rdna4_icb_expand.h"
+#include "garnet_spvrefl.h"
+#include "garnet_tessellation.h"
+#include "garnet_icb_expand.h"
 
-// Cross-check rdna4_tess_draw_params_t dword offsets hardcoded in rdna4_icb_expand.h!
+// Cross-check rdna4_tess_draw_params_t dword offsets hardcoded in garnet_icb_expand.h!
 _Static_assert(offsetof(rdna4_tess_draw_params_t, factor_bda) == 0, "tess draw factor_bda offset");
 _Static_assert(offsetof(rdna4_tess_draw_params_t, factor_size) == 8, "tess draw factor_size offset");
 _Static_assert(offsetof(rdna4_tess_draw_params_t, factor_instance_stride) == 16, "tess draw stride offset");

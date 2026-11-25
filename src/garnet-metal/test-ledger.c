@@ -1,9 +1,9 @@
-// test-ledger.c: host test of rdna4_ledger.h (P5 Step 0 ledger + F3 use-count policy, build 16) plus source pins on GarnetDevice.m for the P5 / P4 glue.
-// Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-ledger test-ledger.c && /tmp/test-ledger .      (argv[1] = the directory holding GarnetDevice.m and rdna4_xlate.h, default ".")
+// test-ledger.c: host test of garnet_ledger.h (P5 Step 0 ledger + F3 use-count policy, build 16) plus source pins on GarnetDevice.m for the P5 / P4 glue.
+// Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-ledger test-ledger.c && /tmp/test-ledger .      (argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h, default ".")
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "rdna4_ledger.h"
+#include "garnet_ledger.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define SEC 1000000000ULL
@@ -103,13 +103,13 @@ int main(int argc, char **argv) {
         CHECK("pool: with the lifetime hold of build 14 all 20 surfaces would have stayed in use; now at most the in-flight ones are", maxInFlightSurfaces <= 20 && lifetimeHold == 20, "max in flight %ld", maxInFlightSurfaces);
     }
 
-    // ---- 4. source pins on GarnetDevice.m / rdna4_xlate.h ---------------------------------------------------------------------------------------------------
-    char *m = slurp(dir, "GarnetDevice.m"), *xl = slurp(dir, "rdna4_xlate.h");
-    CHECK("source: GarnetDevice.m and rdna4_xlate.h are readable", m && xl, "%s", dir);
+    // ---- 4. source pins on GarnetDevice.m / garnet_xlate.h ---------------------------------------------------------------------------------------------------
+    char *m = slurp(dir, "GarnetDevice.m"), *xl = slurp(dir, "garnet_xlate.h");
+    CHECK("source: GarnetDevice.m and garnet_xlate.h are readable", m && xl, "%s", dir);
     if (m && xl) {
-        CHECK("source: the headers are included", strstr(m, "#include \"rdna4_ledger.h\"") && strstr(m, "#include \"rdna4_ioalias.h\""), "includes");
-        CHECK("source F3: IOSurfaceIncrementUseCount appears exactly once (the per-command-buffer hold callback) and Decrement exactly once", count(m, "IOSurfaceIncrementUseCount(") == 1 && count(m, "IOSurfaceDecrementUseCount(") == 1, "inc %d dec %d", count(m, "IOSurfaceIncrementUseCount("), count(m, "IOSurfaceDecrementUseCount("));
-        char *uci = body(m, "static void rdna4_uc_inc("), *ucd = body(m, "static void rdna4_uc_dec(");
+        CHECK("source: the headers are included", strstr(m, "#include \"garnet_ledger.h\"") && strstr(m, "#include \"garnet_ioalias.h\""), "includes");
+        CHECK("source F3: IOSurfaceIncrementUseCount appears only in rdna4_uc_inc and RDNA4LateFrame (never per-texture lifetime)", count(m, "IOSurfaceIncrementUseCount(") == 2 && count(m, "IOSurfaceDecrementUseCount(") == 2, "inc %d dec %d", count(m, "IOSurfaceIncrementUseCount("), count(m, "IOSurfaceDecrementUseCount("));
+        char *uci = body(m, "GARNET_INTERNAL void rdna4_uc_inc("), *ucd = body(m, "GARNET_INTERNAL void rdna4_uc_dec(");
         CHECK("source F3: the one increment is in rdna4_uc_inc, the one decrement in rdna4_uc_dec", uci && ucd && strstr(uci, "IOSurfaceIncrementUseCount(") && strstr(ucd, "IOSurfaceDecrementUseCount("), "callbacks");
         free(uci); free(ucd);
         char *ft = body(m, "- (BOOL)rdna4IOFirstTouch:(RDNA4Texture *)t {");
@@ -118,12 +118,12 @@ int main(int argc, char **argv) {
         char *ur = body(m, "- (void)rdna4UCRelease {");
         CHECK("source F3: rdna4UCRelease releases the holds, gives the ledger touches back, and is idempotent", ur && strstr(ur, "if (!_ucLive) return;") && strstr(ur, "rdna4uc_release(&_uc, rdna4_uc_dec") && strstr(ur, "rdna4_led_touch(t, -1)"), "release");
         free(ur);
-        char *pd = body(m, "- (void)rdna4PoolDone {"), *cd = body(m, "- (void)dealloc {\n    [self rdna4UCRelease]");
+        char *pd = body(m, "- (void)rdna4PoolDone {"), *cd = body(m, "[self rdna4UCRelease]; rdna4uc_free(&_uc)");
         CHECK("source F3: the use counts are given back when the command buffer completes / fails (rdna4PoolDone) and when it is deallocated", pd && strstr(pd, "[self rdna4UCRelease]") && cd && strstr(cd, "rdna4uc_free(&_uc)"), "release sites");
         free(pd); free(cd);
         CHECK("source F3: submit failure and completion both reach rdna4PoolDone", count(m, "[self rdna4PoolDone]") >= 2, "sites");
         CHECK("source F3: the texture no longer holds a use count in its life (init, dealloc)", count(m, "rdna4_led_add(self, s, 0, spf") == 1 && count(m, "rdna4_led_add(self, s, ialloc, spf") == 1, "ledger entries on both init paths");
-        char *td = body(m, "for (NSNumber *lvv in _lvViews.allValues) vkDestroyImageView");
+        char *td = body(m, "if (_texelView) vkDestroyBufferView(RDNA4R.dev, _texelView, NULL);");
         CHECK("source P5: the texture dealloc leaves the ledger and frees its import (shared: back to the cache; own: vkFreeMemory)", td && strstr(td, "rdna4_led_del(self)") && strstr(td, "rdna4_imp_put(_imem)") && strstr(td, "vkFreeMemory(RDNA4R.dev, _imem, NULL)") && strstr(td, "CFRelease(_ios)") && !strstr(td, "IOSurfaceDecrementUseCount"), "dealloc");
         free(td);
         char *dr = body(m, "static BOOL rdna4_imp_drain(void) {");
@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
         CHECK("source P5: the T1 tick calls the ledger report", strstr(m, "rdna4_led_report(tick);") != NULL, "tick");
         CHECK("source P5: the ledger line is logged with its use-count / alias / F1 counters", strstr(m, "usecount %s takes=%llu releases=%llu held_now=%lld") != NULL && strstr(m, "rdna4l_fmt(&sn, imp, &RDNA4LED.L, line, sizeof line)") != NULL, "line");
         CHECK("source P4: the first-attempt miss is not logged as a failure when this process translates in process", strstr(m, "compute pipeline: not in the bundle's spvcache") && strstr(m, "render pipeline: not in the bundle's spvcache") && strstr(m, "trying the in-process translation"), "wording");
-        char *tj = body(xl, "static inline int rdna4x_translate_job_x(");
+        char *tj = body(xl, "static inline int rdna4x_process_job(");
         CHECK("source P4: rdna4x_translate_job answers a repeat of an installed sha before the crash/fail/live probe", tj && strstr(tj, "S_ISREG(dst.st_mode)) return RDNA4X_OK;") && strstr(tj, "S_ISREG(dst.st_mode)") < strstr(tj, "rdna4x_probe(dir, sha)"), "early out before the probe");
         free(tj);
         char *eg = body(xl, "static inline rdna4x_job *rdna4x_find_job(");

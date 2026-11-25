@@ -3,7 +3,7 @@
 // Runtime: Foundation, libSystem/libproc, packaged libgarnetxlate, OS GPUCompiler LLVM.
 // No external validator is invoked; structural checks below are not spirv-val.
 #import <Foundation/Foundation.h>
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 #include <libproc.h>
 #include <spawn.h>
 #include <sys/event.h>

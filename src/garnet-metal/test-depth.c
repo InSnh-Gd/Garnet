@@ -1,4 +1,4 @@
-// test-depth.c: host test of rdna4_depth.h (bundle 10: depth/stencil textures and pipeline state, MSAA, multisample resolve), plus source pins that tie the REAL GarnetDevice.m to it.
+// test-depth.c: host test of garnet_depth.h (bundle 10: depth/stencil textures and pipeline state, MSAA, multisample resolve), plus source pins that tie the REAL GarnetDevice.m to it.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-depth test-depth.c && /tmp/test-depth .
 //   argv[1] = the directory holding GarnetDevice.m and the headers (default ".").
 // The rule this file enforces: nothing a build-9 client could do changes.  A colour-only, single-sample pipeline keeps key 0, the three old dynamic states, one sample and no bias
@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_depth.h"
+#include "garnet_depth.h"
 static int fails, checks;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; checks++; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define QUIET(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
     char *m = slurp(dir, "GarnetDevice.m");
     CHECK(m != NULL, "GarnetDevice.m is readable");
     if (m) {
-        CHECK(strstr(m, "#include \"rdna4_depth.h\"") != NULL, "GarnetDevice.m includes rdna4_depth.h");
+        CHECK(strstr(m, "#include \"garnet_depth.h\"") != NULL, "GarnetDevice.m includes garnet_depth.h");
         CHECK(strstr(m, "- (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }") != NULL && !strstr(m, "isDepth24Stencil8PixelFormatSupported { return YES; }"), "isDepth24Stencil8PixelFormatSupported answers NO");
         CHECK(strstr(m, "rdna4dp_barrier_aspect([t rdna4Aspects]), 0, [t rdna4Levels], 0, [t rdna4ImageLayers] } };") != NULL, "every layout barrier (rdna4_tex_to) names the texture's own aspects, not COLOR");
         CHECK(strstr(m, "rdna4dp_barrier_aspect(_aspects), [self rdna4MipLevel:lv], 1, av.baseLayer, av.layerCount }") != NULL, "the attachment view carries every aspect of a depth/stencil format");

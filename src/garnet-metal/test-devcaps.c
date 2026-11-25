@@ -2,7 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include "rdna4_devcaps.h"
+#include "garnet_devcaps.h"
 
 #define MIB (UINT64_C(1) << 20)
 #define GIB (UINT64_C(1) << 30)

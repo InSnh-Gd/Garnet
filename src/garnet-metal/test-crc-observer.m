@@ -3,8 +3,8 @@
 #import <IOSurface/IOSurface.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include "rdna4_dispflip.h"
-#include "rdna4_crc.h"
+#include "garnet_dispflip.h"
+#include "garnet_crc.h"
 static void fixtureLog(const char *format, ...) { (void)format; }
 #define RDNA4LOG(...) fixtureLog(__VA_ARGS__)
 #define VK_SUCCESS 0

@@ -1,11 +1,11 @@
-// test-dispflip.c: the S5.2a D-copy state machine (rdna4_dispflip.h) on the host: slot choice, drops, present-after-success, fail-closed transitions, kill switch.
+// test-dispflip.c: the S5.2a D-copy state machine (garnet_dispflip.h) on the host: slot choice, drops, present-after-success, fail-closed transitions, kill switch.
 // Build/run on the host Mac:  cc -O1 -Wall -Wextra -Werror -o /tmp/test-dispflip test-dispflip.c && /tmp/test-dispflip
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
-#include "rdna4_scanabi.h"
-#include "rdna4_dispflip.h"
-#include "rdna4_impcache.h"
+#include "garnet_scanabi.h"
+#include "garnet_dispflip.h"
+#include "garnet_impcache.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define R RDNA4DF_SLOT_REUSABLE

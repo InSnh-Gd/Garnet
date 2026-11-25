@@ -1,10 +1,10 @@
-// test-impcache.c: rdna4_impcache.h (P4 import cache + classify cache decisions) on the host.
+// test-impcache.c: garnet_impcache.h (P4 import cache + classify cache decisions) on the host.
 // Build/run on the host Mac:  cc -O1 -Wall -Wextra -Werror -o /tmp/test-impcache test-impcache.c && /tmp/test-impcache
 // Also exercise the actual admission path with host stubs (run from this directory):
 // sed -n '/^static VkResult rdna4_imp_get(/,/^}/p' GarnetDevice.m > /tmp/rdna4-imp-get.inc
 // cc -O1 -Wall -Wextra -Werror -pthread -DRDNA4_IMP_GET_BODY='"/tmp/rdna4-imp-get.inc"' -o /tmp/test-impcache test-impcache.c && /tmp/test-impcache
 #include <stdio.h>
-#include "rdna4_impcache.h"
+#include "garnet_impcache.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define MIB (1ULL << 20)

@@ -1,8 +1,8 @@
-// test-t1.c: host test of rdna4_t1.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-t1 test-t1.c && /tmp/test-t1
+// test-t1.c: host test of garnet_t1.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-t1 test-t1.c && /tmp/test-t1
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include "rdna4_t1.h"
+#include "garnet_t1.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 static rdna4t_hist H;

@@ -1,6 +1,6 @@
 // Execute translated AIR after GPU-only token updates, independently of Metal descriptor setup.
 #include "test-vulkan-replay.h"
-#include "rdna4_buffer_registry.h"
+#include "garnet_buffer_registry.h"
 
 int main(int argc, const char **argv) {
     if (argc != 4) { fprintf(stderr, "Usage: test-gpu-resource-tables VULKAN_LIBRARY CONSUMER_SPV PRODUCER_SPV\n"); return 2; }

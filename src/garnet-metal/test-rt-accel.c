@@ -1,4 +1,4 @@
-// Pure-C host unit tests for rdna4_rt_accel.h (Task 7.1).
+// Pure-C host unit tests for garnet_rt_accel.h (Task 7.1).
 // Build (GCC):
 //   gcc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Wshadow -Wsign-conversion -Werror src/garnet-metal/test-rt-accel.c -lm -o test-rt-accel
 // Build (Clang ASan+UBSan):
@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rdna4_rt_accel.h"
+#include "garnet_rt_accel.h"
 
 static int g_pass = 0;
 static int g_fail = 0;

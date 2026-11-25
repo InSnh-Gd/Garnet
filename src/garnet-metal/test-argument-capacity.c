@@ -1,4 +1,4 @@
-#include "rdna4_argument_capacity.h"
+#include "garnet_argument_capacity.h"
 
 #include <stdio.h>
 #include <stdlib.h>

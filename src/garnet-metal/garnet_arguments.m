@@ -7,7 +7,7 @@
 #include "garnet_metal_internal.h"
 #endif
 #define RDNA4S_TRACE(...) ((void)0)
-#include "rdna4_stitch_reflection.h"
+#include "garnet_stitch_reflection.h"
 #undef RDNA4S_TRACE
 #endif
 
@@ -3185,7 +3185,7 @@ GARNET_INTERNAL BOOL rdna4_argument_reflection(id<MTLFunction> function, NSArray
 #ifndef RDNA4_ARGUMENT_SUMMARY_RUNTIME_INC
 #define RDNA4_ARGUMENT_SUMMARY_RUNTIME_INC
 
-#include "rdna4_argument_summary.h"
+#include "garnet_argument_summary.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -3934,7 +3934,7 @@ rdna4_argument_summary_runtime_record(
 
 #if !defined(RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST)
 
-#include "argument-summary/rdna4_argument_summary_spv.h"
+#include "argument-summary/garnet_argument_summary_spv.h"
 
 #include <pthread.h>
 
@@ -4842,7 +4842,7 @@ rdna4_argument_summary_attempt_publish(
 #ifndef RDNA4_ARGUMENT_SUMMARY_OWNERS_INC
 #define RDNA4_ARGUMENT_SUMMARY_OWNERS_INC
 
-#include "rdna4_argument_summary.h"
+#include "garnet_argument_summary.h"
 
 #include <stdbool.h>
 #include <stddef.h>

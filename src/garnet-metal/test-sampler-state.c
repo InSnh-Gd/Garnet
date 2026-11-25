@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "rdna4_sampler.h"
+#include "garnet_sampler.h"
 
 static int failures;
 

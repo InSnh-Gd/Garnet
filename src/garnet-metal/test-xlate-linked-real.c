@@ -2,7 +2,7 @@
 //   usage: test-xlate-linked-real <libgarnetxlate.dylib> <entry.air> <dep.air> <dep symbol>
 // Checks: the entry alone is REFUSED by the translator for its visible function reference (so the unlinked path never produced a pipeline); the same entry with its dependency translates and the SPIR-V holds
 // the dependency's arithmetic; the dependency's own bitcode alone is not a stage; the library speaks ABI 3.
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 static int fails;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; printf("%s %s\n", ok_ ? "ok  " : "FAIL", name); if (!ok_) fails++; } while (0)
 static uint8_t *slurp(const char *p, size_t *n) { FILE *f = fopen(p, "rb"); if (!f) return NULL; fseek(f, 0, SEEK_END); *n = (size_t)ftell(f); fseek(f, 0, SEEK_SET); uint8_t *b = malloc(*n); if (fread(b, 1, *n, f) != *n) { free(b); b = NULL; } fclose(f); return b; }

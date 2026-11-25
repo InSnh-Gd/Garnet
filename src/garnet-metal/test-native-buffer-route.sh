@@ -40,7 +40,7 @@ if [[ -n ${RDNA4_LEGACY_RADV:-} ]]; then
     "$out/test-command-completion" "$production" complete > "$out/production-legacy.log" 2>&1 || result=1
     grep '^COMPLETION_' "$out/production-legacy.log" || result=1
 fi
-shasum -a 256 "$source_dir/GarnetDevice.m" "$source_dir/garnet_metal_internal.h" "$source_dir"/garnet_*.m "$source_dir/rdna4_native_blit.h" "$source_dir/test-native-buffer-route.m" \
+shasum -a 256 "$source_dir/GarnetDevice.m" "$source_dir/garnet_metal_internal.h" "$source_dir"/garnet_*.m "$source_dir/garnet_native_blit.h" "$source_dir/test-native-buffer-route.m" \
     "$source_dir/test-native-buffer-route.sh" "$out/GarnetMetal-production" "$bundle/Contents/MacOS/GarnetMetal" \
     "$out/test-native-buffer-route" "$out/test-command-completion" "$out/librdna4featureaudit.dylib" \
     "$bundle/Contents/Resources/libvulkan_radeon.dylib" "$production/Contents/Resources/libvulkan_radeon.dylib" > "$out/SHA256SUMS"

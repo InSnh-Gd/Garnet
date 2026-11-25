@@ -1,11 +1,11 @@
-// test-intfmt.c: host test of rdna4_intfmt.h (bundle 19, missing menus: RG16Uint) plus source pins on GarnetDevice.m that prove REACHABILITY and ORDER of the glue, not just the text.
+// test-intfmt.c: host test of garnet_intfmt.h (bundle 19, missing menus: RG16Uint) plus source pins on GarnetDevice.m that prove REACHABILITY and ORDER of the glue, not just the text.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-intfmt test-intfmt.c && /tmp/test-intfmt .      (argv[1] = the directory holding GarnetDevice.m, default ".")
 // The clear table below is what Apple's Metal did on the M4 (test-intclear-semantics.m repeats it live against the real Metal and against this header).
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
-#include "rdna4_intfmt.h"
+#include "garnet_intfmt.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 
@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
     CHECK("pin: kill file /private/tmp/rdna4m-nouint, one definition, one stat(), read through dispatch_once", count(m_, "#define RDNA4_NOUINT_FILE \"/private/tmp/rdna4m-nouint\"") == 1 && count(m_, "stat(RDNA4_NOUINT_FILE, &st)") == 1 && count(m_, "rdna4m-nouint\"") >= 1, "latched once per process");
     const char *nu = at(m_, "static BOOL rdna4_nouint(void) {"), *nuo = nu ? at(nu, "dispatch_once(&once") : NULL, *nus = nu ? at(nu, "stat(RDNA4_NOUINT_FILE") : NULL;
     CHECK("pin: the stat() lives inside the dispatch_once block of rdna4_nouint()", nu && nuo && nus && nuo < nus && nus - nu < 400, "once-only");
-    const char *fm = at(m_, "static const RDNA4Fmt *rdna4_fmt(MTLPixelFormat f) {"), *fme = fm ? at(fm, "\n}") : NULL, *fmk = fm ? at(fm, "(RDNA4F_UINT | RDNA4F_SINT)) && rdna4_nouint()") : NULL;
+    const char *fm = at(m_, "GARNET_INTERNAL const RDNA4Fmt *rdna4_fmt(MTLPixelFormat f) {"), *fme = fm ? at(fm, "\n}") : NULL, *fmk = fm ? at(fm, "(RDNA4F_UINT | RDNA4F_SINT)) && rdna4_nouint()") : NULL;
     CHECK("pin: rdna4_fmt() (the one colour lookup) answers NULL for an RDNA4F_UINT entry when the kill file exists", fm && fme && fmk && fmk < fme, "the kill file restores today's nil everywhere rdna4_fmt is used");
     // clear site
     const char *cl = at(m_, "MTLClearColor c = ca.clearColor;"), *cu = cl ? at(cl, "if ([t rdna4IsUInt]) {") : NULL, *cu32 = cl ? at(cl, ".uint32 = { rdna4if_clear_u(c.red, rgbB)") : NULL, *cs = cl ? at(cl, "} else if ([t rdna4IsSInt]) {") : NULL, *cs32 = cs ? at(cs, ".int32 = { rdna4if_clear_s(c.red, rgbB)") : NULL, *cf = cl ? at(cl, ".float32 = { (float)c.red") : NULL;
@@ -68,8 +68,8 @@ int main(int argc, char **argv) {
           count(m_, "rdna4if_clear_u(c.blue, rgbB)") == 1 && count(m_, "rdna4if_clear_u(c.alpha, aB)") == 1 &&
           count(m_, "rdna4if_clear_s(c.red, rgbB)") == 1 && count(m_, "rdna4if_clear_s(c.green, rgbB)") == 1 &&
           count(m_, "rdna4if_clear_s(c.blue, rgbB)") == 1 && count(m_, "rdna4if_clear_s(c.alpha, aB)") == 1, "4+4 of 4+4");
-    { char *h_ = slurp(dir, "rdna4_intfmt.h"); CHECK("pin: the converter's NaN guard is `!(v > 0.0)` (a UB cast of NaN gives 0 on arm64 but not on x86, so the value test cannot see it)", h_ && count(h_, "if (!(v > 0.0)) return 0;") == 1, "present"); free(h_); }
-    CHECK("pin: the include of rdna4_intfmt.h", count(m_, "#include \"rdna4_intfmt.h\"") == 1, "present");
+    { char *h_ = slurp(dir, "garnet_intfmt.h"); CHECK("pin: the converter's NaN guard is `!(v > 0.0)` (a UB cast of NaN gives 0 on arm64 but not on x86, so the value test cannot see it)", h_ && count(h_, "if (!(v > 0.0)) return 0;") == 1, "present"); free(h_); }
+    CHECK("pin: the include of garnet_intfmt.h", count(m_, "#include \"garnet_intfmt.h\"") == 1, "present");
     CHECK("pin: texture and pipeline creation check the backend format features", count(m_, "rdna4_fmt_feats(p->fmt)") == 1 && count(m_, "rdna4_fmt_feats(f)") >= 1 && count(m_, "RADV features 0x%x lack") >= 1 && count(m_, "p->canRT = p->isDS ?") == 1, "texture allocation uses the shared image plan");
     free(m_);
     { char *pl = slurp(dir, "Info.plist"); CHECK("pin: Info.plist CFBundleVersion is 43", pl && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"), "expected build 43"); free(pl); }

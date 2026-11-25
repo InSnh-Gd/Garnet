@@ -6,8 +6,8 @@
 #include "garnet_metal_internal.h"
 #endif
 #ifdef GARNET_METAL_INTERNAL_H
-#include "rdna4_luma_workgroup.h"
-#include "rdna4_icb_expand.h"
+#include "garnet_luma_workgroup.h"
+#include "garnet_icb_expand.h"
 #endif
 
 #ifndef RDNA4_ICB_INC

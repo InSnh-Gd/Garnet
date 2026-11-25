@@ -1,4 +1,4 @@
-#include "rdna4_argument_epochs.h"
+#include "garnet_argument_epochs.h"
 
 #include <stdbool.h>
 #include <stdint.h>

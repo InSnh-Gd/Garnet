@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rdna4_swizzle.h"
-#include "rdna4_heap_backing.h"
+#include "garnet_swizzle.h"
+#include "garnet_heap_backing.h"
 
 static int fails, checks;
 #define CHECK(name, cond, ...) do { \

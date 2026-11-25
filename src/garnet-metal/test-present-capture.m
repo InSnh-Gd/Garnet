@@ -8,9 +8,9 @@
 #include <sys/sysctl.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "rdna4_dispflip.h"
-#include "rdna4_plane.h"
-#include "rdna4_scanabi.h"
+#include "garnet_dispflip.h"
+#include "garnet_plane.h"
+#include "garnet_scanabi.h"
 #define RDNA4LOG(...) ((void)0)
 #define RDNA4S_FOURCC_BGRA 0x42475241u
 typedef void *VkBuffer;

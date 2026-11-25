@@ -1,5 +1,5 @@
-#include "rdna4_argument_summary.h"
-#include "argument-summary/rdna4_argument_summary_spv.h"
+#include "garnet_argument_summary.h"
+#include "argument-summary/garnet_argument_summary_spv.h"
 
 #include <stdint.h>
 #include <stdio.h>

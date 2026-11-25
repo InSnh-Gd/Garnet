@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "rdna4_pitch.h"
+#include "garnet_pitch.h"
 
 static int checks, failures;
 #define CHECK(name, value, expected) do { \

@@ -1,4 +1,4 @@
-// test-ioalias.c: host test of rdna4_ioalias.h (P1, build 16) plus source pins on GarnetDevice.m for the glue.
+// test-ioalias.c: host test of garnet_ioalias.h (P1, build 16) plus source pins on GarnetDevice.m for the glue.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-ioalias test-ioalias.c && /tmp/test-ioalias .      (argv[1] = the directory holding GarnetDevice.m, default ".")
 //
 // The core is a DIFFERENTIAL test: random sequences of touches (object, path a/b, needs contents, writes, range) are replayed twice, once against an ideal single-truth model and once through a tiny executor that does
@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "rdna4_ioalias.h"
+#include "garnet_ioalias.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define NR 3          // ranges: (sid 7, off 0), (sid 7, off 65536) = the second plane of the same surface, (sid 9, off 0)
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
     char *m = slurp(dir, "GarnetDevice.m");
     CHECK("source: GarnetDevice.m is readable", m != NULL, "%s/GarnetDevice.m", dir);
     if (m) {
-        CHECK("source: the P1 header is included", strstr(m, "#include \"rdna4_ioalias.h\"") != NULL, "include");
+        CHECK("source: the P1 header is included", strstr(m, "#include \"garnet_ioalias.h\"") != NULL, "include");
         CHECK("source: the gate is rdna4ia_enabled(rdna4_is_ws(), <kill file>)", strstr(m, "rdna4ia_enabled(rdna4_is_ws() ? 1 : 0, ") != NULL && strstr(m, "/private/tmp/rdna4m-noioalias") != NULL, "gate + kill file");
         CHECK("source: both render-encoder sampling sites and the generic site go through rdna4_ios_touch", count(m, "rdna4_ios_touch(") >= 4, "%d call sites/definition", count(m, "rdna4_ios_touch("));
         CHECK("source: neither render-encoder site still uploads on the bare first-touch test", count(m, "if ([t rdna4IsIOS] && [_cb rdna4IOFirstTouch:t]) {") == 0 && count(m, "if ([t rdna4IsIOS] && [self->_cb rdna4IOFirstTouch:t]) {") == 0, "legacy first-touch upload blocks");

@@ -1,4 +1,4 @@
-// Host test of rdna4_gl_surface_pure.h plus source pins on assembled GarnetDevice.m.
+// Host test of garnet_gl_surface_pure.h plus source pins on assembled GarnetDevice.m.
 // Build/run from repo root (dev host):
 //   python3 src/garnet-metal/assemble-device.py src/garnet-metal/GarnetDevice.m \
 //     --output temp/scratch/garnet-assembled-device.m
@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_gl_surface_pure.h"
+#include "garnet_gl_surface_pure.h"
 
 static int g_checks = 0;
 static int g_fails = 0;
@@ -225,14 +225,14 @@ static void test_source_pins(const char *assembled_path, const char *dir) {
     }
 
     char path[1024];
-    snprintf(path, sizeof path, "%s/rdna4_gl_surface_pure.h", dir);
+    snprintf(path, sizeof path, "%s/garnet_gl_surface_pure.h", dir);
     char *pure_src = slurp_path(path);
-    CHECK(pure_src != NULL, "source: rdna4_gl_surface_pure.h readable");
+    CHECK(pure_src != NULL, "source: garnet_gl_surface_pure.h readable");
     if (pure_src) {
         CHECK(strstr(pure_src, "AppleParavirt") == NULL,
-              "boundary: rdna4_gl_surface_pure.h has zero AppleParavirt references");
+              "boundary: garnet_gl_surface_pure.h has zero AppleParavirt references");
         CHECK(strstr(pure_src, "glProgramAir") == NULL,
-              "boundary: rdna4_gl_surface_pure.h has zero glProgramAir references");
+              "boundary: garnet_gl_surface_pure.h has zero glProgramAir references");
         free(pure_src);
     }
 

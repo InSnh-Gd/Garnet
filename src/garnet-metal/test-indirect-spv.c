@@ -1,4 +1,4 @@
-#include "rdna4_indirect_compute.h"
+#include "garnet_indirect_compute.h"
 #include <errno.h>
 
 static void require(int condition, const char *what) {

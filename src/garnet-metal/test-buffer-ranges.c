@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
-#include "rdna4_buffer_ranges.h"
+#include "garnet_buffer_ranges.h"
 
 int main(void) {
     const uint64_t gib = UINT64_C(1) << 30;

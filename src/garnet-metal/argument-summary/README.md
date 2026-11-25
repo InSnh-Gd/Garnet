@@ -18,7 +18,7 @@ the existing segment, fence, and checkpoint path.
   Found tokens set the bit for their global dictionary index with `atomicOr`;
   `push.output_word_base` converts that index into the page-local word.
 - The 32-byte std430 push block is `rdna4_argument_summary_push` from
-  `../rdna4_argument_summary.h`.
+  `../garnet_argument_summary.h`.
 - Use `ceil(source_count / 64)` workgroups. One dispatch handles a bounded
   source slice and one dictionary page. Partition by
   `maxComputeWorkGroupCount[0]`; never truncate a slice.

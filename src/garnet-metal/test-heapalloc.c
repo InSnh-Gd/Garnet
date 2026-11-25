@@ -1,4 +1,4 @@
-// test-heapalloc.c: the RDNA4Heap offset allocator (rdna4_heapalloc.h) against the numbers `mtlprobe heap` measured on an Apple-silicon Mac (Apple's AGXG16GFamilyHeap.
+// test-heapalloc.c: the RDNA4Heap offset allocator (garnet_heapalloc.h) against the numbers `mtlprobe heap` measured on an Apple-silicon Mac (Apple's AGXG16GFamilyHeap.
 // Build/run on the host Mac:  cc -O1 -o /tmp/test-heapalloc test-heapalloc.c && /tmp/test-heapalloc
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,7 +7,7 @@ static void *testRealloc(void *pointer, size_t bytes) {
     return refuseGrowth ? NULL : realloc(pointer, bytes);
 }
 #define realloc testRealloc
-#include "rdna4_heapalloc.h"
+#include "garnet_heapalloc.h"
 #undef realloc
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)

@@ -20,8 +20,8 @@ GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
 // ---------------------------------------------------------------------------------------------------------------
 // Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
 // tool that opts in with RDNA4M_ALLOW=1, or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
-// successful RDNA4N open + QueryInfo, never by name; rdna4_gate.h) may get a device. All test hooks are honoured only with RDNA4M_ALLOW=1 as root.
-// Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see rdna4_gate.h.
+// successful RDNA4N open + QueryInfo, never by name; garnet_gate.h) may get a device. All test hooks are honoured only with RDNA4M_ALLOW=1 as root.
+// Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see garnet_gate.h.
 //   /private/tmp/rdna4m-off              exists -> decline (L1 kill file); outside WindowServer also when the stat is denied (anything but ENOENT / ENOTDIR)
 //   /private/tmp/rdna4m-starts           one epoch-seconds line per WindowServer init; >= 3 within 300 s -> decline (L2)
 //   nub property "Garnet,Ready" = 0    -> decline (L3); WindowServer: absent (old kexts) -> proceed; elsewhere it must be present and 1
@@ -101,7 +101,7 @@ GARNET_INTERNAL void rdna4_mark_clean(void) {
 }
 
 // RDNA4G_FLAG_ABSENT (-1) = property absent (or filtered by a sandbox: the registry cannot tell), RDNA4G_FLAG_NONUB (-2) = the nub could not be reached, 0 = false/zero, 1 = true.
-// Reads a numeric/boolean property from the accelerator's parent (the nub). WindowServer treats -1 and -2 alike (proceed); everything else declines on them (rdna4_gate.h).
+// Reads a numeric/boolean property from the accelerator's parent (the nub). WindowServer treats -1 and -2 alike (proceed); everything else declines on them (garnet_gate.h).
 static int rdna4_nub_flag(uint32_t port, CFStringRef name) {
     io_registry_entry_t parent = 0;
     if (IORegistryEntryGetParentEntry((io_registry_entry_t)port, kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return RDNA4G_FLAG_NONUB;
@@ -234,7 +234,7 @@ GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
     const int isWs = cls == RDNA4G_CLASS_WS;
     // 0.0.641 (G4 review HIGH 2): root and daemons (euid < 501) that are neither WindowServer nor an RDNA4M_ALLOW tool are declined BY CLASS, first of all, exactly as in 0.0.632: no kernel open for them.
     if (rdna4g_declined_by_class(cls, (uint32_t)geteuid())) return RDNA4G_DECLINE_BY_CLASS_TEXT;
-    // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (rdna4_gate.h).
+    // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (garnet_gate.h).
     struct stat st;
     const int srcRc = stat(RDNA4_KILL_FILE, &st), srcErr = errno;
     const int ks = rdna4g_kill_state(srcRc, srcErr);
@@ -270,7 +270,7 @@ GARNET_INTERNAL BOOL rdna4_headless(void) {
         int result = stat(RDNA4_HEADLESS_NO, &st);
         int error = result ? errno : 0;
         v = result != 0;
-        RDNA4LOG("[DEBUG-render] isHeadless=%d markerResult=%d errno=%d process=%s",
+        RDNA4LOG("isHeadless=%d markerResult=%d errno=%d process=%s",
                  v, result, error, getprogname());
     });
     return v;
@@ -279,7 +279,7 @@ GARNET_INTERNAL BOOL rdna4_headless(void) {
 #ifndef RDNA4_ARGUMENT_LIMIT_SNAPSHOT_INC
 #define RDNA4_ARGUMENT_LIMIT_SNAPSHOT_INC
 
-#include "rdna4_argument_limit_snapshot.h"
+#include "garnet_argument_limit_snapshot.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -1188,7 +1188,7 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     memcpy(RDNA4PC.uuid, pp->pipelineCacheUUID, 16); RDNA4PC.vendor = pp->vendorID; RDNA4PC.device = pp->deviceID;
     if (!rdna4_pc_derive_key()) { RDNA4LOG("T2 pipeline cache: backend identity unavailable, running without"); return; }
     // GPU-apps G4: WindowServer and RDNA4M_ALLOW root tools use /private/var/tmp/rdna4m-pipecache.bin as before; any other (admitted application) process uses a file of its OWN under the
-    // user's cache directory (confstr _CS_DARWIN_USER_CACHE_DIR, the one cache directory a sandboxed GPU process may write) and has NO cache if that directory is unavailable (rdna4_gate.h).
+    // user's cache directory (confstr _CS_DARWIN_USER_CACHE_DIR, the one cache directory a sandboxed GPU process may write) and has NO cache if that directory is unavailable (garnet_gate.h).
     const int pcls = rdna4g_class(rdna4_is_ws(), rdna4_allow());
     char ucd[1024]; ucd[0] = 0;
     if (pcls == RDNA4G_CLASS_OTHER) { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }

@@ -3,7 +3,7 @@
 #include <assert.h>
 #include <dlfcn.h>
 #define RDNA4LOG(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
-#include "rdna4_coredisplay_compat.h"
+#include "garnet_coredisplay_compat.h"
 
 int main(void) {
     @autoreleasepool {

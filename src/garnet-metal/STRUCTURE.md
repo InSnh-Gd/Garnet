@@ -25,10 +25,10 @@ GARNET_METAL_MODULAR_BUILD`) that includes `garnet_metal_internal.h` and the 11
 | `GarnetDevice` facade, System Profiler registration, GL-on-Metal drawable bridge | `garnet_device.m` |
 
 Single-TU headers with process-local compatibility state remain included only by
-the compilation unit that owns them (`rdna4_ca_sw_compat.h`,
-`rdna4_coredisplay_compat.h`, `rdna4_compositor_observation.h`,
-`rdna4_census.h` in `garnet_device.m`; `rdna4_stitch_reflection.h` in
-`garnet_arguments.m`; `rdna4_icb_expand.h` in `garnet_icb.m`).
+the compilation unit that owns them (`garnet_ca_sw_compat.h`,
+`garnet_coredisplay_compat.h`,
+`garnet_census.h` in `garnet_device.m`; `garnet_stitch_reflection.h` in
+`garnet_arguments.m`; `garnet_icb_expand.h` in `garnet_icb.m`).
 
 Sampler callers acquire and release canonical storage through
 `rdna4_sampler_storage_acquire` and `rdna4_sampler_storage_release`. Those two

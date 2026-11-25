@@ -7,7 +7,7 @@
 //   cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Wshadow -Wsign-conversion -Werror -Isrc/garnet-metal src/garnet-metal/test-dynlib-vft.c -o test-dynlib-vft
 //   ./test-dynlib-vft src/garnet-metal
 
-#include "rdna4_dynlib_vft.h"
+#include "garnet_dynlib_vft.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -650,7 +650,7 @@ static void test_source_pins(const char *src_dir) {
     char *hdr = read_entire_text_file(ph);
     CHECK(rt != NULL && hdr != NULL, "read garnet_shaders.m and garnet_metal_internal.h");
     if (rt && hdr) {
-        CHECK(strstr(hdr, "#include \"rdna4_dynlib_vft.h\"") != NULL, "internal header includes rdna4_dynlib_vft.h");
+        CHECK(strstr(hdr, "#include \"garnet_dynlib_vft.h\"") != NULL, "internal header includes garnet_dynlib_vft.h");
         CHECK(strstr(rt, "\"garnetx_list_exported_symbols\"") != NULL, "runtime dlsym garnetx_list_exported_symbols");
         CHECK(strstr(rt, "\"garnetx_translate_linked_libraries\"") != NULL, "runtime dlsym garnetx_translate_linked_libraries");
         CHECK(strstr(rt, "rdna4x_list_exported_symbols_for_module") != NULL, "runtime symbol enumeration helper");

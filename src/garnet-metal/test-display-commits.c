@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "rdna4_display_commits.h"
+#include "garnet_display_commits.h"
 
 int main(void) {
     rdna4_display_commit entries[128] = {{0}}, *head = NULL;

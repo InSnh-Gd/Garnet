@@ -1,4 +1,4 @@
-#include "rdna4_argument_public_sampler.h"
+#include "garnet_argument_public_sampler.h"
 
 #include <stdio.h>
 #include <stdlib.h>

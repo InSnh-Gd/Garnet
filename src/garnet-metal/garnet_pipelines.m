@@ -5,15 +5,15 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
-#include "rdna4_indirect_compute.h"
-#include "rdna4_luma_workgroup.h"
-#include "rdna4_fragment_output.h"
-#include "rdna4_fallback_spv.h"
+#include "garnet_indirect_compute.h"
+#include "garnet_luma_workgroup.h"
+#include "garnet_fragment_output.h"
+#include "garnet_fallback_spv.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4RenderPipelineState (10d/11e): SPIR-V from Resources/spvcache/<sha256(bitcodeData)>.spv -> VkPipeline variants.
 // ---------------------------------------------------------------------------------------------------------------
-#include "rdna4_fragment_output.h"
+#include "garnet_fragment_output.h"
 
    // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 

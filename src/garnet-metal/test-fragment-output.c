@@ -1,5 +1,5 @@
-#include "rdna4_spvrefl.h"
-#include "rdna4_fragment_output.h"
+#include "garnet_spvrefl.h"
+#include "garnet_fragment_output.h"
 
 static void require(int condition, const char *message)
 {

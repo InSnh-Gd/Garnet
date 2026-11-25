@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
-#include "rdna4_query_caps.h"
+#include "garnet_query_caps.h"
 int main(void) {
     rdna4x_backend_capabilities c = rdna4x_query_caps(1, 1, 32, 0x10, 0x80);
     assert(rdna4x_query_supported(&c) && rdna4x_query_uses_quad(&c));

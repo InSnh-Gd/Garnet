@@ -4,7 +4,7 @@
 // Also accepts AIRR_FILE REPLY_FILE; compile with -x c for Linux host checks.
 // Directory mode also runs truncation checks and unsupported-input regressions.
 #define RDNA4S_TRACE(...) ((void)0)
-#include "rdna4_stitch_reflection.h"
+#include "garnet_stitch_reflection.h"
 #include <assert.h>
 #include <dirent.h>
 #include <string.h>

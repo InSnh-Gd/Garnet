@@ -1,7 +1,7 @@
-// test-gate.c: rdna4_gate.h (GPU-apps G4, kext 0.0.640: the bundle's load policy outside WindowServer) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
-// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and rdna4_gate.h, default "."):
+// test-gate.c: garnet_gate.h (GPU-apps G4, kext 0.0.640: the bundle's load policy outside WindowServer) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
+// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and garnet_gate.h, default "."):
 //   cc -O1 -Wall -Wextra -Werror -o /tmp/test-gate test-gate.c && /tmp/test-gate .
-// tests/../test-gate-plant.sh plants breaks in the REAL rdna4_gate.h and GarnetDevice.m and demands that this suite FAILS on each.
+// tests/../test-gate-plant.sh plants breaks in the REAL garnet_gate.h and GarnetDevice.m and demands that this suite FAILS on each.
 // Covers:
 //   G1  process classes (WindowServer / RDNA4M_ALLOW root / other);
 //   G2  the kill file: ENOENT / ENOTDIR = absent, EPERM / EACCES / anything else = UNREADABLE; WindowServer keeps today's rule (only a present file declines), everyone else FAILS CLOSED;
@@ -20,7 +20,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "rdna4_gate.h"
+#include "garnet_gate.h"
 #include "../../src/garnet/src/GarnetNativeABI.h"
 
 static int fails, runs;

@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <string.h>
-#include "rdna4_nocopy.h"
+#include "garnet_nocopy.h"
 
 int main(void) {
     char text[4]; int fails = 0;

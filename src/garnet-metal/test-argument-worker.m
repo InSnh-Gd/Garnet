@@ -1,5 +1,5 @@
 // Exercise the production postpass queue, input ownership, cache publication and deadline.
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 #include <stdatomic.h>
 
 static unsigned checks;

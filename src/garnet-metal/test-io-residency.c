@@ -8,9 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rdna4_devcaps.h"
-#include "rdna4_io_queue.h"
-#include "rdna4_residency_set.h"
+#include "garnet_devcaps.h"
+#include "garnet_io_queue.h"
+#include "garnet_residency_set.h"
 
 static int fails, checks;
 #define CHECK(name, cond, ...) do { \

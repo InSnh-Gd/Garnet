@@ -7,7 +7,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <time.h>
-#include "rdna4_query_caps.h"
+#include "garnet_query_caps.h"
 
 static void *realLibrary;
 static _Atomic unsigned calls;

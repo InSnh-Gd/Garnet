@@ -1,7 +1,7 @@
 // cc -std=c11 -O2 -Wall -Wextra -Werror test-gather-caps.c -o /tmp/test-gather-caps && /tmp/test-gather-caps
 #include <limits.h>
 #include <stdio.h>
-#include "rdna4_gather_caps.h"
+#include "garnet_gather_caps.h"
 
 static unsigned checks, failures;
 #define CHECK(message, condition) do { \

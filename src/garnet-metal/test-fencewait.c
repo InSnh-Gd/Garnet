@@ -1,4 +1,4 @@
-// test-fencewait.c: host test of rdna4_fencewait.h (bounded-slice fence wait,
+// test-fencewait.c: host test of garnet_fencewait.h (bounded-slice fence wait,
 // sub-ms wakeup, non-blocking serial completion queue) plus source pins on
 // garnet_commands.m and garnet_commands.m.
 // Build/run: cc -O1 -Wall -Wextra -Werror -pthread -o /tmp/test-fencewait test-fencewait.c && /tmp/test-fencewait .
@@ -10,7 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include "rdna4_fencewait.h"
+#include "garnet_fencewait.h"
 
 static int fails;
 #define CHECK(name, cond, ...) do { \

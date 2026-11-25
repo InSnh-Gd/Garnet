@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
-#include "rdna4_query_caps.h"
+#include "garnet_query_caps.h"
 unsigned seen;
 uint32_t garnetx_abi_version(void) {
 #ifdef UNKNOWN_ABI

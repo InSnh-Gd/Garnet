@@ -1,13 +1,13 @@
-// test-texdesc.c: host test of rdna4_texdesc.h (bundle 9, app crash study item 2: cube and 2D-array textures), plus source pins that tie the REAL GarnetDevice.m to it.
+// test-texdesc.c: host test of garnet_texdesc.h (bundle 9, app crash study item 2: cube and 2D-array textures), plus source pins that tie the REAL GarnetDevice.m to it.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-texdesc test-texdesc.c && /tmp/test-texdesc .
-//   argv[1] = the directory holding GarnetDevice.m and rdna4_texdesc.h (default ".").
+//   argv[1] = the directory holding GarnetDevice.m and garnet_texdesc.h (default ".").
 // The rule this file enforces: every descriptor the bundle accepted BEFORE build 9 (2D, 1D, 1DArray, 3D) maps EXACTLY as before.  The old mapping is reproduced below
 // VERBATIM from build 8 (GarnetDevice.m RDNA4Texture initWithDevice:descriptor:error:, the check, VkImageType, arrayLayers, view type, _layers, textureType, arrayLength, heap layers)
 // and a grid over every field is compared with the new function.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_texdesc.h"
+#include "garnet_texdesc.h"
 static int fails, checks;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; checks++; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define QUIET(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
     char *m = slurp(dir, "GarnetDevice.m");
     CHECK(m != NULL, "GarnetDevice.m is readable");
     if (m) {
-        CHECK(strstr(m, "#include \"rdna4_texdesc.h\"") != NULL, "GarnetDevice.m includes rdna4_texdesc.h");
+        CHECK(strstr(m, "#include \"garnet_texdesc.h\"") != NULL, "GarnetDevice.m includes garnet_texdesc.h");
         const char *plan = strstr(m, "GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, rdna4_heap_image_plan *p, NSError **err)");
         const char *plan_end = plan ? strstr(plan, "\n@implementation RDNA4Texture") : NULL;
         CHECK(plan && plan_end, "the shared heap image plan is found");

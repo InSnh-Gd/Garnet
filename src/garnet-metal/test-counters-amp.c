@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rdna4_counters.h"
+#include "garnet_counters.h"
 
 static int fails, checks;
 #define CHECK(name, cond, ...) do { \

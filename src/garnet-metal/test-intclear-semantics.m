@@ -1,11 +1,11 @@
-// test-intclear-semantics.m (bundle 19): runs Apple's REAL Metal (the host Mac's M4) and compares an RG16Uint render-pass Clear against rdna4_intfmt.h's rdna4if_clear_u, over edge values and a pseudo-random grid.
+// test-intclear-semantics.m (bundle 19): runs Apple's REAL Metal (the host Mac's M4) and compares an RG16Uint render-pass Clear against garnet_intfmt.h's rdna4if_clear_u, over edge values and a pseudo-random grid.
 // Build/run (from this directory):  clang -fobjc-arc -framework Metal -framework Foundation -I. -o /tmp/test-intclear test-intclear-semantics.m && /tmp/test-intclear
 // Exit 3 = SKIP (no Metal device). This is what proves the conversion is Metal's, not a guess.
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
-#include "rdna4_intfmt.h"
+#include "garnet_intfmt.h"
 int main(int argc, const char **argv) { @autoreleasepool {
     if (argc > 3) return 2;
     BOOL signed32 = argc == 3 && !strcmp(argv[2], "--r32s");

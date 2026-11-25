@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_tessellation.h"
+#include "garnet_tessellation.h"
 
 static int has_cap(const uint32_t *w, size_t nw, uint32_t cap) {
     for (size_t p = 5; p < nw; p += w[p] >> 16)

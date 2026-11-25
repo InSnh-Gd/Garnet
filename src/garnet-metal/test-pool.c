@@ -1,4 +1,4 @@
-// test-pool.c: rdna4_pool.h (P1 memory pooling decisions) on the host.
+// test-pool.c: garnet_pool.h (P1 memory pooling decisions) on the host.
 // Build/run on the host Mac:  cc -O1 -Wall -Wextra -Werror -o /tmp/test-pool test-pool.c && /tmp/test-pool
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,7 +7,7 @@ static void *testPoolRealloc(void *pointer, size_t size) {
     return refuseRealloc ? NULL : realloc(pointer, size);
 }
 #define realloc testPoolRealloc
-#include "rdna4_pool.h"
+#include "garnet_pool.h"
 #undef realloc
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)

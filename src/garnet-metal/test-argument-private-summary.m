@@ -10,7 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include "rdna4_argument_summary.h"
+#include "garnet_argument_summary.h"
 
 #include <stdint.h>
 #include <stdio.h>

@@ -1,8 +1,8 @@
-// test-plane.c: rdna4_plane.h (P2 multi-plane IOSurface geometry) on the host.
+// test-plane.c: garnet_plane.h (P2 multi-plane IOSurface geometry) on the host.
 // Build/run on the host Mac:  cc -O1 -Wall -Wextra -Werror -o /tmp/test-plane test-plane.c && /tmp/test-plane
 #include <stdio.h>
 #include <string.h>
-#include "rdna4_plane.h"
+#include "garnet_plane.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 // run both stages as the .m does

@@ -1,7 +1,7 @@
 // test-heap-backing.c: physical block/range policy for RDNA4Heap.
 // Host build: cc -O1 -Wall -Wextra -Werror -o /tmp/test-heap-backing test-heap-backing.c && /tmp/test-heap-backing
 #include <stdio.h>
-#include "rdna4_heap_backing.h"
+#include "garnet_heap_backing.h"
 
 static int fails;
 #define CHECK(name, cond, ...) do { \

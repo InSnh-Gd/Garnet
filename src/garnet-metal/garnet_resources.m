@@ -7,7 +7,7 @@
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------
-// P1 "memory pooling" (rdna4_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/rdna4m-pool exists, latched ONCE when the device is
+// P1 "memory pooling" (garnet_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/rdna4m-pool exists, latched ONCE when the device is
 // created; OFF = every call site below runs the code that was there before (the `else` branches are the old lines, unchanged).
 //  * RDNA4Buffer / RDNA4Texture memory: <= 256 KiB from 4 MiB slabs (bound at the slab offset; host-visible slabs mapped once), 256 KiB..64 MiB from a recycle
 //    cache keyed by (memory type, size), the rest (and anything VkMemoryDedicatedRequirements marks dedicated) on its own allocation as before.
@@ -220,7 +220,7 @@ GARNET_INTERNAL VkDescriptorPool rdna4_dp_take(void) {   // VK_NULL_HANDLE: none
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// P5b "per-draw redundancy" (rdna4_drawcache.h decides, this block holds the latch, the device-wide render-pass cache and the counters). ON only when
+// P5b "per-draw redundancy" (garnet_drawcache.h decides, this block holds the latch, the device-wide render-pass cache and the counters). ON only when
 // /private/tmp/rdna4m-drawopt exists, latched ONCE at device creation; OFF = every call site runs the code that was there before.
 //  * RDNA4RenderEncoder: re-uses a stage's VkDescriptorSet while the exact slot contents its set layout reads are unchanged; skips vkCmdBindPipeline for the pipeline
 //    already bound in the current render pass; remembers the last (topology, cull, front, pso) -> VkPipeline answer.
@@ -248,7 +248,7 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// P4 import cache (rdna4_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/rdna4m-noimpcache switches it OFF, latched ONCE at device creation;
+// P4 import cache (garnet_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/rdna4m-noimpcache switches it OFF, latched ONCE at device creation;
 // OFF = -initWithDevice:descriptor:iosurface:plane: and -dealloc run the per-texture import exactly as before (`_impShared` stays NO).
 //  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused (512 MiB in WindowServer).
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
@@ -891,7 +891,7 @@ RDNA4_RESOURCE_SPI
 
 
 // ---------------------------------------------------------------------------------------------------------------
-// bundle 9: rdna4_texdesc.h carries the numeric Metal / Vulkan values (it includes neither header); these asserts tie them to the real enums.
+// bundle 9: garnet_texdesc.h carries the numeric Metal / Vulkan values (it includes neither header); these asserts tie them to the real enums.
 _Static_assert((int)MTLTextureType1D == RDNA4TD_MTL_1D && (int)MTLTextureType1DArray == RDNA4TD_MTL_1DARRAY && (int)MTLTextureType2D == RDNA4TD_MTL_2D && (int)MTLTextureType2DArray == RDNA4TD_MTL_2DARRAY &&
                (int)MTLTextureType2DMultisample == RDNA4TD_MTL_2DMS && (int)MTLTextureTypeCube == RDNA4TD_MTL_CUBE && (int)MTLTextureTypeCubeArray == RDNA4TD_MTL_CUBEARRAY && (int)MTLTextureType3D == RDNA4TD_MTL_3D, "MTLTextureType values");
 _Static_assert((int)MTLTextureUsageShaderWrite == RDNA4TD_USE_SHADERWRITE && (int)MTLTextureUsageRenderTarget == RDNA4TD_USE_RENDERTARGET, "MTLTextureUsage values");
@@ -1434,8 +1434,8 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
 }
 RDNA4_DNR(RDNA4Texture)
 // ---- 11h.6: IOSurface-backed texture ----
-// Accepts a 2D, page-aligned (P2: any plane of a 2/3-plane surface, via rdna4_plane.h), page-multiple 32 bpp surface (BGRA8Unorm / RGBA8Unorm descriptors); anything else returns nil + log.
-// The surface is retained for the texture's lifetime (build 16, F3: NOT use-counted for its life; a command buffer use-counts it while in flight, rdna4_ledger.h); its pages are imported once (whole allocation).
+// Accepts a 2D, page-aligned (P2: any plane of a 2/3-plane surface, via garnet_plane.h), page-multiple 32 bpp surface (BGRA8Unorm / RGBA8Unorm descriptors); anything else returns nil + log.
+// The surface is retained for the texture's lifetime (build 16, F3: NOT use-counted for its life; a command buffer use-counts it while in flight, garnet_ledger.h); its pages are imported once (whole allocation).
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)s plane:(NSUInteger)plane error:(NSError **)err {
     self = [super init];
     if (!self) return nil;

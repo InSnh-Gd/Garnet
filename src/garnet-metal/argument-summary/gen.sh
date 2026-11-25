@@ -1,9 +1,9 @@
 #!/bin/sh
-# Regenerates rdna4_argument_summary_spv.h from summary.comp.
+# Regenerates garnet_argument_summary_spv.h from summary.comp.
 set -eu
 cd "$(dirname "$0")"
 
-out=rdna4_argument_summary_spv.h
+out=garnet_argument_summary_spv.h
 spv=summary.comp.spv
 tmp="$out.tmp"
 trap 'rm -f "$spv" "$tmp"' EXIT HUP INT TERM

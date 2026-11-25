@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
-#include "rdna4_nocopy.h"
+#include "garnet_nocopy.h"
 
 static void range(uint64_t p, uint64_t len, uint64_t align,
                   uint64_t want_base, uint64_t want_span, uint64_t want_delta) {

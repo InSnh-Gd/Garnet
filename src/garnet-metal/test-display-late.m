@@ -3,9 +3,9 @@
 #import <IOSurface/IOSurface.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include "rdna4_dispflip.h"
-#include "rdna4_display_commits.h"
-#include "rdna4_cblog.h"
+#include "garnet_dispflip.h"
+#include "garnet_display_commits.h"
+#include "garnet_cblog.h"
 typedef void *VkCommandBuffer;
 typedef unsigned *VkBuffer;
 typedef int VkResult;

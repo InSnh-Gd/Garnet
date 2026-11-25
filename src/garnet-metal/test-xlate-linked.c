@@ -1,5 +1,5 @@
 // test-xlate-linked.c: P3 (build 18, an internal design note): linked functions in the in-process translation.
-// Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-xlate-linked test-xlate-linked.c && /tmp/test-xlate-linked .      (argv[1] = the directory holding GarnetDevice.m and rdna4_xlate.h)
+// Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-xlate-linked test-xlate-linked.c && /tmp/test-xlate-linked .      (argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h)
 // Covers: the cache key (rdna4x_link_sha) - what changes it and what must not; one job with dependencies (every dependency through the SAME reader, the library's linked entry point, the failure codes and
 // caps); the engine request (the worker gets copies); and source pins that tie GarnetDevice.m's glue to them (privateFunctions and groups are read and logged, binaryFunctions / preloaded libraries refuse,
 // the lookup tries the linked key first, the key is built from the dependencies, the context is scoped).
@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 
 static int fails, runs;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; runs++; if (!ok_) { fails++; printf("FAIL: %s\n", name); } } while (0)

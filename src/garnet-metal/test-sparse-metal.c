@@ -18,8 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rdna4_gate.h"
-#include "rdna4_sparse.h"
+#include "garnet_gate.h"
+#include "garnet_sparse.h"
 
 static int fails, checks;
 #define CHECK(name, cond, ...) do { \

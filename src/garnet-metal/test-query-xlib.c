@@ -6,7 +6,7 @@
 #define st_mtimespec st_mtim
 #endif
 #include <assert.h>
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 static void check_forwarding(const char *path, rdna4x_backend_capabilities caps) {
     rdna4x_real real; rdna4x_deps deps; char error[256] = {0};
     assert(rdna4x_real_open(&real, &deps, NULL, NULL, path, error, sizeof error) == 0);

@@ -1,7 +1,7 @@
-// test-xlate.c: rdna4_xlate.h (bundle 14, in-process shader translation; an internal design note section 1) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
-// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and rdna4_xlate.h, default "."; argv[2] = autotranslate/overrides.txt, default ../../tools/native/autotranslate/overrides.txt):
+// test-xlate.c: garnet_xlate.h (bundle 14, in-process shader translation; an internal design note section 1) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
+// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h, default "."; argv[2] = autotranslate/overrides.txt, default ../../tools/native/autotranslate/overrides.txt):
 //   cc -O1 -Wall -Wextra -Werror -DRDNA4X_TESTHOOKS -o /tmp/test-xlate test-xlate.c && /tmp/test-xlate .
-// test-b14-plant.sh plants breaks in the REAL rdna4_xlate.h, GarnetDevice.m and the fork's Rust and demands that this suite (or the fork's cargo tests) FAIL on each.
+// test-b14-plant.sh plants breaks in the REAL garnet_xlate.h, GarnetDevice.m and the fork's Rust and demands that this suite (or the fork's cargo tests) FAIL on each.
 // Covers:
 //   T1  every combination of rdna4x_applies; the kill-file and environment readers; the side-directory rule; the cache key (every part of it matters) and the path builders; the size caps; the crash-marker
 //       plan table and the real marker files (create, probe, promote, sweep); the least-recently-used trim (the pure decision and the real directory); the override table against overrides.txt;
@@ -22,7 +22,7 @@
 #ifndef RDNA4X_TESTHOOKS
 #error "test-xlate requires -DRDNA4X_TESTHOOKS (see the build line at the top)"
 #endif
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 
 static int fails, runs;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; runs++; if (!ok_) { fails++; printf("FAIL: %s\n", name); } } while (0)

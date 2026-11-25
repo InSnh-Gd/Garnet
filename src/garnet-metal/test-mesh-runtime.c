@@ -1,4 +1,4 @@
-// test-mesh-runtime.c: pure-C host test suite for rdna4_mesh.h and source pins for
+// test-mesh-runtime.c: pure-C host test suite for garnet_mesh.h and source pins for
 // garnet_mesh_rt.m / test-metal3-mesh-shaders.m (Wave 3D Task 6.2).
 //
 // Compile & run (GCC -Werror):
@@ -12,14 +12,14 @@
 #endif
 #endif
 
-#include "rdna4_mesh.h"
+#include "garnet_mesh.h"
 
 #ifdef RDNA4_TEST_HAS_VULKAN
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 #endif
-#include "rdna4_spvrefl.h"
+#include "garnet_spvrefl.h"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif

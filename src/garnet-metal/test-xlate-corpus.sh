@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# test-xlate-corpus.sh - T3 of NATIVE-S8-INPROC.md: the real reader-loading code (rdna4_xlate.h) with Apple's own LLVM (GPUCompiler.framework libLLVM, from the dyld shared cache) and with a second reader
+# test-xlate-corpus.sh - T3 of NATIVE-S8-INPROC.md: the real reader-loading code (garnet_xlate.h) with Apple's own LLVM (GPUCompiler.framework libLLVM, from the dyld shared cache) and with a second reader
 # (Homebrew LLVM 23), and the real libgarnetxlate, over the shader corpus, against the daemon reference (pc-translate.py + the command-line tool + an always-pass validator). Reports identical / different / failed.
 # host Mac only, arm64 (there is no Rosetta here): libgarnetxlate is the HOST build of the fork's garnetxlate crate.
 #   usage: test-xlate-corpus.sh [CORPUS_DIR]      CORPUS_DIR holds manifest.tsv, <sha>.air, <sha>.clang.ll and ref/ (made by xlate-corpus-prep.py + the reference pass); default $RDNA4X_CORPUS

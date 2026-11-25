@@ -6,10 +6,9 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
-#include "rdna4_ca_sw_compat.h"
-#include "rdna4_compositor_observation.h"
-#include "rdna4_coredisplay_compat.h"
-#include "rdna4_census.h"
+#include "garnet_ca_sw_compat.h"
+#include "garnet_coredisplay_compat.h"
+#include "garnet_census.h"
 #endif
 
 // SPDisplaysReporter merges only the PCI function's immediate children. Our accelerator
@@ -474,7 +473,7 @@ RDNA4_DNR(GarnetGLDrawable)
 }
 @end
 
-// MTLGPUFamily values: rdna4_gate.h (RDNA4G_FAMILY_*, rdna4g_supports_family).
+// MTLGPUFamily values: garnet_gate.h (RDNA4G_FAMILY_*, rdna4g_supports_family).
 
 GARNET_INTERNAL NSData *rdna4_function_reflection_data(id function) {
     SEL selector = sel_registerName("reflectionData");
@@ -599,7 +598,7 @@ GARNET_INTERNAL NSData *rdna4_function_reflection_data(id function) {
     { const char *n[] = { "MTLAccelerationStructureCommandEncoder", "MTLCommandEncoder" }; rdna4_add_protocols([GarnetAccelerationStructureCommandEncoder class], n, 2, "GarnetAccelerationStructureCommandEncoder"); }
     { const char *n[] = { "MTLIntersectionFunctionTable", "MTLResource" }; rdna4_add_protocols([RDNA4IntersectionFunctionTable class], n, 2, "RDNA4IntersectionFunctionTable"); }
     { const char *n[] = { "MTLRenderPipelineState" }; rdna4_add_protocols([RDNA4MeshRenderPipelineState class], n, 1, "RDNA4MeshRenderPipelineState"); }
-    {   // build 18: the census (rdna4_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).
+    {   // build 18: the census (garnet_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with RDNA4M_CENSUS=1).
         const rdna4cen_pair pairs[] = { { [RDNA4RenderEncoder class], "RDNA4RenderEncoder", "MTLRenderCommandEncoder" }, { [RDNA4ComputeEncoder class], "RDNA4ComputeEncoder", "MTLComputeCommandEncoder" },
             { [RDNA4BlitEncoder class], "RDNA4BlitEncoder", "MTLBlitCommandEncoder" }, { [RDNA4CommandBuffer class], "RDNA4CommandBuffer", "MTLCommandBuffer" }, { self, "GarnetDevice", "MTLDevice" },
             { [RDNA4Texture class], "RDNA4Texture", "MTLTexture" }, { [RDNA4Buffer class], "RDNA4Buffer", "MTLBuffer" },
@@ -1273,9 +1272,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     if (self && rdna4_is_ws()) {
         uint32_t inheritedPort = ((uint32_t (*)(id, SEL))objc_msgSend)(
             self, sel_getUid("acceleratorPort"));
-        RDNA4LOG("[DEBUG-render] device inputPort=0x%x acceleratorPort=0x%x", port, inheritedPort);
         rdna4_coredisplay_compat(inheritedPort);
-        rdna4_compositor_observe();
     }
     if (self) rdna4_census_log();   // build 18: once per process that got a device
     if (self) rdna4sp_register((id<MTLDevice>)self, port);

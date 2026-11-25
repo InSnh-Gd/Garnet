@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "rdna4_buffer_registry.h"
+#include "garnet_buffer_registry.h"
 
 int main(void) {
     size_t bytes = 0;

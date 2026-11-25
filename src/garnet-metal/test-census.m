@@ -1,10 +1,10 @@
-// test-census.m: the unimplemented-selector census (build 18, rdna4_census.h) and the vetted-list policy.
+// test-census.m: the unimplemented-selector census (build 18, garnet_census.h) and the vetted-list policy.
 // Build/run (from this directory):  clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -o /tmp/test-census test-census.m && /tmp/test-census .      (argv[1] = the directory holding GarnetDevice.m)
 //   1. the scan itself, on a FAKE protocol (a required method, an optional one, an inherited one, and a method the class gets from its superclass): exactly the missing ones are reported, required ones marked '!'.
 //   2. the policy pins on GarnetDevice.m: the census runs from +load over all the Metal protocols the bundle's classes claim, is logged once by a process that got a device, the vetted list is exactly the one
 //      selector the evidence names, it is a no-op with a stated reason, and there is NO blanket handler (no forwardInvocation / methodSignatureForSelector / resolveInstanceMethod answers).
 #import <Foundation/Foundation.h>
-#include "rdna4_census.h"
+#include "garnet_census.h"
 
 @protocol FakeBase
 - (void)baseRequired;

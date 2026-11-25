@@ -2,8 +2,8 @@
 //   cc -std=c11 -O2 -Wall -Wextra -Werror -I. test-argument-scan.c -o /tmp/test-argument-scan
 //   /tmp/test-argument-scan
 
-#include "rdna4_argument_scan.h"
-#include "rdna4_argument_scan.h"
+#include "garnet_argument_scan.h"
+#include "garnet_argument_scan.h"
 
 #include <math.h>
 #include <stdio.h>

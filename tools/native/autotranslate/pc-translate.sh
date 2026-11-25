@@ -1,6 +1,6 @@
 #!/bin/bash
 # RDNA4 on-PC auto-translator (native #12, hardened in C1). Runs as the unprivileged system user `nobody` (LaunchDaemon com.rdna4.translate, UserName); files live in /usr/local/rdna4/.
-# Dump area: /private/tmp/rdna4m/<uid>/<sha>.air (+ sidecars), one subdirectory per uid, made by the bundle (rdna4_gate.h). Every 0.5 s, for each numeric subdirectory and each <64 hex>.air in it:
+# Dump area: /private/tmp/rdna4m/<uid>/<sha>.air (+ sidecars), one subdirectory per uid, made by the bundle (garnet_gate.h). Every 0.5 s, for each numeric subdirectory and each <64 hex>.air in it:
 #   - the subdirectory must be a real directory (not a symlink) owned by the uid in its name, the file a real regular file (not a symlink) owned by that same uid, size 1 B .. 4 MiB;
 #   - not already decided under the CURRENT translator key (see KEY), not already in the bundle's Resources/spvcache;
 #   - then ONE translation under: sandbox-exec (rdna4-translate.sb: read dumps + translator, write only OUT and STATE, no network), ulimit -t 25 CPU s (ulimit -v/-d are NOT enforced on macOS), a 1 GiB resident-memory watchdog and a 20 s wall-clock

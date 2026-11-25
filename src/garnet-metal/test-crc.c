@@ -1,7 +1,7 @@
-// test-crc.c: host test of rdna4_crc.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-crc test-crc.c && /tmp/test-crc
+// test-crc.c: host test of garnet_crc.h.  cc -O1 -Wall -Wextra -Werror -o /tmp/test-crc test-crc.c && /tmp/test-crc
 #include <stdlib.h>
 #include <time.h>
-#include "rdna4_crc.h"
+#include "garnet_crc.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }

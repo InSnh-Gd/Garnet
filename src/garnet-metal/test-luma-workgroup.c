@@ -1,6 +1,6 @@
 #include "test-vulkan-replay.h"
-#include "rdna4_indirect_compute.h"
-#include "rdna4_luma_workgroup.h"
+#include "garnet_indirect_compute.h"
+#include "garnet_luma_workgroup.h"
 #include <stdbool.h>
 
 static void execute_luma(VkQueue queue, uint32_t family, VkDescriptorSetLayout set,

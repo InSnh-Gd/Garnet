@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <string.h>
-#include "rdna4_texture_transfer.h"
+#include "garnet_texture_transfer.h"
 
 int main(void) {
     const size_t widths[] = {0, 1, 2, 64, UINT32_MAX, SIZE_MAX};

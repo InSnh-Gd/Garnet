@@ -8,7 +8,7 @@
 #include <mach-o/loader.h>
 #include <unistd.h>
 #define RDNA4LOG(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
-#include "rdna4_ca_sw_compat.h"
+#include "garnet_ca_sw_compat.h"
 
 @interface CARenderer (DiagnosticSoftware)
 - (instancetype)_initWithOptions:(NSDictionary *)options;

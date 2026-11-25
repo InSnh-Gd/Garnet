@@ -24,9 +24,9 @@
 #endif
 
 #ifdef RDNA4_TEST_HAS_VULKAN_H
-#include "rdna4_spvrefl.h"
+#include "garnet_spvrefl.h"
 #endif
-#include "rdna4_icb_abi.h"
+#include "garnet_icb_abi.h"
 
 /* -------------------------------------------------------------------------
  * 1. Exact 640-byte ABI parity with translator patch 0072
@@ -675,7 +675,7 @@ static void test_source_pins(void) {
     const char *assembled = getenv("RDNA4_TEST_ASSEMBLED_DEVICE");
     if (assembled && assembled[0]) {
         static const char *const asm_inc_pins[] = {
-            "#include \"rdna4_icb_abi.h\"",
+            "#include \"garnet_icb_abi.h\"",
             "#include \"garnet_arguments.m\"",
             "#include \"garnet_icb.m\"",
         };

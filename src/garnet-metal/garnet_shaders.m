@@ -32,7 +32,7 @@ __attribute__((constructor)) static void rdna4_cienv_ctor(void) {
 }
 // 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /tmp/rdna4m/<euid> (0700, a
 // real directory owned by the caller, rdna4g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
-// account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (rdna4_dumpacl.h); a failed grant is logged and the dump still happens.
+// account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (garnet_dumpacl.h); a failed grant is logged and the dump still happens.
 GARNET_INTERNAL int rdna4_dump_dir_ready(char *sub, size_t subn) {
     (void)mkdir(RDNA4G_DUMP_DIR, RDNA4G_DUMP_ROOT_MODE);
     struct stat rs; memset(&rs, 0, sizeof rs);
@@ -172,7 +172,7 @@ static int rdna4x_capture_request(NSString *directory, NSString *sha, NSString *
 }
 #if !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Bundle 14: in-process shader translation (an internal design note). The policy, the cache, the crash markers, the reader and the engine are in rdna4_xlate.h (host tests test-xlate.c and
+// Bundle 14: in-process shader translation (an internal design note). The policy, the cache, the crash markers, the reader and the engine are in garnet_xlate.h (host tests test-xlate.c and
 // test-xlate-corpus.sh run that very header); this is the glue. A spvcache miss in an ADMITTED APPLICATION (or an RDNA4M_ALLOW root tool with RDNA4M_TEST_INPROC=1) is translated inside the process by the
 // operating system's own LLVM (the bitcode reader, loaded on the first miss only) and Resources/libgarnetxlate.dylib (the LGPL translator), and installed in the user's cache directory
 // <confstr user cache dir>/org.garnet.xlate/<K>/. WindowServer NEVER applies: it keeps the precompiled spvcache plus the daemon and loads neither library.
@@ -205,7 +205,7 @@ static void rdna4x_gate_read(void) {
     }
     pthread_mutex_unlock(&RDNA4XL.mu);
 }
-// Does this process translate in process? (rdna4_xlate.h rdna4x_applies; the admitted flag is set by rdna4_admit before any pipeline exists.)
+// Does this process translate in process? (garnet_xlate.h rdna4x_applies; the admitted flag is set by rdna4_admit before any pipeline exists.)
 GARNET_INTERNAL BOOL rdna4x_active(void) {
     rdna4x_gate_read();
     return rdna4x_applies(rdna4_is_ws(), atomic_load(&rdna4_app_admitted), rdna4_allow(), rdna4x_test_inproc(), RDNA4XL.killed, RDNA4XL.envDirty) ? YES : NO;
@@ -2521,7 +2521,7 @@ GARNET_INTERNAL VkBlendOp rdna4_bo(MTLBlendOperation o, BOOL *bad) {
 // ---------------------------------------------------------------------------------------------------------------
 // Pipeline HOT-SWAP (native #12): a FALLBACK pipeline object (spvcache miss in WindowServer; render/compute = no-write placeholder) registers
 // its spvcache keys here. One watcher per process (a dispatch timer on a private serial queue that exists only while an entry is pending)
-// stats <sha>.spv / <sha>.meta.json in the lookup directories; when the state machine (rdna4_hotswap.h) says the files are complete and stable it
+// stats <sha>.spv / <sha>.meta.json in the lookup directories; when the state machine (garnet_hotswap.h) says the files are complete and stable it
 // calls the object's builder on the watcher queue (NEVER the render thread), which builds a NEW pipeline object through the normal init path and
 // publishes it with one atomic store into the fallback object (rdna4hs_install). Encoders resolve the pointer at the start of every draw / dispatch.
 // ---------------------------------------------------------------------------------------------------------------
@@ -2649,7 +2649,7 @@ GARNET_INTERNAL BOOL rdna4_sync_wait(const char *what, NSArray<NSString *> *shas
 // RADV VkPipelineCache blobs indexed by canonical SHA-256 + 64-bit pipeline descriptor keys.
 //
 // Wave 2B integration checklist (GarnetDevice.m + rdna4_render_pipeline_impl.inc):
-//   1. GarnetDevice.m (right after #include "rdna4_icb_abi.h", before #include "rdna4_render_pipeline_impl.m"):
+//   1. GarnetDevice.m (right after #include "garnet_icb_abi.h", before #include "rdna4_render_pipeline_impl.m"):
 //        #include "rdna4_binary_archive_impl.m"
 //   2. GarnetDevice.m +load:
 //        { const char *n[] = { "MTLBinaryArchive" }; rdna4_add_protocols([RDNA4BinaryArchive class], n, 1, "RDNA4BinaryArchive"); }
@@ -3560,7 +3560,7 @@ static BOOL rdna4_ba_lookup_function(id dev, id<MTLFunction> fn, MTLFunctionDesc
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4DynamicLibrary (Task 3.2, Metal 3 MTLDynamicLibrary) and
 // RDNA4FunctionHandle / RDNA4VisibleFunctionTable (Task 3.3, Metal 3 MTLVisibleFunctionTable).
-// Backed by '.grdl' container codec (rdna4_dynlib_vft.h), garnetxlate Stage 2 FFI (0073/0074),
+// Backed by '.grdl' container codec (garnet_dynlib_vft.h), garnetxlate Stage 2 FFI (0073/0074),
 // and host-coherent Shared RDNA4Buffer storage matching 0074 (`word[0]=slot_count, word[1+slot]=handle_id`).
 //
 // Wave 3B integration checklist:

@@ -1,13 +1,13 @@
-// test-m6x.c: bundle build 13 (M6 Stage 1b) + 15 (M6 Stage 2): rdna4_m6x.h on the host - the HDMI scanout decisions PER INSTANCE (the monitor B, and the monitor A since bundle 15) (enable, pool budget, the acquire sequence with failure injection, encode-time and completion-time routing, the 1 s keep-alive tick,
+// test-m6x.c: bundle build 13 (M6 Stage 1b) + 15 (M6 Stage 2): garnet_m6x.h on the host - the HDMI scanout decisions PER INSTANCE (the monitor B, and the monitor A since bundle 15) (enable, pool budget, the acquire sequence with failure injection, encode-time and completion-time routing, the 1 s keep-alive tick,
 // the re-copy memory, R6) - plus the review items R2 (property generation, never an older read over a newer one), R3 (bundle half) and R6, plus source pins on the glue in GarnetDevice.m and the kernel / Mesa mirrors.
 // Build/run on the host Mac:  cc -O1 -D_GNU_SOURCE -Wall -Wextra -Werror -o /tmp/test-m6x test-m6x.c && /tmp/test-m6x .      (the argument is src/garnet-metal)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_scanabi.h"
-#include "rdna4_m6route.h"
-#include "rdna4_dispflip.h"
-#include "rdna4_m6x.h"
+#include "garnet_scanabi.h"
+#include "garnet_m6route.h"
+#include "garnet_dispflip.h"
+#include "garnet_m6x.h"
 static int fails, checks;
 #define CHECK(name, cond) do { checks++; if (!(cond)) { fails++; printf("FAIL: %s\n", name); } } while (0)
 static char *slurp(const char *dir, const char *rel) {
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
           rdna4df_t q2; rdna4df_init(&q2, 0); rdna4df_activate(&q2, 3); q2.damage = 1; int bq = rdna4df_plan_ex(&q2, fl, RDNA4DF_K_PART, part, 0, &pb); a == bq && pa.kind == pb.kind && q.head == q2.head; }));
       CHECK("R6: the pure helpers", rdna4x_kind_for(1, RDNA4DF_K_FULL, RDNA4DF_K_PART) == RDNA4DF_K_FULL && rdna4x_kind_for(0, RDNA4DF_K_FULL, RDNA4DF_K_PART) == RDNA4DF_K_PART && !rdna4x_may_chain(1) && rdna4x_may_chain(0)); }
     // ---- source pins on the glue
-    { char *m = slurp(dir, "GarnetDevice.m"), *pl = slurp(dir, "Info.plist"), *ins = slurp(dir, "../../CHANGES.md"), *abi = slurp(dir, "rdna4_scanabi.h"), *kp = slurp(dir, "../../src/garnet/src/amd/garnet_multidisplay_route_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h"), *xh = slurp(dir, "rdna4_m6x.h");
+    { char *m = slurp(dir, "GarnetDevice.m"), *pl = slurp(dir, "Info.plist"), *ins = slurp(dir, "../../CHANGES.md"), *abi = slurp(dir, "garnet_scanabi.h"), *kp = slurp(dir, "../../src/garnet/src/amd/garnet_multidisplay_route_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h"), *xh = slurp(dir, "garnet_m6x.h");
       // the state: an array over the instance numbers, one descriptor lookup
       CHECK("glue: the HDMI state is an ARRAY over the kernel instance numbers (RDNA4X.i[inst]); no singleton RDNA4X.sm / .enabled remains", strstr(m, "rdna4xi_t i[3]; } RDNA4XScanoutState;") && strstr(m, "GARNET_INTERNAL RDNA4XScanoutState RDNA4X;") && strstr(m, "#define RDNA4XI(inst) (RDNA4X.i[(inst)])") && !strstr(m, "RDNA4X.sm") && !strstr(m, "RDNA4X.enabled") && !strstr(m, "RDNA4X.xs") && !strstr(m, "RDNA4X.sid") && !strstr(m, "RDNA4X.buf") && !strstr(m, "RDNA4X.mem") && !strstr(m, "RDNA4X_PLAN_MONB ? &RDNA4X"));
       // enable at bind, per instance
@@ -286,12 +286,12 @@ int main(int argc, char **argv) {
       CHECK("glue: the re-copy is per instance, checks the surface against the INSTANCE'S geometry, drops the lock around the copy and releases the slot without a present when it fails", strstr(m, "static void rdna4x_recopy_locked(int inst) {\n    rdna4xi_t *const X = &RDNA4XI(inst);") && strstr(m, "IOSurfaceGetWidth(ios) == d->w && IOSurfaceGetHeight(ios) == d->h && IOSurfaceGetBytesPerRow(ios) == d->pitch_bytes") && strstr(m, "const int slot = rdna4df_pick(&X->sm, fl);") && strstr(m, "(void)rdna4df_complete_seq(&X->sm, slot, 1, seq);"));
       CHECK("glue (bundle 20, F4): every HDMI instance logs its class / non-final counts, table occupancy, scan_full_refused and surf_untracked every 10 s", strstr(m, "static void rdna4x_rubber_summary_locked(int xi) {") && strstr(m, "scan_full_refused %llu surf_untracked %llu") && strstr(m, "rdna4df_nonscan_used(&X->sm)") && strstr(m, "rdna4df_marked_count(&X->sm)") && strstr(m, "rdna4x_rubber_summary_locked(xi); } }") && strstr(m, "X->sm.cls[i] - pc[xi][i]") && strstr(m, "X->sm.nonfinal[i] - pn[xi][i]"));
       CHECK("glue (bundle 20, F3): the re-copy presents with the NOTED frame's sequence (never a fresh newest one) and the note carries it", strstr(m, "const uint64_t seq = x->recopy_seq;") && !strstr(strstr(m, "static void rdna4x_recopy_locked(int inst) {"), "atomic_fetch_add(&RDNA4S.seq, 1) + 1;\n    pthread_mutex_unlock") && strstr(m, "rdna4x_recopy_note(&cx->xs, sid, seq);"));
-      // the mapping (S6) in rdna4_m6x.h
+      // the mapping (S6) in garnet_m6x.h
       CHECK("bundle (S6): the plan maps the table's MONA to instance 1 and its MONB to instance 2", strstr(xh, "if (e->inst == RDNA4M6_INST_MONA && rdna4x_on(xon_mask, RDNA4X_PLAN_MONA)) return RDNA4X_PLAN_MONA;") && strstr(xh, "if (e->inst == RDNA4M6_INST_MONB && rdna4x_on(xon_mask, RDNA4X_PLAN_MONB)) return RDNA4X_PLAN_MONB;"));
       // kernel mirrors
       CHECK("kernel: blob version 2, header 12, the generation under the gate", strstr(kp, "kBlobVersion2 = 2u, kBlobHdr2 = 12u") && strstr(kp, "blob_build_v2(SurfTable &t, uint32_t gen,") && strstr(kp, "__atomic_store_n(&g.curGen, seen, __ATOMIC_SEQ_CST);") && strstr(kp, "g.pubGen, seen"));
       CHECK("kernel ABI header carries the bits, the selectors and minor >= 12", strstr(ka, "#define RDNA4N_SCANQ_M6FLIP     (1u << 6)") && strstr(ka, "#define RDNA4N_SCANQ_M6FLIP1    (1u << 7)") && strstr(ka, "RDNA4N_SEL_SCANX_ACQUIRE  = 22") && strstr(ka, "RDNA4N_SEL_SCANX_RELEASE  = 26") && (strstr(ka, "#define RDNA4N_ABI_MINOR     12u") || strstr(ka, "#define RDNA4N_ABI_MINOR     13u")) && strstr(ka, "#define RDNA4N_SCANX_SLOT_TAG_MONA   0x10u"));
-      CHECK("bundle's rdna4_scanabi.h mirrors them", strstr(abi, "#define RDNA4N_SCANQ_M6FLIP     (1u << 6)") && strstr(abi, "#define RDNA4N_SCANQ_M6FLIP1    (1u << 7)") && strstr(abi, "#define RDNA4N_SEL_SCANX_ACQUIRE  22u") && strstr(abi, "#define RDNA4N_SEL_SCANX_RELEASE  26u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG   0x20u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG_MONA 0x10u"));
+      CHECK("bundle's garnet_scanabi.h mirrors them", strstr(abi, "#define RDNA4N_SCANQ_M6FLIP     (1u << 6)") && strstr(abi, "#define RDNA4N_SCANQ_M6FLIP1    (1u << 7)") && strstr(abi, "#define RDNA4N_SEL_SCANX_ACQUIRE  22u") && strstr(abi, "#define RDNA4N_SEL_SCANX_RELEASE  26u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG   0x20u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG_MONA 0x10u"));
       CHECK("bundle build 43 in Info.plist", strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>") != NULL);
       CHECK("CHANGES.md describes M6 Stage 2 enablement", strstr(ins, "**Stage 2**") && strstr(ins, "rdna4-m6flip1=1"));
       free(m); free(pl); free(ins); free(abi); free(kp); free(ka); free(xh); }

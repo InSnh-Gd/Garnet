@@ -1,4 +1,4 @@
-// test-occlusion-semantics.m: what Apple's Metal does with occlusion queries (setVisibilityResultMode:offset:, visibilityResultBuffer, visibilityResultType) - the measurements rdna4_occ.h is built on.
+// test-occlusion-semantics.m: what Apple's Metal does with occlusion queries (setVisibilityResultMode:offset:, visibilityResultBuffer, visibilityResultType) - the measurements garnet_occ.h is built on.
 // Run on a Mac with real Metal (the host Mac, Apple M4, macOS 27.0.x:  clang -fobjc-arc -framework Metal -framework Foundation -o /tmp/occ test-occlusion-semantics.m && /tmp/occ
 // Also runs against this bundle on the PC (it uses only public API on the default device). Measured on the host Mac: E1 [0]=12288 (3 draws of 4096, a Disabled draw adds nothing) [8]=1 [16]=0 [24]=0 (selected, no draw: WRITTEN 0)
 // [32]=16 [40]=1, offsets never selected untouched; E2/E5 Reset overwrites (4096, then 0 / 4096 not 8192), Accumulate adds (sentinel+4096, sentinel+8192); E3 no mode ever set touches nothing; E4 the value is in the buffer

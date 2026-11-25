@@ -1,4 +1,4 @@
-#include "rdna4_spvrefl.h"
+#include "garnet_spvrefl.h"
 
 #include <stdio.h>
 #include <stdlib.h>

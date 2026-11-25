@@ -1,4 +1,4 @@
-// test-xlate-corpus.c: the driver of test-xlate-corpus.sh (T3). Runs the REAL reader-loading code (rdna4_xlate.h: dlopen of an LLVM library, ten functions) and the REAL engine
+// test-xlate-corpus.c: the driver of test-xlate-corpus.sh (T3). Runs the REAL reader-loading code (garnet_xlate.h: dlopen of an LLVM library, ten functions) and the REAL engine
 // (worker thread on 64 MiB, crash markers, caps, atomic install) over a corpus of AIR bitcode with the REAL libgarnetxlate, and leaves the results in a directory for the comparer.
 //   test-xlate-corpus run <corpus dir> <out dir> <libgarnetxlate.dylib> <reader: apple | path to a libLLVM.dylib> [overrides.txt]
 //   test-xlate-corpus ll  <corpus dir> <out dir> <reader>       (only the reader: writes <sha>.ll, for the text comparison)
@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include "rdna4_xlate.h"
+#include "garnet_xlate.h"
 
 static uint8_t *readall(const char *p, size_t *n) {
     FILE *f = fopen(p, "rb"); if (!f) return NULL;

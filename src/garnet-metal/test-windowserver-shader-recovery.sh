@@ -10,8 +10,8 @@ trap 'rm -rf "$out"' EXIT
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "rdna4_gate.h"
-#include "rdna4_hotswap.h"
+#include "garnet_gate.h"
+#include "garnet_hotswap.h"
 
 typedef bool BOOL;
 #define GARNET_INTERNAL static

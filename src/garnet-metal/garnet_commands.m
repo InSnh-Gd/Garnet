@@ -5,7 +5,7 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
-#include "rdna4_luma_workgroup.h"
+#include "garnet_luma_workgroup.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Common helpers for the 10b-10d classes.
@@ -120,7 +120,7 @@ GARNET_INTERNAL const RDNA4Fmt *rdna4_fmt(MTLPixelFormat f) {
     return NULL;
 }
 // bundle 10: the depth / stencil formats live in their OWN table, so rdna4_fmt (colour targets, IOSurface- and buffer-backed textures, views, heaps' colour sizing) answers for them exactly as before: NULL.
-// Depth24Unorm_Stencil8 is not in it (AMD has no D24S8 on this path).  The numbers are tied to rdna4_depth.h by the asserts below.
+// Depth24Unorm_Stencil8 is not in it (AMD has no D24S8 on this path).  The numbers are tied to garnet_depth.h by the asserts below.
 #define RDNA4F_DS 2u
 static const RDNA4Fmt rdna4_dsfmts[] = {
     { MTLPixelFormatDepth16Unorm,          VK_FORMAT_D16_UNORM,          2, RDNA4F_DS },
@@ -585,7 +585,7 @@ static void rdna4s_record_copy_img(VkCommandBuffer cmd, RDNA4Texture *t, const r
     vkCmdCopyImageToBuffer(cmd, [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xd ? RDNA4XI(pl->inst).buf[slot] : RDNA4S.buf[slot], 1, &bic);   // the planned instance's slot buffer
     atomic_fetch_add(&rdna4s_imgcopies, 1);
 }
-// Build 16 (P1): the touch of an IOSurface texture `t` by command buffer `cb`: retains it, takes the F3 use count, and does what the aliasing rules (rdna4_ioalias.h) demand before the caller's own commands:
+// Build 16 (P1): the touch of an IOSurface texture `t` by command buffer `cb`: retains it, takes the F3 use count, and does what the aliasing rules (garnet_ioalias.h) demand before the caller's own commands:
 //   * a PATH (b) writer that another wrapper of the same surface range touches is copied back NOW (and leaves the end-of-command-buffer write-back list), so the pages are current;
 //   * a path (b) toucher whose image is stale (another wrapper wrote since) uploads again, even if it was touched before in this command buffer.
 // endPass (may be NULL) is called, once, before the first recorded command: a render encoder ends its Vulkan render pass there (a copy cannot be recorded inside one).
@@ -2139,7 +2139,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     return o;
 }
 // The GPU is finished with this command buffer (or it never ran): write every selected offset of every visibility buffer, once. Results are read WITHOUT waiting (a lost device must not hang the completion thread):
-// only when the fence reads VK_SUCCESS are the queries read, with availability; anything else answers "visible" (the fail-safe in rdna4_occ.h).
+// only when the fence reads VK_SUCCESS are the queries read, with availability; anything else answers "visible" (the fail-safe in garnet_occ.h).
 - (void)rdna4OccResolve {
     if (!_noj) return;
     BOOL ran = NO;
@@ -3217,7 +3217,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         [self rdna4OwnResource:t kind:RDNA4_RESOURCE_ATTACHMENT
                       fragment:NO index:na];
         MTLClearColor c = ca.clearColor;
-        if ([t rdna4IsUInt]) {   // bundle 19: an integer attachment is cleared through .uint32 with Metal's conversion (truncate, saturate; measured on an Apple-silicon Mac, rdna4_intfmt.h); .float32 would put float bits in the texture
+        if ([t rdna4IsUInt]) {   // bundle 19: an integer attachment is cleared through .uint32 with Metal's conversion (truncate, saturate; measured on an Apple-silicon Mac, garnet_intfmt.h); .float32 would put float bits in the texture
             unsigned rgbB = 16, aB = 16; [t rdna4IntBitsRGB:&rgbB alpha:&aB];
             _cvs[na] = (VkClearValue){ .color = { .uint32 = { rdna4if_clear_u(c.red, rgbB), rdna4if_clear_u(c.green, rgbB), rdna4if_clear_u(c.blue, rgbB), rdna4if_clear_u(c.alpha, aB) } } };
         } else if ([t rdna4IsSInt]) {
@@ -3384,7 +3384,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     _rp1 = VK_NULL_HANDLE;
     _fb = _fbf = VK_NULL_HANDLE;
 }
-// ---- build 18 (P2): occlusion queries (rdna4_occ.h has the model and the measured Metal semantics) ----
+// ---- build 18 (P2): occlusion queries (garnet_occ.h has the model and the measured Metal semantics) ----
 // Called at the end of the encoder's init. A pass with a visibility result buffer gets RDNA4OCC_MAXQ query indices from the command buffer's pool, reset HERE (a reset is illegal inside a render pass).
 - (void)rdna4OccInit:(MTLRenderPassDescriptor *)d {
     id vb = d.visibilityResultBuffer;

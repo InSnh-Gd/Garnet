@@ -1,6 +1,6 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
-#include "rdna4_spvrefl.h"
-#include "rdna4_argument_descriptor_scan.h"
+#include "garnet_spvrefl.h"
+#include "garnet_argument_descriptor_scan.h"
 #include <assert.h>
 
 static unsigned checks;

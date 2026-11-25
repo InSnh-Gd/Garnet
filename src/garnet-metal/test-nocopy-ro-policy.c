@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "rdna4_nocopy.h"
+#include "garnet_nocopy.h"
 
 int main(void) {
     struct rdna4nc_region regions[] = {

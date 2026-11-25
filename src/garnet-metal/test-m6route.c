@@ -1,11 +1,11 @@
-// test-m6route.c: bundle build 11 (M6 Stage 1a): rdna4_m6route.h on the host - the kernel's IOSurface ID -> display table, the encode-time gate, the completion-time decision, the property parser - plus
+// test-m6route.c: bundle build 11 (M6 Stage 1a): garnet_m6route.h on the host - the kernel's IOSurface ID -> display table, the encode-time gate, the completion-time decision, the property parser - plus
 // source pins on the glue in GarnetDevice.m (the ObjC cannot run on the host; the decisions it calls are exercised below, the pins prove it calls them in the right order).
 // Build/run on the host Mac:  cc -O1 -D_GNU_SOURCE -Wall -Wextra -Werror -o /tmp/test-m6route test-m6route.c && /tmp/test-m6route .      (the argument is src/garnet-metal)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_scanabi.h"
-#include "rdna4_m6route.h"
+#include "garnet_scanabi.h"
+#include "garnet_m6route.h"
 static int fails, checks;
 #define CHECK(name, cond) do { checks++; if (!(cond)) { fails++; printf("FAIL: %s\n", name); } } while (0)
 static char *slurp(const char *dir, const char *rel) {

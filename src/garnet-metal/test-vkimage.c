@@ -1,13 +1,13 @@
 // test-vkimage.c (m11h9): checks the Vulkan call shapes the bundle's new texture code uses (3D box copies with bufferRowLength / bufferImageHeight, per-level copies,
 // the GENERAL-layout vkCmdBlitImage mip chain of generateMipmapsForTexture:, an R8 image with a (0,0,0,R) component-mapped view) on ANY Vulkan device. It runs on the host Mac through MoltenVK
 // (no RADV is reachable while WindowServer holds the exclusive RDNA4N client), so it proves the call parameters and the data movement, not RADV.
-// bundle 9 adds the cube and 2D-array sections: the image / view / attachment-view parameters come from rdna4_texdesc.h, the same header the bundle uses.
+// bundle 9 adds the cube and 2D-array sections: the image / view / attachment-view parameters come from garnet_texdesc.h, the same header the bundle uses.
 // build+run: clang -I/opt/homebrew/include test-vkimage.c -L/opt/homebrew/lib -lvulkan -o /tmp/test-vkimage && /tmp/test-vkimage
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_texdesc.h"   // bundle 9: the cube / 2D-array mapping under test is the bundle's own header
+#include "garnet_texdesc.h"   // bundle 9: the cube / 2D-array mapping under test is the bundle's own header
 static VkDevice dev; static VkPhysicalDevice pd; static VkQueue q; static VkCommandPool pool; static int fails;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define VK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { printf("FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(2); } } while (0)

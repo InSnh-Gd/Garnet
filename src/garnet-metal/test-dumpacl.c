@@ -1,11 +1,11 @@
-// test-dumpacl.c: rdna4_dumpacl.h on a real temp directory under $RDNA4_TEST_TMP (else $TMPDIR, else /private/tmp); removed with rmdir only. cc -O1 -Wall -Wextra -Werror -o t test-dumpacl.c && RDNA4_TEST_TMP=<scratch> ./t
+// test-dumpacl.c: garnet_dumpacl.h on a real temp directory under $RDNA4_TEST_TMP (else $TMPDIR, else /private/tmp); removed with rmdir only. cc -O1 -Wall -Wextra -Werror -o t test-dumpacl.c && RDNA4_TEST_TMP=<scratch> ./t
 // Checks: the ACL entry for `nobody` is added (list/search), a second call is a no-op (0), the mode bits stay 0700, a bad fd fails.
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include "rdna4_dumpacl.h"
+#include "garnet_dumpacl.h"
 static int fails, runs;
 #define CHECK(name, cond) do { int ok_ = (cond) ? 1 : 0; runs++; if (!ok_) { fails++; printf("FAIL: %s\n", name); } } while (0)
 int main(void) {

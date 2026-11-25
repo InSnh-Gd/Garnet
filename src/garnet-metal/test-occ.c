@@ -1,4 +1,4 @@
-// test-occ.c: host test of rdna4_occ.h (P2, build 18) plus source pins on GarnetDevice.m for the glue.
+// test-occ.c: host test of garnet_occ.h (P2, build 18) plus source pins on GarnetDevice.m for the glue.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-occ test-occ.c && /tmp/test-occ .      (argv[1] = the directory holding GarnetDevice.m, default ".")
 //
 // The first half REPLAYS THE MEASUREMENTS made on the host Mac's real Apple Metal (test-occlusion-semantics.m, experiments E1..E9) through a tiny executor that does what RDNA4RenderEncoder does with the
@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "rdna4_occ.h"
+#include "garnet_occ.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 
@@ -173,8 +173,9 @@ int main(int argc, char **argv) {
     CHECK("pin: vkCmdEndRenderPass( is called from rdna4EndPass only", COUNT("vkCmdEndRenderPass(") == 1, "%d", COUNT("vkCmdEndRenderPass("));
     { const char *h = FIND("- (void)rdna4EndPass {", src); const char *e = h ? FIND("\n}\n", h) : NULL; const char *a = h ? FIND("[self rdna4OccEndQuery];", h) : NULL; const char *b2 = h ? FIND("vkCmdEndRenderPass(", h) : NULL;
       CHECK("pin: rdna4EndPass ends the open query BEFORE it ends the render pass", h && e && a && b2 && a < b2 && b2 < e, "helper present %d, order ok %d", h != NULL, (a && b2 && a < b2)); }
-    CHECK("pin: every pass-end site goes through rdna4EndPass (uploads, barriers, framebuffer fetch, indirect-arg sync, counters, amplification, mesh draws, endEncoding)", count_code(src, "[self rdna4EndPass]") == 18, "%d", count_code(src, "[self rdna4EndPass]"));
-    { const char *pd = FIND("- (BOOL)rdna4PrepareDraw:", src); const char *bp = pd ? FIND("[self rdna4BeginPass];", pd) : NULL; const char *od = bp ? FIND("[self rdna4OccDraw];", bp) : NULL; const char *dr = FIND("- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)ic baseInstance", src);
+    CHECK("pin: every pass-end site goes through rdna4EndPass (uploads, barriers, framebuffer fetch, indirect-arg sync, counters, amplification, ICB, mesh draws, endEncoding)", count_code(src, "[self rdna4EndPass]") == 21, "%d", count_code(src, "[self rdna4EndPass]"));
+    const char *re_impl = FIND("@implementation RDNA4RenderEncoder", src);
+    { const char *pd = re_impl ? FIND("- (BOOL)rdna4PrepareDraw:", re_impl) : NULL; const char *bp = pd ? FIND("[self rdna4BeginPass];", pd) : NULL; const char *od = bp ? FIND("[self rdna4OccDraw];", bp) : NULL; const char *dr = re_impl ? FIND("- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)ic baseInstance", re_impl) : NULL;
       CHECK("pin: the query begins in rdna4PrepareDraw AFTER the render pass has begun, and before the draw is recorded", pd && bp && od && dr && pd < bp && bp < od && od < dr, "ordered %d", (pd && bp && od && dr && pd < bp && bp < od && od < dr)); }
     { const char *pd = FIND("- (void)rdna4PoolDone {", src); const char *e = pd ? FIND("\n}", pd) : NULL; int ok = pd && e; if (ok) { const char *r = FIND("rdna4OccResolve", pd); const char *c = FIND("rdna4_fence_close", pd); ok = r && c && r < e && r < c; }
       CHECK("pin: rdna4PoolDone resolves the visibility buffers (before it closes the fence serial)", ok, "ok %d", ok); }
@@ -208,7 +209,7 @@ int main(int argc, char **argv) {
     CHECK("pin: a query is begun in exactly one place (rdna4OccDraw), with the interval from rdna4occ_draw", COUNT("vkCmdBeginQuery([_cb vk], _qp, _qbase + q") == 1 && COUNT("if (_occ && rdna4occ_draw(_occ, &q, &precise))") == 1, "%d", COUNT("vkCmdBeginQuery("));
     CHECK("pin: a query is ended in exactly two places: a mode / offset change and the pass end", COUNT("vkCmdEndQuery([_cb vk], _qp, _qbase + ") == 2 && COUNT("if (endq) vkCmdEndQuery(") == 1 && COUNT("if (_occ && rdna4occ_end(_occ, &q)) vkCmdEndQuery(") == 1, "%d", COUNT("vkCmdEndQuery("));
     CHECK("pin: the visibility result TYPE (Accumulate) is read from the pass descriptor", COUNT("acc = (long)[(id)d visibilityResultType] == 1;") == 1 && COUNT("[d respondsToSelector:@selector(visibilityResultType)]") == 1, "%d", COUNT("visibilityResultType"));
-    CHECK("pin: the query indices are reserved and reset in the encoder's init, after the bookkeeping exists", ({ const char *i0 = FIND("- (void)rdna4OccInit:", src); const char *nw = i0 ? FIND("[_cb rdna4OccNew:", i0) : NULL; const char *rs = nw ? FIND("vkCmdResetQueryPool([_cb vk], _qp, _qbase, RDNA4OCC_MAXQ)", nw) : NULL; const char *ie = i0 ? FIND("\n}\n", i0) : NULL; i0 && nw && rs && ie && nw < rs && rs < ie; }), "ordered");
+    CHECK("pin: the query indices are reserved and reset in the encoder's init, after the bookkeeping exists", ({ const char *i0 = re_impl ? FIND("- (void)rdna4OccInit:", re_impl) : NULL; const char *nw = i0 ? FIND("[_cb rdna4OccNew:", i0) : NULL; const char *rs = nw ? FIND("vkCmdResetQueryPool([_cb vk], _qp, _qbase, RDNA4OCC_MAXQ)", nw) : NULL; const char *ie = i0 ? FIND("\n}\n", i0) : NULL; i0 && nw && rs && ie && nw < rs && rs < ie; }), "ordered");
     CHECK("pin: the encoder's init calls rdna4OccInit last (outside any render pass)", ({ const char *ri = FIND("- (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d {", src); const char *oi = ri ? FIND("[self rdna4OccInit:d];", ri) : NULL; const char *rt = oi ? FIND("return self;", oi) : NULL; const char *nx = ri ? FIND("\n}\n", ri) : NULL; ri && oi && rt && nx && rt < nx; }), "ordered");
     CHECK("pin: the visibility buffer is retained for the command buffer's life (the resolve writes into it after the GPU is done)", COUNT("[_ojb addObject:vb]; [self rdna4Retain:vb];") == 1, "%d", COUNT("[_ojb addObject:vb]"));
     CHECK("pin: an offset is written only when the buffer has a CPU mapping and through the bookkeeping's own offset", COUNT("uint64_t *slot = (uint64_t *)(void *)(base + o->u[u].off);") == 1 && COUNT("for (uint32_t u = 0; u < o->nu && base; u++)") == 1, "%d", COUNT("o->nu && base"));

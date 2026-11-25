@@ -5,7 +5,7 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
-#include "rdna4_fragment_output.h"
+#include "garnet_fragment_output.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Metal 3 Hardware Ray Tracing Runtime Binding & MTLIntersectionFunctionTable (Task 7.3).
@@ -27,7 +27,7 @@
 //           - (BOOL)supportsRaytracing { return rdna4_rt_runtime_supports_raytracing(); }
 //           - (BOOL)supportsRaytracingFromRender { return rdna4_rt_runtime_supports_raytracing_from_render(); }
 //           - (BOOL)supportsPrimitiveMotionBlur { return rdna4_rt_runtime_supports_primitive_motion_blur(); }
-//   2. rdna4_spvrefl.h:
+//   2. garnet_spvrefl.h:
 //      a) In rdna4s_parse(): recognize `case 5341: /* OpTypeAccelerationStructureKHR */ { RDNA4sId *t = ID(a[0]); t->op = op; break; }`
 //         (and optionally track OpCapability 4472 RayQueryKHR).
 //      b) In rdna4s_reflect(): map `else if (x->op == 5341) dt = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;`.
@@ -74,7 +74,7 @@
 #define RDNA4_RT_RUNTIME_IMPL_INC
 
 
-// Pin macOS 11/12 Metal enum bits against rdna4_rt_runtime.h pure-C mirrors.
+// Pin macOS 11/12 Metal enum bits against garnet_rt_runtime.h pure-C mirrors.
 _Static_assert((uint64_t)MTLIntersectionFunctionSignatureNone == RDNA4RTR_SIG_NONE,
                "MTLIntersectionFunctionSignatureNone mismatch");
 _Static_assert((uint64_t)MTLIntersectionFunctionSignatureInstancing == RDNA4RTR_SIG_INSTANCING,
@@ -90,7 +90,7 @@ _Static_assert((uint64_t)MTLIntersectionFunctionSignaturePrimitiveMotion == RDNA
 _Static_assert((uint64_t)MTLIntersectionFunctionSignatureExtendedLimits == RDNA4RTR_SIG_EXTENDED_LIMITS,
                "MTLIntersectionFunctionSignatureExtendedLimits mismatch");
 _Static_assert((int)RDNA4RTR_AS_KIND_UNKNOWN == (int)RDNA4RT_KIND_UNKNOWN,
-               "AS kind UNKNOWN mismatch with rdna4_rt_accel.h");
+               "AS kind UNKNOWN mismatch with garnet_rt_accel.h");
 _Static_assert((int)RDNA4RTR_AS_KIND_PRIMITIVE == (int)RDNA4RT_KIND_BLAS,
                "AS kind PRIMITIVE mismatch with RDNA4RT_KIND_BLAS");
 _Static_assert((int)RDNA4RTR_AS_KIND_INSTANCE == (int)RDNA4RT_KIND_TLAS,

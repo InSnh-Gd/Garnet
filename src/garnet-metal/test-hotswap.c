@@ -1,7 +1,7 @@
-// Host test for rdna4_hotswap.h:  cc -O1 -Wall -Wextra -Werror -pthread -o /tmp/test-hotswap test-hotswap.c && /tmp/test-hotswap
+// Host test for garnet_hotswap.h:  cc -O1 -Wall -Wextra -Werror -pthread -o /tmp/test-hotswap test-hotswap.c && /tmp/test-hotswap
 #include <stdio.h>
 #include <pthread.h>
-#include "rdna4_hotswap.h"
+#include "garnet_hotswap.h"
 static int fails, checks;
 #define CK(c) do { checks++; if (!(c)) { fails++; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 #define S 1000000000LL

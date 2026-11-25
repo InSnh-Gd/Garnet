@@ -32,8 +32,6 @@ checks declare retained returns.
 
 ## Compositor and WindowServer diagnostics
 
-`test-compositor-observation.m` checks the temporary `[DEBUG-render]` observer
-against the exact 25G332 SkyLight image: UUID rejection, guarded memory reads
 and cached policy fields. Compile it with Foundation in the existing x86_64
 VM. It must print `COMPOSITOR_OBSERVATION_PASS gpu_execution=0
 server_callbacks_tested=0`. It does not call the WindowServer-only CoreDisplay
@@ -647,7 +645,7 @@ the RX 9060 XT into the analysis VM.
 ## Standalone OpenGL-on-Metal surface bridge (`host-cpu`)
 
 `test-gl-surface.c` exercises the pure surface table and `IOAccelDeviceRegion`
-geometry parser in `rdna4_gl_surface_pure.h` under ASan + UBSan and verifies
+geometry parser in `garnet_gl_surface_pure.h` under ASan + UBSan and verifies
 source pins on the assembled `GarnetDevice.m` output (`supportsUnalignedVertexFetch`,
 `newGLDrawable`, `getSurfaceMode:width:height:forId:`, `commitAndHold`,
 `setLineWidth:`, `rdna4_gl_surfaces_install()`, `+1` `CFRetain` retention in
@@ -663,7 +661,7 @@ or OpenGL runtime execution.
 
 Post-tessellation vertex pipelines (`[[patch(triangle, N)]]` / `[[patch(quad, N)]]`)
 compile through a pass-through vertex stage, a synthesized Tessellation Control
-Shader (`rdna4_tessellation.h`) that reads `MTLTriangleTessellationFactorsHalf` /
+Shader (`garnet_tessellation.h`) that reads `MTLTriangleTessellationFactorsHalf` /
 `MTLQuadTessellationFactorsHalf` factors and `PerPatchControlPoint` / `PerPatch` /
 `Constant` vertex attributes via buffer device addresses, and the translated
 Tessellation Evaluation stage with `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT`:

@@ -1,8 +1,8 @@
-// test-drawcache.c: rdna4_drawcache.h (P5b per-draw redundancy decisions) on the host.
+// test-drawcache.c: garnet_drawcache.h (P5b per-draw redundancy decisions) on the host.
 // Build/run on the host Mac:  cc -O1 -Wall -Wextra -Werror -o /tmp/test-drawcache test-drawcache.c && /tmp/test-drawcache
 #include <stdio.h>
 #include <stdlib.h>
-#include "rdna4_drawcache.h"
+#include "garnet_drawcache.h"
 static int fails;
 #define CHECK(name, cond, ...) do { int ok_ = (cond); printf("%s %s: ", ok_ ? "ok  " : "FAIL", name); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 

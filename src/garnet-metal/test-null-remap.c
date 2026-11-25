@@ -1,4 +1,4 @@
-#include "rdna4_null_shape.h"
+#include "garnet_null_shape.h"
 #include <assert.h>
 #include <stdio.h>
 

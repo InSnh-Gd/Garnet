@@ -1,10 +1,10 @@
-// test-cienv.c: host test of rdna4_cienv.h (bundle 9, CI_USE_MTL_DAG_FOR_CIKL_SRC), plus source pins that tie the REAL GarnetDevice.m to it.
+// test-cienv.c: host test of garnet_cienv.h (bundle 9, CI_USE_MTL_DAG_FOR_CIKL_SRC), plus source pins that tie the REAL GarnetDevice.m to it.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-cienv test-cienv.c && /tmp/test-cienv .
-//   argv[1] = the directory holding GarnetDevice.m and rdna4_cienv.h (default ".").
+//   argv[1] = the directory holding GarnetDevice.m and garnet_cienv.h (default ".").
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "rdna4_cienv.h"
+#include "garnet_cienv.h"
 static int fails, checks;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; checks++; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 // a fake environment: the test never touches the real one
@@ -43,9 +43,9 @@ int main(int argc, char **argv) {
     char *m = slurp(dir, "GarnetDevice.m");
     CHECK(m != NULL, "GarnetDevice.m is readable");
     if (m) {
-        const char *inc = strstr(m, "#include \"rdna4_cienv.h\"");
+        const char *inc = strstr(m, "#include \"garnet_cienv.h\"");
         const char *ctor = strstr(m, "__attribute__((constructor)) static void rdna4_cienv_ctor(void)");
-        CHECK(inc != NULL, "GarnetDevice.m includes rdna4_cienv.h");
+        CHECK(inc != NULL, "GarnetDevice.m includes garnet_cienv.h");
         CHECK(ctor != NULL, "GarnetDevice.m has the constructor rdna4_cienv_ctor");
         if (ctor) {
             const char *end = strstr(ctor, "\n}\n");

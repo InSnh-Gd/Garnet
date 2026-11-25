@@ -1,5 +1,5 @@
 // test-vkdepth.c (bundle 10): checks the Vulkan call shapes the bundle's depth/stencil and MSAA code uses, on ANY Vulkan device (the host Mac: MoltenVK over the Apple GPU; no RADV is reachable here).
-// Everything the bundle DECIDES comes from rdna4_depth.h, the same header GarnetDevice.m uses: the Vulkan format and aspects of a depth format (rdna4dp_fmt), the barrier aspect (rdna4dp_barrier_aspect), the
+// Everything the bundle DECIDES comes from garnet_depth.h, the same header GarnetDevice.m uses: the Vulkan format and aspects of a depth format (rdna4dp_fmt), the barrier aspect (rdna4dp_barrier_aspect), the
 // load / store operations of a depth attachment (rdna4rp_ds), the pipeline's samples and dynamic states (rdna4pc_config), the depth/stencil state (rdna4ds_key -> rdna4ds_decode) and the multisample
 // resolve (vkCmdResolveImage after the pass).  So this proves the call parameters and the data movement, not RADV.
 //   1. each depth/stencil format: an image, a render pass that CLEARS it (rdna4rp_ds), the clear value read back per aspect
@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "rdna4_depth.h"
+#include "garnet_depth.h"
 #include "test-depth-shaders.h"
 static VkDevice dev; static VkPhysicalDevice pd; static VkQueue q; static VkCommandPool pool; static int fails;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)

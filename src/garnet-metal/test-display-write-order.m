@@ -2,10 +2,10 @@
 #include <stdio.h>
 #include <limits.h>
 #include <unistd.h>
-#include "rdna4_dispflip.h"
-#include "rdna4_cblog.h"
-#include "rdna4_m6route.h"
-#include "rdna4_m6x.h"
+#include "garnet_dispflip.h"
+#include "garnet_cblog.h"
+#include "garnet_m6route.h"
+#include "garnet_m6x.h"
 #define RDNA4_ONCE(...) ((void)0)
 #ifdef __APPLE__
 #import <Foundation/Foundation.h>
