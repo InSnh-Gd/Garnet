@@ -932,6 +932,7 @@ void GarnetDriver::handleInterrupt(int count) {
 
 	amdgpu::IHEntry e[32];
 	uint32_t total = 0;
+	bool wakeNativeWaiters = false;
 	// Drain until the ring reports empty; a single MSI can cover many entries.
 	for (int pass = 0; pass < 16; pass++) {
 		uint32_t n = amdgpu::ih_poll(dev, ctx.ih, e, 32, 0);
@@ -944,6 +945,7 @@ void GarnetDriver::handleInterrupt(int count) {
 			// it the way amdgpu_dm_irq_handler does — ack before anything else — counts it by kind and
 			// instance, and keeps its own small log budget, so these never land in irqOther.
 			if (rdna4dcn::ihEntry(e[i].client_id, e[i].src_id, e[i].src_data[0])) continue;
+			if (rdna4native::irqwait::should_wake_on_iv(e[i].src_id)) wakeNativeWaiters = true;
 			switch (e[i].src_id) {
 			case 0:   irqFaults++;  break;   // UTCL2 / VM fault
 			case 181: irqEop++;     break;   // CP end-of-pipe
@@ -974,6 +976,7 @@ void GarnetDriver::handleInterrupt(int count) {
 		}
 	}
 	irqEntries += total;
+	if (wakeNativeWaiters) amdgpu::n1c_irq_notify();
 	(void)count;
 }
 

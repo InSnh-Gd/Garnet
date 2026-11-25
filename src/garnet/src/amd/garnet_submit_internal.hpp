@@ -31,6 +31,7 @@
 #include "garnet_hang_recovery_pure.h"   // 0.0.623 (G1): hang recovery (boot-arg rdna4-g1=1, default OFF)
 #include "garnet_multisession_pure.h"   // 0.0.627 (G2): several sessions (boot-arg garnet-multisession=1, default OFF)
 #include "garnet_app_credit_pure.h"   // 0.0.650 (G5 Stage 1): the application credit (boot-arg rdna4-g5=1, default OFF)
+#include "garnet_irq_wait_pure.h"     // Stage 2A: MSI EOP IRQ-driven fence wakeup policy (kill-switch garnet-irq-wait=0)
 #include "amdgpu_sysmem.h"
 #include "garnet_app_policy_pure.h"   // 0.0.640 (G4): the APP role, the allow-list, the budget report, the close-path mapping rule (boot-arg garnet-apps=1, default OFF)
 #include <pexpert/pexpert.h>  // 0.0.623: PE_parse_boot_argn (rdna4-g1)

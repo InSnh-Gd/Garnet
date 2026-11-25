@@ -18,6 +18,7 @@
 #include "amdgpu_init.h"
 #include "native_s1b.h"
 #include "garnet_submit_pure.h"
+#include "garnet_irq_wait_pure.h"
 
 class IOMemoryDescriptor;
 class IOUserClient;       // 0.0.641: n1c_unmap_for_close
@@ -65,6 +66,10 @@ IOReturn n1c_ctx(const N1cRef &ref, const rdna4n_ctx *in, rdna4n_ctx *out);
 IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_t *seqOut);
 IOReturn n1c_buffer_op(const N1cRef &ref, const rdna4n_buffer_op *in, bool fill, uint64_t *seqOut);
 IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64_t out[3]);
+// Stage 2A: wake blocked native GFX fence/ring waiters from GarnetDriver::handleInterrupt()
+// (CP EOP src_id 181, VM fault 0, CP errors 183..185). Leaf-locked and safe when no waiters exist.
+void n1c_irq_notify();
+bool n1c_irq_wait_enabled();
 // ---- ABI 1.1 (kext 0.0.603, native S2a): the scanout selectors 9..14. Same shape rules as the selectors above (the client checked counts and
 // sizes exactly); all need Hello. Lock order: gCliLock, then the scanout (DCN) lock inside rdna4dcn::scan*. Contract: NATIVE-S1C-ABI.md, "ABI 1.1 addendum".
 IOReturn n1c_scan_query(const N1cRef &ref, rdna4n_scan_query *out);

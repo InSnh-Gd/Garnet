@@ -18,6 +18,84 @@ BringupContext *gCtx;
 volatile UInt32 gOpenFlag;
 Hang gHang;
 IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock;
+static IOLock *gWaitLock;          // Stage 2A leaf lock for IRQ-driven waiter sleep/wakeup (never nested above any other lock)
+static volatile uint64_t gIrqEpoch;
+static uint8_t gIrqEvent;
+static volatile UInt32 gIrqWaitLatch = rdna4native::irqwait::kLatchUnset;
+static volatile uint64_t gIrqWaitSleeps, gIrqWaitWakes;
+
+static bool irq_wait_boot_on() {
+    UInt32 l = gIrqWaitLatch;
+    if (l == rdna4native::irqwait::kLatchUnset) {
+        uint32_t v = 1u;
+        const bool present = PE_parse_boot_argn("garnet-irq-wait", &v, sizeof(v));
+        if (OSCompareAndSwap(rdna4native::irqwait::kLatchUnset,
+                             rdna4native::irqwait::latch_value(present, v), &gIrqWaitLatch)) {
+            N1C_LOG("boot-arg garnet-irq-wait %s: EOP IRQ fence wakeup is %s",
+                    present ? (v == 0u ? "=0" : "nonzero") : "absent (default ON)",
+                    rdna4native::irqwait::latch_is_on(gIrqWaitLatch) ? "ENABLED (when MSI active)" : "DISABLED (legacy spin)");
+        }
+        l = gIrqWaitLatch;
+    }
+    return rdna4native::irqwait::latch_is_on(l);
+}
+
+bool n1c_irq_wait_enabled() {
+    if (gCtx == nullptr) return false;
+    return rdna4native::irqwait::active(gCtx->wantInterrupts, gCtx->ih.enabled,
+                                        gCtx->ih.enable_cpu_intr, irq_wait_boot_on());
+}
+
+static inline uint64_t irq_epoch_now() {
+    return __atomic_load_n(&gIrqEpoch, __ATOMIC_ACQUIRE);
+}
+
+void n1c_irq_notify() {
+    IOLock *wl = __atomic_load_n(&gWaitLock, __ATOMIC_ACQUIRE);
+    if (wl == nullptr) {
+        __atomic_fetch_add(&gIrqEpoch, 1ull, __ATOMIC_ACQ_REL);
+        return;
+    }
+    IOLockLock(wl);
+    __atomic_fetch_add(&gIrqEpoch, 1ull, __ATOMIC_ACQ_REL);
+    IOLockWakeup(wl, &gIrqEvent, false);
+    __atomic_fetch_add(&gIrqWaitWakes, 1ull, __ATOMIC_RELAXED);
+    IOLockUnlock(wl);
+}
+
+static void irq_arm_ring_eop(uint32_t *ring, uint64_t startWc, uint32_t n, uint32_t mask, const uint32_t *dw) {
+    if (!n1c_irq_wait_enabled()) return;
+    if (!rdna4native::irqwait::has_trailing_release_mem(dw, n)) return;
+    ring[ring_idx(startWc + (uint64_t)(n - 6u), mask)] = rdna4native::irqwait::dw2_with_eop_int(dw[n - 6u]);
+}
+
+static void n1c_wait_relax(uint64_t elapsedNs, uint64_t remainingNs, uint64_t epochBeforeCheck) {
+    const bool irqOn = n1c_irq_wait_enabled();
+    const rdna4native::irqwait::WaitStep step = rdna4native::irqwait::next_step(irqOn, elapsedNs, remainingNs);
+    if (step.action == rdna4native::irqwait::kActDelay1us) {
+        IODelay(1);
+        return;
+    }
+    if (step.action == rdna4native::irqwait::kActSleep1ms) {
+        IOSleep(1);
+        return;
+    }
+    IOLock *wl = lazy_lock(&gWaitLock);
+    if (wl == nullptr) {
+        IOSleep(1);
+        return;
+    }
+    uint64_t deltaAbs = 0, nowAbs = 0;
+    nanoseconds_to_absolutetime(step.sleepNs, &deltaAbs);
+    clock_get_uptime(&nowAbs);
+    const AbsoluteTime deadline = static_cast<AbsoluteTime>(nowAbs + deltaAbs);
+    IOLockLock(wl);
+    if (rdna4native::irqwait::should_sleep_for_epoch(epochBeforeCheck, irq_epoch_now())) {
+        __atomic_fetch_add(&gIrqWaitSleeps, 1ull, __ATOMIC_RELAXED);
+        (void)IOLockSleepDeadline(wl, &gIrqEvent, deadline, THREAD_UNINT);
+    }
+    IOLockUnlock(wl);
+}
 uint32_t gSessSeqCounter = 0;
 volatile UInt32 gSessWs;
 static bool gLegacyLogged[8];
@@ -106,6 +184,7 @@ static void hang_log(uint64_t emitted, uint64_t retired) {
 static void hang_announce(uint64_t emitted, uint64_t retired) {
     hang_log(emitted, retired);
     GarnetMetalNub::hungLatched();
+    n1c_irq_notify();
 }
 static bool stall_handle(uint64_t em, uint64_t re);   // 0.0.627 (G2): below the ring
 // Rule 6.3(b), on any GPU-dependent call: true when THIS call latched the hang. 0.0.627 (G2): with the switch ON a detected stall goes to stall_handle
@@ -174,7 +253,9 @@ bool own_wait(Session *s, bool *noBlame) {
     const uint64_t start = now_ns();
     bool stalled = false;
     if (noBlame != nullptr) *noBlame = false;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
     for (;;) {
+        const uint64_t ep = irq_epoch_now();
         if (rdna4native::g2::own_idle(retired_now(emitted_now()), own)) return true;
         if (hung_now()) return false;
         const uint64_t el = now_ns() - start;
@@ -183,8 +264,9 @@ bool own_wait(Session *s, bool *noBlame) {
             if (stall_from_wait() == rdna4native::g2::kBoundNoBlame) { if (noBlame != nullptr) *noBlame = true; return false; }   // R2: progress within kHangNs: Timeout, no blame
             stalled = true; continue;
         }
-        if (stalled && el >= kWaitCapNs + kRecoverWaitNs) return false;
-        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+        const uint64_t limit = stalled ? (kWaitCapNs + kRecoverWaitNs) : kWaitCapNs;
+        if (stalled && el >= limit) return false;
+        n1c_wait_relax(el, el < limit ? (limit - el) : 0ull, ep);
     }
 }
 
@@ -196,8 +278,10 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
     CPContext &cp = gCtx->cp;
     const uint32_t mask = cp.ring_ptr_mask;
     if (n > cp.ring_size_dwords / 2u) return kBadArg;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
     const uint64_t t0 = now_ns();
     for (;;) {
+        const uint64_t ep = irq_epoch_now();
         sysmem_rmb();
         const uint32_t r = *cp.rptr_cpu & mask;
         if (ring_has_space(ring_free64(r, gWc, mask), n)) break;
@@ -206,12 +290,13 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
             N1C_LOG("ring space: need %u dwords (+%u slack), rptr %u wptr %u, no room in 2 s", n, kRingSlack, r, (uint32_t)(gWc & mask));
             return kTimeout;
         }
-        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+        n1c_wait_relax(el, kWaitCapNs - el, ep);
     }
     auto *ring = static_cast<uint32_t *>(cp.ring_cpu);
     const uint64_t startWc = gWc;
     uint64_t wc = gWc;
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
+    irq_arm_ring_eop(ring, startWc, n, mask, dw);
     gWc = wc;
     cp.wptr = ring_idx(wc, mask);
     // The clock for rule 6.3(b) starts at the kick that makes an idle ring busy; emitted goes up BEFORE the doorbell so retired can never
@@ -315,7 +400,9 @@ static uint32_t ring_submit_g5_body(Session *s, const uint64_t *va, const uint32
 static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, bool useG5, uint64_t *seqOut) {
     uint64_t busyStart = 0ull;
     bool stallDone = false;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
     for (;;) {
+        const uint64_t ep = irq_epoch_now();
         if (hung_now()) return hang_rc(true, false);
         if (sess_poisoned(s)) return rdna4native::g2::poison_rc(true);
         rdna4vmid::Grant grant {};
@@ -394,7 +481,7 @@ static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_
             (void)stall_from_wait();
             continue;
         }
-        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+        n1c_wait_relax(el, (kWaitCapNs + kRecoverWaitNs) - el, ep);
     }
 }
 static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
@@ -437,6 +524,7 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
     }
     g2_scrub_locked(g.startWc);
     __atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);
+    n1c_irq_notify();
     const uint32_t resetVmid = (g.vmid >= kNativeVmid && g.vmid < rdna4vmid::kSlots) ? g.vmid : __atomic_load_n(&gs->vmid, __ATOMIC_ACQUIRE);
     const uint64_t t0 = now_ns();
     const kern_return_t r = mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, resetVmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);
@@ -450,10 +538,11 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
         put = ring_put_locked(dw, 8u, probe, kOwnerKernel, 0u, nullptr) == kOk;
         const uint64_t t1 = now_ns();
         while (put && !ret) {
+            const uint64_t ep = irq_epoch_now();
             ret = retired_now(emitted_now()) >= probe;
             verifyNs = now_ns() - t1;
             if (!ret && verifyNs >= kVerifyNs) break;
-            if (!ret) { if (verifyNs < 5000000ull) IODelay(1); else IOSleep(1); }
+            if (!ret) n1c_wait_relax(verifyNs, kVerifyNs - verifyNs, ep);
         }
     }
     IOLockUnlock(gRingLock);
@@ -689,7 +778,9 @@ IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64
     const uint64_t to = wait_timeout_ns(timeoutNs);
     const uint64_t start = now_ns();
     uint64_t re = 0;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
     for (;;) {
+        const uint64_t ep = irq_epoch_now();
         em = emitted_now();
         re = retired_now(em);
         if (sess_poisoned(s)) return kIOReturnAborted;
@@ -697,7 +788,7 @@ IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64
         if (hung_now()) return kIOReturnAborted;
         const uint64_t el = now_ns() - start;
         if (el >= to) break;
-        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+        n1c_wait_relax(el, to - el, ep);
     }
     if (hang_poll()) return kIOReturnTimeout;                // this call's wait detected the hang
     if (sess_poisoned(s)) return kIOReturnAborted;           // 0.0.627: this call's stall named the caller guilty
