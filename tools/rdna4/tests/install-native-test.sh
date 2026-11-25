@@ -380,7 +380,7 @@ elif mode == "check-plan":
     text = (base_arg / "output").read_text()
     boot = next(line[10:] for line in text.splitlines() if line.startswith("BOOT_ARGS="))
     tokens = boot.split()
-    for token in ("garnet=1", "garnet-interrupts=0", "garnet-stage=17", "garnet-native=1", "garnet-metal=1"):
+    for token in ("garnet=1", "garnet-interrupts=1", "garnet-stage=17", "garnet-native=1", "garnet-metal=1"):
         assert token in tokens, (token, boot)
     for forbidden in ("garnet-metal-disp=1", "garnet-metal-ws=1", "garnet-apps=1",
                       "garnet-multisession=1", "amfi=0x80", "navi48", "rdna4"):
@@ -419,7 +419,7 @@ elif mode == "installed":
     old_accel_entries = by_name(entries, old_accel)
     assert len(old_accel_entries) == 1 and old_accel_entries[0]["Enabled"] is False
     tokens = config["NVRAM"]["Add"][guid]["boot-args"].split()
-    for token in ("garnet=1", "garnet-interrupts=0", "garnet-stage=17", "garnet-native=1", "garnet-metal=1"):
+    for token in ("garnet=1", "garnet-interrupts=1", "garnet-stage=17", "garnet-native=1", "garnet-metal=1"):
         assert token in tokens, (token, tokens)
     assert "garnet-metal-disp=1" not in tokens and "garnet-metal-ws=1" not in tokens
     assert "garnet-apps=1" not in tokens and "garnet-multisession=1" not in tokens

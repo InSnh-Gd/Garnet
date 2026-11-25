@@ -41,7 +41,7 @@ launch_job_loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
 
 # Boot-args the native profile sets. garnet-apps-all is deliberately NOT here (it bypasses the application
 # allow-list); add it by hand only for a diagnostic boot.
-RDNA4_ARGS_BASE='garnet=1 garnet-interrupts=0'
+RDNA4_ARGS_BASE='garnet=1 garnet-interrupts=1'
 RDNA4_ARGS_NATIVE='garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80'
 RDNA4_ARGS_VM='garnet-stage=0'
 # Controlled runs use the matched GPU stack but deliberately do not install

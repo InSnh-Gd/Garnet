@@ -8,7 +8,7 @@ path below is taken from the scripts themselves.
 - `deploy-common.sh`: sourced by both installers (bash 3.2). Defines standalone Garnet bundle identities
   (`GARNET_BUNDLE=Garnet.kext` / `org.garnet.driver`, `ACCEL_BUNDLE=GarnetAccel.kext` /
   `org.garnet.accel`, `METAL_BUNDLE=GarnetMetal.bundle` / `org.garnet.metal`),
-  `DELIVERY_MANIFEST_FORMAT=garnet-delivery-v1`, `RDNA4_ARGS_BASE` (`garnet=1 garnet-interrupts=0`),
+  `DELIVERY_MANIFEST_FORMAT=garnet-delivery-v1`, `RDNA4_ARGS_BASE` (`garnet=1 garnet-interrupts=1`),
   `RDNA4_ARGS_NATIVE` (`garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1
   garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80`), `RDNA4_ARGS_VM`
   (`garnet-stage=0`), `RDNA4_ARGS_CONTROLLED`; `strip_args` / `profile_args` / `migrate_args` /

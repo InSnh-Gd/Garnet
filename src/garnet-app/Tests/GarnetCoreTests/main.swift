@@ -612,7 +612,7 @@ struct GarnetCoreTestsRunner {
         increasePciBar: Bool = false,
         secureBoot: String = "Disabled",
         csrHex: String? = "03080000",
-        bootArgs: String = "-v keepsyms=1 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1",
+        bootArgs: String = "-v keepsyms=1 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1",
         deleteKeys: [String] = ["csr-active-config", "boot-args"]
     ) -> [String: Any] {
         let kEntries: [[String: Any]] = exts.map { item in
@@ -831,7 +831,7 @@ struct GarnetCoreTestsRunner {
         try verifyCase("valid-small", makeOCPlist(
             exts: [("Lilu.kext", true), ("GarnetPCIBarCompat.kext", false)],
             resizeApple: 0, resizeUefi: 0,
-            bootArgs: "-v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80"
+            bootArgs: "-v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80"
         ), mode: .modeSmall, expectValid: true)
 
         // 10+ invalid config cases
@@ -842,14 +842,14 @@ struct GarnetCoreTestsRunner {
         try verifyCase("bad-pcibar-enabled-small", makeOCPlist(
             exts: [("GarnetPCIBarCompat.kext", true)],
             resizeApple: 0, resizeUefi: 0,
-            bootArgs: "-v npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80"
+            bootArgs: "-v npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80"
         ), mode: .modeSmall, expectValid: false)
         try verifyCase("bad-secureboot", makeOCPlist(secureBoot: "Default"), mode: .full, expectValid: false)
         try verifyCase("bad-csr-config", makeOCPlist(csrHex: "00000000"), mode: .full, expectValid: false)
         try verifyCase("bad-missing-delete", makeOCPlist(deleteKeys: ["boot-args"]), mode: .full, expectValid: false)
-        try verifyCase("warn-missing-apps-all", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: true, expectWarn: true)
-        try verifyCase("bad-missing-required-boot-arg", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
-        try verifyCase("bad-npci-with-16g", makeOCPlist(bootArgs: "npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
+        try verifyCase("warn-missing-apps-all", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: true, expectWarn: true)
+        try verifyCase("bad-missing-required-boot-arg", makeOCPlist(bootArgs: "garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
+        try verifyCase("bad-npci-with-16g", makeOCPlist(bootArgs: "npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
         try verifyCase("bad-resize-apple-16g", makeOCPlist(resizeApple: 0), mode: .full, expectValid: false)
         try verifyCase("bad-increase-pci-bar", makeOCPlist(increasePciBar: true), mode: .full, expectValid: false)
     }

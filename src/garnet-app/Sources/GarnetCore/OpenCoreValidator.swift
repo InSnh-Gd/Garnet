@@ -67,7 +67,7 @@ public enum OpenCoreValidator {
 
     private static let requiredBootArgs: [String] = [
         "garnet=1",
-        "garnet-interrupts=0",
+        "garnet-interrupts=1",
         "garnet-stage=17",
         "garnet-native=1",
         "garnet-metal=1",
@@ -545,7 +545,7 @@ public enum OpenCoreValidator {
             4. `Misc -> Security -> SecureBootModel` = "Disabled"
             5. `NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`:
                csr-active-config = <03080000>  (0x0803)
-               boot-args = -v keepsyms=1 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1
+               boot-args = -v keepsyms=1 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1
                (DO NOT include npci=0x2000 or -radvesa)
             6. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
             """
@@ -559,7 +559,7 @@ public enum OpenCoreValidator {
             3. `Misc -> Security -> SecureBootModel` = "Disabled"
             4. `NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`:
                csr-active-config = <03080000>  (0x0803)
-               boot-args = -v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=0 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80
+               boot-args = -v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80
                (DO NOT include garnet-full-bar=1 or -radvesa)
             5. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
             """
@@ -573,6 +573,7 @@ public enum OpenCoreValidator {
           - `garnet-aux=0`          Disables GarnetAccel.kext / GarnetFramebuffer while keeping bringup diagnostics accessible.
           - `garnet-rebar-compat=0` Disables GarnetPCIBarCompat.kext Full-BAR hook without removing it from EFI/OC/Kexts/.
           - `garnet-apps-all=0`     Disables global desktop app Metal access while preserving core compositor & allowlisted tools.
+          - `garnet-irq-wait=0`     Reverts kernel fence waits to legacy polling without disabling MSI interrupts.
         """
     }
 }
