@@ -1,5 +1,5 @@
 //
-//  native_g1_pure.h - the PURE half of GPU-apps stage G1 (kext 0.0.623): recovering the native kernel GFX queue from a submission that never
+//  garnet_hang_recovery_pure.h - the PURE half of GPU-apps stage G1 (kext 0.0.623): recovering the native kernel GFX queue from a submission that never
 //  retires, WITHOUT a reboot (an internal design note section 4, G1). No kernel header is included: tests/native_g1_test.cpp compiles
 //  this file and drives the very decision functions and run templates the kext calls (native_s1c.cpp, n1c_g1_*), with a fake environment.
 //
@@ -69,7 +69,7 @@ enum Code : uint32_t {
 
 // ---- bounds (every wait in G1 is one of these) ---------------------------------------------------------------------------------------------------
 constexpr uint64_t kMs = 1000000ull;
-constexpr uint64_t kHangConfirmNs = 2000ull * kMs;   // = native_s1c_pure.h kHangNs: the same 2 s that latches HUNG for a client
+constexpr uint64_t kHangConfirmNs = 2000ull * kMs;   // = garnet_submit_pure.h kHangNs: the same 2 s that latches HUNG for a client
 constexpr uint64_t kVerifyNs      = 1000ull * kMs;   // a probe IB of one WRITE_DATA retires in microseconds when the queue is healthy
 // The MES calls are bounded inside mes_submit_pkt: RESET 2 s, REMOVE_QUEUE 1 s, ADD_QUEUE 2 s (mes_v12_1.cpp). The longest act is remap (1 + 2 s).
 constexpr uint64_t kActMaxNs      = 3000ull * kMs;

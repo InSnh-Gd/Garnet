@@ -1,5 +1,5 @@
 // native_g5_test.cpp - kext 0.0.650 (GPU-apps stage G5 Stage 1: the application credit; an internal design note "G5 design" and "G5 Stage 1 build spec"): the pure half
-// (amd/native_g5_pure.h) driven directly and through a simulation of the ring (WindowServer every 10.7 ms, three apps with 50 ms jobs, the GPU retiring in FIFO order) that calls
+// (amd/garnet_app_credit_pure.h) driven directly and through a simulation of the ring (WindowServer every 10.7 ms, three apps with 50 ms jobs, the GPU retiring in FIFO order) that calls
 // the very function the kernel calls (g5::admission), plus source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetDriver.cpp, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_g5_test.cpp -o /tmp/native_g5 && /tmp/native_g5 .
@@ -27,7 +27,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
-#include "native_g5_pure.h"
+#include "garnet_app_credit_pure.h"
 
 using namespace rdna4native;
 using namespace rdna4native::g5;
@@ -433,7 +433,7 @@ static const char *kRingSubmit642 =
 "    *seqOut = seq;\n"
 "    return kOk;";
 static void t10_pins(const std::string &root) {
-    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd"), pure = slurp(root + "/src/garnet/src/amd/native_g5_pure.h"),
+    const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd"), pure = slurp(root + "/src/garnet/src/amd/garnet_app_credit_pure.h"),
         hdr = slurp(root + "/src/garnet/src/amd/native_s1c.h"), brg = slurp(root + "/src/garnet/src/GarnetDriver.cpp"),
         cli = slurp(root + "/tools/rdna4/native/garnettest.c"), plist = slurp(root + "/src/garnet/Info.plist");
     expect(!eng.empty() && !pure.empty() && !hdr.empty() && !brg.empty() && !cli.empty() && !plist.empty(), "T10: the sources were read");

@@ -16,7 +16,7 @@ static char *slurp(const char *dir, const char *rel) {
 }
 static size_t countof(const char *h, const char *n) { size_t c = 0; const char *p = h; while ((p = strstr(p, n))) { c++; p += strlen(n); } return c; }
 static void w32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
-// a property blob exactly as src/garnet/src/amd/native_m6_pure.h blob_build lays it out
+// a property blob exactly as src/garnet/src/amd/garnet_multidisplay_route_pure.h blob_build lays it out
 static size_t blob(uint8_t *out, uint32_t n, const uint32_t (*ents)[3]) {
     w32(out, RDNA4M6_BLOB_VERSION); w32(out + 4, n);
     for (uint32_t i = 0; i < n; i++) { w32(out + 8 + i * 12, ents[i][0]); w32(out + 12 + i * 12, ents[i][1]); w32(out + 16 + i * 12, ents[i][2]); }
@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     // ---- constants: the bundle's copy equals the kernel's
     CHECK("retry plan", RDNA4M6_RETRIES == 8 && RDNA4M6_RETRY_NS == 3000000ull && RDNA4M6_C_PRESENT == 0 && RDNA4M6_C_SKIP == 1 && RDNA4M6_C_RETRY == 2 && RDNA4M6_C_DROP == 3 && RDNA4M6_MAX_SURF == 16u && RDNA4M6_NINST == 3u);
     CHECK("the scan_query flag is the kernel's bit 5", RDNA4M6_SCANQ_FLAG == RDNA4N_SCANQ_M6 && RDNA4N_SCANQ_M6 == (1u << 5) && RDNA4N_SCANQ_M6 != RDNA4N_SCANQ_DTO_VALID);
-    { char *kp = slurp(dir, "../../src/garnet/src/amd/native_m6_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h");
+    { char *kp = slurp(dir, "../../src/garnet/src/amd/garnet_multidisplay_route_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h");
       CHECK("kernel: blob version / header / entry size / table size", strstr(kp, "kBlobVersion = 1u, kBlobHdr = 8u, kBlobEnt = 12u") && strstr(kp, "constexpr uint32_t kMaxSurf = 16u;") && strstr(kp, "constexpr uint32_t kEntAmbiguous = 1u;"));
       CHECK("kernel: the property names", strstr(kp, "#define RDNA4M6_PROP_SURF    \"" RDNA4M6_PROP_SURF "\"") && strstr(kp, "#define RDNA4M6_PROP_LATCH   \"" RDNA4M6_PROP_LATCH "\""));
       CHECK("kernel: instance numbers (DP 0, monitor A 1, monitor B 2)", strstr(kp, "kInstDp = 0u, kInstMonA = 1u, kInstMonB = 2u") && RDNA4M6_INST_DP == 0 && RDNA4M6_INST_MONA == 1 && RDNA4M6_INST_MONB == 2);

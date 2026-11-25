@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-#include "amd/native_g2_pure.h"
+#include "amd/garnet_multisession_pure.h"
 #include "amd/native_hostimport_pure.h"
 #include "GarnetNativeABI.h"
 
@@ -245,7 +245,7 @@ static void s4_free_leak() {
 static void s5_source_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd");
-    const std::string g2h = slurp(K + "src/amd/native_g2_pure.h");
+    const std::string g2h = slurp(K + "src/amd/garnet_multisession_pure.h");
     const std::string hi = slurp(K + "src/amd/native_hostimport_pure.h");
     const std::string abi = slurp(K + "src/GarnetNativeABI.h");
     expect(!eng.empty() && !g2h.empty() && !hi.empty() && !abi.empty(), "the kernel sources are readable from the root given");

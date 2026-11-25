@@ -23,8 +23,8 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include "amd/native_s1c_pure.h"
-#include "amd/native_g2_pure.h"
+#include "amd/garnet_submit_pure.h"
+#include "amd/garnet_multisession_pure.h"
 #include "GarnetNativeABI.h"
 
 using namespace rdna4native;

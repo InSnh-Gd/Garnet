@@ -32,7 +32,7 @@
 #include <sstream>
 #include <cstdlib>
 #include "dcn/scanx_flow.h"
-#include "amd/native_m6_pure.h"
+#include "amd/garnet_multidisplay_route_pure.h"
 #include "amd/native_open_policy_pure.h"
 #include "GarnetNativeABI.h"
 #include "amd/native_disp_pure.h"
@@ -798,7 +798,7 @@ static void suite_pins(const std::string &root) {
     const std::string pol = slurp(root, (K + "amd/native_open_policy_pure.h").c_str());
     const std::string disp = slurp(root, (K + "amd/native_disp.cpp").c_str());
     const std::string dflow = slurp(root, (K + "amd/native_disp_flow.h").c_str());
-    const std::string pure = slurp(root, (K + "amd/native_m6_pure.h").c_str());
+    const std::string pure = slurp(root, (K + "amd/garnet_multidisplay_route_pure.h").c_str());
     const std::string plist = slurp(root, "src/garnet/Info.plist");
     const std::string clic = slurp(root, "tools/rdna4/native/garnettest.c");
     // the writer: ONE function, two registers, HIGH before LOW

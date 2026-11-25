@@ -1958,7 +1958,7 @@ int main(int argc, char **argv) {
         }
         // ---- N6 the kernel glue and the call sites (source pins; the behaviour above is the reachability) -----------------------------------------------------------------------------------------
         {
-            const std::string m6p = slurp(K + "src/amd/native_m6_pure.h"), dnub = slurp(K + "src/GarnetDisplayNub.cpp");
+            const std::string m6p = slurp(K + "src/amd/garnet_multidisplay_route_pure.h"), dnub = slurp(K + "src/GarnetDisplayNub.cpp");
             expect(glue.find("PE_parse_boot_argn(\"garnet-m6\", &v, sizeof(v))") != std::string::npos && glue.find("volatile uint32_t gM6Latch = rdna4m6::kLatchUnset;") != std::string::npos && glue.find("rdna4m6::latch_is_on(rdna4m6::latch_get(&gM6Latch, []() -> uint32_t {") != std::string::npos && glue.find("return rdna4m6::latch_value(present, v);") != std::string::npos, "N6 the garnet-m6 latch goes through the read-once latch_get, default unset = OFF");
             expect(glue.find("bool m6_on() { return rdna4m6_latched_on(); }") != std::string::npos && count_of(glue, "rdna4m6_latched_on()") >= 5, "N6 the flows' m6_on() is the latch accessor");
             expect(glue.find("if (rdna4m6_latched_on()) m6_record_map();") != std::string::npos, "N6 adopt records the framebuffer map under the latch");
@@ -2017,7 +2017,7 @@ int main(int argc, char **argv) {
         // ---- N9 0.0.660 (queue 290): the self-healing surface table, the serialised publisher, the packing, the restart guard, the glue decisions, the clocks -----------------------------------------------------------------
         const bool savedPrep9 = gAutoPrep; gAutoPrep = false;
         {
-            const std::string m6p = slurp(K + "src/amd/native_m6_pure.h");
+            const std::string m6p = slurp(K + "src/amd/garnet_multidisplay_route_pure.h");
             // ---- S1: the table heals itself ------------------------------------------------------------------------------------------------------------------------------------------------------------
             { SurfTable t {}; (void)learn_surface(t, 7, kInstMonB);
               expect_u("N9 S1 an ID re-learned on another pipe while its owner is FRESH is ambiguous", learn_surface(t, 7, kInstDp), kLBecameAmbiguous);

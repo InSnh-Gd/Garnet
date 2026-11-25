@@ -1,7 +1,7 @@
 // VM-only test of the shared AGDC builder and vendor callback with a real VM
 // framebuffer. It does not run native_flow or admit a VM GPU to the driver.
 #include <sys/proc.h>
-#include "amd/native_m6_pure.h"
+#include "amd/garnet_multidisplay_route_pure.h"
 
 static constexpr unsigned kVtHdr = 2;
 static struct { uint32_t width, height; } gRa;

@@ -5,7 +5,7 @@
  * each IOSurface ID is presented on, and publishes the table as the registry property "Garnet,M6Surf" of the Metal nub (the channel "Garnet,Ready" already uses; the shipped Mesa exports no
  * passthrough and WindowServer's RDNA4N connection is exclusive, so there is no selector the bundle can call). The latch itself arrives in scan_query.flags (RDNA4N_SCANQ_M6).
  *
- * Property layout (little endian, mirrors src/garnet/src/amd/native_m6_pure.h; the host test pins the constants): u32 version (1), u32 n, then n x { u32 id, u32 inst, u32 flags }.
+ * Property layout (little endian, mirrors src/garnet/src/amd/garnet_multidisplay_route_pure.h; the host test pins the constants): u32 version (1), u32 n, then n x { u32 id, u32 inst, u32 flags }.
  *   inst: 0 = the DP display (the only instance this bundle presents), 1 = the monitor A, 2 = the monitor B.   flags bit 0: the ID was seen on TWO pipes (AMBIGUOUS: never presented).
  *
  * Two decisions, both pure:

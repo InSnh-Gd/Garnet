@@ -23,7 +23,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include "native_s1b_pure.h"
+#include "garnet_native_boot_pure.h"
 
 using namespace rdna4native;
 

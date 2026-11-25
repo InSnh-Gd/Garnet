@@ -56,7 +56,7 @@ PY
 }
 
 baseline
-P=$K/src/amd/native_g2_pure.h
+P=$K/src/amd/garnet_multisession_pure.h
 E=$K/src/amd/native_s1c.cpp
 N=$K/src/GarnetNativeClient.cpp
 D=$K/src/amd/native_disp_pure.h

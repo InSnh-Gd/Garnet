@@ -1,5 +1,5 @@
 #pragma once
-#include "native_s1c_pure.h"
+#include "garnet_submit_pure.h"
 
 namespace rdna4native { namespace s1c {
 

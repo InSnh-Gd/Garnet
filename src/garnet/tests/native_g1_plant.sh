@@ -14,7 +14,7 @@ escaped=0; total=0
 fresh() {   # the scratch tree: exactly the files native_g1_test.cpp reads
   rm -rf "$SCR"; mkdir -p "$SCR/$K/src/amd" "$SCR/$K/tests"
   cp "$ROOT/$K/src/GarnetDriver.cpp" "$ROOT/$K/src/GarnetUserClient.cpp" "$ROOT/$K/src/GarnetNativeClient.cpp" "$ROOT/$K/src/GarnetMetalNub.cpp" "$ROOT/$K/src/GarnetDisplayNub.cpp" "$ROOT/$K/src/kmod_info.c" "$ROOT/$K/src/garnet_version.h" "$SCR/$K/src/"
-  cp "$ROOT/$K/src/amd/"native_g1_pure.h "$ROOT/$K/src/amd/"garnet_submit_internal.hpp "$ROOT/$K/src/amd/"garnet_ring_submit.cpp "$ROOT/$K/src/amd/"garnet_session_vm.cpp "$ROOT/$K/src/amd/"garnet_vram_alloc.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"mes_v12_1.cpp "$ROOT/$K/src/amd/"amdgpu_mes.h "$SCR/$K/src/amd/"
+  cp "$ROOT/$K/src/amd/"garnet_hang_recovery_pure.h "$ROOT/$K/src/amd/"garnet_submit_internal.hpp "$ROOT/$K/src/amd/"garnet_ring_submit.cpp "$ROOT/$K/src/amd/"garnet_session_vm.cpp "$ROOT/$K/src/amd/"garnet_vram_alloc.cpp "$ROOT/$K/src/amd/"native_s1c.h "$ROOT/$K/src/amd/"mes_v12_1.cpp "$ROOT/$K/src/amd/"amdgpu_mes.h "$SCR/$K/src/amd/"
   cp "$ROOT/$K/Info.plist" "$ROOT/$K/VERSION" "$SCR/$K/"
   cp "$ROOT/$K/tests/native_g1_test.cpp" "$ROOT/$K/tests/garnet_version_check.h" "$SCR/$K/tests/"
 }
@@ -56,7 +56,7 @@ PY
 }
 
 baseline
-P=$K/src/amd/native_g1_pure.h
+P=$K/src/amd/garnet_hang_recovery_pure.h
 E=$K/src/amd/native_s1c.cpp
 B=$K/src/GarnetDriver.cpp
 U=$K/src/GarnetUserClient.cpp

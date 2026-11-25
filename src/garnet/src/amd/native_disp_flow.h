@@ -300,7 +300,7 @@ template <class E> void withdraw_flow(E &e) {
 
 struct SourceLog { uint64_t sw, sh, sbpr, base, unk88, smLen; uint32_t bpe, fmt, planes; uint16_t rw, rh; uint64_t rbpr; uint8_t elemW; };
 
-// ---- 0.0.659 (M6 Stage 1a): the surface table and the routing guard (decisions: native_m6_pure.h) -------------------------------------------------------------------------------------
+// ---- 0.0.659 (M6 Stage 1a): the surface table and the routing guard (decisions: garnet_multidisplay_route_pure.h) -------------------------------------------------------------------------------------
 // The surface ID of plane 0's IOSurface, read behind a class check (IOSurface+0x10). false = not an IOSurface / unreadable / zero.
 template <class E> bool m6_surface_id(E &e, uint64_t surf, uint32_t *id) {
     *id = 0u;

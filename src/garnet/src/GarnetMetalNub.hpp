@@ -35,7 +35,7 @@ public:
 	static void hungLatched();
 	// 0.0.613: the published nub (NOT retained: an identity for the display glue's provider check), or NULL when none is published.
 	static IOService *published();
-	// 0.0.659 (M6 Stage 1a): write a property on the published nub (the bundle reads "Garnet,M6" and "Garnet,M6Surf" there; native_m6_pure.h). false = no nub is published.
+	// 0.0.659 (M6 Stage 1a): write a property on the published nub (the bundle reads "Garnet,M6" and "Garnet,M6Surf" there; garnet_multidisplay_route_pure.h). false = no nub is published.
 	static bool setPublishedData(const char *key, const void *bytes, uint32_t len);
 	static bool setPublishedNumber(const char *key, uint64_t v);
 	// 0.0.656 (G6): the accelerator the aux kext registered through device_open (identity only, NOT retained), or NULL while there is no device. The native client's start() accepts it as the accelerator route's provider.

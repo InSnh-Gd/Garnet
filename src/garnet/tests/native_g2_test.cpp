@@ -1,5 +1,5 @@
 // native_g2_test.cpp - kext 0.0.627 (GPU-apps stage G2: several native client sessions; an internal design note section 1 and section 4 G2): the pure half
-// (amd/native_g2_pure.h) driven directly and through a small model of the kernel's session table and in-order ring, the close-disarm rule (amd/native_disp_pure.h), plus
+// (amd/garnet_multisession_pure.h) driven directly and through a small model of the kernel's session table and in-order ring, the close-disarm rule (amd/native_disp_pure.h), plus
 // source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetNativeClient.cpp, GarnetDriver.cpp, GarnetUserClient.cpp, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_g2_test.cpp -o /tmp/native_g2 && /tmp/native_g2 .
@@ -30,7 +30,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include "native_g2_pure.h"
+#include "garnet_multisession_pure.h"
 #include "native_disp_pure.h"
 
 using namespace rdna4native::g2;
@@ -404,7 +404,7 @@ static void t10_close_disarm() {
 static void t11_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), hdr = slurp(K + "src/amd/native_s1c.h"), ncl = slurp(K + "src/GarnetNativeClient.cpp"), nclh = slurp(K + "src/GarnetNativeClient.hpp"),
-                      brg = slurp(K + "src/GarnetDriver.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp"), pure = slurp(K + "src/amd/native_g2_pure.h"), dpure = slurp(K + "src/amd/native_disp_pure.h"),
+                      brg = slurp(K + "src/GarnetDriver.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp"), pure = slurp(K + "src/amd/garnet_multisession_pure.h"), dpure = slurp(K + "src/amd/native_disp_pure.h"),
                       plist = slurp(K + "Info.plist"), cli = slurp(root + "/tools/rdna4/native/garnettest.c");
     expect(!eng.empty() && !hdr.empty() && !ncl.empty() && !nclh.empty() && !brg.empty() && !ucl.empty() && !pure.empty() && !dpure.empty() && !plist.empty() && !cli.empty(), "the sources were read");
     // the switch: one latch, read once
@@ -617,7 +617,7 @@ static void t12_r4_syscap() {
 static void t12_r5_fault() {
     const uint64_t boot = fault_word(0x00881071u, 0x00012345u);   // VMID 8's self-test fault, still latched
     expect(fault_word_vmid(boot) == 8u && fault_word_vmid(fault_word(0x00981071u, 0)) == 9u, "R5: the word carries STATUS_LO32.VMID (bits 23:20)");
-    expect(fault_word_vmid(boot) == rdna4native::fault_status_vmid(0x00881071u), "R5: the same VMID field as native_s1b_pure.h's fault_status_vmid");
+    expect(fault_word_vmid(boot) == rdna4native::fault_status_vmid(0x00881071u), "R5: the same VMID field as garnet_native_boot_pure.h's fault_status_vmid");
     expect((boot & 0xFFFFFFFFull) == 0x00881071u && (boot >> 32) == 0x00012345u, "R5: STATUS_LO32 low, ADDR_LO32 high");
     expect(!fault_changed(boot, boot) && fault_changed(boot, fault_word(0x00981071u, 0x00020000u)), "R5: only a CHANGE tells a new fault from the boot-time one");
 }

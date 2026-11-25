@@ -2453,7 +2453,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         if (st != 0 && st != 12) return 3;
     }
     if (in == 104) {
-        // 0.0.640 (G4): out[3 + i] = v[i] of amdgpu::n1c_app_verb (amd/native_g4_pure.h verb_run): v[0] code, v[1] entries after, v[2] op, v[3] max (32), v[4..12] key / the page's entries.
+        // 0.0.640 (G4): out[3 + i] = v[i] of amdgpu::n1c_app_verb (amd/garnet_app_policy_pure.h verb_run): v[0] code, v[1] entries after, v[2] op, v[3] max (32), v[4..12] key / the page's entries.
         static const char *cn[] = { "ok", "OFF: boot-arg garnet-apps or garnet-multisession is not 1", "bad argument", "FULL (32 entries)", "already on the list", "not on the list" };
         const unsigned long long c = out[3];
         printf("  code                    : %llu (%s)\n", c, c <= 5 ? cn[c] : "?");
@@ -2481,7 +2481,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         return c == 0 || c == 4 || c == 5 ? 0 : 3;
     }
     if (in == 103) {
-        // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/native_g2_pure.h sess_out / global_out); v[0] is the code.
+        // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/garnet_multisession_pure.h sess_out / global_out); v[0] is the code.
         const unsigned long long c = out[3];
         const int isExtSlot = in2[1] >= 100;
         printf("  code                    : %llu (%s)\n", c, c == 0 ? "ok" : c == 1 ? "OFF: boot-arg garnet-multisession is not 1" : c == 2 ? "bad page" : "?");
@@ -2499,7 +2499,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             printf("  gcvm fault now / prev   : %#llx (vmid %llu) / %#llx (vmid %llu)%s\n", out[14], (out[14] >> 20) & 0xf, out[15], (out[15] >> 20) & 0xf,
                    out[14] != out[15] ? "  CHANGED since the previous sessstat 8" : "");
         } else if (c == 0 && out[4] == 9) {
-            /* 0.0.650 (G5 Stage 1): out[3 + i] = v[i] of amdgpu::n1c_g5_stat (amd/native_g5_pure.h stat_out); exists only with boot-arg garnet-g5=1 */
+            /* 0.0.650 (G5 Stage 1): out[3 + i] = v[i] of amdgpu::n1c_g5_stat (amd/garnet_app_credit_pure.h stat_out); exists only with boot-arg garnet-g5=1 */
             printf("  G5 flags                : G5 on%s%s\n", (out[5] & 2) ? ", WindowServer ACTIVE (submitted in the last 100 ms)" : ", WindowServer idle", (out[5] & 4) ? ", WindowServer open" : ", no WindowServer open");
             printf("  credit K                : %llu app job(s) may be in flight ahead of WindowServer (boot-arg garnet-g5credit, default 1)\n", out[6]);
             printf("  app jobs in flight now  : %llu    WindowServer seqnos outstanding now: %llu\n", out[7], out[8]);
@@ -2513,7 +2513,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         return c == 0 ? 0 : 3;
     }
     if (in == 100 || in == 101 || in == 102) {
-        // 0.0.623 (G1): out[3 + i] = v[i] of amdgpu::n1c_g1_verb; v[0] is the code (amd/native_g1_pure.h enum Code).
+        // 0.0.623 (G1): out[3 + i] = v[i] of amdgpu::n1c_g1_verb; v[0] is the code (amd/garnet_hang_recovery_pure.h enum Code).
         const unsigned long long c = out[3];
         const char *cn = c == 0 ? "ok" : c == 1 ? "REFUSED: boot-arg garnet-g1 is not 1" : c == 2 ? "REFUSED: bad mode / method" : c == 3 ? (in == 100 ? "REFUSED: a test context already holds the GPU" : "REFUSED: no test context holds a hang")
                        : c == 4 ? (in == 100 ? "REFUSED: a WindowServer native session is open" : "REFUSED: HUNG is not latched") : c == 5 ? (in == 100 ? "REFUSED: a native session is open" : "REFUSED: attempt budget spent")

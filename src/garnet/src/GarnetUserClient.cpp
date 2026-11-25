@@ -9,9 +9,9 @@
 #include "amd/native_disp.h"    // 0.0.613: the display verbs 83..87 open only with boot-arg garnet-metal-disp=1
 #include "amd/native_disp_pure.h"
 #include "amd/native_s1c.h"   // 0.0.601: n1c_refuse_legacy
-#include "amd/native_g1_pure.h"   // 0.0.623 (G1): the hang-recovery verbs 100..102 open only with boot-arg garnet-g1=1
-#include "amd/native_g2_pure.h"   // 0.0.627 (G2): the session stat verb 103 opens only with boot-arg garnet-multisession=1
-#include "amd/native_g4_pure.h"   // 0.0.640 (G4): the allow-list verb 104 opens only with boot-args garnet-apps=1 + garnet-multisession=1
+#include "amd/garnet_hang_recovery_pure.h"   // 0.0.623 (G1): the hang-recovery verbs 100..102 open only with boot-arg garnet-g1=1
+#include "amd/garnet_multisession_pure.h"   // 0.0.627 (G2): the session stat verb 103 opens only with boot-arg garnet-multisession=1
+#include "amd/garnet_app_policy_pure.h"   // 0.0.640 (G4): the allow-list verb 104 opens only with boot-args garnet-apps=1 + garnet-multisession=1
 #include "amd/amdgpu_cp.h"
 #include "amd/amdgpu_gmc.h"
 #include "amd/amdgpu_pm4.h"

@@ -57,7 +57,7 @@ PY
 }
 
 baseline
-P=$K/src/amd/native_g5_pure.h
+P=$K/src/amd/garnet_app_credit_pure.h
 E=$K/src/amd/native_s1c.cpp
 H=$K/src/amd/native_s1c.h
 B=$K/src/GarnetDriver.cpp

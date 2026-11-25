@@ -1,5 +1,5 @@
 //
-//  native_s1c_pure.h - the PURE half of native-stack step S1c (kext 0.0.601): the arithmetic and the decisions behind the native
+//  garnet_submit_pure.h - the PURE half of native-stack step S1c (kext 0.0.601): the arithmetic and the decisions behind the native
 //  user client (an internal design note). No kernel header is included, so tests/native_s1c_test.cpp compiles this on the
 //  host Mac and drives the exact functions the kext calls. The hardware/IOKit half is native_s1c.cpp and GarnetNativeClient.cpp.
 //
@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #include "GarnetNativeABI.h"
-#include "native_s1b_pure.h"
+#include "garnet_native_boot_pure.h"
 #include "cp_pm4_gfx12.h"     // cp_p3, kP3_* (stdint only)
 #include "amdgpu_pm4.h"       // pm4_release_mem_dw1/2 (stdint only)
 

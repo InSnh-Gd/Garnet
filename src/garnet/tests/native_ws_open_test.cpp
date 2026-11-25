@@ -24,7 +24,7 @@
 #include <filesystem>
 #include "amd/native_open_policy_pure.h"
 #include "amd/native_metal_pure.h"
-#include "amd/native_s1c_pure.h"
+#include "amd/garnet_submit_pure.h"
 #include "GarnetNativeABI.h"
 
 using namespace rdna4native::policy;
@@ -164,7 +164,7 @@ static void o3_pins(const std::string &root) {
 
 // ---- O4 ------------------------------------------------------------------------------------------------------------------------------------------------
 namespace {
-// A model of hang_poll / hang_from_wait + hang_announce + the nub: it runs the REAL state machine (hang_detect / hang_latch_wait from native_s1c_pure.h) and the real ready rules.
+// A model of hang_poll / hang_from_wait + hang_announce + the nub: it runs the REAL state machine (hang_detect / hang_latch_wait from garnet_submit_pure.h) and the real ready rules.
 struct NubModel {
     bool published = false;
     uint32_t readyProp = 99;   // the property as the registry shows it (99 = none)
@@ -240,7 +240,7 @@ static void o4_pins(const std::string &root) {
     expect(ann.find("hang_log(emitted, retired);") != std::string::npos && ann.find("GarnetMetalNub::hungLatched();") != std::string::npos && ann.find("hang_log(") < ann.find("GarnetMetalNub::hungLatched();"), "hang_announce logs, then writes the property");
     expect_u("the engine itself never writes gHang.hung (only the pure latch functions do)", count_of(eng, ".hung = true") + count_of(eng, "hung = true;"), 0);
     {   // the pure latch functions are the only writers of `hung`
-        const std::string pure = slurp(K + "src/amd/native_s1c_pure.h");
+        const std::string pure = slurp(K + "src/amd/garnet_submit_pure.h");
         expect_u("the pure header sets hung in exactly two places (hang_detect, hang_latch_wait)", count_of(pure, "h.hung = true;"), 2);
     }
     // the property itself

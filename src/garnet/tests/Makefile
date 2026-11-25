@@ -163,25 +163,25 @@ PTMEM_INC := $(BUILD)/native_ptmem_actual.inc
 $(PTMEM_INC): test-native-ptmem-production.py $(SRC)/amd/garnet_submit_internal.hpp | $(BUILD)
 	python3 $< "$@" "$(SRC)/amd/garnet_submit_internal.hpp"
 
-$(BUILD)/native_ptmem_production_test: native_ptmem_production_test.cpp $(PTMEM_INC) $(SRC)/amd/native_s1c_pure.h $(SRC)/amd/native_g2_pure.h | $(BUILD)
+$(BUILD)/native_ptmem_production_test: native_ptmem_production_test.cpp $(PTMEM_INC) $(SRC)/amd/garnet_submit_pure.h $(SRC)/amd/garnet_multisession_pure.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD) $< -o $@
 
-$(BUILD)/native_large_pt_test: native_large_pt_test.cpp $(SRC)/amd/native_s1c_pure.h $(SRC)/amd/native_hostimport_pure.h $(SRC)/GarnetNativeABI.h | $(BUILD)
+$(BUILD)/native_large_pt_test: native_large_pt_test.cpp $(SRC)/amd/garnet_submit_pure.h $(SRC)/amd/native_hostimport_pure.h $(SRC)/GarnetNativeABI.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
 
 large-pt: $(BUILD)/native_large_pt_test $(BUILD)/native_ptmem_production_test
 	$(BUILD)/native_large_pt_test "$(abspath ../../..)"
 	$(BUILD)/native_ptmem_production_test "$(abspath ../../..)" "$(abspath $(PTMEM_INC))"
 
-$(BUILD)/native_systemmemory_test: native_systemmemory_test.cpp $(SRC)/amd/native_g2_pure.h \
+$(BUILD)/native_systemmemory_test: native_systemmemory_test.cpp $(SRC)/amd/garnet_multisession_pure.h \
   $(SRC)/amd/native_hostimport_pure.h $(SRC)/GarnetNativeABI.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread $< -o $@
 
 system-memory: $(BUILD)/native_systemmemory_test
 	$(BUILD)/native_systemmemory_test "$(abspath ../../..)"
 
-$(PRT_SPARSE_TEST): native_prt_sparse_test.cpp $(PTMEM_INC) $(SRC)/amd/native_s1b_pure.h \
-  $(SRC)/amd/native_s1c_pure.h $(SRC)/amd/native_hostimport_pure.h $(SRC)/amd/native_g2_pure.h \
+$(PRT_SPARSE_TEST): native_prt_sparse_test.cpp $(PTMEM_INC) $(SRC)/amd/garnet_native_boot_pure.h \
+  $(SRC)/amd/garnet_submit_pure.h $(SRC)/amd/native_hostimport_pure.h $(SRC)/amd/garnet_multisession_pure.h \
   $(SRC)/GarnetNativeABI.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD) $< -o $@
 

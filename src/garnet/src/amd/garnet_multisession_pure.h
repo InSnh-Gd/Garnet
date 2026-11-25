@@ -1,5 +1,5 @@
 //
-//  native_g2_pure.h - the PURE half of GPU-apps stage G2 (kext 0.0.627): several native client sessions at once (an internal design note section 1
+//  garnet_multisession_pure.h - the PURE half of GPU-apps stage G2 (kext 0.0.627): several native client sessions at once (an internal design note section 1
 //  and section 4, G2). No kernel header is included: tests/native_g2_test.cpp compiles this file and drives the very decision functions the kext calls
 //  (amd/native_s1c.cpp, GarnetNativeClient.cpp).
 //
@@ -21,7 +21,7 @@
 #pragma once
 #include <stdint.h>
 
-#include "native_s1c_pure.h"   // the return codes, would_exceed, kNativeVmid / vmid_ok (via native_s1b_pure.h)
+#include "garnet_submit_pure.h"   // the return codes, would_exceed, kNativeVmid / vmid_ok (via garnet_native_boot_pure.h)
 
 namespace rdna4native {
 namespace g2 {
@@ -244,7 +244,7 @@ enum StatCode : uint32_t { kStatOk = 0u, kStatOff = 1u, kStatBadArg = 2u };
 // registers native_s1b.cpp's fault leg reads. Session page o[11]: the word at that session's open. Global page o[11]: the word now; o[12]: the word at the
 // PREVIOUS sessstat 8 call (0 before the first). A new fault = o[11] differs from both.
 constexpr uint64_t fault_word(uint32_t statusLo32, uint32_t addrLo32) { return (uint64_t)statusLo32 | ((uint64_t)addrLo32 << 32); }
-constexpr uint32_t fault_word_vmid(uint64_t w) { return (uint32_t)((w >> 20) & 0xFu); }   // GCVM_L2_PROTECTION_FAULT_STATUS_LO32.VMID (bits 23:20, native_s1b_pure.h fault_status_vmid)
+constexpr uint32_t fault_word_vmid(uint64_t w) { return (uint32_t)((w >> 20) & 0xFu); }   // GCVM_L2_PROTECTION_FAULT_STATUS_LO32.VMID (bits 23:20, garnet_native_boot_pure.h fault_status_vmid)
 constexpr bool fault_changed(uint64_t before, uint64_t now) { return before != now; }
 struct SessView { uint8_t state; bool ws, hello, poisoned; uint32_t vmid, id; uint64_t vram, gtt, imported, ptBytes, lastSeq; uint32_t nBos; uint64_t faultAtOpen; bool app = false; };
 struct GlobalView { uint32_t open; bool hung; uint64_t emitted, retired, othersVram, othersCap, recoveries, lastGuiltySeq, collateralTotal; uint32_t lastGuiltySlot, dead; uint64_t faultNow, faultPrev; uint32_t mappedLeakBos = 0; uint64_t appVisBytes = 0; uint32_t appVisCapMiB = 0; };

@@ -1,5 +1,5 @@
 //
-//  native_s1b_pure.h - the PURE half of native-stack step S1b (kext 0.0.600, boot-arg rdna4-native=1).
+//  garnet_native_boot_pure.h - the PURE half of native-stack step S1b (kext 0.0.600, boot-arg rdna4-native=1).
 //
 //  No kernel header is included, so tests/native_s1b_test.cpp compiles this on the host Mac and drives the exact functions the kext
 //  calls. Everything here is arithmetic: the boot-arg gate, the gfx12 page-table entry encoding (4 levels, 9 bits each, 48-bit

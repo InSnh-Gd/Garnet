@@ -45,7 +45,7 @@ struct Pre {
     bool pipeAdopted;    // pipeadopt succeeded this boot
     bool wsOpen;         // a WindowServer native session is open (n1c_ws_is_open)
     bool metalNub;       // 0.0.653: the Metal nub was published earlier this boot (garnetmetal_nub_published; sticky: withdrawn or not)
-    bool m6 = false;     // 0.0.659 (M6 Stage 1a, R2): boot-arg garnet-m6 == 1 (latched). With it the three interlocks below (adopted pipe, WindowServer session, Metal nub) are LIFTED: the routing guard (native_m6_pure.h) replaces them
+    bool m6 = false;     // 0.0.659 (M6 Stage 1a, R2): boot-arg garnet-m6 == 1 (latched). With it the three interlocks below (adopted pipe, WindowServer session, Metal nub) are LIFTED: the routing guard (garnet_multidisplay_route_pure.h) replaces them
 };
 constexpr uint32_t pre_verdict(const Pre &p) {
     if (!p.argOk) return kBadArg;

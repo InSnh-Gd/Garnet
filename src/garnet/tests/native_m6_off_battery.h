@@ -196,7 +196,7 @@ struct BatEnv {
     bool m6flip_on() { return false; }   // 0.0.661: the flows ask it only behind m6_on()
     uint32_t pipe_inst(uint64_t) { return 0xFFFFFFFFu; }
     bool vbl_sample_inst(uint32_t, VblSample *) { return false; }
-#if __has_include("amd/native_m6_pure.h")      // the 0.0.659 tree only: the 0.0.658 flows never name these
+#if __has_include("amd/garnet_multidisplay_route_pure.h")      // the 0.0.659 tree only: the 0.0.658 flows never name these
     rdna4m6::Look m6_lookup(uint32_t) { return rdna4m6::Look { false, false, 0xFFFFFFFFu }; }
     uint32_t m6_learn(uint32_t, uint32_t) { return 0; }
     void m6_note_submit(uint32_t) {}

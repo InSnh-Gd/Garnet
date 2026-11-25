@@ -17,7 +17,7 @@
 #include "../garnet_version.h"
 #include "amdgpu_init.h"
 #include "native_s1b.h"
-#include "native_s1c_pure.h"
+#include "garnet_submit_pure.h"
 
 class IOMemoryDescriptor;
 class IOUserClient;       // 0.0.641: n1c_unmap_for_close
@@ -108,18 +108,18 @@ void n1c_vram_free_excl(BringupContext &ctx, const VRAMAllocation &a);
 bool n1c_d2_pin(uint32_t inst, const uint64_t mc[2]);
 bool n1c_d2_pinned(uint32_t inst);
 
-// ---- 0.0.623: GPU-apps stage G1, hang recovery (native_g1_pure.h). DEFAULT OFF: boot-arg rdna4-g1=1, latched once. -------------------------
+// ---- 0.0.623: GPU-apps stage G1, hang recovery (garnet_hang_recovery_pure.h). DEFAULT OFF: boot-arg rdna4-g1=1, latched once. -------------------------
 bool n1c_g1_latched_on();
 // 0.0.627: the uid-88 (WindowServer) note is now set by n1c_open itself (its `ws` argument) and cleared by that session's close (0.0.623-0.0.626: n1c_note_ws_session).
 // accel actions 100 hangtest / 101 hangrecover / 102 hangstat. `o` receives rdna4native::g1::kOutN (13) scalars; o[0] is the verdict code.
 IOReturn n1c_g1_verb(uint32_t action, uint64_t arg, BringupContext &ctx, uint64_t *o);
 
-// ---- 0.0.627: GPU-apps stage G2, several sessions (native_g2_pure.h). DEFAULT OFF: boot-arg garnet-multisession=1, latched once. -------------------
+// ---- 0.0.627: GPU-apps stage G2, several sessions (garnet_multisession_pure.h). DEFAULT OFF: boot-arg garnet-multisession=1, latched once. -------------------
 bool n1c_multi_latched_on();
 // accel action 103 `sessstat <page>`: page 0..7 one session slot (VMID 8..15), 8 the global page. `o` receives rdna4native::g2::kOutN (13) scalars; read-only.
 IOReturn n1c_g2_stat(uint64_t page, uint64_t *o);
 
-// ---- 0.0.640: GPU-apps stage G4, ordinary user applications (native_g4_pure.h). DEFAULT OFF: boot-args garnet-apps=1 AND garnet-multisession=1, each latched once. -----------------
+// ---- 0.0.640: GPU-apps stage G4, ordinary user applications (garnet_app_policy_pure.h). DEFAULT OFF: boot-args garnet-apps=1 AND garnet-multisession=1, each latched once. -----------------
 bool n1c_apps_enabled();                       // both latches ON
 // Is the process called `comm` (proc_selfname of the opener) on the kernel allow-list? false whenever the role is disabled. The list is empty at every boot and changes only through accel 104.
 bool n1c_app_allowed(const char *comm, bool *struckOut);   // 0.0.641: *struckOut = listed but out of strikes (3 recoveries blamed on that name this boot)
@@ -134,7 +134,7 @@ bool n1c_log_gate(uint32_t *suppressed);        // 0.0.641: rate limit for the "
 IOReturn n1c_app_verb(uint64_t arg, uint64_t *o);
 IOReturn n1c_app_deny_verb(uint64_t arg, uint64_t *o);
 
-// ---- 0.0.650: GPU-apps stage G5 Stage 1, the application credit (native_g5_pure.h). DEFAULT OFF: boot-arg rdna4-g5=1 AND garnet-multisession=1, latched once. -----------------
+// ---- 0.0.650: GPU-apps stage G5 Stage 1, the application credit (garnet_app_credit_pure.h). DEFAULT OFF: boot-arg rdna4-g5=1 AND garnet-multisession=1, latched once. -----------------
 bool n1c_g5_latched_on();                       // both latches ON
 // accel action 103 `sessstat 9`: the G5 page (exists only with G5 ON). `o` receives rdna4native::g2::kOutN (13) scalars; read-only.
 IOReturn n1c_g5_stat(uint64_t *o);

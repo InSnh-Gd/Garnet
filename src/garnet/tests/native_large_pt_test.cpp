@@ -298,7 +298,7 @@ static void l5_protect() {
 }
 
 static void l6_pins(const std::string &root) {
-    std::string pure = slurp(root + "/src/garnet/src/amd/native_s1c_pure.h");
+    std::string pure = slurp(root + "/src/garnet/src/amd/garnet_submit_pure.h");
     std::string himp = slurp(root + "/src/garnet/src/amd/native_hostimport_pure.h");
     std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     expect(!pure.empty() && !himp.empty() && !eng.empty(), "sources readable");

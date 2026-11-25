@@ -28,11 +28,11 @@
 #include "amdgpu_pm4.h"
 #include "cp_pm4_gfx12.h"
 #include "native_d2pin_pure.h" // 0.0.652 (M5): the monitor B pair's pin / free / alloc decisions (host-tested)
-#include "native_g1_pure.h"   // 0.0.623 (G1): hang recovery (boot-arg rdna4-g1=1, default OFF)
-#include "native_g2_pure.h"   // 0.0.627 (G2): several sessions (boot-arg garnet-multisession=1, default OFF)
-#include "native_g5_pure.h"   // 0.0.650 (G5 Stage 1): the application credit (boot-arg rdna4-g5=1, default OFF)
+#include "garnet_hang_recovery_pure.h"   // 0.0.623 (G1): hang recovery (boot-arg rdna4-g1=1, default OFF)
+#include "garnet_multisession_pure.h"   // 0.0.627 (G2): several sessions (boot-arg garnet-multisession=1, default OFF)
+#include "garnet_app_credit_pure.h"   // 0.0.650 (G5 Stage 1): the application credit (boot-arg rdna4-g5=1, default OFF)
 #include "amdgpu_sysmem.h"
-#include "native_g4_pure.h"   // 0.0.640 (G4): the APP role, the allow-list, the budget report, the close-path mapping rule (boot-arg garnet-apps=1, default OFF)
+#include "garnet_app_policy_pure.h"   // 0.0.640 (G4): the APP role, the allow-list, the budget report, the close-path mapping rule (boot-arg garnet-apps=1, default OFF)
 #include <pexpert/pexpert.h>  // 0.0.623: PE_parse_boot_argn (rdna4-g1)
 
 #define N1C_LOG(fmt, ...) AMDGPU_LOG("native-s1c", fmt, ##__VA_ARGS__)

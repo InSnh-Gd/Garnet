@@ -1,6 +1,6 @@
 //
 //  native_s1b.h - the kernel half of native-stack step S1b (kext 0.0.600). Default OFF: nothing here runs unless the boot-arg
-//  rdna4-native=1 is present AND no Apple-path / self-test boot-arg is armed (rdna4native::gate_decide, native_s1b_pure.h).
+//  rdna4-native=1 is present AND no Apple-path / self-test boot-arg is armed (rdna4native::gate_decide, garnet_native_boot_pure.h).
 //
 //  What it does, once, at the end of the ladder (stage 17 passed): programs GFXHUB CONTEXT<vmid> (vmid 8, outside MES's 0xFE mask)
 //  with upstream's geometry (DEPTH 3 / BLOCK_SIZE 0 / RETRY 0) and a 4-level table of our own in VRAM, then submits IBs on the
@@ -12,7 +12,7 @@
 #include <IOKit/IOReturn.h>
 
 #include "amdgpu_init.h"
-#include "native_s1b_pure.h"
+#include "garnet_native_boot_pure.h"
 
 namespace amdgpu {
 

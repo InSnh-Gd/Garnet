@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
           rdna4df_t q2; rdna4df_init(&q2, 0); rdna4df_activate(&q2, 3); q2.damage = 1; int bq = rdna4df_plan_ex(&q2, fl, RDNA4DF_K_PART, part, 0, &pb); a == bq && pa.kind == pb.kind && q.head == q2.head; }));
       CHECK("R6: the pure helpers", rdna4x_kind_for(1, RDNA4DF_K_FULL, RDNA4DF_K_PART) == RDNA4DF_K_FULL && rdna4x_kind_for(0, RDNA4DF_K_FULL, RDNA4DF_K_PART) == RDNA4DF_K_PART && !rdna4x_may_chain(1) && rdna4x_may_chain(0)); }
     // ---- source pins on the glue
-    { char *m = slurp(dir, "GarnetDevice.m"), *pl = slurp(dir, "Info.plist"), *ins = slurp(dir, "../../CHANGES.md"), *abi = slurp(dir, "rdna4_scanabi.h"), *kp = slurp(dir, "../../src/garnet/src/amd/native_m6_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h"), *xh = slurp(dir, "rdna4_m6x.h");
+    { char *m = slurp(dir, "GarnetDevice.m"), *pl = slurp(dir, "Info.plist"), *ins = slurp(dir, "../../CHANGES.md"), *abi = slurp(dir, "rdna4_scanabi.h"), *kp = slurp(dir, "../../src/garnet/src/amd/garnet_multidisplay_route_pure.h"), *ka = slurp(dir, "../../src/garnet/src/GarnetNativeABI.h"), *xh = slurp(dir, "rdna4_m6x.h");
       // the state: an array over the instance numbers, one descriptor lookup
       CHECK("glue: the HDMI state is an ARRAY over the kernel instance numbers (RDNA4X.i[inst]); no singleton RDNA4X.sm / .enabled remains", strstr(m, "rdna4xi_t i[3]; } RDNA4X;") && strstr(m, "#define RDNA4XI(inst) (RDNA4X.i[(inst)])") && !strstr(m, "RDNA4X.sm") && !strstr(m, "RDNA4X.enabled") && !strstr(m, "RDNA4X.xs") && !strstr(m, "RDNA4X.sid") && !strstr(m, "RDNA4X.buf") && !strstr(m, "RDNA4X.mem") && !strstr(m, "RDNA4X_PLAN_MONB ? &RDNA4X"));
       // enable at bind, per instance

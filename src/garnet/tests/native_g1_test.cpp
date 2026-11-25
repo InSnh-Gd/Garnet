@@ -1,4 +1,4 @@
-// native_g1_test.cpp - kext 0.0.623 (GPU-apps stage G1: hang recovery): the pure half (amd/native_g1_pure.h) driven with a fake environment, plus
+// native_g1_test.cpp - kext 0.0.623 (GPU-apps stage G1: hang recovery): the pure half (amd/garnet_hang_recovery_pure.h) driven with a fake environment, plus
 // source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetDriver.cpp, GarnetUserClient.cpp, GarnetNativeClient.cpp, mes_v12_1.cpp) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_g1_test.cpp -o /tmp/native_g1 && /tmp/native_g1 .
@@ -25,7 +25,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include "native_g1_pure.h"
+#include "garnet_hang_recovery_pure.h"
 
 using namespace rdna4native::g1;
 
@@ -388,7 +388,7 @@ static void g9_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), hdr = slurp(K + "src/amd/native_s1c.h"), brg = slurp(K + "src/GarnetDriver.cpp"),
                       ucl = slurp(K + "src/GarnetUserClient.cpp"), ncl = slurp(K + "src/GarnetNativeClient.cpp"), mes = slurp(K + "src/amd/mes_v12_1.cpp"),
-                      mesh = slurp(K + "src/amd/amdgpu_mes.h"), plist = slurp(K + "Info.plist"), pure = slurp(K + "src/amd/native_g1_pure.h");
+                      mesh = slurp(K + "src/amd/amdgpu_mes.h"), plist = slurp(K + "Info.plist"), pure = slurp(K + "src/amd/garnet_hang_recovery_pure.h");
     expect(!eng.empty() && !brg.empty() && !ucl.empty() && !ncl.empty() && !mes.empty() && !mesh.empty() && !plist.empty() && !pure.empty(), "the sources were read");
     const std::string g1 = between(eng, "// ==== 0.0.623: GPU-apps stage G1", "\n} // namespace amdgpu");
     expect(!g1.empty(), "the G1 block exists in native_s1c.cpp");

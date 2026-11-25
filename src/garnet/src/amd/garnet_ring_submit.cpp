@@ -706,7 +706,7 @@ IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64
 }
 
 // ==== 0.0.627: GPU-apps stage G2, several sessions (boot-arg garnet-multisession=1; default OFF) =================================================
-// The pure half is native_g2_pure.h (host-tested by tests/native_g2_test.cpp). The latch and the stat verb (accel action 103 `sessstat <0..8>`).
+// The pure half is garnet_multisession_pure.h (host-tested by tests/native_g2_test.cpp). The latch and the stat verb (accel action 103 `sessstat <0..8>`).
 static volatile UInt32 gMultiLatch = rdna4native::g2::kLatchUnset;
 bool multi_on() {
     UInt32 l = gMultiLatch;
@@ -723,7 +723,7 @@ bool multi_on() {
 bool n1c_multi_latched_on() { return multi_on(); }
 
 // ==== 0.0.640: GPU-apps stage G4, ordinary user applications (boot-arg garnet-apps=1 AND garnet-multisession=1; default OFF) ====================================
-// The pure half is native_g4_pure.h (host-tested by tests/native_g4_test.cpp). The latch, the allow-list, the role mark and the verb (accel action 104 `appallow`).
+// The pure half is garnet_app_policy_pure.h (host-tested by tests/native_g4_test.cpp). The latch, the allow-list, the role mark and the verb (accel action 104 `appallow`).
 static volatile UInt32 gAppsLatch = rdna4native::g4::kLatchUnset;
 bool apps_on() {
     UInt32 l = gAppsLatch;
@@ -752,7 +752,7 @@ static bool apps_all_on() {
     return rdna4native::g4::latch_is_on(l);
 }
 // ==== 0.0.650: GPU-apps stage G5 Stage 1, the application credit (boot-arg rdna4-g5=1 AND garnet-multisession=1; default OFF) ====================================
-// The pure half is native_g5_pure.h (host-tested by tests/native_g5_test.cpp). The latches and the stat page (accel 103 `sessstat 9`).
+// The pure half is garnet_app_credit_pure.h (host-tested by tests/native_g5_test.cpp). The latches and the stat page (accel 103 `sessstat 9`).
 static volatile UInt32 gG5Latch = rdna4native::g2::kLatchUnset;
 static bool g5_on() {
     UInt32 l = gG5Latch;
@@ -916,7 +916,7 @@ IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
 }
 
 // ==== 0.0.623: GPU-apps stage G1, hang recovery (boot-arg rdna4-g1=1; default OFF) ================================================================
-// The pure half is native_g1_pure.h (decisions, plan, bounds, the run templates; host-tested by tests/native_g1_test.cpp). This is the kernel
+// The pure half is garnet_hang_recovery_pure.h (decisions, plan, bounds, the run templates; host-tested by tests/native_g1_test.cpp). This is the kernel
 // environment those templates run against. What it may touch, and nothing else:
 //   - a kernel-owned TEST CONTEXT: the ordinary native session (n1c_open: every gate, the exclusivity CAS, a fresh VMID-8 tree) that no user client
 //     owns (hello stays false, so no selector reaches it) with ONE 16 KiB visible-VRAM BO mapped R|W|X|UC at g1::kTestVa;

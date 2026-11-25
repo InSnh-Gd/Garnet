@@ -12,7 +12,7 @@
 #include "amd/native_metal_pure.h"
 #include "amd/native_s1b.h"
 #include "amd/native_s1c.h"
-#include "amd/native_g2_pure.h"
+#include "amd/garnet_multisession_pure.h"
 #include "amd/native_disp.h"         // 0.0.613: the display pipe glue (behind boot-arg garnet-metal-disp=1)
 #include "amd/native_disp_pure.h"
 #include "amd/amdgpu_log.h"
@@ -337,7 +337,7 @@ void GarnetMetalNub::hungLatched() {
 
 IOService *GarnetMetalNub::published() { return gNub; }   // 0.0.613: identity only (NOT retained)
 
-// 0.0.659 (M6): properties of the published nub that the bundle (in WindowServer) reads: the latch word and the surface table (native_m6_pure.h). false = no nub is published / no memory. Takes this file's lock only (the caller holds none of ours).
+// 0.0.659 (M6): properties of the published nub that the bundle (in WindowServer) reads: the latch word and the surface table (garnet_multidisplay_route_pure.h). false = no nub is published / no memory. Takes this file's lock only (the caller holds none of ours).
 bool GarnetMetalNub::setPublishedData(const char *key, const void *bytes, uint32_t len) {
 	if (!key || !bytes || !len || !gLock) return false;
 	OSData *d = OSData::withBytes(bytes, len);

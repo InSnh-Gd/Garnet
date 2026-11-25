@@ -1,5 +1,5 @@
 //
-//  native_g5_pure.h - the PURE half of GPU-apps stage G5 Stage 1 (kext 0.0.650): an application credit that keeps WindowServer from queuing behind app jobs
+//  garnet_app_credit_pure.h - the PURE half of GPU-apps stage G5 Stage 1 (kext 0.0.650): an application credit that keeps WindowServer from queuing behind app jobs
 //  (an internal design note, "G5 design" and "G5 Stage 1 build spec"). No kernel header is included: tests/native_g5_test.cpp compiles this file and
 //  drives the very functions the kext calls (amd/native_s1c.cpp ring_submit_app_g5, n1c_g5_stat; GarnetDriver.cpp accelExperiment).
 //
@@ -19,7 +19,7 @@
 #pragma once
 #include <stdint.h>
 
-#include "native_g2_pure.h"   // OwnerLog, kOwnerN, kOwnerKernel, kMaxSessions, latch_value; (via native_s1c_pure.h) ring_has_space, kWaitCapNs, kTimeout
+#include "garnet_multisession_pure.h"   // OwnerLog, kOwnerN, kOwnerKernel, kMaxSessions, latch_value; (via garnet_submit_pure.h) ring_has_space, kWaitCapNs, kTimeout
 
 namespace rdna4native {
 namespace g5 {

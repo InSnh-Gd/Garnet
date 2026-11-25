@@ -1,6 +1,6 @@
 /*
  * GarnetAppKey.h - kext 0.0.640 (GPU-apps stage G4; op STRIKES added in 0.0.641): the identity key of the APP allow-list and the packing of accel action 104 `appallow`. ONE plain-C header shared by the kext
- * (amd/native_g4_pure.h, GarnetNativeClient.cpp) and userspace tools, so the two sides can never disagree on how a process name becomes a key.
+ * (amd/garnet_app_policy_pure.h, GarnetNativeClient.cpp) and userspace tools, so the two sides can never disagree on how a process name becomes a key.
  *
  * WHAT IS KEYED (and what that is worth). The only identity a kext can read at IOServiceOpen time through the public KPI is proc_name(proc_selfpid()) (= proc_selfname()): the opener's p_comm, the executable's
  * base name cut to MAXCOMLEN (16) characters, set at exec. There is no KPI for the executable's path (vn_getpath needs a vnode, proc_getexecutablevnode is not in the SDK headers) and none

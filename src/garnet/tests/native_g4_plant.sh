@@ -56,8 +56,8 @@ PY
 }
 
 baseline
-P=$K/src/amd/native_g4_pure.h
-G2=$K/src/amd/native_g2_pure.h
+P=$K/src/amd/garnet_app_policy_pure.h
+G2=$K/src/amd/garnet_multisession_pure.h
 O=$K/src/amd/native_open_policy_pure.h
 E=$K/src/amd/native_s1c.cpp
 N=$K/src/GarnetNativeClient.cpp
@@ -66,7 +66,7 @@ B=$K/src/GarnetDriver.cpp
 U=$K/src/GarnetUserClient.cpp
 A=$K/src/GarnetNativeABI.h
 KEY=$K/src/GarnetAppKey.h
-G2=$K/src/amd/native_g2_pure.h
+G2=$K/src/amd/garnet_multisession_pure.h
 C=tools/rdna4/native/garnettest.c
 
 # ---- the open policy: the third role ----

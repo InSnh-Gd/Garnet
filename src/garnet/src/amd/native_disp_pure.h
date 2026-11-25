@@ -19,7 +19,7 @@
 #include "../dcn/dmubcmd.h"    // 0.0.625 (M2/M3): verbs 95..97 (the DMUB command verbs; their own latch garnet-dmubcmd)
 #include "../dcn/disp2.h"      // 0.0.631 (M4d): verb 98 disp2 (its own latch garnet-disp2)
 #include "native_fb_pure.h"          // 0.0.652 (M5): verb 105 fbpublish (its own latch garnet-fb2) and the display nub
-#include "native_m6_pure.h"          // 0.0.659 (M6 Stage 1a): the routing guard, the surface table, the per-pipe probe entries (its own latch garnet-m6)
+#include "garnet_multidisplay_route_pure.h"          // 0.0.659 (M6 Stage 1a): the routing guard, the surface table, the per-pipe probe entries (its own latch garnet-m6)
 
 namespace rdna4disp {
 
@@ -99,7 +99,7 @@ constexpr bool verb_args_ok(uint32_t action, uint64_t arg) {       // the legal 
 constexpr bool native_exempt(bool latchOn, uint32_t action, uint64_t arg) { return latchOn && verb_args_ok(action, arg); }
 // 0.0.652 (M5) INTERLOCK: with a display nub published the accelerator's display machine must never get a pipe (with garnet-metal-disp=1 its framebuffer walk starts at the GPU's PCI device, where our monitor B framebuffer lives: the bundle
 // classifies display surfaces by SIZE and the monitor B at 1440p equals the DP, so monitor B frames could be flipped onto HUBP0 = the DP). pipeadopt (83) and pipearm 1 (84 with argument 1) are refused while the nub exists. pipearm 0 (disarm) is ALWAYS allowed.
-// 0.0.659 (M6 Stage 1a, R4): with the garnet-m6 latch ON the interlock is LIFTED - the routing guard (native_m6_pure.h) replaces it: a pipe on the monitor B's framebuffer never copies into the DP and a surface mapped to another instance is never presented.
+// 0.0.659 (M6 Stage 1a, R4): with the garnet-m6 latch ON the interlock is LIFTED - the routing guard (garnet_multidisplay_route_pure.h) replaces it: a pipe on the monitor B's framebuffer never copies into the DP and a surface mapped to another instance is never presented.
 constexpr bool fb_interlock_refuses(uint32_t action, uint64_t arg, bool displayNubExists, bool m6On = false) { return !m6On && displayNubExists && (action == kActAdopt || (action == kActArm && arg == 1ull)); }
 
 // ---- the ops table the bring-up kext publishes (ABI 2 only when the latch is ON) -----------------------------------------------------------------------------

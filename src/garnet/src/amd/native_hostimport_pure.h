@@ -12,7 +12,7 @@
 #pragma once
 #include <stdint.h>
 
-#include "native_s1c_pure.h"
+#include "garnet_submit_pure.h"
 
 namespace rdna4native {
 namespace s1c {
@@ -113,7 +113,7 @@ inline uint32_t pt_map_pages(uint64_t rootPa, uint64_t va, uint64_t pages, const
 }
 
 // Scattered transaction twin of pt_map_tx: same pre-check, same snapshot/rollback contract
-// (see native_s1c_pure.h). Reuses pt_map_pages above so the walker never drifts.
+// (see garnet_submit_pure.h). Reuses pt_map_pages above so the walker never drifts.
 // Leaf validation lives only in pt_map_pages (pre-check before any alloc); the wrapper
 // adds only the VA range pre-check.
 template <class M>

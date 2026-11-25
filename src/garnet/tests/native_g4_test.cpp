@@ -1,5 +1,5 @@
 // native_g4_test.cpp - kext 0.0.640, review fixes 0.0.641 (GPU-apps stage G4: ordinary user applications as a third client role; an internal design note section 4 and the G1 / G2 reviews): the pure half
-// (amd/native_g4_pure.h, amd/native_open_policy_pure.h, GarnetAppKey.h) driven directly and through small models, plus source pins that tie the REAL kernel code
+// (amd/garnet_app_policy_pure.h, amd/native_open_policy_pure.h, GarnetAppKey.h) driven directly and through small models, plus source pins that tie the REAL kernel code
 // (amd/native_s1c.cpp, GarnetNativeClient.cpp / .hpp, GarnetDriver.cpp, GarnetUserClient.cpp, GarnetNativeABI.h, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_g4_test.cpp -o /tmp/native_g4 && /tmp/native_g4 .
@@ -28,7 +28,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
-#include "native_g4_pure.h"
+#include "garnet_app_policy_pure.h"
 
 using namespace rdna4native;
 
@@ -338,7 +338,7 @@ static void t8_pins(const std::string &root) {
     const std::string K = root + "/src/garnet/";
     const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), clih = slurp(K + "src/GarnetNativeClient.hpp");
     const std::string brg = slurp(K + "src/GarnetDriver.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp"), abi = slurp(K + "src/GarnetNativeABI.h"), plist = slurp(K + "Info.plist");
-    const std::string cmd = slurp(root + "/tools/rdna4/native/garnettest.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/native_g4_pure.h"), g2p = slurp(K + "src/amd/native_g2_pure.h");
+    const std::string cmd = slurp(root + "/tools/rdna4/native/garnettest.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/garnet_app_policy_pure.h"), g2p = slurp(K + "src/amd/garnet_multisession_pure.h");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !clih.empty() && !brg.empty() && !ucl.empty() && !abi.empty() && !plist.empty() && !cmd.empty() && !pol.empty() && !g4p.empty() && !g2p.empty(), "T8: every source is readable");
     // version and ABI
     expect(garnet_test_ver::plist_matches_version(root, plist), "T8: Info.plist matches VERSION, carried twice");
@@ -483,7 +483,7 @@ static void t9_close_path(const std::string &root) {
     expect(nOff > 0 && nFreedAfterSweep > 0 && nLeaked > 0, "T9: every branch of the model was reached");
     // the retain-count arithmetic of the real kernel path (pins)
     const std::string K = root + "/src/garnet/";
-    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g4p = slurp(K + "src/amd/native_g4_pure.h"), engh = slurp(K + "src/amd/native_s1c.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g4p = slurp(K + "src/amd/garnet_app_policy_pure.h"), engh = slurp(K + "src/amd/native_s1c.h");
     const std::string sw = fn_body(eng, "void n1c_unmap_for_close(const N1cRef &ref, IOUserClient *uc) {");
     expect(!sw.empty(), "T9: n1c_unmap_for_close is found");
     expect(in_order(sw, { "if (uc == nullptr || !apps_on()) return;", "Session *s = sess_lock(ref, false);", "rdna4native::g4::unmap_attempts(true,", "(uint32_t)vmd->getRetainCount()", "if (n != 0u) vmd->retain();",
@@ -678,7 +678,7 @@ static void t12_slots(const std::string &root) {
     expect(ws_already_open(false, true, false) && !ws_already_open(false, false, true) && ws_already_open(true, false, true) && !ws_already_open(true, true, false), "T12: alreadyOpen: any native client with apps OFF, only a WindowServer session with apps ON");
     // the real kernel
     const std::string K = root + "/src/garnet/";
-    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g2p = slurp(K + "src/amd/native_g2_pure.h");
+    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), cli = slurp(K + "src/GarnetNativeClient.cpp"), g2p = slurp(K + "src/amd/garnet_multisession_pure.h");
     expect(in_order(fn_body(eng, "IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {"), { "const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;",
                           "const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);", "if (pk.rc != kOk) {", "if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);" }),
            "T12: REACHABLE: n1c_open hands open_pick the live apps flag and the live WindowServer flag (gSessWs, written with the open itself) under gCliLock");
@@ -734,13 +734,13 @@ static void t13_strikes(const std::string &root) {
 // ---- T14 (0.0.641): wording, and the ungated remainder ----------------------------------------------------------------------------------------------------------
 static void t14_wording(const std::string &root) {
     const std::string K = root + "/src/garnet/";
-    for (const char *f : { "src/amd/native_g4_pure.h", "src/GarnetNativeClient.cpp", "src/GarnetNativeClient.hpp", "src/GarnetAppKey.h", "src/amd/native_open_policy_pure.h" }) {
+    for (const char *f : { "src/amd/garnet_app_policy_pure.h", "src/GarnetNativeClient.cpp", "src/GarnetNativeClient.hpp", "src/GarnetAppKey.h", "src/amd/native_open_policy_pure.h" }) {
         const std::string t = slurp(K + f);
         // (GarnetNativeClient.cpp keeps ONE older line from 0.0.612, the uid-88 selector refusal's log text, pinned by native_ws_open_test: not G4's, not changed)
         expect(count_of(t, "non-admin") == (std::string(f) == "src/GarnetNativeClient.cpp" ? 1u : 0u) && t.find("not an administrator") == std::string::npos, (std::string("T14: ") + f + " says non-root, not non-admin").c_str());
     }
     expect(std::strcmp(policy::open_reason_text(policy::kReasonNotPrivileged), "not root (euid != 0)") == 0, "T14: the refusal text says not root");
-    const std::string g4p = slurp(K + "src/amd/native_g4_pure.h");
+    const std::string g4p = slurp(K + "src/amd/garnet_app_policy_pure.h");
     expect(g4p.find("close_vram_return_ok and the close-time unmap sweep are keyed on apps_on()") != std::string::npos && g4p.find("BoFree / close behave as 0.0.629") == std::string::npos, "T14: the header comment says exactly what is gated");
 }
 

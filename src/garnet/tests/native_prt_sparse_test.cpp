@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "GarnetNativeABI.h"
-#include "amd/native_g2_pure.h"
+#include "amd/garnet_multisession_pure.h"
 #include "amd/native_hostimport_pure.h"
 
 using namespace rdna4native;

@@ -27,10 +27,10 @@
 #include "amd/native_disp.h"            // 0.0.613 (#11 11h.2): the display pipe glue (boot-arg garnet-metal-disp=1)
 #include "amd/native_disp_pure.h"
 #include "amd/native_agdc_pure.h"      // 0.0.614 (#11 11h.3): the native AGDC service (verb 88)
-#include "amd/native_g1_pure.h"        // 0.0.623 (GPU-apps G1): hangtest / hangrecover / hangstat (verbs 100..102, boot-arg garnet-g1=1)
-#include "amd/native_g5_pure.h"        // 0.0.650 (GPU-apps G5 Stage 1): sessstat page 9 (boot-arg garnet-g5=1)
-#include "amd/native_g2_pure.h"        // 0.0.627 (GPU-apps G2): sessstat (verb 103, boot-arg garnet-multisession=1)
-#include "amd/native_g4_pure.h"        // 0.0.640 (GPU-apps G4): appallow (verb 104, boot-args garnet-apps=1 + garnet-multisession=1)
+#include "amd/garnet_hang_recovery_pure.h"        // 0.0.623 (GPU-apps G1): hangtest / hangrecover / hangstat (verbs 100..102, boot-arg garnet-g1=1)
+#include "amd/garnet_app_credit_pure.h"        // 0.0.650 (GPU-apps G5 Stage 1): sessstat page 9 (boot-arg garnet-g5=1)
+#include "amd/garnet_multisession_pure.h"        // 0.0.627 (GPU-apps G2): sessstat (verb 103, boot-arg garnet-multisession=1)
+#include "amd/garnet_app_policy_pure.h"        // 0.0.640 (GPU-apps G4): appallow (verb 104, boot-args garnet-apps=1 + garnet-multisession=1)
 #include "dcn/fbname.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMessage.h>

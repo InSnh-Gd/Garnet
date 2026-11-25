@@ -1,6 +1,6 @@
 //
 //  native_s1b.cpp - native-stack step S1b (kext 0.0.600): the reserved-VMID VM self-test. See native_s1b.h for the shape and
-//  native_s1b_pure.h for the arithmetic (host-tested by tests/native_s1b_test.cpp, which drives the same pure functions).
+//  garnet_native_boot_pure.h for the arithmetic (host-tested by tests/native_s1b_test.cpp, which drives the same pure functions).
 //
 //  Runs ONCE, from GarnetDriver::runStages after the ladder reached stage 17 with the compute test passed, and only when
 //  rdna4-native=1 was accepted by the gate. It writes exactly: one VRAM block for a 4-level page table, one VRAM block of test

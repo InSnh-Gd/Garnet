@@ -32,7 +32,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
-#include "native_s1c_pure.h"
+#include "garnet_submit_pure.h"
 
 using namespace rdna4native;
 using namespace rdna4native::s1c;
@@ -595,7 +595,7 @@ static void u12_pins(const std::string &root) {
     const std::string src = root + "/src/garnet/src/";
     const std::string eng = garnet_test_ver::read_native_engine(src + "amd"), cli = slurp(src + "GarnetNativeClient.cpp"), boot = slurp(src + "GarnetDriver.cpp"),
                       uc = slurp(src + "GarnetUserClient.cpp"), mk = slurp(root + "/src/garnet/Makefile"), plist = slurp(root + "/src/garnet/Info.plist"),
-                      pure = slurp(src + "amd/native_s1c_pure.h"), abi = slurp(src + "GarnetNativeABI.h");
+                      pure = slurp(src + "amd/garnet_submit_pure.h"), abi = slurp(src + "GarnetNativeABI.h");
     expect(!eng.empty() && !cli.empty() && !boot.empty() && !uc.empty() && !mk.empty() && !plist.empty() && !pure.empty() && !abi.empty(), "the sources are readable");
     // gate order in n1c_open: the ladder, the S1b gate, HUNG, then exclusivity
     const size_t g1 = eng.find("ctx.reached != BringupStage::ComputeDispatch"), g2 = eng.find("s1b.gate != kGateOn || !s1b.ran || !s1b.positivePass || s1b.stopped"),

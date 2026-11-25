@@ -1,5 +1,5 @@
 //
-//  native_m6_pure.h - the pure half of M6 Stage 1a (kext 0.0.659, an internal design note "M6 study: all three displays GPU-composited in one boot", sections 1, 3 and 4 "Stage 1a"):
+//  garnet_multidisplay_route_pure.h - the pure half of M6 Stage 1a (kext 0.0.659, an internal design note "M6 study: all three displays GPU-composited in one boot", sections 1, 3 and 4 "Stage 1a"):
 //  every DECISION that lets the display pipe serve MORE THAN ONE framebuffer, judged from arguments alone. No kernel header: tests/native_disp_test.cpp (section N) compiles this very file through
 //  amd/native_disp_flow.h and drives it, with planted breaks (tests/native_m6_plant.sh).
 //

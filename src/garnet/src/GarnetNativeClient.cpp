@@ -17,7 +17,7 @@
 #include <sys/kauth.h>        // kauth_cred_get / kauth_cred_getuid: the opening thread's credential
 #include <kern/task.h>         // current_task (selector 21: only a thread of the owning task may import)
 #include <sys/proc.h>          // 0.0.640 (G4): proc_name / proc_selfpid - the opener's executable name for the APP allow-list
-#include "amd/native_g4_pure.h"   // 0.0.641: kLogPerSec, ws_already_open (g2) via g4
+#include "amd/garnet_app_policy_pure.h"   // 0.0.641: kLogPerSec, ws_already_open (g2) via g4
 #include "GarnetAppKey.h"      // 0.0.640 (G4): rdna4a_comm_key (shared with tools/rdna4/native/garnettest.c)
 
 #define NCLOG(fmt, ...) AMDGPU_LOG("native-s1c", fmt, ##__VA_ARGS__)

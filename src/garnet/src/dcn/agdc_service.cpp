@@ -5,7 +5,7 @@
 #include "../amd/native_agdc_flow.h"
 #include "../amd/native_disp.h"
 #include "../amd/native_display_identity.h"
-#include "../amd/native_m6_pure.h"
+#include "../amd/garnet_multidisplay_route_pure.h"
 #include "../amd/rdna4_log.h"
 
 #include <IOKit/IOLib.h>
