@@ -179,6 +179,55 @@ int main(int argc, const char *argv[]) {
         require(memoryReads == 6 + snapshots.count && identityReads == 6 + snapshots.count &&
             registryIDReads == 6 + snapshots.count && profileReads == 13,
             "device profile properties were reread or did not use the accelerator registry identity");
+        /* RX 9060 XT 8GB memory snapshot & argument-limit host-fact pool regression (simulated). */
+        const uint64_t phys8g = UINT64_C(8112) << 20;
+        const uint64_t pool8g = UINT64_C(7288) << 20;
+        const uint64_t budget8g = UINT64_C(6100) << 20;
+        NSDictionary *mem8gFull = @{ @"version": @1, @"physical": @(phys8g), @"pool": @(pool8g),
+            @"visible": @(UINT64_C(7224) << 20), @"applicationBudget": @(budget8g),
+            @"maxBuffer": @0xfffffffcull };
+        NSMutableDictionary *mem8gComposite = [mem8gFull mutableCopy];
+        mem8gComposite[@"compositeMaxBuffer"] = @(UINT64_C(7224) << 20);
+        NSMutableDictionary *mem8gSmallBar = [mem8gFull mutableCopy];
+        mem8gSmallBar[@"visible"] = @(UINT64_C(217) << 20);
+        NSArray *snapshots8g = @[mem8gFull, mem8gComposite, mem8gSmallBar];
+        for (NSUInteger i = 0; i < snapshots8g.count; i++) {
+            identityMemory = (__bridge CFTypeRef)snapshots8g[i];
+            atomic_store(&rdna4_caps_ready, 0);
+            id device8g = [[GarnetDevice alloc] initWithAcceleratorPort:0x42];
+            require(device8g != nil, "8GB memory snapshot affected accelerator admission");
+            uint64_t wantMaxBuf = (i == 1) ? (UINT64_C(7224) << 20) : 0xfffffffcull;
+            require([device8g maxBufferLength] == wantMaxBuf,
+                "8GB pre-open buffer limit mismatch");
+            require([device8g recommendedMaxWorkingSetSize] == budget8g,
+                "8GB pre-open working set recommendation mismatch");
+            require(!RDNA4R.tried, "querying 8GB native memory opened RADV");
+        }
+        rdna4dc_native_memory native8g = {
+            .version = RDNA4DC_MEMORY_CAPS_VERSION,
+            .physical = phys8g,
+            .pool = pool8g,
+            .visible = UINT64_C(7224) << 20,
+            .application_budget = budget8g,
+            .max_buffer = 0xfffffffcull,
+        };
+        rdna4_radv_darwin_host_facts_v1 facts8g;
+        const rdna4_radv_darwin_host_facts_v1 *factsPtr8g =
+            rdna4_argument_limit_host_facts(&native8g, &facts8g);
+        require(factsPtr8g == &facts8g &&
+                facts8g.valid_flags == RDNA4_RADV_DARWIN_FACT_VRAM_BYTES &&
+                facts8g.vram_bytes == native8g.pool &&
+                facts8g.vram_bytes != native8g.physical,
+                "8GB argument-limit host facts must report usable pool rather than raw physical");
+        rdna4dc_native_memory nativeBad = native8g;
+        nativeBad.pool = 0;
+        require(rdna4_argument_limit_host_facts(&nativeBad, &facts8g) == NULL &&
+                rdna4_argument_limit_host_facts(NULL, &facts8g) == NULL,
+                "invalid native memory produces NULL argument-limit host facts");
+        require(memoryReads == 6 + snapshots.count + snapshots8g.count &&
+            identityReads == 6 + snapshots.count + snapshots8g.count &&
+            registryIDReads == 6 + snapshots.count + snapshots8g.count,
+            "8GB snapshot checks read unexpected property count");
         method_setImplementation(base, original);
         CFRelease(data);
         puts("DEVICE_PROFILE_PASS vendor=AMD registryID=accelerator PCIe=Slot-1 Gen5x16=63015384615");

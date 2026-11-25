@@ -89,20 +89,27 @@ static const char *rdna4_argument_limit_state_name(rdna4_argument_limit_state st
     }
 }
 
+static const rdna4_radv_darwin_host_facts_v1 *rdna4_argument_limit_host_facts(
+    const rdna4dc_native_memory *nativeMemory,
+    rdna4_radv_darwin_host_facts_v1 *facts) {
+    memset(facts, 0, sizeof(*facts));
+    facts->struct_size = sizeof(*facts);
+    if (!rdna4dc_native_memory_valid(nativeMemory) || !nativeMemory->pool)
+        return NULL;
+    /* Match RADV full-open vram.total_heap_size (visible + high pool, not raw physical). */
+    facts->valid_flags = RDNA4_RADV_DARWIN_FACT_VRAM_BYTES;
+    facts->vram_bytes = nativeMemory->pool;
+    return facts;
+}
+
 static void rdna4_argument_limit_prepare(const rdna4dc_native_memory *nativeMemory) {
     dispatch_once(&rdna4_argument_limit_once, ^{
         NSString *path = [[[NSBundle bundleForClass:[GarnetDevice class]] resourcePath]
             stringByAppendingPathComponent:@"libvulkan_radeon.dylib"];
         rdna4_argument_limit_policy policy = rdna4_argument_limit_default_policy();
         rdna4_radv_darwin_host_facts_v1 facts;
-        memset(&facts, 0, sizeof(facts));
-        facts.struct_size = sizeof(facts);
-        const rdna4_radv_darwin_host_facts_v1 *factsInput = NULL;
-        if (rdna4dc_native_memory_valid(nativeMemory) && nativeMemory->physical) {
-            facts.valid_flags = RDNA4_RADV_DARWIN_FACT_VRAM_BYTES;
-            facts.vram_bytes = nativeMemory->physical;
-            factsInput = &facts;
-        }
+        const rdna4_radv_darwin_host_facts_v1 *factsInput =
+            rdna4_argument_limit_host_facts(nativeMemory, &facts);
         rdna4_argument_limit_result result = rdna4_argument_limit_snapshot_init_from_path(
             &RDNA4ALS, path.fileSystemRepresentation, factsInput, &policy);
         RDNA4LOG("argument limits: source %s (result %d), export=%u ABI=%u struct=%u flags=0x%x valid=0x%x identity='%s' path='%s'%s%s",

@@ -490,7 +490,7 @@ static void test_missing_and_malformed(void) {
     memset(&facts, 0, sizeof(facts));
     facts.struct_size = sizeof(facts);
     facts.valid_flags = RDNA4_RADV_DARWIN_FACT_VRAM_BYTES;
-    facts.vram_bytes = 8u << 30;
+    facts.vram_bytes = UINT64_C(8) << 30;
     fake_export_raw = valid_raw(0);
     memset(&snapshot, 0, sizeof(snapshot));
     require(rdna4_argument_limit_snapshot_init_from_export(
@@ -531,7 +531,7 @@ static void test_crosscheck(void) {
     facts.vendor_id = 0x1002;
     facts.device_id = 0x7590;
     facts.gc_version = 0x0c0000;
-    facts.vram_bytes = 8u << 30;
+    facts.vram_bytes = UINT64_C(8) << 30;
     memset(&snapshot, 0, sizeof(snapshot));
     require(rdna4_argument_limit_snapshot_init_from_export(
                 &snapshot, fake_export, &facts, NULL) ==
@@ -689,12 +689,81 @@ static void test_source_identity(void) {
     unlink(path);
 }
 
+static int fake_export_from_vram_fact(
+    const rdna4_radv_darwin_host_facts_v1 *facts,
+    rdna4_radv_darwin_argument_limits_v1 *out) {
+    ++fake_export_calls;
+    if (!facts || facts->struct_size != sizeof(*facts) ||
+        !(facts->valid_flags & RDNA4_RADV_DARWIN_FACT_VRAM_BYTES) ||
+        !facts->vram_bytes)
+        return -EINVAL;
+    const uint64_t align = UINT64_C(256) << 20;
+    if (facts->vram_bytes > UINT64_MAX - (align - 1)) return -EINVAL;
+    const uint64_t fixed = (facts->vram_bytes + align - 1) & ~(align - 1);
+    const uint64_t ceiling = UINT64_C(8) << 30;
+    const uint64_t limit = fixed < ceiling ? fixed : ceiling;
+    *out = valid_raw(1);
+    out->max_memory_allocation_size = limit;
+    out->max_buffer_size = limit;
+    return 0;
+}
+
+static void test_8gb_pool_crosscheck(void) {
+    const uint64_t pool_8g = UINT64_C(7288) << 20;
+    const uint64_t phys_8g = UINT64_C(8112) << 20;
+    const uint64_t aligned_pool_8g = UINT64_C(7424) << 20;
+
+    rdna4_radv_darwin_host_facts_v1 facts;
+    memset(&facts, 0, sizeof(facts));
+    facts.struct_size = sizeof(facts);
+    facts.valid_flags = RDNA4_RADV_DARWIN_FACT_VENDOR_ID |
+                        RDNA4_RADV_DARWIN_FACT_DEVICE_ID |
+                        RDNA4_RADV_DARWIN_FACT_GC_VERSION |
+                        RDNA4_RADV_DARWIN_FACT_VRAM_BYTES;
+    facts.vendor_id = 0x1002;
+    facts.device_id = 0x7590;
+    facts.gc_version = 0x0c0000;
+
+    /* RADV full-open calculates limits from vram_vis_total + vram_hi_total (pool). */
+    facts.vram_bytes = pool_8g;
+    rdna4_argument_limit_snapshot pool_snap;
+    memset(&pool_snap, 0, sizeof(pool_snap));
+    require(rdna4_argument_limit_snapshot_init_from_export(
+                &pool_snap, fake_export_from_vram_fact, &facts, NULL) ==
+                RDNA4_ARGUMENT_LIMIT_RESULT_OK &&
+                pool_snap.raw.max_memory_allocation_size == aligned_pool_8g &&
+                pool_snap.raw.max_buffer_size == aligned_pool_8g,
+            "8GB pool fact rounds up to 7424 MiB");
+
+    rdna4_argument_limit_open_observation full_open =
+        observation_from_raw(&pool_snap.raw);
+    full_open.max_memory_allocation_size = aligned_pool_8g;
+    full_open.max_buffer_size = aligned_pool_8g;
+    require(rdna4_argument_limit_snapshot_crosscheck(&pool_snap, &full_open) ==
+                RDNA4_ARGUMENT_LIMIT_RESULT_OK,
+            "8GB pool pre-open snapshot matches full RADV open");
+
+    /* Old bug: passing physical (~8112 MiB -> 8 GiB) mismatches full-open pool (7424 MiB). */
+    facts.vram_bytes = phys_8g;
+    rdna4_argument_limit_snapshot phys_snap;
+    memset(&phys_snap, 0, sizeof(phys_snap));
+    require(rdna4_argument_limit_snapshot_init_from_export(
+                &phys_snap, fake_export_from_vram_fact, &facts, NULL) ==
+                RDNA4_ARGUMENT_LIMIT_RESULT_OK &&
+                phys_snap.raw.max_memory_allocation_size == (UINT64_C(8) << 30),
+            "8GB raw physical rounds up to 8 GiB");
+    require(rdna4_argument_limit_snapshot_crosscheck(&phys_snap, &full_open) ==
+                RDNA4_ARGUMENT_LIMIT_RESULT_CROSSCHECK_LIMIT_MISMATCH,
+            "8GB raw physical snapshot mismatches full-open pool limit");
+}
+
 int main(int argc, char **argv) {
     test_sizes_and_plan();
     test_admission();
     test_reservation_arithmetic();
     test_missing_and_malformed();
     test_crosscheck();
+    test_8gb_pool_crosscheck();
     test_source_identity();
 
     if (argc == 2) {
