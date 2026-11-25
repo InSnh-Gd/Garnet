@@ -175,6 +175,17 @@ def main() -> int:
           and "rdna4AcquireRenderScratch:" in cmd_m
           and "rdna4AcquireResourceBindings:" in cmd_m)
 
+    # --- Wave 8: Active-scanout WindowServer pipelining + texture-dirty gating ---
+    dc_h = read(GM / "garnet_drawcache.h")
+    check("W8A: WindowServer commitAndWaitUntilSubmitted pipelines when RDNA4DF_ACTIVE owns scanout (keeps wait on fallback/dlate/override)",
+          "garnet_qp_ws_needs_completion_wait(" in qp_h
+          and "garnet_qp_ws_needs_completion_wait(" in cmd_m
+          and "scanoutActive = (RDNA4S.sm.state == RDNA4DF_ACTIVE);" in cmd_m)
+    check("W8B: texture dirty bits gate rdna4EachTex: on buffer/bytes-only draws",
+          "GARNET_DRAW_DIRTY_FTEX" in dc_h
+          and "rdna4dc_stage_needs_tex(" in dc_h
+          and "rdna4dc_stage_needs_tex(" in cmd_m)
+
     print(f"test-160fps-contracts: {checks} checks, {fails} failed")
     return 1 if fails else 0
 

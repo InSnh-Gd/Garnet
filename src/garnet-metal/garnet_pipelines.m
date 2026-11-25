@@ -95,6 +95,8 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     out->hasAddrReg = _hasAddressRegistry ? 1u : 0u;
     out->pushStage[0] = _pushStage[0];
     out->pushStage[1] = _pushStage[1];
+    out->hasEmbeddedTex[0] = _hasEmbeddedTex[0];
+    out->hasEmbeddedTex[1] = _hasEmbeddedTex[1];
 }
 - (RDNA4RenderPipelineState *)rdna4Real { uintptr_t p = rdna4hs_load(&_realp); return p ? (__bridge RDNA4RenderPipelineState *)(void *)p : nil; }
 // Runs on the watcher queue. Builds a complete NEW pipeline object from the recorded descriptor (no fallback allowed, no AIR dump) and publishes it.
@@ -508,6 +510,14 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         if (err) *err = le; free(rv); free(rf); return nil; }
     _pushStage[0] = pushV ? 1u : 0u;
     _pushStage[1] = pushF ? 1u : 0u;
+    for (uint32_t i = 0; i < _npbV; i++)
+        if (_pbV[i].embedded && (_pbV[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || _pbV[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                                 _pbV[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || _pbV[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER))
+            _hasEmbeddedTex[0] = 1u;
+    for (uint32_t i = 0; i < _npbF; i++)
+        if (_pbF[i].embedded && (_pbF[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || _pbF[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                                 _pbF[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || _pbF[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER))
+            _hasEmbeddedTex[1] = 1u;
     if (!rdna4_argument_table_stages_compatible(mv_, mf_)) {
         if (err) *err = rdna4_err(49,
             @"vertex and fragment GPU argument tables use different ABI tails");

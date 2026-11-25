@@ -90,4 +90,16 @@ static inline uint64_t garnet_qp_final_defer_ns(int is_ws, int has_disp_copy_vk,
     return (elapsed < win) ? (win - elapsed) : 0u;
 }
 
+// Active scanout flip (RDNA4DF_ACTIVE) publishes frames asynchronously from the GPU
+// fence completion handler on the single FIFO Vulkan queue, so WindowServer's
+// commitAndWaitUntilSubmitted only needs waitUntilCompleted in fallback/non-active
+// scanout mode, on slotless late copies, or when forced via ws_completion_all.
+static inline int garnet_qp_ws_needs_completion_wait(int is_ws, int no_ws_completion,
+                                                     int ws_completion_all, int is_frame,
+                                                     int scanout_active, int dlate) {
+    if (!is_ws || no_ws_completion) return 0;
+    if (ws_completion_all) return 1;
+    return is_frame && (!scanout_active || dlate);
+}
+
 #endif

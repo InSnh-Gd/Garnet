@@ -169,6 +169,11 @@ int main(void) {
           rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 1, 0, 1) == 0 &&
           rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 0, 1, 1) == 0 &&
           rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 0, 0, 0) == 0, "gated");
+    CHECK("tex walk skipped on buffer/bytes-only dirty unless embedded textures exist",
+          rdna4dc_stage_needs_tex(GARNET_DRAW_DIRTY_FSTAGE, GARNET_DRAW_DIRTY_FTEX, GARNET_DRAW_DIRTY_FSTAGE, 0) == 0 &&
+          rdna4dc_stage_needs_tex(GARNET_DRAW_DIRTY_FSTAGE, GARNET_DRAW_DIRTY_FTEX, GARNET_DRAW_DIRTY_FSTAGE, 1) == 1 &&
+          rdna4dc_stage_needs_tex(GARNET_DRAW_DIRTY_FTEX, GARNET_DRAW_DIRTY_FTEX, GARNET_DRAW_DIRTY_FSTAGE, 0) == 1 &&
+          rdna4dc_stage_needs_tex(GARNET_DRAW_DIRTY_PASS, GARNET_DRAW_DIRTY_VTEX, GARNET_DRAW_DIRTY_VSTAGE, 0) == 1, "tex gated");
 
     printf("%s: %d failure(s)\n", fails ? "FAILED" : "all passed", fails);
     return fails != 0;

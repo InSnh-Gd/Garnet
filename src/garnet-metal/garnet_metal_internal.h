@@ -898,6 +898,7 @@ typedef struct {
     uint32_t sampleCount, maxAmp, drawBits, fetchMax;
     uint8_t hasFrag, hasDS, hasDepth, fetch, isFallback, isTess, isMesh, hasAddrReg;
     uint8_t pushStage[2];
+    uint8_t hasEmbeddedTex[2];
 } RDNA4RenderPSOFast;
 
 @interface RDNA4Texture : _MTLResource {
@@ -1268,6 +1269,7 @@ typedef struct {
     rdna4rtr_reflection_t _rtV, _rtF;
     BOOL _hasAddressRegistry;
     uint8_t _pushStage[2];
+    uint8_t _hasEmbeddedTex[2];
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;

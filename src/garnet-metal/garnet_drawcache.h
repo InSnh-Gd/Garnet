@@ -20,11 +20,19 @@
 #define GARNET_DRAW_DIRTY_FSTAGE (1u << 2)
 #define GARNET_DRAW_DIRTY_VB     (1u << 3)
 #define GARNET_DRAW_DIRTY_PASS   (1u << 4)
+#define GARNET_DRAW_DIRTY_VTEX   (1u << 5)
+#define GARNET_DRAW_DIRTY_FTEX   (1u << 6)
 #define GARNET_DRAW_DIRTY_ALL    (GARNET_DRAW_DIRTY_PIPE | GARNET_DRAW_DIRTY_VSTAGE | \
-                                  GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_VB | GARNET_DRAW_DIRTY_PASS)
+                                  GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_VB | \
+                                  GARNET_DRAW_DIRTY_PASS | GARNET_DRAW_DIRTY_VTEX | GARNET_DRAW_DIRTY_FTEX)
 
 static inline int rdna4dc_stage_can_skip(int valid, uint32_t draw_dirty, uint32_t stage_bit, int need_arg_prep) {
     return valid && !need_arg_prep && (draw_dirty & (stage_bit | GARNET_DRAW_DIRTY_PASS)) == 0u;
+}
+static inline int rdna4dc_stage_needs_tex(uint32_t draw_dirty, uint32_t tex_bit,
+                                          uint32_t stage_bit, int has_embedded_tex) {
+    if (draw_dirty & (tex_bit | GARNET_DRAW_DIRTY_PASS)) return 1;
+    return has_embedded_tex && (draw_dirty & stage_bit) != 0u;
 }
 static inline int rdna4dc_clean_draw_ready(int clean_fast_ok, uint32_t draw_dirty, uint32_t dyn_dirty,
                                            int topo_same, int in_pass, int has_err, int has_arg_writes,

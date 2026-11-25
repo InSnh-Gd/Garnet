@@ -1260,8 +1260,15 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     const RDNA4CBKillFlags kf = ws ? rdna4_cb_kill_flags() : (RDNA4CBKillFlags){0};
     __atomic_store_n(&_syncCommit, YES, __ATOMIC_RELEASE);
     [self commit];
-    if (ws && !kf.noWsCompletion &&
-        ([self rdna4IsFrame] || kf.wsCompletionAll)) {
+    BOOL scanoutActive = NO;
+    if (ws && !kf.noWsCompletion && !kf.wsCompletionAll && [self rdna4IsFrame]) {
+        pthread_mutex_lock(&RDNA4S.mu);
+        scanoutActive = (RDNA4S.sm.state == RDNA4DF_ACTIVE);
+        pthread_mutex_unlock(&RDNA4S.mu);
+    }
+    if (garnet_qp_ws_needs_completion_wait(ws ? 1 : 0, kf.noWsCompletion ? 1 : 0,
+                                           kf.wsCompletionAll ? 1 : 0, [self rdna4IsFrame] ? 1 : 0,
+                                           scanoutActive ? 1 : 0, _dlate ? 1 : 0)) {
         RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: waiting for GPU completion on display frames");
         // A display frame's completion wait is on WindowServer's frame path: when it
         // takes long, the picture on the monitor stops changing for exactly that long.
@@ -1274,7 +1281,9 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
                                             (double)waited / 1e6, (unsigned long long)_cbid, (unsigned long)_segments.count,
                                             (unsigned long)[self status]);
     } else {
-        if (ws && kf.noWsCompletion)
+        if (ws && scanoutActive && !kf.noWsCompletion)
+            RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: active scanout flip owns presentation; pipelining via waitUntilScheduled");
+        else if (ws && kf.noWsCompletion)
             RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: completion wait disabled");
         [self waitUntilScheduled];
     }
@@ -4596,7 +4605,8 @@ RDNA4_DNR(RDNA4RenderEncoder)
     sc->sf.scanPlan = [_pso scanPlanF];
     sc->sv.rtAsRefl = [_pso rdna4RtAsReflV];
     sc->sf.rtAsRefl = [_pso rdna4RtAsReflF];
-    _drawDirty |= GARNET_DRAW_DIRTY_PIPE | GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_VB;
+    _drawDirty |= GARNET_DRAW_DIRTY_PIPE | GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_FSTAGE |
+                  GARNET_DRAW_DIRTY_VB | GARNET_DRAW_DIRTY_VTEX | GARNET_DRAW_DIRTY_FTEX;
     _cleanFastOk = NO;
     [self rdna4OwnResource:pso kind:RDNA4_RESOURCE_PIPELINE
                   fragment:NO index:0];
@@ -4775,7 +4785,8 @@ RDNA4_ENCODER_SHARED
     if (i >= 128) { [_cb rdna4Fail:@"texture index >= 128"]; return; }
     if (t && ![t isKindOfClass:[RDNA4Texture class]]) { [_cb rdna4Fail:@"setTexture: not an RDNA4Texture"]; return; }
     rdna4_stage_set_tex([self rdna4Stage:f], i, t);
-    _drawDirty |= f ? GARNET_DRAW_DIRTY_FSTAGE : GARNET_DRAW_DIRTY_VSTAGE;
+    _drawDirty |= f ? (GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_FTEX)
+                    : (GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VTEX);
     _cleanFastOk = NO;
     [self rdna4OwnResource:t kind:RDNA4_RESOURCE_TEXTURE fragment:f index:i];
 }
@@ -5151,9 +5162,9 @@ RDNA4_ENCODER_SHARED
         [_cb rdna4Fail:[NSString stringWithFormat:@"vertex buffer at index %u is read by the vertex descriptor but never bound", need[i]]]; return NO; }
     id dev = [_cb device];
     if (_dcOn) {   // P5b item 5: the same visit as rdna4_each_tex, as a plain loop (no block capture on the hot path)
-        if (_psoFast.npbV && (_drawDirty & (GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_PASS)))
+        if (_psoFast.npbV && rdna4dc_stage_needs_tex(_drawDirty, GARNET_DRAW_DIRTY_VTEX, GARNET_DRAW_DIRTY_VSTAGE, _psoFast.hasEmbeddedTex[0]))
             [self rdna4EachTex:_psoFast.pbV n:_psoFast.npbV state:&sc->sv dev:dev];
-        if (hasFrag && _psoFast.npbF && (_drawDirty & (GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_PASS)))
+        if (hasFrag && _psoFast.npbF && rdna4dc_stage_needs_tex(_drawDirty, GARNET_DRAW_DIRTY_FTEX, GARNET_DRAW_DIRTY_FSTAGE, _psoFast.hasEmbeddedTex[1]))
             [self rdna4EachTex:_psoFast.pbF n:_psoFast.npbF state:&sc->sf dev:dev];
     } else {
         void (^needTex)(RDNA4Texture *, VkImageLayout, BOOL) = ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {

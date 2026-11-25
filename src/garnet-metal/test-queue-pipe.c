@@ -150,6 +150,18 @@ int main(void) {
           garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 1, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
           garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 1, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL);
 
+    // 8. Active-scanout WindowServer commitAndWaitUntilSubmitted wait policy
+    CHECK("ws wait: non-WS and no_ws_completion never wait for completion",
+          garnet_qp_ws_needs_completion_wait(0, 0, 1, 1, 0, 1) == 0 &&
+          garnet_qp_ws_needs_completion_wait(1, 1, 1, 1, 0, 1) == 0);
+    CHECK("ws wait: fallback/non-active scanout keeps waitUntilCompleted on frames",
+          garnet_qp_ws_needs_completion_wait(1, 0, 0, 1, 0, 0) == 1 &&
+          garnet_qp_ws_needs_completion_wait(1, 0, 0, 0, 0, 0) == 0);
+    CHECK("ws wait: active scanout skips waitUntilCompleted unless dlate or ws_completion_all",
+          garnet_qp_ws_needs_completion_wait(1, 0, 0, 1, 1, 0) == 0 &&
+          garnet_qp_ws_needs_completion_wait(1, 0, 0, 1, 1, 1) == 1 &&
+          garnet_qp_ws_needs_completion_wait(1, 0, 1, 0, 1, 0) == 1);
+
     printf("test-queue-pipe: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
