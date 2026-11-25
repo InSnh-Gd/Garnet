@@ -25,7 +25,7 @@ PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
 TLB83_ARGS := $(SRC)/amd/gmc_v12_0.cpp $(SRC)/amd/amdgpu_regs.h $(SRC)/GarnetDriver.cpp $(SRC)/amd
 TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_v14_0.cpp \
   sdma_v7_0.cpp amdgpu_init.cpp amdgpu_gart.cpp mes_v12_1.cpp cp_v12_0.cpp rlc_v12_0.cpp compute_test.cpp)
-SCANOUT_FULL_ARGS := $(SRC)/dcn/scanout_sdma.cpp $(SRC)/dcn/dcn.cpp $(SRC)/GarnetUserClient.cpp
+SCANOUT_FULL_ARGS := $(SRC)/dcn/garnet_sdma_fastcopy.cpp $(SRC)/dcn/dcn.cpp $(SRC)/GarnetUserClient.cpp
 
 all: $(TESTS) $(PRT_SPARSE_TEST)
 	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST),$(TESTS)); do "$$test"; done

@@ -538,8 +538,11 @@ static void t10_glue(const char *dpgP, const char *bupP, const char *ahhP, const
         const std::string bupS(bupP);
         const size_t pos = bupS.rfind("/GarnetDriver.cpp");
         if (pos != std::string::npos) {
-            const std::string sdma = slurp((bupS.substr(0, pos) + "/dcn/scanout_sdma.cpp").c_str());
-            if (!sdma.empty()) { b += "\n"; b += sdma; }
+            const std::string dcnDir = bupS.substr(0, pos) + "/dcn/";
+            for (const char *f : { "garnet_sdma_fastcopy.cpp", "garnet_scanout_control.cpp", "garnet_flipmode.cpp" }) {
+                const std::string part = slurp((dcnDir + f).c_str());
+                if (!part.empty()) { b += "\n"; b += part; }
+            }
         }
     }
     const std::string d = dpgP ? slurp(dpgP) : std::string();
@@ -564,7 +567,7 @@ static void t10_glue(const char *dpgP, const char *bupP, const char *ahhP, const
         std::printf("note: retired DisplayPipeGuard source absent, skipping dpg_perform pins\n");
     }
     // the switch: OFF at boot, ON in one place, only after a successful engage
-    expect_u("T10 flip mode is OFF at boot (gFm zero-initialised)", count(b, "static rdna4_fm  gFm {};"), 1u);
+    expect_u("T10 flip mode is OFF at boot (gFm zero-initialised)", count(b, "\nrdna4_fm  gFm {};"), 1u);
     expect_u("T10 gFm.on is set to 1 in exactly one place, after a successful engage",
              count(b, "__atomic_store_n(&gFm.on, 1u") == 1u && count(b, "gFm.on = 1") == 0u &&
              count(b, "else if (fm_engage_locked(true) != 0u) { st = 12u;") == 1u &&
@@ -620,7 +623,7 @@ static void t10_glue(const char *dpgP, const char *bupP, const char *ahhP, const
     expect_u("T10 the content read / FNV (3) and the thumbnail (4) read the displayed buffer, before either reads",
              count(sc, rd) == 1u && count(sc, "			fbOff = rd;\n") == 1u && at(sc, rd) < at(sc, "		if (mode == 3) {") &&
              at(sc, rd) < at(sc, "		if (mode == 4) {") && at(sc, rd) > at(sc, "		if (mode == 0) goto done;"), 1u);
-    const std::string fdo = fn_body(b, "static uint64_t fm_displayed_off(uint64_t consoleOff, uint64_t consoleLen) {");
+    const std::string fdo = fn_body(b, "uint64_t fm_displayed_off(uint64_t consoleOff, uint64_t consoleLen) {");
     expect_u("T10 fm_displayed_off answers B only when EARLIEST_INUSE names B",
              count(fdo, "return e == gFm.bMc ? gFm.bOff : consoleOff;") == 1u && count(fdo, "rdna4dcn::fmReadFront(&pending, &e)") == 1u, 1u);
     // the present-side copy goes through the two-destination plan; the flip through the bound device's exact set

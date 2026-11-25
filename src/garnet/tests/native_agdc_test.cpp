@@ -209,7 +209,7 @@ int main(int argc, char **argv) {
     // =========================================================================================================================================================
     // S. source pins on the kernel glue
     // =========================================================================================================================================================
-    const std::string dpg = slurp(K + "src/dcn/agdc_service.cpp"), brg = slurp(K + "src/GarnetDriver.cpp") + "\n" + slurp(K + "src/GarnetDriverStages.cpp") + "\n" + slurp(K + "src/GarnetDisplayGate.cpp") + "\n" + slurp(K + "src/dcn/scanout_sdma.cpp"), dcn = slurp(K + "src/dcn/dcn.cpp") + "\n" + slurp(K + "src/dcn/dcn_scanout_mt.cpp"), dcnh = slurp(K + "src/dcn/dcn.hpp"),
+    const std::string dpg = slurp(K + "src/dcn/agdc_service.cpp"), brg = slurp(K + "src/GarnetDriver.cpp") + "\n" + slurp(K + "src/GarnetDriverStages.cpp") + "\n" + slurp(K + "src/GarnetDisplayGate.cpp") + "\n" + slurp(K + "src/dcn/garnet_sdma_fastcopy.cpp") + "\n" + slurp(K + "src/dcn/garnet_scanout_control.cpp") + "\n" + slurp(K + "src/dcn/garnet_flipmode.cpp"), dcn = slurp(K + "src/dcn/dcn.cpp") + "\n" + slurp(K + "src/dcn/dcn_scanout_mt.cpp"), dcnh = slurp(K + "src/dcn/dcn.hpp"),
                       tlb = slurp(K + "src/dcn/agdc_service.hpp"), cli = slurp(root + "/tools/rdna4/native/garnettest.c"), pure = slurp(K + "src/amd/native_agdc_pure.h"), flow = slurp(K + "src/amd/native_agdc_flow.h"),
                       dglue = slurp(K + "src/amd/native_disp.cpp"), ucl = slurp(K + "src/GarnetUserClient.cpp");
     const std::string &ttl = tlb;

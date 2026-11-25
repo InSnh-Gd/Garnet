@@ -356,7 +356,15 @@ int main(int argc, char **argv)
     }
     // ================================================================ K: the kext
     {
-        const std::string top = slurp(argc > 1 ? argv[1] : nullptr);
+        const std::string top = [&]() {
+            if (argc <= 1 || !argv[1]) return std::string();
+            const std::string p(argv[1]);
+            const size_t slash = p.rfind('/');
+            const std::string dir = (slash == std::string::npos) ? std::string() : p.substr(0, slash + 1);
+            return slurp(p.c_str()) + "\n" +
+                   slurp((dir + "garnet_scanout_control.cpp").c_str()) + "\n" +
+                   slurp((dir + "garnet_flipmode.cpp").c_str());
+        }();
         const std::string dcn = slurp(argc > 2 ? argv[2] : nullptr);
         const std::string dcnHdr = (argc > 2 && argv[2]) ? [&]() {
             const std::string p(argv[2]);
@@ -365,7 +373,7 @@ int main(int argc, char **argv)
         }() : std::string();
         const std::string uc = slurp(argc > 3 ? argv[3] : nullptr);
         expect_u("K0 the three kext sources were read", !top.empty() && !dcn.empty() && !dcnHdr.empty() && !uc.empty(), 1u);
-        const std::string f = body_of(top, "static uint32_t rdna4_scanout_full(uint32_t mode, uint64_t *v) {");
+        const std::string f = body_of(top, "uint32_t rdna4_scanout_full(uint32_t mode, uint64_t *v) {");
         const std::string kk = body_of(top, "static uint32_t sf_kick(void *vc, uint64_t srcMc, uint64_t dstMc, uint32_t bytes, uint32_t fence) {");
         const std::string sb = body_of(top, "static uint32_t sf_submit(void *vc, uint64_t srcMc, uint64_t dstMc, uint32_t bytes, uint32_t fence) {");
         const std::string cf = body_of(top, "static void sf_ctx_fill(rdna4_sf_ctx *c) {");
