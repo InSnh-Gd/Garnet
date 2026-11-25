@@ -1139,12 +1139,17 @@ struct GarnetCoreTestsRunner {
         let spvPerms = (try? fm.attributesOfItem(atPath: migRoot.appendingPathComponent("private/var/tmp/garnet-spv").path)[.posixPermissions] as? Int) ?? 0
         check("Garnet xlate (01777) and spv (0755) runtime permissions applied",
               (xlatePerms & 0o7777) == 0o1777 && (spvPerms & 0o777) == 0o755)
+        let profilePath = migRoot.appendingPathComponent("Library/Application Support/Garnet/native/profile")
+        check("SystemDiskInstaller writes native activation profile",
+              (try? String(contentsOf: profilePath, encoding: .utf8)) == "native\n")
 
         // Critical #2 + Important #1 regression: uninstalling an unmigrated v0.1.0 host with
         // removeDenylist=false preserves app-denylist.txt by migrating it to Garnet/native and
         // removes stale /private/tmp/{garnet,rdna4m}-* and /private/var/tmp/{garnet,rdna4m}-* markers.
         let unmigRoot = tempRoot.appendingPathComponent("v010-uninstall-root")
         try fm.createDirectory(at: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/native"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native"), withIntermediateDirectories: true)
+        try Data("native\n".utf8).write(to: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/profile"))
         try fm.createDirectory(at: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/keep"), withIntermediateDirectories: true)
         try fm.createDirectory(at: unmigRoot.appendingPathComponent("private/tmp"), withIntermediateDirectories: true)
         try fm.createDirectory(at: unmigRoot.appendingPathComponent("private/var/tmp"), withIntermediateDirectories: true)
@@ -1171,7 +1176,8 @@ struct GarnetCoreTestsRunner {
               && fm.fileExists(atPath: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/app-denylist.txt").path)
               && ((try? String(contentsOf: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/app-denylist.txt"), encoding: .utf8)) ?? "").contains("com.example.KeepOnUninstall"))
         check("Uninstall cleans /private/tmp and /private/var/tmp garnet-* and rdna4m-* markers while preserving hardware-test backups",
-              !fm.fileExists(atPath: markerGarnetOff.path)
+              !fm.fileExists(atPath: unmigRoot.appendingPathComponent("Library/Application Support/Garnet/native/profile").path)
+              && !fm.fileExists(atPath: markerGarnetOff.path)
               && !fm.fileExists(atPath: markerLegacyOff.path)
               && !fm.fileExists(atPath: markerPcache.path)
               && (try? String(contentsOf: unmigRoot.appendingPathComponent("Library/Application Support/RDNA4/hardware-test/backups/keep/sentinel.txt"), encoding: .utf8)) == "keep-hw-bak\n")

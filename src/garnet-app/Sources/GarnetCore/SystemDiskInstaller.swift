@@ -270,6 +270,7 @@ public enum SystemDiskInstaller {
             "\(launchDaemonsDir)/com.garnet.native.plist",
             "\(launchDaemonsDir)/com.garnet.native-translate.plist",
             "\(nativeSupportDir)/MANIFEST.txt",
+            "\(nativeSupportDir)/profile",
             "\(nativeSupportDir)/variants/index.json"
         ]
         for f in nativeSupportFiles where f != "MANIFEST.txt" {
@@ -445,6 +446,9 @@ public enum SystemDiskInstaller {
             }
             let varIdxDst = env.url(forSystemPath: "\(nativeSupportDir)/variants/index.json")
             try replaceItem(from: payloadRoot.appendingPathComponent("variants/index.json"), to: varIdxDst)
+            let profileDst = env.url(forSystemPath: "\(nativeSupportDir)/profile")
+            try Data("native\n".utf8).write(to: profileDst, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: profileDst.path)
 
             // Idempotent v0.1.0 -> Garnet app-denylist migration BEFORE cleaning legacy RDNA4/native:
             // preserve existing Garnet denylist; else migrate legacy RDNA4 denylist; else seed default.
@@ -617,6 +621,7 @@ public enum SystemDiskInstaller {
         for rel in nativeSupportFiles {
             managedPaths.append("\(nativeSupportDir)/\(rel)")
         }
+        managedPaths.append("\(nativeSupportDir)/profile")
         managedPaths.append("\(nativeSupportDir)/variants/index.json")
         managedPaths.append(GarnetPaths.xlateDumpDir)
         managedPaths.append(GarnetPaths.spvCacheDir)
