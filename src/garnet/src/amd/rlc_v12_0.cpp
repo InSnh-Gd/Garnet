@@ -566,7 +566,8 @@ kern_return_t
 rlc_set_clock_gating(const DeviceContext &dev, RLCContext &rlc,
                      bool enable, bool hasSdma1)
 {
-    if (!dev.ip.isResolved(IPBlock::GC) || !rlc.bootload_complete) {
+    if (!dev.ip.isResolved(IPBlock::GC, 0) || !dev.ip.isResolved(IPBlock::GC, 1) ||
+        !rlc.bootload_complete) {
         return kIOReturnNotReady;
     }
 
@@ -593,7 +594,6 @@ rlc_set_clock_gating(const DeviceContext &dev, RLCContext &rlc,
     if (!safeAck) {
         RLC_LOG("clock_gating(%s): RLC_SAFE_MODE enter timeout (reg=%#010x)",
                 enable ? "on" : "off", RREG32(dev, regSafe));
-        WREG32(dev, regSafe, rdna4pwr::kRlcSafeModeExitVal);
         return kIOReturnTimeout;
     }
 
@@ -610,29 +610,32 @@ rlc_set_clock_gating(const DeviceContext &dev, RLCContext &rlc,
     const uint32_t nextCgcg3d = rdna4pwr::gfx12_cgcg_cgls_ctrl(preCgcg3d, enable);
     if (nextCgcg3d != preCgcg3d) WREG32(dev, regCgcg3d, nextCgcg3d);
 
+    // Match upstream gfx_v12_0.c (torvalds/linux commit 851faa888a): CP_RB_WPTR_POLL_CNTL,
+    // CP_INT_CNTL, and SDMA*_RLC_CGCG_CTRL are programmed on enable only (never cleared on disable).
     if (enable) {
         const uint32_t prePoll = RREG32(dev, regPoll);
         const uint32_t nextPoll = rdna4pwr::gfx12_cp_rb_wptr_poll_cntl(prePoll);
         if (nextPoll != prePoll) WREG32(dev, regPoll, nextPoll);
+
+        const uint32_t preCpInt = RREG32(dev, regCpInt);
+        const uint32_t nextCpInt = rdna4pwr::gfx12_cp_int_cntl_idle(preCpInt, true);
+        if (nextCpInt != preCpInt) WREG32(dev, regCpInt, nextCpInt);
+
+        const uint32_t preSdma0 = RREG32(dev, regSdma0);
+        const uint32_t nextSdma0 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma0, true);
+        if (nextSdma0 != preSdma0) WREG32(dev, regSdma0, nextSdma0);
+
+        if (hasSdma1) {
+            const uint32_t preSdma1 = RREG32(dev, regSdma1);
+            const uint32_t nextSdma1 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma1, true);
+            if (nextSdma1 != preSdma1) WREG32(dev, regSdma1, nextSdma1);
+        }
     }
 
-    const uint32_t preCpInt = RREG32(dev, regCpInt);
-    const uint32_t nextCpInt = rdna4pwr::gfx12_cp_int_cntl_idle(preCpInt, enable);
-    if (nextCpInt != preCpInt) WREG32(dev, regCpInt, nextCpInt);
-
+    // gfx_v12_0_enable_gui_idle_interrupt: toggle CP_INT_CNTL_RING0 on both enable & disable.
     const uint32_t preCpR0 = RREG32(dev, regCpR0);
     const uint32_t nextCpR0 = rdna4pwr::gfx12_cp_int_cntl_idle(preCpR0, enable);
     if (nextCpR0 != preCpR0) WREG32(dev, regCpR0, nextCpR0);
-
-    const uint32_t preSdma0 = RREG32(dev, regSdma0);
-    const uint32_t nextSdma0 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma0, enable);
-    if (nextSdma0 != preSdma0) WREG32(dev, regSdma0, nextSdma0);
-
-    if (hasSdma1) {
-        const uint32_t preSdma1 = RREG32(dev, regSdma1);
-        const uint32_t nextSdma1 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma1, enable);
-        if (nextSdma1 != preSdma1) WREG32(dev, regSdma1, nextSdma1);
-    }
 
     // 2. Exit RLC safe mode (upstream gfx_v12_0_unset_safe_mode).
     WREG32(dev, regSafe, rdna4pwr::kRlcSafeModeExitVal);

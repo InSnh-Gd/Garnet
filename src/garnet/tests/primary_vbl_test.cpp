@@ -13,7 +13,11 @@ constexpr IOReturn kIOReturnNoMemory = 3;
 constexpr IOReturn kIOReturnNotReady = 4;
 constexpr UInt32 kEnabledInterruptState = 1;
 
-struct OSObject {};
+struct OSObject {
+	int retainCount = 1;
+	void retain() { ++retainCount; }
+	void release() { --retainCount; }
+};
 struct IOLock { bool held = false; };
 void IOLockLock(IOLock *lock) { lock->held = true; }
 void IOLockUnlock(IOLock *lock) { lock->held = false; }
@@ -47,15 +51,25 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	uint64_t fVblLastHwNs = 0u;
 	uint64_t fVblTimerCount = 0u;
 	unsigned hwSyncCalls = 0u;
+	bool dispatchHeld = false;
+	unsigned drainCalls = 0u;
 	bool ensureVblTimer() { return timerAvailable; }
 	unsigned vblPeriodUs() const { return 16667; }
 	uint64_t vblNowNs() const { return fakeNowNs; }
-	bool vblHwActive() const { return hwVblAvailable && fVblHwArmed; }
+	bool vblHwActive() const { return hwVblAvailable && __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE); }
 	uint32_t vblInitialTimeoutUs() const { return rdna4vbl::initial_timer_us(vblPeriodUs(), vblHwActive()); }
 	void syncHardwareVbl(bool want) {
 		++hwSyncCalls;
-		fVblHwArmed = want && hwVblAvailable && !fStopping;
+		__atomic_store_n(&fVblHwArmed, want && hwVblAvailable && !fStopping, __ATOMIC_RELEASE);
 	}
+	void vblDispatchEnter() { dispatchHeld = true; }
+	void vblDispatchExit() { dispatchHeld = false; }
+	void vblDispatchDrain() {
+		++drainCalls;
+		// Re-entrant unregisterInside runs while dispatchHeld == true without deadlocking.
+	}
+	static void vblRetainTarget(OSObject *t) { if (t) t->retain(); }
+	static void vblReleaseTarget(OSObject *t) { if (t) t->release(); }
 	static void onVblTimer(OSObject *, IOTimerEventSource *);
 	IOReturn registerForInterruptType(IOSelect, IOFBInterruptProc, OSObject *, void *, void **);
 	IOReturn unregisterInterrupt(void *);
@@ -180,6 +194,10 @@ int main() {
 	       "stalled HW VBL falls back to timer callback at full refresh cadence");
 	expect(hwFb.setInterruptState(hwState.interrupt, 0) == kIOReturnSuccess && !hwFb.fVblHwArmed,
 	       "disabling VBL disarms hardware VBL source");
+	expect(hwFb.unregisterInterrupt(hwState.interrupt) == kIOReturnSuccess && hwFb.drainCalls == 1u,
+	       "unregisterInterrupt invokes synchronous dispatch drain barrier");
+	expect(target.retainCount == 1 && !hwFb.dispatchHeld && !framebuffer.dispatchHeld,
+	       "target retain/release and dispatch lock stay balanced across normal and re-entrant paths");
 
 	std::printf("primary_vbl_test: %d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;

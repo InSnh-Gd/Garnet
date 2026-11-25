@@ -19,6 +19,7 @@ constexpr uint32_t kNumPipes            = 4u;
 constexpr uint32_t kDetSizeMask         = 0x0000001Fu; // bits [4:0]
 constexpr uint32_t kDetCurShift         = 8u;          // bits [12:8]
 constexpr uint32_t kDetCurMask          = 0x00001F00u;
+constexpr uint32_t kCompbufCfgErrMask   = 0x80000000u; // DCHUBBUB_COMPBUF_CTRL.CONFIG_ERROR [31]
 
 constexpr uint32_t kOtgActiveMask       = 0x00010001u; // MASTER_EN[0] | CURRENT_MASTER_EN[16]
 
@@ -85,11 +86,13 @@ inline ExpandResult expand_single_pipe_det0(const Hw &hw, uint32_t targetSegs = 
 		if ((otgp & kOtgActiveMask) != 0u) { res.status = kSkippedMultiPipe; return res; }
 	}
 
-	// 2. Check CRB budget against live COMPBUF_SIZE_CURRENT and DET0_SIZE_CURRENT.
+	// 2. Check CRB budget against max(COMPBUF_SIZE, COMPBUF_SIZE_CURRENT) and DET0_SIZE_CURRENT.
 	const uint32_t compRaw = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
 	const uint32_t det0Raw = hw.rdSeg2(hw.cookie, kSeg2Det0Ctrl);
 	if (compRaw == 0xffffffffu || det0Raw == 0xffffffffu) { res.status = kIoError; return res; }
-	res.compbufCur = (compRaw & kDetCurMask) >> kDetCurShift;
+	const uint32_t compProg = compRaw & kDetSizeMask;
+	const uint32_t compCur = (compRaw & kDetCurMask) >> kDetCurShift;
+	res.compbufCur = (compProg > compCur) ? compProg : compCur;
 	res.det0Before = (det0Raw & kDetCurMask) >> kDetCurShift;
 	res.det0After = res.det0Before;
 	if (res.det0Before >= targetSegs) {
@@ -128,6 +131,11 @@ inline ExpandResult expand_single_pipe_det0(const Hw &hw, uint32_t targetSegs = 
 		const uint32_t after = hw.rdSeg2(hw.cookie, kSeg2Det0Ctrl);
 		if (after != 0xffffffffu) res.det0After = (after & kDetCurMask) >> kDetCurShift;
 		res.status = kPollTimeout;
+		return res;
+	}
+	const uint32_t compAfter = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
+	if (compAfter == 0xffffffffu || (compAfter & kCompbufCfgErrMask) != 0u) {
+		res.status = kIoError;
 		return res;
 	}
 	res.det0After = targetSegs;

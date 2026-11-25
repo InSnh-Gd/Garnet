@@ -861,13 +861,17 @@ smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz)
 {
     if (!dev.smuOnline) return kIOReturnNotReady;
     const uint32_t param = (PPCLK::UCLK << 16) | (mhz & 0xFFFFu);
-    kern_return_t r = smu_send_msg_with_param(dev, PPSMC::SetHardMinByFreq, param, nullptr);
     if (mhz == 0u) {
+        // Clear soft-min BEFORE hard-min so a soft-min failure never drops hard-min unguarded;
+        // once hard-min clears (r == kIOReturnSuccess), return success so callers always run the underflow guard.
         kern_return_t sr = smu_send_msg_with_param(dev, PPSMC::SetSoftMinByFreq, param, nullptr);
-        SMU_LOG("uclk_unpin: SetHardMin(0) kr=0x%x, SetSoftMin(0) kr=0x%x",
-                (unsigned)r, (unsigned)sr);
-        return (r == kIOReturnSuccess) ? sr : r;
+        kern_return_t r = smu_send_msg_with_param(dev, PPSMC::SetHardMinByFreq, param, nullptr);
+        SMU_LOG("uclk_unpin: SetSoftMin(0) kr=0x%x, SetHardMin(0) kr=0x%x",
+                (unsigned)sr, (unsigned)r);
+        (void)sr;
+        return r;
     }
+    kern_return_t r = smu_send_msg_with_param(dev, PPSMC::SetHardMinByFreq, param, nullptr);
     if (r != kIOReturnSuccess) {
         kern_return_t sr = smu_send_msg_with_param(dev, PPSMC::SetSoftMinByFreq, param, nullptr);
         SMU_LOG("uclk_pin(%u MHz): SetHardMin kr=0x%x, SetSoftMin kr=0x%x",

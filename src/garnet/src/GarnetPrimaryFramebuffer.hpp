@@ -5,6 +5,7 @@
 
 #include <IOKit/IOLocks.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <kern/thread.h>
 
 #include "dcn/dcn41_cursor_pure.h"
 #include "dcn/dcn41_ddc_pad_pure.h"
@@ -90,9 +91,11 @@ private:
 	bool readLiveHardwareEdid(IOPCIDevice *pci, GarnetDriver *driver);
 	void queryClockCaps(IOPCIDevice *pci, GarnetDriver *driver);
 	void rebuildModeTable(uint32_t w, uint32_t h, uint32_t rb);
-	bool applyHardwareMode(const rdna4edidmodes::DetailedTiming &target, bool forceRetrain = false);
-	bool applyDpms(bool wantOn, GarnetDriver *knownDriver = nullptr);
-	void optimizeDet0AndUclk(GarnetDriver *driver);
+	bool applyHardwareModeLocked(const rdna4edidmodes::DetailedTiming &target,
+	                             bool forceRetrain = false,
+	                             GarnetDriver *knownDriver = nullptr);
+	bool applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver = nullptr);
+	void optimizeDet0AndUclkLocked(GarnetDriver *driver);
 	bool captureConsoleAndBar0(IOPCIDevice *pci);
 	bool ensureVblTimer();
 	void teardownVblTimer();
@@ -101,6 +104,11 @@ private:
 	bool vblHwActive() const;
 	uint32_t vblInitialTimeoutUs() const;
 	void syncHardwareVbl(bool want);
+	void vblDispatchEnter();
+	void vblDispatchExit();
+	void vblDispatchDrain();
+	static void vblRetainTarget(OSObject *target);
+	static void vblReleaseTarget(OSObject *target);
 	static void onVblTimer(OSObject *owner, IOTimerEventSource *sender);
 	void initCursorSlot(GarnetDriver *driver);
 	void teardownCursorSlot();
@@ -137,6 +145,8 @@ private:
 	bool fPeerRegistered { false };
 	uint64_t fPeerGeneration { 0u };
 	IOLock *fVblLock { nullptr };
+	IOLock *fVblDispatchLock { nullptr };
+	thread_t fVblDispatchOwner { nullptr };
 	IOWorkLoop *fVblWorkLoop { nullptr };
 	IOTimerEventSource *fVblTimer { nullptr };
 	IOFBInterruptProc fVblProc { nullptr };
@@ -167,4 +177,5 @@ private:
 	bool fCursorVisible { false };
 	bool fCursorHwAvailable { false };
 	bool fCursorNeedsProgram { false };
+	bool fCursorDpmsSuspended { false };
 };

@@ -1535,6 +1535,7 @@ void GarnetDriver::stop(IOService *provider) {
 	}
 	publishDisplayPeer(rdna4peer::kStateStopping);
 	rdna4fbname::restore_on_unload();
+	rdna4dcn::primaryVblShutdown();
 	rdna4dcn::scanShutdown();
 	GarnetDisplayNub::shutdown();
 	GarnetMetalNub::shutdown();

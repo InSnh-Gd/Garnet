@@ -55,6 +55,7 @@ uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount);
 // isolated from `accel dcnvbl` and guarded by a 1000/s rate storm guard.
 bool primaryVblIrqSet(GarnetDriver *owner, uint32_t otg, bool enable);
 bool primaryVblIrqActive();
+void primaryVblShutdown();
 
 // `accel dcnflip <n>` — T3-FLIP. 0 restore the console plane unconditionally (the escape hatch,
 // idempotent, safe at any time), 1 the minimal machine-verified flip (one frame, CRC witness,

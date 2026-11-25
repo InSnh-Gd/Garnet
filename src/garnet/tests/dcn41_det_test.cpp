@@ -150,7 +150,7 @@ int main() {
 		       "multi-pipe OTG1 active skips DET0 expansion untouched");
 	}
 
-	// 3. Budget overrun (e.g. compbufCur = 6, 6 + 9 = 15 > 13) skips safely.
+	// 3. Budget overrun (e.g. compbufCur = 6 or programmed compbuf = 6 -> 6 + 9 = 15 > 13) skips safely.
 	{
 		MockDet m;
 		m.initLiveRx9060Xt();
@@ -158,6 +158,21 @@ int main() {
 		const auto r = expand_single_pipe_det0(m.makeHw());
 		expect(r.status == kSkippedBudget && m.writeOrder.empty(),
 		       "CRB budget overrun skips DET0 expansion untouched");
+
+		m.initLiveRx9060Xt();
+		m.regs[kSeg2 + kSeg2CompbufCtrl] = 0x00040106u; // programmed=6, current=1
+		const auto rProg = expand_single_pipe_det0(m.makeHw());
+		expect(rProg.status == kSkippedBudget && m.writeOrder.empty(),
+		       "programmed COMPBUF_SIZE budget overrun skips DET0 expansion untouched");
+	}
+
+	// 3b. COMPBUF CONFIG_ERROR bit 31 after DET0 commit reports kIoError.
+	{
+		MockDet m;
+		m.initLiveRx9060Xt();
+		m.regs[kSeg2 + kSeg2CompbufCtrl] = 0x80040101u;
+		const auto r = expand_single_pipe_det0(m.makeHw());
+		expect(r.status == kIoError, "COMPBUF CONFIG_ERROR bit 31 flags kIoError");
 	}
 
 	// 4. Stalled DET2 shrink aborts BEFORE touching DET0.

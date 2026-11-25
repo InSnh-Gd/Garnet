@@ -48,6 +48,7 @@ struct MockDpms {
 	uint32_t deniedWrites = 0u;
 	uint32_t phyDisableCalls = 0u;
 	uint32_t auxFailAttempts = 0u;
+	bool sawD3BeforePhyDisable = false;
 
 	void initLive() {
 		const uint32_t db = dig * rdna4modeset::kSeg2DigStride;
@@ -148,7 +149,11 @@ struct MockDpms {
 			return static_cast<MockDpms *>(c)->wrAbs((seg == 1u ? kSeg1 : kSeg2) + off, val);
 		};
 		hw.phyControl = [](void *c, uint32_t action, uint8_t, uint8_t, uint8_t, uint8_t) -> bool {
-			if (action == 2u) static_cast<MockDpms *>(c)->phyDisableCalls++;
+			auto *m = static_cast<MockDpms *>(c);
+			if (action == 2u) {
+				m->phyDisableCalls++;
+				m->sawD3BeforePhyDisable = (m->dpcd[rdna4dpms::kDpcdSetPowerState] == rdna4dpms::kDpPowerStateD3);
+			}
 			return true;
 		};
 		hw.nowUs = [](void *c) -> uint64_t { return static_cast<MockDpms *>(c)->nowUs; };
@@ -211,6 +216,7 @@ int main() {
 	expect((mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0LinkCntl + db] & (1u << 4)) == 0u,
 	       "DP_LINK_CNTL trained bit cleared");
 	expect(mock.phyDisableCalls == 1u, "DMUB PHY disable invoked once");
+	expect(mock.sawD3BeforePhyDisable, "DPCD 0x0600=D3 written BEFORE DMUB PHY disable");
 	expect(mock.dpcd[kDpcdSetPowerState] == kDpPowerStateD3, "DPCD 0x0600 set to D3 (0x02)");
 	expect(mock.deniedWrites == 0u, "all dpmsOff writes pass DCN41 allowlist");
 

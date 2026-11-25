@@ -1185,6 +1185,15 @@ struct GarnetCoreTestsRunner {
         check("OpenCoreMode displayName uses human-readable labels",
               OpenCoreMode.full.displayName == "Full-BAR (8/16 GiB)"
               && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")
+
+        let killText = OpenCoreValidator.emergencyKillSwitchesText()
+        check("OpenCoreValidator emergencyKillSwitchesText documents all Stage 2 and Stage 3 kill-switches",
+              killText.contains("garnet-irq-wait=0")
+              && killText.contains("garnet-vbl-irq=0")
+              && killText.contains("garnet-dpms=0")
+              && killText.contains("garnet-gfx-cg=0")
+              && killText.contains("garnet-det0=0")
+              && killText.contains("garnet-uclk-pin=1"))
     }
 
     static func runOptionalReal25G332Checks() throws {

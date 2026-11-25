@@ -754,11 +754,13 @@ bool AMDGarnetPrimaryFramebuffer::readLiveHardwareEdid(IOPCIDevice *pci, GarnetD
 }
 
 __attribute__((noinline))
-bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::DetailedTiming &target,
-                                                    bool forceRetrain) {
+bool AMDGarnetPrimaryFramebuffer::applyHardwareModeLocked(const rdna4edidmodes::DetailedTiming &target,
+                                                          bool forceRetrain,
+                                                          GarnetDriver *knownDriver) {
 	if (!fPci || !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid || !fDpcdCaps.valid)
 		return false;
-	GarnetDriver *driver = retain_driver();
+	GarnetDriver *driver = knownDriver ? knownDriver : retain_driver();
+	const bool ownDriver = (knownDriver == nullptr && driver != nullptr);
 	if (!driver) {
 		RDNA4LOG("primaryfb: setDisplayMode deferred/refused: GarnetDriver not ready yet");
 		return false;
@@ -768,17 +770,17 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 	}
 	if (fMaxDispClkKhz == 0u || fMaxDppClkKhz == 0u) {
 		RDNA4LOG("primaryfb: setDisplayMode refused: SMU DAL clock caps unavailable");
-		driver->release();
+		if (ownDriver) driver->release();
 		return false;
 	}
 	auto *ctx = static_cast<ModesetCtx *>(IOMalloc(sizeof(ModesetCtx)));
 	if (!ctx) {
-		driver->release();
+		if (ownDriver) driver->release();
 		return false;
 	}
 	bzero(ctx, sizeof(*ctx));
 	if (!acquire_mmio(fPci, driver, &ctx->mmio)) {
-		driver->release();
+		if (ownDriver) driver->release();
 		IOFree(ctx, sizeof(ModesetCtx));
 		return false;
 	}
@@ -799,8 +801,9 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 	// Temporarily pin UCLK across modeset transitions so DP/OTG resync never races a GDDR6 P-state switch.
 	amdgpu::DeviceContext *smuDev = driver->deviceContext();
 	if (fUclkUnpinned && smuDev && smuDev->smuOnline) {
-		(void)amdgpu::smu_pin_uclk_top(*smuDev);
-		fUclkUnpinned = false;
+		if (amdgpu::smu_pin_uclk_top(*smuDev) == kIOReturnSuccess) {
+			fUclkUnpinned = false;
+		}
 	}
 
 	const rdna4modeset::ApplyResult r = rdna4modeset::applyMode(
@@ -864,33 +867,70 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 	}
 
 	release_mmio(ctx->mmio);
-	if (driver) driver->release();
+	if (ownDriver) driver->release();
 	IOFree(ctx, sizeof(ModesetCtx));
 	return r.status == rdna4modeset::kOk;
 }
 
 __attribute__((noinline))
-bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriver) {
-	if (!fDpmsAllowed || fStopping || !fPci || !fDpmsLock ||
+bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver) {
+	if (!fDpmsAllowed || fStopping || !fPci ||
 	    !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid) {
 		return false;
 	}
-	IOLockLock(fDpmsLock);
-	if (wantOn && !fDpmsOff) {
-		IOLockUnlock(fDpmsLock);
-		return true;
-	}
-	if (!wantOn && fDpmsOff) {
-		IOLockUnlock(fDpmsLock);
-		return true;
-	}
+	const bool curOff = __atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE);
+	if (wantOn && !curOff) return true;
+	if (!wantOn && curOff) return true;
 
 	GarnetDriver *driver = knownDriver ? knownDriver : retain_driver();
 	const bool ownDriver = (knownDriver == nullptr && driver != nullptr);
 
+	auto restoreCursorAfterDpms = [&]() {
+		if (!fCursorLock) return;
+		IOLockLock(fCursorLock);
+		fCursorDpmsSuspended = false;
+		if (fCursorHwAvailable) {
+			fCursorNeedsProgram = true;
+			if (fDpmsSavedCursorVisible && fCursorW > 0u && fCursorH > 0u) {
+				MmioAccess mmio {};
+				if (acquire_mmio(fPci, driver, &mmio)) {
+					const rdna4cursor::CursorHw hw { &mmio, cursor_rd_seg2, cursor_wr_seg2 };
+					const rdna4cursor::CursorPlaneConfig cfg {
+						fCursorPipe, fCursorMcAddr, fCursorW, fCursorH,
+						fCursorX, fCursorY, fCursorHotX, fCursorHotY,
+						currentPixelClockKhz(), true,
+					};
+					if (rdna4cursor::program_cursor_plane(hw, cfg)) {
+						fCursorVisible = true;
+						fCursorNeedsProgram = false;
+					}
+					release_mmio(mmio);
+				}
+			}
+		}
+		IOLockUnlock(fCursorLock);
+	};
+
+	auto restoreVblAfterDpms = [&]() {
+		bool vblWanted = false;
+		if (fVblLock) {
+			IOLockLock(fVblLock);
+			vblWanted = fVblEnabled && !fStopping;
+			IOLockUnlock(fVblLock);
+		}
+		if (vblWanted) {
+			syncHardwareVbl(true);
+			if (fVblTimer) {
+				fVblTimer->enable();
+				fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+			}
+		}
+	};
+
 	if (!wantOn) {
-		// Pause hardware VBL IRQ + timer while display sleeps.
+		// Pause hardware VBL IRQ + timer and drain any in-flight VBL callback while display sleeps.
 		syncHardwareVbl(false);
+		vblDispatchDrain();
 		if (fVblTimer) {
 			fVblTimer->disable();
 			fVblTimer->cancelTimeout();
@@ -898,6 +938,7 @@ bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriv
 		if (fCursorLock) {
 			IOLockLock(fCursorLock);
 			fDpmsSavedCursorVisible = fCursorVisible;
+			fCursorDpmsSuspended = true;
 			if (fCursorHwAvailable) {
 				disableCursorLocked(driver);
 				fCursorNeedsProgram = true;
@@ -922,17 +963,22 @@ bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriv
 				                          aux_now_us, aux_delay_us };
 				const rdna4dpms::OffResult off = rdna4dpms::dpmsOff(hw, fActiveOutput);
 				ok = off.streamBlanked || off.phyDisabled;
-				RDNA4LOG("primaryfb: DPMS OFF (blank=%u phyOff=%u d3=%u, OTG%u DIG%u AUX%u)",
-				         off.streamBlanked ? 1u : 0u, off.phyDisabled ? 1u : 0u,
-				         off.sinkD3Written ? 1u : 0u,
+				RDNA4LOG("primaryfb: DPMS OFF (blank=%u d3=%u phyOff=%u, OTG%u DIG%u AUX%u)",
+				         off.streamBlanked ? 1u : 0u, off.sinkD3Written ? 1u : 0u,
+				         off.phyDisabled ? 1u : 0u,
 				         fActiveOutput.otg, fActiveOutput.dig, fActiveOutput.aux);
 				release_mmio(ctx->mmio);
 			}
 			IOFree(ctx, sizeof(ModesetCtx));
 		}
-		if (ok) fDpmsOff = true;
+		if (ok) {
+			__atomic_store_n(&fDpmsOff, true, __ATOMIC_RELEASE);
+		} else {
+			// Failed DPMS-off must restore cursor + VBL so WindowServer never freezes.
+			restoreCursorAfterDpms();
+			restoreVblAfterDpms();
+		}
 		if (ownDriver) driver->release();
-		IOLockUnlock(fDpmsLock);
 		return ok;
 	}
 
@@ -962,63 +1008,28 @@ bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriv
 	rdna4edidmodes::DetailedTiming curTiming {};
 	bool woke = false;
 	if (rdna4fbprimary::modeForId(fModeTable, fCurrentMode, &curTiming)) {
-		woke = applyHardwareMode(curTiming, /*forceRetrain=*/true);
+		woke = applyHardwareModeLocked(curTiming, /*forceRetrain=*/true, driver);
 	}
-	fDpmsOff = false;
 	if (woke) {
+		__atomic_store_n(&fDpmsOff, false, __ATOMIC_RELEASE);
 		RDNA4LOG("primaryfb: DPMS ON retrain OK (%ux%u@%u.%03uHz, rate=0x%02x, dsc=%u)",
 		         curTiming.width, curTiming.height,
 		         curTiming.refreshMilliHz() / 1000u, curTiming.refreshMilliHz() % 1000u,
 		         fActiveLinkRate, fActiveDscOn ? 1u : 0u);
+		restoreCursorAfterDpms();
 	} else {
-		RDNA4LOG("primaryfb: DPMS ON retrain FAILED (modeId=%d)", static_cast<int>(fCurrentMode));
+		// Keep fDpmsOff == true so subsequent wake/power retries can retrain; still resume timer VBL below.
+		RDNA4LOG("primaryfb: DPMS ON retrain FAILED (modeId=%d; keeping DPMS off for retry)",
+		         static_cast<int>(fCurrentMode));
 	}
-
-	if (fCursorLock) {
-		IOLockLock(fCursorLock);
-		if (fCursorHwAvailable) {
-			fCursorNeedsProgram = true;
-			if (fDpmsSavedCursorVisible && fCursorW > 0u && fCursorH > 0u) {
-				MmioAccess mmio {};
-				if (acquire_mmio(fPci, driver, &mmio)) {
-					const rdna4cursor::CursorHw hw { &mmio, cursor_rd_seg2, cursor_wr_seg2 };
-					const rdna4cursor::CursorPlaneConfig cfg {
-						fCursorPipe, fCursorMcAddr, fCursorW, fCursorH,
-						fCursorX, fCursorY, fCursorHotX, fCursorHotY,
-						currentPixelClockKhz(), true,
-					};
-					if (rdna4cursor::program_cursor_plane(hw, cfg)) {
-						fCursorVisible = true;
-						fCursorNeedsProgram = false;
-					}
-					release_mmio(mmio);
-				}
-			}
-		}
-		IOLockUnlock(fCursorLock);
-	}
-
-	bool vblWanted = false;
-	if (fVblLock) {
-		IOLockLock(fVblLock);
-		vblWanted = fVblEnabled && !fStopping;
-		IOLockUnlock(fVblLock);
-	}
-	if (vblWanted) {
-		syncHardwareVbl(true);
-		if (fVblTimer) {
-			fVblTimer->enable();
-			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
-		}
-	}
+	restoreVblAfterDpms();
 
 	if (ownDriver) driver->release();
-	IOLockUnlock(fDpmsLock);
 	return woke;
 }
 
 __attribute__((noinline))
-void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclk(GarnetDriver *driver) {
+void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclkLocked(GarnetDriver *driver) {
 	if (!driver || !fPci || fStopping) return;
 	MmioAccess mmio {};
 	if (!acquire_mmio(fPci, driver, &mmio)) return;
@@ -1087,6 +1098,10 @@ void AMDGarnetPrimaryFramebuffer::free() {
 	if (fVblLock) {
 		IOLockFree(fVblLock);
 		fVblLock = nullptr;
+	}
+	if (fVblDispatchLock) {
+		IOLockFree(fVblDispatchLock);
+		fVblDispatchLock = nullptr;
 	}
 	if (fCursorLock) {
 		IOLockFree(fCursorLock);
@@ -1187,10 +1202,16 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 	fCursorVisible = false;
 	fCursorHwAvailable = false;
 	fCursorNeedsProgram = false;
+	fCursorDpmsSuspended = false;
 	if (!fVblLock) {
 		fVblLock = IOLockAlloc();
 		if (!fVblLock) return false;
 	}
+	if (!fVblDispatchLock) {
+		fVblDispatchLock = IOLockAlloc();
+		if (!fVblDispatchLock) return false;
+	}
+	fVblDispatchOwner = nullptr;
 	if (!fCursorLock) {
 		fCursorLock = IOLockAlloc();
 		if (!fCursorLock) return false;
@@ -1228,31 +1249,36 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 }
 
 void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
-	if (!driver) return;
-	if (fEdidLen < rdna4edidmodes::BlockSize && fPci && readLiveHardwareEdid(fPci, driver)) {
-		if (OSData *edidProp = OSData::withBytes(fEdid, static_cast<unsigned int>(fEdidLen))) {
-			setProperty("DDC,EDID", edidProp);
-			edidProp->release();
+	if (!driver || fStopping) return;
+	if (fDpmsLock) IOLockLock(fDpmsLock);
+	if (!fStopping) {
+		if (fEdidLen < rdna4edidmodes::BlockSize && fPci && readLiveHardwareEdid(fPci, driver)) {
+			if (OSData *edidProp = OSData::withBytes(fEdid, static_cast<unsigned int>(fEdidLen))) {
+				setProperty("DDC,EDID", edidProp);
+				edidProp->release();
+			}
+			rebuildModeTable(fModeTable.consoleWidth, fModeTable.consoleHeight, fModeTable.consoleRowBytes);
+			fCurrentMode = static_cast<IODisplayModeID>(fModeTable.activeModeId);
 		}
-		rebuildModeTable(fModeTable.consoleWidth, fModeTable.consoleHeight, fModeTable.consoleRowBytes);
-		fCurrentMode = static_cast<IODisplayModeID>(fModeTable.activeModeId);
-	}
-	if ((fMaxDispClkKhz == 0u || fMaxDppClkKhz == 0u) && fPci) {
-		queryClockCaps(fPci, driver);
-	}
-	if (!fCursorHwAvailable) {
-		initCursorSlot(driver);
-	}
-	optimizeDet0AndUclk(driver);
-	if (fVblLock) {
-		IOLockLock(fVblLock);
-		const bool wantVbl = fVblEnabled && !fStopping;
-		IOLockUnlock(fVblLock);
-		if (wantVbl) {
-			syncHardwareVbl(true);
-			if (fVblTimer) fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+		if ((fMaxDispClkKhz == 0u || fMaxDppClkKhz == 0u) && fPci) {
+			queryClockCaps(fPci, driver);
+		}
+		if (!fCursorHwAvailable) {
+			initCursorSlot(driver);
+		}
+		optimizeDet0AndUclkLocked(driver);
+		if (fVblLock) {
+			IOLockLock(fVblLock);
+			const bool wantVbl = fVblEnabled && !fStopping;
+			IOLockUnlock(fVblLock);
+			if (wantVbl) {
+				syncHardwareVbl(true);
+				if (fVblTimer) fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+			}
 		}
 	}
+	if (fDpmsLock) IOLockUnlock(fDpmsLock);
+	if (fStopping) return;
 	// Never call IOFramebuffer::handleEvent(kIOFBNotifyDisplayModeDidChange, nullptr) from GarnetDriver's
 	// thread: handleEvent() is only defined for power-state notifications under IOFramebuffer's own lock.
 	if (fPeerRegistered) return;
@@ -1287,12 +1313,18 @@ void AMDGarnetPrimaryFramebuffer::stop(IOService *provider) {
 	if (fVblLock) IOLockLock(fVblLock);
 	fStopping = true;
 	fVblEnabled = false;
-	fVblHwArmed = false;
+	__atomic_store_n(&fVblHwArmed, false, __ATOMIC_RELEASE);
 	fVblProc = nullptr;
 	fVblTarget = nullptr;
 	fVblRef = nullptr;
 	if (fVblLock) IOLockUnlock(fVblLock);
 	syncHardwareVbl(false);
+	vblDispatchDrain();
+	// Drain any in-flight DPMS / modeset / onDriverReady sequence before tearing down timer or fPci.
+	if (fDpmsLock) {
+		IOLockLock(fDpmsLock);
+		IOLockUnlock(fDpmsLock);
+	}
 	teardownVblTimer();
 
 	{
@@ -1349,19 +1381,51 @@ uint64_t AMDGarnetPrimaryFramebuffer::vblNowNs() const {
 }
 
 bool AMDGarnetPrimaryFramebuffer::vblHwActive() const {
-	return fVblIrqAllowed && fVblHwArmed && rdna4dcn::primaryVblIrqActive();
+	return fVblIrqAllowed &&
+	       __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE) &&
+	       rdna4dcn::primaryVblIrqActive();
 }
 
 uint32_t AMDGarnetPrimaryFramebuffer::vblInitialTimeoutUs() const {
 	return rdna4vbl::initial_timer_us(vblPeriodUs(), vblHwActive());
 }
 
+void AMDGarnetPrimaryFramebuffer::vblDispatchEnter() {
+	if (fVblDispatchLock) {
+		IOLockLock(fVblDispatchLock);
+		__atomic_store_n(&fVblDispatchOwner, current_thread(), __ATOMIC_RELEASE);
+	}
+}
+
+void AMDGarnetPrimaryFramebuffer::vblDispatchExit() {
+	if (fVblDispatchLock) {
+		__atomic_store_n(&fVblDispatchOwner, static_cast<thread_t>(nullptr), __ATOMIC_RELEASE);
+		IOLockUnlock(fVblDispatchLock);
+	}
+}
+
+void AMDGarnetPrimaryFramebuffer::vblDispatchDrain() {
+	if (fVblDispatchLock &&
+	    __atomic_load_n(&fVblDispatchOwner, __ATOMIC_ACQUIRE) != current_thread()) {
+		IOLockLock(fVblDispatchLock);
+		IOLockUnlock(fVblDispatchLock);
+	}
+}
+
+void AMDGarnetPrimaryFramebuffer::vblRetainTarget(OSObject *target) {
+	if (target) target->retain();
+}
+
+void AMDGarnetPrimaryFramebuffer::vblReleaseTarget(OSObject *target) {
+	if (target) target->release();
+}
+
 void AMDGarnetPrimaryFramebuffer::syncHardwareVbl(bool want) {
-	if (!want || !fVblIrqAllowed || fStopping || fDpmsOff) {
+	if (!want || !fVblIrqAllowed || fStopping || __atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE)) {
 		uint32_t otg = 0u;
 		if (fVblLock) IOLockLock(fVblLock);
 		otg = fVblOtg;
-		fVblHwArmed = false;
+		__atomic_store_n(&fVblHwArmed, false, __ATOMIC_RELEASE);
 		if (fVblLock) IOLockUnlock(fVblLock);
 		(void)rdna4dcn::primaryVblIrqSet(nullptr, otg, false);
 		return;
@@ -1371,32 +1435,39 @@ void AMDGarnetPrimaryFramebuffer::syncHardwareVbl(bool want) {
 	const bool armed = driver && rdna4dcn::primaryVblIrqSet(driver, otg, true);
 	if (driver) driver->release();
 	if (fVblLock) IOLockLock(fVblLock);
-	const bool prev = fVblHwArmed;
+	const bool prev = __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE);
 	fVblOtg = otg;
-	fVblHwArmed = armed && fVblEnabled && !fStopping;
-	const bool disarmNow = armed && !fVblHwArmed;
+	const bool nextArmed = armed && fVblEnabled && !fStopping &&
+	                       !__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE);
+	__atomic_store_n(&fVblHwArmed, nextArmed, __ATOMIC_RELEASE);
+	const bool disarmNow = armed && !nextArmed;
 	if (fVblLock) IOLockUnlock(fVblLock);
 	if (disarmNow) {
 		(void)rdna4dcn::primaryVblIrqSet(nullptr, otg, false);
-	} else if (armed && !prev) {
+	} else if (nextArmed && !prev) {
 		RDNA4LOG("primaryfb: hardware DCN41 VBLANK IRQ armed on OTG%u (watchdog %u us)",
 		         otg, rdna4vbl::initial_timer_us(vblPeriodUs(), true));
 	}
 }
 
 void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
+	vblDispatchEnter();
 	IOFBInterruptProc proc = nullptr;
 	OSObject *target = nullptr;
 	void *ref = nullptr;
 	bool deliver = false;
 
 	if (fVblLock) IOLockLock(fVblLock);
-	if (fVblEnabled && !fStopping && fVblHwArmed && otg == fVblOtg && fVblProc) {
+	if (fVblEnabled && !fStopping &&
+	    !__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) &&
+	    __atomic_load_n(&fVblHwArmed, __ATOMIC_ACQUIRE) &&
+	    otg == fVblOtg && fVblProc) {
 		fVblLastHwNs = vblNowNs();
 		fVblHwCount++;
 		proc = fVblProc;
 		target = fVblTarget;
 		ref = fVblRef;
+		vblRetainTarget(target);
 		deliver = true;
 	}
 	if (fVblLock) IOLockUnlock(fVblLock);
@@ -1404,12 +1475,17 @@ void AMDGarnetPrimaryFramebuffer::onHardwareVbl(uint32_t otg) {
 	if (deliver && proc) {
 		proc(target, ref);
 	}
+	if (deliver) {
+		vblReleaseTarget(target);
+	}
+	vblDispatchExit();
 }
 
 void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource *sender) {
 	AMDGarnetPrimaryFramebuffer *self = OSDynamicCast(AMDGarnetPrimaryFramebuffer, owner);
 	if (!self || !sender) return;
 
+	self->vblDispatchEnter();
 	IOFBInterruptProc proc = nullptr;
 	OSObject *target = nullptr;
 	void *ref = nullptr;
@@ -1428,13 +1504,20 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 			proc = self->fVblProc;
 			target = self->fVblTarget;
 			ref = self->fVblRef;
+			self->vblRetainTarget(target);
 		}
 	}
 	if (self->fVblLock) IOLockUnlock(self->fVblLock);
 
-	if (!enabled) return;
+	if (!enabled) {
+		self->vblDispatchExit();
+		return;
+	}
 	if (!suppressed && proc) {
 		proc(target, ref);
+	}
+	if (!suppressed) {
+		self->vblReleaseTarget(target);
 	}
 
 	if (self->fVblLock) IOLockLock(self->fVblLock);
@@ -1443,6 +1526,7 @@ void AMDGarnetPrimaryFramebuffer::onVblTimer(OSObject *owner, IOTimerEventSource
 	if (self->fVblLock) IOLockUnlock(self->fVblLock);
 
 	if (enabled) sender->setTimeoutUS(rdna4vbl::rearm_timer_us(self->vblPeriodUs(), hwStill, suppressed));
+	self->vblDispatchExit();
 }
 
 bool AMDGarnetPrimaryFramebuffer::ensureVblTimer() {
@@ -1587,19 +1671,34 @@ IOReturn AMDGarnetPrimaryFramebuffer::getCurrentDisplayMode(IODisplayModeID *dis
 
 IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
 	if (depth != 0) return kIOReturnUnsupported;
-	rdna4fbprimary::PixelSpec px {};
-	if (!rdna4fbprimary::pixelSpecForMode(fModeTable, displayMode, depth, true, &px)) {
-		return kIOReturnUnsupported;
+	if (fDpmsLock) IOLockLock(fDpmsLock);
+	if (fStopping) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		return kIOReturnNotReady;
 	}
-	if (static_cast<uint64_t>(px.bytesPerPlane) > fConsoleLen) {
+	rdna4fbprimary::PixelSpec px {};
+	if (!rdna4fbprimary::pixelSpecForMode(fModeTable, displayMode, depth, true, &px) ||
+	    static_cast<uint64_t>(px.bytesPerPlane) > fConsoleLen) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnUnsupported;
 	}
 	if (displayMode == fCurrentMode && depth == fCurrentDepth) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnSuccess;
 	}
 	rdna4edidmodes::DetailedTiming target {};
 	if (!rdna4fbprimary::modeForId(fModeTable, displayMode, &target)) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnUnsupported;
+	}
+	if (__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE)) {
+		// While sleeping, record the requested mode without touching the powered-down PHY;
+		// DPMS wake will train and apply fCurrentMode directly.
+		fCurrentMode = displayMode;
+		fCurrentDepth = depth;
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		rdna4disp_on_mode_change();
+		return kIOReturnSuccess;
 	}
 	RDNA4LOG("primaryfb: setDisplayMode request id=%d -> %d (%ux%u@%u.%03uHz pclk=%lluHz)",
 	         static_cast<int>(fCurrentMode), static_cast<int>(displayMode),
@@ -1613,13 +1712,13 @@ IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode
 		IOLockUnlock(fVblLock);
 	}
 	if (vblWasEnabled) syncHardwareVbl(false);
-	if (!applyHardwareMode(target)) {
+	if (!applyHardwareModeLocked(target)) {
 		if (vblWasEnabled) syncHardwareVbl(true);
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnError;
 	}
 	fCurrentMode = displayMode;
 	fCurrentDepth = depth;
-	rdna4disp_on_mode_change();
 	if (fVblTimer) {
 		bool enabled = false;
 		if (fVblLock) IOLockLock(fVblLock);
@@ -1630,6 +1729,8 @@ IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode
 			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 		}
 	}
+	if (fDpmsLock) IOLockUnlock(fDpmsLock);
+	rdna4disp_on_mode_change();
 	return kIOReturnSuccess;
 }
 
@@ -1643,18 +1744,22 @@ IOReturn AMDGarnetPrimaryFramebuffer::getStartupDisplayMode(IODisplayModeID *dis
 IOReturn AMDGarnetPrimaryFramebuffer::setAttribute(IOSelect attribute, uintptr_t value) {
 	if (attribute == kIOPowerAttribute) {
 		const uint32_t next = static_cast<uint32_t>(value);
-		const uint32_t prev = fPowerState;
-		if (next < 2u && prev >= 2u) {
-			handleEvent(kIOFBNotifyWillPowerOff, nullptr);
-			fPowerState = next;
-			(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
-		} else if (next >= 2u && prev < 2u) {
-			fPowerState = next;
-			(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
-			handleEvent(kIOFBNotifyDidPowerOn, nullptr);
-		} else {
-			fPowerState = next;
-		}
+		uint32_t prev = 2u;
+		if (fDpmsLock) IOLockLock(fDpmsLock);
+		prev = fPowerState;
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+
+		const bool goingOff = (next < 2u && prev >= 2u);
+		const bool goingOn  = (next >= 2u && prev < 2u);
+		if (goingOff) handleEvent(kIOFBNotifyWillPowerOff, nullptr);
+
+		if (fDpmsLock) IOLockLock(fDpmsLock);
+		fPowerState = next;
+		const bool wantOn = rdna4dpms::should_be_on(fPowerState, fConnPower);
+		(void)applyDpmsLocked(wantOn);
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+
+		if (goingOn) handleEvent(kIOFBNotifyDidPowerOn, nullptr);
 		return kIOReturnSuccess;
 	}
 	return super::setAttribute(attribute, value);
@@ -1707,8 +1812,11 @@ IOReturn AMDGarnetPrimaryFramebuffer::setAttributeForConnection(IOIndex connectI
                                                             uintptr_t value) {
 	if (connectIndex != 0) return kIOReturnBadArgument;
 	if (attribute == kConnectionPower) {
+		if (fDpmsLock) IOLockLock(fDpmsLock);
 		fConnPower = static_cast<uint32_t>(value);
-		(void)applyDpms(rdna4dpms::should_be_on(fPowerState, fConnPower));
+		const bool wantOn = rdna4dpms::should_be_on(fPowerState, fConnPower);
+		(void)applyDpmsLocked(wantOn);
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnSuccess;
 	}
 	return super::setAttributeForConnection(connectIndex, attribute, value);
@@ -1806,13 +1914,14 @@ IOReturn AMDGarnetPrimaryFramebuffer::unregisterInterrupt(void *interruptRef) {
 
 	if (fVblLock) IOLockLock(fVblLock);
 	fVblEnabled = false;
-	fVblHwArmed = false;
+	__atomic_store_n(&fVblHwArmed, false, __ATOMIC_RELEASE);
 	fVblProc = nullptr;
 	fVblTarget = nullptr;
 	fVblRef = nullptr;
 	if (fVblLock) IOLockUnlock(fVblLock);
 
 	syncHardwareVbl(false);
+	vblDispatchDrain();
 	if (fVblTimer) {
 		fVblTimer->disable();
 		fVblTimer->cancelTimeout();
@@ -2026,7 +2135,7 @@ IOReturn AMDGarnetPrimaryFramebuffer::setCursorImage(void *cursorImage) {
 	fCursorNeedsProgram = true;
 
 	bool ok = true;
-	if (fCursorVisible && fPci) {
+	if (fCursorVisible && !fCursorDpmsSuspended && fPci) {
 		MmioAccess mmio {};
 		ok = acquire_mmio(fPci, driver, &mmio);
 		if (ok) {
@@ -2067,6 +2176,13 @@ IOReturn AMDGarnetPrimaryFramebuffer::setCursorState(SInt32 x, SInt32 y, bool vi
 	const bool visibilityChanged = (visible != fCursorVisible);
 	fCursorX = x;
 	fCursorY = y;
+	if (fCursorDpmsSuspended) {
+		fDpmsSavedCursorVisible = visible;
+		fCursorNeedsProgram = true;
+		IOLockUnlock(fCursorLock);
+		if (driver) driver->release();
+		return kIOReturnSuccess;
+	}
 	fCursorVisible = visible;
 
 	if (fCursorW == 0u || fCursorH == 0u) {
@@ -2107,24 +2223,35 @@ IOReturn AMDGarnetPrimaryFramebuffer::setCursorState(SInt32 x, SInt32 y, bool vi
 
 void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
 	if (fStopping) return;
-	if (fDpmsOff && rdna4dpms::should_be_on(fPowerState, fConnPower)) {
-		(void)applyDpms(true, driver);
+	if (fDpmsLock) IOLockLock(fDpmsLock);
+	if (fStopping) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return;
 	}
-	if (fPci && fActiveOutput.found && fActiveOutput.isDp && fActiveOutput.auxValid &&
-	    fActiveOutput.aux < rdna4ddcpad::kMaxDdcLines) {
-		MmioAccess mmio {};
-		if (acquire_mmio(fPci, driver, &mmio)) {
-			const rdna4ddcpad::DdcPadHw padHw { &mmio, cursor_rd_seg2, cursor_wr_seg2, ddcpad_sleep_ms };
-			if (rdna4ddcpad::set_ddc_pad_mode(padHw, static_cast<uint8_t>(fActiveOutput.aux), false)) {
-				RDNA4LOG("primaryfb: wake restored DP AUX%u pads to AUX mode", fActiveOutput.aux);
+	// S3 resume may reset DCHUBBUB_DET0_CTRL back to UEFI's 192 KiB default; re-verify DET0 & UCLK.
+	fDet0Expanded = false;
+	fUclkUnpinned = false;
+	if (__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) &&
+	    rdna4dpms::should_be_on(fPowerState, fConnPower)) {
+		(void)applyDpmsLocked(true, driver);
+	} else {
+		if (fPci && fActiveOutput.found && fActiveOutput.isDp && fActiveOutput.auxValid &&
+		    fActiveOutput.aux < rdna4ddcpad::kMaxDdcLines) {
+			MmioAccess mmio {};
+			if (acquire_mmio(fPci, driver, &mmio)) {
+				const rdna4ddcpad::DdcPadHw padHw { &mmio, cursor_rd_seg2, cursor_wr_seg2, ddcpad_sleep_ms };
+				if (rdna4ddcpad::set_ddc_pad_mode(padHw, static_cast<uint8_t>(fActiveOutput.aux), false)) {
+					RDNA4LOG("primaryfb: wake restored DP AUX%u pads to AUX mode", fActiveOutput.aux);
+				}
+				release_mmio(mmio);
 			}
-			release_mmio(mmio);
+		}
+		if (fCursorLock) {
+			IOLockLock(fCursorLock);
+			if (fCursorHwAvailable) fCursorNeedsProgram = true;
+			IOLockUnlock(fCursorLock);
 		}
 	}
-	if (fCursorLock) {
-		IOLockLock(fCursorLock);
-		if (fCursorHwAvailable) fCursorNeedsProgram = true;
-		IOLockUnlock(fCursorLock);
-	}
+	optimizeDet0AndUclkLocked(driver);
+	if (fDpmsLock) IOLockUnlock(fDpmsLock);
 }

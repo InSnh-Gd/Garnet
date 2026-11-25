@@ -1364,7 +1364,9 @@ inline ApplyResult applyMode(const Hw &hw, const rdna4aux::ActiveOutput &out,
 	if (forceRetrain || plan.targetLinkRate != snap.linkRate || plan.useFec != snap.fecWasOn) {
 		if (!trainDpLink(hw, out, dpcd, plan.targetLinkRate, plan.targetLanes, plan.useFec)) {
 			res.status = kLinkTrainFailed;
-			rollback();
+			// On forced retrain (DPMS wake from disabled PHY), leave the stream cleanly blanked
+			// rather than rolling back and unblanking into an untrained/powered-down PHY.
+			if (!forceRetrain) rollback();
 			return res;
 		}
 		rebindDigStream();

@@ -642,6 +642,22 @@ void testFailureRollbacksRestoreExactState() {
 		assert((mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0VidStreamCntl + db] & 0x10001u) == 0x10001u);
 		assert(mock.deniedWrites == 0u);
 	}
+
+	// Case E (Stage 3B review C3): forceRetrain=true with link training failure does NOT roll back & unblank dead PHY
+	{
+		MockDcn mock;
+		mock.initLiveMiMonitor4k60();
+		const auto t60 = rdna4edidmodes::makeCvtRb2Timing(3840u, 2160u, 60u, 352000u, 1420000000ULL);
+		const uint32_t db = out.dig * rdna4modeset::kSeg2DigStride;
+		mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0VidStreamCntl + db] = 0x00000200u;
+		mock.failLinkEq = true;
+		const auto r = rdna4modeset::applyMode(mock.makeHw(), out, dpcd, t60, 1900000u, 1800000u,
+		                                       /*allowRetrain=*/true, /*allowDsc=*/true,
+		                                       /*forceRetrain=*/true);
+		assert(r.status == rdna4modeset::kLinkTrainFailed && !r.rolledBack);
+		assert((mock.regs[kSeg2 + rdna4modeset::kSeg2Dp0VidStreamCntl + db] & 0x10001u) == 0u);
+		assert(mock.deniedWrites == 0u);
+	}
 }
 
 }  // namespace

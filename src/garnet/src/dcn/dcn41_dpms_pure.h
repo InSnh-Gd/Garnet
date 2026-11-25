@@ -70,7 +70,15 @@ inline OffResult dpmsOff(const rdna4modeset::Hw &hw, const rdna4aux::ActiveOutpu
 		hw.delayUs(hw.cookie, kBlankSettleUs);
 	}
 
-	// 2. Disable PHY transmitter via DMUB DIG1_TRANSMITTER_CONTROL (action=2 -> DISABLE).
+	// 2. Notify sink to enter D3 sleep (DPCD 0x00600 = 0x02) BEFORE dropping PHY link
+	//    (matching upstream AMD DC dp_disable_link_phy order so sinks see explicit D3 before LOS).
+	if (out.auxValid && hw.auxIo.read && hw.auxIo.write) {
+		const uint8_t d3 = kDpPowerStateD3;
+		res.sinkD3Written = rdna4aux::dpcdWrite(hw.auxIo, out.aux, out.hpd,
+		                                        kDpcdSetPowerState, &d3, 1u);
+	}
+
+	// 3. Disable PHY transmitter via DMUB DIG1_TRANSMITTER_CONTROL (action=2 -> DISABLE).
 	if (hw.phyControl) {
 		res.phyDisabled = hw.phyControl(hw.cookie, 2u, 0u, 0u, 0u, 0u);
 	}
@@ -80,13 +88,6 @@ inline OffResult dpmsOff(const rdna4modeset::Hw &hw, const rdna4aux::ActiveOutpu
 		(void)hw.wrSeg(hw.cookie, 2u, rdna4modeset::kSeg2Dp0LinkCntl + be, lc & ~(1u << 4));
 	}
 	(void)hw.wrSeg(hw.cookie, 2u, rdna4modeset::kSeg2Dp0DphyIntCtrl + be, 0u);
-
-	// 3. Notify sink to enter D3 sleep (DPCD 0x00600 = 0x02, best-effort).
-	if (out.auxValid && hw.auxIo.read && hw.auxIo.write) {
-		const uint8_t d3 = kDpPowerStateD3;
-		res.sinkD3Written = rdna4aux::dpcdWrite(hw.auxIo, out.aux, out.hpd,
-		                                        kDpcdSetPowerState, &d3, 1u);
-	}
 	return res;
 }
 

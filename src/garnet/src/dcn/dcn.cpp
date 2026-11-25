@@ -407,7 +407,7 @@ static uint32_t bind_locked(GarnetDriver *owner) {
 			                                   ((uint64_t)fbTop + 1u) << 24);
 	}
 
-	gDcn.armed = true;
+	__atomic_store_n(&gDcn.armed, true, __ATOMIC_RELEASE);
 	gDcn.initStatus = 0;
 	RDNA4LOG("dcn: display layer ARMED — segs %08x %08x %08x %08x %08x, BAR5 %u dwords, "
 	       "allowlist %u ranges / %u writable dwords (deny by default)",
@@ -721,13 +721,14 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 		}
 
 		// Stage 3A: primary framebuffer VBLANK delivery with rate-based storm guard (> 1000/s).
-		if (irq.kind == DCN41_IRQ_VSTARTUP && gDcn.primaryVblEnabled &&
+		if (irq.kind == DCN41_IRQ_VSTARTUP &&
+		    __atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) &&
 		    irq.inst == gDcn.primaryVblOtg) {
 			if (rdna4vbl::record_irq(gDcn.primaryVblStorm, t)) {
 				struct dcn41_irq off { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
 				gDcn.tag = "vblstorm";
 				(void)dcn41_irq_set(&gDcn.d, off, false);
-				gDcn.primaryVblEnabled = false;
+				__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
 				RDNA4LOG("dcn-irq: PRIMARY VBL STORM GUARD — > %u VSTARTUP/s on OTG %u; hardware VBL DISABLED (falling back to timer)",
 				         rdna4vbl::kStormWindowMaxIrqs, off.inst);
 			} else {
@@ -745,6 +746,9 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 			gDcn.tag = "stormoff";
 			(void)dcn41_irq_set(&gDcn.d, off, false);
 			gDcn.srcEnabled = false;
+			if (off.kind == DCN41_IRQ_VSTARTUP && off.inst == gDcn.primaryVblOtg) {
+				__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+			}
 			gDcn.stormTripped = true;
 			RDNA4LOG("dcn-irq: STORM GUARD — %llu entries since the enable exceeded the cap %llu; "
 			       "kind %u inst %u DISABLED by the handler",
@@ -926,6 +930,9 @@ uint32_t vbl(uint64_t arg, uint64_t *out, unsigned outCount) {
 		const int r = dcn41_irq_set(&gDcn.d, off, false);
 		RDNA4LOG("dcn-vbl: disabled kind %u inst %u -> %d", off.kind, off.inst, r);
 		gDcn.srcEnabled = false;
+		if (off.kind == DCN41_IRQ_VSTARTUP && off.inst == gDcn.primaryVblOtg) {
+			__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+		}
 	}
 
 	const int otg = lit_otg();
@@ -1001,45 +1008,62 @@ bool primaryVblIrqSet(GarnetDriver *owner, uint32_t otg, bool enable) {
 	if (otg >= DCN41_NUM_PIPES) return false;
 	if (enable) {
 		if (!owner || !owner->interruptsArmed()) return false;
-		if (!gDcn.armed && bind(owner) != 0u) return false;
+		if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) && bind(owner) != 0u) return false;
 	}
-	if (!gDcn.armed) return false;
-	if (enable && gDcn.primaryVblStorm.tripped) return false;
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return false;
+	if (enable && __atomic_load_n(&gDcn.primaryVblStorm.tripped, __ATOMIC_ACQUIRE)) return false;
 
-	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
-	if (!txn.ok) return false;
-
-	if (enable) {
-		// If switching OTG while previously enabled, disable old OTG first.
-		if (gDcn.primaryVblEnabled && gDcn.primaryVblOtg != otg) {
-			struct dcn41_irq prev { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
-			gDcn.tag = "pvbloff";
-			(void)dcn41_irq_set(&gDcn.d, prev, false);
-			gDcn.primaryVblEnabled = false;
+	// Bounded retry around rdna4_display_txn: ihEntry() holds the local-display lease for only
+	// a few microseconds per frame and never sleeps, so transient collisions clear quickly.
+	for (uint32_t attempt = 0u; attempt < 25u; ++attempt) {
+		rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+		if (!txn.ok) {
+			IODelay(100u);
+			continue;
 		}
-		rdna4vbl::reset_storm(gDcn.primaryVblStorm);
-		struct dcn41_irq on { DCN41_IRQ_VSTARTUP, static_cast<uint8_t>(otg) };
-		gDcn.tag = "pvblon";
-		const int rc = dcn41_irq_set(&gDcn.d, on, true);
-		if (rc != DCN41_OK) return false;
-		gDcn.primaryVblOtg = static_cast<uint8_t>(otg);
-		__atomic_store_n(&gDcn.primaryVblEnabled, true, __ATOMIC_RELEASE);
+
+		if (enable) {
+			if (__atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) && gDcn.primaryVblOtg != otg) {
+				struct dcn41_irq prev { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
+				gDcn.tag = "pvbloff";
+				(void)dcn41_irq_set(&gDcn.d, prev, false);
+				__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+			}
+			rdna4vbl::reset_storm(gDcn.primaryVblStorm);
+			struct dcn41_irq on { DCN41_IRQ_VSTARTUP, static_cast<uint8_t>(otg) };
+			gDcn.tag = "pvblon";
+			const int rc = dcn41_irq_set(&gDcn.d, on, true);
+			if (rc != DCN41_OK) return false;
+			gDcn.primaryVblOtg = static_cast<uint8_t>(otg);
+			__atomic_store_n(&gDcn.primaryVblEnabled, true, __ATOMIC_RELEASE);
+			return true;
+		}
+
+		if (__atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE)) {
+			struct dcn41_irq off { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
+			gDcn.tag = "pvbloff";
+			const int rc = dcn41_irq_set(&gDcn.d, off, false);
+			__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+			return rc == DCN41_OK;
+		}
 		return true;
 	}
-
-	if (gDcn.primaryVblEnabled) {
-		struct dcn41_irq off { DCN41_IRQ_VSTARTUP, gDcn.primaryVblOtg };
-		gDcn.tag = "pvbloff";
-		(void)dcn41_irq_set(&gDcn.d, off, false);
-		__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
-	}
-	return true;
+	RDNA4LOG("dcn-vbl: primaryVblIrqSet(otg=%u, en=%u) timed out waiting for display lease",
+	         otg, enable ? 1u : 0u);
+	return false;
 }
 
 bool primaryVblIrqActive() {
 	return __atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) &&
 	       __atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) &&
-	       !gDcn.primaryVblStorm.tripped;
+	       !__atomic_load_n(&gDcn.primaryVblStorm.tripped, __ATOMIC_ACQUIRE);
+}
+
+void primaryVblShutdown() {
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
+	(void)primaryVblIrqSet(nullptr, gDcn.primaryVblOtg, false);
+	__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
+	__atomic_store_n(&gDcn.armed, false, __ATOMIC_RELEASE);
 }
 
 
