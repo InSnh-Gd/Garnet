@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int g_fails = 0;
 
@@ -49,9 +50,38 @@ static void test_cap_clamping(void) {
     check(n == GARNET_VKPOOL_FENCE_CAP && p.count == 0u, "drain with NULL out clears pool");
 }
 
+static void test_stage2_command_invariants(void) {
+    check(GARNET_DYN_ALL == (GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR | GARNET_DYN_BLEND |
+                             GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R | GARNET_DYN_DEPTHBIAS),
+          "GARNET_DYN_ALL covers all dynamic-state dirty bits");
+    FILE *f = fopen("garnet_commands.m", "rb");
+    check(f != NULL, "open garnet_commands.m");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)len + 1u);
+    check(buf != NULL, "alloc garnet_commands.m buffer");
+    if (buf) {
+        size_t nr = fread(buf, 1, (size_t)len, f);
+        buf[nr] = '\0';
+        const char *bind = strstr(buf, "if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp))");
+        const char *dirty = bind ? strstr(bind, "_dynDirty = GARNET_DYN_ALL;") : NULL;
+        check(bind != NULL && dirty != NULL && (dirty - bind) < 200,
+              "pipeline switch re-dirties all dynamic state (prevents vpCount/depthBias/mesh stale leaks)");
+        const char *pd = strstr(buf, "- (void)rdna4PoolDone {");
+        const char *pser_zero = pd ? strstr(pd, "rdna4_fence_close(_pser); _pser = 0;") : NULL;
+        check(pd != NULL && pser_zero != NULL && (pser_zero - pd) < 160,
+              "rdna4PoolDone clears _pser so dealloc does not double-close under RDNA4P.mu");
+        free(buf);
+    }
+    fclose(f);
+}
+
 int main(void) {
     test_lifo_and_bounds();
     test_cap_clamping();
+    test_stage2_command_invariants();
     if (g_fails) {
         fprintf(stderr, "test-vkpool: %d failure(s)\n", g_fails);
         return 1;

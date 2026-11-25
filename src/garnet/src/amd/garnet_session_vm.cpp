@@ -184,8 +184,8 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         N1C_LOG("open refused (ExclusiveAccess): a native client is already open");
         return kIOReturnExclusiveAccess;
     }
-    lazy_lock(&gCliLock); lazy_lock(&gRingLock); lazy_lock(&gHangLock); lazy_lock(&gTlbLock);
-    if (!gCliLock || !gRingLock || !gHangLock || !gTlbLock) { if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag); return kIOReturnNoMemory; }
+    lazy_lock(&gCliLock); lazy_lock(&gRingLock); lazy_lock(&gHangLock); lazy_lock(&gTlbLock); lazy_lock(&gWaitLock);
+    if (!gCliLock || !gRingLock || !gHangLock || !gTlbLock || !gWaitLock) { if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag); return kIOReturnNoMemory; }
     gCtx = &ctx;
 
     // The whole open runs under the client lock so a racing close cannot see a half-built session.

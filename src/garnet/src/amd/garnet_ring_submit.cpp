@@ -17,8 +17,7 @@ uint64_t gEmitted;
 BringupContext *gCtx;
 volatile UInt32 gOpenFlag;
 Hang gHang;
-IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock;
-static IOLock *gWaitLock;          // Stage 2A leaf lock for IRQ-driven waiter sleep/wakeup (never nested above any other lock)
+IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock, *gWaitLock;
 static volatile uint64_t gIrqEpoch;
 static uint8_t gIrqEvent;
 static volatile UInt32 gIrqWaitLatch = rdna4native::irqwait::kLatchUnset;
@@ -44,6 +43,11 @@ bool n1c_irq_wait_enabled() {
     if (gCtx == nullptr) return false;
     return rdna4native::irqwait::active(gCtx->wantInterrupts, gCtx->ih.enabled,
                                         gCtx->ih.enable_cpu_intr, irq_wait_boot_on());
+}
+
+void n1c_irq_wait_stats(uint64_t *sleeps, uint64_t *wakes) {
+    if (sleeps) *sleeps = __atomic_load_n(&gIrqWaitSleeps, __ATOMIC_RELAXED);
+    if (wakes) *wakes = __atomic_load_n(&gIrqWaitWakes, __ATOMIC_RELAXED);
 }
 
 static inline uint64_t irq_epoch_now() {

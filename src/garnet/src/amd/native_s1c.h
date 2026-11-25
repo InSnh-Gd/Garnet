@@ -70,6 +70,7 @@ IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64
 // (CP EOP src_id 181, VM fault 0, CP errors 183..185). Leaf-locked and safe when no waiters exist.
 void n1c_irq_notify();
 bool n1c_irq_wait_enabled();
+void n1c_irq_wait_stats(uint64_t *sleeps, uint64_t *wakes);
 // ---- ABI 1.1 (kext 0.0.603, native S2a): the scanout selectors 9..14. Same shape rules as the selectors above (the client checked counts and
 // sizes exactly); all need Hello. Lock order: gCliLock, then the scanout (DCN) lock inside rdna4dcn::scan*. Contract: NATIVE-S1C-ABI.md, "ABI 1.1 addendum".
 IOReturn n1c_scan_query(const N1cRef &ref, rdna4n_scan_query *out);

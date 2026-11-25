@@ -152,9 +152,10 @@ extern Hang gHang;
 //                  wait (2 s) runs under it, as before. An automatic recovery holds it for its whole bounded run (emission frozen).
 //   gHangLock      gHang and gRecovering.
 //   gTlbLock       gmc_flush_gpu_tlb (one invalidation engine for every VMID; 0.0.626 only ever flushed under the one client lock).
+//   gWaitLock      Stage 2A leaf lock for IRQ-driven waiter sleep/wakeup (never nested above any other lock).
 // A GPU-dependent check that may RUN a recovery (gpu_gate, hang_poll, own_wait, stall_from_wait) is called with at most the caller's own session lock:
 // never with gCliLock or gRingLock held.
-extern IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock;
+extern IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock, *gWaitLock;
 extern uint32_t gSessSeqCounter;
 extern volatile UInt32 gSessWs;
 extern FenceWindow gWin[kMaxSessions];

@@ -446,7 +446,7 @@ RDNA4_DNR(RDNA4CommandQueue)
     pthread_mutex_unlock(&RDNA4R.qlock);
 }
 - (BOOL)rdna4HasResidencySets {
-    return atomic_load_explicit(&_residencySetCount, memory_order_relaxed) != 0u;
+    return atomic_load_explicit(&_residencySetCount, memory_order_acquire) != 0u;
 }
 - (id)device { return _ndev; }
 - (dispatch_queue_t)rdna4CompletionQueue { return _cq; }
@@ -2216,7 +2216,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
             BOOL terminal = segment->terminal;
             if (terminal) terminalClaimed = [self rdna4ClaimTerminal];
             pthread_mutex_unlock(&self->_smu);
-            [self rdna4SignalSegment:segment];
+            [self rdna4SignalSegment:segment releaseRefs:!terminal];
             if (terminal) {
                 if (terminalClaimed) [self rdna4DeliverTerminalSuccessWithQueue:queue];
             } else {
@@ -2390,7 +2390,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     }
 }
 - (void)rdna4PoolDone {
-    [self rdna4UCRelease]; [self rdna4OccResolve]; if (_pser) rdna4_fence_close(_pser);
+    [self rdna4UCRelease]; [self rdna4OccResolve]; if (_pser) { rdna4_fence_close(_pser); _pser = 0; }
     for (RDNA4CommandSegment *segment in _segments) {
         if (segment->fence && segment->done && !segment->retirementUnknown) {
             VkFence f = segment->fence;
@@ -3511,6 +3511,10 @@ RDNA4_DNR(RDNA4RenderEncoder)
 - (void)rdna4ReleaseRenderHandles {
     _baseHandles = nil;
     _fetchHandles = nil;
+    _snapBaseHandles = NULL;
+    _snapFetchHandles = NULL;
+    _handlesSnapCBId = 0;
+    _handlesSnapSegSer = 0;
     _rp1 = VK_NULL_HANDLE;
     _fb = _fbf = VK_NULL_HANDLE;
 }
@@ -4352,9 +4356,12 @@ RDNA4_ENCODER_SHARED
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
     }
-    if (_dcOn) {   // P5b item 2: RADV's radv_CmdBindPipeline re-marks descriptors dirty and re-binds dynamic state even for the same pipeline; viewport / scissor / blend are set below every draw anyway
+    if (_dcOn) {   // P5b item 2: RADV's radv_CmdBindPipeline re-marks descriptors dirty and re-binds dynamic state even for the same pipeline; re-dirty dynamic state whenever pipeline changes (covers vpCount, depth-bias, mesh/ICB switches)
         _dc.draws++;
-        if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp)) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
+        if (!rdna4dc_enc_pipe_same(&_dc, (uint64_t)(uintptr_t)vkp)) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
+            _dynDirty = GARNET_DYN_ALL;
+        }
     } else
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkp);
     const uint32_t dynEmit = _dcOn ? _dynDirty : GARNET_DYN_ALL;

@@ -583,15 +583,17 @@ static void test_source_pins(const char *src_dir, const char *asm_dir) {
           strstr(cb_inc, "[_residencyHeapResources removeAllObjects];") != NULL,
           "command buffer residency wiring");
 
-    // Verify rdna4PoolDone owns residency release (so unresolved/quarantined CBs never UAF).
+    // Verify rdna4ReleaseCompletionRefs owns residency release (after commandBufferDidComplete:, and gated on !unresolved so quarantined CBs never UAF).
     {
-        const char *pd = strstr(cb_inc, "- (void)rdna4PoolDone {");
-        const char *pd_end = pd ? strstr(pd, "\n}\n") : NULL;
-        const char *rs_rel = pd ? strstr(pd, "[_residencySnapshots removeAllObjects];") : NULL;
-        const char *hp_rel = pd ? strstr(pd, "[_residencyHeapResources removeAllObjects];") : NULL;
-        CHECK("pin: residency snapshots released inside rdna4PoolDone",
-              pd != NULL && pd_end != NULL && rs_rel != NULL && hp_rel != NULL &&
-              rs_rel < pd_end && hp_rel < pd_end,
+        const char *rc = strstr(cb_inc, "- (void)rdna4ReleaseCompletionRefs {");
+        const char *rc_end = rc ? strstr(rc, "\n}\n") : NULL;
+        const char *rs_rel = rc ? strstr(rc, "[_residencySnapshots removeAllObjects];") : NULL;
+        const char *hp_rel = rc ? strstr(rc, "[_residencyHeapResources removeAllObjects];") : NULL;
+        const char *fail_fn = strstr(cb_inc, "- (void)rdna4DeliverTerminalFailure:");
+        const char *fail_gate = fail_fn ? strstr(fail_fn, "if (!unresolved) [self rdna4ReleaseCompletionRefs];") : NULL;
+        CHECK("pin: residency snapshots released inside rdna4ReleaseCompletionRefs and gated on !unresolved",
+              rc != NULL && rc_end != NULL && rs_rel != NULL && hp_rel != NULL &&
+              rs_rel < rc_end && hp_rel < rc_end && fail_gate != NULL,
               "retirement-gated release verified");
     }
 
