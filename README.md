@@ -62,12 +62,12 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 ### Step 2: Configure OpenCore
 
 1. Mount your EFI partition.
-2. In **Garnet.app -> OpenCore Assistant**, select the mode recommended on the main screen (`Full-BAR (8/16 GiB)` or `256 MiB Small-BAR`), click **Auto-Configure OpenCore…**, and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`). Garnet backs up `config.plist`, copies `GarnetPCIBarCompat.kext` for Full-BAR mode, updates the required settings, and validates the file.
+2. In **Garnet.app -> OpenCore Assistant**, select the mode recommended on the main screen (`Full-BAR (8/16 GiB)` or `256 MiB Small-BAR`), click **Configure OpenCore…**, and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`). Garnet backs up `config.plist`, copies `GarnetPCIBarCompat.kext` for Full-BAR mode, updates the required settings, and validates the file.
 3. If preflight shows `SIP SETUP NEEDED`, reboot once so the updated `csr-active-config` takes effect.
 
 ### Step 3: Install and reboot
 
-1. In **Garnet.app -> Install / Uninstall**, wait for `READY` and click **Install / Upgrade Driver…** (or run `sudo /Applications/Garnet.app/Contents/Resources/garnetctl install`; enable the Vulkan ICD option or pass `--with-vulkan` if you want RADV Vulkan).
+1. In **Garnet.app -> Install / Uninstall**, wait for `READY` and click **Install / Upgrade Driver…** (or run `sudo /Applications/Garnet.app/Contents/Resources/garnetctl install`; enable the Vulkan ICD option or pass `--with-vulkan` if you want RADV Vulkan). Upgrading from `v0.1.0` automatically migrates `app-denylist.txt` to `/Library/Application Support/Garnet/native` and cleans up legacy runtime directories.
 2. Reboot.
 
 ### App denylist, uninstall, and recovery

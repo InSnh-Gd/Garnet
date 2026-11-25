@@ -3,6 +3,13 @@ import Foundation
 public enum OpenCoreMode: String, Codable, CaseIterable, Sendable {
     case full = "full"
     case modeSmall = "small"
+
+    public var displayName: String {
+        switch self {
+        case .full: return "Full-BAR (8/16 GiB)"
+        case .modeSmall: return "256 MiB Small-BAR"
+        }
+    }
 }
 
 public enum FindingSeverity: String, Codable, Equatable, Sendable {

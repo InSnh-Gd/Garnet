@@ -8,126 +8,121 @@ struct InstallView: View {
     @State private var showUninstallConfirm = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                headerBanner
+        VStack(spacing: 0) {
+            headerBanner
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+            Divider()
 
-                GroupBox("1. Hardware, OS & Kernel Collection Preflight") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let err = model.payloadError {
-                            Label(err, systemImage: "xmark.octagon.fill")
-                                .foregroundColor(.red)
-                        }
-                        if let p = model.verifiedPayload {
-                            Text("Payload: Garnet \(p.garnetVersion) | GarnetAccel \(p.accelVersion) | GarnetPCIBarCompat \(p.pcibarCompatVersion) | Target: Navi 44 (\(p.targetPCIIDs))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        if let pf = model.preflight {
-                            ForEach(pf.checks, id: \.name) { item in
-                                HStack(alignment: .top, spacing: 8) {
-                                    Image(systemName: iconName(level: item.level))
-                                        .foregroundColor(color(level: item.level))
-                                        .frame(width: 18)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.name).fontWeight(.medium)
-                                        Text(item.detail).font(.caption).foregroundColor(.secondary)
-                                    }
-                                    Spacer()
-                                    Text(item.level)
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(color(level: item.level).opacity(0.15))
-                                        .cornerRadius(4)
+            Form {
+                Section("Preflight") {
+                    if let err = model.payloadError {
+                        Label(err, systemImage: "xmark.octagon.fill")
+                            .foregroundColor(.red)
+                    }
+                    if let p = model.verifiedPayload {
+                        Text("Payload: Garnet \(p.garnetVersion) | GarnetAccel \(p.accelVersion) | GarnetPCIBarCompat \(p.pcibarCompatVersion) | Target: Navi 44 (\(p.targetPCIIDs))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    if let pf = model.preflight {
+                        ForEach(pf.checks, id: \.name) { item in
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: iconName(level: item.level))
+                                    .foregroundColor(color(level: item.level))
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name).fontWeight(.medium)
+                                    Text(item.detail).font(.caption).foregroundColor(.secondary)
                                 }
+                                Spacer()
+                                Text(item.level)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(color(level: item.level).opacity(0.15))
+                                    .cornerRadius(4)
                             }
-                            Divider()
-                            VStack(alignment: .leading, spacing: 4) {
-                                Label(
-                                    pf.barRecommendation == .fullBar
-                                        ? "OpenCore Mode Recommendation: Full-BAR (8/16 GiB, Default)"
-                                        : "OpenCore Mode Recommendation: 256 MiB Small-BAR Fallback",
-                                    systemImage: pf.barRecommendation == .fullBar ? "checkmark.shield" : "exclamationmark.triangle"
-                                )
-                                .fontWeight(.semibold)
-                                Text(pf.barReason).font(.caption).foregroundColor(.secondary)
-                                Text(pf.biosReminder).font(.caption).foregroundColor(.orange)
-                            }
-                            if pf.overallStatus == .sipSetupRequired {
-                                sipSetupGuide
-                            }
-                        } else {
-                            Text("Running preflight checks...")
-                                .foregroundColor(.secondary)
                         }
 
-                        HStack {
-                            Button("Re-run Preflight") { model.refreshAll() }
-                                .disabled(model.isBusy)
-                            Spacer()
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(
+                                pf.barRecommendation == .fullBar
+                                    ? "Recommended OpenCore Mode: \(OpenCoreMode.full.displayName)"
+                                    : "Recommended OpenCore Mode: \(OpenCoreMode.modeSmall.displayName)",
+                                systemImage: pf.barRecommendation == .fullBar ? "checkmark.shield" : "exclamationmark.triangle"
+                            )
+                            .fontWeight(.semibold)
+                            Text(pf.barReason).font(.caption).foregroundColor(.secondary)
+                            Text(pf.biosReminder).font(.caption).foregroundColor(.orange)
                         }
+
+                        if pf.overallStatus == .sipSetupRequired {
+                            sipSetupGuide
+                        }
+                    } else {
+                        Text("Running preflight checks...")
+                            .foregroundColor(.secondary)
                     }
-                    .padding(6)
+
+                    HStack {
+                        Button("Re-run Preflight") { model.refreshAll() }
+                            .disabled(model.isBusy)
+                        Spacer()
+                    }
                 }
 
-                GroupBox("2. Install / Upgrade Options (System Disk Only — Never Modifies ESP)") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Installs Garnet.kext + matched GarnetAccel.kext into /Library/Extensions (rebuilding AuxKC while preserving all existing third-party kexts), GarnetMetal.bundle into /Library/GPUBundles, and native translation daemons. Existing app-denylist.txt is preserved on upgrade.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                Section("Install & Upgrade") {
+                    Text("Installs Garnet kexts into /Library/Extensions (rebuilding AuxKC), GarnetMetal.bundle, and translation services. Preserves third-party kexts and migrates v0.1.0 app-denylist.txt into \(GarnetPaths.nativeSupportDir).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
 
-                        Toggle("Also install optional Vulkan ICD (/Library/Vulkan/icd.d/radeon_icd.x86_64.json & radv-app)", isOn: $model.installVulkanICD)
-                        Text("Default OFF: Metal & OpenGL apps use GarnetMetal directly without exposing an unrequested Vulkan ICD.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
+                    Toggle("Also install optional Vulkan ICD (/Library/Vulkan/icd.d/radeon_icd.x86_64.json & radv-app)", isOn: $model.installVulkanICD)
+                    Text("Default OFF: Metal and OpenGL apps use GarnetMetal directly without exposing an unrequested Vulkan ICD.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
 
-                        HStack(spacing: 12) {
-                            Button {
-                                model.runInstall(dryRun: true)
-                            } label: {
-                                Label("Dry-Run Plan", systemImage: "doc.text.magnifyingglass")
-                            }
-                            .disabled(model.isBusy || model.preflight?.canInstall != true)
-
-                            Button {
-                                model.runInstall(dryRun: false)
-                            } label: {
-                                Label("Install / Upgrade Driver…", systemImage: "square.and.arrow.down")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(model.isBusy || model.preflight?.canInstall != true)
-
-                            Spacer()
+                    HStack(spacing: 12) {
+                        Button {
+                            model.runInstall(dryRun: true)
+                        } label: {
+                            Label("Dry-Run Plan", systemImage: "doc.text.magnifyingglass")
                         }
+                        .disabled(model.isBusy || model.preflight?.canInstall != true)
+
+                        Button {
+                            model.runInstall(dryRun: false)
+                        } label: {
+                            Label("Install / Upgrade Driver…", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isBusy || model.preflight?.canInstall != true)
+
+                        Spacer()
                     }
-                    .padding(6)
                 }
 
-                GroupBox("3. Uninstall from System Disk") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Toggle("Also remove saved app-denylist.txt", isOn: $model.removeDenylistOnUninstall)
-                        Text("Removes Garnet components from /Library/Extensions, /Library/GPUBundles, /Library/LaunchDaemons, \(GarnetPaths.nativeSupportDir), and rebuilds AuxKC preserving third-party extensions. Reboot afterwards and disable Garnet OpenCore entries if reverting.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                Section("Uninstall") {
+                    Toggle("Also remove saved app-denylist.txt", isOn: $model.removeDenylistOnUninstall)
+                    Text("Removes Garnet components and legacy v0.1.0 runtime files from \(GarnetPaths.nativeSupportDir) and system directories, then rebuilds AuxKC. Reboot and disable Garnet entries in OpenCore if reverting.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
 
-                        HStack(spacing: 12) {
-                            Button("Uninstall Dry-Run") {
-                                model.runUninstall(dryRun: true)
-                            }
-                            .disabled(model.isBusy)
-
-                            Button(role: .destructive) {
-                                showUninstallConfirm = true
-                            } label: {
-                                Label("Uninstall Garnet…", systemImage: "trash")
-                            }
-                            .disabled(model.isBusy)
-
-                            Spacer()
+                    HStack(spacing: 12) {
+                        Button("Uninstall Dry-Run") {
+                            model.runUninstall(dryRun: true)
                         }
+                        .disabled(model.isBusy)
+
+                        Button(role: .destructive) {
+                            showUninstallConfirm = true
+                        } label: {
+                            Label("Uninstall Garnet…", systemImage: "trash")
+                        }
+                        .disabled(model.isBusy)
+
+                        Spacer()
                     }
-                    .padding(6)
                 }
                 .confirmationDialog(
                     "Remove Garnet from macOS system disk and rebuild AuxKC?",
@@ -139,7 +134,7 @@ struct InstallView: View {
                     Button("Cancel", role: .cancel) {}
                 }
 
-                GroupBox("Execution Log") {
+                Section("Execution Log") {
                     ScrollView {
                         Text(model.actionLog.isEmpty ? "No actions executed yet." : model.actionLog)
                             .font(.system(.caption, design: .monospaced))
@@ -149,7 +144,7 @@ struct InstallView: View {
                     .frame(height: 140)
                 }
             }
-            .padding()
+            .formStyle(.grouped)
         }
     }
 
@@ -158,7 +153,7 @@ struct InstallView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Garnet RX 9060 XT (Navi 44) Installer")
                     .font(.title2).bold()
-                Text("macOS 26.x (x86_64) • Separate OpenCore & System Disk Architecture")
+                Text("Bare-metal x86_64 macOS 26.x — System disk only (ESP untouched)")
                     .font(.subheadline).foregroundColor(.secondary)
             }
             Spacer()
@@ -170,7 +165,6 @@ struct InstallView: View {
 
     private var sipSetupGuide: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Divider()
             Label("SIP / SecureBoot Setup Required Before AuxKC Install", systemImage: "lock.shield")
                 .fontWeight(.semibold)
                 .foregroundColor(.orange)

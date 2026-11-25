@@ -62,12 +62,12 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 ### 第二步：自动配置 OpenCore
 
 1. 手动挂载你的 EFI 分区。
-2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择模式（`Full-BAR (8/16 GiB)` 或 `256 MiB Small-BAR`），点击 **Auto-Configure OpenCore…**，选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`）。程序会自动备份原 `config.plist`、在 Full-BAR 模式下写入 `GarnetPCIBarCompat.kext`、更新所需键值并立即完成校验。
+2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择模式（`Full-BAR (8/16 GiB)` 或 `256 MiB Small-BAR`），点击 **Configure OpenCore…**，选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`）。程序会自动备份原 `config.plist`、在 Full-BAR 模式下写入 `GarnetPCIBarCompat.kext`、更新所需键值并立即完成校验。
 3. 若预检显示 `SIP SETUP NEEDED`，先重启一次让新的 `csr-active-config` 生效。
 
 ### 第三步：安装并重启
 
-1. 在 **Garnet.app -> Install / Uninstall** 确认状态为 `READY` 后，点击 **Install / Upgrade Driver…**（或执行 `sudo /Applications/Garnet.app/Contents/Resources/garnetctl install`；需要 Vulkan 时再勾选 Vulkan ICD 或加 `--with-vulkan`）。
+1. 在 **Garnet.app -> Install / Uninstall** 确认状态为 `READY` 后，点击 **Install / Upgrade Driver…**（或执行 `sudo /Applications/Garnet.app/Contents/Resources/garnetctl install`；需要 Vulkan 时再勾选 Vulkan ICD 或加 `--with-vulkan`）。从 `v0.1.0` 升级会自动迁移 `app-denylist.txt` 到 `/Library/Application Support/Garnet/native` 并清理旧版运行时目录。
 2. 重启进入桌面。
 
 ### 日常管理与应急恢复

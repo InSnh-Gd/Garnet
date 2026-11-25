@@ -67,11 +67,11 @@ path below is taken from the scripts themselves.
   `--controlled` omits/removes those boot jobs and uses `RDNA4_ARGS_CONTROLLED`; `--vm-load-only`
   is preflight-only in a VM (refuses bare metal).
 - `uninstall-native.sh [--check] [--legacy-only] ESP_MOUNT`: removes the install
-  (everything into `/Library/Application Support/RDNA4-backups/uninstall.*`; removes any
+  (everything into `/Library/Application Support/Garnet/backups/uninstall.*`; removes any
   `/Library/Extensions/Garnet*.kext` and residual ESP `Garnet.kext`). `--legacy-only` removes
   only retired artefacts (`Navi48*`/`RDNA4*`/`AMDRadeonRDNA4`) and migrates legacy boot-args to
   `garnet-*`, preserving standalone Garnet.
-- `activate-native.sh`: runs at boot from `/Library/Application Support/RDNA4/native/`.
+- `activate-native.sh`: runs at boot from `/Library/Application Support/Garnet/native/`.
   Requires `org.garnet.driver` to be boot-loaded, rejects legacy conflicting kexts, and late-loads
   `org.garnet.accel`. It checks `garnet-native/metal/metal-disp/metal-ws/apps/multisession` flags,
   the translator, `GarnetMetal.bundle`, compute/quad/sysdraw probes and `garnettest` steps
@@ -100,7 +100,7 @@ enforces completeness):
   `variants/<shortId>/{GarnetAccel.kext,layout-fingerprint.json}`
 - `optional/GarnetPCIBarCompat.kext` (users install into OpenCore `EFI/OC/Kexts/` for Full-BAR (8/16 GiB))
 - `optional/vulkan/radeon_icd.x86_64.json` and `optional/vulkan/radv-app.sh` (optional, default OFF)
-- `default-app-denylist.txt` (template initialized to `/Library/Application Support/RDNA4/native/app-denylist.txt`)
+- `default-app-denylist.txt` (template initialized to `/Library/Application Support/Garnet/native/app-denylist.txt`)
 - `MANIFEST.txt` includes `RELEASE_MODE=1`, `TARGET_SILICON=navi44`, `TARGET_PCI_IDS=1002:7590`,
   `DEFAULT_LAYOUT_ID=<sha256>`, and `AMD_FIRMWARE_LICENSE=LICENSE.amdgpu`.
 

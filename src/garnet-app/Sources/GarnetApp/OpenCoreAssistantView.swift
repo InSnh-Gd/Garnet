@@ -9,136 +9,124 @@ struct OpenCoreAssistantView: View {
     @ObservedObject var model: GarnetAppModel
     @State private var exportStatus: String = ""
     @State private var copiedBanner: String?
-    @State private var dropTargeted: Bool = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("OpenCore Configuration Assistant")
                     .font(.title2).bold()
-                Text("Garnet never mounts your EFI System Partition automatically. Choose your mounted EFI folder or config.plist to back up, update, and validate it.")
-                    .font(.caption)
+                Text("Mount your EFI partition first. Garnet only reads or updates a config.plist you choose.")
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            Divider()
 
-                GroupBox("1. Automatic OpenCore Configuration") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Picker("Target Mode", selection: $model.selectedOCMode) {
-                                Text("Full-BAR (8/16 GiB, Default)").tag(OpenCoreMode.full)
-                                Text("256 MiB Small-BAR Fallback").tag(OpenCoreMode.modeSmall)
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 420)
-
-                            Spacer()
-
-                            Button {
-                                pickAndConfigureOpenCore()
-                            } label: {
-                                Label("Auto-Configure OpenCore…", systemImage: "wand.and.stars")
-                            }
-                            .disabled(model.selectedOCMode == .full && model.payloadURL == nil)
+            Form {
+                Section("OpenCore Configuration") {
+                    HStack {
+                        Picker("Target Mode", selection: $model.selectedOCMode) {
+                            Text(OpenCoreMode.full.displayName).tag(OpenCoreMode.full)
+                            Text(OpenCoreMode.modeSmall.displayName).tag(OpenCoreMode.modeSmall)
                         }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 420)
 
-                        Text("Creates a timestamped config.plist backup, copies GarnetPCIBarCompat.kext to OC/Kexts (Full-BAR mode), updates required OpenCore keys, and validates the output.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Spacer()
 
-                        if let res = model.ocConfigureResult {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Updated: \(res.configPath)")
-                                    .font(.caption).foregroundColor(.green)
-                                Text("Backup: \(res.backupPath)")
+                        Button {
+                            pickAndConfigureOpenCore()
+                        } label: {
+                            Label("Configure OpenCore…", systemImage: "slider.horizontal.3")
+                        }
+                        .disabled(model.selectedOCMode == .full && model.payloadURL == nil)
+                    }
+
+                    Text("Backs up config.plist, copies GarnetPCIBarCompat.kext (Full-BAR mode), writes required keys, and validates.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    if let res = model.ocConfigureResult {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Updated: \(res.configPath)")
+                                .font(.caption).foregroundColor(.green)
+                            Text("Backup: \(res.backupPath)")
+                                .font(.caption2).foregroundColor(.secondary)
+                            if let kextPath = res.kextInstalledPath {
+                                Text("Installed kext: \(kextPath)")
                                     .font(.caption2).foregroundColor(.secondary)
-                                if let kextPath = res.kextInstalledPath {
-                                    Text("Installed kext: \(kextPath)")
-                                        .font(.caption2).foregroundColor(.secondary)
-                                }
                             }
-                        }
-
-                        if let ocErr = model.ocError {
-                            Text(ocErr).font(.caption).foregroundColor(.red)
-                        }
-                        if let rep = model.ocReport {
-                            validationReportView(rep)
                         }
                     }
-                    .padding(6)
+
+                    if let ocErr = model.ocError {
+                        Text(ocErr).font(.caption).foregroundColor(.red)
+                    }
+                    if let rep = model.ocReport {
+                        validationReportView(rep)
+                    }
                 }
 
-                GroupBox("2. Read-Only config.plist Inspector (Drag & Drop or Choose File)") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8)
-                                .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6]))
-                                .foregroundColor(dropTargeted ? .accentColor : .secondary.opacity(0.5))
-                                .frame(height: 68)
-                            HStack(spacing: 12) {
-                                Image(systemName: "doc.badge.gearshape")
-                                    .font(.title2)
-                                Text("Drop config.plist here for a read-only check")
-                                    .font(.caption)
-                                Button("Inspect Read-Only…") {
-                                    pickConfigPlist()
-                                }
-                            }
+                Section("Read-Only config.plist Inspector") {
+                    FileDropRow(
+                        systemImage: "doc.badge.gearshape",
+                        message: "Drop config.plist here for a read-only check",
+                        buttonTitle: "Inspect Read-Only…",
+                        onPick: pickConfigPlist,
+                        onDropURL: { model.validateOpenCoreConfig(at: $0) }
+                    )
+                }
+
+                Section("Manual Export & Reference") {
+                    HStack {
+                        Button {
+                            chooseAndExportPCIBarCompat()
+                        } label: {
+                            Label("Export GarnetPCIBarCompat.kext…", systemImage: "folder.badge.plus")
                         }
-                        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-                            handleDrop(providers: providers)
+                        .disabled(model.payloadURL == nil)
+
+                        if !exportStatus.isEmpty {
+                            Text(exportStatus)
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+
+                        Spacer()
+
+                        Button("Copy Snippet") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode), forType: .string)
+                            copiedBanner = "Copied \(model.selectedOCMode.displayName) snippet"
+                        }
+                        if let copiedBanner {
+                            Text(copiedBanner).font(.caption).foregroundColor(.green)
                         }
                     }
-                    .padding(6)
-                }
 
-                GroupBox("3. Manual Export & Reference Snippets") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Button {
-                                chooseAndExportPCIBarCompat()
-                            } label: {
-                                Label("Export GarnetPCIBarCompat.kext…", systemImage: "folder.badge.plus")
-                            }
-                            .disabled(model.payloadURL == nil)
-
-                            if !exportStatus.isEmpty {
-                                Text(exportStatus)
-                                    .font(.caption)
-                                    .foregroundColor(.green)
-                            }
-
-                            Spacer()
-
-                            Button("Copy Snippet") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode), forType: .string)
-                                copiedBanner = "Copied!"
-                            }
-                            if let copiedBanner {
-                                Text(copiedBanner).font(.caption).foregroundColor(.green)
-                            }
-                        }
-
-                        ScrollView {
-                            Text(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode))
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 140)
-                        .padding(6)
-                        .background(Color(nsColor: .textBackgroundColor))
-                        .cornerRadius(6)
-
-                        Text(OpenCoreValidator.emergencyKillSwitchesText())
-                            .font(.system(.caption2, design: .monospaced))
+                    ScrollView {
+                        Text(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode))
+                            .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
-                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .frame(height: 140)
                     .padding(6)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .cornerRadius(6)
+
+                    Text(OpenCoreValidator.emergencyKillSwitchesText())
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .foregroundColor(.secondary)
                 }
             }
-            .padding()
+            .formStyle(.grouped)
+            .onChange(of: model.selectedOCMode) {
+                copiedBanner = nil
+            }
         }
     }
 
@@ -147,7 +135,7 @@ struct OpenCoreAssistantView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Label(
-                    rep.valid ? "PASS: Config matches \(rep.mode.rawValue) rules" : "INVALID: \(rep.errorCount) error(s), \(rep.warnCount) warning(s)",
+                    rep.valid ? "PASS: Config matches \(rep.mode.displayName) rules" : "INVALID: \(rep.errorCount) error(s), \(rep.warnCount) warning(s)",
                     systemImage: rep.valid ? "checkmark.seal.fill" : "xmark.octagon.fill"
                 )
                 .foregroundColor(rep.valid ? .green : .red)
@@ -207,19 +195,5 @@ struct OpenCoreAssistantView: View {
         if panel.runModal() == .OK, let u = panel.url {
             model.validateOpenCoreConfig(at: u)
         }
-    }
-
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
-            return false
-        }
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-            guard let data = item as? Data,
-                  let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-            Task { @MainActor in
-                model.validateOpenCoreConfig(at: url)
-            }
-        }
-        return true
     }
 }

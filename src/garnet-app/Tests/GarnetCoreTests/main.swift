@@ -1135,6 +1135,9 @@ struct GarnetCoreTestsRunner {
               && !fm.fileExists(atPath: legacyNativeDir.path))
         check("Hardware-test backup survives repeated install and uninstall",
               (try? String(contentsOf: hwBackupDir.appendingPathComponent("sentinel.txt"), encoding: .utf8)) == "hardware-test-backup-sentinel\n")
+        check("OpenCoreMode displayName uses human-readable labels",
+              OpenCoreMode.full.displayName == "Full-BAR (8/16 GiB)"
+              && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")
     }
 
     static func runOptionalReal25G332Checks() throws {

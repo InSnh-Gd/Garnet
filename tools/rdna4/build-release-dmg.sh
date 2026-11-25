@@ -87,10 +87,10 @@ Garnet RDNA 4 Driver v${VERSION} — Release 1 (Radeon RX 9060 XT / Navi 44, mac
 4. Quick Install Steps
    a) Open Garnet.app -> "Install / Uninstall" -> check Preflight (and Full-BAR vs 256M Small-BAR recommendation).
    b) Mount your EFI partition, then open Garnet.app -> "OpenCore Assistant": select the recommended mode and click
-      "Auto-Configure OpenCore..." (or use read-only Validate / Export Kext). It backs up config.plist, copies
+      "Configure OpenCore..." (or use read-only Validate / Export Kext). It backs up config.plist, copies
       GarnetPCIBarCompat.kext for Full-BAR mode, sets SecureBootModel = Disabled and csr-active-config = <03080000>, and validates the result.
    c) If Preflight showed "SIP SETUP NEEDED", reboot once so the updated csr-active-config takes effect.
-   d) Click "Install / Upgrade Driver..." (Vulkan ICD stays OFF by default unless checked), then reboot.
+   d) Click "Install / Upgrade Driver..." (Vulkan ICD stays OFF by default unless checked; upgrades from v0.1.0 automatically migrate app-denylist.txt to /Library/Application Support/Garnet/native and clean up legacy runtime files), then reboot.
 
 5. Emergency OpenCore boot-arg Kill-Switches
    - garnet=0               Disable Garnet primary driver completely
@@ -105,8 +105,8 @@ Garnet RDNA 4 Driver v${VERSION} — Release 1 (Radeon RX 9060 XT / Navi 44, mac
 - 首次打开如遇 Gatekeeper 提示，执行：xattr -dr com.apple.quarantine /Applications/Garnet.app 或右键“打开”。
 - 严格区分路径：GarnetPCIBarCompat.kext 仅放 EFI/OC/Kexts/（默认 Full-BAR (8/16 GiB) 模式启用，256M 小 BAR 回退模式不启用）；
   Garnet.kext 与 GarnetAccel.kext 仅由 Garnet.app 装入系统盘 /Library/Extensions/ 并重建 AuxKC，严禁放入 OpenCore EFI。
-- 手动挂载 EFI 分区后，可在“OpenCore Assistant”点击“Auto-Configure OpenCore...”自动备份并配置 config.plist（或仅只读校验），
-  若预检提示 SIP SETUP NEEDED 先重启一次，再点击安装并重启；程序绝不自动挂载 ESP。
+- 手动挂载 EFI 分区后，可在“OpenCore Assistant”点击“Configure OpenCore...”自动备份并配置 config.plist（或仅只读校验），
+  若预检提示 SIP SETUP NEEDED 先重启一次，再点击安装并重启；从 v0.1.0 升级时会自动迁移 app-denylist.txt 至 /Library/Application Support/Garnet/native 并清理旧版运行时目录；程序绝不自动挂载 ESP。
 EOF
 
 find "$DMG_ROOT" \( -name '.DS_Store' -o -name '._*' \) -delete
