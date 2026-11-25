@@ -67,4 +67,27 @@ static inline int garnet_qp_should_elide_dcopy(int has_disp_copy_vk, int slot, i
     return has_disp_copy_vk && slot >= 0 && !damage_on && (is_superseded || pending_newer_same_sid);
 }
 
+// Adaptive launch deferral for a WindowServer FINAL CB carrying dispCopyVk while
+// paired FINAL->COMP compositing is armed. Gives the paired COMP commit a short
+// bounded window to arrive so FINAL's wasted 4K dispCopyVk is elided before submit.
+#define GARNET_QP_FINAL_COALESCE_MIN_NS     200000ULL
+#define GARNET_QP_FINAL_COALESCE_DEFAULT_NS 250000ULL
+#define GARNET_QP_FINAL_COALESCE_PAD_NS     150000ULL
+#define GARNET_QP_FINAL_COALESCE_MAX_NS     800000ULL
+
+static inline uint64_t garnet_qp_final_defer_ns(int is_ws, int has_disp_copy_vk, int is_final,
+                                                int sync_commit, int hold_armed, int damage_on,
+                                                int pending_newer_same_sid, int is_superseded,
+                                                uint64_t pair_gap_ns, uint64_t tcommit, uint64_t now) {
+    if (!is_ws || !has_disp_copy_vk || !is_final || sync_commit || !hold_armed || damage_on ||
+        pending_newer_same_sid || is_superseded || !tcommit)
+        return 0u;
+    uint64_t win = pair_gap_ns ? (pair_gap_ns + GARNET_QP_FINAL_COALESCE_PAD_NS)
+                               : GARNET_QP_FINAL_COALESCE_DEFAULT_NS;
+    if (win < GARNET_QP_FINAL_COALESCE_MIN_NS) win = GARNET_QP_FINAL_COALESCE_MIN_NS;
+    if (win > GARNET_QP_FINAL_COALESCE_MAX_NS) win = GARNET_QP_FINAL_COALESCE_MAX_NS;
+    const uint64_t elapsed = (now >= tcommit) ? (now - tcommit) : 0u;
+    return (elapsed < win) ? (win - elapsed) : 0u;
+}
+
 #endif

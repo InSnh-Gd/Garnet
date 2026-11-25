@@ -131,6 +131,25 @@ int main(void) {
     CHECK("1000 out-of-order fence completions deliver strictly FIFO",
           order_ok && next_deliver == 1000 && sim.inflight_count == 0u && sim.max_observed_depth == 4u);
 
+    // 7. Adaptive FINAL D-copy coalesce deferral
+    CHECK("defer: default 250 us when armed WS FINAL has no pair_gap yet",
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 0, 0, 1000000ULL, 1050000ULL) == 200000ULL);
+    CHECK("defer: adaptive window tracks pair_gap + 150 us clamped [200, 800] us",
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 200000ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 0, 400000ULL, 1000000ULL, 1050000ULL) == 500000ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 0, 2000000ULL, 1000000ULL, 1100000ULL) == 700000ULL);
+    CHECK("defer: zero once elapsed >= window",
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1210000ULL) == 0ULL);
+    CHECK("defer: zero when non-WS, non-FINAL, syncCommit, disarmed, damageOn, or already superseded/pendingNewer",
+          garnet_qp_final_defer_ns(0, 1, 1, 0, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 0, 1, 0, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 0, 0, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 1, 1, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 0, 0, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 1, 0, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 1, 0, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL &&
+          garnet_qp_final_defer_ns(1, 1, 1, 0, 1, 0, 0, 1, 60000ULL, 1000000ULL, 1010000ULL) == 0ULL);
+
     printf("test-queue-pipe: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

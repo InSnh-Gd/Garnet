@@ -14,6 +14,25 @@
 #define RDNA4DC_LRU_CAP  16u   // per-stage same-segment descriptor-set reuse slots (owned by RDNA4CommandBuffer)
 #define RDNA4DC_LRU_MAXW 32u   // max signature words kept in the segment LRU (covers layout+dsl+15 bindings)
 
+// Per-encoder dirty bits for skipping redundant texture/VB/descriptor work across draws.
+#define GARNET_DRAW_DIRTY_PIPE   (1u << 0)
+#define GARNET_DRAW_DIRTY_VSTAGE (1u << 1)
+#define GARNET_DRAW_DIRTY_FSTAGE (1u << 2)
+#define GARNET_DRAW_DIRTY_VB     (1u << 3)
+#define GARNET_DRAW_DIRTY_PASS   (1u << 4)
+#define GARNET_DRAW_DIRTY_ALL    (GARNET_DRAW_DIRTY_PIPE | GARNET_DRAW_DIRTY_VSTAGE | \
+                                  GARNET_DRAW_DIRTY_FSTAGE | GARNET_DRAW_DIRTY_VB | GARNET_DRAW_DIRTY_PASS)
+
+static inline int rdna4dc_stage_can_skip(int valid, uint32_t draw_dirty, uint32_t stage_bit, int need_arg_prep) {
+    return valid && !need_arg_prep && (draw_dirty & (stage_bit | GARNET_DRAW_DIRTY_PASS)) == 0u;
+}
+static inline int rdna4dc_clean_draw_ready(int clean_fast_ok, uint32_t draw_dirty, uint32_t dyn_dirty,
+                                           int topo_same, int in_pass, int has_err, int has_arg_writes,
+                                           int has_arg_res, int seg_same) {
+    return clean_fast_ok && draw_dirty == 0u && dyn_dirty == 0u && topo_same &&
+           in_pass && !has_err && !has_arg_writes && !has_arg_res && seg_same;
+}
+
 typedef struct { uint32_t n; int over; uint64_t w[RDNA4DC_MAXW]; } rdna4dc_sig;
 static inline void rdna4dc_sig_begin(rdna4dc_sig *s, uint64_t layout, uint64_t dsl) { s->n = 0; s->over = 0; s->w[s->n++] = layout; s->w[s->n++] = dsl; }
 static inline void rdna4dc_sig_push(rdna4dc_sig *s, uint64_t v) { if (s->n >= RDNA4DC_MAXW) { s->over = 1; return; } s->w[s->n++] = v; }

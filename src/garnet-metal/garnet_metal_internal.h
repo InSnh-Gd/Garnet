@@ -1295,6 +1295,7 @@ typedef struct {
     garnet_vkpool_t _cmdPool;
     garnet_qp_t _qp;
     NSUInteger _launchedCount;
+    BOOL _submitting, _scheduleKickNeeded, _deferTimerArmed;
     _Atomic uint32_t _residencySetCount;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
@@ -1353,6 +1354,7 @@ typedef struct {
 @public
     BOOL _launchedAsBarrier, _fifoDoneFailed;
     void (^_fifoDoneBlock)(void);
+    BOOL _syncCommit;
 }
 - (VkCommandBuffer)rdna4BlitVK;
 - (void)rdna4NativeRecord:(RDNA4NativeOp)op;
@@ -1367,6 +1369,9 @@ typedef struct {
 - (void)rdna4OccResolve;   // build 18 (P2): called from rdna4PoolDone
 - (void)rdna4PrepareForSubmission;
 - (BOOL)rdna4PipelineEligible;
+- (BOOL)rdna4HasEvents;
+- (BOOL)rdna4MayDeferFinal;
+- (uint64_t)rdna4FinalDeferNs;
 - (uint32_t)rdna4DisplayTargetSid;
 - (BOOL)rdna4AdvanceWithQueue:(RDNA4CommandQueue *)queue;
 - (BOOL)rdna4OpenSegment:(NSError **)err;
@@ -1508,6 +1513,14 @@ typedef struct {
     NSUInteger _csbEndV[RDNA4CNT_MAX_PASS_ATTACHMENTS], _csbEndF[RDNA4CNT_MAX_PASS_ATTACHMENTS];
     uint32_t _nCsbEnd;
     uint32_t _dynDirty;
+    uint32_t _drawDirty;
+    BOOL _hasDispAtt, _cleanFastOk;
+    VkPrimitiveTopology _lastTopo;
+    VkBuffer _boundVBuf[31];
+    VkDeviceSize _boundVOff[31];
+    VkBuffer _boundIBuf;
+    VkDeviceSize _boundIOff;
+    VkIndexType _boundIType;
     uint64_t _handlesSnapCBId, _handlesSnapSegSer;
     __unsafe_unretained id _snapBaseHandles, _snapFetchHandles;
 }
@@ -1515,7 +1528,7 @@ typedef struct {
 - (void)rdna4ReleaseRenderHandles;
 @end
 
-@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; NSUInteger _tgMemLengths[RDNA4_ICB_MAX_TG_MEM_INDICES]; MTLRegion _stageInRegion; BOOL _hasStageInRegion; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; }
+@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; NSUInteger _tgMemLengths[RDNA4_ICB_MAX_TG_MEM_INDICES]; MTLRegion _stageInRegion; BOOL _hasStageInRegion; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; VkPipeline _boundPipe; VkPipelineLayout _boundLayout; VkDescriptorSet _boundSet; uint32_t _boundLocal[3]; BOOL _boundIndirect; NSUInteger _boundTgBytes; uint32_t _boundPC[12]; BOOL _boundPCValid; uint64_t _compSegSerial; BOOL _compStateDirty; }
 - (instancetype)initWithCommandBuffer:(id)cb compute:(int)dummy;
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLComputePassDescriptor *)d;
 @end
@@ -2731,7 +2744,7 @@ typedef struct {
 - (NSUInteger)getType;
 - (BOOL)rdna4CheckResolve:(uint32_t)i;
 - (void)rdna4RunDSResolveInto:(RDNA4Texture *)dst level:(uint32_t)dlvl slice:(uint32_t)dslice depthMode:(VkResolveModeFlagBits)dMode stencilMode:(VkResolveModeFlagBits)sMode;
-- (void)rdna4ResolveAll;
+- (BOOL)rdna4ResolveAll;
 - (void)setRenderPipelineState:(id)pso;
 - (void)setCullMode:(MTLCullMode)m;
 - (void)setFrontFacingWinding:(MTLWinding)w;

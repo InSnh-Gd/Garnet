@@ -149,6 +149,27 @@ int main(void) {
       k2 = rk(1, 0); k2.a[0].format = 1000 + 7; CHECK("entries still found when full", rdna4dc_rp_find(c, &k2) == 0x207, "hit");
       free(c); }
 
+    // ---- 6. draw dirty flags & clean-draw fast-path gate ----
+    CHECK("stage skip allowed when valid, stage clean, pass clean, no arg prep",
+          rdna4dc_stage_can_skip(1, GARNET_DRAW_DIRTY_FSTAGE, GARNET_DRAW_DIRTY_VSTAGE, 0) == 1 &&
+          rdna4dc_stage_can_skip(1, GARNET_DRAW_DIRTY_VSTAGE, GARNET_DRAW_DIRTY_FSTAGE, 0) == 1, "stage independent");
+    CHECK("stage skip blocked when invalid, stage dirty, pass dirty, or arg prep active",
+          rdna4dc_stage_can_skip(0, 0u, GARNET_DRAW_DIRTY_VSTAGE, 0) == 0 &&
+          rdna4dc_stage_can_skip(1, GARNET_DRAW_DIRTY_VSTAGE, GARNET_DRAW_DIRTY_VSTAGE, 0) == 0 &&
+          rdna4dc_stage_can_skip(1, GARNET_DRAW_DIRTY_PASS, GARNET_DRAW_DIRTY_VSTAGE, 0) == 0 &&
+          rdna4dc_stage_can_skip(1, 0u, GARNET_DRAW_DIRTY_VSTAGE, 1) == 0, "blocked");
+    CHECK("clean draw ready only when all invariants hold",
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 0, 0, 1) == 1 &&
+          rdna4dc_clean_draw_ready(0, 0u, 0u, 1, 1, 0, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, GARNET_DRAW_DIRTY_PIPE, 0u, 1, 1, 0, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 1u, 1, 1, 0, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 0, 1, 0, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 0, 0, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 1, 0, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 1, 0, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 0, 1, 1) == 0 &&
+          rdna4dc_clean_draw_ready(1, 0u, 0u, 1, 1, 0, 0, 0, 0) == 0, "gated");
+
     printf("%s: %d failure(s)\n", fails ? "FAILED" : "all passed", fails);
     return fails != 0;
 }

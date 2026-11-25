@@ -1657,13 +1657,53 @@ _Static_assert((int)MTLTextureTypeTextureBuffer == RDNA4TD_MTL_BUFFER, "MTLTextu
 - (id)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr { return [self newTextureWithDescriptor:d offset:off bytesPerRow:bpr]; }
 @end
 
+static void rdna4_layout_barrier_masks(VkImageLayout layout, BOOL isSrc,
+                                       VkPipelineStageFlags *stage, VkAccessFlags *access) {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        *stage = isSrc ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        *access = isSrc ? 0 : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        return;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        *stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        *access = isSrc ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                        : (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        return;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        *stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        *access = isSrc ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                        : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        return;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        *stage = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        *access = isSrc ? 0 : VK_ACCESS_SHADER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        *stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *access = isSrc ? 0 : VK_ACCESS_TRANSFER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        *stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    default:
+        *stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        *access = isSrc ? VK_ACCESS_MEMORY_WRITE_BIT : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        return;
+    }
+}
+
 GARNET_INTERNAL void rdna4_image_transition(VkCommandBuffer cmd, RDNA4Texture *t, VkImageLayout oldLayout, VkImageLayout newLayout) {
     if (oldLayout == newLayout) return;
+    VkPipelineStageFlags srcStage = 0, dstStage = 0;
+    VkAccessFlags srcAccess = 0, dstAccess = 0;
+    rdna4_layout_barrier_masks(oldLayout, YES, &srcStage, &srcAccess);
+    rdna4_layout_barrier_masks(newLayout, NO, &dstStage, &dstAccess);
     VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        .srcAccessMask = srcAccess, .dstAccessMask = dstAccess,
         .oldLayout = oldLayout, .newLayout = newLayout, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = [t vkImage], .subresourceRange = { rdna4dp_barrier_aspect([t rdna4Aspects]), 0, [t rdna4Levels], 0, [t rdna4ImageLayers] } };   // bundle 10: a depth/stencil image's barrier names its own aspects
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &ib);
     [t setLayout:newLayout];
 }
 GARNET_INTERNAL VkImageLayout rdna4_use_layout(RDNA4Texture *texture, VkImageLayout preferred) {
