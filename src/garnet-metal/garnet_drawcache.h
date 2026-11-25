@@ -33,12 +33,19 @@ static inline int rdna4dc_clean_draw_ready(int clean_fast_ok, uint32_t draw_dirt
            in_pass && !has_err && !has_arg_writes && !has_arg_res && seg_same;
 }
 
-typedef struct { uint32_t n; int over; uint64_t w[RDNA4DC_MAXW]; } rdna4dc_sig;
-static inline void rdna4dc_sig_begin(rdna4dc_sig *s, uint64_t layout, uint64_t dsl) { s->n = 0; s->over = 0; s->w[s->n++] = layout; s->w[s->n++] = dsl; }
-static inline void rdna4dc_sig_push(rdna4dc_sig *s, uint64_t v) { if (s->n >= RDNA4DC_MAXW) { s->over = 1; return; } s->w[s->n++] = v; }
+typedef struct { uint32_t n; int over; uint64_t hash; uint64_t w[RDNA4DC_MAXW]; } rdna4dc_sig;
+static inline void rdna4dc_sig_begin(rdna4dc_sig *s, uint64_t layout, uint64_t dsl) {
+    s->n = 2u; s->over = 0; s->w[0] = layout; s->w[1] = dsl;
+    s->hash = (layout * 0x9e3779b97f4a7c15ULL) ^ dsl;
+}
+static inline void rdna4dc_sig_push(rdna4dc_sig *s, uint64_t v) {
+    if (s->n >= RDNA4DC_MAXW) { s->over = 1; return; }
+    s->w[s->n++] = v;
+    s->hash = (s->hash ^ v) * 0x100000001b3ULL;
+}
 
-typedef struct { int valid; uint32_t n; uint64_t w[RDNA4DC_MAXW]; uint64_t set; } rdna4dc_stage;
-static inline void rdna4dc_stage_reset(rdna4dc_stage *t) { t->valid = 0; t->n = 0; t->set = 0; }
+typedef struct { int valid; uint32_t n; uint64_t hash; uint64_t w[RDNA4DC_MAXW]; uint64_t set; } rdna4dc_stage;
+static inline void rdna4dc_stage_reset(rdna4dc_stage *t) { t->valid = 0; t->n = 0; t->hash = 0; t->set = 0; }
 // Inline word copy/compare: avoids PLT calls to _platform_memmove/memcmp on short 4..16 word signatures.
 static inline void rdna4dc_copy_words(uint64_t *dst, const uint64_t *src, uint32_t n) {
     uint32_t i = 0;
@@ -54,16 +61,16 @@ static inline int rdna4dc_eq_words(const uint64_t *a, const uint64_t *b, uint32_
 }
 // YES when the stage holds a set built from exactly this signature (then *set is that set).
 static inline int rdna4dc_stage_match(const rdna4dc_stage *t, const rdna4dc_sig *s, uint64_t *set) {
-    if (s->over || !t->valid || t->n != s->n || !rdna4dc_eq_words(t->w, s->w, s->n)) return 0;
+    if (s->over || !t->valid || t->hash != s->hash || t->n != s->n || !rdna4dc_eq_words(t->w, s->w, s->n)) return 0;
     *set = t->set; return 1;
 }
 static inline void rdna4dc_stage_store(rdna4dc_stage *t, const rdna4dc_sig *s, uint64_t set) {
     if (s->over) { rdna4dc_stage_reset(t); return; }
-    t->valid = 1; t->n = s->n; rdna4dc_copy_words(t->w, s->w, s->n); t->set = set;
+    t->valid = 1; t->n = s->n; t->hash = s->hash; rdna4dc_copy_words(t->w, s->w, s->n); t->set = set;
 }
 
 typedef struct { uint32_t topo, cull, front; const void *pso; uint64_t pipe; } rdna4dc_pce;
-typedef struct { uint32_t n; uint64_t set; uint64_t w[RDNA4DC_LRU_MAXW]; } rdna4dc_lru_ent;
+typedef struct { uint32_t n; uint64_t hash; uint64_t set; uint64_t w[RDNA4DC_LRU_MAXW]; } rdna4dc_lru_ent;
 
 // Command-buffer-scoped cache shared across all render encoders in the same command buffer/segment.
 // WindowServer averages <2 draws per render encoder (~40 encoders/CB); hoisting pc[] and lru[][] out of
@@ -109,10 +116,11 @@ static inline int rdna4dc_cb_lru_find(const rdna4dc_cbcache *c, int idx, const r
     if (s->over || s->n < 2u || s->n > RDNA4DC_LRU_MAXW || (unsigned)idx >= 2u) return 0;
     const uint8_t n = c->lruN[idx];
     const uint32_t sn = s->n;
+    const uint64_t sh = s->hash;
     const rdna4dc_lru_ent *arr = c->lru[idx];
     for (uint8_t i = 0; i < n; i++) {
         const rdna4dc_lru_ent *ent = &arr[i];
-        if (ent->n == sn && ent->w[0] == s->w[0] && ent->w[1] == s->w[1] &&
+        if (ent->hash == sh && ent->n == sn && ent->w[0] == s->w[0] && ent->w[1] == s->w[1] &&
             (sn == 2u || rdna4dc_eq_words(ent->w + 2, s->w + 2, sn - 2u))) {
             *set = ent->set; return 1;
         }
@@ -125,7 +133,7 @@ static inline void rdna4dc_cb_lru_put(rdna4dc_cbcache *c, int idx, const rdna4dc
     if (c->lruN[idx] < RDNA4DC_LRU_CAP) slot = c->lruN[idx]++;
     else { slot = c->lruNext[idx]; c->lruNext[idx] = (uint8_t)((slot + 1u) & (RDNA4DC_LRU_CAP - 1u)); }
     rdna4dc_lru_ent *ent = &c->lru[idx][slot];
-    ent->n = s->n; ent->set = set; rdna4dc_copy_words(ent->w, s->w, s->n);
+    ent->n = s->n; ent->hash = s->hash; ent->set = set; rdna4dc_copy_words(ent->w, s->w, s->n);
 }
 
 typedef struct {

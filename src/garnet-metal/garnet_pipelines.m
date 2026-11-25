@@ -72,6 +72,28 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
 - (uint32_t)rdna4DrawBits { return _drawBits; }
 - (BOOL)rdna4HasFragment { return _hasFrag; }
 - (BOOL)rdna4IsRenderFallback { return _fallback; }
+- (void)rdna4FillFast:(RDNA4RenderPSOFast *)out {
+    out->layout = _pl;
+    out->dsl[0] = _dsl[0];
+    out->dsl[1] = _dsl[1];
+    out->pbV = _pbV; out->pbF = _pbF;
+    out->npbV = _npbV; out->npbF = _npbF;
+    out->need = _need; out->nNeed = _nneed;
+    out->argTables = &_argumentTables;
+    out->dsVk = _dsVk;
+    out->sampleCount = _pc.samples;
+    out->maxAmp = _maxAmp ? _maxAmp : 1u;
+    out->drawBits = _drawBits;
+    out->fetchMax = _fetchMax;
+    out->hasFrag = _hasFrag ? 1u : 0u;
+    out->hasDS = (_dsVk != VK_FORMAT_UNDEFINED) ? 1u : 0u;
+    out->hasDepth = (_dpf != MTLPixelFormatInvalid) ? 1u : 0u;
+    out->fetch = _fetch ? 1u : 0u;
+    out->isFallback = _fallback ? 1u : 0u;
+    out->isTess = _isTess ? 1u : 0u;
+    out->isMesh = [self rdna4IsMeshPipeline] ? 1u : 0u;
+    out->hasAddrReg = _hasAddressRegistry ? 1u : 0u;
+}
 - (RDNA4RenderPipelineState *)rdna4Real { uintptr_t p = rdna4hs_load(&_realp); return p ? (__bridge RDNA4RenderPipelineState *)(void *)p : nil; }
 // Runs on the watcher queue. Builds a complete NEW pipeline object from the recorded descriptor (no fallback allowed, no AIR dump) and publishes it.
 - (BOOL)rdna4HotRebuild {
@@ -2234,9 +2256,10 @@ GARNET_INTERNAL BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
     for (uint32_t i = 0; i < _count; i++) {
         if (_entries[i].obj) CFRelease(_entries[i].obj);
     }
-    free(_entries);
+    if (_entries && _entries != _inline) free(_entries);
 }
 - (void)setObject:(id)object key:(uint64_t)key {
+    if (!_entries) { _entries = _inline; _cap = 8u; }
     for (uint32_t i = 0; i < _count; i++) {
         if (_entries[i].key != key) continue;
         if (!object) {
@@ -2255,8 +2278,15 @@ GARNET_INTERNAL BOOL rdna4_encoder_take_segment_change(uint64_t *tracked,
     if (!object) return;
     if (_count == _cap) {
         uint32_t nextCap = _cap ? _cap * 2u : 16u;
-        RDNA4ResBindEntry *grown = realloc(_entries, (size_t)nextCap * sizeof(*grown));
-        if (!grown) return;
+        RDNA4ResBindEntry *grown;
+        if (_entries == _inline) {
+            grown = malloc((size_t)nextCap * sizeof(*grown));
+            if (!grown) return;
+            if (_count) memcpy(grown, _inline, (size_t)_count * sizeof(*grown));
+        } else {
+            grown = realloc(_entries, (size_t)nextCap * sizeof(*grown));
+            if (!grown) return;
+        }
         _entries = grown;
         _cap = nextCap;
     }

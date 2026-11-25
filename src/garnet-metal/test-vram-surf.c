@@ -214,6 +214,28 @@ int main(void) {
           garnet_vs_pathb_should_upload(pb42, 42u) == 0 &&
           garnet_vs_pathb_should_upload(pb42, 43u) == 1);
 
+    // 9. Wave 6 dirty DisplaySurface seed-change immunity (never overwrite dirty VRAM with stale host RAM)
+    garnet_vs_range_t rd = r1; rd.sid = 109; rd.base = 0x9000000;
+    uint64_t idDisp = garnet_vs_add(&c, &rd, GARNET_VS_VK_BGRA8_UNORM, supersetUse, 32ULL << 20,
+                                    (void *)0x1009, (void *)0x2009, (void *)0x3009, (void *)0x4009, (void *)0x5009, 7000);
+    garnet_vs_set_disp(&c, idDisp, 1);
+    garnet_vs_set_layout(&c, idDisp, 2);
+    garnet_vs_note_gpu_write(&c, idDisp, 50, 7000, 0 /* lazy dirty */);
+    CHECK("dirty DisplaySurface ignores seed bump in peek and begin_access",
+          garnet_vs_peek_needs_upload(&c, idDisp, 51) == 0 &&
+          garnet_vs_begin_access(&c, idDisp, 51, 1, 0, 0) == 0);
+    uint64_t dgen = 0;
+    CHECK("after flush clears dirty, seed bump triggers upload again",
+          garnet_vs_begin_sync_flush(&c, idDisp, &dgen) == 1);
+    garnet_vs_finish_flush(&c, idDisp, dgen, 1);
+    CHECK("clean DisplaySurface re-uploads on seed change",
+          garnet_vs_peek_needs_upload(&c, idDisp, 52) == 1 &&
+          garnet_vs_begin_access(&c, idDisp, 52, 1, 0, 0) == 1);
+    garnet_vs_note_gpu_write(&c, idDisp, 52, 8000, 0);
+    garnet_vs_invalidate_cpu_write(&c, idDisp);
+    CHECK("CPU invalidation still forces upload on DisplaySurface",
+          garnet_vs_peek_needs_upload(&c, idDisp, 52) == 1);
+
     garnet_vs_destroy(&c);
     printf("test-vram-surf: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

@@ -910,6 +910,13 @@ GARNET_INTERNAL BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed) {
     return up != 0;
 }
 
+GARNET_INTERNAL void rdna4_vs_note_upload_skip(void) {
+    if (!RDNA4VS.on) return;
+    pthread_mutex_lock(&RDNA4VS.mu);
+    RDNA4VS.c.uploads_skipped++;
+    pthread_mutex_unlock(&RDNA4VS.mu);
+}
+
 GARNET_INTERNAL BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite) {
     if (!RDNA4VS.on || !vsId) return needContents;
     pthread_mutex_lock(&RDNA4VS.mu);
@@ -968,7 +975,10 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
     probe = garnet_vs_probe(&RDNA4VS.c, &vr, (uint32_t)fmt->vk, (uint32_t)reqUse, now, st, &hitId);
     if (probe == GARNET_VS_PROBE_HIT) {
         garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, hitId);
-        if (e) { hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf; }
+        if (e) {
+            if (isDisp) e->is_disp = 1;
+            hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf;
+        }
     } else if (probe == GARNET_VS_PROBE_MISS) {
         const int wantWrite = (mtlUsage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) ? 1 : 0;
         promote = garnet_vs_should_promote(&RDNA4VS.c, vr.sid, vr.w, vr.h, isDisp ? 1 : 0, hostReadOnly ? 1 : 0, 1, wantWrite);
@@ -1063,7 +1073,7 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
     int reProbe = garnet_vs_probe(&RDNA4VS.c, &vr, (uint32_t)fmt->vk, (uint32_t)reqUse, rdna4_now(), st, &hitId);
     if (reProbe == GARNET_VS_PROBE_HIT) {
         garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, hitId);
-        if (e) { hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf; finalId = hitId; raced = YES; }
+        if (e) { if (isDisp) e->is_disp = 1; hitImg = (VkImage)e->opt_img; hitBuf = (VkBuffer)e->ibuf; finalId = hitId; raced = YES; }
     } else if (reProbe == GARNET_VS_PROBE_INCOMPAT_FLUSH) {
         abortInsert = YES;
         incompatId = hitId;
@@ -1073,6 +1083,7 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
                                 (void *)optImg, (void *)optMem, (void *)entryIbuf, (void *)entryImem, (void *)owner, rdna4_now());
         if (finalId) {
             garnet_vs_set_bpp(&RDNA4VS.c, finalId, fmt->bpp);
+            garnet_vs_set_disp(&RDNA4VS.c, finalId, isDisp ? 1 : 0);
             atomic_fetch_add(&rdna4_alloc_total, mr.size);
         } else {
             abortInsert = YES;
@@ -2219,7 +2230,55 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
     _hpId = _hpBlk = _hpLease = _hpBindOff = _hpPhysSize = 0;
     _hpDedicated = _hpAl = NO; _hpOff = _hpSize = 0; _size = 0; _acct = 0;
 }
+- (void)rdna4DestroyFBCache {
+    os_unfair_lock_lock(&_fbLock);
+    const uint8_t n = _fbCacheN;
+    _fbCacheN = 0;
+    VkFramebuffer fbs[4];
+    for (uint8_t i = 0; i < n; i++) { fbs[i] = _fbCache[i].fb; _fbCache[i].fb = VK_NULL_HANDLE; }
+    os_unfair_lock_unlock(&_fbLock);
+    if (RDNA4R.ok) for (uint8_t i = 0; i < n; i++) if (fbs[i]) vkDestroyFramebuffer(RDNA4R.dev, fbs[i], NULL);
+}
+- (VkFramebuffer)rdna4CachedFramebufferForRP:(VkRenderPass)rp view:(VkImageView)view width:(uint32_t)w height:(uint32_t)h {
+    if (!RDNA4DO.on || RDNA4P.auditSubmit || !RDNA4R.ok || _hpHeap || (_root && [self rdna4ResourceHeap]) || !rp || !view ||
+        RDNA4R.realCreateFB == NULL || vkCreateFramebuffer != RDNA4R.realCreateFB ||
+        vkDestroyFramebuffer != RDNA4R.realDestroyFB)
+        return VK_NULL_HANDLE;
+    os_unfair_lock_lock(&_fbLock);
+    for (uint8_t i = 0; i < _fbCacheN; i++) {
+        if (_fbCache[i].rp == rp && _fbCache[i].view == view && _fbCache[i].w == w && _fbCache[i].h == h) {
+            VkFramebuffer hit = _fbCache[i].fb;
+            os_unfair_lock_unlock(&_fbLock);
+            return hit;
+        }
+    }
+    const BOOL full = _fbCacheN >= 4u;
+    os_unfair_lock_unlock(&_fbLock);
+    if (full) return VK_NULL_HANDLE;   // never evict a potentially in-flight cached FB; caller falls back to per-pass handles
+    VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp,
+        .attachmentCount = 1, .pAttachments = &view, .width = w, .height = h, .layers = 1 };
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &fb) != VK_SUCCESS || !fb) return VK_NULL_HANDLE;
+    os_unfair_lock_lock(&_fbLock);
+    for (uint8_t i = 0; i < _fbCacheN; i++) {
+        if (_fbCache[i].rp == rp && _fbCache[i].view == view && _fbCache[i].w == w && _fbCache[i].h == h) {
+            VkFramebuffer existing = _fbCache[i].fb;
+            os_unfair_lock_unlock(&_fbLock);
+            vkDestroyFramebuffer(RDNA4R.dev, fb, NULL);
+            return existing;
+        }
+    }
+    if (_fbCacheN < 4u) {
+        _fbCache[_fbCacheN++] = (RDNA4TexFBCacheEnt){ rp, view, w, h, fb };
+        os_unfair_lock_unlock(&_fbLock);
+        return fb;
+    }
+    os_unfair_lock_unlock(&_fbLock);
+    vkDestroyFramebuffer(RDNA4R.dev, fb, NULL);
+    return VK_NULL_HANDLE;
+}
 - (void)rdna4DestroyRetiredBacking {
+    [self rdna4DestroyFBCache];
     if (_texelView && RDNA4R.ok) vkDestroyBufferView(RDNA4R.dev, _texelView, NULL);
     _texelView = VK_NULL_HANDLE;
     if (_hpBacking) [_hpBacking destroyHandles];
@@ -2240,6 +2299,7 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
     _view = VK_NULL_HANDLE; if (!_root) _img = VK_NULL_HANDLE;
 }
 - (void)dealloc {
+    [self rdna4DestroyFBCache];
     const BOOL heapBacked = _hpHeap && _hpBlk;
     RDNA4_HEAP_DEALLOC;
     if (RDNA4R.ok && !heapBacked) {
@@ -2309,10 +2369,11 @@ RDNA4_DNR(RDNA4Texture)
         if ((ff & nd) != nd) IOSFAIL(92, @"pixel format %lu (vk %d): RADV features 0x%x lack 0x%x", (unsigned long)_pf, _fmt->vk, ff, nd & ~ff);
     }
     if (!RDNA4R.hostExt || !rdna4_vkGetMHPP) IOSFAIL(78, @"VK_EXT_external_memory_host is not available on this RADV");
-    IOSurfaceLock(s, kIOSurfaceLockAvoidSync, NULL);
+    // Read-only lock to query base address without bumping IOSurfaceGetSeed (which would invalidate Phase B VRAM / Path (b) upload caches).
+    IOSurfaceLock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL);
     void *base = IOSurfaceGetBaseAddress(s);   // P2: the whole allocation is imported from the surface base; the plane is used at its offset
     void *pbase = pc ? IOSurfaceGetBaseAddressOfPlane(s, pidx) : base;
-    IOSurfaceUnlock(s, kIOSurfaceLockAvoidSync, NULL);
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL);
     size_t alloc = IOSurfaceGetAllocSize(s);
     uint32_t spf = IOSurfaceGetPixelFormat(s);
     RDNA4LOGR("newTexture(iosurface): id %u %zux%zu bpr %zu allocSize %zu base %p pixelFormat 0x%08x planes %zu", IOSurfaceGetID(s), sw, sh, bpr, alloc, base, spf, pc);

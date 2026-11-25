@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #import <Metal/Metal.h>
 #import <os/log.h>
+#include <os/lock.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <stdint.h>
@@ -642,6 +643,8 @@ typedef struct {
     PFN_vkFreeCommandBuffers realFreeCmd;
     PFN_vkResetCommandBuffer realResetCmd;
     PFN_vkFreeMemory realFreeMem;
+    PFN_vkCreateFramebuffer realCreateFB;
+    PFN_vkDestroyFramebuffer realDestroyFB;
     garnet_bar_policy_t barPolicy;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
@@ -767,6 +770,26 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
     else s->roBufMask &= ~(1u << i);
 }
 
+typedef struct {
+    VkRenderPass rp;
+    VkImageView view;
+    uint32_t w, h;
+    VkFramebuffer fb;
+} RDNA4TexFBCacheEnt;
+
+typedef struct {
+    VkPipelineLayout layout;
+    VkDescriptorSetLayout dsl[2];
+    const RDNA4PB *pbV, *pbF;
+    uint32_t npbV, npbF;
+    const uint32_t *need;
+    uint32_t nNeed;
+    const RDNA4ArgumentTables *argTables;
+    VkFormat dsVk;
+    uint32_t sampleCount, maxAmp, drawBits, fetchMax;
+    uint8_t hasFrag, hasDS, hasDepth, fetch, isFallback, isTess, isMesh, hasAddrReg;
+} RDNA4RenderPSOFast;
+
 @interface RDNA4Texture : _MTLResource {
     id _dev; NSUInteger _w, _h; MTLPixelFormat _pf; const RDNA4Fmt *_fmt; NSUInteger _usage; NSUInteger _opts;
     VkImage _img; VkDeviceMemory _mem; VkImageView _view; VkImageLayout _layout; NSString *_lbl; NSUInteger _size;
@@ -794,6 +817,9 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
     uint64_t _vramSurfId;
     _Atomic uint64_t _pathBSeedState; // Wave 4: packed (1<<32)|seed for WindowServer Path (b) upload elision
     BOOL _led;   // build 16 (P5 Step 0): entered in the live-import ledger (removed in -dealloc)
+    os_unfair_lock _fbLock;
+    RDNA4TexFBCacheEnt _fbCache[4];
+    uint8_t _fbCacheN;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d heap:(RDNA4Heap *)heap error:(NSError **)err;
@@ -872,6 +898,7 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
 - (uint64_t)rdna4BackingSize;
 - (void)rdna4AbortHeapConstruction;
 - (void)rdna4DestroyRetiredBacking;
+- (VkFramebuffer)rdna4CachedFramebufferForRP:(VkRenderPass)rp view:(VkImageView)view width:(uint32_t)w height:(uint32_t)h;
 @end
 
 @interface RDNA4SamplerStorage : NSObject {
@@ -1137,6 +1164,7 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
 - (RDNA4RenderPipelineState *)rdna4Real;   // the hot-swapped real pipeline, or nil
 - (BOOL)rdna4HotRebuild;
 - (BOOL)rdna4IsRenderFallback;
+- (void)rdna4FillFast:(RDNA4RenderPSOFast *)out;
 - (VkPipeline)vkPipeline;
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f;
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;   // bundle 10: dk = rdna4DSKey: (0 for a colour-only pipeline)
@@ -1246,6 +1274,7 @@ typedef struct {
 
 @interface RDNA4ResourceBindings : NSObject {
     RDNA4ResBindEntry *_entries;
+    RDNA4ResBindEntry _inline[8];
     uint32_t _count, _cap;
     uint64_t _lastCBId, _lastSegmentSerial;
     BOOL _hasUnsnapshotted;
@@ -1494,7 +1523,7 @@ typedef struct {
     id _rtex[8]; uint32_t _slvl[8], _sslice[8], _rlvl[8], _rslice[8]; NSUInteger _sact[8];   // bundle 10: per colour attachment the resolve texture (+ level, slice), its source level / slice and the store action
     id _drtex, _srtex; uint32_t _dlvl, _dslice, _drlvl, _drslice, _srlvl, _srslice; NSUInteger _dsact, _ssact, _dresFilter, _sresFilter;
     RDNA4DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
-    RDNA4RenderPipelineState *_pso; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf;
+    RDNA4RenderPipelineState *_pso; RDNA4RenderPSOFast _psoFast; MTLRenderPipelineReflection *_roReflection; RDNA4StageState _sv, _sf;
     MTLViewport _vp, *_extraVps; uint32_t _nvp; MTLScissorRect _sr, *_extraSrs; uint32_t _nsr;
     MTLTriangleFillMode _fillMode; MTLDepthClipMode _depthClipMode;
     BOOL _hasSamplePos; MTLSamplePosition _samplePos[8]; uint32_t _samplePosCount;
@@ -1515,7 +1544,7 @@ typedef struct {
     uint32_t _nCsbEnd;
     uint32_t _dynDirty, _dynReqMask;
     uint32_t _drawDirty;
-    BOOL _hasDispAtt, _cleanFastOk;
+    BOOL _hasDispAtt, _cleanFastOk, _resClean;
     VkPrimitiveTopology _lastTopo;
     uint32_t _vbDirtyMask;
     VkBuffer _boundIBuf;
@@ -3223,6 +3252,7 @@ GARNET_INTERNAL_EXTERN void rdna4_vs_set_layout(uint64_t vsId, VkImageLayout l);
 GARNET_INTERNAL_EXTERN void rdna4_vs_cb_begin(uint64_t vsId);
 GARNET_INTERNAL_EXTERN void rdna4_vs_cb_end(uint64_t vsId);
 GARNET_INTERNAL_EXTERN BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed);
+GARNET_INTERNAL_EXTERN void rdna4_vs_note_upload_skip(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite);
 GARNET_INTERNAL_EXTERN void rdna4_vs_note_full_clear(uint64_t vsId, uint32_t seed);
 GARNET_INTERNAL_EXTERN void rdna4_vs_note_write(uint64_t vsId, uint32_t seed, BOOL syncWriteback);

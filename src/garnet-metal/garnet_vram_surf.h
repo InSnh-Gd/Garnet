@@ -77,6 +77,7 @@ typedef struct {
     uint32_t layout;
     int refs;
     int active_cbs;
+    int is_disp;
     int stale;
     int in_unused;
     int vram_valid;
@@ -477,6 +478,11 @@ static inline void garnet_vs_set_bpp(garnet_vs_cache_t *c, uint64_t id, uint32_t
     if (e && bpp) e->bpp = bpp;
 }
 
+static inline void garnet_vs_set_disp(garnet_vs_cache_t *c, uint64_t id, int is_disp) {
+    garnet_vs_ent_t *e = garnet_vs_find(c, id);
+    if (e) e->is_disp = is_disp ? 1 : 0;
+}
+
 static inline int garnet_vs_is_flushing(garnet_vs_cache_t *c, uint64_t id) {
     garnet_vs_ent_t *e = garnet_vs_find(c, id);
     return (e && e->flushing) ? 1 : 0;
@@ -493,10 +499,16 @@ static inline void garnet_vs_cb_end(garnet_vs_cache_t *c, uint64_t id) {
 }
 
 // Read-only peek: returns 1 if accessing `id` with `need_contents=1` would require a host->VRAM upload.
+// A valid GPU-dirty DisplaySurface owns newer pixels in VRAM than host RAM; never overwrite it from stale host pages.
 static inline int garnet_vs_peek_needs_upload(const garnet_vs_cache_t *c, uint64_t id, uint32_t current_seed) {
     if (!id) return 1;
     for (size_t i = 0; i < c->n; i++) {
-        if (c->e[i].id == id) return (!c->e[i].vram_valid || current_seed != c->e[i].last_seed) ? 1 : 0;
+        if (c->e[i].id == id) {
+            if (!c->e[i].vram_valid) return 1;
+            if (current_seed == c->e[i].last_seed) return 0;
+            if (c->e[i].is_disp && c->e[i].host_dirty) return 0;
+            return 1;
+        }
     }
     return 1;
 }
@@ -507,6 +519,11 @@ static inline int garnet_vs_begin_access(garnet_vs_cache_t *c, uint64_t id, uint
     garnet_vs_ent_t *e = garnet_vs_find(c, id);
     if (!e) return need_contents ? 1 : 0;
     if (need_contents) {
+        if (e->vram_valid && e->is_disp && e->host_dirty && current_seed != e->last_seed) {
+            e->last_seed = current_seed;
+            c->uploads_skipped++;
+            return 0;
+        }
         if (!e->vram_valid || current_seed != e->last_seed) {
             e->vram_valid = 1;
             e->last_seed = current_seed;

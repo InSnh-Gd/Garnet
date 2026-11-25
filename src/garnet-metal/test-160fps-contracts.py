@@ -149,6 +149,10 @@ def main() -> int:
           "screensharingd" not in res_m and "screensharingd" not in cmd_m and "screensharingd" not in vs_h)
     check("B: no duplicate RDNA4VS definitions in garnet_resources.m",
           res_m.count("GARNET_INTERNAL void rdna4_vs_latch(void)") == 1)
+    check("B: newTexture(iosurface:) uses kIOSurfaceLockReadOnly to avoid seed bumps",
+          "IOSurfaceLock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL)" in res_m
+          and "IOSurfaceUnlock(s, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, NULL)" in res_m
+          and "IOSurfaceLock(s, kIOSurfaceLockAvoidSync, NULL)" not in res_m)
 
     print(f"test-160fps-contracts: {checks} checks, {fails} failed")
     return 1 if fails else 0
