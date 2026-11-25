@@ -201,6 +201,19 @@ int main(void) {
           garnet_vs_note_ws_write(&c, 999, 1920, 1080, 0, 0, 2000000000ULL) == 0 &&
           garnet_vs_should_promote(&c, 999, 1920, 1080, 0, 0, 1, 1) == 0);
 
+    // 8. Wave 4 Path (b) seed-elided upload state helpers
+    CHECK("cold Path (b) state 0 always requires upload (even for seed 0)",
+          garnet_vs_pathb_should_upload(0ULL, 0u) == 1 &&
+          garnet_vs_pathb_should_upload(0ULL, 7u) == 1);
+    const uint64_t pb0 = garnet_vs_pathb_pack(0u);
+    CHECK("packed seed 0 skips upload on seed 0 and re-uploads on seed 1",
+          garnet_vs_pathb_should_upload(pb0, 0u) == 0 &&
+          garnet_vs_pathb_should_upload(pb0, 1u) == 1);
+    const uint64_t pb42 = garnet_vs_pathb_pack(42u);
+    CHECK("packed seed 42 skips on 42 and re-uploads on 43",
+          garnet_vs_pathb_should_upload(pb42, 42u) == 0 &&
+          garnet_vs_pathb_should_upload(pb42, 43u) == 1);
+
     garnet_vs_destroy(&c);
     printf("test-vram-surf: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

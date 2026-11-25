@@ -122,6 +122,16 @@ static inline int garnet_vs_should_enable(int is_ws, int test_opt_in, int kill_p
     return (is_ws || test_opt_in) && !kill_present ? 1 : 0;
 }
 
+// Per-texture Path (b) IOSurface upload-elision state packed in a single atomic uint64_t:
+// bit 32 = valid flag (allows seed == 0 to be cached unambiguously), bits 31..0 = last uploaded seed.
+static inline uint64_t garnet_vs_pathb_pack(uint32_t seed) {
+    return (1ULL << 32) | (uint64_t)seed;
+}
+
+static inline int garnet_vs_pathb_should_upload(uint64_t state, uint32_t current_seed) {
+    return ((state >> 32) != 0 && (uint32_t)state == current_seed) ? 0 : 1;
+}
+
 // Classify Vulkan format into compatibility family and return explicit VkImageFormatListCreateInfo view list
 // (2 entries for UNORM/sRGB pairs so RADV keeps GFX12 DCC with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; 0 otherwise).
 static inline uint32_t garnet_vs_format_family(uint32_t vk_fmt, uint32_t *base_fmt_out,

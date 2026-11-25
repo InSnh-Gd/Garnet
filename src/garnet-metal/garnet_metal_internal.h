@@ -791,6 +791,7 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
     BOOL _iosLinearCached;   // Phase A4: _img is borrowed from RDNA4IC.li (release via rdna4_linimg_put, never vkDestroyImage)
     BOOL _vramSurfCached;    // Phase B: _img/_ibuf are borrowed from RDNA4VS (320 GB/s OPTIMAL hi-pool VRAM)
     uint64_t _vramSurfId;
+    _Atomic uint64_t _pathBSeedState; // Wave 4: packed (1<<32)|seed for WindowServer Path (b) upload elision
     BOOL _led;   // build 16 (P5 Step 0): entered in the live-import ledger (removed in -dealloc)
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err;
@@ -828,6 +829,9 @@ static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Bu
 - (void)rdna4IOSLinearDidSubmit;
 - (BOOL)rdna4VramSurfCached;
 - (uint64_t)rdna4VramSurfId;
+- (uint64_t)rdna4PathBSeedState;
+- (void)rdna4PathBSetSeed:(uint32_t)seed;
+- (void)rdna4PathBInvalidate;
 - (BOOL)rdna4HostReadOnly;
 - (VkBuffer)rdna4IOSBuffer;
 - (size_t)rdna4IOSBytesPerRow;
@@ -3198,6 +3202,8 @@ GARNET_INTERNAL_EXTERN void rdna4_imp_report(unsigned tick);
 GARNET_INTERNAL_EXTERN void rdna4_vs_latch(void);
 GARNET_INTERNAL_EXTERN void rdna4_vs_tick(void);
 GARNET_INTERNAL_EXTERN void rdna4_vs_report(unsigned tick);
+GARNET_INTERNAL_EXTERN BOOL rdna4_vs_enabled(void);
+GARNET_INTERNAL_EXTERN void rdna4_vs_note_pathb(BOOL skipped);
 GARNET_INTERNAL_EXTERN BOOL rdna4_vs_sync_wb_on(void);
 GARNET_INTERNAL_EXTERN VkImageLayout rdna4_vs_get_layout(uint64_t vsId);
 GARNET_INTERNAL_EXTERN void rdna4_vs_set_layout(uint64_t vsId, VkImageLayout l);

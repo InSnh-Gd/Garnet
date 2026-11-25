@@ -695,11 +695,17 @@ static void rdna4_ios_upload(RDNA4CommandBuffer *cb, RDNA4Texture *t) {
     }
     rdna4_full_barrier(cmd);
     if ([t rdna4IOSLinear]) return;
+    IOSurfaceRef pathBIos = rdna4_vs_enabled() ? [t rdna4IOSRef] : NULL;
+    const uint32_t pathBSeed = pathBIos ? IOSurfaceGetSeed(pathBIos) : 0u;
     rdna4_image_transition(cmd, t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy bic = { .bufferOffset = [t rdna4IOSOffset], .bufferRowLength = (uint32_t)([t rdna4IOSBytesPerRow] / [t bytesPerPixel]), .bufferImageHeight = 0,
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { (uint32_t)[t width], (uint32_t)[t height], 1 } };
     vkCmdCopyBufferToImage(cmd, [t rdna4IOSBuffer], [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     rdna4_full_barrier(cmd);
+    if (pathBIos) {
+        [t rdna4PathBSetSeed:pathBSeed];
+        rdna4_vs_note_pathb(NO);
+    }
 }
 static BOOL rdna4_ios_writeback_ex(VkCommandBuffer cmd, RDNA4Texture *t, BOOL forceSync) {
     if (rdna4nc_drop_write(t, RDNA4NC_WRITEBACK, "IOSurface write-back", "BlitCommandEncoder")) return NO;
@@ -779,8 +785,20 @@ GARNET_INTERNAL BOOL rdna4_ios_touch(RDNA4CommandBuffer *cb, RDNA4Texture *t, BO
             if ([t rdna4VramSurfCached]) {
                 IOSurfaceRef ios = [t rdna4IOSRef];
                 if (!rdna4_vs_peek_needs_upload([t rdna4VramSurfId], ios ? IOSurfaceGetSeed(ios) : 0u)) return did;
+            } else if (rdna4_vs_enabled() && ![t rdna4IOSLinear]) {
+                IOSurfaceRef ios = [t rdna4IOSRef];
+                if (ios) {
+                    if (!write && [t layout] != VK_IMAGE_LAYOUT_UNDEFINED &&
+                        !garnet_vs_pathb_should_upload([t rdna4PathBSeedState], IOSurfaceGetSeed(ios))) {
+                        rdna4_vs_note_pathb(YES);
+                        return did;
+                    }
+                    if (write) [t rdna4PathBInvalidate];
+                }
             }
             if (endPass) endPass(); rdna4_ios_upload(cb, t); did = YES;
+        } else if (write && ![t rdna4VramSurfCached] && ![t rdna4IOSLinear]) {
+            [t rdna4PathBInvalidate];
         }
         return did;
     }
@@ -964,7 +982,13 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     // WindowServer, CA Whippet, or CPU capture consumer may read the surface as
     // soon as scheduled is visible. The /private/tmp/garnet-early-schedule kill
     // file restores early scheduling.
-    if ([t rdna4IsIOS] &&
+    // WindowServer Class 1 DisplaySurfaces resident in Phase B OPTIMAL VRAM stay
+    // on the single RDNA4R.q queue (scanout waits on the terminal fence in
+    // rdna4DispDone, and CPU getBytes/synchronizeResource waits on active_cbs).
+    // Skipping deferred didSchedule for those writes lets WindowServer overlap
+    // CPU encoding of the next pass with GPU execution of the previous one.
+    const BOOL wsVramDisp = rdna4_is_ws() && [t rdna4IsDisp] && [t rdna4VramSurfCached] && !rdna4_vs_sync_wb_on();
+    if ([t rdna4IsIOS] && !wsVramDisp &&
         !rdna4_cb_kill_flags().earlySchedule && !_scheduleAfterPublish) {
         _scheduleAfterPublish = YES;
         RDNA4_ONCE("scheduled publication deferred until IOSurface write completes");
@@ -2076,6 +2100,15 @@ GARNET_INTERNAL void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4T
     rdna4_capture_surfaces(_iot, _cbid);
     [self rdna4ClearHostActions];
     void (^done)(void) = ^{
+        // Bump IOSurface seed after GPU write-back completes so WindowServer's Path (b)
+        // seed-elided upload immediately detects cross-process Metal GPU redraws.
+        for (RDNA4Texture *wt in self->_iow) {
+            if ([wt rdna4VramSurfCached] || [wt rdna4HostReadOnly]) continue;
+            IOSurfaceRef wios = [wt rdna4IOSRef];
+            if (!wios || (rdna4_is_ws() && [wt rdna4IsDisp])) continue;
+            if (IOSurfaceLock(wios, kIOSurfaceLockAvoidSync, NULL) == kIOReturnSuccess)
+                IOSurfaceUnlock(wios, kIOSurfaceLockAvoidSync, NULL);
+        }
         self->_scheduleAfterPublish = NO;
         [self rdna4EnsureScheduledWithError:nil];
         [self rdna4CBFence:VK_SUCCESS];

@@ -538,6 +538,8 @@ static struct {
     dispatch_source_t timer;
     BOOL timerArmed;
     _Atomic int syncWb;
+    _Atomic uint64_t pathbUploads;
+    _Atomic uint64_t pathbSkipped;
     garnet_vs_cache_t c;
     uint64_t lastSig;
 } RDNA4VS = { .mu = PTHREAD_MUTEX_INITIALIZER, .flushCond = PTHREAD_COND_INITIALIZER };
@@ -578,6 +580,15 @@ GARNET_INTERNAL void rdna4_vs_latch(void) {
     } else {
         RDNA4LOG("Phase B vram_surf: OFF (ws=%d kill=%d)", rdna4_is_ws() ? 1 : 0, killPresent);
     }
+}
+
+GARNET_INTERNAL BOOL rdna4_vs_enabled(void) {
+    return RDNA4VS.on;
+}
+
+GARNET_INTERNAL void rdna4_vs_note_pathb(BOOL skipped) {
+    if (skipped) atomic_fetch_add_explicit(&RDNA4VS.pathbSkipped, 1, memory_order_relaxed);
+    else atomic_fetch_add_explicit(&RDNA4VS.pathbUploads, 1, memory_order_relaxed);
 }
 
 GARNET_INTERNAL BOOL rdna4_vs_sync_wb_on(void) {
@@ -865,18 +876,9 @@ GARNET_INTERNAL BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed) {
 
 GARNET_INTERNAL BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite) {
     if (!RDNA4VS.on || !vsId) return needContents;
-    static _Atomic int upLog;
-    uint32_t sid = 0, w = 0, h = 0, prevSeed = 0; int wasValid = 0, wasDirty = 0;
     pthread_mutex_lock(&RDNA4VS.mu);
-    const garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, vsId);
-    if (e) { sid = e->range.sid; w = e->range.w; h = e->range.h; prevSeed = e->last_seed; wasValid = e->vram_valid; wasDirty = e->host_dirty; }
     const int up = garnet_vs_begin_access(&RDNA4VS.c, vsId, seed, needContents ? 1 : 0, willWrite ? 1 : 0, fullOverwrite ? 1 : 0);
     pthread_mutex_unlock(&RDNA4VS.mu);
-    if (up && atomic_load(&upLog) < 25) {
-        int n = atomic_fetch_add(&upLog, 1) + 1;
-        if (n <= 25) RDNA4LOG("vram_surf upload #%d: id=%llu sid=%u %ux%u seed=%u prev=%u valid=%d dirty=%d",
-                              n, (unsigned long long)vsId, sid, w, h, seed, prevSeed, wasValid, wasDirty);
-    }
     return up != 0;
 }
 
@@ -1069,15 +1071,19 @@ GARNET_INTERNAL void rdna4_vs_tick(void) {
 
 GARNET_INTERNAL void rdna4_vs_report(unsigned tick) {
     if (!RDNA4VS.on) return;
+    const uint64_t pbUp = atomic_load_explicit(&RDNA4VS.pathbUploads, memory_order_relaxed);
+    const uint64_t pbSk = atomic_load_explicit(&RDNA4VS.pathbSkipped, memory_order_relaxed);
     pthread_mutex_lock(&RDNA4VS.mu);
     const garnet_vs_cache_t *c = &RDNA4VS.c;
-    const uint64_t sig = c->created + c->hits + c->uploads + c->uploads_skipped + c->lazy_writes + c->idle_flushes + c->evictions;
+    const uint64_t sig = c->created + c->hits + c->uploads + c->uploads_skipped + c->lazy_writes + c->idle_flushes + c->evictions + pbUp + pbSk;
     if (sig != RDNA4VS.lastSig || tick % 6 == 5) {
         RDNA4VS.lastSig = sig;
-        RDNA4LOG("T1 vram_surf ON: live=%llu MiB (%zu entries) unused=%llu MiB dirty=%zu created=%llu hits=%llu misses=%llu uploads=%llu skipped=%llu lazy_wb=%llu sync_wb=%llu idle_flush=%llu incompat=%llu evict=%llu cap_excl=%llu [%s pid %d]",
+        RDNA4LOG("T1 vram_surf ON: live=%llu MiB (%zu entries) unused=%llu MiB dirty=%zu created=%llu hits=%llu misses=%llu uploads=%llu skipped=%llu pathb_up=%llu pathb_skip=%llu lazy_wb=%llu sync_wb=%llu idle_flush=%llu incompat=%llu evict=%llu cap_excl=%llu [%s pid %d]",
                  (unsigned long long)(c->live_bytes >> 20), c->n, (unsigned long long)(c->unused_bytes >> 20), c->dirty_count,
                  (unsigned long long)c->created, (unsigned long long)c->hits, (unsigned long long)c->misses,
-                 (unsigned long long)c->uploads, (unsigned long long)c->uploads_skipped, (unsigned long long)c->lazy_writes,
+                 (unsigned long long)c->uploads, (unsigned long long)c->uploads_skipped,
+                 (unsigned long long)pbUp, (unsigned long long)pbSk,
+                 (unsigned long long)c->lazy_writes,
                  (unsigned long long)c->sync_writes, (unsigned long long)c->idle_flushes, (unsigned long long)c->incompat_flushes,
                  (unsigned long long)c->evictions, (unsigned long long)c->capture_excluded_sids, getprogname(), (int)getpid());
     }
@@ -2576,6 +2582,15 @@ RDNA4_DNR(RDNA4Texture)
 - (void)rdna4IOSLinearDidSubmit { _iosLinearSubmitted = YES; if (_iosLinearCached && _img) rdna4_linimg_mark_inited(_img); }
 - (BOOL)rdna4VramSurfCached { return _root ? [_root rdna4VramSurfCached] : _vramSurfCached; }
 - (uint64_t)rdna4VramSurfId { return _root ? [_root rdna4VramSurfId] : _vramSurfId; }
+- (uint64_t)rdna4PathBSeedState { return _root ? [_root rdna4PathBSeedState] : atomic_load_explicit(&_pathBSeedState, memory_order_acquire); }
+- (void)rdna4PathBSetSeed:(uint32_t)seed {
+    if (_root) { [_root rdna4PathBSetSeed:seed]; return; }
+    atomic_store_explicit(&_pathBSeedState, garnet_vs_pathb_pack(seed), memory_order_release);
+}
+- (void)rdna4PathBInvalidate {
+    if (_root) { [_root rdna4PathBInvalidate]; return; }
+    atomic_store_explicit(&_pathBSeedState, 0ULL, memory_order_release);
+}
 - (VkBuffer)rdna4IOSBuffer { return _root ? [_root rdna4IOSBuffer] : (_hostBuf ? [_hostBuf vkBuffer] : _ibuf); }
 - (size_t)rdna4IOSBytesPerRow { return _root ? [_root rdna4IOSBytesPerRow] : _ibpr; }
 // 11e CPU access. Shared and Managed textures accept replaceRegion:/getBytes: (Managed has no separate CPU copy here: both are the one
@@ -2613,6 +2628,7 @@ RDNA4_DNR(RDNA4Texture)
         uint8_t *base = (uint8_t *)[self rdna4IBase]; size_t stride = [self rdna4IOSBytesPerRow];
         for (NSUInteger y = 0; y < r.size.height; y++) memcpy(base + (r.origin.y + y) * stride + r.origin.x * _fmt->bpp, (const uint8_t *)bytes + y * bpr, rowBytes);
         if ([self rdna4VramSurfCached]) rdna4_vs_invalidate_cpu([self rdna4VramSurfId]);
+        [self rdna4PathBInvalidate];
         RDNA4LOGR("replaceRegion: %lux%lu into the IOSurface memory", (unsigned long)r.size.width, (unsigned long)r.size.height); return;
     }
     if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG("replaceRegion: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
