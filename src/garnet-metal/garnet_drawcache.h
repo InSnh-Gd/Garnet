@@ -9,9 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RDNA4DC_MAXW     256   // longest cacheable signature (words); a longer one is never cached (always a fresh set)
-#define RDNA4DC_PC_CAP   8u    // per-encoder pipelineForTopology cache slots
-#define RDNA4DC_LRU_CAP  8u    // per-stage same-segment descriptor-set reuse slots
+#define RDNA4DC_MAXW     64    // longest cacheable signature (words); keeps RDNA4RenderEncoder slim (~1.3 KiB vs 8.7 KiB)
+#define RDNA4DC_PC_CAP   8u    // pipelineForTopology cache slots
+#define RDNA4DC_LRU_CAP  16u   // per-stage same-segment descriptor-set reuse slots (owned by RDNA4CommandBuffer)
 #define RDNA4DC_LRU_MAXW 32u   // max signature words kept in the segment LRU (covers layout+dsl+15 bindings)
 
 typedef struct { uint32_t n; int over; uint64_t w[RDNA4DC_MAXW]; } rdna4dc_sig;
@@ -33,37 +33,50 @@ static inline void rdna4dc_stage_store(rdna4dc_stage *t, const rdna4dc_sig *s, u
 typedef struct { uint32_t topo, cull, front; const void *pso; uint64_t pipe; } rdna4dc_pce;
 typedef struct { uint32_t n; uint64_t set; uint64_t w[RDNA4DC_LRU_MAXW]; } rdna4dc_lru_ent;
 
+// Command-buffer-scoped cache shared across all render encoders in the same command buffer/segment.
+// WindowServer averages <2 draws per render encoder (~40 encoders/CB); hoisting pc[] and lru[][] out of
+// RDNA4RenderEncoder cuts per-encoder calloc/bzero and enables reuse across encoder boundaries.
 typedef struct {
-    uint64_t layout;                 // pipeline layout the cached sets were bound with
-    rdna4dc_stage st[2];             // 0 = vertex set (index 0), 1 = fragment set (index 1)
-    uint64_t lastPipe;               // last VkPipeline bound in the current render pass (0 = none)
-    int pcValid;                     // count of valid entries in pc[] (0..RDNA4DC_PC_CAP)
-    uint32_t pcNext;                 // round-robin eviction cursor for pc[]
-    rdna4dc_pce pc[RDNA4DC_PC_CAP];  // recent (topology, cull, front, pso) -> VkPipeline answers
-    uint8_t lruN[2], lruNext[2];     // populated entries + eviction cursor per stage in the current segment
+    int pcValid;
+    uint32_t pcNext;
+    rdna4dc_pce pc[RDNA4DC_PC_CAP];
+    uint8_t lruN[2], lruNext[2];
     rdna4dc_lru_ent lru[2][RDNA4DC_LRU_CAP];
-    uint64_t draws, setsReused, setsAllocated, pipesSkipped, pipesBound, pcHits;
-} rdna4dc_enc;
-static inline void rdna4dc_enc_init(rdna4dc_enc *e) {
-    e->layout = 0; e->lastPipe = 0; e->pcValid = 0; e->pcNext = 0;
-    rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]);
-    e->lruN[0] = e->lruN[1] = e->lruNext[0] = e->lruNext[1] = 0;
-    e->draws = e->setsReused = e->setsAllocated = e->pipesSkipped = e->pipesBound = e->pcHits = 0;
+} rdna4dc_cbcache;
+static inline void rdna4dc_cb_init(rdna4dc_cbcache *c) {
+    c->pcValid = 0; c->pcNext = 0;
+    c->lruN[0] = c->lruN[1] = c->lruNext[0] = c->lruNext[1] = 0;
 }
-// New render pass / barrier inside the same segment: forget what is currently bound (segment-owned LRU sets stay valid).
-static inline void rdna4dc_enc_reset_bound(rdna4dc_enc *e) { e->lastPipe = 0; e->layout = 0; rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]); }
-// Segment boundary: descriptor pools of the previous segment may retire, so drop segment-scoped LRU sets too.
-static inline void rdna4dc_enc_reset_segment(rdna4dc_enc *e) {
-    rdna4dc_enc_reset_bound(e);
-    e->lruN[0] = e->lruN[1] = e->lruNext[0] = e->lruNext[1] = 0;
+static inline void rdna4dc_cb_reset_segment(rdna4dc_cbcache *c) {
+    c->lruN[0] = c->lruN[1] = c->lruNext[0] = c->lruNext[1] = 0;
 }
-// A draw binds a pipeline with this layout: a different layout forgets the currently bound sets (LRU keeps layout in w[0]).
-static inline void rdna4dc_enc_layout(rdna4dc_enc *e, uint64_t layout) { if (e->layout != layout) { e->layout = layout; rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]); } }
+static inline int rdna4dc_cb_pc_get(const rdna4dc_cbcache *c, uint32_t topo, uint32_t cull, uint32_t front, const void *pso, uint64_t *pipe) {
+    for (int i = 0; i < c->pcValid; i++) {
+        const rdna4dc_pce *p = &c->pc[i];
+        if (p->pso == pso && p->topo == topo && p->cull == cull && p->front == front) { *pipe = p->pipe; return 1; }
+    }
+    return 0;
+}
+static inline void rdna4dc_cb_pc_put(rdna4dc_cbcache *c, uint32_t topo, uint32_t cull, uint32_t front, const void *pso, uint64_t pipe) {
+    for (int i = 0; i < c->pcValid; i++) {
+        rdna4dc_pce *p = &c->pc[i];
+        if (p->pso == pso && p->topo == topo && p->cull == cull && p->front == front) {
+            if (pipe) p->pipe = pipe;
+            else c->pc[i] = c->pc[--c->pcValid];
+            return;
+        }
+    }
+    if (!pipe) return;
+    uint32_t slot;
+    if ((uint32_t)c->pcValid < RDNA4DC_PC_CAP) slot = (uint32_t)(c->pcValid++);
+    else { slot = c->pcNext; c->pcNext = (slot + 1u) & (RDNA4DC_PC_CAP - 1u); }
+    c->pc[slot] = (rdna4dc_pce){ topo, cull, front, pso, pipe };
+}
 // YES when a previously filled immutable set in the current segment matches `s`; caller must still vkCmdBindDescriptorSets.
-static inline int rdna4dc_enc_lru_find(const rdna4dc_enc *e, int idx, const rdna4dc_sig *s, uint64_t *set) {
+static inline int rdna4dc_cb_lru_find(const rdna4dc_cbcache *c, int idx, const rdna4dc_sig *s, uint64_t *set) {
     if (s->over || s->n < 2u || s->n > RDNA4DC_LRU_MAXW || (unsigned)idx >= 2u) return 0;
-    const uint8_t n = e->lruN[idx];
-    const rdna4dc_lru_ent *arr = e->lru[idx];
+    const uint8_t n = c->lruN[idx];
+    const rdna4dc_lru_ent *arr = c->lru[idx];
     for (uint8_t i = 0; i < n; i++) {
         const rdna4dc_lru_ent *ent = &arr[i];
         if (ent->n == s->n && ent->w[0] == s->w[0] && ent->w[1] == s->w[1] &&
@@ -73,14 +86,33 @@ static inline int rdna4dc_enc_lru_find(const rdna4dc_enc *e, int idx, const rdna
     }
     return 0;
 }
-static inline void rdna4dc_enc_lru_put(rdna4dc_enc *e, int idx, const rdna4dc_sig *s, uint64_t set) {
+static inline void rdna4dc_cb_lru_put(rdna4dc_cbcache *c, int idx, const rdna4dc_sig *s, uint64_t set) {
     if (s->over || s->n < 2u || s->n > RDNA4DC_LRU_MAXW || !set || (unsigned)idx >= 2u) return;
     uint8_t slot;
-    if (e->lruN[idx] < RDNA4DC_LRU_CAP) slot = e->lruN[idx]++;
-    else { slot = e->lruNext[idx]; e->lruNext[idx] = (uint8_t)((slot + 1u) & (RDNA4DC_LRU_CAP - 1u)); }
-    rdna4dc_lru_ent *ent = &e->lru[idx][slot];
+    if (c->lruN[idx] < RDNA4DC_LRU_CAP) slot = c->lruN[idx]++;
+    else { slot = c->lruNext[idx]; c->lruNext[idx] = (uint8_t)((slot + 1u) & (RDNA4DC_LRU_CAP - 1u)); }
+    rdna4dc_lru_ent *ent = &c->lru[idx][slot];
     ent->n = s->n; ent->set = set; memcpy(ent->w, s->w, (size_t)s->n * sizeof s->w[0]);
 }
+
+typedef struct {
+    uint64_t layout;                 // pipeline layout the cached sets were bound with
+    rdna4dc_stage st[2];             // 0 = vertex set (index 0), 1 = fragment set (index 1)
+    uint64_t lastPipe;               // last VkPipeline bound in the current render pass (0 = none)
+    int pcValid;                     // fallback single-encoder pc[] valid count when no CB cache is attached
+    uint32_t pcNext;
+    rdna4dc_pce pc[RDNA4DC_PC_CAP];
+    uint64_t draws, setsReused, setsAllocated, pipesSkipped, pipesBound, pcHits;
+} rdna4dc_enc;
+static inline void rdna4dc_enc_init(rdna4dc_enc *e) {
+    e->layout = 0; e->lastPipe = 0; e->pcValid = 0; e->pcNext = 0;
+    rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]);
+    e->draws = e->setsReused = e->setsAllocated = e->pipesSkipped = e->pipesBound = e->pcHits = 0;
+}
+// New render pass / barrier inside the same segment: forget what is currently bound.
+static inline void rdna4dc_enc_reset_bound(rdna4dc_enc *e) { e->lastPipe = 0; e->layout = 0; rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]); }
+// A draw binds a pipeline with this layout: a different layout forgets the currently bound sets.
+static inline void rdna4dc_enc_layout(rdna4dc_enc *e, uint64_t layout) { if (e->layout != layout) { e->layout = layout; rdna4dc_stage_reset(&e->st[0]); rdna4dc_stage_reset(&e->st[1]); } }
 // YES when vkCmdBindPipeline may be skipped (same pipeline as the last one bound in this pass).
 static inline int rdna4dc_enc_pipe_same(rdna4dc_enc *e, uint64_t pipe) { if (e->lastPipe == pipe && pipe) { e->pipesSkipped++; return 1; } e->lastPipe = pipe; e->pipesBound++; return 0; }
 static inline int rdna4dc_enc_pc_get(rdna4dc_enc *e, uint32_t topo, uint32_t cull, uint32_t front, const void *pso, uint64_t *pipe) {

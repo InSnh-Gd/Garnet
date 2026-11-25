@@ -1251,6 +1251,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
      * fence; this segment starts with a fresh allocation pool.
      */
     _pool = VK_NULL_HANDLE;
+    rdna4dc_cb_reset_segment(&_dcCache);
     ++_segmentSerial;
     if (!_segmentSerial) ++_segmentSerial;
     return YES;
@@ -1670,6 +1671,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     seg->recentCmdRefs[seg->recentCmdPos++ & 7u] = ptr;
 }
 - (uint64_t)rdna4SegmentSerial { return _segmentSerial; }
+- (rdna4dc_cbcache *)rdna4DrawCache { return &_dcCache; }
 - (uint64_t)rdna4CBId { return _cbid; }
 - (BOOL)rdna4HasResidency {
     return _residencySnapshots.count != 0 || _residencyHeapResources.count != 0 || [_nq rdna4HasResidencySets];
@@ -3664,7 +3666,11 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     if (stencil != depth && [stencil isKindOfClass:[RDNA4Texture class]])
         _hostWriteDropped |= rdna4nc_drop_write(stencil, RDNA4NC_ATTACHMENT, "stencil attachment store", "RenderCommandEncoder");
     if (_hostWriteDropped) { [_cb rdna4Fail:@"render attachment writes a read-only no-copy texture"]; return self; }
-    _dcOn = RDNA4DO.on; if (_dcOn) rdna4dc_enc_init(&_dc);
+    _dcOn = RDNA4DO.on;
+    if (_dcOn) {
+        rdna4dc_enc_init(&_dc);
+        _dcCB = [_cb respondsToSelector:@selector(rdna4DrawCache)] ? [_cb rdna4DrawCache] : NULL;
+    }
     VkImageView views[9]; uint32_t na = 0; _dsi = rdna4_dsinfo_default();
     for (NSUInteger i = 0; i < 8; i++) {
         MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[i];
@@ -3867,7 +3873,10 @@ RDNA4_DNR(RDNA4RenderEncoder)
     uint64_t serial = [_cb rdna4SegmentSerial];
     if (!rdna4_encoder_take_segment_change(&_resourceSegmentSerial, serial))
         return;
-    if (_dcOn) rdna4dc_enc_reset_segment(&_dc);
+    if (_dcOn) {
+        rdna4dc_enc_reset_bound(&_dc);
+        if (_dcCB) rdna4dc_cb_reset_segment(_dcCB);
+    }
 }
 - (void)rdna4SnapshotResources {
     [_resourceBindings snapshotToCommandBuffer:_cb];
@@ -4476,11 +4485,16 @@ RDNA4_ENCODER_SHARED
 
 // ---- P5b helpers (only reached when the rdna4m-drawopt switch is ON) ----
 - (void)rdna4NeedTex:(RDNA4Texture *)t layout:(VkImageLayout)l writable:(BOOL)writable {   // the body of needTex in rdna4PrepareDraw, verbatim
-    if ([t rdna4IsIOS]) (void)rdna4_ios_touch(_cb, t, YES, writable, ^{   // 11h.6 / build 16 (P1): upload / flush outside the render pass (splits it if one is open)
-        if (self->_inPass) { [self rdna4EndPass]; RDNA4LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); } });
+    const BOOL isIOS = [t rdna4IsIOS];
+    if (isIOS) {
+        if (_inPass) (void)rdna4_ios_touch(_cb, t, YES, writable, ^{   // 11h.6 / build 16 (P1): upload / flush outside the render pass (splits it if one is open)
+            if (self->_inPass) { [self rdna4EndPass]; RDNA4LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); } });
+        else (void)rdna4_ios_touch(_cb, t, YES, writable, NULL);
+    }
     [_cb rdna4CBRead:t];
-    if ([t rdna4DispImgOnly]) (void)[_cb rdna4IOFirstTouch:t];   // P6: retained for the command buffer, nothing to upload
-    if (([t rdna4IsIOS] || [t rdna4DispImgOnly]) && writable) { [_cb rdna4IOWritten:t]; [_cb rdna4DispNote:t bits:RDNA4DF_W_COMPUTE pso:nil]; }
+    const BOOL dispOnly = [t rdna4DispImgOnly];
+    if (dispOnly) (void)[_cb rdna4IOFirstTouch:t];   // P6: retained for the command buffer, nothing to upload
+    if ((isIOS || dispOnly) && writable) { [_cb rdna4IOWritten:t]; [_cb rdna4DispNote:t bits:RDNA4DF_W_COMPUTE pso:nil]; }
     [self rdna4Need:t layout:l];
 }
 - (void)rdna4EachTex:(const RDNA4PB *)pb n:(uint32_t)n state:(const RDNA4StageState *)st dev:(id)dev {   // rdna4_each_tex, with the callback inlined
@@ -4547,7 +4561,7 @@ RDNA4_ENCODER_SHARED
     }
     uint64_t set;
     if (rdna4dc_stage_match(&_dc.st[idx], &sig, &set)) { _dc.setsReused++; return YES; }   // same slots, same layout: the set bound at this index is already right
-    if (rdna4dc_enc_lru_find(&_dc, idx, &sig, &set)) {
+    if (_dcCB && rdna4dc_cb_lru_find(_dcCB, idx, &sig, &set)) {
         VkDescriptorSet s = (VkDescriptorSet)(uintptr_t)set;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], (uint32_t)idx, 1, &s, 0, NULL);
         rdna4dc_stage_store(&_dc.st[idx], &sig, set);
@@ -4557,7 +4571,7 @@ RDNA4_ENCODER_SHARED
     VkDescriptorSet s = [_cb rdna4AllocSet:dsl]; if (!s || ![_cb rdna4FillSet:s bindings:pb count:n state:st stage:nm]) { rdna4dc_stage_reset(&_dc.st[idx]); return NO; }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], (uint32_t)idx, 1, &s, 0, NULL);
     rdna4dc_stage_store(&_dc.st[idx], &sig, (uint64_t)(uintptr_t)s);
-    rdna4dc_enc_lru_put(&_dc, idx, &sig, (uint64_t)(uintptr_t)s);
+    if (_dcCB) rdna4dc_cb_lru_put(_dcCB, idx, &sig, (uint64_t)(uintptr_t)s);
     _dc.setsAllocated++;
     return YES;
 }
@@ -4622,10 +4636,15 @@ RDNA4_ENCODER_SHARED
     uint32_t ckey = (uint32_t)cull | (rflags << 4);
     uint32_t fkey = (uint32_t)front | (dk << 1);   // the last-answer cache compares (topology, cull+rflags, front+ds, pso)
     VkPipeline vkp;
-    if (_dcOn) {   // P5b item 3: the last (topology, cull, front, pso) -> VkPipeline answer skips pipelineForTopology's NSNumber / NSLock / NSDictionary
+    if (_dcOn) {   // P5b item 3: CB-shared (topology, cull, front, pso) -> VkPipeline answer skips pipelineForTopology across encoders
         uint64_t pp;
-        if (rdna4dc_enc_pc_get(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
-        else { vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags]; rdna4dc_enc_pc_put(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp); }
+        if (_dcCB && rdna4dc_cb_pc_get(_dcCB, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) { vkp = (VkPipeline)(uintptr_t)pp; _dc.pcHits++; }
+        else if (!_dcCB && rdna4dc_enc_pc_get(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
+        else {
+            vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];
+            if (_dcCB) rdna4dc_cb_pc_put(_dcCB, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
+            else rdna4dc_enc_pc_put(&_dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
+        }
     } else vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];
     if (!vkp) { [_cb rdna4Fail:@"cannot build a pipeline variant for this draw"]; return NO; }
     const uint32_t *need = [_pso needBindings]; uint32_t nn = [_pso nNeed];

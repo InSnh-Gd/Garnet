@@ -865,9 +865,18 @@ GARNET_INTERNAL BOOL rdna4_vs_peek_needs_upload(uint64_t vsId, uint32_t seed) {
 
 GARNET_INTERNAL BOOL rdna4_vs_needs_upload(uint64_t vsId, uint32_t seed, BOOL needContents, BOOL willWrite, BOOL fullOverwrite) {
     if (!RDNA4VS.on || !vsId) return needContents;
+    static _Atomic int upLog;
+    uint32_t sid = 0, w = 0, h = 0, prevSeed = 0; int wasValid = 0, wasDirty = 0;
     pthread_mutex_lock(&RDNA4VS.mu);
+    const garnet_vs_ent_t *e = garnet_vs_find(&RDNA4VS.c, vsId);
+    if (e) { sid = e->range.sid; w = e->range.w; h = e->range.h; prevSeed = e->last_seed; wasValid = e->vram_valid; wasDirty = e->host_dirty; }
     const int up = garnet_vs_begin_access(&RDNA4VS.c, vsId, seed, needContents ? 1 : 0, willWrite ? 1 : 0, fullOverwrite ? 1 : 0);
     pthread_mutex_unlock(&RDNA4VS.mu);
+    if (up && atomic_load(&upLog) < 25) {
+        int n = atomic_fetch_add(&upLog, 1) + 1;
+        if (n <= 25) RDNA4LOG("vram_surf upload #%d: id=%llu sid=%u %ux%u seed=%u prev=%u valid=%d dirty=%d",
+                              n, (unsigned long long)vsId, sid, w, h, seed, prevSeed, wasValid, wasDirty);
+    }
     return up != 0;
 }
 

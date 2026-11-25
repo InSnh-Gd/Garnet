@@ -1343,6 +1343,7 @@ typedef struct {
     rdna4uc_list _uc; BOOL _ucLive; rdna4ia _ia;   // build 16: F3 the surfaces this command buffer use-counts while in flight (rdna4UCRelease gives them back, exactly once); P1 the per-range aliasing state
     NSMutableArray<NSNumber *> *_vsActive;   // Phase B: active RDNA4VS entry IDs held by this CB until completion/dealloc
     RDNA4NativeJournal _native;
+    rdna4dc_cbcache _dcCache;
     NSMutableArray *_residencySnapshots;
     NSMutableSet *_residencyHeapResources;
 @public
@@ -1429,6 +1430,7 @@ typedef struct {
 - (NSError *)rdna4Error;
 - (BOOL)rdna4Bytes:(const void *)p length:(NSUInteger)n buffer:(RDNA4Buffer * __strong *)ob offset:(NSUInteger *)oo;
 - (VkDescriptorSet)rdna4AllocSet:(VkDescriptorSetLayout)l;
+- (rdna4dc_cbcache *)rdna4DrawCache;
 - (BOOL)rdna4FillSet:(VkDescriptorSet)set bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm;
 @end
 
@@ -1489,7 +1491,7 @@ typedef struct {
     float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
     id _tessFactorBuf; NSUInteger _tessFactorOff, _tessFactorStride; float _tessFactorScale;
     NSMutableSet *_samplerBindings;
-    rdna4dc_enc _dc; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcOn = the rdna4m-drawopt switch as latched at device creation)
+    rdna4dc_enc _dc; rdna4dc_cbcache *_dcCB; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcCB = CB-wide segment cache)
     rdna4occ *_occ; VkQueryPool _qp; uint32_t _qbase;   // build 18 (P2): this pass's occlusion bookkeeping (owned by the command buffer), its query pool and the first of its RDNA4OCC_MAXQ reserved query indices
     uint32_t _clrm; NSUInteger _dvc;   // #12 D2: attachments whose load action was Clear and not yet consumed by a presentable draw; vertex/index count of the draw being prepared (diagnostic)
     NSMutableSet *_argumentResources, *_argumentWritable;
@@ -2019,6 +2021,7 @@ typedef struct {
 - (BOOL)rdna4HasArgumentWrites;
 - (void)rdna4ArgumentCheckpoint;
 - (VkDescriptorSet)rdna4AllocSet:(VkDescriptorSetLayout)l;
+- (rdna4dc_cbcache *)rdna4DrawCache;
 - (BOOL)rdna4FillSet:(VkDescriptorSet)set bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm;
 - (BOOL)rdna4PrepareArguments:(const RDNA4ArgumentTables *)tables resources:(NSSet *)resources writable:(NSSet *)writable scan:(const RDNA4ArgumentScanPrepared *)scan textures:(void (^)(RDNA4Texture *, VkImageLayout, BOOL))prepare;
 - (void)rdna4CopyArgumentSets:(VkDescriptorSet [3])outSets;

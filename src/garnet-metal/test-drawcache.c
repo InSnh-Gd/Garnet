@@ -95,26 +95,38 @@ int main(void) {
             rdna4dc_enc_pc_get(&e, 3, 0, 1, &psos[8], &p) && p == 0x2000u &&
             rdna4dc_enc_pc_get(&e, 3, 0, 1, &psos[7], &p) && p == 0x1007u, "evicted slot 0"); }
 
-    // ---- 4b. segment-scoped descriptor-set LRU across layout switches & pass splits ----
-    { rdna4dc_enc lru; rdna4dc_sig sa, sb, slong; uint64_t s;
-      rdna4dc_enc_init(&lru);
+    // ---- 4b. CB-shared segment-scoped descriptor-set LRU & pc cache across render encoders ----
+    { rdna4dc_cbcache cb; rdna4dc_enc e1, e2; rdna4dc_sig sa, sb, slong; uint64_t s, p; int pso1 = 1, pso2 = 2;
+      rdna4dc_cb_init(&cb); rdna4dc_enc_init(&e1); rdna4dc_enc_init(&e2);
+      rdna4dc_cb_pc_put(&cb, 3, 0, 1, &pso1, 0xA1);
+      rdna4dc_cb_pc_put(&cb, 3, 0, 1, &pso2, 0xA2);
+      CHECK("CB pc cache hits across separate encoders",
+            rdna4dc_cb_pc_get(&cb, 3, 0, 1, &pso1, &p) && p == 0xA1 &&
+            rdna4dc_cb_pc_get(&cb, 3, 0, 1, &pso2, &p) && p == 0xA2, "ok");
+      rdna4dc_cb_pc_put(&cb, 3, 0, 1, &pso1, 0);
+      CHECK("CB pc null invalidates entry while keeping others",
+            !rdna4dc_cb_pc_get(&cb, 3, 0, 1, &pso1, &p) && rdna4dc_cb_pc_get(&cb, 3, 0, 1, &pso2, &p) && p == 0xA2, "ok");
       mk(&sa, 1, 10, 0xB0, 0, 0xE0, 0xF0, 0xA0);
       mk(&sb, 2, 20, 0xB1, 64, 0xE1, 0xF1, 0xA1);
-      rdna4dc_enc_layout(&lru, 1); rdna4dc_stage_store(&lru.st[0], &sa, 0x501); rdna4dc_enc_lru_put(&lru, 0, &sa, 0x501);
-      rdna4dc_enc_layout(&lru, 2); rdna4dc_stage_store(&lru.st[0], &sb, 0x502); rdna4dc_enc_lru_put(&lru, 0, &sb, 0x502);
-      rdna4dc_enc_layout(&lru, 1);
-      CHECK("layout switch forgets bound st[0] but hits segment LRU",
-            !rdna4dc_stage_match(&lru.st[0], &sa, &s) && rdna4dc_enc_lru_find(&lru, 0, &sa, &s) && s == 0x501, "lru %#llx", (unsigned long long)s);
-      CHECK("LRU stages stay independent", !rdna4dc_enc_lru_find(&lru, 1, &sa, &s), "stage 1 empty");
-      rdna4dc_enc_reset_bound(&lru);
-      CHECK("reset_bound (new pass, same segment) clears bound st but preserves segment LRU",
-            !lru.st[0].valid && rdna4dc_enc_lru_find(&lru, 0, &sb, &s) && s == 0x502, "lru %#llx", (unsigned long long)s);
-      rdna4dc_enc_reset_segment(&lru);
-      CHECK("reset_segment drops segment LRU", !rdna4dc_enc_lru_find(&lru, 0, &sa, &s) && !rdna4dc_enc_lru_find(&lru, 0, &sb, &s), "cleared");
+      rdna4dc_enc_layout(&e1, 1); rdna4dc_stage_store(&e1.st[0], &sa, 0x501); rdna4dc_cb_lru_put(&cb, 0, &sa, 0x501);
+      rdna4dc_enc_layout(&e1, 2); rdna4dc_stage_store(&e1.st[0], &sb, 0x502); rdna4dc_cb_lru_put(&cb, 0, &sb, 0x502);
+      CHECK("new encoder in same segment hits CB LRU despite empty st[0]",
+            !rdna4dc_stage_match(&e2.st[0], &sa, &s) && rdna4dc_cb_lru_find(&cb, 0, &sa, &s) && s == 0x501 &&
+            rdna4dc_cb_lru_find(&cb, 0, &sb, &s) && s == 0x502, "lru %#llx", (unsigned long long)s);
+      CHECK("CB LRU stages stay independent", !rdna4dc_cb_lru_find(&cb, 1, &sa, &s), "stage 1 empty");
+      rdna4dc_cb_reset_segment(&cb);
+      CHECK("reset_segment drops CB LRU while preserving CB pc cache",
+            !rdna4dc_cb_lru_find(&cb, 0, &sa, &s) && !rdna4dc_cb_lru_find(&cb, 0, &sb, &s) &&
+            rdna4dc_cb_pc_get(&cb, 3, 0, 1, &pso2, &p) && p == 0xA2, "cleared LRU, kept pc");
+      for (uint32_t i = 0; i <= RDNA4DC_LRU_CAP; i++) { mk(&sa, 1, 10, 0xB0 + i, 0, 0xE0, 0xF0, 0xA0); rdna4dc_cb_lru_put(&cb, 0, &sa, 0x700u + i); }
+      mk(&sa, 1, 10, 0xB0, 0, 0xE0, 0xF0, 0xA0);
+      mk(&sb, 1, 10, 0xB0 + RDNA4DC_LRU_CAP, 0, 0xE0, 0xF0, 0xA0);
+      CHECK("CB LRU 17th entry evicts slot 0 and keeps newest",
+            !rdna4dc_cb_lru_find(&cb, 0, &sa, &s) && rdna4dc_cb_lru_find(&cb, 0, &sb, &s) && s == 0x700u + RDNA4DC_LRU_CAP, "evicted 0");
       rdna4dc_sig_begin(&slong, 1, 10);
       for (uint32_t i = 0; i < RDNA4DC_LRU_MAXW; i++) rdna4dc_sig_push(&slong, 0x100u + i);
-      rdna4dc_enc_lru_put(&lru, 0, &slong, 0x999);
-      CHECK("signature longer than RDNA4DC_LRU_MAXW is skipped by LRU", !rdna4dc_enc_lru_find(&lru, 0, &slong, &s), "n=%u", slong.n); }
+      rdna4dc_cb_lru_put(&cb, 0, &slong, 0x999);
+      CHECK("signature longer than RDNA4DC_LRU_MAXW is skipped by CB LRU", !rdna4dc_cb_lru_find(&cb, 0, &slong, &s), "n=%u", slong.n); }
 
     // ---- 5. render-pass key ----
     { rdna4dc_rpcache *c = (rdna4dc_rpcache *)calloc(1, sizeof *c); rdna4dc_rpkey k = rk(2, 0), k2;
