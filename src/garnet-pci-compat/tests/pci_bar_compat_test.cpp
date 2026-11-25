@@ -741,6 +741,46 @@ void test_16g_and_32g_preservation_and_bar2_integrity() {
     CHECK(!handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
 }
 
+void test_8g_preservation_and_bar2_integrity() {
+    TestRig rig;
+    rig.initR9060XT16G();
+    // RX 9060 XT 8GB (1002:7590): 8 GiB BAR0 mask (0xFFFFFFFE_0000000C -> -(0xFFFFFFFE00000000) == 8 GiB).
+    rig.pci.mask[0x10 >> 2] = 0x0000000Cu;
+    rig.pci.mask[0x14 >> 2] = 0xFFFFFFFEu;
+    ProbeCounters cnt {};
+    const ProbeOps ops = sim_ops();
+
+    uint64_t size64 = 0ULL;
+    CHECK(validate_bar0_probe(0x0000000Cu, 0xFFFFFFFEu,
+                              max_allowed_bar0_for_device(kVendorAmd, kDevIdNavi44), size64) &&
+          size64 == (8ULL << 30));
+    CHECK(handle_probe_base_address_register(ops, cnt, &rig.cfg, &rig.dev, 6u, 0u));
+    CHECK(cnt.interceptCount == 1u);
+    CHECK(cnt.preservedBar0Bytes == (8ULL << 30));
+    CHECK(cnt.deviceId == kDevIdNavi44);
+    CHECK(cnt.refusedBridgeCount == 0u);
+    CHECK(cnt.passthroughCount == 0u);
+    CHECK(rig.pci.ranges[0].proposedSize() == (8ULL << 30));
+    CHECK(rig.pci.ranges[0].align() == (8ULL << 30));
+    CHECK((rig.pci.ranges[0].flags() & kIOPCIRangeFlag64Bit) != 0u);
+    CHECK(rig.pci.ranges[1].proposedSize() == 0ULL);
+    CHECK(rig.pci.ranges[2].type() == kIOPCIResourcePrefetchMemory);
+    CHECK(rig.pci.ranges[2].proposedSize() == (2ULL << 20));
+    CHECK((rig.pci.ranges[2].flags() & kIOPCIRangeFlag64Bit) != 0u);
+
+    // Insufficient host bridge PFM64 (< 8 GiB, e.g. 4 GiB) refuses and passes through cleanly.
+    rig.initR9060XT16G();
+    rig.pci.mask[0x10 >> 2] = 0x0000000Cu;
+    rig.pci.mask[0x14 >> 2] = 0xFFFFFFFEu;
+    rig.hbPfm.setWindow(0x400000000ULL, 4ULL << 30);
+    ProbeCounters refusedCnt {};
+    CHECK(!check_root_pfm64_capacity(&rig.cfg, &rig.dev, 8ULL << 30));
+    CHECK(!handle_probe_base_address_register(ops, refusedCnt, &rig.cfg, &rig.dev, 6u, 0u));
+    CHECK(refusedCnt.refusedBridgeCount == 1u);
+    CHECK(refusedCnt.interceptCount == 0u);
+    CHECK(refusedCnt.passthroughCount == 1u);
+}
+
 void test_small_bar_passthrough_and_invalid_bar0() {
     TestRig rig;
     const ProbeOps ops = sim_ops();
@@ -894,6 +934,7 @@ int main() {
     test_policy_and_detour_encoding();
     test_non_target_and_device_allowlist();
     test_16g_and_32g_preservation_and_bar2_integrity();
+    test_8g_preservation_and_bar2_integrity();
     test_small_bar_passthrough_and_invalid_bar0();
     test_bridge_pfm64_sufficiency_and_bounds();
 

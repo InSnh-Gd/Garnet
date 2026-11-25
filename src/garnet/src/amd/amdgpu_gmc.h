@@ -66,20 +66,25 @@ static constexpr uint64_t kVramHiTotalReserve     =
 //
 // B' fixes it in the page tables instead of rewriting Apple's addresses: give
 // GFXHUB CONTEXT0 a DEPTH=1 table whose PDB0 has 8 GiB leaves
-// (PAGE_TABLE_BLOCK_SIZE=12 -> 2^(12+21)) and:
-//   [0], [1]   PDE-as-PTE leaves -> VRAM physical 0 and 8 GiB  (the ALIAS:
-//              MC [0, 16 GiB) now resolves to the same VRAM as MC
-//              [0x8000000000, +16 GiB))
-//   [64],[65]  the same two physical bases (IDENTITY for our own MC window,
-//              so nothing this driver already does changes meaning)
-//   [66]       a real PDE pointing at the existing flat GART PTB, so
-//              MC 0x8400000000.. still resolves through the same 65536-entry
-//              array and every gmc_bind_* index stays valid
-// 66 * 2^33 == 0x8400000000 == gart_start and 64 * 2^33 == 0x8000000000 ==
-// vram_start; gmc_pdb0_build refuses to enable if either identity fails.
+// (PAGE_TABLE_BLOCK_SIZE=12 -> 2^(12+21)) and n_leaves = ceil(real_vram_size / 8 GiB):
+//   [0..n_leaves-1]           PDE-as-PTE leaves -> VRAM physical [0, 8 GiB, ...)  (ALIAS:
+//                             MC [0, n_leaves*8 GiB) resolves like [0x8000000000, +...))
+//   [64..64+n_leaves-1]       the same physical bases (IDENTITY for our MC window)
+//   [idx_gart]                a real PDE pointing at the flat GART PTB ([65] on 8 GiB at
+//                             0x8200000000, [66] on 16 GiB at 0x8400000000, [68] on 32 GiB
+//                             at 0x8800000000) so gmc_bind_* indices stay valid.
+// 64 * 2^33 == 0x8000000000 == vram_start and idx_gart * 2^33 == gart_start;
+// gmc_pdb0_build refuses if alignment, non-overlap, or table bounds fail.
 //
 // MMHUB is NEVER given this table — the VBIOS-programmed scanout translates
 // through MMHUB and must not move.
+struct PDB0Geometry {
+    uint64_t pde_span;
+    uint32_t idx_ident;
+    uint32_t idx_gart;
+    uint32_t n_leaves;
+};
+
 struct PDB0SelfTest {
     bool     ran          { false };
     bool     alias_ok     { false };   // (a) CONST_FILL to a 0-based address

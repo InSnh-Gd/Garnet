@@ -92,6 +92,47 @@ int main() {
         expect(dma_frees == dma_allocations && gmc->mem_scratch_bus == 0,
                "release is complete and idempotent");
     }
+
+    // Dynamic PDB0 geometry validation across 8 / 16 / 32 GiB and fail-closed misaligned/overlapping layouts.
+    {
+        PDB0Geometry geom {};
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 8112ull << 20,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnSuccess &&
+               geom.pde_span == (8ull << 30) && geom.idx_ident == 64u &&
+               geom.idx_gart == 65u && geom.n_leaves == 1u,
+               "8 GiB (8112 MiB) PDB0 computes 1 leaf + GART PDE at [65]");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 8192ull << 20,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnSuccess &&
+               geom.idx_gart == 65u && geom.n_leaves == 1u,
+               "exact 8 GiB PDB0 computes 1 leaf + GART PDE at [65]");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 16304ull << 20,
+                                         0x8400000000ull, 256ull << 20, 512u, geom) == kIOReturnSuccess &&
+               geom.idx_gart == 66u && geom.n_leaves == 2u,
+               "16 GiB PDB0 computes 2 leaves + GART PDE at [66]");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 32768ull << 20,
+                                         0x8800000000ull, 256ull << 20, 512u, geom) == kIOReturnSuccess &&
+               geom.idx_gart == 68u && geom.n_leaves == 4u,
+               "32 GiB PDB0 computes 4 leaves + GART PDE at [68]");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 12288ull << 20,
+                                         0x8300000000ull, 256ull << 20, 512u, geom) == kIOReturnUnsupported,
+               "misaligned 12 GiB gart_start (0x8300000000) is refused");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 16384ull << 20,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnUnsupported,
+               "identity leaves overlapping GART PDE are refused");
+        expect(gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 8192ull << 20,
+                                         0x8000000000ull + (512ull * (8ull << 30)),
+                                         256ull << 20, 512u, geom) == kIOReturnNoSpace,
+               "idx_gart >= kGMCPDB0Entries returns kIOReturnNoSpace");
+        expect(gmc_pdb0_compute_geometry(9u, 0x8000000000ull, 8192ull << 20,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnUnsupported &&
+               gmc_pdb0_compute_geometry(12u, 0x4000000000ull, 8192ull << 20,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnUnsupported &&
+               gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 8192ull << 20,
+                                         0x8200000000ull, 16ull << 30, 512u, geom) == kIOReturnUnsupported &&
+               gmc_pdb0_compute_geometry(12u, 0x8000000000ull, 0ull,
+                                         0x8200000000ull, 256ull << 20, 512u, geom) == kIOReturnUnsupported,
+               "wrong block_size / vram_start / gart_size / zero vram are refused");
+    }
     std::printf("GMC resources: %u failed; production allocation/register code\n", failures);
     return failures ? 1 : 0;
 }

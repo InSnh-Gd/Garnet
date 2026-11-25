@@ -448,6 +448,29 @@ static void p11_fullbar_policy() {
                  pl.visBase + pl.visSize + pl.hiSize + kReserve, kVram);
         expect_u("P11: visible_size reports vramLimit (15472 MiB), never 16384 MiB", visible_size(o.vramLimit, o.mapLen, kVram, 256 * MiB), 15472 * MiB);
     }
+    // Full-BAR 8 GiB (RX 9060 XT 8GB, code-ready aperture/pool verification; 8112 MiB and 8192 MiB)
+    {
+        for (uint64_t vram8g : { 8112 * MiB, 8192 * MiB }) {
+            PlanIn p = mk(8 * GiB, 0x7C00000000ull);
+            p.vramBytes = vram8g;
+            p.mapCap = map_cap_for(true);
+            p.requireFullBar = true;
+            const PlanOut o = plan_bar0(p);
+            const uint64_t wantLimit = vram8g - kReserve - 64 * MiB;
+            expect(o.ok && o.reason == kOk, "P11: 8 GiB full-BAR opt-in plans OK at 0x7C00000000");
+            expect_u("P11: 8 GiB physical BAR0 mapLen is 8 GiB", o.mapLen, 8 * GiB);
+            expect_u("P11: 8 GiB vramLimit clamps below reserve + slack", o.vramLimit, wantLimit);
+            expect(is_full_bar_aperture(o.mapLen, o.vramLimit), "P11: 8 GiB BAR0 with usable limit is full-BAR aperture");
+            const Pools pl = pool_sizes(kBase, kAllocOff, o.vramLimit, vram8g, kReserve);
+            expect_u("P11: 8 GiB zero double-counting: visBase + visSize + hiSize + hiReserve == valid VRAM",
+                     pl.visBase + pl.visSize + pl.hiSize + kReserve, vram8g);
+            uint64_t ex8[kMaxExtraAperturePoints] = {};
+            const uint32_t n8 = aperture_boundary_points(kBase, o.vramLimit, o.mapLen, vram8g, ex8);
+            expect_u("P11: 8 GiB full BAR yields 2 boundary points (4 GiB -64KiB and exact)", n8, 2u);
+            expect_u("P11: 8 GiB pt0 = 4 GiB - 64 KiB", ex8[0], 4 * GiB - 64 * 1024);
+            expect_u("P11: 8 GiB pt1 = 4 GiB",          ex8[1], 4 * GiB);
+        }
+    }
     // Zero double-counting when vramLimit covers ALL allocatable VRAM (vramBytes - hiReserve) -> hi = false, hiSize = 0
     {
         const uint64_t fullAllocLimit = kVram - kReserve;
@@ -699,6 +722,34 @@ static void p13_bartest(const std::string &root) {
         BarTestPointIn pin { vramStart, visBase, vramLimit, bar0Size, kVram, 0ull, consLen, visBase, visBase, visBase + kBarTestBlockBytes };
         expect_u("P13: overlapping target and canary refused kBtOverlapSelf", bartest_run_point(sim, pin).status, kBtOverlapSelf);
     }
+
+    // 4b) 8 GiB Full-BAR planning, bidirectional execution, and fail-closed checks (RX 9060 XT 8GB)
+    for (uint64_t vram8g : { 8112 * MiB, 8192 * MiB }) {
+        const uint64_t limit8g = vram8g - kReserve - 64 * MiB;
+        const uint64_t bar8g = 8 * GiB;
+        uint64_t t8[kMaxBarTestTargets] = {};
+        uint32_t n8 = 0;
+        expect_u("P13: 8 GiB full-BAR arg 0 plans 2 targets", bartest_plan_targets(true, 0ull, visBase, limit8g, bar8g, vram8g, 0ull, consLen, t8, &n8), kBtOk);
+        expect_u("P13: 8 GiB full-BAR target count == 2", n8, 2u);
+        expect_u("P13: 8 GiB target 0 straddles 4 GiB", t8[0], 4 * GiB - 64 * 1024);
+        expect_u("P13: 8 GiB target 1 is top valid block below vramLimit", t8[1], (limit8g - kBarTestBlockBytes) & ~(kLimitAlign - 1ull));
+        for (uint32_t i = 0; i < n8; i++) {
+            FakeBarVram sim;
+            BarTestPointIn pin { vramStart, visBase, limit8g, bar8g, vram8g, 0ull, consLen, t8[i], visBase, visBase + kBarTestCanaryBytes };
+            const BarTestPointOut r = bartest_run_point(sim, pin);
+            expect(r.status == kBtOk && sim.copies == 2u, "P13: 8 GiB bidirectional direct-BAR <-> GPU test PASSES target");
+            expect_u("P13: 8 GiB target payload scrubbed to 0 on exit", sim.bar0_read32(t8[i] + kBarTestPayloadOff), 0u);
+        }
+        // Truncated BAR0 or truncated vramLimit fails closed cleanly.
+        expect_u("P13: 8 GiB card with truncated 4 GiB BAR0 refused kBtBeyondLimit",
+                 bartest_plan_targets(true, 0ull, visBase, 4 * GiB, 4 * GiB, vram8g, 0ull, consLen, t8, &n8), kBtBeyondLimit);
+        expect_u("P13: 8 GiB BAR0 with truncated 3 GiB vramLimit refused kBtBeyondLimit",
+                 bartest_plan_targets(true, 0ull, visBase, 3 * GiB, bar8g, vram8g, 0ull, consLen, t8, &n8), kBtBeyondLimit);
+    }
+    expect_u("P13: 16 GiB BAR0 with truncated 7 GiB vramLimit refused kBtBeyondLimit",
+             bartest_plan_targets(true, 0ull, visBase, 7 * GiB, 16 * GiB, kVram, 0ull, consLen, targets, &nTargets), kBtBeyondLimit);
+    expect_u("P13: 4 GiB VRAM leaves no 4 GiB straddle boundary -> kBtBeyondLimit",
+             bartest_plan_targets(true, 0ull, visBase, 3264 * MiB, 8 * GiB, 4 * GiB, 0ull, consLen, targets, &nTargets), kBtBeyondLimit);
 
     // 5) Source pins for Tasks 3.1 / 3.2 / 3.3 / 4.1
     const std::string K = root + "/src/garnet/src/";

@@ -1216,6 +1216,39 @@ gmc_mmhub_gart_enable(DeviceContext &dev, GMCContext &gmc)
 // same thing here — which is why the 0-based alias and the identity can coexist
 // in one table.
 // ============================================================
+static kern_return_t
+gmc_pdb0_compute_geometry(uint32_t block_size,
+                          uint64_t vram_start,
+                          uint64_t real_vram_size,
+                          uint64_t gart_start,
+                          uint64_t gart_size,
+                          uint32_t max_entries,
+                          PDB0Geometry &out)
+{
+    out = {};
+    if (block_size != 12) return kIOReturnUnsupported;
+    const uint64_t pde_span = 1ULL << (block_size + 21);   // 8 GiB
+    if (pde_span != 0x200000000ULL) return kIOReturnUnsupported;
+    if (vram_start != 0x8000000000ULL) return kIOReturnUnsupported;
+    if (real_vram_size == 0 || real_vram_size > ~0ULL - (pde_span - 1))
+        return kIOReturnUnsupported;
+    if (gart_start <= vram_start || (gart_start % pde_span) != 0)
+        return kIOReturnUnsupported;
+    const uint64_t idx_ident = vram_start / pde_span;
+    const uint64_t idx_gart  = gart_start / pde_span;
+    if (idx_ident != 64) return kIOReturnUnsupported;
+    if (idx_gart >= max_entries) return kIOReturnNoSpace;
+    const uint64_t n_leaves = (real_vram_size + pde_span - 1) / pde_span;
+    if (n_leaves == 0 || n_leaves > max_entries || idx_ident + n_leaves > idx_gart)
+        return kIOReturnUnsupported;
+    if (gart_size == 0 || gart_size > pde_span) return kIOReturnUnsupported;
+    out.pde_span  = pde_span;
+    out.idx_ident = (uint32_t)idx_ident;
+    out.idx_gart  = (uint32_t)idx_gart;
+    out.n_leaves  = (uint32_t)n_leaves;
+    return kIOReturnSuccess;
+}
+
 kern_return_t
 gmc_pdb0_build(DeviceContext &dev, GMCContext &gmc)
 {
@@ -1223,55 +1256,25 @@ gmc_pdb0_build(DeviceContext &dev, GMCContext &gmc)
     if (!gmc.inited)          return kIOReturnNotReady;
     if (gmc.gart_pt_bus == 0) return kIOReturnNotReady;
 
-    const uint32_t bs       = gmc.pdb0_block_size;         // 12
-    const uint64_t pde_span = 1ULL << (bs + 21);           // 8 GiB
-
-    // ---- geometry guards: refuse (and say why) rather than write a table
-    //      whose arithmetic does not hold on this card.
-    if (bs != 12 || pde_span != 0x200000000ULL) {
-        GMC_LOG("pdb0: REFUSING — block_size=%u gives a %llu MiB leaf, expected "
-                "12 / 8192 MiB", (unsigned)bs, (unsigned long long)(pde_span >> 20));
-        return kIOReturnUnsupported;
-    }
-    if (gmc.vram_start != 0x8000000000ULL) {
-        GMC_LOG("pdb0: REFUSING — vram_start is %#llx, not 0x8000000000; the "
-                "identity entries would land at the wrong index",
-                (unsigned long long)gmc.vram_start);
-        return kIOReturnUnsupported;
-    }
-    if (gmc.gart_start != 0x8400000000ULL) {
-        GMC_LOG("pdb0: REFUSING — gart_start is %#llx, not 0x8400000000 "
-                "(66 * 2^33); the GART PDE index would be wrong",
-                (unsigned long long)gmc.gart_start);
-        return kIOReturnUnsupported;
-    }
-    const uint32_t idx_ident = (uint32_t)(gmc.vram_start / pde_span);   // 64
-    const uint32_t idx_gart  = (uint32_t)(gmc.gart_start / pde_span);   // 66
-    const uint32_t n_leaves  =
-        (uint32_t)((gmc.real_vram_size + pde_span - 1) / pde_span);     // 2
-    if (idx_ident != 64 || idx_gart != 66) {
-        GMC_LOG("pdb0: REFUSING — computed indices ident=%u gart=%u, expected "
-                "64/66", (unsigned)idx_ident, (unsigned)idx_gart);
-        return kIOReturnUnsupported;
-    }
-    if (n_leaves == 0 || idx_ident + n_leaves > idx_gart) {
-        GMC_LOG("pdb0: REFUSING — %llu MiB of VRAM needs %u leaves, which would "
-                "run the identity block (idx %u) into the GART PDE (idx %u)",
+    const uint32_t bs = gmc.pdb0_block_size;         // 12
+    PDB0Geometry geom {};
+    const kern_return_t geom_rc = gmc_pdb0_compute_geometry(
+        bs, gmc.vram_start, gmc.real_vram_size, gmc.gart_start, gmc.gart_size,
+        kGMCPDB0Entries, geom);
+    if (geom_rc != kIOReturnSuccess) {
+        GMC_LOG("pdb0: REFUSING — invalid geometry (bs=%u vram_start=%#llx "
+                "vram=%llu MiB gart_start=%#llx gart_size=%llu MiB -> rc=%#x)",
+                (unsigned)bs, (unsigned long long)gmc.vram_start,
                 (unsigned long long)(gmc.real_vram_size >> 20),
-                (unsigned)n_leaves, (unsigned)idx_ident, (unsigned)idx_gart);
-        return kIOReturnUnsupported;
+                (unsigned long long)gmc.gart_start,
+                (unsigned long long)(gmc.gart_size >> 20),
+                (unsigned)geom_rc);
+        return geom_rc;
     }
-    if (idx_gart >= kGMCPDB0Entries) {
-        GMC_LOG("pdb0: REFUSING — GART PDE index %u does not fit in a %u-entry "
-                "page", (unsigned)idx_gart, (unsigned)kGMCPDB0Entries);
-        return kIOReturnNoSpace;
-    }
-    if (gmc.gart_size > pde_span) {
-        GMC_LOG("pdb0: REFUSING — the %llu MiB GART does not fit under one "
-                "%llu MiB PDE", (unsigned long long)(gmc.gart_size >> 20),
-                (unsigned long long)(pde_span >> 20));
-        return kIOReturnUnsupported;
-    }
+    const uint64_t pde_span  = geom.pde_span;
+    const uint32_t idx_ident = geom.idx_ident;
+    const uint32_t idx_gart  = geom.idx_gart;
+    const uint32_t n_leaves  = geom.n_leaves;
 
     const uint64_t pdb0_vram_off = dev.vramBase + kGMCPDB0VRAMOffset;
     if (pdb0_vram_off + kGMCPDB0Bytes > dev.vramLimit) {
@@ -1315,7 +1318,7 @@ gmc_pdb0_build(DeviceContext &dev, GMCContext &gmc)
     const uint64_t gart_ptb_pa =
         gmc.vram_base_offset + gmc.gart_pt_bus - gmc.vram_start;
 
-    // Zero first: entries 2..63, 67..511 must read invalid.
+    // Zero first: all unused PDB0 entries must read invalid.
     bar0_memset_vram(dev, pdb0_vram_off, 0, kGMCPDB0Bytes);
 
     for (uint32_t i = 0; i < n_leaves; i++) {

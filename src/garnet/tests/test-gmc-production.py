@@ -9,6 +9,7 @@ end = source.index("// PDE/PTE bit layout", begin)
 parts = [source[begin:end]]
 for marker in ("kern_return_t\ngmc_alloc_resources(",
                "void\ngmc_release_resources(",
+               "static kern_return_t\ngmc_pdb0_compute_geometry(",
                "static void\nhub_init_system_aperture_regs("):
     begin = source.index(marker)
     end = source.index("\n}\n", begin) + 3

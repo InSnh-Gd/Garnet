@@ -5,8 +5,8 @@
 //   - Direct CPU BAR0 access ONLY (WC drain + HDP flush). NEVER falls back to MM_INDEX.
 //   - Fails closed if offset is outside [visBase, min(bar0Size, vramLimit, vramBytes)), overlaps console/cursor,
 //     overflows 64-bit arithmetic, or BAR0 does not cover the requested target.
-//   - Covers 4 GiB, 8 GiB, 12 GiB boundaries (straddling blocks [boundary - 64 KiB, boundary + 64 KiB))
-//     plus highest allocatable offset below vramLimit.
+//   - Covers all 4 GiB boundaries strictly below VRAM (4 GiB on 8 GiB cards; 4/8/12 GiB on 16 GiB cards,
+//     straddling blocks [boundary - 64 KiB, boundary + 64 KiB)) plus highest allocatable offset below vramLimit.
 //   - Verifies both directions (CPU BAR0 write -> GPU read; GPU write -> CPU BAR0 read),
 //     surrounding guards (before/after payload), and a low-address canary (< 4 GiB) against 32-bit wrap/aliasing.
 #pragma once
@@ -57,7 +57,7 @@ inline const char *bartest_status_name(uint32_t st) {
     case kBtOk: return "ok";
     case kBtBadArg: return "bad argument";
     case kBtNoBar0: return "BAR0 not mapped";
-    case kBtNotFullBar: return "full BAR mode not active (pass garnet-full-bar=1 with 16 GiB BAR0)";
+    case kBtNotFullBar: return "full BAR mode not active (pass garnet-full-bar=1 with full BAR0)";
     case kBtBadAperture: return "BAR0 aperture / vramLimit inconsistent";
     case kBtBelowVisBase: return "target offset below visible allocator base";
     case kBtBeyondLimit: return "target offset exceeds mapped BAR0 / vramLimit / valid VRAM";
@@ -96,8 +96,8 @@ constexpr uint32_t bartest_range_ok(uint64_t off, uint64_t len, uint64_t visBase
 }
 
 // Plan direct-BAR test targets.
-// arg == 0: full-BAR mode required; produces 4 GiB, 8 GiB, 12 GiB straddling blocks + highest valid block below vramLimit.
-// arg == 1: single highest valid block below vramLimit (works on 256 MiB / 1 GiB / 16 GiB for regression checks).
+// arg == 0: full-BAR mode required; produces all 4 GiB straddling blocks within VRAM + highest valid block below vramLimit.
+// arg == 1: single highest valid block below vramLimit (works on 256 MiB / 1 GiB / 8 GiB / 16 GiB for regression checks).
 constexpr uint32_t bartest_plan_targets(bool fullBarMode, uint64_t arg, uint64_t visBase,
                                         uint64_t vramLimit, uint64_t bar0Size, uint64_t vramBytes,
                                         uint64_t consoleOff, uint64_t consoleLen,
@@ -111,17 +111,22 @@ constexpr uint32_t bartest_plan_targets(bool fullBarMode, uint64_t arg, uint64_t
     const uint64_t top = (vramLimit - kBarTestBlockBytes) & ~(kLimitAlign - 1ull);
     uint32_t n = 0u;
     if (arg == 0ull) {
+        if (bar0Size <= kMaxBar0Map || (vramBytes != 0ull && bar0Size < vramBytes))
+            return kBtBeyondLimit;
         const uint64_t boundaries[3] = {
             4ull * kGiB - kBarTestHalfBlock,
             8ull * kGiB - kBarTestHalfBlock,
             12ull * kGiB - kBarTestHalfBlock,
         };
         for (uint32_t i = 0; i < 3u; i++) {
+            if (vramBytes != 0ull && boundaries[i] + kBarTestBlockBytes > vramBytes)
+                continue;
             const uint32_t st = bartest_range_ok(boundaries[i], kBarTestBlockBytes, visBase,
                                                  vramLimit, bar0Size, vramBytes, consoleOff, consoleLen);
-            if (st != kBtOk) return st;   // fail closed: full-BAR mode must cover 4/8/12 GiB boundaries
+            if (st != kBtOk) return st;   // fail closed: full-BAR mode must cover every 4 GiB boundary within VRAM
             out[n++] = boundaries[i];
         }
+        if (n == 0u) return kBtBeyondLimit;
     }
     const uint32_t topSt = bartest_range_ok(top, kBarTestBlockBytes, visBase,
                                             vramLimit, bar0Size, vramBytes, consoleOff, consoleLen);

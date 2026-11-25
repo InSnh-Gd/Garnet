@@ -1345,7 +1345,7 @@ static const char *bartest_status_name(uint32_t st) {
     case 0:  return "ok";
     case 1:  return "bad argument";
     case 2:  return "BAR0 not mapped";
-    case 3:  return "full BAR mode not active (pass garnet-full-bar=1 with 16 GiB BAR0)";
+    case 3:  return "full BAR mode not active (pass garnet-full-bar=1 with full BAR0)";
     case 4:  return "BAR0 aperture / vramLimit inconsistent";
     case 5:  return "target offset below visible allocator base";
     case 6:  return "target offset exceeds mapped BAR0 / vramLimit / valid VRAM";
