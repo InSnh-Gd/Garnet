@@ -69,6 +69,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err { return [self initWithDevice:dev descriptor:d options:0 noFallback:nofb error:err]; }
 - (const char *)rdna4VName { return _vnm; }
 - (const char *)rdna4FName { return _fnm; }
+- (uint32_t)rdna4DrawBits { return _drawBits; }
 - (BOOL)rdna4HasFragment { return _hasFrag; }
 - (BOOL)rdna4IsRenderFallback { return _fallback; }
 - (RDNA4RenderPipelineState *)rdna4Real { uintptr_t p = rdna4hs_load(&_realp); return p ? (__bridge RDNA4RenderPipelineState *)(void *)p : nil; }
@@ -144,7 +145,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         }
         fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
     }
-    strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm);
+    strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
     BOOL fb = NO;
     NSError *translationFailure = nil;
     if (!vsd || (hasFrag && !fsd)) {
@@ -160,7 +161,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                 e1 = nil; e2 = nil; mv_ = nil; mf_ = nil;
                 vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
                 fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
-                strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm);
+                strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
             }
         }
     }
@@ -178,7 +179,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                 if (rdna4_sync_wait("render", want, NO)) {
                     if (!vsd) vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
                     if (hasFrag && !fsd) fsd = rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_);
-                    strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm);
+                    strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
                 }
             }
             if (!vsd || (hasFrag && !fsd)) {
@@ -900,13 +901,25 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front { return [self pipelineForTopology:topo cull:cull front:front ds:[self rdna4DSKey:NULL] rflags:0]; }
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk { return [self pipelineForTopology:topo cull:cull front:front ds:dk rflags:0]; }
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk rflags:(uint32_t)rflags {
-    NSNumber *k = @((uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24) | ((uint64_t)(rflags & 0x7Fu) << 56));
+    const uint64_t key = (uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24) | ((uint64_t)(rflags & 0x7Fu) << 56);
+    // Single-variant lock-free fast path: _fastKey is written once before _fastPipe is published with release semantics.
+    uintptr_t fp = atomic_load_explicit(&_fastPipe, memory_order_acquire);
+    if (fp && atomic_load_explicit(&_fastKey, memory_order_relaxed) == key)
+        return (VkPipeline)fp;
+    NSNumber *k = @(key);
     [_lock lock];
     NSValue *v = _variants[k];
     if (!v) {
         NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk rflags:rflags icb:NO error:&e];
         if (!p) RDNA4LOG("pipeline variant (topology %d cull %d front %d rflags 0x%x) failed: %s", topo, cull, front, rflags, e.localizedDescription.UTF8String);
-        else { v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v; RDNA4LOG("pipeline variant topology %d cull %d front %d rflags 0x%x created", topo, cull, front, rflags); }
+        else {
+            v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v;
+            if (!atomic_load_explicit(&_fastPipe, memory_order_relaxed)) {
+                atomic_store_explicit(&_fastKey, key, memory_order_relaxed);
+                atomic_store_explicit(&_fastPipe, (uintptr_t)p, memory_order_release);
+            }
+            RDNA4LOG("pipeline variant topology %d cull %d front %d rflags 0x%x created", topo, cull, front, rflags);
+        }
     }
     [_lock unlock];
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
@@ -1719,9 +1732,13 @@ GARNET_INTERNAL NSArray *rdna4nc_stage_arguments(id reflection, RDNA4NCOp stage)
 }
 GARNET_INTERNAL BOOL rdna4nc_stage_writes(const RDNA4StageState *state, NSArray *arguments, RDNA4NCOp op,
                                  const char *stage, uint32_t *warned) {
-    if (!rdna4nc_any_readonly_buffer()) return NO;
+    uint32_t mask = state->roBufMask;
+    if (!mask || !rdna4nc_any_readonly_buffer()) return NO;
     BOOL drop = NO;
-    for (unsigned i = 0; i < 31; i++) {
+    while (mask) {
+        unsigned i = (unsigned)__builtin_ctz(mask);
+        mask &= mask - 1u;
+        if (i >= 31) break;
         RDNA4Buffer *buffer = state->buf[i].b;
         if (!buffer || ![buffer rdna4HostReadOnly]) continue;
         BOOL known = NO;

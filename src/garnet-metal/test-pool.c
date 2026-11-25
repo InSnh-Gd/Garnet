@@ -111,7 +111,19 @@ int main(void) {
     rdna4p_done(&p, sw);
     CHECK("whole: reusable after the fence clears", rdna4p_alloc(&p, 3, 1 * MIB, 4096, 23, &r) == RDNA4P_R_REC && r.mem == (void *)0xAA, "hit mem %p", r.mem);
     CHECK("whole: key and exact size must match", rdna4p_free_whole(&p, 3, 1 * MIB, (void *)0xAB, NULL, 24) == 1 && rdna4p_alloc(&p, 4, 1 * MIB, 4096, 25, &r) == RDNA4P_R_NEED_WHOLE &&
-          rdna4p_alloc(&p, 3, 1 * MIB + 4096, 4096, 25, &r) == RDNA4P_R_NEED_WHOLE && rdna4p_alloc(&p, 3, 1 * MIB, 4096, 25, &r) == RDNA4P_R_REC, "other key / other size miss, same key+size hits");
+          rdna4p_alloc(&p, 3, 1 * MIB + 4096, 4096, 25, &r) == RDNA4P_R_NEED_WHOLE && rdna4p_alloc(&p, 3, 1 * MIB, 4096, 25, &r) == RDNA4P_R_REC && r.size == 1 * MIB, "other key / larger size miss, same key+size hits");
+    // best-fit whole recycle within +25%: prefers exact match, returns actual backing size, rejects > +25%
+    CHECK("whole best-fit: exact preferred over +12.5%, +25% boundary hits with actual size, >+25% misses",
+          rdna4p_free_whole(&p, 3, 1 * MIB + 128 * KIB, (void *)0xB1, NULL, 26) == 1 &&
+          rdna4p_free_whole(&p, 3, 1 * MIB, (void *)0xB0, NULL, 26) == 1 &&
+          rdna4p_free_whole(&p, 3, 1 * MIB + 256 * KIB, (void *)0xB2, NULL, 26) == 1 &&
+          rdna4p_free_whole(&p, 3, 1 * MIB + 260 * KIB, (void *)0xB3, NULL, 26) == 1 &&
+          rdna4p_alloc(&p, 3, 1 * MIB, 4096, 27, &r) == RDNA4P_R_REC && r.mem == (void *)0xB0 && r.size == 1 * MIB &&
+          rdna4p_alloc(&p, 3, 1 * MIB, 4096, 27, &r) == RDNA4P_R_REC && r.mem == (void *)0xB1 && r.size == 1 * MIB + 128 * KIB &&
+          rdna4p_alloc(&p, 3, 1 * MIB, 4096, 27, &r) == RDNA4P_R_REC && r.mem == (void *)0xB2 && r.size == 1 * MIB + 256 * KIB &&
+          rdna4p_alloc(&p, 3, 1 * MIB, 4096, 27, &r) == RDNA4P_R_NEED_WHOLE &&
+          p.nrc == 1 && p.recBytes == 1 * MIB + 260 * KIB,
+          "nrc=%zu recBytes=%llu", p.nrc, (unsigned long long)p.recBytes);
     uint64_t sh = rdna4p_submit(&p);
     CHECK("handles: push stamps with submitted", rdna4p_h_push(&p, 0x77, 32) == 1 && rdna4p_h_count(&p) == 1, "pushed");
     CHECK("handles: NOT popped before the fence clears", rdna4p_h_pop(&p) == 0, "0");
@@ -259,7 +271,7 @@ int main(void) {
             } else if (op == 6) {
                 uint64_t sz = (1 + (uint64_t)(rand() % 4)) * MIB; rdna4p_res rs; int kk = rdna4p_alloc(&p, 2, sz, 4096, now, &rs);
                 if (kk == RDNA4P_R_REC) { wreused++; for (int f = 0; f < nfr; f++) if (fr[f].whole && fr[f].mem == (uintptr_t)rs.mem && !fr[f].claimed) { if (fr[f].stamp > p.completed) viol++; fr[f].claimed = 1; } }
-                if ((kk == RDNA4P_R_REC || kk == RDNA4P_R_NEED_WHOLE) && nwl < 64) { uintptr_t m = kk == RDNA4P_R_REC ? (uintptr_t)rs.mem : ++memctr; wl[nwl].mem = m; wl[nwl].size = sz; nwl++; }
+                if ((kk == RDNA4P_R_REC || kk == RDNA4P_R_NEED_WHOLE) && nwl < 64) { uintptr_t m = kk == RDNA4P_R_REC ? (uintptr_t)rs.mem : ++memctr; wl[nwl].mem = m; wl[nwl].size = kk == RDNA4P_R_REC ? rs.size : sz; nwl++; }
             } else if (op == 7 && nwl) {
                 int j = rand() % nwl; int pooled = rdna4p_free_whole(&p, 2, wl[j].size, (void *)wl[j].mem, NULL, now);
                 if (pooled && nfr < NF) { fr[nfr].whole = 1; fr[nfr].mem = wl[j].mem; fr[nfr].stamp = p.submitted; fr[nfr].claimed = 0; nfr++; }

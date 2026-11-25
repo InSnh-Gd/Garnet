@@ -436,6 +436,7 @@ typedef struct {
 typedef struct { __unsafe_unretained RDNA4Buffer *b; NSUInteger off; } RDNA4BufSlot;
 typedef struct {
     RDNA4BufSlot buf[31]; __unsafe_unretained RDNA4Texture *tex[128]; __unsafe_unretained RDNA4SamplerBinding *smp[16]; __unsafe_unretained RDNA4Texture *att[8];   // att: the colour attachments (input attachments, 11e-2)
+    uint32_t roBufMask;   // bit i set iff buf[i].b is a host-read-only no-copy buffer
     RDNA4RTStageSlots rt;
     const rdna4rtr_as_reflection_t *rtAsRefl;
     const rdna4_argument_scan_reflection_plan *scanPlan;
@@ -757,6 +758,13 @@ typedef struct {
 - (void)rdna4DestroyRetiredBacking;
 - (BOOL)rdna4ZeroLargePrivate:(NSUInteger)len unresolved:(BOOL *)unresolved error:(NSError **)err;
 @end
+
+static inline void rdna4_stage_set_buf(RDNA4StageState *s, NSUInteger i, RDNA4Buffer *b, NSUInteger off) {
+    s->buf[i].b = b;
+    s->buf[i].off = off;
+    if (b && [b rdna4HostReadOnly]) s->roBufMask |= (1u << i);
+    else s->roBufMask &= ~(1u << i);
+}
 
 @interface RDNA4Texture : _MTLResource {
     id _dev; NSUInteger _w, _h; MTLPixelFormat _pf; const RDNA4Fmt *_fmt; NSUInteger _usage; NSUInteger _opts;
@@ -1103,6 +1111,9 @@ typedef struct {
     RDNA4PB *_icbPbV, *_icbPbF; uint32_t _icbNpbV, _icbNpbF;
     NSMutableDictionary *_icbVariants;
     char _vnm[64], _fnm[64];   // native #12 P1: vertex / fragment function names (CoreDisplay's final pass = fragment "GPUPass")
+    uint32_t _drawBits;        // cached rdna4df_draw_bits(_fnm)
+    _Atomic uint64_t _fastKey;
+    _Atomic uintptr_t _fastPipe;   // lock-free single-variant fast-path (published once, immutable until dealloc)
     rdna4pc_t _pc; MTLPixelFormat _dpf, _spf; VkFormat _dsVk; unsigned _dsAsp;   // bundle 10: fixed config (samples, dynamic states, depth bias), the depth / stencil attachment formats, the attachment's VkFormat (UNDEFINED = none) and aspects
     MTLRenderPipelineDescriptor *_hsDesc; _Atomic(uintptr_t) _realp;   // hot-swap: creation descriptor (fallback only); the published real object (+1, written once)
     MTLRenderPipelineReflection *_reflection;
@@ -1144,7 +1155,7 @@ typedef struct {
 - (const RDNA4PB *)pbV; - (uint32_t)npbV; - (const RDNA4PB *)pbF; - (uint32_t)npbF;
 - (const uint32_t *)needBindings; - (uint32_t)nNeed;
 - (BOOL)fetch; - (uint32_t)fetchMax;
-- (const char *)rdna4VName; - (const char *)rdna4FName; - (BOOL)rdna4HasFragment;
+- (const char *)rdna4VName; - (const char *)rdna4FName; - (uint32_t)rdna4DrawBits; - (BOOL)rdna4HasFragment;
 - (id)reflection;
 - (void)rdna4SetReflection:(MTLRenderPipelineReflection *)reflection;
 - (BOOL)rdna4IsTessellation;
@@ -1253,6 +1264,9 @@ typedef struct {
     NSMutableArray *argumentIntents;
     NSMutableSet *argumentRefs;
     NSMutableSet *commandRefs;
+    const void *recentArgRefs[8];
+    const void *recentCmdRefs[8];
+    uint32_t recentArgPos, recentCmdPos;
     NSMutableArray *argumentPools;
     NSMutableArray *descriptorPools;
     NSArray *argumentSummaryAttempts;

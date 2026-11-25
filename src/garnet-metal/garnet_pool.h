@@ -171,9 +171,9 @@ static inline void rdna4p_defer(rdna4p_pool *p, rdna4p_def d) {
 
 // ---- allocation ----------------------------------------------------------------------------------------------------------------
 enum { RDNA4P_R_SUB = 1, RDNA4P_R_REC, RDNA4P_R_NEED_SLAB, RDNA4P_R_NEED_WHOLE, RDNA4P_R_DIRECT };
-typedef struct { int kind; uint64_t slab, off; void *mem, *map; } rdna4p_res;
-// SUB: *off in slab r->slab (mem/map are the slab's: bind at off, contents = map + off). REC: a recycled whole allocation. NEED_SLAB: the caller allocates a slab
-// (RDNA4P_SLAB_SIZE, key), calls rdna4p_add_slab and asks again. NEED_WHOLE: the caller allocates exactly `size`; give it back with rdna4p_free_whole.
+typedef struct { int kind; uint64_t slab, off, size; void *mem, *map; } rdna4p_res;
+// SUB: *off in slab r->slab (mem/map are the slab's: bind at off, contents = map + off). REC: a recycled whole allocation (r->size is its actual backing size >= size).
+// NEED_SLAB: the caller allocates a slab (RDNA4P_SLAB_SIZE, key), calls rdna4p_add_slab and asks again. NEED_WHOLE: the caller allocates `size`; give it back with rdna4p_free_whole.
 // DIRECT: too large / over-aligned: the caller allocates and frees it itself, as before.
 static inline int rdna4p_alloc(rdna4p_pool *p, uint32_t key, uint64_t size, uint64_t align, uint64_t now, rdna4p_res *r) {
     memset(r, 0, sizeof *r); if (align < 1) align = 1;
@@ -183,14 +183,28 @@ static inline int rdna4p_alloc(rdna4p_pool *p, uint32_t key, uint64_t size, uint
     if (size <= RDNA4P_SUB_MAX && align <= RDNA4P_SLAB_SIZE) {
         for (size_t i = 0; i < p->nsl; i++) {
             rdna4p_slab *s = p->sl[i]; uint64_t off;
-            if (s->key == key && rdna4p_slab_take(s, size, align, &off)) { r->kind = RDNA4P_R_SUB; r->slab = s->id; r->off = off; r->mem = s->mem; r->map = s->map; p->subAlloc++; p->subHit++; p->avoided++; return r->kind; }
+            if (s->key == key && rdna4p_slab_take(s, size, align, &off)) { r->kind = RDNA4P_R_SUB; r->slab = s->id; r->off = off; r->size = size; r->mem = s->mem; r->map = s->map; p->subAlloc++; p->subHit++; p->avoided++; return r->kind; }
         }
         r->kind = RDNA4P_R_NEED_SLAB; return r->kind;
     }
     if (size > RDNA4P_SUB_MAX && size <= RDNA4P_REC_MAX) {
-        for (size_t i = 0; i < p->nrc; i++) if (p->rc[i].key == key && p->rc[i].size == size) {
-            r->kind = RDNA4P_R_REC; r->mem = p->rc[i].mem; r->map = p->rc[i].map; p->recBytes -= size;
-            memmove(&p->rc[i], &p->rc[i + 1], (p->nrc - i - 1) * sizeof *p->rc); p->nrc--; p->recHit++; p->avoided++; return r->kind;
+        // Best-fit reuse up to +25% oversize avoids kernel BO churn under minor texture/buffer size jitter.
+        const uint64_t maxSize = size + (size >> 2);
+        size_t best = p->nrc;
+        uint64_t bestSize = UINT64_MAX;
+        for (size_t i = 0; i < p->nrc; i++) {
+            if (p->rc[i].key != key) continue;
+            uint64_t cs = p->rc[i].size;
+            if (cs >= size && cs <= maxSize && cs < bestSize) {
+                best = i; bestSize = cs;
+                if (cs == size) break;
+            }
+        }
+        if (best < p->nrc) {
+            r->kind = RDNA4P_R_REC; r->mem = p->rc[best].mem; r->map = p->rc[best].map; r->size = bestSize;
+            p->recBytes -= bestSize;
+            memmove(&p->rc[best], &p->rc[best + 1], (p->nrc - best - 1) * sizeof *p->rc); p->nrc--;
+            p->recHit++; p->avoided++; return r->kind;
         }
         p->recMiss++; r->kind = RDNA4P_R_NEED_WHOLE; return r->kind;
     }

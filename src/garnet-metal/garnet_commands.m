@@ -194,6 +194,8 @@ GARNET_INTERNAL void rdna4_add_protocols(Class c, const char **names, unsigned n
 // segment's fence rather than at terminal command-buffer completion. A sticky
 // NSError is delivered as the completion error instead of submitting.
 // ---------------------------------------------------------------------------------------------------------------
+static inline void rdna4_free_ptr(void **p) { free(*p); }
+
 @implementation RDNA4CommandSegment
 - (instancetype)init {
     self = [super init];
@@ -1568,6 +1570,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (releaseRefs) {
         [segment->argumentRefs removeAllObjects];
         [segment->commandRefs removeAllObjects];
+        memset(segment->recentArgRefs, 0, sizeof segment->recentArgRefs);
+        memset(segment->recentCmdRefs, 0, sizeof segment->recentCmdRefs);
     }
     if (segment->vk || segment->linearInit || segment->dispCopyVk) {
         if (rdna4_cmd_pool_active() && _nq) {
@@ -1643,19 +1647,27 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (void)rdna4Retain:(id)o { if (o) [_refs addObject:o]; }
 - (void)rdna4RetainArgument:(id)object {
     if (!object) return;
-    if (!_curSegment || _curSegment->ended) {
+    RDNA4CommandSegment *seg = _curSegment;
+    if (!seg || seg->ended) {
         [self rdna4Fail:@"argument snapshot has no open command segment"];
         return;
     }
-    [_curSegment->argumentRefs addObject:object];
+    const void *ptr = (__bridge const void *)object;
+    for (uint32_t i = 0; i < 8u; i++) if (seg->recentArgRefs[i] == ptr) return;
+    [seg->argumentRefs addObject:object];
+    seg->recentArgRefs[seg->recentArgPos++ & 7u] = ptr;
 }
 - (void)rdna4RetainEncoded:(id)object {
     if (!object) return;
-    if (!_curSegment || _curSegment->ended) {
+    RDNA4CommandSegment *seg = _curSegment;
+    if (!seg || seg->ended) {
         [self rdna4Fail:@"encoded resource snapshot has no open command segment"];
         return;
     }
-    [_curSegment->commandRefs addObject:object];
+    const void *ptr = (__bridge const void *)object;
+    for (uint32_t i = 0; i < 8u; i++) if (seg->recentCmdRefs[i] == ptr) return;
+    [seg->commandRefs addObject:object];
+    seg->recentCmdRefs[seg->recentCmdPos++ & 7u] = ptr;
 }
 - (uint64_t)rdna4SegmentSerial { return _segmentSerial; }
 - (uint64_t)rdna4CBId { return _cbid; }
@@ -2053,6 +2065,8 @@ GARNET_INTERNAL void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4T
         if (!segment->retirementUnknown) {
             [segment->argumentRefs removeAllObjects];
             [segment->commandRefs removeAllObjects];
+            memset(segment->recentArgRefs, 0, sizeof segment->recentArgRefs);
+            memset(segment->recentCmdRefs, 0, sizeof segment->recentCmdRefs);
         }
     }
 }
@@ -2692,6 +2706,8 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         [segment->argumentPools removeAllObjects];
         [segment->argumentRefs removeAllObjects];
         [segment->commandRefs removeAllObjects];
+        memset(segment->recentArgRefs, 0, sizeof segment->recentArgRefs);
+        memset(segment->recentCmdRefs, 0, sizeof segment->recentCmdRefs);
         [self rdna4ReleaseSegmentDescriptorPools:segment];
     }
 }
@@ -2780,16 +2796,60 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
 }
 // Writes the descriptors of one stage's set from the encoder's bound state (see the binding-model comment).
 - (BOOL)rdna4FillSet:(VkDescriptorSet)set bindings:(const RDNA4PB *)pb count:(uint32_t)n state:(const RDNA4StageState *)st stage:(const char *)nm {
-    enum { MAXW = 256, MAXI = 1024 };
+    enum { MAXW = 256, MAXI = 1024, FASTW = 16, FASTI = 24 };
     if (n > MAXW) { [self rdna4Fail:[NSString stringWithFormat:@"%s stage has %u descriptors (> %d)", nm, n, MAXW]]; return NO; }
-    VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXI]; VkDescriptorImageInfo ii[MAXI];
-    VkBufferView texelViews[MAXI]; uint32_t nbi = 0, nii = 0, ntv = 0; id dev = [self device];
-    VkWriteDescriptorSetAccelerationStructureKHR asw[MAXW]; VkAccelerationStructureKHR ash[MAXI]; uint32_t nash = 0;
-    const rdna4rtr_stage_t rtStage = (nm && strstr(nm, "fragment") != NULL) ? RDNA4RTR_STAGE_FRAGMENT
-        : (nm && strcmp(nm, "vertex") == 0) ? RDNA4RTR_STAGE_VERTEX : RDNA4RTR_STAGE_COMPUTE;
+    uint32_t needBI = 0, needII = 0, needTV = 0, needAS = 0;
     for (uint32_t i = 0; i < n; i++) {
         const RDNA4PB *p = &pb[i];
-        if (p->count > MAXI - nbi || p->count > MAXI - nii || p->count > MAXI - ntv) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
+        uint32_t c = p->count;
+        if (p->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || p->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            uint32_t add = (p->samplerCoordinateFlags || p->argumentTable || p->addressTable) ? 1u : c;
+            if (add > MAXI - needBI) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
+            needBI += add;
+        } else if (p->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || p->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+            if (c > MAXI - needTV) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
+            needTV += c;
+        } else if (p->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || p->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                   p->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || p->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+            if (c > MAXI - needII) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
+            needII += c;
+        } else if (p->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            if (c > MAXI - needAS) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
+            needAS += c;
+        }
+    }
+    // Keep the hot path under one 4 KiB stack page to avoid x86_64 ___chkstk_darwin + 88 KiB frame setup per draw.
+    VkWriteDescriptorSet wSmall[FASTW];
+    VkDescriptorBufferInfo biSmall[FASTI];
+    VkDescriptorImageInfo iiSmall[FASTI];
+    __attribute__((cleanup(rdna4_free_ptr))) void *heapStorage = NULL;
+    VkWriteDescriptorSet *w = wSmall;
+    VkDescriptorBufferInfo *bi = biSmall;
+    VkDescriptorImageInfo *ii = iiSmall;
+    VkBufferView *texelViews = NULL;
+    VkWriteDescriptorSetAccelerationStructureKHR *asw = NULL;
+    VkAccelerationStructureKHR *ash = NULL;
+    if (n > FASTW || needBI > FASTI || needII > FASTI || needTV > 0 || needAS > 0) {
+        size_t sw = ((size_t)n * sizeof *w + 15u) & ~(size_t)15u;
+        size_t sbi = ((size_t)needBI * sizeof *bi + 15u) & ~(size_t)15u;
+        size_t sii = ((size_t)needII * sizeof *ii + 15u) & ~(size_t)15u;
+        size_t stv = ((size_t)needTV * sizeof *texelViews + 15u) & ~(size_t)15u;
+        size_t sasw = ((size_t)(needAS ? n : 0u) * sizeof *asw + 15u) & ~(size_t)15u;
+        size_t sash = ((size_t)needAS * sizeof *ash + 15u) & ~(size_t)15u;
+        size_t total = sw + sbi + sii + stv + sasw + sash;
+        uint8_t *buf = total ? (uint8_t *)malloc(total) : NULL;
+        if (total && !buf) { [self rdna4Fail:@"cannot allocate descriptor write scratch"]; return NO; }
+        heapStorage = buf;
+        w = (VkWriteDescriptorSet *)buf; buf += sw;
+        bi = (VkDescriptorBufferInfo *)buf; buf += sbi;
+        ii = (VkDescriptorImageInfo *)buf; buf += sii;
+        texelViews = (VkBufferView *)buf; buf += stv;
+        asw = (VkWriteDescriptorSetAccelerationStructureKHR *)buf; buf += sasw;
+        ash = (VkAccelerationStructureKHR *)buf;
+    }
+    uint32_t nbi = 0, nii = 0, ntv = 0, nash = 0; id dev = [self device];
+    for (uint32_t i = 0; i < n; i++) {
+        const RDNA4PB *p = &pb[i];
         w[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = p->binding, .descriptorCount = p->count, .descriptorType = p->type };
         switch (p->type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
@@ -3043,11 +3103,13 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 ii[nii++] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, [t rdna4AttViewLevel:0], VK_IMAGE_LAYOUT_GENERAL };
             }
             break;
-        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+            const rdna4rtr_stage_t rtStage = (nm && strstr(nm, "fragment") != NULL) ? RDNA4RTR_STAGE_FRAGMENT
+                : (nm && strcmp(nm, "vertex") == 0) ? RDNA4RTR_STAGE_VERTEX : RDNA4RTR_STAGE_COMPUTE;
             if (!rdna4_rt_fill_accel_descriptor(self, dev, nm, rtStage, p->binding, p->count,
-                                                &st->rt, st->rtAsRefl, &w[i], &asw[i], ash, &nash, MAXI))
+                                                &st->rt, st->rtAsRefl, &w[i], &asw[i], ash, &nash, needAS))
                 return NO;
-            break;
+            break; }
         default: [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: descriptor type %d not supported (texel buffer)", nm, p->binding, p->type]]; return NO;
         }
     }
@@ -3805,7 +3867,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     uint64_t serial = [_cb rdna4SegmentSerial];
     if (!rdna4_encoder_take_segment_change(&_resourceSegmentSerial, serial))
         return;
-    if (_dcOn) rdna4dc_enc_reset_bound(&_dc);
+    if (_dcOn) rdna4dc_enc_reset_segment(&_dc);
 }
 - (void)rdna4SnapshotResources {
     [_resourceBindings snapshotToCommandBuffer:_cb];
@@ -4237,7 +4299,7 @@ RDNA4_ENCODER_SHARED
 - (void)rdna4SetBuffer:(id)buf offset:(NSUInteger)off index:(NSUInteger)i frag:(BOOL)f {
     if (i >= 31) { [_cb rdna4Fail:[NSString stringWithFormat:@"buffer index %lu >= 31", (unsigned long)i]]; return; }
     if (buf && ![buf isKindOfClass:[RDNA4Buffer class]]) { [_cb rdna4Fail:@"setBuffer: not an RDNA4Buffer"]; return; }
-    RDNA4StageState *s = [self rdna4Stage:f]; s->buf[i].b = buf; s->buf[i].off = off;
+    RDNA4StageState *s = [self rdna4Stage:f]; rdna4_stage_set_buf(s, i, buf, off);
     s->rt.as[i] = nil;
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
     [self rdna4OwnResource:buf kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
@@ -4338,7 +4400,7 @@ RDNA4_ENCODER_SHARED
     if ([_cb rdna4Error]) return;
     RDNA4StageState *s = [self rdna4Stage:f];
     if (!rdna4_rt_encoder_bind_accel(_cb, [_cb device], f ? "fragment" : "vertex", &s->rt, accel, i)) return;
-    s->buf[i] = (RDNA4BufSlot){ nil, 0 };
+    rdna4_stage_set_buf(s, i, nil, 0);
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:f index:i];
     [self rdna4OwnResource:accel kind:RDNA4_RESOURCE_ACCEL fragment:f index:i];
 }
@@ -4485,9 +4547,18 @@ RDNA4_ENCODER_SHARED
     }
     uint64_t set;
     if (rdna4dc_stage_match(&_dc.st[idx], &sig, &set)) { _dc.setsReused++; return YES; }   // same slots, same layout: the set bound at this index is already right
+    if (rdna4dc_enc_lru_find(&_dc, idx, &sig, &set)) {
+        VkDescriptorSet s = (VkDescriptorSet)(uintptr_t)set;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], (uint32_t)idx, 1, &s, 0, NULL);
+        rdna4dc_stage_store(&_dc.st[idx], &sig, set);
+        _dc.setsReused++;
+        return YES;
+    }
     VkDescriptorSet s = [_cb rdna4AllocSet:dsl]; if (!s || ![_cb rdna4FillSet:s bindings:pb count:n state:st stage:nm]) { rdna4dc_stage_reset(&_dc.st[idx]); return NO; }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], (uint32_t)idx, 1, &s, 0, NULL);
-    rdna4dc_stage_store(&_dc.st[idx], &sig, (uint64_t)(uintptr_t)s); _dc.setsAllocated++;
+    rdna4dc_stage_store(&_dc.st[idx], &sig, (uint64_t)(uintptr_t)s);
+    rdna4dc_enc_lru_put(&_dc, idx, &sig, (uint64_t)(uintptr_t)s);
+    _dc.setsAllocated++;
     return YES;
 }
 // ---- draws ----
@@ -4524,10 +4595,10 @@ RDNA4_ENCODER_SHARED
     }
     MTLRenderPipelineReflection *reflection = nil;
     const BOOL hasFrag = [_pso rdna4HasFragment];
-    if (rdna4nc_any_readonly_buffer()) {
+    if ((_sv.roBufMask || (hasFrag && _sf.roBufMask)) && rdna4nc_any_readonly_buffer()) {
         reflection = [_pso reflection] ?: _roReflection;
-        BOOL roV = rdna4nc_stage_writes(&_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX), RDNA4NC_VERTEX, "vertex draw", &_roWarnV);
-        BOOL roF = hasFrag ? rdna4nc_stage_writes(&_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT), RDNA4NC_FRAGMENT, "fragment draw", &_roWarnF) : NO;
+        BOOL roV = _sv.roBufMask ? rdna4nc_stage_writes(&_sv, rdna4nc_stage_arguments(reflection, RDNA4NC_VERTEX), RDNA4NC_VERTEX, "vertex draw", &_roWarnV) : NO;
+        BOOL roF = (hasFrag && _sf.roBufMask) ? rdna4nc_stage_writes(&_sf, rdna4nc_stage_arguments(reflection, RDNA4NC_FRAGMENT), RDNA4NC_FRAGMENT, "fragment draw", &_roWarnF) : NO;
         if (roV || roF) { [_cb rdna4Fail:@"render draw writes a read-only no-copy buffer"]; return NO; }
     }
     [self rdna4SyncResourceSegment];
@@ -4561,20 +4632,15 @@ RDNA4_ENCODER_SHARED
     for (uint32_t i = 0; i < nn; i++) if (need[i] != 31 && !_sv.buf[need[i]].b) {
         [_cb rdna4Fail:[NSString stringWithFormat:@"vertex buffer at index %u is read by the vertex descriptor but never bound", need[i]]]; return NO; }
     id dev = [_cb device];
-    void (^needTex)(RDNA4Texture *, VkImageLayout, BOOL) = ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
-        if ([t rdna4IsIOS]) (void)rdna4_ios_touch(self->_cb, t, YES, writable, ^{   // 11h.6 / build 16 (P1): upload / flush outside the render pass (splits it if one is open)
-            if (self->_inPass) { [self rdna4EndPass]; RDNA4LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); } });
-        [self->_cb rdna4CBRead:t];   // Stage 0b: sampled (or storage-accessed) by a render draw
-        if ([t rdna4DispImgOnly]) (void)[self->_cb rdna4IOFirstTouch:t];   // P6: retained for the command buffer, nothing to upload
-        if (([t rdna4IsIOS] || [t rdna4DispImgOnly]) && writable) { [self->_cb rdna4IOWritten:t]; [self->_cb rdna4DispNote:t bits:RDNA4DF_W_COMPUTE pso:nil]; }   // a storage-image write from a render pass
-        [self rdna4Need:t layout:l];
-    };
-    if (_dcOn) {   // P5b item 5: the same visit as rdna4_each_tex, as a plain loop (no heap-copied block)
+    if (_dcOn) {   // P5b item 5: the same visit as rdna4_each_tex, as a plain loop (no block capture on the hot path)
         [self rdna4EachTex:[_pso pbV] n:[_pso npbV] state:&_sv dev:dev];
         if (hasFrag) [self rdna4EachTex:[_pso pbF] n:[_pso npbF] state:&_sf dev:dev];
     } else {
-    rdna4_each_tex([_pso pbV], [_pso npbV], &_sv, dev, needTex);
-    if (hasFrag) rdna4_each_tex([_pso pbF], [_pso npbF], &_sf, dev, needTex);
+        void (^needTex)(RDNA4Texture *, VkImageLayout, BOOL) = ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
+            [self rdna4NeedTex:t layout:l writable:writable];
+        };
+        rdna4_each_tex([_pso pbV], [_pso npbV], &_sv, dev, needTex);
+        if (hasFrag) rdna4_each_tex([_pso pbF], [_pso npbF], &_sf, dev, needTex);
     }
     const RDNA4ArgumentTables *argTables = [_pso argumentTables];
     const BOOL needArgPrep =
@@ -4612,7 +4678,9 @@ RDNA4_ENCODER_SHARED
         }
         BOOL argumentsReady = [_cb rdna4PrepareArguments:argTables
             resources:argumentResources writable:argumentWritable scan:&scan
-            textures:needTex];
+            textures:^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
+                [self rdna4NeedTex:t layout:l writable:writable];
+            }];
         rdna4_argument_scan_prepared_destroy(&scan);
         if (!argumentsReady) return NO;
     }
@@ -4643,7 +4711,7 @@ RDNA4_ENCODER_SHARED
             const RDNA4PB *pbf = [_pso pbF]; uint32_t npf = [_pso npbF];
             for (uint32_t i = 0; i < npf && !src; i++) if (pbf[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && pbf[i].binding >= 32 && pbf[i].binding < 160)
                 for (uint32_t k = 0; k < pbf[i].count && !src; k++) { uint32_t ix = pbf[i].binding - 32 + k; RDNA4Texture *tt = ix < 128 ? _sf.tex[ix] : nil; if (tt && [tt rdna4IsIOS]) src = tt; }
-            uint32_t bits = fallback ? RDNA4DF_W_SHADER_FALLBACK : rdna4df_draw_bits([_pso rdna4FName]);
+            uint32_t bits = fallback ? RDNA4DF_W_SHADER_FALLBACK : [_pso rdna4DrawBits];
             rdna4df_rect_t rc = rdna4df_draw_rect(_vp.originX, _vp.originY, _vp.width, _vp.height, (int64_t)_sr.x, (int64_t)_sr.y, (int64_t)_sr.width, (int64_t)_sr.height, _w, _h);
             for (uint32_t i = 0; i < _na; i++) if ([_tex[i] rdna4IsDisp]) {
                 BOOL clr = (_clrm >> i) & 1u; if (clr && (bits & (RDNA4DF_W_DRAW_FINAL | RDNA4DF_W_DRAW_COMP))) _clrm &= ~(1u << i); else clr = NO;
@@ -4736,6 +4804,7 @@ RDNA4_ENCODER_SHARED
         if ([_pso npbF] && ![self rdna4DcStage:1 pb:[_pso pbF] n:[_pso npbF] state:&_sf dsl:[_pso dsl:1] name:"fragment" cmd:cmd]) return NO;
         return YES;
     }
+    if (_dcOn) rdna4dc_enc_layout(&_dc, 0);
     if ([_pso npbV]) {
         VkDescriptorSet s = [_cb rdna4AllocSet:[_pso dsl:0]]; if (!s || ![_cb rdna4FillSet:s bindings:[_pso pbV] count:[_pso npbV] state:&_sv stage:"vertex"]) return NO;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, [_pso layout], 0, 1, &s, 0, NULL);
@@ -5113,7 +5182,7 @@ RDNA4_DNR(RDNA4ComputeEncoder)
 }
 - (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
     if (i >= 31 || (b && ![b isKindOfClass:[RDNA4Buffer class]])) { [_cb rdna4Fail:@"compute setBuffer: bad index or class"]; return; }
-    _st.buf[i].b = b; _st.buf[i].off = o;
+    rdna4_stage_set_buf(&_st, i, b, o);
     _st.rt.as[i] = nil;
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
     [self rdna4OwnResource:b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
@@ -5153,7 +5222,7 @@ RDNA4_DNR(RDNA4ComputeEncoder)
 - (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accel atBufferIndex:(NSUInteger)i {
     if ([_cb rdna4Error]) return;
     if (!rdna4_rt_encoder_bind_accel(_cb, [_cb device], "compute", &_st.rt, accel, i)) return;
-    _st.buf[i] = (RDNA4BufSlot){ nil, 0 };
+    rdna4_stage_set_buf(&_st, i, nil, 0);
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
     [self rdna4OwnResource:accel kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
 }
@@ -5295,11 +5364,14 @@ RDNA4_ENCODER_SHARED
                         fragment:NO index:0];
           RDNA4LOGR("HOT-SWAP: compute encoder now uses the real pipeline %p", (__bridge void *)r);
       } }
-    MTLComputePipelineReflection *reflection = [_pso reflection] ?: _roReflection;
+    MTLComputePipelineReflection *reflection = nil;
     [self rdna4SnapshotResources];
-    if (rdna4nc_stage_writes(&_st, rdna4nc_stage_arguments(reflection, RDNA4NC_COMPUTE), RDNA4NC_COMPUTE, "compute dispatch", &_roWarn)) {
-        [_cb rdna4Fail:@"compute dispatch writes a read-only no-copy buffer"];
-        return;
+    if (_st.roBufMask && rdna4nc_any_readonly_buffer()) {
+        reflection = [_pso reflection] ?: _roReflection;
+        if (rdna4nc_stage_writes(&_st, rdna4nc_stage_arguments(reflection, RDNA4NC_COMPUTE), RDNA4NC_COMPUTE, "compute dispatch", &_roWarn)) {
+            [_cb rdna4Fail:@"compute dispatch writes a read-only no-copy buffer"];
+            return;
+        }
     }
     if ([_pso noop]) { RDNA4LOGR("COMPUTE FALLBACK: dispatch %lux%lux%lu (tpt %lux%lux%lu) skipped, placeholder pipeline encodes nothing", (unsigned long)grid.width, (unsigned long)grid.height, (unsigned long)grid.depth, (unsigned long)tpt.width, (unsigned long)tpt.height, (unsigned long)tpt.depth); return; }
     const NSUInteger threadgroupBytes = [_pso rdna4LumaWorkgroup] ? _threadgroupBytes : 0;
@@ -5340,6 +5412,7 @@ RDNA4_ENCODER_SHARED
         rdna4_rt_any_arg_owners();
     NSMutableSet *argumentResources = nil;
     if (needArgPrep) {
+        if (!reflection) reflection = [_pso reflection] ?: _roReflection;
         argumentResources = [_argumentResources mutableCopy] ?: [NSMutableSet set];
         NSMutableSet *argumentWritable = [_argumentWritable mutableCopy] ?: [NSMutableSet set];
         rdna4_argument_stage_resources(argumentResources, argumentWritable, [_pso pb], [_pso npb], &_st, rdna4nc_stage_arguments(reflection, RDNA4NC_COMPUTE));

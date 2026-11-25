@@ -113,7 +113,7 @@ static VkResult rdna4_mem_alloc(uint32_t mt, VkMemoryRequirements mr, BOOL map, 
             return VK_SUCCESS;
         }
         if (k == RDNA4P_R_REC) {
-            *m = (RDNA4Mem){ 2, (VkDeviceMemory)r.mem, (uint8_t *)r.map, 0, 0, mr.size, key };
+            *m = (RDNA4Mem){ 2, (VkDeviceMemory)r.mem, (uint8_t *)r.map, 0, 0, r.size, key };
             if (zero && m->map) memset(m->map, 0, mr.size);
             return VK_SUCCESS;
         }
@@ -145,9 +145,9 @@ static VkResult rdna4_mem_alloc(uint32_t mt, VkMemoryRequirements mr, BOOL map, 
             newSlab = YES; continue;
         }
         if (k == RDNA4P_R_NEED_WHOLE) {
-            VkDeviceMemory wm; uint8_t *wmap; VkResult vr = rdna4_pool_vkalloc(mt, mr.size, map, &wm, &wmap);
+            VkDeviceMemory wm; uint8_t *wmap; VkResult vr = rdna4_pool_vkalloc(mt, sz, map, &wm, &wmap);
             if (vr != VK_SUCCESS) return vr;
-            *m = (RDNA4Mem){ 2, wm, wmap, 0, 0, mr.size, key };   // fresh from the kernel: already zero
+            *m = (RDNA4Mem){ 2, wm, wmap, 0, 0, sz, key };   // fresh from the kernel: already zero; size matches rdna4p_alloc's granularity-rounded sz
             return VK_SUCCESS;
         }
         break;   // DIRECT

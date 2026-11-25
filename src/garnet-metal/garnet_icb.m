@@ -2825,8 +2825,7 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         if (index >= 31 || !bind.buffer || [bind.buffer device] != device ||
             bind.offset > bind.buffer.length)
             return NO;
-        vertex.buf[index].b = bind.buffer;
-        vertex.buf[index].off = bind.offset;
+        rdna4_stage_set_buf(&vertex, index, bind.buffer, bind.offset);
     }
     for (NSNumber *slot in record.fragmentBinds) {
         NSUInteger index = slot.unsignedIntegerValue;
@@ -2834,8 +2833,7 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         if (index >= 31 || !bind.buffer || [bind.buffer device] != device ||
             bind.offset > bind.buffer.length)
             return NO;
-        fragment.buf[index].b = bind.buffer;
-        fragment.buf[index].off = bind.offset;
+        rdna4_stage_set_buf(&fragment, index, bind.buffer, bind.offset);
     }
 #ifdef VK_VERSION_1_0
     if ([use rdna4IsTessellation]) {
@@ -2867,6 +2865,8 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
         _sf.buf[i].b = nil;
         _sf.buf[i].off = 0;
     }
+    _sv.roBufMask = 0;
+    _sf.roBufMask = 0;
 }
 - (void)rdna4ICBRetainResource:(id)resource {
 #ifdef VK_VERSION_1_0
@@ -3415,8 +3415,7 @@ static void rdna4_icb_add_local(const rdna4dc_caps *caps, uint32_t (*locals)[3],
         if (index >= 31 || !bind.buffer || [bind.buffer device] != device ||
             bind.offset > bind.buffer.length)
             return NO;
-        kernel.buf[index].b = bind.buffer;
-        kernel.buf[index].off = bind.offset;
+        rdna4_stage_set_buf(&kernel, index, bind.buffer, bind.offset);
     }
     return rdna4icb_stage_buffers_ok([use pb], [use npb], &kernel, device);
 }
@@ -3426,6 +3425,7 @@ static void rdna4_icb_add_local(const rdna4dc_caps *caps, uint32_t (*locals)[3],
         _st.buf[i].off = 0;
         [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
     }
+    _st.roBufMask = 0;
 }
 - (void)rdna4ICBResetPerSlotComputeState {
     _threadgroupBytes = 0;

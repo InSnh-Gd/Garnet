@@ -4446,8 +4446,7 @@ static BOOL rdna4_mesh_update_emul_descriptors(VkDescriptorSet ds, uint32_t emul
     }
     RDNA4MeshEncoderState *ms = [self rdna4MeshState];
     RDNA4StageState *s = isMesh ? &ms->meshState : &ms->objState;
-    s->buf[i].b = buf;
-    s->buf[i].off = off;
+    rdna4_stage_set_buf(s, i, buf, off);
     [self rdna4OwnResource:buf kind:(isMesh ? RDNA4_RESOURCE_MESH_BUFFER : RDNA4_RESOURCE_OBJECT_BUFFER)
                   fragment:NO index:i];
 }
