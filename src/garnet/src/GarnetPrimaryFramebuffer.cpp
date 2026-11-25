@@ -7,10 +7,12 @@
 #include "GarnetDriverInternal.hpp"
 #include "amd/amdgpu_asic.h"
 #include "amd/amdgpu_smu.h"
+#include "amd/garnet_power_policy_pure.h"
 #include "amd/native_disp.h"
 #include "amd/rdna4_log.h"
 #include "amd/smu_dal_pure.h"
 #include "dcn/dcn.hpp"
+#include "dcn/dcn41_det_pure.h"
 #include "dcn/dcn41_dpms_pure.h"
 #include "dcn/dcn41_modeset.h"
 #include "dcn/dispread_flow.h"
@@ -794,9 +796,32 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareMode(const rdna4edidmodes::Detail
 	hw.delayUs = aux_delay_us;
 	hw.auxIo = rdna4aux::Io { &ctx->mmio, aux_mmio_read, aux_mmio_write, aux_now_us, aux_delay_us };
 
+	// Temporarily pin UCLK across modeset transitions so DP/OTG resync never races a GDDR6 P-state switch.
+	amdgpu::DeviceContext *smuDev = driver->deviceContext();
+	if (fUclkUnpinned && smuDev && smuDev->smuOnline) {
+		(void)amdgpu::smu_pin_uclk_top(*smuDev);
+		fUclkUnpinned = false;
+	}
+
 	const rdna4modeset::ApplyResult r = rdna4modeset::applyMode(
 	    hw, fActiveOutput, fDpcdCaps, target, fMaxDispClkKhz, fMaxDppClkKhz,
 	    /*allowRetrain=*/true, /*allowDsc=*/true, forceRetrain);
+
+	if (r.status == rdna4modeset::kOk && fDet0Expanded && !fUclkForcePin && smuDev && smuDev->smuOnline) {
+		if (amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
+			const rdna4det::Hw detHw { &ctx->mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
+			uint32_t optcReg = 0u;
+			if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
+				uint32_t topMhz = 0u;
+				(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
+				fUclkUnpinned = false;
+				RDNA4LOG("primaryfb: post-modeset UCLK unpin saw OPTC0 underflow (0x%08x); auto-repinned UCLK to %u MHz",
+				         optcReg, topMhz);
+			} else {
+				fUclkUnpinned = true;
+			}
+		}
+	}
 
 	if (r.status == rdna4modeset::kOk) {
 		(void)rdna4aux::readDpcdCaps(hw.auxIo, fActiveOutput.aux, fActiveOutput.hpd, &fDpcdCaps);
@@ -992,6 +1017,45 @@ bool AMDGarnetPrimaryFramebuffer::applyDpms(bool wantOn, GarnetDriver *knownDriv
 	return woke;
 }
 
+__attribute__((noinline))
+void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclk(GarnetDriver *driver) {
+	if (!driver || !fPci || fStopping) return;
+	MmioAccess mmio {};
+	if (!acquire_mmio(fPci, driver, &mmio)) return;
+	const rdna4det::Hw detHw { &mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
+
+	if (fDet0Allowed && !fDet0Expanded && !rdna4dcn::disp2LatchedOn()) {
+		const rdna4det::ExpandResult er = rdna4det::expand_single_pipe_det0(detHw);
+		if (er.status == rdna4det::kOk || er.status == rdna4det::kAlreadyExpanded) {
+			fDet0Expanded = true;
+			RDNA4LOG("primaryfb: DCN41 DET0 CRB %s: %u -> %u segs (%u KiB, compbuf=%u segs)",
+			         er.status == rdna4det::kOk ? "expanded" : "already expanded",
+			         er.det0Before, er.det0After, er.det0After * 64u, er.compbufCur);
+		} else {
+			RDNA4LOG("primaryfb: DCN41 DET0 expansion skipped/deferred (status=%u, det0=%u, compbuf=%u)",
+			         static_cast<unsigned>(er.status), er.det0Before, er.compbufCur);
+		}
+	}
+
+	amdgpu::DeviceContext *smuDev = driver->deviceContext();
+	if (fDet0Expanded && !fUclkForcePin && !fUclkUnpinned && smuDev && smuDev->smuOnline) {
+		if (amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
+			uint32_t optcReg = 0u;
+			if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
+				uint32_t topMhz = 0u;
+				(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
+				fUclkUnpinned = false;
+				RDNA4LOG("primaryfb: UCLK unpin underflowed OPTC0 (0x%08x); auto-repinned UCLK to %u MHz",
+				         optcReg, topMhz);
+			} else {
+				fUclkUnpinned = true;
+				RDNA4LOG("primaryfb: UCLK unpinned cleanly with 576 KiB DET0 (0 OPTC0 underflows over 250 ms)");
+			}
+		}
+	}
+	release_mmio(mmio);
+}
+
 void AMDGarnetPrimaryFramebuffer::readProviderEdid(IOService *provider) {
 	fEdidLen = 0u;
 	bzero(fEdid, sizeof(fEdid));
@@ -1085,6 +1149,18 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 			RDNA4LOG("primaryfb: hardware DPMS disabled by boot-arg garnet-dpms=0");
 		}
 	}
+	fDet0Expanded = false;
+	fUclkUnpinned = false;
+	{
+		uint32_t detArg = 1u;
+		const bool detPresent = PE_parse_boot_argn("garnet-det0", &detArg, sizeof(detArg));
+		fDet0Allowed = rdna4pwr::det0_expand_enabled(detPresent, detArg);
+		if (!fDet0Allowed) RDNA4LOG("primaryfb: DCN41 DET0 expansion disabled by garnet-det0=0");
+		uint32_t pinArg = 0u;
+		const bool pinPresent = PE_parse_boot_argn("garnet-uclk-pin", &pinArg, sizeof(pinArg));
+		fUclkForcePin = rdna4pwr::uclk_force_pin(pinPresent, pinArg);
+		if (fUclkForcePin) RDNA4LOG("primaryfb: UCLK pinning forced by garnet-uclk-pin=1");
+	}
 	fPmRegistered = false;
 	fPeerRegistered = false;
 	fPeerGeneration = 0u;
@@ -1167,6 +1243,7 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 	if (!fCursorHwAvailable) {
 		initCursorSlot(driver);
 	}
+	optimizeDet0AndUclk(driver);
 	if (fVblLock) {
 		IOLockLock(fVblLock);
 		const bool wantVbl = fVblEnabled && !fStopping;

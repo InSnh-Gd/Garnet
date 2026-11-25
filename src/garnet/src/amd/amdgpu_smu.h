@@ -280,6 +280,12 @@ namespace SMUPowerState {
 // *** DANGER *** moves real GFX clocks. See smu_smc_hw_setup's note.
 kern_return_t smu_set_power_state(const DeviceContext &dev, uint32_t state);
 
+// Stage 3C: UCLK hard-min control (0 = unpin hard+soft min; >0 = pin floor)
+// and opt-in SMU GFXOFF (PPSMC::AllowGfxOff / DisallowGfxOff).
+kern_return_t smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz);
+kern_return_t smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz = nullptr);
+kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
+
 //=====================================================================
 //  Telemetry — the SMU metrics table
 //=====================================================================

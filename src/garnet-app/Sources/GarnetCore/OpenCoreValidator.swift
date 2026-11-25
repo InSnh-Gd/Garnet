@@ -574,6 +574,11 @@ public enum OpenCoreValidator {
           - `garnet-rebar-compat=0` Disables GarnetPCIBarCompat.kext Full-BAR hook without removing it from EFI/OC/Kexts/.
           - `garnet-apps-all=0`     Disables global desktop app Metal access while preserving core compositor & allowlisted tools.
           - `garnet-irq-wait=0`     Reverts kernel fence waits to legacy polling without disabling MSI interrupts.
+          - `garnet-vbl-irq=0`      Reverts primary framebuffer VBLANK delivery to software timer without disabling MSI.
+          - `garnet-dpms=0`         Disables hardware DisplayPort DPMS sleep/wake stream blanking and PHY power-down.
+          - `garnet-gfx-cg=0`       Disables GFX12 CGCG/CGLS/MGCG/FGCG clock gating (leaves hardware reset defaults).
+          - `garnet-det0=0`         Disables single-pipe DCN41 DET0 CRB expansion (keeps UEFI 192 KiB DET0).
+          - `garnet-uclk-pin=1`     Forces GDDR6 UCLK pinned at top DPM clock (disables DET0-guarded UCLK unpinning).
         """
     }
 }

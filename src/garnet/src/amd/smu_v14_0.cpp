@@ -140,6 +140,8 @@ static const char *smu_msg_name(uint32_t msgId)
     case PPSMC::SetSoftMaxByFreq:           return "SetSoftMaxByFreq";
     case PPSMC::SetHardMinByFreq:           return "SetHardMinByFreq";
     case PPSMC::GetDpmFreqByIndex:          return "GetDpmFreqByIndex";
+    case PPSMC::AllowGfxOff:                return "AllowGfxOff";
+    case PPSMC::DisallowGfxOff:             return "DisallowGfxOff";
     case PPSMC::NotifyPowerSource:          return "NotifyPowerSource";
     case PPSMC::RunDcBtc:                   return "RunDcBtc";
     default:                                return "?";
@@ -852,6 +854,60 @@ smu_set_power_state(const DeviceContext &dev, uint32_t state)
     SMU_LOG("set_power_state: state=%u min=%u max=%u kr=0x%x",
             state, min_mhz, max_mhz, (unsigned)firstErr);
     return firstErr;
+}
+
+kern_return_t
+smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz)
+{
+    if (!dev.smuOnline) return kIOReturnNotReady;
+    const uint32_t param = (PPCLK::UCLK << 16) | (mhz & 0xFFFFu);
+    kern_return_t r = smu_send_msg_with_param(dev, PPSMC::SetHardMinByFreq, param, nullptr);
+    if (mhz == 0u) {
+        kern_return_t sr = smu_send_msg_with_param(dev, PPSMC::SetSoftMinByFreq, param, nullptr);
+        SMU_LOG("uclk_unpin: SetHardMin(0) kr=0x%x, SetSoftMin(0) kr=0x%x",
+                (unsigned)r, (unsigned)sr);
+        return (r == kIOReturnSuccess) ? sr : r;
+    }
+    if (r != kIOReturnSuccess) {
+        kern_return_t sr = smu_send_msg_with_param(dev, PPSMC::SetSoftMinByFreq, param, nullptr);
+        SMU_LOG("uclk_pin(%u MHz): SetHardMin kr=0x%x, SetSoftMin kr=0x%x",
+                mhz, (unsigned)r, (unsigned)sr);
+        return sr;
+    }
+    SMU_LOG("uclk_pin(%u MHz): SetHardMin ok", mhz);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz)
+{
+    if (outTopMhz) *outTopMhz = 0u;
+    if (!dev.smuOnline) return kIOReturnNotReady;
+    uint32_t countRaw = 0u;
+    kern_return_t r = smu_send_msg_with_param(
+        dev, PPSMC::GetDpmFreqByIndex, (PPCLK::UCLK << 16) | 0xFFu, &countRaw);
+    if (r != kIOReturnSuccess) return r;
+    const bool fine = (countRaw & 0x80000000u) != 0u;
+    const uint32_t cnt = countRaw & 0x7FFFFFFFu;
+    if (!fine && (cnt == 0u || cnt > 32u)) return kIOReturnError;
+    const uint32_t maxIdx = fine ? 1u : (cnt - 1u);
+    uint32_t freqRaw = 0u;
+    r = smu_send_msg_with_param(
+        dev, PPSMC::GetDpmFreqByIndex, (PPCLK::UCLK << 16) | maxIdx, &freqRaw);
+    const uint32_t maxMhz = freqRaw & 0x7FFFFFFFu;
+    if (r != kIOReturnSuccess || maxMhz < 100u || maxMhz > 5000u) return kIOReturnError;
+    if (outTopMhz) *outTopMhz = maxMhz;
+    return smu_set_uclk_hard_min(dev, maxMhz);
+}
+
+kern_return_t
+smu_set_gfx_off(const DeviceContext &dev, bool allow)
+{
+    if (!dev.smuOnline) return kIOReturnNotReady;
+    const uint32_t msg = allow ? PPSMC::AllowGfxOff : PPSMC::DisallowGfxOff;
+    kern_return_t r = smu_send_msg(dev, msg);
+    SMU_LOG("gfxoff(%s): kr=0x%x", allow ? "allow" : "disallow", (unsigned)r);
+    return r;
 }
 
 

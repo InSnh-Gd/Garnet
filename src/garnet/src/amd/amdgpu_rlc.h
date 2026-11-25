@@ -75,6 +75,15 @@ namespace GCRegs {
     //                     regRLC_CGCG_CGLS_CTRL = 0x4c49.
     constexpr uint32_t GRBM_STATUS              = 0x0DA4;
     constexpr uint32_t RLC_CGCG_CGLS_CTRL       = 0x4C49;
+    // Stage 3C GFX12 clock gating (gc_12_0_0_offset.h, torvalds/linux)
+    constexpr uint32_t RLC_SAFE_MODE            = 0x0980;
+    constexpr uint32_t RLC_CGTT_MGCG_OVERRIDE   = 0x4C48;
+    constexpr uint32_t RLC_CGCG_CGLS_CTRL_3D    = 0x4CC5;
+    constexpr uint32_t CP_RB_WPTR_POLL_CNTL     = 0x0F62;
+    constexpr uint32_t CP_INT_CNTL              = 0x1DE9;
+    constexpr uint32_t CP_INT_CNTL_RING0        = 0x1E0A;
+    constexpr uint32_t SDMA0_RLC_CGCG_CTRL      = 0x0055;
+    constexpr uint32_t SDMA1_RLC_CGCG_CTRL      = 0x0655;
     // CP_ME_CNTL, CP_RB0_* etc. live here too — added as we port them.
 }
 
@@ -90,6 +99,14 @@ namespace GCRegBaseIdx {
     constexpr int RLC_SRM_CNTL             = 1;
     constexpr int GRBM_STATUS              = 0;
     constexpr int RLC_CGCG_CGLS_CTRL       = 1;
+    constexpr int RLC_SAFE_MODE            = 1;
+    constexpr int RLC_CGTT_MGCG_OVERRIDE   = 1;
+    constexpr int RLC_CGCG_CGLS_CTRL_3D    = 1;
+    constexpr int CP_RB_WPTR_POLL_CNTL     = 0;
+    constexpr int CP_INT_CNTL              = 0;
+    constexpr int CP_INT_CNTL_RING0        = 0;
+    constexpr int SDMA0_RLC_CGCG_CTRL      = 0;
+    constexpr int SDMA1_RLC_CGCG_CTRL      = 0;
 }
 
 // Address one GCRegs entry at the SOC15 BASE_IDX the header declares.
@@ -139,6 +156,7 @@ struct RLCContext {
     bool             csb_populated     { false };  // gfx12_cs_data filled in?
     bool             csib_programmed   { false };  // RLC_CSIB_ADDR_* written?
     bool             srm_enabled       { false };  // RLC_SRM_CNTL.SRM_ENABLE set?
+    bool             cg_enabled        { false };  // Stage 3C: GFX12 CGCG/CGLS/MGCG/FGCG active?
     bool             microcode_loaded  { false };  // RLC sub-bins + RLC_G all OK from PSP?
 
     // CSB allocation in VRAM (via GMC's VRAM bump allocator).
@@ -197,5 +215,9 @@ kern_return_t rlc_enable_srm(const DeviceContext &dev, RLCContext &rlc);
 //
 kern_return_t rlc_init_full(const DeviceContext &dev,
                             GMCContext &gmc, RLCContext &rlc);
+
+// Stage 3C: upstream gfx_v12_0_update_gfx_clock_gating() wrapped in RLC safe mode.
+kern_return_t rlc_set_clock_gating(const DeviceContext &dev, RLCContext &rlc,
+                                   bool enable, bool hasSdma1);
 
 } // namespace amdgpu

@@ -3,7 +3,9 @@
 #include "amdgpu_init.h"
 #include "amdgpu_log.h"
 #include "../fw/fw_table.h"
+#include "garnet_power_policy_pure.h"
 #include "nbif_v6_3_1.h"
+#include <pexpert/pexpert.h>
 
 // GarnetDriver.cpp: the SDMA0_DCC_CNTL no-PTE compression clear (one register write + readback + log line; once per
 // boot, `rdna4-sdmadcc=0` skips it). Called right after sdma_init_full, before our own SDMA copy test and sweep.
@@ -785,6 +787,15 @@ void bringup_teardown(BringupContext &ctx) {
     INIT_LOG("teardown: unwinding from stage %u (%s)",
              (unsigned)ctx.reached, stage_name(ctx.reached));
 
+    // (0) Stage 3C: unwind GFXOFF and GFX12 clock gating before halting engines.
+    if (ctx.gfxOffAllowed && ctx.smuOnline) {
+        (void)smu_set_gfx_off(dev, false);
+        ctx.gfxOffAllowed = false;
+    }
+    if (ctx.rlc.cg_enabled && dev.ip.isResolved(IPBlock::GC)) {
+        (void)rlc_set_clock_gating(dev, ctx.rlc, false, ctx.sdma.instance_present[1]);
+    }
+
     // (1) Unmap the kernel GFX queue from the scheduler while both are still
     //     alive (amdgpu_mes_unmap_legacy_queue before the ring goes away).
     if (ctx.kgqMapped && ctx.mes.pipe[0].inited && ctx.mes.pipe[0].enabled) {
@@ -869,6 +880,30 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
         INIT_LOG("stage %u (%s) done", s, stage_name((BringupStage)s));
     }
     INIT_LOG("reached stage %u (%s)", (unsigned)ctx.reached, stage_name(ctx.reached));
+
+    // Stage 3C: enable upstream-verified GFX12 CGCG/CGLS/3D/MGCG/FGCG after all GC/SDMA IP
+    // blocks are initialized (matching Linux amdgpu_device_ip_late_init), unless garnet-gfx-cg=0.
+    if (ctx.dev && ctx.reached >= BringupStage::SDMAInit && ctx.rlc.srm_enabled && !ctx.rlc.cg_enabled) {
+        uint32_t cgArg = 1u;
+        const bool cgPresent = PE_parse_boot_argn("garnet-gfx-cg", &cgArg, sizeof(cgArg));
+        if (rdna4pwr::gfx_cg_enabled(cgPresent, cgArg)) {
+            kern_return_t cgr = rlc_set_clock_gating(*ctx.dev, ctx.rlc, true, ctx.sdma.instance_present[1]);
+            INIT_LOG("Stage 3C: GFX12 clock gating %s (%#x)",
+                     cgr == kIOReturnSuccess ? "ENABLED" : "FAILED", cgr);
+        } else {
+            INIT_LOG("Stage 3C: GFX12 clock gating disabled by boot-arg garnet-gfx-cg=0");
+        }
+    }
+    if (ctx.dev && ctx.smuOnline && ctx.reached >= BringupStage::SDMAInit && !ctx.gfxOffAllowed) {
+        uint32_t goArg = 0u;
+        const bool goPresent = PE_parse_boot_argn("garnet-gfxoff", &goArg, sizeof(goArg));
+        if (rdna4pwr::gfxoff_opt_in(goPresent, goArg)) {
+            kern_return_t gor = smu_set_gfx_off(*ctx.dev, true);
+            ctx.gfxOffAllowed = (gor == kIOReturnSuccess);
+            INIT_LOG("Stage 3C: opt-in SMU GFXOFF %s (%#x)",
+                     ctx.gfxOffAllowed ? "ALLOWED" : "FAILED", gor);
+        }
+    }
 
     // Leave the card idling cool. Enabling all SMU features powers the GFX
     // core, but nothing here gates it again, so with no work queued the board

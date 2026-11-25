@@ -92,6 +92,7 @@ private:
 	void rebuildModeTable(uint32_t w, uint32_t h, uint32_t rb);
 	bool applyHardwareMode(const rdna4edidmodes::DetailedTiming &target, bool forceRetrain = false);
 	bool applyDpms(bool wantOn, GarnetDriver *knownDriver = nullptr);
+	void optimizeDet0AndUclk(GarnetDriver *driver);
 	bool captureConsoleAndBar0(IOPCIDevice *pci);
 	bool ensureVblTimer();
 	void teardownVblTimer();
@@ -128,6 +129,10 @@ private:
 	bool fDpmsAllowed { true };
 	bool fDpmsOff { false };
 	bool fDpmsSavedCursorVisible { false };
+	bool fDet0Allowed { true };
+	bool fUclkForcePin { false };
+	bool fDet0Expanded { false };
+	bool fUclkUnpinned { false };
 	bool fPmRegistered { false };
 	bool fPeerRegistered { false };
 	uint64_t fPeerGeneration { 0u };

@@ -87,6 +87,7 @@
 #include "amdgpu_rlc.h"
 #include "amdgpu_gmc.h"   // GMCContext / VRAMBumpAllocator
 #include "amdgpu_log.h"   // RLC_LOG
+#include "garnet_power_policy_pure.h"
 
 namespace amdgpu {
 
@@ -558,6 +559,91 @@ rlc_init_full(const DeviceContext &dev, GMCContext &gmc, RLCContext &rlc)
             "csib_programmed=%u srm_enabled=%u",
             rlc.bootload_complete ? 1 : 0, rlc.csb_populated ? 1 : 0,
             rlc.csib_programmed ? 1 : 0, rlc.srm_enabled ? 1 : 0);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+rlc_set_clock_gating(const DeviceContext &dev, RLCContext &rlc,
+                     bool enable, bool hasSdma1)
+{
+    if (!dev.ip.isResolved(IPBlock::GC) || !rlc.bootload_complete) {
+        return kIOReturnNotReady;
+    }
+
+    const uint32_t regSafe   = RLC_GC_REG(dev, RLC_SAFE_MODE);
+    const uint32_t regMgcg   = RLC_GC_REG(dev, RLC_CGTT_MGCG_OVERRIDE);
+    const uint32_t regCgcg   = RLC_GC_REG(dev, RLC_CGCG_CGLS_CTRL);
+    const uint32_t regCgcg3d = RLC_GC_REG(dev, RLC_CGCG_CGLS_CTRL_3D);
+    const uint32_t regPoll   = RLC_GC_REG(dev, CP_RB_WPTR_POLL_CNTL);
+    const uint32_t regCpInt  = RLC_GC_REG(dev, CP_INT_CNTL);
+    const uint32_t regCpR0   = RLC_GC_REG(dev, CP_INT_CNTL_RING0);
+    const uint32_t regSdma0  = RLC_GC_REG(dev, SDMA0_RLC_CGCG_CTRL);
+    const uint32_t regSdma1  = RLC_GC_REG(dev, SDMA1_RLC_CGCG_CTRL);
+
+    // 1. Enter RLC safe mode (upstream gfx_v12_0_set_safe_mode).
+    WREG32(dev, regSafe, rdna4pwr::kRlcSafeModeEnterVal);
+    bool safeAck = false;
+    for (uint32_t i = 0u; i < 100000u; ++i) {
+        if ((RREG32(dev, regSafe) & rdna4pwr::kRlcSafeModeCmdMask) == 0u) {
+            safeAck = true;
+            break;
+        }
+        IODelay(1u);
+    }
+    if (!safeAck) {
+        RLC_LOG("clock_gating(%s): RLC_SAFE_MODE enter timeout (reg=%#010x)",
+                enable ? "on" : "off", RREG32(dev, regSafe));
+        WREG32(dev, regSafe, rdna4pwr::kRlcSafeModeExitVal);
+        return kIOReturnTimeout;
+    }
+
+    const uint32_t preMgcg   = RREG32(dev, regMgcg);
+    const uint32_t preCgcg   = RREG32(dev, regCgcg);
+    const uint32_t preCgcg3d = RREG32(dev, regCgcg3d);
+
+    const uint32_t nextMgcg = rdna4pwr::gfx12_cgtt_mgcg_override(preMgcg, enable);
+    if (nextMgcg != preMgcg) WREG32(dev, regMgcg, nextMgcg);
+
+    const uint32_t nextCgcg = rdna4pwr::gfx12_cgcg_cgls_ctrl(preCgcg, enable);
+    if (nextCgcg != preCgcg) WREG32(dev, regCgcg, nextCgcg);
+
+    const uint32_t nextCgcg3d = rdna4pwr::gfx12_cgcg_cgls_ctrl(preCgcg3d, enable);
+    if (nextCgcg3d != preCgcg3d) WREG32(dev, regCgcg3d, nextCgcg3d);
+
+    if (enable) {
+        const uint32_t prePoll = RREG32(dev, regPoll);
+        const uint32_t nextPoll = rdna4pwr::gfx12_cp_rb_wptr_poll_cntl(prePoll);
+        if (nextPoll != prePoll) WREG32(dev, regPoll, nextPoll);
+    }
+
+    const uint32_t preCpInt = RREG32(dev, regCpInt);
+    const uint32_t nextCpInt = rdna4pwr::gfx12_cp_int_cntl_idle(preCpInt, enable);
+    if (nextCpInt != preCpInt) WREG32(dev, regCpInt, nextCpInt);
+
+    const uint32_t preCpR0 = RREG32(dev, regCpR0);
+    const uint32_t nextCpR0 = rdna4pwr::gfx12_cp_int_cntl_idle(preCpR0, enable);
+    if (nextCpR0 != preCpR0) WREG32(dev, regCpR0, nextCpR0);
+
+    const uint32_t preSdma0 = RREG32(dev, regSdma0);
+    const uint32_t nextSdma0 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma0, enable);
+    if (nextSdma0 != preSdma0) WREG32(dev, regSdma0, nextSdma0);
+
+    if (hasSdma1) {
+        const uint32_t preSdma1 = RREG32(dev, regSdma1);
+        const uint32_t nextSdma1 = rdna4pwr::gfx12_sdma_rlc_cgcg_ctrl(preSdma1, enable);
+        if (nextSdma1 != preSdma1) WREG32(dev, regSdma1, nextSdma1);
+    }
+
+    // 2. Exit RLC safe mode (upstream gfx_v12_0_unset_safe_mode).
+    WREG32(dev, regSafe, rdna4pwr::kRlcSafeModeExitVal);
+
+    rlc.cg_enabled = enable;
+    RLC_LOG("clock_gating(%s): MGCG_OVERRIDE %#010x->%#010x CGCG_CTRL %#010x->%#010x CGCG_3D %#010x->%#010x (sdma1=%u)",
+            enable ? "on" : "off",
+            preMgcg, RREG32(dev, regMgcg),
+            preCgcg, RREG32(dev, regCgcg),
+            preCgcg3d, RREG32(dev, regCgcg3d),
+            hasSdma1 ? 1u : 0u);
     return kIOReturnSuccess;
 }
 
