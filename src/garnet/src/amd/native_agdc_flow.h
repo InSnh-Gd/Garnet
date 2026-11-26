@@ -31,13 +31,14 @@ template <class E> uint32_t native_flow(E &e, uint64_t arg) {
     if (am == 0ull) return kNoAgdc;
     const uint64_t pm = e.pipe_meta();
     if (pm == 0ull) return kNoFamily;
+    if (!kptr_ok(am) || !kptr_ok(pm) || am == pm) return kSlide;
     const SlideOut s = slide_decide(am, pm);
-    if (s.status != kPublished) return s.status;
-    const uint32_t cc = e.class_checks(am, s.slide);
+    const uint64_t slide = (s.status == kPublished) ? s.slide : 0ull;
+    const uint32_t cc = e.class_checks(am, slide);
     if (cc != kPublished) return cc;
     if (!e.have_targets()) return kNoFbPci;
     if (!e.wrangler()) return kNoWrangler;
-    return e.build(am, s.slide);
+    return e.build(am, slide);
 }
 
 } // namespace rdna4agdc

@@ -17,6 +17,8 @@
 extern "C" {
 int proc_selfpid(void);
 void proc_selfname(char *buf, int size);
+void garnet_ioservice_c2(void *, const OSMetaClass *) __asm__("__ZN9IOServiceC2EPK11OSMetaClass");
+void garnet_ioservice_d2(void *) __asm__("__ZN9IOServiceD2Ev");
 }
 
 IOService *garnet_driver_pci(void);
@@ -31,27 +33,24 @@ constexpr char kAgdcToken[] = "native-agdc";
 constexpr uintptr_t kKernelHalf = 0xffffff7000000000ull;
 constexpr unsigned kVtHdr = 2;
 
-constexpr uintptr_t kAgdcVtable        = 0x13d44478ull;
-constexpr unsigned  kAgdcVtSlots       = 276;
-constexpr uintptr_t kAgdcOpNew         = 0x13d3fea6ull;
-constexpr uintptr_t kAgdcCtorMeta      = 0x13d3fe34ull;
-constexpr uintptr_t kAgdcD2            = 0x13d3fe54ull;
-constexpr uintptr_t kAgdcOpDelete      = 0x13d3febaull;
-constexpr uintptr_t kAgdcStart         = 0x13d40392ull;
-constexpr uintptr_t kAgdcNewUserClient = 0x13d41cbeull;
-constexpr uintptr_t kAgdcVendorBase    = 0x13d41c34ull;
-constexpr uintptr_t kAgdcGetMetaClass  = 0x13d3fe5eull;
-constexpr uint32_t  kAgdcClassSize     = 0x110u;
-
-const uint8_t kBytesOpNew[]    = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d};
-const uint8_t kBytesCtorMeta[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xe8};
-const uint8_t kBytesD2[]       = {0x55, 0x48, 0x89, 0xe5, 0x5d, 0xe9};
-const uint8_t kBytesOpDelete[] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xf2, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d};
-
 using AgdcOpNewFn    = void *(*)(size_t);
 using AgdcCtorFn     = void (*)(void *, const OSMetaClass *);
 using AgdcD2Fn       = void (*)(void *);
 using AgdcOpDeleteFn = void (*)(void *, size_t);
+
+struct KernelAgdcMem {
+    bool ptr_ok(uint64_t addr) const { return rdna4agdc::kptr_ok(addr); }
+    bool read_bytes(uint64_t addr, void *dst, size_t len) const {
+        if (!ptr_ok(addr) || !dst) return false;
+        memcpy(dst, reinterpret_cast<const void *>(static_cast<uintptr_t>(addr)), len);
+        return true;
+    }
+    bool read_u64(uint64_t addr, uint64_t *out) const {
+        if (!ptr_ok(addr) || !out || (addr & 7u) != 0u) return false;
+        *out = *reinterpret_cast<const uint64_t *>(static_cast<uintptr_t>(addr));
+        return true;
+    }
+};
 
 inline bool agdc_kptr(const void *p) { return reinterpret_cast<uintptr_t>(p) >= kKernelHalf; }
 
@@ -267,33 +266,37 @@ void agdc_d1(void *self) {
 void agdc_d0(void *self) {
     AGDCLOG("deleting AGDC nub %p", self);
     if (gAg.d2) gAg.d2(self);
-    if (gAg.opDelete) gAg.opDelete(self, kAgdcClassSize);
+    if (gAg.opDelete) gAg.opDelete(self, rdna4agdc::kAgdcClassSize);
 }
 
-bool agdc_bytes(uintptr_t fn, const uint8_t *want, size_t n) {
-    return memcmp(reinterpret_cast<const uint8_t *>(fn), want, n) == 0;
-}
-
-uint32_t agdc_class_checks(const OSMetaClass *mc, uintptr_t slide) {
-    if (mc->getClassSize() != kAgdcClassSize) {
-        AGDCLOG("REFUSED - class size %u, want %#x", mc->getClassSize(), kAgdcClassSize);
-        return rdna4agdc::kClassSize;
+uint32_t agdc_class_checks(const OSMetaClass *mc, uintptr_t slide, rdna4agdc::AgdcResolved *out) {
+    const rdna4agdc::AgdcResolved r = rdna4agdc::resolve_agdc_runtime(
+        KernelAgdcMem{},
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mc)),
+        mc->getClassSize(),
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&garnet_ioservice_c2)),
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&garnet_ioservice_d2)));
+    if (r.status == rdna4agdc::kClassSize) {
+        AGDCLOG("REFUSED - class size %u, want %#x", mc->getClassSize(), rdna4agdc::kAgdcClassSize);
+        return r.status;
     }
-    if (!agdc_bytes(kAgdcOpNew + slide, kBytesOpNew, sizeof(kBytesOpNew)) ||
-        !agdc_bytes(kAgdcCtorMeta + slide, kBytesCtorMeta, sizeof(kBytesCtorMeta)) ||
-        !agdc_bytes(kAgdcD2 + slide, kBytesD2, sizeof(kBytesD2)) ||
-        !agdc_bytes(kAgdcOpDelete + slide, kBytesOpDelete, sizeof(kBytesOpDelete))) {
-        AGDCLOG("REFUSED - expected instruction prologue mismatch");
-        return rdna4agdc::kCodeBytes;
+    if (r.status == rdna4agdc::kCodeBytes) {
+        AGDCLOG("REFUSED - AGDC dynamic signature check failed");
+        return r.status;
     }
-    void **vt = reinterpret_cast<void **>(kAgdcVtable + slide + 16);
-    if (reinterpret_cast<uintptr_t>(vt[184]) - slide != kAgdcStart ||
-        reinterpret_cast<uintptr_t>(vt[238]) - slide != kAgdcNewUserClient ||
-        reinterpret_cast<uintptr_t>(vt[267]) - slide != kAgdcVendorBase ||
-        reinterpret_cast<uintptr_t>(vt[7]) - slide != kAgdcGetMetaClass) {
-        AGDCLOG("REFUSED - AGDC vtable slots 7/184/238/267 mismatch");
-        return rdna4agdc::kVtable;
+    if (r.status == rdna4agdc::kVtable) {
+        AGDCLOG("REFUSED - AGDC vtable check failed (vt %#llx)", static_cast<unsigned long long>(r.vtable));
+        return r.status;
     }
+    if (r.status != rdna4agdc::kPublished) {
+        AGDCLOG("REFUSED - AGDC resolve status %u", r.status);
+        return r.status;
+    }
+    if (out) *out = r;
+    AGDCLOG("resolved dynamically (slide %#lx): vt %#llx opNew %#llx ctor %#llx d2 %#llx opDelete %#llx",
+            static_cast<unsigned long>(slide), static_cast<unsigned long long>(r.vtable),
+            static_cast<unsigned long long>(r.opNew), static_cast<unsigned long long>(r.ctorMeta),
+            static_cast<unsigned long long>(r.d2), static_cast<unsigned long long>(r.opDelete));
     return rdna4agdc::kPublished;
 }
 
@@ -307,29 +310,29 @@ bool agdc_have_wrangler() {
     return true;
 }
 
-uint32_t agdc_build_locked(const OSMetaClass *mc, uintptr_t slide, IOService *fb,
-                           IOService *pci, IOService *provider) {
-    void **vt = reinterpret_cast<void **>(kAgdcVtable + slide + 16);
-    void **copy = static_cast<void **>(IOMalloc((kAgdcVtSlots + kVtHdr) * sizeof(void *)));
+uint32_t agdc_build_locked(const OSMetaClass *mc, uintptr_t slide, const rdna4agdc::AgdcResolved &r,
+                           IOService *fb, IOService *pci, IOService *provider) {
+    void **vt = reinterpret_cast<void **>(static_cast<uintptr_t>(r.vtable));
+    void **copy = static_cast<void **>(IOMalloc((rdna4agdc::kAgdcVtSlots + kVtHdr) * sizeof(void *)));
     if (!copy) return rdna4agdc::kAlloc;
-    memcpy(copy, vt - kVtHdr, (kAgdcVtSlots + kVtHdr) * sizeof(void *));
+    memcpy(copy, vt - kVtHdr, (rdna4agdc::kAgdcVtSlots + kVtHdr) * sizeof(void *));
     copy[kVtHdr + 0] = reinterpret_cast<void *>(&agdc_d1);
     copy[kVtHdr + 1] = reinterpret_cast<void *>(&agdc_d0);
     copy[kVtHdr + 266] = reinterpret_cast<void *>(&agdc_vendor);
-    gAg.d2 = reinterpret_cast<AgdcD2Fn>(kAgdcD2 + slide);
-    gAg.opDelete = reinterpret_cast<AgdcOpDeleteFn>(kAgdcOpDelete + slide);
+    gAg.d2 = reinterpret_cast<AgdcD2Fn>(static_cast<uintptr_t>(r.d2));
+    gAg.opDelete = reinterpret_cast<AgdcOpDeleteFn>(static_cast<uintptr_t>(r.opDelete));
     gAg.fb = fb;
     gAg.pci = pci;
     gAg.slide = slide;
     gAg.vtCopy = copy;
 
-    void *mem = reinterpret_cast<AgdcOpNewFn>(kAgdcOpNew + slide)(kAgdcClassSize);
+    void *mem = reinterpret_cast<AgdcOpNewFn>(static_cast<uintptr_t>(r.opNew))(rdna4agdc::kAgdcClassSize);
     if (!mem) {
-        IOFree(copy, (kAgdcVtSlots + kVtHdr) * sizeof(void *));
+        IOFree(copy, (rdna4agdc::kAgdcVtSlots + kVtHdr) * sizeof(void *));
         gAg.vtCopy = nullptr;
         return rdna4agdc::kAlloc;
     }
-    reinterpret_cast<AgdcCtorFn>(kAgdcCtorMeta + slide)(mem, mc);
+    reinterpret_cast<AgdcCtorFn>(static_cast<uintptr_t>(r.ctorMeta))(mem, mc);
     if (*reinterpret_cast<void ***>(mem) != vt) {
         AGDCLOG("constructor left unexpected vptr %p (want %p)", *reinterpret_cast<void ***>(mem), vt);
     }
@@ -392,6 +395,7 @@ struct AgdcNativeEnv {
     IOService *provider = nullptr;
     IOService *mfb[rdna4m6::kInstCount] = {nullptr, nullptr, nullptr};
     uint32_t mn = 0;
+    rdna4agdc::AgdcResolved resolved {};
 
     static const OSMetaClass *meta(const char *name) {
         const OSSymbol *nm = OSSymbol::withCString(name);
@@ -408,7 +412,7 @@ struct AgdcNativeEnv {
 
     uint32_t class_checks(uint64_t am, uint64_t slide) {
         return agdc_class_checks(reinterpret_cast<const OSMetaClass *>(static_cast<uintptr_t>(am)),
-                                 static_cast<uintptr_t>(slide));
+                                 static_cast<uintptr_t>(slide), &resolved);
     }
 
     bool have_targets() {
@@ -461,7 +465,7 @@ struct AgdcNativeEnv {
         }
         const uint32_t st = agdc_build_locked(
             reinterpret_cast<const OSMetaClass *>(static_cast<uintptr_t>(am)),
-            static_cast<uintptr_t>(slide), fb, pci, provider);
+            static_cast<uintptr_t>(slide), resolved, fb, pci, provider);
         if (st != 0u) gAgm.nfb = 0u;
         return st;
     }

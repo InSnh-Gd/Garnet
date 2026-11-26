@@ -15,6 +15,7 @@
 //  flow answers "off" before it reads anything.
 //
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 namespace rdna4agdc {
@@ -39,8 +40,8 @@ constexpr const char *status_name(uint32_t s) {
 }
 
 // ---- the slide ---------------------------------------------------------------------------------------------------------------------------------------------
-// Static addresses from the extracted x86_64 System KC for macOS 25G332:
-// AppleGraphicsDeviceControl::gMetaClass and IOAccelDisplayPipe::gMetaClass.
+// Static addresses from the extracted x86_64 System KC for macOS 25G332 (retained for optional diagnostics and VM probe tests;
+// runtime AGDC resolution in resolve_agdc_runtime() no longer depends on these fixed offsets).
 constexpr uint64_t kAgdcMeta = 0x13d458e8ull;
 constexpr uint64_t kPipeMeta = 0x14be66d8ull;
 constexpr uint64_t kKernelHalf = 0xffffff7000000000ull;     // the bound DisplayPipeGuard.cpp's dpg_kptr and native_disp_pure.h use
@@ -53,6 +54,205 @@ constexpr SlideOut slide_decide(uint64_t agdcMeta, uint64_t pipeMeta) {
     return (!kptr_ok(agdcMeta) || !kptr_ok(pipeMeta)) ? SlideOut{ kSlide, 0ull } :
            ((agdcMeta - kAgdcMeta) != (pipeMeta - kPipeMeta) || ((agdcMeta - kAgdcMeta) & 0xfffull) != 0ull) ? SlideOut{ kSlide, 0ull } :
            SlideOut{ kPublished, agdcMeta - kAgdcMeta };
+}
+
+// ---- build-independent runtime AGDC resolution -------------------------------------------------------------------------------------------------------------
+constexpr uint32_t kAgdcClassSize = 0x110u;
+constexpr unsigned kAgdcVtSlots = 276u;
+constexpr unsigned kMetaAllocSlot = 17u;
+constexpr uint64_t kAgdcTextSpanMax = 0x100000ull;
+constexpr size_t kAgdcScanWindowMax = 2048u;
+
+struct AgdcResolved {
+    uint32_t status;
+    uint64_t vtable;       // live __ZTV26AppleGraphicsDeviceControl + 16 (slot 0 pointer)
+    uint64_t opNew;        // live AppleGraphicsDeviceControl::operator new(size_t)
+    uint64_t ctorMeta;     // live AppleGraphicsDeviceControl::C2(const OSMetaClass *)
+    uint64_t d2;           // live AppleGraphicsDeviceControl::~D2()
+    uint64_t opDelete;     // live AppleGraphicsDeviceControl::operator delete(void *, size_t)
+    uint64_t getMetaClass; // live AppleGraphicsDeviceControl::getMetaClass()
+    uint64_t kallocView;   // shared kalloc_type_view loaded by opNew & opDelete
+};
+
+namespace detail {
+inline int32_t rd_i32(const uint8_t *p) {
+    const uint32_t u = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    return static_cast<int32_t>(u);
+}
+inline bool eq_bytes(const uint8_t *a, const uint8_t *b, size_t n) {
+    for (size_t i = 0; i < n; ++i) if (a[i] != b[i]) return false;
+    return true;
+}
+inline uint64_t abs_diff(uint64_t a, uint64_t b) { return a >= b ? (a - b) : (b - a); }
+} // namespace detail
+
+template <class Mem>
+inline uint64_t resolve_stub(const Mem &mem, uint64_t addr) {
+    uint8_t b[6] {};
+    if (!mem.ptr_ok(addr) || !mem.read_bytes(addr, b, sizeof(b))) return addr;
+    if (b[0] == 0xffu && b[1] == 0x25u) {
+        const int64_t disp = detail::rd_i32(b + 2);
+        const uint64_t got = static_cast<uint64_t>(static_cast<int64_t>(addr) + 6 + disp);
+        uint64_t target = 0;
+        if (mem.ptr_ok(got) && mem.read_u64(got, &target) && mem.ptr_ok(target)) return target;
+    }
+    return addr;
+}
+
+template <class Mem>
+inline AgdcResolved resolve_agdc_runtime(const Mem &mem, uint64_t mcAddr, uint32_t classSize,
+                                         uint64_t ioServiceC2, uint64_t ioServiceD2) {
+    AgdcResolved out {};
+    out.status = kCodeBytes;
+    if (classSize != kAgdcClassSize) {
+        out.status = kClassSize;
+        return out;
+    }
+    uint64_t mvt = 0, mvt0 = 0, mvt1 = 0, allocFn = 0;
+    if (!mem.ptr_ok(mcAddr) || !mem.read_u64(mcAddr, &mvt) || !mem.ptr_ok(mvt) ||
+        !mem.read_u64(mvt + 0u * 8u, &mvt0) || !mem.ptr_ok(mvt0) ||
+        !mem.read_u64(mvt + 1u * 8u, &mvt1) || !mem.ptr_ok(mvt1) ||
+        !mem.read_u64(mvt + kMetaAllocSlot * 8u, &allocFn) || !mem.ptr_ok(allocFn)) {
+        return out;
+    }
+
+    static constexpr uint8_t kAllocBytes[8] = {0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3};
+    uint8_t abuf[8] {};
+    if (!mem.read_bytes(allocFn, abuf, sizeof(abuf)) || !detail::eq_bytes(abuf, kAllocBytes, sizeof(abuf))) {
+        return out;
+    }
+
+    const uint64_t wantC2 = resolve_stub(mem, ioServiceC2);
+    const uint64_t wantD2 = resolve_stub(mem, ioServiceD2);
+    if (!mem.ptr_ok(wantC2) || !mem.ptr_ok(wantD2) || wantC2 == wantD2) {
+        return out;
+    }
+
+    const uint64_t loAnchor = (mvt0 < allocFn) ? mvt0 : allocFn;
+    const uint64_t hiAnchor = (mvt0 > allocFn) ? mvt0 : allocFn;
+    if (hiAnchor - loAnchor > 0x1000ull) {
+        return out;
+    }
+    const uint64_t backMax = (loAnchor & 0xfffull) < 0x40ull ? (loAnchor & 0xfffull) : 0x40ull;
+    const uint64_t winLo = loAnchor - backMax;
+    uint64_t winHi = hiAnchor + 0x100ull;
+    if (!(mvt1 > hiAnchor && (mvt1 - hiAnchor) >= 0x100ull)) {
+        const uint64_t pageEnd = (hiAnchor & ~0xfffull) + 0x1000ull;
+        if (winHi > pageEnd) winHi = pageEnd;
+    }
+    if (winHi <= winLo || (winHi - winLo) > kAgdcScanWindowMax) {
+        return out;
+    }
+
+    const size_t winLen = static_cast<size_t>(winHi - winLo);
+    uint8_t win[kAgdcScanWindowMax] {};
+    if (!mem.read_bytes(winLo, win, winLen)) {
+        return out;
+    }
+
+    static constexpr uint8_t kPreGetMeta[7] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x8d, 0x05};
+    static constexpr uint8_t kPreC2[10]     = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xe8};
+    static constexpr uint8_t kMidC2[3]      = {0x48, 0x8d, 0x05};
+    static constexpr uint8_t kPostC2[10]    = {0x48, 0x89, 0x03, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0x5d, 0xc3};
+    static constexpr uint8_t kPreD2[6]      = {0x55, 0x48, 0x89, 0xe5, 0x5d, 0xe9};
+    static constexpr uint8_t kPreNew[10]    = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d};
+    static constexpr uint8_t kPreDel[13]    = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xf2, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d};
+
+    unsigned nGetMeta = 0, nC2 = 0, nD2 = 0, nNew = 0, nDel = 0;
+    uint64_t newTarget = 0, delTarget = 0, viewNew = 0, viewDel = 0;
+
+    for (size_t i = 0; i < winLen; ++i) {
+        const uint64_t addr = winLo + i;
+        if (i + 13u <= winLen && detail::eq_bytes(win + i, kPreGetMeta, 7) &&
+            win[i + 11] == 0x5du && win[i + 12] == 0xc3u) {
+            const uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(addr) + 11 + detail::rd_i32(win + i + 7));
+            if (target == mcAddr) {
+                out.getMetaClass = addr;
+                ++nGetMeta;
+            }
+        }
+        if (i + 31u <= winLen && detail::eq_bytes(win + i, kPreC2, 10) &&
+            detail::eq_bytes(win + i + 14, kMidC2, 3) &&
+            detail::eq_bytes(win + i + 21, kPostC2, 10)) {
+            const uint64_t callee = static_cast<uint64_t>(static_cast<int64_t>(addr) + 14 + detail::rd_i32(win + i + 10));
+            const uint64_t vt = static_cast<uint64_t>(static_cast<int64_t>(addr) + 21 + detail::rd_i32(win + i + 17));
+            if (resolve_stub(mem, callee) == wantC2 && mem.ptr_ok(vt) && (vt & 7u) == 0u) {
+                out.ctorMeta = addr;
+                out.vtable = vt;
+                ++nC2;
+            }
+        }
+        if (i + 10u <= winLen && detail::eq_bytes(win + i, kPreD2, 6)) {
+            const uint64_t callee = static_cast<uint64_t>(static_cast<int64_t>(addr) + 10 + detail::rd_i32(win + i + 6));
+            if (resolve_stub(mem, callee) == wantD2) {
+                out.d2 = addr;
+                ++nD2;
+            }
+        }
+        if (i + 20u <= winLen && detail::eq_bytes(win + i, kPreNew, 10) &&
+            win[i + 14] == 0x5du && win[i + 15] == 0xe9u) {
+            const uint64_t vw = static_cast<uint64_t>(static_cast<int64_t>(addr) + 14 + detail::rd_i32(win + i + 10));
+            const uint64_t tgt = resolve_stub(mem, static_cast<uint64_t>(static_cast<int64_t>(addr) + 20 + detail::rd_i32(win + i + 16)));
+            if (mem.ptr_ok(vw) && mem.ptr_ok(tgt)) {
+                out.opNew = addr;
+                viewNew = vw;
+                newTarget = tgt;
+                ++nNew;
+            }
+        }
+        if (i + 23u <= winLen && detail::eq_bytes(win + i, kPreDel, 13) &&
+            win[i + 17] == 0x5du && win[i + 18] == 0xe9u) {
+            const uint64_t vw = static_cast<uint64_t>(static_cast<int64_t>(addr) + 17 + detail::rd_i32(win + i + 13));
+            const uint64_t tgt = resolve_stub(mem, static_cast<uint64_t>(static_cast<int64_t>(addr) + 23 + detail::rd_i32(win + i + 19)));
+            if (mem.ptr_ok(vw) && mem.ptr_ok(tgt)) {
+                out.opDelete = addr;
+                viewDel = vw;
+                delTarget = tgt;
+                ++nDel;
+            }
+        }
+    }
+
+    if (nGetMeta != 1u || nC2 != 1u || nD2 != 1u || nNew != 1u || nDel != 1u ||
+        viewNew != viewDel || newTarget == delTarget) {
+        return out;
+    }
+    out.kallocView = viewNew;
+
+    // Verify AGDC vtable structure and boundary against live memory.
+    out.status = kVtable;
+    uint64_t hdr0 = 1, hdr1 = 1, s0 = 0, s1 = 0, s7 = 0, s184 = 0, s238 = 0, s266 = 0, s267 = 0, s275 = 0, sEnd = 1;
+    if (!mem.read_u64(out.vtable - 16u, &hdr0) || !mem.read_u64(out.vtable - 8u, &hdr1) ||
+        hdr0 != 0ull || hdr1 != 0ull ||
+        !mem.read_u64(out.vtable + 0u * 8u, &s0) || !mem.read_u64(out.vtable + 1u * 8u, &s1) ||
+        !mem.read_u64(out.vtable + 7u * 8u, &s7) || !mem.read_u64(out.vtable + 184u * 8u, &s184) ||
+        !mem.read_u64(out.vtable + 238u * 8u, &s238) || !mem.read_u64(out.vtable + 266u * 8u, &s266) ||
+        !mem.read_u64(out.vtable + 267u * 8u, &s267) || !mem.read_u64(out.vtable + 275u * 8u, &s275) ||
+        !mem.read_u64(out.vtable + kAgdcVtSlots * 8u, &sEnd) || sEnd != 0ull) {
+        return out;
+    }
+    if (s7 != out.getMetaClass ||
+        !mem.ptr_ok(s0) || !mem.ptr_ok(s1) || !mem.ptr_ok(s184) ||
+        !mem.ptr_ok(s238) || !mem.ptr_ok(s266) || !mem.ptr_ok(s267) || !mem.ptr_ok(s275)) {
+        return out;
+    }
+    static constexpr uint8_t kUd2Bytes[6] = {0x55, 0x48, 0x89, 0xe5, 0x0f, 0x0b};
+    uint8_t d0b[6] {}, d1b[6] {};
+    if (!mem.read_bytes(s1, d1b, sizeof(d1b)) || !mem.read_bytes(s0, d0b, sizeof(d0b)) ||
+        !detail::eq_bytes(d1b, kUd2Bytes, sizeof(d1b)) || !detail::eq_bytes(d0b, kUd2Bytes, sizeof(d0b))) {
+        return out;
+    }
+    if (detail::abs_diff(s184, allocFn) >= kAgdcTextSpanMax ||
+        detail::abs_diff(s238, allocFn) >= kAgdcTextSpanMax ||
+        detail::abs_diff(s267, allocFn) >= kAgdcTextSpanMax ||
+        detail::abs_diff(s275, allocFn) >= kAgdcTextSpanMax ||
+        detail::abs_diff(s266, allocFn) < kAgdcTextSpanMax) {
+        return out;
+    }
+
+    out.status = kPublished;
+    return out;
 }
 
 // ---- the framebuffer --------------------------------------------------------------------------------------------------------------------------------------

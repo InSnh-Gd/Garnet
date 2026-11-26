@@ -168,10 +168,14 @@ int main(int argc, char **argv) {
       expect_u("no family class: status", st, kNoFamily);
       expect(e.index("agdc_meta") < e.index("pipe_meta") && !e.called("class_checks") && e.builds == 0, "no family class: the AGDC lookup came first, the class checks never run"); }
     { FakeEnv e; e.pmc = PMC + 0x1000; const uint32_t st = native_flow(e, 1);
-      expect_u("anchors disagree: status", st, kSlide);
-      expect(!e.called("class_checks") && !e.called("targets") && e.builds == 0, "DISAGREEING anchors: the class checks (which read memory at slide + a static) never run"); }
+      expect_u("non-25G332 anchors still reach class_checks with slide 0", st, kPublished);
+      expect(e.called("class_checks") && e.checkedSlide == 0ull && e.builds == 1 && e.builtSlide == 0ull, "different-build kernel anchors proceed via dynamic resolution with slide 0"); }
     { FakeEnv e; e.amc = AMC + 4; e.pmc = PMC + 4; const uint32_t st = native_flow(e, 1);
-      expect_u("unaligned slide: status", st, kSlide); expect(!e.called("class_checks") && e.builds == 0, "an unaligned slide never reaches the class checks"); }
+      expect_u("unaligned 25G332 slide still reaches dynamic class_checks with slide 0", st, kPublished);
+      expect(e.called("class_checks") && e.checkedSlide == 0ull && e.builds == 1, "unaligned slide falls back to slide 0 dynamic resolution"); }
+    { FakeEnv e; e.pmc = e.amc; const uint32_t st = native_flow(e, 1);
+      expect_u("identical AGDC and pipe metaclasses: status", st, kSlide);
+      expect(!e.called("class_checks") && e.builds == 0, "identical metaclasses are refused before class checks"); }
     { FakeEnv e; e.targets = false; const uint32_t st = native_flow(e, 1);
       expect_u("no framebuffer / PCI: status", st, kNoFbPci);
       expect(e.index("class_checks") < e.index("targets") && !e.called("wrangler") && e.builds == 0, "no framebuffer: the class checks came first, the wrangler and the build never run"); }
@@ -189,8 +193,8 @@ int main(int argc, char **argv) {
         { "row-120 held",       [](FakeEnv &e) { e.held = true; },               kHeld },
         { "no AGDC class",      [](FakeEnv &e) { e.amc = 0; },                   kNoAgdc },
         { "no family class",    [](FakeEnv &e) { e.pmc = 0; },                   kNoFamily },
-        { "slide mismatch",     [](FakeEnv &e) { e.pmc += 0x4000; },             kSlide },
-        { "unaligned slide",    [](FakeEnv &e) { e.amc += 16; e.pmc += 16; },    kSlide },
+        { "identical metas",    [](FakeEnv &e) { e.pmc = e.amc; },               kSlide },
+        { "pipe not kernel",    [](FakeEnv &e) { e.pmc = 0x8000; },              kSlide },
         { "AGDC not kernel",    [](FakeEnv &e) { e.amc = 0x7000; },              kSlide },
         { "class size",         [](FakeEnv &e) { e.checks = kClassSize; },       kClassSize },
         { "code bytes",         [](FakeEnv &e) { e.checks = kCodeBytes; },       kCodeBytes },
@@ -244,20 +248,26 @@ int main(int argc, char **argv) {
         expect(ctl.find("rdna4agdc::native_flow(env, arg)") != std::string::npos && count_of(dpg, "rdna4agdc::native_flow(") == 1, "the control runs the tested flow, once");
         { const size_t lk = ctl.find("IOLockLock(gAgdcLock);"), fl = ctl.find("native_flow(env, arg)"), ul = ctl.find("IOLockUnlock(gAgdcLock);"), fin = ctl.find("env.finish(st);");
           expect(lk != std::string::npos && fl != std::string::npos && ul != std::string::npos && fin != std::string::npos && lk < fl && fl < ul && ul < fin, "the flow runs under the AGDC lock; finish runs after it is dropped"); }
-        // the static anchors: the glue's and the pure header's are the same numbers
-        expect(dpg.find("kAgdcVtable        = 0x13d44478ull;") != std::string::npos && pure.find("kAgdcMeta = 0x13d458e8ull;") != std::string::npos, "the AGDC anchor is the same number in the glue and in the pure header");
-        expect(pure.find("kPipeMeta = 0x14be66d8ull;") != std::string::npos, "the family anchor literal");
+        // dynamic resolution pins: no hardcoded 25G332 AGDC addresses in agdc_service.cpp
+        expect(dpg.find("kAgdcVtable") == std::string::npos && dpg.find("kAgdcOpNew") == std::string::npos &&
+               dpg.find("kAgdcCtorMeta") == std::string::npos && dpg.find("kAgdcOpDelete") == std::string::npos,
+               "agdc_service.cpp no longer hardcodes 25G332 static AGDC addresses");
+        expect(dpg.find("garnet_ioservice_c2") != std::string::npos && dpg.find("garnet_ioservice_d2") != std::string::npos,
+               "agdc_service.cpp binds IOService C2/D2 KPI symbols");
+        expect(dpg.find("resolve_agdc_runtime(") != std::string::npos,
+               "agdc_class_checks delegates to pure resolve_agdc_runtime");
         // the class checks keep all three groups of checks
         { const size_t cA = dpg.find("uint32_t agdc_class_checks("), cB = dpg.find("bool agdc_have_wrangler()");
           const std::string cc = (cA != std::string::npos && cB != std::string::npos && cA < cB) ? dpg.substr(cA, cB - cA) : std::string();
-          expect(cc.find("getClassSize() != kAgdcClassSize") != std::string::npos && cc.find("agdc_bytes(kAgdcOpNew + slide") != std::string::npos && cc.find("agdc_bytes(kAgdcOpDelete + slide") != std::string::npos &&
-                 cc.find("vt[184]") != std::string::npos && cc.find("vt[238]") != std::string::npos && cc.find("vt[267]") != std::string::npos && cc.find("vt[7]") != std::string::npos &&
-                 cc.find("return rdna4agdc::kClassSize;") != std::string::npos && cc.find("return rdna4agdc::kCodeBytes;") != std::string::npos && cc.find("return rdna4agdc::kVtable;") != std::string::npos, "the shared class checks still check the size, the four functions' bytes and four vtable slots"); }
+          expect(cc.find("resolve_agdc_runtime(") != std::string::npos && cc.find("rdna4agdc::kClassSize") != std::string::npos &&
+                 cc.find("rdna4agdc::kCodeBytes") != std::string::npos && cc.find("rdna4agdc::kVtable") != std::string::npos,
+                 "the shared class checks map class size, code bytes and vtable verdicts"); }
         // the shared build still carries the whole construction
         { const size_t bA = dpg.find("uint32_t agdc_build_locked("), bB = dpg.find("void agdc_fill_out(");
           const std::string b = (bA != std::string::npos && bB != std::string::npos && bA < bB) ? dpg.substr(bA, bB - bA) : std::string();
-          expect(b.find("copy[kVtHdr + 266] = reinterpret_cast<void *>(&agdc_vendor);") != std::string::npos && b.find("kAgdcOpNew + slide") != std::string::npos &&
-                 b.find("obj->start(provider)") != std::string::npos && b.find("gAg.published = 1u;") != std::string::npos, "the shared build installs slot 266, allocates with operator new, starts and registers");
+          expect(b.find("copy[kVtHdr + 266] = reinterpret_cast<void *>(&agdc_vendor);") != std::string::npos && b.find("r.opNew") != std::string::npos &&
+                 b.find("r.ctorMeta") != std::string::npos && b.find("obj->start(provider)") != std::string::npos && b.find("gAg.published = 1u;") != std::string::npos,
+                 "the shared build installs slot 266, allocates with resolved opNew, constructs with resolved ctorMeta, starts and registers");
           expect(b.find("rdna4_pipeguard_armed_all") == std::string::npos && b.find("PE_parse_boot_argn") == std::string::npos, "the shared build has no legacy route dependency"); }
         expect(dpg.find("void agdc_fill_out(uint32_t st, uint64_t *out, unsigned count) {") != std::string::npos && count_of(dpg, "agdc_fill_out(st, out, count);") == 1, "native control returns the scalars through one filler");
     }
@@ -285,7 +295,7 @@ int main(int argc, char **argv) {
         expect(cli.find("in == 88 ? \"pipeagdc\"") != std::string::npos && cli.find("pipeagdc [0|1]") != std::string::npos && cli.find("if (in == 88) {") != std::string::npos, "rdna4test names, documents and decodes it");
         expect(cli.find("\"IOAccelDisplayPipe class (the second slide anchor) is not loaded\"") != std::string::npos && cli.find("\"row-120 mode hold is up") != std::string::npos, "the CLI decode knows the two native-only statuses");
     }
-    expect(flow.find("if (!e.latch_on()) return kOff;") != std::string::npos && flow.find("e.class_checks(am, s.slide)") != std::string::npos && flow.find("return e.build(am, s.slide);") != std::string::npos, "the flow's three key lines");
+    expect(flow.find("if (!e.latch_on()) return kOff;") != std::string::npos && flow.find("e.class_checks(am, slide)") != std::string::npos && flow.find("return e.build(am, slide);") != std::string::npos, "the flow's three key lines");
 
     // =========================================================================================================================================================
     // I. task 4.2: identity is not a generic class-name allowlist
@@ -314,6 +324,201 @@ int main(int argc, char **argv) {
       const size_t envA = dpg.find("struct AgdcNativeEnv {"), envB = dpg.find("uint32_t rdna4_agdc_native_control(");
       if (envA != std::string::npos && envB != std::string::npos) { const std::string mine = dpg.substr(envA, envB - envA + 900);
           expect(mine.find(a) == std::string::npos && mine.find(b) == std::string::npos && mine.find(c) == std::string::npos, "the native AGDC block of DisplayPipeGuard.cpp spells none"); } }
+
+    // =========================================================================================================================================================
+    // D. dynamic runtime AGDC resolution (non-25G332 layouts + fault injection)
+    // =========================================================================================================================================================
+    {
+        struct FakeMem {
+            uint64_t base;
+            std::vector<uint8_t> buf;
+            bool ptr_ok(uint64_t a) const { return a >= base && a < base + buf.size(); }
+            bool read_bytes(uint64_t a, void *dst, size_t n) const {
+                if (a < base || a > base + buf.size() || n > (base + buf.size() - a)) return false;
+                std::memcpy(dst, buf.data() + (a - base), n);
+                return true;
+            }
+            bool read_u64(uint64_t a, uint64_t *out) const {
+                if ((a & 7u) != 0u) return false;
+                return read_bytes(a, out, sizeof(*out));
+            }
+            void wr_bytes(uint64_t a, const void *src, size_t n) { std::memcpy(buf.data() + (a - base), src, n); }
+            void wr_u64(uint64_t a, uint64_t v) { wr_bytes(a, &v, sizeof(v)); }
+            void wr_i32(uint64_t a, int32_t v) { wr_bytes(a, &v, sizeof(v)); }
+        };
+
+        auto make_layout = [&](uint64_t base, uint64_t offText) {
+            FakeMem m;
+            m.base = base;
+            m.buf.assign(0x200000u, 0xccu); // fill unused memory with int3
+
+            // Layout offsets inside m.buf (distinct from 25G332 when offText != 0)
+            const uint64_t bkcBase  = base + 0x10000ull; // >1 MiB away from AGDC text for ___cxa_pure_virtual
+            const uint64_t agdcText = base + 0x120000ull + offText;
+            const uint64_t agdcData = base + 0x140000ull + offText;
+
+            const uint64_t fnPureVirt = bkcBase + 0x1000ull;
+            const uint64_t fnIoSvcC2  = bkcBase + 0x2000ull;
+            const uint64_t fnIoSvcD2  = bkcBase + 0x3000ull;
+            const uint64_t fnTypedNew = bkcBase + 0x4000ull;
+            const uint64_t fnTypedDel = bkcBase + 0x5000ull;
+
+            // __stubs + __got inside AGDC KC
+            const uint64_t gotC2   = agdcData + 0x000ull;
+            const uint64_t gotD2   = agdcData + 0x008ull;
+            const uint64_t gotNew  = agdcData + 0x010ull;
+            const uint64_t gotDel  = agdcData + 0x018ull;
+            m.wr_u64(gotC2, fnIoSvcC2);
+            m.wr_u64(gotD2, fnIoSvcD2);
+            m.wr_u64(gotNew, fnTypedNew);
+            m.wr_u64(gotDel, fnTypedDel);
+
+            const uint64_t stubC2  = agdcText + 0x010ull;
+            const uint64_t stubD2  = agdcText + 0x016ull;
+            const uint64_t stubNew = agdcText + 0x01cull;
+            const uint64_t stubDel = agdcText + 0x022ull;
+            auto emit_stub = [&](uint64_t s, uint64_t g) {
+                uint8_t b[6] = {0xff, 0x25, 0, 0, 0, 0};
+                m.wr_bytes(s, b, 6);
+                m.wr_i32(s + 2, static_cast<int32_t>(static_cast<int64_t>(g) - static_cast<int64_t>(s + 6)));
+            };
+            emit_stub(stubC2, gotC2);
+            emit_stub(stubD2, gotD2);
+            emit_stub(stubNew, gotNew);
+            emit_stub(stubDel, gotDel);
+
+            // Data objects: kallocView, gMetaClass, AGDC vtable (+16), MetaClass vtable (+16)
+            const uint64_t kallocView = agdcData + 0x100ull;
+            const uint64_t mcAddr     = agdcData + 0x200ull;
+            const uint64_t vtBase     = agdcData + 0x300ull;
+            const uint64_t vtSlot0    = vtBase + 16ull;
+            const uint64_t mvtBase    = agdcData + 0x1000ull;
+            const uint64_t mvtSlot0   = mvtBase + 16ull;
+
+            // Functions in AGDC __text
+            const uint64_t fnMvt0   = agdcText + 0x100ull;
+            const uint64_t fnC2     = agdcText + 0x110ull;
+            const uint64_t fnD2     = agdcText + 0x130ull;
+            const uint64_t fnGetMc  = agdcText + 0x140ull;
+            const uint64_t fnAlloc  = agdcText + 0x160ull;
+            const uint64_t fnOpNew  = agdcText + 0x168ull;
+            const uint64_t fnOpDel  = agdcText + 0x180ull;
+            const uint64_t fnStart  = agdcText + 0x300ull;
+            const uint64_t fnNewUc  = agdcText + 0x400ull;
+            const uint64_t fnVendor = agdcText + 0x500ull;
+            const uint64_t fnRes7   = agdcText + 0x600ull;
+            const uint64_t fnD1     = agdcText + 0x700ull;
+            const uint64_t fnD0     = agdcText + 0x710ull;
+            const uint64_t fnMvt1   = agdcText + 0x720ull;
+
+            const uint8_t retZero[8] = {0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3};
+            const uint8_t ud2Seq[6]  = {0x55, 0x48, 0x89, 0xe5, 0x0f, 0x0b};
+            m.wr_bytes(fnAlloc, retZero, 8);
+            m.wr_bytes(fnD1, ud2Seq, 6);
+            m.wr_bytes(fnD0, ud2Seq, 6);
+
+            // C2(this, meta): 31 bytes
+            const uint8_t c2Seq[31] = {
+                0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xe8, 0, 0, 0, 0,
+                0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x03, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0x5d, 0xc3
+            };
+            m.wr_bytes(fnC2, c2Seq, 31);
+            m.wr_i32(fnC2 + 10, static_cast<int32_t>(static_cast<int64_t>(stubC2) - static_cast<int64_t>(fnC2 + 14)));
+            m.wr_i32(fnC2 + 17, static_cast<int32_t>(static_cast<int64_t>(vtSlot0) - static_cast<int64_t>(fnC2 + 21)));
+
+            // D2(this): 10 bytes
+            const uint8_t d2Seq[10] = {0x55, 0x48, 0x89, 0xe5, 0x5d, 0xe9, 0, 0, 0, 0};
+            m.wr_bytes(fnD2, d2Seq, 10);
+            m.wr_i32(fnD2 + 6, static_cast<int32_t>(static_cast<int64_t>(stubD2) - static_cast<int64_t>(fnD2 + 10)));
+
+            // getMetaClass(): 13 bytes
+            const uint8_t gmSeq[13] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x5d, 0xc3};
+            m.wr_bytes(fnGetMc, gmSeq, 13);
+            m.wr_i32(fnGetMc + 7, static_cast<int32_t>(static_cast<int64_t>(mcAddr) - static_cast<int64_t>(fnGetMc + 11)));
+
+            // opNew(sz): 20 bytes
+            const uint8_t newSeq[20] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x5d, 0xe9, 0, 0, 0, 0};
+            m.wr_bytes(fnOpNew, newSeq, 20);
+            m.wr_i32(fnOpNew + 10, static_cast<int32_t>(static_cast<int64_t>(kallocView) - static_cast<int64_t>(fnOpNew + 14)));
+            m.wr_i32(fnOpNew + 16, static_cast<int32_t>(static_cast<int64_t>(stubNew) - static_cast<int64_t>(fnOpNew + 20)));
+
+            // opDelete(p, sz): 23 bytes
+            const uint8_t delSeq[23] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xf2, 0x48, 0x89, 0xfe, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x5d, 0xe9, 0, 0, 0, 0};
+            m.wr_bytes(fnOpDel, delSeq, 23);
+            m.wr_i32(fnOpDel + 13, static_cast<int32_t>(static_cast<int64_t>(kallocView) - static_cast<int64_t>(fnOpDel + 17)));
+            m.wr_i32(fnOpDel + 19, static_cast<int32_t>(static_cast<int64_t>(stubDel) - static_cast<int64_t>(fnOpDel + 23)));
+
+            // Wire MetaClass & vtables
+            m.wr_u64(mcAddr, mvtSlot0);
+            m.wr_u64(mvtBase + 0, 0);
+            m.wr_u64(mvtBase + 8, 0);
+            m.wr_u64(mvtSlot0 + 0 * 8, fnMvt0);
+            m.wr_u64(mvtSlot0 + 1 * 8, fnMvt1);
+            m.wr_u64(mvtSlot0 + kMetaAllocSlot * 8, fnAlloc);
+
+            m.wr_u64(vtBase + 0, 0);
+            m.wr_u64(vtBase + 8, 0);
+            m.wr_u64(vtSlot0 + 0 * 8, fnD1);
+            m.wr_u64(vtSlot0 + 1 * 8, fnD0);
+            m.wr_u64(vtSlot0 + 7 * 8, fnGetMc);
+            m.wr_u64(vtSlot0 + 184 * 8, fnStart);
+            m.wr_u64(vtSlot0 + 238 * 8, fnNewUc);
+            m.wr_u64(vtSlot0 + 266 * 8, fnPureVirt);
+            m.wr_u64(vtSlot0 + 267 * 8, fnVendor);
+            m.wr_u64(vtSlot0 + 275 * 8, fnRes7);
+            m.wr_u64(vtSlot0 + 276 * 8, 0);
+
+            struct Fixture { FakeMem mem; uint64_t mcAddr, stubC2, stubD2, fnIoSvcC2, fnIoSvcD2, vtSlot0, fnOpNew, fnC2, fnD2, fnOpDel, fnGetMc, kallocView, fnAlloc, fnMvt0, fnD1, fnRes7, agdcText; };
+            return Fixture{m, mcAddr, stubC2, stubD2, fnIoSvcC2, fnIoSvcD2, vtSlot0, fnOpNew, fnC2, fnD2, fnOpDel, fnGetMc, kallocView, fnAlloc, fnMvt0, fnD1, fnRes7, agdcText};
+        };
+
+        // 1. Happy path at arbitrary non-25G332 macOS 26.x layout
+        {
+            auto f = make_layout(0xffffff8022000000ull, 0x3400ull);
+            const AgdcResolved r = resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2);
+            expect_u("dynamic resolve non-25G332 status", r.status, kPublished);
+            expect_u("dynamic resolve vtable", r.vtable, f.vtSlot0);
+            expect_u("dynamic resolve opNew", r.opNew, f.fnOpNew);
+            expect_u("dynamic resolve ctorMeta", r.ctorMeta, f.fnC2);
+            expect_u("dynamic resolve d2", r.d2, f.fnD2);
+            expect_u("dynamic resolve opDelete", r.opDelete, f.fnOpDel);
+            expect_u("dynamic resolve getMetaClass", r.getMetaClass, f.fnGetMc);
+            expect_u("dynamic resolve kallocView", r.kallocView, f.kallocView);
+            // Also verify direct (non-stub) KPI pointers resolve the same stubs inside AGDC text
+            const AgdcResolved rDirect = resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.fnIoSvcC2, f.fnIoSvcD2);
+            expect_u("dynamic resolve with direct KPI symbols", rDirect.status, kPublished);
+        }
+        // 2. Fault injections
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          expect_u("wrong classSize -> kClassSize", resolve_agdc_runtime(f.mem, f.mcAddr, 0x118u, f.stubC2, f.stubD2).status, kClassSize); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          uint8_t bad = 0x90; f.mem.wr_bytes(f.fnAlloc + 4, &bad, 1);
+          expect_u("corrupted alloc() -> kCodeBytes", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kCodeBytes); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_i32(f.fnC2 + 10, 0x1234);
+          expect_u("C2 calling wrong symbol -> kCodeBytes", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kCodeBytes); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_i32(f.fnD2 + 6, 0x1234);
+          expect_u("D2 jumping to wrong symbol -> kCodeBytes", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kCodeBytes); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_i32(f.fnOpDel + 13, 0x7777);
+          expect_u("opNew/opDelete view mismatch -> kCodeBytes", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kCodeBytes); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_i32(f.fnGetMc + 7, 0x1234);
+          expect_u("missing getMetaClass -> kCodeBytes", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kCodeBytes); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_u64(f.vtSlot0 + 7 * 8, f.fnRes7);
+          expect_u("vt[7] != getMetaClass -> kVtable", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kVtable); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          uint8_t bad = 0xc3; f.mem.wr_bytes(f.fnD1 + 4, &bad, 1);
+          expect_u("vt[0] not ud2 -> kVtable", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kVtable); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_u64(f.vtSlot0 + 266 * 8, f.fnRes7);
+          expect_u("vt[266] inside AGDC text -> kVtable", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kVtable); }
+        { auto f = make_layout(0xffffff8030000000ull, 0ull);
+          f.mem.wr_u64(f.vtSlot0 + 276 * 8, f.fnRes7);
+          expect_u("vt[276] non-zero -> kVtable", resolve_agdc_runtime(f.mem, f.mcAddr, kAgdcClassSize, f.stubC2, f.stubD2).status, kVtable); }
+    }
 
     std::printf("native_agdc_test: %d/%d passed\n", gRun - gFail, gRun);
     return gFail ? 1 : 0;
