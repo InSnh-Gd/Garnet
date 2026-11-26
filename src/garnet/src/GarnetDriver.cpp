@@ -253,13 +253,25 @@ bool GarnetDriver::mapVramAperture() {
 		pin.mapCap = rdna4rebar::kMaxBar0Full;
 		pin.requireFullBar = true;
 	}
-	const rdna4rebar::PlanOut pl = rdna4rebar::plan_bar0(pin);
+	rdna4rebar::PlanOut pl = rdna4rebar::plan_bar0(pin);
+	bool fullBarFallback = false;
+	uint32_t fullRefusalReason = rdna4rebar::kOk;
+	if (fullBarRequested && !pl.ok && pl.reason == rdna4rebar::kFullBarNotAssigned) {
+		pl = rdna4rebar::plan_bar0_with_fallback(pin, &fullBarFallback, &fullRefusalReason);
+		if (fullBarFallback) {
+			RDNA4LOG("vram: garnet-full-bar=1 requested but BAR0 (%llu MiB) does not cover VRAM (%llu MiB); falling back to Small-BAR (%llu MiB)",
+			         (unsigned long long)(pin.ioLen >> 20), (unsigned long long)(pin.vramBytes >> 20),
+			         (unsigned long long)(pl.mapLen >> 20));
+			setProperty("BAR0,FullRefusalReason", rdna4rebar::reason_name(fullRefusalReason));
+		}
+	}
 	RDNA4LOG("vram: BAR0 plan (garnet-full-bar=%u, cap %llu MiB): IOPCIFamily [%#llx, +%llu MiB), config space %#llx, ReBAR %s %llu MiB, VRAM %llu MiB -> %s%s (map %llu MiB, vramLimit %llu MiB)",
 	       fullBarRequested ? 1u : 0u, (unsigned long long)(pin.mapCap >> 20), (unsigned long long)pin.ioAddr, (unsigned long long)(pin.ioLen >> 20),
 	       (unsigned long long)pin.cfgAddr, pin.rebarPresent ? "current" : "absent", (unsigned long long)(pin.rebarBytes >> 20), (unsigned long long)(pin.vramBytes >> 20),
 	       pl.ok ? "OK" : "REFUSED: ", pl.ok ? "" : rdna4rebar::reason_name(pl.reason), (unsigned long long)(pl.mapLen >> 20), (unsigned long long)(pl.vramLimit >> 20));
 	setProperty("BAR0,PlanReason", rdna4rebar::reason_name(pl.reason));
 	setProperty("BAR0,FullRequested", fullBarRequested);
+	setProperty("BAR0,FullFallback", fullBarFallback);
 	setProperty("BAR0,FullMode", false);
 	setProperty("BAR0,MapCapMB", static_cast<uint64_t>(pin.mapCap >> 20), 64);
 	if (!pl.ok) { RDNA4LOG("vram: BAR0 refused (%s): nothing is mapped, the native ladder will not run", rdna4rebar::reason_name(pl.reason)); return false; }

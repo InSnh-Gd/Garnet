@@ -133,6 +133,30 @@ constexpr PlanOut plan_bar0(const PlanIn &in) {
     return r;
 }
 
+// Re-plans with Small-BAR defaults (<= 1 GiB) ONLY when Full-BAR was requested on a valid
+// <= 1 GiB BAR0 (kFullBarNotAssigned). All hardware/firmware hazards still fail closed.
+constexpr PlanOut plan_bar0_with_fallback(PlanIn &pin,
+                                          bool *fellBack = nullptr,
+                                          uint32_t *fullRefusalReason = nullptr) {
+    if (fellBack) *fellBack = false;
+    if (fullRefusalReason) *fullRefusalReason = kOk;
+    PlanOut pl = plan_bar0(pin);
+    if (!pl.ok && pin.requireFullBar && pl.reason == kFullBarNotAssigned) {
+        if (fullRefusalReason) *fullRefusalReason = pl.reason;
+        PlanIn fb = pin;
+        fb.mapCap = kMaxBar0Map;
+        fb.requireFullBar = false;
+        PlanOut fpl = plan_bar0(fb);
+        if (fpl.ok) {
+            pin = fb;
+            if (fellBack) *fellBack = true;
+            return fpl;
+        }
+        return fpl;
+    }
+    return pl;
+}
+
 // The address of a memory BAR from its config dword(s): a 64-bit BAR (type bits 2:1 == 10b) takes the next dword as the high half.
 constexpr uint64_t cfg_bar_addr(uint32_t lo, uint32_t hi) {
     return (((lo & 0x6u) == 0x4u) ? ((uint64_t)hi << 32) : 0ull) | (uint64_t)(lo & ~0xFu);

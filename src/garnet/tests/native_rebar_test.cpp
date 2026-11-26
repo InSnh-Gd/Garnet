@@ -783,10 +783,102 @@ static void p13_bartest(const std::string &root) {
            "P13 pin 4.2: garnettest exposes accel bartest (action 109) and vramstat bar0FullMode display");
 }
 
+static void p14_smallbar_fallback(const std::string &root) {
+    // 1) Valid <= 1 GiB BAR0 with requireFullBar=true falls back gracefully to Small-BAR.
+    for (uint64_t barLen : { 256 * MiB, 512 * MiB, GiB }) {
+        const uint64_t addr = (barLen == 256 * MiB) ? 0xD0000000ull
+                            : (barLen == 512 * MiB) ? 0xC0000000ull
+                                                    : 0x7C00000000ull;
+        PlanIn p = mk(barLen, addr);
+        p.mapCap = kMaxBar0Full;
+        p.requireFullBar = true;
+        bool fellBack = false;
+        uint32_t fullReason = kOk;
+        const PlanOut o = plan_bar0_with_fallback(p, &fellBack, &fullReason);
+        expect(o.ok && fellBack, "P14: <= 1 GiB BAR0 with requireFullBar=true falls back cleanly");
+        expect_u("P14: recorded full refusal reason is kFullBarNotAssigned", fullReason, kFullBarNotAssigned);
+        expect(!p.requireFullBar && p.mapCap == kMaxBar0Map, "P14: pin updated to Small-BAR plan bounds");
+        expect_u("P14: fallback mapLen matches BAR0 length", o.mapLen, barLen);
+        PlanIn withCons = p;
+        withCons.consoleOff = 0ull;
+        withCons.consoleLen = 8 * MiB;
+        expect(plan_bar0(withCons).ok, "P14: follow-up console finishVramPlan succeeds after fallback");
+    }
+
+    // 2) 256 MiB BAR0 without ReBAR cap still falls back cleanly.
+    {
+        PlanIn p = mk(256 * MiB, 0xD0000000ull);
+        p.rebarPresent = false;
+        p.rebarBytes = 0ull;
+        p.mapCap = kMaxBar0Full;
+        p.requireFullBar = true;
+        bool fellBack = false;
+        uint32_t fullReason = kOk;
+        const PlanOut o = plan_bar0_with_fallback(p, &fellBack, &fullReason);
+        expect(o.ok && fellBack && fullReason == kFullBarNotAssigned, "P14: 256 MiB without ReBAR cap falls back cleanly");
+    }
+
+    // 3) Full-BAR 8 GiB / 16 GiB succeeds directly without fallback.
+    for (uint64_t barLen : { 8 * GiB, 16 * GiB }) {
+        PlanIn p = mk(barLen, barLen);
+        p.vramBytes = barLen;
+        p.mapCap = kMaxBar0Full;
+        p.requireFullBar = true;
+        bool fellBack = true;
+        uint32_t fullReason = 99u;
+        const PlanOut o = plan_bar0_with_fallback(p, &fellBack, &fullReason);
+        expect(o.ok && !fellBack && fullReason == kOk && o.mapLen == barLen, "P14: matching Full-BAR succeeds directly");
+    }
+
+    // 4) Hazards & partial >1G BAR0 remain fail-closed with fellBack=false.
+    {
+        PlanIn p = mk(256 * MiB, 0xD0000000ull); p.ioLen = 0ull; p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kLenZero && p.requireFullBar, "P14: kLenZero fails closed");
+    }
+    {
+        PlanIn p = mk(256 * MiB, 0xD0000000ull); p.cfgAddr = 0xE0000000ull; p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kAddrMismatch && p.requireFullBar, "P14: kAddrMismatch fails closed");
+    }
+    {
+        PlanIn p = mk(256 * MiB, 0xD0000000ull); p.rebarBytes = 512 * MiB; p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kRebarMismatch && p.requireFullBar, "P14: kRebarMismatch fails closed");
+    }
+    {
+        PlanIn p = mk(256 * MiB, 0xD0000000ull); p.barOverlap = true; p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kBarOverlap && p.requireFullBar, "P14: kBarOverlap fails closed");
+    }
+    {
+        PlanIn p = mk(16 * GiB, 16 * GiB); p.rebarPresent = false; p.rebarBytes = 0ull; p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kNoRebarCap && p.requireFullBar, "P14: kNoRebarCap on 16 GiB fails closed");
+    }
+    {
+        PlanIn p = mk(4 * GiB, 4 * GiB); p.mapCap = kMaxBar0Full; p.requireFullBar = true;
+        bool fb = true;
+        const PlanOut o = plan_bar0_with_fallback(p, &fb);
+        expect(!o.ok && !fb && o.reason == kLenTooBig && p.requireFullBar, "P14: partial 4 GiB BAR0 on 16 GiB VRAM refuses cleanly");
+    }
+
+    // 5) Source pin: GarnetDriver::mapVramAperture calls plan_bar0_with_fallback and publishes BAR0,FullFallback.
+    const std::string b = slurp(root + "/src/garnet/src/GarnetDriver.cpp");
+    const std::string mv = between(b, "bool GarnetDriver::mapVramAperture() {", "// The plan again, now that the console is located");
+    expect(has(mv, "rdna4rebar::plan_bar0_with_fallback(") && has(mv, "\"BAR0,FullFallback\"") && has(mv, "\"BAR0,FullRefusalReason\""),
+           "P14 pin: mapVramAperture invokes plan_bar0_with_fallback and publishes FullFallback properties");
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
     p1_plan(); p2_census(); p3_pure(); p4_high(); p8_identity(); p3b_layout(); p10_pins664(root); p5_pins(root); p6_vramstat(root); p7_mesa(root);
-    p11_fullbar_policy(); p12_cpumap_bounds(); p13_bartest(root);
+    p11_fullbar_policy(); p12_cpumap_bounds(); p13_bartest(root); p14_smallbar_fallback(root);
     std::printf("native_rebar_test: %d checks, %d failed\n", gRun, gFail);
     return gFail == 0 ? 0 : 1;
 }
