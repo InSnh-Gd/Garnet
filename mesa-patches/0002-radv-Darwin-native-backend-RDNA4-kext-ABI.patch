@@ -1001,7 +1001,7 @@ index 9815937af3e..7aeb3cece7d 100644
     *bo = b;
     return 0;
  }
-@@ -323,49 +782,86 @@ int
+@@ -323,49 +782,87 @@ int
  acd_bo_export(acd_device_handle dev, amdgpu_bo_handle bo, enum amdgpu_bo_handle_type type,
                uint32_t *shared_handle)
  {
@@ -1040,11 +1040,12 @@ index 9815937af3e..7aeb3cece7d 100644
 +      r = acd_kext_bo_unmap(dev->core->kext, bo->handle, bo->cpu);
 +      bo->cpu = NULL;
 +   }
-+   int r2 = acd_kext_bo_free(dev->core->kext, bo->handle);
++   const uint32_t handle = bo->handle;
 +   pthread_mutex_lock(&dev->core->bo_lock);
-+   if (dev->core->bos[bo->handle] == bo)
-+      dev->core->bos[bo->handle] = NULL;
++   if (handle < RDNA4N_MAX_BOS && dev->core->bos[handle] == bo)
++      dev->core->bos[handle] = NULL;
 +   pthread_mutex_unlock(&dev->core->bo_lock);
++   int r2 = acd_kext_bo_free(dev->core->kext, handle);
     free(bo);
 -   return 0;
 +   return r2 ? r2 : r;
