@@ -1360,7 +1360,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 
 #if RDNA4_9D
 - (BOOL)supportsFamily:(NSInteger)family {
-    // Mac2, Common1..3, and Metal3 -> YES; Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal4, unknown -> NO.
+    // Mac1..2, Common1..3, and Metal3 -> YES; Apple1..10 (incl. Apple6), MacCatalyst, Metal4, unknown -> NO.
     return rdna4g_supports_family((long)family, rdna4_is_ws() ? 1 : 0) ? YES : NO;
 }
 - (BOOL)supportsFeatureSet:(NSUInteger)featureSet { return rdna4g_supports_feature_set((unsigned long)featureSet) ? YES : NO; }

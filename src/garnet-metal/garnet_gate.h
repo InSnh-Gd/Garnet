@@ -298,10 +298,12 @@ static inline void rdna4g_sync_result(rdna4g_sync *s, int found) {
 }
 
 // ---- the GPU family claim (bundle build 6, C1 finding B; Metal 3 parity Task 8.2) ----
-// Mac2, Common1..3, and Metal3 (AMD 6000-series parity) are advertised for both
+// Mac1..2 (Mac2 is a strict superset of Mac1 in Metal's hierarchy, required by MPS),
+// Common1..3, and Metal3 (AMD 6000-series parity) are advertised for both
 // applications and WindowServer. Apple Silicon families (Apple1..10, explicitly
-// including Apple6 despite GFX12 Sparse/PRT), Mac1, MacCatalyst, Metal4, and
+// including Apple6 despite GFX12 Sparse/PRT), MacCatalyst, Metal4, and
 // unknown values remain strictly NO.
+#define RDNA4G_FAMILY_MAC1     2001
 #define RDNA4G_FAMILY_MAC2     2002
 #define RDNA4G_FAMILY_COMMON1  3001
 #define RDNA4G_FAMILY_COMMON2  3002
@@ -312,9 +314,10 @@ static inline void rdna4g_sync_result(rdna4g_sync *s, int found) {
 static inline int rdna4g_supports_family(long family, int isWs) {
     (void)isWs;
     switch (family) {
-    case RDNA4G_FAMILY_MAC2: case RDNA4G_FAMILY_COMMON1: case RDNA4G_FAMILY_COMMON2: case RDNA4G_FAMILY_COMMON3:
+    case RDNA4G_FAMILY_MAC1: case RDNA4G_FAMILY_MAC2:
+    case RDNA4G_FAMILY_COMMON1: case RDNA4G_FAMILY_COMMON2: case RDNA4G_FAMILY_COMMON3:
     case RDNA4G_FAMILY_METAL3: return 1;
-    default: return 0;    // Apple1..10 (incl. Apple6), Mac1, MacCatalyst, Metal4, unknown
+    default: return 0;    // Apple1..10 (incl. Apple6), MacCatalyst, Metal4, unknown
     }
 }
 

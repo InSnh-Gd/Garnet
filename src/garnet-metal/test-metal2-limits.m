@@ -83,8 +83,9 @@ static NSUInteger callUInt1(id obj, SEL sel, MTLPixelFormat pf) {
 
 static void testCapabilityQueries(id<MTLDevice> dev) {
     // Family & FeatureSet queries (numeric IDs avoid SDK availability errors on -Werror)
-    check(callBoolInt(dev, @selector(supportsFamily:), 2002 /* Mac2 */),
-          @"query supportsFamily:Mac2 == YES");
+    check(callBoolInt(dev, @selector(supportsFamily:), 2001 /* Mac1 */) &&
+          callBoolInt(dev, @selector(supportsFamily:), 2002 /* Mac2 */),
+          @"query supportsFamily:Mac1..2 == YES");
     check(callBoolInt(dev, @selector(supportsFamily:), 3001 /* Common1 */) &&
           callBoolInt(dev, @selector(supportsFamily:), 3002 /* Common2 */) &&
           callBoolInt(dev, @selector(supportsFamily:), 3003 /* Common3 */),
@@ -94,12 +95,11 @@ static void testCapabilityQueries(id<MTLDevice> dev) {
     BOOL badFam = NO;
     for (NSInteger af = 1001; af <= 1010; af++) badFam |= callBoolInt(dev, @selector(supportsFamily:), af);
     check(!badFam &&
-          !callBoolInt(dev, @selector(supportsFamily:), 2001 /* Mac1 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 4001 /* MacCatalyst1 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 4002 /* MacCatalyst2 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 5002 /* Metal4 */) &&
           !callBoolInt(dev, @selector(supportsFamily:), 0),
-          @"query out-of-scope families (Apple1..10 incl. Apple6, Mac1, MacCatalyst, Metal4) == NO");
+          @"query out-of-scope families (Apple1..10 incl. Apple6, MacCatalyst, Metal4) == NO");
 
     check(callBool1(dev, @selector(supportsFeatureSet:), 10000) &&
           callBool1(dev, @selector(supportsFeatureSet:), 10001) &&

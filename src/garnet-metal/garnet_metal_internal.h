@@ -418,6 +418,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
 - (id)rdna4CurrentPrimData;
 - (id)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
 - (uint32_t)rdna4AccelKind;
+- (uint32_t)rdna4GeomIftBase;
 - (BOOL)rdna4IsBuilt;
 @end
 
@@ -2168,6 +2169,7 @@ typedef struct {
 - (rdna4rt_accel_meta_t)rdna4MetaSnapshot;
 - (void)rdna4SetMeta:(rdna4rt_accel_meta_t)meta;
 - (uint32_t)rdna4AccelKind;
+- (uint32_t)rdna4GeomIftBase;
 - (BOOL)rdna4IsBuilt;
 - (BOOL)rdna4AllowsRefit;
 - (BOOL)rdna4AllowsCompaction;

@@ -540,6 +540,20 @@ static void test_ift_encoder_and_dispatch_sim(void) {
     rdna4rtr_ift_simulate_dispatch_abi(w2, written2, RDNA4RTR_IFT_ABI_VERSION_V2, 1, 1u, 0u, 0, 1, &dr);
     CHECK(dr.computed_slot == 1u && dr.handle_id == 2u && !dr.out_of_bounds && dr.action == RDNA4RTR_DISPATCH_CALL_HANDLE,
           "v2 dispatch sim reads handle 2 at word[67]");
+
+    // Apple Sample 1 sphere dispatch: inst.iftOffset(0) + geom.iftOffset(2) -> vkInstanceSBT=2, geomIdx=0 -> IFT slot 2.
+    CHECK(rdna4rtr_ift_set_function(&t2, 2u, 1u, RDNA4RTR_IFT_KIND_BOUNDING_BOX) == RDNA4RTR_OK,
+          "v2 slot 2 -> sphereIntersectionFunction handle 1");
+    CHECK(rdna4rtr_ift_encode(&t2, w2, 72u, &written2) == RDNA4RTR_OK, "re-encode v2 IFT with slot 2");
+    rdna4rtr_ift_simulate_dispatch_abi(w2, written2, RDNA4RTR_IFT_ABI_VERSION_V2, 1, 0u + 2u, 0u, 0, 1, &dr);
+    CHECK(dr.computed_slot == 2u && dr.handle_id == 1u && !dr.out_of_bounds &&
+          dr.action == RDNA4RTR_DISPATCH_CALL_HANDLE,
+          "Apple Sample 1 sphere: combined SBT(0+2) + geom(0) -> slot 2 handle 1");
+    // Multi-geometry consecutive BLAS: inst(1) + geom_base(1) -> vkInstanceSBT=2, geomIdx=1 -> slot 3 (null AABB -> skip).
+    rdna4rtr_ift_simulate_dispatch_abi(w2, written2, RDNA4RTR_IFT_ABI_VERSION_V2, 1, 1u + 1u, 1u, 0, 1, &dr);
+    CHECK(dr.computed_slot == 3u && dr.handle_id == 0u && !dr.out_of_bounds &&
+          dr.action == RDNA4RTR_DISPATCH_SKIP_AABB,
+          "multi-geom consecutive: combined SBT(1+1) + geom(1) -> slot 3");
     rdna4rtr_ift_destroy(&t2);
     // Re-init empty dummy for trailing destroy below.
     (void)rdna4rtr_ift_init(&t, 0u, 0u);
@@ -961,6 +975,14 @@ static void test_source_pins(void) {
               "Wave 4.2 MTLHeap placement/automatic AS helpers and lifecycle retirement wired");
         CHECK(strstr(impl, "RDNA4R.ok ? (rdna4dc_metal3_raytracing_supported(&m3) ? 1u : 0u) : 1u") != NULL,
               "pre-open supportsRaytracing reports RDNA4-guaranteed RT hw caps with radv_open=0");
+        CHECK(strstr(impl, "intersectionFunctionTableOffset") != NULL &&
+              strstr(impl, "rdna4rt_geom_ift_acc_add") != NULL &&
+              strstr(impl, "rdna4rt_convert_instances_ex") != NULL &&
+              strstr(impl, "rdna4rt_state_apply_build_ex") != NULL &&
+              strstr(impl, "rdna4rt_state_apply_refit_ex") != NULL &&
+              strstr(impl, "rdna4rt_blas_table_entry_t") != NULL &&
+              strstr(impl, "rdna4GeomIftBase") != NULL,
+              "Wave 5 BLAS geometry intersectionFunctionTableOffset capture, propagation, and CPU+GPU TLAS combine wired");
         free(impl);
     }
 

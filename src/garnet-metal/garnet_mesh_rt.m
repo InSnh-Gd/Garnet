@@ -2512,6 +2512,7 @@ RDNA4_DNR(GarnetAccelerationStructure)
 }
 
 - (uint32_t)rdna4AccelKind { return (uint32_t)[self rdna4MetaSnapshot].kind; }
+- (uint32_t)rdna4GeomIftBase { return [self rdna4MetaSnapshot].geom_ift_base; }
 - (BOOL)rdna4IsBuilt { return [self rdna4MetaSnapshot].state != RDNA4RT_STATE_UNBUILT; }
 - (BOOL)rdna4AllowsRefit { return [self rdna4MetaSnapshot].allow_refit != 0u; }
 - (BOOL)rdna4AllowsCompaction { return [self rdna4MetaSnapshot].allow_compaction != 0u; }
@@ -2553,6 +2554,7 @@ typedef struct {
     uint64_t usage;
     uint32_t vkBuildFlags;
     uint32_t geomCount;
+    uint32_t geomIftBase;
     uint64_t topologyHash;
     VkAccelerationStructureGeometryKHR *vkGeoms;
     VkAccelerationStructureBuildRangeInfoKHR *vkRanges;
@@ -2805,12 +2807,22 @@ static BOOL rdna4_rt_build_plan_make_ex(
         Class motionTriCls = objc_getClass("MTLAccelerationStructureMotionTriangleGeometryDescriptor");
         Class motionBoxCls = objc_getClass("MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor");
         int hasTriangles = 0;
+        rdna4rt_geom_ift_acc_t geomIftAcc = { 0u, 0u, 0 };
 
         for (NSUInteger i = 0; i < gcount; i++) {
             MTLAccelerationStructureGeometryDescriptor *gd = geoms[i];
             if (!gd) {
                 free(geomSigs); rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, @"nil geometry descriptor in BLAS");
+                return NO;
+            }
+            NSUInteger geomIftOff = [gd respondsToSelector:@selector(intersectionFunctionTableOffset)]
+                ? gd.intersectionFunctionTableOffset : 0u;
+            rdna4rt_err_t iftErr = rdna4rt_geom_ift_acc_add(&geomIftAcc, (uint64_t)geomIftOff);
+            if (iftErr != RDNA4RT_OK) {
+                free(geomSigs); rdna4_rt_plan_free(plan);
+                if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"geometry[%lu] intersectionFunctionTableOffset: %s",
+                                                (unsigned long)i, rdna4rt_err_str(iftErr)]);
                 return NO;
             }
             if ((motionTriCls && [gd isKindOfClass:motionTriCls]) ||
@@ -3081,6 +3093,11 @@ static BOOL rdna4_rt_build_plan_make_ex(
             if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(totErr)]);
             return NO;
         }
+        plan->geomIftBase = geomIftAcc.base;
+        if (requireBuffers && geomIftAcc.non_consecutive) {
+            RDNA4LOGR("rt-accel: multi-geometry BLAS (%u geoms) uses non-consecutive intersectionFunctionTableOffset values (base=%u); Vulkan ray queries index IFT as instanceSBT + geomIdx",
+                      plan->geomCount, geomIftAcc.base);
+        }
         plan->vkBuildFlags = rdna4rt_blas_build_flags_with_caps(plan->vkBuildFlags, hasTriangles, &m3);
         plan->topologyHash = rdna4rt_topology_hash(geomSigs, plan->maxPrimCounts, plan->geomCount);
         free(geomSigs);
@@ -3143,15 +3160,16 @@ static BOOL rdna4_rt_build_plan_make_ex(
         if (requireBuffers && tplan.instance_count > 0u) {
             NSUInteger blasCount = (descType == RDNA4RT_INST_DESC_INDIRECT) ? 0u : blasList.count;
             uint64_t *blasAddrs = blasCount ? (uint64_t *)calloc(blasCount, sizeof(*blasAddrs)) : NULL;
-            if (blasCount && !blasAddrs) {
-                rdna4_rt_plan_free(plan);
+            uint32_t *blasIftOffsets = blasCount ? (uint32_t *)calloc(blasCount, sizeof(*blasIftOffsets)) : NULL;
+            if (blasCount && (!blasAddrs || !blasIftOffsets)) {
+                free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, @"out of host memory collecting BLAS addresses");
                 return NO;
             }
             for (NSUInteger bi = 0; bi < blasCount; bi++) {
                 id obj = blasList[bi];
                 if (![obj isKindOfClass:[GarnetAccelerationStructure class]] || [(GarnetAccelerationStructure *)obj device] != dev) {
-                    free(blasAddrs); rdna4_rt_plan_free(plan);
+                    free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"instancedAccelerationStructures[%lu] is not an GarnetAccelerationStructure on this device", (unsigned long)bi]);
                     return NO;
                 }
@@ -3160,11 +3178,12 @@ static BOOL rdna4_rt_build_plan_make_ex(
                 GarnetASHandle *bhandle = [blas rdna4CurrentHandle];
                 if (bmeta.kind != RDNA4RT_KIND_BLAS || bmeta.state == RDNA4RT_STATE_UNBUILT ||
                     !bhandle || !bhandle->_deviceAddress) {
-                    free(blasAddrs); rdna4_rt_plan_free(plan);
+                    free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"instancedAccelerationStructures[%lu] is not a built BLAS", (unsigned long)bi]);
                     return NO;
                 }
                 blasAddrs[bi] = bhandle->_deviceAddress;
+                blasIftOffsets[bi] = bmeta.geom_ift_base;
                 [retainedObjects addObject:blas];
                 [retainedObjects addObject:bhandle];
                 GarnetASPrimData *bprim = [blas rdna4CurrentPrimData];
@@ -3176,25 +3195,38 @@ static BOOL rdna4_rt_build_plan_make_ex(
 
             uint64_t stageBytes = 0;
             if (!rdna4rt_mul_u64((uint64_t)tplan.instance_count, RDNA4RT_VK_INSTANCE_SIZE, &stageBytes)) {
-                free(blasAddrs); rdna4_rt_plan_free(plan);
+                free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, @"TLAS instance staging size overflow");
                 return NO;
             }
             RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:stageBytes error:err];
-            if (!stg) { free(blasAddrs); rdna4_rt_plan_free(plan); return NO; }
+            if (!stg) { free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan); return NO; }
 
             if (![instBuf contents]) {
                 /* GPU compute conversion for MTLStorageModePrivate instanceDescriptorBuffer. */
                 uint64_t blasTableAddr = 0u;
                 if (blasCount > 0u) {
-                    uint64_t tblBytes = (uint64_t)blasCount * sizeof(uint64_t);
+                    uint64_t tblBytes = 0u;
+                    if (!rdna4rt_mul_u64((uint64_t)blasCount, (uint64_t)sizeof(rdna4rt_blas_table_entry_t), &tblBytes)) {
+                        free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan);
+                        if (err) *err = rdna4_err(145, @"TLAS BLAS table size overflow");
+                        return NO;
+                    }
                     RDNA4RTStagingBuffer *blasTbl = [[RDNA4RTStagingBuffer alloc] initWithSize:tblBytes error:err];
-                    if (!blasTbl) { free(blasAddrs); rdna4_rt_plan_free(plan); return NO; }
-                    memcpy(blasTbl->_map, blasAddrs, (size_t)tblBytes);
+                    if (!blasTbl) { free(blasAddrs); free(blasIftOffsets); rdna4_rt_plan_free(plan); return NO; }
+                    rdna4rt_blas_table_entry_t *entries = (rdna4rt_blas_table_entry_t *)blasTbl->_map;
+                    for (NSUInteger bi = 0; bi < blasCount; bi++) {
+                        entries[bi] = (rdna4rt_blas_table_entry_t){
+                            .bda = blasAddrs[bi],
+                            .geom_ift_base = blasIftOffsets[bi],
+                            ._pad = 0u
+                        };
+                    }
                     blasTableAddr = blasTbl->_addr;
                     [retainedObjects addObject:blasTbl];
                 }
                 free(blasAddrs);
+                free(blasIftOffsets);
                 uint64_t srcAddr = 0u;
                 if (!rdna4rt_add_u64([instBuf gpuAddress], tdesc.inst_buf_offset, &srcAddr)) {
                     rdna4_rt_plan_free(plan);
@@ -3213,11 +3245,12 @@ static BOOL rdna4_rt_build_plan_make_ex(
                     .blas_count = (uint32_t)blasCount
                 };
             } else {
-                rdna4rt_err_t ce = rdna4rt_convert_instances(
+                rdna4rt_err_t ce = rdna4rt_convert_instances_ex(
                     tdesc.descriptor_type, (const uint8_t *)[instBuf contents], (size_t)[instBuf length],
                     tdesc.inst_buf_offset, tplan.stride, tplan.instance_count,
-                    blasAddrs, (uint32_t)blasCount, (rdna4rt_vk_instance_t *)stg->_map);
+                    blasAddrs, blasIftOffsets, (uint32_t)blasCount, (rdna4rt_vk_instance_t *)stg->_map);
                 free(blasAddrs);
+                free(blasIftOffsets);
                 if (ce != RDNA4RT_OK) {
                     rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"TLAS instance conversion failed: %s", rdna4rt_err_str(ce)]);
@@ -3759,8 +3792,8 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     }
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
-    (void)rdna4rt_state_apply_build(&dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
-                                    plan.usage, plan.geomCount, plan.topologyHash);
+    (void)rdna4rt_state_apply_build_ex(&dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
+                                       plan.usage, plan.geomCount, plan.topologyHash, plan.geomIftBase);
     [dstAS rdna4SetMeta:dstMeta];
     rdna4_rt_plan_free(&plan);
 }
@@ -3950,9 +3983,9 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
     }
 
-    (void)rdna4rt_state_apply_refit(
+    (void)rdna4rt_state_apply_refit_ex(
         &srcMeta, &dstMeta, plan.kind, reqAsSize,
-        plan.geomCount, checkTopo, (uint64_t)options);
+        plan.geomCount, checkTopo, (uint64_t)options, plan.geomIftBase);
     [dstAS rdna4SetMeta:dstMeta];
     rdna4_rt_plan_free(&plan);
 }

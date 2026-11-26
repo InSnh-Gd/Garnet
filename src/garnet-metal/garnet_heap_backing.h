@@ -311,12 +311,12 @@ static inline int rdna4hb_alloc(rdna4hb_heap *h, uint64_t size, uint64_t alignme
     }
     uint64_t remaining = h->backing < h->size ? h->size - h->backing : 0;
     if (remaining < need) return rdna4hb_has_reclaimable(h) ? RDNA4HB_R_RETRY : RDNA4HB_R_NO_SPACE;
-    // A partial slab must not consume capacity needed by another memory class.
-    if (out->block_size > remaining) out->block_size = need;
-    if (out->block_size < need) {
-        if (!dedicated && need <= h->max_normal) out->block_size = remaining;
-        if (out->block_size < need) return rdna4hb_has_reclaimable(h) ? RDNA4HB_R_RETRY : RDNA4HB_R_NO_SPACE;
-    }
+    // A speculative slab may consume at most half the unbacked remainder;
+    // otherwise allocate the exact extent so tight heaps never strand a
+    // sub-slab tail or starve larger allocations / other memory classes.
+    if (out->block_size > need &&
+        (out->block_size > remaining || remaining - out->block_size < out->block_size))
+        out->block_size = need;
     out->range_size = need;
     return RDNA4HB_R_NEED_BLOCK;
 }

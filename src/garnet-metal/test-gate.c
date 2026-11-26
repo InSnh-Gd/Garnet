@@ -166,10 +166,10 @@ int main(int argc, char **argv) {
     }
     // ---- G14 (build 6, C1 finding B; Metal 3 parity Task 8.2): the GPU family claim ----
     CHECK("G14: Metal3 (5001) is claimed for apps and WindowServer", rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 0) && rdna4g_supports_family(RDNA4G_FAMILY_METAL3, 1) && RDNA4G_FAMILY_METAL3 == 5001);
-    CHECK("G14: Mac2 and Common1..3 are kept", rdna4g_supports_family(2002, 0) && rdna4g_supports_family(3001, 0) && rdna4g_supports_family(3002, 0) && rdna4g_supports_family(3003, 0) && rdna4g_supports_family(3001, 1));
-    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 2001, 4001, 4002, 5002, 6001, 0, -1, 99999 };
+    CHECK("G14: Mac1..2 and Common1..3 are kept", rdna4g_supports_family(RDNA4G_FAMILY_MAC1, 0) && rdna4g_supports_family(RDNA4G_FAMILY_MAC1, 1) && RDNA4G_FAMILY_MAC1 == 2001 && rdna4g_supports_family(2002, 0) && rdna4g_supports_family(3001, 0) && rdna4g_supports_family(3002, 0) && rdna4g_supports_family(3003, 0) && rdna4g_supports_family(3001, 1));
+    { int any = 0; static const long no[] = { 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 4001, 4002, 5002, 6001, 0, -1, 99999 };
       for (unsigned i = 0; i < sizeof no / sizeof no[0]; i++) any |= rdna4g_supports_family(no[i], 0) | rdna4g_supports_family(no[i], 1);
-      CHECK("G14: Apple1..10 (incl. Apple6), Mac1, MacCatalyst1..2, Metal4 and unknown values are all NO", !any); }
+      CHECK("G14: Apple1..10 (incl. Apple6), MacCatalyst1..2, Metal4 and unknown values are all NO", !any); }
     CHECK("G14: argument buffer tier constants", RDNA4G_ARGBUF_TIER1 == 0 && RDNA4G_ARGBUF_TIER2 == 1);
     { static const unsigned long yes_fs[] = {
           RDNA4G_FS_MACOS_GPUFAMILY1_V1, RDNA4G_FS_MACOS_GPUFAMILY1_V2,

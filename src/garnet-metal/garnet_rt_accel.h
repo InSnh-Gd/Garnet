@@ -1022,11 +1022,68 @@ static inline rdna4rt_barrier_spec_t rdna4rt_barrier_spec(rdna4rt_barrier_kind_t
     return s;
 }
 
-/* Convert Default (64B), UserID (68B), or Indirect (72B) Metal instance descriptor buffer -> Vulkan 64B instances. */
-static inline rdna4rt_err_t rdna4rt_convert_instances(
+/* Validate and accumulate BLAS per-geometry intersectionFunctionTableOffset values.
+ * Metal evaluates ift_slot = instance.iftOffset + geometry[g].iftOffset + fto.
+ * Vulkan ray query evaluates instanceSBT + geometryIndex + fto, which matches
+ * Metal exactly for every geometry g whenever geometry[g].iftOffset == base + g
+ * (including every single-geometry BLAS). Sets non_consecutive = 1 if any
+ * multi-geometry BLAS deviates from base + g so runtime can log a diagnostic. */
+typedef struct {
+    uint32_t count;
+    uint32_t base;
+    int non_consecutive;
+} rdna4rt_geom_ift_acc_t;
+
+static inline rdna4rt_err_t rdna4rt_geom_ift_acc_add(
+    rdna4rt_geom_ift_acc_t *acc, uint64_t geom_ift_offset) {
+    if (!acc) return RDNA4RT_ERR_INVALID_ARG;
+    if (geom_ift_offset > (uint64_t)RDNA4RT_INSTANCE_SBT_OFFSET_MAX)
+        return RDNA4RT_ERR_OUT_OF_RANGE_INDEX;
+    if (acc->count == 0u) {
+        acc->base = (uint32_t)geom_ift_offset;
+    } else if (geom_ift_offset != (uint64_t)acc->base + (uint64_t)acc->count) {
+        acc->non_consecutive = 1;
+    }
+    acc->count++;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_compute_geom_ift_base(
+    const uint64_t *geom_ift_offsets, uint32_t geom_count,
+    uint32_t *base_out, int *non_consecutive_out) {
+    if (!base_out) return RDNA4RT_ERR_INVALID_ARG;
+    *base_out = 0u;
+    if (non_consecutive_out) *non_consecutive_out = 0;
+    if (geom_count == 0u) return RDNA4RT_OK;
+    if (!geom_ift_offsets) return RDNA4RT_ERR_INVALID_ARG;
+    rdna4rt_geom_ift_acc_t acc = { 0u, 0u, 0 };
+    for (uint32_t g = 0u; g < geom_count; g++) {
+        rdna4rt_err_t e = rdna4rt_geom_ift_acc_add(&acc, geom_ift_offsets[g]);
+        if (e != RDNA4RT_OK) return e;
+    }
+    *base_out = acc.base;
+    if (non_consecutive_out) *non_consecutive_out = acc.non_consecutive;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_combine_sbt_offset(
+    uint32_t inst_ift_offset, uint32_t geom_ift_base, uint32_t *out) {
+    if (!out) return RDNA4RT_ERR_INVALID_ARG;
+    uint64_t sum = (uint64_t)inst_ift_offset + (uint64_t)geom_ift_base;
+    if (sum > (uint64_t)RDNA4RT_INSTANCE_SBT_OFFSET_MAX)
+        return RDNA4RT_ERR_OUT_OF_RANGE_INDEX;
+    *out = (uint32_t)sum;
+    return RDNA4RT_OK;
+}
+
+/* Convert Default (64B), UserID (68B), or Indirect (72B) Metal instance descriptor buffer -> Vulkan 64B instances.
+ * When blas_ift_offsets != NULL (Default/UserID), adds blas_ift_offsets[accel_struct_index] into
+ * VkAccelerationStructureInstanceKHR.instanceShaderBindingTableRecordOffset with 24-bit overflow checks. */
+static inline rdna4rt_err_t rdna4rt_convert_instances_ex(
     rdna4rt_inst_desc_type_t type, const uint8_t *src_bytes, size_t src_len,
     uint64_t src_offset, uint64_t stride, uint32_t count,
-    const uint64_t *blas_addrs, uint32_t blas_count, rdna4rt_vk_instance_t *dst) {
+    const uint64_t *blas_addrs, const uint32_t *blas_ift_offsets,
+    uint32_t blas_count, rdna4rt_vk_instance_t *dst) {
     if (count == 0u) return RDNA4RT_OK;
     if (!src_bytes || !dst) return RDNA4RT_ERR_INVALID_ARG;
     uint64_t min_size = (type == RDNA4RT_INST_DESC_DEFAULT) ? RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE :
@@ -1065,14 +1122,27 @@ static inline rdna4rt_err_t rdna4rt_convert_instances(
         rdna4rt_err_t re = rdna4rt_resolve_blas_ref(
             raw.accel_struct_index, raw.mask, blas_addrs, blas_count, &blas_ref);
         if (re != RDNA4RT_OK) return re;
+        uint32_t geom_ift = blas_ift_offsets ? blas_ift_offsets[raw.accel_struct_index] : 0u;
+        uint32_t combined_sbt = 0u;
+        rdna4rt_err_t se = rdna4rt_combine_sbt_offset(
+            raw.intersection_function_offset, geom_ift, &combined_sbt);
+        if (se != RDNA4RT_OK) return se;
         rdna4rt_vk_transform_t xf;
         rdna4rt_err_t te = rdna4rt_transpose_4x3_to_3x4(&raw.transform, &xf);
         if (te != RDNA4RT_OK) return te;
         rdna4rt_err_t pe = rdna4rt_pack_vk_instance(
-            &xf, custom_id, raw.mask, raw.intersection_function_offset, raw.options, blas_ref, &dst[i]);
+            &xf, custom_id, raw.mask, combined_sbt, raw.options, blas_ref, &dst[i]);
         if (pe != RDNA4RT_OK) return pe;
     }
     return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_convert_instances(
+    rdna4rt_inst_desc_type_t type, const uint8_t *src_bytes, size_t src_len,
+    uint64_t src_offset, uint64_t stride, uint32_t count,
+    const uint64_t *blas_addrs, uint32_t blas_count, rdna4rt_vk_instance_t *dst) {
+    return rdna4rt_convert_instances_ex(
+        type, src_bytes, src_len, src_offset, stride, count, blas_addrs, NULL, blas_count, dst);
 }
 
 /* Convert one Metal motion instance descriptor at eval_time -> packed 64B Vulkan instance
@@ -1160,6 +1230,7 @@ typedef struct {
     uint32_t geometry_count;
     uint64_t topology_hash;
     uint32_t compacted_queried;
+    uint32_t geom_ift_base;
 } rdna4rt_accel_meta_t;
 
 static inline void rdna4rt_meta_init(
@@ -1224,6 +1295,20 @@ static inline rdna4rt_err_t rdna4rt_state_apply_build(
     dst->geometry_count = geom_count;
     dst->topology_hash = topology_hash;
     dst->compacted_queried = 0u;
+    dst->geom_ift_base = 0u;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_state_apply_build_ex(
+    rdna4rt_accel_meta_t *dst, rdna4rt_kind_t kind, uint64_t required_as_size,
+    uint64_t usage, uint32_t geom_count, uint64_t topology_hash,
+    uint32_t geom_ift_base) {
+    if (geom_ift_base > RDNA4RT_INSTANCE_SBT_OFFSET_MAX)
+        return RDNA4RT_ERR_OUT_OF_RANGE_INDEX;
+    rdna4rt_err_t e = rdna4rt_state_apply_build(
+        dst, kind, required_as_size, usage, geom_count, topology_hash);
+    if (e != RDNA4RT_OK) return e;
+    dst->geom_ift_base = (kind == RDNA4RT_KIND_BLAS) ? geom_ift_base : 0u;
     return RDNA4RT_OK;
 }
 
@@ -1290,6 +1375,7 @@ static inline rdna4rt_err_t rdna4rt_state_apply_compact(
     dst->geometry_count = src->geometry_count;
     dst->topology_hash = src->topology_hash;
     dst->compacted_queried = 0u;
+    dst->geom_ift_base = src->geom_ift_base;
     return RDNA4RT_OK;
 }
 
@@ -1343,6 +1429,19 @@ static inline rdna4rt_err_t rdna4rt_state_apply_refit(
     dst->allow_refit = 1u;
     dst->allow_compaction = 1u;
     dst->compacted_queried = 0u;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_state_apply_refit_ex(
+    const rdna4rt_accel_meta_t *src, rdna4rt_accel_meta_t *dst,
+    rdna4rt_kind_t kind, uint64_t required_as_size, uint32_t geom_count,
+    uint64_t topology_hash, uint64_t refit_options, uint32_t geom_ift_base) {
+    if (geom_ift_base > RDNA4RT_INSTANCE_SBT_OFFSET_MAX)
+        return RDNA4RT_ERR_OUT_OF_RANGE_INDEX;
+    rdna4rt_err_t e = rdna4rt_state_apply_refit(
+        src, dst, kind, required_as_size, geom_count, topology_hash, refit_options);
+    if (e != RDNA4RT_OK) return e;
+    if (kind == RDNA4RT_KIND_BLAS) dst->geom_ift_base = geom_ift_base;
     return RDNA4RT_OK;
 }
 

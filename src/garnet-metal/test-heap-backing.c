@@ -235,6 +235,78 @@ int main(void) {
     CHECK("all random leases retire", h.nlease == 0, "leases %zu", h.nlease);
     rdna4hb_destroy(&h);
 
+    // Apple Sample 2 tight MTLHeapTypeAutomatic AS sequence:
+    // heap=29,229,056 B, 3 BLASes (24,949,248 + 164,608 + 4,103,168 = 29,217,024 B).
+    // Previously BLAS #1 rounded up to 4 MiB, stranding 85,504 B and failing BLAS #2.
+    rdna4hb_init(&h, 29229056ULL, RDNA4HB_MAX_NORMAL);
+    const uint64_t sample2_sizes[3] = { 24949248ULL, 164608ULL, 4103168ULL };
+    int sample2_ok = 1;
+    uint64_t sample2_max_after_1 = 0;
+    for (int i = 0; i < 3; i++) {
+        k = rdna4hb_alloc(&h, sample2_sizes[i], 256, 256, 1, 0, 0, 0, NULL, &r);
+        if (k == RDNA4HB_R_NEED_BLOCK) {
+            if (!add(&h, r.block_size, 0, 0, 0, r.exclusive, (uintptr_t)(0x9000 + i * 0x100), &block)) {
+                sample2_ok = 0;
+                break;
+            }
+            k = rdna4hb_alloc(&h, sample2_sizes[i], 256, 256, 1, 0, 0, 0, NULL, &r);
+        }
+        if (k != RDNA4HB_R_OK) { sample2_ok = 0; break; }
+        if (i == 1) sample2_max_after_1 = rdna4hb_max_available(&h, 256, 256, 0);
+    }
+    CHECK("Apple Sample 2 tight Automatic heap allocates all 3 BLASes without tail stranding",
+          sample2_ok && h.backing == 29217024ULL && h.backing <= h.size && sample2_max_after_1 >= 4103168ULL,
+          "ok %d backing %llu/%llu max_after_1 %llu", sample2_ok,
+          (unsigned long long)h.backing, (unsigned long long)h.size, (unsigned long long)sample2_max_after_1);
+    rdna4hb_destroy(&h);
+
+    // Same tight remainder with mixed memory classes (dedicated image / different memoryTypeBits).
+    rdna4hb_init(&h, 29229056ULL, RDNA4HB_MAX_NORMAL);
+    int mixed_ok = 1;
+    k = rdna4hb_alloc(&h, 24949248ULL, 256, 256, 1, 0, 0, 0, NULL, &r);
+    mixed_ok &= (k == RDNA4HB_R_NEED_BLOCK && add(&h, r.block_size, 0, 0, 0, 0, 0x9400, &block) &&
+                 rdna4hb_alloc(&h, 24949248ULL, 256, 256, 1, 0, 0, 0, NULL, &r) == RDNA4HB_R_OK);
+    k = rdna4hb_alloc(&h, 164608ULL, 256, 256, 1, 0, 0, 0, NULL, &r);
+    mixed_ok &= (k == RDNA4HB_R_NEED_BLOCK && r.block_size == 164608ULL &&
+                 add(&h, r.block_size, 0, 0, 0, 0, 0x9500, &block) &&
+                 rdna4hb_alloc(&h, 164608ULL, 256, 256, 1, 0, 0, 0, NULL, &r) == RDNA4HB_R_OK);
+    k = rdna4hb_alloc(&h, 4103168ULL, 256, 256, 2, 0, 0, 1, NULL, &r);
+    mixed_ok &= (k == RDNA4HB_R_NEED_BLOCK && r.dedicated && r.block_size == 4103168ULL &&
+                 add(&h, r.block_size, 1, 0, 1, 0, 0x9600, &block) &&
+                 rdna4hb_alloc(&h, 4103168ULL, 256, 256, 2, 0, 0, 1, NULL, &r) == RDNA4HB_R_OK);
+    CHECK("tight remainder preserves capacity for a different dedicated memory class",
+          mixed_ok && h.backing == 29217024ULL,
+          "ok %d backing %llu", mixed_ok, (unsigned long long)h.backing);
+    rdna4hb_destroy(&h);
+
+    // Tight 5 MiB and 7.9 MiB heaps (in [4 MiB, 8 MiB)) never strand tails or starve mixed classes.
+    rdna4hb_init(&h, 5 * MIB, RDNA4HB_MAX_NORMAL);
+    k = rdna4hb_alloc(&h, 164 * KIB, 256, 256, 1, 0, 0, 0, NULL, &r);
+    int tight5 = (k == RDNA4HB_R_NEED_BLOCK && r.block_size == 164 * KIB &&
+                  add(&h, r.block_size, 0, 0, 0, 0, 0x9700, &block) &&
+                  rdna4hb_alloc(&h, 164 * KIB, 256, 256, 1, 0, 0, 0, NULL, &r) == RDNA4HB_R_OK);
+    k = rdna4hb_alloc(&h, 4900 * KIB, 256, 256, 1, 0, 0, 0, NULL, &r);
+    tight5 &= (k == RDNA4HB_R_NEED_BLOCK && r.block_size == 4900 * KIB &&
+               add(&h, r.block_size, 0, 0, 0, 0, 0x9800, &block) &&
+               rdna4hb_alloc(&h, 4900 * KIB, 256, 256, 1, 0, 0, 0, NULL, &r) == RDNA4HB_R_OK);
+    CHECK("tight 5 MiB heap satisfies 164 KiB + 4900 KiB", tight5 && h.backing <= h.size,
+          "ok %d backing %llu/%llu", tight5, (unsigned long long)h.backing, (unsigned long long)h.size);
+    rdna4hb_destroy(&h);
+
+    rdna4hb_init(&h, 6 * MIB, RDNA4HB_MAX_NORMAL);
+    k = rdna4hb_alloc(&h, 1024, 256, 256, 1, 0, 0, 0, NULL, &r);
+    int mixed6 = (k == RDNA4HB_R_NEED_BLOCK && r.block_size == 1024 &&
+                  add(&h, r.block_size, 0, 0, 0, 0, 0x9900, &block) &&
+                  rdna4hb_alloc(&h, 1024, 256, 256, 1, 0, 0, 0, NULL, &r) == RDNA4HB_R_OK);
+    k = rdna4hb_alloc(&h, 5 * MIB, 256, 256, 2, 0, 0, 1, NULL, &r);
+    mixed6 &= (k == RDNA4HB_R_NEED_BLOCK && r.dedicated && r.block_size == 5 * MIB &&
+               add(&h, r.block_size, 1, 0, 1, 0, 0x9a00, &block) &&
+               rdna4hb_alloc(&h, 5 * MIB, 256, 256, 2, 0, 0, 1, NULL, &r) == RDNA4HB_R_OK);
+    CHECK("6 MiB mixed-class heap retains 5 MiB for dedicated image after 1 KiB buffer",
+          mixed6 && h.backing <= h.size,
+          "ok %d backing %llu/%llu", mixed6, (unsigned long long)h.backing, (unsigned long long)h.size);
+    rdna4hb_destroy(&h);
+
     printf(fails ? "FAIL test-heap-backing (%d)\n" : "PASS test-heap-backing\n", fails);
     return fails ? 1 : 0;
 }

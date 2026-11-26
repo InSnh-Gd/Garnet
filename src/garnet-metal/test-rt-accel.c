@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "garnet_rt_accel.h"
+#include "garnet_rt_spv.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -991,6 +992,160 @@ static void test_wave4_prim_and_query_pools(void) {
           "query pool LIFO pop drains all 8 handles cleanly");
 }
 
+static void test_wave5_geom_ift_offset_and_spv(void) {
+    /* 1. BLAS geometry intersectionFunctionTableOffset extraction & consecutive validation. */
+    uint32_t base = 99u;
+    int non_consec = 1;
+    CHECK(rdna4rt_compute_geom_ift_base(NULL, 0u, &base, &non_consec) == RDNA4RT_OK &&
+          base == 0u && non_consec == 0,
+          "empty BLAS yields geom_ift_base=0, consecutive");
+
+    const uint64_t apple_sphere[1] = { 2u };
+    CHECK(rdna4rt_compute_geom_ift_base(apple_sphere, 1u, &base, &non_consec) == RDNA4RT_OK &&
+          base == 2u && non_consec == 0,
+          "Apple Sample 1 sphere BLAS (1 geom, iftOffset=2) -> base=2, consecutive");
+
+    const uint64_t consec[3] = { 4u, 5u, 6u };
+    CHECK(rdna4rt_compute_geom_ift_base(consec, 3u, &base, &non_consec) == RDNA4RT_OK &&
+          base == 4u && non_consec == 0,
+          "consecutive multi-geom offsets [4,5,6] -> base=4, non_consecutive=0");
+
+    const uint64_t nonconsec_gap[2] = { 2u, 5u };
+    CHECK(rdna4rt_compute_geom_ift_base(nonconsec_gap, 2u, &base, &non_consec) == RDNA4RT_OK &&
+          base == 2u && non_consec == 1,
+          "non-consecutive multi-geom offsets [2,5] -> base=2, non_consecutive=1");
+
+    const uint64_t nonconsec_dup[2] = { 0u, 0u };
+    CHECK(rdna4rt_compute_geom_ift_base(nonconsec_dup, 2u, &base, &non_consec) == RDNA4RT_OK &&
+          base == 0u && non_consec == 1,
+          "duplicate multi-geom offsets [0,0] flagged non_consecutive=1");
+
+    const uint64_t oob_geom[1] = { (uint64_t)RDNA4RT_INSTANCE_SBT_OFFSET_MAX + 1u };
+    CHECK(rdna4rt_compute_geom_ift_base(oob_geom, 1u, &base, &non_consec) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "geometry iftOffset > 24-bit rejected");
+
+    const uint64_t oob_geom2[2] = { 0u, (uint64_t)RDNA4RT_INSTANCE_SBT_OFFSET_MAX + 1u };
+    CHECK(rdna4rt_compute_geom_ift_base(oob_geom2, 2u, &base, &non_consec) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "second geometry iftOffset > 24-bit rejected");
+
+    /* 2. Overflow-safe SBT offset combination. */
+    uint32_t comb = 0u;
+    CHECK(rdna4rt_combine_sbt_offset(0u, 2u, &comb) == RDNA4RT_OK && comb == 2u,
+          "combine 0 + 2 == 2 (Apple Sample 1 sphere)");
+    CHECK(rdna4rt_combine_sbt_offset(5u, 2u, &comb) == RDNA4RT_OK && comb == 7u,
+          "combine 5 + 2 == 7");
+    CHECK(rdna4rt_combine_sbt_offset(RDNA4RT_INSTANCE_SBT_OFFSET_MAX, 0u, &comb) == RDNA4RT_OK &&
+          comb == RDNA4RT_INSTANCE_SBT_OFFSET_MAX,
+          "combine max + 0 == max");
+    CHECK(rdna4rt_combine_sbt_offset(RDNA4RT_INSTANCE_SBT_OFFSET_MAX, 1u, &comb) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "combine 0x00FFFFFF + 1 rejected as 24-bit overflow");
+    CHECK(rdna4rt_combine_sbt_offset(UINT32_MAX, 2u, &comb) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "combine UINT32_MAX + 2 rejected without u32 wraparound");
+
+    /* 3. Lifecycle propagation of geom_ift_base across build / refit / copy / compact / rebuild. */
+    rdna4rt_accel_meta_t blas, copied, compacted, refitted, tlas;
+    rdna4rt_meta_init(&blas, 4096u, RDNA4RT_KIND_UNKNOWN);
+    rdna4rt_meta_init(&copied, 4096u, RDNA4RT_KIND_UNKNOWN);
+    rdna4rt_meta_init(&compacted, 2048u, RDNA4RT_KIND_UNKNOWN);
+    rdna4rt_meta_init(&refitted, 4096u, RDNA4RT_KIND_UNKNOWN);
+    rdna4rt_meta_init(&tlas, 4096u, RDNA4RT_KIND_UNKNOWN);
+    uint32_t sig[1] = { rdna4rt_geom_sig(RDNA4RT_GEOM_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, 0u) };
+    uint32_t pc[1] = { 1u };
+    uint64_t topo = rdna4rt_topology_hash(sig, pc, 1u);
+
+    CHECK(rdna4rt_state_apply_build_ex(&blas, RDNA4RT_KIND_BLAS, 2048u, RDNA4RT_USAGE_REFIT, 1u, topo, 2u) == RDNA4RT_OK &&
+          blas.geom_ift_base == 2u,
+          "build_ex stores BLAS geom_ift_base=2");
+    CHECK(rdna4rt_state_apply_copy(&blas, &copied, 0) == RDNA4RT_OK && copied.geom_ift_base == 2u,
+          "copy propagates geom_ift_base=2");
+    CHECK(rdna4rt_state_apply_compact(&blas, &compacted, 0, 1024u) == RDNA4RT_OK && compacted.geom_ift_base == 2u,
+          "copyAndCompact propagates geom_ift_base=2 (Apple Sample 1 sphere path)");
+    CHECK(rdna4rt_state_apply_refit(&blas, &refitted, RDNA4RT_KIND_BLAS, 2048u, 1u, topo, RDNA4RT_REFIT_OPT_VERTEX_DATA) == RDNA4RT_OK &&
+          refitted.geom_ift_base == 2u,
+          "refit preserves geom_ift_base=2");
+    CHECK(rdna4rt_state_apply_refit_ex(&blas, &refitted, RDNA4RT_KIND_BLAS, 2048u, 1u, topo, RDNA4RT_REFIT_OPT_VERTEX_DATA, 5u) == RDNA4RT_OK &&
+          refitted.geom_ift_base == 5u,
+          "refit_ex updates BLAS geom_ift_base=5");
+    CHECK(rdna4rt_state_apply_build(&blas, RDNA4RT_KIND_BLAS, 2048u, RDNA4RT_USAGE_NONE, 1u, topo) == RDNA4RT_OK &&
+          blas.geom_ift_base == 0u,
+          "rebuild without IFT base resets geom_ift_base to 0");
+    CHECK(rdna4rt_state_apply_build_ex(&tlas, RDNA4RT_KIND_TLAS, 2048u, RDNA4RT_USAGE_NONE, 1u, topo, 7u) == RDNA4RT_OK &&
+          tlas.geom_ift_base == 0u,
+          "TLAS build forces geom_ift_base to 0");
+    CHECK(rdna4rt_state_apply_build_ex(&blas, RDNA4RT_KIND_BLAS, 2048u, RDNA4RT_USAGE_NONE, 1u, topo,
+                                       RDNA4RT_INSTANCE_SBT_OFFSET_MAX + 1u) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "build_ex rejects out-of-range geom_ift_base");
+
+    /* 4. CPU TLAS conversion adds blas_ift_offsets[accel_struct_index] (Default + UserID + overflow + Indirect). */
+    const uint64_t blas_addrs[3] = { UINT64_C(0x10000000), UINT64_C(0x20000000), UINT64_C(0x30000000) };
+    const uint32_t blas_ifts[3]  = { 0u, 1u, 2u }; /* Apple Sample 1: light=0, box=1, sphere=2 */
+    rdna4rt_packed_float4x3_t ident = {{ {1,0,0}, {0,1,0}, {0,0,1}, {0,0,0} }};
+    rdna4rt_mtl_instance_default_t defs[3] = {
+        { .transform = ident, .options = RDNA4RT_INST_OPT_OPAQUE, .mask = 0xFFu, .intersection_function_offset = 0u, .accel_struct_index = 0u },
+        { .transform = ident, .options = RDNA4RT_INST_OPT_OPAQUE, .mask = 0xFFu, .intersection_function_offset = 0u, .accel_struct_index = 1u },
+        { .transform = ident, .options = RDNA4RT_INST_OPT_NON_OPAQUE, .mask = 0xFFu, .intersection_function_offset = 0u, .accel_struct_index = 2u },
+    };
+    rdna4rt_vk_instance_t vk_defs[3];
+    CHECK(rdna4rt_convert_instances_ex(RDNA4RT_INST_DESC_DEFAULT, (const uint8_t *)defs, sizeof(defs),
+                                       0u, 0u, 3u, blas_addrs, blas_ifts, 3u, vk_defs) == RDNA4RT_OK,
+          "Apple Sample 1 Default TLAS conversion with per-BLAS geom IFT offsets");
+    CHECK((vk_defs[0].sbt_offset_and_flags & 0x00FFFFFFu) == 0u &&
+          (vk_defs[1].sbt_offset_and_flags & 0x00FFFFFFu) == 1u &&
+          (vk_defs[2].sbt_offset_and_flags & 0x00FFFFFFu) == 2u &&
+          (vk_defs[2].sbt_offset_and_flags >> 24) == RDNA4RT_VK_INST_FORCE_NO_OPAQUE &&
+          vk_defs[2].accel_struct_reference == blas_addrs[2],
+          "Apple Sample 1 sphere instance receives instanceSBT=2 without clobbering flags/BDA");
+
+    rdna4rt_mtl_instance_userid_t uid = {
+        .transform = ident,
+        .options = RDNA4RT_INST_OPT_DISABLE_CULLING,
+        .mask = 0x5Au,
+        .intersection_function_offset = 5u,
+        .accel_struct_index = 2u,
+        .user_id = 0x000123u
+    };
+    rdna4rt_vk_instance_t vk_uid;
+    CHECK(rdna4rt_convert_instances_ex(RDNA4RT_INST_DESC_USER_ID, (const uint8_t *)&uid, sizeof(uid),
+                                       0u, 0u, 1u, blas_addrs, blas_ifts, 3u, &vk_uid) == RDNA4RT_OK &&
+          (vk_uid.sbt_offset_and_flags & 0x00FFFFFFu) == 7u &&
+          (vk_uid.sbt_offset_and_flags >> 24) == RDNA4RT_VK_INST_DISABLE_CULLING &&
+          (vk_uid.custom_index_and_mask & 0x00FFFFFFu) == 0x000123u &&
+          (vk_uid.custom_index_and_mask >> 24) == 0x5Au,
+          "UserID instance combines inst.iftOffset(5) + blas.geomIftBase(2) == 7");
+
+    uid.intersection_function_offset = RDNA4RT_INSTANCE_SBT_OFFSET_MAX;
+    CHECK(rdna4rt_convert_instances_ex(RDNA4RT_INST_DESC_USER_ID, (const uint8_t *)&uid, sizeof(uid),
+                                       0u, 0u, 1u, blas_addrs, blas_ifts, 3u, &vk_uid) == RDNA4RT_ERR_OUT_OF_RANGE_INDEX,
+          "UserID instance combined SBT > 24-bit rejected");
+
+    /* Indirect instance keeps its own intersection_function_offset intact. */
+    rdna4rt_mtl_instance_indirect_t ind = {
+        .transform = ident,
+        .options = RDNA4RT_INST_OPT_NONE,
+        .mask = 0xFFu,
+        .intersection_function_offset = 9u,
+        .user_id = 77u,
+        .accel_struct_id = blas_addrs[2]
+    };
+    rdna4rt_vk_instance_t vk_ind;
+    CHECK(rdna4rt_convert_instances_ex(RDNA4RT_INST_DESC_INDIRECT, (const uint8_t *)&ind, sizeof(ind),
+                                       0u, 0u, 1u, NULL, NULL, 0u, &vk_ind) == RDNA4RT_OK &&
+          (vk_ind.sbt_offset_and_flags & 0x00FFFFFFu) == 9u &&
+          vk_ind.accel_struct_reference == blas_addrs[2],
+          "Indirect instance conversion remains intact");
+
+    /* 5. GPU inst_convert SPIR-V & BlasEntry ABI pins. */
+    CHECK(sizeof(rdna4rt_inst_convert_pc_t) == 48u &&
+          sizeof(rdna4rt_blas_table_entry_t) == 16u &&
+          offsetof(rdna4rt_blas_table_entry_t, bda) == 0u &&
+          offsetof(rdna4rt_blas_table_entry_t, geom_ift_base) == 8u,
+          "GPU inst_convert PC (48B) and BlasTable entry (16B) layouts pinned");
+    CHECK(rdna4rt_spv_inst_convert[0] == 0x07230203u &&
+          rdna4rt_spv_inst_convert[1] == 0x00010600u &&
+          rdna4rt_spv_xform_transpose[0] == 0x07230203u,
+          "embedded SPIR-V 1.6 headers valid");
+}
+
 int main(void) {
     test_caps_and_alignment();
     test_usage_sizes_and_scratch();
@@ -1003,6 +1158,7 @@ int main(void) {
     test_wave4_prim_refit_and_barriers();
     test_wave4_heap_as_sizing_and_validation();
     test_wave4_prim_and_query_pools();
+    test_wave5_geom_ift_offset_and_spv();
     printf("test-rt-accel: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
