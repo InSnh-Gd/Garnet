@@ -1,0 +1,2872 @@
+diff --git a/src/air_intrinsics.rs b/src/air_intrinsics.rs
+index f210fda..0d0f039 100644
+--- a/src/air_intrinsics.rs
++++ b/src/air_intrinsics.rs
+@@ -661,11 +661,17 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition>
+         return None;
+     }
+ 
+-    if name.starts_with("air.intersect.") {
++    if name == "air.intersect" || name.starts_with("air.intersect.") {
+         return Some(LoweredOrStaticLinkage);
+     }
+ 
+-    if name == "air.get_descriptor_size_tensor" {
++    if matches!(
++        name,
++        "air.get_descriptor_size_tensor"
++            | "air.is_null_instance_acceleration_structure"
++            | "air.is_null_primitive_acceleration_structure"
++            | "air.is_null_intersection_function_table"
++    ) {
+         return Some(Lowered);
+     }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 5914d99..5961d4a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -197,7 +197,12 @@ fn lower_air_text_for_options<'a>(
+ ) -> Result<Cow<'a, str>, String> {
+     let lowered = lower_air_text_if_enabled(san_ll);
+     if options.hardware_ray_query {
+-        if let Some(rq) = native::ray_query_air::lower_air_ray_queries(lowered.as_ref(), &[])? {
++        if let Some(rq) = native::ray_query_air::lower_air_ray_queries_with_options(
++            lowered.as_ref(),
++            &[],
++            false,
++            options.rt_primitive_data,
++        )? {
+             return Ok(Cow::Owned(rq));
+         }
+     }
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index da18cfb..6259883 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -35,6 +35,9 @@ pub struct LinkedFunctionLinkage {
+     /// Enable IFT backing buffer ABI v2 (66-word header carrying `attached_bda[31]` for
+     /// `[[buffer(N)]]` / nested VFT access inside `[[intersection]]` callbacks).
+     pub runtime_intersection_abi_v2: bool,
++    /// Enable GPU lookup of per-primitive `primitiveDataBuffer` pointers via set-0 binding 676
++    /// (`GARNETX_CAP_RT_PRIMITIVE_DATA`).
++    pub runtime_rt_primitive_data: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+@@ -2091,7 +2094,7 @@ pub fn specialize_runtime_intersection_function_tables(
+     let tables = discover_intersection_function_table_bindings(entry_ll, stage);
+     if tables.is_empty()
+         && !entry_ll.contains("@air.intersect.intersection_function_buffer")
+-        && !(entry_ll.contains("@air.intersect.")
++        && !((entry_ll.contains("@air.intersect.") || entry_ll.contains("@air.intersect("))
+             && !linkage.runtime_intersection_functions.is_empty())
+     {
+         return Ok((entry_ll.to_string(), None));
+@@ -2166,6 +2169,7 @@ pub fn specialize_runtime_intersection_function_tables(
+                     role,
+                     crate::native::ray_query_air::CallbackParamRole::AttachedBuffer(_)
+                         | crate::native::ray_query_air::CallbackParamRole::AttachedVft(_)
++                        | crate::native::ray_query_air::CallbackParamRole::PrimitiveDataPtr
+                 )
+                 .then_some(pi)
+                 .filter(|&i| param_types.get(i).is_some_and(|t| t.trim() == "ptr addrspace(2)"))
+@@ -2253,8 +2257,12 @@ pub fn specialize_runtime_intersection_function_tables(
+     // Lower `@air.intersect.*` calls into `@__m2v.rq.*` structured ray queries referencing the
+     // linked callback symbols.
+     let abi_v2 = linkage.runtime_intersection_abi_v2;
+-    if let Some(lowered) = crate::native::ray_query_air::lower_air_ray_queries_with_abi(
+-        &output, &callbacks, abi_v2,
++    let prim_data_enabled = linkage.runtime_rt_primitive_data;
++    if let Some(lowered) = crate::native::ray_query_air::lower_air_ray_queries_with_options(
++        &output,
++        &callbacks,
++        abi_v2,
++        prim_data_enabled,
+     )? {
+         output = lowered;
+     }
+@@ -2923,7 +2931,9 @@ fn decode_callback_param_roles(
+             Some(Role::FrontFacing)
+         } else if body.contains("!\"air.primitive_id\"") {
+             Some(Role::PrimitiveId)
+-        } else if body.contains("!\"air.geometry_id\"") {
++        } else if body.contains("!\"air.geometry_id\"")
++            || body.contains("!\"air.geometry_intersection_function_table_offset\"")
++        {
+             Some(Role::GeometryId)
+         } else if body.contains("!\"air.user_instance_id\"") {
+             Some(Role::UserInstanceId)
+diff --git a/src/meta/intersections.rs b/src/meta/intersections.rs
+index 8fc3b89..0f1ebe3 100644
+--- a/src/meta/intersections.rs
++++ b/src/meta/intersections.rs
+@@ -60,12 +60,6 @@ impl AirIntersectionFamily {
+     /// `Ok(None)` means this is not an AIR intersection symbol. Unknown, duplicated, or
+     /// structurally contradictory suffixes are errors rather than silently acquiring semantics.
+     pub fn parse(callee: &str) -> Result<Option<Self>, String> {
+-        let Some(suffix) = callee.strip_prefix("air.intersect.") else {
+-            return Ok(None);
+-        };
+-        if suffix.is_empty() {
+-            return Err("AIR intersection symbol has an empty family suffix".into());
+-        }
+         let mut family = Self {
+             intersection_function_buffer: false,
+             instancing: AirIntersectionInstancing::None,
+@@ -76,6 +70,15 @@ impl AirIntersectionFamily {
+             instance_motion: false,
+             extended_limits: false,
+         };
++        if callee == "air.intersect" {
++            return Ok(Some(family));
++        }
++        let Some(suffix) = callee.strip_prefix("air.intersect.") else {
++            return Ok(None);
++        };
++        if suffix.is_empty() {
++            return Err("AIR intersection symbol has an empty family suffix".into());
++        }
+         for token in suffix.split('.') {
+             match token {
+                 "intersection_function_buffer" if !family.intersection_function_buffer => {
+@@ -248,4 +251,22 @@ mod tests {
+         assert!(AirIntersectionFamily::parse("air.intersect.triangle_data.mystery").is_err());
+         assert_eq!(AirIntersectionFamily::parse("air.foo").unwrap(), None);
+     }
++
++    #[test]
++    fn parses_bare_air_intersect_without_template_tags() {
++        let bare = AirIntersectionFamily::parse("air.intersect")
++            .expect("bare air.intersect must parse")
++            .expect("bare air.intersect must return Some");
++        assert!(!bare.intersection_function_buffer);
++        assert_eq!(bare.instancing, AirIntersectionInstancing::None);
++        assert!(!bare.triangle_data);
++        assert!(!bare.world_space_data);
++        assert_eq!(bare.argument_count(), 18);
++        assert_eq!(bare.intersection_table_argument_index(), 5);
++        assert_eq!(bare.result_fields().len(), 5);
++        assert_eq!(
++            bare.llvm_result_type(),
++            "{ i32, float, i32, i32, ptr addrspace(1) }"
++        );
++    }
+ }
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index fc9f380..578ebbf 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -1742,7 +1742,7 @@ fn parse_air_threadgroup_stage_meta_with_nodes(
+             }
+             "primitive_acceleration_structure" => {
+                 let binding = resource_location(node, idx);
+-                if ll.contains("@air.intersect.") {
++                if ll.contains("@air.intersect.") || ll.contains("@air.intersect(") {
+                     KernRole::PrimitiveAccelerationStructureShadow(binding)
+                 } else {
+                     KernRole::PrimitiveAccelerationStructure(binding)
+@@ -2001,7 +2001,10 @@ fn body_uses_acceleration_structure_shadow(ll: &str) -> bool {
+     ll.contains("@air.get_instance_count_instance_acceleration_structure")
+         || ll.contains("@air.get_primitive_acceleration_structure_instance_acceleration_structure")
+         || ll.lines().any(|line| {
+-            let Some(start) = line.find("@air.intersect.") else {
++            let Some(start) = line
++                .find("@air.intersect.")
++                .or_else(|| line.find("@air.intersect("))
++            else {
+                 return false;
+             };
+             let Some(end) = line[start + 1..].find('(') else {
+diff --git a/src/native/emit_tiers.rs b/src/native/emit_tiers.rs
+index 873fbdd..eb3602f 100644
+--- a/src/native/emit_tiers.rs
++++ b/src/native/emit_tiers.rs
+@@ -1042,9 +1042,10 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
+ fn requires_device_pointer_model(parsed: &LlModule) -> bool {
+     if parsed.functions.iter().any(|function| {
+         function.carrier_insts().any(|inst| {
+-            inst.call()
+-                .as_deref()
+-                .is_some_and(|call| crate::air_intrinsics::is_icb_intrinsic(&call.callee))
++            inst.call().as_deref().is_some_and(|call| {
++                crate::air_intrinsics::is_icb_intrinsic(&call.callee)
++                    || call.callee == "__m2v.rq.prim_table_bda"
++            })
+         })
+     }) {
+         return true;
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+index b0cf8a9..0cebb15 100644
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -1467,8 +1467,16 @@ impl Emitter {
+             self.emit_device_address_nullness(&name, src_id, _instructions)?;
+             let mut dev = RawBufferOffset::root(format!(".bda_inttoptr_{src_id}"), addrspace);
+             dev.device_addr_base = Some(src_id);
++            if self.current_function == "__m2v.rq.query.lookup_prim_data"
++                || self.current_function == "__m2v.rq.query.probe_prim_slot"
++            {
++                dev.trusted_ro_bda = true;
++            }
+             if let LlValue::Local(src_name) = &src.value {
+                 dev.table_bounds = self.bda_integer_bounds.get(src_name).cloned();
++                if src_name.contains("__m2v.rq.prim_data") {
++                    dev.trusted_ro_bda = true;
++                }
+             }
+             self.raw_offsets.insert(name.clone(), dev);
+             self.pointer_storage
+diff --git a/src/native/emitter/body/reinterpret_pointer.rs b/src/native/emitter/body/reinterpret_pointer.rs
+index e6424d2..392595c 100644
+--- a/src/native/emitter/body/reinterpret_pointer.rs
++++ b/src/native/emitter/body/reinterpret_pointer.rs
+@@ -253,9 +253,23 @@ impl Emitter {
+         };
+ 
+         let ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
++        let object_has_concrete_bda = match &object.value {
++            LlValue::Local(name) => {
++                self.bda_direct_addresses.contains_key(name)
++                    || self.raw_offsets.get(name).is_some_and(|raw| {
++                        !raw.unmodelable
++                            && (raw.device_addr_base.is_some()
++                                || self.bda_direct_addresses.contains_key(&raw.root))
++                    })
++            }
++            _ => false,
++        };
+         if self.bda_device_pointers
+-            && *pointee == LlType::Int(64)
+-            && self.bda_phi_value_is_addressable(&object.value)
++            && ((*pointee == LlType::Int(64)
++                && self.bda_phi_value_is_addressable(&object.value))
++                || (matches!(pointee, LlType::Ptr(1 | 2))
++                    && matches!(object_ty, LlType::Ptr(1 | 2))
++                    && object_has_concrete_bda))
+         {
+             let address = self.bda_phi_address_id(&object.value, instructions)?;
+             if self.large_buffer_addressing {
+@@ -390,6 +404,12 @@ impl Emitter {
+     /// Read the 64-bit device address a local aggregate field holds and register the result as an
+     /// address-rooted pointer. `field_pointer` must already point AT the field (an `i64` payload),
+     /// not at the aggregate containing it.
++    fn is_trusted_ro_bda_value(&self, name: &str) -> bool {
++        self.ir
++            .trusted_ro_bda_values
++            .contains(&(self.current_function.clone(), name.to_string()))
++    }
++
+     pub(in crate::native::emitter) fn emit_bda_address_from_field(
+         &mut self,
+         result_name: &str,
+@@ -399,11 +419,13 @@ impl Emitter {
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<(), String> {
+         let bounds = self.emit_local_bda_bounds_load(key, instructions)?;
++        let trusted_ro = self.is_trusted_ro_bda_value(result_name);
+         self.emit_local_bda_pointer_load(
+             result_name,
+             result_ty,
+             field_pointer,
+             bounds,
++            trusted_ro,
+             instructions,
+         )
+     }
+@@ -414,6 +436,7 @@ impl Emitter {
+         result_ty: &LlType,
+         field_pointer: Word,
+         bounds: Option<RawBufferBounds>,
++        trusted_ro: bool,
+         instructions: &mut Vec<Instruction>,
+     ) -> Result<(), String> {
+         let LlType::Ptr(addrspace) = result_ty else {
+@@ -433,6 +456,7 @@ impl Emitter {
+         let mut raw = RawBufferOffset::root(format!(".bda_{address}"), *addrspace);
+         raw.device_addr_base = Some(address);
+         raw.table_bounds = bounds;
++        raw.trusted_ro_bda = trusted_ro;
+         self.raw_offsets.insert(result_name.to_string(), raw);
+         self.pointer_storage
+             .insert(result_name.to_string(), StorageClass::PhysicalStorageBuffer);
+@@ -788,11 +812,11 @@ impl Emitter {
+             let mut raw = RawBufferOffset::root(format!(".bda_{result}"), *addrspace);
+             raw.device_addr_base = Some(result);
+             if let LlValue::Local(source) = &stored.value {
+-                raw.table_bounds = self
+-                    .raw_offsets
+-                    .get(source)
+-                    .and_then(|raw| raw.table_bounds.clone());
++                if let Some(src_raw) = self.raw_offsets.get(source) {
++                    raw.table_bounds = src_raw.table_bounds.clone();
++                }
+             }
++            raw.trusted_ro_bda = self.is_trusted_ro_bda_value(result_name);
+             self.raw_offsets.insert(result_name.to_string(), raw);
+             self.bda_address_values.insert(result);
+             (self.type_id(&LlType::Int(64))?, address)
+@@ -864,12 +888,14 @@ impl Emitter {
+         {
+             if let Some(slots) = self.local_bda_bounds_slots_for_pointer(ptr, instructions)? {
+                 let bounds = self.emit_local_bda_bounds_slots_load(slots, instructions)?;
++                let trusted_ro = self.is_trusted_ro_bda_value(result_name);
+                 let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+                 self.emit_local_bda_pointer_load(
+                     result_name,
+                     result_ty,
+                     pointer,
+                     Some(bounds),
++                    trusted_ro,
+                     instructions,
+                 )?;
+                 return Ok(true);
+@@ -1134,6 +1160,7 @@ impl Emitter {
+         let mut raw = RawBufferOffset::root(format!(".bda_local_{name}"), *addrspace);
+         raw.device_addr_base = Some(result);
+         raw.table_bounds = bounds;
++        raw.trusted_ro_bda = self.is_trusted_ro_bda_value(name);
+         self.raw_offsets.insert(name.to_string(), raw);
+         self.bda_address_values.insert(result);
+         self.pointer_storage
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index a355ece..ccae3d6 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -440,6 +440,7 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+ 
+ impl Emitter {
+     pub(super) fn emit_function(&mut self, f: &LlFunction) -> Result<(), String> {
++        self.current_function = f.name.clone();
+         self.started_functions.insert(f.name.clone());
+         self.values.clear();
+         self.fast_float_products.clear();
+@@ -756,6 +757,10 @@ impl Emitter {
+                         && !self.ir.entry_functions.contains(&f.name)
+                     {
+                         raw.device_addr_base = Some(id);
++                        raw.trusted_ro_bda = self
++                            .ir
++                            .trusted_ro_bda_params
++                            .contains(&(f.name.clone(), name.clone()));
+                         self.used_device_address = true;
+                         self.pointer_storage
+                             .insert(name.clone(), StorageClass::PhysicalStorageBuffer);
+diff --git a/src/native/emitter/memory/device_addr.rs b/src/native/emitter/memory/device_addr.rs
+index 2bc6a2b..3bcbf44 100644
+--- a/src/native/emitter/memory/device_addr.rs
++++ b/src/native/emitter/memory/device_addr.rs
+@@ -606,6 +606,7 @@ impl Emitter {
+             unmodelable: false,
+             device_addr_base: Some(address),
+             table_bounds,
++            trusted_ro_bda: true_raw.trusted_ro_bda && false_raw.trusted_ro_bda,
+         }))
+     }
+ 
+@@ -733,6 +734,24 @@ impl Emitter {
+                 "native emitter: cannot write through a constant-space buffer pointer".into(),
+             );
+         }
++        if raw.trusted_ro_bda {
++            if required_access & 2 != 0 {
++                return Err(
++                    "native emitter: cannot write through a read-only primitive_data pointer".into(),
++                );
++            }
++            let check_addr = raw.device_addr_base.unwrap_or(address);
++            let zero = self.const_int(64, 0)?;
++            let bool_ty = self.type_id(&LlType::Bool)?;
++            let non_null = self.fresh();
++            instructions.push(Self::inst(
++                Op::INotEqual,
++                Some(bool_ty),
++                Some(non_null),
++                vec![Operand::IdRef(check_addr), Operand::IdRef(zero)],
++            ));
++            return Ok(Some(non_null));
++        }
+         let Some(bounds) = raw.table_bounds.as_ref() else {
+             return self
+                 .emit_buffer_registry_guard(address, access_size, required_access, instructions)
+diff --git a/src/native/emitter/mod.rs b/src/native/emitter/mod.rs
+index e8e0d06..4530796 100644
+--- a/src/native/emitter/mod.rs
++++ b/src/native/emitter/mod.rs
+@@ -250,6 +250,7 @@ pub(super) struct Emitter {
+     loop_merges: HashMap<String, LoopMergeInfo>,
+     switch_merges: HashMap<String, String>,
+     current_block: Option<String>,
++    current_function: String,
+     /// Instructions needed to materialize an `OpPhi` incoming value, owned by the source edge's
+     /// predecessor block. Phi lowering records these while visiting the destination block; function
+     /// assembly inserts them before the named predecessor's merge/terminator.
+@@ -512,6 +513,10 @@ struct RawBufferOffset {
+     /// an out-of-range or permission-invalid physical access before issuing it. Pointer values
+     /// loaded from memory carry their own address but no row provenance.
+     table_bounds: Option<RawBufferBounds>,
++    /// True when this device address comes from the translator-emitted RT `primitiveDataBuffer`
++    /// lookup path (binding 676 table, snapshotted TLAS/BLAS metadata, or `primitiveDataBuffer`
++    /// payload). Guarded by a direct non-null base check (read-only) rather than `RegistryV3`.
++    trusted_ro_bda: bool,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -540,6 +545,7 @@ impl RawBufferOffset {
+             unmodelable: false,
+             device_addr_base: None,
+             table_bounds: None,
++            trusted_ro_bda: false,
+         }
+     }
+ }
+@@ -595,6 +601,7 @@ impl Emitter {
+         // call-edge propagation could not see them, so a helper that still receives such a pointer
+         // would not be known to need the raw byte model and would be handed the bare buffer root.
+         ir.propagate_raw_buffer_params();
++        ir.propagate_trusted_ro_bda();
+         let opaque_resource_pointer_values =
+             functions::opaque_resource_pointer_values_by_function(&ir);
+         let air_data_layout = ir.air_data_layout.clone();
+@@ -708,6 +715,7 @@ impl Emitter {
+             loop_merges: HashMap::new(),
+             switch_merges: HashMap::new(),
+             current_block: None,
++            current_function: String::new(),
+             phi_edge_instructions: HashMap::new(),
+             phi_result_instructions: Vec::new(),
+             tir_result_types: HashMap::new(),
+diff --git a/src/native/emitter/pointers/phi_merge.rs b/src/native/emitter/pointers/phi_merge.rs
+index 760b4c5..a3cbab9 100644
+--- a/src/native/emitter/pointers/phi_merge.rs
++++ b/src/native/emitter/pointers/phi_merge.rs
+@@ -40,8 +40,29 @@ impl Emitter {
+         }
+         instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
+         let table_bounds = self.emit_phi_raw_table_bounds(name, incoming, instructions)?;
++        let mut any_trusted = false;
++        let mut all_trusted_or_null = true;
++        for (value, _) in incoming {
++            match value {
++                LlValue::Zero | LlValue::Undef => {}
++                LlValue::Local(v)
++                    if self.raw_offsets.get(v).is_some_and(|r| r.trusted_ro_bda) =>
++                {
++                    any_trusted = true;
++                }
++                _ => {
++                    all_trusted_or_null = false;
++                    break;
++                }
++            }
++        }
++        let trusted_from_ir = self
++            .ir
++            .trusted_ro_bda_values
++            .contains(&(self.current_function.clone(), name.to_string()));
+         if let Some(raw) = self.raw_offsets.get_mut(name) {
+             raw.table_bounds = table_bounds;
++            raw.trusted_ro_bda = trusted_from_ir || (any_trusted && all_trusted_or_null);
+         }
+         self.emit_pointer_nullness_phi(name, incoming, result_ty, instructions)?;
+         self.used_device_address = true;
+@@ -798,6 +819,7 @@ impl Emitter {
+                 unmodelable: false,
+                 device_addr_base: template.device_addr_base,
+                 table_bounds,
++                trusted_ro_bda: template.trusted_ro_bda,
+             },
+         );
+         self.define_unmodeled_pointer_value(name, *addrspace, &LlType::Int(8))?;
+diff --git a/src/native/emitter/pointers/raw_select.rs b/src/native/emitter/pointers/raw_select.rs
+index e170372..58531a5 100644
+--- a/src/native/emitter/pointers/raw_select.rs
++++ b/src/native/emitter/pointers/raw_select.rs
+@@ -814,6 +814,7 @@ impl Emitter {
+                 unmodelable: false,
+                 device_addr_base: Some(selected_address),
+                 table_bounds,
++                trusted_ro_bda: raw.trusted_ro_bda,
+             },
+         );
+         self.pointer_storage
+@@ -948,6 +949,7 @@ impl Emitter {
+                 unmodelable: false,
+                 device_addr_base: true_raw.device_addr_base,
+                 table_bounds,
++                trusted_ro_bda: true_raw.trusted_ro_bda && false_raw.trusted_ro_bda,
+             },
+         );
+         Ok(true)
+@@ -1016,6 +1018,7 @@ impl Emitter {
+                 unmodelable: false,
+                 device_addr_base: true_raw.device_addr_base,
+                 table_bounds,
++                trusted_ro_bda: true_raw.trusted_ro_bda && false_raw.trusted_ro_bda,
+             },
+         );
+         Ok(true)
+diff --git a/src/native/emitter/pointers/select_gep.rs b/src/native/emitter/pointers/select_gep.rs
+index 205de8c..25a0e20 100644
+--- a/src/native/emitter/pointers/select_gep.rs
++++ b/src/native/emitter/pointers/select_gep.rs
+@@ -568,6 +568,7 @@ impl Emitter {
+                 unmodelable: false,
+                 device_addr_base: true_raw.device_addr_base,
+                 table_bounds,
++                trusted_ro_bda: true_raw.trusted_ro_bda && false_raw.trusted_ro_bda,
+             },
+         );
+         let placeholder = self.result_id(name, &LlType::Ptr(addrspace))?;
+diff --git a/src/native/ir/mod.rs b/src/native/ir/mod.rs
+index 3733b15..0867453 100644
+--- a/src/native/ir/mod.rs
++++ b/src/native/ir/mod.rs
+@@ -254,6 +254,461 @@ pub(super) struct LlModule {
+     /// parameter. Workgroup memory in this set can share one raw entry allocation; a raw helper fed
+     /// from a typed global cannot and retains its concrete vector-backed lowering.
+     pub(super) param_connected_raw_params: HashSet<(String, String)>,
++    /// Metadata-seeded helper parameters from `!air.intersection` `!"air.primitive_data"`.
++    metadata_trusted_ro_bda_params: HashSet<(String, String)>,
++    /// Helper pointer parameters proven to carry read-only RT `primitiveDataBuffer` BDA addresses
++    /// (from `!air.intersection` `air.primitive_data` metadata or all-caller propagation from
++    /// `@__m2v.rq.query.lookup_prim_data`). Loads through these pointers use a direct non-null
++    /// check instead of the user-buffer `RegistryV3` table scan.
++    pub(super) trusted_ro_bda_params: HashSet<(String, String)>,
++    /// Function-wide monotone set of `(function_name, ssa_value_name)` pointer values proven to
++    /// hold only read-only RT `primitiveDataBuffer` BDA addresses (or null/undef), independent of
++    /// block/instruction order. Queried directly by local-alloca/phi load emission so mixed
++    /// trusted+untrusted allocas never bypass `RegistryV3`.
++    pub(super) trusted_ro_bda_values: HashSet<(String, String)>,
++}
++
++fn const_gep_u32(val: &LlValue) -> Option<u32> {
++    match *val {
++        LlValue::Zero => Some(0),
++        LlValue::Int(v) => u32::try_from(v).ok(),
++        LlValue::SignedInt(v) if v >= 0 => u32::try_from(v).ok(),
++        _ => None,
++    }
++}
++
++impl LlModule {
++    pub(super) fn infer_trusted_ro_bda_params(&mut self, ll: &str) {
++        self.metadata_trusted_ro_bda_params.clear();
++        // Step 1: Seed from `!air.intersection` metadata nodes carrying `!"air.primitive_data"`.
++        let mut md_nodes = HashMap::<u32, &str>::new();
++        let mut inter_roots = Vec::<u32>::new();
++        let parse_refs = |body: &str| -> Vec<u32> {
++            body.split(',')
++                .filter_map(|part| {
++                    part.trim()
++                        .strip_prefix('!')?
++                        .trim_end_matches('}')
++                        .trim()
++                        .parse::<u32>()
++                        .ok()
++                })
++                .collect()
++        };
++        for line in ll.lines() {
++            let trimmed = line.trim();
++            if !trimmed.starts_with('!') {
++                continue;
++            }
++            let Some((lhs, rhs)) = trimmed.split_once(" = ") else {
++                continue;
++            };
++            let lhs = lhs.trim();
++            let Some(body) = rhs.trim().strip_prefix("!{").and_then(|s| s.strip_suffix('}')) else {
++                continue;
++            };
++            if let Some(id_str) = lhs.strip_prefix('!') {
++                if let Ok(id) = id_str.parse::<u32>() {
++                    md_nodes.insert(id, body);
++                    continue;
++                }
++            }
++            if lhs == "!air.intersection" {
++                inter_roots.extend(parse_refs(body));
++            }
++        }
++        for root_id in inter_roots {
++            let Some(&root_body) = md_nodes.get(&root_id) else {
++                continue;
++            };
++            let Some(at) = root_body.find('@') else {
++                continue;
++            };
++            let rest = &root_body[at + 1..];
++            let fn_name = if let Some(quoted) = rest.strip_prefix('"') {
++                let Some(end) = quoted.find('"') else {
++                    continue;
++                };
++                &quoted[..end]
++            } else {
++                let end = rest.find([' ', '\t', ',', '}']).unwrap_or(rest.len());
++                &rest[..end]
++            };
++            let Some(func) = self.functions.iter().find(|f| f.name == fn_name) else {
++                continue;
++            };
++            let refs = parse_refs(root_body);
++            let Some(&in_list_id) = refs.get(1) else {
++                continue;
++            };
++            let Some(&in_list_body) = md_nodes.get(&in_list_id) else {
++                continue;
++            };
++            for param_ref in parse_refs(in_list_body) {
++                let Some(&param_body) = md_nodes.get(&param_ref) else {
++                    continue;
++                };
++                if !param_body.contains("!\"air.primitive_data\"") {
++                    continue;
++                }
++                if let Some(idx_str) = param_body
++                    .split(',')
++                    .next()
++                    .and_then(|s| s.trim().strip_prefix("i32 "))
++                {
++                    if let Ok(idx) = idx_str.trim().parse::<usize>() {
++                        if let Some((pname, LlType::Ptr(1 | 2))) = func.params.get(idx) {
++                            self.metadata_trusted_ro_bda_params
++                                .insert((func.name.clone(), pname.clone()));
++                        }
++                    }
++                }
++            }
++        }
++        self.propagate_trusted_ro_bda();
++    }
++
++    /// Monotone, block/instruction-order-independent fixpoint over all functions to compute both
++    /// `trusted_ro_bda_params` and `trusted_ro_bda_values`. Re-run after `inline_ordinary_leaf_helpers`
++    /// so post-inline SSA names remain exact.
++    pub(super) fn propagate_trusted_ro_bda(&mut self) {
++        self.trusted_ro_bda_params = self.metadata_trusted_ro_bda_params.clone();
++        self.trusted_ro_bda_values.clear();
++
++        // Pre-scan per-function alloca field paths, escapes, and complete store sets ONCE before
++        // the monotone fixpoint so loads NEVER observe a partial store set.
++        struct FuncAllocaInfo {
++            slot_path: HashMap<String, (String, Vec<u32>)>,
++            escaped_allocas: HashSet<String>,
++            field_stores: HashMap<(String, Vec<u32>), Vec<LlValue>>,
++        }
++        let mut alloca_info: HashMap<String, FuncAllocaInfo> = HashMap::new();
++        for f in &self.functions {
++            let mut slot_path: HashMap<String, (String, Vec<u32>)> = HashMap::new();
++            let mut escaped_allocas: HashSet<String> = HashSet::new();
++            for inst in f.carrier_insts() {
++                if inst.alloca_ty().is_some() {
++                    if let Some(res) = inst.result.as_deref() {
++                        slot_path.insert(res.to_string(), (res.to_string(), Vec::new()));
++                    }
++                }
++            }
++            // Propagate transparent alloca aliases and constant zero-based field GEPs.
++            let mut alias_changed = true;
++            while alias_changed {
++                alias_changed = false;
++                for inst in f.carrier_insts() {
++                    if let Some((res, base)) = inst.identity_ptr_bitcast() {
++                        if !slot_path.contains_key(res) {
++                            if let Some(p) = slot_path.get(base).cloned() {
++                                slot_path.insert(res.to_string(), p);
++                                alias_changed = true;
++                            }
++                        }
++                    } else if let Some(gep) = inst.gep().as_deref() {
++                        if let (Some(res), LlValue::Local(base)) =
++                            (inst.result.as_deref(), &gep.base.value)
++                        {
++                            if let Some((root, path)) = slot_path.get(base).cloned() {
++                                let valid_const = gep
++                                    .indices
++                                    .first()
++                                    .is_some_and(|tv| const_gep_u32(&tv.value) == Some(0))
++                                    && gep
++                                        .indices
++                                        .iter()
++                                        .skip(1)
++                                        .all(|tv| const_gep_u32(&tv.value).is_some());
++                                if valid_const {
++                                    if !slot_path.contains_key(res) {
++                                        let mut new_path = path;
++                                        for tv in gep.indices.iter().skip(1) {
++                                            if let Some(idx) = const_gep_u32(&tv.value) {
++                                                new_path.push(idx);
++                                            }
++                                        }
++                                        slot_path.insert(res.to_string(), (root, new_path));
++                                        alias_changed = true;
++                                    }
++                                } else {
++                                    escaped_allocas.insert(root);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            // Collect complete store sets and disqualify any alloca that escapes or receives
++            // non-pointer writes.
++            let mut field_stores: HashMap<(String, Vec<u32>), Vec<LlValue>> = HashMap::new();
++            for inst in f.carrier_insts() {
++                if let Some(store) = inst.store().as_deref() {
++                    if let LlValue::Local(val_name) = &store.0.value {
++                        if let Some((root, _)) = slot_path.get(val_name) {
++                            escaped_allocas.insert(root.clone());
++                        }
++                    }
++                    if let LlValue::Local(dst_name) = &store.1.value {
++                        if let Some(key) = slot_path.get(dst_name) {
++                            if matches!(store.0.ty, LlType::Ptr(1 | 2)) {
++                                field_stores
++                                    .entry(key.clone())
++                                    .or_default()
++                                    .push(store.0.value.clone());
++                            } else {
++                                escaped_allocas.insert(key.0.clone());
++                            }
++                        }
++                    }
++                    continue;
++                }
++                if inst.load().is_some()
++                    || inst.alloca_ty().is_some()
++                    || inst.identity_ptr_bitcast().is_some()
++                    || inst.gep().is_some()
++                {
++                    continue;
++                }
++                if let Some(call) = inst.call().as_deref() {
++                    if call.callee.starts_with("llvm.lifetime.start")
++                        || call.callee.starts_with("llvm.lifetime.end")
++                    {
++                        continue;
++                    }
++                }
++                inst.visit_uses(|used| {
++                    if let Some((root, _)) = slot_path.get(used) {
++                        escaped_allocas.insert(root.clone());
++                    }
++                });
++            }
++            for block in &f.blocks {
++                if let Some(typed) = block.typed.as_ref() {
++                    if let crate::native::tir::RetEmit::Value(tv) = &typed.ret {
++                        if let LlValue::Local(ret_name) = &tv.value {
++                            if let Some((root, _)) = slot_path.get(ret_name) {
++                                escaped_allocas.insert(root.clone());
++                            }
++                        }
++                    }
++                }
++            }
++            alloca_info.insert(
++                f.name.clone(),
++                FuncAllocaInfo {
++                    slot_path,
++                    escaped_allocas,
++                    field_stores,
++                },
++            );
++        }
++
++        // Step 2: Monotone fixpoint call-site and intra-function propagation.
++        let mut trusted_by_func: HashMap<String, HashSet<String>>;
++        loop {
++            trusted_by_func = HashMap::new();
++            for f in &self.functions {
++                let mut locals = HashSet::<String>::new();
++                for (pname, ty) in &f.params {
++                    if matches!(ty, LlType::Ptr(1 | 2))
++                        && self
++                            .trusted_ro_bda_params
++                            .contains(&(f.name.clone(), pname.clone()))
++                    {
++                        locals.insert(pname.clone());
++                    }
++                }
++                let in_prim_helper = f.name == "__m2v.rq.query.lookup_prim_data"
++                    || f.name == "__m2v.rq.query.probe_prim_slot";
++                let finfo = alloca_info.get(&f.name);
++                let mut inner_changed = true;
++                while inner_changed {
++                    inner_changed = false;
++                    for inst in f.carrier_insts() {
++                        let Some(res) = inst.result.as_deref() else {
++                            continue;
++                        };
++                        if locals.contains(res) {
++                            continue;
++                        }
++                        if inst.opcode == "inttoptr" {
++                            let is_trusted = in_prim_helper
++                                || inst.operands.iter().any(|op| match op {
++                                    crate::native::tir::TirOperand::Value { name, .. } => {
++                                        name.contains("__m2v.rq.prim_data")
++                                    }
++                                    _ => false,
++                                });
++                            if is_trusted && locals.insert(res.to_string()) {
++                                inner_changed = true;
++                            }
++                            continue;
++                        }
++                        if let Some((_, base)) = inst.identity_ptr_bitcast() {
++                            if locals.contains(base) && locals.insert(res.to_string()) {
++                                inner_changed = true;
++                            }
++                            continue;
++                        }
++                        if let Some(gep) = inst.gep().as_deref() {
++                            if let LlValue::Local(base) = &gep.base.value {
++                                if locals.contains(base) && locals.insert(res.to_string()) {
++                                    inner_changed = true;
++                                }
++                            }
++                            continue;
++                        }
++                        if inst.opcode == "freeze" {
++                            if let Some(crate::native::tir::TirOperand::Value { name, .. }) =
++                                inst.operands.first()
++                            {
++                                if locals.contains(name) && locals.insert(res.to_string()) {
++                                    inner_changed = true;
++                                }
++                            }
++                            continue;
++                        }
++                        if let Some((t_tv, f_tv)) = inst.select_arms().as_deref() {
++                            let arm_ok = |v: &LlValue| match v {
++                                LlValue::Zero | LlValue::Undef => true,
++                                LlValue::Local(n) => locals.contains(n),
++                                _ => false,
++                            };
++                            let any_local = matches!(t_tv.value, LlValue::Local(_))
++                                || matches!(f_tv.value, LlValue::Local(_));
++                            if any_local
++                                && arm_ok(&t_tv.value)
++                                && arm_ok(&f_tv.value)
++                                && locals.insert(res.to_string())
++                            {
++                                inner_changed = true;
++                            }
++                            continue;
++                        }
++                        if let Some((_, incoming)) = inst.phi_incoming() {
++                            let mut any_trusted = false;
++                            let mut all_ok = true;
++                            for (val, _) in incoming {
++                                match val {
++                                    LlValue::Zero | LlValue::Undef => {}
++                                    LlValue::Local(n) if locals.contains(n) => {
++                                        any_trusted = true;
++                                    }
++                                    _ => {
++                                        all_ok = false;
++                                        break;
++                                    }
++                                }
++                            }
++                            if any_trusted && all_ok && locals.insert(res.to_string()) {
++                                inner_changed = true;
++                            }
++                            continue;
++                        }
++                        if let Some(load) = inst.load().as_deref() {
++                            if matches!(load.result_ty, LlType::Ptr(1 | 2)) {
++                                if let (LlValue::Local(ptr_name), Some(info)) =
++                                    (&load.ptr.value, finfo)
++                                {
++                                    if let Some(key) = info.slot_path.get(ptr_name) {
++                                        if !info.escaped_allocas.contains(&key.0) {
++                                            if let Some(stores) = info.field_stores.get(key) {
++                                                let mut any_trusted = false;
++                                                let mut all_ok = !stores.is_empty();
++                                                for stored in stores {
++                                                    match stored {
++                                                        LlValue::Zero | LlValue::Undef => {}
++                                                        LlValue::Local(n) if locals.contains(n) => {
++                                                            any_trusted = true;
++                                                        }
++                                                        _ => {
++                                                            all_ok = false;
++                                                            break;
++                                                        }
++                                                    }
++                                                }
++                                                if any_trusted
++                                                    && all_ok
++                                                    && locals.insert(res.to_string())
++                                                {
++                                                    inner_changed = true;
++                                                }
++                                            }
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++                trusted_by_func.insert(f.name.clone(), locals);
++            }
++
++            // Aggregate per-(callee, param_idx): (has_any_trusted_call, all_calls_ok)
++            let mut callee_param_status: HashMap<(String, usize), (bool, bool)> = HashMap::new();
++            for caller in &self.functions {
++                let caller_trusted = trusted_by_func.get(&caller.name);
++                for inst in caller.carrier_insts() {
++                    let Some(call) = inst.call().as_deref() else {
++                        continue;
++                    };
++                    for (ai, arg) in call.args.iter().enumerate() {
++                        if !matches!(arg.ty, LlType::Ptr(1 | 2)) {
++                            continue;
++                        }
++                        let (is_trusted, is_ok) = match &arg.value {
++                            LlValue::Zero | LlValue::Undef => (false, true),
++                            LlValue::Local(n)
++                                if caller_trusted.is_some_and(|s| s.contains(n)) =>
++                            {
++                                (true, true)
++                            }
++                            _ => (false, false),
++                        };
++                        let st = callee_param_status
++                            .entry((call.callee.clone(), ai))
++                            .or_insert((false, true));
++                        st.0 |= is_trusted;
++                        st.1 &= is_ok;
++                    }
++                }
++            }
++
++            let mut added = false;
++            for f in &self.functions {
++                if self.entry_functions.contains(&f.name) {
++                    continue;
++                }
++                for (pi, (pname, ty)) in f.params.iter().enumerate() {
++                    if !matches!(ty, LlType::Ptr(1 | 2)) {
++                        continue;
++                    }
++                    if let Some(&(any_trusted, all_ok)) =
++                        callee_param_status.get(&(f.name.clone(), pi))
++                    {
++                        if any_trusted
++                            && all_ok
++                            && self
++                                .trusted_ro_bda_params
++                                .insert((f.name.clone(), pname.clone()))
++                        {
++                            added = true;
++                        }
++                    }
++                }
++            }
++            if !added {
++                break;
++            }
++        }
++
++        for (func_name, locals) in trusted_by_func {
++            for local in locals {
++                self.trusted_ro_bda_values
++                    .insert((func_name.clone(), local));
++            }
++        }
++    }
+ }
+ 
+ fn infer_metadata_fc_buffer_locations(
+diff --git a/src/native/ir/parse.rs b/src/native/ir/parse.rs
+index 8e79964..b872217 100644
+--- a/src/native/ir/parse.rs
++++ b/src/native/ir/parse.rs
+@@ -263,6 +263,9 @@ impl LlModule {
+             raw_buffer_params: HashSet::new(),
+             call_connected_raw_params: HashSet::new(),
+             param_connected_raw_params: HashSet::new(),
++            metadata_trusted_ro_bda_params: HashSet::new(),
++            trusted_ro_bda_params: HashSet::new(),
++            trusted_ro_bda_values: HashSet::new(),
+         };
+         module.validate_sampler_stores(ll, kern)?;
+         module.infer_metadata_buffer_pointees(kern, entry_name);
+@@ -275,6 +278,7 @@ impl LlModule {
+         module.infer_call_connected_raw_buffer_params();
+         module.propagate_raw_buffer_params();
+         module.propagate_data_buffer_params();
++        module.infer_trusted_ro_bda_params(ll);
+         Ok(module)
+     }
+ }
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+index 4139266..1120a27 100644
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -65,12 +65,27 @@ struct PendingCall {
+     bda_source_load_ptr: Option<String>,
+     bda_source_val: Option<String>,
+     bda_dead_load_line: Option<usize>,
++    descriptor_as_slot: Option<u32>,
+     has_active_table: bool,
++    reads_prim_data: bool,
+     air_result_type: String,
+     lowered_result_type: String,
+     slot_id: u32,
+ }
+ 
++fn has_air_intersect(s: &str) -> bool {
++    s.contains("@air.intersect.") || s.contains("@air.intersect(")
++}
++
++fn find_air_intersect_at(s: &str) -> Option<usize> {
++    match (s.find("@air.intersect."), s.find("@air.intersect(")) {
++        (Some(a), Some(b)) => Some(a.min(b)),
++        (Some(a), None) => Some(a),
++        (None, Some(b)) => Some(b),
++        (None, None) => None,
++    }
++}
++
+ fn llvm_line_scopes(ll: &str) -> Vec<(&str, usize)> {
+     let mut next_function = 1usize;
+     let mut scope = 0usize;
+@@ -309,10 +324,12 @@ fn extract_defined_global(line: &str) -> Option<&str> {
+ }
+ 
+ /// Discover entry parameter names that carry top-level `instance_acceleration_structure` or
+-/// `primitive_acceleration_structure` metadata so we know which `accel` operands are descriptors
+-/// vs argument-buffer 64-bit BDA handles. Scoped strictly to top-level stage entry parameter
+-/// metadata (never nested `!air.indirect_argument` nodes or non-entry helper functions).
+-fn discover_descriptor_as_params(ll: &str) -> HashSet<(usize, String)> {
++/// `primitive_acceleration_structure` metadata, mapped to their Metal buffer `air.location_index`,
++/// so we know both which `accel` operands are descriptors vs argument-buffer 64-bit BDA handles
++/// and which `slot_as_bda[slot]` entry in binding 676 holds their 64-bit AS BDA. Scoped strictly
++/// to top-level stage entry parameter metadata (never nested `!air.indirect_argument` nodes or
++/// non-entry helper functions).
++fn discover_descriptor_as_params(ll: &str) -> HashMap<(usize, String), u32> {
+     let mut md_nodes = HashMap::<u32, &str>::new();
+     let mut stage_roots = Vec::<u32>::new();
+     for line in ll.lines() {
+@@ -342,7 +359,7 @@ fn discover_descriptor_as_params(ll: &str) -> HashSet<(usize, String)> {
+         }
+     }
+ 
+-    let mut entry_as_indices = HashMap::<String, HashSet<u32>>::new();
++    let mut entry_as_indices = HashMap::<String, HashMap<u32, u32>>::new();
+     for root_id in stage_roots {
+         let Some(&root_body) = md_nodes.get(&root_id) else {
+             continue;
+@@ -368,21 +385,29 @@ fn discover_descriptor_as_params(ll: &str) -> HashSet<(usize, String)> {
+             if param_body.contains("!\"air.instance_acceleration_structure\"")
+                 || param_body.contains("!\"air.primitive_acceleration_structure\"")
+             {
+-                if let Some(first) = param_body.split(',').next() {
+-                    if let Some(idx_str) = first.trim().strip_prefix("i32 ") {
+-                        if let Ok(idx) = idx_str.trim().parse::<u32>() {
+-                            entry_as_indices
+-                                .entry(entry_global.to_string())
+-                                .or_default()
+-                                .insert(idx);
+-                        }
+-                    }
++                let parts: Vec<&str> = param_body.split(',').map(str::trim).collect();
++                if let Some(idx) = parts
++                    .first()
++                    .and_then(|first| first.strip_prefix("i32 "))
++                    .and_then(|idx_str| idx_str.trim().parse::<u32>().ok())
++                {
++                    let location = parts
++                        .iter()
++                        .position(|&tok| tok == "!\"air.location_index\"")
++                        .and_then(|pos| parts.get(pos + 1))
++                        .and_then(|tok| tok.strip_prefix("i32 "))
++                        .and_then(|s| s.trim().parse::<u32>().ok())
++                        .unwrap_or(idx);
++                    entry_as_indices
++                        .entry(entry_global.to_string())
++                        .or_default()
++                        .insert(idx, location);
+                 }
+             }
+         }
+     }
+ 
+-    let mut out = HashSet::new();
++    let mut out = HashMap::new();
+     let scoped = llvm_line_scopes(ll);
+     for (line, scope) in scoped {
+         let trimmed = line.trim_start();
+@@ -405,10 +430,10 @@ fn discover_descriptor_as_params(ll: &str) -> HashSet<(usize, String)> {
+             .into_iter()
+             .enumerate()
+         {
+-            if as_param_indices.contains(&(idx as u32)) {
++            if let Some(&location) = as_param_indices.get(&(idx as u32)) {
+                 if let Some((_, name)) = split_typed_arg(param) {
+                     if name.starts_with('%') {
+-                        out.insert((scope, name));
++                        out.insert((scope, name), location);
+                     }
+                 }
+             }
+@@ -417,50 +442,93 @@ fn discover_descriptor_as_params(ll: &str) -> HashSet<(usize, String)> {
+     out
+ }
+ 
++struct AccelClassification {
++    is_bda: bool,
++    bda_source_load_ptr: Option<String>,
++    bda_source_val: Option<String>,
++    bda_dead_load_line: Option<usize>,
++    descriptor_as_slot: Option<u32>,
++}
++
+ /// Inspect the definition of an `accel` operand within `scope` to determine whether it is a
+-/// top-level descriptor parameter or a 64-bit BDA acceleration structure handle.
++/// top-level descriptor parameter (with its Metal `air.location_index`) or a 64-bit BDA
++/// acceleration structure handle, chasing transparent `bitcast` / `addrspacecast` aliases.
+ fn classify_accel_operand(
+     scoped_lines: &[(&str, usize)],
+     scope: usize,
+     accel_ty: &str,
+     accel_val: &str,
+-    descriptor_as_params: &HashSet<(usize, String)>,
+-) -> (bool, Option<String>, Option<String>, Option<usize>) {
++    descriptor_as_params: &HashMap<(usize, String), u32>,
++) -> AccelClassification {
+     if accel_ty == "i64" {
+-        return (true, None, Some(accel_val.to_string()), None);
+-    }
+-    if descriptor_as_params.contains(&(scope, accel_val.to_string())) {
+-        return (false, None, None, None);
++        return AccelClassification {
++            is_bda: true,
++            bda_source_load_ptr: None,
++            bda_source_val: Some(accel_val.to_string()),
++            bda_dead_load_line: None,
++            descriptor_as_slot: None,
++        };
+     }
+-    // Check if accel_val is defined inside this function by `load ptr addrspace(...)` or `inttoptr`.
+-    let mut def_line = None;
+-    let mut other_uses = 0usize;
+-    for (idx, &(line, s)) in scoped_lines.iter().enumerate() {
+-        if s != scope {
+-            continue;
++    let mut cur = accel_val.trim().to_string();
++    for hop in 0..8 {
++        if let Some(&slot) = descriptor_as_params.get(&(scope, cur.clone())) {
++            return AccelClassification {
++                is_bda: false,
++                bda_source_load_ptr: None,
++                bda_source_val: None,
++                bda_dead_load_line: None,
++                descriptor_as_slot: Some(slot),
++            };
+         }
+-        let trimmed = line.trim_start();
+-        if let Some((lhs, rhs)) = trimmed.split_once(" = ") {
+-            if lhs.trim() == accel_val {
+-                def_line = Some((idx, rhs.trim()));
++        // Check if `cur` is defined inside this function by `bitcast`, `addrspacecast`, `load`, or `inttoptr`.
++        let mut def_line = None;
++        let mut other_uses = 0usize;
++        for (idx, &(line, s)) in scoped_lines.iter().enumerate() {
++            if s != scope {
+                 continue;
+             }
++            let trimmed = line.trim_start();
++            if let Some((lhs, rhs)) = trimmed.split_once(" = ") {
++                if lhs.trim() == cur {
++                    def_line = Some((idx, rhs.trim()));
++                    continue;
++                }
++            }
++            if hop == 0
++                && !has_air_intersect(trimmed)
++                && !trimmed.contains("@air.reset_intersection_query")
++                && line_uses_llvm_value(trimmed, &cur)
++            {
++                other_uses += 1;
++            }
+         }
+-        if !trimmed.contains("@air.intersect.")
+-            && !trimmed.contains("@air.reset_intersection_query")
+-            && line_uses_llvm_value(trimmed, accel_val)
++        let Some((idx, rhs)) = def_line else {
++            break;
++        };
++        if let Some(rest) = rhs
++            .strip_prefix("bitcast ")
++            .or_else(|| rhs.strip_prefix("addrspacecast "))
+         {
+-            other_uses += 1;
++            if let Some((src_part, _)) = rest.split_once(" to ") {
++                if let Some((_, next_val)) = split_typed_arg(src_part) {
++                    cur = next_val;
++                    continue;
++                }
++            }
+         }
+-    }
+-    if let Some((idx, rhs)) = def_line {
+         // Case A: `%as = inttoptr i64 %addr to ptr addrspace(1)`
+         if let Some(rest) = rhs.strip_prefix("inttoptr ") {
+             if let Some((src_part, _)) = rest.split_once(" to ") {
+                 if let Some((src_ty, src_val)) = split_typed_arg(src_part) {
+                     if src_ty == "i64" {
+-                        let dead = (other_uses == 0).then_some(idx);
+-                        return (true, None, Some(src_val), dead);
++                        let dead = (hop == 0 && other_uses == 0).then_some(idx);
++                        return AccelClassification {
++                            is_bda: true,
++                            bda_source_load_ptr: None,
++                            bda_source_val: Some(src_val),
++                            bda_dead_load_line: dead,
++                            descriptor_as_slot: None,
++                        };
+                     }
+                 }
+             }
+@@ -470,19 +538,27 @@ fn classify_accel_operand(
+             let parts = split_top_level_commas(rest);
+             if parts.len() >= 2 && parts[0].trim().starts_with("ptr") {
+                 if let Some((ptr_ty, ptr_val)) = split_typed_arg(parts[1]) {
+-                    let dead = (other_uses == 0).then_some(idx);
+-                    return (
+-                        true,
+-                        Some(format!("{ptr_ty} {ptr_val}")),
+-                        None,
+-                        dead,
+-                    );
++                    let dead = (hop == 0 && other_uses == 0).then_some(idx);
++                    return AccelClassification {
++                        is_bda: true,
++                        bda_source_load_ptr: Some(format!("{ptr_ty} {ptr_val}")),
++                        bda_source_val: None,
++                        bda_dead_load_line: dead,
++                        descriptor_as_slot: None,
++                    };
+                 }
+             }
+         }
++        break;
++    }
++    // Default: treat as descriptor AS parameter with unknown slot.
++    AccelClassification {
++        is_bda: false,
++        bda_source_load_ptr: None,
++        bda_source_val: None,
++        bda_dead_load_line: None,
++        descriptor_as_slot: None,
+     }
+-    // Default: treat as descriptor AS parameter.
+-    (false, None, None, None)
+ }
+ 
+ fn table_operand_is_non_null(
+@@ -542,25 +618,44 @@ fn lowered_result_type(family: &AirIntersectionFamily) -> String {
+     )
+ }
+ 
+-/// Lower every `@air.intersect.*` and Metal 3 `@air.*_intersection_query*` call in `ll` to
+-/// structured `@__m2v.rq.*` hardware ray queries.
++/// Lower every `@air.intersect` / `@air.intersect.*`, Metal 3 `@air.*_intersection_query*`, and
++/// `@air.is_null_{instance_acceleration_structure,primitive_acceleration_structure,intersection_function_table}`
++/// call in `ll` to structured `@__m2v.rq.*` hardware ray queries.
+ ///
+-/// Returns `Ok(None)` when `ll` contains neither `@air.intersect.` nor `_intersection_query`.
++/// Returns `Ok(None)` when `ll` contains none of those intrinsics.
++#[allow(dead_code)]
+ pub(crate) fn lower_air_ray_queries(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
+ ) -> Result<Option<String>, String> {
+-    lower_air_ray_queries_with_abi(ll, linked_callbacks, false)
++    lower_air_ray_queries_with_options(ll, linked_callbacks, false, false)
+ }
+ 
++#[allow(dead_code)]
+ pub(crate) fn lower_air_ray_queries_with_abi(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
+     ift_abi_v2: bool,
+ ) -> Result<Option<String>, String> {
+-    let has_intersect = ll.contains("@air.intersect.");
++    lower_air_ray_queries_with_options(ll, linked_callbacks, ift_abi_v2, false)
++}
++
++fn has_air_rt_is_null(ll: &str) -> bool {
++    ll.contains("@air.is_null_instance_acceleration_structure")
++        || ll.contains("@air.is_null_primitive_acceleration_structure")
++        || ll.contains("@air.is_null_intersection_function_table")
++}
++
++pub(crate) fn lower_air_ray_queries_with_options(
++    ll: &str,
++    linked_callbacks: &[LinkedRayCallback],
++    ift_abi_v2: bool,
++    prim_data_enabled: bool,
++) -> Result<Option<String>, String> {
++    let has_intersect = has_air_intersect(ll);
+     let has_iq = ll.contains("_intersection_query");
+-    if !has_intersect && !has_iq {
++    let has_is_null = has_air_rt_is_null(ll);
++    if !has_intersect && !has_iq && !has_is_null {
+         return Ok(None);
+     }
+ 
+@@ -568,17 +663,29 @@ pub(crate) fn lower_air_ray_queries_with_abi(
+     let mut changed = false;
+     let mut next_slot_id = 0u32;
+ 
+-    if has_intersect {
+-        if let Some((lowered, used_slots)) =
+-            lower_air_intersect_calls(&cur_ll, linked_callbacks, next_slot_id, ift_abi_v2)?
+-        {
++    if has_is_null {
++        if let Some(lowered) = lower_air_rt_is_null_calls(&cur_ll)? {
++            cur_ll = lowered;
++            changed = true;
++        }
++    }
++    if has_air_intersect(&cur_ll) {
++        if let Some((lowered, used_slots)) = lower_air_intersect_calls(
++            &cur_ll,
++            linked_callbacks,
++            next_slot_id,
++            ift_abi_v2,
++            prim_data_enabled,
++        )? {
+             cur_ll = lowered;
+             next_slot_id += used_slots;
+             changed = true;
+         }
+     }
+     if cur_ll.contains("_intersection_query") {
+-        if let Some(lowered) = lower_air_intersection_queries(&cur_ll, next_slot_id)? {
++        if let Some(lowered) =
++            lower_air_intersection_queries(&cur_ll, next_slot_id, prim_data_enabled)?
++        {
+             cur_ll = lowered;
+             changed = true;
+         }
+@@ -586,13 +693,158 @@ pub(crate) fn lower_air_ray_queries_with_abi(
+     Ok(changed.then_some(cur_ll))
+ }
+ 
++fn find_air_rt_is_null_callee(rhs: &str) -> Option<(usize, &'static str)> {
++    const CALLEES: [&str; 3] = [
++        "@air.is_null_instance_acceleration_structure(",
++        "@air.is_null_primitive_acceleration_structure(",
++        "@air.is_null_intersection_function_table(",
++    ];
++    CALLEES
++        .iter()
++        .filter_map(|&pat| rhs.find(pat).map(|pos| (pos, pat)))
++        .min_by_key(|&(pos, _)| pos)
++}
++
++/// Lower `@air.is_null_instance_acceleration_structure`,
++/// `@air.is_null_primitive_acceleration_structure`, and
++/// `@air.is_null_intersection_function_table` calls and strip their declarations:
++/// - null / undef / `@air.get_null_intersection_function_table` -> `true` (`or i1 true, true`)
++/// - BDA-loaded handle -> `icmp eq i64 %bda, 0`
++/// - direct descriptor handle -> `false` (`or i1 false, false`)
++fn lower_air_rt_is_null_calls(ll: &str) -> Result<Option<String>, String> {
++    if !has_air_rt_is_null(ll) {
++        return Ok(None);
++    }
++    let scoped_lines = llvm_line_scopes(ll);
++    let descriptor_as_params = discover_descriptor_as_params(ll);
++
++    enum IsNullLowering {
++        Constant(bool),
++        BdaLoad(String),
++        BdaVal(String),
++    }
++
++    let mut replacements: HashMap<usize, (Option<String>, IsNullLowering)> = HashMap::new();
++    let mut dead_load_lines: HashSet<usize> = HashSet::new();
++    let mut any_change = false;
++
++    for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with("declare ") && has_air_rt_is_null(trimmed) {
++            any_change = true;
++            continue;
++        }
++        if scope == 0 {
++            continue;
++        }
++        let (lhs, call_part) = if let Some((l, r)) = trimmed.split_once(" = ") {
++            (Some(l.trim().to_string()), r.trim())
++        } else {
++            (None, trimmed)
++        };
++        let Some((at_pos, pat)) = find_air_rt_is_null_callee(call_part) else {
++            continue;
++        };
++        let open = at_pos + pat.len() - 1;
++        let Some(close) = find_matching_paren(call_part, open) else {
++            return Err(format!("malformed {pat} call: {trimmed}"));
++        };
++        let args = split_top_level_commas(&call_part[open + 1..close]);
++        let (arg_ty, arg_val) = args
++            .first()
++            .and_then(|a| split_typed_arg(a))
++            .ok_or_else(|| format!("malformed operand in {pat}: {trimmed}"))?;
++
++        let lowering = if !table_operand_is_non_null(&scoped_lines, scope, &arg_val) {
++            IsNullLowering::Constant(true)
++        } else {
++            let accel = classify_accel_operand(
++                &scoped_lines,
++                scope,
++                &arg_ty,
++                &arg_val,
++                &descriptor_as_params,
++            );
++            if accel.is_bda {
++                // Only drop the original `load ptr` if NO other instruction (including
++                // `@air.intersect` / `@air.reset_intersection_query`!) still uses `arg_val`.
++                if let Some(dl) = accel.bda_dead_load_line {
++                    let used_elsewhere = scoped_lines.iter().enumerate().any(|(i, &(l, s))| {
++                        s == scope
++                            && i != line_idx
++                            && i != dl
++                            && line_uses_llvm_value(l.trim_start(), &arg_val)
++                    });
++                    if !used_elsewhere {
++                        dead_load_lines.insert(dl);
++                    }
++                }
++                if let Some(src_ptr) = accel.bda_source_load_ptr {
++                    IsNullLowering::BdaLoad(src_ptr)
++                } else if let Some(src_val) = accel.bda_source_val {
++                    IsNullLowering::BdaVal(src_val)
++                } else {
++                    IsNullLowering::BdaVal(arg_val)
++                }
++            } else {
++                IsNullLowering::Constant(false)
++            }
++        };
++        replacements.insert(line_idx, (lhs, lowering));
++        any_change = true;
++    }
++
++    if !any_change {
++        return Ok(None);
++    }
++
++    let mut out = String::with_capacity(ll.len() + 256);
++    for (line_idx, &(line, _)) in scoped_lines.iter().enumerate() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with("declare ") && has_air_rt_is_null(trimmed) {
++            continue;
++        }
++        if dead_load_lines.contains(&line_idx) {
++            continue;
++        }
++        if let Some((lhs, lowering)) = replacements.get(&line_idx) {
++            if let Some(lhs) = lhs {
++                let indent = &line[..line.len() - trimmed.len()];
++                match lowering {
++                    IsNullLowering::Constant(true) => {
++                        out.push_str(&format!("{indent}{lhs} = or i1 true, true\n"));
++                    }
++                    IsNullLowering::Constant(false) => {
++                        out.push_str(&format!("{indent}{lhs} = or i1 false, false\n"));
++                    }
++                    IsNullLowering::BdaLoad(src_ptr) => {
++                        let tmp = format!("%__m2v.rq.is_null_bda.{line_idx}");
++                        out.push_str(&format!(
++                            "{indent}{tmp} = load i64, {src_ptr}, align 8\n\
++                             {indent}{lhs} = icmp eq i64 {tmp}, 0\n"
++                        ));
++                    }
++                    IsNullLowering::BdaVal(val) => {
++                        out.push_str(&format!("{indent}{lhs} = icmp eq i64 {val}, 0\n"));
++                    }
++                }
++            }
++            continue;
++        }
++        out.push_str(line);
++        out.push('\n');
++    }
++    Ok(Some(out))
++}
++
+ fn lower_air_intersect_calls(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
+     slot_base: u32,
+     ift_abi_v2: bool,
++    prim_data_enabled: bool,
+ ) -> Result<Option<(String, u32)>, String> {
+-    if !ll.contains("@air.intersect.") {
++    if !has_air_intersect(ll) {
+         return Ok(None);
+     }
+ 
+@@ -608,7 +860,7 @@ fn lower_air_intersect_calls(
+         let Some((lhs, rhs)) = trimmed.split_once(" = ") else {
+             continue;
+         };
+-        let Some(at_pos) = rhs.find("@air.intersect.") else {
++        let Some(at_pos) = find_air_intersect_at(rhs) else {
+             continue;
+         };
+         let Some(open_rel) = rhs[at_pos..].find('(') else {
+@@ -637,14 +889,13 @@ fn lower_air_intersect_calls(
+             ));
+         }
+         let (accel_ty, accel_val) = &raw_args[4];
+-        let (accel_is_bda, bda_source_load_ptr, bda_source_val, bda_dead_load_line) =
+-            classify_accel_operand(
+-                &scoped_lines,
+-                scope,
+-                accel_ty,
+-                accel_val,
+-                &descriptor_as_params,
+-            );
++        let accel = classify_accel_operand(
++            &scoped_lines,
++            scope,
++            accel_ty,
++            accel_val,
++            &descriptor_as_params,
++        );
+         let table_idx = family.intersection_table_argument_index();
+         let has_active_table = family.intersection_function_buffer
+             || raw_args
+@@ -662,11 +913,13 @@ fn lower_air_intersect_calls(
+             family,
+             raw_args,
+             helper_name: format!("__m2v.rq.query.{ordinal}"),
+-            accel_is_bda,
+-            bda_source_load_ptr,
+-            bda_source_val,
+-            bda_dead_load_line,
++            accel_is_bda: accel.is_bda,
++            bda_source_load_ptr: accel.bda_source_load_ptr,
++            bda_source_val: accel.bda_source_val,
++            bda_dead_load_line: accel.bda_dead_load_line,
++            descriptor_as_slot: accel.descriptor_as_slot,
+             has_active_table,
++            reads_prim_data: false,
+             slot_id: slot_base + (ordinal as u32),
+         });
+     }
+@@ -714,11 +967,15 @@ fn lower_air_intersect_calls(
+         lowered_aggregates.extend(discovered);
+     }
+ 
+-    // Direct field-4 (`OpaquePointer` / primitive_data) extractions become `null` before field 4
+-    // changes to `i64`, and any null-derived bitcasts/GEPs/loads in dead null-guarded branches
+-    // fold cleanly to `null` / zero literals so native emission never loads from `null`.
++    // Field-4 (`OpaquePointer` / primitive_data) extractions:
++    // - When `prim_data_enabled == false`, fold to `null` (and drop dead null-guarded branches) so
++    //   existing translations stay byte-identical and never load from `null`.
++    // - When `prim_data_enabled == true`, preserve the real 64-bit lookup address in field 4 and
++    //   rewrite `extractvalue ..., 4` to `extractvalue` (`i64`) + `inttoptr`.
+     let mut opaque_extractions: Vec<(usize, String)> = Vec::new();
+     let mut opaque_extract_lines: HashSet<usize> = HashSet::new();
++    let mut prim_data_extracts: HashMap<usize, (String, String, String, String)> = HashMap::new();
++    let mut prim_data_scopes: HashSet<(usize, String)> = HashSet::new();
+     for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
+         let Some((defined, instruction)) = line.trim_start().split_once(" = ") else {
+             continue;
+@@ -729,11 +986,36 @@ fn lower_air_intersect_calls(
+         if !rest.trim_end().ends_with(", 4") {
+             continue;
+         }
+-        if lowered_aggregates.iter().any(|(s, r, air_ty, _)| {
++        if let Some((_, _, air_ty, low_ty)) = lowered_aggregates.iter().find(|(s, r, air_ty, _)| {
+             *s == scope && rest.starts_with(air_ty) && line_uses_llvm_value(rest, r)
+         }) {
+-            opaque_extractions.push((scope, defined.trim().to_string()));
+-            opaque_extract_lines.insert(line_idx);
++            if prim_data_enabled {
++                if let Some(after_ty) = rest.strip_prefix(air_ty.as_str()) {
++                    if let Some(agg_val) = after_ty.trim().strip_suffix(", 4") {
++                        let ptr_ty = struct_field_types(air_ty)
++                            .and_then(|fields| fields.get(4).cloned())
++                            .unwrap_or_else(|| "ptr addrspace(1)".to_string());
++                        prim_data_extracts.insert(
++                            line_idx,
++                            (
++                                defined.trim().to_string(),
++                                low_ty.clone(),
++                                agg_val.trim().to_string(),
++                                ptr_ty,
++                            ),
++                        );
++                        prim_data_scopes.insert((scope, air_ty.clone()));
++                    }
++                }
++            } else {
++                opaque_extractions.push((scope, defined.trim().to_string()));
++                opaque_extract_lines.insert(line_idx);
++            }
++        }
++    }
++    for p in &mut pending {
++        if prim_data_scopes.contains(&(p.scope, p.air_result_type.clone())) {
++            p.reads_prim_data = true;
+         }
+     }
+     let (mut null_drop_lines, null_replacements) =
+@@ -753,13 +1035,21 @@ fn lower_air_intersect_calls(
+     let mut out = String::with_capacity(ll.len() + 4096);
+     for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
+         let trimmed = line.trim_start();
+-        // Drop old `declare ... @air.intersect.*(...)` declarations once lowered.
+-        if trimmed.starts_with("declare ") && trimmed.contains("@air.intersect.") {
++        // Drop old `declare ... @air.intersect[.*](...)` declarations once lowered.
++        if trimmed.starts_with("declare ") && has_air_intersect(trimmed) {
+             continue;
+         }
+         if dead_load_lines.contains(&line_idx) || null_drop_lines.contains(&line_idx) {
+             continue;
+         }
++        if let Some((lhs, low_ty, agg_val, ptr_ty)) = prim_data_extracts.get(&line_idx) {
++            let indent = &line[..line.len() - trimmed.len()];
++            out.push_str(&format!(
++                "{indent}%__m2v.rq.prim_data.f4.{line_idx} = extractvalue {low_ty} {agg_val}, 4\n\
++                 {indent}{lhs} = inttoptr i64 %__m2v.rq.prim_data.f4.{line_idx} to {ptr_ty}\n"
++            ));
++            continue;
++        }
+         if let Some(&pidx) = pending_by_line.get(&line_idx) {
+             let p = &pending[pidx];
+             let indent = &line[..line.len() - trimmed.len()];
+@@ -806,12 +1096,25 @@ fn lower_air_intersect_calls(
+         out.push('\n');
+     }
+ 
++    let any_prim_data_used = prim_data_enabled
++        && pending.iter().any(|p| {
++            p.reads_prim_data
++                || (p.has_active_table
++                    && linked_callbacks.iter().any(|cb| {
++                        cb.param_roles
++                            .contains(&CallbackParamRole::PrimitiveDataPtr)
++                    }))
++        });
++
+     // Emit `@__m2v.rq.*` intrinsic declarations (only if not already present in module).
+     append_rq_intrinsic_declarations(&mut out, ll);
++    if any_prim_data_used {
++        append_prim_data_lookup_support(&mut out);
++    }
+ 
+     // Emit each structured ray-query helper function.
+     for p in &pending {
+-        let helper = emit_ray_query_helper(p, linked_callbacks, ift_abi_v2)?;
++        let helper = emit_ray_query_helper(p, linked_callbacks, ift_abi_v2, prim_data_enabled)?;
+         out.push_str(&helper);
+     }
+ 
+@@ -918,6 +1221,21 @@ struct IqOpCall {
+     accel_is_bda: bool,
+     bda_source_load_ptr: Option<String>,
+     bda_source_val: Option<String>,
++    descriptor_as_slot: Option<u32>,
++    ret_ptr_ty: Option<String>,
++}
++
++fn parse_call_ptr_return_type(call_prefix: &str) -> String {
++    if let Some(pos) = call_prefix.find("ptr") {
++        let tail = call_prefix[pos..].trim();
++        if tail.starts_with("ptr addrspace(") {
++            if let Some(end) = tail.find(')') {
++                return tail[..=end].to_string();
++            }
++        }
++        return "ptr".to_string();
++    }
++    "ptr addrspace(1)".to_string()
+ }
+ 
+ fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool)> {
+@@ -975,7 +1293,11 @@ fn resolve_iq_slot(
+     None
+ }
+ 
+-fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<String>, String> {
++fn lower_air_intersection_queries(
++    ll: &str,
++    slot_base: u32,
++    prim_data_enabled: bool,
++) -> Result<Option<String>, String> {
+     if !ll.contains("_intersection_query") {
+         return Ok(None);
+     }
+@@ -991,6 +1313,8 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+     let mut null_ptr_vars: Vec<(usize, String)> = Vec::new();
+     let mut dead_load_lines: HashSet<usize> = HashSet::new();
+     let mut commit_aabb_slots: Vec<u32> = Vec::new();
++    let mut prim_data_slots: HashSet<u32> = HashSet::new();
++    let mut iq_prim_helpers: Vec<(u32, bool, bool)> = Vec::new();
+ 
+     for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
+         if scope == 0 {
+@@ -1044,6 +1368,8 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+                     accel_is_bda: false,
+                     bda_source_load_ptr: None,
+                     bda_source_val: None,
++                    descriptor_as_slot: None,
++                    ret_ptr_ty: None,
+                 },
+             );
+             continue;
+@@ -1059,6 +1385,8 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+         let mut accel_is_bda = false;
+         let mut bda_source_load_ptr = None;
+         let mut bda_source_val = None;
++        let mut descriptor_as_slot = None;
++        let mut ret_ptr_ty = None;
+         if op == "reset" {
+             if raw_args.len() < 12 {
+                 return Err(format!(
+@@ -1067,17 +1395,18 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+                 ));
+             }
+             let (accel_ty, accel_val) = &raw_args[5];
+-            let (is_bda, src_ptr, src_val, dead_line) = classify_accel_operand(
++            let accel = classify_accel_operand(
+                 &scoped_lines,
+                 scope,
+                 accel_ty,
+                 accel_val,
+                 &descriptor_as_params,
+             );
+-            accel_is_bda = is_bda;
+-            bda_source_load_ptr = src_ptr;
+-            bda_source_val = src_val;
+-            if let Some(dl) = dead_line {
++            accel_is_bda = accel.is_bda;
++            bda_source_load_ptr = accel.bda_source_load_ptr;
++            bda_source_val = accel.bda_source_val;
++            descriptor_as_slot = accel.descriptor_as_slot;
++            if let Some(dl) = accel.bda_dead_load_line {
+                 dead_load_lines.insert(dl);
+             }
+         } else if op == "commit_bounding_box_intersection" {
+@@ -1088,7 +1417,16 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+             op.as_str(),
+             "get_candidate_primitive_data" | "get_committed_primitive_data"
+         ) {
+-            if let Some(ref var) = lhs {
++            if prim_data_enabled {
++                if lhs.is_some() {
++                    prim_data_slots.insert(slot_id);
++                    ret_ptr_ty = Some(parse_call_ptr_return_type(&call_part[..at_pos]));
++                    let helper_key = (slot_id, op == "get_committed_primitive_data", has_instancing);
++                    if !iq_prim_helpers.contains(&helper_key) {
++                        iq_prim_helpers.push(helper_key);
++                    }
++                }
++            } else if let Some(ref var) = lhs {
+                 null_ptr_vars.push((scope, var.clone()));
+             }
+         }
+@@ -1105,6 +1443,8 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+                 accel_is_bda,
+                 bda_source_load_ptr,
+                 bda_source_val,
++                descriptor_as_slot,
++                ret_ptr_ty,
+             },
+         );
+     }
+@@ -1129,7 +1469,7 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+             continue;
+         }
+ 
+-        // Insert per-slot CW-polarity alloca right after the entry label of each function with IQs.
++        // Insert per-slot CW-polarity (and optional AS root BDA) allocas right after the entry label.
+         if scope != 0
+             && !entry_inserted.contains(&scope)
+             && !trimmed.starts_with("define ")
+@@ -1144,6 +1484,12 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+                         "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
+                          \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
+                     ));
++                    if prim_data_slots.contains(&slot) {
++                        out.push_str(&format!(
++                            "  %__m2v.rq.as_root.{slot} = alloca i64, align 8\n\
++                             \x20 store i64 0, ptr %__m2v.rq.as_root.{slot}, align 8\n"
++                        ));
++                    }
+                 }
+             }
+             entry_inserted.insert(scope);
+@@ -1155,9 +1501,26 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+             let slot = call.slot_id;
+             let pfx = format!("__m2v.iq.{line_idx}");
+             match call.op.as_str() {
+-                "allocate" | "deallocate" | "get_candidate_primitive_data"
+-                | "get_committed_primitive_data" => {
+-                    // Handled by slot allocation / null replacement.
++                "allocate" | "deallocate" => {
++                    // Handled by slot allocation.
++                }
++                "get_candidate_primitive_data" | "get_committed_primitive_data" => {
++                    if prim_data_enabled {
++                        if let Some(ref lhs) = call.lhs {
++                            let is_comm = call.op == "get_committed_primitive_data";
++                            let kind_tag = if is_comm { "comm" } else { "cand" };
++                            let inst_tag = if call.has_instancing { 1 } else { 0 };
++                            let ptr_ty = call
++                                .ret_ptr_ty
++                                .as_deref()
++                                .unwrap_or("ptr addrspace(1)");
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.root = load i64, ptr %__m2v.rq.as_root.{slot}, align 8\n\
++                                 {indent}%__m2v.rq.prim_data.iq.{line_idx} = call i64 @__m2v.rq.query.iq_prim.{kind_tag}.{slot}.{inst_tag}(i64 %{pfx}.root)\n\
++                                 {indent}{lhs} = inttoptr i64 %__m2v.rq.prim_data.iq.{line_idx} to {ptr_ty}\n"
++                            ));
++                        }
++                    }
+                 }
+                 "reset" => {
+                     let orig = &call.raw_args[1].1;
+@@ -1233,10 +1596,27 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+                         } else {
+                             call.raw_args[5].1.clone()
+                         };
++                        if prim_data_slots.contains(&slot) {
++                            out.push_str(&format!(
++                                "{indent}store i64 {bda_operand}, ptr %__m2v.rq.as_root.{slot}, align 8\n"
++                            ));
++                        }
+                         out.push_str(&format!(
+                             "{indent}call void @__m2v.rq.init.bda(i32 {slot}, i64 {bda_operand}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
+                         ));
+                     } else {
++                        if prim_data_slots.contains(&slot) {
++                            if let Some(as_slot) = call.descriptor_as_slot {
++                                out.push_str(&format!(
++                                    "{indent}%{pfx}.as_root = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n\
++                                     {indent}store i64 %{pfx}.as_root, ptr %__m2v.rq.as_root.{slot}, align 8\n"
++                                ));
++                            } else {
++                                out.push_str(&format!(
++                                    "{indent}store i64 0, ptr %__m2v.rq.as_root.{slot}, align 8\n"
++                                ));
++                            }
++                        }
+                         let as_val = &call.raw_args[5].1;
+                         out.push_str(&format!(
+                             "{indent}call void @__m2v.rq.init(i32 {slot}, ptr addrspace(1) {as_val}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
+@@ -1477,6 +1857,9 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+     }
+ 
+     append_rq_intrinsic_declarations(&mut out, ll);
++    if !iq_prim_helpers.is_empty() {
++        append_prim_data_lookup_support(&mut out);
++    }
+ 
+     // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
+     for slot in commit_aabb_slots {
+@@ -1498,9 +1881,257 @@ fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<Str
+         ));
+     }
+ 
++    // Emit UB-safe intersection_query primitive_data helpers (committed checks committed_type != 0).
++    for (slot, is_comm, has_inst) in iq_prim_helpers {
++        let kind_tag = if is_comm { "comm" } else { "cand" };
++        let inst_tag = if has_inst { 1 } else { 0 };
++        let isect = if is_comm { 1 } else { 0 };
++        let fn_name = format!("@__m2v.rq.query.iq_prim.{kind_tag}.{slot}.{inst_tag}");
++        if out.contains(&format!("define internal i64 {fn_name}(")) {
++            continue;
++        }
++        let inst_lines = if has_inst {
++            format!("  %inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 {isect})\n")
++        } else {
++            String::new()
++        };
++        let inst_arg = if has_inst { "%inst" } else { "0" };
++        if is_comm {
++            out.push_str(&format!(
++                "\ndefine internal i64 {fn_name}(i64 %root_bda) {{\n\
++                 entry:\n\
++                 \x20 %ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
++                 \x20 %hit = icmp ne i32 %ct, 0\n\
++                 \x20 br i1 %hit, label %read, label %done\n\
++                 read:\n\
++                 \x20 %prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 1)\n\
++                 \x20 %geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 1)\n\
++                 {inst_lines}\
++                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
++                 \x20 br label %done\n\
++                 done:\n\
++                 \x20 %res = phi i64 [ %addr, %read ], [ 0, %entry ]\n\
++                 \x20 ret i64 %res\n\
++                 }}\n"
++            ));
++        } else {
++            out.push_str(&format!(
++                "\ndefine internal i64 {fn_name}(i64 %root_bda) {{\n\
++                 entry:\n\
++                 \x20 %prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
++                 \x20 %geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
++                 {inst_lines}\
++                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
++                 \x20 ret i64 %addr\n\
++                 }}\n"
++            ));
++        }
++    }
++
+     Ok(Some(out))
+ }
+ 
++/// Emit `@__m2v.rq.{prim_table_bda,prim_table_mask,slot_as_bda}` declarations and the structured
++/// plain-LLVM-IR `@__m2v.rq.query.{probe_prim_slot,lookup_prim_data}` helpers (deduplicated once
++/// per module, only emitted when `GARNETX_CAP_RT_PRIMITIVE_DATA` is enabled and prim data is read).
++fn append_prim_data_lookup_support(out: &mut String) {
++    let decls = [
++        "declare i64 @__m2v.rq.prim_table_bda()",
++        "declare i32 @__m2v.rq.prim_table_mask()",
++        "declare i64 @__m2v.rq.slot_as_bda(i32)",
++    ];
++    for d in decls {
++        if !out.contains(d) {
++            out.push_str(d);
++            out.push('\n');
++        }
++    }
++    if !out.contains("define internal i64 @__m2v.rq.query.probe_prim_slot(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %key) {\n\
++             entry:\n\
++             \x20 %h0 = lshr i64 %key, 8\n\
++             \x20 %h1 = mul i64 %h0, 7046029254386353131\n\
++             \x20 %h2 = lshr i64 %h1, 32\n\
++             \x20 %h3 = xor i64 %h1, %h2\n\
++             \x20 %h4 = trunc i64 %h3 to i32\n\
++             \x20 %start = and i32 %h4, %mask\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             loop_hdr:\n\
++             \x20 %step = phi i32 [ 0, %entry ], [ %step_next, %loop_latch ]\n\
++             \x20 %done = phi i1 [ false, %entry ], [ %done_next, %loop_latch ]\n\
++             \x20 %found = phi i64 [ 0, %entry ], [ %found_next, %loop_latch ]\n\
++             \x20 %not_done = xor i1 %done, true\n\
++             \x20 %in_lim = icmp ult i32 %step, 32\n\
++             \x20 %cont = and i1 %not_done, %in_lim\n\
++             \x20 br i1 %cont, label %loop_body, label %exit\n\
++             \n\
++             loop_body:\n\
++             \x20 %idx0 = add i32 %start, %step\n\
++             \x20 %idx = and i32 %idx0, %mask\n\
++             \x20 %idx64 = zext i32 %idx to i64\n\
++             \x20 %off = shl i64 %idx64, 5\n\
++             \x20 %__m2v.rq.prim_data.slot_addr = add i64 %tbl_bda, %off\n\
++             \x20 %slot_ptr = inttoptr i64 %__m2v.rq.prim_data.slot_addr to ptr addrspace(1)\n\
++             \x20 %slot_key = load i64, ptr addrspace(1) %slot_ptr, align 8\n\
++             \x20 %is_hit = icmp eq i64 %slot_key, %key\n\
++             \x20 %is_empty = icmp eq i64 %slot_key, 0\n\
++             \x20 %done_next = or i1 %is_hit, %is_empty\n\
++             \x20 %found_next = select i1 %is_hit, i64 %__m2v.rq.prim_data.slot_addr, i64 0\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             loop_latch:\n\
++             \x20 %step_next = add i32 %step, 1\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             exit:\n\
++             \x20 ret i64 %found\n\
++             }\n",
++        );
++    }
++    if !out.contains("define internal i64 @__m2v.rq.query.lookup_prim_data(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 %has_inst, i32 %inst_id, i32 %geom_id, i32 %prim_id) {\n\
++             entry:\n\
++             \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
++             \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
++             \x20 %root_ok = icmp ugt i64 %root_bda, 1\n\
++             \x20 %tbl_ok = icmp ne i64 %tbl_bda, 0\n\
++             \x20 %both_ok = and i1 %root_ok, %tbl_ok\n\
++             \x20 br i1 %both_ok, label %probe1, label %exit_all\n\
++             \n\
++             probe1:\n\
++             \x20 %s1_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %root_bda)\n\
++             \x20 %s1_ok = icmp ne i64 %s1_addr, 0\n\
++             \x20 br i1 %s1_ok, label %read_s1, label %after_probe1\n\
++             \n\
++             read_s1:\n\
++             \x20 %__m2v.rq.prim_data.s1_p8 = add i64 %s1_addr, 8\n\
++             \x20 %s1_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p8 to ptr addrspace(1)\n\
++             \x20 %s1_pay = load i64, ptr addrspace(1) %s1_pay_ptr, align 8\n\
++             \x20 %__m2v.rq.prim_data.s1_p16 = add i64 %s1_addr, 16\n\
++             \x20 %s1_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p16 to ptr addrspace(1)\n\
++             \x20 %s1_cnt = load i32, ptr addrspace(1) %s1_cnt_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.s1_p28 = add i64 %s1_addr, 28\n\
++             \x20 %s1_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p28 to ptr addrspace(1)\n\
++             \x20 %s1_knd = load i32, ptr addrspace(1) %s1_knd_ptr, align 4\n\
++             \x20 %want_inst = icmp ne i32 %has_inst, 0\n\
++             \x20 %is_tlas = icmp eq i32 %s1_knd, 1\n\
++             \x20 %do_tlas = and i1 %want_inst, %is_tlas\n\
++             \x20 br i1 %do_tlas, label %tlas_check, label %blas_check_kind\n\
++             \n\
++             tlas_check:\n\
++             \x20 %tlas_pay_ok = icmp ne i64 %s1_pay, 0\n\
++             \x20 %inst_in_b = icmp ult i32 %inst_id, %s1_cnt\n\
++             \x20 %tlas_ok = and i1 %tlas_pay_ok, %inst_in_b\n\
++             \x20 br i1 %tlas_ok, label %tlas_load, label %tlas_done\n\
++             \n\
++             tlas_load:\n\
++             \x20 %__m2v.rq.prim_data.s1_p20 = add i64 %s1_addr, 20\n\
++             \x20 %s1_str_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p20 to ptr addrspace(1)\n\
++             \x20 %s1_str = load i32, ptr addrspace(1) %s1_str_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.s1_p24 = add i64 %s1_addr, 24\n\
++             \x20 %s1_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p24 to ptr addrspace(1)\n\
++             \x20 %s1_ref = load i32, ptr addrspace(1) %s1_ref_ptr, align 4\n\
++             \x20 %inst64 = zext i32 %inst_id to i64\n\
++             \x20 %str64 = zext i32 %s1_str to i64\n\
++             \x20 %ref64 = zext i32 %s1_ref to i64\n\
++             \x20 %inst_off0 = mul i64 %inst64, %str64\n\
++             \x20 %inst_off = add i64 %inst_off0, %ref64\n\
++             \x20 %__m2v.rq.prim_data.blas_ref = add i64 %s1_pay, %inst_off\n\
++             \x20 %blas_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.blas_ref to ptr addrspace(1)\n\
++             \x20 %blas_bda = load i64, ptr addrspace(1) %blas_ref_ptr, align 8\n\
++             \x20 %blas_bda_ok = icmp ugt i64 %blas_bda, 1\n\
++             \x20 br i1 %blas_bda_ok, label %probe2, label %tlas_load_done\n\
++             \n\
++             probe2:\n\
++             \x20 %s2_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %blas_bda)\n\
++             \x20 %s2_ok = icmp ne i64 %s2_addr, 0\n\
++             \x20 br i1 %s2_ok, label %read_s2, label %probe2_done\n\
++             \n\
++             read_s2:\n\
++             \x20 %__m2v.rq.prim_data.s2_p8 = add i64 %s2_addr, 8\n\
++             \x20 %s2_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p8 to ptr addrspace(1)\n\
++             \x20 %s2_pay = load i64, ptr addrspace(1) %s2_pay_ptr, align 8\n\
++             \x20 %__m2v.rq.prim_data.s2_p16 = add i64 %s2_addr, 16\n\
++             \x20 %s2_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p16 to ptr addrspace(1)\n\
++             \x20 %s2_cnt = load i32, ptr addrspace(1) %s2_cnt_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.s2_p28 = add i64 %s2_addr, 28\n\
++             \x20 %s2_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p28 to ptr addrspace(1)\n\
++             \x20 %s2_knd = load i32, ptr addrspace(1) %s2_knd_ptr, align 4\n\
++             \x20 %s2_is_blas = icmp eq i32 %s2_knd, 0\n\
++             \x20 %s2_gtbl = select i1 %s2_is_blas, i64 %s2_pay, i64 0\n\
++             \x20 %s2_gcnt = select i1 %s2_is_blas, i32 %s2_cnt, i32 0\n\
++             \x20 br label %probe2_done\n\
++             \n\
++             probe2_done:\n\
++             \x20 %p2_tbl = phi i64 [ %s2_gtbl, %read_s2 ], [ 0, %probe2 ]\n\
++             \x20 %p2_cnt = phi i32 [ %s2_gcnt, %read_s2 ], [ 0, %probe2 ]\n\
++             \x20 br label %tlas_load_done\n\
++             \n\
++             tlas_load_done:\n\
++             \x20 %tl_tbl = phi i64 [ %p2_tbl, %probe2_done ], [ 0, %tlas_load ]\n\
++             \x20 %tl_cnt = phi i32 [ %p2_cnt, %probe2_done ], [ 0, %tlas_load ]\n\
++             \x20 br label %tlas_done\n\
++             \n\
++             tlas_done:\n\
++             \x20 %td_tbl = phi i64 [ %tl_tbl, %tlas_load_done ], [ 0, %tlas_check ]\n\
++             \x20 %td_cnt = phi i32 [ %tl_cnt, %tlas_load_done ], [ 0, %tlas_check ]\n\
++             \x20 br label %blas_merge\n\
++             \n\
++             blas_check_kind:\n\
++             \x20 %s1_is_blas = icmp eq i32 %s1_knd, 0\n\
++             \x20 %s1_gtbl = select i1 %s1_is_blas, i64 %s1_pay, i64 0\n\
++             \x20 %s1_gcnt = select i1 %s1_is_blas, i32 %s1_cnt, i32 0\n\
++             \x20 br label %blas_merge\n\
++             \n\
++             blas_merge:\n\
++             \x20 %geom_tbl = phi i64 [ %td_tbl, %tlas_done ], [ %s1_gtbl, %blas_check_kind ]\n\
++             \x20 %geom_cnt = phi i32 [ %td_cnt, %tlas_done ], [ %s1_gcnt, %blas_check_kind ]\n\
++             \x20 %gtbl_ok = icmp ne i64 %geom_tbl, 0\n\
++             \x20 %geom_in_b = icmp ult i32 %geom_id, %geom_cnt\n\
++             \x20 %geom_ok = and i1 %gtbl_ok, %geom_in_b\n\
++             \x20 br i1 %geom_ok, label %read_geom, label %after_geom\n\
++             \n\
++             read_geom:\n\
++             \x20 %geom64 = zext i32 %geom_id to i64\n\
++             \x20 %geom_off = shl i64 %geom64, 4\n\
++             \x20 %__m2v.rq.prim_data.g0 = add i64 %geom_tbl, %geom_off\n\
++             \x20 %g_data_ptr = inttoptr i64 %__m2v.rq.prim_data.g0 to ptr addrspace(1)\n\
++             \x20 %g_data = load i64, ptr addrspace(1) %g_data_ptr, align 8\n\
++             \x20 %__m2v.rq.prim_data.g8 = add i64 %__m2v.rq.prim_data.g0, 8\n\
++             \x20 %g_str_ptr = inttoptr i64 %__m2v.rq.prim_data.g8 to ptr addrspace(1)\n\
++             \x20 %g_str = load i32, ptr addrspace(1) %g_str_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.g12 = add i64 %__m2v.rq.prim_data.g0, 12\n\
++             \x20 %g_pcnt_ptr = inttoptr i64 %__m2v.rq.prim_data.g12 to ptr addrspace(1)\n\
++             \x20 %g_pcnt = load i32, ptr addrspace(1) %g_pcnt_ptr, align 4\n\
++             \x20 %g_data_ok = icmp ne i64 %g_data, 0\n\
++             \x20 %prim_in_b = icmp ult i32 %prim_id, %g_pcnt\n\
++             \x20 %prim_ok = and i1 %g_data_ok, %prim_in_b\n\
++             \x20 %prim64 = zext i32 %prim_id to i64\n\
++             \x20 %g_str64 = zext i32 %g_str to i64\n\
++             \x20 %prim_off = mul i64 %prim64, %g_str64\n\
++             \x20 %prim_addr = add i64 %g_data, %prim_off\n\
++             \x20 %final_addr = select i1 %prim_ok, i64 %prim_addr, i64 0\n\
++             \x20 br label %after_geom\n\
++             \n\
++             after_geom:\n\
++             \x20 %geom_res = phi i64 [ %final_addr, %read_geom ], [ 0, %blas_merge ]\n\
++             \x20 br label %after_probe1\n\
++             \n\
++             after_probe1:\n\
++             \x20 %p1_res = phi i64 [ %geom_res, %after_geom ], [ 0, %probe1 ]\n\
++             \x20 br label %exit_all\n\
++             \n\
++             exit_all:\n\
++             \x20 %res = phi i64 [ %p1_res, %after_probe1 ], [ 0, %entry ]\n\
++             \x20 ret i64 %res\n\
++             }\n",
++        );
++    }
++}
++
+ fn append_rq_intrinsic_declarations(out: &mut String, existing_ll: &str) {
+     let decls = [
+         "declare void @__m2v.rq.init(i32, ptr addrspace(1), i32, i32, <3 x float>, float, <3 x float>, float)",
+@@ -1622,6 +2253,7 @@ fn emit_ray_query_helper(
+     p: &PendingCall,
+     linked_callbacks: &[LinkedRayCallback],
+     ift_abi_v2: bool,
++    prim_data_enabled: bool,
+ ) -> Result<String, String> {
+     let family = &p.family;
+     let idx = param_indices(family);
+@@ -1816,6 +2448,7 @@ fn emit_ray_query_helper(
+                     &idx,
+                     p,
+                     ift_abi_v2,
++                    prim_data_enabled,
+                     &table_param,
+                 )?;
+             }
+@@ -1848,6 +2481,7 @@ fn emit_ray_query_helper(
+                     &idx,
+                     p,
+                     ift_abi_v2,
++                    prim_data_enabled,
+                     &table_param,
+                 )?;
+             }
+@@ -1906,11 +2540,34 @@ fn emit_ray_query_helper(
+             ));
+         }
+     }
++    if prim_data_enabled && p.reads_prim_data {
++        let root_bda = if p.accel_is_bda {
++            "%p4".to_string()
++        } else if let Some(as_slot) = p.descriptor_as_slot {
++            s.push_str(&format!(
++                "  %hit_root_bda = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"
++            ));
++            "%hit_root_bda".to_string()
++        } else {
++            "0".to_string()
++        };
++        let (has_inst_i32, inst_val) = if has_instancing {
++            (1, "%hit_inst")
++        } else {
++            (0, "0")
++        };
++        s.push_str(&format!(
++            "  %hit_prim_data = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 %hit_geom, i32 %hit_prim)\n"
++        ));
++    }
+     s.push_str("  br label %after_hit\n\nafter_hit:\n");
+     s.push_str(
+         "  %res_prim = phi i32 [ %hit_prim, %read_hit ], [ 0, %done ]\n\
+          \x20 %res_geom = phi i32 [ %hit_geom, %read_hit ], [ 0, %done ]\n",
+     );
++    if prim_data_enabled && p.reads_prim_data {
++        s.push_str("  %res_prim_data = phi i64 [ %hit_prim_data, %read_hit ], [ 0, %done ]\n");
++    }
+     if has_instancing {
+         s.push_str(
+             "  %res_inst = phi i32 [ %hit_inst, %read_hit ], [ 0, %done ]\n\
+@@ -1962,7 +2619,13 @@ fn emit_ray_query_helper(
+             AirIntersectionResultField::Distance => ("float", "%comm_t".to_string()),
+             AirIntersectionResultField::PrimitiveId => ("i32", "%res_prim".to_string()),
+             AirIntersectionResultField::GeometryId => ("i32", "%res_geom".to_string()),
+-            AirIntersectionResultField::OpaquePointer => ("i64", "0".to_string()),
++            AirIntersectionResultField::OpaquePointer => {
++                if prim_data_enabled && p.reads_prim_data {
++                    ("i64", "%res_prim_data".to_string())
++                } else {
++                    ("i64", "0".to_string())
++                }
++            }
+             AirIntersectionResultField::InstanceId => ("i32", "%res_inst".to_string()),
+             AirIntersectionResultField::UserInstanceId => ("i32", "%res_user_inst".to_string()),
+             AirIntersectionResultField::InstanceLevel => {
+@@ -1999,6 +2662,7 @@ fn emit_callback_args(
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
+     ift_abi_v2: bool,
++    prim_data_enabled: bool,
+     table_param: &str,
+ ) -> Vec<String> {
+     let mut args = Vec::with_capacity(cb.param_types.len());
+@@ -2161,10 +2825,41 @@ fn emit_callback_args(
+                 }
+             }
+             CallbackParamRole::PrimitiveDataPtr => {
+-                // Wave 2 emits typed BDA-zero pointer so null checks fold safely and untaken loads
+-                // carry PhysicalStorageBuffer storage class; Wave 4 replaces 0 with real lookup.
+-                s.push_str(&format!("  {vname} = inttoptr i64 0 to {pty}\n"));
+-                args.push(format!("{pty} {vname}"));
++                if prim_data_enabled {
++                    let root_bda = if p.accel_is_bda {
++                        "%p4".to_string()
++                    } else if let Some(as_slot) = p.descriptor_as_slot {
++                        s.push_str(&format!(
++                            "  {vname}_root = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"
++                        ));
++                        format!("{vname}_root")
++                    } else {
++                        "0".to_string()
++                    };
++                    s.push_str(&format!(
++                        "  {vname}_prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
++                         \x20 {vname}_geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n"
++                    ));
++                    let (has_inst_i32, inst_val) = if has_instancing {
++                        s.push_str(&format!(
++                            "  {vname}_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"
++                        ));
++                        (1, format!("{vname}_inst"))
++                    } else {
++                        (0, "0".to_string())
++                    };
++                    let addr_var = format!("%__m2v.rq.prim_data.{prefix}_{pi}");
++                    s.push_str(&format!(
++                        "  {addr_var} = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 {vname}_geom, i32 {vname}_prim)\n\
++                         \x20 {vname} = inttoptr i64 {addr_var} to {pty}\n"
++                    ));
++                    args.push(format!("{pty} {vname}"));
++                } else {
++                    // Wave 2 emits typed BDA-zero pointer so null checks fold safely and untaken loads
++                    // carry PhysicalStorageBuffer storage class.
++                    s.push_str(&format!("  {vname} = inttoptr i64 0 to {pty}\n"));
++                    args.push(format!("{pty} {vname}"));
++                }
+             }
+             CallbackParamRole::ZeroFallback => {
+                 args.push(format!("{pty} {}", llvm_zero_literal(pty)));
+@@ -2211,6 +2906,7 @@ fn emit_triangle_callback_case(
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
+     ift_abi_v2: bool,
++    prim_data_enabled: bool,
+     table_param: &str,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+@@ -2226,6 +2922,7 @@ fn emit_triangle_callback_case(
+         idx,
+         p,
+         ift_abi_v2,
++        prim_data_enabled,
+         table_param,
+     );
+     let rty = cb.return_type.trim();
+@@ -2294,6 +2991,7 @@ fn emit_aabb_callback_case(
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
+     ift_abi_v2: bool,
++    prim_data_enabled: bool,
+     table_param: &str,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+@@ -2309,6 +3007,7 @@ fn emit_aabb_callback_case(
+         idx,
+         p,
+         ift_abi_v2,
++        prim_data_enabled,
+         table_param,
+     );
+     let rty = cb.return_type.trim();
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 889a124..302c2ee 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -125,6 +125,9 @@ pub struct TransformOptions {
+     /// - `Stage::Mesh` with a payload emits `MeshEXT` with `DrawParameters` + `BuiltIn DrawIndex`
+     ///   reading its payload from set 0 bindings 673/674 instead of `TaskPayloadWorkgroupEXT`.
+     pub emulated_mesh_payload: bool,
++    /// Enable GPU lookup of per-primitive `primitiveDataBuffer` pointers for hardware ray queries
++    /// (`intersector`, `intersection_query`, and `[[intersection]]` callbacks) via set-0 binding 676.
++    pub rt_primitive_data: bool,
+ }
+ 
+ impl Default for TransformOptions {
+@@ -143,6 +146,7 @@ impl Default for TransformOptions {
+             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+             hardware_ray_query: false,
+             emulated_mesh_payload: false,
++            rt_primitive_data: false,
+         }
+     }
+ }
+@@ -160,6 +164,12 @@ impl TransformOptions {
+         self
+     }
+ 
++    /// Enable RT `primitiveDataBuffer` GPU lookup via binding 676 (`GARNETX_CAP_RT_PRIMITIVE_DATA`).
++    pub fn with_rt_primitive_data(mut self) -> Self {
++        self.rt_primitive_data = true;
++        self
++    }
++
+     /// Select the ABI 8 normalized sampler-coordinate contract described on the field.
+     pub fn with_normalized_sampler_coordinates(mut self) -> Self {
+         self.normalized_sampler_coordinates = true;
+diff --git a/src/passes/ray_query.rs b/src/passes/ray_query.rs
+index 175447c..2076d28 100644
+--- a/src/passes/ray_query.rs
++++ b/src/passes/ray_query.rs
+@@ -50,6 +50,97 @@ fn ty_u64(ctx: &mut Ctx) -> Word {
+     )
+ }
+ 
++fn is_prim_table_intrinsic(name: &str) -> bool {
++    matches!(
++        name,
++        "__m2v.rq.prim_table_bda" | "__m2v.rq.prim_table_mask" | "__m2v.rq.slot_as_bda"
++    )
++}
++
++/// Lazily emit the read-only `[33 x u64]` StorageBuffer at `(descriptor_layout.set, 676)` for
++/// RT `primitiveDataBuffer` table lookup:
++/// - `words64[0]`: `global_table_bda` (u64)
++/// - `words64[1]`: `table_mask` (u64, low 32 bits = `capacity - 1`)
++/// - `words64[2 + slot]` (`slot` 0..30): `slot_as_bda[slot]` (u64)
++fn ensure_rt_prim_data_table_var(
++    ctx: &mut Ctx,
++    cache: &mut Option<(Word, Word, Word)>,
++) -> (Word, Word, Word) {
++    if let Some(cached) = *cache {
++        return cached;
++    }
++    ctx.add_capability(spirv::Capability::Int64);
++    let u64_ty = ty_u64(ctx);
++    let len_33 = ctx.const_uint(33);
++    let arr_ty = ctx.module.fresh_id();
++    ctx.new_globals.push(type_inst(
++        Op::TypeArray,
++        arr_ty,
++        vec![Operand::IdRef(u64_ty), Operand::IdRef(len_33)],
++    ));
++    ctx.module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(arr_ty),
++            Operand::Decoration(Decoration::ArrayStride),
++            Operand::LiteralBit32(8),
++        ],
++    ));
++    let struct_ty = ctx.module.fresh_id();
++    ctx.new_globals
++        .push(type_inst(Op::TypeStruct, struct_ty, vec![Operand::IdRef(arr_ty)]));
++    ctx.module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(struct_ty),
++            Operand::Decoration(Decoration::Block),
++        ],
++    ));
++    ctx.module.annotations.push(Instruction::new(
++        Op::MemberDecorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(struct_ty),
++            Operand::LiteralBit32(0),
++            Operand::Decoration(Decoration::Offset),
++            Operand::LiteralBit32(0),
++        ],
++    ));
++    let ptr_struct_ty = ctx.ty_ptr(StorageClass::StorageBuffer, struct_ty);
++    let var = ctx.module.fresh_id();
++    ctx.new_globals.push(Instruction::new(
++        Op::Variable,
++        Some(ptr_struct_ty),
++        Some(var),
++        vec![Operand::StorageClass(StorageClass::StorageBuffer)],
++    ));
++    decorate_binding(
++        &mut ctx.module,
++        var,
++        ctx.descriptor_layout.set,
++        crate::reflect::RT_PRIM_DATA_BINDING,
++    );
++    ctx.module.annotations.push(Instruction::new(
++        Op::Decorate,
++        None,
++        None,
++        vec![
++            Operand::IdRef(var),
++            Operand::Decoration(Decoration::NonWritable),
++        ],
++    ));
++    ctx.interface_buffer_var(var);
++    let ptr_u64_ty = ctx.ty_ptr(StorageClass::StorageBuffer, u64_ty);
++    let entry = (var, ptr_u64_ty, u64_ty);
++    *cache = Some(entry);
++    entry
++}
++
+ fn const_u32_from_defs(defs: &HashMap<Word, Instruction>, id: Word) -> Option<u32> {
+     let inst = defs.get(&id)?;
+     match inst.class.opcode {
+@@ -262,10 +353,13 @@ pub(in crate::passes) fn lower_ray_query_calls(
+             let Some(Operand::IdRef(callee)) = inst.operands.first() else {
+                 continue;
+             };
+-            if !rq_fn_names.contains_key(callee) {
++            let Some(name) = rq_fn_names.get(callee) else {
+                 continue;
+-            }
++            };
+             has_any_call = true;
++            if is_prim_table_intrinsic(name) {
++                continue;
++            }
+             let slot = inst
+                 .operands
+                 .get(1)
+@@ -282,23 +376,25 @@ pub(in crate::passes) fn lower_ray_query_calls(
+     }
+ 
+     // Allocate one Function-storage OpTypeRayQueryKHR OpVariable per unique slot.
+-    let rq_ty = ty_ray_query(ctx);
+-    let rq_ptr_ty = ctx.ty_ptr(StorageClass::Function, rq_ty);
+-    let mut rq_vars = Vec::with_capacity(slots.len());
+-    for (_, var_id) in slots.iter_mut() {
+-        let id = ctx.module.fresh_id();
+-        *var_id = id;
+-        rq_vars.push(Instruction::new(
+-            Op::Variable,
+-            Some(rq_ptr_ty),
+-            Some(id),
+-            vec![Operand::StorageClass(StorageClass::Function)],
+-        ));
+-    }
+-    // Insert all OpVariable instructions at the very start of block 0.
+-    if let Some(entry_blk) = ctx.module.functions[entry_idx].blocks.first_mut() {
+-        for (i, var_inst) in rq_vars.into_iter().enumerate() {
+-            entry_blk.instructions.insert(i, var_inst);
++    if !slots.is_empty() {
++        let rq_ty = ty_ray_query(ctx);
++        let rq_ptr_ty = ctx.ty_ptr(StorageClass::Function, rq_ty);
++        let mut rq_vars = Vec::with_capacity(slots.len());
++        for (_, var_id) in slots.iter_mut() {
++            let id = ctx.module.fresh_id();
++            *var_id = id;
++            rq_vars.push(Instruction::new(
++                Op::Variable,
++                Some(rq_ptr_ty),
++                Some(id),
++                vec![Operand::StorageClass(StorageClass::Function)],
++            ));
++        }
++        // Insert all OpVariable instructions at the very start of block 0.
++        if let Some(entry_blk) = ctx.module.functions[entry_idx].blocks.first_mut() {
++            for (i, var_inst) in rq_vars.into_iter().enumerate() {
++                entry_blk.instructions.insert(i, var_inst);
++            }
+         }
+     }
+ 
+@@ -309,6 +405,7 @@ pub(in crate::passes) fn lower_ray_query_calls(
+     let v2f_ty = ctx.ty_vecf(2);
+     let v3f_ty = ctx.ty_vecf(3);
+     let mat4x3_ty = ty_mat4x3(ctx);
++    let mut prim_table_var: Option<(Word, Word, Word)> = None;
+ 
+     let block_count = ctx.module.functions[entry_idx].blocks.len();
+     for bi in 0..block_count {
+@@ -337,6 +434,171 @@ pub(in crate::passes) fn lower_ray_query_calls(
+                     _ => None,
+                 })
+                 .collect();
++            let res = inst.result_id;
++            let rty = inst.result_type;
++
++            if is_prim_table_intrinsic(&name) {
++                let (table_var, ptr_u64_ty, u64_ty) =
++                    ensure_rt_prim_data_table_var(ctx, &mut prim_table_var);
++                let zero = ctx.const_uint(0);
++                match name.as_str() {
++                    "__m2v.rq.prim_table_bda" => {
++                        let ptr = ctx.module.fresh_id();
++                        new_insts.push(Instruction::new(
++                            Op::AccessChain,
++                            Some(ptr_u64_ty),
++                            Some(ptr),
++                            vec![
++                                Operand::IdRef(table_var),
++                                Operand::IdRef(zero),
++                                Operand::IdRef(zero),
++                            ],
++                        ));
++                        let target_ty = rty.unwrap_or(u64_ty);
++                        if target_ty == u64_ty {
++                            new_insts.push(Instruction::new(
++                                Op::Load,
++                                Some(u64_ty),
++                                res,
++                                vec![Operand::IdRef(ptr)],
++                            ));
++                        } else {
++                            let raw = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::Load,
++                                Some(u64_ty),
++                                Some(raw),
++                                vec![Operand::IdRef(ptr)],
++                            ));
++                            new_insts.push(Instruction::new(
++                                Op::Bitcast,
++                                Some(target_ty),
++                                res,
++                                vec![Operand::IdRef(raw)],
++                            ));
++                        }
++                    }
++                    "__m2v.rq.prim_table_mask" => {
++                        let one = ctx.const_uint(1);
++                        let ptr = ctx.module.fresh_id();
++                        new_insts.push(Instruction::new(
++                            Op::AccessChain,
++                            Some(ptr_u64_ty),
++                            Some(ptr),
++                            vec![
++                                Operand::IdRef(table_var),
++                                Operand::IdRef(zero),
++                                Operand::IdRef(one),
++                            ],
++                        ));
++                        let raw64 = ctx.module.fresh_id();
++                        new_insts.push(Instruction::new(
++                            Op::Load,
++                            Some(u64_ty),
++                            Some(raw64),
++                            vec![Operand::IdRef(ptr)],
++                        ));
++                        let target_ty = rty.unwrap_or(uint_ty);
++                        if target_ty == uint_ty {
++                            new_insts.push(Instruction::new(
++                                Op::UConvert,
++                                Some(uint_ty),
++                                res,
++                                vec![Operand::IdRef(raw64)],
++                            ));
++                        } else {
++                            let mask32 = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::UConvert,
++                                Some(uint_ty),
++                                Some(mask32),
++                                vec![Operand::IdRef(raw64)],
++                            ));
++                            new_insts.push(Instruction::new(
++                                Op::Bitcast,
++                                Some(target_ty),
++                                res,
++                                vec![Operand::IdRef(mask32)],
++                            ));
++                        }
++                    }
++                    "__m2v.rq.slot_as_bda" => {
++                        if args.is_empty() {
++                            return Err(format!("{name} expects 1 operand"));
++                        }
++                        let idx_word = if let Some(slot_idx) = const_u32_from_defs(&defs, args[0]) {
++                            ctx.const_uint(2 + slot_idx.min(30))
++                        } else {
++                            let slot_u = ensure_uint(ctx, &defs, &val_tys, args[0], &mut new_insts);
++                            let max_slot = ctx.const_uint(30);
++                            let in_range = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::ULessThanEqual,
++                                Some(bool_ty),
++                                Some(in_range),
++                                vec![Operand::IdRef(slot_u), Operand::IdRef(max_slot)],
++                            ));
++                            let clamped = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::Select,
++                                Some(uint_ty),
++                                Some(clamped),
++                                vec![
++                                    Operand::IdRef(in_range),
++                                    Operand::IdRef(slot_u),
++                                    Operand::IdRef(max_slot),
++                                ],
++                            ));
++                            let two = ctx.const_uint(2);
++                            let idx = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::IAdd,
++                                Some(uint_ty),
++                                Some(idx),
++                                vec![Operand::IdRef(clamped), Operand::IdRef(two)],
++                            ));
++                            idx
++                        };
++                        let ptr = ctx.module.fresh_id();
++                        new_insts.push(Instruction::new(
++                            Op::AccessChain,
++                            Some(ptr_u64_ty),
++                            Some(ptr),
++                            vec![
++                                Operand::IdRef(table_var),
++                                Operand::IdRef(zero),
++                                Operand::IdRef(idx_word),
++                            ],
++                        ));
++                        let target_ty = rty.unwrap_or(u64_ty);
++                        if target_ty == u64_ty {
++                            new_insts.push(Instruction::new(
++                                Op::Load,
++                                Some(u64_ty),
++                                res,
++                                vec![Operand::IdRef(ptr)],
++                            ));
++                        } else {
++                            let raw = ctx.module.fresh_id();
++                            new_insts.push(Instruction::new(
++                                Op::Load,
++                                Some(u64_ty),
++                                Some(raw),
++                                vec![Operand::IdRef(ptr)],
++                            ));
++                            new_insts.push(Instruction::new(
++                                Op::Bitcast,
++                                Some(target_ty),
++                                res,
++                                vec![Operand::IdRef(raw)],
++                            ));
++                        }
++                    }
++                    _ => unreachable!(),
++                }
++                continue;
++            }
++
+             let slot = args
+                 .first()
+                 .and_then(|&id| const_u32_from_defs(&defs, id))
+@@ -344,8 +606,6 @@ pub(in crate::passes) fn lower_ray_query_calls(
+             let rq_var = *slots
+                 .get(&slot)
+                 .ok_or_else(|| format!("ray_query: missing allocated slot {slot}"))?;
+-            let res = inst.result_id;
+-            let rty = inst.result_type;
+ 
+             match name.as_str() {
+                 "__m2v.rq.init" | "__m2v.rq.init.bda" => {
+diff --git a/src/passes/resources/bindings.rs b/src/passes/resources/bindings.rs
+index 2deef17..ca1b842 100644
+--- a/src/passes/resources/bindings.rs
++++ b/src/passes/resources/bindings.rs
+@@ -357,6 +357,10 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
+                     | crate::reflect::MESH_EMULATED_INDIRECT_BINDING
+             )
+             && class == DescriptorClass::StorageBuffer;
++        // Binding 676 is the translator-owned RT primitive-data lookup table header SSBO (`[33 x u64]`).
++        let rt_prim_data_binding = set == layout.set
++            && binding == crate::reflect::RT_PRIM_DATA_BINDING
++            && class == DescriptorClass::StorageBuffer;
+         let null_array = coordinate_metadata
+             && runtime
+             && matches!(
+@@ -370,6 +374,7 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
+             && !null_array
+             && !coordinate_flags
+             && !emulated_mesh_binding
++            && !rt_prim_data_binding
+             && (set != layout.set || !allowed)
+         {
+             return Err(format!(
+diff --git a/src/reflect/mod.rs b/src/reflect/mod.rs
+index df59094..cb4d854 100644
+--- a/src/reflect/mod.rs
++++ b/src/reflect/mod.rs
+@@ -483,6 +483,8 @@ pub const MESH_EMULATED_GRID_PARAMS_BINDING: u32 = 673;
+ pub const MESH_EMULATED_PAYLOAD_BINDING: u32 = 674;
+ /// GFX-ring emulated Object set-0 write-only SSBO holding `N` `VkDrawMeshTasksIndirectCommandEXT` (3x u32) entries.
+ pub const MESH_EMULATED_INDIRECT_BINDING: u32 = 675;
++/// Stage-local read-only SSBO carrying the RT `primitiveDataBuffer` lookup table header (`[33 x u64]`, 264 bytes).
++pub const RT_PRIM_DATA_BINDING: u32 = 676;
+ 
+ /// Align an emulated Object+Mesh payload size up to a 16-byte stride (minimum 16 bytes).
+ pub const fn align_up_emulated_payload_stride(byte_size: u32) -> u32 {
+@@ -872,6 +874,8 @@ pub enum ResourceKind {
+     MeshEmulatedPayload,
+     /// Emulated GFX-ring Object indirect draw command SSBO (set 0, binding 675).
+     MeshEmulatedIndirect,
++    /// Translator-owned read-only StorageBuffer holding the RT `primitiveDataBuffer` table header (`[33 x u64]`, set 0, binding 676).
++    RTPrimDataTable,
+ }
+ 
+ /// The descriptor location the interface pass decorates a resource with. Absent for resources that
+@@ -2092,6 +2096,25 @@ fn descriptor_binding_of(module: &Module, variable: spirv::Word) -> Option<u32>
+     })
+ }
+ 
++fn descriptor_set_of(module: &Module, variable: spirv::Word) -> Option<u32> {
++    module.annotations.iter().find_map(|annotation| {
++        match (
++            annotation.class.opcode,
++            annotation.operands.first(),
++            annotation.operands.get(1),
++            annotation.operands.get(2),
++        ) {
++            (
++                spirv::Op::Decorate,
++                Some(crate::spirv_module::Operand::IdRef(target)),
++                Some(crate::spirv_module::Operand::Decoration(spirv::Decoration::DescriptorSet)),
++                Some(crate::spirv_module::Operand::LiteralBit32(set)),
++            ) if *target == variable => Some(*set),
++            _ => None,
++        }
++    })
++}
++
+ fn descriptor_variables(module: &Module) -> std::collections::HashMap<spirv::Word, (u32, u32)> {
+     use crate::spirv_module::Operand;
+ 
+@@ -2764,7 +2787,8 @@ impl ShaderReflection {
+                 | ResourceKind::SynthesizedReadSampler
+                 | ResourceKind::MeshEmulatedGridParams
+                 | ResourceKind::MeshEmulatedPayload
+-                | ResourceKind::MeshEmulatedIndirect => {
++                | ResourceKind::MeshEmulatedIndirect
++                | ResourceKind::RTPrimDataTable => {
+                     return Err(format!(
+                         "cannot reconfigure reflection after synthesized {:?} resources were added",
+                         resource.kind
+@@ -3009,7 +3033,8 @@ impl ShaderReflection {
+                 | ResourceKind::SamplerCoordinateFlags
+                 | ResourceKind::MeshEmulatedGridParams
+                 | ResourceKind::MeshEmulatedPayload
+-                | ResourceKind::MeshEmulatedIndirect => DescriptorClass::StorageBuffer,
++                | ResourceKind::MeshEmulatedIndirect
++                | ResourceKind::RTPrimDataTable => DescriptorClass::StorageBuffer,
+                 ResourceKind::AccelerationStructure => DescriptorClass::AccelerationStructure,
+                 ResourceKind::Texture
+                 | ResourceKind::TextureArray
+@@ -3078,7 +3103,8 @@ impl ShaderReflection {
+                 | ResourceKind::SynthesizedReadSampler
+                 | ResourceKind::MeshEmulatedGridParams
+                 | ResourceKind::MeshEmulatedPayload
+-                | ResourceKind::MeshEmulatedIndirect => None,
++                | ResourceKind::MeshEmulatedIndirect
++                | ResourceKind::RTPrimDataTable => None,
+                 ResourceKind::ThreadgroupBuffer
+                 | ResourceKind::PrimitiveAccelerationStructure
+                 | ResourceKind::VisibleFunctionTable
+@@ -3206,6 +3232,30 @@ impl ShaderReflection {
+                 record(location, owner, class)?;
+                 continue;
+             }
++            if resource.kind == ResourceKind::RTPrimDataTable {
++                let location = resource
++                    .descriptor
++                    .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
++                if location.set != self.descriptor_layout.set
++                    || location.binding != RT_PRIM_DATA_BINDING
++                    || location.count != 1
++                {
++                    return Err(format!(
++                        "{owner} must be one descriptor at set {} binding {RT_PRIM_DATA_BINDING}",
++                        self.descriptor_layout.set
++                    ));
++                }
++                if resource.declared_size != Some(264)
++                    || resource.extent != Some(BufferExtent::Object { bytes: 264 })
++                    || resource.access != Some(ResourceAccess::ReadOnly)
++                {
++                    return Err(
++                        "RTPrimDataTable requires a readonly 264-byte extent".into(),
++                    );
++                }
++                record(location, owner, class)?;
++                continue;
++            }
+             let expected = expected
+                 .flatten()
+                 .ok_or_else(|| format!("{owner} exceeds its descriptor ABI band"))?;
+@@ -3335,6 +3385,7 @@ impl ShaderReflection {
+             .filter_map(|inst| Some((inst.result_id?, inst)))
+             .collect::<std::collections::HashMap<_, _>>();
+         let mut as_bindings = std::collections::HashSet::<u32>::new();
++        let mut has_rt_prim_data_table = false;
+         for inst in module
+             .types_global_values
+             .iter()
+@@ -3343,6 +3394,11 @@ impl ShaderReflection {
+             let Some(var) = inst.result_id else {
+                 continue;
+             };
++            if descriptor_set_of(module, var) == Some(self.descriptor_layout.set)
++                && descriptor_binding_of(module, var) == Some(RT_PRIM_DATA_BINDING)
++            {
++                has_rt_prim_data_table = true;
++            }
+             let is_as = inst
+                 .result_type
+                 .and_then(|ptr| pointee_of(&types, ptr))
+@@ -3354,6 +3410,33 @@ impl ShaderReflection {
+                 }
+             }
+         }
++        self.bindings
++            .retain(|resource| resource.kind != ResourceKind::RTPrimDataTable);
++        if has_rt_prim_data_table {
++            let bytes = 264;
++            self.bindings.push(ResourceBinding {
++                kind: ResourceKind::RTPrimDataTable,
++                metal_index: 0,
++                descriptor: Some(DescriptorLocation {
++                    set: self.descriptor_layout.set,
++                    binding: RT_PRIM_DATA_BINDING,
++                    count: 1,
++                }),
++                comparison_descriptor: None,
++                param_index: None,
++                stage_input_location: None,
++                address_space: None,
++                declared_size: Some(bytes),
++                extent: Some(BufferExtent::Object { bytes }),
++                footprint: None,
++                type_layout: None,
++                type_name: None,
++                texture_shape: None,
++                embedded_source: None,
++                static_sampler: None,
++                access: Some(ResourceAccess::ReadOnly),
++            });
++        }
+         let has_bda_as = module
+             .all_inst_iter()
+             .any(|i| i.class.opcode == spirv::Op::ConvertUToAccelerationStructureKHR);

@@ -12,9 +12,10 @@ use garnetxlate::{
     garnetx_translate_linked_libraries, garnetx_translate_stage3,
     garnetx_translate_with_capabilities, RDNA4xBackendCapabilities, RDNA4xDep,
     RDNA4xDynamicLibrary, RDNA4xIntersectionFunction, GARNETX_CAP_MESH_EMULATED_PAYLOAD,
-    GARNETX_CAP_RT_IFT_ABI_V2, GARNETX_CAP_RT_POSITION_FETCH, GARNETX_IFT_KIND_BOUNDING_BOX,
-    GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
+    GARNETX_CAP_RT_IFT_ABI_V2, GARNETX_CAP_RT_POSITION_FETCH, GARNETX_CAP_RT_PRIMITIVE_DATA,
+    GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
     GARNETX_MESH_GRID_PARAMS_BINDING, GARNETX_MESH_INDIRECT_BINDING, GARNETX_MESH_PAYLOAD_BINDING,
+    GARNETX_RT_PRIM_DATA_BINDING,
     GARNETX_STAGE_FRAGMENT, GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT,
     GARNETX_STAGE_VERTEX, RC_BAD_ARGS, RC_OK, RC_REFUSED,
 };
@@ -2137,4 +2138,860 @@ entry:
             asm
         );
     }
+}
+
+fn assert_spirv_val(label: &str, spv: &[u8]) {
+    if let Ok(mut child) = std::process::Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(spv).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "spirv-val rejected {label} SPIR-V:\n{}\n--- ASM ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            spv_asm(spv)
+        );
+    }
+}
+
+fn assert_has_rt_prim_data_binding(meta: &Value, label: &str) {
+    let binding = meta["bindings"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|b| b["kind"] == "RTPrimDataTable"))
+        .unwrap_or_else(|| panic!("{label}: missing RTPrimDataTable binding in {meta}"));
+    assert_eq!(binding["metal_index"], 0, "{label}: {binding}");
+    assert_eq!(binding["descriptor"]["set"], 0, "{label}: {binding}");
+    assert_eq!(
+        binding["descriptor"]["binding"], GARNETX_RT_PRIM_DATA_BINDING,
+        "{label}: {binding}"
+    );
+    assert_eq!(binding["descriptor"]["count"], 1, "{label}: {binding}");
+    assert_eq!(binding["declared_size"], 264, "{label}: {binding}");
+    assert_eq!(binding["access"], "ReadOnly", "{label}: {binding}");
+    assert_eq!(binding["extent"]["Object"]["bytes"], 264, "{label}: {binding}");
+}
+
+#[test]
+fn wave4_rt_primitive_data_intersector_iq_ift_bda_and_bare_intersect() {
+    assert_eq!(GARNETX_CAP_RT_PRIMITIVE_DATA, 1 << 11);
+    assert_eq!(GARNETX_RT_PRIM_DATA_BINDING, 676);
+
+    let caps_prim = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+    let caps_no_prim = RDNA4xBackendCapabilities {
+        flags: GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2,
+        ..caps_prim
+    };
+
+    // 1. inter30_k_inter_prim_pl (Apple Clang 21 intersector field-4 primitive_data + payload).
+    let inter_prim_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.MyPl = type { float, i32 }
+define void @k_inter_prim_pl(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly "air-buffer-no-alias" %out) local_unnamed_addr {
+entry:
+  %pl = alloca %struct.MyPl, align 4
+  %0 = bitcast ptr %pl to ptr
+  %1 = getelementptr inbounds %struct.MyPl, ptr %pl, i64 0, i32 0
+  store float 1.000000e+00, ptr %1, align 4
+  %2 = getelementptr inbounds %struct.MyPl, ptr %pl, i64 0, i32 1
+  store i32 0, ptr %2, align 4
+  %3 = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 5.000000e-01, float 5.000000e-01, float 0.000000e+00>, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr nonnull align 4 %0, i64 8, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %4 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %3, 4
+  %tobool.not = icmp eq ptr addrspace(1) %4, null
+  br i1 %tobool.not, label %cond.false, label %cond.true
+cond.true:
+  %color = bitcast ptr addrspace(1) %4 to ptr addrspace(1)
+  %5 = load <4 x float>, ptr addrspace(1) %color, align 16
+  br label %cond.end
+cond.false:
+  %6 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %3, 1
+  %7 = load float, ptr %1, align 4
+  %8 = load i32, ptr %2, align 4
+  %9 = call fast float @air.convert.f.f32.u.i32(i32 %8)
+  %10 = insertelement <4 x float> <float poison, float poison, float poison, float 0.000000e+00>, float %7, i64 0
+  %11 = insertelement <4 x float> %10, float %9, i64 1
+  %vecinit9 = insertelement <4 x float> %11, float %6, i64 2
+  br label %cond.end
+cond.end:
+  %cond = phi fast <4 x float> [ %5, %cond.true ], [ %vecinit9, %cond.false ]
+  store <4 x float> %cond, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare float @air.convert.f.f32.u.i32(i32)
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!14}
+!14 = !{ptr @k_inter_prim_pl, !15, !16}
+!15 = !{}
+!16 = !{!17, !18, !19}
+!17 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>", !"air.arg_name", !"scene"}
+!18 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
+!19 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+    let out_inter = call_stage3_with_caps(inter_prim_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_inter.rc, RC_OK, "inter_prim_pl stage3 failed: {}", out_inter.msg);
+    let meta_inter: Value = serde_json::from_slice(&out_inter.meta).unwrap();
+    assert_has_rt_prim_data_binding(&meta_inter, "inter_prim_pl stage3");
+    let asm_inter = spv_asm(&out_inter.spv);
+    assert!(asm_inter.contains("Binding 676"), "{asm_inter}");
+    assert!(asm_inter.contains("OpCapability Int64"), "{asm_inter}");
+    assert!(asm_inter.contains("OpCapability PhysicalStorageBufferAddresses"), "{asm_inter}");
+    assert!(
+        !asm_inter.contains("Binding 640"),
+        "prim_data loads must use trusted_ro_bda non-null guard, not RegistryV3:\n{asm_inter}"
+    );
+    assert_spirv_val("inter_prim_pl stage3", &out_inter.spv);
+
+    // Also verify garnetx_translate_with_capabilities (non-stage3 ABI 3 entry point) on an
+    // intersector shader without IFT.
+    let inter_plain_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_inter_plain_prim(ptr addrspace(1) %scene.coerce, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %0 = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) null, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %pd = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %0, 4
+  %is_null = icmp eq ptr addrspace(1) %pd, null
+  br i1 %is_null, label %miss, label %hit
+hit:
+  %v = load <4 x float>, ptr addrspace(1) %pd, align 16
+  br label %done
+miss:
+  br label %done
+done:
+  %res = phi <4 x float> [ %v, %hit ], [ zeroinitializer, %miss ]
+  store <4 x float> %res, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_inter_plain_prim, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let mut spv_ptr: *mut u8 = std::ptr::null_mut();
+    let mut spv_len = 0usize;
+    let mut meta_ptr: *mut u8 = std::ptr::null_mut();
+    let mut meta_len = 0usize;
+    let mut err_buf = [0 as c_char; 512];
+    let local = [1u32, 1, 1];
+    let rc_caps = unsafe {
+        garnetx_translate_with_capabilities(
+            inter_plain_ll.as_ptr(),
+            inter_plain_ll.len(),
+            local.as_ptr(),
+            &mut spv_ptr,
+            &mut spv_len,
+            &mut meta_ptr,
+            &mut meta_len,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+            &caps_prim,
+        )
+    };
+    assert_eq!(
+        rc_caps,
+        RC_OK,
+        "garnetx_translate_with_capabilities failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(err_buf.as_ptr()) }.to_string_lossy()
+    );
+    let (spv_caps, meta_caps_bytes) = unsafe {
+        let s = std::slice::from_raw_parts(spv_ptr, spv_len).to_vec();
+        let m = std::slice::from_raw_parts(meta_ptr, meta_len).to_vec();
+        garnetx_free(spv_ptr, spv_len);
+        garnetx_free(meta_ptr, meta_len);
+        (s, m)
+    };
+    let meta_caps: Value = serde_json::from_slice(&meta_caps_bytes).unwrap();
+    assert_has_rt_prim_data_binding(&meta_caps, "inter_plain_prim with_capabilities");
+    assert_spirv_val("inter_plain_prim with_capabilities", &spv_caps);
+
+    // Without GARNETX_CAP_RT_PRIMITIVE_DATA, binding 676 must NOT be emitted.
+    let out_no_prim = call_stage3_with_caps(inter_prim_ll, Some([1, 1, 1]), &[], Some(caps_no_prim));
+    assert_eq!(out_no_prim.rc, RC_OK, "inter_prim_pl without bit 11 failed: {}", out_no_prim.msg);
+    let meta_no_prim: Value = serde_json::from_slice(&out_no_prim.meta).unwrap();
+    assert!(
+        meta_no_prim["bindings"]
+            .as_array()
+            .is_none_or(|arr| !arr.iter().any(|b| b["kind"] == "RTPrimDataTable")),
+        "unexpected RTPrimDataTable without GARNETX_CAP_RT_PRIMITIVE_DATA: {meta_no_prim}"
+    );
+    assert!(!spv_asm(&out_no_prim.spv).contains("Binding 676"));
+
+    // 2. iq30_k_iq_full (both candidate & committed primitive_data + -O0 alloca store/reload).
+    let iq_prim_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_iq_full_prim(ptr addrspace(1) %scene.coerce, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %saved_pd = alloca ptr addrspace(1), align 8
+  store ptr addrspace(1) null, ptr %saved_pd, align 8
+  %0 = tail call ptr @air.allocate_intersection_query.instancing.triangle_data()
+  tail call void @air.reset_intersection_query.instancing.triangle_data(ptr %0, <3 x float> <float 0.5, float 0.5, float 0.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %1 = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
+  br i1 %1, label %while.body, label %while.end
+while.body:
+  %2 = tail call i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %is_tri = icmp eq i32 %2, 1
+  br i1 %is_tri, label %if.then, label %if.end
+if.then:
+  %cpd = tail call ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %cnull = icmp eq ptr addrspace(1) %cpd, null
+  br i1 %cnull, label %commit, label %check_c
+check_c:
+  %cv = load <4 x float>, ptr addrspace(1) %cpd, align 16
+  %cx = extractelement <4 x float> %cv, i64 0
+  %cok = fcmp oge float %cx, 0.0
+  br i1 %cok, label %commit, label %if.end
+commit:
+  tail call void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr %0)
+  br label %if.end
+if.end:
+  %more = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
+  br i1 %more, label %while.body, label %while.end
+while.end:
+  %comm_pd = tail call ptr addrspace(1) @air.get_committed_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  store ptr addrspace(1) %comm_pd, ptr %saved_pd, align 8
+  %reloaded_pd = load ptr addrspace(1), ptr %saved_pd, align 8
+  %rnull = icmp eq ptr addrspace(1) %reloaded_pd, null
+  br i1 %rnull, label %done, label %read_comm
+read_comm:
+  %rv = load <4 x float>, ptr addrspace(1) %reloaded_pd, align 16
+  br label %done
+done:
+  %final = phi <4 x float> [ zeroinitializer, %while.end ], [ %rv, %read_comm ]
+  store <4 x float> %final, ptr addrspace(1) %out, align 16
+  tail call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %0)
+  ret void
+}
+declare ptr @air.allocate_intersection_query.instancing.triangle_data()
+declare void @air.deallocate_intersection_query.instancing.triangle_data(ptr)
+declare void @air.reset_intersection_query.instancing.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+declare i1 @air.next_intersection_query.instancing.triangle_data(ptr)
+declare i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare ptr addrspace(1) @air.get_committed_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr)
+!air.kernel = !{!0}
+!0 = !{ptr @k_iq_full_prim, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let out_iq = call_stage3_with_caps(iq_prim_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_iq.rc, RC_OK, "iq_full_prim failed: {}", out_iq.msg);
+    let meta_iq: Value = serde_json::from_slice(&out_iq.meta).unwrap();
+    assert_has_rt_prim_data_binding(&meta_iq, "iq_full_prim");
+    let asm_iq = spv_asm(&out_iq.spv);
+    assert!(asm_iq.contains("Binding 676"), "{asm_iq}");
+    assert!(
+        !asm_iq.contains("Binding 640"),
+        "IQ prim_data loads (including alloca reload) must use trusted_ro_bda, not RegistryV3:\n{asm_iq}"
+    );
+    assert_spirv_val("iq_full_prim", &out_iq.spv);
+
+    // 3. ift30_ift_full_cb + ift30_k_ift_entry + ift30_eval_radius WITH ABI v2 + RT_PRIMITIVE_DATA
+    //    AND chained through lower_gpu_arguments_with_capabilities.
+    let ift_entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_ift_entry(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly "air-buffer-no-alias" %out) local_unnamed_addr {
+entry:
+  %0 = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %1 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %0, 1
+  store float %1, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!14}
+!14 = !{ptr @k_ift_entry, !15, !16}
+!15 = !{}
+!16 = !{!17, !18, !19}
+!17 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>", !"air.arg_name", !"scene"}
+!18 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
+!19 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+    let ift_cb_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.AlphaArgBuf = type { %"struct.metal::texture2d", %"struct.metal::sampler" }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+%struct.PrimRec = type { <4 x float> }
+define <{ i1, float }> @ift_full_cb(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, i32 %pid, ptr addrspace(1) nocapture readonly "air-buffer-no-alias" %spheres, ptr addrspace(2) nocapture readonly align 8 dereferenceable(16) "air-buffer-no-alias" %alphaMat, ptr addrspace(1) nocapture readonly %vft.coerce, ptr addrspace(1) readonly "air-buffer-no-alias" %pdata) local_unnamed_addr {
+entry:
+  %0 = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly %vft.coerce, i32 0)
+  %1 = bitcast ptr %0 to ptr
+  %idxprom = zext i32 %pid to i64
+  %arrayidx = getelementptr inbounds <4 x float>, ptr addrspace(1) %spheres, i64 %idxprom
+  %2 = load <4 x float>, ptr addrspace(1) %arrayidx, align 16
+  %3 = extractelement <4 x float> %2, i64 3
+  %call1 = tail call fast float %1(float %3)
+  %agg.tmp.sroa.0.0..sroa_idx = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %alphaMat, i64 0, i32 1, i32 0
+  %agg.tmp.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(2) %agg.tmp.sroa.0.0..sroa_idx, align 8
+  %t.i13 = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %alphaMat, i64 0, i32 0, i32 0
+  %4 = load ptr addrspace(1), ptr addrspace(2) %t.i13, align 8
+  %5 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly %4, ptr addrspace(2) nocapture readonly %agg.tmp.sroa.0.0.copyload, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %tobool.not = icmp eq ptr addrspace(1) %pdata, null
+  br i1 %tobool.not, label %cond.end, label %cond.true
+cond.true:
+  %info = getelementptr inbounds %struct.PrimRec, ptr addrspace(1) %pdata, i64 0, i32 0
+  %6 = load <4 x float>, ptr addrspace(1) %info, align 16
+  %7 = extractelement <4 x float> %6, i64 0
+  br label %cond.end
+cond.end:
+  %cond = phi fast float [ %7, %cond.true ], [ 0.000000e+00, %entry ]
+  %8 = extractvalue { <4 x float>, i8 } %5, 0
+  %9 = extractelement <4 x float> %8, i64 0
+  %cmp = fcmp fast ogt float %9, 5.000000e-01
+  %add = fadd fast float %call1, %tmin
+  %add4 = fadd fast float %add, %cond
+  %10 = insertvalue <{ i1, float }> undef, i1 %cmp, 0
+  %11 = insertvalue <{ i1, float }> %10, float %add4, 1
+  ret <{ i1, float }> %11
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly, ptr addrspace(2) nocapture readonly, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly, i32)
+!air.intersection = !{!14}
+!14 = !{ptr @ift_full_cb, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool", !"air.arg_name", !"accept"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float", !"air.arg_name", !"dist"}
+!18 = !{!19, !20, !21, !22, !23, !24, !25, !29, !30}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3", !"air.arg_name", !"orig", !"air.arg_unused"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3", !"air.arg_name", !"dir", !"air.arg_unused"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmin"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmax", !"air.arg_unused"}
+!23 = !{i32 4, !"air.primitive_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"pid"}
+!24 = !{i32 5, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"spheres"}
+!25 = !{i32 6, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !26, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"AlphaArgBuf", !"air.arg_name", !"alphaMat"}
+!26 = !{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"alphaTex", !"air.indirect_argument", !27, i32 8, i32 8, i32 0, !"sampler", !"alphaSmp", !"air.indirect_argument", !28}
+!27 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"alphaTex"}
+!28 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"alphaSmp"}
+!29 = !{i32 7, !"air.visible_function_table", !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"vft"}
+!30 = !{i32 8, !"air.primitive_data", !"air.arg_type_name", !"PrimRec", !"air.arg_name", !"pdata"}
+"#;
+    let eval_radius_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define float @eval_radius(float %base) local_unnamed_addr {
+entry:
+  %mul = fmul fast float %base, 5.000000e-01
+  ret float %mul
+}
+!air.visible = !{!14}
+!14 = !{ptr @eval_radius, !15, !17}
+!15 = !{!16}
+!16 = !{!"air.visible_output", !"air.arg_type_name", !"float"}
+!17 = !{!18}
+!18 = !{i32 0, !"air.visible_input", !"air.arg_type_name", !"float", !"air.arg_name", !"base"}
+"#;
+    let (spv_ift_pre, meta_ift_pre) = garnetxlate::translate_bytes_stage3(
+        ift_entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[("eval_radius".to_string(), eval_radius_ll.as_bytes().to_vec())],
+        &[(
+            "ift_full_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            ift_cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_prim),
+    )
+    .expect("ift_full_cb with prim_data translate_bytes_stage3 failed");
+    let (spv_ift, meta_ift_bytes) =
+        garnetxlate::lower_gpu_arguments_with_capabilities(&spv_ift_pre, &meta_ift_pre, caps_prim)
+            .expect("ift_full_cb with prim_data lower_gpu_arguments failed");
+    let meta_ift: Value = serde_json::from_slice(&meta_ift_bytes).unwrap();
+    assert_has_rt_prim_data_binding(&meta_ift, "ift_full_cb after gpu_arguments");
+    let asm_ift = spv_asm(&spv_ift);
+    assert!(asm_ift.contains("Binding 676"), "{asm_ift}");
+    assert!(asm_ift.contains("Binding 640"), "{asm_ift}");
+    assert!(asm_ift.contains("DescriptorSet 2"), "{asm_ift}");
+    assert!(asm_ift.contains("DescriptorSet 4"), "{asm_ift}");
+    assert!(asm_ift.contains("OpRayQueryGenerateIntersectionKHR"), "{asm_ift}");
+    assert_spirv_val("ift_full_cb with prim_data + gpu_arguments", &spv_ift);
+
+    // 4. BDA AS prim data (both intersector and intersection_query reading AS BDA from argbuf).
+    let bda_as_prim_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.SceneArgs = type { ptr addrspace(1) }
+define void @k_bda_as_prim(ptr addrspace(1) %args, ptr addrspace(1) %out) local_unnamed_addr {
+entry:
+  %as_ptr = getelementptr inbounds %struct.SceneArgs, ptr addrspace(1) %args, i32 0, i32 0
+  %as = load ptr addrspace(1), ptr addrspace(1) %as_ptr, align 8
+  %hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) %as, i32 255, ptr addrspace(1) null, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %pd1 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 4
+  %p1_null = icmp eq ptr addrspace(1) %pd1, null
+  br i1 %p1_null, label %iq_phase, label %read1
+read1:
+  %v1 = load <4 x float>, ptr addrspace(1) %pd1, align 16
+  br label %iq_phase
+iq_phase:
+  %c1 = phi <4 x float> [ zeroinitializer, %entry ], [ %v1, %read1 ]
+  %as2 = load ptr addrspace(1), ptr addrspace(1) %as_ptr, align 8
+  %q = tail call ptr @air.allocate_intersection_query.instancing.triangle_data()
+  tail call void @air.reset_intersection_query.instancing.triangle_data(ptr %q, <3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %as2, i32 255, i32 1, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %more = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %q)
+  %pd2 = tail call ptr addrspace(1) @air.get_committed_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly %q)
+  %p2_null = icmp eq ptr addrspace(1) %pd2, null
+  br i1 %p2_null, label %done, label %read2
+read2:
+  %v2 = load <4 x float>, ptr addrspace(1) %pd2, align 16
+  br label %done
+done:
+  %c2 = phi <4 x float> [ zeroinitializer, %iq_phase ], [ %v2, %read2 ]
+  %sum = fadd <4 x float> %c1, %c2
+  store <4 x float> %sum, ptr addrspace(1) %out, align 16
+  tail call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %q)
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+declare ptr @air.allocate_intersection_query.instancing.triangle_data()
+declare void @air.deallocate_intersection_query.instancing.triangle_data(ptr)
+declare void @air.reset_intersection_query.instancing.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+declare i1 @air.next_intersection_query.instancing.triangle_data(ptr)
+declare ptr addrspace(1) @air.get_committed_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+!air.kernel = !{!0}
+!0 = !{ptr @k_bda_as_prim, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.struct_type_info", !5}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+!5 = !{i32 0, i32 8, i32 0, !"acceleration_structure<instancing>", !"tlas", !"air.indirect_argument", !6}
+!6 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>"}
+"#;
+    let out_bda = call_stage3_with_caps(bda_as_prim_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_bda.rc, RC_OK, "bda_as_prim failed: {}", out_bda.msg);
+    let meta_bda: Value = serde_json::from_slice(&out_bda.meta).unwrap();
+    assert_has_rt_prim_data_binding(&meta_bda, "bda_as_prim");
+    let asm_bda = spv_asm(&out_bda.spv);
+    assert!(asm_bda.contains("OpConvertUToAccelerationStructureKHR"), "{asm_bda}");
+    assert!(asm_bda.contains("Binding 676"), "{asm_bda}");
+    assert_spirv_val("bda_as_prim", &out_bda.spv);
+
+    // 5. Bare `intersector<>` (`@air.intersect(` with zero template tags) against raw BLAS
+    //    (`primitive_acceleration_structure`), both with and without prim_data.
+    let bare_blas_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_bare_intersector_blas(ptr addrspace(1) %blas.coerce, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %hit = call { i32, float, i32, i32, ptr addrspace(1) } @air.intersect(<3 x float> <float 0.0, float 0.0, float 1.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %blas.coerce, ptr addrspace(1) null, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false)
+  %pd = extractvalue { i32, float, i32, i32, ptr addrspace(1) } %hit, 4
+  %is_null = icmp eq ptr addrspace(1) %pd, null
+  br i1 %is_null, label %miss, label %read
+read:
+  %v = load <4 x float>, ptr addrspace(1) %pd, align 16
+  br label %done
+miss:
+  %d = extractvalue { i32, float, i32, i32, ptr addrspace(1) } %hit, 1
+  %m = insertelement <4 x float> zeroinitializer, float %d, i64 0
+  br label %done
+done:
+  %res = phi <4 x float> [ %v, %read ], [ %m, %miss ]
+  store <4 x float> %res, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1) } @air.intersect(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_bare_intersector_blas, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.primitive_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"primitive_acceleration_structure"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let out_bare_prim = call_stage3_with_caps(bare_blas_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_bare_prim.rc, RC_OK, "bare intersector prim failed: {}", out_bare_prim.msg);
+    let meta_bare_prim: Value = serde_json::from_slice(&out_bare_prim.meta).unwrap();
+    assert_has_rt_prim_data_binding(&meta_bare_prim, "bare_intersector_blas prim");
+    let asm_bare_prim = spv_asm(&out_bare_prim.spv);
+    assert!(asm_bare_prim.contains("OpTypeAccelerationStructureKHR"), "{asm_bare_prim}");
+    assert!(asm_bare_prim.contains("OpRayQueryInitializeKHR"), "{asm_bare_prim}");
+    assert!(asm_bare_prim.contains("Binding 676"), "{asm_bare_prim}");
+    assert_spirv_val("bare_intersector_blas prim", &out_bare_prim.spv);
+
+    let out_bare_noprim =
+        call_stage3_with_caps(bare_blas_ll, Some([1, 1, 1]), &[], Some(caps_no_prim));
+    assert_eq!(
+        out_bare_noprim.rc, RC_OK,
+        "bare intersector without bit 11 failed: {}",
+        out_bare_noprim.msg
+    );
+    let asm_bare_noprim = spv_asm(&out_bare_noprim.spv);
+    assert!(asm_bare_noprim.contains("OpTypeAccelerationStructureKHR"), "{asm_bare_noprim}");
+    assert!(asm_bare_noprim.contains("OpRayQueryInitializeKHR"), "{asm_bare_noprim}");
+    assert!(!asm_bare_noprim.contains("Binding 676"), "{asm_bare_noprim}");
+    assert_spirv_val("bare_intersector_blas no_prim", &out_bare_noprim.spv);
+
+    // 6. Apple official sample fixes:
+    //    (a) `@air.is_null_{instance_acceleration_structure,primitive_acceleration_structure,intersection_function_table}`
+    //        on both descriptor-bound and BDA-loaded AS/IFT handles.
+    //    (b) `!"air.geometry_intersection_function_table_offset"` callback param role decoded as GeometryId.
+    let is_null_apple_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.SceneArgs = type { ptr addrspace(1) }
+define void @k_apple_is_null(ptr addrspace(1) %tlas.coerce, ptr addrspace(1) %blas.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) %bda_args, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %n0 = tail call i1 @air.is_null_instance_acceleration_structure(ptr addrspace(1) nocapture readonly %tlas.coerce)
+  %n1 = tail call i1 @air.is_null_primitive_acceleration_structure(ptr addrspace(1) nocapture readonly %blas.coerce)
+  %n2 = tail call i1 @air.is_null_intersection_function_table(ptr addrspace(1) nocapture readonly %ift.coerce)
+  %bda_p = getelementptr inbounds %struct.SceneArgs, ptr addrspace(1) %bda_args, i32 0, i32 0
+  %bda_as = load ptr addrspace(1), ptr addrspace(1) %bda_p, align 8
+  %n3 = tail call i1 @air.is_null_instance_acceleration_structure(ptr addrspace(1) nocapture readonly %bda_as)
+  %any0 = or i1 %n0, %n1
+  %any1 = or i1 %any0, %n2
+  %any2 = or i1 %any1, %n3
+  br i1 %any2, label %bail, label %trace
+trace:
+  %hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %tlas.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %t = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 1
+  br label %done
+bail:
+  br label %done
+done:
+  %res = phi float [ %t, %trace ], [ -1.0, %bail ]
+  store float %res, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i1 @air.is_null_instance_acceleration_structure(ptr addrspace(1) nocapture readonly)
+declare i1 @air.is_null_primitive_acceleration_structure(ptr addrspace(1) nocapture readonly)
+declare i1 @air.is_null_intersection_function_table(ptr addrspace(1) nocapture readonly)
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_apple_is_null, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.primitive_acceleration_structure", !"air.location_index", i32 1, i32 1, !"air.read"}
+!5 = !{i32 2, !"air.intersection_function_table", !"air.location_index", i32 2, i32 1, !"air.read"}
+!6 = !{i32 3, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.struct_type_info", !8}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!8 = !{i32 0, i32 8, i32 0, !"acceleration_structure<instancing>", !"tlas", !"air.indirect_argument", !9}
+!9 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>"}
+"#;
+    let geom_offset_cb_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define <{ i1, float }> @apple_sphere_cb(<3 x float> %origin, <3 x float> %direction, float %minDistance, float %maxDistance, i32 %primitiveIndex, i32 %geometryIndex, ptr addrspace(1) %perPrimitiveData) local_unnamed_addr {
+entry:
+  %g = uitofp i32 %geometryIndex to float
+  %d = fadd float %minDistance, %g
+  %ok = fcmp ole float %d, %maxDistance
+  %r0 = insertvalue <{ i1, float }> undef, i1 %ok, 0
+  %r1 = insertvalue <{ i1, float }> %r0, float %d, 1
+  ret <{ i1, float }> %r1
+}
+!air.intersection = !{!14}
+!14 = !{ptr @apple_sphere_cb, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float"}
+!18 = !{!19, !20, !21, !22, !23, !24, !25}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+!23 = !{i32 4, !"air.primitive_id", !"air.arg_type_name", !"uint"}
+!24 = !{i32 5, !"air.geometry_intersection_function_table_offset", !"air.arg_type_name", !"uint", !"air.arg_name", !"geometryIndex"}
+!25 = !{i32 6, !"air.primitive_data", !"air.arg_type_name", !"void", !"air.arg_name", !"perPrimitiveData"}
+"#;
+    let (spv_apple, meta_apple_bytes) = garnetxlate::translate_bytes_stage3(
+        is_null_apple_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[],
+        &[(
+            "apple_sphere_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            geom_offset_cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_prim),
+    )
+    .expect("Apple sample is_null + geometry_intersection_function_table_offset failed");
+    let meta_apple: Value = serde_json::from_slice(&meta_apple_bytes).unwrap();
+    assert_has_rt_prim_data_binding(&meta_apple, "apple_is_null_and_sphere_cb");
+    let asm_apple = spv_asm(&spv_apple);
+    assert!(asm_apple.contains("OpRayQueryGetIntersectionGeometryIndexKHR"), "{asm_apple}");
+    assert!(asm_apple.contains("OpRayQueryGenerateIntersectionKHR"), "{asm_apple}");
+    assert!(!asm_apple.contains("air.is_null_"), "{asm_apple}");
+    assert_spirv_val("apple_is_null_and_sphere_cb", &spv_apple);
+}
+
+#[test]
+fn wave4_trusted_ro_bda_mixed_alloca_loop_keeps_registry_v3_and_reverse_block_order() {
+    let caps_prim = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // Case A (soundness): Alloca receives a trusted prim_data pointer BEFORE a loop load, and an
+    // untrusted user BDA pointer in a LATER block inside the loop. Because tracking is monotone
+    // and function-wide, the loop load MUST still emit RegistryV3 (Binding 640) and never bypass
+    // bounds checks for `%user_ptr`.
+    let mixed_loop_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.UserArgs = type { ptr addrspace(1) }
+define void @k_mixed_alloca_loop(ptr addrspace(1) %scene.coerce, ptr addrspace(2) readonly align 8 dereferenceable(8) %uargs, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %slot = alloca ptr addrspace(1), align 8
+  %hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) null, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %pd = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 4
+  store ptr addrspace(1) %pd, ptr %slot, align 8
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i_next, %latch ]
+  %acc = phi <4 x float> [ zeroinitializer, %entry ], [ %acc_next, %latch ]
+  %cur = load ptr addrspace(1), ptr %slot, align 8
+  %is_null = icmp eq ptr addrspace(1) %cur, null
+  br i1 %is_null, label %latch, label %do_load
+do_load:
+  %v = load <4 x float>, ptr addrspace(1) %cur, align 16
+  %sum = fadd <4 x float> %acc, %v
+  br label %latch
+latch:
+  %acc_next = phi <4 x float> [ %acc, %loop ], [ %sum, %do_load ]
+  %up_field = getelementptr inbounds %struct.UserArgs, ptr addrspace(2) %uargs, i64 0, i32 0
+  %user_ptr = load ptr addrspace(1), ptr addrspace(2) %up_field, align 8
+  store ptr addrspace(1) %user_ptr, ptr %slot, align 8
+  %i_next = add i32 %i, 1
+  %cont = icmp ult i32 %i_next, 2
+  br i1 %cont, label %loop, label %done
+done:
+  store <4 x float> %acc_next, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_mixed_alloca_loop, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"UserArgs", !"air.arg_name", !"uargs"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+!6 = !{i32 0, i32 8, i32 0, !"float4", !"buf", !"air.indirect_argument", !7}
+!7 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let out_mixed = call_stage3_with_caps(mixed_loop_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_mixed.rc, RC_OK, "mixed loop alloca failed: {}", out_mixed.msg);
+    let asm_mixed = spv_asm(&out_mixed.spv);
+    assert!(asm_mixed.contains("Binding 676"), "{asm_mixed}");
+    assert!(
+        asm_mixed.contains("Binding 640"),
+        "mixed trusted+untrusted loop alloca MUST retain RegistryV3 (Binding 640):\n{asm_mixed}"
+    );
+    let meta_mixed: Value = serde_json::from_slice(&out_mixed.meta).unwrap();
+    assert_eq!(
+        meta_mixed["buffer_address_table_version"], 3,
+        "mixed loop alloca must require RegistryV3 metadata: {meta_mixed}"
+    );
+    assert_spirv_val("mixed_alloca_loop", &out_mixed.spv);
+
+    // Case B (block-order independence): Load block appears BEFORE trusted store block in IR order.
+    // Must still recognize trusted_ro_bda (NO Binding 640 / RegistryV3).
+    let reverse_order_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_reverse_alloca_order(ptr addrspace(1) %scene.coerce, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %slot = alloca ptr addrspace(1), align 8
+  br label %do_store
+do_load:
+  %reloaded = load ptr addrspace(1), ptr %slot, align 8
+  %is_null = icmp eq ptr addrspace(1) %reloaded, null
+  br i1 %is_null, label %done, label %read_pd
+read_pd:
+  %v = load <4 x float>, ptr addrspace(1) %reloaded, align 16
+  br label %done
+do_store:
+  %hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) null, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %pd = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 4
+  store ptr addrspace(1) %pd, ptr %slot, align 8
+  br label %do_load
+done:
+  %res = phi <4 x float> [ zeroinitializer, %do_load ], [ %v, %read_pd ]
+  store <4 x float> %res, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_reverse_alloca_order, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let out_rev = call_stage3_with_caps(reverse_order_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_rev.rc, RC_OK, "reverse block order alloca failed: {}", out_rev.msg);
+    let asm_rev = spv_asm(&out_rev.spv);
+    assert!(asm_rev.contains("Binding 676"), "{asm_rev}");
+    assert!(
+        !asm_rev.contains("Binding 640"),
+        "reverse-order all-trusted alloca must NOT emit RegistryV3:\n{asm_rev}"
+    );
+    assert_spirv_val("reverse_alloca_order", &out_rev.spv);
+}
+
+#[test]
+fn wave4_apple_sample_rt_is_null_and_geometry_ift_offset_role() {
+    let caps_prim = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // 1. Descriptor AS + BDA AS + IFT `@air.is_null_*` intrinsics (Apple Sample 2 `rtReflection` pattern).
+    let is_null_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.AsArgs = type { ptr addrspace(1) }
+define void @k_rt_is_null(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %args, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %n0 = tail call i1 @air.is_null_instance_acceleration_structure(ptr addrspace(1) nocapture readonly %scene.coerce)
+  %as_ptr = getelementptr inbounds %struct.AsArgs, ptr addrspace(1) %args, i32 0, i32 0
+  %bda_as = load ptr addrspace(1), ptr addrspace(1) %as_ptr, align 8
+  %n1 = tail call i1 @air.is_null_primitive_acceleration_structure(ptr addrspace(1) nocapture readonly %bda_as)
+  %null_ift = tail call ptr addrspace(1) @air.get_null_intersection_function_table()
+  %n2 = tail call i1 @air.is_null_intersection_function_table(ptr addrspace(1) nocapture readonly %null_ift)
+  %skip0 = or i1 %n0, %n1
+  br i1 %skip0, label %done, label %trace
+trace:
+  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %null_ift, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %t = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 1
+  %bonus = select i1 %n2, float 1.0, float 0.0
+  %sum = fadd float %t, %bonus
+  br label %done
+done:
+  %res = phi float [ 0.0, %entry ], [ %sum, %trace ]
+  store float %res, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i1 @air.is_null_instance_acceleration_structure(ptr addrspace(1) nocapture readonly)
+declare i1 @air.is_null_primitive_acceleration_structure(ptr addrspace(1) nocapture readonly)
+declare i1 @air.is_null_intersection_function_table(ptr addrspace(1) nocapture readonly)
+declare ptr addrspace(1) @air.get_null_intersection_function_table()
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_rt_is_null, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.indirect_buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.struct_type_info", !6}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!6 = !{i32 0, i32 8, i32 0, !"primitive_acceleration_structure", !"blas", !"air.indirect_argument", !7}
+!7 = !{i32 0, !"air.primitive_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+"#;
+    let out_null = call_stage3_with_caps(is_null_ll, Some([1, 1, 1]), &[], Some(caps_prim));
+    assert_eq!(out_null.rc, RC_OK, "is_null_* failed: {}", out_null.msg);
+    let asm_null = spv_asm(&out_null.spv);
+    assert!(asm_null.contains("OpRayQueryInitializeKHR"), "{asm_null}");
+    assert!(!asm_null.contains("air.is_null_"), "{asm_null}");
+    assert_spirv_val("rt_is_null", &out_null.spv);
+
+    // 2. Apple Sample 1 `[[geometry_intersection_function_table_offset]]` callback parameter maps
+    //    to `OpRayQueryGetIntersectionGeometryIndexKHR` (NOT PrimitiveId).
+    let s1_entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_s1_geom_off(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %0 = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %1 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %0, 1
+  store float %1, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @k_s1_geom_off, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+"#;
+    let s1_cb_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define <{ i1, float }> @sphere_geom_off_cb(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, i32 %geomOff, ptr addrspace(1) readonly %pdata) local_unnamed_addr {
+entry:
+  %gf = uitofp i32 %geomOff to float
+  %is_null = icmp eq ptr addrspace(1) %pdata, null
+  br i1 %is_null, label %done, label %read
+read:
+  %pv = load float, ptr addrspace(1) %pdata, align 4
+  br label %done
+done:
+  %pd_f = phi float [ 0.0, %entry ], [ %pv, %read ]
+  %t = fadd float %gf, %pd_f
+  %ok = fcmp oge float %t, %tmin
+  %r0 = insertvalue <{ i1, float }> undef, i1 %ok, 0
+  %r1 = insertvalue <{ i1, float }> %r0, float %t, 1
+  ret <{ i1, float }> %r1
+}
+!air.intersection = !{!14}
+!14 = !{ptr @sphere_geom_off_cb, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float"}
+!18 = !{!19, !20, !21, !22, !23, !24}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+!23 = !{i32 4, !"air.geometry_intersection_function_table_offset", !"air.arg_type_name", !"uint"}
+!24 = !{i32 5, !"air.primitive_data", !"air.arg_type_name", !"void"}
+"#;
+    let (spv_s1, meta_s1_bytes) = garnetxlate::translate_bytes_stage3(
+        s1_entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[],
+        &[(
+            "sphere_geom_off_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            s1_cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_prim),
+    )
+    .expect("s1 geometry_intersection_function_table_offset callback failed");
+    let meta_s1: Value = serde_json::from_slice(&meta_s1_bytes).unwrap();
+    assert_has_rt_prim_data_binding(&meta_s1, "s1_geom_off");
+    let asm_s1 = spv_asm(&spv_s1);
+    assert!(asm_s1.contains("OpRayQueryGetIntersectionGeometryIndexKHR"), "{asm_s1}");
+    assert!(asm_s1.contains("OpRayQueryGenerateIntersectionKHR"), "{asm_s1}");
+    assert_spirv_val("s1_geom_off", &spv_s1);
 }

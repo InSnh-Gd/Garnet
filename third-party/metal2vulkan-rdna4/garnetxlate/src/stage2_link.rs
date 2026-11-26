@@ -438,6 +438,8 @@ pub fn translate_bytes_stage3(
     }
     linkage.runtime_intersection_abi_v2 =
         caps.is_some_and(RDNA4xBackendCapabilities::ift_abi_v2);
+    linkage.runtime_rt_primitive_data =
+        caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data);
 
     let (san_ll, vft_info, ift_info) =
         metal2vulkan::specialize_linked_module_with_tables(&san_entry, stage, &linkage)?;
@@ -456,6 +458,9 @@ pub fn translate_bytes_stage3(
         .with_hardware_ray_query();
     if caps.is_some_and(RDNA4xBackendCapabilities::emulated_mesh_payload) {
         options = options.with_emulated_mesh_payload();
+    }
+    if caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data) {
+        options = options.with_rt_primitive_data();
     }
 
     let tmp = Path::new("");

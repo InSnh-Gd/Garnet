@@ -49,10 +49,12 @@ typedef struct RDNA4xBackendCapabilities {
  *                     Stage::Mesh with payload -> MeshEXT reading payload SSBO via DrawIndex)
  *   bit 9 (1u << 9): Vulkan device enables VK_KHR_ray_tracing_position_fetch
  *   bit 10 (1u << 10): IFT backing buffer ABI v2 (66-word header with attached_bda[31])
+ *   bit 11 (1u << 11): RT per-primitive data GPU sidecar lookup (set 0 binding 676, 264 bytes)
  */
 #define GARNETX_CAP_MESH_EMULATED_PAYLOAD (1u << 8)
 #define GARNETX_CAP_RT_POSITION_FETCH     (1u << 9)
 #define GARNETX_CAP_RT_IFT_ABI_V2         (1u << 10)
+#define GARNETX_CAP_RT_PRIMITIVE_DATA     (1u << 11)
 
 /* Set 0 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER bindings reserved for
  * GARNETX_CAP_MESH_EMULATED_PAYLOAD stages:
@@ -61,10 +63,14 @@ typedef struct RDNA4xBackendCapabilities {
  *                    group_id * (payload_stride_bytes / 4)
  *   675 (WriteOnly on Object): uint32_t[] VkDrawMeshTasksIndirectCommandEXT triples
  *                    { groupCountX, groupCountY, groupCountZ } at group_id * 3 + 0..2
+ * Set 0 (or Fragment set 1) VK_DESCRIPTOR_TYPE_STORAGE_BUFFER binding reserved for
+ * GARNETX_CAP_RT_PRIMITIVE_DATA:
+ *   676 (ReadOnly, 264 bytes): { u64 global_table_bda, u64 table_mask, u64 slot_as_bda[31] }
  */
 #define GARNETX_MESH_GRID_PARAMS_BINDING 673u
 #define GARNETX_MESH_PAYLOAD_BINDING     674u
 #define GARNETX_MESH_INDIRECT_BINDING    675u
+#define GARNETX_RT_PRIM_DATA_BINDING     676u
 
 typedef struct GarnetxIcbVertexAttr {
     uint32_t location;

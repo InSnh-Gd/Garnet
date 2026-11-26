@@ -8,18 +8,22 @@ pub const GARNETX_CAP_MESH_EMULATED_PAYLOAD: u32 = 1 << 8;
 pub const GARNETX_CAP_RT_POSITION_FETCH: u32 = 1 << 9;
 /// Capability flag enabling IFT backing buffer ABI v2 (66-word header with `attached_bda[31]`).
 pub const GARNETX_CAP_RT_IFT_ABI_V2: u32 = 1 << 10;
+/// Capability flag enabling RT `primitiveDataBuffer` GPU lookup via binding 676.
+pub const GARNETX_CAP_RT_PRIMITIVE_DATA: u32 = 1 << 11;
 
-/// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages.
+/// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages and RT prim data.
 pub const GARNETX_MESH_GRID_PARAMS_BINDING: u32 =
     metal2vulkan::reflect::MESH_EMULATED_GRID_PARAMS_BINDING;
 pub const GARNETX_MESH_PAYLOAD_BINDING: u32 = metal2vulkan::reflect::MESH_EMULATED_PAYLOAD_BINDING;
 pub const GARNETX_MESH_INDIRECT_BINDING: u32 =
     metal2vulkan::reflect::MESH_EMULATED_INDIRECT_BINDING;
+pub const GARNETX_RT_PRIM_DATA_BINDING: u32 = metal2vulkan::reflect::RT_PRIM_DATA_BINDING;
 
 const KNOWN_CAPABILITY_FLAGS: u32 = 3
     | GARNETX_CAP_MESH_EMULATED_PAYLOAD
     | GARNETX_CAP_RT_POSITION_FETCH
-    | GARNETX_CAP_RT_IFT_ABI_V2;
+    | GARNETX_CAP_RT_IFT_ABI_V2
+    | GARNETX_CAP_RT_PRIMITIVE_DATA;
 
 /// Caller-proven language/device support and actual Vulkan subgroup properties (ABI 3).
 #[repr(C)]
@@ -52,6 +56,10 @@ impl RDNA4xBackendCapabilities {
 
     pub(crate) fn ift_abi_v2(self) -> bool {
         self.flags & GARNETX_CAP_RT_IFT_ABI_V2 != 0
+    }
+
+    pub(crate) fn rt_primitive_data(self) -> bool {
+        self.flags & GARNETX_CAP_RT_PRIMITIVE_DATA != 0
     }
 
     pub(crate) fn replay(self) -> QueryLodReplay {
@@ -426,13 +434,14 @@ fn translate_bytes_with_capabilities(
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
-    let (spv, meta) = translate_text_with_mesh_options(
+    let (spv, meta) = translate_text_with_rt_options(
         text,
         local,
         dependencies.as_deref(),
         true,
         capabilities.replay(),
         capabilities.emulated_mesh_payload(),
+        capabilities.rt_primitive_data(),
     )?;
     let has_query = gate_query_lod(&spv, capabilities)?;
     let mut metadata: Value = serde_json::from_slice(&meta).map_err(|error| error.to_string())?;
