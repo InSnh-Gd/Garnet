@@ -292,7 +292,7 @@ int main(int argc, char **argv) {
       CHECK("kernel: blob version 2, header 12, the generation under the gate", strstr(kp, "kBlobVersion2 = 2u, kBlobHdr2 = 12u") && strstr(kp, "blob_build_v2(SurfTable &t, uint32_t gen,") && strstr(kp, "__atomic_store_n(&g.curGen, seen, __ATOMIC_SEQ_CST);") && strstr(kp, "g.pubGen, seen"));
       CHECK("kernel ABI header carries the bits, the selectors and minor >= 12", strstr(ka, "#define RDNA4N_SCANQ_M6FLIP     (1u << 6)") && strstr(ka, "#define RDNA4N_SCANQ_M6FLIP1    (1u << 7)") && strstr(ka, "RDNA4N_SEL_SCANX_ACQUIRE  = 22") && strstr(ka, "RDNA4N_SEL_SCANX_RELEASE  = 26") && (strstr(ka, "#define RDNA4N_ABI_MINOR     12u") || strstr(ka, "#define RDNA4N_ABI_MINOR     13u")) && strstr(ka, "#define RDNA4N_SCANX_SLOT_TAG_MONA   0x10u"));
       CHECK("bundle's garnet_scanabi.h mirrors them", strstr(abi, "#define RDNA4N_SCANQ_M6FLIP     (1u << 6)") && strstr(abi, "#define RDNA4N_SCANQ_M6FLIP1    (1u << 7)") && strstr(abi, "#define RDNA4N_SEL_SCANX_ACQUIRE  22u") && strstr(abi, "#define RDNA4N_SEL_SCANX_RELEASE  26u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG   0x20u") && strstr(abi, "#define RDNA4N_SCANX_SLOT_TAG_MONA 0x10u"));
-      CHECK("bundle build 43 in Info.plist", strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>") != NULL);
+      CHECK("bundle build 44 in Info.plist", strstr(pl, "<key>CFBundleVersion</key>\n\t<string>44</string>") != NULL);
       CHECK("CHANGES.md describes M6 Stage 2 enablement", strstr(ins, "**Stage 2**") && strstr(ins, "rdna4-m6flip1=1"));
       free(m); free(pl); free(ins); free(abi); free(kp); free(ka); free(xh); }
     printf("test-m6x: %d checks, %d failed\n", checks, fails);

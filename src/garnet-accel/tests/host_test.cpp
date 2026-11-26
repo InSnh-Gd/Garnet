@@ -284,9 +284,9 @@ static void a5_thin(const std::string &root) {
 static void a6_plist(const std::string &root, const std::string &bringRoot) {
     const std::string plist = slurp(root + "/Info.plist"), kmod = slurp(root + "/src/kmod_info.c"), mk = slurp(root + "/Makefile");
     expect(plist.find("<key>CFBundleIdentifier</key>\n\t<string>org.garnet.accel</string>") != std::string::npos, "the approved id org.garnet.accel is reused");
-    expect_u("version 0.0.8 (short and bundle)", count_of(plist, "<string>0.0.8</string>"), 2);
+    expect_u("version 0.1.1 (short and bundle)", count_of(plist, "<string>0.1.1</string>"), 2);
     expect(plist.find("0.0.2") == std::string::npos && plist.find("<string>0.0.3</string>") == std::string::npos, "no 0.0.2 / 0.0.3 left in the plist");
-    expect(kmod.find("KMOD_EXPLICIT_DECL(org.garnet.accel, \"0.0.8\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(org.garnet.accel, \"0.1.1\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
     expect(plist.find("<key>CFBundleName</key>\n\t<string>GarnetAccel</string>") != std::string::npos, "display name GarnetAccel");
     expect(plist.find("<key>com.apple.iokit.IOAcceleratorFamily2</key>\n\t\t<string>2.0.0</string>") != std::string::npos, "links IOAcceleratorFamily2 2.0.0");
     expect(plist.find("com.apple.iokit.IOGraphicsFamily") != std::string::npos && plist.find("com.apple.kpi.iokit") != std::string::npos && plist.find("com.apple.kpi.libkern") != std::string::npos, "links IOGraphicsFamily and the kpis");
@@ -658,8 +658,8 @@ static void a9_native_open(const std::string &root, const std::string &bring) {
     }
     // the layout lists agree in gate_link / gen_gate (they read leaves.py): nothing else names slot 239
     // versions and the install path
-    expect(plist.find("<string>0.0.8</string>") != std::string::npos && count_of(plist, "<string>0.0.8</string>") == 2 && plist.find("0.0.4") == std::string::npos && plist.find("<string>0.0.5</string>") == std::string::npos && plist.find("<string>0.0.6</string>") == std::string::npos, "Info.plist says 0.0.8 (carried twice)");
-    expect(kmod.find("KMOD_EXPLICIT_DECL(org.garnet.accel, \"0.0.8\", _start, _stop)") != std::string::npos, "kmod_info says 0.0.8");
+    expect(plist.find("<string>0.1.1</string>") != std::string::npos && count_of(plist, "<string>0.1.1</string>") == 2 && plist.find("0.0.4") == std::string::npos && plist.find("<string>0.0.5</string>") == std::string::npos && plist.find("<string>0.0.6</string>") == std::string::npos, "Info.plist says 0.1.1 (carried twice)");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(org.garnet.accel, \"0.1.1\", _start, _stop)") != std::string::npos, "kmod_info says 0.1.1");
     expect(inst.find("/Library/Extensions/GarnetAccel-0.0.5.kext") != std::string::npos && inst.find("Step 4b") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/GarnetAccel-0.0.5.kext (step 4b)");
     { const size_t a = inst.find("## 0.0.5 (G6"), e = inst.find("## 0.0.4 (M5", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
       expect_u("the 0.0.5 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/GarnetAccel-0.0.5.kext"), 7u);

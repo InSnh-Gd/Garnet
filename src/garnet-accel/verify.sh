@@ -23,7 +23,7 @@ inf "boot-args: $(nvram boot-args 2>/dev/null | cut -f2)"
 [ -d "$R/Library/Extensions/RDNA4AccelProbe.kext" ] && no "the old /Library/Extensions/RDNA4AccelProbe.kext is still installed" || ok "no old RDNA4AccelProbe.kext in /Library/Extensions"
 if [ -d "$K" ]; then
   version=$($PLISTBUDDY -c 'Print :CFBundleVersion' "$K/Contents/Info.plist" 2>&1) || version="<read failed>"
-  [ "$version" = 0.0.8 ] && ok "GarnetAccel version 0.0.8" || no "GarnetAccel version is $version (expect 0.0.8)"
+  [ "$version" = 0.1.1 ] && ok "GarnetAccel version 0.1.1" || no "GarnetAccel version is $version (expect 0.1.1)"
 else
   no "GarnetAccel is not installed at $K"
 fi
@@ -64,7 +64,7 @@ else inf "[PHASE 1] no GarnetMetalNub (not published: expected before garnetnub 
 L=$(log show --last boot --predicate 'eventMessage CONTAINS "garnetaccel:" OR eventMessage CONTAINS "GarnetDriver: metal:"' --style compact 2>/dev/null | grep -v '^Timestamp\|^Filtering\|log run noninteractively')
 [ -z "$L" ] && L=$(sudo -n dmesg 2>/dev/null | grep -E 'garnetaccel:|GarnetDriver: metal:')
 echo "$L" | grep -q 'garnetaccel: layout PASS' && ok "[GATE] runtime layout gate PASS: $(echo "$L" | grep -m1 'layout PASS' | sed 's/.*garnetaccel: //')" || inf "no 'garnetaccel: layout PASS' line (expected only in PHASE 2)"
-echo "$L" | grep -q 'layout PASS 2720/2720' && ok "[GATE] aux 0.0.8: 13 classes / 2720 slots compared (GarnetFramebuffer included)" || inf "no 'layout PASS 2720/2720' line (expected only in PHASE 2)"
+echo "$L" | grep -q 'layout PASS 2720/2720' && ok "[GATE] aux 0.1.1: 13 classes / 2720 slots compared (GarnetFramebuffer included)" || inf "no 'layout PASS 2720/2720' line (expected only in PHASE 2)"
 echo "$L" | grep -q 'layout FAIL' && no "[GATE] layout FAIL: $(echo "$L" | grep -m1 'layout FAIL' | sed 's/.*garnetaccel: //')"
 echo "$L" | grep -E 'garnetaccel:|GarnetDriver: metal:' | tail -30 | sed 's/^/INFO  /'
 inf "panics: $(ls -t "$R/Library/Logs/DiagnosticReports"/Kernel* 2>/dev/null | head -1)"

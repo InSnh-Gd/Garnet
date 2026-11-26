@@ -147,9 +147,9 @@ plant 42 Info.plist "an IOResources personality (runs at every boot)" '<key>IOPr
 			<string>IOKit</string>
 			<key>IOProbeScore</key>'
 plant 43 Info.plist "the version is not bumped (one field)" '<key>CFBundleVersion</key>
-	<string>0.0.8</string>' '<key>CFBundleVersion</key>
+	<string>0.1.1</string>' '<key>CFBundleVersion</key>
 	<string>0.0.3</string>'
-plant 44 src/kmod_info.c "kmod version differs from the plist" 'KMOD_EXPLICIT_DECL(org.garnet.accel, "0.0.8", _start, _stop)' 'KMOD_EXPLICIT_DECL(org.garnet.accel, "0.0.3", _start, _stop)'
+plant 44 src/kmod_info.c "kmod version differs from the plist" 'KMOD_EXPLICIT_DECL(org.garnet.accel, "0.1.1", _start, _stop)' 'KMOD_EXPLICIT_DECL(org.garnet.accel, "0.0.3", _start, _stop)'
 plant 45 Info.plist "another bundle id (would need a new Allow approval)" '<string>org.garnet.accel</string>
 	<key>CFBundleInfoDictionaryVersion</key>' '<string>org.garnet.accel2</string>
 	<key>CFBundleInfoDictionaryVersion</key>'
@@ -310,7 +310,7 @@ plant 141 $S "*handler is written on a refusal" '	if (out == kIoSuccess) *handle
 plant 142 $L "slot 239 is not in the expected override list" "[183, 184, 18, 322, 348, 329, 239, 238])" "[183, 184, 18, 322, 348, 329, 238])"
 plant 143 $P "the type constant is not 'GRNT'" 'if (type != GARNET_METAL_UC_GARNETN) return kNucFamily;' 'if (type != 0x47524E55u) return kNucFamily;'
 plant 144 Info.plist "the short version stays 0.0.4" '<key>CFBundleShortVersionString</key>
-	<string>0.0.8</string>' '<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>' '<key>CFBundleShortVersionString</key>
 	<string>0.0.4</string>'
 plant 145 INSTALL.md "the install path is the old one" '/Library/Extensions/GarnetAccel-0.0.5.kext && sudo chown' '/Library/Extensions/GarnetAccel-0.0.4.kext && sudo chown'
 plant 146 INSTALL.md "the 0.0.5 section suggests kmutil install --update-all" '    Kill switch at any time: boot-arg `garnet-aux=0` (a '"'"'GRNT'"'"' open on the accelerator then returns kIOReturnUnsupported).' '    sudo kmutil install --update-all'
@@ -362,7 +362,7 @@ plant 171 $D 'start never refuses on metal-ws (latch or not)' 'const bool metalW
 plant 172 $D 'the M6 latch is read under a wrong name' 'PE_parse_boot_argn("garnet-m6", &m6v, sizeof(m6v))' 'PE_parse_boot_argn("garnet-m6x", &m6v, sizeof(m6v))'
 plant 173 src/garnetaccel_pure.h 'the metal-ws refusal is inverted under the latch' 'return metalWsPresent && !m6On; }' 'return metalWsPresent && m6On; }'
 plant 174 INSTALL.md 'the 0.0.7 install path is the old one' '/Library/Extensions/GarnetAccel-0.0.7.kext && sudo chown' '/Library/Extensions/GarnetAccel-0.0.6.kext && sudo chown'
-plant 175 src/kmod_info.c 'kmod_info still says 0.0.6' '"0.0.8"' '"0.0.6"'
+plant 175 src/kmod_info.c 'kmod_info still says 0.0.6' '"0.1.1"' '"0.0.6"'
 plant 176 $D 'the M6 latch is read twice in start' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On); uint32_t m6w = 0; (void)PE_parse_boot_argn("garnet-m6", &m6w, sizeof(m6w));'
 plant 177 INSTALL.md 'the 0.0.7 section suggests kmutil install --update-all' '    Kill switch at any time: boot-arg `garnet-aux=0` (both framebuffers refuse to start). With garnet-m6=1 they START' '    sudo kmutil install --update-all
     Kill switch at any time: boot-arg `garnet-aux=0` (both framebuffers refuse to start). With garnet-m6=1 they START'

@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
       CHECK("glue: only WindowServer's admitted device records the accelerator port", strstr(m, "if (self && rdna4_is_ws() && !rdna4_acc_port) rdna4_acc_port = port;") != NULL);
       CHECK("glue: the periodic counter log carries 'surfaces for instance 1/2' and runs from the T1 report", strstr(m, "m6: surfaces for instance 1/2: %u/%u") && strstr(m, "rdna4_m6_report();   // bundle 11"));
       CHECK("glue: rdna4s_classify is unchanged (the size match still classifies; the table decides which display)", strstr(m, "ok = size && pitch && (bt || test);") != NULL);
-      CHECK("bundle build 43 in Info.plist", strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>") != NULL);
+      CHECK("bundle build 44 in Info.plist", strstr(pl, "<key>CFBundleVersion</key>\n\t<string>44</string>") != NULL);
       CHECK("CHANGES.md describes the M6 stages and enable flags", strstr(ins, "## Multi-display") && strstr(ins, "**Stage 1a**") && strstr(ins, "**Stage 1b**") && strstr(ins, "**Stage 2**") && strstr(ins, "rdna4-m6=1") && strstr(ins, "rdna4-m6flip=1") && strstr(ins, "rdna4-m6flip1=1"));
       free(m); free(pl); free(ins); }
     printf("test-m6route: %d checks, %d failed\n", checks, fails);

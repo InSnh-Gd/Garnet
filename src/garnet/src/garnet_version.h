@@ -4,7 +4,7 @@
 #ifndef GARNET_VERSION_H
 #define GARNET_VERSION_H
 
-#define GARNET_KEXT_VERSION_STR "0.0.673"
-#define GARNET_KEXT_BUILD       673u
+#define GARNET_KEXT_VERSION_STR "0.1.1"
+#define GARNET_KEXT_BUILD       101u
 
 #endif /* GARNET_VERSION_H */

@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
     // clear site
     const char *cl = at(m_, "MTLClearColor c = ca.clearColor;"), *cu = cl ? at(cl, "if ([t rdna4IsUInt]) {") : NULL, *cu32 = cl ? at(cl, ".uint32 = { rdna4if_clear_u(c.red, rgbB)") : NULL, *cs = cl ? at(cl, "} else if ([t rdna4IsSInt]) {") : NULL, *cs32 = cs ? at(cs, ".int32 = { rdna4if_clear_s(c.red, rgbB)") : NULL, *cf = cl ? at(cl, ".float32 = { (float)c.red") : NULL;
     CHECK("pin: the colour clear takes the .uint32 / .int32 branch for integer attachments BEFORE the .float32 fill (same loop, no early exit)", cl && cu && cu32 && cs && cs32 && cf && cu > cl && cu32 > cu && cs > cu32 && cs32 > cs && cf > cs32 && cf - cl < 1800, "order clear < isUInt < .uint32 < isSInt < .int32 < .float32");
-    CHECK("pin: integer branches chain into the float32 else arm", cu && cs && cf && at(cs, "} else\n        _cvs[na] = (VkClearValue){ .color = { .float32") != NULL, "else arm");
+    CHECK("pin: integer branches chain into the float32 else arm", cu && cs && cf && at(cs, "} else\n        _sc->cvs[na] = (VkClearValue){ .color = { .float32") != NULL, "else arm");
     CHECK("pin: exactly one colour clear value site (.float32), one .uint32 site, and one .int32 site", count(m_, ".color = { .float32") == 1 && count(m_, ".color = { .uint32") == 1 && count(m_, ".color = { .int32") == 1, "no other clear site");
     CHECK("pin: rdna4IsUInt is declared and defined once", count(m_, "- (BOOL)rdna4IsUInt;") == 1 && count(m_, "- (BOOL)rdna4IsUInt { return _fmt != NULL && (_fmt->flags & RDNA4F_UINT) != 0; }") == 1, "reads the table flag of the texture (views inherit _fmt)");
     // fallback mask
@@ -72,6 +72,6 @@ int main(int argc, char **argv) {
     CHECK("pin: the include of garnet_intfmt.h", count(m_, "#include \"garnet_intfmt.h\"") == 1, "present");
     CHECK("pin: texture and pipeline creation check the backend format features", count(m_, "rdna4_fmt_feats(p->fmt)") == 1 && count(m_, "rdna4_fmt_feats(f)") >= 1 && count(m_, "RADV features 0x%x lack") >= 1 && count(m_, "p->canRT = p->isDS ?") == 1, "texture allocation uses the shared image plan");
     free(m_);
-    { char *pl = slurp(dir, "Info.plist"); CHECK("pin: Info.plist CFBundleVersion is 43", pl && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"), "expected build 43"); free(pl); }
+    { char *pl = slurp(dir, "Info.plist"); CHECK("pin: Info.plist CFBundleVersion is 44", pl && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>44</string>"), "expected build 44"); free(pl); }
     printf("%s (%d failed)\n", fails ? "FAILED" : "all passed", fails); return fails ? 1 : 0;
 }

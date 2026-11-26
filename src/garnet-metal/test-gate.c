@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
     CHECK("G15: the setter's export name", !strcmp(RDNA4G_MESA_SETTER, "radv_darwin_set_service_class"));
     // ---- G11 (0.0.641): the bundle build ----
     { char *pl = slurp(dir, "Info.plist");
-      CHECK("G11: Info.plist: bundle version 0.1.1, build 43", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>43</string>"));
+      CHECK("G11: Info.plist: bundle version 0.1.1, build 44", pl && strstr(pl, "<key>CFBundleShortVersionString</key>\n\t<string>0.1.1</string>") && strstr(pl, "<key>CFBundleVersion</key>\n\t<string>44</string>"));
       free(pl); }
     { char *gm = slurp(dir, "GarnetDevice.m");
       const int assembled = gm && strstr(gm, "@implementation RDNA4RenderPipelineState") != NULL;
@@ -362,7 +362,8 @@ int main(int argc, char **argv) {
                && strstr(reSrc, "- (void)setVertexIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i")
                && strstr(reSrc, "- (void)setFragmentIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i")
                && strstr(reSrc, "rdna4_rt_dc_push_accel_sig(")
-               && strstr(reSrc, "if ([_pso rdna4IsMeshPipeline])")
+               && strstr(reSrc, "if (_psoFast.isMesh)")
+               && strstr(rpSrc, "out->isMesh = [self rdna4IsMeshPipeline]")
                && strstr(reSrc, "rdna4_rt_retain_argbuf_resources("));
       free(gd);
       free(gh);

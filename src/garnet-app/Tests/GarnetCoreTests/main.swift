@@ -419,8 +419,8 @@ struct GarnetCoreTestsRunner {
             try Data("dummy-macho-\(exec)".utf8).write(to: dir.appendingPathComponent("Contents/MacOS/\(exec)"))
         }
 
-        try writeDummyBundle(at: payload.appendingPathComponent("Garnet.kext"), bid: "org.garnet.driver", exec: "Garnet", ver: "0.0.673")
-        try writeDummyBundle(at: vDir.appendingPathComponent("GarnetAccel.kext"), bid: "org.garnet.accel", exec: "GarnetAccel", ver: "0.0.8")
+        try writeDummyBundle(at: payload.appendingPathComponent("Garnet.kext"), bid: "org.garnet.driver", exec: "Garnet", ver: "0.1.1")
+        try writeDummyBundle(at: vDir.appendingPathComponent("GarnetAccel.kext"), bid: "org.garnet.accel", exec: "GarnetAccel", ver: "0.1.1")
         try writeDummyBundle(at: payload.appendingPathComponent("optional/GarnetPCIBarCompat.kext"), bid: "org.garnet.pcibarcompat", exec: "GarnetPCIBarCompat", ver: "1.0.0")
 
         // Create real GarnetMetal.bundle.tar using system tar so SystemDiskInstaller extraction works
@@ -463,9 +463,9 @@ struct GarnetCoreTestsRunner {
         DEFAULT_LAYOUT_ID=\(fingerprint.layoutId)
         AMD_FIRMWARE_LICENSE=LICENSE.amdgpu
         GARNET_BUNDLE_ID=org.garnet.driver
-        GARNET_VERSION=0.0.673
+        GARNET_VERSION=0.1.1
         ACCEL_BUNDLE_ID=org.garnet.accel
-        ACCEL_VERSION=0.0.8
+        ACCEL_VERSION=0.1.1
         PCIBARCOMPAT_BUNDLE_ID=org.garnet.pcibarcompat
         PCIBARCOMPAT_VERSION=1.0.0
         #

@@ -65,7 +65,7 @@ exit 0
 SH
 cat > "$work/bin/PlistBuddy" <<'SH'
 #!/bin/bash
-printf '%s\n' "${STUB_VERSION:-0.0.8}"
+printf '%s\n' "${STUB_VERSION:-0.1.1}"
 SH
 chmod 700 "$work"/bin/*
 export PATH="$work/bin:$PATH"
