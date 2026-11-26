@@ -82,6 +82,16 @@ int main(void) {
     o = garnet_async_qorder_next(&q2, 0);
     CHECK(o.wait_value == 2u && o.signal_value == 3u);
 
+    // 6. Concurrent queue-family sharing helpers for resources touched on both GFX and computeQ.
+    CHECK(garnet_async_compute_use_concurrent_buffer(0, 0, 1) == 0);
+    CHECK(garnet_async_compute_use_concurrent_buffer(1, 0, 0) == 0);
+    CHECK(garnet_async_compute_use_concurrent_buffer(1, 0, 1) == 1);
+
+    CHECK(garnet_async_compute_use_concurrent_image(0, 0, 1, 0) == 0);
+    CHECK(garnet_async_compute_use_concurrent_image(1, 0, 0, 0) == 0);
+    CHECK(garnet_async_compute_use_concurrent_image(1, 0, 1, 0) == 1);
+    CHECK(garnet_async_compute_use_concurrent_image(1, 0, 1, 1) == 0); // depth/stencil stays EXCLUSIVE
+
     printf("test-async-compute: %d/%d checks passed\n", passed, passed);
     return 0;
 }

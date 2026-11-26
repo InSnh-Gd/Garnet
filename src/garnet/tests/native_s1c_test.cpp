@@ -743,7 +743,8 @@ static void u12_pins(const std::string &root) {
 }
 
 static void u14_gfx12_dcc() {
-    expect(dcc_boot_enabled(false, 0u), "absent garnet-dcc defaults ON");
+    expect(!dcc_boot_enabled(false, 0u), "absent garnet-dcc defaults OFF");
+    expect(!dcc_boot_enabled(false, 1u), "absent garnet-dcc ignores stale val and defaults OFF");
     expect(dcc_boot_enabled(true, 1u), "garnet-dcc=1 enables DCC");
     expect(!dcc_boot_enabled(true, 0u), "garnet-dcc=0 disables DCC");
 

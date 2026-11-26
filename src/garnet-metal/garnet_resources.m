@@ -1202,13 +1202,19 @@ GARNET_INTERNAL BOOL rdna4_requirements2(VkBuffer buffer, VkImage image, VkMemor
 // One source of truth for the heap buffer's create info. `external` is non-NULL
 // only for the >64 MiB Shared/Managed heap import path.
 GARNET_INTERNAL VkBufferCreateInfo rdna4_heap_buffer_create_info(NSUInteger len, VkExternalMemoryBufferCreateInfo *external) {
-    return (VkBufferCreateInfo){ .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = len,
+    VkBufferCreateInfo info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = len,
         .pNext = external,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                  (RDNA4R.bufferAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0) |
                  (RDNA4R.accelStruct ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0) };
+    if (garnet_async_compute_use_concurrent_buffer(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi)) {
+        info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        info.queueFamilyIndexCount = 2;
+        info.pQueueFamilyIndices = RDNA4R.sharedQfis;
+    }
+    return info;
 }
 static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *span) {
     long page = sysconf(_SC_PAGESIZE);
@@ -1978,6 +1984,11 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
         .extent = { (uint32_t)d.width, (uint32_t)d.height, p->is3D ? (uint32_t)p->depth : 1 },
         .mipLevels = (uint32_t)p->levels, .arrayLayers = p->td.layers, .samples = (VkSampleCountFlagBits)p->td.samples,
         .flags = icf, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .usage = iu };
+    if (garnet_async_compute_use_concurrent_image(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi, p->isDS ? 1 : 0)) {
+        p->create.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        p->create.queueFamilyIndexCount = 2;
+        p->create.pQueueFamilyIndices = RDNA4R.sharedQfis;
+    }
     return YES;
 }
 

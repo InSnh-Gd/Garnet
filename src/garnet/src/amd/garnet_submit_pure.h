@@ -54,8 +54,8 @@ constexpr bool would_exceed(uint64_t used, uint64_t add, uint64_t cap) { return 
 // ---- BoCreate placement -----------------------------------------------------------------------------------------------------
 enum PlaceKind : uint32_t { kPlaceNone = 0, kPlaceVis = 1, kPlaceGtt = 2 };
 struct Place { uint32_t rc; uint32_t kind; uint64_t size; uint64_t align; bool uc; bool hiOk; bool dcc; };
-// Kill-switch boot-arg `garnet-dcc=0`: default ON when absent or nonzero.
-constexpr bool dcc_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
+// shortcut: GFX12 PTE.DCC is opt-in (`garnet-dcc=1`) until n1c_bo_create clears DCC BOs via GPU/SDMA instead of raw CPU BAR0 memset (prevents stale warm-reboot/reused 256B DCC metadata on partial tiles).
+constexpr bool dcc_boot_enabled(bool present, uint32_t val) { return present && val != 0u; }
 // Kill-switch boot-arg `garnet-hugepage=0`: default ON when absent or nonzero.
 constexpr bool hugepage_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
 // Kill-switch boot-arg `garnet-async-compute=0`: default ON when absent or nonzero.

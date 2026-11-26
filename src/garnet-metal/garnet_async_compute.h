@@ -82,3 +82,19 @@ garnet_async_qorder_next(garnet_async_qorder_t *st, int is_compute) {
     out.signal_value = st->last_value;
     return out;
 }
+
+// Resources accessible from both GFX (qfi) and dedicated async compute (computeQfi)
+// without queue-family ownership transfer barriers must use VK_SHARING_MODE_CONCURRENT.
+// Depth/stencil textures stay GFX-only (garnet_async_compute_texture_ok == 0) so keep them EXCLUSIVE.
+static inline int garnet_async_compute_use_concurrent_buffer(int async_on,
+                                                             uint32_t gfx_qfi,
+                                                             uint32_t compute_qfi) {
+    return (async_on && gfx_qfi != compute_qfi) ? 1 : 0;
+}
+
+static inline int garnet_async_compute_use_concurrent_image(int async_on,
+                                                            uint32_t gfx_qfi,
+                                                            uint32_t compute_qfi,
+                                                            int is_depth_or_stencil) {
+    return (async_on && gfx_qfi != compute_qfi && !is_depth_or_stencil) ? 1 : 0;
+}

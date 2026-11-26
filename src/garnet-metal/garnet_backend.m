@@ -2007,6 +2007,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         pthread_mutex_init(&RDNA4R.computeQlock, NULL);
         RDNA4R.computeQ = VK_NULL_HANDLE;
         RDNA4R.computeQfi = qfi;
+        RDNA4R.sharedQfis[0] = qfi;
+        RDNA4R.sharedQfis[1] = qfi;
         RDNA4R.asyncComputeOn = NO;
         RDNA4R.waitSemaphores = vkGetDeviceProcAddr
             ? (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(RDNA4R.dev, "vkWaitSemaphores") : NULL;
@@ -2016,6 +2018,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             vkGetDeviceQueue(RDNA4R.dev, cqfi, 0, &RDNA4R.computeQ);
             if (RDNA4R.computeQ != VK_NULL_HANDLE) {
                 RDNA4R.computeQfi = cqfi;
+                RDNA4R.sharedQfis[0] = qfi;
+                RDNA4R.sharedQfis[1] = cqfi;
                 RDNA4R.asyncComputeOn = YES;
             }
         }

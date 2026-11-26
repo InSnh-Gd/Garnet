@@ -674,7 +674,7 @@ typedef struct {
     uint32_t maxPushDesc;
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescSet;
     garnet_bar_policy_t barPolicy;
-    VkQueue computeQ; uint32_t computeQfi; pthread_mutex_t computeQlock; BOOL asyncComputeOn;
+    VkQueue computeQ; uint32_t computeQfi; uint32_t sharedQfis[2]; pthread_mutex_t computeQlock; BOOL asyncComputeOn;
     PFN_vkWaitSemaphores waitSemaphores;
     // GPL fast-link + Vulkan 1.3 / EDS3 dynamic states (zero Mesa changes).
     BOOL gplExt, eds3PolyMode, eds3DepthClamp;
