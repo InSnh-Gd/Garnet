@@ -60,6 +60,7 @@
 #include "garnet_buffer_ranges.h"
 #include "garnet_buffer_registry.h"
 #include "garnet_spvrefl.h"
+#include "garnet_gpl.h"
 #include "garnet_argument_scan.h"
 #include "garnet_argument_descriptor_scan.h"
 #include "garnet_argument_capacity.h"
@@ -666,6 +667,19 @@ typedef struct {
     garnet_bar_policy_t barPolicy;
     VkQueue computeQ; uint32_t computeQfi; pthread_mutex_t computeQlock; BOOL asyncComputeOn;
     PFN_vkWaitSemaphores waitSemaphores;
+    // GPL fast-link + Vulkan 1.3 / EDS3 dynamic states (zero Mesa changes).
+    BOOL gplExt, eds3PolyMode, eds3DepthClamp;
+    PFN_vkCmdSetCullMode cmdSetCullMode;
+    PFN_vkCmdSetFrontFace cmdSetFrontFace;
+    PFN_vkCmdSetPrimitiveTopology cmdSetPrimitiveTopology;
+    PFN_vkCmdSetPrimitiveRestartEnable cmdSetPrimitiveRestartEnable;
+    PFN_vkCmdSetDepthTestEnable cmdSetDepthTestEnable;
+    PFN_vkCmdSetDepthWriteEnable cmdSetDepthWriteEnable;
+    PFN_vkCmdSetDepthCompareOp cmdSetDepthCompareOp;
+    PFN_vkCmdSetStencilTestEnable cmdSetStencilTestEnable;
+    PFN_vkCmdSetStencilOp cmdSetStencilOp;
+    PFN_vkCmdSetPolygonModeEXT cmdSetPolygonMode;
+    PFN_vkCmdSetDepthClampEnableEXT cmdSetDepthClampEnable;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
 typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;
@@ -900,7 +914,7 @@ typedef struct {
     const RDNA4ArgumentTables *argTables;
     VkFormat dsVk;
     uint32_t sampleCount, maxAmp, drawBits, fetchMax;
-    uint8_t hasFrag, hasDS, hasDepth, fetch, isFallback, isTess, isMesh, hasAddrReg;
+    uint8_t hasFrag, hasDS, hasDepth, fetch, isFallback, isTess, isMesh, hasAddrReg, useGpl;
     uint8_t pushStage[2];
     uint8_t hasEmbeddedTex[2];
 } RDNA4RenderPSOFast;
@@ -1274,6 +1288,10 @@ typedef struct {
     BOOL _hasAddressRegistry;
     uint8_t _pushStage[2];
     uint8_t _hasEmbeddedTex[2];
+    BOOL _useGpl;
+    VkPipelineLayout _gplVsPl, _gplFsPl;
+    VkPipeline _gplFsLib, _gplFoLib;
+    NSMutableDictionary *_gplVsLibs;
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d noFallback:(BOOL)nofb error:(NSError **)err;

@@ -4908,8 +4908,8 @@ RDNA4_DNR(RDNA4RenderEncoder)
     [self rdna4OwnResource:pso kind:RDNA4_RESOURCE_PIPELINE
                   fragment:NO index:0];
 }
-- (void)setCullMode:(MTLCullMode)m { _cull = m; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
-- (void)setFrontFacingWinding:(MTLWinding)w { _wind = w; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
+- (void)setCullMode:(MTLCullMode)m { _cull = m; _dynDirty |= GARNET_DYN_RAST; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
+- (void)setFrontFacingWinding:(MTLWinding)w { _wind = w; _dynDirty |= GARNET_DYN_RAST; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
 - (void)setViewport:(MTLViewport)v { _vp = v; _nvp = 1; _dynDirty |= GARNET_DYN_VIEWPORT; }
 - (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
     if (!n || !v) return;
@@ -4991,14 +4991,14 @@ RDNA4_DNR(RDNA4RenderEncoder)
                                 who:"render"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; _dynDirty |= GARNET_DYN_BLEND; }
-- (void)setTriangleFillMode:(MTLTriangleFillMode)m { _fillMode = m; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
-- (void)setDepthClipMode:(NSUInteger)m { _depthClipMode = (MTLDepthClipMode)m; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
+- (void)setTriangleFillMode:(MTLTriangleFillMode)m { _fillMode = m; _dynDirty |= GARNET_DYN_RAST; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
+- (void)setDepthClipMode:(NSUInteger)m { _depthClipMode = (MTLDepthClipMode)m; _dynDirty |= GARNET_DYN_RAST; _drawDirty |= GARNET_DRAW_DIRTY_PIPE; _cleanFastOk = NO; }
 - (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { _bias[0] = a; _bias[1] = RDNA4R.dbClamp ? c : 0.0f; _bias[2] = b; _dynDirty |= GARNET_DYN_DEPTHBIAS; if (c != 0.0f && !RDNA4R.dbClamp) RDNA4_ONCE("setDepthBias: a non-zero clamp is ignored (the device lacks depthBiasClamp)"); }   // bundle 10
 - (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; _dynDirty |= GARNET_DYN_STENCIL_R; }
 - (void)setDepthStencilState:(id)s {   // bundle 10: recorded; read at every draw of a pipeline that has a depth/stencil attachment (a colour-only pipeline never looks at it)
     if (!s) {
         _dsi = rdna4_dsinfo_default();
-        _dynDirty |= GARNET_DYN_STENCIL_M;
+        _dynDirty |= GARNET_DYN_STENCIL_M | GARNET_DYN_DS_OP;
         _drawDirty |= GARNET_DRAW_DIRTY_PIPE;
         _cleanFastOk = NO;
         [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_DEPTH_STENCIL
@@ -5007,7 +5007,7 @@ RDNA4_DNR(RDNA4RenderEncoder)
     }
     if (![s isKindOfClass:[RDNA4DepthStencilState class]]) { RDNA4LOG("setDepthStencilState: not an RDNA4DepthStencilState"); return; }
     _dsi = [(RDNA4DepthStencilState *)s rdna4Info];
-    _dynDirty |= GARNET_DYN_STENCIL_M;
+    _dynDirty |= GARNET_DYN_STENCIL_M | GARNET_DYN_DS_OP;
     _drawDirty |= GARNET_DRAW_DIRTY_PIPE;
     _cleanFastOk = NO;
     [self rdna4OwnResource:s kind:RDNA4_RESOURCE_DEPTH_STENCIL
@@ -5442,15 +5442,20 @@ RDNA4_ENCODER_SHARED
                       (_hasSamplePos ? 4u : 0u) | ((vpCount - 1u) << 3);
     uint32_t ckey = (uint32_t)cull | (rflags << 4);
     uint32_t fkey = (uint32_t)front | (dk << 1);   // the last-answer cache compares (topology, cull+rflags, front+ds, pso)
+    const BOOL gplDyn = (_psoFast.useGpl != 0) && !_hasSamplePos;
+    const uint32_t pcTopo = gplDyn ? garnet_gpl_topo_class((uint32_t)topo) : (uint32_t)topo;
+    const uint32_t pcRflags = gplDyn ? (rflags & ~(uint32_t)((RDNA4R.eds3PolyMode ? 1u : 0u) | (RDNA4R.eds3DepthClamp ? 2u : 0u))) : rflags;
+    const uint32_t pcCkey = gplDyn ? (pcRflags << 4) : ckey;
+    const uint32_t pcFkey = gplDyn ? 0u : fkey;
     VkPipeline vkp;
     if (_dcOn) {   // P5b item 3: CB-shared (topology, cull, front, pso) -> VkPipeline answer skips pipelineForTopology across encoders
         uint64_t pp;
-        if (_dcCB && rdna4dc_cb_pc_get(_dcCB, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) { vkp = (VkPipeline)(uintptr_t)pp; sc->dc.pcHits++; }
-        else if (!_dcCB && rdna4dc_enc_pc_get(&sc->dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
+        if (_dcCB && rdna4dc_cb_pc_get(_dcCB, pcTopo, pcCkey, pcFkey, (__bridge const void *)_pso, &pp)) { vkp = (VkPipeline)(uintptr_t)pp; sc->dc.pcHits++; }
+        else if (!_dcCB && rdna4dc_enc_pc_get(&sc->dc, pcTopo, pcCkey, pcFkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
         else {
             vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];
-            if (_dcCB) rdna4dc_cb_pc_put(_dcCB, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
-            else rdna4dc_enc_pc_put(&sc->dc, (uint32_t)topo, ckey, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
+            if (_dcCB) rdna4dc_cb_pc_put(_dcCB, pcTopo, pcCkey, pcFkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
+            else rdna4dc_enc_pc_put(&sc->dc, pcTopo, pcCkey, pcFkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp);
         }
     } else vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk rflags:rflags];
     if (!vkp) { [_cb rdna4Fail:@"cannot build a pipeline variant for this draw"]; return NO; }
@@ -5590,6 +5595,33 @@ RDNA4_ENCODER_SHARED
         if (dynEmit & GARNET_DYN_SCISSOR)  { vkCmdSetScissor(cmd, 0, vpCount, scs);  _dynDirty &= ~GARNET_DYN_SCISSOR; }
     }
     if (dynEmit & GARNET_DYN_BLEND) { vkCmdSetBlendConstants(cmd, _blend); _dynDirty &= ~GARNET_DYN_BLEND; }
+    if (gplDyn) {
+        if (dynEmit & GARNET_DYN_RAST) {
+            RDNA4R.cmdSetCullMode(cmd, cull);
+            RDNA4R.cmdSetFrontFace(cmd, front);
+            if (RDNA4R.eds3PolyMode)
+                RDNA4R.cmdSetPolygonMode(cmd, (_fillMode == MTLTriangleFillModeLines) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
+            if (RDNA4R.eds3DepthClamp)
+                RDNA4R.cmdSetDepthClampEnable(cmd, (_depthClipMode == MTLDepthClipModeClamp && RDNA4R.depthClamp) ? VK_TRUE : VK_FALSE);
+            _dynDirty &= ~GARNET_DYN_RAST;
+        }
+        if ((dynEmit & GARNET_DYN_TOPO) || topo != _lastTopo) {
+            RDNA4R.cmdSetPrimitiveTopology(cmd, topo);
+            RDNA4R.cmdSetPrimitiveRestartEnable(cmd, garnet_gpl_is_strip_topo((uint32_t)topo) ? VK_TRUE : VK_FALSE);
+            _dynDirty &= ~GARNET_DYN_TOPO;
+        }
+        if (_psoFast.hasDS && (dynEmit & GARNET_DYN_DS_OP)) {
+            rdna4ds_vk_t dv;
+            rdna4ds_decode(dk, &dv);
+            RDNA4R.cmdSetDepthTestEnable(cmd, dv.depthTest ? VK_TRUE : VK_FALSE);
+            RDNA4R.cmdSetDepthWriteEnable(cmd, dv.depthWrite ? VK_TRUE : VK_FALSE);
+            RDNA4R.cmdSetDepthCompareOp(cmd, (VkCompareOp)dv.depthCompareOp);
+            RDNA4R.cmdSetStencilTestEnable(cmd, dv.stencilTest ? VK_TRUE : VK_FALSE);
+            RDNA4R.cmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, (VkStencilOp)dv.front.failOp, (VkStencilOp)dv.front.passOp, (VkStencilOp)dv.front.depthFailOp, (VkCompareOp)dv.front.compareOp);
+            RDNA4R.cmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, (VkStencilOp)dv.back.failOp, (VkStencilOp)dv.back.passOp, (VkStencilOp)dv.back.depthFailOp, (VkCompareOp)dv.back.compareOp);
+            _dynDirty &= ~GARNET_DYN_DS_OP;
+        }
+    }
     if (_hasSamplePos && rdna4_vkCmdSetSampleLocationsEXT) {
         VkSampleLocationEXT vkSL[8];
         for (uint32_t s = 0; s < _samplePosCount && s < 8; s++) vkSL[s] = (VkSampleLocationEXT){ _samplePos[s].x, _samplePos[s].y };
@@ -5657,7 +5689,9 @@ RDNA4_ENCODER_SHARED
                 return NO;
         }
         const uint32_t reqDyn = GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR | GARNET_DYN_BLEND |
+                                (gplDyn ? (GARNET_DYN_RAST | GARNET_DYN_TOPO) : 0u) |
                                 (_psoFast.hasDS ? (GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R |
+                                                   (gplDyn ? GARNET_DYN_DS_OP : 0u) |
                                                    (_psoFast.hasDepth ? GARNET_DYN_DEPTHBIAS : 0u)) : 0u);
         _dynReqMask = reqDyn;
         _drawDirty = 0u;
@@ -5667,6 +5701,7 @@ RDNA4_ENCODER_SHARED
                        !_hasSamplePos && (_dynDirty & reqDyn) == 0u && !_argumentResources && !_argumentWritable;
         return YES;
     }
+    _lastTopo = topo;
     if (_dcOn) rdna4dc_enc_layout(&sc->dc, 0);
     _drawDirty = GARNET_DRAW_DIRTY_ALL;
     _cleanFastOk = NO;
@@ -5706,9 +5741,10 @@ RDNA4_ENCODER_SHARED
             for (NSUInteger instance = 0; instance < ic; instance++) {
                 for (NSUInteger first = 0; first <= c - size; first += step) {
                     // A separate strip draw restarts parity; preserve front-facing and stencil semantics.
-                    _wind = t == MTLPrimitiveTypeTriangleStrip && (first & 1) ? (winding == MTLWindingClockwise ? MTLWindingCounterClockwise : MTLWindingClockwise) : winding;
+                    MTLWinding nextWind = t == MTLPrimitiveTypeTriangleStrip && (first & 1) ? (winding == MTLWindingClockwise ? MTLWindingCounterClockwise : MTLWindingClockwise) : winding;
+                    if (nextWind != _wind) { _wind = nextWind; _dynDirty |= GARNET_DYN_RAST; }
                     BOOL ready = [self rdna4PrepareDraw:rdna4_topo(t)];
-                    _wind = winding;
+                    if (_wind != winding) { _wind = winding; _dynDirty |= GARNET_DYN_RAST; }
                     if (!ready) return;
                     vkCmdDraw([_cb vk], (uint32_t)size, 1, (uint32_t)(s + first), (uint32_t)(bi + instance));
                 }

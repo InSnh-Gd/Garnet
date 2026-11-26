@@ -78,7 +78,10 @@ enum {
     GARNET_DYN_STENCIL_M = 1u << 3,   // compare/write masks (from depth-stencil state)
     GARNET_DYN_STENCIL_R = 1u << 4,   // front/back reference values
     GARNET_DYN_DEPTHBIAS = 1u << 5,
-    GARNET_DYN_ALL       = 0x3Fu,
+    GARNET_DYN_RAST      = 1u << 6,   // cull, front, polygonMode, depthClamp (GPL/EDS)
+    GARNET_DYN_TOPO      = 1u << 7,   // primitiveTopology, primitiveRestartEnable (GPL/EDS)
+    GARNET_DYN_DS_OP     = 1u << 8,   // depthTest/Write/CompareOp, stencilTest/Op (GPL/EDS)
+    GARNET_DYN_ALL       = 0x1FFu,
 };
 
 #endif

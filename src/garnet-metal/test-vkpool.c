@@ -52,7 +52,8 @@ static void test_cap_clamping(void) {
 
 static void test_stage2_command_invariants(void) {
     check(GARNET_DYN_ALL == (GARNET_DYN_VIEWPORT | GARNET_DYN_SCISSOR | GARNET_DYN_BLEND |
-                             GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R | GARNET_DYN_DEPTHBIAS),
+                             GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R | GARNET_DYN_DEPTHBIAS |
+                             GARNET_DYN_RAST | GARNET_DYN_TOPO | GARNET_DYN_DS_OP),
           "GARNET_DYN_ALL covers all dynamic-state dirty bits");
     FILE *f = fopen("garnet_commands.m", "rb");
     check(f != NULL, "open garnet_commands.m");

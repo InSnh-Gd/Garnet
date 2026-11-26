@@ -1677,10 +1677,17 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
         VkPhysicalDeviceAccelerationStructurePropertiesKHR accelProps = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
+        VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3Feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT };
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gplProps = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT };
         const char *orderedColorExt = NULL;
         BOOL hasDrmMod = NO, hasMemoryBudget = NO, hasSampleLoc = NO, hasInterlock = NO;
         BOOL hasBarycentric = NO, hasAtomicFloat = NO, hasAtomicFloat2 = NO, hasAtomicInt64 = NO;
         BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO, hasPushDesc = NO;
+        BOOL hasPipeLib = NO, hasGpl = NO, hasEds3 = NO;
         VkPhysicalDevicePushDescriptorPropertiesKHR pushDescProps = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR };
         {
@@ -1707,6 +1714,9 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasAccelStruct |= !strcmp(ex[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
                 hasRayQuery |= !strcmp(ex[i].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME);
                 hasPushDesc |= !strcmp(ex[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+                hasPipeLib |= !strcmp(ex[i].extensionName, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+                hasGpl |= !strcmp(ex[i].extensionName, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+                hasEds3 |= !strcmp(ex[i].extensionName, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
                 hasRO |= !strcmp(ex[i].extensionName, "VK_EXT_rasterization_order_attachment_access") || !strcmp(ex[i].extensionName, "VK_ARM_rasterization_order_attachment_access");
                 if (!strcmp(ex[i].extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
                 else if (!orderedColorExt && !strcmp(ex[i].extensionName, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) orderedColorExt = VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
@@ -1725,6 +1735,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             if (hasMeshShader) { meshFeat.pNext = f2Next; f2Next = &meshFeat; }
             if (hasAccelStruct) { accelFeat.pNext = f2Next; f2Next = &accelFeat; }
             if (hasRayQuery) { rayQueryFeat.pNext = f2Next; f2Next = &rayQueryFeat; }
+            if (hasGpl) { gplFeat.pNext = f2Next; f2Next = &gplFeat; }
+            if (hasEds3) { eds3Feat.pNext = f2Next; f2Next = &eds3Feat; }
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = f2Next };
             if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(RDNA4R.pd, &f2);
             RDNA4LOG("radv: framebuffer-fetch support: rasterization_order_attachment_access ext %d (color feature %d, depth %d, stencil %d); dynamic_rendering_local_read ext %d (feature %d); attachment_feedback_loop_layout ext %d; dynamic_rendering ext %d; classic render-pass input attachments: core 1.0",
@@ -1738,6 +1750,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             meshFeat.pNext = NULL;
             accelFeat.pNext = NULL;
             rayQueryFeat.pNext = NULL;
+            gplFeat.pNext = NULL;
+            eds3Feat.pNext = NULL;
             if (vkGetPhysicalDeviceProperties2 && pp.apiVersion >= VK_API_VERSION_1_2) {
                 VkPhysicalDeviceSampleLocationsPropertiesEXT slp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT };
                 VkPhysicalDeviceDepthStencilResolveProperties dsr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES };
@@ -1746,11 +1760,13 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 if (hasMeshShader) { meshProps.pNext = p2bNext; p2bNext = &meshProps; }
                 if (hasAccelStruct) { accelProps.pNext = p2bNext; p2bNext = &accelProps; }
                 if (hasPushDesc) { pushDescProps.pNext = p2bNext; p2bNext = &pushDescProps; }
+                if (hasGpl) { gplProps.pNext = p2bNext; p2bNext = &gplProps; }
                 VkPhysicalDeviceProperties2 p2b = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = p2bNext };
                 vkGetPhysicalDeviceProperties2(RDNA4R.pd, &p2b);
                 meshProps.pNext = NULL;
                 accelProps.pNext = NULL;
                 pushDescProps.pNext = NULL;
+                gplProps.pNext = NULL;
                 if (hasPushDesc) RDNA4R.maxPushDesc = pushDescProps.maxPushDescriptors;
                 RDNA4R.depthResolveModes = dsr.supportedDepthResolveModes;
                 RDNA4R.stencilResolveModes = dsr.supportedStencilResolveModes;
@@ -1765,7 +1781,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 }
             }
         }
-        const char *devExts[24]; uint32_t devExtCount = 0;
+        const char *devExts[32]; uint32_t devExtCount = 0;
         if (RDNA4R.hostExt) devExts[devExtCount++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
         if (hasSampleLoc) devExts[devExtCount++] = VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
         RDNA4R.orderedColorAccess = orderedColorExt && orderedColor.rasterizationOrderColorAttachmentAccess;
@@ -1882,6 +1898,28 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.drmModExt = hasDrmMod && vkGetPhysicalDeviceImageFormatProperties2;
         if (RDNA4R.drmModExt) devExts[devExtCount++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
         if (hasPushDesc) devExts[devExtCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+        const int killGpl = (access(GARNET_NOGPL_FILE, F_OK) == 0 ||
+            (rdna4_allow() && garnet_getenv("GARNET_NOGPL", "RDNA4M_NOGPL"))) ? 1 : 0;
+        VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enabledGpl = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+            .graphicsPipelineLibrary = (!killGpl && pp.apiVersion >= VK_API_VERSION_1_3 &&
+                hasPipeLib && hasGpl && gplFeat.graphicsPipelineLibrary && gplProps.graphicsPipelineLibraryFastLinking)
+                ? VK_TRUE : VK_FALSE };
+        if (enabledGpl.graphicsPipelineLibrary) {
+            enabledGpl.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledGpl;
+            devExts[devExtCount++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
+            devExts[devExtCount++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT enabledEds3 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+            .extendedDynamicState3PolygonMode = (enabledGpl.graphicsPipelineLibrary && hasEds3 && eds3Feat.extendedDynamicState3PolygonMode) ? VK_TRUE : VK_FALSE,
+            .extendedDynamicState3DepthClampEnable = (enabledGpl.graphicsPipelineLibrary && hasEds3 && eds3Feat.extendedDynamicState3DepthClampEnable) ? VK_TRUE : VK_FALSE };
+        if (enabledEds3.extendedDynamicState3PolygonMode || enabledEds3.extendedDynamicState3DepthClampEnable) {
+            enabledEds3.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledEds3;
+            devExts[devExtCount++] = VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME;
+        }
         RDNA4LOG("radv: VK_EXT_image_drm_format_modifier %s (VK_KHR_image_format_list is core at API 1.2; device API is 1.3)", RDNA4R.drmModExt ? "enabled" : "unavailable");
         const int killAsyncCompute = (access(GARNET_NO_ASYNC_COMPUTE_FILE, F_OK) == 0) ? 1 : 0;
         const int wantAsyncCompute = garnet_async_compute_device_enable(
@@ -1901,6 +1939,31 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             RDNA4R.pushDescExt = (RDNA4R.cmdPushDescSet != NULL && RDNA4R.maxPushDesc >= 8u);
         }
         RDNA4LOG("radv: VK_KHR_push_descriptor %s (maxPushDescriptors %u)", RDNA4R.pushDescExt ? "enabled" : "unavailable", RDNA4R.maxPushDesc);
+        if (enabledGpl.graphicsPipelineLibrary && vkGetDeviceProcAddr) {
+            RDNA4R.cmdSetCullMode = (PFN_vkCmdSetCullMode)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetCullMode");
+            RDNA4R.cmdSetFrontFace = (PFN_vkCmdSetFrontFace)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetFrontFace");
+            RDNA4R.cmdSetPrimitiveTopology = (PFN_vkCmdSetPrimitiveTopology)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetPrimitiveTopology");
+            RDNA4R.cmdSetPrimitiveRestartEnable = (PFN_vkCmdSetPrimitiveRestartEnable)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetPrimitiveRestartEnable");
+            RDNA4R.cmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnable)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetDepthTestEnable");
+            RDNA4R.cmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnable)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetDepthWriteEnable");
+            RDNA4R.cmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOp)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetDepthCompareOp");
+            RDNA4R.cmdSetStencilTestEnable = (PFN_vkCmdSetStencilTestEnable)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetStencilTestEnable");
+            RDNA4R.cmdSetStencilOp = (PFN_vkCmdSetStencilOp)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetStencilOp");
+            RDNA4R.gplExt = (RDNA4R.cmdSetCullMode && RDNA4R.cmdSetFrontFace && RDNA4R.cmdSetPrimitiveTopology &&
+                             RDNA4R.cmdSetPrimitiveRestartEnable && RDNA4R.cmdSetDepthTestEnable && RDNA4R.cmdSetDepthWriteEnable &&
+                             RDNA4R.cmdSetDepthCompareOp && RDNA4R.cmdSetStencilTestEnable && RDNA4R.cmdSetStencilOp) ? YES : NO;
+            if (RDNA4R.gplExt && enabledEds3.extendedDynamicState3PolygonMode) {
+                RDNA4R.cmdSetPolygonMode = (PFN_vkCmdSetPolygonModeEXT)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetPolygonModeEXT");
+                RDNA4R.eds3PolyMode = (RDNA4R.cmdSetPolygonMode != NULL);
+            }
+            if (RDNA4R.gplExt && enabledEds3.extendedDynamicState3DepthClampEnable) {
+                RDNA4R.cmdSetDepthClampEnable = (PFN_vkCmdSetDepthClampEnableEXT)vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdSetDepthClampEnableEXT");
+                RDNA4R.eds3DepthClamp = (RDNA4R.cmdSetDepthClampEnable != NULL);
+            }
+        }
+        RDNA4LOG("radv: GPL fast-link %s (fastLink=%u eds3Poly=%d eds3Clamp=%d kill=%d)",
+                 RDNA4R.gplExt ? "enabled" : "disabled", (unsigned)gplProps.graphicsPipelineLibraryFastLinking,
+                 RDNA4R.eds3PolyMode ? 1 : 0, RDNA4R.eds3DepthClamp ? 1 : 0, killGpl);
         if (enabled12.bufferDeviceAddress && vkGetDeviceProcAddr) {
             rdna4_vkGetBufferAddress = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetBufferDeviceAddress");
             RDNA4R.bufferAddress = rdna4_vkGetBufferAddress != NULL;

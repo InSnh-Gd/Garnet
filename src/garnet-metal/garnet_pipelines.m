@@ -13,7 +13,12 @@
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4RenderPipelineState (10d/11e): SPIR-V from Resources/spvcache/<sha256(bitcodeData)>.spv -> VkPipeline variants.
 // ---------------------------------------------------------------------------------------------------------------
-#include "garnet_fragment_output.h"
+_Static_assert((uint32_t)VK_PRIMITIVE_TOPOLOGY_POINT_LIST == GARNET_VK_TOPO_POINT_LIST &&
+               (uint32_t)VK_PRIMITIVE_TOPOLOGY_LINE_LIST == GARNET_VK_TOPO_LINE_LIST &&
+               (uint32_t)VK_PRIMITIVE_TOPOLOGY_LINE_STRIP == GARNET_VK_TOPO_LINE_STRIP &&
+               (uint32_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST == GARNET_VK_TOPO_TRIANGLE_LIST &&
+               (uint32_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP == GARNET_VK_TOPO_TRIANGLE_STRIP,
+               "garnet_gpl.h topology constants must match Vulkan");
 
    // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
@@ -93,6 +98,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     out->isTess = _isTess ? 1u : 0u;
     out->isMesh = [self rdna4IsMeshPipeline] ? 1u : 0u;
     out->hasAddrReg = _hasAddressRegistry ? 1u : 0u;
+    out->useGpl = _useGpl ? 1u : 0u;
     out->pushStage[0] = _pushStage[0];
     out->pushStage[1] = _pushStage[1];
     out->hasEmbeddedTex[0] = _hasEmbeddedTex[0];
@@ -116,7 +122,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d options:(NSUInteger)options noFallback:(BOOL)nofb error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
-    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
+    _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _icbVariants = [NSMutableDictionary dictionary]; _gplVsLibs = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array];
     if (d.label) _lbl = [d.label copy];
     _icb = d.supportIndirectCommandBuffers;
     if (_icb) _icbToken = RDNA4_ICB_PSO_TOKEN_TAG | (atomic_fetch_add(&rdna4_icb_pso_seq, 1) + 1);
@@ -578,13 +584,39 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     if (rf && rf->pc_size) { if (rf->pc_size > pcs) pcs = rf->pc_size; pcf |= VK_SHADER_STAGE_FRAGMENT_BIT; }
     _pcs = pcs; _pcf = pcf;
     if (pcs > 256) { if (err) *err = rdna4_err(48, [NSString stringWithFormat:@"push constant block %u B > 256", pcs]); free(rv); free(rf); return nil; }
+#ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
+    const BOOL useBaCache = baHit && baVk.length > 0;
+#else
+    const BOOL useBaCache = NO;
+#endif
+    _useGpl = garnet_gpl_eligible(RDNA4R.gplExt ? 1 : 0, hasFrag ? 1 : 0, _isTess ? 1 : 0, _icb ? 1 : 0,
+                                  fb ? 1 : 0, _rastOff ? 1 : 0, _argumentTables.active ? 1 : 0,
+                                  useBaCache ? 1 : 0, 0) ? YES : NO;
     VkPushConstantRange pcr = { pcf, 0, pcs };
     VkDescriptorSetLayout layouts[6] = {_dsl[0], _dsl[1], _argumentTables.active ? _argumentTables.dsl[0] : _tessDsl, _argumentTables.dsl[1], _argumentTables.dsl[2], _tessDsl};
     uint32_t layoutCount = _argumentTables.active ? (_isTess ? 6u : 5u) : (_isTess ? 3u : 2u);
-    VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = layoutCount, .pSetLayouts = layouts,
+    VkPipelineLayoutCreateInfo plc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .flags = _useGpl ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0u,
+        .setLayoutCount = layoutCount, .pSetLayouts = layouts,
         .pushConstantRangeCount = pcs ? 1 : 0, .pPushConstantRanges = &pcr };
     r = vkCreatePipelineLayout(RDNA4R.dev, &plc, NULL, &_pl);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(46, [NSString stringWithFormat:@"vkCreatePipelineLayout = %d", r]); free(rv); free(rf); return nil; }
+    if (_useGpl) {
+        VkDescriptorSetLayout vsSets[2] = { _dsl[0], VK_NULL_HANDLE };
+        VkDescriptorSetLayout fsSets[2] = { VK_NULL_HANDLE, _dsl[1] };
+        VkPipelineLayoutCreateInfo vplc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2, .pSetLayouts = vsSets,
+            .pushConstantRangeCount = pcs ? 1 : 0, .pPushConstantRanges = &pcr };
+        VkPipelineLayoutCreateInfo fplc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2, .pSetLayouts = fsSets,
+            .pushConstantRangeCount = pcs ? 1 : 0, .pPushConstantRanges = &pcr };
+        if (vkCreatePipelineLayout(RDNA4R.dev, &vplc, NULL, &_gplVsPl) != VK_SUCCESS ||
+            vkCreatePipelineLayout(RDNA4R.dev, &fplc, NULL, &_gplFsPl) != VK_SUCCESS) {
+            if (_gplVsPl) { vkDestroyPipelineLayout(RDNA4R.dev, _gplVsPl, NULL); _gplVsPl = VK_NULL_HANDLE; }
+            if (_gplFsPl) { vkDestroyPipelineLayout(RDNA4R.dev, _gplFsPl, NULL); _gplFsPl = VK_NULL_HANDLE; }
+            _useGpl = NO;
+        }
+    }
     // Vertex input: for every SPIR-V input Location, the descriptor's attribute of that index (format, offset, bufferIndex) and its
     // buffer layout (stride, step function). A Location without a descriptor attribute reads binding 31 (stride 0, a null buffer).
     MTLVertexDescriptor *vd = d.vertexDescriptor; BOOL dummy = NO;
@@ -633,9 +665,9 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     free(rv); free(rf);
     uint32_t dk0 = [self rdna4DSKey:NULL];   // bundle 10: 0 for a colour-only pipeline (the key below is then exactly the old one)
     VkPrimitiveTopology topo0 = _isTess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    if (_useGpl && ![self rdna4InitGplLibraries]) _useGpl = NO;
 #ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
     rdna4_ba_vkcache_scope_t baScope;
-    const BOOL useBaCache = baHit && baVk.length > 0;
     if (useBaCache) rdna4_ba_vkcache_scope_begin(&baScope, baVk, &baFp);
 #endif
     NSError *ve = nil; VkPipeline p0 = [self rdna4Build:topo0 cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE ds:dk0 error:&ve];
@@ -643,9 +675,14 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     if (useBaCache) rdna4_ba_vkcache_scope_end(&baScope);
 #endif
     if (!p0) { if (err) *err = ve; return nil; }
-    _variants[@((uint64_t)topo0 | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24))] = [NSValue valueWithPointer:(void *)p0];
-    RDNA4LOG("RDNA4RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s%s)", (__bridge void *)self, (void *)p0, na,
-           _npbV, _npbF, _nvia, _nvib, _isTess ? ", TESSELLATION" : "", fb ? ", FALLBACK no-write" : "", _fetch ? ", FRAMEBUFFER FETCH (input attachments)" : "");
+    uint64_t key0 = _useGpl
+        ? garnet_gpl_variant_key((uint32_t)topo0, (uint32_t)VK_CULL_MODE_NONE, (uint32_t)VK_FRONT_FACE_CLOCKWISE, dk0, 0u, 1, RDNA4R.eds3PolyMode ? 1 : 0, RDNA4R.eds3DepthClamp ? 1 : 0)
+        : ((uint64_t)topo0 | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24));
+    _variants[@(key0)] = [NSValue valueWithPointer:(void *)p0];
+    atomic_store_explicit(&_fastKey, key0, memory_order_relaxed);
+    atomic_store_explicit(&_fastPipe, (uintptr_t)p0, memory_order_release);
+    RDNA4LOG("RDNA4RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s%s%s)", (__bridge void *)self, (void *)p0, na,
+           _npbV, _npbF, _nvia, _nvib, _isTess ? ", TESSELLATION" : "", fb ? ", FALLBACK no-write" : "", _fetch ? ", FRAMEBUFFER FETCH (input attachments)" : "", _useGpl ? ", GPL" : "");
     if (fb) {   // hot-swap: remember how to rebuild (descriptor copy: the client may reuse its own) and watch for the .spv files
         NSString *sv = rdna4_fn_sha(d.vertexFunction), *sf = hasFrag ? rdna4_fn_sha(d.fragmentFunction) : nil;
         if (sv && (!hasFrag || sf)) {
@@ -851,6 +888,144 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     [_lock unlock];
     return ok;
 }
+- (BOOL)rdna4InitGplLibraries {
+    VkPipelineCache pc = RDNA4R.pc;
+    VkGraphicsPipelineLibraryCreateInfoEXT fsInfo = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+        .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT };
+    VkPipelineShaderStageCreateInfo fsSt = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = (VkSampleCountFlagBits)_pc.samples,
+        .alphaToCoverageEnable = _pc.alphaToCoverage ? VK_TRUE : VK_FALSE };
+    VkPipelineDepthStencilStateCreateInfo dss = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkDynamicState dynFs[8] = {
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo dsFs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = _pc.hasDS ? 8u : 0u, .pDynamicStates = _pc.hasDS ? dynFs : NULL };
+    VkGraphicsPipelineCreateInfo gpcFs = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &fsInfo,
+        .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR,
+        .stageCount = 1, .pStages = &fsSt, .pMultisampleState = &ms,
+        .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pDynamicState = &dsFs,
+        .layout = _gplFsPl, .renderPass = _rp };
+    uint64_t t_ = rdna4_now();
+    VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcFs, NULL, &_gplFsLib);
+    rdna4t_add(&T1.gfx, rdna4_now() - t_);
+    if (r != VK_SUCCESS) {
+        RDNA4LOG("GPL: FS library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
+        _gplFsLib = VK_NULL_HANDLE;
+        return NO;
+    }
+    atomic_fetch_add(&rdna4_pipes_new, 1);
+    VkGraphicsPipelineLibraryCreateInfoEXT foInfo = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+        .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .flags = _fetch && RDNA4R.orderedColorAccess ? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT : 0,
+        .attachmentCount = _na, .pAttachments = _cba };
+    VkDynamicState dynFo[1] = { VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+    VkPipelineDynamicStateCreateInfo dsFo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 1u, .pDynamicStates = dynFo };
+    VkGraphicsPipelineCreateInfo gpcFo = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &foInfo,
+        .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dsFo,
+        .renderPass = _rp };
+    r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcFo, NULL, &_gplFoLib);
+    if (r != VK_SUCCESS) {
+        RDNA4LOG("GPL: FO library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
+        vkDestroyPipeline(RDNA4R.dev, _gplFsLib, NULL); _gplFsLib = VK_NULL_HANDLE;
+        _gplFoLib = VK_NULL_HANDLE;
+        return NO;
+    }
+    return YES;
+}
+- (VkPipeline)rdna4BuildGpl:(VkPrimitiveTopology)topo rflags:(uint32_t)rflags error:(NSError **)err {
+    const BOOL fillLine = (rflags & 1u) != 0;
+    const BOOL depthClamp = (rflags & 2u) != 0;
+    const uint32_t vpCount = ((rflags >> 3) & 0xFu) + 1u;
+    const uint64_t vkey = garnet_gpl_vslib_key((uint32_t)topo, rflags, RDNA4R.eds3PolyMode ? 1 : 0, RDNA4R.eds3DepthClamp ? 1 : 0);
+    VkPipelineCache pc = RDNA4R.pc;
+    uint64_t t_ = rdna4_now();
+    NSValue *vv = _gplVsLibs[@(vkey)];
+    VkPipeline vsLib = vv ? (VkPipeline)vv.pointerValue : VK_NULL_HANDLE;
+    if (!vsLib) {
+        VkGraphicsPipelineLibraryCreateInfoEXT vsInfo = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+                     VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT };
+        VkPipelineShaderStageCreateInfo vsSt = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = _vep };
+        VkPipelineVertexInputStateCreateInfo vi = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = _nvib, .pVertexBindingDescriptions = _vib,
+            .vertexAttributeDescriptionCount = _nvia, .pVertexAttributeDescriptions = _via };
+        VkPrimitiveTopology topoBase = (VkPrimitiveTopology)garnet_gpl_topo_class((uint32_t)topo);
+        VkPipelineInputAssemblyStateCreateInfo ia = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .topology = topoBase, .primitiveRestartEnable = VK_FALSE };
+        VkPipelineViewportStateCreateInfo vps = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .viewportCount = vpCount, .scissorCount = vpCount };
+        VkPipelineRasterizationStateCreateInfo rs = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .depthClampEnable = (!RDNA4R.eds3DepthClamp && depthClamp && RDNA4R.depthClamp) ? VK_TRUE : VK_FALSE,
+            .polygonMode = (!RDNA4R.eds3PolyMode && fillLine) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL,
+            .rasterizerDiscardEnable = VK_FALSE,
+            .cullMode = VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_CLOCKWISE, .lineWidth = 1.0f,
+            .depthBiasEnable = _pc.depthBias ? VK_TRUE : VK_FALSE };
+        VkDynamicState dynVs[10]; uint32_t nd = 0;
+        dynVs[nd++] = VK_DYNAMIC_STATE_VIEWPORT;
+        dynVs[nd++] = VK_DYNAMIC_STATE_SCISSOR;
+        dynVs[nd++] = VK_DYNAMIC_STATE_CULL_MODE;
+        dynVs[nd++] = VK_DYNAMIC_STATE_FRONT_FACE;
+        dynVs[nd++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
+        dynVs[nd++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
+        if (_pc.depthBias) dynVs[nd++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
+        if (RDNA4R.eds3PolyMode) dynVs[nd++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
+        if (RDNA4R.eds3DepthClamp) dynVs[nd++] = VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT;
+        VkPipelineDynamicStateCreateInfo dsVs = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = nd, .pDynamicStates = dynVs };
+        VkGraphicsPipelineCreateInfo gpcVs = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &vsInfo,
+            .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR,
+            .stageCount = 1, .pStages = &vsSt, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+            .pViewportState = &vps, .pRasterizationState = &rs, .pDynamicState = &dsVs,
+            .layout = _gplVsPl, .renderPass = _rp };
+        VkResult vr = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcVs, NULL, &vsLib);
+        if (vr != VK_SUCCESS) {
+            if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines(gpl-vs) = %d", vr]);
+            return VK_NULL_HANDLE;
+        }
+        _gplVsLibs[@(vkey)] = [NSValue valueWithPointer:(void *)vsLib];
+    }
+    VkPipeline libs[3] = { vsLib, _gplFsLib, _gplFoLib };
+    VkPipelineLibraryCreateInfoKHR linkInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+        .libraryCount = 3, .pLibraries = libs };
+    VkGraphicsPipelineCreateInfo gpcLink = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &linkInfo,
+        .layout = _pl };
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcLink, NULL, &p);
+    rdna4t_add(&T1.gfx, rdna4_now() - t_);
+    atomic_fetch_add(&rdna4_pipes_new, 1);
+    if (r != VK_SUCCESS) {
+        if (err) *err = rdna4_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines(gpl-link) = %d", r]);
+        return VK_NULL_HANDLE;
+    }
+    return p;
+}
 - (VkPipeline)rdna4Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk error:(NSError **)err {
     return [self rdna4Build:topo cull:cull front:front ds:dk rflags:0 icb:NO error:err];
 }
@@ -873,6 +1048,9 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     if (sampleLoc && (!RDNA4R.sampleLocationsExt || !(RDNA4R.sampleLocationCounts & _pc.samples))) {
         if (err) *err = rdna4_err(47, @"programmable sample positions unsupported for sample count");
         return VK_NULL_HANDLE;
+    }
+    if (_useGpl && !icb && !sampleLoc && _gplFsLib && _gplFoLib) {
+        return [self rdna4BuildGpl:topo rflags:rflags error:err];
     }
     VkPipelineShaderStageCreateInfo st[4];
     uint32_t stCount = 0;
@@ -940,7 +1118,8 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front { return [self pipelineForTopology:topo cull:cull front:front ds:[self rdna4DSKey:NULL] rflags:0]; }
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk { return [self pipelineForTopology:topo cull:cull front:front ds:dk rflags:0]; }
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk rflags:(uint32_t)rflags {
-    const uint64_t key = (uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24) | ((uint64_t)(rflags & 0x7Fu) << 56);
+    const uint64_t key = garnet_gpl_variant_key((uint32_t)topo, (uint32_t)cull, (uint32_t)front, dk, rflags,
+                                                _useGpl ? 1 : 0, RDNA4R.eds3PolyMode ? 1 : 0, RDNA4R.eds3DepthClamp ? 1 : 0);
     // Single-variant lock-free fast path: _fastKey is written once before _fastPipe is published with release semantics.
     uintptr_t fp = atomic_load_explicit(&_fastPipe, memory_order_acquire);
     if (fp && atomic_load_explicit(&_fastKey, memory_order_relaxed) == key)
@@ -980,6 +1159,11 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     [self rdna4DestroyICBGPUState];
     if (RDNA4R.ok) {
         for (NSValue *v in _variants.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
+        for (NSValue *v in _gplVsLibs.allValues) vkDestroyPipeline(RDNA4R.dev, (VkPipeline)v.pointerValue, NULL);
+        if (_gplFoLib) vkDestroyPipeline(RDNA4R.dev, _gplFoLib, NULL);
+        if (_gplFsLib) vkDestroyPipeline(RDNA4R.dev, _gplFsLib, NULL);
+        if (_gplVsPl) vkDestroyPipelineLayout(RDNA4R.dev, _gplVsPl, NULL);
+        if (_gplFsPl) vkDestroyPipelineLayout(RDNA4R.dev, _gplFsPl, NULL);
         if (_pl) vkDestroyPipelineLayout(RDNA4R.dev, _pl, NULL);
         for (int i = 0; i < 2; i++) if (_dsl[i]) vkDestroyDescriptorSetLayout(RDNA4R.dev, _dsl[i], NULL);
         if (_tessDsl) vkDestroyDescriptorSetLayout(RDNA4R.dev, _tessDsl, NULL);
