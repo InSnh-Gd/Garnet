@@ -1,0 +1,1425 @@
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index 21af748..b4fd086 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -2116,7 +2116,7 @@ pub fn specialize_runtime_intersection_function_tables(
+     }
+ 
+     // Rewrite `air.intersection_function_table` metadata entries to `air.buffer` (`uint` SSBO)
+-    // and drop any dead `air.set_buffer_intersection_function_table.*` calls if unused.
++    // and normalize Metal `ray_data` (`addrspace(5)`) payload pointers to thread/Private (`addrspace(0)`).
+     let mut output = String::with_capacity(entry_ll.len() + 2048);
+     let mut in_func = false;
+     for raw_line in entry_ll.lines() {
+@@ -2140,19 +2140,21 @@ pub fn specialize_runtime_intersection_function_tables(
+         output.push_str(raw_line);
+         output.push('\n');
+     }
++    output = normalize_ray_data_addrspace5(&output);
+ 
+     let entry_blocks = normalized_function_blocks(&output);
+     let mut handles = Vec::with_capacity(unique_fns.len());
+     let mut callbacks = Vec::with_capacity(unique_fns.len());
+-    let mut linked_modules: Vec<&str> = Vec::new();
+-    let mut linked_module_set: HashSet<&str> = HashSet::new();
++    let mut linked_modules: Vec<String> = Vec::new();
++    let mut linked_module_set: HashSet<String> = HashSet::new();
+ 
+     for (idx, func) in unique_fns.iter().enumerate() {
+         let handle_id = (idx as u32) + 1;
+         let global = llvm_global(&func.symbol)?;
+-        let (return_type, param_types) = parse_callback_signature(&func.module_ll, &global)?;
++        let norm_mod = normalize_ray_data_addrspace5(&func.module_ll);
++        let (return_type, param_types) = parse_callback_signature(&norm_mod, &global)?;
+         let param_roles =
+-            decode_callback_param_roles(&func.module_ll, &func.symbol, func.kind, &param_types);
++            decode_callback_param_roles(&norm_mod, &func.symbol, func.kind, &param_types);
+         handles.push(RuntimeIntersectionFunctionHandle {
+             handle_id,
+             symbol: func.symbol.clone(),
+@@ -2167,7 +2169,7 @@ pub fn specialize_runtime_intersection_function_tables(
+             param_roles,
+         });
+         if let Some(entry_body) = entry_blocks.get(&global) {
+-            let mod_blocks = normalized_function_blocks(&func.module_ll);
++            let mod_blocks = normalized_function_blocks(&norm_mod);
+             if let Some(mod_body) = mod_blocks.get(&global) {
+                 if mod_body != entry_body {
+                     return Err(format!(
+@@ -2180,15 +2182,15 @@ pub fn specialize_runtime_intersection_function_tables(
+             // [[intersection(...)]] function); keep it in callbacks/handles without re-appending.
+             continue;
+         }
+-        if linked_module_set.insert(func.module_ll.as_str()) {
+-            linked_modules.push(func.module_ll.as_str());
++        if linked_module_set.insert(norm_mod.clone()) {
++            linked_modules.push(norm_mod);
+         }
+     }
+ 
+     // Append linked callback definitions BEFORE `lower_air_ray_queries` so `strip_matching_defined_functions`
+     // compares against the un-lowered entry function (allowing whole-library modules that also contain
+     // the entry function alongside a split-library callback) while still rejecting genuine conflicts.
+-    for module in linked_modules {
++    for module in &linked_modules {
+         let resolved = specialize_visible_function_references(module, linkage)?;
+         let trimmed_dep = strip_matching_defined_functions(&output, &resolved)?;
+         let newly_defined: HashSet<String> = trimmed_dep
+@@ -2421,6 +2423,46 @@ fn split_type_and_value_text(param: &str) -> Option<String> {
+     let mut ty = head;
+     loop {
+         let trimmed = ty.trim_end();
++        if let Some(without_quote) = trimmed.strip_suffix('"') {
++            if let Some(open_q) = without_quote.rfind('"') {
++                let before = without_quote[..open_q].trim_end();
++                if !before.is_empty() {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
++        if let Some(without_paren) = trimmed.strip_suffix(')') {
++            if let Some(open_p) = without_paren.rfind('(') {
++                let attr_name = without_paren[..open_p].trim_end();
++                if let Some(before) = ["dereferenceable_or_null", "dereferenceable", "align"]
++                    .iter()
++                    .find_map(|kw| {
++                        attr_name
++                            .strip_suffix(kw)
++                            .filter(|r| r.ends_with(char::is_whitespace))
++                            .map(str::trim_end)
++                    })
++                {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
++        if let Some(ws) = trimmed.rfind(char::is_whitespace) {
++            let last = trimmed[ws..].trim();
++            if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
++                let prefix = trimmed[..ws].trim_end();
++                if let Some(before) = prefix
++                    .strip_suffix("align")
++                    .filter(|r| r.ends_with(char::is_whitespace))
++                    .map(str::trim_end)
++                {
++                    ty = before;
++                    continue;
++                }
++            }
++        }
+         let stripped = [
+             "noundef",
+             "nonnull",
+@@ -2447,6 +2489,33 @@ fn split_type_and_value_text(param: &str) -> Option<String> {
+     Some(ty.to_string())
+ }
+ 
++/// Normalize Apple AIR `ray_data` (`ptr addrspace(5)`) pointers in linked intersection callbacks
++/// to thread/Private (`ptr`, i.e. `addrspace(0)`) so they match caller `alloca` payloads directly.
++fn normalize_ray_data_addrspace5(ll: &str) -> String {
++    if !ll.contains("addrspace(5)") {
++        return ll.to_string();
++    }
++    let mut out = String::with_capacity(ll.len());
++    for line in ll.lines() {
++        let mut s = line.replace("ptr addrspace(5)", "ptr");
++        if s.contains("addrspacecast ptr ") && s.contains(" to ptr") {
++            let trimmed = s.trim_start();
++            if let Some((_, rhs)) = trimmed.split_once(" = ") {
++                if rhs.starts_with("addrspacecast ptr ")
++                    && rhs
++                        .split_once(" to ")
++                        .is_some_and(|(_, dst)| dst.trim() == "ptr" || dst.trim().starts_with("ptr,"))
++                {
++                    s = s.replacen("addrspacecast ptr ", "bitcast ptr ", 1);
++                }
++            }
++        }
++        out.push_str(&s);
++        out.push('\n');
++    }
++    out
++}
++
+ fn extract_return_type_text(before_at: &str) -> Result<String, String> {
+     let mut s = before_at.trim();
+     if let Some(rest) = s.strip_prefix("define ") {
+diff --git a/src/native/emitter/helpers.rs b/src/native/emitter/helpers.rs
+index e892a92..ceaf012 100644
+--- a/src/native/emitter/helpers.rs
++++ b/src/native/emitter/helpers.rs
+@@ -281,7 +281,8 @@ pub(super) fn llvm_pointer_storage(addrspace: u32) -> Result<StorageClass, Strin
+         // addrspace(6) / addrspace(7) are Metal `object_data` payload memory; native emission
+         // uses Workgroup pointer lowering and stage_input re-storage-classes to TaskPayloadWorkgroupEXT.
+         3 | 6 | 7 => Ok(StorageClass::Workgroup),
+-        4 => Ok(StorageClass::Private),
++        // addrspace(4) = threadgroup_imageblock, addrspace(5) = Metal ray_data payload.
++        4 | 5 => Ok(StorageClass::Private),
+         _ => Err(format!(
+             "native emitter: unsupported LLVM pointer addrspace({addrspace})"
+         )),
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+index 28d6940..1c03ab1 100644
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -443,7 +443,10 @@ fn classify_accel_operand(
+                 continue;
+             }
+         }
+-        if !trimmed.contains("@air.intersect.") && line_uses_llvm_value(trimmed, accel_val) {
++        if !trimmed.contains("@air.intersect.")
++            && !trimmed.contains("@air.reset_intersection_query")
++            && line_uses_llvm_value(trimmed, accel_val)
++        {
+             other_uses += 1;
+         }
+     }
+@@ -536,13 +539,47 @@ fn lowered_result_type(family: &AirIntersectionFamily) -> String {
+     )
+ }
+ 
+-/// Lower every `@air.intersect.*` call in `ll` to structured `@__m2v.rq.*` hardware ray queries.
++/// Lower every `@air.intersect.*` and Metal 3 `@air.*_intersection_query*` call in `ll` to
++/// structured `@__m2v.rq.*` hardware ray queries.
+ ///
+-/// Returns `Ok(None)` when `ll` contains no `@air.intersect.*` calls.
++/// Returns `Ok(None)` when `ll` contains neither `@air.intersect.` nor `_intersection_query`.
+ pub(crate) fn lower_air_ray_queries(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
+ ) -> Result<Option<String>, String> {
++    let has_intersect = ll.contains("@air.intersect.");
++    let has_iq = ll.contains("_intersection_query");
++    if !has_intersect && !has_iq {
++        return Ok(None);
++    }
++
++    let mut cur_ll = ll.to_string();
++    let mut changed = false;
++    let mut next_slot_id = 0u32;
++
++    if has_intersect {
++        if let Some((lowered, used_slots)) =
++            lower_air_intersect_calls(&cur_ll, linked_callbacks, next_slot_id)?
++        {
++            cur_ll = lowered;
++            next_slot_id += used_slots;
++            changed = true;
++        }
++    }
++    if cur_ll.contains("_intersection_query") {
++        if let Some(lowered) = lower_air_intersection_queries(&cur_ll, next_slot_id)? {
++            cur_ll = lowered;
++            changed = true;
++        }
++    }
++    Ok(changed.then_some(cur_ll))
++}
++
++fn lower_air_intersect_calls(
++    ll: &str,
++    linked_callbacks: &[LinkedRayCallback],
++    slot_base: u32,
++) -> Result<Option<(String, u32)>, String> {
+     if !ll.contains("@air.intersect.") {
+         return Ok(None);
+     }
+@@ -618,7 +655,7 @@ pub(crate) fn lower_air_ray_queries(
+             bda_source_val,
+             bda_dead_load_line,
+             has_active_table,
+-            slot_id: ordinal as u32,
++            slot_id: slot_base + (ordinal as u32),
+         });
+     }
+ 
+@@ -665,9 +702,12 @@ pub(crate) fn lower_air_ray_queries(
+         lowered_aggregates.extend(discovered);
+     }
+ 
+-    // Direct field-4 (`OpaquePointer`) extractions become `null` before field 4 changes to `i64`.
++    // Direct field-4 (`OpaquePointer` / primitive_data) extractions become `null` before field 4
++    // changes to `i64`, and any null-derived bitcasts/GEPs/loads in dead null-guarded branches
++    // fold cleanly to `null` / zero literals so native emission never loads from `null`.
+     let mut opaque_extractions: Vec<(usize, String)> = Vec::new();
+-    for &(line, scope) in &scoped_lines {
++    let mut opaque_extract_lines: HashSet<usize> = HashSet::new();
++    for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
+         let Some((defined, instruction)) = line.trim_start().split_once(" = ") else {
+             continue;
+         };
+@@ -681,8 +721,12 @@ pub(crate) fn lower_air_ray_queries(
+             *s == scope && rest.starts_with(air_ty) && line_uses_llvm_value(rest, r)
+         }) {
+             opaque_extractions.push((scope, defined.trim().to_string()));
++            opaque_extract_lines.insert(line_idx);
+         }
+     }
++    let (mut null_drop_lines, null_replacements) =
++        propagate_null_ptr_eliminations(&scoped_lines, &opaque_extractions);
++    null_drop_lines.extend(opaque_extract_lines);
+ 
+     let pending_by_line: HashMap<usize, usize> = pending
+         .iter()
+@@ -701,7 +745,7 @@ pub(crate) fn lower_air_ray_queries(
+         if trimmed.starts_with("declare ") && trimmed.contains("@air.intersect.") {
+             continue;
+         }
+-        if dead_load_lines.contains(&line_idx) {
++        if dead_load_lines.contains(&line_idx) || null_drop_lines.contains(&line_idx) {
+             continue;
+         }
+         if let Some(&pidx) = pending_by_line.get(&line_idx) {
+@@ -735,21 +779,10 @@ pub(crate) fn lower_air_ray_queries(
+             continue;
+         }
+ 
+-        // Skip eliminated field-4 extractvalue lines.
+-        if let Some((defined, instruction)) = trimmed.split_once(" = ") {
+-            if instruction.starts_with("extractvalue ")
+-                && opaque_extractions
+-                    .iter()
+-                    .any(|(s, v)| *s == scope && v == defined.trim())
+-            {
+-                continue;
+-            }
+-        }
+-
+         let mut rewritten = line.to_string();
+-        for (s, v) in &opaque_extractions {
++        for (s, v, repl) in &null_replacements {
+             if *s == scope {
+-                rewritten = replace_llvm_value(&rewritten, v, "null");
++                rewritten = replace_llvm_value(&rewritten, v, repl);
+             }
+         }
+         for (s, r, air_ty, low_ty) in &lowered_aggregates {
+@@ -770,6 +803,689 @@ pub(crate) fn lower_air_ray_queries(
+         out.push_str(&helper);
+     }
+ 
++    Ok(Some((out, pending.len() as u32)))
++}
++
++/// Transitively fold dead `bitcast`/`addrspacecast`/`getelementptr`/`load`/`store` operations
++/// derived from null-substituted pointers (e.g. `primitive_data` before Wave 4 wiring) so dead
++/// null-guarded branches never attempt to emit a load from `null`.
++fn propagate_null_ptr_eliminations(
++    scoped_lines: &[(&str, usize)],
++    initial: &[(usize, String)],
++) -> (HashSet<usize>, Vec<(usize, String, String)>) {
++    if initial.is_empty() {
++        return (HashSet::new(), Vec::new());
++    }
++    let mut null_ptrs: HashSet<(usize, String)> = initial.iter().cloned().collect();
++    let mut drop_lines: HashSet<usize> = HashSet::new();
++    let mut replacements: Vec<(usize, String, String)> = initial
++        .iter()
++        .map(|(s, v)| (*s, v.clone(), "null".to_string()))
++        .collect();
++    let mut replaced_vars: HashSet<(usize, String)> = initial.iter().cloned().collect();
++
++    loop {
++        let mut progressed = false;
++        for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
++            if scope == 0 || drop_lines.contains(&line_idx) {
++                continue;
++            }
++            let trimmed = line.trim_start();
++            if let Some((lhs_raw, rhs_raw)) = trimmed.split_once(" = ") {
++                let lhs = lhs_raw.trim();
++                let rhs = rhs_raw.trim();
++                if rhs.starts_with("bitcast ")
++                    || rhs.starts_with("addrspacecast ")
++                    || rhs.starts_with("getelementptr ")
++                {
++                    let uses_null = null_ptrs
++                        .iter()
++                        .any(|(s, v)| *s == scope && line_uses_llvm_value(rhs, v));
++                    if uses_null {
++                        drop_lines.insert(line_idx);
++                        if null_ptrs.insert((scope, lhs.to_string())) {
++                            progressed = true;
++                        }
++                        if replaced_vars.insert((scope, lhs.to_string())) {
++                            replacements.push((scope, lhs.to_string(), "null".to_string()));
++                            progressed = true;
++                        }
++                    }
++                } else if let Some(rest) = rhs.strip_prefix("load ") {
++                    let rest = rest
++                        .strip_prefix("volatile ")
++                        .unwrap_or(rest)
++                        .trim_start();
++                    let parts = split_top_level_commas(rest);
++                    if parts.len() >= 2 {
++                        if let Some((_, ptr_val)) = split_typed_arg(parts[1]) {
++                            if null_ptrs.contains(&(scope, ptr_val)) {
++                                drop_lines.insert(line_idx);
++                                if replaced_vars.insert((scope, lhs.to_string())) {
++                                    replacements.push((
++                                        scope,
++                                        lhs.to_string(),
++                                        llvm_zero_literal(parts[0]).to_string(),
++                                    ));
++                                    progressed = true;
++                                }
++                            }
++                        }
++                    }
++                }
++            } else if let Some(rest) = trimmed.strip_prefix("store ") {
++                let rest = rest
++                    .strip_prefix("volatile ")
++                    .unwrap_or(rest)
++                    .trim_start();
++                let parts = split_top_level_commas(rest);
++                if parts.len() >= 2 {
++                    if let Some((_, ptr_val)) = split_typed_arg(parts[1]) {
++                        if null_ptrs.contains(&(scope, ptr_val)) {
++                            drop_lines.insert(line_idx);
++                            progressed = true;
++                        }
++                    }
++                }
++            }
++        }
++        if !progressed {
++            break;
++        }
++    }
++    (drop_lines, replacements)
++}
++
++struct IqOpCall {
++    lhs: Option<String>,
++    op: String,
++    has_instancing: bool,
++    has_motion: bool,
++    raw_args: Vec<(String, String)>,
++    slot_id: u32,
++    accel_is_bda: bool,
++    bda_source_load_ptr: Option<String>,
++    bda_source_val: Option<String>,
++}
++
++fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool)> {
++    let rest = callee.strip_prefix("air.")?;
++    let marker = rest.find("_intersection_query")?;
++    let op = &rest[..marker];
++    let after = &rest[marker + "_intersection_query".len()..];
++    if !after.is_empty() && !after.starts_with('.') {
++        return None;
++    }
++    let tags = after.strip_prefix('.').unwrap_or("");
++    let has_instancing = tags
++        .split('.')
++        .any(|t| matches!(t, "instancing" | "multi_level_instancing"));
++    let has_motion = tags
++        .split('.')
++        .any(|t| matches!(t, "primitive_motion" | "instance_motion"));
++    Some((op.to_string(), has_instancing, has_motion))
++}
++
++fn resolve_iq_slot(
++    scoped_lines: &[(&str, usize)],
++    scope: usize,
++    q_val: &str,
++    alloc_slots: &HashMap<(usize, String), u32>,
++) -> Option<u32> {
++    let mut cur = q_val.trim().to_string();
++    for _ in 0..8 {
++        if let Some(&slot) = alloc_slots.get(&(scope, cur.clone())) {
++            return Some(slot);
++        }
++        if !cur.starts_with('%') {
++            return None;
++        }
++        let def_rhs = scoped_lines.iter().find_map(|&(line, s)| {
++            if s != scope {
++                return None;
++            }
++            let (lhs, rhs) = line.trim_start().split_once(" = ")?;
++            (lhs.trim() == cur).then_some(rhs.trim())
++        })?;
++        if let Some(rest) = def_rhs
++            .strip_prefix("bitcast ")
++            .or_else(|| def_rhs.strip_prefix("addrspacecast "))
++        {
++            if let Some((src, _)) = rest.split_once(" to ") {
++                if let Some((_, next_val)) = split_typed_arg(src) {
++                    cur = next_val;
++                    continue;
++                }
++            }
++        }
++        return None;
++    }
++    None
++}
++
++fn lower_air_intersection_queries(ll: &str, slot_base: u32) -> Result<Option<String>, String> {
++    if !ll.contains("_intersection_query") {
++        return Ok(None);
++    }
++
++    let scoped_lines = llvm_line_scopes(ll);
++    let descriptor_as_params = discover_descriptor_as_params(ll);
++
++    // Pass 1: discover every `allocate_intersection_query` -> unique slot_id per function scope.
++    let mut alloc_slots: HashMap<(usize, String), u32> = HashMap::new();
++    let mut scope_slots: HashMap<usize, Vec<u32>> = HashMap::new();
++    let mut next_slot = slot_base;
++    let mut ops_by_line: HashMap<usize, IqOpCall> = HashMap::new();
++    let mut null_ptr_vars: Vec<(usize, String)> = Vec::new();
++    let mut dead_load_lines: HashSet<usize> = HashSet::new();
++    let mut commit_aabb_slots: Vec<u32> = Vec::new();
++
++    for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
++        if scope == 0 {
++            continue;
++        }
++        let trimmed = line.trim_start();
++        let (lhs, call_part) = if let Some((l, r)) = trimmed.split_once(" = ") {
++            (Some(l.trim().to_string()), r.trim())
++        } else {
++            (None, trimmed)
++        };
++        let Some(at_pos) = call_part.find("@air.") else {
++            continue;
++        };
++        let Some(open_rel) = call_part[at_pos..].find('(') else {
++            continue;
++        };
++        let open = at_pos + open_rel;
++        let callee = &call_part[at_pos + 1..open];
++        let Some((op, has_instancing, has_motion)) = parse_iq_callee(callee) else {
++            continue;
++        };
++        let Some(close) = find_matching_paren(call_part, open) else {
++            return Err(format!("malformed @{callee} call: {trimmed}"));
++        };
++        let raw_arg_strs = split_top_level_commas(&call_part[open + 1..close]);
++        let mut raw_args = Vec::with_capacity(raw_arg_strs.len());
++        for a in raw_arg_strs {
++            let parsed = split_typed_arg(a)
++                .ok_or_else(|| format!("malformed operand {a:?} in @{callee}"))?;
++            raw_args.push(parsed);
++        }
++
++        if op == "allocate" {
++            let var = lhs
++                .clone()
++                .ok_or_else(|| format!("@{callee} missing result SSA value"))?;
++            let slot_id = next_slot;
++            next_slot += 1;
++            alloc_slots.insert((scope, var), slot_id);
++            scope_slots.entry(scope).or_default().push(slot_id);
++            ops_by_line.insert(
++                line_idx,
++                IqOpCall {
++                    lhs,
++                    op,
++                    has_instancing,
++                    has_motion,
++                    raw_args,
++                    slot_id,
++                    accel_is_bda: false,
++                    bda_source_load_ptr: None,
++                    bda_source_val: None,
++                },
++            );
++            continue;
++        }
++
++        let q_val = raw_args
++            .first()
++            .map(|(_, v)| v.as_str())
++            .ok_or_else(|| format!("@{callee} missing query handle operand"))?;
++        let slot_id = resolve_iq_slot(&scoped_lines, scope, q_val, &alloc_slots)
++            .ok_or_else(|| format!("@{callee} references untracked query handle {q_val}"))?;
++
++        let mut accel_is_bda = false;
++        let mut bda_source_load_ptr = None;
++        let mut bda_source_val = None;
++        if op == "reset" {
++            if raw_args.len() < 12 {
++                return Err(format!(
++                    "@{callee} has {} operands, expected >= 12",
++                    raw_args.len()
++                ));
++            }
++            let (accel_ty, accel_val) = &raw_args[5];
++            let (is_bda, src_ptr, src_val, dead_line) = classify_accel_operand(
++                &scoped_lines,
++                scope,
++                accel_ty,
++                accel_val,
++                &descriptor_as_params,
++            );
++            accel_is_bda = is_bda;
++            bda_source_load_ptr = src_ptr;
++            bda_source_val = src_val;
++            if let Some(dl) = dead_line {
++                dead_load_lines.insert(dl);
++            }
++        } else if op == "commit_bounding_box_intersection" {
++            if !commit_aabb_slots.contains(&slot_id) {
++                commit_aabb_slots.push(slot_id);
++            }
++        } else if matches!(
++            op.as_str(),
++            "get_candidate_primitive_data" | "get_committed_primitive_data"
++        ) {
++            if let Some(ref var) = lhs {
++                null_ptr_vars.push((scope, var.clone()));
++            }
++        }
++
++        ops_by_line.insert(
++            line_idx,
++            IqOpCall {
++                lhs,
++                op,
++                has_instancing,
++                has_motion,
++                raw_args,
++                slot_id,
++                accel_is_bda,
++                bda_source_load_ptr,
++                bda_source_val,
++            },
++        );
++    }
++
++    if ops_by_line.is_empty() {
++        return Ok(None);
++    }
++
++    let (null_drop_lines, null_replacements) =
++        propagate_null_ptr_eliminations(&scoped_lines, &null_ptr_vars);
++
++    // Track first basic-block entry line for each scope that needs `%__m2v.rq.cw.<slot>` allocas.
++    let mut entry_inserted: HashSet<usize> = HashSet::new();
++    let mut out = String::with_capacity(ll.len() + 4096);
++
++    for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with("declare ") && trimmed.contains("_intersection_query") {
++            continue;
++        }
++        if dead_load_lines.contains(&line_idx) || null_drop_lines.contains(&line_idx) {
++            continue;
++        }
++
++        // Insert per-slot CW-polarity alloca right after the entry label of each function with IQs.
++        if scope != 0
++            && !entry_inserted.contains(&scope)
++            && !trimmed.starts_with("define ")
++            && trimmed.ends_with(':')
++            && !trimmed.starts_with(';')
++        {
++            out.push_str(line);
++            out.push('\n');
++            if let Some(slots) = scope_slots.get(&scope) {
++                for &slot in slots {
++                    out.push_str(&format!(
++                        "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
++                         \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
++                    ));
++                }
++            }
++            entry_inserted.insert(scope);
++            continue;
++        }
++
++        if let Some(call) = ops_by_line.get(&line_idx) {
++            let indent = &line[..line.len() - trimmed.len()];
++            let slot = call.slot_id;
++            let pfx = format!("__m2v.iq.{line_idx}");
++            match call.op.as_str() {
++                "allocate" | "deallocate" | "get_candidate_primitive_data"
++                | "get_committed_primitive_data" => {
++                    // Handled by slot allocation / null replacement.
++                }
++                "reset" => {
++                    let orig = &call.raw_args[1].1;
++                    let dir = &call.raw_args[2].1;
++                    let tmin = &call.raw_args[3].1;
++                    let tmax = &call.raw_args[4].1;
++                    let mut cur = 6usize;
++                    let mask = if call.has_instancing {
++                        let m = call.raw_args[cur].1.clone();
++                        cur += 1;
++                        m
++                    } else {
++                        "255".to_string()
++                    };
++                    if call.has_motion {
++                        cur += 1;
++                    }
++                    let winding_val = &call.raw_args[cur].1;
++                    let tri_cull_val = &call.raw_args[cur + 1].1;
++                    let op_cull_val = &call.raw_args[cur + 3].1;
++                    let force_op_val = &call.raw_args[cur + 4].1;
++                    let (accept_ty, accept_val) = call
++                        .raw_args
++                        .last()
++                        .ok_or_else(|| "reset_intersection_query missing accept_any".to_string())?;
++
++                    if accept_ty == "i1" {
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.accept = select i1 {accept_val}, i1 true, i1 false\n"
++                        ));
++                    } else {
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.accept = icmp ne {accept_ty} {accept_val}, 0\n"
++                        ));
++                    }
++                    // Metal winding::clockwise == 0, winding::counterclockwise == 1;
++                    // Vulkan RayQuery front face is CCW, so invert when winding == CW (0).
++                    out.push_str(&format!(
++                        "{indent}%{pfx}.cw = icmp eq i32 {winding_val}, 0\n\
++                         {indent}%{pfx}.cw_i32 = zext i1 %{pfx}.cw to i32\n\
++                         {indent}store i32 %{pfx}.cw_i32, ptr %__m2v.rq.cw.{slot}, align 4\n\
++                         {indent}%{pfx}.cf_req = icmp eq i32 {tri_cull_val}, 1\n\
++                         {indent}%{pfx}.cb_req = icmp eq i32 {tri_cull_val}, 2\n\
++                         {indent}%{pfx}.vk_cf = select i1 %{pfx}.cw, i1 %{pfx}.cb_req, i1 %{pfx}.cf_req\n\
++                         {indent}%{pfx}.vk_cb = select i1 %{pfx}.cw, i1 %{pfx}.cf_req, i1 %{pfx}.cb_req\n\
++                         {indent}%{pfx}.f_cf = select i1 %{pfx}.vk_cf, i32 32, i32 0\n\
++                         {indent}%{pfx}.f_cb = select i1 %{pfx}.vk_cb, i32 16, i32 0\n\
++                         {indent}%{pfx}.f0 = or i32 %{pfx}.f_cf, %{pfx}.f_cb\n\
++                         {indent}%{pfx}.c_op = icmp eq i32 {op_cull_val}, 1\n\
++                         {indent}%{pfx}.c_nop = icmp eq i32 {op_cull_val}, 2\n\
++                         {indent}%{pfx}.f_co = select i1 %{pfx}.c_op, i32 64, i32 0\n\
++                         {indent}%{pfx}.f_cn = select i1 %{pfx}.c_nop, i32 128, i32 0\n\
++                         {indent}%{pfx}.f1 = or i32 %{pfx}.f0, %{pfx}.f_co\n\
++                         {indent}%{pfx}.f2 = or i32 %{pfx}.f1, %{pfx}.f_cn\n\
++                         {indent}%{pfx}.f_op = icmp eq i32 {force_op_val}, 1\n\
++                         {indent}%{pfx}.f_nop = icmp eq i32 {force_op_val}, 2\n\
++                         {indent}%{pfx}.f_fo = select i1 %{pfx}.f_op, i32 1, i32 0\n\
++                         {indent}%{pfx}.f_fn = select i1 %{pfx}.f_nop, i32 2, i32 0\n\
++                         {indent}%{pfx}.f3 = or i32 %{pfx}.f2, %{pfx}.f_fo\n\
++                         {indent}%{pfx}.f4 = or i32 %{pfx}.f3, %{pfx}.f_fn\n\
++                         {indent}%{pfx}.f_term = select i1 %{pfx}.accept, i32 4, i32 0\n\
++                         {indent}%{pfx}.flags = or i32 %{pfx}.f4, %{pfx}.f_term\n"
++                    ));
++                    if call.accel_is_bda {
++                        let bda_operand = if let Some(src_ptr) = &call.bda_source_load_ptr {
++                            let tmp = format!("%{pfx}.as_bda");
++                            out.push_str(&format!(
++                                "{indent}{tmp} = load i64, {src_ptr}, align 8\n"
++                            ));
++                            tmp
++                        } else if let Some(src_val) = &call.bda_source_val {
++                            src_val.clone()
++                        } else {
++                            call.raw_args[5].1.clone()
++                        };
++                        out.push_str(&format!(
++                            "{indent}call void @__m2v.rq.init.bda(i32 {slot}, i64 {bda_operand}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
++                        ));
++                    } else {
++                        let as_val = &call.raw_args[5].1;
++                        out.push_str(&format!(
++                            "{indent}call void @__m2v.rq.init(i32 {slot}, ptr addrspace(1) {as_val}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
++                        ));
++                    }
++                }
++                "next" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i1 @__m2v.rq.proceed(i32 {slot})\n"
++                        ));
++                    } else {
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.ign = call i1 @__m2v.rq.proceed(i32 {slot})\n"
++                        ));
++                    }
++                }
++                "abort" => {
++                    out.push_str(&format!(
++                        "{indent}call void @__m2v.rq.terminate(i32 {slot})\n"
++                    ));
++                }
++                "commit_triangle_intersection" => {
++                    out.push_str(&format!(
++                        "{indent}call void @__m2v.rq.confirm(i32 {slot})\n"
++                    ));
++                }
++                "commit_bounding_box_intersection" => {
++                    let t_val = call
++                        .raw_args
++                        .get(1)
++                        .map(|(_, v)| v.as_str())
++                        .ok_or_else(|| "commit_bounding_box_intersection missing distance".to_string())?;
++                    out.push_str(&format!(
++                        "{indent}call void @__m2v.rq.query.iq_aabb.{slot}(float {t_val})\n"
++                    ));
++                }
++                "get_candidate_intersection_type" => {
++                    if let Some(ref lhs) = call.lhs {
++                        // SPIR-V Candidate: 0=Triangle, 1=AABB; Metal: 1=Triangle, 2=AABB.
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.raw_ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++                             {indent}{lhs} = add i32 %{pfx}.raw_ct, 1\n"
++                        ));
++                    }
++                }
++                "get_committed_intersection_type" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n"
++                        ));
++                    }
++                }
++                "get_candidate_triangle_distance" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call float @__m2v.rq.get_t(i32 {slot}, i32 0)\n"
++                        ));
++                    }
++                }
++                "get_committed_distance" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n"
++                        ));
++                    }
++                }
++                "get_ray_min_distance" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call float @__m2v.rq.get_tmin(i32 {slot})\n"
++                        ));
++                    }
++                }
++                "get_candidate_triangle_barycentric_coord" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call <2 x float> @__m2v.rq.get_barycentrics(i32 {slot}, i32 0)\n"
++                        ));
++                    }
++                }
++                "get_committed_triangle_barycentric_coord" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call <2 x float> @__m2v.rq.get_barycentrics(i32 {slot}, i32 1)\n"
++                        ));
++                    }
++                }
++                "is_candidate_triangle_front_facing" | "is_committed_triangle_front_facing" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("is_candidate_") { 0 } else { 1 };
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.ff_raw = call i1 @__m2v.rq.get_front_face(i32 {slot}, i32 {isect})\n\
++                             {indent}%{pfx}.cw_i32 = load i32, ptr %__m2v.rq.cw.{slot}, align 4\n\
++                             {indent}%{pfx}.cw = icmp ne i32 %{pfx}.cw_i32, 0\n\
++                             {indent}{lhs} = xor i1 %{pfx}.ff_raw, %{pfx}.cw\n"
++                        ));
++                    }
++                }
++                "is_candidate_non_opaque_bounding_box" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.op = call i1 @__m2v.rq.get_candidate_aabb_opaque(i32 {slot})\n\
++                             {indent}{lhs} = xor i1 %{pfx}.op, true\n"
++                        ));
++                    }
++                }
++                "get_candidate_primitive_id" | "get_committed_primitive_id" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 {isect})\n"
++                        ));
++                    }
++                }
++                "get_candidate_geometry_id" | "get_committed_geometry_id" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 {isect})\n"
++                        ));
++                    }
++                }
++                "get_candidate_instance_id" | "get_committed_instance_id" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 {isect})\n"
++                        ));
++                    }
++                }
++                "get_candidate_user_instance_id" | "get_committed_user_instance_id" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call i32 @__m2v.rq.get_instance_custom_index(i32 {slot}, i32 {isect})\n"
++                        ));
++                    }
++                }
++                "get_candidate_instance_count" | "get_committed_instance_count" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        if isect == 0 {
++                            out.push_str(&format!("{indent}{lhs} = add i32 0, 1\n"));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
++                                 {indent}%{pfx}.has = icmp ne i32 %{pfx}.ct, 0\n\
++                                 {indent}{lhs} = select i1 %{pfx}.has, i32 1, i32 0\n"
++                            ));
++                        }
++                    }
++                }
++                "get_world_space_ray_origin" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})\n"
++                        ));
++                    }
++                }
++                "get_world_space_ray_direction" => {
++                    if let Some(ref lhs) = call.lhs {
++                        out.push_str(&format!(
++                            "{indent}{lhs} = call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})\n"
++                        ));
++                    }
++                }
++                "get_candidate_ray_origin" | "get_committed_ray_origin" => {
++                    if let Some(ref lhs) = call.lhs {
++                        if call.has_instancing {
++                            let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call <3 x float> @__m2v.rq.get_object_ray_origin(i32 {slot}, i32 {isect})\n"
++                            ));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})\n"
++                            ));
++                        }
++                    }
++                }
++                "get_candidate_ray_direction" | "get_committed_ray_direction" => {
++                    if let Some(ref lhs) = call.lhs {
++                        if call.has_instancing {
++                            let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call <3 x float> @__m2v.rq.get_object_ray_direction(i32 {slot}, i32 {isect})\n"
++                            ));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})\n"
++                            ));
++                        }
++                    }
++                }
++                "get_candidate_object_to_world_transform"
++                | "get_committed_object_to_world_transform"
++                | "get_candidate_world_to_object_transform"
++                | "get_committed_world_to_object_transform" => {
++                    if let Some(ref lhs) = call.lhs {
++                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
++                        let col_fn = if call.op.contains("object_to_world") {
++                            "@__m2v.rq.get_object_to_world_col"
++                        } else {
++                            "@__m2v.rq.get_world_to_object_col"
++                        };
++                        let mty = "{ <3 x float>, <3 x float>, <3 x float>, <3 x float> }";
++                        for c in 0..4 {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.c{c} = call <3 x float> {col_fn}(i32 {slot}, i32 {isect}, i32 {c})\n"
++                            ));
++                        }
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.m0 = insertvalue {mty} poison, <3 x float> %{pfx}.c0, 0\n\
++                             {indent}%{pfx}.m1 = insertvalue {mty} %{pfx}.m0, <3 x float> %{pfx}.c1, 1\n\
++                             {indent}%{pfx}.m2 = insertvalue {mty} %{pfx}.m1, <3 x float> %{pfx}.c2, 2\n\
++                             {indent}{lhs} = insertvalue {mty} %{pfx}.m2, <3 x float> %{pfx}.c3, 3\n"
++                        ));
++                    }
++                }
++                other => {
++                    return Err(format!(
++                        "unsupported Metal intersection_query intrinsic @air.{other}_intersection_query"
++                    ));
++                }
++            }
++            continue;
++        }
++
++        let mut rewritten = line.to_string();
++        for (s, v, repl) in &null_replacements {
++            if *s == scope {
++                rewritten = replace_llvm_value(&rewritten, v, repl);
++            }
++        }
++        out.push_str(&rewritten);
++        out.push('\n');
++    }
++
++    append_rq_intrinsic_declarations(&mut out, ll);
++
++    // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
++    for slot in commit_aabb_slots {
++        out.push_str(&format!(
++            "\ndefine internal void @__m2v.rq.query.iq_aabb.{slot}(float %t) {{\n\
++             entry:\n\
++             \x20 %tmin = call float @__m2v.rq.get_tmin(i32 {slot})\n\
++             \x20 %cur_t = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n\
++             \x20 %ge = fcmp oge float %t, %tmin\n\
++             \x20 %le = fcmp ole float %t, %cur_t\n\
++             \x20 %ok = and i1 %ge, %le\n\
++             \x20 br i1 %ok, label %do_gen, label %done\n\
++             do_gen:\n\
++             \x20 call void @__m2v.rq.generate(i32 {slot}, float %t)\n\
++             \x20 br label %done\n\
++             done:\n\
++             \x20 ret void\n\
++             }}\n"
++        ));
++    }
++
+     Ok(Some(out))
+ }
+ 
+@@ -791,6 +1507,7 @@ fn append_rq_intrinsic_declarations(out: &mut String, existing_ll: &str) {
+         "declare i32 @__m2v.rq.get_sbt_offset(i32, i32)",
+         "declare <2 x float> @__m2v.rq.get_barycentrics(i32, i32)",
+         "declare i1 @__m2v.rq.get_front_face(i32, i32)",
++        "declare i1 @__m2v.rq.get_candidate_aabb_opaque(i32)",
+         "declare <3 x float> @__m2v.rq.get_world_ray_origin(i32)",
+         "declare <3 x float> @__m2v.rq.get_world_ray_direction(i32)",
+         "declare <3 x float> @__m2v.rq.get_object_ray_origin(i32, i32)",
+@@ -934,12 +1651,15 @@ fn emit_ray_query_helper(
+     //   0x01 OpaqueKHR, 0x02 NoOpaqueKHR, 0x04 TerminateOnFirstHitKHR,
+     //   0x10 CullBackFacingTrianglesKHR, 0x20 CullFrontFacingTrianglesKHR,
+     //   0x40 CullOpaqueKHR, 0x80 CullNoOpaqueKHR.
++    // Vulkan ray queries define front-facing as CCW (dot((v1-v0) x (v2-v0), D) < 0),
++    // whereas Metal winding::clockwise == 0 and winding::counterclockwise == 1.
++    // Therefore invert Vulkan front/back culling and front-face polarity when winding == CW (0).
+     s.push_str(&format!(
+-        "  %ccw = icmp eq i32 %p{}, 1\n\
++        "  %cw = icmp eq i32 %p{}, 0\n\
+          \x20 %cull_front_req = icmp eq i32 %p{}, 1\n\
+          \x20 %cull_back_req = icmp eq i32 %p{}, 2\n\
+-         \x20 %cull_vk_front = select i1 %ccw, i1 %cull_back_req, i1 %cull_front_req\n\
+-         \x20 %cull_vk_back = select i1 %ccw, i1 %cull_front_req, i1 %cull_back_req\n\
++         \x20 %cull_vk_front = select i1 %cw, i1 %cull_back_req, i1 %cull_front_req\n\
++         \x20 %cull_vk_back = select i1 %cw, i1 %cull_front_req, i1 %cull_back_req\n\
+          \x20 %f_cf = select i1 %cull_vk_front, i32 32, i32 0\n\
+          \x20 %f_cb = select i1 %cull_vk_back, i32 16, i32 0\n\
+          \x20 %f_0 = or i32 %f_cf, %f_cb\n\
+@@ -1190,7 +1910,7 @@ fn emit_ray_query_helper(
+              read_tri:\n\
+              \x20 %hit_bary = call <2 x float> @__m2v.rq.get_barycentrics(i32 {slot}, i32 1)\n\
+              \x20 %hit_front_raw = call i1 @__m2v.rq.get_front_face(i32 {slot}, i32 1)\n\
+-             \x20 %hit_front = xor i1 %hit_front_raw, %ccw\n\
++             \x20 %hit_front = xor i1 %hit_front_raw, %cw\n\
+              \x20 br label %pack_result\n\n\
+              pack_result:\n\
+              \x20 %res_bary = phi <2 x float> [ %hit_bary, %read_tri ], [ zeroinitializer, %after_hit ]\n\
+@@ -1313,7 +2033,7 @@ fn emit_callback_args(
+             CallbackParamRole::FrontFacing => {
+                 s.push_str(&format!(
+                     "  {vname}_raw = call i1 @__m2v.rq.get_front_face(i32 {slot}, i32 0)\n\
+-                     \x20 {vname} = xor i1 {vname}_raw, %ccw\n"
++                     \x20 {vname} = xor i1 {vname}_raw, %cw\n"
+                 ));
+                 args.push(format!("{pty} {vname}"));
+             }
+diff --git a/src/passes/ray_query.rs b/src/passes/ray_query.rs
+index 70245a9..175447c 100644
+--- a/src/passes/ray_query.rs
++++ b/src/passes/ray_query.rs
+@@ -430,6 +430,14 @@ pub(in crate::passes) fn lower_ray_query_calls(
+                         vec![Operand::IdRef(rq_var)],
+                     ));
+                 }
++                "__m2v.rq.get_candidate_aabb_opaque" => {
++                    new_insts.push(Instruction::new(
++                        Op::RayQueryGetIntersectionCandidateAABBOpaqueKHR,
++                        Some(rty.unwrap_or(bool_ty)),
++                        res,
++                        vec![Operand::IdRef(rq_var)],
++                    ));
++                }
+                 "__m2v.rq.get_type"
+                 | "__m2v.rq.get_primitive_index"
+                 | "__m2v.rq.get_geometry_index"
+@@ -1274,4 +1282,372 @@ declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @a
+         assert!(has_op(&cm, Op::Switch));
+         assert!(has_op(&cm, Op::RayQueryGenerateIntersectionKHR));
+     }
++
++    #[test]
++    fn cull_and_winding_polarity_inverts_cw_not_ccw() {
++        // Wave 0 Bug #1: Vulkan ray query default front face is CCW (dot(e1 x e2, D) < 0),
++        // whereas Metal winding::clockwise == 0 and winding::counterclockwise == 1.
++        // Therefore CW (0) must invert Vulkan cull/front_face, and CCW (1) must NOT invert.
++        let ll = r#"
++define void @rt_cull(ptr addrspace(1) %as, ptr addrspace(1) %out) {
++entry:
++  %hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 100.0, ptr addrspace(1) %as, i32 255, ptr addrspace(1) null, ptr null, i64 0, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  %ff = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 8
++  %ffi = zext i1 %ff to i32
++  store i32 %ffi, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, ptr addrspace(1), ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++!air.kernel = !{!0}
++!0 = !{ptr @rt_cull, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
++"#;
++        let lowered = crate::native::ray_query_air::lower_air_ray_queries(ll, &[])
++            .expect("lower ray query")
++            .expect("lowered IR");
++        assert!(
++            lowered.contains("%cw = icmp eq i32 %p9, 0")
++                && lowered.contains("%cull_vk_front = select i1 %cw, i1 %cull_back_req, i1 %cull_front_req")
++                && lowered.contains("%hit_front = xor i1 %hit_front_raw, %cw"),
++            "must invert on CW (0), not CCW (1):\n{lowered}"
++        );
++    }
++
++    #[test]
++    fn ray_data_payload_addrspace5_callback_translates_and_forwards_payload_ptr() {
++        // Wave 0 Bug #2: exact Apple Clang 21 AIR shape from inter30_k_inter_prim_pl.ll + inter30_tri_pl_cb.ll.
++        let entry_ll = r#"
++%struct.MyPl = type { float, i32 }
++define void @k_inter_prim_pl(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly %out) {
++entry:
++  %pl = alloca %struct.MyPl, align 4
++  %0 = bitcast ptr %pl to ptr
++  %1 = getelementptr inbounds %struct.MyPl, ptr %pl, i64 0, i32 0
++  store float 1.000000e+00, ptr %1, align 4
++  %2 = getelementptr inbounds %struct.MyPl, ptr %pl, i64 0, i32 1
++  store i32 0, ptr %2, align 4
++  %3 = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 5.000000e-01, float 5.000000e-01, float 0.000000e+00>, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr nonnull align 4 %0, i64 8, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  %7 = load float, ptr %1, align 4
++  %8 = load i32, ptr %2, align 4
++  %9 = uitofp i32 %8 to float
++  %sum = fadd float %7, %9
++  store float %sum, ptr addrspace(1) %out, align 4
++  ret void
++}
++declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++!air.kernel = !{!14}
++!14 = !{ptr @k_inter_prim_pl, !15, !16}
++!15 = !{}
++!16 = !{!17, !18, !19}
++!17 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
++!18 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>"}
++!19 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++"#;
++        let cb_ll = r#"
++%struct.MyPl = type { float, i32 }
++define i1 @tri_pl_cb(<2 x float> %bary, ptr addrspace(5) nocapture align 4 dereferenceable(8) %pl) {
++entry:
++  %0 = extractelement <2 x float> %bary, i64 0
++  %add = fadd float %0, 1.000000e+01
++  %accum = getelementptr inbounds %struct.MyPl, ptr addrspace(5) %pl, i64 0, i32 0
++  %1 = load float, ptr addrspace(5) %accum, align 4
++  %add1 = fadd float %add, %1
++  store float %add1, ptr addrspace(5) %accum, align 4
++  %count = getelementptr inbounds %struct.MyPl, ptr addrspace(5) %pl, i64 0, i32 1
++  %2 = load i32, ptr addrspace(5) %count, align 4
++  %add2 = add i32 %2, 1
++  store i32 %add2, ptr addrspace(5) %count, align 4
++  %cmp = fcmp oge float %0, 3.000000e-01
++  ret i1 %cmp
++}
++!air.intersection = !{!14}
++!14 = !{ptr @tri_pl_cb, !15, !17, !"air.triangle", !"air.instancing", !"air.triangle_data"}
++!15 = !{}
++!17 = !{!18, !19}
++!18 = !{i32 0, !"air.barycentric_coord", !"air.arg_type_name", !"float2"}
++!19 = !{i32 1, !"air.payload", !"air.arg_type_name", !"MyPl"}
++"#;
++        let linkage = LinkedFunctionLinkage {
++            runtime_intersection_functions: vec![LinkedIntersectionFunction {
++                symbol: "tri_pl_cb".to_string(),
++                kind: IntersectionFunctionKind::TriangleAnyHit,
++                module_ll: cb_ll.to_string(),
++            }],
++            runtime_intersection_tables: true,
++            ..Default::default()
++        };
++        let (linked_ll, _, _) =
++            crate::specialize_linked_module_with_tables(entry_ll, Stage::Kernel, &linkage)
++                .expect("specialize ray_data payload callback");
++        assert!(
++            !linked_ll.contains("addrspace(5)"),
++            "addrspace(5) ray_data pointers must be normalized:\n{linked_ll}"
++        );
++        assert!(
++            linked_ll.contains("call i1 @tri_pl_cb(<2 x float> %tc1_a0, ptr %p7)"),
++            "callback must receive real payload pointer %p7, not null:\n{linked_ll}"
++        );
++        let (m, _) = translate_rq(&linked_ll, Stage::Kernel);
++        assert!(has_cap(&m, Capability::RayQueryKHR));
++        assert!(has_op(&m, Op::RayQueryInitializeKHR));
++        assert!(has_op(&m, Op::RayQueryProceedKHR));
++        assert!(has_op(&m, Op::RayQueryConfirmIntersectionKHR));
++    }
++
++    #[test]
++    fn metal3_intersection_query_tlas_and_raw_blas_lower_to_spirv_ray_query() {
++        // Exact Apple Clang 21 Metal 3.0 intersection_query AIR shape (TLAS + raw BLAS).
++        let iq_tlas_ll = r#"
++define void @k_iq_full(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %out) {
++entry:
++  %0 = tail call ptr @air.allocate_intersection_query.instancing.triangle_data()
++  tail call void @air.reset_intersection_query.instancing.triangle_data(ptr %0, <3 x float> <float 5.000000e-01, float 5.000000e-01, float 0.000000e+00>, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  %1 = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
++  br i1 %1, label %while.body, label %while.end
++while.body:
++  %2 = tail call i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  switch i32 %2, label %next_it [
++    i32 1, label %tri
++    i32 2, label %box
++  ]
++tri:
++  %cb = tail call <2 x float> @air.get_candidate_triangle_barycentric_coord_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %ct = tail call float @air.get_candidate_triangle_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %co = tail call <3 x float> @air.get_candidate_ray_origin_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cd = tail call <3 x float> @air.get_candidate_ray_direction_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cff = tail call i1 @air.is_candidate_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %co2w = tail call { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_candidate_object_to_world_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cw2o = tail call { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_candidate_world_to_object_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cpd = tail call ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cg = tail call i32 @air.get_candidate_geometry_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cp = tail call i32 @air.get_candidate_primitive_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %ci = tail call i32 @air.get_candidate_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %cu = tail call i32 @air.get_candidate_user_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %null_ok = icmp eq ptr addrspace(1) %cpd, null
++  %bx = extractelement <2 x float> %cb, i64 0
++  %ok0 = fcmp oge float %bx, 2.000000e-01
++  %ok1 = and i1 %ok0, %cff
++  %ok2 = and i1 %ok1, %null_ok
++  br i1 %ok2, label %commit_tri, label %next_it
++commit_tri:
++  tail call void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr %0)
++  br label %next_it
++box:
++  %tmin = tail call float @air.get_ray_min_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %bt = fadd float %tmin, 5.000000e-01
++  tail call void @air.commit_bounding_box_intersection_intersection_query.instancing.triangle_data(ptr %0, float %bt)
++  tail call void @air.abort_intersection_query.instancing.triangle_data(ptr %0)
++  br label %next_it
++next_it:
++  %more = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
++  br i1 %more, label %while.body, label %while.end
++while.end:
++  %ht = tail call i32 @air.get_committed_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %t = tail call float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %bary = tail call <2 x float> @air.get_committed_triangle_barycentric_coord_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %ff = tail call i1 @air.is_committed_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %pid = tail call i32 @air.get_committed_primitive_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %gid = tail call i32 @air.get_committed_geometry_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %iid = tail call i32 @air.get_committed_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %uid = tail call i32 @air.get_committed_user_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %o2w = tail call { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_committed_object_to_world_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %w2o = tail call { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_committed_world_to_object_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %wo = tail call <3 x float> @air.get_world_space_ray_origin_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %wd = tail call <3 x float> @air.get_world_space_ray_direction_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
++  %o2w3 = extractvalue { <3 x float>, <3 x float>, <3 x float>, <3 x float> } %o2w, 3
++  %w2o3 = extractvalue { <3 x float>, <3 x float>, <3 x float>, <3 x float> } %w2o, 3
++  %s0 = fadd float %t, %ct
++  %ox = extractelement <3 x float> %o2w3, i64 0
++  %wx = extractelement <3 x float> %w2o3, i64 0
++  %wox = extractelement <3 x float> %wo, i64 0
++  %wdx = extractelement <3 x float> %wd, i64 0
++  %s1 = fadd float %ox, %wx
++  %s2 = fadd float %wox, %wdx
++  %s3 = fadd float %s1, %s2
++  %s4 = fadd float %t, %s3
++  store float %s4, ptr addrspace(1) %out, align 4
++  tail call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %0)
++  ret void
++}
++declare ptr @air.allocate_intersection_query.instancing.triangle_data()
++declare void @air.deallocate_intersection_query.instancing.triangle_data(ptr)
++declare void @air.reset_intersection_query.instancing.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++declare i1 @air.next_intersection_query.instancing.triangle_data(ptr)
++declare void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr)
++declare void @air.commit_bounding_box_intersection_intersection_query.instancing.triangle_data(ptr, float)
++declare void @air.abort_intersection_query.instancing.triangle_data(ptr)
++declare i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <2 x float> @air.get_candidate_triangle_barycentric_coord_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare float @air.get_candidate_triangle_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <3 x float> @air.get_candidate_ray_origin_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <3 x float> @air.get_candidate_ray_direction_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i1 @air.is_candidate_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_candidate_object_to_world_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_candidate_world_to_object_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_candidate_geometry_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_candidate_primitive_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_candidate_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_candidate_user_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare float @air.get_ray_min_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_committed_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <2 x float> @air.get_committed_triangle_barycentric_coord_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i1 @air.is_committed_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_committed_primitive_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_committed_geometry_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_committed_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare i32 @air.get_committed_user_instance_id_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_committed_object_to_world_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare { <3 x float>, <3 x float>, <3 x float>, <3 x float> } @air.get_committed_world_to_object_transform_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <3 x float> @air.get_world_space_ray_origin_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++declare <3 x float> @air.get_world_space_ray_direction_intersection_query.instancing.triangle_data(ptr nocapture readonly)
++!air.kernel = !{!14}
++!14 = !{ptr @k_iq_full, !15, !16}
++!15 = !{}
++!16 = !{!17, !18}
++!17 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
++!18 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++"#;
++        // Fix unused %ct dominance in test IR (don't reference %ct outside %tri block).
++        let iq_tlas_ll = iq_tlas_ll.replace("%s0 = fadd float %t, %ct\n", "");
++        let (m, refl) = translate_rq(&iq_tlas_ll, Stage::Kernel);
++        assert!(has_cap(&m, Capability::RayQueryKHR));
++        assert!(has_op(&m, Op::RayQueryInitializeKHR));
++        assert!(has_op(&m, Op::RayQueryProceedKHR));
++        assert!(has_op(&m, Op::RayQueryConfirmIntersectionKHR));
++        assert!(has_op(&m, Op::RayQueryGenerateIntersectionKHR));
++        assert!(has_op(&m, Op::RayQueryTerminateKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionTypeKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionTKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionBarycentricsKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionFrontFaceKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionObjectToWorldKHR));
++        assert!(has_op(&m, Op::RayQueryGetIntersectionWorldToObjectKHR));
++        assert!(has_op(&m, Op::RayQueryGetWorldRayOriginKHR));
++        assert!(has_op(&m, Op::RayQueryGetWorldRayDirectionKHR));
++        assert_eq!(refl.acceleration_structures.len(), 1);
++
++        // Raw BLAS intersection_query (no instancing mask, 16-arg reset).
++        let iq_blas_ll = r#"
++define void @k_iq_blas(ptr addrspace(1) %blas.coerce, ptr addrspace(1) %out) {
++entry:
++  %0 = tail call ptr @air.allocate_intersection_query.triangle_data()
++  tail call void @air.reset_intersection_query.triangle_data(ptr %0, <3 x float> <float 5.000000e-01, float 5.000000e-01, float 2.000000e+00>, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 1.000000e-03, float 1.000000e+02, ptr addrspace(1) readonly %blas.coerce, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false)
++  %1 = tail call i1 @air.next_intersection_query.triangle_data(ptr %0)
++  br i1 %1, label %while.body, label %while.end
++while.body:
++  %2 = tail call i32 @air.get_candidate_intersection_type_intersection_query.triangle_data(ptr nocapture readonly %0)
++  %cmp = icmp eq i32 %2, 1
++  br i1 %cmp, label %if.then, label %if.end
++if.then:
++  tail call void @air.commit_triangle_intersection_intersection_query.triangle_data(ptr %0)
++  br label %if.end
++if.end:
++  %3 = tail call i1 @air.next_intersection_query.triangle_data(ptr %0)
++  br i1 %3, label %while.body, label %while.end
++while.end:
++  %4 = tail call i32 @air.get_committed_intersection_type_intersection_query.triangle_data(ptr nocapture readonly %0)
++  %6 = tail call float @air.get_committed_distance_intersection_query.triangle_data(ptr nocapture readonly %0)
++  store float %6, ptr addrspace(1) %out, align 4
++  tail call void @air.deallocate_intersection_query.triangle_data(ptr %0)
++  ret void
++}
++declare ptr @air.allocate_intersection_query.triangle_data()
++declare void @air.deallocate_intersection_query.triangle_data(ptr)
++declare void @air.reset_intersection_query.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1)
++declare i1 @air.next_intersection_query.triangle_data(ptr)
++declare i32 @air.get_candidate_intersection_type_intersection_query.triangle_data(ptr nocapture readonly)
++declare void @air.commit_triangle_intersection_intersection_query.triangle_data(ptr)
++declare i32 @air.get_committed_intersection_type_intersection_query.triangle_data(ptr nocapture readonly)
++declare float @air.get_committed_distance_intersection_query.triangle_data(ptr nocapture readonly)
++!air.kernel = !{!14}
++!14 = !{ptr @k_iq_blas, !15, !16}
++!15 = !{}
++!16 = !{!17, !18}
++!17 = !{i32 0, !"air.primitive_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
++!18 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++"#;
++        let (mb, reflb) = translate_rq(iq_blas_ll, Stage::Kernel);
++        assert!(has_op(&mb, Op::RayQueryInitializeKHR));
++        assert!(has_op(&mb, Op::RayQueryProceedKHR));
++        assert!(has_op(&mb, Op::RayQueryConfirmIntersectionKHR));
++        assert_eq!(reflb.acceleration_structures.len(), 1);
++        assert_eq!(
++            reflb.acceleration_structures[0].kind,
++            AccelerationStructureKind::Primitive
++        );
++
++        // Also verify BDA AS intersection_query, dual simultaneous query slots, and
++        // spirv-val validation when available.
++        let iq_bda_dual_ll = r#"
++%struct.SceneArgs = type { ptr addrspace(1) }
++define void @k_iq_bda_dual(ptr addrspace(1) %args, ptr addrspace(1) %out) {
++entry:
++  %as_ptr = getelementptr inbounds %struct.SceneArgs, ptr addrspace(1) %args, i32 0, i32 0
++  %as = load ptr addrspace(1), ptr addrspace(1) %as_ptr, align 8
++  %q0 = call ptr @air.allocate_intersection_query.instancing.triangle_data()
++  %q1 = call ptr @air.allocate_intersection_query.instancing.triangle_data()
++  call void @air.reset_intersection_query.instancing.triangle_data(ptr %q0, <3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0.001, float 50.0, ptr addrspace(1) %as, i32 255, i32 0, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
++  call void @air.reset_intersection_query.instancing.triangle_data(ptr %q1, <3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float 1.0>, float 0.001, float 50.0, ptr addrspace(1) %as, i32 255, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 true)
++  %m0 = call i1 @air.next_intersection_query.instancing.triangle_data(ptr %q0)
++  %m1 = call i1 @air.next_intersection_query.instancing.triangle_data(ptr %q1)
++  %t0 = call float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr %q0)
++  %t1 = call float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr %q1)
++  %s = fadd float %t0, %t1
++  store float %s, ptr addrspace(1) %out, align 4
++  call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %q0)
++  call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %q1)
++  ret void
++}
++declare ptr @air.allocate_intersection_query.instancing.triangle_data()
++declare void @air.deallocate_intersection_query.instancing.triangle_data(ptr)
++declare void @air.reset_intersection_query.instancing.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
++declare i1 @air.next_intersection_query.instancing.triangle_data(ptr)
++declare float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr)
++!air.kernel = !{!0}
++!0 = !{ptr @k_iq_bda_dual, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.struct_type_info", !6}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
++!6 = !{i32 0, i32 8, i32 0, !"acceleration_structure<instancing>", !"tlas", !"air.indirect_argument", !7}
++!7 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>"}
++"#;
++        let (md, refld) = translate_rq(iq_bda_dual_ll, Stage::Kernel);
++        assert!(has_op(&md, Op::ConvertUToAccelerationStructureKHR));
++        assert!(has_op(&md, Op::RayQueryInitializeKHR));
++        assert_eq!(refld.acceleration_structures.len(), 1);
++        assert_eq!(
++            refld.acceleration_structures[0].binding_mode,
++            AccelerationStructureBindingMode::BufferDeviceAddress
++        );
++        // Must allocate 2 distinct OpTypeRayQueryKHR OpVariables (slots 0 and 1).
++        let rq_type_id = md
++            .types_global_values
++            .iter()
++            .find(|i| i.class.opcode == Op::TypeRayQueryKHR)
++            .and_then(|i| i.result_id)
++            .expect("TypeRayQueryKHR");
++        let rq_ptr_ids: Vec<_> = md
++            .types_global_values
++            .iter()
++            .filter(|i| {
++                i.class.opcode == Op::TypePointer
++                    && i.operands.get(1) == Some(&Operand::IdRef(rq_type_id))
++            })
++            .filter_map(|i| i.result_id)
++            .collect();
++        let rq_var_count = md
++            .all_inst_iter()
++            .filter(|i| {
++                i.class.opcode == Op::Variable
++                    && i.result_type.is_some_and(|t| rq_ptr_ids.contains(&t))
++            })
++            .count();
++        assert_eq!(rq_var_count, 2, "dual intersection_query must allocate 2 RayQuery variables");
++    }
+ }

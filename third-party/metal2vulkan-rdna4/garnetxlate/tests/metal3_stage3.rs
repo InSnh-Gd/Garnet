@@ -12,7 +12,8 @@ use garnetxlate::{
     garnetx_translate_linked_libraries, garnetx_translate_stage3,
     garnetx_translate_with_capabilities, RDNA4xBackendCapabilities, RDNA4xDep,
     RDNA4xDynamicLibrary, RDNA4xIntersectionFunction, GARNETX_CAP_MESH_EMULATED_PAYLOAD,
-    GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
+    GARNETX_CAP_RT_POSITION_FETCH, GARNETX_IFT_KIND_BOUNDING_BOX,
+    GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
     GARNETX_MESH_GRID_PARAMS_BINDING, GARNETX_MESH_INDIRECT_BINDING, GARNETX_MESH_PAYLOAD_BINDING,
     GARNETX_STAGE_FRAGMENT, GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT,
     GARNETX_STAGE_VERTEX, RC_BAD_ARGS, RC_OK, RC_REFUSED,
@@ -1077,7 +1078,7 @@ fn emulated_object_and_mesh_payload_ffi() {
 
     // 5. Unknown capability flag bit still rejected with RC_BAD_ARGS.
     let bad_caps = RDNA4xBackendCapabilities {
-        flags: 1 << 9,
+        flags: 1 << 30,
         ..emul_caps
     };
     let bad = call_stage3_with_caps(OBJECT_16K_LL, Some([32, 1, 1]), &[], Some(bad_caps));
@@ -1447,4 +1448,85 @@ declare void @air.atomic.global.max.f.f32(ptr addrspace(1), float, i32, i32, i1)
     assert!(asm_f32.contains("OpAtomicFAddEXT"), "{asm_f32}");
     assert!(asm_f32.contains("OpAtomicCompareExchange"), "{asm_f32}");
     assert!(!asm_f32.contains("air.atomic."), "{asm_f32}");
+}
+
+#[test]
+fn wave1_rt_position_fetch_cap_intersection_query_and_ray_data_payload_ffi() {
+    assert_eq!(GARNETX_CAP_RT_POSITION_FETCH, 1 << 9);
+    let rt_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // 1. Metal 3 intersection_query with null-checked primitive_data load (exact Apple Clang 21 shape).
+    let iq_ll = r#"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_iq_prim_null(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %out) {
+entry:
+  %0 = tail call ptr @air.allocate_intersection_query.instancing.triangle_data()
+  tail call void @air.reset_intersection_query.instancing.triangle_data(ptr %0, <3 x float> <float 5.0e-01, float 5.0e-01, float 0.0>, <3 x float> <float 0.0, float 0.0, float -1.0>, float 1.0e-03, float 1.0e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %1 = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
+  br i1 %1, label %while.body, label %while.end
+while.body:
+  %2 = tail call i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %is_tri = icmp eq i32 %2, 1
+  br i1 %is_tri, label %tri, label %next_it
+tri:
+  %cpd = tail call ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %is_null = icmp eq ptr addrspace(1) %cpd, null
+  br i1 %is_null, label %commit, label %read_pd
+read_pd:
+  %color = bitcast ptr addrspace(1) %cpd to ptr addrspace(1)
+  %v = load <4 x float>, ptr addrspace(1) %color, align 16
+  %vx = extractelement <4 x float> %v, i64 0
+  %ok = fcmp oge float %vx, 0.0
+  br i1 %ok, label %commit, label %next_it
+commit:
+  tail call void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr %0)
+  br label %next_it
+next_it:
+  %more = tail call i1 @air.next_intersection_query.instancing.triangle_data(ptr %0)
+  br i1 %more, label %while.body, label %while.end
+while.end:
+  %t = tail call float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %ff = tail call i1 @air.is_committed_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly %0)
+  %ff_f = select i1 %ff, float %t, float -1.0
+  store float %ff_f, ptr addrspace(1) %out, align 4
+  tail call void @air.deallocate_intersection_query.instancing.triangle_data(ptr %0)
+  ret void
+}
+declare ptr @air.allocate_intersection_query.instancing.triangle_data()
+declare void @air.deallocate_intersection_query.instancing.triangle_data(ptr)
+declare void @air.reset_intersection_query.instancing.triangle_data(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+declare i1 @air.next_intersection_query.instancing.triangle_data(ptr)
+declare i32 @air.get_candidate_intersection_type_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare void @air.commit_triangle_intersection_intersection_query.instancing.triangle_data(ptr)
+declare float @air.get_committed_distance_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+declare i1 @air.is_committed_triangle_front_facing_intersection_query.instancing.triangle_data(ptr nocapture readonly)
+!air.kernel = !{!0}
+!0 = !{ptr @k_iq_prim_null, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+"#;
+    let out_iq = call_stage3_with_caps(iq_ll, Some([1, 1, 1]), &[], Some(rt_caps));
+    assert_eq!(out_iq.rc, RC_OK, "intersection_query with GARNETX_CAP_RT_POSITION_FETCH failed: {}", out_iq.msg);
+    let asm_iq = spv_asm(&out_iq.spv);
+    assert!(asm_iq.contains("OpRayQueryInitializeKHR"), "{asm_iq}");
+    assert!(asm_iq.contains("OpRayQueryProceedKHR"), "{asm_iq}");
+    assert!(asm_iq.contains("OpRayQueryConfirmIntersectionKHR"), "{asm_iq}");
+
+    // 2. Unknown capability bit still fails cleanly with RC_BAD_ARGS.
+    let bad_caps = RDNA4xBackendCapabilities {
+        flags: 1 << 30,
+        ..rt_caps
+    };
+    let out_bad = call_stage3_with_caps(iq_ll, Some([1, 1, 1]), &[], Some(bad_caps));
+    assert_eq!(out_bad.rc, RC_BAD_ARGS, "unknown capability flag must fail with RC_BAD_ARGS");
 }
