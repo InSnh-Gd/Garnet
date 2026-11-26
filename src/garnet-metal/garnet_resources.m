@@ -1773,6 +1773,27 @@ GARNET_INTERNAL void rdna4_tex_to(VkCommandBuffer cmd, RDNA4Texture *t, VkImageL
     }
     if (![t rdna4IOSLinear]) rdna4_image_transition(cmd, t, [t layout], nl);
 }
+GARNET_INTERNAL void rdna4_tex_to_compute(VkCommandBuffer cmd, RDNA4Texture *t, VkImageLayout nl) {
+    if ([t rdna4IsTexel]) { rdna4_tex_to(cmd, t, nl); return; }
+    if ([t rdna4IOSLinear]) return;
+    const VkImageLayout oldLayout = [t layout];
+    if (oldLayout == nl) return;
+    const VkPipelineStageFlags srcStage = (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkAccessFlags srcAccess = (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        ? 0 : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    const VkPipelineStageFlags dstStage = (nl == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkAccessFlags dstAccess = (nl == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        ? VK_ACCESS_SHADER_READ_BIT : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = srcAccess, .dstAccessMask = dstAccess,
+        .oldLayout = oldLayout, .newLayout = nl,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = [t vkImage], .subresourceRange = { rdna4dp_barrier_aspect([t rdna4Aspects]), 0, [t rdna4Levels], 0, [t rdna4ImageLayers] } };
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &ib);
+    [t setLayout:nl];
+}
 GARNET_INTERNAL BOOL rdna4_region_ok(RDNA4Texture *t, MTLRegion r, NSUInteger level, NSUInteger slice, const char *what) {
     if (level >= [t mipmapLevelCount] || slice >= [t rdna4Layers]) { RDNA4LOG("%s: mip level %lu / slice %lu: the texture has %lu level(s) and %u slice(s); refused", what, (unsigned long)level, (unsigned long)slice, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return NO; }
     NSUInteger lw = MAX((NSUInteger)1, t.width >> level), lh = MAX((NSUInteger)1, t.height >> level), ld = MAX((NSUInteger)1, t.depth >> level);   // depth is 1 for everything but 3D

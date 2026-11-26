@@ -436,41 +436,52 @@ RDNA4_DNR(GarnetGLDrawable)
 #if !defined(GARNET_SYSTEM_REPORT_ONLY)
 @implementation RDNA4CommandBuffer (Encoders)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+    [self rdna4EnsureGfxSegment];
     (void)[self vk];
     RDNA4LOGR("cb renderCommandEncoderWithDescriptor:");
     return [[RDNA4RenderEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
 - (id)blitCommandEncoder {
+    [self rdna4EnsureGfxSegment];
     RDNA4LOGR("cb blitCommandEncoder");
     return [[RDNA4BlitEncoder alloc] initWithCommandBuffer:self blit:0];
 }
 - (id)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
+    [self rdna4EnsureGfxSegment];
     RDNA4LOGR("cb blitCommandEncoderWithDescriptor:");
     return [[RDNA4BlitEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
-- (id)computeCommandEncoder { (void)[self vk]; RDNA4LOGR("cb computeCommandEncoder"); return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self compute:0]; }
+- (id)computeCommandEncoder {
+    if (![self rdna4TrySwitchToComputeQueue]) (void)[self vk];
+    RDNA4LOGR("cb computeCommandEncoder");
+    return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self compute:0];
+}
 - (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
-    (void)[self vk];
+    if (![self rdna4TrySwitchToComputeQueue]) (void)[self vk];
     RDNA4LOGR("cb computeCommandEncoderWithDescriptor:");
     return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t {
-    (void)[self vk];
+    if (![self rdna4TrySwitchToComputeQueue]) (void)[self vk];
     RDNA4LOGR("cb computeCommandEncoderWithDispatchType:%lu", (unsigned long)t);
     return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self dispatchType:t];
 }
 - (id)resourceStateCommandEncoder {
+    [self rdna4EnsureGfxSegment];
     return rdna4_cb_new_resource_state_encoder(self, nil);
 }
 - (id)resourceStateCommandEncoderWithDescriptor:(id)d {
+    [self rdna4EnsureGfxSegment];
     return rdna4_cb_new_resource_state_encoder(self, d);
 }
 - (id)accelerationStructureCommandEncoder {
+    [self rdna4EnsureGfxSegment];
     (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoder");
     return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
 }
 - (id)accelerationStructureCommandEncoderWithDescriptor:(id)d {
+    [self rdna4EnsureGfxSegment];
     (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoderWithDescriptor:");
     return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];

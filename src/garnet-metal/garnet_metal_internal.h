@@ -67,6 +67,7 @@
 #include "garnet_vkpool.h"
 #include "garnet_queue_pipe.h"
 #include "garnet_bar_policy.h"
+#include "garnet_async_compute.h"
 #include "garnet_vram_surf.h"
 #include "garnet_argument_summary.h"
 #include "garnet_plane.h"
@@ -258,6 +259,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
     X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) X(vkResetCommandBuffer) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) \
+    X(vkCreateSemaphore) X(vkDestroySemaphore) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateRenderPass) X(vkDestroyRenderPass) \
     X(vkCreateFramebuffer) X(vkDestroyFramebuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
@@ -662,6 +664,7 @@ typedef struct {
     uint32_t maxPushDesc;
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescSet;
     garnet_bar_policy_t barPolicy;
+    VkQueue computeQ; uint32_t computeQfi; pthread_mutex_t computeQlock; BOOL asyncComputeOn;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
 typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;
@@ -1422,7 +1425,7 @@ typedef struct {
     NSMutableArray *argumentPools;
     NSMutableArray *descriptorPools;
     NSArray *argumentSummaryAttempts;
-    BOOL ended, submitted, retirementUnknown, done, hasWork, pruned, terminal;
+    BOOL ended, submitted, retirementUnknown, done, hasWork, pruned, terminal, isComputeQueue;
     uint64_t argumentSubmissionEpoch;
     NSUInteger hostWritebackCopies;
     NSUInteger hostLinearWrites;
@@ -1441,6 +1444,11 @@ typedef struct {
     NSMutableArray *_residencySets;
     pthread_mutex_t _qmu;
     garnet_vkpool_t _cmdPool;
+    VkCommandPool _computePool;
+    garnet_vkpool_t _computeCmdPool;
+    VkSemaphore _orderSem;
+    garnet_async_qorder_t _order;
+    _Atomic int _orderLastWasCompute;
     garnet_qp_t _qp;
     NSUInteger _launchedCount;
     BOOL _submitting, _scheduleKickNeeded, _deferTimerArmed;
@@ -1448,9 +1456,15 @@ typedef struct {
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(id)desc error:(NSError **)err;
 - (VkCommandPool)pool;
+- (VkCommandPool)computePool;
 - (VkCommandBuffer)rdna4TakeCmdBuf:(NSError **)err;
 - (VkCommandBuffer)rdna4TakeCmdBufLocked:(NSError **)err;
 - (void)rdna4GiveCmdBuf:(VkCommandBuffer)cmd;
+- (VkCommandBuffer)rdna4TakeComputeCmdBuf:(NSError **)err;
+- (void)rdna4GiveComputeCmdBuf:(VkCommandBuffer)cmd;
+- (VkSemaphore)rdna4OrderSemaphore;
+- (BOOL)rdna4OrderLastWasCompute;
+- (garnet_async_submit_order_t)rdna4NextOrderForCompute:(BOOL)isCompute;
 - (BOOL)rdna4HasResidencySets;
 - (dispatch_queue_t)rdna4CompletionQueue;
 - (void)rdna4Kick;
@@ -1528,6 +1542,9 @@ typedef struct {
 - (BOOL)rdna4AdvanceWithQueue:(RDNA4CommandQueue *)queue;
 - (BOOL)rdna4OpenSegment:(NSError **)err;
 - (BOOL)rdna4EndCurrentSegment:(NSError **)err;
+- (BOOL)rdna4CurrentSegmentIsCompute;
+- (BOOL)rdna4TrySwitchToComputeQueue;
+- (void)rdna4EnsureGfxSegment;
 - (BOOL)rdna4HasArgumentWrites;
 - (void)rdna4ArgumentCheckpoint;
 - (void)rdna4UpdateFence:(id)f;
@@ -3399,6 +3416,7 @@ GARNET_INTERNAL_EXTERN VkBufferCreateInfo rdna4_heap_buffer_create_info(NSUInteg
 GARNET_INTERNAL_EXTERN void rdna4_image_transition(VkCommandBuffer cmd, RDNA4Texture *t, VkImageLayout oldLayout, VkImageLayout newLayout);
 GARNET_INTERNAL_EXTERN VkImageLayout rdna4_use_layout(RDNA4Texture *texture, VkImageLayout preferred);
 GARNET_INTERNAL_EXTERN void rdna4_tex_to(VkCommandBuffer cmd, RDNA4Texture *t, VkImageLayout nl);
+GARNET_INTERNAL_EXTERN void rdna4_tex_to_compute(VkCommandBuffer cmd, RDNA4Texture *t, VkImageLayout nl);
 GARNET_INTERNAL_EXTERN BOOL rdna4_region_ok(RDNA4Texture *t, MTLRegion r, NSUInteger level, NSUInteger slice, const char *what);
 GARNET_INTERNAL_EXTERN BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL aliasable, rdna4_heap_image_plan *p, NSError **err);
 GARNET_INTERNAL_EXTERN NSUInteger rdna4_alup(NSUInteger v, NSUInteger a);
@@ -3763,6 +3781,7 @@ static inline rdna4dc_metal3_caps rdna4_metal3_caps(void) {
     return rdna4_device_caps().metal3;
 }
 static inline void rdna4_qlock(void) { uint64_t t_ = rdna4_now(); pthread_mutex_lock(&(RDNA4R.qlock)); rdna4t_add(&T1.qlk, rdna4_now() - t_); }
+static inline void rdna4_compute_qlock(void) { pthread_mutex_lock(&(RDNA4R.computeQlock)); }
 static inline int rdna4cbl_on(void) { return atomic_load_explicit(&RDNA4CB.on, memory_order_relaxed); }
 static inline BOOL rdna4_fmt_is_bc(const RDNA4Fmt *f) { return f != NULL && (f->flags & RDNA4F_BC) != 0; }
 static inline void rdna4_int_bits(MTLPixelFormat pf, unsigned *rgb, unsigned *a) {

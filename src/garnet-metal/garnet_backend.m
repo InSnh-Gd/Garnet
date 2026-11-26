@@ -1507,6 +1507,11 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         vkGetPhysicalDeviceQueueFamilyProperties(RDNA4R.pd, &nq, qf);
         uint32_t qfi = 0; for (; qfi < nq; qfi++) if (qf[qfi].queueFlags & VK_QUEUE_GRAPHICS_BIT) break;
         if (qfi == nq) { RDNA4R.err = rdna4_err(6, @"no graphics queue family"); goto fail; }
+        uint32_t cqfi = nq;
+        for (uint32_t i = 0; i < nq; i++) {
+            if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { cqfi = i; break; }
+        }
+        const int hasDedicatedComputeQF = (cqfi < nq) ? 1 : 0;
         RDNA4R.qfi = qfi;
         float prio = 1.0f;
         VkDeviceQueueCreateInfo dq = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = qfi, .queueCount = 1, .pQueuePriorities = &prio };
@@ -1551,6 +1556,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .shaderInputAttachmentArrayNonUniformIndexing = supported12.shaderInputAttachmentArrayNonUniformIndexing,
             .shaderUniformTexelBufferArrayNonUniformIndexing = supported12.shaderUniformTexelBufferArrayNonUniformIndexing,
             .shaderStorageTexelBufferArrayNonUniformIndexing = supported12.shaderStorageTexelBufferArrayNonUniformIndexing,
+            .timelineSemaphore = supported12.timelineSemaphore,
             .bufferDeviceAddress = supported12.bufferDeviceAddress };
         VkPhysicalDeviceVulkan11Features enabled11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &enabled12,
             .shaderDrawParameters = supported11.shaderDrawParameters,
@@ -1877,7 +1883,16 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         if (RDNA4R.drmModExt) devExts[devExtCount++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
         if (hasPushDesc) devExts[devExtCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
         RDNA4LOG("radv: VK_EXT_image_drm_format_modifier %s (VK_KHR_image_format_list is core at API 1.2; device API is 1.3)", RDNA4R.drmModExt ? "enabled" : "unavailable");
-        VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &enabled11, .queueCreateInfoCount = 1, .pQueueCreateInfos = &dq, .pEnabledFeatures = &ef,
+        const int killAsyncCompute = (access(GARNET_NO_ASYNC_COMPUTE_FILE, F_OK) == 0) ? 1 : 0;
+        const int wantAsyncCompute = garnet_async_compute_device_enable(
+            hasDedicatedComputeQF, enabled12.timelineSemaphore != VK_FALSE ? 1 : 0,
+            rdna4_is_ws() ? 1 : 0, killAsyncCompute);
+        VkDeviceQueueCreateInfo dqs[2] = {
+            dq,
+            { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = hasDedicatedComputeQF ? cqfi : qfi, .queueCount = 1, .pQueuePriorities = &prio }
+        };
+        VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &enabled11,
+                                   .queueCreateInfoCount = wantAsyncCompute ? 2u : 1u, .pQueueCreateInfos = dqs, .pEnabledFeatures = &ef,
                                    .enabledExtensionCount = devExtCount, .ppEnabledExtensionNames = devExts };
         r = vkCreateDevice(RDNA4R.pd, &dci, NULL, &RDNA4R.dev);
         if (r != VK_SUCCESS) { RDNA4R.err = rdna4_err(7, [NSString stringWithFormat:@"vkCreateDevice = %d", r]); goto fail; }
@@ -1895,6 +1910,22 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             RDNA4R.sampleLocationsExt = rdna4_vkCmdSetSampleLocationsEXT != NULL && RDNA4R.sampleLocationCounts != 0;
         }
         vkGetDeviceQueue(RDNA4R.dev, qfi, 0, &RDNA4R.q);
+        pthread_mutex_init(&RDNA4R.computeQlock, NULL);
+        RDNA4R.computeQ = VK_NULL_HANDLE;
+        RDNA4R.computeQfi = qfi;
+        RDNA4R.asyncComputeOn = NO;
+        if (wantAsyncCompute && vkCreateSemaphore && vkDestroySemaphore) {
+            vkGetDeviceQueue(RDNA4R.dev, cqfi, 0, &RDNA4R.computeQ);
+            if (RDNA4R.computeQ != VK_NULL_HANDLE) {
+                RDNA4R.computeQfi = cqfi;
+                RDNA4R.asyncComputeOn = YES;
+            }
+        }
+        RDNA4LOG("radv: async compute queue %s (dedicatedQF=%d cqfi=%u timeline=%d ws=%d kill=%d)",
+                 RDNA4R.asyncComputeOn ? "enabled" : "disabled",
+                 hasDedicatedComputeQF, hasDedicatedComputeQF ? cqfi : 0u,
+                 enabled12.timelineSemaphore != VK_FALSE ? 1 : 0,
+                 rdna4_is_ws() ? 1 : 0, killAsyncCompute);
         RDNA4R.hostAlign = 4096;
         if (RDNA4R.hostExt && vkGetDeviceProcAddr && vkGetPhysicalDeviceProperties2) {
             rdna4_vkGetMHPP = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(RDNA4R.dev, "vkGetMemoryHostPointerPropertiesEXT");

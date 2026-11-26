@@ -399,6 +399,11 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
     if (!self) { if (err) *err = rdna4_err(50, @"_MTLCommandQueue initWithDevice:descriptor: returned nil"); return nil; }
     pthread_mutex_init(&_qmu, NULL);
     garnet_vkpool_init(&_cmdPool, GARNET_VKPOOL_CMD_CAP);
+    garnet_vkpool_init(&_computeCmdPool, GARNET_VKPOOL_CMD_CAP);
+    _computePool = VK_NULL_HANDLE;
+    _orderSem = VK_NULL_HANDLE;
+    _order = (garnet_async_qorder_t){ 0, 0 };
+    atomic_init(&_orderLastWasCompute, 0);
     const unsigned maxInFlight = (access(GARNET_SERIAL_QUEUE_FILE, F_OK) == 0)
         ? GARNET_QP_SERIAL_MAX_INFLIGHT : GARNET_QP_DEFAULT_MAX_INFLIGHT;
     garnet_qp_init(&_qp, maxInFlight);
@@ -411,6 +416,16 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
     VkResult r = vkCreateCommandPool(RDNA4R.dev, &cpc, NULL, &_pool);
     if (r != VK_SUCCESS) { if (err) *err = rdna4_err(51, [NSString stringWithFormat:@"vkCreateCommandPool = %d", r]); return nil; }
+    if (RDNA4R.asyncComputeOn && vkCreateSemaphore && vkDestroySemaphore) {
+        VkSemaphoreTypeCreateInfo stci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0 };
+        VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci };
+        VkResult sr = vkCreateSemaphore(RDNA4R.dev, &sci, NULL, &_orderSem);
+        if (sr != VK_SUCCESS) {
+            _orderSem = VK_NULL_HANDLE;
+            RDNA4LOG("RDNA4CommandQueue %p: timeline semaphore create failed (%d); staying on GFX queue", (__bridge void *)self, sr);
+        }
+    }
     _ndev = dev;
     _cq = rdna4_serial_interactive_q("rdna4.completion");
     dispatch_queue_set_specific(_cq, &rdna4_cq_key, (__bridge void *)self, NULL);
@@ -421,11 +436,28 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
 - (void)dealloc {
     rdna4_schedule_unregister(self);
     garnet_vkpool_drain(&_cmdPool, NULL, GARNET_VKPOOL_CMD_CAP);
+    garnet_vkpool_drain(&_computeCmdPool, NULL, GARNET_VKPOOL_CMD_CAP);
+    if (RDNA4R.ok && _computePool) vkDestroyCommandPool(RDNA4R.dev, _computePool, NULL);
+    if (RDNA4R.ok && _orderSem && vkDestroySemaphore) vkDestroySemaphore(RDNA4R.dev, _orderSem, NULL);
     if (RDNA4R.ok && _pool) vkDestroyCommandPool(RDNA4R.dev, _pool, NULL);
     pthread_mutex_destroy(&_qmu);
 }
 RDNA4_DNR(RDNA4CommandQueue)
 - (VkCommandPool)pool { return _pool; }
+- (VkCommandPool)computePool { return _computePool; }
+- (VkSemaphore)rdna4OrderSemaphore { return _orderSem; }
+- (BOOL)rdna4OrderLastWasCompute {
+    // Lock-free: called from rdna4NativeEligible -> rdna4PipelineEligible while caller already holds _qmu.
+    return _orderSem != VK_NULL_HANDLE &&
+           atomic_load_explicit(&_orderLastWasCompute, memory_order_acquire) != 0;
+}
+- (garnet_async_submit_order_t)rdna4NextOrderForCompute:(BOOL)isCompute {
+    pthread_mutex_lock(&_qmu);
+    garnet_async_submit_order_t ord = garnet_async_qorder_next(&_order, isCompute ? 1 : 0);
+    atomic_store_explicit(&_orderLastWasCompute, isCompute ? 1 : 0, memory_order_release);
+    pthread_mutex_unlock(&_qmu);
+    return ord;
+}
 - (VkCommandBuffer)rdna4TakeCmdBuf:(NSError **)err {
     if (rdna4_cmd_pool_active()) {
         pthread_mutex_lock(&_qmu);
@@ -479,6 +511,52 @@ RDNA4_DNR(RDNA4CommandQueue)
     rdna4_qlock();
     vkFreeCommandBuffers(RDNA4R.dev, _pool, 1, &cmd);
     pthread_mutex_unlock(&RDNA4R.qlock);
+}
+- (VkCommandBuffer)rdna4TakeComputeCmdBuf:(NSError **)err {
+    if (!RDNA4R.asyncComputeOn) return VK_NULL_HANDLE;
+    if (rdna4_cmd_pool_active()) {
+        pthread_mutex_lock(&_qmu);
+        VkCommandBuffer cached = (VkCommandBuffer)(uintptr_t)garnet_vkpool_pop(&_computeCmdPool);
+        pthread_mutex_unlock(&_qmu);
+        if (cached != VK_NULL_HANDLE) return cached;
+    }
+    VkCommandBuffer vk = VK_NULL_HANDLE;
+    VkResult r = VK_SUCCESS;
+    rdna4_compute_qlock();
+    if (!_computePool) {
+        VkCommandPoolCreateInfo cpc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex = RDNA4R.computeQfi,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
+        r = vkCreateCommandPool(RDNA4R.dev, &cpc, NULL, &_computePool);
+    }
+    if (r == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = _computePool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        r = vkAllocateCommandBuffers(RDNA4R.dev, &ai, &vk);
+    }
+    pthread_mutex_unlock(&RDNA4R.computeQlock);
+    if (r != VK_SUCCESS) {
+        if (err) *err = rdna4_err(55, [NSString stringWithFormat:@"vkAllocateCommandBuffers(compute) = %d", r]);
+        return VK_NULL_HANDLE;
+    }
+    return vk;
+}
+- (void)rdna4GiveComputeCmdBuf:(VkCommandBuffer)cmd {
+    if (!cmd || !RDNA4R.ok || !_computePool) return;
+    if (rdna4_cmd_pool_active()) {
+        rdna4_compute_qlock();
+        VkResult rr = vkResetCommandBuffer(cmd, 0);
+        pthread_mutex_unlock(&RDNA4R.computeQlock);
+        if (rr == VK_SUCCESS) {
+            pthread_mutex_lock(&_qmu);
+            int kept = garnet_vkpool_push(&_computeCmdPool, (uint64_t)(uintptr_t)cmd);
+            pthread_mutex_unlock(&_qmu);
+            if (kept) return;
+        }
+    }
+    rdna4_compute_qlock();
+    vkFreeCommandBuffers(RDNA4R.dev, _computePool, 1, &cmd);
+    pthread_mutex_unlock(&RDNA4R.computeQlock);
 }
 - (BOOL)rdna4HasResidencySets {
     return atomic_load_explicit(&_residencySetCount, memory_order_acquire) != 0u;
@@ -1412,17 +1490,29 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
         }
         if (_segments.count && _nq) {
             VkCommandBuffer *commands = calloc(_segments.count, 3 * sizeof *commands);
-            if (commands) {
-                uint32_t count = 0;
+            VkCommandBuffer *compCommands = calloc(_segments.count, 2 * sizeof *compCommands);
+            if (commands && compCommands) {
+                uint32_t count = 0, compCount = 0;
                 for (RDNA4CommandSegment *segment in _segments) {
                     const BOOL reusable = (!segment->submitted || segment->done) && !segment->retirementUnknown;
-                    if (segment->vk) {
-                        if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->vk];
-                        else commands[count++] = segment->vk;
-                    }
-                    if (segment->linearInit) {
-                        if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->linearInit];
-                        else commands[count++] = segment->linearInit;
+                    if (segment->isComputeQueue) {
+                        if (segment->vk) {
+                            if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveComputeCmdBuf:segment->vk];
+                            else compCommands[compCount++] = segment->vk;
+                        }
+                        if (segment->linearInit) {
+                            if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveComputeCmdBuf:segment->linearInit];
+                            else compCommands[compCount++] = segment->linearInit;
+                        }
+                    } else {
+                        if (segment->vk) {
+                            if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->vk];
+                            else commands[count++] = segment->vk;
+                        }
+                        if (segment->linearInit) {
+                            if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->linearInit];
+                            else commands[count++] = segment->linearInit;
+                        }
                     }
                     if (segment->dispCopyVk) {
                         if (reusable && rdna4_cmd_pool_active()) [_nq rdna4GiveCmdBuf:segment->dispCopyVk];
@@ -1434,8 +1524,14 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
                     vkFreeCommandBuffers(RDNA4R.dev, [_nq pool], count, commands);
                     pthread_mutex_unlock(&RDNA4R.qlock);
                 }
-                free(commands);
+                if (compCount && [_nq computePool]) {
+                    rdna4_compute_qlock();
+                    vkFreeCommandBuffers(RDNA4R.dev, [_nq computePool], compCount, compCommands);
+                    pthread_mutex_unlock(&RDNA4R.computeQlock);
+                }
             }
+            free(commands);
+            free(compCommands);
         }
     }
     [self rdna4VSRelease];
@@ -1516,6 +1612,72 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (!_encErr) _encErr = endError;
     if (err) *err = endError;
     return NO;
+}
+
+- (BOOL)rdna4CurrentSegmentIsCompute {
+    return _curSegment != nil && _curSegment->isComputeQueue;
+}
+- (BOOL)rdna4TrySwitchToComputeQueue {
+    if (!RDNA4R.asyncComputeOn || !_nq || _ended || _encErr || !_curSegment) return NO;
+    if (![_nq respondsToSelector:@selector(rdna4OrderSemaphore)] || [_nq rdna4OrderSemaphore] == VK_NULL_HANDLE) return NO;
+    const int syncItems = (_curSegment->waits.count || _curSegment->signals.count ||
+                           _curSegment->fenceWaits.count || _curSegment->fenceUpdates.count) ? 1 : 0;
+    if (!garnet_async_compute_can_switch_segment(
+            RDNA4R.asyncComputeOn ? 1 : 0, rdna4_is_ws() ? 1 : 0,
+            (uint32_t)_segments.count, _curSegment->ended ? 1 : 0,
+            _curSegment->isComputeQueue ? 1 : 0, _curSegment->hasWork ? 1 : 0,
+            _hasEvents ? 1 : 0, syncItems,
+            _curSegment->argumentIntents.count ? 1 : 0,
+            _curSegment->touches.count ? 1 : 0,
+            _curSegment->hostOnly ? 1 : 0))
+        return NO;
+    NSError *err = nil;
+    VkCommandBuffer compVk = [_nq rdna4TakeComputeCmdBuf:&err];
+    if (!compVk) return NO;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (vkBeginCommandBuffer(compVk, &bi) != VK_SUCCESS) {
+        [_nq rdna4GiveComputeCmdBuf:compVk];
+        return NO;
+    }
+    VkCommandBuffer oldGfx = _curSegment->vk;
+    (void)vkEndCommandBuffer(oldGfx);
+    [_nq rdna4GiveCmdBuf:oldGfx];
+    _curSegment->vk = compVk;
+    _vk = compVk;
+    _curSegment->isComputeQueue = YES;
+    _native.blocked = true;
+    ++_segmentSerial;
+    if (!_segmentSerial) ++_segmentSerial;
+    return YES;
+}
+- (void)rdna4EnsureGfxSegment {
+    if (!_curSegment || !_curSegment->isComputeQueue || _curSegment->ended || _ended || _encErr) return;
+    const BOOL pristine = !_curSegment->hasWork && !_curSegment->waits.count && !_curSegment->signals.count &&
+                          !_curSegment->fenceWaits.count && !_curSegment->fenceUpdates.count &&
+                          !_curSegment->argumentIntents.count && !_curSegment->touches.count;
+    NSError *error = nil;
+    if (pristine && _nq) {
+        VkCommandBuffer gfxVk = [_nq rdna4TakeCmdBuf:&error];
+        if (gfxVk) {
+            VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+            if (vkBeginCommandBuffer(gfxVk, &bi) == VK_SUCCESS) {
+                VkCommandBuffer oldComp = _curSegment->vk;
+                (void)vkEndCommandBuffer(oldComp);
+                [_nq rdna4GiveComputeCmdBuf:oldComp];
+                _curSegment->vk = gfxVk;
+                _vk = gfxVk;
+                _curSegment->isComputeQueue = NO;
+                ++_segmentSerial;
+                if (!_segmentSerial) ++_segmentSerial;
+                return;
+            }
+            [_nq rdna4GiveCmdBuf:gfxVk];
+        }
+    }
+    if (![self rdna4EndCurrentSegment:&error] || ![self rdna4OpenSegment:&error])
+        [self rdna4Fail:error.localizedDescription ?: @"cannot switch from compute segment to graphics segment"];
 }
 
 - (BOOL)rdna4HasArgumentWrites {
@@ -1655,6 +1817,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
         [self rdna4Fail:@"updateFence requires an RDNA4Fence from this device"];
         return;
     }
+    [self rdna4EnsureGfxSegment];
+    if ([self rdna4Error]) return;
     RDNA4FenceCheckpoint *checkpoint = [(RDNA4Fence *)f rdna4UpdateCheckpointForCB:_cbid];
     if (!checkpoint) { [self rdna4Fail:@"updateFence generation overflow"]; return; }
     [self rdna4Retain:f];
@@ -1672,6 +1836,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
         [self rdna4Fail:@"waitForFence requires an RDNA4Fence from this device"];
         return;
     }
+    [self rdna4EnsureGfxSegment];
+    if ([self rdna4Error]) return;
     RDNA4FenceCheckpoint *checkpoint = [(RDNA4Fence *)f rdna4WaitCheckpoint];
     int state = atomic_load_explicit(&checkpoint->state, memory_order_acquire);
     if ((checkpoint->producerCBId && checkpoint->producerCBId == _cbid) || state == RDNA4FenceCheckpointReady) {
@@ -1708,6 +1874,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (!rdna4_event_is_shared(e) && ![e conformsToProtocol:@protocol(MTLEvent)]) {
         [self rdna4Fail:@"encodeSignalEvent: the object is not a Metal event"]; return;
     }
+    [self rdna4EnsureGfxSegment];
+    if ([self rdna4Error]) return;
     _hasEvents = YES; _native.blocked = true;
     [_curSegment->signals addObject:@[e, @(v)]];
     [self rdna4Retain:e];
@@ -1722,6 +1890,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
     if (!rdna4_event_is_shared(e) && ![e conformsToProtocol:@protocol(MTLEvent)]) {
         [self rdna4Fail:@"encodeWaitForEvent: the object is not a Metal event"]; return;
     }
+    [self rdna4EnsureGfxSegment];
+    if ([self rdna4Error]) return;
     _hasEvents = YES; _native.blocked = true;
     BOOL empty = !_curSegment->hasWork && !_curSegment->waits.count && !_curSegment->signals.count &&
                  !_curSegment->fenceWaits.count && !_curSegment->fenceUpdates.count &&
@@ -1806,7 +1976,30 @@ RDNA4_DNR(RDNA4CommandBuffer)
         memset(segment->recentCmdRefs, 0, sizeof segment->recentCmdRefs);
     }
     if (segment->vk || segment->linearInit || segment->dispCopyVk) {
-        if (rdna4_cmd_pool_active() && _nq) {
+        if (segment->isComputeQueue) {
+            if (rdna4_cmd_pool_active() && _nq) {
+                if (segment->vk) [_nq rdna4GiveComputeCmdBuf:segment->vk];
+                if (segment->linearInit) [_nq rdna4GiveComputeCmdBuf:segment->linearInit];
+            } else if (_nq && [_nq computePool]) {
+                VkCommandBuffer commands[2];
+                uint32_t count = 0;
+                if (segment->vk) commands[count++] = segment->vk;
+                if (segment->linearInit) commands[count++] = segment->linearInit;
+                if (count) {
+                    rdna4_compute_qlock();
+                    vkFreeCommandBuffers(RDNA4R.dev, [_nq computePool], count, commands);
+                    pthread_mutex_unlock(&RDNA4R.computeQlock);
+                }
+            }
+            if (segment->dispCopyVk) {
+                if (rdna4_cmd_pool_active() && _nq) [_nq rdna4GiveCmdBuf:segment->dispCopyVk];
+                else if (_nq) {
+                    rdna4_qlock();
+                    vkFreeCommandBuffers(RDNA4R.dev, [_nq pool], 1, &segment->dispCopyVk);
+                    pthread_mutex_unlock(&RDNA4R.qlock);
+                }
+            }
+        } else if (rdna4_cmd_pool_active() && _nq) {
             if (segment->vk) [_nq rdna4GiveCmdBuf:segment->vk];
             if (segment->linearInit) [_nq rdna4GiveCmdBuf:segment->linearInit];
             if (segment->dispCopyVk) [_nq rdna4GiveCmdBuf:segment->dispCopyVk];
@@ -1869,6 +2062,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
 - (VkCommandBuffer)rdna4BlitVK { if (_curSegment) _curSegment->hasWork = YES; return _vk; }
 - (void)rdna4NativeRecord:(RDNA4NativeOp)op { rdna4_native_record(&_native, op); }
 - (BOOL)rdna4NativeEligible {
+    if (_curSegment && _curSegment->isComputeQueue) return NO;
+    if (_nq && [_nq respondsToSelector:@selector(rdna4OrderLastWasCompute)] && [_nq rdna4OrderLastWasCompute]) return NO;
     return !_native.blocked && _native.count && !_iot.count &&
         rdna4_vkQueueWaitIdle && rdna4_native_bridge.copy && rdna4_native_bridge.fill && rdna4_native_bridge.wait;
 }
@@ -2513,7 +2708,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
     VkCommandBuffer init = VK_NULL_HANDLE;
     VkResult result = VK_SUCCESS;
     if (_nq) {
-        init = [_nq rdna4TakeCmdBuf:error];
+        init = segment->isComputeQueue ? [_nq rdna4TakeComputeCmdBuf:error] : [_nq rdna4TakeCmdBuf:error];
         if (!init) result = VK_ERROR_OUT_OF_HOST_MEMORY;
     } else {
         VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -2689,6 +2884,55 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         ? [queue rdna4PendingHasNewerSid:_dsid after:self] : NO;
     BOOL submitAttempted = NO, nativeDone = NO, elidedDispCopy = NO;
     uint64_t argumentSubmissionEpoch = 0;
+    const VkSemaphore orderSem = (queue && [queue respondsToSelector:@selector(rdna4OrderSemaphore)])
+        ? [queue rdna4OrderSemaphore] : VK_NULL_HANDLE;
+    const BOOL submitCompute = segment->isComputeQueue && RDNA4R.asyncComputeOn && RDNA4R.computeQ != VK_NULL_HANDLE;
+    if (submitCompute) {
+        // Dedicated MEC compute queue: never acquires RDNA4R.qlock so distinct MTLCommandQueues
+        // submit GFX and Compute in true lock-free parallel.
+        rdna4_compute_qlock();
+        r = (VkResult)atomic_load(&rdna4_submit_fault);
+        if (r == VK_SUCCESS) {
+            if (!_cbSubmitLogged) {
+                [self rdna4CBSubmit:_startTime];
+                _cbSubmitLogged = YES;
+            }
+            VkCommandBuffer commands[2];
+            uint32_t cmdCount = 0;
+            if (segment->linearInit) commands[cmdCount++] = segment->linearInit;
+            commands[cmdCount++] = segment->vk;
+            VkTimelineSemaphoreSubmitInfo tsi = { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = cmdCount, .pCommandBuffers = commands };
+            garnet_async_submit_order_t ord = { 0u, 0u };
+            if (orderSem != VK_NULL_HANDLE) {
+                ord = [queue rdna4NextOrderForCompute:YES];
+                tsi.signalSemaphoreValueCount = 1u;
+                tsi.pSignalSemaphoreValues = &ord.signal_value;
+                si.pNext = &tsi;
+                si.signalSemaphoreCount = 1u;
+                si.pSignalSemaphores = &orderSem;
+                if (ord.wait_value > 0u) {
+                    tsi.waitSemaphoreValueCount = 1u;
+                    tsi.pWaitSemaphoreValues = &ord.wait_value;
+                    si.waitSemaphoreCount = 1u;
+                    si.pWaitSemaphores = &orderSem;
+                    si.pWaitDstStageMask = &waitStage;
+                }
+            }
+            submitAttempted = YES;
+            r = vkQueueSubmit(RDNA4R.computeQ, 1, &si, fence);
+            if (r != VK_SUCCESS) atomic_store(&rdna4_submit_fault, (int)r);
+            else {
+                if (segment->linearInit)
+                    for (RDNA4Texture *texture in segment->touches)
+                        if ([texture rdna4IOSLinearNeedsInit]) [texture rdna4IOSLinearDidSubmit];
+                argumentSubmissionEpoch = rdna4_argument_next_submission_epoch();
+            }
+        }
+        pthread_mutex_unlock(&RDNA4R.computeQlock);
+    } else {
     uint64_t tLock = rdna4_now(); rdna4_qlock(); tLock = rdna4_now() - tLock;
     if (tLock > 250000000ull) RDNA4LOG("SUBMIT STALL: the queue lock was held for %.1f ms before command buffer %llu (a frame thread waits here: the display freezes)", (double)tLock / 1e6, (unsigned long long)_cbid);
     r = (VkResult)atomic_load(&rdna4_submit_fault);
@@ -2779,8 +3023,26 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
             if (segment->linearInit) commands[cmdCount++] = segment->linearInit;
             commands[cmdCount++] = segment->vk;
             if (segment->dispCopyVk && !elidedDispCopy) commands[cmdCount++] = segment->dispCopyVk;
+            VkTimelineSemaphoreSubmitInfo tsi = { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
             VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .commandBufferCount = cmdCount, .pCommandBuffers = commands };
+            garnet_async_submit_order_t ord = { 0u, 0u };
+            if (orderSem != VK_NULL_HANDLE) {
+                ord = [queue rdna4NextOrderForCompute:NO];
+                tsi.signalSemaphoreValueCount = 1u;
+                tsi.pSignalSemaphoreValues = &ord.signal_value;
+                si.pNext = &tsi;
+                si.signalSemaphoreCount = 1u;
+                si.pSignalSemaphores = &orderSem;
+                if (ord.wait_value > 0u) {
+                    tsi.waitSemaphoreValueCount = 1u;
+                    tsi.pWaitSemaphoreValues = &ord.wait_value;
+                    si.waitSemaphoreCount = 1u;
+                    si.pWaitSemaphores = &orderSem;
+                    si.pWaitDstStageMask = &waitStage;
+                }
+            }
             submitAttempted = YES;
             r = vkQueueSubmit(RDNA4R.q, 1, &si, fence);
             if (r != VK_SUCCESS) atomic_store(&rdna4_submit_fault, (int)r);
@@ -2793,6 +3055,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         }
     }
     pthread_mutex_unlock(&RDNA4R.qlock);
+    }
     if (elidedDispCopy && [queue respondsToSelector:@selector(rdna4NoteElidedDCopy)]) [queue rdna4NoteElidedDCopy];
     RDNA4LOGR("GPU segment submission result = %d (route=%s)", r, nativeDone ? "native-buffer" : "vulkan");
     if (submitAttempted || nativeDone) _submitAttempted = YES;
@@ -5740,6 +6003,7 @@ RDNA4_ENCODER_SHARED
         for (NSUInteger k = 0; sbas && k < RDNA4CNT_MAX_PASS_ATTACHMENTS; k++) {
             MTLComputePassSampleBufferAttachmentDescriptor *att = sbas[k];
             if (!att || !att.sampleBuffer) continue;
+            [_cb rdna4EnsureGfxSegment];
             id<RDNA4CounterSampleBufferInternal> csb = (id<RDNA4CounterSampleBufferInternal>)att.sampleBuffer;
             if (att.startOfEncoderSampleIndex != MTLCounterDontSample)
                 [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk]
@@ -5962,6 +6226,8 @@ RDNA4_DNR(RDNA4ComputeEncoder)
         [_cb rdna4Fail:[NSString stringWithFormat:@"compute sampleCountersInBuffer: %@", why ?: @"invalid"]];
         return;
     }
+    [_cb rdna4EnsureGfxSegment];
+    if ([_cb rdna4Error]) return;
     [csb rdna4SampleOnCommandBuffer:_cb vkCommandBuffer:[_cb vk] sampleIndex:sampleIndex barrier:barrier
                          stageFlags:(barrier ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
                                 who:"compute"];
@@ -6039,6 +6305,29 @@ RDNA4_ENCODER_SHARED
         _argumentWritable.count != 0 ||
         [_cb rdna4HasResidency] ||
         rdna4_rt_any_arg_owners();
+    if ([_cb rdna4CurrentSegmentIsCompute]) {
+        __block BOOL hasIncompatTex = NO;
+        if (_compStateDirty || needArgPrep) {
+            rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
+                (void)l; (void)writable;
+                if (hasIncompatTex) return;
+                const int isIos = [t rdna4IsIOS] ? 1 : 0;
+                const int isDs = ([t rdna4Aspects] & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) ? 1 : 0;
+                const VkImageLayout curL = [t layout];
+                const int inAtt = (curL == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+                                   curL == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) ? 1 : 0;
+                if (!garnet_async_compute_texture_ok(isIos, isDs, inAtt)) hasIncompatTex = YES;
+            });
+        }
+        const int hasIcbOrRt = (rdna4_icb_any_arg_owners() || rdna4_rt_any_arg_owners()) ? 1 : 0;
+        if (garnet_async_compute_needs_gfx_fallback(1, needArgPrep ? 1 : 0, hasIcbOrRt, hasIncompatTex ? 1 : 0)) {
+            [_cb rdna4EnsureGfxSegment];
+            if ([_cb rdna4Error]) return;
+            _compSegSerial = [_cb rdna4SegmentSerial];
+            _pendingSerialBarrier = NO;
+            [self rdna4ResetComputeCache];
+        }
+    }
     NSMutableSet *argumentResources = nil;
     if (needArgPrep) {
         if (_pendingSerialBarrier) {
@@ -6067,7 +6356,12 @@ RDNA4_ENCODER_SHARED
         if (!argumentsReady) return;
     }
     if (_compStateDirty || needArgPrep) {
-        rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) { rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE); rdna4_tex_to([self->_cb vk], t, l); });
+        const BOOL compSeg = [_cb rdna4CurrentSegmentIsCompute];
+        rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
+            rdna4_ios_usek(self->_cb, t, YES, writable, RDNA4DF_W_COMPUTE);
+            if (compSeg) rdna4_tex_to_compute([self->_cb vk], t, l);
+            else rdna4_tex_to([self->_cb vk], t, l);
+        });
     }
     if (rdna4_icb_any_arg_owners() || rdna4_rt_any_arg_owners()) {
         NSMutableSet *icbRefs = [NSMutableSet set];
@@ -6230,6 +6524,8 @@ RDNA4_ENCODER_SHARED
         [_cb rdna4Fail:@"compute executeCommandsInBuffer cannot execute a render indirect command buffer"];
         return;
     }
+    [_cb rdna4EnsureGfxSegment];
+    if ([_cb rdna4Error]) return;
     if ([icb rdna4UseGPUExecution]) {
         [self rdna4ResetComputeCache];
         _pendingSerialBarrier = NO;
@@ -6287,6 +6583,8 @@ RDNA4_ENCODER_SHARED
         [_cb rdna4Fail:@"compute executeCommandsInBuffer:indirectBuffer: cannot execute a render indirect command buffer"];
         return;
     }
+    [_cb rdna4EnsureGfxSegment];
+    if ([_cb rdna4Error]) return;
     [self rdna4ResetComputeCache];
     _pendingSerialBarrier = NO;
     [icb rdna4ExecuteComputeGPUOnEncoder:self
