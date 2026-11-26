@@ -5074,6 +5074,8 @@ RDNA4_ENCODER_SHARED
     if (buf && ![buf isKindOfClass:[RDNA4Buffer class]]) { [_cb rdna4Fail:@"setBuffer: not an RDNA4Buffer"]; return; }
     RDNA4StageState *s = [self rdna4Stage:f]; rdna4_stage_set_buf(s, i, buf, off);
     s->rt.as[i] = nil;
+    s->rt.ift[i] = nil;
+    s->rt.iftMask &= ~(1u << i);
     s->asMask &= ~(1u << i);
     _drawDirty |= f ? GARNET_DRAW_DIRTY_FSTAGE : (GARNET_DRAW_DIRTY_VSTAGE | GARNET_DRAW_DIRTY_VB);
     if (!f) _vbDirtyMask |= (1u << i);
@@ -5206,15 +5208,27 @@ RDNA4_ENCODER_SHARED
     RDNA4Buffer *backing = nil;
     if (!rdna4_rt_encoder_bind_ift(_cb, [_cb device], f ? "fragment" : "vertex", &s->rt, t, i, &backing)) return;
     [self rdna4SetBuffer:backing offset:0 index:i frag:f];
+    if (i < RDNA4RTR_MAX_BUFFER_SLOTS) {
+        s->rt.ift[i] = t;
+        if (t) s->rt.iftMask |= (1u << i);
+        else s->rt.iftMask &= ~(1u << i);
+    }
 }
 - (void)setVertexIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i {
     [self rdna4SetIntersectionFunctionTable:t atBufferIndex:i frag:NO];
 }
 - (void)setVertexIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
     if ([_cb rdna4Error]) return;
-    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "vertex", &[self rdna4Stage:NO]->rt, t, r,
+    RDNA4StageState *s = [self rdna4Stage:NO];
+    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "vertex", &s->rt, t, r,
                                      ^(RDNA4Buffer *buf, NSUInteger idx) {
                                          [self rdna4SetBuffer:buf offset:0 index:idx frag:NO];
+                                         id tbl = t[idx - r.location];
+                                         if (idx < RDNA4RTR_MAX_BUFFER_SLOTS) {
+                                             s->rt.ift[idx] = tbl;
+                                             if (tbl) s->rt.iftMask |= (1u << idx);
+                                             else s->rt.iftMask &= ~(1u << idx);
+                                         }
                                      });
 }
 - (void)setFragmentIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atBufferIndex:(NSUInteger)i {
@@ -5222,9 +5236,16 @@ RDNA4_ENCODER_SHARED
 }
 - (void)setFragmentIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
     if ([_cb rdna4Error]) return;
-    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "fragment", &[self rdna4Stage:YES]->rt, t, r,
+    RDNA4StageState *s = [self rdna4Stage:YES];
+    (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "fragment", &s->rt, t, r,
                                      ^(RDNA4Buffer *buf, NSUInteger idx) {
                                          [self rdna4SetBuffer:buf offset:0 index:idx frag:YES];
+                                         id tbl = t[idx - r.location];
+                                         if (idx < RDNA4RTR_MAX_BUFFER_SLOTS) {
+                                             s->rt.ift[idx] = tbl;
+                                             if (tbl) s->rt.iftMask |= (1u << idx);
+                                             else s->rt.iftMask &= ~(1u << idx);
+                                         }
                                      });
 }
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self rdna4SetBytes:p length:n index:i frag:NO]; }
@@ -5491,6 +5512,8 @@ RDNA4_ENCODER_SHARED
         (hasFrag && sc->sf.scanPlan && sc->sf.scanPlan->plan.count) ||
         _argumentResources.count != 0 ||
         _argumentWritable.count != 0 ||
+        sc->sv.rt.iftMask != 0 ||
+        (hasFrag && sc->sf.rt.iftMask != 0) ||
         [_cb rdna4HasResidency] ||
         rdna4_rt_any_arg_owners();
     if (needArgPrep) {
@@ -6130,6 +6153,8 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     if (i >= 31 || (b && ![b isKindOfClass:[RDNA4Buffer class]])) { [_cb rdna4Fail:@"compute setBuffer: bad index or class"]; return; }
     rdna4_stage_set_buf(&_st, i, b, o);
     _st.rt.as[i] = nil;
+    _st.rt.ift[i] = nil;
+    _st.rt.iftMask &= ~(1u << i);
     _compStateDirty = YES;
     [self rdna4OwnResource:nil kind:RDNA4_RESOURCE_ACCEL fragment:NO index:i];
     [self rdna4OwnResource:b kind:RDNA4_RESOURCE_BUFFER fragment:NO index:i];
@@ -6179,12 +6204,23 @@ RDNA4_DNR(RDNA4ComputeEncoder)
     RDNA4Buffer *backing = nil;
     if (!rdna4_rt_encoder_bind_ift(_cb, [_cb device], "compute", &_st.rt, t, i, &backing)) return;
     [self setBuffer:backing offset:0 atIndex:i];
+    if (i < RDNA4RTR_MAX_BUFFER_SLOTS) {
+        _st.rt.ift[i] = t;
+        if (t) _st.rt.iftMask |= (1u << i);
+        else _st.rt.iftMask &= ~(1u << i);
+    }
 }
 - (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained *)t withBufferRange:(NSRange)r {
     if ([_cb rdna4Error]) return;
     (void)rdna4_rt_encoder_bind_ifts(_cb, [_cb device], "compute", &_st.rt, t, r,
                                      ^(RDNA4Buffer *buf, NSUInteger idx) {
                                          [self setBuffer:buf offset:0 atIndex:idx];
+                                         id tbl = t[idx - r.location];
+                                         if (idx < RDNA4RTR_MAX_BUFFER_SLOTS) {
+                                             self->_st.rt.ift[idx] = tbl;
+                                             if (tbl) self->_st.rt.iftMask |= (1u << idx);
+                                             else self->_st.rt.iftMask &= ~(1u << idx);
+                                         }
                                      });
 }
 - (void)setTexture:(id)t atIndex:(NSUInteger)i {
@@ -6381,6 +6417,7 @@ RDNA4_ENCODER_SHARED
         (_st.scanPlan && _st.scanPlan->plan.count) ||
         _argumentResources.count != 0 ||
         _argumentWritable.count != 0 ||
+        _st.rt.iftMask != 0 ||
         [_cb rdna4HasResidency] ||
         rdna4_rt_any_arg_owners();
     if ([_cb rdna4CurrentSegmentIsCompute]) {

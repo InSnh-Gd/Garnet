@@ -208,7 +208,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
         _hpBlk = _hpLease = _hpBindOff = _hpPhysSize = 0; _hpDedicated = NO; \
     } \
 } while (0)
-#define RDNA4_RESOURCE_SPI \
+#define RDNA4_RESOURCE_SPI_CUSTOM_UID(uidExpr) \
     - (id)heap { return [self rdna4ResourceHeap]; } \
     - (NSUInteger)heapOffset { return [self rdna4ResourceHeapOffset]; } \
     - (BOOL)isAliasable { return [self rdna4ResourceAliasable]; } \
@@ -228,8 +228,9 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
     - (int)responsibleProcess { return _respSet ? _respPid : (int)getpid(); } \
     - (void)setResponsibleProcess:(int)p { _respPid = p; _respSet = YES; } \
     - (NSUInteger)unfilteredResourceOptions { return [self resourceOptions]; } \
-    - (uint64_t)uniqueIdentifier { return rdna4_resource_uid(&_uid); } \
+    - (uint64_t)uniqueIdentifier { return (uidExpr); } \
     - (MTLResourceID)gpuResourceID API_AVAILABLE(macos(13.0)) { MTLResourceID identifier; identifier._impl = self.uniqueIdentifier; return identifier; }
+#define RDNA4_RESOURCE_SPI RDNA4_RESOURCE_SPI_CUSTOM_UID(rdna4_resource_uid(&_uid))
 #define RDNA4_ENCODER_SHARED \
     - (void)useResource:(id)r usage:(NSUInteger)u { if (_ended) { [_cb rdna4Fail:@"useResource after endEncoding"]; return; } [_cb rdna4UseResource:r usage:u]; if (r && ![_cb rdna4Error]) { if (u & MTLResourceUsageWrite) { if (!_argumentWritable) _argumentWritable = [NSMutableSet set]; [_argumentWritable addObject:r]; } if (!_argumentResources) _argumentResources = [NSMutableSet set]; [_argumentResources addObject:r]; } } \
     - (void)useResource:(id)r usage:(NSUInteger)u stages:(NSUInteger)st { (void)st; [self useResource:r usage:u]; } \
@@ -410,6 +411,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
 - (id)device;
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure;
 - (VkDeviceAddress)rdna4DeviceAddress;
+- (VkDeviceAddress)rdna4BindlessGPUAddress;
 - (id)rdna4CurrentHandle;
 - (id)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
 - (uint32_t)rdna4AccelKind;
@@ -436,6 +438,8 @@ enum {
 typedef struct { MTLPixelFormat mtl; VkFormat vk; uint32_t bpp; uint32_t flags; } RDNA4Fmt;
 typedef struct {
     __unsafe_unretained id as[RDNA4RTR_MAX_BUFFER_SLOTS];
+    __unsafe_unretained id ift[RDNA4RTR_MAX_BUFFER_SLOTS];
+    uint32_t iftMask;
 } RDNA4RTStageSlots;
 typedef struct {
     __unsafe_unretained RDNA4Buffer *b;
@@ -1076,6 +1080,7 @@ typedef struct {
 - (VkSampler)rdna4SamplerComparison:(BOOL)comparison error:(NSError **)err;
 - (VkSampler)rdna4SamplerComparison:(BOOL)comparison normalizedCoordinates:(BOOL)normalized error:(NSError **)err;
 - (BOOL)rdna4PixelCoordinates;
+- (MTLResourceID)gpuResourceID API_AVAILABLE(macos(13.0));
 @end
 
 @interface RDNA4DepthStencilState : NSObject { id _dev; NSString *_lbl; MTLDepthStencilDescriptor *_d; RDNA4DSInfo _info; }
@@ -1245,6 +1250,7 @@ typedef struct {
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)functionTable atBufferIndex:(NSUInteger)bufferIndex;
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained *)functionTables withBufferRange:(NSRange)bufferRange;
 - (RDNA4Buffer *)rdna4BackingBuffer;
+- (uint64_t)rdna4BackingGPUAddress;
 - (NSUInteger)rdna4FunctionCount;
 - (uint32_t)rdna4HandleIdAtIndex:(NSUInteger)index;
 - (uint64_t)rdna4OwnerToken;
@@ -1786,6 +1792,7 @@ typedef struct {
 @interface RDNA4ArgumentSamplerAlias : NSObject
 @property (nonatomic, weak) id object;
 @property (nonatomic, weak) id device;
+@property BOOL bindlessQueried;
 @end
 
 @interface RDNA4ArgumentResourceToken : NSObject
@@ -2083,6 +2090,7 @@ typedef struct {
 @public
     VkBuffer _buf;
     VkDeviceMemory _mem;
+    VkDeviceAddress _deviceAddress;
     uint64_t _backingSize;
     uint64_t _allocatedSize;
 }
@@ -2115,6 +2123,7 @@ typedef struct {
 - (GarnetASHandle *)rdna4CurrentHandle;
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure;
 - (VkDeviceAddress)rdna4DeviceAddress;
+- (VkDeviceAddress)rdna4BindlessGPUAddress;
 - (rdna4rt_accel_meta_t)rdna4MetaSnapshot;
 - (void)rdna4SetMeta:(rdna4rt_accel_meta_t)meta;
 - (uint32_t)rdna4AccelKind;
@@ -3582,6 +3591,7 @@ GARNET_INTERNAL_EXTERN BOOL rdna4nc_stage_writes(const RDNA4StageState *state, N
                                  const char *stage, uint32_t *warned);
 GARNET_INTERNAL_EXTERN void rdna4_argument_stage_resources(NSMutableSet *resources, NSMutableSet *writable,
         const RDNA4PB *bindings, uint32_t count, const RDNA4StageState *state, NSArray *arguments);
+GARNET_INTERNAL_EXTERN uint64_t rdna4_argument_resource_token_bindless(id object, id device, BOOL texture, BOOL markBindless);
 GARNET_INTERNAL_EXTERN RDNA4Buffer *rdna4_dummy_buffer(id dev);
 GARNET_INTERNAL_EXTERN RDNA4Texture *rdna4_dummy_texture(id dev);
 GARNET_INTERNAL_EXTERN RDNA4Texture *rdna4_dummy_texture_write(id dev);

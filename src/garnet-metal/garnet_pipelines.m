@@ -2147,6 +2147,13 @@ GARNET_INTERNAL void rdna4_argument_stage_resources(NSMutableSet *resources, NSM
             if (!(known & (1u << index))) [writable addObject:buffer];
         }
     }
+    uint32_t iftMask = state->rt.iftMask;
+    while (iftMask) {
+        uint32_t idx = (uint32_t)__builtin_ctz(iftMask);
+        iftMask &= (iftMask - 1u);
+        if (idx < RDNA4RTR_MAX_BUFFER_SLOTS && state->rt.ift[idx])
+            [resources addObject:state->rt.ift[idx]];
+    }
 }
 
 #pragma clang diagnostic pop

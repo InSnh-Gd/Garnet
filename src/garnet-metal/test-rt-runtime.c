@@ -84,6 +84,7 @@ static void test_capabilities_and_footnote10(void) {
     CHECK(!rdna4rtr_binding_to_metal_index(30u, 2u, &midx), "binding 30 count 2 OOB");
     CHECK(!rdna4rtr_binding_to_metal_index(0u, 0u, &midx), "count 0 rejected");
     CHECK(GARNETX_CAP_RT_POSITION_FETCH == (1u << 9), "GARNETX_CAP_RT_POSITION_FETCH == 1<<9");
+    CHECK(GARNETX_CAP_RT_IFT_ABI_V2 == (1u << 10), "GARNETX_CAP_RT_IFT_ABI_V2 == 1<<10");
 }
 
 static void test_as_reflection_json(void) {
@@ -339,6 +340,23 @@ static void test_ift_reflection_json(void) {
         "\"handles\":[]}}";
     CHECK(rdna4rtr_parse_ift_json(dup_tbl, strlen(dup_tbl), &r) == RDNA4RTR_ERR_DUPLICATE,
           "duplicate IFT table metal_index rejected");
+
+    // Wave 2 IFT ABI v2 reflection (abi_version=2, header_words=66) accepted; mismatched header rejected.
+    const char *v2_doc =
+        "{\"intersection_function_tables\":{\"abi_version\":2,\"header_words\":66,"
+        "\"tables\":[{\"param_index\":1,\"metal_index\":1,\"descriptor\":{\"set\":0,\"binding\":1,\"count\":1}}],"
+        "\"handles\":[{\"handle_id\":1,\"symbol\":\"ift_full_cb\",\"kind\":\"BoundingBox\"}]}}";
+    CHECK(rdna4rtr_parse_ift_json(v2_doc, strlen(v2_doc), &r) == RDNA4RTR_OK &&
+          r.present == 1u && r.abi_version == 2u && r.header_words == 66u &&
+          r.table_count == 1u && r.handle_count == 1u,
+          "IFT ABI v2 reflection JSON accepted");
+    rdna4rtr_ift_refl_destroy(&r);
+
+    const char *v2_bad_hdr =
+        "{\"intersection_function_tables\":{\"abi_version\":2,\"header_words\":1,"
+        "\"tables\":[],\"handles\":[]}}";
+    CHECK(rdna4rtr_parse_ift_json(v2_bad_hdr, strlen(v2_bad_hdr), &r) == RDNA4RTR_ERR_ABI_MISMATCH,
+          "IFT ABI v2 with header_words=1 rejected");
 }
 
 static void test_ir_kind_inference(void) {
@@ -492,6 +510,39 @@ static void test_ift_encoder_and_dispatch_sim(void) {
     CHECK(dr.computed_slot == 9u && dr.out_of_bounds == 1u && dr.handle_id == 0u &&
           dr.action == RDNA4RTR_DISPATCH_SKIP_AABB,
           "OOB slot 9 -> safe skip on AABB");
+    rdna4rtr_ift_destroy(&t);
+
+    // 3. Wave 2 IFT ABI v2: 66-word header with attached_bda[31] + handle_id[] starting at word 66.
+    rdna4rtr_ift_table_t t2;
+    CHECK(rdna4rtr_ift_init_with_abi(&t2, 4u, 2u, 99u) == RDNA4RTR_ERR_ABI_MISMATCH,
+          "invalid ABI version rejected");
+    CHECK(rdna4rtr_ift_init_with_abi(&t2, 4u, 2u, RDNA4RTR_IFT_ABI_VERSION_V2) == RDNA4RTR_OK,
+          "IFT ABI v2 init");
+    CHECK(rdna4rtr_ift_buffer_words_for_abi(4u, RDNA4RTR_IFT_ABI_VERSION_V2) == 70u &&
+          rdna4rtr_ift_aligned_buffer_bytes_for_abi(4u, RDNA4RTR_IFT_ABI_VERSION_V2) == 288u,
+          "IFT ABI v2 buffer sizing (66+4=70 words -> 288B aligned)");
+    const uint64_t bda0 = UINT64_C(0x0000123456789AB0);
+    const uint64_t bda2 = UINT64_C(0x0000FEDCBA987650);
+    CHECK(rdna4rtr_ift_set_attached_bda(&t2, 0u, bda0) == RDNA4RTR_OK, "attach BDA slot 0");
+    CHECK(rdna4rtr_ift_set_attached_bda(&t2, 2u, bda2) == RDNA4RTR_OK, "attach BDA slot 2");
+    CHECK(rdna4rtr_ift_set_attached_bda(&t2, 31u, bda0) == RDNA4RTR_ERR_BOUNDS, "attach BDA slot 31 OOB");
+    CHECK(rdna4rtr_ift_set_function(&t2, 1u, 2u, RDNA4RTR_IFT_KIND_BOUNDING_BOX) == RDNA4RTR_OK, "v2 slot 1 -> handle 2");
+    uint32_t w2[72];
+    size_t written2 = 0;
+    CHECK(rdna4rtr_ift_encode(&t2, w2, 65u, &written2) == RDNA4RTR_ERR_BOUNDS, "undersized v2 buffer rejected");
+    CHECK(rdna4rtr_ift_encode(&t2, w2, 72u, &written2) == RDNA4RTR_OK && written2 == 70u, "v2 encode writes 70 words");
+    CHECK(w2[0] == 4u && w2[1] == 2u && w2[2] == ((1u << 0) | (1u << 2)) && w2[3] == 0u, "v2 header words 0..3 exact");
+    uint64_t read_bda = 0u;
+    CHECK(rdna4rtr_ift_read_attached_bda(w2, written2, 0u, &read_bda) == RDNA4RTR_OK && read_bda == bda0, "read attached BDA 0");
+    CHECK(rdna4rtr_ift_read_attached_bda(w2, written2, 1u, &read_bda) == RDNA4RTR_OK && read_bda == 0u, "read attached BDA 1 == 0");
+    CHECK(rdna4rtr_ift_read_attached_bda(w2, written2, 2u, &read_bda) == RDNA4RTR_OK && read_bda == bda2, "read attached BDA 2");
+    CHECK(w2[66] == 0u && w2[67] == 2u && w2[68] == 0u && w2[69] == 0u, "v2 handles stored at word[66 + slot]");
+    rdna4rtr_ift_simulate_dispatch_abi(w2, written2, RDNA4RTR_IFT_ABI_VERSION_V2, 1, 1u, 0u, 0, 1, &dr);
+    CHECK(dr.computed_slot == 1u && dr.handle_id == 2u && !dr.out_of_bounds && dr.action == RDNA4RTR_DISPATCH_CALL_HANDLE,
+          "v2 dispatch sim reads handle 2 at word[67]");
+    rdna4rtr_ift_destroy(&t2);
+    // Re-init empty dummy for trailing destroy below.
+    (void)rdna4rtr_ift_init(&t, 0u, 0u);
 
     rdna4rtr_ift_destroy(&t);
 }
@@ -641,9 +692,21 @@ static void test_source_pins(void) {
     CHECK(args != NULL, "read garnet_arguments.m for IFT/VFT backing BDA registry pin");
     if (args) {
         CHECK(strstr(args, "[object isKindOfClass:[RDNA4IntersectionFunctionTable class]]") != NULL &&
-              strstr(args, "rdna4BackingBuffer") != NULL,
-              "rdna4PrepareArguments registers IFT/VFT backing buffers in BufferAddressTable");
+              strstr(args, "rdna4BackingBuffer") != NULL &&
+              strstr(args, "rdna4AttachedBufferAtIndex:") != NULL &&
+              strstr(args, "bindlessQueried") != NULL,
+              "rdna4PrepareArguments registers IFT attached buffers and honors bindlessQueried samplers");
         free(args);
+    }
+
+    char *res = read_source_file("src/garnet-metal/garnet_resources.m", "garnet_resources.m");
+    CHECK(res != NULL, "read garnet_resources.m for Wave 2 Bindless Bridges 1 & 2 pins");
+    if (res) {
+        CHECK(strstr(res, "rdna4_argument_resource_token_bindless(self, _dev, YES, YES)") != NULL,
+              "Bridge 1: RDNA4Texture unifies uniqueIdentifier/gpuResourceID to 0x5244 token");
+        CHECK(strstr(res, "rdna4_argument_resource_token_bindless(self, _dev, NO, YES)") != NULL,
+              "Bridge 2: RDNA4SamplerState.gpuResourceID marks bindlessQueried");
+        free(res);
     }
 
     char *live = read_source_file("src/garnet-metal/test-metal3-raytracing.m", "test-metal3-raytracing.m");

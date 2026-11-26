@@ -37,10 +37,21 @@
 #ifndef GARNETX_CAP_RT_POSITION_FETCH
 #define GARNETX_CAP_RT_POSITION_FETCH       (1u << 9)
 #endif
+#ifndef GARNETX_CAP_RT_IFT_ABI_V2
+#define GARNETX_CAP_RT_IFT_ABI_V2           (1u << 10)
+#endif
 
-// Exact 0077 IFT buffer ABI constants (`word[0]=slot_count, word[1+slot]=handle_id`).
+// Exact 0077 / Wave 2 IFT buffer ABI constants:
+//   ABI v1: word[0]=slot_count, word[1+slot]=handle_id
+//   ABI v2: word[0]=slot_count, word[1]=2, word[2]=attached_buf_mask, word[3]=0,
+//           word[4..65]=u64 attached_bda[31] (lo, hi), word[66+slot]=handle_id
 #define RDNA4RTR_IFT_ABI_VERSION        UINT32_C(1)
 #define RDNA4RTR_IFT_HEADER_WORDS       UINT32_C(1)
+#define RDNA4RTR_IFT_ABI_VERSION_V1     UINT32_C(1)
+#define RDNA4RTR_IFT_HEADER_WORDS_V1    UINT32_C(1)
+#define RDNA4RTR_IFT_ABI_VERSION_V2     UINT32_C(2)
+#define RDNA4RTR_IFT_HEADER_WORDS_V2    UINT32_C(66)
+#define RDNA4RTR_IFT_V2_ATTACH_WORD_BASE UINT32_C(4)
 #define RDNA4RTR_IFT_HANDLE_NULL        UINT32_C(0)
 
 // Exact 0077 acceleration structure BDA ABI tag.
@@ -885,8 +896,10 @@ static inline rdna4rtr_status_t rdna4rtr_parse_ift_obj_cur(rdna4rtr_jcur_t *c,
     }
 
     if (!have_abi || !have_hdr || !have_tables || !have_handles) { st = RDNA4RTR_ERR_JSON; goto fail; }
-    if (out->abi_version != RDNA4RTR_IFT_ABI_VERSION ||
-        out->header_words != RDNA4RTR_IFT_HEADER_WORDS) {
+    if (!((out->abi_version == RDNA4RTR_IFT_ABI_VERSION_V1 &&
+           out->header_words == RDNA4RTR_IFT_HEADER_WORDS_V1) ||
+          (out->abi_version == RDNA4RTR_IFT_ABI_VERSION_V2 &&
+           out->header_words == RDNA4RTR_IFT_HEADER_WORDS_V2))) {
         st = RDNA4RTR_ERR_ABI_MISMATCH;
         goto fail;
     }
@@ -1099,28 +1112,53 @@ typedef struct {
 typedef struct {
     uint32_t slot_count;
     uint32_t max_handle_id;
+    uint32_t abi_version;
+    uint32_t attached_buf_mask;
+    uint64_t attached_bda[RDNA4RTR_MAX_ATTACH_BUFFERS];
     rdna4rtr_ift_slot_t *slots;
 } rdna4rtr_ift_table_t;
 
-static inline size_t rdna4rtr_ift_buffer_words(uint32_t slot_count) {
-    return (size_t)RDNA4RTR_IFT_HEADER_WORDS + (size_t)slot_count;
+static inline uint32_t rdna4rtr_ift_header_words_for_abi(uint32_t abi_version) {
+    return (abi_version == RDNA4RTR_IFT_ABI_VERSION_V2)
+        ? RDNA4RTR_IFT_HEADER_WORDS_V2
+        : RDNA4RTR_IFT_HEADER_WORDS_V1;
 }
 
-static inline size_t rdna4rtr_ift_buffer_bytes(uint32_t slot_count) {
-    return rdna4rtr_ift_buffer_words(slot_count) * sizeof(uint32_t);
+static inline size_t rdna4rtr_ift_buffer_words_for_abi(uint32_t slot_count, uint32_t abi_version) {
+    return (size_t)rdna4rtr_ift_header_words_for_abi(abi_version) + (size_t)slot_count;
 }
 
-static inline size_t rdna4rtr_ift_aligned_buffer_bytes(uint32_t slot_count) {
-    size_t raw = rdna4rtr_ift_buffer_bytes(slot_count);
+static inline size_t rdna4rtr_ift_buffer_bytes_for_abi(uint32_t slot_count, uint32_t abi_version) {
+    return rdna4rtr_ift_buffer_words_for_abi(slot_count, abi_version) * sizeof(uint32_t);
+}
+
+static inline size_t rdna4rtr_ift_aligned_buffer_bytes_for_abi(uint32_t slot_count, uint32_t abi_version) {
+    size_t raw = rdna4rtr_ift_buffer_bytes_for_abi(slot_count, abi_version);
     size_t aligned = (raw + 15u) & ~(size_t)15u;
     return aligned < 16u ? 16u : aligned;
 }
 
-static inline rdna4rtr_status_t rdna4rtr_ift_init(rdna4rtr_ift_table_t *t,
-                                                  uint32_t slot_count,
-                                                  uint32_t max_handle_id) {
+static inline size_t rdna4rtr_ift_buffer_words(uint32_t slot_count) {
+    return rdna4rtr_ift_buffer_words_for_abi(slot_count, RDNA4RTR_IFT_ABI_VERSION_V1);
+}
+
+static inline size_t rdna4rtr_ift_buffer_bytes(uint32_t slot_count) {
+    return rdna4rtr_ift_buffer_bytes_for_abi(slot_count, RDNA4RTR_IFT_ABI_VERSION_V1);
+}
+
+static inline size_t rdna4rtr_ift_aligned_buffer_bytes(uint32_t slot_count) {
+    return rdna4rtr_ift_aligned_buffer_bytes_for_abi(slot_count, RDNA4RTR_IFT_ABI_VERSION_V1);
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_init_with_abi(rdna4rtr_ift_table_t *t,
+                                                           uint32_t slot_count,
+                                                           uint32_t max_handle_id,
+                                                           uint32_t abi_version) {
     if (!t) return RDNA4RTR_ERR_INVALID;
     memset(t, 0, sizeof *t);
+    if (abi_version != RDNA4RTR_IFT_ABI_VERSION_V1 &&
+        abi_version != RDNA4RTR_IFT_ABI_VERSION_V2)
+        return RDNA4RTR_ERR_ABI_MISMATCH;
     if (slot_count > RDNA4RTR_MAX_IFT_SLOTS || max_handle_id > RDNA4RTR_MAX_IFT_HANDLES)
         return RDNA4RTR_ERR_BOUNDS;
     if (slot_count > 0u) {
@@ -1129,7 +1167,31 @@ static inline rdna4rtr_status_t rdna4rtr_ift_init(rdna4rtr_ift_table_t *t,
     }
     t->slot_count = slot_count;
     t->max_handle_id = max_handle_id;
+    t->abi_version = abi_version;
     return RDNA4RTR_OK;
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_init(rdna4rtr_ift_table_t *t,
+                                                  uint32_t slot_count,
+                                                  uint32_t max_handle_id) {
+    return rdna4rtr_ift_init_with_abi(t, slot_count, max_handle_id, RDNA4RTR_IFT_ABI_VERSION_V1);
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_set_attached_bda(rdna4rtr_ift_table_t *t,
+                                                              uint32_t index,
+                                                              uint64_t bda) {
+    if (!t) return RDNA4RTR_ERR_INVALID;
+    if (index >= RDNA4RTR_MAX_ATTACH_BUFFERS) return RDNA4RTR_ERR_BOUNDS;
+    t->attached_bda[index] = bda;
+    if (bda != 0u) t->attached_buf_mask |= (UINT32_C(1) << index);
+    else t->attached_buf_mask &= ~(UINT32_C(1) << index);
+    return RDNA4RTR_OK;
+}
+
+static inline uint64_t rdna4rtr_ift_get_attached_bda(const rdna4rtr_ift_table_t *t,
+                                                     uint32_t index) {
+    if (!t || index >= RDNA4RTR_MAX_ATTACH_BUFFERS) return 0u;
+    return t->attached_bda[index];
 }
 
 static inline void rdna4rtr_ift_destroy(rdna4rtr_ift_table_t *t) {
@@ -1282,16 +1344,45 @@ static inline rdna4rtr_status_t rdna4rtr_ift_encode(const rdna4rtr_ift_table_t *
                                                     size_t dst_word_cap,
                                                     size_t *written_words_out) {
     if (!t || !dst_words) return RDNA4RTR_ERR_INVALID;
-    size_t need = rdna4rtr_ift_buffer_words(t->slot_count);
+    uint32_t abi = (t->abi_version == RDNA4RTR_IFT_ABI_VERSION_V2)
+        ? RDNA4RTR_IFT_ABI_VERSION_V2
+        : RDNA4RTR_IFT_ABI_VERSION_V1;
+    uint32_t hdr = rdna4rtr_ift_header_words_for_abi(abi);
+    size_t need = (size_t)hdr + (size_t)t->slot_count;
     if (dst_word_cap < need) return RDNA4RTR_ERR_BOUNDS;
     dst_words[0] = t->slot_count;
+    if (abi == RDNA4RTR_IFT_ABI_VERSION_V2) {
+        dst_words[1] = RDNA4RTR_IFT_ABI_VERSION_V2;
+        dst_words[2] = t->attached_buf_mask;
+        dst_words[3] = 0u;
+        for (uint32_t i = 0; i < RDNA4RTR_MAX_ATTACH_BUFFERS; i++) {
+            uint64_t addr = t->attached_bda[i];
+            dst_words[RDNA4RTR_IFT_V2_ATTACH_WORD_BASE + 2u * i]      = (uint32_t)(addr & UINT64_C(0xFFFFFFFF));
+            dst_words[RDNA4RTR_IFT_V2_ATTACH_WORD_BASE + 2u * i + 1u] = (uint32_t)(addr >> 32);
+        }
+    }
     for (uint32_t i = 0; i < t->slot_count; i++)
-        dst_words[RDNA4RTR_IFT_HEADER_WORDS + i] = t->slots[i].handle_id;
+        dst_words[hdr + i] = t->slots[i].handle_id;
     if (written_words_out) *written_words_out = need;
     return RDNA4RTR_OK;
 }
 
-// Host mirror of 0077 ray_query_air.rs IFT lookup + dispatch switch (for unit verification).
+static inline rdna4rtr_status_t rdna4rtr_ift_read_attached_bda(const uint32_t *words,
+                                                               size_t word_count,
+                                                               uint32_t index,
+                                                               uint64_t *bda_out) {
+    if (!bda_out) return RDNA4RTR_ERR_INVALID;
+    *bda_out = 0u;
+    if (!words || word_count < RDNA4RTR_IFT_HEADER_WORDS_V2) return RDNA4RTR_ERR_BOUNDS;
+    if (words[1] != RDNA4RTR_IFT_ABI_VERSION_V2) return RDNA4RTR_ERR_ABI_MISMATCH;
+    if (index >= RDNA4RTR_MAX_ATTACH_BUFFERS) return RDNA4RTR_ERR_BOUNDS;
+    uint64_t lo = (uint64_t)words[RDNA4RTR_IFT_V2_ATTACH_WORD_BASE + 2u * index];
+    uint64_t hi = (uint64_t)words[RDNA4RTR_IFT_V2_ATTACH_WORD_BASE + 2u * index + 1u];
+    *bda_out = lo | (hi << 32);
+    return RDNA4RTR_OK;
+}
+
+// Host mirror of 0077 / Wave 2 ray_query_air.rs IFT lookup + dispatch switch (for unit verification).
 typedef enum {
     RDNA4RTR_DISPATCH_CONFIRM_TRIANGLE = 0, // handle_id==0 on triangle -> OpRayQueryConfirmIntersectionKHR
     RDNA4RTR_DISPATCH_SKIP_AABB        = 1, // handle_id==0 on AABB -> safe skip (no confirm)
@@ -1305,6 +1396,36 @@ typedef struct {
     rdna4rtr_ift_dispatch_action_t action;
 } rdna4rtr_ift_dispatch_result_t;
 
+static inline void rdna4rtr_ift_simulate_dispatch_abi(const uint32_t *words,
+                                                      size_t word_count,
+                                                      uint32_t abi_version,
+                                                      int is_instancing,
+                                                      uint32_t cand_sbt_offset,
+                                                      uint32_t cand_geom_index,
+                                                      int32_t function_table_offset,
+                                                      int is_aabb,
+                                                      rdna4rtr_ift_dispatch_result_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    uint32_t hdr = rdna4rtr_ift_header_words_for_abi(abi_version);
+    uint32_t fto_safe = (function_table_offset < 0) ? 0u : (uint32_t)function_table_offset;
+    uint32_t slot = (is_instancing ? cand_sbt_offset : 0u) + cand_geom_index + fto_safe;
+    out->computed_slot = slot;
+    uint32_t slot_count = (words && word_count >= (size_t)hdr) ? words[0] : 0u;
+    if (slot >= slot_count || (size_t)hdr + (size_t)slot >= word_count) {
+        out->out_of_bounds = 1u;
+        out->handle_id = RDNA4RTR_IFT_HANDLE_NULL;
+    } else {
+        out->out_of_bounds = 0u;
+        out->handle_id = words[hdr + slot];
+    }
+    if (out->handle_id == RDNA4RTR_IFT_HANDLE_NULL) {
+        out->action = is_aabb ? RDNA4RTR_DISPATCH_SKIP_AABB : RDNA4RTR_DISPATCH_CONFIRM_TRIANGLE;
+    } else {
+        out->action = RDNA4RTR_DISPATCH_CALL_HANDLE;
+    }
+}
+
 static inline void rdna4rtr_ift_simulate_dispatch(const uint32_t *words,
                                                   size_t word_count,
                                                   int is_instancing,
@@ -1313,24 +1434,9 @@ static inline void rdna4rtr_ift_simulate_dispatch(const uint32_t *words,
                                                   int32_t function_table_offset,
                                                   int is_aabb,
                                                   rdna4rtr_ift_dispatch_result_t *out) {
-    if (!out) return;
-    memset(out, 0, sizeof *out);
-    uint32_t fto_safe = (function_table_offset < 0) ? 0u : (uint32_t)function_table_offset;
-    uint32_t slot = (is_instancing ? cand_sbt_offset : 0u) + cand_geom_index + fto_safe;
-    out->computed_slot = slot;
-    uint32_t slot_count = (words && word_count >= RDNA4RTR_IFT_HEADER_WORDS) ? words[0] : 0u;
-    if (slot >= slot_count || (size_t)RDNA4RTR_IFT_HEADER_WORDS + (size_t)slot >= word_count) {
-        out->out_of_bounds = 1u;
-        out->handle_id = RDNA4RTR_IFT_HANDLE_NULL;
-    } else {
-        out->out_of_bounds = 0u;
-        out->handle_id = words[RDNA4RTR_IFT_HEADER_WORDS + slot];
-    }
-    if (out->handle_id == RDNA4RTR_IFT_HANDLE_NULL) {
-        out->action = is_aabb ? RDNA4RTR_DISPATCH_SKIP_AABB : RDNA4RTR_DISPATCH_CONFIRM_TRIANGLE;
-    } else {
-        out->action = RDNA4RTR_DISPATCH_CALL_HANDLE;
-    }
+    rdna4rtr_ift_simulate_dispatch_abi(words, word_count, RDNA4RTR_IFT_ABI_VERSION_V1,
+                                       is_instancing, cand_sbt_offset, cand_geom_index,
+                                       function_table_offset, is_aabb, out);
 }
 
 // =================================================================================================

@@ -2935,7 +2935,8 @@ RDNA4_DNR(RDNA4Texture)
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_opts & 0xF); }
 - (MTLHazardTrackingMode)hazardTrackingMode { return (MTLHazardTrackingMode)((_opts >> 8) & 0x3); }
 // ---- gap census: MTLResource / MTLTexture surface sent by QuartzCore, SkyLight and Metal ----
-RDNA4_RESOURCE_SPI
+// Bridge 1 (Metal 3 Bindless): unify texture uniqueIdentifier & gpuResourceID to the ABI-10 0x5244... token when device-bound.
+RDNA4_RESOURCE_SPI_CUSTOM_UID(_dev ? (rdna4_argument_resource_token_bindless(self, _dev, YES, YES) ?: rdna4_resource_uid(&_uid)) : rdna4_resource_uid(&_uid))
 - (id)rootResource { return _root ? [_root rootResource] : self; }
 - (BOOL)isShareable { return NO; }
 - (id)newSharedTextureHandle { RDNA4_ONCE("newSharedTextureHandle: shared texture handles are not implemented; nil"); return nil; }
@@ -4129,6 +4130,15 @@ RDNA4_DNR(RDNA4SamplerState)
     return rdna4_sampler_storage_handle(_storage, comparison, normalized, err);
 }
 - (BOOL)supportArgumentBuffers { return _argumentBuffers; }
+- (MTLResourceID)gpuResourceID API_AVAILABLE(macos(13.0)) {
+    MTLResourceID identifier = { 0 };
+    if (!_argumentBuffers) {
+        RDNA4_ONCE("RDNA4SamplerState.gpuResourceID: sampler created with supportArgumentBuffers=NO; returning 0");
+        return identifier;
+    }
+    identifier._impl = rdna4_argument_resource_token_bindless(self, _dev, NO, YES);
+    return identifier;
+}
 - (id)device { return _dev; }
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }

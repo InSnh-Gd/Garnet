@@ -1125,6 +1125,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     work.useStage3 = wantStage3 ? 1 : 0;
     work.caps = rdna4_query_caps();
     if (RDNA4R.rtPositionFetch) work.caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
+    work.caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
     work.lowerArgs = RDNA4R.gpuArgumentTables ? 1 : 0;
 
     int rc = RDNA4X_E_IO;
@@ -4234,6 +4235,7 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 }
 
 - (RDNA4Buffer *)rdna4BackingBuffer { return _backing; }
+- (uint64_t)rdna4BackingGPUAddress { return _backing ? [_backing gpuAddress] : 0u; }
 - (NSUInteger)rdna4FunctionCount { return (NSUInteger)_table.slot_count; }
 - (uint64_t)rdna4OwnerToken { return _ownerToken; }
 - (NSUInteger)rdna4Stage { return _stage; }
@@ -4304,7 +4306,8 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 - (BOOL)rdna4ResourceAliasable { return NO; }
 - (void)rdna4ResourceMakeAliasable {}
 - (BOOL)rdna4ResourceAliases:(id)other { (void)other; return NO; }
-RDNA4_RESOURCE_SPI
+// Bridge 3 (Metal 3 Bindless): return backing GPU BDA for gpuResourceID.
+RDNA4_RESOURCE_SPI_CUSTOM_UID(_backing ? [_backing gpuAddress] : rdna4_resource_uid(&_uid))
 
 @end
 

@@ -1300,18 +1300,41 @@ static _Atomic uint64_t rdna4_argument_pool_descriptors;
 @end
 #endif // !defined(RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST) && !defined(GARNET_ARGUMENT_SUMMARY_OWNERS_ONLY)
 #if !defined(RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST) && !defined(GARNET_ARGUMENT_SUMMARY_OWNERS_ONLY)
+static BOOL rdna4_argument_sampler_scope_work(
+        id device, RDNA4Buffer *buffer, const rdna4_as_work *work,
+        NSDictionary *__strong *live, NSMutableSet *samplers,
+        NSMutableArray<NSDictionary *> *writes, NSString **why);
 @implementation RDNA4CommandBuffer (RDNA4ArgumentCommands)
 - (BOOL)rdna4PrepareArguments:(const RDNA4ArgumentTables *)tables resources:(NSSet *)resources writable:(NSSet *)writable scan:(const RDNA4ArgumentScanPrepared *)scan textures:(void (^)(RDNA4Texture *, VkImageLayout, BOOL))prepare {
     NSSet *residency = [self rdna4ResidencyDeclaredResources];
     if (residency.count) resources = resources ? [resources setByAddingObjectsFromSet:residency] : residency;
     NSMutableSet<RDNA4Buffer *> *bufferResources = [NSMutableSet set];
+    NSMutableSet<RDNA4Buffer *> *iftAttachedBuffers = nil;
     for (id object in resources) {
         // Declarations remain active when an encoder continues in a new segment.
         [self rdna4RetainArgument:object];
         if ([object isKindOfClass:[RDNA4Buffer class]]) [bufferResources addObject:object];
-        if ([object isKindOfClass:[RDNA4IntersectionFunctionTable class]] ||
-            [object isKindOfClass:[RDNA4VisibleFunctionTable class]]) {
-            RDNA4Buffer *backing = [(RDNA4IntersectionFunctionTable *)object rdna4BackingBuffer];
+        if ([object isKindOfClass:[RDNA4IntersectionFunctionTable class]]) {
+            RDNA4IntersectionFunctionTable *ift = (RDNA4IntersectionFunctionTable *)object;
+            RDNA4Buffer *backing = [ift rdna4BackingBuffer];
+            if (backing) { [self rdna4RetainArgument:backing]; [bufferResources addObject:backing]; }
+            for (uint32_t i = 0; i < RDNA4RTR_MAX_ATTACH_BUFFERS; ++i) {
+                RDNA4Buffer *att = [ift rdna4AttachedBufferAtIndex:i offset:NULL];
+                if (att) {
+                    [self rdna4RetainArgument:att];
+                    [bufferResources addObject:att];
+                    if (!iftAttachedBuffers) iftAttachedBuffers = [NSMutableSet set];
+                    [iftAttachedBuffers addObject:att];
+                }
+                RDNA4VisibleFunctionTable *nvft = [ift rdna4NestedVFTAtBufferIndex:i];
+                if (nvft) {
+                    [self rdna4RetainArgument:nvft];
+                    RDNA4Buffer *nbacking = [nvft rdna4BackingBuffer];
+                    if (nbacking) { [self rdna4RetainArgument:nbacking]; [bufferResources addObject:nbacking]; }
+                }
+            }
+        } else if ([object isKindOfClass:[RDNA4VisibleFunctionTable class]]) {
+            RDNA4Buffer *backing = [(RDNA4VisibleFunctionTable *)object rdna4BackingBuffer];
             if (backing) { [self rdna4RetainArgument:backing]; [bufferResources addObject:backing]; }
         }
         if ([object isKindOfClass:[RDNA4Heap class]])
@@ -1335,6 +1358,32 @@ static _Atomic uint64_t rdna4_argument_pool_descriptors;
                                       &scopeError)) {
         [self rdna4Fail:scopeError ?: @"argument sampler scope failed"];
         return NO;
+    }
+    if (iftAttachedBuffers.count) {
+        NSDictionary *iftLive = nil;
+        for (RDNA4Buffer *att in iftAttachedBuffers) {
+            if (att.device != [self device] || [att isAliasable] || att.length < RDNA4_AS_TOKEN_BYTES)
+                continue;
+            rdna4_as_bound bound = {
+                .present = true,
+                .mapped = att.contents != NULL,
+                .storage = rdna4_argument_scan_storage(att.storageMode),
+            };
+            rdna4_as_work work = {
+                .kind = RDNA4_AS_KIND_UNKNOWN,
+                .flags = RDNA4_AS_TRANSPORT |
+                    (rdna4_argument_scan_writable(writable, att) ? RDNA4_AS_WRITABLE : 0),
+                .mode = (uint8_t)rdna4_as_scan_mode_for(&bound),
+                .stride = RDNA4_AS_TOKEN_BYTES,
+                .count = att.length / RDNA4_AS_TOKEN_BYTES,
+                .width = RDNA4_AS_TOKEN_BYTES,
+            };
+            if (!rdna4_argument_sampler_scope_work([self device], att, &work, &iftLive,
+                                                   samplers, writes, &scopeError)) {
+                [self rdna4Fail:scopeError ?: @"IFT attached buffer sampler scope failed"];
+                return NO;
+            }
+        }
     }
     for (NSDictionary *write in writes) {
         id buffer = write[@"buffer"];
@@ -1976,7 +2025,7 @@ static id rdna4_argument_token_sampler_alias_locked(RDNA4ArgumentResourceToken *
     for (RDNA4ArgumentSamplerAlias *alias in entry.aliases) {
         id object = alias.object;
         if (!object || alias.device != device) continue;
-        if (scope && ![scope containsObject:object]) continue;
+        if (scope && ![scope containsObject:object] && !alias.bindlessQueried) continue;
         return object;
     }
     return nil;
@@ -1994,7 +2043,7 @@ static void rdna4_argument_token_prune_locked(void) {
     }
 }
 
-static uint64_t rdna4_argument_resource_token(id object, id device, BOOL texture) {
+GARNET_INTERNAL uint64_t rdna4_argument_resource_token_bindless(id object, id device, BOOL texture, BOOL markBindless) {
     if (!object) return 0;
     id identity = rdna4_argument_token_identity(object, texture);
     if (!identity) return 0;
@@ -2027,6 +2076,7 @@ static uint64_t rdna4_argument_resource_token(id object, id device, BOOL texture
         for (RDNA4ArgumentSamplerAlias *alias in entry.aliases)
             if (alias.object == object) {
                 alias.device = device;
+                if (markBindless) alias.bindlessQueried = YES;
                 found = YES;
                 break;
             }
@@ -2034,6 +2084,7 @@ static uint64_t rdna4_argument_resource_token(id object, id device, BOOL texture
             RDNA4ArgumentSamplerAlias *alias = [RDNA4ArgumentSamplerAlias new];
             alias.object = object;
             alias.device = device;
+            alias.bindlessQueried = markBindless;
             [entry.aliases addObject:alias];
         }
     }
@@ -2042,6 +2093,10 @@ static uint64_t rdna4_argument_resource_token(id object, id device, BOOL texture
     }
     [rdna4_argument_tokens_lock unlock];
     return token;
+}
+
+static uint64_t rdna4_argument_resource_token(id object, id device, BOOL texture) {
+    return rdna4_argument_resource_token_bindless(object, device, texture, NO);
 }
 GARNET_INTERNAL id rdna4_argument_resource_for_token(uint64_t token, BOOL texture, id device) {
     if (!token) return nil;

@@ -206,7 +206,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     _stage = stage;
     _lock = [NSLock new];
 
-    rdna4rtr_status_t st = rdna4rtr_ift_init(&_table, (uint32_t)count, maxHid);
+    uint32_t abiVer = (refl && refl->present) ? refl->abi_version : RDNA4RTR_IFT_ABI_VERSION_V2;
+    rdna4rtr_status_t st = rdna4rtr_ift_init_with_abi(&_table, (uint32_t)count, maxHid, abiVer);
     if (st != RDNA4RTR_OK) {
         if (error) *error = rdna4_err(145, [NSString stringWithFormat:@"intersection function table init failed: %s",
                                             rdna4rtr_status_str(st)]);
@@ -229,8 +230,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
         }
     }
 
-    // Backing Shared RDNA4Buffer holds [slot_count, handle_id_0..handle_id_{N-1}] matching 0077 (>= 16 B aligned).
-    size_t allocBytes = rdna4rtr_ift_aligned_buffer_bytes((uint32_t)count);
+    // Backing Shared RDNA4Buffer holds ABI v1 or v2 header + handle_id[0..N-1] (>= 16 B aligned).
+    size_t allocBytes = rdna4rtr_ift_aligned_buffer_bytes_for_abi((uint32_t)count, abiVer);
     _backing = [[RDNA4Buffer alloc] initWithDevice:dev length:allocBytes options:MTLResourceStorageModeShared error:error];
     void *ptr = _backing ? [_backing contents] : NULL;
     if (!ptr) {
@@ -408,9 +409,18 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
         RDNA4LOG("RDNA4IntersectionFunctionTable setBuffer: invalid buffer class or device");
         return;
     }
+    if (buffer && offset > [(RDNA4Buffer *)buffer length]) {
+        RDNA4LOG("RDNA4IntersectionFunctionTable setBuffer: offset %lu exceeds buffer length %lu",
+                 (unsigned long)offset, (unsigned long)[(RDNA4Buffer *)buffer length]);
+        return;
+    }
+    uint64_t bda = buffer ? ([(RDNA4Buffer *)buffer gpuAddress] + (uint64_t)offset) : 0u;
     [_lock lock];
     _attachedBuffers[index] = (RDNA4Buffer *)buffer;
     _attachedBufferOffsets[index] = buffer ? offset : 0u;
+    _nestedVFTs[index] = nil;
+    (void)rdna4rtr_ift_set_attached_bda(&_table, (uint32_t)index, bda);
+    (void)[self rdna4SyncBackingLocked];
     [_lock unlock];
 }
 
@@ -441,8 +451,13 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
         RDNA4LOG("RDNA4IntersectionFunctionTable: rejected invalid nested VFT class or device");
         return;
     }
+    uint64_t bda = functionTable ? [(RDNA4VisibleFunctionTable *)functionTable rdna4BackingGPUAddress] : 0u;
     [_lock lock];
     _nestedVFTs[bufferIndex] = functionTable;
+    _attachedBuffers[bufferIndex] = nil;
+    _attachedBufferOffsets[bufferIndex] = 0u;
+    (void)rdna4rtr_ift_set_attached_bda(&_table, (uint32_t)bufferIndex, bda);
+    (void)[self rdna4SyncBackingLocked];
     [_lock unlock];
 }
 
@@ -532,7 +547,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
 - (BOOL)rdna4ResourceAliasable { return NO; }
 - (void)rdna4ResourceMakeAliasable {}
 - (BOOL)rdna4ResourceAliases:(id)other { (void)other; return NO; }
-RDNA4_RESOURCE_SPI
+// Bridge 3 (Metal 3 Bindless): return backing GPU BDA for gpuResourceID.
+RDNA4_RESOURCE_SPI_CUSTOM_UID(_backing ? [_backing gpuAddress] : rdna4_resource_uid(&_uid))
 
 @end
 
@@ -601,6 +617,8 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_encoder_bind_accel(
         rtSlots->as[bufferIndex] = nil;
         return YES;
     }
+    rtSlots->ift[bufferIndex] = nil;
+    rtSlots->iftMask &= ~(1u << bufferIndex);
     NSString *why = nil;
     id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(accel, dev, &why);
     if (!as) {
@@ -635,7 +653,11 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_encoder_bind_ift(
         return NO;
     }
     rtSlots->as[bufferIndex] = nil;
-    if (!ift) return YES;
+    if (!ift) {
+        rtSlots->ift[bufferIndex] = nil;
+        rtSlots->iftMask &= ~(1u << bufferIndex);
+        return YES;
+    }
     if (![ift isKindOfClass:[RDNA4IntersectionFunctionTable class]] ||
         [(RDNA4IntersectionFunctionTable *)ift device] != dev) {
         rdna4_rt_cb_fail(cb, [NSString stringWithFormat:@"%s setIntersectionFunctionTable: not an RDNA4IntersectionFunctionTable for this device",
@@ -643,6 +665,8 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_encoder_bind_ift(
         return NO;
     }
     RDNA4IntersectionFunctionTable *tbl = (RDNA4IntersectionFunctionTable *)ift;
+    rtSlots->ift[bufferIndex] = tbl;
+    rtSlots->iftMask |= (1u << bufferIndex);
     [tbl rdna4RetainIntoCommandBuffer:cb];
     if (backingBufOut) *backingBufOut = [tbl rdna4BackingBuffer];
     return YES;
@@ -1394,6 +1418,11 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
         if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"accel storage vkBindBufferMemory = %d", r]);
         return nil;
     }
+    VkBufferDeviceAddressInfo bdaInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = _buf
+    };
+    _deviceAddress = rdna4_vkGetBufferAddress(RDNA4R.dev, &bdaInfo);
     _backingSize = backingSize;
     return self;
 }
@@ -1564,6 +1593,12 @@ RDNA4_DNR(GarnetAccelerationStructure)
     return h ? h->_deviceAddress : 0u;
 }
 
+- (VkDeviceAddress)rdna4BindlessGPUAddress {
+    GarnetASHandle *h = [self rdna4CurrentHandle];
+    if (h && h->_deviceAddress) return h->_deviceAddress;
+    return _storage ? _storage->_deviceAddress : 0u;
+}
+
 - (rdna4rt_accel_meta_t)rdna4MetaSnapshot {
     pthread_mutex_lock(&_mu);
     rdna4rt_accel_meta_t snap = _meta;
@@ -1596,7 +1631,8 @@ RDNA4_DNR(GarnetAccelerationStructure)
 - (BOOL)rdna4ResourceAliasable { return NO; }
 - (void)rdna4ResourceMakeAliasable {}
 - (BOOL)rdna4ResourceAliases:(id)other { (void)other; return NO; }
-RDNA4_RESOURCE_SPI
+// Bridge 3 (Metal 3 Bindless): return 64-bit GPU BDA (valid before & after build via Wave 0 Invariant #2).
+RDNA4_RESOURCE_SPI_CUSTOM_UID([self rdna4BindlessGPUAddress] ?: rdna4_resource_uid(&_uid))
 @end
 
 // ---------------------------------------------------------------------------------------------------------------
