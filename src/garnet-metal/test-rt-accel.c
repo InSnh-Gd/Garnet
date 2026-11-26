@@ -122,6 +122,7 @@ static void test_usage_sizes_and_scratch(void) {
           "NULL caps omits ALLOW_DATA_ACCESS");
 
     rdna4rt_sizes_t sz;
+    memset(&sz, 0, sizeof(sz));
     CHECK(rdna4rt_compute_sizes(100u, 1024u, 512u, RDNA4RT_USAGE_NONE, 256u, &sz) == RDNA4RT_OK,
           "compute sizes without refit");
     CHECK(sz.acceleration_structure_size == 256u, "AS size rounded to 256");
@@ -405,9 +406,85 @@ static void test_tlas_and_instance_conversion(void) {
     CHECK(rdna4rt_validate_tlas_desc(&tl, 0, 0, &caps, &tp) == RDNA4RT_ERR_LIMIT, "TLAS > rt_max_instances rejected");
     tl.instance_count = 4u;
     tl.descriptor_type = RDNA4RT_INST_DESC_INDIRECT;
-    CHECK(rdna4rt_validate_tlas_desc(&tl, 0, 0, &caps, &tp) == RDNA4RT_ERR_UNSUPPORTED, "Indirect TLAS rejected");
+    tl.inst_buf_len = 4u * 72u;
+    CHECK(rdna4rt_validate_tlas_desc(&tl, 1, 0, &caps, &tp) == RDNA4RT_OK && tp.stride == 72u,
+          "Indirect descriptor type in TLAS desc supported (72B)");
+    tl.descriptor_type = RDNA4RT_INST_DESC_INDIRECT_MOTION;
+    CHECK(rdna4rt_validate_tlas_desc(&tl, 0, 0, &caps, &tp) == RDNA4RT_ERR_MOTION_UNSUPPORTED,
+          "Indirect motion TLAS rejected when motion unsupported");
     tl.descriptor_type = RDNA4RT_INST_DESC_MOTION;
     CHECK(rdna4rt_validate_tlas_desc(&tl, 0, 0, &caps, &tp) == RDNA4RT_ERR_MOTION_UNSUPPORTED, "Motion TLAS gated off when unsupported");
+
+    /* Wave 3: Indirect instance descriptor conversion (72B) + Indirect TLAS descriptor + staging buckets + targeted barriers. */
+    rdna4rt_mtl_instance_indirect_t ind0 = {
+        .transform = {{ {1,0,0}, {0,1,0}, {0,0,1}, {7,8,9} }},
+        .options = RDNA4RT_INST_OPT_OPAQUE,
+        .mask = 0xAAu,
+        .intersection_function_offset = 5u,
+        .user_id = 0x123456u,
+        .accel_struct_id = UINT64_C(0xFFFF8001001C0000)
+    };
+    rdna4rt_vk_instance_t vk_ind;
+    CHECK(rdna4rt_convert_instances(RDNA4RT_INST_DESC_INDIRECT, (const uint8_t *)&ind0, sizeof(ind0),
+                                    0u, 0u, 1u, NULL, 0u, &vk_ind) == RDNA4RT_OK,
+          "indirect 72B instance conversion");
+    CHECK(feq(vk_ind.transform.matrix[0][3], 7.0f, 1e-6f) &&
+          feq(vk_ind.transform.matrix[1][3], 8.0f, 1e-6f) &&
+          feq(vk_ind.transform.matrix[2][3], 9.0f, 1e-6f) &&
+          (vk_ind.custom_index_and_mask & 0x00FFFFFFu) == 0x123456u &&
+          (vk_ind.custom_index_and_mask >> 24) == 0xAAu &&
+          (vk_ind.sbt_offset_and_flags & 0x00FFFFFFu) == 5u &&
+          (vk_ind.sbt_offset_and_flags >> 24) == RDNA4RT_VK_INST_FORCE_OPAQUE &&
+          vk_ind.accel_struct_reference == UINT64_C(0xFFFF8001001C0000),
+          "indirect 72B instance exact BDA/userID/transform packing");
+
+    rdna4rt_indirect_tlas_desc_t itl;
+    memset(&itl, 0, sizeof(itl));
+    itl.descriptor_type = RDNA4RT_INST_DESC_INDIRECT;
+    itl.usage = RDNA4RT_USAGE_REFIT;
+    itl.max_instance_count = 4u;
+    itl.has_inst_buf = 1;
+    itl.inst_buf_len = 4u * 72u;
+    itl.has_count_buf = 1;
+    itl.count_buf_len = 4u;
+    CHECK(rdna4rt_validate_indirect_tlas_desc(&itl, 1, 0, &caps, &tp) == RDNA4RT_OK &&
+          tp.stride == 72u && tp.instance_count == 4u,
+          "valid MTLIndirectInstanceAccelerationStructureDescriptor");
+    itl.count_buf_len = 2u;
+    CHECK(rdna4rt_validate_indirect_tlas_desc(&itl, 1, 0, &caps, &tp) == RDNA4RT_ERR_BOUNDS,
+          "indirect TLAS rejects undersized count buffer");
+    itl.count_buf_len = 4u;
+    itl.count_buf_offset = 2u;
+    CHECK(rdna4rt_validate_indirect_tlas_desc(&itl, 1, 0, &caps, &tp) == RDNA4RT_ERR_ALIGNMENT,
+          "indirect TLAS rejects misaligned count buffer offset");
+    itl.count_buf_offset = 0u;
+    itl.descriptor_type = RDNA4RT_INST_DESC_DEFAULT;
+    CHECK(rdna4rt_validate_indirect_tlas_desc(&itl, 1, 0, &caps, &tp) == RDNA4RT_ERR_INVALID_ARG,
+          "indirect TLAS rejects Default descriptor type");
+    itl.descriptor_type = RDNA4RT_INST_DESC_INDIRECT_MOTION;
+    CHECK(rdna4rt_validate_indirect_tlas_desc(&itl, 1, 0, &caps, &tp) == RDNA4RT_ERR_MOTION_UNSUPPORTED,
+          "indirect TLAS rejects IndirectMotion when motion unsupported");
+
+    uint64_t bkt = 0;
+    CHECK(rdna4rt_staging_bucket_size(64u, &bkt) == 1 && bkt == 4096u, "staging bucket min 4 KiB");
+    CHECK(rdna4rt_staging_bucket_size(4097u, &bkt) == 1 && bkt == 8192u, "staging bucket next pow2 8 KiB");
+    CHECK(rdna4rt_staging_bucket_size(RDNA4RT_STAGING_POOL_MAX_BUCKET, &bkt) == 1 &&
+          bkt == RDNA4RT_STAGING_POOL_MAX_BUCKET, "staging bucket max 64 MiB");
+    CHECK(rdna4rt_staging_bucket_size(RDNA4RT_STAGING_POOL_MAX_BUCKET + 1u, &bkt) == 0,
+          "staging > 64 MiB bypasses pool");
+
+    /* Targeted barrier masks: computeQ must never contain graphics stage bits. */
+    const uint32_t gfx_stages = RDNA4RT_VK_STAGE_VERTEX_SHADER | RDNA4RT_VK_STAGE_FRAGMENT_SHADER | RDNA4RT_VK_STAGE_ALL_GRAPHICS;
+    for (int k = 0; k <= (int)RDNA4RT_BARRIER_TRANSFER_TO_HOST; k++) {
+        rdna4rt_barrier_spec_t cb_spec = rdna4rt_barrier_spec((rdna4rt_barrier_kind_t)k, 1);
+        CHECK((cb_spec.src_stage & gfx_stages) == 0u && (cb_spec.dst_stage & gfx_stages) == 0u,
+              "computeQ RT barrier contains zero graphics stage bits");
+    }
+    rdna4rt_barrier_spec_t post_gfx = rdna4rt_barrier_spec(RDNA4RT_BARRIER_POST_BUILD, 0);
+    CHECK((post_gfx.dst_stage & RDNA4RT_VK_STAGE_VERTEX_SHADER) != 0u &&
+          (post_gfx.dst_stage & RDNA4RT_VK_STAGE_FRAGMENT_SHADER) != 0u &&
+          (post_gfx.dst_stage & RDNA4RT_VK_STAGE_COMPUTE_SHADER) != 0u,
+          "gfxQ post-build RT barrier covers vertex, fragment, and compute stages");
 }
 
 static void test_motion_blur_validation_and_interpolation(void) {

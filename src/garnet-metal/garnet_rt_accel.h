@@ -18,7 +18,11 @@
 #define RDNA4RT_VK_INSTANCE_ALIGN           UINT64_C(16)
 #define RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE   UINT64_C(64)
 #define RDNA4RT_MTL_INSTANCE_USERID_SIZE    UINT64_C(68)
+#define RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE  UINT64_C(72)
 #define RDNA4RT_MTL_INSTANCE_MOTION_SIZE    UINT64_C(44)
+#define RDNA4RT_STAGING_POOL_MIN_BUCKET     UINT64_C(4096)
+#define RDNA4RT_STAGING_POOL_MAX_BUCKET     (UINT64_C(64) << 20)
+#define RDNA4RT_STAGING_POOL_MAX_SLABS      32u
 #define RDNA4RT_INSTANCE_CUSTOM_INDEX_MAX   UINT32_C(0x00FFFFFF)
 #define RDNA4RT_INSTANCE_SBT_OFFSET_MAX     UINT32_C(0x00FFFFFF)
 
@@ -212,6 +216,15 @@ typedef struct {
 } rdna4rt_mtl_instance_userid_t;
 
 typedef struct {
+    rdna4rt_packed_float4x3_t transform;
+    uint32_t options;
+    uint32_t mask;
+    uint32_t intersection_function_offset;
+    uint32_t user_id;
+    uint64_t accel_struct_id;
+} rdna4rt_mtl_instance_indirect_t;
+
+typedef struct {
     uint32_t options;
     uint32_t mask;
     uint32_t intersection_function_offset;
@@ -231,6 +244,7 @@ _Static_assert(sizeof(rdna4rt_vk_aabb_t) == 24u, "VkAabbPositionsKHR must be 24 
 _Static_assert(sizeof(rdna4rt_vk_instance_t) == 64u, "VkAccelerationStructureInstanceKHR must be 64 bytes");
 _Static_assert(sizeof(rdna4rt_mtl_instance_default_t) == 64u, "MTLAccelerationStructureInstanceDescriptor must be 64 bytes");
 _Static_assert(sizeof(rdna4rt_mtl_instance_userid_t) == 68u, "MTLAccelerationStructureUserIDInstanceDescriptor must be 68 bytes");
+_Static_assert(sizeof(rdna4rt_mtl_instance_indirect_t) == 72u, "MTLIndirectAccelerationStructureInstanceDescriptor must be 72 bytes");
 _Static_assert(sizeof(rdna4rt_mtl_instance_motion_t) == 44u, "MTLAccelerationStructureMotionInstanceDescriptor must be 44 bytes");
 
 #ifdef VK_KHR_acceleration_structure
@@ -788,8 +802,10 @@ static inline rdna4rt_err_t rdna4rt_validate_tlas_desc(
         min_size = RDNA4RT_MTL_INSTANCE_MOTION_SIZE;
         break;
     case RDNA4RT_INST_DESC_INDIRECT:
+        min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE;
+        break;
     case RDNA4RT_INST_DESC_INDIRECT_MOTION:
-        return RDNA4RT_ERR_UNSUPPORTED;
+        return allow_motion_blur ? RDNA4RT_ERR_UNSUPPORTED : RDNA4RT_ERR_MOTION_UNSUPPORTED;
     default:
         return RDNA4RT_ERR_INVALID_ARG;
     }
@@ -841,7 +857,166 @@ static inline rdna4rt_err_t rdna4rt_resolve_blas_ref(
     return RDNA4RT_OK;
 }
 
-/* Convert Default (64B) or UserID (68B) Metal instance descriptor buffer -> Vulkan 64B instances. */
+/* Indirect TLAS descriptor validator (MTLIndirectInstanceAccelerationStructureDescriptor). */
+typedef struct {
+    rdna4rt_inst_desc_type_t descriptor_type;
+    uint64_t usage;
+    uint64_t max_instance_count;
+    int has_inst_buf;
+    uint64_t inst_buf_len;
+    uint64_t inst_buf_offset;
+    uint64_t inst_stride;
+    int has_count_buf;
+    uint64_t count_buf_len;
+    uint64_t count_buf_offset;
+} rdna4rt_indirect_tlas_desc_t;
+
+static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
+    const rdna4rt_indirect_tlas_desc_t *d, int require_buffers, int allow_motion_blur,
+    const rdna4dc_metal3_caps *caps, rdna4rt_tlas_plan_t *out) {
+    if (!d || !out) return RDNA4RT_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    uint32_t vk_flags = 0;
+    rdna4rt_err_t ue = rdna4rt_usage_to_vk_build_flags(d->usage, &vk_flags);
+    if (ue != RDNA4RT_OK) return ue;
+    if (d->max_instance_count > UINT32_MAX) return RDNA4RT_ERR_LIMIT;
+    if (caps && caps->rt_max_instances > 0u && d->max_instance_count > caps->rt_max_instances)
+        return RDNA4RT_ERR_LIMIT;
+
+    if (d->descriptor_type == RDNA4RT_INST_DESC_INDIRECT_MOTION)
+        return allow_motion_blur ? RDNA4RT_ERR_UNSUPPORTED : RDNA4RT_ERR_MOTION_UNSUPPORTED;
+    if (d->descriptor_type != RDNA4RT_INST_DESC_INDIRECT)
+        return RDNA4RT_ERR_INVALID_ARG;
+
+    uint64_t min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE;
+    uint64_t stride = d->inst_stride ? d->inst_stride : min_size;
+    if (stride < min_size || (stride % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+
+    if (d->max_instance_count > 0u) {
+        if (require_buffers && (!d->has_inst_buf || !d->has_count_buf))
+            return RDNA4RT_ERR_INVALID_ARG;
+        if (d->has_inst_buf) {
+            if (d->inst_buf_offset > d->inst_buf_len) return RDNA4RT_ERR_BOUNDS;
+            if ((d->inst_buf_offset % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+            uint64_t span = 0, need = 0;
+            if (!rdna4rt_mul_u64(d->max_instance_count - 1u, stride, &span) ||
+                !rdna4rt_add_u64(span, min_size, &need))
+                return RDNA4RT_ERR_OVERFLOW;
+            if (need > d->inst_buf_len - d->inst_buf_offset) return RDNA4RT_ERR_BOUNDS;
+        }
+        if (d->has_count_buf) {
+            if (d->count_buf_offset > d->count_buf_len) return RDNA4RT_ERR_BOUNDS;
+            if ((d->count_buf_offset % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+            if (4u > d->count_buf_len - d->count_buf_offset) return RDNA4RT_ERR_BOUNDS;
+        }
+    }
+
+    out->elem_size = min_size;
+    out->stride = stride;
+    out->instance_count = (uint32_t)d->max_instance_count;
+    out->vk_build_flags = vk_flags;
+    return RDNA4RT_OK;
+}
+
+/* Staging pool bucket rounding: power-of-2 buckets in [4 KiB, 64 MiB].
+ * Returns 1 with bucket size if poolable, 0 if allocation exceeds pool cap (allocate directly). */
+static inline int rdna4rt_staging_bucket_size(uint64_t size, uint64_t *bucket_out) {
+    if (!bucket_out) return 0;
+    if (size > RDNA4RT_STAGING_POOL_MAX_BUCKET) return 0;
+    uint64_t b = RDNA4RT_STAGING_POOL_MIN_BUCKET;
+    while (b < size && b < RDNA4RT_STAGING_POOL_MAX_BUCKET) b <<= 1;
+    *bucket_out = b;
+    return 1;
+}
+
+/* Targeted Vulkan pipeline barrier stage/access specifications (computeQ-safe: zero graphics
+ * stage bits when is_compute_queue != 0). */
+enum {
+    RDNA4RT_VK_STAGE_VERTEX_SHADER   = 0x00000008u,
+    RDNA4RT_VK_STAGE_FRAGMENT_SHADER = 0x00000080u,
+    RDNA4RT_VK_STAGE_COMPUTE_SHADER  = 0x00000800u,
+    RDNA4RT_VK_STAGE_TRANSFER        = 0x00001000u,
+    RDNA4RT_VK_STAGE_HOST            = 0x00004000u,
+    RDNA4RT_VK_STAGE_ALL_GRAPHICS    = 0x00008000u,
+    RDNA4RT_VK_STAGE_AS_BUILD        = 0x02000000u,
+
+    RDNA4RT_VK_ACCESS_SHADER_READ    = 0x00000020u,
+    RDNA4RT_VK_ACCESS_SHADER_WRITE   = 0x00000040u,
+    RDNA4RT_VK_ACCESS_TRANSFER_READ  = 0x00000800u,
+    RDNA4RT_VK_ACCESS_TRANSFER_WRITE = 0x00001000u,
+    RDNA4RT_VK_ACCESS_HOST_READ      = 0x00002000u,
+    RDNA4RT_VK_ACCESS_AS_READ        = 0x00200000u,
+    RDNA4RT_VK_ACCESS_AS_WRITE       = 0x00400000u,
+};
+
+#ifdef VK_KHR_acceleration_structure
+_Static_assert(RDNA4RT_VK_STAGE_VERTEX_SHADER   == (uint32_t)VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, "STAGE_VERTEX");
+_Static_assert(RDNA4RT_VK_STAGE_FRAGMENT_SHADER == (uint32_t)VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, "STAGE_FRAGMENT");
+_Static_assert(RDNA4RT_VK_STAGE_COMPUTE_SHADER  == (uint32_t)VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "STAGE_COMPUTE");
+_Static_assert(RDNA4RT_VK_STAGE_TRANSFER        == (uint32_t)VK_PIPELINE_STAGE_TRANSFER_BIT, "STAGE_TRANSFER");
+_Static_assert(RDNA4RT_VK_STAGE_HOST            == (uint32_t)VK_PIPELINE_STAGE_HOST_BIT, "STAGE_HOST");
+_Static_assert(RDNA4RT_VK_STAGE_ALL_GRAPHICS    == (uint32_t)VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, "STAGE_ALL_GRAPHICS");
+_Static_assert(RDNA4RT_VK_STAGE_AS_BUILD        == (uint32_t)VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, "STAGE_AS_BUILD");
+_Static_assert(RDNA4RT_VK_ACCESS_SHADER_READ    == (uint32_t)VK_ACCESS_SHADER_READ_BIT, "ACCESS_SHADER_READ");
+_Static_assert(RDNA4RT_VK_ACCESS_SHADER_WRITE   == (uint32_t)VK_ACCESS_SHADER_WRITE_BIT, "ACCESS_SHADER_WRITE");
+_Static_assert(RDNA4RT_VK_ACCESS_TRANSFER_READ  == (uint32_t)VK_ACCESS_TRANSFER_READ_BIT, "ACCESS_TRANSFER_READ");
+_Static_assert(RDNA4RT_VK_ACCESS_TRANSFER_WRITE == (uint32_t)VK_ACCESS_TRANSFER_WRITE_BIT, "ACCESS_TRANSFER_WRITE");
+_Static_assert(RDNA4RT_VK_ACCESS_HOST_READ      == (uint32_t)VK_ACCESS_HOST_READ_BIT, "ACCESS_HOST_READ");
+_Static_assert(RDNA4RT_VK_ACCESS_AS_READ        == (uint32_t)VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR, "ACCESS_AS_READ");
+_Static_assert(RDNA4RT_VK_ACCESS_AS_WRITE       == (uint32_t)VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, "ACCESS_AS_WRITE");
+#endif
+
+typedef enum {
+    RDNA4RT_BARRIER_PRE_BUILD = 0,
+    RDNA4RT_BARRIER_COMP_TO_BUILD,
+    RDNA4RT_BARRIER_POST_BUILD,
+    RDNA4RT_BARRIER_TRANSFER_TO_HOST,
+} rdna4rt_barrier_kind_t;
+
+typedef struct {
+    uint32_t src_stage;
+    uint32_t dst_stage;
+    uint32_t src_access;
+    uint32_t dst_access;
+} rdna4rt_barrier_spec_t;
+
+static inline rdna4rt_barrier_spec_t rdna4rt_barrier_spec(rdna4rt_barrier_kind_t kind, int is_compute_queue) {
+    rdna4rt_barrier_spec_t s = { 0u, 0u, 0u, 0u };
+    switch (kind) {
+    case RDNA4RT_BARRIER_PRE_BUILD:
+        s.src_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_TRANSFER | RDNA4RT_VK_STAGE_AS_BUILD |
+                      (is_compute_queue ? 0u : RDNA4RT_VK_STAGE_ALL_GRAPHICS);
+        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_COMPUTE_SHADER;
+        s.src_access = RDNA4RT_VK_ACCESS_SHADER_WRITE | RDNA4RT_VK_ACCESS_TRANSFER_WRITE | RDNA4RT_VK_ACCESS_AS_WRITE;
+        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE;
+        break;
+    case RDNA4RT_BARRIER_COMP_TO_BUILD:
+        s.src_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER;
+        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD;
+        s.src_access = RDNA4RT_VK_ACCESS_SHADER_WRITE;
+        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ;
+        break;
+    case RDNA4RT_BARRIER_POST_BUILD:
+        s.src_stage = RDNA4RT_VK_STAGE_AS_BUILD;
+        s.dst_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER |
+                      (is_compute_queue ? 0u : (RDNA4RT_VK_STAGE_VERTEX_SHADER | RDNA4RT_VK_STAGE_FRAGMENT_SHADER));
+        s.src_access = RDNA4RT_VK_ACCESS_AS_WRITE;
+        s.dst_access = RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE |
+                       RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_TRANSFER_READ;
+        break;
+    case RDNA4RT_BARRIER_TRANSFER_TO_HOST:
+    default:
+        s.src_stage = RDNA4RT_VK_STAGE_TRANSFER | RDNA4RT_VK_STAGE_AS_BUILD;
+        s.dst_stage = RDNA4RT_VK_STAGE_HOST | RDNA4RT_VK_STAGE_TRANSFER | RDNA4RT_VK_STAGE_COMPUTE_SHADER |
+                      (is_compute_queue ? 0u : (RDNA4RT_VK_STAGE_VERTEX_SHADER | RDNA4RT_VK_STAGE_FRAGMENT_SHADER));
+        s.src_access = RDNA4RT_VK_ACCESS_TRANSFER_WRITE | RDNA4RT_VK_ACCESS_AS_WRITE;
+        s.dst_access = RDNA4RT_VK_ACCESS_HOST_READ | RDNA4RT_VK_ACCESS_TRANSFER_READ | RDNA4RT_VK_ACCESS_SHADER_READ;
+        break;
+    }
+    return s;
+}
+
+/* Convert Default (64B), UserID (68B), or Indirect (72B) Metal instance descriptor buffer -> Vulkan 64B instances. */
 static inline rdna4rt_err_t rdna4rt_convert_instances(
     rdna4rt_inst_desc_type_t type, const uint8_t *src_bytes, size_t src_len,
     uint64_t src_offset, uint64_t stride, uint32_t count,
@@ -849,7 +1024,8 @@ static inline rdna4rt_err_t rdna4rt_convert_instances(
     if (count == 0u) return RDNA4RT_OK;
     if (!src_bytes || !dst) return RDNA4RT_ERR_INVALID_ARG;
     uint64_t min_size = (type == RDNA4RT_INST_DESC_DEFAULT) ? RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE :
-                        (type == RDNA4RT_INST_DESC_USER_ID) ? RDNA4RT_MTL_INSTANCE_USERID_SIZE : 0u;
+                        (type == RDNA4RT_INST_DESC_USER_ID) ? RDNA4RT_MTL_INSTANCE_USERID_SIZE :
+                        (type == RDNA4RT_INST_DESC_INDIRECT) ? RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE : 0u;
     if (!min_size) return RDNA4RT_ERR_UNSUPPORTED;
     if (stride == 0u) stride = min_size;
     if (stride < min_size || (stride % 4u) != 0u || (src_offset % 4u) != 0u)
@@ -863,6 +1039,18 @@ static inline rdna4rt_err_t rdna4rt_convert_instances(
 
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *p = src_bytes + (size_t)(src_offset + (uint64_t)i * stride);
+        if (type == RDNA4RT_INST_DESC_INDIRECT) {
+            rdna4rt_mtl_instance_indirect_t ind;
+            memcpy(&ind, p, sizeof(ind));
+            rdna4rt_vk_transform_t xf;
+            rdna4rt_err_t te = rdna4rt_transpose_4x3_to_3x4(&ind.transform, &xf);
+            if (te != RDNA4RT_OK) return te;
+            rdna4rt_err_t pe = rdna4rt_pack_vk_instance(
+                &xf, ind.user_id, ind.mask, ind.intersection_function_offset,
+                ind.options, ind.accel_struct_id, &dst[i]);
+            if (pe != RDNA4RT_OK) return pe;
+            continue;
+        }
         rdna4rt_mtl_instance_userid_t raw;
         memset(&raw, 0, sizeof(raw));
         memcpy(&raw, p, (size_t)min_size);

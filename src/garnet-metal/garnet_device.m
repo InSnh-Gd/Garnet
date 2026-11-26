@@ -475,14 +475,12 @@ RDNA4_DNR(GarnetGLDrawable)
     return rdna4_cb_new_resource_state_encoder(self, d);
 }
 - (id)accelerationStructureCommandEncoder {
-    [self rdna4EnsureGfxSegment];
-    (void)[self vk];
+    if (![self rdna4TrySwitchToComputeQueue]) (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoder");
     return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:nil];
 }
 - (id)accelerationStructureCommandEncoderWithDescriptor:(id)d {
-    [self rdna4EnsureGfxSegment];
-    (void)[self vk];
+    if (![self rdna4TrySwitchToComputeQueue]) (void)[self vk];
     RDNA4LOGR("cb accelerationStructureCommandEncoderWithDescriptor:");
     return [[GarnetAccelerationStructureCommandEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }

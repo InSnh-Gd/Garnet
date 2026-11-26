@@ -6,6 +6,7 @@
 #include "garnet_metal_internal.h"
 #endif
 #include "garnet_fragment_output.h"
+#include "garnet_rt_spv.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Metal 3 Hardware Ray Tracing Runtime Binding & MTLIntersectionFunctionTable (Task 7.3).
@@ -1136,6 +1137,10 @@ _Static_assert(sizeof(MTLPackedFloat4x3) == sizeof(rdna4rt_packed_float4x3_t), "
 _Static_assert(sizeof(MTLAxisAlignedBoundingBox) == sizeof(rdna4rt_vk_aabb_t), "MTLAxisAlignedBoundingBox size");
 _Static_assert(sizeof(MTLAccelerationStructureInstanceDescriptor) == sizeof(rdna4rt_mtl_instance_default_t), "MTLAccelerationStructureInstanceDescriptor size");
 _Static_assert(sizeof(MTLAccelerationStructureUserIDInstanceDescriptor) == sizeof(rdna4rt_mtl_instance_userid_t), "MTLAccelerationStructureUserIDInstanceDescriptor size");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+_Static_assert(sizeof(MTLIndirectAccelerationStructureInstanceDescriptor) == sizeof(rdna4rt_mtl_instance_indirect_t), "MTLIndirectAccelerationStructureInstanceDescriptor size");
+#pragma clang diagnostic pop
 _Static_assert((uint32_t)MTLAccelerationStructureUsageNone == RDNA4RT_USAGE_NONE, "UsageNone");
 _Static_assert((uint32_t)MTLAccelerationStructureUsageRefit == RDNA4RT_USAGE_REFIT, "UsageRefit");
 _Static_assert((uint32_t)MTLAccelerationStructureUsagePreferFastBuild == RDNA4RT_USAGE_PREFER_FAST_BUILD, "UsagePreferFastBuild");
@@ -1148,6 +1153,11 @@ _Static_assert((uint32_t)MTLAccelerationStructureInstanceOptionNonOpaque == RDNA
 _Static_assert((uint32_t)MTLAccelerationStructureInstanceDescriptorTypeDefault == RDNA4RT_INST_DESC_DEFAULT, "InstDescDefault");
 _Static_assert((uint32_t)MTLAccelerationStructureInstanceDescriptorTypeUserID == RDNA4RT_INST_DESC_USER_ID, "InstDescUserID");
 _Static_assert((uint32_t)MTLAccelerationStructureInstanceDescriptorTypeMotion == RDNA4RT_INST_DESC_MOTION, "InstDescMotion");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+_Static_assert((uint32_t)MTLAccelerationStructureInstanceDescriptorTypeIndirect == RDNA4RT_INST_DESC_INDIRECT, "InstDescIndirect");
+_Static_assert((uint32_t)MTLAccelerationStructureInstanceDescriptorTypeIndirectMotion == RDNA4RT_INST_DESC_INDIRECT_MOTION, "InstDescIndirectMotion");
+#pragma clang diagnostic pop
 _Static_assert((uint32_t)MTLMotionBorderModeClamp == RDNA4RT_MOTION_BORDER_CLAMP, "MotionBorderClamp");
 _Static_assert((uint32_t)MTLMotionBorderModeVanish == RDNA4RT_MOTION_BORDER_VANISH, "MotionBorderVanish");
 
@@ -1202,20 +1212,209 @@ static BOOL rdna4_rt_resolve_funcs(void) {
     return RDNA4RTFn.ready;
 }
 
-static void rdna4_rt_barrier(VkCommandBuffer cmd) {
-    rdna4_full_barrier(cmd);
-}
-
-static void rdna4_rt_transfer_to_host_barrier(VkCommandBuffer cmd) {
+static void rdna4_rt_emit_barrier(VkCommandBuffer cmd, rdna4rt_barrier_kind_t kind, BOOL isComputeQueue) {
+    rdna4rt_barrier_spec_t sp = rdna4rt_barrier_spec(kind, isComputeQueue ? 1 : 0);
     VkMemoryBarrier mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+        .srcAccessMask = (VkAccessFlags)sp.src_access,
+        .dstAccessMask = (VkAccessFlags)sp.dst_access
     };
     vkCmdPipelineBarrier(cmd,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         (VkPipelineStageFlags)sp.src_stage,
+                         (VkPipelineStageFlags)sp.dst_stage,
                          0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Lazy push-constant-only BDA compute pipelines for GPU-driven RT AS builds (Wave 3.2):
+//   - instPipe:  MTLStorageModePrivate instanceDescriptorBuffer (Default 64B / UserID 68B / Indirect 72B)
+//                and zero-CPU-readback MTLIndirectInstanceAccelerationStructureDescriptor
+//   - xformPipe: MTLStorageModePrivate transformationMatrixBuffer (column-major 4x3 / unaligned row-major 3x4)
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct {
+    pthread_mutex_t mu;
+    VkDevice dev;
+    VkPipelineLayout instLayout;
+    VkPipeline instPipe;
+    VkPipelineLayout xformLayout;
+    VkPipeline xformPipe;
+} RDNA4RTComputePipes;
+
+static RDNA4RTComputePipes g_rtPipes = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static BOOL rdna4_rt_create_compute_pipe(
+    const uint32_t *words, size_t byteSize, uint32_t pushBytes,
+    VkPipelineLayout *outLayout, VkPipeline *outPipe, NSError **err) {
+    VkPushConstantRange pcr = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0u,
+        .size = pushBytes
+    };
+    VkPipelineLayoutCreateInfo lci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0u,
+        .pushConstantRangeCount = 1u,
+        .pPushConstantRanges = &pcr
+    };
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkResult r = vkCreatePipelineLayout(RDNA4R.dev, &lci, NULL, &layout);
+    if (r != VK_SUCCESS || !layout) {
+        if (err) *err = rdna4_err(140, [NSString stringWithFormat:@"rt compute vkCreatePipelineLayout = %d", r]);
+        return NO;
+    }
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = byteSize,
+        .pCode = words
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    r = vkCreateShaderModule(RDNA4R.dev, &smci, NULL, &mod);
+    if (r != VK_SUCCESS || !mod) {
+        vkDestroyPipelineLayout(RDNA4R.dev, layout, NULL);
+        if (err) *err = rdna4_err(140, [NSString stringWithFormat:@"rt compute vkCreateShaderModule = %d", r]);
+        return NO;
+    }
+    VkComputePipelineCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = mod,
+            .pName = "main"
+        },
+        .layout = layout
+    };
+    VkPipeline pipe = VK_NULL_HANDLE;
+    r = vkCreateComputePipelines(RDNA4R.dev, VK_NULL_HANDLE, 1u, &pci, NULL, &pipe);
+    vkDestroyShaderModule(RDNA4R.dev, mod, NULL);
+    if (r != VK_SUCCESS || !pipe) {
+        vkDestroyPipelineLayout(RDNA4R.dev, layout, NULL);
+        if (err) *err = rdna4_err(140, [NSString stringWithFormat:@"rt compute vkCreateComputePipelines = %d", r]);
+        return NO;
+    }
+    *outLayout = layout;
+    *outPipe = pipe;
+    return YES;
+}
+
+static BOOL rdna4_rt_ensure_compute_pipes(
+    VkPipelineLayout *instLayoutOut, VkPipeline *instPipeOut,
+    VkPipelineLayout *xformLayoutOut, VkPipeline *xformPipeOut,
+    NSError **err) {
+    if (!RDNA4R.ok || !RDNA4R.dev) {
+        if (err) *err = rdna4_err(140, @"rt compute pipelines: Vulkan device unavailable");
+        return NO;
+    }
+    pthread_mutex_lock(&g_rtPipes.mu);
+    if (g_rtPipes.dev == RDNA4R.dev && g_rtPipes.instPipe && g_rtPipes.xformPipe) {
+        if (instLayoutOut) *instLayoutOut = g_rtPipes.instLayout;
+        if (instPipeOut) *instPipeOut = g_rtPipes.instPipe;
+        if (xformLayoutOut) *xformLayoutOut = g_rtPipes.xformLayout;
+        if (xformPipeOut) *xformPipeOut = g_rtPipes.xformPipe;
+        pthread_mutex_unlock(&g_rtPipes.mu);
+        return YES;
+    }
+    g_rtPipes.dev = RDNA4R.dev;
+    g_rtPipes.instLayout = VK_NULL_HANDLE;
+    g_rtPipes.instPipe = VK_NULL_HANDLE;
+    g_rtPipes.xformLayout = VK_NULL_HANDLE;
+    g_rtPipes.xformPipe = VK_NULL_HANDLE;
+    BOOL ok = rdna4_rt_create_compute_pipe(
+                  rdna4rt_spv_inst_convert, sizeof(rdna4rt_spv_inst_convert),
+                  (uint32_t)sizeof(rdna4rt_inst_convert_pc_t),
+                  &g_rtPipes.instLayout, &g_rtPipes.instPipe, err) &&
+              rdna4_rt_create_compute_pipe(
+                  rdna4rt_spv_xform_transpose, sizeof(rdna4rt_spv_xform_transpose),
+                  (uint32_t)sizeof(rdna4rt_xform_transpose_pc_t),
+                  &g_rtPipes.xformLayout, &g_rtPipes.xformPipe, err);
+    if (!ok) {
+        if (g_rtPipes.instPipe) vkDestroyPipeline(RDNA4R.dev, g_rtPipes.instPipe, NULL);
+        if (g_rtPipes.instLayout) vkDestroyPipelineLayout(RDNA4R.dev, g_rtPipes.instLayout, NULL);
+        if (g_rtPipes.xformPipe) vkDestroyPipeline(RDNA4R.dev, g_rtPipes.xformPipe, NULL);
+        if (g_rtPipes.xformLayout) vkDestroyPipelineLayout(RDNA4R.dev, g_rtPipes.xformLayout, NULL);
+        g_rtPipes.instLayout = VK_NULL_HANDLE; g_rtPipes.instPipe = VK_NULL_HANDLE;
+        g_rtPipes.xformLayout = VK_NULL_HANDLE; g_rtPipes.xformPipe = VK_NULL_HANDLE;
+        g_rtPipes.dev = VK_NULL_HANDLE;
+        pthread_mutex_unlock(&g_rtPipes.mu);
+        return NO;
+    }
+    if (instLayoutOut) *instLayoutOut = g_rtPipes.instLayout;
+    if (instPipeOut) *instPipeOut = g_rtPipes.instPipe;
+    if (xformLayoutOut) *xformLayoutOut = g_rtPipes.xformLayout;
+    if (xformPipeOut) *xformPipeOut = g_rtPipes.xformPipe;
+    pthread_mutex_unlock(&g_rtPipes.mu);
+    RDNA4LOGR("rt compute pipelines ready (inst_convert + xform_transpose)");
+    return YES;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fence-retired RT staging buffer pool (Wave 3.1): blocks return to pool in dealloc after segment fence retires.
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    void *map;
+    VkDeviceAddress addr;
+    uint64_t size;
+    uint64_t allocSize;
+} RDNA4RTStagingSlot;
+
+typedef struct {
+    pthread_mutex_t mu;
+    VkDevice dev;
+    uint32_t count;
+    uint64_t totalBytes;
+    uint64_t hits;
+    uint64_t misses;
+    RDNA4RTStagingSlot slots[RDNA4RT_STAGING_POOL_MAX_SLABS];
+} RDNA4RTStagingPoolState;
+
+static RDNA4RTStagingPoolState g_rtStagingPool = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static BOOL rdna4_rt_staging_pool_pop(uint64_t needSize, RDNA4RTStagingSlot *out) {
+    pthread_mutex_lock(&g_rtStagingPool.mu);
+    if (g_rtStagingPool.dev != RDNA4R.dev) {
+        g_rtStagingPool.dev = RDNA4R.dev;
+        g_rtStagingPool.count = 0u;
+        g_rtStagingPool.totalBytes = 0u;
+    }
+    uint32_t bestIdx = UINT32_MAX;
+    uint64_t bestSize = UINT64_MAX;
+    for (uint32_t i = 0; i < g_rtStagingPool.count; i++) {
+        uint64_t sz = g_rtStagingPool.slots[i].size;
+        if (sz >= needSize && sz < bestSize) {
+            bestSize = sz;
+            bestIdx = i;
+        }
+    }
+    if (bestIdx != UINT32_MAX) {
+        *out = g_rtStagingPool.slots[bestIdx];
+        g_rtStagingPool.totalBytes -= out->allocSize;
+        g_rtStagingPool.slots[bestIdx] = g_rtStagingPool.slots[g_rtStagingPool.count - 1u];
+        g_rtStagingPool.count--;
+        g_rtStagingPool.hits++;
+        pthread_mutex_unlock(&g_rtStagingPool.mu);
+        return YES;
+    }
+    g_rtStagingPool.misses++;
+    pthread_mutex_unlock(&g_rtStagingPool.mu);
+    return NO;
+}
+
+static BOOL rdna4_rt_staging_pool_push(const RDNA4RTStagingSlot *slot) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !slot->buf || !slot->mem) return NO;
+    pthread_mutex_lock(&g_rtStagingPool.mu);
+    if (g_rtStagingPool.dev == VK_NULL_HANDLE) g_rtStagingPool.dev = RDNA4R.dev;
+    if (g_rtStagingPool.dev != RDNA4R.dev ||
+        g_rtStagingPool.count >= RDNA4RT_STAGING_POOL_MAX_SLABS ||
+        g_rtStagingPool.totalBytes + slot->allocSize > RDNA4RT_STAGING_POOL_MAX_BUCKET) {
+        pthread_mutex_unlock(&g_rtStagingPool.mu);
+        return NO;
+    }
+    g_rtStagingPool.slots[g_rtStagingPool.count++] = *slot;
+    g_rtStagingPool.totalBytes += slot->allocSize;
+    pthread_mutex_unlock(&g_rtStagingPool.mu);
+    return YES;
 }
 
 static BOOL rdna4_rt_vfmt_from_mtl(NSUInteger mtlFmt, rdna4rt_vfmt_t *outPure, VkFormat *outVk) {
@@ -1271,10 +1470,28 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
         if (err) *err = rdna4_err(140, @"RT staging buffer size overflow");
         return nil;
     }
+    uint64_t allocTarget = aligned;
+    uint64_t bucket = 0;
+    BOOL poolable = rdna4rt_staging_bucket_size(aligned, &bucket) ? YES : NO;
+    if (poolable) {
+        RDNA4RTStagingSlot recycled;
+        if (rdna4_rt_staging_pool_pop(bucket, &recycled)) {
+            _buf = recycled.buf;
+            _mem = recycled.mem;
+            _map = recycled.map;
+            _addr = recycled.addr;
+            _size = recycled.size;
+            _allocSize = recycled.allocSize;
+            _pooled = YES;
+            return self;
+        }
+        allocTarget = bucket;
+    }
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = aligned,
-        .usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        .size = allocTarget,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -1328,11 +1545,25 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
         if (err) *err = rdna4_err(140, @"rt staging: invalid or misaligned buffer device address");
         return nil;
     }
-    _size = aligned;
+    _size = allocTarget;
+    _pooled = poolable;
     return self;
 }
 
 - (void)dealloc {
+    if (_pooled && _buf && _mem && RDNA4R.ok) {
+        RDNA4RTStagingSlot slot = {
+            .buf = _buf, .mem = _mem, .map = _map, .addr = _addr,
+            .size = _size, .allocSize = _allocSize
+        };
+        if (rdna4_rt_staging_pool_push(&slot)) {
+            _buf = VK_NULL_HANDLE;
+            _mem = VK_NULL_HANDLE;
+            _map = NULL;
+            _addr = 0;
+            return;
+        }
+    }
     if (RDNA4R.ok) {
         if (_buf) vkDestroyBuffer(RDNA4R.dev, _buf, NULL);
         if (_mem) {
@@ -1649,6 +1880,10 @@ typedef struct {
     uint32_t *maxPrimCounts;
     VkAccelerationStructureBuildSizesInfoKHR vkSizes;
     rdna4rt_sizes_t metalSizes;
+    BOOL hasInstDispatch;
+    rdna4rt_inst_convert_pc_t instPC;
+    rdna4rt_xform_transpose_pc_t *xformPCs;
+    uint32_t xformDispatchCount;
 } RDNA4RTBuildPlan;
 
 static void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
@@ -1656,9 +1891,51 @@ static void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
     free(p->vkGeoms);
     free(p->vkRanges);
     free(p->maxPrimCounts);
+    free(p->xformPCs);
     p->vkGeoms = NULL;
     p->vkRanges = NULL;
     p->maxPrimCounts = NULL;
+    p->xformPCs = NULL;
+    p->xformDispatchCount = 0u;
+    p->hasInstDispatch = NO;
+}
+
+static BOOL rdna4_rt_plan_append_xform(RDNA4RTBuildPlan *p, const rdna4rt_xform_transpose_pc_t *pc) {
+    uint32_t next = p->xformDispatchCount + 1u;
+    rdna4rt_xform_transpose_pc_t *arr = (rdna4rt_xform_transpose_pc_t *)realloc(
+        p->xformPCs, (size_t)next * sizeof(*arr));
+    if (!arr) return NO;
+    arr[p->xformDispatchCount] = *pc;
+    p->xformPCs = arr;
+    p->xformDispatchCount = next;
+    return YES;
+}
+
+static BOOL rdna4_rt_dispatch_pre_build(
+    VkCommandBuffer cmd, const RDNA4RTBuildPlan *plan, BOOL isComputeQueue, NSError **err) {
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isComputeQueue);
+    if (!plan->hasInstDispatch && plan->xformDispatchCount == 0u) return YES;
+    VkPipelineLayout instLayout = VK_NULL_HANDLE, xformLayout = VK_NULL_HANDLE;
+    VkPipeline instPipe = VK_NULL_HANDLE, xformPipe = VK_NULL_HANDLE;
+    if (!rdna4_rt_ensure_compute_pipes(&instLayout, &instPipe, &xformLayout, &xformPipe, err))
+        return NO;
+    if (plan->xformDispatchCount > 0u) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xformPipe);
+        for (uint32_t i = 0; i < plan->xformDispatchCount; i++) {
+            vkCmdPushConstants(cmd, xformLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                               (uint32_t)sizeof(plan->xformPCs[i]), &plan->xformPCs[i]);
+            vkCmdDispatch(cmd, 1u, 1u, 1u);
+        }
+    }
+    if (plan->hasInstDispatch && plan->instPC.max_count > 0u) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instPipe);
+        vkCmdPushConstants(cmd, instLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                           (uint32_t)sizeof(plan->instPC), &plan->instPC);
+        uint32_t groups = (plan->instPC.max_count + 63u) / 64u;
+        vkCmdDispatch(cmd, groups, 1u, 1u);
+    }
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_COMP_TO_BUILD, isComputeQueue);
+    return YES;
 }
 
 static BOOL rdna4_rt_check_buffer(id obj, id dev, BOOL writable, RDNA4Buffer **outBuf, NSString **why) {
@@ -1706,11 +1983,6 @@ static BOOL rdna4_rt_build_plan_make(
     const int allowMotion = rdna4rt_motion_blur_supported(&m3);
 
     Class indirectInstCls = objc_getClass("MTLIndirectInstanceAccelerationStructureDescriptor");
-    if (indirectInstCls && [desc isKindOfClass:indirectInstCls]) {
-        // shortcut: indirect TLAS descriptors require GPU-side ID-to-BDA translation; reject cleanly until needed
-        if (err) *err = rdna4_err(145, @"MTLIndirectInstanceAccelerationStructureDescriptor is not supported");
-        return NO;
-    }
 
     /* Validate caller descriptor usage first; refit inherits source build flags for Vulkan VUID compliance. */
     uint32_t callerFlags = 0;
@@ -1902,31 +2174,40 @@ static BOOL rdna4_rt_build_plan_make(
                 if (requireBuffers && tbuf) {
                     const uint8_t *tmap = (const uint8_t *)[tbuf contents];
                     if (tplan.needs_transform_staging) {
-                        if (!tmap) {
-                            // shortcut: Private column-major/unaligned triangle transform requires a GPU transpose pass; add if needed
-                            free(geomSigs); rdna4_rt_plan_free(plan);
-                            if (err) *err = rdna4_err(145, @"column-major or unaligned transformationMatrixBuffer must be Shared/Managed");
-                            return NO;
-                        }
-                        rdna4rt_vk_transform_t vkXf;
-                        rdna4rt_err_t xerr = RDNA4RT_OK;
-                        if (tdesc.transform_layout == RDNA4RT_MATRIX_COLUMN_MAJOR) {
-                            rdna4rt_packed_float4x3_t colXf;
-                            memcpy(&colXf, tmap + tbufOff, sizeof(colXf));
-                            xerr = rdna4rt_transpose_4x3_to_3x4(&colXf, &vkXf);
-                        } else {
-                            rdna4rt_vk_transform_t rowXf;
-                            memcpy(&rowXf, tmap + tbufOff, sizeof(rowXf));
-                            xerr = rdna4rt_validate_transform_3x4(&rowXf, &vkXf);
-                        }
-                        if (xerr != RDNA4RT_OK) {
-                            free(geomSigs); rdna4_rt_plan_free(plan);
-                            if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(xerr)]);
-                            return NO;
-                        }
-                        RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:sizeof(vkXf) error:err];
+                        RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:RDNA4RT_TRANSFORM_SIZE error:err];
                         if (!stg) { free(geomSigs); rdna4_rt_plan_free(plan); return NO; }
-                        memcpy(stg->_map, &vkXf, sizeof(vkXf));
+                        if (!tmap) {
+                            /* GPU compute transpose/copy for Private transformationMatrixBuffer. */
+                            rdna4rt_xform_transpose_pc_t xpc = {
+                                .src_addr = tplan.transform_addr,
+                                .dst_addr = stg->_addr,
+                                .layout_mode = (tdesc.transform_layout == RDNA4RT_MATRIX_ROW_MAJOR) ? 1u : 0u,
+                                ._pad = 0u
+                            };
+                            if (!rdna4_rt_plan_append_xform(plan, &xpc)) {
+                                free(geomSigs); rdna4_rt_plan_free(plan);
+                                if (err) *err = rdna4_err(145, @"out of host memory recording Private transform dispatch");
+                                return NO;
+                            }
+                        } else {
+                            rdna4rt_vk_transform_t vkXf;
+                            rdna4rt_err_t xerr = RDNA4RT_OK;
+                            if (tdesc.transform_layout == RDNA4RT_MATRIX_COLUMN_MAJOR) {
+                                rdna4rt_packed_float4x3_t colXf;
+                                memcpy(&colXf, tmap + tbufOff, sizeof(colXf));
+                                xerr = rdna4rt_transpose_4x3_to_3x4(&colXf, &vkXf);
+                            } else {
+                                rdna4rt_vk_transform_t rowXf;
+                                memcpy(&rowXf, tmap + tbufOff, sizeof(rowXf));
+                                xerr = rdna4rt_validate_transform_3x4(&rowXf, &vkXf);
+                            }
+                            if (xerr != RDNA4RT_OK) {
+                                free(geomSigs); rdna4_rt_plan_free(plan);
+                                if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(xerr)]);
+                                return NO;
+                            }
+                            memcpy(stg->_map, &vkXf, sizeof(vkXf));
+                        }
                         transformAddr = stg->_addr;
                         [retainedObjects addObject:stg];
                     } else if (tmap) {
@@ -2101,13 +2382,7 @@ static BOOL rdna4_rt_build_plan_make(
 
         VkDeviceAddress vkInstAddr = 0;
         if (requireBuffers && tplan.instance_count > 0u) {
-            if (![instBuf contents]) {
-                // shortcut: Private TLAS instanceDescriptorBuffer requires a GPU compute translation pass; add when needed
-                rdna4_rt_plan_free(plan);
-                if (err) *err = rdna4_err(145, @"TLAS instanceDescriptorBuffer must be Shared/Managed for Vulkan instance translation");
-                return NO;
-            }
-            NSUInteger blasCount = blasList.count;
+            NSUInteger blasCount = (descType == RDNA4RT_INST_DESC_INDIRECT) ? 0u : blasList.count;
             uint64_t *blasAddrs = blasCount ? (uint64_t *)calloc(blasCount, sizeof(*blasAddrs)) : NULL;
             if (blasCount && !blasAddrs) {
                 rdna4_rt_plan_free(plan);
@@ -2144,21 +2419,162 @@ static BOOL rdna4_rt_build_plan_make(
             RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:stageBytes error:err];
             if (!stg) { free(blasAddrs); rdna4_rt_plan_free(plan); return NO; }
 
-            rdna4rt_err_t ce = rdna4rt_convert_instances(
-                tdesc.descriptor_type, (const uint8_t *)[instBuf contents], (size_t)[instBuf length],
-                tdesc.inst_buf_offset, tplan.stride, tplan.instance_count,
-                blasAddrs, (uint32_t)blasCount, (rdna4rt_vk_instance_t *)stg->_map);
-            free(blasAddrs);
-            if (ce != RDNA4RT_OK) {
-                rdna4_rt_plan_free(plan);
-                if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"TLAS instance conversion failed: %s", rdna4rt_err_str(ce)]);
-                return NO;
+            if (![instBuf contents]) {
+                /* GPU compute conversion for MTLStorageModePrivate instanceDescriptorBuffer. */
+                uint64_t blasTableAddr = 0u;
+                if (blasCount > 0u) {
+                    uint64_t tblBytes = (uint64_t)blasCount * sizeof(uint64_t);
+                    RDNA4RTStagingBuffer *blasTbl = [[RDNA4RTStagingBuffer alloc] initWithSize:tblBytes error:err];
+                    if (!blasTbl) { free(blasAddrs); rdna4_rt_plan_free(plan); return NO; }
+                    memcpy(blasTbl->_map, blasAddrs, (size_t)tblBytes);
+                    blasTableAddr = blasTbl->_addr;
+                    [retainedObjects addObject:blasTbl];
+                }
+                free(blasAddrs);
+                uint64_t srcAddr = 0u;
+                if (!rdna4rt_add_u64([instBuf gpuAddress], tdesc.inst_buf_offset, &srcAddr)) {
+                    rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, @"TLAS Private instance buffer address overflow");
+                    return NO;
+                }
+                plan->hasInstDispatch = YES;
+                plan->instPC = (rdna4rt_inst_convert_pc_t){
+                    .src_addr = srcAddr,
+                    .dst_addr = stg->_addr,
+                    .blas_table_addr = blasTableAddr,
+                    .count_addr = 0u,
+                    .max_count = tplan.instance_count,
+                    .src_stride = (uint32_t)tplan.stride,
+                    .desc_type = (uint32_t)tdesc.descriptor_type,
+                    .blas_count = (uint32_t)blasCount
+                };
+            } else {
+                rdna4rt_err_t ce = rdna4rt_convert_instances(
+                    tdesc.descriptor_type, (const uint8_t *)[instBuf contents], (size_t)[instBuf length],
+                    tdesc.inst_buf_offset, tplan.stride, tplan.instance_count,
+                    blasAddrs, (uint32_t)blasCount, (rdna4rt_vk_instance_t *)stg->_map);
+                free(blasAddrs);
+                if (ce != RDNA4RT_OK) {
+                    rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"TLAS instance conversion failed: %s", rdna4rt_err_str(ce)]);
+                    return NO;
+                }
             }
             vkInstAddr = stg->_addr;
             [retainedObjects addObject:stg];
             [retainedObjects addObject:instBuf];
         } else if (requireBuffers && instBuf) {
             [retainedObjects addObject:instBuf];
+        }
+
+        plan->vkGeoms[0] = (VkAccelerationStructureGeometryKHR){
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+            .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+            .flags = 0u,
+            .geometry.instances = {
+                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+                .arrayOfPointers = VK_FALSE,
+                .data.deviceAddress = vkInstAddr
+            }
+        };
+        plan->vkRanges[0] = (VkAccelerationStructureBuildRangeInfoKHR){
+            .primitiveCount = tplan.instance_count,
+            .primitiveOffset = 0u,
+            .firstVertex = 0u,
+            .transformOffset = 0u
+        };
+        plan->maxPrimCounts[0] = tplan.instance_count;
+        uint32_t tsig = rdna4rt_geom_sig(RDNA4RT_GEOM_INSTANCES, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, 0u);
+        plan->topologyHash = rdna4rt_topology_hash(&tsig, plan->maxPrimCounts, 1u);
+    } else if (indirectInstCls && [desc isKindOfClass:indirectInstCls]) {
+        plan->kind = RDNA4RT_KIND_TLAS;
+        id rawInstBuf = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("instanceDescriptorBuffer"));
+        NSUInteger instOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, sel_registerName("instanceDescriptorBufferOffset"));
+        NSUInteger instStride = ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, sel_registerName("instanceDescriptorStride"));
+        NSUInteger maxCount = ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, sel_registerName("maxInstanceCount"));
+        id rawCountBuf = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("instanceCountBuffer"));
+        NSUInteger countOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, sel_registerName("instanceCountBufferOffset"));
+        NSUInteger descType = RDNA4RT_INST_DESC_INDIRECT;
+        SEL dtSel = sel_registerName("instanceDescriptorType");
+        if ([desc respondsToSelector:dtSel])
+            descType = ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, dtSel);
+
+        RDNA4Buffer *instBuf = nil, *countBuf = nil;
+        NSString *bwhy = nil;
+        if (!rdna4_rt_check_buffer(rawInstBuf, dev, NO, &instBuf, &bwhy)) {
+            if (err) *err = rdna4_err(145, bwhy ?: @"invalid indirect TLAS instanceDescriptorBuffer");
+            return NO;
+        }
+        if (!rdna4_rt_check_buffer(rawCountBuf, dev, NO, &countBuf, &bwhy)) {
+            if (err) *err = rdna4_err(145, bwhy ?: @"invalid indirect TLAS instanceCountBuffer");
+            return NO;
+        }
+
+        rdna4rt_indirect_tlas_desc_t idesc = {
+            .descriptor_type = (rdna4rt_inst_desc_type_t)descType,
+            .usage = plan->usage,
+            .max_instance_count = (uint64_t)maxCount,
+            .has_inst_buf = instBuf != nil ? 1 : 0,
+            .inst_buf_len = instBuf ? (uint64_t)[instBuf length] : 0u,
+            .inst_buf_offset = (uint64_t)instOff,
+            .inst_stride = (uint64_t)instStride,
+            .has_count_buf = countBuf != nil ? 1 : 0,
+            .count_buf_len = countBuf ? (uint64_t)[countBuf length] : 0u,
+            .count_buf_offset = (uint64_t)countOff
+        };
+        rdna4rt_tlas_plan_t tplan;
+        rdna4rt_err_t te = rdna4rt_validate_indirect_tlas_desc(&idesc, requireBuffers ? 1 : 0, allowMotion, &m3, &tplan);
+        if (te != RDNA4RT_OK) {
+            if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(te)]);
+            return NO;
+        }
+
+        plan->geomCount = 1u;
+        plan->vkGeoms = (VkAccelerationStructureGeometryKHR *)calloc(1, sizeof(*plan->vkGeoms));
+        plan->vkRanges = (VkAccelerationStructureBuildRangeInfoKHR *)calloc(1, sizeof(*plan->vkRanges));
+        plan->maxPrimCounts = (uint32_t *)calloc(1, sizeof(*plan->maxPrimCounts));
+        if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts) {
+            rdna4_rt_plan_free(plan);
+            if (err) *err = rdna4_err(145, @"out of host memory building indirect TLAS plan");
+            return NO;
+        }
+
+        VkDeviceAddress vkInstAddr = 0;
+        if (requireBuffers && tplan.instance_count > 0u) {
+            uint64_t stageBytes = 0;
+            if (!rdna4rt_mul_u64((uint64_t)tplan.instance_count, RDNA4RT_VK_INSTANCE_SIZE, &stageBytes)) {
+                rdna4_rt_plan_free(plan);
+                if (err) *err = rdna4_err(145, @"indirect TLAS staging size overflow");
+                return NO;
+            }
+            RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:stageBytes error:err];
+            if (!stg) { rdna4_rt_plan_free(plan); return NO; }
+            uint64_t srcAddr = 0u, cntAddr = 0u;
+            if (!rdna4rt_add_u64([instBuf gpuAddress], idesc.inst_buf_offset, &srcAddr) ||
+                !rdna4rt_add_u64([countBuf gpuAddress], idesc.count_buf_offset, &cntAddr)) {
+                rdna4_rt_plan_free(plan);
+                if (err) *err = rdna4_err(145, @"indirect TLAS buffer address overflow");
+                return NO;
+            }
+            /* Always translate on GPU with zero CPU readback (count/descriptors may be written earlier in the same CB). */
+            plan->hasInstDispatch = YES;
+            plan->instPC = (rdna4rt_inst_convert_pc_t){
+                .src_addr = srcAddr,
+                .dst_addr = stg->_addr,
+                .blas_table_addr = 0u,
+                .count_addr = cntAddr,
+                .max_count = tplan.instance_count,
+                .src_stride = (uint32_t)tplan.stride,
+                .desc_type = RDNA4RT_INST_DESC_INDIRECT,
+                .blas_count = 0u
+            };
+            vkInstAddr = stg->_addr;
+            [retainedObjects addObject:stg];
+            [retainedObjects addObject:instBuf];
+            [retainedObjects addObject:countBuf];
+        } else if (requireBuffers) {
+            if (instBuf) [retainedObjects addObject:instBuf];
+            if (countBuf) [retainedObjects addObject:countBuf];
         }
 
         plan->vkGeoms[0] = (VkAccelerationStructureGeometryKHR){
@@ -2385,9 +2801,14 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     const VkAccelerationStructureBuildRangeInfoKHR *pRanges = plan.geomCount ? plan.vkRanges : &dummyRange;
 
     VkCommandBuffer cmd = [_cb vk];
-    rdna4_rt_barrier(cmd);
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
+        rdna4_rt_plan_free(&plan);
+        [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: pre-build compute conversion failed"];
+        return;
+    }
     RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
-    rdna4_rt_barrier(cmd);
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_build(&dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
                                     plan.usage, plan.geomCount, plan.topologyHash);
@@ -2521,9 +2942,14 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     const VkAccelerationStructureBuildRangeInfoKHR *pRanges = plan.geomCount ? plan.vkRanges : &dummyRange;
 
     VkCommandBuffer cmd = [_cb vk];
-    rdna4_rt_barrier(cmd);
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
+        rdna4_rt_plan_free(&plan);
+        [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: pre-build compute conversion failed"];
+        return;
+    }
     RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
-    rdna4_rt_barrier(cmd);
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_refit(
         &srcMeta, &dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
@@ -2572,9 +2998,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR
     };
     VkCommandBuffer cmd = [_cb vk];
-    rdna4_rt_barrier(cmd);
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
     RDNA4RTFn.cmdCopyAS(cmd, &ci);
-    rdna4_rt_barrier(cmd);
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_copy(&srcMeta, &dstMeta, 0);
     [dstAS rdna4SetMeta:dstMeta];
@@ -2657,7 +3084,8 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     if (stg) [_cb rdna4RetainEncoded:stg];
 
     VkCommandBuffer cmd = [_cb vk];
-    rdna4_rt_barrier(cmd);
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
     vkCmdResetQueryPool(cmd, qp->_qp, 0u, 1u);
     RDNA4RTFn.cmdWriteASProps(cmd, 1u, &srcHandle->_vkAS,
                               VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
@@ -2678,7 +3106,7 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         RDNA4RTFn.cmdCopyQueryPoolResults(cmd, qp->_qp, 0u, 1u, [dstBuf vkBuffer], dstVkOff, 8u,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
-    rdna4_rt_transfer_to_host_barrier(cmd);
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_TRANSFER_TO_HOST, isCompQ);
 
     (void)rdna4rt_state_apply_write_compacted_size(&srcMeta);
     [srcAS rdna4SetMeta:srcMeta];
@@ -2724,9 +3152,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR
     };
     VkCommandBuffer cmd = [_cb vk];
-    rdna4_rt_barrier(cmd);
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
     RDNA4RTFn.cmdCopyAS(cmd, &ci);
-    rdna4_rt_barrier(cmd);
+    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_compact(&srcMeta, &dstMeta, 0, 0u);
     [dstAS rdna4SetMeta:dstMeta];
@@ -2799,9 +3228,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
 - (void)endEncoding {
     if (_ended) return;
     _ended = YES;
+    const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
     if (_nCsbEnd) {
         VkCommandBuffer cmd = [_cb vk];
-        rdna4_rt_barrier(cmd);
+        rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
         BOOL cbOk = ![_cb rdna4Error];
         SEL sampleSel = sel_registerName("rdna4SampleOnCommandBuffer:vkCommandBuffer:sampleIndex:barrier:stageFlags:who:");
         for (uint32_t k = 0; k < _nCsbEnd; k++) {
@@ -2813,7 +3243,7 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         }
         _nCsbEnd = 0u;
     } else if (![_cb rdna4Error]) {
-        rdna4_rt_barrier([_cb vk]);
+        rdna4_rt_emit_barrier([_cb vk], RDNA4RT_BARRIER_POST_BUILD, isCompQ);
     }
     RDNA4LOGR("GarnetAccelerationStructureCommandEncoder endEncoding");
     [super endEncoding];

@@ -2075,6 +2075,7 @@ typedef struct {
     VkDeviceAddress _addr;
     uint64_t _size;
     uint64_t _allocSize;
+    BOOL _pooled;
 }
 - (instancetype)initWithSize:(uint64_t)size error:(NSError **)err;
 @end
