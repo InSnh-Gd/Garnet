@@ -14,16 +14,21 @@ Session *gSlot[kMaxSessions] = { &gSess };
 uint64_t gWc;
 bool gWcInit;
 uint64_t gEmitted;
+uint64_t gKcqWc;
+bool gKcqWcInit;
+uint64_t gKcqEmitted;
 BringupContext *gCtx;
 volatile UInt32 gOpenFlag;
 Hang gHang;
-IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock, *gWaitLock;
+Hang gKcqHang;
+IOLock *gCliLock, *gRingLock, *gKcqRingLock, *gHangLock, *gTlbLock, *gWaitLock;
 static volatile uint64_t gIrqEpoch;
 static uint8_t gIrqEvent;
 static volatile UInt32 gIrqWaitLatch = rdna4native::irqwait::kLatchUnset;
 static volatile uint64_t gIrqWaitSleeps, gIrqWaitWakes;
 static volatile UInt32 gDccLatch;   // 0 = unset, 1 = OFF (garnet-dcc=0), 2 = ON (default)
 static volatile UInt32 gHugeLatch;  // 0 = unset, 1 = OFF (garnet-hugepage=0), 2 = ON (default)
+static volatile UInt32 gAsyncComputeLatch; // 0 = unset, 1 = OFF (garnet-async-compute=0), 2 = ON (default)
 
 bool dcc_on() {
     UInt32 l = gDccLatch;
@@ -55,6 +60,26 @@ bool hugepage_on() {
         l = gHugeLatch;
     }
     return l == 2u;
+}
+
+bool async_compute_on() {
+    if (gCtx == nullptr || !gCtx->kcqMapped || !gCtx->kcq.mapped || !gCtx->kcqTestPassed ||
+        gCtx->kcq.ring_cpu == nullptr || gCtx->kcq.wb_cpu == nullptr || gCtx->kcq.rptr_cpu == nullptr) {
+        return false;
+    }
+    UInt32 l = gAsyncComputeLatch;
+    if (l == 0u) {
+        uint32_t v = 1u;
+        const bool present = PE_parse_boot_argn("garnet-async-compute", &v, sizeof(v));
+        const bool en = rdna4native::s1c::async_compute_boot_enabled(present, v);
+        if (OSCompareAndSwap(0u, en ? 2u : 1u, &gAsyncComputeLatch)) {
+            N1C_LOG("boot-arg garnet-async-compute %s: MEC async compute ring (ctx.kcq) is %s",
+                    present ? (v == 0u ? "=0" : "nonzero") : "absent (default ON)",
+                    en ? "ENABLED" : "DISABLED");
+        }
+        l = gAsyncComputeLatch;
+    }
+    return rdna4native::s1c::async_compute_active(gCtx->kcq.mapped, gCtx->kcqTestPassed, l == 2u);
 }
 
 static bool irq_wait_boot_on() {
@@ -138,6 +163,7 @@ uint32_t gSessSeqCounter = 0;
 volatile UInt32 gSessWs;
 static bool gLegacyLogged[8];
 static uint32_t gSubmitBuf[280];
+static uint32_t gKcqSubmitBuf[280];
 static rdna4native::g2::OwnerLog gOwners;
 static BufferFlight gBufferFlights[kMaxSessions];
 static volatile UInt32 gRecovering;
@@ -176,7 +202,10 @@ uint64_t now_ns() {
     absolutetime_to_nanoseconds(t, &ns);
     return ns;
 }
-bool vmid_fence_reached(void *, uint32_t, uint64_t seq) { return retired_now(emitted_now()) >= seq; }
+bool vmid_fence_reached(void *, uint32_t domain, uint64_t seq) {
+    if (domain == rdna4vmid::kDomainCompute) return kcq_retired_now(kcq_emitted_now()) >= seq_raw(seq);
+    return retired_now(emitted_now()) >= seq;
+}
 // Take the caller's session lock and re-check under it. Returns the session LOCKED, or null with nothing held.
 Session *sess_lock(const N1cRef &r, bool needHello) {
     Session *s = slot_ptr(r.slot);
@@ -273,11 +302,34 @@ uint32_t stall_from_wait() {
     if (mine) (void)stall_handle(em, re);
     return rdna4native::g2::bound_verdict(busy, mine);
 }
+static bool kcq_hang_poll() {
+    if (!async_compute_on()) return false;
+    const uint64_t em = kcq_emitted_now();
+    if (em == 0ull) return false;
+    const uint64_t re = kcq_retired_now(em), now = now_ns();
+    bool det = false;
+    IOLockLock(gHangLock);
+    if (!gHang.hung) {
+        hang_note(gKcqHang, re, em, now);
+        if (hang_expired(gKcqHang, re, em, now)) {
+            det = hang_latch_wait(gHang);
+            (void)hang_latch_wait(gKcqHang);
+        }
+    }
+    IOLockUnlock(gHangLock);
+    if (det) {
+        N1C_LOG("KCQ HUNG: compute seq emitted %llu retired %llu rptr %u wptr %u",
+                (unsigned long long)em, (unsigned long long)re,
+                gCtx->kcq.rptr_cpu ? *gCtx->kcq.rptr_cpu : 0u, gCtx->kcq.wptr);
+        hang_announce(emitted_now(), retired_now(emitted_now()));
+    }
+    return det;
+}
 // The prologue of every GPU-dependent call: Aborted after a latch (or for a poisoned session), Timeout for the call that detects it, else kOk.
 uint32_t gpu_gate(const Session *s) {
     if (hung_now()) return hang_rc(true, false);
     if (s != nullptr && sess_poisoned(s)) return rdna4native::g2::poison_rc(true);
-    const uint32_t rc = hang_rc(false, hang_poll());
+    const uint32_t rc = hang_rc(false, hang_poll() || kcq_hang_poll());
     if (rc == kOk && s != nullptr && sess_poisoned(s)) return rdna4native::g2::poison_rc(true);   // this very call's stall named the caller guilty
     return rc;
 }
@@ -288,17 +340,24 @@ uint32_t gpu_gate(const Session *s) {
 constexpr uint64_t kRecoverWaitNs = 6000000000ull;   // RESET 2 s + ring space 2 s + verify 1 s + slack
 bool own_wait(Session *s, bool *noBlame) {
     const uint64_t own = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE);
+    const uint64_t ownKcq = __atomic_load_n(&s->emittedKcq, __ATOMIC_ACQUIRE);
     const uint64_t start = now_ns();
     bool stalled = false;
     if (noBlame != nullptr) *noBlame = false;
     if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
     for (;;) {
         const uint64_t ep = irq_epoch_now();
-        if (rdna4native::g2::own_idle(retired_now(emitted_now()), own)) return true;
+        if (rdna4native::g2::own_idle(retired_now(emitted_now()), own) &&
+            (ownKcq == 0ull || rdna4native::g2::own_idle(kcq_retired_now(kcq_emitted_now()), ownKcq))) return true;
         if (hung_now()) return false;
         const uint64_t el = now_ns() - start;
         if (!stalled && el >= kWaitCapNs) {
             if (!multi_on()) { hang_from_wait(); return false; }   // switch OFF: exactly the 0.0.626 idle wait (latch, not idle)
+            if (ownKcq != 0ull && !rdna4native::g2::own_idle(kcq_retired_now(kcq_emitted_now()), ownKcq)) {
+                if (kcq_hang_poll()) return false;
+                if (noBlame != nullptr) *noBlame = true;
+                return false;
+            }
             if (stall_from_wait() == rdna4native::g2::kBoundNoBlame) { if (noBlame != nullptr) *noBlame = true; return false; }   // R2: progress within kHangNs: Timeout, no blame
             stalled = true; continue;
         }
@@ -527,6 +586,155 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
     return ring_submit_g5_body(s, va, by, nIbs, hasFence, fenceAddr, seqOut);
 }
 
+// ---- MEC async compute ring (ctx.kcq) ------------------------------------------------------------------------------------------
+// Runs completely independently of gRingLock so GFX and Compute submissions never serialize on ring writes or GPU execution.
+static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, Session *owner) {
+    DeviceContext &dev = *gCtx->dev;
+    ComputeQueue &cq = gCtx->kcq;
+    const uint32_t mask = cq.ring_ptr_mask;
+    if (n > cq.ring_size_dwords / 2u) return kBadArg;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
+    const uint64_t t0 = now_ns();
+    for (;;) {
+        const uint64_t ep = irq_epoch_now();
+        sysmem_rmb();
+        const uint32_t r = *cq.rptr_cpu & mask;
+        const uint64_t emCheck = kcq_emitted_now();
+        if (ring_has_space(ring_free64(r, gKcqWc, mask), n) || kcq_retired_now(emCheck) >= emCheck) break;
+        const uint64_t el = now_ns() - t0;
+        if (el >= kWaitCapNs) {
+            N1C_LOG("kcq ring space: need %u dwords (+%u slack), rptr %u wptr %u, no room in 2 s",
+                    n, kRingSlack, r, (uint32_t)(gKcqWc & mask));
+            return kTimeout;
+        }
+        n1c_wait_relax(el, kWaitCapNs - el, ep);
+    }
+    auto *ring = static_cast<uint32_t *>(cq.ring_cpu);
+    const uint64_t startWc = gKcqWc;
+    uint64_t wc = gKcqWc;
+    for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
+    irq_arm_ring_eop(ring, startWc, n, mask, dw);
+    gKcqWc = wc;
+    cq.wptr = ring_idx(wc, mask);
+    const uint64_t emBefore = kcq_emitted_now();
+    const uint64_t reNow = kcq_retired_now(emBefore);
+    IOLockLock(gHangLock);
+    hang_kick(gKcqHang, reNow, emBefore, now_ns());
+    IOLockUnlock(gHangLock);
+    if (owner != nullptr) __atomic_store_n(&owner->emittedKcq, rawSeq, __ATOMIC_RELEASE);
+    __atomic_store_n(&gKcqEmitted, rawSeq, __ATOMIC_RELEASE);
+    amdgpu_hdp_flush(dev);
+    const uint64_t wptr64 = wc;
+    *reinterpret_cast<volatile uint64_t *>(static_cast<uint8_t *>(cq.wb_cpu) + kCPWBOffsetWptr) = wptr64;
+    sysmem_wmb();
+    const uint64_t off = (uint64_t)cq.doorbell_index * kCPDoorbellStride;
+    WDOORBELL64(dev, off, wptr64);
+    (void)RDOORBELL32(dev, off);
+    return kOk;
+}
+static uint32_t kcq_submit(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
+    IOLockLock(gKcqRingLock);
+    const uint64_t rawSeq = kcq_emitted_now() + 1ull;
+    const uint64_t taggedSeq = seq_with_ring(rawSeq, true);
+    const uint32_t n = build_compute_submit(gKcqSubmitBuf, (uint32_t)(sizeof(gKcqSubmitBuf) / sizeof(gKcqSubmitBuf[0])),
+                                            va, by, nIbs, __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE), hasFence,
+                                            fenceAddr, taggedSeq, gCtx->kcq.wb_bus + kWbOffsetNativeSeq, rawSeq);
+    if (n == 0u) { IOLockUnlock(gKcqRingLock); return (uint32_t)kIOReturnInternalError; }
+    const uint32_t er = kcq_put_locked(gKcqSubmitBuf, n, rawSeq, s);
+    IOLockUnlock(gKcqRingLock);
+    if (er == kTimeout) { (void)kcq_hang_poll(); return kTimeout; }
+    if (er != kOk) return er;
+    *seqOut = taggedSeq;
+    return kOk;
+}
+static uint32_t kcq_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
+    uint64_t busyStart = 0ull;
+    bool stallDone = false;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
+    for (;;) {
+        const uint64_t ep = irq_epoch_now();
+        if (hung_now()) return hang_rc(true, false);
+        if (sess_poisoned(s)) return rdna4native::g2::poison_rc(true);
+        rdna4vmid::Grant grant {};
+        IOLockLock(gCliLock);
+        ensure_vmid_pool_locked();
+        const uint64_t seqNeed = __atomic_load_n(&s->tlbSeq, __ATOMIC_ACQUIRE);
+        const rdna4vmid::Result pr = gVmidPool.grab(reinterpret_cast<uintptr_t>(s), s->rootPa, seqNeed, grant);
+        if (pr == rdna4vmid::Result::Exhausted) {
+            IOLockUnlock(gCliLock);
+            N1C_LOG("kcq submit refused (NoResources): pooled VMID pool exhausted (slot %u)", s->slot);
+            return kNoResources;
+        }
+        if (pr == rdna4vmid::Result::Ok) {
+            if (grant.stolen && grant.prevOwner != 0u) {
+                Session *prev = reinterpret_cast<Session *>(grant.prevOwner);
+                if (__atomic_load_n(&prev->vmid, __ATOMIC_ACQUIRE) == grant.vmid) __atomic_store_n(&prev->vmid, 0u, __ATOMIC_RELEASE);
+            }
+            if (!gVmidCtxReady[grant.vmid]) {
+                bool ctxOk = false;
+                (void)ctx_prepare_vmid(grant.vmid, &ctxOk);
+                if (!ctxOk) {
+                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                    IOLockUnlock(gCliLock);
+                    return kNotReady;
+                }
+                gVmidCtxReady[grant.vmid] = true;
+            }
+            if (grant.rebind) {
+                if (program_root(grant.vmid, s->rootPa) != kOk) {
+                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                    IOLockUnlock(gCliLock);
+                    return kTimeout;
+                }
+                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
+                (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
+            } else {
+                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
+                if (grant.flush) {
+                    amdgpu_hdp_flush(*gCtx->dev);
+                    if (flush_vmid(grant.vmid) != kOk) {
+                        (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
+                        __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+                        IOLockUnlock(gCliLock);
+                        return kTimeout;
+                    }
+                    (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
+                }
+            }
+            const uint32_t vmid = grant.vmid;
+            gVmidPool.beginSubmit(vmid);
+            IOLockUnlock(gCliLock);
+            uint64_t seq = 0ull;
+            const uint32_t er = kcq_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq);
+            IOLockLock(gCliLock);
+            if (er == kOk) {
+                if (gVmidPool.ownerOf(vmid) == reinterpret_cast<uintptr_t>(s)) gVmidPool.noteSubmit(vmid, rdna4vmid::kDomainCompute, seq_raw(seq));
+                *seqOut = seq;
+            }
+            gVmidPool.endSubmit(vmid);
+            IOLockUnlock(gCliLock);
+            return er;
+        }
+        IOLockUnlock(gCliLock);
+        const uint64_t now = now_ns();
+        if (busyStart == 0ull) busyStart = now;
+        const uint64_t el = now - busyStart;
+        if (el >= kWaitCapNs + kRecoverWaitNs) {
+            N1C_LOG("kcq submit refused (Timeout): pooled VMID wait exceeded bound (slot %u)", s->slot);
+            return kTimeout;
+        }
+        if (!stallDone && el >= kWaitCapNs) {
+            stallDone = true;
+            (void)stall_from_wait();
+            (void)kcq_hang_poll();
+            continue;
+        }
+        n1c_wait_relax(el, (kWaitCapNs + kRecoverWaitNs) - el, ep);
+    }
+}
+
 // ---- the automatic recovery (0.0.627, G2; switch ON only) ----------------------------------------------------------------------------
 // NOP every ring dword outside the live range [liveStart, gWc) - the G1 scrub rule (the older dwords have run; the free space must not hold stale
 // packets if the RESET moves the read pointer). Caller holds gRingLock.
@@ -689,7 +897,7 @@ static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_
 IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_t *seqOut) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
     CsView v;
-    const uint32_t prc = cs_parse(in, size, &v);
+    const uint32_t prc = cs_parse(in, size, &v, async_compute_on());
     if (prc != kOk) return (IOReturn)prc;
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
@@ -718,6 +926,12 @@ IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_
             const uint32_t fr = resolve_fence(s, v.fenceHandle, v.fenceOffset, &fenceAddr);
             IOLockUnlock(gCliLock);
             if (fr != kOk) { rc = (IOReturn)fr; break; }
+        }
+        if (v.ipType == RDNA4N_HW_IP_COMPUTE) {
+            const uint32_t cer = s->pinnedVmid ? kcq_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)
+                                               : kcq_submit_pooled(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);
+            if (cer != kOk) rc = (IOReturn)cer;
+            break;
         }
         uint32_t er;
         if (!g5_on()) er = s->pinnedVmid ? ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut) : ring_submit_pooled(s, va, by, v.nIbs, hasFence, fenceAddr, false, seqOut);   // G5 OFF
@@ -804,11 +1018,45 @@ IOReturn n1c_buffer_op(const N1cRef &ref, const rdna4n_buffer_op *in, bool fill,
     return (IOReturn)rc;
 }
 
+static IOReturn n1c_wait_kcq(Session *s, uint64_t target, uint64_t timeoutNs, uint64_t out[3]) {
+    if (!async_compute_on()) return kIOReturnBadArgument;
+    const uint64_t rawTarget = seq_raw(target);
+    uint64_t em = kcq_emitted_now();
+    if (rawTarget > em) return kIOReturnBadArgument;
+    const uint64_t to = wait_timeout_ns(timeoutNs);
+    const uint64_t start = now_ns();
+    uint64_t re = 0;
+    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
+    for (;;) {
+        const uint64_t ep = irq_epoch_now();
+        em = kcq_emitted_now();
+        re = kcq_retired_now(em);
+        if (sess_poisoned(s)) return kIOReturnAborted;
+        if (rawTarget == 0ull || re >= rawTarget) {
+            out[0] = 0;
+            out[1] = seq_with_ring(re, true);
+            out[2] = seq_with_ring(em, true);
+            return kIOReturnSuccess;
+        }
+        if (hung_now()) return kIOReturnAborted;
+        const uint64_t el = now_ns() - start;
+        if (el >= to) break;
+        n1c_wait_relax(el, to - el, ep);
+    }
+    if (kcq_hang_poll()) return kIOReturnTimeout;
+    if (sess_poisoned(s)) return kIOReturnAborted;
+    out[0] = 1;
+    out[1] = seq_with_ring(re, true);
+    out[2] = seq_with_ring(em, true);
+    return kIOReturnSuccess;
+}
+
 IOReturn n1c_wait(const N1cRef &ref, uint64_t target, uint64_t timeoutNs, uint64_t out[3]) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
     Session *s = sess_peek(ref);
     if (s == nullptr) return kIOReturnNotReady;
     if (sess_poisoned(s)) return kIOReturnAborted;   // 0.0.627 (G2): a poisoned session's fences are failed
+    if (seq_is_compute(target)) return n1c_wait_kcq(s, target, timeoutNs, out);
     uint64_t res = 0;
     uint64_t em = emitted_now();
     const uint32_t rrc = rdna4native::g2::own_wait_resolve(target, em, __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE), &res);   // 0.0.627: LAST = this session's own last seqno

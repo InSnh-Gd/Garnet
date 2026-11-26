@@ -14,8 +14,9 @@ namespace rdna4vmid {
 constexpr uint32_t kFirst      = 1u;   // VMID 0 is the kernel's physical context
 constexpr uint32_t kLast       = 15u;
 constexpr uint32_t kSlots      = kLast + 1u;
-constexpr uint32_t kMaxDomains = 4u;
-constexpr uint32_t kDomainGfx  = 2u;
+constexpr uint32_t kMaxDomains    = 4u;
+constexpr uint32_t kDomainGfx     = 2u;
+constexpr uint32_t kDomainCompute = 3u;
 
 using FenceReached = bool (*)(void *context, uint32_t domain, uint64_t seq);
 

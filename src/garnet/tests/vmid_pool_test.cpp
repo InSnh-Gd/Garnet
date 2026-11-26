@@ -237,12 +237,33 @@ void test_in_flight_prevents_steal() {
 	check(pool.grab(2u, 0x2000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid == 15u && g.stolen, "steal succeeds after endSubmit");
 }
 
+void test_dual_domain_gfx_and_compute_eviction() {
+	FenceMock f {};
+	rdna4vmid::Pool pool;
+	pool.init(&FenceMock::reached, &f, 0x7FFFu); // only VMID 15 usable
+	rdna4vmid::Grant g {};
+	check(pool.grab(1u, 0x1000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid == 15u, "owner 1 grabs VMID 15");
+	pool.noteSubmit(15u, rdna4vmid::kDomainGfx, 5u);
+	pool.noteSubmit(15u, rdna4vmid::kDomainCompute, 3u);
+	check(!pool.idle(15u), "VMID busy while both GFX and Compute pending");
+	// Retire GFX only -> still blocked by kDomainCompute!
+	f.completed[rdna4vmid::kDomainGfx] = 5u;
+	check(!pool.idle(15u), "VMID still busy after GFX retires while Compute seq 3 pending");
+	check(pool.grab(2u, 0x2000u, 1u, g) == rdna4vmid::Result::Busy && g.waitDomain == rdna4vmid::kDomainCompute && g.waitSeq == 3u,
+	      "steal blocked on kDomainCompute seq 3");
+	// Retire Compute -> now idle and stealable!
+	f.completed[rdna4vmid::kDomainCompute] = 3u;
+	check(pool.idle(15u), "VMID idle once both GFX and Compute retire");
+	check(pool.grab(2u, 0x2000u, 1u, g) == rdna4vmid::Result::Ok && g.vmid == 15u && g.stolen, "steal succeeds after Compute retires");
+}
+
 } // namespace
 
 int main() {
 	test_vmid_pool_exact_ack_and_quarantine();
 	test_sparse_pt_rollback_and_range();
 	test_in_flight_prevents_steal();
+	test_dual_domain_gfx_and_compute_eviction();
 	std::printf("vmid_pool_test: %d checks, %d failed\n", gChecks, gFails);
 	return gFails ? 1 : 0;
 }

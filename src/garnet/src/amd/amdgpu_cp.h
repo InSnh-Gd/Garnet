@@ -199,6 +199,8 @@ namespace CPRegs {
     // gc_12_0_0_offset.h:3528-3533 — CP interrupt control/status, BASE_IDX 0.
     constexpr uint32_t CP_INT_CNTL_RING0          = 0x1E0A;
     constexpr uint32_t CP_INT_STATUS_RING0        = 0x1E0D;
+    // gc_12_0_0_offset.h — MEC ME1 pipe 0 interrupt control (compute EOP IRQ), BASE_IDX 0.
+    constexpr uint32_t CP_ME1_PIPE0_INT_CNTL      = 0x1E25;
     // gc_12_0_0_offset.h:4348-4349 regSCRATCH_REG0 = 0x2040, BASE_IDX 1 —
     // the register gfx_v12_0_ring_test_ring writes through SET_UCONFIG_REG.
     constexpr uint32_t SCRATCH_REG0               = 0x2040;
@@ -309,6 +311,7 @@ namespace CPRegBaseIdx {
     constexpr int CP_GFX_MQD_CONTROL          = 0;
     constexpr int CP_INT_CNTL_RING0           = 0;
     constexpr int CP_INT_STATUS_RING0         = 0;
+    constexpr int CP_ME1_PIPE0_INT_CNTL       = 0;
     constexpr int SCRATCH_REG0                = 1;  // regSCRATCH_REG0_BASE_IDX 1
     constexpr int CP_MQD_BASE_ADDR            = 0;
     constexpr int CP_HQD_ACTIVE               = 0;
@@ -464,6 +467,12 @@ namespace CPRegBaseIdx {
 #define CP_INT_CNTL_RING0__OPCODE_ERROR_INT_ENABLE_MASK   0x01000000u
 #define CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK     0x04000000u
 #define CP_INT_CNTL_RING0__GENERIC0_INT_ENABLE_MASK       0x80000000u
+
+// CP_ME1_PIPE0_INT_CNTL fields (gc_12_0_0_sh_mask.h): MEC pipe 0 EOP IRQ bits.
+#define CP_ME1_PIPE0_INT_CNTL__TIME_STAMP_INT_ENABLE__SHIFT 0x1a
+#define CP_ME1_PIPE0_INT_CNTL__GENERIC0_INT_ENABLE__SHIFT   0x1f
+#define CP_ME1_PIPE0_INT_CNTL__TIME_STAMP_INT_ENABLE_MASK   0x04000000u
+#define CP_ME1_PIPE0_INT_CNTL__GENERIC0_INT_ENABLE_MASK     0x80000000u
 
 // CP_RB_DOORBELL_CONTROL field shifts (upstream gfx_v12_0.c uses
 // REG_SET_FIELD on these). DOORBELL_OFFSET[27:2], DOORBELL_EN[30].

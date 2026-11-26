@@ -79,6 +79,15 @@ static void test_eop_packet_patching() {
 
     // User fence (earlier RELEASE_MEM at n-16) stays INT_SEL=0 when only trailing slot is patched.
     check(((pkt[n - 14u] >> 24) & 3u) == 0u, "user fence keeps INT_SEL=0");
+
+    // Compute ring build_compute_submit also ends with a patchable trailing RELEASE_MEM.
+    uint32_t cpkt[32] = {};
+    const uint32_t cn = rdna4native::s1c::build_compute_submit(
+        cpkt, 32u, va, by, 1u, 9u, true, 0x8400001000ull, (1ull << 62) | 5ull, 0x8400002000ull, 5ull);
+    check(cn == 20u, "1 compute IB + user fence + seqno = 20 dwords");
+    check(has_trailing_release_mem(cpkt, cn), "compute submit trailing packet recognized as RELEASE_MEM");
+    check(dw2_with_eop_int(cpkt[cn - 6u]) == dw2Expected, "compute trailing RELEASE_MEM patches cleanly to INT_SEL=2");
+    check(((cpkt[cn - 14u] >> 24) & 3u) == 0u, "compute user fence keeps INT_SEL=0");
 }
 
 static void test_iv_wake_and_epoch() {

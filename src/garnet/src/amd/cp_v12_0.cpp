@@ -1923,7 +1923,13 @@ cp_set_eop_interrupt(const DeviceContext &dev, bool enable)
                           CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE_MASK;
     if (enable) v |= bits; else v &= ~bits;
     cp_wreg_logged(dev, "CP_INT_CNTL_RING0", reg, v);
-    CP_LOG("EOP + command-stream-error interrupts %s", enable ? "enabled" : "disabled");
+    const uint32_t mecReg = CP_REG(dev, CP_ME1_PIPE0_INT_CNTL);
+    uint32_t mv = RREG32(dev, mecReg);
+    const uint32_t mecBits = CP_ME1_PIPE0_INT_CNTL__TIME_STAMP_INT_ENABLE_MASK |
+                             CP_ME1_PIPE0_INT_CNTL__GENERIC0_INT_ENABLE_MASK;
+    if (enable) mv |= mecBits; else mv &= ~mecBits;
+    cp_wreg_logged(dev, "CP_ME1_PIPE0_INT_CNTL", mecReg, mv);
+    CP_LOG("EOP + command-stream-error interrupts (GFX + MEC pipe 0) %s", enable ? "enabled" : "disabled");
     return kIOReturnSuccess;
 }
 

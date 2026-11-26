@@ -184,8 +184,8 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         N1C_LOG("open refused (ExclusiveAccess): a native client is already open");
         return kIOReturnExclusiveAccess;
     }
-    lazy_lock(&gCliLock); lazy_lock(&gRingLock); lazy_lock(&gHangLock); lazy_lock(&gTlbLock); lazy_lock(&gWaitLock);
-    if (!gCliLock || !gRingLock || !gHangLock || !gTlbLock || !gWaitLock) { if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag); return kIOReturnNoMemory; }
+    lazy_lock(&gCliLock); lazy_lock(&gRingLock); lazy_lock(&gKcqRingLock); lazy_lock(&gHangLock); lazy_lock(&gTlbLock); lazy_lock(&gWaitLock);
+    if (!gCliLock || !gRingLock || !gKcqRingLock || !gHangLock || !gTlbLock || !gWaitLock) { if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag); return kIOReturnNoMemory; }
     gCtx = &ctx;
 
     // The whole open runs under the client lock so a racing close cannot see a half-built session.
@@ -233,6 +233,7 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             gPark.have = true;
         }
         if (!gWcInit) { gWc = cp.wptr; gWcInit = true; }   // the ring is idle: the counter starts at the hardware wptr and never restarts
+        if (!gKcqWcInit && ctx.kcq.inited && ctx.kcq.mapped) { gKcqWc = ctx.kcq.wptr; gKcqWcInit = true; }
         // The session record. Slot 0 is the static gSess; slots 1..63 are allocated once (switch ON) and never freed. Its lock is kept across opens.
         if (gSlot[slot] == nullptr) {
             Session *ns = static_cast<Session *>(IOMalloc(sizeof(Session)));
@@ -259,10 +260,14 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         if (openNow == 0u) {
             // The first session: zero the native seqno slot while the ring is idle, restart the count, and start the clock.
             *seq_slot() = 0ull;
+            if (kcq_seq_slot() != nullptr) *kcq_seq_slot() = 0ull;
             sysmem_wmb();
             __atomic_store_n(&gEmitted, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&gKcqEmitted, 0ull, __ATOMIC_RELEASE);
             gVmidPool.resetFences();
-            gHang.lastRetired = 0; gHang.tProgress = now_ns();
+            const uint64_t tNow = now_ns();
+            gHang.lastRetired = 0; gHang.tProgress = tNow;
+            gKcqHang.lastRetired = 0; gKcqHang.tProgress = tNow;
         }
         if (pinnedVmid && program_root(vmid, s->rootPa) != kOk) { rc = kIOReturnNotReady; break; }
         __atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);   // 0.0.609
@@ -478,7 +483,8 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
     const IPVersion v = c.dev->ip.getVersion(IPBlock::GC);
     const uint64_t em = emitted_now();
     o->abi_version = RDNA4N_ABI_VERSION; o->kext_build = kN1cKextBuild;
-    o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u) | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
+    o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u) | (async_compute_on() ? RDNA4N_CAP_ASYNC_COMPUTE : 0u) |
+               (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
     o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));

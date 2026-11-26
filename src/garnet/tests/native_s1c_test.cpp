@@ -641,11 +641,11 @@ static void u12_pins(const std::string &root) {
                  em = eng.find("__atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);", re), hf = eng.find("amdgpu_hdp_flush(dev)", em), db = eng.find("WDOORBELL64(dev, off, wptr64)", re);
     expect(re != std::string::npos && sp != std::string::npos && wr != std::string::npos && on != std::string::npos && em != std::string::npos && hf != std::string::npos && db != std::string::npos, "ring_put_locked's steps are present");
     expect(re < sp && sp < wr && wr < on && on < em && em < hf && hf < db, "ORDER in ring_put_locked: space check, ring write, owner record, emitted++, HDP flush, doorbell");
-    expect_u("the ring is written in exactly one place", count_of(eng, "ring[ring_idx(wc, mask)] = dw[i]"), 1);
+    expect_u("each hardware ring (GFX + MEC KCQ) is written in exactly one place", count_of(eng, "ring[ring_idx(wc, mask)] = dw[i]"), 2);
     expect_u("0.0.623: the only other ring stores are G1's NOP fills (the scrub outside the live range, the remap clear) and 0.0.627's recovery scrub", count_of(eng, "ring[i] = cp_p3_nop1();"), 3);
     { const size_t g1b = eng.find("// ==== 0.0.623: GPU-apps stage G1"), sc = eng.find("static void g2_scrub_locked("), n1 = eng.find("ring[i] = cp_p3_nop1();"), n2 = eng.find("ring[i] = cp_p3_nop1();", n1 + 1);
       expect(sc != std::string::npos && n1 > sc && n1 < eng.find("\n}\n", sc) && n2 > g1b, "the NOP fills: one in g2_scrub_locked (the recovery), the other two inside the G1 block"); }
-    expect_u("the doorbell is rung in exactly one place", count_of(eng, "WDOORBELL64("), 1);
+    expect_u("each hardware ring's doorbell (GFX + MEC KCQ) is rung in exactly one place", count_of(eng, "WDOORBELL64("), 2);
     { const std::string rs = fn_body(eng, "static uint32_t ring_submit(");
       expect(!rs.empty() && in_order(rs, { "IOLockLock(gRingLock);", "const uint64_t seq = emitted_now() + 1ull;", "build_submit(gSubmitBuf,", "ring_put_locked(gSubmitBuf, n, seq,", "IOLockUnlock(gRingLock);", "if (er == kTimeout) { (void)stall_from_wait(); return kTimeout; }" }),
              "ring_submit: the ring lock is held over the seqno, the build and the put (incl. the space check); a 2 s space wait goes to the stall path AFTER the lock is dropped"); }
@@ -656,7 +656,7 @@ static void u12_pins(const std::string &root) {
     expect(eng.find("resolve_fence(s, v.fenceHandle") < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "the fence target is resolved BEFORE the ring is touched");
     expect(eng.find("va_exec_covered(s->maps") < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "the IB coverage check is BEFORE the ring is touched");
     expect(eng.find("const uint32_t gate = gpu_gate(s);", eng.find("IOReturn n1c_submit(")) < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "Submit takes the HUNG gate first");
-    expect(eng.find("cs_parse(in, size, &v)") < eng.find("IOLockLock(gCliLock);", eng.find("IOReturn n1c_submit(")), "the chunk is parsed before the lock");
+    expect(eng.find("cs_parse(in, size, &v,") < eng.find("IOLockLock(gCliLock);", eng.find("IOReturn n1c_submit(")), "the chunk is parsed before the lock");
     expect(eng.find("wb_bus + kWbOffsetNativeSeq") != std::string::npos, "the seqno slot address is the WB page + the slot offset");
     // WaitSeq and ReadRegs do not need an allocator snapshot.
     for (const char *fn : { "IOReturn n1c_wait(", "IOReturn n1c_read_regs(" }) {
@@ -880,9 +880,72 @@ static void u15_huge_2m() {
     }
 }
 
+static void u16_async_compute() {
+    // 1. ABI constants and boot-arg kill-switch policy.
+    expect_u("RDNA4N_HW_IP_COMPUTE is 1", RDNA4N_HW_IP_COMPUTE, 1u);
+    expect_u("RDNA4N_CAP_ASYNC_COMPUTE is bit 6", RDNA4N_CAP_ASYNC_COMPUTE, 1u << 6);
+    expect_u("RDNA4N_SEQ_RING_COMPUTE is bit 62", RDNA4N_SEQ_RING_COMPUTE, 1ull << 62);
+    expect(async_compute_boot_enabled(false, 0u) && async_compute_boot_enabled(true, 1u) && !async_compute_boot_enabled(true, 0u),
+           "garnet-async-compute default ON, =0 disables");
+    expect(async_compute_active(true, true, true) && !async_compute_active(false, true, true) &&
+           !async_compute_active(true, false, true) && !async_compute_active(true, true, false),
+           "async compute active requires kcqMapped && kcqTestPassed && bootArgOn");
+
+    // 2. Seqno bit-62 ring tag helpers.
+    expect(!seq_is_compute(0ull) && !seq_is_compute(42ull) && !seq_is_compute(RDNA4N_SEQ_LAST),
+           "GFX seqnos and RDNA4N_SEQ_LAST are not compute-tagged");
+    const uint64_t c0 = seq_with_ring(0ull, true), c7 = seq_with_ring(7ull, true);
+    expect(seq_is_compute(c0) && seq_raw(c0) == 0ull && seq_ring_index(c0) == 1u, "compute seq 0 tagged properly");
+    expect(seq_is_compute(c7) && seq_raw(c7) == 7ull && seq_ring_index(c7) == 1u, "compute seq 7 tagged properly");
+    expect(seq_with_ring(7ull, false) == 7ull && seq_ring_index(7ull) == 0u, "GFX seq 7 untagged");
+
+    // 3. cs_parse with allowCompute=false vs allowCompute=true (including mixed-IP rejection).
+    CsView v {};
+    {
+        auto b = mk_cs(2);
+        set32(b, 32 + 20, RDNA4N_HW_IP_COMPUTE);
+        set32(b, 32 + 32 + 20, RDNA4N_HW_IP_COMPUTE);
+        expect_u("compute CS rejected when allowCompute=false", cs_parse(b.data(), (uint32_t)b.size(), &v, false), kBadArg);
+        expect_u("compute CS accepted when allowCompute=true", cs_parse(b.data(), (uint32_t)b.size(), &v, true), kOk);
+        expect_u("parsed ipType is RDNA4N_HW_IP_COMPUTE", v.ipType, RDNA4N_HW_IP_COMPUTE);
+    }
+    {
+        auto b = mk_cs(2);
+        set32(b, 32 + 20, RDNA4N_HW_IP_GFX);
+        set32(b, 32 + 32 + 20, RDNA4N_HW_IP_COMPUTE);
+        expect_u("mixed GFX + COMPUTE in one CS rejected", cs_parse(b.data(), (uint32_t)b.size(), &v, true), kBadArg);
+        expect_u("mixed IP names offending IB 1", v.badIb, 1u);
+    }
+    {
+        auto b = mk_cs(1);
+        set32(b, 32 + 20, 2u);
+        expect_u("unknown ipType 2 rejected even with allowCompute=true", cs_parse(b.data(), (uint32_t)b.size(), &v, true), kBadArg);
+    }
+
+    // 4. MEC compute packet builder (no CONTEXT_CONTROL, INDIRECT_BUFFER_VALID set, raw seq in kernel slot, tagged seq in user fence).
+    expect_u("compute_submit_dwords(1, false)", compute_submit_dwords(1, false), 12u);
+    expect_u("compute_submit_dwords(1, true)", compute_submit_dwords(1, true), 20u);
+    expect_u("compute_submit_dwords(64, true)", compute_submit_dwords(64, true), 272u);
+    uint32_t o[32] = {};
+    const uint64_t va[2] = { 0xffff800100001000ull, 0xffff800100002000ull };
+    const uint32_t by[2] = { 64u, 128u };
+    const uint64_t fAddr = 0x8400001000ull, sAddr = 0x8400002000ull;
+    const uint64_t rawSeq = 9ull, tagSeq = seq_with_ring(rawSeq, true);
+    const uint32_t n = build_compute_submit(o, 32u, va, by, 2u, 11u, true, fAddr, tagSeq, sAddr, rawSeq);
+    expect_u("2-IB compute submit + user fence = 24 dwords", n, 24u);
+    expect_u("dw0 is INDIRECT_BUFFER (no CONTEXT_CONTROL)", o[0], amdgpu::cp_p3(amdgpu::kP3_INDIRECT_BUFFER, 2));
+    expect_u("IB0 control sets INDIRECT_BUFFER_VALID | dwords | vmid<<24", o[3], amdgpu::kP3_INDIRECT_BUFFER_VALID | 16u | (11u << 24));
+    expect_u("IB1 control sets INDIRECT_BUFFER_VALID | dwords | vmid<<24", o[7], amdgpu::kP3_INDIRECT_BUFFER_VALID | 32u | (11u << 24));
+    expect_u("user fence receives tagged seq lo", o[8 + 5], (uint32_t)(tagSeq & 0xFFFFFFFFu));
+    expect_u("user fence receives tagged seq hi (bit 62)", o[8 + 6], (uint32_t)(tagSeq >> 32));
+    expect_u("kernel seq slot receives raw seq lo", o[16 + 5], (uint32_t)(rawSeq & 0xFFFFFFFFu));
+    expect_u("kernel seq slot receives raw seq hi (0)", o[16 + 6], 0u);
+    expect_u("too-small buffer rejected", build_compute_submit(o, 23u, va, by, 2u, 11u, true, fAddr, tagSeq, sAddr, rawSeq), 0u);
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
-    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u14_gfx12_dcc(); u15_huge_2m(); u12_pins(root);
+    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u14_gfx12_dcc(); u15_huge_2m(); u16_async_compute(); u12_pins(root);
     std::printf("native_s1c_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

@@ -112,6 +112,7 @@ struct Session {
     uint64_t  importedBytes;   // 0.0.612: host-import bytes held (cap kImportCap, separate from the GTT cap)
     uint32_t  nBos;
     uint64_t  emitted;         // seqno of THIS session's last Submit (0.0.627: the global count is gEmitted). Written under gRingLock; atomics
+    uint64_t  emittedKcq;      // raw monotonic seqno of THIS session's last KCQ compute Submit. Written under gKcqRingLock; atomics
     // 0.0.627 (G2): identity. lock / slot / vmid never change once the slot exists; id / open / ws are written under gCliLock at open and close.
     IOLock   *lock;            // THIS session's lock: its tables and counters (the old client lock's job for one session). Allocated with the slot, never freed
     uint32_t  slot, vmid, id;  // id: unique per open (1, 2, 3 ...), the client's N1cRef carries it; 0 = never opened; vmid is pinned (8) or dynamically pooled (9..15, 0 = unbound)
@@ -141,9 +142,13 @@ extern uint32_t gPtN, gPtFreeN;
 extern uint64_t gWc;
 extern bool gWcInit;
 extern uint64_t gEmitted;
+extern uint64_t gKcqWc;
+extern bool gKcqWcInit;
+extern uint64_t gKcqEmitted;
 extern BringupContext *gCtx;
 extern volatile UInt32 gOpenFlag;
 extern Hang gHang;
+extern Hang gKcqHang;
 // THE LOCK MAP (0.0.627, G2). Order: a session's own lock -> gCliLock -> gRingLock -> gHangLock; gTlbLock is a leaf (nothing is taken under it).
 //   Session::lock  one per session: that session's BO / map / ctx / fence-slot tables, its counters and hello. Held for a whole selector body, INCLUDING
 //                  its own-seqno waits (own_wait), and NEVER while another session's lock is wanted.
@@ -158,7 +163,7 @@ extern Hang gHang;
 //   gWaitLock      Stage 2A leaf lock for IRQ-driven waiter sleep/wakeup (never nested above any other lock).
 // A GPU-dependent check that may RUN a recovery (gpu_gate, hang_poll, own_wait, stall_from_wait) is called with at most the caller's own session lock:
 // never with gCliLock or gRingLock held.
-extern IOLock *gCliLock, *gRingLock, *gHangLock, *gTlbLock, *gWaitLock;
+extern IOLock *gCliLock, *gRingLock, *gKcqRingLock, *gHangLock, *gTlbLock, *gWaitLock;
 extern uint32_t gSessSeqCounter;
 extern volatile UInt32 gSessWs;
 extern FenceWindow gWin[kMaxSessions];
@@ -185,6 +190,7 @@ bool multi_on();
 bool apps_on();
 bool dcc_on();
 bool hugepage_on();
+bool async_compute_on();
 uint64_t appvis_cap();
 bool g1_holds();
 Session *sess_lock(const N1cRef &r, bool needHello);
@@ -215,6 +221,18 @@ static inline uint64_t emitted_now() { return __atomic_load_n(&gEmitted, __ATOMI
 static inline uint64_t retired_now(uint64_t emitted) {
     sysmem_rmb();
     return retired_clamped(*seq_slot(), emitted);
+}
+static inline volatile uint64_t *kcq_seq_slot() {
+    return (gCtx != nullptr && gCtx->kcq.wb_cpu != nullptr)
+        ? reinterpret_cast<volatile uint64_t *>(static_cast<uint8_t *>(gCtx->kcq.wb_cpu) + kWbOffsetNativeSeq)
+        : nullptr;
+}
+static inline uint64_t kcq_emitted_now() { return __atomic_load_n(&gKcqEmitted, __ATOMIC_ACQUIRE); }
+static inline uint64_t kcq_retired_now(uint64_t emitted) {
+    volatile uint64_t *slot = kcq_seq_slot();
+    if (slot == nullptr) return 0ull;
+    sysmem_rmb();
+    return retired_clamped(*slot, emitted);
 }
 static inline bool hung_now() { return __atomic_load_n(&gHang.hung, __ATOMIC_ACQUIRE); }
 static inline void ensure_vmid_pool_locked() {

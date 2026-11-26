@@ -58,6 +58,14 @@ struct Place { uint32_t rc; uint32_t kind; uint64_t size; uint64_t align; bool u
 constexpr bool dcc_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
 // Kill-switch boot-arg `garnet-hugepage=0`: default ON when absent or nonzero.
 constexpr bool hugepage_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
+// Kill-switch boot-arg `garnet-async-compute=0`: default ON when absent or nonzero.
+constexpr bool async_compute_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
+constexpr bool async_compute_active(bool kcqMapped, bool kcqTestPassed, bool bootArgOn) { return kcqMapped && kcqTestPassed && bootArgOn; }
+// Compute-ring seqno tag (bit 62). RDNA4N_SEQ_LAST (all-ones) always targets the GFX ring.
+constexpr bool seq_is_compute(uint64_t seq) { return seq != RDNA4N_SEQ_LAST && (seq & RDNA4N_SEQ_RING_COMPUTE) != 0ull; }
+constexpr uint64_t seq_raw(uint64_t seq) { return seq & ~RDNA4N_SEQ_RING_COMPUTE; }
+constexpr uint64_t seq_with_ring(uint64_t raw, bool isCompute) { return isCompute ? (raw | RDNA4N_SEQ_RING_COMPUTE) : raw; }
+constexpr uint32_t seq_ring_index(uint64_t seq) { return seq_is_compute(seq) ? 1u : 0u; }
 // Opportunistic 2 MiB VRAM alignment ONLY when `size` is an exact multiple of 2 MiB (zero rounding waste in VRAMBumpAllocator).
 constexpr uint64_t bo_alloc_align(uint64_t size, uint64_t reqAlign, bool hugeOn) {
     return (hugeOn && size >= kHuge2mBytes && (size & kHuge2mMask) == 0ull && reqAlign < kHuge2mBytes) ? kHuge2mBytes : reqAlign;
@@ -609,11 +617,12 @@ constexpr uint32_t kIbKnownFlags = kIbUnsupportedFlags | RDNA4N_IB_FLAG_PREAMBLE
 constexpr uint32_t kIbMaxDw = 0xFFFFFu;
 inline uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 inline uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32); }
-struct CsView { uint32_t ctx, nIbs, flags, fenceHandle, fenceOffset; uint32_t badIb; };
+struct CsView { uint32_t ctx, nIbs, flags, fenceHandle, fenceOffset; uint32_t badIb; uint32_t ipType; };
 // Validates the header and every IB record: `size` must be exactly 32 + 32*num_ibs (checked against num_ibs read from the bytes, so a
 // short buffer can never be over-read). Returns kOk / kBadArg / kUnsupported; nothing here touches the ring.
-inline uint32_t cs_parse(const uint8_t *p, uint32_t size, CsView *v) {
+inline uint32_t cs_parse(const uint8_t *p, uint32_t size, CsView *v, bool allowCompute = false) {
     v->badIb = 0xFFFFFFFFu;
+    v->ipType = RDNA4N_HW_IP_GFX;
     if (p == nullptr || size < kCsHdr) return kBadArg;
     if (rd32(p + 0) != RDNA4N_ABI_VERSION) return kBadArg;
     v->ctx = rd32(p + 4); v->nIbs = rd32(p + 8); v->flags = rd32(p + 12);
@@ -628,7 +637,10 @@ inline uint32_t cs_parse(const uint8_t *p, uint32_t size, CsView *v) {
         const uint32_t pad = rd32(r + 0), fl = rd32(r + 4), bytes = rd32(r + 16), ipType = rd32(r + 20), ipInst = rd32(r + 24), ring = rd32(r + 28);
         const uint64_t va = rd64(r + 8);
         v->badIb = i;
-        if (pad != 0u || ipType != RDNA4N_HW_IP_GFX || ipInst != 0u || ring != 0u) return kBadArg;
+        const bool ipOk = (ipType == RDNA4N_HW_IP_GFX) || (allowCompute && ipType == RDNA4N_HW_IP_COMPUTE);
+        if (pad != 0u || !ipOk || ipInst != 0u || ring != 0u) return kBadArg;
+        if (i == 0u) v->ipType = ipType;
+        else if (ipType != v->ipType) return kBadArg;
         if ((fl & ~kIbKnownFlags) != 0u) return kBadArg;
         if ((fl & kIbUnsupportedFlags) != 0u) return kUnsupported;
         if (bytes == 0u || (bytes & 3u) != 0u || bytes > kIbMaxDw * 4u) return kBadArg;
@@ -654,6 +666,9 @@ constexpr uint32_t ring_advance(uint32_t wptr, uint32_t n, uint32_t mask) { retu
 // 3 (CONTEXT_CONTROL) + 4 per IB + 8 for the kernel seqno RELEASE_MEM + 8 for the user fence when asked.
 constexpr uint32_t submit_dwords(uint32_t nIbs, bool hasFence) { return 3u + 4u * nIbs + 8u + (hasFence ? 8u : 0u); }
 static_assert(submit_dwords(RDNA4N_MAX_IBS, true) == 275u, "the contract's 275 dwords for n = 64");
+// MEC compute ring: no CONTEXT_CONTROL; 4 per IB + 8 for kernel seqno RELEASE_MEM + 8 for optional user fence.
+constexpr uint32_t compute_submit_dwords(uint32_t nIbs, bool hasFence) { return 4u * nIbs + 8u + (hasFence ? 8u : 0u); }
+static_assert(compute_submit_dwords(RDNA4N_MAX_IBS, true) == 272u, "MEC compute submit fits in 272 dwords for n = 64");
 
 // ---- the HUNG latch -------------------------------------------------------------------------------------------------------------
 constexpr uint64_t kHangNs = 2000000000ull;
@@ -727,6 +742,24 @@ inline uint32_t build_submit(uint32_t *o, uint32_t cap, const uint64_t *ibVa, co
     }
     if (hasFence) k += emit_release_mem(o + k, fenceAddr, seq);
     k += emit_release_mem(o + k, seqAddr, seq);
+    return k == need ? k : 0u;
+}
+// MEC compute Submit: no CONTEXT_CONTROL, INDIRECT_BUFFER carries kP3_INDIRECT_BUFFER_VALID, optional user fence gets
+// tagged fenceData, trailing kernel seqno slot gets monotonic raw seqRaw.
+inline uint32_t build_compute_submit(uint32_t *o, uint32_t cap, const uint64_t *ibVa, const uint32_t *ibBytes, uint32_t n, uint32_t vmid,
+                                     bool hasFence, uint64_t fenceAddr, uint64_t fenceData, uint64_t seqAddr, uint64_t seqRaw) {
+    if (n < 1u || n > RDNA4N_MAX_IBS || vmid > 15u || (seqAddr & 7ull) != 0ull || (hasFence && (fenceAddr & 7ull) != 0ull)) return 0u;
+    const uint32_t need = compute_submit_dwords(n, hasFence);
+    if (cap < need) return 0u;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        o[k++] = amdgpu::cp_p3(amdgpu::kP3_INDIRECT_BUFFER, 2);
+        o[k++] = (uint32_t)(ibVa[i] & 0xFFFFFFFFu);
+        o[k++] = (uint32_t)(ibVa[i] >> 32);
+        o[k++] = amdgpu::kP3_INDIRECT_BUFFER_VALID | (ibBytes[i] / 4u) | (vmid << 24);
+    }
+    if (hasFence) k += emit_release_mem(o + k, fenceAddr, fenceData);
+    k += emit_release_mem(o + k, seqAddr, seqRaw);
     return k == need ? k : 0u;
 }
 

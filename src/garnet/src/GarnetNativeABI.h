@@ -33,7 +33,8 @@
 #define RDNA4N_MAX_CTX       64u              /* ids 1..64 */
 #define RDNA4N_FENCE_SLOTS   16u
 #define RDNA4N_WAIT_CAP_NS   2000000000ull
-#define RDNA4N_SEQ_LAST      0xFFFFFFFFFFFFFFFFull   /* WaitSeq: "last emitted at entry" */
+#define RDNA4N_SEQ_LAST      0xFFFFFFFFFFFFFFFFull   /* WaitSeq: "last emitted at entry" (GFX ring) */
+#define RDNA4N_SEQ_RING_COMPUTE (1ull << 62)         /* Tag bit identifying a KCQ/compute-ring seqno (raw seqno in bits 61:0) */
 
 /* ---- selectors of the native client (own numbering; type 0 is the legacy GarnetUserClient) ---------------- */
 enum {
@@ -156,6 +157,7 @@ RDNA4N_STATIC_ASSERT(sizeof(struct rdna4n_buffer_op) == 48, "buffer op is 48 B")
 #define RDNA4N_CTX_QUERY2_GUILTY    (1ull << 2)
 
 #define RDNA4N_HW_IP_GFX            0u
+#define RDNA4N_HW_IP_COMPUTE        1u               /* MEC async compute ring (enabled when RDNA4N_CAP_ASYNC_COMPUTE is advertised) */
 #define RDNA4N_IB_FLAG_CE                  (1u << 0)   /* Unsupported */
 #define RDNA4N_IB_FLAG_PREAMBLE            (1u << 1)   /* accepted, ignored: a preamble is always executed */
 #define RDNA4N_IB_FLAG_PREEMPT             (1u << 2)   /* accepted, ignored */
@@ -218,6 +220,7 @@ struct rdna4n_info {                 /* 192 B */
 #define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
 #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
 #define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
+#define RDNA4N_CAP_ASYNC_COMPUTE  (1u << 6)   /* Dedicated MEC async compute ring (RDNA4N_HW_IP_COMPUTE, seqno bit 62 tag; kill-switch: garnet-async-compute=0) */
 /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
  *   reserved[3] = RDNA4N_BUDGET_* flags
