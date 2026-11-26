@@ -132,6 +132,58 @@ int main() {
         if (m.id == amdgpu::PPSMC::GetDpmFreqByIndex || m.id == amdgpu::PPSMC::SetHardMinByFreq) ++any_dpm_query;
     expect(any_dpm_query == 0, "failed EnableAllSmuFeatures skips DPM clock pinning");
 
+    // Wave 10: SMU IF 0x2E..0x33 verification and effective GFXCLK decoding.
+    expect(!amdgpu::smu_driver_if_verified(0x2Du), "IF 0x2D is below verified range");
+    expect(amdgpu::smu_driver_if_verified(0x2Eu), "IF 0x2E is verified");
+    expect(amdgpu::smu_driver_if_verified(0x33u), "IF 0x33 (RX 9060 XT PMFW) is verified");
+    expect(!amdgpu::smu_driver_if_verified(0x34u), "unknown newer IF 0x34 stays unverified");
+
+    // Active load (RX 9060 XT live 143 W FP32 snapshot: CurrClock stuck at 1000, PreDs 3088).
+    amdgpu::SmuMetrics active {};
+    active.CurrClock[amdgpu::SMUClk::GFXCLK] = 1000u;
+    active.CurrClock[amdgpu::SMUClk::UCLK]   = 1258u;
+    active.AverageGfxclkFrequencyTarget = 3130u;
+    active.AverageGfxclkFrequencyPreDs  = 3088u;
+    active.AverageGfxclkFrequencyPostDs = 2900u;
+    active.AverageGfxActivity = 100u;
+    active.AverageUclkActivity = 3u;
+    active.AvgTemperature[amdgpu::SMUTemp::EDGE]    = 49u;
+    active.AvgTemperature[amdgpu::SMUTemp::HOTSPOT] = 53u;
+    expect(amdgpu::smu_effective_gfxclk_mhz(active) == 3088u,
+           "active load selects AverageGfxclkFrequencyPreDs over static CurrClock 1000");
+    expect(amdgpu::smu_metrics_plausible(active), "active RX 9060 XT metrics pass plausibility");
+
+    // Low activity (<= 5%) selects PostDs (deep-sleep effective clock).
+    amdgpu::SmuMetrics idle = active;
+    idle.AverageGfxActivity = 5u;
+    idle.AverageGfxclkFrequencyPostDs = 420u;
+    expect(amdgpu::smu_effective_gfxclk_mhz(idle) == 420u,
+           "low activity (<= 5%) selects AverageGfxclkFrequencyPostDs");
+    idle.AverageGfxActivity = 6u;
+    expect(amdgpu::smu_effective_gfxclk_mhz(idle) == 3088u,
+           "activity > 5% switches back to AverageGfxclkFrequencyPreDs");
+
+    // Fallbacks when primary average clock is 0.
+    amdgpu::SmuMetrics fb = idle;
+    fb.AverageGfxActivity = 0u;
+    fb.AverageGfxclkFrequencyPostDs = 0u;
+    expect(amdgpu::smu_effective_gfxclk_mhz(fb) == 3088u,
+           "zero PostDs at idle falls back to PreDs");
+    fb.AverageGfxclkFrequencyPreDs = 0u;
+    expect(amdgpu::smu_effective_gfxclk_mhz(fb) == 1000u,
+           "zero PreDs and PostDs falls back to CurrClock[GFXCLK]");
+
+    // Plausibility rejects corrupted/shifted fields.
+    amdgpu::SmuMetrics badClk = active;
+    badClk.AverageGfxclkFrequencyPreDs = 5500u;
+    expect(!amdgpu::smu_metrics_plausible(badClk), "out-of-range effective GFXCLK fails plausibility");
+    amdgpu::SmuMetrics badTemp = active;
+    badTemp.AvgTemperature[amdgpu::SMUTemp::HOTSPOT] = 40u;
+    expect(!amdgpu::smu_metrics_plausible(badTemp), "hotspot < edge fails plausibility");
+    amdgpu::SmuMetrics badAct = active;
+    badAct.AverageGfxActivity = 101u;
+    expect(!amdgpu::smu_metrics_plausible(badAct), "activity > 100% fails plausibility");
+
     std::printf("smu setup: %u failed; simulated PMFW, no hardware access\n", failures);
     return failures ? 1 : 0;
 }

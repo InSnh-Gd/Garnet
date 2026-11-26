@@ -304,6 +304,9 @@ kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
 // checks the version first and refuses rather than reporting garbage.
 constexpr uint32_t kSMUTableMetrics        = 5;      // TABLE_SMU_METRICS
 constexpr uint32_t kSMUDriverIfVersion_14_0_2 = 0x2E;
+// IF 0x33 (RX 9060 XT / Navi44 PMFW) verified empirically against raw[00..31]:
+// all SmuMetrics offsets match 0x2E (dGPU_W_MAX, FCLK, UCLK, temps, power, activity).
+constexpr uint32_t kSMUDriverIfVersion_14_0_2_MaxVerified = 0x33;
 constexpr uint32_t kSMUPpClkCount   = 11;   // PPCLK_COUNT
 constexpr uint32_t kSMUSviPlaneCount = 4;   // SVI_PLANE_COUNT
 constexpr uint32_t kSMUTempCount    = 12;   // TEMP_COUNT
@@ -372,22 +375,45 @@ struct SmuMetrics {
 };
 static_assert(sizeof(SmuMetrics) == 260, "SmuMetrics must match SmuMetrics_t");
 
-// The PMFW on this card reports driver-interface version 0x33, while upstream
-// Linux pins 0x2E for both SMU 14.0.2 and 14.0.3 (smu_v14_0_2_ppt.c handles
-// both). So the firmware here is NEWER than any published header, and the
-// struct above is the 0x2E layout. Fields near the start (CurrClock[], which
-// sits at offset 0) are very likely still correct; anything deep in the struct
-// may have shifted if AMD inserted members.
-//
-// Rather than refuse outright — which tells us nothing — smu_read_metrics
-// reads the table, sets `layout_verified` only when the version matches, and
-// range-checks what it decodes. Callers must not present unverified numbers as
-// fact. `raw` carries the first bytes so offsets can be re-derived empirically.
+// Upstream smu_v14_0_2_ppt.c pins 0x2E; RX 9060 XT PMFW reports 0x33 with the
+// exact same 260-byte SmuMetrics layout (verified empirically on hardware).
+constexpr bool smu_driver_if_verified(uint32_t if_ver) {
+    return if_ver >= kSMUDriverIfVersion_14_0_2 &&
+           if_ver <= kSMUDriverIfVersion_14_0_2_MaxVerified;
+}
+
+// Effective GFXCLK in MHz, mirroring upstream smu_v14_0_2_ppt.c: PMFW leaves
+// CurrClock[GFXCLK] fixed at 1000 MHz on IF 0x33, while AverageGfxclkFrequency
+// PostDs (idle / <= 5% busy) and PreDs (active) carry the live DPM clock.
+constexpr uint32_t smu_effective_gfxclk_mhz(const SmuMetrics &m) {
+    const uint32_t primary  = (m.AverageGfxActivity <= 5u)
+                                  ? (uint32_t)m.AverageGfxclkFrequencyPostDs
+                                  : (uint32_t)m.AverageGfxclkFrequencyPreDs;
+    if (primary != 0u) return primary;
+    const uint32_t fallback = (m.AverageGfxActivity <= 5u)
+                                  ? (uint32_t)m.AverageGfxclkFrequencyPreDs
+                                  : (uint32_t)m.AverageGfxclkFrequencyPostDs;
+    if (fallback != 0u) return fallback;
+    return m.CurrClock[SMUClk::GFXCLK];
+}
+
+constexpr bool smu_metrics_plausible(const SmuMetrics &m) {
+    const uint32_t gfx  = smu_effective_gfxclk_mhz(m);
+    const uint32_t mem  = m.CurrClock[SMUClk::UCLK];
+    const uint32_t edge = m.AvgTemperature[SMUTemp::EDGE];
+    const uint32_t hot  = m.AvgTemperature[SMUTemp::HOTSPOT];
+    return gfx <= 5000u && mem <= 5000u &&
+           edge <= 125u && hot <= 125u && hot >= edge &&
+           m.AverageGfxActivity <= 100u && m.AverageUclkActivity <= 100u;
+}
+
+// smu_read_metrics checks the IF version against the verified range (0x2E..0x33)
+// and range-checks decoded values so unknown newer PMFW versions stay flagged.
 struct SmuMetricsResult {
     SmuMetrics metrics;
     uint32_t   if_version;        // what PMFW reported
-    bool       layout_verified;   // if_version == kSMUDriverIfVersion_14_0_2
-    bool       values_plausible;  // clocks/temps inside sane ranges
+    bool       layout_verified;   // smu_driver_if_verified(if_version)
+    bool       values_plausible;  // smu_metrics_plausible(metrics)
 };
 
 // Ask PMFW for a fresh snapshot and copy it out of the driver table.

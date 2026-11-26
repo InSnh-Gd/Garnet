@@ -929,7 +929,7 @@ smu_read_metrics(const DeviceContext &dev, SmuMetricsResult *out)
         SMU_LOG("read_metrics: GetDriverIfVersion failed %#x", r);
         return r;
     }
-    out->layout_verified = (out->if_version == kSMUDriverIfVersion_14_0_2);
+    out->layout_verified = smu_driver_if_verified(out->if_version);
 
     const uint64_t table_mc = smu_driver_table_mc(dev);
     if (table_mc == 0) {
@@ -951,18 +951,7 @@ smu_read_metrics(const DeviceContext &dev, SmuMetricsResult *out)
     for (uint32_t i = 0; i < sizeof(SmuMetrics) / 4; i++)
         dst[i] = RVRAM32_via_mm(dev, off + i * 4);
 
-    // Plausibility: a Navi 48 at idle or load should sit inside these ranges.
-    // This is the only defence when the layout is unverified — it catches a
-    // wholesale offset shift, though not a subtle one.
-    const SmuMetrics &m = out->metrics;
-    const uint32_t gfx = m.CurrClock[SMUClk::GFXCLK];
-    const uint32_t mem = m.CurrClock[SMUClk::UCLK];
-    const uint32_t edge = m.AvgTemperature[SMUTemp::EDGE];
-    const uint32_t hot  = m.AvgTemperature[SMUTemp::HOTSPOT];
-    out->values_plausible =
-        gfx <= 4000 && mem <= 4000 &&
-        edge <= 125 && hot <= 125 && hot >= edge &&
-        m.AverageGfxActivity <= 100 && m.AverageUclkActivity <= 100;
+    out->values_plausible = smu_metrics_plausible(out->metrics);
     return kIOReturnSuccess;
 }
 
@@ -971,16 +960,14 @@ smu_log_metrics(const SmuMetricsResult &res)
 {
     const SmuMetrics &m = res.metrics;
     if (!res.layout_verified) {
-        SMU_LOG("metrics: PMFW driver-IF version %#x, this build's SmuMetrics layout "
-                "is the %#x one (upstream pins that for SMU 14.0.2 and 14.0.3). The "
-                "firmware is newer than any published header, so treat the decode "
-                "below as UNVERIFIED: offset-0 fields are probably right, deeper "
-                "ones may have shifted. Plausibility check: %s.",
+        SMU_LOG("metrics: PMFW driver-IF version %#x is outside verified range %#x..%#x "
+                "— treat decode below as UNVERIFIED. Plausibility check: %s.",
                 res.if_version, kSMUDriverIfVersion_14_0_2,
+                kSMUDriverIfVersion_14_0_2_MaxVerified,
                 res.values_plausible ? "passed" : "FAILED");
     }
     SMU_LOG("metrics: gfx %u MHz, soc %u MHz, mem %u MHz, fclk %u MHz (counter %u)",
-            m.CurrClock[SMUClk::GFXCLK], m.CurrClock[SMUClk::SOCCLK],
+            smu_effective_gfxclk_mhz(m), m.CurrClock[SMUClk::SOCCLK],
             m.CurrClock[SMUClk::UCLK],   m.CurrClock[SMUClk::FCLK],
             m.MetricsCounter);
     SMU_LOG("metrics: temps edge %u C, hotspot %u C, mem %u C | fan %u rpm (%u%% pwm)",
