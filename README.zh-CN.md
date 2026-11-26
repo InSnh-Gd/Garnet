@@ -135,6 +135,6 @@ make -C src/garnet CHIPS=navi44 MKSDK=/path/to/MacKernelSDK all
 - [RX4Darwin/AMDRadeonRDNA4.kext](https://github.com/RX4Darwin/AMDRadeonRDNA4.kext)（BSD 3-Clause，Copyright (c) 2026 Sunneva N. Mariu，`next` @ `dded456d`）：非 Lilu 相关组件，包括 Navi 44 `ODM_MEM_PWR_CTRL2` 读写危险排除、CoreDisplay `AMD*` 帧缓冲类名前缀识别、DCN 4.01 128x128 硬件光标编程、RADV `VK_EXT_metal_surface` WSI 回退与 `radv-app.sh` 启动封装、VMID 精确 TLB 应答/隔离/稀疏页表回滚、无 Lilu S3 休眠唤醒与 DP DDC-to-AUX 恢复，以及 `GarnetGLDrawable` OpenGL-on-Metal 表面桥接（`supportsUnalignedVertexFetch`、`commitAndHold`、`setLineWidth:`）。
 - [RDNA4FB](https://github.com/somestupidgirl/RDNA4FB)（BSD 3-Clause，Copyright (c) 2026 Sunneva N. Mariu）：片上 IP 发现（`src/garnet/src/ipdiscovery.*`）、BAR5 映射与间接显存访问实现参考。
 - [mac-amdgpu](https://github.com/lemonade-sdk/mac-amdgpu)（MIT，Copyright (c) 2026 Geramy Loveless）：RDNA 4 IP 模块初始化顺序参考。
-- [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（MIT）、[metal2vulkan](https://github.com/steelbrain/metal2vulkan)（LGPL-3.0-or-later）及 [NullMoth Systems](https://github.com/nullmoth/nvidia-macos-driver)（LGPL-3.0-or-later 编译器补丁适配，见 [third-party/metal2vulkan-rdna4/NOTICE](third-party/metal2vulkan-rdna4/NOTICE)）。
+- [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（MIT）与 [metal2vulkan](https://github.com/steelbrain/metal2vulkan)（LGPL-3.0-or-later，衍生补丁说明见 [third-party/metal2vulkan-rdna4/NOTICE](third-party/metal2vulkan-rdna4/NOTICE)）。
 
 完整第三方许可条款及逐文件溯源见 [third-party/THIRD-PARTY-LICENSES.txt](third-party/THIRD-PARTY-LICENSES.txt)。本项目为独立开源驱动实验，与 AMD、Apple、Cobalt64 或 RX4Darwin 均无从属或官方背书关系。

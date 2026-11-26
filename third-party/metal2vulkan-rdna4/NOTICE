@@ -10,26 +10,6 @@ Upstream:   https://github.com/steelbrain/metal2vulkan   (LGPL-3.0-or-later,
             Copyright Anees Iqbal and contributors)
 Based on:   upstream commit 43c46ac8a24adf1a6e872b8a52c706ec9614fad0
 
-Additional compiler adaptations (patches 0032, 0038 and 0039):
-  NullMoth Systems, https://github.com/nullmoth/nvidia-macos-driver
-  commit 18ba05f38b5eadea8b5ae05834bb51c61fb4c5c3
-  translator/translator/src/passes/resources/sampler_array.rs and associated
-  stage-input materialization. The upstream root NOTICE explicitly licenses
-  the translator subtree and NullMoth modifications as LGPL-3.0-or-later.
-  Copyright (C) Anees Iqbal and contributors; modifications by NullMoth Systems.
-  Local changes preserve per-element descriptor reflection, sampler operation
-  usage and runtime coordinate provenance. No PolyForm Noncommercial plugin
-  source is included. The same LGPL source/distribution obligations apply.
-  Patch 0038 also adapts cube-array storage coordinate construction and pending
-  coordinate type lookup from passes/air_calls/images/{fetch_coord,write_read}.rs,
-  storage cube-array coordinate validation from native/owned_cfg.rs, cube-array
-  capability derivation from passes/module_cleanup.rs and the authored regression
-  native/tests/textures.rs::native_kernel_cube_array_write_texture_folds_slice_and_face_into_layer.
-  Patch 0039 adapts the cube-array read operand parser from the same
-  passes/air_calls/images/write_read.rs. Local lowering extends sampled cube-array
-  reads (unsupported in that reference), preserves explicit mip selection and
-  separates read and cube-coordinate logic into focused modules.
-
 Contents
   garnetxlate/    a new crate: an in-process C ABI (cdylib libgarnetxlate.dylib) around the
                translator, so a sandboxed process can turn AIR text into SPIR-V without

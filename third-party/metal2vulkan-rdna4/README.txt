@@ -385,11 +385,9 @@ gather-compare operations and Never/Always/Less compare functions.
 
 Patches 0032–0060
 =================
-Patch 0032 adapts NullMoth's LGPL constant direct sampler-array materializer,
-with local per-element reflection, ordinary/comparison representations and
-coordinate provenance. It does not provide dynamic direct sampler indexing.
-The source pin and attribution are in NOTICE; the separately licensed NullMoth
-Metal plugin is not part of this adaptation.
+Patch 0032 implements constant-indexed direct sampler-array materialization,
+with per-element descriptor reflection, ordinary/comparison representations, and
+runtime coordinate provenance. Dynamic direct sampler indexing remains separate.
 
 Patch 0033 adds reflection 65 / table ABI 9 null-shape registration. The sorted,
 duplicate-free null_shapes list carries canonical dimension, array, component,
@@ -456,7 +454,7 @@ both distinct comparison operations. Descriptor ambiguity checks stay strict.
 Cache tag: rdna4x-22-shared-comparison-descriptors; postpass: rdna4x-argument-resources-23-shared-comparison-descriptors.
 Reflection 65, resource-table ABI 9 and C ABI 3 are unchanged.
 
-Patch 0038 adapts NullMoth's LGPL cube-array storage-coordinate lowering and
+Patch 0038 implements cube and cube-array storage-coordinate lowering and
 capability derivation. Writes combine the cube slice and face as slice*6+face,
 use three integer coordinate components and require ImageCubeArray for storage
 arrays. The macOS zero-LOD requirement remains enforced at the correct operand.
@@ -469,8 +467,8 @@ texture creation and shape-matched dummy factory accept these forms and still
 require actual storage-image format support.
 Cache tag: rdna4x-23-cube-storage-shapes; postpass: rdna4x-argument-resources-24-cube-storage-shapes.
 
-Patch 0039 adapts NullMoth's cube-array read operand parsing and implements the
-sampled cube-array path that the reference rejects. Read lowering keeps face,
+Patch 0039 implements cube-array read operand parsing and sampled/storage
+cube-array texel reads. Read lowering keeps face,
 slice and LOD distinct. Sampled cubes use a texel-center direction and the existing
 exact synthesized nearest/nearest-mip sampler; size query and sample both use the
 read's explicit mip, including runtime LOD. Cube arrays append the cube slice as

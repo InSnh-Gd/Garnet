@@ -16,9 +16,9 @@ diff --git a/src/passes/air_calls/images/read.rs b/src/passes/air_calls/images/r
 +        };
 +        (coord, None, None, None)
 +    } else if cube && arrayed {
-         // NullMoth's cube-array AIR ABI: coord, face, slice, [offset], lod, access.
-         let base = if value_is_int_or_intvec(ctx, args[1]) {
-             1
+         cube_array_read_operands(ctx, args)?
+     } else {
+         let (coord, layer, lod) = read_operands(ctx, args, arrayed || cube)?;
 diff --git a/src/passes/resources/gpu_argument_graph.rs b/src/passes/resources/gpu_argument_graph.rs
 --- a/src/passes/resources/gpu_argument_graph.rs
 +++ b/src/passes/resources/gpu_argument_graph.rs

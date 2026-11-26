@@ -471,7 +471,7 @@
  mod fetch_coord;
 --- /dev/null
 +++ b/src/passes/air_calls/images/read.rs
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,440 @@
 +//! Sampler-less texture and depth reads.
 +
 +use super::*;
@@ -530,19 +530,7 @@
 +    // lod, access)`), so parse it with the arrayed shape.
 +    let cube = dim == Dim::DimCube;
 +    let (coord, layer, lod, slice) = if cube && arrayed {
-+        // NullMoth's cube-array AIR ABI: coord, face, slice, [offset], lod, access.
-+        let base = if value_is_int_or_intvec(ctx, args[1]) {
-+            1
-+        } else {
-+            2
-+        };
-+        let lod_at = base + if base == 2 && args.len() >= 8 { 4 } else { 3 };
-+        (
-+            *args.get(base).ok_or("air.read_texture missing coord")?,
-+            Some(*args.get(base + 1).ok_or("cube array read missing face")?),
-+            Some(*args.get(lod_at).ok_or("cube array read missing LOD")?),
-+            Some(*args.get(base + 2).ok_or("cube array read missing slice")?),
-+        )
++        cube_array_read_operands(ctx, args)?
 +    } else {
 +        let (coord, layer, lod) = read_operands(ctx, args, arrayed || cube)?;
 +        (coord, layer, lod, None)
@@ -898,6 +886,31 @@
 +        ));
 +    }
 +    Ok(out)
++}
++
++/// Unpack AIR `read_texture_cube_array` arguments:
++/// `(tex[, sampler], coord, face, slice[, offset], lod, access)`.
++fn cube_array_read_operands(
++    ctx: &Ctx,
++    args: &[Word],
++) -> Result<(Word, Option<Word>, Option<Word>, Option<Word>), String> {
++    let has_sampler = !value_is_int_or_intvec(ctx, args[1]);
++    let coord_slot = if has_sampler { 2 } else { 1 };
++    let has_offset = has_sampler && args.len() >= 8;
++    let lod_slot = coord_slot + if has_offset { 4 } else { 3 };
++    let coord = *args
++        .get(coord_slot)
++        .ok_or("air.read_texture missing coord")?;
++    let face = *args
++        .get(coord_slot + 1)
++        .ok_or("cube array read missing face")?;
++    let slice = *args
++        .get(coord_slot + 2)
++        .ok_or("cube array read missing slice")?;
++    let lod = *args
++        .get(lod_slot)
++        .ok_or("cube array read missing LOD")?;
++    Ok((coord, Some(face), Some(lod), Some(slice)))
 +}
 --- a/src/passes/air_calls/images/write_read.rs
 +++ b/src/passes/air_calls/images/write_read.rs
