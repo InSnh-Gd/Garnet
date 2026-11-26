@@ -147,10 +147,10 @@ struct RDNA4Metrics {
     uint32_t fan_rpm, fan_pwm_pct;
     uint32_t pcie_gen, pcie_width;
     uint32_t metrics_counter;
-    // The card's PMFW is newer than any published header (it reports interface
-    // version 0x33; upstream pins 0x2E), so the decode above is best-effort.
+    // PMFW driver-IF versions 0x2E..0x33 share the verified 260-byte layout;
+    // unknown versions stay flagged unverified and rely on values_plausible.
     uint32_t if_version;        // what the firmware reported
-    uint32_t layout_verified;   // 1 only if if_version matches the layout
+    uint32_t layout_verified;   // 1 if if_version is in the verified range
     uint32_t values_plausible;  // 1 if the decoded values pass range checks
     uint32_t reserved[1];
 };

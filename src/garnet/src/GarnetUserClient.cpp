@@ -490,7 +490,7 @@ IOReturn GarnetUserClient::doMetrics(IOExternalMethodArguments *args) {
 	out.if_version      = res.if_version;
 	out.layout_verified = res.layout_verified ? 1u : 0u;
 	out.values_plausible = res.values_plausible ? 1u : 0u;
-	out.gfxclk_mhz       = m.CurrClock[amdgpu::SMUClk::GFXCLK];
+	out.gfxclk_mhz       = amdgpu::smu_effective_gfxclk_mhz(m);
 	out.socclk_mhz       = m.CurrClock[amdgpu::SMUClk::SOCCLK];
 	out.uclk_mhz         = m.CurrClock[amdgpu::SMUClk::UCLK];
 	out.fclk_mhz         = m.CurrClock[amdgpu::SMUClk::FCLK];
