@@ -232,6 +232,7 @@ int main(void) {
             .rt_min_scratch_alignment = 128u, .rt_max_geometries = 1u << 24,
             .rt_max_instances = 1u << 24, .rt_max_primitives = 1u << 29,
             .ext_ray_query = 1, .feat_ray_query = 1,
+            .ext_ray_tracing_position_fetch = 1, .feat_ray_tracing_position_fetch = 1,
             .timestamp_query_funcs = 1, .timestamp_compute_and_graphics = 1,
             .timestamp_period_ns = 10.0f, .timestamp_valid_bits = 64u,
             .sparse_queue = 1, .sparse_bind_func = 1,
@@ -308,7 +309,20 @@ int main(void) {
         sub = mp; sub.feat_accel_struct = 0;
         mc = rdna4dc_metal3_from_probe(&sub);
         CHECK("ray_query fails closed without accelerationStructure",
-            !mc.acceleration_structure && !mc.ray_query && !rdna4dc_metal3_raytracing_supported(&mc));
+            !mc.acceleration_structure && !mc.ray_query && !mc.ray_tracing_position_fetch &&
+            !rdna4dc_metal3_raytracing_supported(&mc) && !rdna4dc_metal3_rt_position_fetch_supported(&mc));
+
+        CHECK("position_fetch gates on cleanly when RT + ext + feat present",
+            m->ray_tracing_position_fetch && rdna4dc_metal3_rt_position_fetch_supported(m));
+        sub = mp; sub.feat_ray_query = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("position_fetch fails closed without ray_query",
+            !mc.ray_tracing_position_fetch && !rdna4dc_metal3_rt_position_fetch_supported(&mc));
+        sub = mp; sub.ext_ray_tracing_position_fetch = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("position_fetch fails closed without extension",
+            !mc.ray_tracing_position_fetch && !rdna4dc_metal3_rt_position_fetch_supported(&mc));
+        sub = mp; sub.feat_ray_tracing_position_fetch = 0; mc = rdna4dc_metal3_from_probe(&sub);
+        CHECK("position_fetch fails closed without feature bit",
+            !mc.ray_tracing_position_fetch && !rdna4dc_metal3_rt_position_fetch_supported(&mc));
 
         sub = mp; sub.ext_barycentric = 0; mc = rdna4dc_metal3_from_probe(&sub);
         CHECK("barycentric requires both extension and feature", !rdna4dc_metal3_barycentric_ok(&mc));

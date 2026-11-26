@@ -645,7 +645,7 @@ typedef struct {
     uint32_t maxPerSetDescriptors;
     BOOL barycentric, atomicFloat, atomicFloat2, atomicInt64;
     BOOL meshShader, objectShader, multiDrawIndirect;
-    BOOL deferredHostOps, accelStruct, rayQuery;
+    BOOL deferredHostOps, accelStruct, rayQuery, rtPositionFetch;
     BOOL timestampQuery, timestampComputeAndGraphics;
     float timestampPeriod;
     uint32_t timestampValidBits;

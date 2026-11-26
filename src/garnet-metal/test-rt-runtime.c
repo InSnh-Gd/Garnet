@@ -83,6 +83,7 @@ static void test_capabilities_and_footnote10(void) {
     CHECK(!rdna4rtr_binding_to_metal_index(31u, 1u, &midx), "binding 31 OOB");
     CHECK(!rdna4rtr_binding_to_metal_index(30u, 2u, &midx), "binding 30 count 2 OOB");
     CHECK(!rdna4rtr_binding_to_metal_index(0u, 0u, &midx), "count 0 rejected");
+    CHECK(GARNETX_CAP_RT_POSITION_FETCH == (1u << 9), "GARNETX_CAP_RT_POSITION_FETCH == 1<<9");
 }
 
 static void test_as_reflection_json(void) {
@@ -604,7 +605,45 @@ static void test_source_pins(void) {
         CHECK(strstr(impl, "isKindOfClass:[NSDictionary class]") != NULL &&
               strstr(impl, "NSJSONSerialization") != NULL,
               "rdna4_rt_parse_meta handles NSDictionary pipeline metadata");
+        CHECK(strstr(impl, "rdna4rt_blas_build_flags_with_caps") != NULL,
+              "BLAS build plan applies position_fetch ALLOW_DATA_ACCESS via helper");
         free(impl);
+    }
+
+    char *cmds = read_source_file("src/garnet-metal/garnet_commands.m", "garnet_commands.m");
+    CHECK(cmds != NULL, "read garnet_commands.m for useResource RT pins");
+    if (cmds) {
+        const char *ur = strstr(cmds, "- (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage");
+        CHECK(ur != NULL, "found rdna4UseResource:usage:");
+        if (ur) {
+            char seg[1600];
+            size_t slen = strlen(ur);
+            if (slen >= sizeof(seg)) slen = sizeof(seg) - 1u;
+            memcpy(seg, ur, slen);
+            seg[slen] = '\0';
+            CHECK(strstr(seg, "RDNA4IntersectionFunctionTable") != NULL,
+                  "rdna4UseResource accepts RDNA4IntersectionFunctionTable");
+            CHECK(strstr(seg, "RDNA4VisibleFunctionTable") != NULL,
+                  "rdna4UseResource accepts RDNA4VisibleFunctionTable");
+        }
+        free(cmds);
+    }
+
+    char *be = read_source_file("src/garnet-metal/garnet_backend.m", "garnet_backend.m");
+    CHECK(be != NULL, "read garnet_backend.m for position_fetch pin");
+    if (be) {
+        CHECK(strstr(be, "VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME") != NULL,
+              "garnet_backend probes/enables VK_KHR_ray_tracing_position_fetch");
+        free(be);
+    }
+
+    char *args = read_source_file("src/garnet-metal/garnet_arguments.m", "garnet_arguments.m");
+    CHECK(args != NULL, "read garnet_arguments.m for IFT/VFT backing BDA registry pin");
+    if (args) {
+        CHECK(strstr(args, "[object isKindOfClass:[RDNA4IntersectionFunctionTable class]]") != NULL &&
+              strstr(args, "rdna4BackingBuffer") != NULL,
+              "rdna4PrepareArguments registers IFT/VFT backing buffers in BufferAddressTable");
+        free(args);
     }
 
     char *live = read_source_file("src/garnet-metal/test-metal3-raytracing.m", "test-metal3-raytracing.m");

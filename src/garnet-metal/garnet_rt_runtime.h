@@ -34,6 +34,10 @@
 #define RDNA4RTR_IFT_KIND_BOUNDING_BOX      UINT32_C(0)
 #define RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT  UINT32_C(1)
 
+#ifndef GARNETX_CAP_RT_POSITION_FETCH
+#define GARNETX_CAP_RT_POSITION_FETCH       (1u << 9)
+#endif
+
 // Exact 0077 IFT buffer ABI constants (`word[0]=slot_count, word[1+slot]=handle_id`).
 #define RDNA4RTR_IFT_ABI_VERSION        UINT32_C(1)
 #define RDNA4RTR_IFT_HEADER_WORDS       UINT32_C(1)

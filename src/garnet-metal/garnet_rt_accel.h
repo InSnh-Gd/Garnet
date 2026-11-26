@@ -113,6 +113,7 @@ enum {
     RDNA4RT_VK_BUILD_PREFER_FAST_TRACE = 0x00000004u,
     RDNA4RT_VK_BUILD_PREFER_FAST_BUILD = 0x00000008u,
     RDNA4RT_VK_BUILD_LOW_MEMORY        = 0x00000010u,
+    RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS = 0x00000800u,
 };
 
 enum {
@@ -249,6 +250,9 @@ _Static_assert(RDNA4RT_VK_BUILD_ALLOW_COMPACTION == (uint32_t)VK_BUILD_ACCELERAT
 _Static_assert(RDNA4RT_VK_BUILD_PREFER_FAST_TRACE == (uint32_t)VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR, "PREFER_FAST_TRACE");
 _Static_assert(RDNA4RT_VK_BUILD_PREFER_FAST_BUILD == (uint32_t)VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR, "PREFER_FAST_BUILD");
 _Static_assert(RDNA4RT_VK_BUILD_LOW_MEMORY == (uint32_t)VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR, "LOW_MEMORY");
+#ifdef VK_KHR_ray_tracing_position_fetch
+_Static_assert(RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS == (uint32_t)VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR, "ALLOW_DATA_ACCESS");
+#endif
 _Static_assert(RDNA4RT_VK_COPY_CLONE == (uint32_t)VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR, "COPY_CLONE");
 _Static_assert(RDNA4RT_VK_COPY_COMPACT == (uint32_t)VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR, "COPY_COMPACT");
 #endif
@@ -312,6 +316,13 @@ static inline rdna4rt_err_t rdna4rt_usage_to_vk_build_flags(uint64_t usage, uint
     if (usage & RDNA4RT_USAGE_MINIMIZE_MEMORY) flags |= RDNA4RT_VK_BUILD_LOW_MEMORY;
     *vk_flags_out = flags;
     return RDNA4RT_OK;
+}
+
+static inline uint32_t rdna4rt_blas_build_flags_with_caps(
+    uint32_t base_flags, int has_triangles, const rdna4dc_metal3_caps *caps) {
+    if (has_triangles && rdna4dc_metal3_rt_position_fetch_supported(caps))
+        base_flags |= RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS;
+    return base_flags;
 }
 
 typedef struct {

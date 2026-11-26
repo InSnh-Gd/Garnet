@@ -1691,6 +1691,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
         VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeat = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+        VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR rtPosFetchFeat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
         VkPhysicalDeviceMeshShaderPropertiesEXT meshProps = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
         VkPhysicalDeviceAccelerationStructurePropertiesKHR accelProps = {
@@ -1704,7 +1706,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         const char *orderedColorExt = NULL;
         BOOL hasDrmMod = NO, hasMemoryBudget = NO, hasSampleLoc = NO, hasInterlock = NO;
         BOOL hasBarycentric = NO, hasAtomicFloat = NO, hasAtomicFloat2 = NO, hasAtomicInt64 = NO;
-        BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO, hasPushDesc = NO;
+        BOOL hasMeshShader = NO, hasDeferredHostOps = NO, hasAccelStruct = NO, hasRayQuery = NO, hasRtPosFetch = NO, hasPushDesc = NO;
         BOOL hasPipeLib = NO, hasGpl = NO, hasEds3 = NO;
         VkPhysicalDevicePushDescriptorPropertiesKHR pushDescProps = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR };
@@ -1731,6 +1733,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 hasDeferredHostOps |= !strcmp(ex[i].extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
                 hasAccelStruct |= !strcmp(ex[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
                 hasRayQuery |= !strcmp(ex[i].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+                hasRtPosFetch |= !strcmp(ex[i].extensionName, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
                 hasPushDesc |= !strcmp(ex[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
                 hasPipeLib |= !strcmp(ex[i].extensionName, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
                 hasGpl |= !strcmp(ex[i].extensionName, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
@@ -1753,6 +1756,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             if (hasMeshShader) { meshFeat.pNext = f2Next; f2Next = &meshFeat; }
             if (hasAccelStruct) { accelFeat.pNext = f2Next; f2Next = &accelFeat; }
             if (hasRayQuery) { rayQueryFeat.pNext = f2Next; f2Next = &rayQueryFeat; }
+            if (hasRtPosFetch) { rtPosFetchFeat.pNext = f2Next; f2Next = &rtPosFetchFeat; }
             if (hasGpl) { gplFeat.pNext = f2Next; f2Next = &gplFeat; }
             if (hasEds3) { eds3Feat.pNext = f2Next; f2Next = &eds3Feat; }
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = f2Next };
@@ -1768,6 +1772,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             meshFeat.pNext = NULL;
             accelFeat.pNext = NULL;
             rayQueryFeat.pNext = NULL;
+            rtPosFetchFeat.pNext = NULL;
             gplFeat.pNext = NULL;
             eds3Feat.pNext = NULL;
             if (vkGetPhysicalDeviceProperties2 && pp.apiVersion >= VK_API_VERSION_1_2) {
@@ -1895,6 +1900,14 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             enabledRayQuery.pNext = enabled13.pNext;
             enabled13.pNext = &enabledRayQuery;
             devExts[devExtCount++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+        }
+        VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR enabledRtPosFetch = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
+            .rayTracingPositionFetch = enabledRayQuery.rayQuery && hasRtPosFetch && rtPosFetchFeat.rayTracingPositionFetch };
+        if (enabledRtPosFetch.rayTracingPositionFetch) {
+            enabledRtPosFetch.pNext = enabled13.pNext;
+            enabled13.pNext = &enabledRtPosFetch;
+            devExts[devExtCount++] = VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME;
         }
         BOOL hasSparseQueue = (qf[qfi].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
         BOOL hasBindSparse = rdna4_gipa(RDNA4R.inst, "vkQueueBindSparse") != NULL;
@@ -2082,6 +2095,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             .rt_max_primitives = accelProps.maxPrimitiveCount,
             .ext_ray_query = enabledRayQuery.rayQuery != VK_FALSE,
             .feat_ray_query = enabledRayQuery.rayQuery != VK_FALSE,
+            .ext_ray_tracing_position_fetch = enabledRtPosFetch.rayTracingPositionFetch != VK_FALSE,
+            .feat_ray_tracing_position_fetch = enabledRtPosFetch.rayTracingPositionFetch != VK_FALSE,
             .timestamp_query_funcs = (RDNA4R.occOK && hasWriteTimestamp) ? 1 : 0,
             .timestamp_compute_and_graphics = pp.limits.timestampComputeAndGraphics != VK_FALSE,
             .timestamp_period_ns = pp.limits.timestampPeriod,
@@ -2131,6 +2146,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.deferredHostOps = m3.deferred_host_ops ? YES : NO;
         RDNA4R.accelStruct = m3.acceleration_structure ? YES : NO;
         RDNA4R.rayQuery = m3.ray_query ? YES : NO;
+        RDNA4R.rtPositionFetch = m3.ray_tracing_position_fetch ? YES : NO;
         RDNA4R.timestampQuery = m3.timestamp_supported ? YES : NO;
         RDNA4R.timestampComputeAndGraphics = m3.timestamp_compute_and_graphics ? YES : NO;
         RDNA4R.timestampPeriod = m3.timestamp_period_ns;
@@ -2139,12 +2155,12 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.sparseResidencyBuffer = m3.sparse_residency_buffer ? YES : NO;
         RDNA4R.sparseResidencyImage2D = m3.sparse_residency_image_2d ? YES : NO;
         RDNA4R.sparseResidencyImage3D = m3.sparse_residency_image_3d ? YES : NO;
-        RDNA4LOG("radv: metal3 probe: bary=%d pull=%d atomicF32=%d/%d/%d(mm=%d) atomicI64=%d/%d mesh=%d/%d(payload=%u grid=%u) rt=%d/%d ts=%d(%.2fns,%ub) sparse=%d(buf=%d 2d=%d 3d=%d)",
+        RDNA4LOG("radv: metal3 probe: bary=%d pull=%d atomicF32=%d/%d/%d(mm=%d) atomicI64=%d/%d mesh=%d/%d(payload=%u grid=%u) rt=%d/%d(posFetch=%d) ts=%d(%.2fns,%ub) sparse=%d(buf=%d 2d=%d 3d=%d)",
                  m3.barycentric, m3.pull_model_interpolation,
                  m3.atomic_float_buffer, m3.atomic_float_shared, m3.atomic_float_image, m3.atomic_float_minmax,
                  m3.atomic_int64_buffer, m3.atomic_int64_shared,
                  m3.object_shader, m3.mesh_shader, m3.mesh_max_payload_bytes, m3.mesh_max_workgroup_total_count,
-                 m3.acceleration_structure, m3.ray_query,
+                 m3.acceleration_structure, m3.ray_query, m3.ray_tracing_position_fetch,
                  m3.timestamp_supported, (double)m3.timestamp_period_ns, m3.timestamp_valid_bits,
                  m3.sparse_binding, m3.sparse_residency_buffer, m3.sparse_residency_image_2d, m3.sparse_residency_image_3d);
         atomic_store_explicit(&rdna4_caps_ready, 1, memory_order_release);

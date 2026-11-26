@@ -44,6 +44,8 @@ static rdna4dc_metal3_caps make_rt_caps(uint32_t scratch_align, uint64_t max_geo
     p.rt_max_primitives = max_prim;
     p.ext_ray_query = 1;
     p.feat_ray_query = 1;
+    p.ext_ray_tracing_position_fetch = 1;
+    p.feat_ray_tracing_position_fetch = 1;
     return rdna4dc_metal3_from_probe(&p);
 }
 
@@ -101,6 +103,23 @@ static void test_usage_sizes_and_scratch(void) {
           "conflicting fast build + fast intersection rejected");
     CHECK(rdna4rt_usage_to_vk_build_flags(1u << 3, &f) == RDNA4RT_ERR_INVALID_ARG,
           "reserved usage bit rejected");
+
+    /* VK_KHR_ray_tracing_position_fetch ALLOW_DATA_ACCESS flag gating (triangle BLAS only). */
+    CHECK(RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS == 0x00000800u,
+          "RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS matches Vulkan bit 11");
+    rdna4dc_metal3_caps full_pf = make_rt_caps(256u, 1024u, 4096u, 100000u);
+    rdna4dc_metal3_caps no_pf = full_pf;
+    no_pf.ray_tracing_position_fetch = 0;
+    uint32_t base_f = RDNA4RT_VK_BUILD_ALLOW_COMPACTION | RDNA4RT_VK_BUILD_PREFER_FAST_TRACE;
+    CHECK(rdna4rt_blas_build_flags_with_caps(base_f, 1, &full_pf) ==
+              (base_f | RDNA4RT_VK_BUILD_ALLOW_DATA_ACCESS),
+          "triangle BLAS with position_fetch sets ALLOW_DATA_ACCESS");
+    CHECK(rdna4rt_blas_build_flags_with_caps(base_f, 0, &full_pf) == base_f,
+          "AABB-only BLAS omits ALLOW_DATA_ACCESS");
+    CHECK(rdna4rt_blas_build_flags_with_caps(base_f, 1, &no_pf) == base_f,
+          "triangle BLAS without position_fetch omits ALLOW_DATA_ACCESS");
+    CHECK(rdna4rt_blas_build_flags_with_caps(base_f, 1, NULL) == base_f,
+          "NULL caps omits ALLOW_DATA_ACCESS");
 
     rdna4rt_sizes_t sz;
     CHECK(rdna4rt_compute_sizes(100u, 1024u, 512u, RDNA4RT_USAGE_NONE, 256u, &sz) == RDNA4RT_OK,

@@ -2116,7 +2116,11 @@ RDNA4_DNR(RDNA4CommandBuffer)
     BOOL isICB = icbCls && [resource isKindOfClass:icbCls];
     Class asCls = objc_getClass("GarnetAccelerationStructure");
     BOOL isAS = asCls && [resource isKindOfClass:asCls];
-    if ((!(isICB || isAS || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
+    Class iftCls = objc_getClass("RDNA4IntersectionFunctionTable");
+    BOOL isIFT = iftCls && [resource isKindOfClass:iftCls];
+    Class vftCls = objc_getClass("RDNA4VisibleFunctionTable");
+    BOOL isVFT = vftCls && [resource isKindOfClass:vftCls];
+    if ((!(isICB || isAS || isIFT || isVFT || [resource isKindOfClass:[RDNA4Buffer class]] || [resource isKindOfClass:[RDNA4Texture class]])) ||
         [(id<MTLResource>)resource device] != [self device] || !usage || (usage & ~(NSUInteger)7)) {
         [self rdna4Fail:@"useResource has an invalid resource, device or usage"];
         return;
@@ -2128,6 +2132,10 @@ RDNA4_DNR(RDNA4CommandBuffer)
     } else if (isAS) {
         id handle = [(id<GarnetASInternal>)resource rdna4CurrentHandle];
         if (handle) [self rdna4RetainEncoded:handle];
+    } else if (isIFT) {
+        [(RDNA4IntersectionFunctionTable *)resource rdna4RetainIntoCommandBuffer:self];
+    } else if (isVFT) {
+        [(RDNA4VisibleFunctionTable *)resource rdna4RetainIntoCommandBuffer:self];
     }
 }
 - (void)rdna4UseHeap:(id)heap {

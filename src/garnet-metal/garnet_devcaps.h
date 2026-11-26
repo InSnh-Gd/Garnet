@@ -40,6 +40,7 @@ typedef struct {
     uint32_t rt_min_scratch_alignment;
     uint64_t rt_max_geometries, rt_max_instances, rt_max_primitives;
     int ext_ray_query, feat_ray_query;
+    int ext_ray_tracing_position_fetch, feat_ray_tracing_position_fetch;
     int timestamp_query_funcs, timestamp_compute_and_graphics;
     float timestamp_period_ns;
     uint32_t timestamp_valid_bits;
@@ -62,6 +63,7 @@ typedef struct {
     uint32_t mesh_max_workgroup_count[3], mesh_max_workgroup_total_count, mesh_max_workgroup_invocations;
     uint32_t mesh_max_output_vertices, mesh_max_output_primitives;
     int deferred_host_ops, acceleration_structure, accel_indirect_build, accel_uab, ray_query;
+    int ray_tracing_position_fetch;
     uint32_t rt_min_scratch_alignment;
     uint64_t rt_max_geometries, rt_max_instances, rt_max_primitives;
     int timestamp_supported, timestamp_compute_and_graphics;
@@ -159,7 +161,11 @@ static inline rdna4dc_metal3_caps rdna4dc_metal3_from_probe(const rdna4dc_metal3
         m.rt_max_geometries = p->rt_max_geometries;
         m.rt_max_instances = p->rt_max_instances;
         m.rt_max_primitives = p->rt_max_primitives;
-        if (p->ext_ray_query && p->feat_ray_query) m.ray_query = 1;
+        if (p->ext_ray_query && p->feat_ray_query) {
+            m.ray_query = 1;
+            if (p->ext_ray_tracing_position_fetch && p->feat_ray_tracing_position_fetch)
+                m.ray_tracing_position_fetch = 1;
+        }
     }
     if (p->timestamp_query_funcs && p->timestamp_valid_bits > 0u && p->timestamp_valid_bits <= 64u &&
         p->timestamp_period_ns > 0.0f && p->timestamp_period_ns < 1e9f) {
@@ -321,6 +327,10 @@ static inline int rdna4dc_metal3_object_grid_ok(const rdna4dc_metal3_caps *c, ui
 
 static inline int rdna4dc_metal3_raytracing_supported(const rdna4dc_metal3_caps *c) {
     return c && c->deferred_host_ops && c->acceleration_structure && c->ray_query;
+}
+
+static inline int rdna4dc_metal3_rt_position_fetch_supported(const rdna4dc_metal3_caps *c) {
+    return rdna4dc_metal3_raytracing_supported(c) && c->ray_tracing_position_fetch;
 }
 
 static inline int rdna4dc_metal3_timestamps_supported(const rdna4dc_metal3_caps *c) {

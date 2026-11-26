@@ -1309,6 +1309,11 @@ static _Atomic uint64_t rdna4_argument_pool_descriptors;
         // Declarations remain active when an encoder continues in a new segment.
         [self rdna4RetainArgument:object];
         if ([object isKindOfClass:[RDNA4Buffer class]]) [bufferResources addObject:object];
+        if ([object isKindOfClass:[RDNA4IntersectionFunctionTable class]] ||
+            [object isKindOfClass:[RDNA4VisibleFunctionTable class]]) {
+            RDNA4Buffer *backing = [(RDNA4IntersectionFunctionTable *)object rdna4BackingBuffer];
+            if (backing) { [self rdna4RetainArgument:backing]; [bufferResources addObject:backing]; }
+        }
         if ([object isKindOfClass:[RDNA4Heap class]])
             for (id resource in [object rdna4LiveResources]) if (![resource isAliasable]) {
                 [self rdna4RetainArgument:resource];

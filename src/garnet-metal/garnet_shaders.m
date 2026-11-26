@@ -1124,6 +1124,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     work.ift = inIft; work.nift = ni;
     work.useStage3 = wantStage3 ? 1 : 0;
     work.caps = rdna4_query_caps();
+    if (RDNA4R.rtPositionFetch) work.caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
     work.lowerArgs = RDNA4R.gpuArgumentTables ? 1 : 0;
 
     int rc = RDNA4X_E_IO;

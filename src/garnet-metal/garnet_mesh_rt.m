@@ -1748,6 +1748,7 @@ static BOOL rdna4_rt_build_plan_make(
 
         Class motionTriCls = objc_getClass("MTLAccelerationStructureMotionTriangleGeometryDescriptor");
         Class motionBoxCls = objc_getClass("MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor");
+        int hasTriangles = 0;
 
         for (NSUInteger i = 0; i < gcount; i++) {
             MTLAccelerationStructureGeometryDescriptor *gd = geoms[i];
@@ -1779,6 +1780,7 @@ static BOOL rdna4_rt_build_plan_make(
             }
 
             if ([gd isKindOfClass:[MTLAccelerationStructureTriangleGeometryDescriptor class]]) {
+                hasTriangles = 1;
                 MTLAccelerationStructureTriangleGeometryDescriptor *td =
                     (MTLAccelerationStructureTriangleGeometryDescriptor *)gd;
                 RDNA4Buffer *vbuf = nil, *ibuf = nil, *tbuf = nil;
@@ -2003,6 +2005,7 @@ static BOOL rdna4_rt_build_plan_make(
             if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(totErr)]);
             return NO;
         }
+        plan->vkBuildFlags = rdna4rt_blas_build_flags_with_caps(plan->vkBuildFlags, hasTriangles, &m3);
         plan->topologyHash = rdna4rt_topology_hash(geomSigs, plan->maxPrimCounts, plan->geomCount);
         free(geomSigs);
     } else if ([desc isKindOfClass:[MTLInstanceAccelerationStructureDescriptor class]]) {
