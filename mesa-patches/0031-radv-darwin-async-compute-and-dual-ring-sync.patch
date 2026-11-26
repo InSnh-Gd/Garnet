@@ -22,6 +22,7 @@ When QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE:
 Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 + patches 0001..0030.
 
 diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi.h
+index 3665deb..e415978 100644
 --- a/include/darwin/rdna4_native_abi.h
 +++ b/include/darwin/rdna4_native_abi.h
 @@ -33,7 +33,8 @@
@@ -34,7 +35,7 @@ diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi
  
  /* ---- selectors of the native client (own numbering; type 0 is the legacy GarnetUserClient) ---------------- */
  enum {
-@@ -143,6 +144,7 @@
+@@ -143,6 +144,7 @@ struct rdna4n_buffer_op {
  #define RDNA4N_CTX_QUERY2_GUILTY    (1ull << 2)
  
  #define RDNA4N_HW_IP_GFX            0u
@@ -42,7 +43,7 @@ diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi
  #define RDNA4N_IB_FLAG_CE                  (1u << 0)   /* Unsupported */
  #define RDNA4N_IB_FLAG_PREAMBLE            (1u << 1)   /* accepted, ignored: a preamble is always executed */
  #define RDNA4N_IB_FLAG_PREEMPT             (1u << 2)   /* accepted, ignored */
-@@ -205,6 +207,7 @@
+@@ -205,6 +207,7 @@ struct rdna4n_info {                 /* 192 B */
  #define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
  #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
  #define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
@@ -50,27 +51,11 @@ diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi
  /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
   *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
   *   reserved[3] = RDNA4N_BUDGET_* flags
-diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
---- a/src/amd/common/darwin/ac_darwin_drm.h
-+++ b/src/amd/common/darwin/ac_darwin_drm.h
-@@ -76,9 +76,10 @@
- };
- struct util_sync_provider *acd_sync_provider_create(const struct acd_sync_backend *be);
- /* CS path: blocks until (handle, point) is CPU-signalled or attached to a seqno
-- * (WAIT_FOR_SUBMIT semantics); a point backed by a seqno of this client is already
-- * ordered before the next submit and needs no wait. */
--int acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t timeout_ns);
-+ * (WAIT_FOR_SUBMIT semantics). A point pending on the SAME single ring (target_ring_mask == 1u << ring)
-+ * is FIFO-ordered in hardware and needs no wait; a point pending on another ring (or before a gang
-+ * submission spanning both rings) waits for the producer ring's seqno to retire first. */
-+int acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t target_ring_mask, uint32_t handle, uint64_t point, uint64_t timeout_ns);
- /* CS path: attaches the returned seqno to (handle, point); point 0 = binary payload. */
- int acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq);
- 
 diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 837335d..f880572 100644
 --- a/src/amd/common/darwin/ac_darwin_drm.c
 +++ b/src/amd/common/darwin/ac_darwin_drm.c
-@@ -70,6 +70,8 @@
+@@ -70,6 +70,8 @@ struct acd_core {
     uint32_t minor; /* ABI minor the kernel reported */
     bool has_vm_prt; /* ABI 1.13+: rdna4n_info.flags & RDNA4N_CAP_VM_PRT */
     bool has_gfx12_dcc; /* rdna4n_info.flags & RDNA4N_CAP_GFX12_DCC */
@@ -79,7 +64,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_da
     bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
     struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
     struct amdgpu_va_manager *va_mgr;
-@@ -181,6 +183,7 @@
+@@ -181,6 +183,7 @@ acd_native_handshake(struct acd_core *c)
     }
     c->has_vm_prt = (info.flags & RDNA4N_CAP_VM_PRT) != 0;
     c->has_gfx12_dcc = (info.flags & RDNA4N_CAP_GFX12_DCC) != 0;
@@ -87,7 +72,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_da
  
     r = acd_select_chip(c, info.gc_version, true);
     if (r)
-@@ -517,9 +520,9 @@
+@@ -517,9 +520,9 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
           *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_gfx;
        else if (info->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE) {
           *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_compute;
@@ -99,7 +84,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_da
        }
        return 0;
     case AMDGPU_INFO_HW_IP_COUNT:
-@@ -656,14 +659,25 @@
+@@ -656,20 +659,36 @@ acd_cmd_cs(struct acd_device *dev, union drm_amdgpu_cs *cs)
     if (r)
        return r;
  
@@ -115,20 +100,36 @@ diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_da
 -      r = acd_sync_cs_wait_ready(dev->sync, plan.waits[i].handle, plan.waits[i].point, ACD_CS_DEP_TIMEOUT_NS);
 +      r = acd_sync_cs_wait_ready(dev->sync, target_ring_mask, plan.waits[i].handle, plan.waits[i].point, ACD_CS_DEP_TIMEOUT_NS);
  
-    uint64_t seq = 0;
+-   uint64_t seq = 0;
++   uint64_t seq = 0, aux_seq = 0;
     if (!r)
-       r = acd_kext_submit(dev->core->kext, &plan, &seq);
-+   if (!r && seq != RDNA4N_SEQ_LAST && (seq & RDNA4N_SEQ_RING_COMPUTE) != 0ull) {
-+      uint64_t cur = __atomic_load_n(&dev->core->last_compute_seq, __ATOMIC_RELAXED);
-+      while ((seq & ~RDNA4N_SEQ_RING_COMPUTE) > (cur & ~RDNA4N_SEQ_RING_COMPUTE) &&
-+             !__atomic_compare_exchange_n(&dev->core->last_compute_seq, &cur, seq, false,
-+                                          __ATOMIC_RELEASE, __ATOMIC_RELAXED))
-+         ;
+-      r = acd_kext_submit(dev->core->kext, &plan, &seq);
+-   /* SYNCOBJ_OUT / TIMELINE_SIGNAL: attach the returned seqno to each (handle, point). */
++      r = acd_kext_submit_ex(dev->core->kext, &plan, &seq, &aux_seq);
++   if (!r) {
++      const uint64_t cseq =
++         (aux_seq != 0ull && aux_seq != RDNA4N_SEQ_LAST && (aux_seq & RDNA4N_SEQ_RING_COMPUTE) != 0ull) ? aux_seq
++         : (seq != 0ull && seq != RDNA4N_SEQ_LAST && (seq & RDNA4N_SEQ_RING_COMPUTE) != 0ull) ? seq : 0ull;
++      if (cseq) {
++         uint64_t cur = __atomic_load_n(&dev->core->last_compute_seq, __ATOMIC_RELAXED);
++         while ((cseq & ~RDNA4N_SEQ_RING_COMPUTE) > (cur & ~RDNA4N_SEQ_RING_COMPUTE) &&
++                !__atomic_compare_exchange_n(&dev->core->last_compute_seq, &cur, cseq, false,
++                                             __ATOMIC_RELEASE, __ATOMIC_RELAXED))
++            ;
++      }
 +   }
-    /* SYNCOBJ_OUT / TIMELINE_SIGNAL: attach the returned seqno to each (handle, point). */
++   /* SYNCOBJ_OUT / TIMELINE_SIGNAL: attach both ring seqnos (for gang submits) to each (handle, point). */
     for (uint32_t i = 0; i < plan.n_signals && !r; i++)
-       r = acd_sync_cs_attach(dev->sync, plan.signals[i].handle, plan.signals[i].point, seq);
-@@ -729,6 +743,13 @@
+-      r = acd_sync_cs_attach(dev->sync, plan.signals[i].handle, plan.signals[i].point, seq);
++      r = acd_sync_cs_attach_pair(dev->sync, plan.signals[i].handle, plan.signals[i].point, seq, aux_seq);
+ 
+    acd_cs_plan_fini(&plan);
+-   if (r && seq) {
++   if (r && (seq || aux_seq)) {
+       acd_kext_abort_submissions(dev->core->kext);
+       return -ECANCELED;
+    }
+@@ -729,6 +748,13 @@ acd_cmd_gem_wait_idle(struct acd_device *dev, union drm_amdgpu_gem_wait_idle *ar
     int r = acd_kext_wait_deadline(dev->core->kext, RDNA4N_SEQ_LAST, deadline, &busy);
     if (r)
        return r;
@@ -142,10 +143,35 @@ diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_da
     struct amdgpu_bo *bo = bo_lookup(dev, handle);
     memset(&args->out, 0, sizeof(args->out));
     args->out.status = busy;
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index d6a9871..59578f5 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -76,11 +76,15 @@ struct acd_sync_backend {
+ };
+ struct util_sync_provider *acd_sync_provider_create(const struct acd_sync_backend *be);
+ /* CS path: blocks until (handle, point) is CPU-signalled or attached to a seqno
+- * (WAIT_FOR_SUBMIT semantics); a point backed by a seqno of this client is already
+- * ordered before the next submit and needs no wait. */
+-int acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t timeout_ns);
+-/* CS path: attaches the returned seqno to (handle, point); point 0 = binary payload. */
++ * (WAIT_FOR_SUBMIT semantics). A point pending on the SAME single ring (target_ring_mask == 1u << ring)
++ * is FIFO-ordered in hardware and needs no wait; a point pending on another ring (or before a gang
++ * submission spanning both rings) waits for the producer ring's seqno to retire first. */
++int acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t target_ring_mask, uint32_t handle, uint64_t point, uint64_t timeout_ns);
++/* CS path: attaches the returned seqno(s) to (handle, point); point 0 = binary payload.
++ * Gang submissions pass both the GFX leader seqno and the compute follower seqno in seq0/seq1. */
+ int acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq);
++int acd_sync_cs_attach_pair(struct util_sync_provider *p, uint32_t handle, uint64_t point,
++                            uint64_t seq0, uint64_t seq1);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index 6e552e0..026c118 100644
 --- a/src/amd/common/darwin/ac_darwin_kext.c
 +++ b/src/amd/common/darwin/ac_darwin_kext.c
-@@ -72,6 +72,9 @@
+@@ -72,6 +72,9 @@ _Static_assert(RDNA4N_VA_OP_MAP == AMDGPU_VA_OP_MAP && RDNA4N_VA_OP_UNMAP == AMD
                 RDNA4N_VM_PAGE_NOALLOC == AMDGPU_VM_PAGE_NOALLOC, "va values");
  _Static_assert(RDNA4N_CAP_VM_PRT == (1u << 4), "vm prt capability bit");
  _Static_assert(RDNA4N_CAP_GFX12_DCC == (1u << 5), "gfx12 dcc capability bit");
@@ -155,7 +181,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
  _Static_assert(RDNA4N_CTX_OP_ALLOC == AMDGPU_CTX_OP_ALLOC_CTX && RDNA4N_CTX_OP_FREE == AMDGPU_CTX_OP_FREE_CTX &&
                 RDNA4N_CTX_OP_QUERY_STATE2 == AMDGPU_CTX_OP_QUERY_STATE2, "ctx ops");
  _Static_assert(RDNA4N_IB_FLAG_CE == AMDGPU_IB_FLAG_CE && RDNA4N_IB_FLAG_PREAMBLE == AMDGPU_IB_FLAG_PREAMBLE &&
-@@ -657,35 +660,30 @@
+@@ -657,35 +660,30 @@ acd_kext_abort_submissions(struct acd_kext *k)
     atomic_store(&k->submit_lost, true);
  }
  
@@ -203,7 +229,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
  
        uint64_t sout[1] = {0};
        uint32_t nout = 1;
-@@ -693,7 +690,7 @@
+@@ -693,7 +691,7 @@ acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *la
        int r = kcall(k, ACD_SEL_SUBMIT, NULL, 0, buf, sizeof(hdr) + n * sizeof(struct rdna4n_cs_ib), sout, &nout,
                      NULL, NULL);
        if (r) {
@@ -212,7 +238,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
              return r;
           acd_kext_abort_submissions(k);
           return -ECANCELED;
-@@ -702,9 +699,61 @@
+@@ -702,11 +700,75 @@ acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *la
           acd_kext_abort_submissions(k);
           return -ECANCELED;
        }
@@ -220,12 +246,15 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
        *last_seqno = sout[0];
     }
     return 0;
-+}
-+
+ }
+ 
 +int
-+acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno)
++acd_kext_submit_ex(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno,
++                   uint64_t *aux_seqno)
 +{
 +   *last_seqno = 0;
++   if (aux_seqno)
++      *aux_seqno = 0;
 +   if (atomic_load(&k->submit_lost))
 +      return -ECANCELED;
 +
@@ -247,7 +276,8 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
 +   }
 +
 +   /* Gang submission (e.g. RADV Task+Mesh): launch ACE follower IBs on KCQ, then immediately launch
-+    * GFX leader IBs on the GFX ring so both engines execute concurrently; leader seqno signals the gang. */
++    * GFX leader IBs on the GFX ring so both engines execute concurrently; report both seqnos so
++    * callers track compute retirement alongside the GFX leader. */
 +   struct rdna4n_cs_ib *comp_ibs = malloc((size_t)n_comp * sizeof(*comp_ibs));
 +   struct rdna4n_cs_ib *gfx_ibs = malloc((size_t)n_gfx * sizeof(*gfx_ibs));
 +   if (!comp_ibs || !gfx_ibs) {
@@ -264,6 +294,8 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
 +   }
 +   uint64_t comp_seq = 0;
 +   int r = submit_ib_slice(k, plan->ctx_id, comp_ibs, n_comp, false, 0, 0, &comp_seq, &any_accepted);
++   if (aux_seqno)
++      *aux_seqno = comp_seq;
 +   if (!r)
 +      r = submit_ib_slice(k, plan->ctx_id, gfx_ibs, n_gfx,
 +                          plan->has_fence, plan->fence_handle, plan->fence_offset,
@@ -271,13 +303,38 @@ diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_d
 +   free(comp_ibs);
 +   free(gfx_ibs);
 +   return r;
- }
- 
++}
++
++int
++acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno)
++{
++   return acd_kext_submit_ex(k, plan, last_seqno, NULL);
++}
++
  int
+ acd_kext_buffer_op(struct acd_kext *k, const struct rdna4n_buffer_op *op, bool fill, uint64_t *seq)
+ {
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index acb7478..fc82c8e 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -191,8 +191,10 @@ int acd_cs_plan_init(struct acd_cs_plan *plan, uint32_t ctx_id, uint32_t bo_list
+ void acd_cs_plan_fini(struct acd_cs_plan *plan);
+ 
+ /* Splits into Submits of <= RDNA4N_MAX_IBS IBs (fence on the last only). Returns
+- * the last seqno. */
++ * the last seqno (and, for gang COMPUTE+GFX submits, the compute follower seqno in *aux_seqno). */
+ int acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno);
++int acd_kext_submit_ex(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno,
++                       uint64_t *aux_seqno);
+ void acd_kext_abort_submissions(struct acd_kext *k);
+ /* Number of Submit calls a plan of n IBs needs. */
+ uint32_t acd_cs_split_count(uint32_t n_ibs);
 diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_darwin_sync.c
+index d5a4f52..c970220 100644
 --- a/src/amd/common/darwin/ac_darwin_sync.c
 +++ b/src/amd/common/darwin/ac_darwin_sync.c
-@@ -22,11 +22,16 @@
+@@ -22,22 +22,27 @@
  
  #include "drm-uapi/drm.h"
  #include "ac_darwin_drm.h"
@@ -293,8 +350,24 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
 +
  struct acd_tl_entry {
     uint64_t point;
-    uint64_t seq;
-@@ -49,7 +54,7 @@
+-   uint64_t seq;
++   uint64_t seq[ACD_NUM_RINGS]; /* per-ring pending seqnos (both nonzero for gang submits) */
+ };
+ 
+ struct acd_syncobj {
+    bool in_use;
+-   bool bin_cpu;       /* binary payload signalled (CPU, or a retired seqno folded in) */
+-   uint64_t bin_seq;   /* binary payload pending on this kernel seqno (0 = none) */
+-   uint64_t point;     /* highest signalled timeline point (CPU, or retired seqno folded in) */
+-   struct acd_tl_entry *tl; /* timeline points pending on kernel seqnos */
++   bool bin_cpu;                       /* binary payload signalled (CPU, or retired seqno(s) folded in) */
++   uint64_t bin_seq[ACD_NUM_RINGS];    /* binary payload pending per ring (0 = none) */
++   uint64_t point;                     /* highest signalled timeline point (CPU, or retired seqno(s) folded in) */
++   struct acd_tl_entry *tl;            /* timeline points pending on kernel seqnos */
+    uint32_t tl_n, tl_cap;
+ };
+ 
+@@ -49,7 +54,7 @@ struct acd_sync {
     struct acd_syncobj *objs;
     uint32_t count;
     struct acd_sync_backend be;
@@ -303,7 +376,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
  };
  
  struct acd_sync_handle {
-@@ -63,6 +68,26 @@
+@@ -63,6 +68,26 @@ struct acd_sync_handle {
  
  enum pstate { P_DONE, P_PENDING, P_UNSUBMITTED };
  
@@ -330,7 +403,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
  static struct acd_sync *
  to_sync(struct util_sync_provider *p)
  {
-@@ -88,9 +113,11 @@
+@@ -88,23 +113,45 @@ lookup(struct acd_sync *s, uint32_t handle)
  static void
  note_retired(struct acd_sync *s, uint64_t retired)
  {
@@ -345,39 +418,144 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
        ;
  }
  
-@@ -98,13 +125,12 @@
++static inline void
++pack_seq_pair(uint64_t out[ACD_NUM_RINGS], uint64_t seq0, uint64_t seq1)
++{
++   out[0] = 0;
++   out[1] = 0;
++   const uint64_t in[2] = {seq0, seq1};
++   for (uint32_t i = 0; i < 2; i++) {
++      if (!in[i])
++         continue;
++      const uint32_t r = seq_ring(in[i]);
++      if (out[r] == 0 || seq_raw(in[i]) > seq_raw(out[r]))
++         out[r] = in[i];
++   }
++}
++
+ /* Fold every attached seqno that is known retired into the plain payload. */
  static void
  fold(struct acd_sync *s, struct acd_syncobj *o)
  {
 -   const uint64_t ret = __atomic_load_n(&s->known_retired, __ATOMIC_RELAXED);
 -   if (o->bin_seq && o->bin_seq <= ret) {
-+   if (o->bin_seq && seq_is_retired(s, o->bin_seq)) {
-       o->bin_cpu = true;
-       o->bin_seq = 0;
+-      o->bin_cpu = true;
+-      o->bin_seq = 0;
++   if (o->bin_seq[0] || o->bin_seq[1]) {
++      for (uint32_t r = 0; r < ACD_NUM_RINGS; r++)
++         if (o->bin_seq[r] && seq_is_retired(s, o->bin_seq[r]))
++            o->bin_seq[r] = 0;
++      if (!o->bin_seq[0] && !o->bin_seq[1])
++         o->bin_cpu = true;
     }
     for (uint32_t i = 0; i < o->tl_n;) {
 -      if (o->tl[i].seq <= ret) {
-+      if (seq_is_retired(s, o->tl[i].seq)) {
++      for (uint32_t r = 0; r < ACD_NUM_RINGS; r++)
++         if (o->tl[i].seq[r] && seq_is_retired(s, o->tl[i].seq[r]))
++            o->tl[i].seq[r] = 0;
++      if (!o->tl[i].seq[0] && !o->tl[i].seq[1]) {
           if (o->tl[i].point > o->point)
              o->point = o->tl[i].point;
           o->tl[i] = o->tl[--o->tl_n];
-@@ -131,9 +157,14 @@
+@@ -114,17 +161,20 @@ fold(struct acd_sync *s, struct acd_syncobj *o)
     }
+ }
+ 
+-/* Payload state of (o, point); for P_PENDING *seq is the kernel seqno that signals it. */
++/* Payload state of (o, point); for P_PENDING seq[r] holds the earliest pending seqno on ring r
++ * across all entries satisfying >= point (so multi-point cross-ring waits poll every active ring). */
+ static enum pstate
+-point_state(struct acd_sync *s, struct acd_syncobj *o, uint64_t point, uint64_t *seq)
++point_state(struct acd_sync *s, struct acd_syncobj *o, uint64_t point, uint64_t seq[ACD_NUM_RINGS])
+ {
+    fold(s, o);
+-   *seq = 0;
++   seq[0] = 0;
++   seq[1] = 0;
+    if (point == 0) {
+       if (o->bin_cpu)
+          return P_DONE;
+-      if (o->bin_seq) {
+-         *seq = o->bin_seq;
++      if (o->bin_seq[0] || o->bin_seq[1]) {
++         seq[0] = o->bin_seq[0];
++         seq[1] = o->bin_seq[1];
+          return P_PENDING;
+       }
+       return P_UNSUBMITTED;
+@@ -132,10 +182,68 @@ point_state(struct acd_sync *s, struct acd_syncobj *o, uint64_t point, uint64_t
     if (o->point >= point)
        return P_DONE;
-+   uint64_t best_point = UINT64_MAX;
     for (uint32_t i = 0; i < o->tl_n; i++) {
 -      if (o->tl[i].point >= point && (*seq == 0 || o->tl[i].seq < *seq))
-+      if (o->tl[i].point >= point &&
-+          (*seq == 0 || o->tl[i].point < best_point ||
-+           (o->tl[i].point == best_point && seq_raw(o->tl[i].seq) < seq_raw(*seq)))) {
-+         best_point = o->tl[i].point;
-          *seq = o->tl[i].seq;
+-         *seq = o->tl[i].seq;
++      if (o->tl[i].point < point)
++         continue;
++      for (uint32_t r = 0; r < ACD_NUM_RINGS; r++) {
++         const uint64_t candidate = o->tl[i].seq[r];
++         if (candidate && (seq[r] == 0 || seq_raw(candidate) < seq_raw(seq[r])))
++            seq[r] = candidate;
 +      }
     }
-    return *seq ? P_PENDING : P_UNSUBMITTED;
+-   return *seq ? P_PENDING : P_UNSUBMITTED;
++   return (seq[0] || seq[1]) ? P_PENDING : P_UNSUBMITTED;
++}
++
++/* True if an already-queued submission solely on target_ring_mask guarantees (o, point) retires
++ * before the next submission on that same single ring by hardware FIFO order. */
++static bool
++point_satisfied_on_same_ring(const struct acd_syncobj *o, uint64_t point, uint32_t target_ring_mask)
++{
++   uint32_t r;
++   if (target_ring_mask == (1u << ACD_RING_GFX))
++      r = ACD_RING_GFX;
++   else if (target_ring_mask == (1u << ACD_RING_COMPUTE))
++      r = ACD_RING_COMPUTE;
++   else
++      return false;
++   const uint32_t other = 1u - r;
++   if (point == 0)
++      return o->bin_seq[r] != 0 && o->bin_seq[other] == 0;
++   for (uint32_t i = 0; i < o->tl_n; i++) {
++      if (o->tl[i].point >= point && o->tl[i].seq[r] != 0 && o->tl[i].seq[other] == 0)
++         return true;
++   }
++   return false;
++}
++
++/* Single-entry lookup for sync_transfer: copies the exact ring pair of one satisfying entry. */
++static enum pstate
++transfer_state(struct acd_sync *s, struct acd_syncobj *o, uint64_t point, uint64_t seq[ACD_NUM_RINGS])
++{
++   fold(s, o);
++   seq[0] = 0;
++   seq[1] = 0;
++   if (point == 0) {
++      if (o->bin_cpu)
++         return P_DONE;
++      if (o->bin_seq[0] || o->bin_seq[1]) {
++         seq[0] = o->bin_seq[0];
++         seq[1] = o->bin_seq[1];
++         return P_PENDING;
++      }
++      return P_UNSUBMITTED;
++   }
++   if (o->point >= point)
++      return P_DONE;
++   int best = -1;
++   for (uint32_t i = 0; i < o->tl_n; i++) {
++      if (o->tl[i].point >= point && (best < 0 || o->tl[i].point < o->tl[best].point))
++         best = (int)i;
++   }
++   if (best < 0)
++      return P_UNSUBMITTED;
++   seq[0] = o->tl[best].seq[0];
++   seq[1] = o->tl[best].seq[1];
++   return P_PENDING;
  }
-@@ -225,11 +256,12 @@
+ 
+ static int
+@@ -225,11 +333,12 @@ wait_generic(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsi
     const bool infinite = timeout_nsec == INT64_MAX;
     const uint64_t deadline = infinite ? UINT64_MAX : timeout_nsec < 0 ? 0 : (uint64_t)timeout_nsec;
     bool final_poll = false;
@@ -391,21 +569,29 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
  
        pthread_mutex_lock(&s->mtx);
        for (unsigned i = 0; i < n; i++) {
-@@ -244,8 +276,11 @@
+@@ -238,14 +347,17 @@ wait_generic(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsi
+             pthread_mutex_unlock(&s->mtx);
+             return SYNC_FAIL(EINVAL);
+          }
+-         uint64_t seq;
+-         enum pstate st = point_state(s, o, points ? points[i] : 0, &seq);
++         uint64_t seq[ACD_NUM_RINGS];
++         enum pstate st = point_state(s, o, points ? points[i] : 0, seq);
+          if (st == P_DONE) {
              done++;
              if (first < 0)
                 first = i;
 -         } else if (st == P_PENDING && (pend_min == 0 || seq < pend_min)) {
 -            pend_min = seq;
 +         } else if (st == P_PENDING) {
-+            const uint32_t ring = seq_ring(seq);
-+            if (pend_min[ring] == 0 || seq_raw(seq) < seq_raw(pend_min[ring])) {
-+               pend_min[ring] = seq;
++            for (uint32_t ring = 0; ring < ACD_NUM_RINGS; ring++) {
++               if (seq[ring] && (pend_min[ring] == 0 || seq_raw(seq[ring]) < seq_raw(pend_min[ring])))
++                  pend_min[ring] = seq[ring];
 +            }
           }
        }
        const bool ok = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? done == n : done > 0;
-@@ -259,12 +294,16 @@
+@@ -259,12 +371,16 @@ wait_generic(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsi
        const uint64_t now = now_mono_ns();
        if (!infinite && now >= deadline) {
           pthread_mutex_unlock(&s->mtx);
@@ -427,7 +613,7 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
              continue;
           }
           return SYNC_FAIL(ETIME);
-@@ -273,10 +312,18 @@
+@@ -273,10 +389,18 @@ wait_generic(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsi
        if (slice > ACD_SYNC_POLL_NS)
           slice = ACD_SYNC_POLL_NS;
  
@@ -449,7 +635,27 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
           if (r)
              return SYNC_FAIL(-r);
        } else {
-@@ -371,21 +418,25 @@
+@@ -318,7 +442,8 @@ sync_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t handl
+          return SYNC_FAIL(EINVAL);
+       }
+       o->bin_cpu = false;
+-      o->bin_seq = 0;
++      o->bin_seq[0] = 0;
++      o->bin_seq[1] = 0;
+    }
+    pthread_mutex_unlock(&s->mtx);
+    return 0;
+@@ -336,7 +461,8 @@ sync_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t hand
+          return SYNC_FAIL(EINVAL);
+       }
+       o->bin_cpu = true;
+-      o->bin_seq = 0;
++      o->bin_seq[0] = 0;
++      o->bin_seq[1] = 0;
+    }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+@@ -371,21 +497,27 @@ sync_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, ui
  
     /* Refresh the retired seqno once (zero-timeout WaitSeq on the newest pending one). */
     if (s->be.wait_seq) {
@@ -464,9 +670,11 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
 -            if (o->tl[j].seq > newest)
 -               newest = o->tl[j].seq;
 +         for (uint32_t j = 0; j < o->tl_n; j++) {
-+            const uint32_t ring = seq_ring(o->tl[j].seq);
-+            if (newest[ring] == 0 || seq_raw(o->tl[j].seq) > seq_raw(newest[ring]))
-+               newest[ring] = o->tl[j].seq;
++            for (uint32_t ring = 0; ring < ACD_NUM_RINGS; ring++) {
++               const uint64_t q = o->tl[j].seq[ring];
++               if (q && (newest[ring] == 0 || seq_raw(q) > seq_raw(newest[ring])))
++                  newest[ring] = q;
++            }
 +         }
        }
        pthread_mutex_unlock(&s->mtx);
@@ -483,7 +691,38 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
        }
     }
  
-@@ -484,10 +536,12 @@
+@@ -415,8 +547,8 @@ sync_transfer(struct util_sync_provider *p, uint32_t dst_handle, uint64_t dst_po
+       pthread_mutex_unlock(&s->mtx);
+       return SYNC_FAIL(EINVAL);
+    }
+-   uint64_t seq;
+-   enum pstate st = point_state(s, src, src_point, &seq);
++   uint64_t seq[ACD_NUM_RINGS];
++   enum pstate st = transfer_state(s, src, src_point, seq);
+    if (st == P_UNSUBMITTED) {
+       /* nothing to transfer yet (the fence does not exist) */
+       pthread_mutex_unlock(&s->mtx);
+@@ -437,14 +569,16 @@ sync_transfer(struct util_sync_provider *p, uint32_t dst_handle, uint64_t dst_po
+             dst->tl = t;
+             dst->tl_cap = ncap;
+          }
+-         dst->tl[dst->tl_n++] = (struct acd_tl_entry){.point = dst_point, .seq = seq};
++         dst->tl[dst->tl_n++] = (struct acd_tl_entry){.point = dst_point, .seq = {seq[0], seq[1]}};
+       }
+    } else if (st == P_DONE) {
+       dst->bin_cpu = true;
+-      dst->bin_seq = 0;
++      dst->bin_seq[0] = 0;
++      dst->bin_seq[1] = 0;
+    } else {
+       dst->bin_cpu = false;
+-      dst->bin_seq = seq;
++      dst->bin_seq[0] = seq[0];
++      dst->bin_seq[1] = seq[1];
+    }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+@@ -484,10 +618,13 @@ sync_clone(struct util_sync_provider *p)
  /* ---- called by the CS path (ac_darwin_drm.c) ---- */
  
  int
@@ -494,51 +733,120 @@ diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_d
     struct acd_sync *s = to_sync(p);
     const uint64_t deadline = now_mono_ns() + timeout_ns;
 +   bool final_poll = false;
++   uint32_t rr = 0;
  
     pthread_mutex_lock(&s->mtx);
     for (;;) {
-@@ -497,10 +551,42 @@
+@@ -496,12 +633,65 @@ acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t p
+          pthread_mutex_unlock(&s->mtx);
           return -EINVAL;
        }
-       uint64_t seq;
+-      uint64_t seq;
 -      /* DONE, or pending on a seqno of this client: already ordered before the new submit. */
 -      if (point_state(s, o, point, &seq) != P_UNSUBMITTED) {
-+      enum pstate st = point_state(s, o, point, &seq);
++      uint64_t seq[ACD_NUM_RINGS];
++      enum pstate st = point_state(s, o, point, seq);
 +      if (st == P_DONE) {
           pthread_mutex_unlock(&s->mtx);
           return 0;
-+      }
+       }
 +      if (st == P_PENDING) {
-+         const uint32_t dep_mask = 1u << seq_ring(seq);
 +         /* Same single ring: hardware FIFO guarantees ordering with zero CPU wait. */
-+         if (target_ring_mask == dep_mask) {
++         if (point_satisfied_on_same_ring(o, point, target_ring_mask)) {
 +            pthread_mutex_unlock(&s->mtx);
 +            return 0;
 +         }
-+         /* Cross-ring (or gang) dependency: wait for producer ring's seqno to retire before submit. */
++         /* Cross-ring (or gang) dependency: wait for producer ring(s) to retire before submit. */
 +         if (!s->be.wait_seq) {
 +            pthread_mutex_unlock(&s->mtx);
 +            return 0;
 +         }
++         uint64_t wait_rings[ACD_NUM_RINGS] = {seq[0], seq[1]};
++         /* Single-ring target only needs the OTHER ring to retire; once it does, the remaining
++          * same-ring seqno (if any, e.g. from a gang submit) is FIFO-ordered on the target ring. */
++         if (target_ring_mask == (1u << ACD_RING_GFX) && wait_rings[ACD_RING_COMPUTE])
++            wait_rings[ACD_RING_GFX] = 0;
++         else if (target_ring_mask == (1u << ACD_RING_COMPUTE) && wait_rings[ACD_RING_GFX])
++            wait_rings[ACD_RING_COMPUTE] = 0;
++
 +         const uint64_t now = now_mono_ns();
-+         uint64_t slice = 0;
 +         if (now >= deadline) {
 +            if (final_poll) {
 +               pthread_mutex_unlock(&s->mtx);
 +               return -ETIME;
 +            }
 +            final_poll = true;
-+         } else {
-+            slice = deadline - now;
-+            if (slice > ACD_SYNC_POLL_NS)
-+               slice = ACD_SYNC_POLL_NS;
++            pthread_mutex_unlock(&s->mtx);
++            for (uint32_t ring = 0; ring < ACD_NUM_RINGS; ring++) {
++               if (!wait_rings[ring])
++                  continue;
++               int r = backend_wait(s, wait_rings[ring], 0);
++               if (r)
++                  return r;
++            }
++            pthread_mutex_lock(&s->mtx);
++            continue;
++         }
++         uint64_t slice = deadline - now;
++         if (slice > ACD_SYNC_POLL_NS)
++            slice = ACD_SYNC_POLL_NS;
++         uint64_t wait_seq = wait_rings[0] ? wait_rings[0] : wait_rings[1];
++         if (wait_rings[0] && wait_rings[1]) {
++            wait_seq = wait_rings[rr++ & 1u];
++            if (slice > 1000000ull)
++               slice = 1000000ull;
 +         }
 +         pthread_mutex_unlock(&s->mtx);
-+         int r = backend_wait(s, seq, slice);
++         int r = backend_wait(s, wait_seq, slice);
 +         if (r)
 +            return r;
 +         pthread_mutex_lock(&s->mtx);
 +         continue;
-       }
++      }
        const uint64_t now = now_mono_ns();
        if (now >= deadline) {
+          pthread_mutex_unlock(&s->mtx);
+@@ -520,9 +710,11 @@ acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t p
+ }
+ 
+ int
+-acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq)
++acd_sync_cs_attach_pair(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq0, uint64_t seq1)
+ {
+    struct acd_sync *s = to_sync(p);
++   uint64_t pair[ACD_NUM_RINGS];
++   pack_seq_pair(pair, seq0, seq1);
+    pthread_mutex_lock(&s->mtx);
+    struct acd_syncobj *o = lookup(s, handle);
+    if (!o) {
+@@ -531,7 +723,8 @@ acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point
+    }
+    if (point == 0) {
+       o->bin_cpu = false;
+-      o->bin_seq = seq;
++      o->bin_seq[0] = pair[0];
++      o->bin_seq[1] = pair[1];
+    } else {
+       fold(s, o);
+       if (o->tl_n == o->tl_cap) {
+@@ -544,13 +737,19 @@ acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point
+          o->tl = t;
+          o->tl_cap = ncap;
+       }
+-      o->tl[o->tl_n++] = (struct acd_tl_entry){.point = point, .seq = seq};
++      o->tl[o->tl_n++] = (struct acd_tl_entry){.point = point, .seq = {pair[0], pair[1]}};
+    }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+    return 0;
+ }
+ 
++int
++acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq)
++{
++   return acd_sync_cs_attach_pair(p, handle, point, seq, 0);
++}
++
+ static struct util_sync_provider *
+ make_handle(struct acd_sync *st)
+ {

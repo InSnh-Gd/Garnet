@@ -28,6 +28,9 @@ done
 "$cc" -fsanitize=address,undefined "${objects[@]}" "$out/amdgpu_devices.o" -pthread -lm -o "$out/runtime-test"
 "$cc" "${flags[@]}" -Wall -Wextra -Werror "$repo/mesa-patches/gfx1200_submit_test.c" \
     "$out/ac_darwin_kext.o" -lm -o "$out/submit-test"
+"$cc" "${flags[@]}" -Wall -c "$mesa/src/amd/common/darwin/ac_darwin_sync.c" -o "$out/ac_darwin_sync_plain.o"
+"$cc" "${flags[@]}" -Wall -Wextra -Werror "$repo/mesa-patches/dual_ring_sync_test.c" \
+    "$out/ac_darwin_kext.o" "$out/ac_darwin_sync_plain.o" -pthread -lm -o "$out/dual-ring-sync-test"
 "$cxx" -std=c++17 -g -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
     -I"$repo/src/garnet/src" -I"$repo/src/garnet/src/amd" \
     "$repo/mesa-patches/gfx1200_kernel_contract_test.cpp" -o "$out/kernel-contract-test"
@@ -37,3 +40,4 @@ export UBSAN_OPTIONS=halt_on_error=1
 "$out/kernel-contract-test"
 "$out/runtime-test"
 "$out/submit-test"
+"$out/dual-ring-sync-test"

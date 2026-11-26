@@ -111,8 +111,8 @@ public enum DiagnosticsManager {
             if mr.exitCode == 0 && !mr.stdout.isEmpty {
                 let parsed = parseSmuMetricsOutput(mr.stdout)
                 if let v = parsed.driverIfVersion { smuIfVer = v }
-                if let lv = parsed.layoutVerified { smuLayoutVerified = lv }
-                if let vp = parsed.valuesPlausible { smuValuesPlausible = vp }
+                if let lv = parsed.layoutVerified, smuLayoutVerified == nil || !lv { smuLayoutVerified = lv }
+                if let vp = parsed.valuesPlausible, smuValuesPlausible == nil || !vp { smuValuesPlausible = vp }
             }
         }
 

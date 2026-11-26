@@ -878,6 +878,38 @@ static void u15_huge_2m() {
         expect_u("huge page 0 leaf bit-exact", post0, orig0);
         expect_u("huge page 1 leaf bit-exact", post1, orig1);
     }
+
+    // 5. Partial BO REPLACE inside a 2 MiB huge page (splits huge page, preserves head/tail DCC without FRAG, maps slice to new PA) + OOM rollback.
+    {
+        FakeMem m(16);
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0x40000000ull, paOrig = 0x500000000ull, paNew = 0x600000000ull;
+        expect_u("map 2 MiB huge page for partial BO REPLACE", pt_map_tx(root, va, kHuge2mPages, paOrig, lfDcc, m, true), kOk);
+        expect_u("3 tables before partial BO REPLACE", m.allocs, 3u);
+        const uint64_t off = 0x40000ull;
+        const uint64_t repPages = 16ull; // 64 KiB slice inside the 2 MiB huge page
+        expect_u("partial BO REPLACE inside huge page succeeds", pt_replace_tx(root, va + off, repPages, paNew, lfPlain, m, true), kOk);
+        expect_u("exactly 1 PTB allocated for split", m.allocs, 4u);
+        uint64_t lHead = 0, lMid = 0, lTail = 0;
+        expect_u("head page before BO slice preserved", pt_walk(root, va + off - kPage, m, &lHead), paOrig + off - kPage);
+        expect_u("replaced slice maps to new BO PA", pt_walk(root, va + off + 0x3000ull, m, &lMid), paNew + 0x3000ull);
+        expect_u("tail page after BO slice preserved", pt_walk(root, va + off + repPages * kPage, m, &lTail), paOrig + off + repPages * kPage);
+        expect((lHead & kPteFragMask) == 0ull && (lHead & kPteDcc) != 0ull, "head leaf stripped FRAG and kept DCC");
+        expect((lMid & kPteFragMask) == 0ull && (lMid & kPteDcc) == 0ull, "replaced BO slice uses new plain leaf flags");
+        expect((lTail & kPteFragMask) == 0ull && (lTail & kPteDcc) != 0ull, "tail leaf stripped FRAG and kept DCC");
+    }
+    {
+        FakeMem m(3); // root + PDB1 + PDB0 only: zero pages left to split huge page on partial BO REPLACE
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0x42000000ull, paOrig = 0x700000000ull, paNew = 0x800000000ull;
+        expect_u("map 2 MiB huge page with 0 spare pages", pt_map_tx(root, va, kHuge2mPages, paOrig, lfDcc, m, true), kOk);
+        uint64_t origLeaf = 0;
+        pt_walk(root, va + 0x8000ull, m, &origLeaf);
+        expect_u("OOM partial BO REPLACE returns kNoMemory", pt_replace_tx(root, va + 0x8000ull, 4ull, paNew, lfPlain, m, true), kNoMemory);
+        uint64_t afterLeaf = 0;
+        expect_u("OOM partial BO REPLACE leaves huge leaf intact", pt_walk(root, va + 0x8000ull, m, &afterLeaf), paOrig + 0x8000ull);
+        expect_u("OOM partial BO REPLACE huge leaf bit-exact", afterLeaf, origLeaf);
+    }
 }
 
 static void u16_async_compute() {

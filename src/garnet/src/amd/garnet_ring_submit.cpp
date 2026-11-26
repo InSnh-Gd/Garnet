@@ -492,9 +492,13 @@ static uint32_t ring_submit_g5_body(Session *s, const uint64_t *va, const uint32
     }
     return rc;
 }
+// Forward declaration for shared pooled submission helper.
+static uint32_t kcq_submit(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut);
+
 // Pooled submission for non-pinned multi-session clients (GFXHUB VMIDs 9..15): binds/flushes a pool VMID under gCliLock,
-// holds it against eviction via beginSubmit/endSubmit while calling ring_submit[_g5_body], then records the emitted seqno.
-static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, bool useG5, uint64_t *seqOut) {
+// holds it against eviction via beginSubmit/endSubmit while emitting on GFX or KCQ, then records the emitted seqno.
+static uint32_t submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr,
+                              bool isCompute, bool useG5, uint64_t *seqOut) {
     uint64_t busyStart = 0ull;
     bool stallDone = false;
     if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
@@ -509,7 +513,7 @@ static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_
         const rdna4vmid::Result pr = gVmidPool.grab(reinterpret_cast<uintptr_t>(s), s->rootPa, seqNeed, grant);
         if (pr == rdna4vmid::Result::Exhausted) {
             IOLockUnlock(gCliLock);
-            N1C_LOG("submit refused (NoResources): pooled VMID pool exhausted (slot %u)", s->slot);
+            N1C_LOG("%ssubmit refused (NoResources): pooled VMID pool exhausted (slot %u)", isCompute ? "kcq " : "", s->slot);
             return kNoResources;
         }
         if (pr == rdna4vmid::Result::Ok) {
@@ -554,11 +558,15 @@ static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_
             gVmidPool.beginSubmit(vmid);
             IOLockUnlock(gCliLock);
             uint64_t seq = 0ull;
-            const uint32_t er = useG5 ? ring_submit_g5_body(s, va, by, nIbs, hasFence, fenceAddr, &seq)
-                                      : ring_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq);
+            const uint32_t er = isCompute ? kcq_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq)
+                                          : (useG5 ? ring_submit_g5_body(s, va, by, nIbs, hasFence, fenceAddr, &seq)
+                                                   : ring_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq));
             IOLockLock(gCliLock);
             if (er == kOk) {
-                if (gVmidPool.ownerOf(vmid) == reinterpret_cast<uintptr_t>(s)) gVmidPool.noteSubmit(vmid, rdna4vmid::kDomainGfx, seq);
+                if (gVmidPool.ownerOf(vmid) == reinterpret_cast<uintptr_t>(s)) {
+                    gVmidPool.noteSubmit(vmid, isCompute ? rdna4vmid::kDomainCompute : rdna4vmid::kDomainGfx,
+                                         isCompute ? seq_raw(seq) : seq);
+                }
                 *seqOut = seq;
             }
             gVmidPool.endSubmit(vmid);
@@ -570,16 +578,20 @@ static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_
         if (busyStart == 0ull) busyStart = now;
         const uint64_t el = now - busyStart;
         if (el >= kWaitCapNs + kRecoverWaitNs) {
-            N1C_LOG("submit refused (Timeout): pooled VMID wait exceeded bound (slot %u)", s->slot);
+            N1C_LOG("%ssubmit refused (Timeout): pooled VMID wait exceeded bound (slot %u)", isCompute ? "kcq " : "", s->slot);
             return kTimeout;
         }
         if (!stallDone && el >= kWaitCapNs) {
             stallDone = true;
             (void)stall_from_wait();
+            (void)kcq_hang_poll();
             continue;
         }
         n1c_wait_relax(el, (kWaitCapNs + kRecoverWaitNs) - el, ep);
     }
+}
+static uint32_t ring_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, bool useG5, uint64_t *seqOut) {
+    return submit_pooled(s, va, by, nIbs, hasFence, fenceAddr, false, useG5, seqOut);
 }
 static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
     if (!s->pinnedVmid) return ring_submit_pooled(s, va, by, nIbs, hasFence, fenceAddr, true, seqOut);
@@ -648,91 +660,7 @@ static uint32_t kcq_submit(Session *s, const uint64_t *va, const uint32_t *by, u
     return kOk;
 }
 static uint32_t kcq_submit_pooled(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
-    uint64_t busyStart = 0ull;
-    bool stallDone = false;
-    if (n1c_irq_wait_enabled()) (void)lazy_lock(&gWaitLock);
-    for (;;) {
-        const uint64_t ep = irq_epoch_now();
-        if (hung_now()) return hang_rc(true, false);
-        if (sess_poisoned(s)) return rdna4native::g2::poison_rc(true);
-        rdna4vmid::Grant grant {};
-        IOLockLock(gCliLock);
-        ensure_vmid_pool_locked();
-        const uint64_t seqNeed = __atomic_load_n(&s->tlbSeq, __ATOMIC_ACQUIRE);
-        const rdna4vmid::Result pr = gVmidPool.grab(reinterpret_cast<uintptr_t>(s), s->rootPa, seqNeed, grant);
-        if (pr == rdna4vmid::Result::Exhausted) {
-            IOLockUnlock(gCliLock);
-            N1C_LOG("kcq submit refused (NoResources): pooled VMID pool exhausted (slot %u)", s->slot);
-            return kNoResources;
-        }
-        if (pr == rdna4vmid::Result::Ok) {
-            if (grant.stolen && grant.prevOwner != 0u) {
-                Session *prev = reinterpret_cast<Session *>(grant.prevOwner);
-                if (__atomic_load_n(&prev->vmid, __ATOMIC_ACQUIRE) == grant.vmid) __atomic_store_n(&prev->vmid, 0u, __ATOMIC_RELEASE);
-            }
-            if (!gVmidCtxReady[grant.vmid]) {
-                bool ctxOk = false;
-                (void)ctx_prepare_vmid(grant.vmid, &ctxOk);
-                if (!ctxOk) {
-                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
-                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
-                    IOLockUnlock(gCliLock);
-                    return kNotReady;
-                }
-                gVmidCtxReady[grant.vmid] = true;
-            }
-            if (grant.rebind) {
-                if (program_root(grant.vmid, s->rootPa) != kOk) {
-                    (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
-                    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
-                    IOLockUnlock(gCliLock);
-                    return kTimeout;
-                }
-                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
-                (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
-            } else {
-                __atomic_store_n(&s->vmid, grant.vmid, __ATOMIC_RELEASE);
-                if (grant.flush) {
-                    amdgpu_hdp_flush(*gCtx->dev);
-                    if (flush_vmid(grant.vmid) != kOk) {
-                        (void)gVmidPool.quarantine(reinterpret_cast<uintptr_t>(s), grant.vmid);
-                        __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
-                        IOLockUnlock(gCliLock);
-                        return kTimeout;
-                    }
-                    (void)gVmidPool.flushComplete(reinterpret_cast<uintptr_t>(s), grant.vmid, grant.flushSeq);
-                }
-            }
-            const uint32_t vmid = grant.vmid;
-            gVmidPool.beginSubmit(vmid);
-            IOLockUnlock(gCliLock);
-            uint64_t seq = 0ull;
-            const uint32_t er = kcq_submit(s, va, by, nIbs, hasFence, fenceAddr, &seq);
-            IOLockLock(gCliLock);
-            if (er == kOk) {
-                if (gVmidPool.ownerOf(vmid) == reinterpret_cast<uintptr_t>(s)) gVmidPool.noteSubmit(vmid, rdna4vmid::kDomainCompute, seq_raw(seq));
-                *seqOut = seq;
-            }
-            gVmidPool.endSubmit(vmid);
-            IOLockUnlock(gCliLock);
-            return er;
-        }
-        IOLockUnlock(gCliLock);
-        const uint64_t now = now_ns();
-        if (busyStart == 0ull) busyStart = now;
-        const uint64_t el = now - busyStart;
-        if (el >= kWaitCapNs + kRecoverWaitNs) {
-            N1C_LOG("kcq submit refused (Timeout): pooled VMID wait exceeded bound (slot %u)", s->slot);
-            return kTimeout;
-        }
-        if (!stallDone && el >= kWaitCapNs) {
-            stallDone = true;
-            (void)stall_from_wait();
-            (void)kcq_hang_poll();
-            continue;
-        }
-        n1c_wait_relax(el, (kWaitCapNs + kRecoverWaitNs) - el, ep);
-    }
+    return submit_pooled(s, va, by, nIbs, hasFence, fenceAddr, true, false, seqOut);
 }
 
 // ---- the automatic recovery (0.0.627, G2; switch ON only) ----------------------------------------------------------------------------

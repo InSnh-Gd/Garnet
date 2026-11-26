@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-#include "native_s1c_pure.h"
+#include "garnet_submit_pure.h"
 #include <cstdio>
 #include <cstring>
 

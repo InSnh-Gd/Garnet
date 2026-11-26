@@ -52,12 +52,17 @@ int main(void) {
 
     o = garnet_async_qorder_next(&q, 0); // GFX #1 (initial)
     CHECK(o.wait_value == 0u && o.signal_value == 1u);
+    CHECK(garnet_async_qorder_cross_wait(&q, 0) == 0u);
+    CHECK(garnet_async_qorder_cross_wait(&q, 1) == 1u);
 
     o = garnet_async_qorder_next(&q, 0); // GFX #2 (same queue -> no wait)
     CHECK(o.wait_value == 0u && o.signal_value == 2u);
+    CHECK(garnet_async_qorder_cross_wait(&q, 1) == 2u);
 
     o = garnet_async_qorder_next(&q, 1); // Compute #1 (cross-queue -> wait on 2)
     CHECK(o.wait_value == 2u && o.signal_value == 3u);
+    CHECK(garnet_async_qorder_cross_wait(&q, 1) == 0u);
+    CHECK(garnet_async_qorder_cross_wait(&q, 0) == 3u);
 
     o = garnet_async_qorder_next(&q, 1); // Compute #2 (same queue -> no wait)
     CHECK(o.wait_value == 0u && o.signal_value == 4u);

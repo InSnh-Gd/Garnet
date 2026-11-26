@@ -21,10 +21,11 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0030. The kext ABI header that patches 0002-0004,
-0028, and 0030 mirror is src/garnet/src/GarnetNativeABI.h in this repository;
+Order matters: 0001 .. 0031. The kext ABI header that patches 0002-0004,
+0028, 0030, and 0031 mirror is src/garnet/src/GarnetNativeABI.h in this repository;
 Mesa's copy and the kext's copy must stay ABI-compatible (currently 1.13; older
-ABI <= 1.12 kernels remain compatible with sparse/PRT and GFX12 DCC disabled).
+ABI <= 1.12 kernels remain compatible with sparse/PRT, GFX12 DCC, and async
+compute disabled).
 
 0010: Navi 44 (RX 9060 XT, gfx1200) canned device entry; the chip is chosen at runtime from the kext QueryInfo gc_version (0x0c0001 gfx1201 / 0x0c0000 gfx1200, 0 = old kext -> gfx1201). Env: RADV_DARWIN_CHIP=gfx1200|gfx1201 forces the chip (also the HOST_BO stand-in choice); RADV_DARWIN_MOCK_GC=gfx1200 makes the mock report GC 12.0.0. The gfx1200 device fields are confirmed by the target's Linux amdgpu DRM_INFO dump, preserved in `.omo/evidence/navi44-topology/linux-amdgpu-dump.txt`.
 
@@ -68,7 +69,7 @@ ABI <= 1.12 kernels remain compatible with sparse/PRT and GFX12 DCC disabled).
 
 0030: sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; report drm_minor = 60 in acd_device_initialize() when QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC (unlocking gfx12_supports_dcc_write_compress_disable), and gate radv_is_dcc_disabled() on Darwin on !pdev->info.gfx12_supports_dcc_write_compress_disable (superseding 0025's unconditional GFX12 disable while preserving RADV_DEBUG=nodcc, garnet-dcc=0, and HOST_BO fallback).
 
-0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]) and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit() for concurrent Task+Mesh launch; drain both rings in acd_cmd_gem_wait_idle().
+0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]), per-ring pending pairs (seq[2]) for gang submissions, multi-point cross-ring timeline wait polling, and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit_ex() for concurrent Task+Mesh launch while propagating both leader and follower seqnos into last_compute_seq and syncobjs; drain both rings in acd_cmd_gem_wait_idle(). Exercised by `mesa-patches/dual_ring_sync_test.c` (invoked from `test-gfx1200-runtime.sh`).
 
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"

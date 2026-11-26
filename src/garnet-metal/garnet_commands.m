@@ -451,6 +451,12 @@ RDNA4_DNR(RDNA4CommandQueue)
     return _orderSem != VK_NULL_HANDLE &&
            atomic_load_explicit(&_orderLastWasCompute, memory_order_acquire) != 0;
 }
+- (uint64_t)rdna4PendingCrossQueueWaitForCompute:(BOOL)isCompute {
+    pthread_mutex_lock(&_qmu);
+    const uint64_t waitVal = garnet_async_qorder_cross_wait(&_order, isCompute ? 1 : 0);
+    pthread_mutex_unlock(&_qmu);
+    return waitVal;
+}
 - (garnet_async_submit_order_t)rdna4NextOrderForCompute:(BOOL)isCompute {
     pthread_mutex_lock(&_qmu);
     garnet_async_submit_order_t ord = garnet_async_qorder_next(&_order, isCompute ? 1 : 0);
@@ -2868,6 +2874,37 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         return NO;
     }
 
+    const VkSemaphore orderSem = (queue && [queue respondsToSelector:@selector(rdna4OrderSemaphore)])
+        ? [queue rdna4OrderSemaphore] : VK_NULL_HANDLE;
+    const BOOL submitCompute = segment->isComputeQueue && RDNA4R.asyncComputeOn && RDNA4R.computeQ != VK_NULL_HANDLE;
+    // Resolve any cross-queue timeline dependency BEFORE acquiring RDNA4R.qlock / RDNA4R.computeQlock
+    // so a blocking producer wait never stalls unrelated MTLCommandQueues on the process-wide queue lock.
+    if (orderSem != VK_NULL_HANDLE && RDNA4R.waitSemaphores &&
+        [queue respondsToSelector:@selector(rdna4PendingCrossQueueWaitForCompute:)]) {
+        const uint64_t preWait = [queue rdna4PendingCrossQueueWaitForCompute:submitCompute];
+        if (preWait > 0u) {
+            _inFlight = YES;
+            pthread_mutex_unlock(&_smu);
+            VkSemaphoreWaitInfo wi = {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                .semaphoreCount = 1u,
+                .pSemaphores = &orderSem,
+                .pValues = &preWait,
+            };
+            const VkResult wr = RDNA4R.waitSemaphores(RDNA4R.dev, &wi, 30000000000ull);
+            pthread_mutex_lock(&_smu);
+            _inFlight = NO;
+            if (wr != VK_SUCCESS) {
+                if (wr != VK_TIMEOUT) atomic_store(&rdna4_submit_fault, (int)wr);
+                error = rdna4_err(53, [NSString stringWithFormat:@"cross-queue timeline wait = %d", wr]);
+                BOOL claimed = [self rdna4ClaimTerminal];
+                pthread_mutex_unlock(&_smu);
+                if (claimed) [self rdna4DeliverTerminalFailure:error queue:queue unresolved:NO fault:wr];
+                return NO;
+            }
+        }
+    }
+
     VkFence fence = VK_NULL_HANDLE;
     VkResult r = rdna4_fence_take(&fence);
     if (r != VK_SUCCESS) {
@@ -2884,9 +2921,6 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         ? [queue rdna4PendingHasNewerSid:_dsid after:self] : NO;
     BOOL submitAttempted = NO, nativeDone = NO, elidedDispCopy = NO;
     uint64_t argumentSubmissionEpoch = 0;
-    const VkSemaphore orderSem = (queue && [queue respondsToSelector:@selector(rdna4OrderSemaphore)])
-        ? [queue rdna4OrderSemaphore] : VK_NULL_HANDLE;
-    const BOOL submitCompute = segment->isComputeQueue && RDNA4R.asyncComputeOn && RDNA4R.computeQ != VK_NULL_HANDLE;
     if (submitCompute) {
         // Dedicated MEC compute queue: never acquires RDNA4R.qlock so distinct MTLCommandQueues
         // submit GFX and Compute in true lock-free parallel.
@@ -6311,7 +6345,7 @@ RDNA4_ENCODER_SHARED
             rdna4_each_tex([_pso pb], [_pso npb], &_st, dev, ^(RDNA4Texture *t, VkImageLayout l, BOOL writable) {
                 (void)l; (void)writable;
                 if (hasIncompatTex) return;
-                const int isIos = [t rdna4IsIOS] ? 1 : 0;
+                const int isIos = ([t rdna4IsIOS] || [t rdna4IsDisp]) ? 1 : 0;
                 const int isDs = ([t rdna4Aspects] & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) ? 1 : 0;
                 const VkImageLayout curL = [t layout];
                 const int inAtt = (curL == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||

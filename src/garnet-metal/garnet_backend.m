@@ -1914,6 +1914,10 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.computeQ = VK_NULL_HANDLE;
         RDNA4R.computeQfi = qfi;
         RDNA4R.asyncComputeOn = NO;
+        RDNA4R.waitSemaphores = vkGetDeviceProcAddr
+            ? (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(RDNA4R.dev, "vkWaitSemaphores") : NULL;
+        if (!RDNA4R.waitSemaphores && vkGetDeviceProcAddr)
+            RDNA4R.waitSemaphores = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(RDNA4R.dev, "vkWaitSemaphoresKHR");
         if (wantAsyncCompute && vkCreateSemaphore && vkDestroySemaphore) {
             vkGetDeviceQueue(RDNA4R.dev, cqfi, 0, &RDNA4R.computeQ);
             if (RDNA4R.computeQ != VK_NULL_HANDLE) {

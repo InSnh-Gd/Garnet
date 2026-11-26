@@ -62,17 +62,23 @@ static inline int garnet_async_compute_needs_gfx_fallback(int is_compute_segment
     return (need_arg_prep || has_icb_or_rt_owners || has_incompatible_texture) ? 1 : 0;
 }
 
+// Peek the cross-queue timeline value that must retire before submitting on GFX (0) or Compute (1),
+// without mutating ordering state. Returns 0 for same-queue or first submissions.
+static inline uint64_t
+garnet_async_qorder_cross_wait(const garnet_async_qorder_t *st, int is_compute) {
+    const int cur = is_compute ? 1 : 0;
+    return (st->last_value > 0u && st->last_was_compute != cur) ? st->last_value : 0u;
+}
+
 // Advance same-MTLCommandQueue timeline ordering for a submission to GFX (0) or Compute (1).
 // Same-queue submissions stay hardware-FIFO without waits; GFX <-> Compute transitions wait
 // on the prior queue's last signaled timeline value.
 static inline garnet_async_submit_order_t
 garnet_async_qorder_next(garnet_async_qorder_t *st, int is_compute) {
     garnet_async_submit_order_t out = { 0u, 0u };
-    const int cur = is_compute ? 1 : 0;
-    if (st->last_value > 0u && st->last_was_compute != cur)
-        out.wait_value = st->last_value;
+    out.wait_value = garnet_async_qorder_cross_wait(st, is_compute);
     st->last_value++;
-    st->last_was_compute = cur;
+    st->last_was_compute = is_compute ? 1 : 0;
     out.signal_value = st->last_value;
     return out;
 }

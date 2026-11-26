@@ -257,7 +257,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
                 b.kind = kBoVis; b.a = a; b.mc = a.gpu_va;
                 bar0_memset_vram(dev, a.gpu_va - gCtx->gmc.vram_start, 0, a.size);
                 amdgpu_hdp_flush(dev);
-                placed = RDNA4N_GEM_DOMAIN_VRAM; bits = RDNA4N_PLACED_CPU_MAPPABLE | RDNA4N_PLACED_ZEROED;
+                placed = RDNA4N_GEM_DOMAIN_VRAM; bits = (b.dcc ? 0u : RDNA4N_PLACED_CPU_MAPPABLE) | RDNA4N_PLACED_ZEROED;
                 if (rdna4native::g4::appvis_counts(appsNow, s->ws, true)) { b.visCounted = 1u; gVisOthers += p.size; }
             } else if (hiDone || (p.hiOk && gCtx->gmc.vram_alloc_hi.is_inited() &&
                                   ((hugeAlign > p.align && gCtx->gmc.vram_alloc_hi.alloc(p.size, hugeAlign, &a)) ||

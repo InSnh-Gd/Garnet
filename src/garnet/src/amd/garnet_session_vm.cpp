@@ -214,6 +214,22 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
                 if (now_ns() - t0 >= kWaitCapNs) { N1C_LOG("open refused (NotReady): the kernel ring is not idle (rptr %u wptr %u)", *cp.rptr_cpu, cp.wptr); rc = kIOReturnNotReady; break; }
                 IOSleep(1);
             }
+            if (rc == kIOReturnSuccess && ctx.kcq.inited && ctx.kcq.mapped && ctx.kcq.rptr_cpu != nullptr) {
+                const uint64_t tKcq = now_ns();
+                for (;;) {
+                    sysmem_rmb();
+                    const uint64_t kcqEm = kcq_emitted_now();
+                    const uint64_t kcqRet = kcq_retired_now(kcqEm);
+                    if ((*ctx.kcq.rptr_cpu & ctx.kcq.ring_ptr_mask) == ctx.kcq.wptr && kcqRet >= kcqEm) break;
+                    if (now_ns() - tKcq >= kWaitCapNs) {
+                        N1C_LOG("open refused (NotReady): the compute ring is not idle (rptr %u wptr %u emitted %llu retired %llu)",
+                                *ctx.kcq.rptr_cpu, ctx.kcq.wptr, (unsigned long long)kcqEm, (unsigned long long)kcqRet);
+                        rc = kIOReturnNotReady;
+                        break;
+                    }
+                    IOSleep(1);
+                }
+            }
         }
         if (rc != kIOReturnSuccess) break;
         uint32_t cntl = 0u;

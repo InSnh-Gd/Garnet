@@ -665,6 +665,7 @@ typedef struct {
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescSet;
     garnet_bar_policy_t barPolicy;
     VkQueue computeQ; uint32_t computeQfi; pthread_mutex_t computeQlock; BOOL asyncComputeOn;
+    PFN_vkWaitSemaphores waitSemaphores;
 } RDNA4BackendState;
 typedef struct { rdna4t_hist spv, shm, gfx, cmp, imp, enc, gpu, wake, qlk, fgap, fgpu; } RDNA4T1State;
 typedef struct { BOOL on; BOOL auditSubmit; pthread_mutex_t mu; rdna4p_pool p; BOOL reqOK; uint64_t lastTrim, lastSig; unsigned unchanged;

@@ -1063,6 +1063,12 @@ struct GarnetCoreTestsRunner {
         let parsedFail = DiagnosticsManager.parseSmuMetricsOutput("!! firmware driver-interface version 0x36 is newer than the layout this\n!! build decodes; values are UNVERIFIED (range check: FAILED)\n")
         check("parseSmuMetricsOutput detects UNVERIFIED with FAILED range check", parsedFail.driverIfVersion == "0x36" && parsedFail.layoutVerified == false && parsedFail.valuesPlausible == false)
 
+        // Root garnetctl status must preserve ioreg SMU,MetricsValuesPlausible = No even when garnettest metrics prints no UNVERIFIED banner
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 51\n\"SMU,MetricsLayoutVerified\" = Yes\n\"SMU,MetricsValuesPlausible\" = No"
+        mock.garnetTestMetricsStdout = "clocks  gfx 3200 MHz  soc 1200 MHz  mem 1250 MHz  fclk 1800 MHz\n"
+        let stRootImplaus = DiagnosticsManager.collectStatus(env: rootEnv)
+        check("Root status preserves ioreg SMU,MetricsValuesPlausible = No", stRootImplaus.smuTelemetryState == .unverified && stRootImplaus.smuMetricsPlausible == false)
+
         mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 8192\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
         let st8g = DiagnosticsManager.collectStatus(env: env)
         check("Status parses 8 GiB BAR0 CurrentMB and unavailable SMU", st8g.bar0CurrentMB == 8192 && st8g.smuTelemetryState == .unavailable && st8g.smuDriverIfVersion == nil)
