@@ -68,6 +68,8 @@ ABI <= 1.12 kernels remain compatible with sparse/PRT and GFX12 DCC disabled).
 
 0030: sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; report drm_minor = 60 in acd_device_initialize() when QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC (unlocking gfx12_supports_dcc_write_compress_disable), and gate radv_is_dcc_disabled() on Darwin on !pdev->info.gfx12_supports_dcc_write_compress_disable (superseding 0025's unconditional GFX12 disable while preserving RADV_DEBUG=nodcc, garnet-dcc=0, and HOST_BO fallback).
 
+0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]) and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit() for concurrent Task+Mesh launch; drain both rings in acd_cmd_gem_wait_idle().
+
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
     python3 mesa-patches/test-host-composite.py /path/to/patched-mesa "$TMPDIR/host-test"
