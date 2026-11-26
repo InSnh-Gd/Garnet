@@ -186,6 +186,24 @@ def main() -> int:
           and "rdna4dc_stage_needs_tex(" in dc_h
           and "rdna4dc_stage_needs_tex(" in cmd_m)
 
+    # --- Wave 9: Compute GL2/MALL-preserving barriers, MTLDispatchTypeConcurrent, compute push descriptors ---
+    dev_m = read(GM / "garnet_device.m")
+    check("W9A: pure-C compute barrier policy helpers wired in garnet_queue_pipe.h and RDNA4ComputeEncoder",
+          "garnet_comp_needs_pre_barrier(" in qp_h
+          and "garnet_comp_scope_needs_full_barrier(" in qp_h
+          and "garnet_comp_needs_pre_barrier(" in cmd_m
+          and "garnet_comp_scope_needs_full_barrier(" in cmd_m)
+    check("W9A: MTLDispatchTypeConcurrent plumbed and per-dispatch DRAW_INDIRECT stall removed from rdna4Dispatch",
+          "initWithCommandBuffer:self dispatchType:t" in dev_m
+          and "- (NSUInteger)dispatchType { return _dispatchType; }" in cmd_m
+          and "VK_ACCESS_INDIRECT_COMMAND_READ_BIT" not in cmd_m
+          and "VK_ACCESS_UNIFORM_READ_BIT" in cmd_m)
+    check("W9B: compute pipelines use VK_KHR_push_descriptor with COMPUTE bind point",
+          "rdna4_stage_dsl_ex(r, 0, VK_SHADER_STAGE_COMPUTE_BIT" in pipe_m
+          and "- (BOOL)pushDesc { return _pushDesc; }" in pipe_m
+          and "fromRender ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE" in cmd_m
+          and "const BOOL usePush = [_pso pushDesc];" in cmd_m)
+
     print(f"test-160fps-contracts: {checks} checks, {fails} failed")
     return 1 if fails else 0
 

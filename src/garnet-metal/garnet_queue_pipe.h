@@ -102,4 +102,31 @@ static inline int garnet_qp_ws_needs_completion_wait(int is_ws, int no_ws_comple
     return is_frame && (!scanout_active || dlate);
 }
 
+// Compute encoder barrier policy (Wave 9):
+//   MTLDispatchTypeSerial (0): defer a compute-only barrier to the next direct
+//   dispatch, skipping DRAW_INDIRECT / PFP_SYNC_ME / WB_L2 so 4 MiB GL2 and
+//   32 MiB Infinity Cache (MALL) stay warm. Indirect dispatches and endEncoding
+//   keep rdna4_full_barrier.
+//   MTLDispatchTypeConcurrent (1): omit implicit inter-dispatch barriers; the
+//   caller orders dependencies with memoryBarrierWithScope: / Resources:.
+#define GARNET_COMP_DISPATCH_SERIAL     0u
+#define GARNET_COMP_DISPATCH_CONCURRENT 1u
+
+static inline unsigned garnet_comp_norm_dispatch_type(uint64_t dispatch_type) {
+    return dispatch_type == GARNET_COMP_DISPATCH_CONCURRENT
+        ? GARNET_COMP_DISPATCH_CONCURRENT : GARNET_COMP_DISPATCH_SERIAL;
+}
+
+static inline int garnet_comp_needs_pre_barrier(unsigned dispatch_type, int pending_serial,
+                                                int is_indirect) {
+    return dispatch_type == GARNET_COMP_DISPATCH_SERIAL && pending_serial && !is_indirect;
+}
+
+// MTLBarrierScope: Buffers=1<<0, Textures=1<<1, RenderTargets=1<<2.
+// Compute-local scopes only need compute-to-compute ordering; RenderTargets or
+// unknown higher bits fall back to rdna4_full_barrier.
+static inline int garnet_comp_scope_needs_full_barrier(uint64_t scope) {
+    return (scope & ~3ULL) != 0ULL;
+}
+
 #endif

@@ -1241,7 +1241,8 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     }
     rdna4s_free(&m);
     _pcSize = r->pc_size;
-    BOOL ok = rdna4_stage_dsl(r, 0, VK_SHADER_STAGE_COMPUTE_BIT, meta, &_dsl, &_pb, &_npb, _owned, &e);
+    const BOOL allowPush = (meta[@"argument_resource_tables"] == nil);
+    BOOL ok = rdna4_stage_dsl_ex(r, 0, VK_SHADER_STAGE_COMPUTE_BIT, meta, &_dsl, &_pb, &_npb, _owned, allowPush, &_pushDesc, &e);
     if (ok) {
         _argumentTables.comparisonSamplers = [meta[@"argument_resource_tables"][@"comparison_sampler"] boolValue];
         _argumentTables.samplerCoordinates = [meta[@"normalized_sampler_coordinates"] boolValue];
@@ -1523,6 +1524,7 @@ RDNA4_DNR(RDNA4ComputePipelineState)
     return n;
 }
 - (const RDNA4ArgumentTables *)argumentTables { return &_argumentTables; }
+- (BOOL)pushDesc { return _pushDesc; }
 - (const rdna4_argument_scan_reflection_plan *)scanPlan { return &_scan; }
 - (BOOL)rdna4HasAddressRegistry { return _hasAddressRegistry; }
 - (const uint32_t *)nominalLocal { return _local; } - (int)mode { return _mode; } - (uint32_t)pcOffset { return _pcOff; } - (uint32_t)pcSize { return _pcSize; }

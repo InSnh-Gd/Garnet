@@ -162,6 +162,27 @@ int main(void) {
           garnet_qp_ws_needs_completion_wait(1, 0, 0, 1, 1, 1) == 1 &&
           garnet_qp_ws_needs_completion_wait(1, 0, 1, 0, 1, 0) == 1);
 
+    // 9. Wave 9 compute barrier policy (serial deferred compute-only vs concurrent)
+    CHECK("comp dispatch type: normalizes concurrent=1, everything else=serial(0)",
+          garnet_comp_norm_dispatch_type(0) == GARNET_COMP_DISPATCH_SERIAL &&
+          garnet_comp_norm_dispatch_type(1) == GARNET_COMP_DISPATCH_CONCURRENT &&
+          garnet_comp_norm_dispatch_type(2) == GARNET_COMP_DISPATCH_SERIAL &&
+          garnet_comp_norm_dispatch_type(99) == GARNET_COMP_DISPATCH_SERIAL);
+    CHECK("comp pre-barrier: only when serial + pending + direct dispatch",
+          garnet_comp_needs_pre_barrier(GARNET_COMP_DISPATCH_SERIAL, 0, 0) == 0 &&
+          garnet_comp_needs_pre_barrier(GARNET_COMP_DISPATCH_SERIAL, 1, 0) == 1 &&
+          garnet_comp_needs_pre_barrier(GARNET_COMP_DISPATCH_SERIAL, 1, 1) == 0 &&
+          garnet_comp_needs_pre_barrier(GARNET_COMP_DISPATCH_CONCURRENT, 1, 0) == 0 &&
+          garnet_comp_needs_pre_barrier(GARNET_COMP_DISPATCH_CONCURRENT, 0, 0) == 0);
+    CHECK("comp memoryBarrierWithScope: Buffers/Textures use compute-only, RenderTargets/unknown use full",
+          garnet_comp_scope_needs_full_barrier(0) == 0 &&
+          garnet_comp_scope_needs_full_barrier(1) == 0 &&
+          garnet_comp_scope_needs_full_barrier(2) == 0 &&
+          garnet_comp_scope_needs_full_barrier(3) == 0 &&
+          garnet_comp_scope_needs_full_barrier(4) == 1 &&
+          garnet_comp_scope_needs_full_barrier(5) == 1 &&
+          garnet_comp_scope_needs_full_barrier(8) == 1);
+
     printf("test-queue-pipe: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

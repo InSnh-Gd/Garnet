@@ -1345,6 +1345,7 @@ typedef struct {
     uint64_t _iftOwnerToken;
     rdna4rtr_reflection_t _rt;
     BOOL _hasAddressRegistry;
+    BOOL _pushDesc;
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev function:(id)fn spv:(NSData *)spv meta:(NSDictionary *)meta fname:(NSString *)fname error:(NSError **)err;
@@ -1366,7 +1367,7 @@ typedef struct {
 - (uint32_t)icbNpb;
 - (uint32_t)rdna4CopyCompiledLocals:(uint32_t (*)[3])outLocals maxCount:(uint32_t)maxCount;
 - (BOOL)rdna4LumaWorkgroup;
-- (VkPipelineLayout)layout; - (VkDescriptorSetLayout)dsl; - (const RDNA4PB *)pb; - (uint32_t)npb;
+- (VkPipelineLayout)layout; - (VkDescriptorSetLayout)dsl; - (const RDNA4PB *)pb; - (uint32_t)npb; - (BOOL)pushDesc;
 - (const RDNA4ArgumentTables *)argumentTables;
 - (const rdna4_argument_scan_reflection_plan *)scanPlan;
 - (BOOL)rdna4HasAddressRegistry;
@@ -1685,7 +1686,8 @@ typedef struct {
 - (void)rdna4ReleaseRenderHandles;
 @end
 
-@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; NSUInteger _tgMemLengths[RDNA4_ICB_MAX_TG_MEM_INDICES]; MTLRegion _stageInRegion; BOOL _hasStageInRegion; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; VkPipeline _boundPipe; VkPipelineLayout _boundLayout; VkDescriptorSet _boundSet; uint32_t _boundLocal[3]; BOOL _boundIndirect; NSUInteger _boundTgBytes; uint32_t _boundPC[12]; BOOL _boundPCValid; uint64_t _compSegSerial; BOOL _compStateDirty; }
+@interface RDNA4ComputeEncoder : _MTLCommandEncoder { RDNA4CommandBuffer *_cb; BOOL _ended; NSString *_lbl; RDNA4ComputePipelineState *_pso; MTLComputePipelineReflection *_roReflection; RDNA4StageState _st; uint32_t _roWarn; NSMutableSet *_argumentResources, *_argumentWritable, *_samplerBindings; RDNA4ResourceBindings *_resourceBindings; NSUInteger _threadgroupBytes; NSUInteger _tgMemLengths[RDNA4_ICB_MAX_TG_MEM_INDICES]; MTLRegion _stageInRegion; BOOL _hasStageInRegion; id<RDNA4CounterSampleBufferInternal> _csbEnd[RDNA4CNT_MAX_PASS_ATTACHMENTS]; NSUInteger _csbEndIdx[RDNA4CNT_MAX_PASS_ATTACHMENTS]; uint32_t _nCsbEnd; VkPipeline _boundPipe; VkPipelineLayout _boundLayout; VkDescriptorSet _boundSet; uint32_t _boundLocal[3]; BOOL _boundIndirect; NSUInteger _boundTgBytes; uint32_t _boundPC[12]; BOOL _boundPCValid; uint64_t _compSegSerial; BOOL _compStateDirty; BOOL _boundPushValid; NSUInteger _dispatchType; BOOL _pendingSerialBarrier; }
+- (instancetype)initWithCommandBuffer:(id)cb dispatchType:(NSUInteger)dispatchType;
 - (instancetype)initWithCommandBuffer:(id)cb compute:(int)dummy;
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLComputePassDescriptor *)d;
 @end

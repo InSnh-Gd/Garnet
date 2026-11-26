@@ -454,7 +454,11 @@ RDNA4_DNR(GarnetGLDrawable)
     RDNA4LOGR("cb computeCommandEncoderWithDescriptor:");
     return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self descriptor:d];
 }
-- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
+- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t {
+    (void)[self vk];
+    RDNA4LOGR("cb computeCommandEncoderWithDispatchType:%lu", (unsigned long)t);
+    return [[RDNA4ComputeEncoder alloc] initWithCommandBuffer:self dispatchType:t];
+}
 - (id)resourceStateCommandEncoder {
     return rdna4_cb_new_resource_state_encoder(self, nil);
 }
