@@ -30,6 +30,7 @@ if [ -z "$XL" ]; then
 fi
 [ -f "$XL" ] || { echo "build.sh: libgarnetxlate.dylib not found: $XL" >&2; exit 1; }
 [ "$(lipo -archs "$XL" 2>/dev/null)" = "x86_64" ] || { echo "build.sh: $XL is not a thin x86_64 library" >&2; exit 1; }
+bash "$D/../../tools/rdna4/xlate-guard.sh" verify "$D/../.." "$XL" || exit 1
 VKINC="${RDNA4_VK_INC:--I/opt/homebrew/include}"
 rm -rf "$B"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$B/sanity"
 cp "$D/Info.plist" "$APP/Contents/Info.plist"

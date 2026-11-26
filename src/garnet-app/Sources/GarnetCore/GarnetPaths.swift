@@ -28,6 +28,10 @@ public enum GarnetPaths {
     public static let vulkanICDPath = "/Library/Vulkan/icd.d/radeon_icd.x86_64.json"
     public static let radvAppBinPath = "/usr/local/bin/radv-app"
 
+    // macOS icon-services & Dock icon cache locations cleared best-effort on install/uninstall.
+    public static let systemIconCacheStorePath = "/Library/Caches/com.apple.iconservices.store"
+    public static let varFoldersDir = "/private/var/folders"
+
     // Legacy v0.1.0 runtime paths (migrated/cleaned on upgrade; never includes RDNA4/hardware-test).
     public static let legacyNativeSupportDir = "/Library/Application Support/RDNA4/native"
     public static let legacyDenylistPath = "/Library/Application Support/RDNA4/native/app-denylist.txt"

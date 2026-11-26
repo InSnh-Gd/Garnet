@@ -191,6 +191,8 @@ if [ -z "${RDNA4_XLATE_LIB:-}" ]; then
     require_file 'XLATE build output' "$RDNA4_XLATE_LIB"
     RDNA4_XLATE_LIB=$(absolute_file "$RDNA4_XLATE_LIB")
 fi
+bash "$repo/tools/rdna4/xlate-guard.sh" verify "$repo" "$RDNA4_XLATE_LIB" \
+    || fail 'RDNA4_XLATE_LIB failed symbol/freshness verification'
 record_input RDNA4_RADV_LIB "$RDNA4_RADV_LIB"
 record_input RDNA4_XLATE_LIB "$RDNA4_XLATE_LIB"
 export RDNA4_RADV_LIB RDNA4_XLATE_LIB RDNA4_VK_INC C64_WORK

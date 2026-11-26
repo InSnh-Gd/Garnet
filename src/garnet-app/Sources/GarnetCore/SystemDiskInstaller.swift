@@ -580,6 +580,9 @@ public enum SystemDiskInstaller {
             throw SystemInstallError.transactionFailed("\(error)")
         }
 
+        let clearedIconCaches = clearIconCachesBestEffort(env: env)
+        let cacheNote = clearedIconCaches.isEmpty ? "" : "; cleared \(clearedIconCaches.count) macOS icon cache path(s)"
+
         return InstallPlanResult(
             executed: true,
             dryRun: false,
@@ -592,7 +595,7 @@ public enum SystemDiskInstaller {
             vulkanICDInstalled: options.installVulkanICD,
             denylistPreservedOnUpgrade: willPreserveOrMigrateDenylist,
             backupDirectory: backupDir.path,
-            message: "Installed Garnet \(verified.garnetVersion) (layout \(matchedShortId)) to system disk & AuxKC; reboot required to activate. ESP was not modified."
+            message: "Installed Garnet \(verified.garnetVersion) (layout \(matchedShortId)) to system disk & AuxKC\(cacheNote); reboot required to activate. ESP was not modified."
         )
     }
 
@@ -774,6 +777,9 @@ public enum SystemDiskInstaller {
             throw SystemInstallError.transactionFailed("\(error)")
         }
 
+        let clearedIconCaches = clearIconCachesBestEffort(env: env)
+        let cacheNote = clearedIconCaches.isEmpty ? "" : "; cleared \(clearedIconCaches.count) macOS icon cache path(s)"
+
         return UninstallPlanResult(
             executed: true,
             dryRun: false,
@@ -782,7 +788,7 @@ public enum SystemDiskInstaller {
             preservedForeignAuxKexts: foreignKexts,
             auxKCRemoved: auxRemoved,
             backupDirectory: backupDir.path,
-            message: "Uninstalled Garnet system-disk components (\(foreignKexts.count) foreign AuxKC kext(s) preserved); reboot required. Remember to disable GarnetPCIBarCompat.kext / garnet* boot-args in OpenCore if reverting completely."
+            message: "Uninstalled Garnet system-disk components (\(foreignKexts.count) foreign AuxKC kext(s) preserved)\(cacheNote); reboot required. Remember to disable GarnetPCIBarCompat.kext / garnet* boot-args in OpenCore if reverting completely."
         )
     }
 
@@ -796,6 +802,60 @@ public enum SystemDiskInstaller {
         let dst = destDir.appendingPathComponent("GarnetPCIBarCompat.kext")
         try replaceItem(from: src, to: dst)
         return dst
+    }
+
+    /// Best-effort deletion of macOS icon bitmap caches so iconservicesagent and Dock regenerate
+    /// fresh icons after rebooting into a new (or removed) GarnetMetal stack. Never kills running
+    /// daemons, never follows symlinks, and ignores missing/EPERM paths so install/uninstall cannot fail.
+    @discardableResult
+    public static func clearIconCachesBestEffort(env: HostEnvironment) -> [String] {
+        let fm = FileManager.default
+        var cleared: [String] = []
+
+        func isRegularOrDir(_ url: URL) -> Bool {
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return false }
+            let kind = st.st_mode & S_IFMT
+            return kind == S_IFREG || kind == S_IFDIR
+        }
+
+        func isRealDir(_ url: URL) -> Bool {
+            var st = stat()
+            return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+        }
+
+        let sysStore = env.url(forSystemPath: GarnetPaths.systemIconCacheStorePath)
+        if isRegularOrDir(sysStore) {
+            do {
+                try fm.removeItem(at: sysStore)
+                cleared.append(GarnetPaths.systemIconCacheStorePath)
+            } catch {}
+        }
+
+        let varFoldersURL = env.url(forSystemPath: GarnetPaths.varFoldersDir)
+        if isRealDir(varFoldersURL),
+           let buckets = try? fm.contentsOfDirectory(atPath: varFoldersURL.path) {
+            for bucket in buckets.sorted() {
+                let bucketURL = varFoldersURL.appendingPathComponent(bucket)
+                guard isRealDir(bucketURL),
+                      let users = try? fm.contentsOfDirectory(atPath: bucketURL.path) else {
+                    continue
+                }
+                for userHash in users.sorted() {
+                    let cDirURL = bucketURL.appendingPathComponent(userHash).appendingPathComponent("C")
+                    guard isRealDir(cDirURL) else { continue }
+                    for targetName in ["com.apple.iconservices", "com.apple.dock.iconcache"] {
+                        let targetURL = cDirURL.appendingPathComponent(targetName)
+                        guard isRegularOrDir(targetURL) else { continue }
+                        do {
+                            try fm.removeItem(at: targetURL)
+                            cleared.append("\(GarnetPaths.varFoldersDir)/\(bucket)/\(userHash)/C/\(targetName)")
+                        } catch {}
+                    }
+                }
+            }
+        }
+        return cleared
     }
 
     private static func resolveForeignKextURL(_ bundlePath: String, env: HostEnvironment) -> URL {

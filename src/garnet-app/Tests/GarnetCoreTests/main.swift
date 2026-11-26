@@ -960,7 +960,19 @@ struct GarnetCoreTestsRunner {
 
         let env = HostEnvironment(sysRoot: sysRoot, bootKCPath: "/kcs/BootKernelExtensions.kc", systemKCPath: "/kcs/SystemKernelExtensions.kc", runner: mock, effectiveUID: 501)
 
-        // Dry run install
+        // Dry run install (seed icon caches first and confirm dry-run leaves them untouched)
+        let iconStoreURL = sysRoot.appendingPathComponent("Library/Caches/com.apple.iconservices.store")
+        let iconUserC = sysRoot.appendingPathComponent("private/var/folders/ab/cdef01/C")
+        let iconSvcURL = iconUserC.appendingPathComponent("com.apple.iconservices")
+        let dockCacheURL = iconUserC.appendingPathComponent("com.apple.dock.iconcache")
+        let keepOtherURL = iconUserC.appendingPathComponent("com.apple.keep.other")
+        try fm.createDirectory(at: iconStoreURL, withIntermediateDirectories: true)
+        try Data("stale-store".utf8).write(to: iconStoreURL.appendingPathComponent("store.bin"))
+        try fm.createDirectory(at: iconSvcURL, withIntermediateDirectories: true)
+        try Data("stale-user-icon".utf8).write(to: iconSvcURL.appendingPathComponent("icon.bin"))
+        try Data("stale-dock-icon".utf8).write(to: dockCacheURL)
+        try Data("unrelated-cache".utf8).write(to: keepOtherURL)
+
         let dryPlan = try SystemDiskInstaller.install(
             payloadURL: fix.payloadDir,
             options: InstallOptions(installVulkanICD: false, dryRun: true, verifyCodeSignatures: false, allowNonRootSandbox: true),
@@ -968,6 +980,7 @@ struct GarnetCoreTestsRunner {
         )
         check("Installer dryRun=true does not write Garnet.kext", dryPlan.dryRun && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/Garnet.kext").path))
         check("Installer dryRun preserves foreign kext list", dryPlan.preservedForeignAuxKexts.count == 1)
+        check("Installer dryRun leaves icon caches intact", fm.fileExists(atPath: iconStoreURL.path) && fm.fileExists(atPath: iconSvcURL.path) && fm.fileExists(atPath: dockCacheURL.path))
 
         // Real sandbox install (Vulkan OFF by default)
         let instRes = try SystemDiskInstaller.install(
@@ -976,6 +989,12 @@ struct GarnetCoreTestsRunner {
             env: env
         )
         check("Installer executed", instRes.executed && !instRes.vulkanICDInstalled)
+        check("Installer clears macOS icon caches and preserves unrelated files",
+              !fm.fileExists(atPath: iconStoreURL.path)
+              && !fm.fileExists(atPath: iconSvcURL.path)
+              && !fm.fileExists(atPath: dockCacheURL.path)
+              && fm.fileExists(atPath: keepOtherURL.path)
+              && instRes.message.contains("cleared 3 macOS icon cache"))
         check("Garnet.kext & GarnetAccel.kext installed", fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/Garnet.kext/Contents/Info.plist").path) && fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/GarnetAccel.kext/Contents/Info.plist").path))
         check("GarnetPCIBarCompat.kext NEVER placed in /Library/Extensions", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/GarnetPCIBarCompat.kext").path))
         check("Vulkan ICD omitted by default", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Vulkan/icd.d/radeon_icd.x86_64.json").path))
@@ -1079,12 +1098,28 @@ struct GarnetCoreTestsRunner {
         let scrubbed = DiagnosticsManager.sanitizeText("IOPlatformSerialNumber = \"C02FAKE12345\"\npath=/Users/\(NSUserName())/foo\n")
         check("Sanitizer strips serial & username", !scrubbed.contains("C02FAKE12345") && scrubbed.contains("REDACTED HARDWARE IDENTIFIER") && !scrubbed.contains("/Users/\(NSUserName())/"))
 
+        // Re-seed icon caches + a symlinked icon cache target before uninstall to verify cleanup & symlink safety
+        try fm.createDirectory(at: iconStoreURL, withIntermediateDirectories: true)
+        try fm.createDirectory(at: iconSvcURL, withIntermediateDirectories: true)
+        try Data("stale-dock-before-uninstall".utf8).write(to: dockCacheURL)
+        let symRealTarget = tempRoot.appendingPathComponent("do-not-delete-via-symlink.txt")
+        try Data("protected".utf8).write(to: symRealTarget)
+        let symIconDir = sysRoot.appendingPathComponent("private/var/folders/zz/yy/C")
+        try fm.createDirectory(at: symIconDir, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: symIconDir.appendingPathComponent("com.apple.dock.iconcache"), withDestinationURL: symRealTarget)
+
         // Uninstall preserving foreign kext & denylist
         let unRes = try SystemDiskInstaller.uninstall(
             options: UninstallOptions(removeDenylist: false, dryRun: false, allowNonRootSandbox: true),
             env: env
         )
         check("Uninstall removed Garnet.kext & preserved foreign AuxKC", unRes.executed && !unRes.auxKCRemoved && unRes.preservedForeignAuxKexts.count == 1 && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/Garnet.kext").path))
+        check("Uninstall clears macOS icon caches and never deletes symlink targets",
+              !fm.fileExists(atPath: iconStoreURL.path)
+              && !fm.fileExists(atPath: iconSvcURL.path)
+              && !fm.fileExists(atPath: dockCacheURL.path)
+              && fm.fileExists(atPath: symRealTarget.path)
+              && unRes.message.contains("cleared 3 macOS icon cache"))
         check("Uninstall preserved custom denylist", fm.fileExists(atPath: sysRoot.appendingPathComponent(DenylistManager.denylistPath.dropFirst().description).path))
 
         // Uninstall with 0 foreign kexts removes AuxKC
