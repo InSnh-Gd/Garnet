@@ -8,8 +8,6 @@ import GarnetCore
 struct StatusTroubleshootView: View {
     @ObservedObject var model: GarnetAppModel
     @State private var manualProcName: String = ""
-    @State private var diagExportMessage: String = ""
-    @State private var diagExportFailed: Bool = false
     @State private var showClearDenylistConfirm: Bool = false
 
     var body: some View {
@@ -18,6 +16,12 @@ struct StatusTroubleshootView: View {
                 Text("Runtime Status, App Denylist & Diagnostics")
                     .font(.title2).bold()
                 Spacer()
+                Button {
+                    model.exportDiagnosticsOneClick()
+                } label: {
+                    Label("Export Diagnostics", systemImage: "square.and.arrow.up")
+                }
+                .disabled(model.isExportingDiag)
                 Button("Refresh Status") { model.refreshAll() }
                     .disabled(model.isBusy)
             }
@@ -129,19 +133,41 @@ struct StatusTroubleshootView: View {
                 }
 
                 Section("Troubleshooting Diagnostics") {
-                    Text("Exports a .tar.gz archive with preflight JSON, driver/PCI ioregistry dumps, kmutil showloaded output, and recent Garnet kernel logs (username, home paths, serial number, and IOPlatformUUID scrubbed).")
+                    Text("Exports a .tar.gz archive with activation & translator logs, LaunchDaemon status, preflight JSON, driver/accelerator/display IORegistry dumps, system_profiler displays, kmutil showloaded output, and unified logs (username, home paths, serial number, and hardware UUID scrubbed).")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
-                    HStack {
+                    HStack(spacing: 12) {
                         Button {
-                            exportDiagnostics()
+                            model.exportDiagnosticsOneClick()
                         } label: {
-                            Label("Export Diagnostics Bundle…", systemImage: "square.and.arrow.up")
+                            Label("One-Click Export to Desktop", systemImage: "square.and.arrow.up")
                         }
-                        if !diagExportMessage.isEmpty {
-                            Text(diagExportMessage).font(.caption).foregroundColor(diagExportFailed ? .red : .green)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isExportingDiag)
+
+                        Button("Save As…") {
+                            exportDiagnostics()
                         }
+                        .disabled(model.isExportingDiag)
+
+                        if let exportedURL = model.lastExportedDiagURL {
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([exportedURL])
+                            }
+                        }
+
+                        if model.isExportingDiag {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+
+                    if !model.diagExportMessage.isEmpty {
+                        Text(model.diagExportMessage)
+                            .font(.caption)
+                            .foregroundColor(model.diagExportFailed ? .red : .green)
+                            .textSelection(.enabled)
                     }
                 }
             }
@@ -196,21 +222,10 @@ struct StatusTroubleshootView: View {
 
     private func exportDiagnostics() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "garnet-diagnostics.tar.gz"
+        panel.nameFieldStringValue = DiagnosticsManager.defaultDiagnosticsArchiveURL().lastPathComponent
         panel.allowedContentTypes = [UTType.gzip]
         if panel.runModal() == .OK, let outURL = panel.url {
-            do {
-                let saved = try DiagnosticsManager.exportSanitizedDiagnostics(
-                    toArchive: outURL,
-                    env: HostEnvironment(),
-                    payloadURL: model.payloadURL
-                )
-                diagExportFailed = false
-                diagExportMessage = "Saved \(saved.lastPathComponent)"
-            } catch {
-                diagExportFailed = true
-                diagExportMessage = "Failed: \(error)"
-            }
+            model.exportDiagnostics(to: outURL, revealInFinder: true)
         }
     }
 }

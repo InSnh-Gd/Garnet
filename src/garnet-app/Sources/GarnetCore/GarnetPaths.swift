@@ -16,6 +16,7 @@ public enum GarnetPaths {
     public static let nativeSupportDir = "/Library/Application Support/Garnet/native"
     public static let backupsDir = "/Library/Application Support/Garnet/backups"
     public static let denylistPath = "/Library/Application Support/Garnet/native/app-denylist.txt"
+    public static let profilePath = "/Library/Application Support/Garnet/native/profile"
     public static let garnetTestPath = "/Library/Application Support/Garnet/native/garnettest"
     public static let manifestPath = "/Library/Application Support/Garnet/native/MANIFEST.txt"
 
@@ -35,8 +36,11 @@ public enum GarnetPaths {
     // Legacy v0.1.0 runtime paths (migrated/cleaned on upgrade; never includes RDNA4/hardware-test).
     public static let legacyNativeSupportDir = "/Library/Application Support/RDNA4/native"
     public static let legacyDenylistPath = "/Library/Application Support/RDNA4/native/app-denylist.txt"
+    public static let legacyProfilePath = "/Library/Application Support/RDNA4/native/profile"
     public static let legacyGarnetTestPath = "/Library/Application Support/RDNA4/native/garnettest"
     public static let legacyManifestPath = "/Library/Application Support/RDNA4/native/MANIFEST.txt"
+    public static let legacyLogsDir = "/Library/Logs/RDNA4"
+    public static let legacyTranslateLogsDir = "/Library/Logs/RDNA4Translate"
     public static let legacyXlateDumpDir = "/private/tmp/rdna4m"
     public static let legacySpvCacheDir = "/private/var/tmp/rdna4m-spv"
 

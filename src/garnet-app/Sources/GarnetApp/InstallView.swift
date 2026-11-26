@@ -68,7 +68,23 @@ struct InstallView: View {
                     HStack {
                         Button("Re-run Preflight") { model.refreshAll() }
                             .disabled(model.isBusy)
+                        Button {
+                            model.exportDiagnosticsOneClick()
+                        } label: {
+                            Label("Export Diagnostics", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(model.isExportingDiag)
+                        if model.isExportingDiag {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
                         Spacer()
+                    }
+                    if !model.diagExportMessage.isEmpty {
+                        Text(model.diagExportMessage)
+                            .font(.caption)
+                            .foregroundColor(model.diagExportFailed ? .red : .green)
+                            .textSelection(.enabled)
                     }
                 }
 

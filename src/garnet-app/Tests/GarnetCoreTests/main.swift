@@ -538,6 +538,15 @@ struct GarnetCoreTestsRunner {
                 return CommandResult(exitCode: 0, stdout: arch, stderr: "")
             }
             if executable == "/usr/sbin/sysctl" {
+                if arguments.contains("kern.bootargs") {
+                    return CommandResult(exitCode: 0, stdout: "garnet=1 garnet-metal=1\n", stderr: "")
+                }
+                if arguments.contains("kern.osversion") {
+                    return CommandResult(exitCode: 0, stdout: "25G332\n", stderr: "")
+                }
+                if arguments.contains("kern.boottime") {
+                    return CommandResult(exitCode: 0, stdout: "{ sec = 1764000000, usec = 0 }\n", stderr: "")
+                }
                 return CommandResult(exitCode: 0, stdout: cpuFeatures, stderr: "")
             }
             if executable == "/usr/bin/csrutil" {
@@ -548,11 +557,27 @@ struct GarnetCoreTestsRunner {
                 if arguments.contains("IOPCIDevice") { return CommandResult(exitCode: 0, stdout: pciGPUsIoreg, stderr: "") }
                 if arguments.contains("GarnetDriver") { return CommandResult(exitCode: 0, stdout: garnetDriverIoreg, stderr: "") }
                 if arguments.contains("GarnetPCIBarCompat") { return CommandResult(exitCode: 0, stdout: pciCompatIoreg, stderr: "") }
+                if arguments.contains("GarnetMetalNub") { return CommandResult(exitCode: 0, stdout: "+-o GarnetMetalNub <class GarnetMetalNub>\n", stderr: "") }
+                if arguments.contains("GarnetAccelerator") { return CommandResult(exitCode: 0, stdout: "+-o GarnetAccelerator <class GarnetAccelerator>\n", stderr: "") }
+                if arguments.contains("AMDGarnetPrimaryFramebuffer") { return CommandResult(exitCode: 0, stdout: "+-o AMDGarnetPrimaryFramebuffer\n", stderr: "") }
+            }
+            if executable == "/bin/launchctl" {
+                return CommandResult(exitCode: 0, stdout: "system/com.garnet.native = {\n\tstate = running\n}\n", stderr: "")
+            }
+            if executable == "/usr/sbin/system_profiler" {
+                return CommandResult(exitCode: 0, stdout: "Graphics/Displays:\n  AMD Radeon RX 9060 XT:\n    Metal Support: Metal 3\n    Hardware UUID: 11111111-2222-3333-4444-555555555555\n", stderr: "")
+            }
+            if executable == "/bin/ps" {
+                return CommandResult(exitCode: 0, stdout: "  PID  PPID   UID STAT      ETIME COMM\n  123     1    88 Ss     01:00 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n  456     1     0 S      01:00 /usr/sbin/unrelated\n", stderr: "")
             }
             if executable.hasSuffix("garnettest") {
                 if failGarnetTest { return CommandResult(exitCode: 1, stdout: "", stderr: "mock fail") }
                 if arguments.contains("vramstat") { return CommandResult(exitCode: 0, stdout: "vram=16384MB used=512MB", stderr: "") }
                 if arguments == ["metrics"] { return CommandResult(exitCode: 0, stdout: garnetTestMetricsStdout, stderr: "") }
+                if arguments == ["info"] { return CommandResult(exitCode: 0, stdout: "gc=12.0.0\n", stderr: "") }
+                if arguments == ["log"] { return CommandResult(exitCode: 0, stdout: "ring ok\n", stderr: "") }
+                if arguments == ["counters"] { return CommandResult(exitCode: 0, stdout: "submits=42\n", stderr: "") }
+                if arguments == ["accel", "pipestat"] { return CommandResult(exitCode: 0, stdout: "agdc=PUBLISHED\n", stderr: "") }
                 return CommandResult(exitCode: 0, stdout: "ok\n", stderr: "")
             }
             if executable == "/usr/bin/kmutil" {
@@ -1092,11 +1117,68 @@ struct GarnetCoreTestsRunner {
         let st8g = DiagnosticsManager.collectStatus(env: env)
         check("Status parses 8 GiB BAR0 CurrentMB and unavailable SMU", st8g.bar0CurrentMB == 8192 && st8g.smuTelemetryState == .unavailable && st8g.smuDriverIfVersion == nil)
         mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 51\n\"SMU,MetricsLayoutVerified\" = Yes"
+        try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/Logs/Garnet"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/Logs/GarnetTranslate"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/Logs/RDNA4"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/Logs/RDNA4Translate"), withIntermediateDirectories: true)
+        try Data("native\n".utf8).write(to: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/profile"))
+        try Data("activation stdout ok\n".utf8).write(to: sysRoot.appendingPathComponent("Library/Logs/Garnet/native-activation.stdout"))
+        try Data("activation stderr ok\n".utf8).write(to: sysRoot.appendingPathComponent("Library/Logs/Garnet/native-activation.stderr"))
+        try Data("translate stderr ok\n".utf8).write(to: sysRoot.appendingPathComponent("Library/Logs/GarnetTranslate/translate.stderr"))
+        try Data("cat: profile: No such file or directory\n".utf8).write(to: sysRoot.appendingPathComponent("Library/Logs/RDNA4/native-activation.stderr"))
+        let diagSecretTarget = tempRoot.appendingPathComponent("diag-secret.txt")
+        try Data("DO_NOT_LEAK_SYMLINK\n".utf8).write(to: diagSecretTarget)
+        try fm.createSymbolicLink(at: sysRoot.appendingPathComponent("Library/Logs/RDNA4Translate/translate.stderr"), withDestinationURL: diagSecretTarget)
+
         let diagOut = tempRoot.appendingPathComponent("diag.tar.gz")
-        _ = try DiagnosticsManager.exportSanitizedDiagnostics(toArchive: diagOut, env: env, payloadURL: fix.payloadDir)
+        _ = try DiagnosticsManager.exportSanitizedDiagnostics(
+            toArchive: diagOut,
+            env: env,
+            payloadURL: fix.payloadDir,
+            appActionLog: "UI action log /Users/\(NSUserName())/test\n"
+        )
         check("Diagnostics archive created", fm.fileExists(atPath: diagOut.path))
-        let scrubbed = DiagnosticsManager.sanitizeText("IOPlatformSerialNumber = \"C02FAKE12345\"\npath=/Users/\(NSUserName())/foo\n")
-        check("Sanitizer strips serial & username", !scrubbed.contains("C02FAKE12345") && scrubbed.contains("REDACTED HARDWARE IDENTIFIER") && !scrubbed.contains("/Users/\(NSUserName())/"))
+        let diagExtract = tempRoot.appendingPathComponent("diag-extract")
+        try fm.createDirectory(at: diagExtract, withIntermediateDirectories: true)
+        let untarDiag = ProcessCommandRunner().run("/usr/bin/tar", ["-xzf", diagOut.path, "-C", diagExtract.path])
+        let expectedDiagFiles = [
+            "capture-summary.txt", "system-info.txt", "activation-state.txt",
+            "native-activation.stdout", "native-activation.stderr", "translate.stderr",
+            "legacy-native-activation.stderr", "launchctl-com.garnet.native.txt",
+            "ioreg-accel-display.txt", "displays.txt", "processes.txt",
+            "unified-logs-30m.txt", "app-action-log.txt"
+        ]
+        let allDiagFilesPresent = expectedDiagFiles.allSatisfy { fm.fileExists(atPath: diagExtract.appendingPathComponent($0).path) }
+        let noSymlinkLog = !fm.fileExists(atPath: diagExtract.appendingPathComponent("legacy-translate.stderr").path)
+        let actionLogText = (try? String(contentsOf: diagExtract.appendingPathComponent("app-action-log.txt"), encoding: .utf8)) ?? ""
+        let displaysText = (try? String(contentsOf: diagExtract.appendingPathComponent("displays.txt"), encoding: .utf8)) ?? ""
+        let psText = (try? String(contentsOf: diagExtract.appendingPathComponent("processes.txt"), encoding: .utf8)) ?? ""
+        check("Diagnostics bundle captures expanded logs and skips symlinked logs",
+              untarDiag.exitCode == 0 && allDiagFilesPresent && noSymlinkLog
+              && !actionLogText.contains("/Users/\(NSUserName())/")
+              && !displaysText.contains("11111111-2222-3333-4444-555555555555")
+              && psText.contains("WindowServer") && !psText.contains("unrelated"))
+
+        let rootDiagOut = tempRoot.appendingPathComponent("diag-root.tar.gz")
+        _ = try DiagnosticsManager.exportSanitizedDiagnostics(toArchive: rootDiagOut, env: rootEnv, payloadURL: fix.payloadDir)
+        let rootDiagExtract = tempRoot.appendingPathComponent("diag-root-extract")
+        try fm.createDirectory(at: rootDiagExtract, withIntermediateDirectories: true)
+        _ = ProcessCommandRunner().run("/usr/bin/tar", ["-xzf", rootDiagOut.path, "-C", rootDiagExtract.path])
+        check("Root diagnostics bundle captures garnettest outputs",
+              fm.fileExists(atPath: rootDiagExtract.appendingPathComponent("garnettest-info.txt").path)
+              && fm.fileExists(atPath: rootDiagExtract.appendingPathComponent("garnettest-log.txt").path)
+              && fm.fileExists(atPath: rootDiagExtract.appendingPathComponent("garnettest-pipestat.txt").path))
+
+        let defaultDiagName = DiagnosticsManager.defaultDiagnosticsArchiveURL(in: tempRoot).lastPathComponent
+        check("Default diagnostics filename matches garnet-diagnostics-*.tar.gz",
+              defaultDiagName.hasPrefix("garnet-diagnostics-") && defaultDiagName.hasSuffix(".tar.gz"))
+
+        let scrubbed = DiagnosticsManager.sanitizeText("IOPlatformSerialNumber = \"C02FAKE12345\"\nHardware UUID: 11111111-2222-3333-4444-555555555555\nSerial Number (system): C02FAKE999\npath=/Users/\(NSUserName())/foo\n")
+        check("Sanitizer strips serial, hardware UUID & username",
+              !scrubbed.contains("C02FAKE12345") && !scrubbed.contains("C02FAKE999")
+              && !scrubbed.contains("11111111-2222-3333-4444-555555555555")
+              && scrubbed.contains("REDACTED HARDWARE IDENTIFIER")
+              && !scrubbed.contains("/Users/\(NSUserName())/"))
 
         // Re-seed icon caches + a symlinked icon cache target before uninstall to verify cleanup & symlink safety
         try fm.createDirectory(at: iconStoreURL, withIntermediateDirectories: true)

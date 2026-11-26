@@ -417,11 +417,14 @@ struct GarnetCLI {
 
     private static func cmdExportDiag(_ args: [String]) throws -> Int32 {
         let parsed = try parse(args, valueFlags: ["--out", "--payload", "--sysroot"], boolFlags: ["--json"])
-        guard let outPath = parsed.options["--out"] ?? parsed.positional.first else {
-            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "export-diag requires --out <archive.tar.gz>"])
-        }
+        let outPath = parsed.options["--out"] ?? parsed.positional.first ?? DiagnosticsManager.defaultDiagnosticsArchiveURL().path
         let env = buildEnv(sysRoot: parsed.options["--sysroot"])
-        let payloadURL = parsed.options["--payload"].map { URL(fileURLWithPath: $0) }
+        let payloadURL: URL?
+        if let explicitPayload = parsed.options["--payload"], !explicitPayload.isEmpty {
+            payloadURL = URL(fileURLWithPath: explicitPayload)
+        } else {
+            payloadURL = try? resolvePayloadURL(explicit: nil)
+        }
         let archiveURL = try DiagnosticsManager.exportSanitizedDiagnostics(
             toArchive: URL(fileURLWithPath: outPath),
             env: env,
@@ -446,7 +449,7 @@ struct GarnetCLI {
           status [--json]
           denylist <list|add-app|add-bundle|add-proc|remove-bundle|remove-proc|clear|sync> [...]
           export-pcibarcompat [--payload <dir>] --out <dest-dir> [--json]
-          export-diag --out <archive.tar.gz> [--payload <dir>] [--json]
+          export-diag [--out <archive.tar.gz>] [--payload <dir>] [--json]
         """)
     }
 }

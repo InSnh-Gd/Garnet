@@ -197,6 +197,10 @@ final class GarnetAppModel: ObservableObject {
     @Published var removeDenylistOnUninstall: Bool = false
     @Published var isBusy: Bool = false
     @Published var actionLog: String = ""
+    @Published var isExportingDiag: Bool = false
+    @Published var diagExportMessage: String = ""
+    @Published var diagExportFailed: Bool = false
+    @Published var lastExportedDiagURL: URL?
 
     @Published var selectedOCMode: OpenCoreMode = .full
     @Published var ocReport: OpenCoreReport?
@@ -346,6 +350,53 @@ final class GarnetAppModel: ObservableObject {
             actionLog = prefix + text
         } else {
             actionLog += "\n" + prefix + text
+        }
+    }
+
+    func exportDiagnosticsOneClick() {
+        exportDiagnostics(to: DiagnosticsManager.defaultDiagnosticsArchiveURL(), revealInFinder: true)
+    }
+
+    func exportDiagnostics(to outURL: URL, revealInFinder: Bool = true) {
+        guard !isExportingDiag else { return }
+        isExportingDiag = true
+        diagExportFailed = false
+        diagExportMessage = "Collecting diagnostics..."
+        let currentEnv = env
+        let pURL = payloadURL
+        let logSnapshot = actionLog
+
+        Task { [weak self] in
+            let outcome: Result<URL, Error> = await Task.detached {
+                do {
+                    let saved = try DiagnosticsManager.exportSanitizedDiagnostics(
+                        toArchive: outURL,
+                        env: currentEnv,
+                        payloadURL: pURL,
+                        appActionLog: logSnapshot
+                    )
+                    return .success(saved)
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
+            guard let self else { return }
+            self.isExportingDiag = false
+            switch outcome {
+            case .success(let saved):
+                self.lastExportedDiagURL = saved
+                self.diagExportFailed = false
+                self.diagExportMessage = "Saved to \(saved.path)"
+                self.appendLog("Exported diagnostics bundle to \(saved.path)")
+                if revealInFinder {
+                    NSWorkspace.shared.activateFileViewerSelecting([saved])
+                }
+            case .failure(let error):
+                self.diagExportFailed = true
+                self.diagExportMessage = "Export failed: \(error)"
+                self.appendLog("Diagnostics export failed: \(error)")
+            }
         }
     }
 
