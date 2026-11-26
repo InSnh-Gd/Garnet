@@ -2995,3 +2995,174 @@ done:
     assert!(asm_s1.contains("OpRayQueryGenerateIntersectionKHR"), "{asm_s1}");
     assert_spirv_val("s1_geom_off", &spv_s1);
 }
+
+#[test]
+fn wave5_pathtracer_nested_loop_exit_avoids_flat_relooper_switch() {
+    // Regression test for Wave 5.2 multi-bounce path tracer (`k_pathtrace`):
+    // Nested sample + bounce loops with multiple early breaks/continues, hardware ray query +
+    // IFT callback + primitiveData lookup, and an LCSSA value defined inside the outer loop
+    // consumed at the post-loop exit trampoline. `reloop_nest` must selectively repair the
+    // staging-broken value and emit genuinely nested loops rather than falling back to a flat
+    // whole-function `OpSwitch` state machine.
+    let caps_prim = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    let pt_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Params = type { i32, i32 }
+
+define void @k_pt_nested(ptr addrspace(2) nocapture readonly %params, ptr addrspace(1) %tlas.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly %out, <2 x i32> %gid) local_unnamed_addr {
+entry:
+  %spp_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 0
+  %spp = load i32, ptr addrspace(2) %spp_ptr, align 4
+  %skip = icmp eq i32 %spp, 0
+  br i1 %skip, label %for.cond.cleanup, label %for.body
+
+for.body:
+  %s = phi i32 [ 0, %entry ], [ %s_next, %cleanup_sample ]
+  %total = phi float [ 0.000000e+00, %entry ], [ %total_next, %cleanup_sample ]
+  br label %bounce.hdr
+
+bounce.hdr:
+  %b = phi i32 [ 0, %for.body ], [ %b_next, %bounce.inc ]
+  %rad = phi float [ 0.000000e+00, %for.body ], [ %rad_next, %bounce.inc ]
+  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %tlas.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %ht = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 0
+  %pd = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %hit, 4
+  %miss = icmp eq i32 %ht, 0
+  br i1 %miss, label %on_miss, label %on_hit
+
+on_miss:
+  %rad_sky = fadd float %rad, 1.000000e-01
+  br label %cleanup_sample
+
+on_hit:
+  %has_pd = icmp ne ptr addrspace(1) %pd, null
+  br i1 %has_pd, label %load_pd, label %after_pd
+
+load_pd:
+  %pv = load float, ptr addrspace(1) %pd, align 4
+  br label %after_pd
+
+after_pd:
+  %alb = phi float [ %pv, %load_pd ], [ 5.000000e-01, %on_hit ]
+  %rad_hit = fadd float %rad, %alb
+  %is_emissive = icmp eq i32 %ht, 2
+  br i1 %is_emissive, label %cleanup_sample, label %check_mirror
+
+check_mirror:
+  %is_mirror = icmp eq i32 %b, 1
+  br i1 %is_mirror, label %bounce.inc, label %diffuse_path
+
+diffuse_path:
+  %rad_diff = fmul float %rad_hit, 9.000000e-01
+  br label %bounce.inc
+
+bounce.inc:
+  %rad_next = phi float [ %rad_hit, %check_mirror ], [ %rad_diff, %diffuse_path ]
+  %b_next = add i32 %b, 1
+  %more_b = icmp ult i32 %b_next, 4
+  br i1 %more_b, label %bounce.hdr, label %cleanup_sample
+
+cleanup_sample:
+  %rad_final = phi float [ %rad_sky, %on_miss ], [ %rad_hit, %after_pd ], [ %rad_next, %bounce.inc ]
+  %total_next = fadd float %total, %rad_final
+  %s_next = add i32 %s, 1
+  %done_s = icmp eq i32 %s_next, %spp
+  br i1 %done_s, label %exit_tramp, label %for.body
+
+exit_tramp:
+  br label %for.cond.cleanup
+
+for.cond.cleanup:
+  %lcssa_total = phi float [ 0.000000e+00, %entry ], [ %total_next, %exit_tramp ]
+  store float %lcssa_total, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_pt_nested, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Params"}
+!4 = !{i32 1, !"air.instance_acceleration_structure", !"air.location_index", i32 1, i32 1, !"air.read"}
+!5 = !{i32 2, !"air.intersection_function_table", !"air.location_index", i32 2, i32 1, !"air.read"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2"}
+"#;
+
+    let cb_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+define <{ i1, float }> @pt_aabb_cb(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax) local_unnamed_addr {
+entry:
+  %mid = fmul float %tmax, 5.000000e-01
+  %ok = fcmp oge float %mid, %tmin
+  %r0 = insertvalue <{ i1, float }> undef, i1 %ok, 0
+  %r1 = insertvalue <{ i1, float }> %r0, float %mid, 1
+  ret <{ i1, float }> %r1
+}
+
+!air.intersection = !{!14}
+!14 = !{ptr @pt_aabb_cb, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float"}
+!18 = !{!19, !20, !21, !22}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+"#;
+
+    let (spv, meta_bytes) = garnetxlate::translate_bytes_stage3(
+        pt_ll.as_bytes(),
+        [8, 8, 1],
+        &[],
+        &[],
+        &[],
+        &[(
+            "pt_aabb_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_prim),
+    )
+    .expect("wave5 nested path tracer failed");
+    let meta: Value = serde_json::from_slice(&meta_bytes).unwrap();
+    assert_has_rt_prim_data_binding(&meta, "pt_nested");
+    let asm = spv_asm(&spv);
+    assert!(asm.contains("OpRayQueryProceedKHR"), "{asm}");
+    let loop_count = asm.matches("OpLoopMerge").count();
+    assert!(
+        loop_count >= 3,
+        "expected genuinely nested loops (outer + bounce + ray query), got {loop_count}:\n{asm}"
+    );
+    let max_switch_cases = asm
+        .lines()
+        .filter(|line| line.contains("OpSwitch"))
+        .map(|line| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            toks.len().saturating_sub(3) / 2
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_switch_cases <= 8,
+        "must not fall back to flat state-machine OpSwitch (got {max_switch_cases} cases)"
+    );
+    assert_spirv_val("wave5_pt_nested", &spv);
+}

@@ -1,0 +1,424 @@
+diff --git a/src/native/reloop_nest/emit.rs b/src/native/reloop_nest/emit.rs
+index 7c0167d..c22a8e4 100644
+--- a/src/native/reloop_nest/emit.rs
++++ b/src/native/reloop_nest/emit.rs
+@@ -32,11 +32,15 @@
+ //! Anything this emitter cannot express is returned as `Err`, and the caller keeps the function on
+ //! the state-machine constructor. It never emits a guess.
+ 
+-use super::super::relooper::{block_label, decode_term, Term, TypeCtx};
++use super::super::relooper::{
++    block_label, build_spill, decode_term, is_spillable_value_type, load_spill,
++    scalarized_spill_leaf_count, store_spill, Term, TypeCtx,
++    MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION,
++};
+ use super::shape::{Graph, Shape};
+ use crate::spirv_module::{Block, Function, Instruction, Operand};
+ use spirv::{LoopControl, Op, SelectionControl, StorageClass, Word};
+-use std::collections::{BTreeSet, HashMap, HashSet};
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ 
+ /// What a branch to some original block becomes in the emitted nesting.
+ struct Action {
+@@ -123,6 +127,9 @@ pub(super) struct Emitter<'a, 'b> {
+     /// dispatch header's merge has to be dominated by that header, so it cannot be a label the
+     /// enclosing construct also branches straight at.
+     forced_dispatch: HashSet<usize>,
++    /// Emitted edge-helper label -> original source block whose outgoing edge it runs on. Used to
++    /// distinguish dominance lost strictly to merge-dispatch staging from input dominance errors.
++    origin_block: HashMap<Word, Word>,
+     variables: Vec<Instruction>,
+     out: Vec<Block>,
+ }
+@@ -159,6 +166,7 @@ pub(super) fn structure_function(
+         merge_flow: HashSet::new(),
+         fused: HashSet::new(),
+         forced_dispatch: HashSet::new(),
++        origin_block: HashMap::new(),
+         variables: Vec::new(),
+         out: Vec::new(),
+     };
+@@ -170,6 +178,7 @@ pub(super) fn structure_function(
+ 
+     let entry_label = emitter.head_of(shape)?;
+     emitter.emit(shape, &mut Vec::new())?;
++    emitter.repair_non_dominating_values(entry_label, graph);
+     emitter.promote_phi_slots();
+ 
+     // OpVariable is only legal in a function's first block, and the root shape may be a loop
+@@ -990,6 +999,7 @@ impl Emitter<'_, '_> {
+             vec![Operand::IdRef(action.label)],
+         ));
+         self.out.push(block);
++        self.origin_block.insert(helper, from);
+         Ok(helper)
+     }
+ 
+@@ -1217,6 +1227,171 @@ impl Emitter<'_, '_> {
+         join
+     }
+ 
++    /// Selectively demote SSA values whose dominance was broken strictly by merge-dispatch staging.
++    ///
++    /// Nesting keeps ordinary values in SSA registers, which stays valid wherever the shape tree
++    /// preserved the original dominator relationship. When an edge leaves a construct through a
++    /// merge dispatch, a block beyond the dispatch is entered from that dispatch rather than from
++    /// the original predecessor, so a value defined inside the construct can stop dominating a use
++    /// beyond it even though the original CFG proved every dynamic path to the use executed the
++    /// definition. Demoting ONLY those staging-broken spillable values to function-scope slots
++    /// preserves the nested loop/selection structure without falling back to the flat state-machine
++    /// switch. Values that did not dominate their uses in the input graph (or have non-spillable
++    /// pointer/opaque types) are left untouched so the post-emit contract check declines safely.
++    fn repair_non_dominating_values(&mut self, entry_label: Word, graph: &Graph) {
++        let mut labels = Vec::with_capacity(self.out.len());
++        let mut label_to_pos = HashMap::with_capacity(self.out.len());
++        for (pos, block) in self.out.iter().enumerate() {
++            let Some(label) = block_label(block) else {
++                return;
++            };
++            labels.push(label);
++            label_to_pos.insert(label, pos);
++        }
++        let Some(&entry_pos) = label_to_pos.get(&entry_label) else {
++            return;
++        };
++        let swap = |pos: usize| match pos {
++            0 => entry_pos,
++            p if p == entry_pos => 0,
++            p => p,
++        };
++        let mut successors = vec![Vec::new(); self.out.len()];
++        for (pos, block) in self.out.iter().enumerate() {
++            let Some(term) = block.instructions.last().and_then(decode_term) else {
++                continue;
++            };
++            let targets = match term {
++                Term::Branch(target) => vec![target],
++                Term::BranchCond(_, on_true, on_false) => vec![on_true, on_false],
++                Term::Switch(_, default, cases) => {
++                    let mut targets = vec![default];
++                    targets.extend(cases.into_iter().map(|(_, label)| label));
++                    targets
++                }
++                Term::Return | Term::ReturnValue(_) | Term::Unreachable | Term::Kill(_) => vec![],
++            };
++            let dom_pos = swap(pos);
++            let out_succ = &mut successors[dom_pos];
++            for target in targets {
++                if let Some(&target_pos) = label_to_pos.get(&target) {
++                    let target_dom = swap(target_pos);
++                    if !out_succ.contains(&target_dom) {
++                        out_succ.push(target_dom);
++                    }
++                }
++            }
++        }
++        let predecessors = crate::dominators::build_predecessors(&successors);
++        let (flow_reachable, flow_dominance, _) =
++            crate::dominators::dominance(&successors, &predecessors);
++
++        let mut def_info: HashMap<Word, (usize, Word)> = HashMap::new();
++        for (pos, block) in self.out.iter().enumerate() {
++            for instruction in &block.instructions {
++                if let (Some(rid), Some(ty)) = (instruction.result_id, instruction.result_type) {
++                    def_info.insert(rid, (pos, ty));
++                }
++            }
++        }
++
++        let mut orig_dom: Option<super::shape::Dominators> = None;
++        let mut non_dom_uses: BTreeMap<Word, BTreeSet<usize>> = BTreeMap::new();
++        for (use_pos, block) in self.out.iter().enumerate() {
++            let use_dom = swap(use_pos);
++            if !flow_reachable[use_dom] {
++                continue;
++            }
++            let use_label = labels[use_pos];
++            let orig_use = self.origin_block.get(&use_label).copied().unwrap_or(use_label);
++            for instruction in &block.instructions {
++                for operand in &instruction.operands {
++                    let Operand::IdRef(val) = operand else {
++                        continue;
++                    };
++                    let Some(&(def_pos, _)) = def_info.get(val) else {
++                        continue;
++                    };
++                    if def_pos == use_pos {
++                        continue;
++                    }
++                    let def_dom = swap(def_pos);
++                    if !flow_reachable[def_dom]
++                        || crate::dominators::dominates_interval(&flow_dominance, def_dom, use_dom)
++                    {
++                        continue;
++                    }
++                    let dom = orig_dom.get_or_insert_with(|| graph.dominators());
++                    let def_label = labels[def_pos];
++                    let orig_def = self.origin_block.get(&def_label).copied().unwrap_or(def_label);
++                    if !dom.dominates(orig_def, orig_use) {
++                        continue;
++                    }
++                    non_dom_uses.entry(*val).or_default().insert(use_pos);
++                }
++            }
++        }
++
++        if non_dom_uses.is_empty() {
++            return;
++        }
++
++        // Verify every candidate is spillable within the scalarized leaf budget before mutating.
++        let mut scalarized_leaves = 0usize;
++        for &val in non_dom_uses.keys() {
++            let (_, val_ty) = def_info[&val];
++            if !is_spillable_value_type(self.tc, val_ty) {
++                return;
++            }
++            if self.tc.has_explicit_layout_reachable(val_ty) {
++                let Some(leaves) = scalarized_spill_leaf_count(self.tc, val_ty) else {
++                    return;
++                };
++                let Some(total) = scalarized_leaves.checked_add(leaves) else {
++                    return;
++                };
++                if total > MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION {
++                    return;
++                }
++                scalarized_leaves = total;
++            }
++        }
++
++        if crate::env_vars::reloop_why() {
++            eprintln!("NEST-REPAIR-DOM demoted={}", non_dom_uses.len());
++        }
++
++        for (val, use_positions) in non_dom_uses {
++            let (def_pos, val_ty) = def_info[&val];
++            let Some(def_idx) = self.out[def_pos]
++                .instructions
++                .iter()
++                .position(|instruction| instruction.result_id == Some(val))
++            else {
++                continue;
++            };
++            let spill = build_spill(self.tc, val_ty, &mut self.variables);
++            let mut store_insts = Vec::new();
++            store_spill(self.tc, &spill, val, &mut store_insts);
++            self.out[def_pos]
++                .instructions
++                .splice(def_idx + 1..def_idx + 1, store_insts);
++
++            for use_pos in use_positions {
++                let mut load_insts = Vec::new();
++                let reload = load_spill(self.tc, &spill, &mut load_insts);
++                for instruction in &mut self.out[use_pos].instructions {
++                    for operand in &mut instruction.operands {
++                        if *operand == Operand::IdRef(val) {
++                            *operand = Operand::IdRef(reload);
++                        }
++                    }
++                }
++                self.out[use_pos].instructions.splice(0..0, load_insts);
++            }
++        }
++    }
++
+     fn promote_phi_slots(&mut self) {
+         let mut predecessors: HashMap<Word, Vec<Word>> = HashMap::new();
+         for block in &self.out {
+diff --git a/src/native/reloop_nest/mod.rs b/src/native/reloop_nest/mod.rs
+index 44545f2..761cd03 100644
+--- a/src/native/reloop_nest/mod.rs
++++ b/src/native/reloop_nest/mod.rs
+@@ -571,4 +571,65 @@ mod tests {
+             .collect::<HashSet<_>>();
+         assert!(structure_selected_functions(&mut module, &selected).is_empty());
+     }
++
++    /// A loop-exit value computed inside a loop body whose definition dominates the post-loop
++    /// trampoline in the input CFG, but loses dominance in the nested CFG once a multi-exit
++    /// loop stages exits through a merge dispatch. Selective demotion of ONLY that staging-broken
++    /// value must keep the function in genuinely nested loop form and pass `spirv-val` instead of
++    /// falling back to the flat state-machine switch.
++    const STAGED_LOOP_EXIT_VALUE: &str = r#"
++               OpCapability Shader
++               OpMemoryModel Logical GLSL450
++               OpEntryPoint GLCompute %main "main"
++               OpExecutionMode %main LocalSize 1 1 1
++       %void = OpTypeVoid
++       %uint = OpTypeInt 32 0
++       %bool = OpTypeBool
++     %uint_0 = OpConstant %uint 0
++     %uint_1 = OpConstant %uint 1
++     %uint_4 = OpConstant %uint 4
++     %uint_7 = OpConstant %uint 7
++     %fnvoid = OpTypeFunction %void
++       %main = OpFunction %void None %fnvoid
++      %entry = OpLabel
++      %skip0 = OpIEqual %bool %uint_0 %uint_1
++               OpBranchConditional %skip0 %after %loop_hdr
++   %loop_hdr = OpLabel
++          %i = OpPhi %uint %uint_0 %entry %next %latch
++        %acc = OpPhi %uint %uint_0 %entry %acc1 %latch
++        %cmp = OpULessThan %bool %i %uint_4
++               OpBranchConditional %cmp %body %exit_a
++       %body = OpLabel
++       %acc1 = OpIAdd %uint %acc %i
++       %brk  = OpIEqual %bool %i %uint_1
++               OpBranchConditional %brk %exit_b %latch
++      %latch = OpLabel
++       %next = OpIAdd %uint %i %uint_1
++               OpBranch %loop_hdr
++     %exit_a = OpLabel
++               OpBranch %after
++     %exit_b = OpLabel
++      %final = OpIAdd %uint %acc1 %uint_7
++               OpBranch %after
++      %after = OpLabel
++        %res = OpPhi %uint %uint_0 %entry %acc %exit_a %final %exit_b
++        %use = OpIAdd %uint %res %uint_1
++               OpReturn
++               OpFunctionEnd
++"#;
++
++    #[test]
++    fn staged_loop_exit_value_is_selectively_repaired_and_validates() {
++        let Some(spv) = assemble(STAGED_LOOP_EXIT_VALUE) else {
++            return;
++        };
++        let nested = nested_bytes(&spv)
++            .expect("staging-broken loop-exit value must be selectively repaired and nested");
++        assert!(validates(&nested));
++        let asm = disassemble(&nested);
++        assert!(asm.contains("OpLoopMerge"), "{asm}");
++        // Only the loop's real structure + tiny merge dispatch — never a whole-function switch.
++        assert_eq!(asm.matches("OpLoopMerge").count(), 1, "{asm}");
++        assert!(asm.matches("OpVariable").count() <= 4, "{asm}");
++    }
+ }
+diff --git a/src/native/reloop_nest/shape.rs b/src/native/reloop_nest/shape.rs
+index a8e8de6..d24da61 100644
+--- a/src/native/reloop_nest/shape.rs
++++ b/src/native/reloop_nest/shape.rs
+@@ -129,7 +129,7 @@ impl Graph {
+     ///
+     /// Dense block indices are what [`crate::native::dominators`] speaks, and the label ordering
+     /// this graph already keeps makes the translation a single pass each way.
+-    fn dominators(&self) -> Dominators {
++    pub(super) fn dominators(&self) -> Dominators {
+         let index = self
+             .successors
+             .keys()
+diff --git a/src/native/relooper.rs b/src/native/relooper.rs
+index 7915458..9a90c55 100644
+--- a/src/native/relooper.rs
++++ b/src/native/relooper.rs
+@@ -282,7 +282,7 @@ impl<'a> TypeCtx<'a> {
+         id
+     }
+ 
+-    fn type_opcode(&self, ty: Word) -> Option<Op> {
++    pub(super) fn type_opcode(&self, ty: Word) -> Option<Op> {
+         self.type_op.get(&ty).copied()
+     }
+ 
+@@ -290,7 +290,7 @@ impl<'a> TypeCtx<'a> {
+         self.value_types.get(&value).copied()
+     }
+ 
+-    fn composite_members(&self, ty: Word) -> Option<Vec<Word>> {
++    pub(super) fn composite_members(&self, ty: Word) -> Option<Vec<Word>> {
+         let def = self.type_defs.get(&ty)?;
+         match def.class.opcode {
+             Op::TypeStruct => Some(
+@@ -316,7 +316,7 @@ impl<'a> TypeCtx<'a> {
+         }
+     }
+ 
+-    fn has_explicit_layout_reachable(&self, ty: Word) -> bool {
++    pub(super) fn has_explicit_layout_reachable(&self, ty: Word) -> bool {
+         let mut pending = vec![ty];
+         let mut seen = HashSet::new();
+         while let Some(current) = pending.pop() {
+@@ -460,14 +460,43 @@ pub(super) enum Term {
+ }
+ 
+ const MAX_SCALARIZED_SPILL_LEAVES: usize = 64;
+-const MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION: usize = 512;
++pub(super) const MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION: usize = 512;
+ 
+-enum Spill {
++pub(super) enum Spill {
+     Direct { var: Word, ty: Word },
+     Composite { ty: Word, members: Vec<Spill> },
+ }
+ 
+-fn scalarized_spill_leaf_count(tc: &TypeCtx<'_>, ty: Word) -> Option<usize> {
++pub(super) fn is_spillable_value_type(tc: &TypeCtx<'_>, ty: Word) -> bool {
++    let mut pending = vec![ty];
++    let mut seen = HashSet::new();
++    while let Some(current) = pending.pop() {
++        if !seen.insert(current) {
++            continue;
++        }
++        match tc.type_opcode(current) {
++            Some(Op::TypePointer)
++            | Some(Op::TypeImage)
++            | Some(Op::TypeSampler)
++            | Some(Op::TypeSampledImage)
++            | Some(Op::TypeAccelerationStructureKHR)
++            | Some(Op::TypeRayQueryKHR)
++            | Some(Op::TypeRuntimeArray)
++            | Some(Op::TypeVoid)
++            | None => return false,
++            Some(Op::TypeStruct) | Some(Op::TypeArray) => {
++                let Some(members) = tc.composite_members(current) else {
++                    return false;
++                };
++                pending.extend(members);
++            }
++            _ => {}
++        }
++    }
++    true
++}
++
++pub(super) fn scalarized_spill_leaf_count(tc: &TypeCtx<'_>, ty: Word) -> Option<usize> {
+     if !tc.has_explicit_layout_reachable(ty) {
+         return Some(1);
+     }
+@@ -482,7 +511,11 @@ fn scalarized_spill_leaf_count(tc: &TypeCtx<'_>, ty: Word) -> Option<usize> {
+     Some(leaves)
+ }
+ 
+-fn build_spill(tc: &mut TypeCtx<'_>, ty: Word, variables: &mut Vec<Instruction>) -> Spill {
++pub(super) fn build_spill(
++    tc: &mut TypeCtx<'_>,
++    ty: Word,
++    variables: &mut Vec<Instruction>,
++) -> Spill {
+     if tc.has_explicit_layout_reachable(ty) {
+         if let Some(member_types) = tc.composite_members(ty) {
+             return Spill::Composite {
+@@ -505,7 +538,7 @@ fn build_spill(tc: &mut TypeCtx<'_>, ty: Word, variables: &mut Vec<Instruction>)
+     Spill::Direct { var, ty }
+ }
+ 
+-fn store_spill(
++pub(super) fn store_spill(
+     tc: &mut TypeCtx<'_>,
+     spill: &Spill,
+     value: Word,
+@@ -536,7 +569,11 @@ fn store_spill(
+     }
+ }
+ 
+-fn load_spill(tc: &mut TypeCtx<'_>, spill: &Spill, instructions: &mut Vec<Instruction>) -> Word {
++pub(super) fn load_spill(
++    tc: &mut TypeCtx<'_>,
++    spill: &Spill,
++    instructions: &mut Vec<Instruction>,
++) -> Word {
+     match spill {
+         Spill::Direct { var, ty } => {
+             let loaded = tc.fresh();
