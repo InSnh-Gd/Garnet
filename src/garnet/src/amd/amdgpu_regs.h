@@ -61,6 +61,7 @@ struct DeviceContext {
     // --- state flags kept for API compatibility with the reference ---
     bool psoCAlive { false };   // (sic) SOS alive
     bool smuOnline { false };
+    uint32_t smuDriverIfVersion { 0 };
     bool gmcReady  { false };
     DoorbellState doorbell {};   // BAR2 doorbell map (amdgpu_ip.h), filled by the doorbell module
 

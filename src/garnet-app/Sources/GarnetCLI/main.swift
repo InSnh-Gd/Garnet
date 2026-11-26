@@ -297,6 +297,15 @@ struct GarnetCLI {
             print("BAR0 Size: \(rep.bar0CurrentMB.map { "\($0) MB" } ?? "unknown") | Display: \(rep.displayPrimaryStatus ?? "unknown")")
             print("GarnetPCIBarCompat: mode=\(rep.iopciCompatMatchMode ?? "none"), IOPCIFamilyUUID=\(rep.iopciCompatUUID ?? "unknown")")
             print("SIP Ready For AuxKC: \(rep.sipReadyForAuxKC) | Vulkan ICD: \(rep.vulkanInstalled ? "installed" : "not installed") | Denylist Entries: \(rep.denylistCount)")
+            let smuTag: String = {
+                switch rep.smuTelemetryState {
+                case .verified: return "verified"
+                case .unverified: return "UNVERIFIED"
+                case .unavailable: return "unavailable"
+                }
+            }()
+            let smuRange = rep.smuMetricsPlausible.map { $0 ? ", rangeCheck=passed" : ", rangeCheck=FAILED" } ?? ""
+            print("SMU Telemetry: \(smuTag) (if=\(rep.smuDriverIfVersion ?? "unknown")\(smuRange))")
             if let vram = rep.vramStatSummary {
                 print("VRAM Summary: \(vram)")
             }

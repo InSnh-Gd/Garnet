@@ -516,7 +516,8 @@ struct GarnetCoreTestsRunner {
             "model" = "AMD Radeon RX 9060 XT"
             "assigned-addresses" = <00000000 00000000 00000000 00000004 00000000>
         """
-        var garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
+        var garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 51\n\"SMU,MetricsLayoutVerified\" = Yes"
+        var garnetTestMetricsStdout = "clocks  gfx 3200 MHz  soc 1200 MHz  mem 1250 MHz  fclk 1800 MHz\n"
         var pciCompatIoreg = "\"GarnetPCIBarCompat,MatchMode\" = \"exact-uuid\"\n\"GarnetPCIBarCompat,IOPCIFamilyUUID\" = \"227771C6-ADC2-30C7-8408-263F723CF81C\""
         var kmutilLoaded = "org.garnet.driver\norg.garnet.accel\norg.garnet.pcibarcompat"
         var foreignAuxKexts: [(bundleID: String, bundlePath: String)] = []
@@ -551,6 +552,7 @@ struct GarnetCoreTestsRunner {
             if executable.hasSuffix("garnettest") {
                 if failGarnetTest { return CommandResult(exitCode: 1, stdout: "", stderr: "mock fail") }
                 if arguments.contains("vramstat") { return CommandResult(exitCode: 0, stdout: "vram=16384MB used=512MB", stderr: "") }
+                if arguments == ["metrics"] { return CommandResult(exitCode: 0, stdout: garnetTestMetricsStdout, stderr: "") }
                 return CommandResult(exitCode: 0, stdout: "ok\n", stderr: "")
             }
             if executable == "/usr/bin/kmutil" {
@@ -1039,11 +1041,32 @@ struct GarnetCoreTestsRunner {
 
         // Status & sanitized diagnostics export
         let st = DiagnosticsManager.collectStatus(env: env)
-        check("Status parses driver/BAR/compat/denylist", st.driverLoaded && st.accelLoaded && st.pciBarCompatLoaded && st.bar0CurrentMB == 16384 && st.iopciCompatMatchMode == "exact-uuid" && st.vulkanInstalled && st.denylistCount >= 2)
+        check("Status parses driver/BAR/compat/denylist/SMU verified", st.driverLoaded && st.accelLoaded && st.pciBarCompatLoaded && st.bar0CurrentMB == 16384 && st.iopciCompatMatchMode == "exact-uuid" && st.vulkanInstalled && st.denylistCount >= 2 && st.smuDriverIfVersion == "0x33" && st.smuTelemetryState == .verified)
+
+        // SMU UNVERIFIED detection via ioreg (non-root Garnet.app path)
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 52\n\"SMU,MetricsLayoutVerified\" = No\n\"SMU,MetricsValuesPlausible\" = No"
+        let stUnver = DiagnosticsManager.collectStatus(env: env)
+        check("Non-root status detects SMU UNVERIFIED and failed range check from ioreg", stUnver.smuDriverIfVersion == "0x34" && stUnver.smuTelemetryState == .unverified && stUnver.smuMetricsPlausible == false)
+
+        // SMU UNVERIFIED detection via garnettest metrics output (root CLI path)
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
+        mock.garnetTestMetricsStdout = """
+        !! firmware driver-interface version 0x35 is newer than the layout this
+        !! build decodes; values are UNVERIFIED (range check: passed)
+        clocks  gfx 1000 MHz  soc 1000 MHz  mem 1250 MHz  fclk 1800 MHz
+        """
+        let rootEnv = HostEnvironment(sysRoot: sysRoot, bootKCPath: "/kcs/BootKernelExtensions.kc", systemKCPath: "/kcs/SystemKernelExtensions.kc", runner: mock, effectiveUID: 0)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/garnettest").path)
+        let stRootUnver = DiagnosticsManager.collectStatus(env: rootEnv)
+        check("Root status detects SMU UNVERIFIED from garnettest metrics", stRootUnver.smuDriverIfVersion == "0x35" && stRootUnver.smuTelemetryState == .unverified && stRootUnver.smuMetricsPlausible == true)
+
+        let parsedFail = DiagnosticsManager.parseSmuMetricsOutput("!! firmware driver-interface version 0x36 is newer than the layout this\n!! build decodes; values are UNVERIFIED (range check: FAILED)\n")
+        check("parseSmuMetricsOutput detects UNVERIFIED with FAILED range check", parsedFail.driverIfVersion == "0x36" && parsedFail.layoutVerified == false && parsedFail.valuesPlausible == false)
+
         mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 8192\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
         let st8g = DiagnosticsManager.collectStatus(env: env)
-        check("Status parses 8 GiB BAR0 CurrentMB", st8g.bar0CurrentMB == 8192)
-        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\""
+        check("Status parses 8 GiB BAR0 CurrentMB and unavailable SMU", st8g.bar0CurrentMB == 8192 && st8g.smuTelemetryState == .unavailable && st8g.smuDriverIfVersion == nil)
+        mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 51\n\"SMU,MetricsLayoutVerified\" = Yes"
         let diagOut = tempRoot.appendingPathComponent("diag.tar.gz")
         _ = try DiagnosticsManager.exportSanitizedDiagnostics(toArchive: diagOut, env: env, payloadURL: fix.payloadDir)
         check("Diagnostics archive created", fm.fileExists(atPath: diagOut.path))

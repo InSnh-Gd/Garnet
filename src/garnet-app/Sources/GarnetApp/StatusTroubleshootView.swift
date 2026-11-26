@@ -53,8 +53,26 @@ struct StatusTroubleshootView: View {
                                 Text("Vulkan ICD:").bold()
                                 Text(st.vulkanInstalled ? "Installed (Optional)" : "Disabled (Default)")
                             }
+                            GridRow {
+                                Text("SMU Telemetry:").bold()
+                                Text(smuTelemetryLabel(st))
+                                    .foregroundColor(smuTelemetryColor(st))
+                                Text("SMU Driver IF:").bold()
+                                Text(st.smuDriverIfVersion ?? "n/a")
+                                    .font(.system(.caption, design: .monospaced))
+                            }
                         }
                         .font(.caption)
+                        if st.smuTelemetryState == .unverified {
+                            Label {
+                                Text(smuUnverifiedWarning(st))
+                                    .font(.caption)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                            }
+                            .foregroundColor(st.smuMetricsPlausible == false ? .red : .orange)
+                            .padding(.top, 4)
+                        }
                     } else {
                         Text("Collecting runtime status...").font(.caption).foregroundColor(.secondary)
                     }
@@ -138,6 +156,31 @@ struct StatusTroubleshootView: View {
                 Button("Cancel", role: .cancel) {}
             }
         }
+    }
+
+    private func smuTelemetryLabel(_ st: RuntimeStatusReport) -> String {
+        switch st.smuTelemetryState {
+        case .verified:
+            return "Verified"
+        case .unverified:
+            return st.smuMetricsPlausible == false ? "UNVERIFIED (Range Check Failed)" : "UNVERIFIED"
+        case .unavailable:
+            return "Unavailable"
+        }
+    }
+
+    private func smuTelemetryColor(_ st: RuntimeStatusReport) -> Color {
+        switch st.smuTelemetryState {
+        case .verified: return .green
+        case .unverified: return st.smuMetricsPlausible == false ? .red : .orange
+        case .unavailable: return .secondary
+        }
+    }
+
+    private func smuUnverifiedWarning(_ st: RuntimeStatusReport) -> String {
+        let ver = st.smuDriverIfVersion ?? "unknown"
+        let rangeNote = st.smuMetricsPlausible == false ? " Range check FAILED." : ""
+        return "SMU PMFW interface \(ver) is outside the verified telemetry layout (0x2e–0x33).\(rangeNote) Reported clocks and sensors may be inaccurate."
     }
 
     private func pickAppToDenylist() {

@@ -484,6 +484,11 @@ IOReturn GarnetUserClient::doMetrics(IOExternalMethodArguments *args) {
 	kern_return_t r = amdgpu::smu_read_metrics(*dev, &res);
 	if (r != kIOReturnSuccess) return r;
 	amdgpu::smu_log_metrics(res);
+	if (res.if_version != 0u) {
+		owner->setProperty("SMU,DriverIfVersion", static_cast<uint64_t>(res.if_version), 32);
+		owner->setProperty("SMU,MetricsLayoutVerified", res.layout_verified);
+		owner->setProperty("SMU,MetricsValuesPlausible", res.values_plausible);
+	}
 	const amdgpu::SmuMetrics &m = res.metrics;
 
 	RDNA4Metrics out {};

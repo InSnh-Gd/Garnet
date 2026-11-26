@@ -9,6 +9,7 @@
 #include "amd/amdgpu_asic.h"
 #include "amd/amdgpu_discovery.h"
 #include "amd/amdgpu_init.h"
+#include "amd/amdgpu_smu.h"
 #include "amd/garnet_power_policy_pure.h"
 #include "amd/native_s1b.h"
 #include "fw/fw_table.h"
@@ -646,7 +647,13 @@ void GarnetDriver::runStages(uint32_t target) {
 	setProperty("Garnet,StageReachedName", amdgpu::stage_name(ctx.reached));
 	setProperty("Garnet,StageResult", static_cast<uint64_t>(r), 32);
 	if (r != kIOReturnSuccess) setProperty("Garnet,StageFailed", amdgpu::stage_name(ctx.failedAt));
-	if (ctx.smuOnline) setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ctx.smuVersion), 32);
+	if (ctx.smuOnline) {
+		setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ctx.smuVersion), 32);
+		if (ctx.dev && ctx.dev->smuDriverIfVersion != 0u) {
+			setProperty("SMU,DriverIfVersion", static_cast<uint64_t>(ctx.dev->smuDriverIfVersion), 32);
+			setProperty("SMU,MetricsLayoutVerified", amdgpu::smu_driver_if_verified(ctx.dev->smuDriverIfVersion));
+		}
+	}
 	if (ctx.mesFailed) setProperty("Garnet,MESFailed", true);
 	if (ctx.reached >= amdgpu::BringupStage::ComputeDispatch || ctx.failedAt == amdgpu::BringupStage::ComputeDispatch) {
 		setProperty("Garnet,ComputeDispatch", ctx.computePassed ? "passed" : "failed");

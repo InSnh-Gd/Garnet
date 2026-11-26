@@ -1,5 +1,17 @@
 import Foundation
 
+public enum SmuTelemetryState: String, Codable, Equatable, Sendable {
+    case verified
+    case unverified
+    case unavailable
+}
+
+public struct SmuMetricsParseResult: Equatable, Sendable {
+    public let driverIfVersion: String?
+    public let layoutVerified: Bool?
+    public let valuesPlausible: Bool?
+}
+
 public struct RuntimeStatusReport: Codable, Equatable, Sendable {
     public let driverLoaded: Bool
     public let accelLoaded: Bool
@@ -15,6 +27,9 @@ public struct RuntimeStatusReport: Codable, Equatable, Sendable {
     public let iopciCompatUUID: String?
     public let vramStatSummary: String?
     public let denylistCount: Int
+    public let smuDriverIfVersion: String?
+    public let smuTelemetryState: SmuTelemetryState
+    public let smuMetricsPlausible: Bool?
 }
 
 public enum DiagnosticsManager {
@@ -30,6 +45,9 @@ public enum DiagnosticsManager {
         var dispStatus: String?
         var matchMode: String?
         var matchUUID: String?
+        var smuIfVer: String?
+        var smuLayoutVerified: Bool?
+        var smuValuesPlausible: Bool?
 
         for rawLine in drvIoreg.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
@@ -41,6 +59,12 @@ public enum DiagnosticsManager {
                 matchMode = s
             } else if line.contains("\"GarnetPCIBarCompat,IOPCIFamilyUUID\""), let s = stringValue(from: line) {
                 matchUUID = s
+            } else if line.contains("\"SMU,DriverIfVersion\""), let v = intValue(from: line), v > 0 {
+                smuIfVer = String(format: "0x%x", v)
+            } else if line.contains("\"SMU,MetricsLayoutVerified\""), let b = boolValue(from: line) {
+                smuLayoutVerified = b
+            } else if line.contains("\"SMU,MetricsValuesPlausible\""), let b = boolValue(from: line) {
+                smuValuesPlausible = b
             }
         }
 
@@ -83,6 +107,22 @@ public enum DiagnosticsManager {
             if vr.exitCode == 0 && !vr.stdout.isEmpty {
                 vramSummary = vr.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             }
+            let mr = env.runner.run(garnettest.path, ["metrics"])
+            if mr.exitCode == 0 && !mr.stdout.isEmpty {
+                let parsed = parseSmuMetricsOutput(mr.stdout)
+                if let v = parsed.driverIfVersion { smuIfVer = v }
+                if let lv = parsed.layoutVerified { smuLayoutVerified = lv }
+                if let vp = parsed.valuesPlausible { smuValuesPlausible = vp }
+            }
+        }
+
+        let smuState: SmuTelemetryState
+        if smuLayoutVerified == false || smuValuesPlausible == false {
+            smuState = .unverified
+        } else if smuLayoutVerified == true {
+            smuState = .verified
+        } else {
+            smuState = .unavailable
         }
 
         let denyCount = (try? DenylistManager.load(env: env).count) ?? 0
@@ -101,8 +141,41 @@ public enum DiagnosticsManager {
             iopciCompatMatchMode: matchMode,
             iopciCompatUUID: matchUUID,
             vramStatSummary: vramSummary,
-            denylistCount: denyCount
+            denylistCount: denyCount,
+            smuDriverIfVersion: smuIfVer,
+            smuTelemetryState: smuState,
+            smuMetricsPlausible: smuValuesPlausible
         )
+    }
+
+    public static func parseSmuMetricsOutput(_ stdout: String) -> SmuMetricsParseResult {
+        var ifVer: String?
+        var verified: Bool?
+        var plausible: Bool?
+
+        for rawLine in stdout.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.contains("UNVERIFIED") {
+                verified = false
+                if line.contains("range check: passed") {
+                    plausible = true
+                } else if line.contains("range check: FAILED") {
+                    plausible = false
+                }
+            }
+            if let r = line.range(of: "version 0x") {
+                let tail = line[r.upperBound...]
+                let hex = String(tail.prefix(while: { $0.isHexDigit }))
+                if !hex.isEmpty {
+                    ifVer = "0x\(hex.lowercased())"
+                }
+            }
+        }
+        if verified == nil && stdout.contains("clocks") {
+            verified = true
+            plausible = true
+        }
+        return SmuMetricsParseResult(driverIfVersion: ifVer, layoutVerified: verified, valuesPlausible: plausible)
     }
 
     public static func sanitizeText(_ raw: String) -> String {
@@ -181,6 +254,15 @@ public enum DiagnosticsManager {
     private static func intValue(from line: String) -> Int? {
         guard let eq = line.range(of: "=") else { return nil }
         return Int(line[eq.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func boolValue(from line: String) -> Bool? {
+        guard let eq = line.range(of: "=") else { return nil }
+        switch line[eq.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "yes", "true", "1": return true
+        case "no", "false", "0": return false
+        default: return nil
+        }
     }
 
     private static func stringValue(from line: String) -> String? {

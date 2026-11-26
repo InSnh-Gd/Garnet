@@ -703,7 +703,8 @@ smu_hw_init(DeviceContext &dev, bool runSmcHwSetup)
     // [ADDED vs the reference stage] also log the SMC interface version
     // here, so a read-only run records it without running smc_hw_setup.
     uint32_t ifver = 0;
-    (void)smu_get_driver_if_version(dev, &ifver);
+    if (smu_get_driver_if_version(dev, &ifver) == kIOReturnSuccess)
+        dev.smuDriverIfVersion = ifver;
 
     dev.smuOnline = true;
     SMU_LOG("hw_init: SMU online (pmfw 0x%08x, if 0x%08x)", ver, ifver);
