@@ -48,9 +48,11 @@ typedef struct RDNA4xBackendCapabilities {
  *                    (Stage::Object -> GLCompute writing payload + indirect SSBOs;
  *                     Stage::Mesh with payload -> MeshEXT reading payload SSBO via DrawIndex)
  *   bit 9 (1u << 9): Vulkan device enables VK_KHR_ray_tracing_position_fetch
+ *   bit 10 (1u << 10): IFT backing buffer ABI v2 (66-word header with attached_bda[31])
  */
 #define GARNETX_CAP_MESH_EMULATED_PAYLOAD (1u << 8)
 #define GARNETX_CAP_RT_POSITION_FETCH     (1u << 9)
+#define GARNETX_CAP_RT_IFT_ABI_V2         (1u << 10)
 
 /* Set 0 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER bindings reserved for
  * GARNETX_CAP_MESH_EMULATED_PAYLOAD stages:

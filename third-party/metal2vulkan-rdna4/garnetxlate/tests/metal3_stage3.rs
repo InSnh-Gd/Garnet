@@ -12,7 +12,7 @@ use garnetxlate::{
     garnetx_translate_linked_libraries, garnetx_translate_stage3,
     garnetx_translate_with_capabilities, RDNA4xBackendCapabilities, RDNA4xDep,
     RDNA4xDynamicLibrary, RDNA4xIntersectionFunction, GARNETX_CAP_MESH_EMULATED_PAYLOAD,
-    GARNETX_CAP_RT_POSITION_FETCH, GARNETX_IFT_KIND_BOUNDING_BOX,
+    GARNETX_CAP_RT_IFT_ABI_V2, GARNETX_CAP_RT_POSITION_FETCH, GARNETX_IFT_KIND_BOUNDING_BOX,
     GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
     GARNETX_MESH_GRID_PARAMS_BINDING, GARNETX_MESH_INDIRECT_BINDING, GARNETX_MESH_PAYLOAD_BINDING,
     GARNETX_STAGE_FRAGMENT, GARNETX_STAGE_KERNEL, GARNETX_STAGE_MESH, GARNETX_STAGE_OBJECT,
@@ -1529,4 +1529,612 @@ declare i1 @air.is_committed_triangle_front_facing_intersection_query.instancing
     };
     let out_bad = call_stage3_with_caps(iq_ll, Some([1, 1, 1]), &[], Some(bad_caps));
     assert_eq!(out_bad.rc, RC_BAD_ARGS, "unknown capability flag must fail with RC_BAD_ARGS");
+}
+
+#[test]
+fn wave2_bindless30_flat_and_nested_apple_air_lower_to_abi10() {
+    let rt_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    // Exact Apple Clang 21 AIR for encoder-less Metal 3 flat bindless struct array:
+    // struct Material { texture2d<float> albedo; sampler smp; float4 tint; };
+    // kernel void k_bindless_flat(device const Material *mats [[buffer(0)]], ...)
+    let flat_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.Material = type { %"struct.metal::texture2d", %"struct.metal::sampler", <4 x float> }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+define void @k_bindless_flat(ptr addrspace(1) nocapture readonly "air-buffer-no-alias" %mats, ptr addrspace(1) nocapture writeonly "air-buffer-no-alias" %out, i32 %tid) local_unnamed_addr {
+entry:
+  %idxprom = zext i32 %tid to i64
+  %agg.tmp.sroa.0.0..sroa_idx = getelementptr inbounds %struct.Material, ptr addrspace(1) %mats, i64 %idxprom, i32 1, i32 0
+  %agg.tmp.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(1) %agg.tmp.sroa.0.0..sroa_idx, align 8
+  %t.i = getelementptr inbounds %struct.Material, ptr addrspace(1) %mats, i64 %idxprom, i32 0, i32 0
+  %0 = load ptr addrspace(1), ptr addrspace(1) %t.i, align 8
+  %1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly %0, ptr addrspace(2) nocapture readonly %agg.tmp.sroa.0.0.copyload, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %2 = extractvalue { <4 x float>, i8 } %1, 0
+  %tint = getelementptr inbounds %struct.Material, ptr addrspace(1) %mats, i64 %idxprom, i32 2
+  %3 = load <4 x float>, ptr addrspace(1) %tint, align 16
+  %mul = fmul fast <4 x float> %2, %3
+  %arrayidx7 = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i64 %idxprom
+  store <4 x float> %mul, ptr addrspace(1) %arrayidx7, align 16
+  ret void
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly, ptr addrspace(2) nocapture readonly, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+!air.kernel = !{!14}
+!14 = !{ptr @k_bindless_flat, !15, !16}
+!15 = !{}
+!16 = !{!17, !22, !23}
+!17 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !18, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Material", !"air.arg_name", !"mats"}
+!18 = !{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"albedo", !"air.indirect_argument", !19, i32 8, i32 8, i32 0, !"sampler", !"smp", !"air.indirect_argument", !20, i32 16, i32 16, i32 0, !"float4", !"tint", !"air.indirect_argument", !21}
+!19 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"albedo"}
+!20 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"smp"}
+!21 = !{i32 2, !"air.indirect_constant", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"tint"}
+!22 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!23 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let out_flat = call_stage3_with_caps(flat_ll, Some([1, 1, 1]), &[], Some(rt_caps));
+    assert_eq!(out_flat.rc, RC_OK, "flat bindless translate failed: {}", out_flat.msg);
+    let (spv_flat, meta_flat) =
+        garnetxlate::lower_gpu_arguments_with_capabilities(&out_flat.spv, &out_flat.meta, rt_caps)
+            .expect("flat bindless lower_gpu_arguments failed");
+    let meta_flat_json: Value = serde_json::from_slice(&meta_flat).unwrap();
+    let cats_flat = meta_flat_json["argument_resource_tables"]["categories"]
+        .as_array()
+        .expect("flat bindless must emit argument_resource_tables.categories");
+    assert!(cats_flat.iter().any(|v| v == 0), "missing texture category 0: {meta_flat_json}");
+    assert!(cats_flat.iter().any(|v| v == 2), "missing sampler category 2: {meta_flat_json}");
+    let asm_flat = spv_asm(&spv_flat);
+    assert!(asm_flat.contains("OpCapability RuntimeDescriptorArray"), "{asm_flat}");
+    assert!(asm_flat.contains("DescriptorSet 2"), "{asm_flat}");
+    assert!(asm_flat.contains("DescriptorSet 4"), "{asm_flat}");
+
+    // Exact Apple Clang 21 AIR for nested bindless scene + RT TLAS + material pointer deref:
+    let nested_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.BindlessScene = type { ptr addrspace(1), %"struct.metal::raytracing::_acceleration_structure", %"struct.metal::texture2d", %"struct.metal::sampler" }
+%"struct.metal::raytracing::_acceleration_structure" = type { ptr addrspace(1) }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+%struct.Material = type { %"struct.metal::texture2d", %"struct.metal::sampler", <4 x float> }
+define void @k_bindless_nested(ptr addrspace(2) nocapture readonly align 8 dereferenceable(32) "air-buffer-no-alias" %scene, ptr addrspace(1) nocapture writeonly "air-buffer-no-alias" %out, i32 %tid) local_unnamed_addr {
+entry:
+  %agg.tmp3.sroa.0.0..sroa_idx = getelementptr inbounds %struct.BindlessScene, ptr addrspace(2) %scene, i64 0, i32 1, i32 0
+  %agg.tmp3.sroa.0.0.copyload = load ptr addrspace(1), ptr addrspace(2) %agg.tmp3.sroa.0.0..sroa_idx, align 8
+  %0 = tail call ptr addrspace(1) @air.get_null_intersection_function_table()
+  %1 = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> <float 5.000000e-01, float 5.000000e-01, float 0.000000e+00>, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %agg.tmp3.sroa.0.0.copyload, i32 255, ptr addrspace(1) readonly %0, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %2 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %1, 0
+  %cmp.not = icmp eq i32 %2, 0
+  br i1 %cmp.not, label %cond.false, label %cond.true
+cond.true:
+  %3 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %1, 5
+  %mats = getelementptr inbounds %struct.BindlessScene, ptr addrspace(2) %scene, i64 0, i32 0
+  %4 = load ptr addrspace(1), ptr addrspace(2) %mats, align 8
+  %idxprom = zext i32 %3 to i64
+  %agg.tmp4.sroa.0.0..sroa_idx = getelementptr inbounds %struct.Material, ptr addrspace(1) %4, i64 %idxprom, i32 1, i32 0
+  %agg.tmp4.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(1) %agg.tmp4.sroa.0.0..sroa_idx, align 8
+  %t.i = getelementptr inbounds %struct.Material, ptr addrspace(1) %4, i64 %idxprom, i32 0, i32 0
+  %5 = load ptr addrspace(1), ptr addrspace(1) %t.i, align 8
+  %6 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly %5, ptr addrspace(2) nocapture readonly %agg.tmp4.sroa.0.0.copyload, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  br label %cond.end
+cond.false:
+  %agg.tmp12.sroa.0.0..sroa_idx = getelementptr inbounds %struct.BindlessScene, ptr addrspace(2) %scene, i64 0, i32 3, i32 0
+  %agg.tmp12.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(2) %agg.tmp12.sroa.0.0..sroa_idx, align 8
+  %t.i56 = getelementptr inbounds %struct.BindlessScene, ptr addrspace(2) %scene, i64 0, i32 2, i32 0
+  %7 = load ptr addrspace(1), ptr addrspace(2) %t.i56, align 8
+  %8 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly %7, ptr addrspace(2) nocapture readonly %agg.tmp12.sroa.0.0.copyload, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  br label %cond.end
+cond.end:
+  %.pn = phi { <4 x float>, i8 } [ %6, %cond.true ], [ %8, %cond.false ]
+  %cond = extractvalue { <4 x float>, i8 } %.pn, 0
+  %idxprom15 = zext i32 %tid to i64
+  %arrayidx16 = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i64 %idxprom15
+  store <4 x float> %cond, ptr addrspace(1) %arrayidx16, align 16
+  ret void
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly, ptr addrspace(2) nocapture readonly, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+declare ptr addrspace(1) @air.get_null_intersection_function_table()
+!air.kernel = !{!14}
+!14 = !{ptr @k_bindless_nested, !15, !16}
+!15 = !{}
+!16 = !{!17, !27, !28}
+!17 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !18, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"BindlessScene", !"air.arg_name", !"scene"}
+!18 = !{i32 0, i32 8, i32 0, !"Material", !"mats", !"air.indirect_argument", !19, i32 8, i32 8, i32 0, !"acceleration_structure<instancing>", !"tlas", !"air.indirect_argument", !24, i32 16, i32 8, i32 0, !"texture2d<float, sample>", !"envMap", !"air.indirect_argument", !25, i32 24, i32 8, i32 0, !"sampler", !"envSmp", !"air.indirect_argument", !26}
+!19 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !20, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Material", !"air.arg_name", !"mats"}
+!20 = !{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"albedo", !"air.indirect_argument", !21, i32 8, i32 8, i32 0, !"sampler", !"smp", !"air.indirect_argument", !22, i32 16, i32 16, i32 0, !"float4", !"tint", !"air.indirect_argument", !23}
+!21 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"albedo"}
+!22 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"smp"}
+!23 = !{i32 2, !"air.indirect_constant", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"tint"}
+!24 = !{i32 1, !"air.instance_acceleration_structure", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>", !"air.arg_name", !"tlas"}
+!25 = !{i32 2, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"envMap"}
+!26 = !{i32 3, !"air.sampler", !"air.location_index", i32 3, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"envSmp"}
+!27 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!28 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let out_nested = call_stage3_with_caps(nested_ll, Some([1, 1, 1]), &[], Some(rt_caps));
+    assert_eq!(out_nested.rc, RC_OK, "nested bindless translate failed: {}", out_nested.msg);
+    let (spv_nested, meta_nested) = garnetxlate::lower_gpu_arguments_with_capabilities(
+        &out_nested.spv,
+        &out_nested.meta,
+        rt_caps,
+    )
+    .expect("nested bindless lower_gpu_arguments failed");
+    let meta_nested_json: Value = serde_json::from_slice(&meta_nested).unwrap();
+    let cats_nested = meta_nested_json["argument_resource_tables"]["categories"]
+        .as_array()
+        .expect("nested bindless must emit argument_resource_tables.categories");
+    assert!(cats_nested.iter().any(|v| v == 0), "missing texture category 0: {meta_nested_json}");
+    assert!(cats_nested.iter().any(|v| v == 2), "missing sampler category 2: {meta_nested_json}");
+    let asm_nested = spv_asm(&spv_nested);
+    assert!(asm_nested.contains("OpConvertUToAccelerationStructureKHR"), "{asm_nested}");
+    assert!(asm_nested.contains("OpRayQueryInitializeKHR"), "{asm_nested}");
+    assert!(asm_nested.contains("DescriptorSet 2"), "{asm_nested}");
+    assert!(asm_nested.contains("DescriptorSet 4"), "{asm_nested}");
+    for (label, bin) in [("flat", &spv_flat), ("nested", &spv_nested)] {
+        if let Ok(mut child) = std::process::Command::new("spirv-val")
+            .args(["--target-env", "vulkan1.3", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(bin).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "spirv-val rejected {label} bindless SPIR-V:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+}
+
+#[test]
+fn wave2_ift_abi_v2_attached_buffers_argbuf_texture_and_nested_vft() {
+    assert_eq!(GARNETX_CAP_RT_IFT_ABI_V2, 1 << 10);
+    let caps_v2 = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+
+    let entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define void @k_ift_entry(ptr addrspace(1) %scene.coerce, ptr addrspace(1) %ift.coerce, ptr addrspace(1) nocapture writeonly "air-buffer-no-alias" %out) local_unnamed_addr {
+entry:
+  %0 = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %scene.coerce, i32 255, ptr addrspace(1) readonly %ift.coerce, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %1 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %0, 1
+  store float %1, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!14}
+!14 = !{ptr @k_ift_entry, !15, !16}
+!15 = !{}
+!16 = !{!17, !18, !19}
+!17 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>", !"air.arg_name", !"scene"}
+!18 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
+!19 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+
+    let cb_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.AlphaArgBuf = type { %"struct.metal::texture2d", %"struct.metal::sampler" }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+%struct.PrimRec = type { <4 x float> }
+define <{ i1, float }> @ift_full_cb(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, i32 %pid, ptr addrspace(1) nocapture readonly "air-buffer-no-alias" %spheres, ptr addrspace(2) nocapture readonly align 8 dereferenceable(16) "air-buffer-no-alias" %alphaMat, ptr addrspace(1) nocapture readonly %vft.coerce, ptr addrspace(1) readonly "air-buffer-no-alias" %pdata) local_unnamed_addr {
+entry:
+  %0 = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly %vft.coerce, i32 0)
+  %1 = bitcast ptr %0 to ptr
+  %idxprom = zext i32 %pid to i64
+  %arrayidx = getelementptr inbounds <4 x float>, ptr addrspace(1) %spheres, i64 %idxprom
+  %2 = load <4 x float>, ptr addrspace(1) %arrayidx, align 16
+  %3 = extractelement <4 x float> %2, i64 3
+  %call1 = tail call fast float %1(float %3)
+  %agg.tmp.sroa.0.0..sroa_idx = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %alphaMat, i64 0, i32 1, i32 0
+  %agg.tmp.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(2) %agg.tmp.sroa.0.0..sroa_idx, align 8
+  %t.i13 = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %alphaMat, i64 0, i32 0, i32 0
+  %4 = load ptr addrspace(1), ptr addrspace(2) %t.i13, align 8
+  %5 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly %4, ptr addrspace(2) nocapture readonly %agg.tmp.sroa.0.0.copyload, <2 x float> <float 5.000000e-01, float 5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %tobool.not = icmp eq ptr addrspace(1) %pdata, null
+  br i1 %tobool.not, label %cond.end, label %cond.true
+cond.true:
+  %info = getelementptr inbounds %struct.PrimRec, ptr addrspace(1) %pdata, i64 0, i32 0
+  %6 = load <4 x float>, ptr addrspace(1) %info, align 16
+  %7 = extractelement <4 x float> %6, i64 0
+  br label %cond.end
+cond.end:
+  %cond = phi fast float [ %7, %cond.true ], [ 0.000000e+00, %entry ]
+  %8 = extractvalue { <4 x float>, i8 } %5, 0
+  %9 = extractelement <4 x float> %8, i64 0
+  %cmp = fcmp fast ogt float %9, 5.000000e-01
+  %add = fadd fast float %call1, %tmin
+  %add4 = fadd fast float %add, %cond
+  %10 = insertvalue <{ i1, float }> undef, i1 %cmp, 0
+  %11 = insertvalue <{ i1, float }> %10, float %add4, 1
+  ret <{ i1, float }> %11
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) nocapture readonly, ptr addrspace(2) nocapture readonly, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly, i32)
+!air.intersection = !{!14}
+!14 = !{ptr @ift_full_cb, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool", !"air.arg_name", !"accept"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float", !"air.arg_name", !"dist"}
+!18 = !{!19, !20, !21, !22, !23, !24, !25, !29, !30}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3", !"air.arg_name", !"orig", !"air.arg_unused"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3", !"air.arg_name", !"dir", !"air.arg_unused"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmin"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmax", !"air.arg_unused"}
+!23 = !{i32 4, !"air.primitive_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"pid"}
+!24 = !{i32 5, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"spheres"}
+!25 = !{i32 6, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !26, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"AlphaArgBuf", !"air.arg_name", !"alphaMat"}
+!26 = !{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"alphaTex", !"air.indirect_argument", !27, i32 8, i32 8, i32 0, !"sampler", !"alphaSmp", !"air.indirect_argument", !28}
+!27 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"alphaTex"}
+!28 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"alphaSmp"}
+!29 = !{i32 7, !"air.visible_function_table", !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"vft"}
+!30 = !{i32 8, !"air.primitive_data", !"air.arg_type_name", !"PrimRec", !"air.arg_name", !"pdata"}
+"#;
+
+    let vis_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define float @eval_radius(float %base) local_unnamed_addr {
+entry:
+  %mul = fmul fast float %base, 5.000000e-01
+  ret float %mul
+}
+!air.visible = !{!14}
+!14 = !{ptr @eval_radius, !15, !17}
+!15 = !{!16}
+!16 = !{!"air.visible_output", !"air.arg_type_name", !"float"}
+!17 = !{!18}
+!18 = !{i32 0, !"air.visible_input", !"air.arg_type_name", !"float", !"air.arg_name", !"base"}
+"#;
+
+    let (spv, meta) = garnetxlate::translate_bytes_stage3(
+        entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[("eval_radius".to_string(), vis_ll.as_bytes().to_vec())],
+        &[(
+            "ift_full_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_v2),
+    )
+    .expect("IFT ABI v2 full callback translate_bytes_stage3 failed");
+    let (spv, meta) =
+        garnetxlate::lower_gpu_arguments_with_capabilities(&spv, &meta, caps_v2)
+            .expect("IFT ABI v2 lower_gpu_arguments failed");
+    let meta_json: Value = serde_json::from_slice(&meta).unwrap();
+    assert_eq!(meta_json["intersection_function_tables"]["abi_version"], 2, "{meta_json}");
+    assert_eq!(meta_json["intersection_function_tables"]["header_words"], 66, "{meta_json}");
+    assert_eq!(meta_json["visible_function_tables"]["handles"][0]["symbol"], "eval_radius", "{meta_json}");
+    let cats = meta_json["argument_resource_tables"]["categories"]
+        .as_array()
+        .expect("IFT callback AlphaArgBuf must trigger argument_resource_tables");
+    assert!(cats.iter().any(|v| v == 0), "missing texture category 0: {meta_json}");
+    assert!(cats.iter().any(|v| v == 2), "missing sampler category 2: {meta_json}");
+    let asm = spv_asm(&spv);
+    assert!(asm.contains("OpRayQueryProceedKHR"), "{asm}");
+    assert!(asm.contains("OpRayQueryGenerateIntersectionKHR"), "{asm}");
+    assert!(asm.contains("DescriptorSet 2"), "{asm}");
+    assert!(asm.contains("DescriptorSet 4"), "{asm}");
+    assert!(asm.contains("Binding 640"), "missing BufferAddressTable binding 640: {asm}");
+
+    // Validate generated SPIR-V with spirv-val when available on PATH.
+    if let Ok(mut child) = std::process::Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(&spv).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "spirv-val rejected IFT ABI v2 SPIR-V:\n{}\n--- ASM ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            asm
+        );
+    }
+
+    // Also verify ABI v1 compatibility when GARNETX_CAP_RT_IFT_ABI_V2 is NOT set.
+    let caps_v1 = RDNA4xBackendCapabilities {
+        flags: GARNETX_CAP_RT_POSITION_FETCH,
+        ..caps_v2
+    };
+    let (_, meta_v1) = garnetxlate::translate_bytes_stage3(
+        entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[("eval_radius".to_string(), vis_ll.as_bytes().to_vec())],
+        &[(
+            "ift_full_cb".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+            cb_ll.as_bytes().to_vec(),
+        )],
+        Some(caps_v1),
+    )
+    .expect("IFT ABI v1 compat failed");
+    let meta_v1_json: Value = serde_json::from_slice(&meta_v1).unwrap();
+    assert_eq!(meta_v1_json["intersection_function_tables"]["abi_version"], 1, "{meta_v1_json}");
+    assert_eq!(meta_v1_json["intersection_function_tables"]["header_words"], 1, "{meta_v1_json}");
+}
+
+#[test]
+fn wave2_bindless_vft_in_struct_and_spirv_val() {
+    let rt_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+    let entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.VftHolder = type { ptr addrspace(1) }
+define void @k_bindless_vft(ptr addrspace(2) nocapture readonly align 8 dereferenceable(8) %holder, ptr addrspace(1) nocapture writeonly %out, i32 %tid) local_unnamed_addr {
+entry:
+  %vptr = getelementptr inbounds %struct.VftHolder, ptr addrspace(2) %holder, i64 0, i32 0
+  %vft = load ptr addrspace(1), ptr addrspace(2) %vptr, align 8
+  %fp = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly %vft, i32 0)
+  %res = tail call fast float %fp(float 4.000000e+00)
+  %idx = zext i32 %tid to i64
+  %dst = getelementptr inbounds float, ptr addrspace(1) %out, i64 %idx
+  store float %res, ptr addrspace(1) %dst, align 4
+  ret void
+}
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) nocapture readonly, i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k_bindless_vft, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"VftHolder", !"air.arg_name", !"holder"}
+!6 = !{i32 0, i32 8, i32 0, !"visible_function_table", !"vft", !"air.indirect_argument", !7}
+!7 = !{i32 0, !"air.visible_function_table", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"vft"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let vis_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define float @eval_radius(float %base) local_unnamed_addr {
+entry:
+  %mul = fmul fast float %base, 5.000000e-01
+  ret float %mul
+}
+!air.visible = !{!14}
+!14 = !{ptr @eval_radius, !15, !17}
+!15 = !{!16}
+!16 = !{!"air.visible_output", !"air.arg_type_name", !"float"}
+!17 = !{!18}
+!18 = !{i32 0, !"air.visible_input", !"air.arg_type_name", !"float", !"air.arg_name", !"base"}
+"#;
+    let (spv, meta) = garnetxlate::translate_bytes_stage3(
+        entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[("eval_radius".to_string(), vis_ll.as_bytes().to_vec())],
+        &[],
+        Some(rt_caps),
+    )
+    .expect("bindless VFT struct translate failed");
+    let meta_json: Value = serde_json::from_slice(&meta).unwrap();
+    assert_eq!(meta_json["visible_function_tables"]["handles"][0]["symbol"], "eval_radius", "{meta_json}");
+    let asm = spv_asm(&spv);
+    assert!(asm.contains("Binding 640"), "missing BDA table: {asm}");
+    if let Ok(mut child) = std::process::Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(&spv).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "spirv-val rejected bindless VFT SPIR-V:\n{}\n--- ASM ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            asm
+        );
+    }
+}
+
+#[test]
+fn wave2_bindless_holder_ift_abi_v2_and_spirv_val() {
+    let rt_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+    let entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.IftBindlessHolder = type { %"struct.metal::raytracing::_acceleration_structure", %"struct.metal::raytracing::intersection_function_table" }
+%"struct.metal::raytracing::_acceleration_structure" = type { ptr addrspace(1) }
+%"struct.metal::raytracing::intersection_function_table" = type { ptr addrspace(1) }
+
+define void @k_ift_via_bindless_holder(ptr addrspace(2) readonly align 8 captures(none) dereferenceable(16) "air-buffer-no-alias" %holder, ptr addrspace(1) readonly captures(none) "air-buffer-no-alias" %rays_orig, ptr addrspace(1) writeonly captures(none) "air-buffer-no-alias" %out_dist, i32 %tid) local_unnamed_addr {
+entry:
+  %idxprom = zext i32 %tid to i64
+  %arrayidx = getelementptr inbounds <4 x float>, ptr addrspace(1) %rays_orig, i64 %idxprom
+  %0 = load <4 x float>, ptr addrspace(1) %arrayidx, align 16
+  %1 = shufflevector <4 x float> %0, <4 x float> poison, <3 x i32> <i32 0, i32 1, i32 2>
+  %agg.tmp1.sroa.0.0..sroa_idx = getelementptr inbounds %struct.IftBindlessHolder, ptr addrspace(2) %holder, i64 0, i32 0, i32 0
+  %agg.tmp1.sroa.0.0.copyload = load ptr addrspace(1), ptr addrspace(2) %agg.tmp1.sroa.0.0..sroa_idx, align 8
+  %agg.tmp2.sroa.0.0..sroa_idx = getelementptr inbounds %struct.IftBindlessHolder, ptr addrspace(2) %holder, i64 0, i32 1, i32 0
+  %agg.tmp2.sroa.0.0.copyload = load ptr addrspace(1), ptr addrspace(2) %agg.tmp2.sroa.0.0..sroa_idx, align 8
+  %2 = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> %1, <3 x float> <float 0.000000e+00, float 0.000000e+00, float -1.000000e+00>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %agg.tmp1.sroa.0.0.copyload, i32 -1, ptr addrspace(1) readonly %agg.tmp2.sroa.0.0.copyload, ptr null, i64 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false)
+  %3 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %2, 0
+  %4 = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } %2, 1
+  %cmp.not = icmp eq i32 %3, 0
+  %cond = select fast i1 %cmp.not, float -1.000000e+00, float %4
+  %arrayidx4 = getelementptr inbounds float, ptr addrspace(1) %out_dist, i64 %idxprom
+  store float %cond, ptr addrspace(1) %arrayidx4, align 4
+  ret void
+}
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+!air.kernel = !{!14}
+!14 = !{ptr @k_ift_via_bindless_holder, !15, !16}
+!15 = !{}
+!16 = !{!17, !21, !22, !23}
+!17 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !18, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"IftBindlessHolder", !"air.arg_name", !"holder"}
+!18 = !{i32 0, i32 8, i32 0, !"acceleration_structure<instancing>", !"scene", !"air.indirect_argument", !19, i32 8, i32 8, i32 0, !"intersection_function_table<instancing, triangle_data>", !"ift", !"air.indirect_argument", !20}
+!19 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing>", !"air.arg_name", !"scene"}
+!20 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"intersection_function_table<instancing, triangle_data>", !"air.arg_name", !"ift"}
+!21 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"rays_orig"}
+!22 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out_dist"}
+!23 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let sphere_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define <{ i1, float }> @sphere_vft_cb(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, i32 %pid, ptr addrspace(1) readonly captures(none) "air-buffer-no-alias" %spheres, ptr addrspace(1) readonly captures(none) %vft.coerce) local_unnamed_addr {
+entry:
+  %idxprom = zext i32 %pid to i64
+  %arrayidx = getelementptr inbounds <4 x float>, ptr addrspace(1) %spheres, i64 %idxprom
+  %0 = load <4 x float>, ptr addrspace(1) %arrayidx, align 16
+  %1 = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) readonly captures(none) %vft.coerce, i32 0)
+  %2 = bitcast ptr %1 to ptr
+  %3 = extractelement <4 x float> %0, i64 3
+  %call1 = tail call fast float %2(float %3)
+  %10 = insertvalue <{ i1, float }> undef, i1 true, 0
+  %11 = insertvalue <{ i1, float }> %10, float %call1, 1
+  ret <{ i1, float }> %11
+}
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) readonly captures(none), i32)
+!air.intersection = !{!14}
+!14 = !{ptr @sphere_vft_cb, !15, !18, !"air.bounding_box", !"air.instancing", !"air.triangle_data"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool", !"air.arg_name", !"accept"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float", !"air.arg_name", !"distance"}
+!18 = !{!19, !20, !21, !22, !23, !24, !25}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3", !"air.arg_name", !"orig"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3", !"air.arg_name", !"dir"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmin"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"tmax"}
+!23 = !{i32 4, !"air.primitive_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"pid"}
+!24 = !{i32 5, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"spheres"}
+!25 = !{i32 6, !"air.visible_function_table", !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"vft"}
+"#;
+    let alpha_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.AlphaArgBuf = type { %"struct.metal::texture2d", %"struct.metal::sampler" }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+define i1 @tri_alpha_bindless_cb(<2 x float> %bary, i32 %pid, ptr addrspace(2) readonly align 8 captures(none) dereferenceable(16) "air-buffer-no-alias" %mat) local_unnamed_addr {
+entry:
+  %agg.tmp.sroa.0.0..sroa_idx = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %mat, i64 0, i32 1, i32 0
+  %agg.tmp.sroa.0.0.copyload = load ptr addrspace(2), ptr addrspace(2) %agg.tmp.sroa.0.0..sroa_idx, align 8
+  %vecinit1 = insertelement <2 x float> %bary, float 5.000000e-01, i64 1
+  %t.i = getelementptr inbounds %struct.AlphaArgBuf, ptr addrspace(2) %mat, i64 0, i32 0, i32 0
+  %0 = load ptr addrspace(1), ptr addrspace(2) %t.i, align 8
+  %1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(2) readonly captures(none) %agg.tmp.sroa.0.0.copyload, <2 x float> %vecinit1, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %2 = extractvalue { <4 x float>, i8 } %1, 0
+  %3 = extractelement <4 x float> %2, i64 3
+  %cmp = fcmp fast ogt float %3, 5.000000e-01
+  ret i1 %cmp
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+!air.intersection = !{!14}
+!14 = !{ptr @tri_alpha_bindless_cb, !15, !17, !"air.triangle", !"air.instancing", !"air.triangle_data"}
+!15 = !{!16}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!18, !19, !20}
+!18 = !{i32 0, !"air.barycentric_coord", !"air.arg_type_name", !"float2", !"air.arg_name", !"bary"}
+!19 = !{i32 1, !"air.primitive_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"pid"}
+!20 = !{i32 2, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !21, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"AlphaBindlessBuf", !"air.arg_name", !"mat"}
+!21 = !{i32 0, i32 8, i32 0, !"texture2d<float, sample>", !"alphaTex", !"air.indirect_argument", !22, i32 8, i32 8, i32 0, !"sampler", !"alphaSmp", !"air.indirect_argument", !23}
+!22 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"alphaTex"}
+!23 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"alphaSmp"}
+"#;
+    let vis_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+define float @scale_radius_half(float %r) local_unnamed_addr {
+entry:
+  %mul = fmul fast float %r, 5.000000e-01
+  ret float %mul
+}
+!air.visible = !{!14}
+!14 = !{ptr @scale_radius_half, !15, !17}
+!15 = !{!16}
+!16 = !{!"air.visible_output", !"air.arg_type_name", !"float"}
+!17 = !{!18}
+!18 = !{i32 0, !"air.visible_input", !"air.arg_type_name", !"float", !"air.arg_name", !"r"}
+"#;
+    let (spv, meta) = garnetxlate::translate_bytes_stage3(
+        entry_ll.as_bytes(),
+        [1, 1, 1],
+        &[],
+        &[],
+        &[("scale_radius_half".to_string(), vis_ll.as_bytes().to_vec())],
+        &[
+            (
+                "sphere_vft_cb".to_string(),
+                metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+                sphere_ll.as_bytes().to_vec(),
+            ),
+            (
+                "tri_alpha_bindless_cb".to_string(),
+                metal2vulkan::linked_functions::IntersectionFunctionKind::TriangleAnyHit,
+                alpha_ll.as_bytes().to_vec(),
+            ),
+        ],
+        Some(rt_caps),
+    )
+    .expect("bindless holder IFT ABI v2 translate failed");
+    let meta_json: Value = serde_json::from_slice(&meta).unwrap();
+    assert_eq!(meta_json["intersection_function_tables"]["abi_version"], 2, "{meta_json}");
+    let asm = spv_asm(&spv);
+    assert!(asm.contains("Binding 640"), "missing BDA table: {asm}");
+    if let Ok(mut child) = std::process::Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(&spv).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "spirv-val rejected bindless holder IFT ABI v2 SPIR-V:\n{}\n--- ASM ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            asm
+        );
+    }
 }

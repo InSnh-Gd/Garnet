@@ -36,6 +36,7 @@ pub use query_lod::{
     lower_gpu_arguments_with_capabilities,
     RDNA4xBackendCapabilities,
     GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+    GARNETX_CAP_RT_IFT_ABI_V2,
     GARNETX_CAP_RT_POSITION_FETCH,
     GARNETX_MESH_GRID_PARAMS_BINDING,
     GARNETX_MESH_INDIRECT_BINDING,

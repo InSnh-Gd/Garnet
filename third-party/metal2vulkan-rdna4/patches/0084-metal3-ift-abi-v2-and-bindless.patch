@@ -1,0 +1,582 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2df5002..5914d99 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -802,19 +802,19 @@ pub fn specialize_linked_module_with_tables(
+     };
+     let entry_name = meta::entry_name(san_ll, stage_name)
+         .ok_or_else(|| format!("linked translation found no AIR {stage_name} entry"))?;
+-    let (specialized, vft_info) = linked_functions::specialize_runtime_visible_function_tables(
+-        san_ll,
+-        stage,
+-        &entry_name,
+-        linkage,
+-    )?;
+     let (specialized, ift_info) =
+         linked_functions::specialize_runtime_intersection_function_tables(
+-            &specialized,
++            san_ll,
+             stage,
+             &entry_name,
+             linkage,
+         )?;
++    let (specialized, vft_info) = linked_functions::specialize_runtime_visible_function_tables(
++        &specialized,
++        stage,
++        &entry_name,
++        linkage,
++    )?;
+     let specialized =
+         linked_functions::specialize_visible_function_tables(&specialized, &entry_name, linkage)?;
+     let specialized =
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index b4fd086..da18cfb 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -32,6 +32,9 @@ pub struct LinkedFunctionLinkage {
+     /// Explicitly enable runtime `MTLIntersectionFunctionTable` buffer lowering even when
+     /// `runtime_intersection_functions` is empty (safe handle-0/OOB fallback).
+     pub runtime_intersection_tables: bool,
++    /// Enable IFT backing buffer ABI v2 (66-word header carrying `attached_bda[31]` for
++    /// `[[buffer(N)]]` / nested VFT access inside `[[intersection]]` callbacks).
++    pub runtime_intersection_abi_v2: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+@@ -1824,7 +1827,7 @@ pub fn specialize_runtime_visible_function_tables(
+                     ));
+                 }
+                 let table_val = value_operand(arguments[0]);
+-                if current_tables.contains(table_val) {
++                if current_tables.contains(table_val) || table_val.starts_with('%') {
+                     if !arguments[1].trim_start().starts_with("i32 ") {
+                         return Err(format!(
+                             "runtime visible function-table lookup has non-i32 slot operand {:?}",
+@@ -1862,7 +1865,7 @@ pub fn specialize_runtime_visible_function_tables(
+                 if let Some(table_val) = arguments
+                     .first()
+                     .map(|a| value_operand(a))
+-                    .filter(|v| current_tables.contains(*v))
++                    .filter(|v| current_tables.contains(*v) || v.starts_with('%'))
+                 {
+                     writeln!(
+                         output,
+@@ -1876,7 +1879,7 @@ pub fn specialize_runtime_visible_function_tables(
+                 if let Some(table_val) = arguments
+                     .first()
+                     .map(|a| value_operand(a))
+-                    .filter(|v| current_tables.contains(*v))
++                    .filter(|v| current_tables.contains(*v) || v.starts_with('%'))
+                 {
+                     let id = temp_counter;
+                     temp_counter += 1;
+@@ -2151,10 +2154,38 @@ pub fn specialize_runtime_intersection_function_tables(
+     for (idx, func) in unique_fns.iter().enumerate() {
+         let handle_id = (idx as u32) + 1;
+         let global = llvm_global(&func.symbol)?;
+-        let norm_mod = normalize_ray_data_addrspace5(&func.module_ll);
+-        let (return_type, param_types) = parse_callback_signature(&norm_mod, &global)?;
++        let mut norm_mod = normalize_ray_data_addrspace5(&func.module_ll);
++        let (mut return_type, mut param_types) = parse_callback_signature(&norm_mod, &global)?;
+         let param_roles =
+             decode_callback_param_roles(&norm_mod, &func.symbol, func.kind, &param_types);
++        let const_attached_indices: HashSet<usize> = param_roles
++            .iter()
++            .enumerate()
++            .filter_map(|(pi, role)| {
++                matches!(
++                    role,
++                    crate::native::ray_query_air::CallbackParamRole::AttachedBuffer(_)
++                        | crate::native::ray_query_air::CallbackParamRole::AttachedVft(_)
++                )
++                .then_some(pi)
++                .filter(|&i| param_types.get(i).is_some_and(|t| t.trim() == "ptr addrspace(2)"))
++            })
++            .collect();
++        if !const_attached_indices.is_empty() {
++            norm_mod = normalize_callback_const_buffer_params(
++                &norm_mod,
++                &global,
++                &const_attached_indices,
++            );
++            output = normalize_callback_const_buffer_params(
++                &output,
++                &global,
++                &const_attached_indices,
++            );
++            let updated = parse_callback_signature(&norm_mod, &global)?;
++            return_type = updated.0;
++            param_types = updated.1;
++        }
+         handles.push(RuntimeIntersectionFunctionHandle {
+             handle_id,
+             symbol: func.symbol.clone(),
+@@ -2221,15 +2252,16 @@ pub fn specialize_runtime_intersection_function_tables(
+ 
+     // Lower `@air.intersect.*` calls into `@__m2v.rq.*` structured ray queries referencing the
+     // linked callback symbols.
+-    if let Some(lowered) =
+-        crate::native::ray_query_air::lower_air_ray_queries(&output, &callbacks)?
+-    {
++    let abi_v2 = linkage.runtime_intersection_abi_v2;
++    if let Some(lowered) = crate::native::ray_query_air::lower_air_ray_queries_with_abi(
++        &output, &callbacks, abi_v2,
++    )? {
+         output = lowered;
+     }
+ 
+     let info = RuntimeIntersectionFunctionTableInfo {
+-        abi_version: 1,
+-        header_words: 1,
++        abi_version: if abi_v2 { 2 } else { 1 },
++        header_words: if abi_v2 { 66 } else { 1 },
+         tables,
+         handles,
+     };
+@@ -2435,7 +2467,15 @@ fn split_type_and_value_text(param: &str) -> Option<String> {
+         if let Some(without_paren) = trimmed.strip_suffix(')') {
+             if let Some(open_p) = without_paren.rfind('(') {
+                 let attr_name = without_paren[..open_p].trim_end();
+-                if let Some(before) = ["dereferenceable_or_null", "dereferenceable", "align"]
++                if let Some(before) = [
++                    "dereferenceable_or_null",
++                    "dereferenceable",
++                    "align",
++                    "captures",
++                    "range",
++                    "nofpclass",
++                    "initializes",
++                ]
+                     .iter()
+                     .find_map(|kw| {
+                         attr_name
+@@ -2469,9 +2509,15 @@ fn split_type_and_value_text(param: &str) -> Option<String> {
+             "nocapture",
+             "readonly",
+             "writeonly",
++            "readnone",
++            "writable",
+             "noalias",
+             "signext",
+             "zeroext",
++            "returned",
++            "immarg",
++            "dead_on_unwind",
++            "dead_on_return",
+         ]
+         .iter()
+         .find_map(|attr| {
+@@ -2516,6 +2562,125 @@ fn normalize_ray_data_addrspace5(ll: &str) -> String {
+     out
+ }
+ 
++/// Promote `constant` (`ptr addrspace(2)`) attached-buffer parameters of a linked intersection
++/// callback to `device` (`ptr addrspace(1)`) so they carry `PhysicalStorageBuffer` device
++/// addresses across the callback call boundary without disturbing loaded `ptr addrspace(2)`
++/// sampler handles.
++fn normalize_callback_const_buffer_params(
++    ll: &str,
++    target_global: &str,
++    const_param_indices: &HashSet<usize>,
++) -> String {
++    if const_param_indices.is_empty() || !ll.contains("addrspace(2)") {
++        return ll.to_string();
++    }
++    let mut out = String::with_capacity(ll.len());
++    let mut in_target = false;
++    let mut promoted = HashSet::<String>::new();
++    for raw_line in ll.lines() {
++        let trimmed = raw_line.trim_start();
++        if !in_target && trimmed.starts_with("define ") {
++            if definition_global(trimmed).as_deref() == Some(target_global) {
++                in_target = !trimmed.ends_with('}');
++                promoted.clear();
++                if let Some(at) = raw_line.find(target_global) {
++                    if let Some(open_rel) = raw_line[at..].find('(') {
++                        let open = at + open_rel;
++                        if let Some(close) = find_matching_paren_lf(raw_line, open) {
++                            let params_str = &raw_line[open + 1..close];
++                            let mut rewritten_params = Vec::new();
++                            for (pi, p) in split_top_level(params_str, ',').into_iter().enumerate() {
++                                if const_param_indices.contains(&pi) {
++                                    let p_trim = p.trim();
++                                    let pname = value_operand(p_trim);
++                                    if pname.starts_with('%') {
++                                        promoted.insert(pname.to_string());
++                                    }
++                                    rewritten_params.push(
++                                        p_trim.replacen("ptr addrspace(2)", "ptr addrspace(1)", 1),
++                                    );
++                                } else {
++                                    rewritten_params.push(p.trim().to_string());
++                                }
++                            }
++                            out.push_str(&raw_line[..open + 1]);
++                            out.push_str(&rewritten_params.join(", "));
++                            out.push_str(&raw_line[close..]);
++                            out.push('\n');
++                            continue;
++                        }
++                    }
++                }
++            }
++            out.push_str(raw_line);
++            out.push('\n');
++            continue;
++        }
++        if in_target {
++            if trimmed == "}" {
++                in_target = false;
++                promoted.clear();
++                out.push_str(raw_line);
++                out.push('\n');
++                continue;
++            }
++            let mut line = raw_line.to_string();
++            let mut result_promoted = false;
++            for p in promoted.clone() {
++                let needle = format!("ptr addrspace(2) {p}");
++                if line.contains(&needle) {
++                    let repl = format!("ptr addrspace(1) {p}");
++                    line = replace_typed_ptr_operand(&line, &needle, &repl);
++                    if let Some((_, rhs)) = trimmed.split_once(" = ") {
++                        if rhs.starts_with("getelementptr ")
++                            || rhs.starts_with("bitcast ")
++                            || rhs.starts_with("select ")
++                            || rhs.starts_with("phi ")
++                        {
++                            result_promoted = true;
++                        }
++                    }
++                }
++            }
++            if result_promoted {
++                if let Some((lhs, _)) = trimmed.split_once(" = ") {
++                    let res = lhs.trim();
++                    if res.starts_with('%') {
++                        promoted.insert(res.to_string());
++                    }
++                }
++            }
++            out.push_str(&line);
++            out.push('\n');
++            continue;
++        }
++        out.push_str(raw_line);
++        out.push('\n');
++    }
++    out
++}
++
++fn replace_typed_ptr_operand(line: &str, needle: &str, replacement: &str) -> String {
++    let mut out = String::with_capacity(line.len());
++    let mut rest = line;
++    while let Some(pos) = rest.find(needle) {
++        let after_idx = pos + needle.len();
++        let boundary_ok = rest[after_idx..]
++            .chars()
++            .next()
++            .is_none_or(|ch| !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-'));
++        out.push_str(&rest[..pos]);
++        if boundary_ok {
++            out.push_str(replacement);
++        } else {
++            out.push_str(needle);
++        }
++        rest = &rest[after_idx..];
++    }
++    out.push_str(rest);
++    out
++}
++
+ fn extract_return_type_text(before_at: &str) -> Result<String, String> {
+     let mut s = before_at.trim();
+     if let Some(rest) = s.strip_prefix("define ") {
+@@ -2699,11 +2864,24 @@ fn decode_callback_param_roles(
+             Role::PrimitiveId | Role::GeometryId | Role::InstanceId | Role::UserInstanceId => {
+                 t == "i32"
+             }
+-            Role::PayloadPtr | Role::UserDataPtr => t.starts_with("ptr"),
++            Role::PayloadPtr
++            | Role::UserDataPtr
++            | Role::AttachedBuffer(_)
++            | Role::AttachedVft(_)
++            | Role::PrimitiveDataPtr => t.starts_with("ptr"),
+             Role::ZeroFallback => true,
+         }
+     };
+ 
++    let extract_location_index = |body: &str| -> Option<u32> {
++        let marker = "!\"air.location_index\"";
++        let pos = body.find(marker)?;
++        let rest = body[pos + marker.len()..].trim_start();
++        let rest = rest.strip_prefix(',')?.trim_start();
++        let tok = rest.split(',').next()?.trim();
++        tok.strip_prefix("i32 ")?.trim().parse::<u32>().ok()
++    };
++
+     // First look for AIR parameter role metadata (`!{i32 idx, !"air.<role>", ...}`).
+     let mut by_idx: HashMap<usize, Role> = HashMap::new();
+     let candidate_bodies: Vec<&str> = if !scoped_param_bodies.is_empty() {
+@@ -2753,10 +2931,13 @@ fn decode_callback_param_roles(
+             Some(Role::InstanceId)
+         } else if body.contains("!\"air.payload\"") || body.contains("!\"air.ray_data\"") {
+             Some(Role::PayloadPtr)
+-        } else if body.contains("!\"air.user_data\"")
+-            || body.contains("!\"air.primitive_data\"")
+-            || body.contains("!\"air.geometry_data\"")
+-        {
++        } else if body.contains("!\"air.primitive_data\"") {
++            Some(Role::PrimitiveDataPtr)
++        } else if body.contains("!\"air.visible_function_table\"") {
++            extract_location_index(body).map(Role::AttachedVft)
++        } else if body.contains("!\"air.indirect_buffer\"") || body.contains("!\"air.buffer\"") {
++            extract_location_index(body).map(Role::AttachedBuffer)
++        } else if body.contains("!\"air.user_data\"") || body.contains("!\"air.geometry_data\"") {
+             Some(Role::UserDataPtr)
+         } else {
+             None
+@@ -3072,10 +3253,10 @@ fn propagate_runtime_vft_flow(
+                 let result = result.trim();
+                 if instruction.contains("@air.get_function_pointer_visible_function_table(") {
+                     let arguments = call_arguments(instruction)?;
+-                    if arguments
+-                        .first()
+-                        .is_some_and(|a| tables.contains(value_operand(a)))
+-                    {
++                    if arguments.first().is_some_and(|a| {
++                        let v = value_operand(a);
++                        tables.contains(v) || v.starts_with('%')
++                    }) {
+                         pointers.insert(result.to_string());
+                     }
+                 } else if instruction.starts_with("bitcast ")
+diff --git a/src/native/emitter/types.rs b/src/native/emitter/types.rs
+index 903d20e..37a8a6e 100644
+--- a/src/native/emitter/types.rs
++++ b/src/native/emitter/types.rs
+@@ -426,7 +426,8 @@ impl Emitter {
+     pub(super) fn value_id(&mut self, value: &LlValue, ty: &LlType) -> Result<Word, String> {
+         match value {
+             LlValue::Local(name) => {
+-                if self.pointer_phi_values.contains(name)
++                if (self.pointer_phi_values.contains(name)
++                    || (self.bda_device_pointers && self.bda_inttoptr_sources.contains_key(name)))
+                     && matches!(self.resolve_type(ty)?, LlType::Ptr(_))
+                 {
+                     if let Some(address) = self.raw_offsets.get(name).and_then(|raw| {
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+index 1c03ab1..4139266 100644
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -36,6 +36,9 @@ pub(crate) enum CallbackParamRole {
+     WorldToObjectCol(u8),
+     PayloadPtr,
+     UserDataPtr,
++    AttachedBuffer(u32),
++    AttachedVft(u32),
++    PrimitiveDataPtr,
+     ZeroFallback,
+ }
+ 
+@@ -546,6 +549,14 @@ fn lowered_result_type(family: &AirIntersectionFamily) -> String {
+ pub(crate) fn lower_air_ray_queries(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
++) -> Result<Option<String>, String> {
++    lower_air_ray_queries_with_abi(ll, linked_callbacks, false)
++}
++
++pub(crate) fn lower_air_ray_queries_with_abi(
++    ll: &str,
++    linked_callbacks: &[LinkedRayCallback],
++    ift_abi_v2: bool,
+ ) -> Result<Option<String>, String> {
+     let has_intersect = ll.contains("@air.intersect.");
+     let has_iq = ll.contains("_intersection_query");
+@@ -559,7 +570,7 @@ pub(crate) fn lower_air_ray_queries(
+ 
+     if has_intersect {
+         if let Some((lowered, used_slots)) =
+-            lower_air_intersect_calls(&cur_ll, linked_callbacks, next_slot_id)?
++            lower_air_intersect_calls(&cur_ll, linked_callbacks, next_slot_id, ift_abi_v2)?
+         {
+             cur_ll = lowered;
+             next_slot_id += used_slots;
+@@ -579,6 +590,7 @@ fn lower_air_intersect_calls(
+     ll: &str,
+     linked_callbacks: &[LinkedRayCallback],
+     slot_base: u32,
++    ift_abi_v2: bool,
+ ) -> Result<Option<(String, u32)>, String> {
+     if !ll.contains("@air.intersect.") {
+         return Ok(None);
+@@ -799,7 +811,7 @@ fn lower_air_intersect_calls(
+ 
+     // Emit each structured ray-query helper function.
+     for p in &pending {
+-        let helper = emit_ray_query_helper(p, linked_callbacks)?;
++        let helper = emit_ray_query_helper(p, linked_callbacks, ift_abi_v2)?;
+         out.push_str(&helper);
+     }
+ 
+@@ -1609,6 +1621,7 @@ fn param_indices(family: &AirIntersectionFamily) -> ParsedParamIndices {
+ fn emit_ray_query_helper(
+     p: &PendingCall,
+     linked_callbacks: &[LinkedRayCallback],
++    ift_abi_v2: bool,
+ ) -> Result<String, String> {
+     let family = &p.family;
+     let idx = param_indices(family);
+@@ -1757,6 +1770,10 @@ fn emit_ray_query_helper(
+             s.push_str("  %slot_0 = add i32 %cand_geom, 0\n");
+         }
+         // Normalize negative sentinel (-1) function_table_offset to 0.
++        // ABI v1: header_words = 1 (word[0] = slot_count, word[1 + slot] = handle_id).
++        // ABI v2: header_words = 66 (word[0] = slot_count, word[1] = 2, word[2] = attached_mask,
++        //         word[3] = 0, word[4..65] = u64 attached_bda[31], word[66 + slot] = handle_id).
++        let header_words: u32 = if ift_abi_v2 { 66 } else { 1 };
+         s.push_str(&format!(
+             "  %fto_neg = icmp slt i32 {fto_param}, 0\n\
+              \x20 %fto_safe = select i1 %fto_neg, i32 0, i32 {fto_param}\n\
+@@ -1765,7 +1782,7 @@ fn emit_ray_query_helper(
+              \x20 %ift_in_bounds = icmp ult i32 %ift_slot, %ift_count\n\
+              \x20 br i1 %ift_in_bounds, label %ift_load, label %ift_oob\n\n\
+              ift_load:\n\
+-             \x20 %ift_word_idx = add i32 %ift_slot, 1\n\
++             \x20 %ift_word_idx = add i32 %ift_slot, {header_words}\n\
+              \x20 %ift_ptr = getelementptr inbounds i32, ptr addrspace(1) {table_param}, i32 %ift_word_idx\n\
+              \x20 %ift_loaded_hdl = load i32, ptr addrspace(1) %ift_ptr, align 4\n\
+              \x20 br label %ift_dispatch\n\n\
+@@ -1791,7 +1808,16 @@ fn emit_ray_query_helper(
+             }
+             s.push_str("  ]\n\n");
+             for cb in &tri_callbacks {
+-                emit_triangle_callback_case(&mut s, slot, cb, has_instancing, &idx, p)?;
++                emit_triangle_callback_case(
++                    &mut s,
++                    slot,
++                    cb,
++                    has_instancing,
++                    &idx,
++                    p,
++                    ift_abi_v2,
++                    &table_param,
++                )?;
+             }
+         }
+         s.push_str(&format!(
+@@ -1814,7 +1840,16 @@ fn emit_ray_query_helper(
+             }
+             s.push_str("  ]\n\n");
+             for cb in &aabb_callbacks {
+-                emit_aabb_callback_case(&mut s, slot, cb, has_instancing, &idx, p)?;
++                emit_aabb_callback_case(
++                    &mut s,
++                    slot,
++                    cb,
++                    has_instancing,
++                    &idx,
++                    p,
++                    ift_abi_v2,
++                    &table_param,
++                )?;
+             }
+         }
+         s.push_str(
+@@ -1963,6 +1998,8 @@ fn emit_callback_args(
+     has_instancing: bool,
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
++    ift_abi_v2: bool,
++    table_param: &str,
+ ) -> Vec<String> {
+     let mut args = Vec::with_capacity(cb.param_types.len());
+     for (pi, (pty, role)) in cb
+@@ -2101,6 +2138,34 @@ fn emit_callback_args(
+                     args.push(format!("{pty} null"));
+                 }
+             }
++            CallbackParamRole::AttachedBuffer(buf_idx)
++            | CallbackParamRole::AttachedVft(buf_idx) => {
++                if ift_abi_v2 && buf_idx < 31 {
++                    let lo_w = 4 + 2 * buf_idx;
++                    let hi_w = 5 + 2 * buf_idx;
++                    s.push_str(&format!(
++                        "  {vname}_lo_p = getelementptr inbounds i32, ptr addrspace(1) {table_param}, i32 {lo_w}\n\
++                         \x20 {vname}_lo = load i32, ptr addrspace(1) {vname}_lo_p, align 4\n\
++                         \x20 {vname}_hi_p = getelementptr inbounds i32, ptr addrspace(1) {table_param}, i32 {hi_w}\n\
++                         \x20 {vname}_hi = load i32, ptr addrspace(1) {vname}_hi_p, align 4\n\
++                         \x20 {vname}_lo64 = zext i32 {vname}_lo to i64\n\
++                         \x20 {vname}_hi64 = zext i32 {vname}_hi to i64\n\
++                         \x20 {vname}_sh = shl i64 {vname}_hi64, 32\n\
++                         \x20 {vname}_addr = or i64 {vname}_lo64, {vname}_sh\n\
++                         \x20 {vname} = inttoptr i64 {vname}_addr to {pty}\n"
++                    ));
++                    args.push(format!("{pty} {vname}"));
++                } else {
++                    s.push_str(&format!("  {vname} = inttoptr i64 0 to {pty}\n"));
++                    args.push(format!("{pty} {vname}"));
++                }
++            }
++            CallbackParamRole::PrimitiveDataPtr => {
++                // Wave 2 emits typed BDA-zero pointer so null checks fold safely and untaken loads
++                // carry PhysicalStorageBuffer storage class; Wave 4 replaces 0 with real lookup.
++                s.push_str(&format!("  {vname} = inttoptr i64 0 to {pty}\n"));
++                args.push(format!("{pty} {vname}"));
++            }
+             CallbackParamRole::ZeroFallback => {
+                 args.push(format!("{pty} {}", llvm_zero_literal(pty)));
+             }
+@@ -2145,11 +2210,24 @@ fn emit_triangle_callback_case(
+     has_instancing: bool,
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
++    ift_abi_v2: bool,
++    table_param: &str,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+     let prefix = format!("tc{hid}");
+     s.push_str(&format!("tri_case_{hid}:\n"));
+-    let args = emit_callback_args(s, slot, &prefix, cb, true, has_instancing, idx, p);
++    let args = emit_callback_args(
++        s,
++        slot,
++        &prefix,
++        cb,
++        true,
++        has_instancing,
++        idx,
++        p,
++        ift_abi_v2,
++        table_param,
++    );
+     let rty = cb.return_type.trim();
+     s.push_str(&format!(
+         "  %{prefix}_ret = call {rty} {}({})\n",
+@@ -2215,11 +2293,24 @@ fn emit_aabb_callback_case(
+     has_instancing: bool,
+     idx: &ParsedParamIndices,
+     p: &PendingCall,
++    ift_abi_v2: bool,
++    table_param: &str,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+     let prefix = format!("ac{hid}");
+     s.push_str(&format!("aabb_case_{hid}:\n"));
+-    let args = emit_callback_args(s, slot, &prefix, cb, false, has_instancing, idx, p);
++    let args = emit_callback_args(
++        s,
++        slot,
++        &prefix,
++        cb,
++        false,
++        has_instancing,
++        idx,
++        p,
++        ift_abi_v2,
++        table_param,
++    );
+     let rty = cb.return_type.trim();
+     s.push_str(&format!(
+         "  %{prefix}_ret = call {rty} {}({})\n\

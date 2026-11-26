@@ -395,7 +395,13 @@ pub fn translate_bytes_stage3(
             }
         }
     }
-    if !visible_functions.is_empty() || san_entry.contains("air.visible_function_table") {
+    if !visible_functions.is_empty()
+        || san_entry.contains("air.visible_function_table")
+        || san_entry.contains("@air.get_function_pointer_visible_function_table")
+        || intersection_functions.iter().any(|(_, _, b)| {
+            std::str::from_utf8(b).is_ok_and(|s| s.contains("visible_function_table"))
+        })
+    {
         linkage.runtime_visible_tables = true;
     }
 
@@ -430,6 +436,8 @@ pub fn translate_bytes_stage3(
     {
         linkage.runtime_intersection_tables = true;
     }
+    linkage.runtime_intersection_abi_v2 =
+        caps.is_some_and(RDNA4xBackendCapabilities::ift_abi_v2);
 
     let (san_ll, vft_info, ift_info) =
         metal2vulkan::specialize_linked_module_with_tables(&san_entry, stage, &linkage)?;

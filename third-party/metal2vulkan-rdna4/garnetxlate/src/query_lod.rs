@@ -6,6 +6,8 @@ use super::*;
 pub const GARNETX_CAP_MESH_EMULATED_PAYLOAD: u32 = 1 << 8;
 /// Capability flag advertising device-enabled `VK_KHR_ray_tracing_position_fetch` (`GARNETX_CAP_RT_POSITION_FETCH`).
 pub const GARNETX_CAP_RT_POSITION_FETCH: u32 = 1 << 9;
+/// Capability flag enabling IFT backing buffer ABI v2 (66-word header with `attached_bda[31]`).
+pub const GARNETX_CAP_RT_IFT_ABI_V2: u32 = 1 << 10;
 
 /// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages.
 pub const GARNETX_MESH_GRID_PARAMS_BINDING: u32 =
@@ -14,8 +16,10 @@ pub const GARNETX_MESH_PAYLOAD_BINDING: u32 = metal2vulkan::reflect::MESH_EMULAT
 pub const GARNETX_MESH_INDIRECT_BINDING: u32 =
     metal2vulkan::reflect::MESH_EMULATED_INDIRECT_BINDING;
 
-const KNOWN_CAPABILITY_FLAGS: u32 =
-    3 | GARNETX_CAP_MESH_EMULATED_PAYLOAD | GARNETX_CAP_RT_POSITION_FETCH;
+const KNOWN_CAPABILITY_FLAGS: u32 = 3
+    | GARNETX_CAP_MESH_EMULATED_PAYLOAD
+    | GARNETX_CAP_RT_POSITION_FETCH
+    | GARNETX_CAP_RT_IFT_ABI_V2;
 
 /// Caller-proven language/device support and actual Vulkan subgroup properties (ABI 3).
 #[repr(C)]
@@ -44,6 +48,10 @@ impl RDNA4xBackendCapabilities {
 
     pub(crate) fn emulated_mesh_payload(self) -> bool {
         self.flags & GARNETX_CAP_MESH_EMULATED_PAYLOAD != 0
+    }
+
+    pub(crate) fn ift_abi_v2(self) -> bool {
+        self.flags & GARNETX_CAP_RT_IFT_ABI_V2 != 0
     }
 
     pub(crate) fn replay(self) -> QueryLodReplay {
