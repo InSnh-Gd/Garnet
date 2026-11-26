@@ -1,0 +1,78 @@
+From: Garnet local integration
+Subject: [PATCH 30/30] radv/darwin: enable GFX12 DCC when kernel advertises RDNA4N_CAP_GFX12_DCC
+
+Sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h
+and ac_darwin_kext.c. When QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC
+on a native connection, report drm_minor = 60 in acd_device_initialize() so
+ac_gpu_info sets gfx12_supports_dcc_write_compress_disable = true (Garnet
+never migrates BOs between VRAM and GTT).
+
+Update radv_is_dcc_disabled() (superseding patch 0025's unconditional GFX12
+disable on Darwin) to disable GFX12 DCC on Darwin only when
+!pdev->info.gfx12_supports_dcc_write_compress_disable. Older kexts,
+garnet-dcc=0 boots, HOST_BO stand-ins, and RADV_DEBUG=nodcc keep DCC off.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 + patches 0001..0029.
+
+diff --git a/include/darwin/rdna4_native_abi.h b/include/darwin/rdna4_native_abi.h
+--- a/include/darwin/rdna4_native_abi.h
++++ b/include/darwin/rdna4_native_abi.h
+@@ -204,6 +204,7 @@
+ #define RDNA4N_INFO_NATIVE_BOOT   (1u << 2)
+ #define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
+ #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
++#define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
+ /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+  *   reserved[3] = RDNA4N_BUDGET_* flags
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -69,6 +69,7 @@
+    const struct amdgpu_device *canned;
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool has_vm_prt; /* ABI 1.13+: rdna4n_info.flags & RDNA4N_CAP_VM_PRT */
++   bool has_gfx12_dcc; /* rdna4n_info.flags & RDNA4N_CAP_GFX12_DCC */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+    struct amdgpu_va_manager *va_mgr;
+@@ -179,6 +180,7 @@
+       return r;
+    }
+    c->has_vm_prt = (info.flags & RDNA4N_CAP_VM_PRT) != 0;
++   c->has_gfx12_dcc = (info.flags & RDNA4N_CAP_GFX12_DCC) != 0;
+ 
+    r = acd_select_chip(c, info.gc_version, true);
+    if (r)
+@@ -347,7 +349,7 @@
+    dev->next_bo_handle = 1;
+    dev->next_ctx_id = 1;
+    *drm_major = ACD_DRM_MAJOR;
+-   *drm_minor = ACD_DRM_MINOR;
++   *drm_minor = (!dev->host_bo && dev->core->has_gfx12_dcc) ? 60 : ACD_DRM_MINOR;
+    *out = dev;
+    return 0;
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -71,6 +71,7 @@
+                RDNA4N_VM_MTYPE_RW == AMDGPU_VM_MTYPE_RW &&
+                RDNA4N_VM_PAGE_NOALLOC == AMDGPU_VM_PAGE_NOALLOC, "va values");
+ _Static_assert(RDNA4N_CAP_VM_PRT == (1u << 4), "vm prt capability bit");
++_Static_assert(RDNA4N_CAP_GFX12_DCC == (1u << 5), "gfx12 dcc capability bit");
+ _Static_assert(RDNA4N_CTX_OP_ALLOC == AMDGPU_CTX_OP_ALLOC_CTX && RDNA4N_CTX_OP_FREE == AMDGPU_CTX_OP_FREE_CTX &&
+                RDNA4N_CTX_OP_QUERY_STATE2 == AMDGPU_CTX_OP_QUERY_STATE2, "ctx ops");
+ _Static_assert(RDNA4N_IB_FLAG_CE == AMDGPU_IB_FLAG_CE && RDNA4N_IB_FLAG_PREAMBLE == AMDGPU_IB_FLAG_PREAMBLE &&
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -321,7 +321,7 @@
+ radv_is_dcc_disabled(const struct radv_physical_device *pdev)
+ {
+ #ifdef HAVE_AMDGPU_DARWIN
+-   if (pdev->info.gfx_level >= GFX12)
++   if (pdev->info.gfx_level >= GFX12 && !pdev->info.gfx12_supports_dcc_write_compress_disable)
+       return true;
+ #endif
+ 

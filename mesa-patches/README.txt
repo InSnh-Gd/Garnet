@@ -21,10 +21,10 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0029. The kext ABI header that patches 0002-0004 and
-0028 mirror is src/garnet/src/GarnetNativeABI.h in this repository; Mesa's copy
-and the kext's copy must stay ABI-compatible (currently 1.13; older ABI <= 1.12
-kernels remain compatible with sparse/PRT disabled).
+Order matters: 0001 .. 0030. The kext ABI header that patches 0002-0004,
+0028, and 0030 mirror is src/garnet/src/GarnetNativeABI.h in this repository;
+Mesa's copy and the kext's copy must stay ABI-compatible (currently 1.13; older
+ABI <= 1.12 kernels remain compatible with sparse/PRT and GFX12 DCC disabled).
 
 0010: Navi 44 (RX 9060 XT, gfx1200) canned device entry; the chip is chosen at runtime from the kext QueryInfo gc_version (0x0c0001 gfx1201 / 0x0c0000 gfx1200, 0 = old kext -> gfx1201). Env: RADV_DARWIN_CHIP=gfx1200|gfx1201 forces the chip (also the HOST_BO stand-in choice); RADV_DARWIN_MOCK_GC=gfx1200 makes the mock report GC 12.0.0. The gfx1200 device fields are confirmed by the target's Linux amdgpu DRM_INFO dump, preserved in `.omo/evidence/navi44-topology/linux-amdgpu-dump.txt`.
 
@@ -65,6 +65,8 @@ kernels remain compatible with sparse/PRT disabled).
 0028: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.13 (RDNA4N_CAP_VM_PRT = 1u << 4, RDNA4N_VA_OP_CLEAR/REPLACE, RDNA4N_VM_PAGE_PRT), enable CLEAR/REPLACE/PRT VA operations in the Darwin winsys and mock when QueryInfo.flags advertises RDNA4N_CAP_VM_PRT (continuing to reject them with -EOPNOTSUPP on older ABI <= 1.12 kernels and HOST_BO), replace 0021's unconditional false in radv_sparse_enabled() with a runtime RDNA4N_CAP_VM_PRT capability check that preserves Mesa's sparse disable flags, and reject composite child-backed BOs as sparse backing targets.
 
 0029: split radv_mesh_enabled() from radv_taskmesh_enabled() in src/amd/vulkan/radv_physical_device.c so GFX10.3+ / GFX12 hardware exposes VK_EXT_mesh_shader (meshShader=true, multiviewMeshShader=true, primitiveFragmentShadingRateMeshShader=true, meshShaderQueries=false) on GFX ring 0 when ip[AMD_IP_COMPUTE].num_queues == 0, while keeping taskShader, meshAndTaskShaderDerivatives, and VK_SHADER_STAGE_TASK_BIT_EXT gated on radv_compute_queue_enabled(). Zero kext/ABI changes; mesh-only draws run on GFX ring 0 via PKT3_DISPATCH_MESH_DIRECT.
+
+0030: sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; report drm_minor = 60 in acd_device_initialize() when QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC (unlocking gfx12_supports_dcc_write_compress_disable), and gate radv_is_dcc_disabled() on Darwin on !pdev->info.gfx12_supports_dcc_write_compress_disable (superseding 0025's unconditional GFX12 disable while preserving RADV_DEBUG=nodcc, garnet-dcc=0, and HOST_BO fallback).
 
 Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
     python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
