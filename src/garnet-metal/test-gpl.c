@@ -89,8 +89,10 @@ int main(void) {
               strstr(be, "VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME") != NULL &&
               strstr(be, "VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME") != NULL,
               "garnet_backend.m queries and enables GPL + EDS3 extensions");
-        check(strstr(be, "GARNET_NOGPL_FILE") != NULL,
-              "garnet_backend.m honors /private/tmp/garnet-nogpl");
+        check(strstr(be, "GARNET_NOGPL_FILE") != NULL &&
+              strstr(be, "rdna4_gpl_prewarm_start();") != NULL &&
+              strstr(be, "seeded read-only from") != NULL,
+              "garnet_backend.m honors /private/tmp/garnet-nogpl, triggers pre-warm, and seeds cold app caches read-only");
         check(strstr(pi, "VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT") != NULL &&
               strstr(pi, "VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT") != NULL &&
               strstr(pi, "VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT") != NULL &&
@@ -98,6 +100,12 @@ int main(void) {
               strstr(pi, "VK_PIPELINE_CREATE_LIBRARY_BIT_KHR") != NULL &&
               strstr(pi, "VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT") == NULL,
               "garnet_pipelines.m uses 3-library GPL fast-link without LTO");
+        check(strstr(pi, "6cc985fd81b32b264203827cb3f7a8c6d9216d7a7f2b23707b18adeee36898ec") != NULL &&
+              strstr(pi, "0fca3c0b863929837cced752a6d4f37e7271ee055415c1937586c33184306f5c") != NULL &&
+              strstr(pi, "b4d554ed376a3f6f4bb279d1da1672958aaed902c73312d788ddb99283c29e70") != NULL &&
+              strstr(pi, "0fddae4cfb947d265b833f525390d8eb9efb806d99d54a83f5af8248dae6cc3c") != NULL &&
+              strstr(pi, "rdna4_pc_save(\"prewarm\")") != NULL,
+              "garnet_pipelines.m pre-warms all 4 giant spvcache shaders and persists cache on miss");
         check(strstr(cm, "RDNA4R.cmdSetCullMode(cmd, cull)") != NULL &&
               strstr(cm, "RDNA4R.cmdSetFrontFace(cmd, front)") != NULL &&
               strstr(cm, "RDNA4R.cmdSetPrimitiveTopology(cmd, topo)") != NULL &&

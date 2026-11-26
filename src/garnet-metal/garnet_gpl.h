@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define GARNET_NOGPL_FILE     "/private/tmp/garnet-nogpl"
+#define GARNET_NOPREWARM_FILE "/private/tmp/garnet-noprewarm"
 
 /* Vulkan VkPrimitiveTopology numeric constants (validated statically in garnet_pipelines.m). */
 #define GARNET_VK_TOPO_POINT_LIST     0u

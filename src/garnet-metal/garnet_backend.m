@@ -1263,23 +1263,41 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
                    if (c) { RDNA4LOG("T2 pipeline cache: %s ignored: %s", RDNA4PC.path, rdna4pc_why(c)); payload = NULL; plen = 0; } }
         else RDNA4LOG("T2 pipeline cache: %s unreadable/empty/oversized, ignored", RDNA4PC.path);
     } else RDNA4LOG("T2 pipeline cache: no file %s yet (cold start; saving %s)", RDNA4PC.path, RDNA4PC.save ? "ON" : "OFF in this process");
+    BOOL seeded = NO;
+    if (!payload && pcls == RDNA4G_CLASS_OTHER) {
+        // Cold/invalid per-app cache: seed read-only from WindowServer's warmed cache so first launch skips compiling giant QuartzCore shaders.
+        static const char *const kSeedPath = "/private/var/tmp/garnet-pipecache.bin";
+        int sfd = open(kSeedPath, O_RDONLY);
+        if (sfd >= 0) {
+            struct stat sst; void *sbuf = NULL; size_t sflen = 0;
+            if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
+                size_t got = 0; while (got < (size_t)sst.st_size) { ssize_t n = read(sfd, (char *)sbuf + got, (size_t)sst.st_size - got); if (n <= 0) break; got += (size_t)n; }
+                sflen = got;
+            }
+            close(sfd);
+            if (sbuf && rdna4pc_check(sbuf, sflen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, &payload, &plen) == 0) {
+                free(buf); buf = sbuf; seeded = YES;
+                RDNA4LOG("T2 pipeline cache: seeded read-only from %s (%zu B)", kSeedPath, plen);
+            } else free(sbuf);
+        }
+    }
     VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = plen, .pInitialData = payload };
-    int mk = -1; if (payload) mk = open(marker, O_WRONLY | O_CREAT, 0644);
+    int mk = -1; if (payload && !seeded) mk = open(marker, O_WRONLY | O_CREAT, 0644);
     uint64_t t0 = rdna4_now();
     VkResult r = vkCreatePipelineCache(RDNA4R.dev, &ci, NULL, &RDNA4R.pc);
     uint64_t dt = rdna4_now() - t0;
     if (mk >= 0) { close(mk); unlink(marker); }
     if (r != VK_SUCCESS && payload) {   // RADV refused the data: start empty
         RDNA4LOG("T2 pipeline cache: vkCreatePipelineCache(initialData %zu B) = %d, retrying empty", plen, r);
-        ci.initialDataSize = 0; ci.pInitialData = NULL; payload = NULL; r = vkCreatePipelineCache(RDNA4R.dev, &ci, NULL, &RDNA4R.pc);
+        ci.initialDataSize = 0; ci.pInitialData = NULL; payload = NULL; seeded = NO; r = vkCreatePipelineCache(RDNA4R.dev, &ci, NULL, &RDNA4R.pc);
     }
     if (r != VK_SUCCESS) { RDNA4R.pc = VK_NULL_HANDLE; RDNA4LOG("T2 pipeline cache: vkCreatePipelineCache = %d, running without", r); free(buf); return; }
-    if (payload) RDNA4PC.lastHash = rdna4pc_fnv(payload, plen);
+    if (payload && !seeded) RDNA4PC.lastHash = rdna4pc_fnv(payload, plen);
     RDNA4LOG("T2 pipeline cache: %p created from %s in %.2f ms (initialData %zu B%s); key %02x%02x%02x%02x uuid %02x%02x%02x%02x", (void *)RDNA4R.pc, RDNA4PC.path, (double)dt / 1e6, plen, payload ? ", ACCEPTED" : ", none",
            RDNA4PC.key[0], RDNA4PC.key[1], RDNA4PC.key[2], RDNA4PC.key[3], RDNA4PC.uuid[0], RDNA4PC.uuid[1], RDNA4PC.uuid[2], RDNA4PC.uuid[3]);
     free(buf);
 }
-static void rdna4_pc_save(const char *why) {
+GARNET_INTERNAL void rdna4_pc_save(const char *why) {
     if (!RDNA4R.ok || !RDNA4R.pc || !RDNA4PC.save || !RDNA4PC.path[0]) return;
     uint64_t np = atomic_load(&rdna4_pipes_new);
     pthread_mutex_lock(&RDNA4PC.mu);
@@ -2134,6 +2152,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         atomic_store_explicit(&rdna4_gather_caps_ready, 1, memory_order_release);
         rdna4_t1_start();
         rdna4s_prebind_on_radv_open();
+        rdna4_gpl_prewarm_start();
         RDNA4LOG("radv open: OK (queue family %u)", qfi);
         return YES;
     fail:

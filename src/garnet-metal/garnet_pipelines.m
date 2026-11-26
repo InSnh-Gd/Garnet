@@ -1248,6 +1248,140 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 }
 @end
 
+// Background pre-warm of the 4 giant QuartzCore spvcache fragment libraries in WindowServer.
+// Because RADV PS epilog makes FRAGMENT_SHADER_BIT_EXT binaries color-format-independent,
+// warming BGRA8_UNORM once populates RDNA4R.pc for all non-MSAA formats (BGRA8, sRGB, RGBA16Float).
+GARNET_INTERNAL void rdna4_gpl_prewarm_start(void) {
+    if (!rdna4_is_ws() || !RDNA4R.ok || !RDNA4R.gplExt || !RDNA4R.pc) return;
+    if (access(GARNET_NOPREWARM_FILE, F_OK) == 0) {
+        RDNA4LOG("GPL prewarm: disabled (%s)", GARNET_NOPREWARM_FILE);
+        return;
+    }
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            @autoreleasepool {
+                static const char *const kGiantShas[4] = {
+                    "6cc985fd81b32b264203827cb3f7a8c6d9216d7a7f2b23707b18adeee36898ec", // Xgc (815 KiB)
+                    "0fca3c0b863929837cced752a6d4f37e7271ee055415c1937586c33184306f5c", // fixed_frag_lph_cph
+                    "b4d554ed376a3f6f4bb279d1da1672958aaed902c73312d788ddb99283c29e70", // fixed_frag_lph_cpf
+                    "0fddae4cfb947d265b833f525390d8eb9efb806d99d54a83f5af8248dae6cc3c", // fixed_frag_lpf_cpf
+                };
+                NSArray<NSString *> *dirs = rdna4_spv_dirs();
+                uint64_t tStart = rdna4_now();
+                unsigned done = 0, misses = 0;
+                for (unsigned idx = 0; idx < 4u; idx++) {
+                    if (!RDNA4R.ok || !RDNA4R.pc) break;
+                    NSString *sha = [NSString stringWithUTF8String:kGiantShas[idx]];
+                    NSString *path = nil;
+                    NSData *fsd = nil;
+                    for (NSString *dir in dirs) {
+                        NSString *cand = [dir stringByAppendingPathComponent:[sha stringByAppendingString:@".spv"]];
+                        NSData *d = [NSData dataWithContentsOfFile:cand];
+                        if (d.length >= 20 && !(d.length & 3)) { path = cand; fsd = d; break; }
+                    }
+                    if (!fsd) continue;
+                    NSDictionary *meta = rdna4_meta_for_spv(path);
+                    NSData *fsp = rdna4_spv_set(fsd, 1);
+                    RDNA4sMod mf = {0};
+                    RDNA4sRefl *rf = calloc(1, sizeof *rf);
+                    char why[256] = "";
+                    if (!rf || rdna4s_parse(fsp.bytes, fsp.length / 4, &mf, why, sizeof why) ||
+                        !mf.has_ep || mf.ep_model != 4 || rdna4s_reflect(&mf, 1, rf)) {
+                        rdna4s_free(&mf); free(rf); continue;
+                    }
+                    size_t cnt = fsp.length / 4;
+                    uint32_t *norm = NULL;
+                    if (!rdna4s_widen_fragment_output(fsp.bytes, &cnt, &mf, &norm) && norm) {
+                        fsp = [NSData dataWithBytesNoCopy:norm length:cnt * 4 freeWhenDone:YES];
+                    }
+                    char fep[128] = "main";
+                    strlcpy(fep, mf.ep_name, sizeof fep);
+                    rdna4s_free(&mf);
+
+                    BOOL fetch = NO; uint32_t fetchMax = 0;
+                    for (int b = 192; b < 200; b++) {
+                        if (rf->bind[1][b].used && rf->bind[1][b].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+                            fetch = YES; fetchMax = (uint32_t)(b - 192);
+                        }
+                    }
+                    uint32_t na = fetch ? (fetchMax + 1u) : 1u;
+                    if (na > 8u) { free(rf); continue; }
+                    VkShaderModule fsMod = rdna4_spv_module(fsp.bytes, fsp.length, "gpl-prewarm", NULL);
+                    if (!fsMod) { free(rf); continue; }
+                    VkDescriptorSetLayout dsl1 = VK_NULL_HANDLE;
+                    RDNA4PB *pbF = NULL; uint32_t npbF = 0; BOOL pushF = NO;
+                    NSMutableArray *owned = [NSMutableArray array];
+                    if (rdna4_stage_dsl_ex(rf, 1, VK_SHADER_STAGE_FRAGMENT_BIT, meta, &dsl1, &pbF, &npbF, owned, YES, &pushF, NULL)) {
+                        VkAttachmentDescription ads[8];
+                        VkAttachmentReference refs[8];
+                        for (uint32_t a = 0; a < na; a++) {
+                            VkImageLayout lay = fetch ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                            ads[a] = (VkAttachmentDescription){
+                                .format = VK_FORMAT_B8G8R8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                                .initialLayout = lay, .finalLayout = lay };
+                            refs[a] = (VkAttachmentReference){ a, lay };
+                        }
+                        VkRenderPass rp = VK_NULL_HANDLE;
+                        if (fetch) rp = rdna4_mk_rp(ads, na, 0, YES);
+                        else {
+                            VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = na, .pColorAttachments = refs };
+                            VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na, .pAttachments = ads, .subpassCount = 1, .pSubpasses = &sp };
+                            if (vkCreateRenderPass(RDNA4R.dev, &rpc, NULL, &rp) != VK_SUCCESS) rp = VK_NULL_HANDLE;
+                        }
+                        VkDescriptorSetLayout sets[2] = { VK_NULL_HANDLE, dsl1 };
+                        VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, rf->pc_size };
+                        VkPipelineLayoutCreateInfo plci = {
+                            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                            .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT,
+                            .setLayoutCount = 2, .pSetLayouts = sets,
+                            .pushConstantRangeCount = rf->pc_size ? 1u : 0u, .pPushConstantRanges = rf->pc_size ? &pcr : NULL };
+                        VkPipelineLayout pl = VK_NULL_HANDLE;
+                        if (rp && vkCreatePipelineLayout(RDNA4R.dev, &plci, NULL, &pl) == VK_SUCCESS) {
+                            VkGraphicsPipelineLibraryCreateInfoEXT fsInfo = {
+                                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                                .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT };
+                            VkPipelineShaderStageCreateInfo fsSt = {
+                                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsMod, .pName = fep };
+                            VkPipelineMultisampleStateCreateInfo ms = {
+                                .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+                            VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+                            VkGraphicsPipelineCreateInfo gpc = {
+                                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &fsInfo,
+                                .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR,
+                                .stageCount = 1, .pStages = &fsSt, .pMultisampleState = &ms,
+                                .pDynamicState = &ds, .layout = pl, .renderPass = rp };
+                            VkPipeline lib = VK_NULL_HANDLE;
+                            uint64_t t0 = rdna4_now();
+                            VkResult pr = vkCreateGraphicsPipelines(RDNA4R.dev, RDNA4R.pc, 1, &gpc, NULL, &lib);
+                            uint64_t dt = rdna4_now() - t0;
+                            if (pr == VK_SUCCESS) {
+                                done++;
+                                if (dt >= 5000000ULL) { misses++; atomic_fetch_add(&rdna4_pipes_new, 1); }
+                                vkDestroyPipeline(RDNA4R.dev, lib, NULL);
+                            }
+                            vkDestroyPipelineLayout(RDNA4R.dev, pl, NULL);
+                        }
+                        if (rp) vkDestroyRenderPass(RDNA4R.dev, rp, NULL);
+                        if (dsl1) vkDestroyDescriptorSetLayout(RDNA4R.dev, dsl1, NULL);
+                        for (NSValue *v in owned) rdna4_destroy_sampler((VkSampler)v.pointerValue, NULL);
+                        free(pbF);
+                    }
+                    vkDestroyShaderModule(RDNA4R.dev, fsMod, NULL);
+                    free(rf);
+                }
+                RDNA4LOG("GPL prewarm: %u/4 giant fragment libraries ready in %.2f ms (cache misses=%u)",
+                         done, (double)(rdna4_now() - tStart) / 1e6, misses);
+                if (misses > 0) rdna4_pc_save("prewarm");
+            }
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4ComputePipelineState (11e R2): SPIR-V + meta sidecar from spvcache; ThreadsDynamic modules take the local size as spec ids 0..2.
 // ---------------------------------------------------------------------------------------------------------------
