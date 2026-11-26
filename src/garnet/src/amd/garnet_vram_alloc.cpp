@@ -209,7 +209,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
         const uint32_t h = lowest_free(s->boUsed, 1, RDNA4N_MAX_BOS - 1);
         if (h == 0) { rc = kIOReturnNoResources; break; }
         Bo b {};
-        b.uc = p.uc; b.size = p.size;
+        b.uc = p.uc; b.dcc = p.dcc && dcc_on(); b.size = p.size;
         uint32_t placed = RDNA4N_GEM_DOMAIN_GTT, bits = 0;
         if (p.kind == kPlaceVis) {
             // 0.0.627 (G2): non-WindowServer sessions together stay within the shared allowance (switch ON; always true with it OFF).
@@ -744,7 +744,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
                 const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
                 const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
                 r = scattered ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
-                              : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys), mem);
+                              : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem);
             }
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
@@ -776,7 +776,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
                 const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
                 const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
                 r = scattered ? pt_replace_pages_tx(s->rootPa, vaCanon, pages, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
-                              : pt_replace_tx(s->rootPa, vaCanon, pages, basePa, leaf_flags(vmf, b.uc, sys), mem);
+                              : pt_replace_tx(s->rootPa, vaCanon, pages, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem);
             }
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
@@ -834,6 +834,7 @@ IOReturn n1c_memory_for_handle(const N1cRef &ref, uint32_t handle, IOOptionBits 
     else {
         Bo &b = s->bo[handle];
         if (b.kind == kBoHi || b.kind == kBoHost) rc = kIOReturnNotPermitted;   // 0.0.612: a host import is already in the caller's own address space
+        else if (b.dcc) rc = kIOReturnNotPermitted;   // GFX12 DCC BOs are never CPU-mapped through raw BAR0
         else if (b.kind == kBoGtt) {
             b.gmd->retain();
             *memory = b.gmd;

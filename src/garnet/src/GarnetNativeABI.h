@@ -127,7 +127,7 @@ RDNA4N_STATIC_ASSERT(sizeof(struct rdna4n_buffer_op) == 48, "buffer op is 48 B")
 #define RDNA4N_GEM_PREEMPTIBLE         (1ull << 11)   /* refused */
 #define RDNA4N_GEM_DISCARDABLE         (1ull << 12)
 #define RDNA4N_GEM_UNCACHED            (1ull << 14)   /* forces MTYPE UC in the PTE */
-#define RDNA4N_GEM_GFX12_DCC           (1ull << 16)   /* ignored: no DCC PTE bit in S1c */
+#define RDNA4N_GEM_GFX12_DCC           (1ull << 16)   /* GFX12 DCC compression on NO_CPU_ACCESS VRAM BOs (sets AMDGPU_PTE_DCC when RDNA4N_CAP_GFX12_DCC is advertised) */
 #define RDNA4N_GEM_VIRTIO_SHARED       (1ull << 31)   /* Mesa-internal flag, ignored */
 
 #define RDNA4N_VA_OP_MAP        1u
@@ -217,6 +217,7 @@ struct rdna4n_info {                 /* 192 B */
 #define RDNA4N_INFO_NATIVE_BOOT   (1u << 2)
 #define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
 #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
+#define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
 /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
  *   reserved[3] = RDNA4N_BUDGET_* flags

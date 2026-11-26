@@ -59,12 +59,14 @@ static_assert(rdna4scan::kOk == (uint32_t)kIOReturnSuccess && rdna4scan::kBadArg
               "the scanout pure header's codes are the IOReturn.h values");
 static_assert(PTEFlags::PRT_GFX12 == kPtePrt && PTEFlags::PRT_LEAF == kPtePrtLeaf && (PTEFlags::PRT_LEAF & PTEFlags::VALID) == 0ULL,
               "GFX12 PRT PTE encoding matches Linux amdgpu_vm.h/gmc_v12_0.c");
+static_assert(PTEFlags::DCC_GFX12 == kPteDcc, "GFX12 DCC PTE bit 58 matches Linux amdgpu_vm.h");
 
 // ---- state --------------------------------------------------------------------------------------------------------------------
 enum : uint8_t { kBoNone = 0, kBoVis = 1, kBoHi = 2, kBoGtt = 3, kBoHost = 4 };   // kBoHost: 0.0.612, an import of the caller's memory (hmd / hpages)
 struct Bo {
     uint8_t   kind;
     bool      uc;          // created UNCACHED
+    bool      dcc;         // GFX12 AMDGPU_PTE_DCC (NO_CPU_ACCESS VRAM BO with RDNA4N_GEM_GFX12_DCC when dcc_on())
     uint64_t  size;        // 4 KiB rounded (what the caller asked for)
     uint64_t  mc;          // VRAM MC address (vis / hi)
     VRAMAllocation a;      // vis / hi
@@ -180,6 +182,7 @@ uint64_t now_ns();
 bool vmid_fence_reached(void *, uint32_t, uint64_t seq);
 bool multi_on();
 bool apps_on();
+bool dcc_on();
 uint64_t appvis_cap();
 bool g1_holds();
 Session *sess_lock(const N1cRef &r, bool needHello);

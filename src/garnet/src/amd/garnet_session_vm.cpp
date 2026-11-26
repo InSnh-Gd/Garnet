@@ -478,7 +478,7 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
     const IPVersion v = c.dev->ip.getVersion(IPBlock::GC);
     const uint64_t em = emitted_now();
     o->abi_version = RDNA4N_ABI_VERSION; o->kext_build = kN1cKextBuild;
-    o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
+    o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u) | (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
     o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));

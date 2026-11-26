@@ -87,11 +87,13 @@ constexpr uint64_t kPteRead      = 1ull << 5;
 constexpr uint64_t kPteWrite     = 1ull << 6;
 constexpr uint64_t kPteMtypeUC   = 2ull << 54;
 constexpr uint64_t kPtePrt       = 1ull << 56;       // AMDGPU_PTE_PRT_GFX12 (amdgpu_vm.h)
+constexpr uint64_t kPteDcc       = 1ull << 58;       // AMDGPU_PTE_DCC (GFX12 amdgpu_vm.h)
 constexpr uint64_t kPteIsPte     = 1ull << 63;       // AMDGPU_PDE_PTE_GFX12 / AMDGPU_PTE_IS_PTE
 constexpr uint64_t kPtePrtLeaf   = kPtePrt | kPteSnooped | kPteSystem | kPteIsPte;   // gmc_v12_0_get_vm_pte: PRT | SNOOPED | SYSTEM | IS_PTE, VALID clear
 static_assert((kPtePrtLeaf & kPteValid) == 0ull, "GFX12 PRT leaf clears VALID");
 constexpr uint64_t kPtePaMask    = 0x0000FFFFFFFFF000ull;   // pte_addr_mask for GC 12.0.1
 static_assert((kPtePrtLeaf & kPtePaMask) == 0ull, "GFX12 PRT leaf carries zero PA");
+static_assert((kPteDcc & (kPtePaMask | kPtePrt | kPteMtypeUC | kPteIsPte)) == 0ull, "GFX12 DCC bit 58 is disjoint from PA/PRT/MTYPE/IS_PTE");
 constexpr uint64_t kPdeAddrMask  = 0x0000FFFFFFFFF000ull;   // we only place tables on 4 KiB boundaries (the field is 47:6)
 // The flags RADV gives every BO (AMDGPU_VM_PAGE_READABLE | WRITEABLE | EXECUTABLE) on local VRAM, as vmfrag_leaf: UC memory type.
 constexpr uint64_t kPteFlagsRwx  = kPteExec | kPteRead | kPteWrite | kPteValid | kPteMtypeUC;

@@ -53,7 +53,9 @@ constexpr bool would_exceed(uint64_t used, uint64_t add, uint64_t cap) { return 
 
 // ---- BoCreate placement -----------------------------------------------------------------------------------------------------
 enum PlaceKind : uint32_t { kPlaceNone = 0, kPlaceVis = 1, kPlaceGtt = 2 };
-struct Place { uint32_t rc; uint32_t kind; uint64_t size; uint64_t align; bool uc; bool hiOk; };
+struct Place { uint32_t rc; uint32_t kind; uint64_t size; uint64_t align; bool uc; bool hiOk; bool dcc; };
+// Kill-switch boot-arg `garnet-dcc=0`: default ON when absent or nonzero.
+constexpr bool dcc_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
 constexpr uint64_t kGemAccepted = RDNA4N_GEM_CPU_ACCESS_REQUIRED | RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_CPU_GTT_USWC | RDNA4N_GEM_VRAM_CLEARED |
     RDNA4N_GEM_VRAM_CONTIGUOUS | RDNA4N_GEM_VM_ALWAYS_VALID | RDNA4N_GEM_EXPLICIT_SYNC | RDNA4N_GEM_DISCARDABLE | RDNA4N_GEM_UNCACHED |
     RDNA4N_GEM_GFX12_DCC | RDNA4N_GEM_VIRTIO_SHARED;
@@ -61,16 +63,19 @@ constexpr bool pow2(uint64_t v) { return v != 0ull && (v & (v - 1ull)) == 0ull; 
 // The contract's S1c policy. Malformed sizes/alignments are BadArg; a well-formed request S1c does not implement (a CPU/GDS/GWS/OA/
 // DOORBELL domain, no domain, an unlisted/refused GEM flag) is Unsupported. Anything containing VRAM goes to the visible pool first.
 constexpr Place place_decide(uint64_t boSize, uint64_t alignment, uint64_t domains, uint64_t flags) {
-    if (boSize == 0ull || boSize > kMaxBoBytes) return Place{ kBadArg, kPlaceNone, 0, 0, false, false };
-    if (alignment != 0ull && (!pow2(alignment) || alignment > kMaxAlign)) return Place{ kBadArg, kPlaceNone, 0, 0, false, false };
+    if (boSize == 0ull || boSize > kMaxBoBytes) return Place{ kBadArg, kPlaceNone, 0, 0, false, false, false };
+    if (alignment != 0ull && (!pow2(alignment) || alignment > kMaxAlign)) return Place{ kBadArg, kPlaceNone, 0, 0, false, false, false };
     const uint64_t size = (boSize + kPage - 1ull) & ~(kPage - 1ull);
     const uint64_t align = alignment < kPage ? kPage : alignment;
     if (domains == 0ull || (domains & ~(uint64_t)(RDNA4N_GEM_DOMAIN_GTT | RDNA4N_GEM_DOMAIN_VRAM)) != 0ull)
-        return Place{ kUnsupported, kPlaceNone, size, align, false, false };
-    if ((flags & ~kGemAccepted) != 0ull) return Place{ kUnsupported, kPlaceNone, size, align, false, false };
+        return Place{ kUnsupported, kPlaceNone, size, align, false, false, false };
+    if ((flags & ~kGemAccepted) != 0ull) return Place{ kUnsupported, kPlaceNone, size, align, false, false, false };
+    const bool uc = (flags & RDNA4N_GEM_UNCACHED) != 0ull;
     const bool hiOk = (flags & RDNA4N_GEM_NO_CPU_ACCESS) != 0ull && (flags & RDNA4N_GEM_CPU_ACCESS_REQUIRED) == 0ull;
-    return Place{ kOk, (domains & RDNA4N_GEM_DOMAIN_VRAM) ? (uint32_t)kPlaceVis : (uint32_t)kPlaceGtt, size, align,
-                  (flags & RDNA4N_GEM_UNCACHED) != 0ull, hiOk };
+    const bool isVram = (domains & RDNA4N_GEM_DOMAIN_VRAM) != 0ull;
+    // GFX12 DCC is valid only for non-CPU-accessible, non-uncached VRAM allocations.
+    const bool dcc = isVram && !uc && hiOk && (flags & RDNA4N_GEM_GFX12_DCC) != 0ull;
+    return Place{ kOk, isVram ? (uint32_t)kPlaceVis : (uint32_t)kPlaceGtt, size, align, uc, hiOk, dcc };
 }
 
 // ---- GemVa ------------------------------------------------------------------------------------------------------------------
@@ -118,12 +123,15 @@ constexpr bool range_in_bo(uint64_t off, uint64_t size, uint64_t boSize) { retur
 // The leaf flags of a mapping (pte_encode adds IS_PTE):
 //   - PRT (RDNA4N_VM_PAGE_PRT): AMDGPU_PTE_PRT_GFX12 (1<<56) | SNOOPED | SYSTEM (VALID cleared; pte_encode sets IS_PTE).
 //   - BO: READ/WRITE/EXEC from the vm flags, MTYPE UC when the vm flags say UC or the BO was created UNCACHED
-//         (upstream gmc_v12_0_get_vm_pte), every other MTYPE = NC = 0; a GTT/host page adds SYSTEM|SNOOPED.
-constexpr uint64_t leaf_flags(uint32_t vmflags, bool boUncached, bool system) {
+//         (upstream gmc_v12_0_get_vm_pte), every other MTYPE = NC = 0; GFX12 DCC (bit 58) for non-UC VRAM BOs
+//         with boDcc; a GTT/host page adds SYSTEM|SNOOPED (never DCC).
+constexpr uint64_t leaf_flags(uint32_t vmflags, bool boUncached, bool system, bool boDcc = false) {
     if ((vmflags & RDNA4N_VM_PAGE_PRT) != 0u) return kPtePrt | kPteSnooped | kPteSystem;
+    const bool uc = (vmflags & RDNA4N_VM_MTYPE_MASK) == RDNA4N_VM_MTYPE_UC || boUncached;
     return kPteValid | ((vmflags & RDNA4N_VM_PAGE_READABLE) ? kPteRead : 0ull) | ((vmflags & RDNA4N_VM_PAGE_WRITEABLE) ? kPteWrite : 0ull) |
            ((vmflags & RDNA4N_VM_PAGE_EXECUTABLE) ? kPteExec : 0ull) |
-           (((vmflags & RDNA4N_VM_MTYPE_MASK) == RDNA4N_VM_MTYPE_UC || boUncached) ? kPteMtypeUC : 0ull) |
+           (uc ? kPteMtypeUC : 0ull) |
+           ((!system && !uc && boDcc) ? kPteDcc : 0ull) |
            (system ? (kPteSystem | kPteSnooped) : 0ull);
 }
 // The flags the S1d recording carries: 0xe (R|W|X, MTYPE 0 -> NC), 0xa (R|X, NC), 0x8a (R|X, MTYPE 4 = UC).
@@ -132,8 +140,12 @@ static_assert(leaf_flags(0xa, false, false) == (kPteValid | kPteRead | kPteExec)
 static_assert(leaf_flags(0x8a, false, false) == (kPteValid | kPteRead | kPteExec | kPteMtypeUC), "0x8a = R|X|UC");
 static_assert(leaf_flags(0xe, false, true) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteSystem | kPteSnooped), "GTT adds SYSTEM|SNOOPED");
 static_assert(leaf_flags(0xe, true, false) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteMtypeUC), "BO UNCACHED forces UC");
+static_assert(leaf_flags(0xe, false, false, true) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteDcc), "VRAM non-UC DCC sets AMDGPU_PTE_DCC");
+static_assert(leaf_flags(0xe, false, true, true) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteSystem | kPteSnooped), "GTT never sets DCC");
+static_assert(leaf_flags(0xe, true, false, true) == (kPteValid | kPteRead | kPteWrite | kPteExec | kPteMtypeUC), "BO UNCACHED suppresses DCC");
+static_assert(leaf_flags(0x8a, false, false, true) == (kPteValid | kPteRead | kPteExec | kPteMtypeUC), "VM MTYPE_UC suppresses DCC");
 static_assert(pte_encode(0ull, leaf_flags(RDNA4N_VM_PAGE_PRT, false, false)) == kPtePrtLeaf, "PRT leaf = bit56 | SNOOPED | SYSTEM | IS_PTE, VALID clear");
-static_assert(pte_encode(0ull, leaf_flags(RDNA4N_VM_PAGE_PRT | 0xeu, true, true)) == kPtePrtLeaf, "PRT overrides BO/RWX/VALID bits");
+static_assert(pte_encode(0ull, leaf_flags(RDNA4N_VM_PAGE_PRT | 0xeu, true, true, true)) == kPtePrtLeaf, "PRT overrides BO/DCC/RWX/VALID bits");
 
 // ---- the VA map ---------------------------------------------------------------------------------------------------------------
 struct VaEnt { uint64_t start; uint64_t size; uint64_t off; uint32_t handle; uint32_t flags; };   // stripped start; size 0 = free slot

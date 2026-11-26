@@ -698,14 +698,48 @@ static void u12_pins(const std::string &root) {
     expect(mk.find("src/GarnetNativeClient.cpp") != std::string::npos, "the Makefile builds the client");
     expect(garnet_test_ver::plist_matches_version(root, plist) && garnet_test_ver::all_match(root), "Info.plist and version sources match VERSION");
     expect(pure.find("kWbOffsetNativeSeq = 0x0C0u") != std::string::npos, "the native seqno slot offset");
+    // Wave 11: GFX12 PTE.DCC capability, boot-arg kill-switch, and VRAM leaf propagation
+    expect(abi.find("#define RDNA4N_CAP_GFX12_DCC      (1u << 5)") != std::string::npos, "GarnetNativeABI.h defines RDNA4N_CAP_GFX12_DCC");
+    expect(eng.find("dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u") != std::string::npos, "n1c_query_info gates RDNA4N_CAP_GFX12_DCC on dcc_on()");
+    expect(eng.find("PE_parse_boot_argn(\"garnet-dcc\"") != std::string::npos, "garnet-dcc boot-arg kill-switch exists");
+    expect(eng.find("else if (b.dcc) rc = kIOReturnNotPermitted;") != std::string::npos, "GFX12 DCC BOs refuse raw BAR0 CPU mapping");
     // banned strings in the new files
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens
     for (const std::string *f : { &eng, &cli, &pure, &abi }) expect(f->find(bad1) == std::string::npos && f->find(bad2) == std::string::npos && f->find(bad3) == std::string::npos, "no banned pipe offsets in the new files");
 }
 
+static void u14_gfx12_dcc() {
+    expect(dcc_boot_enabled(false, 0u), "absent garnet-dcc defaults ON");
+    expect(dcc_boot_enabled(true, 1u), "garnet-dcc=1 enables DCC");
+    expect(!dcc_boot_enabled(true, 0u), "garnet-dcc=0 disables DCC");
+
+    const Place pDcc = place_decide(0x10000, 0x1000, RDNA4N_GEM_DOMAIN_VRAM, RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_GFX12_DCC);
+    expect(pDcc.rc == kOk && pDcc.kind == kPlaceVis && pDcc.hiOk && pDcc.dcc, "VRAM NO_CPU_ACCESS + GFX12_DCC enables Place::dcc");
+    const Place pCpuDcc = place_decide(0x10000, 0x1000, RDNA4N_GEM_DOMAIN_VRAM, RDNA4N_GEM_CPU_ACCESS_REQUIRED | RDNA4N_GEM_GFX12_DCC);
+    expect(pCpuDcc.rc == kOk && !pCpuDcc.dcc, "CPU_ACCESS_REQUIRED suppresses Place::dcc");
+    const Place pUcDcc = place_decide(0x10000, 0x1000, RDNA4N_GEM_DOMAIN_VRAM, RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_UNCACHED | RDNA4N_GEM_GFX12_DCC);
+    expect(pUcDcc.rc == kOk && !pUcDcc.dcc, "UNCACHED suppresses Place::dcc");
+    const Place pGttDcc = place_decide(0x10000, 0x1000, RDNA4N_GEM_DOMAIN_GTT, RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_GFX12_DCC);
+    expect(pGttDcc.rc == kOk && pGttDcc.kind == kPlaceGtt && !pGttDcc.dcc, "GTT never enables Place::dcc");
+
+    // Verify pt_map encodes AMDGPU_PTE_DCC (bit 58) on VRAM DCC leaves without clobbering PA or IS_PTE.
+    TestMem mem;
+    const uint64_t root = mem.alloc_page();
+    const uint64_t pa = 0x200000000ull;
+    const uint64_t va = 0x200000ull;
+    const uint64_t lf = leaf_flags(RDNA4N_VM_PAGE_READABLE | RDNA4N_VM_PAGE_WRITEABLE, false, false, true);
+    expect_u("pt_map VRAM DCC leaf", pt_map(root, va, 2, pa, lf, mem), kOk);
+    const uint64_t pte0 = pt_walk(root, va, mem);
+    const uint64_t pte1 = pt_walk(root, va + kPage, mem);
+    expect((pte0 & kPteDcc) != 0ull && (pte0 & kPteIsPte) != 0ull && (pte0 & kPteValid) != 0ull && entry_pa(pte0) == pa,
+           "page 0 PTE carries bit 58 (DCC), bit 63 (IS_PTE), VALID, and exact PA");
+    expect((pte1 & kPteDcc) != 0ull && entry_pa(pte1) == pa + kPage,
+           "page 1 PTE carries bit 58 (DCC) and PA + 4 KiB");
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
-    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u12_pins(root);
+    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u14_gfx12_dcc(); u12_pins(root);
     std::printf("native_s1c_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

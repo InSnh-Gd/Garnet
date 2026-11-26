@@ -402,7 +402,7 @@ static void h5_pins(const std::string &root) {
     expect(fn_body(eng, "IOReturn n1c_memory_for_handle(").find("if (b.kind == kBoHi || b.kind == kBoHost) rc = kIOReturnNotPermitted;") != std::string::npos, "a host BO is never CPU-mapped by clientMemoryForType (it would map bogus VRAM)");
     // GemVa
     const std::string gv = fn_body(eng, "IOReturn n1c_gem_va(");
-    expect(gv.find("pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)") != std::string::npos && gv.find("pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys), mem);") != std::string::npos,
+    expect(gv.find("pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)") != std::string::npos && gv.find("pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem);") != std::string::npos,
            "GemVa MAP of a host or non-contiguous GTT BO maps the slice of its scattered page list via tx; VRAM BOs still go through pt_map_tx (canonicalized, strict check kept)");
     expect(gv.find("const bool scattered = host || b.kind == kBoGtt;") != std::string::npos && gv.find("const bool sys = scattered;") != std::string::npos, "a host BO is SYSTEM|SNOOPED like a GTT BO");
     // the Bo record and the session

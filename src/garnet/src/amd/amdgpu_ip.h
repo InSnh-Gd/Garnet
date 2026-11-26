@@ -295,6 +295,7 @@ namespace PTEFlags {
     // GFX12 / RDNA4 PRT leaf bit: AMDGPU_PTE_PRT_GFX12 (amdgpu_vm.h).
     // gmc_v12_0_get_vm_pte sets PRT_GFX12 | SNOOPED | SYSTEM | IS_PTE and clears VALID.
     constexpr uint64_t PRT_GFX12 = (1ULL << 56);
+    constexpr uint64_t DCC_GFX12 = (1ULL << 58);  // AMDGPU_PTE_DCC (GFX12 amdgpu_vm.h)
     constexpr uint64_t PRT_LEAF  = PRT_GFX12 | SNOOPED | SYSTEM | IS_PTE;
     static_assert((PRT_LEAF & VALID) == 0ULL, "GFX12 PRT leaf clears VALID");
     // Standard sysmem mapping for PSP-readable buffers. Adds IS_PTE
