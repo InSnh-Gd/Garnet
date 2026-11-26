@@ -40,6 +40,30 @@
 #ifndef GARNETX_CAP_RT_IFT_ABI_V2
 #define GARNETX_CAP_RT_IFT_ABI_V2           (1u << 10)
 #endif
+#ifndef GARNETX_CAP_RT_PRIMITIVE_DATA
+#define GARNETX_CAP_RT_PRIMITIVE_DATA       (1u << 11)
+#endif
+
+// Exact Wave 4.1 RT primitiveDataBuffer lookup table ABI (shared bit-for-bit with garnetxlate).
+#define RDNA4RT_PRIM_DATA_BINDING            UINT32_C(676)
+#define RDNA4RT_PRIM_DATA_STAGE_TABLE_BYTES  UINT32_C(264)
+#define RDNA4RT_PRIM_TABLE_CAP               UINT32_C(4096)
+#define RDNA4RT_PRIM_TABLE_MASK              UINT32_C(4095)
+#define RDNA4RT_PRIM_TABLE_MAX_PROBE         UINT32_C(32)
+#define RDNA4RT_PRIM_TABLE_BYTES             ((size_t)RDNA4RT_PRIM_TABLE_CAP * 32u)
+#define RDNA4RT_PRIM_HASH_MULT               UINT64_C(0x61C8864680B583EB)
+#define RDNA4RT_PRIM_SLOT_EMPTY              UINT64_C(0)
+#define RDNA4RT_PRIM_SLOT_TOMBSTONE          UINT64_C(1)
+#define RDNA4RT_PRIM_KIND_BLAS               UINT32_C(0)
+#define RDNA4RT_PRIM_KIND_TLAS               UINT32_C(1)
+#define RDNA4RT_PRIM_TLAS_ENTRY_STRIDE       UINT32_C(64)
+#define RDNA4RT_PRIM_TLAS_REF_OFFSET         UINT32_C(56)
+
+_Static_assert(RDNA4RT_PRIM_HASH_MULT == UINT64_C(7046029254386353131),
+               "RT prim hash multiplier must match garnetxlate decimal constant");
+_Static_assert((RDNA4RT_PRIM_TABLE_CAP & (RDNA4RT_PRIM_TABLE_CAP - 1u)) == 0u &&
+               RDNA4RT_PRIM_TABLE_MASK == RDNA4RT_PRIM_TABLE_CAP - 1u,
+               "RT prim table capacity must be power-of-two");
 
 // Exact 0077 / Wave 2 IFT buffer ABI constants:
 //   ABI v1: word[0]=slot_count, word[1+slot]=handle_id
@@ -1547,6 +1571,237 @@ static inline int rdna4rtr_arg_kind_is_rt(rdna4rtr_arg_kind_t k) {
     return k == RDNA4RTR_ARG_KIND_PRIMITIVE_AS ||
            k == RDNA4RTR_ARG_KIND_INSTANCE_AS ||
            k == RDNA4RTR_ARG_KIND_IFT;
+}
+
+// =================================================================================================
+// 8. Wave 4.1 RT Per-Primitive Data Lookup Table ABI (Binding 676 + Device-Wide Open-Address Hash)
+// =================================================================================================
+
+typedef struct {
+    uint64_t global_table_bda;
+    uint64_t table_mask;
+    uint64_t slot_as_bda[RDNA4RTR_MAX_BUFFER_SLOTS];
+} rdna4rt_stage_prim_table_t;
+
+typedef struct {
+    uint64_t as_bda;       // 0 = empty, 1 = tombstone, else 256B-aligned VkDeviceAddress
+    uint64_t payload_bda;  // BLAS: geom_table_bda; TLAS: VkAccelerationStructureInstanceKHR[] snapshot BDA
+    uint32_t count;        // BLAS: geomCount; TLAS: instanceCount
+    uint32_t entry_stride; // BLAS: 0; TLAS: 64
+    uint32_t ref_offset;   // BLAS: 0; TLAS: 56
+    uint32_t kind;         // 0 = BLAS, 1 = TLAS
+} rdna4rt_prim_slot_t;
+
+#ifndef RDNA4RT_GEOM_PRIM_ENTRY_DEFINED
+#define RDNA4RT_GEOM_PRIM_ENTRY_DEFINED 1
+typedef struct {
+    uint64_t data_bda;
+    uint32_t stride;
+    uint32_t prim_count;
+} rdna4rt_geom_prim_entry_t;
+#endif
+
+_Static_assert(sizeof(rdna4rt_stage_prim_table_t) == RDNA4RT_PRIM_DATA_STAGE_TABLE_BYTES,
+               "rdna4rt_stage_prim_table_t must be 264 bytes");
+_Static_assert(offsetof(rdna4rt_stage_prim_table_t, global_table_bda) == 0u,
+               "stage prim table global_table_bda offset");
+_Static_assert(offsetof(rdna4rt_stage_prim_table_t, table_mask) == 8u,
+               "stage prim table table_mask offset");
+_Static_assert(offsetof(rdna4rt_stage_prim_table_t, slot_as_bda) == 16u,
+               "stage prim table slot_as_bda offset");
+_Static_assert(sizeof(rdna4rt_prim_slot_t) == 32u, "rdna4rt_prim_slot_t must be 32 bytes");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, as_bda) == 0u, "prim slot as_bda offset");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, payload_bda) == 8u, "prim slot payload_bda offset");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, count) == 16u, "prim slot count offset");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, entry_stride) == 20u, "prim slot entry_stride offset");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, ref_offset) == 24u, "prim slot ref_offset offset");
+_Static_assert(offsetof(rdna4rt_prim_slot_t, kind) == 28u, "prim slot kind offset");
+_Static_assert(sizeof(rdna4rt_geom_prim_entry_t) == 16u, "rdna4rt_geom_prim_entry_t must be 16 bytes");
+_Static_assert(offsetof(rdna4rt_geom_prim_entry_t, data_bda) == 0u, "geom prim entry data_bda offset");
+_Static_assert(offsetof(rdna4rt_geom_prim_entry_t, stride) == 8u, "geom prim entry stride offset");
+_Static_assert(offsetof(rdna4rt_geom_prim_entry_t, prim_count) == 12u, "geom prim entry prim_count offset");
+
+#ifdef VK_KHR_acceleration_structure
+_Static_assert(RDNA4RT_PRIM_TLAS_ENTRY_STRIDE == sizeof(VkAccelerationStructureInstanceKHR),
+               "TLAS prim table entry_stride must equal sizeof(VkAccelerationStructureInstanceKHR)");
+_Static_assert(RDNA4RT_PRIM_TLAS_REF_OFFSET == offsetof(VkAccelerationStructureInstanceKHR, accelerationStructureReference),
+               "TLAS prim table ref_offset must equal offsetof(accelerationStructureReference)");
+#endif
+
+static inline uint32_t rdna4rt_prim_hash_slot(uint64_t key, uint32_t mask) {
+    uint64_t h = (key >> 8) * RDNA4RT_PRIM_HASH_MULT;
+    h ^= (h >> 32);
+    return (uint32_t)h & mask;
+}
+
+static inline void rdna4rt_stage_prim_table_init(rdna4rt_stage_prim_table_t *t,
+                                                 uint64_t global_table_bda,
+                                                 uint64_t table_mask) {
+    if (!t) return;
+    memset(t, 0, sizeof *t);
+    t->global_table_bda = global_table_bda;
+    t->table_mask = table_mask;
+}
+
+// Inserts or updates `as_bda` in a power-of-two open-addressed hash table (caller holds CPU mutex).
+// Writes payload fields before atomic-release storing `as_bda` so lock-free GPU readers never see torn state.
+// Reuses the first tombstone encountered ONLY after confirming `as_bda` does not appear later in the chain.
+// Optionally reports the chosen `slot_idx_out` and whether that slot transitioned from EMPTY (0) (`was_empty_out`).
+static inline rdna4rtr_status_t rdna4rt_prim_table_upsert_slot(
+    rdna4rt_prim_slot_t *slots,
+    uint32_t cap,
+    uint64_t as_bda,
+    uint64_t payload_bda,
+    uint32_t count,
+    uint32_t entry_stride,
+    uint32_t ref_offset,
+    uint32_t kind,
+    uint32_t *slot_idx_out,
+    int *was_empty_out) {
+    if (!slots || cap < 2u || (cap & (cap - 1u)) != 0u) return RDNA4RTR_ERR_INVALID;
+    if (as_bda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return RDNA4RTR_ERR_INVALID;
+    if (kind != RDNA4RT_PRIM_KIND_BLAS && kind != RDNA4RT_PRIM_KIND_TLAS) return RDNA4RTR_ERR_INVALID;
+
+    const uint32_t mask = cap - 1u;
+    const uint32_t start = rdna4rt_prim_hash_slot(as_bda, mask);
+    const uint32_t limit = cap < RDNA4RT_PRIM_TABLE_MAX_PROBE ? cap : RDNA4RT_PRIM_TABLE_MAX_PROBE;
+    uint32_t first_tomb = UINT32_MAX;
+    uint32_t target = UINT32_MAX;
+    int target_was_empty = 0;
+
+    for (uint32_t p = 0u; p < limit; p++) {
+        const uint32_t idx = (start + p) & mask;
+        const uint64_t cur = __atomic_load_n(&slots[idx].as_bda, __ATOMIC_ACQUIRE);
+        if (cur == as_bda) {
+            target = idx;
+            target_was_empty = 0;
+            break;
+        }
+        if (cur == RDNA4RT_PRIM_SLOT_TOMBSTONE) {
+            if (first_tomb == UINT32_MAX) first_tomb = idx;
+            continue;
+        }
+        if (cur == RDNA4RT_PRIM_SLOT_EMPTY) {
+            if (first_tomb != UINT32_MAX) {
+                target = first_tomb;
+                target_was_empty = 0;
+            } else {
+                target = idx;
+                target_was_empty = 1;
+            }
+            break;
+        }
+    }
+    if (target == UINT32_MAX) {
+        if (first_tomb != UINT32_MAX) {
+            target = first_tomb;
+            target_was_empty = 0;
+        } else {
+            return RDNA4RTR_ERR_BOUNDS;
+        }
+    }
+
+    __atomic_store_n(&slots[target].payload_bda, payload_bda, __ATOMIC_RELAXED);
+    __atomic_store_n(&slots[target].count, count, __ATOMIC_RELAXED);
+    __atomic_store_n(&slots[target].entry_stride, entry_stride, __ATOMIC_RELAXED);
+    __atomic_store_n(&slots[target].ref_offset, ref_offset, __ATOMIC_RELAXED);
+    __atomic_store_n(&slots[target].kind, kind, __ATOMIC_RELAXED);
+    __atomic_store_n(&slots[target].as_bda, as_bda, __ATOMIC_RELEASE);
+    if (slot_idx_out) *slot_idx_out = target;
+    if (was_empty_out) *was_empty_out = target_was_empty;
+    return RDNA4RTR_OK;
+}
+
+static inline rdna4rtr_status_t rdna4rt_prim_table_upsert(
+    rdna4rt_prim_slot_t *slots,
+    uint32_t cap,
+    uint64_t as_bda,
+    uint64_t payload_bda,
+    uint32_t count,
+    uint32_t entry_stride,
+    uint32_t ref_offset,
+    uint32_t kind) {
+    return rdna4rt_prim_table_upsert_slot(
+        slots, cap, as_bda, payload_bda, count, entry_stride, ref_offset, kind, NULL, NULL);
+}
+
+// Marks `as_bda` as a tombstone (1) via atomic release. When `expected_payload_bda != 0`, only
+// tombstones if the slot's current `payload_bda` matches (safe under MTLHeap placement aliasing
+// where a newer AS already re-registered the same BDA before the old AS's dealloc runs).
+// Returns 1 if removed (storing the slot index in `slot_idx_out` if non-NULL), 0 otherwise.
+static inline int rdna4rt_prim_table_remove_if_match_slot(
+    rdna4rt_prim_slot_t *slots,
+    uint32_t cap,
+    uint64_t as_bda,
+    uint64_t expected_payload_bda,
+    uint32_t *slot_idx_out) {
+    if (!slots || cap < 2u || (cap & (cap - 1u)) != 0u) return 0;
+    if (as_bda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return 0;
+
+    const uint32_t mask = cap - 1u;
+    const uint32_t start = rdna4rt_prim_hash_slot(as_bda, mask);
+    const uint32_t limit = cap < RDNA4RT_PRIM_TABLE_MAX_PROBE ? cap : RDNA4RT_PRIM_TABLE_MAX_PROBE;
+
+    for (uint32_t p = 0u; p < limit; p++) {
+        const uint32_t idx = (start + p) & mask;
+        const uint64_t cur = __atomic_load_n(&slots[idx].as_bda, __ATOMIC_ACQUIRE);
+        if (cur == RDNA4RT_PRIM_SLOT_EMPTY) return 0;
+        if (cur == as_bda) {
+            if (expected_payload_bda != 0u) {
+                const uint64_t cur_payload = __atomic_load_n(&slots[idx].payload_bda, __ATOMIC_RELAXED);
+                if (cur_payload != expected_payload_bda) return 0;
+            }
+            __atomic_store_n(&slots[idx].as_bda, RDNA4RT_PRIM_SLOT_TOMBSTONE, __ATOMIC_RELEASE);
+            if (slot_idx_out) *slot_idx_out = idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline int rdna4rt_prim_table_remove_if_match(
+    rdna4rt_prim_slot_t *slots,
+    uint32_t cap,
+    uint64_t as_bda,
+    uint64_t expected_payload_bda) {
+    return rdna4rt_prim_table_remove_if_match_slot(slots, cap, as_bda, expected_payload_bda, NULL);
+}
+
+static inline int rdna4rt_prim_table_remove(
+    rdna4rt_prim_slot_t *slots, uint32_t cap, uint64_t as_bda) {
+    return rdna4rt_prim_table_remove_if_match(slots, cap, as_bda, 0u);
+}
+
+// Lock-free reader mirror of GPU `@__m2v.rq.query.lookup_prim_data` hash probe.
+static inline int rdna4rt_prim_table_lookup(
+    const rdna4rt_prim_slot_t *slots,
+    uint32_t cap,
+    uint64_t as_bda,
+    rdna4rt_prim_slot_t *out) {
+    if (!slots || cap < 2u || (cap & (cap - 1u)) != 0u) return 0;
+    if (as_bda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return 0;
+
+    const uint32_t mask = cap - 1u;
+    const uint32_t start = rdna4rt_prim_hash_slot(as_bda, mask);
+    const uint32_t limit = cap < RDNA4RT_PRIM_TABLE_MAX_PROBE ? cap : RDNA4RT_PRIM_TABLE_MAX_PROBE;
+
+    for (uint32_t p = 0u; p < limit; p++) {
+        const uint32_t idx = (start + p) & mask;
+        const uint64_t cur = __atomic_load_n(&slots[idx].as_bda, __ATOMIC_ACQUIRE);
+        if (cur == RDNA4RT_PRIM_SLOT_EMPTY) return 0;
+        if (cur == as_bda) {
+            if (out) {
+                out->as_bda = cur;
+                out->payload_bda = __atomic_load_n(&slots[idx].payload_bda, __ATOMIC_RELAXED);
+                out->count = __atomic_load_n(&slots[idx].count, __ATOMIC_RELAXED);
+                out->entry_stride = __atomic_load_n(&slots[idx].entry_stride, __ATOMIC_RELAXED);
+                out->ref_offset = __atomic_load_n(&slots[idx].ref_offset, __ATOMIC_RELAXED);
+                out->kind = __atomic_load_n(&slots[idx].kind, __ATOMIC_RELAXED);
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 #endif // RDNA4_RT_RUNTIME_H

@@ -23,6 +23,10 @@
 #define RDNA4RT_STAGING_POOL_MIN_BUCKET     UINT64_C(4096)
 #define RDNA4RT_STAGING_POOL_MAX_BUCKET     (UINT64_C(64) << 20)
 #define RDNA4RT_STAGING_POOL_MAX_SLABS      32u
+#define RDNA4RT_PRIM_POOL_MIN_BUCKET        RDNA4RT_STAGING_POOL_MIN_BUCKET
+#define RDNA4RT_PRIM_POOL_MAX_BUCKET        RDNA4RT_STAGING_POOL_MAX_BUCKET
+#define RDNA4RT_PRIM_POOL_MAX_SLABS         RDNA4RT_STAGING_POOL_MAX_SLABS
+#define RDNA4RT_QUERY_POOL_MAX_FREE         8u
 #define RDNA4RT_INSTANCE_CUSTOM_INDEX_MAX   UINT32_C(0x00FFFFFF)
 #define RDNA4RT_INSTANCE_SBT_OFFSET_MAX     UINT32_C(0x00FFFFFF)
 
@@ -986,21 +990,23 @@ static inline rdna4rt_barrier_spec_t rdna4rt_barrier_spec(rdna4rt_barrier_kind_t
     case RDNA4RT_BARRIER_PRE_BUILD:
         s.src_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_TRANSFER | RDNA4RT_VK_STAGE_AS_BUILD |
                       (is_compute_queue ? 0u : RDNA4RT_VK_STAGE_ALL_GRAPHICS);
-        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_COMPUTE_SHADER;
+        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_TRANSFER;
         s.src_access = RDNA4RT_VK_ACCESS_SHADER_WRITE | RDNA4RT_VK_ACCESS_TRANSFER_WRITE | RDNA4RT_VK_ACCESS_AS_WRITE;
-        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE;
+        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE |
+                       RDNA4RT_VK_ACCESS_TRANSFER_READ | RDNA4RT_VK_ACCESS_TRANSFER_WRITE;
         break;
     case RDNA4RT_BARRIER_COMP_TO_BUILD:
         s.src_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER;
-        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD;
+        s.dst_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER;
         s.src_access = RDNA4RT_VK_ACCESS_SHADER_WRITE;
-        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ;
+        s.dst_access = RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_AS_READ |
+                       RDNA4RT_VK_ACCESS_TRANSFER_READ | RDNA4RT_VK_ACCESS_TRANSFER_WRITE;
         break;
     case RDNA4RT_BARRIER_POST_BUILD:
-        s.src_stage = RDNA4RT_VK_STAGE_AS_BUILD;
+        s.src_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER;
         s.dst_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER |
                       (is_compute_queue ? 0u : (RDNA4RT_VK_STAGE_VERTEX_SHADER | RDNA4RT_VK_STAGE_FRAGMENT_SHADER));
-        s.src_access = RDNA4RT_VK_ACCESS_AS_WRITE;
+        s.src_access = RDNA4RT_VK_ACCESS_AS_WRITE | RDNA4RT_VK_ACCESS_TRANSFER_WRITE;
         s.dst_access = RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE |
                        RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_TRANSFER_READ;
         break;
@@ -1287,17 +1293,37 @@ static inline rdna4rt_err_t rdna4rt_state_apply_compact(
     return RDNA4RT_OK;
 }
 
+static inline int rdna4rt_refit_updates_vertices(uint64_t refit_options) {
+    return (refit_options & RDNA4RT_REFIT_OPT_VERTEX_DATA) != 0u;
+}
+
+static inline int rdna4rt_refit_updates_prim_data(uint64_t refit_options) {
+    return (refit_options & RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) != 0u;
+}
+
+static inline int rdna4rt_refit_is_prim_data_only(uint64_t refit_options) {
+    return refit_options == RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA;
+}
+
 static inline rdna4rt_err_t rdna4rt_state_can_refit(
     const rdna4rt_accel_meta_t *src, const rdna4rt_accel_meta_t *dst,
     rdna4rt_kind_t kind, uint64_t required_as_size, uint32_t geom_count,
     uint64_t topology_hash, uint64_t refit_options) {
-    if (!src || !dst || required_as_size == 0u) return RDNA4RT_ERR_INVALID_ARG;
-    if (refit_options & ~(uint64_t)RDNA4RT_REFIT_OPT_KNOWN_MASK) return RDNA4RT_ERR_INVALID_ARG;
+    if (!src || !dst) return RDNA4RT_ERR_INVALID_ARG;
+    if (refit_options == 0u || (refit_options & ~(uint64_t)RDNA4RT_REFIT_OPT_KNOWN_MASK) != 0u)
+        return RDNA4RT_ERR_INVALID_ARG;
+    const int prim_only = rdna4rt_refit_is_prim_data_only(refit_options);
+    const uint64_t need_size = prim_only
+        ? (required_as_size ? required_as_size : src->built_size_bytes)
+        : required_as_size;
+    if (need_size == 0u) return RDNA4RT_ERR_INVALID_ARG;
     if (src->state != RDNA4RT_STATE_BUILT || !src->allow_refit) return RDNA4RT_ERR_STATE;
-    if (src->kind != kind || src->geometry_count != geom_count ||
-        src->topology_hash != topology_hash)
+    if (src->kind != kind || src->geometry_count != geom_count) return RDNA4RT_ERR_STATE;
+    if (!prim_only && src->topology_hash != topology_hash) return RDNA4RT_ERR_STATE;
+    if (prim_only && topology_hash != 0u && src->topology_hash != topology_hash)
         return RDNA4RT_ERR_STATE;
-    if (dst->capacity_bytes < required_as_size) return RDNA4RT_ERR_BOUNDS;
+    if (dst->capacity_bytes < need_size || dst->capacity_bytes < src->built_size_bytes)
+        return RDNA4RT_ERR_BOUNDS;
     return RDNA4RT_OK;
 }
 
@@ -1308,15 +1334,337 @@ static inline rdna4rt_err_t rdna4rt_state_apply_refit(
     rdna4rt_err_t e = rdna4rt_state_can_refit(
         src, dst, kind, required_as_size, geom_count, topology_hash, refit_options);
     if (e != RDNA4RT_OK) return e;
+    const int prim_only = rdna4rt_refit_is_prim_data_only(refit_options);
     uint64_t cap = dst->capacity_bytes;
     *dst = *src;
     dst->capacity_bytes = cap;
     dst->state = RDNA4RT_STATE_BUILT;
-    dst->built_size_bytes = required_as_size;
+    dst->built_size_bytes = prim_only ? src->built_size_bytes : required_as_size;
     dst->allow_refit = 1u;
     dst->allow_compaction = 1u;
     dst->compacted_queried = 0u;
     return RDNA4RT_OK;
+}
+
+/* Wave 4.1B: BLAS primitiveDataBuffer validation, GPU snapshot layout, and copy/compact header rebase. */
+#define RDNA4RT_PRIM_DATA_ALIGN       UINT64_C(4)
+#define RDNA4RT_PRIM_SLICE_ALIGN      UINT64_C(16)
+#define RDNA4RT_PRIM_UPDATE_BUF_MAX   UINT64_C(65536)
+
+#ifndef RDNA4RT_GEOM_PRIM_ENTRY_DEFINED
+#define RDNA4RT_GEOM_PRIM_ENTRY_DEFINED 1
+typedef struct {
+    uint64_t data_bda;
+    uint32_t stride;
+    uint32_t prim_count;
+} rdna4rt_geom_prim_entry_t;
+#endif
+
+_Static_assert(sizeof(rdna4rt_geom_prim_entry_t) == 16u, "rdna4rt_geom_prim_entry_t must be 16 bytes");
+
+typedef struct {
+    int has_buf;
+    uint64_t buf_len;
+    uint64_t buf_offset;
+    uint64_t element_size;
+    uint64_t stride;
+    uint64_t prim_count;
+} rdna4rt_prim_data_geom_desc_t;
+
+typedef struct {
+    int present;
+    uint32_t stride;
+    uint32_t element_size;
+    uint32_t prim_count;
+    uint64_t src_offset;
+    uint64_t copy_bytes;
+} rdna4rt_prim_data_geom_plan_t;
+
+static inline rdna4rt_err_t rdna4rt_validate_prim_data_geom(
+    const rdna4rt_prim_data_geom_desc_t *d, int require_buffers, rdna4rt_prim_data_geom_plan_t *out) {
+    if (!d || !out) return RDNA4RT_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!d->has_buf) return RDNA4RT_OK;
+    if (d->prim_count > UINT32_MAX) return RDNA4RT_ERR_LIMIT;
+    if ((d->buf_offset % RDNA4RT_PRIM_DATA_ALIGN) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+    if (d->element_size == 0u) return RDNA4RT_ERR_INVALID_ARG;
+    if (d->element_size > UINT32_MAX) return RDNA4RT_ERR_LIMIT;
+    if ((d->element_size % RDNA4RT_PRIM_DATA_ALIGN) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+
+    uint64_t stride = d->stride ? d->stride : d->element_size;
+    if (stride < d->element_size) return RDNA4RT_ERR_INVALID_ARG;
+    if (stride > UINT32_MAX) return RDNA4RT_ERR_LIMIT;
+    if ((stride % RDNA4RT_PRIM_DATA_ALIGN) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+
+    uint64_t copy_bytes = 0u;
+    if (d->prim_count > 0u) {
+        uint64_t span = 0u;
+        if (!rdna4rt_mul_u64(d->prim_count - 1u, stride, &span) ||
+            !rdna4rt_add_u64(span, d->element_size, &copy_bytes))
+            return RDNA4RT_ERR_OVERFLOW;
+    }
+    if (require_buffers || d->buf_len > 0u) {
+        if (d->buf_offset > d->buf_len) return RDNA4RT_ERR_BOUNDS;
+        if (copy_bytes > d->buf_len - d->buf_offset) return RDNA4RT_ERR_BOUNDS;
+    }
+
+    out->present = 1;
+    out->stride = (uint32_t)stride;
+    out->element_size = (uint32_t)d->element_size;
+    out->prim_count = (uint32_t)d->prim_count;
+    out->src_offset = d->buf_offset;
+    out->copy_bytes = copy_bytes;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_blas_prim_layout_compute(
+    const rdna4rt_prim_data_geom_plan_t *geoms, uint32_t geom_count,
+    uint64_t *rel_offsets_out, uint64_t *header_bytes_out,
+    uint64_t *total_bytes_out, int *any_prim_data_out) {
+    if (!header_bytes_out || !total_bytes_out || !any_prim_data_out) return RDNA4RT_ERR_INVALID_ARG;
+    *header_bytes_out = 0u;
+    *total_bytes_out = 0u;
+    *any_prim_data_out = 0;
+    if (geom_count == 0u) return RDNA4RT_OK;
+    if (!geoms || !rel_offsets_out) return RDNA4RT_ERR_INVALID_ARG;
+
+    int any = 0;
+    for (uint32_t i = 0u; i < geom_count; i++) {
+        rel_offsets_out[i] = 0u;
+        if (geoms[i].present && geoms[i].prim_count > 0u && geoms[i].copy_bytes > 0u) any = 1;
+    }
+    if (!any) return RDNA4RT_OK;
+
+    uint64_t hdr_bytes = 0u;
+    if (!rdna4rt_mul_u64((uint64_t)geom_count, (uint64_t)sizeof(rdna4rt_geom_prim_entry_t), &hdr_bytes))
+        return RDNA4RT_ERR_OVERFLOW;
+    uint64_t cursor = hdr_bytes;
+    for (uint32_t i = 0u; i < geom_count; i++) {
+        if (!geoms[i].present || geoms[i].prim_count == 0u || geoms[i].copy_bytes == 0u) {
+            rel_offsets_out[i] = 0u;
+            continue;
+        }
+        uint64_t aligned_off = 0u;
+        if (!rdna4rt_align_up_u64(cursor, RDNA4RT_PRIM_SLICE_ALIGN, &aligned_off))
+            return RDNA4RT_ERR_OVERFLOW;
+        rel_offsets_out[i] = aligned_off;
+        uint64_t next = 0u;
+        if (!rdna4rt_add_u64(aligned_off, geoms[i].copy_bytes, &next))
+            return RDNA4RT_ERR_OVERFLOW;
+        cursor = next;
+    }
+    uint64_t final_bytes = 0u;
+    if (!rdna4rt_align_up_u64(cursor, RDNA4RT_PRIM_SLICE_ALIGN, &final_bytes))
+        return RDNA4RT_ERR_OVERFLOW;
+
+    *header_bytes_out = hdr_bytes;
+    *total_bytes_out = final_bytes;
+    *any_prim_data_out = 1;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_blas_prim_build_headers(
+    uint64_t base_bda, const rdna4rt_prim_data_geom_plan_t *geoms,
+    const uint64_t *rel_offsets, uint32_t geom_count,
+    rdna4rt_geom_prim_entry_t *headers_out) {
+    if (geom_count == 0u) return RDNA4RT_OK;
+    if (!base_bda || !geoms || !rel_offsets || !headers_out) return RDNA4RT_ERR_INVALID_ARG;
+    for (uint32_t i = 0u; i < geom_count; i++) {
+        if (!geoms[i].present || geoms[i].prim_count == 0u || geoms[i].copy_bytes == 0u) {
+            headers_out[i] = (rdna4rt_geom_prim_entry_t){ 0u, 0u, 0u };
+            continue;
+        }
+        uint64_t addr = 0u;
+        if (!rdna4rt_add_u64(base_bda, rel_offsets[i], &addr)) return RDNA4RT_ERR_OVERFLOW;
+        headers_out[i] = (rdna4rt_geom_prim_entry_t){
+            .data_bda = addr,
+            .stride = geoms[i].stride,
+            .prim_count = geoms[i].prim_count
+        };
+    }
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_blas_prim_rebase_headers(
+    const rdna4rt_geom_prim_entry_t *src_headers, uint32_t geom_count,
+    uint64_t src_base_bda, uint64_t dst_base_bda, uint64_t total_bytes,
+    rdna4rt_geom_prim_entry_t *dst_headers) {
+    if (geom_count == 0u) return RDNA4RT_OK;
+    if (!src_headers || !dst_headers || !src_base_bda || !dst_base_bda || total_bytes == 0u)
+        return RDNA4RT_ERR_INVALID_ARG;
+    uint64_t hdr_bytes = 0u;
+    if (!rdna4rt_mul_u64((uint64_t)geom_count, (uint64_t)sizeof(rdna4rt_geom_prim_entry_t), &hdr_bytes) ||
+        hdr_bytes > total_bytes)
+        return RDNA4RT_ERR_BOUNDS;
+    for (uint32_t i = 0u; i < geom_count; i++) {
+        dst_headers[i].stride = src_headers[i].stride;
+        dst_headers[i].prim_count = src_headers[i].prim_count;
+        if (src_headers[i].data_bda == 0u) {
+            dst_headers[i].data_bda = 0u;
+            continue;
+        }
+        if (src_headers[i].data_bda < src_base_bda) return RDNA4RT_ERR_BOUNDS;
+        uint64_t rel = src_headers[i].data_bda - src_base_bda;
+        if (rel < hdr_bytes || rel >= total_bytes) return RDNA4RT_ERR_BOUNDS;
+        uint64_t new_bda = 0u;
+        if (!rdna4rt_add_u64(dst_base_bda, rel, &new_bda)) return RDNA4RT_ERR_OVERFLOW;
+        dst_headers[i].data_bda = new_bda;
+    }
+    return RDNA4RT_OK;
+}
+
+/* Wave 4.2: MTLHeap placement & automatic acceleration structure size/align/offset validation. */
+#define RDNA4RT_HEAP_AS_ALIGN         RDNA4RT_AS_SIZE_ALIGN
+#define RDNA4RT_HEAP_STORAGE_SHARED   UINT32_C(0)
+#define RDNA4RT_HEAP_STORAGE_MANAGED  UINT32_C(1)
+#define RDNA4RT_HEAP_STORAGE_PRIVATE  UINT32_C(2)
+#define RDNA4RT_HEAP_TYPE_AUTOMATIC   UINT32_C(0)
+#define RDNA4RT_HEAP_TYPE_PLACEMENT   UINT32_C(1)
+
+typedef struct {
+    uint64_t size;
+    uint64_t align;
+} rdna4rt_heap_size_align_t;
+
+static inline rdna4rt_err_t rdna4rt_heap_as_size_align(
+    uint64_t requested_size, uint64_t vk_req_size, uint64_t vk_req_align,
+    uint64_t buffer_image_granularity, rdna4rt_heap_size_align_t *out) {
+    if (!out) return RDNA4RT_ERR_INVALID_ARG;
+    out->size = 0u;
+    out->align = 0u;
+    if (requested_size == 0u || vk_req_size == 0u || vk_req_align == 0u)
+        return RDNA4RT_ERR_INVALID_ARG;
+    uint64_t gran = buffer_image_granularity ? buffer_image_granularity : 1u;
+    if (!rdna4rt_is_pow2_u64(vk_req_align) || !rdna4rt_is_pow2_u64(gran))
+        return RDNA4RT_ERR_ALIGNMENT;
+    uint64_t align = vk_req_align;
+    if (align < RDNA4RT_HEAP_AS_ALIGN) align = RDNA4RT_HEAP_AS_ALIGN;
+    if (align < gran) align = gran;
+    uint64_t base_sz = vk_req_size > requested_size ? vk_req_size : requested_size;
+    uint64_t extent = 0u;
+    if (!rdna4rt_align_up_u64(base_sz, RDNA4RT_HEAP_AS_ALIGN, &extent))
+        return RDNA4RT_ERR_OVERFLOW;
+    if (gran > RDNA4RT_HEAP_AS_ALIGN && !rdna4rt_align_up_u64(extent, gran, &extent))
+        return RDNA4RT_ERR_OVERFLOW;
+    out->size = extent;
+    out->align = align;
+    return RDNA4RT_OK;
+}
+
+static inline rdna4rt_err_t rdna4rt_heap_as_validate_alloc(
+    uint32_t heap_storage_mode, uint32_t heap_type, uint64_t heap_size,
+    uint64_t requested_size, int has_offset, uint64_t offset, uint64_t required_align,
+    uint64_t *aligned_size_out) {
+    if (aligned_size_out) *aligned_size_out = 0u;
+    if (heap_storage_mode != RDNA4RT_HEAP_STORAGE_PRIVATE) return RDNA4RT_ERR_UNSUPPORTED;
+    if (has_offset ? (heap_type != RDNA4RT_HEAP_TYPE_PLACEMENT)
+                   : (heap_type != RDNA4RT_HEAP_TYPE_AUTOMATIC))
+        return RDNA4RT_ERR_CONFLICT;
+    if (requested_size == 0u || heap_size == 0u) return RDNA4RT_ERR_INVALID_ARG;
+    uint64_t align = required_align < RDNA4RT_HEAP_AS_ALIGN ? RDNA4RT_HEAP_AS_ALIGN : required_align;
+    if (!rdna4rt_is_pow2_u64(align)) return RDNA4RT_ERR_ALIGNMENT;
+    uint64_t backing_sz = 0u;
+    if (!rdna4rt_align_up_u64(requested_size, RDNA4RT_HEAP_AS_ALIGN, &backing_sz))
+        return RDNA4RT_ERR_OVERFLOW;
+    if (backing_sz > heap_size) return RDNA4RT_ERR_BOUNDS;
+    if (has_offset) {
+        if ((offset % align) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+        if (offset >= heap_size || backing_sz > heap_size - offset) return RDNA4RT_ERR_BOUNDS;
+    }
+    if (aligned_size_out) *aligned_size_out = backing_sz;
+    return RDNA4RT_OK;
+}
+
+/* Fence-retired device-local buffer pool (GarnetASPrimData) & compacted-size query pool free list. */
+typedef struct {
+    uint64_t buf_handle;
+    uint64_t mem_handle;
+    uint64_t bda;
+    uint64_t cap;
+    uint64_t alloc_size;
+} rdna4rt_buf_pool_entry_t;
+
+typedef struct {
+    uint32_t count;
+    uint64_t total_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    rdna4rt_buf_pool_entry_t slots[RDNA4RT_PRIM_POOL_MAX_SLABS];
+} rdna4rt_buf_pool_t;
+
+static inline void rdna4rt_buf_pool_reset(rdna4rt_buf_pool_t *p) {
+    if (!p) return;
+    p->count = 0u;
+    p->total_bytes = 0u;
+}
+
+/* Best-fit pop within [need_size, 2 * need_size] so tiny persistent BLAS snapshots never pin huge slabs. */
+static inline int rdna4rt_buf_pool_pop(
+    rdna4rt_buf_pool_t *p, uint64_t need_size, rdna4rt_buf_pool_entry_t *out) {
+    if (!p || !out || need_size == 0u) return 0;
+    uint64_t max_cap = (need_size <= UINT64_MAX / 2u) ? (need_size * 2u) : UINT64_MAX;
+    uint32_t best_idx = UINT32_MAX;
+    uint64_t best_cap = UINT64_MAX;
+    for (uint32_t i = 0u; i < p->count; i++) {
+        uint64_t c = p->slots[i].cap;
+        if (c >= need_size && c <= max_cap && c < best_cap) {
+            best_cap = c;
+            best_idx = i;
+        }
+    }
+    if (best_idx != UINT32_MAX) {
+        *out = p->slots[best_idx];
+        p->total_bytes = (p->total_bytes >= out->alloc_size) ? (p->total_bytes - out->alloc_size) : 0u;
+        p->slots[best_idx] = p->slots[p->count - 1u];
+        p->count--;
+        p->hits++;
+        return 1;
+    }
+    p->misses++;
+    return 0;
+}
+
+static inline int rdna4rt_buf_pool_push(
+    rdna4rt_buf_pool_t *p, const rdna4rt_buf_pool_entry_t *entry) {
+    if (!p || !entry || !entry->buf_handle || !entry->mem_handle || !entry->bda ||
+        entry->cap == 0u || entry->alloc_size == 0u)
+        return 0;
+    if (p->count >= RDNA4RT_PRIM_POOL_MAX_SLABS) return 0;
+    if (entry->alloc_size > RDNA4RT_PRIM_POOL_MAX_BUCKET ||
+        p->total_bytes > RDNA4RT_PRIM_POOL_MAX_BUCKET - entry->alloc_size)
+        return 0;
+    p->slots[p->count++] = *entry;
+    p->total_bytes += entry->alloc_size;
+    return 1;
+}
+
+typedef struct {
+    uint32_t count;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t handles[RDNA4RT_QUERY_POOL_MAX_FREE];
+} rdna4rt_qp_pool_t;
+
+static inline void rdna4rt_qp_pool_reset(rdna4rt_qp_pool_t *p) {
+    if (!p) return;
+    p->count = 0u;
+}
+
+static inline int rdna4rt_qp_pool_pop(rdna4rt_qp_pool_t *p, uint64_t *handle_out) {
+    if (!p || !handle_out) return 0;
+    if (p->count > 0u) {
+        *handle_out = p->handles[--p->count];
+        p->hits++;
+        return 1;
+    }
+    p->misses++;
+    return 0;
+}
+
+static inline int rdna4rt_qp_pool_push(rdna4rt_qp_pool_t *p, uint64_t handle) {
+    if (!p || handle == 0u || p->count >= RDNA4RT_QUERY_POOL_MAX_FREE) return 0;
+    p->handles[p->count++] = handle;
+    return 1;
 }
 
 #endif /* RDNA4_RT_ACCEL_H */

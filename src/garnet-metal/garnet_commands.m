@@ -2132,6 +2132,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
     } else if (isAS) {
         id handle = [(id<GarnetASInternal>)resource rdna4CurrentHandle];
         if (handle) [self rdna4RetainEncoded:handle];
+        id primData = [(id<GarnetASInternal>)resource rdna4CurrentPrimData];
+        if (primData) [self rdna4RetainEncoded:primData];
     } else if (isIFT) {
         [(RDNA4IntersectionFunctionTable *)resource rdna4RetainIntoCommandBuffer:self];
     } else if (isVFT) {
@@ -2147,7 +2149,18 @@ RDNA4_DNR(RDNA4CommandBuffer)
     }
     [self rdna4RetainEncoded:heap];
     if (!isSparseHeap) {
-        for (id resource in [heap rdna4LiveResources]) if (![resource isAliasable]) [self rdna4RetainEncoded:resource];
+        Class asCls = objc_getClass("GarnetAccelerationStructure");
+        for (id resource in [heap rdna4LiveResources]) {
+            if (![resource isAliasable]) {
+                [self rdna4RetainEncoded:resource];
+                if (asCls && [resource isKindOfClass:asCls]) {
+                    id handle = [(id<GarnetASInternal>)resource rdna4CurrentHandle];
+                    if (handle) [self rdna4RetainEncoded:handle];
+                    id primData = [(id<GarnetASInternal>)resource rdna4CurrentPrimData];
+                    if (primData) [self rdna4RetainEncoded:primData];
+                }
+            }
+        }
     }
 }
 - (void)rdna4AttachResidencySnapshot:(id)snapshot {
@@ -3405,7 +3418,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         const RDNA4PB *p = &pb[i];
         uint32_t c = p->count;
         if (p->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || p->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-            uint32_t add = (p->samplerCoordinateFlags || p->argumentTable || p->addressTable) ? 1u : c;
+            uint32_t add = (p->samplerCoordinateFlags || p->argumentTable || p->addressTable || p->rtPrimDataTable) ? 1u : c;
             if (add > MAXI - needBI) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: too many array descriptors", nm, p->binding]]; return NO; }
             needBI += add;
         } else if (p->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || p->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
@@ -3596,6 +3609,18 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
                 if (![self rdna4Bytes:registry ? registry.bytes : &addresses length:tableBytes buffer:&table offset:&offset]) return NO;
                 w[i].pBufferInfo = &bi[nbi];
                 bi[nbi++] = (VkDescriptorBufferInfo){ [table vkBuffer], [table rdna4VkOffset] + offset, tableBytes };
+                break;
+            }
+            if (p->rtPrimDataTable) {
+                rdna4rt_stage_prim_table_t stageTable;
+                if (!rdna4_rt_fill_stage_prim_table(self, dev, st ? &st->rt : NULL, &stageTable)) {
+                    [self rdna4Fail:@"RT primitive data table could not be prepared"];
+                    return NO;
+                }
+                RDNA4Buffer *table = nil; NSUInteger offset = 0;
+                if (![self rdna4Bytes:&stageTable length:sizeof(stageTable) buffer:&table offset:&offset]) return NO;
+                w[i].pBufferInfo = &bi[nbi];
+                bi[nbi++] = (VkDescriptorBufferInfo){ [table vkBuffer], [table rdna4VkOffset] + offset, sizeof(stageTable) };
                 break;
             }
             if (p->binding >= 32 && !p->argumentRoot) { [self rdna4Fail:[NSString stringWithFormat:@"%s binding %u: buffer descriptor outside the [[buffer(n)]] band 0..31 (synthetic address table? not supported)", nm, p->binding]]; return NO; }
@@ -5326,7 +5351,7 @@ RDNA4_ENCODER_SHARED
     rdna4dc_sig sig; rdna4dc_sig_begin(&sig, _sc->dc.layout, (uint64_t)(uintptr_t)dsl);
     for (uint32_t i = 0; i < n; i++) {
         const RDNA4PB *p = &pb[i];
-        if (p->addressTable || p->samplerCoordinateFlags) { sig.over = 1; break; }
+        if (p->addressTable || p->samplerCoordinateFlags || p->rtPrimDataTable) { sig.over = 1; break; }
         switch (p->type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
             for (uint32_t k = 0; k < p->count; k++) { uint32_t ix = p->binding + k; RDNA4BufSlot sl = ix < 31 ? st->buf[ix] : (RDNA4BufSlot){ 0 };
@@ -6527,7 +6552,7 @@ RDNA4_ENCODER_SHARED
     BOOL canCache = !needArgPrep && ![_pso argumentTables]->active && ![_pso rdna4HasAddressRegistry];
     if (canCache && _compStateDirty) {
         for (uint32_t i = 0; i < npb; i++) {
-            if (pb[i].addressTable || pb[i].samplerCoordinateFlags || pb[i].embedded) { canCache = NO; break; }
+            if (pb[i].addressTable || pb[i].samplerCoordinateFlags || pb[i].embedded || pb[i].rtPrimDataTable) { canCache = NO; break; }
         }
     }
     const BOOL usePush = [_pso pushDesc];

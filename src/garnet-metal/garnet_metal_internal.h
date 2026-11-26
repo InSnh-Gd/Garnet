@@ -282,6 +282,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
 
 // ---- Forward ObjC class declarations ----
 @class GarnetASHandle;
+@class GarnetASPrimData;
 @class GarnetASStorage;
 @class GarnetAccelerationStructure;
 @class GarnetAccelerationStructureCommandEncoder;
@@ -380,6 +381,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
 
 @protocol GarnetASInternal <NSObject>
 - (GarnetASHandle *)rdna4CurrentHandle;
+- (GarnetASPrimData *)rdna4CurrentPrimData;
 @end
 
 @protocol RDNA4ResidencySnapshotInternal <NSObject>
@@ -413,6 +415,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
 - (VkDeviceAddress)rdna4DeviceAddress;
 - (VkDeviceAddress)rdna4BindlessGPUAddress;
 - (id)rdna4CurrentHandle;
+- (id)rdna4CurrentPrimData;
 - (id)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
 - (uint32_t)rdna4AccelKind;
 - (BOOL)rdna4IsBuilt;
@@ -562,6 +565,7 @@ typedef struct {
     BOOL samplerCoordinateFlags;
     BOOL pixelCoordinates;
     BOOL stageResourceMetadata, stageTokenTable;
+    BOOL rtPrimDataTable;
     uint8_t imageSampleKinds;
     uint8_t texelComponentKinds;
     uint16_t nullShapeCount;
@@ -2087,6 +2091,26 @@ typedef struct {
 - (instancetype)initCompactedSizePoolWithError:(NSError **)err;
 @end
 
+@interface GarnetASPrimData : NSObject {
+@public
+    VkBuffer _buf;
+    VkDeviceMemory _mem;
+    VkDeviceAddress _bda;
+    uint64_t _totalBytes;
+    uint64_t _capacity;
+    uint64_t _allocatedSize;
+    BOOL _pooled;
+    uint32_t _kind;
+    uint32_t _count;
+    uint32_t _entryStride;
+    uint32_t _refOffset;
+    rdna4rt_geom_prim_entry_t *_blasHeaders;
+    NSArray<GarnetASPrimData *> *_referencedPrimData;
+}
+- (instancetype)initWithSize:(uint64_t)totalBytes kind:(uint32_t)kind count:(uint32_t)count
+                 entryStride:(uint32_t)entryStride refOffset:(uint32_t)refOffset error:(NSError **)err;
+@end
+
 @interface GarnetASStorage : NSObject {
 @public
     VkBuffer _buf;
@@ -2094,8 +2118,15 @@ typedef struct {
     VkDeviceAddress _deviceAddress;
     uint64_t _backingSize;
     uint64_t _allocatedSize;
+    RDNA4Heap *_hpHeap;
+    NSUInteger _hpOff, _hpSize;
+    uint64_t _hpId, _hpBlk, _hpLease, _hpBindOff, _hpPhysSize;
+    BOOL _hpDedicated;
+    RDNA4HeapBacking *_hpBacking;
 }
 - (instancetype)initWithBackingSize:(uint64_t)backingSize error:(NSError **)err;
+- (instancetype)initWithBackingSize:(uint64_t)backingSize heap:(RDNA4Heap *)heap
+                             offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset error:(NSError **)err;
 @end
 
 @interface GarnetASHandle : NSObject {
@@ -2114,14 +2145,23 @@ typedef struct {
     NSUInteger _size;
     GarnetASStorage *_storage;
     GarnetASHandle *_handle;
+    GarnetASPrimData *_primData;
+    uint64_t _registeredAsBda;
+    uint64_t _registeredPayloadBda;
     rdna4rt_accel_meta_t _meta;
     pthread_mutex_t _mu;
     BOOL _muInit;
     RDNA4_RES_IVARS
 }
 - (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind error:(NSError **)err;
+- (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind
+                          heap:(RDNA4Heap *)heap offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset
+                         error:(NSError **)err;
 - (GarnetASHandle *)rdna4EnsureHandleForKind:(rdna4rt_kind_t)kind error:(NSError **)err;
 - (GarnetASHandle *)rdna4CurrentHandle;
+- (GarnetASPrimData *)rdna4CurrentPrimData;
+- (BOOL)rdna4SetPrimData:(GarnetASPrimData *)primData forAsAddress:(uint64_t)asBda
+           commandBuffer:(RDNA4CommandBuffer *)cb vkCmdBuffer:(VkCommandBuffer)cmd error:(NSError **)err;
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure;
 - (VkDeviceAddress)rdna4DeviceAddress;
 - (VkDeviceAddress)rdna4BindlessGPUAddress;
@@ -2136,6 +2176,9 @@ typedef struct {
 - (BOOL)rdna4ResourceAliasable;
 - (void)rdna4ResourceMakeAliasable;
 - (BOOL)rdna4ResourceAliases:(id)other;
+- (uint64_t)rdna4BackingBlock;
+- (uint64_t)rdna4BackingOffset;
+- (uint64_t)rdna4BackingSize;
 @end
 
 @interface GarnetAccelerationStructureCommandEncoder : _MTLCommandEncoder {
@@ -2420,6 +2463,8 @@ typedef struct {
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d;
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)len options:(MTLResourceOptions)o;
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d;
+- (MTLSizeAndAlign)heapAccelerationStructureSizeAndAlignWithSize:(NSUInteger)size;
+- (MTLSizeAndAlign)heapAccelerationStructureSizeAndAlignWithDescriptor:(MTLAccelerationStructureDescriptor *)d;
 - (id)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d;
 - (id)newFence;
 - (NSUInteger)currentAllocatedSize;
@@ -2792,6 +2837,12 @@ typedef struct {
 - (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o atOffset:(NSUInteger)off;
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off;
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d atOffset:(NSUInteger)off;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size offset:(NSUInteger)off;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size atOffset:(NSUInteger)off;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d offset:(NSUInteger)off;
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d atOffset:(NSUInteger)off;
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)al;
 - (NSUInteger)setPurgeableState:(NSUInteger)st;
 - (id)device;
@@ -3801,6 +3852,16 @@ GARNET_INTERNAL_EXTERN id<MTLAccelerationStructure> rdna4_rt_device_new_with_siz
     id dev, NSUInteger size);
 GARNET_INTERNAL_EXTERN id<MTLAccelerationStructure> rdna4_rt_device_new_with_descriptor(
     id dev, MTLAccelerationStructureDescriptor *descriptor);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_fill_stage_prim_table(
+    id cb, id dev, const RDNA4RTStageSlots *rtSlots, rdna4rt_stage_prim_table_t *out);
+GARNET_INTERNAL_EXTERN MTLSizeAndAlign rdna4_rt_device_heap_as_size_align_with_size(
+    id dev, NSUInteger size);
+GARNET_INTERNAL_EXTERN MTLSizeAndAlign rdna4_rt_device_heap_as_size_align_with_descriptor(
+    id dev, MTLAccelerationStructureDescriptor *descriptor);
+GARNET_INTERNAL_EXTERN id<MTLAccelerationStructure> rdna4_rt_heap_new_as_with_size(
+    RDNA4Heap *heap, id dev, NSUInteger size, BOOL hasOffset, NSUInteger offset);
+GARNET_INTERNAL_EXTERN id<MTLAccelerationStructure> rdna4_rt_heap_new_as_with_descriptor(
+    RDNA4Heap *heap, id dev, MTLAccelerationStructureDescriptor *descriptor, BOOL hasOffset, NSUInteger offset);
 GARNET_INTERNAL_EXTERN id rdna4_mesh_device_new_pipeline(
     id dev, id desc, NSUInteger options, MTLRenderPipelineReflection **refl, NSError **error);
 GARNET_INTERNAL_EXTERN void rdna4_mesh_device_new_pipeline_async(

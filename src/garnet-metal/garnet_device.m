@@ -1134,6 +1134,12 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
     return rdna4_rt_device_new_with_descriptor(self, d);
 }
+- (MTLSizeAndAlign)heapAccelerationStructureSizeAndAlignWithSize:(NSUInteger)size {
+    return rdna4_rt_device_heap_as_size_align_with_size(self, size);
+}
+- (MTLSizeAndAlign)heapAccelerationStructureSizeAndAlignWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
+    return rdna4_rt_device_heap_as_size_align_with_descriptor(self, d);
+}
 - (void)getDefaultSamplePositions:(MTLSamplePosition *)positions count:(NSUInteger)count {
     if (!positions) return;
     static const MTLSamplePosition p1[1] = { { 0.5f, 0.5f } };

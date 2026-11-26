@@ -212,6 +212,14 @@ GARNET_INTERNAL BOOL rdna4x_active(void) {
 }
 static NSString *rdna4x_resources(void) { return [[NSBundle bundleForClass:[GarnetDevice class]] resourcePath]; }
 static NSString *rdna4x_xlib_path(void) { return [rdna4x_resources() stringByAppendingPathComponent:@RDNA4X_LIB_NAME]; }
+static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
+    rdna4x_backend_capabilities caps = rdna4_query_caps();
+    if (RDNA4R.rtPositionFetch) caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
+    caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
+    if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress)
+        caps.flags |= GARNETX_CAP_RT_PRIMITIVE_DATA;
+    return caps;
+}
 // Sets up <user cache dir>/org.garnet.xlate/<K> once, after admission (never inside rdna4_spv_dirs' dispatch_once). Caller holds RDNA4XL.mu.
 static void rdna4x_setup_locked(void) {
     uint8_t xl[16], rd[16]; memset(rd, 0, sizeof rd);
@@ -221,7 +229,7 @@ static void rdna4x_setup_locked(void) {
     else { uuid_t cu; if (_dyld_get_shared_cache_uuid(cu)) memcpy(rd, cu, 16); }   // the reader lives in the dyld shared cache (no file, not loaded yet): the cache's UUID pins it
     char osv[64] = ""; size_t osn = sizeof osv; if (sysctlbyname("kern.osversion", osv, &osn, NULL, 0) != 0) osv[0] = 0;
     uint8_t ov[CC_SHA256_DIGEST_LENGTH]; rdna4x_override_hash(ov);
-    const rdna4x_backend_capabilities queryCaps = rdna4_query_caps();
+    const rdna4x_backend_capabilities queryCaps = rdna4_rt_xlate_caps();
     char key[17]; rdna4x_key_with_capabilities(key, xl, rd, ov, osv, &queryCaps);
     char ucd[1024]; ucd[0] = 0;
     const char *tu = rdna4_allow() ? garnet_getenv("GARNET_TEST_USERCACHE", "RDNA4M_TEST_USERCACHE") : NULL;
@@ -368,7 +376,7 @@ GARNET_INTERNAL void rdna4x_engine_prepare(void) {
         const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
         rdna4x_engine_init(&RDNA4XL.eng, NULL, NULL, rl, rdna4x_xlib_path().fileSystemRepresentation, RDNA4X_WORKER_STACK);
         RDNA4XL.eng.lowerTranslatedArguments = RDNA4R.gpuArgumentTables;
-        RDNA4XL.eng.capabilities = rdna4_query_caps();
+        RDNA4XL.eng.capabilities = rdna4_rt_xlate_caps();
         RDNA4XL.engineInit = 1;
     }
     pthread_mutex_unlock(&RDNA4XL.mu);
@@ -1123,9 +1131,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     work.vis = inVis; work.nvis = nv;
     work.ift = inIft; work.nift = ni;
     work.useStage3 = wantStage3 ? 1 : 0;
-    work.caps = rdna4_query_caps();
-    if (RDNA4R.rtPositionFetch) work.caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
-    work.caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
+    work.caps = rdna4_rt_xlate_caps();
     work.lowerArgs = RDNA4R.gpuArgumentTables ? 1 : 0;
 
     int rc = RDNA4X_E_IO;
@@ -2152,7 +2158,8 @@ static NSDictionary *rdna4_stage_meta_relocate(NSDictionary *meta, int set) {
         }
         NSMutableDictionary *relocated = [row mutableCopy];
         BOOL coordinate = [relocated[@"kind"] isEqual:@"SamplerCoordinateFlags"] ||
-            [relocated[@"kind"] isEqual:@"StageResourceMetadata"];
+            [relocated[@"kind"] isEqual:@"StageResourceMetadata"] ||
+            [relocated[@"kind"] isEqual:@"RTPrimDataTable"];
         BOOL sampler = rdna4_stage_meta_sampler_row(relocated);
         if (!coordinate && !sampler) {
             [rows addObject:relocated];
@@ -2362,6 +2369,13 @@ GARNET_INTERNAL BOOL rdna4_stage_dsl_ex(const RDNA4sRefl *r, int set, VkShaderSt
             pb[nb].normalizedCoordinates = normalizedCoordinates &&
                 a->type == VK_DESCRIPTOR_TYPE_SAMPLER;
             pb[nb].samplerCoordinateFlags = b == 674;
+            pb[nb].rtPrimDataTable = (b == (int)RDNA4RT_PRIM_DATA_BINDING &&
+                a->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && a->count == 1 && !a->runtime);
+            if (pb[nb].rtPrimDataTable && !RDNA4R.bufferAddress) {
+                free(bnd); free(pb);
+                if (err) *err = rdna4_err(49, @"RT primitive data table requires Vulkan buffer device address support");
+                return NO;
+            }
             if (b == 674 && rdna4_argument_table_uses_shape_registry(meta)) {
                 pb[nb].stageResourceMetadata = YES;
                 pb[nb].stageTokenTable = r->bind[set][672].used;
@@ -2456,6 +2470,33 @@ GARNET_INTERNAL BOOL rdna4_stage_dsl_ex(const RDNA4sRefl *r, int set, VkShaderSt
         }
     }
     for (NSDictionary *bd in bindingMetadata) {
+        if (![bd[@"kind"] isEqual:@"RTPrimDataTable"]) continue;
+        NSDictionary *descriptor = [bd[@"descriptor"] isKindOfClass:[NSDictionary class]] ? bd[@"descriptor"] : nil;
+        uint64_t descriptorSet = (uint64_t)set, binding = 0, count = 0;
+        BOOL setOK = !descriptor[@"set"] ||
+            (rdna4_number_u64((__bridge CFTypeRef)descriptor[@"set"], &descriptorSet) &&
+             descriptorSet == (uint64_t)set);
+        BOOL found = NO;
+        if (RDNA4R.bufferAddress && setOK &&
+            rdna4_number_u64((__bridge CFTypeRef)descriptor[@"binding"], &binding) &&
+            binding == RDNA4RT_PRIM_DATA_BINDING &&
+            rdna4_number_u64((__bridge CFTypeRef)descriptor[@"count"], &count) && count == 1) {
+            for (uint32_t i = 0; i < nb; ++i) {
+                if (pb[i].binding == RDNA4RT_PRIM_DATA_BINDING && pb[i].count == 1 &&
+                    pb[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    pb[i].rtPrimDataTable = YES;
+                    found = YES;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            free(bnd); free(pb);
+            if (err) *err = rdna4_err(49, @"RT primitive data table metadata or Vulkan device-address support is invalid");
+            return NO;
+        }
+    }
+    for (NSDictionary *bd in bindingMetadata) {
         BOOL staticSampler = [bd[@"kind"] isEqual:@"StaticSampler"] ||
             [bd[@"kind"] isEqual:@"SynthesizedReadSampler"];
         if (!staticSampler || ![bd[@"static_sampler"] isKindOfClass:[NSDictionary class]]) continue;
@@ -2481,7 +2522,7 @@ GARNET_INTERNAL BOOL rdna4_stage_dsl_ex(const RDNA4sRefl *r, int set, VkShaderSt
         BOOL okPush = YES;
         for (uint32_t i = 0; i < nb; i++) {
             const RDNA4PB *p = &pb[i];
-            if (p->addressTable || p->samplerCoordinateFlags || p->argumentTable ||
+            if (p->addressTable || p->samplerCoordinateFlags || p->argumentTable || p->rtPrimDataTable ||
                 (p->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && p->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
                  p->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && p->type != VK_DESCRIPTOR_TYPE_SAMPLER &&
                  p->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && p->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) {
@@ -2751,7 +2792,7 @@ static BOOL rdna4_ba_device_fingerprint(rdna4ba_fingerprint_t *out, NSError **er
 
     uint8_t xlUuid[16] = {0};
     (void)rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xlUuid);
-    rdna4x_backend_capabilities qcaps = rdna4_query_caps();
+    rdna4x_backend_capabilities qcaps = rdna4_rt_xlate_caps();
     rdna4ba_sha256_ctx sc;
     rdna4ba_sha256_init(&sc);
     rdna4ba_sha256_update(&sc, RDNA4X_KEY_TAG, sizeof RDNA4X_KEY_TAG);

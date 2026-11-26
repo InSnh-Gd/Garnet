@@ -106,11 +106,13 @@ __attribute__((unused)) static BOOL rdna4_rt_runtime_translator_stage3_ready(voi
     return rdna4x_ensure_stage3_xlib(NULL, &fn, NULL) && fn != NULL;
 }
 
-// Builds honest ray tracing capabilities without opening RADV (rdna4_metal3_caps returns zeroed
-// fallback until RADV opens, and probed GFX12 capabilities thereafter).
+// Builds honest ray tracing capabilities without opening RADV: pre-open reports RDNA4-guaranteed
+// RT hardware caps as 1u (matching garnet_device.m pre-open policy so apps querying
+// supportsRaytracing before newCommandQueue succeed with radv_open=0), while post-open reflects
+// probed GFX12 Vulkan capabilities and always keeps stage3Ok gating.
 __attribute__((unused)) static rdna4rtr_hw_caps_t rdna4_rt_runtime_caps(void) {
     const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
-    const uint8_t vkRtOk = rdna4dc_metal3_raytracing_supported(&m3) ? 1u : 0u;
+    const uint8_t vkRtOk = RDNA4R.ok ? (rdna4dc_metal3_raytracing_supported(&m3) ? 1u : 0u) : 1u;
     const uint8_t stage3Ok = rdna4_rt_runtime_translator_stage3_ready() ? 1u : 0u;
     return (rdna4rtr_hw_caps_t){
         .accel_struct_supported    = vkRtOk,
@@ -631,6 +633,8 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_encoder_bind_accel(
     rdna4_rt_cb_retain(cb, accel);
     id handle = [as rdna4CurrentHandle];
     if (handle) rdna4_rt_cb_retain(cb, handle);
+    id primData = [as rdna4CurrentPrimData];
+    if (primData) rdna4_rt_cb_retain(cb, primData);
     return YES;
 }
 
@@ -762,6 +766,8 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_fill_accel_descriptor(
         rdna4_rt_cb_retain(cb, raw);
         id handle = [as rdna4CurrentHandle];
         if (handle) rdna4_rt_cb_retain(cb, handle);
+        id primData = [as rdna4CurrentPrimData];
+        if (primData) rdna4_rt_cb_retain(cb, primData);
         asHandlesOut[baseIdx + k] = vkAS;
     }
 
@@ -861,6 +867,8 @@ static void rdna4_rt_retain_argbuf_walk(RDNA4Buffer *buf, id cb, NSMutableSet *v
         id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(asObj, nil, NULL);
         id h = as ? [as rdna4CurrentHandle] : nil;
         if (h) rdna4_rt_cb_retain(cb, h);
+        id pd = as ? [as rdna4CurrentPrimData] : nil;
+        if (pd) rdna4_rt_cb_retain(cb, pd);
     }
     for (RDNA4IntersectionFunctionTable *ift in localIFTs)
         [ift rdna4RetainIntoCommandBuffer:cb];
@@ -1172,6 +1180,7 @@ typedef struct {
     PFN_vkCmdCopyAccelerationStructureKHR cmdCopyAS;
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR cmdWriteASProps;
     PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults;
+    PFN_vkCmdUpdateBuffer cmdUpdateBuffer;
 } RDNA4RTFnTable;
 
 static RDNA4RTFnTable RDNA4RTFn;
@@ -1200,6 +1209,12 @@ static BOOL rdna4_rt_resolve_funcs(void) {
         if (!RDNA4RTFn.cmdCopyQueryPoolResults && rdna4_gipa && RDNA4R.inst) {
             RDNA4RTFn.cmdCopyQueryPoolResults = (PFN_vkCmdCopyQueryPoolResults)
                 rdna4_gipa(RDNA4R.inst, "vkCmdCopyQueryPoolResults");
+        }
+        RDNA4RTFn.cmdUpdateBuffer = (PFN_vkCmdUpdateBuffer)
+            vkGetDeviceProcAddr(RDNA4R.dev, "vkCmdUpdateBuffer");
+        if (!RDNA4RTFn.cmdUpdateBuffer && rdna4_gipa && RDNA4R.inst) {
+            RDNA4RTFn.cmdUpdateBuffer = (PFN_vkCmdUpdateBuffer)
+                rdna4_gipa(RDNA4R.inst, "vkCmdUpdateBuffer");
         }
         RDNA4RTFn.ready = RDNA4RTFn.getBuildSizes && RDNA4RTFn.createAS && RDNA4RTFn.destroyAS &&
                           RDNA4RTFn.getASAddress && RDNA4RTFn.cmdBuildAS && RDNA4RTFn.cmdCopyAS &&
@@ -1579,10 +1594,44 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 @end
 
 
+typedef struct {
+    pthread_mutex_t mu;
+    VkDevice dev;
+    rdna4rt_qp_pool_t pool;
+} RDNA4RTQueryPoolCache;
+
+static RDNA4RTQueryPoolCache g_rtQueryPool = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static BOOL rdna4_rt_qp_pool_pop(VkQueryPool *out) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !out) return NO;
+    pthread_mutex_lock(&g_rtQueryPool.mu);
+    if (g_rtQueryPool.dev != RDNA4R.dev) {
+        g_rtQueryPool.dev = RDNA4R.dev;
+        rdna4rt_qp_pool_reset(&g_rtQueryPool.pool);
+    }
+    uint64_t h = 0u;
+    int ok = rdna4rt_qp_pool_pop(&g_rtQueryPool.pool, &h);
+    pthread_mutex_unlock(&g_rtQueryPool.mu);
+    if (!ok) return NO;
+    *out = (VkQueryPool)(uintptr_t)h;
+    return YES;
+}
+
+static BOOL rdna4_rt_qp_pool_push(VkQueryPool qp) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !qp) return NO;
+    pthread_mutex_lock(&g_rtQueryPool.mu);
+    if (g_rtQueryPool.dev == VK_NULL_HANDLE) g_rtQueryPool.dev = RDNA4R.dev;
+    int ok = (g_rtQueryPool.dev == RDNA4R.dev) &&
+             rdna4rt_qp_pool_push(&g_rtQueryPool.pool, (uint64_t)(uintptr_t)qp);
+    pthread_mutex_unlock(&g_rtQueryPool.mu);
+    return ok ? YES : NO;
+}
+
 @implementation RDNA4RTQueryPool
 - (instancetype)initCompactedSizePoolWithError:(NSError **)err {
     self = [super init];
     if (!self) return nil;
+    if (rdna4_rt_qp_pool_pop(&_qp)) return self;
     VkQueryPoolCreateInfo qi = {
         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
         .queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
@@ -1597,18 +1646,462 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 }
 
 - (void)dealloc {
-    if (RDNA4R.ok && _qp && vkDestroyQueryPool) vkDestroyQueryPool(RDNA4R.dev, _qp, NULL);
+    if (RDNA4R.ok && _qp) {
+        if (rdna4_rt_qp_pool_push(_qp)) {
+            _qp = VK_NULL_HANDLE;
+            return;
+        }
+        if (vkDestroyQueryPool) vkDestroyQueryPool(RDNA4R.dev, _qp, NULL);
+    }
     _qp = VK_NULL_HANDLE;
 }
 @end
 
-// Backing Private VkBuffer + VkDeviceMemory. Held strongly by GarnetASHandle so Vulkan
-// always destroys VkAccelerationStructureKHR before its storage VkBuffer and VkDeviceMemory.
+// ---------------------------------------------------------------------------------------------------------------
+// Wave 4.1B: Device-wide GPU hash table (RDNA4RTPrimDataTable) + per-AS snapshot buffer (GarnetASPrimData).
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct {
+    pthread_mutex_t mu;
+    VkDevice dev;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    rdna4rt_prim_slot_t *slots;
+    VkDeviceAddress bda;
+    uint64_t allocSize;
+    rdna4rt_prim_slot_t shadow[RDNA4RT_PRIM_TABLE_CAP];
+} RDNA4RTPrimDataTableState;
 
-@implementation GarnetASStorage
-- (instancetype)initWithBackingSize:(uint64_t)backingSize error:(NSError **)err {
+static RDNA4RTPrimDataTableState g_rtPrimTable = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static BOOL rdna4_rt_cmd_write_buf_bytes(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb, VkBuffer dstBuf,
+    uint64_t dstOffset, const void *data, uint64_t bytes, NSError **err)
+{
+    if (bytes == 0u) return YES;
+    if (bytes <= RDNA4RT_PRIM_UPDATE_BUF_MAX && (dstOffset % 4u) == 0u &&
+        (bytes % 4u) == 0u && RDNA4RTFn.cmdUpdateBuffer) {
+        RDNA4RTFn.cmdUpdateBuffer(cmd, dstBuf, dstOffset, bytes, data);
+        return YES;
+    }
+    RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:bytes error:err];
+    if (!stg) return NO;
+    memcpy(stg->_map, data, (size_t)bytes);
+    [cb rdna4RetainEncoded:stg];
+    VkBufferCopy copy = { .srcOffset = 0u, .dstOffset = dstOffset, .size = bytes };
+    vkCmdCopyBuffer(cmd, stg->_buf, dstBuf, 1u, &copy);
+    return YES;
+}
+
+static BOOL rdna4_rt_prim_table_ensure_locked(NSError **err) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !RDNA4R.bufferAddress || !rdna4_vkGetBufferAddress) {
+        if (err) *err = rdna4_err(146, @"RT primitive data table requires Vulkan buffer device address");
+        return NO;
+    }
+    if (g_rtPrimTable.dev == RDNA4R.dev && g_rtPrimTable.buf && g_rtPrimTable.slots && g_rtPrimTable.bda)
+        return YES;
+    g_rtPrimTable.dev = VK_NULL_HANDLE;
+    g_rtPrimTable.buf = VK_NULL_HANDLE;
+    g_rtPrimTable.mem = VK_NULL_HANDLE;
+    g_rtPrimTable.slots = NULL;
+    g_rtPrimTable.bda = 0u;
+    g_rtPrimTable.allocSize = 0u;
+    memset(g_rtPrimTable.shadow, 0, sizeof(g_rtPrimTable.shadow));
+
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = RDNA4RT_PRIM_TABLE_BYTES,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(RDNA4R.dev, &bci, NULL, &buf);
+    if (r != VK_SUCCESS || !buf) {
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"rt prim table vkCreateBuffer = %d", r]);
+        return NO;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(RDNA4R.dev, buf, &mr);
+    int mt = rdna4_find_mem(mr.memoryTypeBits,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0) {
+        vkDestroyBuffer(RDNA4R.dev, buf, NULL);
+        if (err) *err = rdna4_err(146, @"rt prim table: no host-visible coherent memory type");
+        return NO;
+    }
+    VkMemoryAllocateFlagsInfo afi = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &afi,
+        .allocationSize = mr.size,
+        .memoryTypeIndex = (uint32_t)mt
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    r = vkAllocateMemory(RDNA4R.dev, &mai, NULL, &mem);
+    if (r != VK_SUCCESS || !mem) {
+        vkDestroyBuffer(RDNA4R.dev, buf, NULL);
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"rt prim table vkAllocateMemory = %d", r]);
+        return NO;
+    }
+    r = vkBindBufferMemory(RDNA4R.dev, buf, mem, 0);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(RDNA4R.dev, buf, NULL);
+        vkFreeMemory(RDNA4R.dev, mem, NULL);
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"rt prim table vkBindBufferMemory = %d", r]);
+        return NO;
+    }
+    void *map = NULL;
+    r = vkMapMemory(RDNA4R.dev, mem, 0, VK_WHOLE_SIZE, 0, &map);
+    if (r != VK_SUCCESS || !map) {
+        vkDestroyBuffer(RDNA4R.dev, buf, NULL);
+        vkFreeMemory(RDNA4R.dev, mem, NULL);
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"rt prim table vkMapMemory = %d", r]);
+        return NO;
+    }
+    memset(map, 0, RDNA4RT_PRIM_TABLE_BYTES);
+    VkBufferDeviceAddressInfo bdaInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buf
+    };
+    VkDeviceAddress bda = rdna4_vkGetBufferAddress(RDNA4R.dev, &bdaInfo);
+    if (!bda) {
+        vkUnmapMemory(RDNA4R.dev, mem);
+        vkDestroyBuffer(RDNA4R.dev, buf, NULL);
+        vkFreeMemory(RDNA4R.dev, mem, NULL);
+        if (err) *err = rdna4_err(146, @"rt prim table: zero buffer device address");
+        return NO;
+    }
+    atomic_fetch_add(&rdna4_alloc_total, mr.size);
+    g_rtPrimTable.dev = RDNA4R.dev;
+    g_rtPrimTable.buf = buf;
+    g_rtPrimTable.mem = mem;
+    g_rtPrimTable.slots = (rdna4rt_prim_slot_t *)map;
+    g_rtPrimTable.bda = bda;
+    g_rtPrimTable.allocSize = mr.size;
+    RDNA4LOGR("RDNA4RTPrimDataTable ready: %u slots (%zu bytes) at bda 0x%llx",
+              RDNA4RT_PRIM_TABLE_CAP, RDNA4RT_PRIM_TABLE_BYTES, (unsigned long long)bda);
+    return YES;
+}
+
+// GPU-timeline publish: allocates/updates the slot in the CPU shadow table, marks a previously
+// EMPTY GPU slot as TOMBSTONE on CPU (so an abandoned CB never breaks collision chains without
+// disturbing any live GPU slot), and records the 32B slot publish into `cmd` before POST_BUILD.
+static BOOL rdna4_rt_prim_table_register_cmd(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    uint64_t asBda, uint64_t payloadBda, uint32_t count,
+    uint32_t entryStride, uint32_t refOffset, uint32_t kind, NSError **err)
+{
+    uint32_t slotIdx = 0u;
+    int wasEmpty = 0;
+    VkBuffer tableBuf = VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_rtPrimTable.mu);
+    if (!rdna4_rt_prim_table_ensure_locked(err)) {
+        pthread_mutex_unlock(&g_rtPrimTable.mu);
+        return NO;
+    }
+    rdna4rtr_status_t st = rdna4rt_prim_table_upsert_slot(
+        g_rtPrimTable.shadow, RDNA4RT_PRIM_TABLE_CAP,
+        asBda, payloadBda, count, entryStride, refOffset, kind,
+        &slotIdx, &wasEmpty);
+    if (st == RDNA4RTR_OK) {
+        if (wasEmpty) {
+            __atomic_store_n(&g_rtPrimTable.slots[slotIdx].as_bda,
+                             RDNA4RT_PRIM_SLOT_TOMBSTONE, __ATOMIC_RELEASE);
+        }
+        tableBuf = g_rtPrimTable.buf;
+    }
+    pthread_mutex_unlock(&g_rtPrimTable.mu);
+    if (st != RDNA4RTR_OK) {
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"RT primitive data table register failed: %s",
+                                        rdna4rtr_status_str(st)]);
+        return NO;
+    }
+    rdna4rt_prim_slot_t slotVal = {
+        .as_bda = asBda,
+        .payload_bda = payloadBda,
+        .count = count,
+        .entry_stride = entryStride,
+        .ref_offset = refOffset,
+        .kind = kind
+    };
+    return rdna4_rt_cmd_write_buf_bytes(
+        cmd, cb, tableBuf, (uint64_t)slotIdx * (uint64_t)sizeof(rdna4rt_prim_slot_t),
+        &slotVal, sizeof(slotVal), err);
+}
+
+// GPU-timeline clear (for encode-time rebuild without primData or AS BDA switch): tombstones the
+// matching entry in shadow[] and records an 8B TOMBSTONE write into `cmd` so in-flight GPU work
+// prior to this command keeps seeing the previous live entry.
+static BOOL rdna4_rt_prim_table_clear_cmd(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    uint64_t asBda, uint64_t expectedPayloadBda, NSError **err)
+{
+    if (asBda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return YES;
+    uint32_t slotIdx = 0u;
+    int removed = 0;
+    VkBuffer tableBuf = VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_rtPrimTable.mu);
+    if (g_rtPrimTable.dev == RDNA4R.dev && g_rtPrimTable.buf) {
+        removed = rdna4rt_prim_table_remove_if_match_slot(
+            g_rtPrimTable.shadow, RDNA4RT_PRIM_TABLE_CAP,
+            asBda, expectedPayloadBda, &slotIdx);
+        if (removed) tableBuf = g_rtPrimTable.buf;
+    }
+    pthread_mutex_unlock(&g_rtPrimTable.mu);
+    if (!removed) return YES;
+    const uint64_t tomb = RDNA4RT_PRIM_SLOT_TOMBSTONE;
+    return rdna4_rt_cmd_write_buf_bytes(
+        cmd, cb, tableBuf, (uint64_t)slotIdx * (uint64_t)sizeof(rdna4rt_prim_slot_t),
+        &tomb, sizeof(tomb), err);
+}
+
+// Dealloc-time CPU unregister: safe on CPU because all command buffers retaining the AS have retired.
+static void rdna4_rt_prim_table_unregister_cpu(uint64_t asBda, uint64_t expectedPayloadBda) {
+    if (asBda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return;
+    pthread_mutex_lock(&g_rtPrimTable.mu);
+    if (g_rtPrimTable.dev == RDNA4R.dev && g_rtPrimTable.slots) {
+        uint32_t slotIdx = 0u;
+        if (rdna4rt_prim_table_remove_if_match_slot(
+                g_rtPrimTable.shadow, RDNA4RT_PRIM_TABLE_CAP,
+                asBda, expectedPayloadBda, &slotIdx)) {
+            __atomic_store_n(&g_rtPrimTable.slots[slotIdx].as_bda,
+                             RDNA4RT_PRIM_SLOT_TOMBSTONE, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&g_rtPrimTable.mu);
+}
+
+GARNET_INTERNAL __attribute__((unused)) BOOL rdna4_rt_fill_stage_prim_table(
+    id cb, id dev, const RDNA4RTStageSlots *rtSlots, rdna4rt_stage_prim_table_t *out)
+{
+    if (!cb || !out) return NO;
+    NSError *err = nil;
+    pthread_mutex_lock(&g_rtPrimTable.mu);
+    BOOL ok = rdna4_rt_prim_table_ensure_locked(&err);
+    uint64_t globalBda = ok ? (uint64_t)g_rtPrimTable.bda : 0u;
+    pthread_mutex_unlock(&g_rtPrimTable.mu);
+    if (!ok || !globalBda) {
+        RDNA4LOG("rt prim table fill failed: %s", err ? err.localizedDescription.UTF8String : "unavailable");
+        return NO;
+    }
+    rdna4rt_stage_prim_table_init(out, globalBda, RDNA4RT_PRIM_TABLE_MASK);
+    if (rtSlots) {
+        for (uint32_t i = 0; i < RDNA4RTR_MAX_BUFFER_SLOTS; i++) {
+            id raw = rtSlots->as[i];
+            if (!raw) continue;
+            id<GarnetAccelerationStructureRuntimeInternal> as = rdna4_rt_validate_accel(raw, dev, NULL);
+            if (!as) continue;
+            out->slot_as_bda[i] = (uint64_t)[as rdna4DeviceAddress];
+            rdna4_rt_cb_retain(cb, raw);
+            id handle = [as rdna4CurrentHandle];
+            if (handle) rdna4_rt_cb_retain(cb, handle);
+            id primData = [as rdna4CurrentPrimData];
+            if (primData) rdna4_rt_cb_retain(cb, primData);
+        }
+    }
+    return YES;
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    VkDevice dev;
+    rdna4rt_buf_pool_t pool;
+} RDNA4RTPrimDataPoolState;
+
+static RDNA4RTPrimDataPoolState g_rtPrimPool = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static BOOL rdna4_rt_prim_pool_pop(uint64_t needSize, rdna4rt_buf_pool_entry_t *out) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !out) return NO;
+    pthread_mutex_lock(&g_rtPrimPool.mu);
+    if (g_rtPrimPool.dev != RDNA4R.dev) {
+        g_rtPrimPool.dev = RDNA4R.dev;
+        rdna4rt_buf_pool_reset(&g_rtPrimPool.pool);
+    }
+    int ok = rdna4rt_buf_pool_pop(&g_rtPrimPool.pool, needSize, out);
+    pthread_mutex_unlock(&g_rtPrimPool.mu);
+    return ok ? YES : NO;
+}
+
+static BOOL rdna4_rt_prim_pool_push(const rdna4rt_buf_pool_entry_t *entry) {
+    if (!RDNA4R.ok || !RDNA4R.dev || !entry) return NO;
+    pthread_mutex_lock(&g_rtPrimPool.mu);
+    if (g_rtPrimPool.dev == VK_NULL_HANDLE) g_rtPrimPool.dev = RDNA4R.dev;
+    int ok = (g_rtPrimPool.dev == RDNA4R.dev) && rdna4rt_buf_pool_push(&g_rtPrimPool.pool, entry);
+    pthread_mutex_unlock(&g_rtPrimPool.mu);
+    return ok ? YES : NO;
+}
+
+@implementation GarnetASPrimData
+- (instancetype)initWithSize:(uint64_t)totalBytes kind:(uint32_t)kind count:(uint32_t)count
+                 entryStride:(uint32_t)entryStride refOffset:(uint32_t)refOffset error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
+    if (!totalBytes || !RDNA4R.ok || !RDNA4R.dev || !rdna4_vkGetBufferAddress) {
+        if (err) *err = rdna4_err(146, @"GarnetASPrimData: invalid size or Vulkan device unavailable");
+        return nil;
+    }
+    uint64_t alignedSize = 0u;
+    if (!rdna4rt_align_up_u64(totalBytes, RDNA4RT_PRIM_DATA_ALIGN, &alignedSize)) {
+        if (err) *err = rdna4_err(146, @"GarnetASPrimData: size overflow");
+        return nil;
+    }
+    uint64_t allocTarget = alignedSize;
+    uint64_t bucket = 0u;
+    BOOL poolable = rdna4rt_staging_bucket_size(alignedSize, &bucket) ? YES : NO;
+    if (poolable) {
+        rdna4rt_buf_pool_entry_t recycled;
+        if (rdna4_rt_prim_pool_pop(bucket, &recycled)) {
+            _buf = (VkBuffer)(uintptr_t)recycled.buf_handle;
+            _mem = (VkDeviceMemory)(uintptr_t)recycled.mem_handle;
+            _bda = (VkDeviceAddress)recycled.bda;
+            _capacity = recycled.cap;
+            _allocatedSize = recycled.alloc_size;
+            _pooled = YES;
+            _totalBytes = totalBytes;
+            _kind = kind;
+            _count = count;
+            _entryStride = entryStride;
+            _refOffset = refOffset;
+            return self;
+        }
+        allocTarget = bucket;
+    }
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = allocTarget,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+    };
+    VkResult r = vkCreateBuffer(RDNA4R.dev, &bci, NULL, &_buf);
+    if (r != VK_SUCCESS || !_buf) {
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"GarnetASPrimData vkCreateBuffer = %d", r]);
+        return nil;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(RDNA4R.dev, _buf, &mr);
+    int mt = rdna4_find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt < 0) {
+        if (err) *err = rdna4_err(146, @"GarnetASPrimData: no device-local memory type");
+        return nil;
+    }
+    VkMemoryAllocateFlagsInfo afi = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    };
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &afi,
+        .allocationSize = mr.size,
+        .memoryTypeIndex = (uint32_t)mt
+    };
+    r = vkAllocateMemory(RDNA4R.dev, &mai, NULL, &_mem);
+    if (r != VK_SUCCESS || !_mem) {
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"GarnetASPrimData vkAllocateMemory = %d", r]);
+        return nil;
+    }
+    _allocatedSize = mr.size;
+    atomic_fetch_add(&rdna4_alloc_total, _allocatedSize);
+    r = vkBindBufferMemory(RDNA4R.dev, _buf, _mem, 0);
+    if (r != VK_SUCCESS) {
+        if (err) *err = rdna4_err(146, [NSString stringWithFormat:@"GarnetASPrimData vkBindBufferMemory = %d", r]);
+        return nil;
+    }
+    VkBufferDeviceAddressInfo bdaInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = _buf
+    };
+    _bda = rdna4_vkGetBufferAddress(RDNA4R.dev, &bdaInfo);
+    if (!_bda) {
+        if (err) *err = rdna4_err(146, @"GarnetASPrimData: zero buffer device address");
+        return nil;
+    }
+    _capacity = allocTarget;
+    _pooled = poolable;
+    _totalBytes = totalBytes;
+    _kind = kind;
+    _count = count;
+    _entryStride = entryStride;
+    _refOffset = refOffset;
+    return self;
+}
+
+- (void)dealloc {
+    free(_blasHeaders);
+    _blasHeaders = NULL;
+    _referencedPrimData = nil;
+    if (_pooled && _buf && _mem && _bda && RDNA4R.ok) {
+        rdna4rt_buf_pool_entry_t entry = {
+            .buf_handle = (uint64_t)(uintptr_t)_buf,
+            .mem_handle = (uint64_t)(uintptr_t)_mem,
+            .bda = (uint64_t)_bda,
+            .cap = _capacity,
+            .alloc_size = _allocatedSize
+        };
+        if (rdna4_rt_prim_pool_push(&entry)) {
+            _buf = VK_NULL_HANDLE;
+            _mem = VK_NULL_HANDLE;
+            _bda = 0u;
+            _capacity = 0u;
+            _allocatedSize = 0u;
+            _pooled = NO;
+            return;
+        }
+    }
+    if (RDNA4R.ok) {
+        if (_buf) vkDestroyBuffer(RDNA4R.dev, _buf, NULL);
+        if (_mem) {
+            vkFreeMemory(RDNA4R.dev, _mem, NULL);
+            atomic_fetch_sub(&rdna4_alloc_total, _allocatedSize);
+        }
+    }
+    _buf = VK_NULL_HANDLE;
+    _mem = VK_NULL_HANDLE;
+    _bda = 0u;
+    _capacity = 0u;
+    _pooled = NO;
+}
+@end
+
+// Backing Private VkBuffer + VkDeviceMemory (standalone or MTLHeap suballocated). Held strongly by
+// GarnetASHandle so Vulkan always destroys VkAccelerationStructureKHR before its storage VkBuffer
+// and VkDeviceMemory (and before RDNA4Heap detaches the backing block).
+
+@implementation GarnetASStorage
+- (void)rdna4AbortHeapConstruction {
+    RDNA4Heap *heap = _hpHeap;
+    uint64_t bid = _hpId, block = _hpBlk, lease = _hpLease;
+    const BOOL bound = _hpBacking != nil;
+    if (_hpBacking) {
+        [_hpBacking destroyHandles];
+        _buf = VK_NULL_HANDLE;
+    } else if (RDNA4R.ok && _buf) {
+        vkDestroyBuffer(RDNA4R.dev, _buf, NULL);
+        _buf = VK_NULL_HANDLE;
+    }
+    _hpBacking = nil;
+    if (heap && block && bound) [heap rdna4CloseBackingHandle:block];
+    if (heap && lease) [heap rdna4AbandonBacking:lease];
+    if (heap && bid) [heap rdna4Free:bid];
+    _hpHeap = nil;
+    _hpId = _hpBlk = _hpLease = _hpBindOff = _hpPhysSize = 0u;
+    _hpDedicated = NO;
+    _hpOff = _hpSize = 0u;
+}
+
+- (instancetype)initWithBackingSize:(uint64_t)backingSize error:(NSError **)err {
+    return [self initWithBackingSize:backingSize heap:nil offset:0 hasOffset:NO error:err];
+}
+
+- (instancetype)initWithBackingSize:(uint64_t)backingSize heap:(RDNA4Heap *)heap
+                             offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset error:(NSError **)err {
+    self = [super init];
+    if (!self) return nil;
+    _hpHeap = heap;
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = backingSize,
@@ -1620,6 +2113,100 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
         if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"accel storage vkCreateBuffer = %d", r]);
         return nil;
     }
+    if (heap) {
+        if ([heap storageMode] != MTLStorageModePrivate) {
+            if (err) *err = rdna4_err(142, @"heap acceleration structures require MTLStorageModePrivate heap");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        VkMemoryRequirements mr;
+        BOOL prefersDedicated = NO, requiresDedicated = NO;
+        if (!rdna4_requirements2(_buf, VK_NULL_HANDLE, &mr, &prefersDedicated, &requiresDedicated, YES)) {
+            if (err) *err = rdna4_err(142, @"heap acceleration structures require vkGetBufferMemoryRequirements2");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        (void)prefersDedicated;
+        if (requiresDedicated) {
+            if (err) *err = rdna4_err(142, @"acceleration structure storage requires dedicated memory and cannot be suballocated from a heap");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        if (mr.alignment < RDNA4RT_HEAP_AS_ALIGN) mr.alignment = RDNA4RT_HEAP_AS_ALIGN;
+        uint64_t alignedMrSize = 0u;
+        if (!rdna4rt_align_up_u64((uint64_t)mr.size, RDNA4RT_HEAP_AS_ALIGN, &alignedMrSize)) {
+            if (err) *err = rdna4_err(142, @"heap acceleration structure requirement size overflow");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        mr.size = alignedMrSize;
+
+        VkDeviceMemory hmem = VK_NULL_HANDLE;
+        uint64_t bindOff = 0u, rangeSize = 0u;
+        uint8_t *map = NULL;
+        if (hasOffset) {
+            _hpOff = offset;
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquirePlacementBackingForBuffer:_buf image:VK_NULL_HANDLE requirements:mr
+                                                      offset:offset hostImport:NO requiresDedicated:NO
+                                                         mem:&hmem offset:&bindOff map:&map block:&_hpBlk
+                                                       lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+        } else {
+            if (![heap rdna4ReserveRequirements:mr offset:&_hpOff id:&_hpId]) {
+                if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"heap has no logical range for a %llu-byte acceleration structure",
+                                                (unsigned long long)mr.size]);
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+            _hpSize = (NSUInteger)mr.size;
+            if (![heap rdna4AcquireBackingForBuffer:_buf image:VK_NULL_HANDLE requirements:mr
+                                          dedicated:NO hostImport:NO
+                                                mem:&hmem offset:&bindOff map:&map block:&_hpBlk
+                                              lease:&_hpLease rangeSize:&rangeSize error:err]) {
+                [self rdna4AbortHeapConstruction];
+                return nil;
+            }
+        }
+        (void)map;
+        _hpBindOff = bindOff;
+        _hpPhysSize = rangeSize;
+        _hpDedicated = NO;
+        _allocatedSize = mr.size;
+        r = vkBindBufferMemory(RDNA4R.dev, _buf, hmem, bindOff);
+        if (r != VK_SUCCESS) {
+            if (err) *err = rdna4_err(142, [NSString stringWithFormat:@"accel storage vkBindBufferMemory = %d (heap offset %llu)",
+                                            r, (unsigned long long)bindOff]);
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        VkBufferDeviceAddressInfo bdaInfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = _buf
+        };
+        _deviceAddress = rdna4_vkGetBufferAddress(RDNA4R.dev, &bdaInfo);
+        if (!_deviceAddress) {
+            if (err) *err = rdna4_err(142, @"heap accel storage: zero buffer device address");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        RDNA4HeapBacking *backing = [[RDNA4HeapBacking alloc] initWithBuffer:_buf image:VK_NULL_HANDLE view:VK_NULL_HANDLE];
+        if (!backing || ![heap rdna4BindSucceeded:_hpBlk lease:_hpLease owner:backing]) {
+            if (backing) {
+                [backing destroyHandles];
+                _buf = VK_NULL_HANDLE;
+            }
+            if (err) *err = rdna4_err(142, @"cannot retain heap acceleration structure backing");
+            [self rdna4AbortHeapConstruction];
+            return nil;
+        }
+        _hpBacking = backing;
+        _backingSize = backingSize;
+        return self;
+    }
+
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(RDNA4R.dev, _buf, &mr);
     int mt = rdna4_find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1659,6 +2246,17 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 }
 
 - (void)dealloc {
+    if (_hpHeap && _hpBlk) {
+        RDNA4Heap *heap = _hpHeap;
+        RDNA4HeapBacking *backing = _hpBacking;
+        uint64_t blk = _hpBlk, lease = _hpLease;
+        _hpBacking = nil;
+        _hpHeap = nil;
+        _hpBlk = _hpLease = _hpBindOff = _hpPhysSize = _hpId = 0u;
+        _buf = VK_NULL_HANDLE;
+        [heap rdna4DetachBacking:backing block:blk lease:lease];
+        return;
+    }
     if (RDNA4R.ok) {
         if (_buf) vkDestroyBuffer(RDNA4R.dev, _buf, NULL);
         if (_mem) {
@@ -1738,6 +2336,12 @@ static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
 RDNA4_DNR(GarnetAccelerationStructure)
 
 - (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind error:(NSError **)err {
+    return [self initWithDevice:dev size:size initialKind:kind heap:nil offset:0 hasOffset:NO error:err];
+}
+
+- (instancetype)initWithDevice:(id)dev size:(NSUInteger)size initialKind:(rdna4rt_kind_t)kind
+                          heap:(RDNA4Heap *)heap offset:(NSUInteger)offset hasOffset:(BOOL)hasOffset
+                         error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
     if (!dev || size == 0) {
@@ -1759,8 +2363,24 @@ RDNA4_DNR(GarnetAccelerationStructure)
         if (err) *err = rdna4_err(144, @"acceleration structure size exceeds device buffer limit");
         return nil;
     }
-    GarnetASStorage *storage = [[GarnetASStorage alloc] initWithBackingSize:backingSize error:err];
+    GarnetASStorage *storage = [[GarnetASStorage alloc] initWithBackingSize:backingSize
+                                                                       heap:heap
+                                                                     offset:offset
+                                                                  hasOffset:hasOffset
+                                                                      error:err];
     if (!storage) return nil;
+    _storage = storage;
+    if (heap) {
+        _hpHeap = storage->_hpHeap;
+        _hpOff = storage->_hpOff;
+        _hpSize = storage->_hpSize;
+        _hpId = storage->_hpId;
+        _hpBlk = storage->_hpBlk;
+        _hpLease = storage->_hpLease;
+        _hpBindOff = storage->_hpBindOff;
+        _hpPhysSize = storage->_hpPhysSize;
+        _hpDedicated = storage->_hpDedicated;
+    }
     GarnetASHandle *handle = nil;
     if (kind == RDNA4RT_KIND_BLAS || kind == RDNA4RT_KIND_TLAS) {
         handle = [[GarnetASHandle alloc] initWithStorage:storage kind:kind error:err];
@@ -1770,17 +2390,24 @@ RDNA4_DNR(GarnetAccelerationStructure)
     _muInit = YES;
     _dev = dev;
     _size = size;
-    _storage = storage;
     _handle = handle;
     rdna4rt_meta_init(&_meta, (uint64_t)size, kind);
-    RDNA4LOGR("GarnetAccelerationStructure %p: size %lu (backing %llu, alloc %llu, kind %u)",
+    RDNA4LOGR("GarnetAccelerationStructure %p: size %lu (backing %llu, alloc %llu, kind %u, heap %p off %lu)",
               (__bridge void *)self, (unsigned long)size,
-              (unsigned long long)backingSize, (unsigned long long)storage->_allocatedSize, (unsigned)kind);
+              (unsigned long long)backingSize, (unsigned long long)storage->_allocatedSize,
+              (unsigned)kind, (__bridge void *)heap, (unsigned long)(heap ? _hpOff : 0u));
     return self;
 }
 
 - (void)dealloc {
+    uint64_t regAs = _registeredAsBda;
+    uint64_t regPayload = _registeredPayloadBda;
+    _registeredAsBda = 0u;
+    _registeredPayloadBda = 0u;
+    if (regAs) rdna4_rt_prim_table_unregister_cpu(regAs, regPayload);
+    _primData = nil;
     _handle = nil;
+    RDNA4_HEAP_RETIRE;
     _storage = nil;
     if (_muInit) pthread_mutex_destroy(&_mu);
 }
@@ -1812,6 +2439,47 @@ RDNA4_DNR(GarnetAccelerationStructure)
     GarnetASHandle *h = _handle;
     pthread_mutex_unlock(&_mu);
     return h;
+}
+
+- (GarnetASPrimData *)rdna4CurrentPrimData {
+    pthread_mutex_lock(&_mu);
+    GarnetASPrimData *pd = _primData;
+    pthread_mutex_unlock(&_mu);
+    return pd;
+}
+
+- (BOOL)rdna4SetPrimData:(GarnetASPrimData *)primData forAsAddress:(uint64_t)asBda
+           commandBuffer:(RDNA4CommandBuffer *)cb vkCmdBuffer:(VkCommandBuffer)cmd error:(NSError **)err {
+    pthread_mutex_lock(&_mu);
+    GarnetASPrimData *oldPrim = _primData;
+    uint64_t oldAsBda = _registeredAsBda;
+    uint64_t oldPayloadBda = _registeredPayloadBda;
+    if (!primData) {
+        _primData = nil;
+        _registeredAsBda = 0u;
+        _registeredPayloadBda = 0u;
+        pthread_mutex_unlock(&_mu);
+        if (oldPrim && cb) [cb rdna4RetainEncoded:oldPrim];
+        if (oldAsBda)
+            return rdna4_rt_prim_table_clear_cmd(cmd, cb, oldAsBda, oldPayloadBda, err);
+        return YES;
+    }
+    pthread_mutex_unlock(&_mu);
+    if (!rdna4_rt_prim_table_register_cmd(cmd, cb, asBda, (uint64_t)primData->_bda, primData->_count,
+                                          primData->_entryStride, primData->_refOffset, primData->_kind, err))
+        return NO;
+    pthread_mutex_lock(&_mu);
+    oldPrim = _primData;
+    oldAsBda = _registeredAsBda;
+    oldPayloadBda = _registeredPayloadBda;
+    _primData = primData;
+    _registeredAsBda = asBda;
+    _registeredPayloadBda = (uint64_t)primData->_bda;
+    pthread_mutex_unlock(&_mu);
+    if (oldPrim && oldPrim != primData && cb) [cb rdna4RetainEncoded:oldPrim];
+    if (oldAsBda && oldAsBda != asBda)
+        return rdna4_rt_prim_table_clear_cmd(cmd, cb, oldAsBda, oldPayloadBda, err);
+    return YES;
 }
 
 - (VkAccelerationStructureKHR)rdna4VkAccelerationStructure {
@@ -1855,13 +2523,24 @@ RDNA4_DNR(GarnetAccelerationStructure)
 - (NSUInteger)allocatedSize { return _storage ? (NSUInteger)_storage->_allocatedSize : _size; }
 - (MTLStorageMode)storageMode { return MTLStorageModePrivate; }
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
-- (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
-- (NSUInteger)resourceOptions { return MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked; }
+- (MTLHazardTrackingMode)hazardTrackingMode {
+    return _hpHeap ? [_hpHeap hazardTrackingMode] : MTLHazardTrackingModeTracked;
+}
+- (NSUInteger)resourceOptions {
+    return MTLResourceStorageModePrivate | ((NSUInteger)[self hazardTrackingMode] << 8);
+}
 - (RDNA4Heap *)rdna4ResourceHeap { return _hpHeap; }
-- (NSUInteger)rdna4ResourceHeapOffset { return 0; }
-- (BOOL)rdna4ResourceAliasable { return NO; }
-- (void)rdna4ResourceMakeAliasable {}
-- (BOOL)rdna4ResourceAliases:(id)other { (void)other; return NO; }
+- (NSUInteger)rdna4ResourceHeapOffset {
+    return (_hpHeap && [_hpHeap type] == MTLHeapTypePlacement) ? _hpOff : 0;
+}
+- (BOOL)rdna4ResourceAliasable { return _hpAl; }
+- (void)rdna4ResourceMakeAliasable { RDNA4_HEAP_RETIRE; }
+- (BOOL)rdna4ResourceAliases:(id)other {
+    return _hpHeap && _hpBlk && [_hpHeap rdna4Block:_hpBlk offset:_hpBindOff size:_hpPhysSize aliases:other];
+}
+- (uint64_t)rdna4BackingBlock { return _hpBlk; }
+- (uint64_t)rdna4BackingOffset { return _hpBindOff; }
+- (uint64_t)rdna4BackingSize { return _hpPhysSize; }
 // Bridge 3 (Metal 3 Bindless): return 64-bit GPU BDA (valid before & after build via Wave 0 Invariant #2).
 RDNA4_RESOURCE_SPI_CUSTOM_UID([self rdna4BindlessGPUAddress] ?: rdna4_resource_uid(&_uid))
 @end
@@ -1878,6 +2557,11 @@ typedef struct {
     VkAccelerationStructureGeometryKHR *vkGeoms;
     VkAccelerationStructureBuildRangeInfoKHR *vkRanges;
     uint32_t *maxPrimCounts;
+    rdna4rt_prim_data_geom_plan_t *primPlans;
+    VkBuffer *primSrcVkBufs;
+    uint64_t *primSrcVkOffs;
+    VkBuffer tlasInstStgBuf;
+    uint32_t tlasInstanceCount;
     VkAccelerationStructureBuildSizesInfoKHR vkSizes;
     rdna4rt_sizes_t metalSizes;
     BOOL hasInstDispatch;
@@ -1891,10 +2575,18 @@ static void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
     free(p->vkGeoms);
     free(p->vkRanges);
     free(p->maxPrimCounts);
+    free(p->primPlans);
+    free(p->primSrcVkBufs);
+    free(p->primSrcVkOffs);
     free(p->xformPCs);
     p->vkGeoms = NULL;
     p->vkRanges = NULL;
     p->maxPrimCounts = NULL;
+    p->primPlans = NULL;
+    p->primSrcVkBufs = NULL;
+    p->primSrcVkOffs = NULL;
+    p->tlasInstStgBuf = VK_NULL_HANDLE;
+    p->tlasInstanceCount = 0u;
     p->xformPCs = NULL;
     p->xformDispatchCount = 0u;
     p->hasInstDispatch = NO;
@@ -1953,17 +2645,69 @@ static BOOL rdna4_rt_check_buffer(id obj, id dev, BOOL writable, RDNA4Buffer **o
     return YES;
 }
 
-static BOOL rdna4_rt_descriptor_has_primitive_data(id geomDesc) {
-    SEL sel = sel_registerName("primitiveDataBuffer");
-    if (![geomDesc respondsToSelector:sel]) return NO;
-    id buf = ((id (*)(id, SEL))objc_msgSend)(geomDesc, sel);
-    return buf != nil;
+static BOOL rdna4_rt_extract_prim_data_geom(
+    id gd, id dev, uint32_t primCount, BOOL collectPrimBuffers,
+    NSMutableArray *retainedObjects,
+    rdna4rt_prim_data_geom_plan_t *outPlan,
+    VkBuffer *outVkBuf, uint64_t *outVkOff,
+    NSError **err)
+{
+    memset(outPlan, 0, sizeof(*outPlan));
+    *outVkBuf = VK_NULL_HANDLE;
+    *outVkOff = 0u;
+    SEL bufSel = sel_registerName("primitiveDataBuffer");
+    if (![gd respondsToSelector:bufSel]) return YES;
+    id rawPbuf = ((id (*)(id, SEL))objc_msgSend)(gd, bufSel);
+    if (!rawPbuf) return YES;
+    RDNA4Buffer *pbuf = nil;
+    NSString *bwhy = nil;
+    if (!rdna4_rt_check_buffer(rawPbuf, dev, NO, &pbuf, &bwhy)) {
+        if (err) *err = rdna4_err(145, bwhy ?: @"invalid primitiveDataBuffer");
+        return NO;
+    }
+    NSUInteger pOff = 0, pElemSz = 0, pStride = 0;
+    SEL offSel = sel_registerName("primitiveDataBufferOffset");
+    SEL elemSel = sel_registerName("primitiveDataElementSize");
+    SEL strideSel = sel_registerName("primitiveDataStride");
+    if ([gd respondsToSelector:offSel])
+        pOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, offSel);
+    if ([gd respondsToSelector:elemSel])
+        pElemSz = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, elemSel);
+    if ([gd respondsToSelector:strideSel])
+        pStride = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, strideSel);
+    rdna4rt_prim_data_geom_desc_t pdesc = {
+        .has_buf = 1,
+        .buf_len = (uint64_t)[pbuf length],
+        .buf_offset = (uint64_t)pOff,
+        .element_size = (uint64_t)pElemSz,
+        .stride = (uint64_t)pStride,
+        .prim_count = (uint64_t)primCount
+    };
+    rdna4rt_err_t pe = rdna4rt_validate_prim_data_geom(&pdesc, collectPrimBuffers ? 1 : 0, outPlan);
+    if (pe != RDNA4RT_OK) {
+        if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"primitiveDataBuffer: %s",
+                                        rdna4rt_err_str(pe)]);
+        return NO;
+    }
+    if (collectPrimBuffers && outPlan->present && outPlan->copy_bytes > 0u) {
+        VkDeviceSize srcVkOff = 0u;
+        if (__builtin_add_overflow([pbuf rdna4VkOffset], (VkDeviceSize)outPlan->src_offset, &srcVkOff)) {
+            if (err) *err = rdna4_err(145, @"primitiveDataBuffer offset overflow");
+            return NO;
+        }
+        *outVkBuf = [pbuf vkBuffer];
+        *outVkOff = (uint64_t)srcVkOff;
+        if (retainedObjects) [retainedObjects addObject:pbuf];
+    }
+    return YES;
 }
 
-static BOOL rdna4_rt_build_plan_make(
-    id dev, MTLAccelerationStructureDescriptor *desc, BOOL requireBuffers,
+static BOOL rdna4_rt_build_plan_make_ex(
+    id dev, MTLAccelerationStructureDescriptor *desc,
+    BOOL requireBuffers, BOOL validatePrimData, BOOL collectPrimBuffers,
     BOOL useOverrideUsage, uint64_t overrideUsage,
     NSMutableArray *retainedObjects,
+    NSMutableArray<GarnetASPrimData *> *tlasBlasPrimDatas,
     RDNA4RTBuildPlan *plan, NSError **err) {
     memset(plan, 0, sizeof(*plan));
     if (!dev || !desc) {
@@ -2045,8 +2789,12 @@ static BOOL rdna4_rt_build_plan_make(
             plan->vkGeoms = (VkAccelerationStructureGeometryKHR *)calloc(gcount, sizeof(*plan->vkGeoms));
             plan->vkRanges = (VkAccelerationStructureBuildRangeInfoKHR *)calloc(gcount, sizeof(*plan->vkRanges));
             plan->maxPrimCounts = (uint32_t *)calloc(gcount, sizeof(*plan->maxPrimCounts));
+            plan->primPlans = (rdna4rt_prim_data_geom_plan_t *)calloc(gcount, sizeof(*plan->primPlans));
+            plan->primSrcVkBufs = (VkBuffer *)calloc(gcount, sizeof(*plan->primSrcVkBufs));
+            plan->primSrcVkOffs = (uint64_t *)calloc(gcount, sizeof(*plan->primSrcVkOffs));
             geomSigs = (uint32_t *)calloc(gcount, sizeof(*geomSigs));
-            if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts || !geomSigs) {
+            if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts ||
+                !plan->primPlans || !plan->primSrcVkBufs || !plan->primSrcVkOffs || !geomSigs) {
                 free(geomSigs);
                 rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, @"out of host memory building BLAS plan");
@@ -2079,11 +2827,6 @@ static BOOL rdna4_rt_build_plan_make(
                 rdna4rt_err_t me = rdna4rt_validate_motion_params(&mp, allowMotion);
                 free(geomSigs); rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(me != RDNA4RT_OK ? me : RDNA4RT_ERR_MOTION_UNSUPPORTED)]);
-                return NO;
-            }
-            if (rdna4_rt_descriptor_has_primitive_data(gd)) {
-                free(geomSigs); rdna4_rt_plan_free(plan);
-                if (err) *err = rdna4_err(145, @"per-primitive data buffers are not supported in acceleration structure builds");
                 return NO;
             }
 
@@ -2168,6 +2911,14 @@ static BOOL rdna4_rt_build_plan_make(
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"triangle geometry[%lu]: %s", (unsigned long)i, rdna4rt_err_str(te)]);
                     return NO;
+                }
+                if (validatePrimData) {
+                    if (!rdna4_rt_extract_prim_data_geom(gd, dev, tplan.primitive_count, collectPrimBuffers,
+                                                         retainedObjects, &plan->primPlans[i],
+                                                         &plan->primSrcVkBufs[i], &plan->primSrcVkOffs[i], err)) {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        return NO;
+                    }
                 }
 
                 VkDeviceAddress transformAddr = tplan.transform_addr;
@@ -2284,6 +3035,14 @@ static BOOL rdna4_rt_build_plan_make(
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"bounding-box geometry[%lu]: %s", (unsigned long)i, rdna4rt_err_str(ae)]);
                     return NO;
+                }
+                if (validatePrimData) {
+                    if (!rdna4_rt_extract_prim_data_geom(gd, dev, aplan.primitive_count, collectPrimBuffers,
+                                                         retainedObjects, &plan->primPlans[i],
+                                                         &plan->primSrcVkBufs[i], &plan->primSrcVkOffs[i], err)) {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        return NO;
+                    }
                 }
                 if (requireBuffers && bbuf) [retainedObjects addObject:bbuf];
                 plan->vkGeoms[i] = (VkAccelerationStructureGeometryKHR){
@@ -2408,6 +3167,11 @@ static BOOL rdna4_rt_build_plan_make(
                 blasAddrs[bi] = bhandle->_deviceAddress;
                 [retainedObjects addObject:blas];
                 [retainedObjects addObject:bhandle];
+                GarnetASPrimData *bprim = [blas rdna4CurrentPrimData];
+                if (bprim) {
+                    [retainedObjects addObject:bprim];
+                    if (tlasBlasPrimDatas) [tlasBlasPrimDatas addObject:bprim];
+                }
             }
 
             uint64_t stageBytes = 0;
@@ -2461,6 +3225,8 @@ static BOOL rdna4_rt_build_plan_make(
                 }
             }
             vkInstAddr = stg->_addr;
+            plan->tlasInstStgBuf = stg->_buf;
+            plan->tlasInstanceCount = tplan.instance_count;
             [retainedObjects addObject:stg];
             [retainedObjects addObject:instBuf];
         } else if (requireBuffers && instBuf) {
@@ -2569,6 +3335,8 @@ static BOOL rdna4_rt_build_plan_make(
                 .blas_count = 0u
             };
             vkInstAddr = stg->_addr;
+            plan->tlasInstStgBuf = stg->_buf;
+            plan->tlasInstanceCount = tplan.instance_count;
             [retainedObjects addObject:stg];
             [retainedObjects addObject:instBuf];
             [retainedObjects addObject:countBuf];
@@ -2601,6 +3369,11 @@ static BOOL rdna4_rt_build_plan_make(
         return NO;
     }
 
+    if (!requireBuffers && collectPrimBuffers) {
+        /* PerPrimitiveData-only refit skips vkCmdBuildAccelerationStructuresKHR and needs no scratch sizing. */
+        return YES;
+    }
+
     VkAccelerationStructureBuildGeometryInfoKHR sizeInfoReq = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
         .type = (plan->kind == RDNA4RT_KIND_TLAS)
@@ -2629,6 +3402,173 @@ static BOOL rdna4_rt_build_plan_make(
         if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(se)]);
         return NO;
     }
+    return YES;
+}
+
+static BOOL rdna4_rt_build_plan_make(
+    id dev, MTLAccelerationStructureDescriptor *desc, BOOL requireBuffers,
+    BOOL useOverrideUsage, uint64_t overrideUsage,
+    NSMutableArray *retainedObjects,
+    RDNA4RTBuildPlan *plan, NSError **err) {
+    return rdna4_rt_build_plan_make_ex(dev, desc, requireBuffers, YES, requireBuffers,
+                                       useOverrideUsage, overrideUsage, retainedObjects, nil, plan, err);
+}
+
+static BOOL rdna4_rt_upload_prim_header(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb, VkBuffer dstBuf,
+    const void *hdrData, uint64_t hdrBytes, NSError **err)
+{
+    return rdna4_rt_cmd_write_buf_bytes(cmd, cb, dstBuf, 0u, hdrData, hdrBytes, err);
+}
+
+static BOOL rdna4_rt_record_blas_prim_snapshot(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    GarnetAccelerationStructure *dstAS, uint64_t dstAsBda,
+    const RDNA4RTBuildPlan *plan, NSError **err)
+{
+    if (!plan->primPlans || plan->geomCount == 0u)
+        return [dstAS rdna4SetPrimData:nil forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err];
+    uint64_t *sliceOffsets = (uint64_t *)calloc(plan->geomCount, sizeof(*sliceOffsets));
+    if (!sliceOffsets) {
+        if (err) *err = rdna4_err(146, @"out of host memory computing BLAS primitive data layout");
+        return NO;
+    }
+    uint64_t headerBytes = 0u, totalBytes = 0u;
+    int anyPrim = 0;
+    rdna4rt_err_t le = rdna4rt_blas_prim_layout_compute(
+        plan->primPlans, plan->geomCount, sliceOffsets, &headerBytes, &totalBytes, &anyPrim);
+    if (le != RDNA4RT_OK) {
+        free(sliceOffsets);
+        if (err) *err = rdna4_err(146, [NSString stringWithUTF8String:rdna4rt_err_str(le)]);
+        return NO;
+    }
+    if (!anyPrim) {
+        free(sliceOffsets);
+        return [dstAS rdna4SetPrimData:nil forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err];
+    }
+    GarnetASPrimData *pd = [[GarnetASPrimData alloc]
+        initWithSize:totalBytes kind:RDNA4RT_PRIM_KIND_BLAS count:plan->geomCount
+         entryStride:0u refOffset:0u error:err];
+    if (!pd) {
+        free(sliceOffsets);
+        return NO;
+    }
+    rdna4rt_geom_prim_entry_t *headers = (rdna4rt_geom_prim_entry_t *)calloc(plan->geomCount, sizeof(*headers));
+    if (!headers) {
+        free(sliceOffsets);
+        if (err) *err = rdna4_err(146, @"out of host memory building BLAS primitive headers");
+        return NO;
+    }
+    rdna4rt_err_t he = rdna4rt_blas_prim_build_headers(
+        (uint64_t)pd->_bda, plan->primPlans, sliceOffsets, plan->geomCount, headers);
+    if (he != RDNA4RT_OK) {
+        free(headers); free(sliceOffsets);
+        if (err) *err = rdna4_err(146, [NSString stringWithUTF8String:rdna4rt_err_str(he)]);
+        return NO;
+    }
+    pd->_blasHeaders = headers;
+
+    if (!rdna4_rt_upload_prim_header(cmd, cb, pd->_buf, headers, headerBytes, err)) {
+        free(sliceOffsets);
+        return NO;
+    }
+    for (uint32_t i = 0; i < plan->geomCount; i++) {
+        if (!plan->primPlans[i].present || plan->primPlans[i].copy_bytes == 0u) continue;
+        VkBufferCopy copy = {
+            .srcOffset = plan->primSrcVkOffs[i],
+            .dstOffset = sliceOffsets[i],
+            .size = plan->primPlans[i].copy_bytes
+        };
+        vkCmdCopyBuffer(cmd, plan->primSrcVkBufs[i], pd->_buf, 1u, &copy);
+    }
+    free(sliceOffsets);
+
+    if (![dstAS rdna4SetPrimData:pd forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err]) return NO;
+    [cb rdna4RetainEncoded:pd];
+    return YES;
+}
+
+static BOOL rdna4_rt_record_tlas_prim_snapshot(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    GarnetAccelerationStructure *dstAS, uint64_t dstAsBda,
+    const RDNA4RTBuildPlan *plan, NSArray<GarnetASPrimData *> *referencedBlasPrimData,
+    NSError **err)
+{
+    if (!plan->tlasInstStgBuf || plan->tlasInstanceCount == 0u)
+        return [dstAS rdna4SetPrimData:nil forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err];
+    uint64_t totalBytes = 0u;
+    if (!rdna4rt_mul_u64((uint64_t)plan->tlasInstanceCount, RDNA4RT_PRIM_TLAS_ENTRY_STRIDE, &totalBytes)) {
+        if (err) *err = rdna4_err(146, @"TLAS primitive table snapshot size overflow");
+        return NO;
+    }
+    GarnetASPrimData *pd = [[GarnetASPrimData alloc]
+        initWithSize:totalBytes kind:RDNA4RT_PRIM_KIND_TLAS count:plan->tlasInstanceCount
+         entryStride:RDNA4RT_PRIM_TLAS_ENTRY_STRIDE refOffset:RDNA4RT_PRIM_TLAS_REF_OFFSET error:err];
+    if (!pd) return NO;
+    if (referencedBlasPrimData.count > 0)
+        pd->_referencedPrimData = [referencedBlasPrimData copy];
+    VkBufferCopy copy = { .srcOffset = 0u, .dstOffset = 0u, .size = totalBytes };
+    vkCmdCopyBuffer(cmd, plan->tlasInstStgBuf, pd->_buf, 1u, &copy);
+    if (![dstAS rdna4SetPrimData:pd forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err]) return NO;
+    [cb rdna4RetainEncoded:pd];
+    return YES;
+}
+
+static BOOL rdna4_rt_record_prim_data_clone(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    GarnetAccelerationStructure *srcAS,
+    GarnetAccelerationStructure *dstAS, uint64_t dstAsBda,
+    NSError **err)
+{
+    GarnetASPrimData *srcPd = [srcAS rdna4CurrentPrimData];
+    if (!srcPd)
+        return [dstAS rdna4SetPrimData:nil forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err];
+    [cb rdna4RetainEncoded:srcPd];
+    GarnetASPrimData *dstPd = [[GarnetASPrimData alloc]
+        initWithSize:srcPd->_totalBytes kind:srcPd->_kind count:srcPd->_count
+         entryStride:srcPd->_entryStride refOffset:srcPd->_refOffset error:err];
+    if (!dstPd) return NO;
+    if (srcPd->_referencedPrimData.count > 0)
+        dstPd->_referencedPrimData = [srcPd->_referencedPrimData copy];
+
+    if (srcPd->_kind == RDNA4RT_PRIM_KIND_BLAS) {
+        uint64_t headerBytes = (uint64_t)srcPd->_count * (uint64_t)sizeof(rdna4rt_geom_prim_entry_t);
+        if (!srcPd->_blasHeaders || headerBytes > srcPd->_totalBytes) {
+            if (err) *err = rdna4_err(146, @"BLAS primitive data clone: missing or corrupt source headers");
+            return NO;
+        }
+        rdna4rt_geom_prim_entry_t *rebased = (rdna4rt_geom_prim_entry_t *)calloc(srcPd->_count, sizeof(*rebased));
+        if (!rebased) {
+            if (err) *err = rdna4_err(146, @"out of host memory rebasing BLAS primitive headers");
+            return NO;
+        }
+        rdna4rt_err_t re = rdna4rt_blas_prim_rebase_headers(
+            srcPd->_blasHeaders, srcPd->_count,
+            (uint64_t)srcPd->_bda, (uint64_t)dstPd->_bda, srcPd->_totalBytes,
+            rebased);
+        if (re != RDNA4RT_OK) {
+            free(rebased);
+            if (err) *err = rdna4_err(146, [NSString stringWithUTF8String:rdna4rt_err_str(re)]);
+            return NO;
+        }
+        dstPd->_blasHeaders = rebased;
+        if (!rdna4_rt_upload_prim_header(cmd, cb, dstPd->_buf, rebased, headerBytes, err))
+            return NO;
+        if (srcPd->_totalBytes > headerBytes) {
+            VkBufferCopy tailCopy = {
+                .srcOffset = headerBytes,
+                .dstOffset = headerBytes,
+                .size = srcPd->_totalBytes - headerBytes
+            };
+            vkCmdCopyBuffer(cmd, srcPd->_buf, dstPd->_buf, 1u, &tailCopy);
+        }
+    } else {
+        VkBufferCopy fullCopy = { .srcOffset = 0u, .dstOffset = 0u, .size = srcPd->_totalBytes };
+        vkCmdCopyBuffer(cmd, srcPd->_buf, dstPd->_buf, 1u, &fullCopy);
+    }
+
+    if (![dstAS rdna4SetPrimData:dstPd forAsAddress:dstAsBda commandBuffer:cb vkCmdBuffer:cmd error:err]) return NO;
+    [cb rdna4RetainEncoded:dstPd];
     return YES;
 }
 
@@ -2739,9 +3679,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     }
 
     NSMutableArray *retained = [NSMutableArray array];
+    NSMutableArray<GarnetASPrimData *> *tlasBlasPrimDatas = [NSMutableArray array];
     RDNA4RTBuildPlan plan;
     NSError *err = nil;
-    if (!rdna4_rt_build_plan_make(dev, descriptor, YES, NO, 0u, retained, &plan, &err)) {
+    if (!rdna4_rt_build_plan_make_ex(dev, descriptor, YES, YES, YES, NO, 0u, retained, tlasBlasPrimDatas, &plan, &err)) {
         [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: invalid descriptor"];
         return;
     }
@@ -2808,6 +3749,14 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         return;
     }
     RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
+    BOOL primOk = (plan.kind == RDNA4RT_KIND_BLAS)
+        ? rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err)
+        : rdna4_rt_record_tlas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, tlasBlasPrimDatas, &err);
+    if (!primOk) {
+        rdna4_rt_plan_free(&plan);
+        [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: primitive data snapshot failed"];
+        return;
+    }
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_build(&dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
@@ -2852,14 +3801,13 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         return;
     }
 
-    if (((uint64_t)options & ~(uint64_t)RDNA4RT_REFIT_OPT_KNOWN_MASK) != 0u) {
+    if (options == 0u || ((uint64_t)options & ~(uint64_t)RDNA4RT_REFIT_OPT_KNOWN_MASK) != 0u) {
         [_cb rdna4Fail:@"refitAccelerationStructure: invalid refit options"];
         return;
     }
-    if (!(options & RDNA4RT_REFIT_OPT_VERTEX_DATA) && (options & RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA)) {
-        [_cb rdna4Fail:@"refitAccelerationStructure: per-primitive-only refit without vertex data is unsupported"];
-        return;
-    }
+    const BOOL updVerts = rdna4rt_refit_updates_vertices((uint64_t)options) != 0;
+    const BOOL updPrim = rdna4rt_refit_updates_prim_data((uint64_t)options) != 0;
+    const BOOL primOnly = rdna4rt_refit_is_prim_data_only((uint64_t)options) != 0;
 
     GarnetAccelerationStructure *srcAS = (GarnetAccelerationStructure *)sourceAccelerationStructure;
     GarnetAccelerationStructure *dstAS = (GarnetAccelerationStructure *)effectiveDst;
@@ -2870,17 +3818,21 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     }
 
     NSMutableArray *retained = [NSMutableArray array];
+    NSMutableArray<GarnetASPrimData *> *tlasBlasPrimDatas = [NSMutableArray array];
     RDNA4RTBuildPlan plan;
     NSError *err = nil;
-    if (!rdna4_rt_build_plan_make(dev, descriptor, YES, YES, srcMeta.usage, retained, &plan, &err)) {
+    if (!rdna4_rt_build_plan_make_ex(dev, descriptor, updVerts, updPrim, updPrim,
+                                     YES, srcMeta.usage, retained, tlasBlasPrimDatas, &plan, &err)) {
         [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: invalid descriptor"];
         return;
     }
 
     rdna4rt_accel_meta_t dstMeta = (dstAS == srcAS) ? srcMeta : [dstAS rdna4MetaSnapshot];
+    const uint64_t reqAsSize = primOnly ? 0u : plan.metalSizes.acceleration_structure_size;
+    const uint64_t checkTopo = primOnly ? 0u : plan.topologyHash;
     rdna4rt_err_t re = rdna4rt_state_can_refit(
-        &srcMeta, &dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
-        plan.geomCount, plan.topologyHash, (uint64_t)options);
+        &srcMeta, &dstMeta, plan.kind, reqAsSize,
+        plan.geomCount, checkTopo, (uint64_t)options);
     if (re != RDNA4RT_OK) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:[NSString stringWithFormat:@"refitAccelerationStructure: %s", rdna4rt_err_str(re)]];
@@ -2894,19 +3846,21 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         return;
     }
 
-    const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
     uint64_t scratchAddr = 0;
-    rdna4rt_err_t se = rdna4rt_resolve_scratch_addr(
-        scratch ? [scratch gpuAddress] : 0u,
-        scratch ? (uint64_t)[scratch length] : 0u,
-        (uint64_t)scratchBufferOffset,
-        plan.vkSizes.updateScratchSize,
-        rdna4rt_scratch_align(&m3),
-        &scratchAddr);
-    if (se != RDNA4RT_OK) {
-        rdna4_rt_plan_free(&plan);
-        [_cb rdna4Fail:[NSString stringWithFormat:@"refitAccelerationStructure scratchBuffer: %s", rdna4rt_err_str(se)]];
-        return;
+    if (updVerts) {
+        const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
+        rdna4rt_err_t se = rdna4rt_resolve_scratch_addr(
+            scratch ? [scratch gpuAddress] : 0u,
+            scratch ? (uint64_t)[scratch length] : 0u,
+            (uint64_t)scratchBufferOffset,
+            plan.vkSizes.updateScratchSize,
+            rdna4rt_scratch_align(&m3),
+            &scratchAddr);
+        if (se != RDNA4RT_OK) {
+            rdna4_rt_plan_free(&plan);
+            [_cb rdna4Fail:[NSString stringWithFormat:@"refitAccelerationStructure scratchBuffer: %s", rdna4rt_err_str(se)]];
+            return;
+        }
     }
 
     GarnetASHandle *dstHandle = (dstAS == srcAS) ? srcHandle : [dstAS rdna4EnsureHandleForKind:plan.kind error:&err];
@@ -2925,35 +3879,80 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     if (scratch) [_cb rdna4RetainEncoded:scratch];
     for (id obj in retained) [_cb rdna4RetainEncoded:obj];
 
-    VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
-        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type = (plan.kind == RDNA4RT_KIND_TLAS)
-            ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-            : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-        .flags = plan.vkBuildFlags,
-        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR,
-        .srcAccelerationStructure = srcHandle->_vkAS,
-        .dstAccelerationStructure = dstHandle->_vkAS,
-        .geometryCount = plan.geomCount,
-        .pGeometries = plan.vkGeoms,
-        .scratchData.deviceAddress = scratchAddr
-    };
-    VkAccelerationStructureBuildRangeInfoKHR dummyRange = { 0u, 0u, 0u, 0u };
-    const VkAccelerationStructureBuildRangeInfoKHR *pRanges = plan.geomCount ? plan.vkRanges : &dummyRange;
-
     VkCommandBuffer cmd = [_cb vk];
     const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
-    if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
-        rdna4_rt_plan_free(&plan);
-        [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: pre-build compute conversion failed"];
-        return;
+    if (primOnly) {
+        rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
+        if (dstAS != srcAS) {
+            VkCopyAccelerationStructureInfoKHR ci = {
+                .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR,
+                .src = srcHandle->_vkAS,
+                .dst = dstHandle->_vkAS,
+                .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR
+            };
+            RDNA4RTFn.cmdCopyAS(cmd, &ci);
+        }
+        BOOL primOk = YES;
+        if (plan.kind == RDNA4RT_KIND_BLAS) {
+            primOk = rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err);
+        } else if (dstAS != srcAS) {
+            primOk = rdna4_rt_record_prim_data_clone(cmd, _cb, srcAS, dstAS, (uint64_t)dstHandle->_deviceAddress, &err);
+        } else {
+            GarnetASPrimData *curPd = [srcAS rdna4CurrentPrimData];
+            if (curPd) [_cb rdna4RetainEncoded:curPd];
+        }
+        if (!primOk) {
+            rdna4_rt_plan_free(&plan);
+            [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: per-primitive data update failed"];
+            return;
+        }
+        rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
+    } else {
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+            .type = (plan.kind == RDNA4RT_KIND_TLAS)
+                ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+                : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+            .flags = plan.vkBuildFlags,
+            .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR,
+            .srcAccelerationStructure = srcHandle->_vkAS,
+            .dstAccelerationStructure = dstHandle->_vkAS,
+            .geometryCount = plan.geomCount,
+            .pGeometries = plan.vkGeoms,
+            .scratchData.deviceAddress = scratchAddr
+        };
+        VkAccelerationStructureBuildRangeInfoKHR dummyRange = { 0u, 0u, 0u, 0u };
+        const VkAccelerationStructureBuildRangeInfoKHR *pRanges = plan.geomCount ? plan.vkRanges : &dummyRange;
+
+        if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
+            rdna4_rt_plan_free(&plan);
+            [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: pre-build compute conversion failed"];
+            return;
+        }
+        RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
+
+        BOOL primOk = YES;
+        if (plan.kind == RDNA4RT_KIND_TLAS) {
+            primOk = rdna4_rt_record_tlas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, tlasBlasPrimDatas, &err);
+        } else if (updPrim) {
+            primOk = rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err);
+        } else if (dstAS != srcAS) {
+            primOk = rdna4_rt_record_prim_data_clone(cmd, _cb, srcAS, dstAS, (uint64_t)dstHandle->_deviceAddress, &err);
+        } else {
+            GarnetASPrimData *curPd = [srcAS rdna4CurrentPrimData];
+            if (curPd) [_cb rdna4RetainEncoded:curPd];
+        }
+        if (!primOk) {
+            rdna4_rt_plan_free(&plan);
+            [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: primitive data update failed"];
+            return;
+        }
+        rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
     }
-    RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
-    rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_refit(
-        &srcMeta, &dstMeta, plan.kind, plan.metalSizes.acceleration_structure_size,
-        plan.geomCount, plan.topologyHash, (uint64_t)options);
+        &srcMeta, &dstMeta, plan.kind, reqAsSize,
+        plan.geomCount, checkTopo, (uint64_t)options);
     [dstAS rdna4SetMeta:dstMeta];
     rdna4_rt_plan_free(&plan);
 }
@@ -3001,6 +4000,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
     RDNA4RTFn.cmdCopyAS(cmd, &ci);
+    if (!rdna4_rt_record_prim_data_clone(cmd, _cb, srcAS, dstAS, (uint64_t)dstHandle->_deviceAddress, &err)) {
+        [_cb rdna4Fail:err.localizedDescription ?: @"copyAccelerationStructure: primitive data clone failed"];
+        return;
+    }
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_copy(&srcMeta, &dstMeta, 0);
@@ -3155,6 +4158,10 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
     const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isCompQ);
     RDNA4RTFn.cmdCopyAS(cmd, &ci);
+    if (!rdna4_rt_record_prim_data_clone(cmd, _cb, srcAS, dstAS, (uint64_t)dstHandle->_deviceAddress, &err)) {
+        [_cb rdna4Fail:err.localizedDescription ?: @"copyAndCompactAccelerationStructure: primitive data clone failed"];
+        return;
+    }
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_POST_BUILD, isCompQ);
 
     (void)rdna4rt_state_apply_compact(&srcMeta, &dstMeta, 0, 0u);
@@ -3185,6 +4192,8 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         [_cb rdna4RetainEncoded:resource];
         GarnetASHandle *h = [(GarnetAccelerationStructure *)resource rdna4CurrentHandle];
         if (h) [_cb rdna4RetainEncoded:h];
+        GarnetASPrimData *pd = [(GarnetAccelerationStructure *)resource rdna4CurrentPrimData];
+        if (pd) [_cb rdna4RetainEncoded:pd];
         return;
     }
     [_cb rdna4UseResource:resource usage:(NSUInteger)usage];
@@ -3320,6 +4329,130 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_de
         initWithDevice:dev size:reqSize initialKind:kind error:&err];
     if (!as) RDNA4LOG("newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
                       (unsigned long)reqSize, err.localizedDescription.UTF8String);
+    return (id<MTLAccelerationStructure>)as;
+}
+
+GARNET_INTERNAL __attribute__((unused)) MTLSizeAndAlign rdna4_rt_device_heap_as_size_align_with_size(
+    id dev, NSUInteger size) {
+    MTLSizeAndAlign zero = { 0, 0 };
+    if (!dev || size == 0) return zero;
+    NSError *err = nil;
+    if (!rdna4_radv_open(&err)) {
+        RDNA4LOG("heapAccelerationStructureSizeAndAlignWithSize: RADV open failed: %s",
+                 err.localizedDescription.UTF8String);
+        return zero;
+    }
+    if (!rdna4_rt_resolve_funcs() || !RDNA4P.bmr2) {
+        RDNA4LOG("heapAccelerationStructureSizeAndAlignWithSize: acceleration structure or requirements2 unavailable");
+        return zero;
+    }
+    uint64_t backingSize = 0u;
+    if (!rdna4rt_align_up_u64((uint64_t)size, RDNA4RT_HEAP_AS_ALIGN, &backingSize)) return zero;
+    rdna4dc_caps caps = rdna4_device_caps();
+    if (!rdna4dc_buffer_ok(&caps, backingSize)) return zero;
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = backingSize,
+        .usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+    };
+    VkBuffer tmpBuf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(RDNA4R.dev, &bci, NULL, &tmpBuf);
+    if (r != VK_SUCCESS || !tmpBuf) return zero;
+    VkMemoryRequirements mr;
+    BOOL queried = rdna4_requirements2(tmpBuf, VK_NULL_HANDLE, &mr, NULL, NULL, YES);
+    vkDestroyBuffer(RDNA4R.dev, tmpBuf, NULL);
+    if (!queried) return zero;
+    uint64_t gran = RDNA4R.lim.bufferImageGranularity ? RDNA4R.lim.bufferImageGranularity : 1u;
+    rdna4rt_heap_size_align_t sa;
+    if (rdna4rt_heap_as_size_align(backingSize, (uint64_t)mr.size, (uint64_t)mr.alignment, gran, &sa) != RDNA4RT_OK ||
+        sa.size > NSUIntegerMax || sa.align > NSUIntegerMax)
+        return zero;
+    return (MTLSizeAndAlign){ .size = (NSUInteger)sa.size, .align = (NSUInteger)sa.align };
+}
+
+GARNET_INTERNAL __attribute__((unused)) MTLSizeAndAlign rdna4_rt_device_heap_as_size_align_with_descriptor(
+    id dev, MTLAccelerationStructureDescriptor *descriptor) {
+    MTLSizeAndAlign zero = { 0, 0 };
+    if (!dev || !descriptor) return zero;
+    MTLAccelerationStructureSizes sz = rdna4_rt_device_sizes(dev, descriptor);
+    if (sz.accelerationStructureSize == 0) return zero;
+    return rdna4_rt_device_heap_as_size_align_with_size(dev, sz.accelerationStructureSize);
+}
+
+GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_heap_new_as_with_size(
+    RDNA4Heap *heap, id dev, NSUInteger size, BOOL hasOffset, NSUInteger offset) {
+    if (!heap || !dev) return nil;
+    uint64_t alignedSize = 0u;
+    rdna4rt_err_t ve = rdna4rt_heap_as_validate_alloc(
+        (uint32_t)[heap storageMode], (uint32_t)[heap type], (uint64_t)[heap size],
+        (uint64_t)size, hasOffset ? 1 : 0, (uint64_t)offset, RDNA4RT_HEAP_AS_ALIGN, &alignedSize);
+    if (ve != RDNA4RT_OK) {
+        RDNA4LOG("heap newAccelerationStructureWithSize:%lu offset:%lu(has=%d) refused: %s",
+                 (unsigned long)size, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
+        return nil;
+    }
+    NSError *err = nil;
+    GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
+        initWithDevice:dev size:size initialKind:RDNA4RT_KIND_UNKNOWN
+                  heap:heap offset:offset hasOffset:hasOffset error:&err];
+    if (!as) {
+        RDNA4LOG("heap newAccelerationStructureWithSize:%lu failed: %s",
+                 (unsigned long)size, err ? err.localizedDescription.UTF8String : "unknown");
+        return nil;
+    }
+    [heap rdna4TrackResource:as];
+    return (id<MTLAccelerationStructure>)as;
+}
+
+GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_heap_new_as_with_descriptor(
+    RDNA4Heap *heap, id dev, MTLAccelerationStructureDescriptor *descriptor, BOOL hasOffset, NSUInteger offset) {
+    if (!heap || !dev || !descriptor) return nil;
+    /* Pre-check storageMode and Automatic vs Placement heap gating before Vulkan size query. */
+    if ([heap storageMode] != MTLStorageModePrivate) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor refused: heap must use MTLStorageModePrivate");
+        return nil;
+    }
+    if ((hasOffset && [heap type] != MTLHeapTypePlacement) ||
+        (!hasOffset && [heap type] != MTLHeapTypeAutomatic)) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor refused: heap type mismatch (hasOffset=%d, type=%lu)",
+                 hasOffset ? 1 : 0, (unsigned long)[heap type]);
+        return nil;
+    }
+    NSError *err = nil;
+    if (!rdna4_radv_open(&err)) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor: RADV open failed: %s",
+                 err.localizedDescription.UTF8String);
+        return nil;
+    }
+    RDNA4RTBuildPlan plan;
+    if (!rdna4_rt_build_plan_make(dev, descriptor, NO, NO, 0u, nil, &plan, &err)) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor: refused: %s",
+                 err.localizedDescription.UTF8String);
+        return nil;
+    }
+    rdna4rt_kind_t kind = plan.kind;
+    NSUInteger reqSize = (NSUInteger)plan.metalSizes.acceleration_structure_size;
+    rdna4_rt_plan_free(&plan);
+
+    uint64_t alignedSize = 0u;
+    rdna4rt_err_t ve = rdna4rt_heap_as_validate_alloc(
+        (uint32_t)[heap storageMode], (uint32_t)[heap type], (uint64_t)[heap size],
+        (uint64_t)reqSize, hasOffset ? 1 : 0, (uint64_t)offset, RDNA4RT_HEAP_AS_ALIGN, &alignedSize);
+    if (ve != RDNA4RT_OK) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor:%lu offset:%lu(has=%d) refused: %s",
+                 (unsigned long)reqSize, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
+        return nil;
+    }
+    GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
+        initWithDevice:dev size:reqSize initialKind:kind
+                  heap:heap offset:offset hasOffset:hasOffset error:&err];
+    if (!as) {
+        RDNA4LOG("heap newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
+                 (unsigned long)reqSize, err ? err.localizedDescription.UTF8String : "unknown");
+        return nil;
+    }
+    [heap rdna4TrackResource:as];
     return (id<MTLAccelerationStructure>)as;
 }
 

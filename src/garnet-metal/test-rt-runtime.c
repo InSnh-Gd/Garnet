@@ -620,6 +620,285 @@ static void test_as_descriptor_and_bda_planners(void) {
           "argbuf IFT planner rejects non-IFT field kind");
 }
 
+static void test_wave4_prim_data_table_and_abi(void) {
+    CHECK(GARNETX_CAP_RT_PRIMITIVE_DATA == (1u << 11), "GARNETX_CAP_RT_PRIMITIVE_DATA == (1u << 11)");
+    CHECK(RDNA4RT_PRIM_DATA_BINDING == 676u, "prim data binding == 676");
+    CHECK(RDNA4RT_PRIM_DATA_STAGE_TABLE_BYTES == 264u && sizeof(rdna4rt_stage_prim_table_t) == 264u,
+          "rdna4rt_stage_prim_table_t == 264 bytes");
+    CHECK(sizeof(rdna4rt_prim_slot_t) == 32u, "rdna4rt_prim_slot_t == 32 bytes");
+    CHECK(sizeof(rdna4rt_geom_prim_entry_t) == 16u, "rdna4rt_geom_prim_entry_t == 16 bytes");
+    CHECK(RDNA4RT_PRIM_TABLE_CAP == 4096u && RDNA4RT_PRIM_TABLE_MASK == 4095u &&
+          RDNA4RT_PRIM_TABLE_MAX_PROBE == 32u && RDNA4RT_PRIM_TABLE_BYTES == 131072u,
+          "prim data table capacity/mask/probe/bytes constants");
+    CHECK(RDNA4RT_PRIM_TLAS_ENTRY_STRIDE == 64u && RDNA4RT_PRIM_TLAS_REF_OFFSET == 56u,
+          "TLAS instance snapshot stride 64 and ref_offset 56");
+
+    /* Exact hash function parity check. */
+    const uint64_t sampleKey = UINT64_C(0x0000123456789A00);
+    uint64_t refH = (sampleKey >> 8) * UINT64_C(0x61C8864680B583EB);
+    refH ^= (refH >> 32);
+    CHECK(rdna4rt_prim_hash_slot(sampleKey, RDNA4RT_PRIM_TABLE_MASK) == ((uint32_t)refH & RDNA4RT_PRIM_TABLE_MASK),
+          "rdna4rt_prim_hash_slot matches exact shared hash formula");
+
+    /* Allocate 4096-slot table on heap (ASan/UBSan verified). */
+    rdna4rt_prim_slot_t *tbl = (rdna4rt_prim_slot_t *)calloc(RDNA4RT_PRIM_TABLE_CAP, sizeof(*tbl));
+    CHECK(tbl != NULL, "allocate 4096-slot RDNA4RTPrimDataTable");
+    if (!tbl) return;
+
+    /* Invalid sentinel keys rejected. */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    RDNA4RT_PRIM_SLOT_EMPTY, 0x1000u, 1u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS) == RDNA4RTR_ERR_INVALID,
+          "upsert rejects EMPTY sentinel key 0");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    RDNA4RT_PRIM_SLOT_TOMBSTONE, 0x1000u, 1u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS) == RDNA4RTR_ERR_INVALID,
+          "upsert rejects TOMBSTONE sentinel key 1");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, 0u, NULL) == 0,
+          "lookup rejects key 0");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, 1u, NULL) == 0,
+          "lookup rejects key 1");
+
+    /* Basic insert, lookup, update in-place for BLAS & TLAS. */
+    const uint64_t blasBda = UINT64_C(0x10000100);
+    const uint64_t tlasBda = UINT64_C(0x20000200);
+    const uint32_t blasBaseSlot = rdna4rt_prim_hash_slot(blasBda, RDNA4RT_PRIM_TABLE_MASK);
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    blasBda, UINT64_C(0x30000000), 3u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS) == RDNA4RTR_OK,
+          "insert BLAS into prim table");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    tlasBda, UINT64_C(0x40000000), 5u, 64u, 56u, RDNA4RT_PRIM_KIND_TLAS) == RDNA4RTR_OK,
+          "insert TLAS into prim table");
+
+    rdna4rt_prim_slot_t got;
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, blasBda, &got) == 1 &&
+          got.as_bda == blasBda && got.payload_bda == UINT64_C(0x30000000) && got.count == 3u && got.kind == RDNA4RT_PRIM_KIND_BLAS,
+          "lookup BLAS matches inserted fields");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, tlasBda, &got) == 1 &&
+          got.as_bda == tlasBda && got.payload_bda == UINT64_C(0x40000000) && got.count == 5u &&
+          got.entry_stride == 64u && got.ref_offset == 56u && got.kind == RDNA4RT_PRIM_KIND_TLAS,
+          "lookup TLAS matches inserted fields");
+
+    /* Update BLAS in-place keeps same slot. */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    blasBda, UINT64_C(0x30001000), 4u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS) == RDNA4RTR_OK &&
+          tbl[blasBaseSlot].as_bda == blasBda && tbl[blasBaseSlot].payload_bda == UINT64_C(0x30001000),
+          "update existing BLAS key reuses exact slot");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, blasBda, &got) == 1 &&
+          got.payload_bda == UINT64_C(0x30001000) && got.count == 4u,
+          "updated BLAS payload/count visible");
+
+    /* Find 34 distinct 256B-aligned keys that collide on the same base slot. */
+    memset(tbl, 0, RDNA4RT_PRIM_TABLE_CAP * sizeof(*tbl));
+    uint64_t coll[34];
+    uint32_t foundColl = 0u;
+    const uint32_t targetSlot = 42u;
+    for (uint64_t k = UINT64_C(0x100000); foundColl < 34u && k < UINT64_C(0x100000000); k += 256u) {
+        if (rdna4rt_prim_hash_slot(k, RDNA4RT_PRIM_TABLE_MASK) == targetSlot)
+            coll[foundColl++] = k;
+    }
+    CHECK(foundColl == 34u, "found 34 colliding 256B-aligned AS BDAs on same base slot");
+
+    /* Collision chain + tombstone + probe-past-tombstone + in-place update + tombstone reuse. */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[0], 0xA000u, 1u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[targetSlot].as_bda == coll[0],
+          "coll[0] lands at base slot");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[1], 0xB000u, 2u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[(targetSlot + 1u) & RDNA4RT_PRIM_TABLE_MASK].as_bda == coll[1],
+          "coll[1] probes to base+1");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[2], 0xC000u, 3u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[(targetSlot + 2u) & RDNA4RT_PRIM_TABLE_MASK].as_bda == coll[2],
+          "coll[2] probes to base+2");
+
+    /* Delete coll[0] -> tombstone at base slot; coll[1] & coll[2] still found. */
+    CHECK(rdna4rt_prim_table_remove(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[0]) == 1 &&
+          tbl[targetSlot].as_bda == RDNA4RT_PRIM_SLOT_TOMBSTONE,
+          "deleting coll[0] writes tombstone sentinel 1");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[0], NULL) == 0,
+          "deleted coll[0] is not found");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[1], &got) == 1 &&
+          got.payload_bda == 0xB000u,
+          "coll[1] found past tombstone");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[2], &got) == 1 &&
+          got.payload_bda == 0xC000u,
+          "coll[2] found past tombstone");
+
+    /* Re-inserting coll[2] MUST update base+2 in place (no duplicate at tombstone base slot!). */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[2], 0xC999u, 9u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[(targetSlot + 2u) & RDNA4RT_PRIM_TABLE_MASK].as_bda == coll[2] &&
+          tbl[(targetSlot + 2u) & RDNA4RT_PRIM_TABLE_MASK].payload_bda == 0xC999u &&
+          tbl[targetSlot].as_bda == RDNA4RT_PRIM_SLOT_TOMBSTONE,
+          "re-upsert coll[2] updates existing slot past tombstone without duplicating");
+
+    /* Inserting brand-new coll[3] reuses the tombstone at base slot. */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[3], 0xD000u, 4u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[targetSlot].as_bda == coll[3],
+          "new key coll[3] reuses first tombstone slot");
+
+    /* Placement-aliasing conditional remove_if_match prevents stale AS1 dealloc from clobbering AS2. */
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[1], 0xB222u, 2u, 0u, 0u, 0u) == RDNA4RTR_OK,
+          "aliasing AS2 overwrites coll[1] payload");
+    CHECK(rdna4rt_prim_table_remove_if_match(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[1], 0xB000u) == 0,
+          "stale AS1 dealloc with old payload_bda does not tombstone live AS2");
+    CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[1], &got) == 1 &&
+          got.payload_bda == 0xB222u,
+          "AS2 entry survives stale AS1 remove_if_match");
+    CHECK(rdna4rt_prim_table_remove_if_match(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[1], 0xB222u) == 1,
+          "matching AS2 remove_if_match tombstones slot");
+
+    /* Full 32-probe collision saturation & recovery via tombstone reuse. */
+    memset(tbl, 0, RDNA4RT_PRIM_TABLE_CAP * sizeof(*tbl));
+    int all32 = 1;
+    for (uint32_t i = 0; i < RDNA4RT_PRIM_TABLE_MAX_PROBE; i++) {
+        if (rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                      coll[i], 0x50000u + (uint64_t)i * 16u, i + 1u, 0u, 0u, 0u) != RDNA4RTR_OK)
+            all32 = 0;
+    }
+    CHECK(all32, "32 colliding keys fill entire probe window");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[32], 0x99999u, 1u, 0u, 0u, 0u) == RDNA4RTR_ERR_BOUNDS,
+          "33rd colliding key exceeds MAX_PROBE=32 and returns BOUNDS");
+    CHECK(rdna4rt_prim_table_remove(tbl, RDNA4RT_PRIM_TABLE_CAP, coll[15]) == 1,
+          "delete middle colliding key coll[15]");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    coll[32], 0x99999u, 1u, 0u, 0u, 0u) == RDNA4RTR_OK &&
+          tbl[(targetSlot + 15u) & RDNA4RT_PRIM_TABLE_MASK].as_bda == coll[32],
+          "coll[32] succeeds after tombstone frees slot in probe window");
+
+    /* End-to-end 2-level shader lookup simulation: stage_table -> TLAS -> BLAS -> geom -> prim. */
+    memset(tbl, 0, RDNA4RT_PRIM_TABLE_CAP * sizeof(*tbl));
+    struct { uint32_t id; float weight; } primPayload[2] = { { 101u, 1.5f }, { 202u, 2.75f } };
+    rdna4rt_geom_prim_entry_t blasGeomTable[2] = {
+        { 0u, 0u, 0u },
+        { (uint64_t)(uintptr_t)primPayload, (uint32_t)sizeof(primPayload[0]), 2u }
+    };
+    uint8_t tlasInstBuf[2 * 64];
+    memset(tlasInstBuf, 0, sizeof(tlasInstBuf));
+    const uint64_t simBlasBda = UINT64_C(0x55550000);
+    const uint64_t simTlasBda = UINT64_C(0x66660000);
+    memcpy(tlasInstBuf + 1u * RDNA4RT_PRIM_TLAS_ENTRY_STRIDE + RDNA4RT_PRIM_TLAS_REF_OFFSET,
+           &simBlasBda, sizeof(simBlasBda));
+
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    simBlasBda, (uint64_t)(uintptr_t)blasGeomTable, 2u, 0u, 0u,
+                                    RDNA4RT_PRIM_KIND_BLAS) == RDNA4RTR_OK,
+          "2-level sim: register BLAS");
+    CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                    simTlasBda, (uint64_t)(uintptr_t)tlasInstBuf, 2u,
+                                    RDNA4RT_PRIM_TLAS_ENTRY_STRIDE, RDNA4RT_PRIM_TLAS_REF_OFFSET,
+                                    RDNA4RT_PRIM_KIND_TLAS) == RDNA4RTR_OK,
+          "2-level sim: register TLAS");
+
+    rdna4rt_stage_prim_table_t stageTbl;
+    rdna4rt_stage_prim_table_init(&stageTbl, (uint64_t)(uintptr_t)tbl, RDNA4RT_PRIM_TABLE_MASK);
+    stageTbl.slot_as_bda[0] = simTlasBda;
+
+    /* Simulate shader: slot 0 -> TLAS -> instance 1 -> BLAS -> geom 1 -> prim 1. */
+    rdna4rt_prim_slot_t tlasSlot, blasSlot;
+    CHECK(rdna4rt_prim_table_lookup((const rdna4rt_prim_slot_t *)(uintptr_t)stageTbl.global_table_bda,
+                                    (uint32_t)stageTbl.table_mask + 1u,
+                                    stageTbl.slot_as_bda[0], &tlasSlot) == 1 &&
+          tlasSlot.kind == RDNA4RT_PRIM_KIND_TLAS && 1u < tlasSlot.count,
+          "2-level sim: stage slot 0 resolves TLAS");
+    uint64_t resolvedBlasBda = 0u;
+    memcpy(&resolvedBlasBda,
+           (const uint8_t *)(uintptr_t)(tlasSlot.payload_bda + 1u * (uint64_t)tlasSlot.entry_stride + tlasSlot.ref_offset),
+           sizeof(resolvedBlasBda));
+    CHECK(resolvedBlasBda == simBlasBda, "2-level sim: TLAS instance 1 resolves BLAS BDA");
+    CHECK(rdna4rt_prim_table_lookup((const rdna4rt_prim_slot_t *)(uintptr_t)stageTbl.global_table_bda,
+                                    (uint32_t)stageTbl.table_mask + 1u,
+                                    resolvedBlasBda, &blasSlot) == 1 &&
+          blasSlot.kind == RDNA4RT_PRIM_KIND_BLAS && 1u < blasSlot.count,
+          "2-level sim: BLAS BDA resolves geom header table");
+    const rdna4rt_geom_prim_entry_t *ge =
+        ((const rdna4rt_geom_prim_entry_t *)(uintptr_t)blasSlot.payload_bda) + 1u;
+    CHECK(ge->data_bda != 0u && 1u < ge->prim_count, "2-level sim: geom 1 entry valid");
+    const uint8_t *primPtr = (const uint8_t *)(uintptr_t)(ge->data_bda + 1u * (uint64_t)ge->stride);
+    uint32_t readId = 0u;
+    float readWeight = 0.0f;
+    memcpy(&readId, primPtr, sizeof(readId));
+    memcpy(&readWeight, primPtr + 4u, sizeof(readWeight));
+    CHECK(readId == 202u && readWeight == 2.75f, "2-level sim: reads exact per-primitive payload");
+
+    /* Shadow + GPU-timeline synchronization simulation (pipelined refit, abandoned CB, encode-time clear). */
+    rdna4rt_prim_slot_t *shadow = (rdna4rt_prim_slot_t *)calloc(RDNA4RT_PRIM_TABLE_CAP, sizeof(*shadow));
+    rdna4rt_prim_slot_t *gpuTbl = (rdna4rt_prim_slot_t *)calloc(RDNA4RT_PRIM_TABLE_CAP, sizeof(*gpuTbl));
+    CHECK(shadow != NULL && gpuTbl != NULL, "allocate shadow and GPU timeline tables");
+    if (shadow && gpuTbl) {
+        /* 1. Encode build(V1) -> shadow[S] transitions EMPTY->occupied (wasEmpty==1 -> CPU marks gpu[S]=TOMBSTONE). */
+        uint32_t idxV1 = 0u, idxV2 = 0u, idxK1 = 0u, idxClr = 0u;
+        int wasEmptyV1 = 0, wasEmptyV2 = 0, wasEmptyK1 = 0;
+        CHECK(rdna4rt_prim_table_upsert_slot(shadow, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[0], 0x11110000u, 1u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS,
+                                             &idxV1, &wasEmptyV1) == RDNA4RTR_OK &&
+              idxV1 == targetSlot && wasEmptyV1 == 1,
+              "shadow build(V1) reports slot_idx and was_empty==1");
+        if (wasEmptyV1) gpuTbl[idxV1].as_bda = RDNA4RT_PRIM_SLOT_TOMBSTONE;
+
+        /* 2. Simulate GPU executing build(V1) 32B vkCmdUpdateBuffer. */
+        gpuTbl[idxV1] = shadow[idxV1];
+
+        /* 3. Encode refit_inplace(V2) while trace1 is STILL in flight on GPU. */
+        CHECK(rdna4rt_prim_table_upsert_slot(shadow, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[0], 0x22220000u, 1u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS,
+                                             &idxV2, &wasEmptyV2) == RDNA4RTR_OK &&
+              idxV2 == idxV1 && wasEmptyV2 == 0,
+              "shadow refit_inplace(V2) reuses exact slot with was_empty==0 (does not touch live GPU slot)");
+        /* trace1 executes on GPU BEFORE refit_inplace(V2) GPU update: MUST still see V1! */
+        CHECK(rdna4rt_prim_table_lookup(gpuTbl, RDNA4RT_PRIM_TABLE_CAP, coll[0], &got) == 1 &&
+              got.payload_bda == 0x11110000u,
+              "in-flight trace1 still sees V1 on GPU while refit(V2) is only encoded in shadow");
+        /* GPU executes refit_inplace(V2) 32B update -> trace2 sees V2! */
+        gpuTbl[idxV2] = shadow[idxV2];
+        CHECK(rdna4rt_prim_table_lookup(gpuTbl, RDNA4RT_PRIM_TABLE_CAP, coll[0], &got) == 1 &&
+              got.payload_bda == 0x22220000u,
+              "trace2 sees V2 after GPU executes refit_inplace(V2) update");
+
+        /* 4. Encode clear (rebuild without primData) while trace2 is still in flight on GPU. */
+        CHECK(rdna4rt_prim_table_remove_if_match_slot(shadow, RDNA4RT_PRIM_TABLE_CAP,
+                                                      coll[0], 0x22220000u, &idxClr) == 1 &&
+              idxClr == idxV2,
+              "shadow encode-time clear returns tombstoned slot index");
+        /* Prior trace2 on GPU STILL sees V2 before the 8B GPU tombstone runs! */
+        CHECK(rdna4rt_prim_table_lookup(gpuTbl, RDNA4RT_PRIM_TABLE_CAP, coll[0], &got) == 1 &&
+              got.payload_bda == 0x22220000u,
+              "in-flight trace2 survives encode-time shadow clear until GPU 8B tombstone runs");
+        /* GPU executes 8B TOMBSTONE update -> subsequent trace sees NOT FOUND. */
+        gpuTbl[idxClr].as_bda = RDNA4RT_PRIM_SLOT_TOMBSTONE;
+        CHECK(rdna4rt_prim_table_lookup(gpuTbl, RDNA4RT_PRIM_TABLE_CAP, coll[0], NULL) == 0,
+              "post-clear trace sees NOT FOUND after GPU tombstone executes");
+
+        /* 5. Abandoned CB collision-chain preservation: CB_A encodes coll[4] into EMPTY slot,
+         * marks gpu[slot]=TOMBSTONE on CPU, and is abandoned; CB_B encodes & runs colliding coll[5]. */
+        memset(shadow, 0, RDNA4RT_PRIM_TABLE_CAP * sizeof(*shadow));
+        memset(gpuTbl, 0, RDNA4RT_PRIM_TABLE_CAP * sizeof(*gpuTbl));
+        CHECK(rdna4rt_prim_table_upsert_slot(shadow, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[4], 0x44440000u, 1u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS,
+                                             &idxV1, &wasEmptyV1) == RDNA4RTR_OK && wasEmptyV1 == 1,
+              "abandoned CB_A allocates base slot (was_empty==1)");
+        gpuTbl[idxV1].as_bda = RDNA4RT_PRIM_SLOT_TOMBSTONE; /* CB_A abandoned: 32B GPU write never runs */
+        CHECK(rdna4rt_prim_table_upsert_slot(shadow, RDNA4RT_PRIM_TABLE_CAP,
+                                             coll[5], 0x55550000u, 2u, 0u, 0u, RDNA4RT_PRIM_KIND_BLAS,
+                                             &idxK1, &wasEmptyK1) == RDNA4RTR_OK &&
+              idxK1 == ((targetSlot + 1u) & RDNA4RT_PRIM_TABLE_MASK) && wasEmptyK1 == 1,
+              "CB_B places colliding coll[5] at base+1");
+        gpuTbl[idxK1] = shadow[idxK1]; /* CB_B runs on GPU */
+        CHECK(rdna4rt_prim_table_lookup(gpuTbl, RDNA4RT_PRIM_TABLE_CAP, coll[5], &got) == 1 &&
+              got.payload_bda == 0x55550000u,
+              "GPU probes past abandoned CB_A tombstone and resolves CB_B colliding key coll[5]");
+    }
+    free(shadow);
+    free(gpuTbl);
+
+    free(tbl);
+}
+
 static char *read_source_file(const char *rel_a, const char *rel_b) {
     FILE *f = fopen(rel_a, "rb");
     if (!f && rel_b) f = fopen(rel_b, "rb");
@@ -658,7 +937,50 @@ static void test_source_pins(void) {
               "rdna4_rt_parse_meta handles NSDictionary pipeline metadata");
         CHECK(strstr(impl, "rdna4rt_blas_build_flags_with_caps") != NULL,
               "BLAS build plan applies position_fetch ALLOW_DATA_ACCESS via helper");
+        CHECK(strstr(impl, "RDNA4RTPrimDataTable") != NULL &&
+              strstr(impl, "GarnetASPrimData") != NULL &&
+              strstr(impl, "rdna4_rt_fill_stage_prim_table") != NULL &&
+              strstr(impl, "rdna4rt_blas_prim_rebase_headers") != NULL &&
+              strstr(impl, "rdna4_rt_prim_table_register_cmd") != NULL &&
+              strstr(impl, "rdna4_rt_prim_table_clear_cmd") != NULL &&
+              strstr(impl, "rdna4rt_prim_table_upsert_slot") != NULL &&
+              strstr(impl, "rdna4rt_prim_table_remove_if_match_slot") != NULL &&
+              strstr(impl, "VK_BUFFER_USAGE_TRANSFER_DST_BIT") != NULL &&
+              strstr(impl, "rdna4_rt_prim_pool_pop") != NULL &&
+              strstr(impl, "rdna4_rt_prim_pool_push") != NULL &&
+              strstr(impl, "rdna4_rt_qp_pool_pop") != NULL &&
+              strstr(impl, "rdna4_rt_qp_pool_push") != NULL,
+              "Wave 4.1B GPU-timeline prim-data table, pooled snapshot/query-pool, and copy/compact rebase wired");
+        CHECK(strstr(impl, "per-primitive data buffers are not supported") == NULL &&
+              strstr(impl, "per-primitive-only refit without vertex data is unsupported") == NULL,
+              "Wave 4.1B removes legacy primitiveDataBuffer and PerPrimitiveData-only refit rejections");
+        CHECK(strstr(impl, "rdna4_rt_device_heap_as_size_align_with_size") != NULL &&
+              strstr(impl, "rdna4_rt_heap_new_as_with_size") != NULL &&
+              strstr(impl, "rdna4_rt_heap_new_as_with_descriptor") != NULL &&
+              strstr(impl, "RDNA4_HEAP_RETIRE") != NULL,
+              "Wave 4.2 MTLHeap placement/automatic AS helpers and lifecycle retirement wired");
+        CHECK(strstr(impl, "RDNA4R.ok ? (rdna4dc_metal3_raytracing_supported(&m3) ? 1u : 0u) : 1u") != NULL,
+              "pre-open supportsRaytracing reports RDNA4-guaranteed RT hw caps with radv_open=0");
         free(impl);
+    }
+
+    char *shd = read_source_file("src/garnet-metal/garnet_shaders.m", "garnet_shaders.m");
+    CHECK(shd != NULL, "read garnet_shaders.m for Wave 4.1B pins");
+    if (shd) {
+        CHECK(strstr(shd, "GARNETX_CAP_RT_PRIMITIVE_DATA") != NULL &&
+              strstr(shd, "rtPrimDataTable") != NULL &&
+              strstr(shd, "RTPrimDataTable") != NULL,
+              "garnet_shaders wires GARNETX_CAP_RT_PRIMITIVE_DATA and binding 676 RTPrimDataTable");
+        free(shd);
+    }
+
+    char *devm = read_source_file("src/garnet-metal/garnet_device.m", "garnet_device.m");
+    CHECK(devm != NULL, "read garnet_device.m for Wave 4.2 pins");
+    if (devm) {
+        CHECK(strstr(devm, "heapAccelerationStructureSizeAndAlignWithSize:") != NULL &&
+              strstr(devm, "heapAccelerationStructureSizeAndAlignWithDescriptor:") != NULL,
+              "GarnetDevice wires heapAccelerationStructureSizeAndAlignWithSize/Descriptor");
+        free(devm);
     }
 
     char *cmds = read_source_file("src/garnet-metal/garnet_commands.m", "garnet_commands.m");
@@ -676,7 +998,12 @@ static void test_source_pins(void) {
                   "rdna4UseResource accepts RDNA4IntersectionFunctionTable");
             CHECK(strstr(seg, "RDNA4VisibleFunctionTable") != NULL,
                   "rdna4UseResource accepts RDNA4VisibleFunctionTable");
+            CHECK(strstr(seg, "rdna4CurrentPrimData") != NULL,
+                  "rdna4UseResource retains GarnetASPrimData");
         }
+        CHECK(strstr(cmds, "rdna4_rt_fill_stage_prim_table") != NULL &&
+              strstr(cmds, "p->rtPrimDataTable") != NULL,
+              "garnet_commands fills binding 676 stage primitive data table");
         free(cmds);
     }
 
@@ -706,6 +1033,9 @@ static void test_source_pins(void) {
               "Bridge 1: RDNA4Texture unifies uniqueIdentifier/gpuResourceID to 0x5244 token");
         CHECK(strstr(res, "rdna4_argument_resource_token_bindless(self, _dev, NO, YES)") != NULL,
               "Bridge 2: RDNA4SamplerState.gpuResourceID marks bindlessQueried");
+        CHECK(strstr(res, "newAccelerationStructureWithSize:(NSUInteger)size offset:") != NULL &&
+              strstr(res, "newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d offset:") != NULL,
+              "Wave 4.2: RDNA4Heap wires placement & automatic acceleration structure constructors");
         free(res);
     }
 
@@ -737,6 +1067,7 @@ int main(void) {
     test_ir_kind_inference();
     test_ift_encoder_and_dispatch_sim();
     test_as_descriptor_and_bda_planners();
+    test_wave4_prim_data_table_and_abi();
     test_source_pins();
     printf("test-rt-runtime: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

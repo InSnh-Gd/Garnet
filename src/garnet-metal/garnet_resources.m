@@ -3624,6 +3624,24 @@ static uint64_t rdna4_heap_completed_serial(void) {
     return t;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d atOffset:(NSUInteger)off { return [self newTextureWithDescriptor:d offset:off]; }
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size {
+    return rdna4_rt_heap_new_as_with_size(self, _dev, size, NO, 0);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d {
+    return rdna4_rt_heap_new_as_with_descriptor(self, _dev, d, NO, 0);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size offset:(NSUInteger)off {
+    return rdna4_rt_heap_new_as_with_size(self, _dev, size, YES, off);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size atOffset:(NSUInteger)off {
+    return rdna4_rt_heap_new_as_with_size(self, _dev, size, YES, off);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d offset:(NSUInteger)off {
+    return rdna4_rt_heap_new_as_with_descriptor(self, _dev, d, YES, off);
+}
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d atOffset:(NSUInteger)off {
+    return rdna4_rt_heap_new_as_with_descriptor(self, _dev, d, YES, off);
+}
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)al {
     @synchronized (self) {
         // Query correctness is part of the allocation contract: retire cleared

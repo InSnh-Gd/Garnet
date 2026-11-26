@@ -681,6 +681,316 @@ static void test_heap_batch_asan(void) {
     free(addrs);
 }
 
+static void test_wave4_prim_data_validation_and_layout(void) {
+    /* 1. Absent buffer -> clean no-op plan. */
+    rdna4rt_prim_data_geom_desc_t d0 = { .has_buf = 0, .prim_count = 10u };
+    rdna4rt_prim_data_geom_plan_t p0;
+    CHECK(rdna4rt_validate_prim_data_geom(&d0, 1, &p0) == RDNA4RT_OK &&
+          p0.present == 0 && p0.copy_bytes == 0u,
+          "nil primitiveDataBuffer produces empty plan");
+
+    /* 2. Default stride (0 -> element_size), tight bounds. */
+    rdna4rt_prim_data_geom_desc_t d1 = {
+        .has_buf = 1, .buf_len = 64u, .buf_offset = 0u,
+        .element_size = 16u, .stride = 0u, .prim_count = 4u
+    };
+    rdna4rt_prim_data_geom_plan_t p1;
+    CHECK(rdna4rt_validate_prim_data_geom(&d1, 1, &p1) == RDNA4RT_OK &&
+          p1.present == 1 && p1.stride == 16u &&
+          p1.copy_bytes == 64u && p1.prim_count == 4u,
+          "default stride==0 uses element_size");
+
+    /* 3. Padded stride > element_size with non-zero 4B offset: exact boundary vs 1B short. */
+    rdna4rt_prim_data_geom_desc_t d2 = {
+        .has_buf = 1, .buf_len = 68u, .buf_offset = 8u,
+        .element_size = 12u, .stride = 24u, .prim_count = 3u
+    };
+    rdna4rt_prim_data_geom_plan_t p2;
+    CHECK(rdna4rt_validate_prim_data_geom(&d2, 1, &p2) == RDNA4RT_OK &&
+          p2.stride == 24u && p2.copy_bytes == 60u && p2.src_offset == 8u,
+          "padded stride exact boundary accepted");
+    d2.buf_len = 67u;
+    CHECK(rdna4rt_validate_prim_data_geom(&d2, 1, &p2) == RDNA4RT_ERR_BOUNDS,
+          "padded stride 1 byte short rejected");
+
+    /* 4. Zero primitives with valid buffer metadata -> copy_bytes == 0. */
+    rdna4rt_prim_data_geom_desc_t dzero = {
+        .has_buf = 1, .buf_len = 4u, .buf_offset = 4u,
+        .element_size = 16u, .stride = 16u, .prim_count = 0u
+    };
+    rdna4rt_prim_data_geom_plan_t pzero;
+    CHECK(rdna4rt_validate_prim_data_geom(&dzero, 1, &pzero) == RDNA4RT_OK &&
+          pzero.present == 1 && pzero.copy_bytes == 0u,
+          "zero primitives with valid primData metadata ok");
+
+    /* 5. Negative alignment / size / stride / limit / overflow checks. */
+    rdna4rt_prim_data_geom_desc_t bad = d1;
+    bad.element_size = 0u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_INVALID_ARG, "primData elementSize==0 rejected");
+    bad = d1; bad.element_size = 6u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_ALIGNMENT, "primData unaligned elementSize rejected");
+    bad = d1; bad.buf_offset = 2u; bad.buf_len = 128u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_ALIGNMENT, "primData unaligned offset rejected");
+    bad = d1; bad.stride = 18u; bad.buf_len = 128u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_ALIGNMENT, "primData unaligned stride rejected");
+    bad = d1; bad.stride = 12u; bad.buf_len = 128u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_INVALID_ARG, "primData stride < elementSize rejected");
+    bad = d1; bad.buf_offset = 68u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_BOUNDS, "primData offset > buf_len rejected");
+    bad = d1; bad.prim_count = (uint64_t)UINT32_MAX + 1u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_LIMIT, "primData prim_count > UINT32_MAX rejected");
+    bad = d1; bad.prim_count = UINT32_MAX; bad.stride = (uint64_t)UINT32_MAX - 3u;
+    CHECK(rdna4rt_validate_prim_data_geom(&bad, 1, &p1) == RDNA4RT_ERR_BOUNDS, "primData huge span rejected");
+
+    /* 6. Multi-geometry BLAS layout, header build, and rebase for copy/compact. */
+    rdna4rt_prim_data_geom_plan_t plans[3];
+    memset(plans, 0, sizeof(plans));
+    plans[0] = (rdna4rt_prim_data_geom_plan_t){ .present = 1, .stride = 8u, .element_size = 8u, .prim_count = 3u, .src_offset = 0u, .copy_bytes = 20u };
+    plans[1] = (rdna4rt_prim_data_geom_plan_t){ .present = 0 };
+    plans[2] = (rdna4rt_prim_data_geom_plan_t){ .present = 1, .stride = 12u, .element_size = 12u, .prim_count = 1u, .src_offset = 16u, .copy_bytes = 12u };
+
+    uint64_t offs[3] = { 0, 0, 0 };
+    uint64_t hdrBytes = 0, totBytes = 0;
+    int anyPrim = 0;
+    CHECK(rdna4rt_blas_prim_layout_compute(plans, 3u, offs, &hdrBytes, &totBytes, &anyPrim) == RDNA4RT_OK &&
+          anyPrim == 1 && hdrBytes == 48u && offs[0] == 48u && offs[1] == 0u && offs[2] == 80u && totBytes == 96u,
+          "multi-geom BLAS prim layout computes 16B-aligned slices");
+
+    rdna4rt_geom_prim_entry_t srcHdr[3], dstHdr[3];
+    const uint64_t srcBase = UINT64_C(0x10000000);
+    const uint64_t dstBase = UINT64_C(0x20000000);
+    CHECK(rdna4rt_blas_prim_build_headers(srcBase, plans, offs, 3u, srcHdr) == RDNA4RT_OK &&
+          srcHdr[0].data_bda == srcBase + 48u && srcHdr[0].stride == 8u && srcHdr[0].prim_count == 3u &&
+          srcHdr[1].data_bda == 0u && srcHdr[1].stride == 0u && srcHdr[1].prim_count == 0u &&
+          srcHdr[2].data_bda == srcBase + 80u && srcHdr[2].stride == 12u && srcHdr[2].prim_count == 1u,
+          "BLAS prim headers store absolute BDAs and zero absent geometries");
+
+    CHECK(rdna4rt_blas_prim_rebase_headers(srcHdr, 3u, srcBase, dstBase, totBytes, dstHdr) == RDNA4RT_OK &&
+          dstHdr[0].data_bda == dstBase + 48u && dstHdr[0].stride == 8u && dstHdr[0].prim_count == 3u &&
+          dstHdr[1].data_bda == 0u && dstHdr[1].stride == 0u && dstHdr[1].prim_count == 0u &&
+          dstHdr[2].data_bda == dstBase + 80u && dstHdr[2].stride == 12u && dstHdr[2].prim_count == 1u,
+          "BLAS prim header rebase shifts BDAs cleanly to destination base");
+
+    /* Corrupted source headers rejected by rebase. */
+    rdna4rt_geom_prim_entry_t badHdr[3];
+    memcpy(badHdr, srcHdr, sizeof(badHdr));
+    badHdr[0].data_bda = srcBase - 16u;
+    CHECK(rdna4rt_blas_prim_rebase_headers(badHdr, 3u, srcBase, dstBase, totBytes, dstHdr) == RDNA4RT_ERR_BOUNDS,
+          "rebase rejects BDA below srcBase");
+    memcpy(badHdr, srcHdr, sizeof(badHdr));
+    badHdr[0].data_bda = srcBase + 16u; /* inside header table */
+    CHECK(rdna4rt_blas_prim_rebase_headers(badHdr, 3u, srcBase, dstBase, totBytes, dstHdr) == RDNA4RT_ERR_BOUNDS,
+          "rebase rejects BDA pointing inside header");
+    memcpy(badHdr, srcHdr, sizeof(badHdr));
+    badHdr[2].data_bda = srcBase + totBytes;
+    CHECK(rdna4rt_blas_prim_rebase_headers(badHdr, 3u, srcBase, dstBase, totBytes, dstHdr) == RDNA4RT_ERR_BOUNDS,
+          "rebase rejects BDA at/past totalBytes");
+    CHECK(rdna4rt_blas_prim_rebase_headers(srcHdr, 3u, srcBase, 0u, totBytes, dstHdr) == RDNA4RT_ERR_INVALID_ARG,
+          "rebase rejects zero dstBase");
+
+    /* All-absent BLAS -> anyPrim == 0. */
+    rdna4rt_prim_data_geom_plan_t emptyPlans[2];
+    memset(emptyPlans, 0, sizeof(emptyPlans));
+    CHECK(rdna4rt_blas_prim_layout_compute(emptyPlans, 2u, offs, &hdrBytes, &totBytes, &anyPrim) == RDNA4RT_OK &&
+          anyPrim == 0 && totBytes == 0u,
+          "all-absent BLAS produces anyPrim == 0");
+}
+
+static void test_wave4_prim_refit_and_barriers(void) {
+    CHECK(!rdna4rt_refit_updates_vertices(0u) && !rdna4rt_refit_updates_prim_data(0u) && !rdna4rt_refit_is_prim_data_only(0u),
+          "refit option 0 updates nothing");
+    CHECK(rdna4rt_refit_updates_vertices(RDNA4RT_REFIT_OPT_VERTEX_DATA) &&
+          !rdna4rt_refit_updates_prim_data(RDNA4RT_REFIT_OPT_VERTEX_DATA) &&
+          !rdna4rt_refit_is_prim_data_only(RDNA4RT_REFIT_OPT_VERTEX_DATA),
+          "VertexData-only option predicates");
+    CHECK(!rdna4rt_refit_updates_vertices(RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) &&
+          rdna4rt_refit_updates_prim_data(RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) &&
+          rdna4rt_refit_is_prim_data_only(RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA),
+          "PerPrimitiveData-only option predicates");
+    const uint64_t both = RDNA4RT_REFIT_OPT_VERTEX_DATA | RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA;
+    CHECK(rdna4rt_refit_updates_vertices(both) && rdna4rt_refit_updates_prim_data(both) &&
+          !rdna4rt_refit_is_prim_data_only(both),
+          "VertexData|PerPrimitiveData predicates");
+
+    rdna4rt_accel_meta_t blas, dst, smallDst;
+    rdna4rt_meta_init(&blas, 4096u, RDNA4RT_KIND_BLAS);
+    rdna4rt_meta_init(&dst, 4096u, RDNA4RT_KIND_UNKNOWN);
+    rdna4rt_meta_init(&smallDst, 1024u, RDNA4RT_KIND_UNKNOWN);
+    uint32_t sig[1] = { rdna4rt_geom_sig(RDNA4RT_GEOM_TRIANGLES, RDNA4RT_INDEX_UINT32, RDNA4RT_VFMT_FLOAT3, RDNA4RT_VK_GEOM_OPAQUE) };
+    uint32_t pc[1] = { 8u };
+    uint64_t topo = rdna4rt_topology_hash(sig, pc, 1u);
+    CHECK(rdna4rt_state_apply_build(&blas, RDNA4RT_KIND_BLAS, 2048u, RDNA4RT_USAGE_REFIT, 1u, topo) == RDNA4RT_OK,
+          "build refittable BLAS for Wave 4 prim-refit test");
+
+    /* options == 0 rejected. */
+    CHECK(rdna4rt_state_can_refit(&blas, &blas, RDNA4RT_KIND_BLAS, 2048u, 1u, topo, 0u) == RDNA4RT_ERR_INVALID_ARG,
+          "refit options == 0 rejected");
+
+    /* PerPrimitiveData-only in-place (required_as_size=0, topology_hash=0 allowed) preserves built_size & topo. */
+    CHECK(rdna4rt_state_apply_refit(&blas, &blas, RDNA4RT_KIND_BLAS, 0u, 1u, 0u, RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) == RDNA4RT_OK &&
+          blas.built_size_bytes == 2048u && blas.topology_hash == topo && blas.allow_refit == 1u,
+          "PerPrimitiveData-only in-place refit preserves built_size and topology_hash");
+
+    /* PerPrimitiveData-only out-of-place succeeds into sized dst and fails into undersized dst. */
+    CHECK(rdna4rt_state_apply_refit(&blas, &dst, RDNA4RT_KIND_BLAS, 0u, 1u, 0u, RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) == RDNA4RT_OK &&
+          dst.built_size_bytes == 2048u && dst.topology_hash == topo && dst.kind == RDNA4RT_KIND_BLAS,
+          "PerPrimitiveData-only out-of-place refit populates dst state");
+    CHECK(rdna4rt_state_can_refit(&blas, &smallDst, RDNA4RT_KIND_BLAS, 0u, 1u, 0u, RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) == RDNA4RT_ERR_BOUNDS,
+          "PerPrimitiveData-only out-of-place refit rejects undersized dst");
+    CHECK(rdna4rt_state_can_refit(&blas, &blas, RDNA4RT_KIND_BLAS, 0u, 2u, 0u, RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) == RDNA4RT_ERR_STATE,
+          "PerPrimitiveData-only refit rejects geom_count mismatch");
+    CHECK(rdna4rt_state_can_refit(&blas, &blas, RDNA4RT_KIND_TLAS, 0u, 1u, 0u, RDNA4RT_REFIT_OPT_PER_PRIMITIVE_DATA) == RDNA4RT_ERR_STATE,
+          "PerPrimitiveData-only refit rejects kind mismatch");
+
+    /* Both (0x3) requires matching topology hash and sized dst. */
+    CHECK(rdna4rt_state_apply_refit(&blas, &dst, RDNA4RT_KIND_BLAS, 2048u, 1u, topo, both) == RDNA4RT_OK,
+          "VertexData|PerPrimitiveData refit succeeds");
+    CHECK(rdna4rt_state_can_refit(&blas, &dst, RDNA4RT_KIND_BLAS, 2048u, 1u, topo ^ 1u, both) == RDNA4RT_ERR_STATE,
+          "VertexData|PerPrimitiveData refit rejects topology mismatch");
+
+    /* Barrier specs cover TRANSFER for prim-data copies/updates and keep computeQ free of graphics stages. */
+    rdna4rt_barrier_spec_t preG = rdna4rt_barrier_spec(RDNA4RT_BARRIER_PRE_BUILD, 0);
+    rdna4rt_barrier_spec_t preC = rdna4rt_barrier_spec(RDNA4RT_BARRIER_PRE_BUILD, 1);
+    rdna4rt_barrier_spec_t c2bC = rdna4rt_barrier_spec(RDNA4RT_BARRIER_COMP_TO_BUILD, 1);
+    rdna4rt_barrier_spec_t postC = rdna4rt_barrier_spec(RDNA4RT_BARRIER_POST_BUILD, 1);
+    CHECK((preG.dst_stage & RDNA4RT_VK_STAGE_TRANSFER) != 0u &&
+          (preC.dst_stage & RDNA4RT_VK_STAGE_TRANSFER) != 0u &&
+          (preC.dst_access & RDNA4RT_VK_ACCESS_TRANSFER_READ) != 0u &&
+          (preC.dst_access & RDNA4RT_VK_ACCESS_TRANSFER_WRITE) != 0u,
+          "PRE_BUILD barrier covers TRANSFER stage and accesses");
+    CHECK((c2bC.dst_stage & RDNA4RT_VK_STAGE_TRANSFER) != 0u &&
+          (c2bC.dst_access & RDNA4RT_VK_ACCESS_TRANSFER_READ) != 0u,
+          "COMP_TO_BUILD barrier covers TLAS snapshot vkCmdCopyBuffer read");
+    CHECK((postC.src_stage & RDNA4RT_VK_STAGE_TRANSFER) != 0u &&
+          (postC.src_access & RDNA4RT_VK_ACCESS_TRANSFER_WRITE) != 0u,
+          "POST_BUILD barrier flushes prim-data TRANSFER writes to shaders");
+    CHECK((preC.src_stage & RDNA4RT_VK_STAGE_ALL_GRAPHICS) == 0u &&
+          (postC.dst_stage & RDNA4RT_VK_STAGE_ALL_GRAPHICS) == 0u,
+          "computeQ barriers emit zero ALL_GRAPHICS stages");
+}
+
+static void test_wave4_heap_as_sizing_and_validation(void) {
+    rdna4rt_heap_size_align_t sa;
+    /* Align bumped to >= 256, size aligned up to max(256, gran). */
+    CHECK(rdna4rt_heap_as_size_align(100u, 128u, 16u, 1u, &sa) == RDNA4RT_OK &&
+          sa.align == 256u && sa.size == 256u,
+          "heap AS size/align floors alignment and size to 256B");
+    CHECK(rdna4rt_heap_as_size_align(500u, 1024u, 4096u, 65536u, &sa) == RDNA4RT_OK &&
+          sa.align == 65536u && sa.size == 65536u,
+          "heap AS size/align honors larger bufferImageGranularity");
+    CHECK(rdna4rt_heap_as_size_align(4096u, 4096u, 8192u, 256u, &sa) == RDNA4RT_OK &&
+          sa.align == 8192u && sa.size == 4096u,
+          "heap AS size/align honors larger vk_req_align");
+    CHECK(rdna4rt_heap_as_size_align(0u, 256u, 256u, 256u, &sa) == RDNA4RT_ERR_INVALID_ARG,
+          "heap AS size/align rejects requested_size == 0");
+    CHECK(rdna4rt_heap_as_size_align(256u, 256u, 300u, 256u, &sa) == RDNA4RT_ERR_ALIGNMENT,
+          "heap AS size/align rejects non-power-of-two alignment");
+    CHECK(rdna4rt_heap_as_size_align(UINT64_MAX, 256u, 256u, 256u, &sa) == RDNA4RT_ERR_OVERFLOW,
+          "heap AS size/align catches overflow");
+
+    /* Allocation validation: Private Automatic & Private Placement. */
+    uint64_t aligned = 0u;
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 0u, 65536u, 500u, 0, 0u, 256u, &aligned) == RDNA4RT_OK &&
+          aligned == 512u,
+          "Private Automatic heap AS alloc accepted");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 300u, 1, 256u, 256u, &aligned) == RDNA4RT_OK &&
+          aligned == 512u,
+          "Private Placement heap AS alloc accepted at 256B offset");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 512u, 1, 65024u, 256u, &aligned) == RDNA4RT_OK &&
+          aligned == 512u,
+          "Private Placement heap AS exact end boundary accepted");
+
+    /* Rejections: Shared/Managed, Placement-vs-Automatic mismatch, alignment, bounds, zero size. */
+    CHECK(rdna4rt_heap_as_validate_alloc(0u, 0u, 65536u, 512u, 0, 0u, 256u, &aligned) == RDNA4RT_ERR_UNSUPPORTED,
+          "Shared heap rejected for AS");
+    CHECK(rdna4rt_heap_as_validate_alloc(1u, 1u, 65536u, 512u, 1, 0u, 256u, &aligned) == RDNA4RT_ERR_UNSUPPORTED,
+          "Managed heap rejected for AS");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 0u, 65536u, 512u, 1, 0u, 256u, &aligned) == RDNA4RT_ERR_CONFLICT,
+          "Automatic heap rejects placement offset:");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 512u, 0, 0u, 256u, &aligned) == RDNA4RT_ERR_CONFLICT,
+          "Placement heap rejects non-offset alloc");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 512u, 1, 128u, 256u, &aligned) == RDNA4RT_ERR_ALIGNMENT,
+          "Placement heap rejects misaligned 128B offset");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 512u, 1, 65280u, 256u, &aligned) == RDNA4RT_ERR_BOUNDS,
+          "Placement heap rejects OOB offset+alignedSize");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 1u, 65536u, 512u, 1, 65536u, 256u, &aligned) == RDNA4RT_ERR_BOUNDS,
+          "Placement heap rejects offset == heapSize");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 0u, 65536u, 0u, 0, 0u, 256u, &aligned) == RDNA4RT_ERR_INVALID_ARG,
+          "heap AS rejects size == 0");
+    CHECK(rdna4rt_heap_as_validate_alloc(2u, 0u, 1024u, 2048u, 0, 0u, 256u, &aligned) == RDNA4RT_ERR_BOUNDS,
+          "Automatic heap rejects size > heapSize");
+}
+
+static void test_wave4_prim_and_query_pools(void) {
+    /* 1. Device-local GarnetASPrimData buffer pool: bucket fit, 2x guard, slab/byte caps, overflow. */
+    rdna4rt_buf_pool_t bp;
+    memset(&bp, 0, sizeof(bp));
+    rdna4rt_buf_pool_entry_t out;
+    CHECK(rdna4rt_buf_pool_pop(&bp, 4096u, &out) == 0 && bp.misses == 1u, "empty prim pool pop misses");
+
+    rdna4rt_buf_pool_entry_t e4k = { .buf_handle = 1u, .mem_handle = 101u, .bda = 0x10000u, .cap = 4096u, .alloc_size = 4096u };
+    rdna4rt_buf_pool_entry_t e8k = { .buf_handle = 2u, .mem_handle = 102u, .bda = 0x20000u, .cap = 8192u, .alloc_size = 8192u };
+    rdna4rt_buf_pool_entry_t e16m = { .buf_handle = 3u, .mem_handle = 103u, .bda = 0x30000u, .cap = 16u << 20, .alloc_size = 16u << 20 };
+    CHECK(rdna4rt_buf_pool_push(&bp, &e16m) == 1 && rdna4rt_buf_pool_push(&bp, &e8k) == 1 &&
+          rdna4rt_buf_pool_push(&bp, &e4k) == 1 && bp.count == 3u,
+          "push 16MiB, 8KiB, 4KiB slabs to prim pool");
+
+    /* Best-fit picks 4KiB first, then 8KiB (<= 2x), then refuses to steal 16MiB for a 4KiB request. */
+    CHECK(rdna4rt_buf_pool_pop(&bp, 4096u, &out) == 1 && out.buf_handle == 1u && bp.hits == 1u,
+          "4KiB pop picks exact 4KiB slab");
+    CHECK(rdna4rt_buf_pool_pop(&bp, 4096u, &out) == 1 && out.buf_handle == 2u && bp.hits == 2u,
+          "second 4KiB pop picks 8KiB slab (<=2x)");
+    CHECK(rdna4rt_buf_pool_pop(&bp, 4096u, &out) == 0 && bp.count == 1u,
+          "third 4KiB pop refuses to pin oversized 16MiB slab");
+    CHECK(rdna4rt_buf_pool_pop(&bp, 16u << 20, &out) == 1 && out.buf_handle == 3u &&
+          bp.count == 0u && bp.total_bytes == 0u,
+          "16MiB pop reclaims 16MiB slab cleanly");
+
+    /* Slab cap (32) enforcement. */
+    int all32 = 1;
+    for (uint32_t i = 0u; i < RDNA4RT_PRIM_POOL_MAX_SLABS; i++) {
+        rdna4rt_buf_pool_entry_t e = { .buf_handle = i + 10u, .mem_handle = i + 100u, .bda = 0x40000u + (uint64_t)i * 4096u, .cap = 4096u, .alloc_size = 4096u };
+        if (!rdna4rt_buf_pool_push(&bp, &e)) all32 = 0;
+    }
+    CHECK(all32 && bp.count == RDNA4RT_PRIM_POOL_MAX_SLABS, "prim pool accepts 32 slabs");
+    CHECK(rdna4rt_buf_pool_push(&bp, &e4k) == 0, "prim pool rejects 33rd slab");
+
+    /* Byte cap (64 MiB) + overflow guard. */
+    rdna4rt_buf_pool_reset(&bp);
+    rdna4rt_buf_pool_entry_t e32m = { .buf_handle = 50u, .mem_handle = 150u, .bda = 0x80000u, .cap = 32u << 20, .alloc_size = 32u << 20 };
+    CHECK(rdna4rt_buf_pool_push(&bp, &e32m) == 1 && rdna4rt_buf_pool_push(&bp, &e32m) == 1 &&
+          bp.total_bytes == RDNA4RT_PRIM_POOL_MAX_BUCKET,
+          "prim pool fills to exact 64 MiB cap");
+    CHECK(rdna4rt_buf_pool_push(&bp, &e4k) == 0, "prim pool rejects push exceeding 64 MiB cap");
+    rdna4rt_buf_pool_entry_t eHuge = { .buf_handle = 99u, .mem_handle = 199u, .bda = 0x90000u, .cap = 4096u, .alloc_size = UINT64_MAX };
+    CHECK(rdna4rt_buf_pool_push(&bp, &eHuge) == 0, "prim pool rejects overflowing alloc_size");
+    rdna4rt_buf_pool_entry_t eZeroBda = e4k; eZeroBda.bda = 0u;
+    CHECK(rdna4rt_buf_pool_push(&bp, &eZeroBda) == 0, "prim pool rejects zero BDA entry");
+    CHECK(rdna4rt_buf_pool_pop(&bp, 32u << 20, &out) == 1 && rdna4rt_buf_pool_push(&bp, &e4k) == 1,
+          "prim pool accepts push after popping frees budget");
+
+    /* 2. Compacted-size VkQueryPool free list (cap 8). */
+    rdna4rt_qp_pool_t qp;
+    memset(&qp, 0, sizeof(qp));
+    uint64_t qh = 0u;
+    CHECK(rdna4rt_qp_pool_pop(&qp, &qh) == 0 && qp.misses == 1u, "empty query pool misses");
+    CHECK(rdna4rt_qp_pool_push(&qp, 0u) == 0, "query pool rejects null handle 0");
+    int all8 = 1;
+    for (uint32_t i = 0u; i < RDNA4RT_QUERY_POOL_MAX_FREE; i++) {
+        if (!rdna4rt_qp_pool_push(&qp, UINT64_C(0x7000) + i)) all8 = 0;
+    }
+    CHECK(all8 && qp.count == RDNA4RT_QUERY_POOL_MAX_FREE, "query pool accepts 8 free pools");
+    CHECK(rdna4rt_qp_pool_push(&qp, UINT64_C(0x7099)) == 0, "query pool rejects 9th pool");
+    int popped8 = 1;
+    for (uint32_t i = 0u; i < RDNA4RT_QUERY_POOL_MAX_FREE; i++) {
+        if (!rdna4rt_qp_pool_pop(&qp, &qh) || qh != UINT64_C(0x7000) + (RDNA4RT_QUERY_POOL_MAX_FREE - 1u - i))
+            popped8 = 0;
+    }
+    CHECK(popped8 && qp.count == 0u && qp.hits == RDNA4RT_QUERY_POOL_MAX_FREE &&
+          rdna4rt_qp_pool_pop(&qp, &qh) == 0,
+          "query pool LIFO pop drains all 8 handles cleanly");
+}
+
 int main(void) {
     test_caps_and_alignment();
     test_usage_sizes_and_scratch();
@@ -689,6 +999,10 @@ int main(void) {
     test_motion_blur_validation_and_interpolation();
     test_lifecycle_state_machine();
     test_heap_batch_asan();
+    test_wave4_prim_data_validation_and_layout();
+    test_wave4_prim_refit_and_barriers();
+    test_wave4_heap_as_sizing_and_validation();
+    test_wave4_prim_and_query_pools();
     printf("test-rt-accel: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
