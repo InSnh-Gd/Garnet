@@ -228,17 +228,29 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
             // On a full-BAR (> 1 GiB) boot, visible pool is nearly all usable VRAM (hi pool is tiny), so hi_first and appvis_active both stay OFF while g2::app_vram_budget_ok still binds.
             const bool fullBar = rdna4rebar::is_full_bar_aperture(dev.bar0Size, dev.vramLimit);
             const bool appsNow = rdna4native::g4::appvis_active(apps_on(), fullBar);
+            // Opportunistic 2 MiB alignment only for exact 2 MiB multiples (zero rounding waste in VRAMBumpAllocator); falls back to p.align on fragmentation.
+            const uint64_t hugeAlign = rdna4native::s1c::bo_alloc_align(p.size, p.align, hugepage_on());
             bool got = false;
-            bool hiDone = rdna4native::g4::hi_first(fullBar, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a);
+            bool hiDone = rdna4native::g4::hi_first(fullBar, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() &&
+                          ((hugeAlign > p.align && gCtx->gmc.vram_alloc_hi.alloc(p.size, hugeAlign, &a)) ||
+                           gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a));
             if (!hiDone) {
                 if (!rdna4native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)) {
                     N1C_LOG("BoCreate refused (NoMemory): slot %u is over the visible-VRAM cap for non-WindowServer sessions (%llu KiB held of %llu MiB, %llu KiB asked)", s->slot,
                             (unsigned long long)(gVisOthers >> 10), (unsigned long long)(appvis_cap() >> 20), (unsigned long long)(p.size >> 10));
                     rc = kIOReturnNoMemory; break;
                 }
-                got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);
-                if (got) {
-                    if (!rdna4rebar::vis_vram_range_ok(a.gpu_va, a.size, gCtx->gmc.vram_start, dev.vramLimit, dev.bar0Size, dev.vramSizeBytes)) { gCtx->gmc.vram_alloc.free(a); got = false; }
+                if (hugeAlign > p.align && gCtx->gmc.vram_alloc.alloc(p.size, hugeAlign, &a)) {
+                    if (rdna4rebar::vis_vram_range_ok(a.gpu_va, a.size, gCtx->gmc.vram_start, dev.vramLimit, dev.bar0Size, dev.vramSizeBytes))
+                        got = true;
+                    else
+                        gCtx->gmc.vram_alloc.free(a);
+                }
+                if (!got) {
+                    got = gCtx->gmc.vram_alloc.alloc(p.size, p.align, &a);
+                    if (got) {
+                        if (!rdna4rebar::vis_vram_range_ok(a.gpu_va, a.size, gCtx->gmc.vram_start, dev.vramLimit, dev.bar0Size, dev.vramSizeBytes)) { gCtx->gmc.vram_alloc.free(a); got = false; }
+                    }
                 }
             }
             if (got) {
@@ -247,7 +259,9 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
                 amdgpu_hdp_flush(dev);
                 placed = RDNA4N_GEM_DOMAIN_VRAM; bits = RDNA4N_PLACED_CPU_MAPPABLE | RDNA4N_PLACED_ZEROED;
                 if (rdna4native::g4::appvis_counts(appsNow, s->ws, true)) { b.visCounted = 1u; gVisOthers += p.size; }
-            } else if (hiDone || (p.hiOk && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a))) {
+            } else if (hiDone || (p.hiOk && gCtx->gmc.vram_alloc_hi.is_inited() &&
+                                  ((hugeAlign > p.align && gCtx->gmc.vram_alloc_hi.alloc(p.size, hugeAlign, &a)) ||
+                                   gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a)))) {
                 b.kind = kBoHi; b.a = a; b.mc = a.gpu_va;
                 placed = RDNA4N_GEM_DOMAIN_VRAM; bits = RDNA4N_PLACED_HI_POOL;
             } else { rc = kIOReturnNoMemory; break; }
@@ -744,7 +758,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
                 const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
                 const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
                 r = scattered ? pt_map_pages_tx(s->rootPa, vaCanon, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
-                              : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem);
+                              : pt_map_tx(s->rootPa, vaCanon, in->map_size / kPage, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem, hugepage_on());
             }
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
@@ -776,7 +790,7 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
                 const uint64_t basePa = scattered ? 0ull : pa_of_mc(b.mc) + in->offset_in_bo;
                 const uint32_t vmf = host ? host_vm_flags(in->flags, b.hro != 0u) : in->flags;
                 r = scattered ? pt_replace_pages_tx(s->rootPa, vaCanon, pages, b.hpages + in->offset_in_bo / kPage, leaf_flags(vmf, b.uc, sys), mem)
-                              : pt_replace_tx(s->rootPa, vaCanon, pages, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem);
+                              : pt_replace_tx(s->rootPa, vaCanon, pages, basePa, leaf_flags(vmf, b.uc, sys, b.dcc), mem, hugepage_on());
             }
             if (r == kNoMemory) {
                 amdgpu_hdp_flush(*gCtx->dev);
@@ -796,7 +810,15 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             if (!va_clear_fits(plan)) { rc = kIOReturnNoResources; break; }
             if (plan.overlapping > 0u && !own_wait(s)) { rc = kIOReturnTimeout; break; }
             if (plan.overlapping > 0u) {
-                pt_unmap(s->rootPa, q.stripped, pages, mem);
+                IOLockLock(gCliLock);
+                uint32_t r = pt_unmap_tx(s->rootPa, vaCanon, pages, mem);
+                if (r == kNoMemory) {
+                    amdgpu_hdp_flush(*gCtx->dev);
+                    const uint32_t f = session_flush_if_bound_locked(s);
+                    if (f != kOk) { mem.quarantine_rollback(); r = f; }
+                }
+                IOLockUnlock(gCliLock);
+                if (r != kOk) { rc = (IOReturn)r; break; }
                 (void)va_carve(s->maps, kMaxMaps, q.stripped, in->map_size);
                 session_sync_prt(s);
             }
@@ -811,6 +833,8 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
                 rc = kIOReturnTimeout;
                 break;
             }
+            // Exact UNMAP matches a whole VaEnt (any partial CLEAR/REPLACE already split boundary 2 MiB leaves),
+            // so pt_unmap clears full 2 MiB huge leaves and 4 KiB PTEs with zero PT allocations (no gCliLock).
             pt_unmap(s->rootPa, q.stripped, in->map_size / kPage, mem);
             s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 };
             session_sync_prt(s);

@@ -60,6 +60,7 @@ static_assert(rdna4scan::kOk == (uint32_t)kIOReturnSuccess && rdna4scan::kBadArg
 static_assert(PTEFlags::PRT_GFX12 == kPtePrt && PTEFlags::PRT_LEAF == kPtePrtLeaf && (PTEFlags::PRT_LEAF & PTEFlags::VALID) == 0ULL,
               "GFX12 PRT PTE encoding matches Linux amdgpu_vm.h/gmc_v12_0.c");
 static_assert(PTEFlags::DCC_GFX12 == kPteDcc, "GFX12 DCC PTE bit 58 matches Linux amdgpu_vm.h");
+static_assert(PTEFlags::FRAG_MASK == kPteFragMask && PTEFlags::FRAG_2M == kPteFrag2M, "GFX12 FRAG(9) huge-page bits match Linux amdgpu_vm.h");
 
 // ---- state --------------------------------------------------------------------------------------------------------------------
 enum : uint8_t { kBoNone = 0, kBoVis = 1, kBoHi = 2, kBoGtt = 3, kBoHost = 4 };   // kBoHost: 0.0.612, an import of the caller's memory (hmd / hpages)
@@ -183,6 +184,7 @@ bool vmid_fence_reached(void *, uint32_t, uint64_t seq);
 bool multi_on();
 bool apps_on();
 bool dcc_on();
+bool hugepage_on();
 uint64_t appvis_cap();
 bool g1_holds();
 Session *sess_lock(const N1cRef &r, bool needHello);
@@ -308,8 +310,19 @@ struct PtMem {
             for (uint32_t lvl = 0; lvl < 3; lvl++) {
                 const uint64_t e = rd(tbl, idx[lvl]);
                 if (!entry_valid(e) || entry_is_leaf(e)) break;
-                if (is_new_table(e & kPtePaMask, snap)) { wr(tbl, idx[lvl], 0ull); break; }
-                tbl = e & kPtePaMask;
+                const uint64_t childPa = e & kPtePaMask;
+                if (is_new_table(childPa, snap)) {
+                    // If Pass 1 split a pre-existing 2 MiB PDB0 huge leaf into this new PTB, child[0]
+                    // holds its exact base PA + child flags; restore the huge leaf before discarding the PTB.
+                    uint64_t restore = 0ull;
+                    if (lvl == 2u) {
+                        const uint64_t p0 = rd(childPa, 0u);
+                        if (entry_valid(p0)) restore = pte_encode_huge2m(entry_pa(p0), p0);
+                    }
+                    wr(tbl, idx[lvl], restore);
+                    break;
+                }
+                tbl = childPa;
             }
             const uint64_t run = 512ull - idx_ptb(v);
             p += run < pages - p ? run : pages - p;

@@ -56,6 +56,15 @@ enum PlaceKind : uint32_t { kPlaceNone = 0, kPlaceVis = 1, kPlaceGtt = 2 };
 struct Place { uint32_t rc; uint32_t kind; uint64_t size; uint64_t align; bool uc; bool hiOk; bool dcc; };
 // Kill-switch boot-arg `garnet-dcc=0`: default ON when absent or nonzero.
 constexpr bool dcc_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
+// Kill-switch boot-arg `garnet-hugepage=0`: default ON when absent or nonzero.
+constexpr bool hugepage_boot_enabled(bool present, uint32_t val) { return !present || val != 0u; }
+// Opportunistic 2 MiB VRAM alignment ONLY when `size` is an exact multiple of 2 MiB (zero rounding waste in VRAMBumpAllocator).
+constexpr uint64_t bo_alloc_align(uint64_t size, uint64_t reqAlign, bool hugeOn) {
+    return (hugeOn && size >= kHuge2mBytes && (size & kHuge2mMask) == 0ull && reqAlign < kHuge2mBytes) ? kHuge2mBytes : reqAlign;
+}
+static_assert(bo_alloc_align(2ull << 20, 4096ull, true) == (2ull << 20), "exact 2 MiB BO tries 2 MiB align");
+static_assert(bo_alloc_align(3ull << 20, 4096ull, true) == 4096ull, "non-multiple 3 MiB BO keeps reqAlign (zero waste)");
+static_assert(bo_alloc_align(2ull << 20, 4096ull, false) == 4096ull, "garnet-hugepage=0 keeps reqAlign");
 constexpr uint64_t kGemAccepted = RDNA4N_GEM_CPU_ACCESS_REQUIRED | RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_CPU_GTT_USWC | RDNA4N_GEM_VRAM_CLEARED |
     RDNA4N_GEM_VRAM_CONTIGUOUS | RDNA4N_GEM_VM_ALWAYS_VALID | RDNA4N_GEM_EXPLICIT_SYNC | RDNA4N_GEM_DISCARDABLE | RDNA4N_GEM_UNCACHED |
     RDNA4N_GEM_GFX12_DCC | RDNA4N_GEM_VIRTIO_SHARED;
@@ -283,12 +292,26 @@ inline uint32_t va_remove_prt(VaEnt *t, uint32_t n) {
 // ---- the page-table tree over an abstract memory ------------------------------------------------------------------------------
 // `M` supplies: uint64_t rd(uint64_t tablePa, uint32_t idx); void wr(uint64_t tablePa, uint32_t idx, uint64_t v);
 //               uint64_t alloc_page()  -> the pa of a fresh ZEROED 4 KiB table page, or 0 when the page-table cap is reached.
-// Ensures the PDB1 / PDB0 / PTB chain for `va` exists under `rootPa` and returns the PTB's pa (0 on exhaustion or an unencodable pa).
+// 2-slot stack undo for partial-overlap 2 MiB huge-leaf splits (any contiguous range touches at most 2 partial 2 MiB slots: head & tail).
+struct SplitRec { uint64_t pdb0Pa; uint32_t idx; uint64_t origLeaf; };
+struct SplitUndo {
+    uint32_t count = 0u;
+    SplitRec rec[2] = {};
+    void push(uint64_t pdb0Pa, uint32_t idx, uint64_t origLeaf) {
+        if (count < 2u) rec[count++] = SplitRec{ pdb0Pa, idx, origLeaf };
+    }
+    template <class M>
+    void restore(M &m) const {
+        for (uint32_t i = count; i > 0u; i--)
+            m.wr(rec[i - 1u].pdb0Pa, rec[i - 1u].idx, rec[i - 1u].origLeaf);
+    }
+};
+// Ensures the PDB1 / PDB0 chain for `va` exists under `rootPa` and returns PDB0's pa (0 on exhaustion or an unencodable pa).
 template <class M>
-inline uint64_t pt_ensure_ptb(uint64_t rootPa, uint64_t va, M &m) {
+inline uint64_t pt_ensure_pdb0(uint64_t rootPa, uint64_t va, M &m) {
     uint64_t tbl = rootPa;
-    const uint32_t idx[3] = { idx_pdb2(va), idx_pdb1(va), idx_pdb0(va) };
-    for (uint32_t lvl = 0; lvl < 3; lvl++) {
+    const uint32_t idx[2] = { idx_pdb2(va), idx_pdb1(va) };
+    for (uint32_t lvl = 0; lvl < 2; lvl++) {
         uint64_t e = m.rd(tbl, idx[lvl]);
         if (!entry_valid(e)) {
             const uint64_t pa = m.alloc_page();
@@ -301,11 +324,45 @@ inline uint64_t pt_ensure_ptb(uint64_t rootPa, uint64_t va, M &m) {
     }
     return tbl;
 }
+// Split a 2 MiB PDB0 huge leaf at `(pdb0, idx0)` into 512 4 KiB PTEs (FRAG stripped) in a fresh PTB.
+// Returns the new PTB PA, or 0 on allocation failure (leaving `pdb0[idx0]` untouched).
+template <class M>
+inline uint64_t pt_split_huge(uint64_t pdb0, uint32_t idx0, uint64_t hugeLeaf, M &m) {
+    const uint64_t ptb = m.alloc_page();
+    const uint64_t enc = ptb ? pde_encode(ptb) : 0ull;
+    if (enc == 0ull) return 0ull;
+    const uint64_t basePa = entry_pa(hugeLeaf);
+    const uint64_t childFlags = huge2m_child_flags(hugeLeaf);
+    for (uint32_t k = 0; k < 512u; k++)
+        m.wr(ptb, k, pte_encode(basePa + (uint64_t)k * kPage, childFlags));
+    m.wr(pdb0, idx0, enc);
+    return ptb;
+}
+// Ensures the PDB1 / PDB0 / PTB chain for `va` exists under `rootPa` and returns the PTB's pa (0 on exhaustion or an unencodable pa).
+// Automatically splits an existing 2 MiB PDB0 huge leaf into a 4 KiB PTB when 4 KiB granularity is needed.
+template <class M>
+inline uint64_t pt_ensure_ptb(uint64_t rootPa, uint64_t va, M &m) {
+    const uint64_t pdb0 = pt_ensure_pdb0(rootPa, va, m);
+    if (pdb0 == 0ull) return 0ull;
+    const uint32_t idx0 = idx_pdb0(va);
+    const uint64_t e = m.rd(pdb0, idx0);
+    if (!entry_valid(e)) {
+        const uint64_t pa = m.alloc_page();
+        const uint64_t enc = pa ? pde_encode(pa) : 0ull;
+        if (enc == 0ull) return 0ull;
+        m.wr(pdb0, idx0, enc);
+        return pa;
+    }
+    if (entry_is_huge2m(e)) return pt_split_huge(pdb0, idx0, e, m);
+    return entry_pa(e);
+}
 // Map `pages` 4 KiB pages at `va` to consecutive physical pages starting at `firstPa`. Two passes: every table page first (the only
 // step that can fail), then the leaves, so a failed call leaves no partial mapping. Returns kOk / kNoMemory / kBadArg.
 // Pre-validates every leaf PTE before allocating any table page, so a BadArg leaves no leaf behind.
+// When `allowHuge` is true, 2 MiB-aligned VA/PA spans of >= 512 pages write 2 MiB PDB0 huge leaves directly whenever the target PDB0
+// slot is empty or already a 2 MiB huge leaf (existing 4 KiB PTBs are reused in place to avoid leaking table pages).
 template <class M>
-inline uint32_t pt_map(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m) {
+inline uint32_t pt_map(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m, bool allowHuge = false) {
     if (pages == 0ull) return kBadArg;
     // Full PTE pre-check before any table allocation: overflow-safe, every PA encodable and aligned.
     // Callers guarantee `va` via gemva_check (canonical, seam, 4 KiB aligned); this checks the PA side only.
@@ -318,15 +375,40 @@ inline uint32_t pt_map(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t fi
     }
     for (uint64_t p = 0; p < pages;) {
         const uint64_t v = va + p * kPage;
+        const uint64_t pa = firstPa + p * kPage;
+        const uint64_t rem = pages - p;
+        const bool canHuge = allowHuge && (leafFlags & kPteValid) != 0ull &&
+                             idx_ptb(v) == 0u && rem >= kHuge2mPages && (pa & kHuge2mMask) == 0ull;
+        const uint64_t pdb0 = pt_ensure_pdb0(rootPa, v, m);
+        if (pdb0 == 0ull) return kNoMemory;
+        const uint64_t e0 = m.rd(pdb0, idx_pdb0(v));
+        if (canHuge && (!entry_valid(e0) || entry_is_huge2m(e0))) {
+            p += kHuge2mPages;
+            continue;
+        }
         if (pt_ensure_ptb(rootPa, v, m) == 0ull) return kNoMemory;
-        p += 512ull - idx_ptb(v);                                 // to the next PTB
+        const uint64_t step = 512ull - idx_ptb(v);
+        p += step < rem ? step : rem;                             // to the next PTB
     }
     for (uint64_t p = 0; p < pages;) {
         const uint64_t v = va + p * kPage;
+        const uint64_t pa = firstPa + p * kPage;
+        const uint64_t rem = pages - p;
+        const bool canHuge = allowHuge && (leafFlags & kPteValid) != 0ull &&
+                             idx_ptb(v) == 0u && rem >= kHuge2mPages && (pa & kHuge2mMask) == 0ull;
+        const uint64_t pdb0 = pt_ensure_pdb0(rootPa, v, m);       // all present now: no allocation
+        if (pdb0 == 0ull) return kNoMemory;
+        const uint32_t idx0 = idx_pdb0(v);
+        const uint64_t e0 = m.rd(pdb0, idx0);
+        if (canHuge && (!entry_valid(e0) || entry_is_huge2m(e0))) {
+            m.wr(pdb0, idx0, pte_encode_huge2m(pa, leafFlags));
+            p += kHuge2mPages;
+            continue;
+        }
         const uint64_t ptb = pt_ensure_ptb(rootPa, v, m);         // all present now: no allocation
         if (ptb == 0ull) return kNoMemory;
-        const uint64_t run = 512ull - idx_ptb(v) < pages - p ? 512ull - idx_ptb(v) : pages - p;
-        for (uint64_t k = 0; k < run; k++) m.wr(ptb, idx_ptb(v) + (uint32_t)k, pte_encode(firstPa + (p + k) * kPage, leafFlags));
+        const uint64_t run = 512ull - idx_ptb(v) < rem ? 512ull - idx_ptb(v) : rem;
+        for (uint64_t k = 0; k < run; k++) m.wr(ptb, idx_ptb(v) + (uint32_t)k, pte_encode(pa + k * kPage, leafFlags));
         p += run;
     }
     return kOk;
@@ -351,21 +433,66 @@ inline uint32_t pt_fill(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t l
     }
     return kOk;
 }
-// Clear `pages` leaves at `va` (a missing table is skipped: nothing was ever mapped there).
+// Clear `pages` leaves at `va` (a missing table is skipped; full 2 MiB huge leaves are cleared directly in PDB0 with 0 allocations).
 template <class M>
 inline void pt_unmap(uint64_t rootPa, uint64_t va, uint64_t pages, M &m) {
     for (uint64_t p = 0; p < pages;) {
         const uint64_t v = va + p * kPage;
+        const uint64_t rem = pages - p;
+        const uint64_t run = 512ull - idx_ptb(v) < rem ? 512ull - idx_ptb(v) : rem;
         uint64_t tbl = rootPa; bool ok = true;
-        const uint32_t idx[3] = { idx_pdb2(v), idx_pdb1(v), idx_pdb0(v) };
-        for (uint32_t lvl = 0; lvl < 3 && ok; lvl++) {
+        const uint32_t idx[2] = { idx_pdb2(v), idx_pdb1(v) };
+        for (uint32_t lvl = 0; lvl < 2 && ok; lvl++) {
             const uint64_t e = m.rd(tbl, idx[lvl]);
-            if (!entry_valid(e)) ok = false; else tbl = entry_pa(e);
+            if (!entry_valid(e) || entry_is_leaf(e)) ok = false; else tbl = entry_pa(e);
         }
-        const uint64_t run = 512ull - idx_ptb(v) < pages - p ? 512ull - idx_ptb(v) : pages - p;
-        if (ok) for (uint64_t k = 0; k < run; k++) m.wr(tbl, idx_ptb(v) + (uint32_t)k, 0ull);
+        if (ok) {
+            const uint32_t idx0 = idx_pdb0(v);
+            const uint64_t e0 = m.rd(tbl, idx0);
+            if (entry_is_huge2m(e0)) {
+                if (idx_ptb(v) == 0u && run == kHuge2mPages) m.wr(tbl, idx0, 0ull);
+            } else if (entry_valid(e0)) {
+                const uint64_t ptb = entry_pa(e0);
+                for (uint64_t k = 0; k < run; k++) m.wr(ptb, idx_ptb(v) + (uint32_t)k, 0ull);
+            }
+        }
         p += run;
     }
+}
+// Transactional unmap / clear supporting partial 2 MiB huge-leaf splits.
+// Pass 1 splits at most 2 partial-overlap 2 MiB huge leaves (head & tail), recording origLeaf in SplitUndo;
+// on kNoMemory, restores origLeaf and calls m.rollback() so pre-existing 2 MiB mappings remain intact.
+template <class M>
+inline uint32_t pt_unmap_tx(uint64_t rootPa, uint64_t va, uint64_t pages, M &m) {
+    if (pages == 0ull) return kOk;
+    auto snap = m.snapshot();
+    SplitUndo undo {};
+    for (uint64_t p = 0; p < pages;) {
+        const uint64_t v = va + p * kPage;
+        const uint64_t rem = pages - p;
+        const uint64_t run = 512ull - idx_ptb(v) < rem ? 512ull - idx_ptb(v) : rem;
+        uint64_t tbl = rootPa; bool havePdb0 = true;
+        const uint32_t idx[2] = { idx_pdb2(v), idx_pdb1(v) };
+        for (uint32_t lvl = 0; lvl < 2 && havePdb0; lvl++) {
+            const uint64_t e = m.rd(tbl, idx[lvl]);
+            if (!entry_valid(e) || entry_is_leaf(e)) havePdb0 = false; else tbl = entry_pa(e);
+        }
+        if (havePdb0) {
+            const uint32_t idx0 = idx_pdb0(v);
+            const uint64_t e0 = m.rd(tbl, idx0);
+            if (entry_is_huge2m(e0) && !(idx_ptb(v) == 0u && run == kHuge2mPages)) {
+                if (pt_split_huge(tbl, idx0, e0, m) == 0ull) {
+                    undo.restore(m);
+                    m.rollback(snap, rootPa, va, pages);
+                    return kNoMemory;
+                }
+                undo.push(tbl, idx0, e0);
+            }
+        }
+        p += run;
+    }
+    pt_unmap(rootPa, va, pages, m);
+    return kOk;
 }
 // Host-test walker: the physical address and leaf flags `va` resolves to under `rootPa` (0 when a level is invalid).
 template <class M>
@@ -374,7 +501,12 @@ inline uint64_t pt_walk(uint64_t rootPa, uint64_t va, M &m, uint64_t *leafOut) {
     const uint32_t idx[3] = { idx_pdb2(va), idx_pdb1(va), idx_pdb0(va) };
     for (uint32_t lvl = 0; lvl < 3; lvl++) {
         const uint64_t e = m.rd(tbl, idx[lvl]);
-        if (!entry_valid(e) || entry_is_leaf(e)) return 0ull;
+        if (!entry_valid(e)) return 0ull;
+        if (entry_is_leaf(e)) {
+            if (lvl != 2u) return 0ull;   // only PDB0 supports 2 MiB huge leaves
+            if (leafOut) *leafOut = e;
+            return entry_pa(e) | (va & kHuge2mMask);
+        }
         tbl = entry_pa(e);
     }
     const uint64_t leaf = m.rd(tbl, idx_ptb(va));
@@ -436,11 +568,11 @@ constexpr uint32_t pt_va_precheck(uint64_t va, uint64_t pages) {
 // Leaf validation lives only in pt_map below (overflow/align/encodable pre-check before any
 // alloc); the wrapper adds only the VA range pre-check so bad ranges never touch tables.
 template <class M>
-inline uint32_t pt_map_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m) {
+inline uint32_t pt_map_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m, bool allowHuge = false) {
     uint32_t rc = pt_va_precheck(va, pages);
     if (rc != kOk) return rc;
     auto snap = m.snapshot();
-    rc = pt_map(rootPa, va, pages, firstPa, leafFlags, m);
+    rc = pt_map(rootPa, va, pages, firstPa, leafFlags, m, allowHuge);
     if (rc != kOk) {
         pt_unmap(rootPa, va, pages, m);
         m.rollback(snap, rootPa, va, pages);
@@ -449,7 +581,8 @@ inline uint32_t pt_map_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t
 }
 // Transactional constant-leaf fill (PRT MAP and PRT REPLACE) and contiguous BO REPLACE:
 // Pass 1 allocates all missing PTBs before Pass 2 writes any leaf, so a failure never overwrites
-// pre-existing overlapping leaves; rollback detaches newly allocated tables only (no pt_unmap).
+// pre-existing overlapping leaves; rollback detaches newly allocated tables only (and restores any
+// split 2 MiB huge leaves via child PTE[0]).
 template <class M>
 inline uint32_t pt_fill_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t leafPte, M &m) {
     uint32_t rc = pt_va_precheck(va, pages);
@@ -460,11 +593,11 @@ inline uint32_t pt_fill_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_
     return rc;
 }
 template <class M>
-inline uint32_t pt_replace_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m) {
+inline uint32_t pt_replace_tx(uint64_t rootPa, uint64_t va, uint64_t pages, uint64_t firstPa, uint64_t leafFlags, M &m, bool allowHuge = false) {
     uint32_t rc = pt_va_precheck(va, pages);
     if (rc != kOk) return rc;
     auto snap = m.snapshot();
-    rc = pt_map(rootPa, va, pages, firstPa, leafFlags, m);
+    rc = pt_map(rootPa, va, pages, firstPa, leafFlags, m, allowHuge);
     if (rc != kOk) m.rollback(snap, rootPa, va, pages);
     return rc;
 }

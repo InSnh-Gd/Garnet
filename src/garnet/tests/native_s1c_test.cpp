@@ -256,7 +256,37 @@ struct FakeMem {
     uint64_t next { 0x40000000ull };
     uint32_t budget;
     uint32_t allocs { 0 };
+    struct Snap { uint32_t allocs; uint64_t next; };
     explicit FakeMem(uint32_t b) : budget(b) {}
+    Snap snapshot() const { return Snap{ allocs, next }; }
+    void rollback(const Snap &s, uint64_t rootPa, uint64_t va, uint64_t count) {
+        for (uint64_t p = 0; p < count;) {
+            const uint64_t v = va + p * kPage;
+            uint64_t tbl = rootPa;
+            const uint32_t idx[3] = { idx_pdb2(v), idx_pdb1(v), idx_pdb0(v) };
+            for (uint32_t lvl = 0; lvl < 3; lvl++) {
+                const uint64_t e = rd(tbl, idx[lvl]);
+                if (!entry_valid(e) || entry_is_leaf(e)) break;
+                const uint64_t childPa = e & kPtePaMask;
+                if (childPa >= s.next) {
+                    uint64_t restore = 0ull;
+                    if (lvl == 2u) {
+                        const uint64_t p0 = rd(childPa, 0u);
+                        if (entry_valid(p0)) restore = pte_encode_huge2m(entry_pa(p0), p0);
+                    }
+                    wr(tbl, idx[lvl], restore);
+                    break;
+                }
+                tbl = childPa;
+            }
+            const uint64_t run = 512ull - idx_ptb(v);
+            p += run < count - p ? run : count - p;
+        }
+        std::vector<uint64_t> dead;
+        for (auto &kv : pages) if (kv.first >= s.next) dead.push_back(kv.first);
+        for (uint64_t pa : dead) pages.erase(pa);
+        allocs = s.allocs; next = s.next;
+    }
     uint64_t alloc_page() {
         if (allocs >= budget) return 0;
         allocs++;
@@ -703,6 +733,10 @@ static void u12_pins(const std::string &root) {
     expect(eng.find("dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u") != std::string::npos, "n1c_query_info gates RDNA4N_CAP_GFX12_DCC on dcc_on()");
     expect(eng.find("PE_parse_boot_argn(\"garnet-dcc\"") != std::string::npos, "garnet-dcc boot-arg kill-switch exists");
     expect(eng.find("else if (b.dcc) rc = kIOReturnNotPermitted;") != std::string::npos, "GFX12 DCC BOs refuse raw BAR0 CPU mapping");
+    // Wave 12: 2 MiB PDB0 huge pages, kill-switch, opportunistic alignment, and locked pt_unmap_tx
+    expect(eng.find("PE_parse_boot_argn(\"garnet-hugepage\"") != std::string::npos, "garnet-hugepage boot-arg kill-switch exists");
+    expect(eng.find("bo_alloc_align(p.size, p.align, hugepage_on())") != std::string::npos, "n1c_bo_create uses opportunistic 2 MiB alignment");
+    expect_u("CLEAR uses transactional pt_unmap_tx under gCliLock", count_of(eng, "pt_unmap_tx(s->rootPa, vaCanon, pages, mem)"), 1);
     // banned strings in the new files
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens
     for (const std::string *f : { &eng, &cli, &pure, &abi }) expect(f->find(bad1) == std::string::npos && f->find(bad2) == std::string::npos && f->find(bad3) == std::string::npos, "no banned pipe offsets in the new files");
@@ -723,23 +757,132 @@ static void u14_gfx12_dcc() {
     expect(pGttDcc.rc == kOk && pGttDcc.kind == kPlaceGtt && !pGttDcc.dcc, "GTT never enables Place::dcc");
 
     // Verify pt_map encodes AMDGPU_PTE_DCC (bit 58) on VRAM DCC leaves without clobbering PA or IS_PTE.
-    TestMem mem;
+    FakeMem mem(64);
     const uint64_t root = mem.alloc_page();
     const uint64_t pa = 0x200000000ull;
     const uint64_t va = 0x200000ull;
     const uint64_t lf = leaf_flags(RDNA4N_VM_PAGE_READABLE | RDNA4N_VM_PAGE_WRITEABLE, false, false, true);
     expect_u("pt_map VRAM DCC leaf", pt_map(root, va, 2, pa, lf, mem), kOk);
-    const uint64_t pte0 = pt_walk(root, va, mem);
-    const uint64_t pte1 = pt_walk(root, va + kPage, mem);
+    uint64_t pte0 = 0, pte1 = 0;
+    expect_u("page 0 walks to pa", pt_walk(root, va, mem, &pte0), pa);
+    expect_u("page 1 walks to pa + 4 KiB", pt_walk(root, va + kPage, mem, &pte1), pa + kPage);
     expect((pte0 & kPteDcc) != 0ull && (pte0 & kPteIsPte) != 0ull && (pte0 & kPteValid) != 0ull && entry_pa(pte0) == pa,
            "page 0 PTE carries bit 58 (DCC), bit 63 (IS_PTE), VALID, and exact PA");
     expect((pte1 & kPteDcc) != 0ull && entry_pa(pte1) == pa + kPage,
            "page 1 PTE carries bit 58 (DCC) and PA + 4 KiB");
 }
 
+static void u15_huge_2m() {
+    expect(hugepage_boot_enabled(false, 0u), "absent garnet-hugepage defaults ON");
+    expect(hugepage_boot_enabled(true, 1u), "garnet-hugepage=1 enables 2 MiB huge pages");
+    expect(!hugepage_boot_enabled(true, 0u), "garnet-hugepage=0 disables 2 MiB huge pages");
+    expect_u("bo_alloc_align promotes exact 2 MiB multiple", bo_alloc_align(64ull << 20, 4096, true), kHuge2mBytes);
+    expect_u("bo_alloc_align preserves non-multiple (zero rounding waste)", bo_alloc_align((2ull << 20) + 4096, 4096, true), 4096);
+    expect_u("bo_alloc_align disabled keeps reqAlign", bo_alloc_align(64ull << 20, 65536, false), 65536);
+
+    const uint64_t lfDcc = leaf_flags(RDNA4N_VM_PAGE_READABLE | RDNA4N_VM_PAGE_WRITEABLE | RDNA4N_VM_PAGE_EXECUTABLE, false, false, true);
+    const uint64_t lfPlain = leaf_flags(RDNA4N_VM_PAGE_READABLE | RDNA4N_VM_PAGE_WRITEABLE, false, false, false);
+
+    // 1. 64 MiB aligned VRAM huge-page mapping: uses 3 tables total (root + PDB1 + PDB0, 0 PTBs!).
+    {
+        FakeMem m(16);
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0x10000000ull, pa = 0x200000000ull, pages = (64ull << 20) / kPage;
+        expect_u("64 MiB huge map succeeds with tiny PT budget", pt_map_tx(root, va, pages, pa, lfDcc, m, true), kOk);
+        expect_u("64 MiB huge map allocated only root+PDB1+PDB0 (3 pages, 0 PTBs)", m.allocs, 3u);
+        uint64_t leaf = 0;
+        expect_u("huge walk start", pt_walk(root, va, m, &leaf), pa);
+        expect((leaf & kPteFragMask) == kPteFrag2M && (leaf & kPteIsPte) != 0ull && (leaf & kPteDcc) != 0ull,
+               "PDB0 huge leaf carries FRAG(9), IS_PTE, and DCC");
+        expect_u("huge walk mid-slot offset", pt_walk(root, va + (17ull << 20) + 0x123456ull, m, &leaf), pa + (17ull << 20) + 0x123456ull);
+        expect_u("huge walk end-1 byte", pt_walk(root, va + (64ull << 20) - 1ull, m, &leaf), pa + (64ull << 20) - 1ull);
+        expect_u("past end unmapped", pt_walk(root, va + (64ull << 20), m, nullptr), 0ull);
+        // Full unmap needs 0 allocations.
+        expect_u("full 64 MiB huge unmap succeeds with 0 extra pages", pt_unmap_tx(root, va, pages, m), kOk);
+        expect_u("no pages allocated on full huge unmap", m.allocs, 3u);
+        expect_u("start unmapped after huge unmap", pt_walk(root, va, m, nullptr), 0ull);
+        expect_u("mid unmapped after huge unmap", pt_walk(root, va + (32ull << 20), m, nullptr), 0ull);
+    }
+
+    // 2. Mixed unaligned head + 2 MiB interior + unaligned tail (va=0x10100000, pa=0x200100000, size=6 MiB -> 1M + 4M + 1M).
+    {
+        FakeMem m(16);
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0x10100000ull, pa = 0x200100000ull, pages = (6ull << 20) / kPage;
+        expect_u("mixed 6 MiB map succeeds", pt_map_tx(root, va, pages, pa, lfDcc, m, true), kOk);
+        // root + PDB1 + PDB0 + 2 PTBs (head + tail) = 5 pages (2 interior 2 MiB slots need 0 PTBs!).
+        expect_u("mixed 6 MiB allocates 5 pages (2 PTBs + 2 huge leaves)", m.allocs, 5u);
+        uint64_t lh = 0, lm = 0, lt = 0;
+        expect_u("head 4 KiB walks", pt_walk(root, va, m, &lh), pa);
+        expect_u("middle huge walks", pt_walk(root, va + (1ull << 20) + 0x55000ull, m, &lm), pa + (1ull << 20) + 0x55000ull);
+        expect_u("tail 4 KiB walks", pt_walk(root, va + (6ull << 20) - kPage, m, &lt), pa + (6ull << 20) - kPage);
+        expect((lh & kPteFragMask) == 0ull && (lm & kPteFragMask) == kPteFrag2M && (lt & kPteFragMask) == 0ull,
+               "head/tail are 4 KiB (FRAG=0) and middle is 2 MiB huge (FRAG=9)");
+    }
+
+    // 3. Partial CLEAR split (strips FRAG, keeps DCC), partial REPLACE with PRT & BO, and existing PTB reuse.
+    {
+        FakeMem m(32);
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0xFFFF800020000000ull, pa = 0x300000000ull, pages = (6ull << 20) / kPage;
+        expect_u("high-half 6 MiB huge map", pt_map_tx(root, va, pages, pa, lfDcc, m, true), kOk);
+        expect_u("3 tables allocated", m.allocs, 3u);
+
+        // Partial CLEAR across head (slot 0 tail) + full interior (slot 1) + tail (slot 2 head): [va+0x10000, va+4MiB+0x10000).
+        expect_u("partial CLEAR splits head & tail, clears slot 1 directly", pt_unmap_tx(root, va + 0x10000ull, (4ull << 20) / kPage, m), kOk);
+        expect_u("only 2 PTBs allocated for head+tail splits", m.allocs, 5u);
+        uint64_t lHead = 0, lTail = 0;
+        expect_u("surviving head page walks", pt_walk(root, va + 0xF000ull, m, &lHead), pa + 0xF000ull);
+        expect((lHead & kPteFragMask) == 0ull && (lHead & kPteDcc) != 0ull && (lHead & kPteIsPte) != 0ull,
+               "split head child PTE stripped FRAG[11:7] while keeping DCC & IS_PTE");
+        expect_u("cleared head slice gone", pt_walk(root, va + 0x10000ull, m, nullptr), 0ull);
+        expect_u("cleared interior huge slot gone", pt_walk(root, va + (2ull << 20), m, nullptr), 0ull);
+        expect_u("cleared tail head gone", pt_walk(root, va + (4ull << 20) + 0xF000ull, m, nullptr), 0ull);
+        expect_u("surviving tail page walks", pt_walk(root, va + (4ull << 20) + 0x10000ull, m, &lTail), pa + (4ull << 20) + 0x10000ull);
+        expect((lTail & kPteFragMask) == 0ull && (lTail & kPteDcc) != 0ull, "split tail child PTE stripped FRAG[11:7]");
+
+        // REPLACE a full 2 MiB slot (slot 0, which now holds a 4 KiB PTB) with an aligned 2 MiB BO: must reuse PTB (0 allocs, no PTB leak!).
+        const uint32_t beforeReuse = m.allocs;
+        expect_u("REPLACE over existing 4 KiB PTB succeeds", pt_replace_tx(root, va, kHuge2mPages, pa + 0x10000000ull, lfPlain, m, true), kOk);
+        expect_u("reused existing PTB (0 allocs)", m.allocs, beforeReuse);
+        uint64_t lReused = 0;
+        expect_u("reused PTB walks to new PA", pt_walk(root, va + 0x2000ull, m, &lReused), pa + 0x10000000ull + 0x2000ull);
+        expect((lReused & kPteFragMask) == 0ull, "reused PTB keeps 4 KiB leaves (zero PTB leak)");
+
+        // Map fresh 2 MiB huge page at slot 1, then partial REPLACE with PRT in the middle.
+        expect_u("map fresh huge slot 1", pt_map_tx(root, va + (2ull << 20), kHuge2mPages, pa + (2ull << 20), lfDcc, m, true), kOk);
+        expect_u("partial PRT replace over huge slot 1", pt_fill_tx(root, va + (2ull << 20) + 0x8000ull, 4, kPtePrtLeaf, m), kOk);
+        uint64_t lPrt = 0, lBefore = 0, lAfter = 0;
+        expect_u("before PRT survives as 4 KiB", pt_walk(root, va + (2ull << 20) + 0x7000ull, m, &lBefore), pa + (2ull << 20) + 0x7000ull);
+        expect_u("PRT walks invalid", pt_walk(root, va + (2ull << 20) + 0x8000ull, m, &lPrt), 0ull);
+        expect(entry_is_prt(lPrt), "PRT leaf written cleanly inside split huge page");
+        expect_u("after PRT survives as 4 KiB", pt_walk(root, va + (2ull << 20) + 0xC000ull, m, &lAfter), pa + (2ull << 20) + 0xC000ull);
+        expect((lBefore & kPteFragMask) == 0ull && (lAfter & kPteFragMask) == 0ull, "neighbors of PRT have FRAG=0");
+    }
+
+    // 4. OOM SplitUndo rollback: partial CLEAR across 2 huge pages fails on 2nd PTB split -> BOTH huge leaves restored bit-for-bit!
+    {
+        FakeMem m(4); // root(1) + PDB1(2) + PDB0(3) + ONLY 1 page left (4) -> 1st split succeeds, 2nd split hits kNoMemory!
+        const uint64_t root = m.alloc_page();
+        const uint64_t va = 0x20000000ull, pa = 0x400000000ull, pages = (4ull << 20) / kPage;
+        expect_u("map 4 MiB (2 huge pages)", pt_map_tx(root, va, pages, pa, lfDcc, m, true), kOk);
+        expect_u("3 tables used, 1 free", m.allocs, 3u);
+        uint64_t orig0 = 0, orig1 = 0;
+        pt_walk(root, va, m, &orig0);
+        pt_walk(root, va + kHuge2mBytes, m, &orig1);
+        expect_u("partial CLEAR needing 2 splits hits kNoMemory", pt_unmap_tx(root, va + 0x10000ull, (2ull << 20) / kPage, m), kNoMemory);
+        expect_u("quota unchanged after SplitUndo rollback", m.allocs, 3u);
+        uint64_t post0 = 0, post1 = 0;
+        expect_u("huge page 0 restored", pt_walk(root, va + 0x55000ull, m, &post0), pa + 0x55000ull);
+        expect_u("huge page 1 intact", pt_walk(root, va + kHuge2mBytes + 0x1000ull, m, &post1), pa + kHuge2mBytes + 0x1000ull);
+        expect_u("huge page 0 leaf bit-exact", post0, orig0);
+        expect_u("huge page 1 leaf bit-exact", post1, orig1);
+    }
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
-    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u14_gfx12_dcc(); u12_pins(root);
+    u1_abi(); u2_place(); u3_gemva(); u4_tables(); u5_vamap(); u6_pt(); u7_cs(); u8_ring(); u9_hang(); u10_wait(); u11_submit(); u13_review(); u14_gfx12_dcc(); u15_huge_2m(); u12_pins(root);
     std::printf("native_s1c_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

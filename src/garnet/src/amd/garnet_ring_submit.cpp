@@ -23,6 +23,7 @@ static uint8_t gIrqEvent;
 static volatile UInt32 gIrqWaitLatch = rdna4native::irqwait::kLatchUnset;
 static volatile uint64_t gIrqWaitSleeps, gIrqWaitWakes;
 static volatile UInt32 gDccLatch;   // 0 = unset, 1 = OFF (garnet-dcc=0), 2 = ON (default)
+static volatile UInt32 gHugeLatch;  // 0 = unset, 1 = OFF (garnet-hugepage=0), 2 = ON (default)
 
 bool dcc_on() {
     UInt32 l = gDccLatch;
@@ -36,6 +37,22 @@ bool dcc_on() {
                     en ? "ENABLED" : "DISABLED");
         }
         l = gDccLatch;
+    }
+    return l == 2u;
+}
+
+bool hugepage_on() {
+    UInt32 l = gHugeLatch;
+    if (l == 0u) {
+        uint32_t v = 1u;
+        const bool present = PE_parse_boot_argn("garnet-hugepage", &v, sizeof(v));
+        const bool en = rdna4native::s1c::hugepage_boot_enabled(present, v);
+        if (OSCompareAndSwap(0u, en ? 2u : 1u, &gHugeLatch)) {
+            N1C_LOG("boot-arg garnet-hugepage %s: 2 MiB PDB0 huge pages are %s",
+                    present ? (v == 0u ? "=0" : "nonzero") : "absent (default ON)",
+                    en ? "ENABLED" : "DISABLED");
+        }
+        l = gHugeLatch;
     }
     return l == 2u;
 }

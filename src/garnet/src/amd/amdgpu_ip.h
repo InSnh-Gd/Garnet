@@ -275,6 +275,8 @@ namespace PTEFlags {
     constexpr uint64_t READABLE  = (1ULL << 5);
     constexpr uint64_t WRITEABLE = (1ULL << 6);
     constexpr uint64_t FRAG_4K   = 0;
+    constexpr uint64_t FRAG_MASK = (0x1FULL << 7);  // AMDGPU_PTE_FRAG(0x1f) bits [11:7]
+    constexpr uint64_t FRAG_2M   = (9ULL << 7);     // AMDGPU_PTE_FRAG(9) = 2 MiB PDB0 huge leaf
     // GFX12 / RDNA4 PTE bit. With PAGE_TABLE_DEPTH=0 (single-level
     // page table), GMC distinguishes PTEs from sub-PDE pointers by
     // bit 63. Every PTE we write MUST have this set, otherwise GMC

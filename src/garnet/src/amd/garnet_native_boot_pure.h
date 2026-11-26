@@ -85,6 +85,11 @@ constexpr uint64_t kPteSnooped   = 1ull << 2;
 constexpr uint64_t kPteExec      = 1ull << 4;
 constexpr uint64_t kPteRead      = 1ull << 5;
 constexpr uint64_t kPteWrite     = 1ull << 6;
+constexpr uint64_t kPteFragMask  = 0x1Full << 7;     // AMDGPU_PTE_FRAG bits [11:7]
+constexpr uint64_t kPteFrag2M    = 9ull << 7;        // AMDGPU_PTE_FRAG(9): 2^(12+9) = 2 MiB PDB0 huge leaf
+constexpr uint64_t kHuge2mBytes  = 2ull << 20;
+constexpr uint64_t kHuge2mPages  = 512ull;
+constexpr uint64_t kHuge2mMask   = kHuge2mBytes - 1ull;   // 0x1FFFFFull
 constexpr uint64_t kPteMtypeUC   = 2ull << 54;
 constexpr uint64_t kPtePrt       = 1ull << 56;       // AMDGPU_PTE_PRT_GFX12 (amdgpu_vm.h)
 constexpr uint64_t kPteDcc       = 1ull << 58;       // AMDGPU_PTE_DCC (GFX12 amdgpu_vm.h)
@@ -107,12 +112,35 @@ constexpr uint64_t pde_encode(uint64_t pa) {
 constexpr uint64_t pte_encode(uint64_t pa, uint64_t flags) {
     return ((pa & ~kPtePaMask) != 0ull) ? 0ull : (pa | (flags & ~kPteIsPte) | kPteIsPte);
 }
+// A 2 MiB PDB0 huge leaf: 2 MiB-aligned address | VALID | flags (FRAG replaced by 9) | P (bit 63).
+// Non-VALID leaves (e.g. PRT) and misaligned addresses are refused (returns 0).
+constexpr uint64_t pte_encode_huge2m(uint64_t pa, uint64_t flags) {
+    return ((pa & ~kPtePaMask) != 0ull || (pa & kHuge2mMask) != 0ull || (flags & kPteValid) == 0ull)
+        ? 0ull
+        : (pa | (flags & ~(kPtePaMask | kPteIsPte | kPteFragMask)) | kPteFrag2M | kPteIsPte);
+}
+// Extract 4 KiB child leaf flags when splitting a 2 MiB PDB0 huge leaf: strips PA, FRAG[11:7], and IS_PTE.
+constexpr uint64_t huge2m_child_flags(uint64_t hugeLeaf) {
+    return hugeLeaf & ~(kPtePaMask | kPteFragMask | kPteIsPte);
+}
 // A directory entry never grants access: no READ / WRITE / EXEC bit (those belong to leaves).
 static_assert((pde_encode(0x1000ull) & (kPteRead | kPteWrite | kPteExec)) == 0ull, "pde_encode never sets READ/WRITE/EXEC");
 static_assert((pde_encode(0x0000FFFFFFFFF000ull) & (kPteRead | kPteWrite | kPteExec)) == 0ull, "... at the widest address either");
+static_assert((kPteFragMask & (kPteValid | kPteSystem | kPteSnooped | kPteExec | kPteRead | kPteWrite | kPtePaMask | kPteMtypeUC | kPtePrt | kPteDcc | kPteIsPte)) == 0ull,
+              "FRAG bits [11:7] are disjoint from all other PTE fields");
+static_assert(pte_encode_huge2m(0x200001000ull, kPteFlagsRwx) == 0ull, "2 MiB huge leaf refuses non-2M-aligned PA");
+static_assert(pte_encode_huge2m(0x200000000ull, kPtePrtLeaf) == 0ull, "2 MiB huge leaf refuses non-VALID PRT leaf");
+static_assert((pte_encode_huge2m(0x200000000ull, kPteFlagsRwx | kPteDcc) & (kPteFragMask | kPteIsPte | kPteDcc | kPteValid)) ==
+              (kPteFrag2M | kPteIsPte | kPteDcc | kPteValid), "2 MiB huge leaf encodes FRAG(9), IS_PTE, DCC, VALID");
+static_assert((huge2m_child_flags(pte_encode_huge2m(0x200000000ull, kPteFlagsRwx | kPteDcc)) & kPteFragMask) == 0ull,
+              "splitting a 2 MiB huge leaf strips FRAG bits");
+static_assert(pte_encode_huge2m(0x200000000ull, pte_encode(0x200000000ull, huge2m_child_flags(pte_encode_huge2m(0x200000000ull, kPteFlagsRwx | kPteDcc)))) ==
+              pte_encode_huge2m(0x200000000ull, kPteFlagsRwx | kPteDcc),
+              "child PTE[0] round-trips bit-for-bit back to the original 2 MiB huge leaf");
 constexpr bool entry_valid(uint64_t e) { return (e & kPteValid) != 0ull; }
 constexpr uint64_t entry_pa(uint64_t e) { return e & kPtePaMask; }
 constexpr bool entry_is_leaf(uint64_t e) { return ((e >> 63) & 1ull) != 0ull; }
+constexpr bool entry_is_huge2m(uint64_t e) { return entry_valid(e) && entry_is_leaf(e); }
 constexpr bool entry_is_prt(uint64_t e) { return !entry_valid(e) && (e & kPtePrtLeaf) == kPtePrtLeaf && entry_pa(e) == 0ull; }
 
 // ---- the test layout -----------------------------------------------------------------------------------------------------

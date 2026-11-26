@@ -332,13 +332,72 @@ static void l3_sibling() {
     expect_u("low intact after nomem", pt_walk(s.rootPa, 0x10000000ull, m, nullptr), 0x940000000ull);
 }
 
+// Production PtMem rollback over 2 MiB huge-page splits (both 2-slot SplitUndo on CLEAR and
+// >2 split huge leaves restored via child PTE[0] during PRT REPLACE OOM).
+static void l4_huge_2m_rollback() {
+    amdgpu::test_reset(256ull << 20, 256ull << 20);
+    amdgpu::Session s;
+    amdgpu::PtMem m{ &s };
+    s.rootPa = m.alloc_page();
+    const uint64_t lfDcc = leaf_flags(0xe, false, false, true);
+    const uint64_t va = 0x40000000ull, pa = 0x500000000ull;
+    // Map 8 MiB = 4x 2 MiB huge pages (uses root + PDB1 + PDB0 = 3 pages inside block 0, leaving 1 page free in block 0!).
+    expect_u("prod PtMem 8 MiB huge map", pt_map_tx(s.rootPa, va, (8ull << 20) / kPage, pa, lfDcc, m, true), kOk);
+    expect_u("only 3 PT pages in block 0", s.ptPages, 3u);
+    expect_u("pagesInBlk == 3 (1 tail slot left)", s.pagesInBlk, 3u);
+    uint64_t orig[4] = {};
+    for (int i = 0; i < 4; i++) pt_walk(s.rootPa, va + (uint64_t)i * kHuge2mBytes, m, &orig[i]);
+
+    // Case A: Drain visible free so block 1 cannot allocate; partial CLEAR across 2 huge pages
+    // consumes the 1 tail slot for head split, then fails on tail split -> restores BOTH huge leaves & scrubs tail!
+    gCtx->gmc.vram_alloc.freeBytes = 0;
+    expect_u("prod PtMem partial CLEAR OOM on 2nd split", pt_unmap_tx(s.rootPa, va + 0x10000ull, (2ull << 20) / kPage, m), kNoMemory);
+    expect_u("nblk restored after CLEAR OOM", s.nblk, 1u);
+    expect_u("pagesInBlk restored after CLEAR OOM", s.pagesInBlk, 3u);
+    expect_u("ptPages restored after CLEAR OOM", s.ptPages, 3u);
+    for (int i = 0; i < 4; i++) {
+        uint64_t got = 0;
+        expect_u("huge page intact after CLEAR OOM", pt_walk(s.rootPa, va + (uint64_t)i * kHuge2mBytes + 0x123000ull, m, &got),
+                 pa + (uint64_t)i * kHuge2mBytes + 0x123000ull);
+        expect_u("huge leaf bit-exact after CLEAR OOM", got, orig[i]);
+    }
+
+    // Case B: Give room for EXACTLY 1 new 16 KiB block? Actually 1 tail slot + 0 new blocks = 1 page;
+    // give room for 1 new block (16 KiB = 4 pages -> total 5 pages? Too many for 4 slots! Give 0 free -> 1 page;
+    // OR consume tail page first via sibling, then give 16 KiB = 4 pages and map 10 MiB = 5 huge pages!).
+    gCtx->gmc.vram_alloc.freeBytes = 16384; // allows 1 new block (4 pages) + 1 existing tail = 5 pages -> 6-huge-page PRT REPLACE splits 5 and fails on 6th!
+    expect_u("prod PtMem map 2 more huge pages (total 12 MiB = 6 huge)", pt_map_tx(s.rootPa, va + (8ull << 20), (4ull << 20) / kPage, pa + (8ull << 20), lfDcc, m, true), kOk);
+    expect_u("still 3 PT pages (same PDB0)", s.ptPages, 3u);
+    uint64_t orig6[6] = {};
+    for (int i = 0; i < 6; i++) pt_walk(s.rootPa, va + (uint64_t)i * kHuge2mBytes, m, &orig6[i]);
+
+    // 12 MiB PRT REPLACE needs 6 PTBs (splitting all 6 huge pages), but only 5 PT pages are available -> fails on 6th!
+    expect_u("prod PtMem 6-huge PRT REPLACE hits kNoMemory on 6th split", pt_fill_tx(s.rootPa, va, (12ull << 20) / kPage, kPtePrtLeaf, m), kNoMemory);
+    expect_u("nblk restored to 1 after 5-split rollback", s.nblk, 1u);
+    expect_u("pagesInBlk restored to 3 after 5-split rollback", s.pagesInBlk, 3u);
+    expect_u("ptPages restored to 3 after 5-split rollback", s.ptPages, 3u);
+    for (int i = 0; i < 6; i++) {
+        uint64_t got = 0;
+        expect_u("all 6 huge pages walk after 5-split rollback", pt_walk(s.rootPa, va + (uint64_t)i * kHuge2mBytes + 0x77000ull, m, &got),
+                 pa + (uint64_t)i * kHuge2mBytes + 0x77000ull);
+        expect_u("all 6 huge leaves bit-exact after 5-split rollback", got, orig6[i]);
+    }
+
+    // Retry with plenty of visible free succeeds cleanly.
+    gCtx->gmc.vram_alloc.freeBytes = 128ull << 20;
+    expect_u("retry 12 MiB PRT REPLACE succeeds", pt_fill_tx(s.rootPa, va, (12ull << 20) / kPage, kPtePrtLeaf, m), kOk);
+    uint64_t prtLeaf = 0;
+    expect_u("PRT walks invalid after retry", pt_walk(s.rootPa, va + 0x123000ull, m, &prtLeaf), 0ull);
+    expect(entry_is_prt(prtLeaf), "PRT leaf active after retry");
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         std::fprintf(stderr, "usage: %s <repo> <generated-include>\n", argv[0]);
         return 2;
     }
     std::string root = argc > 1 ? argv[1] : ".";
-    l0_generated(root, argv[2]); l1_partial_retry(); l2_global_reserve(); l3_sibling();
+    l0_generated(root, argv[2]); l1_partial_retry(); l2_global_reserve(); l3_sibling(); l4_huge_2m_rollback();
     std::printf("native_ptmem_production_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }
