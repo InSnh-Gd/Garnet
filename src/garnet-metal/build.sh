@@ -9,7 +9,7 @@ D="$(cd "$(dirname "$0")" && pwd)"
 # *.bundle directories, which codesign --verify rejects ("detritus not allowed").  The shippable artefact is
 # build/GarnetMetal.bundle.tar (bsdtar --no-xattrs); extract it on the PC.
 B="$D/build"; W="$(mktemp -d "${TMPDIR:-/tmp}/garnetmetal.XXXXXX")"; APP="$W/GarnetMetal.bundle"
-LAZY="${RDNA4_LAZY:-1}"; F9D="${RDNA4_9D:-1}"
+LAZY="${RDNA4_LAZY:-1}"; F9D="${RDNA4_9D:-1}"; RELEASE="${RDNA4_RELEASE:-0}"
 RADV="${RDNA4_RADV_LIB:-$HOME/rdna4-native/mesa-mac/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib}"   # x86_64 RADV (10a: shipped in Resources)
 [ -f "$RADV" ] || { echo "build.sh: RADV dylib not found: $RADV" >&2; exit 1; }
 # VM backends can have the same filename and ICD entry point; never package them for the PC.
@@ -63,7 +63,7 @@ compile_modular() {
     local obj="$objdir/$u.o"
     objs+=("$obj")
     clang $VKINC -arch "$arch" ${=minver_flag} -fobjc-arc -O2 -Wall -Wextra -Werror \
-          -fvisibility=hidden -DGARNET_METAL_MODULAR_BUILD=1 -DRDNA4_LAZY=$LAZY -DRDNA4_9D=$F9D \
+          -fvisibility=hidden -DGARNET_METAL_MODULAR_BUILD=1 -DRDNA4_LAZY=$LAZY -DRDNA4_9D=$F9D -DRDNA4_RELEASE=$RELEASE \
           -I"$D" -c "$D/$u.m" -o "$obj" &
     pids+=($!)
   done

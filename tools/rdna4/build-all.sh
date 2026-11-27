@@ -202,7 +202,7 @@ C64_MKSDK="$MKSDK" make -C "$repo/src/garnet-accel" all "MKSDK=$MKSDK" \
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     make -C "$repo/src/garnet-pci-compat" all "MKSDK=$MKSDK" "BUILD=$work/pcibarcompat" SIGN=1 >&2
 fi
-zsh "$repo/src/garnet-metal/build.sh" >&2
+RDNA4_RELEASE="$RDNA4_RELEASE" zsh "$repo/src/garnet-metal/build.sh" >&2
 bash "$repo/tools/rdna4/build-native-tools.sh" "$work/tools" >&2
 
 payload="$out/payload"
