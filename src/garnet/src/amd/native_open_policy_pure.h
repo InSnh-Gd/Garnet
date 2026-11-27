@@ -60,12 +60,21 @@ constexpr OpenDecision app_refine(OpenDecision d, uint32_t uid, bool appsOn, boo
     if (d.admit || d.reason != kReasonNotPrivileged || !appsOn || uid < kAppMinUid) return d;
     return onAllowList ? OpenDecision{ true, kReasonApp } : OpenDecision{ false, kReasonAppNotAllowed };
 }
-// An APP client reaches the application set only: Hello, QueryInfo, BoCreate, BoFree, GemVa, Ctx, Submit, WaitSeq (0, 1, 3..8) and BoImportHost (21). Never ReadRegs (2: raw register reads),
-// never the scanout set (9..14: the display plane belongs to WindowServer), never 15..20 (DAL step, mode trial / hold / release, Metal nub publish / withdraw), nor an unknown number.
+// ABI 1.14: map WebKit-silent APP aliases (30/31/39) to their canonical selector numbers (3/21/27).
+constexpr uint32_t canonical_app_selector(uint32_t sel) {
+    return sel == (uint32_t)RDNA4N_SEL_BOCREATE_APP ? (uint32_t)RDNA4N_SEL_BOCREATE
+         : sel == (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST_APP ? (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST
+         : sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY_APP ? (uint32_t)RDNA4N_SEL_BUFFER_COPY
+         : sel;
+}
+// An APP client reaches the application set only: Hello, QueryInfo, BoCreate, BoFree, GemVa, Ctx, Submit, WaitSeq (0, 1, 3..8), BoImportHost (21), BufferCopy/Fill (27..28),
+// and ABI 1.14 WebKit-silent aliases 30 (BOCREATE), 31 (BO_IMPORT_HOST), 39 (BUFFER_COPY). Selector 29 stays reserved for VCN 5.0 (refused in ABI 1.14).
 constexpr bool selector_allowed_for_app(uint32_t sel) {
     return sel == (uint32_t)RDNA4N_SEL_HELLO || sel == (uint32_t)RDNA4N_SEL_QUERYINFO ||
            (sel >= (uint32_t)RDNA4N_SEL_BOCREATE && sel <= (uint32_t)RDNA4N_SEL_WAITSEQ) || sel == (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST ||
-           sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY || sel == (uint32_t)RDNA4N_SEL_BUFFER_FILL;
+           sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY || sel == (uint32_t)RDNA4N_SEL_BUFFER_FILL ||
+           sel == (uint32_t)RDNA4N_SEL_BOCREATE_APP || sel == (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST_APP ||
+           sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY_APP;
 }
 
 // ---- who may call what (0.0.612 review items B and E) -------------------------------------------------------------------------------------
@@ -73,11 +82,12 @@ constexpr bool selector_allowed_for_app(uint32_t sel) {
 // must not import the owner's memory, or map its own under the owner's name). `cur` = current_task(), `owner` = the task stored at open; both null-checked.
 constexpr bool import_caller_ok(const void *cur, const void *owner) { return owner != nullptr && cur == owner; }
 // E: a client admitted by the uid-88 rule (NOT an administrator) may call only the selectors WindowServer's bundle needs: 0..8 (Hello, QueryInfo, ReadRegs, BoCreate, BoFree, GemVa,
-// Ctx, Submit, WaitSeq), 9..14 (the scanout set) and 21 (BoImportHost). Everything else (15 DAL step, 16..18 mode trial / hold / release, 19..20 the Metal nub publish / withdraw, and any
-// number the ABI does not name) is NotPrivileged for it. An administrator client reaches every selector, exactly as before 0.0.612.
+// Ctx, Submit, WaitSeq), 9..14 (the scanout set), 21 (BoImportHost), 22..28, and ABI 1.14 APP aliases 30/31/39. Everything else (15..20, reserved 29, unknown) is NotPrivileged.
 constexpr bool selector_allowed_for_windowserver(uint32_t sel) {
     return sel <= (uint32_t)RDNA4N_SEL_SCAN_RELEASE || sel == (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST ||
            sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY || sel == (uint32_t)RDNA4N_SEL_BUFFER_FILL ||
+           sel == (uint32_t)RDNA4N_SEL_BOCREATE_APP || sel == (uint32_t)RDNA4N_SEL_BO_IMPORT_HOST_APP ||
+           sel == (uint32_t)RDNA4N_SEL_BUFFER_COPY_APP ||
            (sel >= (uint32_t)RDNA4N_SEL_SCANX_ACQUIRE && sel <= (uint32_t)RDNA4N_SEL_SCANX_RELEASE);   // 0.0.661 (ABI 1.11): instance 2's scanout - WindowServer's bundle presents the monitor B with them (APPs and the accelerator route still never reach them)
 }
 constexpr bool selector_allowed(bool admin, uint32_t sel) { return admin || selector_allowed_for_windowserver(sel); }
@@ -105,6 +115,12 @@ constexpr bool start_provider_ok(Route r, bool providerIsOwner, bool providerIsR
 constexpr uint32_t kLatchUnset = 0u, kLatchOff = 1u, kLatchOn = 2u;
 constexpr uint32_t latch_value(bool present, uint32_t value) { return (present && value == 1u) ? kLatchOn : kLatchOff; }
 constexpr bool latch_is_on(uint32_t latch) { return latch == kLatchOn; }
+
+// ABI 1.14 root-only accel verb 115 (`killswitch [0|1|status]`): syncs /private/tmp/garnet-off to RDNA4N_INFO_KILL_SWITCH.
+constexpr uint32_t kActKillSwitch = 115u;
+constexpr uint64_t kKillSwitchOff = 0ull, kKillSwitchOn = 1ull, kKillSwitchQuery = 2ull;
+constexpr bool killswitch_is_action(uint32_t a) { return a == kActKillSwitch; }
+constexpr bool killswitch_arg_ok(uint64_t arg) { return arg <= kKillSwitchQuery; }
 
 } // namespace policy
 } // namespace rdna4native

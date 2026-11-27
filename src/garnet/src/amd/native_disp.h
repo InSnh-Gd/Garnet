@@ -50,10 +50,14 @@ void     rdna4disp_on_withdraw(void);                // the nub was withdrawn / 
 
 // 0.0.652 (M5): pipeadopt succeeded this boot (gD.adopted); one atomic load. fbpublish refuses while it is true (and the display nub's presence refuses pipeadopt / pipearm 1: rdna4disp::fb_interlock_refuses).
 bool     rdna4disp_pipe_adopted(void);
+// ABI 1.14: display pipe is currently armed (gD.armed != 0); one atomic load, reported in RDNA4N_INFO_DISPLAY_ACTIVE.
+bool     rdna4disp_pipe_armed(void);
 // GarnetDisplayNub.cpp: a GarnetDisplayNub is published (never withdrawn in M5). One atomic load.
 bool     rdna4fb_nub_exists(void);
 // 0.0.653: GarnetMetalNub.cpp: the Metal nub was published at any time this boot (sticky: stays true after a withdraw). One atomic load. fbpublish refuses while it is true.
 bool     garnetmetal_nub_published(void);
+// ABI 1.14: GarnetMetalNub.cpp: a live Metal nub is published and Garnet,Ready == 1 (gReadyNo == 0). One atomic load, reported in RDNA4N_INFO_READY.
+bool     garnetmetal_ready(void);
 
 // 0.0.659 (M6 Stage 1a): boot-arg garnet-m6 == 1, read and latched ONCE at the first call (first writer wins, never re-read); default OFF. With it OFF every M6 branch is skipped and the code is 0.0.658's.
 bool     rdna4m6_latched_on(void);

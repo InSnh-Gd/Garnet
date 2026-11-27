@@ -690,6 +690,7 @@ void rdna4disp_on_withdraw(void) {
 }
 
 bool rdna4disp_pipe_adopted(void) { return __atomic_load_n(&gD.adopted, __ATOMIC_ACQUIRE) != 0u; }
+bool rdna4disp_pipe_armed(void) { return __atomic_load_n(&gD.armed, __ATOMIC_ACQUIRE) != 0u; }
 
 uint32_t rdna4disp_verb(uint32_t action, uint64_t arg, uint64_t *out, unsigned count) {
     for (unsigned i = 0; i < count; ++i) out[i] = 0;

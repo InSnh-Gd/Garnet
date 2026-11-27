@@ -221,6 +221,7 @@ garnetmetal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 } // namespace
 
 bool garnetmetal_nub_published(void) { return __atomic_load_n(&gEverPublished, __ATOMIC_ACQUIRE) != 0u; }   // 0.0.653
+bool garnetmetal_ready(void) { return __atomic_load_n(&gNub, __ATOMIC_ACQUIRE) != nullptr && __atomic_load_n(&gReadyNo, __ATOMIC_ACQUIRE) == 0u; }   // ABI 1.14: Garnet,Ready == 1 on live nub
 
 // ---- the selectors --------------------------------------------------------------------------------------------------------------------------------------
 IOReturn GarnetMetalNub::selectorPublish(GarnetDriver *owner, uint64_t flags, uint64_t out[4]) {
@@ -244,7 +245,7 @@ IOReturn GarnetMetalNub::selectorPublish(GarnetDriver *owner, uint64_t flags, ui
 		char modelName[64];
 		snprintf(modelName, sizeof(modelName), "AMD Radeon %s",
 		         amdgpu::asic_pci_name(amdgpu::asic_current(), pci ? pci->configRead16(kIOPCIConfigDeviceID) : 0));
-		OSString *model = OSString::withCString(modelName);
+		OSData *model = OSData::withBytes(modelName, static_cast<unsigned int>(strlen(modelName) + 1));
 		const rdna4disp::OpsShape shape = rdna4disp::ops_shape(rdna4disp_latched_on());   // 0.0.613: OFF reports what 0.0.612 did (ABI 1, 120 bytes)
 		OSNumber *abi = OSNumber::withNumber((uint64_t)shape.abi, 32);
 		OSNumber *va = OSNumber::withNumber((uint64_t)garnetmetal::kTaskVaSize, 64);

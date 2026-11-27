@@ -93,7 +93,11 @@ bool GarnetDriver::selectAsic(bool haveDiscovery) {
 	if (byPci) {
 		char model[64];
 		snprintf(model, sizeof(model), "AMD Radeon %s", amdgpu::asic_pci_name(byPci, device));
-		pciDevice->setProperty("model", model);
+		// Publish as NUL-terminated OSData (macOS PCI GPU convention; Geekbench calls CFDataGetBytePtr).
+		if (OSData *modelData = OSData::withBytes(model, static_cast<unsigned int>(strlen(model) + 1))) {
+			pciDevice->setProperty("model", modelData);
+			modelData->release();
+		}
 	}
 	RDNA4LOG("asic: %s (%s, 0x%04x), GC %u.%u.%u, MP0 %u.%u.%u, firmware %s", a->family, amdgpu::asic_pci_name(a, device),
 	       device, a->gcMajor, a->gcMinor, a->gcRev, a->mp0Major, a->mp0Minor, a->mp0Rev,
@@ -504,6 +508,9 @@ void GarnetDriver::runStages(uint32_t target) {
 	uint32_t clamp = 0;
 	const bool clampPresent = PE_parse_boot_argn("garnet-idle-clamp", &clamp, sizeof(clamp));
 	ctx.idleClamp = rdna4pwr::idle_clamp_enabled(clampPresent, clamp);
+	uint32_t idleDpm = 1;
+	const bool idleDpmPresent = PE_parse_boot_argn("garnet-idle-dpm", &idleDpm, sizeof(idleDpm));
+	ctx.idleDpmEnabled = rdna4pwr::idle_dpm_enabled(idleDpmPresent, idleDpm);
 	uint32_t kcq = 1;
 	PE_parse_boot_argn("garnet-kcq", &kcq, sizeof(kcq));
 	ctx.wantKcq = (kcq != 0);
