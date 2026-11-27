@@ -140,7 +140,7 @@ public enum PayloadVerifier {
               manifest["ACCEL_BUNDLE_ID"] == "org.garnet.accel",
               manifest["PCIBARCOMPAT_BUNDLE_ID"] == "org.garnet.pcibarcompat",
               let lid = manifest["DEFAULT_LAYOUT_ID"], lid.count == 64 else {
-            throw PayloadVerifyError.failed("MANIFEST.txt failed Release 1 Navi 44 contract validation")
+            throw PayloadVerifyError.failed("MANIFEST.txt failed Navi 44 release contract validation")
         }
 
         // 4. Verify required files & variants index.

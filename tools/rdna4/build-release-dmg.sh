@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a self-contained, ad-hoc signed macOS .dmg installer for Garnet Release 1 (Navi 44).
+# Build a self-contained, ad-hoc signed macOS .dmg installer for Garnet (Navi 44).
 # Usage:
 #   bash tools/rdna4/build-release-dmg.sh <release_payload_dir> <out_dir> [version]
 set -euo pipefail
@@ -34,7 +34,7 @@ MANIFEST="$PAYLOAD_DIR/MANIFEST.txt"
 VERSION=${3:-$(awk -F= '$1=="GARNET_VERSION"{print $2; exit}' "$MANIFEST")}
 [ -n "$VERSION" ] || { echo "Cannot determine GARNET_VERSION from $MANIFEST" >&2; exit 1; }
 
-echo "build-release-dmg: verifying Release 1 payload $PAYLOAD_DIR..."
+echo "build-release-dmg: verifying release payload $PAYLOAD_DIR..."
 python3 -B "$REPO_ROOT/tools/rdna4/build_identity.py" verify-release-payload "$PAYLOAD_DIR"
 
 for req_file in \
@@ -50,7 +50,7 @@ cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
 APP_BUILD="$STAGE/app-build"
-echo "build-release-dmg: building x86_64 Garnet.app + garnetctl (with embedded Release 1 payload)..."
+echo "build-release-dmg: building x86_64 Garnet.app + garnetctl (with embedded release payload)..."
 make -C "$REPO_ROOT/src/garnet-app" clean all \
     GARNET_EMBED_PAYLOAD="$PAYLOAD_DIR" \
     BUILD="$APP_BUILD"
@@ -67,11 +67,11 @@ cp "$PAYLOAD_DIR/LICENSE.amdgpu" "$DMG_ROOT/LICENSE.amdgpu"
 cp "$REPO_ROOT/third-party/THIRD-PARTY-LICENSES.txt" "$DMG_ROOT/THIRD-PARTY-LICENSES.txt"
 
 cat > "$DMG_ROOT/INSTALL-QUICKSTART.txt" <<EOF
-Garnet RDNA 4 Driver v${VERSION} — Release 1 (Radeon RX 9060 XT / Navi 44, macOS 26.x x86_64)
-=========================================================================================
+Garnet RDNA 4 Driver v${VERSION} (Radeon RX 9060 XT / Navi 44, macOS 26.x x86_64)
+================================================================================
 
 1. Hardware & BIOS Prerequisites
-   - Supported GPU in Release 1: AMD Radeon RX 9060 XT (Navi 44, PCI ID 1002:7590) on bare-metal x86_64 macOS 26.x.
+   - Supported GPU in this release: AMD Radeon RX 9060 XT (Navi 44, PCI ID 1002:7590) on bare-metal x86_64 macOS 26.x.
    - Motherboard BIOS: Enable "Above 4G Decoding" and "Re-Size BAR Support", Disable CSM.
 
 2. Gatekeeper Launch (Ad-Hoc Signed App)

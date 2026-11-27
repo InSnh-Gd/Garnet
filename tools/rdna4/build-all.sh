@@ -483,6 +483,6 @@ fi
 )
 if [ "$RDNA4_RELEASE" = 1 ]; then
     python3 "$helper" verify-release-payload "$payload" >&2 \
-        || fail 'Release 1 payload verification failed'
+        || fail 'Release payload verification failed'
 fi
 printf '%s\n' "$payload"

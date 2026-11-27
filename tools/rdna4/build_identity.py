@@ -510,16 +510,16 @@ def command_manifest(args):
         )
     if args.release_mode == "1":
         if args.pcibarcompat_identity is None:
-            raise IdentityError("Release 1 manifest requires --pcibarcompat-identity")
+            raise IdentityError("Release manifest requires --pcibarcompat-identity")
         if args.target_silicon != RELEASE_TARGET_SILICON:
             raise IdentityError(
-                "Release 1 TARGET_SILICON must be {}, got {!r}".format(
+                "Release TARGET_SILICON must be {}, got {!r}".format(
                     RELEASE_TARGET_SILICON, args.target_silicon
                 )
             )
         if args.target_pci_ids != RELEASE_TARGET_PCI_IDS:
             raise IdentityError(
-                "Release 1 TARGET_PCI_IDS must be {}, got {!r}".format(
+                "Release TARGET_PCI_IDS must be {}, got {!r}".format(
                     RELEASE_TARGET_PCI_IDS, args.target_pci_ids
                 )
             )
@@ -527,13 +527,13 @@ def command_manifest(args):
             r"[0-9a-f]{64}", args.default_layout_id
         ):
             raise IdentityError(
-                "Release 1 DEFAULT_LAYOUT_ID must be 64-char hex SHA256, got {!r}".format(
+                "Release DEFAULT_LAYOUT_ID must be 64-char hex SHA256, got {!r}".format(
                     args.default_layout_id
                 )
             )
         if args.amd_firmware_license != RELEASE_FIRMWARE_LICENSE:
             raise IdentityError(
-                "Release 1 AMD_FIRMWARE_LICENSE must be {}, got {!r}".format(
+                "Release AMD_FIRMWARE_LICENSE must be {}, got {!r}".format(
                     RELEASE_FIRMWARE_LICENSE, args.amd_firmware_license
                 )
             )
@@ -720,7 +720,7 @@ def command_verify_release_payload(args):
         if not p.is_file() or p.stat().st_size == 0 and rel not in ("default-app-denylist.txt",):
             raise IdentityError("missing or empty required release file: {}".format(rel))
     if (payload / "GarnetAccel.kext").exists():
-        raise IdentityError("Release 1 payload must place GarnetAccel.kext under variants/<shortId>/ only")
+        raise IdentityError("Release payload must place GarnetAccel.kext under variants/<shortId>/ only")
 
     icd = json.loads((payload / "optional/vulkan/radeon_icd.x86_64.json").read_text(encoding="utf-8"))
     if icd.get("file_format_version") != "1.0.0":
