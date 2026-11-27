@@ -35,7 +35,11 @@
 #include <string.h>
 #include <stdio.h>
 #ifndef RDNA4S_TRACE
+#if defined(RDNA4_RELEASE) && RDNA4_RELEASE
+#define RDNA4S_TRACE(...) ((void)0)
+#else
 #define RDNA4S_TRACE(...) fprintf(stderr,__VA_ARGS__)
+#endif
 #endif
 #define RDNA4S_FAIL(l) do{RDNA4S_TRACE("fail@%d\n",l);goto fail;}while(0)
 

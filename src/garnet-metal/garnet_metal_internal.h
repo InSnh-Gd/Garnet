@@ -50,6 +50,9 @@
 #ifndef RDNA4_9D
 #define RDNA4_9D 1
 #endif
+#ifndef RDNA4_RELEASE
+#define RDNA4_RELEASE 0
+#endif
 
 #include "garnet_native_blit.h"
 #include "garnet_heapalloc.h"
@@ -178,13 +181,35 @@ typedef struct { uint64_t bits; } RDNA4ReflectionFlags;
 
 
 // ---- Shared internal macros ----
+enum {
+    RDNA4_LOG_DEBUG = 0,
+    RDNA4_LOG_DEFAULT = 1,
+    RDNA4_LOG_ERROR = 2,
+};
+#define RDNA4LOG_ERR(fmt, ...)  rdna4_log_lvl(RDNA4_LOG_ERROR, fmt, ##__VA_ARGS__)
+#define RDNA4LOG_WARN(fmt, ...) rdna4_log_lvl(RDNA4_LOG_DEFAULT, fmt, ##__VA_ARGS__)
+#define RDNA4LOG_KEY(fmt, ...)  rdna4_log_lvl(RDNA4_LOG_DEFAULT, fmt, ##__VA_ARGS__)
+#if RDNA4_RELEASE
+#define RDNA4LOG(fmt, ...) do { if (rdna4_debug_log_active()) rdna4_log(fmt, ##__VA_ARGS__); } while (0)
+#define RDNA4LOGR(fmt, ...) do { if (rdna4_debug_log_active()) { static _Atomic uint64_t n_; uint64_t k_ = atomic_fetch_add_explicit(&n_, 1, memory_order_relaxed); if (k_ < 8 || (k_ & 1023) == 0) rdna4_log(fmt, ##__VA_ARGS__); } } while (0)
+#else
 #define RDNA4LOG(fmt, ...) rdna4_log(fmt, ##__VA_ARGS__)
 #define RDNA4LOGR(fmt, ...) do { static _Atomic uint64_t n_; uint64_t k_ = atomic_fetch_add_explicit(&n_, 1, memory_order_relaxed); if (k_ < 8 || (k_ & 1023) == 0) rdna4_log(fmt, ##__VA_ARGS__); } while (0)
+#endif
 #define RDNA4_ONCE(fmt, ...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) RDNA4LOG(fmt, ##__VA_ARGS__); } while (0)
+#define RDNA4_ONCE_WARN(fmt, ...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) RDNA4LOG_WARN(fmt, ##__VA_ARGS__); } while (0)
+#if RDNA4_RELEASE
+#define RDNA4_DNR(cls) \
+    - (void)doesNotRecognizeSelector:(SEL)sel { \
+        os_log_error(rdna4_oslog(), "GarnetMetal: UNRECOGNIZED selector %{public}s on " #cls, sel_getName(sel)); \
+        RDNA4LOG("UNRECOGNIZED selector %s on " #cls, sel_getName(sel)); \
+        [super doesNotRecognizeSelector:sel]; }
+#else
 #define RDNA4_DNR(cls) \
     - (void)doesNotRecognizeSelector:(SEL)sel { \
         RDNA4LOG("UNRECOGNIZED selector %s on " #cls, sel_getName(sel)); \
         [super doesNotRecognizeSelector:sel]; }
+#endif
 #define RDNA4_KILL_FILE          "/private/tmp/garnet-off"
 #define RDNA4_LEGACY_KILL_FILE   "/private/tmp/rdna4m-off"
 #define RDNA4_STARTS_FILE        "/private/tmp/garnet-starts"
@@ -3428,7 +3453,12 @@ GARNET_INTERNAL_EXTERN char rdna4_rt_arg_owners_key;
 
 // ---- Shared internal function prototypes ----
 GARNET_INTERNAL_EXTERN VkPipelineCache rdna4_ba_vkcache(void);
+GARNET_INTERNAL_EXTERN os_log_t rdna4_oslog(void);
+GARNET_INTERNAL_EXTERN void rdna4_log_lvl(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 GARNET_INTERNAL_EXTERN void rdna4_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+GARNET_INTERNAL_EXTERN BOOL rdna4_verbose_log(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_t1_log_enabled(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_debug_log_active(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_is_ws(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_allow(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_force_fallback(void);
