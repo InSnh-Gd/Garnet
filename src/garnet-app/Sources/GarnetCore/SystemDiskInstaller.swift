@@ -5,17 +5,20 @@ public struct InstallOptions: Sendable {
     public let dryRun: Bool
     public let verifyCodeSignatures: Bool
     public let allowNonRootSandbox: Bool
+    public let selfContainedCLIURL: URL?
 
     public init(
         installVulkanICD: Bool = false,
         dryRun: Bool = false,
         verifyCodeSignatures: Bool = true,
-        allowNonRootSandbox: Bool = false
+        allowNonRootSandbox: Bool = false,
+        selfContainedCLIURL: URL? = nil
     ) {
         self.installVulkanICD = installVulkanICD
         self.dryRun = dryRun
         self.verifyCodeSignatures = verifyCodeSignatures
         self.allowNonRootSandbox = allowNonRootSandbox
+        self.selfContainedCLIURL = selfContainedCLIURL
     }
 }
 
@@ -23,15 +26,18 @@ public struct UninstallOptions: Sendable {
     public let removeDenylist: Bool
     public let dryRun: Bool
     public let allowNonRootSandbox: Bool
+    public let skipRecoveryDaemonBootout: Bool
 
     public init(
         removeDenylist: Bool = false,
         dryRun: Bool = false,
-        allowNonRootSandbox: Bool = false
+        allowNonRootSandbox: Bool = false,
+        skipRecoveryDaemonBootout: Bool = false
     ) {
         self.removeDenylist = removeDenylist
         self.dryRun = dryRun
         self.allowNonRootSandbox = allowNonRootSandbox
+        self.skipRecoveryDaemonBootout = skipRecoveryDaemonBootout
     }
 }
 
@@ -114,6 +120,7 @@ public enum SystemDiskInstaller {
     private static let legacyDaemonLabels: [String] = [
         "com.garnet.native",
         "com.garnet.native-translate",
+        "com.garnet.recovery",
         "com.rdna4.native",
         "com.rdna4.native-translate",
         "com.navi48.native",
@@ -139,6 +146,7 @@ public enum SystemDiskInstaller {
 
     private static let nativeSupportFiles: [String] = [
         "activate-native.sh",
+        "recover-uninstall.sh",
         "deploy-common.sh",
         "garnettest",
         "native-translate",
@@ -150,6 +158,14 @@ public enum SystemDiskInstaller {
         "LICENSE.amdgpu",
         "default-app-denylist.txt"
     ]
+
+    public static func bootoutLabelsForUninstall(
+        skipRecoveryDaemonBootout: Bool,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        let skipRecovery = skipRecoveryDaemonBootout || environment["GARNET_RECOVERY_DAEMON"] == "1"
+        return legacyDaemonLabels.filter { !($0 == "com.garnet.recovery" && skipRecovery) }
+    }
 
     public static func inspectAuxKCForeignKexts(env: HostEnvironment, allowUnreadableInDryRun: Bool = false) throws -> [AuxKCForeignKext] {
         let auxURL = env.url(forSystemPath: auxKCPath)
@@ -264,16 +280,34 @@ public enum SystemDiskInstaller {
         let legacyDenylistExists = FileManager.default.fileExists(atPath: legacyDenylistURL.path)
         let willPreserveOrMigrateDenylist = denylistExists || legacyDenylistExists
 
+        let resolvedSelfCLIURL: URL? = {
+            if let explicit = options.selfContainedCLIURL {
+                return explicit.standardizedFileURL
+            }
+            let arg0 = CommandLine.arguments.first ?? ""
+            if !arg0.isEmpty {
+                let cand = URL(fileURLWithPath: arg0).standardizedFileURL.resolvingSymlinksInPath()
+                if cand.lastPathComponent == "garnetctl" && FileManager.default.isExecutableFile(atPath: cand.path) {
+                    return cand
+                }
+            }
+            return nil
+        }()
+
         var planned = [
             "\(extensionsDir)/Garnet.kext",
             "\(extensionsDir)/GarnetAccel.kext",
             "\(gpuBundlesDir)/GarnetMetal.bundle",
             "\(launchDaemonsDir)/com.garnet.native.plist",
             "\(launchDaemonsDir)/com.garnet.native-translate.plist",
+            GarnetPaths.recoveryDaemonPath,
             "\(nativeSupportDir)/MANIFEST.txt",
             "\(nativeSupportDir)/profile",
             "\(nativeSupportDir)/variants/index.json"
         ]
+        if resolvedSelfCLIURL != nil {
+            planned.append(GarnetPaths.selfContainedCLIPath)
+        }
         for f in nativeSupportFiles where f != "MANIFEST.txt" {
             planned.append("\(nativeSupportDir)/\(f)")
         }
@@ -469,11 +503,19 @@ public enum SystemDiskInstaller {
                 }
             }
 
-            // Copy LaunchDaemons
-            for plistName in ["com.garnet.native.plist", "com.garnet.native-translate.plist"] {
+            // Copy LaunchDaemons (including self-contained com.garnet.recovery)
+            for plistName in ["com.garnet.native.plist", "com.garnet.native-translate.plist", "com.garnet.recovery.plist"] {
                 let src = payloadRoot.appendingPathComponent(plistName)
                 let dst = env.url(forSystemPath: "\(launchDaemonsDir)/\(plistName)")
                 try replaceItem(from: src, to: dst)
+            }
+
+            // Copy self-contained garnetctl binary so com.garnet.recovery works even if Garnet.app was removed.
+            if let cliSrc = resolvedSelfCLIURL {
+                try assertNotSymlink(url: cliSrc)
+                let cliDst = env.url(forSystemPath: GarnetPaths.selfContainedCLIPath)
+                try replaceItem(from: cliSrc, to: cliDst)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDst.path)
             }
 
             // Copy optional Vulkan ICD & radv-app ONLY if explicitly enabled
@@ -491,7 +533,7 @@ public enum SystemDiskInstaller {
             }
 
             // Permissions & ownership on real system root (set permissions AFTER chown so special bits like 01777 stick)
-            let execNames = ["activate-native.sh", "garnettest", "native-translate", "native-bundle-check", "publish-metal", "mtlprobe-direct"]
+            let execNames = ["activate-native.sh", "recover-uninstall.sh", "garnettest", "native-translate", "native-bundle-check", "publish-metal", "mtlprobe-direct"]
             for name in execNames {
                 let p = env.url(forSystemPath: "\(nativeSupportDir)/\(name)").path
                 try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: p)
@@ -500,6 +542,7 @@ public enum SystemDiskInstaller {
                 var chownPaths = [garnetDst.path, accelDst.path, metalDst.path,
                                   env.url(forSystemPath: "\(launchDaemonsDir)/com.garnet.native.plist").path,
                                   env.url(forSystemPath: "\(launchDaemonsDir)/com.garnet.native-translate.plist").path,
+                                  env.url(forSystemPath: GarnetPaths.recoveryDaemonPath).path,
                                   env.url(forSystemPath: GarnetPaths.supportRoot).path,
                                   env.url(forSystemPath: GarnetPaths.xlateDumpDir).path]
                 if options.installVulkanICD {
@@ -512,7 +555,7 @@ public enum SystemDiskInstaller {
                         throw SystemInstallError.transactionFailed("chown root:wheel \(p) failed: \(ch.stderr)")
                     }
                 }
-                for ld in ["com.garnet.native.plist", "com.garnet.native-translate.plist"] {
+                for ld in ["com.garnet.native.plist", "com.garnet.native-translate.plist", "com.garnet.recovery.plist"] {
                     try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: env.url(forSystemPath: "\(launchDaemonsDir)/\(ld)").path)
                 }
                 let chSpv = env.runner.run("/usr/sbin/chown", ["-hR", "nobody:nobody", GarnetPaths.spvCacheDir])
@@ -620,6 +663,8 @@ public enum SystemDiskInstaller {
             "\(gpuBundlesDir)/GarnetMetal.bundle",
             "\(launchDaemonsDir)/com.garnet.native.plist",
             "\(launchDaemonsDir)/com.garnet.native-translate.plist",
+            GarnetPaths.recoveryDaemonPath,
+            GarnetPaths.selfContainedCLIPath,
             vulkanICDPath,
             radvAppBinPath
         ]
@@ -687,7 +732,7 @@ public enum SystemDiskInstaller {
         }
 
         if !isSandbox {
-            for lbl in legacyDaemonLabels {
+            for lbl in bootoutLabelsForUninstall(skipRecoveryDaemonBootout: options.skipRecoveryDaemonBootout) {
                 _ = env.runner.run("/bin/launchctl", ["bootout", "system/\(lbl)"])
             }
         }
@@ -802,6 +847,50 @@ public enum SystemDiskInstaller {
         }
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
         let dst = destDir.appendingPathComponent("GarnetPCIBarCompat.kext")
+        try replaceItem(from: src, to: dst)
+        return dst
+    }
+
+    public static func exportRecoverEFI(fromPayload payloadURL: URL, toDestination destDir: URL) throws -> URL {
+        let src = payloadURL.appendingPathComponent("optional/GarnetRecover.efi")
+        try assertNotSymlink(url: src)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDir), !isDir.boolValue else {
+            throw SystemInstallError.payloadInvalid("optional/GarnetRecover.efi missing in payload")
+        }
+        do {
+            try PayloadVerifier.verifyPE32PlusEFI(at: src)
+        } catch {
+            throw SystemInstallError.payloadInvalid("\(error)")
+        }
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        let dst = destDir.appendingPathComponent("GarnetRecover.efi")
+        try replaceItem(from: src, to: dst)
+        return dst
+    }
+
+    public static func exportAnchorInjector(fromPayload payloadURL: URL, toDestination destDir: URL) throws -> URL {
+        let src = payloadURL.appendingPathComponent("optional/GarnetAnchorInjector.kext")
+        try assertNotSymlink(url: src)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDir), isDir.boolValue else {
+            throw SystemInstallError.payloadInvalid("optional/GarnetAnchorInjector.kext missing in payload (build with GARNET_SIGN_CA_DIR)")
+        }
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        let dst = destDir.appendingPathComponent("GarnetAnchorInjector.kext")
+        try replaceItem(from: src, to: dst)
+        return dst
+    }
+
+    public static func exportAMFIAnchor(fromPayload payloadURL: URL, toDestination destDir: URL) throws -> URL? {
+        let src = payloadURL.appendingPathComponent("optional/AMFIAnchor.kext")
+        try assertNotSymlink(url: src)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDir), isDir.boolValue else {
+            return nil
+        }
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        let dst = destDir.appendingPathComponent("AMFIAnchor.kext")
         try replaceItem(from: src, to: dst)
         return dst
     }

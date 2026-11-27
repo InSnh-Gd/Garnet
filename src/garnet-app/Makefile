@@ -57,7 +57,8 @@ $(APP_BUNDLE): $(CORE_SRCS) $(APP_SRCS) $(CLI_BIN) Resources/Info.plist | $(BUIL
 	fi
 	find $(APP_BUNDLE) \( -name '.DS_Store' -o -name '._*' \) -delete
 	xattr -cr $(APP_BUNDLE) 2>/dev/null || true
-	codesign --force --deep --sign - $(APP_BUNDLE)
+	# Sign only the outer app bundle (not --deep) so embedded Payload/ SHA256SUMS and CA signatures stay bit-identical.
+	codesign --force --sign - $(APP_BUNDLE)
 	codesign --verify --deep --strict $(APP_BUNDLE)
 
 clean:

@@ -58,6 +58,8 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 ```
 
 - `GarnetPCIBarCompat.kext`（`src/garnet-pci-compat/`）：面向 Full-BAR（8GB 卡 8 GiB / 16GB 卡 16 GiB）模式的可选早期 OpenCore 驱动。在跨 `26.x` 对 `com.apple.iokit.IOPCIFamily` 完成 `exact-uuid`（`25G332`）或 `structural` 校验后开启大内存 BAR。
+- `GarnetRecover.efi`（`src/garnet-recover-efi/`）：独立 OpenCore 启动菜单恢复工具（`EFI/OC/Tools/GarnetRecover.efi`），不写 ESP 磁盘，仅通过 UEFI NVRAM 与系统内自包含守护进程 `com.garnet.recovery` 通信（支持 `[1]` 单次安全启动与 `[2]` 安全启动并自动卸载）。
+- 可选 `AMFIAnchor` 信任锚路径（`GarnetAnchorInjector.kext`）：构建时提供 `GARNET_SIGN_CA_DIR` 会使用专用代码签名 CA 签发用户态 Mach-O 并生成无代码 Schema-1 注入 kext（`org.garnet.code-signing`），配合上游 BSD-3-Clause 的 `b00t0x/AMFIAnchor`（加载顺序 `Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext`）即可去掉 `amfi=0x80` 保持 AMFI 开启；`Garnet.kext` 与 `GarnetAccel.kext` 仍保持零 `Lilu.kext` 依赖。
 - `Garnet.kext`（`src/garnet/`）：负责 PCIe BAR 映射、片上 IP 发现、固件加载、VMID 与稀疏页表管理、无 Lilu S3 休眠唤醒与 DP DDC/AUX 恢复、`AMDGarnetPrimaryFramebuffer` 模式设置与 128x128 硬件光标，以及 `'GRNT'` 用户客户端（`IOAccelGarnetNativeClient`）。
 - `GarnetAccel.kext`（`src/garnet-accel/`）：在 Auxiliary Kernel Collection 中对接 `IOAcceleratorFamily2`，通过版本化布局指纹匹配虚表偏移与实例大小（`tools/ioaccel-layout/`）。
 - Mesa RADV Darwin（`mesa-patches/`）：基于 Mesa 提交 `f5cb8ee032adabef599ae892ec4e42d796b84da9` 的补丁系列，编译仅启用 ACO 的 `libvulkan_radeon.dylib`，支持 `'GRNT'` 传输、`VK_EXT_metal_surface` 及 `tools/rdna4/radv-app.sh`。
@@ -82,7 +84,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 ### 第二步：自动配置 OpenCore
 
 1. 手动挂载你的 EFI 分区。
-2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择模式（`Full-BAR (8/16 GiB)` 或 `256 MiB Small-BAR`），点击 **Configure OpenCore…**，选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`）。程序会自动备份原 `config.plist`、在 Full-BAR 模式下写入 `GarnetPCIBarCompat.kext`、更新所需键值并立即完成校验。
+2. 打开 **Garnet.app -> OpenCore Assistant**，按主界面建议选择 BAR 模式（`Full-BAR (8/16 GiB)` 或 `256 MiB Small-BAR`）与 AMFI 模式（载荷含 `GARNET_SIGN_CA_DIR` 签名且 `EFI/OC/Kexts/` 已有 `Lilu.kext` 与 `AMFIAnchor.kext` 时可选 `AMFIAnchor (AMFI Enabled)`，否则使用 `Legacy (amfi=0x80)`）。点击 **Configure OpenCore…** 并选中已挂载的 `EFI` 目录或 `EFI/OC/config.plist`（命令行等价操作：`/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --amfi legacy --config /Volumes/EFI/EFI/OC/config.plist`，启用信任锚时改用 `--amfi anchor`）。程序会保存时间戳备份及一次性安装前基线 `config.plist.garnet-pre-garnet`，写入 `GarnetPCIBarCompat.kext`（Full-BAR）与 `EFI/OC/Tools/GarnetRecover.efi`，在 `anchor` 模式下自动按 `Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext`（并位于 `AMFIPass.kext` 之前）排序且移除 `amfi=0x80`，完成后立即校验。
 3. 若预检显示 `SIP SETUP NEEDED`，先重启一次让新的 `csr-active-config` 生效。
 
 ### 第三步：安装并重启
@@ -94,7 +96,11 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 
 - 应用 Metal 黑名单：将 `.app` 拖入 **Garnet.app -> Status & Denylist**，或执行 `sudo /Applications/Garnet.app/Contents/Resources/garnetctl denylist add-app /Applications/ProblemApp.app`。
 - 导出脱敏诊断：在 **Status & Denylist** 导出，或执行 `garnetctl export-diag --out ~/Desktop/garnet-diag.tar.gz`。
-- 完整卸载：在 **Garnet.app -> Install / Uninstall** 点击 **Uninstall Garnet…**（或执行 `sudo garnetctl uninstall`），随后在 OpenCore 中禁用 `GarnetPCIBarCompat.kext` 与 `garnet*` 启动参数并重启。
+- **OpenCore 启动菜单一键恢复（`GarnetRecover.efi`）**：在 OpenCore 引导菜单选择 **Garnet: Safe Boot & Recovery**（全程不写 ESP 磁盘）：
+  - `[1] Safe Boot Once`：仅向 UEFI NVRAM 追加 `garnet=0 garnet-aux=0 garnet-rebar-compat=0`，保留已安装驱动以便临时进入安全桌面排查；
+  - `[2] Safe Boot & Uninstall Garnet`：在安全启动参数基础上写入 NVRAM 卸载标记，随后选入 macOS 后由系统盘自包含的 `com.garnet.recovery` 先清除标记、执行 `garnetctl uninstall`、写入 `/Library/Logs/Garnet/recovery-complete.txt`，并停留在安全桌面（不自动重启）。
+- **一键恢复 OpenCore 配置（`restore-oc`）**：正常卸载或自动恢复卸载后，手动挂载 EFI 分区，在 **Garnet.app -> OpenCore Assistant** 点击 **Restore OpenCore…**，或执行 `/Applications/Garnet.app/Contents/Resources/garnetctl restore-oc --config /Volumes/EFI/EFI/OC/config.plist`（无基线备份时可加 `--strip-only`）。该操作会恢复 `config.plist.garnet-pre-garnet`、删除已校验的 Garnet EFI 文件，且绝不删除 `Lilu.kext` 或 `AMFIAnchor.kext`。
+- 手动完整卸载：在 **Garnet.app -> Install / Uninstall** 点击 **Uninstall Garnet…**（或执行 `sudo garnetctl uninstall`），再挂载 EFI 执行 `restore-oc` 后重启。
 - 应急启动参数（可在 OpenCore 启动菜单临时追加）：`garnet=0` 禁用 `Garnet.kext`，`garnet-aux=0` 禁用 `GarnetAccel.kext`，`garnet-rebar-compat=0` 禁用 Full-BAR 补丁，`garnet-apps-all=0` 关闭普通桌面应用 Metal 加速。
 
 ## 目录结构
@@ -104,6 +110,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 | `src/garnet` | 主驱动 `Garnet.kext`、DCN 4.01 模式设置与光标代码、VM/休眠纯逻辑模块、着色器及宿主测试 |
 | `src/garnet-accel` | 辅助内核集合驱动 `GarnetAccel.kext` 与布局守卫测试 |
 | `src/garnet-pci-compat` | OpenCore 早期 Full-BAR 扩展 `GarnetPCIBarCompat.kext` 与 `IOPCIFamily` 校验测试 |
+| `src/garnet-recover-efi` | 独立 x86_64 UEFI OpenCore 引导恢复工具 `GarnetRecover.efi` 与纯 C 宿主测试 |
 | `src/garnet-metal` | `GarnetMetal.bundle`、纯 C 不变量模块、`spvcache` 元数据与兼容测试 |
 | `src/garnet-app` | Swift `Garnet.app`、`garnetctl` CLI、KC/OpenCore 校验与配置器及 `GarnetCoreTests` |
 | `src/dcn41` | DCN 4.01 寄存器定义与生成的写入白名单 |
@@ -135,7 +142,7 @@ CHIPS=navi44 bash tools/fetch-firmware.sh /path/to/linux-firmware
 make -C src/garnet CHIPS=navi44 MKSDK=/path/to/MacKernelSDK all
 ```
 
-如需在 macOS 上生成完整的匹配签名载荷，按 [BUILDING.md](BUILDING.md) 和 [tools/rdna4/README.md](tools/rdna4/README.md) 准备好环境变量后运行 `tools/rdna4/build-all.sh OUT_DIR`。
+如需在 macOS 上生成完整的匹配签名载荷，按 [BUILDING.md](BUILDING.md) 和 [tools/rdna4/README.md](tools/rdna4/README.md) 准备好环境变量后运行 `tools/rdna4/build-all.sh OUT_DIR`。如需启用 `AMFIAnchor` 信任锚签名（免 `amfi=0x80`），先在仓库外通过 `bash tools/rdna4/make-signing-ca.sh ~/garnet-signing-ca` 生成本地代码签名 CA，并在运行 `tools/rdna4/build-all.sh` 时传入 `GARNET_SIGN_CA_DIR=~/garnet-signing-ca`（以及可选的 `GARNET_AMFIANCHOR_KEXT=/path/to/AMFIAnchor.kext`，需要 `rcodesign`）；未设置 `GARNET_SIGN_CA_DIR` 时保持默认 ad-hoc 签名（`amfi=0x80`）。
 
 ## 文档索引
 
@@ -155,6 +162,7 @@ make -C src/garnet CHIPS=navi44 MKSDK=/path/to/MacKernelSDK all
 - [RX4Darwin/AMDRadeonRDNA4.kext](https://github.com/RX4Darwin/AMDRadeonRDNA4.kext)（BSD 3-Clause，Copyright (c) 2026 Sunneva N. Mariu，`next` @ `dded456d`）：非 Lilu 相关组件，包括 Navi 44 `ODM_MEM_PWR_CTRL2` 读写危险排除、CoreDisplay `AMD*` 帧缓冲类名前缀识别、DCN 4.01 128x128 硬件光标编程、RADV `VK_EXT_metal_surface` WSI 回退与 `radv-app.sh` 启动封装、VMID 精确 TLB 应答/隔离/稀疏页表回滚、无 Lilu S3 休眠唤醒与 DP DDC-to-AUX 恢复，以及 `GarnetGLDrawable` OpenGL-on-Metal 表面桥接（`supportsUnalignedVertexFetch`、`commitAndHold`、`setLineWidth:`）。
 - [RDNA4FB](https://github.com/somestupidgirl/RDNA4FB)（BSD 3-Clause，Copyright (c) 2026 Sunneva N. Mariu）：片上 IP 发现（`src/garnet/src/ipdiscovery.*`）、BAR5 映射与间接显存访问实现参考。
 - [mac-amdgpu](https://github.com/lemonade-sdk/mac-amdgpu)（MIT，Copyright (c) 2026 Geramy Loveless）：RDNA 4 IP 模块初始化顺序参考。
+- [AMFIAnchor](https://github.com/b00t0x/AMFIAnchor)（BSD 3-Clause，Copyright (c) 2026 b00t0x）：可选 OpenCore 信任锚内核扩展接口（`SchemaVersion = 1` 无代码注入契约），用于在无需 `amfi=0x80` 的前提下保持 macOS AMFI 启用。
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（MIT）与 [metal2vulkan](https://github.com/steelbrain/metal2vulkan)（LGPL-3.0-or-later，衍生补丁说明见 [third-party/metal2vulkan-rdna4/NOTICE](third-party/metal2vulkan-rdna4/NOTICE)）。
 
 完整第三方许可条款及逐文件溯源见 [third-party/THIRD-PARTY-LICENSES.txt](third-party/THIRD-PARTY-LICENSES.txt)。本项目为独立开源驱动实验，与 AMD、Apple、Cobalt64 或 RX4Darwin 均无从属或官方背书关系。

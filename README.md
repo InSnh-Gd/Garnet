@@ -58,6 +58,8 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 ```
 
 - `GarnetPCIBarCompat.kext` (`src/garnet-pci-compat/`): Optional early OpenCore kext for Full-BAR (`8 GiB` on 8GB, `16 GiB` on 16GB) mode. It verifies `com.apple.iokit.IOPCIFamily` via `exact-uuid` (`25G332`) or `structural` checks across macOS `26.x` before enabling large GPU BAR allocation.
+- `GarnetRecover.efi` (`src/garnet-recover-efi/`): Standalone OpenCore Picker recovery tool (`EFI/OC/Tools/GarnetRecover.efi`) that performs zero ESP disk writes and communicates via UEFI NVRAM (`[1]` Safe Boot Once, `[2]` Safe Boot & Uninstall Garnet via the self-contained `com.garnet.recovery` LaunchDaemon).
+- Optional `AMFIAnchor` trust-anchor path (`GarnetAnchorInjector.kext`): Payloads built with `GARNET_SIGN_CA_DIR` sign userspace Mach-Os with a dedicated code-signing CA and ship a codeless Schema-1 `GarnetAnchorInjector.kext` (`org.garnet.code-signing`) for upstream BSD-3-Clause `b00t0x/AMFIAnchor` (`Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext`), letting macOS keep AMFI enabled without `amfi=0x80` while `Garnet.kext` and `GarnetAccel.kext` retain zero `Lilu.kext` dependency.
 - `Garnet.kext` (`src/garnet/`): Initializes PCIe BARs and IP discovery, loads GPU firmware, manages VMIDs and sparse page tables, handles S3 sleep/wake and DP DDC/AUX recovery, drives DCN 4.01 modesetting and 128x128 hardware cursors via `AMDGarnetPrimaryFramebuffer`, and exposes the `'GRNT'` user client (`IOAccelGarnetNativeClient`).
 - `GarnetAccel.kext` (`src/garnet-accel/`): Integrates with `IOAcceleratorFamily2` in the Auxiliary Kernel Collection by matching versioned layout fingerprints (`tools/ioaccel-layout/`).
 - Mesa RADV Darwin (`mesa-patches/`): Patch series on Mesa `f5cb8ee032adabef599ae892ec4e42d796b84da9` building `libvulkan_radeon.dylib` with ACO over `'GRNT'`, `VK_EXT_metal_surface`, and `tools/rdna4/radv-app.sh`.
@@ -82,7 +84,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 ### Step 2: Configure OpenCore
 
 1. Mount your EFI partition.
-2. In **Garnet.app -> OpenCore Assistant**, select the mode recommended on the main screen (`Full-BAR (8/16 GiB)` or `256 MiB Small-BAR`), click **Configure OpenCore…**, and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --config /Volumes/EFI/EFI/OC/config.plist`). Garnet backs up `config.plist`, copies `GarnetPCIBarCompat.kext` for Full-BAR mode, updates the required settings, and validates the file.
+2. In **Garnet.app -> OpenCore Assistant**, select the BAR mode recommended on the main screen (`Full-BAR (8/16 GiB)` or `256 MiB Small-BAR`) and the AMFI mode (`AMFIAnchor (AMFI Enabled)` if your payload was built with `GARNET_SIGN_CA_DIR` and `EFI/OC/Kexts/` has `Lilu.kext` + `AMFIAnchor.kext`, or `Legacy (amfi=0x80)` for ad-hoc payloads). Click **Configure OpenCore…** and select your mounted `EFI` folder or `EFI/OC/config.plist` (CLI equivalent: `/Applications/Garnet.app/Contents/Resources/garnetctl configure-oc --mode full --amfi legacy --config /Volumes/EFI/EFI/OC/config.plist`, or `--amfi anchor`). Garnet saves a timestamped backup and a one-time pre-Garnet baseline (`config.plist.garnet-pre-garnet`), copies `GarnetPCIBarCompat.kext` (Full-BAR), `GarnetRecover.efi` (`EFI/OC/Tools/`), and in `anchor` mode enforces `Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext` (before `AMFIPass.kext` if present) without `amfi=0x80`, then validates the file.
 3. If preflight shows `SIP SETUP NEEDED`, reboot once so the updated `csr-active-config` takes effect.
 
 ### Step 3: Install and reboot
@@ -94,7 +96,11 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 
 - To exclude an app from Metal acceleration, drop it onto **Garnet.app -> Status & Denylist** or run `sudo /Applications/Garnet.app/Contents/Resources/garnetctl denylist add-app /Applications/ProblemApp.app`.
 - To export redacted diagnostics, use **Status & Denylist** or run `garnetctl export-diag --out ~/Desktop/garnet-diag.tar.gz`.
-- To uninstall, click **Garnet.app -> Install / Uninstall -> Uninstall Garnet…** (or run `sudo garnetctl uninstall`), then reboot and disable `GarnetPCIBarCompat.kext` and `garnet*` boot-args in OpenCore.
+- **OpenCore Picker recovery (`GarnetRecover.efi`)**: Select **Garnet: Safe Boot & Recovery** in the OpenCore boot menu (zero ESP writes):
+  - `[1] Safe Boot Once` appends `garnet=0 garnet-aux=0 garnet-rebar-compat=0` in UEFI NVRAM for the next macOS selection while leaving Garnet installed.
+  - `[2] Safe Boot & Uninstall Garnet` sets the same safe-boot flags plus an NVRAM recovery flag; on the next macOS boot, `com.garnet.recovery` clears the flag first, runs self-contained `garnetctl uninstall`, writes `/Library/Logs/Garnet/recovery-complete.txt`, and stays on the safe desktop without auto-rebooting.
+- **Restore OpenCore**: After uninstalling (normal or recovery), mount your EFI partition and click **Garnet.app -> OpenCore Assistant -> Restore OpenCore…** or run `/Applications/Garnet.app/Contents/Resources/garnetctl restore-oc --config /Volumes/EFI/EFI/OC/config.plist` (pass `--strip-only` if no `config.plist.garnet-pre-garnet` baseline exists). This restores your pre-Garnet `config.plist`, removes verified Garnet EFI files, and never deletes `Lilu.kext` or `AMFIAnchor.kext`.
+- Manual uninstall: click **Garnet.app -> Install / Uninstall -> Uninstall Garnet…** (or run `sudo garnetctl uninstall`), then run `restore-oc` on your mounted EFI and reboot.
 - Emergency boot-arg kill-switches for OpenCore: `garnet=0` disables `Garnet.kext`, `garnet-aux=0` disables `GarnetAccel.kext`, `garnet-rebar-compat=0` disables the Full-BAR hook, and `garnet-apps-all=0` restricts desktop app Metal acceleration.
 
 ## Repository layout
@@ -104,6 +110,7 @@ Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Na
 | `src/garnet` | Primary kext (`Garnet.kext`), DCN 4.01 modeset/cursor code, VM/sleep helpers, shaders, and host tests |
 | `src/garnet-accel` | Auxiliary Kernel Collection kext (`GarnetAccel.kext`) and layout gate tests |
 | `src/garnet-pci-compat` | Early OpenCore Full-BAR kext (`GarnetPCIBarCompat.kext`) and `IOPCIFamily` tests |
+| `src/garnet-recover-efi` | Freestanding x86_64 UEFI OpenCore Picker recovery tool (`GarnetRecover.efi`) and pure-C host tests |
 | `src/garnet-metal` | `GarnetMetal.bundle`, pure-C modules, `spvcache` metadata, and tests |
 | `src/garnet-app` | Swift `Garnet.app`, `garnetctl` CLI, KC/OpenCore validator and configurator, and `GarnetCoreTests` |
 | `src/dcn41` | DCN 4.01 register headers and generated write allowlist |
@@ -135,7 +142,7 @@ CHIPS=navi44 bash tools/fetch-firmware.sh /path/to/linux-firmware
 make -C src/garnet CHIPS=navi44 MKSDK=/path/to/MacKernelSDK all
 ```
 
-To build a full matched payload on macOS, follow [BUILDING.md](BUILDING.md) and [tools/rdna4/README.md](tools/rdna4/README.md), then run `tools/rdna4/build-all.sh OUT_DIR`.
+To build a full matched payload on macOS, follow [BUILDING.md](BUILDING.md) and [tools/rdna4/README.md](tools/rdna4/README.md), then run `tools/rdna4/build-all.sh OUT_DIR`. To build with `AMFIAnchor` trust-anchor signing (eliminating `amfi=0x80`), generate an out-of-repo local CA with `bash tools/rdna4/make-signing-ca.sh ~/garnet-signing-ca` and pass `GARNET_SIGN_CA_DIR=~/garnet-signing-ca` (plus optional `GARNET_AMFIANCHOR_KEXT=/path/to/AMFIAnchor.kext`) to `tools/rdna4/build-all.sh` (requires `rcodesign`); leaving `GARNET_SIGN_CA_DIR` unset preserves default ad-hoc signing (`amfi=0x80`).
 
 ## Documentation
 
@@ -155,6 +162,7 @@ Garnet builds on these projects:
 - [RX4Darwin/AMDRadeonRDNA4.kext](https://github.com/RX4Darwin/AMDRadeonRDNA4.kext) (BSD 3-Clause, Copyright (c) 2026 Sunneva N. Mariu, `next` @ `dded456d`): Adapted non-Lilu components, including the Navi 44 `ODM_MEM_PWR_CTRL2` hazard exclusion, CoreDisplay `AMD*` framebuffer prefix recognition, DCN 4.01 128x128 hardware cursor programming, RADV `VK_EXT_metal_surface` WSI fallback and `radv-app.sh`, VMID exact TLB ack / quarantine / sparse page-table rollback, S3 sleep/wake and DP DDC-to-AUX pad recovery, and the `GarnetGLDrawable` surface bridge (`supportsUnalignedVertexFetch`, `commitAndHold`, `setLineWidth:`).
 - [RDNA4FB](https://github.com/somestupidgirl/RDNA4FB) (BSD 3-Clause, Copyright (c) 2026 Sunneva N. Mariu): On-die IP discovery (`src/garnet/src/ipdiscovery.*`), BAR5 mapping, and indirect VRAM survey logic.
 - [mac-amdgpu](https://github.com/lemonade-sdk/mac-amdgpu) (MIT, Copyright (c) 2026 Geramy Loveless): RDNA 4 IP-block initialization sequence references.
+- [AMFIAnchor](https://github.com/b00t0x/AMFIAnchor) (BSD 3-Clause, Copyright (c) 2026 b00t0x): Optional OpenCore trust-anchor kernel extension interface (`SchemaVersion = 1` codeless injector contract) used to keep macOS AMFI enabled without `amfi=0x80`.
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT) and [metal2vulkan](https://github.com/steelbrain/metal2vulkan) (LGPL-3.0-or-later, derivative patches noted in [third-party/metal2vulkan-rdna4/NOTICE](third-party/metal2vulkan-rdna4/NOTICE)).
 
 Full third-party license texts and commit-level attributions are in [third-party/THIRD-PARTY-LICENSES.txt](third-party/THIRD-PARTY-LICENSES.txt). This project is an independent open-source effort and is not affiliated with or endorsed by AMD, Apple, Cobalt64, or RX4Darwin.

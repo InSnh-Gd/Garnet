@@ -27,6 +27,7 @@ public struct PreflightReport: Codable, Equatable, Sendable {
     public let isVM: Bool
     public let detectedGPUs: [PCIGPUInfo]
     public let sip: SIPStatusInfo
+    public let amfi: AMFIAnchorStatusInfo
     public let layoutMatch: LayoutMatchResult?
     public let pciBarCompat: PCIBarCompatResult?
     public let barRecommendation: BARRecommendation
@@ -161,6 +162,32 @@ public enum PreflightChecker {
             detail: sip.detail
         ))
 
+        // AMFI / Trust-Anchor readiness (advisory; resolved via OpenCore config + reboot)
+        let manifestKV = (try? PayloadVerifier.parseKVFile(at: payloadURL.appendingPathComponent("MANIFEST.txt"))) ?? [:]
+        let payloadHasTrustAnchor = manifestKV["TRUST_ANCHOR_ENABLED"] == "1"
+        let amfi = env.readAMFIAnchorStatus(bootArgs: sip.bootArgs)
+        let amfiReady = payloadHasTrustAnchor ? (amfi.garnetAnchorLoaded || amfi.amfiDisabledByBootArg) : amfi.amfiDisabledByBootArg
+        let amfiDetail: String
+        if payloadHasTrustAnchor {
+            if amfi.garnetAnchorLoaded {
+                amfiDetail = "AMFIAnchor active with org.garnet.code-signing loaded (AMFI enabled; amfi=0x80 not required)"
+            } else if amfi.amfiDisabledByBootArg {
+                amfiDetail = "Fallback amfi=0x80 active; use OpenCore Assistant (AMFIAnchor mode) to re-enable AMFI"
+            } else {
+                amfiDetail = "Payload supports AMFIAnchor (org.garnet.code-signing), but neither AMFIAnchor nor amfi=0x80 is active; configure OpenCore and reboot"
+            }
+        } else if amfi.amfiDisabledByBootArg {
+            amfiDetail = "Ad-hoc payload with legacy amfi=0x80 active"
+        } else {
+            amfiDetail = "Ad-hoc payload requires amfi=0x80 in OpenCore boot-args (or rebuild with GARNET_SIGN_CA_DIR for AMFIAnchor)"
+        }
+        checks.append(PreflightCheckItem(
+            name: "AMFI / Trust Anchor",
+            passed: amfiReady,
+            level: amfiReady ? "PASS" : "WARN",
+            detail: amfiDetail
+        ))
+
         let overall: PreflightStatus
         if hardFailed || !sysKCOk {
             overall = .blocked
@@ -179,6 +206,7 @@ public enum PreflightChecker {
             isVM: isVM,
             detectedGPUs: gpus,
             sip: sip,
+            amfi: amfi,
             layoutMatch: layoutResult,
             pciBarCompat: compat,
             barRecommendation: barRec,

@@ -552,12 +552,23 @@ class BuildIdentityTests(unittest.TestCase):
             "uninstall-native.sh",
             "deploy-common.sh",
             "activate-native.sh",
+            "recover-uninstall.sh",
             "collect-installed.sh",
             "com.garnet.native.plist",
             "com.garnet.native-translate.plist",
+            "com.garnet.recovery.plist",
             "LOCAL-SOURCE-MANIFEST.txt",
         ):
             (payload / fname).write_bytes(b"fixture-content-" + fname.encode("ascii") + b"\n")
+        # Minimal valid x86_64 PE32+ EFI application header for optional/GarnetRecover.efi
+        efi_bytes = bytearray(0x200)
+        efi_bytes[0:2] = b"MZ"
+        efi_bytes[0x3C:0x40] = (0x80).to_bytes(4, "little")
+        efi_bytes[0x80:0x84] = b"PE\x00\x00"
+        efi_bytes[0x84:0x86] = (0x8664).to_bytes(2, "little")
+        efi_bytes[0x98:0x9A] = (0x020B).to_bytes(2, "little")
+        efi_bytes[0x98 + 68 : 0x98 + 70] = (10).to_bytes(2, "little")
+        (payload / "optional" / "GarnetRecover.efi").write_bytes(bytes(efi_bytes))
         (payload / "MANIFEST.txt").write_text(
             "\n".join(
                 [
@@ -675,6 +686,86 @@ class BuildIdentityTests(unittest.TestCase):
         # Legacy identifier inside layout-fingerprint.json must fail
         fp_text = (payload / "layout-fingerprint.json").read_text()
         (payload / "layout-fingerprint.json").write_text(fp_text.replace("Class0", "/Users/leak/Class0"))
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        (payload / "layout-fingerprint.json").write_text(fp_text)
+        self._write_sha256sums(payload)
+
+        # Malformed optional/GarnetRecover.efi must fail
+        orig_efi = (payload / "optional" / "GarnetRecover.efi").read_bytes()
+        (payload / "optional" / "GarnetRecover.efi").write_bytes(b"not-a-pe-file" * 32)
+        self._write_sha256sums(payload)
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+        (payload / "optional" / "GarnetRecover.efi").write_bytes(orig_efi)
+        self._write_sha256sums(payload)
+
+    def test_release_payload_trust_anchor_dual_track(self):
+        payload = self._make_release_payload(self.root / "anchor-case")
+        # Build a codeless GarnetAnchorInjector.kext fixture
+        skid = bytes.fromhex("11" * 20)
+        spki = b"\x30" * 160
+        inj_dir = payload / "optional" / "GarnetAnchorInjector.kext" / "Contents"
+        inj_dir.mkdir(parents=True, exist_ok=True)
+        inj_plist = {
+            "CFBundleIdentifier": "org.garnet.anchor-injector",
+            "CFBundleName": "GarnetAnchorInjector",
+            "CFBundleVersion": "1.0.0",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundlePackageType": "KEXT",
+            "OSBundleRequired": "Root",
+            "OSBundleLibraries": {"org.b00t0x.AMFIAnchor": "0.1.0"},
+            "IOKitPersonalities": {
+                "org.garnet.anchor-injector": {
+                    "CFBundleIdentifier": "org.b00t0x.AMFIAnchor",
+                    "IOClass": "AMFIAnchorProvider",
+                    "IOProviderClass": "IOResources",
+                    "IOResourceMatch": "IOKit",
+                    "IOMatchCategory": "org.garnet.anchor-injector",
+                    "AMFIAnchorProviderID": "org.garnet.anchor-injector",
+                    "AMFIAnchorConfig": {
+                        "SchemaVersion": 1,
+                        "Anchors": {
+                            "org.garnet.code-signing": {
+                                "Enabled": True,
+                                "SPKI": spki,
+                                "SKID": skid,
+                            }
+                        },
+                    },
+                }
+            },
+        }
+        (inj_dir / "Info.plist").write_bytes(plistlib.dumps(inj_plist))
+        self._write_sha256sums(payload)
+        # Stray injector while TRUST_ANCHOR_ENABLED=0 must fail
+        self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
+
+        # Enable TRUST_ANCHOR_ENABLED=1 + AMFIANCHOR_BUNDLED=1 with valid AMFIAnchor.kext -> pass
+        make_kext(
+            payload / "optional" / "AMFIAnchor.kext",
+            "org.b00t0x.AMFIAnchor",
+            "AMFIAnchor",
+            "0.2.0",
+            libraries={"as.vit9696.Lilu": "1.7.2"},
+        )
+        m_text = (payload / "MANIFEST.txt").read_text()
+        m_anchor = m_text.replace(
+            "PCIBARCOMPAT_BUNDLE_ID=org.garnet.pcibarcompat\n",
+            "PCIBARCOMPAT_BUNDLE_ID=org.garnet.pcibarcompat\n"
+            "TRUST_ANCHOR_ENABLED=1\n"
+            "TRUST_ANCHOR_BUNDLE_ID=org.garnet.anchor-injector\n"
+            "TRUST_ANCHOR_ID=org.garnet.code-signing\n"
+            f"TRUST_ANCHOR_SKID={skid.hex()}\n"
+            "AMFIANCHOR_BUNDLED=1\n",
+        )
+        (payload / "MANIFEST.txt").write_text(m_anchor)
+        self._write_sha256sums(payload)
+        ok = self.run_cli("verify-release-payload", str(payload))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("release_payload.trust_anchor_enabled=1", ok.stdout)
+
+        # Mismatched SKID in MANIFEST must fail
+        (payload / "MANIFEST.txt").write_text(m_anchor.replace(skid.hex(), "22" * 20))
         self._write_sha256sums(payload)
         self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
 

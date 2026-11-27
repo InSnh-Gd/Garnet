@@ -86,6 +86,16 @@ public struct SIPStatusInfo: Codable, Equatable, Sendable {
     public let detail: String
 }
 
+public struct AMFIAnchorStatusInfo: Codable, Equatable, Sendable {
+    public let servicePresent: Bool
+    public let installStatus: Int?
+    public let anchorReady: Bool
+    public let loadedAnchors: [String]
+    public let garnetAnchorLoaded: Bool
+    public let amfiDisabledByBootArg: Bool
+    public let detail: String
+}
+
 public struct HostEnvironment: Sendable {
     public let sysRoot: URL
     public let bootKCPath: String
@@ -181,6 +191,92 @@ public struct HostEnvironment: Sendable {
             fsProtectionsDisabled: fsOff,
             readyForAuxKC: ready,
             bootArgs: bootArgs,
+            detail: detail
+        )
+    }
+
+    public func readAMFIAnchorStatus(bootArgs: String? = nil) -> AMFIAnchorStatusInfo {
+        let effectiveArgs = bootArgs ?? readSIPStatus().bootArgs ?? ""
+        let argTokens = Set(effectiveArgs.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        let amfiOff = argTokens.contains("amfi=0x80")
+
+        let ioregOut = runner.run("/usr/sbin/ioreg", ["-r", "-c", "AMFIAnchor", "-l"]).stdout
+        let servicePresent = ioregOut.contains("AMFIAnchor")
+        var installStatus: Int?
+        var anchorReady = false
+        var loadedAnchors: [String] = []
+        var inLoadedAnchors = false
+        var anchorDepth = 0
+
+        func recordAnchorID(_ raw: String) {
+            var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            while cleaned.hasSuffix(",") || cleaned.hasSuffix(";") || cleaned.hasSuffix(")") || cleaned.hasSuffix("}") {
+                cleaned = String(cleaned.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if cleaned.hasPrefix("\"") && cleaned.hasSuffix("\"") && cleaned.count >= 2 {
+                cleaned = String(cleaned.dropFirst().dropLast())
+            }
+            if !cleaned.isEmpty && !cleaned.hasPrefix("{") && !cleaned.hasPrefix("(") && !loadedAnchors.contains(cleaned) {
+                loadedAnchors.append(cleaned)
+            }
+        }
+
+        for rawLine in ioregOut.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.contains("\"InstallStatus\""), let eq = line.range(of: "=") {
+                installStatus = Int(line[eq.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines))
+            } else if line.contains("\"AnchorReady\""), let eq = line.range(of: "=") {
+                let rhs = line[eq.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                anchorReady = (rhs == "yes" || rhs == "true" || rhs == "1")
+            } else if line.contains("\"LoadedAnchors\"") {
+                inLoadedAnchors = true
+                anchorDepth = 0
+                if line.contains("\"org.garnet.code-signing\"") {
+                    recordAnchorID("org.garnet.code-signing")
+                }
+                for ch in line {
+                    if ch == "(" || ch == "{" { anchorDepth += 1 }
+                    else if ch == ")" || ch == "}" { anchorDepth -= 1 }
+                }
+                if anchorDepth <= 0 && (line.contains(")") || line.contains("}")) {
+                    inLoadedAnchors = false
+                }
+            } else if inLoadedAnchors {
+                if line.contains("\"org.garnet.code-signing\"") {
+                    recordAnchorID("org.garnet.code-signing")
+                }
+                if (line.contains("\"ID\"") || line.contains("\"AnchorID\"")), let eq = line.range(of: "=") {
+                    recordAnchorID(String(line[eq.upperBound...]))
+                }
+                for ch in line {
+                    if ch == "(" || ch == "{" { anchorDepth += 1 }
+                    else if ch == ")" || ch == "}" { anchorDepth -= 1 }
+                }
+                if anchorDepth <= 0 {
+                    inLoadedAnchors = false
+                }
+            }
+        }
+
+        let garnetLoaded = (installStatus == 1) && anchorReady && loadedAnchors.contains("org.garnet.code-signing")
+        let detail: String
+        if garnetLoaded {
+            detail = "AMFIAnchor installed (InstallStatus=1) with org.garnet.code-signing active (AMFI enabled)"
+        } else if servicePresent {
+            detail = "AMFIAnchor present (InstallStatus=\(installStatus.map(String.init) ?? "?"), AnchorReady=\(anchorReady)), but org.garnet.code-signing is not loaded"
+        } else if amfiOff {
+            detail = "Legacy amfi=0x80 active (AMFIAnchor not loaded)"
+        } else {
+            detail = "Neither AMFIAnchor (org.garnet.code-signing) nor amfi=0x80 is active"
+        }
+
+        return AMFIAnchorStatusInfo(
+            servicePresent: servicePresent,
+            installStatus: installStatus,
+            anchorReady: anchorReady,
+            loadedAnchors: loadedAnchors,
+            garnetAnchorLoaded: garnetLoaded,
+            amfiDisabledByBootArg: amfiOff,
             detail: detail
         )
     }

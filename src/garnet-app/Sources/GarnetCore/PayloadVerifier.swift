@@ -12,6 +12,11 @@ public struct VerifiedPayloadInfo: Codable, Equatable, Sendable {
     public let garnetVersion: String
     public let accelVersion: String
     public let pcibarCompatVersion: String
+    public let trustAnchorEnabled: Bool
+    public let trustAnchorID: String?
+    public let trustAnchorSKID: String?
+    public let amfiAnchorBundled: Bool
+    public let recoverEFIPresent: Bool
 }
 
 public enum PayloadVerifyError: Error, CustomStringConvertible {
@@ -155,6 +160,7 @@ public enum PayloadVerifier {
             "variants/index.json",
             "layout-fingerprint.json",
             "activate-native.sh",
+            "recover-uninstall.sh",
             "deploy-common.sh",
             "garnettest",
             "native-translate",
@@ -162,7 +168,8 @@ public enum PayloadVerifier {
             "publish-metal",
             "mtlprobe-direct",
             "com.garnet.native.plist",
-            "com.garnet.native-translate.plist"
+            "com.garnet.native-translate.plist",
+            "com.garnet.recovery.plist"
         ]
         for rel in requiredRel where !coveredFiles.contains(rel) {
             throw PayloadVerifyError.failed("Required release payload item missing: \(rel)")
@@ -170,6 +177,51 @@ public enum PayloadVerifier {
         let licenseData = try Data(contentsOf: root.appendingPathComponent("LICENSE.amdgpu"))
         if licenseData.isEmpty {
             throw PayloadVerifyError.failed("LICENSE.amdgpu must not be empty")
+        }
+
+        let recoverEFIRel = "optional/GarnetRecover.efi"
+        let recoverEFIPresent = coveredFiles.contains(recoverEFIRel)
+        if recoverEFIPresent {
+            try verifyPE32PlusEFI(at: root.appendingPathComponent(recoverEFIRel))
+        }
+
+        let trustAnchorFlag = manifest["TRUST_ANCHOR_ENABLED"] ?? "0"
+        let trustAnchorEnabled: Bool
+        var trustAnchorID: String?
+        var trustAnchorSKID: String?
+        var amfiAnchorBundled = false
+        let injectorRel = "optional/GarnetAnchorInjector.kext/Contents/Info.plist"
+        if trustAnchorFlag == "1" {
+            trustAnchorEnabled = true
+            guard coveredFiles.contains(injectorRel) else {
+                throw PayloadVerifyError.failed("TRUST_ANCHOR_ENABLED=1 requires \(injectorRel)")
+            }
+            let expectedAnchorID = manifest["TRUST_ANCHOR_ID"] ?? ""
+            let expectedSKID = manifest["TRUST_ANCHOR_SKID"] ?? ""
+            guard expectedAnchorID == "org.garnet.code-signing", expectedSKID.count == 40 else {
+                throw PayloadVerifyError.failed("MANIFEST.txt has invalid TRUST_ANCHOR_ID or TRUST_ANCHOR_SKID")
+            }
+            try verifyAnchorInjectorPlist(
+                at: root.appendingPathComponent(injectorRel),
+                expectedAnchorID: expectedAnchorID,
+                expectedSKIDHex: expectedSKID
+            )
+            trustAnchorID = expectedAnchorID
+            trustAnchorSKID = expectedSKID
+            if manifest["AMFIANCHOR_BUNDLED"] == "1" {
+                let amfiPlistRel = "optional/AMFIAnchor.kext/Contents/Info.plist"
+                guard coveredFiles.contains(amfiPlistRel) else {
+                    throw PayloadVerifyError.failed("AMFIANCHOR_BUNDLED=1 requires \(amfiPlistRel)")
+                }
+                amfiAnchorBundled = true
+            }
+        } else if trustAnchorFlag == "0" {
+            trustAnchorEnabled = false
+            if coveredFiles.contains(injectorRel) {
+                throw PayloadVerifyError.failed("Unexpected \(injectorRel) when TRUST_ANCHOR_ENABLED=0")
+            }
+        } else {
+            throw PayloadVerifyError.failed("Invalid TRUST_ANCHOR_ENABLED value: '\(trustAnchorFlag)'")
         }
 
         let idxData = try Data(contentsOf: root.appendingPathComponent("variants/index.json"))
@@ -205,7 +257,73 @@ public enum PayloadVerifier {
             releaseMode: "1",
             garnetVersion: manifest["GARNET_VERSION"] ?? "?",
             accelVersion: manifest["ACCEL_VERSION"] ?? "?",
-            pcibarCompatVersion: manifest["PCIBARCOMPAT_VERSION"] ?? "?"
+            pcibarCompatVersion: manifest["PCIBARCOMPAT_VERSION"] ?? "?",
+            trustAnchorEnabled: trustAnchorEnabled,
+            trustAnchorID: trustAnchorID,
+            trustAnchorSKID: trustAnchorSKID,
+            amfiAnchorBundled: amfiAnchorBundled,
+            recoverEFIPresent: recoverEFIPresent
         )
+    }
+
+    public static func verifyPE32PlusEFI(at url: URL) throws {
+        let data = try Data(contentsOf: url)
+        guard data.count >= 0x100, data[0] == 0x4D, data[1] == 0x5A else {
+            throw PayloadVerifyError.failed("Invalid EFI binary (missing MZ header): \(url.path)")
+        }
+        let peOff = Int(readUInt32LE(data, offset: 0x3C))
+        guard peOff >= 0, peOff + 0x70 <= data.count,
+              data[peOff] == 0x50, data[peOff + 1] == 0x45, data[peOff + 2] == 0, data[peOff + 3] == 0 else {
+            throw PayloadVerifyError.failed("Invalid EFI binary (missing PE header): \(url.path)")
+        }
+        let machine = readUInt16LE(data, offset: peOff + 4)
+        let optOff = peOff + 24
+        let magic = readUInt16LE(data, offset: optOff)
+        let subsystem = readUInt16LE(data, offset: optOff + 68)
+        guard machine == 0x8664, magic == 0x020B, subsystem == 10 else {
+            throw PayloadVerifyError.failed("EFI binary is not x86_64 PE32+ EFI application: \(url.path)")
+        }
+    }
+
+    private static func verifyAnchorInjectorPlist(at url: URL, expectedAnchorID: String, expectedSKIDHex: String) throws {
+        let data = try Data(contentsOf: url)
+        if let text = String(data: data, encoding: .utf8), text.uppercased().contains("PRIVATE KEY") {
+            throw PayloadVerifyError.failed("Private key material forbidden in \(url.path)")
+        }
+        let obj = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        guard let info = obj as? [String: Any],
+              (info["CFBundleIdentifier"] as? String) == "org.garnet.anchor-injector",
+              info["CFBundleExecutable"] == nil,
+              (info["OSBundleRequired"] as? String) == "Root",
+              let libs = info["OSBundleLibraries"] as? [String: Any],
+              (libs["org.b00t0x.AMFIAnchor"] as? String) == "0.1.0",
+              libs["as.vit9696.Lilu"] == nil,
+              let pers = info["IOKitPersonalities"] as? [String: Any],
+              let p = pers["org.garnet.anchor-injector"] as? [String: Any],
+              (p["CFBundleIdentifier"] as? String) == "org.b00t0x.AMFIAnchor",
+              (p["IOClass"] as? String) == "AMFIAnchorProvider",
+              let cfg = p["AMFIAnchorConfig"] as? [String: Any],
+              (cfg["SchemaVersion"] as? Int) == 1,
+              let anchors = cfg["Anchors"] as? [String: Any],
+              let entry = anchors[expectedAnchorID] as? [String: Any],
+              let spki = entry["SPKI"] as? Data, (64...1024).contains(spki.count),
+              let skid = entry["SKID"] as? Data, skid.count == 20, skid.contains(where: { $0 != 0 }) else {
+            throw PayloadVerifyError.failed("Invalid Schema-1 GarnetAnchorInjector.kext Info.plist")
+        }
+        let actualHex = skid.map { String(format: "%02x", $0) }.joined()
+        guard actualHex == expectedSKIDHex.lowercased() else {
+            throw PayloadVerifyError.failed("GarnetAnchorInjector SKID mismatch: expected \(expectedSKIDHex), got \(actualHex)")
+        }
+    }
+
+    private static func readUInt16LE(_ data: Data, offset: Int) -> UInt16 {
+        UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+    }
+
+    private static func readUInt32LE(_ data: Data, offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
     }
 }

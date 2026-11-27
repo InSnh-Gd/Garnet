@@ -203,8 +203,10 @@ final class GarnetAppModel: ObservableObject {
     @Published var lastExportedDiagURL: URL?
 
     @Published var selectedOCMode: OpenCoreMode = .full
+    @Published var selectedAMFIMode: OpenCoreAMFIMode = .legacy
     @Published var ocReport: OpenCoreReport?
     @Published var ocConfigureResult: OpenCoreConfigureResult?
+    @Published var ocRestoreResult: OpenCoreRestoreResult?
     @Published var ocError: String?
 
     private let env = HostEnvironment()
@@ -280,6 +282,9 @@ final class GarnetAppModel: ObservableObject {
             if let pf = snap.pf {
                 self.selectedOCMode = (pf.barRecommendation == .fullBar) ? .full : .modeSmall
             }
+            if let v = snap.vInfo {
+                self.selectedAMFIMode = v.trustAnchorEnabled ? .anchor : .legacy
+            }
         }
     }
 
@@ -323,8 +328,9 @@ final class GarnetAppModel: ObservableObject {
     func validateOpenCoreConfig(at url: URL) {
         ocError = nil
         ocConfigureResult = nil
+        ocRestoreResult = nil
         do {
-            ocReport = try OpenCoreValidator.validate(configURL: url, mode: selectedOCMode)
+            ocReport = try OpenCoreValidator.validate(configURL: url, mode: selectedOCMode, amfiMode: selectedAMFIMode)
         } catch {
             ocReport = nil
             ocError = "Failed to inspect plist read-only: \(error)"
@@ -334,12 +340,30 @@ final class GarnetAppModel: ObservableObject {
     func configureOpenCore(at url: URL) {
         ocError = nil
         ocConfigureResult = nil
+        ocRestoreResult = nil
         do {
-            let result = try OpenCoreValidator.configure(targetURL: url, mode: selectedOCMode, payloadURL: payloadURL)
+            let result = try OpenCoreValidator.configure(
+                targetURL: url,
+                mode: selectedOCMode,
+                amfiMode: selectedAMFIMode,
+                payloadURL: payloadURL
+            )
             ocConfigureResult = result
             ocReport = result.report
         } catch {
             ocError = "Failed to configure OpenCore: \(error)"
+        }
+    }
+
+    func restoreOpenCore(at url: URL, stripOnly: Bool = false) {
+        ocError = nil
+        ocConfigureResult = nil
+        ocRestoreResult = nil
+        ocReport = nil
+        do {
+            ocRestoreResult = try OpenCoreValidator.restore(targetURL: url, backupURL: nil, stripOnly: stripOnly)
+        } catch {
+            ocError = "Failed to restore OpenCore: \(error)"
         }
     }
 

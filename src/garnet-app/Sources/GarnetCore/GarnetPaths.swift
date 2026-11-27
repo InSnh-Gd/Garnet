@@ -19,8 +19,13 @@ public enum GarnetPaths {
     public static let profilePath = "/Library/Application Support/Garnet/native/profile"
     public static let garnetTestPath = "/Library/Application Support/Garnet/native/garnettest"
     public static let manifestPath = "/Library/Application Support/Garnet/native/MANIFEST.txt"
+    public static let recoveryDaemonPath = "/Library/LaunchDaemons/com.garnet.recovery.plist"
+    public static let recoveryScriptPath = "/Library/Application Support/Garnet/native/recover-uninstall.sh"
+    public static let selfContainedCLIPath = "/Library/Application Support/Garnet/native/garnetctl"
 
     public static let logsDir = "/Library/Logs/Garnet"
+    public static let recoveryLogPath = "/Library/Logs/Garnet/recovery.log"
+    public static let recoveryCompletePath = "/Library/Logs/Garnet/recovery-complete.txt"
     public static let translateLogsDir = "/Library/Logs/GarnetTranslate"
     public static let xlateDumpDir = "/private/tmp/garnet-xlate"
     public static let spvCacheDir = "/private/var/tmp/garnet-spv"
