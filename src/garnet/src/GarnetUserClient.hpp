@@ -9,7 +9,7 @@
 //
 //  It is NOT an accelerator interface. Apple's graphics stack reaches a GPU
 //  through IOAcceleratorFamily2's user clients with a private, versioned C++
-//  ABI (see notes/re/PHASE2-MAP.md); this is a plain IOUserClient with our own
+//  ABI (not Apple's private IOAccelerator ABI); this is a plain IOUserClient with our own
 //  selectors, for our own test harness. Phase 4 is where the Apple-shaped
 //  interface gets built.
 //

@@ -1,4 +1,4 @@
-// garnet_occ.h: bundle build 18, app-fix round 2, P2 (an internal design note section P2, "Maps crash: setVisibilityResultMode:offset:"). Pure C (host test: test-occ.c).
+// garnet_occ.h: bundle build 18, app-fix round 2, P2 (app compatibility fix). Pure C (host test: test-occ.c).
 //
 // THE MODEL (what the Vulkan side does with it is in GarnetDevice.m, RDNA4RenderEncoder; this file is only the bookkeeping and the arithmetic, so a host test can drive it).
 //   * -setVisibilityResultMode:offset: only RECORDS the mode and offset (after the checks in rdna4occ_set).

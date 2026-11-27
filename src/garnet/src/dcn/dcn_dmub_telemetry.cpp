@@ -3,7 +3,7 @@
 namespace rdna4dcn {
 
 // =====================================================================================================================================================================================================
-// build 0.0.622 (multi-monitor track, stage M1; an internal design note): THE THREE READ-ONLY INSTRUMENTS. Decisions: dispread.h; sequences: dispread_flow.h; host test:
+// Multi-monitor read-only telemetry instruments (ddcread, dmubring, dispcensus). Decisions: dispread.h; sequences: dispread_flow.h; host test:
 // tests/native_dispread_test.cpp (with planted breaks in tests/native_dispread_plant.sh).
 //   ddcread   <line> <block>  the ONLY one of the three that writes registers: the DC_I2C engine's own (BASE_IDX 2, absolute 0x5358..0x539e, allowlist range "DC..DIG6" 0x5358..0x53d3), each write through
 //             dcn41_allow_write, and only after the arbitration read says the engine is free. Needs bind() (the allowlist), like the DCN verbs 74-77.
@@ -285,7 +285,7 @@ uint32_t dispCensus(uint64_t arg, uint64_t *out, unsigned outCount) {
 
 
 // =====================================================================================================================================================================================================
-// build 0.0.625 (stages M2 / M3; an internal design note "M1.5 result" section 4): verbs 95 `dmubsend`, 96 `dmubmode`, 97 `dmubctx` - the FIRST code that sends to the display firmware. All behind boot-arg
+// DMUB display firmware command interface (verbs 95 `dmubsend`, 96 `dmubmode`, 97 `dmubctx`). All behind boot-arg
 // garnet-dmubcmd=1 (OFF: RDNA4DR_CMD_OFF, nothing touched, not even a register read). Decisions: dcn/dmubcmd.h; sequences: dcn/dmubcmd_flow.h (host test src/garnet/tests/native_dmubcmd_test.cpp + native_dmubcmd_plant.sh).
 // The writes: VRAM only through rdna4_vram_write_mm (the existing locked MM_INDEX writer); ONE register, DMCUB_INBOX1_WPTR, through dcn41_allow_write (needs bind(), like ddcread). One verb at a time (gDmBusy).
 // =====================================================================================================================================================================================================

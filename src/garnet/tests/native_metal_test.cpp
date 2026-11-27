@@ -1,4 +1,4 @@
-// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, an internal design note): the pure half of the Metal nub and its ops table, plus source pins.
+// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, driver design): the pure half of the Metal nub and its ops table, plus source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_metal_test.cpp -o /tmp/native_metal && /tmp/native_metal .
 //   (run from the repo root; the argument is the repo root the source pins read from; an optional second argument is the tree that holds the aux kext

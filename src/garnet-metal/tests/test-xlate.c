@@ -1,4 +1,4 @@
-// test-xlate.c: garnet_xlate.h (bundle 14, in-process shader translation; an internal design note section 1) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
+// test-xlate.c: garnet_xlate.h (bundle 14, in-process shader translation; driver contract
 // Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h, default "."; argv[2] = xlate overrides file, default fixtures/xlate-overrides.txt):
 //   cc -O1 -Wall -Wextra -Werror -DRDNA4X_TESTHOOKS -o /tmp/test-xlate test-xlate.c && /tmp/test-xlate .
 // test-b14-plant.sh plants breaks in the REAL garnet_xlate.h, GarnetDevice.m and the fork's Rust and demands that this suite (or the fork's cargo tests) FAIL on each.

@@ -268,7 +268,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
     - (void)useResourceGroup:(id)g usage:(NSUInteger)u stages:(NSUInteger)st { (void)g; (void)u; (void)st; RDNA4_ONCE("useResourceGroup: ignored"); }
 #define RDNA4F_A8   1u
 #define RDNA4F_SINT 8u
-#define RDNA4F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/rdna4m-nouint restores the old refusal. (2u is RDNA4F_DS below.)
+#define RDNA4F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/garnet-nouint restores the old refusal. (2u is RDNA4F_DS below.)
 #define RDNA4F_BC   16u  // 4x4 block-compressed format; bpp holds bytes per 4x4 block (8 or 16)
 #define RDNA4_HAS_MULTI_DRAW_INDIRECT 1
 #define RDNA4_HAS_MESH_PIPELINE_QUERY 1

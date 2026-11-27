@@ -3,7 +3,7 @@
 namespace rdna4dcn {
 
 // =====================================================================================================================================================================================================
-// build 0.0.631 (multi-monitor stage M4d; an internal design note "M4 design" / "M4b analysis"): verb 98 `disp2 timing|connect|off|status` - OTG1 -> ODM1 -> OPP1 (DPG1 pattern) -> DIG2 -> the
+// Multi-monitor display-2 control (verb 98 `disp2 timing|connect|off|status`): OTG1 -> ODM1 -> OPP1 (DPG1 pattern) -> DIG2 -> the
 // DMUB-enabled PHY C. Behind boot-arg garnet-disp2=1 (OFF: RDNA4D2_OFF, nothing touched, not even a register read). Decisions, step lists and the instance guard: dcn/disp2.h; the sequence: dcn/disp2_flow.h
 // (host test src/garnet/tests/native_disp2_test.cpp + native_disp2_plant.sh). Every write: the instance guard (rdna4d2_guard_write, address AND value) and then the DCN write allowlist, then ONE WREG32. One call at a time (gD2Busy).
 // =====================================================================================================================================================================================================
@@ -92,7 +92,7 @@ void wait_for_dcn_threads_quiescent() {
 }
 
 // =====================================================================================================================================================================================================
-// build 0.0.652 (multi-monitor stage M5; an internal design note "M5 build spec: GarnetFramebuffer for the monitor B"): what `fbpublish 2` (GarnetDisplayNub.cpp) needs from the display layer.
+// build 0.0.652 (multi-monitor stage M5; GarnetFramebuffer design): what `fbpublish 2` (GarnetDisplayNub.cpp) needs from the display layer.
 // disp2Held: the HELD plane (stage HELD, or the pair pinned): ONE atomic load of each word; no lock, no register. fbView: the software facts (no register read). fbLive: the plane's live gates (READS ONLY), re-judged by
 // rdna4d2_hold_verdict. fbEdid: the monitor B's EDID blocks 0 and 1 over DDC line 3 through the SAME engine sequence as `accel ddcread` (rdna4dr::ddc_read: arbitration verdict first, bounded poll, always released; its only register
 // writes are the DC_I2C engine's, through the DCN allowlist, exactly as ddcread). None of them writes a plane or pipe register.
@@ -253,7 +253,7 @@ uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupCo
 
 
 // =====================================================================================================================================================================================================
-// build 0.0.661 (M6 Stage 1b, ABI 1.11; an internal design note "Q2: Stage 1b build contract") + 0.0.662 (M6 Stage 2, ABI 1.12; "Stage 2 build contract (monitor A, instance 1)"): the HDMI displays' scanout - INSTANCE 2 = the
+// build 0.0.661 (M6 Stage 1b, ABI 1.11; multi-display scanout contract) + 0.0.662 (M6 Stage 2, ABI 1.12; "Stage 2 build contract (monitor A, instance 1)"): the HDMI displays' scanout - INSTANCE 2 = the
 // monitor B (HUBP2 / OTG2) and INSTANCE 1 = the monitor A (HUBP1 / OTG1), poll-only. THE SEQUENCES ARE dcn/scanx_flow.h (one XDesc per instance); this block is the environment (register read / write, clock, lock, thread) and the entry points.
 // Each instance writes exactly two registers, ITS OWN HUBPREQn_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH then ..._ADDRESS (instance 2: 0x3c83 / 0x3c82; instance 1: 0x3ba7 / 0x3ba6), and only through rdna4scanx::write_addr (which judges the whole
 // 64-bit address); the DCN write allowlist is asked again here. Behind garnet-m6=1 AND garnet-m6flip=1 (instance 2) and additionally garnet-m6flip1=1 (instance 1), all read ONCE: with a latch OFF nothing here touches a register,

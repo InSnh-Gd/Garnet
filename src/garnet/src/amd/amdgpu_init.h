@@ -77,7 +77,7 @@ struct BringupContext {
     // Runs at the END of SDMAInit for the same reason the PDB0 one does: QUEUE0
     // has just resumed (its MCU unhalt and instance-wide registers are what
     // QUEUE1 borrows), and nothing downstream depends on QUEUE1. Settles open
-    // question 1 of notes/re/sdma-takeover-design.md — does one S2A window route
+    // SDMA doorbell/fence routing — does one S2A window route
     // two indices to two queues on one engine — with OUR ring, before `sdmamap`
     // ever points the engine at Apple's. Inert unless the boot-arg is set.
     bool             sdmaQ1TestWant { false };
@@ -137,7 +137,7 @@ struct BringupContext {
     // rdna4-hsa-abi=1: dispatch the LLVM-compiled kernel (shaders/store_magic_hsa.s)
     // with the standard HSA kernarg convention instead of the hand-written shader.
     // Off by default — the hand-written path is the proven stage-17 result and stays
-    // the reference. See notes/B1-COMPILER-BRIDGE.md.
+    // the reference. Built via src/garnet/tools/build-shader.sh.
     bool hsaAbi { false };          // rdna4-kcq=1: create the kernel compute queue (opt-in, see below)
     bool kcqMapped { false };        // PM4Test: MES acked ADD_QUEUE(COMPUTE) for the kernel compute queue
     bool kcqTestPassed { false };    // PM4Test: a WRITE_DATA IB executed on the compute ring

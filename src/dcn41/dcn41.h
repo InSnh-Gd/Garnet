@@ -27,7 +27,7 @@
  * and silently truncates high bits); a VMID above 15 is refused.
  * HUBP address-high and flip-control reads reject all-ones hardware values with DCN41_E_HW before publishing outputs.
  *
- * Which interrupt paces VBL (see notes/DISPLAY-DESIGN.md): Linux 238650ef6c7c's amdgpu_dm uses VUPDATE_NO_LOCK (IH src
+ * Which interrupt paces VBL (per Linux amdgpu_dm): Linux 238650ef6c7c's amdgpu_dm uses VUPDATE_NO_LOCK (IH src
  * 0x57 + otg) as the single DCN vblank and flip-completion interrupt ("VSTARTUP and GRPH_PFLIP are not used",
  * amdgpu_dm_irq.c dm_crtc_high_irq_handler). DC's irq table still maps VSTARTUP (0x3C + otg) and HUBP flip
  * (0x4F + hubp), so all three are supported here.

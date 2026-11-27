@@ -48,7 +48,7 @@ enum {
     RDNA4N_SEL_SUBMIT    = 7,   /* struct in: rdna4n_cs_in (32 + 32*n B)   out: [0] seqno */
     RDNA4N_SEL_WAITSEQ   = 8,   /* in: [0] seqno [1] timeout ns (relative) [2] ctx id (ignored)   out: [0] busy [1] retired [2] emitted */
     RDNA4N_SEL_COUNT     = 9,   /* the v1.0 selectors; unchanged so old clients' tables stay valid */
-    /* ---- ABI 1.1 (kext 0.0.603): native scanout, contract section "ABI 1.1 addendum" of NATIVE-S1C-ABI.md. All need Hello first. ---- */
+    /* ---- ABI 1.1 (kext 0.0.603): native scanout, ABI addendum. All need Hello first. ---- */
     RDNA4N_SEL_SCAN_QUERY    = 9,   /* struct out: rdna4n_scan_query (96 B). Valid without Acquire. */
     RDNA4N_SEL_SCAN_ACQUIRE  = 10,  /* in: [0] flags (0)   out: [0] console MC [1] OTG frame count (24-bit, extended) */
     RDNA4N_SEL_SCAN_REGISTER = 11,  /* struct in: rdna4n_scan_reg (32 B)   out: [0] slot id [1] slot MC */
@@ -56,7 +56,7 @@ enum {
     RDNA4N_SEL_SCAN_STATUS   = 13,  /* struct out: rdna4n_scan_status (256 B) */
     RDNA4N_SEL_SCAN_RELEASE  = 14,  /* out: [0] console restore verified (1/0) [1] plane MC after; idempotent */
     RDNA4N_SEL_COUNT_1_1     = 15,
-    /* ---- ABI 1.2 (kext 0.0.604): the DISPCLK/DPPCLK experiment, contract section "ABI 1.2 addendum" of NATIVE-S1C-ABI.md. Needs Hello first. ---- */
+    /* ---- ABI 1.2 (kext 0.0.604): the DISPCLK/DPPCLK experiment, ABI addendum. Needs Hello first. ---- */
     RDNA4N_SEL_DAL_STEP      = 15,  /* in: [0] step (1 E1b, 2 E2, 3 E3, 4 E4) [1] flags (0)   struct out: rdna4n_dal_result (256 B). Blocks up to ~65 s (E4 dwell). Success = the step RAN; the verdict word says how it went. */
     RDNA4N_SEL_COUNT_1_2     = 16,
     /* ---- ABI 1.3 (kext 0.0.605): the timed mode trial, native-S2d (contract text: the "ABI 1.3 addendum" block below the structs). Needs Hello first. ---- */
@@ -341,7 +341,7 @@ struct rdna4n_dal_result {           /* 256 B */
 };
 
 /* ---- ABI 1.3: the timed mode trial (kext 0.0.605, native S2d) --------------------------------------------------------------------------
- * ABI 1.3 addendum (proposed text for an internal design note; the header is the only place it lives until the reviewer merges it):
+ * ABI 1.3 addendum (ABI 1.3 specification):
  *   Selector 16 RDNA4N_SEL_MODE_TRIAL. Native boots only (rdna4-native=1 with S1b POSITIVE PASS), scanout plane NOT acquired, DISPCLK/DPPCLK at least what the row's DML
  *   needs (read from the DFS registers, never assumed), the live mode the 60 Hz census raster. It programs the display to the row's refresh (row 50 = the 60 Hz raster at a
  *   201 MHz pixel clock, 49.90 Hz, the live 60 Hz DLG/TTU stays; row 120 = 497.75 MHz, 2720x1525, the DML DLG/TTU/prefetch goldens; row 120 needs a passed row-50 trial on
@@ -353,7 +353,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   Time in the trial mode is about 0.5 s + 3 s + dwell. The hardware writes are the ones listed in modetrial_tables.h (the generated golden tables), nothing else.
  *   It never raises a clock: a row whose DML clocks exceed the live DFS readback is DENIED (rdna4dal / rdna4-dalsmc is the only clock path).
  *   rdna4n_mode_result: verdict RDNA4N_MODE_V_*, deny RDNA4N_MODE_D_* (verdict DENIED: nothing was written), flags RDNA4N_MODE_F_*. Tool: tools/native/rdna4mode.c.
- * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design an internal design note P1 / P2 / P3):
+ * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design mode-trial hardware sequences):
  *   The result is 512 B: the first 256 B are the 1.3 layout unchanged, the second 256 B are `ext` (below). A client built for 1.3 must not call selector 16 on a 1.4 kext (the output size differs).
  *   Two new rows, both at 60 Hz with no clock or DTO change: row 1 = the DP1 stream resync (blank, then unblank, exactly Linux's order: field-exact writes of DP1_DP_VID_STREAM_CNTL,
  *   DP1_DP_STEER_FIFO and DIG1_DIG_FIFO_CTRL0 only; one retry; the stream is left blanked only if both attempts failed, and then the restore / watchdog / `dcnmode 0` / kext stop unblank it);
@@ -363,7 +363,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   The underflow registers (HUBP0_DCHUBP_CNTL, ODM0_OPTC_INPUT_GLOBAL_CONTROL) are read before the trial (must be clean), after the settle (reported), every 250 ms during the rate window and
  *   the dwell (an underflow ends the trial: verdict UNDERFLOW, restored, latched) and after the restore (an underflow there makes the verdict RESTORE). They are cleared with their write-1
  *   strobes (never while ODM0_OPTC_INPUT_GLOBAL_CONTROL.INPUT_SOFT_RESET is set). Row 120 stays hard-denied. */
-/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design an internal design note P4 / P5):
+/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design clock-hold sequence):
  *   Row 120 (2560x1440, 2720x1525, 497.75 MHz = 119.998 Hz) is DENIED (RDNA4N_MODE_D_ROW120_OFF) unless the boot-arg garnet-row120=1 is present. With it, the trial needs: a native boot with S1b POSITIVE PASS and
  *   rdna4-dalsmc=4; E1b (rdna4dal e1b) run on THIS boot; a passed row-50 trial, a passed row-1 resync and a row-2 PASS with RDNA4N_MODE_F_LOCK_HELD_PROVEN on THIS boot (deny 15 / 23); the F6 / F7 / P1 baselines
  *   (OTG lock usable, FIFO health, underflow clean); the clock hold available (deny 22: the reason is ext.hold_pre, rdna4dal::HoldPre 1 level, 2 no E1b, 3 DAL latch, 4 hold state, 5 mailbox owner busy). The operator keeps the
@@ -375,7 +375,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   underflow; (14) only then release the clock hold (DPPCLK then DISPCLK to the 272 MHz floor). A restore that did not verify never releases (hold state STUCK: the clocks stay up, harmless at 60 Hz; cold power cycle).
  *   Any failure at any step goes to the restore. The watchdog restores registers only; it never touches a clock. New words: verdict 12 CLOCK_LOST (the DFS readback fell under the need while held), verdict 15 HOLD (the release
  *   did not verify), flags 22..24, the hold report in ext (hold_*). The result struct keeps its 512 B; the hold report lives in what 1.4 called ext.reserved. */
-/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of an internal design note and the comments of dcn/modetrial_pure.h):
+/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the comments of dcn/modetrial_pure.h):
  *   A mode trial and a scanout client exclude each other (scanAcquire refuses while a trial is busy; the trial refuses while the plane is acquired). The HELD mode lets a scanout client present WHILE the display runs at 1440p 120 Hz.
  *   Selector 17 RDNA4N_SEL_MODE_HOLD (row 120 only, needs everything `rdna4mode 120` needs): runs the SAME trial on a kernel thread - deny gate, clock hold, blank, lock, writes, unlock, latch, DTO, MSA, unblank, 500 ms settle, the
  *   3 s judged rate window - and, when that is clean (no failure, rate inside 1 %, no underflow judged), does NOT dwell for a fixed time: it publishes the entry snapshot and returns it (verdict RDNA4N_MODE_V_HELD) with the mode UP.

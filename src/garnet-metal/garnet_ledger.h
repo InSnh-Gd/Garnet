@@ -1,5 +1,5 @@
 #pragma once
-// garnet_ledger.h: bundle build 16, app-fix round 1 (an internal design note section P5): pure C, no Foundation, no Vulkan, no IOSurface (host test: test-ledger.c).
+// garnet_ledger.h: bundle build 16, app-fix round 1 (driver contract: pure C, no Foundation, no Vulkan, no IOSurface (host test: test-ledger.c).
 //  (A) THE LIVE-IMPORT LEDGER (Step 0, logging only). One entry per live IOSurface-backed texture: its surface id, the import bytes it stands for, pixel format, plane count, birth time and the
 //      number of command buffers that have touched it and not finished yet. A snapshot gives: live textures, distinct live surface ids, bytes (per texture and per distinct surface), textures
 //      with NO command buffer in flight (a WindowServer that keeps textures nothing draws with is the "held for no reason" signature), and the top 5 groups by (size, pixel format, planes) with the
@@ -99,7 +99,7 @@ static inline int rdna4l_fmt(const rdna4l_snap *s, uint64_t impTotal, const rdna
 
 // ---- (B) the use-count policy (F3) -----------------------------------------------------------------------------------------------
 #define RDNA4UC_INFLIGHT 1   // default: a surface is use-counted only while a command buffer that touched a texture of it is in flight
-#define RDNA4UC_NONE     0   // kill file /private/tmp/rdna4m-nousecount: Apple-identical, never use-counted (diagnosis)
+#define RDNA4UC_NONE     0   // kill file /private/tmp/garnet-nousecount: Apple-identical, never use-counted (diagnosis)
 // killedStat: 1 when the kill file exists. Anything else is the default.
 static inline int rdna4uc_mode(int killedStat) { return killedStat ? RDNA4UC_NONE : RDNA4UC_INFLIGHT; }
 typedef struct { void **s; size_t n, c; } rdna4uc_list;

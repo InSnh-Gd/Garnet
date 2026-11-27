@@ -1,4 +1,4 @@
-// garnet_xlate.h - bundle 14: in-process shader translation for sandboxed applications (an internal design note, sections 1.1-1.7).
+// garnet_xlate.h - bundle 14: in-process shader translation for sandboxed applications (driver design, sections 1.1-1.7).
 // Pure C: no Metal, no Foundation, no IOKit. Host test test-xlate.c compiles this very header and drives the very functions GarnetDevice.m calls; test-xlate-corpus.sh drives the real
 // reader and translator through the real engine over the shader corpus.
 //
@@ -70,7 +70,7 @@
 // isWs        WindowServer: NEVER (it keeps the precompiled spvcache plus the daemon and never loads either library).
 // admitted    the kernel admitted this (class OTHER) process as an allow-listed application.
 // rootAllow   an RDNA4M_ALLOW=1 root tool; it applies only with RDNA4M_TEST_INPROC=1 (this retires the add-air.py seeding root probes needed).
-// killed      /private/tmp/rdna4m-noinproc exists or could not be read (fail closed), read once per process.
+// killed      /private/tmp/garnet-noinproc exists or could not be read (fail closed), read once per process.
 // envDirty    a METAL2VULKAN_* variable is present: several change the translator's output (RELOOPER_MAX_BLOCKS, WHOLE_PART, TIR_ONLY, ...), and the cache is keyed without them.
 static inline int rdna4x_applies(int isWs, int admitted, int rootAllow, int testInproc, int killed, int envDirty) {
     if (isWs) return 0;

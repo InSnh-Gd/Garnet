@@ -1,5 +1,5 @@
 //
-//  disp2.h - build 0.0.631 (multi-monitor track, stage M4d: a TEST PATTERN on the second display; an internal design note, "M4 design" steps 4-9 and "M4b analysis").
+//  disp2.h - build 0.0.631 (multi-monitor track, stage M4d: a TEST PATTERN on the second display; DCN secondary display setup).
 //  The pure half of accel verb 98 `disp2 <op>`: the ops, the boot-arg latch, every register this verb may touch (absolute BAR5 dwords on this card), the step lists of each op (the Linux functions they mirror),
 //  the INSTANCE GUARD, the EDID timing decode and the result layouts. Shared by the kext (dcn/disp2_flow.h + the glue in dcn/dcn.cpp), the CLI (tools/rdna4/native/garnettest.c includes this very file)
 //  and the host test (src/garnet/tests/native_disp2_test.cpp). Plain C99 + C++17: no kernel header.
@@ -24,7 +24,7 @@
 //  2560x1440); `off` now clears the instance's SYMCLK FE bits AFTER the DIG back-end disconnect (Linux: reset_dio_stream_encoder, then disable_symclk_se); and every op reads NINE more registers of the live DP pipe before and after (rdna4d2_dpx_regs:
 //  MPC_OUT0_MUX, MPCC0 TOP / BOT / OPP, HUBP0 DCHUBP_CNTL, DPPCLK0 DTO, DPPCLK_CTRL bit 0, DET0, COMPBUF): any masked change ends the op in RDNA4D2_DP_DISTURBED exactly like the OTG0 / DIG1 checks. READS only: no new writable register.
 //
-//  0.0.635 (multi-monitor, stages M4c / M4d: the monitor B's plane from VRAM; an internal design note, the LAST section "M4c/M4d build spec"): five more ops, ALL instance 2 ONLY and behind the same garnet-disp2 switch:
+//  0.0.635 (multi-monitor, stages M4c / M4d: the monitor B's plane from VRAM; secondary plane bring-up): five more ops, ALL instance 2 ONLY and behind the same garnet-disp2 switch:
 //        op 8 plane    two 2560x1440x4 buffers (A / B: kext-drawn colour bars, VRAM-verified), HUBP2 / DPP2 / MPCC2 programmed from pipe 0's census values (COPY0 steps), the address latched while BLANKED, then unblank
 //        op 9 show     clear the underflow flags, 10 frames, require 0, DPG2 off (the plane is the picture)
 //        op 10 flip    A or B (argument bits 16..23, legal for op 10 alone): SET HIGH, SET LOW, WAIT FLIP_PENDING = 0, read EARLIEST_INUSE
@@ -1396,7 +1396,7 @@ static inline uint32_t rdna4d2_build_planeoff(struct rdna4d2_step *s)
 }
 
 // =====================================================================================================================================================================================================
-// ---- 0.0.655: INSTANCE 1 (the monitor A's) PLANE at 1080p60: ops 8..13 for the monitor A, an internal design note "monitor A (instance 1) plane + framebuffer spec at 1080p60", sections 1 and 3 (the framebuffer side, section 4, is a LATER build).
+// ---- 0.0.655: INSTANCE 1 (the monitor A's) PLANE at 1080p60: ops 8..13 for the monitor A, monitor A 1080p60 plane layout(the framebuffer side, section 4, is a LATER build).
 // The order is the monitor B's (0.0.643 / 0.0.651: clocks, BLANK first and read back, pitch, address, the HUBP clock, the programming, a 2-frame wait, the read-back, then LOCK -> address / MPCC1 / mux / UNBLANK -> UNLOCK, then the post gates);
 // the registers are the pipe-1 twins and EVERY programmed value is an explicit SET with its exact value pinned by the guard (rdna4d1_pin[]): there is NO COPY0 for instance 1 - pipe 0's DLG values are 1440p values, not 1080p ones.
 // The step lists have the SAME SHAPE (step counts and the indices the flow gates on) as the monitor B's, so the flow's index constants (RDNA4D2_PA_I_*, RDNA4D2_LK_I_*, RDNA4D2_PC_I_*, RDNA4D2_PO_I_*, ...) are shared.

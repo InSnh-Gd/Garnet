@@ -1,4 +1,4 @@
-// native_g2_test.cpp - kext 0.0.627 (GPU-apps stage G2: several native client sessions; an internal design note section 1 and section 4 G2): the pure half
+// native_g2_test.cpp - kext 0.0.627 (GPU-apps stage G2: several native client sessions; multi-session policy): the pure half
 // (amd/garnet_multisession_pure.h) driven directly and through a small model of the kernel's session table and in-order ring, the close-disarm rule (amd/native_disp_pure.h), plus
 // source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetNativeClient.cpp, GarnetDriver.cpp, GarnetUserClient.cpp, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \

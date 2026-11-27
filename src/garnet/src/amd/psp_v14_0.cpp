@@ -24,7 +24,7 @@
 //      IOBufferMemoryDescriptor/
 //        IODMACommand               → dropped; every buffer is VRAM and is
 //                                     reached with bar0_* / RBAR2_32
-//      hardcoded VRAM offset k…      → dev.vramBase + k…  (PORTING.md)
+//      hardcoded VRAM offset k…      → dev.vramBase + k…  (kext constraint)
 //      gmc.vram_start                → dev.vramMcBase
 //      mdelay(20) / IOSleep(20)      → IOSleep(20)   (unchanged)
 //      poll_reg / poll_psp_response  → unchanged (amdgpu_regs.h)
@@ -105,7 +105,7 @@ psp_read_vram_start(const DeviceContext &dev)
 // VRAM layout for PSP-accessed buffers. IDENTICAL to the reference's
 // constants; every one of them is used as `dev.vramBase + k…` because VRAM
 // [0, vramBase) here is the UEFI console framebuffer the kernel keeps
-// drawing into. See PORTING.md "VRAM layout".
+// drawing into. Avoid overlapping the active boot framebuffer.
 static constexpr uint64_t kFwPriVRAMOffset  = 0;          // [0, 1MB)
 static constexpr uint64_t kRingVRAMOffset   = 0x100000;   // 1 MB
 static constexpr uint64_t kCmdBufVRAMOffset = 0x104000;   // 1 MB + 16 KB

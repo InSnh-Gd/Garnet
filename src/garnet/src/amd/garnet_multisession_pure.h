@@ -1,5 +1,5 @@
 //
-//  garnet_multisession_pure.h - the PURE half of GPU-apps stage G2 (kext 0.0.627): several native client sessions at once (an internal design note section 1
+//  garnet_multisession_pure.h - the PURE half of GPU-apps stage G2 (kext 0.0.627): several native client sessions at once (driver contract
 //  and section 4, G2). No kernel header is included: tests/native_g2_test.cpp compiles this file and drives the very decision functions the kext calls
 //  (amd/native_s1c.cpp, GarnetNativeClient.cpp).
 //

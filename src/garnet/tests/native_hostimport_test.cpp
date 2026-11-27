@@ -1,4 +1,4 @@
-// native_hostimport_test.cpp - build 0.0.612 (milestone #11 step 11c, an internal design note sections 3 and 4): W4 BoImportHost, selector 21 of ABI 1.9.
+// native_hostimport_test.cpp - build 0.0.612 (milestone #11 step 11c, driver contract: W4 BoImportHost, selector 21 of ABI 1.9.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_hostimport_test.cpp -o /tmp/native_hostimport && /tmp/native_hostimport .
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_ws_open_plant.sh plants breaks)

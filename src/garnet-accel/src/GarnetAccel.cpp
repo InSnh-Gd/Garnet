@@ -1,10 +1,10 @@
 //
 //  GarnetAccel.cpp - the Aux-KC accelerator kext (org.garnet.accel 0.0.8, display name GarnetAccel); 0.0.8 preserves native-open errors at IOService's five-argument entry. 0.0.5 (G6) routes type 'GRNT' to the bring-up kext's native client through the ops table's ABI-3 native_open; 0.0.3 adds the display pipe; 0.0.4 adds the monitor B framebuffer.
-//  (GarnetFramebuffer : IOFramebuffer, an internal design note "M5 build spec": matches ONLY a GarnetDisplayNub with GarnetDisplayIndex 1 (the monitor B) or, since 0.0.6, 2 (the monitor A; two personalities, one class),
+//  (GarnetFramebuffer : IOFramebuffer, GarnetFramebuffer: matches ONLY a GarnetDisplayNub with GarnetDisplayIndex 1 (the monitor B) or, since 0.0.6, 2 (the monitor A; two personalities, one class),
 //  published on demand by the bring-up kext's `fbpublish 2` / `fbpublish 1`, never at boot; it answers from the immutable snapshot of GarnetDisplayOps.h (ABI 2: the per-index geometry) and touches no register).
-//  (GarnetDisplayPipe : IOAccelDisplayPipe, an internal design note section 3.4 + the binding "11h.1 RE facts" section), OFF unless the bring-up kext's ops
+//  (GarnetDisplayPipe : IOAccelDisplayPipe, IOAccelDisplayPipe layout contract), OFF unless the bring-up kext's ops
 //  table is ABI 2 with the display flag (boot-arg garnet-metal-disp=1): with an ABI-1 table or the flag clear it behaves exactly as 0.0.2.
-//  Design: an internal design note (sections 0-3, 5 and the review MUST-FIX 1-7) + the K3 finding: EVERY rebuild of this kext requires a security approval (Allow click) from the user. An
+//  Design: driver contract + the K3 finding: EVERY rebuild of this kext requires a security approval (Allow click) from the user. An
 //  Allow click, so it is THIN and STABLE. Nothing here decides a value: it is the fixed IOAccelerator class graph, the gates (kill switch, the
 //  runtime vtable/layout gate) and vtable-shaped trampolines into the versioned ops table of the bring-up kext (GarnetMetalOps.h). See garnetaccel_pure.h
 //  for what stays here and why.
@@ -210,7 +210,7 @@ public:
 	void _vslot277() override;
 };
 
-// aux 0.0.4 (M5): the monitor B framebuffer (an internal design note "M5 build spec: GarnetFramebuffer for the monitor B", section 2). A plain IOFramebuffer subclass (the SDK's class, size and slot count proven against the running
+// aux 0.0.4 (M5): the monitor B framebuffer (GarnetFramebuffer design). A plain IOFramebuffer subclass (the SDK's class, size and slot count proven against the running
 // kernel by the generated header's static_assert and the layout gates). Exactly these overrides, nothing else: start (184), getVRAMRange (310), enableController (311), setDisplayMode (319), getStartupDisplayMode (322),
 // setAttribute (325), getAttribute (326), getConnectionCount (330), setAttributeForConnection (331), getAttributeForConnection (332), hasDDCConnect (344), getDDCBlock (345) and the pure virtuals getApertureRange (309),
 // getPixelFormats (312), getDisplayModeCount (313), getDisplayModes (314), getInformationForDisplayMode (315), getPixelFormatsForDisplayMode (316), getPixelInformation (317), getCurrentDisplayMode (318). isConsoleDevice (305)
@@ -499,7 +499,7 @@ IOAccelDisplayPipe *GarnetAccelerator::newDisplayPipe() {
 	garnet_trace(GARNET_TR_DISPPIPE, (uint64_t)(uintptr_t)p, ours ? 1u : 0u);
 	return p;
 }
-// aux 0.0.5 (G6, an internal design note "G6 design" section 2): slot 239 of the family (IOGraphicsAccelerator2::newUserClient). Type 'GRNT' is the bring-up kext's native client, attached to THIS accelerator so that a
+// aux 0.0.5 (G6, IOAccelerator user-client routing): slot 239 of the family (IOGraphicsAccelerator2::newUserClient). Type 'GRNT' is the bring-up kext's native client, attached to THIS accelerator so that a
 // sandboxed application (whose profile admits user clients on an IOAccelerator service) can open it. It is decided HERE, before the family's per-PID client limits and its 0x9bc bookkeeping, and an 'GRNT' open NEVER reaches the
 // family (the family would hand an unknown type to newContext and give the caller a generic IOAccelContext2): kill switch off, gate not passed, no usable hook = kIOReturnUnsupported. Every other type is the family's, untouched.
 // The hook returns an IOReturn: it is compared with kIoSuccess (nuc_result), never read as a bool (vhook's "1 = handled" convention does not apply).

@@ -3,7 +3,7 @@
  *
  * Two kinds of check: internal consistency of every row (totals, the OTG register values optc1_program_timing would
  * write, the VSTARTUP bound, the link requirement), and hand-written expectations for three rows taken from the EDID
- * bytes and from notes/DISPLAY-TRACK.md's own T1 predictions (CEA 1080p60 leaves OTG_H_TOTAL 2199 and OTG_V_TOTAL
+ * bytes and from DCN 4.1 CEA timing math (CEA 1080p60 leaves OTG_H_TOTAL 2199 and OTG_V_TOTAL
  * 1124). The refresh column is checked against the module's own dcn41_nominal_refresh_mhz, so the table and the kext
  * arithmetic cannot drift apart.
  */

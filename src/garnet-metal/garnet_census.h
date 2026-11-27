@@ -1,5 +1,5 @@
 #pragma once
-// garnet_census.h: bundle build 18 (app-fix round 2), the unimplemented-selector CENSUS (an internal design note "Unimplemented-selector policy").
+// garnet_census.h: bundle build 18 (app-fix round 2), the unimplemented-selector CENSUS (unimplemented-selector telemetry).
 //
 // WHY. Every selector a client sends that none of our classes (or their Apple superclasses) implements ends in -doesNotRecognizeSelector: and the process dies (Maps: -setVisibilityResultMode:offset:). We do not
 // answer "everything with zero" (zero is the wrong safe value for occlusion, and nil only moves a crash). Instead the +load protocol pass, which already makes our classes CONFORM to Apple's Metal protocols,

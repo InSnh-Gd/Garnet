@@ -116,7 +116,7 @@ void fmCrcEnd();
 // built at start() (liveraster.h rdna4lr_scan_surface; no register is written, no bind() needed). 1 = every read made.
 uint32_t roScanSurface(rdna4_sf_dcn *s);
 
-// build 0.0.603 (native S2a; contract: the "ABI 1.1 addendum" of an internal design note, design an internal design note + Review).
+// build 0.0.603 (native S2a; contract: ABI 1.1 scanout contract).
 // The native scanout path behind the RDNA4N selectors 9..14. All of it needs bind() to have succeeded and a NATIVE boot (Acquire checks the
 // S1b gate), and none of it runs unless a native client calls it. Return values are IOReturn codes (rdna4scan::k*); 0 = success.
 //   LOCK ORDER: the native client's lock (gCliLock) is taken BEFORE the scanout lock, never after; the interrupt handler takes only the
@@ -154,7 +154,7 @@ void modeHoldSessionClosed(uint32_t sess);
 // 0.0.614 (native AGDC, amd/native_agdc_pure.h): true while a row-120 hold is launching or up (the claim to the runner's end). ONE atomic load of each word: no lock, no register, callable from anywhere.
 bool modeHoldActive();
 uint32_t scanGeneration();
-// build 0.0.622 (multi-monitor track, stage M1; dcn/dispread.h, an internal design note): the three instruments behind accel verbs 91 / 92 / 93. Each fills out[0..12] (13 scalars) and returns the
+// build 0.0.622 (multi-monitor track, stage M1; dcn/dispread.h, driver design): the three instruments behind accel verbs 91 / 92 / 93. Each fills out[0..12] (13 scalars) and returns the
 // RDNA4DR_ status (out[0]'s low byte). ddcRead needs bind() (its writes go through the DCN allowlist); dmubRing and dispCensus read through the read-only device attach() built and need nothing else.
 uint32_t ddcRead(uint64_t arg, uint64_t *out, unsigned outCount);
 uint32_t scdcRead(uint64_t arg, uint64_t *out, unsigned outCount);   // 0.0.633: verb 99, READ-ONLY SCDC read over the same DC_I2C engine as ddcRead (same busy flag)

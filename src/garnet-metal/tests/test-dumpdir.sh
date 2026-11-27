@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # test-dumpdir.sh - runs the REAL rdna4_dump_dir_ready() (extracted from GarnetDevice.m) against a scratch dump root. Everything happens inside ONE mktemp dir (prefix-checked before it is removed);
 # every symlink points inside it; the real /tmp/rdna4m is never touched (the root is compiled in with -DRDNA4G_DUMP_DIR).
-#   bundle 14 repair (queue 279, 6 of 8 failed): (1) the test's output buffer was 64 bytes, shorter than a scratch path under $TMPDIR (/var/folders/...), so the helper returned 0 silently before it did anything - it is 512 now (the production buffer, char sub[64] for /tmp/rdna4m/<uid>, is not affected); (2) macOS 27 `ls -le` prints the nobody ACL entry as its UUID, not as user:nobody - both spellings are accepted.
+#   bundle 14 repair (queue 279, 6 of 8 failed): (1) the test's output buffer was 64 bytes, shorter than a scratch path under $TMPDIR (/var/folders/...), so the helper returned 0 silently before it did anything - it is 512 now (the production buffer, char sub[64] for /private/tmp/garnet-xlate/<uid>, is not affected); (2) macOS 27 `ls -le` prints the nobody ACL entry as its UUID, not as user:nobody - both spellings are accepted.
 #   usage: test-dumpdir.sh   (RDNA4_TEST_TMP = parent of the scratch dir, default $TMPDIR, else /private/tmp)
 set -u
 D="$(cd "$(dirname "$0")/.." && pwd)"

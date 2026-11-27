@@ -5,7 +5,7 @@
  * dmub_dcn401.c and dmub_reg.c (GPINT, the inbox1 ring queue/execute/idle wait, fw meta lookup). The bios parser is
  * set up the way the vendored board ROM makes Linux set it up: no digxencodercontrol / setpixelclock /
  * enabledisppowergating / dig1transmittercontrol command tables (their master-table entries are 0, see
- * notes/DISPLAY-DESIGN.md), so amdgpu_atom_parse_cmd_header() fails and every call takes the *_fallback -> DMUB path. */
+ * the DCN 4.1 display register tables), so amdgpu_atom_parse_cmd_header fails and every call takes the *_fallback -> DMUB path. */
 #include "dm_services.h"
 #include "dc.h"
 #include "atomfirmware.h"

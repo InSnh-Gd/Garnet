@@ -430,7 +430,7 @@ static void publishVMFragOn(IOService *svc, const amdgpu::BringupContext &ctx) {
 	}
 }
 
-// NATIVE S1b (0.0.600, an internal design note step S1b + review MUST-FIX 4): rdna4-native=1 asks for the reserved-VMID VM
+// NATIVE S1b (0.0.600, native VM reservation): rdna4-native=1 asks for the reserved-VMID VM
 // self-test at the END of the ladder. It is REFUSED (logged, nothing native runs) when the Apple accelerator experiment, the boot
 // chain, any of the four self-tests (they rewrite CONTEXT1 with RETRY = 1) or the two Apple-only hooks are also armed. Absent (every
 // current config) it reads one boot-arg, finds it 0 and does nothing else: no log line, no property, no register. noinline and
@@ -535,7 +535,7 @@ void GarnetDriver::runStages(uint32_t target) {
 		       "(option B'); MMHUB stays on the flat table");
 	// rdna4-sdma-q1-test=1 (0.0.185): at the END of stage 15, prove whether BAR2
 	// doorbell dword 0x202 reaches SDMA0 QUEUE1, using OUR OWN 4 KiB ring and one
-	// FENCE packet. Open question 1 of notes/re/sdma-takeover-design.md; it must
+	// FENCE packet. SDMA doorbell/fence routing; it must
 	// be answered before `sdmamap` points the engine at Apple's ring, because a
 	// silent takeover failure and a doorbell that does not route look identical.
 	// QUEUE1 is left DISABLED and the scratch ring freed, so this changes nothing
@@ -672,7 +672,7 @@ void GarnetDriver::runStages(uint32_t target) {
 	if (ctx.reached >= amdgpu::BringupStage::SDMAInit) {
 		setProperty("Garnet,SDMACopyTest", ctx.sdmaCopyPassed ? "passed" : "failed");
 		setProperty("Garnet,SDMACopyMismatched", static_cast<uint64_t>(ctx.sdmaCopy.mismatched), 32);
-		// E1 (0.0.418, an internal design note): the SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT.
+		// E1 (0.0.418, driver design): the SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT.
 		// 0.0.657: the SDMAInit stage already applied it right after `sdma_init_full` (before its own copy test and
 		// sweep), so this call is then a logged no-op (gSdmaDccDefaultDone). `rdna4-sdmadcc=0` skips it.
 		rdna4_sdmadcc_default();

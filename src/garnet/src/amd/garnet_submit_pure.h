@@ -1,6 +1,6 @@
 //
 //  garnet_submit_pure.h - the PURE half of native-stack step S1c (kext 0.0.601): the arithmetic and the decisions behind the native
-//  user client (an internal design note). No kernel header is included, so tests/native_s1c_test.cpp compiles this on the
+//  user client (driver design). No kernel header is included, so tests/native_s1c_test.cpp compiles this on the
 //  host Mac and drives the exact functions the kext calls. The hardware/IOKit half is native_s1c.cpp and GarnetNativeClient.cpp.
 //
 //  Contents: return codes, BoCreate placement decisions, GemVa validation and the flag -> PTE table, the VA map (overlap, exact

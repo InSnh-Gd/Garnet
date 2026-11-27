@@ -10,7 +10,7 @@
 
 #if !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// AIR dump for the pipeline-creation overrides (NATIVE-S4-M10 "Shaders": cache miss -> /tmp/rdna4m/<sha256>.air).
+// AIR dump for the pipeline-creation overrides (cache miss -> /private/tmp/garnet-xlate/<sha256>.air).
 // ---------------------------------------------------------------------------------------------------------------
 GARNET_INTERNAL NSString *rdna4_sha256hex(NSData *d) {
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
@@ -30,7 +30,7 @@ __attribute__((constructor)) static void rdna4_cienv_ctor(void) {
     else if (r == RDNA4CE_ALREADY_SET) RDNA4_ONCE("cienv: " RDNA4CE_VAR " is already set in this process (=%s); left alone", getenv(RDNA4CE_VAR));
     else RDNA4_ONCE_WARN("cienv: setenv " RDNA4CE_VAR " failed (errno %d)", errno);
 }
-// 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /tmp/rdna4m/<euid> (0700, a
+// 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /private/tmp/garnet-xlate/<euid> (0700, a
 // real directory owned by the caller, rdna4g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
 // account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (garnet_dumpacl.h); a failed grant is logged and the dump still happens.
 GARNET_INTERNAL int rdna4_dump_dir_ready(char *sub, size_t subn) {
@@ -180,11 +180,11 @@ static int rdna4x_capture_request(NSString *directory, NSString *sha, NSString *
 }
 #if !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Bundle 14: in-process shader translation (an internal design note). The policy, the cache, the crash markers, the reader and the engine are in garnet_xlate.h (host tests test-xlate.c and
+// Bundle 14: in-process shader translation (driver design). The policy, the cache, the crash markers, the reader and the engine are in garnet_xlate.h (host tests test-xlate.c and
 // test-xlate-corpus.sh run that very header); this is the glue. A spvcache miss in an ADMITTED APPLICATION (or an RDNA4M_ALLOW root tool with RDNA4M_TEST_INPROC=1) is translated inside the process by the
 // operating system's own LLVM (the bitcode reader, loaded on the first miss only) and Resources/libgarnetxlate.dylib (the LGPL translator), and installed in the user's cache directory
 // <confstr user cache dir>/org.garnet.xlate/<K>/. WindowServer NEVER applies: it keeps the precompiled spvcache plus the daemon and loads neither library.
-//   /private/tmp/rdna4m-noinproc      exists (or cannot be read) -> in-process translation OFF for the process (read once); the dump + daemon path is then exactly bundle 13's
+//   /private/tmp/garnet-noinproc      exists (or cannot be read) -> in-process translation OFF for the process (read once); the dump + daemon path is then exactly bundle 13's
 //   METAL2VULKAN_*                  any such variable in the environment -> OFF (several change the translator's output; the cache key does not cover them)
 //   RDNA4M_TEST_INPROC=1              (root + RDNA4M_ALLOW=1) -> a root tool translates in process (retires the add-air.py seeding root probes needed)
 //   RDNA4M_TEST_LLVM_LIB=<dylib>      (root + RDNA4M_ALLOW=1) -> that library is the bitcode reader (a second LLVM for host comparisons)
@@ -298,7 +298,7 @@ GARNET_INTERNAL void rdna4x_touch_hit(NSString *path, NSString *sha) {
     pthread_mutex_unlock(&RDNA4XL.mu);
     if (first) { rdna4x_touch(path.fileSystemRepresentation); if ([path hasSuffix:@".spv"]) { NSString *m = [[path stringByDeletingPathExtension] stringByAppendingString:@".meta.json"]; rdna4x_touch(m.fileSystemRepresentation); } }
 }
-// ---- build 18 (P3): linked functions (NATIVE-S8-APPFIX1.md section P3) ----
+// ---- build 18 (P3): linked functions (linked functions) ----
 // A pipeline stage whose descriptor links functions (MTLLinkedFunctions.functions / privateFunctions / groups) is translated TOGETHER with them: garnetxlate's garnetx_translate_linked resolves the entry's direct
 // visible-function references (RenderBox's custom effects, Maps' magenta fragment) to the exact authored dependencies. The cache key is rdna4x_link_sha (entry + sorted dependencies), never the entry's sha alone.
 // The context is per THREAD and per creation call (thread-local, cleared by a cleanup scope): the lookups, the translation request and the hot-swap registration all run on the thread that creates the

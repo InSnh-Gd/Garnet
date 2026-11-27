@@ -655,7 +655,7 @@ int main(void) {
         rdna4df_t q = active(); int u = rdna4df_pick(&q, all); rdna4df_skip_content(&q, u); int u2 = rdna4df_pick(&q, all);
         CHECK("skip: the released slot is free for the next frame at once", u2 >= 0 && q.m6_skip == 1, "picked %d", u2);
     }
-    // ---- bundle 20: HDMI rubberband fix (an internal design note Q3): F1 known scanout surfaces, F2 per-slot supersede marks, F3 re-copy with the noted seq, F4 counters ----
+    // ---- bundle 20: HDMI rubberband fix (HDMI scanout supersede): F1 known scanout surfaces, F2 per-slot supersede marks, F3 re-copy with the noted seq, F4 counters ----
     {
         const uint32_t PS = RDNA4DF_W_PASS, DFN = RDNA4DF_W_DRAW_FINAL, DOT = RDNA4DF_W_DRAW_OTHER, CMP = RDNA4DF_W_DRAW_COMP;
         const uint32_t G_ = PS | DFN, C_ = PS | DOT | CMP;

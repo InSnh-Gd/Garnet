@@ -1391,7 +1391,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (NSUInteger)maxBufferLength                { return (NSUInteger)[self rdna4MemoryCaps].buffer_length; }
 - (uint64_t)recommendedMaxWorkingSetSize     { return [self rdna4MemoryCaps].working_set; }
 - (BOOL)hasUnifiedMemory { return NO; }
-- (BOOL)isHeadless       { return rdna4_headless(); }   // 11b: YES unless /private/tmp/rdna4m-headless-no exists (read once per process)
+- (BOOL)isHeadless       { return rdna4_headless(); }   // 11b: YES unless /private/tmp/garnet-headless-no exists (read once per process)
 - (BOOL)isLowPower       { return NO; }
 - (BOOL)isRemovable      { return NO; }
 #endif

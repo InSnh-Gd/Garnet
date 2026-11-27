@@ -1,6 +1,6 @@
 //
 //  GarnetDisplayNub.hpp - the software nub the Aux-KC framebuffer (GarnetFramebuffer in org.garnet.accel 0.0.4; 0.0.6 adds the monitor A's personality) matches, kext 0.0.652, milestone M5
-//  (an internal design note "M5 build spec: GarnetFramebuffer for the monitor B"; 0.0.658: one nub PER DISPLAY INDEX, "monitor A (instance 1) plane + framebuffer spec at 1080p60" section 4).
+//  (GarnetFramebuffer design; 0.0.658: one nub PER DISPLAY INDEX, "monitor A (instance 1) plane + framebuffer spec at 1080p60" section 4).
 //
 //  GarnetDisplayNub : IOService, attached to the GPU's IOPCIDevice (NOT to GarnetDriver: IOAccelDisplayMachine::start finds a framebuffer only two levels below its provider, so
 //  PCI -> nub -> framebuffer is found and PCI -> GarnetDriver -> nub -> framebuffer is not; M6 needs that), with GarnetDisplayIndex = 1 (the monitor B) or 2 (the monitor A, 0.0.658). It is published ON DEMAND by the accel verb

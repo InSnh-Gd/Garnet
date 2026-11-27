@@ -22,7 +22,7 @@
 //  Deviations from the reference (see also mes_v12_1.cpp's header)
 //  ---------------------------------------------------------------
 //   1. DriverKit IOBufferMemoryDescriptor + IODMACommand pairs →
-//      amdgpu::SysMem (PORTING.md). There is no IOMMU here, so the
+//      amdgpu::SysMem (kext constraint). There is no IOMMU here, so the
 //      SysMem bus address is the host physical address and is NOT a
 //      GPU address: every MES buffer is additionally bound into the
 //      GART (gmc_bind_existing) and `*_bus` holds the resulting MC

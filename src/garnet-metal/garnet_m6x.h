@@ -1,4 +1,4 @@
-/* garnet_m6x.h: bundle build 13 (M6 Stage 1b, an internal design note "Q2: Stage 1b build contract" item 12 and the review items R2, R3, R6): THE MONB'S SCANOUT FROM THE BUNDLE.
+/* garnet_m6x.h: bundle build 13 (M6 Stage 1b, multi-display scanout contract): THE MONB'S SCANOUT FROM THE BUNDLE.
  * BUNDLE 15 (M6 Stage 2, "Stage 2 build contract (monitor A, instance 1)" item 12): the same decisions PER INSTANCE. The state is an array over the kernel instance numbers [DP, monitor A, monitor B]; every constant that was the monitor B's is a field of an
  * rdna4x_desc_t (rdna4x_desc(inst)): the slot size, the plane geometry (and so the copy rectangle), the slot tag, the kill file. The plan / completion functions are THREE-way (DP, monitor A, monitor B) over an enable MASK (bit i = instance i is enabled and
  * not OFF). The monitor A's enable comes from ITS constants and the Acquire's returned geometry (rdna4x_acq_geom_ok), never from the DP's scan query. A surface the table maps to instance i whose size is not geom(i) takes no slot (inst_geom_mismatch).
@@ -7,7 +7,7 @@
  * The scanout state is an array over INSTANCES [DP, monitor B] (instance 0 = the DP display, 2 = the monitor B; the monitor A, instance 1, is Stage 2). Instance 2 is enabled ONLY when ALL hold:
  *   - the kernel reports both latches (scan_query.flags RDNA4N_SCANQ_M6 and RDNA4N_SCANQ_M6FLIP),
  *   - the Mesa exports radv_darwin_rdna4n_call and radv_darwin_rdna4n_bo_handle are present (a bundle on an older dylib keeps instance 2 OFF),
- *   - /private/tmp/rdna4m-noflip2 is absent (the kill switch, polled in the 1 s tick; present = instance 2 is released and stays OFF for the process),
+ *   - /private/tmp/garnet-noflip2 is absent (the kill switch, polled in the 1 s tick; present = instance 2 is released and stays OFF for the process),
  *   - (bundle 15) the geometry is the descriptor's, cross-checked by the Acquire; no longer judged on the DP's query.
  * It is acquired LAZILY, at the first frame the table maps to the monitor B; 3 slots are allocated in visible VRAM and registered (SCANX_REGISTER). If anything fails - the pool, an allocation, a register, the Acquire - instance 2
  * goes OFF, releases what it took, and the DP is untouched.

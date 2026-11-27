@@ -1,6 +1,6 @@
 /*
  *  GarnetMetalOps.h - the ONE interface between Garnet.kext (owner of the GPU, ESP-injected: rebuilds are free) and GarnetAccel.kext
- *  (the IOAccelerator object graph; ANY rebuild requires a security approval (Allow click) from the user), an internal design note section 1 + the K3 finding.
+ *  (the IOAccelerator object graph; ANY rebuild requires a security approval (Allow click) from the user), driver contract
  *  BYTE-IDENTICAL copies live in src/garnet/src/ and src/garnet-accel/src/ (both host tests compare them). Plain C.
  *
  *  RULE: every decision that may change during #9 / #10 lives behind this table in Garnet.kext; the aux kext is a fixed class graph, the gates
@@ -13,7 +13,7 @@
  *  kIOReturnSuccess and stores a pointer to a STATIC const table (valid while Garnet.kext is loaded).
  *
  *  ABI 3 (bring-up 0.0.656 / aux 0.0.5, G6): appends native_open (below) with its own capability bit GARNET_CAP_NATIVE_OPEN. The aux accelerator's newUserClient (slot 239) hands a
- *  type 'GRNT' open to it, so a SANDBOXED application can open the native client on the IOAccelerator service (an internal design note, "G6 design").
+ *  type 'GRNT' open to it, so a SANDBOXED application can open the native client on the IOAccelerator service (IOAccelerator user-client routing).
  */
 #ifndef GARNET_METAL_OPS_H
 #define GARNET_METAL_OPS_H
@@ -99,7 +99,7 @@ struct GarnetMetalOps {
     int   (*vhook)(void *ctx, uint32_t cls, uint32_t slot, void *self, const uint64_t *args, uint32_t nargs, uint64_t *ret);   /*  96 */
     uint64_t caps;                                                        /* 104  GARNET_CAP_*; a hook is used only if its cap bit is set */
     uint64_t reserved1;                                                   /* 112 */
-    /* ---- ABI 2 (bring-up 0.0.613 / aux 0.0.3): the display pipe of #11 (an internal design note, the "11h.1 RE facts" section; route: the aux
+    /* ---- ABI 2 (bring-up 0.0.613 / aux 0.0.3): the display pipe of #11 (IOAccelDisplayPipe layout contract; route: the aux
      * subclass GarnetDisplayPipe of M11H section 3.4). Read ONLY when abi >= 2 AND size >= GARNET_METAL_OPS_V2; an ABI-1 table (120 bytes) means "display off":
      * the aux kext then behaves exactly as aux 0.0.2 (the family's own pipe, the family's own display-machine start). */
     uint32_t disp_flags;                                                  /* 120  GARNET_DISP_F_*; 0 = display off */
