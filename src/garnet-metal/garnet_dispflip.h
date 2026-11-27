@@ -14,7 +14,7 @@
 #define RDNA4DF_MAX_SLOTS 3
 #define RDNA4DF_MAX_SURF 8                         // the scanout-flag table (proxy flag for tentative / latch-off frames) and the nonscanout counters (bundle 20: NOT the supersede bookkeeping any more, which is per in-flight slot)
 #define RDNA4DF_RETRY_MAX_ATTEMPTS 3
-#define RDNA4DF_INCOMPLETE_QUIET_NS (250ull * 1000000ull)
+#define RDNA4DF_INCOMPLETE_QUIET_NS (50ull * 1000000ull)
 #define RDNA4DF_INCOMPLETE_MAX_NS   (2000ull * 1000000ull)
 #define RDNA4DF_SLOT_REUSABLE (1u << 2)   // == RDNA4N_SCANSLOT_REUSABLE (garnet_scanabi.h); the host test checks the equality
 

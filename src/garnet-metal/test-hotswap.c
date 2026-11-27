@@ -16,7 +16,7 @@ static void t_basic(void) {
     CK(rdna4hs_tick(&e, 11 * S, one) == RDNA4HS_NONE); CK(rdna4hs_tick(&e, 12 * S, one) == RDNA4HS_NONE);
     rdna4hs_key_obs both[2] = { mk(1, 400, 10 * S, 1), mk(1, 800, 13 * S, 1) };
     CK(rdna4hs_tick(&e, 13 * S + 100, both) == RDNA4HS_NONE);                   // first sighting: not yet stable
-    CK(rdna4hs_tick(&e, 13 * S + 200000000, both) == RDNA4HS_NONE);             // stable but newest file younger than MIN_AGE
+    CK(rdna4hs_tick(&e, 13 * S + 10000000, both) == RDNA4HS_NONE);              // stable but newest file younger than MIN_AGE
     CK(rdna4hs_tick(&e, 14 * S, both) == RDNA4HS_BUILD); CK(e.st == RDNA4HS_BUILDING); CK(e.attempts == 1);
     CK(rdna4hs_tick(&e, 15 * S, both) == RDNA4HS_NONE);                          // one BUILD per attempt
     CK(rdna4hs_build_done(&e, 1, 15 * S) == 1); CK(e.st == RDNA4HS_SWAPPED);
@@ -35,7 +35,7 @@ static void t_cold_pair_poll_delay(void) {
         if (rdna4hs_tick(&entry, time, current) == RDNA4HS_BUILD) { eligible = time; break; }
     }
     CK(eligible - published >= RDNA4HS_MIN_AGE_NS);
-    CK(eligible - published < RDNA4HS_MIN_AGE_NS + 100000000LL);
+    CK(eligible - published <= 45000000LL);
     printf("cold shader pair ready-to-build latency: %lld ms\n", (long long)((eligible - published) / 1000000LL));
 }
 static void t_partial_file(void) {

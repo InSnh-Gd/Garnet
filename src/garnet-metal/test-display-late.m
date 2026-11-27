@@ -387,7 +387,11 @@ int main(void) { @autoreleasepool {
         testClockNs += 16000000ull;
     }
     CHECK("continuous fallback stays suppressed before the suppression cap", visible == 27);
-    testClockNs += 200000000ull; // past RDNA4DF_INCOMPLETE_MAX_NS
+    for (unsigned step = 0; step < 5; ++step) { // reach RDNA4DF_INCOMPLETE_MAX_NS without exceeding quiet window
+        fallback = submit_frame(nil, compA, YES, NO, NO); [fallback rdna4DispDone:0];
+        f = submit_frame(compA, scanA, NO, NO, NO); [f rdna4DispDone:0];
+        testClockNs += 16000000ull;
+    }
     scanA->value = 52;
     fallback = submit_frame(nil, compA, YES, NO, NO); [fallback rdna4DispDone:0];
     f = submit_frame(compA, scanA, NO, NO, NO); [f rdna4DispDone:0];

@@ -35,29 +35,39 @@ static void pauseUntil(double deadline) {
     if (deadline > current) current = deadline;
 }
 
-static double wake_delay(BOOL more, BOOL rescan, double request_time) {
-    struct { int kq; } scan = {1};
+static double wake_delay(int kq, BOOL more, BOOL *rescan_io, double request_time) {
+    struct { int kq; } scan = {kq};
+    BOOL rescan = *rescan_io;
     current = 0;
     event_time = request_time;
 C
     awk '/BOOL pace = more \|\| rescan;/ { emit = 1 } emit { print } emit && /pauseUntil\(/ { exit }' "$source_file"
     cat <<'C'
+    *rescan_io = rescan;
     return current;
 }
 
 int main(void) {
-    double idle = wake_delay(NO, NO, 1.0);
-    double early = wake_delay(NO, NO, 0.125);
-    double backlog = wake_delay(1, NO, 0.125);
-    double rescan = wake_delay(NO, 1, 0.125);
-    double quiet = wake_delay(NO, NO, 10.0);
-    printf("next scan in seconds: idle wake=%.3f early wake=%.3f backlog=%.3f rescan=%.3f no event=%.3f\n",
-           idle, early, backlog, rescan, quiet);
-    if (idle != 1.0 || early != 0.25 || backlog != 0.25 || rescan != 0.25 || quiet != 5.25) {
-        fputs("FAIL idle request spent part of its own deadline on daemon pacing, or active pacing changed\n", stderr);
+    BOOL r_idle = NO, r_early = NO, r_backlog = NO, r_backlog_ev = NO, r_rescan = YES, r_quiet = NO;
+    BOOL r_nokq_idle = NO, r_nokq_busy = NO;
+    double idle = wake_delay(1, NO, &r_idle, 1.0);
+    double early = wake_delay(1, NO, &r_early, 0.125);
+    double backlog = wake_delay(1, YES, &r_backlog, 0.125);
+    double backlog_ev = wake_delay(1, YES, &r_backlog_ev, 0.0);
+    double rescan = wake_delay(1, NO, &r_rescan, 0.125);
+    double quiet = wake_delay(1, NO, &r_quiet, 10.0);
+    double nokq_idle = wake_delay(-1, NO, &r_nokq_idle, 10.0);
+    double nokq_busy = wake_delay(-1, YES, &r_nokq_busy, 10.0);
+    printf("next scan in seconds: idle wake=%.3f early wake=%.3f backlog=%.3f backlog_ev=%.3f rescan=%.3f no event=%.3f nokq_idle=%.3f nokq_busy=%.3f\n",
+           idle, early, backlog, backlog_ev, rescan, quiet, nokq_idle, nokq_busy);
+    if (idle != 1.0 || !r_idle || early != 0.125 || !r_early ||
+        backlog != 0.0 || r_backlog || backlog_ev != 0.0 || !r_backlog_ev ||
+        rescan != 0.0 || !r_rescan || quiet != 5.0 || r_quiet ||
+        nokq_idle != 0.25 || nokq_busy != 0.0) {
+        fputs("FAIL daemon wake/backlog pacing did not drain immediately or preserve 5s idle fallback\n", stderr);
         return 1;
     }
-    puts("PASS idle vnode wake is immediate after pacing; active scans remain bounded");
+    puts("PASS vnode wakes and backlog slices run immediately; idle fallback waits 5s");
     return 0;
 }
 C
