@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = Path(__file__).with_name("fixtures") / "reflection-trim-abi8.json"
 SOURCES = (
     ROOT / "src/garnet-metal/add-air.py",

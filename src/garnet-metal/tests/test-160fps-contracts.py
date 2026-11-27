@@ -13,7 +13,7 @@ Validates wiring invariants across C++, Objective-C, and pure-C headers offline 
 import pathlib
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 GM = ROOT / "src" / "garnet-metal"
 GK = ROOT / "src" / "garnet" / "src"
 

@@ -18,7 +18,7 @@ def main():
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    fixtures = Path(__file__).resolve().parents[2] / "third-party/metal2vulkan-rdna4/garnetxlate/tests/fixtures"
+    fixtures = Path(__file__).resolve().parents[3] / "third-party/metal2vulkan-rdna4/garnetxlate/tests/fixtures"
     entry = (fixtures / "constant_helper_kernel.ll").read_bytes()
     helper = (fixtures / "constant_helper_body.ll").read_bytes()
     library = C.CDLL(str(args.translator.resolve()))

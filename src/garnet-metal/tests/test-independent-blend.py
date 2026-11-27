@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 
-backend = Path(__file__).with_name('garnet_backend.m').read_text()
+backend = (Path(__file__).resolve().parent.parent / 'garnet_backend.m').read_text()
 features = re.search(r'VkPhysicalDeviceFeatures ef = \{[^}]+\};', backend)[0]
 create_info = re.search(r'VkDeviceCreateInfo dci = \{[^}]+\};', backend)[0]
 test = r'''

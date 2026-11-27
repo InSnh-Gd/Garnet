@@ -1062,7 +1062,7 @@ static void test_source_pins(void) {
     CHECK(strstr(sr, "RDNA4RTR_MTL_FN_TYPE_INTERSECTION") == NULL);
     free(sr);
 
-    char *live = slurp_file("src/garnet-metal/test-metal3-mesh-shaders.m");
+    char *live = slurp_file("src/garnet-metal/tests/test-metal3-mesh-shaders.m");
     if (!live) live = slurp_file("test-metal3-mesh-shaders.m");
     CHECK(live != NULL);
     const char *live_pins[] = {
