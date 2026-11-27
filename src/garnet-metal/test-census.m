@@ -1,8 +1,8 @@
 // test-census.m: the unimplemented-selector census (build 18, garnet_census.h) and the vetted-list policy.
 // Build/run (from this directory):  clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -o /tmp/test-census test-census.m && /tmp/test-census .      (argv[1] = the directory holding GarnetDevice.m)
 //   1. the scan itself, on a FAKE protocol (a required method, an optional one, an inherited one, and a method the class gets from its superclass): exactly the missing ones are reported, required ones marked '!'.
-//   2. the policy pins on GarnetDevice.m: the census runs from +load over all the Metal protocols the bundle's classes claim, is logged once by a process that got a device, the vetted list is exactly the one
-//      selector the evidence names, it is a no-op with a stated reason, and there is NO blanket handler (no forwardInvocation / methodSignatureForSelector / resolveInstanceMethod answers).
+//   2. the policy pins on GarnetDevice.m: the census runs from +load over all the Metal protocols the bundle's classes claim, is logged once by a process that got a device, the retired build-18
+//      setFragmentVisibleFunctionTable:atBufferIndex: vetted no-op is replaced by real MTLVisibleFunctionTable bindings with no vetted no-op stubs left, and there is NO blanket handler (no forwardInvocation / methodSignatureForSelector / resolveInstanceMethod answers).
 #import <Foundation/Foundation.h>
 #include "garnet_census.h"
 
@@ -89,8 +89,12 @@ int main(int argc, char **argv) { @autoreleasepool {
         NSString *iab = ia.location != NSNotFound ? [src substringWithRange:NSMakeRange(ia.location, MIN((NSUInteger)2600, src.length - ia.location))] : @"";
         NSRange dec = [iab rangeOfString:@"return nil;"], cal = [iab rangeOfString:@"rdna4_census_log();"];
         CHECK("pin: only a process that was NOT declined logs the census (the call comes after the decline's return)", dec.location != NSNotFound && cal.location != NSNotFound && dec.location < cal.location);
-        CHECK("pin: the vetted list is exactly ONE selector, setFragmentVisibleFunctionTable:atBufferIndex:", count(src, @"- (void)setFragmentVisibleFunctionTable:(id)t atBufferIndex:(NSUInteger)i {") == 1 && count(src, @"VisibleFunctionTable") >= 1 && count(src, @"- (void)setVertexVisibleFunctionTable") == 0 && count(src, @"- (void)setVisibleFunctionTable") == 0);
-        CHECK("pin: the vetted selector is a no-op with a stated reason, logged once", [src containsString:@"RDNA4_ONCE(\"setFragmentVisibleFunctionTable:atBufferIndex: ignored (vetted no-op: pipelines that call through a function table are refused at creation)\")"]);
+        CHECK("pin: VisibleFunctionTable selectors are real implementations on render and compute encoders",
+              count(src, @"- (void)setFragmentVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {") == 1 &&
+              count(src, @"- (void)setVertexVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {") == 1 &&
+              count(src, @"- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atBufferIndex:(NSUInteger)i {") == 1);
+        CHECK("pin: retired build-18 vetted no-op stub is removed (no silent vetted no-op selectors remain)",
+              count(src, @"vetted no-op") == 0 && count(src, @"setFragmentVisibleFunctionTable:atBufferIndex: ignored") == 0);
         CHECK("pin: NO blanket handler: no forwardInvocation / methodSignatureForSelector / resolveInstanceMethod / forwardingTargetForSelector", count(src, @"forwardInvocation:") == 0 && count(src, @"methodSignatureForSelector:") == 0 && count(src, @"resolveInstanceMethod:") == 0 && count(src, @"forwardingTargetForSelector:") == 0);
         CHECK("pin: everything else keeps the crash, logged first (RDNA4_DNR on every encoder and pipeline class, the device logs too)", count(src, @"RDNA4_DNR(RDNA4RenderEncoder)") == 1 && count(src, @"RDNA4_DNR(RDNA4ComputeEncoder)") == 1 && count(src, @"RDNA4_DNR(RDNA4BlitEncoder)") == 1 && count(src, @"RDNA4_DNR(RDNA4CommandBuffer)") == 1 && [src containsString:@"UNRECOGNIZED selector %{public}s"]);
         CHECK("pin: RDNA4_DNR still ends in the standard exception (no swallowing)", [src containsString:@"RDNA4LOG(\"UNRECOGNIZED selector %s on \" #cls, sel_getName(sel)); \\\n        [super doesNotRecognizeSelector:sel]; }"]);
