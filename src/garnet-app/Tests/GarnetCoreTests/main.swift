@@ -766,8 +766,17 @@ struct GarnetCoreTestsRunner {
             "vendor-id" = <02100000>
             "device-id" = <90750000>
             "class-code" = <00000300>
-            "model" = "AMD Radeon RX 9060 XT"
+            "model" = <"AMD Radeon RX 9060 XT">
         """
+        check("SystemEnv decodes quoted OSData model", env.readPCIGPUs().first?.model == "AMD Radeon RX 9060 XT")
+        mock.pciGPUsIoreg = """
+        +-o PEG0@1  <class IOPCIDevice>
+            "vendor-id" = <02100000>
+            "device-id" = <90750000>
+            "class-code" = <00000300>
+            "model" = <414d4420 52616465 6f6e2052 58203930 36302058 5400>
+        """
+        check("SystemEnv decodes hex OSData model", env.readPCIGPUs().first?.model == "AMD Radeon RX 9060 XT")
 
         // Blocked: macOS 15.x, arm64, VM
         mock.productVersion = "15.7.1"
@@ -1027,6 +1036,13 @@ struct GarnetCoreTestsRunner {
         check("GarnetPCIBarCompat.kext NEVER placed in /Library/Extensions", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/GarnetPCIBarCompat.kext").path))
         check("Vulkan ICD omitted by default", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Vulkan/icd.d/radeon_icd.x86_64.json").path))
         check("GarnetMetal.bundle extracted", fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib").path))
+        check("Installer enforces go-w,a+rX (o+r) permissions on GarnetMetal.bundle and kexts",
+              mock.calls.contains(where: {
+                  $0.exe == "/bin/chmod"
+                  && $0.args.count == 5
+                  && $0.args[0] == "-R" && $0.args[1] == "go-w,a+rX"
+                  && $0.args[4].hasSuffix("/Library/GPUBundles/GarnetMetal.bundle")
+              }))
         check("Legacy 0.1.0 AMDRadeonRDNA4MTLDriver.bundle retired", !fm.fileExists(atPath: legacyMtlBundleURL.path))
 
         // Denylist persistence + upgrade test
@@ -1337,13 +1353,17 @@ struct GarnetCoreTestsRunner {
               && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")
 
         let killText = OpenCoreValidator.emergencyKillSwitchesText()
-        check("OpenCoreValidator emergencyKillSwitchesText documents all Stage 2 and Stage 3 kill-switches",
+        check("OpenCoreValidator emergencyKillSwitchesText documents all Stage 2, Stage 3, and recovery kill-switches",
               killText.contains("garnet-irq-wait=0")
               && killText.contains("garnet-vbl-irq=0")
               && killText.contains("garnet-dpms=0")
               && killText.contains("garnet-gfx-cg=0")
               && killText.contains("garnet-det0=0")
-              && killText.contains("garnet-uclk-pin=1"))
+              && killText.contains("garnet-uclk-pin=1")
+              && killText.contains("garnet-webkitgpu=0")
+              && killText.contains("garnet-hpd-recover=0")
+              && killText.contains("garnet-idle-dpm=0")
+              && killText.contains("garnet-gfxoff=0"))
     }
 
     static func runOptionalReal25G332Checks() throws {

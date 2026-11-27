@@ -579,6 +579,10 @@ public enum OpenCoreValidator {
           - `garnet-gfx-cg=0`       Disables GFX12 CGCG/CGLS/MGCG/FGCG clock gating (leaves hardware reset defaults).
           - `garnet-det0=0`         Disables single-pipe DCN41 DET0 CRB expansion (keeps UEFI 192 KiB DET0).
           - `garnet-uclk-pin=1`     Forces GDDR6 UCLK pinned at top DPM clock (disables DET0-guarded UCLK unpinning).
+          - `garnet-webkitgpu=0`    Disables Garnet.kext's version-independent _mac_file_check_mmap Safari WebKit.GPU hook.
+          - `garnet-hpd-recover=0`  Disables automatic DCN 4.0.1 DisplayPort HPD & link-loss recovery retraining.
+          - `garnet-idle-dpm=0`     Disables activity-driven SMU GFXCLK idle governor (keeps SMUPowerState::Auto).
+          - `garnet-gfxoff=0`       Disables SMU GFXOFF power-gating and its refcounted GC MMIO guard.
         """
     }
 }

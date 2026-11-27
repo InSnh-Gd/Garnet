@@ -512,10 +512,6 @@ public enum SystemDiskInstaller {
                         throw SystemInstallError.transactionFailed("chown root:wheel \(p) failed: \(ch.stderr)")
                     }
                 }
-                let cm = env.runner.run("/bin/chmod", ["-R", "go-w", garnetDst.path, accelDst.path, metalDst.path])
-                if cm.exitCode != 0 {
-                    throw SystemInstallError.transactionFailed("chmod go-w failed: \(cm.stderr)")
-                }
                 for ld in ["com.garnet.native.plist", "com.garnet.native-translate.plist"] {
                     try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: env.url(forSystemPath: "\(launchDaemonsDir)/\(ld)").path)
                 }
@@ -527,6 +523,11 @@ public enum SystemDiskInstaller {
                 if chLog.exitCode != 0 {
                     throw SystemInstallError.transactionFailed("chown nobody:nobody \(GarnetPaths.translateLogsDir) failed: \(chLog.stderr)")
                 }
+            }
+            // Enforce world-readable o+rX (required by WebKit.GPUProcess.sb) and non-writable go-w on kexts & Metal bundle.
+            let cm = env.runner.run("/bin/chmod", ["-R", "go-w,a+rX", garnetDst.path, accelDst.path, metalDst.path])
+            if cm.exitCode != 0 {
+                throw SystemInstallError.transactionFailed("chmod go-w,a+rX failed: \(cm.stderr)")
             }
             try fm.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: env.url(forSystemPath: GarnetPaths.xlateDumpDir).path)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: env.url(forSystemPath: GarnetPaths.spvCacheDir).path)

@@ -235,7 +235,14 @@ public struct HostEnvironment: Sendable {
                 if rhs.hasPrefix("\"") && rhs.hasSuffix("\"") && rhs.count >= 2 {
                     rhs = String(rhs.dropFirst().dropLast())
                 } else if let lt = rhs.firstIndex(of: "<"), let gt = rhs.firstIndex(of: ">"), lt < gt {
-                    rhs = String(rhs[rhs.index(after: lt)..<gt])
+                    let inner = String(rhs[rhs.index(after: lt)..<gt]).trimmingCharacters(in: .whitespaces)
+                    if inner.hasPrefix("\"") && inner.hasSuffix("\"") && inner.count >= 2 {
+                        rhs = String(inner.dropFirst().dropLast())
+                    } else if let decoded = decodeASCIIHexData(inner) {
+                        rhs = decoded
+                    } else {
+                        rhs = inner
+                    }
                 }
                 curModel = rhs
             } else if trimmed.contains("\"assigned-addresses\""), let lt = trimmed.firstIndex(of: "<"), let gt = trimmed.firstIndex(of: ">"), lt < gt {
@@ -258,6 +265,22 @@ public struct HostEnvironment: Sendable {
         }
         flushCurrent()
         return gpus
+    }
+
+    private func decodeASCIIHexData(_ raw: String) -> String? {
+        let hex = raw.replacingOccurrences(of: " ", with: "")
+        guard !hex.isEmpty, hex.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            let next = hex.index(idx, offsetBy: 2)
+            guard let b = UInt8(hex[idx..<next], radix: 16) else { return nil }
+            if b == 0 { break }
+            bytes.append(b)
+            idx = next
+        }
+        guard !bytes.isEmpty, let s = String(bytes: bytes, encoding: .utf8) else { return nil }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func parseLEDWord(from line: String) -> UInt32? {
