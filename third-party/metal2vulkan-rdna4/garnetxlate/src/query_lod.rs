@@ -92,6 +92,10 @@ impl RDNA4xBackendCapabilities {
         self.flags & GARNETX_CAP_RT_CURVES != 0
     }
 
+    pub(crate) fn rt_motion(self) -> bool {
+        self.flags & GARNETX_CAP_RT_MOTION_BLUR != 0
+    }
+
     pub(crate) fn replay(self) -> QueryLodReplay {
         if self.subgroup_size >= 4
             && self.subgroup_supported_stages & 0x10 != 0
@@ -473,6 +477,7 @@ fn translate_bytes_with_capabilities(
         capabilities.emulated_mesh_payload(),
         capabilities.rt_primitive_data(),
         capabilities.rt_curves(),
+        capabilities.rt_motion(),
         capabilities.native_int64(),
         capabilities.raster_sample_count(),
     )?;

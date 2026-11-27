@@ -19,6 +19,17 @@ they do not establish physical RDNA4 GPU execution or complete Tier 2
 acceptance. Runtime capability/execution gating stays controlled by the native
 bundle and compatibility runner.
 
+0089-metal3-rt-motion-blur.patch lowers Metal 3 primitive and instance motion blur
+ray tracing (`GARNETX_CAP_RT_MOTION_BLUR`) in `src/native/ray_query_motion.rs`,
+`src/native/ray_query_air.rs`, `src/native/mod.rs`, `src/passes/mod.rs`,
+`src/lib.rs`, `src/linked_functions.rs`, `src/native/emitter/body/core_inst.rs`,
+and `src/native/ir/mod.rs`. It supports both `air.intersect.*` and
+`air.*_intersection_query.*` families with `primitive_motion` and/or
+`instance_motion`, interpolating motion keyframes (including cubic/SRT
+motion-instance transforms and Clamp/Vanish borders) via dual-slot traversal
+and software Möller-Trumbore / motion-AABB checks when traversing motion-flagged
+acceleration structures.
+
 0082-metal3-renderbox-visible-ref-trailing-ptr-params.patch relaxes the direct
 visible-function reference signature check in `src/linked_functions.rs`
 (`rewrite_visible_reference_stubs` / `visible_ref_params_compatible`) to accept

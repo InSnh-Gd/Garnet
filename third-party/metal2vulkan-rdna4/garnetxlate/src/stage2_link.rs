@@ -444,6 +444,8 @@ pub fn translate_bytes_stage3(
         caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data);
     linkage.runtime_rt_curves =
         caps.is_some_and(RDNA4xBackendCapabilities::rt_curves);
+    linkage.runtime_rt_motion =
+        caps.is_some_and(RDNA4xBackendCapabilities::rt_motion);
 
     let (san_ll, vft_info, ift_info) =
         metal2vulkan::specialize_linked_module_with_tables(&san_entry, stage, &linkage)?;
@@ -468,6 +470,9 @@ pub fn translate_bytes_stage3(
     }
     if caps.is_some_and(RDNA4xBackendCapabilities::rt_curves) {
         options = options.with_rt_curves();
+    }
+    if caps.is_some_and(RDNA4xBackendCapabilities::rt_motion) {
+        options = options.with_rt_motion();
     }
     if caps.is_some_and(RDNA4xBackendCapabilities::native_int64) {
         options = options.with_native_int64();

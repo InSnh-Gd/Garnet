@@ -667,7 +667,7 @@ index 909f50d..3f48539 100644
  
      // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
      for slot in commit_aabb_slots {
-@@ -2138,6 +2442,905 @@ fn append_prim_data_lookup_support(out: &mut String) {
+@@ -2138,6 +2442,904 @@ fn append_prim_data_lookup_support(out: &mut String) {
      }
  }
  
@@ -1312,8 +1312,7 @@ index 909f50d..3f48539 100644
 +             \x20 %hit_next = select i1 %cb_take, i32 1, i32 %h1\n\
 +             \x20 %s_next = select i1 %cb_take, float %cb, float %s1\n\
 +             \x20 %bu_next = select i1 %cb_take, float %ub_cl, float %u1\n\
-+             \x20 br label %loop_latch\n\"
-+        );
++             \x20 br label %loop_latch\n\
 +             \n\
 +             loop_latch:\n\
 +             \x20 %step_next = add i32 %step, 1\n\
