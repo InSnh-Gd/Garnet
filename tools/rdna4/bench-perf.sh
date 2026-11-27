@@ -12,11 +12,11 @@ export LC_ALL=C
 
 usage() {
     cat <<'EOF'
-Usage: bench-perf.sh <label> [--modes "60 160"] [--idle-secs 15] [--host user@ip] [--key path]
+Usage: bench-perf.sh <label> --host user@ip [--modes "60 160"] [--idle-secs 15] [--key path]
   <label>           Run label (e.g. stage1-baseline, stage1-post, stage2-post)
   --modes           Space-separated refresh rates to sample (default: "60 160")
   --idle-secs       Idle sampling duration per mode in seconds (default: 15)
-  --host            SSH target (default: ${RDNA4_TEST_HOST:-${RDNA4_SSH_TARGET:-insnh-gd@172.29.5.214}})
+  --host            SSH target (required, or set GARNET_TEST_HOST / RDNA4_TEST_HOST / RDNA4_SSH_TARGET)
   --key             SSH key path (default: ${RDNA4_SSH_KEY:-$HOME/.ssh/id_ed25519})
 EOF
 }
@@ -30,7 +30,7 @@ LABEL=$1
 shift
 MODES="60 160"
 IDLE_SECS=15
-HOST="${RDNA4_TEST_HOST:-${RDNA4_SSH_TARGET:-insnh-gd@172.29.5.214}}"
+HOST="${GARNET_TEST_HOST:-${RDNA4_TEST_HOST:-${RDNA4_SSH_TARGET:-}}}"
 SSH_KEY="${RDNA4_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 
 while [ "$#" -gt 0 ]; do
@@ -42,6 +42,8 @@ while [ "$#" -gt 0 ]; do
         *) echo "bench-perf.sh: unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+[ -n "$HOST" ] || { echo "bench-perf.sh: missing SSH target (pass --host user@ip or set GARNET_TEST_HOST)" >&2; usage >&2; exit 2; }
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate $C64_LAYOUT_OUT/IOAccelFamily2_decl.h (+ slots.json) from $C64_LAYOUT_OUT/model.json (written by dump_vtables.py).
+"""Generate $GARNET_LAYOUT_OUT/IOAccelFamily2_decl.h (+ slots.json) from $GARNET_LAYOUT_OUT/model.json (written by dump_vtables.py).
 
 For every IOAcceleratorFamily2 class (and IOAccelerator from IOGraphicsFamily) the header
 declares, in vtable order, exactly the virtual methods the class INTRODUCES beyond its parent:
@@ -14,7 +14,7 @@ proves their slot counts equal the kernel's. Nothing is hand-typed: run dump_vta
 import json, os, re, sys
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, here)
-from kcmod import OUT   # regenerating into a different C64_LAYOUT_OUT lets you diff two runs
+from kcmod import OUT   # regenerating into a different GARNET_LAYOUT_OUT lets you diff two runs
 import dump_vtables as D
 import exports as X
 

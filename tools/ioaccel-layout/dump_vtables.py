@@ -3,12 +3,12 @@
 IOAccelerator / IOService / IORegistryEntry / OSObject / OSMetaClassBase out of the
 System/Boot KCs) into vtables/<Class>.tsv, generated/model.json and summary.md.
 
-Inputs (read only): $C64_WORK/kexts/{com.apple.iokit.IOAcceleratorFamily2,
-com.apple.driver.AppleParavirtGPU}, $C64_WORK/kc/{System,Boot}KernelExtensions.kc (see kcmod.py).
-Outputs: $C64_LAYOUT_OUT/{vtables/*.tsv, model.json, paravirt_overrides.tsv, summary.md}. Apple-derived: do not publish.
+Inputs (read only): $GARNET_KC_WORK/kexts/{com.apple.iokit.IOAcceleratorFamily2,
+com.apple.driver.AppleParavirtGPU}, $GARNET_KC_WORK/kc/{System,Boot}KernelExtensions.kc (see kcmod.py).
+Outputs: $GARNET_LAYOUT_OUT/{vtables/*.tsv, model.json, paravirt_overrides.tsv, summary.md}. Apple-derived: do not publish.
 Slot N of a vtable sits at <vtable symbol> + 16 + 8*N; the 64-bit value is a chained
 fixup (see kcmod.py): target = raw & 0x3FFFFFFF, cache level = bits 30-31.
-Usage: C64_WORK=... dump_vtables.py
+Usage: GARNET_KC_WORK=... dump_vtables.py
 """
 import json, os, re, sys
 here = os.path.dirname(os.path.abspath(__file__))

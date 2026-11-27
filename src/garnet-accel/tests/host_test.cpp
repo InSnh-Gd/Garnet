@@ -510,9 +510,9 @@ static void a8_framebuffer(const std::string &root) {
     for (const char *t : { "registerForInterruptType", "unregisterInterrupt", "setInterruptState", "getNotificationSemaphore" }) expect(decl.find(t) == std::string::npos && src.find(std::string("GarnetFramebuffer::") + t) == std::string::npos, (std::string("the interrupts are super's: ") + t).c_str());
     expect(decl.find("virtual") == std::string::npos, "the leaf declares no new virtual");
     // the slot numbers, against the KC's IOFramebuffer vtable listing (ioaccel-layout/vtables/IOFramebuffer.tsv: idx, ..., demangled)
-    { const char *layout = std::getenv("C64_LAYOUT_OUT");
+    { const char *layout = std::getenv("GARNET_LAYOUT_OUT");
       std::string tsv = slurp((layout ? std::string(layout) : root + "/../../tools/ioaccel-layout/layout-out") + "/vtables/IOFramebuffer.tsv"); if (tsv.empty()) tsv = slurp(root + "/ioaccel/IOFramebuffer.tsv");     // the plant scratch tree carries a copy
-      if (tsv.empty()) std::printf("NOTE: IOFramebuffer.tsv not readable in C64_LAYOUT_OUT/vtables\n");
+      if (tsv.empty()) std::printf("NOTE: IOFramebuffer.tsv not readable in GARNET_LAYOUT_OUT/vtables\n");
       else {
         std::map<int, std::pair<std::string, bool>> row; std::istringstream is(tsv); std::string ln;
         while (std::getline(is, ln)) { if (ln.empty() || ln[0] == '#') continue; std::vector<std::string> f; size_t a = 0; while (true) { const size_t t = ln.find('\t', a); f.push_back(ln.substr(a, t == std::string::npos ? std::string::npos : t - a)); if (t == std::string::npos) break; a = t + 1; } if (f.size() >= 7) row[atoi(f[0].c_str())] = { f[6], f[3] == "PURE" }; }

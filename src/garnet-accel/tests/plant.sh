@@ -16,7 +16,7 @@ fresh() {
   cp -R "$HERE/src" "$SCR/src"; cp -R "$HERE/gates" "$SCR/gates"; mkdir -p "$SCR/build/gen"; cp "${BUILD:-$HERE/build}/gen/garnet_tramp.inc" "$SCR/build/gen/" 2>/dev/null
   cp "$HERE/Info.plist" "$HERE/Makefile" "$SCR/"
   cp "$HERE/tests/host_test.cpp" "$SCR/tests/"
-  cp "$HERE/INSTALL.md" "$SCR/"; mkdir -p "$SCR/ioaccel"; cp "${C64_LAYOUT_OUT:-$HERE/../../tools/ioaccel-layout/layout-out}/vtables/IOFramebuffer.tsv" "$SCR/ioaccel/"     # aux 0.0.4: the INSTALL.md pins and the KC vtable listing the framebuffer tests read
+  cp "$HERE/INSTALL.md" "$SCR/"; mkdir -p "$SCR/ioaccel"; cp "${GARNET_LAYOUT_OUT:-$HERE/../../tools/ioaccel-layout/layout-out}/vtables/IOFramebuffer.tsv" "$SCR/ioaccel/"     # copy INSTALL.md pins and KC vtable listing for framebuffer tests
 }
 build_run() {
   local out
