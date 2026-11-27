@@ -82,7 +82,7 @@ public enum PreflightChecker {
             let names = gpus.map { "\($0.model) [\($0.pciIDString)]" }.joined(separator: ", ")
             gpuDetail = "Verified Navi 44 (1002:7590) present (\(names))"
         } else if hasNavi48 {
-            gpuDetail = "Unsupported/unvalidated Navi 48 GPU detected (\(gpus.map { $0.pciIDString }.joined(separator: ", "))); Release 1 supports Navi 44 (1002:7590) only"
+            gpuDetail = "Unsupported/unvalidated Navi 48 GPU detected (\(gpus.map { $0.pciIDString }.joined(separator: ", "))); this release supports Navi 44 (1002:7590) only"
         } else {
             gpuDetail = "No AMD Radeon RX 9060 XT (1002:7590) found (detected: \(gpus.isEmpty ? "none" : gpus.map { $0.pciIDString }.joined(separator: ", ")))"
         }

@@ -266,7 +266,7 @@ final class GarnetAppModel: ObservableObject {
                         pErr = "\(error)"
                     }
                 } else {
-                    pErr = "Embedded Release 1 payload not found in application bundle."
+                    pErr = "Embedded driver payload not found in application bundle."
                 }
                 let st = DiagnosticsManager.collectStatus(env: currentEnv)
                 let dl = (try? DenylistManager.load(env: currentEnv)) ?? []

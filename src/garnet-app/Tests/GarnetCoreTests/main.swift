@@ -418,7 +418,7 @@ struct GarnetCoreTestsRunner {
         let sysKCURL = kcDir.appendingPathComponent("SystemKernelExtensions.kc")
         try sysKCData.write(to: sysKCURL)
 
-        // Compute layout fingerprint and assemble full synthetic Release 1 payload
+        // Compute layout fingerprint and assemble full synthetic release payload
         let tempFP = LayoutFingerprint(
             schema: "garnet-layout-fingerprint-v1",
             arch: "x86_64",

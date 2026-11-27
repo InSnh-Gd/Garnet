@@ -663,7 +663,7 @@ class BuildIdentityTests(unittest.TestCase):
         (payload / "LICENSE.amdgpu").write_text(saved_lic)
         self._write_sha256sums(payload)
 
-        # Top-level duplicate GarnetAccel.kext must fail in Release 1 layout
+        # Top-level duplicate GarnetAccel.kext must fail in release layout
         make_kext(payload / "GarnetAccel.kext", "org.garnet.accel", "GarnetAccel", "0.0.8")
         self._write_sha256sums(payload)
         self.assertNotEqual(self.run_cli("verify-release-payload", str(payload)).returncode, 0)
