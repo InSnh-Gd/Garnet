@@ -1645,7 +1645,7 @@ RDNA4_DNR(RDNA4SparseHeap)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)td {
     NSError *e = nil;
     RDNA4SparseTexture *t = rdna4_sparse_texture_new(_dev, td, self, &e);
-    if (!t) RDNA4LOG("sparseHeap newTextureWithDescriptor NIL: %s", e.localizedDescription.UTF8String);
+    if (!t) RDNA4LOG_WARN("sparseHeap newTextureWithDescriptor NIL: %s", e.localizedDescription.UTF8String);
     return t;
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o {
@@ -1730,7 +1730,7 @@ GARNET_INTERNAL __attribute__((unused)) id rdna4_sparse_heap_new(id dev, MTLHeap
     NSError *localErr = nil;
     RDNA4SparseHeap *h = [[RDNA4SparseHeap alloc] initWithDevice:dev descriptor:d error:&localErr];
     if (!h) {
-        RDNA4LOG("newHeapWithDescriptor(Sparse) NIL: %s", localErr.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("newHeapWithDescriptor(Sparse) NIL: %s", localErr.localizedDescription.UTF8String);
         if (err) *err = localErr;
     }
     return h;
@@ -1956,12 +1956,12 @@ GARNET_INTERNAL __attribute__((unused)) id rdna4_sparse_heap_new(id dev, MTLHeap
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)slice
             withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
     (void)r; (void)lvl; (void)slice; (void)bytes; (void)bpr; (void)bpi;
-    RDNA4LOG("replaceRegion: refused on Private sparse texture %p", (__bridge void *)self);
+    RDNA4LOG_WARN("replaceRegion: refused on Private sparse texture %p", (__bridge void *)self);
 }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
       fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)slice {
     (void)dst; (void)bpr; (void)bpi; (void)r; (void)lvl; (void)slice;
-    RDNA4LOG("getBytes: refused on Private sparse texture %p", (__bridge void *)self);
+    RDNA4LOG_WARN("getBytes: refused on Private sparse texture %p", (__bridge void *)self);
 }
 
 - (BOOL)rdna4ValidateRegions:(const rdna4sp_region *)regions mipLevels:(const uint64_t *)mips

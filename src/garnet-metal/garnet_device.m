@@ -577,13 +577,19 @@ GARNET_INTERNAL NSData *rdna4_function_reflection_data(id function) {
     for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         Protocol *p = objc_getProtocol(names[i]);
         BOOL added = p ? class_addProtocol(self, p) : NO;
-        os_log(OS_LOG_DEFAULT, "GarnetMetal: +load protocol %{public}s found %d added %d", names[i], p != nil, added);
+        if (!p || (!added && !class_conformsToProtocol(self, p)))
+            os_log_error(rdna4_oslog(), "GarnetMetal: +load protocol %{public}s found %d added %d", names[i], p != nil, added);
+        else if (rdna4_verbose_log())
+            os_log(rdna4_oslog(), "GarnetMetal: +load protocol %{public}s found %d added %d", names[i], p != nil, added);
     }
     const char *bnames[] = { "MTLBuffer", "MTLResource" };   // RDNA4Buffer conformance (no compile-time adoption)
     for (unsigned i = 0; i < sizeof(bnames) / sizeof(bnames[0]); i++) {
         Protocol *p = objc_getProtocol(bnames[i]);
         BOOL added = p ? class_addProtocol([RDNA4Buffer class], p) : NO;
-        os_log(OS_LOG_DEFAULT, "GarnetMetal: +load RDNA4Buffer protocol %{public}s found %d added %d", bnames[i], p != nil, added);
+        if (!p || (!added && !class_conformsToProtocol([RDNA4Buffer class], p)))
+            os_log_error(rdna4_oslog(), "GarnetMetal: +load RDNA4Buffer protocol %{public}s found %d added %d", bnames[i], p != nil, added);
+        else if (rdna4_verbose_log())
+            os_log(rdna4_oslog(), "GarnetMetal: +load RDNA4Buffer protocol %{public}s found %d added %d", bnames[i], p != nil, added);
     }
     { const char *n[] = { "MTLTexture", "MTLResource" }; rdna4_add_protocols([RDNA4Texture class], n, 2, "RDNA4Texture"); }
     { const char *n[] = { "MTLRenderPipelineState" }; rdna4_add_protocols([RDNA4RenderPipelineState class], n, 1, "RDNA4RenderPipelineState"); }
@@ -624,6 +630,7 @@ GARNET_INTERNAL NSData *rdna4_function_reflection_data(id function) {
 }
 // build 18: the census lines saved by +load, logged once by a process that got a device.
 static void rdna4_census_log(void) {
+    if (!rdna4_verbose_log() && !garnet_getenv("GARNET_CENSUS", "RDNA4M_CENSUS")) return;
     static _Atomic int done_; if (atomic_exchange(&done_, 1)) return;
     for (NSString *l in rdna4cen_lines) RDNA4LOG("%s", l.UTF8String);
     RDNA4LOG("census: %lu (class, selector) pair(s) missing in this process", (unsigned long)rdna4cen_missing_set.count);
@@ -640,14 +647,14 @@ static void rdna4_census_log(void) {
 // ---- 10a: buffers ----
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     RDNA4LOGR("newBufferWithLength:%lu options:0x%lx", (unsigned long)length, (unsigned long)options);
-    if (length == 0) { RDNA4LOG("newBuffer: refused length"); return nil; }
+    if (length == 0) { RDNA4LOG_WARN("newBuffer: refused length"); return nil; }
     if (((options >> 4) & 0xF) > 2) {   // 11e: Shared, Managed, Private
-        RDNA4LOG("newBuffer: storage mode %lu not supported (Memoryless)", (unsigned long)((options >> 4) & 0xF));
+        RDNA4LOG_WARN("newBuffer: storage mode %lu not supported (Memoryless)", (unsigned long)((options >> 4) & 0xF));
         return nil;
     }
     NSError *err = nil;
     RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:self length:length options:options error:&err];
-    if (!b) RDNA4LOG("newBuffer: failed: %s", err.localizedDescription.UTF8String);
+    if (!b) RDNA4LOG_ERR("newBuffer: failed: %s", err.localizedDescription.UTF8String);
     return b;
 }
 
@@ -655,7 +662,7 @@ static void rdna4_census_log(void) {
     RDNA4LOGR("newBufferWithBytes:length:%lu options:0x%lx", (unsigned long)length, (unsigned long)options);
     RDNA4Buffer *b = [self newBufferWithLength:length options:options];
     if (b && [b contents] && bytes) memcpy([b contents], bytes, length);
-    else if (b && bytes) RDNA4LOG("newBufferWithBytes: buffer has no CPU mapping (Private): contents NOT copied");
+    else if (b && bytes) RDNA4LOG_WARN("newBufferWithBytes: buffer has no CPU mapping (Private): contents NOT copied");
     return b;
 }
 
@@ -664,7 +671,7 @@ static void rdna4_census_log(void) {
     RDNA4LOGR("newSamplerStateWithDescriptor:");
     NSError *err = nil;
     RDNA4SamplerState *s = [[RDNA4SamplerState alloc] initWithDevice:self descriptor:d error:&err];
-    if (!s) RDNA4LOG("newSamplerState: failed: %s", err.localizedDescription.UTF8String);
+    if (!s) RDNA4LOG_ERR("newSamplerState: failed: %s", err.localizedDescription.UTF8String);
     return s;
 }
 
@@ -681,14 +688,14 @@ static void rdna4_census_log(void) {
         : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e];
     if (p) return p;
     if ((opts & RDNA4_PIPELINE_OPT_FAIL_ON_ARCHIVE_MISS) || [e.domain isEqualToString:MTLBinaryArchiveDomain]) {
-        RDNA4LOG("compute pipeline binary archive failure: %s", e.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("compute pipeline binary archive failure: %s", e.localizedDescription.UTF8String);
         if (error) *error = e;
         return nil;
     }
     const BOOL inproc = (e.code == 41 && rdna4x_active()) ? YES : NO;
     // build 16 (P4): the first attempt of an application that translates in process is NOT a failure: it is a miss in the bundle's own cache, followed by "inproc OK" and a created pipeline (0 COMPUTE FALLBACK lines in the b14 trial).
     if (inproc) RDNA4LOG("compute pipeline: not in the bundle's spvcache (%s); trying the in-process translation", e.localizedDescription.UTF8String);
-    else RDNA4LOG("compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
+    else RDNA4LOG_ERR("compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
     const BOOL backendReady = !inproc || rdna4_radv_open(&inprocFailure);
     const uint64_t computeDeadline = rdna4_is_ws()
         ? (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_WS_MS * 1000000ull)
@@ -700,7 +707,7 @@ static void rdna4_census_log(void) {
             : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e3];
         if (p3) return p3;
         inprocFailure = e3 ?: rdna4_err(100, @"pipeline initializer returned nil without an NSError after in-process translation");
-        RDNA4LOG("compute pipeline creation failed after the in-process translation: %s", inprocFailure.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("compute pipeline creation failed after the in-process translation: %s", inprocFailure.localizedDescription.UTF8String);
     }
     if (!inproc && e.code == 41 && rdna4g_syncwait_applies(rdna4_is_ws(), atomic_load(&rdna4_app_admitted), rdna4_force_fallback(), rdna4_test_fb_as_ws())) {
         // Dump before waiting: WS gets 250 ms, admitted apps 3 s, subject to the process strikes budget.
@@ -713,7 +720,7 @@ static void rdna4_census_log(void) {
                 ? [[RDNA4ComputePipelineState alloc] initWithDevice:self descriptor:desc options:opts error:&e2]
                 : [[RDNA4ComputePipelineState alloc] initWithDevice:self function:fn error:&e2];
             if (p2) return p2;
-            RDNA4LOG("compute pipeline creation failed after the wait: %s", e2.localizedDescription.UTF8String);
+            RDNA4LOG_ERR("compute pipeline creation failed after the wait: %s", e2.localizedDescription.UTF8String);
         }
     }
     RDNA4LinkCtx *lk = rdna4_lk_for(fn);
@@ -723,7 +730,7 @@ static void rdna4_census_log(void) {
         // Its dispatches are temporary no-ops until hot-swap installs the real shader.
         NSMutableArray *paths = [NSMutableArray array], *notes = [NSMutableArray array];
         if (!inproc) rdna4_dump_function(fn, "kernel", paths, notes);
-        RDNA4LOG("COMPUTE FALLBACK %s (%s); %s: %s", ([fn respondsToSelector:@selector(name)] ? [fn name] : @"?").UTF8String, e.localizedDescription.UTF8String, inproc ? "not dumped (in-process translation did not produce it)" : "AIR dumped", [paths componentsJoinedByString:@"; "].UTF8String);
+        RDNA4LOG_WARN("COMPUTE FALLBACK %s (%s); %s: %s", ([fn respondsToSelector:@selector(name)] ? [fn name] : @"?").UTF8String, e.localizedDescription.UTF8String, inproc ? "not dumped (in-process translation did not produce it)" : "AIR dumped", [paths componentsJoinedByString:@"; "].UTF8String);
         return [[RDNA4ComputePipelineState alloc] initPlaceholderWithDevice:self function:fn];
     }
     if (e.code == 41) {
@@ -744,7 +751,7 @@ static void rdna4_census_log(void) {
                 status, [paths componentsJoinedByString:@"; "],
                 notes.count ? [@" | problems: " stringByAppendingString:[notes componentsJoinedByString:@"; "]] : @""]);
         }
-        RDNA4LOG("%s", e.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("%s", e.localizedDescription.UTF8String);
     }
     if (error) *error = e;
     return nil;
@@ -837,9 +844,9 @@ static BOOL rdna4_compute_desc_wants_icb(MTLComputePipelineDescriptor *d, NSErro
     RDNA4LOGR("newTextureWithDescriptor: %lux%lu pf %lu usage 0x%lx", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.usage);
     NSError *err = nil;
     RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:self descriptor:d error:&err];
-    if (!t) RDNA4LOG("newTextureWithDescriptor NIL: pf %lu type %lu usage 0x%lx storage %lu %lux%lux%lu mips %lu array %lu samples %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
-                   (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.mipmapLevelCount,
-                   (unsigned long)d.arrayLength, (unsigned long)d.sampleCount, err.localizedDescription.UTF8String);
+    if (!t) RDNA4LOG_WARN("newTextureWithDescriptor NIL: pf %lu type %lu usage 0x%lx storage %lu %lux%lux%lu mips %lu array %lu samples %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
+                          (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.mipmapLevelCount,
+                          (unsigned long)d.arrayLength, (unsigned long)d.sampleCount, err.localizedDescription.UTF8String);
     return t;
 }
 
@@ -848,22 +855,22 @@ static BOOL rdna4_compute_desc_wants_icb(MTLComputePipelineDescriptor *d, NSErro
     RDNA4LOGR("newTextureWithDescriptor:iosurface:plane: %lux%lu pf %lu usage 0x%lx plane %lu", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.usage, (unsigned long)plane);
     NSError *err = nil;
     RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:self descriptor:d iosurface:s plane:plane error:&err];
-    if (!t) RDNA4LOG("newTextureWithDescriptor:iosurface:plane: NIL: pf %lu type %lu usage 0x%lx storage %lu %lux%lu plane %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
-                   (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)plane, err.localizedDescription.UTF8String);
+    if (!t) RDNA4LOG_WARN("newTextureWithDescriptor:iosurface:plane: NIL: pf %lu type %lu usage 0x%lx storage %lu %lux%lu plane %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
+                          (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)plane, err.localizedDescription.UTF8String);
     return t;
 }
 
 // ---- 12: client-memory buffers and textures (QuartzCore: -newTiledTextureWithBytesNoCopy:length:descriptor:offset:bytesPerRow:, 4 per second at the login screen) ----
 - (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)len options:(MTLResourceOptions)o deallocator:(void (^)(void *, NSUInteger))d {
-    RDNA4LOG("newBufferWithBytesNoCopy:length:%lu options:0x%lx", (unsigned long)len, (unsigned long)o);
+    RDNA4LOGR("newBufferWithBytesNoCopy:length:%lu options:0x%lx", (unsigned long)len, (unsigned long)o);
     NSError *e = nil; RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:self bytesNoCopy:p length:len options:o deallocator:d error:&e];
-    if (!b) RDNA4LOG("newBufferWithBytesNoCopy: NIL: %s", e.localizedDescription.UTF8String);   // a refused buffer never owned the memory: the deallocator is NOT called
+    if (!b) RDNA4LOG_WARN("newBufferWithBytesNoCopy: NIL: %s", e.localizedDescription.UTF8String);   // a refused buffer never owned the memory: the deallocator is NOT called
     return b;
 }
 - (id)rdna4NoCopyTexture:(void *)p length:(NSUInteger)len deallocator:(void (^)(void *, NSUInteger))dl descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr what:(const char *)what {
     RDNA4Buffer *b = [self newBufferWithBytesNoCopy:p length:len options:MTLResourceStorageModeShared deallocator:dl];
-    if (!b) { RDNA4LOG("%s: NIL (buffer over the client memory refused); pf %lu type %lu usage 0x%lx storage %lu %lux%lu", what, (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
-                     (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height); return nil; }
+    if (!b) { RDNA4LOG_WARN("%s: NIL (buffer over the client memory refused); pf %lu type %lu usage 0x%lx storage %lu %lux%lu", what, (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
+                            (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height); return nil; }
     return [b newTextureWithDescriptor:d offset:off bytesPerRow:bpr];   // the texture keeps the buffer, the buffer keeps the memory until the deallocator runs
 }
 - (id)newTiledTextureWithBytesNoCopy:(void *)p length:(NSUInteger)len descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr {
@@ -905,28 +912,28 @@ static BOOL rdna4_heap_buffer_size_align(NSUInteger len, NSUInteger opts,
     if (!len || !size || !align) return NO;
     NSError *error = nil;
     if (!rdna4_radv_open(&error)) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: RADV open failed: %s; size 0",
-                 error.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("heapBufferSizeAndAlignWithLength: RADV open failed: %s; size 0",
+                     error.localizedDescription.UTF8String);
         return NO;
     }
     unsigned sm = (unsigned)((opts >> 4) & 0xF);
     if (sm > 2) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: storage mode Memoryless is not supported; size 0");
+        RDNA4LOG_WARN("heapBufferSizeAndAlignWithLength: storage mode Memoryless is not supported; size 0");
         return NO;
     }
     rdna4dc_caps caps = rdna4_device_caps();
     if (!rdna4dc_buffer_ok(&caps, len)) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: length %lu exceeds the Vulkan buffer limit; size 0",
-                 (unsigned long)len);
+        RDNA4LOG_WARN("heapBufferSizeAndAlignWithLength: length %lu exceeds the Vulkan buffer limit; size 0",
+                      (unsigned long)len);
         return NO;
     }
     BOOL hostImport = sm < 2 && len > (64ull << 20);
     if (hostImport && (!RDNA4R.hostExt || !rdna4_vkGetMHPP)) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: large Shared/Managed buffers require coherent host import; size 0");
+        RDNA4LOG_WARN("heapBufferSizeAndAlignWithLength: large Shared/Managed buffers require coherent host import; size 0");
         return NO;
     }
     if (!RDNA4P.bmr2) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: vkGetBufferMemoryRequirements2 is unavailable; size 0");
+        RDNA4LOG_WARN("heapBufferSizeAndAlignWithLength: vkGetBufferMemoryRequirements2 is unavailable; size 0");
         return NO;
     }
     VkExternalMemoryBufferCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
@@ -935,20 +942,20 @@ static BOOL rdna4_heap_buffer_size_align(NSUInteger len, NSUInteger opts,
     VkBuffer buffer = VK_NULL_HANDLE;
     VkResult result = vkCreateBuffer(RDNA4R.dev, &create, NULL, &buffer);
     if (result != VK_SUCCESS || !buffer) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: vkCreateBuffer = %d handle %p; size 0",
-                 result, (void *)buffer);
+        RDNA4LOG_ERR("heapBufferSizeAndAlignWithLength: vkCreateBuffer = %d handle %p; size 0",
+                     result, (void *)buffer);
         return NO;
     }
     VkMemoryRequirements mr;
     BOOL queried = rdna4_requirements2(buffer, VK_NULL_HANDLE, &mr, NULL, NULL, YES);
     vkDestroyBuffer(RDNA4R.dev, buffer, NULL);
     if (!queried) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: buffer requirements2 query failed; size 0");
+        RDNA4LOG_ERR("heapBufferSizeAndAlignWithLength: buffer requirements2 query failed; size 0");
         return NO;
     }
     if (!rdna4_heap_query_extent(mr, hostImport, size, align)) {
-        RDNA4LOG("heapBufferSizeAndAlignWithLength: invalid buffer requirement (size %llu alignment %llu); size 0",
-                 (unsigned long long)mr.size, (unsigned long long)mr.alignment);
+        RDNA4LOG_ERR("heapBufferSizeAndAlignWithLength: invalid buffer requirement (size %llu alignment %llu); size 0",
+                     (unsigned long long)mr.size, (unsigned long long)mr.alignment);
         *size = *align = 0;
         return NO;
     }
@@ -962,37 +969,37 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     if (!d || !size || !align) return NO;
     NSError *error = nil;
     if (!rdna4_radv_open(&error)) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: RADV open failed: %s; size 0",
-                 error.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("heapTextureSizeAndAlignWithDescriptor: RADV open failed: %s; size 0",
+                     error.localizedDescription.UTF8String);
         return NO;
     }
     if (!RDNA4P.imr2) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: vkGetImageMemoryRequirements2 is unavailable; size 0");
+        RDNA4LOG_WARN("heapTextureSizeAndAlignWithDescriptor: vkGetImageMemoryRequirements2 is unavailable; size 0");
         return NO;
     }
     rdna4_heap_image_plan plan;
     if (!rdna4_heap_image_plan_make(d, YES, &plan, &error)) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: %s; size 0",
-                 error.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("heapTextureSizeAndAlignWithDescriptor: %s; size 0",
+                      error.localizedDescription.UTF8String);
         return NO;
     }
     VkImage image = VK_NULL_HANDLE;
     VkResult result = vkCreateImage(RDNA4R.dev, &plan.create, NULL, &image);
     if (result != VK_SUCCESS || !image) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: vkCreateImage = %d handle %p; size 0",
-                 result, (void *)image);
+        RDNA4LOG_ERR("heapTextureSizeAndAlignWithDescriptor: vkCreateImage = %d handle %p; size 0",
+                     result, (void *)image);
         return NO;
     }
     VkMemoryRequirements mr;
     BOOL queried = rdna4_requirements2(VK_NULL_HANDLE, image, &mr, NULL, NULL, YES);
     vkDestroyImage(RDNA4R.dev, image, NULL);
     if (!queried) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: image requirements2 query failed; size 0");
+        RDNA4LOG_ERR("heapTextureSizeAndAlignWithDescriptor: image requirements2 query failed; size 0");
         return NO;
     }
     if (!rdna4_heap_query_extent(mr, NO, size, align)) {
-        RDNA4LOG("heapTextureSizeAndAlignWithDescriptor: invalid image requirement (size %llu alignment %llu); size 0",
-                 (unsigned long long)mr.size, (unsigned long long)mr.alignment);
+        RDNA4LOG_ERR("heapTextureSizeAndAlignWithDescriptor: invalid image requirement (size %llu alignment %llu); size 0",
+                     (unsigned long long)mr.size, (unsigned long long)mr.alignment);
         *size = *align = 0;
         return NO;
     }
@@ -1182,7 +1189,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (id)rdna4NewQueue:(id)desc {
     NSError *err = nil;
     RDNA4CommandQueue *q = [[RDNA4CommandQueue alloc] initWithDevice:self descriptor:desc error:&err];
-    if (!q) RDNA4LOG("newCommandQueue: failed: %s", err.localizedDescription.UTF8String);
+    if (!q) RDNA4LOG_ERR("newCommandQueue: failed: %s", err.localizedDescription.UTF8String);
     return q;
 }
 - (id)newCommandQueue { RDNA4LOG("newCommandQueue"); return [self rdna4NewQueue:nil]; }
@@ -1198,7 +1205,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
     RDNA4RenderPipelineState *p = [[RDNA4RenderPipelineState alloc] initWithDevice:self descriptor:d options:opts noFallback:NO error:&e];
     if (p) return p;
     if (e.code == 41 && rdna4x_active()) RDNA4LOG("render pipeline: not in the bundle's spvcache (%s); the in-process translation was already tried for its functions", e.localizedDescription.UTF8String);   // build 16 (P4)
-    else RDNA4LOG("pipeline creation failed: %s", e.localizedDescription.UTF8String);
+    else RDNA4LOG_ERR("pipeline creation failed: %s", e.localizedDescription.UTF8String);
     if (error) *error = [e copy];
     return nil;
 }
@@ -1264,22 +1271,24 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 // Diagnostic: name any selector Metal sends that we (and our superclasses) do not implement, before the
 // standard exception. Seen: -[_MTLDevice initLimits] -> doesNotRecognizeSelector.
 - (void)doesNotRecognizeSelector:(SEL)sel {
-    os_log(OS_LOG_DEFAULT, "GarnetMetal: UNRECOGNIZED selector %{public}s", sel_getName(sel));
-    NSLog(@"GarnetMetal: UNRECOGNIZED selector %s", sel_getName(sel));
+    os_log_error(rdna4_oslog(), "GarnetMetal: UNRECOGNIZED selector %{public}s", sel_getName(sel));
+    if (!RDNA4_RELEASE || rdna4_verbose_log())
+        NSLog(@"GarnetMetal: UNRECOGNIZED selector %s", sel_getName(sel));
     [super doesNotRecognizeSelector:sel];
 }
 
 - (instancetype)initWithAcceleratorPort:(uint32_t)port {
-    os_log(OS_LOG_DEFAULT, "GarnetMetal: initWithAcceleratorPort 0x%x", port);
-    NSLog(@"GarnetMetal: initWithAcceleratorPort 0x%x", port);
+    if (!RDNA4_RELEASE || rdna4_verbose_log()) {
+        os_log(rdna4_oslog(), "GarnetMetal: initWithAcceleratorPort 0x%x", port);
+        NSLog(@"GarnetMetal: initWithAcceleratorPort 0x%x", port);
+    }
     const char *why = rdna4_admit(port);   // 11b: process filter, kill file, Ready, crash counter
     self = [super initWithAcceleratorPort:port];
     if (why) {
         // Declining BEFORE the base init crashed (measured: the un-initialised object is released by ARC and
         // -[_MTLDevice dealloc] -> dispatch_release(NULL) SEGVs), so the base init runs first and the object is then
         // dropped: ARC releases the fully initialised self and Metal sees nil.
-        os_log(OS_LOG_DEFAULT, "GarnetMetal: initWithAcceleratorPort 0x%x DECLINED in %{public}s (pid %d): %{public}s", port, getprogname(), getpid(), why);
-        fprintf(stderr, "GarnetMetal: declined in %s (pid %d): %s\n", getprogname(), getpid(), why);
+        RDNA4LOG_WARN("initWithAcceleratorPort 0x%x DECLINED in %s (pid %d): %s", port, getprogname(), getpid(), why);
         return nil;
     }
     if (self) {
@@ -1289,7 +1298,8 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
         _rdna4NativeMemory = rdna4_nub_memory(port);
         rdna4_argument_limit_prepare(&_rdna4NativeMemory);
     }
-    os_log(OS_LOG_DEFAULT, "GarnetMetal: initWithAcceleratorPort 0x%x -> %{public}s", port, self ? "ok" : "nil");
+    if (!self) RDNA4LOG_ERR("initWithAcceleratorPort 0x%x -> nil", port);
+    else if (rdna4_is_ws() || !RDNA4_RELEASE || rdna4_verbose_log()) RDNA4LOG_KEY("initWithAcceleratorPort 0x%x -> ok", port);
     if (self && rdna4_is_ws()) (void)rdna4_ca_sw_compat();
     if (self && rdna4_is_ws()) {
         uint32_t inheritedPort = ((uint32_t (*)(id, SEL))objc_msgSend)(

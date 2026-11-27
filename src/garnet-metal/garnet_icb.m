@@ -2219,8 +2219,8 @@ static BOOL rdna4_icb_get_expander(VkDescriptorSetLayout *outDsl, VkPipelineLayo
     }
     pthread_mutex_unlock(&_mu);
     if (problem)
-        RDNA4LOG("indirect command buffer resetRange [%lu,+%lu) refused: %s",
-                 (unsigned long)range.location, (unsigned long)range.length, problem.UTF8String);
+        RDNA4LOG_WARN("indirect command buffer resetRange [%lu,+%lu) refused: %s",
+                      (unsigned long)range.location, (unsigned long)range.length, problem.UTF8String);
 }
 - (BOOL)rdna4SameConfigurationAs:(RDNA4IndirectCommandBuffer *)other {
     return other && _dev == other->_dev && rdna4icb_descriptor_equal(_descriptor, other->_descriptor);
@@ -3934,7 +3934,7 @@ static void rdna4_icb_add_local(const rdna4dc_caps *caps, uint32_t (*locals)[3],
                                                                                     options:options
                                                                                       error:&error];
     if (!buffer) {
-        RDNA4LOG("newIndirectCommandBufferWithDescriptor: refused: %s", error.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("newIndirectCommandBufferWithDescriptor: refused: %s", error.localizedDescription.UTF8String);
         return nil;
     }
     if ([buffer rdna4IsComputeICB]) {

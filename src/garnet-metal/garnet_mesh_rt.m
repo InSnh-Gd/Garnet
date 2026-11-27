@@ -272,24 +272,24 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     *kindOut = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
     if (!function) return YES;
     if (![function isKindOfClass:[RDNA4FunctionHandle class]]) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable: rejected non-RDNA4FunctionHandle object");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable: rejected non-RDNA4FunctionHandle object");
         return NO;
     }
     RDNA4FunctionHandle *fh = (RDNA4FunctionHandle *)function;
     if ([fh functionType] != MTLFunctionTypeIntersection) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable: rejected handle '%s' with non-intersection functionType %lu",
-                 [fh name].UTF8String ?: "?", (unsigned long)[fh functionType]);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable: rejected handle '%s' with non-intersection functionType %lu",
+                      [fh name].UTF8String ?: "?", (unsigned long)[fh functionType]);
         return NO;
     }
     if ([fh device] != _dev || [fh rdna4OwnerToken] != _ownerToken || [fh rdna4Stage] != _stage) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable: rejected handle '%s' from mismatched pipeline/stage/device",
-                 [fh name].UTF8String ?: "?");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable: rejected handle '%s' from mismatched pipeline/stage/device",
+                      [fh name].UTF8String ?: "?");
         return NO;
     }
     uint32_t hid = [fh rdna4HandleId];
     if (hid == RDNA4RTR_IFT_HANDLE_NULL || hid > _table.max_handle_id ||
         !_handleKinds || _handleKinds[hid] == 0xFFu) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable: rejected invalid handle id %u (max %u)", hid, _table.max_handle_id);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable: rejected invalid handle id %u (max %u)", hid, _table.max_handle_id);
         return NO;
     }
     *hidOut = hid;
@@ -300,8 +300,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
 - (void)setFunction:(id<MTLFunctionHandle>)function atIndex:(NSUInteger)index {
     [_lock lock];
     if (index >= _table.slot_count) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setFunction:atIndex:%lu out of bounds (count=%u)",
-                 (unsigned long)index, _table.slot_count);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setFunction:atIndex:%lu out of bounds (count=%u)",
+                      (unsigned long)index, _table.slot_count);
         [_lock unlock];
         return;
     }
@@ -317,13 +317,13 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
 - (void)setFunctions:(const id<MTLFunctionHandle> __unsafe_unretained *)functions withRange:(NSRange)range {
     if (range.length == 0) return;
     if (!functions) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setFunctions:withRange: NULL array");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setFunctions:withRange: NULL array");
         return;
     }
     [_lock lock];
     if (range.location > _table.slot_count || range.length > _table.slot_count - range.location) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setFunctions:withRange:[%lu,+%lu) out of bounds (count=%u)",
-                 (unsigned long)range.location, (unsigned long)range.length, _table.slot_count);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setFunctions:withRange:[%lu,+%lu) out of bounds (count=%u)",
+                      (unsigned long)range.location, (unsigned long)range.length, _table.slot_count);
         [_lock unlock];
         return;
     }
@@ -358,8 +358,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     if (st == RDNA4RTR_OK) {
         (void)[self rdna4SyncBackingLocked];
     } else {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setOpaqueTriangleIntersectionFunctionWithSignature:0x%lx atIndex:%lu rejected: %s",
-                 (unsigned long)signature, (unsigned long)index, rdna4rtr_status_str(st));
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setOpaqueTriangleIntersectionFunctionWithSignature:0x%lx atIndex:%lu rejected: %s",
+                      (unsigned long)signature, (unsigned long)index, rdna4rtr_status_str(st));
     }
     [_lock unlock];
 }
@@ -374,8 +374,8 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     if (st == RDNA4RTR_OK) {
         (void)[self rdna4SyncBackingLocked];
     } else {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setOpaqueTriangleIntersectionFunctionWithSignature:0x%lx withRange:[%lu,+%lu) rejected: %s",
-                 (unsigned long)signature, (unsigned long)range.location, (unsigned long)range.length, rdna4rtr_status_str(st));
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setOpaqueTriangleIntersectionFunctionWithSignature:0x%lx withRange:[%lu,+%lu) rejected: %s",
+                      (unsigned long)signature, (unsigned long)range.location, (unsigned long)range.length, rdna4rtr_status_str(st));
     }
     [_lock unlock];
 }
@@ -397,24 +397,24 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
         (void)[self rdna4SyncBackingLocked];
         RDNA4_ONCE("RDNA4IntersectionFunctionTable: curve intersection functions are unsupported on RADV GFX12 (encoded safe null handle)");
     } else if (st != RDNA4RTR_OK) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setOpaqueCurveIntersectionFunctionWithSignature:0x%lx withRange:[%lu,+%lu) rejected: %s",
-                 (unsigned long)signature, (unsigned long)range.location, (unsigned long)range.length, rdna4rtr_status_str(st));
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setOpaqueCurveIntersectionFunctionWithSignature:0x%lx withRange:[%lu,+%lu) rejected: %s",
+                      (unsigned long)signature, (unsigned long)range.location, (unsigned long)range.length, rdna4rtr_status_str(st));
     }
     [_lock unlock];
 }
 
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
     if (index >= RDNA4RTR_MAX_ATTACH_BUFFERS) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setBuffer:atIndex:%lu out of bounds", (unsigned long)index);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setBuffer:atIndex:%lu out of bounds", (unsigned long)index);
         return;
     }
     if (buffer && (![buffer isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)buffer device] != _dev)) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setBuffer: invalid buffer class or device");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setBuffer: invalid buffer class or device");
         return;
     }
     if (buffer && offset > [(RDNA4Buffer *)buffer length]) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setBuffer: offset %lu exceeds buffer length %lu",
-                 (unsigned long)offset, (unsigned long)[(RDNA4Buffer *)buffer length]);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setBuffer: offset %lu exceeds buffer length %lu",
+                      (unsigned long)offset, (unsigned long)[(RDNA4Buffer *)buffer length]);
         return;
     }
     uint64_t bda = buffer ? ([(RDNA4Buffer *)buffer gpuAddress] + (uint64_t)offset) : 0u;
@@ -434,7 +434,7 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     if (!buffers || !offsets ||
         range.location > RDNA4RTR_MAX_ATTACH_BUFFERS ||
         range.length > RDNA4RTR_MAX_ATTACH_BUFFERS - range.location) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setBuffers:offsets:withRange: invalid range or NULL array");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setBuffers:offsets:withRange: invalid range or NULL array");
         return;
     }
     for (NSUInteger i = 0; i < range.length; i++)
@@ -444,14 +444,14 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)functionTable
                   atBufferIndex:(NSUInteger)bufferIndex {
     if (bufferIndex >= RDNA4RTR_MAX_NESTED_VFTS) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setVisibleFunctionTable:atBufferIndex:%lu out of bounds",
-                 (unsigned long)bufferIndex);
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setVisibleFunctionTable:atBufferIndex:%lu out of bounds",
+                      (unsigned long)bufferIndex);
         return;
     }
     if (functionTable &&
         (![functionTable isKindOfClass:[RDNA4VisibleFunctionTable class]] ||
          [(RDNA4VisibleFunctionTable *)functionTable device] != _dev)) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable: rejected invalid nested VFT class or device");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable: rejected invalid nested VFT class or device");
         return;
     }
     uint64_t bda = functionTable ? [(RDNA4VisibleFunctionTable *)functionTable rdna4BackingGPUAddress] : 0u;
@@ -470,7 +470,7 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     if (!functionTables ||
         bufferRange.location > RDNA4RTR_MAX_NESTED_VFTS ||
         bufferRange.length > RDNA4RTR_MAX_NESTED_VFTS - bufferRange.location) {
-        RDNA4LOG("RDNA4IntersectionFunctionTable setVisibleFunctionTables:withBufferRange: invalid range or NULL array");
+        RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setVisibleFunctionTables:withBufferRange: invalid range or NULL array");
         return;
     }
     for (NSUInteger i = 0; i < bufferRange.length; i++)
@@ -1089,7 +1089,7 @@ __attribute__((unused)) GARNET_INTERNAL id<MTLIntersectionFunctionTable> rdna4_r
     RDNA4IntersectionFunctionTable *tbl = [[RDNA4IntersectionFunctionTable alloc]
         initWithDevice:dev descriptor:descriptor ownerToken:iftOwnerToken stage:stage refl:refl error:&e];
     if (!tbl && e)
-        RDNA4LOG("newIntersectionFunctionTableWithDescriptor failed: %s", e.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("newIntersectionFunctionTableWithDescriptor failed: %s", e.localizedDescription.UTF8String);
     return (id<MTLIntersectionFunctionTable>)tbl;
 }
 
@@ -1225,7 +1225,7 @@ static BOOL rdna4_rt_resolve_funcs(void) {
                           vkCreateQueryPool && vkDestroyQueryPool && vkCmdResetQueryPool &&
                           rdna4_vkGetBufferAddress;
         if (!RDNA4RTFn.ready)
-            RDNA4LOG("rt-accel: one or more VK_KHR_acceleration_structure entry points are missing");
+            RDNA4LOG_WARN("rt-accel: one or more VK_KHR_acceleration_structure entry points are missing");
     });
     return RDNA4RTFn.ready;
 }
@@ -1887,7 +1887,7 @@ GARNET_INTERNAL __attribute__((unused)) BOOL rdna4_rt_fill_stage_prim_table(
     uint64_t globalBda = ok ? (uint64_t)g_rtPrimTable.bda : 0u;
     pthread_mutex_unlock(&g_rtPrimTable.mu);
     if (!ok || !globalBda) {
-        RDNA4LOG("rt prim table fill failed: %s", err ? err.localizedDescription.UTF8String : "unavailable");
+        RDNA4LOG_ERR("rt prim table fill failed: %s", err ? err.localizedDescription.UTF8String : "unavailable");
         return NO;
     }
     rdna4rt_stage_prim_table_init(out, globalBda, RDNA4RT_PRIM_TABLE_MASK);
@@ -3641,7 +3641,7 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
             NSUInteger endIdx = ((NSUInteger (*)(id, SEL))objc_msgSend)(att, @selector(endOfEncoderSampleIndex));
             if (![sb respondsToSelector:sampleSel] || ![sb respondsToSelector:@selector(device)] ||
                 [sb device] != [_cb device] || ![sb respondsToSelector:@selector(sampleCount)]) {
-                RDNA4LOG("accel pass: sampleBufferAttachments[%lu] invalid; refused", (unsigned long)k);
+                RDNA4LOG_WARN("accel pass: sampleBufferAttachments[%lu] invalid; refused", (unsigned long)k);
                 _ended = YES;
                 [super endEncoding];
                 return nil;
@@ -3649,7 +3649,7 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
             NSUInteger count = ((NSUInteger (*)(id, SEL))objc_msgSend)(sb, @selector(sampleCount));
             if ((startIdx != MTLCounterDontSample && startIdx >= count) ||
                 (endIdx != MTLCounterDontSample && endIdx >= count)) {
-                RDNA4LOG("accel pass: sampleBufferAttachments[%lu] sample index out of range; refused", (unsigned long)k);
+                RDNA4LOG_WARN("accel pass: sampleBufferAttachments[%lu] sample index out of range; refused", (unsigned long)k);
                 _ended = YES;
                 [super endEncoding];
                 return nil;
@@ -4314,14 +4314,14 @@ GARNET_INTERNAL __attribute__((unused)) MTLAccelerationStructureSizes rdna4_rt_d
     if (!dev || !descriptor) return zero;
     NSError *err = nil;
     if (!rdna4_radv_open(&err)) {
-        RDNA4LOG("accelerationStructureSizesWithDescriptor: RADV open failed: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("accelerationStructureSizesWithDescriptor: RADV open failed: %s",
+                     err.localizedDescription.UTF8String);
         return zero;
     }
     RDNA4RTBuildPlan plan;
     if (!rdna4_rt_build_plan_make(dev, descriptor, NO, NO, 0u, nil, &plan, &err)) {
-        RDNA4LOG("accelerationStructureSizesWithDescriptor: refused: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("accelerationStructureSizesWithDescriptor: refused: %s",
+                      err.localizedDescription.UTF8String);
         return zero;
     }
     MTLAccelerationStructureSizes out = {
@@ -4338,8 +4338,8 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_de
     NSError *err = nil;
     GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
         initWithDevice:dev size:size initialKind:RDNA4RT_KIND_UNKNOWN error:&err];
-    if (!as) RDNA4LOG("newAccelerationStructureWithSize:%lu failed: %s",
-                      (unsigned long)size, err.localizedDescription.UTF8String);
+    if (!as) RDNA4LOG_ERR("newAccelerationStructureWithSize:%lu failed: %s",
+                          (unsigned long)size, err.localizedDescription.UTF8String);
     return (id<MTLAccelerationStructure>)as;
 }
 
@@ -4348,14 +4348,14 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_de
     if (!dev || !descriptor) return nil;
     NSError *err = nil;
     if (!rdna4_radv_open(&err)) {
-        RDNA4LOG("newAccelerationStructureWithDescriptor: RADV open failed: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("newAccelerationStructureWithDescriptor: RADV open failed: %s",
+                     err.localizedDescription.UTF8String);
         return nil;
     }
     RDNA4RTBuildPlan plan;
     if (!rdna4_rt_build_plan_make(dev, descriptor, NO, NO, 0u, nil, &plan, &err)) {
-        RDNA4LOG("newAccelerationStructureWithDescriptor: refused: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("newAccelerationStructureWithDescriptor: refused: %s",
+                      err.localizedDescription.UTF8String);
         return nil;
     }
     rdna4rt_kind_t kind = plan.kind;
@@ -4363,8 +4363,8 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_de
     rdna4_rt_plan_free(&plan);
     GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
         initWithDevice:dev size:reqSize initialKind:kind error:&err];
-    if (!as) RDNA4LOG("newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
-                      (unsigned long)reqSize, err.localizedDescription.UTF8String);
+    if (!as) RDNA4LOG_ERR("newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
+                          (unsigned long)reqSize, err.localizedDescription.UTF8String);
     return (id<MTLAccelerationStructure>)as;
 }
 
@@ -4374,12 +4374,12 @@ GARNET_INTERNAL __attribute__((unused)) MTLSizeAndAlign rdna4_rt_device_heap_as_
     if (!dev || size == 0) return zero;
     NSError *err = nil;
     if (!rdna4_radv_open(&err)) {
-        RDNA4LOG("heapAccelerationStructureSizeAndAlignWithSize: RADV open failed: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("heapAccelerationStructureSizeAndAlignWithSize: RADV open failed: %s",
+                     err.localizedDescription.UTF8String);
         return zero;
     }
     if (!rdna4_rt_resolve_funcs() || !RDNA4P.bmr2) {
-        RDNA4LOG("heapAccelerationStructureSizeAndAlignWithSize: acceleration structure or requirements2 unavailable");
+        RDNA4LOG_WARN("heapAccelerationStructureSizeAndAlignWithSize: acceleration structure or requirements2 unavailable");
         return zero;
     }
     uint64_t backingSize = 0u;
@@ -4424,8 +4424,8 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_he
         (uint32_t)[heap storageMode], (uint32_t)[heap type], (uint64_t)[heap size],
         (uint64_t)size, hasOffset ? 1 : 0, (uint64_t)offset, RDNA4RT_HEAP_AS_ALIGN, &alignedSize);
     if (ve != RDNA4RT_OK) {
-        RDNA4LOG("heap newAccelerationStructureWithSize:%lu offset:%lu(has=%d) refused: %s",
-                 (unsigned long)size, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
+        RDNA4LOG_WARN("heap newAccelerationStructureWithSize:%lu offset:%lu(has=%d) refused: %s",
+                      (unsigned long)size, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
         return nil;
     }
     NSError *err = nil;
@@ -4433,8 +4433,8 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_he
         initWithDevice:dev size:size initialKind:RDNA4RT_KIND_UNKNOWN
                   heap:heap offset:offset hasOffset:hasOffset error:&err];
     if (!as) {
-        RDNA4LOG("heap newAccelerationStructureWithSize:%lu failed: %s",
-                 (unsigned long)size, err ? err.localizedDescription.UTF8String : "unknown");
+        RDNA4LOG_ERR("heap newAccelerationStructureWithSize:%lu failed: %s",
+                     (unsigned long)size, err ? err.localizedDescription.UTF8String : "unknown");
         return nil;
     }
     [heap rdna4TrackResource:as];
@@ -4446,25 +4446,25 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_he
     if (!heap || !dev || !descriptor) return nil;
     /* Pre-check storageMode and Automatic vs Placement heap gating before Vulkan size query. */
     if ([heap storageMode] != MTLStorageModePrivate) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor refused: heap must use MTLStorageModePrivate");
+        RDNA4LOG_WARN("heap newAccelerationStructureWithDescriptor refused: heap must use MTLStorageModePrivate");
         return nil;
     }
     if ((hasOffset && [heap type] != MTLHeapTypePlacement) ||
         (!hasOffset && [heap type] != MTLHeapTypeAutomatic)) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor refused: heap type mismatch (hasOffset=%d, type=%lu)",
-                 hasOffset ? 1 : 0, (unsigned long)[heap type]);
+        RDNA4LOG_WARN("heap newAccelerationStructureWithDescriptor refused: heap type mismatch (hasOffset=%d, type=%lu)",
+                      hasOffset ? 1 : 0, (unsigned long)[heap type]);
         return nil;
     }
     NSError *err = nil;
     if (!rdna4_radv_open(&err)) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor: RADV open failed: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("heap newAccelerationStructureWithDescriptor: RADV open failed: %s",
+                     err.localizedDescription.UTF8String);
         return nil;
     }
     RDNA4RTBuildPlan plan;
     if (!rdna4_rt_build_plan_make(dev, descriptor, NO, NO, 0u, nil, &plan, &err)) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor: refused: %s",
-                 err.localizedDescription.UTF8String);
+        RDNA4LOG_WARN("heap newAccelerationStructureWithDescriptor: refused: %s",
+                      err.localizedDescription.UTF8String);
         return nil;
     }
     rdna4rt_kind_t kind = plan.kind;
@@ -4476,16 +4476,16 @@ GARNET_INTERNAL __attribute__((unused)) id<MTLAccelerationStructure> rdna4_rt_he
         (uint32_t)[heap storageMode], (uint32_t)[heap type], (uint64_t)[heap size],
         (uint64_t)reqSize, hasOffset ? 1 : 0, (uint64_t)offset, RDNA4RT_HEAP_AS_ALIGN, &alignedSize);
     if (ve != RDNA4RT_OK) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor:%lu offset:%lu(has=%d) refused: %s",
-                 (unsigned long)reqSize, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
+        RDNA4LOG_WARN("heap newAccelerationStructureWithDescriptor:%lu offset:%lu(has=%d) refused: %s",
+                      (unsigned long)reqSize, (unsigned long)offset, hasOffset ? 1 : 0, rdna4rt_err_str(ve));
         return nil;
     }
     GarnetAccelerationStructure *as = [[GarnetAccelerationStructure alloc]
         initWithDevice:dev size:reqSize initialKind:kind
                   heap:heap offset:offset hasOffset:hasOffset error:&err];
     if (!as) {
-        RDNA4LOG("heap newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
-                 (unsigned long)reqSize, err ? err.localizedDescription.UTF8String : "unknown");
+        RDNA4LOG_ERR("heap newAccelerationStructureWithDescriptor: alloc %lu failed: %s",
+                     (unsigned long)reqSize, err ? err.localizedDescription.UTF8String : "unknown");
         return nil;
     }
     [heap rdna4TrackResource:as];
@@ -4583,7 +4583,7 @@ static BOOL rdna4_mesh_resolve_vk_funcs(void) {
         RDNA4MeshFn.ready = (RDNA4MeshFn.cmdDrawMeshTasksEXT != NULL &&
                              RDNA4MeshFn.cmdDrawMeshTasksIndirectEXT != NULL);
         if (!RDNA4MeshFn.ready) {
-            RDNA4LOG("mesh: VK_EXT_mesh_shader command entry points are missing");
+            RDNA4LOG_WARN("mesh: VK_EXT_mesh_shader command entry points are missing");
         }
     });
     return RDNA4MeshFn.ready;
@@ -5989,7 +5989,7 @@ __attribute__((unused)) GARNET_INTERNAL id rdna4_mesh_device_new_pipeline(
     RDNA4MeshRenderPipelineState *p = [[RDNA4MeshRenderPipelineState alloc]
         initWithDevice:dev meshDescriptor:desc options:options error:&e];
     if (!p) {
-        if (e) RDNA4LOG("mesh pipeline creation failed: %s", e.localizedDescription.UTF8String);
+        if (e) RDNA4LOG_ERR("mesh pipeline creation failed: %s", e.localizedDescription.UTF8String);
         if (error) *error = [e copy];
         return nil;
     }
