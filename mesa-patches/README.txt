@@ -68,56 +68,18 @@ ABI <= 1.13 kernels remain compatible with automatic fallback to legacy selector
 
 0030: sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; report drm_minor = 60 in acd_device_initialize() when QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC (unlocking gfx12_supports_dcc_write_compress_disable), and gate radv_is_dcc_disabled() on Darwin on !pdev->info.gfx12_supports_dcc_write_compress_disable (superseding 0025's unconditional GFX12 disable while preserving RADV_DEBUG=nodcc, garnet-dcc=0, and HOST_BO fallback).
 
-0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]), per-ring pending pairs (seq[2]) for gang submissions, multi-point cross-ring timeline wait polling, and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit_ex() for concurrent Task+Mesh launch while propagating both leader and follower seqnos into last_compute_seq and syncobjs; drain both rings in acd_cmd_gem_wait_idle(). Exercised by `mesa-patches/dual_ring_sync_test.c` (invoked from `test-gfx1200-runtime.sh`).
+0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]), per-ring pending pairs (seq[2]) for gang submissions, multi-point cross-ring timeline wait polling, and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit_ex() for concurrent Task+Mesh launch while propagating both leader and follower seqnos into last_compute_seq and syncobjs; drain both rings in acd_cmd_gem_wait_idle(). Exercised by `mesa-patches/tests/dual_ring_sync_test.c` (invoked from `mesa-patches/tests/test-gfx1200-runtime.sh`).
 
 0033: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.14 (reserving selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 ABI 1.15; adding WebKit-silent APP aliases 30/31/39 for BOCREATE/BO_IMPORT_HOST/BUFFER_COPY and info flags bits 8..10); route RADV's GarnetAccelerator connection through selectors 30/31/39 on ABI >= 1.14 kernels with automatic fallback to 3/21/27 on ABI <= 1.13 kernels and on the GarnetDriver route. Verified by `python3 mesa-patches/test-webkit-safe-selectors.py "$TMPDIR/webkit-sel-test"`.
 
-Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
-    python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
-    python3 mesa-patches/test-host-composite.py /path/to/patched-mesa "$TMPDIR/host-test"
-    python3 mesa-patches/test-large-buffer-api.py /path/to/patched-mesa "$TMPDIR/api-test"
-    python3 mesa-patches/test-large-buffer-transfer.py /path/to/patched-mesa "$TMPDIR/transfer-test"
-These compile extracted production functions with stub transport boundaries and
-ASan/UBSan. Synthetic 8 GiB layouts do not allocate 8 GiB physical backing or
-execute the target GPU. Hardware capacity acceptance remains separate.
-
-Read-only argument-limit export check (no Vulkan object, native open or GPU
-work):
-    python3 mesa-patches/test-radv-darwin-argument-limits.py /path/to/patched-mesa "$TMPDIR/argument-limits-test"
-
-The same check can also prove the ordered canonical patch series from a clean
-pinned archive:
-    python3 mesa-patches/test-radv-darwin-argument-limits-series.py \
-      /path/to/mesa.tar.gz "$TMPDIR/argument-limits-series-test" \
-      --expected-archive-sha256 4bc5830a77c420e6fcd1d13d8edf12c8b17c95fa5c689ed27370b19c47cbae1d
-This extracts a fresh tree, applies 0001..0022 with `patch -p1 --fuzz=0`,
-rejects any `.rej`/`.orig`, and runs the optimized and ASan+UBSan export tests.
-
-Sparse / PRT series and host check (no Mesa tarball, IOKit, or GPU needed):
-    python3 mesa-patches/test-radv-darwin-sparse-prt-series.py "$TMPDIR/sparse-prt-test"
-This verifies contiguous 0001..0028 patch integrity, replays 0001..0028 with
-`patch -p1 --fuzz=0` on all Darwin-added files plus post-0027 upstream anchors,
-checks ABI 1.13 constants against src/garnet/src/GarnetNativeABI.h bit-for-bit,
-and compiles and runs the real post-0028 Darwin kext/mock marshaller and
-radv_sparse_enabled() gating harness under -Wall -Wextra -Werror with ASan+UBSan.
-Pass `--mesa-archive /path/to/mesa.tar.gz` when the pinned Mesa archive is
-available to replay the full 0001..0028 series end-to-end.
-
-Mesh shader series and host check (no Mesa tarball, IOKit, or GPU needed):
-    python3 mesa-patches/test-radv-darwin-mesh-series.py "$TMPDIR/mesh-test"
-This verifies contiguous 0001..0029 patch integrity, validates 0029 with
-`patch -p1 --fuzz=0` and `git apply --check` against exact post-0028
-`radv_physical_device.c` context (or a full Mesa archive via `--mesa-archive`),
-and compiles and runs the extracted `radv_mesh_enabled()` /
-`radv_taskmesh_enabled()` feature and stage-mask harness under
-`-Wall -Wextra -Werror` (both `-O2` and ASan+UBSan). Full `mesa@f5cb8ee` build
-and live RX 9060 XT execution remain separate.
-
-Standalone Vulkan sparse/PRT execution test (buffer + 2D/3D/MSAA residency,
-non-resident zero-read / discard-write, and rebinding; ready for RX 9060 XT
-and Vulkan 1.4 ICDs exposing sparseBinding):
-    cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/vulkan_sparse_prt_test.c -lvulkan -o "$TMPDIR/vulkan_sparse_prt_test"
-    "$TMPDIR/vulkan_sparse_prt_test"
+Active RADV Darwin tests live under `mesa-patches/tests/`:
+    - Host runtime / submit / dual-ring sync / kernel Submit contract:
+        bash mesa-patches/tests/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
+    - Native macOS mock pipeline / queue marshalling / hang propagation:
+        bash mesa-patches/tests/test-gfx1200-pipeline.sh /path/to/patched-mesa /path/to/libvulkan_radeon.dylib /path/to/output
+    - Standalone Vulkan sparse / GFX12 PRT residency test:
+        cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/tests/vulkan_sparse_prt_test.c -lvulkan -o "$TMPDIR/vulkan_sparse_prt_test"
+    - Argument-limit export test: `mesa-patches/tests/radv_darwin_argument_limits_test.c`
 
 Memory and topology audit (offline, 2026-11-01):
     The gfx1200 .mem values are synthetic HOST_BO/drm-shim inputs, copied from
