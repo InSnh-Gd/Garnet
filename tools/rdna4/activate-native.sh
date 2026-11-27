@@ -92,6 +92,8 @@ step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add 'Syst
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add iconservicesagent
 # Terminal uses RGhA CA Whippet IOSurfaces on wide-gamut (P3) displays, which macOS 26 drops to zero without Metal.
 step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add Terminal
+# Safari WebKit GPU process (proc_name truncates com.apple.WebKit.GPU to 16 chars: com.apple.WebKit).
+step 'code[[:space:]]*: (0 \(ok\)|4 \(already on the list\))' appallow add com.apple.WebKit
 # Persistent application denylist: load proc: entries into kernel gAppDeny (bundle: entries are enforced by GarnetMetal.bundle).
 deny_file=
 if [ -L "$root/app-denylist.txt" ]; then
@@ -137,6 +139,12 @@ if [ -f /private/var/tmp/garnet-observe ] && [ ! -L /private/var/tmp/garnet-obse
 fi
 step 'status +: 0 \(OK\)|status 0 \(OK\)' pipeadopt
 step 'agdc status +: 0 \(PUBLISHED\)' pipeagdc 1
+# ABI 1.14: mirror /private/tmp/garnet-off kill-file state into kernel RDNA4N_INFO_KILL_SWITCH (best-effort on older kexts).
+if [ -e /private/tmp/garnet-off ] || [ -e /private/tmp/rdna4m-off ]; then
+    "$root/garnettest" accel killswitch 1 >/dev/null 2>&1 || :
+else
+    "$root/garnettest" accel killswitch 0 >/dev/null 2>&1 || :
+fi
 touch /private/tmp/garnet-headless-no
 chmod 644 /private/tmp/garnet-headless-no
 step '0xccf now +: 1' pipearm 1
