@@ -15,8 +15,9 @@ namespace rdna4pwr {
 //   garnet-gfx-cg=0     disables GFX12 CGCG/CGLS/MGCG/FGCG (default ON)
 //   garnet-det0=0       disables single-pipe DCN41 DET0 expansion (default ON)
 //   garnet-uclk-pin=1   forces UCLK pinned at top DPM (default AUTO after DET0 expand)
-//   garnet-gfxoff=1     opt-in SMU AllowGfxOff (default OFF)
+//   garnet-gfxoff=0     kill-switch disabling GFXOFF guard/feature (default OFF; =1 opts into AllowGfxOff)
 //   garnet-idle-clamp=1 opt-in 200 MHz GFXCLK Low clamp at boot (default OFF: SMUPowerState::Auto)
+//   garnet-idle-dpm=0   disables activity-driven SMU GFXCLK idle governor (default ON)
 inline bool gfx_cg_enabled(bool present, uint32_t value) {
 	return !present || value != 0u;
 }
@@ -32,6 +33,152 @@ inline bool gfxoff_opt_in(bool present, uint32_t value) {
 inline bool idle_clamp_enabled(bool present, uint32_t value) {
 	return present && value != 0u;
 }
+inline bool idle_dpm_enabled(bool present, uint32_t value) {
+	return !present || value != 0u;
+}
+
+// Activity-driven SMU GFXCLK idle governor:
+// Keeps SMUPowerState::Auto (3450 MHz boost) during sustained interactive/3D/compute
+// workloads, and drops to SMUPowerState::Low (200-500 MHz idle envelope) after 1000 ms
+// without heavy work or sustained frame rate. Low-rate desktop compositing frames
+// (4-15 submits/s, each ~0.4 ms) stay in Low; bursts (>= 32 Hz), heavy/compute submits,
+// or any single frame still running at the 50 ms hwBusy probe boost back to Auto.
+// Bypassed when garnet-idle-dpm=0, garnet-idle-clamp=1, or `garnettest power` is active.
+constexpr uint64_t kIdleDpmTimeoutNs       = 1000ULL * 1000ULL * 1000ULL; // 1000 ms
+constexpr uint32_t kIdleDpmBoostSubmits    = 8u;  // >= 8 submits / 250 ms (32 Hz) boosts Low -> Auto
+constexpr uint32_t kIdleDpmKeepAutoSubmits = 6u;  // >= 6 submits / 250 ms (24 Hz) keeps Auto alive
+constexpr uint32_t kIdleDpmBusyProbeMs     = 50u; // quick hwBusy probe after a light submit while Low
+constexpr uint32_t kIdleDpmWindowRemainMs  = 200u; // remaining 250 ms rate window after 50 ms probe
+
+enum class IdleDpmAction : uint8_t {
+	None    = 0,
+	SetAuto = 1, // Low -> Auto transition
+	SetLow  = 2, // Auto -> Low transition
+};
+
+struct IdleDpmGovernor {
+	static constexpr uint32_t kStateAuto = 0u; // matches SMUPowerState::Auto
+	static constexpr uint32_t kStateLow  = 1u; // matches SMUPowerState::Low
+
+	bool     enabled         { false };
+	bool     idleClamp       { false };
+	bool     manualOverride  { false };
+	bool     lowProbePending { false };
+	uint32_t currentState    { kStateAuto };
+	uint32_t inFlight        { 0u };
+	uint64_t lastActiveNs    { 0ull };
+	uint64_t idleTimeoutNs   { kIdleDpmTimeoutNs };
+	uint32_t boostCount      { 0u };
+	uint32_t idleDropCount   { 0u };
+
+	void init(bool dpmEnabled, bool clampEnabled, uint64_t nowNs,
+	          uint64_t timeoutNs = kIdleDpmTimeoutNs) {
+		enabled         = dpmEnabled;
+		idleClamp       = clampEnabled;
+		manualOverride  = false;
+		lowProbePending = false;
+		currentState    = clampEnabled ? kStateLow : kStateAuto;
+		inFlight        = 0u;
+		lastActiveNs    = nowNs;
+		idleTimeoutNs   = timeoutNs;
+		boostCount      = 0u;
+		idleDropCount   = 0u;
+	}
+
+	bool active() const {
+		return enabled && !idleClamp && !manualOverride;
+	}
+
+	bool is_low() const {
+		return currentState == kStateLow;
+	}
+
+	void on_manual_override(uint32_t state) {
+		manualOverride  = true;
+		lowProbePending = false;
+		currentState    = state;
+	}
+
+	IdleDpmAction on_submit_begin(uint64_t nowNs) {
+		if (inFlight != UINT32_MAX) inFlight++;
+		if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+		if (!active()) return IdleDpmAction::None;
+		return (currentState == kStateLow) ? IdleDpmAction::SetAuto : IdleDpmAction::None;
+	}
+
+	void on_submit_end(uint64_t nowNs) {
+		if (inFlight > 0u) inFlight--;
+		if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+	}
+
+	// Heavy/compute/burst activity: immediately refreshes idle clock and boosts Low -> Auto.
+	IdleDpmAction on_activity(uint64_t nowNs) {
+		if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+		if (!active()) return IdleDpmAction::None;
+		return (currentState == kStateLow) ? IdleDpmAction::SetAuto : IdleDpmAction::None;
+	}
+
+	// Two-stage probe while in Low (50 ms busy check -> 200 ms rate-window completion).
+	IdleDpmAction on_low_probe(uint64_t nowNs, bool hwBusy, uint32_t lightSubmits,
+	                           uint32_t *nextProbeMs, bool *resetWindow) {
+		if (nextProbeMs) *nextProbeMs = 0u;
+		if (resetWindow) *resetWindow = false;
+		if (!active() || currentState != kStateLow) {
+			lowProbePending = false;
+			if (resetWindow) *resetWindow = true;
+			return IdleDpmAction::None;
+		}
+		if (inFlight > 0u || hwBusy || lightSubmits >= kIdleDpmBoostSubmits) {
+			lowProbePending = false;
+			if (resetWindow) *resetWindow = true;
+			if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+			return IdleDpmAction::SetAuto;
+		}
+		if (!lowProbePending) {
+			lowProbePending = true;
+			if (nextProbeMs) *nextProbeMs = kIdleDpmWindowRemainMs;
+			return IdleDpmAction::None;
+		}
+		lowProbePending = false;
+		if (resetWindow) *resetWindow = true;
+		return IdleDpmAction::None;
+	}
+
+	IdleDpmAction on_tick(uint64_t nowNs, bool hwBusy, uint32_t sampledSubmits = 0u) {
+		if (!active()) return IdleDpmAction::None;
+		if (inFlight > 0u || hwBusy) {
+			if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+			return (currentState == kStateLow) ? IdleDpmAction::SetAuto : IdleDpmAction::None;
+		}
+		if (currentState == kStateLow) {
+			if (sampledSubmits >= kIdleDpmBoostSubmits) {
+				if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+				return IdleDpmAction::SetAuto;
+			}
+			return IdleDpmAction::None;
+		}
+		if (sampledSubmits >= kIdleDpmKeepAutoSubmits) {
+			if (nowNs > lastActiveNs) lastActiveNs = nowNs;
+			return IdleDpmAction::None;
+		}
+		if (nowNs >= lastActiveNs && (nowNs - lastActiveNs) >= idleTimeoutNs) {
+			return IdleDpmAction::SetLow;
+		}
+		return IdleDpmAction::None;
+	}
+
+	void commit(IdleDpmAction action, bool ok) {
+		if (!ok) return;
+		lowProbePending = false;
+		if (action == IdleDpmAction::SetAuto) {
+			currentState = kStateAuto;
+			boostCount++;
+		} else if (action == IdleDpmAction::SetLow) {
+			currentState = kStateLow;
+			idleDropCount++;
+		}
+	}
+};
 
 // Minimum DET0 buffer time and VBLANK duration required to safely absorb GDDR6 UCLK
 // P-state switch blackouts (~150-250 us) without DMUB FAMS2 / DML2 watermark programming.

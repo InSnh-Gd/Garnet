@@ -39,6 +39,144 @@ int main() {
 	expect(idle_clamp_enabled(true, 1u), "garnet-idle-clamp=1 clamps GFXCLK to 200 MHz Low");
 	expect(idle_clamp_enabled(true, 2u), "garnet-idle-clamp nonzero opts into Low clamp");
 
+	expect(idle_dpm_enabled(false, 0u), "garnet-idle-dpm absent defaults ON");
+	expect(idle_dpm_enabled(true, 1u), "garnet-idle-dpm=1 enables idle governor");
+	expect(!idle_dpm_enabled(true, 0u), "garnet-idle-dpm=0 disables idle governor");
+
+	// Activity-driven SMU GFXCLK idle governor state machine.
+	{
+		constexpr uint64_t kMs = 1000ULL * 1000ULL;
+		IdleDpmGovernor gov {};
+		gov.init(/*dpmEnabled=*/true, /*clampEnabled=*/false, /*nowNs=*/1000ULL * kMs);
+		expect(gov.active() && !gov.is_low(), "governor starts active in SMUPowerState::Auto");
+
+		// Not idle long enough yet (999 ms < 1000 ms).
+		expect(gov.on_tick(1999ULL * kMs, false) == IdleDpmAction::None,
+		       "999 ms idle stays in Auto");
+
+		// In-flight submission holds off Auto -> Low even well past 1000 ms.
+		expect(gov.on_submit_begin(1999ULL * kMs) == IdleDpmAction::None,
+		       "submit_begin while Auto emits zero SMU traffic (deduplicated)");
+		expect(gov.on_tick(5000ULL * kMs, false) == IdleDpmAction::None,
+		       "in-flight submission holds off idle drop past 1000 ms");
+		gov.on_submit_end(5000ULL * kMs);
+		expect(gov.on_tick(5999ULL * kMs, false) == IdleDpmAction::None,
+		       "999 ms after submit_end stays in Auto");
+
+		// Unretired ring work (hwBusy) also holds off idle drop.
+		expect(gov.on_tick(7500ULL * kMs, true) == IdleDpmAction::None,
+		       "hwBusy refreshes idle clock and holds off Low");
+		expect(gov.on_tick(8499ULL * kMs, false) == IdleDpmAction::None,
+		       "999 ms after hwBusy clears stays in Auto");
+
+		// 1000 ms after last activity with zero in-flight work -> Auto -> Low.
+		const IdleDpmAction dropAct = gov.on_tick(8500ULL * kMs, false);
+		expect(dropAct == IdleDpmAction::SetLow, "1000 ms idle triggers Auto -> Low");
+		// Failed SMU transition does not lie about state (allows clean retry).
+		gov.commit(dropAct, false);
+		expect(!gov.is_low() && gov.idleDropCount == 0u, "failed SetLow leaves state Auto for retry");
+		expect(gov.on_tick(8750ULL * kMs, false) == IdleDpmAction::SetLow, "retry emits SetLow");
+		gov.commit(IdleDpmAction::SetLow, true);
+		expect(gov.is_low() && gov.idleDropCount == 1u, "committed SetLow enters Low state");
+
+		// Repeated idle ticks while Low emit zero SMU traffic.
+		expect(gov.on_tick(9500ULL * kMs, false) == IdleDpmAction::None,
+		       "already Low emits no duplicate SetLow");
+		expect(gov.on_tick(20000ULL * kMs, false) == IdleDpmAction::None,
+		       "long idle stays silent in Low");
+
+		// GPU submission while Low triggers Low -> Auto boost once (deduplicated).
+		const IdleDpmAction boostAct = gov.on_activity(21000ULL * kMs);
+		expect(boostAct == IdleDpmAction::SetAuto, "activity while Low requests Low -> Auto");
+		gov.commit(boostAct, true);
+		expect(!gov.is_low() && gov.boostCount == 1u, "committed SetAuto restores Auto");
+		expect(gov.on_activity(21001ULL * kMs) == IdleDpmAction::None,
+		       "subsequent frames while Auto emit zero SMU spam");
+		expect(gov.on_activity(21002ULL * kMs) == IdleDpmAction::None,
+		       "continuous submissions emit zero SMU spam");
+
+		// Drop back to Low after another 1000 ms quiet window, then test submit_begin boost.
+		expect(gov.on_tick(22002ULL * kMs, false) == IdleDpmAction::SetLow,
+		       "second 1000 ms idle window triggers SetLow");
+		gov.commit(IdleDpmAction::SetLow, true);
+		expect(gov.on_submit_begin(23000ULL * kMs) == IdleDpmAction::SetAuto,
+		       "submit_begin while Low requests SetAuto");
+		gov.commit(IdleDpmAction::SetAuto, true);
+		gov.on_submit_end(23050ULL * kMs);
+		expect(gov.inFlight == 0u && gov.boostCount == 2u && gov.idleDropCount == 2u,
+		       "paired submit_begin/end tracks counts accurately");
+
+		// Manual `garnettest power` override locks out governor permanently for the boot.
+		gov.on_manual_override(IdleDpmGovernor::kStateAuto);
+		expect(!gov.active(), "manual garnettest power locks out automatic governor");
+		expect(gov.on_tick(99000ULL * kMs, false) == IdleDpmAction::None,
+		       "manual override blocks Auto -> Low");
+		gov.on_manual_override(IdleDpmGovernor::kStateLow);
+		expect(gov.on_activity(100000ULL * kMs) == IdleDpmAction::None,
+		       "manual Low override blocks Low -> Auto");
+		expect(gov.on_tick(100100ULL * kMs, true) == IdleDpmAction::None,
+		       "manual Low override stays locked even when hwBusy");
+
+		// Kill-switch garnet-idle-dpm=0 disables governor completely.
+		IdleDpmGovernor offGov {};
+		offGov.init(/*dpmEnabled=*/false, /*clampEnabled=*/false, 0ULL);
+		expect(!offGov.active() && !offGov.is_low(), "garnet-idle-dpm=0 stays inactive in Auto");
+		expect(offGov.on_tick(10000ULL * kMs, false) == IdleDpmAction::None,
+		       "garnet-idle-dpm=0 never drops to Low");
+
+		// garnet-idle-clamp=1 bypasses governor completely (stays in Low).
+		IdleDpmGovernor clampGov {};
+		clampGov.init(/*dpmEnabled=*/true, /*clampEnabled=*/true, 0ULL);
+		expect(!clampGov.active() && clampGov.is_low(), "garnet-idle-clamp=1 bypasses governor in Low");
+		expect(clampGov.on_activity(5000ULL * kMs) == IdleDpmAction::None,
+		       "garnet-idle-clamp=1 never boosts to Auto");
+		expect(clampGov.on_tick(5000ULL * kMs, true) == IdleDpmAction::None,
+		       "garnet-idle-clamp=1 stays clamped even when hwBusy");
+
+		// Light desktop compositing hysteresis: 1..5 submits/250 ms (4..20 Hz) drops
+		// Auto -> Low and stays in Low; >= 8 submits/250 ms (32 Hz) or 50 ms hwBusy boosts.
+		IdleDpmGovernor deskGov {};
+		deskGov.init(/*dpmEnabled=*/true, /*clampEnabled=*/false, 1000ULL * kMs);
+		// Sustained 24+ Hz (6 submits / 250 ms) keeps Auto alive indefinitely.
+		expect(deskGov.on_tick(1500ULL * kMs, false, kIdleDpmKeepAutoSubmits) == IdleDpmAction::None,
+		       "6 submits/250ms keeps Auto alive");
+		expect(deskGov.on_tick(2250ULL * kMs, false, kIdleDpmKeepAutoSubmits) == IdleDpmAction::None,
+		       "sustained 24 Hz keeps Auto alive past 1000 ms");
+		// Drop to light idle desktop rate (4 submits / 250 ms = 16 Hz) -> drops to Low after 1000 ms.
+		expect(deskGov.on_tick(2500ULL * kMs, false, 4u) == IdleDpmAction::None, "250 ms light desktop still Auto");
+		expect(deskGov.on_tick(3000ULL * kMs, false, 3u) == IdleDpmAction::None, "750 ms light desktop still Auto");
+		expect(deskGov.on_tick(3250ULL * kMs, false, 4u) == IdleDpmAction::SetLow,
+		       "1000 ms of light desktop frames (< 6/250ms) drops Auto -> Low");
+		deskGov.commit(IdleDpmAction::SetLow, true);
+		expect(deskGov.is_low(), "light desktop entered Low");
+
+		// While Low, 50 ms probe + 200 ms window with 4 submits and !hwBusy stays in Low.
+		uint32_t nextMs = 0u; bool resetWin = false;
+		expect(deskGov.on_low_probe(3300ULL * kMs, false, 1u, &nextMs, &resetWin) == IdleDpmAction::None &&
+		       nextMs == kIdleDpmWindowRemainMs && !resetWin,
+		       "50 ms probe with 1 idle submit arms 200 ms window remainder");
+		expect(deskGov.on_low_probe(3500ULL * kMs, false, 4u, &nextMs, &resetWin) == IdleDpmAction::None &&
+		       nextMs == 0u && resetWin && deskGov.is_low(),
+		       "250 ms window with 4 idle submits resets and stays in Low");
+
+		// Single heavy CB still running at 50 ms probe (hwBusy == true) boosts Low -> Auto.
+		expect(deskGov.on_low_probe(4050ULL * kMs, true, 1u, &nextMs, &resetWin) == IdleDpmAction::SetAuto &&
+		       resetWin,
+		       "single heavy CB still busy at 50 ms probe boosts Low -> Auto");
+		deskGov.commit(IdleDpmAction::SetAuto, true);
+		expect(deskGov.on_tick(5050ULL * kMs, false, 2u) == IdleDpmAction::SetLow,
+		       "returns to Low 1000 ms after heavy CB finishes");
+		deskGov.commit(IdleDpmAction::SetLow, true);
+
+		// High-rate burst (>= 8 submits / 250 ms) boosts Low -> Auto.
+		expect(deskGov.on_low_probe(5100ULL * kMs, false, kIdleDpmBoostSubmits, &nextMs, &resetWin) == IdleDpmAction::SetAuto &&
+		       resetWin,
+		       "burst >= 8 submits/250ms boosts Low -> Auto");
+		deskGov.commit(IdleDpmAction::SetAuto, true);
+		expect(!deskGov.is_low() && deskGov.boostCount == 2u && deskGov.idleDropCount == 2u,
+		       "hysteresis boost/drop counters match");
+	}
+
 	// Exact live RX 9060 XT defaults -> upstream GFX12 gated values
 	expect(gfx12_cgtt_mgcg_override(0x000007FFu, true) == 0x00000040u,
 	       "RLC_CGTT_MGCG_OVERRIDE 0x7FF -> 0x40 (all upstream GFX12 overrides cleared, MGLS untouched)");
