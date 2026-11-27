@@ -1,32 +1,15 @@
-# DCN 4.01 DML2.1 offline prerequisites
+# DCN 4.01 DML2.1: host solver and kernel boundary
 
-Garnet does not currently run DML2.1. To reproduce a display-mode calculation, verify the solver source and run the Linux reference independently before comparing outputs.
+The Garnet host suite runs the 15 DCN 4.01 translation units from Linux `9437ee8b6cf607e883b36e44bd755968daaebd48`. `Garnet.kext` does **not** contain or call the solver. The [import notes](../../src/garnet/src/dcn/dml21/README.md) record provenance and differences from Linux.
 
-## Verify source before importing
+## Run the comparison
 
-The reference is Linux `9437ee8b6cf607e883b36e44bd755968daaebd48`. Check the Git tree IDs under `drivers/gpu/drm/amd/display/dc/dml2_0/dml21`; a nearby kernel release does not guarantee identical inputs:
+`make -C src/garnet/tests all` runs the port under ASan and UBSan. It checks 4K60, 4K160 DSC, and simultaneous DP + HDMI, each with a 32 MiB or 64 MiB MALL profile. The expected values come from compiling the **unmodified** Linux solver separately. The [reference recipe](../../src/garnet/tests/dml21-oracle/README.md) gives the exact inputs, commands, and sanitizer caveats for upstream. All reported watermarks, DET/COMPBUF sizes, P-state methods, MALL byte counts, and pre-routing FAMS2 bytes are compared; these are not hardware traces.
 
-| Source | `inc` tree | `src` tree |
-| --- | --- | --- |
-| Pinned commit | `76503077907f83419bb32239a47a2cd2d31205dd` | `b1b2159d4d8d4e8d9b3edcb85ef199ae88e5162b` |
-| Linux 7.2.12 (`cc9de5d4b5ab6459f5774946aa3195ad51236fa8`) | `fa4d8c6ee4f00147c0e033ef72f5c657b4ee8fe1` | `8545a44bddeea4bdca8887f24272625c9f02df1f` |
-| Nix `linux-src-patched` 7.3.6 (calculated from the unpacked tree) | `ac38085dadf6e970b4b09310cfd57fefbdb79aca` | `c112defd83788b7e575cfd587e90e9a5a3ccbae8` |
+The profiles model unscaled linear ARGB8888 surfaces and fixed clocks and latencies. They do not validate an actual link, measure power, identify a physical HUBP/OTG, or authorize a UCLK change. A real modeset needs a consistent snapshot of active planes, links, clock tables, ATOM memory geometry, and latencies. An idle clock reading or a chip's physical MALL capacity cannot replace that snapshot.
 
-Use a complete local checkout or bundle at the pin, with the wrapper and its DCN 4.01 dependencies as well as the solver. The pin's wrapper is under `dc/dml2_wrapper/dml21_wrapper`, not in the solver directory. Verify the object and trees without triggering a partial clone fetch:
+## Check kernel compilation without enabling execution
 
-```bash
-export GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=file
-pin=9437ee8b6cf607e883b36e44bd755968daaebd48
-solver=drivers/gpu/drm/amd/display/dc/dml2_0/dml21
-git -C "$LINUX_TREE" cat-file -t "$pin" &&
-git -C "$LINUX_TREE" ls-tree "$pin" "$solver/inc" "$solver/src"
-```
+With the cross-toolchain configured, run `make -C src/garnet check-dml21-kernel check-kernel-fp`. The first target compiles the solver and adapter in isolation with SSE2, no AVX, and a 3072-byte per-frame limit. The second checks every object actually linked into the kext for FP/SIMD instructions. The host entry allocates the large contexts on the heap; it is excluded from the kext.
 
-Expect `commit` and the two pinned tree IDs. For an archive without Git objects, authenticate its bytes against the pinned recursive tree or a manifest derived from a verified checkout; a version string is not enough. The local copies differ in the DCN 4.01 core and shared headers, not only in post-DCN 4.01 source files. Neither is a verified replacement. Preserve MIT notices and record port changes separately from the source import.
-
-## Build and validate the bridge
-
-- Independently run the pinned, unmodified Linux solver in a host oracle. Record complete inputs, revision and build command, then compare the Garnet bridge against those outputs under ASan+UBSan. Cover 4K@60, 4K@160 DSC, and mixed DP+HDMI on both Navi 44 and Navi 48. Compare mode support, urgent/stutter/UCLK/FCLK watermarks, DET and COMPBUF allocations, UCLK P-state method, per-plane MALL bytes and FAMS2 programming. Verify units before comparing: e.g. raw register cycles vs. time, and bytes/KiB vs. hardware segments.
-- Record each mode's timing, link rate, lane count, color depth, DSC settings, scanout layout, cursor, and pipe mapping. A measured timing (e.g. 533.250 MHz; totals 4000 × 2222 for 4K60) and an idle clock reading are not a DCN clock table. Linux `dc/soc_and_ip_translator/dcn401/dcn401_soc_and_ip_translator.c` labels its default clock table a placeholder. Use per-chip SMU clocks and BIOS latencies, and distinguish physical MALL (32/64 MiB) from the available display budget.
-- Allocate the solver instance, initialization inputs, display config/scratch and programming outputs on the heap, outside the FPU critical section. Expose integer inputs/outputs at the kernel boundary; do the conversions inside the isolated `-msse -msse2 -mno-avx` objects with a `3072`-byte per-frame limit. Keep clock access and MMIO out of the solver. The absence of FP/SIMD in non-DML object disassembly does not prove the solver's stack or FPU context safety.
-- Before invoking the solver, establish the supported XNU preemption and FPU ownership hooks for the target x86_64 kernel. Reject IRQ or unsupported FPU state before the first `fxsave64`; do not clear `CR0.TS` speculatively. Verify save/restore of x87/SSE and MXCSR around a non-sleeping call, outside `gScanoutLock` and `rdna4_display_txn`, before using the results to program a mode.
+On the examined Darwin 25.6 x86_64 kernel, XNU manages extended processor state during context switches and `#NM` handling. Its kext interfaces expose interrupt controls, but no verified way for this driver to acquire FPU ownership. A driver lock, disabling interrupts, or saving with `fxsave64` does not establish ownership. Do not call the solver from the kernel on that basis.

@@ -95,7 +95,7 @@ Meanwhile, Wave 9 compute benchmarks (`logs/rdna4-perf-baseline/perf-160fps-wave
 
 ### 6.1 Full MIT DML2.1 Port & macOS x86_64 Kernel FPU Isolation
 - **Upstream MIT C source subset (`torvalds/linux/drivers/gpu/drm/amd/display/dc/dml2_0/Makefile`)**:
-  - `dml21/src/dml2_top/{dml2_top_interfaces,dml2_top_soc15,dml2_top_utm}.c`
+  - `dml21/src/dml2_top/{dml2_top_interfaces,dml2_top_soc15}.c` (DCN 4.01 uses the SoC15 path, not UTM)
   - `dml21/src/dml2_core/{dml2_core_dcn4,dml2_core_utils,dml2_core_factory,dml2_core_dcn4_calcs}.c`
   - `dml21/src/dml2_dpmm/{dml2_dpmm_dcn4,dml2_dpmm_factory}.c`
   - `dml21/src/dml2_mcg/{dml2_mcg_dcn4,dml2_mcg_factory}.c`
@@ -104,7 +104,7 @@ Meanwhile, Wave 9 compute benchmarks (`logs/rdna4-perf-baseline/perf-160fps-wave
   (DCN5/DCN6 files are excluded.)
 - **macOS x86_64 kext constraints (`src/garnet/Makefile:101-108`)**:
   - Normal kext objects compile with `-mkernel` (no FPU/SSE instructions). DML2.1 `.c` files must be isolated in their own build rule with `-msse -msse2 -mno-avx -Wframe-larger-than=3072` (never touching non-DML translation units).
-  - Every DML2.1 call site must be wrapped in serialized `DC_FP_START()` / `DC_FP_END()`: acquire dedicated `IOLock`, disable preemption/interrupts around `fxsave64` (64-byte-aligned buffer) + `fninit` + `ldmxcsr(0x1F80)` on entry and `fxrstor64` on exit, strictly forbidden from primary/VBL IRQ context.
+  - A non-IRQ lock and `fxsave64`/`fxrstor64` do not grant ownership of a thread's FPU state. The solver runs in the host suite only; see [the kernel boundary and offline comparison](dml21-offline-prerequisites.md).
   - Because `dml2_core_dcn4_calcs.c` carries large structs and macOS kernel thread stacks are 16 KiB, `dml2_context` / `display_configuation_with_meta` / `dml2_display_cfg_programming` MUST be heap-allocated (`IOMallocZero` / `IOFree`), never stack-allocated.
 
 ### 6.2 FAMS2 v2.1 & SubVP
