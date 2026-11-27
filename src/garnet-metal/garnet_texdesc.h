@@ -11,7 +11,7 @@
 // MTLTextureType values (asserted in GarnetDevice.m)
 enum { RDNA4TD_MTL_1D = 0, RDNA4TD_MTL_1DARRAY = 1, RDNA4TD_MTL_2D = 2, RDNA4TD_MTL_2DARRAY = 3, RDNA4TD_MTL_2DMS = 4, RDNA4TD_MTL_CUBE = 5, RDNA4TD_MTL_CUBEARRAY = 6, RDNA4TD_MTL_3D = 7, RDNA4TD_MTL_2DMSARRAY = 8, RDNA4TD_MTL_BUFFER = 9 };
 // MTLTextureUsage bits
-enum { RDNA4TD_USE_SHADERWRITE = 2, RDNA4TD_USE_RENDERTARGET = 4 };
+enum { RDNA4TD_USE_SHADERREAD = 1, RDNA4TD_USE_SHADERWRITE = 2, RDNA4TD_USE_RENDERTARGET = 4 };
 // VkImageType / VkImageViewType values and the create flag (asserted in GarnetDevice.m)
 enum { RDNA4TD_VK_IMAGE_1D = 0, RDNA4TD_VK_IMAGE_2D = 1, RDNA4TD_VK_IMAGE_3D = 2 };
 enum { RDNA4TD_VK_VIEW_1D = 0, RDNA4TD_VK_VIEW_2D = 1, RDNA4TD_VK_VIEW_3D = 2, RDNA4TD_VK_VIEW_CUBE = 3, RDNA4TD_VK_VIEW_1D_ARRAY = 4, RDNA4TD_VK_VIEW_2D_ARRAY = 5, RDNA4TD_VK_VIEW_CUBE_ARRAY = 6 };
@@ -47,7 +47,9 @@ static inline int rdna4td_map(unsigned long tt, unsigned long w, unsigned long h
         if (arrayLength < 1 || arrayLength > UINT32_MAX) { o->why = "a 2D multisample-array texture needs 1 <= arrayLength <= UINT32_MAX"; return 0; }
         if (depth != 1) { o->why = "a 2D multisample-array texture has depth 1"; return 0; }
         if (levels != 1) { o->why = "a 2D multisample-array texture has one mip level"; return 0; }
-        if (usage & RDNA4TD_USE_SHADERWRITE) { o->why = "ShaderWrite on a multisample texture is not supported (a storage image cannot be multisampled here)"; return 0; }
+        // Callers like ANGLE Metal conservatively OR ShaderWrite alongside RenderTarget/ShaderRead on MSAA targets;
+        // accept those (storage usage is omitted on VkImage creation) and only refuse pure storage-only MSAA textures.
+        if ((usage & RDNA4TD_USE_SHADERWRITE) && !(usage & (RDNA4TD_USE_SHADERREAD | RDNA4TD_USE_RENDERTARGET))) { o->why = "ShaderWrite on a multisample texture is not supported (a storage image cannot be multisampled here)"; return 0; }
         o->kind = RDNA4TD_K_2DMSARRAY; o->imageType = RDNA4TD_VK_IMAGE_2D; o->viewType = RDNA4TD_VK_VIEW_2D_ARRAY;
         o->layers = (unsigned)arrayLength; o->flags = 0; o->layersIvar = (unsigned)arrayLength; o->samples = (unsigned)sampleCount;
         o->ok = 1; return 1;
@@ -57,7 +59,7 @@ static inline int rdna4td_map(unsigned long tt, unsigned long w, unsigned long h
         if (arrayLength != 1) { o->why = "a 2D multisample texture has arrayLength 1 (use 2DMultisampleArray)"; return 0; }
         if (depth != 1) { o->why = "a 2D multisample texture has depth 1"; return 0; }
         if (levels != 1) { o->why = "a 2D multisample texture has one mip level"; return 0; }
-        if (usage & RDNA4TD_USE_SHADERWRITE) { o->why = "ShaderWrite on a multisample texture is not supported (a storage image cannot be multisampled here)"; return 0; }
+        if ((usage & RDNA4TD_USE_SHADERWRITE) && !(usage & (RDNA4TD_USE_SHADERREAD | RDNA4TD_USE_RENDERTARGET))) { o->why = "ShaderWrite on a multisample texture is not supported (a storage image cannot be multisampled here)"; return 0; }
         o->kind = RDNA4TD_K_2DMS; o->imageType = RDNA4TD_VK_IMAGE_2D; o->viewType = RDNA4TD_VK_VIEW_2D; o->layers = 1; o->flags = 0; o->layersIvar = 0; o->samples = (unsigned)sampleCount;
         o->ok = 1; return 1;
     }
