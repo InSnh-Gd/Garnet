@@ -1,0 +1,200 @@
+From: Garnet local integration
+Subject: [PATCH 32/32] aco/spill: bound spill_ctx memory with IDSet and dead-block spill-map release
+
+Large compute shaders with heavy register spilling (such as Blender Cycles
+MetalRT uber-shaders translated to SPIR-V, ~99k ACO blocks and ~157k spill IDs
+with ~240M interference edges) caused aco::spill phys_footprint to explode past
+12-29 GiB on 16 GiB macOS hosts due to two unbounded allocations in spill_ctx:
+
+1. spill_ctx::interferences stored std::unordered_set<uint32_t> per spill ID,
+   allocating two libc++ hash-table nodes plus bucket storage (~96 B/edge) via
+   operator new. Replacing it with aco::IDSet backed by spill_ctx::memory (held
+   in a std::deque for stable addresses with O(1) indexing) cuts 240M edges
+   from ~23 GiB down to ~301 MiB used.
+2. spills_entry and spills_exit used aco::unordered_map backed by the
+   non-reclaiming monotonic_buffer_resource across all ~99k blocks, and
+   spill_block copied spills_entry -> spills_exit without reserve(), leaking
+   rehash buckets and retaining ~9.5 GiB used / 16 GiB slab of dead per-block
+   spill maps. Moving spills_entry/spills_exit (and loop_info::spills) to
+   std::unordered_map, moving spills_entry -> spills_exit for non-loop-header
+   blocks, saving only top-level SGPR spill IDs for end_unused_spill_vgprs(),
+   and releasing spills_exit[pred] once all predecessor-reading successors
+   (and loop-header coupling code) finish keeps only the active CFG frontier
+   in memory.
+
+Together these cut cycles_metal_integrator_shade_shadow from >29.9 GiB Jetsam
+OOM down to 2,156 MiB total peak (1,638 MiB during aco::spill) in 230.9s with
+identical spill slot assignments.
+
+Base: f5cb8ee032adabef599ae892ec4e42d796b84da9 + patches 0001..0031.
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 3e238f1..b0d716a 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -11,11 +11,11 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <deque>
+ #include <map>
+ #include <optional>
+ #include <set>
+ #include <unordered_map>
+-#include <unordered_set>
+ #include <vector>
+ 
+ namespace std {
+@@ -52,7 +52,7 @@ struct remat_info {
+ 
+ struct loop_info {
+    uint32_t index;
+-   aco::unordered_map<Temp, uint32_t> spills;
++   std::unordered_map<Temp, uint32_t> spills;
+    IDSet live_in;
+ };
+ 
+@@ -68,14 +68,16 @@ struct spill_ctx {
+    aco::monotonic_buffer_resource memory;
+ 
+    std::vector<aco::map<Temp, Temp>> renames;
+-   std::vector<aco::unordered_map<Temp, uint32_t>> spills_entry;
+-   std::vector<aco::unordered_map<Temp, uint32_t>> spills_exit;
++   std::vector<std::unordered_map<Temp, uint32_t>> spills_entry;
++   std::vector<std::unordered_map<Temp, uint32_t>> spills_exit;
++   std::vector<uint32_t> spills_exit_uses;
++   std::vector<std::vector<uint32_t>> top_level_sgpr_spills;
+ 
+    std::vector<bool> processed;
+    std::vector<loop_info> loop;
+ 
+    std::vector<use_info> ssa_infos;
+-   std::vector<std::pair<RegClass, std::unordered_set<uint32_t>>> interferences;
++   std::deque<std::pair<RegClass, aco::IDSet>> interferences;
+    std::vector<std::vector<uint32_t>> affinities;
+    std::vector<bool> is_reloaded;
+    aco::unordered_map<Temp, remat_info> remat;
+@@ -98,12 +100,20 @@ struct spill_ctx {
+              unsigned max_lds_spill_slots_)
+        : target_pressure(target_pressure_), program(program_), memory(),
+          renames(program->blocks.size(), aco::map<Temp, Temp>(memory)),
+-         spills_entry(program->blocks.size(), aco::unordered_map<Temp, uint32_t>(memory)),
+-         spills_exit(program->blocks.size(), aco::unordered_map<Temp, uint32_t>(memory)),
++         spills_entry(program->blocks.size()), spills_exit(program->blocks.size()),
++         spills_exit_uses(program->blocks.size(), 0),
++         top_level_sgpr_spills(program->blocks.size()),
+          processed(program->blocks.size(), false), ssa_infos(program->peekAllocationId()),
+          remat(memory), wave_size(program->wave_size), sgpr_spill_slots(0), vgpr_spill_slots(0),
+          extra_vgprs(extra_vgprs_), resume_idx(0), max_lds_spill_slots(max_lds_spill_slots_)
+-   {}
++   {
++      for (const Block& b : program->blocks) {
++         for (unsigned pred_idx : b.linear_preds)
++            spills_exit_uses[pred_idx]++;
++         for (unsigned pred_idx : b.logical_preds)
++            spills_exit_uses[pred_idx]++;
++      }
++   }
+ 
+    void add_affinity(uint32_t first, uint32_t second)
+    {
+@@ -135,7 +145,7 @@ struct spill_ctx {
+       }
+    }
+ 
+-   uint32_t add_to_spills(Temp to_spill, aco::unordered_map<Temp, uint32_t>& spills)
++   uint32_t add_to_spills(Temp to_spill, std::unordered_map<Temp, uint32_t>& spills)
+    {
+       const uint32_t spill_id = allocate_spill_id(to_spill.regClass());
+       for (auto pair : spills)
+@@ -161,11 +171,24 @@ struct spill_ctx {
+ 
+    uint32_t allocate_spill_id(RegClass rc)
+    {
+-      interferences.emplace_back(rc, std::unordered_set<uint32_t>());
++      interferences.emplace_back(rc, aco::IDSet(memory));
+       is_reloaded.push_back(false);
+       return next_spill_id++;
+    }
+ 
++   void release_pred_spills(const Block* block)
++   {
++      auto dec = [&](unsigned pred_idx) {
++         assert(spills_exit_uses[pred_idx] > 0);
++         if (--spills_exit_uses[pred_idx] == 0 && processed[pred_idx])
++            std::unordered_map<Temp, uint32_t>().swap(spills_exit[pred_idx]);
++      };
++      for (unsigned pred_idx : block->linear_preds)
++         dec(pred_idx);
++      for (unsigned pred_idx : block->logical_preds)
++         dec(pred_idx);
++   }
++
+    std::pair<int, float> get_score(Temp var, RegisterDemand spills_needed)
+    {
+       int wasted = MAX2((int)var.size() - spills_needed[var.type()], 0);
+@@ -1160,13 +1183,28 @@ spill_block(spill_ctx& ctx, unsigned block_idx)
+    if (!(block->kind & block_kind_loop_header)) {
+       /* add spill/reload code on incoming control flow edges */
+       add_coupling_code(ctx, block, ctx.program->live.live_in[block_idx]);
++      ctx.release_pred_spills(block);
++   }
++
++   if (block->kind & block_kind_top_level) {
++      for (const std::pair<const Temp, uint32_t>& pair : ctx.spills_entry[block_idx]) {
++         if (pair.first.type() == RegType::sgpr)
++            ctx.top_level_sgpr_spills[block_idx].push_back(pair.second);
++      }
+    }
+ 
+    assert(ctx.spills_exit[block_idx].empty());
+-   ctx.spills_exit[block_idx] = ctx.spills_entry[block_idx];
++   if (!(block->kind & block_kind_loop_header)) {
++      ctx.spills_exit[block_idx] = std::move(ctx.spills_entry[block_idx]);
++   } else {
++      ctx.spills_exit[block_idx].reserve(ctx.spills_entry[block_idx].size());
++      ctx.spills_exit[block_idx] = ctx.spills_entry[block_idx];
++   }
+    process_block(ctx, block_idx, block, spilled_registers);
+ 
+    ctx.processed[block_idx] = true;
++   if (ctx.spills_exit_uses[block_idx] == 0)
++      std::unordered_map<Temp, uint32_t>().swap(ctx.spills_exit[block_idx]);
+ 
+    /* check if the next block leaves the current loop */
+    if (block->loop_nest_depth == 0 ||
+@@ -1182,6 +1220,8 @@ spill_block(spill_ctx& ctx, unsigned block_idx)
+    for (unsigned t : ctx.loop.back().live_in)
+       ctx.ssa_infos[t].num_uses--;
+    add_coupling_code(ctx, &ctx.program->blocks[loop_header_idx], ctx.loop.back().live_in);
++   ctx.release_pred_spills(&ctx.program->blocks[loop_header_idx]);
++   std::unordered_map<Temp, uint32_t>().swap(ctx.spills_entry[loop_header_idx]);
+    renames.swap(ctx.renames[loop_header_idx]);
+ 
+    /* remove loop header info from stack */
+@@ -1586,12 +1626,12 @@ assign_spill_slots_helper(spill_ctx& ctx, RegType type, std::vector<bool>& is_as
+ void
+ end_unused_spill_vgprs(spill_ctx& ctx, Block& block, std::vector<Temp>& vgpr_spill_temps,
+                        const std::vector<uint32_t>& slots,
+-                       const aco::unordered_map<Temp, uint32_t>& spills)
++                       const std::vector<uint32_t>& sgpr_spills)
+ {
+    std::vector<bool> is_used(vgpr_spill_temps.size());
+-   for (std::pair<Temp, uint32_t> pair : spills) {
+-      if (pair.first.type() == RegType::sgpr && ctx.is_reloaded[pair.second])
+-         is_used[slots[pair.second] / ctx.wave_size] = true;
++   for (uint32_t spill_id : sgpr_spills) {
++      if (ctx.is_reloaded[spill_id])
++         is_used[slots[spill_id] / ctx.wave_size] = true;
+    }
+ 
+    std::vector<Temp> temps;
+@@ -1684,7 +1724,7 @@ assign_spill_slots(spill_ctx& ctx, unsigned spills_to_vgpr)
+       if (block.kind & block_kind_top_level) {
+          last_top_level_block_idx = block.index;
+ 
+-         end_unused_spill_vgprs(ctx, block, vgpr_spill_temps, slots, ctx.spills_entry[block.index]);
++         end_unused_spill_vgprs(ctx, block, vgpr_spill_temps, slots, ctx.top_level_sgpr_spills[block.index]);
+ 
+          /* If the block has no predecessors (for example in RT resume shaders),
+           * we cannot reuse the current scratch_rsrc temp because its definition is unreachable */
