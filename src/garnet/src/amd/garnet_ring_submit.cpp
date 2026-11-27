@@ -933,6 +933,52 @@ struct BufferEnv {
     }
 };
 
+// Synchronously zero-clear [vaCanon, vaCanon + bytes) through the session's live PTEs (PTE.DCC=1 for DCC BOs,
+// PTE.DCC=0 for non-DCC hi-pool BOs) via CP_DMA + GL2 WB/INV. Caller holds ONLY s->lock.
+uint32_t bo_gpu_clear_va(Session *s, uint64_t vaCanon, uint64_t bytes) {
+    if (bytes == 0ull || (bytes & 3ull) != 0ull) return kBadArg;
+    BufferEnv env{s};
+    uint32_t rc = env.gate();
+    if (rc != kOk) return rc;
+    rc = env.prepare();
+    if (rc != kOk) return rc;
+    uint32_t packet[256];
+    uint64_t done = 0ull;
+    while (done < bytes) {
+        const uint64_t chunk = (bytes - done) > RDNA4N_BUFFER_MAX_BYTES ? RDNA4N_BUFFER_MAX_BYTES : (bytes - done);
+        const uint32_t n = rdna4native::s1c::buffer_build(packet, 256u, 0ull, vaCanon + done, chunk, true, 0u);
+        if (n == 0u) return kBadArg;
+        rc = env.idle();
+        if (rc != kOk) return rc;
+        rc = env.gate();
+        if (rc != kOk) return rc;
+        uint64_t seq = 0ull;
+        rc = env.submit(packet, n, &seq);
+        if (rc != kOk) return rc;
+        done += chunk;
+    }
+    return env.idle();
+}
+
+// Flush and invalidate GL2/TC before recycling a ReBAR visible-pool DCC BO back to vram_alloc. Caller holds ONLY s->lock.
+uint32_t bo_gpu_gl2_inv(Session *s) {
+    if (s->bufferIbPa == 0ull) return kOk;
+    BufferEnv env{s};
+    uint32_t rc = env.gate();
+    if (rc != kOk) return rc;
+    rc = env.idle();
+    if (rc != kOk) return rc;
+    rc = env.gate();
+    if (rc != kOk) return rc;
+    uint32_t packet[16];
+    const uint32_t n = rdna4native::s1c::buffer_build_gl2_inv(packet, 16u);
+    if (n == 0u) return kBadArg;
+    uint64_t seq = 0ull;
+    rc = env.submit(packet, n, &seq);
+    if (rc != kOk) return rc;
+    return env.idle();
+}
+
 IOReturn n1c_buffer_op(const N1cRef &ref, const rdna4n_buffer_op *in, bool fill, uint64_t *seqOut) {
     if (!in || !seqOut) return kIOReturnBadArgument;
     *seqOut = 0;

@@ -68,6 +68,8 @@ struct Bo {
     uint8_t   kind;
     bool      uc;          // created UNCACHED
     bool      dcc;         // GFX12 AMDGPU_PTE_DCC (NO_CPU_ACCESS VRAM BO with RDNA4N_GEM_GFX12_DCC when dcc_on())
+    uint8_t   needsGpuClear; // 1 = clear via GPU CP_DMA on first writable GemVa map (DCC BOs + non-DCC hi-pool BOs)
+    uint64_t  clearedBytes;  // contiguous prefix [0, clearedBytes) already GPU-cleared
     uint64_t  size;        // 4 KiB rounded (what the caller asked for)
     uint64_t  mc;          // VRAM MC address (vis / hi)
     VRAMAllocation a;      // vis / hi
@@ -199,6 +201,8 @@ void hang_from_wait();
 uint32_t stall_from_wait();
 uint32_t gpu_gate(const Session *s);
 bool own_wait(Session *s, bool *noBlame = nullptr);
+uint32_t bo_gpu_clear_va(Session *s, uint64_t vaCanon, uint64_t bytes);
+uint32_t bo_gpu_gl2_inv(Session *s);
 uint32_t flush_vmid(uint32_t vmid);
 uint32_t program_root(uint32_t vmid, uint64_t rootPa);
 uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok);
