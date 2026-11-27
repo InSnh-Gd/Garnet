@@ -3,7 +3,7 @@
 # runtime layout gate, gates/layout_gate_host.py). For each plant: copy the aux dir and the ioaccel-layout tools into a scratch tree, apply the break, run the REAL `make`
 # and demand that it FAILS; where the kext still linked, the host twin is also run on the planted binary and must say what the gate says (it FAILs when a slot is not
 # exactly the family's). The CONTROL (no break) must build and both gates PASS. Slow (about 30 s per plant).
-#   tools/native/garnetaccel/tests/gate_plants.sh [first last]
+#   GARNET_KC_WORK=/path/to/kc-work src/garnet-accel/tests/gate_plants.sh [first last]
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -13,7 +13,8 @@ escaped=0; total=0
 FIRST=${1:-0}; LAST=${2:-9999}
 A=src/garnet-accel
 L=tools/ioaccel-layout
-LAYOUT_DATA="${C64_LAYOUT_OUT:-$ROOT/$L/layout-out}"
+LAYOUT_DATA="${GARNET_LAYOUT_OUT:-$ROOT/$L/layout-out}"
+KC_WORK="${GARNET_KC_WORK:?set GARNET_KC_WORK to the target KC work directory}"
 
 fresh() {
   rm -rf "$SCR"; mkdir -p "$SCR/src" "$SCR/tools"
@@ -22,14 +23,14 @@ fresh() {
   rsync -a --exclude build --exclude vtables "$LAYOUT_DATA/" "$SCR/$L/layout-out/"
 }
 run_make() {   # -> 0 if make succeeded (gates passed), 1 if it failed
-  (cd "$SCR/$A" && C64_LAYOUT_OUT="$SCR/$L/layout-out" make CXX="${CXX:-clang++}" CC="${CC:-clang}" MKSDK="${MKSDK:-$ROOT/build-toolchain/sdk}" KEXT_LD="${KEXT_LD:-$ROOT/build-toolchain/cctools/bin/x86_64-apple-darwin-ld}" C64_WORK="${C64_WORK:-$ROOT/build-offline/vm-25G332}" > "$SCR/make.log" 2>&1)
+  (cd "$SCR/$A" && GARNET_LAYOUT_OUT="$SCR/$L/layout-out" make CXX="${CXX:-clang++}" CC="${CC:-clang}" MKSDK="${MKSDK:-$ROOT/build-toolchain/sdk}" KEXT_LD="${KEXT_LD:-$ROOT/build-toolchain/cctools/bin/x86_64-apple-darwin-ld}" GARNET_KC_WORK="$KC_WORK" > "$SCR/make.log" 2>&1)
 }
 twin() {       # the host twin on the planted binary, if it linked
   local exe="$SCR/$A/build/GarnetAccel.kext/Contents/MacOS/GarnetAccel"
   [ -f "$exe" ] || { echo "no binary"; return 9; }
-  local nm_bin="${C64_NM:-}"
+  local nm_bin="${GARNET_NM:-}"
   if [ -z "$nm_bin" ] && [ "$(uname -s)" != Darwin ]; then nm_bin=llvm-nm; fi
-  (cd "$SCR/$A" && C64_NM="$nm_bin" C64_LAYOUT_OUT="$SCR/$L/layout-out" python3 gates/layout_gate_host.py "$exe" 2>&1 | tail -1)
+  (cd "$SCR/$A" && GARNET_NM="$nm_bin" GARNET_KC_WORK="$KC_WORK" GARNET_LAYOUT_OUT="$SCR/$L/layout-out" python3 gates/layout_gate_host.py "$exe" 2>&1 | tail -1)
 }
 plant() {   # plant <id> <file relative to the scratch root> <description> <old1> <new1> ...
   local id="$1" file="$2" desc="$3" want_twin="$4"; shift 4

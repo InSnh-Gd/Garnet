@@ -4,7 +4,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 test_dir=$(cd "$(dirname "$0")" && pwd)
 mesa=$(cd "${1:?usage: bash mesa-patches/tests/test-gfx1200-runtime.sh PATCHED_MESA [OUTPUT_DIR]}" && pwd)
-out=${2:-"$repo/build-offline/mesa-gfx1200/hosttest"}
+out=${2:-"${TMPDIR:-/tmp}/garnet-mesa-hosttest"}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 cc=${CC:-clang}

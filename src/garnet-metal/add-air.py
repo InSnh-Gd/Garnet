@@ -10,8 +10,10 @@ kernel_dispatch, function_constants): the bundle reads static samplers and the c
 Kernels: metal2vulkan's default is `--local 64,1,1` with ThreadsDynamic dispatch (the safe default); --local NAME=X,Y,Z sets the
 nominal threadgroup size for kernels whose AIR name is NAME (the .txt sidecar of dumpair holds the name).
 """
-import glob, hashlib, json, os, struct, subprocess, sys
-M2V = os.environ.get("M2V", os.path.expanduser("~/rdna4-native/metal2vulkan/target/release/metal2vulkan"))
+import glob, hashlib, json, os, shutil, struct, subprocess, sys
+M2V = os.environ.get("M2V") or shutil.which("metal2vulkan")
+if not M2V:
+    sys.exit("add-air.py: set M2V=/path/to/metal2vulkan or put metal2vulkan on PATH")
 env = dict(os.environ); env["PATH"] = "/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:" + env.get("PATH", "")
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spvcache")
 args = sys.argv[1:]; locs = {}; files = []

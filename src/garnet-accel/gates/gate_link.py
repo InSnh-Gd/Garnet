@@ -64,7 +64,7 @@ def gate_c():
     problems = []
     with tempfile.TemporaryDirectory(prefix='rdna4gen') as tmp:
         shutil.copyfile(os.path.join(LAYOUT_OUT, 'model.json'), os.path.join(tmp, 'model.json'))
-        env = dict(os.environ, C64_LAYOUT_OUT=tmp)
+        env = dict(os.environ, GARNET_LAYOUT_OUT=tmp)
         r = subprocess.run([sys.executable, os.path.join(LAYOUT, 'gen_header.py')], env=env, capture_output=True, text=True)
         if r.returncode:
             problems.append('gen_header.py failed: ' + r.stderr[-300:])
@@ -75,7 +75,7 @@ def gate_c():
                 problems.append('IOAccelFamily2_decl.h is STALE (regenerating gives a different file): run tools/ioaccel-layout/gen_header.py')
             else:
                 print('  C generated header fresh: sha256 %s' % hashlib.sha256(a).hexdigest()[:16])
-    cl = subprocess.run([sys.executable, os.path.join(LAYOUT, 'check_layout.py')], env=dict(os.environ, C64_LAYOUT_OUT=LAYOUT_OUT), capture_output=True, text=True)
+    cl = subprocess.run([sys.executable, os.path.join(LAYOUT, 'check_layout.py')], env=dict(os.environ, GARNET_LAYOUT_OUT=LAYOUT_OUT), capture_output=True, text=True)
     last = [l for l in cl.stdout.splitlines() if l.startswith(('MATCH', 'MISMATCH', 'COMPILE'))]
     print('  C check_layout.py: ' + (last[-1] if last else 'no verdict (rc=%d): %s' % (cl.returncode, ' / '.join(cl.stderr.splitlines()[-3:]))))
     if cl.returncode != 0:

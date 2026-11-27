@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build one matched standalone Garnet payload for install-native.sh; never install or load it.
-# Usage: MKSDK=... C64_LAYOUT_OUT=... C64_WORK=... [other inputs] build-all.sh OUT_DIR
+# Usage: MKSDK=... GARNET_LAYOUT_OUT=... GARNET_KC_WORK=... [other inputs] build-all.sh OUT_DIR
 set -euo pipefail
 export LC_ALL=C
 export PYTHONDONTWRITEBYTECODE=1
@@ -72,16 +72,16 @@ require_file() { [ -n "$2" ] && [ -f "$2" ] || fail "$1 must name an existing fi
 absolute_file() { printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"; }
 plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1"; }
 require_dir MKSDK "${MKSDK:-}"
-require_dir C64_LAYOUT_OUT "${C64_LAYOUT_OUT:-}"
-require_dir C64_WORK "${C64_WORK:-}"
-require_dir C64_WORK/kc "$C64_WORK/kc"
-require_dir C64_WORK/kexts "$C64_WORK/kexts"
+require_dir GARNET_LAYOUT_OUT "${GARNET_LAYOUT_OUT:-}"
+require_dir GARNET_KC_WORK "${GARNET_KC_WORK:-}"
+require_dir GARNET_KC_WORK/kc "$GARNET_KC_WORK/kc"
+require_dir GARNET_KC_WORK/kexts "$GARNET_KC_WORK/kexts"
 [ -z "${RDNA4_FB_KEXT:-}" ] || fail 'RDNA4_FB_KEXT is obsolete; standalone Garnet builds directly from src/garnet'
 [ -z "${RDNA4_DISPLAY_SRC:-}" ] || fail 'RDNA4_DISPLAY_SRC is obsolete; standalone Garnet builds directly from src/garnet'
 [ -z "${RDNA4_LILU_KEXT:-}" ] || fail 'RDNA4_LILU_KEXT is obsolete; standalone Garnet requires no Lilu dependency'
 MKSDK=$(cd "$MKSDK" && pwd -P)
-C64_LAYOUT_OUT=$(cd "$C64_LAYOUT_OUT" && pwd -P)
-C64_WORK=$(cd "$C64_WORK" && pwd -P)
+GARNET_LAYOUT_OUT=$(cd "$GARNET_LAYOUT_OUT" && pwd -P)
+GARNET_KC_WORK=$(cd "$GARNET_KC_WORK" && pwd -P)
 CHIPS=${CHIPS:-navi44}
 for chip in $CHIPS; do
     case "$chip" in navi44|navi48) ;; *) fail "CHIPS contains unsupported chip: $chip";; esac
@@ -167,8 +167,8 @@ metal_meta_count=$(find "$metal_cache" -maxdepth 1 -type f -name '*.meta.json' |
 [ "$metal_spv_count" -gt 0 ] && [ "$metal_spv_count" -eq "$metal_meta_count" ] || \
     fail 'Metal shader cache must contain matching .spv and .meta.json files'
 record_input MKSDK "$MKSDK"
-record_input C64_LAYOUT_OUT "$C64_LAYOUT_OUT"
-record_input C64_WORK "$C64_WORK"
+record_input GARNET_LAYOUT_OUT "$GARNET_LAYOUT_OUT"
+record_input GARNET_KC_WORK "$GARNET_KC_WORK"
 if [ -n "${RDNA4_MESA_SRC:-}" ]; then
     record_input RDNA4_MESA_SRC "$RDNA4_MESA_SRC"
 fi
@@ -195,10 +195,10 @@ bash "$repo/tools/rdna4/xlate-guard.sh" verify "$repo" "$RDNA4_XLATE_LIB" \
     || fail 'RDNA4_XLATE_LIB failed symbol/freshness verification'
 record_input RDNA4_RADV_LIB "$RDNA4_RADV_LIB"
 record_input RDNA4_XLATE_LIB "$RDNA4_XLATE_LIB"
-export RDNA4_RADV_LIB RDNA4_XLATE_LIB RDNA4_VK_INC C64_WORK
+export RDNA4_RADV_LIB RDNA4_XLATE_LIB RDNA4_VK_INC GARNET_KC_WORK
 make -C "$repo/src/garnet" all "CHIPS=$CHIPS" "MKSDK=$MKSDK" "BUILD=$work/garnet" >&2
-C64_MKSDK="$MKSDK" make -C "$repo/src/garnet-accel" all "MKSDK=$MKSDK" \
-    "C64_LAYOUT_OUT=$C64_LAYOUT_OUT" "C64_WORK=$C64_WORK" "BUILD=$work/accel" >&2
+GARNET_MKSDK="$MKSDK" make -C "$repo/src/garnet-accel" all "MKSDK=$MKSDK" \
+    "GARNET_LAYOUT_OUT=$GARNET_LAYOUT_OUT" "GARNET_KC_WORK=$GARNET_KC_WORK" "BUILD=$work/accel" >&2
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     make -C "$repo/src/garnet-pci-compat" all "MKSDK=$MKSDK" "BUILD=$work/pcibarcompat" SIGN=1 >&2
 fi
@@ -212,7 +212,7 @@ release_layout_id=
 release_short_id=
 if [ "$RDNA4_RELEASE" = 1 ]; then
     release_layout_id=$(python3 "$fp_exporter" \
-        --layout-out "$C64_LAYOUT_OUT" \
+        --layout-out "$GARNET_LAYOUT_OUT" \
         --gates-dir "$repo/src/garnet-accel/gates" \
         --out "$work/layout-fingerprint.json" \
         --variants-index "$work/variants-index.json" \
@@ -441,8 +441,8 @@ fi
     printf 'BUILD_CARGO=%s\nBUILD_NINJA=%s\nBUILD_MESON=%s\n' \
         "$cargo_version" "$ninja_version" "$meson_version"
     printf 'BUILD_GARNET_OPTIONS=CHIPS=%s BUILD=work/garnet\n' "$CHIPS"
-    printf 'BUILD_ACCEL_OPTIONS=CHIPS=%s BUILD=work/accel C64_LAYOUT_OUT=%s C64_WORK=%s\n' \
-        "$CHIPS" "$C64_LAYOUT_OUT" "$C64_WORK"
+    printf 'BUILD_ACCEL_OPTIONS=CHIPS=%s BUILD=work/accel GARNET_LAYOUT_OUT=%s GARNET_KC_WORK=%s\n' \
+        "$CHIPS" "$GARNET_LAYOUT_OUT" "$GARNET_KC_WORK"
     if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
         printf 'BUILD_PCIBARCOMPAT_OPTIONS=BUILD=work/pcibarcompat STAGED=optional/GarnetPCIBarCompat.kext LOAD_ORDER=after-IOPCIFamily-before-PCI-config-and-Garnet-via-OpenCore-Kernel-Add-Root DISABLE_BOOT_ARG=garnet-rebar-compat=0\n'
     fi

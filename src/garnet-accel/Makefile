@@ -2,13 +2,13 @@
 # (MacKernelSDK, macOS 11 ABI, -mkernel -fapple-kext, -Xlinker -kext).
 #   make        kext + gates A/B/C + host twin (each FAILS the make)
 #   make test   host tests
-# Linux cross: pass MKSDK + KEXT_LD, BUILD + C64_LAYOUT_OUT outside the repo,
-# and C64_WORK at the matching KC dir. Tool/SDK choice travels as C64_NM/C64_SDK.
+# Linux cross: pass MKSDK + KEXT_LD, BUILD + GARNET_LAYOUT_OUT outside the repo,
+# and GARNET_KC_WORK at the matching KC dir. Tool/SDK choice travels as GARNET_NM/GARNET_SDK.
 PRODUCT := GarnetAccel
 ARCH    := x86_64
 DEPLOY  := 11.0
 HOST_OS := $(shell uname -s)
-MKSDK   ?= $(if $(C64_MKSDK),$(C64_MKSDK),../../build-toolchain/sdk)
+MKSDK   ?= $(if $(GARNET_MKSDK),$(GARNET_MKSDK),../../build-toolchain/sdk)
 ifeq ($(HOST_OS),Darwin)
 SDK     := $(shell xcrun --sdk macosx --show-sdk-path)
 NM      := nm
@@ -23,16 +23,16 @@ SIGN    ?= 0
 endif
 KEXT_LD ?=
 LAYOUT  := ../../tools/ioaccel-layout
-C64_LAYOUT_OUT ?= $(abspath $(LAYOUT)/layout-out)
-export C64_LAYOUT_OUT
-export C64_NM := $(NM)
-export C64_SDK := $(abspath $(SDK))
-export C64_MKSDK := $(abspath $(MKSDK))
+GARNET_LAYOUT_OUT ?= $(abspath $(LAYOUT)/layout-out)
+export GARNET_LAYOUT_OUT
+export GARNET_NM := $(NM)
+export GARNET_SDK := $(abspath $(SDK))
+export GARNET_MKSDK := $(abspath $(MKSDK))
 BUILD   ?= build
 KEXT    := $(BUILD)/$(PRODUCT).kext
 EXEC    := $(KEXT)/Contents/MacOS/$(PRODUCT)
 GEN     := $(BUILD)/gen
-COMMON  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) -I$(MKSDK)/Headers -Isrc -I$(GEN) -I$(C64_LAYOUT_OUT) \
+COMMON  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) -I$(MKSDK)/Headers -Isrc -I$(GEN) -I$(GARNET_LAYOUT_OUT) \
   -mmacosx-version-min=$(DEPLOY) -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
   -D_FORTIFY_SOURCE=0 -nostdinc -fno-builtin -fno-common -fno-stack-protector -mkernel -fapple-kext -Wall -Os -g
 CXXFLAGS := $(COMMON) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors \
@@ -41,16 +41,16 @@ LDFLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 \
   $(if $(wildcard $(MKSDK)/Library/x86_64/libkmodc++.a),-lkmodc++) -lkmod -Wl,-no_deduplicate \
   $(if $(KEXT_LD),--ld-path=$(KEXT_LD))
-GENHDR  := $(C64_LAYOUT_OUT)/IOAccelFamily2_decl.h
+GENHDR  := $(GARNET_LAYOUT_OUT)/IOAccelFamily2_decl.h
 
 all: $(KEXT) gates
 
 # the generated declarations must be fresh: gen_header.py output == the committed header (gate C's input)
-$(GEN)/garnet_gate.inc: gates/gen_gate.py gates/common.py gates/leaves.py $(C64_LAYOUT_OUT)/model.json $(C64_LAYOUT_OUT)/forwarded.json
+$(GEN)/garnet_gate.inc: gates/gen_gate.py gates/common.py gates/leaves.py $(GARNET_LAYOUT_OUT)/model.json $(GARNET_LAYOUT_OUT)/forwarded.json
 	@mkdir -p $(GEN)
 	python3 gates/gen_gate.py $@
 
-$(GEN)/garnet_tramp.inc: gates/gen_tramp.py gates/gen_gate.py gates/common.py gates/leaves.py $(C64_LAYOUT_OUT)/slots.json $(C64_LAYOUT_OUT)/forwarded.json $(LAYOUT)/gen_header.py
+$(GEN)/garnet_tramp.inc: gates/gen_tramp.py gates/gen_gate.py gates/common.py gates/leaves.py $(GARNET_LAYOUT_OUT)/slots.json $(GARNET_LAYOUT_OUT)/forwarded.json $(LAYOUT)/gen_header.py
 	@mkdir -p $(GEN)
 	python3 gates/gen_tramp.py $@
 

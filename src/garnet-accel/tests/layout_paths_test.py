@@ -9,7 +9,7 @@ import tempfile
 
 
 def run_case(gates: Path, fixture: Path, code: str) -> None:
-    env = dict(os.environ, C64_WORK=str(fixture), C64_LAYOUT_OUT=str(fixture / "output"))
+    env = dict(os.environ, GARNET_KC_WORK=str(fixture), GARNET_LAYOUT_OUT=str(fixture / "output"))
     env["PYTHONPATH"] = str(gates)
     subprocess.run([sys.executable, "-c", code, str(fixture)], env=env, check=True)
 
@@ -30,7 +30,7 @@ import common, os
 from pathlib import Path
 assert Path(common.LAYOUT).resolve() == Path(common.HERE).parents[2] / 'tools' / 'ioaccel-layout'
 assert Path(common.LAYOUT, 'gen_header.py').is_file()
-assert common.LAYOUT_OUT == os.environ['C64_LAYOUT_OUT']
+assert common.LAYOUT_OUT == os.environ['GARNET_LAYOUT_OUT']
 assert common.model() == {'fixture': 1}
 assert common.forwarded() == {'fixture': [3]}
 import gen_tramp
@@ -42,14 +42,14 @@ print('PASS: actual layout scripts and custom model/forwarded/slots output')
         generator.write_text("""
 import os
 from pathlib import Path
-p = Path(os.environ['C64_LAYOUT_OUT'])
+p = Path(os.environ['GARNET_LAYOUT_OUT'])
 assert p.name != 'output', 'regeneration must not overwrite the live layout'
 p.joinpath('IOAccelFamily2_decl.h').write_bytes(p.joinpath('model.json').read_bytes())
 """)
         (fixture / "check_layout.py").write_text("""
 import os, sys
 from pathlib import Path
-p = Path(os.environ['C64_LAYOUT_OUT'])
+p = Path(os.environ['GARNET_LAYOUT_OUT'])
 assert p.name == 'output', 'layout check must use the selected live layout'
 bad = p.joinpath('mismatch').exists()
 print('MISMATCH fixture' if bad else 'MATCH fixture')

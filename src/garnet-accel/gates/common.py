@@ -1,7 +1,7 @@
 import json, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAYOUT = os.path.abspath(os.path.join(HERE, '../../../tools/ioaccel-layout'))
-LAYOUT_OUT = os.path.abspath(os.environ.get('C64_LAYOUT_OUT') or os.path.join(LAYOUT, 'layout-out'))
+LAYOUT_OUT = os.path.abspath(os.environ.get('GARNET_LAYOUT_OUT') or os.path.join(LAYOUT, 'layout-out'))
 sys.path.insert(0, LAYOUT)
 sys.path.insert(0, HERE)
 from leaves import LEAVES, OSDEFINE_SLOTS, TRAMP, HAND, EXPECT_CLASSES, EXPECT_SLOTS, NEGATIVE_CLASS, FB_LEAF, FB_EXTRA, FB_PURE

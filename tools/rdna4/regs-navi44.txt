@@ -1,4 +1,4 @@
-# Bases from WhateverRed#6 ground truth; confirm against your own card's discovery dump.
+# Navi 44 register offsets (dword indices); confirm against your card's IP discovery dump.
 # Read-only; returns 0xffffffff before the ladder built the device context.
 0x16600 THM_TCON_CUR_TMP
 0x1660f CG_MULT_THERMAL_STATUS

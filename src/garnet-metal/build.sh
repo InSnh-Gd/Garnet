@@ -10,7 +10,8 @@ D="$(cd "$(dirname "$0")" && pwd)"
 # build/GarnetMetal.bundle.tar (bsdtar --no-xattrs); extract it on the PC.
 B="$D/build"; W="$(mktemp -d "${TMPDIR:-/tmp}/garnetmetal.XXXXXX")"; APP="$W/GarnetMetal.bundle"
 LAZY="${RDNA4_LAZY:-1}"; F9D="${RDNA4_9D:-1}"; RELEASE="${RDNA4_RELEASE:-0}"
-RADV="${RDNA4_RADV_LIB:-$HOME/rdna4-native/mesa-mac/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib}"   # x86_64 RADV (10a: shipped in Resources)
+RADV="${RDNA4_RADV_LIB:-}"   # x86_64 RADV dylib shipped in Resources
+[ -n "$RADV" ] || { echo "build.sh: set RDNA4_RADV_LIB=/path/to/libvulkan_radeon.dylib" >&2; exit 1; }
 [ -f "$RADV" ] || { echo "build.sh: RADV dylib not found: $RADV" >&2; exit 1; }
 # VM backends can have the same filename and ICD entry point; never package them for the PC.
 nm -arch x86_64 -gU "$RADV" > "$W/radv-exports.txt"
@@ -19,12 +20,12 @@ for symbol in radv_darwin_set_service_class radv_darwin_get_argument_limits_v1 \
   awk -v want="_$symbol" '$NF == want { found=1 } END { exit !found }' "$W/radv-exports.txt" || \
     { echo "build.sh: not a production RADV: missing $symbol in $RADV" >&2; exit 1; }
 done
-# Bundle 14: libgarnetxlate.dylib (x86_64), the LGPL in-process translator of the fork (NATIVE-S8-INPROC.md). RDNA4_XLATE_LIB takes a prebuilt one; otherwise it is built from the fork
-# (branch rdna4-inproc of ~/rdna4-native/metal2vulkan, or RDNA4_M2V_DIR) with `cargo build --release -p garnetxlate --target x86_64-apple-darwin`.
+# libgarnetxlate.dylib (x86_64): LGPL in-process Metal AIR -> SPIR-V translator.
+# Pass a prebuilt library via RDNA4_XLATE_LIB, or set RDNA4_M2V_DIR to build garnetxlate via Cargo.
 XL="${RDNA4_XLATE_LIB:-}"
 if [ -z "$XL" ]; then
-  M2V="${RDNA4_M2V_DIR:-$HOME/rdna4-native/metal2vulkan}"
-  [ -f "$M2V/garnetxlate/Cargo.toml" ] || { echo "build.sh: the fork with garnetxlate is not at $M2V (set RDNA4_M2V_DIR or RDNA4_XLATE_LIB)" >&2; exit 1; }
+  M2V="${RDNA4_M2V_DIR:-}"
+  [ -n "$M2V" ] && [ -f "$M2V/garnetxlate/Cargo.toml" ] || { echo "build.sh: set RDNA4_XLATE_LIB or RDNA4_M2V_DIR (containing garnetxlate/Cargo.toml)" >&2; exit 1; }
   ( cd "$M2V" && PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --release -p garnetxlate --target x86_64-apple-darwin >&2 ) || { echo "build.sh: cargo build of garnetxlate failed" >&2; exit 1; }
   XL="$M2V/target/x86_64-apple-darwin/release/libgarnetxlate.dylib"
 fi

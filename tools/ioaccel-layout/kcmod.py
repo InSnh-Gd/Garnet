@@ -8,26 +8,26 @@ KERNEL_BASE + offset (level 0: the kernel, whose own vtables hold plain VAs).
 Nothing here is hand-typed per class.
 
 Inputs come from the USER'S OWN macOS install (nothing Apple-derived ships with this tool):
-  $C64_WORK/kc/BootKernelExtensions.kc, $C64_WORK/kc/SystemKernelExtensions.kc
-  $C64_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2, $C64_WORK/kexts/com.apple.driver.AppleParavirtGPU
+  $GARNET_KC_WORK/kc/BootKernelExtensions.kc, $GARNET_KC_WORK/kc/SystemKernelExtensions.kc
+  $GARNET_KC_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2, $GARNET_KC_WORK/kexts/com.apple.driver.AppleParavirtGPU
     (the two kexts carved out of the kernel collection as standalone Mach-O files)
-Outputs go to $C64_LAYOUT_OUT (default ./layout-out) and must NOT be redistributed (Apple-derived).
+Outputs go to $GARNET_LAYOUT_OUT (default ./layout-out) and must NOT be redistributed (Apple-derived).
 """
 import struct, subprocess, bisect, os, shutil, sys
 
 KERNEL_BASE = 0xffffff8000100000   # level-0 target offset base (verified: pure-virtual offset 0xab4820 -> ___cxa_pure_virtual at 0xffffff8000bb4820)
-WORK = os.environ.get('C64_WORK')
+WORK = os.environ.get('GARNET_KC_WORK')
 if not WORK:
-    sys.exit('set C64_WORK to the directory holding kc/ and kexts/ (see README.md)')
+    sys.exit('set GARNET_KC_WORK to the directory holding kc/ and kexts/ (see README.md)')
 WORK = os.path.expanduser(WORK)
-OUT = os.path.abspath(os.environ.get('C64_LAYOUT_OUT') or 'layout-out')
+OUT = os.path.abspath(os.environ.get('GARNET_LAYOUT_OUT') or 'layout-out')
 KEXTDIR = WORK + '/kexts'
 BOOT_KC = WORK + '/kc/BootKernelExtensions.kc'
 SYS_KC = WORK + '/kc/SystemKernelExtensions.kc'
 FAMILY = KEXTDIR + '/com.apple.iokit.IOAcceleratorFamily2'
 PARAVIRT = KEXTDIR + '/com.apple.driver.AppleParavirtGPU'
-NM = os.environ.get('C64_NM') or 'nm'   # tool choice: Makefile exports C64_NM (llvm-nm on Linux cross)
-CXXFILT = os.environ.get('C64_CXXFILT') or shutil.which('llvm-cxxfilt') or shutil.which('c++filt') or 'c++filt'
+NM = os.environ.get('GARNET_NM') or 'nm'   # tool choice: Makefile exports GARNET_NM (llvm-nm on Linux cross)
+CXXFILT = os.environ.get('GARNET_CXXFILT') or shutil.which('llvm-cxxfilt') or shutil.which('c++filt') or 'c++filt'
 
 
 def demangle(names):
