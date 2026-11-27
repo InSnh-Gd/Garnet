@@ -336,6 +336,54 @@ void stage_failure_retry() {
     CHECK(loader.get_payload(PSPGfxFwType::IMU_D, bus, size) == kIOReturnSuccess);
     CHECK(f.stageCalls == 2 && bus == stageBase && size == 4);
 }
+
+void optional_dmub() {
+    Fixture f;
+    active = &f;
+    CHECK(fw_loader_prepare(f.dev, f.psp, f.state) == kIOReturnSuccess);
+    CHECK(!f.state.dmubPresent);
+    constexpr uint32_t offset = 0x100;
+    constexpr uint32_t signedBytes = 0x300;
+    uint8_t image[offset + signedBytes] {};
+    dmcub_firmware_header_v1_0 wrapper {};
+    wrapper.header = Fixture::common<decltype(wrapper)>(1);
+    wrapper.header.ip_version_major = 4;
+    wrapper.header.size_bytes = sizeof(image);
+    wrapper.header.ucode_array_offset_bytes = offset;
+    wrapper.header.ucode_size_bytes = wrapper.inst_const_bytes = signedBytes;
+    std::memcpy(image, &wrapper, sizeof(wrapper));
+    f.blobs[Fixture::index(FwId::DCN_DMUB)] = {image, sizeof(image), "synthetic-dmub", FwId::DCN_DMUB};
+    CHECK(fw_loader_prepare(f.dev, f.psp, f.state) == kIOReturnSuccess);
+    CHECK(f.state.dmubPresent && f.stageCalls == 0);
+    auto loader = fw_loader_make(f.state);
+    uint64_t bus = 0;
+    uint32_t size = 0;
+    CHECK(loader.get_payload(PSPGfxFwType::DMUB, bus, size) == kIOReturnSuccess);
+    CHECK(bus == stageBase && size == signedBytes && f.stagedBytes == image + offset);
+
+    const auto reject = [&](auto corrupt) {
+        auto bad = wrapper;
+        corrupt(bad);
+        std::memcpy(image, &bad, sizeof(bad));
+        CHECK(fw_loader_prepare(f.dev, f.psp, f.state) == kIOReturnSuccess);
+        CHECK(!f.state.dmubPresent);
+        CHECK(loader.get_payload(PSPGfxFwType::DMUB, bus, size) == kIOReturnUnsupported);
+        CHECK(f.stageCalls == 1);
+    };
+    reject([](auto &h) { ++h.header.header_version_minor; });
+    reject([](auto &h) { ++h.header.ip_version_major; });
+    reject([](auto &h) { --h.header.header_size_bytes; });
+    reject([](auto &h) { h.header.header_size_bytes = h.header.ucode_array_offset_bytes + 1; });
+    reject([](auto &h) { h.header.ucode_array_offset_bytes = 0; });
+    reject([](auto &h) { --h.header.size_bytes; });
+    reject([](auto &h) { --h.header.ucode_size_bytes; });
+    reject([](auto &h) { h.inst_const_bytes = 0xfffffffcu; });
+    reject([](auto &h) { h.bss_data_bytes = 4; });
+    reject([](auto &h) {
+        h.header.ucode_size_bytes = h.inst_const_bytes = 512;
+        h.header.ucode_array_offset_bytes = h.header.size_bytes - h.inst_const_bytes;
+    });
+}
 } // namespace
 
 namespace amdgpu {
@@ -368,6 +416,7 @@ int main(int argc, char **argv) {
         {"partial_mes", partial_mes}, {"rlc_requires_g", rlc_requires_g},
         {"optional_rlc", optional_rlc}, {"reuse", reuse},
         {"stage_failure_retry", stage_failure_retry},
+        {"optional_dmub", optional_dmub},
     };
     unsigned ran = 0;
     for (const Test &test : tests) {

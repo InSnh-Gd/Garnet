@@ -60,11 +60,25 @@ kern_return_t fw_loader_prepare(DeviceContext &dev, PSPContext &psp, FwLoaderSta
             }
         }
     }
+    // Optional shared DCN4 DAL DMUB payload (used only when garnet-dmcub-fw=1).
+    if (const FwBlob *dmub = fw_get(FwId::DCN_DMUB); dmub && dmub->data && dmub->size > 0) {
+        UcodePayload out[kMaxUcodePayloadsPerFile];
+        uint32_t n = amdgpu_ucode_extract(kHostFwFile_DCN_DMUB, dmub->data, dmub->size, out);
+        if (n > 0 && st.count < FwLoaderState::kMaxEntries &&
+            out[0].size_bytes > 0 &&
+            (uint64_t)out[0].offset_bytes + out[0].size_bytes <= dmub->size) {
+            FwLoaderState::Entry &e = st.entries[st.count++];
+            e.fw_type = out[0].fw_type; e.src = dmub->data + out[0].offset_bytes; e.size = out[0].size_bytes;
+            e.mc = 0; e.staged = false; e.blob = dmub->name;
+            st.dmubPresent = true;
+            UCODE_LOG("loader: dcn_dmub type %3u  %7u bytes @+%u", e.fw_type, e.size, out[0].offset_bytes);
+        }
+    }
     st.dev = &dev; st.psp = &psp;
     st.smuPresent = st.imuPresent = st.rlcPresent = st.cpPresent = st.mesPresent = st.sdmaPresent = true;
     psp.fwBufBumpOffset = 0;    // a successful re-run re-stages everything from the start of fw_buf
-    UCODE_LOG("loader: %u payloads ready (smu %d imu %d rlc %d cp %d mes %d sdma %d)", st.count,
-              st.smuPresent, st.imuPresent, st.rlcPresent, st.cpPresent, st.mesPresent, st.sdmaPresent);
+    UCODE_LOG("loader: %u payloads ready (smu %d imu %d rlc %d cp %d mes %d sdma %d dmub %d)", st.count,
+              st.smuPresent, st.imuPresent, st.rlcPresent, st.cpPresent, st.mesPresent, st.sdmaPresent, st.dmubPresent);
     return kIOReturnSuccess;
 }
 

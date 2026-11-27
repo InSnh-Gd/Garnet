@@ -354,6 +354,23 @@ uint32_t extract_mes(const uint8_t *bin, uint64_t size,
     return n;
 }
 
+uint32_t extract_dmcub(const uint8_t *bin, uint64_t size,
+                       UcodePayload out[]) {
+    if (size < sizeof(dmcub_firmware_header_v1_0)) return 0;
+    const auto &dmub = *reinterpret_cast<const dmcub_firmware_header_v1_0 *>(bin);
+    const auto &header = dmub.header;
+    const uint64_t offset = header.ucode_array_offset_bytes;
+    const uint32_t signedBytes = dmub.inst_const_bytes;
+    constexpr uint32_t minSignedBytes = 256 + 64 + 256; // PSP prefix, DMUB metadata, shortest signature
+    if (header.header_version_major != 1 || header.header_version_minor != 0 ||
+        header.ip_version_major != 4 || header.ip_version_minor != 0 ||
+        header.size_bytes != size || header.header_size_bytes < sizeof(dmub) ||
+        offset < header.header_size_bytes || (offset & 3u) || dmub.bss_data_bytes != 0 ||
+        signedBytes < minSignedBytes || header.ucode_size_bytes != signedBytes ||
+        offset + signedBytes != size) return 0;
+    return push(out, 0, PSPGfxFwType::DMUB, offset, signedBytes, size);
+}
+
 // =====================================================================
 // Single-payload fallback for backward-compatible 0x100+psp_fw_type
 // callers (SMU, single-type IMU_I/IMU_D, etc.). Just uses the common
@@ -404,6 +421,8 @@ uint32_t amdgpu_ucode_extract(uint64_t hostFwType,
         return extract_cp_rs64(bin, size_bytes, RS64Family::ME, out);
     case kHostFwFile_CP_MEC:
         return extract_cp_rs64(bin, size_bytes, RS64Family::MEC, out);
+    case kHostFwFile_DCN_DMUB:
+        return extract_dmcub(bin, size_bytes, out);
     default:
         break;
     }
@@ -418,6 +437,9 @@ uint32_t amdgpu_ucode_extract(uint64_t hostFwType,
     // file-typed path instead.
     if (hostFwType >= 0x100 && hostFwType < 0x200) {
         uint32_t psp_fw_type = static_cast<uint32_t>(hostFwType - 0x100);
+        if (psp_fw_type == PSPGfxFwType::DMUB) {
+            return extract_dmcub(bin, size_bytes, out);
+        }
 
         // SDMA via 0x100+71 should ideally use the v3.0 extractor too —
         // emit through extract_sdma so the offset/size matches a v3.0
