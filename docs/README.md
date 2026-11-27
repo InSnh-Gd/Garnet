@@ -24,6 +24,7 @@ Documentation in this repository covers the standalone Garnet driver architectur
 | [metal2-baseline.md](rdna4/metal2-baseline.md) | Metal 2 capability advertisement and baseline probe contracts |
 | [metal2-matrix.md](rdna4/metal2-matrix.md) | Tier 2 feature/capability matrix across kernel, translator, RADV, and Metal bundle |
 | [metal3-matrix.md](rdna4/metal3-matrix.md) | Metal 3 capability, bindless, ray tracing, and mesh shader tracking matrix |
+| [display-mall-and-power-research.md](rdna4/display-mall-and-power-research.md) | Primary-source research on GFXOFF default-on, HDMI/multi-display DPMS, CRB/DET, `dcn_4_0_1_dmcub`, DML2.1, FAMS2, and Display MALL |
 | [STRUCTURE.md](../src/garnet-metal/STRUCTURE.md) | Module layout of `src/garnet-metal/` |
 | [TESTING.md](../src/garnet-metal/TESTING.md) | Host regression suites, offline gates, and physical verification tiers for `GarnetMetal` |
 | [argument-summary/README.md](../src/garnet-metal/argument-summary/README.md) | Compute-assisted argument-buffer pointer summary shader and runtime layout |
