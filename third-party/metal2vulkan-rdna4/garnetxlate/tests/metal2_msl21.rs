@@ -187,3 +187,114 @@ entry:
         oob.msg
     );
 }
+
+#[test]
+fn air_get_num_samples_requires_and_uses_raster_sample_count_cap() {
+    use garnetxlate::{
+        garnetx_translate_with_capabilities, translate_bytes_stage3, RDNA4xBackendCapabilities,
+        GARNETX_CAP_RASTER_SAMPLES_SHIFT, RC_BAD_ARGS, RC_OK, RC_REFUSED,
+    };
+    let msaa_ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define <4 x float> @f() {
+entry:
+  %ns = tail call i32 @air.get_num_samples.i32()
+  %f = sitofp i32 %ns to float
+  %v0 = insertelement <4 x float> poison, float %f, i32 0
+  %v1 = insertelement <4 x float> %v0, float 0.0, i32 1
+  %v2 = insertelement <4 x float> %v1, float 0.0, i32 2
+  %v3 = insertelement <4 x float> %v2, float 1.0, i32 3
+  ret <4 x float> %v3
+}
+
+declare i32 @air.get_num_samples.i32()
+
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{!3}
+!2 = !{}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+"#;
+    let run_with_flags = |flags: u32| -> Out {
+        let caps = RDNA4xBackendCapabilities {
+            struct_size: 24,
+            version: 1,
+            flags,
+            subgroup_size: 32,
+            subgroup_supported_stages: 0x10,
+            subgroup_supported_operations: 0x80,
+        };
+        let mut spv: *mut u8 = std::ptr::null_mut();
+        let mut spv_len = 0usize;
+        let mut meta: *mut u8 = std::ptr::null_mut();
+        let mut meta_len = 0usize;
+        let mut err = [0 as c_char; 512];
+        let rc = unsafe {
+            garnetx_translate_with_capabilities(
+                msaa_ll.as_ptr(),
+                msaa_ll.len(),
+                std::ptr::null(),
+                &mut spv,
+                &mut spv_len,
+                &mut meta,
+                &mut meta_len,
+                err.as_mut_ptr(),
+                err.len(),
+                &caps,
+            )
+        };
+        let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let mut spv_bytes = Vec::new();
+        if rc == RC_OK {
+            unsafe {
+                spv_bytes = std::slice::from_raw_parts(spv, spv_len).to_vec();
+                garnetx_free(spv, spv_len);
+                garnetx_free(meta, meta_len);
+            }
+        }
+        Out {
+            rc,
+            msg,
+            spv: spv_bytes,
+        }
+    };
+
+    let refused = run_with_flags(0);
+    assert_eq!(refused.rc, RC_REFUSED, "unset sample count must refuse: {}", refused.msg);
+    assert!(
+        refused.msg.contains("raster_sample_count"),
+        "expected raster_sample_count refusal, got: {}",
+        refused.msg
+    );
+
+    let bad = run_with_flags(3u32 << GARNETX_CAP_RASTER_SAMPLES_SHIFT);
+    assert_eq!(bad.rc, RC_BAD_ARGS, "non-power-of-two sample count must be rejected");
+
+    let ok4 = run_with_flags(4u32 << GARNETX_CAP_RASTER_SAMPLES_SHIFT);
+    assert_eq!(ok4.rc, RC_OK, "4x MSAA translation failed: {}", ok4.msg);
+    let asm = metal2vulkan::disassemble(&ok4.spv).expect("disassemble");
+    assert!(
+        asm.lines().any(|l| l.contains("OpConstant") && l.trim_end().ends_with(" 4")),
+        "{asm}"
+    );
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+
+    let stage3_caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: 4u32 << GARNETX_CAP_RASTER_SAMPLES_SHIFT,
+        subgroup_size: 32,
+        subgroup_supported_stages: 0x10,
+        subgroup_supported_operations: 0x80,
+    };
+    let (s3_spv, _) =
+        translate_bytes_stage3(msaa_ll.as_bytes(), [64, 1, 1], &[], &[], &[], &[], Some(stage3_caps))
+            .expect("stage3 4x MSAA translation");
+    let s3_asm = metal2vulkan::disassemble(&s3_spv).expect("disassemble stage3");
+    assert!(
+        s3_asm.lines().any(|l| l.contains("OpConstant") && l.trim_end().ends_with(" 4")),
+        "{s3_asm}"
+    );
+}

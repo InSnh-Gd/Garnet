@@ -448,7 +448,7 @@ pub fn translate_bytes_stage3(
     let mut options = TransformOptions {
         kernel_local_size: local,
         kernel_dispatch: None,
-        raster_sample_count: None,
+        raster_sample_count: caps.and_then(RDNA4xBackendCapabilities::raster_sample_count),
         vertex_amplification_count: 1,
         ..TransformOptions::default()
     };

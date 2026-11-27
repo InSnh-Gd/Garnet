@@ -216,6 +216,7 @@ pub(crate) fn translate_text_with_mesh_options(
         emulated_mesh_payload,
         false,
         false,
+        None,
     )
 }
 
@@ -229,6 +230,7 @@ pub(crate) fn translate_text_with_rt_options(
     emulated_mesh_payload: bool,
     rt_primitive_data: bool,
     native_int64: bool,
+    raster_sample_count: Option<u32>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (san_entry, datalayout) = sanitize_ll_text_with_datalayout(ll_text);
     let stage = detect_stage_text(&san_entry)?;
@@ -251,7 +253,7 @@ pub(crate) fn translate_text_with_rt_options(
     let mut options = TransformOptions {
         kernel_local_size: local,
         kernel_dispatch: None,
-        raster_sample_count: None,
+        raster_sample_count,
         vertex_amplification_count: 1,
         ..TransformOptions::default()
     };

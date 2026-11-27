@@ -51,12 +51,15 @@ typedef struct RDNA4xBackendCapabilities {
  *   bit 10 (1u << 10): IFT backing buffer ABI v2 (66-word header with attached_bda[31])
  *   bit 11 (1u << 11): RT per-primitive data GPU sidecar lookup (set 0 binding 676, 264 bytes)
  *   bit 12 (1u << 12): Vulkan device supports native shaderInt64 arithmetic (skip u32-half i64 emulation)
+ *   bits 23..16: optional TransformOptions::raster_sample_count (0 = unspecified; valid power-of-two 1..=64)
  */
 #define GARNETX_CAP_MESH_EMULATED_PAYLOAD (1u << 8)
 #define GARNETX_CAP_RT_POSITION_FETCH     (1u << 9)
 #define GARNETX_CAP_RT_IFT_ABI_V2         (1u << 10)
 #define GARNETX_CAP_RT_PRIMITIVE_DATA     (1u << 11)
 #define GARNETX_CAP_NATIVE_INT64          (1u << 12)
+#define GARNETX_CAP_RASTER_SAMPLES_SHIFT  16u
+#define GARNETX_CAP_RASTER_SAMPLES_MASK   (0xFFu << GARNETX_CAP_RASTER_SAMPLES_SHIFT)
 
 /* Set 0 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER bindings reserved for
  * GARNETX_CAP_MESH_EMULATED_PAYLOAD stages:
