@@ -17,44 +17,24 @@ NOARG_TESTS := \
   test-argument-summary-owners \
   test-argument-summary-plan \
   test-argument-writer-epochs \
-  test-async-compute \
-  test-bar-policy \
   test-binary-archive \
-  test-buffer-ranges \
-  test-buffer-registry \
-  test-cblog \
   test-compute-icb \
   test-counters-amp \
-  test-crc \
-  test-devcaps \
   test-dispflip \
-  test-display-commits \
-  test-drawcache \
   test-dynlib-vft \
   test-gather-caps \
-  test-heap-backing \
-  test-heapalloc \
-  test-hotswap \
+  test-host-display \
+  test-host-memory \
+  test-host-runtime \
   test-impcache \
   test-io-residency \
   test-mesh-runtime \
-  test-nocopy-protection \
-  test-nocopy-range \
-  test-nocopy-ro-policy \
   test-null-remap \
   test-null-shape \
-  test-pitch \
-  test-plane \
-  test-pool \
-  test-query-caps \
-  test-queue-pipe \
   test-rt-accel \
   test-rt-runtime \
   test-sparse-metal \
-  test-swizzle-placement \
-  test-t1 \
-  test-texture-transfer \
-  test-vram-surf
+  test-swizzle-placement
 
 SRCDIR_TESTS := \
   test-fencewait \
@@ -62,14 +42,27 @@ SRCDIR_TESTS := \
   test-gpl \
   test-vkpool
 
-ALL_C_BINS := $(addprefix $(BUILD)/,$(NOARG_TESTS) $(SRCDIR_TESTS))
+ASSEMBLED_TESTS := \
+  test-cienv \
+  test-intfmt \
+  test-ioalias \
+  test-texdesc
 
-all: host py
+ALL_C_BINS := $(addprefix $(BUILD)/,$(NOARG_TESTS) $(SRCDIR_TESTS) $(ASSEMBLED_TESTS))
 
-host: $(ALL_C_BINS)
+all: host assembled py
+
+host: $(addprefix $(BUILD)/,$(NOARG_TESTS) $(SRCDIR_TESTS))
 	@set -e; root="$(abspath $(REPO_ROOT))"; src="$(abspath $(SRC))"; \
 	for t in $(NOARG_TESTS); do (cd "$$root" && "$(abspath $(BUILD))/$$t"); done; \
 	for t in $(SRCDIR_TESTS); do (cd "$$src" && "$(abspath $(BUILD))/$$t" "$$src"); done
+
+assembled: $(addprefix $(BUILD)/,$(ASSEMBLED_TESTS))
+	@set -e; asm="$(abspath $(BUILD))/assembled"; src="$(abspath $(SRC))"; \
+	mkdir -p "$$asm"; \
+	PYTHONDONTWRITEBYTECODE=1 python3 "$$src/assemble-device.py" "$$src/GarnetDevice.m" --include-dir "$$src" --output "$$asm/GarnetDevice.m"; \
+	cp "$$src/garnet_intfmt.h" "$$src/Info.plist" "$$asm/"; \
+	for t in $(ASSEMBLED_TESTS); do "$(abspath $(BUILD))/$$t" "$$asm"; done
 
 py:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test-validation-runner.py
@@ -87,4 +80,4 @@ $(BUILD)/%: %.c | $(BUILD)
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all host py clean
+.PHONY: all host assembled py clean

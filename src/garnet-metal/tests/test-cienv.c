@@ -57,5 +57,7 @@ int main(int argc, char **argv) {
             CHECK(!strstr(ctor, "setenv(") && !strstr(ctor, "putenv("), "the constructor does not call setenv itself (no overwrite path)");
         }
     }
+    free(m);
+    free(fake_val);
     printf("test-cienv: %d checks, %d failed\n", checks, fails); return fails ? 1 : 0;
 }
