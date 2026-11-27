@@ -57,8 +57,9 @@ FW_navi48   := gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp gc_12_0_1_
                psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3
 FW_navi44   := gc_12_0_0_imu gc_12_0_0_me gc_12_0_0_mec gc_12_0_0_pfp gc_12_0_0_rlc gc_12_0_0_uni_mes \
                psp_14_0_2_sos psp_14_0_2_ta sdma_7_0_0 smu_14_0_2
-FW_ALLCHIPS := $(FW_navi48) $(FW_navi44)
-FW_REQUIRED := $(foreach c,$(CHIPS),$(FW_$(c)))
+FW_SHARED   := dcn_4_0_1_dmcub
+FW_ALLCHIPS := $(FW_navi48) $(FW_navi44) $(FW_SHARED)
+FW_REQUIRED := $(foreach c,$(CHIPS),$(FW_$(c))) $(FW_SHARED)
 ifneq ($(filter-out navi48 navi44,$(CHIPS)),)
 $(error CHIPS may only contain navi48 and navi44, got: $(CHIPS))
 endif

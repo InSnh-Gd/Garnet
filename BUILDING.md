@@ -23,7 +23,7 @@
   ```
 
   This only copies files (no network) into `src/garnet/firmware/`, which is
-  gitignored. The kext embeds these files from linux-firmware's `amdgpu/`, ten per chip:
+  gitignored. The kext embeds these files from linux-firmware's `amdgpu/`, ten per chip plus one shared image:
 
   ```
   Navi 48 (RX 9070 / 9070 XT, AI PRO R9700; CHIPS=navi48):
@@ -37,15 +37,19 @@
   gc_12_0_0_rlc.bin  gc_12_0_0_uni_mes.bin
   psp_14_0_2_sos.bin  psp_14_0_2_ta.bin
   sdma_7_0_0.bin  smu_14_0_2.bin
+
+  Required for either build:
+  dcn_4_0_1_dmcub.bin
   ```
 
   `make` builds both chips by default (`CHIPS="navi48 navi44"`); `make CHIPS=navi44` builds a
   kext with only the 9060 XT's blobs (the other chip's symbols become empty stubs and that chip is
   refused at probe). `CHIPS=navi44 tools/fetch-firmware.sh <path>` copies only that chip's set.
 
-  The Makefile stops with a list if any is missing. `tools/fetch-firmware.sh` prints the
-  sha256 of each copy against the revision the project was developed with; a different
-  linux-firmware revision may work, but only that one has been run.
+  The Makefile stops with a list if a required file is missing. Re-run `tools/fetch-firmware.sh`
+  on older build trees to copy the shared image. Embedding it does not change the running firmware:
+  VBIOS remains in control, and `garnet-dmcub-fw=1` currently requests a read-only preflight, not a load.
+  The copy script reports each SHA-256 against the development baseline; this is not hardware acceptance.
 
 ## Build
 

@@ -36,6 +36,7 @@ enum class FwId : uint32_t {
     GC_TOC,
     SMU,
     SDMA,
+    DCN_DMUB,
     Count
 };
 
