@@ -1002,6 +1002,18 @@ static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
 
 /* Staging pool bucket rounding: power-of-2 buckets in [4 KiB, 64 MiB].
  * Returns 1 with bucket size if poolable, 0 if allocation exceeds pool cap (allocate directly). */
+static inline int rdna4rt_take_transform_slice(uint64_t capacity, uint64_t *next) {
+    if (!next || *next % RDNA4RT_TRANSFORM_ALIGN || *next > capacity ||
+        capacity - *next < RDNA4RT_TRANSFORM_SIZE) return 0;
+    *next += RDNA4RT_TRANSFORM_SIZE;
+    return 1;
+}
+
+static inline int rdna4rt_motion_table_fits(uint64_t capacity, uint64_t offset, uint32_t keyframes) {
+    return offset % sizeof(uint64_t) == 0 && offset <= capacity &&
+           (uint64_t)keyframes <= (capacity - offset) / sizeof(uint64_t);
+}
+
 static inline int rdna4rt_staging_bucket_size(uint64_t size, uint64_t *bucket_out) {
     if (!bucket_out) return 0;
     if (size > RDNA4RT_STAGING_POOL_MAX_BUCKET) return 0;

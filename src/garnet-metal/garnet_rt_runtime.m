@@ -193,6 +193,10 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     return rdna4rtr_ift_encode(&_table, (uint32_t *)ptr, capWords, &written) == RDNA4RTR_OK;
 }
 
+- (void)rdna4SyncSlotsLocked:(uint32_t)first count:(uint32_t)count {
+    (void)rdna4rtr_ift_encode_slots(&_table, [_backing contents], [_backing length] / sizeof(uint32_t), first, count);
+}
+
 - (instancetype)initWithDevice:(id)dev
                     descriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor
                     ownerToken:(uint64_t)token
@@ -321,7 +325,7 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     uint32_t kind = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
     if ([self rdna4ValidateHandleLocked:function handleIdOut:&hid kindOut:&kind]) {
         if (rdna4rtr_ift_set_function(&_table, (uint32_t)index, hid, kind) == RDNA4RTR_OK)
-            (void)[self rdna4SyncBackingLocked];
+            [self rdna4SyncSlotsLocked:(uint32_t)index count:1u];
     }
     [_lock unlock];
 }
@@ -355,7 +359,7 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
     }
     if (valid &&
         rdna4rtr_ift_set_functions_range(&_table, (uint32_t)range.location, (uint32_t)range.length, ids, kinds) == RDNA4RTR_OK)
-        (void)[self rdna4SyncBackingLocked];
+        [self rdna4SyncSlotsLocked:(uint32_t)range.location count:(uint32_t)range.length];
     free(ids);
     free(kinds);
     [_lock unlock];

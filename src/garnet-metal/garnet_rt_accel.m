@@ -402,6 +402,7 @@ static BOOL rdna4_rt_staging_pool_pop(uint64_t needSize, RDNA4RTStagingSlot *out
         if (sz >= needSize && sz < bestSize) {
             bestSize = sz;
             bestIdx = i;
+            if (sz == needSize) break;
         }
     }
     if (bestIdx != UINT32_MAX) {

@@ -30,6 +30,12 @@ motion-instance transforms and Clamp/Vanish borders) via dual-slot traversal
 and software Möller-Trumbore / motion-AABB checks when traversing motion-flagged
 acceleration structures.
 
+0090-metal3-rt-perf.patch applies after 0089. Curve and motion traversal reuse
+sidecar slots, and motion traversal snapshots the immutable instance header.
+Identical key indices need only one keyframe read. Nearby rotations skip the
+trigonometric path; queries without transform results use a smaller return type.
+The build-shader ABI, proxy counts and Vulkan synchronization are unchanged.
+
 0082-metal3-renderbox-visible-ref-trailing-ptr-params.patch relaxes the direct
 visible-function reference signature check in `src/linked_functions.rs`
 (`rewrite_visible_reference_stubs` / `visible_ref_params_compatible`) to accept

@@ -580,6 +580,14 @@ static void test_ift_encoder_and_dispatch_sim(void) {
     size_t written2 = 0;
     CHECK(rdna4rtr_ift_encode(&t2, w2, 65u, &written2) == RDNA4RTR_ERR_BOUNDS, "undersized v2 buffer rejected");
     CHECK(rdna4rtr_ift_encode(&t2, w2, 72u, &written2) == RDNA4RTR_OK && written2 == 70u, "v2 encode writes 70 words");
+    uint32_t partial[72];
+    memcpy(partial, w2, sizeof(uint32_t) * written2);
+    partial[67] = 99u;
+    CHECK(rdna4rtr_ift_encode_slots(&t2, partial, 70u, 1u, 1u) == RDNA4RTR_OK &&
+          !memcmp(partial, w2, sizeof(uint32_t) * written2), "single-slot update matches full v2 encoding");
+    CHECK(rdna4rtr_ift_encode_slots(&t2, partial, 67u, 1u, 1u) == RDNA4RTR_ERR_BOUNDS &&
+          rdna4rtr_ift_encode_slots(&t2, partial, 70u, 3u, 2u) == RDNA4RTR_ERR_BOUNDS,
+          "partial update rejects short backing or invalid slot range");
     CHECK(w2[0] == 4u && w2[1] == 2u && w2[2] == ((1u << 0) | (1u << 2)) && w2[3] == 0u, "v2 header words 0..3 exact");
     uint64_t read_bda = 0u;
     CHECK(rdna4rtr_ift_read_attached_bda(w2, written2, 0u, &read_bda) == RDNA4RTR_OK && read_bda == bda0, "read attached BDA 0");

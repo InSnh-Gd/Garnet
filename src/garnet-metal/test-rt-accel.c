@@ -468,6 +468,17 @@ static void test_tlas_and_instance_conversion(void) {
 
     uint64_t bkt = 0;
     CHECK(rdna4rt_staging_bucket_size(64u, &bkt) == 1 && bkt == 4096u, "staging bucket min 4 KiB");
+    uint64_t next = 0u;
+    for (uint32_t index = 0; index < 85u; ++index)
+        CHECK(rdna4rt_take_transform_slice(4096u, &next) && next == (index + 1u) * 48u,
+              "transform slices are distinct and aligned");
+    CHECK(!rdna4rt_take_transform_slice(4096u, &next) && next == 4080u, "slab tail cannot fit a transform");
+    next = UINT64_MAX - 15u;
+    CHECK(!rdna4rt_take_transform_slice(UINT64_MAX, &next), "slice bounds cannot wrap");
+    CHECK(rdna4rt_motion_table_fits(4096, 4080, 2), "keyframe table fits exact staging tail");
+    CHECK(!rdna4rt_motion_table_fits(4096, 4080, 3), "larger keyframe table uses separate storage");
+    CHECK(!rdna4rt_motion_table_fits(4096, 4097, 1) &&
+          !rdna4rt_motion_table_fits(UINT64_MAX, UINT64_MAX-7, 2), "staging tail cannot wrap");
     CHECK(rdna4rt_staging_bucket_size(4097u, &bkt) == 1 && bkt == 8192u, "staging bucket next pow2 8 KiB");
     CHECK(rdna4rt_staging_bucket_size(RDNA4RT_STAGING_POOL_MAX_BUCKET, &bkt) == 1 &&
           bkt == RDNA4RT_STAGING_POOL_MAX_BUCKET, "staging bucket max 64 MiB");

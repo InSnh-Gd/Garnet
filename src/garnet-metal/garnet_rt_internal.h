@@ -61,6 +61,8 @@ typedef struct {
     uint64_t payloadBytes;
 } RDNA4RTMotionGeomPlanEntry;
 
+enum { RDNA4RT_INLINE_GEOMS = 4 };
+
 typedef struct {
     rdna4rt_kind_t kind;
     uint64_t usage;
@@ -76,6 +78,16 @@ typedef struct {
     uint64_t *primSrcVkOffs;
     RDNA4RTCurvePlanEntry *curvePlans;
     RDNA4RTMotionGeomPlanEntry *motionPlans;
+    struct {
+        VkAccelerationStructureGeometryKHR vkGeoms[RDNA4RT_INLINE_GEOMS];
+        VkAccelerationStructureBuildRangeInfoKHR vkRanges[RDNA4RT_INLINE_GEOMS];
+        uint32_t maxPrimCounts[RDNA4RT_INLINE_GEOMS];
+        rdna4rt_prim_data_geom_plan_t primPlans[RDNA4RT_INLINE_GEOMS];
+        VkBuffer primSrcVkBufs[RDNA4RT_INLINE_GEOMS];
+        uint64_t primSrcVkOffs[RDNA4RT_INLINE_GEOMS];
+        RDNA4RTCurvePlanEntry curvePlans[RDNA4RT_INLINE_GEOMS];
+        RDNA4RTMotionGeomPlanEntry motionPlans[RDNA4RT_INLINE_GEOMS];
+    } small;
     VkBuffer tlasInstStgBuf;
     uint32_t tlasInstanceCount;
     VkAccelerationStructureBuildSizesInfoKHR vkSizes;

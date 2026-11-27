@@ -1,0 +1,1495 @@
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -13,6 +13,7 @@
+ //!   with bounded `switch i32 %handle_id` for custom bounding-box and triangle any-hit callbacks
+ //!   plus safe handle-0 / out-of-bounds fallback.
+ 
++use super::ray_query_motion::MOTION_HEADER;
+ use crate::linked_functions::IntersectionFunctionKind;
+ use crate::meta::{AirIntersectionFamily, AirIntersectionInstancing, AirIntersectionResultField};
+ use std::collections::{HashMap, HashSet};
+@@ -1142,7 +1143,6 @@
+     }
+ 
+     let any_curve_used = rt_curves_enabled && pending.iter().any(|p| p.family.curve_data);
+-    let any_inst_motion = rt_motion_enabled && pending.iter().any(|p| p.family.instance_motion);
+     let any_motion_used = rt_motion_enabled
+         && pending
+             .iter()
+@@ -1159,14 +1159,21 @@
+ 
+     // Emit `@__m2v.rq.*` intrinsic declarations (only if not already present in module).
+     append_rq_intrinsic_declarations(&mut out, ll);
+-    if any_prim_data_used && !any_curve_used && !any_motion_used {
+-        append_prim_data_lookup_support(&mut out);
++    if any_prim_data_used {
++        append_prim_data_address_support(&mut out);
+     }
+     if any_curve_used {
+         append_curve_rt_support(&mut out);
+     }
+     if any_motion_used {
+-        super::ray_query_motion::append_motion_rt_support(&mut out, any_inst_motion);
++        let mut instances = false;
++        for world in [false, true] {
++            if pending.iter().any(|p| p.family.instance_motion && p.family.world_space_data == world) {
++                super::ray_query_motion::append_motion_rt_support(&mut out, Some(world));
++                instances = true;
++            }
++        }
++        if !instances { super::ray_query_motion::append_motion_rt_support(&mut out, None); }
+     }
+ 
+     // Emit each structured ray-query helper function.
+@@ -1553,7 +1560,12 @@
+             "get_candidate_primitive_data" | "get_committed_primitive_data"
+         ) {
+             if prim_data_enabled {
+-                if lhs.is_some() {
++                let used = lhs.as_ref().is_some_and(|name| {
++                    scoped_lines.iter().enumerate().any(|(index, &(line, owner))| {
++                        owner == scope && index != line_idx && line.contains(name) && line_uses_llvm_value(line, name)
++                    })
++                });
++                if used {
+                     prim_data_slots.insert(slot_id);
+                     ret_ptr_ty = Some(parse_call_ptr_return_type(&call_part[..at_pos]));
+                     let helper_key = (slot_id, op == "get_committed_primitive_data", has_instancing);
+@@ -1605,6 +1617,11 @@
+     let (null_drop_lines, null_replacements) =
+         propagate_null_ptr_eliminations(&scoped_lines, &null_ptr_vars);
+ 
++    let front_face_slots: HashSet<_> = ops_by_line.values()
++        .filter(|call| call.lhs.is_some() && matches!(call.op.as_str(),
++            "is_candidate_triangle_front_facing" | "is_committed_triangle_front_facing"))
++        .map(|call| call.slot_id)
++        .collect();
+     // Track first basic-block entry line for each scope that needs `%__m2v.rq.cw.<slot>` allocas.
+     let mut entry_inserted: HashSet<usize> = HashSet::new();
+     let mut out = String::with_capacity(ll.len() + 4096);
+@@ -1632,10 +1649,12 @@
+                     let has_mot = motion_any_slots.contains(&slot);
+                     let has_im = motion_inst_slots.contains(&slot);
+                     let has_curve = curve_slots.contains(&slot);
+-                    out.push_str(&format!(
+-                        "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
+-                         \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
+-                    ));
++                    if front_face_slots.contains(&slot) || has_mot {
++                        out.push_str(&format!(
++                            "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
++                             \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
++                        ));
++                    }
+                     if prim_data_slots.contains(&slot) || has_curve || has_mot {
+                         out.push_str(&format!(
+                             "  %__m2v.rq.as_root.{slot} = alloca i64, align 8\n\
+@@ -1698,6 +1717,8 @@
+                         out.push_str(&format!(
+                             "  %__m2v.rq.iq_flags.{slot} = alloca i32, align 4\n\
+                              \x20 store i32 0, ptr %__m2v.rq.iq_flags.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_header.{slot} = alloca {MOTION_HEADER}, align 8\n\
++                             \x20 store {MOTION_HEADER} zeroinitializer, ptr %__m2v.rq.iq_header.{slot}, align 8\n\
+                              \x20 %__m2v.rq.iq_mtlas.{slot} = alloca i64, align 8\n\
+                              \x20 store i64 0, ptr %__m2v.rq.iq_mtlas.{slot}, align 8\n\
+                              \x20 %__m2v.rq.iq_in_act.{slot} = alloca i32, align 4\n\
+@@ -1745,7 +1766,7 @@
+                     // Handled by slot allocation.
+                 }
+                 "get_candidate_primitive_data" | "get_committed_primitive_data" => {
+-                    if prim_data_enabled {
++                    if prim_data_enabled && call.ret_ptr_ty.is_some() {
+                         if let Some(ref lhs) = call.lhs {
+                             let is_comm = call.op == "get_committed_primitive_data";
+                             let kind_tag = if is_comm { "comm" } else { "cand" };
+@@ -1834,11 +1855,14 @@
+                             "{indent}%{pfx}.accept = icmp ne {accept_ty} {accept_val}, 0\n"
+                         ));
+                     }
++                    // Metal winding::clockwise == 0, winding::counterclockwise == 1;
++                    // Vulkan RayQuery front face is CCW, so invert when winding == CW (0).
++                    out.push_str(&format!("{indent}%{pfx}.cw = icmp eq i32 {winding_val}, 0\n"));
++                    if front_face_slots.contains(&slot) || has_mot {
++                        out.push_str(&format!("{indent}%{pfx}.cw_i32 = zext i1 %{pfx}.cw to i32\n{indent}store i32 %{pfx}.cw_i32, ptr %__m2v.rq.cw.{slot}, align 4\n"));
++                    }
+                     out.push_str(&format!(
+-                        "{indent}%{pfx}.cw = icmp eq i32 {winding_val}, 0\n\
+-                         {indent}%{pfx}.cw_i32 = zext i1 %{pfx}.cw to i32\n\
+-                         {indent}store i32 %{pfx}.cw_i32, ptr %__m2v.rq.cw.{slot}, align 4\n\
+-                         {indent}%{pfx}.cf_req = icmp eq i32 {tri_cull_val}, 1\n\
++                        "{indent}%{pfx}.cf_req = icmp eq i32 {tri_cull_val}, 1\n\
+                          {indent}%{pfx}.cb_req = icmp eq i32 {tri_cull_val}, 2\n\
+                          {indent}%{pfx}.vk_cf = select i1 %{pfx}.cw, i1 %{pfx}.cb_req, i1 %{pfx}.cf_req\n\
+                          {indent}%{pfx}.vk_cb = select i1 %{pfx}.cw, i1 %{pfx}.cf_req, i1 %{pfx}.cb_req\n\
+@@ -1896,14 +1920,16 @@
+                     };
+                     if need_as_root {
+                         out.push_str(&format!(
+-                            "{indent}store i64 {root_val}, ptr %__m2v.rq.as_root.{slot}, align 8\n"
++                            "{indent}%{pfx}.root_slot = call i64 @__m2v.rq.query.root_slot(i64 {root_val})\n{indent}store i64 %{pfx}.root_slot, ptr %__m2v.rq.as_root.{slot}, align 8\n"
+                         ));
+                     }
+                     let outer_flags_expr = if has_im {
+                         out.push_str(&format!(
+                             "{indent}store i32 %{pfx}.flags, ptr %__m2v.rq.iq_flags.{slot}, align 4\n\
+                              {indent}store i32 0, ptr %__m2v.rq.iq_in_act.{slot}, align 4\n\
+-                             {indent}%{pfx}.mtlas = call i64 @__m2v.rq.query.motion_check_tlas_slot(i64 {root_val})\n\
++                             {indent}%{pfx}.mtlas = call i64 @__m2v.rq.query.motion_check_tlas_slot(i64 %{pfx}.root_slot)\n\
++                             {indent}%{pfx}.header = call {MOTION_HEADER} @__m2v.rq.query.motion_read_header(i64 %{pfx}.mtlas)\n\
++                             {indent}store {MOTION_HEADER} %{pfx}.header, ptr %__m2v.rq.iq_header.{slot}, align 8\n\
+                              {indent}store i64 %{pfx}.mtlas, ptr %__m2v.rq.iq_mtlas.{slot}, align 8\n\
+                              {indent}%{pfx}.is_mt = icmp ne i64 %{pfx}.mtlas, 0\n\
+                              {indent}%{pfx}.out_flags = select i1 %{pfx}.is_mt, i32 0, i32 %{pfx}.flags\n"
+@@ -1942,6 +1968,7 @@
+                         if has_im {
+                             out.push_str(&format!(
+                                 "{indent}%{pfx}.fl = load i32, ptr %__m2v.rq.iq_flags.{slot}, align 4\n\
++                                 {indent}%{pfx}.header = load {MOTION_HEADER}, ptr %__m2v.rq.iq_header.{slot}, align 8\n\
+                                  {indent}%{pfx}.mtlas = load i64, ptr %__m2v.rq.iq_mtlas.{slot}, align 8\n\
+                                  {indent}%{pfx}.in_act = load i32, ptr %__m2v.rq.iq_in_act.{slot}, align 4\n\
+                                  {indent}%{pfx}.in_cw = load i32, ptr %__m2v.rq.iq_in_cw.{slot}, align 4\n\
+@@ -1949,11 +1976,11 @@
+                                  {indent}%{pfx}.in_cslot = load i64, ptr %__m2v.rq.iq_in_cslot.{slot}, align 8\n\
+                                  {indent}%{pfx}.ci = load i32, ptr %__m2v.rq.iq_cand_inst.{slot}, align 4\n\
+                                  {indent}%{pfx}.cu = load i32, ptr %__m2v.rq.iq_cand_uid.{slot}, align 4\n\
+-                                 {indent}%{pfx}.mres = call {mot_ret_ty} @__m2v.rq.query.iq_next_motion.{slot}(i64 %{pfx}.root, float %{pfx}.mtime, i1 %{pfx}.cw, i32 %{pfx}.cull, i32 %{pfx}.fl, i64 %{pfx}.mtlas, i32 %{pfx}.in_act, i32 %{pfx}.in_cw, i32 %{pfx}.in_cull, i64 %{pfx}.in_cslot, i32 %{pfx}.ci, i32 %{pfx}.cu)\n"
++                                 {indent}%{pfx}.mres = call {mot_ret_ty} @__m2v.rq.query.iq_next_motion.{slot}(i64 %{pfx}.root, float %{pfx}.mtime, i1 %{pfx}.cw, i32 %{pfx}.cull, i32 %{pfx}.fl, i64 %{pfx}.mtlas, {MOTION_HEADER} %{pfx}.header, i32 %{pfx}.in_act, i32 %{pfx}.in_cw, i32 %{pfx}.in_cull, i64 %{pfx}.in_cslot, i32 %{pfx}.ci, i32 %{pfx}.cu)\n"
+                             ));
+                         } else {
+                             out.push_str(&format!(
+-                                "{indent}%{pfx}.mres = call {mot_ret_ty} @__m2v.rq.query.iq_next_motion.{slot}(i64 %{pfx}.root, float %{pfx}.mtime, i1 %{pfx}.cw, i32 %{pfx}.cull, i32 0, i64 0, i32 0, i32 0, i32 0, i64 0, i32 0, i32 0)\n"
++                                "{indent}%{pfx}.mres = call {mot_ret_ty} @__m2v.rq.query.iq_next_motion.{slot}(i64 %{pfx}.root, float %{pfx}.mtime, i1 %{pfx}.cw, i32 %{pfx}.cull, i32 0, i64 0, {MOTION_HEADER} zeroinitializer, i32 0, i32 0, i32 0, i64 0, i32 0, i32 0)\n"
+                             ));
+                         }
+                         out.push_str(&format!(
+@@ -2651,14 +2678,19 @@
+     }
+ 
+     append_rq_intrinsic_declarations(&mut out, ll);
+-    if !iq_prim_helpers.is_empty() && curve_slots.is_empty() && motion_any_slots.is_empty() {
+-        append_prim_data_lookup_support(&mut out);
++    if !iq_prim_helpers.is_empty() {
++        append_prim_data_address_support(&mut out);
+     }
+     if !curve_slots.is_empty() {
+         append_curve_rt_support(&mut out);
+     }
+     if !motion_any_slots.is_empty() {
+-        super::ray_query_motion::append_motion_rt_support(&mut out, !motion_inst_slots.is_empty());
++        if motion_inst_slots.is_empty() { super::ray_query_motion::append_motion_rt_support(&mut out, None); }
++        for world in [false, true] {
++            if motion_inst_slots.iter().any(|slot| iq_world_slots.contains(slot) == world) {
++                super::ray_query_motion::append_motion_rt_support(&mut out, Some(world));
++            }
++        }
+     }
+ 
+     // Emit curve IQ commit & next helpers.
+@@ -2701,9 +2733,12 @@
+             )
+         };
+         let inst_arg = if has_inst { "%inst_id" } else { "0" };
++        let setup = slot_cache_entry(has_inst, "%root_slot", "blas_slot");
++        let lookup = slot_cache_lookup(has_inst, "%root_slot", inst_arg, "blas_slot");
+         out.push_str(&format!(
+-            "\ndefine internal <4 x float> {fn_name}(i64 %root_bda) {{\n\
++            "\ndefine internal <4 x float> {fn_name}(i64 %root_slot) {{\n\
+              entry:\n\
++             {setup}\
+              \x20 br label %loop_hdr\n\
+              \n\
+              loop_hdr:\n\
+@@ -2731,7 +2766,7 @@
+              \x20 %geom_id = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
+              \x20 %aabb_id = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+              {inst_lines}\
+-             \x20 %blas_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg})\n\
++             {lookup}\
+              \x20 %curve_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %blas_slot, i32 %geom_id)\n\
+              \x20 %is_curve = icmp ne i64 %curve_hdr, 0\n\
+              \x20 br i1 %is_curve, label %do_curve, label %plain_aabb\n\
+@@ -2808,7 +2843,7 @@
+         let inst_arg = if has_inst { "%inst" } else { "0" };
+         if is_comm {
+             out.push_str(&format!(
+-                "\ndefine internal i64 {fn_name}(i64 %root_bda) {{\n\
++                "\ndefine internal i64 {fn_name}(i64 %root_slot) {{\n\
+                  entry:\n\
+                  \x20 %ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
+                  \x20 %hit = icmp ne i32 %ct, 0\n\
+@@ -2817,7 +2852,7 @@
+                  \x20 %prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 1)\n\
+                  \x20 %geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 1)\n\
+                  {inst_lines}\
+-                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
++                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_slot, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
+                  \x20 br label %done\n\
+                  done:\n\
+                  \x20 %res = phi i64 [ %addr, %read ], [ 0, %entry ]\n\
+@@ -2826,12 +2861,12 @@
+             ));
+         } else {
+             out.push_str(&format!(
+-                "\ndefine internal i64 {fn_name}(i64 %root_bda) {{\n\
++                "\ndefine internal i64 {fn_name}(i64 %root_slot) {{\n\
+                  entry:\n\
+                  \x20 %prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+                  \x20 %geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
+                  {inst_lines}\
+-                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
++                 \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_slot, i32 {inst_tag}, i32 {inst_arg}, i32 %geom, i32 %prim)\n\
+                  \x20 ret i64 %addr\n\
+                  }}\n"
+             ));
+@@ -2887,7 +2922,7 @@
+             };
+             if is_comm {
+                 out.push_str(&format!(
+-                    "\ndefine internal i64 {fn_name}(i64 %root_bda, i32 %ov_k, i32 %ov_g, i32 %ov_p, i32 %ov_i) {{\n\
++                    "\ndefine internal i64 {fn_name}(i64 %root_slot, i32 %ov_k, i32 %ov_g, i32 %ov_p, i32 %ov_i) {{\n\
+                      entry:\n\
+                      \x20 %ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
+                      \x20 %hit = icmp ne i32 %ct, 0\n\
+@@ -2902,7 +2937,7 @@
+                      \x20 %res_p = select i1 %use_ov, i32 %ov_p, i32 %rp\n\
+                      \x20 %res_g = select i1 %use_ov, i32 %ov_g, i32 %rg\n\
+                      \x20 {inst_sel}\n\
+-                     \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 %res_i, i32 %res_g, i32 %res_p)\n\
++                     \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_slot, i32 {inst_tag}, i32 %res_i, i32 %res_g, i32 %res_p)\n\
+                      \x20 br label %done\n\
+                      done:\n\
+                      \x20 %res = phi i64 [ %addr, %read ], [ 0, %entry ]\n\
+@@ -2911,7 +2946,7 @@
+                 ));
+             } else {
+                 out.push_str(&format!(
+-                    "\ndefine internal i64 {fn_name}(i64 %root_bda, i32 %ov_k, i32 %ov_g, i32 %ov_p, i32 %ov_i) {{\n\
++                    "\ndefine internal i64 {fn_name}(i64 %root_slot, i32 %ov_k, i32 %ov_g, i32 %ov_p, i32 %ov_i) {{\n\
+                      entry:\n\
+                      \x20 %rp = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+                      \x20 %rg = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
+@@ -2920,7 +2955,7 @@
+                      \x20 %res_p = select i1 %nz_ok, i32 %ov_p, i32 %rp\n\
+                      \x20 %res_g = select i1 %nz_ok, i32 %ov_g, i32 %rg\n\
+                      \x20 {inst_sel}\n\
+-                     \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 {inst_tag}, i32 %res_i, i32 %res_g, i32 %res_p)\n\
++                     \x20 %addr = call i64 @__m2v.rq.query.lookup_prim_data(i64 %root_slot, i32 {inst_tag}, i32 %res_i, i32 %res_g, i32 %res_p)\n\
+                      \x20 ret i64 %addr\n\
+                      }}\n"
+                 ));
+@@ -2939,6 +2974,19 @@
+     }
+ }
+ 
++fn slot_cache_entry(instanced: bool, root: &str, name: &str) -> String {
++    if instanced {
++        "  %last_inst = alloca i32, align 4\n  %last_slot = alloca i64, align 8\n  store i32 0, ptr %last_inst, align 4\n  store i64 1, ptr %last_slot, align 8\n".to_string()
++    } else {
++        format!("  %{name} = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {root}, i32 0, i32 0)\n")
++    }
++}
++
++fn slot_cache_lookup(instanced: bool, root: &str, instance: &str, name: &str) -> String {
++    if !instanced { return String::new(); }
++    format!("  %previous_inst = load i32, ptr %last_inst, align 4\n  %previous_slot = load i64, ptr %last_slot, align 8\n  %valid_slot = icmp ne i64 %previous_slot, 1\n  %same_inst = icmp eq i32 %previous_inst, {instance}\n  %reuse = and i1 %valid_slot, %same_inst\n  br i1 %reuse, label %slot_ready, label %resolve_slot\n\nresolve_slot:\n  %resolved = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {root}, i32 1, i32 {instance})\n  store i64 %resolved, ptr %last_slot, align 8\n  store i32 {instance}, ptr %last_inst, align 4\n  br label %slot_ready\n\nslot_ready:\n  %{name} = load i64, ptr %last_slot, align 8\n")
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn append_iq_motion_helpers(
+     out: &mut String,
+@@ -3053,7 +3101,6 @@
+     if out.contains(&fn_hdr) {
+         return;
+     }
+-    let inst_tag = if has_inst { 1 } else { 0 };
+     let (ro_call, rd_call) = if has_inst {
+         (
+             format!("call <3 x float> @__m2v.rq.get_object_ray_origin(i32 {slot}, i32 0)"),
+@@ -3072,6 +3119,9 @@
+     };
+     let outer_inst_arg = if has_inst { "%o_inst" } else { "0" };
+ 
++    let setup = slot_cache_entry(has_inst, "%root_slot", "blas_slot");
++    let lookup = slot_cache_lookup(has_inst, "%root_slot", outer_inst_arg, "blas_slot");
++
+     // Local helper formatting a packed candidate result in %iq_next_motion.
+     let pack_result = |pfx: &str,
+                        more: &str,
+@@ -3129,8 +3179,9 @@
+     };
+ 
+     let mut s = format!(
+-        "\n{fn_hdr}i64 %root_bda, float %mtime, i1 %cw, i32 %cull, i32 %ray_flags, i64 %mtlas_slot, i32 %init_in_act, i32 %init_in_cw, i32 %init_in_cull, i64 %init_in_cslot, i32 %init_inst, i32 %init_uid) {{\n\
++        "\n{fn_hdr}i64 %root_slot, float %mtime, i1 %cw, i32 %cull, i32 %ray_flags, i64 %mtlas_slot, {MOTION_HEADER} %motion_header, i32 %init_in_act, i32 %init_in_cw, i32 %init_in_cull, i64 %init_in_cslot, i32 %init_inst, i32 %init_uid) {{\n\
+          entry:\n\
++         {setup}\
+          \x20 %s_act = alloca i32, align 4\n\
+          \x20 %s_cw = alloca i32, align 4\n\
+          \x20 %s_cull = alloca i32, align 4\n\
+@@ -3179,7 +3230,8 @@
+     ));
+ 
+     if has_im {
+-        let xf_rty = "{ i64, <3 x float>, <3 x float>, i32, i32, i32, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float> }";
++        let name = super::ray_query_motion::xform_name(has_world);
++        let xf_rty = super::ray_query_motion::xform_type(has_world);
+         s.push_str(&format!(
+             "  %is_mtlas = icmp ne i64 %mtlas_slot, 0\n\
+              \x20 br i1 %is_mtlas, label %mtlas_cand, label %outer_std\n\n\
+@@ -3187,7 +3239,7 @@
+              \x20 %mp_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n\
+              \x20 %w_ro = call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})\n\
+              \x20 %w_rd = call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})\n\
+-             \x20 %mp_xf = call {xf_rty} @__m2v.rq.query.motion_tlas_xform_ray(i64 %mtlas_slot, i32 %mp_inst, float %mtime, <3 x float> %w_ro, <3 x float> %w_rd)\n\
++             \x20 %mp_xf = call {xf_rty} {name}({MOTION_HEADER} %motion_header, i32 %mp_inst, float %mtime, <3 x float> %w_ro, <3 x float> %w_rd)\n\
+              \x20 %mp_cbda = extractvalue {xf_rty} %mp_xf, 0\n\
+              \x20 %mp_ok = icmp ne i64 %mp_cbda, 0\n\
+              \x20 br i1 %mp_ok, label %mtlas_setup, label %mtlas_skip\n\n\
+@@ -3228,7 +3280,7 @@
+              \x20 %inst_op_all = or i32 %inst_op_i, %inst_no_i\n\
+              \x20 %inst_op_app = select i1 %rf_nof, i32 %inst_op_all, i32 0\n\
+              \x20 %in_flags = or i32 %rf_cull, %inst_op_app\n\
+-             \x20 %mp_cslot = call i64 @__m2v.rq.query.motion_find_slot(i64 %mp_cbda)\n\
++             \x20 %mp_cslot = call i64 @__m2v.rq.query.root_slot(i64 %mp_cbda)\n\
+              \x20 store i32 1, ptr %s_act, align 4\n\
+              \x20 store i32 %in_cw_32, ptr %s_cw, align 4\n\
+              \x20 store i32 %in_cull_s, ptr %s_cull, align 4\n\
+@@ -3264,7 +3316,7 @@
+          \x20 %geom_id = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
+          \x20 %aabb_id = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+          {outer_inst_line}\
+-         \x20 %blas_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_bda, i32 {inst_tag}, i32 {outer_inst_arg})\n"
++         {lookup}"
+     ));
+ 
+     let post_prim_lbl = if has_curve { "check_curve" } else { "plain_aabb" };
+@@ -3441,7 +3493,7 @@
+ 
+     // Inner loop if `has_im`
+     if has_im {
+-        let xf_rty = "{ i64, <3 x float>, <3 x float>, i32, i32, i32, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float> }";
++        let xf_rty = super::ray_query_motion::xform_type(has_world);
+         if has_world {
+             // Save w2o/o2w from %mp_xf into %s_w2o_*/%s_o2w_* in mtlas_setup and populate %s_w2o on %in_loop_exit!
+             let mut w_ins = String::new();
+@@ -3737,7 +3789,7 @@
+ /// Emit `@__m2v.rq.{prim_table_bda,prim_table_mask,slot_as_bda}` declarations and the structured
+ /// plain-LLVM-IR `@__m2v.rq.query.{probe_prim_slot,lookup_prim_data}` helpers (deduplicated once
+ /// per module, only emitted when `GARNETX_CAP_RT_PRIMITIVE_DATA` is enabled and prim data is read).
+-fn append_prim_data_lookup_support(out: &mut String) {
++pub(super) fn append_prim_data_lookup_support(out: &mut String) {
+     let decls = [
+         "declare i64 @__m2v.rq.prim_table_bda()",
+         "declare i32 @__m2v.rq.prim_table_mask()",
+@@ -3793,38 +3845,48 @@
+              }\n",
+         );
+     }
+-    if !out.contains("define internal i64 @__m2v.rq.query.lookup_prim_data(") {
++    if !out.contains("define internal i64 @__m2v.rq.query.root_slot(") {
+         out.push_str(
+-            "\ndefine internal i64 @__m2v.rq.query.lookup_prim_data(i64 %root_bda, i32 %has_inst, i32 %inst_id, i32 %geom_id, i32 %prim_id) {\n\
++            "\ndefine internal i64 @__m2v.rq.query.root_slot(i64 %root_bda) {\n\
+              entry:\n\
+              \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
+              \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
+              \x20 %root_ok = icmp ugt i64 %root_bda, 1\n\
+              \x20 %tbl_ok = icmp ne i64 %tbl_bda, 0\n\
+-             \x20 %both_ok = and i1 %root_ok, %tbl_ok\n\
+-             \x20 br i1 %both_ok, label %probe1, label %exit_all\n\
+-             \n\
+-             probe1:\n\
+-             \x20 %s1_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %root_bda)\n\
++             \x20 %ok = and i1 %root_ok, %tbl_ok\n\
++             \x20 br i1 %ok, label %probe, label %done\n\
++             probe:\n\
++             \x20 %slot = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %root_bda)\n\
++             \x20 br label %done\n\
++             done:\n\
++             \x20 %result = phi i64 [ 0, %entry ], [ %slot, %probe ]\n\
++             \x20 ret i64 %result\n\
++             }\n",
++        );
++    }
++    if !out.contains("define internal i64 @__m2v.rq.query.lookup_blas_slot(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.lookup_blas_slot(i64 %s1_addr, i32 %has_inst, i32 %inst_id) {\n\
++             entry:\n\
+              \x20 %s1_ok = icmp ne i64 %s1_addr, 0\n\
+              \x20 br i1 %s1_ok, label %read_s1, label %after_probe1\n\
+              \n\
+              read_s1:\n\
+-             \x20 %__m2v.rq.prim_data.s1_p8 = add i64 %s1_addr, 8\n\
+-             \x20 %s1_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p8 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs1_p8 = add i64 %s1_addr, 8\n\
++             \x20 %s1_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p8 to ptr addrspace(1)\n\
+              \x20 %s1_pay = load i64, ptr addrspace(1) %s1_pay_ptr, align 8\n\
+-             \x20 %__m2v.rq.prim_data.s1_p16 = add i64 %s1_addr, 16\n\
+-             \x20 %s1_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p16 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs1_p16 = add i64 %s1_addr, 16\n\
++             \x20 %s1_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p16 to ptr addrspace(1)\n\
+              \x20 %s1_cnt = load i32, ptr addrspace(1) %s1_cnt_ptr, align 4\n\
+-             \x20 %__m2v.rq.prim_data.s1_p28 = add i64 %s1_addr, 28\n\
+-             \x20 %s1_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p28 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs1_p28 = add i64 %s1_addr, 28\n\
++             \x20 %s1_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p28 to ptr addrspace(1)\n\
+              \x20 %s1_knd = load i32, ptr addrspace(1) %s1_knd_ptr, align 4\n\
+              \x20 %want_inst = icmp ne i32 %has_inst, 0\n\
+              \x20 %is_tlas_s = icmp eq i32 %s1_knd, 1\n\
+              \x20 %is_tlas_m = icmp eq i32 %s1_knd, 2\n\
+              \x20 %is_tlas = or i1 %is_tlas_s, %is_tlas_m\n\
+              \x20 %do_tlas = and i1 %want_inst, %is_tlas\n\
+-             \x20 br i1 %do_tlas, label %tlas_check, label %blas_check_kind\n\
++             \x20 br i1 %do_tlas, label %tlas_check, label %blas_check\n\
+              \n\
+              tlas_check:\n\
+              \x20 %tlas_pay_ok = icmp ne i64 %s1_pay, 0\n\
+@@ -3833,67 +3895,83 @@
+              \x20 br i1 %tlas_ok, label %tlas_load, label %tlas_done\n\
+              \n\
+              tlas_load:\n\
+-             \x20 %__m2v.rq.prim_data.s1_p20 = add i64 %s1_addr, 20\n\
+-             \x20 %s1_str_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p20 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs1_p20 = add i64 %s1_addr, 20\n\
++             \x20 %s1_str_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p20 to ptr addrspace(1)\n\
+              \x20 %s1_str = load i32, ptr addrspace(1) %s1_str_ptr, align 4\n\
+-             \x20 %__m2v.rq.prim_data.s1_p24 = add i64 %s1_addr, 24\n\
+-             \x20 %s1_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.s1_p24 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs1_p24 = add i64 %s1_addr, 24\n\
++             \x20 %s1_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p24 to ptr addrspace(1)\n\
+              \x20 %s1_ref = load i32, ptr addrspace(1) %s1_ref_ptr, align 4\n\
+              \x20 %inst64 = zext i32 %inst_id to i64\n\
+              \x20 %str64 = zext i32 %s1_str to i64\n\
+              \x20 %ref64 = zext i32 %s1_ref to i64\n\
+              \x20 %inst_off0 = mul i64 %inst64, %str64\n\
+              \x20 %inst_off = add i64 %inst_off0, %ref64\n\
+-             \x20 %__m2v.rq.prim_data.blas_ref = add i64 %s1_pay, %inst_off\n\
+-             \x20 %blas_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.blas_ref to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bblas_ref = add i64 %s1_pay, %inst_off\n\
++             \x20 %blas_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bblas_ref to ptr addrspace(1)\n\
+              \x20 %blas_bda = load i64, ptr addrspace(1) %blas_ref_ptr, align 8\n\
+              \x20 %blas_bda_ok = icmp ugt i64 %blas_bda, 1\n\
+              \x20 br i1 %blas_bda_ok, label %probe2, label %tlas_load_done\n\
+              \n\
+              probe2:\n\
++             \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
++             \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
+              \x20 %s2_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %blas_bda)\n\
+              \x20 %s2_ok = icmp ne i64 %s2_addr, 0\n\
+              \x20 br i1 %s2_ok, label %read_s2, label %probe2_done\n\
+              \n\
+              read_s2:\n\
+-             \x20 %__m2v.rq.prim_data.s2_p8 = add i64 %s2_addr, 8\n\
+-             \x20 %s2_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p8 to ptr addrspace(1)\n\
+-             \x20 %s2_pay = load i64, ptr addrspace(1) %s2_pay_ptr, align 8\n\
+-             \x20 %__m2v.rq.prim_data.s2_p16 = add i64 %s2_addr, 16\n\
+-             \x20 %s2_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p16 to ptr addrspace(1)\n\
+-             \x20 %s2_cnt = load i32, ptr addrspace(1) %s2_cnt_ptr, align 4\n\
+-             \x20 %__m2v.rq.prim_data.s2_p28 = add i64 %s2_addr, 28\n\
+-             \x20 %s2_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.s2_p28 to ptr addrspace(1)\n\
++             \x20 %__m2v.rq.prim_data.bs2_p28 = add i64 %s2_addr, 28\n\
++             \x20 %s2_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs2_p28 to ptr addrspace(1)\n\
+              \x20 %s2_knd = load i32, ptr addrspace(1) %s2_knd_ptr, align 4\n\
+              \x20 %s2_is_blas = icmp eq i32 %s2_knd, 0\n\
+-             \x20 %s2_gtbl = select i1 %s2_is_blas, i64 %s2_pay, i64 0\n\
+-             \x20 %s2_gcnt = select i1 %s2_is_blas, i32 %s2_cnt, i32 0\n\
++             \x20 %s2_res = select i1 %s2_is_blas, i64 %s2_addr, i64 0\n\
+              \x20 br label %probe2_done\n\
+              \n\
+              probe2_done:\n\
+-             \x20 %p2_tbl = phi i64 [ %s2_gtbl, %read_s2 ], [ 0, %probe2 ]\n\
+-             \x20 %p2_cnt = phi i32 [ %s2_gcnt, %read_s2 ], [ 0, %probe2 ]\n\
++             \x20 %p2_slot = phi i64 [ %s2_res, %read_s2 ], [ 0, %probe2 ]\n\
+              \x20 br label %tlas_load_done\n\
+              \n\
+              tlas_load_done:\n\
+-             \x20 %tl_tbl = phi i64 [ %p2_tbl, %probe2_done ], [ 0, %tlas_load ]\n\
+-             \x20 %tl_cnt = phi i32 [ %p2_cnt, %probe2_done ], [ 0, %tlas_load ]\n\
++             \x20 %tl_slot = phi i64 [ %p2_slot, %probe2_done ], [ 0, %tlas_load ]\n\
+              \x20 br label %tlas_done\n\
+              \n\
+              tlas_done:\n\
+-             \x20 %td_tbl = phi i64 [ %tl_tbl, %tlas_load_done ], [ 0, %tlas_check ]\n\
+-             \x20 %td_cnt = phi i32 [ %tl_cnt, %tlas_load_done ], [ 0, %tlas_check ]\n\
++             \x20 %td_slot = phi i64 [ %tl_slot, %tlas_load_done ], [ 0, %tlas_check ]\n\
+              \x20 br label %blas_merge\n\
+              \n\
+-             blas_check_kind:\n\
++             blas_check:\n\
+              \x20 %s1_is_blas = icmp eq i32 %s1_knd, 0\n\
+-             \x20 %s1_gtbl = select i1 %s1_is_blas, i64 %s1_pay, i64 0\n\
+-             \x20 %s1_gcnt = select i1 %s1_is_blas, i32 %s1_cnt, i32 0\n\
++             \x20 %s1_res = select i1 %s1_is_blas, i64 %s1_addr, i64 0\n\
+              \x20 br label %blas_merge\n\
+              \n\
+              blas_merge:\n\
+-             \x20 %geom_tbl = phi i64 [ %td_tbl, %tlas_done ], [ %s1_gtbl, %blas_check_kind ]\n\
+-             \x20 %geom_cnt = phi i32 [ %td_cnt, %tlas_done ], [ %s1_gcnt, %blas_check_kind ]\n\
++             \x20 %slot_res = phi i64 [ %td_slot, %tlas_done ], [ %s1_res, %blas_check ]\n\
++             \x20 br label %after_probe1\n\
++             \n\
++             after_probe1:\n\
++             \x20 %res = phi i64 [ %slot_res, %blas_merge ], [ 0, %entry ]\n\
++             \x20 ret i64 %res\n\
++             }\n",
++        );
++    }
++}
++
++fn append_prim_data_address_support(out: &mut String) {
++    append_prim_data_lookup_support(out);
++    if !out.contains("define internal i64 @__m2v.rq.query.lookup_prim_data(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.lookup_prim_data(i64 %root_slot, i32 %has_inst, i32 %inst_id, i32 %geom_id, i32 %prim_id) {\n\
++             entry:\n\
++             \x20 %slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_slot, i32 %has_inst, i32 %inst_id)\n\
++             \x20 %ok = icmp ne i64 %slot, 0\n\
++             \x20 br i1 %ok, label %blas_merge, label %after_probe1\n\
++             blas_merge:\n\
++             \x20 %__m2v.rq.prim_data.geom_pay = add i64 %slot, 8\n\
++             \x20 %pay_ptr = inttoptr i64 %__m2v.rq.prim_data.geom_pay to ptr addrspace(1)\n\
++             \x20 %geom_tbl = load i64, ptr addrspace(1) %pay_ptr, align 8\n\
++             \x20 %__m2v.rq.prim_data.geom_count = add i64 %slot, 16\n\
++             \x20 %count_ptr = inttoptr i64 %__m2v.rq.prim_data.geom_count to ptr addrspace(1)\n\
++             \x20 %geom_cnt = load i32, ptr addrspace(1) %count_ptr, align 4\n\
+              \x20 %gtbl_ok = icmp ne i64 %geom_tbl, 0\n\
+              \x20 %geom_in_b = icmp ult i32 %geom_id, %geom_cnt\n\
+              \x20 %geom_ok = and i1 %gtbl_ok, %geom_in_b\n\
+@@ -3926,11 +4004,7 @@
+              \x20 br label %after_probe1\n\
+              \n\
+              after_probe1:\n\
+-             \x20 %p1_res = phi i64 [ %geom_res, %after_geom ], [ 0, %probe1 ]\n\
+-             \x20 br label %exit_all\n\
+-             \n\
+-             exit_all:\n\
+-             \x20 %res = phi i64 [ %p1_res, %after_probe1 ], [ 0, %entry ]\n\
++             \x20 %res = phi i64 [ %geom_res, %after_geom ], [ 0, %entry ]\n\
+              \x20 ret i64 %res\n\
+              }\n",
+         );
+@@ -3947,117 +4021,13 @@
+     }
+ }
+ 
+-pub(super) fn append_blas_slot_lookup_support_pub(out: &mut String) {
+-    append_prim_data_lookup_support(out);
+-    if !out.contains("define internal i64 @__m2v.rq.query.lookup_blas_slot(") {
+-        out.push_str(
+-            "\ndefine internal i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_bda, i32 %has_inst, i32 %inst_id) {\n\
+-             entry:\n\
+-             \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
+-             \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
+-             \x20 %root_ok = icmp ugt i64 %root_bda, 1\n\
+-             \x20 %tbl_ok = icmp ne i64 %tbl_bda, 0\n\
+-             \x20 %both_ok = and i1 %root_ok, %tbl_ok\n\
+-             \x20 br i1 %both_ok, label %probe1, label %exit_all\n\
+-             \n\
+-             probe1:\n\
+-             \x20 %s1_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %root_bda)\n\
+-             \x20 %s1_ok = icmp ne i64 %s1_addr, 0\n\
+-             \x20 br i1 %s1_ok, label %read_s1, label %after_probe1\n\
+-             \n\
+-             read_s1:\n\
+-             \x20 %__m2v.rq.prim_data.bs1_p8 = add i64 %s1_addr, 8\n\
+-             \x20 %s1_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p8 to ptr addrspace(1)\n\
+-             \x20 %s1_pay = load i64, ptr addrspace(1) %s1_pay_ptr, align 8\n\
+-             \x20 %__m2v.rq.prim_data.bs1_p16 = add i64 %s1_addr, 16\n\
+-             \x20 %s1_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p16 to ptr addrspace(1)\n\
+-             \x20 %s1_cnt = load i32, ptr addrspace(1) %s1_cnt_ptr, align 4\n\
+-             \x20 %__m2v.rq.prim_data.bs1_p28 = add i64 %s1_addr, 28\n\
+-             \x20 %s1_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p28 to ptr addrspace(1)\n\
+-             \x20 %s1_knd = load i32, ptr addrspace(1) %s1_knd_ptr, align 4\n\
+-             \x20 %want_inst = icmp ne i32 %has_inst, 0\n\
+-             \x20 %is_tlas_s = icmp eq i32 %s1_knd, 1\n\
+-             \x20 %is_tlas_m = icmp eq i32 %s1_knd, 2\n\
+-             \x20 %is_tlas = or i1 %is_tlas_s, %is_tlas_m\n\
+-             \x20 %do_tlas = and i1 %want_inst, %is_tlas\n\
+-             \x20 br i1 %do_tlas, label %tlas_check, label %blas_check\n\
+-             \n\
+-             tlas_check:\n\
+-             \x20 %tlas_pay_ok = icmp ne i64 %s1_pay, 0\n\
+-             \x20 %inst_in_b = icmp ult i32 %inst_id, %s1_cnt\n\
+-             \x20 %tlas_ok = and i1 %tlas_pay_ok, %inst_in_b\n\
+-             \x20 br i1 %tlas_ok, label %tlas_load, label %tlas_done\n\
+-             \n\
+-             tlas_load:\n\
+-             \x20 %__m2v.rq.prim_data.bs1_p20 = add i64 %s1_addr, 20\n\
+-             \x20 %s1_str_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p20 to ptr addrspace(1)\n\
+-             \x20 %s1_str = load i32, ptr addrspace(1) %s1_str_ptr, align 4\n\
+-             \x20 %__m2v.rq.prim_data.bs1_p24 = add i64 %s1_addr, 24\n\
+-             \x20 %s1_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p24 to ptr addrspace(1)\n\
+-             \x20 %s1_ref = load i32, ptr addrspace(1) %s1_ref_ptr, align 4\n\
+-             \x20 %inst64 = zext i32 %inst_id to i64\n\
+-             \x20 %str64 = zext i32 %s1_str to i64\n\
+-             \x20 %ref64 = zext i32 %s1_ref to i64\n\
+-             \x20 %inst_off0 = mul i64 %inst64, %str64\n\
+-             \x20 %inst_off = add i64 %inst_off0, %ref64\n\
+-             \x20 %__m2v.rq.prim_data.bblas_ref = add i64 %s1_pay, %inst_off\n\
+-             \x20 %blas_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bblas_ref to ptr addrspace(1)\n\
+-             \x20 %blas_bda = load i64, ptr addrspace(1) %blas_ref_ptr, align 8\n\
+-             \x20 %blas_bda_ok = icmp ugt i64 %blas_bda, 1\n\
+-             \x20 br i1 %blas_bda_ok, label %probe2, label %tlas_load_done\n\
+-             \n\
+-             probe2:\n\
+-             \x20 %s2_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %blas_bda)\n\
+-             \x20 %s2_ok = icmp ne i64 %s2_addr, 0\n\
+-             \x20 br i1 %s2_ok, label %read_s2, label %probe2_done\n\
+-             \n\
+-             read_s2:\n\
+-             \x20 %__m2v.rq.prim_data.bs2_p28 = add i64 %s2_addr, 28\n\
+-             \x20 %s2_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs2_p28 to ptr addrspace(1)\n\
+-             \x20 %s2_knd = load i32, ptr addrspace(1) %s2_knd_ptr, align 4\n\
+-             \x20 %s2_is_blas = icmp eq i32 %s2_knd, 0\n\
+-             \x20 %s2_res = select i1 %s2_is_blas, i64 %s2_addr, i64 0\n\
+-             \x20 br label %probe2_done\n\
+-             \n\
+-             probe2_done:\n\
+-             \x20 %p2_slot = phi i64 [ %s2_res, %read_s2 ], [ 0, %probe2 ]\n\
+-             \x20 br label %tlas_load_done\n\
+-             \n\
+-             tlas_load_done:\n\
+-             \x20 %tl_slot = phi i64 [ %p2_slot, %probe2_done ], [ 0, %tlas_load ]\n\
+-             \x20 br label %tlas_done\n\
+-             \n\
+-             tlas_done:\n\
+-             \x20 %td_slot = phi i64 [ %tl_slot, %tlas_load_done ], [ 0, %tlas_check ]\n\
+-             \x20 br label %blas_merge\n\
+-             \n\
+-             blas_check:\n\
+-             \x20 %s1_is_blas = icmp eq i32 %s1_knd, 0\n\
+-             \x20 %s1_res = select i1 %s1_is_blas, i64 %s1_addr, i64 0\n\
+-             \x20 br label %blas_merge\n\
+-             \n\
+-             blas_merge:\n\
+-             \x20 %slot_res = phi i64 [ %td_slot, %tlas_done ], [ %s1_res, %blas_check ]\n\
+-             \x20 br label %after_probe1\n\
+-             \n\
+-             after_probe1:\n\
+-             \x20 %p1_res = phi i64 [ %slot_res, %blas_merge ], [ 0, %probe1 ]\n\
+-             \x20 br label %exit_all\n\
+-             \n\
+-             exit_all:\n\
+-             \x20 %res = phi i64 [ %p1_res, %after_probe1 ], [ 0, %entry ]\n\
+-             \x20 ret i64 %res\n\
+-             }\n",
+-        );
+-    }
+-}
+ 
+ /// Emit curve RT lookup + analytic/Phantom cubic-Bezier ray-curve intersection helpers.
+ /// Called when `GARNETX_CAP_RT_CURVES` is enabled and any `intersection_query` or `intersect`
+ /// call uses `curve_data`. All BDA pointers use `%__m2v.rq.prim_data.*` scalar reads and
+ /// structured diamond/single-loop CFGs without nested loops or dynamic array allocas.
+ fn append_curve_rt_support(out: &mut String) {
+-    append_blas_slot_lookup_support_pub(out);
++    append_prim_data_lookup_support(out);
+     for decl in [
+         "declare float @air.sqrt.f32(float)",
+         "declare float @llvm.fabs.f32(float)",
+@@ -5073,6 +5043,34 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod sidecar_perf_tests {
++    use super::*;
++
++    #[test]
++    fn unused_primitive_getter_does_not_materialize_sidecar_state() {
++        let ir = "define void @k(ptr %out) {\nentry:\n  %q = call ptr @air.allocate_intersection_query.triangle_data()\n  %unused = call ptr addrspace(1) @air.get_candidate_primitive_data_intersection_query.triangle_data(ptr %q)\n  ret void\n}\n";
++        let lowered = lower_air_ray_queries_with_rt_options(ir, &[], false, true, true, false).unwrap().unwrap();
++        assert!(!lowered.contains("alloca"));
++        assert!(!lowered.contains("probe_prim_slot"));
++        let used = ir.replace("ret void", "store ptr addrspace(1) %unused, ptr %out\n  ret void");
++        let lowered = lower_air_ray_queries_with_rt_options(&used, &[], false, true, true, false).unwrap().unwrap();
++        assert!(lowered.contains("probe_prim_slot"));
++    }
++
++    #[test]
++    fn curve_query_resolves_the_root_before_proceed() {
++        let ir = "define i1 @k(ptr addrspace(1) %as) {\nentry:\n  %q = call ptr @air.allocate_intersection_query.instancing.curve_data()\n  call void @air.reset_intersection_query.instancing.curve_data(ptr %q, <3 x float> zeroinitializer, <3 x float> zeroinitializer, float 0.0, float 1.0, ptr addrspace(1) %as, i32 -1, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 -1, i32 -1, i32 0, i1 false, i1 false)\n  %more = call i1 @air.next_intersection_query.instancing.curve_data(ptr %q)\n  ret i1 %more\n}\n";
++        let lowered = lower_air_ray_queries_with_rt_options(ir, &[], false, false, true, false).unwrap().unwrap();
++        let helper = lowered.split("define internal <4 x float> @__m2v.rq.query.iq_next_curve.").nth(1).unwrap();
++        let (preheader, traversal) = helper.split_once("loop_hdr:").unwrap();
++        assert!(!preheader.contains("call i64 @__m2v.rq.query.root_slot"));
++        assert!(lowered[..lowered.find("define internal").unwrap()].contains("call i64 @__m2v.rq.query.root_slot"));
++        assert!(!traversal.contains("call i64 @__m2v.rq.query.root_slot"));
++        assert!(!lowered.contains("define internal i64 @__m2v.rq.query.lookup_prim_data"));
++    }
++}
++
+ fn append_rq_intrinsic_declarations(out: &mut String, existing_ll: &str) {
+     let decls = [
+         "declare void @__m2v.rq.init(i32, ptr addrspace(1), i32, i32, <3 x float>, float, <3 x float>, float)",
+@@ -5202,7 +5200,7 @@
+     hdr_label: &'a str,
+     term_label: &'a str,
+     cw_val: &'a str,
+-    root_bda_for_prim: &'a str,
++    root_slot_for_prim: &'a str,
+     has_inst_for_prim: bool,
+     tri_cand_vals: Option<(&'a str, &'a str, &'a str, &'a str)>,
+     override_world_or_inst: bool,
+@@ -5329,25 +5327,57 @@
+         idx.force_opacity,
+     ));
+ 
+-    let need_root_bda = has_curves || has_motion || (prim_data_enabled && p.reads_prim_data);
+-    let root_bda_expr = if need_root_bda {
+-        if p.accel_is_bda {
+-            "%p4".to_string()
+-        } else if let Some(as_slot) = p.descriptor_as_slot {
+-            s.push_str(&format!(
+-                "  %rq_root_bda = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"
+-            ));
+-            "%rq_root_bda".to_string()
+-        } else {
+-            "0".to_string()
+-        }
++    let call_payload_size: Option<u32> = p
++        .raw_args
++        .get(idx.payload + 1)
++        .and_then(|(_, val)| val.trim().parse::<u32>().ok());
++    let active_callbacks: Vec<&LinkedRayCallback> = if p.has_active_table {
++        linked_callbacks
++            .iter()
++            .filter(|cb| match (call_payload_size, cb.payload_size) {
++                (Some(csz), Some(bsz)) => csz == bsz,
++                _ => true,
++            })
++            .collect()
+     } else {
+-        "0".to_string()
++        Vec::new()
+     };
++    let tri_callbacks: Vec<&LinkedRayCallback> = active_callbacks
++        .iter()
++        .copied()
++        .filter(|cb| cb.kind == IntersectionFunctionKind::TriangleAnyHit)
++        .collect();
++    let aabb_callbacks: Vec<&LinkedRayCallback> = active_callbacks
++        .iter()
++        .copied()
++        .filter(|cb| cb.kind == IntersectionFunctionKind::BoundingBox)
++        .collect();
++    let curve_callbacks: Vec<&LinkedRayCallback> = active_callbacks
++        .iter()
++        .copied()
++        .filter(|cb| cb.kind == IntersectionFunctionKind::Curve)
++        .collect();
+ 
++    let cache_root = has_motion || has_curves || (prim_data_enabled && active_callbacks.iter().any(|cb|
++        cb.param_roles.contains(&CallbackParamRole::PrimitiveDataPtr)));
++    if cache_root {
++        let root = if p.accel_is_bda {
++            "%p4"
++        } else if let Some(as_slot) = p.descriptor_as_slot {
++            s.push_str(&format!("  %rq_root_bda = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"));
++            "%rq_root_bda"
++        } else {
++            "0"
++        };
++        s.push_str(&format!("  %rq_root_slot = call i64 @__m2v.rq.query.root_slot(i64 {root})\n"));
++        if has_curves || has_prim_motion {
++            s.push_str(&slot_cache_entry(has_instancing, "%rq_root_slot", if has_motion { "m_slot" } else { "c_slot" }));
++        }
++    }
+     if has_inst_motion {
+         s.push_str(&format!(
+-            "  %mtlas_slot = call i64 @__m2v.rq.query.motion_check_tlas_slot(i64 {root_bda_expr})\n\
++            "  %mtlas_slot = call i64 @__m2v.rq.query.motion_check_tlas_slot(i64 %rq_root_slot)\n\
++             \x20 %motion_header = call {MOTION_HEADER} @__m2v.rq.query.motion_read_header(i64 %mtlas_slot)\n\
+              \x20 %is_mtlas_hdr = icmp ne i64 %mtlas_slot, 0\n\
+              \x20 %outer_ray_flags = select i1 %is_mtlas_hdr, i32 0, i32 %ray_flags\n"
+         ));
+@@ -5439,38 +5469,6 @@
+             }
+         }
+     }
+-    let curve_root_bda = root_bda_expr.clone();
+-
+-    let call_payload_size: Option<u32> = p
+-        .raw_args
+-        .get(idx.payload + 1)
+-        .and_then(|(_, val)| val.trim().parse::<u32>().ok());
+-    let active_callbacks: Vec<&LinkedRayCallback> = if p.has_active_table {
+-        linked_callbacks
+-            .iter()
+-            .filter(|cb| match (call_payload_size, cb.payload_size) {
+-                (Some(csz), Some(bsz)) => csz == bsz,
+-                _ => true,
+-            })
+-            .collect()
+-    } else {
+-        Vec::new()
+-    };
+-    let tri_callbacks: Vec<&LinkedRayCallback> = active_callbacks
+-        .iter()
+-        .copied()
+-        .filter(|cb| cb.kind == IntersectionFunctionKind::TriangleAnyHit)
+-        .collect();
+-    let aabb_callbacks: Vec<&LinkedRayCallback> = active_callbacks
+-        .iter()
+-        .copied()
+-        .filter(|cb| cb.kind == IntersectionFunctionKind::BoundingBox)
+-        .collect();
+-    let curve_callbacks: Vec<&LinkedRayCallback> = active_callbacks
+-        .iter()
+-        .copied()
+-        .filter(|cb| cb.kind == IntersectionFunctionKind::Curve)
+-        .collect();
+ 
+     s.push_str("  br label %proceed_hdr\n\n");
+     s.push_str(&format!(
+@@ -5492,7 +5490,6 @@
+             p,
+             ift_abi_v2,
+             prim_data_enabled,
+-            &root_bda_expr,
+             &active_callbacks,
+             &tri_callbacks,
+             &aabb_callbacks,
+@@ -5500,14 +5497,10 @@
+         )?;
+     } else if active_callbacks.is_empty() {
+         if has_curves {
+-            let (inst_tag, inst_line, inst_arg) = if has_instancing {
+-                (
+-                    1u32,
+-                    format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"),
+-                    "%c_inst",
+-                )
++            let inst_line = if has_instancing {
++                format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n{}", slot_cache_lookup(true, "%rq_root_slot", "%c_inst", "c_slot"))
+             } else {
+-                (0u32, String::new(), "0")
++                String::new()
+             };
+             let (ro_call, rd_call) = if has_instancing {
+                 (
+@@ -5533,7 +5526,6 @@
+                  \x20 %c_geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
+                  \x20 %c_aabb = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+                  {inst_line}\
+-                 \x20 %c_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {curve_root_bda}, i32 {inst_tag}, i32 {inst_arg})\n\
+                  \x20 %c_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %c_slot, i32 %c_geom)\n\
+                  \x20 %c_is = icmp ne i64 %c_hdr, 0\n\
+                  \x20 br i1 %c_is, label %curve_cand, label %proceed_hdr\n\n\
+@@ -5624,7 +5616,7 @@
+             hdr_label: "proceed_hdr",
+             term_label: "term_hit",
+             cw_val: "%cw",
+-            root_bda_for_prim: &curve_root_bda,
++            root_slot_for_prim: "%rq_root_slot",
+             has_inst_for_prim: has_instancing,
+             tri_cand_vals: None,
+             override_world_or_inst: false,
+@@ -5673,14 +5665,10 @@
+         ));
+ 
+         if has_curves {
+-            let (inst_tag, inst_line, inst_arg) = if has_instancing {
+-                (
+-                    1u32,
+-                    format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"),
+-                    "%c_inst",
+-                )
++            let inst_line = if has_instancing {
++                format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n{}", slot_cache_lookup(true, "%rq_root_slot", "%c_inst", "c_slot"))
+             } else {
+-                (0u32, String::new(), "0")
++                String::new()
+             };
+             let (ro_call, rd_call) = if has_instancing {
+                 (
+@@ -5697,7 +5685,6 @@
+                 "non_tri_dispatch:\n\
+                  \x20 %c_aabb = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+                  {inst_line}\
+-                 \x20 %c_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {curve_root_bda}, i32 {inst_tag}, i32 {inst_arg})\n\
+                  \x20 %c_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %c_slot, i32 %cand_geom)\n\
+                  \x20 %c_is = icmp ne i64 %c_hdr, 0\n\
+                  \x20 br i1 %c_is, label %curve_cand, label %aabb_dispatch\n\n\
+@@ -5913,6 +5900,20 @@
+         }
+     }
+     if prim_data_enabled && p.reads_prim_data {
++        let root_slot = if cache_root {
++            "%rq_root_slot"
++        } else {
++            let bda = if p.accel_is_bda {
++                "%p4"
++            } else if let Some(as_slot) = p.descriptor_as_slot {
++                s.push_str(&format!("  %hit_root_bda = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"));
++                "%hit_root_bda"
++            } else {
++                "0"
++            };
++            s.push_str(&format!("  %hit_root_slot = call i64 @__m2v.rq.query.root_slot(i64 {bda})\n"));
++            "%hit_root_slot"
++        };
+         let (has_inst_i32, inst_val) = if has_instancing {
+             (1, "%hit_inst")
+         } else {
+@@ -5926,7 +5927,7 @@
+             ("%hit_geom", "%hit_prim")
+         };
+         s.push_str(&format!(
+-            "  %hit_prim_data = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda_expr}, i32 {has_inst_i32}, i32 {inst_val}, i32 {lookup_geom_arg}, i32 {lookup_prim_arg})\n"
++            "  %hit_prim_data = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_slot}, i32 {has_inst_i32}, i32 {inst_val}, i32 {lookup_geom_arg}, i32 {lookup_prim_arg})\n"
+         ));
+     }
+     s.push_str("  br label %after_hit\n\nafter_hit:\n");
+@@ -6108,7 +6109,6 @@
+     p: &PendingCall,
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
+-    root_bda_expr: &str,
+     active_callbacks: &[&LinkedRayCallback],
+     tri_callbacks: &[&LinkedRayCallback],
+     aabb_callbacks: &[&LinkedRayCallback],
+@@ -6186,14 +6186,13 @@
+     }
+ 
+     // Outer non-triangle candidate: motion BLAS primitives -> curves -> custom AABB.
+-    let (inst_tag, inst_line, inst_arg) = if has_instancing {
++    let (inst_line, inst_arg) = if has_instancing {
+         (
+-            1u32,
+             format!("  %m_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"),
+             "%m_inst",
+         )
+     } else {
+-        (0u32, String::new(), "0")
++        (String::new(), "0")
+     };
+     let (ro_call, rd_call) = if has_instancing {
+         (
+@@ -6218,7 +6217,7 @@
+         s.push_str(&format!(
+             "  %m_aabb = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+              {inst_line}\
+-             \x20 %m_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {root_bda_expr}, i32 {inst_tag}, i32 {inst_arg})\n"
++             {}", slot_cache_lookup(has_instancing, "%rq_root_slot", inst_arg, "m_slot")
+         ));
+     }
+     if has_prim_motion {
+@@ -6309,7 +6308,7 @@
+             hdr_label: "proceed_hdr",
+             term_label: "term_hit",
+             cw_val: "%cw",
+-            root_bda_for_prim: root_bda_expr,
++            root_slot_for_prim: "%rq_root_slot",
+             has_inst_for_prim: has_instancing,
+             tri_cand_vals: Some(("%tri_cand_t", "%tri_cand_bary", "%tri_cand_ff", "%tri_cand_is_mt")),
+             override_world_or_inst: false,
+@@ -6377,7 +6376,7 @@
+             hdr_label: "proceed_hdr",
+             term_label: "term_hit",
+             cw_val: "%cw",
+-            root_bda_for_prim: root_bda_expr,
++            root_slot_for_prim: "%rq_root_slot",
+             has_inst_for_prim: has_instancing,
+             tri_cand_vals: None,
+             override_world_or_inst: false,
+@@ -6451,7 +6450,7 @@
+             hdr_label: "proceed_hdr",
+             term_label: "term_hit",
+             cw_val: "%cw",
+-            root_bda_for_prim: root_bda_expr,
++            root_slot_for_prim: "%rq_root_slot",
+             has_inst_for_prim: has_instancing,
+             tri_cand_vals: None,
+             override_world_or_inst: false,
+@@ -6487,11 +6486,12 @@
+     // Path 2: mtlas_proxy -> inner BLAS traversal (instance_motion TLAS_MOTION)
+     // -------------------------------------------------------------------------
+     if has_inst_motion {
+-        let xform_ret_ty = "{ i64, <3 x float>, <3 x float>, i32, i32, i32, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float> }";
++        let name = super::ray_query_motion::xform_name(world_space_data);
++        let xform_ret_ty = super::ray_query_motion::xform_type(world_space_data);
+         s.push_str(&format!(
+             "mtlas_proxy:\n\
+              \x20 %mp_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n\
+-             \x20 %mp_xf = call {xform_ret_ty} @__m2v.rq.query.motion_tlas_xform_ray(i64 %mtlas_slot, i32 %mp_inst, float {time_val}, <3 x float> %p0, <3 x float> %p1)\n\
++             \x20 %mp_xf = call {xform_ret_ty} {name}({MOTION_HEADER} %motion_header, i32 %mp_inst, float {time_val}, <3 x float> %p0, <3 x float> %p1)\n\
+              \x20 %mp_cbda = extractvalue {xform_ret_ty} %mp_xf, 0\n\
+              \x20 %mp_ok = icmp ne i64 %mp_cbda, 0\n\
+              \x20 br i1 %mp_ok, label %mtlas_setup, label %proceed_hdr\n\n\
+@@ -6545,7 +6545,7 @@
+              \x20 %inst_op_all = or i32 %inst_op_i, %inst_no_i\n\
+              \x20 %inst_op_app = select i1 %rf_nof, i32 %inst_op_all, i32 0\n\
+              \x20 %in_flags = or i32 %rf_cull, %inst_op_app\n\
+-             \x20 %mp_cslot = call i64 @__m2v.rq.query.motion_find_slot(i64 %mp_cbda)\n\
++             \x20 %mp_cslot = call i64 @__m2v.rq.query.root_slot(i64 %mp_cbda)\n\
+              \x20 store i32 %mp_inst, ptr %in_cand_inst_v, align 4\n\
+              \x20 store i32 %mp_uid, ptr %in_cand_uid_v, align 4\n\
+              \x20 store i32 %in_cw32, ptr %in_cand_cw_v, align 4\n\
+@@ -6712,7 +6712,7 @@
+                 hdr_label: "in_proceed_hdr",
+                 term_label: "in_term_hit",
+                 cw_val: "%in_cw",
+-                root_bda_for_prim: "%mp_cbda",
++                root_slot_for_prim: "%mp_cslot",
+                 has_inst_for_prim: false,
+                 tri_cand_vals: Some((
+                     "%in_tri_cand_t",
+@@ -6785,7 +6785,7 @@
+                 hdr_label: "in_proceed_hdr",
+                 term_label: "in_term_hit",
+                 cw_val: "%in_cw",
+-                root_bda_for_prim: "%mp_cbda",
++                root_slot_for_prim: "%mp_cslot",
+                 has_inst_for_prim: false,
+                 tri_cand_vals: None,
+                 override_world_or_inst: true,
+@@ -6861,7 +6861,7 @@
+                 hdr_label: "in_proceed_hdr",
+                 term_label: "in_term_hit",
+                 cw_val: "%in_cw",
+-                root_bda_for_prim: "%mp_cbda",
++                root_slot_for_prim: "%mp_cslot",
+                 has_inst_for_prim: false,
+                 tri_cand_vals: None,
+                 override_world_or_inst: true,
+@@ -7258,7 +7258,7 @@
+             }
+             CallbackParamRole::PrimitiveDataPtr => {
+                 if prim_data_enabled {
+-                    let root_bda = cfg.root_bda_for_prim;
++                    let root_slot = cfg.root_slot_for_prim;
+                     let prim_expr = if let Some((_, _, cseg)) = curve_vals {
+                         cseg.to_string()
+                     } else {
+@@ -7280,7 +7280,7 @@
+                     };
+                     let addr_var = format!("%__m2v.rq.prim_data.{prefix}_{pi}");
+                     s.push_str(&format!(
+-                        "  {addr_var} = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 {vname}_geom, i32 {prim_expr})\n\
++                        "  {addr_var} = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_slot}, i32 {has_inst_i32}, i32 {inst_val}, i32 {vname}_geom, i32 {prim_expr})\n\
+                          \x20 {vname} = inttoptr i64 {addr_var} to {pty}\n"
+                     ));
+                     args.push(format!("{pty} {vname}"));
+@@ -7862,7 +7862,8 @@
+         assert!(out.contains("%outer_ray_flags = select i1 %is_mtlas_hdr, i32 0, i32 %ray_flags"));
+         assert!(out.contains("call void @__m2v.rq.init.bda(i32 1,"));
+         assert!(out.contains("@__m2v.rq.query.motion_tri_intersect("));
+-        assert!(out.contains("@__m2v.rq.query.motion_tlas_xform_ray("));
++        assert!(out.contains("@__m2v.rq.query.motion_tlas_xform_ray_compact("));
++        assert!(!out.contains("%o2wc0 = insertelement"));
+     }
+ 
+     #[test]
+diff --git a/src/native/ray_query_motion.rs b/src/native/ray_query_motion.rs
+--- a/src/native/ray_query_motion.rs
++++ b/src/native/ray_query_motion.rs
+@@ -11,9 +11,9 @@
+ /// Emit scalar BDA motion-blur helper functions into `out` (deduplicated once per module).
+ /// All computed BDA integers use `%__m2v.rq.prim_data.*` names and `motion_*` function names are
+ /// allowlisted as `trusted_ro_bda` in `core_inst.rs` / `ir/mod.rs`.
+-pub(super) fn append_motion_rt_support(out: &mut String, need_inst_motion: bool) {
+-    super::ray_query_air::append_blas_slot_lookup_support_pub(out);
+-    let decls: &[&str] = if need_inst_motion {
++pub(super) fn append_motion_rt_support(out: &mut String, inst_world: Option<bool>) {
++    super::ray_query_air::append_prim_data_lookup_support(out);
++    let decls: &[&str] = if inst_world.is_some() {
+         &[
+             "declare float @air.sqrt.f32(float)",
+             "declare float @llvm.fabs.f32(float)",
+@@ -90,26 +90,6 @@
+         );
+     }
+ 
+-    if !out.contains("define internal i64 @__m2v.rq.query.motion_find_slot(") {
+-        out.push_str(
+-            "\ndefine internal i64 @__m2v.rq.query.motion_find_slot(i64 %bda) {\n\
+-             entry:\n\
+-             \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
+-             \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
+-             \x20 %bda_ok = icmp ugt i64 %bda, 1\n\
+-             \x20 %tbl_ok = icmp ne i64 %tbl_bda, 0\n\
+-             \x20 %both = and i1 %bda_ok, %tbl_ok\n\
+-             \x20 br i1 %both, label %probe, label %exit\n\
+-             probe:\n\
+-             \x20 %s = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %bda)\n\
+-             \x20 br label %exit\n\
+-             exit:\n\
+-             \x20 %res = phi i64 [ %s, %probe ], [ 0, %entry ]\n\
+-             \x20 ret i64 %res\n\
+-             }\n",
+-        );
+-    }
+-
+     if !out.contains("define internal i64 @__m2v.rq.query.motion_check_blas_hdr(") {
+         out.push_str(
+             "\ndefine internal i64 @__m2v.rq.query.motion_check_blas_hdr(i64 %blas_slot, i32 %geom_id) {\n\
+@@ -179,8 +159,28 @@
+ 
+     append_motion_tri_helper(out);
+     append_motion_aabb_helper(out);
+-    if need_inst_motion {
+-        append_motion_tlas_helpers(out);
++    if let Some(world) = inst_world {
++        append_motion_tlas_helpers(out, world);
++    }
++}
++
++fn keyframe_lerp(out: &mut String, block: &str, base: &str, fields: usize, dest: impl Fn(usize) -> String) {
++    for field in 0..fields {
++        let off = field * 4;
++        out.push_str(&format!("  %__m2v.rq.prim_data.{block}a{field} = add i64 %{base}0, {off}\n  %{block}ap{field} = inttoptr i64 %__m2v.rq.prim_data.{block}a{field} to ptr addrspace(1)\n  %{block}a{field} = load float, ptr addrspace(1) %{block}ap{field}, align 4\n"));
++    }
++    out.push_str(&format!("  %{block}_single = icmp eq i32 %k0, %k1\n  br i1 %{block}_single, label %{block}_key, label %{block}_blend\n\n{block}_key:\n"));
++    for field in 0..fields {
++        out.push_str(&format!("  %{block}zero{field} = fsub float %{block}a{field}, %{block}a{field}\n  %{block}key{field} = fadd float %{block}a{field}, %{block}zero{field}\n"));
++    }
++    out.push_str(&format!("  br label %{block}_ready\n\n{block}_blend:\n"));
++    for field in 0..fields {
++        let off = field * 4;
++        out.push_str(&format!("  %__m2v.rq.prim_data.{block}b{field} = add i64 %{base}1, {off}\n  %{block}bp{field} = inttoptr i64 %__m2v.rq.prim_data.{block}b{field} to ptr addrspace(1)\n  %{block}b{field} = load float, ptr addrspace(1) %{block}bp{field}, align 4\n  %{block}d{field} = fsub float %{block}b{field}, %{block}a{field}\n  %{block}p{field} = fmul float %{block}d{field}, %alpha\n  %{block}mix{field} = fadd float %{block}a{field}, %{block}p{field}\n"));
++    }
++    out.push_str(&format!("  br label %{block}_ready\n\n{block}_ready:\n"));
++    for field in 0..fields {
++        out.push_str(&format!("  %{} = phi float [ %{block}key{field}, %{block}_key ], [ %{block}mix{field}, %{block}_blend ]\n", dest(field)));
+     }
+ }
+ 
+@@ -257,21 +257,7 @@
+          \x20 %__m2v.rq.prim_data.tri0 = add i64 %data_base, %off0\n\
+          \x20 %__m2v.rq.prim_data.tri1 = add i64 %data_base, %off1\n",
+     );
+-    // Load and interpolate all 9 floats of v0, v1, v2 (0..32 bytes).
+-    for i in 0..9u32 {
+-        let b = i * 4;
+-        s.push_str(&format!(
+-            "  %__m2v.rq.prim_data.t0_{i} = add i64 %__m2v.rq.prim_data.tri0, {b}\n\
+-             \x20 %__m2v.rq.prim_data.t1_{i} = add i64 %__m2v.rq.prim_data.tri1, {b}\n\
+-             \x20 %p0_{i} = inttoptr i64 %__m2v.rq.prim_data.t0_{i} to ptr addrspace(1)\n\
+-             \x20 %p1_{i} = inttoptr i64 %__m2v.rq.prim_data.t1_{i} to ptr addrspace(1)\n\
+-             \x20 %a_{i} = load float, ptr addrspace(1) %p0_{i}, align 4\n\
+-             \x20 %b_{i} = load float, ptr addrspace(1) %p1_{i}, align 4\n\
+-             \x20 %d_{i} = fsub float %b_{i}, %a_{i}\n\
+-             \x20 %m_{i} = fmul float %d_{i}, %alpha\n\
+-             \x20 %v_{i} = fadd float %a_{i}, %m_{i}\n"
+-        ));
+-    }
++    keyframe_lerp(&mut s, "test_tri", "__m2v.rq.prim_data.tri", 9, |i| format!("v_{i}"));
+     s.push_str(
+         "  %e1x = fsub float %v_3, %v_0\n\
+          \x20 %e1y = fsub float %v_4, %v_1\n\
+@@ -379,7 +365,7 @@
+          \x20 br label %hdr_done\n\
+          \n\
+          hdr_done:\n\
+-         \x20 %h_res = phi <4 x float> [ %r3, %test_tri ], [ zeroinitializer, %read_hdr ]\n\
++         \x20 %h_res = phi <4 x float> [ %r3, %test_tri_ready ], [ zeroinitializer, %read_hdr ]\n\
+          \x20 br label %exit\n\
+          \n\
+          exit:\n\
+@@ -463,20 +449,7 @@
+          \x20 %__m2v.rq.prim_data.ab0 = add i64 %data_base, %off0\n\
+          \x20 %__m2v.rq.prim_data.ab1 = add i64 %data_base, %off1\n",
+     );
+-    for i in 0..6u32 {
+-        let b = i * 4;
+-        s.push_str(&format!(
+-            "  %__m2v.rq.prim_data.b0_{i} = add i64 %__m2v.rq.prim_data.ab0, {b}\n\
+-             \x20 %__m2v.rq.prim_data.b1_{i} = add i64 %__m2v.rq.prim_data.ab1, {b}\n\
+-             \x20 %p0_{i} = inttoptr i64 %__m2v.rq.prim_data.b0_{i} to ptr addrspace(1)\n\
+-             \x20 %p1_{i} = inttoptr i64 %__m2v.rq.prim_data.b1_{i} to ptr addrspace(1)\n\
+-             \x20 %a_{i} = load float, ptr addrspace(1) %p0_{i}, align 4\n\
+-             \x20 %b_{i} = load float, ptr addrspace(1) %p1_{i}, align 4\n\
+-             \x20 %d_{i} = fsub float %b_{i}, %a_{i}\n\
+-             \x20 %m_{i} = fmul float %d_{i}, %alpha\n\
+-             \x20 %box_{i} = fadd float %a_{i}, %m_{i}\n"
+-        ));
+-    }
++    keyframe_lerp(&mut s, "test_box", "__m2v.rq.prim_data.ab", 6, |i| format!("box_{i}"));
+     for (ax, i0, i1) in [(0, 0, 3), (1, 1, 4), (2, 2, 5)] {
+         s.push_str(&format!(
+             "  %ro_{ax} = extractelement <3 x float> %ro, i64 {ax}\n\
+@@ -521,7 +494,7 @@
+          \x20 br label %hdr_done\n\
+          \n\
+          hdr_done:\n\
+-         \x20 %h_res = phi i1 [ %box_hit, %test_box ], [ false, %read_hdr ]\n\
++         \x20 %h_res = phi i1 [ %box_hit, %test_box_ready ], [ false, %read_hdr ]\n\
+          \x20 br label %exit\n\
+          \n\
+          exit:\n\
+@@ -532,13 +505,22 @@
+     out.push_str(&s);
+ }
+ 
+-fn append_motion_tlas_helpers(out: &mut String) {
++pub(super) const MOTION_HEADER: &str = "{ i64, i64, i32, i32, i32 }";
++
++pub(super) fn xform_type(world: bool) -> &'static str {
++    if world { "{ i64, <3 x float>, <3 x float>, i32, i32, i32, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float> }" } else { "{ i64, <3 x float>, <3 x float>, i32, i32, i32 }" }
++}
++
++pub(super) fn xform_name(world: bool) -> &'static str {
++    if world { "@__m2v.rq.query.motion_tlas_xform_ray" } else { "@__m2v.rq.query.motion_tlas_xform_ray_compact" }
++}
++
++fn append_motion_tlas_helpers(out: &mut String, world: bool) {
+     if !out.contains("define internal i64 @__m2v.rq.query.motion_check_tlas_slot(") {
+         // Returns slot addr in g_rtPrimTable if kind == 2 (TLAS_MOTION) and header magic == 'RTMT'.
+         out.push_str(
+-            "\ndefine internal i64 @__m2v.rq.query.motion_check_tlas_slot(i64 %root_bda) {\n\
++            "\ndefine internal i64 @__m2v.rq.query.motion_check_tlas_slot(i64 %s) {\n\
+              entry:\n\
+-             \x20 %s = call i64 @__m2v.rq.query.motion_find_slot(i64 %root_bda)\n\
+              \x20 %ok = icmp ne i64 %s, 0\n\
+              \x20 br i1 %ok, label %chk, label %exit\n\
+              chk:\n\
+@@ -555,11 +537,9 @@
+         );
+     }
+ 
+-    let xform_ret_ty = "{ i64, <3 x float>, <3 x float>, i32, i32, i32, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float>, <3 x float> }";
+-    if !out.contains("@__m2v.rq.query.motion_tlas_xform_ray(") {
+-        let mut s = format!(
+-            "\ndefine internal {xform_ret_ty} @__m2v.rq.query.motion_tlas_xform_ray(\
+-             i64 %tlas_slot, i32 %inst_id, float %time, <3 x float> %w_ro, <3 x float> %w_rd) {{\n\
++    let hdr = MOTION_HEADER;
++    if !out.contains(&format!("define internal {hdr} @__m2v.rq.query.motion_read_header(")) {
++        out.push_str(&format!("\ndefine internal {hdr} @__m2v.rq.query.motion_read_header(i64 %tlas_slot) {{\n\
+              entry:\n\
+              \x20 %s_ok = icmp ne i64 %tlas_slot, 0\n\
+              \x20 br i1 %s_ok, label %read_slot, label %exit\n\
+@@ -575,11 +555,9 @@
+              \x20 %ioff_p = inttoptr i64 %__m2v.rq.prim_data.tx_p24 to ptr addrspace(1)\n\
+              \x20 %inst_meta_off = load i32, ptr addrspace(1) %ioff_p, align 4\n\
+              \x20 %pay_ok = icmp ne i64 %pay, 0\n\
+-             \x20 %inst_ok = icmp ult i32 %inst_id, %cnt\n\
+              \x20 %mo_ok = icmp uge i32 %inst_meta_off, 32\n\
+-             \x20 %m0 = and i1 %pay_ok, %inst_ok\n\
+-             \x20 %m1 = and i1 %m0, %mo_ok\n\
+-             \x20 br i1 %m1, label %read_hdr, label %slot_done\n\
++             \x20 %m1 = and i1 %pay_ok, %mo_ok\n\
++             \x20 br i1 %m1, label %read_hdr, label %exit\n\
+              \n\
+              read_hdr:\n\
+              \x20 %hdr_rel = sub i32 %inst_meta_off, 32\n\
+@@ -597,9 +575,38 @@
+              \x20 %xo_p = inttoptr i64 %__m2v.rq.prim_data.th_xo to ptr addrspace(1)\n\
+              \x20 %xoff = load i64, ptr addrspace(1) %xo_p, align 8\n\
+              \x20 %imo64 = zext i32 %inst_meta_off to i64\n\
++             \x20 %ibase = add i64 %pay, %imo64\n\
++             \x20 %xbase = add i64 %pay, %xoff\n\
++             \x20 %valid = icmp eq i32 %mag, 1381256532\n\
++             \x20 %count = select i1 %valid, i32 %cnt, i32 0\n\
++             \x20 %h0 = insertvalue {hdr} poison, i64 %ibase, 0\n\
++             \x20 %h1 = insertvalue {hdr} %h0, i64 %xbase, 1\n\
++             \x20 %h2 = insertvalue {hdr} %h1, i32 %count, 2\n\
++             \x20 %h3 = insertvalue {hdr} %h2, i32 %xtype, 3\n\
++             \x20 %h4 = insertvalue {hdr} %h3, i32 %xcount, 4\n\
++             \x20 br label %exit\n\
++             exit:\n\
++             \x20 %result = phi {hdr} [ zeroinitializer, %entry ], [ zeroinitializer, %read_slot ], [ %h4, %read_hdr ]\n\
++             \x20 ret {hdr} %result\n\
++             }}\n"));
++    }
++    let xform_ret_ty = xform_type(world);
++    let name = xform_name(world);
++    if !out.contains(&format!("define internal {xform_ret_ty} {name}(")) {
++        let mut s = format!(
++            "\ndefine internal {xform_ret_ty} {name}(\
++             {hdr} %header, i32 %inst_id, float %time, <3 x float> %w_ro, <3 x float> %w_rd) {{\n\
++             entry:\n\
++             \x20 %ibase0 = extractvalue {hdr} %header, 0\n\
++             \x20 %xbase = extractvalue {hdr} %header, 1\n\
++             \x20 %cnt = extractvalue {hdr} %header, 2\n\
++             \x20 %xtype = extractvalue {hdr} %header, 3\n\
++             \x20 %xcount = extractvalue {hdr} %header, 4\n\
++             \x20 %inst_ok = icmp ult i32 %inst_id, %cnt\n\
++             \x20 br i1 %inst_ok, label %read_inst, label %exit\n\
++             read_inst:\n\
+              \x20 %i64 = zext i32 %inst_id to i64\n\
+              \x20 %ioff_item = mul i64 %i64, 64\n\
+-             \x20 %ibase0 = add i64 %pay, %imo64\n\
+              \x20 %__m2v.rq.prim_data.ti = add i64 %ibase0, %ioff_item\n\
+              \x20 %blas_p = inttoptr i64 %__m2v.rq.prim_data.ti to ptr addrspace(1)\n\
+              \x20 %blas_bda = load i64, ptr addrspace(1) %blas_p, align 8\n\
+@@ -639,18 +646,15 @@
+              \x20 %k0 = bitcast float %k0_f to i32\n\
+              \x20 %k1 = bitcast float %k1_f to i32\n\
+              \x20 %xend = add i32 %xs, %ixc\n\
+-             \x20 %mag_ok = icmp eq i32 %mag, 1381256532\n\
+              \x20 %blas_ok = icmp ugt i64 %blas_bda, 1\n\
+              \x20 %xf_in = icmp ule i32 %xend, %xcount\n\
+              \x20 %xc_pos = icmp ne i32 %ixc, 0\n\
+-             \x20 %ok_a = and i1 %mag_ok, %blas_ok\n\
+              \x20 %ok_b = and i1 %xf_in, %xc_pos\n\
+-             \x20 %ok_c = and i1 %act, %ok_a\n\
++             \x20 %ok_c = and i1 %act, %blas_ok\n\
+              \x20 %xf_ok = and i1 %ok_c, %ok_b\n\
+              \x20 br i1 %xf_ok, label %eval_xf, label %hdr_done\n\
+              \n\
+              eval_xf:\n\
+-             \x20 %xbase = add i64 %pay, %xoff\n\
+              \x20 %idx0 = add i32 %xs, %k0\n\
+              \x20 %idx1 = add i32 %xs, %k1\n\
+              \x20 %is_comp = icmp eq i32 %xtype, 1\n\
+@@ -664,25 +668,7 @@
+              \x20 %__m2v.rq.prim_data.m0 = add i64 %xbase, %moff0\n\
+              \x20 %__m2v.rq.prim_data.m1 = add i64 %xbase, %moff1\n",
+         );
+-        // Packed float4x3 column-major: col0(0,4,8) col1(12,16,20) col2(24,28,32) col3(36,40,44).
+-        // row rw (0..2), col cl (0..3) sits at word index cl*3 + rw.
+-        for cl in 0..4u32 {
+-            for rw in 0..3u32 {
+-                let w = cl * 3 + rw;
+-                let off = w * 4;
+-                s.push_str(&format!(
+-                    "  %__m2v.rq.prim_data.m0_{w} = add i64 %__m2v.rq.prim_data.m0, {off}\n\
+-                     \x20 %__m2v.rq.prim_data.m1_{w} = add i64 %__m2v.rq.prim_data.m1, {off}\n\
+-                     \x20 %mp0_{w} = inttoptr i64 %__m2v.rq.prim_data.m0_{w} to ptr addrspace(1)\n\
+-                     \x20 %mp1_{w} = inttoptr i64 %__m2v.rq.prim_data.m1_{w} to ptr addrspace(1)\n\
+-                     \x20 %ma_{w} = load float, ptr addrspace(1) %mp0_{w}, align 4\n\
+-                     \x20 %mb_{w} = load float, ptr addrspace(1) %mp1_{w}, align 4\n\
+-                     \x20 %md_{w} = fsub float %mb_{w}, %ma_{w}\n\
+-                     \x20 %mm_{w} = fmul float %md_{w}, %alpha\n\
+-                     \x20 %m_{rw}_{cl} = fadd float %ma_{w}, %mm_{w}\n"
+-                ));
+-            }
+-        }
++        keyframe_lerp(&mut s, "xf_mat", "__m2v.rq.prim_data.m", 12, |i| format!("m_{}_{}", i % 3, i / 3));
+         s.push_str("  br label %xf_merge\n\nxf_comp:\n");
+         s.push_str(
+             "  %idx0_c = zext i32 %idx0 to i64\n\
+@@ -692,25 +678,22 @@
+              \x20 %__m2v.rq.prim_data.c0 = add i64 %xbase, %coff0\n\
+              \x20 %__m2v.rq.prim_data.c1 = add i64 %xbase, %coff1\n",
+         );
+-        // Load all 16 floats of MTLComponentTransform for kf0 and kf1.
+-        // Layout: scale[3](0..8), shear[3](12..20), pivot[3](24..32), rotation[4](36..48), translation[3](52..60).
+-        for w in 0..16u32 {
+-            let off = w * 4;
+-            s.push_str(&format!(
+-                "  %__m2v.rq.prim_data.c0_{w} = add i64 %__m2v.rq.prim_data.c0, {off}\n\
+-                 \x20 %__m2v.rq.prim_data.c1_{w} = add i64 %__m2v.rq.prim_data.c1, {off}\n\
+-                 \x20 %cp0_{w} = inttoptr i64 %__m2v.rq.prim_data.c0_{w} to ptr addrspace(1)\n\
+-                 \x20 %cp1_{w} = inttoptr i64 %__m2v.rq.prim_data.c1_{w} to ptr addrspace(1)\n\
+-                 \x20 %ca_{w} = load float, ptr addrspace(1) %cp0_{w}, align 4\n\
+-                 \x20 %cb_{w} = load float, ptr addrspace(1) %cp1_{w}, align 4\n"
+-            ));
+-            if !(9..=12).contains(&w) {
+-                s.push_str(&format!(
+-                    "  %cd_{w} = fsub float %cb_{w}, %ca_{w}\n\
+-                     \x20 %cm_{w} = fmul float %cd_{w}, %alpha\n\
+-                     \x20 %cv_{w} = fadd float %ca_{w}, %cm_{w}\n"
+-                ));
++        for key in 0..2 {
++            if key == 1 {
++                s.push_str("  %single = icmp eq i32 %k0, %k1\n  br i1 %single, label %component_keys, label %component_blend\n\ncomponent_blend:\n");
+             }
++            for field in 0..16 {
++                let off = field * 4;
++                let val = if key == 0 { "ca" } else { "ck1" };
++                s.push_str(&format!("  %__m2v.rq.prim_data.c{key}_{field} = add i64 %__m2v.rq.prim_data.c{key}, {off}\n  %cp{key}_{field} = inttoptr i64 %__m2v.rq.prim_data.c{key}_{field} to ptr addrspace(1)\n  %{val}_{field} = load float, ptr addrspace(1) %cp{key}_{field}, align 4\n"));
++            }
++        }
++        s.push_str("  br label %component_keys\n\ncomponent_keys:\n");
++        for field in 0..16 {
++            s.push_str(&format!("  %cb_{field} = phi float [ %ca_{field}, %xf_comp ], [ %ck1_{field}, %component_blend ]\n"));
++        }
++        for field in (0..9).chain(13..16) {
++            s.push_str(&format!("  %cd_{field} = fsub float %cb_{field}, %ca_{field}\n  %cm_{field} = fmul float %cd_{field}, %alpha\n  %cv_{field} = fadd float %ca_{field}, %cm_{field}\n"));
+         }
+         // Quaternion SLERP between ca_9..ca_12 and cb_9..cb_12.
+         s.push_str(
+@@ -763,6 +746,8 @@
+              \x20 %qdot_gt1 = fcmp ogt float %qdot_p, 1.000000e+00\n\
+              \x20 %qdot = select i1 %qdot_gt1, float 1.000000e+00, float %qdot_p\n\
+              \x20 %qnear = fcmp ogt float %qdot, 0x3FEFFBE760000000\n\
++             \x20 br i1 %qnear, label %near_weights, label %slerp_weights\n\
++             slerp_weights:\n\
+              \x20 %theta0 = call float @air.fast_acos.f32(float %qdot)\n\
+              \x20 %sin0 = call float @air.fast_sin.f32(float %theta0)\n\
+              \x20 %s0_nz = fcmp ogt float %sin0, 1.000000e-06\n\
+@@ -773,9 +758,13 @@
+              \x20 %s1_sl = fdiv float %sint, %safe_sin0\n\
+              \x20 %ds1 = fmul float %qdot, %s1_sl\n\
+              \x20 %s0_sl = fsub float %cost, %ds1\n\
++             \x20 br label %weights_ready\n\
++             near_weights:\n\
+              \x20 %om_al = fsub float 1.000000e+00, %alpha\n\
+-             \x20 %w0 = select i1 %qnear, float %om_al, float %s0_sl\n\
+-             \x20 %w1 = select i1 %qnear, float %alpha, float %s1_sl\n\
++             \x20 br label %weights_ready\n\
++             weights_ready:\n\
++             \x20 %w0 = phi float [ %om_al, %near_weights ], [ %s0_sl, %slerp_weights ]\n\
++             \x20 %w1 = phi float [ %alpha, %near_weights ], [ %s1_sl, %slerp_weights ]\n\
+              \x20 %qr0r = fmul float %w0, %qa0\n\
+              \x20 %qr0s = fmul float %w1, %qb0\n\
+              \x20 %qr0u = fadd float %qr0r, %qr0s\n\
+@@ -878,7 +867,7 @@
+         for rw in 0..3u32 {
+             for cl in 0..4u32 {
+                 s.push_str(&format!(
+-                    "  %w_{rw}_{cl} = phi float [ %m_{rw}_{cl}, %xf_mat ], [ %c_{rw}_{cl}, %xf_comp ]\n"
++                    "  %w_{rw}_{cl} = phi float [ %m_{rw}_{cl}, %xf_mat_ready ], [ %c_{rw}_{cl}, %weights_ready ]\n"
+                 ));
+             }
+         }
+@@ -971,6 +960,7 @@
+              \x20 %odv1 = insertelement <3 x float> %odv0, float %ord_y, i64 1\n\
+              \x20 %odv = insertelement <3 x float> %odv1, float %ord_z, i64 2\n",
+         ));
++        if world {
+         for cl in 0..4u32 {
+             s.push_str(&format!(
+                 "  %o2wc{cl}_0 = insertelement <3 x float> poison, float %w_0_{cl}, i64 0\n\
+@@ -981,6 +971,7 @@
+                  \x20 %w2oc{cl} = insertelement <3 x float> %w2oc{cl}_1, float %i_2_{cl}, i64 2\n"
+             ));
+         }
++        }
+         s.push_str(&format!(
+             "  %ret_bda = select i1 %det_ok, i64 %blas_bda, i64 0\n\
+              \x20 %st_0 = insertvalue {xform_ret_ty} poison, i64 %ret_bda, 0\n\
+@@ -988,27 +979,29 @@
+              \x20 %st_2 = insertvalue {xform_ret_ty} %st_1, <3 x float> %odv, 2\n\
+              \x20 %st_3 = insertvalue {xform_ret_ty} %st_2, i32 %opts, 3\n\
+              \x20 %st_4 = insertvalue {xform_ret_ty} %st_3, i32 %ift_off, 4\n\
+-             \x20 %st_5 = insertvalue {xform_ret_ty} %st_4, i32 %uid, 5\n\
+-             \x20 %st_6 = insertvalue {xform_ret_ty} %st_5, <3 x float> %w2oc0, 6\n\
++             \x20 %st_5 = insertvalue {xform_ret_ty} %st_4, i32 %uid, 5\n",
++        ));
++        if world {
++            s.push_str(&format!(
++                "\x20 %st_6 = insertvalue {xform_ret_ty} %st_5, <3 x float> %w2oc0, 6\n\
+              \x20 %st_7 = insertvalue {xform_ret_ty} %st_6, <3 x float> %w2oc1, 7\n\
+              \x20 %st_8 = insertvalue {xform_ret_ty} %st_7, <3 x float> %w2oc2, 8\n\
+              \x20 %st_9 = insertvalue {xform_ret_ty} %st_8, <3 x float> %w2oc3, 9\n\
+              \x20 %st_10 = insertvalue {xform_ret_ty} %st_9, <3 x float> %o2wc0, 10\n\
+              \x20 %st_11 = insertvalue {xform_ret_ty} %st_10, <3 x float> %o2wc1, 11\n\
+              \x20 %st_12 = insertvalue {xform_ret_ty} %st_11, <3 x float> %o2wc2, 12\n\
+-             \x20 %st_13 = insertvalue {xform_ret_ty} %st_12, <3 x float> %o2wc3, 13\n\
+-             \x20 br label %hdr_done\n\
++             \x20 %st_13 = insertvalue {xform_ret_ty} %st_12, <3 x float> %o2wc3, 13\n",
++            ));
++        }
++        let last = if world { "%st_13" } else { "%st_5" };
++        s.push_str(&format!(
++            "\x20 br label %hdr_done\n\
+              \n\
+              hdr_done:\n\
+-             \x20 %h_res = phi {xform_ret_ty} [ %st_13, %xf_merge ], [ zeroinitializer, %read_hdr ]\n\
+-             \x20 br label %slot_done\n\
+-             \n\
+-             slot_done:\n\
+-             \x20 %s_res = phi {xform_ret_ty} [ %h_res, %hdr_done ], [ zeroinitializer, %read_slot ]\n\
++             \x20 %h_res = phi {xform_ret_ty} [ {last}, %xf_merge ], [ zeroinitializer, %read_inst ]\n\
+              \x20 br label %exit\n\
+-             \n\
+              exit:\n\
+-             \x20 %res = phi {xform_ret_ty} [ %s_res, %slot_done ], [ zeroinitializer, %entry ]\n\
++             \x20 %res = phi {xform_ret_ty} [ %h_res, %hdr_done ], [ zeroinitializer, %entry ]\n\
+              \x20 ret {xform_ret_ty} %res\n\
+              }}\n",
+         ));

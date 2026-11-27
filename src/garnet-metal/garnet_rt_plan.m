@@ -7,6 +7,21 @@
 #endif
 #include "garnet_rt_internal.h"
 
+static VkDeviceAddress rdna4_rt_store_motion_keys(RDNA4RTStagingBuffer *bounds, uint64_t used,
+        const uint64_t *addresses, uint32_t count, NSMutableArray *retained, NSError **err) {
+    if (!bounds) return 0;
+    RDNA4RTStagingBuffer *storage = bounds;
+    uint64_t bytes = (uint64_t)count * sizeof(uint64_t);
+    if (!rdna4rt_motion_table_fits(bounds->_size, used, count)) {
+        storage = [[RDNA4RTStagingBuffer alloc] initWithSize:bytes error:err];
+        if (!storage) return 0;
+        [retained addObject:storage];
+        used = 0;
+    }
+    memcpy((uint8_t *)storage->_map + used, addresses, (size_t)bytes);
+    return storage->_addr + used;
+}
+
 static BOOL rdna4_rt_vfmt_from_mtl(NSUInteger mtlFmt, rdna4rt_vfmt_t *outPure, VkFormat *outVk) {
     if (!outPure || !outVk) return NO;
     switch (mtlFmt) {
@@ -66,14 +81,16 @@ static BOOL rdna4_rt_curve_rad_fmt_from_mtl(NSUInteger mtlFmt, rdna4rt_curve_rad
 
 GARNET_INTERNAL void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
     if (!p) return;
-    free(p->vkGeoms);
-    free(p->vkRanges);
-    free(p->maxPrimCounts);
-    free(p->primPlans);
-    free(p->primSrcVkBufs);
-    free(p->primSrcVkOffs);
-    free(p->curvePlans);
-    free(p->motionPlans);
+    if (p->geomCount > RDNA4RT_INLINE_GEOMS) {
+        free(p->vkGeoms);
+        free(p->vkRanges);
+        free(p->maxPrimCounts);
+        free(p->primPlans);
+        free(p->primSrcVkBufs);
+        free(p->primSrcVkOffs);
+        free(p->curvePlans);
+        free(p->motionPlans);
+    }
     free(p->xformPCs);
     free(p->curvePCs);
     free(p->motionBlasPCs);
@@ -384,8 +401,18 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
         }
 
         plan->geomCount = (uint32_t)gcount;
+        uint32_t inlineSigs[RDNA4RT_INLINE_GEOMS];
         uint32_t *geomSigs = NULL;
-        if (gcount > 0) {
+        if (gcount > 0 && gcount <= RDNA4RT_INLINE_GEOMS) {
+            plan->vkGeoms = plan->small.vkGeoms;
+            plan->vkRanges = plan->small.vkRanges;
+            plan->maxPrimCounts = plan->small.maxPrimCounts;
+            plan->primPlans = plan->small.primPlans;
+            plan->primSrcVkBufs = plan->small.primSrcVkBufs;
+            plan->primSrcVkOffs = plan->small.primSrcVkOffs;
+            plan->curvePlans = plan->small.curvePlans;
+            plan->motionPlans = plan->small.motionPlans;
+        } else if (gcount > RDNA4RT_INLINE_GEOMS) {
             plan->vkGeoms = (VkAccelerationStructureGeometryKHR *)calloc(gcount, sizeof(*plan->vkGeoms));
             plan->vkRanges = (VkAccelerationStructureBuildRangeInfoKHR *)calloc(gcount, sizeof(*plan->vkRanges));
             plan->maxPrimCounts = (uint32_t *)calloc(gcount, sizeof(*plan->maxPrimCounts));
@@ -405,6 +432,9 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
             }
         }
 
+        uint32_t *signatures = geomSigs ? geomSigs : inlineSigs;
+        RDNA4RTStagingBuffer *transformSlab = nil;
+        uint64_t nextTransform = 0u;
         Class motionTriCls = objc_getClass("MTLAccelerationStructureMotionTriangleGeometryDescriptor");
         Class motionBoxCls = objc_getClass("MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor");
         Class curveCls = objc_getClass("MTLAccelerationStructureCurveGeometryDescriptor");
@@ -596,19 +626,18 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                 if (requireBuffers && mtplan.primitive_count > 0u) {
                     RDNA4RTStagingBuffer *aabbStg = [[RDNA4RTStagingBuffer alloc]
                         initWithSize:(uint64_t)mtplan.primitive_count * RDNA4RT_AABB_STRIDE_MIN error:err];
-                    RDNA4RTStagingBuffer *kfTblStg = aabbStg ? [[RDNA4RTStagingBuffer alloc]
-                        initWithSize:(uint64_t)kfCount * sizeof(uint64_t) error:err] : nil;
-                    if (!aabbStg || !kfTblStg) {
+                    VkDeviceAddress keyTable = rdna4_rt_store_motion_keys(aabbStg,
+                        (uint64_t)mtplan.primitive_count * RDNA4RT_AABB_STRIDE_MIN,
+                        kfEffAddrs, kfCount, retainedObjects, err);
+                    if (!keyTable) {
                         free(kfEffAddrs);
                         free(geomSigs); rdna4_rt_plan_free(plan);
                         return NO;
                     }
-                    memcpy(kfTblStg->_map, kfEffAddrs, (size_t)kfCount * sizeof(uint64_t));
                     [retainedObjects addObject:aabbStg];
-                    [retainedObjects addObject:kfTblStg];
                     aabbAddr = aabbStg->_addr;
                     rdna4rt_motion_blas_build_pc_t mpc = {
-                        .kf_addrs_bda = kfTblStg->_addr,
+                        .kf_addrs_bda = keyTable,
                         .idx_addr = mtplan.index_addr,
                         .xform_addr = mtplan.transform_addr,
                         .aabb_dst_addr = aabbAddr,
@@ -647,7 +676,7 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                     .transformOffset = 0u
                 };
                 plan->maxPrimCounts[i] = mtplan.primitive_count;
-                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_MOTION_TRIANGLES, mtplan.effective_index_type, pureVfmt, mtplan.vk_geom_flags);
+                signatures[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_MOTION_TRIANGLES, mtplan.effective_index_type, pureVfmt, mtplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)mtplan.primitive_count, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
@@ -759,19 +788,18 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                 if (requireBuffers && maplan.primitive_count > 0u) {
                     RDNA4RTStagingBuffer *aabbStg = [[RDNA4RTStagingBuffer alloc]
                         initWithSize:(uint64_t)maplan.primitive_count * RDNA4RT_AABB_STRIDE_MIN error:err];
-                    RDNA4RTStagingBuffer *kfTblStg = aabbStg ? [[RDNA4RTStagingBuffer alloc]
-                        initWithSize:(uint64_t)kfCount * sizeof(uint64_t) error:err] : nil;
-                    if (!aabbStg || !kfTblStg) {
+                    VkDeviceAddress keyTable = rdna4_rt_store_motion_keys(aabbStg,
+                        (uint64_t)maplan.primitive_count * RDNA4RT_AABB_STRIDE_MIN,
+                        kfEffAddrs, kfCount, retainedObjects, err);
+                    if (!keyTable) {
                         free(kfEffAddrs);
                         free(geomSigs); rdna4_rt_plan_free(plan);
                         return NO;
                     }
-                    memcpy(kfTblStg->_map, kfEffAddrs, (size_t)kfCount * sizeof(uint64_t));
                     [retainedObjects addObject:aabbStg];
-                    [retainedObjects addObject:kfTblStg];
                     aabbAddr = aabbStg->_addr;
                     rdna4rt_motion_blas_build_pc_t mpc = {
-                        .kf_addrs_bda = kfTblStg->_addr,
+                        .kf_addrs_bda = keyTable,
                         .idx_addr = 0u,
                         .xform_addr = 0u,
                         .aabb_dst_addr = aabbAddr,
@@ -808,7 +836,7 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                     .transformOffset = 0u
                 };
                 plan->maxPrimCounts[i] = maplan.primitive_count;
-                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_MOTION_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, maplan.vk_geom_flags);
+                signatures[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_MOTION_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, maplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)maplan.primitive_count, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
@@ -909,13 +937,19 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                 if (requireBuffers && tbuf) {
                     const uint8_t *tmap = (const uint8_t *)[tbuf contents];
                     if (tplan.needs_transform_staging) {
-                        RDNA4RTStagingBuffer *stg = [[RDNA4RTStagingBuffer alloc] initWithSize:RDNA4RT_TRANSFORM_SIZE error:err];
-                        if (!stg) { free(geomSigs); rdna4_rt_plan_free(plan); return NO; }
+                        if (!transformSlab || !rdna4rt_take_transform_slice(transformSlab->_size, &nextTransform)) {
+                            transformSlab = [[RDNA4RTStagingBuffer alloc] initWithSize:RDNA4RT_TRANSFORM_SIZE error:err];
+                            if (!transformSlab) { free(geomSigs); rdna4_rt_plan_free(plan); return NO; }
+                            [retainedObjects addObject:transformSlab];
+                            nextTransform = RDNA4RT_TRANSFORM_SIZE;
+                        }
+                        uint64_t offset = nextTransform - RDNA4RT_TRANSFORM_SIZE;
+                        transformAddr = transformSlab->_addr + offset;
                         if (!tmap) {
                             /* GPU compute transpose/copy for Private transformationMatrixBuffer. */
                             rdna4rt_xform_transpose_pc_t xpc = {
                                 .src_addr = tplan.transform_addr,
-                                .dst_addr = stg->_addr,
+                                .dst_addr = transformAddr,
                                 .layout_mode = (tdesc.transform_layout == RDNA4RT_MATRIX_ROW_MAJOR) ? 1u : 0u,
                                 ._pad = 0u
                             };
@@ -941,10 +975,8 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                                 if (err) *err = rdna4_err(145, [NSString stringWithUTF8String:rdna4rt_err_str(xerr)]);
                                 return NO;
                             }
-                            memcpy(stg->_map, &vkXf, sizeof(vkXf));
+                            memcpy((uint8_t *)transformSlab->_map + offset, &vkXf, sizeof(vkXf));
                         }
-                        transformAddr = stg->_addr;
-                        [retainedObjects addObject:stg];
                     } else if (tmap) {
                         rdna4rt_vk_transform_t rowXf, checkXf;
                         memcpy(&rowXf, tmap + tbufOff, sizeof(rowXf));
@@ -987,7 +1019,7 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                     .transformOffset = 0u
                 };
                 plan->maxPrimCounts[i] = tplan.primitive_count;
-                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_TRIANGLES, tplan.effective_index_type, pureVfmt, tplan.vk_geom_flags);
+                signatures[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_TRIANGLES, tplan.effective_index_type, pureVfmt, tplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)tplan.primitive_count, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
@@ -1067,7 +1099,7 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                     .transformOffset = 0u
                 };
                 plan->maxPrimCounts[i] = aplan.primitive_count;
-                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, aplan.vk_geom_flags);
+                signatures[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, aplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)aplan.primitive_count, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
@@ -1263,7 +1295,7 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                     .transformOffset = 0u
                 };
                 plan->maxPrimCounts[i] = aabbCount;
-                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_CURVES, cplan.effective_index_type, RDNA4RT_VFMT_FLOAT3, cplan.vk_geom_flags);
+                signatures[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_CURVES, cplan.effective_index_type, RDNA4RT_VFMT_FLOAT3, cplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)aabbCount, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
@@ -1307,8 +1339,8 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
                       plan->geomCount, geomIftAcc.base);
         }
         plan->vkBuildFlags = rdna4rt_blas_build_flags_with_caps(plan->vkBuildFlags, hasTriangles, &m3);
-        plan->topologyHash = rdna4rt_topology_hash(geomSigs, plan->maxPrimCounts, plan->geomCount);
-        free(geomSigs);
+        plan->topologyHash = rdna4rt_topology_hash(signatures, plan->maxPrimCounts, plan->geomCount);
+        if (geomSigs) free(geomSigs);
     } else if ([desc isKindOfClass:[MTLInstanceAccelerationStructureDescriptor class]]) {
         MTLInstanceAccelerationStructureDescriptor *idesc = (MTLInstanceAccelerationStructureDescriptor *)desc;
         plan->kind = RDNA4RT_KIND_TLAS;
@@ -1360,14 +1392,9 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
 
         /* Vulkan requires geometryCount == 1 for TOP_LEVEL even when instanceCount == 0. */
         plan->geomCount = 1u;
-        plan->vkGeoms = (VkAccelerationStructureGeometryKHR *)calloc(1, sizeof(*plan->vkGeoms));
-        plan->vkRanges = (VkAccelerationStructureBuildRangeInfoKHR *)calloc(1, sizeof(*plan->vkRanges));
-        plan->maxPrimCounts = (uint32_t *)calloc(1, sizeof(*plan->maxPrimCounts));
-        if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts) {
-            rdna4_rt_plan_free(plan);
-            if (err) *err = rdna4_err(145, @"out of host memory building TLAS plan");
-            return NO;
-        }
+        plan->vkGeoms = plan->small.vkGeoms;
+        plan->vkRanges = plan->small.vkRanges;
+        plan->maxPrimCounts = plan->small.maxPrimCounts;
 
         VkDeviceAddress vkInstAddr = 0;
         if (requireBuffers && tplan.instance_count > 0u) {
@@ -1639,14 +1666,9 @@ GARNET_INTERNAL BOOL rdna4_rt_build_plan_make_ex(
         }
 
         plan->geomCount = 1u;
-        plan->vkGeoms = (VkAccelerationStructureGeometryKHR *)calloc(1, sizeof(*plan->vkGeoms));
-        plan->vkRanges = (VkAccelerationStructureBuildRangeInfoKHR *)calloc(1, sizeof(*plan->vkRanges));
-        plan->maxPrimCounts = (uint32_t *)calloc(1, sizeof(*plan->maxPrimCounts));
-        if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts) {
-            rdna4_rt_plan_free(plan);
-            if (err) *err = rdna4_err(145, @"out of host memory building indirect TLAS plan");
-            return NO;
-        }
+        plan->vkGeoms = plan->small.vkGeoms;
+        plan->vkRanges = plan->small.vkRanges;
+        plan->maxPrimCounts = plan->small.maxPrimCounts;
 
         VkDeviceAddress vkInstAddr = 0;
         if (requireBuffers && tplan.instance_count > 0u) {

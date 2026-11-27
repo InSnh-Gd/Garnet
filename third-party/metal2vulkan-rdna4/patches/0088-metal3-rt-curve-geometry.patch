@@ -118,10 +118,9 @@ index 0867453..4d3428e 100644
                  let mut inner_changed = true;
                  while inner_changed {
 diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
-index 909f50d..3f48539 100644
 --- a/src/native/ray_query_air.rs
 +++ b/src/native/ray_query_air.rs
-@@ -26,6 +26,8 @@ pub(crate) enum CallbackParamRole {
+@@ -26,6 +26,8 @@
      WorldDirection,
      MinDistance,
      MaxDistance,
@@ -130,11 +129,10 @@ index 909f50d..3f48539 100644
      Barycentrics,
      FrontFacing,
      PrimitiveId,
-@@ -655,6 +657,22 @@ pub(crate) fn lower_air_ray_queries_with_options(
-     linked_callbacks: &[LinkedRayCallback],
+@@ -656,6 +658,22 @@
      ift_abi_v2: bool,
      prim_data_enabled: bool,
-+) -> Result<Option<String>, String> {
+ ) -> Result<Option<String>, String> {
 +    lower_air_ray_queries_with_rt_options(
 +        ll,
 +        linked_callbacks,
@@ -150,10 +148,11 @@ index 909f50d..3f48539 100644
 +    ift_abi_v2: bool,
 +    prim_data_enabled: bool,
 +    rt_curves_enabled: bool,
- ) -> Result<Option<String>, String> {
++) -> Result<Option<String>, String> {
      let has_intersect = has_air_intersect(ll);
      let has_iq = ll.contains("_intersection_query");
-@@ -680,6 +698,7 @@ pub(crate) fn lower_air_ray_queries_with_options(
+     let has_is_null = has_air_rt_is_null(ll);
+@@ -680,6 +698,7 @@
              next_slot_id,
              ift_abi_v2,
              prim_data_enabled,
@@ -161,7 +160,7 @@ index 909f50d..3f48539 100644
          )? {
              cur_ll = lowered;
              next_slot_id += used_slots;
-@@ -687,9 +706,12 @@ pub(crate) fn lower_air_ray_queries_with_options(
+@@ -687,9 +706,12 @@
          }
      }
      if cur_ll.contains("_intersection_query") {
@@ -177,7 +176,7 @@ index 909f50d..3f48539 100644
              cur_ll = lowered;
              changed = true;
          }
-@@ -847,6 +869,7 @@ fn lower_air_intersect_calls(
+@@ -847,6 +869,7 @@
      slot_base: u32,
      ift_abi_v2: bool,
      prim_data_enabled: bool,
@@ -185,7 +184,7 @@ index 909f50d..3f48539 100644
  ) -> Result<Option<(String, u32)>, String> {
      if !has_air_intersect(ll) {
          return Ok(None);
-@@ -1102,6 +1125,7 @@ fn lower_air_intersect_calls(
+@@ -1102,6 +1125,7 @@
          out.push('\n');
      }
  
@@ -193,7 +192,7 @@ index 909f50d..3f48539 100644
      let any_prim_data_used = prim_data_enabled
          && pending.iter().any(|p| {
              p.reads_prim_data
-@@ -1114,13 +1138,22 @@ fn lower_air_intersect_calls(
+@@ -1114,13 +1138,22 @@
  
      // Emit `@__m2v.rq.*` intrinsic declarations (only if not already present in module).
      append_rq_intrinsic_declarations(&mut out, ll);
@@ -218,7 +217,7 @@ index 909f50d..3f48539 100644
          out.push_str(&helper);
      }
  
-@@ -1244,7 +1277,7 @@ fn parse_call_ptr_return_type(call_prefix: &str) -> String {
+@@ -1244,7 +1277,7 @@
      "ptr addrspace(1)".to_string()
  }
  
@@ -227,7 +226,7 @@ index 909f50d..3f48539 100644
      let rest = callee.strip_prefix("air.")?;
      let marker = rest.find("_intersection_query")?;
      let op = &rest[..marker];
-@@ -1259,7 +1292,8 @@ fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool)> {
+@@ -1259,7 +1292,8 @@
      let has_motion = tags
          .split('.')
          .any(|t| matches!(t, "primitive_motion" | "instance_motion"));
@@ -237,7 +236,7 @@ index 909f50d..3f48539 100644
  }
  
  fn resolve_iq_slot(
-@@ -1303,6 +1337,7 @@ fn lower_air_intersection_queries(
+@@ -1303,6 +1337,7 @@
      ll: &str,
      slot_base: u32,
      prim_data_enabled: bool,
@@ -245,7 +244,7 @@ index 909f50d..3f48539 100644
  ) -> Result<Option<String>, String> {
      if !ll.contains("_intersection_query") {
          return Ok(None);
-@@ -1319,8 +1354,11 @@ fn lower_air_intersection_queries(
+@@ -1319,8 +1354,11 @@
      let mut null_ptr_vars: Vec<(usize, String)> = Vec::new();
      let mut dead_load_lines: HashSet<usize> = HashSet::new();
      let mut commit_aabb_slots: Vec<u32> = Vec::new();
@@ -257,7 +256,7 @@ index 909f50d..3f48539 100644
  
      for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
          if scope == 0 {
-@@ -1340,7 +1378,7 @@ fn lower_air_intersection_queries(
+@@ -1340,7 +1378,7 @@
          };
          let open = at_pos + open_rel;
          let callee = &call_part[at_pos + 1..open];
@@ -266,7 +265,7 @@ index 909f50d..3f48539 100644
              continue;
          };
          let Some(close) = find_matching_paren(call_part, open) else {
-@@ -1362,6 +1400,9 @@ fn lower_air_intersection_queries(
+@@ -1362,6 +1400,9 @@
              next_slot += 1;
              alloc_slots.insert((scope, var), slot_id);
              scope_slots.entry(scope).or_default().push(slot_id);
@@ -276,7 +275,7 @@ index 909f50d..3f48539 100644
              ops_by_line.insert(
                  line_idx,
                  IqOpCall {
-@@ -1387,6 +1428,9 @@ fn lower_air_intersection_queries(
+@@ -1387,6 +1428,9 @@
              .ok_or_else(|| format!("@{callee} missing query handle operand"))?;
          let slot_id = resolve_iq_slot(&scoped_lines, scope, q_val, &alloc_slots)
              .ok_or_else(|| format!("@{callee} references untracked query handle {q_val}"))?;
@@ -286,7 +285,7 @@ index 909f50d..3f48539 100644
  
          let mut accel_is_bda = false;
          let mut bda_source_load_ptr = None;
-@@ -1415,10 +1459,25 @@ fn lower_air_intersection_queries(
+@@ -1415,10 +1459,25 @@
              if let Some(dl) = accel.bda_dead_load_line {
                  dead_load_lines.insert(dl);
              }
@@ -312,7 +311,7 @@ index 909f50d..3f48539 100644
          } else if matches!(
              op.as_str(),
              "get_candidate_primitive_data" | "get_committed_primitive_data"
-@@ -1490,12 +1549,30 @@ fn lower_air_intersection_queries(
+@@ -1490,12 +1549,30 @@
                          "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
                           \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
                      ));
@@ -344,7 +343,7 @@ index 909f50d..3f48539 100644
                  }
              }
              entry_inserted.insert(scope);
-@@ -1602,7 +1679,7 @@ fn lower_air_intersection_queries(
+@@ -1602,7 +1679,7 @@
                          } else {
                              call.raw_args[5].1.clone()
                          };
@@ -353,7 +352,7 @@ index 909f50d..3f48539 100644
                              out.push_str(&format!(
                                  "{indent}store i64 {bda_operand}, ptr %__m2v.rq.as_root.{slot}, align 8\n"
                              ));
-@@ -1611,7 +1688,7 @@ fn lower_air_intersection_queries(
+@@ -1611,7 +1688,7 @@
                              "{indent}call void @__m2v.rq.init.bda(i32 {slot}, i64 {bda_operand}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
                          ));
                      } else {
@@ -362,7 +361,7 @@ index 909f50d..3f48539 100644
                              if let Some(as_slot) = call.descriptor_as_slot {
                                  out.push_str(&format!(
                                      "{indent}%{pfx}.as_root = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n\
-@@ -1628,9 +1705,37 @@ fn lower_air_intersection_queries(
+@@ -1628,9 +1705,37 @@
                              "{indent}call void @__m2v.rq.init(i32 {slot}, ptr addrspace(1) {as_val}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
                          ));
                      }
@@ -401,7 +400,7 @@ index 909f50d..3f48539 100644
                          out.push_str(&format!(
                              "{indent}{lhs} = call i1 @__m2v.rq.proceed(i32 {slot})\n"
                          ));
-@@ -1649,6 +1754,11 @@ fn lower_air_intersection_queries(
+@@ -1649,6 +1754,11 @@
                      out.push_str(&format!(
                          "{indent}call void @__m2v.rq.confirm(i32 {slot})\n"
                      ));
@@ -413,7 +412,7 @@ index 909f50d..3f48539 100644
                  }
                  "commit_bounding_box_intersection" => {
                      let t_val = call
-@@ -1659,24 +1769,98 @@ fn lower_air_intersection_queries(
+@@ -1659,24 +1769,98 @@
                      out.push_str(&format!(
                          "{indent}call void @__m2v.rq.query.iq_aabb.{slot}(float {t_val})\n"
                      ));
@@ -521,7 +520,7 @@ index 909f50d..3f48539 100644
                      if let Some(ref lhs) = call.lhs {
                          out.push_str(&format!(
                              "{indent}{lhs} = call float @__m2v.rq.get_t(i32 {slot}, i32 0)\n"
-@@ -1732,10 +1916,23 @@ fn lower_air_intersection_queries(
+@@ -1732,10 +1916,23 @@
                  }
                  "get_candidate_primitive_id" | "get_committed_primitive_id" => {
                      if let Some(ref lhs) = call.lhs {
@@ -549,7 +548,7 @@ index 909f50d..3f48539 100644
                      }
                  }
                  "get_candidate_geometry_id" | "get_committed_geometry_id" => {
-@@ -1863,9 +2060,116 @@ fn lower_air_intersection_queries(
+@@ -1863,9 +2060,116 @@
      }
  
      append_rq_intrinsic_declarations(&mut out, ll);
@@ -667,10 +666,20 @@ index 909f50d..3f48539 100644
  
      // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
      for slot in commit_aabb_slots {
-@@ -2138,6 +2442,904 @@ fn append_prim_data_lookup_support(out: &mut String) {
+@@ -2138,6 +2442,1137 @@
      }
  }
  
++fn emit_curve_extreme(out: &mut String, name: &str, values: &[impl AsRef<str>; 4], op: &str) {
++    let mut best = values[0].as_ref().to_owned();
++    for (i, value) in values[1..].iter().enumerate() {
++        let value = value.as_ref();
++        let dst = if i == 2 { name.to_owned() } else { format!("{name}_{i}") };
++        out.push_str(&format!("  %{dst}_take = fcmp {op} float %{value}, %{best}\n  %{dst} = select i1 %{dst}_take, float %{value}, float %{best}\n"));
++        best = dst;
++    }
++}
++
 +/// Emit curve RT lookup + analytic/Phantom cubic-Bezier ray-curve intersection helpers.
 +/// Called when `GARNETX_CAP_RT_CURVES` is enabled and any `intersection_query` or `intersect`
 +/// call uses `curve_data`. All BDA pointers use `%__m2v.rq.prim_data.*` scalar reads and
@@ -892,7 +901,7 @@ index 909f50d..3f48539 100644
 +             \x20 %d2z = fmul float %rdz, %rdz\n\
 +             \x20 %d2xy = fadd float %d2x, %d2y\n\
 +             \x20 %d2 = fadd float %d2xy, %d2z\n\
-+             \x20 %d2_ok = fcmp ogt float %d2, 1.000000e-20\n\
++             \x20 %d2_ok = fcmp ogt float %d2, 0x3BC79CA100000000\n\
 +             \x20 %m0 = and i1 %in_b, %pay_ok\n\
 +             \x20 %m1 = and i1 %so_ok, %d2_ok\n\
 +             \x20 %meta_ok = and i1 %m0, %m1\n\
@@ -941,7 +950,7 @@ index 909f50d..3f48539 100644
 +             \x20 %smin = fmul float %tmin, %dlen\n\
 +             \x20 %smax = fmul float %tmax, %dlen\n\
 +             \x20 %awx = call float @llvm.fabs.f32(float %wnx)\n\
-+             \x20 %gt90 = fcmp ogt float %awx, 9.000000e-01\n\
++             \x20 %gt90 = fcmp ogt float %awx, 0x3FECCCCCC0000000\n\
 +             \x20 %n_wnz = fsub float -0.000000e+00, %wnz\n\
 +             \x20 %n_wny = fsub float -0.000000e+00, %wny\n\
 +             \x20 %u0x = select i1 %gt90, float 0.000000e+00, float %n_wnz\n\
@@ -993,23 +1002,214 @@ index 909f50d..3f48539 100644
 +                 \x20 %br{i}_z = fadd float %br{i}_z01, %br{i}_z2\n"
 +            ));
 +        }
++        // A Bezier lies inside its control hull. Include the disk/flat acceptance tolerance.
++        emit_curve_extreme(out, "rmax", &["b0_3", "b1_3", "b2_3", "b3_3"], "ogt");
++        for axis in ["x", "y", "z"] {
++            let names = [0, 1, 2, 3].map(|i| format!("br{i}_{axis}"));
++            for (side, op) in [("min", "olt"), ("max", "ogt")] {
++                emit_curve_extreme(out, &format!("{axis}{side}"), &names, op);
++            }
++        }
 +        out.push_str(
 +            "  %is_flat = icmp eq i32 %ctype, 1\n\
 +             \x20 %is_round = icmp eq i32 %ctype, 0\n\
-+             \x20 br label %loop_hdr\n\
++             \x20 %pad = fmul float %rmax, 0x3FF0000A80000000\n\
++             \x20 %neg_pad = fneg float %pad\n\
++             \x20 %left = fcmp olt float %xmax, %neg_pad\n\
++             \x20 %right = fcmp ogt float %xmin, %pad\n\
++             \x20 %below = fcmp olt float %ymax, %neg_pad\n\
++             \x20 %above = fcmp ogt float %ymin, %pad\n\
++             \x20 %zlo = fsub float %zmin, %pad\n\
++             \x20 %zhi = fadd float %zmax, %pad\n\
++             \x20 %before = fcmp olt float %zhi, %smin\n\
++             \x20 %past = fcmp ogt float %zlo, %smax\n\
++             \x20 %xmiss = or i1 %left, %right\n\
++             \x20 %ymiss = or i1 %below, %above\n\
++             \x20 %zmiss = or i1 %before, %past\n\
++             \x20 %xymiss = or i1 %xmiss, %ymiss\n\
++             \x20 %boxmiss = or i1 %xymiss, %zmiss\n\
++             \x20 br i1 %boxmiss, label %meta_done, label %basis_dispatch\n\
++             basis_dispatch:\n\
++             \x20 %__m2v.rq.prim_data.ci_basis = add i64 %curve_hdr, 8\n\
++             \x20 %basis_ptr = inttoptr i64 %__m2v.rq.prim_data.ci_basis to ptr addrspace(1)\n\
++             \x20 %basis = load i32, ptr addrspace(1) %basis_ptr, align 4\n\
++             \x20 %linear = icmp eq i32 %basis, 2\n\
++             \x20 br i1 %linear, label %line_body, label %loop_hdr\n\
++             line_body:\n\
++             \x20 %line_dx = fsub float %b3_0, %b0_0\n\
++             \x20 %line_dy = fsub float %b3_1, %b0_1\n\
++             \x20 %line_dz = fsub float %b3_2, %b0_2\n\
++             \x20 %line_ocx = fsub float %rox, %b0_0\n\
++             \x20 %line_ocy = fsub float %roy, %b0_1\n\
++             \x20 %line_ocz = fsub float %roz, %b0_2\n\
++             \x20 %line_d2x = fmul float %line_dx, %line_dx\n\
++             \x20 %line_d2y = fmul float %line_dy, %line_dy\n\
++             \x20 %line_d2z = fmul float %line_dz, %line_dz\n\
++             \x20 %line_d2xy = fadd float %line_d2x, %line_d2y\n\
++             \x20 %line_d2 = fadd float %line_d2xy, %line_d2z\n\
++             \x20 %line_dr = fsub float %b3_3, %b0_3\n\
++             \x20 %line_regular = fcmp ogt float %line_d2, 0x3D71979980000000\n\
++             \x20 br i1 %is_flat, label %line_flat, label %line_round\n\
++             line_flat:\n\
++             \x20 %su = fsub float %br3_x, %br0_x\n\
++             \x20 %sv = fsub float %br3_y, %br0_y\n\
++             \x20 %sz = fsub float %br3_z, %br0_z\n\
++             \x20 %su2 = fmul float %su, %su\n\
++             \x20 %sv2 = fmul float %sv, %sv\n\
++             \x20 %flat_ss = fadd float %su2, %sv2\n\
++             \x20 %pus = fmul float %br0_x, %su\n\
++             \x20 %pvs = fmul float %br0_y, %sv\n\
++             \x20 %uv = fadd float %pus, %pvs\n\
++             \x20 %flat_regular = fcmp ogt float %flat_ss, 0x3D71979980000000\n\
++             \x20 %flat_neg = fneg float %uv\n\
++             \x20 %flat_div = fdiv float %flat_neg, %flat_ss\n\
++             \x20 %flat_raw = select i1 %flat_regular, float %flat_div, float 5.000000e-01\n\
++             \x20 %flat_neg_u = fcmp olt float %flat_raw, 0.000000e+00\n\
++             \x20 %flat_nonneg = select i1 %flat_neg_u, float 0.000000e+00, float %flat_raw\n\
++             \x20 %flat_over = fcmp ogt float %flat_nonneg, 1.000000e+00\n\
++             \x20 %flat_u = select i1 %flat_over, float 1.000000e+00, float %flat_nonneg\n\
++             \x20 %flat_stepx = fmul float %flat_u, %su\n\
++             \x20 %flat_x = fadd float %br0_x, %flat_stepx\n\
++             \x20 %flat_stepy = fmul float %flat_u, %sv\n\
++             \x20 %flat_y = fadd float %br0_y, %flat_stepy\n\
++             \x20 %flat_stepr = fmul float %flat_u, %line_dr\n\
++             \x20 %flat_r = fadd float %b0_3, %flat_stepr\n\
++             \x20 %flat_stepz = fmul float %flat_u, %sz\n\
++             \x20 %flat_z = fadd float %br0_z, %flat_stepz\n\
++             \x20 %fx2 = fmul float %flat_x, %flat_x\n\
++             \x20 %fy2 = fmul float %flat_y, %flat_y\n\
++             \x20 %flat_dist = fadd float %fx2, %fy2\n\
++             \x20 %flat_r2 = fmul float %flat_r, %flat_r\n\
++             \x20 %flat_inside = fcmp ole float %flat_dist, %flat_r2\n\
++             \x20 %flat_geom = and i1 %line_regular, %flat_inside\n\
++             \x20 %flat_r_ok = fcmp oge float %flat_r, 0.000000e+00\n\
++             \x20 %flat_rng_lo = fcmp oge float %flat_z, %smin\n\
++             \x20 %flat_rng_hi = fcmp ole float %flat_z, %smax\n\
++             \x20 %flat_rng = and i1 %flat_rng_lo, %flat_rng_hi\n\
++             \x20 %flat_bounds = and i1 %flat_r_ok, %flat_rng\n\
++             \x20 %flat_ok = and i1 %flat_geom, %flat_bounds\n\
++             \x20 %flat_hit = zext i1 %flat_ok to i32\n\
++             \x20 br label %after_loop\n\
++             line_round:\n\
++             \x20 %ldr2 = fmul float %line_dr, %line_dr\n\
++             \x20 %lden = fsub float %line_d2, %ldr2\n\
++             \x20 %lden_abs = call float @llvm.fabs.f32(float %lden)\n\
++             \x20 %lden_ok = fcmp ogt float %lden_abs, 0x3DDB7CDFE0000000\n\
++             \x20 %locdx = fmul float %line_ocx, %line_dx\n\
++             \x20 %locdy = fmul float %line_ocy, %line_dy\n\
++             \x20 %locdz = fmul float %line_ocz, %line_dz\n\
++             \x20 %locdxy = fadd float %locdx, %locdy\n\
++             \x20 %locd = fadd float %locdxy, %locdz\n\
++             \x20 %lrdr = fmul float %b0_3, %line_dr\n\
++             \x20 %lk_num = fadd float %locd, %lrdr\n\
++             \x20 %lk0 = fdiv float %lk_num, %lden\n\
++             \x20 %ldwx = fmul float %wnx, %line_dx\n\
++             \x20 %ldwy = fmul float %wny, %line_dy\n\
++             \x20 %ldwz = fmul float %wnz, %line_dz\n\
++             \x20 %ldwxy = fadd float %ldwx, %ldwy\n\
++             \x20 %ldw = fadd float %ldwxy, %ldwz\n\
++             \x20 %lk1 = fdiv float %ldw, %lden\n\
++             \x20 %lk0dx = fmul float %lk0, %line_dx\n\
++             \x20 %lpqx = fsub float %line_ocx, %lk0dx\n\
++             \x20 %lk0dy = fmul float %lk0, %line_dy\n\
++             \x20 %lpqy = fsub float %line_ocy, %lk0dy\n\
++             \x20 %lk0dz = fmul float %lk0, %line_dz\n\
++             \x20 %lpqz = fsub float %line_ocz, %lk0dz\n\
++             \x20 %lk1dx = fmul float %lk1, %line_dx\n\
++             \x20 %lvqx = fsub float %wnx, %lk1dx\n\
++             \x20 %lk1dy = fmul float %lk1, %line_dy\n\
++             \x20 %lvqy = fsub float %wny, %lk1dy\n\
++             \x20 %lk1dz = fmul float %lk1, %line_dz\n\
++             \x20 %lvqz = fsub float %wnz, %lk1dz\n\
++             \x20 %lkdr = fmul float %lk0, %line_dr\n\
++             \x20 %lrq = fadd float %b0_3, %lkdr\n\
++             \x20 %lrq1 = fmul float %lk1, %line_dr\n\
++             \x20 %lvq2x = fmul float %lvqx, %lvqx\n\
++             \x20 %lvq2y = fmul float %lvqy, %lvqy\n\
++             \x20 %lvq2z = fmul float %lvqz, %lvqz\n\
++             \x20 %lvq2xy = fadd float %lvq2x, %lvq2y\n\
++             \x20 %lvq2 = fadd float %lvq2xy, %lvq2z\n\
++             \x20 %lrq12 = fmul float %lrq1, %lrq1\n\
++             \x20 %lqa = fsub float %lvq2, %lrq12\n\
++             \x20 %lpvx = fmul float %lpqx, %lvqx\n\
++             \x20 %lpvy = fmul float %lpqy, %lvqy\n\
++             \x20 %lpvz = fmul float %lpqz, %lvqz\n\
++             \x20 %lpvxy = fadd float %lpvx, %lpvy\n\
++             \x20 %lpv = fadd float %lpvxy, %lpvz\n\
++             \x20 %lrr = fmul float %lrq, %lrq1\n\
++             \x20 %lqb = fsub float %lpv, %lrr\n\
++             \x20 %lpq2x = fmul float %lpqx, %lpqx\n\
++             \x20 %lpq2y = fmul float %lpqy, %lpqy\n\
++             \x20 %lpq2z = fmul float %lpqz, %lpqz\n\
++             \x20 %lpq2xy = fadd float %lpq2x, %lpq2y\n\
++             \x20 %lpq2 = fadd float %lpq2xy, %lpq2z\n\
++             \x20 %lrq2 = fmul float %lrq, %lrq\n\
++             \x20 %lqc = fsub float %lpq2, %lrq2\n\
++             \x20 %lqb2 = fmul float %lqb, %lqb\n\
++             \x20 %lac = fmul float %lqa, %lqc\n\
++             \x20 %ldisc = fsub float %lqb2, %lac\n\
++             \x20 %lsqrt = call float @air.sqrt.f32(float %ldisc)\n\
++             \x20 %lqa_abs = call float @llvm.fabs.f32(float %lqa)\n\
++             \x20 %lquad = fcmp ogt float %lqa_abs, 0x3DDB7CDFE0000000\n\
++             \x20 %lneg_b = fneg float %lqb\n\
++             \x20 %ln0 = fsub float %lneg_b, %lsqrt\n\
++             \x20 %lroot0 = fdiv float %ln0, %lqa\n\
++             \x20 %lneg_c = fneg float %lqc\n\
++             \x20 %l2b = fadd float %lqb, %lqb\n\
++             \x20 %lsingle = fdiv float %lneg_c, %l2b\n\
++             \x20 %ls0 = select i1 %lquad, float %lroot0, float %lsingle\n\
++             \x20 %ln1 = fadd float %lneg_b, %lsqrt\n\
++             \x20 %ls1 = fdiv float %ln1, %lqa\n\
++             \x20 %ldvalid = and i1 %line_regular, %lden_ok\n\
++             \x20 %lreal = fcmp oge float %ldisc, 0.000000e+00\n\
++             \x20 %lvalid = and i1 %ldvalid, %lreal\n\
++             \x20 %l0ks = fmul float %lk1, %ls0\n\
++             \x20 %l0u = fadd float %lk0, %l0ks\n\
++             \x20 %l0segment_lo = fcmp oge float %l0u, 0.000000e+00\n\
++             \x20 %l0segment_hi = fcmp ole float %l0u, 1.000000e+00\n\
++             \x20 %l0segment = and i1 %l0segment_lo, %l0segment_hi\n\
++             \x20 %l0ray_lo = fcmp oge float %ls0, %smin\n\
++             \x20 %l0ray_hi = fcmp ole float %ls0, %smax\n\
++             \x20 %l0ray = and i1 %l0ray_lo, %l0ray_hi\n\
++             \x20 %l0rng = and i1 %l0segment, %l0ray\n\
++             \x20 %lqb_abs = call float @llvm.fabs.f32(float %lqb)\n\
++             \x20 %lqb_ok = fcmp ogt float %lqb_abs, 0x3DDB7CDFE0000000\n\
++             \x20 %lhas_eq = or i1 %lquad, %lqb_ok\n\
++             \x20 %l0ok = and i1 %lhas_eq, %l0rng\n\
++             \x20 %l1ks = fmul float %lk1, %ls1\n\
++             \x20 %l1u = fadd float %lk0, %l1ks\n\
++             \x20 %l1segment_lo = fcmp oge float %l1u, 0.000000e+00\n\
++             \x20 %l1segment_hi = fcmp ole float %l1u, 1.000000e+00\n\
++             \x20 %l1segment = and i1 %l1segment_lo, %l1segment_hi\n\
++             \x20 %l1ray_lo = fcmp oge float %ls1, %smin\n\
++             \x20 %l1ray_hi = fcmp ole float %ls1, %smax\n\
++             \x20 %l1ray = and i1 %l1ray_lo, %l1ray_hi\n\
++             \x20 %l1rng = and i1 %l1segment, %l1ray\n\
++             \x20 %l1ok = and i1 %lquad, %l1rng\n\
++             \x20 %lnearer = fcmp olt float %ls1, %ls0\n\
++             \x20 %lno0 = xor i1 %l0ok, true\n\
++             \x20 %lbetter = or i1 %lnearer, %lno0\n\
++             \x20 %lchoose1 = and i1 %l1ok, %lbetter\n\
++             \x20 %line_s = select i1 %lchoose1, float %ls1, float %ls0\n\
++             \x20 %line_u = select i1 %lchoose1, float %l1u, float %l0u\n\
++             \x20 %lany = or i1 %l0ok, %l1ok\n\
++             \x20 %lbody_hit = and i1 %lvalid, %lany\n\
++             \x20 %line_degen = xor i1 %line_regular, true\n\
++             \x20 %line_hit = zext i1 %lbody_hit to i32\n\
++             \x20 br label %after_loop\n\
 +             \n\
 +             loop_hdr:\n\
-+             \x20 %step = phi i32 [ 0, %load_seg ], [ %step_next, %loop_latch ]\n\
-+             \x20 %u_cur = phi float [ 0.000000e+00, %load_seg ], [ %u_next, %loop_latch ]\n\
-+             \x20 %hit_cur = phi i32 [ 0, %load_seg ], [ %hit_next, %loop_latch ]\n\
-+             \x20 %s_cur = phi float [ %smax, %load_seg ], [ %s_next, %loop_latch ]\n\
-+             \x20 %bu_cur = phi float [ 0.000000e+00, %load_seg ], [ %bu_next, %loop_latch ]\n\
-+             \x20 %in_lim = icmp ult i32 %step, 48\n\
++             \x20 %step = phi i32 [ 0, %basis_dispatch ], [ %step_next, %loop_latch ]\n\
++             \x20 %u_cur = phi float [ 0.000000e+00, %basis_dispatch ], [ %u_next, %loop_latch ]\n\
++             \x20 %hit_cur = phi i32 [ 0, %basis_dispatch ], [ %h_latch, %loop_latch ]\n\
++             \x20 %s_cur = phi float [ %smax, %basis_dispatch ], [ %s_latch, %loop_latch ]\n\
++             \x20 %bu_cur = phi float [ 0.000000e+00, %basis_dispatch ], [ %u_latch, %loop_latch ]\n\
++             \x20 %in_lim = icmp ult i32 %step, 64\n\
 +             \x20 br i1 %in_lim, label %loop_body, label %after_loop\n\
 +             \n\
 +             loop_body:\n\
-+             \x20 %seed = udiv i32 %step, 6\n\
-+             \x20 %it = urem i32 %step, 6\n\
++             \x20 %seed = udiv i32 %step, 8\n\
++             \x20 %it = urem i32 %step, 8\n\
 +             \x20 %is_it0 = icmp eq i32 %it, 0\n\
 +             \x20 %seed_f = sitofp i32 %seed to float\n\
 +             \x20 %seed_p = fadd float %seed_f, 5.000000e-01\n\
@@ -1064,7 +1264,7 @@ index 909f50d..3f48539 100644
 +             \x20 %d_xyz2 = fadd float %d_xy2, %dz2\n\
 +             \x20 %D_val = fsub float %d_xyz2, %dr2\n\
 +             \x20 %abs_D = call float @llvm.fabs.f32(float %D_val)\n\
-+             \x20 %D_ok = fcmp ogt float %abs_D, 1.000000e-10\n\
++             \x20 %D_ok = fcmp ogt float %abs_D, 0x3DDB7CDFE0000000\n\
 +             \x20 %safe_D = select i1 %D_ok, float %D_val, float 1.000000e+00\n\
 +             \x20 %pxdx = fmul float %px, %dx\n\
 +             \x20 %pydy = fmul float %py, %dy\n\
@@ -1095,7 +1295,7 @@ index 909f50d..3f48539 100644
 +             \x20 %ac_prod = fmul float %a_coef, %c_coef\n\
 +             \x20 %disc = fsub float %tz2, %ac_prod\n\
 +             \x20 %abs_a = call float @llvm.fabs.f32(float %a_coef)\n\
-+             \x20 %a_ok = fcmp ogt float %abs_a, 1.000000e-08\n\
++             \x20 %a_ok = fcmp ogt float %abs_a, 0x3E45798EE0000000\n\
 +             \x20 %disc_ok = fcmp oge float %disc, 0.000000e+00\n\
 +             \x20 %cone_0 = and i1 %not_flat, %D_ok\n\
 +             \x20 %cone_1 = and i1 %cone_0, %a_ok\n\
@@ -1124,14 +1324,14 @@ index 909f50d..3f48539 100644
 +             \x20 %dr_term = select i1 %is_flat, float 0.000000e+00, float %dr2\n\
 +             \x20 %df_val = fsub float %d_xy2, %dr_term\n\
 +             \x20 %abs_df = call float @llvm.fabs.f32(float %df_val)\n\
-+             \x20 %df_ok = fcmp oge float %abs_df, 1.000000e-10\n\
++             \x20 %df_ok = fcmp oge float %abs_df, 0x3DDB7CDFE0000000\n\
 +             \x20 %safe_df = select i1 %df_ok, float %df_val, float 1.000000e+00\n\
 +             \x20 %raw_st = fdiv float %f_val, %safe_df\n\
 +             \x20 %st_if = select i1 %df_ok, float %raw_st, float 0.000000e+00\n\
-+             \x20 %st_hi = fcmp ogt float %st_if, 2.000000e-01\n\
-+             \x20 %st_c0 = select i1 %st_hi, float 2.000000e-01, float %st_if\n\
-+             \x20 %st_lo = fcmp olt float %st_c0, -2.000000e-01\n\
-+             \x20 %st_cl = select i1 %st_lo, float -2.000000e-01, float %st_c0\n\
++             \x20 %st_hi = fcmp ogt float %st_if, 0x3FC99999A0000000\n\
++             \x20 %st_c0 = select i1 %st_hi, float 0x3FC99999A0000000, float %st_if\n\
++             \x20 %st_lo = fcmp olt float %st_c0, 0xBFC99999A0000000\n\
++             \x20 %st_cl = select i1 %st_lo, float 0xBFC99999A0000000, float %st_c0\n\
 +             \x20 %du_2d = fsub float -0.000000e+00, %st_cl\n\
 +             \x20 %du_use = select i1 %cone_ok, float %du_c1, float %du_2d\n\
 +             \x20 %u_sub = fadd float %u0, %du_use\n\
@@ -1139,6 +1339,15 @@ index 909f50d..3f48539 100644
 +             \x20 %u_c0 = select i1 %u_neg, float 0.000000e+00, float %u_sub\n\
 +             \x20 %u_ov = fcmp ogt float %u_c0, 1.000000e+00\n\
 +             \x20 %u_next = select i1 %u_ov, float 1.000000e+00, float %u_c0\n\
++             \x20 %abs_du = call float @llvm.fabs.f32(float %du_use)\n\
++             \x20 %tiny_step = fcmp olt float %abs_du, 0x3EB0C6F7A0000000\n\
++             \x20 %outside = or i1 %u_neg, %u_ov\n\
++             \x20 %inside = xor i1 %outside, true\n\
++             \x20 %settled = and i1 %inside, %tiny_step\n\
++             \x20 %at_limit = icmp eq i32 %it, 7\n\
++             \x20 %finish_seed = or i1 %settled, %at_limit\n\
++             \x20 br i1 %finish_seed, label %evaluate_hit, label %loop_latch\n\
++             evaluate_hit:\n\
 +             \x20 %qom = fsub float 1.000000e+00, %u_next\n\
 +             \x20 %qom2 = fmul float %qom, %qom\n\
 +             \x20 %qu2 = fmul float %u_next, %u_next\n\
@@ -1178,15 +1387,14 @@ index 909f50d..3f48539 100644
 +            ));
 +        }
 +        out.push_str(
-+            "  %is_last = icmp eq i32 %it, 5\n\
-+             \x20 %qx2 = fmul float %qx, %qx\n\
++            "  %qx2 = fmul float %qx, %qx\n\
 +             \x20 %qy2 = fmul float %qy, %qy\n\
 +             \x20 %d2_uv = fadd float %qx2, %qy2\n\
 +             \x20 %qr2 = fmul float %qr, %qr\n\
-+             \x20 %qr2_tol = fmul float %qr2, 1.000010e+00\n\
++             \x20 %qr2_tol = fmul float %qr2, 0x3FF0000A80000000\n\
 +             \x20 %r_nonneg = fcmp oge float %qr, 0.000000e+00\n\
 +             \x20 %in_rad = fcmp ole float %d2_uv, %qr2_tol\n\
-+             \x20 %fl_0 = and i1 %is_last, %is_flat\n\
++             \x20 %fl_0 = and i1 %finish_seed, %is_flat\n\
 +             \x20 %fl_1 = and i1 %r_nonneg, %in_rad\n\
 +             \x20 %fl_ge = fcmp oge float %qz, %smin\n\
 +             \x20 %fl_le = fcmp ole float %qz, %smax\n\
@@ -1208,7 +1416,7 @@ index 909f50d..3f48539 100644
 +             \x20 %qd_xyz2 = fadd float %qd_xy2, %qdz2\n\
 +             \x20 %qD = fsub float %qd_xyz2, %qdr2\n\
 +             \x20 %qabs_D = call float @llvm.fabs.f32(float %qD)\n\
-+             \x20 %qD_ok = fcmp ogt float %qabs_D, 1.000000e-10\n\
++             \x20 %qD_ok = fcmp ogt float %qabs_D, 0x3DDB7CDFE0000000\n\
 +             \x20 %qsafe_D = select i1 %qD_ok, float %qD, float 1.000000e+00\n\
 +             \x20 %qxqdx = fmul float %qx, %qdx\n\
 +             \x20 %qyqdy = fmul float %qy, %qdy\n\
@@ -1239,9 +1447,9 @@ index 909f50d..3f48539 100644
 +             \x20 %qac = fmul float %qa, %qc\n\
 +             \x20 %qdisc = fsub float %qtz2, %qac\n\
 +             \x20 %qabs_a = call float @llvm.fabs.f32(float %qa)\n\
-+             \x20 %qa_ok = fcmp ogt float %qabs_a, 1.000000e-08\n\
++             \x20 %qa_ok = fcmp ogt float %qabs_a, 0x3E45798EE0000000\n\
 +             \x20 %qdisc_ok = fcmp oge float %qdisc, 0.000000e+00\n\
-+             \x20 %qc0_ok = and i1 %is_last, %not_flat\n\
++             \x20 %qc0_ok = and i1 %finish_seed, %not_flat\n\
 +             \x20 %qc1_ok = and i1 %qc0_ok, %qD_ok\n\
 +             \x20 %qc2_ok = and i1 %qc1_ok, %qa_ok\n\
 +             \x20 %qcone_ok = and i1 %qc2_ok, %qdisc_ok\n\
@@ -1260,9 +1468,9 @@ index 909f50d..3f48539 100644
 +             \x20 %ra = fadd float %qr, %duadr\n\
 +             \x20 %abs_dua = call float @llvm.fabs.f32(float %dua)\n\
 +             \x20 %ra_ok = fcmp oge float %ra, 0.000000e+00\n\
-+             \x20 %dua_ok = fcmp ole float %abs_dua, 5.000000e-02\n\
-+             \x20 %ua_lo = fcmp oge float %ua_raw, -1.000000e-04\n\
-+             \x20 %ua_hi = fcmp ole float %ua_raw, 1.000100e+00\n\
++             \x20 %dua_ok = fcmp ole float %abs_dua, 0x3FA99999A0000000\n\
++             \x20 %ua_lo = fcmp oge float %ua_raw, 0xBF1A36E2E0000000\n\
++             \x20 %ua_hi = fcmp ole float %ua_raw, 0x3FF00068E0000000\n\
 +             \x20 %ua_neg = fcmp olt float %ua_raw, 0.000000e+00\n\
 +             \x20 %ua_cl0 = select i1 %ua_neg, float 0.000000e+00, float %ua_raw\n\
 +             \x20 %ua_ov = fcmp ogt float %ua_cl0, 1.000000e+00\n\
@@ -1290,9 +1498,9 @@ index 909f50d..3f48539 100644
 +             \x20 %rb = fadd float %qr, %dubdr\n\
 +             \x20 %abs_dub = call float @llvm.fabs.f32(float %dub)\n\
 +             \x20 %rb_ok = fcmp oge float %rb, 0.000000e+00\n\
-+             \x20 %dub_ok = fcmp ole float %abs_dub, 5.000000e-02\n\
-+             \x20 %ub_lo = fcmp oge float %ub_raw, -1.000000e-04\n\
-+             \x20 %ub_hi = fcmp ole float %ub_raw, 1.000100e+00\n\
++             \x20 %dub_ok = fcmp ole float %abs_dub, 0x3FA99999A0000000\n\
++             \x20 %ub_lo = fcmp oge float %ub_raw, 0xBF1A36E2E0000000\n\
++             \x20 %ub_hi = fcmp ole float %ub_raw, 0x3FF00068E0000000\n\
 +             \x20 %ub_neg = fcmp olt float %ub_raw, 0.000000e+00\n\
 +             \x20 %ub_cl0 = select i1 %ub_neg, float 0.000000e+00, float %ub_raw\n\
 +             \x20 %ub_ov = fcmp ogt float %ub_cl0, 1.000000e+00\n\
@@ -1315,10 +1523,23 @@ index 909f50d..3f48539 100644
 +             \x20 br label %loop_latch\n\
 +             \n\
 +             loop_latch:\n\
-+             \x20 %step_next = add i32 %step, 1\n\
++             \x20 %h_latch = phi i32 [ %hit_next, %evaluate_hit ], [ %hit_cur, %loop_body ]\n\
++             \x20 %s_latch = phi float [ %s_next, %evaluate_hit ], [ %s_cur, %loop_body ]\n\
++             \x20 %u_latch = phi float [ %bu_next, %evaluate_hit ], [ %bu_cur, %loop_body ]\n\
++             \x20 %one_step = add i32 %step, 1\n\
++             \x20 %next_seed = add i32 %seed, 1\n\
++             \x20 %seed_step = mul i32 %next_seed, 8\n\
++             \x20 %step_next = select i1 %finish_seed, i32 %seed_step, i32 %one_step\n\
 +             \x20 br label %loop_hdr\n\
 +             \n\
 +             after_loop:\n\
++             \x20 %ldz = phi float [ 0.000000e+00, %loop_hdr ], [ %line_dz, %line_flat ], [ %line_dz, %line_round ]\n\
++             \x20 %ldy = phi float [ 0.000000e+00, %loop_hdr ], [ %line_dy, %line_flat ], [ %line_dy, %line_round ]\n\
++             \x20 %ldx = phi float [ 0.000000e+00, %loop_hdr ], [ %line_dx, %line_flat ], [ %line_dx, %line_round ]\n\
++             \x20 %body_hit = phi i32 [ %hit_cur, %loop_hdr ], [ %flat_hit, %line_flat ], [ %line_hit, %line_round ]\n\
++             \x20 %body_s = phi float [ %s_cur, %loop_hdr ], [ %flat_z, %line_flat ], [ %line_s, %line_round ]\n\
++             \x20 %body_u = phi float [ %bu_cur, %loop_hdr ], [ %flat_u, %line_flat ], [ %line_u, %line_round ]\n\
++             \x20 %degenerate_line = phi i1 [ false, %loop_hdr ], [ false, %line_flat ], [ %line_degen, %line_round ]\n\
 +             \x20 %caps_sphere = icmp eq i32 %caps, 2\n\
 +             \x20 %caps_disk = icmp eq i32 %caps, 1\n\
 +             \x20 %do_sph = and i1 %is_round, %caps_sphere\n\
@@ -1326,7 +1547,10 @@ index 909f50d..3f48539 100644
 +             \x20 %at_start = fcmp oeq float %seg_t0, 0.000000e+00\n\
 +             \x20 %at_end = fcmp oeq float %seg_t1, 1.000000e+00\n\
 +             \x20 %sp0_en0 = and i1 %do_sph, %at_start\n\
-+             \x20 %sp0_rk = fcmp ogt float %b0_3, 0.000000e+00\n\
++             \x20 %larger_end = fcmp ogt float %b3_3, %b0_3\n\
++             \x20 %use_end_radius = and i1 %degenerate_line, %larger_end\n\
++             \x20 %start_radius = select i1 %use_end_radius, float %b3_3, float %b0_3\n\
++             \x20 %sp0_rk = fcmp ogt float %start_radius, 0.000000e+00\n\
 +             \x20 %sp0_en = and i1 %sp0_en0, %sp0_rk\n\
 +             \x20 %sp0_b = fadd float %br0_z, 0.000000e+00\n\
 +             \x20 %oc0_x = fsub float %rox, %b0_0\n\
@@ -1342,7 +1566,7 @@ index 909f50d..3f48539 100644
 +             \x20 %oc0_2z = fmul float %oc0_z, %oc0_z\n\
 +             \x20 %oc0_xy = fadd float %oc0_2x, %oc0_2y\n\
 +             \x20 %oc0_2 = fadd float %oc0_xy, %oc0_2z\n\
-+             \x20 %r0_2 = fmul float %b0_3, %b0_3\n\
++             \x20 %r0_2 = fmul float %start_radius, %start_radius\n\
 +             \x20 %sp0_cc = fsub float %oc0_2, %r0_2\n\
 +             \x20 %sp0_b2 = fmul float %sp0_bv, %sp0_bv\n\
 +             \x20 %sp0_disc = fsub float %sp0_b2, %sp0_cc\n\
@@ -1356,14 +1580,14 @@ index 909f50d..3f48539 100644
 +             \x20 %sp0_r0_ge = fcmp oge float %sp0_r0, %smin\n\
 +             \x20 %sp0_r0_le = fcmp ole float %sp0_r0, %smax\n\
 +             \x20 %sp0_r0_rng = and i1 %sp0_r0_ge, %sp0_r0_le\n\
-+             \x20 %sp0_nh0 = icmp eq i32 %hit_cur, 0\n\
-+             \x20 %sp0_lt0 = fcmp olt float %sp0_r0, %s_cur\n\
++             \x20 %sp0_nh0 = icmp eq i32 %body_hit, 0\n\
++             \x20 %sp0_lt0 = fcmp olt float %sp0_r0, %body_s\n\
 +             \x20 %sp0_im0 = or i1 %sp0_nh0, %sp0_lt0\n\
 +             \x20 %sp0_tk0a = and i1 %sp0_use0, %sp0_r0_rng\n\
 +             \x20 %sp0_tk0 = and i1 %sp0_tk0a, %sp0_im0\n\
-+             \x20 %hc1 = select i1 %sp0_tk0, i32 1, i32 %hit_cur\n\
-+             \x20 %sc1 = select i1 %sp0_tk0, float %sp0_r0, float %s_cur\n\
-+             \x20 %uc1 = select i1 %sp0_tk0, float 0.000000e+00, float %bu_cur\n\
++             \x20 %hc1 = select i1 %sp0_tk0, i32 1, i32 %body_hit\n\
++             \x20 %sc1 = select i1 %sp0_tk0, float %sp0_r0, float %body_s\n\
++             \x20 %uc1 = select i1 %sp0_tk0, float 0.000000e+00, float %body_u\n\
 +             \x20 %sp0_r1_ge = fcmp oge float %sp0_r1, %smin\n\
 +             \x20 %sp0_r1_le = fcmp ole float %sp0_r1, %smax\n\
 +             \x20 %sp0_r1_rng = and i1 %sp0_r1_ge, %sp0_r1_le\n\
@@ -1375,7 +1599,9 @@ index 909f50d..3f48539 100644
 +             \x20 %hc2 = select i1 %sp0_tk1, i32 1, i32 %hc1\n\
 +             \x20 %sc2 = select i1 %sp0_tk1, float %sp0_r1, float %sc1\n\
 +             \x20 %uc2 = select i1 %sp0_tk1, float 0.000000e+00, float %uc1\n\
-+             \x20 %sp1_en0 = and i1 %do_sph, %at_end\n\
++             \x20 %sph_end = and i1 %do_sph, %at_end\n\
++             \x20 %not_degen = xor i1 %degenerate_line, true\n\
++             \x20 %sp1_en0 = and i1 %sph_end, %not_degen\n\
 +             \x20 %sp1_rk = fcmp ogt float %b3_3, 0.000000e+00\n\
 +             \x20 %sp1_en = and i1 %sp1_en0, %sp1_rk\n\
 +             \x20 %oc1_x = fsub float %rox, %b3_0\n\
@@ -1424,15 +1650,18 @@ index 909f50d..3f48539 100644
 +             \x20 %hc4 = select i1 %sp1_tk1, i32 1, i32 %hc3\n\
 +             \x20 %sc4 = select i1 %sp1_tk1, float %sp1_r1, float %sc3\n\
 +             \x20 %uc4 = select i1 %sp1_tk1, float 1.000000e+00, float %uc3\n\
-+             \x20 %d0x = fsub float %b1_0, %b0_0\n\
-+             \x20 %d0y = fsub float %b1_1, %b0_1\n\
-+             \x20 %d0z = fsub float %b1_2, %b0_2\n\
++             \x20 %cubic_d0x = fsub float %b1_0, %b0_0\n\
++             \x20 %d0x = select i1 %linear, float %ldx, float %cubic_d0x\n\
++             \x20 %cubic_d0y = fsub float %b1_1, %b0_1\n\
++             \x20 %d0y = select i1 %linear, float %ldy, float %cubic_d0y\n\
++             \x20 %cubic_d0z = fsub float %b1_2, %b0_2\n\
++             \x20 %d0z = select i1 %linear, float %ldz, float %cubic_d0z\n\
 +             \x20 %d0_x2 = fmul float %d0x, %d0x\n\
 +             \x20 %d0_y2 = fmul float %d0y, %d0y\n\
 +             \x20 %d0_z2 = fmul float %d0z, %d0z\n\
 +             \x20 %d0_xy = fadd float %d0_x2, %d0_y2\n\
 +             \x20 %d0_2 = fadd float %d0_xy, %d0_z2\n\
-+             \x20 %dk0_ok = fcmp ogt float %d0_2, 1.000000e-12\n\
++             \x20 %dk0_ok = fcmp ogt float %d0_2, 0x3D71979980000000\n\
 +             \x20 %dk0_len = call float @air.sqrt.f32(float %d0_2)\n\
 +             \x20 %dk0_lsafe = select i1 %dk0_ok, float %dk0_len, float 1.000000e+00\n\
 +             \x20 %dk0_nx0 = fsub float -0.000000e+00, %d0x\n\
@@ -1447,7 +1676,7 @@ index 909f50d..3f48539 100644
 +             \x20 %dk0_dn01 = fadd float %dk0_dn0, %dk0_dn1\n\
 +             \x20 %dk0_den = fadd float %dk0_dn01, %dk0_dn2\n\
 +             \x20 %dk0_aden = call float @llvm.fabs.f32(float %dk0_den)\n\
-+             \x20 %dk0_dok = fcmp oge float %dk0_aden, 1.000000e-08\n\
++             \x20 %dk0_dok = fcmp oge float %dk0_aden, 0x3E45798EE0000000\n\
 +             \x20 %dk0_dsafe = select i1 %dk0_dok, float %dk0_den, float 1.000000e+00\n\
 +             \x20 %dk0_pc0 = fmul float %oc0_x, %dk0_nx\n\
 +             \x20 %dk0_pc1 = fmul float %oc0_y, %dk0_ny\n\
@@ -1485,15 +1714,18 @@ index 909f50d..3f48539 100644
 +             \x20 %hc5 = select i1 %dk0_tk, i32 1, i32 %hc4\n\
 +             \x20 %sc5 = select i1 %dk0_tk, float %dk0_s, float %sc4\n\
 +             \x20 %uc5 = select i1 %dk0_tk, float 0.000000e+00, float %uc4\n\
-+             \x20 %d1x = fsub float %b3_0, %b2_0\n\
-+             \x20 %d1y = fsub float %b3_1, %b2_1\n\
-+             \x20 %d1z = fsub float %b3_2, %b2_2\n\
++             \x20 %cubic_d1x = fsub float %b3_0, %b2_0\n\
++             \x20 %d1x = select i1 %linear, float %ldx, float %cubic_d1x\n\
++             \x20 %cubic_d1y = fsub float %b3_1, %b2_1\n\
++             \x20 %d1y = select i1 %linear, float %ldy, float %cubic_d1y\n\
++             \x20 %cubic_d1z = fsub float %b3_2, %b2_2\n\
++             \x20 %d1z = select i1 %linear, float %ldz, float %cubic_d1z\n\
 +             \x20 %d1_x2 = fmul float %d1x, %d1x\n\
 +             \x20 %d1_y2 = fmul float %d1y, %d1y\n\
 +             \x20 %d1_z2 = fmul float %d1z, %d1z\n\
 +             \x20 %d1_xy = fadd float %d1_x2, %d1_y2\n\
 +             \x20 %d1_2 = fadd float %d1_xy, %d1_z2\n\
-+             \x20 %dk1_ok = fcmp ogt float %d1_2, 1.000000e-12\n\
++             \x20 %dk1_ok = fcmp ogt float %d1_2, 0x3D71979980000000\n\
 +             \x20 %dk1_len = call float @air.sqrt.f32(float %d1_2)\n\
 +             \x20 %dk1_lsafe = select i1 %dk1_ok, float %dk1_len, float 1.000000e+00\n\
 +             \x20 %dk1_nx = fdiv float %d1x, %dk1_lsafe\n\
@@ -1505,7 +1737,7 @@ index 909f50d..3f48539 100644
 +             \x20 %dk1_dn01 = fadd float %dk1_dn0, %dk1_dn1\n\
 +             \x20 %dk1_den = fadd float %dk1_dn01, %dk1_dn2\n\
 +             \x20 %dk1_aden = call float @llvm.fabs.f32(float %dk1_den)\n\
-+             \x20 %dk1_dok = fcmp oge float %dk1_aden, 1.000000e-08\n\
++             \x20 %dk1_dok = fcmp oge float %dk1_aden, 0x3E45798EE0000000\n\
 +             \x20 %dk1_dsafe = select i1 %dk1_dok, float %dk1_den, float 1.000000e+00\n\
 +             \x20 %dk1_pc0 = fmul float %oc1_x, %dk1_nx\n\
 +             \x20 %dk1_pc1 = fmul float %oc1_y, %dk1_ny\n\
@@ -1558,7 +1790,7 @@ index 909f50d..3f48539 100644
 +             \x20 br label %meta_done\n\
 +             \n\
 +             meta_done:\n\
-+             \x20 %m_res = phi <4 x float> [ %r3, %after_loop ], [ zeroinitializer, %read_meta ]\n\
++             \x20 %m_res = phi <4 x float> [ %r3, %after_loop ], [ zeroinitializer, %read_meta ], [ zeroinitializer, %load_seg ]\n\
 +             \x20 br label %exit\n\
 +             \n\
 +             exit:\n\
@@ -1572,7 +1804,7 @@ index 909f50d..3f48539 100644
  fn append_rq_intrinsic_declarations(out: &mut String, existing_ll: &str) {
      let decls = [
          "declare void @__m2v.rq.init(i32, ptr addrspace(1), i32, i32, <3 x float>, float, <3 x float>, float)",
-@@ -2260,11 +3327,14 @@ fn emit_ray_query_helper(
+@@ -2260,11 +3695,14 @@
      linked_callbacks: &[LinkedRayCallback],
      ift_abi_v2: bool,
      prim_data_enabled: bool,
@@ -1587,7 +1819,7 @@ index 909f50d..3f48539 100644
  
      let mut params = Vec::with_capacity(p.raw_args.len());
      for (i, (ty, _)) in p.raw_args.iter().enumerate() {
-@@ -2351,6 +3421,30 @@ fn emit_ray_query_helper(
+@@ -2351,6 +3789,30 @@
          ));
      }
  
@@ -1618,7 +1850,7 @@ index 909f50d..3f48539 100644
      let call_payload_size: Option<u32> = p
          .raw_args
          .get(idx.payload + 1)
-@@ -2376,6 +3470,11 @@ fn emit_ray_query_helper(
+@@ -2376,6 +3838,11 @@
          .copied()
          .filter(|cb| cb.kind == IntersectionFunctionKind::BoundingBox)
          .collect();
@@ -1630,7 +1862,7 @@ index 909f50d..3f48539 100644
  
      s.push_str("  br label %proceed_hdr\n\n");
      s.push_str(&format!(
-@@ -2385,23 +3484,89 @@ fn emit_ray_query_helper(
+@@ -2385,23 +3852,89 @@
      ));
  
      if active_callbacks.is_empty() {
@@ -1734,7 +1966,7 @@ index 909f50d..3f48539 100644
          let table_param = format!("%p{}", idx.table);
          let fto_param = format!("%p{}", idx.function_table_offset);
          s.push_str(&format!(
-@@ -2422,6 +3587,11 @@ fn emit_ray_query_helper(
+@@ -2422,6 +3955,11 @@
          // ABI v2: header_words = 66 (word[0] = slot_count, word[1] = 2, word[2] = attached_mask,
          //         word[3] = 0, word[4..65] = u64 attached_bda[31], word[66 + slot] = handle_id).
          let header_words: u32 = if ift_abi_v2 { 66 } else { 1 };
@@ -1746,7 +1978,7 @@ index 909f50d..3f48539 100644
          s.push_str(&format!(
              "  %fto_neg = icmp slt i32 {fto_param}, 0\n\
               \x20 %fto_safe = select i1 %fto_neg, i32 0, i32 {fto_param}\n\
-@@ -2439,7 +3609,7 @@ fn emit_ray_query_helper(
+@@ -2439,7 +3977,7 @@
               ift_dispatch:\n\
               \x20 %ift_hdl = phi i32 [ %ift_loaded_hdl, %ift_load ], [ 0, %ift_oob ]\n\
               \x20 %is_tri = icmp eq i32 %ctype, 0\n\
@@ -1755,7 +1987,7 @@ index 909f50d..3f48539 100644
          ));
  
          // Triangle any-hit dispatch.
-@@ -2466,15 +3636,105 @@ fn emit_ray_query_helper(
+@@ -2466,15 +4004,105 @@
                      ift_abi_v2,
                      prim_data_enabled,
                      &table_param,
@@ -1861,7 +2093,7 @@ index 909f50d..3f48539 100644
          // Bounding-box custom intersection dispatch.
          s.push_str("aabb_dispatch:\n");
          if aabb_callbacks.is_empty() {
-@@ -2499,6 +3759,7 @@ fn emit_ray_query_helper(
+@@ -2499,6 +4127,7 @@
                      ift_abi_v2,
                      prim_data_enabled,
                      &table_param,
@@ -1869,7 +2101,7 @@ index 909f50d..3f48539 100644
                  )?;
              }
          }
-@@ -2515,8 +3776,7 @@ fn emit_ray_query_helper(
+@@ -2515,8 +4144,7 @@
      }
  
      // Done: UB-safe committed intersection extraction (never invoke hit-only getters on miss,
@@ -1879,7 +2111,7 @@ index 909f50d..3f48539 100644
      let is_multi_level = family.instancing == AirIntersectionInstancing::MultiLevel;
      s.push_str(&format!(
          "done:\n\
-@@ -2556,8 +3816,22 @@ fn emit_ray_query_helper(
+@@ -2556,8 +4184,22 @@
              ));
          }
      }
@@ -1903,7 +2135,7 @@ index 909f50d..3f48539 100644
              "%p4".to_string()
          } else if let Some(as_slot) = p.descriptor_as_slot {
              s.push_str(&format!(
-@@ -2572,15 +3846,35 @@ fn emit_ray_query_helper(
+@@ -2572,15 +4214,35 @@
          } else {
              (0, "0")
          };
@@ -1944,7 +2176,7 @@ index 909f50d..3f48539 100644
      if prim_data_enabled && p.reads_prim_data {
          s.push_str("  %res_prim_data = phi i64 [ %hit_prim_data, %read_hit ], [ 0, %done ]\n");
      }
-@@ -2631,7 +3925,13 @@ fn emit_ray_query_helper(
+@@ -2631,7 +4293,13 @@
      let mut prev = "poison".to_string();
      for (fi, field) in fields.iter().enumerate() {
          let (ft, fv) = match field {
@@ -1959,7 +2191,7 @@ index 909f50d..3f48539 100644
              AirIntersectionResultField::Distance => ("float", "%comm_t".to_string()),
              AirIntersectionResultField::PrimitiveId => ("i32", "%res_prim".to_string()),
              AirIntersectionResultField::GeometryId => ("i32", "%res_geom".to_string()),
-@@ -2650,7 +3950,13 @@ fn emit_ray_query_helper(
+@@ -2650,7 +4318,13 @@
              }
              AirIntersectionResultField::Barycentrics => ("<2 x float>", "%res_bary".to_string()),
              AirIntersectionResultField::FrontFacing => ("i1", "%res_front".to_string()),
@@ -1974,7 +2206,7 @@ index 909f50d..3f48539 100644
              AirIntersectionResultField::WorldSpaceVector(v) => {
                  if *v < 4 {
                      ("<3 x float>", format!("%res_w2o_{v}"))
-@@ -2681,6 +3987,7 @@ fn emit_callback_args(
+@@ -2681,6 +4355,7 @@
      ift_abi_v2: bool,
      prim_data_enabled: bool,
      table_param: &str,
@@ -1982,7 +2214,7 @@ index 909f50d..3f48539 100644
  ) -> Vec<String> {
      let mut args = Vec::with_capacity(cb.param_types.len());
      for (pi, (pty, role)) in cb
-@@ -2756,10 +4063,31 @@ fn emit_callback_args(
+@@ -2756,10 +4431,31 @@
                  args.push(format!("{pty} {vname}"));
              }
              CallbackParamRole::PrimitiveId => {
@@ -2018,7 +2250,7 @@ index 909f50d..3f48539 100644
              }
              CallbackParamRole::GeometryId => {
                  s.push_str(&format!(
-@@ -2868,9 +4196,16 @@ fn emit_callback_args(
+@@ -2868,9 +4564,16 @@
                      } else {
                          "0".to_string()
                      };
@@ -2037,7 +2269,7 @@ index 909f50d..3f48539 100644
                      ));
                      let (has_inst_i32, inst_val) = if has_instancing {
                          s.push_str(&format!(
-@@ -2882,7 +4217,7 @@ fn emit_callback_args(
+@@ -2882,7 +4585,7 @@
                      };
                      let addr_var = format!("%__m2v.rq.prim_data.{prefix}_{pi}");
                      s.push_str(&format!(
@@ -2046,7 +2278,7 @@ index 909f50d..3f48539 100644
                           \x20 {vname} = inttoptr i64 {addr_var} to {pty}\n"
                      ));
                      args.push(format!("{pty} {vname}"));
-@@ -3000,6 +4335,7 @@ fn emit_triangle_callback_case(
+@@ -3000,6 +4703,7 @@
      ift_abi_v2: bool,
      prim_data_enabled: bool,
      table_param: &str,
@@ -2054,7 +2286,7 @@ index 909f50d..3f48539 100644
  ) -> Result<(), String> {
      let hid = cb.handle_id;
      let prefix = format!("tc{hid}");
-@@ -3016,6 +4352,7 @@ fn emit_triangle_callback_case(
+@@ -3016,6 +4720,7 @@
          ift_abi_v2,
          prim_data_enabled,
          table_param,
@@ -2062,7 +2294,7 @@ index 909f50d..3f48539 100644
      );
      let rty = cb.return_type.trim();
      s.push_str(&format!(
-@@ -3062,12 +4399,18 @@ fn emit_triangle_callback_case(
+@@ -3062,12 +4767,18 @@
              cb.llvm_symbol
          ));
      };
@@ -2081,7 +2313,7 @@ index 909f50d..3f48539 100644
           \x20 br i1 %{prefix}_stop, label %term_hit, label %proceed_hdr\n\n\
           tri_reject_{hid}:\n\
           \x20 br i1 %{prefix}_stop_cb, label %term_hit, label %proceed_hdr\n\n"
-@@ -3075,6 +4418,95 @@ fn emit_triangle_callback_case(
+@@ -3075,6 +4786,95 @@
      Ok(())
  }
  
@@ -2177,7 +2409,7 @@ index 909f50d..3f48539 100644
  fn emit_aabb_callback_case(
      s: &mut String,
      slot: u32,
-@@ -3085,6 +4517,7 @@ fn emit_aabb_callback_case(
+@@ -3085,6 +4885,7 @@
      ift_abi_v2: bool,
      prim_data_enabled: bool,
      table_param: &str,
@@ -2185,7 +2417,7 @@ index 909f50d..3f48539 100644
  ) -> Result<(), String> {
      let hid = cb.handle_id;
      let prefix = format!("ac{hid}");
-@@ -3101,6 +4534,7 @@ fn emit_aabb_callback_case(
+@@ -3101,6 +4902,7 @@
          ift_abi_v2,
          prim_data_enabled,
          table_param,
@@ -2193,7 +2425,7 @@ index 909f50d..3f48539 100644
      );
      let rty = cb.return_type.trim();
      s.push_str(&format!(
-@@ -3156,6 +4590,11 @@ fn emit_aabb_callback_case(
+@@ -3156,6 +4958,11 @@
          ));
      };
  
@@ -2205,7 +2437,7 @@ index 909f50d..3f48539 100644
      s.push_str(&format!(
          "  %{prefix}_ge_min = fcmp oge float {dist_val}, %{prefix}_tmin\n\
           \x20 %{prefix}_le_cur = fcmp ole float {dist_val}, %{prefix}_cur_t\n\
-@@ -3166,6 +4605,7 @@ fn emit_aabb_callback_case(
+@@ -3166,6 +4973,7 @@
           \x20 br i1 %{prefix}_valid, label %aabb_gen_{hid}, label %aabb_miss_{hid}\n\n\
           aabb_gen_{hid}:\n\
           \x20 call void @__m2v.rq.generate(i32 {slot}, float {dist_val})\n\

@@ -1454,6 +1454,17 @@ static inline rdna4rtr_ift_slot_mode_t rdna4rtr_ift_get_mode(const rdna4rtr_ift_
     return (rdna4rtr_ift_slot_mode_t)t->slots[index].mode;
 }
 
+static inline rdna4rtr_status_t rdna4rtr_ift_encode_slots(const rdna4rtr_ift_table_t *t,
+        uint32_t *dst, size_t capacity, uint32_t first, uint32_t count) {
+    if (!t || !dst || (t->slot_count && !t->slots)) return RDNA4RTR_ERR_INVALID;
+    size_t header = rdna4rtr_ift_header_words_for_abi(t->abi_version);
+    if (first > t->slot_count || count > t->slot_count - first ||
+        header > capacity || first > capacity - header || count > capacity - header - first)
+        return RDNA4RTR_ERR_BOUNDS;
+    for (uint32_t i = 0; i < count; ++i) dst[header + first + i] = t->slots[first + i].handle_id;
+    return RDNA4RTR_OK;
+}
+
 static inline rdna4rtr_status_t rdna4rtr_ift_encode(const rdna4rtr_ift_table_t *t,
                                                     uint32_t *dst_words,
                                                     size_t dst_word_cap,
