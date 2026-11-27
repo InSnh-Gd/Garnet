@@ -1681,14 +1681,17 @@ psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
         }
     }
 
-    // 4. Load MES firmware (CP_MES + CP_MES_DATA for uni_mes packaging).
+    // 4. Load MES firmware (SCHED pipe: CP_MES + CP_MES_DATA;
+    //    KIQ pipe: CP_MES_KIQ + MES_KIQ_STACK for uni_mes dual-pipe bringup).
     {
         struct MESBin {
             uint32_t fw_type;
             const char *name;
         } bins[] = {
-            { PSPGfxFwType::CP_MES,       "CP_MES" },
-            { PSPGfxFwType::CP_MES_DATA,  "CP_MES_DATA" },
+            { PSPGfxFwType::CP_MES,        "CP_MES" },
+            { PSPGfxFwType::CP_MES_DATA,   "CP_MES_DATA" },
+            { PSPGfxFwType::CP_MES_KIQ,    "CP_MES_KIQ" },
+            { PSPGfxFwType::MES_KIQ_STACK, "MES_KIQ_STACK" },
         };
 
         for (auto &bin : bins) {

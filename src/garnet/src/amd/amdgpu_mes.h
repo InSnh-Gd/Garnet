@@ -61,6 +61,7 @@
 #include "amdgpu_ip.h"
 #include "amdgpu_regs.h"
 #include "amdgpu_sysmem.h"
+#include "amdgpu_vram.h"
 // Provides CP_HQD_*/CP_MQD_*/GRBM_GFX_CNTL__* field macros and the
 // kCP_*_DEFAULT reset values (deviation 4).
 #include "amdgpu_gfx.h"
@@ -372,39 +373,42 @@ struct MESInstance {
     uint64_t  ring_wptr_gpu_addr { 0 };   // wb base + 0x40
     uint32_t  ring_size_dwords   { 0 };
     uint32_t  doorbell_index     { 0 };   // BAR2 doorbell slot for this ring
+
+    // Per-pipe SET_HW_RESOURCES & SET_HW_RESOURCES_1 backing allocations
+    // (mirrors upstream mes->sch_ctx_gpu_addr[pipe], query_status_fence_gpu_addr[pipe],
+    // resource_1_gpu_addr[pipe] in mes_v12_0.c).
+    SysMem         sch_ctx_mem        {};
+    SysMem         status_fence_mem   {};
+    uint64_t       sch_ctx_bus        { 0 };
+    uint64_t       status_fence_bus   { 0 };
+    VRAMAllocation resource_1_vram    {};
+    bool           resource_1_is_vram { false };
+    SysMem         resource_1_mem     {};
+    uint64_t       resource_1_bus     { 0 };
 };
 
 struct MESContext {
     MESInstance pipe[kMaxMESPipes];
     bool        sched_ucode_loaded { false };  // RS64_MES (76) seen via LoadFirmware
-    bool        kiq_ucode_loaded   { false };  // RS64_KIQ  (78) seen — N/A for uni
+    bool        kiq_ucode_loaded   { false };  // RS64_KIQ (78) / uni-MES KIQ pipe
     bool        uni_mes_active     { false };
 
-    // MES scheduler firmware version. Read from CP_MES_GP3_LO after
-    // mes_v12_0_queue_init by upstream (mes_v12_0.c:1506). Only the
-    // low 16 bits matter (AMDGPU_MES_VERSION_MASK = 0xffff). Used to
-    // gate SET_HW_RESOURCES_1: upstream sends that frame only when
-    // sched_version >= 0x4b (mes_v12_0_hw_init:1859).
+    // MES scheduler/KIQ firmware versions. Read from CP_MES_GP3_LO after
+    // mes_v12_0_queue_init by upstream (mes_v12_0.c:1870-1872). Only the
+    // low 12 bits matter (AMDGPU_MES_VERSION_MASK = 0xfff). Used to
+    // gate SET_HW_RESOURCES_1 (>= 0x4b) and oversubscription_timer (>= 0x8b).
     uint32_t  sched_version { 0 };
     uint32_t  kiq_version   { 0 };
-
-    // SET_HW_RESOURCES_1 cleaner-shader fence buffer. Allocated lazily
-    // by mes_set_hw_resources_1.  Matches mes->resource_1_gpu_addr in
-    // upstream (mes_v12_0.c:721).
-    SysMem    resource_1_mem {};
-    uint64_t  resource_1_bus { 0 };
-
-    // Lazy-allocated by mes_set_hw_resources on first call. Lifetime
-    // is tied to the MESContext (i.e. the driver instance).
-    SysMem    sch_ctx_mem       {};
-    SysMem    status_fence_mem  {};
-    uint64_t  sch_ctx_bus       { 0 };
-    uint64_t  status_fence_bus  { 0 };
 };
 
-constexpr uint32_t kMES_VERSION_MASK     = 0x0000FFFFu;
-constexpr uint32_t kMES_Resource1Bytes   = 4096;
+constexpr uint32_t kMES_VERSION_MASK                = 0x00000FFFu; // upstream AMDGPU_MES_VERSION_MASK
+constexpr uint32_t kMES_Resource1Bytes              = 4096;
 constexpr uint32_t kMES_HwResources1MinSchedVersion = 0x4b;
+constexpr uint32_t kMES_OversubTimerMinSchedVersion = 0x8bu;       // upstream 4e22a5fe6ea6
+
+constexpr uint32_t mes_oversubscription_timer(uint32_t sched_version) {
+    return ((sched_version & kMES_VERSION_MASK) < kMES_OversubTimerMinSchedVersion) ? 0u : 50u;
+}
 
 //------------------------------------------------------------------
 // Helper — GRBM_GFX_CNTL select. Mirrors soc21_grbm_select(adev,
@@ -436,12 +440,14 @@ mes_grbm_select(const DeviceContext &dev, uint32_t me, uint32_t pipe,
 // `gmc` is needed to bind the sysmem pages into GART (deviation 2);
 // gmc.inited must be true and gmc_init must have run.
 kern_return_t mes_alloc_storage(DeviceContext &dev, GMCContext &gmc,
-                                MESInstance &inst);
+                                MESInstance &inst,
+                                MESPipe pipe = MESPipe::Sched);
 
 // Release everything mes_alloc_storage / the lazy allocators took.
 // GART slots are bump-allocated and are NOT reclaimed (see
 // gmc_bind_existing) — the PTEs simply stop being referenced.
-void mes_release_storage(MESContext &mes);
+// Pass `gmc` when releasing a VRAM-backed resource_1 allocation.
+void mes_release_storage(MESContext &mes, GMCContext *gmc = nullptr);
 
 // CP_MES_CNTL enable/disable for uni_mes pipe 0. Writes
 // PRGRM_CNTR_START/_HI from inst.uc_start_addr (caller must have
@@ -679,8 +685,8 @@ static_assert(offsetof(MES_QuerySchedStatus, subopcode) == 4 &&
 //   bit 16  : use_add_queue_unmap_flag_addr
 //   bit 17  : enable_mes_sch_stb_log
 //   bit 18  : limit_single_process
-//   bit 19..20 : unmapped_doorbell_handling (2 bits) — upstream
-//                writes value 1 (basic version) per mes_v12_0.c:792
+//   bit 19..20 : unmapped_doorbell_handling (2 bits) — upstream 55596f696ae6
+//                writes value 2 (basic+) per mes_v12_0.c:1007
 //   bit 21  : enable_mes_fence_int
 //   bit 22  : enable_lr_compute_wa
 constexpr uint32_t kSetHwRsrcFlag_disable_reset                      = 1u <<  0;
@@ -688,7 +694,8 @@ constexpr uint32_t kSetHwRsrcFlag_use_different_vmid_compute         = 1u <<  1;
 constexpr uint32_t kSetHwRsrcFlag_disable_mes_log                    = 1u <<  2;
 constexpr uint32_t kSetHwRsrcFlag_enable_level_process_quantum_check = 1u <<  6;
 constexpr uint32_t kSetHwRsrcFlag_enable_reg_active_poll             = 1u << 10;
-constexpr uint32_t kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC   = 1u << 19;
+constexpr uint32_t kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC      = 1u << 19;
+constexpr uint32_t kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC_PLUS = 2u << 19;
 
 struct MES_AddQueue {
     MES_Header_Wire header;
@@ -881,10 +888,11 @@ constexpr uint32_t kResetFlag_reset_legacy_gfx = 1u << 3;
 // mes_v12_0_unmap_legacy_queue (mes_v12_0.c:762-766): remove_queue_after_reset is set only for a reset-time unmap and only from sched version 0x5a.
 constexpr uint32_t kMES_RemoveAfterResetMinVersion = 0x5au;
 
-// MES queue types (mirrors enum MES_QUEUE_TYPE).
+// MES queue types (mirrors enum MES_QUEUE_TYPE in mes_v12_api_def.h).
 constexpr uint32_t kMESQueueType_GFX     = 0;
 constexpr uint32_t kMESQueueType_COMPUTE = 1;
 constexpr uint32_t kMESQueueType_SDMA    = 2;
+constexpr uint32_t kMESQueueType_SCHQ    = 3;
 
 //------------------------------------------------------------------
 // Inputs for the high-level helpers.
@@ -942,6 +950,9 @@ kern_return_t mes_remove_hw_queue_flags(const DeviceContext &dev, MESContext &me
                                         uint32_t queue_type, uint32_t pipe_id,
                                         uint32_t queue_id, uint32_t doorbell_offset,
                                         uint32_t flags);
+// Unmap the uni-MES SCHED queue (pipe 0) through the KIQ pipe (pipe 1)
+// before halting MES during teardown (mirrors mes_v12_0_kiq_hw_fini).
+kern_return_t mes_unmap_sched_queue(const DeviceContext &dev, MESContext &mes);
 // 0.0.623 (G1): mes_v12_0_reset_hw_queue for a legacy (kernel) GFX queue: RESET { queue_type GFX, reset_legacy_gfx = 1, pipe_id_lp, queue_id_lp,
 // vmid_id_lp, mqd_mc_addr_lp, doorbell_offset_lp, wptr_addr_lp } on the SCHED pipe, bounded at 2 s by mes_submit_pkt. Sends nothing but the frame.
 kern_return_t mes_reset_legacy_gfx_queue(const DeviceContext &dev, MESContext &mes,

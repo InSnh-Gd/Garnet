@@ -36,6 +36,7 @@ kern_return_t doorbell_init(DeviceContext &dev, DoorbellState &db) {
         db.index.sdma_engine[3] = 0x11E;
         db.index.ih             = 6;
         db.index.mes_ring0      = 0x20;
+        db.index.mes_ring1      = 0x21;
         for (uint32_t i = 0; i < 5; i++) db.index.mes_aggregated[i] = 0x100 + i;
         db.index.max_assignment = 0x200;
     }

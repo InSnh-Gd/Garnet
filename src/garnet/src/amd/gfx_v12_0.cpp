@@ -1046,6 +1046,8 @@ gfx_build_gfx_mqd(uint32_t *mqd_cpu, const GFXMqdProps &p)
         v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BUFSZ, rb_bufsz);
         v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BLKSZ,
                           (rb_bufsz >= 2) ? (rb_bufsz - 2) : 0);
+        // Upstream 14741c01680a (gfx_v12_0.c:3063): mark kernel GFX queues.
+        v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, KMD_QUEUE, p.kernel_queue ? 1u : 0u);
         if (!p.kernel_queue) {
             v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_NON_PRIV, 1);
         }
