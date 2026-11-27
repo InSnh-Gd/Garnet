@@ -608,7 +608,7 @@ static void test_pool_and_batch_planner(void) {
 static void test_source_pins(const char *dir) {
     char *impl = slurp(dir, "garnet_sparse_io.m");
     char *hdr = slurp(dir, "garnet_metal_internal.h");
-    char *live = slurp(dir, "test-metal3-sparse-prt.m");
+    char *live = slurp(dir, "tests/test-metal3-sparse-prt.m");
     CHECK("source pins: read garnet_sparse_io.m, garnet_metal_internal.h, and test-metal3-sparse-prt.m",
           impl != NULL && hdr != NULL && live != NULL, "dir=%s", dir);
     if (impl && hdr) {

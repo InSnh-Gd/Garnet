@@ -4,7 +4,7 @@
 #   bundle 14 repair (queue 279, 6 of 8 failed): (1) the test's output buffer was 64 bytes, shorter than a scratch path under $TMPDIR (/var/folders/...), so the helper returned 0 silently before it did anything - it is 512 now (the production buffer, char sub[64] for /tmp/rdna4m/<uid>, is not affected); (2) macOS 27 `ls -le` prints the nobody ACL entry as its UUID, not as user:nobody - both spellings are accepted.
 #   usage: test-dumpdir.sh   (RDNA4_TEST_TMP = parent of the scratch dir, default $TMPDIR, else /private/tmp)
 set -u
-D="$(cd "$(dirname "$0")" && pwd)"
+D="$(cd "$(dirname "$0")/.." && pwd)"
 W=$(mktemp -d "${RDNA4_TEST_TMP:-${TMPDIR:-/private/tmp}}/rdna4dumpdir.XXXXXX") || exit 2; W=${W:A}
 case "$W" in */rdna4dumpdir.??????) ;; *) echo "unexpected scratch dir '$W'"; exit 2;; esac
 trap 'case "$W" in */rdna4dumpdir.??????) [ -d "$W" ] && rm -rf -- "$W";; esac' EXIT

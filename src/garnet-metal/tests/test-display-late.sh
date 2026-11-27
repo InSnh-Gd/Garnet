@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 test_dir=$(cd -- "$(dirname -- "$0")" && pwd)
-source_dir=${1:-$test_dir}
+source_dir=${1:-$(cd -- "$test_dir/.." && pwd)}
 out=${2:-$(mktemp -d "${TMPDIR:-/tmp}/rdna4-display-late.XXXXXX")}
 mkdir -p "$out"
-python3 "$test_dir/assemble-device.py" "$source_dir/GarnetDevice.m" --output "$out/device.m"
+python3 "$source_dir/assemble-device.py" "$source_dir/GarnetDevice.m" --output "$out/device.m"
 python3 - "$out" <<'PY'
 from pathlib import Path
 import hashlib

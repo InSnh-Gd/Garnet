@@ -55,6 +55,7 @@ int main(void) {
     // cost of one full check (3 samples) on this host, cached memory
     uint64_t t0 = now_ns(); for (int i = 0; i < 100; i++) { rdna4crc_sample(&s1, a, pitch, rb, H, 64, scr); } uint64_t t1 = now_ns();
     printf("info: one 23-row sample (235 KB) on the host: %.1f us\n", (t1 - t0) / 100 / 1000.0);
+    free(p); free(scr); free(b); free(a);
     printf(fails ? "FAILED %d\n" : "PASS\n", fails);
     return fails != 0;
 }

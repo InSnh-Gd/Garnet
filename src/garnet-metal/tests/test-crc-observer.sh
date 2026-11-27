@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 test_dir=$(cd "$(dirname "$0")" && pwd)
-source_dir=${1:-$test_dir}
+source_dir=${1:-$(cd "$test_dir/.." && pwd)}
 out=${2:?Expected source directory and output directory}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
