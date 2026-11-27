@@ -375,13 +375,18 @@ void n1c_close(const N1cRef &ref, const char *how) {
     if (!leak && !own_wait(s)) leak = true;            // a timeout here latched the hang (switch ON: or left this slot's work unproven)
     const bool ownIdle = !leak;
     uint32_t nBos = 0, nHost = 0; uint64_t vramB = 0, gttB = 0, hostB = 0;
+    bool hadVisDcc = false;
     for (uint32_t h = 1; h < RDNA4N_MAX_BOS; h++) {
         if (!s->boUsed[h]) continue;
         nBos++;
         if (s->bo[h].kind == kBoGtt) gttB += s->bo[h].size;
         else if (s->bo[h].kind == kBoHost) { hostB += s->bo[h].size; nHost++; }   // 0.0.612
-        else vramB += s->bo[h].size;
+        else {
+            vramB += s->bo[h].size;
+            if (rdna4native::s1c::bo_needs_free_gl2_inv(s->bo[h].kind == kBoVis, s->bo[h].dcc)) hadVisDcc = true;
+        }
     }
+    if (!leak && hadVisDcc && bo_gpu_gl2_inv(s) != kOk) leak = true;
     const uint64_t seqs = s->emitted;
     const uint32_t ptPages = s->ptPages;
     IOLockLock(gCliLock);

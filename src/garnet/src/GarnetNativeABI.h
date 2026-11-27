@@ -219,7 +219,7 @@ struct rdna4n_info {                 /* 192 B */
 #define RDNA4N_INFO_NATIVE_BOOT   (1u << 2)
 #define RDNA4N_INFO_BUFFER_OPS    (1u << 3)
 #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
-#define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (opt-in: garnet-dcc=1) */
+#define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
 #define RDNA4N_CAP_ASYNC_COMPUTE  (1u << 6)   /* Dedicated MEC async compute ring (RDNA4N_HW_IP_COMPUTE, seqno bit 62 tag; kill-switch: garnet-async-compute=0) */
 /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)

@@ -255,14 +255,19 @@ IOReturn n1c_bo_create(const N1cRef &ref, const rdna4n_gem_create_in *in, uint64
             }
             if (got) {
                 b.kind = kBoVis; b.a = a; b.mc = a.gpu_va;
-                bar0_memset_vram(dev, a.gpu_va - gCtx->gmc.vram_start, 0, a.size);
-                amdgpu_hdp_flush(dev);
-                placed = RDNA4N_GEM_DOMAIN_VRAM; bits = (b.dcc ? 0u : RDNA4N_PLACED_CPU_MAPPABLE) | RDNA4N_PLACED_ZEROED;
+                const bool bar0Zero = rdna4native::s1c::bo_needs_bar0_zero(true, b.dcc);
+                if (bar0Zero) {
+                    bar0_memset_vram(dev, a.gpu_va - gCtx->gmc.vram_start, 0, a.size);
+                    amdgpu_hdp_flush(dev);
+                }
+                b.needsGpuClear = rdna4native::s1c::bo_needs_gpu_clear(true, b.dcc) ? 1u : 0u;
+                placed = RDNA4N_GEM_DOMAIN_VRAM; bits = (b.dcc ? 0u : RDNA4N_PLACED_CPU_MAPPABLE) | (bar0Zero ? RDNA4N_PLACED_ZEROED : 0u);
                 if (rdna4native::g4::appvis_counts(appsNow, s->ws, true)) { b.visCounted = 1u; gVisOthers += p.size; }
             } else if (hiDone || (p.hiOk && gCtx->gmc.vram_alloc_hi.is_inited() &&
                                   ((hugeAlign > p.align && gCtx->gmc.vram_alloc_hi.alloc(p.size, hugeAlign, &a)) ||
                                    gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a)))) {
                 b.kind = kBoHi; b.a = a; b.mc = a.gpu_va;
+                b.needsGpuClear = rdna4native::s1c::bo_needs_gpu_clear(false, b.dcc) ? 1u : 0u;
                 placed = RDNA4N_GEM_DOMAIN_VRAM; bits = RDNA4N_PLACED_HI_POOL;
             } else { rc = kIOReturnNoMemory; break; }
             if (multi && !s->ws) { b.budgeted = 1u; gVramOthers += p.size; }
@@ -420,6 +425,10 @@ IOReturn n1c_bo_free(const N1cRef &ref, uint64_t handle) {
                 // as they were) and the caller gets Timeout. Its close frees it after its own work retired.
                 N1C_LOG("BoFree: slot %u BO %u: own work not retired within 2 s while the GPU is progressing: Timeout, the BO is kept (no blame)", s->slot, h);
             } else {
+                if (m == kRelNormal && rdna4native::s1c::bo_needs_free_gl2_inv(b0.kind == kBoVis, b0.dcc)) {
+                    const uint32_t irc = bo_gpu_gl2_inv(s);
+                    if (irc != kOk) { m = kRelLeak; rc = (IOReturn)irc; }
+                }
                 IOLockLock(gCliLock);
                 bo_release(s, h, m);
                 IOLockUnlock(gCliLock);
@@ -772,6 +781,11 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             amdgpu_hdp_flush(*gCtx->dev);
             const uint32_t f = session_pt_flush(s);      // synchronous when bound; otherwise recorded in tlbSeq
             if (f != kOk) rc = (IOReturn)f;
+            else if (!prt && bp->needsGpuClear != 0u && (in->flags & RDNA4N_VM_PAGE_WRITEABLE) != 0u) {
+                const uint32_t c = bo_gpu_clear_va(s, vaCanon, in->map_size);
+                if (c != kOk) rc = (IOReturn)c;
+                else rdna4native::s1c::bo_gpu_clear_advance(bp->needsGpuClear, bp->clearedBytes, bp->size, in->offset_in_bo, in->map_size);
+            }
         } else if (in->operation == RDNA4N_VA_OP_REPLACE) {
             const VaRangePlan plan = va_range_plan(s->maps, kMaxMaps, q.stripped, in->map_size);
             if (!va_replace_fits(plan)) { rc = kIOReturnNoResources; break; }
@@ -805,6 +819,11 @@ IOReturn n1c_gem_va(const N1cRef &ref, const rdna4n_gem_va *in) {
             amdgpu_hdp_flush(*gCtx->dev);
             const uint32_t f = session_pt_flush(s);
             if (f != kOk) rc = (IOReturn)f;
+            else if (!prt && bp->needsGpuClear != 0u && (in->flags & RDNA4N_VM_PAGE_WRITEABLE) != 0u) {
+                const uint32_t c = bo_gpu_clear_va(s, vaCanon, in->map_size);
+                if (c != kOk) rc = (IOReturn)c;
+                else rdna4native::s1c::bo_gpu_clear_advance(bp->needsGpuClear, bp->clearedBytes, bp->size, in->offset_in_bo, in->map_size);
+            }
         } else if (in->operation == RDNA4N_VA_OP_CLEAR) {
             const VaRangePlan plan = va_range_plan(s->maps, kMaxMaps, q.stripped, in->map_size);
             if (!va_clear_fits(plan)) { rc = kIOReturnNoResources; break; }

@@ -743,10 +743,31 @@ static void u12_pins(const std::string &root) {
 }
 
 static void u14_gfx12_dcc() {
-    expect(!dcc_boot_enabled(false, 0u), "absent garnet-dcc defaults OFF");
-    expect(!dcc_boot_enabled(false, 1u), "absent garnet-dcc ignores stale val and defaults OFF");
+    expect(dcc_boot_enabled(false, 0u), "absent garnet-dcc defaults ON");
+    expect(dcc_boot_enabled(false, 1u), "absent garnet-dcc ignores stale val and defaults ON");
     expect(dcc_boot_enabled(true, 1u), "garnet-dcc=1 enables DCC");
     expect(!dcc_boot_enabled(true, 0u), "garnet-dcc=0 disables DCC");
+
+    // Scheme B + reverse-reuse policy: BAR0 zero only for visible non-DCC BOs; GPU CP_DMA clear for DCC BOs and hi-pool BOs;
+    // ReBAR visible DCC BOs run GL2 WB/INV before recycling into vram_alloc.
+    expect(bo_needs_bar0_zero(true, false) && !bo_needs_gpu_clear(true, false) && !bo_needs_free_gl2_inv(true, false),
+           "visible non-DCC BO uses BAR0 zero only");
+    expect(!bo_needs_bar0_zero(true, true) && bo_needs_gpu_clear(true, true) && bo_needs_free_gl2_inv(true, true),
+           "visible DCC BO (ReBAR) skips BAR0 zero, uses GPU CP_DMA clear, and runs GL2 inv on free");
+    expect(!bo_needs_bar0_zero(false, true) && bo_needs_gpu_clear(false, true) && !bo_needs_free_gl2_inv(false, true),
+           "hi-pool DCC BO uses GPU CP_DMA clear");
+    expect(!bo_needs_bar0_zero(false, false) && bo_needs_gpu_clear(false, false) && !bo_needs_free_gl2_inv(false, false),
+           "hi-pool non-DCC BO uses GPU CP_DMA clear for DCC->non-DCC reverse reuse");
+
+    uint8_t needs = 1u; uint64_t cleared = 0ull;
+    bo_gpu_clear_advance(needs, cleared, 0x20000ull, 0x10000ull, 0x10000ull);
+    expect(needs == 1u && cleared == 0ull, "non-zero-start partial map keeps needsGpuClear=1");
+    bo_gpu_clear_advance(needs, cleared, 0x20000ull, 0ull, 0x10000ull);
+    expect(needs == 1u && cleared == 0x10000ull, "first half map advances clearedBytes prefix");
+    bo_gpu_clear_advance(needs, cleared, 0x20000ull, 0x10000ull, 0x10000ull);
+    expect(needs == 0u && cleared == 0x20000ull, "full coverage clears needsGpuClear");
+    bo_gpu_clear_advance(needs, cleared, 0x20000ull, 0ull, 0x10000ull);
+    expect(needs == 0u && cleared == 0x20000ull, "already cleared BO is idempotent");
 
     const Place pDcc = place_decide(0x10000, 0x1000, RDNA4N_GEM_DOMAIN_VRAM, RDNA4N_GEM_NO_CPU_ACCESS | RDNA4N_GEM_GFX12_DCC);
     expect(pDcc.rc == kOk && pDcc.kind == kPlaceVis && pDcc.hiOk && pDcc.dcc, "VRAM NO_CPU_ACCESS + GFX12_DCC enables Place::dcc");

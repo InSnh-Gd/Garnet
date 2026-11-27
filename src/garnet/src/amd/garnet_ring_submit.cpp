@@ -26,7 +26,7 @@ static volatile uint64_t gIrqEpoch;
 static uint8_t gIrqEvent;
 static volatile UInt32 gIrqWaitLatch = rdna4native::irqwait::kLatchUnset;
 static volatile uint64_t gIrqWaitSleeps, gIrqWaitWakes;
-static volatile UInt32 gDccLatch;   // 0 = unset, 1 = OFF (default), 2 = ON (garnet-dcc=1)
+static volatile UInt32 gDccLatch;   // 0 = unset, 1 = OFF (garnet-dcc=0), 2 = ON (default)
 static volatile UInt32 gHugeLatch;  // 0 = unset, 1 = OFF (garnet-hugepage=0), 2 = ON (default)
 static volatile UInt32 gAsyncComputeLatch; // 0 = unset, 1 = OFF (garnet-async-compute=0), 2 = ON (default)
 
@@ -38,7 +38,7 @@ bool dcc_on() {
         const bool en = rdna4native::s1c::dcc_boot_enabled(present, v);
         if (OSCompareAndSwap(0u, en ? 2u : 1u, &gDccLatch)) {
             N1C_LOG("boot-arg garnet-dcc %s: GFX12 PTE.DCC is %s",
-                    present ? (v == 0u ? "=0" : "nonzero") : "absent (default OFF)",
+                    present ? (v == 0u ? "=0" : "nonzero") : "absent (default ON)",
                     en ? "ENABLED" : "DISABLED");
         }
         l = gDccLatch;
