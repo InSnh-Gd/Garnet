@@ -6,7 +6,7 @@
 //!   <sha>.clang.ll       the LLVM text `rdna4-llvm-dis` printed for the AIR
 //!   ref/<sha>.spv        the daemon's output (pc-translate.py + command-line tool + always-pass validator)
 //!   ref/<sha>.meta.json  the daemon's trimmed meta
-//! and the daemon's override table (`RDNA4X_OVERRIDES`, autotranslate/overrides.txt).
+//! and the override table (`RDNA4X_OVERRIDES`, fixtures/xlate-overrides.txt).
 //! A sha with no ref/<sha>.spv is one the daemon refused: the in-process translation must refuse it too.
 //! Without RDNA4X_CORPUS the tests print that they did nothing and pass; the bundle's driver script always sets it.
 use std::collections::HashMap;

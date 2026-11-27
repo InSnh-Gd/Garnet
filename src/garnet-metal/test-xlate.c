@@ -1,5 +1,5 @@
 // test-xlate.c: garnet_xlate.h (bundle 14, in-process shader translation; an internal design note section 1) on the host, plus source pins that tie the REAL GarnetDevice.m to it.
-// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h, default "."; argv[2] = autotranslate/overrides.txt, default ../../tools/native/autotranslate/overrides.txt):
+// Build/run on the host Mac (from this directory; argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h, default "."; argv[2] = xlate overrides file, default fixtures/xlate-overrides.txt):
 //   cc -O1 -Wall -Wextra -Werror -DRDNA4X_TESTHOOKS -o /tmp/test-xlate test-xlate.c && /tmp/test-xlate .
 // test-b14-plant.sh plants breaks in the REAL garnet_xlate.h, GarnetDevice.m and the fork's Rust and demands that this suite (or the fork's cargo tests) FAIL on each.
 // Covers:
@@ -114,7 +114,7 @@ static void *probe_stack(void *a) { (void)a; seen_stack = pthread_get_stacksize_
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
-    char ovrPath[1024]; snprintf(ovrPath, sizeof ovrPath, "%s", argc > 2 ? argv[2] : "../../tools/native/autotranslate/overrides.txt");
+    char ovrPath[1024]; snprintf(ovrPath, sizeof ovrPath, "%s", argc > 2 ? argv[2] : "fixtures/xlate-overrides.txt");
     {   // scratch root: under $TMPDIR (or /private/tmp)
         const char *base = getenv("RDNA4_TEST_TMP"); if (!base) base = getenv("TMPDIR"); if (!base || !*base) base = "/private/tmp";
         snprintf(TMP, sizeof TMP, "%s/rdna4xlate-test.XXXXXX", base);
