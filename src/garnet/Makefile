@@ -40,7 +40,7 @@ CC  ?= clang
 CXX_SRCS := src/GarnetDriver.cpp src/GarnetDriverStages.cpp src/GarnetDisplayGate.cpp \
             src/GarnetPrimaryFramebuffer.cpp src/GarnetUserClient.cpp \
             src/GarnetNativeClient.cpp src/GarnetMetalNub.cpp \
-            src/GarnetDisplayNub.cpp src/ipdiscovery.cpp src/psp.cpp \
+            src/GarnetDisplayNub.cpp src/webkit_mmap_hook.cpp src/ipdiscovery.cpp src/psp.cpp \
             $(wildcard src/amd/*.cpp) $(wildcard src/dcn/*.cpp)
 # Generated firmware belongs to this build, so concurrent chip builds cannot reuse stale stubs.
 FW_GEN   := $(BUILD)/firmware
