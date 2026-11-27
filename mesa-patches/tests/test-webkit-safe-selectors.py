@@ -231,8 +231,8 @@ struct drm_amdgpu_cs_chunk_syncobj { uint32_t handle, flags; uint64_t point; };
 
 
 def main() -> int:
-    repo = pathlib.Path(__file__).resolve().parent.parent
-    out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else repo / "temp/scratch/webkit-sel-test"
+    repo = pathlib.Path(__file__).resolve().parent.parent.parent
+    out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "webkit-sel-test"
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)

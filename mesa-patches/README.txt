@@ -72,7 +72,7 @@ ABI <= 1.13 kernels remain compatible with automatic fallback to legacy selector
 
 0032: use IDSet for interference tracking in aco_spill.cpp (`0032-aco-spill-use-idset-for-interferences.patch`), cutting peak host memory by ~7x to 14x when compiling large MetalRT / Blender Cycles megakernels without OOM.
 
-0033: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.14 (reserving selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 ABI 1.15; adding WebKit-silent APP aliases 30/31/39 for BOCREATE/BO_IMPORT_HOST/BUFFER_COPY and info flags bits 8..10); route RADV's GarnetAccelerator connection through selectors 30/31/39 on ABI >= 1.14 kernels with automatic fallback to 3/21/27 on ABI <= 1.13 kernels and on the GarnetDriver route. Verified by `python3 mesa-patches/test-webkit-safe-selectors.py "$TMPDIR/webkit-sel-test"`.
+0033: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.14 (reserving selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 ABI 1.15; adding WebKit-silent APP aliases 30/31/39 for BOCREATE/BO_IMPORT_HOST/BUFFER_COPY and info flags bits 8..10); route RADV's GarnetAccelerator connection through selectors 30/31/39 on ABI >= 1.14 kernels with automatic fallback to 3/21/27 on ABI <= 1.13 kernels and on the GarnetDriver route. Verified by `python3 mesa-patches/tests/test-webkit-safe-selectors.py "$TMPDIR/webkit-sel-test"`.
 
 Active RADV Darwin tests live under `mesa-patches/tests/`:
     - Host runtime / submit / dual-ring sync / kernel Submit contract:

@@ -10,6 +10,7 @@ CFLAGS := -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O1 -g \
 LDFLAGS := -lm -ldl -lpthread
 
 NOARG_TESTS := \
+  test-argscan-incremental \
   test-argument-capacity \
   test-argument-limit-snapshot \
   test-argument-public-sampler \
@@ -23,6 +24,7 @@ NOARG_TESTS := \
   test-dispflip \
   test-dynlib-vft \
   test-gather-caps \
+  test-heap-alloc \
   test-host-display \
   test-host-memory \
   test-host-runtime \
@@ -32,6 +34,8 @@ NOARG_TESTS := \
   test-null-remap \
   test-null-shape \
   test-rt-accel \
+  test-rt-curves \
+  test-rt-motion \
   test-rt-runtime \
   test-sparse-metal \
   test-swizzle-placement
@@ -40,7 +44,9 @@ SRCDIR_TESTS := \
   test-fencewait \
   test-gate \
   test-gpl \
-  test-vkpool
+  test-pipeline-fallback \
+  test-vkpool \
+  test-xlate-fallback
 
 ASSEMBLED_TESTS := \
   test-cienv \

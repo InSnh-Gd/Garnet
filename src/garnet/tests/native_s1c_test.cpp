@@ -692,7 +692,7 @@ static void u12_pins(const std::string &root) {
     expect(eng.find("if (hung_now()) m = kRelLeak;") != std::string::npos && fn_body(eng, "IOReturn n1c_bo_free(").find("bo_release(s, h, m);") != std::string::npos, "BoFree under HUNG leaks and succeeds");
     // client: exact shapes, nothing inline-refusable slips through
     expect(cli.find("args->structureInputDescriptor != nullptr || args->structureOutputDescriptor != nullptr") != std::string::npos, "out-of-line structs are refused");
-    expect_u("the client dispatches 29 selectors including bounded copy/fill", count_of(cli, "case RDNA4N_SEL_"), 29);
+    expect_u("the client dispatches 32 selectors including bounded copy/fill and WebKit-safe APP aliases", count_of(cli, "case RDNA4N_SEL_"), 32);
     expect(cli.find("return kIOReturnBadArgument;   // an unknown selector") != std::string::npos && cli.find("super::externalMethod") == std::string::npos, "an unknown selector never falls through to IOUserClient");
     expect(cli.find("kIOClientPrivilegeAdministrator") != std::string::npos, "root only");
     expect(cli.find("if (opened) { rdna4disp_on_ws_client_closed(wsSession); amdgpu::n1c_unmap_for_close(amdgpu::N1cRef{ sessSlot, sessId }, this); amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, \"clientClose\")") != std::string::npos && cli.find("amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, \"stop\")") != std::string::npos, "close runs from clientClose and stop, with this client's session");
