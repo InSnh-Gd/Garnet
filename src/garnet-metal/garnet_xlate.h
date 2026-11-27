@@ -91,7 +91,7 @@ static inline int rdna4x_killed_from_stat(int statRc, int err) { return rdna4g_k
 static inline int rdna4x_skip_side_dir(int isWs, int sandboxed) { return !isWs && sandboxed; }
 
 // ======================================================================================================================================================================
-// 2. The --local override table (matches autotranslate/overrides.txt; test-xlate.c compares them)
+// 2. The --local override table (matches fixtures/xlate-overrides.txt; test-xlate.c compares them)
 // ======================================================================================================================================================================
 typedef struct { const char *name; uint32_t xyz[3]; } rdna4x_override;
 static const rdna4x_override rdna4x_overrides[] = {

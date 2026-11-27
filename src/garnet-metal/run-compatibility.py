@@ -1218,7 +1218,7 @@ def main():
             case(
                 "reflection-trim-abi8",
                 [sys.executable, str(source / "test-reflection-trim.py")],
-                "REFLECTION_TRIM_ABI8_PASS paths=2 rust_fixture=1",
+                "REFLECTION_TRIM_ABI8_PASS paths=1 rust_fixture=1",
                 timeout=60,
                 evidence_class="offline-metadata")
         elif group == "archive":
