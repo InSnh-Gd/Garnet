@@ -130,6 +130,7 @@ public enum SystemDiskInstaller {
         "/Library/Extensions/Navi48FB.kext",
         "/Library/GPUBundles/RDNA4Metal.bundle",
         "/Library/GPUBundles/Navi48Metal.bundle",
+        "/Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle",
         "/Library/LaunchDaemons/com.rdna4.native.plist",
         "/Library/LaunchDaemons/com.rdna4.native-translate.plist",
         "/Library/LaunchDaemons/com.navi48.native.plist",

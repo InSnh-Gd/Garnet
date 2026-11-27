@@ -979,6 +979,9 @@ struct GarnetCoreTestsRunner {
         // Create a foreign kext & garnettest binary in sysRoot
         let foreignPath = "/Library/Extensions/VirtualSMC.kext"
         try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/Extensions/VirtualSMC.kext"), withIntermediateDirectories: true)
+        let legacyMtlBundleURL = sysRoot.appendingPathComponent("Library/GPUBundles/AMDRadeonRDNA4MTLDriver.bundle")
+        try fm.createDirectory(at: legacyMtlBundleURL.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+        try Data("legacy-0.1.0".utf8).write(to: legacyMtlBundleURL.appendingPathComponent("Contents/Info.plist"))
         mock.foreignAuxKexts = [("as.vit9696.VirtualSMC", foreignPath)]
         try fm.createDirectory(at: sysRoot.appendingPathComponent("Library/KernelCollections"), withIntermediateDirectories: true)
         try Data("preexisting-aux".utf8).write(to: sysRoot.appendingPathComponent("Library/KernelCollections/AuxiliaryKernelExtensions.kc"))
@@ -1024,6 +1027,7 @@ struct GarnetCoreTestsRunner {
         check("GarnetPCIBarCompat.kext NEVER placed in /Library/Extensions", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/GarnetPCIBarCompat.kext").path))
         check("Vulkan ICD omitted by default", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Vulkan/icd.d/radeon_icd.x86_64.json").path))
         check("GarnetMetal.bundle extracted", fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib").path))
+        check("Legacy 0.1.0 AMDRadeonRDNA4MTLDriver.bundle retired", !fm.fileExists(atPath: legacyMtlBundleURL.path))
 
         // Denylist persistence + upgrade test
         let mockApp = tempRoot.appendingPathComponent("MockHeavyApp.app")
