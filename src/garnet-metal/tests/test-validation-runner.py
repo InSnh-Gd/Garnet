@@ -22,7 +22,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def test_device_assembly_preserves_source_extraction_contract(self):
-        source = Path(__file__).parent
+        source = Path(__file__).resolve().parent.parent
         spec = importlib.util.spec_from_file_location(
             "device_assembly", source / "assemble-device.py")
         assembly = importlib.util.module_from_spec(spec)
@@ -271,8 +271,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(runtime_build[runtime_build.index("-x") + 1], "c")
             metadata = json.loads((output / "metadata.json").read_text())
             self.assertIn(".c", {Path(name).suffix for name in metadata["source_sha256"]})
-            fixture = Path(runner.__file__).parent / "fixtures/null-shapes-abi9.spv"
-            self.assertEqual(metadata["fixture_sha256"]["fixtures/null-shapes-abi9.spv"],
+            fixture = Path(runner.__file__).parent / "fixtures/null-shapes-abi9.spvasm"
+            self.assertEqual(metadata["fixture_sha256"]["fixtures/null-shapes-abi9.spvasm"],
                              hashlib.sha256(fixture.read_bytes()).hexdigest())
 
     def test_sampling_limits_require_a_usable_queried_bound_before_platform_access(self):

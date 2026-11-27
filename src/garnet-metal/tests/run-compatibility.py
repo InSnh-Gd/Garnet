@@ -412,7 +412,8 @@ def main():
         parser.error("requested mode does not match the machine")
     if args.mode == "live" and os.environ.get("RADV_DARWIN_MOCK", "0") != "0":
         parser.error("live mode refuses RADV_DARWIN_MOCK")
-    source = Path(__file__).resolve().parent
+    tests_dir = Path(__file__).resolve().parent
+    source = tests_dir.parent
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     bundle = args.bundle.resolve(strict=True)
@@ -429,10 +430,11 @@ def main():
             "selected_cases": tier2_selection.case_ids if tier2_selection else [],
         },
         "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                          for p in source.iterdir() if p.suffix in (".m", ".c", ".h", ".inc", ".py")},
+                          for directory in (source, tests_dir)
+                          for p in directory.iterdir() if p.suffix in (".m", ".c", ".h", ".inc", ".py")},
         "fixture_sha256": {
-            str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in (source / "fixtures").rglob("*") if p.is_file()
+            str(p.relative_to(tests_dir)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in (tests_dir / "fixtures").rglob("*") if p.is_file()
         },
         "bundle_sha256": {str(p.relative_to(bundle)): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in bundle.rglob("*") if p.is_file()},
@@ -483,7 +485,8 @@ def main():
         if name in build_cache:
             return build_cache[name]
         executable = out / name
-        command = common + list(extra) + [str(source / (name + ".m")), "-o", str(executable)]
+        command = common + ["-I", str(source), "-I", str(tests_dir)] + list(extra) + [
+            str(tests_dir / (name + ".m")), "-o", str(executable)]
         # A successful compiler has no required stdout marker.
         if not run_case(out, "build-" + name, command, "", env=env, build=True,
                         evidence_class="compile-only"):
@@ -495,8 +498,8 @@ def main():
         executable = out / name
         command = ["/usr/bin/clang", "-arch", "x86_64", "-std=c11",
                    "-Wall", "-Wextra", "-Werror", "-I", str(source),
-                   "-I", str(include)] + list(extra) + [
-                       str(source / (name + suffix)), "-o", str(executable)]
+                   "-I", str(tests_dir), "-I", str(include)] + list(extra) + [
+                       str(tests_dir / (name + suffix)), "-o", str(executable)]
         if not run_case(out, "build-" + name, command, "", env=env,
                         build=True, evidence_class="compile-only"):
             raise RuntimeError("compilation failed: " + name)
@@ -518,8 +521,8 @@ def main():
                 required=("simulated_vulkan=1", "gpu_execution=0"))
             state = out / "test-sampler-state"
             state_build = ["/usr/bin/clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                           "-I", str(source), "-I", str(include),
-                           str(source / "test-sampler-state.c"), "-o", str(state)]
+                           "-I", str(source), "-I", str(tests_dir), "-I", str(include),
+                           str(tests_dir / "test-sampler-state.c"), "-o", str(state)]
             if not run_case(
                     out, "build-sampler-state", state_build, "", env=env,
                     build=True, evidence_class="compile-only"):
@@ -559,8 +562,8 @@ def main():
             coordinate_state = out / "test-sampler-coordinate-state"
             coordinate_state_build = [
                 "/usr/bin/clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                "-I", str(source), "-I", str(include),
-                str(source / "test-sampler-coordinate-state.c"),
+                "-I", str(source), "-I", str(tests_dir), "-I", str(include),
+                str(tests_dir / "test-sampler-coordinate-state.c"),
                 "-o", str(coordinate_state)]
             if not run_case(
                     out, "build-sampler-coordinate-state",
@@ -726,9 +729,9 @@ def main():
                 ))
             oracle = out / "test-sampler-binding-state-oracle"
             oracle_build = common + [
-                "-I", str(include), "-fblocks", "-O1",
+                "-I", str(source), "-I", str(tests_dir), "-I", str(include), "-fblocks", "-O1",
                 "-DRDNA4_SAMPLER_BINDING_ORACLE_ONLY",
-                str(source / "test-sampler-binding-state.m"),
+                str(tests_dir / "test-sampler-binding-state.m"),
                 "-o", str(oracle),
             ]
             if not run_case(
@@ -1027,7 +1030,7 @@ def main():
             exe = build_c("test-" + group)
             command = [exe]
             if group == "null-shape-reflection":
-                command.extend(str(source / "fixtures" / (name + ".spv"))
+                command.extend(str(tests_dir / "fixtures" / (name + ".spv"))
                                for name in ("null-shapes-abi9", "null-shapes-invalid"))
             case(group, command, group.upper().replace("-", "_") + "_PASS",
                  evidence_class=("offline-metadata" if group == "null-shape-reflection"
@@ -1217,7 +1220,7 @@ def main():
         elif group == "reflection-trim":
             case(
                 "reflection-trim-abi8",
-                [sys.executable, str(source / "test-reflection-trim.py")],
+                [sys.executable, str(tests_dir / "test-reflection-trim.py")],
                 "REFLECTION_TRIM_ABI8_PASS paths=1 rust_fixture=1",
                 timeout=60,
                 evidence_class="offline-metadata")
@@ -1378,9 +1381,10 @@ def main():
                              timeout=120, capture=True, evidence_class="capture-only")
         elif group == "reflection":
             audit = out / "librdna4featureaudit.dylib"
-            command = common + ["-I", str(include), "-DRDNA4_FEATURE_AUDIT", "-dynamiclib",
+            command = common + ["-I", str(source), "-I", str(tests_dir), "-I", str(include),
+                                "-DRDNA4_FEATURE_AUDIT", "-dynamiclib",
                                 "-install_name", "@rpath/librdna4featureaudit.dylib",
-                                str(source / "test-system-pipelines.m"), "-o", str(audit)]
+                                str(tests_dir / "test-system-pipelines.m"), "-o", str(audit)]
             if not run_case(
                     out, "build-reflection-audit", command, "", env=env,
                     build=True, evidence_class="compile-only"):
@@ -1393,7 +1397,7 @@ def main():
             case("stitching-reference", [exe, "--reference"], "STITCHING_LIBRARY_PASS AIR=")
             case("stitching-bundle", [exe, str(bundle)], "STITCHING_LINKED_ACCESSOR_PASS arguments result=returned")
             exe = build("test-stitch-reflection")
-            case("stitch-reflection", [exe, str(source / "fixtures/stitch-reflection")], "STITCH_PASS cases=")
+            case("stitch-reflection", [exe, str(tests_dir / "fixtures/stitch-reflection")], "STITCH_PASS cases=")
         elif group == "renderbox":
             exe = build("test-renderbox", ["-framework", "CoreGraphics"])
             case("renderbox-reference", [exe, "--reference"], "RENDERBOX_PASS")

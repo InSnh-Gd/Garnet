@@ -2,13 +2,13 @@
 import re
 from pathlib import Path
 
-root = Path(__file__).parent
+root = Path(__file__).resolve().parent.parent
 blit = (root / "garnet_commands.m").read_text()
 compute = (root / "garnet_commands.m").read_text()
 render = (root / "garnet_commands.m").read_text()
 queue = (root / "garnet_commands.m").read_text()
 command_buffer = (root / "garnet_commands.m").read_text()
-runtime_test = (root / "test-nocopy-readonly.m").read_text()
+runtime_test = Path(__file__).with_name("test-nocopy-readonly.m").read_text()
 
 compute_rejection = compute[compute.index("if (rdna4nc_stage_writes("):].split("return;", 1)[0]
 render_rejection = render[render.index("if (roV || roF)"):].split("return NO;", 1)[0]

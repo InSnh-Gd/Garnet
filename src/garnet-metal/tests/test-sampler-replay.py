@@ -20,7 +20,7 @@ def main():
     parser.add_argument("vulkan", type=Path)
     parser.add_argument("replay", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2] /
+    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[3] /
                         "third-party/metal2vulkan-rdna4/garnetxlate/tests/fixtures/abi8/sampler-mixed.ll")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)

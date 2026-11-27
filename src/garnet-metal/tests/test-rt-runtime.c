@@ -1216,7 +1216,7 @@ static void test_source_pins(void) {
         free(res);
     }
 
-    char *live = read_source_file("src/garnet-metal/test-metal3-raytracing.m", "test-metal3-raytracing.m");
+    char *live = read_source_file("src/garnet-metal/tests/test-metal3-raytracing.m", "test-metal3-raytracing.m");
     CHECK(live != NULL, "read test-metal3-raytracing.m for source pins");
     if (live) {
         CHECK(strstr(live, "createGarnetDevice") != NULL, "live test uses self-contained createGarnetDevice");

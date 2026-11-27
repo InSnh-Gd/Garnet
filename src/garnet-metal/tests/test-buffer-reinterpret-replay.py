@@ -19,7 +19,7 @@ def main():
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    fixture = Path(__file__).resolve().parents[2] / "third-party/metal2vulkan-rdna4/garnetxlate/tests/fixtures/descriptor_reinterpret.ll"
+    fixture = Path(__file__).resolve().parents[3] / "third-party/metal2vulkan-rdna4/garnetxlate/tests/fixtures/descriptor_reinterpret.ll"
     source = fixture.read_text()
     start = source.index("define void @reinterpret_helper(")
     end = source.index("\n}", start) + 2

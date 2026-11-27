@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-spec = importlib.util.spec_from_file_location('capture', Path(__file__).with_name('analyze-present-capture.py'))
+spec = importlib.util.spec_from_file_location('capture', Path(__file__).resolve().parent.parent / 'analyze-present-capture.py')
 capture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(capture)
 with tempfile.TemporaryDirectory() as directory:
