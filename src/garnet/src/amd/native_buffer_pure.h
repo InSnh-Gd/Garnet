@@ -72,6 +72,16 @@ inline uint32_t buffer_build(uint32_t *out, uint32_t cap, uint64_t src, uint64_t
     return k;
 }
 
+// Standalone 8-dword ACQUIRE_MEM (SEQ + GL2 WB/INV + GL1/GLV/GLK/GLM/GLI INV) for ReBAR DCC->non-DCC reuse.
+inline uint32_t buffer_build_gl2_inv(uint32_t *out, uint32_t cap) {
+    if (cap < 8u) return 0u;
+    out[0] = 0xc0065800u; out[1] = 0u;
+    out[2] = 0xffffffffu; out[3] = 0x00ffffffu;
+    out[4] = 0u; out[5] = 0u; out[6] = 10u;
+    out[7] = 0x1c3f1u;
+    return 8u;
+}
+
 struct BufferBo { uint64_t size; bool live, host; };
 struct BufferFlight { uint64_t seq; uint32_t id; };
 constexpr bool buffer_reset_loses(BufferFlight flight, uint32_t liveId, uint64_t retired) {

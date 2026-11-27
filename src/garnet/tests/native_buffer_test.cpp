@@ -149,6 +149,8 @@ int main() {
     assert(dw[8 + 33 * 7] == 0xc0004200 && dw[10 + 33 * 7] == 0xc0065800);
     assert(buffer_build(dw, 1024, 0, dst, 64, true, 0x12345678) == 32);
     assert(dw[9] == 0xc0300000 && dw[10] == 0x12345678 && dw[11] == 0);
+    assert(buffer_build_gl2_inv(dw, 7) == 0);
+    assert(buffer_build_gl2_inv(dw, 8) == 8 && dw[0] == 0xc0065800u && dw[7] == 0x1c3f1u);
     uint32_t untouched[1024];
     std::memset(untouched, 0xa5, sizeof untouched);
     std::memcpy(dw, untouched, sizeof dw);
