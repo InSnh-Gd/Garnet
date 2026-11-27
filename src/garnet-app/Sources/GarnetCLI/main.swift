@@ -29,6 +29,8 @@ struct GarnetCLI {
                 return try cmdValidateOC(rest)
             case "configure-oc":
                 return try cmdConfigureOC(rest)
+            case "restore-oc":
+                return try cmdRestoreOC(rest)
             case "install":
                 return try cmdInstall(rest)
             case "uninstall":
@@ -39,6 +41,10 @@ struct GarnetCLI {
                 return try cmdDenylist(rest)
             case "export-pcibarcompat":
                 return try cmdExportPCIBarCompat(rest)
+            case "export-recovery-tool":
+                return try cmdExportRecoveryTool(rest)
+            case "export-anchor-injector":
+                return try cmdExportAnchorInjector(rest)
             case "export-diag":
                 return try cmdExportDiag(rest)
             default:
@@ -178,7 +184,7 @@ struct GarnetCLI {
     }
 
     private static func cmdValidateOC(_ args: [String]) throws -> Int32 {
-        let parsed = try parse(args, valueFlags: ["--config", "--mode"], boolFlags: ["--json"])
+        let parsed = try parse(args, valueFlags: ["--config", "--mode", "--amfi"], boolFlags: ["--json"])
         guard let cfgPath = parsed.options["--config"] ?? parsed.positional.first else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "validate-oc requires --config <path>"])
         }
@@ -186,11 +192,15 @@ struct GarnetCLI {
         guard let mode = OpenCoreMode(rawValue: modeStr) else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected full or small)"])
         }
-        let report = try OpenCoreValidator.validate(configURL: URL(fileURLWithPath: cfgPath), mode: mode)
+        let amfiStr = parsed.options["--amfi"] ?? "legacy"
+        guard let amfiMode = OpenCoreAMFIMode(rawValue: amfiStr) else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --amfi '\(amfiStr)' (expected anchor or legacy)"])
+        }
+        let report = try OpenCoreValidator.validate(configURL: URL(fileURLWithPath: cfgPath), mode: mode, amfiMode: amfiMode)
         if parsed.flags.contains("--json") {
             try emitJSON(report)
         } else {
-            print("OpenCore config: \(report.configPath) (mode=\(report.mode.rawValue), valid=\(report.valid), errors=\(report.errorCount), warnings=\(report.warnCount), readOnly=\(report.readOnlyVerified))")
+            print("OpenCore config: \(report.configPath) (mode=\(report.mode.rawValue), amfi=\(report.amfiMode.rawValue), valid=\(report.valid), errors=\(report.errorCount), warnings=\(report.warnCount), readOnly=\(report.readOnlyVerified))")
             for f in report.findings {
                 print("  [\(f.severity.rawValue)] \(f.keyPath): \(f.message)")
             }
@@ -199,7 +209,7 @@ struct GarnetCLI {
     }
 
     private static func cmdConfigureOC(_ args: [String]) throws -> Int32 {
-        let parsed = try parse(args, valueFlags: ["--config", "--mode", "--payload"], boolFlags: ["--json"])
+        let parsed = try parse(args, valueFlags: ["--config", "--mode", "--amfi", "--payload"], boolFlags: ["--json"])
         guard let targetPath = parsed.options["--config"] ?? parsed.positional.first else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "configure-oc requires --config <EFI-or-config.plist>"])
         }
@@ -207,22 +217,72 @@ struct GarnetCLI {
         guard let mode = OpenCoreMode(rawValue: modeStr) else {
             throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --mode '\(modeStr)' (expected full or small)"])
         }
-        let payloadURL: URL? = (mode == .full) ? try resolvePayloadURL(explicit: parsed.options["--payload"]) : nil
+        var amfiMode: OpenCoreAMFIMode? = nil
+        if let amfiStr = parsed.options["--amfi"] {
+            guard let parsedAmfi = OpenCoreAMFIMode(rawValue: amfiStr) else {
+                throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid --amfi '\(amfiStr)' (expected anchor or legacy)"])
+            }
+            amfiMode = parsedAmfi
+        }
+        let payloadURL: URL? = try? resolvePayloadURL(explicit: parsed.options["--payload"])
+        if mode == .full && payloadURL == nil {
+            _ = try resolvePayloadURL(explicit: parsed.options["--payload"])
+        }
         let result = try OpenCoreValidator.configure(
             targetURL: URL(fileURLWithPath: targetPath),
             mode: mode,
+            amfiMode: amfiMode,
             payloadURL: payloadURL
         )
         if parsed.flags.contains("--json") {
             try emitJSON(result)
         } else {
-            print("Configured OpenCore: \(result.configPath) (mode=\(result.mode.rawValue), valid=\(result.report.valid))")
+            print("Configured OpenCore: \(result.configPath) (mode=\(result.mode.rawValue), amfi=\(result.amfiMode.rawValue), valid=\(result.report.valid))")
             print("  Backup: \(result.backupPath)")
+            if let base = result.baselineBackupPath {
+                print("  Baseline: \(base)")
+            }
             if let kextPath = result.kextInstalledPath {
                 print("  Kext: \(kextPath)")
             }
+            if let recPath = result.recoverToolInstalledPath {
+                print("  Recovery Tool: \(recPath)")
+            }
+            if let injPath = result.anchorInjectorInstalledPath {
+                print("  Anchor Injector: \(injPath)")
+            }
+            if let amfiPath = result.amfiAnchorInstalledPath {
+                print("  AMFIAnchor: \(amfiPath)")
+            }
         }
         return result.report.valid ? 0 : 5
+    }
+
+    private static func cmdRestoreOC(_ args: [String]) throws -> Int32 {
+        let parsed = try parse(args, valueFlags: ["--config", "--backup"], boolFlags: ["--strip-only", "--json"])
+        guard let targetPath = parsed.options["--config"] ?? parsed.positional.first else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "restore-oc requires --config <EFI-or-config.plist>"])
+        }
+        let backupURL = parsed.options["--backup"].map { URL(fileURLWithPath: $0) }
+        let res = try OpenCoreValidator.restore(
+            targetURL: URL(fileURLWithPath: targetPath),
+            backupURL: backupURL,
+            stripOnly: parsed.flags.contains("--strip-only")
+        )
+        if parsed.flags.contains("--json") {
+            try emitJSON(res)
+        } else {
+            print("Restored OpenCore: \(res.configPath) (stripOnly=\(res.stripOnly))")
+            print("  Pre-restore backup: \(res.preRestoreBackupPath)")
+            if let from = res.restoredFromBackupPath {
+                print("  Restored from: \(from)")
+            }
+            print("  Removed Garnet EFI artifacts: \(res.removedArtifacts.count)")
+            for item in res.removedArtifacts {
+                print("    - \(item)")
+            }
+        }
+        return 0
     }
 
     private static func cmdInstall(_ args: [String]) throws -> Int32 {
@@ -297,6 +357,20 @@ struct GarnetCLI {
             print("BAR0 Size: \(rep.bar0CurrentMB.map { "\($0) MB" } ?? "unknown") | Display: \(rep.displayPrimaryStatus ?? "unknown")")
             print("GarnetPCIBarCompat: mode=\(rep.iopciCompatMatchMode ?? "none"), IOPCIFamilyUUID=\(rep.iopciCompatUUID ?? "unknown")")
             print("SIP Ready For AuxKC: \(rep.sipReadyForAuxKC) | Vulkan ICD: \(rep.vulkanInstalled ? "installed" : "not installed") | Denylist Entries: \(rep.denylistCount)")
+            let amfiSummary: String
+            if rep.garnetAnchorLoaded {
+                amfiSummary = "AMFIAnchor active (InstallStatus=\(rep.amfiAnchorInstallStatus.map(String.init) ?? "1"), org.garnet.code-signing loaded)"
+            } else if rep.amfiDisabledByBootArg {
+                amfiSummary = "Legacy amfi=0x80"
+            } else if rep.amfiAnchorLoaded {
+                amfiSummary = "AMFIAnchor present (InstallStatus=\(rep.amfiAnchorInstallStatus.map(String.init) ?? "?"), org.garnet.code-signing NOT loaded)"
+            } else {
+                amfiSummary = "Not configured"
+            }
+            print("AMFI Trust Mode: \(amfiSummary)")
+            if let notice = rep.recoveryCompleteNotice {
+                print("Recovery Notice: \(notice.replacingOccurrences(of: "\n", with: " | "))")
+            }
             let smuTag: String = {
                 switch rep.smuTelemetryState {
                 case .verified: return "verified"
@@ -415,6 +489,44 @@ struct GarnetCLI {
         return 0
     }
 
+    private static func cmdExportRecoveryTool(_ args: [String]) throws -> Int32 {
+        let parsed = try parse(args, valueFlags: ["--payload", "--out"], boolFlags: ["--json"])
+        guard let outPath = parsed.options["--out"] ?? parsed.positional.first else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "export-recovery-tool requires --out <dest-dir>"])
+        }
+        let payloadURL = try resolvePayloadURL(explicit: parsed.options["--payload"])
+        let dst = try SystemDiskInstaller.exportRecoverEFI(
+            fromPayload: payloadURL,
+            toDestination: URL(fileURLWithPath: outPath)
+        )
+        if parsed.flags.contains("--json") {
+            try emitJSON(["exportedPath": dst.path])
+        } else {
+            print("Exported GarnetRecover.efi to: \(dst.path)")
+            print("Place into OpenCore EFI/OC/Tools/ and enable under Misc -> Tools.")
+        }
+        return 0
+    }
+
+    private static func cmdExportAnchorInjector(_ args: [String]) throws -> Int32 {
+        let parsed = try parse(args, valueFlags: ["--payload", "--out"], boolFlags: ["--json"])
+        guard let outPath = parsed.options["--out"] ?? parsed.positional.first else {
+            throw NSError(domain: "garnetctl", code: 2, userInfo: [NSLocalizedDescriptionKey: "export-anchor-injector requires --out <dest-dir>"])
+        }
+        let payloadURL = try resolvePayloadURL(explicit: parsed.options["--payload"])
+        let dst = try SystemDiskInstaller.exportAnchorInjector(
+            fromPayload: payloadURL,
+            toDestination: URL(fileURLWithPath: outPath)
+        )
+        if parsed.flags.contains("--json") {
+            try emitJSON(["exportedPath": dst.path])
+        } else {
+            print("Exported GarnetAnchorInjector.kext to: \(dst.path)")
+            print("Place into OpenCore EFI/OC/Kexts/ after Lilu.kext and AMFIAnchor.kext.")
+        }
+        return 0
+    }
+
     private static func cmdExportDiag(_ args: [String]) throws -> Int32 {
         let parsed = try parse(args, valueFlags: ["--out", "--payload", "--sysroot"], boolFlags: ["--json"])
         let outPath = parsed.options["--out"] ?? parsed.positional.first ?? DiagnosticsManager.defaultDiagnosticsArchiveURL().path
@@ -442,13 +554,16 @@ struct GarnetCLI {
         print("""
         Usage: garnetctl <command> [options]
           preflight [--payload <dir>] [--sysroot <dir>] [--json]
-          validate-oc --config <config.plist> [--mode full|small] [--json]
-          configure-oc --config <EFI-or-config.plist> [--mode full|small] [--payload <dir>] [--json]
+          validate-oc --config <config.plist> [--mode full|small] [--amfi anchor|legacy] [--json]
+          configure-oc --config <EFI-or-config.plist> [--mode full|small] [--amfi anchor|legacy] [--payload <dir>] [--json]
+          restore-oc --config <EFI-or-config.plist> [--backup <path>] [--strip-only] [--json]
           install [--payload <dir>] [--with-vulkan] [--dry-run] [--json]
           uninstall [--remove-denylist] [--dry-run] [--json]
           status [--json]
           denylist <list|add-app|add-bundle|add-proc|remove-bundle|remove-proc|clear|sync> [...]
           export-pcibarcompat [--payload <dir>] --out <dest-dir> [--json]
+          export-recovery-tool [--payload <dir>] --out <dest-dir> [--json]
+          export-anchor-injector [--payload <dir>] --out <dest-dir> [--json]
           export-diag [--out <archive.tar.gz>] [--payload <dir>] [--json]
         """)
     }
