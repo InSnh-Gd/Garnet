@@ -51,6 +51,8 @@ typedef struct RDNA4xBackendCapabilities {
  *   bit 10 (1u << 10): IFT backing buffer ABI v2 (66-word header with attached_bda[31])
  *   bit 11 (1u << 11): RT per-primitive data GPU sidecar lookup (set 0 binding 676, 264 bytes)
  *   bit 12 (1u << 12): Vulkan device supports native shaderInt64 arithmetic (skip u32-half i64 emulation)
+ *   bit 13 (1u << 13): RT Metal 3.1 curve geometry & curve intersection lowering
+ *   bit 14 (1u << 14): RT Metal 3 primitive & instance motion blur lowering
  *   bits 23..16: optional TransformOptions::raster_sample_count (0 = unspecified; valid power-of-two 1..=64)
  */
 #define GARNETX_CAP_MESH_EMULATED_PAYLOAD (1u << 8)
@@ -58,6 +60,8 @@ typedef struct RDNA4xBackendCapabilities {
 #define GARNETX_CAP_RT_IFT_ABI_V2         (1u << 10)
 #define GARNETX_CAP_RT_PRIMITIVE_DATA     (1u << 11)
 #define GARNETX_CAP_NATIVE_INT64          (1u << 12)
+#define GARNETX_CAP_RT_CURVES             (1u << 13)
+#define GARNETX_CAP_RT_MOTION_BLUR        (1u << 14)
 #define GARNETX_CAP_RASTER_SAMPLES_SHIFT  16u
 #define GARNETX_CAP_RASTER_SAMPLES_MASK   (0xFFu << GARNETX_CAP_RASTER_SAMPLES_SHIFT)
 
@@ -190,6 +194,7 @@ int garnetx_lower_icb_stage(
 
 #define GARNETX_IFT_KIND_BOUNDING_BOX     0u
 #define GARNETX_IFT_KIND_TRIANGLE_ANY_HIT 1u
+#define GARNETX_IFT_KIND_CURVE            2u
 
 typedef struct RDNA4xIntersectionFunction {
     const uint8_t *symbol;

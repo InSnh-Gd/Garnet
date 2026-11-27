@@ -36,6 +36,7 @@ pub const GARNETX_STAGE_MESH: u32 = 4;
 
 pub const GARNETX_IFT_KIND_BOUNDING_BOX: u32 = 0;
 pub const GARNETX_IFT_KIND_TRIANGLE_ANY_HIT: u32 = 1;
+pub const GARNETX_IFT_KIND_CURVE: u32 = 2;
 
 /// One preloaded dynamic library (`MTLDynamicLibrary` / `binaryFunctions`) as LLVM AIR text.
 #[repr(C)]
@@ -273,6 +274,7 @@ fn enrich_ift_metadata(
                 "kind": match h.kind {
                     IntersectionFunctionKind::BoundingBox => "BoundingBox",
                     IntersectionFunctionKind::TriangleAnyHit => "TriangleAnyHit",
+                    IntersectionFunctionKind::Curve => "Curve",
                 },
             })
         })
@@ -440,6 +442,8 @@ pub fn translate_bytes_stage3(
         caps.is_some_and(RDNA4xBackendCapabilities::ift_abi_v2);
     linkage.runtime_rt_primitive_data =
         caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data);
+    linkage.runtime_rt_curves =
+        caps.is_some_and(RDNA4xBackendCapabilities::rt_curves);
 
     let (san_ll, vft_info, ift_info) =
         metal2vulkan::specialize_linked_module_with_tables(&san_entry, stage, &linkage)?;
@@ -461,6 +465,9 @@ pub fn translate_bytes_stage3(
     }
     if caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data) {
         options = options.with_rt_primitive_data();
+    }
+    if caps.is_some_and(RDNA4xBackendCapabilities::rt_curves) {
+        options = options.with_rt_curves();
     }
     if caps.is_some_and(RDNA4xBackendCapabilities::native_int64) {
         options = options.with_native_int64();
@@ -707,6 +714,7 @@ unsafe fn read_ift_array(
         let kind = match item.kind {
             GARNETX_IFT_KIND_BOUNDING_BOX => IntersectionFunctionKind::BoundingBox,
             GARNETX_IFT_KIND_TRIANGLE_ANY_HIT => IntersectionFunctionKind::TriangleAnyHit,
+            GARNETX_IFT_KIND_CURVE => IntersectionFunctionKind::Curve,
             other => {
                 return Err(format!(
                     "bad arguments: unknown intersection function kind {other}"

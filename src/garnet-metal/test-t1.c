@@ -47,6 +47,27 @@ int main(void) {
     c = rdna4pc_check(f, flen, key, uuid, 0x1002, 0x7550, &pp, &pl); CHECK("inner vk vendor wrong", c == RDNA4PC_VKHDR, "%s", rdna4pc_why(c));
     pay[8] = 0x02; pay[9] = 0x10; pay[10] = 0; pay[11] = 0; memcpy(pay + 16, uuid2, 16); rdna4pc_fill(&h, key, uuid, 0x1002, 0x7550, pay, plen); memcpy(f, &h, sizeof h); memcpy(f + sizeof h, pay, plen);
     c = rdna4pc_check(f, flen, key, uuid, 0x1002, 0x7550, &pp, &pl); CHECK("inner vk uuid wrong", c == RDNA4PC_VKHDR, "%s", rdna4pc_why(c));
+    free(pay); free(f);
+
+    // ---- bounded payload cap and incremental save policy ----
+    CHECK("max payload bounds", rdna4pc_max_payload(1) == (32ULL << 20) && rdna4pc_max_payload(0) == (256ULL << 20),
+          "ws=%llu app=%llu", (unsigned long long)rdna4pc_max_payload(1), (unsigned long long)rdna4pc_max_payload(0));
+    {
+        uint8_t pay2[128]; memset(pay2, 0x3C, sizeof pay2);
+        uint32_t vk2[4] = { 32, 1, 0x1002, 0x7590 }; memcpy(pay2, vk2, 16); memcpy(pay2 + 16, uuid, 16);
+        size_t fl2 = sizeof(rdna4pc_hdr) + sizeof pay2; uint8_t f2[sizeof(rdna4pc_hdr) + sizeof pay2];
+        rdna4pc_hdr h2; rdna4pc_fill(&h2, key, uuid, 0x1002, 0x7590, pay2, sizeof pay2);
+        memcpy(f2, &h2, sizeof h2); memcpy(f2 + sizeof h2, pay2, sizeof pay2);
+        CHECK("bounded accepts <= max", rdna4pc_check_bounded(f2, fl2, key, uuid, 0x1002, 0x7590, 128, &pp, &pl) == RDNA4PC_OK, "128 <= 128");
+        CHECK("bounded rejects > max", rdna4pc_check_bounded(f2, fl2, key, uuid, 0x1002, 0x7590, 64, &pp, &pl) == RDNA4PC_LEN, "128 > 64");
+    }
+    const uint64_t sec = 1000000000ULL;
+    CHECK("inc save: no new pipes", rdna4pc_should_incremental_save(900 * 1000000ULL, 4, 4, 20 * sec, 10 * sec) == 0, "np == saved");
+    CHECK("inc save: slow first save", rdna4pc_should_incremental_save(500 * 1000000ULL, 1, 0, 1 * sec, 0) == 1, "500ms first");
+    CHECK("inc save: debounce blocks <5s", rdna4pc_should_incremental_save(900 * 1000000ULL, 20, 5, 14 * sec, 10 * sec) == 0, "4s < 5s");
+    CHECK("inc save: debounce clears at 5s", rdna4pc_should_incremental_save(500 * 1000000ULL, 6, 5, 15 * sec, 10 * sec) == 1, "5s slow");
+    CHECK("inc save: single fast pipe skipped", rdna4pc_should_incremental_save(10 * 1000000ULL, 12, 5, 20 * sec, 10 * sec) == 0, "7 fast < 8");
+    CHECK("inc save: batch >= 8 triggers", rdna4pc_should_incremental_save(10 * 1000000ULL, 13, 5, 20 * sec, 10 * sec) == 1, "8 fast >= 8");
     printf(fails ? "FAILED %d\n" : "ALL PASS\n", fails);
     return fails != 0;
 }

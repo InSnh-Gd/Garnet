@@ -1,0 +1,2114 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 5961d4a..714a282 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -197,11 +197,12 @@ fn lower_air_text_for_options<'a>(
+ ) -> Result<Cow<'a, str>, String> {
+     let lowered = lower_air_text_if_enabled(san_ll);
+     if options.hardware_ray_query {
+-        if let Some(rq) = native::ray_query_air::lower_air_ray_queries_with_options(
++        if let Some(rq) = native::ray_query_air::lower_air_ray_queries_with_rt_options(
+             lowered.as_ref(),
+             &[],
+             false,
+             options.rt_primitive_data,
++            options.rt_curves,
+         )? {
+             return Ok(Cow::Owned(rq));
+         }
+diff --git a/src/linked_functions.rs b/src/linked_functions.rs
+index b690113..3557715 100644
+--- a/src/linked_functions.rs
++++ b/src/linked_functions.rs
+@@ -38,6 +38,7 @@ pub struct LinkedFunctionLinkage {
+     /// Enable GPU lookup of per-primitive `primitiveDataBuffer` pointers via set-0 binding 676
+     /// (`GARNETX_CAP_RT_PRIMITIVE_DATA`).
+     pub runtime_rt_primitive_data: bool,
++    pub runtime_rt_curves: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+@@ -45,6 +46,7 @@ pub struct LinkedFunctionLinkage {
+ pub enum IntersectionFunctionKind {
+     BoundingBox,
+     TriangleAnyHit,
++    Curve,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -2264,11 +2266,13 @@ pub fn specialize_runtime_intersection_function_tables(
+     // linked callback symbols.
+     let abi_v2 = linkage.runtime_intersection_abi_v2;
+     let prim_data_enabled = linkage.runtime_rt_primitive_data;
+-    if let Some(lowered) = crate::native::ray_query_air::lower_air_ray_queries_with_options(
++    let rt_curves_enabled = linkage.runtime_rt_curves;
++    if let Some(lowered) = crate::native::ray_query_air::lower_air_ray_queries_with_rt_options(
+         &output,
+         &callbacks,
+         abi_v2,
+         prim_data_enabled,
++        rt_curves_enabled,
+     )? {
+         output = lowered;
+     }
+@@ -3034,7 +3038,10 @@ fn decode_callback_param_roles(
+             | Role::WorldDirection
+             | Role::ObjectToWorldCol(_)
+             | Role::WorldToObjectCol(_) => t == "<3 x float>",
+-            Role::MinDistance | Role::MaxDistance => t == "float",
++            Role::MinDistance
++            | Role::MaxDistance
++            | Role::CandidateDistance
++            | Role::CurveParameter => t == "float",
+             Role::Barycentrics => t == "<2 x float>",
+             Role::FrontFacing => t == "i1",
+             Role::PrimitiveId | Role::GeometryId | Role::InstanceId | Role::UserInstanceId => {
+@@ -3098,7 +3105,13 @@ fn decode_callback_param_roles(
+             Some(Role::Direction)
+         } else if body.contains("!\"air.min_distance\"") {
+             Some(Role::MinDistance)
+-        } else if body.contains("!\"air.max_distance\"") || body.contains("!\"air.distance\"") {
++        } else if body.contains("!\"air.distance\"") {
++            if kind == IntersectionFunctionKind::Curve {
++                Some(Role::CandidateDistance)
++            } else {
++                Some(Role::MaxDistance)
++            }
++        } else if body.contains("!\"air.max_distance\"") {
+             Some(Role::MaxDistance)
+         } else if body.contains("!\"air.barycentric_coord\"")
+             || body.contains("!\"air.barycentrics\"")
+@@ -3127,7 +3140,7 @@ fn decode_callback_param_roles(
+         } else if body.contains("!\"air.user_data\"") || body.contains("!\"air.geometry_data\"") {
+             Some(Role::UserDataPtr)
+         } else if body.contains("!\"air.curve_parameter\"") {
+-            Some(Role::ZeroFallback)
++            Some(Role::CurveParameter)
+         } else {
+             None
+         };
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+index 0cebb15..74948dd 100644
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -1469,6 +1469,9 @@ impl Emitter {
+             dev.device_addr_base = Some(src_id);
+             if self.current_function == "__m2v.rq.query.lookup_prim_data"
+                 || self.current_function == "__m2v.rq.query.probe_prim_slot"
++                || self.current_function == "__m2v.rq.query.lookup_blas_slot"
++                || self.current_function == "__m2v.rq.query.check_curve_hdr"
++                || self.current_function == "__m2v.rq.query.curve_intersect"
+             {
+                 dev.trusted_ro_bda = true;
+             }
+diff --git a/src/native/ir/mod.rs b/src/native/ir/mod.rs
+index 0867453..4d3428e 100644
+--- a/src/native/ir/mod.rs
++++ b/src/native/ir/mod.rs
+@@ -519,7 +519,10 @@ impl LlModule {
+                     }
+                 }
+                 let in_prim_helper = f.name == "__m2v.rq.query.lookup_prim_data"
+-                    || f.name == "__m2v.rq.query.probe_prim_slot";
++                    || f.name == "__m2v.rq.query.probe_prim_slot"
++                    || f.name == "__m2v.rq.query.lookup_blas_slot"
++                    || f.name == "__m2v.rq.query.check_curve_hdr"
++                    || f.name == "__m2v.rq.query.curve_intersect";
+                 let finfo = alloca_info.get(&f.name);
+                 let mut inner_changed = true;
+                 while inner_changed {
+diff --git a/src/native/ray_query_air.rs b/src/native/ray_query_air.rs
+index 909f50d..3f48539 100644
+--- a/src/native/ray_query_air.rs
++++ b/src/native/ray_query_air.rs
+@@ -26,6 +26,8 @@ pub(crate) enum CallbackParamRole {
+     WorldDirection,
+     MinDistance,
+     MaxDistance,
++    CandidateDistance,
++    CurveParameter,
+     Barycentrics,
+     FrontFacing,
+     PrimitiveId,
+@@ -655,6 +657,22 @@ pub(crate) fn lower_air_ray_queries_with_options(
+     linked_callbacks: &[LinkedRayCallback],
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
++) -> Result<Option<String>, String> {
++    lower_air_ray_queries_with_rt_options(
++        ll,
++        linked_callbacks,
++        ift_abi_v2,
++        prim_data_enabled,
++        false,
++    )
++}
++
++pub(crate) fn lower_air_ray_queries_with_rt_options(
++    ll: &str,
++    linked_callbacks: &[LinkedRayCallback],
++    ift_abi_v2: bool,
++    prim_data_enabled: bool,
++    rt_curves_enabled: bool,
+ ) -> Result<Option<String>, String> {
+     let has_intersect = has_air_intersect(ll);
+     let has_iq = ll.contains("_intersection_query");
+@@ -680,6 +698,7 @@ pub(crate) fn lower_air_ray_queries_with_options(
+             next_slot_id,
+             ift_abi_v2,
+             prim_data_enabled,
++            rt_curves_enabled,
+         )? {
+             cur_ll = lowered;
+             next_slot_id += used_slots;
+@@ -687,9 +706,12 @@ pub(crate) fn lower_air_ray_queries_with_options(
+         }
+     }
+     if cur_ll.contains("_intersection_query") {
+-        if let Some(lowered) =
+-            lower_air_intersection_queries(&cur_ll, next_slot_id, prim_data_enabled)?
+-        {
++        if let Some(lowered) = lower_air_intersection_queries(
++            &cur_ll,
++            next_slot_id,
++            prim_data_enabled,
++            rt_curves_enabled,
++        )? {
+             cur_ll = lowered;
+             changed = true;
+         }
+@@ -847,6 +869,7 @@ fn lower_air_intersect_calls(
+     slot_base: u32,
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
++    rt_curves_enabled: bool,
+ ) -> Result<Option<(String, u32)>, String> {
+     if !has_air_intersect(ll) {
+         return Ok(None);
+@@ -1102,6 +1125,7 @@ fn lower_air_intersect_calls(
+         out.push('\n');
+     }
+ 
++    let any_curve_used = rt_curves_enabled && pending.iter().any(|p| p.family.curve_data);
+     let any_prim_data_used = prim_data_enabled
+         && pending.iter().any(|p| {
+             p.reads_prim_data
+@@ -1114,13 +1138,22 @@ fn lower_air_intersect_calls(
+ 
+     // Emit `@__m2v.rq.*` intrinsic declarations (only if not already present in module).
+     append_rq_intrinsic_declarations(&mut out, ll);
+-    if any_prim_data_used {
++    if any_prim_data_used && !any_curve_used {
+         append_prim_data_lookup_support(&mut out);
+     }
++    if any_curve_used {
++        append_curve_rt_support(&mut out);
++    }
+ 
+     // Emit each structured ray-query helper function.
+     for p in &pending {
+-        let helper = emit_ray_query_helper(p, linked_callbacks, ift_abi_v2, prim_data_enabled)?;
++        let helper = emit_ray_query_helper(
++            p,
++            linked_callbacks,
++            ift_abi_v2,
++            prim_data_enabled,
++            rt_curves_enabled,
++        )?;
+         out.push_str(&helper);
+     }
+ 
+@@ -1244,7 +1277,7 @@ fn parse_call_ptr_return_type(call_prefix: &str) -> String {
+     "ptr addrspace(1)".to_string()
+ }
+ 
+-fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool)> {
++fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool, bool)> {
+     let rest = callee.strip_prefix("air.")?;
+     let marker = rest.find("_intersection_query")?;
+     let op = &rest[..marker];
+@@ -1259,7 +1292,8 @@ fn parse_iq_callee(callee: &str) -> Option<(String, bool, bool)> {
+     let has_motion = tags
+         .split('.')
+         .any(|t| matches!(t, "primitive_motion" | "instance_motion"));
+-    Some((op.to_string(), has_instancing, has_motion))
++    let has_curve_data = tags.split('.').any(|t| t == "curve_data");
++    Some((op.to_string(), has_instancing, has_motion, has_curve_data))
+ }
+ 
+ fn resolve_iq_slot(
+@@ -1303,6 +1337,7 @@ fn lower_air_intersection_queries(
+     ll: &str,
+     slot_base: u32,
+     prim_data_enabled: bool,
++    rt_curves_enabled: bool,
+ ) -> Result<Option<String>, String> {
+     if !ll.contains("_intersection_query") {
+         return Ok(None);
+@@ -1319,8 +1354,11 @@ fn lower_air_intersection_queries(
+     let mut null_ptr_vars: Vec<(usize, String)> = Vec::new();
+     let mut dead_load_lines: HashSet<usize> = HashSet::new();
+     let mut commit_aabb_slots: Vec<u32> = Vec::new();
++    let mut commit_curve_slots: Vec<u32> = Vec::new();
+     let mut prim_data_slots: HashSet<u32> = HashSet::new();
++    let mut curve_slots: HashSet<u32> = HashSet::new();
+     let mut iq_prim_helpers: Vec<(u32, bool, bool)> = Vec::new();
++    let mut iq_curve_next_helpers: Vec<(u32, bool)> = Vec::new();
+ 
+     for (line_idx, &(line, scope)) in scoped_lines.iter().enumerate() {
+         if scope == 0 {
+@@ -1340,7 +1378,7 @@ fn lower_air_intersection_queries(
+         };
+         let open = at_pos + open_rel;
+         let callee = &call_part[at_pos + 1..open];
+-        let Some((op, has_instancing, has_motion)) = parse_iq_callee(callee) else {
++        let Some((op, has_instancing, has_motion, has_curve_data)) = parse_iq_callee(callee) else {
+             continue;
+         };
+         let Some(close) = find_matching_paren(call_part, open) else {
+@@ -1362,6 +1400,9 @@ fn lower_air_intersection_queries(
+             next_slot += 1;
+             alloc_slots.insert((scope, var), slot_id);
+             scope_slots.entry(scope).or_default().push(slot_id);
++            if rt_curves_enabled && has_curve_data {
++                curve_slots.insert(slot_id);
++            }
+             ops_by_line.insert(
+                 line_idx,
+                 IqOpCall {
+@@ -1387,6 +1428,9 @@ fn lower_air_intersection_queries(
+             .ok_or_else(|| format!("@{callee} missing query handle operand"))?;
+         let slot_id = resolve_iq_slot(&scoped_lines, scope, q_val, &alloc_slots)
+             .ok_or_else(|| format!("@{callee} references untracked query handle {q_val}"))?;
++        if rt_curves_enabled && has_curve_data {
++            curve_slots.insert(slot_id);
++        }
+ 
+         let mut accel_is_bda = false;
+         let mut bda_source_load_ptr = None;
+@@ -1415,10 +1459,25 @@ fn lower_air_intersection_queries(
+             if let Some(dl) = accel.bda_dead_load_line {
+                 dead_load_lines.insert(dl);
+             }
++        } else if op == "next" {
++            if rt_curves_enabled && (has_curve_data || curve_slots.contains(&slot_id)) {
++                curve_slots.insert(slot_id);
++                let k = (slot_id, has_instancing);
++                if !iq_curve_next_helpers.contains(&k) {
++                    iq_curve_next_helpers.push(k);
++                }
++            }
+         } else if op == "commit_bounding_box_intersection" {
+             if !commit_aabb_slots.contains(&slot_id) {
+                 commit_aabb_slots.push(slot_id);
+             }
++        } else if op == "commit_curve_intersection" {
++            if rt_curves_enabled {
++                curve_slots.insert(slot_id);
++                if !commit_curve_slots.contains(&slot_id) {
++                    commit_curve_slots.push(slot_id);
++                }
++            }
+         } else if matches!(
+             op.as_str(),
+             "get_candidate_primitive_data" | "get_committed_primitive_data"
+@@ -1490,12 +1549,30 @@ fn lower_air_intersection_queries(
+                         "  %__m2v.rq.cw.{slot} = alloca i32, align 4\n\
+                          \x20 store i32 1, ptr %__m2v.rq.cw.{slot}, align 4\n"
+                     ));
+-                    if prim_data_slots.contains(&slot) {
++                    if prim_data_slots.contains(&slot) || curve_slots.contains(&slot) {
+                         out.push_str(&format!(
+                             "  %__m2v.rq.as_root.{slot} = alloca i64, align 8\n\
+                              \x20 store i64 0, ptr %__m2v.rq.as_root.{slot}, align 8\n"
+                         ));
+                     }
++                    if curve_slots.contains(&slot) {
++                        out.push_str(&format!(
++                            "  %__m2v.rq.iq_cand_is_curve.{slot} = alloca i32, align 4\n\
++                             \x20 store i32 0, ptr %__m2v.rq.iq_cand_is_curve.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_cand_t.{slot} = alloca float, align 4\n\
++                             \x20 store float 0.000000e+00, ptr %__m2v.rq.iq_cand_t.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_cand_u.{slot} = alloca float, align 4\n\
++                             \x20 store float 0.000000e+00, ptr %__m2v.rq.iq_cand_u.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_cand_seg.{slot} = alloca i32, align 4\n\
++                             \x20 store i32 0, ptr %__m2v.rq.iq_cand_seg.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_comm_is_curve.{slot} = alloca i32, align 4\n\
++                             \x20 store i32 0, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_comm_u.{slot} = alloca float, align 4\n\
++                             \x20 store float 0.000000e+00, ptr %__m2v.rq.iq_comm_u.{slot}, align 4\n\
++                             \x20 %__m2v.rq.iq_comm_seg.{slot} = alloca i32, align 4\n\
++                             \x20 store i32 0, ptr %__m2v.rq.iq_comm_seg.{slot}, align 4\n"
++                        ));
++                    }
+                 }
+             }
+             entry_inserted.insert(scope);
+@@ -1602,7 +1679,7 @@ fn lower_air_intersection_queries(
+                         } else {
+                             call.raw_args[5].1.clone()
+                         };
+-                        if prim_data_slots.contains(&slot) {
++                        if prim_data_slots.contains(&slot) || curve_slots.contains(&slot) {
+                             out.push_str(&format!(
+                                 "{indent}store i64 {bda_operand}, ptr %__m2v.rq.as_root.{slot}, align 8\n"
+                             ));
+@@ -1611,7 +1688,7 @@ fn lower_air_intersection_queries(
+                             "{indent}call void @__m2v.rq.init.bda(i32 {slot}, i64 {bda_operand}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
+                         ));
+                     } else {
+-                        if prim_data_slots.contains(&slot) {
++                        if prim_data_slots.contains(&slot) || curve_slots.contains(&slot) {
+                             if let Some(as_slot) = call.descriptor_as_slot {
+                                 out.push_str(&format!(
+                                     "{indent}%{pfx}.as_root = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n\
+@@ -1628,9 +1705,37 @@ fn lower_air_intersection_queries(
+                             "{indent}call void @__m2v.rq.init(i32 {slot}, ptr addrspace(1) {as_val}, i32 %{pfx}.flags, i32 {mask}, <3 x float> {orig}, float {tmin}, <3 x float> {dir}, float {tmax})\n"
+                         ));
+                     }
++                    if curve_slots.contains(&slot) {
++                        out.push_str(&format!(
++                            "{indent}store i32 0, ptr %__m2v.rq.iq_cand_is_curve.{slot}, align 4\n\
++                             {indent}store i32 0, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n"
++                        ));
++                    }
+                 }
+                 "next" => {
+-                    if let Some(ref lhs) = call.lhs {
++                    if curve_slots.contains(&slot) {
++                        let inst_tag = if call.has_instancing { 1 } else { 0 };
++                        out.push_str(&format!(
++                            "{indent}%{pfx}.root = load i64, ptr %__m2v.rq.as_root.{slot}, align 8\n\
++                             {indent}%{pfx}.cres = call <4 x float> @__m2v.rq.query.iq_next_curve.{slot}.{inst_tag}(i64 %{pfx}.root)\n\
++                             {indent}%{pfx}.tag = extractelement <4 x float> %{pfx}.cres, i64 0\n\
++                             {indent}%{pfx}.isc = fcmp ogt float %{pfx}.tag, 1.500000e+00\n\
++                             {indent}%{pfx}.isc32 = zext i1 %{pfx}.isc to i32\n\
++                             {indent}store i32 %{pfx}.isc32, ptr %__m2v.rq.iq_cand_is_curve.{slot}, align 4\n\
++                             {indent}%{pfx}.ct = extractelement <4 x float> %{pfx}.cres, i64 1\n\
++                             {indent}store float %{pfx}.ct, ptr %__m2v.rq.iq_cand_t.{slot}, align 4\n\
++                             {indent}%{pfx}.cu = extractelement <4 x float> %{pfx}.cres, i64 2\n\
++                             {indent}store float %{pfx}.cu, ptr %__m2v.rq.iq_cand_u.{slot}, align 4\n\
++                             {indent}%{pfx}.csf = extractelement <4 x float> %{pfx}.cres, i64 3\n\
++                             {indent}%{pfx}.cseg = bitcast float %{pfx}.csf to i32\n\
++                             {indent}store i32 %{pfx}.cseg, ptr %__m2v.rq.iq_cand_seg.{slot}, align 4\n"
++                        ));
++                        if let Some(ref lhs) = call.lhs {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = fcmp ogt float %{pfx}.tag, 5.000000e-01\n"
++                            ));
++                        }
++                    } else if let Some(ref lhs) = call.lhs {
+                         out.push_str(&format!(
+                             "{indent}{lhs} = call i1 @__m2v.rq.proceed(i32 {slot})\n"
+                         ));
+@@ -1649,6 +1754,11 @@ fn lower_air_intersection_queries(
+                     out.push_str(&format!(
+                         "{indent}call void @__m2v.rq.confirm(i32 {slot})\n"
+                     ));
++                    if curve_slots.contains(&slot) {
++                        out.push_str(&format!(
++                            "{indent}store i32 0, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n"
++                        ));
++                    }
+                 }
+                 "commit_bounding_box_intersection" => {
+                     let t_val = call
+@@ -1659,24 +1769,98 @@ fn lower_air_intersection_queries(
+                     out.push_str(&format!(
+                         "{indent}call void @__m2v.rq.query.iq_aabb.{slot}(float {t_val})\n"
+                     ));
++                    if curve_slots.contains(&slot) {
++                        out.push_str(&format!(
++                            "{indent}store i32 0, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n"
++                        ));
++                    }
+                 }
+-                "get_candidate_intersection_type" => {
+-                    if let Some(ref lhs) = call.lhs {
+-                        // SPIR-V Candidate: 0=Triangle, 1=AABB; Metal: 1=Triangle, 2=AABB.
++                "commit_curve_intersection" => {
++                    if curve_slots.contains(&slot) {
+                         out.push_str(&format!(
+-                            "{indent}%{pfx}.raw_ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
+-                             {indent}{lhs} = add i32 %{pfx}.raw_ct, 1\n"
++                            "{indent}%{pfx}.c_ok32 = load i32, ptr %__m2v.rq.iq_cand_is_curve.{slot}, align 4\n\
++                             {indent}%{pfx}.c_t = load float, ptr %__m2v.rq.iq_cand_t.{slot}, align 4\n\
++                             {indent}%{pfx}.c_u = load float, ptr %__m2v.rq.iq_cand_u.{slot}, align 4\n\
++                             {indent}%{pfx}.c_seg = load i32, ptr %__m2v.rq.iq_cand_seg.{slot}, align 4\n\
++                             {indent}%{pfx}.c_did = call i1 @__m2v.rq.query.iq_commit_curve.{slot}(i32 %{pfx}.c_ok32, float %{pfx}.c_t)\n\
++                             {indent}%{pfx}.old_ic = load i32, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n\
++                             {indent}%{pfx}.old_u = load float, ptr %__m2v.rq.iq_comm_u.{slot}, align 4\n\
++                             {indent}%{pfx}.old_seg = load i32, ptr %__m2v.rq.iq_comm_seg.{slot}, align 4\n\
++                             {indent}%{pfx}.new_ic = select i1 %{pfx}.c_did, i32 1, i32 %{pfx}.old_ic\n\
++                             {indent}%{pfx}.new_u = select i1 %{pfx}.c_did, float %{pfx}.c_u, float %{pfx}.old_u\n\
++                             {indent}%{pfx}.new_seg = select i1 %{pfx}.c_did, i32 %{pfx}.c_seg, i32 %{pfx}.old_seg\n\
++                             {indent}store i32 %{pfx}.new_ic, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n\
++                             {indent}store float %{pfx}.new_u, ptr %__m2v.rq.iq_comm_u.{slot}, align 4\n\
++                             {indent}store i32 %{pfx}.new_seg, ptr %__m2v.rq.iq_comm_seg.{slot}, align 4\n"
+                         ));
+                     }
+                 }
++                "get_candidate_intersection_type" => {
++                    if let Some(ref lhs) = call.lhs {
++                        // SPIR-V Candidate: 0=Triangle, 1=AABB; Metal: 1=Triangle, 2=AABB, 3=Curve.
++                        if curve_slots.contains(&slot) {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.raw_ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++                                 {indent}%{pfx}.base_ct = add i32 %{pfx}.raw_ct, 1\n\
++                                 {indent}%{pfx}.isc32 = load i32, ptr %__m2v.rq.iq_cand_is_curve.{slot}, align 4\n\
++                                 {indent}%{pfx}.isc = icmp ne i32 %{pfx}.isc32, 0\n\
++                                 {indent}{lhs} = select i1 %{pfx}.isc, i32 3, i32 %{pfx}.base_ct\n"
++                            ));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.raw_ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++                                 {indent}{lhs} = add i32 %{pfx}.raw_ct, 1\n"
++                            ));
++                        }
++                    }
++                }
+                 "get_committed_intersection_type" => {
+                     if let Some(ref lhs) = call.lhs {
+-                        out.push_str(&format!(
+-                            "{indent}{lhs} = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n"
+-                        ));
++                        if curve_slots.contains(&slot) {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.raw_cm = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
++                                 {indent}%{pfx}.isc32 = load i32, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n\
++                                 {indent}%{pfx}.nz = icmp ne i32 %{pfx}.raw_cm, 0\n\
++                                 {indent}%{pfx}.isc = icmp ne i32 %{pfx}.isc32, 0\n\
++                                 {indent}%{pfx}.ret_c = and i1 %{pfx}.nz, %{pfx}.isc\n\
++                                 {indent}{lhs} = select i1 %{pfx}.ret_c, i32 3, i32 %{pfx}.raw_cm\n"
++                            ));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n"
++                            ));
++                        }
+                     }
+                 }
+-                "get_candidate_triangle_distance" => {
++                "get_candidate_curve_parameter" => {
++                    if let Some(ref lhs) = call.lhs {
++                        if curve_slots.contains(&slot) {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = load float, ptr %__m2v.rq.iq_cand_u.{slot}, align 4\n"
++                            ));
++                        } else {
++                            out.push_str(&format!("{indent}{lhs} = fadd float 0.000000e+00, 0.000000e+00\n"));
++                        }
++                    }
++                }
++                "get_committed_curve_parameter" => {
++                    if let Some(ref lhs) = call.lhs {
++                        if curve_slots.contains(&slot) {
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.ct = call i32 @__m2v.rq.get_type(i32 {slot}, i32 1)\n\
++                                 {indent}%{pfx}.isc32 = load i32, ptr %__m2v.rq.iq_comm_is_curve.{slot}, align 4\n\
++                                 {indent}%{pfx}.nz = icmp ne i32 %{pfx}.ct, 0\n\
++                                 {indent}%{pfx}.isc = icmp ne i32 %{pfx}.isc32, 0\n\
++                                 {indent}%{pfx}.ok = and i1 %{pfx}.nz, %{pfx}.isc\n\
++                                 {indent}%{pfx}.uval = load float, ptr %__m2v.rq.iq_comm_u.{slot}, align 4\n\
++                                 {indent}{lhs} = select i1 %{pfx}.ok, float %{pfx}.uval, float 0.000000e+00\n"
++                            ));
++                        } else {
++                            out.push_str(&format!("{indent}{lhs} = fadd float 0.000000e+00, 0.000000e+00\n"));
++                        }
++                    }
++                }
++                "get_candidate_triangle_distance" | "get_candidate_bounding_box_distance" => {
+                     if let Some(ref lhs) = call.lhs {
+                         out.push_str(&format!(
+                             "{indent}{lhs} = call float @__m2v.rq.get_t(i32 {slot}, i32 0)\n"
+@@ -1732,10 +1916,23 @@ fn lower_air_intersection_queries(
+                 }
+                 "get_candidate_primitive_id" | "get_committed_primitive_id" => {
+                     if let Some(ref lhs) = call.lhs {
+-                        let isect = if call.op.starts_with("get_candidate_") { 0 } else { 1 };
+-                        out.push_str(&format!(
+-                            "{indent}{lhs} = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 {isect})\n"
+-                        ));
++                        let is_cand = call.op.starts_with("get_candidate_");
++                        let isect = if is_cand { 0 } else { 1 };
++                        if curve_slots.contains(&slot) {
++                            let alloca_c = if is_cand { "cand_is_curve" } else { "comm_is_curve" };
++                            let alloca_seg = if is_cand { "cand_seg" } else { "comm_seg" };
++                            out.push_str(&format!(
++                                "{indent}%{pfx}.raw_p = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 {isect})\n\
++                                 {indent}%{pfx}.isc32 = load i32, ptr %__m2v.rq.iq_{alloca_c}.{slot}, align 4\n\
++                                 {indent}%{pfx}.isc = icmp ne i32 %{pfx}.isc32, 0\n\
++                                 {indent}%{pfx}.cseg = load i32, ptr %__m2v.rq.iq_{alloca_seg}.{slot}, align 4\n\
++                                 {indent}{lhs} = select i1 %{pfx}.isc, i32 %{pfx}.cseg, i32 %{pfx}.raw_p\n"
++                            ));
++                        } else {
++                            out.push_str(&format!(
++                                "{indent}{lhs} = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 {isect})\n"
++                            ));
++                        }
+                     }
+                 }
+                 "get_candidate_geometry_id" | "get_committed_geometry_id" => {
+@@ -1863,9 +2060,116 @@ fn lower_air_intersection_queries(
+     }
+ 
+     append_rq_intrinsic_declarations(&mut out, ll);
+-    if !iq_prim_helpers.is_empty() {
++    if !iq_prim_helpers.is_empty() && curve_slots.is_empty() {
+         append_prim_data_lookup_support(&mut out);
+     }
++    if !curve_slots.is_empty() {
++        append_curve_rt_support(&mut out);
++    }
++
++    // Emit curve IQ commit & next helpers.
++    for slot in commit_curve_slots {
++        out.push_str(&format!(
++            "\ndefine internal i1 @__m2v.rq.query.iq_commit_curve.{slot}(i32 %cand_is_curve, float %t) {{\n\
++             entry:\n\
++             \x20 %is_c = icmp ne i32 %cand_is_curve, 0\n\
++             \x20 %tmin = call float @__m2v.rq.get_tmin(i32 {slot})\n\
++             \x20 %cur_t = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n\
++             \x20 %ge = fcmp oge float %t, %tmin\n\
++             \x20 %le = fcmp ole float %t, %cur_t\n\
++             \x20 %ok0 = and i1 %ge, %le\n\
++             \x20 %ok = and i1 %is_c, %ok0\n\
++             \x20 br i1 %ok, label %do_gen, label %done\n\
++             do_gen:\n\
++             \x20 call void @__m2v.rq.generate(i32 {slot}, float %t)\n\
++             \x20 br label %done\n\
++             done:\n\
++             \x20 ret i1 %ok\n\
++             }}\n"
++        ));
++    }
++    for (slot, has_inst) in iq_curve_next_helpers {
++        let inst_tag = if has_inst { 1 } else { 0 };
++        let fn_name = format!("@__m2v.rq.query.iq_next_curve.{slot}.{inst_tag}");
++        if out.contains(&format!("define internal <4 x float> {fn_name}(")) {
++            continue;
++        }
++        let inst_lines = if has_inst {
++            format!(
++                "  %inst_id = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n\
++                 \x20 %ro = call <3 x float> @__m2v.rq.get_object_ray_origin(i32 {slot}, i32 0)\n\
++                 \x20 %rd = call <3 x float> @__m2v.rq.get_object_ray_direction(i32 {slot}, i32 0)\n"
++            )
++        } else {
++            format!(
++                "  %ro = call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})\n\
++                 \x20 %rd = call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})\n"
++            )
++        };
++        let inst_arg = if has_inst { "%inst_id" } else { "0" };
++        out.push_str(&format!(
++            "\ndefine internal <4 x float> {fn_name}(i64 %root_bda) {{\n\
++             entry:\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             loop_hdr:\n\
++             \x20 %done = phi i1 [ false, %entry ], [ %done_next, %loop_latch ]\n\
++             \x20 %res = phi <4 x float> [ zeroinitializer, %entry ], [ %res_next, %loop_latch ]\n\
++             \x20 %not_done = xor i1 %done, true\n\
++             \x20 br i1 %not_done, label %loop_body, label %exit\n\
++             \n\
++             loop_body:\n\
++             \x20 %more = call i1 @__m2v.rq.proceed(i32 {slot})\n\
++             \x20 br i1 %more, label %check_cand, label %no_more\n\
++             \n\
++             no_more:\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             check_cand:\n\
++             \x20 %ctype = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++             \x20 %is_tri = icmp eq i32 %ctype, 0\n\
++             \x20 br i1 %is_tri, label %plain_cand, label %check_aabb\n\
++             \n\
++             plain_cand:\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             check_aabb:\n\
++             \x20 %geom_id = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
++             \x20 %aabb_id = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
++             {inst_lines}\
++             \x20 %blas_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_bda, i32 {inst_tag}, i32 {inst_arg})\n\
++             \x20 %curve_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %blas_slot, i32 %geom_id)\n\
++             \x20 %is_curve = icmp ne i64 %curve_hdr, 0\n\
++             \x20 br i1 %is_curve, label %do_curve, label %plain_aabb\n\
++             \n\
++             plain_aabb:\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             do_curve:\n\
++             \x20 %tmin = call float @__m2v.rq.get_tmin(i32 {slot})\n\
++             \x20 %cur_t = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n\
++             \x20 %cres = call <4 x float> @__m2v.rq.query.curve_intersect(i64 %blas_slot, i64 %curve_hdr, i32 %aabb_id, <3 x float> %ro, <3 x float> %rd, float %tmin, float %cur_t)\n\
++             \x20 %chit_f = extractelement <4 x float> %cres, i64 0\n\
++             \x20 %chit = fcmp ogt float %chit_f, 5.000000e-01\n\
++             \x20 %ct = extractelement <4 x float> %cres, i64 1\n\
++             \x20 %cu = extractelement <4 x float> %cres, i64 2\n\
++             \x20 %cs = extractelement <4 x float> %cres, i64 3\n\
++             \x20 %v0 = insertelement <4 x float> poison, float 2.000000e+00, i64 0\n\
++             \x20 %v1 = insertelement <4 x float> %v0, float %ct, i64 1\n\
++             \x20 %v2 = insertelement <4 x float> %v1, float %cu, i64 2\n\
++             \x20 %v3 = insertelement <4 x float> %v2, float %cs, i64 3\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             loop_latch:\n\
++             \x20 %done_next = phi i1 [ true, %no_more ], [ true, %plain_cand ], [ true, %plain_aabb ], [ %chit, %do_curve ]\n\
++             \x20 %res_next = phi <4 x float> [ zeroinitializer, %no_more ], [ <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00>, %plain_cand ], [ <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00>, %plain_aabb ], [ %v3, %do_curve ]\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             exit:\n\
++             \x20 ret <4 x float> %res\n\
++             }}\n"
++        ));
++    }
+ 
+     // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
+     for slot in commit_aabb_slots {
+@@ -2138,6 +2442,769 @@ fn append_prim_data_lookup_support(out: &mut String) {
+     }
+ }
+ 
++/// Emit curve RT lookup + analytic/Phantom cubic-Bezier ray-curve intersection helpers.
++/// Called when `GARNETX_CAP_RT_CURVES` is enabled and any `intersection_query` or `intersect`
++/// call uses `curve_data`. All BDA pointers use `%__m2v.rq.prim_data.*` scalar reads and
++/// structured diamond/single-loop CFGs without nested loops or dynamic array allocas.
++fn append_curve_rt_support(out: &mut String) {
++    append_prim_data_lookup_support(out);
++    for decl in [
++        "declare float @air.sqrt.f32(float)",
++        "declare float @llvm.fabs.f32(float)",
++    ] {
++        let prefix = decl.split('(').next().unwrap_or(decl);
++        if !out.contains(&format!("{prefix}(")) {
++            out.push_str(decl);
++            out.push('\n');
++        }
++    }
++
++    if !out.contains("define internal i64 @__m2v.rq.query.lookup_blas_slot(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.lookup_blas_slot(i64 %root_bda, i32 %has_inst, i32 %inst_id) {\n\
++             entry:\n\
++             \x20 %tbl_bda = call i64 @__m2v.rq.prim_table_bda()\n\
++             \x20 %mask = call i32 @__m2v.rq.prim_table_mask()\n\
++             \x20 %root_ok = icmp ugt i64 %root_bda, 1\n\
++             \x20 %tbl_ok = icmp ne i64 %tbl_bda, 0\n\
++             \x20 %both_ok = and i1 %root_ok, %tbl_ok\n\
++             \x20 br i1 %both_ok, label %probe1, label %exit_all\n\
++             \n\
++             probe1:\n\
++             \x20 %s1_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %root_bda)\n\
++             \x20 %s1_ok = icmp ne i64 %s1_addr, 0\n\
++             \x20 br i1 %s1_ok, label %read_s1, label %after_probe1\n\
++             \n\
++             read_s1:\n\
++             \x20 %__m2v.rq.prim_data.bs1_p8 = add i64 %s1_addr, 8\n\
++             \x20 %s1_pay_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p8 to ptr addrspace(1)\n\
++             \x20 %s1_pay = load i64, ptr addrspace(1) %s1_pay_ptr, align 8\n\
++             \x20 %__m2v.rq.prim_data.bs1_p16 = add i64 %s1_addr, 16\n\
++             \x20 %s1_cnt_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p16 to ptr addrspace(1)\n\
++             \x20 %s1_cnt = load i32, ptr addrspace(1) %s1_cnt_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.bs1_p28 = add i64 %s1_addr, 28\n\
++             \x20 %s1_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p28 to ptr addrspace(1)\n\
++             \x20 %s1_knd = load i32, ptr addrspace(1) %s1_knd_ptr, align 4\n\
++             \x20 %want_inst = icmp ne i32 %has_inst, 0\n\
++             \x20 %is_tlas = icmp eq i32 %s1_knd, 1\n\
++             \x20 %do_tlas = and i1 %want_inst, %is_tlas\n\
++             \x20 br i1 %do_tlas, label %tlas_check, label %blas_check\n\
++             \n\
++             tlas_check:\n\
++             \x20 %tlas_pay_ok = icmp ne i64 %s1_pay, 0\n\
++             \x20 %inst_in_b = icmp ult i32 %inst_id, %s1_cnt\n\
++             \x20 %tlas_ok = and i1 %tlas_pay_ok, %inst_in_b\n\
++             \x20 br i1 %tlas_ok, label %tlas_load, label %tlas_done\n\
++             \n\
++             tlas_load:\n\
++             \x20 %__m2v.rq.prim_data.bs1_p20 = add i64 %s1_addr, 20\n\
++             \x20 %s1_str_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p20 to ptr addrspace(1)\n\
++             \x20 %s1_str = load i32, ptr addrspace(1) %s1_str_ptr, align 4\n\
++             \x20 %__m2v.rq.prim_data.bs1_p24 = add i64 %s1_addr, 24\n\
++             \x20 %s1_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bs1_p24 to ptr addrspace(1)\n\
++             \x20 %s1_ref = load i32, ptr addrspace(1) %s1_ref_ptr, align 4\n\
++             \x20 %inst64 = zext i32 %inst_id to i64\n\
++             \x20 %str64 = zext i32 %s1_str to i64\n\
++             \x20 %ref64 = zext i32 %s1_ref to i64\n\
++             \x20 %inst_off0 = mul i64 %inst64, %str64\n\
++             \x20 %inst_off = add i64 %inst_off0, %ref64\n\
++             \x20 %__m2v.rq.prim_data.bblas_ref = add i64 %s1_pay, %inst_off\n\
++             \x20 %blas_ref_ptr = inttoptr i64 %__m2v.rq.prim_data.bblas_ref to ptr addrspace(1)\n\
++             \x20 %blas_bda = load i64, ptr addrspace(1) %blas_ref_ptr, align 8\n\
++             \x20 %blas_bda_ok = icmp ugt i64 %blas_bda, 1\n\
++             \x20 br i1 %blas_bda_ok, label %probe2, label %tlas_load_done\n\
++             \n\
++             probe2:\n\
++             \x20 %s2_addr = call i64 @__m2v.rq.query.probe_prim_slot(i64 %tbl_bda, i32 %mask, i64 %blas_bda)\n\
++             \x20 %s2_ok = icmp ne i64 %s2_addr, 0\n\
++             \x20 br i1 %s2_ok, label %read_s2, label %probe2_done\n\
++             \n\
++             read_s2:\n\
++             \x20 %__m2v.rq.prim_data.bs2_p28 = add i64 %s2_addr, 28\n\
++             \x20 %s2_knd_ptr = inttoptr i64 %__m2v.rq.prim_data.bs2_p28 to ptr addrspace(1)\n\
++             \x20 %s2_knd = load i32, ptr addrspace(1) %s2_knd_ptr, align 4\n\
++             \x20 %s2_is_blas = icmp eq i32 %s2_knd, 0\n\
++             \x20 %s2_res = select i1 %s2_is_blas, i64 %s2_addr, i64 0\n\
++             \x20 br label %probe2_done\n\
++             \n\
++             probe2_done:\n\
++             \x20 %p2_slot = phi i64 [ %s2_res, %read_s2 ], [ 0, %probe2 ]\n\
++             \x20 br label %tlas_load_done\n\
++             \n\
++             tlas_load_done:\n\
++             \x20 %tl_slot = phi i64 [ %p2_slot, %probe2_done ], [ 0, %tlas_load ]\n\
++             \x20 br label %tlas_done\n\
++             \n\
++             tlas_done:\n\
++             \x20 %td_slot = phi i64 [ %tl_slot, %tlas_load_done ], [ 0, %tlas_check ]\n\
++             \x20 br label %blas_merge\n\
++             \n\
++             blas_check:\n\
++             \x20 %s1_is_blas = icmp eq i32 %s1_knd, 0\n\
++             \x20 %s1_res = select i1 %s1_is_blas, i64 %s1_addr, i64 0\n\
++             \x20 br label %blas_merge\n\
++             \n\
++             blas_merge:\n\
++             \x20 %slot_res = phi i64 [ %td_slot, %tlas_done ], [ %s1_res, %blas_check ]\n\
++             \x20 br label %after_probe1\n\
++             \n\
++             after_probe1:\n\
++             \x20 %p1_res = phi i64 [ %slot_res, %blas_merge ], [ 0, %probe1 ]\n\
++             \x20 br label %exit_all\n\
++             \n\
++             exit_all:\n\
++             \x20 %res = phi i64 [ %p1_res, %after_probe1 ], [ 0, %entry ]\n\
++             \x20 ret i64 %res\n\
++             }\n",
++        );
++    }
++
++    if !out.contains("define internal i64 @__m2v.rq.query.check_curve_hdr(") {
++        out.push_str(
++            "\ndefine internal i64 @__m2v.rq.query.check_curve_hdr(i64 %blas_slot, i32 %geom_id) {\n\
++             entry:\n\
++             \x20 %slot_ok = icmp ne i64 %blas_slot, 0\n\
++             \x20 br i1 %slot_ok, label %read_slot, label %exit\n\
++             \n\
++             read_slot:\n\
++             \x20 %__m2v.rq.prim_data.ch_p8 = add i64 %blas_slot, 8\n\
++             \x20 %pay_p = inttoptr i64 %__m2v.rq.prim_data.ch_p8 to ptr addrspace(1)\n\
++             \x20 %pay = load i64, ptr addrspace(1) %pay_p, align 8\n\
++             \x20 %__m2v.rq.prim_data.ch_p16 = add i64 %blas_slot, 16\n\
++             \x20 %cnt_p = inttoptr i64 %__m2v.rq.prim_data.ch_p16 to ptr addrspace(1)\n\
++             \x20 %cnt = load i32, ptr addrspace(1) %cnt_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ch_p20 = add i64 %blas_slot, 20\n\
++             \x20 %aux_p = inttoptr i64 %__m2v.rq.prim_data.ch_p20 to ptr addrspace(1)\n\
++             \x20 %aux_off = load i32, ptr addrspace(1) %aux_p, align 4\n\
++             \x20 %pay_ok = icmp ne i64 %pay, 0\n\
++             \x20 %aux_ok = icmp ne i32 %aux_off, 0\n\
++             \x20 %g_ok = icmp ult i32 %geom_id, %cnt\n\
++             \x20 %p_a = and i1 %pay_ok, %aux_ok\n\
++             \x20 %hdr_in = and i1 %p_a, %g_ok\n\
++             \x20 br i1 %hdr_in, label %read_hdr, label %slot_done\n\
++             \n\
++             read_hdr:\n\
++             \x20 %aux64 = zext i32 %aux_off to i64\n\
++             \x20 %g64 = zext i32 %geom_id to i64\n\
++             \x20 %goff = mul i64 %g64, 48\n\
++             \x20 %base = add i64 %pay, %aux64\n\
++             \x20 %__m2v.rq.prim_data.chdr = add i64 %base, %goff\n\
++             \x20 %mag_p = inttoptr i64 %__m2v.rq.prim_data.chdr to ptr addrspace(1)\n\
++             \x20 %mag = load i32, ptr addrspace(1) %mag_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ch_sc = add i64 %__m2v.rq.prim_data.chdr, 20\n\
++             \x20 %sc_p = inttoptr i64 %__m2v.rq.prim_data.ch_sc to ptr addrspace(1)\n\
++             \x20 %sc = load i32, ptr addrspace(1) %sc_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ch_ss = add i64 %__m2v.rq.prim_data.chdr, 24\n\
++             \x20 %ss_p = inttoptr i64 %__m2v.rq.prim_data.ch_ss to ptr addrspace(1)\n\
++             \x20 %ss = load i32, ptr addrspace(1) %ss_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ch_so = add i64 %__m2v.rq.prim_data.chdr, 32\n\
++             \x20 %so_p = inttoptr i64 %__m2v.rq.prim_data.ch_so to ptr addrspace(1)\n\
++             \x20 %so = load i64, ptr addrspace(1) %so_p, align 8\n\
++             \x20 %mag_ok = icmp eq i32 %mag, 1381253974\n\
++             \x20 %sc_ok = icmp ne i32 %sc, 0\n\
++             \x20 %ss_ok = icmp ne i32 %ss, 0\n\
++             \x20 %so_ok = icmp ne i64 %so, 0\n\
++             \x20 %ok0 = and i1 %mag_ok, %sc_ok\n\
++             \x20 %ok1 = and i1 %ss_ok, %so_ok\n\
++             \x20 %all_ok = and i1 %ok0, %ok1\n\
++             \x20 %hdr_res = select i1 %all_ok, i64 %__m2v.rq.prim_data.chdr, i64 0\n\
++             \x20 br label %slot_done\n\
++             \n\
++             slot_done:\n\
++             \x20 %s_res = phi i64 [ %hdr_res, %read_hdr ], [ 0, %read_slot ]\n\
++             \x20 br label %exit\n\
++             \n\
++             exit:\n\
++             \x20 %res = phi i64 [ %s_res, %slot_done ], [ 0, %entry ]\n\
++             \x20 ret i64 %res\n\
++             }\n",
++        );
++    }
++
++    if !out.contains("define internal <4 x float> @__m2v.rq.query.curve_intersect(") {
++        out.push_str(
++            "\ndefine internal <4 x float> @__m2v.rq.query.curve_intersect(i64 %blas_slot, i64 %curve_hdr, i32 %aabb_id, <3 x float> %ro, <3 x float> %rd, float %tmin, float %tmax) {\n\
++             entry:\n\
++             \x20 %b_ok = icmp ne i64 %blas_slot, 0\n\
++             \x20 %h_ok = icmp ne i64 %curve_hdr, 0\n\
++             \x20 %t_ok = fcmp oge float %tmax, %tmin\n\
++             \x20 %e0 = and i1 %b_ok, %h_ok\n\
++             \x20 %e_ok = and i1 %e0, %t_ok\n\
++             \x20 br i1 %e_ok, label %read_meta, label %exit\n\
++             \n\
++             read_meta:\n\
++             \x20 %__m2v.rq.prim_data.ci_p8 = add i64 %blas_slot, 8\n\
++             \x20 %pay_p = inttoptr i64 %__m2v.rq.prim_data.ci_p8 to ptr addrspace(1)\n\
++             \x20 %pay = load i64, ptr addrspace(1) %pay_p, align 8\n\
++             \x20 %__m2v.rq.prim_data.ci_ct = add i64 %curve_hdr, 4\n\
++             \x20 %ct_p = inttoptr i64 %__m2v.rq.prim_data.ci_ct to ptr addrspace(1)\n\
++             \x20 %ctype = load i32, ptr addrspace(1) %ct_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ci_cp = add i64 %curve_hdr, 12\n\
++             \x20 %cp_p = inttoptr i64 %__m2v.rq.prim_data.ci_cp to ptr addrspace(1)\n\
++             \x20 %caps = load i32, ptr addrspace(1) %cp_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ci_sc = add i64 %curve_hdr, 20\n\
++             \x20 %sc_p = inttoptr i64 %__m2v.rq.prim_data.ci_sc to ptr addrspace(1)\n\
++             \x20 %sc = load i32, ptr addrspace(1) %sc_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ci_ss = add i64 %curve_hdr, 24\n\
++             \x20 %ss_p = inttoptr i64 %__m2v.rq.prim_data.ci_ss to ptr addrspace(1)\n\
++             \x20 %ss = load i32, ptr addrspace(1) %ss_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.ci_so = add i64 %curve_hdr, 32\n\
++             \x20 %so_p = inttoptr i64 %__m2v.rq.prim_data.ci_so to ptr addrspace(1)\n\
++             \x20 %so = load i64, ptr addrspace(1) %so_p, align 8\n\
++             \x20 %lim = mul i32 %sc, %ss\n\
++             \x20 %in_b = icmp ult i32 %aabb_id, %lim\n\
++             \x20 %pay_ok = icmp ne i64 %pay, 0\n\
++             \x20 %so_ok = icmp ne i64 %so, 0\n\
++             \x20 %rdx = extractelement <3 x float> %rd, i64 0\n\
++             \x20 %rdy = extractelement <3 x float> %rd, i64 1\n\
++             \x20 %rdz = extractelement <3 x float> %rd, i64 2\n\
++             \x20 %d2x = fmul float %rdx, %rdx\n\
++             \x20 %d2y = fmul float %rdy, %rdy\n\
++             \x20 %d2z = fmul float %rdz, %rdz\n\
++             \x20 %d2xy = fadd float %d2x, %d2y\n\
++             \x20 %d2 = fadd float %d2xy, %d2z\n\
++             \x20 %d2_ok = fcmp ogt float %d2, 1.000000e-20\n\
++             \x20 %m0 = and i1 %in_b, %pay_ok\n\
++             \x20 %m1 = and i1 %so_ok, %d2_ok\n\
++             \x20 %meta_ok = and i1 %m0, %m1\n\
++             \x20 br i1 %meta_ok, label %load_seg, label %meta_done\n\
++             \n\
++             load_seg:\n\
++             \x20 %seg_base = add i64 %pay, %so\n\
++             \x20 %a64 = zext i32 %aabb_id to i64\n\
++             \x20 %aoff = mul i64 %a64, 80\n\
++             \x20 %__m2v.rq.prim_data.seg = add i64 %seg_base, %aoff\n",
++        );
++        // Load all 16 floats of b[4][4] (offsets 0..60).
++        for i in 0..16u32 {
++            let off = i * 4;
++            let row = i / 4;
++            let col = i % 4;
++            if off == 0 {
++                out.push_str(
++                    "  %b0_0_p = inttoptr i64 %__m2v.rq.prim_data.seg to ptr addrspace(1)\n\
++                     \x20 %b0_0 = load float, ptr addrspace(1) %b0_0_p, align 4\n",
++                );
++            } else {
++                out.push_str(&format!(
++                    "  %__m2v.rq.prim_data.sb_{off} = add i64 %__m2v.rq.prim_data.seg, {off}\n\
++                     \x20 %b{row}_{col}_p = inttoptr i64 %__m2v.rq.prim_data.sb_{off} to ptr addrspace(1)\n\
++                     \x20 %b{row}_{col} = load float, ptr addrspace(1) %b{row}_{col}_p, align 4\n"
++                ));
++            }
++        }
++        out.push_str(
++            "  %__m2v.rq.prim_data.st0 = add i64 %__m2v.rq.prim_data.seg, 64\n\
++             \x20 %st0_p = inttoptr i64 %__m2v.rq.prim_data.st0 to ptr addrspace(1)\n\
++             \x20 %seg_t0 = load float, ptr addrspace(1) %st0_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.st1 = add i64 %__m2v.rq.prim_data.seg, 68\n\
++             \x20 %st1_p = inttoptr i64 %__m2v.rq.prim_data.st1 to ptr addrspace(1)\n\
++             \x20 %seg_t1 = load float, ptr addrspace(1) %st1_p, align 4\n\
++             \x20 %__m2v.rq.prim_data.sid = add i64 %__m2v.rq.prim_data.seg, 72\n\
++             \x20 %sid_p = inttoptr i64 %__m2v.rq.prim_data.sid to ptr addrspace(1)\n\
++             \x20 %seg_id = load i32, ptr addrspace(1) %sid_p, align 4\n\
++             \x20 %seg_id_f = bitcast i32 %seg_id to float\n\
++             \x20 %dlen = call float @air.sqrt.f32(float %d2)\n\
++             \x20 %inv_dlen = fdiv float 1.000000e+00, %dlen\n\
++             \x20 %wnx = fmul float %rdx, %inv_dlen\n\
++             \x20 %wny = fmul float %rdy, %inv_dlen\n\
++             \x20 %wnz = fmul float %rdz, %inv_dlen\n\
++             \x20 %smin = fmul float %tmin, %dlen\n\
++             \x20 %smax = fmul float %tmax, %dlen\n\
++             \x20 %awx = call float @llvm.fabs.f32(float %wnx)\n\
++             \x20 %gt90 = fcmp ogt float %awx, 9.000000e-01\n\
++             \x20 %n_wnz = fsub float -0.000000e+00, %wnz\n\
++             \x20 %n_wny = fsub float -0.000000e+00, %wny\n\
++             \x20 %u0x = select i1 %gt90, float 0.000000e+00, float %n_wnz\n\
++             \x20 %u0y = select i1 %gt90, float %wnz, float 0.000000e+00\n\
++             \x20 %u0z = select i1 %gt90, float %n_wny, float %wnx\n\
++             \x20 %u0x2 = fmul float %u0x, %u0x\n\
++             \x20 %u0y2 = fmul float %u0y, %u0y\n\
++             \x20 %u0z2 = fmul float %u0z, %u0z\n\
++             \x20 %u0_xy = fadd float %u0x2, %u0y2\n\
++             \x20 %u0_2 = fadd float %u0_xy, %u0z2\n\
++             \x20 %ulen = call float @air.sqrt.f32(float %u0_2)\n\
++             \x20 %iu = fdiv float 1.000000e+00, %ulen\n\
++             \x20 %ux = fmul float %u0x, %iu\n\
++             \x20 %uy = fmul float %u0y, %iu\n\
++             \x20 %uz = fmul float %u0z, %iu\n\
++             \x20 %wy_uz = fmul float %wny, %uz\n\
++             \x20 %wz_uy = fmul float %wnz, %uy\n\
++             \x20 %vx = fsub float %wy_uz, %wz_uy\n\
++             \x20 %wz_ux = fmul float %wnz, %ux\n\
++             \x20 %wx_uz = fmul float %wnx, %uz\n\
++             \x20 %vy = fsub float %wz_ux, %wx_uz\n\
++             \x20 %wx_uy = fmul float %wnx, %uy\n\
++             \x20 %wy_ux = fmul float %wny, %ux\n\
++             \x20 %vz = fsub float %wx_uy, %wy_ux\n\
++             \x20 %rox = extractelement <3 x float> %ro, i64 0\n\
++             \x20 %roy = extractelement <3 x float> %ro, i64 1\n\
++             \x20 %roz = extractelement <3 x float> %ro, i64 2\n",
++        );
++        // Transform control points into ray-centered (u_ax, v_ax, wn) frame.
++        for i in 0..4u32 {
++            out.push_str(&format!(
++                "  %rel{i}_x = fsub float %b{i}_0, %rox\n\
++                 \x20 %rel{i}_y = fsub float %b{i}_1, %roy\n\
++                 \x20 %rel{i}_z = fsub float %b{i}_2, %roz\n\
++                 \x20 %br{i}_x0 = fmul float %rel{i}_x, %ux\n\
++                 \x20 %br{i}_x1 = fmul float %rel{i}_y, %uy\n\
++                 \x20 %br{i}_x2 = fmul float %rel{i}_z, %uz\n\
++                 \x20 %br{i}_x01 = fadd float %br{i}_x0, %br{i}_x1\n\
++                 \x20 %br{i}_x = fadd float %br{i}_x01, %br{i}_x2\n\
++                 \x20 %br{i}_y0 = fmul float %rel{i}_x, %vx\n\
++                 \x20 %br{i}_y1 = fmul float %rel{i}_y, %vy\n\
++                 \x20 %br{i}_y2 = fmul float %rel{i}_z, %vz\n\
++                 \x20 %br{i}_y01 = fadd float %br{i}_y0, %br{i}_y1\n\
++                 \x20 %br{i}_y = fadd float %br{i}_y01, %br{i}_y2\n\
++                 \x20 %br{i}_z0 = fmul float %rel{i}_x, %wnx\n\
++                 \x20 %br{i}_z1 = fmul float %rel{i}_y, %wny\n\
++                 \x20 %br{i}_z2 = fmul float %rel{i}_z, %wnz\n\
++                 \x20 %br{i}_z01 = fadd float %br{i}_z0, %br{i}_z1\n\
++                 \x20 %br{i}_z = fadd float %br{i}_z01, %br{i}_z2\n"
++            ));
++        }
++        out.push_str(
++            "  %is_flat = icmp eq i32 %ctype, 1\n\
++             \x20 %is_round = icmp eq i32 %ctype, 0\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             loop_hdr:\n\
++             \x20 %step = phi i32 [ 0, %load_seg ], [ %step_next, %loop_latch ]\n\
++             \x20 %u_cur = phi float [ 0.000000e+00, %load_seg ], [ %u_next, %loop_latch ]\n\
++             \x20 %hit_cur = phi i32 [ 0, %load_seg ], [ %hit_next, %loop_latch ]\n\
++             \x20 %s_cur = phi float [ %smax, %load_seg ], [ %s_next, %loop_latch ]\n\
++             \x20 %bu_cur = phi float [ 0.000000e+00, %load_seg ], [ %bu_next, %loop_latch ]\n\
++             \x20 %in_lim = icmp ult i32 %step, 48\n\
++             \x20 br i1 %in_lim, label %loop_body, label %after_loop\n\
++             \n\
++             loop_body:\n\
++             \x20 %seed = udiv i32 %step, 6\n\
++             \x20 %it = urem i32 %step, 6\n\
++             \x20 %is_it0 = icmp eq i32 %it, 0\n\
++             \x20 %seed_f = sitofp i32 %seed to float\n\
++             \x20 %seed_p = fadd float %seed_f, 5.000000e-01\n\
++             \x20 %u_seed = fmul float %seed_p, 1.250000e-01\n\
++             \x20 %u0 = select i1 %is_it0, float %u_seed, float %u_cur\n\
++             \x20 %om = fsub float 1.000000e+00, %u0\n\
++             \x20 %om2 = fmul float %om, %om\n\
++             \x20 %u2 = fmul float %u0, %u0\n\
++             \x20 %c0 = fmul float %om2, %om\n\
++             \x20 %c1_0 = fmul float 3.000000e+00, %om2\n\
++             \x20 %c1 = fmul float %c1_0, %u0\n\
++             \x20 %c2_0 = fmul float 3.000000e+00, %om\n\
++             \x20 %c2 = fmul float %c2_0, %u2\n\
++             \x20 %c3 = fmul float %u2, %u0\n\
++             \x20 %dc0 = fmul float -3.000000e+00, %om2\n\
++             \x20 %om_u = fmul float %om, %u0\n\
++             \x20 %six_omu = fmul float 6.000000e+00, %om_u\n\
++             \x20 %three_om2 = fmul float 3.000000e+00, %om2\n\
++             \x20 %dc1 = fsub float %three_om2, %six_omu\n\
++             \x20 %three_u2 = fmul float 3.000000e+00, %u2\n\
++             \x20 %dc2 = fsub float %six_omu, %three_u2\n\
++             \x20 %dc3 = fmul float 3.000000e+00, %u2\n",
++        );
++        // Evaluate P(u0) and dP(u0) for X, Y, R (W).
++        for (ch, rcol) in [("x", "x"), ("y", "y"), ("r", "3")] {
++            let suffix = if ch == "r" { "_3" } else { &format!("_{rcol}") };
++            let prefix = if ch == "r" { "b" } else { "br" };
++            out.push_str(&format!(
++                "  %p{ch}_0 = fmul float %c0, %{prefix}0{suffix}\n\
++                 \x20 %p{ch}_1 = fmul float %c1, %{prefix}1{suffix}\n\
++                 \x20 %p{ch}_2 = fmul float %c2, %{prefix}2{suffix}\n\
++                 \x20 %p{ch}_3 = fmul float %c3, %{prefix}3{suffix}\n\
++                 \x20 %p{ch}_01 = fadd float %p{ch}_0, %p{ch}_1\n\
++                 \x20 %p{ch}_23 = fadd float %p{ch}_2, %p{ch}_3\n\
++                 \x20 %p{ch} = fadd float %p{ch}_01, %p{ch}_23\n\
++                 \x20 %d{ch}_0 = fmul float %dc0, %{prefix}0{suffix}\n\
++                 \x20 %d{ch}_1 = fmul float %dc1, %{prefix}1{suffix}\n\
++                 \x20 %d{ch}_2 = fmul float %dc2, %{prefix}2{suffix}\n\
++                 \x20 %d{ch}_3 = fmul float %dc3, %{prefix}3{suffix}\n\
++                 \x20 %d{ch}_01 = fadd float %d{ch}_0, %d{ch}_1\n\
++                 \x20 %d{ch}_23 = fadd float %d{ch}_2, %d{ch}_3\n\
++                 \x20 %d{ch} = fadd float %d{ch}_01, %d{ch}_23\n"
++            ));
++        }
++        out.push_str(
++            "  %pxdx = fmul float %px, %dx\n\
++             \x20 %pydy = fmul float %py, %dy\n\
++             \x20 %pd_xy = fadd float %pxdx, %pydy\n\
++             \x20 %prdr = fmul float %pr, %dr\n\
++             \x20 %r_term = select i1 %is_flat, float 0.000000e+00, float %prdr\n\
++             \x20 %f_val = fsub float %pd_xy, %r_term\n\
++             \x20 %dx2 = fmul float %dx, %dx\n\
++             \x20 %dy2 = fmul float %dy, %dy\n\
++             \x20 %d_xy2 = fadd float %dx2, %dy2\n\
++             \x20 %dr2 = fmul float %dr, %dr\n\
++             \x20 %dr_term = select i1 %is_flat, float 0.000000e+00, float %dr2\n\
++             \x20 %df_val = fsub float %d_xy2, %dr_term\n\
++             \x20 %abs_df = call float @llvm.fabs.f32(float %df_val)\n\
++             \x20 %df_ok = fcmp oge float %abs_df, 1.000000e-10\n\
++             \x20 %safe_df = select i1 %df_ok, float %df_val, float 1.000000e+00\n\
++             \x20 %raw_st = fdiv float %f_val, %safe_df\n\
++             \x20 %st_if = select i1 %df_ok, float %raw_st, float 0.000000e+00\n\
++             \x20 %st_hi = fcmp ogt float %st_if, 2.000000e-01\n\
++             \x20 %st_c0 = select i1 %st_hi, float 2.000000e-01, float %st_if\n\
++             \x20 %st_lo = fcmp olt float %st_c0, -2.000000e-01\n\
++             \x20 %st_cl = select i1 %st_lo, float -2.000000e-01, float %st_c0\n\
++             \x20 %u_sub = fsub float %u0, %st_cl\n\
++             \x20 %u_neg = fcmp olt float %u_sub, 0.000000e+00\n\
++             \x20 %u_c0 = select i1 %u_neg, float 0.000000e+00, float %u_sub\n\
++             \x20 %u_ov = fcmp ogt float %u_c0, 1.000000e+00\n\
++             \x20 %u_next = select i1 %u_ov, float 1.000000e+00, float %u_c0\n\
++             \x20 %qom = fsub float 1.000000e+00, %u_next\n\
++             \x20 %qom2 = fmul float %qom, %qom\n\
++             \x20 %qu2 = fmul float %u_next, %u_next\n\
++             \x20 %qc0 = fmul float %qom2, %qom\n\
++             \x20 %qc1_0 = fmul float 3.000000e+00, %qom2\n\
++             \x20 %qc1 = fmul float %qc1_0, %u_next\n\
++             \x20 %qc2_0 = fmul float 3.000000e+00, %qom\n\
++             \x20 %qc2 = fmul float %qc2_0, %qu2\n\
++             \x20 %qc3 = fmul float %qu2, %u_next\n\
++             \x20 %qdc0 = fmul float -3.000000e+00, %qom2\n\
++             \x20 %qomu = fmul float %qom, %u_next\n\
++             \x20 %qsix = fmul float 6.000000e+00, %qomu\n\
++             \x20 %q3om2 = fmul float 3.000000e+00, %qom2\n\
++             \x20 %qdc1 = fsub float %q3om2, %qsix\n\
++             \x20 %q3u2 = fmul float 3.000000e+00, %qu2\n\
++             \x20 %qdc2 = fsub float %qsix, %q3u2\n\
++             \x20 %qdc3 = fmul float 3.000000e+00, %qu2\n",
++        );
++        for (ch, rcol) in [("x", "x"), ("y", "y"), ("z", "z"), ("r", "3")] {
++            let suffix = if ch == "r" { "_3" } else { &format!("_{rcol}") };
++            let prefix = if ch == "r" { "b" } else { "br" };
++            out.push_str(&format!(
++                "  %q{ch}_0 = fmul float %qc0, %{prefix}0{suffix}\n\
++                 \x20 %q{ch}_1 = fmul float %qc1, %{prefix}1{suffix}\n\
++                 \x20 %q{ch}_2 = fmul float %qc2, %{prefix}2{suffix}\n\
++                 \x20 %q{ch}_3 = fmul float %qc3, %{prefix}3{suffix}\n\
++                 \x20 %q{ch}_01 = fadd float %q{ch}_0, %q{ch}_1\n\
++                 \x20 %q{ch}_23 = fadd float %q{ch}_2, %q{ch}_3\n\
++                 \x20 %q{ch} = fadd float %q{ch}_01, %q{ch}_23\n"
++            ));
++            if ch == "x" || ch == "y" || ch == "z" {
++                out.push_str(&format!(
++                    "  %qd{ch}_0 = fmul float %qdc0, %br0_{rcol}\n\
++                     \x20 %qd{ch}_1 = fmul float %qdc1, %br1_{rcol}\n\
++                     \x20 %qd{ch}_2 = fmul float %qdc2, %br2_{rcol}\n\
++                     \x20 %qd{ch}_3 = fmul float %qdc3, %br3_{rcol}\n\
++                     \x20 %qd{ch}_01 = fadd float %qd{ch}_0, %qd{ch}_1\n\
++                     \x20 %qd{ch}_23 = fadd float %qd{ch}_2, %qd{ch}_3\n\
++                     \x20 %qd{ch} = fadd float %qd{ch}_01, %qd{ch}_23\n"
++                ));
++            }
++        }
++        out.push_str(
++            "  %qx2 = fmul float %qx, %qx\n\
++             \x20 %qy2 = fmul float %qy, %qy\n\
++             \x20 %d2_uv = fadd float %qx2, %qy2\n\
++             \x20 %qr2 = fmul float %qr, %qr\n\
++             \x20 %qr2_tol = fmul float %qr2, 0x3FF0000A80000000\n\
++             \x20 %r_nonneg = fcmp oge float %qr, 0.000000e+00\n\
++             \x20 %in_rad = fcmp ole float %d2_uv, %qr2_tol\n\
++             \x20 %is_last = icmp eq i32 %it, 5\n\
++             \x20 %rad_ok0 = and i1 %r_nonneg, %in_rad\n\
++             \x20 %eval_ok = and i1 %is_last, %rad_ok0\n\
++             \x20 %qdx2 = fmul float %qdx, %qdx\n\
++             \x20 %qdy2 = fmul float %qdy, %qdy\n\
++             \x20 %qdz2 = fmul float %qdz, %qdz\n\
++             \x20 %qd_xy2 = fadd float %qdx2, %qdy2\n\
++             \x20 %qd_3d = fadd float %qd_xy2, %qdz2\n\
++             \x20 %qd_ok = fcmp ogt float %qd_3d, 1.000000e-12\n\
++             \x20 %qd_safe = select i1 %qd_ok, float %qd_3d, float 1.000000e+00\n\
++             \x20 %dz_raw = fdiv float %qdz2, %qd_safe\n\
++             \x20 %dz_fr = select i1 %qd_ok, float %dz_raw, float 0.000000e+00\n\
++             \x20 %st2_raw = fsub float 1.000000e+00, %dz_fr\n\
++             \x20 %st2_low = fcmp olt float %st2_raw, 1.000000e-06\n\
++             \x20 %sin_t2 = select i1 %st2_low, float 1.000000e-06, float %st2_raw\n\
++             \x20 %rsq_raw = fsub float %qr2, %d2_uv\n\
++             \x20 %rsq_pos = fcmp ogt float %rsq_raw, 0.000000e+00\n\
++             \x20 %rsq = select i1 %rsq_pos, float %rsq_raw, float 0.000000e+00\n\
++             \x20 %dz_arg = fdiv float %rsq, %sin_t2\n\
++             \x20 %dz_off = call float @air.sqrt.f32(float %dz_arg)\n\
++             \x20 %s_m = fsub float %qz, %dz_off\n\
++             \x20 %s_p = fadd float %qz, %dz_off\n\
++             \x20 %ca = select i1 %is_flat, float %qz, float %s_m\n\
++             \x20 %cb = select i1 %is_flat, float %qz, float %s_p\n\
++             \x20 %ca_ge = fcmp oge float %ca, %smin\n\
++             \x20 %ca_le = fcmp ole float %ca, %smax\n\
++             \x20 %ca_ok = and i1 %ca_ge, %ca_le\n\
++             \x20 %cb_ge = fcmp oge float %cb, %smin\n\
++             \x20 %cb_le = fcmp ole float %cb, %smax\n\
++             \x20 %cb_ok = and i1 %cb_ge, %cb_le\n\
++             \x20 %no_hit = icmp eq i32 %hit_cur, 0\n\
++             \x20 %ca_lt = fcmp olt float %ca, %s_cur\n\
++             \x20 %ca_impr = or i1 %no_hit, %ca_lt\n\
++             \x20 %ca_take0 = and i1 %eval_ok, %ca_ok\n\
++             \x20 %ca_take = and i1 %ca_take0, %ca_impr\n\
++             \x20 %h1 = select i1 %ca_take, i32 1, i32 %hit_cur\n\
++             \x20 %s1 = select i1 %ca_take, float %ca, float %s_cur\n\
++             \x20 %u1 = select i1 %ca_take, float %u_next, float %bu_cur\n\
++             \x20 %no_hit1 = icmp eq i32 %h1, 0\n\
++             \x20 %cb_lt = fcmp olt float %cb, %s1\n\
++             \x20 %cb_impr = or i1 %no_hit1, %cb_lt\n\
++             \x20 %cb_take0 = and i1 %eval_ok, %cb_ok\n\
++             \x20 %cb_take = and i1 %cb_take0, %cb_impr\n\
++             \x20 %hit_next = select i1 %cb_take, i32 1, i32 %h1\n\
++             \x20 %s_next = select i1 %cb_take, float %cb, float %s1\n\
++             \x20 %bu_next = select i1 %cb_take, float %u_next, float %u1\n\
++             \x20 br label %loop_latch\n\
++             \n\
++             loop_latch:\n\
++             \x20 %step_next = add i32 %step, 1\n\
++             \x20 br label %loop_hdr\n\
++             \n\
++             after_loop:\n\
++             \x20 %caps_sphere = icmp eq i32 %caps, 2\n\
++             \x20 %caps_disk = icmp eq i32 %caps, 1\n\
++             \x20 %do_sph = and i1 %is_round, %caps_sphere\n\
++             \x20 %do_dsk = and i1 %is_round, %caps_disk\n\
++             \x20 %at_start = fcmp oeq float %seg_t0, 0.000000e+00\n\
++             \x20 %at_end = fcmp oeq float %seg_t1, 1.000000e+00\n\
++             \x20 %sp0_en0 = and i1 %do_sph, %at_start\n\
++             \x20 %sp0_rk = fcmp ogt float %b0_3, 0.000000e+00\n\
++             \x20 %sp0_en = and i1 %sp0_en0, %sp0_rk\n\
++             \x20 %sp0_b = fadd float %br0_z, 0.000000e+00\n\
++             \x20 %oc0_x = fsub float %rox, %b0_0\n\
++             \x20 %oc0_y = fsub float %roy, %b0_1\n\
++             \x20 %oc0_z = fsub float %roz, %b0_2\n\
++             \x20 %sp0_dot = fmul float %oc0_x, %wnx\n\
++             \x20 %sp0_d1 = fmul float %oc0_y, %wny\n\
++             \x20 %sp0_d2 = fmul float %oc0_z, %wnz\n\
++             \x20 %sp0_b0 = fadd float %sp0_dot, %sp0_d1\n\
++             \x20 %sp0_bv = fadd float %sp0_b0, %sp0_d2\n\
++             \x20 %oc0_2x = fmul float %oc0_x, %oc0_x\n\
++             \x20 %oc0_2y = fmul float %oc0_y, %oc0_y\n\
++             \x20 %oc0_2z = fmul float %oc0_z, %oc0_z\n\
++             \x20 %oc0_xy = fadd float %oc0_2x, %oc0_2y\n\
++             \x20 %oc0_2 = fadd float %oc0_xy, %oc0_2z\n\
++             \x20 %r0_2 = fmul float %b0_3, %b0_3\n\
++             \x20 %sp0_cc = fsub float %oc0_2, %r0_2\n\
++             \x20 %sp0_b2 = fmul float %sp0_bv, %sp0_bv\n\
++             \x20 %sp0_disc = fsub float %sp0_b2, %sp0_cc\n\
++             \x20 %sp0_dok = fcmp oge float %sp0_disc, 0.000000e+00\n\
++             \x20 %sp0_dsafe = select i1 %sp0_dok, float %sp0_disc, float 0.000000e+00\n\
++             \x20 %sp0_sq = call float @air.sqrt.f32(float %sp0_dsafe)\n\
++             \x20 %sp0_nb = fsub float -0.000000e+00, %sp0_bv\n\
++             \x20 %sp0_r0 = fsub float %sp0_nb, %sp0_sq\n\
++             \x20 %sp0_r1 = fadd float %sp0_nb, %sp0_sq\n\
++             \x20 %sp0_use0 = and i1 %sp0_en, %sp0_dok\n\
++             \x20 %sp0_r0_ge = fcmp oge float %sp0_r0, %smin\n\
++             \x20 %sp0_r0_le = fcmp ole float %sp0_r0, %smax\n\
++             \x20 %sp0_r0_rng = and i1 %sp0_r0_ge, %sp0_r0_le\n\
++             \x20 %sp0_nh0 = icmp eq i32 %hit_cur, 0\n\
++             \x20 %sp0_lt0 = fcmp olt float %sp0_r0, %s_cur\n\
++             \x20 %sp0_im0 = or i1 %sp0_nh0, %sp0_lt0\n\
++             \x20 %sp0_tk0a = and i1 %sp0_use0, %sp0_r0_rng\n\
++             \x20 %sp0_tk0 = and i1 %sp0_tk0a, %sp0_im0\n\
++             \x20 %hc1 = select i1 %sp0_tk0, i32 1, i32 %hit_cur\n\
++             \x20 %sc1 = select i1 %sp0_tk0, float %sp0_r0, float %s_cur\n\
++             \x20 %uc1 = select i1 %sp0_tk0, float 0.000000e+00, float %bu_cur\n\
++             \x20 %sp0_r1_ge = fcmp oge float %sp0_r1, %smin\n\
++             \x20 %sp0_r1_le = fcmp ole float %sp0_r1, %smax\n\
++             \x20 %sp0_r1_rng = and i1 %sp0_r1_ge, %sp0_r1_le\n\
++             \x20 %sp0_nh1 = icmp eq i32 %hc1, 0\n\
++             \x20 %sp0_lt1 = fcmp olt float %sp0_r1, %sc1\n\
++             \x20 %sp0_im1 = or i1 %sp0_nh1, %sp0_lt1\n\
++             \x20 %sp0_tk1a = and i1 %sp0_use0, %sp0_r1_rng\n\
++             \x20 %sp0_tk1 = and i1 %sp0_tk1a, %sp0_im1\n\
++             \x20 %hc2 = select i1 %sp0_tk1, i32 1, i32 %hc1\n\
++             \x20 %sc2 = select i1 %sp0_tk1, float %sp0_r1, float %sc1\n\
++             \x20 %uc2 = select i1 %sp0_tk1, float 0.000000e+00, float %uc1\n\
++             \x20 %sp1_en0 = and i1 %do_sph, %at_end\n\
++             \x20 %sp1_rk = fcmp ogt float %b3_3, 0.000000e+00\n\
++             \x20 %sp1_en = and i1 %sp1_en0, %sp1_rk\n\
++             \x20 %oc1_x = fsub float %rox, %b3_0\n\
++             \x20 %oc1_y = fsub float %roy, %b3_1\n\
++             \x20 %oc1_z = fsub float %roz, %b3_2\n\
++             \x20 %sp1_d0 = fmul float %oc1_x, %wnx\n\
++             \x20 %sp1_d1 = fmul float %oc1_y, %wny\n\
++             \x20 %sp1_d2 = fmul float %oc1_z, %wnz\n\
++             \x20 %sp1_b0 = fadd float %sp1_d0, %sp1_d1\n\
++             \x20 %sp1_bv = fadd float %sp1_b0, %sp1_d2\n\
++             \x20 %oc1_2x = fmul float %oc1_x, %oc1_x\n\
++             \x20 %oc1_2y = fmul float %oc1_y, %oc1_y\n\
++             \x20 %oc1_2z = fmul float %oc1_z, %oc1_z\n\
++             \x20 %oc1_xy = fadd float %oc1_2x, %oc1_2y\n\
++             \x20 %oc1_2 = fadd float %oc1_xy, %oc1_2z\n\
++             \x20 %r3_2 = fmul float %b3_3, %b3_3\n\
++             \x20 %sp1_cc = fsub float %oc1_2, %r3_2\n\
++             \x20 %sp1_b2 = fmul float %sp1_bv, %sp1_bv\n\
++             \x20 %sp1_disc = fsub float %sp1_b2, %sp1_cc\n\
++             \x20 %sp1_dok = fcmp oge float %sp1_disc, 0.000000e+00\n\
++             \x20 %sp1_dsafe = select i1 %sp1_dok, float %sp1_disc, float 0.000000e+00\n\
++             \x20 %sp1_sq = call float @air.sqrt.f32(float %sp1_dsafe)\n\
++             \x20 %sp1_nb = fsub float -0.000000e+00, %sp1_bv\n\
++             \x20 %sp1_r0 = fsub float %sp1_nb, %sp1_sq\n\
++             \x20 %sp1_r1 = fadd float %sp1_nb, %sp1_sq\n\
++             \x20 %sp1_use0 = and i1 %sp1_en, %sp1_dok\n\
++             \x20 %sp1_r0_ge = fcmp oge float %sp1_r0, %smin\n\
++             \x20 %sp1_r0_le = fcmp ole float %sp1_r0, %smax\n\
++             \x20 %sp1_r0_rng = and i1 %sp1_r0_ge, %sp1_r0_le\n\
++             \x20 %sp1_nh0 = icmp eq i32 %hc2, 0\n\
++             \x20 %sp1_lt0 = fcmp olt float %sp1_r0, %sc2\n\
++             \x20 %sp1_im0 = or i1 %sp1_nh0, %sp1_lt0\n\
++             \x20 %sp1_tk0a = and i1 %sp1_use0, %sp1_r0_rng\n\
++             \x20 %sp1_tk0 = and i1 %sp1_tk0a, %sp1_im0\n\
++             \x20 %hc3 = select i1 %sp1_tk0, i32 1, i32 %hc2\n\
++             \x20 %sc3 = select i1 %sp1_tk0, float %sp1_r0, float %sc2\n\
++             \x20 %uc3 = select i1 %sp1_tk0, float 1.000000e+00, float %uc2\n\
++             \x20 %sp1_r1_ge = fcmp oge float %sp1_r1, %smin\n\
++             \x20 %sp1_r1_le = fcmp ole float %sp1_r1, %smax\n\
++             \x20 %sp1_r1_rng = and i1 %sp1_r1_ge, %sp1_r1_le\n\
++             \x20 %sp1_nh1 = icmp eq i32 %hc3, 0\n\
++             \x20 %sp1_lt1 = fcmp olt float %sp1_r1, %sc3\n\
++             \x20 %sp1_im1 = or i1 %sp1_nh1, %sp1_lt1\n\
++             \x20 %sp1_tk1a = and i1 %sp1_use0, %sp1_r1_rng\n\
++             \x20 %sp1_tk1 = and i1 %sp1_tk1a, %sp1_im1\n\
++             \x20 %hc4 = select i1 %sp1_tk1, i32 1, i32 %hc3\n\
++             \x20 %sc4 = select i1 %sp1_tk1, float %sp1_r1, float %sc3\n\
++             \x20 %uc4 = select i1 %sp1_tk1, float 1.000000e+00, float %uc3\n\
++             \x20 %d0x = fsub float %b1_0, %b0_0\n\
++             \x20 %d0y = fsub float %b1_1, %b0_1\n\
++             \x20 %d0z = fsub float %b1_2, %b0_2\n\
++             \x20 %d0_x2 = fmul float %d0x, %d0x\n\
++             \x20 %d0_y2 = fmul float %d0y, %d0y\n\
++             \x20 %d0_z2 = fmul float %d0z, %d0z\n\
++             \x20 %d0_xy = fadd float %d0_x2, %d0_y2\n\
++             \x20 %d0_2 = fadd float %d0_xy, %d0_z2\n\
++             \x20 %dk0_ok = fcmp ogt float %d0_2, 1.000000e-12\n\
++             \x20 %dk0_len = call float @air.sqrt.f32(float %d0_2)\n\
++             \x20 %dk0_lsafe = select i1 %dk0_ok, float %dk0_len, float 1.000000e+00\n\
++             \x20 %dk0_nx0 = fsub float -0.000000e+00, %d0x\n\
++             \x20 %dk0_ny0 = fsub float -0.000000e+00, %d0y\n\
++             \x20 %dk0_nz0 = fsub float -0.000000e+00, %d0z\n\
++             \x20 %dk0_nx = fdiv float %dk0_nx0, %dk0_lsafe\n\
++             \x20 %dk0_ny = fdiv float %dk0_ny0, %dk0_lsafe\n\
++             \x20 %dk0_nz = fdiv float %dk0_nz0, %dk0_lsafe\n\
++             \x20 %dk0_dn0 = fmul float %wnx, %dk0_nx\n\
++             \x20 %dk0_dn1 = fmul float %wny, %dk0_ny\n\
++             \x20 %dk0_dn2 = fmul float %wnz, %dk0_nz\n\
++             \x20 %dk0_dn01 = fadd float %dk0_dn0, %dk0_dn1\n\
++             \x20 %dk0_den = fadd float %dk0_dn01, %dk0_dn2\n\
++             \x20 %dk0_aden = call float @llvm.fabs.f32(float %dk0_den)\n\
++             \x20 %dk0_dok = fcmp oge float %dk0_aden, 1.000000e-08\n\
++             \x20 %dk0_dsafe = select i1 %dk0_dok, float %dk0_den, float 1.000000e+00\n\
++             \x20 %dk0_pc0 = fmul float %oc0_x, %dk0_nx\n\
++             \x20 %dk0_pc1 = fmul float %oc0_y, %dk0_ny\n\
++             \x20 %dk0_pc2 = fmul float %oc0_z, %dk0_nz\n\
++             \x20 %dk0_pc01 = fadd float %dk0_pc0, %dk0_pc1\n\
++             \x20 %dk0_pc = fadd float %dk0_pc01, %dk0_pc2\n\
++             \x20 %dk0_npc = fsub float -0.000000e+00, %dk0_pc\n\
++             \x20 %dk0_s = fdiv float %dk0_npc, %dk0_dsafe\n\
++             \x20 %dk0_hx0 = fmul float %wnx, %dk0_s\n\
++             \x20 %dk0_hy0 = fmul float %wny, %dk0_s\n\
++             \x20 %dk0_hz0 = fmul float %wnz, %dk0_s\n\
++             \x20 %dk0_hx = fadd float %oc0_x, %dk0_hx0\n\
++             \x20 %dk0_hy = fadd float %oc0_y, %dk0_hy0\n\
++             \x20 %dk0_hz = fadd float %oc0_z, %dk0_hz0\n\
++             \x20 %dk0_h2x = fmul float %dk0_hx, %dk0_hx\n\
++             \x20 %dk0_h2y = fmul float %dk0_hy, %dk0_hy\n\
++             \x20 %dk0_h2z = fmul float %dk0_hz, %dk0_hz\n\
++             \x20 %dk0_h2xy = fadd float %dk0_h2x, %dk0_h2y\n\
++             \x20 %dk0_h2 = fadd float %dk0_h2xy, %dk0_h2z\n\
++             \x20 %dk0_r2t = fmul float %r0_2, 0x3FF0000A80000000\n\
++             \x20 %dk0_in = fcmp ole float %dk0_h2, %dk0_r2t\n\
++             \x20 %dk0_en0 = and i1 %do_dsk, %at_start\n\
++             \x20 %dk0_en1 = and i1 %dk0_en0, %sp0_rk\n\
++             \x20 %dk0_en2 = and i1 %dk0_en1, %dk0_ok\n\
++             \x20 %dk0_en3 = and i1 %dk0_en2, %dk0_dok\n\
++             \x20 %dk0_en4 = and i1 %dk0_en3, %dk0_in\n\
++             \x20 %dk0_ge = fcmp oge float %dk0_s, %smin\n\
++             \x20 %dk0_le = fcmp ole float %dk0_s, %smax\n\
++             \x20 %dk0_rng = and i1 %dk0_ge, %dk0_le\n\
++             \x20 %dk0_nh = icmp eq i32 %hc4, 0\n\
++             \x20 %dk0_lt = fcmp olt float %dk0_s, %sc4\n\
++             \x20 %dk0_im = or i1 %dk0_nh, %dk0_lt\n\
++             \x20 %dk0_tk0 = and i1 %dk0_en4, %dk0_rng\n\
++             \x20 %dk0_tk = and i1 %dk0_tk0, %dk0_im\n\
++             \x20 %hc5 = select i1 %dk0_tk, i32 1, i32 %hc4\n\
++             \x20 %sc5 = select i1 %dk0_tk, float %dk0_s, float %sc4\n\
++             \x20 %uc5 = select i1 %dk0_tk, float 0.000000e+00, float %uc4\n\
++             \x20 %d1x = fsub float %b3_0, %b2_0\n\
++             \x20 %d1y = fsub float %b3_1, %b2_1\n\
++             \x20 %d1z = fsub float %b3_2, %b2_2\n\
++             \x20 %d1_x2 = fmul float %d1x, %d1x\n\
++             \x20 %d1_y2 = fmul float %d1y, %d1y\n\
++             \x20 %d1_z2 = fmul float %d1z, %d1z\n\
++             \x20 %d1_xy = fadd float %d1_x2, %d1_y2\n\
++             \x20 %d1_2 = fadd float %d1_xy, %d1_z2\n\
++             \x20 %dk1_ok = fcmp ogt float %d1_2, 1.000000e-12\n\
++             \x20 %dk1_len = call float @air.sqrt.f32(float %d1_2)\n\
++             \x20 %dk1_lsafe = select i1 %dk1_ok, float %dk1_len, float 1.000000e+00\n\
++             \x20 %dk1_nx = fdiv float %d1x, %dk1_lsafe\n\
++             \x20 %dk1_ny = fdiv float %d1y, %dk1_lsafe\n\
++             \x20 %dk1_nz = fdiv float %d1z, %dk1_lsafe\n\
++             \x20 %dk1_dn0 = fmul float %wnx, %dk1_nx\n\
++             \x20 %dk1_dn1 = fmul float %wny, %dk1_ny\n\
++             \x20 %dk1_dn2 = fmul float %wnz, %dk1_nz\n\
++             \x20 %dk1_dn01 = fadd float %dk1_dn0, %dk1_dn1\n\
++             \x20 %dk1_den = fadd float %dk1_dn01, %dk1_dn2\n\
++             \x20 %dk1_aden = call float @llvm.fabs.f32(float %dk1_den)\n\
++             \x20 %dk1_dok = fcmp oge float %dk1_aden, 1.000000e-08\n\
++             \x20 %dk1_dsafe = select i1 %dk1_dok, float %dk1_den, float 1.000000e+00\n\
++             \x20 %dk1_pc0 = fmul float %oc1_x, %dk1_nx\n\
++             \x20 %dk1_pc1 = fmul float %oc1_y, %dk1_ny\n\
++             \x20 %dk1_pc2 = fmul float %oc1_z, %dk1_nz\n\
++             \x20 %dk1_pc01 = fadd float %dk1_pc0, %dk1_pc1\n\
++             \x20 %dk1_pc = fadd float %dk1_pc01, %dk1_pc2\n\
++             \x20 %dk1_npc = fsub float -0.000000e+00, %dk1_pc\n\
++             \x20 %dk1_s = fdiv float %dk1_npc, %dk1_dsafe\n\
++             \x20 %dk1_hx0 = fmul float %wnx, %dk1_s\n\
++             \x20 %dk1_hy0 = fmul float %wny, %dk1_s\n\
++             \x20 %dk1_hz0 = fmul float %wnz, %dk1_s\n\
++             \x20 %dk1_hx = fadd float %oc1_x, %dk1_hx0\n\
++             \x20 %dk1_hy = fadd float %oc1_y, %dk1_hy0\n\
++             \x20 %dk1_hz = fadd float %oc1_z, %dk1_hz0\n\
++             \x20 %dk1_h2x = fmul float %dk1_hx, %dk1_hx\n\
++             \x20 %dk1_h2y = fmul float %dk1_hy, %dk1_hy\n\
++             \x20 %dk1_h2z = fmul float %dk1_hz, %dk1_hz\n\
++             \x20 %dk1_h2xy = fadd float %dk1_h2x, %dk1_h2y\n\
++             \x20 %dk1_h2 = fadd float %dk1_h2xy, %dk1_h2z\n\
++             \x20 %dk1_r2t = fmul float %r3_2, 0x3FF0000A80000000\n\
++             \x20 %dk1_in = fcmp ole float %dk1_h2, %dk1_r2t\n\
++             \x20 %dk1_en0 = and i1 %do_dsk, %at_end\n\
++             \x20 %dk1_en1 = and i1 %dk1_en0, %sp1_rk\n\
++             \x20 %dk1_en2 = and i1 %dk1_en1, %dk1_ok\n\
++             \x20 %dk1_en3 = and i1 %dk1_en2, %dk1_dok\n\
++             \x20 %dk1_en4 = and i1 %dk1_en3, %dk1_in\n\
++             \x20 %dk1_ge = fcmp oge float %dk1_s, %smin\n\
++             \x20 %dk1_le = fcmp ole float %dk1_s, %smax\n\
++             \x20 %dk1_rng = and i1 %dk1_ge, %dk1_le\n\
++             \x20 %dk1_nh = icmp eq i32 %hc5, 0\n\
++             \x20 %dk1_lt = fcmp olt float %dk1_s, %sc5\n\
++             \x20 %dk1_im = or i1 %dk1_nh, %dk1_lt\n\
++             \x20 %dk1_tk0 = and i1 %dk1_en4, %dk1_rng\n\
++             \x20 %dk1_tk = and i1 %dk1_tk0, %dk1_im\n\
++             \x20 %hc_fin = select i1 %dk1_tk, i32 1, i32 %hc5\n\
++             \x20 %sc_fin = select i1 %dk1_tk, float %dk1_s, float %sc5\n\
++             \x20 %uc_fin_loc = select i1 %dk1_tk, float 1.000000e+00, float %uc5\n\
++             \x20 %du_sub = fsub float %seg_t1, %seg_t0\n\
++             \x20 %u_scaled = fmul float %du_sub, %uc_fin_loc\n\
++             \x20 %u_glob = fadd float %seg_t0, %u_scaled\n\
++             \x20 %has_h = icmp ne i32 %hc_fin, 0\n\
++             \x20 %hf = select i1 %has_h, float 1.000000e+00, float 0.000000e+00\n\
++             \x20 %tf0 = fmul float %sc_fin, %inv_dlen\n\
++             \x20 %tf = select i1 %has_h, float %tf0, float 0.000000e+00\n\
++             \x20 %uf = select i1 %has_h, float %u_glob, float 0.000000e+00\n\
++             \x20 %r0 = insertelement <4 x float> poison, float %hf, i64 0\n\
++             \x20 %r1 = insertelement <4 x float> %r0, float %tf, i64 1\n\
++             \x20 %r2 = insertelement <4 x float> %r1, float %uf, i64 2\n\
++             \x20 %r3 = insertelement <4 x float> %r2, float %seg_id_f, i64 3\n\
++             \x20 br label %meta_done\n\
++             \n\
++             meta_done:\n\
++             \x20 %m_res = phi <4 x float> [ %r3, %after_loop ], [ zeroinitializer, %read_meta ]\n\
++             \x20 br label %exit\n\
++             \n\
++             exit:\n\
++             \x20 %res = phi <4 x float> [ %m_res, %meta_done ], [ zeroinitializer, %entry ]\n\
++             \x20 ret <4 x float> %res\n\
++             }\n",
++        );
++    }
++}
++
+ fn append_rq_intrinsic_declarations(out: &mut String, existing_ll: &str) {
+     let decls = [
+         "declare void @__m2v.rq.init(i32, ptr addrspace(1), i32, i32, <3 x float>, float, <3 x float>, float)",
+@@ -2260,11 +3327,14 @@ fn emit_ray_query_helper(
+     linked_callbacks: &[LinkedRayCallback],
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
++    rt_curves_enabled: bool,
+ ) -> Result<String, String> {
+     let family = &p.family;
+     let idx = param_indices(family);
+     let slot = p.slot_id;
+     let ret_ty = &p.lowered_result_type;
++    let has_instancing = family.instancing != AirIntersectionInstancing::None;
++    let has_curves = rt_curves_enabled && family.curve_data;
+ 
+     let mut params = Vec::with_capacity(p.raw_args.len());
+     for (i, (ty, _)) in p.raw_args.iter().enumerate() {
+@@ -2351,6 +3421,30 @@ fn emit_ray_query_helper(
+         ));
+     }
+ 
++    let curve_root_bda = if has_curves {
++        let root_val = if p.accel_is_bda {
++            "%p4".to_string()
++        } else if let Some(as_slot) = p.descriptor_as_slot {
++            s.push_str(&format!(
++                "  %rq_root_bda = call i64 @__m2v.rq.slot_as_bda(i32 {as_slot})\n"
++            ));
++            "%rq_root_bda".to_string()
++        } else {
++            "0".to_string()
++        };
++        s.push_str(
++            "  %comm_is_curve = alloca i32, align 4\n\
++             \x20 %comm_curve_u = alloca float, align 4\n\
++             \x20 %comm_curve_seg = alloca i32, align 4\n\
++             \x20 store i32 0, ptr %comm_is_curve, align 4\n\
++             \x20 store float 0.000000e+00, ptr %comm_curve_u, align 4\n\
++             \x20 store i32 0, ptr %comm_curve_seg, align 4\n",
++        );
++        root_val
++    } else {
++        "0".to_string()
++    };
++
+     let call_payload_size: Option<u32> = p
+         .raw_args
+         .get(idx.payload + 1)
+@@ -2376,6 +3470,11 @@ fn emit_ray_query_helper(
+         .copied()
+         .filter(|cb| cb.kind == IntersectionFunctionKind::BoundingBox)
+         .collect();
++    let curve_callbacks: Vec<&LinkedRayCallback> = active_callbacks
++        .iter()
++        .copied()
++        .filter(|cb| cb.kind == IntersectionFunctionKind::Curve)
++        .collect();
+ 
+     s.push_str("  br label %proceed_hdr\n\n");
+     s.push_str(&format!(
+@@ -2385,23 +3484,89 @@ fn emit_ray_query_helper(
+     ));
+ 
+     if active_callbacks.is_empty() {
+-        // Callback-free (or empty-table) proceed loop: confirm non-opaque triangles, skip AABBs.
+-        s.push_str(&format!(
+-            "proceed_body:\n\
+-             \x20 %ctype = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
+-             \x20 %is_tri = icmp eq i32 %ctype, 0\n\
+-             \x20 br i1 %is_tri, label %confirm_tri, label %proceed_hdr\n\n\
+-             confirm_tri:\n\
+-             \x20 call void @__m2v.rq.confirm(i32 {slot})\n\
+-             \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n\
+-             term_hit:\n\
+-             \x20 call void @__m2v.rq.terminate(i32 {slot})\n\
+-             \x20 br label %proceed_hdr\n\n"
+-        ));
++        if has_curves {
++            let (inst_tag, inst_line, inst_arg) = if has_instancing {
++                (
++                    1u32,
++                    format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"),
++                    "%c_inst",
++                )
++            } else {
++                (0u32, String::new(), "0")
++            };
++            let (ro_call, rd_call) = if has_instancing {
++                (
++                    format!("call <3 x float> @__m2v.rq.get_object_ray_origin(i32 {slot}, i32 0)"),
++                    format!("call <3 x float> @__m2v.rq.get_object_ray_direction(i32 {slot}, i32 0)"),
++                )
++            } else {
++                (
++                    format!("call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})"),
++                    format!("call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})"),
++                )
++            };
++            s.push_str(&format!(
++                "proceed_body:\n\
++                 \x20 %ctype = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++                 \x20 %is_tri = icmp eq i32 %ctype, 0\n\
++                 \x20 br i1 %is_tri, label %confirm_tri, label %check_curve_geom\n\n\
++                 confirm_tri:\n\
++                 \x20 call void @__m2v.rq.confirm(i32 {slot})\n\
++                 \x20 store i32 0, ptr %comm_is_curve, align 4\n\
++                 \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n\
++                 check_curve_geom:\n\
++                 \x20 %c_geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n\
++                 \x20 %c_aabb = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
++                 {inst_line}\
++                 \x20 %c_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {curve_root_bda}, i32 {inst_tag}, i32 {inst_arg})\n\
++                 \x20 %c_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %c_slot, i32 %c_geom)\n\
++                 \x20 %c_is = icmp ne i64 %c_hdr, 0\n\
++                 \x20 br i1 %c_is, label %curve_cand, label %proceed_hdr\n\n\
++                 curve_cand:\n\
++                 \x20 %c_ro = {ro_call}\n\
++                 \x20 %c_rd = {rd_call}\n\
++                 \x20 %c_tmin = call float @__m2v.rq.get_tmin(i32 {slot})\n\
++                 \x20 %c_tmax = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n\
++                 \x20 %c_res = call <4 x float> @__m2v.rq.query.curve_intersect(i64 %c_slot, i64 %c_hdr, i32 %c_aabb, <3 x float> %c_ro, <3 x float> %c_rd, float %c_tmin, float %c_tmax)\n\
++                 \x20 %c_hf = extractelement <4 x float> %c_res, i64 0\n\
++                 \x20 %c_t = extractelement <4 x float> %c_res, i64 1\n\
++                 \x20 %c_u = extractelement <4 x float> %c_res, i64 2\n\
++                 \x20 %c_sf = extractelement <4 x float> %c_res, i64 3\n\
++                 \x20 %c_seg = bitcast float %c_sf to i32\n\
++                 \x20 %c_hit = fcmp ogt float %c_hf, 5.000000e-01\n\
++                 \x20 %c_ge = fcmp oge float %c_t, %c_tmin\n\
++                 \x20 %c_le = fcmp ole float %c_t, %c_tmax\n\
++                 \x20 %c_rng = and i1 %c_ge, %c_le\n\
++                 \x20 %c_ok = and i1 %c_hit, %c_rng\n\
++                 \x20 br i1 %c_ok, label %curve_gen, label %proceed_hdr\n\n\
++                 curve_gen:\n\
++                 \x20 call void @__m2v.rq.generate(i32 {slot}, float %c_t)\n\
++                 \x20 store i32 1, ptr %comm_is_curve, align 4\n\
++                 \x20 store float %c_u, ptr %comm_curve_u, align 4\n\
++                 \x20 store i32 %c_seg, ptr %comm_curve_seg, align 4\n\
++                 \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n\
++                 term_hit:\n\
++                 \x20 call void @__m2v.rq.terminate(i32 {slot})\n\
++                 \x20 br label %proceed_hdr\n\n"
++            ));
++        } else {
++            // Callback-free (or empty-table) proceed loop: confirm non-opaque triangles, skip AABBs.
++            s.push_str(&format!(
++                "proceed_body:\n\
++                 \x20 %ctype = call i32 @__m2v.rq.get_type(i32 {slot}, i32 0)\n\
++                 \x20 %is_tri = icmp eq i32 %ctype, 0\n\
++                 \x20 br i1 %is_tri, label %confirm_tri, label %proceed_hdr\n\n\
++                 confirm_tri:\n\
++                 \x20 call void @__m2v.rq.confirm(i32 {slot})\n\
++                 \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n\
++                 term_hit:\n\
++                 \x20 call void @__m2v.rq.terminate(i32 {slot})\n\
++                 \x20 br label %proceed_hdr\n\n"
++            ));
++        }
+     } else {
+         // Runtime MTLIntersectionFunctionTable dispatch inside OpRayQueryProceedKHR loop.
+         // Buffer ABI (matching 0074 VFT): word[0] = slot_count, word[1 + slot] = handle_id.
+-        let has_instancing = family.instancing != AirIntersectionInstancing::None;
+         let table_param = format!("%p{}", idx.table);
+         let fto_param = format!("%p{}", idx.function_table_offset);
+         s.push_str(&format!(
+@@ -2422,6 +3587,11 @@ fn emit_ray_query_helper(
+         // ABI v2: header_words = 66 (word[0] = slot_count, word[1] = 2, word[2] = attached_mask,
+         //         word[3] = 0, word[4..65] = u64 attached_bda[31], word[66 + slot] = handle_id).
+         let header_words: u32 = if ift_abi_v2 { 66 } else { 1 };
++        let non_tri_label = if has_curves {
++            "non_tri_dispatch"
++        } else {
++            "aabb_dispatch"
++        };
+         s.push_str(&format!(
+             "  %fto_neg = icmp slt i32 {fto_param}, 0\n\
+              \x20 %fto_safe = select i1 %fto_neg, i32 0, i32 {fto_param}\n\
+@@ -2439,7 +3609,7 @@ fn emit_ray_query_helper(
+              ift_dispatch:\n\
+              \x20 %ift_hdl = phi i32 [ %ift_loaded_hdl, %ift_load ], [ 0, %ift_oob ]\n\
+              \x20 %is_tri = icmp eq i32 %ctype, 0\n\
+-             \x20 br i1 %is_tri, label %tri_dispatch, label %aabb_dispatch\n\n"
++             \x20 br i1 %is_tri, label %tri_dispatch, label %{non_tri_label}\n\n"
+         ));
+ 
+         // Triangle any-hit dispatch.
+@@ -2466,15 +3636,105 @@ fn emit_ray_query_helper(
+                     ift_abi_v2,
+                     prim_data_enabled,
+                     &table_param,
++                    has_curves,
+                 )?;
+             }
+         }
++        let tri_def_clr = if has_curves {
++            "  store i32 0, ptr %comm_is_curve, align 4\n"
++        } else {
++            ""
++        };
+         s.push_str(&format!(
+             "tri_default:\n\
+              \x20 call void @__m2v.rq.confirm(i32 {slot})\n\
++             {tri_def_clr}\
+              \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n"
+         ));
+ 
++        if has_curves {
++            let (inst_tag, inst_line, inst_arg) = if has_instancing {
++                (
++                    1u32,
++                    format!("  %c_inst = call i32 @__m2v.rq.get_instance_id(i32 {slot}, i32 0)\n"),
++                    "%c_inst",
++                )
++            } else {
++                (0u32, String::new(), "0")
++            };
++            let (ro_call, rd_call) = if has_instancing {
++                (
++                    format!("call <3 x float> @__m2v.rq.get_object_ray_origin(i32 {slot}, i32 0)"),
++                    format!("call <3 x float> @__m2v.rq.get_object_ray_direction(i32 {slot}, i32 0)"),
++                )
++            } else {
++                (
++                    format!("call <3 x float> @__m2v.rq.get_world_ray_origin(i32 {slot})"),
++                    format!("call <3 x float> @__m2v.rq.get_world_ray_direction(i32 {slot})"),
++                )
++            };
++            s.push_str(&format!(
++                "non_tri_dispatch:\n\
++                 \x20 %c_aabb = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
++                 {inst_line}\
++                 \x20 %c_slot = call i64 @__m2v.rq.query.lookup_blas_slot(i64 {curve_root_bda}, i32 {inst_tag}, i32 {inst_arg})\n\
++                 \x20 %c_hdr = call i64 @__m2v.rq.query.check_curve_hdr(i64 %c_slot, i32 %cand_geom)\n\
++                 \x20 %c_is = icmp ne i64 %c_hdr, 0\n\
++                 \x20 br i1 %c_is, label %curve_cand, label %aabb_dispatch\n\n\
++                 curve_cand:\n\
++                 \x20 %c_ro = {ro_call}\n\
++                 \x20 %c_rd = {rd_call}\n\
++                 \x20 %c_tmin = call float @__m2v.rq.get_tmin(i32 {slot})\n\
++                 \x20 %c_tmax = call float @__m2v.rq.get_t(i32 {slot}, i32 1)\n\
++                 \x20 %c_res = call <4 x float> @__m2v.rq.query.curve_intersect(i64 %c_slot, i64 %c_hdr, i32 %c_aabb, <3 x float> %c_ro, <3 x float> %c_rd, float %c_tmin, float %c_tmax)\n\
++                 \x20 %c_hf = extractelement <4 x float> %c_res, i64 0\n\
++                 \x20 %c_t = extractelement <4 x float> %c_res, i64 1\n\
++                 \x20 %c_u = extractelement <4 x float> %c_res, i64 2\n\
++                 \x20 %c_sf = extractelement <4 x float> %c_res, i64 3\n\
++                 \x20 %c_seg = bitcast float %c_sf to i32\n\
++                 \x20 %c_hit = fcmp ogt float %c_hf, 5.000000e-01\n\
++                 \x20 %c_ge = fcmp oge float %c_t, %c_tmin\n\
++                 \x20 %c_le = fcmp ole float %c_t, %c_tmax\n\
++                 \x20 %c_rng = and i1 %c_ge, %c_le\n\
++                 \x20 %c_ok = and i1 %c_hit, %c_rng\n\
++                 \x20 br i1 %c_ok, label %curve_dispatch, label %proceed_hdr\n\n\
++                 curve_dispatch:\n"
++            ));
++            if curve_callbacks.is_empty() {
++                s.push_str("  br label %curve_default\n\n");
++            } else {
++                s.push_str("  switch i32 %ift_hdl, label %curve_default [\n");
++                for cb in &curve_callbacks {
++                    s.push_str(&format!(
++                        "    i32 {}, label %curve_case_{}\n",
++                        cb.handle_id, cb.handle_id
++                    ));
++                }
++                s.push_str("  ]\n\n");
++                for cb in &curve_callbacks {
++                    emit_curve_callback_case(
++                        &mut s,
++                        slot,
++                        cb,
++                        has_instancing,
++                        &idx,
++                        p,
++                        ift_abi_v2,
++                        prim_data_enabled,
++                        &table_param,
++                    )?;
++                }
++            }
++            s.push_str(&format!(
++                "curve_default:\n\
++                 \x20 call void @__m2v.rq.generate(i32 {slot}, float %c_t)\n\
++                 \x20 store i32 1, ptr %comm_is_curve, align 4\n\
++                 \x20 store float %c_u, ptr %comm_curve_u, align 4\n\
++                 \x20 store i32 %c_seg, ptr %comm_curve_seg, align 4\n\
++                 \x20 br i1 %accept_any, label %term_hit, label %proceed_hdr\n\n"
++            ));
++        }
++
+         // Bounding-box custom intersection dispatch.
+         s.push_str("aabb_dispatch:\n");
+         if aabb_callbacks.is_empty() {
+@@ -2499,6 +3759,7 @@ fn emit_ray_query_helper(
+                     ift_abi_v2,
+                     prim_data_enabled,
+                     &table_param,
++                    has_curves,
+                 )?;
+             }
+         }
+@@ -2515,8 +3776,7 @@ fn emit_ray_query_helper(
+     }
+ 
+     // Done: UB-safe committed intersection extraction (never invoke hit-only getters on miss,
+-    // never invoke triangle-only getters on generated AABB hits).
+-    let has_instancing = family.instancing != AirIntersectionInstancing::None;
++    // never invoke triangle-only getters on generated AABB/curve hits).
+     let is_multi_level = family.instancing == AirIntersectionInstancing::MultiLevel;
+     s.push_str(&format!(
+         "done:\n\
+@@ -2556,8 +3816,22 @@ fn emit_ray_query_helper(
+             ));
+         }
+     }
++    if has_curves {
++        s.push_str(
++            "  %hit_ic32 = load i32, ptr %comm_is_curve, align 4\n\
++             \x20 %hit_ic = icmp ne i32 %hit_ic32, 0\n\
++             \x20 %hit_is_gen = icmp eq i32 %comm_type, 2\n\
++             \x20 %hit_is_curve = and i1 %hit_ic, %hit_is_gen\n\
++             \x20 %hit_cu_raw = load float, ptr %comm_curve_u, align 4\n\
++             \x20 %hit_cseg_raw = load i32, ptr %comm_curve_seg, align 4\n\
++             \x20 %hit_prim_final = select i1 %hit_is_curve, i32 %hit_cseg_raw, i32 %hit_prim\n\
++             \x20 %hit_cu_final = select i1 %hit_is_curve, float %hit_cu_raw, float 0.000000e+00\n",
++        );
++    }
+     if prim_data_enabled && p.reads_prim_data {
+-        let root_bda = if p.accel_is_bda {
++        let root_bda = if has_curves {
++            curve_root_bda.clone()
++        } else if p.accel_is_bda {
+             "%p4".to_string()
+         } else if let Some(as_slot) = p.descriptor_as_slot {
+             s.push_str(&format!(
+@@ -2572,15 +3846,35 @@ fn emit_ray_query_helper(
+         } else {
+             (0, "0")
+         };
++        let lookup_prim_arg = if has_curves {
++            "%hit_prim_final"
++        } else {
++            "%hit_prim"
++        };
+         s.push_str(&format!(
+-            "  %hit_prim_data = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 %hit_geom, i32 %hit_prim)\n"
++            "  %hit_prim_data = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 %hit_geom, i32 {lookup_prim_arg})\n"
+         ));
+     }
+     s.push_str("  br label %after_hit\n\nafter_hit:\n");
+-    s.push_str(
+-        "  %res_prim = phi i32 [ %hit_prim, %read_hit ], [ 0, %done ]\n\
+-         \x20 %res_geom = phi i32 [ %hit_geom, %read_hit ], [ 0, %done ]\n",
+-    );
++    let prim_phi_src = if has_curves {
++        "%hit_prim_final"
++    } else {
++        "%hit_prim"
++    };
++    s.push_str(&format!(
++        "  %res_prim = phi i32 [ {prim_phi_src}, %read_hit ], [ 0, %done ]\n\
++         \x20 %res_geom = phi i32 [ %hit_geom, %read_hit ], [ 0, %done ]\n"
++    ));
++    if has_curves {
++        s.push_str(
++            "  %res_curve_u = phi float [ %hit_cu_final, %read_hit ], [ 0.000000e+00, %done ]\n\
++             \x20 %res_ic32 = load i32, ptr %comm_is_curve, align 4\n\
++             \x20 %res_ic = icmp ne i32 %res_ic32, 0\n\
++             \x20 %res_is_gen = icmp eq i32 %comm_type, 2\n\
++             \x20 %res_is_curve = and i1 %res_ic, %res_is_gen\n\
++             \x20 %res_itype = select i1 %res_is_curve, i32 3, i32 %comm_type\n",
++        );
++    }
+     if prim_data_enabled && p.reads_prim_data {
+         s.push_str("  %res_prim_data = phi i64 [ %hit_prim_data, %read_hit ], [ 0, %done ]\n");
+     }
+@@ -2631,7 +3925,13 @@ fn emit_ray_query_helper(
+     let mut prev = "poison".to_string();
+     for (fi, field) in fields.iter().enumerate() {
+         let (ft, fv) = match field {
+-            AirIntersectionResultField::IntersectionType => ("i32", "%comm_type".to_string()),
++            AirIntersectionResultField::IntersectionType => {
++                if has_curves {
++                    ("i32", "%res_itype".to_string())
++                } else {
++                    ("i32", "%comm_type".to_string())
++                }
++            }
+             AirIntersectionResultField::Distance => ("float", "%comm_t".to_string()),
+             AirIntersectionResultField::PrimitiveId => ("i32", "%res_prim".to_string()),
+             AirIntersectionResultField::GeometryId => ("i32", "%res_geom".to_string()),
+@@ -2650,7 +3950,13 @@ fn emit_ray_query_helper(
+             }
+             AirIntersectionResultField::Barycentrics => ("<2 x float>", "%res_bary".to_string()),
+             AirIntersectionResultField::FrontFacing => ("i1", "%res_front".to_string()),
+-            AirIntersectionResultField::CurveParameter => ("float", "0.000000e+00".to_string()),
++            AirIntersectionResultField::CurveParameter => {
++                if has_curves {
++                    ("float", "%res_curve_u".to_string())
++                } else {
++                    ("float", "0.000000e+00".to_string())
++                }
++            }
+             AirIntersectionResultField::WorldSpaceVector(v) => {
+                 if *v < 4 {
+                     ("<3 x float>", format!("%res_w2o_{v}"))
+@@ -2681,6 +3987,7 @@ fn emit_callback_args(
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
+     table_param: &str,
++    curve_vals: Option<(&str, &str, &str)>,
+ ) -> Vec<String> {
+     let mut args = Vec::with_capacity(cb.param_types.len());
+     for (pi, (pty, role)) in cb
+@@ -2756,10 +4063,31 @@ fn emit_callback_args(
+                 args.push(format!("{pty} {vname}"));
+             }
+             CallbackParamRole::PrimitiveId => {
+-                s.push_str(&format!(
+-                    "  {vname} = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n"
+-                ));
+-                args.push(format!("{pty} {vname}"));
++                if let Some((_, _, cseg)) = curve_vals {
++                    args.push(format!("{pty} {cseg}"));
++                } else {
++                    s.push_str(&format!(
++                        "  {vname} = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n"
++                    ));
++                    args.push(format!("{pty} {vname}"));
++                }
++            }
++            CallbackParamRole::CandidateDistance => {
++                if let Some((ct, _, _)) = curve_vals {
++                    args.push(format!("{pty} {ct}"));
++                } else {
++                    s.push_str(&format!(
++                        "  {vname} = call float @__m2v.rq.get_t(i32 {slot}, i32 0)\n"
++                    ));
++                    args.push(format!("{pty} {vname}"));
++                }
++            }
++            CallbackParamRole::CurveParameter => {
++                if let Some((_, cu, _)) = curve_vals {
++                    args.push(format!("{pty} {cu}"));
++                } else {
++                    args.push(format!("{pty} 0.000000e+00"));
++                }
+             }
+             CallbackParamRole::GeometryId => {
+                 s.push_str(&format!(
+@@ -2868,9 +4196,16 @@ fn emit_callback_args(
+                     } else {
+                         "0".to_string()
+                     };
++                    let prim_expr = if let Some((_, _, cseg)) = curve_vals {
++                        cseg.to_string()
++                    } else {
++                        s.push_str(&format!(
++                            "  {vname}_prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n"
++                        ));
++                        format!("{vname}_prim")
++                    };
+                     s.push_str(&format!(
+-                        "  {vname}_prim = call i32 @__m2v.rq.get_primitive_index(i32 {slot}, i32 0)\n\
+-                         \x20 {vname}_geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n"
++                        "  {vname}_geom = call i32 @__m2v.rq.get_geometry_index(i32 {slot}, i32 0)\n"
+                     ));
+                     let (has_inst_i32, inst_val) = if has_instancing {
+                         s.push_str(&format!(
+@@ -2882,7 +4217,7 @@ fn emit_callback_args(
+                     };
+                     let addr_var = format!("%__m2v.rq.prim_data.{prefix}_{pi}");
+                     s.push_str(&format!(
+-                        "  {addr_var} = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 {vname}_geom, i32 {vname}_prim)\n\
++                        "  {addr_var} = call i64 @__m2v.rq.query.lookup_prim_data(i64 {root_bda}, i32 {has_inst_i32}, i32 {inst_val}, i32 {vname}_geom, i32 {prim_expr})\n\
+                          \x20 {vname} = inttoptr i64 {addr_var} to {pty}\n"
+                     ));
+                     args.push(format!("{pty} {vname}"));
+@@ -3000,6 +4335,7 @@ fn emit_triangle_callback_case(
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
+     table_param: &str,
++    has_curves: bool,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+     let prefix = format!("tc{hid}");
+@@ -3016,6 +4352,7 @@ fn emit_triangle_callback_case(
+         ift_abi_v2,
+         prim_data_enabled,
+         table_param,
++        None,
+     );
+     let rty = cb.return_type.trim();
+     s.push_str(&format!(
+@@ -3062,12 +4399,18 @@ fn emit_triangle_callback_case(
+             cb.llvm_symbol
+         ));
+     };
++    let tri_clr = if has_curves {
++        "  store i32 0, ptr %comm_is_curve, align 4\n"
++    } else {
++        ""
++    };
+     s.push_str(&format!(
+         "  %{prefix}_stop_cb = xor i1 {continue_val}, true\n\
+          \x20 %{prefix}_stop = or i1 %accept_any, %{prefix}_stop_cb\n\
+          \x20 br i1 {accept_val}, label %tri_confirm_{hid}, label %tri_reject_{hid}\n\n\
+          tri_confirm_{hid}:\n\
+          \x20 call void @__m2v.rq.confirm(i32 {slot})\n\
++         {tri_clr}\
+          \x20 br i1 %{prefix}_stop, label %term_hit, label %proceed_hdr\n\n\
+          tri_reject_{hid}:\n\
+          \x20 br i1 %{prefix}_stop_cb, label %term_hit, label %proceed_hdr\n\n"
+@@ -3075,6 +4418,95 @@ fn emit_triangle_callback_case(
+     Ok(())
+ }
+ 
++fn emit_curve_callback_case(
++    s: &mut String,
++    slot: u32,
++    cb: &LinkedRayCallback,
++    has_instancing: bool,
++    idx: &ParsedParamIndices,
++    p: &PendingCall,
++    ift_abi_v2: bool,
++    prim_data_enabled: bool,
++    table_param: &str,
++) -> Result<(), String> {
++    let hid = cb.handle_id;
++    let prefix = format!("cc{hid}");
++    s.push_str(&format!("curve_case_{hid}:\n"));
++    let args = emit_callback_args(
++        s,
++        slot,
++        &prefix,
++        cb,
++        false,
++        has_instancing,
++        idx,
++        p,
++        ift_abi_v2,
++        prim_data_enabled,
++        table_param,
++        Some(("%c_t", "%c_u", "%c_seg")),
++    );
++    let rty = cb.return_type.trim();
++    s.push_str(&format!(
++        "  %{prefix}_ret = call {rty} {}({})\n",
++        cb.llvm_symbol,
++        args.join(", ")
++    ));
++    let (accept_val, continue_val) = if rty == "i1" {
++        (format!("%{prefix}_ret"), "true".to_string())
++    } else if rty == "i8" || rty == "i32" {
++        s.push_str(&format!(
++            "  %{prefix}_acc = icmp ne {rty} %{prefix}_ret, 0\n"
++        ));
++        (format!("%{prefix}_acc"), "true".to_string())
++    } else if let Some(fields) = struct_field_types(rty) {
++        let mut bool_fields = Vec::new();
++        for (fi, ft) in fields.iter().enumerate() {
++            if ft == "i1" || ft == "i8" || ft == "i32" {
++                s.push_str(&format!(
++                    "  %{prefix}_f{fi} = extractvalue {rty} %{prefix}_ret, {fi}\n"
++                ));
++                if ft == "i1" {
++                    bool_fields.push(format!("%{prefix}_f{fi}"));
++                } else {
++                    s.push_str(&format!(
++                        "  %{prefix}_b{fi} = icmp ne {ft} %{prefix}_f{fi}, 0\n"
++                    ));
++                    bool_fields.push(format!("%{prefix}_b{fi}"));
++                }
++            }
++        }
++        let acc = bool_fields
++            .first()
++            .cloned()
++            .unwrap_or_else(|| "true".to_string());
++        let cont = bool_fields
++            .get(1)
++            .cloned()
++            .unwrap_or_else(|| "true".to_string());
++        (acc, cont)
++    } else {
++        return Err(format!(
++            "unsupported curve intersection callback return type {rty:?} on {}",
++            cb.llvm_symbol
++        ));
++    };
++    s.push_str(&format!(
++        "  %{prefix}_stop_cb = xor i1 {continue_val}, true\n\
++         \x20 %{prefix}_stop = or i1 %accept_any, %{prefix}_stop_cb\n\
++         \x20 br i1 {accept_val}, label %curve_confirm_{hid}, label %curve_reject_{hid}\n\n\
++         curve_confirm_{hid}:\n\
++         \x20 call void @__m2v.rq.generate(i32 {slot}, float %c_t)\n\
++         \x20 store i32 1, ptr %comm_is_curve, align 4\n\
++         \x20 store float %c_u, ptr %comm_curve_u, align 4\n\
++         \x20 store i32 %c_seg, ptr %comm_curve_seg, align 4\n\
++         \x20 br i1 %{prefix}_stop, label %term_hit, label %proceed_hdr\n\n\
++         curve_reject_{hid}:\n\
++         \x20 br i1 %{prefix}_stop_cb, label %term_hit, label %proceed_hdr\n\n"
++    ));
++    Ok(())
++}
++
+ fn emit_aabb_callback_case(
+     s: &mut String,
+     slot: u32,
+@@ -3085,6 +4517,7 @@ fn emit_aabb_callback_case(
+     ift_abi_v2: bool,
+     prim_data_enabled: bool,
+     table_param: &str,
++    has_curves: bool,
+ ) -> Result<(), String> {
+     let hid = cb.handle_id;
+     let prefix = format!("ac{hid}");
+@@ -3101,6 +4534,7 @@ fn emit_aabb_callback_case(
+         ift_abi_v2,
+         prim_data_enabled,
+         table_param,
++        None,
+     );
+     let rty = cb.return_type.trim();
+     s.push_str(&format!(
+@@ -3156,6 +4590,11 @@ fn emit_aabb_callback_case(
+         ));
+     };
+ 
++    let aabb_clr = if has_curves {
++        "  store i32 0, ptr %comm_is_curve, align 4\n"
++    } else {
++        ""
++    };
+     s.push_str(&format!(
+         "  %{prefix}_ge_min = fcmp oge float {dist_val}, %{prefix}_tmin\n\
+          \x20 %{prefix}_le_cur = fcmp ole float {dist_val}, %{prefix}_cur_t\n\
+@@ -3166,6 +4605,7 @@ fn emit_aabb_callback_case(
+          \x20 br i1 %{prefix}_valid, label %aabb_gen_{hid}, label %aabb_miss_{hid}\n\n\
+          aabb_gen_{hid}:\n\
+          \x20 call void @__m2v.rq.generate(i32 {slot}, float {dist_val})\n\
++         {aabb_clr}\
+          \x20 br i1 %{prefix}_stop, label %term_hit, label %proceed_hdr\n\n\
+          aabb_miss_{hid}:\n\
+          \x20 br i1 %{prefix}_stop_cb, label %term_hit, label %proceed_hdr\n\n"
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 92e9753..9fa63ab 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -128,6 +128,8 @@ pub struct TransformOptions {
+     /// Enable GPU lookup of per-primitive `primitiveDataBuffer` pointers for hardware ray queries
+     /// (`intersector`, `intersection_query`, and `[[intersection]]` callbacks) via set-0 binding 676.
+     pub rt_primitive_data: bool,
++    /// Enable Metal 3.1 curve geometry analytic solver & `curve_parameter` lowering (`GARNETX_CAP_RT_CURVES`).
++    pub rt_curves: bool,
+     /// Preserve native 64-bit integer arithmetic (`OpIAdd`/`OpISub`/`OpIMul` on `OpTypeInt 64`)
+     /// instead of expanding scalar 64-bit ops into 32-bit/16-bit halves (`GARNETX_CAP_NATIVE_INT64`).
+     pub native_int64: bool,
+@@ -150,6 +152,7 @@ impl Default for TransformOptions {
+             hardware_ray_query: false,
+             emulated_mesh_payload: false,
+             rt_primitive_data: false,
++            rt_curves: false,
+             native_int64: false,
+         }
+     }
+@@ -174,6 +177,12 @@ impl TransformOptions {
+         self
+     }
+ 
++    /// Enable Metal 3.1 curve geometry lowering (`GARNETX_CAP_RT_CURVES`).
++    pub fn with_rt_curves(mut self) -> Self {
++        self.rt_curves = true;
++        self
++    }
++
+     /// Preserve native 64-bit integer arithmetic (`GARNETX_CAP_NATIVE_INT64`).
+     pub fn with_native_int64(mut self) -> Self {
+         self.native_int64 = true;

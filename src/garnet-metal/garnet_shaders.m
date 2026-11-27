@@ -225,8 +225,11 @@ static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
     rdna4x_backend_capabilities caps = rdna4_query_caps();
     if (RDNA4R.rtPositionFetch) caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
     caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
-    if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress)
+    if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress) {
         caps.flags |= GARNETX_CAP_RT_PRIMITIVE_DATA;
+        if (rdna4_rt_curves_enabled())
+            caps.flags |= GARNETX_CAP_RT_CURVES;
+    }
     if (RDNA4R.shaderInt64)
         caps.flags |= GARNETX_CAP_NATIVE_INT64;
     return caps;

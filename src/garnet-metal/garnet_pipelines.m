@@ -1160,12 +1160,16 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     if (fp && atomic_load_explicit(&_fastKey, memory_order_relaxed) == key)
         return (VkPipeline)fp;
     NSNumber *k = @(key);
+    uint64_t compileNs = 0; BOOL builtNew = NO;
     [_lock lock];
     NSValue *v = _variants[k];
     if (!v) {
+        uint64_t bt0 = rdna4_now();
         NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk rflags:rflags icb:NO error:&e];
+        compileNs = rdna4_now() - bt0;
         if (!p) RDNA4LOG_ERR("pipeline variant (topology %d cull %d front %d rflags 0x%x) failed: %s", topo, cull, front, rflags, e.localizedDescription.UTF8String);
         else {
+            builtNew = YES;
             v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v;
             if (!atomic_load_explicit(&_fastPipe, memory_order_relaxed)) {
                 atomic_store_explicit(&_fastKey, key, memory_order_relaxed);
@@ -1175,19 +1179,24 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
         }
     }
     [_lock unlock];
+    if (builtNew) rdna4_pc_maybe_save_after_compile(compileNs, "gfx-pipeline");
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
 - (VkPipeline)icbPipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk {
     NSNumber *k = @((uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24));
+    uint64_t compileNs = 0; BOOL builtNew = NO;
     [_lock lock];
     if (!_icbGpuReady) { [_lock unlock]; return VK_NULL_HANDLE; }
     NSValue *v = _icbVariants[k];
     if (!v) {
+        uint64_t bt0 = rdna4_now();
         NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk rflags:0 icb:YES error:&e];
+        compileNs = rdna4_now() - bt0;
         if (!p) RDNA4LOG_ERR("icb pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
-        else { v = [NSValue valueWithPointer:(void *)p]; _icbVariants[k] = v; RDNA4LOG("icb pipeline variant topology %d cull %d front %d created", topo, cull, front); }
+        else { builtNew = YES; v = [NSValue valueWithPointer:(void *)p]; _icbVariants[k] = v; RDNA4LOG("icb pipeline variant topology %d cull %d front %d created", topo, cull, front); }
     }
     [_lock unlock];
+    if (builtNew) rdna4_pc_maybe_save_after_compile(compileNs, "icb-gfx-pipeline");
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
 - (void)dealloc {
@@ -1665,6 +1674,7 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     if (bytes && (!_lumaWorkgroup || !rdna4_luma_workgroup_bytes_ok(bytes, caps.shared_memory) ||
         !rdna4_luma_workgroup_fits(bytes, l))) return VK_NULL_HANDLE;
     id<NSCopying> k = bytes ? (id<NSCopying>)@[ @(key), @(bytes) ] : @(key);
+    uint64_t compileNs = 0; BOOL compiledOk = NO;
     [_lock lock];
     NSValue *v = _variants[k];
     if (!v) {
@@ -1689,10 +1699,11 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
 #ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
         pc = rdna4_ba_vkcache();
 #endif
-        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, spvBytes, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
+        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, spvBytes, &p); compileNs = rdna4_now() - t_; rdna4t_add(&T1.cmp, compileNs); atomic_fetch_add(&rdna4_pipes_new, 1);
         if (module != _sm) vkDestroyShaderModule(RDNA4R.dev, module, NULL);
         if (r != VK_SUCCESS) RDNA4LOG("vkCreateComputePipelines(local %u,%u,%u) = %d", l[0], l[1], l[2], r);
         else {
+            compiledOk = YES;
             v = [NSValue valueWithPointer:(void *)p];
             _variants[k] = v;
             if (_nCompiledLocals < 32u) {
@@ -1713,6 +1724,7 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
         }
     }
     [_lock unlock];
+    if (compiledOk) rdna4_pc_maybe_save_after_compile(compileNs, "compute-compile");
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
 - (void)rdna4DestroyICBGPUState {

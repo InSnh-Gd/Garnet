@@ -216,6 +216,7 @@ pub(crate) fn translate_text_with_mesh_options(
         emulated_mesh_payload,
         false,
         false,
+        false,
         None,
     )
 }
@@ -229,6 +230,7 @@ pub(crate) fn translate_text_with_rt_options(
     query_lod_replay: QueryLodReplay,
     emulated_mesh_payload: bool,
     rt_primitive_data: bool,
+    rt_curves: bool,
     native_int64: bool,
     raster_sample_count: Option<u32>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -268,6 +270,9 @@ pub(crate) fn translate_text_with_rt_options(
     }
     if rt_primitive_data {
         options = options.with_rt_primitive_data();
+    }
+    if rt_curves {
+        options = options.with_rt_curves();
     }
     if native_int64 {
         options = options.with_native_int64();

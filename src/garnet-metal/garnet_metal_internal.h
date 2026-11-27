@@ -3565,6 +3565,7 @@ GARNET_INTERNAL_EXTERN BOOL rdna4s_classify(size_t w, size_t h, uint32_t spf, NS
 GARNET_INTERNAL_EXTERN BOOL rdna4s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const rdna4df_wr_t *wr, int *pinst, int *ptent);
 GARNET_INTERNAL_EXTERN void rdna4s_prebind_on_radv_open(void);
 GARNET_INTERNAL_EXTERN void rdna4_pc_save(const char *why);
+GARNET_INTERNAL_EXTERN void rdna4_pc_maybe_save_after_compile(uint64_t compile_ns, const char *why);
 GARNET_INTERNAL_EXTERN void rdna4_gpl_prewarm_start(void);
 GARNET_INTERNAL_EXTERN int rdna4s_damage_on(void);
 GARNET_INTERNAL_EXTERN int rdna4s_plan(const rdna4df_wr_t *wr, int inst, int tent, rdna4df_plan_t *pl);
@@ -3819,6 +3820,7 @@ GARNET_INTERNAL_EXTERN void rdna4_device_convert_sparse_tile_regions(const MTLRe
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing_from_render(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_primitive_motion_blur(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_curves_enabled(void);
 GARNET_INTERNAL_EXTERN uint32_t rdna4_rt_descriptor_pool_append(
     VkDescriptorPoolSize *sizes,
     uint32_t count,

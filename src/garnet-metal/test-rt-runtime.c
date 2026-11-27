@@ -323,7 +323,7 @@ static void test_ift_reflection_json(void) {
 
     const char *bad_kind =
         "{\"intersection_function_tables\":{\"abi_version\":1,\"header_words\":1,\"tables\":[],"
-        "\"handles\":[{\"handle_id\":1,\"symbol\":\"a\",\"kind\":\"Curve\"}]}}";
+        "\"handles\":[{\"handle_id\":1,\"symbol\":\"a\",\"kind\":\"UnknownKind\"}]}}";
     CHECK(rdna4rtr_parse_ift_json(bad_kind, strlen(bad_kind), &r) == RDNA4RTR_ERR_JSON,
           "unknown IFT handle kind rejected");
 
@@ -436,8 +436,8 @@ static void test_ir_kind_inference(void) {
               kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
               "<{ i1, i1 }> return without metadata -> TriangleAnyHit");
         CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__curve", &kind) == 1 &&
-              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
-              "Cycles __intersection__curve (!\"air.curve\" + <{ i1, i1 }>, ignoring !\"air.triangle_data\") -> TriangleAnyHit");
+              kind == RDNA4RTR_IFT_KIND_CURVE,
+              "Cycles __intersection__curve (!\"air.curve\" + !\"air.triangle_data\") -> Curve");
         CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "meta_precedence_tri", &kind) == 1 &&
               kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
               "!air.intersection !\"air.triangle\" metadata takes precedence over %struct return");
@@ -1237,6 +1237,58 @@ static void test_source_pins(void) {
     }
 }
 
+static void test_wave2_curve_caps_and_ift(void) {
+    CHECK(GARNETX_CAP_RT_CURVES == (1u << 13), "GARNETX_CAP_RT_CURVES == 1<<13");
+    CHECK(GARNETX_CAP_RT_MOTION_BLUR == (1u << 14), "GARNETX_CAP_RT_MOTION_BLUR == 1<<14");
+    CHECK(RDNA4RTR_IFT_KIND_CURVE == UINT32_C(2), "RDNA4RTR_IFT_KIND_CURVE == 2");
+
+    rdna4rtr_hw_caps_t c = make_full_gfx12_caps();
+    c.curve_geometry_supported = 1u;
+    CHECK(rdna4rtr_supports_curve_intersections(&c) == 1,
+          "curve_geometry_supported=1 + core RT enables curve intersections");
+
+    /* Exact Apple Clang 21 curve_rt.ll !air.intersection IR fixture check. */
+    const char *curve_air_ir =
+        "define i1 @curve_anyhit(float noundef %dist, float noundef %param, i32 noundef %prim) local_unnamed_addr #0 {\n"
+        "  ret i1 true\n"
+        "}\n"
+        "!air.intersection = !{!14}\n"
+        "!14 = !{ptr @curve_anyhit, !15, !17, !\"air.curve\", !\"air.instancing\", !\"air.curve_data\"}\n";
+    uint32_t kind = 99u;
+    CHECK(rdna4rtr_infer_ift_kind_from_ir(curve_air_ir, strlen(curve_air_ir), "curve_anyhit", &kind) == 1 &&
+          kind == RDNA4RTR_IFT_KIND_CURVE,
+          "Wave 0.1 curve_anyhit (!\"air.curve\", !\"air.curve_data\") -> Curve");
+
+    /* Reflection JSON "Curve" / "CurveAnyHit" kind parsing. */
+    rdna4rtr_ift_reflection_t r;
+    const char *curve_json =
+        "{\"intersection_function_tables\":{\"abi_version\":2,\"header_words\":66,"
+        "\"tables\":[{\"param_index\":1,\"metal_index\":1,\"descriptor\":{\"set\":0,\"binding\":1,\"count\":1}}],"
+        "\"handles\":[{\"handle_id\":1,\"symbol\":\"curve_anyhit\",\"kind\":\"Curve\"},"
+        "{\"handle_id\":2,\"symbol\":\"curve_ah2\",\"kind\":\"CurveAnyHit\"}]}}";
+    CHECK(rdna4rtr_parse_ift_json(curve_json, strlen(curve_json), &r) == RDNA4RTR_OK &&
+          r.handle_count == 2u && r.handles[0].kind == RDNA4RTR_IFT_KIND_CURVE &&
+          r.handles[1].kind == RDNA4RTR_IFT_KIND_CURVE,
+          "IFT reflection JSON parses Curve and CurveAnyHit kinds");
+    rdna4rtr_ift_refl_destroy(&r);
+
+    /* IFT function slot + opaque curve gated helper. */
+    rdna4rtr_ift_table_t t;
+    CHECK(rdna4rtr_ift_init(&t, 4u, 2u) == RDNA4RTR_OK, "curve IFT init");
+    CHECK(rdna4rtr_ift_set_function(&t, 0u, 1u, RDNA4RTR_IFT_KIND_CURVE) == RDNA4RTR_OK &&
+          rdna4rtr_ift_get_handle(&t, 0u) == 1u,
+          "IFT slot accepts RDNA4RTR_IFT_KIND_CURVE handle");
+    uint32_t ids[2] = { 1u, 2u };
+    uint32_t kinds[2] = { RDNA4RTR_IFT_KIND_CURVE, RDNA4RTR_IFT_KIND_CURVE };
+    CHECK(rdna4rtr_ift_set_functions_range(&t, 1u, 2u, ids, kinds) == RDNA4RTR_OK,
+          "IFT range accepts RDNA4RTR_IFT_KIND_CURVE");
+    CHECK(rdna4rtr_ift_set_opaque_curve_range_ex(&t, 3u, 1u, RDNA4RTR_SIG_CURVE_DATA, 1) == RDNA4RTR_OK &&
+          rdna4rtr_ift_get_mode(&t, 3u) == RDNA4RTR_IFT_SLOT_OPAQUE_CURVE &&
+          rdna4rtr_ift_get_handle(&t, 3u) == 0u,
+          "opaque curve gated helper returns OK when curve_supported=1");
+    rdna4rtr_ift_destroy(&t);
+}
+
 int main(void) {
     test_capabilities_and_footnote10();
     test_as_reflection_json();
@@ -1245,6 +1297,7 @@ int main(void) {
     test_ift_encoder_and_dispatch_sim();
     test_as_descriptor_and_bda_planners();
     test_wave4_prim_data_table_and_abi();
+    test_wave2_curve_caps_and_ift();
     test_source_pins();
     printf("test-rt-runtime: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

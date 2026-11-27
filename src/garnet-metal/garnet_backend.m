@@ -1374,7 +1374,7 @@ GARNET_INTERNAL void rdna4_quarantine(id resources, VkResult fault) {
     RDNA4LOG_ERR("GPU work unresolved (%d): retaining resources until process exit; further submissions disabled", fault);
 }
 
-static struct { char path[300]; uint8_t key[32], uuid[16]; uint32_t vendor, device; BOOL save; uint64_t lastHash, savedPipes; pthread_mutex_t mu; } RDNA4PC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static struct { char path[300]; uint8_t key[32], uuid[16]; uint32_t vendor, device; BOOL save; uint64_t lastHash, savedPipes, lastSaveNs; pthread_mutex_t mu; } RDNA4PC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static BOOL rdna4_pc_derive_key(void) {
     NSBundle *b = [NSBundle bundleForClass:[GarnetDevice class]];
@@ -1407,16 +1407,17 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     RDNA4PC.save = rdna4g_pcache_save(pcls, (rdna4_allow() && garnet_getenv("GARNET_PCACHE_SAVE", "RDNA4M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with GARNET_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
     char marker[sizeof RDNA4PC.path + 16]; snprintf(marker, sizeof marker, "%s.loading", RDNA4PC.path);
     if (access(marker, F_OK) == 0) { unlink(RDNA4PC.path); unlink(marker); RDNA4LOG("T2 pipeline cache: a previous load never finished (%s present): cache file discarded", marker); }
+    const uint64_t maxPay = rdna4pc_max_payload(rdna4_is_ws() ? 1 : 0);
     void *buf = NULL; size_t flen = 0; const void *payload = NULL; size_t plen = 0; int c = -1;
     int fd = open(RDNA4PC.path, O_RDONLY);
     if (fd >= 0) {
         struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size > 0 && (uint64_t)st.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (buf = malloc((size_t)st.st_size))) {
+        if (fstat(fd, &st) == 0 && st.st_size > 0 && (uint64_t)st.st_size <= maxPay + sizeof(rdna4pc_hdr) && (buf = malloc((size_t)st.st_size))) {
             size_t got = 0; while (got < (size_t)st.st_size) { ssize_t n = read(fd, (char *)buf + got, (size_t)st.st_size - got); if (n <= 0) break; got += (size_t)n; }
             flen = got;
         }
         close(fd);
-        if (buf) { c = rdna4pc_check(buf, flen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, &payload, &plen);
+        if (buf) { c = rdna4pc_check_bounded(buf, flen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, maxPay, &payload, &plen);
                    if (c) { RDNA4LOG("T2 pipeline cache: %s ignored: %s", RDNA4PC.path, rdna4pc_why(c)); payload = NULL; plen = 0; } }
         else RDNA4LOG("T2 pipeline cache: %s unreadable/empty/oversized, ignored", RDNA4PC.path);
     } else RDNA4LOG("T2 pipeline cache: no file %s yet (cold start; saving %s)", RDNA4PC.path, RDNA4PC.save ? "ON" : "OFF in this process");
@@ -1427,12 +1428,12 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
         int sfd = rdna4_sb_open_ro(kSeedPath, O_RDONLY);
         if (sfd >= 0) {
             struct stat sst; void *sbuf = NULL; size_t sflen = 0;
-            if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
+            if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= maxPay + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
                 size_t got = 0; while (got < (size_t)sst.st_size) { ssize_t n = read(sfd, (char *)sbuf + got, (size_t)sst.st_size - got); if (n <= 0) break; got += (size_t)n; }
                 sflen = got;
             }
             close(sfd);
-            if (sbuf && rdna4pc_check(sbuf, sflen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, &payload, &plen) == 0) {
+            if (sbuf && rdna4pc_check_bounded(sbuf, sflen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, maxPay, &payload, &plen) == 0) {
                 free(buf); buf = sbuf; seeded = YES;
                 RDNA4LOG("T2 pipeline cache: seeded read-only from %s (%zu B)", kSeedPath, plen);
             } else free(sbuf);
@@ -1456,16 +1457,17 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
 }
 GARNET_INTERNAL void rdna4_pc_save(const char *why) {
     if (!RDNA4R.ok || !RDNA4R.pc || !RDNA4PC.save || !RDNA4PC.path[0]) return;
+    const uint64_t maxPay = rdna4pc_max_payload(rdna4_is_ws() ? 1 : 0);
     uint64_t np = atomic_load(&rdna4_pipes_new);
     pthread_mutex_lock(&RDNA4PC.mu);
     if (np == RDNA4PC.savedPipes) { pthread_mutex_unlock(&RDNA4PC.mu); return; }
     RDNA4PC.savedPipes = np;   // retried only when another pipeline appears (no log spam on a persistent write failure)
     uint64_t t0 = rdna4_now(); size_t sz = 0; uint8_t *buf = NULL;
-    if (vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, NULL) == VK_SUCCESS && sz >= 32 && sz <= RDNA4PC_MAX_PAYLOAD && (buf = malloc(sizeof(rdna4pc_hdr) + sz))) {
+    if (vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, NULL) == VK_SUCCESS && sz >= 32 && (uint64_t)sz <= maxPay && (buf = malloc(sizeof(rdna4pc_hdr) + sz))) {
         VkResult r = vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, buf + sizeof(rdna4pc_hdr));
         if (r == VK_SUCCESS && rdna4pc_vk_header_ok(buf + sizeof(rdna4pc_hdr), sz, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device)) {
             uint64_t h = rdna4pc_fnv(buf + sizeof(rdna4pc_hdr), sz);
-            if (h == RDNA4PC.lastHash) { free(buf); pthread_mutex_unlock(&RDNA4PC.mu); return; }   // nothing new in the cache
+            if (h == RDNA4PC.lastHash) { RDNA4PC.lastSaveNs = rdna4_now(); free(buf); pthread_mutex_unlock(&RDNA4PC.mu); return; }   // nothing new in the cache
             rdna4pc_hdr hd; rdna4pc_fill(&hd, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, buf + sizeof hd, sz); memcpy(buf, &hd, sizeof hd);
             char tmp[sizeof RDNA4PC.path + 24]; snprintf(tmp, sizeof tmp, "%s.tmp.%d", RDNA4PC.path, (int)getpid());
             int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644); BOOL ok = NO; int en = 0;
@@ -1475,12 +1477,23 @@ GARNET_INTERNAL void rdna4_pc_save(const char *why) {
                 if (ok && rename(tmp, RDNA4PC.path) != 0) { ok = NO; en = errno; }
                 if (!ok) unlink(tmp);
             } else en = errno;
-            if (ok) { RDNA4PC.lastHash = h; RDNA4LOG("T2 pipeline cache: SAVED %zu B to %s (%s; %llu pipelines created so far) in %.2f ms", sizeof hd + sz, RDNA4PC.path, why, (unsigned long long)np, (double)(rdna4_now() - t0) / 1e6); }
+            if (ok) { RDNA4PC.lastHash = h; RDNA4PC.lastSaveNs = rdna4_now(); RDNA4LOG("T2 pipeline cache: SAVED %zu B to %s (%s; %llu pipelines created so far) in %.2f ms", sizeof hd + sz, RDNA4PC.path, why, (unsigned long long)np, (double)(rdna4_now() - t0) / 1e6); }
             else RDNA4LOG_WARN("T2 pipeline cache: save to %s FAILED (errno %d)", RDNA4PC.path, en);
         } else RDNA4LOG_WARN("T2 pipeline cache: vkGetPipelineCacheData = %d / header check failed, not saved", r);
     }
     free(buf);
     pthread_mutex_unlock(&RDNA4PC.mu);
+}
+// Caller MUST NOT hold any PSO _lock, rdna4_heavy_compute_pipe_mu, or RDNA4R.qlock.
+GARNET_INTERNAL void rdna4_pc_maybe_save_after_compile(uint64_t compile_ns, const char *why) {
+    if (!RDNA4R.ok || !RDNA4R.pc || !RDNA4PC.save || !RDNA4PC.path[0]) return;
+    const uint64_t np = atomic_load(&rdna4_pipes_new);
+    pthread_mutex_lock(&RDNA4PC.mu);
+    const uint64_t saved = RDNA4PC.savedPipes;
+    const uint64_t lastSave = RDNA4PC.lastSaveNs;
+    pthread_mutex_unlock(&RDNA4PC.mu);
+    if (rdna4pc_should_incremental_save(compile_ns, np, saved, rdna4_now(), lastSave))
+        rdna4_pc_save(why);
 }
 static void rdna4_pc_atexit(void) { rdna4_pc_save("exit"); }
 

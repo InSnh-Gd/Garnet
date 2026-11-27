@@ -110,10 +110,17 @@ __attribute__((unused)) static BOOL rdna4_rt_runtime_translator_stage3_ready(voi
 // RT hardware caps as 1u (matching garnet_device.m pre-open policy so apps querying
 // supportsRaytracing before newCommandQueue succeed with radv_open=0), while post-open reflects
 // probed GFX12 Vulkan capabilities and always keeps stage3Ok gating.
+GARNET_INTERNAL BOOL rdna4_rt_curves_enabled(void) {
+    if (!rdna4_allow()) return NO;
+    const char *v = garnet_getenv("GARNET_RT_CURVES", NULL);
+    return (v && v[0] && v[0] != '0') ? YES : NO;
+}
+
 __attribute__((unused)) static rdna4rtr_hw_caps_t rdna4_rt_runtime_caps(void) {
     const rdna4dc_metal3_caps m3 = rdna4_metal3_caps();
     const uint8_t vkRtOk = RDNA4R.ok ? (rdna4dc_metal3_raytracing_supported(&m3) ? 1u : 0u) : 1u;
     const uint8_t stage3Ok = rdna4_rt_runtime_translator_stage3_ready() ? 1u : 0u;
+    const uint8_t curvesOk = rdna4_rt_curves_enabled() ? 1u : 0u;
     return (rdna4rtr_hw_caps_t){
         .accel_struct_supported    = vkRtOk,
         .ray_query_supported       = vkRtOk,
@@ -121,7 +128,7 @@ __attribute__((unused)) static rdna4rtr_hw_caps_t rdna4_rt_runtime_caps(void) {
         .deferred_host_ops         = vkRtOk,
         .translator_stage3_ready   = stage3Ok,
         .motion_blur_ext_supported = 0u, // RADV GFX12 lacks VK_NV_ray_tracing_motion_blur
-        .curve_geometry_supported  = 0u, // Metal 3.1 curve RT is outside Metal 3.0 / RADV GFX12
+        .curve_geometry_supported  = curvesOk,
     };
 }
 
@@ -389,14 +396,17 @@ RDNA4_DNR(RDNA4IntersectionFunctionTable)
                                               withRange:(NSRange)range {
     if (range.length == 0) return;
     [_lock lock];
+    const int curveSupported = rdna4_rt_curves_enabled() ? 1 : 0;
     rdna4rtr_status_t st = (range.location <= UINT32_MAX && range.length <= UINT32_MAX)
-        ? rdna4rtr_ift_set_opaque_curve_range(&_table, (uint32_t)range.location, (uint32_t)range.length, (uint64_t)signature)
+        ? rdna4rtr_ift_set_opaque_curve_range_ex(&_table, (uint32_t)range.location, (uint32_t)range.length, (uint64_t)signature, curveSupported)
         : RDNA4RTR_ERR_BOUNDS;
-    if (st == RDNA4RTR_ERR_UNSUPPORTED) {
+    if (st == RDNA4RTR_OK) {
+        [self rdna4SyncBackingLocked];
+    } else if (st == RDNA4RTR_ERR_UNSUPPORTED) {
         // Safe handle_id = 0 has been encoded; sync so GPU never reads stale handles.
         (void)[self rdna4SyncBackingLocked];
-        RDNA4_ONCE("RDNA4IntersectionFunctionTable: curve intersection functions are unsupported on RADV GFX12 (encoded safe null handle)");
-    } else if (st != RDNA4RTR_OK) {
+        RDNA4_ONCE("RDNA4IntersectionFunctionTable: curve intersection functions disabled (set GARNET_RT_CURVES=1; encoded safe null handle)");
+    } else {
         RDNA4LOG_WARN("RDNA4IntersectionFunctionTable setOpaqueCurveIntersectionFunctionWithSignature:0x%lx withRange:[%lu,+%lu) rejected: %s",
                       (unsigned long)signature, (unsigned long)range.location, (unsigned long)range.length, rdna4rtr_status_str(st));
     }
@@ -1256,6 +1266,8 @@ typedef struct {
     VkPipeline instPipe;
     VkPipelineLayout xformLayout;
     VkPipeline xformPipe;
+    VkPipelineLayout curveLayout;
+    VkPipeline curvePipe;
 } RDNA4RTComputePipes;
 
 static RDNA4RTComputePipes g_rtPipes = { .mu = PTHREAD_MUTEX_INITIALIZER };
@@ -1303,7 +1315,7 @@ static BOOL rdna4_rt_create_compute_pipe(
         .layout = layout
     };
     VkPipeline pipe = VK_NULL_HANDLE;
-    r = vkCreateComputePipelines(RDNA4R.dev, VK_NULL_HANDLE, 1u, &pci, NULL, &pipe);
+    r = vkCreateComputePipelines(RDNA4R.dev, RDNA4R.pc, 1u, &pci, NULL, &pipe);
     vkDestroyShaderModule(RDNA4R.dev, mod, NULL);
     if (r != VK_SUCCESS || !pipe) {
         vkDestroyPipelineLayout(RDNA4R.dev, layout, NULL);
@@ -1352,6 +1364,7 @@ static BOOL rdna4_rt_ensure_compute_pipes(
         if (g_rtPipes.xformLayout) vkDestroyPipelineLayout(RDNA4R.dev, g_rtPipes.xformLayout, NULL);
         g_rtPipes.instLayout = VK_NULL_HANDLE; g_rtPipes.instPipe = VK_NULL_HANDLE;
         g_rtPipes.xformLayout = VK_NULL_HANDLE; g_rtPipes.xformPipe = VK_NULL_HANDLE;
+        g_rtPipes.curveLayout = VK_NULL_HANDLE; g_rtPipes.curvePipe = VK_NULL_HANDLE;
         g_rtPipes.dev = VK_NULL_HANDLE;
         pthread_mutex_unlock(&g_rtPipes.mu);
         return NO;
@@ -1362,6 +1375,43 @@ static BOOL rdna4_rt_ensure_compute_pipes(
     if (xformPipeOut) *xformPipeOut = g_rtPipes.xformPipe;
     pthread_mutex_unlock(&g_rtPipes.mu);
     RDNA4LOGR("rt compute pipelines ready (inst_convert + xform_transpose)");
+    return YES;
+}
+
+static BOOL rdna4_rt_ensure_curve_pipe(
+    VkPipelineLayout *curveLayoutOut, VkPipeline *curvePipeOut, NSError **err) {
+    if (!RDNA4R.ok || !RDNA4R.dev) {
+        if (err) *err = rdna4_err(140, @"rt curve pipeline: Vulkan device unavailable");
+        return NO;
+    }
+    pthread_mutex_lock(&g_rtPipes.mu);
+    if (g_rtPipes.dev == RDNA4R.dev && g_rtPipes.curvePipe) {
+        if (curveLayoutOut) *curveLayoutOut = g_rtPipes.curveLayout;
+        if (curvePipeOut) *curvePipeOut = g_rtPipes.curvePipe;
+        pthread_mutex_unlock(&g_rtPipes.mu);
+        return YES;
+    }
+    if (g_rtPipes.dev != RDNA4R.dev) {
+        g_rtPipes.dev = RDNA4R.dev;
+        g_rtPipes.instLayout = VK_NULL_HANDLE; g_rtPipes.instPipe = VK_NULL_HANDLE;
+        g_rtPipes.xformLayout = VK_NULL_HANDLE; g_rtPipes.xformPipe = VK_NULL_HANDLE;
+        g_rtPipes.curveLayout = VK_NULL_HANDLE; g_rtPipes.curvePipe = VK_NULL_HANDLE;
+    }
+    VkPipelineLayout cl = VK_NULL_HANDLE;
+    VkPipeline cp = VK_NULL_HANDLE;
+    BOOL ok = rdna4_rt_create_compute_pipe(
+        rdna4rt_spv_curve_build, sizeof(rdna4rt_spv_curve_build),
+        (uint32_t)sizeof(rdna4rt_curve_build_pc_t), &cl, &cp, err);
+    if (!ok) {
+        pthread_mutex_unlock(&g_rtPipes.mu);
+        return NO;
+    }
+    g_rtPipes.curveLayout = cl;
+    g_rtPipes.curvePipe = cp;
+    if (curveLayoutOut) *curveLayoutOut = cl;
+    if (curvePipeOut) *curvePipeOut = cp;
+    pthread_mutex_unlock(&g_rtPipes.mu);
+    RDNA4LOGR("rt compute pipeline ready (curve_build)");
     return YES;
 }
 
@@ -1466,6 +1516,30 @@ static BOOL rdna4_rt_vk_vfmt_supported(VkFormat vkFmt) {
     memset(&fp, 0, sizeof fp);
     vkGetPhysicalDeviceFormatProperties(RDNA4R.pd, vkFmt, &fp);
     return (fp.bufferFeatures & VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR) != 0;
+}
+
+static BOOL rdna4_rt_curve_cp_fmt_from_mtl(NSUInteger mtlFmt, rdna4rt_curve_cp_fmt_t *outFmt) {
+    if (!outFmt) return NO;
+    switch (mtlFmt) {
+    case MTLAttributeFormatFloat2:  *outFmt = RDNA4RT_CURVE_CP_FLOAT2; return YES;
+    case MTLAttributeFormatInvalid:
+    case MTLAttributeFormatFloat3:  *outFmt = RDNA4RT_CURVE_CP_FLOAT3; return YES;
+    case MTLAttributeFormatFloat4:  *outFmt = RDNA4RT_CURVE_CP_FLOAT4; return YES;
+    case MTLAttributeFormatHalf2:   *outFmt = RDNA4RT_CURVE_CP_HALF2;  return YES;
+    case MTLAttributeFormatHalf3:   *outFmt = RDNA4RT_CURVE_CP_HALF3;  return YES;
+    case MTLAttributeFormatHalf4:   *outFmt = RDNA4RT_CURVE_CP_HALF4;  return YES;
+    default: return NO;
+    }
+}
+
+static BOOL rdna4_rt_curve_rad_fmt_from_mtl(NSUInteger mtlFmt, rdna4rt_curve_rad_fmt_t *outFmt) {
+    if (!outFmt) return NO;
+    switch (mtlFmt) {
+    case MTLAttributeFormatInvalid:
+    case MTLAttributeFormatFloat: *outFmt = RDNA4RT_CURVE_RAD_FLOAT; return YES;
+    case MTLAttributeFormatHalf:  *outFmt = RDNA4RT_CURVE_RAD_HALF;  return YES;
+    default: return NO;
+    }
 }
 
 static uint32_t rdna4_rt_compacted_size_bytes(MTLDataType dt) {
@@ -2553,6 +2627,14 @@ RDNA4_RESOURCE_SPI_CUSTOM_UID([self rdna4BindlessGPUAddress] ?: rdna4_resource_u
 // Descriptor -> Vulkan build plan translator (shared by size queries, build, and refit).
 // ---------------------------------------------------------------------------------------------------------------
 typedef struct {
+    int isCurve;
+    rdna4rt_curve_geom_t desc;
+    uint32_t subSplits;
+    uint32_t aabbCount;
+    uint32_t vkGeomFlags;
+} RDNA4RTCurvePlanEntry;
+
+typedef struct {
     rdna4rt_kind_t kind;
     uint64_t usage;
     uint32_t vkBuildFlags;
@@ -2565,14 +2647,18 @@ typedef struct {
     rdna4rt_prim_data_geom_plan_t *primPlans;
     VkBuffer *primSrcVkBufs;
     uint64_t *primSrcVkOffs;
+    RDNA4RTCurvePlanEntry *curvePlans;
     VkBuffer tlasInstStgBuf;
     uint32_t tlasInstanceCount;
     VkAccelerationStructureBuildSizesInfoKHR vkSizes;
     rdna4rt_sizes_t metalSizes;
     BOOL hasInstDispatch;
+    BOOL hasCurves;
     rdna4rt_inst_convert_pc_t instPC;
     rdna4rt_xform_transpose_pc_t *xformPCs;
     uint32_t xformDispatchCount;
+    rdna4rt_curve_build_pc_t *curvePCs;
+    uint32_t curveDispatchCount;
 } RDNA4RTBuildPlan;
 
 static void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
@@ -2583,18 +2669,24 @@ static void rdna4_rt_plan_free(RDNA4RTBuildPlan *p) {
     free(p->primPlans);
     free(p->primSrcVkBufs);
     free(p->primSrcVkOffs);
+    free(p->curvePlans);
     free(p->xformPCs);
+    free(p->curvePCs);
     p->vkGeoms = NULL;
     p->vkRanges = NULL;
     p->maxPrimCounts = NULL;
     p->primPlans = NULL;
     p->primSrcVkBufs = NULL;
     p->primSrcVkOffs = NULL;
+    p->curvePlans = NULL;
     p->tlasInstStgBuf = VK_NULL_HANDLE;
     p->tlasInstanceCount = 0u;
     p->xformPCs = NULL;
     p->xformDispatchCount = 0u;
+    p->curvePCs = NULL;
+    p->curveDispatchCount = 0u;
     p->hasInstDispatch = NO;
+    p->hasCurves = NO;
 }
 
 static BOOL rdna4_rt_plan_append_xform(RDNA4RTBuildPlan *p, const rdna4rt_xform_transpose_pc_t *pc) {
@@ -2608,28 +2700,58 @@ static BOOL rdna4_rt_plan_append_xform(RDNA4RTBuildPlan *p, const rdna4rt_xform_
     return YES;
 }
 
+static BOOL rdna4_rt_plan_append_curve(RDNA4RTBuildPlan *p, const rdna4rt_curve_build_pc_t *pc) {
+    uint32_t next = p->curveDispatchCount + 1u;
+    rdna4rt_curve_build_pc_t *arr = (rdna4rt_curve_build_pc_t *)realloc(
+        p->curvePCs, (size_t)next * sizeof(*arr));
+    if (!arr) return NO;
+    arr[p->curveDispatchCount] = *pc;
+    p->curvePCs = arr;
+    p->curveDispatchCount = next;
+    return YES;
+}
+
 static BOOL rdna4_rt_dispatch_pre_build(
     VkCommandBuffer cmd, const RDNA4RTBuildPlan *plan, BOOL isComputeQueue, NSError **err) {
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_PRE_BUILD, isComputeQueue);
-    if (!plan->hasInstDispatch && plan->xformDispatchCount == 0u) return YES;
-    VkPipelineLayout instLayout = VK_NULL_HANDLE, xformLayout = VK_NULL_HANDLE;
-    VkPipeline instPipe = VK_NULL_HANDLE, xformPipe = VK_NULL_HANDLE;
-    if (!rdna4_rt_ensure_compute_pipes(&instLayout, &instPipe, &xformLayout, &xformPipe, err))
-        return NO;
-    if (plan->xformDispatchCount > 0u) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xformPipe);
-        for (uint32_t i = 0; i < plan->xformDispatchCount; i++) {
-            vkCmdPushConstants(cmd, xformLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
-                               (uint32_t)sizeof(plan->xformPCs[i]), &plan->xformPCs[i]);
-            vkCmdDispatch(cmd, 1u, 1u, 1u);
+    if (!plan->hasInstDispatch && plan->xformDispatchCount == 0u && plan->curveDispatchCount == 0u) return YES;
+    if (plan->hasInstDispatch || plan->xformDispatchCount > 0u) {
+        VkPipelineLayout instLayout = VK_NULL_HANDLE, xformLayout = VK_NULL_HANDLE;
+        VkPipeline instPipe = VK_NULL_HANDLE, xformPipe = VK_NULL_HANDLE;
+        if (!rdna4_rt_ensure_compute_pipes(&instLayout, &instPipe, &xformLayout, &xformPipe, err))
+            return NO;
+        if (plan->xformDispatchCount > 0u) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xformPipe);
+            for (uint32_t i = 0; i < plan->xformDispatchCount; i++) {
+                vkCmdPushConstants(cmd, xformLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                                   (uint32_t)sizeof(plan->xformPCs[i]), &plan->xformPCs[i]);
+                vkCmdDispatch(cmd, 1u, 1u, 1u);
+            }
+        }
+        if (plan->hasInstDispatch && plan->instPC.max_count > 0u) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instPipe);
+            vkCmdPushConstants(cmd, instLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                               (uint32_t)sizeof(plan->instPC), &plan->instPC);
+            uint32_t groups = (plan->instPC.max_count + 63u) / 64u;
+            vkCmdDispatch(cmd, groups, 1u, 1u);
         }
     }
-    if (plan->hasInstDispatch && plan->instPC.max_count > 0u) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, instPipe);
-        vkCmdPushConstants(cmd, instLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
-                           (uint32_t)sizeof(plan->instPC), &plan->instPC);
-        uint32_t groups = (plan->instPC.max_count + 63u) / 64u;
-        vkCmdDispatch(cmd, groups, 1u, 1u);
+    if (plan->curveDispatchCount > 0u) {
+        VkPipelineLayout curveLayout = VK_NULL_HANDLE;
+        VkPipeline curvePipe = VK_NULL_HANDLE;
+        if (!rdna4_rt_ensure_curve_pipe(&curveLayout, &curvePipe, err))
+            return NO;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, curvePipe);
+        for (uint32_t i = 0; i < plan->curveDispatchCount; i++) {
+            uint32_t sub = (plan->curvePCs[i].packed_flags >> 20u) & 0xFu;
+            if (!sub) sub = 1u;
+            uint64_t n = (uint64_t)plan->curvePCs[i].segment_count * (uint64_t)sub;
+            if (!n) continue;
+            vkCmdPushConstants(cmd, curveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                               (uint32_t)sizeof(plan->curvePCs[i]), &plan->curvePCs[i]);
+            uint32_t groups = (uint32_t)((n + 63u) / 64u);
+            vkCmdDispatch(cmd, groups, 1u, 1u);
+        }
     }
     rdna4_rt_emit_barrier(cmd, RDNA4RT_BARRIER_COMP_TO_BUILD, isComputeQueue);
     return YES;
@@ -2797,9 +2919,11 @@ static BOOL rdna4_rt_build_plan_make_ex(
             plan->primPlans = (rdna4rt_prim_data_geom_plan_t *)calloc(gcount, sizeof(*plan->primPlans));
             plan->primSrcVkBufs = (VkBuffer *)calloc(gcount, sizeof(*plan->primSrcVkBufs));
             plan->primSrcVkOffs = (uint64_t *)calloc(gcount, sizeof(*plan->primSrcVkOffs));
+            plan->curvePlans = (RDNA4RTCurvePlanEntry *)calloc(gcount, sizeof(*plan->curvePlans));
             geomSigs = (uint32_t *)calloc(gcount, sizeof(*geomSigs));
             if (!plan->vkGeoms || !plan->vkRanges || !plan->maxPrimCounts ||
-                !plan->primPlans || !plan->primSrcVkBufs || !plan->primSrcVkOffs || !geomSigs) {
+                !plan->primPlans || !plan->primSrcVkBufs || !plan->primSrcVkOffs ||
+                !plan->curvePlans || !geomSigs) {
                 free(geomSigs);
                 rdna4_rt_plan_free(plan);
                 if (err) *err = rdna4_err(145, @"out of host memory building BLAS plan");
@@ -2809,6 +2933,7 @@ static BOOL rdna4_rt_build_plan_make_ex(
 
         Class motionTriCls = objc_getClass("MTLAccelerationStructureMotionTriangleGeometryDescriptor");
         Class motionBoxCls = objc_getClass("MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor");
+        Class curveCls = objc_getClass("MTLAccelerationStructureCurveGeometryDescriptor");
         int hasTriangles = 0;
         rdna4rt_geom_ift_acc_t geomIftAcc = { 0u, 0u, 0 };
 
@@ -3079,6 +3204,178 @@ static BOOL rdna4_rt_build_plan_make_ex(
                 plan->maxPrimCounts[i] = aplan.primitive_count;
                 geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_AABBS, RDNA4RT_INDEX_NONE, RDNA4RT_VFMT_FLOAT3, aplan.vk_geom_flags);
                 if (!rdna4rt_add_u64(totalPrims, (uint64_t)aplan.primitive_count, &totalPrims)) {
+                    free(geomSigs); rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
+                    return NO;
+                }
+            } else if (curveCls && [gd isKindOfClass:curveCls]) {
+                id rawCpBuf = ((id (*)(id, SEL))objc_msgSend)(gd, sel_registerName("controlPointBuffer"));
+                NSUInteger cpOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("controlPointBufferOffset"));
+                NSUInteger cpCount = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("controlPointCount"));
+                NSUInteger cpStride = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("controlPointStride"));
+                NSUInteger cpMtlFmt = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("controlPointFormat"));
+                id rawRadBuf = ((id (*)(id, SEL))objc_msgSend)(gd, sel_registerName("radiusBuffer"));
+                NSUInteger radOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("radiusBufferOffset"));
+                NSUInteger radStride = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("radiusStride"));
+                NSUInteger radMtlFmt = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("radiusFormat"));
+                id rawIdxBuf = ((id (*)(id, SEL))objc_msgSend)(gd, sel_registerName("indexBuffer"));
+                NSUInteger idxOff = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("indexBufferOffset"));
+                NSUInteger idxMtlType = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("indexType"));
+                NSUInteger segCount = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("segmentCount"));
+                NSUInteger segCpCount = ((NSUInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("segmentControlPointCount"));
+                NSInteger curveType = ((NSInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("curveType"));
+                NSInteger curveBasis = ((NSInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("curveBasis"));
+                NSInteger curveCaps = ((NSInteger (*)(id, SEL))objc_msgSend)(gd, sel_registerName("curveEndCaps"));
+
+                RDNA4Buffer *cpBuf = nil, *radBuf = nil, *idxBuf = nil;
+                NSString *bwhy = nil;
+                if (!rdna4_rt_check_buffer(rawCpBuf, dev, NO, &cpBuf, &bwhy) ||
+                    !rdna4_rt_check_buffer(rawRadBuf, dev, NO, &radBuf, &bwhy) ||
+                    !rdna4_rt_check_buffer(rawIdxBuf, dev, NO, &idxBuf, &bwhy)) {
+                    free(geomSigs); rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, bwhy ?: @"invalid curve geometry buffer");
+                    return NO;
+                }
+
+                rdna4rt_curve_cp_fmt_t cpFmt = RDNA4RT_CURVE_CP_FLOAT3;
+                rdna4rt_curve_rad_fmt_t radFmt = RDNA4RT_CURVE_RAD_FLOAT;
+                if (!rdna4_rt_curve_cp_fmt_from_mtl(cpMtlFmt, &cpFmt) ||
+                    !rdna4_rt_curve_rad_fmt_from_mtl(radMtlFmt, &radFmt)) {
+                    free(geomSigs); rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"unsupported curve format cp=%lu rad=%lu", (unsigned long)cpMtlFmt, (unsigned long)radMtlFmt]);
+                    return NO;
+                }
+
+                rdna4rt_index_type_t cIdxType = RDNA4RT_INDEX_NONE;
+                if (idxBuf) {
+                    if (idxMtlType == MTLIndexTypeUInt16) cIdxType = RDNA4RT_INDEX_UINT16;
+                    else if (idxMtlType == MTLIndexTypeUInt32) cIdxType = RDNA4RT_INDEX_UINT32;
+                    else {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        if (err) *err = rdna4_err(145, @"unsupported curve indexType");
+                        return NO;
+                    }
+                }
+
+                rdna4rt_curve_geom_t cdesc = {
+                    .curve_type = (rdna4rt_curve_type_t)curveType,
+                    .curve_basis = (rdna4rt_curve_basis_t)curveBasis,
+                    .curve_end_caps = (rdna4rt_curve_endcaps_t)curveCaps,
+                    .segment_control_point_count = (uint32_t)MIN(segCpCount, (NSUInteger)UINT32_MAX),
+                    .segment_count = (uint64_t)segCount,
+                    .control_point_count = (uint64_t)cpCount,
+                    .control_point_format = cpFmt,
+                    .has_control_point_buf = cpBuf != nil ? 1 : 0,
+                    .control_point_buf_gpu_addr = cpBuf ? [cpBuf gpuAddress] : 0u,
+                    .control_point_buf_len = cpBuf ? (uint64_t)[cpBuf length] : 0u,
+                    .control_point_buf_offset = (uint64_t)cpOff,
+                    .control_point_stride = (uint64_t)cpStride,
+                    .radius_format = radFmt,
+                    .has_radius_buf = radBuf != nil ? 1 : 0,
+                    .radius_buf_gpu_addr = radBuf ? [radBuf gpuAddress] : 0u,
+                    .radius_buf_len = radBuf ? (uint64_t)[radBuf length] : 0u,
+                    .radius_buf_offset = (uint64_t)radOff,
+                    .radius_stride = (uint64_t)radStride,
+                    .has_index_buf = idxBuf != nil ? 1 : 0,
+                    .index_type = cIdxType,
+                    .index_buf_gpu_addr = idxBuf ? [idxBuf gpuAddress] : 0u,
+                    .index_buf_len = idxBuf ? (uint64_t)[idxBuf length] : 0u,
+                    .index_buf_offset = (uint64_t)idxOff,
+                    .opaque = gd.opaque ? 1 : 0,
+                    .allow_duplicate_any_hit = gd.allowDuplicateIntersectionFunctionInvocation ? 1 : 0
+                };
+                rdna4rt_curve_plan_t cplan;
+                rdna4rt_err_t ce = rdna4rt_validate_curve_geom_ex(&cdesc, m3.rt_max_primitives, requireBuffers ? 1 : 0, &cplan);
+                if (ce != RDNA4RT_OK) {
+                    free(geomSigs); rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"curve geometry[%lu]: %s", (unsigned long)i, rdna4rt_err_str(ce)]);
+                    return NO;
+                }
+                uint32_t subSplits = rdna4rt_curve_sub_splits(cdesc.curve_basis);
+                uint32_t aabbCount = 0u;
+                rdna4rt_err_t ace = rdna4rt_curve_aabb_count(cplan.segment_count, subSplits, &aabbCount);
+                if (ace != RDNA4RT_OK || (m3.rt_max_primitives > 0u && aabbCount > m3.rt_max_primitives)) {
+                    free(geomSigs); rdna4_rt_plan_free(plan);
+                    if (err) *err = rdna4_err(145, [NSString stringWithFormat:@"curve geometry[%lu]: %s", (unsigned long)i, rdna4rt_err_str(ace != RDNA4RT_OK ? ace : RDNA4RT_ERR_LIMIT)]);
+                    return NO;
+                }
+                if (validatePrimData) {
+                    if (!rdna4_rt_extract_prim_data_geom(gd, dev, cplan.segment_count, collectPrimBuffers,
+                                                         retainedObjects, &plan->primPlans[i],
+                                                         &plan->primSrcVkBufs[i], &plan->primSrcVkOffs[i], err)) {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        return NO;
+                    }
+                }
+                if (requireBuffers) {
+                    if (cpBuf) [retainedObjects addObject:cpBuf];
+                    if (radBuf) [retainedObjects addObject:radBuf];
+                    if (idxBuf) [retainedObjects addObject:idxBuf];
+                }
+                plan->curvePlans[i] = (RDNA4RTCurvePlanEntry){
+                    .isCurve = 1,
+                    .desc = cdesc,
+                    .subSplits = subSplits,
+                    .aabbCount = aabbCount,
+                    .vkGeomFlags = cplan.vk_geom_flags
+                };
+                if (aabbCount > 0u) plan->hasCurves = YES;
+
+                VkDeviceAddress aabbAddr = 0u;
+                if (requireBuffers && aabbCount > 0u) {
+                    RDNA4RTStagingBuffer *aabbStg = [[RDNA4RTStagingBuffer alloc]
+                        initWithSize:(uint64_t)aabbCount * RDNA4RT_AABB_STRIDE_MIN error:err];
+                    if (!aabbStg) {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        return NO;
+                    }
+                    [retainedObjects addObject:aabbStg];
+                    aabbAddr = aabbStg->_addr;
+                    rdna4rt_curve_build_pc_t cpc = {
+                        .cp_addr = cplan.cp_addr,
+                        .rad_addr = cplan.rad_addr,
+                        .idx_addr = cplan.index_addr,
+                        .aabb_dst_addr = (uint64_t)aabbAddr,
+                        .seg_dst_addr = 0u,
+                        .segment_count = cplan.segment_count,
+                        .control_point_count = (uint32_t)cdesc.control_point_count,
+                        .cp_stride = (uint32_t)cplan.cp_stride,
+                        .rad_stride = (uint32_t)cplan.rad_stride,
+                        .geom_index = (uint32_t)i,
+                        .packed_flags = rdna4rt_curve_pack_flags(
+                            (uint32_t)cdesc.control_point_format,
+                            (uint32_t)cdesc.radius_format,
+                            (uint32_t)cplan.effective_index_type,
+                            (uint32_t)cdesc.curve_basis,
+                            cplan.segment_cp_count,
+                            subSplits)
+                    };
+                    if (!rdna4_rt_plan_append_curve(plan, &cpc)) {
+                        free(geomSigs); rdna4_rt_plan_free(plan);
+                        if (err) *err = rdna4_err(145, @"out of host memory recording curve dispatch");
+                        return NO;
+                    }
+                }
+
+                plan->vkGeoms[i] = (VkAccelerationStructureGeometryKHR){
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+                    .geometryType = VK_GEOMETRY_TYPE_AABBS_KHR,
+                    .flags = cplan.vk_geom_flags,
+                    .geometry.aabbs = {
+                        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR,
+                        .data.deviceAddress = aabbAddr,
+                        .stride = RDNA4RT_AABB_STRIDE_MIN
+                    }
+                };
+                plan->vkRanges[i] = (VkAccelerationStructureBuildRangeInfoKHR){
+                    .primitiveCount = aabbCount,
+                    .primitiveOffset = 0u,
+                    .firstVertex = 0u,
+                    .transformOffset = 0u
+                };
+                plan->maxPrimCounts[i] = aabbCount;
+                geomSigs[i] = rdna4rt_geom_sig(RDNA4RT_GEOM_CURVES, cplan.effective_index_type, RDNA4RT_VFMT_FLOAT3, cplan.vk_geom_flags);
+                if (!rdna4rt_add_u64(totalPrims, (uint64_t)aabbCount, &totalPrims)) {
                     free(geomSigs); rdna4_rt_plan_free(plan);
                     if (err) *err = rdna4_err(145, @"total BLAS primitive count overflow");
                     return NO;
@@ -3524,6 +3821,170 @@ static BOOL rdna4_rt_record_blas_prim_snapshot(
     return YES;
 }
 
+static BOOL rdna4_rt_prepare_blas_sidecar(
+    VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
+    RDNA4RTBuildPlan *plan, GarnetASPrimData *cloneSrcPd,
+    BOOL updPrim, BOOL cloneTailCurveSegs,
+    GarnetASPrimData **outPd, NSError **err)
+{
+    if (outPd) *outPd = nil;
+    if (!plan || plan->geomCount == 0u || !plan->curvePlans) return YES;
+
+    uint32_t *curveAabbs = (uint32_t *)calloc(plan->geomCount, sizeof(*curveAabbs));
+    uint64_t *primOffsets = (uint64_t *)calloc(plan->geomCount, sizeof(*primOffsets));
+    uint64_t *segOffsets = (uint64_t *)calloc(plan->geomCount, sizeof(*segOffsets));
+    if (!curveAabbs || !primOffsets || !segOffsets) {
+        free(curveAabbs); free(primOffsets); free(segOffsets);
+        if (err) *err = rdna4_err(146, @"out of host memory planning BLAS curve sidecar");
+        return NO;
+    }
+    for (uint32_t i = 0; i < plan->geomCount; i++) {
+        curveAabbs[i] = plan->curvePlans[i].isCurve ? plan->curvePlans[i].aabbCount : 0u;
+    }
+    const rdna4rt_prim_data_geom_plan_t *primSrc = updPrim
+        ? plan->primPlans
+        : NULL;
+    uint64_t headerBytes = 0u, auxCurveOff = 0u, totalBytes = 0u;
+    int anyPrim = 0, anyCurve = 0;
+    rdna4rt_prim_data_geom_plan_t *clonedPlans = NULL;
+    if (!updPrim && cloneSrcPd && cloneSrcPd->_blasHeaders && cloneSrcPd->_count == plan->geomCount) {
+        clonedPlans = (rdna4rt_prim_data_geom_plan_t *)calloc(plan->geomCount, sizeof(*clonedPlans));
+        if (!clonedPlans) {
+            free(curveAabbs); free(primOffsets); free(segOffsets);
+            if (err) *err = rdna4_err(146, @"out of host memory cloning prim headers");
+            return NO;
+        }
+        for (uint32_t i = 0; i < plan->geomCount; i++) {
+            uint32_t st = cloneSrcPd->_blasHeaders[i].stride;
+            uint32_t pc = cloneSrcPd->_blasHeaders[i].prim_count;
+            if (cloneSrcPd->_blasHeaders[i].data_bda != 0u && pc > 0u) {
+                clonedPlans[i].present = 1;
+                clonedPlans[i].stride = st;
+                clonedPlans[i].prim_count = pc;
+                clonedPlans[i].copy_bytes = (uint64_t)pc * (uint64_t)st;
+            }
+        }
+        primSrc = clonedPlans;
+    }
+
+    rdna4rt_err_t le = rdna4rt_blas_curve_layout_compute(
+        primSrc, curveAabbs, plan->geomCount,
+        primOffsets, &headerBytes, &auxCurveOff, segOffsets, &totalBytes, &anyPrim, &anyCurve);
+    if (le != RDNA4RT_OK) {
+        free(clonedPlans); free(curveAabbs); free(primOffsets); free(segOffsets);
+        if (err) *err = rdna4_err(146, [NSString stringWithUTF8String:rdna4rt_err_str(le)]);
+        return NO;
+    }
+    if (!anyPrim && !anyCurve) {
+        free(clonedPlans); free(curveAabbs); free(primOffsets); free(segOffsets);
+        return YES;
+    }
+
+    GarnetASPrimData *pd = [[GarnetASPrimData alloc]
+        initWithSize:totalBytes kind:RDNA4RT_PRIM_KIND_BLAS count:plan->geomCount
+         entryStride:(uint32_t)auxCurveOff refOffset:0u error:err];
+    if (!pd) {
+        free(clonedPlans); free(curveAabbs); free(primOffsets); free(segOffsets);
+        return NO;
+    }
+
+    rdna4rt_geom_prim_entry_t *headers = (rdna4rt_geom_prim_entry_t *)calloc(plan->geomCount, sizeof(*headers));
+    rdna4rt_curve_meta_hdr_t *curveHdrs = anyCurve
+        ? (rdna4rt_curve_meta_hdr_t *)calloc(plan->geomCount, sizeof(*curveHdrs))
+        : NULL;
+    if (!headers || (anyCurve && !curveHdrs)) {
+        free(headers); free(curveHdrs); free(clonedPlans);
+        free(curveAabbs); free(primOffsets); free(segOffsets);
+        if (err) *err = rdna4_err(146, @"out of host memory building BLAS curve headers");
+        return NO;
+    }
+    if (primSrc && anyPrim) {
+        rdna4rt_err_t he = rdna4rt_blas_prim_build_headers(
+            (uint64_t)pd->_bda, primSrc, primOffsets, plan->geomCount, headers);
+        if (he != RDNA4RT_OK) {
+            free(headers); free(curveHdrs); free(clonedPlans);
+            free(curveAabbs); free(primOffsets); free(segOffsets);
+            if (err) *err = rdna4_err(146, [NSString stringWithUTF8String:rdna4rt_err_str(he)]);
+            return NO;
+        }
+    }
+    pd->_blasHeaders = headers;
+    if (!rdna4_rt_upload_prim_header(cmd, cb, pd->_buf, headers, headerBytes, err)) {
+        free(curveHdrs); free(clonedPlans);
+        free(curveAabbs); free(primOffsets); free(segOffsets);
+        return NO;
+    }
+    if (anyPrim) {
+        for (uint32_t i = 0; i < plan->geomCount; i++) {
+            if (!primSrc[i].present || primSrc[i].copy_bytes == 0u) continue;
+            if (updPrim) {
+                VkBufferCopy copy = {
+                    .srcOffset = plan->primSrcVkOffs[i],
+                    .dstOffset = primOffsets[i],
+                    .size = primSrc[i].copy_bytes
+                };
+                vkCmdCopyBuffer(cmd, plan->primSrcVkBufs[i], pd->_buf, 1u, &copy);
+            } else if (cloneSrcPd && cloneSrcPd->_blasHeaders[i].data_bda >= (uint64_t)cloneSrcPd->_bda) {
+                VkBufferCopy copy = {
+                    .srcOffset = cloneSrcPd->_blasHeaders[i].data_bda - (uint64_t)cloneSrcPd->_bda,
+                    .dstOffset = primOffsets[i],
+                    .size = primSrc[i].copy_bytes
+                };
+                vkCmdCopyBuffer(cmd, cloneSrcPd->_buf, pd->_buf, 1u, &copy);
+            }
+        }
+    }
+    if (anyCurve) {
+        for (uint32_t i = 0; i < plan->geomCount; i++) {
+            if (!plan->curvePlans[i].isCurve || plan->curvePlans[i].aabbCount == 0u) continue;
+            const rdna4rt_curve_geom_t *cg = &plan->curvePlans[i].desc;
+            curveHdrs[i] = (rdna4rt_curve_meta_hdr_t){
+                .magic = RDNA4RT_CURVE_META_MAGIC,
+                .curve_type = (uint32_t)cg->curve_type,
+                .curve_basis = (uint32_t)cg->curve_basis,
+                .curve_end_caps = (uint32_t)cg->curve_end_caps,
+                .segment_cp_count = cg->segment_control_point_count,
+                .segment_count = (uint32_t)cg->segment_count,
+                .sub_splits = plan->curvePlans[i].subSplits,
+                .flags = cg->opaque ? 1u : 0u,
+                .seg_table_off = segOffsets[i],
+                .sub_map_off = 0u
+            };
+        }
+        uint64_t curveHdrBytes = (uint64_t)plan->geomCount * (uint64_t)sizeof(rdna4rt_curve_meta_hdr_t);
+        if (!rdna4_rt_cmd_write_buf_bytes(cmd, cb, pd->_buf, auxCurveOff, curveHdrs, curveHdrBytes, err)) {
+            free(curveHdrs); free(clonedPlans);
+            free(curveAabbs); free(primOffsets); free(segOffsets);
+            return NO;
+        }
+        if (cloneTailCurveSegs && cloneSrcPd && cloneSrcPd->_entryStride > 0u &&
+            cloneSrcPd->_totalBytes > (uint64_t)cloneSrcPd->_entryStride + curveHdrBytes) {
+            uint64_t srcTailOff = (uint64_t)cloneSrcPd->_entryStride + curveHdrBytes;
+            uint64_t dstTailOff = auxCurveOff + curveHdrBytes;
+            uint64_t availSrc = cloneSrcPd->_totalBytes - srcTailOff;
+            uint64_t availDst = pd->_totalBytes - dstTailOff;
+            uint64_t tailCopySz = MIN(availSrc, availDst);
+            if (tailCopySz > 0u) {
+                VkBufferCopy tcopy = { .srcOffset = srcTailOff, .dstOffset = dstTailOff, .size = tailCopySz };
+                vkCmdCopyBuffer(cmd, cloneSrcPd->_buf, pd->_buf, 1u, &tcopy);
+            }
+        } else {
+            for (uint32_t k = 0; k < plan->curveDispatchCount; k++) {
+                uint32_t gi = plan->curvePCs[k].geom_index;
+                if (gi < plan->geomCount && segOffsets[gi] > 0u) {
+                    plan->curvePCs[k].seg_dst_addr = (uint64_t)pd->_bda + segOffsets[gi];
+                }
+            }
+        }
+        free(curveHdrs);
+    }
+
+    free(clonedPlans); free(curveAabbs); free(primOffsets); free(segOffsets);
+    [cb rdna4RetainEncoded:pd];
+    if (outPd) *outPd = pd;
+    return YES;
+}
+
 static BOOL rdna4_rt_record_tlas_prim_snapshot(
     VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
     GarnetAccelerationStructure *dstAS, uint64_t dstAsBda,
@@ -3549,7 +4010,6 @@ static BOOL rdna4_rt_record_tlas_prim_snapshot(
     [cb rdna4RetainEncoded:pd];
     return YES;
 }
-
 static BOOL rdna4_rt_record_prim_data_clone(
     VkCommandBuffer cmd, RDNA4CommandBuffer *cb,
     GarnetAccelerationStructure *srcAS,
@@ -3779,15 +4239,28 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
 
     VkCommandBuffer cmd = [_cb vk];
     const BOOL isCompQ = [_cb rdna4CurrentSegmentIsCompute];
+    GarnetASPrimData *preparedCurvePd = nil;
+    if (plan.kind == RDNA4RT_KIND_BLAS && plan.hasCurves) {
+        if (!rdna4_rt_prepare_blas_sidecar(cmd, _cb, &plan, nil, YES, NO, &preparedCurvePd, &err)) {
+            rdna4_rt_plan_free(&plan);
+            [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: curve sidecar preparation failed"];
+            return;
+        }
+    }
     if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: pre-build compute conversion failed"];
         return;
     }
     RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
-    BOOL primOk = (plan.kind == RDNA4RT_KIND_BLAS)
-        ? rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err)
-        : rdna4_rt_record_tlas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, tlasBlasPrimDatas, &err);
+    BOOL primOk = YES;
+    if (plan.kind == RDNA4RT_KIND_BLAS && plan.hasCurves) {
+        primOk = [dstAS rdna4SetPrimData:preparedCurvePd forAsAddress:(uint64_t)dstHandle->_deviceAddress commandBuffer:_cb vkCmdBuffer:cmd error:&err];
+    } else {
+        primOk = (plan.kind == RDNA4RT_KIND_BLAS)
+            ? rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err)
+            : rdna4_rt_record_tlas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, tlasBlasPrimDatas, &err);
+    }
     if (!primOk) {
         rdna4_rt_plan_free(&plan);
         [_cb rdna4Fail:err.localizedDescription ?: @"buildAccelerationStructure: primitive data snapshot failed"];
@@ -3929,7 +4402,11 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
             RDNA4RTFn.cmdCopyAS(cmd, &ci);
         }
         BOOL primOk = YES;
-        if (plan.kind == RDNA4RT_KIND_BLAS) {
+        if (plan.kind == RDNA4RT_KIND_BLAS && plan.hasCurves) {
+            GarnetASPrimData *preparedPd = nil;
+            primOk = rdna4_rt_prepare_blas_sidecar(cmd, _cb, &plan, [srcAS rdna4CurrentPrimData], YES, YES, &preparedPd, &err) &&
+                     [dstAS rdna4SetPrimData:preparedPd forAsAddress:(uint64_t)dstHandle->_deviceAddress commandBuffer:_cb vkCmdBuffer:cmd error:&err];
+        } else if (plan.kind == RDNA4RT_KIND_BLAS) {
             primOk = rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err);
         } else if (dstAS != srcAS) {
             primOk = rdna4_rt_record_prim_data_clone(cmd, _cb, srcAS, dstAS, (uint64_t)dstHandle->_deviceAddress, &err);
@@ -3960,6 +4437,14 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         VkAccelerationStructureBuildRangeInfoKHR dummyRange = { 0u, 0u, 0u, 0u };
         const VkAccelerationStructureBuildRangeInfoKHR *pRanges = plan.geomCount ? plan.vkRanges : &dummyRange;
 
+        GarnetASPrimData *preparedCurvePd = nil;
+        if (plan.kind == RDNA4RT_KIND_BLAS && plan.hasCurves) {
+            if (!rdna4_rt_prepare_blas_sidecar(cmd, _cb, &plan, [srcAS rdna4CurrentPrimData], updPrim, NO, &preparedCurvePd, &err)) {
+                rdna4_rt_plan_free(&plan);
+                [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: curve sidecar preparation failed"];
+                return;
+            }
+        }
         if (!rdna4_rt_dispatch_pre_build(cmd, &plan, isCompQ, &err)) {
             rdna4_rt_plan_free(&plan);
             [_cb rdna4Fail:err.localizedDescription ?: @"refitAccelerationStructure: pre-build compute conversion failed"];
@@ -3968,7 +4453,9 @@ RDNA4_DNR(GarnetAccelerationStructureCommandEncoder)
         RDNA4RTFn.cmdBuildAS(cmd, 1u, &buildInfo, &pRanges);
 
         BOOL primOk = YES;
-        if (plan.kind == RDNA4RT_KIND_TLAS) {
+        if (plan.kind == RDNA4RT_KIND_BLAS && plan.hasCurves) {
+            primOk = [dstAS rdna4SetPrimData:preparedCurvePd forAsAddress:(uint64_t)dstHandle->_deviceAddress commandBuffer:_cb vkCmdBuffer:cmd error:&err];
+        } else if (plan.kind == RDNA4RT_KIND_TLAS) {
             primOk = rdna4_rt_record_tlas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, tlasBlasPrimDatas, &err);
         } else if (updPrim) {
             primOk = rdna4_rt_record_blas_prim_snapshot(cmd, _cb, dstAS, (uint64_t)dstHandle->_deviceAddress, &plan, &err);
@@ -5256,16 +5743,21 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
         return VK_NULL_HANDLE;
     }
     NSString *k = [NSString stringWithFormat:@"%u,%u,%u", objLocal[0], objLocal[1], objLocal[2]];
+    uint64_t compileNs = 0; BOOL builtNew = NO;
     [_lock lock];
     NSValue *v = _objCompVariants[k];
     if (!v) {
+        uint64_t bt0 = rdna4_now();
         VkPipeline p = [self rdna4BuildObjectComputeLocked:objLocal error:err];
+        compileNs = rdna4_now() - bt0;
         if (p) {
+            builtNew = YES;
             v = [NSValue valueWithPointer:(void *)p];
             _objCompVariants[k] = v;
         }
     }
     [_lock unlock];
+    if (builtNew) rdna4_pc_maybe_save_after_compile(compileNs, "object-compute");
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
 
@@ -5425,17 +5917,22 @@ static BOOL rdna4_mesh_build_stage_dsl(const RDNA4sRefl *r, int set, VkShaderSta
     NSString *k = [NSString stringWithFormat:@"%u:%u:%u:%u:%u,%u,%u:%u,%u,%u",
                    (unsigned)cull, (unsigned)front, dk, rflags,
                    ol[0], ol[1], ol[2], meshLocal[0], meshLocal[1], meshLocal[2]];
+    uint64_t compileNs = 0; BOOL builtNew = NO;
     [_lock lock];
     NSValue *v = _meshVariants[k];
     if (!v) {
+        uint64_t bt0 = rdna4_now();
         VkPipeline p = [self rdna4BuildMeshGfxLocked:cull front:front ds:dk rflags:rflags
                                             objLocal:ol meshLocal:meshLocal error:err];
+        compileNs = rdna4_now() - bt0;
         if (p) {
+            builtNew = YES;
             v = [NSValue valueWithPointer:(void *)p];
             _meshVariants[k] = v;
         }
     }
     [_lock unlock];
+    if (builtNew) rdna4_pc_maybe_save_after_compile(compileNs, "mesh-pipeline");
     return v ? (VkPipeline)v.pointerValue : VK_NULL_HANDLE;
 }
 
