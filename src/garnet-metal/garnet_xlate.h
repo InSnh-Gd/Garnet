@@ -33,6 +33,21 @@
 #include <CommonCrypto/CommonDigest.h>
 #include "garnet_gate.h"
 #include "garnet_query_caps.h"
+#include "garnet_xlate_fallback.h"
+
+#ifndef GARNETX_CAP_RASTER_SAMPLES_SHIFT
+#define GARNETX_CAP_RASTER_SAMPLES_SHIFT 16u
+#define GARNETX_CAP_RASTER_SAMPLES_MASK  (0xFFu << GARNETX_CAP_RASTER_SAMPLES_SHIFT)
+#endif
+static inline uint32_t garnetx_cap_raster_samples(uint32_t samples) {
+    if (samples == 0u || samples > 64u || (samples & (samples - 1u)) != 0u) return 0u;
+    return (samples << GARNETX_CAP_RASTER_SAMPLES_SHIFT) & GARNETX_CAP_RASTER_SAMPLES_MASK;
+}
+static inline int rdna4x_needs_raster_sample_count(const char *reason) {
+    if (!reason || !reason[0]) return 0;
+    return strstr(reason, "raster_sample_count") != NULL ||
+           strstr(reason, "air.get_num_samples") != NULL;
+}
 
 // ---- constants ----
 #define RDNA4X_KEY_TAG       "rdna4x-54-gpu-icb-render-lowering"
@@ -151,16 +166,6 @@ static inline void rdna4x_key_with_capabilities(char out[17], const uint8_t xlUu
 static inline void rdna4x_key(char out[17], const uint8_t xlUuid[16], const uint8_t readerId[16], const uint8_t ovHash[32], const char *osversion) {
     rdna4x_key_with_capabilities(out, xlUuid, readerId, ovHash, osversion, NULL);
 }
-static inline int rdna4x_sha_ok(const char *s) {
-    if (!s) return 0;
-    for (int i = 0; i < 64; i++) { const char c = s[i]; if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0; }
-    return s[64] == 0;
-}
-static inline int rdna4x_key_ok(const char *k) {
-    if (!k) return 0;
-    for (int i = 0; i < 16; i++) { const char c = k[i]; if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0; }
-    return k[16] == 0;
-}
 // ---- build 18 (P3): the cache key of a LINKED translation ----
 // The same entry function linked to different functions is a different program (the dependency decides the output: garnetxlate/tests/linked.rs), so the key is
 //   sha256( "rdna4x-link-1\n" + entrySha(64 hex) + "\n" + for each dependency, sorted by (symbol, sha) with exact duplicates dropped: symbol + "\0" + sha(64 hex) + "\n" ).
@@ -190,26 +195,21 @@ static inline int rdna4x_link_sha(char out[65], const char *entrySha, size_t n, 
     free(v);
     return 0;
 }
-// <userCacheDir>/org.garnet.xlate  (userCacheDir is confstr(_CS_DARWIN_USER_CACHE_DIR), which ends with '/')
-static inline size_t rdna4x_parent_path(char *out, size_t n, const char *userCacheDir) {
-    if (!out || n == 0) return 0;
+// Cache key for sample-count-specialized shaders (e.g. fragment air.get_num_samples.i32).
+static inline int rdna4x_msaa_sha(char out[65], const char *baseSha, uint32_t samples) {
     out[0] = 0;
-    if (!userCacheDir || !userCacheDir[0]) return 0;
-    const size_t dl = strlen(userCacheDir);
-    const int w = snprintf(out, n, "%s%s" RDNA4X_CACHE_SUB, userCacheDir, userCacheDir[dl - 1] == '/' ? "" : "/");
-    if (w <= 0 || (size_t)w >= n) { out[0] = 0; return 0; }
-    return (size_t)w;
-}
-// <userCacheDir>/org.garnet.xlate/<K>
-static inline size_t rdna4x_dir_path(char *out, size_t n, const char *userCacheDir, const char *key) {
-    if (!out || n == 0) return 0;
-    out[0] = 0;
-    if (!rdna4x_key_ok(key)) return 0;
-    char p[RDNA4X_PATH_MAX];
-    if (!rdna4x_parent_path(p, sizeof p, userCacheDir)) return 0;
-    const int w = snprintf(out, n, "%s/%s", p, key);
-    if (w <= 0 || (size_t)w >= n) { out[0] = 0; return 0; }
-    return (size_t)w;
+    if (!rdna4x_sha_ok(baseSha) || !garnetx_cap_raster_samples(samples)) return -1;
+    char buf[32];
+    const int n = snprintf(buf, sizeof buf, "%u\n", samples);
+    if (n <= 0 || (size_t)n >= sizeof buf) return -1;
+    CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, "rdna4x-msaa-1\n", 14);
+    CC_SHA256_Update(&c, baseSha, 64);
+    CC_SHA256_Update(&c, "\n", 1);
+    CC_SHA256_Update(&c, buf, (CC_LONG)n);
+    uint8_t d[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(d, &c);
+    rdna4x_hex(out, d, 32);
+    return 0;
 }
 // <dir>/<sha><ext>  with ext one of .spv .meta.json .fail .inflight .crash
 #define RDNA4X_EXT_SPV      ".spv"
@@ -224,78 +224,6 @@ static inline size_t rdna4x_file_path(char *out, size_t n, const char *dir, cons
     const int w = snprintf(out, n, "%s/%s%s", dir, sha, ext);
     if (w <= 0 || (size_t)w >= n) { out[0] = 0; return 0; }
     return (size_t)w;
-}
-
-// ---- the cache directory: created 0700, lstat-checked (a real directory owned by the caller, never a symlink), old keys removed (section 1.4) ----
-// mkdir (EEXIST is fine), then lstat: only a real directory owned by euid passes. 0 = ok.
-static inline int rdna4x_mkdir_checked(const char *path) {
-    if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
-    struct stat st;
-    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != geteuid()) return -1;
-    return 0;
-}
-// mkdir -p for the cache path: a sandboxed application's container cache directory
-// (<user cache>/com.apple.<service>) is NOT created by the system up front, so
-// creating <container>/org.garnet.xlate failed with ENOENT and every translation of
-// that process was refused. Each missing ancestor is created 0700 and then checked
-// like the final directory (a real directory of ours). Existing ancestors are
-// followed through symlinks (/var -> /private/var, /tmp -> /private/tmp); the LAST
-// component, the directory we then write into, is never a symlink.
-static inline int rdna4x_mkdir_p(const char *path) {
-    if (!path || path[0] != '/') return -1;
-    char buf[RDNA4X_PATH_MAX];
-    const size_t n = strlen(path);
-    if (n == 0 || n >= sizeof buf) return -1;
-    memcpy(buf, path, n + 1);
-    for (size_t i = 1; i <= n; i++) {
-        if (buf[i] != '/' && buf[i] != 0) continue;
-        const char c = buf[i];
-        const int last = (buf[i] == 0);
-        buf[i] = 0;
-        struct stat st;
-        if (last ? (lstat(buf, &st) == 0) : (stat(buf, &st) == 0)) {   // an existing ancestor (/private, /var, the user's cache) is used as-is: it is not ours to own
-            if (!S_ISDIR(st.st_mode) || (last && S_ISLNK(st.st_mode))) { buf[i] = c; return -1; }
-        } else {
-            if (mkdir(buf, 0700) != 0 && errno != EEXIST) { buf[i] = c; return -1; }
-            if (lstat(buf, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != geteuid()) { buf[i] = c; return -1; }
-        }
-        buf[i] = c;
-    }
-    return 0;
-}
-// Removes every key directory under parent except `keep`: plain files (lstat) are unlinked, then rmdir. A symlink, or anything that is not a real directory of ours, is left alone and never followed.
-// Returns the number of directories removed.
-static inline int rdna4x_remove_old_keys(const char *parent, const char *keep) {
-    DIR *d = opendir(parent);
-    if (!d) return 0;
-    int removed = 0; struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        const char *nm = e->d_name;
-        if (!strcmp(nm, ".") || !strcmp(nm, "..") || !strcmp(nm, keep)) continue;
-        char sub[RDNA4X_PATH_MAX]; struct stat st;
-        if (snprintf(sub, sizeof sub, "%s/%s", parent, nm) >= (int)sizeof sub) continue;
-        if (lstat(sub, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != geteuid()) continue;
-        DIR *sd = opendir(sub);
-        if (!sd) continue;
-        struct dirent *f;
-        while ((f = readdir(sd)) != NULL) {
-            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..")) continue;
-            char fp[RDNA4X_PATH_MAX + 300]; struct stat fs;
-            if (snprintf(fp, sizeof fp, "%s/%s", sub, f->d_name) >= (int)sizeof fp) continue;
-            if (lstat(fp, &fs) == 0 && S_ISREG(fs.st_mode)) (void)unlink(fp);
-        }
-        closedir(sd);
-        if (rmdir(sub) == 0) removed++;
-    }
-    closedir(d);
-    return removed;
-}
-// parent + parent/<key> exist and pass the checks, and old keys are gone. 0 = ready.
-static inline int rdna4x_prepare_dirs(const char *parent, const char *dir, const char *key) {
-    if (rdna4x_mkdir_p(parent) != 0) return -1;
-    if (rdna4x_mkdir_checked(dir) != 0) return -1;
-    (void)rdna4x_remove_old_keys(parent, key);
-    return 0;
 }
 
 // ======================================================================================================================================================================
@@ -503,7 +431,9 @@ static inline int rdna4x_write_atomic(const char *path, const void *data, size_t
     if (fd < 0) return -1;
     const char *p = (const char *)data; size_t left = n; int ok = 1;
     while (left) { const ssize_t w = write(fd, p, left); if (w <= 0) { ok = 0; break; } p += w; left -= (size_t)w; }
-    if (ok && fchmod(fd, 0644) != 0) ok = 0;
+    // Sandboxed GPU helpers (e.g. Chromium) may deny file-write-mode (fchmod -> EPERM) inside a
+    // user-private 0700 cache dir; keep the 0600 file owned by geteuid() rather than failing I/O.
+    if (ok && fchmod(fd, 0644) != 0 && errno != EPERM && errno != EACCES) ok = 0;
     if (close(fd) != 0) ok = 0;
     if (!ok || rename(tmp, path) != 0) { (void)unlink(tmp); return -1; }
     return 0;
@@ -806,7 +736,7 @@ static inline int rdna4x_xlib_load(rdna4x_xlib *x, const char *path, char *err, 
     return 0;
 }
 
-typedef struct { rdna4x_reader rd; rdna4x_xlib xl; rdna4x_backend_capabilities capabilities; const char *gpucBase, *readerOverride; } rdna4x_real;
+typedef struct { rdna4x_reader rd; rdna4x_xlib xl; rdna4x_backend_capabilities capabilities; uint32_t rasterSampleCount; const char *gpucBase, *readerOverride; } rdna4x_real;
 static inline int rdna4x_real_air_to_text(void *c, const uint8_t *air, size_t n, char **t, size_t *l, char *e, size_t en) {
     rdna4x_real *r = c;
     if (!r->rd.h && rdna4x_reader_load(&r->rd, r->gpucBase, r->readerOverride, e, en)) return -1;
@@ -815,7 +745,9 @@ static inline int rdna4x_real_air_to_text(void *c, const uint8_t *air, size_t n,
 static inline void rdna4x_real_free_text(void *c, char *t) { (void)c; free(t); }
 static inline int rdna4x_real_translate(void *c, const char *ll, size_t ll_len, const uint32_t *local, uint8_t **spv, size_t *sl, uint8_t **meta, size_t *ml, char *e, size_t en) {
     rdna4x_real *r = c;
-    return r->xl.translate_with_capabilities((const uint8_t *)ll, ll_len, local, spv, sl, meta, ml, e, en, &r->capabilities);
+    rdna4x_backend_capabilities caps = r->capabilities;
+    caps.flags |= garnetx_cap_raster_samples(r->rasterSampleCount);
+    return r->xl.translate_with_capabilities((const uint8_t *)ll, ll_len, local, spv, sl, meta, ml, e, en, &caps);
 }
 static inline void rdna4x_real_release(void *c, uint8_t *p, size_t n) { ((rdna4x_real *)c)->xl.freep(p, n); }
 static inline int rdna4x_real_lower_arguments(void *c, const uint8_t *spv, size_t sl, const uint8_t *meta, size_t ml,
@@ -831,7 +763,9 @@ static inline int rdna4x_real_translate_linked(void *c, const char *ll, size_t l
     if (!cd) { rdna4x_set_err(e, en, "out of memory%s", ""); return 3; }
     for (size_t i = 0; i < nd; i++) { cd[i].symbol = (const uint8_t *)deps[i].symbol; cd[i].symbol_len = strlen(deps[i].symbol); cd[i].ll = (const uint8_t *)deps[i].ll; cd[i].ll_len = deps[i].llLen; }
     rdna4x_real *r = c;
-    const int rc = r->xl.translate_linked_with_capabilities((const uint8_t *)ll, ll_len, local, cd, nd, spv, sl, meta, ml, e, en, &r->capabilities);
+    rdna4x_backend_capabilities caps = r->capabilities;
+    caps.flags |= garnetx_cap_raster_samples(r->rasterSampleCount);
+    const int rc = r->xl.translate_linked_with_capabilities((const uint8_t *)ll, ll_len, local, cd, nd, spv, sl, meta, ml, e, en, &caps);
     free(cd);
     return rc;
 }
@@ -856,6 +790,7 @@ typedef struct rdna4x_job {
     uint8_t *air; size_t airLen;
     uint8_t *inputMeta; size_t inputMetaLen;
     rdna4x_ldep *deps; size_t nd;   // build 18 (P3): owned copies (name + bitcode) of the linked dependencies
+    uint32_t rasterSampleCount;
     int refs, done, rc; char err[256];
 } rdna4x_job;
 typedef struct rdna4x_engine {
@@ -868,7 +803,99 @@ typedef struct rdna4x_engine {
     int useReal; char gpucBase[RDNA4X_PATH_MAX], readerOverride[RDNA4X_PATH_MAX], xlPath[RDNA4X_PATH_MAX];
     char sweptDir[RDNA4X_PATH_MAX];
     char loadErr[256];
+    rdna4x_memcache_t *memcache;   // Tier-2 bounded in-memory SPIR-V + metadata cache (when dir == RDNA4X_MEMCACHE_DIR)
 } rdna4x_engine;
+
+static inline void rdna4x_engine_set_memcache(rdna4x_engine *e, rdna4x_memcache_t *mc) {
+    if (!e) return;
+    pthread_mutex_lock(&e->mu);
+    e->memcache = mc;
+    pthread_mutex_unlock(&e->mu);
+}
+
+// Tier-2 in-memory translation job (zero filesystem access): stores SPIR-V + metadata or refusal into mc.
+static inline int rdna4x_process_job_mem(const rdna4x_deps *dp, rdna4x_memcache_t *mc, const char *sha, const char *fname,
+                                         const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld,
+                                         const uint8_t *inputMeta, size_t inputMetaLen, char *err, size_t errn) {
+    if (err && errn) err[0] = 0;
+    if (!dp || !dp->release || !mc || (inputMeta && !dp->lower_arguments) ||
+        (!inputMeta && (!dp->air_to_text || !dp->translate || !dp->free_text))) {
+        rdna4x_set_err(err, errn, "required translator operation or memory cache is unavailable%s", "");
+        return RDNA4X_E_UNAVAILABLE;
+    }
+    if (!air || (inputMeta ? !rdna4x_spv_size_ok(airLen) || !rdna4x_meta_size_ok(inputMetaLen) : !rdna4x_air_size_ok(airLen))) {
+        rdna4x_set_err(err, errn, "translator input size outside the caps%s", "");
+        return RDNA4X_E_CAP;
+    }
+    if (!rdna4x_sha_ok(sha)) { rdna4x_set_err(err, errn, "bad sha%s", ""); return RDNA4X_E_IO; }
+    {
+        char prevErr[256] = "";
+        const int hit = rdna4x_memcache_get(mc, sha, NULL, NULL, NULL, NULL, prevErr, sizeof prevErr);
+        if (hit > 0) return RDNA4X_OK;
+        if (hit < 0) { rdna4x_set_err(err, errn, "%s", prevErr[0] ? prevErr : "the translator refused this shader before"); return RDNA4X_E_SKIP_FAIL; }
+    }
+    char why[512]; why[0] = 0;
+    char *text = NULL; size_t tl = 0; uint8_t *spv = NULL, *meta = NULL; size_t sl = 0, ml = 0; int rc = RDNA4X_OK;
+    rdna4x_ldep_ll *dl = NULL; char **dtext = NULL; size_t ndt = 0;
+    if (inputMeta) {
+        if (dp->lower_arguments(dp->ctx, air, airLen, inputMeta, inputMetaLen, &spv, &sl, &meta, &ml, why, sizeof why)) {
+            rc = RDNA4X_E_REFUSED; goto refused;
+        }
+        goto output_ready;
+    }
+    if (dp->air_to_text(dp->ctx, air, airLen, &text, &tl, why, sizeof why) != 0 || !text) { rc = RDNA4X_E_READER; goto refused; }
+    if (!rdna4x_ll_size_ok(tl)) { snprintf(why, sizeof why, "LLVM text of %zu bytes is outside the cap", tl); rc = RDNA4X_E_CAP; goto refused; }
+    if (nld) {
+        if (!dp->translate_linked || nld > RDNA4X_MAX_DEPS || !ld) { snprintf(why, sizeof why, "linked translation unavailable or too many dependencies (%zu)", nld); rc = RDNA4X_E_UNAVAILABLE; goto refused; }
+        dl = (rdna4x_ldep_ll *)calloc(nld, sizeof *dl); dtext = (char **)calloc(nld, sizeof *dtext);
+        if (!dl || !dtext) { snprintf(why, sizeof why, "out of memory"); rc = RDNA4X_E_IO; goto refused; }
+        size_t tot = tl;
+        for (size_t i = 0; i < nld; i++) {
+            char *t = NULL; size_t l = 0;
+            if (!ld[i].symbol || !ld[i].symbol[0] || !rdna4x_air_size_ok(ld[i].airLen) || !ld[i].air) { snprintf(why, sizeof why, "dependency %zu: bad name or bitcode size", i); rc = RDNA4X_E_CAP; goto refused; }
+            if (dp->air_to_text(dp->ctx, ld[i].air, ld[i].airLen, &t, &l, why, sizeof why) != 0 || !t) { rc = RDNA4X_E_READER; goto refused; }
+            dtext[ndt++] = t; tot += l;
+            if (!rdna4x_ll_size_ok(l) || tot > RDNA4X_MAX_LL) { snprintf(why, sizeof why, "LLVM text of the dependencies (%zu bytes) is outside the cap", tot); rc = RDNA4X_E_CAP; goto refused; }
+            dl[i].symbol = ld[i].symbol; dl[i].ll = t; dl[i].llLen = l;
+        }
+    }
+    {
+        const uint32_t *loc = rdna4x_local_for(fname);
+        const int tr = nld ? dp->translate_linked(dp->ctx, text, tl, loc, dl, nld, &spv, &sl, &meta, &ml, why, sizeof why)
+                           : dp->translate(dp->ctx, text, tl, loc, &spv, &sl, &meta, &ml, why, sizeof why);
+        dp->free_text(dp->ctx, text); text = NULL;
+        for (size_t i = 0; i < ndt; i++) dp->free_text(dp->ctx, dtext[i]);
+        ndt = 0; free(dl); free(dtext); dl = NULL; dtext = NULL;
+        if (tr != 0) { rc = RDNA4X_E_REFUSED; goto refused; }
+    }
+output_ready:
+    if (!spv || !meta || !rdna4x_spv_size_ok(sl) || !rdna4x_meta_size_ok(ml)) { snprintf(why, sizeof why, "SPIR-V %zu bytes / meta %zu bytes outside the caps", sl, ml); rc = RDNA4X_E_CAP; goto refused; }
+    if (!inputMeta && dp->lowerTranslatedArguments && dp->lower_arguments) {
+        uint8_t *code = NULL, *json = NULL; size_t cl = 0, jl = 0;
+        int result = dp->lower_arguments(dp->ctx, spv, sl, meta, ml, &code, &cl, &json, &jl, why, sizeof why);
+        dp->release(dp->ctx, spv, sl); dp->release(dp->ctx, meta, ml);
+        spv = code; sl = cl; meta = json; ml = jl;
+        if (result) { rc = RDNA4X_E_REFUSED; goto refused; }
+        if (!spv || !meta || !rdna4x_spv_size_ok(sl) || !rdna4x_meta_size_ok(ml)) {
+            snprintf(why, sizeof why, "argument postpass output outside the caps"); rc = RDNA4X_E_CAP; goto refused;
+        }
+    }
+    if (rdna4x_memcache_put(mc, sha, spv, sl, meta, ml) != 0) {
+        snprintf(why, sizeof why, "SPIR-V/meta (%zu + %zu B) exceeds 64 MiB memory cache cap", sl, ml);
+        rc = RDNA4X_E_CAP;
+    }
+    goto done;
+refused:
+    if (text) { dp->free_text(dp->ctx, text); text = NULL; }
+    for (size_t i = 0; i < ndt; i++) dp->free_text(dp->ctx, dtext[i]);
+    free(dl); free(dtext); dl = NULL; dtext = NULL; ndt = 0;
+    (void)rdna4x_memcache_put_refusal(mc, sha, why);
+done:
+    if (spv) dp->release(dp->ctx, spv, sl);
+    if (meta) dp->release(dp->ctx, meta, ml);
+    if (rc != RDNA4X_OK && why[0]) rdna4x_set_err(err, errn, "%s", why);
+    return rc;
+}
 
 // deps != NULL: use those (tests). deps == NULL: load the real reader and translator on the worker thread, on the first job. stack: the worker's stack size (RDNA4X_WORKER_STACK in the bundle).
 static inline void rdna4x_engine_init(rdna4x_engine *e, const rdna4x_deps *deps, const char *gpucBase, const char *readerOverride, const char *xlPath, size_t stack) {
@@ -905,12 +932,16 @@ static inline void *rdna4x_worker_main(void *arg) {
             e->deps.lowerTranslatedArguments = e->lowerTranslatedArguments;
         }
         pthread_mutex_unlock(&e->mu);
+        if (e->useReal) e->real.rasterSampleCount = j->rasterSampleCount;
         int rc;
         if (!e->ready) { rc = RDNA4X_E_UNAVAILABLE; snprintf(j->err, sizeof j->err, "%s", e->loadErr[0] ? e->loadErr : "translator unavailable"); }
-        else {
+        else if (rdna4x_is_mem_dir(j->dir)) {
+            rc = rdna4x_process_job_mem(&e->deps, e->memcache, j->sha, j->name, j->air, j->airLen, j->deps, j->nd, j->inputMeta, j->inputMetaLen, j->err, sizeof j->err);
+        } else {
             if (strcmp(e->sweptDir, j->dir) != 0) { (void)rdna4x_sweep(j->dir); snprintf(e->sweptDir, sizeof e->sweptDir, "%s", j->dir); }   // the first miss in a directory: dead markers become .crash
             rc = rdna4x_process_job(&e->deps, j->dir, j->sha, j->name, j->air, j->airLen, j->deps, j->nd, j->inputMeta, j->inputMetaLen, j->err, sizeof j->err);
         }
+        if (e->useReal) e->real.rasterSampleCount = 0;
         pthread_mutex_lock(&e->mu);
         j->rc = rc; j->done = 1; e->running = NULL;
         pthread_cond_broadcast(&e->cvDone);
@@ -925,7 +956,7 @@ static inline rdna4x_job *rdna4x_find_job(rdna4x_engine *e, const char *dir, con
 }
 // Submits one translation and waits up to waitMs (0 = do not wait; < 0 = wait synchronously until done; the worker still finishes it and installs the result). A second request for a sha already queued or running shares that job.
 // Returns the job's code, or RDNA4X_E_TIMEOUT when the wait ran out. err (optional) gets a message.
-static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, const uint8_t *inputMeta, size_t inputMetaLen, int waitMs, char *err, size_t errn) {
+static inline int rdna4x_engine_submit_ex(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, const uint8_t *inputMeta, size_t inputMetaLen, uint32_t rasterSampleCount, int waitMs, char *err, size_t errn) {
     if (err && errn) err[0] = 0;
     if (nld > RDNA4X_MAX_DEPS || (nld && !ld)) { rdna4x_set_err(err, errn, "too many linked dependencies%s", ""); return RDNA4X_E_CAP; }
     { size_t tot = 0; for (size_t i = 0; i < nld; i++) { tot += ld[i].airLen; if (!ld[i].symbol || !ld[i].symbol[0] || !rdna4x_air_size_ok(ld[i].airLen) || !ld[i].air || tot > RDNA4X_MAX_DEP_AIR) { if (err && errn) snprintf(err, errn, "linked dependency %zu: bad name or bitcode outside the caps", i); return RDNA4X_E_CAP; } } }
@@ -941,7 +972,7 @@ static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const 
         uint8_t *copy = (uint8_t *)malloc(airLen);
         if (!j || !copy) { free(j); free(copy); pthread_mutex_unlock(&e->mu); return RDNA4X_E_IO; }
         memcpy(copy, air, airLen);
-        j->air = copy; j->airLen = airLen; j->refs = 2;   // the waiter and the worker
+        j->air = copy; j->airLen = airLen; j->rasterSampleCount = rasterSampleCount; j->refs = 2;   // the waiter and the worker
         if (inputMeta) {
             j->inputMeta = malloc(inputMetaLen);
             if (!j->inputMeta) { j->refs = 1; rdna4x_job_unref(e, j); pthread_mutex_unlock(&e->mu); return RDNA4X_E_IO; }
@@ -980,6 +1011,12 @@ static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const 
     rdna4x_job_unref(e, j);
     pthread_mutex_unlock(&e->mu);
     return rc;
+}
+static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, const uint8_t *inputMeta, size_t inputMetaLen, int waitMs, char *err, size_t errn) {
+    return rdna4x_engine_submit_ex(e, dir, sha, fname, air, airLen, ld, nld, inputMeta, inputMetaLen, 0u, waitMs, err, errn);
+}
+static inline int rdna4x_engine_run_samples(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, uint32_t rasterSampleCount, int waitMs, char *err, size_t errn) {
+    return rdna4x_engine_submit_ex(e, dir, sha, fname, air, airLen, ld, nld, NULL, 0, rasterSampleCount, waitMs, err, errn);
 }
 static inline int rdna4x_engine_run_linked(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, int waitMs, char *err, size_t errn) {
     return rdna4x_engine_submit(e, dir, sha, fname, air, airLen, ld, nld, NULL, 0, waitMs, err, errn);

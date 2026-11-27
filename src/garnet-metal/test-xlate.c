@@ -189,6 +189,26 @@ int main(int argc, char **argv) {
             rdna4x_key_with_capabilities(kc1, xl, rd, ov, "26A434", &c1);
             CHECK("key: GARNETX_CAP_NATIVE_INT64 (1<<12) changes the cache key", strcmp(kc0, kc1) != 0);
         }
+        {
+            CHECK("msaa cap: power-of-two 1..=64 packed in bits 23:16; invalid -> 0",
+                  garnetx_cap_raster_samples(0) == 0 &&
+                  garnetx_cap_raster_samples(1) == (1u << 16) &&
+                  garnetx_cap_raster_samples(4) == (4u << 16) &&
+                  garnetx_cap_raster_samples(64) == (64u << 16) &&
+                  garnetx_cap_raster_samples(3) == 0 &&
+                  garnetx_cap_raster_samples(128) == 0);
+            char m1[65], m4[65], m4b[65], mbad[65];
+            CHECK("msaa sha: deterministic, distinct across sample counts, rejects bad inputs",
+                  rdna4x_msaa_sha(m1, SHA_A, 1) == 0 && rdna4x_sha_ok(m1) &&
+                  rdna4x_msaa_sha(m4, SHA_A, 4) == 0 && rdna4x_sha_ok(m4) &&
+                  rdna4x_msaa_sha(m4b, SHA_A, 4) == 0 && strcmp(m4, m4b) == 0 &&
+                  strcmp(m1, m4) != 0 && strcmp(m4, SHA_A) != 0 &&
+                  rdna4x_msaa_sha(mbad, SHA_A, 3) != 0 && mbad[0] == 0);
+            CHECK("msaa refusal matcher detects air.get_num_samples / raster_sample_count",
+                  rdna4x_needs_raster_sample_count("air.get_num_samples.i32 requires TransformOptions::raster_sample_count") == 1 &&
+                  rdna4x_needs_raster_sample_count("unsupported opcode") == 0 &&
+                  rdna4x_needs_raster_sample_count(NULL) == 0);
+        }
         CHECK("rdna4x_key_ok: rejects upper case, short, long, non-hex", !rdna4x_key_ok("ABCDEF0123456789") && !rdna4x_key_ok("abc") && !rdna4x_key_ok("0123456789abcdef0") && !rdna4x_key_ok("0123456789abcdeg") && !rdna4x_key_ok(NULL));
     }
 

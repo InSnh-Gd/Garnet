@@ -4858,7 +4858,7 @@ static void *rdna4_mesh_s3_worker(void *opaque) {
         goto done;
     }
 
-    if (w->dir && w->dir[0] && w->sha && rdna4x_sha_ok(w->sha)) {
+    if (w->dir && w->dir[0] && !rdna4x_is_mem_dir(w->dir) && w->sha && rdna4x_sha_ok(w->sha)) {
         char path[RDNA4X_PATH_MAX];
         if (rdna4x_file_path(path, sizeof path, w->dir, w->sha, RDNA4X_EXT_META))
             (void)rdna4x_write_atomic(path, meta, metaLen);

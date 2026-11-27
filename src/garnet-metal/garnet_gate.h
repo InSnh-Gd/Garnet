@@ -38,6 +38,20 @@ static inline int rdna4g_class(int isWs, int allowRoot) { return isWs ? RDNA4G_C
 static inline int rdna4g_declined_by_class(int cls, uint32_t euid) { return cls == RDNA4G_CLASS_OTHER && euid < RDNA4G_APP_MIN_EUID; }
 #define RDNA4G_DECLINE_BY_CLASS_TEXT "process is not WindowServer and GARNET_ALLOW=1 (as root) is not set"
 
+// ---- one-way Seatbelt sandbox latch ----
+// Processes such as WebKit.GPU and Electron helpers may initialize frameworks before
+// calling sandbox_init_with_parameters. Never permanently cache 0 (unsandboxed); once
+// probe_fn returns > 0, latch 1 permanently because a macOS process cannot leave Seatbelt.
+static inline int rdna4g_sb_check_latch(int prev_latched, int (*probe_fn)(void *), void *ctx, int *next_latched) {
+    if (prev_latched) {
+        if (next_latched) *next_latched = 1;
+        return 1;
+    }
+    const int sb = (probe_fn && probe_fn(ctx) > 0) ? 1 : 0;
+    if (next_latched) *next_latched = sb;
+    return sb;
+}
+
 // ---- environment variable fallback (1-release compatibility: GARNET_* primary, RDNA4M_* fallback) ----
 static inline const char *rdna4g_getenv_pair(const char *newVal, const char *legacyVal, int *usedLegacyOut) {
     if (usedLegacyOut) *usedLegacyOut = 0;
@@ -160,11 +174,25 @@ static inline int rdna4g_kill_declines(int isWs, int state, int ignored) {
     if (state == RDNA4G_KILL_PRESENT) return !ignored;
     return isWs ? 0 : (state != RDNA4G_KILL_ABSENT);
 }
+// ABI 1.14 class-aware kill check: CLASS_OTHER encountering UNREADABLE (sandbox EPERM on /private/tmp/garnet-off)
+// defers to Hello+QueryInfo RDNA4N_INFO_KILL_SWITCH (and fails closed if kernel ABI < 1.14).
+static inline int rdna4g_kill_declines_for_class(int cls, int state, int ignored) {
+    if (state == RDNA4G_KILL_PRESENT) return !ignored;
+    if (state == RDNA4G_KILL_ABSENT) return 0;
+    return cls == RDNA4G_CLASS_ROOT ? 1 : 0;
+}
 
 // ---- the nub flags: -1 = property absent (or filtered: the registry cannot tell), -2 = the nub (parent entry) could not be reached, 0 / 1 = the value ----
 #define RDNA4G_FLAG_ABSENT   (-1)
 #define RDNA4G_FLAG_NONUB    (-2)
 static inline int rdna4g_ready_declines(int isWs, int flag) { return isWs ? (flag == 0) : (flag != 1); }
+// ABI 1.14 class-aware ready check: explicit 0 always declines; CLASS_OTHER encountering filtered ABSENT/NONUB
+// defers to Hello+QueryInfo RDNA4N_INFO_READY (and fails closed if kernel ABI < 1.14).
+static inline int rdna4g_ready_declines_for_class(int cls, int flag) {
+    if (flag == 0) return 1;
+    if (flag == 1) return 0;
+    return cls == RDNA4G_CLASS_ROOT ? 1 : 0;
+}
 static inline int rdna4g_autodisarm_declines(int isWs, int flag) { (void)isWs; return flag == 1; }
 
 // ---- which service the RDNA4N connection is opened on (G6, bundle 8) ----
@@ -183,17 +211,24 @@ static inline const char *rdna4g_mesa_service_for_class(int cls) { return cls ==
 #define RDNA4G_INFO_SIZE        192u
 #define RDNA4G_INFO_FLAGS_OFF   8u            // rdna4n_info.flags
 #define RDNA4G_INFO_HUNG        1u
+#define RDNA4G_INFO_READY          (1u << 8)  // ABI 1.14: GarnetMetalNub published and Garnet,Ready == 1
+#define RDNA4G_INFO_DISPLAY_ACTIVE (1u << 9)  // ABI 1.14: primary display pipe armed (isHeadless == NO)
+#define RDNA4G_INFO_KILL_SWITCH    (1u << 10) // ABI 1.14: kernel kill switch latched
+#define RDNA4G_INFO_MINOR_OFF   168u          // rdna4n_info.reserved[2]: ABI minor
+#define RDNA4G_ABI_MINOR_KERNEL_GATES 14u
 #define RDNA4G_INFO_BUDGET_OFF  172u          // rdna4n_info.reserved[3] (ABI 1.10): the budget flags word
 #define RDNA4G_BUDGET_APP       2u            // RDNA4N_BUDGET_APP: the kernel admitted this session as an allow-listed APPLICATION (not as root)
 #define RDNA4G_KR_EXCLUSIVE     0xe00002c5u   // kIOReturnExclusiveAccess: every session slot is busy, or a previous client is still closing
 #define RDNA4G_PROBE_RETRIES    50            // x 10 ms: the same courtesy Mesa's winsys extends to a client that is still closing
-#define RDNA4G_PROBE_OK     0
-#define RDNA4G_PROBE_NOSVC  1
-#define RDNA4G_PROBE_OPEN   2
-#define RDNA4G_PROBE_HELLO  3
-#define RDNA4G_PROBE_INFO   4
-#define RDNA4G_PROBE_HUNG   5
-#define RDNA4G_PROBE_NOTAPP 6
+#define RDNA4G_PROBE_OK       0
+#define RDNA4G_PROBE_NOSVC    1
+#define RDNA4G_PROBE_OPEN     2
+#define RDNA4G_PROBE_HELLO    3
+#define RDNA4G_PROBE_INFO     4
+#define RDNA4G_PROBE_HUNG     5
+#define RDNA4G_PROBE_NOTAPP   6
+#define RDNA4G_PROBE_NOTREADY 7
+#define RDNA4G_PROBE_KILLED   8
 static inline int rdna4g_probe_retry(uint32_t openRc, int tries) { return openRc == RDNA4G_KR_EXCLUSIVE && tries < RDNA4G_PROBE_RETRIES; }
 // budgetFlags: rdna4n_info.reserved[3]. A root process is admitted by the kernel too, as root - without RDNA4M_ALLOW=1 that must stay declined, so the verdict
 // needs the kernel to say APP.
@@ -206,16 +241,43 @@ static inline int rdna4g_probe_verdict(int haveSvc, uint32_t openRc, uint32_t he
     if ((budgetFlags & RDNA4G_BUDGET_APP) == 0u) return RDNA4G_PROBE_NOTAPP;
     return RDNA4G_PROBE_OK;
 }
+// ABI 1.14 kernel-authoritative sandbox verdict: when kernel ABI >= 1.14, QueryInfo bits 8 and 10 settle
+// readiness and kill-switch state even when Seatbelt denied /private/tmp or filtered IORegistry properties.
+// On older kernels (ABI <= 1.13), any deferred unreadable gate still fails closed.
+static inline int rdna4g_probe_verdict_v2(int haveSvc, uint32_t openRc, uint32_t helloRc, uint32_t infoRc,
+                                          uint32_t infoFlags, uint32_t budgetFlags, uint32_t abiMinor,
+                                          int killDeferred, int readyDeferred) {
+    const int base = rdna4g_probe_verdict(haveSvc, openRc, helloRc, infoRc, infoFlags, budgetFlags);
+    if (base != RDNA4G_PROBE_OK) return base;
+    if (abiMinor >= RDNA4G_ABI_MINOR_KERNEL_GATES) {
+        if ((infoFlags & RDNA4G_INFO_KILL_SWITCH) != 0u) return RDNA4G_PROBE_KILLED;
+        if ((infoFlags & RDNA4G_INFO_READY) == 0u) return RDNA4G_PROBE_NOTREADY;
+        return RDNA4G_PROBE_OK;
+    }
+    if (killDeferred) return RDNA4G_PROBE_KILLED;
+    if (readyDeferred) return RDNA4G_PROBE_NOTREADY;
+    return RDNA4G_PROBE_OK;
+}
+// ABI 1.14 sandbox-aware headless check: if /private/tmp/garnet-headless-no exists -> NO (0).
+// If stat was denied by Seatbelt (EPERM/EACCES) and an ABI >= 1.14 kernel probe succeeded, trust RDNA4N_INFO_DISPLAY_ACTIVE.
+static inline int rdna4g_headless_from_probe(int markerRc, int markerErr, int haveProbe, uint32_t probeAbiMinor, uint32_t probeInfoFlags) {
+    if (markerRc == 0) return 0;
+    if ((markerErr == EPERM || markerErr == EACCES) && haveProbe && probeAbiMinor >= RDNA4G_ABI_MINOR_KERNEL_GATES)
+        return (probeInfoFlags & RDNA4G_INFO_DISPLAY_ACTIVE) != 0u ? 0 : 1;
+    return 1;
+}
 static inline const char *rdna4g_probe_text(int v) {
     switch (v) {
-    case RDNA4G_PROBE_OK:    return "the kernel admitted this process";
-    case RDNA4G_PROBE_NOSVC: return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the GarnetDriver service was not found (or the sandbox denied the lookup)";
-    case RDNA4G_PROBE_OPEN:  return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the kernel refused its RDNA4N open (not allow-listed, or the user-application role is off)";
-    case RDNA4G_PROBE_HELLO: return "the kernel probe's Hello failed";
-    case RDNA4G_PROBE_INFO:  return "the kernel probe's QueryInfo could not be read";
-    case RDNA4G_PROBE_HUNG:  return "the kernel reports the GPU HUNG";
-    case RDNA4G_PROBE_NOTAPP: return "the kernel admitted this process as root, not as an allow-listed application (a root tool needs GARNET_ALLOW=1)";
-    default:               return "?";
+    case RDNA4G_PROBE_OK:       return "the kernel admitted this process";
+    case RDNA4G_PROBE_NOSVC:    return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the GarnetDriver service was not found (or the sandbox denied the lookup)";
+    case RDNA4G_PROBE_OPEN:     return "process is not WindowServer or a GARNET_ALLOW=1 root tool, and the kernel refused its RDNA4N open (not allow-listed, or the user-application role is off)";
+    case RDNA4G_PROBE_HELLO:    return "the kernel probe's Hello failed";
+    case RDNA4G_PROBE_INFO:     return "the kernel probe's QueryInfo could not be read";
+    case RDNA4G_PROBE_HUNG:     return "the kernel reports the GPU HUNG";
+    case RDNA4G_PROBE_NOTAPP:   return "the kernel admitted this process as root, not as an allow-listed application (a root tool needs GARNET_ALLOW=1)";
+    case RDNA4G_PROBE_NOTREADY: return "the kernel reports Garnet,Ready is 0 (or unavailable on ABI <= 1.13)";
+    case RDNA4G_PROBE_KILLED:   return "the kernel kill switch is active (or kill file unreadable on ABI <= 1.13)";
+    default:                    return "?";
     }
 }
 

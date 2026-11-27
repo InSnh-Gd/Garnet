@@ -35,6 +35,14 @@ static char *slurp(const char *dir, const char *name) {
     b[n] = 0; fclose(f); return b;
 }
 
+static int test_sb_probe_ret = 0;
+static int test_sb_probe_calls = 0;
+static int test_sb_probe_fn(void *ctx) {
+    (void)ctx;
+    test_sb_probe_calls++;
+    return test_sb_probe_ret;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
     // ---- G1 ----
@@ -97,7 +105,12 @@ int main(int argc, char **argv) {
     CHECK("G7: the HUNG bit", RDNA4G_INFO_HUNG == RDNA4N_INFO_HUNG);
     CHECK("G7: the budget flags word is info.reserved[3] and the APP bit is the ABI's", RDNA4G_INFO_BUDGET_OFF == offsetof(struct rdna4n_info, reserved) + 4u * RDNA4N_INFO_R_BUDGET_FLAGS && RDNA4G_BUDGET_APP == RDNA4N_BUDGET_APP);
     CHECK("G7: ExclusiveAccess is the IOReturn value", RDNA4G_KR_EXCLUSIVE == 0xe00002c5u);
-    CHECK("G7: ABI minor is 13", RDNA4N_ABI_MINOR == 13u);
+    CHECK("G7: ABI minor is 14", RDNA4N_ABI_MINOR == 14u);
+    CHECK("G7: ABI 1.14 info flags and minor offset match GarnetNativeABI.h",
+          RDNA4G_INFO_READY == RDNA4N_INFO_READY &&
+          RDNA4G_INFO_DISPLAY_ACTIVE == RDNA4N_INFO_DISPLAY_ACTIVE &&
+          RDNA4G_INFO_KILL_SWITCH == RDNA4N_INFO_KILL_SWITCH &&
+          RDNA4G_INFO_MINOR_OFF == offsetof(struct rdna4n_info, reserved) + 8u);
     // ---- G9 ----
     CHECK("G9: the by-class text names GARNET_ALLOW=1", !strcmp(RDNA4G_DECLINE_BY_CLASS_TEXT, "process is not WindowServer and GARNET_ALLOW=1 (as root) is not set"));
     // ---- G9b (1D migration): GARNET_* priority + 1-release RDNA4M_* fallback & kill-file pair ----
@@ -439,6 +452,65 @@ int main(int argc, char **argv) {
             unlink(dpath);
             unlink(lpath);
         }
+    }
+    // ---- G17: one-way Seatbelt sandbox latch ----
+    {
+        int latched = 0, next = -1;
+        test_sb_probe_calls = 0; test_sb_probe_ret = 0;
+        CHECK("G17: unsandboxed returns 0 without latching",
+              rdna4g_sb_check_latch(latched, test_sb_probe_fn, NULL, &next) == 0 && next == 0 && test_sb_probe_calls == 1);
+        latched = next;
+        CHECK("G17: negative error from sandbox_check does not falsely latch",
+              (test_sb_probe_ret = -1, rdna4g_sb_check_latch(latched, test_sb_probe_fn, NULL, &next) == 0) && next == 0 && test_sb_probe_calls == 2);
+        latched = next;
+        test_sb_probe_ret = 1; // late Seatbelt entry after framework init
+        CHECK("G17: late Seatbelt entry is observed and latched to 1",
+              rdna4g_sb_check_latch(latched, test_sb_probe_fn, NULL, &next) == 1 && next == 1 && test_sb_probe_calls == 3);
+        latched = next;
+        test_sb_probe_ret = 0;
+        CHECK("G17: once latched to 1, probe_fn is skipped and stays 1",
+              rdna4g_sb_check_latch(latched, test_sb_probe_fn, NULL, &next) == 1 && next == 1 && test_sb_probe_calls == 3);
+        char *bk = slurp(dir, "garnet_backend.m");
+        CHECK("G17: garnet_backend.m uses rdna4g_sb_check_latch one-way latch",
+              bk && strstr(bk, "rdna4g_sb_check_latch(") != NULL &&
+              strstr(bk, "sandboxed = (fn && fn(getpid(), NULL, 0) != 0) ? 1 : 0;") == NULL);
+        // ---- G18: ABI 1.14 kernel-authoritative sandbox gate & headless ----
+        CHECK("G18: CLASS_OTHER defers UNREADABLE kill file while ROOT still fails closed and PRESENT always declines",
+              !rdna4g_kill_declines_for_class(RDNA4G_CLASS_OTHER, RDNA4G_KILL_UNREADABLE, 0) &&
+              rdna4g_kill_declines_for_class(RDNA4G_CLASS_ROOT, RDNA4G_KILL_UNREADABLE, 0) &&
+              !rdna4g_kill_declines_for_class(RDNA4G_CLASS_WS, RDNA4G_KILL_UNREADABLE, 0) &&
+              rdna4g_kill_declines_for_class(RDNA4G_CLASS_OTHER, RDNA4G_KILL_PRESENT, 0));
+        CHECK("G18: CLASS_OTHER defers filtered Garnet,Ready while ROOT fails closed and explicit 0 always declines",
+              !rdna4g_ready_declines_for_class(RDNA4G_CLASS_OTHER, RDNA4G_FLAG_ABSENT) &&
+              !rdna4g_ready_declines_for_class(RDNA4G_CLASS_OTHER, RDNA4G_FLAG_NONUB) &&
+              rdna4g_ready_declines_for_class(RDNA4G_CLASS_OTHER, 0) &&
+              rdna4g_ready_declines_for_class(RDNA4G_CLASS_ROOT, RDNA4G_FLAG_ABSENT) &&
+              !rdna4g_ready_declines_for_class(RDNA4G_CLASS_WS, RDNA4G_FLAG_ABSENT));
+        CHECK("G18: ABI 1.14 probe admits deferred sandbox app when READY=1 and KILL_SWITCH=0",
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, RDNA4G_INFO_READY | RDNA4G_INFO_DISPLAY_ACTIVE, RDNA4G_BUDGET_APP, 14u, 1, 1) == RDNA4G_PROBE_OK);
+        CHECK("G18: ABI 1.14 probe declines when KILL_SWITCH=1 or READY=0",
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, RDNA4G_INFO_READY | RDNA4G_INFO_KILL_SWITCH, RDNA4G_BUDGET_APP, 14u, 0, 0) == RDNA4G_PROBE_KILLED &&
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, 0u, RDNA4G_BUDGET_APP, 14u, 0, 0) == RDNA4G_PROBE_NOTREADY);
+        CHECK("G18: ABI <= 1.13 fails closed on deferred unreadable kill/ready gates, admits clean readable",
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, 0u, RDNA4G_BUDGET_APP, 13u, 1, 0) == RDNA4G_PROBE_KILLED &&
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, 0u, RDNA4G_BUDGET_APP, 13u, 0, 1) == RDNA4G_PROBE_NOTREADY &&
+              rdna4g_probe_verdict_v2(1, 0, 0, 0, 0u, RDNA4G_BUDGET_APP, 13u, 0, 0) == RDNA4G_PROBE_OK);
+        CHECK("G18: headless uses DISPLAY_ACTIVE when marker stat gets EPERM/EACCES on ABI >= 1.14",
+              rdna4g_headless_from_probe(0, 0, 0, 0u, 0u) == 0 &&
+              rdna4g_headless_from_probe(-1, EPERM, 1, 14u, RDNA4G_INFO_DISPLAY_ACTIVE) == 0 &&
+              rdna4g_headless_from_probe(-1, EACCES, 1, 14u, RDNA4G_INFO_DISPLAY_ACTIVE) == 0 &&
+              rdna4g_headless_from_probe(-1, EPERM, 1, 14u, 0u) == 1 &&
+              rdna4g_headless_from_probe(-1, ENOENT, 1, 14u, RDNA4G_INFO_DISPLAY_ACTIVE) == 1 &&
+              rdna4g_headless_from_probe(-1, EPERM, 1, 13u, RDNA4G_INFO_DISPLAY_ACTIVE) == 1);
+        CHECK("G18: all probe verdicts 0..8 have descriptive text",
+              strcmp(rdna4g_probe_text(RDNA4G_PROBE_NOTREADY), "?") != 0 &&
+              strcmp(rdna4g_probe_text(RDNA4G_PROBE_KILLED), "?") != 0);
+        CHECK("G18: garnet_backend.m wires kernel-authoritative sandbox admission and headless",
+              bk && strstr(bk, "rdna4g_kill_declines_for_class(") != NULL &&
+              strstr(bk, "rdna4g_ready_declines_for_class(") != NULL &&
+              strstr(bk, "rdna4g_probe_verdict_v2(") != NULL &&
+              strstr(bk, "rdna4g_headless_from_probe(") != NULL);
+        free(bk);
     }
     printf("test-gate: %d checks, %d failed\n", runs, fails);
     return fails ? 1 : 0;
