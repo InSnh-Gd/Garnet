@@ -7,6 +7,9 @@
 #include "garnet_crc.h"
 static void fixtureLog(const char *format, ...) { (void)format; }
 #define RDNA4LOG(...) fixtureLog(__VA_ARGS__)
+#define RDNA4LOG_KEY(...) fixtureLog(__VA_ARGS__)
+#define RDNA4LOG_WARN(...) fixtureLog(__VA_ARGS__)
+#define RDNA4LOG_ERR(...) fixtureLog(__VA_ARGS__)
 #define VK_SUCCESS 0
 #define VK_WHOLE_SIZE (~0ull)
 typedef int VkResult;

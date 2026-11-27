@@ -46,7 +46,11 @@ static uint64_t rdna4_resource_uid(_Atomic uint64_t *uid) {
 static void rdna4_log(const char *format, ...) { (void)format; }
 #define RDNA4LOG(...) rdna4_log(__VA_ARGS__)
 #define RDNA4LOGR(...) rdna4_log(__VA_ARGS__)
+#define RDNA4LOG_KEY(...) rdna4_log(__VA_ARGS__)
+#define RDNA4LOG_WARN(...) rdna4_log(__VA_ARGS__)
+#define RDNA4LOG_ERR(...) rdna4_log(__VA_ARGS__)
 #define RDNA4_ONCE(...) do { } while (0)
+#define RDNA4_ONCE_WARN(...) do { } while (0)
 
 static NSError *rdna4_err(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:@"RDNA4ICBTransactionTest"

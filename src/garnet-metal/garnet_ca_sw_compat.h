@@ -13,6 +13,9 @@
 #include <string.h>
 
 #if defined(__x86_64__)
+#ifndef RDNA4LOG_WARN
+#define RDNA4LOG_WARN RDNA4LOG
+#endif
 typedef void *(*rdna4_ca_sw_import_fn)(void *, int, int, int, void *);
 static _Atomic(rdna4_ca_sw_import_fn) rdna4_ca_sw_original;
 static void (*rdna4_ca_sw_track)(void *, void *);
@@ -55,7 +58,7 @@ static int rdna4_ca_sw_install(void) {
         (void *)(base + 0x33cac858 + 0x2d8);
     rdna4_ca_sw_import_fn original = atomic_load_explicit(slot, memory_order_acquire);
     if (original != (rdna4_ca_sw_import_fn)(base + 0x1ea9ec)) {
-        RDNA4LOG("CA SW compatibility refused: unexpected IOSurface import slot");
+        RDNA4LOG_WARN("CA SW compatibility refused: unexpected IOSurface import slot");
         return -1;
     }
 
@@ -71,7 +74,7 @@ static int rdna4_ca_sw_install(void) {
     if (kr != KERN_SUCCESS || address < region || region_size < sizeof(*slot) ||
         address - region > region_size - sizeof(*slot) ||
         !(info.protection & VM_PROT_READ)) {
-        RDNA4LOG("CA SW compatibility refused: cannot inspect import page (%d)", kr);
+        RDNA4LOG_WARN("CA SW compatibility refused: cannot inspect import page (%d)", kr);
         return -1;
     }
     mach_vm_size_t page_size = vm_page_size;
@@ -79,7 +82,7 @@ static int rdna4_ca_sw_install(void) {
     kr = mach_vm_protect(mach_task_self(), page, page_size, FALSE,
                         info.protection | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
-        RDNA4LOG("CA SW compatibility refused: cannot copy import page (%d)", kr);
+        RDNA4LOG_WARN("CA SW compatibility refused: cannot copy import page (%d)", kr);
         return -1;
     }
     rdna4_ca_sw_track = (void *)(base + 0x16ffa6);
@@ -89,7 +92,7 @@ static int rdna4_ca_sw_install(void) {
     if (kr != KERN_SUCCESS) {
         atomic_store_explicit(slot, original, memory_order_release);
         (void)mach_vm_protect(mach_task_self(), page, page_size, FALSE, info.protection);
-        RDNA4LOG("CA SW compatibility refused: cannot restore import page (%d)", kr);
+        RDNA4LOG_WARN("CA SW compatibility refused: cannot restore import page (%d)", kr);
         return -1;
     }
     RDNA4LOG("CA SW compatibility installed: track imported flattened IOSurfaces");

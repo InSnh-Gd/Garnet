@@ -14,6 +14,8 @@ typedef int VkResult;
 #define VK_NULL_HANDLE NULL
 #define RDNA4LOG(...) ((void)0)
 #define RDNA4LOGR(...) ((void)0)
+#define RDNA4LOG_WARN(...) ((void)0)
+#define RDNA4LOG_ERR(...) ((void)0)
 static NSMutableArray *work;
 static void enqueue(dispatch_block_t block) { [work addObject:[block copy]]; }
 #define dispatch_async(q, b) enqueue(b)
