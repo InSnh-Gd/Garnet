@@ -603,6 +603,60 @@ struct MES_SetHwResources {
 };
 static_assert(sizeof(MES_SetHwResources) == 64 * 4,
               "MES_SetHwResources must be 64 dwords");
+static_assert(offsetof(MES_SetHwResources, vmid_mask_mmhub) == 4 &&
+              offsetof(MES_SetHwResources, compute_hqd_mask) == 20 &&
+              offsetof(MES_SetHwResources, aggregated_doorbells) == 68 &&
+              offsetof(MES_SetHwResources, g_sch_ctx_gpu_mc_ptr) == 88 &&
+              offsetof(MES_SetHwResources, query_status_fence_gpu_mc_ptr) == 96 &&
+              offsetof(MES_SetHwResources, gc_base) == 104 &&
+              offsetof(MES_SetHwResources, mmhub_base) == 136 &&
+              offsetof(MES_SetHwResources, osssys_base) == 168 &&
+              offsetof(MES_SetHwResources, api_status) == 200 &&
+              offsetof(MES_SetHwResources, flags) == 216 &&
+              offsetof(MES_SetHwResources, doorbell_info) == 224 &&
+              offsetof(MES_SetHwResources, timestamp) == 240 &&
+              offsetof(MES_SetHwResources, os_tdr_timeout_in_sec) == 248,
+              "MES_SetHwResources wire offsets must match mes_v12_api_def.h");
+
+// MESAPI_SET_HW_RESOURCES_1 (#pragma pack(push, 8), mes_v12_api_def.h).
+struct MES_SetHwResources1 {
+    MES_Header_Wire header;                       // dw  0 (auto-pad at dw 1)
+    MES_API_Status  api_status;                   // dw  2..5
+    uint64_t        timestamp;                    // dw  6..7
+    uint32_t        flags;                        // dw  8 (auto-pad at dw 9)
+    uint64_t        mes_debug_ctx_mc_addr;        // dw 10..11
+    uint32_t        mes_debug_ctx_size;           // dw 12
+    uint32_t        mes_kiq_unmap_timeout;        // dw 13
+    uint64_t        coop_sch_shared_mc_addr;      // dw 14..15
+    uint64_t        cleaner_shader_fence_mc_addr; // dw 16..17
+    uint32_t        pad[46];                      // round to 64 dw
+};
+static_assert(sizeof(MES_SetHwResources1) == 64 * 4,
+              "MES_SetHwResources1 must be 64 dwords");
+static_assert(offsetof(MES_SetHwResources1, api_status) == 8 &&
+              offsetof(MES_SetHwResources1, timestamp) == 24 &&
+              offsetof(MES_SetHwResources1, flags) == 32 &&
+              offsetof(MES_SetHwResources1, mes_debug_ctx_mc_addr) == 40 &&
+              offsetof(MES_SetHwResources1, mes_debug_ctx_size) == 48 &&
+              offsetof(MES_SetHwResources1, mes_kiq_unmap_timeout) == 52 &&
+              offsetof(MES_SetHwResources1, coop_sch_shared_mc_addr) == 56 &&
+              offsetof(MES_SetHwResources1, cleaner_shader_fence_mc_addr) == 64,
+              "MES_SetHwResources1 wire offsets must match mes_v12_api_def.h");
+
+// MESAPI__QUERY_MES_STATUS (#pragma pack(push, 8), mes_v12_api_def.h).
+struct MES_QuerySchedStatus {
+    MES_Header_Wire header;     // dw 0
+    uint32_t        subopcode;  // dw 1
+    MES_API_Status  api_status; // dw 2..5
+    uint64_t        timestamp;  // dw 6..7
+    uint32_t        pad[56];    // round to 64 dw
+};
+static_assert(sizeof(MES_QuerySchedStatus) == 64 * 4,
+              "MES_QuerySchedStatus must be 64 dwords");
+static_assert(offsetof(MES_QuerySchedStatus, subopcode) == 4 &&
+              offsetof(MES_QuerySchedStatus, api_status) == 8 &&
+              offsetof(MES_QuerySchedStatus, timestamp) == 24,
+              "MES_QuerySchedStatus wire offsets must match mes_v12_api_def.h");
 
 // SET_HW_RESOURCES flag bit positions (mirrors upstream packed
 // bitfield in mes_v12_api_def.h:275-298). Layout (LSB→MSB):
@@ -660,15 +714,12 @@ struct MES_AddQueue {
     uint32_t gws_base;
     uint32_t gws_size;
     uint32_t oa_mask;
-    // Natural u64 alignment pads to 144 here. trap_handler_addr at
-    // offset 144 (dw 36) — matches upstream's offset (compiler also
-    // inserts the same 4-byte pad after `oa_mask` upstream).
+    // Running offset is 136 (8-aligned): trap_handler_addr sits at 136 (dw 34),
+    // matching upstream mes_v12_api_def.h (#pragma pack(push, 8)).
     uint64_t trap_handler_addr;
     uint32_t vm_context_cntl;
     uint32_t flags;             // packed bitfield
-    // api_status (u64 first field) is naturally aligned — vm_context_cntl
-    // + flags = 8 bytes; sum-since-trap_handler_addr u64 = 16 bytes; the
-    // running offset is 8-aligned.
+    // api_status (u64 first field) is naturally aligned at 152 (dw 38).
     MES_API_Status api_status;
     uint64_t tma_addr;
     uint32_t sch_id;
@@ -686,6 +737,23 @@ struct MES_AddQueue {
 };
 static_assert(sizeof(MES_AddQueue) == 64 * 4,
               "MES_AddQueue must be 64 dwords");
+static_assert(offsetof(MES_AddQueue, page_table_base_addr) == 8 &&
+              offsetof(MES_AddQueue, doorbell_offset) == 72 &&
+              offsetof(MES_AddQueue, mqd_addr) == 80 &&
+              offsetof(MES_AddQueue, wptr_addr) == 88 &&
+              offsetof(MES_AddQueue, queue_type) == 112 &&
+              offsetof(MES_AddQueue, gds_base) == 116 &&
+              offsetof(MES_AddQueue, oa_mask) == 132 &&
+              offsetof(MES_AddQueue, trap_handler_addr) == 136 &&
+              offsetof(MES_AddQueue, vm_context_cntl) == 144 &&
+              offsetof(MES_AddQueue, flags) == 148 &&
+              offsetof(MES_AddQueue, api_status) == 152 &&
+              offsetof(MES_AddQueue, tma_addr) == 168 &&
+              offsetof(MES_AddQueue, timestamp) == 184 &&
+              offsetof(MES_AddQueue, pipe_id) == 200 &&
+              offsetof(MES_AddQueue, queue_id) == 204 &&
+              offsetof(MES_AddQueue, full_sh_mem_config_data) == 212,
+              "MES_AddQueue wire offsets must match mes_v12_api_def.h");
 
 // MES_AddQueue flags bitfield encoding (bit position).
 // Mirrors mes_v12_api_def.h:369-385 packed bitfield order:
@@ -737,6 +805,18 @@ struct MES_RemoveQueue {
 };
 static_assert(sizeof(MES_RemoveQueue) == 64 * 4,
               "MES_RemoveQueue must be 64 dwords");
+static_assert(offsetof(MES_RemoveQueue, doorbell_offset) == 4 &&
+              offsetof(MES_RemoveQueue, gang_context_addr) == 8 &&
+              offsetof(MES_RemoveQueue, flags) == 16 &&
+              offsetof(MES_RemoveQueue, api_status) == 24 &&
+              offsetof(MES_RemoveQueue, pipe_id) == 40 &&
+              offsetof(MES_RemoveQueue, queue_id) == 44 &&
+              offsetof(MES_RemoveQueue, tf_addr) == 48 &&
+              offsetof(MES_RemoveQueue, tf_data) == 56 &&
+              offsetof(MES_RemoveQueue, queue_type) == 60 &&
+              offsetof(MES_RemoveQueue, timestamp) == 64 &&
+              offsetof(MES_RemoveQueue, gang_context_array_index) == 72,
+              "MES_RemoveQueue wire offsets must match mes_v12_api_def.h");
 
 // REMOVE_QUEUE flags (bit positions, mes_v12_api_def.h):
 //   bit 0 reserved01, 1 unmap_kiq_utility_queue, 2 preempt_legacy_gfx_queue,
