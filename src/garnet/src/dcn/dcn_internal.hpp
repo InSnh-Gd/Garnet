@@ -18,10 +18,12 @@
 #include "amd/native_disp_pure.h"
 #include "amd/native_disp.h"
 #include "modetrial_pure.h"
+#include "dcn41_hpd_pure.h"
 #include "dcn41_vbl_irq_pure.h"
 #include "GarnetDisplayOps.h"
 
 void garnet_primary_fb_notify_vbl(uint32_t otg);
+void garnet_primary_fb_notify_hpd(uint32_t hpd, bool isShortPulse, bool senseHigh);
 
 extern "C" {
 #include "dcn41.h"
@@ -72,6 +74,12 @@ struct DcnState {
 	uint8_t  primaryVblOtg     { 0 };
 	bool     irqAckRecoveryNeeded { false };
 	rdna4vbl::RateStormGuard primaryVblStorm {};
+
+	// Primary framebuffer DisplayPort HPD / HPD_RX IRQ state (rate-guarded)
+	bool     primaryHpdEnabled { false };
+	uint8_t  primaryHpdPin     { 0 };
+	bool     hpdAckRecoveryNeeded { false };
+	rdna4hpd::HpdStormGuard primaryHpdStorm {};
 
 	// IH counters
 	uint64_t dceEntries { 0 };

@@ -3,6 +3,7 @@
 // here.  A successful call must hold the local-display lease while the
 // watchdog restore, scanIrq(), fallback ACK and storm disable run.  A refused
 // lease must consume the entry without any of those paths or ACK statistics.
+#include "dcn/dcn41_hpd_pure.h"
 #include "dcn/dcn41_vbl_irq_pure.h"
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,8 @@ static constexpr int DCN41_OK = 0;
 static constexpr uint32_t DCN41_IH_CLIENT_DCE = 4u;
 static constexpr uint32_t DCN41_NUM_PIPES = 4u;
 static constexpr uint8_t DCN41_IRQ_NONE = 0;
+static constexpr uint8_t DCN41_IRQ_HPD = 1;
+static constexpr uint8_t DCN41_IRQ_HPD_RX = 2;
 static constexpr uint8_t DCN41_IRQ_VSTARTUP = 4;
 static constexpr uint8_t DCN41_IRQ_VUPDATE_NO_LOCK = 6;
 static constexpr uint8_t DCN41_IRQ_KIND_COUNT = 8;
@@ -61,6 +64,7 @@ struct rdna4_display_txn {
 
 struct DcnState {
 	bool armed { false };
+	uint32_t seg[5] { 0x12u, 0xc0u, 0x34c0u, 0x9000u, 0x02403c00u };
 	int d {};
 	uint64_t dceEntries { 0 };
 	uint64_t dceByKind[DCN41_IRQ_KIND_COUNT] {};
@@ -86,6 +90,10 @@ struct DcnState {
 	uint8_t primaryVblOtg { 0 };
 	bool irqAckRecoveryNeeded { false };
 	rdna4vbl::RateStormGuard primaryVblStorm {};
+	bool primaryHpdEnabled { false };
+	uint8_t primaryHpdPin { 0 };
+	bool hpdAckRecoveryNeeded { false };
+	rdna4hpd::HpdStormGuard primaryHpdStorm {};
 	const char *tag { "?" };
 };
 
@@ -100,15 +108,33 @@ static uint32_t gAckCalls;
 static uint32_t gIrqSetCalls;
 static uint32_t gPrimaryVblCalls;
 static uint32_t gPrimaryVblLastOtg;
+static uint32_t gPrimaryHpdCalls;
+static uint32_t gPrimaryHpdLastPin;
+static bool gPrimaryHpdLastShort;
+static bool gPrimaryHpdLastSense;
+static uint32_t gFakeHpdStatus = rdna4hpd::kHpdConnectedMask;
 static uint64_t gFakeNowNs = 42u;
 static struct dcn41_irq gFakeIrq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 
 static uint64_t now_ns() { return gFakeNowNs; }
 
+static uint32_t dcn_rreg(void *, uint32_t) {
+	expect(gLeaseActive, "DCN status read runs under the acquired lease");
+	return gFakeHpdStatus;
+}
+
 static void garnet_primary_fb_notify_vbl(uint32_t otg) {
 	gPrimaryVblCalls++;
 	gPrimaryVblLastOtg = otg;
 	expect(!gLeaseActive, "primary FB VBL notification runs AFTER releasing the display lease");
+}
+
+static void garnet_primary_fb_notify_hpd(uint32_t hpd, bool isShortPulse, bool senseHigh) {
+	gPrimaryHpdCalls++;
+	gPrimaryHpdLastPin = hpd;
+	gPrimaryHpdLastShort = isShortPulse;
+	gPrimaryHpdLastSense = senseHigh;
+	expect(!gLeaseActive, "primary FB HPD notification runs AFTER releasing the display lease");
 }
 
 static struct dcn41_irq dcn41_ih_to_irq(uint32_t, uint32_t, uint32_t) {
@@ -149,6 +175,9 @@ static void reset_world() {
 	gScan.active = 0;
 	gScanCalls = gWatchdogCalls = gAckCalls = gIrqSetCalls = 0;
 	gPrimaryVblCalls = gPrimaryVblLastOtg = 0;
+	gPrimaryHpdCalls = gPrimaryHpdLastPin = 0;
+	gPrimaryHpdLastShort = gPrimaryHpdLastSense = false;
+	gFakeHpdStatus = rdna4hpd::kHpdConnectedMask;
 	gFakeNowNs = 42u;
 	gFakeIrq = dcn41_irq { DCN41_IRQ_VUPDATE_NO_LOCK, 0u };
 	gTxnAllowed = true;
@@ -278,6 +307,46 @@ static void contract_checks() {
 	expect(gIrqSetCalls == 1u && !gDcn.primaryVblEnabled && gDcn.primaryVblStorm.tripped,
 	       "primary VBL storm guard disables DCN41_IRQ_VUPDATE_NO_LOCK inside lease when scanout is inactive");
 	expect(gPrimaryVblCalls == 0u, "storm-tripping VUPDATE_NO_LOCK suppresses FB notification");
+
+	// Primary HPD / HPD_RX dispatches AFTER releasing rdna4_display_txn and honors rate storm guard.
+	reset_world();
+	gDcn.armed = true;
+	gDcn.primaryHpdEnabled = true;
+	gDcn.primaryHpdPin = 1u;
+	gDcn.hpdAckRecoveryNeeded = true;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_HPD, 1u };
+	gFakeHpdStatus = rdna4hpd::kHpdConnectedMask;
+	gFakeNowNs = 3000000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, rdna4hpd::kIhSrcHpd, 1u), "HPD entry is consumed");
+	expect(gAckCalls == 1u && gPrimaryHpdCalls == 1u && gPrimaryHpdLastPin == 1u &&
+	       !gPrimaryHpdLastShort && gPrimaryHpdLastSense,
+	       "HPD ACKs under lease and notifies FB outside lease with delayed sense");
+	expect(!gDcn.hpdAckRecoveryNeeded, "successful HPD ACK clears hpdAckRecoveryNeeded");
+
+	reset_world();
+	gDcn.armed = true;
+	gDcn.primaryHpdEnabled = true;
+	gDcn.primaryHpdPin = 1u;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_HPD_RX, 1u };
+	gFakeHpdStatus = rdna4hpd::kHpdConnectedMask;
+	gFakeNowNs = 3100000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, rdna4hpd::kIhSrcHpd, 7u), "HPD_RX entry is consumed");
+	expect(gAckCalls == 1u && gPrimaryHpdCalls == 1u && gPrimaryHpdLastPin == 1u &&
+	       gPrimaryHpdLastShort && gPrimaryHpdLastSense,
+	       "HPD_RX ACKs under lease and notifies FB outside lease as short pulse");
+
+	reset_world();
+	gDcn.armed = true;
+	gDcn.primaryHpdEnabled = true;
+	gDcn.primaryHpdPin = 1u;
+	gDcn.primaryHpdStorm.windowStartNs = 4000000000ULL;
+	gDcn.primaryHpdStorm.windowCount = rdna4hpd::kHpdStormMaxIrqs;
+	gFakeIrq = dcn41_irq { DCN41_IRQ_HPD, 1u };
+	gFakeNowNs = 4100000000ULL;
+	expect(ihEntry(DCN41_IH_CLIENT_DCE, rdna4hpd::kIhSrcHpd, 1u), "storm-tripping HPD entry is consumed");
+	expect(gIrqSetCalls == 2u && !gDcn.primaryHpdEnabled && gDcn.primaryHpdStorm.tripped,
+	       "HPD storm guard disables both HPD and HPD_RX inside lease");
+	expect(gPrimaryHpdCalls == 0u, "storm-tripping HPD suppresses FB notification");
 }
 
 int main() {

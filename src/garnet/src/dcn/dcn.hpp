@@ -58,6 +58,11 @@ bool primaryVblIrqActive();
 void primaryVblRecoverAckIfNeeded(uint32_t otg);
 void primaryVblShutdown();
 
+// Primary framebuffer DisplayPort HPD / HPD_RX IRQ control, rate-storm guarded.
+bool primaryHpdIrqSet(GarnetDriver *owner, uint32_t hpd, bool enable);
+void primaryHpdRecoverAck(uint32_t hpd);
+void primaryHpdShutdown();
+
 // `accel dcnflip <n>` — T3-FLIP. 0 restore the console plane unconditionally (the escape hatch,
 // idempotent, safe at any time), 1 the minimal machine-verified flip (one frame, CRC witness,
 // immediate flip back), 2 the same but holding the test pattern ~5 s for the user to see. The

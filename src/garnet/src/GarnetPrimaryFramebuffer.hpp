@@ -10,6 +10,7 @@
 #include "dcn/dcn41_cursor_pure.h"
 #include "dcn/dcn41_ddc_pad_pure.h"
 #include "dcn/dcn41_det_pure.h"
+#include "dcn/dcn41_hpd_pure.h"
 #include "dcn/dcn41_vbl_irq_pure.h"
 #include "dcn/dp_edid_aux.h"
 #include "dcn/primary_fb_pure.h"
@@ -20,8 +21,10 @@ class IOTimerEventSource;
 class GarnetDriver;
 
 void garnet_primary_fb_notify_driver_ready(GarnetDriver *driver);
+void garnet_primary_fb_notify_sleep(GarnetDriver *driver, bool sleeping);
 void garnet_primary_fb_notify_wake(GarnetDriver *driver);
 void garnet_primary_fb_notify_vbl(uint32_t otg);
+void garnet_primary_fb_notify_hpd(uint32_t hpd, bool isShortPulse, bool senseHigh);
 IOMemoryDescriptor *rdna4_scanout_descriptor(bool viaFramebuffer);
 
 // Primary IOFramebuffer matched directly against the AMD RDNA4 PCI device (score 200000).
@@ -83,8 +86,10 @@ public:
 	IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
 
 	void onDriverReady(GarnetDriver *driver);
+	void onSystemSleep(bool sleeping);
 	void onSystemWake(GarnetDriver *driver);
 	void onHardwareVbl(uint32_t otg);
+	void onHardwareHpd(uint32_t hpd, bool isShortPulse, bool senseHigh);
 
 private:
 	void initForPM();
@@ -116,6 +121,14 @@ private:
 	static void vblRetainTarget(OSObject *target);
 	static void vblReleaseTarget(OSObject *target);
 	static void onVblTimer(OSObject *owner, IOTimerEventSource *sender);
+	bool ensureHpdTimer();
+	void teardownHpdTimer();
+	uint64_t hpdNowMs() const;
+	void applyHpdTimerAction(const rdna4hpd::Action &act, IOTimerEventSource *retainedTimer);
+	void scheduleHpdWatchdogIfNeeded();
+	void syncHardwareHpd(bool want, GarnetDriver *knownDriver = nullptr);
+	bool runHpdRecoveryLocked(rdna4hpd::Reason reason, bool *outSenseStillHigh);
+	static void onHpdTimer(OSObject *owner, IOTimerEventSource *sender);
 	void initCursorSlot(GarnetDriver *driver);
 	void teardownCursorSlot();
 	void disableCursorLocked(GarnetDriver *driver);
@@ -184,4 +197,14 @@ private:
 	bool fCursorHwAvailable { false };
 	bool fCursorNeedsProgram { false };
 	bool fCursorDpmsSuspended { false };
+
+	IOLock *fHpdLock { nullptr };
+	IOWorkLoop *fHpdWorkLoop { nullptr };
+	IOTimerEventSource *fHpdTimer { nullptr };
+	rdna4hpd::StateMachine fHpdState {};
+	bool fHpdRecoverAllowed { true };
+	bool fHpdHwArmed { false };
+	bool fHpdDestWriteFailed { false };
+	bool fSystemSleeping { false };
+	uint32_t fHpdPin { 0u };
 };

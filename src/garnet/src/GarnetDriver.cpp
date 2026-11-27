@@ -15,6 +15,7 @@
 #include "amd/amdgpu_sdma.h"
 #include "GarnetMetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
 #include "GarnetDisplayNub.hpp"       // 0.0.652 (M5): fbpublish 2
+#include "webkit_mmap_hook.hpp"       // Version-independent _mac_file_check_mmap hook for Safari WebKit.GPU
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
 #include "amd/native_s1b.h"   // 0.0.600 (native S1b): garnet-native=1, default OFF
@@ -1153,6 +1154,7 @@ bool GarnetDriver::start(IOService *provider) {
 		}
 	}
 	publishDisplayPeer(rdna4peer::kStateReady);
+	garnet_webkit::install(this);
 	registerService();
 	garnet_primary_fb_notify_driver_ready(this);
 	RDNA4LOG("start: ready");
@@ -1318,6 +1320,15 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 		if (outExtra)
 			for (unsigned i = 0; i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
+	}
+	// action 115 (ABI 1.14): root-only kernel kill-switch control (0 = off, 1 = on, 2 = read only).
+	if (rdna4native::policy::killswitch_is_action(action)) {
+		if (!rdna4native::policy::killswitch_arg_ok(argScalar)) return kIOReturnBadArgument;
+		if (argScalar == rdna4native::policy::kKillSwitchOff) amdgpu::n1c_set_kill_switch(false);
+		else if (argScalar == rdna4native::policy::kKillSwitchOn) amdgpu::n1c_set_kill_switch(true);
+		const uint64_t now = amdgpu::n1c_kill_switch() ? 1ull : 0ull;
+		if (outExtra) outExtra[0] = now;
+		return kIOReturnSuccess;
 	}
 	if (!rdna4scan::accel_exempt(action, argScalar) && !rdna4disp::native_exempt(rdna4disp_latched_on(), action, argScalar)) {
 	if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;
@@ -1541,6 +1552,7 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 }
 
 void GarnetDriver::stop(IOService *provider) {
+	garnet_webkit::uninstall();
 	if (sleepNotifier) {
 		sleepNotifier->remove();
 		sleepNotifier = nullptr;
@@ -1552,6 +1564,7 @@ void GarnetDriver::stop(IOService *provider) {
 	GarnetDisplayNub::shutdown();
 	GarnetMetalNub::shutdown();
 	if (waitForDisplayLeasesAndReleasePrimary()) {
+		amdgpu::smu_idle_dpm_stop();
 		amdgpu::bringup_teardown(gBringup);
 		disarmInterrupts();
 		if (bar2Map) {
@@ -1659,8 +1672,12 @@ IOReturn GarnetDriver::sleepWakeCallback(void *target, void *, UInt32 messageTyp
 	}
 	if (self->sleepLock) IOLockUnlock(self->sleepLock);
 
-	if (act.recoverDisplayPads) {
+	if (act.quiesceEngines) {
+		garnet_primary_fb_notify_sleep(self, true);
+	} else if (act.recoverDisplayPads) {
 		garnet_primary_fb_notify_wake(self);
+	} else if (act.resumeEngines) {
+		garnet_primary_fb_notify_sleep(self, false);
 	}
 	ackIfNeeded();
 	return kIOReturnSuccess;
