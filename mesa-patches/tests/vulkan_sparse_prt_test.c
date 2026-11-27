@@ -12,7 +12,7 @@
  *   - Sparse MSAA (2x / 4x / 8x) image residency, clear+resolve, and unbind
  *
  * Build (Linux/macOS with Vulkan headers + loader):
- *   cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/vulkan_sparse_prt_test.c \
+ *   cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/tests/vulkan_sparse_prt_test.c \
  *      -I"$VK_INC" -L"$VK_LIB" -lvulkan -o vulkan_sparse_prt_test
  *
  * Options:
