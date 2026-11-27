@@ -265,6 +265,8 @@ IOReturn GarnetUserClient::doRegRead(IOExternalMethodArguments *args) {
 	if (args->scalarInputCount < 1 || args->scalarOutputCount < 1) return kIOReturnBadArgument;
 	auto *dev = owner->deviceContext();
 	if (!dev) return kIOReturnNotReady;
+	amdgpu::ScopedGfxOffGuard gfxOffGuard(*dev);
+	if (!gfxOffGuard.ok()) return gfxOffGuard.status();
 	args->scalarOutput[0] = amdgpu::RREG32(*dev, (uint32_t)args->scalarInput[0]);
 	return kIOReturnSuccess;
 }

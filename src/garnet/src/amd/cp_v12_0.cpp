@@ -163,6 +163,7 @@
 #include "amdgpu_gfx.h"
 #include "amdgpu_mes.h"
 #include "amdgpu_log.h"
+#include "amdgpu_smu.h"
 #include "amdgpu_ucode_psp.h"
 #include "cp_pm4_gfx12.h"
 #include "../fw/fw_table.h"
@@ -244,6 +245,11 @@ cp_dump_state(const DeviceContext &dev, const CPContext &cp,
 {
     if (!dev.ip.isResolved(IPBlock::GC)) {
         CP_LOG("state dump (%s): GC IP base unresolved", where);
+        return;
+    }
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) {
+        CP_LOG("state dump (%s): GFXOFF disallow failed (%#x)", where, gfxOffGuard.status());
         return;
     }
     CP_LOG("=== CP state dump (%s) ===", where);
@@ -1392,6 +1398,8 @@ void
 cp_dump_gfx_hqd(const DeviceContext &dev, const char *where)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return;
     CP_LOG("--- GFX HQD block me0/pipe0/queue0 (%s) ---", where);
     cp_grbm_select(dev, 0, 0, 0, 0);
     cp_rreg_logged(dev, "CP_GFX_HQD_ACTIVE",       CP_REG(dev, CP_GFX_HQD_ACTIVE));
@@ -2938,6 +2946,8 @@ void
 cp_dump_compute_hqd(const DeviceContext &dev, const ComputeQueue &cq, const char *where)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return;
     CP_LOG("--- compute HQD me%u/pipe%u/queue%u (%s) ---", cq.me, cq.pipe, cq.queue, where);
     cp_grbm_select(dev, cq.me, cq.pipe, cq.queue, 0);
     cp_rreg_logged(dev, "CP_HQD_ACTIVE",            CP_REG(dev, CP_HQD_ACTIVE));

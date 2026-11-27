@@ -66,6 +66,7 @@ struct BringupContext {
     ComputeQueue   kcq {};        // kernel compute queue (MEC), mapped by the MES
     SDMAContext    sdma {};
     MESContext     mes {};
+    SMUContext     smu {};
     SDMAVRAMCopyResult sdmaCopy {};
     bool           sdmaCopyPassed { false };
     // Option B' self-test. Runs at the END of SDMAInit (stage 15) — the first

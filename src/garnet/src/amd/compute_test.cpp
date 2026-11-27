@@ -93,6 +93,7 @@
 #include "amdgpu_cp.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_sysmem.h"
+#include "amdgpu_smu.h"
 #include "amdgpu_log.h"
 
 #define CS_LOG(fmt, ...) AMDGPU_LOG("compute", fmt, ##__VA_ARGS__)
@@ -395,6 +396,11 @@ uint32_t emit_set_sh_reg_index3(const DeviceContext &dev, uint32_t *pkt, uint32_
 // SPI_BUSY with CP_BUSY/ME busy after a dispatch = waves launched and stuck.
 void log_grbm_status(const DeviceContext &dev, const char *when)
 {
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) {
+        CS_LOG("GRBM_STATUS (%s) skipped: GFXOFF disallow failed (%#x)", when, gfxOffGuard.status());
+        return;
+    }
     const uint32_t v = RREG32(dev, gc0(dev, Reg::GRBM_STATUS));
     CS_LOG("GRBM_STATUS (%s) = %#010x:%s%s%s%s%s%s%s%s%s%s%s%s  CP_STAT=%#010x", when, v,
            (v & 0x80000000u) ? " GUI_ACTIVE" : "", (v & 0x40000000u) ? " CB_BUSY" : "",
@@ -455,6 +461,11 @@ void dump_packets(const uint32_t *pkt, uint32_t n, const char *what)
 // never landed and the problem is upstream of the shader.
 void dump_sh_readback(const DeviceContext &dev, const char *when)
 {
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) {
+        CS_LOG("SH register readback (%s) skipped: GFXOFF disallow failed (%#x)", when, gfxOffGuard.status());
+        return;
+    }
     CS_LOG("SH register readback (%s): PGM_LO=%#010x PGM_HI=%#010x "
            "RSRC1=%#010x RSRC2=%#010x RSRC3=%#010x", when,
            RREG32(dev, gc0(dev, Reg::COMPUTE_PGM_LO)),

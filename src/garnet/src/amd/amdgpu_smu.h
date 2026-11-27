@@ -33,6 +33,7 @@
 
 #include <stdint.h>
 #include "amdgpu_regs.h"
+#include "garnet_gfxoff_pure.h"
 
 namespace amdgpu {
 
@@ -285,6 +286,49 @@ kern_return_t smu_set_power_state(const DeviceContext &dev, uint32_t state);
 kern_return_t smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz);
 kern_return_t smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz = nullptr);
 kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
+
+// Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard with
+// ~100 ms delayed-idle AllowGfxOff hysteresis (`rdna4-gfxoff-default`).
+struct SMUContext {
+    rdna4gfxoff::GuardState gfxoff {};
+    const DeviceContext    *gfxoffDev   { nullptr };
+    void                   *gfxoffTimer { nullptr }; // thread_call_t in kernel
+    bool                    inited      { false };
+};
+
+kern_return_t gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow);
+kern_return_t gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
+                                bool bootArgPresent, uint32_t bootArgValue,
+                                bool *outAllowed = nullptr);
+void          gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
+void          gfx_off_register_context(SMUContext *smu);
+SMUContext   *gfx_off_active_context();
+
+// Balanced RAII guard for GC MMIO critical sections.
+struct ScopedGfxOffGuard {
+    const DeviceContext *dev;
+    SMUContext          *ctx;
+    kern_return_t        kr;
+    bool                 held;
+
+    explicit ScopedGfxOffGuard(const DeviceContext &d,
+                               SMUContext *c = gfx_off_active_context())
+        : dev(&d), ctx(c), kr(kIOReturnSuccess), held(false) {
+        if (ctx != nullptr) {
+            kr = gfx_off_ctrl(*dev, *ctx, false);
+            held = (kr == kIOReturnSuccess);
+        }
+    }
+    ~ScopedGfxOffGuard() {
+        if (held && ctx != nullptr) {
+            (void)gfx_off_ctrl(*dev, *ctx, true);
+        }
+    }
+    ScopedGfxOffGuard(const ScopedGfxOffGuard &) = delete;
+    ScopedGfxOffGuard &operator=(const ScopedGfxOffGuard &) = delete;
+    bool ok() const { return kr == kIOReturnSuccess; }
+    kern_return_t status() const { return kr; }
+};
 
 //=====================================================================
 //  Telemetry — the SMU metrics table

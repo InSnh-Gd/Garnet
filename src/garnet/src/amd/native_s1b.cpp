@@ -17,6 +17,7 @@
 #include "amdgpu_log.h"
 #include "amdgpu_field_defs.h"
 #include "amdgpu_pm4.h"
+#include "amdgpu_smu.h"
 #include "compute_test.h"
 
 #define NAT_LOG(fmt, ...) AMDGPU_LOG("native-s1b", fmt, ##__VA_ARGS__)
@@ -348,6 +349,13 @@ kern_return_t native_s1b_run(BringupContext &ctx)
         return kIOReturnNotReady;
     }
     gN.vmid = E.vmid;
+
+    ScopedGfxOffGuard gfxOffGuard(*dev);
+    if (!gfxOffGuard.ok()) {
+        NAT_LOG("NOT RUN: GFXOFF disallow failed (%#x)", gfxOffGuard.status());
+        NAT_LOG("RESULT FAIL (not run)");
+        return gfxOffGuard.status();
+    }
 
     // (3) The fault control, read and logged BEFORE any fault leg.
     gN.l2FaultCntl = RREG32(*dev, SOC15_REG_OFFSET_BIDX(*dev, h.ip, h.base_idx, h.vm_l2_protection_fault_cntl));

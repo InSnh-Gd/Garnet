@@ -66,6 +66,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_log.h"
 #include "amdgpu_psp.h"
+#include "garnet_gfxoff_pure.h"
 // amdgpu_ucode_extract.h carries its own copy of the PSPGfxFwType
 // constants, guarded by AMDGPU_PSP_GFX_FW_TYPE_DEFINED. amdgpu_psp.h
 // (included above) defines the same namespace but does NOT define that
@@ -1437,21 +1438,21 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
     // wptr<<2 (bytes) as in sdma_v7_0_ring_set_wptr.
     const uint64_t offs =
         static_cast<uint64_t>(inst.doorbell_index) * 4ull;
-    if (dev.bar2 == nullptr || offs + 8 > dev.bar2Size) {
-        SDMA_LOG("SDMA%u kick: doorbell offset %#llx outside BAR2 "
-                 "(bar2Size=%llu) — MMIO WPTR path only",
-                 inst.instance, (unsigned long long)offs,
-                 (unsigned long long)dev.bar2Size);
-    } else {
+    if (rdna4gfxoff::sdma_use_bar2_doorbell_only(dev.bar2 != nullptr, offs, dev.bar2Size)) {
+        // BAR2 WDOORBELL64 wakes GFXOFF in hardware with zero GC MMIO and zero
+        // SMU lock dependency (callers may hold gScanoutLock).
         WDOORBELL64(dev, offs, v);
+        SDMA_LOG("SDMA%u kick: wptr=%llu (byte %#llx) doorbell@BAR2+%#llx wb_rptr=%#010x",
+                 inst.instance, (unsigned long long)inst.wptr, (unsigned long long)v,
+                 (unsigned long long)offs, sdma_wb_read32(dev, inst, kSDMAWBRptrOffset));
+        return kIOReturnSuccess;
     }
 
-    // 4) MMIO RB_WPTR write — port of upstream sdma_v7_0_ring_set_wptr's
-    //    else-branch (the use_doorbell=false fallback, sdma_v7_0.c:233-241):
-    //    write lower<<2 to regSDMA0_QUEUE0_RB_WPTR and upper<<2 to _HI.
-    //    Even with engine-side QUEUE0_DOORBELL.ENABLE=1 (PSP default),
-    //    the MCU accepts this MMIO update and processes the ring
-    //    (mac-amdgpu v0.1.44 verified).
+    // Fallback ONLY when BAR2 doorbell aperture is unavailable/out-of-range.
+    SDMA_LOG("SDMA%u kick: doorbell offset %#llx outside BAR2 "
+             "(bar2=%p bar2Size=%llu) — MMIO WPTR fallback",
+             inst.instance, (unsigned long long)offs,
+             (const void *)dev.bar2, (unsigned long long)dev.bar2Size);
     const uint32_t wptr_reg = sdma_reg_offset(
         dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
     const uint32_t wptr_hi_reg = sdma_reg_offset(
@@ -1461,11 +1462,10 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 
     const uint32_t rptr_reg = sdma_reg_offset(
         dev, inst.instance, sdma_regs(dev).QUEUE0_RB_RPTR);
-    SDMA_LOG("SDMA%u kick: wptr=%llu (byte %#llx) doorbell@BAR2+%#llx; "
+    SDMA_LOG("SDMA%u kick(MMIO): wptr=%llu (byte %#llx) "
              "readback RB_WPTR=%#010x RB_RPTR=%#010x wb_rptr=%#010x",
              inst.instance, (unsigned long long)inst.wptr, (unsigned long long)v,
-             (unsigned long long)offs, RREG32(dev, wptr_reg),
-             RREG32(dev, rptr_reg),
+             RREG32(dev, wptr_reg), RREG32(dev, rptr_reg),
              sdma_wb_read32(dev, inst, kSDMAWBRptrOffset));
     return kIOReturnSuccess;
 }

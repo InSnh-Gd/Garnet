@@ -242,9 +242,14 @@ bool n1c_refuse_legacy(uint32_t site) {
 // ---- the HUNG latch -----------------------------------------------------------------------------------------------------------
 static void hang_log(uint64_t emitted, uint64_t retired) {
     CPContext &cp = gCtx->cp;
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    const uint32_t cpStat = gfxOffGuard.ok()
+        ? RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u))
+        : 0xFFFFFFFFu;
+    const uint32_t faultLo = gfxOffGuard.ok() ? hub_rd(0x15d0) : 0xFFFFFFFFu;
     N1C_LOG("HUNG: seq emitted %llu retired %llu rptr %u wptr %u CP_STAT %#x GCVM_L2_PROTECTION_FAULT_STATUS_LO32 %#x",
             (unsigned long long)emitted, (unsigned long long)retired, cp.rptr_cpu ? *cp.rptr_cpu : 0u, cp.wptr,
-            RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u)), hub_rd(0x15d0));   // CP_STAT, GC base idx 0
+            cpStat, faultLo);   // CP_STAT, GC base idx 0
 }
 // 0.0.612 (W3): the ONE place a latch is announced. Every latch site calls it only after hang_detect / hang_latch_wait returned true (gHang.hung is set),
 // and it writes RDNA4,Ready = 0 on the Metal nub (sticky: never back to 1 this boot). Called with no hang lock held.
@@ -686,6 +691,8 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
     using namespace rdna4native::g2;
     DeviceContext &dev = *gCtx->dev;
     CPContext &cp = gCtx->cp;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return false;
     IOLockLock(gRingLock);
     const uint64_t emAt = emitted_now();
     const uint64_t reAt = retired_now(emAt);
@@ -1308,7 +1315,11 @@ IOLock *gG1Lock;
 }
 
 bool g1_holds() { return gG1.holds; }   // 0.0.627 (G2): n1c_open refuses every open while a test context holds the GPU (switch ON)
-static uint32_t g1_cp_stat() { return RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u)); }   // CP_STAT (read only), as hang_log
+static uint32_t g1_cp_stat() {
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    if (!gfxOffGuard.ok()) return 0xFFFFFFFFu;
+    return RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u));   // CP_STAT (read only), as hang_log
+}
 static uint32_t g1_rptr() { sysmem_rmb(); return gCtx->cp.rptr_cpu ? *gCtx->cp.rptr_cpu : 0u; }
 
 // NOP every ring dword outside the live range [gG1.liveStart, gWc). Caller holds gCliLock; the ring lock is taken here.
@@ -1420,6 +1431,8 @@ struct G1Env {
             return kOk;
         }
         if (method == kMethMesReset) {
+            ScopedGfxOffGuard gfxOffGuard(dev);
+            if (!gfxOffGuard.ok()) return (uint32_t)gfxOffGuard.status();
             IOLockLock(gCliLock);
             g1_scrub_ring();
             IOLockUnlock(gCliLock);
@@ -1430,6 +1443,8 @@ struct G1Env {
             return (uint32_t)r;
         }
         if (method == kMethRemap) {
+            ScopedGfxOffGuard gfxOffGuard(dev);
+            if (!gfxOffGuard.ok()) return (uint32_t)gfxOffGuard.status();
             const bool after = unmap_after_reset(resetAcked || gG1.resetAcked, mes.sched_version & kMES_VERSION_MASK);
             const uint32_t fl = kRemoveQueueFlag_unmap_legacy_queue | (after ? kRemoveQueueFlag_remove_after_reset : 0u);
             kern_return_t r = mes_remove_hw_queue_flags(dev, mes, kMESQueueType_GFX, 0u, 0u, cp.doorbell_index, fl);
@@ -1541,7 +1556,9 @@ IOReturn n1c_g1_verb(uint32_t action, uint64_t arg, BringupContext &ctx, uint64_
             gG1.lastCode = t.outcome;
             if (gCtx != nullptr) {
                 const uint64_t em = emitted_now();
-                o[3] = em; o[4] = retired_now(em); o[5] = g1_cp_stat(); o[6] = g1_rptr(); o[7] = gWc; o[8] = hub_rd(0x15d0);
+                ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+                const uint64_t f0 = gfxOffGuard.ok() ? hub_rd(0x15d0) : 0xFFFFFFFFull;
+                o[3] = em; o[4] = retired_now(em); o[5] = g1_cp_stat(); o[6] = g1_rptr(); o[7] = gWc; o[8] = f0;
             }
             N1C_LOG("g1 hangtest: outcome %u (rc %#x, seq %llu)", t.outcome, t.rc, (unsigned long long)t.seq);
         }

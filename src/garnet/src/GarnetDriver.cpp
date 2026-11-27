@@ -751,6 +751,8 @@ uint32_t rdna4_sdmadcc_control(uint64_t arg, uint64_t *out, unsigned count) {
 	{
 		const uint32_t gc = rdna4_gc_base();
 		if (!gc) { v[7] = kRDNA4DccStNoGc; goto done; }
+		amdgpu::ScopedGfxOffGuard gfxOffGuard(*gBringup.dev);
+		if (!gfxOffGuard.ok()) { v[7] = kRDNA4DccStNoGc; goto done; }
 		const uint32_t reg0 = gc + RDNA4_SDMA_DCC_CNTL_OFF;
 		const uint32_t reg1 = gc + RDNA4_SDMA1_DCC_CNTL_OFF;
 		// Both registers are READ on every mode (including before a write) so the report always shows the raw
@@ -838,6 +840,8 @@ void rdna4_sdmadcc_default(void) {
 	if (!gBringup.dev) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - no DeviceContext"); return; }
 	const uint32_t gc = rdna4_gc_base();
 	if (!gc) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - GC BASE_IDX 0 did not resolve"); return; }
+	amdgpu::ScopedGfxOffGuard gfxOffGuard(*gBringup.dev);
+	if (!gfxOffGuard.ok()) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - GFXOFF guard failed (%#x)", gfxOffGuard.status()); return; }
 	const uint32_t reg0 = gc + RDNA4_SDMA_DCC_CNTL_OFF;
 	if (!gSdmaDccCaptured) { gSdmaDccRestore = rdna4_reg_read32(reg0); gSdmaDccCaptured = true; }
 	const uint32_t target = rdna4_sdma_dcc_cleared(gSdmaDccRestore);

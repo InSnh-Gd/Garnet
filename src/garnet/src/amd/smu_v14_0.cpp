@@ -76,6 +76,10 @@
 #include "amdgpu_log.h"
 
 #include <kern/thread.h>          // current_thread(): the owner of the shared mailbox lock (0.0.604)
+#ifdef KERNEL
+#include <kern/clock.h>
+#include <kern/thread_call.h>
+#endif
 #include <libkern/OSAtomic.h>
 
 namespace amdgpu {
@@ -913,6 +917,187 @@ smu_set_gfx_off(const DeviceContext &dev, bool allow)
     kern_return_t r = smu_send_msg(dev, msg);
     SMU_LOG("gfxoff(%s): kr=0x%x", allow ? "allow" : "disallow", (unsigned)r);
     return r;
+}
+
+static SMUContext *gActiveSmuContext { nullptr };
+
+void gfx_off_register_context(SMUContext *smu)
+{
+    __atomic_store_n(&gActiveSmuContext, smu, __ATOMIC_RELEASE);
+}
+
+SMUContext *gfx_off_active_context()
+{
+    return __atomic_load_n(&gActiveSmuContext, __ATOMIC_ACQUIRE);
+}
+
+#ifdef KERNEL
+static void gfx_off_idle_timer_cb(thread_call_param_t p0, thread_call_param_t)
+{
+    SMUContext *smu = static_cast<SMUContext *>(p0);
+    if (!smu) return;
+    const bool locked = smu_lock_enter();
+    const DeviceContext *dev = smu->gfxoffDev;
+    const bool smuReady = (dev != nullptr && dev->smuOnline);
+    const rdna4gfxoff::Action act = smu->gfxoff.on_idle_timer(smuReady);
+    if (act == rdna4gfxoff::Action::SendAllow && dev != nullptr) {
+        const kern_return_t r = smu_set_gfx_off(*dev, true);
+        smu->gfxoff.commit(act, r == kIOReturnSuccess);
+    }
+    if (locked) smu_lock_exit();
+}
+
+static void gfx_off_schedule_idle_timer(SMUContext &smu)
+{
+    if (!smu.gfxoffTimer) return;
+    uint64_t interval = 0;
+    uint64_t deadline = 0;
+    nanoseconds_to_absolutetime(
+        static_cast<uint64_t>(rdna4gfxoff::kGfxOffIdleDelayMs) * 1000000ULL,
+        &interval);
+    clock_absolutetime_interval_to_deadline(interval, &deadline);
+    (void)thread_call_enter_delayed(
+        static_cast<thread_call_t>(smu.gfxoffTimer), deadline);
+}
+#endif
+
+kern_return_t
+gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
+                  bool bootArgPresent, uint32_t bootArgValue,
+                  bool *outAllowed)
+{
+    if (outAllowed) *outAllowed = false;
+    const bool locked = smu_lock_enter();
+    smu.gfxoff.configure(bootArgPresent, bootArgValue, /*hysteresis=*/true);
+    smu.gfxoffDev = &dev;
+    smu.inited = true;
+    gfx_off_register_context(&smu);
+    if (smu.gfxoff.kill_switch) {
+        SMU_LOG("gfxoff: disabled by boot-arg garnet-gfxoff=0");
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    }
+    if (!rdna4gfxoff::gfxoff_hw_opt_in(bootArgPresent, bootArgValue)) {
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    }
+#ifdef KERNEL
+    if (!smu.gfxoffTimer) {
+        smu.gfxoffTimer = thread_call_allocate_with_options(
+            gfx_off_idle_timer_cb, &smu,
+            THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+    }
+#endif
+    if (!dev.smuOnline) {
+        if (locked) smu_lock_exit();
+        return kIOReturnNotReady;
+    }
+    const kern_return_t r = smu_set_gfx_off(dev, true);
+    if (r == kIOReturnSuccess) {
+        const bool armed = smu.gfxoff.arm_hw_allowed();
+        if (outAllowed) *outAllowed = armed;
+    }
+    if (locked) smu_lock_exit();
+    return r;
+}
+
+void
+gfx_off_teardown(const DeviceContext &dev, SMUContext &smu)
+{
+    void *timer = nullptr;
+    {
+        const bool locked = smu_lock_enter();
+        const rdna4gfxoff::Action act = smu.gfxoff.disable_hw();
+        if (act == rdna4gfxoff::Action::SendDisallow && dev.smuOnline) {
+            (void)smu_set_gfx_off(dev, false);
+        }
+        timer = smu.gfxoffTimer;
+        smu.gfxoffTimer = nullptr;
+        smu.gfxoffDev = nullptr;
+        smu.inited = false;
+        gfx_off_register_context(nullptr);
+        if (locked) smu_lock_exit();
+    }
+#ifdef KERNEL
+    if (timer) {
+        thread_call_cancel_wait(static_cast<thread_call_t>(timer));
+        thread_call_free(static_cast<thread_call_t>(timer));
+    }
+#endif
+}
+
+kern_return_t
+gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow)
+{
+    const bool locked = smu_lock_enter();
+    if (!smu.inited) {
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    }
+    // Fast path when hardware GFXOFF is inactive (default opt-in off or kill-switch):
+    if (!smu.gfxoff.hw_enabled) {
+        const rdna4gfxoff::Action act = smu.gfxoff.request(allow, dev.smuOnline);
+        if (act == rdna4gfxoff::Action::Underflow) {
+            SMU_LOG("gfx_off_ctrl: underflow on allow() while inactive");
+            if (locked) smu_lock_exit();
+            return kIOReturnUnderrun;
+        }
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    }
+
+    const rdna4gfxoff::Action act = smu.gfxoff.request(allow, dev.smuOnline);
+    switch (act) {
+    case rdna4gfxoff::Action::None:
+#ifdef KERNEL
+        if (!allow && smu.gfxoffTimer) (void)thread_call_cancel(static_cast<thread_call_t>(smu.gfxoffTimer));
+#endif
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    case rdna4gfxoff::Action::Underflow:
+        SMU_LOG("gfx_off_ctrl: underflow on allow() (count=0, total_underflows=%u)",
+                smu.gfxoff.underflow_count);
+        if (locked) smu_lock_exit();
+        return kIOReturnUnderrun;
+    case rdna4gfxoff::Action::Faulted:
+        SMU_LOG("gfx_off_ctrl: refusing GC access in faulted/offline GFXOFF state (smuOnline=%u)",
+                dev.smuOnline ? 1u : 0u);
+        if (locked) smu_lock_exit();
+        return kIOReturnNotReady;
+    case rdna4gfxoff::Action::ScheduleAllow:
+#ifdef KERNEL
+        if (smu.gfxoffTimer) {
+            gfx_off_schedule_idle_timer(smu);
+        } else {
+            const kern_return_t r = smu_set_gfx_off(dev, true);
+            smu.gfxoff.commit(rdna4gfxoff::Action::SendAllow, r == kIOReturnSuccess);
+        }
+#endif
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    case rdna4gfxoff::Action::SendDisallow: {
+        const kern_return_t r = smu_set_gfx_off(dev, false);
+        smu.gfxoff.commit(act, r == kIOReturnSuccess);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("gfx_off_ctrl: DisallowGfxOff FAILED (kr=0x%x) — latching fail-safe",
+                    (unsigned)r);
+        }
+        if (locked) smu_lock_exit();
+        return r;
+    }
+    case rdna4gfxoff::Action::SendAllow: {
+        const kern_return_t r = smu_set_gfx_off(dev, true);
+        smu.gfxoff.commit(act, r == kIOReturnSuccess);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("gfx_off_ctrl: AllowGfxOff failed (kr=0x%x) — staying disallowed",
+                    (unsigned)r);
+        }
+        if (locked) smu_lock_exit();
+        return kIOReturnSuccess;
+    }
+    }
+    if (locked) smu_lock_exit();
+    return kIOReturnSuccess;
 }
 
 

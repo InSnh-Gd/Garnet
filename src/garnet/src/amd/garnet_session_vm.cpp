@@ -56,6 +56,8 @@ static inline bool ctx_geometry_ok(uint32_t cntl) {
 // Point CONTEXT<vmid> at `rootPa` (VALID set, START 0, END max_pfn - 1) and flush that VMID's TLB. Caller holds gCliLock.
 uint32_t program_root(uint32_t vmid, uint64_t rootPa) {
     DeviceContext &dev = *gCtx->dev;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return kTimeout;
     const CtxRegs r = ctx_regs(vmid);
     const uint64_t root = rootPa | kPteValid;
     WREG32(dev, r.baseLo, (uint32_t)(root & 0xFFFFFFFFu));
@@ -74,6 +76,8 @@ uint32_t program_root(uint32_t vmid, uint64_t rootPa) {
 // CONTEXT8 itself is never written here (the S1b self-test owns it). Returns the CNTL read; *ok = usable.
 __attribute__((noinline)) uint32_t ctx_prepare_vmid(uint32_t vmid, bool *ok) {
     DeviceContext &dev = *gCtx->dev;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) { *ok = false; return 0u; }
     const CtxRegs r = ctx_regs(vmid);
     uint32_t cntl = RREG32(dev, r.cntl);
     if (vmid != kNativeVmid && !ctx_geometry_ok(cntl)) {
@@ -135,6 +139,8 @@ bool fence_window_reserve_locked(FenceWindow &win) {
 // 0x15d3, the four native_s1b.cpp's fault leg reads - log them, and return rdna4native::g2::fault_word(STATUS_LO32, ADDR_LO32). NEVER written or cleared here (the
 // S1b self-test's VMID-8 fault stays latched: a new fault is told only by a CHANGE of this word). Register reads only.
 __attribute__((noinline)) uint64_t fault_snap(const char *when, uint32_t slot) {
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    if (!gfxOffGuard.ok()) return 0ull;
     const uint32_t sLo = hub_rd(0x15d0), sHi = hub_rd(0x15d1), aLo = hub_rd(0x15d2), aHi = hub_rd(0x15d3);
     N1C_LOG("gcvm register snapshot (%s, slot %u): STATUS_LO32 %#010x (vmid %u) HI32 %#010x ADDR_LO32 %#010x HI32 %#010x (read only, never cleared)", when, slot, sLo,
             rdna4native::g2::fault_word_vmid(rdna4native::g2::fault_word(sLo, aLo)), sHi, aLo, aHi);
@@ -508,7 +514,11 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
                (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
     o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
-    o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));
+    {
+        ScopedGfxOffGuard gfxOffGuard(*c.dev);
+        if (!gfxOffGuard.ok()) return gfxOffGuard.status();
+        o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));
+    }
     o->gc_version = ((uint32_t)v.major << 16) | ((uint32_t)v.minor << 8) | v.rev;
     o->ring_size_dw = c.cp.ring_size_dwords; o->max_ibs = RDNA4N_MAX_IBS;
     uint64_t visTotal, visFree, hiTotal, hiFree, othersHeld, ptHeld;
@@ -541,6 +551,8 @@ IOReturn n1c_read_regs(const N1cRef &ref, uint64_t off, uint64_t count, uint64_t
     if (app_refused(ref, rdna4native::g4::kCallReadRegs)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): an APP session never reads registers
     if (count < 1 || count > 16 || instance != 0xFFFFFFFFull) return kIOReturnBadArgument;
     if (!regs_allowed(off, count) || (off + count) * 4ull > gCtx->dev->rmmioSize) return kIOReturnBadArgument;   // allowlist 0x263e..0x2641 only
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    if (!gfxOffGuard.ok()) return gfxOffGuard.status();
     for (uint64_t i = 0; i < count; i++) out[i] = RREG32(*gCtx->dev, (uint32_t)(off + i));
     return kIOReturnSuccess;
 }

@@ -788,10 +788,8 @@ void bringup_teardown(BringupContext &ctx) {
              (unsigned)ctx.reached, stage_name(ctx.reached));
 
     // (0) Stage 3C: unwind GFXOFF and GFX12 clock gating before halting engines.
-    if (ctx.gfxOffAllowed && ctx.smuOnline) {
-        (void)smu_set_gfx_off(dev, false);
-        ctx.gfxOffAllowed = false;
-    }
+    gfx_off_teardown(dev, ctx.smu);
+    ctx.gfxOffAllowed = false;
     if (ctx.rlc.cg_enabled && dev.ip.isResolved(IPBlock::GC)) {
         (void)rlc_set_clock_gating(dev, ctx.rlc, false, ctx.sdma.instance_present[1]);
     }
@@ -897,9 +895,8 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
     if (ctx.dev && ctx.smuOnline && ctx.reached >= BringupStage::SDMAInit && !ctx.gfxOffAllowed) {
         uint32_t goArg = 0u;
         const bool goPresent = PE_parse_boot_argn("garnet-gfxoff", &goArg, sizeof(goArg));
-        if (rdna4pwr::gfxoff_opt_in(goPresent, goArg)) {
-            kern_return_t gor = smu_set_gfx_off(*ctx.dev, true);
-            ctx.gfxOffAllowed = (gor == kIOReturnSuccess);
+        kern_return_t gor = gfx_off_boot_init(*ctx.dev, ctx.smu, goPresent, goArg, &ctx.gfxOffAllowed);
+        if (rdna4gfxoff::gfxoff_hw_opt_in(goPresent, goArg)) {
             INIT_LOG("Stage 3C: opt-in SMU GFXOFF %s (%#x)",
                      ctx.gfxOffAllowed ? "ALLOWED" : "FAILED", gor);
         }
