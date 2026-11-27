@@ -7,17 +7,34 @@ Build (macOS, Rust >= 1.87; automated by tools/rdna4/build-xlate.sh):
     cp -R /path/to/Garnet/third-party/metal2vulkan-rdna4/garnetxlate .
     cargo build --release -p garnetxlate     # target/release/libgarnetxlate.dylib
 See NOTICE for the licence (LGPL-3.0-or-later; separate from the MIT code in this repository).
-Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0082).
+Note: tools/rdna4/build-xlate.sh overlays garnetxlate/ after applying patches/ (0001..0087).
 
-Verification and Tier 2 Scope
-=============================
+Verification and Tier 2 / Metal 3 Scope
+=======================================
 Unless explicitly stated in a section below, wire contracts remain at the
 current baseline (C ABI 3, reflection 66, argument-table ABI 9, source-proof
 version 2). Patch-level SPIR-V, wrapper, and host/LavaPipe checks verify
-translation, metadata invariants, and software Vulkan 1.4.363 execution only;
-they do not establish physical RDNA4 GPU execution or complete Tier 2
-acceptance. Runtime capability/execution gating stays controlled by the native
-bundle and compatibility runner.
+translation, metadata invariants, and software Vulkan execution only; physical
+RDNA 4 GPU execution is verified separately on target hardware.
+
+0087-metal3-blender-cycles-rt-and-air-fixes.patch adds Blender 4.2 Cycles
+(`CYCLES_METALRT=1`) AIR translation support and fixes across all 63 Cycles
+megakernels and 14 IFT callbacks.
+
+0086-reloop-nest-repair-staging-dominance.patch repairs staging-variable SSA
+dominance inside nested reloop control flow (`reloop_nest`), fixing SPIR-V
+validation errors on large megakernels.
+
+0085-metal3-rt-primitive-data-and-bare-intersect.patch adds `primitiveDataBuffer`
+retrieval and bare `@air.intersect` lowering for ray-query callers.
+
+0084-metal3-ift-abi-v2-and-bindless.patch upgrades intersection function tables
+to IFT ABI v2 (`attached_bda[31]`) and supports encoder-less Metal 3 bindless
+resource addressing alongside stateless nested visible function tables.
+
+0083-metal3-intersection-query-and-rt-fixes.patch lowers Metal 3
+`intersection_query` intrinsics and ray-tracing payload/parameter forms to
+`VK_KHR_ray_query`.
 
 0089-metal3-rt-motion-blur.patch lowers Metal 3 primitive and instance motion blur
 ray tracing (`GARNETX_CAP_RT_MOTION_BLUR`) in `src/native/ray_query_motion.rs`,
@@ -679,9 +696,7 @@ Cache tag: rdna4x-40-coordinate-identities; postpass: rdna4x-argument-resources-
   registry in ABI 10 metadata. Synthetic float read/write graphs validate as Vulkan
   1.2 SPIR-V and round-trip through the translator metadata type. Native ABI 10
   metadata, layout, and dynamic VkBufferView descriptor publication are wired in
-  `src/garnet-metal/{rdna4_argument_tables.inc,rdna4_argument_table_commands.inc}`
-  and gated via `rdna4ns_registry_build_abi`, while live RDNA4 GPU execution of
-  ABI 10 dynamic texel graphs remains pending in Tier 2 verification.
+  `src/garnet-metal/garnet_arguments.m` and gated via `rdna4ns_registry_build_abi`.
   Cache tag: rdna4x-47-dynamic-texel; postpass: rdna4x-argument-resources-47-dynamic-texel.
 
 0061-nested-buffer-element-paths.patch

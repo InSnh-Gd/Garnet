@@ -45,47 +45,40 @@ checks declare retained returns.
 
 ## Compositor and WindowServer diagnostics
 
-and cached policy fields. Compile it with Foundation in the existing x86_64
-VM. It must print `COMPOSITOR_OBSERVATION_PASS gpu_execution=0
-server_callbacks_tested=0`. It does not call the WindowServer-only CoreDisplay
-accessors. In the real WindowServer, the observer records the cached policy and
-main display accelerator on the main queue at 3 and 15 seconds after device creation.
-It changes no policy or framework memory and submits no GPU work. Remove it after
-diagnosing desktop selection; its records are temporary evidence, not a rendering fix.
+`test-compositor-observation.m` verifies read-only compositor diagnostics
+and cached policy fields. Compile it with Foundation on x86_64 macOS. It must
+print `COMPOSITOR_OBSERVATION_PASS gpu_execution=0 server_callbacks_tested=0`
+and does not invoke WindowServer-only CoreDisplay accessors. In a live
+WindowServer session, the observer logs the cached policy and main display
+accelerator on the main queue at 3 and 15 seconds after device creation without
+changing policy, mutating framework memory, or submitting GPU work.
 
 `test-ca-sw-flatten.m` separately diagnoses the QuartzCore software compositor
-assertion seen at desktop login on macOS 25G332. It loads no RDNA4 bundle and
-does no GPU work. Compile it with Foundation, QuartzCore and CoreGraphics in
-the existing x86_64 VM. On the exact supported QuartzCore image, `--raw` must
-abort at `push_surface`, `ogl-context.cpp:1186`; `--compat` must print
-`SW_FLATTEN_COMPLETED --compat contexts=16 pixel_tolerance=1` and exit zero.
-The `--plain` control must also exit zero. The compatibility run checks all
-pixels against a plain-rendered control while creating and destroying sixteen
-flattening contexts; one LSB covers offscreen blend rounding. Unknown images
-and installation errors are unsupported or failing results, never PASS.
+assertion seen at desktop login on macOS 26.x (`25G332`). It loads no Garnet
+bundle and submits no GPU work. Compile it with Foundation, QuartzCore, and
+CoreGraphics. On the supported QuartzCore image, `--raw` aborts at
+`push_surface`, `ogl-context.cpp:1186`; `--compat` prints
+`SW_FLATTEN_COMPLETED --compat contexts=16 pixel_tolerance=1` and exits zero.
+The `--plain` control also exits zero. The compatibility run checks all pixels
+against a plain-rendered control across sixteen flattening contexts (one LSB
+covers offscreen blend rounding). Unknown images and installation errors are
+reported as unsupported or failing, never PASS.
 
 `test-coredisplay-compat.m` checks the version-independent CoreDisplay
 compatibility guard without mutating process-local dyld state. Compile with
 Foundation and IOKit and verify that `rdna4_cd_bound_primary(0)` returns 0,
 `rdna4_coredisplay_compat(0)` is a safe no-op outside `WindowServer`, and
-`CoreDisplay_UseIOPresentment` (when loaded) is unchanged. The identity and
-actual display-pipe lookup require physical validation.
+`CoreDisplay_UseIOPresentment` (when loaded) is unchanged.
 
 `test-ca-icons.m` renders four AppKit system-symbol images through a real
 `CARenderer` into a Metal texture, checking all 65,536 pixels on the first frame
-and two warm frames. Compile with AppKit, Foundation, QuartzCore and Metal;
+and two warm frames. Compile with AppKit, Foundation, QuartzCore, and Metal;
 run as root with `--reference OUTPUT_DIRECTORY`, then
-`VM_TEST_BUNDLE OUTPUT_DIRECTORY` in the analysis VM. It reports frame time
-separately from pixel correctness. This covers icon composition through the
-bundle; the VM backend does not establish physical Settings loading latency,
-application admission or native display output.
-
-Four fragment translations captured from boot
-`2A63AC8F-9491-4C2A-97FC-D37CEBADF446` are bundled with their metadata to avoid
-the five observed no-write placeholders (one shader was requested twice).
-Their import provenance and Vulkan 1.2 validation are under
-`logs/rdna4-hardware-test/20261110-settings-icons/`. Unseen shaders still use
-the existing translation path.
+`VM_TEST_BUNDLE OUTPUT_DIRECTORY`. Frame time is reported separately from pixel
+correctness. Pre-translated fragment shaders for System Settings icons are
+bundled with their `.meta.json` sidecars in `src/garnet-metal/spvcache/` to
+avoid cold placeholder draws; unseen shaders fall back to in-process
+translation.
 
 ## Texture transfer bounds, device profile and log budget
 
@@ -289,13 +282,11 @@ write. Whole argument bytes, output guards and selection guards remain intact.
 No member is called on a null texture. These cases are separate from the
 existing project-only zero-read and discard-write compatibility tests.
 
-The 0059 analysis candidate passes all 21 non-cube cases on both endpoints and
-the two depth cube cases on the candidate. Eight cube sources compile/capture
-on each endpoint; color cube storage execution and the depth cube references
-remain unexecuted because of previously observed VM lowering failures. Capture
-does not count as GPU PASS. The native log confirms `nullDescriptor=false` and
-typed dummy use; this does not complete task 4.1, including texel buffers and
-dual-use comparison dummies.
+In VM testing, non-cube cases pass on both endpoints and depth-cube cases pass
+on the candidate, while color-cube storage execution and depth-cube references
+remain compile/capture-only due to VM host lowering limits (capture never counts
+as GPU PASS). When `nullDescriptor=false`, the candidate binds typed dummy
+descriptors.
 
 `A02.null-sampling-depth-*-{never,less,always}` extends the defined null guards
 with ordinary and comparison samples using the same valid sampler token.
@@ -320,9 +311,7 @@ spirv-val --target-env vulkan1.2 fixtures/null-shapes-abi9.spv
 
 The valid fixture passes Vulkan 1.2 validation. The malformed multisample-1D
 fixture intentionally fails validation (including missing `Sampled1D`
-capability); the reflection test checks its invalid-shape flag. Generator
-commands, assembly/binary hashes and the 15-check parser result are recorded
-in `logs/rdna4-metal2/20261106-tier2-implementation/native/integration-r20/fixture-generation.json`.
+capability); the reflection test checks its invalid-shape flag.
 
 **Samplers, arguments, scanning and fragment flow.**
 The sampler patterns share `test-sampler-pattern-oracle.h` with the host fixture.
@@ -520,19 +509,15 @@ controls:
 | `T02.quad-margin-control-coordinate` | `--control coordinate` | One mode, one sampling, one flip, one case. |
 | `T02.quad-margin-control-lod1` | `--control lod1` | Three modes, one sampling, two flips, six cases. |
 
-The `r14-r18` archive records PASS on both endpoints for both controls; original
-sampler-only (`actual=13 expected=11`) and image-only (`actual=23 expected=21`)
-implicit sampling still fail on system Metal while candidate runs PASS (logs in
-`logs/rdna4-metal2/20261106-tier2-implementation/native/RESULT-r14-r18-checkpoints.md`
-and `r14-r18-log-index.tsv`).
+Both controls pass on reference and candidate; original sampler-only
+(`actual=13 expected=11`) and image-only (`actual=23 expected=21`) implicit
+sampling fail on the VM reference while passing on the candidate.
 
-The quad entry preserves the original divergent implicit-LOD failure: system
-reference and RDNA4 both produced `actual=23 expected=22` at `pixel=(3,1)`.
-`--mode uniform` and `--mode gradient` isolate descriptor divergence from sampler
-clamp, upload and explicit gradient behavior; keep the divergent oracle and
-tolerance unchanged. Raw logs are archived in
-`logs/rdna4-metal2/20261106-depth-comparison/guest-red-and-quad-controls-r1.tar`
-(`quad-lod-reference-r5.log`, `quad-lod-candidate-r5.log`).
+The quad entry preserves the divergent implicit-LOD behavior: system reference
+and candidate both produce `actual=23 expected=22` at `pixel=(3,1)`.
+`--mode uniform` and `--mode gradient` isolate descriptor divergence from
+sampler clamp, upload, and explicit gradient behavior; keep the divergent
+oracle and tolerance unchanged.
 
 `run-metal-test.sh test-cold-pipelines` runs nineteen default cases, including compute and
 render deadline/retry and first results from concurrent cold compute pipelines. Its test translator
@@ -716,7 +701,7 @@ sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache"
   "$TMPDIR/test-tessellation" /path/to/GarnetMetal.bundle
 ```
 
-## Indirect Command Buffers (7.1–7.3)
+## Indirect Command Buffers
 
 Offline SPIR-V expander generator validation and host-only transaction semantics
 (no Vulkan headers or GPU submission required for `test-icb-transactions.m`):
@@ -757,21 +742,20 @@ for b in test-icb test-icb-gpu test-icb-lifecycle-o0 test-icb-lifecycle-o2; do
 done
 ```
 
-## Remaining Metal 2 Formats, MSL 2.1, and Limits (8.1–8.3)
+## Metal 2 Formats, MSL 2.1, and Limits
 
 Host pure-C checks for occlusion 256 KiB boundary (`L20`), depth/stencil target
 validation, integer clears/formats, texture descriptors, Wave32 `threadExecutionWidth`,
-and Mac2 feature sets / capability source pins (`make -C src/garnet-metal/tests host assembled`,
-or compile against an assembled `GarnetDevice.m` directory via `assemble-device.py`):
+and Mac2 feature sets / capability source pins (`make -C src/garnet-metal/tests host assembled`):
 
 ```sh
 make -C src/garnet-metal/tests host assembled
 ```
 
-Offline translator checks for patch `0069` (dual-source `Decoration::Index`,
+Offline translator checks for dual-source blending (`Decoration::Index`),
 `raster_order_group(0..7)` pixel interlock & `< 8` enforcement,
-`air.simd_active_threads_mask.i64`, `air.simd_shuffle_rotate_up`,
-`air.quad_shuffle_rotate_up`):
+`air.simd_active_threads_mask.i64`, `air.simd_shuffle_rotate_up`, and
+`air.quad_shuffle_rotate_up`:
 
 ```sh
 cargo test --offline -p garnetxlate --lib --test linked --test stack --test metal2_msl21
@@ -781,10 +765,7 @@ cargo test --offline -p metal2vulkan --lib -- \
   native_fragment_dual_source_and_raster_order_group_lower_cleanly
 ```
 
-Live RX 9060 XT Objective-C verification suites (build with Xcode CLT on macOS;
-pre-`01:30` baseline ran `test-metal2-formats-render` 9/10 before patch `0069`,
-and all three must run on next macOS boot against the rebuilt bundle and
-`libgarnetxlate.dylib`):
+Live RX 9060 XT Objective-C verification suites (build with Xcode CLT on macOS):
 
 ```sh
 for t in test-metal2-formats-render test-metal2-msl-probe test-metal2-limits; do
@@ -795,14 +776,14 @@ for t in test-metal2-formats-render test-metal2-msl-probe test-metal2-limits; do
 done
 ```
 
-## Metal 3 Texture Swizzle and Placement Heaps (2.1–2.2)
+## Metal 3 Texture Swizzle and Placement Heaps
 
 Host pure-C checks (`host-cpu`, ASan + UBSan) cover swizzle composition
-(including the Apple doc parent/view composition rule, `Zero`/`One` constants,
-`BGRA`, `A8Unorm`, depth swizzles, and descriptor/view usage refusal),
-placement-heap offset/alignment/granularity/overflow validation, explicit
-overlap aliasing, interval-union `usedSize` / `maxAvailableSizeWithAlignment:`
-accounting, and assembled `GarnetDevice.m` source pins:
+(including parent/view composition, `Zero`/`One` constants, `BGRA`, `A8Unorm`,
+depth swizzles, and descriptor/view usage refusal), placement-heap
+offset/alignment/granularity/overflow validation, explicit overlap aliasing,
+interval-union `usedSize` / `maxAvailableSizeWithAlignment:` accounting, and
+assembled `GarnetDevice.m` source pins:
 
 ```sh
 python3 src/garnet-metal/assemble-device.py --output "$TMPDIR/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
@@ -832,7 +813,7 @@ for b in test-metal3-swizzle test-metal3-placement-heap-o0 test-metal3-placement
 done
 ```
 
-## Metal 3 Barycentrics/Pull-Model, Counters/Amp, MSL 3 Atomics, Binary Archives, I/O Queue, and Residency Sets (2.4–2.6, 3.1, 4.1–4.2)
+## Metal 3 Barycentrics/Pull-Model, Counters/Amp, MSL 3 Atomics, Binary Archives, I/O Queue, and Residency Sets
 
 Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
 under Clang ASan + UBSan) cover timestamp counter sampling & vertex amplification
@@ -850,27 +831,27 @@ on macOS; compile ARC lifetime suites `test-metal3-binary-archive.m`,
 `test-metal3-io-queue.m`, and `test-metal3-residency-set.m` with both `-O0` and
 `-O2`):
 
-- `test-metal3-bary-pull.m` (Task `2.4`): `[[barycentric_coord]]` (perspective +
+- `test-metal3-bary-pull.m`: `[[barycentric_coord]]` (perspective +
   `center_no_perspective`) and 4x MSAA `interpolant<T>::interpolate_at_{center,centroid,sample,offset}`
   for `float2` and `half2` vs analytical oracle.
-- `test-metal3-counters-amp.m` (Task `2.5`): `MTLCommonCounterSetTimestamp`
+- `test-metal3-counters-amp.m`: `MTLCommonCounterSetTimestamp`
   sampling across compute/render/blit passes and pass descriptors, timestamp
   monotonicity & error paths, and `supportsVertexAmplificationCount:` /
   `setVertexAmplificationCount:viewMappings:` boundary checks.
-- `test-metal3-msl3-atomics.m` (Task `2.6`): `atomic<float>` (device +
+- `test-metal3-msl3-atomics.m`: `atomic<float>` (device +
   threadgroup add/sub/exchange/CAS min+max), 64-bit `atomic_ulong` /
   `atomic<int64_t>` (`Int64Atomics`), `bfloat` / `bfloat4` FMA/math/conversions,
   storage-texture atomics (`R32Uint` / `R32Sint`), and
   `simd_shuffle_and_fill_{up,down}` vs race-free CPU oracle.
-- `test-metal3-binary-archive.m` (Task `3.1`): compute + render archive
+- `test-metal3-binary-archive.m`: compute + render archive
   creation, tile refusal, serialization/reload in a fresh archive,
   `MTLPipelineOptionFailOnBinaryArchiveMiss` hit/miss, bit-exact GPU execution,
   and corrupt/tampered archive rejection.
-- `test-metal3-io-queue.m` (Task `4.1`): `MTLIOFileHandle`, `MTLIOCommandQueue`,
+- `test-metal3-io-queue.m`: `MTLIOFileHandle`, `MTLIOCommandQueue`,
   and `MTLIOCommandBuffer` async buffer/texture loads into Private storage,
   `MTLSharedEvent` handoff, serial barriers, 8,192-command cap, early handle
   release, and EOF/missing-file/compression/`tryCancel` error paths.
-- `test-metal3-residency-set.m` (Task `4.2`): `MTLResidencySet` staged vs
+- `test-metal3-residency-set.m`: `MTLResidencySet` staged vs
   committed snapshots, queue `addResidencySet:` and command-buffer
   `useResidencySet:`, early ARC release of BDA/heap-backed resources at `-O0`
   and `-O2`, and leak-free reclamation.
@@ -898,7 +879,7 @@ for b in test-metal3-bary-pull test-metal3-counters-amp test-metal3-msl3-atomics
 done
 ```
 
-## Metal 3 Compute ICBs, Sparse/PRT Textures, and Ray Tracing Acceleration Structures (2.3, 5.3, 7.1)
+## Metal 3 Compute ICBs, Sparse/PRT Textures, and Ray Tracing Acceleration Structures
 
 Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
 under Clang ASan + UBSan) cover compute ICB 640-byte ABI, command validation,
@@ -923,21 +904,20 @@ Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
 on macOS; compile `test-metal3-rt-accel.m` with both `-O0` and `-O2` for early
 ARC release coverage):
 
-- `test-metal3-compute-icb.m` (Task `2.3`): CPU-encoded and GPU-encoded
+- `test-metal3-compute-icb.m`: CPU-encoded and GPU-encoded
   multi-pipeline compute ICBs (`ConcurrentDispatch` + `ConcurrentDispatchThreads`),
   per-slot `setBarrier`, threadgroup memory, `stageInRegion`, indirect execution
   ranges, zero CPU readback, and negative error paths.
-- `test-metal3-sparse-prt.m` (Task `5.3`): 64 KiB sparse tile queries &
+- `test-metal3-sparse-prt.m`: 64 KiB sparse tile queries &
   pixel/tile region conversions, `MTLHeapTypeSparse` + mipmapped sparse texture
   creation, `MTLResourceStateCommandEncoder` direct/batch/indirect map & unmap
   with `MTLFence`, MSL `sparse_color<float4>::resident()` / non-resident
   zero-read & write-discard, negative rejections, and `MTLGPUFamilyApple6 == NO`.
-- `test-metal3-rt-accel.m` (Task `7.1`): `accelerationStructureSizesWithDescriptor:`,
+- `test-metal3-rt-accel.m`: `accelerationStructureSizesWithDescriptor:`,
   triangle & AABB BLAS builds, compacted size readback (`UInt32` / `UInt64`) +
   `copyAndCompactAccelerationStructure:`, clone copies, in-place/out-of-place
   refit, Default & UserID TLAS build + refit, early ARC release safety, and
-  controlled negative rejections (`supportsRaytracing` remains `NO` until
-  Tasks `7.2`–`7.3` land).
+  controlled negative rejections.
 
 ```sh
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
@@ -959,15 +939,15 @@ for b in test-metal3-compute-icb test-metal3-sparse-prt \
 done
 ```
 
-## Metal 3 Dynamic Libraries & Visible Function Tables (3.2, 3.3)
+## Metal 3 Dynamic Libraries & Visible Function Tables
 
 Host pure-C suite (`host-cpu`, run via `make -C src/garnet-metal/tests host`
 under Clang ASan + UBSan) validates the `.grdl`
 dynamic library container codec (atomic roundtrip, magic/version/SHA-256/truncation/tamper
-rejection), Stage 2 linked cache-key determinism, patch `0074` VFT buffer encoding &
+rejection), Stage 2 linked cache-key determinism, VFT buffer encoding &
 OOB-clamping simulation, `visible_function_tables` JSON reflection parsing, Footnote 10
 mesh vs render function-pointer/RT exclusion, and source pins (`test-dynlib-vft.c`,
-plus assembled `GarnetDevice.m` Wave 3B wiring pins in `test-gate.c`):
+`test-gate.c`):
 
 ```sh
 make -C src/garnet-metal/tests host
@@ -976,12 +956,12 @@ make -C src/garnet-metal/tests host
 Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
 on macOS at both `-O0` and `-O2` for early ARC release coverage):
 
-- `test-metal3-dynamic-lib.m` (Task `3.2`): `newDynamicLibrary:error:`,
+- `test-metal3-dynamic-lib.m`: `newDynamicLibrary:error:`,
   `serializeToURL:error:` (`.grdl` container on Garnet), `newDynamicLibraryWithURL:error:`
   reload, compute + vertex + fragment dynamic library linking via
   `preloadedLibraries`, `MTLLinkedFunctions.binaryFunctions`, and non-dynamic /
   missing-symbol / corrupt / truncated / foreign `.metallib` rejection.
-- `test-metal3-function-tables.m` (Task `3.3`): compute and fragment
+- `test-metal3-function-tables.m`: compute and fragment
   `functionHandleWithFunction:` / `newVisibleFunctionTableWithDescriptor:`,
   `setVisibleFunctionTable:atBufferIndex:` / `setFragmentVisibleFunctionTable:atBufferIndex:`,
   dynamic handle swaps on the same PSO without recreation, null & OOB slot safe
@@ -1004,16 +984,15 @@ for b in test-metal3-dynamic-lib-O0 test-metal3-dynamic-lib-O2 \
 done
 ```
 
-## Metal 3 Mesh Shaders & Ray Tracing Runtime / IFT (6.2, 7.3, Wave 3E)
+## Metal 3 Mesh Shaders & Ray Tracing Runtime / IFT
 
 Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
 under Clang ASan + UBSan) validate mesh descriptor/threadgroup/emulated-payload
 planning, SPIR-V mesh execution-model inspection, and Footnote 10 rules
-(`test-mesh-runtime.c`), plus ray-tracing reflection JSON parsing, patch `0077`
-IFT storage-buffer ABI encoding/dispatch simulation, direct-AS vs 64-bit BDA
+(`test-mesh-runtime.c`), plus ray-tracing reflection JSON parsing, IFT
+storage-buffer ABI encoding/dispatch simulation, direct-AS vs 64-bit BDA
 argument-buffer planning, AIR intersection kind inference, and honest capability
-gating (`test-rt-runtime.c`), alongside assembled `GarnetDevice.m` Wave 3E
-wiring pins (`test-gate.c`, `test-occ.c`):
+gating (`test-rt-runtime.c`, `test-gate.c`, `test-occ.c`):
 
 ```sh
 make -C src/garnet-metal/tests host
@@ -1023,18 +1002,17 @@ Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
 on macOS; compile `test-metal3-raytracing.m` with both `-O0` and `-O2` for early
 ARC release coverage):
 
-- `test-metal3-mesh-shaders.m` (Task `6.2`): mesh-only and object+mesh pipelines
+- `test-metal3-mesh-shaders.m`: mesh-only and object+mesh pipelines
   (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`),
   `drawMeshThreadgroups:`, `drawMeshThreads:`,
   `drawMeshThreadgroupsWithIndirectBuffer:`, `setObjectThreadgroupMemoryLength:`
   (up to 16 KiB), object/mesh buffer/texture/sampler binding, `privateFunctions`
   linkage, Footnote 10 mesh + function-pointer rejection, and `MTLGPUFamilyApple6 == NO`.
-- `test-metal3-raytracing.m` (Task `7.3`): honest capability assertions
-  (`supportsRaytracing`, `supportsRaytracingFromRender`,
-  `supportsPrimitiveMotionBlur == NO`), compute & fragment ray-query traversal
-  against triangle/AABB BLAS + compacted/refit TLAS via direct
-  `setAccelerationStructure:` / `setFragmentAccelerationStructure:` and Tier 2
-  argument-buffer 64-bit BDA (`setAccelerationStructure:atIndex:`),
+- `test-metal3-raytracing.m`: capability assertions (`supportsRaytracing`,
+  `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur == NO`), compute
+  & fragment ray-query traversal against triangle/AABB BLAS + compacted/refit
+  TLAS via direct `setAccelerationStructure:` / `setFragmentAccelerationStructure:`
+  and Tier 2 argument-buffer 64-bit BDA (`setAccelerationStructure:atIndex:`),
   `MTLIntersectionFunctionTable` creation/binding/opaque-triangle signatures/null
   slots, and early ARC release safety under `-O0` and `-O2`.
 

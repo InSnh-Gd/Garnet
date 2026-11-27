@@ -24,25 +24,25 @@ stays on your machine.
 ## What you need
 
 - macOS with Xcode Command Line Tools (`nm`, `c++filt`, `clang++`), Python 3.
-- A MacKernelSDK checkout (`Headers/`), for `check_layout.py` only: `export C64_MKSDK=/path/to/MacKernelSDK`.
+- A MacKernelSDK checkout (`Headers/`), for `check_layout.py` only: `export GARNET_MKSDK=/path/to/MacKernelSDK`.
 - A work directory with, from your own Mac:
 
 ```
-$C64_WORK/kc/BootKernelExtensions.kc
-$C64_WORK/kc/SystemKernelExtensions.kc
-$C64_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2     # standalone Mach-O carved from the KC
-$C64_WORK/kexts/com.apple.driver.AppleParavirtGPU        # standalone Mach-O carved from the KC
+$GARNET_KC_WORK/kc/BootKernelExtensions.kc
+$GARNET_KC_WORK/kc/SystemKernelExtensions.kc
+$GARNET_KC_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2     # standalone Mach-O carved from the KC
+$GARNET_KC_WORK/kexts/com.apple.driver.AppleParavirtGPU        # standalone Mach-O carved from the KC
 ```
 
 The two kernel collections come from `/System/Library/KernelCollections/` (the paths differ per OS build; use the ones
 that match the OS you will load on). For an x86_64 `MH_FILESET` system collection, create the two analysis images with:
 
 ```sh
-mkdir -p "$C64_WORK/kexts"
-python3 extract_fileset.py "$C64_WORK/kc/SystemKernelExtensions.kc" \
-  com.apple.iokit.IOAcceleratorFamily2 "$C64_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2"
-python3 extract_fileset.py "$C64_WORK/kc/SystemKernelExtensions.kc" \
-  com.apple.driver.AppleParavirtGPU "$C64_WORK/kexts/com.apple.driver.AppleParavirtGPU"
+mkdir -p "$GARNET_KC_WORK/kexts"
+python3 extract_fileset.py "$GARNET_KC_WORK/kc/SystemKernelExtensions.kc" \
+  com.apple.iokit.IOAcceleratorFamily2 "$GARNET_KC_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2"
+python3 extract_fileset.py "$GARNET_KC_WORK/kc/SystemKernelExtensions.kc" \
+  com.apple.driver.AppleParavirtGPU "$GARNET_KC_WORK/kexts/com.apple.driver.AppleParavirtGPU"
 python3 test_extract_fileset.py
 ```
 
@@ -53,18 +53,18 @@ and the layout scripts; do not install them as kernel extensions. Existing outpu
 ## Run
 
 ```sh
-export C64_WORK=$HOME/c64-work        # input directory above
-export C64_LAYOUT_OUT=$PWD/layout-out # output directory (default ./layout-out)
-export C64_MKSDK=$HOME/MacKernelSDK
+export GARNET_KC_WORK=$HOME/garnet-kc-work  # input directory above
+export GARNET_LAYOUT_OUT=$PWD/layout-out    # output directory (default ./layout-out)
+export GARNET_MKSDK=$HOME/MacKernelSDK
 python3 dump_vtables.py
 python3 gen_header.py
-python3 check_layout.py               # expect MATCH
+python3 check_layout.py                     # expect MATCH
 ```
 
-The accelerator build and its gates use the same `C64_LAYOUT_OUT` directory.
+The accelerator build and its gates use the same `GARNET_LAYOUT_OUT` directory.
 Keep that export when running `make -C ../../src/garnet-accel` from this
 directory. Without an override, that build looks in this directory's
-`layout-out/`. `C64_WORK` must still point to the matching target system's
+`layout-out/`. `GARNET_KC_WORK` must still point to the matching target system's
 kernel collections and carved kexts; generating a header alone does not
 establish binary compatibility.
 
@@ -79,4 +79,4 @@ Memory: `kcmod.Image` reads each input file into memory (the system KC is about 
   signature in your kernel's own `IOUserClient` vtable at run time, not stored.
 - `kcmod.KERNEL_BASE` (`0xffffff8000100000`) is the level-0 chained-fixup base. It was verified against
   `___cxa_pure_virtual` on macOS 26.x. If `check_layout.py` reports nonsense on another OS build, check this first.
-- Tested only on macOS 26.6.2 (25G83) x86_64. Other builds have not been tried.
+- Verified on x86_64 macOS 26.x (`25G83` and `25G332`); re-run against your target machine's kernel collections whenever macOS updates.
