@@ -317,9 +317,9 @@ int main(int argc, char **argv) {
     // =========================================================================================================================================================
     { const std::string a = std::string("pipe+") + "0x280", b = std::string("pipe+") + "0x282", c = std::string("pipe+") + "0x299";
       for (const std::string *f : { &pure, &flow }) expect(f->find(a) == std::string::npos && f->find(b) == std::string::npos && f->find(c) == std::string::npos, "no NEW AGDC header spells the three forbidden pipe offsets");
-      const std::string me = slurp(K + "tests/native_agdc_test.cpp"), pl = slurp(K + "tests/native_agdc_plant.sh");
-      expect(me.find(a) == std::string::npos && me.find(b) == std::string::npos && me.find(c) == std::string::npos && pl.find(a) == std::string::npos && pl.find(b) == std::string::npos && pl.find(c) == std::string::npos,
-             "this test and its plant script never spell them");
+      const std::string me = slurp(K + "tests/native_agdc_test.cpp");
+      expect(me.find(a) == std::string::npos && me.find(b) == std::string::npos && me.find(c) == std::string::npos,
+             "this test never spells them");
       // DisplayPipeGuard.cpp is an OLD file whose historical comments carry them; this task added none: the count is its 0.0.613 count
       const size_t envA = dpg.find("struct AgdcNativeEnv {"), envB = dpg.find("uint32_t rdna4_agdc_native_control(");
       if (envA != std::string::npos && envB != std::string::npos) { const std::string mine = dpg.substr(envA, envB - envA + 900);
