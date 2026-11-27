@@ -212,7 +212,7 @@ GARNET_INTERNAL uint64_t rdna4_fence_open(void) {
     uint64_t s = rdna4p_submit(&RDNA4HT.p);
     if (!s) {
         pthread_mutex_unlock(&RDNA4P.mu);
-        RDNA4LOG("heap retirement timeline unavailable (pending allocation failed); command buffer refused");
+        RDNA4LOG_ERR("heap retirement timeline unavailable (pending allocation failed); command buffer refused");
         return 0;
     }
     if (RDNA4P.on) {
@@ -220,17 +220,17 @@ GARNET_INTERNAL uint64_t rdna4_fence_open(void) {
         if (!pooled) {
             BOOL cancelled = rdna4p_cancel_last(&RDNA4HT.p, s);
             pthread_mutex_unlock(&RDNA4P.mu);
-            RDNA4LOG("pool timeline unavailable (pending allocation failed); heap serial %llu %s",
-                     (unsigned long long)s, cancelled ? "rolled back" : "ROLLBACK FAILED");
+            RDNA4LOG_ERR("pool timeline unavailable (pending allocation failed); heap serial %llu %s",
+                         (unsigned long long)s, cancelled ? "rolled back" : "ROLLBACK FAILED");
             return 0;
         }
         if (pooled != s) {
             BOOL poolCancelled = rdna4p_cancel_last(&RDNA4P.p, pooled);
             BOOL heapCancelled = rdna4p_cancel_last(&RDNA4HT.p, s);
             pthread_mutex_unlock(&RDNA4P.mu);
-            RDNA4LOG("timeline serial mismatch: heap %llu pool %llu; rollback %s/%s",
-                     (unsigned long long)s, (unsigned long long)pooled,
-                     heapCancelled ? "ok" : "FAILED", poolCancelled ? "ok" : "FAILED");
+            RDNA4LOG_ERR("timeline serial mismatch: heap %llu pool %llu; rollback %s/%s",
+                         (unsigned long long)s, (unsigned long long)pooled,
+                         heapCancelled ? "ok" : "FAILED", poolCancelled ? "ok" : "FAILED");
             return 0;
         }
     }
@@ -1168,7 +1168,7 @@ GARNET_INTERNAL BOOL rdna4nc_vk_offset_ok(VkDeviceSize off, VkDeviceSize align, 
     static _Atomic unsigned warned;
     static const char *const names[] = { "storage descriptor", "uniform descriptor", "index buffer", "indirect command", "buffer/image copy" };
     if (!(atomic_fetch_or(&warned, 1u << use) & (1u << use)))
-        RDNA4LOG("NoCopy Vulkan alignment limit: %s offset %llu must be a multiple of %llu; operation refused before encoding", names[use], (unsigned long long)off, (unsigned long long)align);
+        RDNA4LOG_WARN("NoCopy Vulkan alignment limit: %s offset %llu must be a multiple of %llu; operation refused before encoding", names[use], (unsigned long long)off, (unsigned long long)align);
     return NO;
 }
 
@@ -1531,7 +1531,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
     return [self rdna4ImportHostPointer:p length:len ownedSpan:0 deallocator:d error:err];
 }
 - (instancetype)rdna4ImportHostPointer:(void *)p length:(NSUInteger)len ownedSpan:(uint64_t)ownedSpan deallocator:(void (^)(void *, NSUInteger))d error:(NSError **)err {
-    #define NCFAIL(code, ...) do { NSString *m_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG("newBufferWithBytesNoCopy: refused: %s", m_.UTF8String); if (err) *err = rdna4_err(code, m_); return nil; } while (0)
+    #define NCFAIL(code, ...) do { NSString *m_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG_WARN("newBufferWithBytesNoCopy: refused: %s", m_.UTF8String); if (err) *err = rdna4_err(code, m_); return nil; } while (0)
     if (!p || !len) NCFAIL(110, @"NULL pointer or zero length");
     if (((_opts >> 4) & 0xF) > 1) NCFAIL(111, @"storage mode %lu: only Shared and Managed client memory can be wrapped", (unsigned long)((_opts >> 4) & 0xF));
     if (!rdna4_radv_open(err)) return nil;
@@ -1568,7 +1568,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
                              (unsigned long)span, hostBase, r, (unsigned long long)RDNA4R.hostAlign, (unsigned long long)mr.alignment, pages];
         static _Atomic uint64_t refusedLogCount;
         uint64_t logIndex = atomic_fetch_add(&refusedLogCount, 1);
-        if (logIndex < 8 || (logIndex & 1023u) == 0) RDNA4LOG("newBufferWithBytesNoCopy: refused: %s", message.UTF8String);
+        if (logIndex < 8 || (logIndex & 1023u) == 0) RDNA4LOG_WARN("newBufferWithBytesNoCopy: refused: %s", message.UTF8String);
         if (err) *err = rdna4_err(118, message);
         return nil;
     }
@@ -1587,7 +1587,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
     _vkoff = delta;
     _ptr = p; _deallocator = [d copy];
     [self rdna4CheckHostReadOnly:imp.pHostPointer length:(NSUInteger)ma.allocationSize];
-    RDNA4LOG("RDNA4Buffer %p: NO-COPY %lu bytes at %p imported as [%p, +%llu) offset %llu", (__bridge void *)self, (unsigned long)len, p, hostBase, (unsigned long long)span, (unsigned long long)delta);
+    RDNA4LOGR("RDNA4Buffer %p: NO-COPY %lu bytes at %p imported as [%p, +%llu) offset %llu", (__bridge void *)self, (unsigned long)len, p, hostBase, (unsigned long long)span, (unsigned long long)delta);
     #undef NCFAIL
     return self;
 }
@@ -1598,9 +1598,9 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
     int protection = rdna4nc_host_readonly(p, len);
     _hostReadOnly = protection != 0;
     if (_hostReadOnly) rdna4nc_note_readonly_buffer();
-    if (protection < 0) RDNA4LOG("RDNA4Buffer %p: NO-COPY protection unknown, treating as read-only", (__bridge void *)self);
-    if (_hostReadOnly) RDNA4LOG("RDNA4Buffer %p: NO-COPY %lu bytes at %p imported READ-ONLY (GPU writes will be dropped)",
-                               (__bridge void *)self, (unsigned long)len, p);
+    if (protection < 0) RDNA4LOGR("RDNA4Buffer %p: NO-COPY protection unknown, treating as read-only", (__bridge void *)self);
+    if (_hostReadOnly) RDNA4LOGR("RDNA4Buffer %p: NO-COPY %lu bytes at %p imported READ-ONLY (GPU writes will be dropped)",
+                                (__bridge void *)self, (unsigned long)len, p);
 }
 - (VkDeviceMemory)rdna4NativeMemory:(uint64_t *)offset {
     if (_hpHeap) { *offset = _hpBindOff; return [_hpHeap rdna4BackingMemory:_hpBlk]; }
@@ -1629,7 +1629,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
     if (_deallocator) { void (^d)(void *, NSUInteger) = _deallocator; _deallocator = nil; d(_ptr, _len); }
 }
 - (void)doesNotRecognizeSelector:(SEL)sel {
-    RDNA4LOG("UNRECOGNIZED selector %s on RDNA4Buffer", sel_getName(sel));
+    RDNA4LOG_ERR("UNRECOGNIZED selector %s on RDNA4Buffer", sel_getName(sel));
     [super doesNotRecognizeSelector:sel];
 }
 - (VkBuffer)vkBuffer { return _vkbuf; }
@@ -1701,8 +1701,8 @@ _Static_assert((int)MTLTextureTypeTextureBuffer == RDNA4TD_MTL_BUFFER, "MTLTextu
 // Linear textures over this buffer (public -newTextureWithDescriptor:offset:bytesPerRow:, SPI -newLinearTexture..., -newTiledTexture...): see RDNA4Texture initWithDevice:descriptor:buffer:
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr {
     NSError *e = nil; id t = [[RDNA4Texture alloc] initWithDevice:_dev descriptor:d buffer:self offset:off bytesPerRow:bpr error:&e];
-    if (!t) RDNA4LOG("buffer newTextureWithDescriptor:offset:bytesPerRow: NIL: %s; pf %lu type %lu usage 0x%lx storage %lu %lux%lu", e.localizedDescription.UTF8String,
-                   (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height);
+    if (!t) RDNA4LOG_WARN("buffer newTextureWithDescriptor:offset:bytesPerRow: NIL: %s; pf %lu type %lu usage 0x%lx storage %lu %lux%lu", e.localizedDescription.UTF8String,
+                          (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned long)d.width, (unsigned long)d.height);
     if (t) [[self rdna4ResourceHeap] rdna4TrackResource:t];
     return t;
 }
@@ -1801,17 +1801,17 @@ GARNET_INTERNAL void rdna4_tex_to_compute(VkCommandBuffer cmd, RDNA4Texture *t, 
     [t setLayout:nl];
 }
 GARNET_INTERNAL BOOL rdna4_region_ok(RDNA4Texture *t, MTLRegion r, NSUInteger level, NSUInteger slice, const char *what) {
-    if (level >= [t mipmapLevelCount] || slice >= [t rdna4Layers]) { RDNA4LOG("%s: mip level %lu / slice %lu: the texture has %lu level(s) and %u slice(s); refused", what, (unsigned long)level, (unsigned long)slice, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return NO; }
+    if (level >= [t mipmapLevelCount] || slice >= [t rdna4Layers]) { RDNA4LOG_WARN("%s: mip level %lu / slice %lu: the texture has %lu level(s) and %u slice(s); refused", what, (unsigned long)level, (unsigned long)slice, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return NO; }
     NSUInteger lw = MAX((NSUInteger)1, t.width >> level), lh = MAX((NSUInteger)1, t.height >> level), ld = MAX((NSUInteger)1, t.depth >> level);   // depth is 1 for everything but 3D
     if (!r.size.width || !r.size.height || !r.size.depth || r.origin.x > lw || r.size.width > lw - r.origin.x ||
         r.origin.y > lh || r.size.height > lh - r.origin.y || r.origin.z > ld || r.size.depth > ld - r.origin.z) {
-        RDNA4LOG("%s: region origin %lu,%lu,%lu size %lux%lux%lu outside the %lux%lux%lu level %lu; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y,
-               (unsigned long)r.origin.z, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.size.depth, (unsigned long)lw, (unsigned long)lh, (unsigned long)ld, (unsigned long)level); return NO; }
+        RDNA4LOG_WARN("%s: region origin %lu,%lu,%lu size %lux%lux%lu outside the %lux%lux%lu level %lu; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y,
+                      (unsigned long)r.origin.z, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.size.depth, (unsigned long)lw, (unsigned long)lh, (unsigned long)ld, (unsigned long)level); return NO; }
     if ([t isCompressed] &&
         ((r.origin.x & 3) || (r.origin.y & 3) ||
          ((r.size.width & 3) && r.origin.x + r.size.width != lw) ||
          ((r.size.height & 3) && r.origin.y + r.size.height != lh))) {
-        RDNA4LOG("%s: block-compressed region origin/size (%lu,%lu %lux%lu) is not 4x4 block aligned on %lux%lu level; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)lw, (unsigned long)lh);
+        RDNA4LOG_WARN("%s: block-compressed region origin/size (%lu,%lu %lux%lu) is not 4x4 block aligned on %lux%lu level; refused", what, (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)lw, (unsigned long)lh);
         return NO;
     }
     return YES;
@@ -2365,7 +2365,7 @@ RDNA4_DNR(RDNA4Texture)
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)s plane:(NSUInteger)plane error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
-    #define IOSFAIL(code, ...) do { NSString *m_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG("newTexture(iosurface): refused: %s", m_.UTF8String); if (err) *err = rdna4_err(code, m_); return nil; } while (0)
+    #define IOSFAIL(code, ...) do { NSString *m_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG_WARN("newTexture(iosurface): refused: %s", m_.UTF8String); if (err) *err = rdna4_err(code, m_); return nil; } while (0)
     if (!s) IOSFAIL(70, @"NULL IOSurface");
     _dev = dev; _w = d.width; _h = d.height; _pf = d.pixelFormat; _usage = d.usage; _layout = VK_IMAGE_LAYOUT_UNDEFINED; _iosPlane = plane;
     _swz = d.swizzle;
@@ -2413,7 +2413,7 @@ RDNA4_DNR(RDNA4Texture)
     // the "baseless" branch below (same GPU-only image, same classification) with f1 set: the content captured through this wrapper is blank, the process stays up. The import cache is flushed and the import retried
     // first (rdna4_imp_get). The branch itself is not edited for this except that a size difference between descriptor and plane no longer refuses and no "protected" note is logged.
     BOOL f1 = NO;
-    #define RDNA4F1_FALL(...) do { f1 = YES; atomic_fetch_add(&RDNA4LED.f1Fallbacks, 1); static _Atomic int f1log_; if (atomic_fetch_add(&f1log_, 1) < 16) { NSString *w_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG("F1: the import of IOSurface %u was refused (%s): GPU-only texture instead of nil (the content captured through this wrapper is blank; the process stays up)", IOSurfaceGetID(s), w_.UTF8String); } goto nobase_path; } while (0)
+    #define RDNA4F1_FALL(...) do { f1 = YES; atomic_fetch_add(&RDNA4LED.f1Fallbacks, 1); static _Atomic int f1log_; if (atomic_fetch_add(&f1log_, 1) < 16) { NSString *w_ = [NSString stringWithFormat:__VA_ARGS__]; RDNA4LOG_WARN("F1: the import of IOSurface %u was refused (%s): GPU-only texture instead of nil (the content captured through this wrapper is blank; the process stays up)", IOSurfaceGetID(s), w_.UTF8String); } goto nobase_path; } while (0)
     if (!pbase || !base) {   // P4: a protected IOSurface has no CPU mapping (CoreDisplay's DisplaySurface::GetMTLTexture cannot survive a nil texture). Not refused: a device-local optimal image of the descriptor's
         // size/format that is NOT backed by the surface's memory (the surface's contents are not shared). No import, no _ibuf, no _ibase: rdna4IsIOS is NO, so no upload/write-back copy and no CPU path touches a NULL base.
         // P6: classified like any other IOSurface texture (below, before return): with only the VkImage as D-copy source (vkCmdCopyImageToBuffer).
@@ -2452,7 +2452,7 @@ RDNA4_DNR(RDNA4Texture)
         nr = vkCreateImageView(RDNA4R.dev, &nvc, NULL, &_view);
         if (nr != VK_SUCCESS) IOSFAIL(91, @"vkCreateImageView = %d", nr);
         _iosNoBase = YES; _ios = (IOSurfaceRef)CFRetain(s); rdna4_led_add(self, s, 0, spf, (uint32_t)pc, YES); _led = YES;   // retained (F3: not use-counted for its life) and entered in the ledger; set last so a failed init above never releases
-        RDNA4LOG("newTexture(iosurface) %p: plane %lu %zux%zu bpr %zu pf %lu -> GPU-ONLY (no CPU mapping): optimal VkImage, not backed by the surface's memory", (__bridge void *)self, (unsigned long)plane, sw, sh, bpr, (unsigned long)_pf);
+        RDNA4LOGR("newTexture(iosurface) %p: plane %lu %zux%zu bpr %zu pf %lu -> GPU-ONLY (no CPU mapping): optimal VkImage, not backed by the surface's memory", (__bridge void *)self, (unsigned long)plane, sw, sh, bpr, (unsigned long)_pf);
         // P6: same rule as the mapped surfaces (rdna4s_classify: geometry/pitch vs the plane + the DisplaySurface::GetMTLTexture backtrace). Inputs: width/height/pixel format/bytesPerRow/allocSize from the IOSurface
         // object (none needs a CPU mapping); alloc 0 -> bpr*height (rdna4df_nobase_alloc); the cache key's base is 0, which no mapped surface has (a mapped one passed the !base test above).
         // The image is the copy source, so the format must be 4 bytes per texel (the slot's pitch is in 4-byte texels) and the image must be the plane's size.
@@ -2466,11 +2466,11 @@ RDNA4_DNR(RDNA4Texture)
     pin.alloc = alloc; pin.poff = ((uintptr_t)pbase >= (uintptr_t)base) ? (uint64_t)((uintptr_t)pbase - (uintptr_t)base) : UINT64_MAX;
     if (!rdna4pl_bound(&pin, &pout)) IOSFAIL(pout.code, @"%s", pout.why);
     const NSUInteger poff = (NSUInteger)pout.off;
-    if (pc > 1) RDNA4LOG("newTexture(iosurface): plane %lu of %zu: offset %lu size %zux%zu bpe %zu bpr %zu (bufferRowLength %zu texels)", (unsigned long)plane, pc, (unsigned long)poff, sw, sh, bpe, bpr, pout.rowlen);
+    if (pc > 1) RDNA4LOGR("newTexture(iosurface): plane %lu of %zu: offset %lu size %zux%zu bpe %zu bpr %zu (bufferRowLength %zu texels)", (unsigned long)plane, pc, (unsigned long)poff, sw, sh, bpe, bpr, pout.rowlen);
     // m11h6: IOSurface allocations are page-granular in the VM map, but IOSurfaceGetAllocSize reports the exact byte size (e.g. 5760, 303360, 1840000).
     // Import the whole pages that hold the surface: round up to the host-pointer alignment. The extra tail bytes are the surface's own page, never another object's.
     const size_t ialloc = (alloc + (size_t)RDNA4R.hostAlign - 1) & ~((size_t)RDNA4R.hostAlign - 1);
-    if (ialloc != alloc) RDNA4LOG("newTexture(iosurface): allocSize %zu rounded up to %zu for the page-granular import", alloc, ialloc);
+    if (ialloc != alloc) RDNA4LOGR("newTexture(iosurface): allocSize %zu rounded up to %zu for the page-granular import", alloc, ialloc);
     if (ialloc > 64u << 20) RDNA4F1_FALL(@"allocSize %zu > 64 MiB (the RDNA4N per-BO import limit)", ialloc);
     // Import (whole allocation). The kernel refuses BAR pages, unaligned ranges and > 256 MiB per client; that arrives as a vkAllocateMemory error.
     VkMemoryHostPointerPropertiesEXT hp = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
@@ -2487,10 +2487,10 @@ RDNA4_DNR(RDNA4Texture)
     if (rdna4f1_action((int)r) == RDNA4F1_FALLBACK) { _imem = VK_NULL_HANDLE; _impShared = NO; RDNA4F1_FALL(@"vkAllocateMemory(import %zu B at %p) = %d, running import total %llu B", ialloc, base, r, (unsigned long long)RDNA4R.impTotal); }
     int protection = rdna4nc_host_readonly(base, ialloc);
     _hostReadOnly = protection != 0;
-    if (protection < 0) RDNA4LOG("RDNA4Texture %p: NO-COPY protection unknown, treating as read-only", (__bridge void *)self);
-    if (_hostReadOnly) RDNA4LOG("RDNA4Texture %p: NO-COPY %zu bytes at %p imported READ-ONLY (GPU writes will be dropped)", (__bridge void *)self, ialloc, base);
-    if (impHit) { static _Atomic int nlog; if (atomic_fetch_add(&nlog, 1) < 8) RDNA4LOG("newTexture(iosurface): id %u import REUSED from the cache (%zu B)", IOSurfaceGetID(s), ialloc); }
-    else @synchronized ([GarnetDevice class]) { RDNA4R.impTotal += ialloc; RDNA4LOG("newTexture(iosurface): imported %zu B (host memory type %d, bits 0x%x); running import total %llu B", ialloc, hmt, hp.memoryTypeBits, (unsigned long long)RDNA4R.impTotal); }
+    if (protection < 0) RDNA4LOGR("RDNA4Texture %p: NO-COPY protection unknown, treating as read-only", (__bridge void *)self);
+    if (_hostReadOnly) RDNA4LOGR("RDNA4Texture %p: NO-COPY %zu bytes at %p imported READ-ONLY (GPU writes will be dropped)", (__bridge void *)self, ialloc, base);
+    if (impHit) { static _Atomic int nlog; if (atomic_fetch_add(&nlog, 1) < 8) RDNA4LOGR("newTexture(iosurface): id %u import REUSED from the cache (%zu B)", IOSurfaceGetID(s), ialloc); }
+    else @synchronized ([GarnetDevice class]) { RDNA4R.impTotal += ialloc; RDNA4LOGR("newTexture(iosurface): imported %zu B (host memory type %d, bits 0x%x); running import total %llu B", ialloc, hmt, hp.memoryTypeBits, (unsigned long long)RDNA4R.impTotal); }
     _ialloc = ialloc; _ibase = (uint8_t *)base + poff; _ioff = poff; _ibpr = bpr; _ios = (IOSurfaceRef)CFRetain(s); rdna4_led_add(self, s, ialloc, spf, (uint32_t)pc, NO); _led = YES; _size = ialloc;   // F3: retained, not use-counted for its life; entered in the ledger
     // S5.2a: classify display surfaces BEFORE Phase B VRAM cache lookup so Class 1 (_disp) promotes directly into hi-pool VRAM.
     if (pc <= 1 && _w == sw && _h == sh && rdna4s_classify(sw, sh, spf, d.usage, bpr, alloc, IOSurfaceGetID(s), base)) {   // build 7: only an exact-size texture can be a display surface
@@ -2513,8 +2513,8 @@ RDNA4_DNR(RDNA4Texture)
         VkFormatProperties lfp = {0}; vkGetPhysicalDeviceFormatProperties(RDNA4R.pd, _fmt->vk, &lfp);
         VkFormatFeatureFlags lneed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
             (attOK ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : 0) | ((d.usage & MTLTextureUsageShaderWrite) ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : 0);
-        if ((lfp.linearTilingFeatures & lneed) != lneed) { RDNA4LOG("newTexture(iosurface): path (a) unavailable: LINEAR features 0x%x lack 0x%x for vk format %d", lfp.linearTilingFeatures, lneed & ~lfp.linearTilingFeatures, _fmt->vk); tryA = NO; }
-        else RDNA4LOG("newTexture(iosurface): LINEAR features 0x%x cover 0x%x for vk format %d", lfp.linearTilingFeatures, lneed, _fmt->vk);
+        if ((lfp.linearTilingFeatures & lneed) != lneed) { RDNA4LOGR("newTexture(iosurface): path (a) unavailable: LINEAR features 0x%x lack 0x%x for vk format %d", lfp.linearTilingFeatures, lneed & ~lfp.linearTilingFeatures, _fmt->vk); tryA = NO; }
+        else RDNA4LOGR("newTexture(iosurface): LINEAR features 0x%x cover 0x%x for vk format %d", lfp.linearTilingFeatures, lneed, _fmt->vk);
     }
     if (tryA) {
         const VkImageCreateFlags liFlags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -2533,7 +2533,7 @@ RDNA4_DNR(RDNA4Texture)
         VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &emi, .flags = liFlags, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
         VkImage li = VK_NULL_HANDLE; r = vkCreateImage(RDNA4R.dev, &ic, NULL, &li);
-        if (r != VK_SUCCESS) RDNA4LOG("newTexture(iosurface): path (a) unavailable: linear vkCreateImage = %d", r);
+        if (r != VK_SUCCESS) RDNA4LOGR("newTexture(iosurface): path (a) unavailable: linear vkCreateImage = %d", r);
         else {
             VkImageSubresource sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 }; VkSubresourceLayout sl; vkGetImageSubresourceLayout(RDNA4R.dev, li, &sr, &sl);
             VkMemoryRequirements mr; vkGetImageMemoryRequirements(RDNA4R.dev, li, &mr);
@@ -2592,14 +2592,14 @@ RDNA4_DNR(RDNA4Texture)
                     explicitOK ? "" : " (", explicitOK ? "" : rdna4p_explicit_pitch_reason_text(explicitReason), explicitOK ? "" : ")");
             NSString *pitchResult = !naturalPitchOK ? [NSString stringWithFormat:@" -> explicit pitch %@%@",
                 explicitOK ? @"OK" : @"refused", explicitOK ? @"" : [NSString stringWithFormat:@" (%s)", rdna4p_explicit_pitch_reason_text(explicitReason)]] : @"";
-            RDNA4LOG("newTexture(iosurface): linear layout for %lux%lu (descriptor; surface %zux%zu): rowPitch %llu offset %llu size %llu vs IOSurface bytesPerRow %zu -> %s%s; image req size %llu align %llu typeBits 0x%x (host bits 0x%x)",
+            RDNA4LOGR("newTexture(iosurface): linear layout for %lux%lu (descriptor; surface %zux%zu): rowPitch %llu offset %llu size %llu vs IOSurface bytesPerRow %zu -> %s%s; image req size %llu align %llu typeBits 0x%x (host bits 0x%x)",
                    (unsigned long)_w, (unsigned long)_h, sw, sh, (unsigned long long)sl.rowPitch, (unsigned long long)sl.offset, (unsigned long long)sl.size, bpr, naturalPitchOK ? "MATCH" : "MISMATCH",
                    pitchResult.UTF8String,
                    (unsigned long long)mr.size, (unsigned long long)mr.alignment, mr.memoryTypeBits, hp.memoryTypeBits);
             BOOL fits = pitchOK && rdna4pl_bind_ok(poff, mr.size, mr.alignment, ialloc) && (mr.alignment == 0 || ((uintptr_t)base % mr.alignment) == 0) && (mr.memoryTypeBits & (1u << hmt));
-            if (pitchOK && !fits && poff) RDNA4LOG("newTexture(iosurface): plane offset %lu: LINEAR bind at that offset not possible (image align %llu size %llu, import %zu) -> copy path (b)", (unsigned long)poff, (unsigned long long)mr.alignment, (unsigned long long)mr.size, ialloc);
-            if (pitchOK && !fits) RDNA4LOG("newTexture(iosurface): path (a) unavailable: image requirements do not fit the import (size/alignment/memory type)");
-            if (fits && !alreadyBound) { r = vkBindImageMemory(RDNA4R.dev, li, _imem, poff); if (r != VK_SUCCESS) { RDNA4LOG("newTexture(iosurface): path (a) unavailable: vkBindImageMemory = %d", r); fits = NO; } }
+            if (pitchOK && !fits && poff) RDNA4LOGR("newTexture(iosurface): plane offset %lu: LINEAR bind at that offset not possible (image align %llu size %llu, import %zu) -> copy path (b)", (unsigned long)poff, (unsigned long long)mr.alignment, (unsigned long long)mr.size, ialloc);
+            if (pitchOK && !fits) RDNA4LOGR("newTexture(iosurface): path (a) unavailable: image requirements do not fit the import (size/alignment/memory type)");
+            if (fits && !alreadyBound) { r = vkBindImageMemory(RDNA4R.dev, li, _imem, poff); if (r != VK_SUCCESS) { RDNA4LOGR("newTexture(iosurface): path (a) unavailable: vkBindImageMemory = %d", r); fits = NO; } }
             if (fits && li) {
                 _iosLinear = YES;
                 if (RDNA4IC.on && _impShared) {
@@ -2767,8 +2767,8 @@ RDNA4_DNR(RDNA4Texture)
 // returns). Private textures are REFUSED (Metal does not allow CPU access to them): there is no NSError channel in these selectors, so the
 // refusal is an RDNA4LOG line and a no-op. Rows are re-packed tightly into the staging buffer, so any bytesPerRow is accepted.
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
-    if (!bytes) { RDNA4LOG("replaceRegion: NULL bytes; refused"); return; }
-    if ([self rdna4HostReadOnly]) { RDNA4LOG("replaceRegion: read-only backing; CPU write refused"); return; }
+    if (!bytes) { RDNA4LOG_WARN("replaceRegion: NULL bytes; refused"); return; }
+    if ([self rdna4HostReadOnly]) { RDNA4LOG_WARN("replaceRegion: read-only backing; CPU write refused"); return; }
     if (!rdna4_region_ok(self, r, lvl, slice, "replaceRegion")) return;
     BOOL bc = rdna4_fmt_is_bc(_fmt);
     NSUInteger bw = bc ? (r.size.width + 3) / 4 : r.size.width;
@@ -2780,10 +2780,10 @@ RDNA4_DNR(RDNA4Texture)
     if (!rdna4_texture_transfer_layout(bw, bh, r.size.depth,
             _fmt->bpp, bpr, bpi, &transfer) ||
         !rdna4_texture_transfer_pointer(bytes, transfer.span)) {
-        RDNA4LOG("replaceRegion: CPU row/image layout is too small or overflows; refused"); return;
+        RDNA4LOG_WARN("replaceRegion: CPU row/image layout is too small or overflows; refused"); return;
     }
     if (_texel) {
-        if (![_hostBuf contents]) { RDNA4LOG("replaceRegion: Private texture buffer; refused"); return; }
+        if (![_hostBuf contents]) { RDNA4LOG_WARN("replaceRegion: Private texture buffer; refused"); return; }
         memcpy((uint8_t *)[_hostBuf contents] + _hoff + r.origin.x * _fmt->bpp, bytes, rowBytes);
         return;
     }
@@ -2800,12 +2800,12 @@ RDNA4_DNR(RDNA4Texture)
         [self rdna4PathBInvalidate];
         RDNA4LOGR("replaceRegion: %lux%lu into the IOSurface memory", (unsigned long)r.size.width, (unsigned long)r.size.height); return;
     }
-    if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG("replaceRegion: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
+    if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG_WARN("replaceRegion: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
     NSUInteger nz = r.size.depth;
     NSError *err = nil;
     NSUInteger opts = MTLResourceStorageModeShared | RDNA4_OPT_NOZERO;
     RDNA4Buffer *stg = [[RDNA4Buffer alloc] initWithDevice:_dev length:transfer.packed_bytes options:opts error:&err];
-    if (!stg) { RDNA4LOG("replaceRegion: staging buffer failed: %s", err.localizedDescription.UTF8String); return; }
+    if (!stg) { RDNA4LOG_ERR("replaceRegion: staging buffer failed: %s", err.localizedDescription.UTF8String); return; }
     for (NSUInteger z = 0; z < nz; z++) for (NSUInteger y = 0; y < bh; y++)
         memcpy((uint8_t *)[stg contents] + (z * bh + y) * rowBytes, (const uint8_t *)bytes + z * bpi + y * bpr, rowBytes);
     BOOL ok = rdna4_oneshot(&err, ^(VkCommandBuffer cmd) {
@@ -2823,12 +2823,12 @@ RDNA4_DNR(RDNA4Texture)
     NSUInteger bpi = 0;
     NSUInteger bh = rdna4_fmt_is_bc(_fmt) ? (r.size.height + 3) / 4 : r.size.height;
     if (r.size.depth > 1 && __builtin_mul_overflow(bpr, bh, &bpi)) {
-        RDNA4LOG("replaceRegion: image stride overflows; refused"); return;
+        RDNA4LOG_WARN("replaceRegion: image stride overflows; refused"); return;
     }
     [self replaceRegion:r mipmapLevel:lvl slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:bpi];
 }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)slice {
-    if (!dst) { RDNA4LOG("getBytes: NULL destination; refused"); return; }
+    if (!dst) { RDNA4LOG_WARN("getBytes: NULL destination; refused"); return; }
     if (!rdna4_region_ok(self, r, lvl, slice, "getBytes")) return;
     BOOL bc = rdna4_fmt_is_bc(_fmt);
     NSUInteger bw = bc ? (r.size.width + 3) / 4 : r.size.width;
@@ -2840,10 +2840,10 @@ RDNA4_DNR(RDNA4Texture)
     if (!rdna4_texture_transfer_layout(bw, bh, r.size.depth,
             _fmt->bpp, bpr, bpi, &transfer) ||
         !rdna4_texture_transfer_pointer(dst, transfer.span)) {
-        RDNA4LOG("getBytes: CPU row/image layout is too small or overflows; refused"); return;
+        RDNA4LOG_WARN("getBytes: CPU row/image layout is too small or overflows; refused"); return;
     }
     if (_texel) {
-        if (![_hostBuf contents]) { RDNA4LOG("getBytes: Private texture buffer; refused"); return; }
+        if (![_hostBuf contents]) { RDNA4LOG_WARN("getBytes: Private texture buffer; refused"); return; }
         memcpy(dst, (const uint8_t *)[_hostBuf contents] + _hoff + r.origin.x * _fmt->bpp, rowBytes);
         return;
     }
@@ -2853,11 +2853,11 @@ RDNA4_DNR(RDNA4Texture)
         for (NSUInteger y = 0; y < r.size.height; y++) memcpy((uint8_t *)dst + y * bpr, base + (r.origin.y + y) * stride + r.origin.x * _fmt->bpp, rowBytes);
         return;
     }
-    if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG("getBytes: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
+    if ([self storageMode] == MTLStorageModePrivate) { RDNA4LOG_WARN("getBytes: texture %p is Private: CPU access refused (no NSError channel; no-op)", (__bridge void *)self); return; }
     NSUInteger nz = r.size.depth;
     NSError *err = nil;
     RDNA4Buffer *stg = [[RDNA4Buffer alloc] initWithDevice:_dev length:transfer.packed_bytes options:MTLResourceStorageModeShared error:&err];
-    if (!stg) { RDNA4LOG("getBytes: staging buffer failed: %s", err.localizedDescription.UTF8String); return; }
+    if (!stg) { RDNA4LOG_ERR("getBytes: staging buffer failed: %s", err.localizedDescription.UTF8String); return; }
     VkImageLayout was = [self layout];
     BOOL ok = rdna4_oneshot(&err, ^(VkCommandBuffer cmd) {
         rdna4_tex_to(cmd, self, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2876,7 +2876,7 @@ RDNA4_DNR(RDNA4Texture)
     NSUInteger bpi = 0;
     NSUInteger bh = rdna4_fmt_is_bc(_fmt) ? (r.size.height + 3) / 4 : r.size.height;
     if (r.size.depth > 1 && __builtin_mul_overflow(bpr, bh, &bpi)) {
-        RDNA4LOG("getBytes: image stride overflows; refused"); return;
+        RDNA4LOG_WARN("getBytes: image stride overflows; refused"); return;
     }
     [self getBytes:dst bytesPerRow:bpr bytesPerImage:bpi fromRegion:r mipmapLevel:lvl slice:0];
 }
@@ -2968,10 +2968,10 @@ RDNA4_RESOURCE_SPI_CUSTOM_UID(_dev ? (rdna4_argument_resource_token_bindless(sel
 - (id)rdna4View:(MTLPixelFormat)pf type:(MTLTextureType)tt levels:(NSRange)lv slices:(NSRange)sl swizzle:(MTLTextureSwizzleChannels)sw {
     NSUInteger count = [self mipmapLevelCount];
     if (!lv.length || lv.location >= count || lv.length > count - lv.location) {
-        RDNA4LOG("newTextureView: type %lu levels %lu+%lu slices %lu+%lu: mip range outside the parent; nil", (unsigned long)tt, (unsigned long)lv.location,
-               (unsigned long)lv.length, (unsigned long)sl.location, (unsigned long)sl.length); return nil; }
+        RDNA4LOG_WARN("newTextureView: type %lu levels %lu+%lu slices %lu+%lu: mip range outside the parent; nil", (unsigned long)tt, (unsigned long)lv.location,
+                      (unsigned long)lv.length, (unsigned long)sl.location, (unsigned long)sl.length); return nil; }
     NSError *e = nil; RDNA4Texture *v = [[RDNA4Texture alloc] initViewOf:self pixelFormat:pf type:tt levels:lv slices:sl swizzle:sw error:&e];
-    if (!v) RDNA4LOG("newTextureView: refused: %s", e.localizedDescription.UTF8String);
+    if (!v) RDNA4LOG_WARN("newTextureView: refused: %s", e.localizedDescription.UTF8String);
     return v;
 }
 - (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pf {
@@ -3096,7 +3096,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLHeapDescriptor *)d {
     self = [super init]; if (!self) return nil;
     NSUInteger sz = d.size; unsigned st = (unsigned)d.storageMode, cc = (unsigned)d.cpuCacheMode, hz = (unsigned)d.hazardTrackingMode;
-    #define HFAIL(...) do { RDNA4LOG("newHeapWithDescriptor: NIL: " __VA_ARGS__); return nil; } while (0)
+    #define HFAIL(...) do { RDNA4LOG_WARN("newHeapWithDescriptor: NIL: " __VA_ARGS__); return nil; } while (0)
     if (d.type != MTLHeapTypeAutomatic && d.type != MTLHeapTypePlacement) HFAIL("heap type %lu: only automatic and placement heaps are supported", (unsigned long)d.type);
     if (!sz) HFAIL("size 0");
     if (st > 2) HFAIL("storage mode %u (Memoryless) not supported", st);
@@ -3138,7 +3138,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
     rdna4ha_destroy(&_ha);
 }
 - (void)doesNotRecognizeSelector:(SEL)sel {
-    RDNA4LOG("UNRECOGNIZED selector %s on RDNA4Heap", sel_getName(sel));
+    RDNA4LOG_ERR("UNRECOGNIZED selector %s on RDNA4Heap", sel_getName(sel));
     [super doesNotRecognizeSelector:sel];
 }
 // Logical accounting is driven by the resource's real VkMemoryRequirements. The
@@ -3146,7 +3146,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (BOOL)rdna4ReserveRequirements:(VkMemoryRequirements)mr offset:(NSUInteger *)off id:(uint64_t *)bid {
     if (!off || !bid || !mr.size || !mr.alignment) return NO;
     NSError *e = nil;
-    if (!rdna4_radv_open(&e)) { RDNA4LOG("heap resource: RADV open failed: %s", e.localizedDescription.UTF8String); return NO; }
+    if (!rdna4_radv_open(&e)) { RDNA4LOG_ERR("heap resource: RADV open failed: %s", e.localizedDescription.UTF8String); return NO; }
     @synchronized (self) {
         uint64_t gran = RDNA4R.lim.bufferImageGranularity ? RDNA4R.lim.bufferImageGranularity : 1;
         uint64_t extent = rdna4_alup((NSUInteger)mr.size, (NSUInteger)gran), align = MAX((uint64_t)mr.alignment, gran);
@@ -3489,19 +3489,19 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (BOOL)rdna4BindSucceeded:(uint64_t)block lease:(uint64_t)lease owner:(id)owner {
     @synchronized (self) {
         if (!rdna4hb_handle_open(&_hb, block)) {
-            RDNA4LOG("heap: failed to retain backing block %llu", (unsigned long long)block);
+            RDNA4LOG_ERR("heap: failed to retain backing block %llu", (unsigned long long)block);
             return NO;
         }
         rdna4hb_lease *found = rdna4hb_find_lease(&_hb, lease);
         if (!found || found->block != block) {
             rdna4hb_handle_close(&_hb, block);
-            RDNA4LOG("heap: backing lease %llu disappeared before bind", (unsigned long long)lease);
+            RDNA4LOG_ERR("heap: backing lease %llu disappeared before bind", (unsigned long long)lease);
             return NO;
         }
         if (!found->dedicated) return YES;
         if (!owner) {
             rdna4hb_handle_close(&_hb, block);
-            RDNA4LOG("heap: dedicated block %llu has no lifecycle owner", (unsigned long long)block);
+            RDNA4LOG_ERR("heap: dedicated block %llu has no lifecycle owner", (unsigned long long)block);
             return NO;
         }
         void *retained = (__bridge_retained void *)owner;
@@ -3509,7 +3509,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
             id released = (__bridge_transfer id)retained;
             (void)released;
             rdna4hb_handle_close(&_hb, block);
-            RDNA4LOG("heap: failed to attach the lifecycle owner to lease %llu", (unsigned long long)lease);
+            RDNA4LOG_ERR("heap: failed to attach the lifecycle owner to lease %llu", (unsigned long long)lease);
             return NO;
         }
         return YES;
@@ -3586,15 +3586,15 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (BOOL)rdna4OptionsOK:(NSUInteger)o what:(const char *)what {
     unsigned st = (unsigned)((o >> 4) & 0xF), cc = (unsigned)(o & 0xF), hz = (unsigned)((o >> 8) & 3);
     if (st != _st || cc != _cc || (hz && hz != _hz)) {
-        RDNA4LOG("heap %s NIL: requested storage %u cache %u hazard %u does not match the heap's %u / %u / %u (Apple's validation layer aborts on this)", what, st, cc, hz, _st, _cc, _hz); return NO; }
+        RDNA4LOG_WARN("heap %s NIL: requested storage %u cache %u hazard %u does not match the heap's %u / %u / %u (Apple's validation layer aborts on this)", what, st, cc, hz, _st, _cc, _hz); return NO; }
     return YES;
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o {
     if (_type != MTLHeapTypeAutomatic) { RDNA4_ONCE("heap newBufferWithLength:options: on a placement heap: nil (use offset:)"); return nil; }
-    if (!len || len > _size || ![self rdna4OptionsOK:o what:"newBufferWithLength:options:"]) { if (!len || len > _size) RDNA4LOG("heap newBufferWithLength: NIL: length %lu (heap %lu)", (unsigned long)len, (unsigned long)_size); return nil; }
+    if (!len || len > _size || ![self rdna4OptionsOK:o what:"newBufferWithLength:options:"]) { if (!len || len > _size) RDNA4LOG_WARN("heap newBufferWithLength: NIL: length %lu (heap %lu)", (unsigned long)len, (unsigned long)_size); return nil; }
     NSError *e = nil; NSUInteger ro = ((NSUInteger)_st << 4) | _cc | ((NSUInteger)_hz << 8);
     RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:_dev length:len options:ro heap:self error:&e];
-    if (!b) { RDNA4LOG("heap newBuffer: failed: %s", e.localizedDescription.UTF8String); return nil; }
+    if (!b) { RDNA4LOG_ERR("heap newBuffer: failed: %s", e.localizedDescription.UTF8String); return nil; }
     [self rdna4TrackResource:b];
     return b;
 }
@@ -3604,7 +3604,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
     MTLTextureDescriptor *c = [td copy]; c.hazardTrackingMode = (MTLHazardTrackingMode)_hz;
     NSError *e = nil; RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:_dev descriptor:c heap:self
                                                                              error:&e];
-    if (!t) { RDNA4LOG("heap newTextureWithDescriptor NIL: pf %lu %lux%lu (%s)", (unsigned long)td.pixelFormat, (unsigned long)td.width, (unsigned long)td.height, e.localizedDescription.UTF8String); return nil; }
+    if (!t) { RDNA4LOG_WARN("heap newTextureWithDescriptor NIL: pf %lu %lux%lu (%s)", (unsigned long)td.pixelFormat, (unsigned long)td.width, (unsigned long)td.height, e.localizedDescription.UTF8String); return nil; }
     [self rdna4TrackResource:t];
     return t;
 }
@@ -3612,12 +3612,12 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (id)newBufferWithLength:(NSUInteger)l options:(MTLResourceOptions)o offset:(NSUInteger)off {
     if (_type != MTLHeapTypePlacement) { RDNA4_ONCE("heap newBufferWithLength:options:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
     if (!l || off >= _size || l > _size - off || ![self rdna4OptionsOK:o what:"newBufferWithLength:options:offset:"]) {
-        if (!l || off >= _size || l > _size - off) RDNA4LOG("placement heap newBuffer: NIL: length %lu offset %lu (heap %lu)", (unsigned long)l, (unsigned long)off, (unsigned long)_size);
+        if (!l || off >= _size || l > _size - off) RDNA4LOG_WARN("placement heap newBuffer: NIL: length %lu offset %lu (heap %lu)", (unsigned long)l, (unsigned long)off, (unsigned long)_size);
         return nil;
     }
     NSError *e = nil; NSUInteger ro = ((NSUInteger)_st << 4) | _cc | ((NSUInteger)_hz << 8);
     RDNA4Buffer *b = [[RDNA4Buffer alloc] initWithDevice:_dev length:l options:ro heap:self offset:off error:&e];
-    if (!b) { RDNA4LOG("placement heap newBuffer: failed: %s", e.localizedDescription.UTF8String); return nil; }
+    if (!b) { RDNA4LOG_ERR("placement heap newBuffer: failed: %s", e.localizedDescription.UTF8String); return nil; }
     [self rdna4TrackResource:b];
     return b;
 }
@@ -3625,12 +3625,12 @@ static uint64_t rdna4_heap_completed_serial(void) {
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off {
     if (_type != MTLHeapTypePlacement) { RDNA4_ONCE("heap newTextureWithDescriptor:offset: on an automatic heap: nil (as an Apple-silicon Mac)"); return nil; }
     if (!d || off >= _size || ![self rdna4OptionsOK:((NSUInteger)d.storageMode << 4) | (NSUInteger)d.cpuCacheMode | ((NSUInteger)d.hazardTrackingMode << 8) what:"newTextureWithDescriptor:offset:"]) {
-        if (!d || off >= _size) RDNA4LOG("placement heap newTexture: NIL: offset %lu (heap %lu)", (unsigned long)off, (unsigned long)_size);
+        if (!d || off >= _size) RDNA4LOG_WARN("placement heap newTexture: NIL: offset %lu (heap %lu)", (unsigned long)off, (unsigned long)_size);
         return nil;
     }
     MTLTextureDescriptor *c = [d copy]; c.hazardTrackingMode = (MTLHazardTrackingMode)_hz;
     NSError *e = nil; RDNA4Texture *t = [[RDNA4Texture alloc] initWithDevice:_dev descriptor:c heap:self offset:off error:&e];
-    if (!t) { RDNA4LOG("placement heap newTexture NIL: pf %lu %lux%lu offset %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)off, e.localizedDescription.UTF8String); return nil; }
+    if (!t) { RDNA4LOG_WARN("placement heap newTexture NIL: pf %lu %lux%lu offset %lu (%s)", (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)off, e.localizedDescription.UTF8String); return nil; }
     [self rdna4TrackResource:t];
     return t;
 }
@@ -3801,7 +3801,7 @@ static void rdna4_sampler_budget_release(RDNA4SamplerStorage *storage) {
             rdna4_argument_limit_snapshot_budget_release_reserved(
                 &RDNA4ALS, &rdna4_sampler_budget_state, &released);
         if (status != RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK || !released)
-            RDNA4LOG("argument sampler budget: reserved release failed (%d)", status);
+            RDNA4LOG_WARN("argument sampler budget: reserved release failed (%d)", status);
     }
     const uint64_t actual = atomic_load(&rdna4_sampler_allocations);
     if (actual) atomic_store(&rdna4_sampler_allocations, actual - 1u);
@@ -3863,10 +3863,10 @@ static void rdna4_sampler_budget_release_configuration(
     if (status == RDNA4_ARGUMENT_PUBLIC_SAMPLER_OK && released)
         storage->argumentReserved = NO;
     else
-        RDNA4LOG("argument sampler budget: configuration release failed (%d, handles %u, reserved %llu/%llu)",
-                 status, storage->handles,
-                 (unsigned long long)rdna4_sampler_budget_state.reserved_actual_objects,
-                 (unsigned long long)rdna4_sampler_budget_state.reserved_objects);
+        RDNA4LOG_WARN("argument sampler budget: configuration release failed (%d, handles %u, reserved %llu/%llu)",
+                      status, storage->handles,
+                      (unsigned long long)rdna4_sampler_budget_state.reserved_actual_objects,
+                      (unsigned long long)rdna4_sampler_budget_state.reserved_objects);
     pthread_mutex_unlock(&rdna4_sampler_budget_lock);
 }
 
@@ -4493,7 +4493,7 @@ RDNA4_DNR(RDNA4ResidencySet)
     rdna4rs_diff_t diff = {0};
     if (!rdna4rs_commit(&_state, &diff)) {
         pthread_mutex_unlock(&_mu);
-        RDNA4LOG("RDNA4ResidencySet %p: commit failed (out of memory); preserving prior snapshot", (__bridge void *)self);
+        RDNA4LOG_ERR("RDNA4ResidencySet %p: commit failed (out of memory); preserving prior snapshot", (__bridge void *)self);
         return;
     }
     for (size_t i = 0; i < diff.added_count; i++) {

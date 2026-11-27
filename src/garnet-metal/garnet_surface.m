@@ -177,7 +177,7 @@ static void rdna4x_release_all_locked(void) { for (int i = 1; i <= 2; i++) rdna4
 static void rdna4x_off_locked(int inst, int reason, const char *why) {
     rdna4xi_t *const x = &RDNA4XI(inst); const rdna4x_desc_t *const d = rdna4x_desc((uint32_t)inst);
     const int rel = rdna4df_fail(&x->sm, reason);
-    RDNA4LOG("scanout (instance %d, %s): FAIL CLOSED / OFF (%s): %s", inst, d ? d->name : "?", rdna4s_reason_name(reason), why);
+    RDNA4LOG_ERR("scanout (instance %d, %s): FAIL CLOSED / OFF (%s): %s", inst, d ? d->name : "?", rdna4s_reason_name(reason), why);
     if (rel) { x->sm.released = 0; rdna4x_do_release_locked(inst); }
 }
 
@@ -205,8 +205,8 @@ static void rdna4s_m6_refresh_locked(void) {
     const int rc = rdna4s_m6_read(&tmp);
     pthread_mutex_lock(&RDNA4S.mu);
     RDNA4S.m6.refreshes++;
-    if (rc == 0) { if (rdna4m6_store(&RDNA4S.m6, &tmp) != 0 && RDNA4S.m6.store_refused <= 3) RDNA4LOG("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, RDNA4S.m6.gen); }   // bundle 13 (R2): never store an older generation over a newer one
-    else { RDNA4S.m6.refresh_fail++; if (RDNA4S.m6.refresh_fail <= 3) RDNA4LOG("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, rdna4_acc_port); }
+    if (rc == 0) { if (rdna4m6_store(&RDNA4S.m6, &tmp) != 0 && RDNA4S.m6.store_refused <= 3) RDNA4LOG_WARN("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, RDNA4S.m6.gen); }   // bundle 13 (R2): never store an older generation over a newer one
+    else { RDNA4S.m6.refresh_fail++; if (RDNA4S.m6.refresh_fail <= 3) RDNA4LOG_WARN("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, rdna4_acc_port); }
 }
 // bundle 12 (queue 290 S3): an unknown ID is refreshed ASYNCHRONOUSLY - the registry read is an IPC, and it must never run (or sleep) on the serial present queue. At most one read is in flight; the result is stored
 // under RDNA4S.mu like every refresh. The completion that asked is not blocked: it is queued again RDNA4M6_RETRY_NS later (rdna4s_complete_run).
@@ -218,8 +218,8 @@ static void rdna4s_m6_refresh_async(void) {
         const int rc = rdna4s_m6_read(&tmp);
         pthread_mutex_lock(&RDNA4S.mu);
         RDNA4S.m6.refreshes++;
-        if (rc == 0) { if (rdna4m6_store(&RDNA4S.m6, &tmp) != 0 && RDNA4S.m6.store_refused <= 3) RDNA4LOG("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, RDNA4S.m6.gen); }   // bundle 13 (R2)
-        else { RDNA4S.m6.refresh_fail++; if (RDNA4S.m6.refresh_fail <= 3) RDNA4LOG("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, rdna4_acc_port); }
+        if (rc == 0) { if (rdna4m6_store(&RDNA4S.m6, &tmp) != 0 && RDNA4S.m6.store_refused <= 3) RDNA4LOG_WARN("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, RDNA4S.m6.gen); }   // bundle 13 (R2)
+        else { RDNA4S.m6.refresh_fail++; if (RDNA4S.m6.refresh_fail <= 3) RDNA4LOG_WARN("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, rdna4_acc_port); }
         pthread_mutex_unlock(&RDNA4S.mu);
         atomic_store(&rdna4s_m6_refreshing, 0);
     });
@@ -261,7 +261,7 @@ static void rdna4s_free_slots(void);
 // Fail closed: disable D-copy for the process and release the plane if it was taken.
 static void rdna4s_off_locked(int reason, const char *why) {
     int rel = rdna4df_fail(&RDNA4S.sm, reason);
-    RDNA4LOG("scanout: FAIL CLOSED / OFF (%s): %s", rdna4s_reason_name(reason), why);
+    RDNA4LOG_ERR("scanout: FAIL CLOSED / OFF (%s): %s", rdna4s_reason_name(reason), why);
     if (!RDNA4S.sm.acquired) rdna4s_free_slots();
     if (rel) rdna4s_do_release_locked();
 }
@@ -367,6 +367,7 @@ GARNET_INTERNAL void rdna4_scan_cc_counters(uint64_t *h, uint64_t *m, uint64_t *
     pthread_mutex_lock(&RDNA4S.mu); *h = RDNA4S.cc.hits; *m = RDNA4S.cc.misses; *mm = RDNA4S.cc.mismatches; pthread_mutex_unlock(&RDNA4S.mu);
 }
 GARNET_INTERNAL BOOL rdna4s_classify(size_t w, size_t h, uint32_t spf, NSUInteger usage, size_t bpr, size_t alloc, unsigned sid, const void *base) {
+    if (!rdna4_is_ws() && !rdna4s_testmode()) return NO;   // only WindowServer (or explicit test mode) owns scanout; avoids non-WS selector-9 refusals
     if (spf != RDNA4S_FOURCC_BGRA || !(usage & MTLTextureUsageRenderTarget) || w < 1024 || h < 600) return NO;   // cheap prefilter: no lock, no log
     BOOL ok = NO;
     pthread_mutex_lock(&RDNA4S.mu);
@@ -407,7 +408,7 @@ static BOOL rdna4s_status_locked(struct rdna4n_scan_status *st) {
 }
 GARNET_INTERNAL _Atomic uint64_t rdna4s_imgcopies;   // P6: display copies recorded from an image source (a display surface with no CPU mapping)
 static void rdna4s_log_counters_locked(const struct rdna4n_scan_status *st) {
-    RDNA4LOG("scanout: counters: presents %llu (kernel presents %llu) latched %llu replaced %llu repeats %llu refused %llu watchdog_restores %llu drops %llu gpu_fail %llu stale_skipped %llu superseded_skipped %llu multi_disp_cbs %llu inflight %d display_surfaces %d hold %s H %d held %llu held_superseded %llu held_presented %llu hold_total_ms %.1f hold_mean_ms %.3f image_source_copies %llu present_busy %llu retry_presented %llu retry_dropped %llu",
+    RDNA4LOG_KEY("scanout: counters: presents %llu (kernel presents %llu) latched %llu replaced %llu repeats %llu refused %llu watchdog_restores %llu drops %llu gpu_fail %llu stale_skipped %llu superseded_skipped %llu multi_disp_cbs %llu inflight %d display_surfaces %d hold %s H %d held %llu held_superseded %llu held_presented %llu hold_total_ms %.1f hold_mean_ms %.3f image_source_copies %llu present_busy %llu retry_presented %llu retry_dropped %llu",
            (unsigned long long)RDNA4S.sm.presents, (unsigned long long)st->presents, (unsigned long long)st->latched, (unsigned long long)st->replaced, (unsigned long long)st->repeats,
            (unsigned long long)st->refused, (unsigned long long)st->watchdog_restores, (unsigned long long)RDNA4S.sm.drops, (unsigned long long)RDNA4S.sm.gpu_fail, (unsigned long long)RDNA4S.sm.stale, (unsigned long long)RDNA4S.sm.superseded, (unsigned long long)atomic_load(&RDNA4S.multi), rdna4df_inflight_count(&RDNA4S.sm), RDNA4S.ndisp,
            rdna4s_hold_mode_name(atomic_load(&RDNA4H.mode)), atomic_load(&RDNA4H.ms), (unsigned long long)RDNA4H.held, (unsigned long long)RDNA4H.held_sup, (unsigned long long)RDNA4H.held_pres, (double)RDNA4H.hold_ns / 1e6, RDNA4H.held ? (double)RDNA4H.hold_ns / 1e6 / (double)RDNA4H.held : 0.0, (unsigned long long)atomic_load(&rdna4s_imgcopies), (unsigned long long)RDNA4S.sm.present_busy, (unsigned long long)RDNA4S.sm.retry_presented, (unsigned long long)RDNA4S.sm.retry_dropped);
@@ -526,7 +527,7 @@ static void rdna4x_recopy_locked(int inst) {
         const int rc = rdna4x_k_present(inst, X->sid[slot], o);
         present_rc = rc;
         if (rc == 0) { X->presents_seen++; shown = 1; }
-        if (rdna4df_present_result(&X->sm, rc)) { RDNA4LOG("scanout (instance %d): FAIL CLOSED / OFF (scanout-error): re-copy present rc %d", inst, rc); rdna4x_do_release_locked(inst); }
+        if (rdna4df_present_result(&X->sm, rc)) { RDNA4LOG_ERR("scanout (instance %d): FAIL CLOSED / OFF (scanout-error): re-copy present rc %d", inst, rc); rdna4x_do_release_locked(inst); }
     } else (void)rdna4df_complete_seq(&X->sm, slot, 1, seq);      // not copied (or stale): the slot is released without a present
     rdna4x_recopy_done(x, ok);
     RDNA4LOG("scanout (instance %d, %s): re-copy of IOSurface %u (a tentative DP-planned frame turned out to be this display's): %s", inst, d->name, sid, shown ? "presented" : present_rc == -EBUSY ? "not shown (scanout busy)" : present_rc ? "FAILED (scanout error)" : ok ? "copied but NOT shown (stale: a newer frame of this display was presented since)" : "FAILED (the next present of this display repaints the whole surface)");
@@ -541,7 +542,7 @@ static void rdna4s_tick(void) {   // 1 s keep-alive (a status call counts as act
         uint64_t now = rdna4_now();
         if (now - RDNA4S.tLog >= 10ull * 1000000000ull) { RDNA4S.tLog = now; rdna4s_log_counters_locked(&RDNA4S.st); rdna4s_class_summary_locked(); rdna4s_dirty_summary_locked(); rdna4s_crc_summary();
             for (int xi = 1; xi <= 2; xi++) { rdna4xi_t *const X = &RDNA4XI(xi); if (X->sm.state != RDNA4DF_ACTIVE) continue;
-                RDNA4LOG("scanout (instance %d, %s): counters: presents %llu (kernel presents %llu latched %llu replaced %llu refused %llu watchdog_restores %llu) drops %llu gpu_fail %llu stale_skipped %llu superseded %llu; planned %llu inst_mismatch %llu inst_geom_mismatch %llu stale_retry %llu stale_drop %llu tentative %llu re-copy noted %llu done %llu failed %llu; status calls %llu (keep-alive %llu); table gen %u (cached %u, refused out-of-order %llu)", xi, rdna4x_descs[xi].name,
+                RDNA4LOG_KEY("scanout (instance %d, %s): counters: presents %llu (kernel presents %llu latched %llu replaced %llu refused %llu watchdog_restores %llu) drops %llu gpu_fail %llu stale_skipped %llu superseded %llu; planned %llu inst_mismatch %llu inst_geom_mismatch %llu stale_retry %llu stale_drop %llu tentative %llu re-copy noted %llu done %llu failed %llu; status calls %llu (keep-alive %llu); table gen %u (cached %u, refused out-of-order %llu)", xi, rdna4x_descs[xi].name,
                 (unsigned long long)X->sm.presents, (unsigned long long)X->st.presents, (unsigned long long)X->st.latched, (unsigned long long)X->st.replaced, (unsigned long long)X->st.refused, (unsigned long long)X->st.watchdog_restores,
                 (unsigned long long)X->sm.drops, (unsigned long long)X->sm.gpu_fail, (unsigned long long)X->sm.stale, (unsigned long long)X->sm.superseded, (unsigned long long)X->plan_count, (unsigned long long)X->xs.inst_mismatch, (unsigned long long)X->xs.inst_geom_mismatch, (unsigned long long)X->xs.stale_retry, (unsigned long long)X->xs.stale_drop,
                 (unsigned long long)X->xs.tentative_frames, (unsigned long long)X->xs.recopy_noted, (unsigned long long)X->xs.recopy_done, (unsigned long long)X->xs.recopy_fail, (unsigned long long)X->xs.status_calls, (unsigned long long)X->xs.keepalive_calls, X->gen, RDNA4S.m6.gen, (unsigned long long)RDNA4S.m6.store_refused);
@@ -622,7 +623,7 @@ GARNET_INTERNAL void rdna4s_prebind_on_radv_open(void) {
                                  RDNA4DF_MAX_SLOTS, (unsigned long long)slotBytes, q.plane_w, q.plane_h, pitch);
                     } else {
                         RDNA4S.slotBytes = 0;
-                        RDNA4LOG("scanout: early slot pre-allocation failed (will retry at acquire): %s", why);
+                        RDNA4LOG_WARN("scanout: early slot pre-allocation failed (will retry at acquire): %s", why);
                     }
                 }
             }
@@ -695,15 +696,15 @@ static int rdna4x_op_pool(void *c) {
     const rdna4x_acq_t *a = c; rdna4xi_t *const X = &RDNA4XI(a->inst); const rdna4x_desc_t *const d = rdna4x_desc((uint32_t)a->inst);
     const rdna4x_pool_t pool = { .free_bytes = a->ao[3], .slot_bytes = d->slot_bytes, .slots = RDNA4DF_MAX_SLOTS, .margin_bytes = RDNA4X_MARGIN_BYTES };   // the kernel's FREE visible-VRAM figure (out[3]) - NOT RADV's heap size (review S4)
     const int pv = rdna4x_pool_verdict(&pool);
-    if (pv != RDNA4X_POOL_OK) { RDNA4LOG("scanout (instance %d, %s): the free visible VRAM (%llu MiB, the kernel's figure) does not cover this display's %u slots + the %llu MiB margin (need %llu MiB: verdict %d)", a->inst, d->name, (unsigned long long)(pool.free_bytes >> 20), RDNA4DF_MAX_SLOTS, (unsigned long long)(RDNA4X_MARGIN_BYTES >> 20), (unsigned long long)(rdna4x_pool_need(&pool) >> 20), pv); X->xs.alloc_fail++; }
+    if (pv != RDNA4X_POOL_OK) { RDNA4LOG_WARN("scanout (instance %d, %s): the free visible VRAM (%llu MiB, the kernel's figure) does not cover this display's %u slots + the %llu MiB margin (need %llu MiB: verdict %d)", a->inst, d->name, (unsigned long long)(pool.free_bytes >> 20), RDNA4DF_MAX_SLOTS, (unsigned long long)(RDNA4X_MARGIN_BYTES >> 20), (unsigned long long)(rdna4x_pool_need(&pool) >> 20), pv); X->xs.alloc_fail++; }
     else RDNA4LOG("scanout (instance %d, %s): free visible VRAM %llu MiB covers this display's %u slots + margin (need %llu MiB)", a->inst, d->name, (unsigned long long)(pool.free_bytes >> 20), RDNA4DF_MAX_SLOTS, (unsigned long long)(rdna4x_pool_need(&pool) >> 20));
     return pv;
 }
-static int rdna4x_op_acquire(void *c) { rdna4x_acq_t *a = c; rdna4xi_t *const X = &RDNA4XI(a->inst); const int rc = rdna4x_k_acquire(a->inst, a->ao, &a->nout); if (rc) { RDNA4LOG("scanout (instance %d): SCANX_ACQUIRE rc %d", a->inst, rc); X->xs.acquire_fail++; } else { X->gen = (uint32_t)a->ao[2]; X->gen_known = 1; } return rc; }
+static int rdna4x_op_acquire(void *c) { rdna4x_acq_t *a = c; rdna4xi_t *const X = &RDNA4XI(a->inst); const int rc = rdna4x_k_acquire(a->inst, a->ao, &a->nout); if (rc) { RDNA4LOG_WARN("scanout (instance %d): SCANX_ACQUIRE rc %d", a->inst, rc); X->xs.acquire_fail++; } else { X->gen = (uint32_t)a->ao[2]; X->gen_known = 1; } return rc; }
 static int rdna4x_op_geom(void *c) {
     const rdna4x_acq_t *a = c; const rdna4x_desc_t *const d = rdna4x_desc((uint32_t)a->inst);
     const int ok = rdna4x_acq_geom_ok(d, a->nout, a->ao[4]);
-    if (!ok) RDNA4LOG("scanout (instance %d, %s): the kernel's plane geometry word 0x%llx (%u output words) is NOT %ux%u pitch %u B: instance OFF", a->inst, d->name, (unsigned long long)a->ao[4], a->nout, d->w, d->h, d->pitch_bytes);
+    if (!ok) RDNA4LOG_WARN("scanout (instance %d, %s): the kernel's plane geometry word 0x%llx (%u output words) is NOT %ux%u pitch %u B: instance OFF", a->inst, d->name, (unsigned long long)a->ao[4], a->nout, d->w, d->h, d->pitch_bytes);
     return ok ? 0 : -1;
 }
 static void rdna4x_op_mark(void *c) { const rdna4x_acq_t *a = c; rdna4df_mark_acquired(&RDNA4XI(a->inst).sm); }
@@ -847,7 +848,7 @@ static void rdna4s_crc_present(const rdna4crc_rec_t *r) {
     pthread_mutex_unlock(&RDNA4C.mu);
     if (chg && atomic_fetch_add(&RDNA4C.logged_p, 1) < 20) {
         uint32_t d[8]; int nd = rdna4crc_diff(&r->a1, &c, d, 8);
-        RDNA4LOG("scanout: CRC MISMATCH src-changed-before-present: seq %llu surface %u slot %d (%s), %d sampled rows differ (step %u), first y: %u %u %u %u", (unsigned long long)r->seq, r->sid, r->slot, later ? "a LATER command buffer for this surface was submitted" : "NO later command buffer: written outside our command buffers", nd, r->step, d[0], nd > 1 ? d[1] : 0, nd > 2 ? d[2] : 0, nd > 3 ? d[3] : 0);
+        RDNA4LOG_ERR("scanout: CRC MISMATCH src-changed-before-present: seq %llu surface %u slot %d (%s), %d sampled rows differ (step %u), first y: %u %u %u %u", (unsigned long long)r->seq, r->sid, r->slot, later ? "a LATER command buffer for this surface was submitted" : "NO later command buffer: written outside our command buffers", nd, r->step, d[0], nd > 1 ? d[1] : 0, nd > 2 ? d[2] : 0, nd > 3 ? d[3] : 0);
     }
 }
 static void rdna4s_crc_free(rdna4crc_rec_t *r) { if (!r) return; if (r->ios) CFRelease(r->ios); free(r); }
@@ -895,7 +896,7 @@ static void rdna4cbl_poll(void) {   // 1 s timer
     if (want && !atomic_load(&RDNA4CB.on) && !RDNA4CB.capped) {
         char path[96]; snprintf(path, sizeof path, "/private/var/tmp/garnet-cblog.%d.txt", (int)getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0) { static int warned; if (!warned) { warned = 1; RDNA4LOG("cblog: cannot open %s: errno %d", path, errno); } }
+        if (fd < 0) { static int warned; if (!warned) { warned = 1; RDNA4LOG_WARN("cblog: cannot open %s: errno %d", path, errno); } }
         else {
             RDNA4CB.fd = fd; RDNA4CB.bytes = 0; RDNA4CB.inv_logged = 0; RDNA4CB.tick = 0; rdna4cb_init(&RDNA4CB.trk); rdna4cba_init(&RDNA4CB.activity);
             rdna4cbl_line_locked("H pid=%d up=%llu wall=%llu cap=%llu fmt=1", (int)getpid(), (unsigned long long)rdna4_now(), (unsigned long long)rdna4cbl_wall(), (unsigned long long)RDNA4_CBLOG_CAP);
@@ -1026,12 +1027,12 @@ static void rdna4s_retry_run(int inst, uint64_t expected) {
         RDNA4LOGR("scanout: retry presented slot %d seq %llu surface %u", slot, (unsigned long long)seq, sid);
     } else if (rc == -EBUSY || rc == -ENODEV) {
         if (release) {
-            RDNA4LOG("scanout: FAIL CLOSED / OFF (retry refusals exhausted; rc %d)", rc);
+            RDNA4LOG_ERR("scanout: FAIL CLOSED / OFF (retry refusals exhausted; rc %d)", rc);
             if (xinst) rdna4x_do_release_locked(inst); else rdna4s_do_release_locked();
         } else if (sm->retry_slot >= 0) rdna4s_retry_schedule(inst);
         else RDNA4LOGR("scanout: retry gave up after %u refusals (slot %d seq %llu surface %u)", RDNA4DF_RETRY_MAX_ATTEMPTS, slot, (unsigned long long)seq, sid);
     } else if (release) {
-        RDNA4LOG("scanout: FAIL CLOSED / OFF (retry present rc %d)", rc);
+        RDNA4LOG_ERR("scanout: FAIL CLOSED / OFF (retry present rc %d)", rc);
         if (xinst) rdna4x_do_release_locked(inst); else rdna4s_do_release_locked();
     }
     pthread_mutex_unlock(&RDNA4S.mu);
@@ -1096,7 +1097,7 @@ static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, ui
             const uint64_t tk0 = rdna4_now();
             int rc = xinst ? rdna4x_k_present(inst, sids[slot], o) : RDNA4S.fp(RDNA4R.dev, sids[slot], o);   // bundle 13/15: the instance's own present
             const uint64_t tk = rdna4_now() - tk0;
-            if (tk > 250000000ull) RDNA4LOG("scanout STALL: the kernel present ioctl took %.1f ms (instance %d slot %d seq %llu rc %d)", (double)tk / 1e6, inst, slot, (unsigned long long)seq, rc);
+            if (tk > 250000000ull) RDNA4LOG_WARN("scanout STALL: the kernel present ioctl took %.1f ms (instance %d slot %d seq %llu rc %d)", (double)tk / 1e6, inst, slot, (unsigned long long)seq, rc);
             rdna4cbl_present(tp0_, rdna4_now(), sid, seq, slot, rc);   // Stage 0b (no-op unless /private/tmp/rdna4m-cblog exists)
             if (rc == 0) {
                 rdna4_capture_present(inst, slot, sid, seq, rc, o[0]);
@@ -1108,7 +1109,7 @@ static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, ui
             if (xinst && rc == 0) { RDNA4XI(inst).presents_seen++; RDNA4XI(inst).xs.recopy_pending = 0; }   // a present of an HDMI display repaints the whole surface: a pending re-copy is moot
             const int retryable = rc == -EBUSY || rc == -ENODEV;
             if (!retryable && rdna4df_present_result(sm, rc)) {
-                RDNA4LOG("scanout: FAIL CLOSED / OFF (scanout-error): scanout_present(slot %d) rc %d", slot, rc);
+                RDNA4LOG_ERR("scanout: FAIL CLOSED / OFF (scanout-error): scanout_present(slot %d) rc %d", slot, rc);
                 if (xinst) rdna4x_do_release_locked(inst); else rdna4s_do_release_locked();   // a failed HDMI present fails THAT instance closed only
             } else if (rc == 0) RDNA4LOGR("scanout: present slot %d seq %llu id %llu target frame %llu vupdates %llu", slot, (unsigned long long)seq, (unsigned long long)o[0], (unsigned long long)o[1], (unsigned long long)o[2]);
             else if (retryable) {
@@ -1242,7 +1243,10 @@ static void rdna4s_late_run(RDNA4LateFrame *frame) {
             if (frame->inst) rdna4x_do_release_locked(frame->inst); else rdna4s_do_release_locked();
         }
         pthread_mutex_unlock(&RDNA4S.mu);
-        RDNA4LOG("scanout: deferred copy unresolved: %s", error.localizedDescription.UTF8String);
+#ifndef RDNA4LOG_ERR
+#define RDNA4LOG_ERR RDNA4LOG
+#endif
+        RDNA4LOG_ERR("scanout: deferred copy unresolved: %s", error.localizedDescription.UTF8String);
         return;   // The slot and source stay retained; never reuse memory the GPU may still write.
     }
     rdna4s_complete_run(frame->inst, slot, ok ? VK_SUCCESS : VK_ERROR_UNKNOWN, frame->seq, frame->sid, NULL, frame->cls, frame->commit, 0);

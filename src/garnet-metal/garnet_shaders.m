@@ -28,7 +28,7 @@ __attribute__((constructor)) static void rdna4_cienv_ctor(void) {
     int r = rdna4ce_apply((rdna4ce_getenv_fn)getenv, setenv);
     if (r == RDNA4CE_SET) RDNA4_ONCE("cienv: set " RDNA4CE_VAR "=" RDNA4CE_VALUE " (Core Image takes its kernel-language parser, not the nil [device compiler])");
     else if (r == RDNA4CE_ALREADY_SET) RDNA4_ONCE("cienv: " RDNA4CE_VAR " is already set in this process (=%s); left alone", getenv(RDNA4CE_VAR));
-    else RDNA4_ONCE("cienv: setenv " RDNA4CE_VAR " failed (errno %d)", errno);
+    else RDNA4_ONCE_WARN("cienv: setenv " RDNA4CE_VAR " failed (errno %d)", errno);
 }
 // 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /tmp/rdna4m/<euid> (0700, a
 // real directory owned by the caller, rdna4g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
@@ -225,7 +225,7 @@ static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
 // Sets up <user cache dir>/org.garnet.xlate/<K> once, after admission (never inside rdna4_spv_dirs' dispatch_once). Caller holds RDNA4XL.mu.
 static void rdna4x_setup_locked(void) {
     uint8_t xl[16], rd[16]; memset(rd, 0, sizeof rd);
-    if (!rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xl)) { RDNA4XL.dirState = -1; RDNA4LOG("inproc: %s is missing or has no LC_UUID: in-process translation is unavailable", RDNA4X_LIB_NAME); return; }
+    if (!rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xl)) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: %s is missing or has no LC_UUID: in-process translation is unavailable", RDNA4X_LIB_NAME); return; }
     const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
     if (rl && rl[0]) { if (!rdna4x_file_uuid(rl, rd)) memset(rd, 0, sizeof rd); }
     else { uuid_t cu; if (_dyld_get_shared_cache_uuid(cu)) memcpy(rd, cu, 16); }   // the reader lives in the dyld shared cache (no file, not loaded yet): the cache's UUID pins it
@@ -238,8 +238,8 @@ static void rdna4x_setup_locked(void) {
     if (tu && tu[0]) snprintf(ucd, sizeof ucd, "%s", tu);
     else { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
     char parent[RDNA4X_PATH_MAX];
-    if (!rdna4x_parent_path(parent, sizeof parent, ucd) || !rdna4x_dir_path(RDNA4XL.dir, sizeof RDNA4XL.dir, ucd, key)) { RDNA4XL.dirState = -1; RDNA4LOG("inproc: no user cache directory: in-process translation is unavailable"); return; }
-    if (rdna4x_prepare_dirs(parent, RDNA4XL.dir, key) != 0) { RDNA4XL.dirState = -1; RDNA4LOG("inproc: cannot use the cache directory %s (not a real directory of ours?): in-process translation is unavailable", RDNA4XL.dir); return; }
+    if (!rdna4x_parent_path(parent, sizeof parent, ucd) || !rdna4x_dir_path(RDNA4XL.dir, sizeof RDNA4XL.dir, ucd, key)) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: no user cache directory: in-process translation is unavailable"); return; }
+    if (rdna4x_prepare_dirs(parent, RDNA4XL.dir, key) != 0) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: cannot use the cache directory %s (not a real directory of ours?): in-process translation is unavailable", RDNA4XL.dir); return; }
     RDNA4XL.dirNS = [NSString stringWithUTF8String:RDNA4XL.dir];
     RDNA4XL.dirState = 1;
     RDNA4LOG("inproc: enabled for %s (%s); cache %s (key %s); reader: the OS's GPUCompiler libLLVM, loaded on the first miss", getprogname(), rdna4_is_ws() ? "WindowServer?!" : rdna4_allow() ? "root test" : "application", RDNA4XL.dir, key);
@@ -1207,7 +1207,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         NSString *cached = rdna4x_cached_refusal(dir, sha);
         if (cached.length) reason = [NSString stringWithFormat:@"the translator refused before: %@", cached];
     }
-    RDNA4LOG("inproc Stage 2 FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, reason.UTF8String);
+    RDNA4LOG_ERR("inproc Stage 2 FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, reason.UTF8String);
     rdna4x_translation_error(error, role, name, sha, rc, reason);
     return NO;
 }
@@ -1282,8 +1282,8 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
     const BOOL firstLog = ![rdna4x_logged containsObject:sha]; if (firstLog) [rdna4x_logged addObject:sha];
     pthread_mutex_unlock(&RDNA4XL.mu);
     if (rc == RDNA4X_OK) RDNA4LOG("inproc OK %s '%s' %s: translated in %.0f ms", role, name.UTF8String, sha.UTF8String, ms);
-    else if (rc == RDNA4X_E_TIMEOUT) RDNA4LOG("inproc TIMEOUT %s '%s' %s: compilation did not finish within %d ms", role, name.UTF8String, sha.UTF8String, waitMs);
-    else if (firstLog) RDNA4LOG("inproc FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, err);
+    else if (rc == RDNA4X_E_TIMEOUT) RDNA4LOG_WARN("inproc TIMEOUT %s '%s' %s: compilation did not finish within %d ms", role, name.UTF8String, sha.UTF8String, waitMs);
+    else if (firstLog) RDNA4LOG_ERR("inproc FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, err);
     if (rc != RDNA4X_OK) {
         NSString *reason = rc == RDNA4X_E_TIMEOUT
             ? [NSString stringWithFormat:@"translation exceeded the %d ms wait deadline", waitMs]
@@ -1652,7 +1652,7 @@ static void rdna4x_linkage_check(id desc, const char *role, const char *linkedPr
                       role, name ? name : "?", (unsigned long)[(NSArray *)rdna4x_prop(linked, "functions") count], rdna4x_names(rdna4x_prop(linked, "functions"), NO).UTF8String, (unsigned long)[(NSArray *)rdna4x_prop(linked, "privateFunctions") count], rdna4x_names(rdna4x_prop(linked, "privateFunctions"), NO).UTF8String,
                       rdna4x_names(gr, YES).length ? rdna4x_names(gr, YES).UTF8String : "-", bf, pl, (ctx && ctx->lsha) ? " -> resolved in process, key " : "", (ctx && ctx->lsha) ? ctx->lsha.UTF8String : "");
     if (ctx) rdna4_lk_install(slot, ctx);
-    if ((!ctx || ctx->linkageError) && first) RDNA4LOG("LINKAGE IGNORED %s '%s': %s%s%s%s is set - linked functions / preloaded libraries are not resolved for this pipeline (%s)", role, name ? name : "?", f ? "linkedFunctions.functions " : "", bf ? "linkedFunctions.binaryFunctions " : "", pf ? "linkedFunctions.privateFunctions " : "", pl ? "preloadedLibraries" : "", why ? why.UTF8String : "unknown");
+    if ((!ctx || ctx->linkageError) && first) RDNA4LOG_WARN("LINKAGE IGNORED %s '%s': %s%s%s%s is set - linked functions / preloaded libraries are not resolved for this pipeline (%s)", role, name ? name : "?", f ? "linkedFunctions.functions " : "", bf ? "linkedFunctions.binaryFunctions " : "", pf ? "linkedFunctions.privateFunctions " : "", pl ? "preloadedLibraries" : "", why ? why.UTF8String : "unknown");
 }
 GARNET_INTERNAL void rdna4x_linkage_render(id d) {
     id vf = rdna4x_prop(d, "vertexFunction"), ff = rdna4x_prop(d, "fragmentFunction");
@@ -2653,8 +2653,8 @@ static void rdna4hs_tick_all(void) {
                 RDNA4LOG("HOT-SWAP %s: fallback -> real (built in %.3f ms)", e->name.UTF8String, ms);
                 rdna4hs_drop(e);
             }
-            else if (e->st.st == RDNA4HS_GAVEUP) { RDNA4LOG("HOT-SWAP %s: GAVE UP after %d failed builds (the fallback stays)", e->name.UTF8String, e->st.attempts); rdna4hs_drop(e); }
-            else RDNA4LOG("HOT-SWAP %s: build failed (attempt %d), will retry", e->name.UTF8String, e->st.attempts);
+            else if (e->st.st == RDNA4HS_GAVEUP) { RDNA4LOG_ERR("HOT-SWAP %s: GAVE UP after %d failed builds (the fallback stays)", e->name.UTF8String, e->st.attempts); rdna4hs_drop(e); }
+            else RDNA4LOG_WARN("HOT-SWAP %s: build failed (attempt %d), will retry", e->name.UTF8String, e->st.attempts);
         }
     }
 }
@@ -4161,18 +4161,18 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
     *hidOut = RDNA4VFT_HANDLE_NULL;
     if (!function) return YES;
     if (![function isKindOfClass:[RDNA4FunctionHandle class]]) {
-        RDNA4LOG("RDNA4VisibleFunctionTable: rejected non-RDNA4FunctionHandle object");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable: rejected non-RDNA4FunctionHandle object");
         return NO;
     }
     RDNA4FunctionHandle *fh = (RDNA4FunctionHandle *)function;
     if ([fh device] != _dev || [fh rdna4OwnerToken] != _ownerToken || [fh rdna4Stage] != _stage) {
-        RDNA4LOG("RDNA4VisibleFunctionTable: rejected handle '%s' from mismatched pipeline/stage/device",
-                 [fh name].UTF8String ?: "?");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable: rejected handle '%s' from mismatched pipeline/stage/device",
+                      [fh name].UTF8String ?: "?");
         return NO;
     }
     uint32_t hid = [fh rdna4HandleId];
     if (hid == RDNA4VFT_HANDLE_NULL || hid > _table.max_handle_id) {
-        RDNA4LOG("RDNA4VisibleFunctionTable: rejected out-of-range handle id %u (max %u)", hid, _table.max_handle_id);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable: rejected out-of-range handle id %u (max %u)", hid, _table.max_handle_id);
         return NO;
     }
     *hidOut = hid;
@@ -4182,8 +4182,8 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 - (void)setFunction:(id<MTLFunctionHandle>)function atIndex:(NSUInteger)index {
     [_lock lock];
     if (index >= _table.slot_count) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setFunction:atIndex:%lu out of bounds (count=%u)",
-                 (unsigned long)index, _table.slot_count);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setFunction:atIndex:%lu out of bounds (count=%u)",
+                      (unsigned long)index, _table.slot_count);
         [_lock unlock];
         return;
     }
@@ -4198,13 +4198,13 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 - (void)setFunctions:(const id<MTLFunctionHandle> __unsafe_unretained *)functions withRange:(NSRange)range {
     if (range.length == 0) return;
     if (!functions) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setFunctions:withRange: NULL array");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setFunctions:withRange: NULL array");
         return;
     }
     [_lock lock];
     if (range.location > _table.slot_count || range.length > _table.slot_count - range.location) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setFunctions:withRange:[%lu,+%lu) out of bounds (count=%u)",
-                 (unsigned long)range.location, (unsigned long)range.length, _table.slot_count);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setFunctions:withRange:[%lu,+%lu) out of bounds (count=%u)",
+                      (unsigned long)range.location, (unsigned long)range.length, _table.slot_count);
         [_lock unlock];
         return;
     }
@@ -4225,11 +4225,11 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
     if (index >= RDNA4VFT_MAX_ATTACH_BUFFERS) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setBuffer:atIndex:%lu out of bounds", (unsigned long)index);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setBuffer:atIndex:%lu out of bounds", (unsigned long)index);
         return;
     }
     if (buffer && (![buffer isKindOfClass:[RDNA4Buffer class]] || [(RDNA4Buffer *)buffer device] != _dev)) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setBuffer: invalid buffer class or device");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setBuffer: invalid buffer class or device");
         return;
     }
     [_lock lock];
@@ -4245,7 +4245,7 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
     if (!buffers || !offsets ||
         range.location > RDNA4VFT_MAX_ATTACH_BUFFERS ||
         range.length > RDNA4VFT_MAX_ATTACH_BUFFERS - range.location) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setBuffers:offsets:withRange: invalid range or NULL array");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setBuffers:offsets:withRange: invalid range or NULL array");
         return;
     }
     for (NSUInteger i = 0; i < range.length; i++)
@@ -4254,19 +4254,19 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
 
 - (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)functionTable atBufferIndex:(NSUInteger)bufferIndex {
     if (bufferIndex >= RDNA4VFT_MAX_NESTED_TABLES) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setVisibleFunctionTable:atBufferIndex:%lu out of bounds",
-                 (unsigned long)bufferIndex);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setVisibleFunctionTable:atBufferIndex:%lu out of bounds",
+                      (unsigned long)bufferIndex);
         return;
     }
     if (functionTable == (id)self) {
-        RDNA4LOG("RDNA4VisibleFunctionTable: rejected cyclic self-attachment at buffer index %lu",
-                 (unsigned long)bufferIndex);
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable: rejected cyclic self-attachment at buffer index %lu",
+                      (unsigned long)bufferIndex);
         return;
     }
     if (functionTable &&
         (![functionTable isKindOfClass:[RDNA4VisibleFunctionTable class]] ||
          [(RDNA4VisibleFunctionTable *)functionTable device] != _dev)) {
-        RDNA4LOG("RDNA4VisibleFunctionTable: rejected invalid nested table class or device");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable: rejected invalid nested table class or device");
         return;
     }
     [_lock lock];
@@ -4280,7 +4280,7 @@ RDNA4_DNR(RDNA4VisibleFunctionTable)
     if (!functionTables ||
         bufferRange.location > RDNA4VFT_MAX_NESTED_TABLES ||
         bufferRange.length > RDNA4VFT_MAX_NESTED_TABLES - bufferRange.location) {
-        RDNA4LOG("RDNA4VisibleFunctionTable setVisibleFunctionTables:withBufferRange: invalid range or NULL array");
+        RDNA4LOG_WARN("RDNA4VisibleFunctionTable setVisibleFunctionTables:withBufferRange: invalid range or NULL array");
         return;
     }
     for (NSUInteger i = 0; i < bufferRange.length; i++)
@@ -4403,7 +4403,7 @@ __attribute__((unused)) GARNET_INTERNAL id<MTLVisibleFunctionTable> rdna4_vft_pi
     NSError *e = nil;
     RDNA4VisibleFunctionTable *tbl = [[RDNA4VisibleFunctionTable alloc]
         initWithDevice:dev ownerToken:ownerToken stage:stage functionCount:count maxHandleId:maxHid error:&e];
-    if (!tbl && e) RDNA4LOG("newVisibleFunctionTableWithDescriptor failed: %s", e.localizedDescription.UTF8String);
+    if (!tbl && e) RDNA4LOG_ERR("newVisibleFunctionTableWithDescriptor failed: %s", e.localizedDescription.UTF8String);
     return (id<MTLVisibleFunctionTable>)tbl;
 }
 
