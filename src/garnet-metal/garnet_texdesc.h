@@ -1,6 +1,6 @@
 // garnet_texdesc.h (bundle 9, app crash study item 2): the pure mapping from a Metal texture descriptor to the Vulkan image, so cube and 2D-array textures can exist.
 // Pure C (no Metal / Vulkan headers: the numeric values are asserted against the real enums in GarnetDevice.m with _Static_assert), host-tested by test-texdesc.c and test-vkimage.c.
-// an internal design note, "App crash study", item (2): VectorKit (Photos, Maps) creates MTLTextureTypeCube textures and aborts on nil.
+// Metal app compatibility: VectorKit (Photos, Maps) creates MTLTextureTypeCube textures and aborts on nil.
 //
 // Rule that binds this file: every descriptor the bundle accepted before build 9 (2D, 1D, 1DArray, 3D) maps EXACTLY as before; test-texdesc.c sweeps a grid against a verbatim copy of the old check.
 #ifndef RDNA4_TEXDESC_H

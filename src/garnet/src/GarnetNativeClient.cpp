@@ -1,5 +1,5 @@
 //
-//  GarnetNativeClient.cpp - see the header. The contract is an internal design note (ABI 1.1 addendum: selectors 9..14, 0.0.603; ABI 1.9: selector 21, the class rename and the uid-88 policy, 0.0.612).
+//  GarnetNativeClient.cpp - see the header. The contract is driver design (ABI 1.1 addendum: selectors 9..14, 0.0.603; ABI 1.9: selector 21, the class rename and the uid-88 policy, 0.0.612).
 //
 #include "GarnetNativeClient.hpp"
 #include "GarnetDriver.hpp"

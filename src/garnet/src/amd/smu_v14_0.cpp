@@ -38,7 +38,7 @@
 //     module is in flight under another owner) and DeviceContext carries
 //     no VRAMBumpAllocator, so the default is a FIXED VRAM slot at
 //     dev.vramBase + 0x0E00000 (64 KB) — in the free gap below fw_buf (+16 MiB) in the
-//     PORTING.md layout, colliding with nothing fixed, but overlapping
+//     VRAM arena layout, colliding with nothing fixed, but overlapping
 //     the first 64 KB of the future bump-allocator arena. Callers that
 //     own an allocator pass their own MC address instead.
 //     MC address = dev.vramMC(dev.vramBase + 0x0E00000), i.e. the same
@@ -86,7 +86,7 @@
 namespace amdgpu {
 
 // ---------------------------------------------------------------------------------------------------------------------
-//  0.0.604 (an internal design note C6): ONE lock for the PPSMC mailbox and the DAL mailbox (smu_dal.cpp), so a
+//  0.0.604 (shared SMU mailbox lock): ONE lock for the PPSMC mailbox and the DAL mailbox (smu_dal.cpp), so a
 //  metrics read, a power-state change, the boot-time init and a DAL experiment step can never interleave. It is RECURSIVE
 //  for its owning thread, so a caller that needs several messages back to back (the user client's doMetrics / doPowerState)
 //  holds it across the whole sequence while each message still takes it itself. If IOLockAlloc fails smu_lock_enter()

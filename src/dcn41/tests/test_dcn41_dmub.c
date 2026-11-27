@@ -120,7 +120,7 @@ static void test_probe(void)
     CHECK(dcn41_dmub_probe(&d, &st) == DCN41_OK && st.verdict == DCN41_DMUB_RING_INSANE, "size 0");
 }
 
-/* Run t1a (notes/APPLE-DRIVER-VERDICT.md section 515): the 27 DMUB registers dcn41_dmub_probe reads, copied verbatim, in
+/* Run t1a (DCN 4.1 DMUB baseline): the 27 DMUB registers dcn41_dmub_probe reads, copied verbatim, in
  * the probe's own order, from notes/logs/runs/t1a/passA.txt ("REG <absolute dword address> <value> <us> dmub/<name>").
  * The GOP left the VBIOS DMUB firmware alive and idle: SCRATCH0 0x82 (dal_fw 0, mailbox_rdy 1, hw_power_init_done 1),
  * WPTR == RPTR == 0x640, inbox in the REGION4 form. */

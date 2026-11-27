@@ -1,5 +1,5 @@
 //
-//  GarnetMetalNub.hpp - the software nub the Aux-KC accelerator kext (GarnetAccel) matches, kext 0.0.610, milestone #9 route A (an internal design note sec. 1).
+//  GarnetMetalNub.hpp - the software nub the Aux-KC accelerator kext (GarnetAccel) matches, kext 0.0.610, milestone #9 route A (driver design sec. 1).
 //
 //  GarnetMetalNub : IOService, attached to GarnetDriver, published ONLY on demand by the native client's selector RDNA4N_SEL_METAL_NUB_PUBLISH (ABI 1.8), and
 //  only with boot-arg garnet-metal=1 on a native boot whose S1b reported POSITIVE PASS, the GPU not HUNG and a Hello'd session. NEVER at boot. It matches

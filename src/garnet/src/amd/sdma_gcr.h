@@ -1,5 +1,5 @@
 // sdma_gcr.h — the SDMA GCR_REQ "graphics cache rinse" packet, and the pure arithmetic and refusal
-// rules 0.0.416 (an internal design note;) drives it with. No kernel headers, no hardware:
+// rules 0.0.416 (driver design) drives it with. No kernel headers, no hardware:
 // the kext (GarnetDriver.cpp, DisplayPipeGuard.cpp), the host test (src/garnet/tests/sdma_gcr_test.cpp) and the
 // native test client (tools/rdna4/native/garnettest.c) compile this same file, so there is no second implementation
 // that could drift from the one that runs.

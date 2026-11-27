@@ -1,5 +1,5 @@
 //
-//  native_open_policy_pure.h - the pure half of the RDNA4N open policy (kext 0.0.612, milestone #11 step 11c; an internal design note sections 3 and 8). No kernel header:
+//  native_open_policy_pure.h - the pure half of the RDNA4N open policy (kext 0.0.612, milestone #11 step 11c; driver contract:
 //  tests/native_ws_open_test.cpp compiles this very file and drives it; IOAccelGarnetNativeClient::initWithTask (GarnetNativeClient.cpp) is the only caller.
 //
 //  The policy. Until 0.0.611 the native client admitted exactly one kind of caller: a task with kIOClientPrivilegeAdministrator (root). From 0.0.612 it ALSO admits a task whose
@@ -94,7 +94,7 @@ constexpr bool selector_allowed(bool admin, uint32_t sel) { return admin || sele
 
 // ---- 0.0.656 (G6): the ROUTE a native client is attached through -------------------------------------------------------------------------------------------------
 // A client is attached either to GarnetDriver (kRouteBringup: the PCI driver, what WindowServer and root tools open, exactly as before) or to the aux kext's GarnetAccelerator (kRouteAccelerator: what a SANDBOXED application
-// opens, because its profile admits user clients on an IOAccelerator service; an internal design note "G6 design"). Admission (initWithTask: allow-list / root / WindowServer identity) is the same on both routes.
+// opens, because its profile admits user clients on an IOAccelerator service; IOAccelerator user-client routing). Admission (initWithTask: allow-list / root / WindowServer identity) is the same on both routes.
 // The accelerator route gets the APP selector set (0, 1, 3..8, 21) ONLY, whatever the client's role: selector 20 (Metal nub withdraw) on a client whose provider is the accelerator would terminate the client's own provider from
 // inside externalMethod, 19 publishes the nub the accelerator hangs under, and ReadRegs / the scanout set belong to the GarnetDriver route.
 enum Route : uint32_t { kRouteBringup = 0, kRouteAccelerator = 1 };

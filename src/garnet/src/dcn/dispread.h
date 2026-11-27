@@ -1,5 +1,5 @@
 //
-//  dispread.h - build 0.0.622 (multi-monitor track, stage M1: READ-ONLY instruments; an internal design note, stage M1 and sections 2 / 5).
+//  dispread.h - build 0.0.622 (multi-monitor track, stage M1: READ-ONLY instruments; DCN read-only telemetry).
 //
 //  The pure half of three accel verbs, shared (one source of truth) by the kext (dcn/dispread_flow.h + the glue at the end of dcn/dcn.cpp), the CLI
 //  (tools/rdna4/native/garnettest.c includes this very file) and the host test (src/garnet/tests/native_dispread_test.cpp). Plain C99 + C++17: no kernel header, no libc beyond stdint.
@@ -459,7 +459,7 @@ static inline void rdna4dr_pack_regs(uint64_t *v, unsigned firstSlot, const uint
 }
 
 // ---- region4read (0.0.624, multi-monitor stage M1.5) --------------------------------------------------------------------------------------------------------------------------------------
-// The DMUB's REGION4 window is the VRAM the firmware's ring and display service live in (an internal design note, "M1 result: the DMUB dialect"): the ring at +0x0..0x2000, the VBIOS ring state
+// The DMUB's REGION4 window is the VRAM the firmware's ring and display service live in (DMUB command dialect): the ring at +0x0..0x2000, the VBIOS ring state
 // +0x3100..0x3124, the mode block +0x4c00.., the four display contexts +0x6000..0x7fff. The verb reads ONLY inside the first 64 KiB of it, at most 64 dwords per call, READ-ONLY.
 // Argument (one scalar): offset | dwords << 32 | page << 40 (offset a 4-byte aligned window offset, dwords 1..64, nothing above bit 47). A call returns 22 dwords per page, so page 0 does the VRAM read
 // (and stores the dwords) and page 1 / 2 return the stored rest, with no VRAM access, exactly as ddcread's page 1 does.
@@ -535,7 +535,7 @@ static const struct rdna4dr_reg rdna4dr_census[RDNA4DR_CENSUS_COUNT] = {
     { "DP_DTO2_PHASE", 1, 0x0089 }, { "DP_DTO2_MODULO", 1, 0x008a }, { "DP_DTO3_PHASE", 1, 0x008d }, { "DP_DTO3_MODULO", 1, 0x008e },
 };
 
-// ---- the M4a pages (0.0.628, multi-monitor stage M4a; an internal design note "M4 design") -------------------------------------------------------------------------------------------
+// ---- the M4a pages (0.0.628, multi-monitor stage M4a; DCN secondary display setup) -------------------------------------------------------------------------------------------
 // READ-ONLY census of the clock and PHY state HDMI bring-up depends on, pages 2..7: the DCCG clock-source registers (PIXEL_RATE_CNTL incl. the OTGn_DIO_ERROR_COUNT field [27:16] of
 // OTGn_PIXEL_RATE_CNTL - there is no separate DIO_ERROR_COUNT register in dcn_4_1_0_offset.h, so the page that reads PIXEL_RATE_CNTL reads it - PHYPLL_PIXEL_RATE_CNTL, OTG_PIXEL_RATE_DIV, DP_DTO0..3 PHASE / MODULO,
 // SYMCLKA..E_CLOCK_ENABLE, PHYA..ESYMCLK_CLOCK_CNTL), DIG0..3 FE / BE (CNTL, CLK_CNTL, FE_EN_CNTL, STREAM_MAPPER_CONTROL) and the whole RDPCSTX1 / RDPCSTX2 PHY blocks (PHY_CNTL0..17, FUSE, SRAM_CNTL, CNTL, CLOCK_CNTL, ...)
@@ -612,7 +612,7 @@ static const struct rdna4dr_reg rdna4dr_census2[RDNA4DR_CENSUS2_COUNT] = {
     { "RDPCSTX2_RDPCSTX_PHY_CNTL16", 2, 0x2b09 }, { "RDPCSTX2_RDPCSTX_PHY_CNTL17", 2, 0x2b0a }, { "RDPCSTX2_RDPCSTX_DEBUG_CONFIG2", 2, 0x2b0b },
     { "RDPCSTX2_RDPCS_CNTL3", 2, 0x2b0c }, { "RDPCSTX2_RDPCS_TX_PLL_UPDATE_ADDR_OVRRD", 2, 0x2b0d }, { "RDPCSTX2_RDPCS_TX_PLL_UPDATE_DATA_OVRRD", 2, 0x2b0e },
 };
-// ---- the M4c pages (0.0.630, multi-monitor stage M4c; an internal design note "M4b analysis" section 3, "Readable substitutes") ---------------------------------------------------------------
+// ---- the M4c pages (0.0.630, multi-monitor stage M4c; readable register substitutes) ---------------------------------------------------------------
 // Pages 8 and 9, READS ONLY: the registers that stand in for the RDPCSTX block (which reads all ones) plus OTG0 / OTG1's clock, status and lock state. Page 8 = entries 0..22, page 9 = entries 23..24.
 // Every offset and BASE_IDX is dcn_4_1_0_offset.h's (checked by tests/native_dispread_test.cpp against re/linux-dc).
 static const struct rdna4dr_reg rdna4dr_census3[RDNA4DR_CENSUS3_COUNT] = {
@@ -629,7 +629,7 @@ static const struct rdna4dr_reg rdna4dr_census3[RDNA4DR_CENSUS3_COUNT] = {
     /* ---- page 9 starts here (index 23) ---- */
     { "OTG0_OTG_UPDATE_LOCK", 2, 0x1b5b }, { "OTG1_OTG_UPDATE_LOCK", 2, 0x1bdb },
 };
-// ---- the M4a plane census (0.0.634, multi-monitor stage M4a; an internal design note "Plane design", M4a) ---------------------------------------------------------------------------------------
+// ---- the M4a plane census (0.0.634, multi-monitor stage M4a; plane register census) ---------------------------------------------------------------------------------------
 // READS ONLY, like every table above (the census environment has no write member). Every name, BASE_IDX and offset is dcn_4_1_0_offset.h's (tests/native_dispread_test.cpp re-reads the header for each entry).
 // Page 10 (rdna4dr_census4) is the DP WATCH: the nine registers of the live DP pipe that `disp2` and `dmubsend` compare before / after (dcn/disp2.h rdna4d2_dpx_regs; the CLI reads this very page).
 static const struct rdna4dr_reg rdna4dr_census4[RDNA4DR_CENSUS4_COUNT] = {
@@ -653,7 +653,7 @@ static const struct rdna4dr_reg rdna4dr_census6[RDNA4DR_CENSUS6_COUNT] = {
     { "HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS", 2, 0x060a },
     { "HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH", 2, 0x060b },
 };
-// ---- the monitor A (instance 1) plane census (0.0.654, an internal design note "monitor A (instance 1) plane + framebuffer spec at 1080p60", part 2 "Census first"; READS ONLY) ----------------------------------------------------
+// ---- the monitor A (instance 1) plane census (0.0.654, monitor A 1080p60 plane layout; READS ONLY) ----------------------------------------------------
 // Pages 44..59 (rdna4dr_census7): the instance-1 twins of census5's pipe-2 rows, found BY NAME in dcn_4_1_0_offset.h (HUBP/HUBPREQ/HUBPRET are pipe 0 + 0xdc, DPP_TOP/CNVC_CFG/DSCL/CM + 0x16b, MPC_OUT1 + 8; the two HUBP*_3DLUT_FL_* registers
 // are the header's exception: BASE_IDX 3, instance stride 1 instead of 0xdc, so the table is built from names, never from arithmetic). Order: the 13 single registers (OTG1 global control 2 / master update lock / VSTARTUP / VUPDATE / VREADY /
 // H and V total and blank, ODM1_OPTC_INPUT_GLOBAL_CONTROL, DIG2_DIG_OUTPUT_CRC_CNTL, DOMAIN1_PG_STATUS, DENTIST_DISPCLK_CNTL), MPC_OUT1 (MUX, DENORM_CONTROL, the two clamps, CSC_MODE), MPCC_OGAM1_MPCC_OGAM_CONTROL, MCM1 SHAPER_CONTROL /

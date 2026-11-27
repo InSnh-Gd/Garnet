@@ -21,7 +21,7 @@ struct AsicInfo;   // ../amd/amdgpu_asic.h
 // GC_MES / GC_MES1 (legacy split MES packaging — superseded here by
 // GC_UNI_MES) and GC_TOC (only loaded for psp_14_0_5, not psp_14_0_3)
 // have a table entry with data=nullptr, size=0. Always check
-// FwBlob::data before use. See PORTING.md and firmware/WHENCE.*.txt.
+// FwBlob::data before use. See BUILDING.md for firmware provenance.
 enum class FwId : uint32_t {
     PSP_SOS,
     PSP_TA,

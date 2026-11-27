@@ -1,4 +1,4 @@
-// garnet_dispflip.h: the pure state machine of the S5.2a D-copy present (an internal design note section 3), no Vulkan, no ObjC, no locking.
+// garnet_dispflip.h: the pure state machine of the S5.2a D-copy present (driver contract
 // The bundle (GarnetDevice.m) keeps ONE rdna4df_t under its scanout mutex and drives it; test-dispflip.c exercises it on the host.
 //
 //   UNBOUND --activate--> ACTIVE --fail--> OFF          (OFF is final for the process: kill switch, missing exports, ENOSYS, fatal scanout errors)
@@ -46,7 +46,7 @@ typedef struct {
     uint8_t made[RDNA4DF_MAX_SLOTS];                   // bundle 20 (F2): bit j = the in-flight frame in this slot added one to sup_n[j]; used only to take it back if this frame fails on the GPU (cleared when the slot is released)
     uint64_t scan_full_refused, surf_untracked;      // bundle 20 (F4): proxy flags refused because scan_id[] was full; submissions that could not be tracked (no slot in flight)
     uint64_t cls[RDNA4DF_NCLS], nonfinal[RDNA4DF_NCLS];  // native #12 P1/P2: command buffers that wrote a display surface, by write class; those skipped as non-final
-    int damage;                                      // native #12 D2: partial-update emulation on (/private/tmp/rdna4m-damage); also lets SkyLight composite passes count as frames
+    int damage;                                      // native #12 D2: partial-update emulation on (/private/tmp/garnet-damage); also lets SkyLight composite passes count as frames
     int head;                                        // slot holding the content of the latest CHAINED frame (-1 none): the base of the next partial frame
     uint64_t chain_id, head_id, last_sub_id; int last_sub_valid;   // chain ids are taken at encode; last_sub_* is the latest SUBMITTED chained frame (validity check under the submit lock)
     uint64_t fid[RDNA4DF_MAX_SLOTS];                   // chain id of the frame that owns the slot (0 = none/full-chain-less)
@@ -58,14 +58,14 @@ typedef struct {
     uint32_t scan_id[RDNA4DF_MAX_SURF]; int nscan;     // native #12 scanout flag: surfaces a final-GPUPass draw has targeted (CoreDisplay's display surfaces); composite writes present only into these
     uint64_t nonscan_skip[RDNA4DF_MAX_SURF]; uint32_t nonscan_sid[RDNA4DF_MAX_SURF]; uint64_t nonscan_total;   // "nonscanout_skipped" by sid (table of 8; overflow counted in the total only)
     uint32_t flag_log[10]; int nflag_log;            // the first 10 flag-set events (sid)
-    int presentall;                                  // kill switch of the final-pass rule (/private/tmp/rdna4m-presentall): present every display write as before
+    int presentall;                                  // kill switch of the final-pass rule (/private/tmp/garnet-presentall): present every display write as before
 } rdna4df_t;
 
 static inline void rdna4df_init(rdna4df_t *s, int killed) {
     memset(s, 0, sizeof *s); s->last = -1; s->head = -1; s->retry_slot = -1; for (int i = 0; i < RDNA4DF_MAX_SLOTS; i++) s->basep[i] = -1;
     if (killed) { s->state = RDNA4DF_OFF; s->reason = RDNA4DF_R_KILL; }
 }
-// Kill-file bypass for the ROOT TEST path only: the L1 kill file /private/tmp/rdna4m-off is ignored by a process that is root, has RDNA4M_ALLOW=1 and
+// Kill-file bypass for the ROOT TEST path only: the L1 kill file /private/tmp/garnet-off is ignored by a process that is root, has RDNA4M_ALLOW=1 and
 // RDNA4M_TEST_IGNORE_KILL=1 and is NOT WindowServer. Every other process (WindowServer included) always honours it.
 static inline int rdna4df_off_file_ignored(int euid, const char *allow, const char *ignore, int is_windowserver) {
     return !is_windowserver && euid == 0 && allow && !strcmp(allow, "1") && ignore && !strcmp(ignore, "1");
@@ -217,8 +217,8 @@ static inline int rdna4df_complete_surf(rdna4df_t *s, int slot, int vkres, uint6
     return rdna4df_complete_seq(s, slot, vkres, seq);
 }
 // native #12 P3 "present hold". Default mode is FINAL (hold RDNA4DF_C_FINAL = CoreDisplay GPUPass up to H ms
-// unless /private/tmp/rdna4m-nohold exists, so a following RENDER_COMP C submitted within H supersedes G cleanly without
-// delaying C). /private/tmp/rdna4m-hold switches to legacy ALL mode with optional content "1".."8" = H ms (else 3 ms).
+// unless /private/tmp/garnet-nohold exists, so a following RENDER_COMP C submitted within H supersedes G cleanly without
+// delaying C). /private/tmp/garnet-hold switches to legacy ALL mode with optional content "1".."8" = H ms (else 3 ms).
 // (the command buffer's commit time + H ms) BEFORE the superseded/stale rules above run, so a later command buffer for the same surface (CoreDisplay's G then C) that was
 // SUBMITTED within H supersedes it by the existing rule (rdna4df_complete_surf: seq vs surf_hi[sid], filled by rdna4df_submit at submission). No second supersede mechanism.
 #define RDNA4DF_HOLD_DEFAULT_MS 3
@@ -310,7 +310,7 @@ static inline int rdna4df_complete_held(rdna4df_t *s, int slot, int vkres, uint6
 }
 // In-order caller (host tests of the plain machine): the next sequence number is implied.
 static inline int rdna4df_complete(rdna4df_t *s, int slot, int vkres) { return rdna4df_complete_seq(s, slot, vkres, s->last_seq + 1); }
-// CoreDisplay's final display pass is the render pass whose FRAGMENT function is GPUPass (any specialisation keeps the function name; an internal design note).
+// CoreDisplay's final display pass is the render pass whose FRAGMENT function is GPUPass (any specialisation keeps the function name; driver design).
 static inline int rdna4df_fn_is_final(const char *fragment_name) { return fragment_name && strstr(fragment_name, "GPUPass") != 0; }
 static inline int rdna4df_class(uint32_t m) {
     if (m & RDNA4DF_W_SHADER_FALLBACK) return RDNA4DF_C_SHADER_FALLBACK;
@@ -408,8 +408,8 @@ static inline void rdna4df_retry_supersede(rdna4df_t *s, uint64_t seq) {
 static inline int rdna4df_inflight_count(const rdna4df_t *s) { int n = 0; for (int i = 0; i < RDNA4DF_MAX_SLOTS; i++) n += s->inflight[i]; return n; }
 
 // ================================================================ native #12 D1 / D2: dirty rectangles and partial-update emulation ================================================================
-// Hypothesis (NATIVE-S5-FLIP.md "Partial-update emulation"): CoreDisplay/SkyLight redraw only a dirty region of a display surface S and rely on the pipe to keep showing the rest
-// from the previous scanout. D1 measures the extents; D2 (switch /private/tmp/rdna4m-damage, default OFF) rebuilds the full frame as  front-slot content + region R of S.
+// Hypothesis (partial-update emulation): CoreDisplay/SkyLight redraw only a dirty region of a display surface S and rely on the pipe to keep showing the rest
+// from the previous scanout. D1 measures the extents; D2 (switch /private/tmp/garnet-damage, default OFF) rebuilds the full frame as  front-slot content + region R of S.
 typedef struct { int32_t x0, y0, x1, y1; } rdna4df_rect_t;     // half-open pixel rectangle, y down (row 0 = top); empty when x1 <= x0 or y1 <= y0
 static inline int rdna4df_rect_empty(rdna4df_rect_t r) { return r.x1 <= r.x0 || r.y1 <= r.y0; }
 static inline rdna4df_rect_t rdna4df_rect_make(int64_t x0, int64_t y0, int64_t x1, int64_t y1) {   // saturating narrowing so absurd client values cannot wrap

@@ -25,7 +25,7 @@
 //  Deviations from the reference
 //  ==================================================================
 //   1. DriverKit IOBufferMemoryDescriptor + IODMACommand → amdgpu::SysMem
-//      (PORTING.md). There is no IOMMU on this platform, so SysMem.bus
+//      (kext constraint). There is no IOMMU on this platform, so SysMem.bus
 //      is the HOST PHYSICAL address, which is not a GPU address: each
 //      MES buffer is additionally bound into the GART with
 //      gmc_bind_existing() and `MESInstance::*_bus` holds the returned
@@ -73,7 +73,7 @@
 //      kicks and fence polls. The reference relied on `volatile` alone.
 //   9. mes_release_storage() added — the dext never freed these buffers.
 //  10. Logging: every programmed address and every touched register is
-//      logged with its before/after value (PORTING.md rule 6). No
+//      logged with its before/after value (for hardware trace logging). No
 //      %{public}s; uint64_t values are cast to unsigned long long.
 //
 //  11. ADDRESSING. The reference addressed every GC register in this file

@@ -160,7 +160,7 @@ GARNET_INTERNAL const char *garnet_getenv(const char *newName, const char *legac
 // #12 R5: per-command-buffer / per-encoder lines are rate limited per call site: the first 8, then every 1024th (errors and WARN lines stay RDNA4LOG).
 
 // ---------------------------------------------------------------------------------------------------------------
-// Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
+// Load policy (load policy L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
 // tool that opts in with GARNET_ALLOW=1 (or legacy RDNA4M_ALLOW=1), or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
 // successful RDNA4N open + QueryInfo, never by name; garnet_gate.h) may get a device. All test hooks are honoured only with GARNET_ALLOW=1 as root.
 // Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see garnet_gate.h.
@@ -1143,7 +1143,7 @@ rdna4_argument_limit_result rdna4_argument_limit_snapshot_source_matches_path(
 #endif
 #if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Lazy in-process RADV (NATIVE-S4-M10 route a', F5). Opened on the first resource/queue request, NEVER in
+// Lazy in-process RADV (lazy RADV initialization). Opened on the first resource/queue request, NEVER in
 // initWithAcceleratorPort: (every Metal-enumerating process loads this bundle). RDNA4N is root-only and exclusive:
 // a refusal (non-root, second client) becomes nil + NSError, never an abort.
 // ---------------------------------------------------------------------------------------------------------------
@@ -2224,10 +2224,10 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         r = vkCreateCommandPool(RDNA4R.dev, &opc, NULL, &RDNA4R.opool);   // one-shot uploads (replaceRegion, getBytes)
         if (r != VK_SUCCESS) { RDNA4R.err = rdna4_err(8, [NSString stringWithFormat:@"vkCreateCommandPool(one-shot) = %d", r]); goto fail; }
         rdna4_pc_open(&pp);
-        rdna4_pool_latch();   // P1: reads /private/tmp/rdna4m-pool ONCE
-        rdna4_imp_latch();    // P4: reads the kill file /private/tmp/rdna4m-noimpcache ONCE (build 16: the cache is ON by default)
+        rdna4_pool_latch();   // P1: reads /private/tmp/garnet-pool ONCE
+        rdna4_imp_latch();    // P4: reads the kill file /private/tmp/garnet-noimpcache ONCE (build 16: the cache is ON by default)
         rdna4_vs_latch();     // Phase B: WindowServer OPTIMAL VRAM surface cache (kill file /private/tmp/garnet-no-vram-surf)
-        rdna4_drawopt_latch();   // P5b: reads /private/tmp/rdna4m-drawopt ONCE
+        rdna4_drawopt_latch();   // P5b: reads /private/tmp/garnet-drawopt ONCE
         RDNA4R.ok = YES;
         rdna4dc_heap heaps[VK_MAX_MEMORY_HEAPS] = {0};
         uint32_t heapCount = MIN(RDNA4R.mp.memoryHeapCount, VK_MAX_MEMORY_HEAPS);

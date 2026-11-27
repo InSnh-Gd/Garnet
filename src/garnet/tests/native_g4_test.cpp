@@ -1,4 +1,4 @@
-// native_g4_test.cpp - kext 0.0.640, review fixes 0.0.641 (GPU-apps stage G4: ordinary user applications as a third client role; an internal design note section 4 and the G1 / G2 reviews): the pure half
+// native_g4_test.cpp - kext 0.0.640, review fixes 0.0.641 (GPU-apps stage G4: ordinary user applications as a third client role; sandbox/app load policy): the pure half
 // (amd/garnet_app_policy_pure.h, amd/native_open_policy_pure.h, GarnetAppKey.h) driven directly and through small models, plus source pins that tie the REAL kernel code
 // (amd/native_s1c.cpp, GarnetNativeClient.cpp / .hpp, GarnetDriver.cpp, GarnetUserClient.cpp, GarnetNativeABI.h, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \

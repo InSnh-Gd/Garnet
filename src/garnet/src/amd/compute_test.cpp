@@ -107,7 +107,7 @@ extern const uint8_t fw_shader_store_magic[];
 extern const size_t  fw_shader_store_magic_size;
 // The same kernel produced by LLVM from shaders/llvm/lean.ll instead of by hand,
 // so it uses the standard HSA kernarg convention. Built by
-// tools/build-shader.sh store_magic_hsa. See notes/B1-COMPILER-BRIDGE.md.
+// tools/build-shader.sh store_magic_hsa. Built via src/garnet/tools/build-shader.sh.
 extern const uint8_t fw_shader_store_magic_hsa[];
 extern const size_t  fw_shader_store_magic_hsa_size;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Translate dumped AIR (mtlprobe dumpair <dir>, or /tmp/rdna4m/<sha>.air) into spvcache/<sha>.spv + <sha>.meta.json (native #11 step 11e).
+"""Translate dumped AIR (mtlprobe dumpair <dir>, or /private/tmp/garnet-xlate/<sha>.air) into spvcache/<sha>.spv + <sha>.meta.json (native #11 step 11e).
 
 usage: add-air.py <air dir or files...> [--local NAME=X,Y,Z ...]
 The key is the sha256 of the file content (= sha256 of -[MTLFunction bitcodeData], measured equal for 275/275 functions).

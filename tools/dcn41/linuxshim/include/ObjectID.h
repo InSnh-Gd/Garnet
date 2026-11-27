@@ -1,7 +1,7 @@
 /* linuxshim: amd/include/ObjectID.h is NOT in the sparse clone.
  * PLACEHOLDER VALUES, NOT AMD'S: distinct numbers so command_table_helper2.c compiles and its translations stay
  * distinguishable. The DMUB harness only compares how a translated value is PACKED, so these numbers never become
- * evidence; the real ENCODER_OBJECT_ID_* values are not established on the host Mac (notes/DISPLAY-DESIGN.md). */
+ * evidence; the real ENCODER_OBJECT_ID_* values are not established on the host Mac (the DCN 4.1 display register tables). */
 #ifndef DCN41_SHIM_OBJECTID_H
 #define DCN41_SHIM_OBJECTID_H
 #define ENCODER_OBJECT_ID_NONE 0xA0

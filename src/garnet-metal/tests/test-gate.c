@@ -397,7 +397,7 @@ int main(int argc, char **argv) {
       free(cp);
       free(rp);
       free(gm); }
-    // ---- G16 (Release 1 Task 3.3): dual-key denylist & sandbox fallback ----
+    // ---- G16: dual-key denylist & sandbox fallback ----
     CHECK("G16: denylist applies only to class OTHER (WindowServer & RDNA4M_ALLOW=1 root immune)",
           !rdna4g_denylist_applies(RDNA4G_CLASS_WS) && !rdna4g_denylist_applies(RDNA4G_CLASS_ROOT) && rdna4g_denylist_applies(RDNA4G_CLASS_OTHER));
     CHECK("G16: sandbox fallback covers ENOENT/ENOTDIR/EPERM/EACCES",

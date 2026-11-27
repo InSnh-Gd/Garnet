@@ -719,7 +719,7 @@ uint32_t rdna4_vram_apple_dest_check(uint64_t off, uint64_t len) {
 #include "amd/sdma_dcc.h"
 
 // =====================================================================================================
-// 0.0.417 (an internal design note, D1) — action 82 `sdmadcc [0|1|2]`.
+// 0.0.417 (SDMA probe/DCC control) — action 82 `sdmadcc [0|1|2]`.
 //
 // SDMA0_DCC_CNTL (GC BASE_IDX 0, offset 0x0034) turns on no-PTE read DECOMPRESSION and write COMPRESSION for
 // our SDMA0 QUEUE0 (VMID 0, FB aperture passed through —), which is why a uniform block reads back as a
@@ -805,7 +805,7 @@ done:
 }
 
 // =====================================================================================================
-// E1 (0.0.418, an internal design note) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
+// E1 (0.0.418, driver design) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
 //
 // THE SITE, cited: SDMA0's QUEUE0 ring is up when `sdma_init_full` returns in the ladder's SDMAInit stage
 // (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case). 0.0.657 (GitHub issue #1, fixed on the public repo in

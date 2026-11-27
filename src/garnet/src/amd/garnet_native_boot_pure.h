@@ -173,7 +173,7 @@ static_assert(va_canonicalize(va_strip(kVaHighBase)) == kVaHighBase, "strip and 
 static_assert(idx_pdb2(kVaUnmapped) == 0 && idx_pdb1(kVaUnmapped) == 8 && va_in_context(kVaUnmapped), "the unmapped VA is inside the context");
 
 // ---- the gate ---------------------------------------------------------------------------------------------------------------
-// The boot-args that must NOT be armed together with rdna4-native=1 (NATIVE-S1.md review MUST-FIX 4): the Apple accelerator
+// The boot-args that must NOT be armed together with rdna4-native=1 (mutually exclusive boot-args): the Apple accelerator
 // experiment, the boot chain, the four self-tests (vmfrag rewrites CONTEXT1 with RETRY = 1) and the two hooks that only exist for
 // Apple's driver.
 struct GateArgs {

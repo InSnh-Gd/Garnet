@@ -94,7 +94,7 @@
 //
 //  6. Logging. Every control-register write goes through a local helper
 //     that logs `before -> written -> readback` with the absolute dword
-//     address (task requirement; PORTING.md rule 6). This adds one MMIO
+//     address (for hardware trace readability). This adds one MMIO
 //     read before and one after each write — CP config registers only, no
 //     side effects. All ring / MQD / WB addresses (bus, MC and CPU) are
 //     logged. cp_compute_enable additionally reads CP_MEC_RS64_CNTL at
@@ -189,7 +189,7 @@ namespace amdgpu {
 //============================================================
 
 // Write a register and log before / written / readback with the absolute
-// dword address. PORTING.md rule 6 + the task's "before/after of each
+// dword address. Hardware trace logging requires before/after of each
 // control register" requirement. Not in the reference.
 static inline void
 cp_wreg_logged(const DeviceContext &dev, const char *name,

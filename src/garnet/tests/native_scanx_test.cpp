@@ -5,7 +5,7 @@
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/dcn -I src/garnet/src/amd \
 //       src/garnet/tests/native_scanx_test.cpp -o /tmp/native_scanx && /tmp/native_scanx .     (run from the repo root; the argument is the repo root the source pins read from;
 //   tests/native_scanx_plant.sh plants breaks and shows every check that catches them)
-// Covers (contract item numbers are the "Q2: Stage 1b build contract" and the "Stage 2 build contract (monitor A, instance 1)" of an internal design note):
+// Covers (contract item numbers are the multi-display scanout contract):
 //   X1  the registers (re-derived from the HUBP0 twin + n * 0xdc through the disp2 mirror table), the write allowlist (exactly this instance's two address registers), the slot tag            [per instance]
 //   X2  Acquire: every precondition refuses with NOTHING written; the success path; the latch-OFF gate reads and writes nothing, takes no lock                                                [per instance]
 //   X3  Register: tagged ids, B / A / DP / other-display overlaps, bounds, full table                                                                                                         [per instance]

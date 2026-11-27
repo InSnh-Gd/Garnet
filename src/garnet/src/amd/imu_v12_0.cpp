@@ -40,7 +40,7 @@
 //     reference never performs.
 //
 //  3. Added a log of the gate's inputs on the success path so the
-//     stage is visible in the hardware log (PORTING.md rule 6).
+//     stage is visible in the hardware log (for hardware trace logging).
 //  =====================================================================
 //
 

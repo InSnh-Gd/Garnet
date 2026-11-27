@@ -16,7 +16,7 @@ LEAVES = [
     ('GarnetSharedUserClient', 'IOAccelSharedUserClient2', []),
     ('GarnetCommandQueue',  'IOAccelCommandQueue',      []),
     ('GarnetDisplayPipe',   'IOAccelDisplayPipe',       [277]),            # aux 0.0.3: performTransaction, hand-written (its generated declaration is a placeholder)
-    # aux 0.0.4 (M5, an internal design note "M5 build spec" section 2): the monitor B framebuffer. IOFramebuffer (IOGraphicsFamily, 350 slots, size 0x1d0, 8 pure: 309 and 312-318) is the SDK's class; the slots the leaf overrides besides
+    # aux 0.0.4 (M5, GarnetFramebuffer): the monitor B framebuffer. IOFramebuffer (IOGraphicsFamily, 350 slots, size 0x1d0, 8 pure: 309 and 312-318) is the SDK's class; the slots the leaf overrides besides
     # the OSDefine three and the pure ones: 184 start, 310 getVRAMRange, 311 enableController, 319 setDisplayMode, 322 getStartupDisplayMode, 325 / 326 set / getAttribute, 330 getConnectionCount, 331 / 332 set / getAttributeForConnection,
     # 344 hasDDCConnect, 345 getDDCBlock. Everything else (305 isConsoleDevice, 346-348 the interrupts, ...) is the family's own. The whole vtable (slots 0-349, so 305-348 included) is gated.
     ('GarnetFramebuffer',   'IOFramebuffer',            FB_EXTRA),

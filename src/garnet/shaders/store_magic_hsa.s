@@ -20,7 +20,7 @@
 //
 //  That is the standard convention every real driver implements and the only
 //  one that generalises past a single argument, so the dispatch side is what
-//  changes, not the compiler. See notes/B1-COMPILER-BRIDGE.md.
+//  changes, not the compiler. Built via src/garnet/tools/build-shader.sh.
 // ---------------------------------------------------------------------------
 	.amdgcn_target "amdgcn-amd-amdhsa-unknown-gfx1201"
 	.amdhsa_code_object_version 6

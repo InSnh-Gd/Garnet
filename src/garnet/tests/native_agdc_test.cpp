@@ -1,4 +1,4 @@
-// native_agdc_test.cpp - build 0.0.614 (#11 step 11h.3, an internal design note section 2 row 2 and section 3.5): the NATIVE AGDC service (`pipeagdc`, accel action 88).
+// native_agdc_test.cpp - build 0.0.614 (#11 step 11h.3, native AGDC service): the NATIVE AGDC service (`pipeagdc`, accel action 88).
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/amd \
 //       src/garnet/tests/native_agdc_test.cpp -o /tmp/native_agdc && /tmp/native_agdc .
 //   (run from the tree root; the argument is that root, for the source pins. tests/native_agdc_plant.sh plants breaks in the real headers and glue and demands a failure.)

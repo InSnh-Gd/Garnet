@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""txn-correlate.py - Stage 0c of an internal design note: merge the DTrace transaction log (retired tools/pc/txnlog.d) with the bundle's command-buffer log
-(/private/var/tmp/rdna4m-cblog.<pid>.txt) and print the inversion count, the transacted-vs-presented IOSurface id comparison, and the decision of the memo's table.
+"""txn-correlate.py - Stage 0c of driver design: merge the DTrace transaction log (retired tools/pc/txnlog.d) with the bundle's command-buffer log
+(/private/var/tmp/garnet-cblog.<pid>.txt) and print the inversion count and the transacted-vs-presented IOSurface id comparison.
 
-    txn-correlate.py txnlog.txt rdna4m-cblog.<pid>.txt [more cblog files] [--match-ms 100] [--inv-min 1] [--mismatch-frac 0.01] [--shift-ms 0] [--first 20]
+    txn-correlate.py txnlog.txt garnet-cblog.<pid>.txt [more cblog files] [--match-ms 100] [--inv-min 1] [--mismatch-frac 0.01] [--shift-ms 0] [--first 20]
     txn-correlate.py --selftest        (synthetic data for the three decision rows; exits non-zero if any decision is wrong)
 
 Clock: both logs carry CLOCK_REALTIME (DTrace `wall=`; the bundle's `K up= wall=` pairs, one per second). Bundle uptime stamps are converted to wall time by
@@ -180,7 +180,7 @@ def analyse(tx, s12, cb, a):
     pr('transaction shapes (options, dirty mask, plane-1 present): ' + ', '.join('%s x%d' % (('opt=%#x mask=%#x p1=%s' % k), n) for k, n in other.most_common(6)))
 
     # ---- decision
-    pr('\n== 3. decision (NATIVE-S5-TXN.md section 2 table) ==')
+    pr('\n== 3. decision ==')
     mism = (un_t + un_p + swaps) / max(len(T) + len(Pn), 1)
     inv_bad = inv_n >= a.inv_min
     seq_bad = bool(never_p or never_t) or mism > a.mismatch_frac

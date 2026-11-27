@@ -1,4 +1,4 @@
-// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, an internal design note sections 3, 7, 8): W1 the class rename, W2 the open policy (uid 88 behind
+// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, driver contract: W1 the class rename, W2 the open policy (uid 88 behind
 // garnet-metal-ws=1), W3 the "Garnet,Ready" property and where the HUNG latch writes it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_ws_open_test.cpp -o /tmp/native_ws_open && /tmp/native_ws_open .

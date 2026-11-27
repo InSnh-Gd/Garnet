@@ -3,7 +3,7 @@
  * channel, the inbox1 command ring, and byte-exact builders for the VBIOS-service commands that enable an output.
  *
  * NOT WIRED INTO ANY BUILD YET. Same rules as dcn41.h: C11/C++17, no heap, no floating point, every register from
- * dcn41_regs.h. The design and the evidence for every choice are in notes/DISPLAY-DESIGN.md (DMUB sections).
+ * dcn41_regs.h. DMUB register layout and probing rules.
  *
  * Linux references (238650ef6c7c, MIT):
  *   ABI and ring        display/dmub/inc/dmub_cmd.h (struct dmub_cmd_header, union dmub_rb_cmd, dmub_rb_*),

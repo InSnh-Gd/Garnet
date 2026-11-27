@@ -116,7 +116,7 @@ static int cmd_reg(const char *arg) {
     return 0;
 }
 
-// `regs` — the T1 census reader (notes/DISPLAY-DESIGN.md section 6).
+// `regs` — the T1 census reader (DCN 4.1 register census).
 //
 // Same selector as `reg`, but ONE process and ONE user-client connection for the
 // whole list, read from stdin as `<abs_dword_hex> [label]` lines (# comments and
@@ -1700,7 +1700,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "gfxmap")) in = 36;
     else if (what && !strcmp(what, "gfxstate")) in = 37;
     // 38/39 — 0.0.185, the SDMA counterpart of gfxmap (design memo
-    // notes/re/sdma-takeover-design.md, recorded as an earlier analysis). `sdmamap`
+    // SDMA takeover verification). `sdmamap`
     // puts APPLE'S SDMA ring (chan id 14, the (queue 10, inst 1) ring at
     // 0x8400220000) onto OUR SDMA0 QUEUE1 at doorbell dword index 0x202 by direct
     // register programming - no MES, no MQD - after PTE-checking every page of
@@ -1796,8 +1796,8 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     // SURFACE_EARLIEST_INUSE: the console A or flip mode's B) into the kext by SDMA, then this tool pulls it and writes a 256-byte
     // header + the raw surface to [file] (default ./scanout-full-<n>-<time>.rdna4scan; never over an existing file) and frees it
     // (`scanout 10`). READ-ONLY toward the display; decode with tools/runkit/scanout2png.py.
-    // an internal design note; 7 is 0.0.416, an internal design note; 8 is 0.0.417,
-    // an internal design note D7 - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
+    // driver design; 7 is 0.0.416, driver design; 8 is 0.0.417,
+    // SDMA probe/DCC control - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
     // 6 (0.0.414, section 950) is the FULL-GEOMETRY SDMA self-test: one call, the 256x256 section 719 control then
     // the live 1920x1080 ADDR3 64KB_2D geometry, on our own three scratch VRAM buffers. 7 (0.0.416, section 953) is
     // the SDMA CACHE-RINSE instrument: `scanout 7 <vramOff>` copies a 256 KiB plane window linearly into our scratch
@@ -1846,7 +1846,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "ucprobe")) in = 81;
     else if (what && !strcmp(what, "fbbench")) in = 68;
     else if (what && !strcmp(what, "fbwc")) in = 69;
-    // 82 - 0.0.417 (an internal design note, D1; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
+    // 82 - 0.0.417 (SDMA probe/DCC control; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
     // no-PTE read-decompression / write-compression switch. 0 READ SDMA0_DCC_CNTL (GC[0]+0x34) and
     // SDMA1_DCC_CNTL (GC[0]+0x634) raw and decoded per set; 1 CAPTURE SDMA0's value on first use, write
     // captured & ~0x00015554 (only the eight *_COMP_EN_n bits), read back and report; 2 RESTORE the captured
@@ -1916,7 +1916,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     //     killall -9 WindowServer            (within 15 s; no `pipearm 1` dance and no 120 s spacing needed)
     //     garnettest accel pipereload 1      (optional: the window should read closed, "closed by slot 267" 1)
     else if (what && !strcmp(what, "pipereload")) in = 90;
-    // 91..93 - 0.0.622 (multi-monitor stage M1, an internal design note): the display instruments. All need boot-arg garnet-metal-disp=1 (admitted past 82 only then).
+    // 91..93 - 0.0.622 (multi-monitor stage M1, driver design): the display instruments. All need boot-arg garnet-metal-disp=1 (admitted past 82 only then).
     //     ddcread <line 2|3> <block 0..3> : an EDID block over the HDMI DDC line with the DC_I2C engine (writes only that engine's registers, after the arbitration read says it is free)
     //     dmubring [0|1..25|0x80]          : READ-ONLY DMUB state and ring decode (the ring is beyond the BAR0 aperture on this card: reported, not read)
     //     dispcensus [0|1|2..9]            : READ-ONLY census of power gates, DIG, OTG, DCCG / PHY PLL and hot-plug registers
@@ -1939,7 +1939,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "dmubctx")) in = 97;
     // 98 - 0.0.631 (stage M4d): disp2 timing|connect|off|status - the OTG1 -> DIG2 test pattern. Needs boot-arg garnet-metal-disp=1 AND garnet-disp2=1. `accel disp2` alone prints the run script.
     else if (what && !strcmp(what, "disp2")) in = 98;
-    // 100..102 - 0.0.623 (GPU-apps G1, an internal design note section 4): hang recovery. They exist ONLY when the PC booted with boot-arg garnet-g1=1 (else
+    // 100..102 - 0.0.623 (GPU-apps G1, driver contract: hang recovery. They exist ONLY when the PC booted with boot-arg garnet-g1=1 (else
     // 0xe00002c2). Root only (this client). Run with WindowServer on the CPU renderer: hangtest refuses while ANY native session is open (a WindowServer one by name).
     //   hangtest [1]        a kernel-owned VMID-8 test context submits ONE IB that never retires (WAIT_REG_MEM on a dword nobody writes); after 2 s HUNG is latched
     //   hangrecover <0..4>  0 auto (mesreset then remap), 1 release (the CPU writes the awaited value: harness control), 2 mesreset (MES RESET legacy GFX queue),
@@ -1949,10 +1949,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "hangtest")) in = 100;
     else if (what && !strcmp(what, "hangrecover")) in = 101;
     else if (what && !strcmp(what, "hangstat")) in = 102;
-    // 103 - 0.0.627 (GPU-apps G2, an internal design note section 4): `sessstat [0..9]`, READ-ONLY. Exists ONLY when the PC booted with boot-arg
+    // 103 - 0.0.627 (GPU-apps G2, driver contract: `sessstat [0..9]`, READ-ONLY. Exists ONLY when the PC booted with boot-arg
     // garnet-multisession=1 (else 0xe00002c2). Pages 0..7: native session slots 0..7 (VMID 8..15); page 8 (the default): global; page 9: G5 stats.
     else if (what && !strcmp(what, "sessstat")) in = 103;
-    // 104 - 0.0.640 (GPU-apps G4, an internal design note section 4): `appallow add <name>|remove <name>|list`, the kernel's allow-list of user applications that may open a native
+    // 104 - 0.0.640 (GPU-apps G4, driver contract: `appallow add <name>|remove <name>|list`, the kernel's allow-list of user applications that may open a native
     // GPU session (name = the executable's base name, the first 16 characters; see GarnetAppKey.h for what that is worth). Touches no hardware. Exists ONLY when the PC booted with BOTH
     // boot-args garnet-apps=1 and garnet-multisession=1 (else 0xe00002c2). The list is empty at every boot and holds 32 entries; this verb is the only way to change it.
     else if (what && !strcmp(what, "appallow")) in = 104;
@@ -2083,7 +2083,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     if (in == 100 && !arg) in2[1] = 1;
     if (in == 103 && !arg) in2[1] = 8;   // 0.0.627 (G2): sessstat defaults to the global page
     if (in == 101 && !arg) { fprintf(stderr, "accel hangrecover: give the method: 0 auto, 1 release, 2 mesreset, 3 remap, 4 abandon (read the state with `accel hangstat`)\n"); return 2; }
-    // 0.0.416 (an internal design note, G2): mode 7 carries its source VRAM offset as a SECOND CLI token
+    // 0.0.416 (SDMA GCR cache-rinse): mode 7 carries its source VRAM offset as a SECOND CLI token
     // (`accel scanout 7 <vramOff> [gcr]`) and packs it into the ONE ABI scalar with the mode and the GCR flag
     // (sdma_gcr.h). All other verbs ignore arg2/arg3.
     // build 0.0.542: `accel scanout full [file]` is mode 9 (the optional file is written by scanfull_pull below).
@@ -2736,7 +2736,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
                                      "source control FAILED", "PRE-FLIGHT copy FAILED", "FENCE timeout", "READBACK mismatch",
                                      "plan refused", "interlock: positive control not passed", "ring write failed",
                                      "nothing saved to restore", "buffer unresolved", "backing unprepared or short",
-                                     /* 0.0.416 mode 7 (an internal design note G2) */
+                                     /* 0.0.416 mode 7 (SDMA GCR cache-rinse) */
                                      "mode 7 source not 4 KiB aligned", "mode 7 source outside the card's VRAM",
                                      "mode 7 source overlaps one of our own allocations",
                                      /* 0.0.518 / 0.0.542 */
@@ -2797,7 +2797,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 6) {
-            /* 0.0.414 (an internal design note, section 950): the FULL-GEOMETRY SDMA self-test.
+            /* 0.0.414 (driver design, section 950): the FULL-GEOMETRY SDMA self-test.
                One call, two cases in order: the 256x256 section 719 control, then the live 1920x1080 geometry.
                Three scratch VRAM buffers only - it never touches the scanout, needs no interlock, no WindowServer
                and no Apple accelerator. The 16x16 wrong-cell maps and the decoded wrong pixels are in the driver
@@ -2816,7 +2816,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 7) {
-            /* 0.0.416 (an internal design note, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
+            /* 0.0.416 (driver design, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
                source. ONE COPY_LINEAR of a 256 KiB window, optionally with the GCR_REQ (GL2 write-back + invalidate)
                immediately before it in the SAME submission, into a low scratch of ours; then the scratch and the
                source are both read through the MM window and compared per 256-byte line.
@@ -2839,7 +2839,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 8) {
-            /* D7 (0.0.417, an internal design note): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
+            /* D7 (0.0.417, driver design): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
                exactly - same buffers, packet fields, sample set, report lines and POISON detection - except the
                CPU writes 0xff00ff00 everywhere and every expected value is 0xff00ff00. It measures the WRITE
                compression half: with SDMA0's no-PTE write compression ON a constant block is stored as a code
@@ -2891,7 +2891,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         if (st != 0) return 3;
     }
     if (in == 82) {
-        /* D1 (0.0.417, an internal design note): out[i] = v[i] of rdna4_sdmadcc_control.
+        /* D1 (0.0.417, driver design): out[i] = v[i] of rdna4_sdmadcc_control.
            v: 0 op (0 refused, 1 read, 2 set, 3 restore), 1 SDMA0 raw, 2 SDMA1 raw, 3 restore value,
            4 written/target, 5 read-back, 6 match, 7 status (0 ok, 1 bad arg, 2 no context, 3 no GC base,
            4 mismatch), 8 captured. The per-set decode uses sdma_dcc.h's own accessors. */

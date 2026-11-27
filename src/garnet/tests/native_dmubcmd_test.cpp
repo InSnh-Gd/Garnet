@@ -1,4 +1,4 @@
-// native_dmubcmd_test.cpp - build 0.0.625 (multi-monitor track, stages M2 / M3: the FIRST code that sends commands to the display firmware; an internal design note "M1.5 result" section 4).
+// native_dmubcmd_test.cpp - build 0.0.625 (multi-monitor track, stages M2 / M3: the FIRST code that sends commands to the display firmware; DMUB command ring).
 // It compiles the REAL decisions of dcn/dmubcmd.h and the REAL sequences of dcn/dmubcmd_flow.h and drives them against a model of the DMUB (a register file with a firmware that completes a command
 // after k RPTR reads or never, a sparse VRAM window, the REAL DCN write allowlist). The kext glue (dcn/dcn.cpp, GarnetDriver.cpp), the CLI and the plist are checked by source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/dcn -I src/garnet/src/amd -I src/dcn41 \
@@ -616,11 +616,8 @@ int main(int argc, char **argv) {
               size_t n = 0, pos = e0; while (e0 != std::string::npos && e1 != std::string::npos && (pos = gro.find("ENGINE_ID_", pos)) != std::string::npos && pos < e1) { ++n; pos += 10; }
               expect(e0 != std::string::npos && e1 != std::string::npos && n == 3u && ct.find("params.digid = (uint8_t)(cntl->engine_id);") != std::string::npos, "V: enum engine_id lists DIGA, DIGB, DIGC before DIGD (DIGD = 3); encoder_control_digx_v1_5 sends digid = (uint8_t)engine_id"); }
         } else { std::printf("note: skipped V7 Linux source check (not in tree)\n"); }
-        { const std::string notes = slurp(g_root + "/notes/DISPLAY-DESIGN.md"), notes2 = slurp("/path/to/garnet-checkout/notes/DISPLAY-DESIGN.md"); const std::string& nn = notes.empty() ? notes2 : notes;
-          if (!nn.empty()) {
-              expect(nn.find("path 3: display_objid 0x340c (HDMI) encoderobjid 0x2220  device_tag 0x0400   -> link 3, UNIPHY_D, DIGD") != std::string::npos && (0x340cu & 0xFFu) == 0x0Cu && ((0x2220u & 0xFFu) == 0x20u) && ((0x2120u & 0xFFu) == 0x20u),
-                     "V: the monitor B's ROM path (notes/DISPLAY-DESIGN.md 3.5): display_objid 0x340c -> connector object id 0x0C (HDMI type A, as the monitor A's 0x330c), encoder object 0x2220 -> id 0x20 (as the monitor A's 0x2120), link 3 / UNIPHY_D / DIGD");
-          } else { std::printf("note: skipped V7 notes/DISPLAY-DESIGN.md check (not in tree)\n"); } } }
+        expect((0x340cu & 0xFFu) == 0x0Cu && ((0x2220u & 0xFFu) == 0x20u) && ((0x2120u & 0xFFu) == 0x20u),
+               "V: monitor B ROM path ids: display_objid 0x340c -> connector 0x0C (HDMI type A), encoder 0x2220/0x2120 -> id 0x20"); }
       // V8. the slots and the exact check; every single-bit flip of every dword of every one of the fifteen templates is refused unless it IS another template
       for (unsigned i = 7; i < 12; i++) { uint32_t sl[16]; rdna4dm_tpl_slot(sl, &rdna4dm_tpls[i]); bool z = true; for (unsigned k = 5; k < 16; k++) z = z && sl[k] == 0u;
           expect(z && sl[0] == rdna4dm_tpls[i].dw[0] && sl[1] == rdna4dm_tpls[i].dw[1] && sl[4] == rdna4dm_tpls[i].dw[4] && rdna4dm_tpl_slot_check(sl) == 0u, (std::string(rdna4dm_tpls[i].name) + ": the 64-byte slot is the five dwords + 11 zeros and passes the exact-slot check").c_str()); }
@@ -904,9 +901,9 @@ int main(int argc, char **argv) {
                       flowS = slurp(src + "dcn/dmubcmd_flow.h"), hdrS = slurp(src + "dcn/dmubcmd.h"), drh = slurp(src + "dcn/dispread.h"), cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"),
                       plist = slurp(g_root + "/src/garnet/Info.plist"), s1c = slurp(src + "amd/native_s1c.h"), mk = slurp(g_root + "/src/garnet/Makefile");
     expect(!dcn.empty() && !hpp.empty() && !brg.empty() && !pure.empty() && !flowS.empty() && !hdrS.empty() && !cli.empty() && !plist.empty(), "the sources are readable");
-    const size_t g0 = dcn.find("build 0.0.625 (stages M2 / M3; an internal design note");
+    const size_t g0 = dcn.find("DMUB display firmware command interface");
     expect(g0 != std::string::npos, "the command glue block is present");
-    const size_t g1 = dcn.find("build 0.0.631 (multi-monitor stage M4d;", g0 == std::string::npos ? 0 : g0);   // 0.0.631: the disp2 glue follows; it has its own pins (tests/native_disp2_test.cpp)
+    const size_t g1 = dcn.find("Multi-monitor display-2 control (verb 98", g0 == std::string::npos ? 0 : g0);   // the disp2 glue follows; it has its own pins (tests/native_disp2_test.cpp)
     const std::string glue = g0 == std::string::npos ? "" : strip_line_comments(dcn.substr(g0, g1 == std::string::npos ? std::string::npos : g1 - g0));
     const std::string flowCode = strip_line_comments(flowS), hdrCode = strip_line_comments(hdrS);
     // 1. the OFF switch is the first test, and the latch is exactly the boot-arg

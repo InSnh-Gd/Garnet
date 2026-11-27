@@ -39,7 +39,7 @@ static const RDNA4Fmt rdna4_fmts[] = {
     { MTLPixelFormatRG11B10Float,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,  4, 0 },
     // m11h9: A8Unorm (178 NIL lines in the first Metal-compositor run: glyph / mask textures, also buffer-backed)
     { MTLPixelFormatA8Unorm,         VK_FORMAT_R8_UNORM,                 1, RDNA4F_A8 },
-    // bundle 19 (NATIVE-S8-MENUS.md): pixel format 63. Core Animation's large-shadow distance-field pass (brim_init / brim_jump / brim_outline) ping-pongs two of these; the refusal made
+    // bundle 19 (integer format support): pixel format 63. Core Animation's large-shadow distance-field pass (brim_init / brim_jump / brim_outline) ping-pongs two of these; the refusal made
     // emit_large_brim return without drawing, so the whole menu / Spotlight layer vanished. The RADV feature check at texture / pipeline creation stays the fail-closed gate.
     { MTLPixelFormatRG16Uint,        VK_FORMAT_R16G16_UINT,              4, RDNA4F_UINT },
     { MTLPixelFormatR32Uint,         VK_FORMAT_R32_UINT,                 4, RDNA4F_UINT },
@@ -1026,7 +1026,7 @@ static void rdna4s_record_copy_img(VkCommandBuffer cmd, RDNA4Texture *t, const r
 //   * a PATH (b) writer that another wrapper of the same surface range touches is copied back NOW (and leaves the end-of-command-buffer write-back list), so the pages are current;
 //   * a path (b) toucher whose image is stale (another wrapper wrote since) uploads again, even if it was touched before in this command buffer.
 // endPass (may be NULL) is called, once, before the first recorded command: a render encoder ends its Vulkan render pass there (a copy cannot be recorded inside one).
-// WindowServer and the kill file /private/tmp/rdna4m-noioalias keep build 14's rule exactly (upload at the first touch that needs the contents) and only COUNT the cases the rules would have acted on.
+// WindowServer and the kill file /private/tmp/garnet-noioalias keep build 14's rule exactly (upload at the first touch that needs the contents) and only COUNT the cases the rules would have acted on.
 // Returns YES when commands were recorded. The caller guarantees [t rdna4IsIOS].
 GARNET_INTERNAL BOOL rdna4_ios_touch(RDNA4CommandBuffer *cb, RDNA4Texture *t, BOOL need, BOOL write, void (^endPass)(void)) {
     const BOOL first = [cb rdna4IOFirstTouch:t];

@@ -1,4 +1,4 @@
-// sdma_dcc_test.cpp — 0.0.417 (an internal design note, binding D5,). The pure half of the
+// sdma_dcc_test.cpp — 0.0.417 (SDMA DCC control). The pure half of the
 // SDMA0_DCC_CNTL no-PTE compression build, host-tested:
 //   1. D1's constants: the two register offsets, and the mask 0x00015554 = exactly the eight
 //      *_COMP_EN_n bits, sharing no bit with the eight *_OVERRIDE_n bits (0x0000AAAA) or the bypass
@@ -110,7 +110,7 @@ static int checks(const Fns &fn)
                  kRDNA4DccStMismatch != kRDNA4DccStNoGc) ? 1u : 0u, 1u);
     }
 
-    // --- E1 (0.0.418, an internal design note): THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT. ---
+    // --- E1 (0.0.418, driver design): THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT. ---
     // The default is ON when the boot-arg is absent or nonzero, and SKIPPED by an explicit `garnet-sdmadcc=0`.
     // Its write is the SAME arithmetic `sdmadcc 1` writes: `rdna4_sdma_dcc_cleared` of the captured value.
     {

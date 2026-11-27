@@ -1,4 +1,4 @@
-// native_rebar_test.cpp - build 0.0.663 (Resizable BAR support, an internal design note section 3 items 1-9; plus `vramstat`, Stage 2 review S3).
+// native_rebar_test.cpp - build 0.0.663 (Resizable BAR support, ReBAR BAR0 sizing contract; plus `vramstat`, Stage 2 review S3).
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_rebar_test.cpp -o /tmp/native_rebar && /tmp/native_rebar .
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_rebar_plant.sh plants breaks)

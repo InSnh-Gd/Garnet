@@ -38,8 +38,7 @@ FW_SRC_DIR="$REPO/src/fw"
 # Which shader to build. No argument = store_magic, exactly as before.
 #   build-shader.sh                 -> shaders/store_magic.s   (hand-written)
 #   build-shader.sh store_magic_hsa -> shaders/store_magic_hsa.s (LLVM-compiled,
-#                                      standard HSA kernarg ABI — see
-#                                      notes/B1-COMPILER-BRIDGE.md)
+#                                      standard HSA kernarg ABI)
 NAME="${1:-store_magic}"
 SRC="$SHADER_DIR/$NAME.s"
 SYMBOL="fw_shader_$NAME"

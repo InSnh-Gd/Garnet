@@ -1,4 +1,4 @@
-// native_disp2_test.cpp - build 0.0.631 (multi-monitor stage M4d: a TEST PATTERN on the second display; an internal design note "M4 design" / "M4b analysis").
+// native_disp2_test.cpp - build 0.0.631 (multi-monitor stage M4d: a TEST PATTERN on the second display; DCN secondary display setup).
 // It compiles the REAL decisions of dcn/disp2.h and the REAL sequence of dcn/disp2_flow.h and drives them against a register-file model of OTG0 / OTG1 / ODM1 / DPG1 / DIG1 / DIG2 whose writes go through
 // the instance guard AND the REAL DCN write allowlist (exactly the kext glue's E::wr). The kext glue, the dispatch, the CLI and the plist are checked by source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/dcn -I src/garnet/src/amd -I src/dcn41 \
@@ -2016,7 +2016,7 @@ static void plane_source_pins() {
                       cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"), brg = slurp(src + "GarnetDriver.cpp") + "\n" + slurp(src + "GarnetDriverStages.cpp");
     expect(!dcn.empty() && !s1c.empty() && !s1h.empty() && !flow.empty() && !hdr.empty() && !cli.empty() && !brg.empty(), "0.0.635: the sources are readable");
     // ---- the glue: allocate BEFORE the busy flag, run, release the flag, free AFTER it
-    const size_t g0 = dcn.find("build 0.0.631 (multi-monitor stage M4d; an internal design note");
+    const size_t g0 = dcn.find("Multi-monitor display-2 control (verb 98");
     const std::string glue = g0 == std::string::npos ? "" : strip_line_comments(dcn.substr(g0));
     const size_t f0 = glue.find("uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx) {"), f1 = glue.find("}  // namespace rdna4dcn", f0 == std::string::npos ? 0 : f0);
     const std::string fn = f0 == std::string::npos ? "" : glue.substr(f0, f1 == std::string::npos ? std::string::npos : f1 - f0);
@@ -2470,7 +2470,7 @@ static void plane_638_tests() {
     {
         const std::string src = g_root + "/src/garnet/src/";
         const std::string dcn = slurp(src + "dcn/dcn.cpp") + "\n" + slurp(src + "dcn/dcn_internal.hpp") + "\n" + slurp(src + "dcn/dcn_dmub_telemetry.cpp") + "\n" + slurp(src + "dcn/dcn_scanout_mt.cpp") + "\n" + slurp(src + "dcn/dcn_disp2_scanx.cpp"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")), cli = slurp(g_root + "/tools/rdna4/native/garnettest.c");
-        const size_t g0 = dcn.find("build 0.0.631 (multi-monitor stage M4d; an internal design note");
+        const size_t g0 = dcn.find("Multi-monitor display-2 control (verb 98");
         const std::string glue = g0 == std::string::npos ? "" : strip_line_comments(dcn.substr(g0));
         const size_t f0 = glue.find("uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx) {");
         const std::string fn = f0 == std::string::npos ? "" : glue.substr(f0);
@@ -2749,7 +2749,7 @@ static void plane_643_tests() {
 
 
 // =====================================================================================================================================================================================================
-// 0.0.652 (M5): op 14 `fbhold 2` and the HELD plane (an internal design note "M5 build spec", section 3). The flow runs over the model; the planted breaks are in native_disp2_plant.sh.
+// 0.0.652 (M5): op 14 `fbhold 2` and the HELD plane (GarnetFramebuffer). The flow runs over the model; the planted breaks are in native_disp2_plant.sh.
 // =====================================================================================================================================================================================================
 static void shown_up(PModel &m) {
     plane_up(m);
@@ -2909,7 +2909,7 @@ static void plane_652_tests() {
 }
 
 // =====================================================================================================================================================================================================
-// 0.0.655: INSTANCE 1 (the monitor A) PLANE at 1080p60: ops 8..13 for the monitor A (an internal design note "monitor A (instance 1) plane + framebuffer spec at 1080p60", sections 1 and 3).
+// 0.0.655: INSTANCE 1 (the monitor A) PLANE at 1080p60: ops 8..13 for the monitor A (monitor A 1080p60 plane layout).
 // Groups: tables vs Linux / the spec / the census (mona_tables_vs_linux); the per-instance guard, both directions (mona_guard_tests); the exact step lists (mona_list_shapes); the flow over P1Model (op 8 clean + order + prechecks +
 // fill / verify, the gate failures, ops 9..13, the DP watch AND the MONB WATCH); the per-instance allocator / address set / HELD, with the monitor B held while the monitor A runs (mona_instance_tests); source pins (mona_source_pins).
 // =====================================================================================================================================================================================================
@@ -3824,7 +3824,7 @@ static void mona_source_pins() {
                       s1c = garnet_test_ver::read_native_engine(src + "amd"), s1h = slurp(src + "amd/native_s1c.h"), hpp = slurp(src + "dcn/dcn.hpp"), flow = strip_line_comments(slurp(src + "dcn/disp2_flow.h")), hdr = strip_line_comments(slurp(src + "dcn/disp2.h")),
                       cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"), brg = slurp(src + "GarnetDriver.cpp") + slurp(src + "GarnetDriverStages.cpp");
     expect(!dcn.empty() && !s1c.empty() && !s1h.empty() && !hpp.empty() && !flow.empty() && !hdr.empty() && !cli.empty() && !brg.empty(), "0.0.655: the sources are readable");
-    const size_t g0 = dcn.find("build 0.0.631 (multi-monitor stage M4d; an internal design note");
+    const size_t g0 = dcn.find("Multi-monitor display-2 control (verb 98");
     const std::string glue = g0 == std::string::npos ? "" : strip_line_comments(dcn.substr(g0));
     const size_t f0 = glue.find("uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx) {"), f1 = glue.find("}  // namespace rdna4dcn", f0 == std::string::npos ? 0 : f0);
     const std::string fn = f0 == std::string::npos ? "" : glue.substr(f0, f1 == std::string::npos ? std::string::npos : f1 - f0);
@@ -4639,7 +4639,7 @@ int main(int argc, char **argv) {
                       flowS = slurp(src + "dcn/disp2_flow.h"), hdrS = slurp(src + "dcn/disp2.h"), cli = slurp(g_root + "/tools/rdna4/native/garnettest.c"), plist = slurp(g_root + "/src/garnet/Info.plist"),
                       s1c = slurp(src + "amd/native_s1c.h"), nub = slurp(src + "GarnetMetalNub.cpp");
     expect(!dcn.empty() && !hpp.empty() && !brg.empty() && !pure.empty() && !flowS.empty() && !hdrS.empty() && !cli.empty() && !plist.empty(), "the sources are readable");
-    const size_t g0 = dcn.find("build 0.0.631 (multi-monitor stage M4d; an internal design note");
+    const size_t g0 = dcn.find("Multi-monitor display-2 control (verb 98");
     expect(g0 != std::string::npos, "the disp2 glue block is present");
     const std::string glue = g0 == std::string::npos ? "" : strip_line_comments(dcn.substr(g0));
     const std::string flowCode = strip_line_comments(flowS);

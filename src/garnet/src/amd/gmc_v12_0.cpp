@@ -21,7 +21,7 @@
 //     → amdgpu::SysMem / sysmem_alloc / sysmem_free. No IOMMU here, so
 //     SysMem.bus is the host physical address the GPU sees directly.
 //  3. VRAM offsets: every fixed VRAM offset the reference hardcodes is
-//     relative to dev.vramBase (PORTING.md). The UEFI/GOP console owns
+//     relative to dev.vramBase (kext constraint). The UEFI/GOP console owns
 //     VRAM [0, 0x7e9000) and the kernel keeps drawing into it — we never
 //     write below dev.vramBase. GART page table: dev.vramBase + 0x700000
 //     (512 KiB). VRAM allocator: [dev.vramBase + 0x1800000, dev.vramLimit).
@@ -147,7 +147,7 @@ constexpr uint64_t kGARTAlignment        = 0x0000000100000000ULL;
 // reliably reach host memory for the PT fetch, so PT-must-be-in-VRAM is
 // a hard requirement.
 //
-// Offsets below are relative to dev.vramBase (PORTING.md VRAM layout);
+// Offsets below are relative to dev.vramBase (relative to VRAM arena base);
 // dev.vramBase sits above the live UEFI console framebuffer:
 //   +0x00000000  fw_pri            1 MiB   PSP staging
 //   +0x00100000  PSP ring/cmd/fence       48 KiB

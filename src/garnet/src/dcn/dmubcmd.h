@@ -1,5 +1,5 @@
 //
-//  dmubcmd.h - build 0.0.625 (multi-monitor track, stages M2 / M3: the FIRST code that sends commands to the display firmware; an internal design note, "M1 result: the DMUB dialect" and
+//  dmubcmd.h - build 0.0.625 (multi-monitor track, stages M2 / M3: the FIRST code that sends commands to the display firmware; DMUB command dialect and
 //  "M1.5 result: ... M2/M3 plans", section 4 "Plans"). The pure half (decisions, allowlists, constants, argument and result layouts), shared by the kext (dcn/dmubcmd_flow.h + the glue in dcn/dcn.cpp), the CLI
 //  (tools/rdna4/native/garnettest.c includes this very file) and the host test (src/garnet/tests/native_dmubcmd_test.cpp). Plain C99 + C++17: no kernel header.
 //
@@ -65,7 +65,7 @@ static inline int rdna4dm_latch_is_on(uint32_t latch) { return latch == RDNA4DM_
 #define RDNA4DM_POLL_MAX_VBIOS 200000u
 #define RDNA4DM_POLL_BOUND_VBIOS_US (RDNA4DM_POLL_STEP_US * RDNA4DM_POLL_MAX_VBIOS)
 
-// ---- the allowlist (the brief; the dialect is an internal design note section "M1 result" 2) -----------------------------------------------------------------------------------------------------------
+// ---- the allowlist (the brief; the dialect is DMUB command dialect) -----------------------------------------------------------------------------------------------------------
 #define RDNA4DM_HDR_DETECT  0x04000a80u    /* sub 0xa  detect plus EDID into the context */
 #define RDNA4DM_HDR_BEGIN   0x08000680u    /* sub 6    mode change begin / end */
 #define RDNA4DM_HDR_SETMODE 0x08000580u    /* sub 5    set mode on the display */
@@ -167,7 +167,7 @@ static inline uint32_t rdna4dm_replay_unarg(uint64_t a, uint32_t *off)
     return 0u;
 }
 
-// ---- the mainline VBIOS packets (0.0.630, stage M4c; an internal design note "M4b analysis" section 4 (a)) ------------------------------------------------------------------------------------------
+// ---- the mainline VBIOS packets (0.0.630, stage M4c; mainline VBIOS DMUB packets) ------------------------------------------------------------------------------------------
 // Sub 2 SET_PIXEL_CLOCK (Linux struct dmub_rb_cmd_set_pixel_clock: header + struct set_pixel_clock_parameter_v1_7, 16 bytes -> payload_bytes 16, header 0x10000280) and sub 1 TRANSMITTER_CONTROL
 // (struct dmub_rb_cmd_dig1_transmitter_control: header + a 60-byte union (dmub_dig_transmitter_control_data_v1_7, reserved3[11]) -> payload_bytes 60 = sizeof(cmd) - sizeof(header), header 0x3C000180; command_table2.c
 // transmitter_control_dmcub_v1_7 memsets the whole command first, so every payload byte past the 16 below is ZERO). Each allowed packet is a FULL FIXED slot: the allowlist is "this exact 16-dword slot", never a
@@ -186,7 +186,7 @@ static inline uint32_t rdna4dm_replay_unarg(uint64_t a, uint32_t *off)
 // 0.0.633 (multi-monitor, the monitor B SINK-C on UNIPHY_D / DIG3 / HDMI-A ddc3 hpd4): templates 8..12 are templates 3 / 4 / 5 / 6 / 7 with ONLY the instance fields changed, each derived field by field from the same Linux structs:
 //   8  pclk-otg2-on   / 9  pclk-otg2-off : set_pixel_clock_parameter_v1_7 as 3 / 4 but crtc_id = 2 (controller_id_to_atom(CONTROLLER_ID_D2) = ATOM_CRTC3 = 2, atomfirmware.h enum atom_crtc_def: CRTC1 0, CRTC2 1, CRTC3 2 - OTG2 is
 //      controller D2) and pll_id = 0x17 = ATOM_COMBOPHY_PLL3 (clock_source_id_to_atom(CLOCK_SOURCE_COMBO_PHY_PLL3)). WHY PLL3: the previous builder gave PLL2 (0x16) to OTG1 because UNIPHY_C is PHY 2 (the PLL number equals the PHY it
-//      feeds; SUSPECTED, an internal design note M4c: "Whether a PLL number is tied to a PHY is SUSPECTED"); the monitor B's PHY D is PHY 3, so the SAME rule gives PLL3, which is also simply the next free PLL after PLL2
+//      feeds; SUSPECTED, DCN PHY/PLL note: "Whether a PLL number is tied to a PHY is SUSPECTED"); the monitor B's PHY D is PHY 3, so the SAME rule gives PLL3, which is also simply the next free PLL after PLL2
 //      (PLL0 is Linux's first-free choice but not the card's PHY-tied choice; the DP uses the DTO and no PHY PLL). PLL3 was also the pll of the harmless OTG3 probe (templates 1 / 2): never have pclk-otg3-on and pclk-otg2-on up together.
 //      d2 = pll_id 0x17 | encoderobjid 0x20 << 8 (ENCODER_OBJECT_ID_INTERNAL_UNIPHY1: display_objid 0x340c's encoder object 0x2220 is UNIPHY1 enum 2, id 0x20, as the monitor A's 0x2120 is UNIPHY1 enum 1) | encoder_mode 2 (DVI) << 16.
 //   10 phyd-enable-dvi / 11 phyd-disable : dmub_dig_transmitter_control_data_v1_7 as 5 / 6 but phyid = 3 (UNIPHYD, dmub_cmd.h "3=UNIPHYD"), hpdsel = 4 (ATOM_TRANSMITTER_V6_HPD4_SEL, 1-based: the monitor B's connector list entry is ddc3/hpd4),
@@ -288,7 +288,7 @@ static inline uint32_t rdna4dm_tpl_unarg(uint64_t a, uint32_t *id)
 #define RDNA4DM_MODE_RESTORE 2u
 #define RDNA4DM_VBE_1080P 0x1a6u
 #define RDNA4DM_VBE_DP 0x1d4u
-// The plan's 1080p block and the measured DP block (an internal design note M1.5 section 4, step 2, and Rollback step 1; the DP block is notes/logs/runs/m1-622/region4.txt +0x4c00..+0x4c1f).
+// The plan's 1080p block and the measured DP block (DMUB 1080p and DP timing blocks +0x4c00..+0x4c1f).
 static const uint32_t rdna4dm_block_1a6[RDNA4DM_MODE_DWORDS] = { 0x04380780u, 0x00020780u, 0x41a60001u, 0x08081008u, 0x00000008u, 0x3a02007fu, 0x00000000u, 0x00000000u };
 static const uint32_t rdna4dm_block_1d4[RDNA4DM_MODE_DWORDS] = { 0x05a00a00u, 0x00020a00u, 0x41d40001u, 0x08081008u, 0x00000008u, 0x000000e2u, 0x00000000u, 0x00000000u };
 static inline int rdna4dm_mode_op_ok(uint64_t op) { return op == RDNA4DM_MODE_SAVE || op == RDNA4DM_MODE_RESTORE || op == RDNA4DM_VBE_1080P || op == RDNA4DM_VBE_DP; }

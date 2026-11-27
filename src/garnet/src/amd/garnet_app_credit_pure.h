@@ -1,6 +1,6 @@
 //
 //  garnet_app_credit_pure.h - the PURE half of GPU-apps stage G5 Stage 1 (kext 0.0.650): an application credit that keeps WindowServer from queuing behind app jobs
-//  (an internal design note, "G5 design" and "G5 Stage 1 build spec"). No kernel header is included: tests/native_g5_test.cpp compiles this file and
+//  (per-app GPU credit accounting). No kernel header is included: tests/native_g5_test.cpp compiles this file and
 //  drives the very functions the kext calls (amd/native_s1c.cpp ring_submit_app_g5, n1c_g5_stat; GarnetDriver.cpp accelExperiment).
 //
 //  DEFAULT OFF: boot-arg rdna4-g5=1 (effective only with garnet-multisession=1). OFF, n1c_submit calls ring_submit exactly as 0.0.642 and writes no G5 state.

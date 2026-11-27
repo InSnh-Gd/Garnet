@@ -7,7 +7,7 @@
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------
-// P1 "memory pooling" (garnet_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/rdna4m-pool exists, latched ONCE when the device is
+// P1 "memory pooling" (garnet_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/garnet-pool exists, latched ONCE when the device is
 // created; OFF = every call site below runs the code that was there before (the `else` branches are the old lines, unchanged).
 //  * RDNA4Buffer / RDNA4Texture memory: <= 256 KiB from 4 MiB slabs (bound at the slab offset; host-visible slabs mapped once), 256 KiB..64 MiB from a recycle
 //    cache keyed by (memory type, size), the rest (and anything VkMemoryDedicatedRequirements marks dedicated) on its own allocation as before.
@@ -347,7 +347,7 @@ GARNET_INTERNAL BOOL rdna4nc_any_readonly_buffer(void) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // P5b "per-draw redundancy" (garnet_drawcache.h decides, this block holds the latch, the device-wide render-pass cache and the counters). ON only when
-// /private/tmp/rdna4m-drawopt exists, latched ONCE at device creation; OFF = every call site runs the code that was there before.
+// /private/tmp/garnet-drawopt exists, latched ONCE at device creation; OFF = every call site runs the code that was there before.
 //  * RDNA4RenderEncoder: re-uses a stage's VkDescriptorSet while the exact slot contents its set layout reads are unchanged; skips vkCmdBindPipeline for the pipeline
 //    already bound in the current render pass; remembers the last (topology, cull, front, pso) -> VkPipeline answer.
 //  * Render passes are cached device-wide by their attachment descriptions (<= 64, never destroyed while the device lives; beyond the cap created / destroyed as before).
@@ -374,7 +374,7 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// P4 import cache (garnet_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/rdna4m-noimpcache switches it OFF, latched ONCE at device creation;
+// P4 import cache (garnet_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/garnet-noimpcache switches it OFF, latched ONCE at device creation;
 // OFF = -initWithDevice:descriptor:iosurface:plane: and -dealloc run the per-texture import exactly as before (`_impShared` stays NO).
 //  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused (512 MiB in WindowServer).
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
@@ -1151,7 +1151,7 @@ GARNET_INTERNAL void rdna4_vs_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Metal API gap census fixes (an internal design note). Shared pieces:
+// Metal API gap census fixes (driver design). Shared pieces:
 //   RDNA4_ONCE          one log line per call site per process (no-op stubs are called thousands of times a second by the compositor)
 //   RDNA4_RES_IVARS /   state + the public/SPI MTLResource surface that QuartzCore / SkyLight send to every texture and buffer
 //   RDNA4_RESOURCE_SPI  (census: -setResponsibleProcess: 7450, -protectionOptions 6741, -heap 1397, -virtualAddress 1092 in 45 s)
@@ -2429,7 +2429,7 @@ RDNA4_DNR(RDNA4Texture)
     if (d.textureType != MTLTextureType2D || d.depth != 1 || d.arrayLength != 1 || d.mipmapLevelCount != 1 || d.sampleCount != 1) IOSFAIL(72, @"only single 2D textures (no mips/array/MSAA)");
     size_t pc = IOSurfaceGetPlaneCount(s);
     // P2: a plane p < planeCount of a 2- or 3-plane surface is accepted (CoreAnimation makes one texture per plane of a bi-planar YUV surface). The kill file
-    // /private/tmp/rdna4m-noplanes (latched once per process) restores the old refusal of every multi-plane surface.
+    // /private/tmp/garnet-noplanes (latched once per process) restores the old refusal of every multi-plane surface.
     static int noplanes = -1; if (noplanes < 0) { noplanes = rdna4_sb_access_exists(RDNA4_NOPLANES_FILE) ? 1 : 0; if (noplanes) RDNA4LOG("P2 planes: multi-plane IOSurfaces REFUSED (kill file " RDNA4_NOPLANES_FILE " exists; latched for the life of this process)"); }
     if (pc > 1 && noplanes) IOSFAIL(73, @"IOSurface has %zu planes; single-plane surfaces only", pc);
     size_t pidx = pc > 1 ? plane : 0;   // pc <= 1: any plane != 0 is refused by rdna4pl_geom below, exactly as before

@@ -1,6 +1,6 @@
 //
 //  garnetaccel_pure.h - the pure (no IOKit, no kernel) decisions of the GarnetAccel aux kext (route A, milestone #9). Compiled into the kext AND into
-//  tests/host_test.cpp, which drives these very functions (with planted breaks: tests/plant.sh). Design: an internal design note.
+//  tests/host_test.cpp, which drives these very functions (with planted breaks: tests/plant.sh). Design: driver design.
 //
 //  THIN BY DESIGN (K3: every rebuild of this kext requires a security approval (Allow click) from the user): only the safety gates, the fixed class graph and the
 //  fail-closed defaults live here. All values, stamp / task / config / factory decisions and logging live in the bring-up kext behind
@@ -89,7 +89,7 @@ inline EmPlan em_init_plan(bool superInitOk, bool haveStampVA) {
     return p;
 }
 
-// ---- the display pipe (ABI 2, aux 0.0.3; an internal design note section 3.4 and the "11h.1 RE facts" section) ---------------------------------
+// ---- the display pipe (ABI 2, aux 0.0.3; IOAccelDisplayPipe layout contract) ---------------------------------
 // Display is ON only with a table of abi >= 2 whose OWN size covers the ABI-2 members, the ON flag set by the bring-up kext (boot-arg garnet-metal-disp=1
 // latched), and the hook present. The order of the tests matters: nothing past byte 120 is read unless the table says it has it. OFF (an ABI-1 table from the
 // 0.0.612 bring-up kext, a short table, flag 0, no hook, no table) = every display entry point behaves exactly as aux 0.0.2 did: the family's own display pipe,
@@ -106,7 +106,7 @@ inline void *dm_walk_provider(bool dispOn, bool providerIsNub, void *provider, v
 enum PipeChoice : uint32_t { kPipeOurs = 1, kPipeFamily = 2 };
 inline PipeChoice pipe_choice(bool dispOn, bool allocated) { return (dispOn && allocated) ? kPipeOurs : kPipeFamily; }
 
-// ---- the 'GRNT' user client on the accelerator (aux 0.0.5, G6; an internal design note "G6 design", section 2) ---------------------------------------------------------------------------------------------
+// ---- the 'GRNT' user client on the accelerator (aux 0.0.5, G6; IOAccelerator user-client routing) ---------------------------------------------------------------------------------------------
 // GarnetAccelerator overrides both newUserClient entries (slots 239 and 238). The five-argument entry preserves native errors instead of IOService's fallback. A sandboxed application reaches the
 // bring-up kext's native client. The decision for one open is nuc_plan:
 //   * type != 'GRNT'                         -> kNucFamily: the family's own newUserClient, untouched (its per-PID limits and bookkeeping are the family's);
@@ -126,7 +126,7 @@ inline NucPlan nuc_plan(uint32_t type, bool auxOn, bool gatePass, const GarnetMe
 constexpr int32_t kIoSuccess = 0, kIoInternalError = (int32_t)0xE00002C9, kIoUnsupported = (int32_t)0xE00002C7, kIoBadArgument = (int32_t)0xE00002C2;
 inline int32_t nuc_result(int32_t rc, bool haveClient) { return rc != kIoSuccess ? rc : (haveClient ? kIoSuccess : kIoInternalError); }
 
-// ---- the monitor B framebuffer (aux 0.0.4, milestone M5; an internal design note "M5 build spec: GarnetFramebuffer for the monitor B", section 2) ----------------------------------------------------------------
+// ---- the monitor B framebuffer (aux 0.0.4, milestone M5; GarnetFramebuffer design) ----------------------------------------------------------------
 // GarnetFramebuffer answers IOFramebuffer's questions from the IMMUTABLE GarnetDispSnap the bring-up kext took at `fbpublish 2` (GarnetDisplayOps.h). Every answer below is a pure function of the snapshot, host-tested; the class in
 // GarnetAccel.cpp only copies the results into IOKit structures. No register is read or written, nothing is looked up at run time. The shared validators (garnetdisp_ops_check, garnetdisp_snap_valid) are in GarnetDisplayOps.h.
 

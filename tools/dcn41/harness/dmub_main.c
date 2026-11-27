@@ -5,7 +5,7 @@
  * Comparison per kind: command builders - the 64 command bytes (and no register I/O on either side); GPINT and idle
  * wait - the full register trace and results; ring submit - every register WRITE (our layer adds deliberate reads)
  * plus the ring memory after the sequence and each submission's result; return data and fw meta - bytes / results.
- * Planted controls must differ. Also dumps, as evidence for notes/DISPLAY-DESIGN.md, the register trace of Linux's
+ * Planted controls must differ. Also dumps, as evidence for the DCN 4.1 display register tables, the register trace of Linux's
  * dmub_srv_hw_reset() on a live firmware: what a DMUB reload does first. */
 #include <inttypes.h>
 #include <stdio.h>

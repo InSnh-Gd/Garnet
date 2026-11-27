@@ -1,4 +1,4 @@
-// test-xlate-linked.c: P3 (build 18, an internal design note): linked functions in the in-process translation.
+// test-xlate-linked.c: P3 (build 18, driver design): linked functions in the in-process translation.
 // Build/run (from this directory):  cc -O1 -Wall -Wextra -Werror -o /tmp/test-xlate-linked test-xlate-linked.c && /tmp/test-xlate-linked .      (argv[1] = the directory holding GarnetDevice.m and garnet_xlate.h)
 // Covers: the cache key (rdna4x_link_sha) - what changes it and what must not; one job with dependencies (every dependency through the SAME reader, the library's linked entry point, the failure codes and
 // caps); the engine request (the worker gets copies); and source pins that tie GarnetDevice.m's glue to them (privateFunctions and groups are read and logged, binaryFunctions / preloaded libraries refuse,

@@ -743,7 +743,7 @@ IOReturn n1c_scanx_release(const N1cRef &ref, uint64_t inst, uint64_t out[2]) {
     return rc;
 }
 
-// ---- ABI 1.2: the DAL experiment (0.0.604). One named step of an internal design note per call. The client lock is NOT held: a step
+// ---- ABI 1.2: the DAL experiment (0.0.604). One named DAL experiment step per call. The client lock is NOT held: a step
 // sleeps for up to ~65 s (E4's dwell) and a racing close must not wait for it; smu_dal.cpp's own busy flag refuses a second concurrent step, and
 // its latch, gate and allowlist do all the refusing. Nothing here touches a session field.
 IOReturn n1c_dal_step(const N1cRef &ref, uint64_t step, uint64_t flags, rdna4n_dal_result *out) {

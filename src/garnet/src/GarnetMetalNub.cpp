@@ -97,7 +97,7 @@ int op_populate_config(uint8_t *cfg, uint32_t bytes) {
 	const int rc = garnetmetal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName);
 	if (rc != 0) { MNLOG("populate_config: REFUSED rc %d (a limit the family default left at zero would cap every IOSurface for the boot)", rc); return rc; }
 	// (0.0.611: config_populate fills a local copy and copies it into cfg only when the static check passed, so a refusal leaves the family defaults in cfg.)
-	// The whole 0x90 bytes and the values IOSurfaceRoot::updateLimits will take as system-wide minimums (NATIVE-S3 review SHOULD-FIX).
+	// The whole 0x90 bytes and the values IOSurfaceRoot::updateLimits will take as system-wide minimums (IOSurfaceRoot minimum limits).
 	MNLOG("populate_config: ok; IOSurface limits +0x30 %llu +0x32 %llu +0x4c %llu +0x50 %llu +0x54 %llu, +0x47 (type-4 pipe) %u",
 	      (unsigned long long)garnetmetal::ld_le(cfg + garnetmetal::kOffLim30, 2), (unsigned long long)garnetmetal::ld_le(cfg + garnetmetal::kOffLim32, 2),
 	      (unsigned long long)garnetmetal::ld_le(cfg + garnetmetal::kOffLim4c, 4), (unsigned long long)garnetmetal::ld_le(cfg + garnetmetal::kOffLim50, 4),
@@ -174,7 +174,7 @@ int32_t op_native_open(void *ctx, void *accel, void *task, void *securityID, uin
 	return (int32_t)rc;
 }
 
-// 0.0.613 (ABI 2): the display-pipe hook and the PCI getter (an internal design note section 3.4). The aux kext calls them only from a table of abi >= 2 that carries GARNET_DISP_F_ON.
+// 0.0.613 (ABI 2): the display-pipe hook and the PCI getter (driver contract>= 2 that carries GARNET_DISP_F_ON.
 int op_disp_hook(void *ctx, uint32_t cls, uint32_t slot, void *self, const uint64_t *args, uint32_t nargs, uint64_t *ret) { return rdna4disp_hook(ctx, cls, slot, self, args, nargs, ret); }
 void *op_pci_device(void *ctx) { return rdna4disp_pci_device(ctx); }
 

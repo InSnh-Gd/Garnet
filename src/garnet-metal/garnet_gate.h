@@ -1,4 +1,4 @@
-// garnet_gate.h - the pure half of the bundle's load policy outside WindowServer (GPU-apps stage G4, kext 0.0.640; an internal design note section 2 and the G2 review).
+// garnet_gate.h - the pure half of the bundle's load policy outside WindowServer (GPU-apps stage G4, kext 0.0.640; sandbox/app load policy).
 // No Metal, no IOKit, no I/O: host test test-gate.c compiles this very header and drives the very functions GarnetDevice.m calls (rdna4_admit, rdna4_pc_open, rdna4_fallback_ok).
 //
 // Three kinds of process load the bundle (every Metal-enumerating process does):
@@ -9,7 +9,7 @@
 //         also report the APP role (ABI 1.10 budget flags): a root process the kernel admits as root stays declined unless it set RDNA4M_ALLOW=1, as before. 0.0.641: and a process with
 //         euid < 501 (root, daemons) is not probed at all (rdna4g_declined_by_class).
 //
-// FAIL CLOSED outside WindowServer. The G2 review found the three safety gates fail OPEN in a sandbox: stat("/private/tmp/rdna4m-off") is denied (EPERM, not ENOENT) and was read as
+// FAIL CLOSED outside WindowServer. The G2 review found the three safety gates fail OPEN in a sandbox: stat("/private/tmp/garnet-off") is denied (EPERM, not ENOENT) and was read as
 // "no kill file"; the nub properties Garnet,Ready / Garnet,AutoDisarmed are filtered by the sandbox's iokit-get-properties allow-list, so a denied read came back as "absent" and was
 // read as "proceed". Outside WindowServer an answer that is not a positive "all clear" now declines:
 //   * kill file: only ENOENT / ENOTDIR (a real "no such file") means absent; any other stat failure is UNREADABLE and declines.
@@ -196,7 +196,7 @@ static inline int rdna4g_ready_declines_for_class(int cls, int flag) {
 static inline int rdna4g_autodisarm_declines(int isWs, int flag) { (void)isWs; return flag == 1; }
 
 // ---- which service the RDNA4N connection is opened on (G6, bundle 8) ----
-// A sandboxed application's profile admits user clients only on a service that conforms to IOAccelerator (an internal design note "G6 design"). The accelerator port this bundle was initialised with IS such a
+// A sandboxed application's profile admits user clients only on a service that conforms to IOAccelerator (IOAccelerator user-client routing). The accelerator port this bundle was initialised with IS such a
 // service, and the aux kext's GarnetAccelerator hands out the same native client on it. So the APP class (CLASS_OTHER: not WindowServer, not an RDNA4M_ALLOW root tool) probes on THAT port and tells Mesa to open
 // "GarnetAccelerator" (radv_darwin_set_service_class); WindowServer and root tools keep Mesa's default, GarnetDriver, untouched (no setter call at all).
 #define RDNA4G_SVC_ACCEL        "GarnetAccelerator"
@@ -319,11 +319,11 @@ static inline int rdna4g_fallback_ok(int isWs, int force, int testAsWs, int appA
 
 // ---- the AIR dump directories (0.0.641 safety rules, 0.0.652 / bundle build 6: ONE SUBDIRECTORY PER UID; C1 finding A) ----
 // 0.0.641: /tmp/rdna4m was created 0700 and used only when owned by the caller. That made it per-BOOT, not per-user: the first uid to create it (WindowServer, uid 88) locked every uid-501 app out of
-// dumping, so an admitted app's spvcache misses stayed magenta for good (an internal design note "G6 compatibility", finding A).
+// dumping, so an admitted app's spvcache misses stayed magenta for good (sandbox shader-cache compatibility).
 // Now:  PARENT  /tmp/rdna4m            a real directory (lstat, never a symlink), mode 01777 (sticky, world-writable: every uid can make its own subdirectory, none can remove another's),
 //                                    owned by root, by the translate daemon's user (RDNA4G_DAEMON_UID) or by the caller. A parent that is OURS (owner == caller) with the wrong mode is repaired to 01777
 //                                    without following links (fchmodat AT_SYMLINK_NOFOLLOW); a parent owned by anyone else with the wrong mode (or a symlink) means: skip dumping.
-//       SUBDIR  /tmp/rdna4m/<euid>     created by that uid, 0700, lstat-checked: a real directory OWNED BY THE CALLER (a planted subdir of someone else, or a symlink, skips the dump).
+//       SUBDIR  /private/tmp/garnet-xlate/<euid>     created by that uid, 0700, lstat-checked: a real directory OWNED BY THE CALLER (a planted subdir of someone else, or a symlink, skips the dump).
 //                                    The daemon's user is granted list+search on it by an ACL entry (garnet_dumpacl.h), so the mode stays 0700 for everyone else.
 // The daemon scans every numeric subdirectory and trusts a file only when the directory AND the file are owned by the uid in the directory's name (pc-translate.sh).
 #ifndef RDNA4G_DUMP_DIR

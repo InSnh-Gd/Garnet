@@ -539,12 +539,12 @@ shaders and repaints only 64 pixels through the original pipeline object while
 `test-surface-capture.m` checks the opt-in completion observer on a 330px-wide
 RGBA16Float IOSurface (2816-byte stride): off by default, bounded to 2 snapshots
 per geometry and 64 MiB per process, skipping display surfaces and writing on its
-own queue. `/private/var/tmp/rdna4m-observe` (root-owned) recreates CRC/frame
-trace markers and `/private/tmp/rdna4m-surfaces` after boot cleanup;
+own queue. `/private/var/tmp/garnet-observe` (root-owned) recreates CRC/frame
+trace markers and `/private/tmp/garnet-surfaces` after boot cleanup;
 `tools/rdna4/tests/render-observe-test.sh` checks two simulated boots and symlink
 refusal.
 
-For a short desktop interaction trace, the optional `/private/tmp/rdna4m-cblog`
+For a short desktop interaction trace, the optional `/private/tmp/garnet-cblog`
 log records command-buffer submission (`S`), retired path-(b) host copies (`W`),
 terminal GPU status (`F`), and scanout presentation attempts (`P`). Join `S`,
 `W`, and `F` by `cb`; join the terminal display sequence `dseq` to `P.seq`.
@@ -567,7 +567,7 @@ For completed segments, `W` reports `copies` for image-to-buffer write-back
 and `linear` for direct writes made visible to the host. Earlier logs can omit
 `W` for completed linear writes.
 
-`/private/tmp/rdna4m-present-capture` (root- or WindowServer-owned regular file)
+`/private/tmp/garnet-present-capture` (root- or WindowServer-owned regular file)
 enables top-64-row captures after accepted DP presents for WindowServer only
 (rolling 16 records, <=2 Hz with backoff). Normal, deferred-copy and retry
 presents can schedule one background capture at a time. The capture reserves
@@ -583,8 +583,8 @@ captures have no latch binding. Verify offline with the simulated scanout tests.
 - `analyze-present-capture.py CAPTURE_DIRECTORY --output REPORT.json`
   (regression: `test-present-analysis.py`)
 
-The existing `/private/tmp/rdna4m-present-full` opt-in, used together with
-`/private/tmp/rdna4m-present-capture`, captures the entire accepted DP slot
+The existing `/private/tmp/garnet-present-full` opt-in, used together with
+`/private/tmp/garnet-present-capture`, captures the entire accepted DP slot
 instead of the top rows. Full mode retains two records and refuses a frame if
 its padded GPU copy would exceed 64 MiB. The record includes the boot UUID,
 the slot and hardware latch observed on both sides of the read, and a SHA-256

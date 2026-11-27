@@ -1,5 +1,5 @@
 //
-//  native_fb_pure.h - the pure half of M5 (kext 0.0.652, an internal design note "M5 build spec: GarnetFramebuffer for the monitor B"; 0.0.658: and the monitor A, "monitor A (instance 1) plane + framebuffer
+//  native_fb_pure.h - the pure half of M5 (kext 0.0.652, GarnetFramebuffer design; 0.0.658: and the monitor A, "monitor A (instance 1) plane + framebuffer
 //  spec at 1080p60" section 4): every DECISION of the verb `fbpublish 2` (the monitor B) / `fbpublish 1` (the monitor A) and of the GarnetDisplayNub, judged from arguments alone. No kernel header: tests/native_disp_test.cpp compiles this very file and drives it, with planted breaks
 //  (tests/native_disp_plant.sh). The kernel glue is GarnetDisplayNub.cpp; the shared interface (the snapshot, the ops table, the snapshot validator) is GarnetDisplayOps.h.
 //

@@ -941,7 +941,7 @@ sdma_q1_set_wptr_mmio(const DeviceContext &dev, const SDMAInstance &inst,
 //------------------------------------------------------------------
 // sdma_q1_selftest — does BAR2 dword `doorbell_index` reach SDMA0 QUEUE1?
 //
-// Open question 1 of notes/re/sdma-takeover-design.md, settled with OUR OWN ring
+// SDMA doorbell/fence routing, settled with OUR OWN ring
 // before Apple's is ever involved. 4 KiB of VRAM, one FENCE packet, RB_ENABLE=1,
 // a doorbell-only kick, a 200 ms poll; only if that fails, the MMIO control leg.
 // QUEUE1 ends DISABLED and the ring is freed either way.

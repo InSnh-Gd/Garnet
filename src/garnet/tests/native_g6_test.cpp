@@ -1,4 +1,4 @@
-// native_g6_test.cpp - build 0.0.656 (G6: sandboxed apps reach the RDNA4N client through the IOAccelerator; an internal design note "G6 design" sections 2 and 4 step 1).
+// native_g6_test.cpp - build 0.0.656 (G6: sandboxed apps reach the RDNA4N client through the IOAccelerator; IOAccelerator user-client routing).
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_g6_test.cpp -o /tmp/native_g6 && /tmp/native_g6 .
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_g6_plant.sh plants breaks)
