@@ -26,6 +26,7 @@ TESTS += $(BUILD)/dcn41_vbl_irq_test
 TESTS += $(BUILD)/dcn41_dpms_test
 TESTS += $(BUILD)/garnet_power_policy_test
 TESTS += $(BUILD)/dcn41_fams2_test
+TESTS += $(BUILD)/dcn41_fams2_mall_test
 TESTS += $(BUILD)/dcn41_det_test
 TESTS += $(BUILD)/garnet_gfxoff_guard_test
 PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
@@ -55,6 +56,9 @@ $(BUILD)/fw_loader_test: fw_loader_test.cpp $(SRC)/amd/fw_loader.cpp $(SRC)/amd/
 
 $(BUILD)/dcn41_fams2_test: dcn41_fams2_test.cpp $(SRC)/dcn/dcn41_fams2_pure.h ../../dcn41/dcn41_dmub.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) dcn41_fams2_test.cpp -o $@
+
+$(BUILD)/dcn41_fams2_mall_test: dcn41_fams2_mall_test.cpp $(SRC)/dcn/dcn41_mall_pure.h $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/amdgpu_asic.h ../../dcn41/dcn41_dmub.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) dcn41_fams2_mall_test.cpp $(SRC)/amd/amdgpu_asic.cpp -o $@
 
 $(BUILD)/gfx_golden_test: gfx_golden_test.cpp $(SRC)/amd/gfx_v12_0.cpp $(SRC)/amd/amdgpu_asic.cpp $(wildcard $(SRC)/amd/*.h ../hosttest/shim/IOKit/*.h) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) gfx_golden_test.cpp $(SRC)/amd/amdgpu_asic.cpp -o $@

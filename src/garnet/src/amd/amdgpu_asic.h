@@ -56,6 +56,8 @@ struct AsicInfo {
     // Used only when the discovery gc_info table is unavailable.
     GcGeometry  fallbackGeometry;
     AsicFwNames fw;
+    uint8_t     mallSizeMiB;
+    uint8_t     displayMallChannelLimit;
 };
 
 // Table lookups. nullptr when nothing matches.
