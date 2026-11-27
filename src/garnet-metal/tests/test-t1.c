@@ -47,6 +47,7 @@ int main(void) {
     c = rdna4pc_check(f, flen, key, uuid, 0x1002, 0x7550, &pp, &pl); CHECK("inner vk vendor wrong", c == RDNA4PC_VKHDR, "%s", rdna4pc_why(c));
     pay[8] = 0x02; pay[9] = 0x10; pay[10] = 0; pay[11] = 0; memcpy(pay + 16, uuid2, 16); rdna4pc_fill(&h, key, uuid, 0x1002, 0x7550, pay, plen); memcpy(f, &h, sizeof h); memcpy(f + sizeof h, pay, plen);
     c = rdna4pc_check(f, flen, key, uuid, 0x1002, 0x7550, &pp, &pl); CHECK("inner vk uuid wrong", c == RDNA4PC_VKHDR, "%s", rdna4pc_why(c));
+    free(f); free(pay);
     printf(fails ? "FAILED %d\n" : "ALL PASS\n", fails);
     return fails != 0;
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-source_dir=$(cd "$(dirname "$0")" && pwd)
+source_dir=$(cd "$(dirname "$0")/.." && pwd)
 runtime="$source_dir/garnet_shaders.m"
 out=$(mktemp -d "${TMPDIR:-/tmp}/windowserver-shader-recovery.XXXXXXXX")
 trap 'rm -rf "$out"' EXIT

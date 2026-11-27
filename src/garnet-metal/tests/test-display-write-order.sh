@@ -6,7 +6,8 @@ if [ "${1:-}" = --help ]; then
 fi
 [ "$#" -le 2 ] || exit 2
 test_dir=$(cd -- "$(dirname -- "$0")" && pwd)
-source_file=${1:-$test_dir/GarnetDevice.m}
+source_dir=$(cd -- "$test_dir/.." && pwd)
+source_file=${1:-$source_dir/GarnetDevice.m}
 if [ "$#" -eq 2 ]; then
     mkdir -p -- "$2"
     out=$(cd -- "$2" && pwd)
@@ -14,7 +15,7 @@ else
     out=$(mktemp -d "${TMPDIR:-/tmp}/rdna4-write-order.XXXXXX")
     trap 'rm -rf -- "$out"' EXIT
 fi
-python3 "$test_dir/assemble-device.py" "$source_file" --output "$out/device.m"
+python3 "$source_dir/assemble-device.py" "$source_file" --output "$out/device.m"
 python3 - "$out/device.m" "$out" <<'PY'
 import hashlib
 import json

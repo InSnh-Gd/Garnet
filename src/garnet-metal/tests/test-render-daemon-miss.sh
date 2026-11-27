@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 [ "$(uname -s)" = Darwin ] || exit 2
-source_dir=${1:-$(cd "$(dirname "$0")" && pwd)}
+source_dir=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 out=$(mktemp -d "${TMPDIR:-/tmp}/render-daemon-miss.XXXXXXXX")
 trap 'rm -rf "$out"' EXIT
 {

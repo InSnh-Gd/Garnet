@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-source_dir=$(cd "$(dirname "$0")" && pwd)
+test_dir=$(cd "$(dirname "$0")" && pwd)
+source_dir=$(cd "$test_dir/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/rdna4dumpwrite.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 python3 "$source_dir/assemble-device.py" "$source_dir/GarnetDevice.m" --output "$work/device.m"
@@ -17,5 +18,5 @@ body = body.replace('data.length', 'data->length').replace('data.bytes', 'data->
 Path(sys.argv[2]).write_text(body)
 PY
 "${CC:-cc}" -std=c11 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Werror -pthread \
-    -DRDNA4_DUMP_WRITER="\"$work/writer.inc\"" "$source_dir/test-dump-write.c" -o "$work/test"
+    -DRDNA4_DUMP_WRITER="\"$work/writer.inc\"" "$test_dir/test-dump-write.c" -o "$work/test"
 "$work/test" "$work"

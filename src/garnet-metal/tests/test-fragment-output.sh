@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source_dir=$(cd "$(dirname "$0")" && pwd)
+test_dir=$(cd "$(dirname "$0")" && pwd)
+source_dir=$(cd "$test_dir/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/garnet-fragment-output.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
-"${CC:-cc}" -std=c11 -Wall -Wextra -Werror ${CPPFLAGS:-} "$source_dir/test-fragment-output.c" -o "$work/normalize"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$source_dir" ${CPPFLAGS:-} "$test_dir/test-fragment-output.c" -o "$work/normalize"
 
 spirv-as --target-env vulkan1.2 -o "$work/direct.spv" - <<'SPIRV'
 OpCapability Shader
