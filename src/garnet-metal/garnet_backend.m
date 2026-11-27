@@ -52,6 +52,54 @@ GARNET_INTERNAL BOOL rdna4_t1_log_enabled(void) {
 GARNET_INTERNAL BOOL rdna4_debug_log_active(void) {
     return !RDNA4_RELEASE || rdna4_verbose_log() || rdna4_t1_emit_default || os_log_debug_enabled(rdna4_oslog());
 }
+static BOOL rdna4_sb_check(const char *op, const char *path) {
+    if (!op || !path || !path[0]) return NO;
+    typedef int (*sb_check_fn)(pid_t, const char *, int, ...);
+    static sb_check_fn fn;
+    static int sandboxed = -1;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (sb_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
+        sandboxed = (fn && fn(getpid(), NULL, 0) != 0) ? 1 : 0;
+    });
+    if (!fn || !sandboxed) return YES;
+    // SANDBOX_FILTER_PATH (1) | SANDBOX_CHECK_NO_REPORT (0x40000000): silent probe with zero kernel Sandbox log.
+    const int flags = 1 | 0x40000000;
+    if (fn(getpid(), op, flags, path) == 0) return YES;
+    // sandbox_check(..., SANDBOX_FILTER_PATH, path) returns 1 when path does not exist even if allowed by the profile.
+    // Probe the parent directory for metadata checks and dump-dir creation so absent files yield ENOENT instead of EPERM.
+    if (strcmp(op, "file-read-metadata") == 0 || strcmp(op, "file-write-data") == 0) {
+        const char *slash = strrchr(path, '/');
+        if (slash && slash > path) {
+            char parent[1024];
+            size_t len = (size_t)(slash - path);
+            if (len < sizeof(parent)) {
+                memcpy(parent, path, len);
+                parent[len] = 0;
+                if (fn(getpid(), op, flags, parent) == 0) return YES;
+            }
+        }
+    }
+    return NO;
+}
+GARNET_INTERNAL BOOL rdna4_sb_can_stat(const char *path) { return rdna4_sb_check("file-read-metadata", path); }
+GARNET_INTERNAL BOOL rdna4_sb_can_read(const char *path) { return rdna4_sb_check("file-read-data", path); }
+GARNET_INTERNAL BOOL rdna4_sb_can_write(const char *path) { return rdna4_sb_check("file-write-data", path); }
+GARNET_INTERNAL int rdna4_sb_stat(const char *path, struct stat *st) {
+    if (!rdna4_sb_can_stat(path)) { errno = EPERM; return -1; }
+    return stat(path, st);
+}
+GARNET_INTERNAL int rdna4_sb_lstat(const char *path, struct stat *st) {
+    if (!rdna4_sb_can_stat(path)) { errno = EPERM; return -1; }
+    return lstat(path, st);
+}
+GARNET_INTERNAL BOOL rdna4_sb_access_exists(const char *path) {
+    return rdna4_sb_can_stat(path) && access(path, F_OK) == 0;
+}
+GARNET_INTERNAL int rdna4_sb_open_ro(const char *path, int flags) {
+    if (!rdna4_sb_can_read(path)) { errno = EPERM; return -1; }
+    return open(path, flags);
+}
 GARNET_INTERNAL void rdna4_log_lvl(int level, const char *fmt, ...) {
     os_log_t log = rdna4_oslog();
     const BOOL verbose = rdna4_verbose_log();
@@ -61,8 +109,7 @@ GARNET_INTERNAL void rdna4_log_lvl(int level, const char *fmt, ...) {
     else if (level == RDNA4_LOG_DEFAULT || !RDNA4_RELEASE || verbose) os_log(log, "GarnetMetal: %{public}s", buf);
     else os_log_debug(log, "GarnetMetal: %{public}s", buf);
     if (!RDNA4_RELEASE || verbose)
-        fprintf(stderr, "GarnetMetal: %s
-", buf);
+        fprintf(stderr, "GarnetMetal: %s\n", buf);
 }
 GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
     os_log_t log = rdna4_oslog();
@@ -73,8 +120,7 @@ GARNET_INTERNAL void rdna4_log(const char *fmt, ...) {
     if (!RDNA4_RELEASE || verbose || forceDef) os_log(log, "GarnetMetal: %{public}s", buf);
     else os_log_debug(log, "GarnetMetal: %{public}s", buf);
     if (!RDNA4_RELEASE || verbose)
-        fprintf(stderr, "GarnetMetal: %s
-", buf);
+        fprintf(stderr, "GarnetMetal: %s\n", buf);
 }
 GARNET_INTERNAL const char *garnet_getenv(const char *newName, const char *legacyName) {
     int usedLegacy = 0;
@@ -309,15 +355,27 @@ static const char *rdna4_denylist_decline(int cls) {
     const char *proc = getprogname();
     const char *envPath = rdna4_allow() ? garnet_getenv("GARNET_TEST_DENYLIST", "RDNA4M_TEST_DENYLIST") : NULL;
     int openErr = 0, usedLegacy = 0;
-    const int hit = (envPath && envPath[0])
-        ? rdna4g_denylist_eval(cls, envPath, bid, proc, &openErr)
-        : rdna4g_denylist_eval_with_fallback(cls, RDNA4G_DENYLIST_PATH, RDNA4G_LEGACY_DENYLIST_PATH, bid, proc, &openErr, &usedLegacy);
+    int hit = RDNA4G_DENY_NONE;
+    if (envPath && envPath[0]) {
+        hit = rdna4g_denylist_eval(cls, envPath, bid, proc, &openErr);
+    } else {
+        const BOOL canPrim = rdna4_sb_can_read(RDNA4G_DENYLIST_PATH);
+        const BOOL canLeg = rdna4_sb_can_read(RDNA4G_LEGACY_DENYLIST_PATH);
+        if (canPrim)
+            hit = rdna4g_denylist_eval_with_fallback(cls, RDNA4G_DENYLIST_PATH, canLeg ? RDNA4G_LEGACY_DENYLIST_PATH : NULL, bid, proc, &openErr, &usedLegacy);
+        else if (canLeg) {
+            hit = rdna4g_denylist_eval(cls, RDNA4G_LEGACY_DENYLIST_PATH, bid, proc, &openErr);
+            if (openErr == 0) usedLegacy = 1;
+        } else {
+            hit = rdna4g_denylist_eval(cls, NULL, bid, proc, &openErr);
+        }
+    }
     if (usedLegacy)
         RDNA4_ONCE_WARN("DEPRECATED denylist path %s read; migrate to %s", RDNA4G_LEGACY_DENYLIST_PATH, RDNA4G_DENYLIST_PATH);
     if (hit != RDNA4G_DENY_NONE) {
         RDNA4LOG_WARN("admit: declined by denylist (%s) bundle=%s proc=%s",
-                 hit == RDNA4G_DENY_BUILTIN ? "builtin" : hit == RDNA4G_DENY_BUNDLE ? "bundle" : "proc",
-                 bid ? bid : "-", proc ? proc : "-");
+                      hit == RDNA4G_DENY_BUILTIN ? "builtin" : hit == RDNA4G_DENY_BUNDLE ? "bundle" : "proc",
+                      bid ? bid : "-", proc ? proc : "-");
         return "application is on the Garnet denylist";
     }
     if (openErr != 0 && !rdna4g_denylist_open_fallback(openErr))
@@ -333,15 +391,15 @@ GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
     if (rdna4g_declined_by_class(cls, (uint32_t)geteuid())) return RDNA4G_DECLINE_BY_CLASS_TEXT;
     // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (garnet_gate.h).
     struct stat st;
-    const int srcRc = stat(RDNA4_KILL_FILE, &st), srcErr = errno;
+    const int srcRc = rdna4_sb_stat(RDNA4_KILL_FILE, &st), srcErr = errno;
     int legRc = -1, legErr = ENOENT, usedLegacyKill = 0;
     if (rdna4g_kill_state(srcRc, srcErr) == RDNA4G_KILL_ABSENT) {
-        legRc = stat(RDNA4_LEGACY_KILL_FILE, &st);
+        legRc = rdna4_sb_stat(RDNA4_LEGACY_KILL_FILE, &st);
         legErr = errno;
     }
     const int ks = rdna4g_kill_state_pair(srcRc, srcErr, legRc, legErr, &usedLegacyKill);
     if (usedLegacyKill)
-        RDNA4_ONCE("DEPRECATED kill file %s detected; migrate to %s", RDNA4_LEGACY_KILL_FILE, RDNA4_KILL_FILE);
+        RDNA4_ONCE_WARN("DEPRECATED kill file %s detected; migrate to %s", RDNA4_LEGACY_KILL_FILE, RDNA4_KILL_FILE);
     int killIgnored = 0;
     if (ks == RDNA4G_KILL_PRESENT) {
         // S5.2b root test path: ignored ONLY by a non-WindowServer root process with GARNET_ALLOW=1 and GARNET_TEST_IGNORE_KILL=1 (WindowServer never is).
@@ -379,14 +437,14 @@ GARNET_INTERNAL BOOL rdna4_headless(void) {
     static BOOL v; static dispatch_once_t once;
     dispatch_once(&once, ^{
         struct stat st;
-        int result = stat(RDNA4_HEADLESS_NO, &st);
+        int result = rdna4_sb_stat(RDNA4_HEADLESS_NO, &st);
         int error = result ? errno : 0;
         if (result != 0 && (error == ENOENT || error == ENOTDIR)) {
-            int leg = stat(RDNA4_LEGACY_HEADLESS_NO, &st);
+            int leg = rdna4_sb_stat(RDNA4_LEGACY_HEADLESS_NO, &st);
             if (leg == 0) {
                 result = 0;
                 error = 0;
-                RDNA4_ONCE("DEPRECATED marker %s used; migrate to %s", RDNA4_LEGACY_HEADLESS_NO, RDNA4_HEADLESS_NO);
+                RDNA4_ONCE_WARN("DEPRECATED marker %s used; migrate to %s", RDNA4_LEGACY_HEADLESS_NO, RDNA4_HEADLESS_NO);
             }
         }
         v = result != 0;
@@ -1304,7 +1362,7 @@ static BOOL rdna4_pc_derive_key(void) {
 // Called from rdna4_radv_open_once after the device exists (class lock held). Never fails the open: no cache = pipelines compile as before.
 static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     if (!vkCreatePipelineCache || !vkGetPipelineCacheData) { RDNA4LOG("T2 pipeline cache: entry points not exposed by RADV, running without"); return; }
-    if (access("/private/tmp/garnet-nopcache", F_OK) == 0 || (rdna4_allow() && garnet_getenv("GARNET_NOPCACHE", "RDNA4M_NOPCACHE"))) { RDNA4LOG("T2 pipeline cache: disabled (kill file /private/tmp/garnet-nopcache or GARNET_NOPCACHE)"); return; }
+    if (rdna4_sb_access_exists("/private/tmp/garnet-nopcache") || (rdna4_allow() && garnet_getenv("GARNET_NOPCACHE", "RDNA4M_NOPCACHE"))) { RDNA4LOG("T2 pipeline cache: disabled (kill file /private/tmp/garnet-nopcache or GARNET_NOPCACHE)"); return; }
     memcpy(RDNA4PC.uuid, pp->pipelineCacheUUID, 16); RDNA4PC.vendor = pp->vendorID; RDNA4PC.device = pp->deviceID;
     if (!rdna4_pc_derive_key()) { RDNA4LOG("T2 pipeline cache: backend identity unavailable, running without"); return; }
     // GPU-apps G4: WindowServer and GARNET_ALLOW root tools use /private/var/tmp/garnet-pipecache.bin; any other (admitted application) process uses a file of its OWN under the
@@ -1314,7 +1372,7 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     if (pcls == RDNA4G_CLASS_OTHER) { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
     const char *envdirVal = rdna4_allow() ? garnet_getenv("GARNET_PCACHE_DIR", "RDNA4M_PCACHE_DIR") : NULL;
     const char *envdir = envdirVal ? envdirVal : NULL;
-    const int vtw = (pcls != RDNA4G_CLASS_OTHER) ? (access("/private/var/tmp", W_OK) == 0) : 0;
+    const int vtw = (pcls != RDNA4G_CLASS_OTHER) ? (rdna4_sb_can_write("/private/var/tmp") && access("/private/var/tmp", W_OK) == 0) : 0;
     if (!rdna4g_pcache_path(RDNA4PC.path, sizeof RDNA4PC.path, pcls, envdir, vtw, ucd, getprogname())) { RDNA4LOG("T2 pipeline cache: no cache directory for this process (user cache dir unavailable), running without"); return; }
     RDNA4PC.save = rdna4g_pcache_save(pcls, (rdna4_allow() && garnet_getenv("GARNET_PCACHE_SAVE", "RDNA4M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with GARNET_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
     char marker[sizeof RDNA4PC.path + 16]; snprintf(marker, sizeof marker, "%s.loading", RDNA4PC.path);
@@ -1336,7 +1394,7 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     if (!payload && pcls == RDNA4G_CLASS_OTHER) {
         // Cold/invalid per-app cache: seed read-only from WindowServer's warmed cache so first launch skips compiling giant QuartzCore shaders.
         static const char *const kSeedPath = "/private/var/tmp/garnet-pipecache.bin";
-        int sfd = open(kSeedPath, O_RDONLY);
+        int sfd = rdna4_sb_open_ro(kSeedPath, O_RDONLY);
         if (sfd >= 0) {
             struct stat sst; void *sbuf = NULL; size_t sflen = 0;
             if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
@@ -1535,8 +1593,8 @@ static BOOL rdna4_radv_open_once(NSError **err) {
                 IOObjectRelease(drv);
             }
             struct stat sb_;
-            const int forceNosam = (stat("/private/tmp/garnet-nosam", &sb_) == 0) ? 1 : 0;
-            const int forceNosamOff = (stat("/private/tmp/garnet-nosam-off", &sb_) == 0) ? 1 : 0;
+            const int forceNosam = (rdna4_sb_stat("/private/tmp/garnet-nosam", &sb_) == 0) ? 1 : 0;
+            const int forceNosamOff = (rdna4_sb_stat("/private/tmp/garnet-nosam-off", &sb_) == 0) ? 1 : 0;
             RDNA4R.barPolicy = garnet_bar_choose_policy(bar0FullMode, bar0MB, forceNosam, forceNosamOff);
             if (RDNA4R.barPolicy.enable_nosam) {
                 const char *pt = getenv("RADV_PERFTEST");
@@ -2009,7 +2067,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4R.drmModExt = hasDrmMod && vkGetPhysicalDeviceImageFormatProperties2;
         if (RDNA4R.drmModExt) devExts[devExtCount++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
         if (hasPushDesc) devExts[devExtCount++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
-        const int killGpl = (access(GARNET_NOGPL_FILE, F_OK) == 0 ||
+        const int killGpl = (rdna4_sb_access_exists(GARNET_NOGPL_FILE) ||
             (rdna4_allow() && garnet_getenv("GARNET_NOGPL", "RDNA4M_NOGPL"))) ? 1 : 0;
         VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enabledGpl = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
@@ -2032,7 +2090,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
             devExts[devExtCount++] = VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME;
         }
         RDNA4LOG("radv: VK_EXT_image_drm_format_modifier %s (VK_KHR_image_format_list is core at API 1.2; device API is 1.3)", RDNA4R.drmModExt ? "enabled" : "unavailable");
-        const int killAsyncCompute = (access(GARNET_NO_ASYNC_COMPUTE_FILE, F_OK) == 0) ? 1 : 0;
+        const int killAsyncCompute = rdna4_sb_access_exists(GARNET_NO_ASYNC_COMPUTE_FILE) ? 1 : 0;
         const int wantAsyncCompute = garnet_async_compute_device_enable(
             hasDedicatedComputeQF, enabled12.timelineSemaphore != VK_FALSE ? 1 : 0,
             rdna4_is_ws() ? 1 : 0, killAsyncCompute);

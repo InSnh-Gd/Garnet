@@ -3459,6 +3459,13 @@ GARNET_INTERNAL_EXTERN void rdna4_log(const char *fmt, ...) __attribute__((forma
 GARNET_INTERNAL_EXTERN BOOL rdna4_verbose_log(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_t1_log_enabled(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_debug_log_active(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_sb_can_stat(const char *path);
+GARNET_INTERNAL_EXTERN BOOL rdna4_sb_can_read(const char *path);
+GARNET_INTERNAL_EXTERN BOOL rdna4_sb_can_write(const char *path);
+GARNET_INTERNAL_EXTERN int rdna4_sb_stat(const char *path, struct stat *st);
+GARNET_INTERNAL_EXTERN int rdna4_sb_lstat(const char *path, struct stat *st);
+GARNET_INTERNAL_EXTERN BOOL rdna4_sb_access_exists(const char *path);
+GARNET_INTERNAL_EXTERN int rdna4_sb_open_ro(const char *path, int flags);
 GARNET_INTERNAL_EXTERN BOOL rdna4_is_ws(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_allow(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_force_fallback(void);
