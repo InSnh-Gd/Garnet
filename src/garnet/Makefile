@@ -103,7 +103,7 @@ COMMON := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -I$(MKSDK)/Headers -Isrc -Isrc/amd -I$(DCN41_DIR) -mmacosx-version-min=$(DEPLOY) \
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
   -D_FORTIFY_SOURCE=0 -nostdinc -fno-builtin -fno-common -fno-stack-protector \
-  -mkernel -fapple-kext -Wall -Os -g
+  -mkernel -mno-sse -mno-mmx -mno-80387 -fapple-kext -Wall -Os -g
 CXXFLAGS := $(COMMON) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors \
   -include src/GarnetBootArgs.h   # rdna4-* boot-arg fallback (logs when a legacy token is used)
 CFLAGS   := $(filter-out -fapple-kext,$(COMMON))
@@ -114,7 +114,13 @@ LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) 
 
 all: $(KEXT)
 
-$(OBJS): | check-firmware check-version
+OBJDUMP ?= llvm-objdump
+.PHONY: check-kernel-fp
+check-kernel-fp: $(OBJS)
+	@count=$$(python3 ../../tools/dcn41/fpu_count.py "$(OBJDUMP)" $(OBJS)) && \
+	  printf 'FP/SIMD instructions in %s kernel objects: %s\n' '$(words $(OBJS))' "$$count" && test "$$count" = 0
+
+$(OBJS): Makefile | check-firmware check-version
 check-version:
 	@ver=$$(tr -d ' \t\r\n' < VERSION); \
 	 grep -q "GARNET_KEXT_VERSION_STR \"$$ver\"" src/garnet_version.h || { echo "error: src/garnet_version.h does not match VERSION ($$ver)"; exit 1; }; \
