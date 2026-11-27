@@ -107,6 +107,7 @@
 #include "amdgpu_log.h"
 #include "amdgpu_field_defs.h"
 #include "amdgpu_sdma.h"   // 0.0.193: sdma_ib_copy_linear_test for the vmfrag self-test
+#include "amdgpu_smu.h"    // refcounted GC MMIO GFXOFF guard
 
 // amdgpu_regs.h's REG_SET_FIELD complements `reg##__##field##_MASK`, and
 // amdgpu_field_defs.h spells those masks as plain (signed) `int` literals
@@ -1705,6 +1706,8 @@ gmc_flush_gpu_tlb(DeviceContext &dev, const GMCContext &gmc,
     const uint64_t call_start_us = tlb83_now_us(nullptr);
     (void)gmc;
     if (!hub.inited || !dev.ip.isResolved(hub.ip)) return kIOReturnNotReady;
+    ScopedGfxOffGuard gfxOffGuard(dev, (hub.ip == IPBlock::GC) ? gfx_off_active_context() : nullptr);
+    if (!gfxOffGuard.ok()) return gfxOffGuard.status();
 
     // Build the request word via REG_SET_FIELD — same pattern as
     // {mmhub,gfxhub}_v*_get_invalidate_req upstream.
@@ -1961,8 +1964,12 @@ static void log_hub_faults(DeviceContext &dev, const char *name, IPBlock block,
 
 void gmc_log_vm_faults(DeviceContext &dev, const GMCContext &gmc) {
     (void)gmc;
-    log_hub_faults(dev, "GCVM (gfxhub)",  IPBlock::GC,    0x15d0, 0x15d1, 0x15d2, 0x15d3);
-    log_hub_faults(dev, "MMVM (mmhub)",   IPBlock::MMHUB, 0x04f0, 0x04f1, 0x04f2, 0x04f3);
+    {
+        ScopedGfxOffGuard gfxOffGuard(dev);
+        if (gfxOffGuard.ok())
+            log_hub_faults(dev, "GCVM (gfxhub)", IPBlock::GC, 0x15d0, 0x15d1, 0x15d2, 0x15d3);
+    }
+    log_hub_faults(dev, "MMVM (mmhub)", IPBlock::MMHUB, 0x04f0, 0x04f1, 0x04f2, 0x04f3);
 }
 
 // Linux gmc_v12_0_process_interrupt: after reading the status,
@@ -1973,6 +1980,8 @@ void gmc_clear_vm_faults(DeviceContext &dev, const GMCContext &gmc) {
     const HubContext *hubs[2] = { &gmc.gfxhub, &gmc.mmhub };
     for (const HubContext *h : hubs) {
         if (!h->inited || !dev.ip.isResolved(h->ip)) continue;
+        ScopedGfxOffGuard gfxOffGuard(dev, (h->ip == IPBlock::GC) ? gfx_off_active_context() : nullptr);
+        if (!gfxOffGuard.ok()) continue;
         const uint32_t reg = SOC15_REG_OFFSET_BIDX(dev, h->ip, h->base_idx, h->vm_l2_protection_fault_cntl);
         const uint32_t v = RREG32(dev, reg);
         WREG32(dev, reg, v | 1u);

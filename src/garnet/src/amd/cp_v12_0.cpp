@@ -157,6 +157,7 @@
 //
 
 #include <IOKit/IOLib.h>
+#include "amdgpu_smu.h"
 
 #include "amdgpu_cp.h"
 #include "amdgpu_gmc.h"
@@ -244,6 +245,11 @@ cp_dump_state(const DeviceContext &dev, const CPContext &cp,
 {
     if (!dev.ip.isResolved(IPBlock::GC)) {
         CP_LOG("state dump (%s): GC IP base unresolved", where);
+        return;
+    }
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) {
+        CP_LOG("state dump (%s): GFXOFF disallow failed (%#x)", where, gfxOffGuard.status());
         return;
     }
     CP_LOG("=== CP state dump (%s) ===", where);
@@ -1392,6 +1398,8 @@ void
 cp_dump_gfx_hqd(const DeviceContext &dev, const char *where)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return;
     CP_LOG("--- GFX HQD block me0/pipe0/queue0 (%s) ---", where);
     cp_grbm_select(dev, 0, 0, 0, 0);
     cp_rreg_logged(dev, "CP_GFX_HQD_ACTIVE",       CP_REG(dev, CP_GFX_HQD_ACTIVE));
@@ -1511,6 +1519,8 @@ cp_gfx_mqd_init(const DeviceContext &dev, CPContext &cp)
     tmp = GfxMqd::kDefault_CP_GFX_HQD_CNTL;
     tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, RB_BUFSZ, rb_bufsz);
     tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, RB_BLKSZ, rb_bufsz - 2u);
+    // Upstream 14741c01680a (gfx_v12_0.c:3063): mark kernel GFX queue (bit 29).
+    tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, KMD_QUEUE, 1u);
     // kernel_queue -> RB_NON_PRIV 0; not a TMZ queue -> TMZ_MATCH 0.
     m[GfxMqd::cp_gfx_hqd_cntl] = tmp;
 
@@ -1655,6 +1665,8 @@ cp_gfx_mqd_init_external(const DeviceContext &dev, CPContext &cp,
     tmp = GfxMqd::kDefault_CP_GFX_HQD_CNTL;
     tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, RB_BUFSZ, rb_bufsz);
     tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, RB_BLKSZ, rb_bufsz - 2u);
+    // Upstream 14741c01680a (gfx_v12_0.c:3063): external ring is also a kernel GFX queue.
+    tmp = REG_SET_FIELD(tmp, CP_GFX_HQD_CNTL, KMD_QUEUE, 1u);
     // RB_NO_UPDATE (bit 27) stays CLEAR: initGraphicsMQD clears the same bit in
     // Apple's own copy (`andb $-0x9, 0x247(%r13)` @0xbe2553d — byte 0x247 is
     // byte 3 of dword 145, i.e. bit 27 of CP_GFX_HQD_CNTL), so the CP is meant
@@ -2895,10 +2907,12 @@ cp_compute_submit_ib(const DeviceContext &dev, ComputeQueue &cq, uint64_t ib_gpu
     pkt[n++] = 0;       // data_hi (the fence counter is 32-bit)
     pkt[n++] = 0;       // trailing dword required by count = 6
 
+    // Keep cq.wptr as a monotonic 64-bit counter (matching GFX ring_put_locked);
+    // mask only the ring buffer index so WDOORBELL64 always receives the full 64-bit wptr.
     auto *ring = static_cast<uint32_t *>(cq.ring_cpu);
     for (uint32_t i = 0; i < n; i++) {
-        ring[cq.wptr] = pkt[i];
-        cq.wptr = (cq.wptr + 1) & cq.ring_ptr_mask;
+        ring[static_cast<uint32_t>(cq.wptr & cq.ring_ptr_mask)] = pkt[i];
+        cq.wptr++;
     }
 
     const uint64_t wptr64 = cq.wptr;
@@ -2907,6 +2921,7 @@ cp_compute_submit_ib(const DeviceContext &dev, ComputeQueue &cq, uint64_t ib_gpu
     sysmem_wmb();
     amdgpu_hdp_flush(dev);
     if (dev.bar2 == nullptr) return kIOReturnNotAttached;
+    smu_idle_dpm_note_activity(false, true);
     WDOORBELL64(dev, (uint64_t)cq.doorbell_index * kCPDoorbellStride, wptr64);
 
     if (out_fence) *out_fence = fence;
@@ -2938,6 +2953,8 @@ void
 cp_dump_compute_hqd(const DeviceContext &dev, const ComputeQueue &cq, const char *where)
 {
     if (!dev.ip.isResolved(IPBlock::GC)) return;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return;
     CP_LOG("--- compute HQD me%u/pipe%u/queue%u (%s) ---", cq.me, cq.pipe, cq.queue, where);
     cp_grbm_select(dev, cq.me, cq.pipe, cq.queue, 0);
     cp_rreg_logged(dev, "CP_HQD_ACTIVE",            CP_REG(dev, CP_HQD_ACTIVE));
@@ -2950,7 +2967,7 @@ cp_dump_compute_hqd(const DeviceContext &dev, const ComputeQueue &cq, const char
     cp_grbm_select(dev, 0, 0, 0, 0);
     if (cq.wb_cpu) {
         sysmem_rmb();
-        CP_LOG("  sw wptr=%u  wb rptr=%u  wb fence=%#llx", cq.wptr,
+        CP_LOG("  sw wptr=%llu  wb rptr=%u  wb fence=%#llx", (unsigned long long)cq.wptr,
                cq.rptr_cpu ? *cq.rptr_cpu : 0u,
                (unsigned long long)(cq.fence_cpu ? *cq.fence_cpu : 0ull));
     }

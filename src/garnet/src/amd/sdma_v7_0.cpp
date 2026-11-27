@@ -66,6 +66,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_log.h"
 #include "amdgpu_psp.h"
+#include "amdgpu_smu.h"
 // amdgpu_ucode_extract.h carries its own copy of the PSPGfxFwType
 // constants, guarded by AMDGPU_PSP_GFX_FW_TYPE_DEFINED. amdgpu_psp.h
 // (included above) defines the same namespace but does NOT define that
@@ -1406,6 +1407,9 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    // Notify the activity-driven GFXCLK idle governor without blocking (caller
+    // may hold gScanoutLock).
+    smu_idle_dpm_note_activity(false);
     const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
 
     // 1) WPTR shadow in the writeback page — upstream

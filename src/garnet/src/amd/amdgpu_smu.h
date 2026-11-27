@@ -33,6 +33,8 @@
 
 #include <stdint.h>
 #include "amdgpu_regs.h"
+#include "garnet_gfxoff_pure.h"
+#include "garnet_power_policy_pure.h"
 
 namespace amdgpu {
 
@@ -285,6 +287,71 @@ kern_return_t smu_set_power_state(const DeviceContext &dev, uint32_t state);
 kern_return_t smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz);
 kern_return_t smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz = nullptr);
 kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
+
+// Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard
+// and activity-driven GFXCLK idle DPM governor.
+struct SMUContext {
+    rdna4gfxoff::GuardState   gfxoff {};
+    rdna4pwr::IdleDpmGovernor idleDpm {};
+    volatile uint32_t         hwGfxOffActive { 0u };
+    bool                      inited         { false };
+};
+
+// Refcounted GC MMIO GFXOFF guard.
+// Exported cleanly so GC MMIO paths (TLB flush, diagnostics, hang recovery)
+// and VCN 5.0 DPG handoff (`enable-rdna4-vcn5-video`) share one serialized
+// refcount. When hardware GFXOFF is active, allow=false increments refcount
+// (0 -> 1 sends DisallowGfxOff) and allow=true decrements (1 -> 0 sends
+// AllowGfxOff). Fails closed on underflow or DisallowGfxOff failure.
+kern_return_t gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow);
+kern_return_t gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
+                                bool bootArgPresent, uint32_t bootArgValue,
+                                bool *outAllowed = nullptr);
+void          gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
+void          gfx_off_register_context(SMUContext *smu);
+SMUContext   *gfx_off_active_context();
+
+// Balanced RAII guard for GC MMIO critical sections.
+struct ScopedGfxOffGuard {
+    const DeviceContext *dev;
+    SMUContext          *ctx;
+    kern_return_t        kr;
+    bool                 held;
+
+    explicit ScopedGfxOffGuard(const DeviceContext &d,
+                               SMUContext *c = gfx_off_active_context())
+        : dev(&d), ctx(c), kr(kIOReturnSuccess), held(false) {
+        if (ctx != nullptr) {
+            kr = gfx_off_ctrl(*dev, *ctx, false);
+            held = (kr == kIOReturnSuccess);
+        }
+    }
+    ~ScopedGfxOffGuard() {
+        if (held && ctx != nullptr) {
+            (void)gfx_off_ctrl(*dev, *ctx, true);
+        }
+    }
+    bool ok() const { return kr == kIOReturnSuccess; }
+    kern_return_t status() const { return kr; }
+    ScopedGfxOffGuard(const ScopedGfxOffGuard &) = delete;
+    ScopedGfxOffGuard &operator=(const ScopedGfxOffGuard &) = delete;
+};
+
+// Activity-driven SMU GFXCLK idle governor (`garnet-idle-dpm`).
+// Serialized via SmuSeq on a dedicated IOWorkLoop/IOTimerEventSource (never
+// in IRQ context, never holding GPU ring locks across SMU mailbox I/O).
+using IdleDpmBusyFn = bool (*)(void *);
+void smu_idle_dpm_start(DeviceContext &dev, SMUContext &smu,
+                        bool dpmEnabled, bool idleClamp,
+                        IdleDpmBusyFn hwBusyFn, void *hwBusyCtx);
+void smu_idle_dpm_stop();
+// Notify governor of GFX/KCQ/SDMA submission activity.
+// `canBlock == true` boosts Low -> Auto synchronously (caller must hold no GPU
+// ring/scanout lock); `canBlock == false` updates timestamp lock-free and kicks
+// the governor workloop asynchronously when currently in Low.
+void smu_idle_dpm_note_activity(bool canBlock, bool heavy = false);
+// Lock out automatic idle governance after manual `garnettest power <state>`.
+void smu_idle_dpm_manual_override(uint32_t state);
 
 //=====================================================================
 //  Telemetry — the SMU metrics table

@@ -66,6 +66,7 @@ struct BringupContext {
     ComputeQueue   kcq {};        // kernel compute queue (MEC), mapped by the MES
     SDMAContext    sdma {};
     MESContext     mes {};
+    SMUContext     smu {};
     SDMAVRAMCopyResult sdmaCopy {};
     bool           sdmaCopyPassed { false };
     // Option B' self-test. Runs at the END of SDMAInit (stage 15) — the first
@@ -132,6 +133,7 @@ struct BringupContext {
     bool kgqMapped { false };        // PM4Test: MES acked ADD_QUEUE(map_legacy_kq) for the kernel GFX ring
     bool cpRingTestPassed { false }; // PM4Test: gfx_v12_0_ring_test_ring (SET_UCONFIG_REG SCRATCH_REG0) landed
     bool idleClamp { false };        // garnet-idle-clamp=1 to clamp GFXCLK to 200 MHz Low (default OFF: Auto)
+    bool idleDpmEnabled { true };    // garnet-idle-dpm=0 disables activity-driven SMU GFXCLK idle governor (default ON)
     bool gfxOffAllowed { false };    // Stage 3C: opt-in garnet-gfxoff=1 enabled AllowGfxOff
     bool wantKcq { false };
     // rdna4-hsa-abi=1: dispatch the LLVM-compiled kernel (shaders/store_magic_hsa.s)

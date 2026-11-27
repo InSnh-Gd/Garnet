@@ -46,6 +46,11 @@ bool n1c_is_open();   // any session open
 // 0.0.610 (ABI 1.8): read-only views for the Metal nub's gate. Hello done on the live session / the GPU declared HUNG this boot.
 bool n1c_hello_done();
 bool n1c_hung();
+// Lock-free busy probe for the activity-driven SMU GFXCLK idle governor (true if GFX or KCQ has unretired work).
+bool n1c_rings_busy();
+// ABI 1.14: kernel-authoritative kill switch (synced with /private/tmp/garnet-off via root-only accel action 115).
+bool n1c_kill_switch();
+void n1c_set_kill_switch(bool on);
 
 // Selector bodies. The caller (the client) has already checked scalar counts and struct sizes EXACTLY. Every one returns NotReady
 // until Hello succeeded. Locking is described in the contract: all but QueryInfo / ReadRegs / WaitSeq take the client lock.

@@ -75,6 +75,11 @@
 #include "amdgpu_smu.h"
 #include "amdgpu_log.h"
 
+#ifdef KERNEL
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
+#endif
+#include <kern/clock.h>
 #include <kern/thread.h>          // current_thread(): the owner of the shared mailbox lock (0.0.604)
 #include <libkern/OSAtomic.h>
 
@@ -913,6 +918,429 @@ smu_set_gfx_off(const DeviceContext &dev, bool allow)
     kern_return_t r = smu_send_msg(dev, msg);
     SMU_LOG("gfxoff(%s): kr=0x%x", allow ? "allow" : "disallow", (unsigned)r);
     return r;
+}
+
+//=====================================================================
+//  Refcounted GC MMIO GFXOFF guard
+//=====================================================================
+static SMUContext *gActiveGfxOffCtx { nullptr };
+
+void
+gfx_off_register_context(SMUContext *smu)
+{
+    __atomic_store_n(&gActiveGfxOffCtx, smu, __ATOMIC_RELEASE);
+}
+
+SMUContext *
+gfx_off_active_context()
+{
+    return __atomic_load_n(&gActiveGfxOffCtx, __ATOMIC_ACQUIRE);
+}
+
+kern_return_t
+gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
+                  bool bootArgPresent, uint32_t bootArgValue,
+                  bool *outAllowed)
+{
+    if (outAllowed) *outAllowed = false;
+    SmuSeq seq;
+    if (!seq.held) return kIOReturnNoMemory;
+    smu.gfxoff.configure(bootArgPresent, bootArgValue);
+    __atomic_store_n(&smu.hwGfxOffActive, 0u, __ATOMIC_RELEASE);
+    if (rdna4gfxoff::gfxoff_kill_switch_active(bootArgPresent, bootArgValue)) {
+        SMU_LOG("gfxoff: disabled by boot-arg garnet-gfxoff=0");
+        return kIOReturnSuccess;
+    }
+    if (!rdna4gfxoff::gfxoff_hw_opt_in(bootArgPresent, bootArgValue)) {
+        return kIOReturnSuccess;
+    }
+    if (!dev.smuOnline) return kIOReturnNotReady;
+    kern_return_t r = smu_set_gfx_off(dev, true);
+    if (r == kIOReturnSuccess && smu.gfxoff.arm_hw_allowed()) {
+        __atomic_store_n(&smu.hwGfxOffActive, 1u, __ATOMIC_RELEASE);
+        if (outAllowed) *outAllowed = true;
+    }
+    return r;
+}
+
+void
+gfx_off_teardown(const DeviceContext &dev, SMUContext &smu)
+{
+    SmuSeq seq;
+    if (!seq.held) return;
+    const rdna4gfxoff::Action act = smu.gfxoff.disable_hw();
+    __atomic_store_n(&smu.hwGfxOffActive, 0u, __ATOMIC_RELEASE);
+    if (act == rdna4gfxoff::Action::SendDisallow && dev.smuOnline) {
+        (void)smu_set_gfx_off(dev, false);
+    }
+}
+
+kern_return_t
+gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow)
+{
+    // Fast path when hardware GFXOFF is inactive (default boot or garnet-gfxoff=0):
+    // avoids contending on SmuSeq in hot TLB-flush paths while preserving balanced counts.
+    if (__atomic_load_n(&smu.hwGfxOffActive, __ATOMIC_ACQUIRE) == 0u) {
+        if (!allow) {
+            uint32_t cur = __atomic_load_n(&smu.gfxoff.disallow_count, __ATOMIC_RELAXED);
+            while (cur != UINT32_MAX &&
+                   !__atomic_compare_exchange_n(&smu.gfxoff.disallow_count, &cur, cur + 1u,
+                                                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+            return kIOReturnSuccess;
+        }
+        uint32_t cur = __atomic_load_n(&smu.gfxoff.disallow_count, __ATOMIC_ACQUIRE);
+        while (cur > 0u) {
+            if (__atomic_compare_exchange_n(&smu.gfxoff.disallow_count, &cur, cur - 1u,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                return kIOReturnSuccess;
+            }
+        }
+        __atomic_fetch_add(&smu.gfxoff.underflow_count, 1u, __ATOMIC_RELAXED);
+        SMU_LOG("gfx_off_ctrl: underflow on allow() while inactive");
+        return kIOReturnBadArgument;
+    }
+
+    SmuSeq seq;
+    if (!seq.held) return kIOReturnNoMemory;
+
+    const rdna4gfxoff::Action act = smu.gfxoff.request(allow, dev.smuOnline);
+    switch (act) {
+    case rdna4gfxoff::Action::None:
+        return kIOReturnSuccess;
+    case rdna4gfxoff::Action::Underflow:
+        SMU_LOG("gfx_off_ctrl: underflow on allow() (count=0, total_underflows=%u)",
+                smu.gfxoff.underflow_count);
+        return kIOReturnBadArgument;
+    case rdna4gfxoff::Action::Faulted:
+        SMU_LOG("gfx_off_ctrl: refusing GC access in faulted/offline GFXOFF state (smuOnline=%u)",
+                dev.smuOnline ? 1u : 0u);
+        return kIOReturnNotReady;
+    case rdna4gfxoff::Action::SendDisallow: {
+        const kern_return_t r = smu_set_gfx_off(dev, false);
+        smu.gfxoff.commit(act, r == kIOReturnSuccess);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("gfx_off_ctrl: DisallowGfxOff FAILED (kr=0x%x) — latching fail-safe",
+                    (unsigned)r);
+        }
+        return r;
+    }
+    case rdna4gfxoff::Action::SendAllow: {
+        const kern_return_t r = smu_set_gfx_off(dev, true);
+        smu.gfxoff.commit(act, r == kIOReturnSuccess);
+        if (r != kIOReturnSuccess) {
+            SMU_LOG("gfx_off_ctrl: AllowGfxOff failed (kr=0x%x) — staying disallowed",
+                    (unsigned)r);
+        }
+        return r;
+    }
+    }
+    return kIOReturnError;
+}
+
+//=====================================================================
+//  Activity-driven SMU GFXCLK idle governor (`garnet-idle-dpm`)
+//
+//  Lock ordering (strictly acyclic):
+//    gIdleDpmCtlLock -> gIdleDpmWorkLoop gate -> SmuSeq
+//  Never acquire gIdleDpmCtlLock inside the timer callback, and never hold
+//  SmuSeq across IOTimerEventSource::setTimeoutMS().
+//=====================================================================
+static constexpr uint32_t kIdleDpmPollMs = 250u;
+
+static IOLock             *gIdleDpmCtlLock   { nullptr };
+#ifdef KERNEL
+static IOWorkLoop         *gIdleDpmWorkLoop  { nullptr };
+static IOTimerEventSource *gIdleDpmTimer     { nullptr };
+#endif
+static DeviceContext      *gIdleDpmDev       { nullptr };
+static SMUContext         *gIdleDpmSmu       { nullptr };
+static IdleDpmBusyFn       gIdleDpmBusyFn    { nullptr };
+static void               *gIdleDpmBusyCtx   { nullptr };
+static volatile uint32_t   gIdleDpmInLow         { 0u };
+static volatile uint32_t   gIdleDpmWantBoost     { 0u };
+static volatile uint32_t   gIdleDpmLightSubmits  { 0u };
+static volatile uint32_t   gIdleDpmLowProbeArmed { 0u };
+static volatile uint32_t   gIdleDpmStopping      { 1u };
+static volatile uint64_t   gIdleDpmLastActNs     { 0ull };
+
+static inline uint64_t smu_now_ns()
+{
+    uint64_t t = 0, ns = 0;
+    clock_get_uptime(&t);
+    absolutetime_to_nanoseconds(t, &ns);
+    return ns;
+}
+
+static void smu_idle_dpm_arm_timer_ms(uint32_t ms)
+{
+#ifdef KERNEL
+    IOLock *l = __atomic_load_n(&gIdleDpmCtlLock, __ATOMIC_ACQUIRE);
+    if (l == nullptr) return;
+    IOLockLock(l);
+    if (gIdleDpmTimer != nullptr && __atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) == 0u) {
+        (void)gIdleDpmTimer->setTimeoutMS(ms);
+    }
+    IOLockUnlock(l);
+#else
+    (void)ms;
+#endif
+}
+
+#ifdef KERNEL
+static void smu_idle_dpm_timer_cb(OSObject *, IOTimerEventSource *sender)
+{
+    if (__atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) != 0u) return;
+
+    const bool hwBusy = (gIdleDpmBusyFn != nullptr) && gIdleDpmBusyFn(gIdleDpmBusyCtx);
+    uint32_t nextTimerMs = 0u;
+    {
+        SmuSeq seq;
+        if (!seq.held) return;
+        if (__atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) != 0u) return;
+        DeviceContext *dev = gIdleDpmDev;
+        SMUContext    *smu = gIdleDpmSmu;
+        if (dev == nullptr || smu == nullptr || !dev->smuOnline) return;
+
+        rdna4pwr::IdleDpmGovernor &gov = smu->idleDpm;
+        const uint64_t lastAtom = __atomic_load_n(&gIdleDpmLastActNs, __ATOMIC_ACQUIRE);
+        if (lastAtom > gov.lastActiveNs) gov.lastActiveNs = lastAtom;
+
+        const bool wantBoost = (__atomic_exchange_n(&gIdleDpmWantBoost, 0u, __ATOMIC_ACQ_REL) != 0u);
+        const uint64_t nowNs = smu_now_ns();
+        rdna4pwr::IdleDpmAction act = rdna4pwr::IdleDpmAction::None;
+        bool resetLowWin = false;
+
+        if (wantBoost) {
+            act = gov.on_activity(nowNs);
+            resetLowWin = true;
+        } else if (gov.is_low()) {
+            const uint32_t cnt = __atomic_load_n(&gIdleDpmLightSubmits, __ATOMIC_ACQUIRE);
+            act = gov.on_low_probe(nowNs, hwBusy, cnt, &nextTimerMs, &resetLowWin);
+        } else {
+            const uint32_t sampled = __atomic_exchange_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_ACQ_REL);
+            act = gov.on_tick(nowNs, hwBusy, sampled);
+        }
+
+        if (act == rdna4pwr::IdleDpmAction::SetAuto) {
+            const kern_return_t r = smu_set_power_state(*dev, SMUPowerState::Auto);
+            gov.commit(act, r == kIOReturnSuccess);
+            if (r == kIOReturnSuccess) {
+                __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+                SMU_LOG("idle-dpm: GFXCLK Low -> Auto (boost #%u)", gov.boostCount);
+            }
+        } else if (act == rdna4pwr::IdleDpmAction::SetLow) {
+            const kern_return_t r = smu_set_power_state(*dev, SMUPowerState::Low);
+            gov.commit(act, r == kIOReturnSuccess);
+            if (r == kIOReturnSuccess) {
+                __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+                SMU_LOG("idle-dpm: GFXCLK Auto -> Low after idle quiet window (drop #%u)",
+                        gov.idleDropCount);
+            }
+        } else if (resetLowWin) {
+            __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+            // Catch a submit that arrived right as the 250 ms Low rate window closed.
+            if (nextTimerMs == 0u && gov.active() && gov.is_low() &&
+                __atomic_load_n(&gIdleDpmLightSubmits, __ATOMIC_ACQUIRE) > 0u &&
+                __atomic_exchange_n(&gIdleDpmLowProbeArmed, 1u, __ATOMIC_ACQ_REL) == 0u) {
+                nextTimerMs = rdna4pwr::kIdleDpmBusyProbeMs;
+            }
+        }
+
+        const bool isLow = gov.active() && gov.is_low();
+        __atomic_store_n(&gIdleDpmInLow, isLow ? 1u : 0u, __ATOMIC_RELEASE);
+        if (gov.active() && !gov.is_low()) {
+            nextTimerMs = kIdleDpmPollMs;
+        }
+    }
+
+    if (nextTimerMs > 0u && sender != nullptr &&
+        __atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) == 0u) {
+        (void)sender->setTimeoutMS(nextTimerMs);
+    }
+}
+#endif
+
+void
+smu_idle_dpm_start(DeviceContext &dev, SMUContext &smu,
+                   bool dpmEnabled, bool idleClamp,
+                   IdleDpmBusyFn hwBusyFn, void *hwBusyCtx)
+{
+    smu_idle_dpm_stop();
+
+    if (__atomic_load_n(&gIdleDpmCtlLock, __ATOMIC_ACQUIRE) == nullptr) {
+        IOLock *l = IOLockAlloc();
+        if (l != nullptr &&
+            !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIdleDpmCtlLock)) {
+            IOLockFree(l);
+        }
+    }
+
+    const uint64_t nowNs = smu_now_ns();
+    {
+        SmuSeq seq;
+        if (!seq.held) return;
+        smu.idleDpm.init(dpmEnabled, idleClamp, nowNs);
+        gIdleDpmDev     = &dev;
+        gIdleDpmSmu     = &smu;
+        gIdleDpmBusyFn  = hwBusyFn;
+        gIdleDpmBusyCtx = hwBusyCtx;
+        __atomic_store_n(&gIdleDpmLastActNs, nowNs, __ATOMIC_RELEASE);
+        __atomic_store_n(&gIdleDpmWantBoost, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&gIdleDpmInLow, 0u, __ATOMIC_RELEASE);
+    }
+
+    if (!smu.idleDpm.active()) {
+        SMU_LOG("idle-dpm: inactive (enabled=%u idleClamp=%u)",
+                dpmEnabled ? 1u : 0u, idleClamp ? 1u : 0u);
+        return;
+    }
+
+#ifdef KERNEL
+    IOWorkLoop *wl = IOWorkLoop::workLoop();
+    if (wl == nullptr) {
+        SMU_LOG("idle-dpm: IOWorkLoop alloc failed — staying in Auto");
+        return;
+    }
+    IOTimerEventSource *timer = IOTimerEventSource::timerEventSource(wl, &smu_idle_dpm_timer_cb);
+    if (timer == nullptr || wl->addEventSource(timer) != kIOReturnSuccess) {
+        if (timer != nullptr) timer->release();
+        wl->release();
+        SMU_LOG("idle-dpm: IOTimerEventSource setup failed — staying in Auto");
+        return;
+    }
+    timer->enable();
+
+    IOLock *l = __atomic_load_n(&gIdleDpmCtlLock, __ATOMIC_ACQUIRE);
+    if (l != nullptr) IOLockLock(l);
+    gIdleDpmWorkLoop = wl;
+    gIdleDpmTimer    = timer;
+    __atomic_store_n(&gIdleDpmStopping, 0u, __ATOMIC_RELEASE);
+    (void)timer->setTimeoutMS(kIdleDpmPollMs);
+    if (l != nullptr) IOLockUnlock(l);
+#else
+    __atomic_store_n(&gIdleDpmStopping, 0u, __ATOMIC_RELEASE);
+#endif
+
+    SMU_LOG("idle-dpm: started (1000 ms quiet -> Low; light <24 Hz stays Low, >=32 Hz / heavy / 50 ms busy -> Auto; garnet-idle-dpm=0 disables)");
+}
+
+void
+smu_idle_dpm_stop()
+{
+    __atomic_store_n(&gIdleDpmStopping, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmInLow, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmWantBoost, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+
+#ifdef KERNEL
+    IOTimerEventSource *timer = nullptr;
+    IOWorkLoop         *wl    = nullptr;
+    IOLock *l = __atomic_load_n(&gIdleDpmCtlLock, __ATOMIC_ACQUIRE);
+    if (l != nullptr) IOLockLock(l);
+    timer = gIdleDpmTimer;    gIdleDpmTimer    = nullptr;
+    wl    = gIdleDpmWorkLoop; gIdleDpmWorkLoop = nullptr;
+    if (l != nullptr) IOLockUnlock(l);
+
+    if (timer != nullptr) {
+        timer->cancelTimeout();
+        timer->disable();
+        if (wl != nullptr) wl->removeEventSource(timer);
+        timer->release();
+    }
+    if (wl != nullptr) wl->release();
+#endif
+
+    SmuSeq seq;
+    if (seq.held) {
+        gIdleDpmDev     = nullptr;
+        gIdleDpmSmu     = nullptr;
+        gIdleDpmBusyFn  = nullptr;
+        gIdleDpmBusyCtx = nullptr;
+    }
+}
+
+void
+smu_idle_dpm_note_activity(bool canBlock, bool heavy)
+{
+    if (__atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) != 0u) return;
+
+    if (!heavy) {
+        const uint32_t cnt = __atomic_add_fetch(&gIdleDpmLightSubmits, 1u, __ATOMIC_ACQ_REL);
+        // Hot path while in Auto: zero lock, zero SMU traffic; 250 ms timer evaluates rate.
+        if (__atomic_load_n(&gIdleDpmInLow, __ATOMIC_ACQUIRE) == 0u) return;
+        // While in Low: stay in Low for light desktop frames (< 8 submits / 250 ms) and arm
+        // a single 50 ms hwBusy probe to catch any long-running single command buffer.
+        if (cnt < rdna4pwr::kIdleDpmBoostSubmits) {
+            if (__atomic_exchange_n(&gIdleDpmLowProbeArmed, 1u, __ATOMIC_ACQ_REL) == 0u) {
+                smu_idle_dpm_arm_timer_ms(rdna4pwr::kIdleDpmBusyProbeMs);
+            }
+            return;
+        }
+    }
+
+    const uint64_t nowNs = smu_now_ns();
+    __atomic_store_n(&gIdleDpmLastActNs, nowNs, __ATOMIC_RELEASE);
+
+    // Hot path: already in Auto (or bypassed) -> zero lock, zero SMU traffic.
+    if (__atomic_load_n(&gIdleDpmInLow, __ATOMIC_ACQUIRE) == 0u) return;
+
+    if (!canBlock) {
+        __atomic_store_n(&gIdleDpmWantBoost, 1u, __ATOMIC_RELEASE);
+        smu_idle_dpm_arm_timer_ms(0u);
+        return;
+    }
+
+    bool needRearm = false;
+    {
+        SmuSeq seq;
+        if (!seq.held) return;
+        if (__atomic_load_n(&gIdleDpmStopping, __ATOMIC_ACQUIRE) != 0u) return;
+        DeviceContext *dev = gIdleDpmDev;
+        SMUContext    *smu = gIdleDpmSmu;
+        if (dev == nullptr || smu == nullptr || !dev->smuOnline) return;
+        rdna4pwr::IdleDpmGovernor &gov = smu->idleDpm;
+        const rdna4pwr::IdleDpmAction act = gov.on_activity(nowNs);
+        if (act == rdna4pwr::IdleDpmAction::SetAuto) {
+            const kern_return_t r = smu_set_power_state(*dev, SMUPowerState::Auto);
+            gov.commit(act, r == kIOReturnSuccess);
+            if (r == kIOReturnSuccess) {
+                __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&gIdleDpmInLow, 0u, __ATOMIC_RELEASE);
+                needRearm = true;
+                SMU_LOG("idle-dpm: GFXCLK Low -> Auto on %s submit (boost #%u)",
+                        heavy ? "heavy" : "burst", gov.boostCount);
+            }
+        } else if (!gov.active() || !gov.is_low()) {
+            __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&gIdleDpmInLow, 0u, __ATOMIC_RELEASE);
+            needRearm = gov.active();
+        }
+    }
+    if (needRearm) smu_idle_dpm_arm_timer_ms(kIdleDpmPollMs);
+}
+
+void
+smu_idle_dpm_manual_override(uint32_t state)
+{
+    SmuSeq seq;
+    if (!seq.held) return;
+    SMUContext *smu = gIdleDpmSmu;
+    if (smu != nullptr) {
+        smu->idleDpm.on_manual_override(state);
+    }
+    __atomic_store_n(&gIdleDpmInLow, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmWantBoost, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmLightSubmits, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gIdleDpmLowProbeArmed, 0u, __ATOMIC_RELEASE);
+    SMU_LOG("idle-dpm: locked out by manual power state %u override", state);
 }
 
 

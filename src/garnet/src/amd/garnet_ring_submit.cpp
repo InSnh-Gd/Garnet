@@ -318,9 +318,9 @@ static bool kcq_hang_poll() {
     }
     IOLockUnlock(gHangLock);
     if (det) {
-        N1C_LOG("KCQ HUNG: compute seq emitted %llu retired %llu rptr %u wptr %u",
+        N1C_LOG("KCQ HUNG: compute seq emitted %llu retired %llu rptr %u wptr %llu",
                 (unsigned long long)em, (unsigned long long)re,
-                gCtx->kcq.rptr_cpu ? *gCtx->kcq.rptr_cpu : 0u, gCtx->kcq.wptr);
+                gCtx->kcq.rptr_cpu ? *gCtx->kcq.rptr_cpu : 0u, (unsigned long long)gCtx->kcq.wptr);
         hang_announce(emitted_now(), retired_now(emitted_now()));
     }
     return det;
@@ -627,7 +627,7 @@ static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, 
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
     irq_arm_ring_eop(ring, startWc, n, mask, dw);
     gKcqWc = wc;
-    cq.wptr = ring_idx(wc, mask);
+    cq.wptr = wc;
     const uint64_t emBefore = kcq_emitted_now();
     const uint64_t reNow = kcq_retired_now(emBefore);
     IOLockLock(gHangLock);
@@ -686,6 +686,8 @@ static bool g2_recover(const rdna4native::g2::Guilty &g, Session *gs) {
     using namespace rdna4native::g2;
     DeviceContext &dev = *gCtx->dev;
     CPContext &cp = gCtx->cp;
+    ScopedGfxOffGuard gfxOffGuard(dev);
+    if (!gfxOffGuard.ok()) return false;
     IOLockLock(gRingLock);
     const uint64_t emAt = emitted_now();
     const uint64_t reAt = retired_now(emAt);
@@ -822,11 +824,21 @@ static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_
     return kOk;
 }
 
+bool n1c_rings_busy() {
+    if (gCtx == nullptr) return false;
+    const uint64_t gfxEm = emitted_now();
+    if (gfxEm != 0ull && retired_now(gfxEm) < gfxEm) return true;
+    const uint64_t kcqEm = kcq_emitted_now();
+    if (kcqEm != 0ull && kcq_retired_now(kcqEm) < kcqEm) return true;
+    return false;
+}
+
 IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_t *seqOut) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
     CsView v;
     const uint32_t prc = cs_parse(in, size, &v, async_compute_on());
     if (prc != kOk) return (IOReturn)prc;
+    smu_idle_dpm_note_activity(true, v.ipType == RDNA4N_HW_IP_COMPUTE);
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOReturn rc = kIOReturnSuccess;
@@ -984,6 +996,7 @@ IOReturn n1c_buffer_op(const N1cRef &ref, const rdna4n_buffer_op *in, bool fill,
     *seqOut = 0;
     if (!sess_hello(ref)) return kIOReturnNotReady;
     const rdna4n_buffer_op q = *in;
+    smu_idle_dpm_note_activity(true);
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;
     BufferEnv env{s};
@@ -1420,6 +1433,8 @@ struct G1Env {
             return kOk;
         }
         if (method == kMethMesReset) {
+            ScopedGfxOffGuard gfxOffGuard(dev);
+            if (!gfxOffGuard.ok()) return (uint32_t)gfxOffGuard.status();
             IOLockLock(gCliLock);
             g1_scrub_ring();
             IOLockUnlock(gCliLock);
@@ -1430,6 +1445,8 @@ struct G1Env {
             return (uint32_t)r;
         }
         if (method == kMethRemap) {
+            ScopedGfxOffGuard gfxOffGuard(dev);
+            if (!gfxOffGuard.ok()) return (uint32_t)gfxOffGuard.status();
             const bool after = unmap_after_reset(resetAcked || gG1.resetAcked, mes.sched_version & kMES_VERSION_MASK);
             const uint32_t fl = kRemoveQueueFlag_unmap_legacy_queue | (after ? kRemoveQueueFlag_remove_after_reset : 0u);
             kern_return_t r = mes_remove_hw_queue_flags(dev, mes, kMESQueueType_GFX, 0u, 0u, cp.doorbell_index, fl);

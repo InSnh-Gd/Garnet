@@ -938,7 +938,7 @@ struct ComputeQueue {
     uint64_t  wptr_gpu_addr  { 0 };
     uint64_t  fence_gpu_addr { 0 };
 
-    uint32_t  wptr { 0 };
+    uint64_t  wptr { 0 };
     uint32_t  fence_counter { 0 };
     uint32_t  doorbell_index { 0 };
     // Which HQD this queue occupies. me is always 1 (the MEC); Linux's KCQs
