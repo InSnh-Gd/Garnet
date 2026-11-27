@@ -577,8 +577,12 @@ public enum OpenCoreValidator {
           - `garnet-vbl-irq=0`      Reverts primary framebuffer VBLANK delivery to software timer without disabling MSI.
           - `garnet-dpms=0`         Disables hardware DisplayPort DPMS sleep/wake stream blanking and PHY power-down.
           - `garnet-gfx-cg=0`       Disables GFX12 CGCG/CGLS/MGCG/FGCG clock gating (leaves hardware reset defaults).
+          - `garnet-gfxoff=0`       Keeps the graphics core awake; GFXOFF is opt-in.
           - `garnet-det0=0`         Disables single-pipe DCN41 DET0 CRB expansion (keeps UEFI 192 KiB DET0).
           - `garnet-uclk-pin=1`     Forces GDDR6 UCLK pinned at top DPM clock (disables DET0-guarded UCLK unpinning).
+          - `garnet-dmcub-fw=0`     Keeps the VBIOS display firmware and skips the experimental DAL firmware preflight.
+          - `garnet-fams2=0`        Keeps firmware-assisted display memory-clock switching off.
+          - `garnet-mall=0`         Keeps SubVP and static-screen display caching off.
         """
     }
 }
