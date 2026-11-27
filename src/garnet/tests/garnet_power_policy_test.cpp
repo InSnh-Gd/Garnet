@@ -1,6 +1,7 @@
 #include "amd/garnet_power_policy_pure.h"
 
 #include <cstdio>
+#include <initializer_list>
 
 namespace {
 int gChecks = 0;
@@ -38,6 +39,8 @@ int main() {
 	expect(!idle_clamp_enabled(true, 0u), "garnet-idle-clamp=0 stays OFF (Auto)");
 	expect(idle_clamp_enabled(true, 1u), "garnet-idle-clamp=1 clamps GFXCLK to 200 MHz Low");
 	expect(idle_clamp_enabled(true, 2u), "garnet-idle-clamp nonzero opts into Low clamp");
+	expect(fams2_enabled(false, 0u), "garnet-fams2 absent allows a verified DAL path");
+	expect(!fams2_enabled(true, 0u), "garnet-fams2=0 disallows FAMS2");
 
 	// Exact live RX 9060 XT defaults -> upstream GFX12 gated values
 	expect(gfx12_cgtt_mgcg_override(0x000007FFu, true) == 0x00000040u,
@@ -83,6 +86,35 @@ int main() {
 	       "4K@160Hz DSC stays pinned at top UCLK to prevent top-1/10th OPTC0 underflow");
 	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k60, vb4k60),
 	       "DSC always forces UCLK pinned even with wide timing margins");
+	Fams2ModeProof proof {};
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160, proof),
+	       "without DAL/DML/FAMS2 proof, DSC stays pinned");
+	proof = {true, true, true, true, true, 0x41u, 7u, 7u, false};
+	expect(uclk_unpin_safe_for_mode(false, false, true, det4k160, vb4k160, proof),
+	       "confirmed FAMS2/MALL permits DSC even without Stage 3 timing margins");
+	expect(uclk_unpin_safe_for_mode(false, false, false, 0u, 0u, proof),
+	       "confirmed FAMS2/MALL does not require a single expanded DET pipe");
+	expect(!uclk_unpin_safe_for_mode(true, false, true, det4k160, vb4k160, proof),
+	       "forced UCLK pin overrides confirmed hardware programming");
+	for (bool Fams2ModeProof::*field : {&Fams2ModeProof::allowed, &Fams2ModeProof::dalActive,
+	                                    &Fams2ModeProof::dmlPstateSupported,
+	                                    &Fams2ModeProof::configCompleted, &Fams2ModeProof::mallProgrammed}) {
+		Fams2ModeProof incomplete = proof;
+		incomplete.*field = false;
+		expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160, incomplete),
+		       "missing any FAMS2 dependency prevents a framebuffer UCLK floor change");
+	}
+	Fams2ModeProof stale = proof;
+	stale.liveModeGeneration = 8u;
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160, stale), "stale config keeps UCLK pinned");
+	stale.liveModeGeneration = stale.configGeneration = 0u;
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160, stale), "no active mode binding keeps UCLK pinned");
+	proof.fwVersion = 21u;
+	expect(!uclk_unpin_safe_for_mode(false, true, true, det4k160, vb4k160, proof), "decimal 21 is not the firmware's packed version");
+	proof.fwVersion = 0x41u;
+	proof.underflowLatched = true;
+	expect(!uclk_unpin_safe_for_mode(false, true, false, det4k60, vb4k60, proof),
+	       "an underflow overrides even the legacy timing-margin fallback");
 
 	const uint32_t det4k120 = det0_buffer_us(kDet0ExpandedBytes, 3840u, 4000u, 1066500000ULL);
 	const uint32_t vb4k120  = vblank_us(2160u, 2222u, 4000u, 1066500000ULL);

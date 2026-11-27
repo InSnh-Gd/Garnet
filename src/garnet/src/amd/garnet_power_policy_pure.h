@@ -32,6 +32,23 @@ inline bool gfxoff_opt_in(bool present, uint32_t value) {
 inline bool idle_clamp_enabled(bool present, uint32_t value) {
 	return present && value != 0u;
 }
+inline bool fams2_enabled(bool present, uint32_t value) {
+	return !present || value != 0u;
+}
+
+constexpr uint8_t kFams21Version = (2u << 5) | 1u;
+
+struct Fams2ModeProof {
+	bool allowed;
+	bool dalActive;
+	bool dmlPstateSupported;
+	bool configCompleted;
+	bool mallProgrammed;
+	uint8_t fwVersion;
+	uint64_t configGeneration;
+	uint64_t liveModeGeneration;
+	bool underflowLatched;
+};
 
 // Minimum DET0 buffer time and VBLANK duration required to safely absorb GDDR6 UCLK
 // P-state switch blackouts (~150-250 us) without DMUB FAMS2 / DML2 watermark programming.
@@ -65,9 +82,13 @@ inline uint32_t vblank_us(uint32_t vActive, uint32_t vTotal, uint32_t hTotal,
 }
 
 inline bool uclk_unpin_safe_for_mode(bool uclkForcePin, bool det0Expanded, bool dscEnabled,
-                                     uint32_t detBufUs, uint32_t vblankUs) {
-	return !uclkForcePin && det0Expanded && !dscEnabled &&
-	       detBufUs >= kUclkUnpinMinDetBufUs &&
+                                     uint32_t detBufUs, uint32_t vblankUs,
+                                     const Fams2ModeProof &proof = {}) {
+	if (uclkForcePin || proof.underflowLatched) return false;
+	if (proof.allowed && proof.dalActive && proof.dmlPstateSupported && proof.configCompleted &&
+	    proof.mallProgrammed && proof.fwVersion == kFams21Version && proof.configGeneration != 0u &&
+	    proof.configGeneration == proof.liveModeGeneration) return true;
+	return det0Expanded && !dscEnabled && detBufUs >= kUclkUnpinMinDetBufUs &&
 	       vblankUs >= kUclkUnpinMinVblankUs;
 }
 
