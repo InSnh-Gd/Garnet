@@ -28,12 +28,12 @@ struct OpenCoreAssistantView: View {
             Form {
                 Section("OpenCore Configuration") {
                     HStack {
-                        Picker("Target Mode", selection: $model.selectedOCMode) {
+                        Picker("BAR Mode", selection: $model.selectedOCMode) {
                             Text(OpenCoreMode.full.displayName).tag(OpenCoreMode.full)
                             Text(OpenCoreMode.modeSmall.displayName).tag(OpenCoreMode.modeSmall)
                         }
                         .pickerStyle(.segmented)
-                        .frame(maxWidth: 420)
+                        .frame(maxWidth: 360)
 
                         Spacer()
 
@@ -43,20 +43,65 @@ struct OpenCoreAssistantView: View {
                             Label("Configure OpenCore…", systemImage: "slider.horizontal.3")
                         }
                         .disabled(model.selectedOCMode == .full && model.payloadURL == nil)
+
+                        Button(role: .destructive) {
+                            pickAndRestoreOpenCore()
+                        } label: {
+                            Label("Restore OpenCore…", systemImage: "arrow.uturn.backward.circle")
+                        }
                     }
 
-                    Text("Backs up config.plist, copies GarnetPCIBarCompat.kext (Full-BAR mode), writes required keys, and validates.")
+                    Picker("AMFI Mode", selection: $model.selectedAMFIMode) {
+                        Text(OpenCoreAMFIMode.anchor.displayName).tag(OpenCoreAMFIMode.anchor)
+                        Text(OpenCoreAMFIMode.legacy.displayName).tag(OpenCoreAMFIMode.legacy)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 420)
+
+                    Text("Configure saves a one-time baseline backup (config.plist.garnet-pre-garnet), installs GarnetPCIBarCompat.kext (Full-BAR), GarnetRecover.efi (Misc -> Tools), and GarnetAnchorInjector.kext (AMFIAnchor mode, requires user Lilu.kext in EFI/OC/Kexts/). Restore reverts to the baseline or strips Garnet entries.")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
                     if let res = model.ocConfigureResult {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Updated: \(res.configPath)")
+                            Text("Updated: \(res.configPath) [\(res.mode.displayName), \(res.amfiMode.displayName)]")
                                 .font(.caption).foregroundColor(.green)
                             Text("Backup: \(res.backupPath)")
                                 .font(.caption2).foregroundColor(.secondary)
+                            if let base = res.baselineBackupPath {
+                                Text("Baseline backup: \(base)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
                             if let kextPath = res.kextInstalledPath {
                                 Text("Installed kext: \(kextPath)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                            if let recPath = res.recoverToolInstalledPath {
+                                Text("Installed recovery tool: \(recPath)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                            if let injPath = res.anchorInjectorInstalledPath {
+                                Text("Installed trust anchor: \(injPath)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+
+                    if let rest = model.ocRestoreResult {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Restored: \(rest.configPath)")
+                                .font(.caption).foregroundColor(.green)
+                            if let src = rest.restoredFromBackupPath {
+                                Text("Restored from baseline: \(src)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            } else {
+                                Text("Stripped Garnet entries in-place (no pre-Garnet baseline found)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                            Text("Pre-restore backup: \(rest.preRestoreBackupPath)")
+                                .font(.caption2).foregroundColor(.secondary)
+                            if !rest.removedArtifacts.isEmpty {
+                                Text("Removed Garnet EFI files: \(rest.removedArtifacts.count)")
                                     .font(.caption2).foregroundColor(.secondary)
                             }
                         }
@@ -99,7 +144,10 @@ struct OpenCoreAssistantView: View {
 
                         Button("Copy Snippet") {
                             NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode), forType: .string)
+                            NSPasteboard.general.setString(
+                                OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode, amfiMode: model.selectedAMFIMode),
+                                forType: .string
+                            )
                             copiedBanner = "Copied \(model.selectedOCMode.displayName) snippet"
                         }
                         if let copiedBanner {
@@ -108,7 +156,7 @@ struct OpenCoreAssistantView: View {
                     }
 
                     ScrollView {
-                        Text(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode))
+                        Text(OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode, amfiMode: model.selectedAMFIMode))
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -166,6 +214,18 @@ struct OpenCoreAssistantView: View {
         panel.message = "Select your mounted EFI folder, OC folder, or config.plist"
         if panel.runModal() == .OK, let u = panel.url {
             model.configureOpenCore(at: u)
+        }
+    }
+
+    private func pickAndRestoreOpenCore() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowedContentTypes = [UTType.propertyList, UTType.folder]
+        panel.prompt = "Restore"
+        panel.message = "Select your mounted EFI folder, OC folder, or config.plist to restore from baseline backup or strip Garnet entries"
+        if panel.runModal() == .OK, let u = panel.url {
+            model.restoreOpenCore(at: u)
         }
     }
 
