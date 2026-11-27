@@ -82,10 +82,12 @@ struct MockDet {
 			return false;
 		}
 		writeOrder.push_back(seg2Off);
-		if (seg2Off >= rdna4det::kSeg2Det0Ctrl && seg2Off < rdna4det::kSeg2Det0Ctrl + 4u) {
-			const uint32_t pipe = seg2Off - rdna4det::kSeg2Det0Ctrl;
+		if (seg2Off == rdna4det::kSeg2CompbufCtrl ||
+		    (seg2Off >= rdna4det::kSeg2Det0Ctrl && seg2Off < rdna4det::kSeg2Det0Ctrl + 4u)) {
+			const bool isComp = (seg2Off == rdna4det::kSeg2CompbufCtrl);
+			const uint32_t pipe = isComp ? 0u : (seg2Off - rdna4det::kSeg2Det0Ctrl);
 			const uint32_t req = val & rdna4det::kDetSizeMask;
-			if (stallDet2 && pipe == 2u) {
+			if (!isComp && stallDet2 && pipe == 2u) {
 				regs[absDw] = (regs[absDw] & ~rdna4det::kDetSizeMask) | req;
 				// Simulate stuck DET2_SIZE_CURRENT != 0
 				regs[absDw] |= (3u << 8);
@@ -199,6 +201,67 @@ int main() {
 		m.injectUnderflow = true;
 		expect(probe_optc0_underflow(m.makeHw(), 250000u, &reg) && (reg & kOptcUnderflowMask) != 0u,
 		       "latched OPTC0 bit 13 underflow is detected");
+	}
+
+	// 6. DCN 4.01 21-segment CRB planner + multi-pipe DET programmer + disp2 preservation.
+	{
+		const auto single21 = plan_crb_distribution(0x1u, kDefaultCompbufSegs, kHardwareCrbBudgetSegs, false);
+		expect(single21.status == kOk && single21.compbufSegs == 5u &&
+		       single21.detSegs[0] == 16u && single21.detSegs[1] == 0u,
+		       "21-seg single-pipe CRB gives 5 compbuf + 16 DET0 (1024 KiB)");
+
+		MockDet m;
+		m.initLiveRx9060Xt();
+		expect(program_multi_pipe_det(m.makeHw(), single21, kHardwareCrbBudgetSegs) == kOk,
+		       "program_multi_pipe_det commits 21-seg distribution");
+		expect(m.regs[kSeg2 + kSeg2CompbufCtrl] == 0x00040505u &&
+		       m.regs[kSeg2 + kSeg2Det0Ctrl + 0u] == 0x00001010u &&
+		       m.regs[kSeg2 + kSeg2Det0Ctrl + 1u] == 0u &&
+		       m.regs[kSeg2 + kSeg2CompbufRsvSpace] == 64u,
+		       "COMPBUF=5, DET0=16, DET1..3=0, RESERVED_SPACE=64");
+		expect(m.maxLiveCrbSum <= kHardwareCrbBudgetSegs && m.deniedWrites == 0u,
+		       "21-seg multi-pipe programming never exceeds 21 segments and passes allowlist");
+
+		// Multi-pipe DP+HDMI+HDMI with disp2 active preserves DET0=3 (0x303) / DET1=3 / DET2=3.
+		const auto disp2Plan = plan_crb_distribution(0x7u, 5u, kHardwareCrbBudgetSegs, true);
+		expect(disp2Plan.status == kOk && disp2Plan.disp2Preserved &&
+		       disp2Plan.detSegs[1] == 3u && disp2Plan.detSegs[2] == 3u &&
+		       disp2Plan.detSegs[0] >= 3u &&
+		       disp2Plan.compbufSegs + disp2Plan.detSegs[0] + disp2Plan.detSegs[1] + disp2Plan.detSegs[2] == 21u,
+		       "disp2 active preserves DET1=3, DET2=3 inside 21-seg CRB");
+		expect(program_multi_pipe_det(m.makeHw(), disp2Plan, kHardwareCrbBudgetSegs) == kOk,
+		       "transition from single-pipe 16-seg shrinks DET0 before growing DET1/2");
+		expect(m.regs[kSeg2 + kSeg2Det0Ctrl + 1u] == 0x00000303u &&
+		       m.regs[kSeg2 + kSeg2Det0Ctrl + 2u] == 0x00000303u &&
+		       m.maxLiveCrbSum <= kHardwareCrbBudgetSegs,
+		       "shrink-before-grow keeps sum <= 21 on single->multi-pipe transition");
+	}
+
+	// 7. DCHUBBUB_ARB watermark sets A/B and HUBPREQ TTU programming.
+	{
+		MockDet m;
+		m.initLiveRx9060Xt();
+		HubbubWatermarks wm {};
+		wm.setA = { 410u, 110u, 120u, 90u, 22u, 24u, 320u, 850u, 950u, 2400u, 2600u, 1800u, 2000u };
+		wm.setB = { 520u, 140u, 150u, 100u, 26u, 28u, 380u, 920u, 1040u, 3100u, 3300u, 2200u, 2400u };
+		wm.selectSetB = true;
+		expect(program_hubbub_watermarks(m.makeHw(), wm),
+		       "program_hubbub_watermarks writes sets A/B and asserts change request");
+		expect(m.regs[kSeg2 + kSeg2WmUrgA] == 410u &&
+		       m.regs[kSeg2 + kSeg2WmUrgB] == 520u &&
+		       m.regs[kSeg2 + kSeg2WmUclkPstateA] == 2400u &&
+		       m.regs[kSeg2 + kSeg2WmUclkPstateA + 0x13u] == 3100u &&
+		       m.regs[kSeg2 + kSeg2WmFclkPstateA] == 1800u &&
+		       (m.regs[kSeg2 + kSeg2WmChangeCntl] & ((1u << 0) | (1u << 8) | (1u << 25) | (1u << 26))) ==
+		           ((1u << 0) | (1u << 8) | (1u << 25) | (1u << 26)),
+		       "Set A/B urgency, UCLK/FCLK P-state WMs and change control match");
+
+		const HubpTtuTiming ttu { 180u, 320u, 1280u, 5u, true, 960u };
+		expect(program_hubp_ttu(m.makeHw(), 0u, ttu), "program_hubp_ttu writes HUBPREQ0 TTU");
+		expect(m.regs[kSeg2 + kSeg2HubpReq0TtuQosWm] == (180u | (320u << 16)) &&
+		       m.regs[kSeg2 + kSeg2HubpReq0Ttu1] == 960u,
+		       "HUBPREQ0 TTU QoS and pre-delivery match");
+		expect(m.deniedWrites == 0u, "all watermark/TTU writes pass DCN41 allowlist");
 	}
 
 	std::printf("dcn41_det_test: %d checks, %d failed\n", gChecks, gFail);
