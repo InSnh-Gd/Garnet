@@ -95,7 +95,8 @@ int main(int argc, const char *argv[]) {
         NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "vertex float4 fallback_repaint_vs(uint i [[vertex_id]]) {\n"
             "float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)};return float4(p[i],0,1); }\n"
-            "fragment float4 fallback_repaint_fs() {return float4(64.0/255,128.0/255,192.0/255,1);}\n";
+            "fragment float4 fallback_repaint_fs() {return float4(64.0/255,128.0/255,192.0/255,1);}\n"
+            "fragment float4 fallback_partial_miss_fs() {return float4(192.0/255,64.0/255,128.0/255,1);}\n";
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) fail(error.description);
         MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
@@ -125,7 +126,16 @@ int main(int argc, const char *argv[]) {
         draw(queue, texture, cold, NO, YES);
         bad += check(device, queue, texture, YES, "hot-swap-partial-repaint");
         if (bad) fail(@"cold draw corrupted pixels retained after a partial repaint");
-        puts("RENDER_FALLBACK_PASS cold_preserved=1024 hot_repaint=64 preserved=960 native_display_transport=untested");
+        // Single-stage spvcache hit (cached VS) + single-stage miss (uncached FS) must enter fallback cleanly (no Code=49).
+        setenv("RDNA4M_TEST_INPROC", "0", 1);
+        MTLRenderPipelineDescriptor *partialMiss = [MTLRenderPipelineDescriptor new];
+        partialMiss.vertexFunction = descriptor.vertexFunction;
+        partialMiss.fragmentFunction = [library newFunctionWithName:@"fallback_partial_miss_fs"];
+        partialMiss.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        error = nil;
+        id<MTLRenderPipelineState> halfCold = [device newRenderPipelineStateWithDescriptor:partialMiss error:&error];
+        if (!halfCold || error) fail(error.description ?: @"single-stage hit + miss fallback returned nil");
+        puts("RENDER_FALLBACK_PASS cold_preserved=1024 hot_repaint=64 preserved=960 partial_miss=ok native_display_transport=untested");
         _exit(0);
     }
 }

@@ -24,7 +24,7 @@ _Static_assert((uint32_t)VK_PRIMITIVE_TOPOLOGY_POINT_LIST == GARNET_VK_TOPO_POIN
 
 // Returns the cached SPIR-V for fn, or nil with *err code 40 (no bitcodeData) / 41 (miss, or RDNA4M_FORCE_FALLBACK).
 // *fname gets the function name for logs; *meta the <sha>.meta.json sidecar when present. Reflection reads the entry-point name out of the SPIR-V itself.
-static NSData *rdna4_spv_lookup_impl(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta) {
+static NSData *rdna4_spv_lookup_impl(id fn, const char *role, uint32_t rasterSamples, NSError **err, NSString **fname, NSDictionary **meta) {
     SEL sel = NSSelectorFromString(@"bitcodeData");
     NSData *bc = (fn && [fn respondsToSelector:sel]) ? ((NSData *(*)(id, SEL))objc_msgSend)(fn, sel) : nil;
     if (fname) *fname = (fn && [fn respondsToSelector:@selector(name)]) ? [fn name] : @"?";
@@ -40,25 +40,53 @@ static NSData *rdna4_spv_lookup_impl(id fn, const char *role, NSError **err, NSS
         return nil;
     }
     const BOOL stage2Only = lk && lk->useStage2 && (lk->requireStage2 || rdna4x_stage2_symbols_available());
-    NSArray<NSString *> *keys = lk ? (stage2Only ? @[ lk->lsha ] : @[ lk->lsha, sha ]) : @[ sha ];
-    for (NSString *cs in keys) {
+    NSArray<NSString *> *baseKeys = lk ? (stage2Only ? @[ lk->lsha ] : @[ lk->lsha, sha ]) : @[ sha ];
+    NSMutableArray<NSString *> *keys = nil;
+    if (garnetx_cap_raster_samples(rasterSamples)) {
+        keys = [NSMutableArray arrayWithCapacity:baseKeys.count * 2u];
+        for (NSString *bk in baseKeys) {
+            [keys addObject:bk];
+            char ms[65];
+            if (rdna4x_msaa_sha(ms, bk.UTF8String, rasterSamples) == 0)
+                [keys addObject:[NSString stringWithUTF8String:ms]];
+        }
+    }
+    NSArray<NSString *> *searchKeys = keys ? (NSArray<NSString *> *)keys : baseKeys;
+    NSDictionary *memMeta = nil;
+    BOOL fromMem = NO;
+    for (NSString *cs in searchKeys) {
         for (NSString *dir in rdna4_spv_dirs()) {   // H2: bundle spvcache first, then the side directory
             path = [dir stringByAppendingPathComponent:[cs stringByAppendingString:@".spv"]];
             spv = [NSData dataWithContentsOfFile:path];
             if (spv.length >= 20 && !(spv.length & 3)) break;
             spv = nil;
         }
+        if (!spv && rdna4x_memcache_active()) {
+            NSData *mspv = nil; NSDictionary *mmeta = nil;
+            if (rdna4x_memcache_lookup(cs, &mspv, meta ? &mmeta : NULL, NULL) && mspv.length >= 20 && !(mspv.length & 3)) {
+                spv = mspv; memMeta = mmeta; fromMem = YES; path = @RDNA4X_MEMCACHE_DIR;
+            }
+        }
         if (spv) { sha = cs; break; }
     }
     if (!spv) { if (err) *err = rdna4_err(41, [NSString stringWithFormat:@"spvcache miss for %s: %@", role, [[rdna4_spv_dirs().firstObject stringByAppendingPathComponent:sha] stringByAppendingString:@".spv"]]); return nil; }
+    if (fromMem) {
+        if (meta) *meta = memMeta;
+        RDNA4LOG("spvcache hit %s: :memory:/%s (%lu bytes%s)", role, sha.UTF8String, (unsigned long)spv.length, (meta && *meta) ? ", meta" : ", no meta");
+        return spv;
+    }
     if (meta) *meta = rdna4_meta_for_spv(path);
     rdna4x_touch_hit(path, sha);
     RDNA4LOG("spvcache hit %s: %s (%lu bytes%s)", role, path.UTF8String, (unsigned long)spv.length, (meta && *meta) ? ", meta" : ", no meta");
     return spv;
 }
 
+GARNET_INTERNAL NSData *rdna4_spv_lookup_samples(id fn, const char *role, uint32_t rasterSamples, NSError **err, NSString **fname, NSDictionary **meta) {
+    uint64_t t_ = rdna4_now(); NSData *d = rdna4_spv_lookup_impl(fn, role, rasterSamples, err, fname, meta); rdna4t_add(&T1.spv, rdna4_now() - t_); return d;
+}
+
 GARNET_INTERNAL NSData *rdna4_spv_lookup(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta) {
-    uint64_t t_ = rdna4_now(); NSData *d = rdna4_spv_lookup_impl(fn, role, err, fname, meta); rdna4t_add(&T1.spv, rdna4_now() - t_); return d;
+    return rdna4_spv_lookup_samples(fn, role, 0u, err, fname, meta);
 }
 
 GARNET_INTERNAL VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const char *role, NSError **err) {
@@ -141,6 +169,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     NSError *flkErr = d.fragmentFunction ? rdna4_lk_error(d.fragmentFunction) : nil;
     if (flkErr) { if (err) *err = flkErr; return nil; }
     const BOOL hasFrag = d.fragmentFunction != nil;
+    const uint32_t rastSamples = d.rasterSampleCount ? (uint32_t)d.rasterSampleCount : 1u;
     _hasFrag = hasFrag;
     _rastOff = !d.isRasterizationEnabled;
     if (!rdna4_radv_open(err)) return nil;
@@ -175,7 +204,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
             vsd = nil; mv_ = nil;
             e1 = rdna4_err(41, @"cached tessellation sidecar lacks tessellation metadata");
         }
-        fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
+        fsd = hasFrag ? rdna4_spv_lookup_samples(d.fragmentFunction, "fragment", rastSamples, &e2, &fname, &mf_) : nil;
     }
     strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
     BOOL fb = NO;
@@ -187,12 +216,17 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
             const uint64_t dl = deadline;
             NSError *vertexFailure = nil, *fragmentFailure = nil;
             const BOOL tv = vsd ? YES : rdna4x_translate_fn_with_error(d.vertexFunction, "vertex", dl, &vertexFailure);
-            const BOOL tf = (!hasFrag || fsd) ? YES : rdna4x_translate_fn_with_error(d.fragmentFunction, "fragment", dl, &fragmentFailure);
+            BOOL tf = (!hasFrag || fsd) ? YES : rdna4x_translate_fn_with_error(d.fragmentFunction, "fragment", dl, &fragmentFailure);
+            if (!tf && hasFrag && fragmentFailure &&
+                rdna4x_needs_raster_sample_count(fragmentFailure.localizedDescription.UTF8String)) {
+                fragmentFailure = nil;
+                tf = rdna4x_translate_fn_with_samples(d.fragmentFunction, "fragment", dl, rastSamples, &fragmentFailure);
+            }
             translationFailure = vertexFailure ?: fragmentFailure;
             if (tv && tf) {
                 e1 = nil; e2 = nil; mv_ = nil; mf_ = nil;
                 vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
-                fsd = hasFrag ? rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_) : nil;
+                fsd = hasFrag ? rdna4_spv_lookup_samples(d.fragmentFunction, "fragment", rastSamples, &e2, &fname, &mf_) : nil;
                 strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
             }
         }
@@ -210,7 +244,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                 if (sf_) [want addObject:sf_];
                 if (rdna4_sync_wait("render", want, NO)) {
                     if (!vsd) vsd = rdna4_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
-                    if (hasFrag && !fsd) fsd = rdna4_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_);
+                    if (hasFrag && !fsd) fsd = rdna4_spv_lookup_samples(d.fragmentFunction, "fragment", rastSamples, &e2, &fname, &mf_);
                     strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "(none)", sizeof _fnm); _drawBits = rdna4df_draw_bits(_fnm);
                 }
             }
@@ -229,6 +263,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                     return nil;
                 }
                 fb = YES; _fallback = YES;
+                mv_ = nil; mf_ = nil;
                 RDNA4LOG_WARN("FALLBACK %s / %s (%s)", vname.UTF8String, fname.UTF8String, e.localizedDescription.UTF8String);
             }
         } else { if (err) *err = e; return nil; }
