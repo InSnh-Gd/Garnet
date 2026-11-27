@@ -19,6 +19,10 @@
 //  OTG_GLOBAL_SYNC_STATUS's interrupt enable/ack bits on the lit OTG.
 //
 #include "dcn_internal.hpp"
+#include "dcn41_dmub_boot_pure.h"
+#include "dcn41_regs.h"
+#include "amd/amdgpu_ucode_extract.h"
+#include "fw/fw_table.h"
 
 namespace rdna4dcn {
 
@@ -311,8 +315,50 @@ uint32_t liveRaster(uint32_t *hAct, uint32_t *vAct, uint32_t *hTot, uint32_t *vT
 // build 0.0.542: `accel scanout full`'s display read - the read-only device only (never gDcn, never a write).
 uint32_t roScanSurface(rdna4_sf_dcn *s) { return rdna4lr_scan_surface(&gLr, s); }
 
-// build 0.0.515: the read-only raster device, built ONCE at start() - no register I/O (dcn41_dev_init only checks its
-// arguments) - from the same device context and IP-discovery DMU bases bind() uses. Nothing here arms the display layer.
+// Report only the first refusal; an unread prerequisite is not a claim about hardware state.
+static void preflightDalDmub(GarnetDriver *owner) {
+	uint32_t optIn = 0;
+	const bool present = PE_parse_boot_argn("garnet-dmcub-fw", &optIn, sizeof(optIn));
+	if (!rdna4dmub::dmcub_fw_opt_in(present, optIn)) return;
+
+	const auto *firmware = amdgpu::fw_get(amdgpu::FwId::DCN_DMUB);
+	if (!firmware || !firmware->data || !firmware->size) {
+		RDNA4LOG("dmcub-fw: preflight refused: DAL firmware not embedded; no STOP or PSP load");
+		return;
+	}
+	amdgpu::UcodePayload payloads[amdgpu::kMaxUcodePayloadsPerFile];
+	dcn41_dmub_fw_meta_info metadata {};
+	if (amdgpu::amdgpu_ucode_extract(amdgpu::kHostFwFile_DCN_DMUB, firmware->data, firmware->size, payloads) != 1u ||
+	    dcn41_dmub_fw_meta_from_psp(firmware->data + payloads[0].offset_bytes, payloads[0].size_bytes, &metadata, nullptr) != DCN41_OK ||
+	    metadata.dal_fw != 1u) {
+		RDNA4LOG("dmcub-fw: preflight refused: malformed DAL firmware payload; no STOP or PSP load");
+		return;
+	}
+	dcn41_dmub_state current {};
+	if (gLr.state != RDNA4LR_READY || dcn41_dmub_probe(&gLr.d, &current) != DCN41_OK ||
+	    current.dal_fw || current.verdict != DCN41_DMUB_ALIVE_IDLE || current.ring_map == DCN41_DMUB_MAP_UNKNOWN) {
+		RDNA4LOG("dmcub-fw: preflight refused: no known idle VBIOS mailbox; no STOP or PSP load");
+		return;
+	}
+	const auto *bringup = owner->bringupContext();
+	if (!bringup || bringup->dev != owner->deviceContext() || !bringup->psp.ringCreated || !bringup->psp.tmrSetUp ||
+	    !bringup->gmc.vram_alloc.is_inited()) {
+		RDNA4LOG("dmcub-fw: preflight refused: PSP or VRAM allocator unavailable; no STOP or PSP load");
+		return;
+	}
+	const uint32_t cw0 = dcn41_abs(&gLr.d, DCN41_DMCUB_REGION3_CW0_TOP_ADDRESS, DCN41_DMCUB_REGION3_CW0_TOP_ADDRESS_BASE_IDX);
+	const uint32_t cw1 = dcn41_abs(&gLr.d, DCN41_DMCUB_REGION3_CW1_TOP_ADDRESS, DCN41_DMCUB_REGION3_CW1_TOP_ADDRESS_BASE_IDX);
+	if (cw0 == DCN41_BAD_OFFSET || cw1 == DCN41_BAD_OFFSET) {
+		RDNA4LOG("dmcub-fw: preflight refused: cannot resolve current firmware windows; no STOP or PSP load");
+		return;
+	}
+	const uint32_t codeWindow = gLr.d.rreg(gLr.d.cookie, cw0);
+	const uint32_t stackWindow = gLr.d.rreg(gLr.d.cookie, cw1);
+	RDNA4LOG("dmcub-fw: preflight refused: VBIOS recovery unverified (DAL version=%#x, CW0_TOP=%#x, CW1_TOP=%#x, inbox_map=%u); no STOP or PSP load",
+	         metadata.fw_version, codeWindow, stackWindow, static_cast<unsigned>(current.ring_map));
+}
+
+// Build the read-only raster device from the same DMU bases bind() uses. Only the opt-in DMUB preflight reads registers here.
 void attach(GarnetDriver *owner) {
 	(void)dm_latched_on();                                   // 0.0.625: latch garnet-dmubcmd at start (no register, no memory touched)
 	(void)d2_latched_on();                                   // 0.0.631: latch garnet-disp2 at start (no register, no memory touched)
@@ -333,6 +379,7 @@ void attach(GarnetDriver *owner) {
 	const uint32_t ok = rdna4lr_ro_build(&gLr, dev, lr_rreg, seg, (uint32_t)(dev->rmmioSize / 4));
 	RDNA4LOG("dcn: read-only raster path %s (dcn41_dev_init %d; segs %08x %08x %08x %08x %08x; no register read or written here)",
 	       ok ? "BUILT" : "NOT BUILT", gLr.init_rc, seg[0], seg[1], seg[2], seg[3], seg[4]);
+	preflightDalDmub(owner);
 }
 
 static uint32_t bind_locked(GarnetDriver *owner);
