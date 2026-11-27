@@ -176,7 +176,10 @@ GARNET_INTERNAL void rdna4_add_protocols(Class c, const char **names, unsigned n
     for (unsigned i = 0; i < n; i++) {
         Protocol *p = objc_getProtocol(names[i]);
         BOOL added = p ? class_addProtocol(c, p) : NO;
-        os_log(OS_LOG_DEFAULT, "GarnetMetal: +load %{public}s protocol %{public}s found %d added %d", tag, names[i], p != nil, added);
+        if (!p || (!added && !class_conformsToProtocol(c, p)))
+            os_log_error(rdna4_oslog(), "GarnetMetal: +load %{public}s protocol %{public}s found %d added %d", tag, names[i], p != nil, added);
+        else if (rdna4_verbose_log())
+            os_log(rdna4_oslog(), "GarnetMetal: +load %{public}s protocol %{public}s found %d added %d", tag, names[i], p != nil, added);
     }
 }
 
@@ -228,7 +231,7 @@ static rdna4crc_rec_t *rdna4s_crc_check(RDNA4Texture *dt, int slot, uint64_t seq
         pthread_mutex_lock(&RDNA4S.mu);
         if (!RDNA4S.map[slot]) {
             void *m = NULL; VkResult mr = vkMapMemory(RDNA4R.dev, RDNA4S.mem[slot], 0, VK_WHOLE_SIZE, 0, &m);
-            if (mr != VK_SUCCESS || !m) { if (!RDNA4C.mapfail++) RDNA4LOG("scanout: CRC diagnostic: vkMapMemory(slot %d) = %d: the slot CRC is skipped", slot, mr); pthread_mutex_unlock(&RDNA4S.mu); return NULL; }
+            if (mr != VK_SUCCESS || !m) { if (!RDNA4C.mapfail++) RDNA4LOG_WARN("scanout: CRC diagnostic: vkMapMemory(slot %d) = %d: the slot CRC is skipped", slot, mr); pthread_mutex_unlock(&RDNA4S.mu); return NULL; }
             RDNA4S.map[slot] = m;
         }
         slotBase = RDNA4S.map[slot];
@@ -248,7 +251,7 @@ static rdna4crc_rec_t *rdna4s_crc_check(RDNA4Texture *dt, int slot, uint64_t seq
     pthread_mutex_unlock(&RDNA4C.mu);
     if (lg) {
         uint32_t d1[8] = { 0 }, d2[8] = { 0 }; int n1 = doslot ? rdna4crc_diff(&r->a1, &b, d1, 8) : 0, n2 = rdna4crc_diff(&r->a1, &a2, d2, 8);
-        RDNA4LOG("scanout: CRC MISMATCH #%d: seq %llu surface %u slot %d step %u:%s%s slot!=src rows %d (y: %u %u %u %u), src-unstable rows %d (y: %u %u %u %u), %s, check cost %.0f us (slot read %.0f us)", lg, (unsigned long long)seq, r->sid, slot, r->step,
+        RDNA4LOG_ERR("scanout: CRC MISMATCH #%d: seq %llu surface %u slot %d step %u:%s%s slot!=src rows %d (y: %u %u %u %u), src-unstable rows %d (y: %u %u %u %u), %s, check cost %.0f us (slot read %.0f us)", lg, (unsigned long long)seq, r->sid, slot, r->step,
                (f & RDNA4CRC_F_SLOT_NE) ? " SLOT_NE_SRC" : "", (f & RDNA4CRC_F_UNSTABLE) ? " SRC_UNSTABLE" : "", n1, d1[0], n1 > 1 ? d1[1] : 0, n1 > 2 ? d1[2] : 0, n1 > 3 ? d1[3] : 0,
                n2, d2[0], n2 > 1 ? d2[1] : 0, n2 > 2 ? d2[2] : 0, n2 > 3 ? d2[3] : 0,
                later ? "a LATER command buffer for this surface was submitted" : "NO later command buffer: written outside our command buffers", dtn / 1000.0, ts / 1000.0);
@@ -423,7 +426,7 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
         VkResult sr = vkCreateSemaphore(RDNA4R.dev, &sci, NULL, &_orderSem);
         if (sr != VK_SUCCESS) {
             _orderSem = VK_NULL_HANDLE;
-            RDNA4LOG("RDNA4CommandQueue %p: timeline semaphore create failed (%d); staying on GFX queue", (__bridge void *)self, sr);
+            RDNA4LOG_WARN("RDNA4CommandQueue %p: timeline semaphore create failed (%d); staying on GFX queue", (__bridge void *)self, sr);
         }
     }
     _ndev = dev;
@@ -1126,8 +1129,8 @@ GARNET_INTERNAL void rdna4_fence_wait_pending(void *ctx, int slices) {
     const rdna4_fence_wait_ctx *w = (const rdna4_fence_wait_ctx *)ctx;
     const uint64_t now = rdna4_now();
     const uint64_t elapsedMs = now > w->t1 ? (now - w->t1) / 1000000ULL : 0ULL;
-    RDNA4LOG("FENCE PENDING: command buffer %llu has not completed after %llu ms (%d slice(s))",
-             (unsigned long long)w->cbid, (unsigned long long)elapsedMs, slices);
+    RDNA4LOG_WARN("FENCE PENDING: command buffer %llu has not completed after %llu ms (%d slice(s))",
+                  (unsigned long long)w->cbid, (unsigned long long)elapsedMs, slices);
 }
 
 typedef struct {
@@ -1361,9 +1364,9 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
         const uint64_t tw = rdna4_now();
         [self waitUntilCompleted];
         const uint64_t waited = rdna4_now() - tw;
-        if (waited > 500000000ull) RDNA4LOG("FRAME WAIT STALL: WindowServer waited %.1f ms for command buffer %llu (%lu segment(s), status %lu): the display shows the previous frame until it returns",
-                                            (double)waited / 1e6, (unsigned long long)_cbid, (unsigned long)_segments.count,
-                                            (unsigned long)[self status]);
+        if (waited > 500000000ull) RDNA4LOG_WARN("FRAME WAIT STALL: WindowServer waited %.1f ms for command buffer %llu (%lu segment(s), status %lu): the display shows the previous frame until it returns",
+                                                 (double)waited / 1e6, (unsigned long long)_cbid, (unsigned long)_segments.count,
+                                                 (unsigned long)[self status]);
     } else {
         if (ws && scanoutActive && !kf.noWsCompletion)
             RDNA4_ONCE("WindowServer commitAndWaitUntilSubmitted: active scanout flip owns presentation; pipelining via waitUntilScheduled");
@@ -1387,7 +1390,7 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
         RDNA4CB.inv_logged++;
         rdna4cbl_line_locked("I t=%llu rd_cb=%llu rd_q=%#llx rd_sub=%llu sid=%u wr_cb=%llu wr_q=%#llx wr_commit=%llu", (unsigned long long)t, (unsigned long long)inv[i].reader_id, (unsigned long long)inv[i].reader_queue,
             (unsigned long long)inv[i].reader_sub, inv[i].sid, (unsigned long long)inv[i].writer_id, (unsigned long long)inv[i].writer_queue, (unsigned long long)inv[i].writer_commit);
-        RDNA4LOG("cblog: INVERSION #%llu: cb %llu (queue %#llx, submit #%llu) reads IOSurface %u whose writer cb %llu (queue %#llx, committed earlier) is not yet submitted", (unsigned long long)RDNA4CB.inv_logged,
+        RDNA4LOG_WARN("cblog: INVERSION #%llu: cb %llu (queue %#llx, submit #%llu) reads IOSurface %u whose writer cb %llu (queue %#llx, committed earlier) is not yet submitted", (unsigned long long)RDNA4CB.inv_logged,
             (unsigned long long)inv[i].reader_id, (unsigned long long)inv[i].reader_queue, (unsigned long long)inv[i].reader_sub, inv[i].sid, (unsigned long long)inv[i].writer_id, (unsigned long long)inv[i].writer_queue);
     }
     pthread_mutex_unlock(&RDNA4CB.mu);
@@ -1456,13 +1459,13 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     _segments = [NSMutableArray array];
     NSError *segmentError = nil;
     if (![self rdna4OpenSegment:&segmentError]) {
-        RDNA4LOG("command buffer segment allocation failed: %s", segmentError.localizedDescription.UTF8String);
+        RDNA4LOG_ERR("command buffer segment allocation failed: %s", segmentError.localizedDescription.UTF8String);
         return nil;
     }
     _tBeg = rdna4_now();
     _pser = rdna4_fence_open();   // P1: fence-gated pool/backing reuse; unconditional for heap retirement when the pool is OFF
     if (!_pser) {
-        RDNA4LOG("command buffer refused: GPU retirement timeline is unavailable (allocation failure)");
+        RDNA4LOG_ERR("command buffer refused: GPU retirement timeline is unavailable (allocation failure)");
         return nil;
     }
     RDNA4LOGR("RDNA4CommandBuffer %p: vk %p begun", (__bridge void *)self, (void *)_vk);
@@ -2211,7 +2214,7 @@ RDNA4_DNR(RDNA4CommandBuffer)
     return out;
 }
 - (void)rdna4Fail:(NSString *)why {
-    RDNA4LOG("ENCODE ERROR (command buffer will complete with an error): %s", why.UTF8String);
+    RDNA4LOG_ERR("ENCODE ERROR (command buffer will complete with an error): %s", why.UTF8String);
     if (!_encErr) _encErr = rdna4_err(66, why);
 }
 - (NSError *)rdna4Error { return _encErr; }
@@ -2262,8 +2265,8 @@ RDNA4_DNR(RDNA4CommandBuffer)
         if (RDNA4S.incompleteSources.count || RDNA4S.incompleteImages.count || !RDNA4S.incompleteCapLogged) {
             if (!RDNA4S.incompleteCapLogged) {
                 RDNA4S.incompleteCapLogged = YES;
-                RDNA4LOG("scanout: shader-fallback suppression cap (%.0f ms) reached; resuming presentation",
-                         (double)(now - RDNA4S.incompleteSinceNs) / 1e6);
+                RDNA4LOG_WARN("scanout: shader-fallback suppression cap (%.0f ms) reached; resuming presentation",
+                              (double)(now - RDNA4S.incompleteSinceNs) / 1e6);
             }
             [RDNA4S.incompleteSources removeAllIndexes];
             [RDNA4S.incompleteImages removeAllObjects];
@@ -2466,7 +2469,7 @@ GARNET_INTERNAL void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4T
             const uint32_t gw_ = pxd ? pxd->w : RDNA4S.pw, gh_ = pxd ? pxd->h : RDNA4S.ph, gp_ = pxd ? pxd->pitch_bytes : RDNA4S.pitch;
             // bundle 17 (R-B1): the width / height check applies to EVERY frame, not only the image-sourced ones; a buffer-sourced frame (the surface's pages) also needs bytes-per-row == the plan's pitch (the copy reads pitch*height bytes of the surface)
             if (take && !((imgsrc ? rdna4df_img_ok(gw_, gh_, gp_, 4) : (BOOL)YES) && [dt bytesPerPixel] == 4 && [dt width] == gw_ && [dt height] == gh_ && [dt rdna4Levels] == 1 && (imgsrc || [dt rdna4IOSBytesPerRow] == gp_))) {   // refuse before a slot is taken
-                static _Atomic int rl; if (atomic_fetch_add(&rl, 1) < 8) RDNA4LOG("scanout: display surface %u cannot be copied to the slot (%lux%lu bpp %lu bpr %lu, %s; plan %ux%u pitch %u): frame not copied", [dt rdna4DispSid], (unsigned long)[dt width], (unsigned long)[dt height], (unsigned long)[dt bytesPerPixel], (unsigned long)(imgsrc ? 0 : [dt rdna4IOSBytesPerRow]), imgsrc ? "no CPU mapping" : "buffer source", gw_, gh_, gp_);
+                static _Atomic int rl; if (atomic_fetch_add(&rl, 1) < 8) RDNA4LOG_WARN("scanout: display surface %u cannot be copied to the slot (%lux%lu bpp %lu bpr %lu, %s; plan %ux%u pitch %u): frame not copied", [dt rdna4DispSid], (unsigned long)[dt width], (unsigned long)[dt height], (unsigned long)[dt bytesPerPixel], (unsigned long)(imgsrc ? 0 : [dt rdna4IOSBytesPerRow]), imgsrc ? "no CPU mapping" : "buffer source", gw_, gh_, gp_);
                 take = NO; }
             const BOOL vramImgSrc = imgsrc || [dt rdna4VramSurfCached];
             if (take && vramImgSrc && !imgsrc && !rdna4df_img_ok(gw_, gh_, gp_, 4)) take = NO;
@@ -2680,8 +2683,8 @@ GARNET_INTERNAL void rdna4s_record_copy_img_preserve(VkCommandBuffer cmd, RDNA4T
             if (r == VK_TIMEOUT) {
                 const uint64_t now = rdna4_now();
                 const uint64_t elapsedMs = now > t1 ? (now - t1) / 1000000ULL : 0ULL;
-                RDNA4LOG("FENCE STALL: command buffer %llu: the GPU fence did not signal within %llu ms (%d slice(s)); failing this submission",
-                         (unsigned long long)ctx.cbid, (unsigned long long)elapsedMs, slices);
+                RDNA4LOG_ERR("FENCE STALL: command buffer %llu: the GPU fence did not signal within %llu ms (%d slice(s)); failing this submission",
+                             (unsigned long long)ctx.cbid, (unsigned long long)elapsedMs, slices);
             }
             dispatch_async(completionQueue, ^{
                 RDNA4CommandBuffer *cb = (__bridge_transfer RDNA4CommandBuffer *)cbRef;
@@ -2989,7 +2992,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         pthread_mutex_unlock(&RDNA4R.computeQlock);
     } else {
     uint64_t tLock = rdna4_now(); rdna4_qlock(); tLock = rdna4_now() - tLock;
-    if (tLock > 250000000ull) RDNA4LOG("SUBMIT STALL: the queue lock was held for %.1f ms before command buffer %llu (a frame thread waits here: the display freezes)", (double)tLock / 1e6, (unsigned long long)_cbid);
+    if (tLock > 250000000ull) RDNA4LOG_WARN("SUBMIT STALL: the queue lock was held for %.1f ms before command buffer %llu (a frame thread waits here: the display freezes)", (double)tLock / 1e6, (unsigned long long)_cbid);
     r = (VkResult)atomic_load(&rdna4_submit_fault);
     if (r == VK_SUCCESS) {
         [self rdna4DispSourceWrites:segment];
@@ -3027,7 +3030,7 @@ static NSUInteger rdna4_linear_image_span(RDNA4Texture *texture) {
         }
         if (!_hasEvents && [self rdna4NativeEligible]) {
             uint64_t tIdle = rdna4_now(); r = rdna4_vkQueueWaitIdle(RDNA4R.q); tIdle = rdna4_now() - tIdle;
-            if (tIdle > 250000000ull) RDNA4LOG("SUBMIT STALL: vkQueueWaitIdle took %.1f ms on the native-buffer route (command buffer %llu)", (double)tIdle / 1e6, (unsigned long long)_cbid);
+            if (tIdle > 250000000ull) RDNA4LOG_WARN("SUBMIT STALL: vkQueueWaitIdle took %.1f ms on the native-buffer route (command buffer %llu)", (double)tIdle / 1e6, (unsigned long long)_cbid);
             if (r == VK_SUCCESS) {
                 bool fallback = false;
                 int nr = [self rdna4NativeExecute:&fallback];
@@ -4072,12 +4075,12 @@ RDNA4_DNR(RDNA4CounterSampleBuffer)
 
 - (NSData *)resolveCounterRange:(NSRange)range {
     if (!rdna4cnt_resolve_cpu_allowed(_state.storage_mode)) {
-        RDNA4LOG("resolveCounterRange: refused on non-Shared counter sample buffer (storageMode %u)", _state.storage_mode);
+        RDNA4LOG_WARN("resolveCounterRange: refused on non-Shared counter sample buffer (storageMode %u)", _state.storage_mode);
         return nil;
     }
     if (!rdna4cnt_range_ok((uint64_t)_state.sample_count, (uint64_t)range.location, (uint64_t)range.length)) {
-        RDNA4LOG("resolveCounterRange: invalid range {%lu, %lu} for sampleCount %u",
-                 (unsigned long)range.location, (unsigned long)range.length, _state.sample_count);
+        RDNA4LOG_WARN("resolveCounterRange: invalid range {%lu, %lu} for sampleCount %u",
+                      (unsigned long)range.location, (unsigned long)range.length, _state.sample_count);
         return nil;
     }
     NSMutableData *out = [NSMutableData dataWithLength:range.length * sizeof(MTLCounterResultTimestamp)];
@@ -4242,7 +4245,7 @@ GARNET_INTERNAL VkRenderPass rdna4_mk_rp(const VkAttachmentDescription *ads, uin
     VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na + nd, .pAttachments = ads, .subpassCount = 1,
         .pSubpasses = &sp, .dependencyCount = fetch ? 3 : 2, .pDependencies = deps };
     VkRenderPass rp = VK_NULL_HANDLE; VkResult r = vkCreateRenderPass(RDNA4R.dev, &rpc, NULL, &rp);
-    if (r != VK_SUCCESS) { RDNA4LOG("render pass: vkCreateRenderPass = %d", r); return VK_NULL_HANDLE; }
+    if (r != VK_SUCCESS) { RDNA4LOG_ERR("render pass: vkCreateRenderPass = %d", r); return VK_NULL_HANDLE; }
     return rp;
 }
 // P5b: cached passes belong to the device; uncached passes belong to the caller.
@@ -4293,15 +4296,15 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     uint32_t rlvl = isDepth ? _drlvl : _srlvl, rslice = isDepth ? _drslice : _srslice;
     NSUInteger filter = isDepth ? _dresFilter : _sresFilter;
     if (!RDNA4R.ok || !vkCreateRenderPass2 || !vkCmdBeginRenderPass2 || !vkCmdEndRenderPass2) {
-        RDNA4LOG("render pass: depth/stencil resolve requires Vulkan 1.2 renderPass2; refused"); return NO;
+        RDNA4LOG_WARN("render pass: depth/stencil resolve requires Vulkan 1.2 renderPass2; refused"); return NO;
     }
-    if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: %s resolve texture is not an RDNA4Texture; refused", isDepth ? "depth" : "stencil"); return NO; }
+    if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG_WARN("render pass: %s resolve texture is not an RDNA4Texture; refused", isDepth ? "depth" : "stencil"); return NO; }
     RDNA4Texture *dst = r;
     if (dst == src || [dst rdna4IsView] || [dst textureType] == MTLTextureType3D) {
-        RDNA4LOG("render pass: %s resolve texture is self, a view or a 3D texture; refused", isDepth ? "depth" : "stencil"); return NO;
+        RDNA4LOG_WARN("render pass: %s resolve texture is self, a view or a 3D texture; refused", isDepth ? "depth" : "stencil"); return NO;
     }
     if (rlvl >= [dst mipmapLevelCount] || rslice + _layers > [dst rdna4Layers]) {
-        RDNA4LOG("render pass: %s resolve level %u slice %u+%u outside resolve texture; refused", isDepth ? "depth" : "stencil", rlvl, rslice, _layers); return NO;
+        RDNA4LOG_WARN("render pass: %s resolve level %u slice %u+%u outside resolve texture; refused", isDepth ? "depth" : "stencil", rlvl, rslice, _layers); return NO;
     }
     unsigned sw = (unsigned)MAX((NSUInteger)1, src.width >> _dlvl), sh = (unsigned)MAX((NSUInteger)1, src.height >> _dlvl);
     unsigned dw = (unsigned)MAX((NSUInteger)1, dst.width >> rlvl), dh = (unsigned)MAX((NSUInteger)1, dst.height >> rlvl);
@@ -4309,19 +4312,19 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     BOOL compatFmt = (svkf == dvkf) || (svkf == VK_FORMAT_D32_SFLOAT_S8_UINT && ((isDepth && dvkf == VK_FORMAT_D32_SFLOAT) || (!isDepth && dvkf == VK_FORMAT_S8_UINT)));
     const char *why = NULL;
     if (!rdna4sa_ds_target_ok(sw, sh, (unsigned)svkf, dw, dh, compatFmt ? (unsigned)svkf : (unsigned)dvkf, (unsigned)[dst rdna4Samples], &why)) {
-        RDNA4LOG("render pass: %s resolve: %s; refused", isDepth ? "depth" : "stencil", why); return NO;
+        RDNA4LOG_WARN("render pass: %s resolve: %s; refused", isDepth ? "depth" : "stencil", why); return NO;
     }
     if (isDepth) {
         VkResolveModeFlagBits rm = filter == 1 ? VK_RESOLVE_MODE_MIN_BIT : filter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
         if (filter > 2 || !(RDNA4R.depthResolveModes & rm)) {
-            RDNA4LOG("render pass: depthResolveFilter %lu is not supported on RADV (modes 0x%x); refused", (unsigned long)filter, RDNA4R.depthResolveModes); return NO;
+            RDNA4LOG_WARN("render pass: depthResolveFilter %lu is not supported on RADV (modes 0x%x); refused", (unsigned long)filter, RDNA4R.depthResolveModes); return NO;
         }
     } else {
         if (filter != 0) {
-            RDNA4LOG("render pass: stencilResolveFilter %lu (DepthResolvedSample) is not supported on Vulkan; refused", (unsigned long)filter); return NO;
+            RDNA4LOG_WARN("render pass: stencilResolveFilter %lu (DepthResolvedSample) is not supported on Vulkan; refused", (unsigned long)filter); return NO;
         }
         if (!(RDNA4R.stencilResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)) {
-            RDNA4LOG("render pass: stencil Sample0 resolve is not supported on RADV (modes 0x%x); refused", RDNA4R.stencilResolveModes); return NO;
+            RDNA4LOG_WARN("render pass: stencil Sample0 resolve is not supported on RADV (modes 0x%x); refused", RDNA4R.stencilResolveModes); return NO;
         }
     }
     return YES;
@@ -4341,7 +4344,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     if (!_sc) return nil;
     NSUInteger reqLayers = [d respondsToSelector:@selector(renderTargetArrayLength)] ? d.renderTargetArrayLength : 0;
     if (reqLayers && (!RDNA4R.ok || reqLayers > RDNA4R.lim.maxFramebufferLayers)) {
-        RDNA4LOG("render pass: renderTargetArrayLength %lu exceeds RADV maxFramebufferLayers %u; refused", (unsigned long)reqLayers, RDNA4R.lim.maxFramebufferLayers);
+        RDNA4LOG_WARN("render pass: renderTargetArrayLength %lu exceeds RADV maxFramebufferLayers %u; refused", (unsigned long)reqLayers, RDNA4R.lim.maxFramebufferLayers);
         return nil;
     }
     _layers = reqLayers ? (uint32_t)reqLayers : 1u;
@@ -4370,13 +4373,13 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
         MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[i];
         RDNA4Texture *t = (RDNA4Texture *)ca.texture;
         if (!t) continue;
-        if (![t isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: attachment %lu is not an RDNA4Texture", (unsigned long)i); return nil; }
+        if (![t isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG_WARN("render pass: attachment %lu is not an RDNA4Texture", (unsigned long)i); return nil; }
         NSUInteger tsm = [t rdna4Samples];   // bundle 10: every attachment of a pass has the same sample count
-        if (_encSamples && tsm != _encSamples) { RDNA4LOG("render pass: attachment %lu has %lu samples, the others %u; refused", (unsigned long)i, (unsigned long)tsm, _encSamples); return nil; }
+        if (_encSamples && tsm != _encSamples) { RDNA4LOG_WARN("render pass: attachment %lu has %lu samples, the others %u; refused", (unsigned long)i, (unsigned long)tsm, _encSamples); return nil; }
         _encSamples = (unsigned)tsm;
         // m11h9: a mip level of a 2D texture can be the attachment (the compositor renders into the base level of mipmapped textures and generates the rest)
         NSUInteger lvl = ca.level;
-        if (lvl >= [t mipmapLevelCount] || ca.slice >= [t rdna4Layers] || _layers > [t rdna4Layers] - ca.slice || ca.depthPlane != 0) { RDNA4LOG("render pass: attachment %lu level %lu slice %lu+%u depthPlane %lu outside the texture (%lu level(s), %u slice(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, _layers, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return nil; }
+        if (lvl >= [t mipmapLevelCount] || ca.slice >= [t rdna4Layers] || _layers > [t rdna4Layers] - ca.slice || ca.depthPlane != 0) { RDNA4LOG_WARN("render pass: attachment %lu level %lu slice %lu+%u depthPlane %lu outside the texture (%lu level(s), %u slice(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, _layers, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount], [t rdna4Layers]); return nil; }
         const NSUInteger attachmentWidth = MAX((NSUInteger)1, t.width >> lvl);
         const NSUInteger attachmentHeight = MAX((NSUInteger)1, t.height >> lvl);
         if (na == 0) { _w = (uint32_t)attachmentWidth; _h = (uint32_t)attachmentHeight; }
@@ -4429,29 +4432,29 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
             [self rdna4OwnResource:ca.resolveTexture
                               kind:RDNA4_RESOURCE_RESOLVE
                           fragment:NO index:na];
-        { rdna4sa_t sat; if (!rdna4sa_map((unsigned long)ca.storeAction, ca.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: attachment %lu: %s; refused", (unsigned long)i, sat.why); return nil; }
+        { rdna4sa_t sat; if (!rdna4sa_map((unsigned long)ca.storeAction, ca.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG_WARN("render pass: attachment %lu: %s; refused", (unsigned long)i, sat.why); return nil; }
           if (sat.resolve && ![self rdna4CheckResolve:na]) return nil; }
         na++;
     }
     if (d.depthAttachment.texture || d.stencilAttachment.texture) {   // bundle 10: the depth / stencil attachment (one Vulkan attachment: one texture, depth and/or stencil aspect)
         id dtI = d.depthAttachment.texture, stI = d.stencilAttachment.texture;
         MTLRenderPassDepthAttachmentDescriptor *da = d.depthAttachment; MTLRenderPassStencilAttachmentDescriptor *sa = d.stencilAttachment;
-        if (dtI && stI && dtI != stI) { RDNA4LOG("render pass: separate depth and stencil textures are not supported (use one Depth32Float_Stencil8 texture); refused"); return nil; }
+        if (dtI && stI && dtI != stI) { RDNA4LOG_WARN("render pass: separate depth and stencil textures are not supported (use one Depth32Float_Stencil8 texture); refused"); return nil; }
         id ti = dtI ? dtI : stI;
-        if (![ti isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: the depth/stencil attachment is not an RDNA4Texture"); return nil; }
+        if (![ti isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG_WARN("render pass: the depth/stencil attachment is not an RDNA4Texture"); return nil; }
         RDNA4Texture *dt = ti; unsigned asp = [dt rdna4Aspects];
-        if (![dt rdna4IsDS]) { RDNA4LOG("render pass: the depth/stencil attachment texture has a colour pixel format; refused"); return nil; }
-        if ((dtI && !(asp & RDNA4DP_ASP_DEPTH)) || (stI && !(asp & RDNA4DP_ASP_STENCIL))) { RDNA4LOG("render pass: the %s attachment texture (pixel format %lu) has no %s aspect; refused", dtI ? "depth" : "stencil", (unsigned long)dt.pixelFormat, dtI ? "depth" : "stencil"); return nil; }
-        if ([dt rdna4IsView] && ([dt pixelFormat] == MTLPixelFormatX32_Stencil8 || asp != rdna4dp_view_aspect(asp))) { RDNA4LOG("render pass: a view of a combined depth/stencil texture cannot be an attachment; refused"); return nil; }
-        if (dtI && stI && (da.level != sa.level || da.slice != sa.slice)) { RDNA4LOG("render pass: the depth and stencil attachments name different levels / slices; refused"); return nil; }
+        if (![dt rdna4IsDS]) { RDNA4LOG_WARN("render pass: the depth/stencil attachment texture has a colour pixel format; refused"); return nil; }
+        if ((dtI && !(asp & RDNA4DP_ASP_DEPTH)) || (stI && !(asp & RDNA4DP_ASP_STENCIL))) { RDNA4LOG_WARN("render pass: the %s attachment texture (pixel format %lu) has no %s aspect; refused", dtI ? "depth" : "stencil", (unsigned long)dt.pixelFormat, dtI ? "depth" : "stencil"); return nil; }
+        if ([dt rdna4IsView] && ([dt pixelFormat] == MTLPixelFormatX32_Stencil8 || asp != rdna4dp_view_aspect(asp))) { RDNA4LOG_WARN("render pass: a view of a combined depth/stencil texture cannot be an attachment; refused"); return nil; }
+        if (dtI && stI && (da.level != sa.level || da.slice != sa.slice)) { RDNA4LOG_WARN("render pass: the depth and stencil attachments name different levels / slices; refused"); return nil; }
         NSUInteger lvl = dtI ? da.level : sa.level, slc = dtI ? da.slice : sa.slice, dpl = dtI ? da.depthPlane : sa.depthPlane;
-        if (lvl >= [dt mipmapLevelCount] || slc >= [dt rdna4Layers] || _layers > [dt rdna4Layers] - slc || dpl != 0) { RDNA4LOG("render pass: the depth/stencil attachment level %lu slice %lu+%u depthPlane %lu is outside the texture; refused", (unsigned long)lvl, (unsigned long)slc, _layers, (unsigned long)dpl); return nil; }
+        if (lvl >= [dt mipmapLevelCount] || slc >= [dt rdna4Layers] || _layers > [dt rdna4Layers] - slc || dpl != 0) { RDNA4LOG_WARN("render pass: the depth/stencil attachment level %lu slice %lu+%u depthPlane %lu is outside the texture; refused", (unsigned long)lvl, (unsigned long)slc, _layers, (unsigned long)dpl); return nil; }
         NSUInteger tsm = [dt rdna4Samples];
-        if (_encSamples && tsm != _encSamples) { RDNA4LOG("render pass: the depth/stencil attachment has %lu samples, the colour attachments %u; refused", (unsigned long)tsm, _encSamples); return nil; }
+        if (_encSamples && tsm != _encSamples) { RDNA4LOG_WARN("render pass: the depth/stencil attachment has %lu samples, the colour attachments %u; refused", (unsigned long)tsm, _encSamples); return nil; }
         _encSamples = (unsigned)tsm;
         uint32_t dw = (uint32_t)MAX((NSUInteger)1, dt.width >> lvl), dh = (uint32_t)MAX((NSUInteger)1, dt.height >> lvl);
         if (na == 0) { _w = dw; _h = dh; }
-        else if (dw < _w || dh < _h) { RDNA4LOG("render pass: the depth/stencil attachment (%ux%u) is smaller than the colour attachments (%ux%u); refused", dw, dh, _w, _h); return nil; }
+        else if (dw < _w || dh < _h) { RDNA4LOG_WARN("render pass: the depth/stencil attachment (%ux%u) is smaller than the colour attachments (%ux%u); refused", dw, dh, _w, _h); return nil; }
         rdna4rp_ds_t ops; rdna4rp_ds(asp, dtI != nil, (unsigned)da.loadAction, stI != nil, (unsigned)sa.loadAction, [dt layout] == VK_IMAGE_LAYOUT_UNDEFINED, &ops);
         BOOL wholeImg = [dt rdna4Levels] > 1 || [dt rdna4ImageLayers] > 1;
         if (wholeImg) rdna4_tex_to([_cb vk], dt, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -4475,9 +4478,9 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
             if (sa.resolveTexture) [self rdna4OwnResource:sa.resolveTexture kind:RDNA4_RESOURCE_RESOLVE fragment:NO index:9];
         }
         { rdna4sa_t sat;
-          if (dtI && !rdna4sa_map((unsigned long)da.storeAction, da.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: depth attachment: %s; refused", sat.why); return nil; }
+          if (dtI && !rdna4sa_map((unsigned long)da.storeAction, da.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG_WARN("render pass: depth attachment: %s; refused", sat.why); return nil; }
           if (dtI && sat.resolve && ![self rdna4CheckDSResolve:YES]) return nil;
-          if (stI && !rdna4sa_map((unsigned long)sa.storeAction, sa.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG("render pass: stencil attachment: %s; refused", sat.why); return nil; }
+          if (stI && !rdna4sa_map((unsigned long)sa.storeAction, sa.resolveTexture != nil, tsm > 1, &sat)) { RDNA4LOG_WARN("render pass: stencil attachment: %s; refused", sat.why); return nil; }
           if (stI && sat.resolve && ![self rdna4CheckDSResolve:NO]) return nil; }
         [self rdna4OwnResource:dt kind:RDNA4_RESOURCE_ATTACHMENT
                       fragment:NO index:na];
@@ -4486,13 +4489,13 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
                 (unsigned long)lvl, (unsigned long)slc, (unsigned long)tsm, ops.depthLoad, ops.depthStore, ops.stencilLoad, ops.stencilStore);
     }
     if (!_encSamples) _encSamples = 1;
-    if (!na && !_nd) { RDNA4LOG("render pass: no colour or depth/stencil attachments"); return nil; }
+    if (!na && !_nd) { RDNA4LOG_WARN("render pass: no colour or depth/stencil attachments"); return nil; }
     if ([d respondsToSelector:@selector(getSamplePositions:count:)]) {
         NSUInteger spc = [d getSamplePositions:NULL count:0];
         if (spc > 0) {
             if (!RDNA4R.sampleLocationsExt || spc != _encSamples || spc > 8 || !(RDNA4R.sampleLocationCounts & _encSamples)) {
-                RDNA4LOG("render pass: programmable sample positions count %lu for %u samples unsupported (ext %d counts 0x%x); refused",
-                         (unsigned long)spc, _encSamples, RDNA4R.sampleLocationsExt, RDNA4R.sampleLocationCounts);
+                RDNA4LOG_WARN("render pass: programmable sample positions count %lu for %u samples unsupported (ext %d counts 0x%x); refused",
+                              (unsigned long)spc, _encSamples, RDNA4R.sampleLocationsExt, RDNA4R.sampleLocationCounts);
                 return nil;
             }
             [d getSamplePositions:_samplePos count:spc];
@@ -4511,8 +4514,8 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
                 !rdna4_counter_pass_index_valid(csb, att.endOfVertexSampleIndex) ||
                 !rdna4_counter_pass_index_valid(csb, att.startOfFragmentSampleIndex) ||
                 !rdna4_counter_pass_index_valid(csb, att.endOfFragmentSampleIndex)) {
-                RDNA4LOG("render pass: sampleBufferAttachments[%lu] invalid (%s); refused",
-                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                RDNA4LOG_WARN("render pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                              (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
                 _ended = YES;
                 [super endEncoding];
                 return nil;
@@ -4530,7 +4533,7 @@ static VkRenderPass rdna4_mk_rp_c(const VkAttachmentDescription *ads, uint32_t n
     } else {
         VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = _rp1, .attachmentCount = na + _nd, .pAttachments = views, .width = _w, .height = _h, .layers = _layers };
         VkResult r = vkCreateFramebuffer(RDNA4R.dev, &fbc, NULL, &_fb);
-        if (r != VK_SUCCESS) { RDNA4LOG("render pass: vkCreateFramebuffer = %d", r); if (!_rp1c) vkDestroyRenderPass(RDNA4R.dev, _rp1, NULL); return nil; }
+        if (r != VK_SUCCESS) { RDNA4LOG_ERR("render pass: vkCreateFramebuffer = %d", r); if (!_rp1c) vkDestroyRenderPass(RDNA4R.dev, _rp1, NULL); return nil; }
         _baseHandles = [[RDNA4RenderHandles alloc]
             initWithRenderPass:_rp1c ? VK_NULL_HANDLE : _rp1 framebuffer:_fb];
     }
@@ -4693,13 +4696,13 @@ RDNA4_DNR(RDNA4RenderEncoder)
 // 1 when colour attachment i's resolve texture is usable (a 2D single-sample texture of the attachment's size and format); logs and returns 0 otherwise.
 - (BOOL)rdna4CheckResolve:(uint32_t)i {
     RDNA4Texture *src = _tex[i]; id r = _rtex[i];
-    if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG("render pass: attachment %u: the resolve texture is not an RDNA4Texture; refused", i); return NO; }
+    if (![r isKindOfClass:[RDNA4Texture class]]) { RDNA4LOG_WARN("render pass: attachment %u: the resolve texture is not an RDNA4Texture; refused", i); return NO; }
     RDNA4Texture *dst = r;
-    if (dst == src || [dst rdna4IsView] || [dst textureType] == MTLTextureType3D) { RDNA4LOG("render pass: attachment %u: the resolve texture is the attachment itself, a view or a 3D texture; refused", i); return NO; }
-    if (_sc->rlvl[i] >= [dst mipmapLevelCount] || _sc->rslice[i] + _layers > [dst rdna4Layers]) { RDNA4LOG("render pass: attachment %u: resolve level %u slice %u+%u is outside the resolve texture; refused", i, _sc->rlvl[i], _sc->rslice[i], _layers); return NO; }
+    if (dst == src || [dst rdna4IsView] || [dst textureType] == MTLTextureType3D) { RDNA4LOG_WARN("render pass: attachment %u: the resolve texture is the attachment itself, a view or a 3D texture; refused", i); return NO; }
+    if (_sc->rlvl[i] >= [dst mipmapLevelCount] || _sc->rslice[i] + _layers > [dst rdna4Layers]) { RDNA4LOG_WARN("render pass: attachment %u: resolve level %u slice %u+%u is outside the resolve texture; refused", i, _sc->rlvl[i], _sc->rslice[i], _layers); return NO; }
     unsigned sw = (unsigned)MAX((NSUInteger)1, src.width >> _sc->slvl[i]), sh = (unsigned)MAX((NSUInteger)1, src.height >> _sc->slvl[i]), dw = (unsigned)MAX((NSUInteger)1, dst.width >> _sc->rlvl[i]), dh = (unsigned)MAX((NSUInteger)1, dst.height >> _sc->rlvl[i]);
     const char *why = NULL;
-    if (!rdna4sa_target_ok(sw, sh, (unsigned)[src vkFormat], [src rdna4Aspects], dw, dh, (unsigned)[dst vkFormat], (unsigned)[dst rdna4Samples], &why)) { RDNA4LOG("render pass: attachment %u: %s; refused", i, why); return NO; }
+    if (!rdna4sa_target_ok(sw, sh, (unsigned)[src vkFormat], [src rdna4Aspects], dw, dh, (unsigned)[dst vkFormat], (unsigned)[dst rdna4Samples], &why)) { RDNA4LOG_WARN("render pass: attachment %u: %s; refused", i, why); return NO; }
     return YES;
 }
 - (void)rdna4RunDSResolveInto:(RDNA4Texture *)dst level:(uint32_t)dlvl slice:(uint32_t)dslice
@@ -6119,8 +6122,8 @@ RDNA4_ENCODER_SHARED
             id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(att.sampleBuffer, [_cb device], 0, NO, &cwhy);
             if (!csb || !rdna4_counter_pass_index_valid(csb, att.startOfEncoderSampleIndex) ||
                 !rdna4_counter_pass_index_valid(csb, att.endOfEncoderSampleIndex)) {
-                RDNA4LOG("compute pass: sampleBufferAttachments[%lu] invalid (%s); refused",
-                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                RDNA4LOG_WARN("compute pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                              (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
                 _ended = YES;
                 [super endEncoding];
                 return nil;
@@ -6875,8 +6878,8 @@ static void rdna4_blit_note_overwrite(RDNA4CommandBuffer *cb, RDNA4Texture *text
             id<RDNA4CounterSampleBufferInternal> csb = rdna4_counter_buffer_check(att.sampleBuffer, [_cb device], 0, NO, &cwhy);
             if (!csb || !rdna4_counter_pass_index_valid(csb, att.startOfEncoderSampleIndex) ||
                 !rdna4_counter_pass_index_valid(csb, att.endOfEncoderSampleIndex)) {
-                RDNA4LOG("blit pass: sampleBufferAttachments[%lu] invalid (%s); refused",
-                         (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
+                RDNA4LOG_WARN("blit pass: sampleBufferAttachments[%lu] invalid (%s); refused",
+                              (unsigned long)k, cwhy ? cwhy.UTF8String : "sample index out of range");
                 _ended = YES;
                 [super endEncoding];
                 return nil;

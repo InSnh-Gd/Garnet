@@ -111,7 +111,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     NSError *e = nil;
     RDNA4_LK_SCOPE; rdna4x_linkage_render(_hsDesc);   // build 18 (P3): the rebuild re-reads the descriptor's linkage on the watcher thread, so it looks under the same linked key
     RDNA4RenderPipelineState *r = [[RDNA4RenderPipelineState alloc] initWithDevice:_dev descriptor:_hsDesc noFallback:YES error:&e];
-    if (!r) { RDNA4LOG("HOT-SWAP rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
+    if (!r) { RDNA4LOG_ERR("HOT-SWAP rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
     r->_icbToken = _icbToken;
     r->_maxAmp = _maxAmp;
@@ -229,7 +229,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                     return nil;
                 }
                 fb = YES; _fallback = YES;
-                RDNA4LOG("FALLBACK %s / %s (%s)", vname.UTF8String, fname.UTF8String, e.localizedDescription.UTF8String);
+                RDNA4LOG_WARN("FALLBACK %s / %s (%s)", vname.UTF8String, fname.UTF8String, e.localizedDescription.UTF8String);
             }
         } else { if (err) *err = e; return nil; }
     }
@@ -409,7 +409,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
     {   // bundle 10: sample count, dynamic states, depth bias: rdna4pc_config (a colour-only single-sample pipeline gets exactly the old three dynamic states, one sample, no bias)
         const char *pcwhy = NULL;
         if (!rdna4pc_config(d.depthAttachmentPixelFormat != MTLPixelFormatInvalid, d.stencilAttachmentPixelFormat != MTLPixelFormatInvalid, (unsigned long)d.rasterSampleCount, d.alphaToCoverageEnabled ? 1 : 0, rdna4_ms_mask(), &_pc, &pcwhy)) {
-            RDNA4LOG("pipeline: rasterSampleCount %lu refused: %s (device mask 0x%x)", (unsigned long)d.rasterSampleCount, pcwhy, rdna4_ms_mask());
+            RDNA4LOG_WARN("pipeline: rasterSampleCount %lu refused: %s (device mask 0x%x)", (unsigned long)d.rasterSampleCount, pcwhy, rdna4_ms_mask());
             if (err) *err = rdna4_err(44, [NSString stringWithFormat:@"rasterSampleCount %lu: %s", (unsigned long)d.rasterSampleCount, pcwhy]); free(rv); free(rf); return nil; }
     }
     uint32_t dualSrcUsed = 0;
@@ -417,13 +417,13 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
         MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
         if (ca.pixelFormat == MTLPixelFormatInvalid) continue;
         const RDNA4Fmt *f = rdna4_fmt(ca.pixelFormat);
-        if (!f) { RDNA4LOG("pipeline: colour attachment %lu pixel format %lu has no Vulkan mapping in the format table", (unsigned long)i, (unsigned long)ca.pixelFormat);
+        if (!f) { RDNA4LOG_WARN("pipeline: colour attachment %lu pixel format %lu has no Vulkan mapping in the format table", (unsigned long)i, (unsigned long)ca.pixelFormat);
                   if (err) *err = rdna4_err(43, [NSString stringWithFormat:@"unsupported colour attachment format %lu", (unsigned long)ca.pixelFormat]); free(rv); free(rf); return nil; }
-        if (f->flags & (RDNA4F_A8 | RDNA4F_BC)) { RDNA4LOG("pipeline: colour attachment %lu format %lu cannot be a render target", (unsigned long)i, (unsigned long)ca.pixelFormat);
+        if (f->flags & (RDNA4F_A8 | RDNA4F_BC)) { RDNA4LOG_WARN("pipeline: colour attachment %lu format %lu cannot be a render target", (unsigned long)i, (unsigned long)ca.pixelFormat);
                   if (err) *err = rdna4_err(43, [NSString stringWithFormat:@"unsupported colour attachment format %lu", (unsigned long)ca.pixelFormat]); free(rv); free(rf); return nil; }
         if (!rdna4_radv_open(err)) { free(rv); free(rf); return nil; }
         { VkFormatFeatureFlags ff = rdna4_fmt_feats(f), nd = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | (ca.isBlendingEnabled ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT : 0);
-          if ((ff & nd) != nd) { RDNA4LOG("pipeline: colour attachment %lu pixel format %lu (vk %d): RADV features 0x%x lack 0x%x", (unsigned long)i, (unsigned long)ca.pixelFormat, f->vk, ff, nd & ~ff);
+          if ((ff & nd) != nd) { RDNA4LOG_WARN("pipeline: colour attachment %lu pixel format %lu (vk %d): RADV features 0x%x lack 0x%x", (unsigned long)i, (unsigned long)ca.pixelFormat, f->vk, ff, nd & ~ff);
               if (err) *err = rdna4_err(43, [NSString stringWithFormat:@"unsupported colour attachment format %lu (RADV lacks attachment%s support)", (unsigned long)ca.pixelFormat, ca.isBlendingEnabled ? "/blend" : ""]); free(rv); free(rf); return nil; } }
         RDNA4LOG("pipeline: colour attachment %lu pixel format %lu (vk %d)", (unsigned long)i, (unsigned long)ca.pixelFormat, f->vk);
         ads[na] = (VkAttachmentDescription){ .format = f->vk, .samples = (VkSampleCountFlagBits)_pc.samples, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -657,7 +657,7 @@ static _Atomic uint64_t rdna4_icb_pso_seq;
                 };
             }
         } else {
-            RDNA4LOG("pipeline: WARN shader input location %u has no vertex-descriptor attribute: reads a zero-stride null binding", loc);
+            RDNA4LOG_WARN("pipeline: WARN shader input location %u has no vertex-descriptor attribute: reads a zero-stride null binding", loc);
             if (!dummy) { _vib[_nvib++] = (VkVertexInputBindingDescription){ 31, 0, VK_VERTEX_INPUT_RATE_VERTEX }; _need[_nneed++] = 31; dummy = YES; }
             _via[_nvia++] = (VkVertexInputAttributeDescription){ loc, 31, rv->va[i].format, 0 };
         }
@@ -918,7 +918,7 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     VkResult r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcFs, NULL, &_gplFsLib);
     rdna4t_add(&T1.gfx, rdna4_now() - t_);
     if (r != VK_SUCCESS) {
-        RDNA4LOG("GPL: FS library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
+        RDNA4LOG_WARN("GPL: FS library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
         _gplFsLib = VK_NULL_HANDLE;
         return NO;
     }
@@ -941,7 +941,7 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
         .renderPass = _rp };
     r = vkCreateGraphicsPipelines(RDNA4R.dev, pc, 1, &gpcFo, NULL, &_gplFoLib);
     if (r != VK_SUCCESS) {
-        RDNA4LOG("GPL: FO library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
+        RDNA4LOG_WARN("GPL: FO library failed (%d) for %s, falling back to monolithic", (int)r, _fnm);
         vkDestroyPipeline(RDNA4R.dev, _gplFsLib, NULL); _gplFsLib = VK_NULL_HANDLE;
         _gplFoLib = VK_NULL_HANDLE;
         return NO;
@@ -1129,7 +1129,7 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     NSValue *v = _variants[k];
     if (!v) {
         NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk rflags:rflags icb:NO error:&e];
-        if (!p) RDNA4LOG("pipeline variant (topology %d cull %d front %d rflags 0x%x) failed: %s", topo, cull, front, rflags, e.localizedDescription.UTF8String);
+        if (!p) RDNA4LOG_ERR("pipeline variant (topology %d cull %d front %d rflags 0x%x) failed: %s", topo, cull, front, rflags, e.localizedDescription.UTF8String);
         else {
             v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v;
             if (!atomic_load_explicit(&_fastPipe, memory_order_relaxed)) {
@@ -1149,7 +1149,7 @@ static BOOL rdna4_icb_build_stage_dsl(const RDNA4PB *origPb, uint32_t origN, con
     NSValue *v = _icbVariants[k];
     if (!v) {
         NSError *e = nil; VkPipeline p = [self rdna4Build:topo cull:cull front:front ds:dk rflags:0 icb:YES error:&e];
-        if (!p) RDNA4LOG("icb pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
+        if (!p) RDNA4LOG_ERR("icb pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
         else { v = [NSValue valueWithPointer:(void *)p]; _icbVariants[k] = v; RDNA4LOG("icb pipeline variant topology %d cull %d front %d created", topo, cull, front); }
     }
     [_lock unlock];
@@ -1448,7 +1448,7 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     NSError *e = nil;
     RDNA4_LK_SCOPE; if (_hsLk) rdna4_lk_install(2, _hsLk);   // build 18 (P3)
     RDNA4ComputePipelineState *r = [[RDNA4ComputePipelineState alloc] initWithDevice:_dev function:_hsFn error:&e];
-    if (!r) { RDNA4LOG("HOT-SWAP kernel rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
+    if (!r) { RDNA4LOG_ERR("HOT-SWAP kernel rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
     r->_icb = _icb;
     r->_icbToken = _icbToken;
@@ -2096,8 +2096,8 @@ GARNET_INTERNAL BOOL rdna4nc_drop_write(id resource, RDNA4NCOp op, const char *o
     uint64_t n = atomic_fetch_add(&dropped[op], 1);
     if (n < 8 || (n & 1023u) == 0) {
         NSString *label = [resource label];
-        RDNA4LOG("-[MTLDebug%s ] validation: %s writes read-only no-copy buffer %p (%s) — command dropped",
-                 encoder, operation, (__bridge void *)resource, label ? label.UTF8String : "unlabeled");
+        RDNA4LOG_WARN("-[MTLDebug%s ] validation: %s writes read-only no-copy buffer %p (%s) — command dropped",
+                      encoder, operation, (__bridge void *)resource, label ? label.UTF8String : "unlabeled");
     }
     return YES;
 }
@@ -2131,7 +2131,7 @@ GARNET_INTERNAL BOOL rdna4nc_stage_writes(const RDNA4StageState *state, NSArray 
         }
         if (!known && !(*warned & (1u << i))) {
             *warned |= 1u << i;
-            RDNA4LOG("%s: cannot tell if binding %u writes a read-only buffer %p", stage, i, (__bridge void *)buffer);
+            RDNA4LOG_WARN("%s: cannot tell if binding %u writes a read-only buffer %p", stage, i, (__bridge void *)buffer);
         }
     }
     return drop;
@@ -2185,7 +2185,7 @@ GARNET_INTERNAL RDNA4Buffer *rdna4_dummy_buffer(id dev) {
     static RDNA4Buffer *b;
     @synchronized ([GarnetDevice class]) {
         if (!b) { NSError *e = nil; b = [[RDNA4Buffer alloc] initWithDevice:dev length:65536 options:MTLResourceStorageModeShared error:&e];
-                  if (b) memset([b contents], 0, 65536); else RDNA4LOG("dummy buffer failed: %s", e.localizedDescription.UTF8String); }
+                  if (b) memset([b contents], 0, 65536); else RDNA4LOG_ERR("dummy buffer failed: %s", e.localizedDescription.UTF8String); }
     }
     return b;
 }
@@ -2199,7 +2199,7 @@ GARNET_INTERNAL RDNA4Texture *rdna4_dummy_texture(id dev) {
             td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
             NSError *e = nil; t = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
             if (t) { uint32_t z = 0; [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&z bytesPerRow:4]; }
-            else RDNA4LOG("dummy texture failed: %s", e.localizedDescription.UTF8String);
+            else RDNA4LOG_ERR("dummy texture failed: %s", e.localizedDescription.UTF8String);
         }
     }
     return t;
@@ -2222,14 +2222,14 @@ GARNET_INTERNAL RDNA4Texture *rdna4_dummy_texture_write(id dev) {
             owner = dev;
             const RDNA4Fmt *f = rdna4_dummy_storage_format();
             if (!f) {
-                RDNA4LOG("dummy shader-write texture unavailable: no storage-image format is supported");
+                RDNA4LOG_WARN("dummy shader-write texture unavailable: no storage-image format is supported");
                 t = nil;
                 return t;
             }
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->mtl width:1 height:1 mipmapped:NO];
             td.usage = MTLTextureUsageShaderWrite; td.storageMode = MTLStorageModePrivate;
             NSError *e = nil; t = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
-            if (!t) RDNA4LOG("dummy shader-write texture failed: %s", e.localizedDescription.UTF8String);
+            if (!t) RDNA4LOG_ERR("dummy shader-write texture failed: %s", e.localizedDescription.UTF8String);
         }
     }
     return t;
@@ -2342,8 +2342,8 @@ static RDNA4Texture *rdna4_dummy_null_image_legacy(id dev, uint32_t shape, BOOL 
     RDNA4DummyImagePlan plan;
     const char *why = NULL;
     if (!rdna4_dummy_image_plan_make(shape, writable, samples, &plan, &why)) {
-        RDNA4LOG("dummy %s texture shape %u samples %u rejected: %s", writable ? "storage" : "sampled",
-                 shape, samples, why ?: "invalid descriptor");
+        RDNA4LOG_WARN("dummy %s texture shape %u samples %u rejected: %s", writable ? "storage" : "sampled",
+                      shape, samples, why ?: "invalid descriptor");
         return nil;
     }
     RDNA4DummyImageSlot *slot = writable ? &rdna4_dummy_null_write[shape] : &rdna4_dummy_null_read[shape][sampleSlot];
@@ -2360,8 +2360,8 @@ static RDNA4Texture *rdna4_dummy_null_image_legacy(id dev, uint32_t shape, BOOL 
         NSError *e = nil;
         slot->texture = [[RDNA4Texture alloc] initWithDevice:dev descriptor:td error:&e];
         if (!slot->texture) {
-            RDNA4LOG("dummy %s texture shape %u samples %u failed: %s", writable ? "storage" : "sampled",
-                     shape, samples, e.localizedDescription.UTF8String);
+            RDNA4LOG_ERR("dummy %s texture shape %u samples %u failed: %s", writable ? "storage" : "sampled",
+                         shape, samples, e.localizedDescription.UTF8String);
         } else if (!plan.storage && !plan.depth && plan.sampleCount == 1) {
             rdna4_dummy_zero_texture(slot->texture);
         }
@@ -2546,7 +2546,7 @@ GARNET_INTERNAL RDNA4SamplerState *rdna4_dummy_sampler(id dev) {
     static RDNA4SamplerState *s;
     @synchronized ([GarnetDevice class]) {
         if (!s) { NSError *e = nil; s = [[RDNA4SamplerState alloc] initWithDevice:dev descriptor:[MTLSamplerDescriptor new] error:&e];
-                  if (!s) RDNA4LOG("dummy sampler failed: %s", e.localizedDescription.UTF8String); }
+                  if (!s) RDNA4LOG_ERR("dummy sampler failed: %s", e.localizedDescription.UTF8String); }
     }
     return s;
 }
