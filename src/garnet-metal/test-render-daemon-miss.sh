@@ -55,6 +55,7 @@ static NSData *rdna4_spv_lookup(NSString *shader, const char *role, NSError **er
     *error = rdna4_err(41, @(role));
     return nil;
 }
+static uint32_t rdna4df_draw_bits(const char *fragmentName) { (void)fragmentName; return 0; }
 OBJC
     echo '#define GARNET_INTERNAL static'
     awk '/^GARNET_INTERNAL NSError \*rdna4_dump_pipeline\(/ {emit=1} emit {print} emit && /^}/ {exit}' "$source_dir/garnet_shaders.m"
@@ -70,6 +71,7 @@ static BOOL check(const char *label, BOOL vertexHit, BOOL fragmentHit, BOOL hasF
     NSString *vname = nil, *fname = nil;
     NSDictionary *mv_ = nil, *mf_ = nil;
     char _vnm[16], _fnm[16];
+    uint32_t _drawBits = 0; (void)_drawBits;
     queued = [NSMutableArray array];
     waited = @[];
     ready = [NSSet setWithArray:expected];
