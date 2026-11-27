@@ -30,16 +30,29 @@ TESTS += $(BUILD)/dcn41_hpd_test
 TESTS += $(BUILD)/webkit_mmap_hook_test
 TESTS += $(BUILD)/garnet_gfxoff_guard_test
 PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
+EXTENDED_NOARG_TESTS := $(BUILD)/test_gfx12_descriptors $(BUILD)/scanout_copy_test \
+  $(BUILD)/sdma_gcr_test $(BUILD)/sdma_dcc_test $(BUILD)/native_buffer_test \
+  $(BUILD)/gfx_flipmode_test $(BUILD)/gfx_ramtop_test
+EXTENDED_ROOT_TESTS := $(BUILD)/native_s1c_test $(BUILD)/native_hostimport_test \
+  $(BUILD)/native_agdc_test $(BUILD)/native_ws_open_test $(BUILD)/fbname_scan_test \
+  $(BUILD)/bootargs_alias_test $(BUILD)/native_dmubcmd_test $(BUILD)/native_dispread_test \
+  $(BUILD)/native_scanx_test $(BUILD)/native_disp2_test \
+  $(BUILD)/native_g1_test $(BUILD)/native_g2_test $(BUILD)/native_g4_test \
+  $(BUILD)/native_g5_test $(BUILD)/native_g6_test $(BUILD)/native_rebar_test \
+  $(BUILD)/native_sdmaorder_test $(BUILD)/native_metal_test
+LIVERASTER_TEST := $(BUILD)/dcn_liveraster_test
+LIVERASTER_ARGS := $(SRC)/dcn/dcn.cpp $(SRC)/GarnetDriver.cpp $(SRC)/dcn/agdc_service.cpp
 TLB83_ARGS := $(SRC)/amd/gmc_v12_0.cpp $(SRC)/amd/amdgpu_regs.h $(SRC)/GarnetDriver.cpp $(SRC)/amd
 TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_v14_0.cpp \
   sdma_v7_0.cpp amdgpu_init.cpp amdgpu_gart.cpp mes_v12_1.cpp cp_v12_0.cpp rlc_v12_0.cpp compute_test.cpp)
 SCANOUT_FULL_ARGS := $(SRC)/dcn/garnet_sdma_fastcopy.cpp $(SRC)/dcn/dcn.cpp $(SRC)/GarnetUserClient.cpp
 
-all: $(TESTS) $(PRT_SPARSE_TEST)
-	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST),$(TESTS)); do "$$test"; done
+all: $(TESTS) $(PRT_SPARSE_TEST) $(EXTENDED_NOARG_TESTS) $(EXTENDED_ROOT_TESTS) $(LIVERASTER_TEST)
+	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST),$(TESTS)) $(EXTENDED_NOARG_TESTS); do "$$test"; done
 	$(TLB83_TEST) $(TLB83_ARGS)
 	$(SCANOUT_FULL_TEST) $(SCANOUT_FULL_ARGS)
-	$(PRT_SPARSE_TEST) "$(abspath ../../..)"
+	$(LIVERASTER_TEST) $(LIVERASTER_ARGS)
+	@set -e; root="$(abspath ../../..)"; for test in $(PRT_SPARSE_TEST) $(EXTENDED_ROOT_TESTS); do "$$test" "$$root"; done
 
 $(BUILD):
 	mkdir -p $@
@@ -220,5 +233,83 @@ $(PRT_SPARSE_TEST): native_prt_sparse_test.cpp $(PTMEM_INC) $(SRC)/amd/garnet_na
 
 prt-sparse: $(PRT_SPARSE_TEST)
 	$(PRT_SPARSE_TEST) "$(abspath ../../..)"
+
+$(BUILD)/test_gfx12_descriptors: test_gfx12_descriptors.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/scanout_copy_test: scanout_copy_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn $(CXXFLAGS) $< -o $@
+
+$(BUILD)/sdma_gcr_test: sdma_gcr_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/sdma_dcc_test: sdma_dcc_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_buffer_test: native_buffer_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/gfx_flipmode_test: gfx_flipmode_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn $(CXXFLAGS) $< -o $@
+
+$(BUILD)/gfx_ramtop_test: gfx_ramtop_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_g1_test: native_g1_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_g2_test: native_g2_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_g4_test: native_g4_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_g5_test: native_g5_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_g6_test: native_g6_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_rebar_test: native_rebar_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_sdmaorder_test: native_sdmaorder_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_metal_test: native_metal_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_s1c_test: native_s1c_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_hostimport_test: native_hostimport_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_agdc_test: native_agdc_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_ws_open_test: native_ws_open_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/fbname_scan_test: fbname_scan_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn $(CXXFLAGS) $< -o $@
+
+$(BUILD)/bootargs_alias_test: bootargs_alias_test.cpp | $(BUILD)
+	$(CXX) -DKERNEL -Ibootargs_stub -include $(SRC)/GarnetBootArgs.h $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_dmubcmd_test: native_dmubcmd_test.cpp ../../dcn41/dcn41_allow.c | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn -I../../dcn41 $(CXXFLAGS) $< -x c++ ../../dcn41/dcn41_allow.c -o $@
+
+$(BUILD)/native_dispread_test: native_dispread_test.cpp ../../dcn41/dcn41_allow.c ../../dcn41/dcn41_dmub.c ../../dcn41/dcn41_core.c | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn -I../../dcn41 $(CXXFLAGS) $< -x c++ ../../dcn41/dcn41_allow.c ../../dcn41/dcn41_dmub.c ../../dcn41/dcn41_core.c -o $@
+
+$(BUILD)/native_scanx_test: native_scanx_test.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn -I../../dcn41 $(CXXFLAGS) $< -o $@
+
+$(BUILD)/native_disp2_test: native_disp2_test.cpp ../../dcn41/dcn41_allow.c | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn -I../../dcn41 $(CXXFLAGS) $< -x c++ ../../dcn41/dcn41_allow.c -o $@
+
+$(LIVERASTER_TEST): dcn_liveraster_test.cpp ../../dcn41/dcn41_core.c ../../dcn41/dcn41_otg.c | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I$(SRC)/dcn -I../../dcn41 $(CXXFLAGS) -x c++ $< ../../dcn41/dcn41_core.c ../../dcn41/dcn41_otg.c -o $@
 
 .PHONY: all gfx-golden smu-setup init-gart mes-resources gmc-resources large-pt system-memory prt-sparse
