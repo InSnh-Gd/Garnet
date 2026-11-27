@@ -1253,7 +1253,7 @@ RDNA4_DNR(RDNA4RenderPipelineState)
 // warming BGRA8_UNORM once populates RDNA4R.pc for all non-MSAA formats (BGRA8, sRGB, RGBA16Float).
 GARNET_INTERNAL void rdna4_gpl_prewarm_start(void) {
     if (!rdna4_is_ws() || !RDNA4R.ok || !RDNA4R.gplExt || !RDNA4R.pc) return;
-    if (access(GARNET_NOPREWARM_FILE, F_OK) == 0) {
+    if (rdna4_sb_access_exists(GARNET_NOPREWARM_FILE)) {
         RDNA4LOG("GPL prewarm: disabled (%s)", GARNET_NOPREWARM_FILE);
         return;
     }

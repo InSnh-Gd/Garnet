@@ -24,7 +24,7 @@ static struct { rdna4p_pool p; BOOL ready; } RDNA4HT;
 GARNET_INTERNAL RDNA4PoolState RDNA4P = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_pool_latch(void) {
     static int done; if (done) return; done = 1;
-    RDNA4P.on = access(RDNA4_POOL_FILE, F_OK) == 0 || access(RDNA4_POOL_FILE "-off", F_OK) != 0;   //: DEFAULT ON; /private/tmp/rdna4m-pool-off disables
+    RDNA4P.on = rdna4_sb_access_exists(RDNA4_POOL_FILE) || !rdna4_sb_access_exists(RDNA4_POOL_FILE "-off");   //: DEFAULT ON; /private/tmp/garnet-pool-off disables
     RDNA4P.auditSubmit = getenv("RDNA4_AUDIT_SUBMIT") != NULL;
     rdna4p_init(&RDNA4P.p, RDNA4P.on);
     garnet_vkpool_init(&RDNA4P.fences, GARNET_VKPOOL_FENCE_CAP);
@@ -357,7 +357,7 @@ GARNET_INTERNAL RDNA4DrawOptState RDNA4DO = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL _Atomic int rdna4_dw_logged;   // P5b: how many "scanout: display write" lines rdna4s_disp_account has printed (it prints the pipeline-name list of the first 20 only)
 GARNET_INTERNAL void rdna4_drawopt_latch(void) {
     static int done; if (done) return; done = 1;
-    RDNA4DO.on = access(RDNA4_DRAWOPT_FILE, F_OK) == 0 || access(RDNA4_DRAWOPT_FILE "-off", F_OK) != 0;   //: DEFAULT ON; /private/tmp/rdna4m-drawopt-off disables
+    RDNA4DO.on = rdna4_sb_access_exists(RDNA4_DRAWOPT_FILE) || !rdna4_sb_access_exists(RDNA4_DRAWOPT_FILE "-off");   //: DEFAULT ON; /private/tmp/garnet-drawopt-off disables
     if (RDNA4DO.on) { RDNA4DO.rp = (rdna4dc_rpcache *)calloc(1, sizeof *RDNA4DO.rp); if (!RDNA4DO.rp) RDNA4DO.on = NO; }
     if (!RDNA4DO.on) { RDNA4LOG("T1 drawopt: OFF (no %s at device creation; latched for the life of this process)", RDNA4_DRAWOPT_FILE); return; }
     RDNA4LOG("T1 drawopt: ON (%s present at device creation; latched for the life of this process): descriptor-set reuse, pipeline-bind skip, variant cache, render-pass cache (<= %d)", RDNA4_DRAWOPT_FILE, RDNA4DC_RP_CAP);
@@ -384,7 +384,7 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 static struct { BOOL on; pthread_mutex_t mu; rdna4ic_cache c; rdna4li_cache li; _Atomic uint64_t baseless; uint64_t lastSig; } RDNA4IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 GARNET_INTERNAL void rdna4_imp_latch(void) {
     static int done; if (done) return; done = 1;
-    RDNA4IC.on = rdna4ic_default_on(access(RDNA4_IMPCACHE_KILL_FILE, F_OK) == 0) ? YES : NO;   // build 16 (F2): default ON
+    RDNA4IC.on = rdna4ic_default_on(rdna4_sb_access_exists(RDNA4_IMPCACHE_KILL_FILE) ? 1 : 0) ? YES : NO;   // build 16 (F2): default ON
     rdna4ic_init(&RDNA4IC.c, RDNA4IC.on);
     rdna4ic_set_cap(&RDNA4IC.c, rdna4ic_cap_for_process(rdna4_is_ws() ? 1 : 0));
     rdna4li_init(&RDNA4IC.li, RDNA4IC.on ? 1 : 0, rdna4_is_ws() ? 128 : 64);
@@ -568,6 +568,7 @@ _Static_assert((uint32_t)VK_FORMAT_R8G8B8A8_UNORM == GARNET_VS_VK_RGBA8_UNORM &&
 
 static struct {
     BOOL on;
+    BOOL canStatSyncWb;
     pthread_mutex_t mu;
     pthread_cond_t flushCond;
     dispatch_queue_t flushQ;
@@ -595,13 +596,14 @@ static void rdna4_vs_idle_timer_fire(void);
 
 GARNET_INTERNAL void rdna4_vs_latch(void) {
     static int done; if (done) return; done = 1;
-    const int killPresent = access(GARNET_VS_KILL_FILE, F_OK) == 0 ? 1 : 0;
+    const int killPresent = rdna4_sb_access_exists(GARNET_VS_KILL_FILE) ? 1 : 0;
     const char *testEnv = garnet_getenv("GARNET_TEST_VRAM_SURF", NULL);
     const int testOptIn = (rdna4_allow() && testEnv && !strcmp(testEnv, "1")) ? 1 : 0;
     const int on = garnet_vs_should_enable(rdna4_is_ws() ? 1 : 0, testOptIn, killPresent);
     const uint64_t cap = RDNA4R.barPolicy.vram_surf_cap_bytes ? RDNA4R.barPolicy.vram_surf_cap_bytes : GARNET_VRAM_SURF_CAP_SMALL_BAR;
     RDNA4VS.on = on ? YES : NO;
-    atomic_store_explicit(&RDNA4VS.syncWb, access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0 ? 1 : 0, memory_order_relaxed);
+    RDNA4VS.canStatSyncWb = rdna4_sb_can_stat(GARNET_VS_SYNC_WB_FILE);
+    atomic_store_explicit(&RDNA4VS.syncWb, (RDNA4VS.canStatSyncWb && access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0) ? 1 : 0, memory_order_relaxed);
     garnet_vs_init(&RDNA4VS.c, on, cap);
     if (RDNA4VS.on) {
         RDNA4VS.flushQ = dispatch_queue_create("rdna4.vs-flush", DISPATCH_QUEUE_SERIAL);
@@ -1112,7 +1114,8 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
 
 GARNET_INTERNAL void rdna4_vs_tick(void) {
     if (!RDNA4VS.on) return;
-    atomic_store_explicit(&RDNA4VS.syncWb, access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0 ? 1 : 0, memory_order_relaxed);
+    if (RDNA4VS.canStatSyncWb)
+        atomic_store_explicit(&RDNA4VS.syncWb, access(GARNET_VS_SYNC_WB_FILE, F_OK) == 0 ? 1 : 0, memory_order_relaxed);
     rdna4_vs_evict_if_needed();
 }
 
@@ -2385,7 +2388,7 @@ RDNA4_DNR(RDNA4Texture)
     size_t pc = IOSurfaceGetPlaneCount(s);
     // P2: a plane p < planeCount of a 2- or 3-plane surface is accepted (CoreAnimation makes one texture per plane of a bi-planar YUV surface). The kill file
     // /private/tmp/rdna4m-noplanes (latched once per process) restores the old refusal of every multi-plane surface.
-    static int noplanes = -1; if (noplanes < 0) { noplanes = access(RDNA4_NOPLANES_FILE, F_OK) == 0; if (noplanes) RDNA4LOG("P2 planes: multi-plane IOSurfaces REFUSED (kill file " RDNA4_NOPLANES_FILE " exists; latched for the life of this process)"); }
+    static int noplanes = -1; if (noplanes < 0) { noplanes = rdna4_sb_access_exists(RDNA4_NOPLANES_FILE) ? 1 : 0; if (noplanes) RDNA4LOG("P2 planes: multi-plane IOSurfaces REFUSED (kill file " RDNA4_NOPLANES_FILE " exists; latched for the life of this process)"); }
     if (pc > 1 && noplanes) IOSFAIL(73, @"IOSurface has %zu planes; single-plane surfaces only", pc);
     size_t pidx = pc > 1 ? plane : 0;   // pc <= 1: any plane != 0 is refused by rdna4pl_geom below, exactly as before
     size_t sw = pc ? IOSurfaceGetWidthOfPlane(s, pidx) : IOSurfaceGetWidth(s), sh = pc ? IOSurfaceGetHeightOfPlane(s, pidx) : IOSurfaceGetHeight(s);

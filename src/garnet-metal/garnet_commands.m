@@ -89,7 +89,7 @@ static const RDNA4Fmt rdna4_fmts[] = {
 #define RDNA4_NOUINT_FILE "/private/tmp/garnet-nouint"   // bundle 19: exists -> the integer formats are refused as before (nil), read ONCE per process
 static BOOL rdna4_nouint(void) {
     static BOOL v; static dispatch_once_t once;
-    dispatch_once(&once, ^{ struct stat st; v = stat(RDNA4_NOUINT_FILE, &st) == 0; if (v) RDNA4LOG("integer colour formats (RG16Uint) OFF: kill file " RDNA4_NOUINT_FILE " exists (read once per process)"); });
+    dispatch_once(&once, ^{ struct stat st; v = rdna4_sb_stat(RDNA4_NOUINT_FILE, &st) == 0; if (v) RDNA4LOG("integer colour formats (RG16Uint) OFF: kill file " RDNA4_NOUINT_FILE " exists (read once per process)"); });
     return v;
 }
 // The component mapping of a view of format f whose client swizzle is swz: client channel -> (format's own mapping of that channel). Identity for every format but A8.
@@ -396,7 +396,7 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
     id qd = desc ? [desc copy] : [[NSClassFromString(@"MTLCommandQueueDescriptor") alloc] init];
     if ([[qd valueForKey:@"maxCommandBufferCount"] unsignedIntegerValue] == 0) [qd setValue:@64 forKey:@"maxCommandBufferCount"];   // base asserts on 0
     if (!desc && [qd respondsToSelector:NSSelectorFromString(@"setCommitSynchronously:")] &&
-        access("/private/tmp/garnet-async-commit", F_OK) != 0)
+        !rdna4_sb_access_exists("/private/tmp/garnet-async-commit"))
         [qd setValue:@YES forKey:@"commitSynchronously"];
     self = [super initWithDevice:dev descriptor:qd];
     if (!self) { if (err) *err = rdna4_err(50, @"_MTLCommandQueue initWithDevice:descriptor: returned nil"); return nil; }
@@ -407,7 +407,7 @@ GARNET_INTERNAL void rdna4_schedule_kick(void) {
     _orderSem = VK_NULL_HANDLE;
     _order = (garnet_async_qorder_t){ 0, 0 };
     atomic_init(&_orderLastWasCompute, 0);
-    const unsigned maxInFlight = (access(GARNET_SERIAL_QUEUE_FILE, F_OK) == 0)
+    const unsigned maxInFlight = rdna4_sb_access_exists(GARNET_SERIAL_QUEUE_FILE)
         ? GARNET_QP_SERIAL_MAX_INFLIGHT : GARNET_QP_DEFAULT_MAX_INFLIGHT;
     garnet_qp_init(&_qp, maxInFlight);
     _launchedCount = 0;
@@ -1143,9 +1143,9 @@ static RDNA4CBKillFlags rdna4_cb_kill_flags(void) {
     static RDNA4CBKillFlags flags;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        flags.earlySchedule = access("/private/tmp/garnet-early-schedule", F_OK) == 0;
-        flags.noWsCompletion = access("/private/tmp/garnet-no-ws-completion", F_OK) == 0;
-        flags.wsCompletionAll = access("/private/tmp/garnet-ws-completion-all", F_OK) == 0;
+        flags.earlySchedule = rdna4_sb_access_exists("/private/tmp/garnet-early-schedule");
+        flags.noWsCompletion = rdna4_sb_access_exists("/private/tmp/garnet-no-ws-completion");
+        flags.wsCompletionAll = rdna4_sb_access_exists("/private/tmp/garnet-ws-completion-all");
     });
     return flags;
 }
