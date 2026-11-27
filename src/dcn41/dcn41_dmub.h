@@ -201,6 +201,8 @@ bool dcn41_dmub_ring_full(const struct dcn41_dmub_ring *ring);
  * equals ours (someone else wrote), or the ring is full; writes the 16 dwords at wptr, reads them back and refuses on any
  * mismatch WITHOUT moving WPTR, then writes DMCUB_INBOX1_WPTR. */
 int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd);
+/* Under caller serialization, stage and verify all entries before publishing them with one WPTR write. */
+int dcn41_dmub_ring_submit_batch(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmds, uint32_t count);
 /* dmub_srv_wait_for_idle: poll DMCUB_INBOX1_RPTR (udelay(1) between polls) until it equals our WPTR. */
 int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us);
 /* dmub_rb_get_return_data: the entry just behind RPTR, for commands sent with ret_status set. */

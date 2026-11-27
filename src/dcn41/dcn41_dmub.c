@@ -170,6 +170,12 @@ static bool ring_ok(const struct dcn41_dmub_ring *ring)
     return ring && ring->magic == DCN41_DMUB_RING_MAGIC && dcn41_ready(ring->dev) && ring->mread && ring->mwrite;
 }
 
+static bool ring_ptr_valid(const struct dcn41_dmub_ring *ring, uint32_t ptr)
+{
+    return ring->capacity % DCN41_DMUB_CMD_SIZE == 0 &&
+           ptr % DCN41_DMUB_CMD_SIZE == 0 && ptr < ring->capacity;
+}
+
 int dcn41_dmub_ring_attach(struct dcn41_dmub_ring *ring, struct dcn41_dev *dev, const struct dcn41_dmub_state *st,
                            dcn41_mem_read32_fn mread, dcn41_mem_write32_fn mwrite, void *mcookie)
 {
@@ -207,16 +213,33 @@ bool dcn41_dmub_ring_full(const struct dcn41_dmub_ring *ring)
     return data_count == ring->capacity - DCN41_DMUB_CMD_SIZE;
 }
 
-int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd)
+static int ring_stage(const struct dcn41_dmub_ring *ring, uint32_t offset, const struct dcn41_dmub_cmd *cmd)
 {
-    const uint8_t *src;
-    uint32_t hw_wptr = 0, hw_rptr = 0, i, next;
+    const uint8_t *src = (const uint8_t *)cmd;
+    for (uint32_t i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
+        uint32_t word = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
+                        ((uint32_t)src[i + 3] << 24);
+        ring->mwrite(ring->mcookie, ring->ring_addr + offset + i, word);
+    }
+    /* dmub_rb_flush_pending reads the queued entries back before WPTR moves; we also compare them. */
+    for (uint32_t i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
+        uint32_t word = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
+                        ((uint32_t)src[i + 3] << 24);
+        if (ring->mread(ring->mcookie, ring->ring_addr + offset + i) != word)
+            return DCN41_E_READBACK;
+    }
+    return DCN41_OK;
+}
+
+int dcn41_dmub_ring_submit_batch(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmds, uint32_t count)
+{
+    uint32_t hw_wptr = 0, hw_rptr = 0, used, next;
     uint32_t wptr_addr, rptr_addr;
     int rc;
 
     if (!ring_ok(ring))
         return DCN41_E_UNINIT;
-    if (!cmd)
+    if (!cmds || !count)
         return DCN41_E_ARG;
     wptr_addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_WPTR);
     rptr_addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_RPTR);
@@ -230,34 +253,32 @@ int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub
     rc = dcn41_read(ring->dev, rptr_addr, &hw_rptr);
     if (rc)
         return rc;
-    /* dmub_srv_fb_cmd_queue: "if (dmub->inbox1.rb.rptr > capacity || wrpt > capacity) return DMUB_STATUS_HW_FAILURE" */
-    if (hw_rptr > ring->capacity || ring->wptr > ring->capacity)
+    if (!ring_ptr_valid(ring, hw_rptr) || !ring_ptr_valid(ring, ring->wptr))
         return DCN41_E_HW;
     ring->rptr = hw_rptr;
-    if (dcn41_dmub_ring_full(ring))
+    used = ring->wptr >= hw_rptr ? ring->wptr - hw_rptr : ring->capacity - (hw_rptr - ring->wptr);
+    if (count >= (ring->capacity - used) / DCN41_DMUB_CMD_SIZE)
         return DCN41_E_FULL;
-    src = (const uint8_t *)cmd;
-    for (i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
-        uint32_t w = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
-                     ((uint32_t)src[i + 3] << 24);
-        ring->mwrite(ring->mcookie, ring->ring_addr + ring->wptr + i, w);
+    next = ring->wptr;
+    for (uint32_t index = 0; index < count; ++index) {
+        rc = ring_stage(ring, next, &cmds[index]);
+        if (rc)
+            return rc;
+        next += DCN41_DMUB_CMD_SIZE;
+        if (next == ring->capacity)
+            next = 0;
     }
-    /* dmub_rb_flush_pending reads the queued entries back before WPTR moves; we also compare them */
-    for (i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
-        uint32_t w = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
-                     ((uint32_t)src[i + 3] << 24);
-        if (ring->mread(ring->mcookie, ring->ring_addr + ring->wptr + i) != w)
-            return DCN41_E_READBACK;
-    }
-    next = ring->wptr + DCN41_DMUB_CMD_SIZE;
-    if (next >= ring->capacity)
-        next %= ring->capacity;
     rc = dcn41_write(ring->dev, wptr_addr, next);   /* dmub_dcn401_set_inbox1_wptr */
     if (rc)
         return rc;
     ring->wptr = next;
-    ring->submitted++;
+    ring->submitted += count;
     return DCN41_OK;
+}
+
+int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd)
+{
+    return dcn41_dmub_ring_submit_batch(ring, cmd, 1);
 }
 
 int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
@@ -267,6 +288,8 @@ int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
 
     if (!ring_ok(ring))
         return DCN41_E_UNINIT;
+    if (!ring_ptr_valid(ring, ring->rptr) || !ring_ptr_valid(ring, ring->wptr))
+        return DCN41_E_HW;
     addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_RPTR);
     if (addr == DCN41_BAD_OFFSET)
         return DCN41_E_WINDOW;
@@ -275,7 +298,7 @@ int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
         rc = dcn41_read(ring->dev, addr, &rptr);
         if (rc)
             return rc;
-        if (rptr > ring->capacity)
+        if (!ring_ptr_valid(ring, rptr))
             return DCN41_E_HW;
         if (ring->rptr > rptr)
             ring->reported += (rptr + ring->capacity - ring->rptr) / DCN41_DMUB_CMD_SIZE;
