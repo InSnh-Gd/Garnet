@@ -30,6 +30,11 @@ TESTS += $(BUILD)/dcn41_fams2_mall_test
 TESTS += $(BUILD)/dcn41_det_test
 TESTS += $(BUILD)/garnet_gfxoff_guard_test
 TESTS += $(BUILD)/dcn41_dmub_boot_test
+TESTS += $(BUILD)/dcn41_dml21_test
+DML21_DIR := $(SRC)/dcn/dml21
+include $(DML21_DIR)/sources.mk
+DML21_OBJS := $(patsubst $(DML21_DIR)/src/%.c,$(BUILD)/dml21/%.o,$(DML21_C_SRCS))
+DML21_FP_FLAGS := -ffp-contract=off $(if $(filter x86_64 amd64,$(shell uname -m)),-msse -msse2 -mno-avx)
 PRT_SPARSE_TEST := $(BUILD)/native_prt_sparse_test
 TLB83_ARGS := $(SRC)/amd/gmc_v12_0.cpp $(SRC)/amd/amdgpu_regs.h $(SRC)/GarnetDriver.cpp $(SRC)/amd
 TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_v14_0.cpp \
@@ -58,6 +63,18 @@ $(BUILD)/fw_loader_test: fw_loader_test.cpp $(SRC)/amd/fw_loader.cpp $(SRC)/amd/
 
 $(BUILD)/dcn41_fams2_test: dcn41_fams2_test.cpp $(SRC)/dcn/dcn41_fams2_pure.h ../../dcn41/dcn41_dmub.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) dcn41_fams2_test.cpp -o $@
+
+$(BUILD)/dml21/%.o: $(DML21_DIR)/src/%.c $(DML21_DIR)/sources.mk Makefile
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 $(filter-out -std=c++17 -Wextra -Werror,$(CXXFLAGS)) $(DML21_CPPFLAGS) $(DML21_FP_FLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/dml21-adapter.o: $(SRC)/dcn/dml21_adapter/dcn41_dml21_adapter.cpp $(DML21_DIR)/sources.mk Makefile | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(DML21_CPPFLAGS) $(DML21_FP_FLAGS) -Wno-missing-field-initializers -MMD -MP -c $< -o $@
+
+$(BUILD)/dcn41_dml21_test: dcn41_dml21_test.cpp dml21-oracle/fixture.h dml21-oracle/expected.h dml21-oracle/expected.inc $(SRC)/dcn/dcn41_dml21_bridge.cpp $(SRC)/dcn/dcn41_dml21_bridge.h $(SRC)/dcn/dml21_adapter/dcn41_dml21_adapter.h $(BUILD)/dml21-adapter.o $(DML21_OBJS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@
+
+-include $(DML21_OBJS:.o=.d) $(BUILD)/dml21-adapter.d
 
 $(BUILD)/dcn41_fams2_mall_test: dcn41_fams2_mall_test.cpp $(SRC)/dcn/dcn41_mall_pure.h $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/amdgpu_asic.h ../../dcn41/dcn41_dmub.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) dcn41_fams2_mall_test.cpp $(SRC)/amd/amdgpu_asic.cpp -o $@
