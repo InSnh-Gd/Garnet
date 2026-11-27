@@ -1,5 +1,5 @@
 // test-mesh-runtime.c: pure-C host test suite for garnet_mesh.h and source pins for
-// garnet_mesh_rt.m / test-metal3-mesh-shaders.m (Wave 3D Task 6.2).
+// garnet_mesh.m / test-metal3-mesh-shaders.m (Wave 3D Task 6.2).
 //
 // Compile & run (GCC -Werror):
 //   gcc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Wshadow -Wsign-conversion -Werror -Isrc/garnet-metal src/garnet-metal/test-mesh-runtime.c -o "$TMPDIR/test-mesh-runtime-gcc"
@@ -1007,8 +1007,8 @@ static char *slurp_file(const char *path) {
 }
 
 static void test_source_pins(void) {
-    char *impl = slurp_file("src/garnet-metal/garnet_mesh_rt.m");
-    if (!impl) impl = slurp_file("garnet_mesh_rt.m");
+    char *impl = slurp_file("src/garnet-metal/garnet_mesh.m");
+    if (!impl) impl = slurp_file("garnet_mesh.m");
     CHECK(impl != NULL);
 
     const char *impl_pins[] = {

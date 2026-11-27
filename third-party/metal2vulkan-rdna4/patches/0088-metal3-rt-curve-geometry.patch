@@ -667,7 +667,7 @@ index 909f50d..3f48539 100644
  
      // Emit bounded AABB commit helpers (checks tmin <= t <= committed_t before OpRayQueryGenerateIntersectionKHR).
      for slot in commit_aabb_slots {
-@@ -2138,6 +2442,769 @@ fn append_prim_data_lookup_support(out: &mut String) {
+@@ -2138,6 +2442,905 @@ fn append_prim_data_lookup_support(out: &mut String) {
      }
  }
  
@@ -1033,8 +1033,8 @@ index 909f50d..3f48539 100644
 +             \x20 %dc2 = fsub float %six_omu, %three_u2\n\
 +             \x20 %dc3 = fmul float 3.000000e+00, %u2\n",
 +        );
-+        // Evaluate P(u0) and dP(u0) for X, Y, R (W).
-+        for (ch, rcol) in [("x", "x"), ("y", "y"), ("r", "3")] {
++        // Evaluate P(u0) and dP(u0) for X, Y, Z, R (W).
++        for (ch, rcol) in [("x", "x"), ("y", "y"), ("z", "z"), ("r", "3")] {
 +            let suffix = if ch == "r" { "_3" } else { &format!("_{rcol}") };
 +            let prefix = if ch == "r" { "b" } else { "br" };
 +            out.push_str(&format!(
@@ -1055,16 +1055,72 @@ index 909f50d..3f48539 100644
 +            ));
 +        }
 +        out.push_str(
-+            "  %pxdx = fmul float %px, %dx\n\
++            "  %not_flat = xor i1 %is_flat, true\n\
++             \x20 %dx2 = fmul float %dx, %dx\n\
++             \x20 %dy2 = fmul float %dy, %dy\n\
++             \x20 %dz2 = fmul float %dz, %dz\n\
++             \x20 %dr2 = fmul float %dr, %dr\n\
++             \x20 %d_xy2 = fadd float %dx2, %dy2\n\
++             \x20 %d_xyz2 = fadd float %d_xy2, %dz2\n\
++             \x20 %D_val = fsub float %d_xyz2, %dr2\n\
++             \x20 %abs_D = call float @llvm.fabs.f32(float %D_val)\n\
++             \x20 %D_ok = fcmp ogt float %abs_D, 1.000000e-10\n\
++             \x20 %safe_D = select i1 %D_ok, float %D_val, float 1.000000e+00\n\
++             \x20 %pxdx = fmul float %px, %dx\n\
 +             \x20 %pydy = fmul float %py, %dy\n\
 +             \x20 %pd_xy = fadd float %pxdx, %pydy\n\
 +             \x20 %prdr = fmul float %pr, %dr\n\
++             \x20 %k0_num = fsub float %prdr, %pd_xy\n\
++             \x20 %k0_raw = fdiv float %k0_num, %safe_D\n\
++             \x20 %k0 = select i1 %D_ok, float %k0_raw, float 0.000000e+00\n\
++             \x20 %k1_raw = fdiv float %dz, %safe_D\n\
++             \x20 %k1 = select i1 %D_ok, float %k1_raw, float 0.000000e+00\n\
++             \x20 %k0dx = fmul float %k0, %dx\n\
++             \x20 %k0dy = fmul float %k0, %dy\n\
++             \x20 %tx = fadd float %px, %k0dx\n\
++             \x20 %ty = fadd float %py, %k0dy\n\
++             \x20 %tz = fmul float %k0, %dz\n\
++             \x20 %k0dr = fmul float %k0, %dr\n\
++             \x20 %tr0 = fadd float %pr, %k0dr\n\
++             \x20 %a_num = fsub float %d_xy2, %dr2\n\
++             \x20 %a_raw = fdiv float %a_num, %safe_D\n\
++             \x20 %a_coef = select i1 %D_ok, float %a_raw, float 0.000000e+00\n\
++             \x20 %tx2 = fmul float %tx, %tx\n\
++             \x20 %ty2 = fmul float %ty, %ty\n\
++             \x20 %tz2 = fmul float %tz, %tz\n\
++             \x20 %tr02 = fmul float %tr0, %tr0\n\
++             \x20 %txy2 = fadd float %tx2, %ty2\n\
++             \x20 %txyz2 = fadd float %txy2, %tz2\n\
++             \x20 %c_coef = fsub float %txyz2, %tr02\n\
++             \x20 %ac_prod = fmul float %a_coef, %c_coef\n\
++             \x20 %disc = fsub float %tz2, %ac_prod\n\
++             \x20 %abs_a = call float @llvm.fabs.f32(float %a_coef)\n\
++             \x20 %a_ok = fcmp ogt float %abs_a, 1.000000e-08\n\
++             \x20 %disc_ok = fcmp oge float %disc, 0.000000e+00\n\
++             \x20 %cone_0 = and i1 %not_flat, %D_ok\n\
++             \x20 %cone_1 = and i1 %cone_0, %a_ok\n\
++             \x20 %cone_ok = and i1 %cone_1, %disc_ok\n\
++             \x20 %safe_a = select i1 %a_ok, float %a_coef, float 1.000000e+00\n\
++             \x20 %safe_disc = select i1 %disc_ok, float %disc, float 0.000000e+00\n\
++             \x20 %sq_disc = call float @air.sqrt.f32(float %safe_disc)\n\
++             \x20 %tau_num0 = fsub float %tz, %sq_disc\n\
++             \x20 %tau_num1 = fadd float %tz, %sq_disc\n\
++             \x20 %tau0 = fdiv float %tau_num0, %safe_a\n\
++             \x20 %tau1 = fdiv float %tau_num1, %safe_a\n\
++             \x20 %t_lt = fcmp olt float %tau0, %tau1\n\
++             \x20 %t_lo = select i1 %t_lt, float %tau0, float %tau1\n\
++             \x20 %t_hi = select i1 %t_lt, float %tau1, float %tau0\n\
++             \x20 %s_lo = fadd float %pz, %t_lo\n\
++             \x20 %lo_ge = fcmp oge float %s_lo, %smin\n\
++             \x20 %tau_pick = select i1 %lo_ge, float %t_lo, float %t_hi\n\
++             \x20 %k1t = fmul float %k1, %tau_pick\n\
++             \x20 %du_c_raw = fadd float %k0, %k1t\n\
++             \x20 %du_c_hi = fcmp ogt float %du_c_raw, 2.500000e-01\n\
++             \x20 %du_c0 = select i1 %du_c_hi, float 2.500000e-01, float %du_c_raw\n\
++             \x20 %du_c_lo = fcmp olt float %du_c0, -2.500000e-01\n\
++             \x20 %du_c1 = select i1 %du_c_lo, float -2.500000e-01, float %du_c0\n\
 +             \x20 %r_term = select i1 %is_flat, float 0.000000e+00, float %prdr\n\
 +             \x20 %f_val = fsub float %pd_xy, %r_term\n\
-+             \x20 %dx2 = fmul float %dx, %dx\n\
-+             \x20 %dy2 = fmul float %dy, %dy\n\
-+             \x20 %d_xy2 = fadd float %dx2, %dy2\n\
-+             \x20 %dr2 = fmul float %dr, %dr\n\
 +             \x20 %dr_term = select i1 %is_flat, float 0.000000e+00, float %dr2\n\
 +             \x20 %df_val = fsub float %d_xy2, %dr_term\n\
 +             \x20 %abs_df = call float @llvm.fabs.f32(float %df_val)\n\
@@ -1076,7 +1132,9 @@ index 909f50d..3f48539 100644
 +             \x20 %st_c0 = select i1 %st_hi, float 2.000000e-01, float %st_if\n\
 +             \x20 %st_lo = fcmp olt float %st_c0, -2.000000e-01\n\
 +             \x20 %st_cl = select i1 %st_lo, float -2.000000e-01, float %st_c0\n\
-+             \x20 %u_sub = fsub float %u0, %st_cl\n\
++             \x20 %du_2d = fsub float -0.000000e+00, %st_cl\n\
++             \x20 %du_use = select i1 %cone_ok, float %du_c1, float %du_2d\n\
++             \x20 %u_sub = fadd float %u0, %du_use\n\
 +             \x20 %u_neg = fcmp olt float %u_sub, 0.000000e+00\n\
 +             \x20 %u_c0 = select i1 %u_neg, float 0.000000e+00, float %u_sub\n\
 +             \x20 %u_ov = fcmp ogt float %u_c0, 1.000000e+00\n\
@@ -1109,75 +1167,153 @@ index 909f50d..3f48539 100644
 +                 \x20 %q{ch}_3 = fmul float %qc3, %{prefix}3{suffix}\n\
 +                 \x20 %q{ch}_01 = fadd float %q{ch}_0, %q{ch}_1\n\
 +                 \x20 %q{ch}_23 = fadd float %q{ch}_2, %q{ch}_3\n\
-+                 \x20 %q{ch} = fadd float %q{ch}_01, %q{ch}_23\n"
++                 \x20 %q{ch} = fadd float %q{ch}_01, %q{ch}_23\n\
++                 \x20 %qd{ch}_0 = fmul float %qdc0, %{prefix}0{suffix}\n\
++                 \x20 %qd{ch}_1 = fmul float %qdc1, %{prefix}1{suffix}\n\
++                 \x20 %qd{ch}_2 = fmul float %qdc2, %{prefix}2{suffix}\n\
++                 \x20 %qd{ch}_3 = fmul float %qdc3, %{prefix}3{suffix}\n\
++                 \x20 %qd{ch}_01 = fadd float %qd{ch}_0, %qd{ch}_1\n\
++                 \x20 %qd{ch}_23 = fadd float %qd{ch}_2, %qd{ch}_3\n\
++                 \x20 %qd{ch} = fadd float %qd{ch}_01, %qd{ch}_23\n"
 +            ));
-+            if ch == "x" || ch == "y" || ch == "z" {
-+                out.push_str(&format!(
-+                    "  %qd{ch}_0 = fmul float %qdc0, %br0_{rcol}\n\
-+                     \x20 %qd{ch}_1 = fmul float %qdc1, %br1_{rcol}\n\
-+                     \x20 %qd{ch}_2 = fmul float %qdc2, %br2_{rcol}\n\
-+                     \x20 %qd{ch}_3 = fmul float %qdc3, %br3_{rcol}\n\
-+                     \x20 %qd{ch}_01 = fadd float %qd{ch}_0, %qd{ch}_1\n\
-+                     \x20 %qd{ch}_23 = fadd float %qd{ch}_2, %qd{ch}_3\n\
-+                     \x20 %qd{ch} = fadd float %qd{ch}_01, %qd{ch}_23\n"
-+                ));
-+            }
 +        }
 +        out.push_str(
-+            "  %qx2 = fmul float %qx, %qx\n\
++            "  %is_last = icmp eq i32 %it, 5\n\
++             \x20 %qx2 = fmul float %qx, %qx\n\
 +             \x20 %qy2 = fmul float %qy, %qy\n\
 +             \x20 %d2_uv = fadd float %qx2, %qy2\n\
 +             \x20 %qr2 = fmul float %qr, %qr\n\
-+             \x20 %qr2_tol = fmul float %qr2, 0x3FF0000A80000000\n\
++             \x20 %qr2_tol = fmul float %qr2, 1.000010e+00\n\
 +             \x20 %r_nonneg = fcmp oge float %qr, 0.000000e+00\n\
 +             \x20 %in_rad = fcmp ole float %d2_uv, %qr2_tol\n\
-+             \x20 %is_last = icmp eq i32 %it, 5\n\
-+             \x20 %rad_ok0 = and i1 %r_nonneg, %in_rad\n\
-+             \x20 %eval_ok = and i1 %is_last, %rad_ok0\n\
++             \x20 %fl_0 = and i1 %is_last, %is_flat\n\
++             \x20 %fl_1 = and i1 %r_nonneg, %in_rad\n\
++             \x20 %fl_ge = fcmp oge float %qz, %smin\n\
++             \x20 %fl_le = fcmp ole float %qz, %smax\n\
++             \x20 %fl_rng = and i1 %fl_ge, %fl_le\n\
++             \x20 %fl_nh = icmp eq i32 %hit_cur, 0\n\
++             \x20 %fl_lt = fcmp olt float %qz, %s_cur\n\
++             \x20 %fl_im = or i1 %fl_nh, %fl_lt\n\
++             \x20 %fl_t0 = and i1 %fl_0, %fl_1\n\
++             \x20 %fl_t1 = and i1 %fl_t0, %fl_rng\n\
++             \x20 %fl_take = and i1 %fl_t1, %fl_im\n\
++             \x20 %h0 = select i1 %fl_take, i32 1, i32 %hit_cur\n\
++             \x20 %s0 = select i1 %fl_take, float %qz, float %s_cur\n\
++             \x20 %u0_h = select i1 %fl_take, float %u_next, float %bu_cur\n\
 +             \x20 %qdx2 = fmul float %qdx, %qdx\n\
 +             \x20 %qdy2 = fmul float %qdy, %qdy\n\
 +             \x20 %qdz2 = fmul float %qdz, %qdz\n\
++             \x20 %qdr2 = fmul float %qdr, %qdr\n\
 +             \x20 %qd_xy2 = fadd float %qdx2, %qdy2\n\
-+             \x20 %qd_3d = fadd float %qd_xy2, %qdz2\n\
-+             \x20 %qd_ok = fcmp ogt float %qd_3d, 1.000000e-12\n\
-+             \x20 %qd_safe = select i1 %qd_ok, float %qd_3d, float 1.000000e+00\n\
-+             \x20 %dz_raw = fdiv float %qdz2, %qd_safe\n\
-+             \x20 %dz_fr = select i1 %qd_ok, float %dz_raw, float 0.000000e+00\n\
-+             \x20 %st2_raw = fsub float 1.000000e+00, %dz_fr\n\
-+             \x20 %st2_low = fcmp olt float %st2_raw, 1.000000e-06\n\
-+             \x20 %sin_t2 = select i1 %st2_low, float 1.000000e-06, float %st2_raw\n\
-+             \x20 %rsq_raw = fsub float %qr2, %d2_uv\n\
-+             \x20 %rsq_pos = fcmp ogt float %rsq_raw, 0.000000e+00\n\
-+             \x20 %rsq = select i1 %rsq_pos, float %rsq_raw, float 0.000000e+00\n\
-+             \x20 %dz_arg = fdiv float %rsq, %sin_t2\n\
-+             \x20 %dz_off = call float @air.sqrt.f32(float %dz_arg)\n\
-+             \x20 %s_m = fsub float %qz, %dz_off\n\
-+             \x20 %s_p = fadd float %qz, %dz_off\n\
-+             \x20 %ca = select i1 %is_flat, float %qz, float %s_m\n\
-+             \x20 %cb = select i1 %is_flat, float %qz, float %s_p\n\
++             \x20 %qd_xyz2 = fadd float %qd_xy2, %qdz2\n\
++             \x20 %qD = fsub float %qd_xyz2, %qdr2\n\
++             \x20 %qabs_D = call float @llvm.fabs.f32(float %qD)\n\
++             \x20 %qD_ok = fcmp ogt float %qabs_D, 1.000000e-10\n\
++             \x20 %qsafe_D = select i1 %qD_ok, float %qD, float 1.000000e+00\n\
++             \x20 %qxqdx = fmul float %qx, %qdx\n\
++             \x20 %qyqdy = fmul float %qy, %qdy\n\
++             \x20 %qd_xy = fadd float %qxqdx, %qyqdy\n\
++             \x20 %qrqdr = fmul float %qr, %qdr\n\
++             \x20 %qk0_num = fsub float %qrqdr, %qd_xy\n\
++             \x20 %qk0_raw = fdiv float %qk0_num, %qsafe_D\n\
++             \x20 %qk0 = select i1 %qD_ok, float %qk0_raw, float 0.000000e+00\n\
++             \x20 %qk1_raw = fdiv float %qdz, %qsafe_D\n\
++             \x20 %qk1 = select i1 %qD_ok, float %qk1_raw, float 0.000000e+00\n\
++             \x20 %qk0dx = fmul float %qk0, %qdx\n\
++             \x20 %qk0dy = fmul float %qk0, %qdy\n\
++             \x20 %qtx = fadd float %qx, %qk0dx\n\
++             \x20 %qty = fadd float %qy, %qk0dy\n\
++             \x20 %qtz = fmul float %qk0, %qdz\n\
++             \x20 %qk0dr = fmul float %qk0, %qdr\n\
++             \x20 %qtr0 = fadd float %qr, %qk0dr\n\
++             \x20 %qa_num = fsub float %qd_xy2, %qdr2\n\
++             \x20 %qa_raw = fdiv float %qa_num, %qsafe_D\n\
++             \x20 %qa = select i1 %qD_ok, float %qa_raw, float 0.000000e+00\n\
++             \x20 %qtx2 = fmul float %qtx, %qtx\n\
++             \x20 %qty2 = fmul float %qty, %qty\n\
++             \x20 %qtz2 = fmul float %qtz, %qtz\n\
++             \x20 %qtr02 = fmul float %qtr0, %qtr0\n\
++             \x20 %qtxy2 = fadd float %qtx2, %qty2\n\
++             \x20 %qtxyz2 = fadd float %qtxy2, %qtz2\n\
++             \x20 %qc = fsub float %qtxyz2, %qtr02\n\
++             \x20 %qac = fmul float %qa, %qc\n\
++             \x20 %qdisc = fsub float %qtz2, %qac\n\
++             \x20 %qabs_a = call float @llvm.fabs.f32(float %qa)\n\
++             \x20 %qa_ok = fcmp ogt float %qabs_a, 1.000000e-08\n\
++             \x20 %qdisc_ok = fcmp oge float %qdisc, 0.000000e+00\n\
++             \x20 %qc0_ok = and i1 %is_last, %not_flat\n\
++             \x20 %qc1_ok = and i1 %qc0_ok, %qD_ok\n\
++             \x20 %qc2_ok = and i1 %qc1_ok, %qa_ok\n\
++             \x20 %qcone_ok = and i1 %qc2_ok, %qdisc_ok\n\
++             \x20 %qsafe_a = select i1 %qa_ok, float %qa, float 1.000000e+00\n\
++             \x20 %qsafe_disc = select i1 %qdisc_ok, float %qdisc, float 0.000000e+00\n\
++             \x20 %qsq = call float @air.sqrt.f32(float %qsafe_disc)\n\
++             \x20 %qtn_a = fsub float %qtz, %qsq\n\
++             \x20 %qtn_b = fadd float %qtz, %qsq\n\
++             \x20 %qtau_a = fdiv float %qtn_a, %qsafe_a\n\
++             \x20 %qtau_b = fdiv float %qtn_b, %qsafe_a\n\
++             \x20 %ca = fadd float %qz, %qtau_a\n\
++             \x20 %k1ta = fmul float %qk1, %qtau_a\n\
++             \x20 %dua = fadd float %qk0, %k1ta\n\
++             \x20 %ua_raw = fadd float %u_next, %dua\n\
++             \x20 %duadr = fmul float %dua, %qdr\n\
++             \x20 %ra = fadd float %qr, %duadr\n\
++             \x20 %abs_dua = call float @llvm.fabs.f32(float %dua)\n\
++             \x20 %ra_ok = fcmp oge float %ra, 0.000000e+00\n\
++             \x20 %dua_ok = fcmp ole float %abs_dua, 5.000000e-02\n\
++             \x20 %ua_lo = fcmp oge float %ua_raw, -1.000000e-04\n\
++             \x20 %ua_hi = fcmp ole float %ua_raw, 1.000100e+00\n\
++             \x20 %ua_neg = fcmp olt float %ua_raw, 0.000000e+00\n\
++             \x20 %ua_cl0 = select i1 %ua_neg, float 0.000000e+00, float %ua_raw\n\
++             \x20 %ua_ov = fcmp ogt float %ua_cl0, 1.000000e+00\n\
++             \x20 %ua_cl = select i1 %ua_ov, float 1.000000e+00, float %ua_cl0\n\
 +             \x20 %ca_ge = fcmp oge float %ca, %smin\n\
 +             \x20 %ca_le = fcmp ole float %ca, %smax\n\
-+             \x20 %ca_ok = and i1 %ca_ge, %ca_le\n\
++             \x20 %ca_rng = and i1 %ca_ge, %ca_le\n\
++             \x20 %no_hit = icmp eq i32 %h0, 0\n\
++             \x20 %ca_lt = fcmp olt float %ca, %s0\n\
++             \x20 %ca_impr = or i1 %no_hit, %ca_lt\n\
++             \x20 %ca_v0 = and i1 %qcone_ok, %ra_ok\n\
++             \x20 %ca_v1 = and i1 %dua_ok, %ua_lo\n\
++             \x20 %ca_v2 = and i1 %ua_hi, %ca_rng\n\
++             \x20 %ca_v01 = and i1 %ca_v0, %ca_v1\n\
++             \x20 %ca_v012 = and i1 %ca_v01, %ca_v2\n\
++             \x20 %ca_take = and i1 %ca_v012, %ca_impr\n\
++             \x20 %h1 = select i1 %ca_take, i32 1, i32 %h0\n\
++             \x20 %s1 = select i1 %ca_take, float %ca, float %s0\n\
++             \x20 %u1 = select i1 %ca_take, float %ua_cl, float %u0_h\n\
++             \x20 %cb = fadd float %qz, %qtau_b\n\
++             \x20 %k1tb = fmul float %qk1, %qtau_b\n\
++             \x20 %dub = fadd float %qk0, %k1tb\n\
++             \x20 %ub_raw = fadd float %u_next, %dub\n\
++             \x20 %dubdr = fmul float %dub, %qdr\n\
++             \x20 %rb = fadd float %qr, %dubdr\n\
++             \x20 %abs_dub = call float @llvm.fabs.f32(float %dub)\n\
++             \x20 %rb_ok = fcmp oge float %rb, 0.000000e+00\n\
++             \x20 %dub_ok = fcmp ole float %abs_dub, 5.000000e-02\n\
++             \x20 %ub_lo = fcmp oge float %ub_raw, -1.000000e-04\n\
++             \x20 %ub_hi = fcmp ole float %ub_raw, 1.000100e+00\n\
++             \x20 %ub_neg = fcmp olt float %ub_raw, 0.000000e+00\n\
++             \x20 %ub_cl0 = select i1 %ub_neg, float 0.000000e+00, float %ub_raw\n\
++             \x20 %ub_ov = fcmp ogt float %ub_cl0, 1.000000e+00\n\
++             \x20 %ub_cl = select i1 %ub_ov, float 1.000000e+00, float %ub_cl0\n\
 +             \x20 %cb_ge = fcmp oge float %cb, %smin\n\
 +             \x20 %cb_le = fcmp ole float %cb, %smax\n\
-+             \x20 %cb_ok = and i1 %cb_ge, %cb_le\n\
-+             \x20 %no_hit = icmp eq i32 %hit_cur, 0\n\
-+             \x20 %ca_lt = fcmp olt float %ca, %s_cur\n\
-+             \x20 %ca_impr = or i1 %no_hit, %ca_lt\n\
-+             \x20 %ca_take0 = and i1 %eval_ok, %ca_ok\n\
-+             \x20 %ca_take = and i1 %ca_take0, %ca_impr\n\
-+             \x20 %h1 = select i1 %ca_take, i32 1, i32 %hit_cur\n\
-+             \x20 %s1 = select i1 %ca_take, float %ca, float %s_cur\n\
-+             \x20 %u1 = select i1 %ca_take, float %u_next, float %bu_cur\n\
++             \x20 %cb_rng = and i1 %cb_ge, %cb_le\n\
 +             \x20 %no_hit1 = icmp eq i32 %h1, 0\n\
 +             \x20 %cb_lt = fcmp olt float %cb, %s1\n\
 +             \x20 %cb_impr = or i1 %no_hit1, %cb_lt\n\
-+             \x20 %cb_take0 = and i1 %eval_ok, %cb_ok\n\
-+             \x20 %cb_take = and i1 %cb_take0, %cb_impr\n\
++             \x20 %cb_v0 = and i1 %qcone_ok, %rb_ok\n\
++             \x20 %cb_v1 = and i1 %dub_ok, %ub_lo\n\
++             \x20 %cb_v2 = and i1 %ub_hi, %cb_rng\n\
++             \x20 %cb_v01 = and i1 %cb_v0, %cb_v1\n\
++             \x20 %cb_v012 = and i1 %cb_v01, %cb_v2\n\
++             \x20 %cb_take = and i1 %cb_v012, %cb_impr\n\
 +             \x20 %hit_next = select i1 %cb_take, i32 1, i32 %h1\n\
 +             \x20 %s_next = select i1 %cb_take, float %cb, float %s1\n\
-+             \x20 %bu_next = select i1 %cb_take, float %u_next, float %u1\n\
-+             \x20 br label %loop_latch\n\
++             \x20 %bu_next = select i1 %cb_take, float %ub_cl, float %u1\n\
++             \x20 br label %loop_latch\n\"
++        );
 +             \n\
 +             loop_latch:\n\
 +             \x20 %step_next = add i32 %step, 1\n\

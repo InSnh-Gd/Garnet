@@ -1003,9 +1003,50 @@ static char *read_source_file(const char *rel_a, const char *rel_b) {
     return buf;
 }
 
+static char *read_rt_sources(void) {
+    static const char *const kRelA[] = {
+        "src/garnet-metal/garnet_rt_runtime.m",
+        "src/garnet-metal/garnet_rt_accel.m",
+        "src/garnet-metal/garnet_rt_plan.m",
+        "src/garnet-metal/garnet_rt_encoder.m",
+    };
+    static const char *const kRelB[] = {
+        "garnet_rt_runtime.m",
+        "garnet_rt_accel.m",
+        "garnet_rt_plan.m",
+        "garnet_rt_encoder.m",
+    };
+    char *parts[4] = { NULL, NULL, NULL, NULL };
+    size_t lens[4] = { 0, 0, 0, 0 };
+    size_t total = 1u;
+    for (size_t i = 0; i < 4u; i++) {
+        parts[i] = read_source_file(kRelA[i], kRelB[i]);
+        if (!parts[i]) {
+            for (size_t j = 0; j < i; j++) free(parts[j]);
+            return NULL;
+        }
+        lens[i] = strlen(parts[i]);
+        total += lens[i] + 1u;
+    }
+    char *joined = (char *)malloc(total);
+    if (!joined) {
+        for (size_t j = 0; j < 4u; j++) free(parts[j]);
+        return NULL;
+    }
+    size_t pos = 0u;
+    for (size_t i = 0; i < 4u; i++) {
+        memcpy(joined + pos, parts[i], lens[i]);
+        pos += lens[i];
+        joined[pos++] = '\n';
+        free(parts[i]);
+    }
+    joined[pos] = '\0';
+    return joined;
+}
+
 static void test_source_pins(void) {
-    char *impl = read_source_file("src/garnet-metal/garnet_mesh_rt.m", "garnet_mesh_rt.m");
-    CHECK(impl != NULL, "read garnet_mesh_rt.m for source pins");
+    char *impl = read_rt_sources();
+    CHECK(impl != NULL, "read split garnet_rt_{runtime,accel,plan,encoder}.m for source pins");
     if (impl) {
         CHECK(strstr(impl, "RDNA4IntersectionFunctionTable") != NULL, "impl defines RDNA4IntersectionFunctionTable");
         CHECK(strstr(impl, "rdna4VkAccelerationStructure") != NULL, "impl uses real rdna4VkAccelerationStructure selector");
@@ -1057,9 +1098,24 @@ static void test_source_pins(void) {
               strstr(impl, "rdna4rt_blas_table_entry_t") != NULL &&
               strstr(impl, "rdna4GeomIftBase") != NULL,
               "Wave 5 BLAS geometry intersectionFunctionTableOffset capture, propagation, and CPU+GPU TLAS combine wired");
-        CHECK(strstr(impl, "if (RDNA4R.shaderInt64) work.caps.flags |= GARNETX_CAP_NATIVE_INT64;") != NULL,
-              "R6: mesh/object Stage 3 worker sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
+        CHECK(strstr(impl, "GARNET_RT_MOTION") != NULL &&
+              strstr(impl, "rdna4_rt_motion_enabled") != NULL &&
+              strstr(impl, "rdna4_rt_ensure_motion_pipes") != NULL &&
+              strstr(impl, "rdna4_rt_ensure_unit_box_blas") != NULL &&
+              strstr(impl, "rdna4_rt_prepare_motion_tlas_sidecar") != NULL &&
+              strstr(impl, "RDNA4RT_PRIM_KIND_TLAS_MOTION") != NULL &&
+              strstr(impl, "MTLAccelerationStructureMotionTriangleGeometryDescriptor") != NULL &&
+              strstr(impl, "MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor") != NULL,
+              "Wave 3.2 runtime motion gate, pipelines, unit-box BLAS, motion BLAS/TLAS builders, and sidecars wired");
         free(impl);
+    }
+
+    char *meshImpl = read_source_file("src/garnet-metal/garnet_mesh.m", "garnet_mesh.m");
+    CHECK(meshImpl != NULL, "read garnet_mesh.m for R6 source pin");
+    if (meshImpl) {
+        CHECK(strstr(meshImpl, "if (RDNA4R.shaderInt64) work.caps.flags |= GARNETX_CAP_NATIVE_INT64;") != NULL,
+              "R6: mesh/object Stage 3 worker sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
+        free(meshImpl);
     }
 
     char *shd = read_source_file("src/garnet-metal/garnet_shaders.m", "garnet_shaders.m");
@@ -1074,6 +1130,8 @@ static void test_source_pins(void) {
               "R4: rdna4x_translate_fn_with_error honors UINT64_MAX sentinel -> waitMs=-1 for non-WS");
         CHECK(strstr(shd, "if (RDNA4R.shaderInt64)\n        caps.flags |= GARNETX_CAP_NATIVE_INT64;") != NULL,
               "R6: rdna4_rt_xlate_caps sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
+        CHECK(strstr(shd, "GARNETX_CAP_RT_MOTION_BLUR") != NULL,
+              "Wave 3.2: garnet_shaders wires GARNETX_CAP_RT_MOTION_BLUR");
         free(shd);
     }
 
@@ -1289,6 +1347,40 @@ static void test_wave2_curve_caps_and_ift(void) {
     rdna4rtr_ift_destroy(&t);
 }
 
+static void test_wave3_motion_runtime_table_and_ift(void) {
+    CHECK(RDNA4RT_PRIM_KIND_TLAS_MOTION == UINT32_C(2), "RDNA4RT_PRIM_KIND_TLAS_MOTION == 2");
+
+    rdna4rt_prim_slot_t *tbl = (rdna4rt_prim_slot_t *)calloc(RDNA4RT_PRIM_TABLE_CAP, sizeof(*tbl));
+    CHECK(tbl != NULL, "calloc prim table for motion TLAS");
+    if (tbl) {
+        const uint64_t mtlasBda = UINT64_C(0x5555000000);
+        const uint64_t mtlasPay = UINT64_C(0x6666000000);
+        CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                        mtlasBda, mtlasPay, 4u, 64u, 56u,
+                                        RDNA4RT_PRIM_KIND_TLAS_MOTION) == RDNA4RTR_OK,
+              "prim table accepts RDNA4RT_PRIM_KIND_TLAS_MOTION");
+        rdna4rt_prim_slot_t got;
+        CHECK(rdna4rt_prim_table_lookup(tbl, RDNA4RT_PRIM_TABLE_CAP, mtlasBda, &got) == 1 &&
+              got.kind == RDNA4RT_PRIM_KIND_TLAS_MOTION && got.payload_bda == mtlasPay && got.count == 4u,
+              "prim table round-trips RDNA4RT_PRIM_KIND_TLAS_MOTION slot");
+        CHECK(rdna4rt_prim_table_upsert(tbl, RDNA4RT_PRIM_TABLE_CAP,
+                                        mtlasBda, mtlasPay, 4u, 64u, 56u, 3u) == RDNA4RTR_ERR_INVALID,
+              "prim table rejects invalid kind > TLAS_MOTION");
+        free(tbl);
+    }
+
+    rdna4rtr_ift_table_t t;
+    CHECK(rdna4rtr_ift_init(&t, 4u, 2u) == RDNA4RTR_OK, "motion IFT init");
+    uint64_t msig = RDNA4RTR_SIG_INSTANCING | RDNA4RTR_SIG_INSTANCE_MOTION | RDNA4RTR_SIG_PRIMITIVE_MOTION;
+    CHECK(rdna4rtr_ift_set_opaque_triangle_range_ex(&t, 0u, 2u, msig, 0) == RDNA4RTR_ERR_UNSUPPORTED,
+          "opaque triangle rejects motion sig when motion_supported=0");
+    CHECK(rdna4rtr_ift_set_opaque_triangle_range_ex(&t, 0u, 2u, msig, 1) == RDNA4RTR_OK &&
+          rdna4rtr_ift_get_mode(&t, 0u) == RDNA4RTR_IFT_SLOT_OPAQUE_TRIANGLE &&
+          rdna4rtr_ift_get_handle(&t, 0u) == 0u,
+          "opaque triangle accepts motion sig when motion_supported=1");
+    rdna4rtr_ift_destroy(&t);
+}
+
 int main(void) {
     test_capabilities_and_footnote10();
     test_as_reflection_json();
@@ -1298,6 +1390,7 @@ int main(void) {
     test_as_descriptor_and_bda_planners();
     test_wave4_prim_data_table_and_abi();
     test_wave2_curve_caps_and_ift();
+    test_wave3_motion_runtime_table_and_ift();
     test_source_pins();
     printf("test-rt-runtime: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -229,6 +229,8 @@ static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
         caps.flags |= GARNETX_CAP_RT_PRIMITIVE_DATA;
         if (rdna4_rt_curves_enabled())
             caps.flags |= GARNETX_CAP_RT_CURVES;
+        if (rdna4_rt_motion_enabled())
+            caps.flags |= GARNETX_CAP_RT_MOTION_BLUR;
     }
     if (RDNA4R.shaderInt64)
         caps.flags |= GARNETX_CAP_NATIVE_INT64;

@@ -52,7 +52,11 @@ GARNET_UNITS=(
   garnet_arguments
   garnet_icb
   garnet_sparse_io
-  garnet_mesh_rt
+  garnet_rt_runtime
+  garnet_rt_accel
+  garnet_rt_plan
+  garnet_rt_encoder
+  garnet_mesh
   garnet_device
 )
 compile_modular() {

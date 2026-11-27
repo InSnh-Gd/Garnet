@@ -277,7 +277,11 @@ int main(int argc, char **argv) {
                && (assembled ? (strstr(gm, "@implementation RDNA4ResourceStateEncoder")
                                 && strstr(gm, "@implementation GarnetAccelerationStructureCommandEncoder"))
                              : (strstr(gm, "#include \"garnet_sparse_io.m\"")
-                                && strstr(gm, "#include \"garnet_mesh_rt.m\"")))
+                                && strstr(gm, "#include \"garnet_rt_runtime.m\"")
+                                && strstr(gm, "#include \"garnet_rt_accel.m\"")
+                                && strstr(gm, "#include \"garnet_rt_plan.m\"")
+                                && strstr(gm, "#include \"garnet_rt_encoder.m\"")
+                                && strstr(gm, "#include \"garnet_mesh.m\"")))
                && strstr(devSrc, "rdna4_sparse_heap_new(self, d, NULL)")
                && strstr(devSrc, "rdna4_device_sparse_tile_size_in_bytes()")
                && strstr(devSrc, "rdna4_device_sparse_tile_size_for_page_size(")
@@ -337,7 +341,8 @@ int main(int argc, char **argv) {
                && (assembled ? (strstr(gm, "@implementation RDNA4IntersectionFunctionTable")
                                 && strstr(gm, "@implementation RDNA4MeshRenderPipelineState")
                                 && strstr(gm, "rdna4_rt_arg_is_rt_data_type(") != NULL)
-                             : (strstr(gm, "#include \"garnet_mesh_rt.m\"") != NULL
+                             : (strstr(gm, "#include \"garnet_rt_runtime.m\"") != NULL
+                                && strstr(gm, "#include \"garnet_mesh.m\"") != NULL
                                 && ag != NULL
                                 && strstr(ag, "rdna4_rt_arg_is_rt_data_type(") != NULL
                                 && strstr(ag, "- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure atIndex:(NSUInteger)index") != NULL

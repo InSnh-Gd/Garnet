@@ -2162,8 +2162,10 @@ typedef struct {
     VkAccelerationStructureKHR _vkAS;
     VkDeviceAddress _deviceAddress;
     rdna4rt_kind_t _kind;
+    RDNA4RTStagingBuffer *_localAabbBuf;
 }
 - (instancetype)initWithStorage:(GarnetASStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err;
+- (VkDeviceAddress)rdna4EnsureLocalAabbAddress:(NSError **)err;
 @end
 
 @interface GarnetAccelerationStructure : _MTLResource {
@@ -3821,6 +3823,7 @@ GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing_from_render(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_primitive_motion_blur(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_curves_enabled(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_motion_enabled(void);
 GARNET_INTERNAL_EXTERN uint32_t rdna4_rt_descriptor_pool_append(
     VkDescriptorPoolSize *sizes,
     uint32_t count,

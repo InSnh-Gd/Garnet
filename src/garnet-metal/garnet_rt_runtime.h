@@ -66,6 +66,7 @@
 #define RDNA4RT_PRIM_SLOT_TOMBSTONE          UINT64_C(1)
 #define RDNA4RT_PRIM_KIND_BLAS               UINT32_C(0)
 #define RDNA4RT_PRIM_KIND_TLAS               UINT32_C(1)
+#define RDNA4RT_PRIM_KIND_TLAS_MOTION        UINT32_C(2)
 #define RDNA4RT_PRIM_TLAS_ENTRY_STRIDE       UINT32_C(64)
 #define RDNA4RT_PRIM_TLAS_REF_OFFSET         UINT32_C(56)
 
@@ -1359,39 +1360,29 @@ static inline rdna4rtr_status_t rdna4rtr_ift_set_functions_range(rdna4rtr_ift_ta
     return RDNA4RTR_OK;
 }
 
-static inline rdna4rtr_status_t rdna4rtr_ift_validate_opaque_triangle_sig(uint64_t sig) {
+static inline rdna4rtr_status_t rdna4rtr_ift_validate_opaque_triangle_sig_ex(uint64_t sig,
+                                                                            int motion_supported) {
     if ((sig & ~RDNA4RTR_SIG_KNOWN_MASK) != 0u) return RDNA4RTR_ERR_INVALID;
     if ((sig & RDNA4RTR_SIG_CURVE_DATA) != 0u) return RDNA4RTR_ERR_INVALID;
-    if ((sig & RDNA4RTR_SIG_MOTION_MASK) != 0u) return RDNA4RTR_ERR_UNSUPPORTED;
+    if (!motion_supported && (sig & RDNA4RTR_SIG_MOTION_MASK) != 0u) return RDNA4RTR_ERR_UNSUPPORTED;
     return RDNA4RTR_OK;
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_validate_opaque_triangle_sig(uint64_t sig) {
+    return rdna4rtr_ift_validate_opaque_triangle_sig_ex(sig, 0);
 }
 
 // Opaque triangle intersection encodes handle_id = 0, matching 0077's default triangle path
 // (`tri_default -> OpRayQueryConfirmIntersectionKHR`), while recording slot mode & signature.
-static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle(rdna4rtr_ift_table_t *t,
-                                                                 uint32_t index,
-                                                                 uint64_t signature) {
+static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle_range_ex(rdna4rtr_ift_table_t *t,
+                                                                          uint32_t start,
+                                                                          uint32_t count,
+                                                                          uint64_t signature,
+                                                                          int motion_supported) {
     if (!t) return RDNA4RTR_ERR_INVALID;
-    if (index >= t->slot_count || !t->slots) return RDNA4RTR_ERR_BOUNDS;
-    rdna4rtr_status_t st = rdna4rtr_ift_validate_opaque_triangle_sig(signature);
-    if (st != RDNA4RTR_OK) return st;
-    t->slots[index] = (rdna4rtr_ift_slot_t){
-        .handle_id = RDNA4RTR_IFT_HANDLE_NULL,
-        .mode = RDNA4RTR_IFT_SLOT_OPAQUE_TRIANGLE,
-        .fn_kind = 0u,
-        .signature = signature,
-    };
-    return RDNA4RTR_OK;
-}
-
-static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle_range(rdna4rtr_ift_table_t *t,
-                                                                       uint32_t start,
-                                                                       uint32_t count,
-                                                                       uint64_t signature) {
-    if (!t) return RDNA4RTR_ERR_INVALID;
-    if (count == 0u) return rdna4rtr_ift_validate_opaque_triangle_sig(signature);
+    if (count == 0u) return rdna4rtr_ift_validate_opaque_triangle_sig_ex(signature, motion_supported);
     if (start > t->slot_count || count > t->slot_count - start || !t->slots) return RDNA4RTR_ERR_BOUNDS;
-    rdna4rtr_status_t st = rdna4rtr_ift_validate_opaque_triangle_sig(signature);
+    rdna4rtr_status_t st = rdna4rtr_ift_validate_opaque_triangle_sig_ex(signature, motion_supported);
     if (st != RDNA4RTR_OK) return st;
     for (uint32_t i = 0; i < count; i++) {
         t->slots[start + i] = (rdna4rtr_ift_slot_t){
@@ -1402,6 +1393,19 @@ static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle_range(rdna4rtr_
         };
     }
     return RDNA4RTR_OK;
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle(rdna4rtr_ift_table_t *t,
+                                                                 uint32_t index,
+                                                                 uint64_t signature) {
+    return rdna4rtr_ift_set_opaque_triangle_range_ex(t, index, 1u, signature, 0);
+}
+
+static inline rdna4rtr_status_t rdna4rtr_ift_set_opaque_triangle_range(rdna4rtr_ift_table_t *t,
+                                                                       uint32_t start,
+                                                                       uint32_t count,
+                                                                       uint64_t signature) {
+    return rdna4rtr_ift_set_opaque_triangle_range_ex(t, start, count, signature, 0);
 }
 
 // Record safe handle_id = 0 in opaque curve slot(s). Returns RDNA4RTR_OK when curve_supported != 0
@@ -1750,7 +1754,7 @@ static inline rdna4rtr_status_t rdna4rt_prim_table_upsert_slot(
     int *was_empty_out) {
     if (!slots || cap < 2u || (cap & (cap - 1u)) != 0u) return RDNA4RTR_ERR_INVALID;
     if (as_bda <= RDNA4RT_PRIM_SLOT_TOMBSTONE) return RDNA4RTR_ERR_INVALID;
-    if (kind != RDNA4RT_PRIM_KIND_BLAS && kind != RDNA4RT_PRIM_KIND_TLAS) return RDNA4RTR_ERR_INVALID;
+    if (kind > RDNA4RT_PRIM_KIND_TLAS_MOTION) return RDNA4RTR_ERR_INVALID;
 
     const uint32_t mask = cap - 1u;
     const uint32_t start = rdna4rt_prim_hash_slot(as_bda, mask);

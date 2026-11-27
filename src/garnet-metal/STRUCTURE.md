@@ -1,12 +1,13 @@
 # Native Metal implementation
 
-`GarnetMetal.bundle` is built from 11 independent Objective-C compilation units
+`GarnetMetal.bundle` is built from 15 independent Objective-C compilation units
 compiled in parallel with `-DGARNET_METAL_MODULAR_BUILD=1 -fvisibility=hidden
 -Wall -Wextra -Werror` (see `build.sh`). Shared internal declarations live in
-`garnet_metal_internal.h`.
+`garnet_metal_internal.h` (with private RT build-plan/helper declarations in
+`garnet_rt_internal.h`).
 
 `GarnetDevice.m` is a thin single-TU compatibility bridge (`#ifndef
-GARNET_METAL_MODULAR_BUILD`) that includes `garnet_metal_internal.h` and the 11
+GARNET_METAL_MODULAR_BUILD`) that includes `garnet_metal_internal.h` and the 15
 `garnet_*.m` units in dependency order so existing mock fixtures that `#include
 "GarnetDevice.m"` continue to compile without exporting a new runtime ABI.
 
@@ -21,7 +22,11 @@ GARNET_METAL_MODULAR_BUILD`) that includes `garnet_metal_internal.h` and the 11
 | Argument table layouts, descriptor pools, command materialization, argument encoders, summary | `garnet_arguments.m` |
 | Indirect command buffers (render & compute CPU/GPU paths, reset/copy transactions) | `garnet_icb.m` |
 | Metal 3 IO command queues and sparse/PRT heaps, textures, and resource-state encoders | `garnet_sparse_io.m` |
-| Ray tracing acceleration structures, IFT/runtime, and mesh/object shader pipelines | `garnet_mesh_rt.m` |
+| Ray tracing IFT, argument-buffer BDA, pipeline handles, and capability gates | `garnet_rt_runtime.m` |
+| Ray tracing VK dispatch, compute pipes, staging/query pools, AS storage/handles, unit-box proxy | `garnet_rt_accel.m` |
+| Ray tracing AS descriptor validation, build/refit plans, and BLAS/TLAS sidecars | `garnet_rt_plan.m` |
+| Ray tracing acceleration structure command encoder and device/heap AS factories | `garnet_rt_encoder.m` |
+| Mesh and object shader pipelines, encoder bindings, and emulated/native draw paths | `garnet_mesh.m` |
 | `GarnetDevice` facade, System Profiler registration, GL-on-Metal drawable bridge | `garnet_device.m` |
 
 Single-TU headers with process-local compatibility state remain included only by
