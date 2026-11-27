@@ -121,6 +121,29 @@ static inline int rdna4hb_has_reclaimable(const rdna4hb_heap *h) {
     return 0;
 }
 
+// Returns 1 if block `b` has no active ranges (`nrng == 0`), is not a placement
+// block, and every remaining handle on `b` (if any) belongs to a retired lease
+// whose handle owner can be destroyed to reclaim the block under space pressure.
+static inline int rdna4hb_block_evictable_retired(const rdna4hb_heap *h, const rdna4hb_block *b) {
+    if (!h || !b || b->placement || b->nrng) return 0;
+    if (!b->handles) return !rdna4hb_block_has_lease(h, b->id);
+    uint64_t retired_owners = 0;
+    for (size_t i = 0; i < h->nlease; i++) {
+        const rdna4hb_lease *l = &h->lease[i];
+        if (l->block != b->id) continue;
+        if (!l->retired || !l->owner) return 0;
+        retired_owners++;
+    }
+    return retired_owners == b->handles;
+}
+
+static inline int rdna4hb_has_evictable_retired(const rdna4hb_heap *h) {
+    if (!h) return 0;
+    for (size_t i = 0; i < h->nblk; i++)
+        if (h->blk[i].handles && rdna4hb_block_evictable_retired(h, &h->blk[i])) return 1;
+    return 0;
+}
+
 // Adds a Vulkan allocation. The caller owns the Vulkan calls; nothing is freed here.
 static inline int rdna4hb_add_block(rdna4hb_heap *h, uint64_t size, uint32_t memory_type,
                                     int host_mapped, int dedicated, int exclusive,
@@ -239,8 +262,16 @@ static inline uint64_t rdna4hb_max_available(const rdna4hb_heap *h, uint64_t ali
         }
     }
     uint64_t unbacked = h->backing < h->size ? h->size - h->backing : 0;
-    unbacked -= unbacked % gran;
-    return unbacked > best ? unbacked : best;
+    uint64_t reclaimable = 0;
+    for (size_t i = 0; i < h->nblk; i++) {
+        if (rdna4hb_block_evictable_retired(h, &h->blk[i])) {
+            if (h->blk[i].size > h->size - reclaimable) reclaimable = h->size;
+            else reclaimable += h->blk[i].size;
+        }
+    }
+    uint64_t pool = reclaimable > h->size - unbacked ? h->size : unbacked + reclaimable;
+    pool -= pool % gran;
+    return pool > best ? pool : best;
 }
 
 static inline int rdna4hb_lease_add(rdna4hb_heap *h, rdna4hb_block *b, uint64_t off, uint64_t size,
@@ -287,6 +318,9 @@ static inline int rdna4hb_alloc(rdna4hb_heap *h, uint64_t size, uint64_t alignme
         if (host_import ? !(b->host_mapped && b->owned_host)
                         : (b->host_mapped != (host_mapped != 0) || (host_mapped && b->owned_host))) continue;
         if (!(memory_type_bits & (1u << b->memory_type))) continue;
+        if (!b->nrng && b->handles && b->size > need && b->size < RDNA4HB_TARGET_BLOCK &&
+            (b->size - need) > (b->size >> 2) && rdna4hb_block_evictable_retired(h, b))
+            continue;
         uint64_t off;
         if (need > b->size || !rdna4hb_candidate(b, need, align, &off)) continue;
         if (!rdna4hb_lease_add(h, b, off, need, b->dedicated, owner, &out->lease)) continue;
@@ -310,7 +344,9 @@ static inline int rdna4hb_alloc(rdna4hb_heap *h, uint64_t size, uint64_t alignme
         out->block_size = target;
     }
     uint64_t remaining = h->backing < h->size ? h->size - h->backing : 0;
-    if (remaining < need) return rdna4hb_has_reclaimable(h) ? RDNA4HB_R_RETRY : RDNA4HB_R_NO_SPACE;
+    if (remaining < need)
+        return (rdna4hb_has_reclaimable(h) || rdna4hb_has_evictable_retired(h))
+            ? RDNA4HB_R_RETRY : RDNA4HB_R_NO_SPACE;
     // A speculative slab may consume at most half the unbacked remainder;
     // otherwise allocate the exact extent so tight heaps never strand a
     // sub-slab tail or starve larger allocations / other memory classes.
@@ -346,12 +382,39 @@ static inline void rdna4hb_reap(rdna4hb_heap *h, uint64_t completed) {
         }
         rdna4hb_range_remove(b, l->id);
         l->retired = 1;
-        if (!l->dedicated) {
+        if (!l->dedicated && !l->owner) {
             h->lease[i] = h->lease[--h->nlease];
             continue;
         }
         i++;
     }
+}
+
+// Finds one retired non-dedicated lease on an empty block whose handles can all be
+// finalized so the block can be reclaimed under space pressure.
+static inline int rdna4hb_evict_candidate(rdna4hb_heap *h, uint64_t *lease_id,
+                                          uint64_t *block_id, void **owner) {
+    if (!h) return 0;
+    for (size_t i = 0; i < h->nlease; i++) {
+        rdna4hb_lease *l = &h->lease[i];
+        if (l->dedicated || !l->retired || l->finalizing || !l->owner) continue;
+        const rdna4hb_block *b = rdna4hb_find_block_const(h, l->block);
+        if (!b || !rdna4hb_block_evictable_retired(h, b)) continue;
+        l->finalizing = 1;
+        if (lease_id) *lease_id = l->id;
+        if (block_id) *block_id = l->block;
+        if (owner) *owner = l->owner;
+        return 1;
+    }
+    return 0;
+}
+
+// Removes any retired lease (dedicated or non-dedicated) whose owner handle has been closed.
+static inline void rdna4hb_finalized_retired(rdna4hb_heap *h, uint64_t lease_id) {
+    rdna4hb_lease *l = rdna4hb_find_lease(h, lease_id);
+    if (!l || !l->retired) return;
+    size_t i = (size_t)(l - h->lease);
+    h->lease[i] = h->lease[--h->nlease];
 }
 
 // A dedicated block can be destroyed while its Metal resource is still alive after

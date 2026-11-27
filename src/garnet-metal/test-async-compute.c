@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "garnet_async_compute.h"
 
 static int passed = 0;
@@ -12,7 +14,14 @@ static int passed = 0;
     passed++; \
 } while (0)
 
-int main(void) {
+static size_t count_substr(const char *hay, const char *needle) {
+    size_t n = 0, nlen = strlen(needle);
+    for (const char *p = hay; p && (p = strstr(p, needle)) != NULL; p += nlen) n++;
+    return n;
+}
+
+int main(int argc, char **argv) {
+    const char *dir = argc > 1 ? argv[1] : ".";
     // 1. Device gate: enabled only when dedicated compute QF + timelineSemaphore + non-WS + no kill switch.
     CHECK(garnet_async_compute_device_enable(1, 1, 0, 0) == 1);
     CHECK(garnet_async_compute_device_enable(0, 1, 0, 0) == 0);
@@ -91,6 +100,33 @@ int main(void) {
     CHECK(garnet_async_compute_use_concurrent_image(1, 0, 0, 0) == 0);
     CHECK(garnet_async_compute_use_concurrent_image(1, 0, 1, 0) == 1);
     CHECK(garnet_async_compute_use_concurrent_image(1, 0, 1, 1) == 0); // depth/stencil stays EXCLUSIVE
+
+    // 7. Source pin: every VkImageCreateInfo / VkBufferCreateInfo in garnet_resources.m
+    // (2 heap helpers + 6 non-heap IOSurface/vram_surf sites = 8 total) sets VK_SHARING_MODE_CONCURRENT
+    // when async compute is enabled, and DRM modifier query mirrors ic.sharingMode.
+    char rpath[1024];
+    snprintf(rpath, sizeof rpath, "%s/garnet_resources.m", dir);
+    FILE *rf = fopen(rpath, "rb");
+    CHECK(rf != NULL);
+    if (rf) {
+        fseek(rf, 0, SEEK_END);
+        long sz = ftell(rf);
+        fseek(rf, 0, SEEK_SET);
+        char *buf = malloc((size_t)sz + 1);
+        CHECK(buf != NULL);
+        if (buf) {
+            CHECK(fread(buf, 1, (size_t)sz, rf) == (size_t)sz);
+            buf[sz] = 0;
+            const size_t imgCreates = count_substr(buf, "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO");
+            const size_t bufCreates = count_substr(buf, "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO");
+            const size_t concAssign = count_substr(buf, "VK_SHARING_MODE_CONCURRENT");
+            CHECK(imgCreates == 5u && bufCreates == 3u);
+            CHECK(concAssign == imgCreates + bufCreates);
+            CHECK(strstr(buf, ".sharingMode = ic.sharingMode") != NULL);
+            free(buf);
+        }
+        fclose(rf);
+    }
 
     printf("test-async-compute: %d/%d checks passed\n", passed, passed);
     return 0;

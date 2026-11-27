@@ -56,4 +56,27 @@ static inline uint64_t rdna4ha_maxavail(const RDNA4HeapAlloc *h, uint64_t al) {
     }
     return best;
 }
+// Exact MTLSizeAndAlign sizing from VkMemoryRequirements + heap placement rules.
+// Rounds query size up to effective alignment = max(mr_align, gran[, host_align])
+// so multi-texture heap packing (e.g. pf 115 RGBA16Float tiled images on RADV where
+// bufferImageGranularity == 1 while image alignment is 4 KiB..64 KiB) never under-sizes
+// the heap by inter-texture alignment gaps.
+static inline int rdna4ha_query_extent(uint64_t mr_size, uint64_t mr_align,
+                                       uint64_t granularity, int host_import,
+                                       uint64_t host_align,
+                                       uint64_t *size_out, uint64_t *align_out) {
+    if (!size_out || !align_out || !mr_size || !mr_align || (mr_align & (mr_align - 1)))
+        return 0;
+    uint64_t gran = granularity ? granularity : 1;
+    uint64_t host = host_import ? host_align : 1;
+    if ((gran & (gran - 1)) || !host || (host & (host - 1)))
+        return 0;
+    uint64_t a = mr_align > gran ? mr_align : gran;
+    if (host_import && host > a) a = host;
+    uint64_t extent = rdna4ha_alup(mr_size, a);
+    if (extent == UINT64_MAX || extent < mr_size) return 0;
+    *size_out = extent;
+    *align_out = a;
+    return 1;
+}
 #endif
