@@ -2,10 +2,10 @@
 // (MTLAccelerationStructureMotionTriangleGeometryDescriptor,
 //  MTLAccelerationStructureMotionBoundingBoxGeometryDescriptor + IFT,
 //  MTLAccelerationStructureMotionInstanceDescriptor + packed float4x3 & MTLComponentTransform SLERP,
-//  Clamp & Vanish border modes, intersection_query + world transforms, and copy/compact/refit).
+//  Clamp & Vanish border modes, world transforms & compact intersector, and copy/compact/refit).
 //
 // Build on macOS:
-//   clang -arch x86_64 -mmacosx-version-min=14.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
+//   clang -arch x86_64 -mmacosx-version-min=15.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
 //     -Isrc/garnet-metal -framework Foundation -framework Metal \
 //     src/garnet-metal/test-metal3-rt-motion.m -lm -o "$TMPDIR/test-metal3-rt-motion"
 // Run:
@@ -129,7 +129,7 @@ static NSString *const kMotionShaders = @
     "kernel void trace_motion_prim(\n"
     "    device const MotionRayInput *rays [[buffer(0)]],\n"
     "    device MotionRayResult *out       [[buffer(1)]],\n"
-    "    primitive_acceleration_structure<primitive_motion> scene [[buffer(2)]],\n"
+    "    acceleration_structure<primitive_motion> scene [[buffer(2)]],\n"
     "    uint tid [[thread_position_in_grid]])\n"
     "{\n"
     "    ray r;\n"
@@ -151,8 +151,8 @@ static NSString *const kMotionShaders = @
     "    out[tid] = o;\n"
     "}\n"
     "\n"
-    "struct BoxHit { bool accept; float distance; };\n"
-    "[[intersection(bounding_box, instancing)]]\n"
+    "struct BoxHit { bool accept [[accept_intersection]]; float distance [[distance]]; };\n"
+    "[[intersection(bounding_box, instancing, primitive_motion)]]\n"
     "BoxHit box_any_unit(float3 origin [[origin]], float3 dir [[direction]], float tmin [[min_distance]], float tmax [[max_distance]]) {\n"
     "    BoxHit h = {false, -1.0f};\n"
     "    float t = -origin.z / dir.z;\n"
@@ -166,8 +166,8 @@ static NSString *const kMotionShaders = @
     "kernel void trace_motion_aabb(\n"
     "    device const MotionRayInput *rays [[buffer(0)]],\n"
     "    device MotionRayResult *out       [[buffer(1)]],\n"
-    "    instance_acceleration_structure<instancing, primitive_motion> scene [[buffer(2)]],\n"
-    "    intersection_function_table<instancing> ift [[buffer(3)]],\n"
+    "    acceleration_structure<instancing, primitive_motion> scene [[buffer(2)]],\n"
+    "    intersection_function_table<instancing, primitive_motion> ift [[buffer(3)]],\n"
     "    uint tid [[thread_position_in_grid]])\n"
     "{\n"
     "    ray r;\n"
@@ -190,7 +190,7 @@ static NSString *const kMotionShaders = @
     "kernel void trace_motion_both(\n"
     "    device const MotionRayInput *rays [[buffer(0)]],\n"
     "    device MotionRayResult *out       [[buffer(1)]],\n"
-    "    instance_acceleration_structure<instancing, primitive_motion, instance_motion> scene [[buffer(2)]],\n"
+    "    acceleration_structure<instancing, primitive_motion, instance_motion> scene [[buffer(2)]],\n"
     "    uint tid [[thread_position_in_grid]])\n"
     "{\n"
     "    ray r;\n"
@@ -214,10 +214,10 @@ static NSString *const kMotionShaders = @
     "    out[tid] = o;\n"
     "}\n"
     "\n"
-    "kernel void trace_motion_iq(\n"
+    "kernel void trace_motion_compact(\n"
     "    device const MotionRayInput *rays [[buffer(0)]],\n"
     "    device MotionRayResult *out       [[buffer(1)]],\n"
-    "    instance_acceleration_structure<instancing, primitive_motion, instance_motion> scene [[buffer(2)]],\n"
+    "    acceleration_structure<instancing, primitive_motion, instance_motion> scene [[buffer(2)]],\n"
     "    uint tid [[thread_position_in_grid]])\n"
     "{\n"
     "    ray r;\n"
@@ -225,22 +225,17 @@ static NSString *const kMotionShaders = @
     "    r.direction = rays[tid].dir_tmax.xyz;\n"
     "    r.min_distance = rays[tid].origin_tmin.w;\n"
     "    r.max_distance = rays[tid].dir_tmax.w;\n"
-    "    intersection_query<triangle_data, instancing, primitive_motion, instance_motion> q(r, scene, rays[tid].mask, rays[tid].rayTime);\n"
-    "    while (q.next()) {\n"
-    "        if (q.get_candidate_intersection_type() == intersection_type::triangle) {\n"
-    "            q.commit_triangle_intersection();\n"
-    "        }\n"
-    "    }\n"
+    "    intersector<triangle_data, instancing, primitive_motion, instance_motion> it;\n"
+    "    auto res = it.intersect(r, scene, rays[tid].mask, rays[tid].rayTime);\n"
     "    MotionRayResult o = {0, 0, 0, 0, -1.0f, 0.0f, 0.0f, 0.0f};\n"
-    "    if (q.get_committed_intersection_type() == intersection_type::triangle) {\n"
+    "    if (res.type == intersection_type::triangle) {\n"
     "        o.hitType = 1;\n"
-    "        o.instanceId = q.get_committed_instance_id();\n"
-    "        o.primitiveId = q.get_committed_primitive_id();\n"
-    "        o.frontFacing = q.is_committed_triangle_front_facing() ? 1u : 0u;\n"
-    "        o.distance = q.get_committed_distance();\n"
-    "        o.baryX = q.get_committed_triangle_barycentric_coord().x;\n"
-    "        o.baryY = q.get_committed_triangle_barycentric_coord().y;\n"
-    "        o.worldTx = q.get_committed_object_to_world_transform()[3][0];\n"
+    "        o.instanceId = res.instance_id;\n"
+    "        o.primitiveId = res.primitive_id;\n"
+    "        o.frontFacing = res.triangle_front_facing ? 1u : 0u;\n"
+    "        o.distance = res.distance;\n"
+    "        o.baryX = res.triangle_barycentric_coord.x;\n"
+    "        o.baryY = res.triangle_barycentric_coord.y;\n"
     "    }\n"
     "    out[tid] = o;\n"
     "}\n";
@@ -331,8 +326,8 @@ int main(int argc, const char **argv) {
         id<MTLFunction> fnAabb = [lib newFunctionWithName:@"trace_motion_aabb"];
         id<MTLFunction> fnBoxAny = [lib newFunctionWithName:@"box_any_unit"];
         id<MTLFunction> fnBoth = [lib newFunctionWithName:@"trace_motion_both"];
-        id<MTLFunction> fnIq = [lib newFunctionWithName:@"trace_motion_iq"];
-        require(fnPrim && fnAabb && fnBoxAny && fnBoth && fnIq, @"missing Metal 3.1 motion kernel functions");
+        id<MTLFunction> fnCompact = [lib newFunctionWithName:@"trace_motion_compact"];
+        require(fnPrim && fnAabb && fnBoxAny && fnBoth && fnCompact, @"missing Metal 3.1 motion kernel functions");
 
         id<MTLComputePipelineState> psoPrim = [dev newComputePipelineStateWithFunction:fnPrim error:&err];
         require(psoPrim != nil, [NSString stringWithFormat:@"psoPrim failed: %@", err]);
@@ -351,8 +346,9 @@ int main(int argc, const char **argv) {
         [iftAabb setFunction:[psoAabb functionHandleWithFunction:fnBoxAny] atIndex:0];
 
         id<MTLComputePipelineState> psoBoth = [dev newComputePipelineStateWithFunction:fnBoth error:&err];
-        id<MTLComputePipelineState> psoIq = [dev newComputePipelineStateWithFunction:fnIq error:&err];
-        require(psoBoth && psoIq, @"psoBoth/psoIq creation failed");
+        require(psoBoth != nil, [NSString stringWithFormat:@"psoBoth failed: %@", err]);
+        id<MTLComputePipelineState> psoCompact = [dev newComputePipelineStateWithFunction:fnCompact error:&err];
+        require(psoCompact != nil, [NSString stringWithFormat:@"psoCompact failed: %@", err]);
 
         // 1. Motion triangle BLAS (2 keyframes shifting Y by +2.0 over [0.0, 1.0]) + Clamp vs Vanish oracle
         const rdna4rt_tri_verts_t triKfs[2] = {
@@ -468,17 +464,17 @@ int main(int argc, const char **argv) {
         require(boxOut[0].hitType == 2u && fabsf(boxOut[0].distance - 5.0f) < 1e-4f && boxOut[1].hitType == 0u,
                 [NSString stringWithFormat:@"motion AABB mismatch: %u(%f) %u", boxOut[0].hitType, boxOut[0].distance, boxOut[1].hitType]);
 
-        // 3. Instance Motion TLAS (MTLComponentTransform quaternion slerp + combined primitive+instance motion + IQ)
+        // 3. Instance Motion TLAS (MTLComponentTransform SLERP + MTLPackedFloat4x3 + combined primitive+instance motion + compact)
         const MTLComponentTransform compKfs[2] = {
-            { .scale = {1,1,1}, .shear = {0,0,0}, .pivot = {0,0,0}, .rotation = {0,0,0,1}, .translation = {0,0,0} },
-            { .scale = {1,1,1}, .shear = {0,0,0}, .pivot = {0,0,0}, .rotation = {0,0,0,1}, .translation = {4,0,0} },
+            { .scale = {{{1,1,1}}}, .shear = {{{0,0,0}}}, .pivot = {{{0,0,0}}}, .rotation = {0,0,0,1}, .translation = {{{0,0,0}}} },
+            { .scale = {{{1,1,1}}}, .shear = {{{0,0,0}}}, .pivot = {{{0,0,0}}}, .rotation = {0,0,0,1}, .translation = {{{4,0,0}}} },
         };
         MTLAccelerationStructureMotionInstanceDescriptor mInst;
         memset(&mInst, 0, sizeof(mInst));
         mInst.mask = 0xFFu;
         mInst.accelerationStructureIndex = 0u;
-        mInst.motionTransformStartIndex = 0u;
-        mInst.motionTransformCount = 2u;
+        mInst.motionTransformsStartIndex = 0u;
+        mInst.motionTransformsCount = 2u;
         mInst.motionStartBorderMode = MTLMotionBorderModeClamp;
         mInst.motionEndBorderMode = MTLMotionBorderModeVanish;
         mInst.motionStartTime = 0.0f;
@@ -510,9 +506,9 @@ int main(int argc, const char **argv) {
             { 2.0f, 1.0f, -5.0f, 0.01f, 0.0f, 0.0f, 1.0f, 20.0f, 0.5f, 0xFFu, 0, 0 },
             { 4.0f, 2.0f, -5.0f, 0.01f, 0.0f, 0.0f, 1.0f, 20.0f, 1.25f, 0xFFu, 0, 0 },
         };
-        MotionRayResult bothOut[2], iqOut[2];
-        dispatchMotionTrace(dev, q, psoBoth, tlasMotion, nil, bothRays, bothOut, 2, @"trace-motion-both");
-        dispatchMotionTrace(dev, q, psoIq,   tlasMotion, nil, bothRays, iqOut,   2, @"trace-motion-iq");
+        MotionRayResult bothOut[2], compactOut[2];
+        dispatchMotionTrace(dev, q, psoBoth,    tlasMotion, nil, bothRays, bothOut,    2, @"trace-motion-both");
+        dispatchMotionTrace(dev, q, psoCompact, tlasMotion, nil, bothRays, compactOut, 2, @"trace-motion-compact");
 
         rdna4rt_component_transform_t cpuComp[2];
         memcpy(cpuComp, compKfs, sizeof(cpuComp));
@@ -522,14 +518,58 @@ int main(int argc, const char **argv) {
             RDNA4RT_XFORM_COMPONENT, cpuComp, 2, 0.0f, 1.0f, RDNA4RT_MOTION_BORDER_CLAMP, RDNA4RT_MOTION_BORDER_VANISH,
             triKfs, 2, 0.0f, 1.0f, RDNA4RT_MOTION_BORDER_CLAMP, RDNA4RT_MOTION_BORDER_CLAMP,
             1, 0u, &oT, &oU, &oV, &oFf);
-        require(oHit == 1 && bothOut[0].hitType == 1u && iqOut[0].hitType == 1u &&
-                fabsf(bothOut[0].distance - oT) < 1e-3f && fabsf(iqOut[0].distance - oT) < 1e-3f &&
-                fabsf(bothOut[0].worldTx - 2.0f) < 1e-3f && fabsf(iqOut[0].worldTx - 2.0f) < 1e-3f &&
-                bothOut[1].hitType == 0u && iqOut[1].hitType == 0u,
-                [NSString stringWithFormat:@"combined inst+prim/IQ mismatch: both=%u(%f,tx=%f) iq=%u(%f,tx=%f) miss=%u/%u",
+        require(oHit == 1 && bothOut[0].hitType == 1u && compactOut[0].hitType == 1u &&
+                fabsf(bothOut[0].distance - oT) < 1e-3f && fabsf(compactOut[0].distance - oT) < 1e-3f &&
+                fabsf(compactOut[0].baryX - oU) < 1e-3f && fabsf(compactOut[0].baryY - oV) < 1e-3f &&
+                fabsf(bothOut[0].worldTx - 2.0f) < 1e-3f &&
+                bothOut[1].hitType == 0u && compactOut[1].hitType == 0u,
+                [NSString stringWithFormat:@"combined inst+prim/compact mismatch: both=%u(%f,tx=%f) compact=%u(%f,uv=%f,%f) miss=%u/%u",
                                             bothOut[0].hitType, bothOut[0].distance, bothOut[0].worldTx,
-                                            iqOut[0].hitType, iqOut[0].distance, iqOut[0].worldTx,
-                                            bothOut[1].hitType, iqOut[1].hitType]);
+                                            compactOut[0].hitType, compactOut[0].distance, compactOut[0].baryX, compactOut[0].baryY,
+                                            bothOut[1].hitType, compactOut[1].hitType]);
+
+        // 3b. PackedFloat4x3 Motion Instance TLAS
+        const MTLPackedFloat4x3 packedKfs[2] = {
+            makeTranslate4x3(0.0f, 0.0f, 0.0f),
+            makeTranslate4x3(4.0f, 0.0f, 0.0f),
+        };
+        MTLInstanceAccelerationStructureDescriptor *mtPackedDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        mtPackedDesc.instancedAccelerationStructures = @[ blasTriClamp ];
+        mtPackedDesc.instanceCount = 1;
+        mtPackedDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeMotion;
+        mtPackedDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureMotionInstanceDescriptor);
+        mtPackedDesc.instanceDescriptorBuffer = mtDesc.instanceDescriptorBuffer;
+        mtPackedDesc.motionTransformBuffer = [dev newBufferWithBytes:packedKfs length:sizeof(packedKfs) options:MTLResourceStorageModeShared];
+        mtPackedDesc.motionTransformCount = 2;
+        mtPackedDesc.motionTransformType = MTLTransformTypePackedFloat4x3;
+        MTLAccelerationStructureSizes mtPackedSz = [dev accelerationStructureSizesWithDescriptor:mtPackedDesc];
+        require(mtPackedSz.accelerationStructureSize > 0, @"packed4x3 motion TLAS size == 0");
+        id<MTLAccelerationStructure> tlasMotionPacked = [dev newAccelerationStructureWithSize:mtPackedSz.accelerationStructureSize];
+        {
+            id<MTLBuffer> scr = [dev newBufferWithLength:MAX(mtPackedSz.buildScratchBufferSize, (NSUInteger)64) options:MTLResourceStorageModePrivate];
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            [enc buildAccelerationStructure:tlasMotionPacked descriptor:mtPackedDesc scratchBuffer:scr scratchBufferOffset:0];
+            [enc endEncoding];
+            finishOK(cb, @"tlas-motion-packed4x3");
+        }
+        MotionRayResult packedOut[2];
+        dispatchMotionTrace(dev, q, psoBoth, tlasMotionPacked, nil, bothRays, packedOut, 2, @"trace-motion-packed4x3");
+        rdna4rt_packed_float4x3_t cpuPacked[2];
+        memcpy(cpuPacked, packedKfs, sizeof(cpuPacked));
+        float pT = 0, pU = 0, pV = 0; int pFf = 0;
+        int pHit = rdna4rt_cpu_intersect_motion_inst_tri(
+            &bothRays[0].ox, &bothRays[0].dx, bothRays[0].tmin, bothRays[0].tmax, 0.5f,
+            RDNA4RT_XFORM_PACKED_FLOAT4X3, cpuPacked, 2, 0.0f, 1.0f, RDNA4RT_MOTION_BORDER_CLAMP, RDNA4RT_MOTION_BORDER_VANISH,
+            triKfs, 2, 0.0f, 1.0f, RDNA4RT_MOTION_BORDER_CLAMP, RDNA4RT_MOTION_BORDER_CLAMP,
+            1, 0u, &pT, &pU, &pV, &pFf);
+        require(pHit == 1 && packedOut[0].hitType == 1u &&
+                fabsf(packedOut[0].distance - pT) < 1e-3f &&
+                fabsf(packedOut[0].worldTx - 2.0f) < 1e-3f &&
+                packedOut[1].hitType == 0u,
+                [NSString stringWithFormat:@"packed4x3 inst+prim mismatch: out=%u(%f,tx=%f) miss=%u",
+                                            packedOut[0].hitType, packedOut[0].distance, packedOut[0].worldTx,
+                                            packedOut[1].hitType]);
 
         // 4. Lifecycle: copy, compact, refit on blasTriClamp
         id<MTLAccelerationStructure> blasCopy = [dev newAccelerationStructureWithSize:blasTriClamp.size];
@@ -550,15 +590,31 @@ int main(int argc, const char **argv) {
             { .v = { { -1.0f, 4.0f, 0.0f }, { 1.0f, 4.0f, 0.0f }, { 0.0f, 6.0f, 0.0f } } },
             { .v = { { -1.0f, 6.0f, 0.0f }, { 1.0f, 6.0f, 0.0f }, { 0.0f, 8.0f, 0.0f } } },
         };
-        tk0.buffer = [dev newBufferWithBytes:&triRefitKfs[0] length:sizeof(triRefitKfs[0]) options:MTLResourceStorageModeShared];
-        tk1.buffer = [dev newBufferWithBytes:&triRefitKfs[1] length:sizeof(triRefitKfs[1]) options:MTLResourceStorageModeShared];
-        MTLAccelerationStructureSizes refSz = [dev accelerationStructureSizesWithDescriptor:pdClamp];
+        MTLMotionKeyframeData *tkRef0 = [MTLMotionKeyframeData data];
+        tkRef0.buffer = [dev newBufferWithBytes:&triRefitKfs[0] length:sizeof(triRefitKfs[0]) options:MTLResourceStorageModeShared];
+        MTLMotionKeyframeData *tkRef1 = [MTLMotionKeyframeData data];
+        tkRef1.buffer = [dev newBufferWithBytes:&triRefitKfs[1] length:sizeof(triRefitKfs[1]) options:MTLResourceStorageModeShared];
+        MTLAccelerationStructureMotionTriangleGeometryDescriptor *mgRefit =
+            [MTLAccelerationStructureMotionTriangleGeometryDescriptor descriptor];
+        mgRefit.vertexBuffers = @[ tkRef0, tkRef1 ];
+        mgRefit.vertexStride = 12;
+        mgRefit.triangleCount = 1;
+        mgRefit.opaque = YES;
+        MTLPrimitiveAccelerationStructureDescriptor *pdRefit = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        pdRefit.geometryDescriptors = @[ mgRefit ];
+        pdRefit.motionKeyframeCount = 2;
+        pdRefit.motionStartTime = 0.0f;
+        pdRefit.motionEndTime = 1.0f;
+        pdRefit.motionStartBorderMode = MTLMotionBorderModeClamp;
+        pdRefit.motionEndBorderMode = MTLMotionBorderModeClamp;
+        pdRefit.usage = MTLAccelerationStructureUsageRefit;
+        MTLAccelerationStructureSizes refSz = [dev accelerationStructureSizesWithDescriptor:pdRefit];
         id<MTLBuffer> refScr = [dev newBufferWithLength:MAX(refSz.refitScratchBufferSize, (NSUInteger)64) options:MTLResourceStorageModePrivate];
         {
             id<MTLCommandBuffer> cb = [q commandBuffer];
             id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
             [enc copyAndCompactAccelerationStructure:blasTriClamp toAccelerationStructure:blasComp];
-            [enc refitAccelerationStructure:blasTriClamp descriptor:pdClamp destination:blasRefit scratchBuffer:refScr scratchBufferOffset:0];
+            [enc refitAccelerationStructure:blasTriClamp descriptor:pdRefit destination:blasRefit scratchBuffer:refScr scratchBufferOffset:0];
             [enc endEncoding];
             finishOK(cb, @"motion-compact-refit");
         }
@@ -567,10 +623,14 @@ int main(int argc, const char **argv) {
         dispatchMotionTrace(dev, q, psoPrim, blasCopy,  nil, &primRays[0], &lcRes[0], 1, @"trace-motion-copy");
         dispatchMotionTrace(dev, q, psoPrim, blasComp,  nil, &primRays[0], &lcRes[1], 1, @"trace-motion-compact");
         dispatchMotionTrace(dev, q, psoPrim, blasRefit, nil, &refRay,      &lcRes[2], 1, @"trace-motion-refit");
-        require(lcRes[0].hitType == 1u && lcRes[1].hitType == 1u && lcRes[2].hitType == 1u,
-                @"motion lifecycle trace failure");
+        require(lcRes[0].hitType == 1u && lcRes[1].hitType == 1u && lcRes[2].hitType == 1u &&
+                fabsf(lcRes[2].distance - 5.0f) < 1e-3f,
+                [NSString stringWithFormat:@"motion lifecycle trace failure: copy=%u(%.4f) compact=%u(%.4f) refit=%u(%.4f)",
+                                            lcRes[0].hitType, lcRes[0].distance,
+                                            lcRes[1].hitType, lcRes[1].distance,
+                                            lcRes[2].hitType, lcRes[2].distance]);
 
-        printf("METAL3_RT_MOTION_PASS prim=ok aabb=ok inst_srt=ok iq=ok lifecycle=ok\n");
+        printf("METAL3_RT_MOTION_PASS prim=ok aabb=ok inst_srt=ok inst_4x3=ok compact=ok lifecycle=ok\n");
         fflush(stdout);
     }
     return 0;
