@@ -42,7 +42,14 @@ rollback and last-public-owner release. Callers adapt Metal descriptors or LOD
 overrides; they do not update storage counters. Handle creation retains the
 existing budget rule `committed = actual + reserved - reservedActual`.
 
-Tests that include `GarnetDevice.m` compile normally via the single-TU bridge.
-Tests that extract or inspect full production source use `assemble-device.py` to
-expand `garnet_metal_internal.h` and `garnet_*.m` (plus legacy `*_impl.inc`
-fixtures in `test-validation-runner.py`).
+Tests, fixtures, and runners live under `src/garnet-metal/tests/`:
+- `make -C src/garnet-metal/tests all` builds and runs the offline C11 host
+  suites (ASan + UBSan), assembled-device source-pin tests, and Python/shell
+  checks without a GPU.
+- `run-metal-test.sh` builds and runs standalone macOS `.m` mock/VM fixtures.
+- `run-compatibility.py` drives the Tier 2 compatibility manifest
+  (`tier2-cases.json`).
+- Tests that include `GarnetDevice.m` compile normally via the single-TU bridge;
+  tests that extract or inspect full production source use `assemble-device.py`
+  to expand `garnet_metal_internal.h` and `garnet_*.m` (plus legacy `*_impl.inc`
+  fixtures in `tests/test-validation-runner.py`).

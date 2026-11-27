@@ -131,14 +131,14 @@ gated in-flight protection, and repeated alias cycles without allocation growth.
 Reference mode uses public APIs and does not impose the candidate's private
 backing policy on system Metal.
 
-`test-heap-execution.sh` additionally executes production resource constructors
+`run-metal-test.sh test-heap-execution.m` additionally executes production resource constructors
 with simulated Vulkan boundaries: requirements2, dedicated allocations, memory
 types, failure rollback, pool-off retirement, views, host imports and quarantine.
-`test-heap-backing.c` checks automatic allocation policy and
-`test-swizzle-placement.c` checks placement validation, overlap aliasing,
+`src/garnet-metal/tests/test-host-memory.c` checks automatic allocation policy and
+`src/garnet-metal/tests/test-swizzle-placement.c` checks placement validation, overlap aliasing,
 interval accounting and source pins with host sanitizers.
 `test-metal3-placement-heap.m` is the live RX 9060 XT / `--reference`
-placement-heap GPU oracle (see `src/garnet-metal/TESTING.md`); these host
+placement-heap GPU oracle (see `src/garnet-metal/tests/TESTING.md`); these host
 checks do not establish target-RDNA4 GPU execution or physical large-memory
 capacity. Evidence is under `logs/rdna4-metal2/20261105-110230/heaps/`; real
 hardware acceptance remains in the final task group.

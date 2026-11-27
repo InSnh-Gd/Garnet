@@ -1,5 +1,18 @@
 # Metal compatibility checks
 
+## Quick start (host offline tests & macOS fixtures)
+
+All `GarnetMetal` tests, fixtures, and runners live under `src/garnet-metal/tests/`:
+
+```sh
+# Offline host C11 (ASan+UBSan), assembled-device source-pin, and Python suites (no GPU):
+make -C src/garnet-metal/tests all
+
+# Standalone macOS Objective-C mock/VM fixtures (replaces individual thin test-*.sh wrappers):
+bash src/garnet-metal/tests/run-metal-test.sh [--vk-inc DIR] [--iokit] [--quartz] \
+  TEST_NAME OUTPUT_DIR [-- TEST_ARGS...]
+```
+
 ## Contents
 
 - [Verification tiers](#verification-tiers)
@@ -82,10 +95,10 @@ Run the production CPU/backing and blit validation fixtures in the isolated
 x86_64 macOS VM; neither fixture opens a GPU or changes the desktop:
 
 ```sh
-bash src/garnet-metal/test-texture-transfer-bounds.sh \
-  /path/to/vulkan/include /path/to/new-texture-results
-bash src/garnet-metal/test-blit-buffer-layout.sh \
-  /path/to/vulkan/include /path/to/new-blit-results
+bash src/garnet-metal/tests/run-metal-test.sh --vk-inc /path/to/vulkan/include \
+  test-texture-transfer-bounds /path/to/new-texture-results
+bash src/garnet-metal/tests/run-metal-test.sh --vk-inc /path/to/vulkan/include \
+  test-blit-buffer-layout /path/to/new-blit-results
 ```
 
 The texture suite runs 20 isolated cases. Invalid buffer extents, relocated
@@ -101,12 +114,13 @@ and image strides, relocated-offset overflow, ended encoders and prior command
 errors must record no copy or argument write intent. Tight, padded and existing
 default-row handling have explicit `VkBufferImageCopy` controls (`gpu_execution=0`).
 
-The shared span arithmetic also has an independent 128-bit host oracle:
+The shared span arithmetic also has an independent 128-bit host oracle
+(included in `make -C src/garnet-metal/tests host` via `test-host-display.c`):
 
 ```sh
-cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -O1 \
-  src/garnet-metal/test-texture-transfer.c -o /path/to/test-texture-transfer
-/path/to/test-texture-transfer
+cc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -O1 \
+  -Isrc/garnet-metal src/garnet-metal/tests/test-host-display.c -o /path/to/test-host-display
+/path/to/test-host-display
 ```
 
 It checks 28,800 layout combinations, unchanged output on rejection and three
@@ -119,8 +133,8 @@ Run the device identity fixture to check the Metal device fields consumed by
 System Information without opening RADV or requiring a PCI device:
 
 ```sh
-bash src/garnet-metal/test-device-identity.sh \
-  /path/to/vulkan/include /path/to/new-device-profile-results
+bash src/garnet-metal/tests/run-metal-test.sh --vk-inc /path/to/vulkan/include --iokit \
+  test-device-identity /path/to/new-device-profile-results
 ```
 
 It checks the registry ID, discrete PCIe location, slot number, AMD vendor and
@@ -135,7 +149,7 @@ mocked PCI and accelerator registry entries, without creating GPU resources:
 ```sh
 clang -fobjc-arc -Wall -Wextra -Werror \
   -framework Foundation -framework Metal -framework IOKit \
-  src/garnet-metal/test-system-report.m -o "$TMPDIR/test-system-report"
+  src/garnet-metal/tests/test-system-report.m -o "$TMPDIR/test-system-report"
 "$TMPDIR/test-system-report"
 "$TMPDIR/test-system-report" --late-load
 ```
@@ -148,8 +162,8 @@ The resource creation fixture measures production CPU paths and captures
 their log volume with simulated Vulkan:
 
 ```sh
-bash src/garnet-metal/test-resource-log-budget.sh \
-  /path/to/vulkan/include /path/to/new-log-results
+bash src/garnet-metal/tests/run-metal-test.sh --vk-inc /path/to/vulkan/include \
+  test-resource-log-budget /path/to/new-log-results
 ```
 
 Successful per-resource diagnostics are rate-limited; refusals and errors
@@ -162,7 +176,7 @@ cleanup, not WindowServer latency or GPU throughput.
 Run the existing tests serially in the isolated macOS VM, as root:
 
 ```sh
-sudo env TMPDIR=/path/to/scratch python3 src/garnet-metal/run-compatibility.py \
+sudo env TMPDIR=/path/to/scratch python3 src/garnet-metal/tests/run-compatibility.py \
   vm /path/to/GarnetMetal.bundle /path/to/vulkan/include /path/to/new-results
 ```
 
@@ -173,7 +187,7 @@ separate from `FAIL`. Use repeated `--only sampler`, `--only arguments`, etc. to
 run affected groups. Host checks for the runner need no GPU:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 src/garnet-metal/test-validation-runner.py
+PYTHONDONTWRITEBYTECODE=1 python3 src/garnet-metal/tests/test-validation-runner.py
 ```
 
 `tier2-cases.json` is the selectable Tier 2 execution contract. Each entry fixes
@@ -181,14 +195,14 @@ the matrix IDs, shader stages, language, storage, operation, oracle, reference
 and candidate domains, and backend gap. List the cases without Metal or root:
 
 ```sh
-python3 src/garnet-metal/run-compatibility.py --list-cases
+python3 src/garnet-metal/tests/run-compatibility.py --list-cases
 ```
 
 Select one entry, including both of its declared sides:
 
 ```sh
 sudo env TMPDIR=/path/to/scratch python3 \
-  src/garnet-metal/run-compatibility.py vm /path/to/GarnetMetal.bundle \
+  src/garnet-metal/tests/run-compatibility.py vm /path/to/GarnetMetal.bundle \
   /path/to/vulkan/include /path/to/new-results --case A02.resource-arrays
 ```
 
@@ -296,7 +310,7 @@ and `fixtures/null-shapes-invalid.spv`; it needs no assembler at runtime. To
 regenerate them during development from the checked-in assembly:
 
 ```sh
-cd src/garnet-metal
+cd src/garnet-metal/tests
 spirv-as --target-env vulkan1.2 fixtures/null-shapes-abi9.spvasm \
   -o fixtures/null-shapes-abi9.spv
 spirv-as --target-env vulkan1.2 fixtures/null-shapes-invalid.spvasm \
@@ -436,7 +450,7 @@ lacks `robustness2`, and a provisional module also exposed the VM host's
 `ArgumentBufferTextures/NotImplemented` pipeline path (do not retry that known
 fatal path as an ordinary regression).
 
-**Independent attachment blending.** `CC=clang python3 src/garnet-metal/test-independent-blend.py -I/path/to/vulkan/include`
+**Independent attachment blending.** `CC=clang python3 src/garnet-metal/tests/test-independent-blend.py -I/path/to/vulkan/include`
 compiles the production device-feature setup and checks that it requests
 `independentBlend` when advertised, without requiring a Vulkan device.
 
@@ -444,9 +458,9 @@ compiles the production device-feature setup and checks that it requests
 
 ```sh
 cc -std=c11 -O1 -Wall -Wextra -Werror -I/path/to/vulkan/include \
-  src/garnet-metal/test-sampler-replay.c -ldl -o /path/to/replay
+  src/garnet-metal/tests/test-sampler-replay.c -ldl -o /path/to/replay
 VK_DRIVER_FILES=/path/to/lvp_icd.json python3 \
-  src/garnet-metal/test-sampler-replay.py /path/to/libgarnetxlate.so \
+  src/garnet-metal/tests/test-sampler-replay.py /path/to/libgarnetxlate.so \
   /path/to/libvulkan.so.1 /path/to/replay /path/to/new-results
 ```
 
@@ -520,7 +534,7 @@ tolerance unchanged. Raw logs are archived in
 `logs/rdna4-metal2/20261106-depth-comparison/guest-red-and-quad-controls-r1.tar`
 (`quad-lod-reference-r5.log`, `quad-lod-candidate-r5.log`).
 
-`test-cold-pipelines.sh` runs nineteen default cases, including compute and
+`run-metal-test.sh test-cold-pipelines` runs nineteen default cases, including compute and
 render deadline/retry and first results from concurrent cold compute pipelines. Its test translator
 forwards ABI3 capability-aware exports to the matching real library; refusal
 cases check both the injected reason and underlying error (render failures
@@ -535,7 +549,7 @@ stages, and leave in-process requests out of the daemon queue.
 in an isolated MoltenVK VM bundle (`sudo test-render-fallback VM_TEST_BUNDLE EMPTY_CACHE_DIRECTORY`).
 Checks that a cold miss preserves 1024 existing pixels, then publishes translated
 shaders and repaints only 64 pixels through the original pipeline object while
-960 pixels stay untouched. Runs in `test-execution.sh` as well.
+960 pixels stay untouched. Runs via `run-metal-test.sh` or `run-compatibility.py` as well.
 
 `test-surface-capture.m` checks the opt-in completion observer on a 330px-wide
 RGBA16Float IOSurface (2816-byte stride): off by default, bounded to 2 snapshots
@@ -554,7 +568,7 @@ just encoded. Multiple `W` records may share a `cb`; intermediate segments may
 have `dseq=0`. Direct-mapped surfaces require no path-(b) copy. A `P` with `rc=0`
 is an accepted request, not proof of latch or pixel contents. Compare deltas
 during an interaction that changes the desktop; an idle interval requires no
-advance. `test-nocopy-writeback.sh` exercises the `W` boundary without GPU work.
+advance. `run-metal-test.sh test-nocopy-writeback` exercises the `W` boundary without GPU work.
 
 `T` records identify read-only or display-classified BGRA8 textures by the
 root texture and backing addresses, IOSurface ID (zero for a buffer alias),
@@ -605,28 +619,14 @@ WindowServer PID from `rdna4m/88` or `rdna4m/0`, excluding symlinks and other PI
 
 ## Broader VM comparisons, automatic heaps and live target mode
 
-`test-texture-host-access.m` runs in `test-execution.sh`: `readonly` checks that
+`test-texture-host-access.m` runs via `run-metal-test.sh`: `readonly` checks that
 `replaceRegion` refuses writes on an `mprotect`-protected no-copy buffer while
 CPU/GPU reads stay exact; `iosurface` checks nonzero partial updates, row padding
 and readback for BGRA8 1446x1250/5824, RGBA16Float 330x1507/2816 and A8
 1698x1248/1792 via the VM IOSurface copy path.
 
-For the broader VM pixel comparisons, supply Vulkan headers:
-
-```sh
-sudo env TMPDIR=/path/to/scratch RDNA4_VK_INC="-I/path/to/vulkan/include" \
-  bash src/garnet-metal/test-execution.sh \
-  /path/to/vm/GarnetMetal.bundle /path/to/radv/GarnetMetal.bundle /path/to/results
-```
-
-Each case gets its own translator cache. Core Image concurrent cold pipelines
-use a root test hook to wait up to three seconds per filter for placeholder
-replacement, then rerender (deferred pixels are logged as unvalidated);
-`concurrent-compute` in the cold suite checks strict root refusal and retry
-without placeholders.
-
 Automatic-heap sizing, backing, aliasing and GPU checks are documented in
-`docs/rdna4/automatic-heaps.md`. `test-heap-execution.sh` uses simulated Vulkan;
+`docs/rdna4/automatic-heaps.md`. `run-metal-test.sh test-heap-execution` uses simulated Vulkan;
 `test-heap-gpu.sh` builds a GPU data oracle (`--reference` / candidate), both run
 serially in the existing VM.
 
@@ -697,7 +697,7 @@ configuration validation:
 
 ```sh
 clang -std=c11 -O2 -Wall -Wextra -Werror -I/path/to/vulkan/include \
-  src/garnet-metal/test-tessellation-spv.c -lm -o "$TMPDIR/test-tessellation-spv"
+  src/garnet-metal/tests/test-tessellation-spv.c -lm -o "$TMPDIR/test-tessellation-spv"
 "$TMPDIR/test-tessellation-spv"
 ```
 
@@ -711,7 +711,7 @@ culling, zero-CP patches, and negative validation checks):
 ```sh
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-tessellation.m -o "$TMPDIR/test-tessellation"
+  src/garnet-metal/tests/test-tessellation.m -o "$TMPDIR/test-tessellation"
 sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
   "$TMPDIR/test-tessellation" /path/to/GarnetMetal.bundle
 ```
@@ -719,14 +719,14 @@ sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache"
 ## Indirect Command Buffers (7.1–7.3)
 
 Offline SPIR-V expander generator validation and host-only transaction semantics
-(no Vulkan headers or GPU submission required for `test-icb-transactions.sh`):
+(no Vulkan headers or GPU submission required for `test-icb-transactions.m`):
 
 ```sh
 clang -std=c11 -O2 -Wall -Wextra -Werror -I/path/to/mesa-src/include \
-  -Isrc/garnet-metal src/garnet-metal/test-icb-spv.c -o "$TMPDIR/test-icb-spv"
+  -Isrc/garnet-metal src/garnet-metal/tests/test-icb-spv.c -o "$TMPDIR/test-icb-spv"
 "$TMPDIR/test-icb-spv"
 
-bash src/garnet-metal/test-icb-transactions.sh "$TMPDIR/icb-tx"
+bash src/garnet-metal/tests/run-metal-test.sh test-icb-transactions "$TMPDIR/icb-tx"
 ```
 
 Live RX 9060 XT CPU ICB (draw, indexed draw, direct/indexed patch equivalence,
@@ -740,16 +740,16 @@ usage:MTLResourceUsageWrite]`):
 ```sh
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-icb.m -o "$TMPDIR/test-icb"
+  src/garnet-metal/tests/test-icb.m -o "$TMPDIR/test-icb"
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-icb-gpu.m -o "$TMPDIR/test-icb-gpu"
+  src/garnet-metal/tests/test-icb-gpu.m -o "$TMPDIR/test-icb-gpu"
 clang -arch x86_64 -fobjc-arc -O0 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o0"
+  src/garnet-metal/tests/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o0"
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o2"
+  src/garnet-metal/tests/test-icb-lifecycle.m -o "$TMPDIR/test-icb-lifecycle-o2"
 
 for b in test-icb test-icb-gpu test-icb-lifecycle-o0 test-icb-lifecycle-o2; do
   sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
@@ -761,22 +761,11 @@ done
 
 Host pure-C checks for occlusion 256 KiB boundary (`L20`), depth/stencil target
 validation, integer clears/formats, texture descriptors, Wave32 `threadExecutionWidth`,
-and Mac2 feature sets / capability source pins (compile against an assembled
-`GarnetDevice.m` directory via `assemble-device.py`):
+and Mac2 feature sets / capability source pins (`make -C src/garnet-metal/tests host assembled`,
+or compile against an assembled `GarnetDevice.m` directory via `assemble-device.py`):
 
 ```sh
-python3 src/garnet-metal/assemble-device.py --output "$TMPDIR/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
-cp src/garnet-metal/Info.plist "$TMPDIR/"
-for t in test-gate test-occ test-depth test-intfmt test-texdesc test-devcaps; do
-  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
-    -Isrc/garnet-metal -Isrc/garnet/src -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
-done
-"$TMPDIR/test-gate" "$TMPDIR"
-"$TMPDIR/test-occ" "$TMPDIR"
-"$TMPDIR/test-depth" "$TMPDIR"
-"$TMPDIR/test-intfmt" "$TMPDIR"
-"$TMPDIR/test-texdesc" "$TMPDIR"
-"$TMPDIR/test-devcaps"
+make -C src/garnet-metal/tests host assembled
 ```
 
 Offline translator checks for patch `0069` (dual-source `Decoration::Index`,
@@ -800,7 +789,7 @@ and all three must run on next macOS boot against the rebuilt bundle and
 ```sh
 for t in test-metal2-formats-render test-metal2-msl-probe test-metal2-limits; do
   clang -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Metal \
-    "src/garnet-metal/$t.m" -o "$TMPDIR/$t"
+    "src/garnet-metal/tests/$t.m" -o "$TMPDIR/$t"
   sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
     "$TMPDIR/$t" /path/to/GarnetMetal.bundle
 done
@@ -818,7 +807,7 @@ accounting, and assembled `GarnetDevice.m` source pins:
 ```sh
 python3 src/garnet-metal/assemble-device.py --output "$TMPDIR/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
 cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
-  -o "$TMPDIR/test-swizzle-placement" src/garnet-metal/test-swizzle-placement.c
+  -o "$TMPDIR/test-swizzle-placement" src/garnet-metal/tests/test-swizzle-placement.c
 "$TMPDIR/test-swizzle-placement" "$TMPDIR"
 ```
 
@@ -829,13 +818,13 @@ ARC teardown accounting):
 ```sh
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-metal3-swizzle.m -o "$TMPDIR/test-metal3-swizzle"
+  src/garnet-metal/tests/test-metal3-swizzle.m -o "$TMPDIR/test-metal3-swizzle"
 clang -arch x86_64 -fobjc-arc -O0 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o0"
+  src/garnet-metal/tests/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o0"
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o2"
+  src/garnet-metal/tests/test-metal3-placement-heap.m -o "$TMPDIR/test-metal3-placement-heap-o2"
 
 for b in test-metal3-swizzle test-metal3-placement-heap-o0 test-metal3-placement-heap-o2; do
   sudo RDNA4M_ALLOW=1 RDNA4M_TEST_INPROC=1 RDNA4M_TEST_USERCACHE="$TMPDIR/xlcache" \
@@ -845,28 +834,15 @@ done
 
 ## Metal 3 Barycentrics/Pull-Model, Counters/Amp, MSL 3 Atomics, Binary Archives, I/O Queue, and Residency Sets (2.4–2.6, 3.1, 4.1–4.2)
 
-Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
-and Clang ASan + UBSan) cover timestamp counter sampling & vertex amplification
+Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
+under Clang ASan + UBSan) cover timestamp counter sampling & vertex amplification
 (`test-counters-amp.c`), Garnet binary archive container codec/SHA-256/UUID/miss
 semantics (`test-binary-archive.c`), fast I/O queue state machine/8192-command
 cap & residency set snapshot retention (`test-io-residency.c`), plus Metal 3
-capability probes and wiring pins (`test-devcaps.c`, `test-gate.c`, `test-occ.c`):
+capability probes and wiring pins (`test-host-runtime.c`, `test-gate.c`, `test-occ.c`):
 
 ```sh
-python3 src/garnet-metal/assemble-device.py \
-  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
-cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
-
-for t in test-devcaps test-gate test-occ test-counters-amp test-binary-archive test-io-residency; do
-  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
-    -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
-done
-"$TMPDIR/test-devcaps"
-"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
-"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
-"$TMPDIR/test-counters-amp" "$TMPDIR/src/garnet-metal" src/garnet-metal
-"$TMPDIR/test-binary-archive"
-"$TMPDIR/test-io-residency" src/garnet-metal "$TMPDIR/src/garnet-metal"
+make -C src/garnet-metal/tests host
 ```
 
 Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
@@ -903,13 +879,13 @@ on macOS; compile ARC lifetime suites `test-metal3-binary-archive.m`,
 for t in test-metal3-bary-pull test-metal3-counters-amp test-metal3-msl3-atomics; do
   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
     -framework Foundation -framework Metal \
-    "src/garnet-metal/$t.m" -o "$TMPDIR/$t"
+    "src/garnet-metal/tests/$t.m" -o "$TMPDIR/$t"
 done
 for t in test-metal3-binary-archive test-metal3-io-queue test-metal3-residency-set; do
   for opt in O0 O2; do
     clang -arch x86_64 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
       -framework Foundation -framework Metal \
-      "src/garnet-metal/$t.m" -o "$TMPDIR/$t-$opt"
+      "src/garnet-metal/tests/$t.m" -o "$TMPDIR/$t-$opt"
   done
 done
 
@@ -924,8 +900,8 @@ done
 
 ## Metal 3 Compute ICBs, Sparse/PRT Textures, and Ray Tracing Acceleration Structures (2.3, 5.3, 7.1)
 
-Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
-and Clang ASan + UBSan) cover compute ICB 640-byte ABI, command validation,
+Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
+under Clang ASan + UBSan) cover compute ICB 640-byte ABI, command validation,
 expander SPIR-V, and optional LavaPipe GPU replay (`test-compute-icb.c`), 64 KiB
 sparse tile geometry/conversions, mip-tail layouts, tile pool, atomic bind/unbind
 planning, indirect mapping validation, and `Apple6 == NO` pins
@@ -935,19 +911,7 @@ instance conversion, and lifecycle state machine (`test-rt-accel.c`), plus
 assembled `GarnetDevice.m` wiring pins (`test-gate.c`, `test-occ.c`):
 
 ```sh
-python3 src/garnet-metal/assemble-device.py \
-  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
-cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
-
-for t in test-compute-icb test-sparse-metal test-rt-accel test-gate test-occ; do
-  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
-    -o "$TMPDIR/$t" "src/garnet-metal/$t.c" -lm
-done
-"$TMPDIR/test-compute-icb"
-"$TMPDIR/test-sparse-metal" src/garnet-metal
-"$TMPDIR/test-rt-accel"
-"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
-"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
+make -C src/garnet-metal/tests host
 ```
 
 Pass `-DRDNA4_SPARSE_TEST_VK -DVK_NO_PROTOTYPES -I/path/to/vulkan/include` to
@@ -978,14 +942,14 @@ ARC release coverage):
 ```sh
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal -framework QuartzCore \
-  src/garnet-metal/test-metal3-compute-icb.m -o "$TMPDIR/test-metal3-compute-icb"
+  src/garnet-metal/tests/test-metal3-compute-icb.m -o "$TMPDIR/test-metal3-compute-icb"
 clang -arch x86_64 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-metal3-sparse-prt.m -o "$TMPDIR/test-metal3-sparse-prt"
+  src/garnet-metal/tests/test-metal3-sparse-prt.m -o "$TMPDIR/test-metal3-sparse-prt"
 for opt in O0 O2; do
   clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
     -framework Foundation -framework Metal \
-    src/garnet-metal/test-metal3-rt-accel.m -o "$TMPDIR/test-metal3-rt-accel-$opt"
+    src/garnet-metal/tests/test-metal3-rt-accel.m -o "$TMPDIR/test-metal3-rt-accel-$opt"
 done
 
 for b in test-metal3-compute-icb test-metal3-sparse-prt \
@@ -997,8 +961,8 @@ done
 
 ## Metal 3 Dynamic Libraries & Visible Function Tables (3.2, 3.3)
 
-Host pure-C suite (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
-and Clang ASan + UBSan with `-Wshadow -Wsign-conversion`) validates the `.grdl`
+Host pure-C suite (`host-cpu`, run via `make -C src/garnet-metal/tests host`
+under Clang ASan + UBSan) validates the `.grdl`
 dynamic library container codec (atomic roundtrip, magic/version/SHA-256/truncation/tamper
 rejection), Stage 2 linked cache-key determinism, patch `0074` VFT buffer encoding &
 OOB-clamping simulation, `visible_function_tables` JSON reflection parsing, Footnote 10
@@ -1006,16 +970,7 @@ mesh vs render function-pointer/RT exclusion, and source pins (`test-dynlib-vft.
 plus assembled `GarnetDevice.m` Wave 3B wiring pins in `test-gate.c`):
 
 ```sh
-python3 src/garnet-metal/assemble-device.py \
-  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
-cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
-
-cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Wshadow -Wsign-conversion \
-  -Isrc/garnet-metal -o "$TMPDIR/test-dynlib-vft" src/garnet-metal/test-dynlib-vft.c
-"$TMPDIR/test-dynlib-vft" src/garnet-metal
-cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
-  -o "$TMPDIR/test-gate" src/garnet-metal/test-gate.c
-"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
+make -C src/garnet-metal/tests host
 ```
 
 Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
@@ -1038,7 +993,7 @@ for t in test-metal3-dynamic-lib test-metal3-function-tables; do
   for opt in O0 O2; do
     clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
       -framework Foundation -framework Metal \
-      "src/garnet-metal/$t.m" -o "$TMPDIR/$t-$opt"
+      "src/garnet-metal/tests/$t.m" -o "$TMPDIR/$t-$opt"
   done
 done
 
@@ -1051,8 +1006,8 @@ done
 
 ## Metal 3 Mesh Shaders & Ray Tracing Runtime / IFT (6.2, 7.3, Wave 3E)
 
-Host pure-C suites (`host-cpu`, run under both GCC `-O2 -Wall -Wextra -Werror`
-and Clang ASan + UBSan) validate mesh descriptor/threadgroup/emulated-payload
+Host pure-C suites (`host-cpu`, run via `make -C src/garnet-metal/tests host`
+under Clang ASan + UBSan) validate mesh descriptor/threadgroup/emulated-payload
 planning, SPIR-V mesh execution-model inspection, and Footnote 10 rules
 (`test-mesh-runtime.c`), plus ray-tracing reflection JSON parsing, patch `0077`
 IFT storage-buffer ABI encoding/dispatch simulation, direct-AS vs 64-bit BDA
@@ -1061,19 +1016,7 @@ gating (`test-rt-runtime.c`), alongside assembled `GarnetDevice.m` Wave 3E
 wiring pins (`test-gate.c`, `test-occ.c`):
 
 ```sh
-python3 src/garnet-metal/assemble-device.py \
-  --output "$TMPDIR/src/garnet-metal/GarnetDevice.m" src/garnet-metal/GarnetDevice.m
-cp src/garnet-metal/Info.plist "$TMPDIR/src/garnet-metal/Info.plist"
-
-for t in test-mesh-runtime test-rt-runtime test-gate test-occ; do
-  cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -Isrc/garnet-metal \
-    -o "$TMPDIR/$t" "src/garnet-metal/$t.c"
-done
-"$TMPDIR/test-mesh-runtime"
-"$TMPDIR/test-rt-runtime"
-"$TMPDIR/test-gate" src/garnet-metal
-"$TMPDIR/test-gate" "$TMPDIR/src/garnet-metal"
-"$TMPDIR/test-occ" "$TMPDIR/src/garnet-metal"
+make -C src/garnet-metal/tests host
 ```
 
 Live RX 9060 XT / `--reference` Objective-C suites (`live`, build with Xcode CLT
@@ -1098,11 +1041,11 @@ ARC release coverage):
 ```sh
 clang -arch x86_64 -mmacosx-version-min=13.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
   -framework Foundation -framework Metal \
-  src/garnet-metal/test-metal3-mesh-shaders.m -o "$TMPDIR/test-metal3-mesh-shaders"
+  src/garnet-metal/tests/test-metal3-mesh-shaders.m -o "$TMPDIR/test-metal3-mesh-shaders"
 for opt in O0 O2; do
   clang -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc "-$opt" -Wall -Wextra -Werror \
     -framework Foundation -framework Metal \
-    src/garnet-metal/test-metal3-raytracing.m -o "$TMPDIR/test-metal3-raytracing-$opt"
+    src/garnet-metal/tests/test-metal3-raytracing.m -o "$TMPDIR/test-metal3-raytracing-$opt"
 done
 
 for b in test-metal3-mesh-shaders \

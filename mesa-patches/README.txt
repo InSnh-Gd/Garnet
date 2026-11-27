@@ -54,7 +54,7 @@ ABI <= 1.13 kernels remain compatible with automatic fallback to legacy selector
 
 0023: propagate failed graphics shader allocation instead of caching or dereferencing an incomplete pipeline.
 
-0024: on Darwin, retry an ordinary CPU-mapped shader arena in GTT after a visible-VRAM device-memory error. Preserve its flags and alignment, and do not retry capture/replay or non-mappable arenas. Run `bash mesa-patches/test-shader-arena-fallback.sh /path/to/patched-mesa "$TMPDIR/arena-test"` to exercise both attempts and the double-failure case without a GPU. The native `test-pipeline-oom.sh` visible-VRAM-only refusal check applies to the 0023 baseline; it does not exhaust the GTT fallback.
+0024: on Darwin, retry an ordinary CPU-mapped shader arena in GTT after a visible-VRAM device-memory error. Preserve its flags and alignment, and do not retry capture/replay or non-mappable arenas.
 
 0025: disable GFX12 color compression on Darwin. Garnet accepts the allocation flag without setting the GPU page table compression bit. Keep image format queries, image creation, and allocation on the uncompressed path. The gfx1200 pipeline probe checks the reported color attachment compression mode.
 
@@ -103,7 +103,7 @@ Memory and topology audit (offline, 2026-11-01):
     report and native GPU execution still require a physical acceptance run.
 
 Host regression test (no Mesa configure, IOKit, Vulkan loader, or GPU needed):
-    bash mesa-patches/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
+    bash mesa-patches/tests/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
     Run from this repository after applying the full series to the pinned
     Mesa base. Requires clang/clang++ (or CC/CXX), pthreads, and sanitizer
     runtimes. Builds the actual backend, marshaller, mock, sync provider,
@@ -146,20 +146,9 @@ Native macOS build (ACO only, no LLVM/Rust/system installations):
     Dylib SHA256:
       845214bb3e31b878f784df61fa02f3f0b7971c7f15df14a1d1e79800b420379e
 
-Native buffer bridge dylib check (macOS, no queue submission):
-    clang -std=gnu11 -O1 -g -Wall -Wextra -Werror \
-      -I/path/to/patched-mesa/include -I/path/to/patched-mesa/include/darwin \
-      -I/path/to/patched-mesa/src/amd/vulkan/winsys/amdgpu \
-      mesa-patches/0015-native-buffer-dylib-test.c -o /path/to/dylib-bridge-test
-    /path/to/dylib-bridge-test /path/to/libvulkan_radeon.dylib
-    The production ICD is loaded directly. Only this test process selects the
-    mock transport, which lacks the buffer capability. Typed exports, real
-    gfx1200 device/memory objects, same-device/bounds checks and -ENOSYS
-    fallback are exercised; teardown must report 0 submits, 0 seqs.
-
 Native Vulkan mock pipeline test (macOS, no queue submission):
     Put the user-prefix glslangValidator on PATH, then run:
-    bash mesa-patches/test-gfx1200-pipeline.sh /path/to/patched-mesa \
+    bash mesa-patches/tests/test-gfx1200-pipeline.sh /path/to/patched-mesa \
       /path/to/radv-build/src/amd/vulkan/libvulkan_radeon.dylib /path/to/output
     This loads the actual ICD directly through vk_icdGetInstanceProcAddr;
     a Vulkan loader installation is unnecessary. The harness forces
