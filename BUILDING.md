@@ -1,125 +1,89 @@
 # Building the Garnet driver stack
 
-> **WARNING.** Garnet.kext writes GPU registers directly (PCIe BARs, PSP, SMU, RLC, SDMA, CP,
-> MES, display engine). It is experimental. Physical bring-up from this tree is unverified, and a
-> wrong build or a different card can hang or restart the machine or corrupt display state. The only
-> intended target is one x86_64 test bench with one RX 9060 XT (Navi 44). Do not run it on a machine
-> you cannot afford to restart or recover. You run it entirely at your own risk; there is no
-> warranty (see LICENSE).
+> [!WARNING]
+> `Garnet.kext` writes GPU registers directly (PCIe BARs, PSP, SMU, RLC, SDMA, CP, MES, and the DCN display engine). An incompatible build, GPU, or macOS version can freeze or restart the machine or corrupt display output. Run builds only on a dedicated, recoverable test machine at your own risk; see [LICENSE](LICENSE).
 
 ## Prerequisites
 
-- macOS with the Xcode Command Line Tools (clang, make, codesign, python3) for a loadable kext,
-  or Linux with clang, `llvm-nm`, and MacKernelSDK plus a cctools-port `ld` that implements
-  `-kext` for a kernel-only cross-build (see below).
-- MacKernelSDK (pinned at `05094e5e88cec7caedbfb35e8449ed0db94bf95b`, not vendored here); pass its
-  path as `MKSDK` below. (`Garnet.kext` and `GarnetAccel.kext` have no `Lilu.kext` or external
-  display-plugin dependency.)
-- AMD firmware from linux-firmware (not in this repo, AMD's own licence):
+- **macOS host** with Xcode Command Line Tools (`clang`, `make`, `codesign`, `python3`) for full signed payloads, or **Linux host** with `clang`, `llvm-nm`, `MacKernelSDK`, and a `cctools-port` `ld64` linker implementing `-kext` for kernel-only cross-builds.
+- **MacKernelSDK** pinned at `05094e5e88cec7caedbfb35e8449ed0db94bf95b` (not vendored here); pass its path as `MKSDK`. `Garnet.kext` and `GarnetAccel.kext` have no `Lilu.kext` or external display-plugin dependency.
+- **AMD firmware** from `linux-firmware` (not tracked in git; distributed under AMD's firmware license):
 
-  ```
+  ```sh
   git clone https://gitlab.com/kernel-firmware/linux-firmware.git
-  tools/fetch-firmware.sh <path-to-that-checkout>
+  CHIPS=navi44 bash tools/fetch-firmware.sh /path/to/linux-firmware
   ```
 
-  This only copies files (no network) into `src/garnet/firmware/`, which is
-  gitignored. The kext embeds these files from linux-firmware's `amdgpu/`, ten per chip:
+  `fetch-firmware.sh` only copies local files (no network) into gitignored `src/garnet/firmware/`. Ten blobs are embedded per chip:
 
-  ```
-  Navi 48 (RX 9070 / 9070 XT, AI PRO R9700; CHIPS=navi48):
-  gc_12_0_1_imu.bin  gc_12_0_1_me.bin  gc_12_0_1_mec.bin  gc_12_0_1_pfp.bin
-  gc_12_0_1_rlc.bin  gc_12_0_1_uni_mes.bin
-  psp_14_0_3_sos.bin  psp_14_0_3_ta.bin
-  sdma_7_0_1.bin  smu_14_0_3.bin
-
+  ```text
   Navi 44 (RX 9060 XT; CHIPS=navi44):
   gc_12_0_0_imu.bin  gc_12_0_0_me.bin  gc_12_0_0_mec.bin  gc_12_0_0_pfp.bin
   gc_12_0_0_rlc.bin  gc_12_0_0_uni_mes.bin
   psp_14_0_2_sos.bin  psp_14_0_2_ta.bin
   sdma_7_0_0.bin  smu_14_0_2.bin
+
+  Navi 48 (RX 9070 / RX 9070 XT / AI PRO R9700; CHIPS=navi48):
+  gc_12_0_1_imu.bin  gc_12_0_1_me.bin  gc_12_0_1_mec.bin  gc_12_0_1_pfp.bin
+  gc_12_0_1_rlc.bin  gc_12_0_1_uni_mes.bin
+  psp_14_0_3_sos.bin  psp_14_0_3_ta.bin
+  sdma_7_0_1.bin  smu_14_0_3.bin
   ```
 
-  `make` builds both chips by default (`CHIPS="navi48 navi44"`); `make CHIPS=navi44` builds a
-  kext with only the 9060 XT's blobs (the other chip's symbols become empty stubs and that chip is
-  refused at probe). `CHIPS=navi44 tools/fetch-firmware.sh <path>` copies only that chip's set.
+  `make` embeds both chips by default (`CHIPS="navi48 navi44"`). Setting `CHIPS=navi44` builds a kext containing only Navi 44 firmware; unsupported chips are stubbed out and refused at probe time. The Makefile stops with a list if any required blob is missing, and `fetch-firmware.sh` verifies SHA-256 digests against the tested revision.
 
-  The Makefile stops with a list if any is missing. `tools/fetch-firmware.sh` prints the
-  sha256 of each copy against the revision the project was developed with; a different
-  linux-firmware revision may work, but only that one has been run.
+## Build `Garnet.kext` on macOS
 
-## Build
-
-```
-make -C src/garnet MKSDK=/path/to/MacKernelSDK all
+```sh
+make -C src/garnet CHIPS=navi44 MKSDK=/path/to/MacKernelSDK all
 ```
 
-The result is `src/garnet/build/Garnet.kext` (x86_64, ad-hoc signed, min macOS
-11 ABI). Check it with: `dwarfdump --uuid build/Garnet.kext/Contents/MacOS/Garnet`
-and `nm -u -arch x86_64 <that binary>` (only kernel, IOKit and KPI symbols).
+The output lands in `src/garnet/build/Garnet.kext` (`x86_64`, ad-hoc signed, macOS 11 minimum ABI). Verify it with:
+
+```sh
+dwarfdump --uuid src/garnet/build/Garnet.kext/Contents/MacOS/Garnet
+nm -u -arch x86_64 src/garnet/build/Garnet.kext/Contents/MacOS/Garnet
+```
+
+Only kernel, IOKit, and KPI symbols should appear as undefined imports.
 
 ## Linux kernel-only cross-build
 
-The kernel extension can also be built with Linux clang, MacKernelSDK,
-`llvm-nm` and a cctools-port ld64 linker that implements `-kext`:
+`Garnet.kext` can also be cross-compiled on Linux with `clang`, `MacKernelSDK`, `llvm-nm`, and a `cctools-port` `ld64` supporting `-kext`:
 
 ```sh
 CHIPS=navi44 bash tools/fetch-firmware.sh /usr/lib/firmware
-make -C src/garnet all CHIPS=navi44 BUILD=/path/to/workspace/temp/scratch/garnet \
+make -C src/garnet all CHIPS=navi44 BUILD=/tmp/garnet-build \
   MKSDK=/absolute/path/to/MacKernelSDK \
   KEXT_LD=/absolute/path/to/x86_64-apple-darwin-ld
 ```
 
-Linux defaults to `SIGN=0`: the result is explicitly unsigned, intended for
-OpenCore injection. This does not validate macOS loading or GPU behavior.
-The macOS build still defaults to `SIGN=1` and requires its normal codesign
-checks. A current MacKernelSDK only supplies libkmod; the older libkmodc++
-is linked when present. Userspace tools still need a full macOS SDK and are
-not built by this kernel-only command.
+Linux defaults to `SIGN=0` (unsigned kext for OpenCore injection or offline inspection); macOS defaults to `SIGN=1` and runs `codesign`. Recent `MacKernelSDK` snapshots provide `libkmod`; `libkmodc++` is linked automatically when present. Userspace components (`GarnetMetal.bundle`, `Garnet.app`, `libvulkan_radeon.dylib`) require a macOS SDK and are not built by this kernel-only target.
 
-Do not substitute ld64.lld: the tested LLVM 23 linker ignores `-kext` and
-attempts to produce an executable. Check the output with `file` or
-`llvm-objdump --macho --private-header`; it must be an x86_64 KEXTBUNDLE.
+Do not substitute `ld64.lld`: LLVM's `ld64.lld` ignores `-kext` and emits an executable instead of a `KEXTBUNDLE`. Verify the output with `file` or `llvm-objdump --macho --private-header`.
 
-## Where generated files land
+## Generated files and build directories
 
-- `firmware/*.bin` inputs live in `src/garnet/firmware/` (gitignored). The Makefile
-  generates the embedding C sources and their objects under `$(BUILD)/firmware/`
-  (`FW_GEN := $(BUILD)/firmware`), so the default `src/` tree stays free of generated files.
-  `BUILD` defaults to `src/garnet/build`; pass another `BUILD=` for candidate builds
-  (for example a shader-cache experiment), never the default build directory.
-- Compiled objects also land under `$(BUILD)/` (`dcn/*.o`, `amd/*.o`).
-- The `src/garnet/firmware/` directory, `build/` and `build-*/`, `*.kext/`, `*.o`,
-  `*.log`, and `runs/` are all gitignored (see `.gitignore`). Never commit build outputs,
-  logs, or run archives.
-- The aux kext host tests (`src/garnet-accel/tests/Makefile`) honor `BUILD` and
-  `TMPDIR`: `BUILD ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/garnet-accel-tests`. Work logs for the
-  RDNA4 refactor itself go under the workspace `logs/rdna4-refactor/` directory, not `/tmp`
-  and not into the repo.
+- `src/garnet/firmware/*.bin` is gitignored. Generated firmware C sources and objects land under `$(BUILD)/firmware/` (`FW_GEN := $(BUILD)/firmware`), keeping `src/` clean.
+- Override `BUILD=` for candidate or experiment builds instead of reusing `src/garnet/build`.
+- Build outputs (`build/`, `build-*/`, `*.kext/`, `*.o`, `*.log`, `runs/`) are gitignored; do not commit generated artifacts.
+- `src/garnet-accel/tests/Makefile` honors `BUILD` and `TMPDIR` (defaulting to `${TMPDIR:-/tmp}/garnet-accel-tests`).
 
 ## Runtime shader cache and ABI notes
 
-The native stack (Mesa RADV plus `GarnetMetal.bundle` in `src/garnet-metal`) does not use
-Apple shader-substitution caches. Compiled compute test shaders remain in `src/garnet/shaders/`.
-Boot-args and loading are described in the source comments; this file only covers building.
+The native stack (Mesa RADV plus `GarnetMetal.bundle` in `src/garnet-metal/`) translates Metal AIR to SPIR-V directly and does not use Apple shader-substitution caches. Compiled compute test shaders remain in `src/garnet/shaders/`.
 
-## Rebuild cooperating components together
+## Rebuilding matching components together
 
-The standalone Garnet stack uses `Garnet` (`org.garnet.driver`), `GarnetAccel`
-(`org.garnet.accel`), `GarnetMetal` (`org.garnet.metal`), `libgarnetxlate.dylib`,
-`garnettest`, and `garnet-*` boot arguments. Rebuild the kernel and user-space
-components together and update service names, bundle paths and boot arguments before a later
-deployment. Numeric ABI values, selectors, structure layouts and serialized signatures stay
-unchanged. Actual chip selectors remain `navi44` and `navi48`.
+All layers share the standalone Garnet identity (`Garnet` / `org.garnet.driver`, `GarnetAccel` / `org.garnet.accel`, `GarnetMetal` / `org.garnet.metal`, `libgarnetxlate.dylib`, `garnettest`, and `garnet-*` boot arguments). Rebuild kernel and userspace components together whenever ABI headers or layouts change. Chip selectors remain `navi44` and `navi48`.
 
-## Full payload (`Garnet`, `GarnetAccel`, `GarnetMetal`)
+## Full matched payload (`Garnet`, `GarnetAccel`, `GarnetMetal`)
 
-`tools/rdna4/build-all.sh OUT_DIR` builds one matched, signed standalone Garnet payload for
-`tools/rdna4/install-native.sh` (scripts, layout, env vars, and safety notes: see
-`tools/rdna4/README.md`). Pass `MKSDK`, `C64_LAYOUT_OUT`, and `C64_WORK` (plus
-`RDNA4_RADV_LIB`/`RDNA4_MESA_SRC` and `RDNA4_XLATE_LIB`/`RDNA4_M2V_SRC`); no
-`AMDRadeonRDNA4.kext` or `Lilu.kext` input is required or accepted. Before compiling,
-`build-all.sh` writes `MANIFEST.txt` (`garnet-delivery-v1`) and `LOCAL-SOURCE-MANIFEST.txt`
-covering tracked and untracked local build inputs plus declared ignored inputs
-(`src/garnet/firmware/` and `src/garnet-metal/spvcache/`); generated build outputs are
-excluded. Each kext is strict-verified, signed ad hoc if not already signed, and strict-verified
-again. The script never installs or loads anything on the target system.
+`tools/rdna4/build-all.sh OUT_DIR` builds a single matched, signed standalone Garnet payload for `tools/rdna4/install-native.sh` (see [tools/rdna4/README.md](tools/rdna4/README.md) for full options and safety notes). Pass:
+
+- `MKSDK`: `MacKernelSDK` directory
+- `GARNET_KC_WORK`: directory holding `kc/` (`BootKernelExtensions.kc`, `SystemKernelExtensions.kc`) and carved `kexts/` from the target macOS build
+- `GARNET_LAYOUT_OUT`: output directory generated by `tools/ioaccel-layout/`
+- `RDNA4_RADV_LIB` (or `RDNA4_MESA_SRC`) and `RDNA4_XLATE_LIB` (or `RDNA4_M2V_SRC`)
+
+Before compiling, `build-all.sh` records `MANIFEST.txt` (`garnet-delivery-v1`) and `LOCAL-SOURCE-MANIFEST.txt` covering tracked and untracked local inputs plus declared ignored inputs (`src/garnet/firmware/` and `src/garnet-metal/spvcache/`). Each kext is strict-verified, ad-hoc signed if needed, and verified again. The script never installs or loads anything on the host.
