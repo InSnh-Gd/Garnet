@@ -25,6 +25,8 @@ h='''#define GARNET_INTERNAL static
 #include "garnet_dumpacl.h"
 #define RDNA4LOG(fmt, ...) printf("LOG: " fmt "\\n", ##__VA_ARGS__)
 #define RDNA4_ONCE(fmt, ...) RDNA4LOG(fmt, ##__VA_ARGS__)
+static int rdna4_sb_can_stat(const char *p) { (void)p; return 1; }
+static int rdna4_sb_can_write(const char *p) { (void)p; return 1; }
 '''
 m='int main(void){ char sub[512]; sub[0]=0; int r=rdna4_dump_dir_ready(sub,sizeof sub); printf("RESULT %d %s\\n",r,r?sub:""); return 0; }\n'
 open(sys.argv[2],'w').write(h+s[a:b]+m)

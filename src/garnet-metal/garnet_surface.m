@@ -24,8 +24,8 @@ GARNET_INTERNAL void rdna4_led_latch(void) {
     static dispatch_once_t o;
     dispatch_once(&o, ^{
         rdna4l_init(&RDNA4LED.L);
-        RDNA4LED.ucMode = rdna4uc_mode(access(RDNA4_NOUSECOUNT_FILE, F_OK) == 0);
-        RDNA4LED.iaActs = rdna4ia_enabled(rdna4_is_ws() ? 1 : 0, access(RDNA4_NOIOALIAS_FILE, F_OK) == 0);
+        RDNA4LED.ucMode = rdna4uc_mode(rdna4_sb_access_exists(RDNA4_NOUSECOUNT_FILE) ? 1 : 0);
+        RDNA4LED.iaActs = rdna4ia_enabled(rdna4_is_ws() ? 1 : 0, rdna4_sb_access_exists(RDNA4_NOIOALIAS_FILE) ? 1 : 0);
         RDNA4LOG("build 16: use-count policy %s (kill file " RDNA4_NOUSECOUNT_FILE " %s); IOSurface wrapper aliasing (P1) %s (%s%s)", RDNA4LED.ucMode == RDNA4UC_INFLIGHT ? "IN-FLIGHT ONLY (a surface is use-counted while a command buffer that touched a texture of it is in flight)" : "NONE (Apple-identical)",
                RDNA4LED.ucMode == RDNA4UC_INFLIGHT ? "absent" : "PRESENT", RDNA4LED.iaActs ? "ACTS" : "OFF", rdna4_is_ws() ? "WindowServer: counted only" : "application", rdna4_is_ws() ? "" : RDNA4LED.iaActs ? "" : ", kill file " RDNA4_NOIOALIAS_FILE " present");
     });
@@ -272,10 +272,10 @@ static const char *rdna4s_hold_mode_name(int mode) {
 }
 static void rdna4s_poll_hold_switch(BOOL forceLog) {
     int mode = RDNA4DF_HOLD_MODE_FINAL, ms = RDNA4DF_HOLD_DEFAULT_MS;
-    if (access(RDNA4_NOHOLD_FILE, F_OK) == 0) {
+    if (rdna4_sb_access_exists(RDNA4_NOHOLD_FILE)) {
         mode = RDNA4DF_HOLD_MODE_OFF;
     } else {
-        int fd = open(RDNA4_HOLD_FILE, O_RDONLY);
+        int fd = rdna4_sb_open_ro(RDNA4_HOLD_FILE, O_RDONLY);
         if (fd >= 0) {
             char b[32]; ssize_t n = read(fd, b, sizeof b); close(fd);
             mode = RDNA4DF_HOLD_MODE_ALL;
@@ -301,10 +301,10 @@ static void rdna4s_bind_locked(void) {
     if (RDNA4S.bound) return;
     RDNA4S.bound = 1; RDNA4S.tStart = rdna4_now();
     struct stat sb;
-    BOOL killed = stat(RDNA4_NOFLIP_FILE, &sb) == 0;
+    BOOL killed = rdna4_sb_stat(RDNA4_NOFLIP_FILE, &sb) == 0;
     rdna4df_init(&RDNA4S.sm, killed);
     rdna4df_hold_adapt_init(&RDNA4S.holdAdapt);
-    RDNA4S.sm.presentall = stat(RDNA4_PRESENTALL_FILE, &sb) == 0;
+    RDNA4S.sm.presentall = rdna4_sb_stat(RDNA4_PRESENTALL_FILE, &sb) == 0;
     if (RDNA4S.sm.presentall) RDNA4LOG("scanout: final-pass rule DISABLED at bind: " RDNA4_PRESENTALL_FILE " exists (every display write is copied and presented)");
     if (killed) { rdna4s_free_slots(); RDNA4LOG("scanout: D-copy OFF: kill switch " RDNA4_NOFLIP_FILE " exists (read once per process)"); return; }
     rdna4s_poll_hold_switch(YES);
@@ -330,7 +330,7 @@ static void rdna4s_bind_locked(void) {
         for (int xi = 1; xi <= 2; xi++) {
             const rdna4x_desc_t *const d = rdna4x_desc((uint32_t)xi); struct stat xs_;
             const rdna4x_enable_t xe = { .inst = (uint32_t)xi, .kernel_m6 = (q.flags & RDNA4N_SCANQ_M6) != 0, .kernel_m6flip = (q.flags & RDNA4X_SCANQ_M6FLIP) != 0, .kernel_m6flip1 = (q.flags & RDNA4X_SCANQ_M6FLIP1) != 0,
-                                       .have_call = RDNA4X.call != NULL, .have_handle = RDNA4X.bohandle != NULL, .killfile = stat(d->killfile, &xs_) == 0 };
+                                       .have_call = RDNA4X.call != NULL, .have_handle = RDNA4X.bohandle != NULL, .killfile = rdna4_sb_stat(d->killfile, &xs_) == 0 };
             RDNA4XI(xi).enabled = rdna4x_enabled(&xe);
             rdna4df_init(&RDNA4XI(xi).sm, 0);
             if (xe.kernel_m6flip) RDNA4LOG("scanout: instance %d (the %s): %s (kernel latches m6 %d m6flip %d m6flip1 %d, exports call %d bo_handle %d, kill file %s; geometry %ux%u pitch %u B from the descriptor, slot %llu B)", xi, d->name, RDNA4XI(xi).enabled ? "ENABLED (acquired lazily at the first frame the table maps to it)" : "OFF",
@@ -536,8 +536,8 @@ static void rdna4s_tick(void) {   // 1 s keep-alive (a status call counts as act
     (void)rdna4s_crc_on();   // keeps the 2 s file poll alive on an idle screen
     rdna4s_poll_hold_switch(NO);
     pthread_mutex_lock(&RDNA4S.mu);
-    { struct stat sb; int pa = stat(RDNA4_PRESENTALL_FILE, &sb) == 0; if (pa != RDNA4S.sm.presentall) { RDNA4S.sm.presentall = pa; RDNA4LOG("scanout: final-pass rule %s (" RDNA4_PRESENTALL_FILE " %s)", pa ? "DISABLED: every display write is copied and presented" : "ENABLED: only GPUPass frames are presented", pa ? "exists" : "removed"); } }
-    { struct stat sb; int dm = stat(RDNA4_DAMAGE_FILE, &sb) == 0; if (dm != RDNA4S.sm.damage) { RDNA4S.sm.damage = dm; RDNA4S.sm.head = -1; RDNA4LOG("scanout: partial-update emulation %s (" RDNA4_DAMAGE_FILE " %s)", dm ? "ENABLED: SkyLight composite passes count as frames; each frame = previous frame + its dirty rectangle" : "DISABLED: full-surface copies", dm ? "exists" : "removed"); } }
+    { struct stat sb; int pa = rdna4_sb_stat(RDNA4_PRESENTALL_FILE, &sb) == 0; if (pa != RDNA4S.sm.presentall) { RDNA4S.sm.presentall = pa; RDNA4LOG("scanout: final-pass rule %s (" RDNA4_PRESENTALL_FILE " %s)", pa ? "DISABLED: every display write is copied and presented" : "ENABLED: only GPUPass frames are presented", pa ? "exists" : "removed"); } }
+    { struct stat sb; int dm = rdna4_sb_stat(RDNA4_DAMAGE_FILE, &sb) == 0; if (dm != RDNA4S.sm.damage) { RDNA4S.sm.damage = dm; RDNA4S.sm.head = -1; RDNA4LOG("scanout: partial-update emulation %s (" RDNA4_DAMAGE_FILE " %s)", dm ? "ENABLED: SkyLight composite passes count as frames; each frame = previous frame + its dirty rectangle" : "DISABLED: full-surface copies", dm ? "exists" : "removed"); } }
     if (RDNA4S.sm.state == RDNA4DF_ACTIVE && rdna4s_status_locked(&RDNA4S.st)) {
         uint64_t now = rdna4_now();
         if (now - RDNA4S.tLog >= 10ull * 1000000000ull) { RDNA4S.tLog = now; rdna4s_log_counters_locked(&RDNA4S.st); rdna4s_class_summary_locked(); rdna4s_dirty_summary_locked(); rdna4s_crc_summary();
@@ -551,7 +551,7 @@ static void rdna4s_tick(void) {   // 1 s keep-alive (a status call counts as act
     for (int xi = 1; xi <= 2; xi++) {   // bundle 13/15: each HDMI instance's 1 s duties (rdna4x_tick_plan, host-tested). The KEEP-ALIVE comes first: a display pipe idles when nothing changes (queue 292), so a STATIC display is a static plane, and the kernel's 5 s
         // idle watchdog would put it back on the bars unless a call counts as activity - Status is that call, once per ACTIVE instance. Then the kill file (this instance's own), a table refresh when the kernel has published a newer table than the cache, and a pending re-copy.
         rdna4xi_t *const X = &RDNA4XI(xi); const rdna4x_desc_t *const d = rdna4x_desc((uint32_t)xi);
-        struct stat kb; const int kill = stat(d->killfile, &kb) == 0;
+        struct stat kb; const int kill = rdna4_sb_stat(d->killfile, &kb) == 0;
         if (kill && X->enabled) { X->enabled = 0; X->xs.killed++; RDNA4LOG("scanout (instance %d, %s): kill switch %s exists: this instance %s and stays OFF for this process", xi, d->name, d->killfile, X->sm.state == RDNA4DF_ACTIVE ? "is being released (the kernel puts A back)" : "is disabled");
             if (X->sm.state == RDNA4DF_ACTIVE) rdna4x_off_locked(xi, RDNA4DF_R_KILL, "kill switch file present"); }
         rdna4x_tick_t tk = { .x_active = X->sm.state == RDNA4DF_ACTIVE, .killfile = 0, .status_gen_known = X->gen_known, .status_gen = X->gen, .recopy_pending = X->xs.recopy_pending };
@@ -609,7 +609,7 @@ GARNET_INTERNAL void rdna4s_prebind_on_radv_open(void) {
     pthread_mutex_lock(&RDNA4S.mu);
     if (!RDNA4S.bound && RDNA4S.sm.state == RDNA4DF_UNBOUND && !RDNA4S.preallocBytes) {
         struct stat sb;
-        if (stat(RDNA4_NOFLIP_FILE, &sb) != 0) {
+        if (rdna4_sb_stat(RDNA4_NOFLIP_FILE, &sb) != 0) {
             rdna4s_query_t fq = (rdna4s_query_t)dlsym(RDNA4R.lib, "radv_darwin_scanout_query");
             struct rdna4n_scan_query q; memset(&q, 0, sizeof q);
             if (fq && fq(RDNA4R.dev, &q) == 0 && (q.flags & RDNA4N_SCANQ_GEOM_OK) && q.plane_w && q.plane_h && q.pitch_px >= q.plane_w) {
@@ -812,7 +812,7 @@ GARNET_INTERNAL BOOL rdna4s_crc_on(void) {
     if (!rdna4_is_ws()) return NO;
     uint64_t now = rdna4_now(), nx = atomic_load(&RDNA4C.next);
     if (now >= nx && atomic_compare_exchange_strong(&RDNA4C.next, &nx, now + 2000000000ull)) {
-        int fd = open(RDNA4_CRC_FILE, O_RDONLY | O_CLOEXEC), was = atomic_load(&RDNA4C.on);
+        int fd = rdna4_sb_open_ro(RDNA4_CRC_FILE, O_RDONLY | O_CLOEXEC), was = atomic_load(&RDNA4C.on);
         if (fd >= 0) {
             char b[48] = { 0 }; ssize_t n = read(fd, b, sizeof b - 1); close(fd); long v = n > 0 ? atol(b) : 0;
             atomic_store(&RDNA4C.noslot, n > 0 && strstr(b, "noslot") != NULL);
@@ -891,7 +891,7 @@ GARNET_INTERNAL void rdna4cbl_sids(char *o, size_t cap, const uint32_t *a, uint3
 }
 static uint64_t rdna4cbl_wall(void) { return clock_gettime_nsec_np(CLOCK_REALTIME); }
 static void rdna4cbl_poll(void) {   // 1 s timer
-    struct stat sb; int want = stat(RDNA4_CBLOG_FLAG, &sb) == 0;
+    struct stat sb; int want = rdna4_sb_stat(RDNA4_CBLOG_FLAG, &sb) == 0;
     pthread_mutex_lock(&RDNA4CB.mu);
     if (want && !atomic_load(&RDNA4CB.on) && !RDNA4CB.capped) {
         char path[96]; snprintf(path, sizeof path, "/private/var/tmp/garnet-cblog.%d.txt", (int)getpid());
@@ -925,6 +925,7 @@ static dispatch_source_t rdna4cbl_timer;   // kept alive for the process (a loca
 GARNET_INTERNAL void rdna4cbl_start(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        if (!rdna4_sb_can_stat(RDNA4_CBLOG_FLAG)) return;
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
         dispatch_source_set_event_handler(t, ^{ rdna4cbl_poll(); });
@@ -1276,7 +1277,7 @@ static BOOL rdna4_capture_on(void) {
     uint64_t now = rdna4_now(), due = atomic_load(&next);
     if (now >= due && atomic_compare_exchange_strong(&next, &due, now + NSEC_PER_SEC)) {
         struct stat st;
-        atomic_store(&enabled, lstat(RDNA4_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
+        atomic_store(&enabled, rdna4_sb_lstat(RDNA4_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
             (st.st_uid == 0 || st.st_uid == geteuid()));
     }
     return atomic_load(&enabled) != 0;
@@ -1343,6 +1344,9 @@ GARNET_INTERNAL void rdna4_capture_surfaces(NSArray *textures, uint64_t cbid) {
 #ifndef RDNA4_PRESENT_FULL_FLAG
 #define RDNA4_PRESENT_FULL_FLAG "/private/tmp/garnet-present-full"
 #endif
+#ifdef GARNET_PRESENT_CAPTURE_ONLY
+#define rdna4_sb_lstat lstat
+#endif
 static BOOL rdna4_capture_scan_matches(const struct rdna4n_scan_status *status, int slot, uint64_t presentId) {
     return status->acquired && !status->flags && status->presents == presentId &&
         status->front_slot == (uint32_t)slot &&
@@ -1355,7 +1359,7 @@ static BOOL rdna4_present_capture_on(void) {
     uint64_t now = rdna4_now(), due = atomic_load(&next);
     if (now >= due && atomic_compare_exchange_strong(&next, &due, now + NSEC_PER_SEC)) {
         struct stat st;
-        atomic_store(&enabled, lstat(RDNA4_PRESENT_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
+        atomic_store(&enabled, rdna4_sb_lstat(RDNA4_PRESENT_CAPTURE_FLAG, &st) == 0 && S_ISREG(st.st_mode) &&
             (st.st_uid == 0 || st.st_uid == geteuid()));
     }
     return atomic_load(&enabled) != 0;
@@ -1393,7 +1397,7 @@ static void rdna4_capture_present(int inst, int slot, uint32_t sid, uint64_t seq
     const uint64_t now = rdna4_now();
     if (now < atomic_load(&next) || atomic_exchange(&writing, 1)) return;
     struct stat flagStat;
-    const BOOL full = lstat(RDNA4_PRESENT_FULL_FLAG, &flagStat) == 0 && S_ISREG(flagStat.st_mode) &&
+    const BOOL full = rdna4_sb_lstat(RDNA4_PRESENT_FULL_FLAG, &flagStat) == 0 && S_ISREG(flagStat.st_mode) &&
         (flagStat.st_uid == 0 || flagStat.st_uid == geteuid());
     atomic_store(&next, now + (full ? 5 * NSEC_PER_SEC : NSEC_PER_SEC / 2));
     const uint32_t width = RDNA4S.pw, height = RDNA4S.ph, kernelSlot = RDNA4S.sid[slot];

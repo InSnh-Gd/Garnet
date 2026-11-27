@@ -34,6 +34,10 @@ __attribute__((constructor)) static void rdna4_cienv_ctor(void) {
 // real directory owned by the caller, rdna4g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
 // account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (garnet_dumpacl.h); a failed grant is logged and the dump still happens.
 GARNET_INTERNAL int rdna4_dump_dir_ready(char *sub, size_t subn) {
+    if (!rdna4_sb_can_stat(RDNA4G_DUMP_DIR) || !rdna4_sb_can_write(RDNA4G_DUMP_DIR)) {
+        RDNA4_ONCE("dump: " RDNA4G_DUMP_DIR " is blocked by sandbox: skipped");
+        return 0;
+    }
     (void)mkdir(RDNA4G_DUMP_DIR, RDNA4G_DUMP_ROOT_MODE);
     struct stat rs; memset(&rs, 0, sizeof rs);
     int rrc = lstat(RDNA4G_DUMP_DIR, &rs);
@@ -149,13 +153,17 @@ GARNET_INTERNAL NSError *rdna4_dump_pipeline(MTLRenderPipelineDescriptor *d, BOO
 #ifndef RDNA4_SHADER_CAPTURE_FLAG
 #define RDNA4_SHADER_CAPTURE_FLAG "/private/tmp/garnet-shader-capture"
 #endif
+#ifdef GARNET_SHADER_REQUEST_CAPTURE_ONLY
+#define rdna4_sb_lstat lstat
+#define rdna4_sb_open_ro open
+#endif
 static int rdna4x_capture_request(NSString *directory, NSString *sha, NSString *name,
     const char *role, NSData *air, NSArray *dependencies) {
     struct stat flag;
-    if (lstat(RDNA4_SHADER_CAPTURE_FLAG, &flag) || !S_ISREG(flag.st_mode) ||
+    if (rdna4_sb_lstat(RDNA4_SHADER_CAPTURE_FLAG, &flag) || !S_ISREG(flag.st_mode) ||
         (flag.st_uid != 0 && flag.st_uid != geteuid()) || !directory || !sha || !air.length) return 0;
     char requested[65];
-    int marker = open(RDNA4_SHADER_CAPTURE_FLAG, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int marker = rdna4_sb_open_ro(RDNA4_SHADER_CAPTURE_FLAG, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (marker < 0) return 0;
     ssize_t count = read(marker, requested, sizeof requested);
     close(marker);
@@ -196,10 +204,10 @@ static void rdna4x_gate_read(void) {
     if (!RDNA4XL.gateDone) {
         RDNA4XL.gateDone = 1;
         if (!rdna4_is_ws()) {   // WindowServer never reads these: it never applies
-            struct stat st; const int rc = stat(RDNA4X_KILL_FILE, &st), er = errno;
+            struct stat st; const int rc = rdna4_sb_stat(RDNA4X_KILL_FILE, &st), er = errno;
             RDNA4XL.killed = rdna4x_killed_from_stat(rc, er);
             RDNA4XL.envDirty = rdna4x_env_dirty(*_NSGetEnviron());
-            if (RDNA4XL.killed) RDNA4LOG("inproc: kill file " RDNA4X_KILL_FILE " %s: in-process translation is OFF for this process", rc == 0 ? "exists" : "could not be read (fail closed)");
+            if (RDNA4XL.killed) RDNA4LOG_WARN("inproc: kill file " RDNA4X_KILL_FILE " %s: in-process translation is OFF for this process", rc == 0 ? "exists" : "could not be read (fail closed)");
             if (RDNA4XL.envDirty) RDNA4LOG("inproc: a " RDNA4X_ENV_PREFIX "* variable is set: in-process translation is OFF for this process");
         }
     }
@@ -1719,8 +1727,13 @@ GARNET_INTERNAL NSArray<NSString *> *rdna4_spv_dirs(void) {
         if (!(rdna4_allow() && h && !strcmp(h, "1"))) bundleOnly = @[ [[[NSBundle bundleForClass:[GarnetDevice class]] resourcePath] stringByAppendingPathComponent:@"spvcache"] ];
         else bundleOnly = @[];
     });
+    static BOOL sideReadable; static dispatch_once_t sideOnce;
+    dispatch_once(&sideOnce, ^{
+        const char *sd = rdna4_side_dir().fileSystemRepresentation;
+        sideReadable = rdna4_sb_can_stat(sd) && rdna4_sb_can_read(sd);
+    });
     NSString *u = rdna4x_user_dir();                                   // nil unless this process translates in process
-    const BOOL skipSide = u && rdna4x_skip_side_dir(rdna4_is_ws(), rdna4x_sandboxed());
+    const BOOL skipSide = !sideReadable || (u && rdna4x_skip_side_dir(rdna4_is_ws(), rdna4x_sandboxed()));
     const int idx = (u ? 1 : 0) | (skipSide ? 2 : 0);
     @synchronized ([GarnetDevice class]) {
         if (!a[idx] || (u && ![userFor isEqualToString:u])) {
@@ -2617,7 +2630,7 @@ static int64_t rdna4hs_wall_ns(void) { struct timespec t; clock_gettime(CLOCK_RE
 // First lookup directory holding a usable file (same order and sanity as the creation-time lookup).
 static rdna4hs_obs rdna4hs_stat_path(NSString *path) {
     struct stat fileStat;
-    if (stat(path.fileSystemRepresentation, &fileStat) || !S_ISREG(fileStat.st_mode) || fileStat.st_size <= 0)
+    if (rdna4_sb_stat(path.fileSystemRepresentation, &fileStat) || !S_ISREG(fileStat.st_mode) || fileStat.st_size <= 0)
         return (rdna4hs_obs){0};
     return (rdna4hs_obs){1, (uint64_t)fileStat.st_size,
         (int64_t)fileStat.st_mtimespec.tv_sec * 1000000000LL + fileStat.st_mtimespec.tv_nsec};
@@ -2687,6 +2700,7 @@ GARNET_INTERNAL BOOL rdna4_sync_wait(const char *what, NSArray<NSString *> *shas
     if (queue < 0) { rdna4_sync_end(NO, NO); return NO; }
     NSMutableArray<NSNumber *> *fds = [NSMutableArray array];
     for (NSString *dir in rdna4_spv_dirs()) {
+        if (!rdna4_sb_can_stat(dir.fileSystemRepresentation)) continue;
         int fd = open(dir.fileSystemRepresentation, O_EVTONLY | O_CLOEXEC);
         if (fd < 0) continue;
         struct kevent change;
