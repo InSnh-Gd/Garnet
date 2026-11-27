@@ -218,6 +218,8 @@ static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
     caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
     if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress)
         caps.flags |= GARNETX_CAP_RT_PRIMITIVE_DATA;
+    if (RDNA4R.shaderInt64)
+        caps.flags |= GARNETX_CAP_NATIVE_INT64;
     return caps;
 }
 // Sets up <user cache dir>/org.garnet.xlate/<K> once, after admission (never inside rdna4_spv_dirs' dispatch_once). Caller holds RDNA4XL.mu.
@@ -1247,11 +1249,18 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
         return rdna4x_translate_stage2_to_cache(dir, sha, name, role, bc, lk, NULL, NULL, NULL, error);
     }
     rdna4x_engine_prepare();
-    const uint64_t now = rdna4_now();
-    const uint64_t leftMs = deadlineNs > now ? (deadlineNs - now) / 1000000ull : 0;
-    int waitMs = leftMs > RDNA4G_SYNC_WAIT_APP_MS ? RDNA4G_SYNC_WAIT_APP_MS : (int)leftMs;
-    const BOOL waiting = waitMs > 0 && rdna4_sync_begin(!rdna4_is_ws());
-    if (!waiting) waitMs = 0;   // enqueue even when the strikes budget is exhausted
+    const BOOL unlimited = (deadlineNs == UINT64_MAX && !rdna4_is_ws());
+    int waitMs;
+    BOOL waiting = NO;
+    if (unlimited) {
+        waitMs = -1;
+    } else {
+        const uint64_t now = rdna4_now();
+        const uint64_t leftMs = deadlineNs > now ? (deadlineNs - now) / 1000000ull : 0;
+        waitMs = leftMs > RDNA4G_SYNC_WAIT_APP_MS ? RDNA4G_SYNC_WAIT_APP_MS : (int)leftMs;
+        waiting = waitMs > 0 && rdna4_sync_begin(!rdna4_is_ws());
+        if (!waiting) waitMs = 0;   // enqueue even when the strikes budget is exhausted
+    }
     char err[256] = ""; const uint64_t t0 = rdna4_now();
     int rc = RDNA4X_E_IO;
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -3038,7 +3047,10 @@ static BOOL rdna4_ba_resolve_stage(id fn, const char *role, NSData **spvOut, NSD
     NSError *e = nil, *xe = nil;
     NSData *spv = rdna4_spv_lookup(fn, role, &e, &fname, &meta);
     if (!spv && e.code == 41 && rdna4x_active()) {
-        const uint64_t dl = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;
+        const BOOL isCompute = (role && strcmp(role, "kernel") == 0);
+        const uint64_t dl = (isCompute && !rdna4_is_ws())
+            ? UINT64_MAX
+            : (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull);
         if (rdna4x_translate_fn_with_error(fn, role, dl, &xe)) {
             e = nil; meta = nil;
             spv = rdna4_spv_lookup(fn, role, &e, &fname, &meta);

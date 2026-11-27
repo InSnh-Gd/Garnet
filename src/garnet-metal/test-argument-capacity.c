@@ -313,12 +313,31 @@ static void test_sampler_object_limits(void) {
             "sampler object addition overflow is rejected");
 }
 
+static void test_argument_descriptor_effective_count(void) {
+    require(rdna4_argument_descriptor_effective_count(0) == 1u,
+            "MTLArgumentDescriptor arrayLength == 0 defaults to single non-array element");
+    require(rdna4_argument_descriptor_effective_count(0) ==
+                rdna4_argument_descriptor_effective_count(1),
+            "arrayLength == 0 behaves identically to arrayLength == 1");
+    require(rdna4_argument_descriptor_effective_count(1) == 1u,
+            "arrayLength == 1 stays 1");
+    require(rdna4_argument_descriptor_effective_count(8) == 8u,
+            "arrayLength == 8 preserves array element count");
+    require(rdna4_argument_descriptor_effective_count(4096) == 4096u,
+            "arrayLength == 4096 stays at cap");
+    require(rdna4_argument_descriptor_effective_count(4097) == 4097u,
+            "arrayLength > 4096 passes through so layout validation rejects it");
+    require(rdna4_argument_descriptor_effective_count(UINT64_MAX) == UINT64_MAX,
+            "arrayLength == UINT64_MAX does not wrap");
+}
+
 int main(void) {
     test_shape_and_descriptor_counts();
     test_capacity_plan();
     test_token_limits();
     test_table_and_pool_limits();
     test_sampler_object_limits();
+    test_argument_descriptor_effective_count();
     printf("ARGUMENT_CAPACITY_PASS checks=%u gpu_execution=0\n", checks);
     return 0;
 }

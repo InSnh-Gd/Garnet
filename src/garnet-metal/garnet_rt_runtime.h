@@ -43,6 +43,9 @@
 #ifndef GARNETX_CAP_RT_PRIMITIVE_DATA
 #define GARNETX_CAP_RT_PRIMITIVE_DATA       (1u << 11)
 #endif
+#ifndef GARNETX_CAP_NATIVE_INT64
+#define GARNETX_CAP_NATIVE_INT64            (1u << 12)
+#endif
 
 // Exact Wave 4.1 RT primitiveDataBuffer lookup table ABI (shared bit-for-bit with garnetxlate).
 #define RDNA4RT_PRIM_DATA_BINDING            UINT32_C(676)
@@ -1020,8 +1023,65 @@ static inline rdna4rtr_status_t rdna4rtr_parse_ift_json(const char *json, size_t
 // =================================================================================================
 // 5. AIR/LLVM IR Intersection Function Kind Inference (for Stage 3 garnetx_translate_stage3)
 // =================================================================================================
+static inline int rdna4rtr_slice_has_lit(const char *beg, const char *end,
+                                         const char *lit, size_t lit_len) {
+    if (!beg || !end || end < beg || (size_t)(end - beg) < lit_len) return 0;
+    const char *lim = end - lit_len;
+    for (const char *q = beg; q <= lim; q++) {
+        if (memcmp(q, lit, lit_len) == 0) return 1;
+    }
+    return 0;
+}
+
+static inline int rdna4rtr_meta_line_has_sym(const char *beg, const char *end,
+                                             const char *fn_name, size_t nlen) {
+    for (const char *q = beg; q < end; q++) {
+        if (*q != '@') continue;
+        const char *sym = q + 1;
+        int quoted = (sym < end && *sym == '"');
+        if (quoted) sym++;
+        const size_t need = nlen + (quoted ? 1u : 0u);
+        if ((size_t)(end - sym) < need) continue;
+        if (memcmp(sym, fn_name, nlen) != 0) continue;
+        if (quoted && sym[nlen] != '"') continue;
+        const char *after = sym + need;
+        if (after == end || *after == ',' || *after == ' ' || *after == '\t' ||
+            *after == '}' || *after == '\r')
+            return 1;
+    }
+    return 0;
+}
+
+// Returns 1 if an anonymous struct return slice `{ ... }` / `<{ ... }>` contains only 1..2 `i1`
+// fields (e.g. Cycles' `<{ i1, i1 }>` `{ accept_intersection, continue_search }` triangle return
+// struct, with no `float` distance field).
+static inline int rdna4rtr_ret_struct_is_bool_only(const char *ret_beg, size_t r) {
+    const char *lb = NULL, *rb = NULL;
+    for (size_t k = 0; k < r; k++) {
+        if (ret_beg[k] == '{' && !lb) lb = ret_beg + k;
+        else if (ret_beg[k] == '}') rb = ret_beg + k;
+    }
+    if (!lb || !rb || rb <= lb + 1) return 0;
+    const char *cur = lb + 1;
+    unsigned nfields = 0u;
+    while (cur < rb) {
+        while (cur < rb && (*cur == ' ' || *cur == '\t')) cur++;
+        const char *fstart = cur;
+        while (cur < rb && *cur != ',') cur++;
+        const char *fend = cur;
+        while (fend > fstart && (fend[-1] == ' ' || fend[-1] == '\t')) fend--;
+        if ((size_t)(fend - fstart) != 2u || memcmp(fstart, "i1", 2u) != 0) return 0;
+        nfields++;
+        if (cur < rb && *cur == ',') cur++;
+    }
+    return (nfields >= 1u && nfields <= 2u) ? 1 : 0;
+}
+
 // Inspects LLVM IR text for a linked [[intersection(...)]] function to classify it as
 // GARNETX_IFT_KIND_BOUNDING_BOX (0) or GARNETX_IFT_KIND_TRIANGLE_ANY_HIT (1).
+// Checks authoritative `!air.intersection` metadata (`!"air.triangle"` vs `!"air.bounding_box"`)
+// FIRST before falling back to `define` return-type heuristics (`i1` / `<{ i1, i1 }>` -> triangle,
+// `{ i1, float }` / `<{ i1, i1, float }>` / `%struct` / `sret` -> bounding_box).
 // Returns 1 if inferred unambiguously, 0 if ambiguous (caller defaults to BOUNDING_BOX or errors).
 static inline int rdna4rtr_infer_ift_kind_from_ir(const char *ir, size_t ir_len,
                                                   const char *fn_name, uint32_t *kind_out) {
@@ -1029,10 +1089,33 @@ static inline int rdna4rtr_infer_ift_kind_from_ir(const char *ir, size_t ir_len,
     const size_t nlen = strlen(fn_name);
     const char *end = ir + ir_len;
 
-    // 1) Scan `define ... @<fn_name>(` header line:
-    //    - `[[intersection(triangle, ...)]]` returns `i1` (bool accept)
-    //    - `[[intersection(bounding_box, ...)]]` returns struct `{ i1, float }` or `bounding_box_result`
+    // 1) Authoritative AIR metadata check FIRST: inspect metadata entries referencing @fn_name
+    //    for exact quoted geometry tags (`!"air.triangle"` / `!"triangle"` vs
+    //    `!"air.bounding_box"` / `!"bounding_box"`). Exact quoted matching avoids confusing
+    //    `!"air.triangle_data"` (present on bounding_box/curve signatures) with `!"air.triangle"`.
     const char *p = ir;
+    while (p < end) {
+        const char *line_end = (const char *)memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) line_end = end;
+        if (*p == '!' && rdna4rtr_meta_line_has_sym(p, line_end, fn_name, nlen)) {
+            if (rdna4rtr_slice_has_lit(p, line_end, "!\"air.bounding_box\"", 19u) ||
+                rdna4rtr_slice_has_lit(p, line_end, "!\"bounding_box\"", 15u)) {
+                *kind_out = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
+                return 1;
+            }
+            if (rdna4rtr_slice_has_lit(p, line_end, "!\"air.triangle\"", 15u) ||
+                rdna4rtr_slice_has_lit(p, line_end, "!\"triangle\"", 11u)) {
+                *kind_out = RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT;
+                return 1;
+            }
+        }
+        p = (line_end < end) ? (line_end + 1) : end;
+    }
+
+    // 2) Fallback: scan `define ... @<fn_name>(` header line return type:
+    //    - `i1` or `<{ i1, i1 }>` / `{ i1, i1 }` (no float distance) -> TRIANGLE_ANY_HIT
+    //    - `{ i1, float }` / `<{ i1, i1, float }>` / `%struct...` / `sret` -> BOUNDING_BOX
+    p = ir;
     while (p < end) {
         const char *line_end = (const char *)memchr(p, '\n', (size_t)(end - p));
         if (!line_end) line_end = end;
@@ -1060,12 +1143,21 @@ static inline int rdna4rtr_infer_ift_kind_from_ir(const char *ir, size_t ir_len,
                         *kind_out = RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT;
                         return 1;
                     }
-                    // Aggregate/struct return (`{ i1, float }` or `%struct...`) is bounding_box.
+                    // Aggregate/struct return: bool-only `{ i1, i1 }` / `<{ i1, i1 }>` (accept +
+                    // continue_search, no float distance) is triangle; `{ i1, float }`,
+                    // `<{ i1, i1, float }>`, or named `%struct...` is bounding_box.
+                    int has_pct = 0, has_brace = 0;
                     for (size_t k = 0; k < r; k++) {
-                        if (ret_beg[k] == '%' || ret_beg[k] == '{') {
-                            *kind_out = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
-                            return 1;
-                        }
+                        if (ret_beg[k] == '%') has_pct = 1;
+                        else if (ret_beg[k] == '{') has_brace = 1;
+                    }
+                    if (!has_pct && has_brace && rdna4rtr_ret_struct_is_bool_only(ret_beg, r)) {
+                        *kind_out = RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT;
+                        return 1;
+                    }
+                    if (has_pct || has_brace) {
+                        *kind_out = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
+                        return 1;
                     }
                     // `void` with `sret` parameter is also an aggregate bounding_box return.
                     const char *arg_beg = sym + nlen + (quoted ? 2u : 1u);
@@ -1074,35 +1166,6 @@ static inline int rdna4rtr_infer_ift_kind_from_ir(const char *ir, size_t ir_len,
                             *kind_out = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
                             return 1;
                         }
-                    }
-                }
-            }
-        }
-        p = (line_end < end) ? (line_end + 1) : end;
-    }
-
-    // 2) Fallback: check AIR metadata markers mentioning both function name and geometry tag.
-    p = ir;
-    while (p < end) {
-        const char *line_end = (const char *)memchr(p, '\n', (size_t)(end - p));
-        if (!line_end) line_end = end;
-        if (*p == '!') {
-            // Look for fn_name on the same metadata line.
-            int has_fn = 0;
-            for (const char *q = p; q + nlen <= line_end; q++) {
-                if (memcmp(q, fn_name, nlen) == 0) { has_fn = 1; break; }
-            }
-            if (has_fn) {
-                for (const char *q = p; q + 12u <= line_end; q++) {
-                    if (memcmp(q, "bounding_box", 12u) == 0) {
-                        *kind_out = RDNA4RTR_IFT_KIND_BOUNDING_BOX;
-                        return 1;
-                    }
-                }
-                for (const char *q = p; q + 8u <= line_end; q++) {
-                    if (memcmp(q, "triangle", 8u) == 0) {
-                        *kind_out = RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT;
-                        return 1;
                     }
                 }
             }
@@ -1530,9 +1593,12 @@ static inline rdna4rtr_status_t rdna4rtr_plan_as_bda_encode(
         out->is_null = 1u;
         return RDNA4RTR_OK;
     }
-    rdna4rtr_as_kind_t want = (field_kind == RDNA4RTR_ARG_KIND_INSTANCE_AS)
-        ? RDNA4RTR_AS_KIND_INSTANCE : RDNA4RTR_AS_KIND_PRIMITIVE;
-    if (as_kind != RDNA4RTR_AS_KIND_UNKNOWN && as_kind != want)
+    // Apple Metal accepts both BLAS (primitive) and TLAS (instance) handles in either
+    // MTLDataTypeInstanceAccelerationStructure (118) or MTLDataTypePrimitiveAccelerationStructure (117)
+    // argument-buffer slots; both encode as opaque 64-bit GPU acceleration structure addresses.
+    if (as_kind != RDNA4RTR_AS_KIND_UNKNOWN &&
+        as_kind != RDNA4RTR_AS_KIND_PRIMITIVE &&
+        as_kind != RDNA4RTR_AS_KIND_INSTANCE)
         return RDNA4RTR_ERR_KIND_MISMATCH;
     if (as_device_address == 0u) return RDNA4RTR_ERR_NULL_HANDLE;
     out->encoded_u64 = as_device_address;

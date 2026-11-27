@@ -83,7 +83,8 @@ static inline int rdna4s_widen_fragment_output(const uint32_t *words, size_t *co
         }
         pos += width;
     }
-    if (!float16 || entries != 1 || !stores || !functions || stores > 0x3fffffu - module->bound - 8) return 0;
+    if (!float16 || entries != 1 || !stores || !functions ||
+        module->bound >= 0x3fffffu - 8u || stores > (size_t)(0x3fffffu - 8u - module->bound)) return 0;
     for (size_t idx = 0; idx < output_count; idx++)
         if (!outputs[idx].declaration) return 0;
     const size_t max_type_words = 3 + 4 * (3 + 4);

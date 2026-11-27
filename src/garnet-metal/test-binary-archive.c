@@ -460,10 +460,13 @@ static void test_large_payload_and_bounds(void) {
           v.vk_cache_size == vk_sz && memcmp(v.vk_cache, vk, vk_sz) == 0, "2.56 MiB verified");
 
     // Bounds enforcement: over RDNA4BA_MAX_ENTRY_PAYLOAD rejected without allocation
+    CHECK("entry payload cap accommodates 64 MiB SPIR-V + meta + vk_cache",
+          RDNA4BA_MAX_ENTRY_PAYLOAD == (UINT64_C(80) << 20), "cap=%llu MiB",
+          (unsigned long long)(RDNA4BA_MAX_ENTRY_PAYLOAD >> 20));
     ev.spv0_size = (uint32_t)RDNA4BA_MAX_ENTRY_PAYLOAD;
     ev.meta0_size = 1u;
     ev.vk_cache_size = 0u;
-    CHECK("reject entry > MAX_ENTRY_PAYLOAD", rdna4ba_put(&a, &ev) == RDNA4BA_ERR_BOUNDS, ">32 MiB rejected");
+    CHECK("reject entry > MAX_ENTRY_PAYLOAD", rdna4ba_put(&a, &ev) == RDNA4BA_ERR_BOUNDS, ">80 MiB rejected");
 
     // Invalid compute with secondary stage rejected in rdna4ba_put
     ev.spv0_size = 64u; ev.meta0_size = 0u; ev.spv1 = spv; ev.spv1_size = 64u;
@@ -471,7 +474,7 @@ static void test_large_payload_and_bounds(void) {
 
     // Oversized archive vk_cache rejected
     CHECK("reject archive vk_cache > MAX_ENTRY_PAYLOAD",
-          rdna4ba_set_vk_cache(&a, spv, (size_t)RDNA4BA_MAX_ENTRY_PAYLOAD + 1u) == RDNA4BA_ERR_BOUNDS, ">32 MiB vk_cache");
+          rdna4ba_set_vk_cache(&a, spv, (size_t)RDNA4BA_MAX_ENTRY_PAYLOAD + 1u) == RDNA4BA_ERR_BOUNDS, ">80 MiB vk_cache");
 
     // Oversized deserialize buffer length rejected immediately
     rdna4ba_archive_t tmp;

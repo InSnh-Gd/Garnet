@@ -1387,6 +1387,23 @@ GARNET_INTERNAL void rdna4_gpl_prewarm_start(void) {
 // ---------------------------------------------------------------------------------------------------------------
 
 static _Atomic uint64_t rdna4_icb_compute_pso_seq;
+// Serialize heavy (>= 1 MiB SPIR-V) vkCreateComputePipelines calls so concurrent
+// shader compile threads (e.g. Blender Cycles) do not multiply peak RADV/ACO RAM
+// on 16 GiB systems. Strictly a leaf lock (order: PSO._lock -> rdna4_heavy_compute_pipe_mu);
+// NEVER acquires any PSO _lock or other GarnetMetal mutex while held.
+#define RDNA4_HEAVY_COMPUTE_SPV_BYTES (1u << 20)
+static pthread_mutex_t rdna4_heavy_compute_pipe_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static VkResult rdna4_create_compute_pipeline_guarded(
+    VkDevice dev, VkPipelineCache pc, const VkComputePipelineCreateInfo *ci,
+    size_t spvBytes, VkPipeline *out) {
+    const BOOL serialize = (spvBytes >= RDNA4_HEAVY_COMPUTE_SPV_BYTES);
+    if (serialize) pthread_mutex_lock(&rdna4_heavy_compute_pipe_mu);
+    VkResult r = vkCreateComputePipelines(dev, pc, 1, ci, NULL, out);
+    if (serialize) pthread_mutex_unlock(&rdna4_heavy_compute_pipe_mu);
+    return r;
+}
+
 static pthread_mutex_t rdna4_icb_compute_reg_mu = PTHREAD_MUTEX_INITIALIZER;
 static NSHashTable *rdna4_icb_compute_reg;
 
@@ -1531,7 +1548,9 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     if (!fname) fname = @"?";
     NSError *e = nil;
     if (!rdna4_radv_open(err)) return nil;
-    const uint64_t deadline = rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull;
+    const uint64_t deadline = rdna4_is_ws()
+        ? (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_WS_MS * 1000000ull)
+        : UINT64_MAX;
     NSDictionary *preMeta = meta;
     spv = rdna4_gpu_argument_spv(spv, &meta, deadline, err);
     if (!spv) return nil;
@@ -1615,12 +1634,14 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
     NSValue *v = _variants[k];
     if (!v) {
         VkShaderModule module = _sm;
+        size_t spvBytes = _spv.length;
         if (_mode && indirect) {
             uint32_t *words = NULL; size_t count = 0; char why[256] = "";
             if (rdna4s_indirect_compute(_spv.bytes, _spv.length / 4, _pcOff, l, &words, &count, why, sizeof why)) {
                 RDNA4LOG("indirect compute transformation: %s", why); [_lock unlock]; return VK_NULL_HANDLE;
             }
-            module = rdna4_spv_module(words, count * 4, "indirect kernel", NULL);
+            spvBytes = count * 4u;
+            module = rdna4_spv_module(words, spvBytes, "indirect kernel", NULL);
             free(words);
             if (!module) { [_lock unlock]; return VK_NULL_HANDLE; }
         }
@@ -1633,7 +1654,7 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
 #ifdef RDNA4_BINARY_ARCHIVE_IMPL_INC
         pc = rdna4_ba_vkcache();
 #endif
-        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = vkCreateComputePipelines(RDNA4R.dev, pc, 1, &ci, NULL, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
+        VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = rdna4_now(); VkResult r = rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, spvBytes, &p); rdna4t_add(&T1.cmp, rdna4_now() - t_); atomic_fetch_add(&rdna4_pipes_new, 1);
         if (module != _sm) vkDestroyShaderModule(RDNA4R.dev, module, NULL);
         if (r != VK_SUCCESS) RDNA4LOG("vkCreateComputePipelines(local %u,%u,%u) = %d", l[0], l[1], l[2], r);
         else {
@@ -1794,7 +1815,7 @@ GARNET_INTERNAL NSArray *rdna4_icb_compute_reg_for_device(id dev) {
 #endif
         VkPipeline p = VK_NULL_HANDLE;
         uint64_t t_ = rdna4_now();
-        VkResult r = vkCreateComputePipelines(RDNA4R.dev, pc, 1, &ci, NULL, &p);
+        VkResult r = rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, count * 4u, &p);
         rdna4t_add(&T1.cmp, rdna4_now() - t_);
         atomic_fetch_add(&rdna4_pipes_new, 1);
         vkDestroyShaderModule(RDNA4R.dev, module, NULL);

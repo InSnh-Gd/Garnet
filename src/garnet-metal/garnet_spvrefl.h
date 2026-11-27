@@ -46,13 +46,17 @@ typedef struct {
 } RDNA4sMod;
 
 
+#define RDNA4S_MAX_ID_BOUND (8u * 1024u * 1024u)
+
 static inline int rdna4s_parse(const uint32_t *w, size_t nw, RDNA4sMod *m, char *why, size_t whyn)
 {
    memset(m, 0, sizeof *m);
+   if (!w || nw < 5) { snprintf(why, whyn, "truncated SPIR-V header"); return 1; }
    if (w[0] != 0x07230203) { snprintf(why, whyn, "bad SPIR-V magic"); return 1; }
    m->bound = w[3];
-   if (m->bound > 1000000) { snprintf(why, whyn, "id bound %u", m->bound); return 1; }
-   m->id = calloc(m->bound + 1, sizeof(RDNA4sId));
+   if (m->bound > RDNA4S_MAX_ID_BOUND) { snprintf(why, whyn, "id bound %u", m->bound); return 1; }
+   m->id = calloc((size_t)m->bound + 1u, sizeof(RDNA4sId));
+   if (!m->id) { snprintf(why, whyn, "oom id bound %u", m->bound); return 1; }
    for (uint32_t i = 0; i <= m->bound; i++) { m->id[i].set = m->id[i].bind = m->id[i].loc = m->id[i].builtin = -1; }
    /* pass 1: decorations and definitions (decorations may precede type defs, so member arrays are sized lazily) */
    size_t p = 5;

@@ -55,6 +55,8 @@ static const char SHA_A[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 static const char SHA_B[] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 static const char SHA_C[] = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static const char SHA_D[] = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+static const char SHA_E[] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+static const char SHA_F[] = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 // ---- fake dependencies ----
 static struct {
@@ -82,8 +84,17 @@ static int fk_xl(void *c, const char *ll, size_t llLen, const uint32_t *local, u
     return 0;
 }
 static void fk_release(void *c, uint8_t *p, size_t n) { (void)c; (void)n; FK.relCalls++; free(p); }
+static int fk_lower(void *c, const uint8_t *spv, size_t sl, const uint8_t *meta, size_t ml,
+    uint8_t **code, size_t *cl, uint8_t **json, size_t *jl, char *e, size_t en) {
+    (void)c; (void)e; (void)en;
+    if (FK.delayMs) usleep((useconds_t)FK.delayMs * 1000);
+    *code = malloc(sl); *json = malloc(ml);
+    if (!*code || !*json) { free(*code); free(*json); *code = NULL; *json = NULL; return 3; }
+    memcpy(*code, spv, sl); memcpy(*json, meta, ml); *cl = sl; *jl = ml;
+    return 0;
+}
 static const rdna4x_deps FDEPS = { .air_to_text = fk_air, .free_text = fk_free_text,
-    .translate = fk_xl, .release = fk_release };
+    .translate = fk_xl, .release = fk_release, .lower_arguments = fk_lower };
 static int fk_job(const char *dir, const char *sha, const char *name, char *err, size_t en) {
     static const uint8_t air[16] = "BC\xc0\xde-----------";
     return rdna4x_translate_job(&FDEPS, dir, sha, name, air, sizeof air, err, en);
@@ -170,6 +181,14 @@ int main(int argc, char **argv) {
         CC_SHA256_Update(&old, ov, 32); CC_SHA256_Update(&old, "26A434", 6);
         uint8_t oldDigest[32]; char oldKey[17]; CC_SHA256_Final(oldDigest, &old); rdna4x_hex(oldKey, oldDigest, 8);
         CHECK("key: old address-only generation cannot reuse a BDA64 translation", strcmp(k0, oldKey) != 0);
+        {
+            rdna4x_backend_capabilities c0 = rdna4x_query_caps(1, 1, 32, 0x10, 0x80);
+            rdna4x_backend_capabilities c1 = c0; c1.flags |= (1u << 12);   // GARNETX_CAP_NATIVE_INT64
+            char kc0[17], kc1[17];
+            rdna4x_key_with_capabilities(kc0, xl, rd, ov, "26A434", &c0);
+            rdna4x_key_with_capabilities(kc1, xl, rd, ov, "26A434", &c1);
+            CHECK("key: GARNETX_CAP_NATIVE_INT64 (1<<12) changes the cache key", strcmp(kc0, kc1) != 0);
+        }
         CHECK("rdna4x_key_ok: rejects upper case, short, long, non-hex", !rdna4x_key_ok("ABCDEF0123456789") && !rdna4x_key_ok("abc") && !rdna4x_key_ok("0123456789abcdef0") && !rdna4x_key_ok("0123456789abcdeg") && !rdna4x_key_ok(NULL));
     }
 
@@ -193,8 +212,8 @@ int main(int argc, char **argv) {
     // ===== T1.4 caps =====
     CHECK("caps: bitcode 4 bytes .. 4 MiB", !rdna4x_air_size_ok(0) && !rdna4x_air_size_ok(3) && rdna4x_air_size_ok(4) && rdna4x_air_size_ok(4u << 20) && !rdna4x_air_size_ok((4u << 20) + 1));
     CHECK("caps: LLVM text 1 .. 64 MiB", !rdna4x_ll_size_ok(0) && rdna4x_ll_size_ok(1) && rdna4x_ll_size_ok(64u << 20) && !rdna4x_ll_size_ok((64u << 20) + 1));
-    CHECK("caps: SPIR-V >= 20 bytes, word aligned, <= 16 MiB", !rdna4x_spv_size_ok(16) && !rdna4x_spv_size_ok(22) && rdna4x_spv_size_ok(20) && rdna4x_spv_size_ok(16u << 20) && !rdna4x_spv_size_ok((16u << 20) + 4));
-    CHECK("caps: the documented sizes", RDNA4X_MAX_AIR == 4u << 20 && RDNA4X_MAX_LL == 64u << 20 && RDNA4X_MAX_SPV == 16u << 20 && RDNA4X_CACHE_CAP == 256ull << 20 && RDNA4X_WORKER_STACK == (size_t)64u << 20);
+    CHECK("caps: SPIR-V >= 20 bytes, word aligned, <= 64 MiB (Cycles uber-shaders 17.4-26.7 MB)", !rdna4x_spv_size_ok(16) && !rdna4x_spv_size_ok(22) && rdna4x_spv_size_ok(20) && rdna4x_spv_size_ok(18u << 20) && rdna4x_spv_size_ok(28u << 20) && rdna4x_spv_size_ok(64u << 20) && !rdna4x_spv_size_ok((64u << 20) + 4));
+    CHECK("caps: the documented sizes", RDNA4X_MAX_AIR == 4u << 20 && RDNA4X_MAX_LL == 64u << 20 && RDNA4X_MAX_SPV == 64u << 20 && RDNA4X_CACHE_CAP == 512ull << 20 && RDNA4X_WORKER_STACK == (size_t)64u << 20);
 
     // ===== T1.5 the plan table =====
     {
@@ -429,7 +448,7 @@ int main(int argc, char **argv) {
         CHECK("job: LLVM text over the 64 MiB cap is refused before the translator runs", rc == RDNA4X_E_CAP && FK.xlCalls == 0 && file_exists(jf, SHA_D, RDNA4X_EXT_FAIL));
         char jg[1024]; snprintf(jg, sizeof jg, "%s/j5", TMP); mkd(jg);
         fk_reset(); FK.bigSpv = 1; rc = fk_job(jg, SHA_A, "k", err, sizeof err);
-        CHECK("job: SPIR-V over the 16 MiB cap is not installed", rc == RDNA4X_E_CAP && !file_exists(jg, SHA_A, RDNA4X_EXT_SPV) && file_exists(jg, SHA_A, RDNA4X_EXT_FAIL));
+        CHECK("job: SPIR-V over the 64 MiB cap is not installed", rc == RDNA4X_E_CAP && !file_exists(jg, SHA_A, RDNA4X_EXT_SPV) && file_exists(jg, SHA_A, RDNA4X_EXT_FAIL));
         fk_reset(); { uint8_t big[8]; rc = rdna4x_translate_job(&FDEPS, jg, SHA_B, "k", big, RDNA4X_MAX_AIR + 1, err, sizeof err); }
         CHECK("job: bitcode over the 4 MiB cap is refused before anything is written", rc == RDNA4X_E_CAP && FK.airCalls == 0 && !file_exists(jg, SHA_B, RDNA4X_EXT_INFLIGHT) && !file_exists(jg, SHA_B, RDNA4X_EXT_FAIL));
         fk_reset(); rc = rdna4x_translate_job(&FDEPS, jg, SHA_B, "k", (const uint8_t *)"abc", 3, err, sizeof err);
@@ -468,6 +487,19 @@ int main(int argc, char **argv) {
         CHECK("engine: wait 0 returns at once and the job still completes", rc == RDNA4X_E_TIMEOUT);
         for (int i = 0; i < 100 && !file_exists(ed, SHA_C, RDNA4X_EXT_SPV); i++) usleep(50000);
         CHECK("engine: ... completes in the background", file_exists(ed, SHA_C, RDNA4X_EXT_SPV));
+        // waitMs < 0 waits synchronously until done without timing out
+        fk_reset(); FK.delayMs = 150;
+        rc = rdna4x_engine_run(&eng, ed, SHA_E, "k", air, sizeof air, -1, err, sizeof err);
+        CHECK("engine: waitMs < 0 waits synchronously until translation completes (no E_TIMEOUT)",
+              rc == RDNA4X_OK && file_exists(ed, SHA_E, RDNA4X_EXT_SPV) && file_exists(ed, SHA_E, RDNA4X_EXT_META) && !file_exists(ed, SHA_E, RDNA4X_EXT_INFLIGHT));
+        {
+            uint8_t spv_in[64] = { 3, 2, 0x23, 7 };
+            const uint8_t meta_in[] = "{\"stage\":\"Kernel\"}";
+            fk_reset(); FK.delayMs = 150;
+            rc = rdna4x_engine_lower_arguments(&eng, ed, SHA_F, spv_in, sizeof spv_in, meta_in, sizeof meta_in - 1, -1, err, sizeof err);
+            CHECK("engine: waitMs < 0 waits synchronously for argument lowering (no E_TIMEOUT)",
+                  rc == RDNA4X_OK && file_exists(ed, SHA_F, RDNA4X_EXT_SPV) && file_exists(ed, SHA_F, RDNA4X_EXT_META) && !file_exists(ed, SHA_F, RDNA4X_EXT_INFLIGHT));
+        }
         // sharing: two callers for one sha are one translation
         fk_reset(); FK.delayMs = 300;
         struct share sh = { &eng, ed, -1 };

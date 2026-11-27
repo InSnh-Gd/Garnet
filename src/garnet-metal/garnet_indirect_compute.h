@@ -3,6 +3,8 @@
 
 #include "garnet_spvrefl.h"
 
+#define RDNA4I_MAX_WORDS (16u * 1024u * 1024u)
+
 /* Whole-group indirect dispatch gets its grid from the GPU, without CPU argument reads. */
 static inline int rdna4s_indirect_compute(const uint32_t *words, size_t count, uint32_t offset,
                                 const uint32_t local[3], uint32_t **output, size_t *output_count,
@@ -13,7 +15,7 @@ static inline int rdna4s_indirect_compute(const uint32_t *words, size_t count, u
     *output = NULL;
     *output_count = 0;
 #define RDNA4I_FAIL(message) do { snprintf(why, why_size, "%s", message); goto done; } while (0)
-    if (count < 5 || count > 1000000 || !local[0] || !local[1] || !local[2])
+    if (count < 5 || count > RDNA4I_MAX_WORDS || !local[0] || !local[1] || !local[2])
         RDNA4I_FAIL("invalid indirect compute module or local size");
     if (rdna4s_parse(words, count, &module, why, why_size)) goto done;
     if (!module.has_ep || module.ep_model != 5) RDNA4I_FAIL("indirect module is not a compute kernel");

@@ -155,6 +155,25 @@ int main(void) {
     CHECK(!rdna4_argument_descriptor_scan(v, f, 0, &usage));
     CHECK(!memcmp(&before, &usage, sizeof usage));
     free(v); free(f);
+
+    /* Large SPIR-V reflection ID bound (>1M for Cycles 26.7 MB shade_surface, capped at 8M) + header guard. */
+    {
+        RDNA4sMod mod = {0};
+        char why[128] = {0};
+        uint32_t trunc_hdr[4] = {0x07230203u, 0x00010500u, 0u, 16u};
+        CHECK(rdna4s_parse(trunc_hdr, 4u, &mod, why, sizeof why) != 0);
+        CHECK(rdna4s_parse(NULL, 5u, &mod, why, sizeof why) != 0);
+
+        uint32_t over_hdr[5] = {0x07230203u, 0x00010500u, 0u, RDNA4S_MAX_ID_BOUND + 1u, 0u};
+        CHECK(rdna4s_parse(over_hdr, 5u, &mod, why, sizeof why) != 0 &&
+              strstr(why, "id bound") != NULL);
+
+        uint32_t big_hdr[5] = {0x07230203u, 0x00010500u, 0u, 1500000u, 0u};
+        CHECK(rdna4s_parse(big_hdr, 5u, &mod, why, sizeof why) == 0 &&
+              mod.bound == 1500000u && mod.id != NULL);
+        rdna4s_free(&mod);
+    }
+
     printf("ARGUMENT_DESCRIPTOR_SCAN_PASS checks=%u production_reflection=1 shared_union=1 abi9_texel=1 overflow_rollback=1 gpu_execution=0\n", checks);
     return 0;
 }

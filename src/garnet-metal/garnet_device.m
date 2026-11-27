@@ -690,7 +690,10 @@ static void rdna4_census_log(void) {
     if (inproc) RDNA4LOG("compute pipeline: not in the bundle's spvcache (%s); trying the in-process translation", e.localizedDescription.UTF8String);
     else RDNA4LOG("compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
     const BOOL backendReady = !inproc || rdna4_radv_open(&inprocFailure);
-    if (inproc && backendReady && rdna4x_translate_fn_with_error(fn, "kernel", rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_APP_MS * 1000000ull, &inprocFailure)) {   // translate in process first; skip the daemon wait
+    const uint64_t computeDeadline = rdna4_is_ws()
+        ? (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_WS_MS * 1000000ull)
+        : UINT64_MAX;
+    if (inproc && backendReady && rdna4x_translate_fn_with_error(fn, "kernel", computeDeadline, &inprocFailure)) {   // translate in process first; skip the daemon wait
         NSError *e3 = nil;
         RDNA4ComputePipelineState *p3 = desc
             ? [[RDNA4ComputePipelineState alloc] initWithDevice:self descriptor:desc options:opts error:&e3]

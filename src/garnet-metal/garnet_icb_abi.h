@@ -950,6 +950,8 @@ static inline void rdna4_icbc_emit_op(rdna4_icbc_buf_t *out, uint16_t op, const 
  *   binding 676 slot[31] + BuiltIn NumWorkgroups (0 for tbase/gbase).
  * - For barrier-free shaders with binding 676, guards entry with gid < active_threads
  *   so non-multiple ConcurrentDispatchThreads never executes out-of-range lanes. */
+#define RDNA4IC_MAX_WORDS (16u * 1024u * 1024u)
+
 static inline int rdna4s_icb_compute_indirect(const uint32_t *words, size_t count,
                                               uint32_t offset, int is_dynamic,
                                               const uint32_t local[3],
@@ -962,7 +964,7 @@ static inline int rdna4s_icb_compute_indirect(const uint32_t *words, size_t coun
     *output = NULL;
     *output_count = 0;
 #define RDNA4IC_FAIL(msg) do { if (why && why_size) snprintf(why, why_size, "%s", (msg)); goto done; } while (0)
-    if (!words || count < 5u || count > 1000000u || !local || !local[0] || !local[1] || !local[2])
+    if (!words || count < 5u || count > RDNA4IC_MAX_WORDS || !local || !local[0] || !local[1] || !local[2])
         RDNA4IC_FAIL("invalid compute ICB module or local size");
     if (rdna4s_parse(words, count, &module, why, why_size)) goto done;
     if (!module.has_ep || module.ep_model != 5u) RDNA4IC_FAIL("ICB compute module is not GLCompute");

@@ -2141,6 +2141,7 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         RDNA4QueryCaps = queryCaps;
         RDNA4Caps = rdna4dc_from_properties(&caps);
         const rdna4dc_metal3_caps m3 = RDNA4Caps.metal3;
+        RDNA4R.shaderInt64 = (ef.shaderInt64 != VK_FALSE) ? YES : NO;
         RDNA4R.barycentric = m3.barycentric ? YES : NO;
         RDNA4R.atomicFloat = (m3.atomic_float_buffer || m3.atomic_float_shared || m3.atomic_float_image) ? YES : NO;
         RDNA4R.atomicFloat2 = m3.atomic_float_minmax ? YES : NO;

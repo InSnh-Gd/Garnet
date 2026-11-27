@@ -374,7 +374,35 @@ static void test_ir_kind_inference(void) {
         "  ret void\n"
         "}\n"
         "!42 = !{ptr @meta_only_box, !\"bounding_box\"}\n"
-        "!43 = !{ptr @meta_only_tri, !\"triangle\"}\n";
+        "!43 = !{ptr @meta_only_tri, !\"triangle\"}\n"
+        // Real Cycles Apple Clang 21 opaque-pointer AIR callbacks & !air.intersection metadata:
+        "define <{ i1, i1 }> @__intersection__tri(ptr addrspace(2) %lp, i32 %obj) local_unnamed_addr #0 {\n"
+        "  ret <{ i1, i1 }> <{ i1 true, i1 false }>\n"
+        "}\n"
+        "define <{ i1, i1 }> @__intersection__tri_shadow_all(ptr addrspace(2) %lp, i32 %obj) local_unnamed_addr #0 {\n"
+        "  ret <{ i1, i1 }> <{ i1 true, i1 true }>\n"
+        "}\n"
+        "define <{ i1, i1, float }> @__intersection__point(ptr addrspace(2) %lp, i32 %obj) local_unnamed_addr #0 {\n"
+        "  ret <{ i1, i1, float }> zeroinitializer\n"
+        "}\n"
+        "define <{ i1, i1 }> @__intersection__tri_nometa(i32 %prim) {\n"
+        "  ret <{ i1, i1 }> <{ i1 true, i1 false }>\n"
+        "}\n"
+        "define <{ i1, i1 }> @__intersection__curve(ptr addrspace(2) %lp, float %u) {\n"
+        "  ret <{ i1, i1 }> <{ i1 true, i1 false }>\n"
+        "}\n"
+        // Metadata precedence: %struct return overridden by explicit !"air.triangle" metadata.
+        "define %struct.tri_custom @meta_precedence_tri(i32 %p) {\n"
+        "  ret %struct.tri_custom zeroinitializer\n"
+        "}\n"
+        // Prefix disambiguation: @__intersection__tri_box_suffix must not hijack @__intersection__tri.
+        "!air.intersection = !{!14, !15, !16, !17, !18, !19}\n"
+        "!14 = !{ptr @__intersection__tri, !1, !2, !\"air.triangle\", !\"air.instancing\", !\"air.triangle_data\", !\"air.curve_data\", !\"air.extended_limits\"}\n"
+        "!15 = !{ptr @__intersection__tri_shadow_all, !1, !2, !\"air.triangle\", !\"air.instancing\", !\"air.triangle_data\", !\"air.curve_data\"}\n"
+        "!16 = !{ptr @__intersection__point, !1, !3, !\"air.bounding_box\", !\"air.instancing\", !\"air.triangle_data\", !\"air.curve_data\", !\"air.extended_limits\"}\n"
+        "!17 = !{ptr @__intersection__curve, !1, !2, !\"air.curve\", !\"air.instancing\", !\"air.triangle_data\", !\"air.curve_data\"}\n"
+        "!18 = !{ptr @meta_precedence_tri, !1, !2, !\"air.triangle\"}\n"
+        "!19 = !{ptr @__intersection__tri_box_suffix, !1, !3, !\"air.bounding_box\"}\n";
 
     // Allocate an exact non-NUL-terminated copy to verify strict length-bounded scanning under ASan.
     size_t slen = strlen(src);
@@ -395,6 +423,27 @@ static void test_ir_kind_inference(void) {
               kind == RDNA4RTR_IFT_KIND_BOUNDING_BOX, "metadata bounding_box fallback");
         CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "meta_only_tri", &kind) == 1 &&
               kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT, "metadata triangle fallback");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__tri", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
+              "Cycles __intersection__tri (<{ i1, i1 }> + !\"air.triangle\") -> TriangleAnyHit");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__tri_shadow_all", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
+              "Cycles __intersection__tri_shadow_all -> TriangleAnyHit");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__point", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_BOUNDING_BOX,
+              "Cycles __intersection__point (<{ i1, i1, float }> + !\"air.bounding_box\" + !\"air.triangle_data\") -> BoundingBox");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__tri_nometa", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
+              "<{ i1, i1 }> return without metadata -> TriangleAnyHit");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__curve", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
+              "Cycles __intersection__curve (!\"air.curve\" + <{ i1, i1 }>, ignoring !\"air.triangle_data\") -> TriangleAnyHit");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "meta_precedence_tri", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_TRIANGLE_ANY_HIT,
+              "!air.intersection !\"air.triangle\" metadata takes precedence over %struct return");
+        CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "__intersection__tri_box_suffix", &kind) == 1 &&
+              kind == RDNA4RTR_IFT_KIND_BOUNDING_BOX,
+              "symbol boundary matching distinguishes __intersection__tri_box_suffix from __intersection__tri");
         CHECK(rdna4rtr_infer_ift_kind_from_ir(raw, slen, "unknown_sym", &kind) == 0,
               "unknown symbol returns 0");
         free(raw);
@@ -606,10 +655,32 @@ static void test_as_descriptor_and_bda_planners(void) {
     CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_PRIMITIVE_AS, 0u, 8u, 64u,
                                       1, 0u, RDNA4RTR_AS_KIND_UNKNOWN, &bp) == RDNA4RTR_OK &&
           bp.encoded_u64 == 0u && bp.is_null == 1u,
-          "argbuf nil AS encodes 0");
+          "argbuf nil AS into PrimitiveAS slot encodes 0");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_INSTANCE_AS, 8u, 8u, 64u,
+                                      1, 0u, RDNA4RTR_AS_KIND_UNKNOWN, &bp) == RDNA4RTR_OK &&
+          bp.byte_offset == 8u && bp.encoded_u64 == 0u && bp.is_null == 1u,
+          "argbuf nil AS into InstanceAS slot encodes 0");
     CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_INSTANCE_AS, 0u, 8u, 64u,
-                                      0, bda, RDNA4RTR_AS_KIND_PRIMITIVE, &bp) == RDNA4RTR_ERR_KIND_MISMATCH,
-          "argbuf BLAS into InstanceAS field rejected");
+                                      0, bda, RDNA4RTR_AS_KIND_PRIMITIVE, &bp) == RDNA4RTR_OK &&
+          bp.byte_offset == 0u && bp.encoded_u64 == bda && bp.is_null == 0u,
+          "argbuf BLAS into InstanceAS (118) slot accepted (Cycles update_bvh blas_array)");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_PRIMITIVE_AS, 8u, 8u, 64u,
+                                      0, bda, RDNA4RTR_AS_KIND_INSTANCE, &bp) == RDNA4RTR_OK &&
+          bp.byte_offset == 8u && bp.encoded_u64 == bda && bp.is_null == 0u,
+          "argbuf TLAS into PrimitiveAS (117) slot accepted");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_PRIMITIVE_AS, 16u, 8u, 64u,
+                                      0, bda, RDNA4RTR_AS_KIND_PRIMITIVE, &bp) == RDNA4RTR_OK &&
+          bp.byte_offset == 16u && bp.encoded_u64 == bda && bp.is_null == 0u,
+          "argbuf BLAS into PrimitiveAS (117) slot accepted");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_NONE, 0u, 8u, 64u,
+                                      0, bda, RDNA4RTR_AS_KIND_PRIMITIVE, &bp) == RDNA4RTR_ERR_INVALID,
+          "argbuf non-AS (NONE) field kind rejected");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_IFT, 0u, 8u, 64u,
+                                      0, bda, RDNA4RTR_AS_KIND_INSTANCE, &bp) == RDNA4RTR_ERR_INVALID,
+          "argbuf non-AS (IFT) field kind rejected");
+    CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_INSTANCE_AS, 0u, 8u, 64u,
+                                      0, bda, (rdna4rtr_as_kind_t)99, &bp) == RDNA4RTR_ERR_KIND_MISMATCH,
+          "argbuf invalid AS kind enum rejected");
     CHECK(rdna4rtr_plan_as_bda_encode(RDNA4RTR_ARG_KIND_INSTANCE_AS, 4u, 8u, 64u,
                                       0, bda, RDNA4RTR_AS_KIND_INSTANCE, &bp) == RDNA4RTR_ERR_ALIGNMENT,
           "argbuf misaligned offset 4 rejected");
@@ -636,6 +707,9 @@ static void test_as_descriptor_and_bda_planners(void) {
 
 static void test_wave4_prim_data_table_and_abi(void) {
     CHECK(GARNETX_CAP_RT_PRIMITIVE_DATA == (1u << 11), "GARNETX_CAP_RT_PRIMITIVE_DATA == (1u << 11)");
+    CHECK(GARNETX_CAP_NATIVE_INT64 == (1u << 12) &&
+          (GARNETX_CAP_NATIVE_INT64 & (0x3u | GARNETX_CAP_RT_POSITION_FETCH | GARNETX_CAP_RT_IFT_ABI_V2 | GARNETX_CAP_RT_PRIMITIVE_DATA)) == 0u,
+          "GARNETX_CAP_NATIVE_INT64 == (1u << 12) and disjoint from query/RT cap bits");
     CHECK(RDNA4RT_PRIM_DATA_BINDING == 676u, "prim data binding == 676");
     CHECK(RDNA4RT_PRIM_DATA_STAGE_TABLE_BYTES == 264u && sizeof(rdna4rt_stage_prim_table_t) == 264u,
           "rdna4rt_stage_prim_table_t == 264 bytes");
@@ -983,6 +1057,8 @@ static void test_source_pins(void) {
               strstr(impl, "rdna4rt_blas_table_entry_t") != NULL &&
               strstr(impl, "rdna4GeomIftBase") != NULL,
               "Wave 5 BLAS geometry intersectionFunctionTableOffset capture, propagation, and CPU+GPU TLAS combine wired");
+        CHECK(strstr(impl, "if (RDNA4R.shaderInt64) work.caps.flags |= GARNETX_CAP_NATIVE_INT64;") != NULL,
+              "R6: mesh/object Stage 3 worker sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
         free(impl);
     }
 
@@ -993,6 +1069,11 @@ static void test_source_pins(void) {
               strstr(shd, "rtPrimDataTable") != NULL &&
               strstr(shd, "RTPrimDataTable") != NULL,
               "garnet_shaders wires GARNETX_CAP_RT_PRIMITIVE_DATA and binding 676 RTPrimDataTable");
+        CHECK(strstr(shd, "const BOOL unlimited = (deadlineNs == UINT64_MAX && !rdna4_is_ws());") != NULL &&
+              strstr(shd, "waitMs = -1;") != NULL,
+              "R4: rdna4x_translate_fn_with_error honors UINT64_MAX sentinel -> waitMs=-1 for non-WS");
+        CHECK(strstr(shd, "if (RDNA4R.shaderInt64)\n        caps.flags |= GARNETX_CAP_NATIVE_INT64;") != NULL,
+              "R6: rdna4_rt_xlate_caps sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
         free(shd);
     }
 
@@ -1002,6 +1083,9 @@ static void test_source_pins(void) {
         CHECK(strstr(devm, "heapAccelerationStructureSizeAndAlignWithSize:") != NULL &&
               strstr(devm, "heapAccelerationStructureSizeAndAlignWithDescriptor:") != NULL,
               "GarnetDevice wires heapAccelerationStructureSizeAndAlignWithSize/Descriptor");
+        CHECK(strstr(devm, "const uint64_t computeDeadline = rdna4_is_ws()") != NULL &&
+              strstr(devm, "rdna4x_translate_fn_with_error(fn, \"kernel\", computeDeadline, &inprocFailure)") != NULL,
+              "R4: compute pipeline translation passes UINT64_MAX sentinel for non-WS");
         free(devm);
     }
 
@@ -1034,6 +1118,9 @@ static void test_source_pins(void) {
     if (be) {
         CHECK(strstr(be, "VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME") != NULL,
               "garnet_backend probes/enables VK_KHR_ray_tracing_position_fetch");
+        CHECK(strstr(be, "RDNA4R.shaderInt64 = (ef.shaderInt64 != VK_FALSE) ? YES : NO;") != NULL &&
+              strstr(be, "GARNETX_CAP_NATIVE_INT64") == NULL,
+              "R6: garnet_backend publishes RDNA4R.shaderInt64 without polluting RDNA4QueryCaps");
         free(be);
     }
 
@@ -1045,7 +1132,75 @@ static void test_source_pins(void) {
               strstr(args, "rdna4AttachedBufferAtIndex:") != NULL &&
               strstr(args, "bindlessQueried") != NULL,
               "rdna4PrepareArguments registers IFT attached buffers and honors bindlessQueried samplers");
+        CHECK(strstr(args, "rdna4_argument_descriptor_effective_count(argument.arrayLength)") != NULL &&
+              strstr(args, "|| !argument.arrayLength") == NULL,
+              "RDNA4ArgumentLayout initWithArguments normalizes arrayLength == 0 to 1");
+        CHECK(strstr(args, "field.type != MTLDataTypeInstanceAccelerationStructure && field.type != MTLDataTypePrimitiveAccelerationStructure") != NULL,
+              "RDNA4ArgumentEncoder setAccelerationStructure accepts both InstanceAS (118) and PrimitiveAS (117) slots");
+        CHECK(strstr(args, "const BOOL unlimited = (deadline == UINT64_MAX && !rdna4_is_ws());") != NULL &&
+              strstr(args, "waitMs = -1;") != NULL,
+              "R4: rdna4_gpu_argument_spv honors UINT64_MAX sentinel -> waitMs=-1 for non-WS");
         free(args);
+    }
+
+    char *xl = read_source_file("src/garnet-metal/garnet_xlate.h", "garnet_xlate.h");
+    CHECK(xl != NULL, "read garnet_xlate.h for 64 MiB SPIR-V cap pin");
+    if (xl) {
+        CHECK(strstr(xl, "#define RDNA4X_MAX_SPV       (64u * 1024u * 1024u)") != NULL,
+              "R3: RDNA4X_MAX_SPV bumped to 64 MiB for Cycles uber-shaders");
+        CHECK(strstr(xl, "#define RDNA4X_CACHE_CAP     (512ull * 1024ull * 1024ull)") != NULL,
+              "R4: RDNA4X_CACHE_CAP bumped to 512 MiB for 66 Cycles shaders + lowered copies");
+        CHECK(strstr(xl, "if (waitMs < 0) {\n        while (!j->done) pthread_cond_wait(&e->cvDone, &e->mu);") != NULL,
+              "R4: rdna4x_engine_submit waits synchronously on pthread_cond_wait when waitMs < 0");
+        free(xl);
+    }
+
+    char *pipes = read_source_file("src/garnet-metal/garnet_pipelines.m", "garnet_pipelines.m");
+    CHECK(pipes != NULL, "read garnet_pipelines.m for R4 compute arg-lowering deadline pin");
+    if (pipes) {
+        CHECK(strstr(pipes, "const uint64_t deadline = rdna4_is_ws()\n        ? (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_WS_MS * 1000000ull)\n        : UINT64_MAX;") != NULL,
+              "R4: compute pipeline passes UINT64_MAX deadline to rdna4_gpu_argument_spv for non-WS");
+        CHECK(strstr(pipes, "#define RDNA4_HEAVY_COMPUTE_SPV_BYTES (1u << 20)") != NULL &&
+              strstr(pipes, "static pthread_mutex_t rdna4_heavy_compute_pipe_mu = PTHREAD_MUTEX_INITIALIZER;") != NULL &&
+              strstr(pipes, "rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, spvBytes, &p)") != NULL &&
+              strstr(pipes, "rdna4_create_compute_pipeline_guarded(RDNA4R.dev, pc, &ci, count * 4u, &p)") != NULL,
+              "R7: garnet_pipelines serializes >=1 MiB compute vkCreateComputePipelines via leaf mutex");
+        free(pipes);
+    }
+
+    char *ba = read_source_file("src/garnet-metal/garnet_binary_archive.h", "garnet_binary_archive.h");
+    CHECK(ba != NULL, "read garnet_binary_archive.h for 80 MiB entry payload cap pin");
+    if (ba) {
+        CHECK(strstr(ba, "#define RDNA4BA_MAX_ENTRY_PAYLOAD (UINT64_C(80) << 20)") != NULL,
+              "R3: RDNA4BA_MAX_ENTRY_PAYLOAD bumped to 80 MiB for 64 MiB SPIR-V + meta + vkCache");
+        free(ba);
+    }
+
+    char *refl = read_source_file("src/garnet-metal/garnet_spvrefl.h", "garnet_spvrefl.h");
+    CHECK(refl != NULL, "read garnet_spvrefl.h for 8M ID bound cap pin");
+    if (refl) {
+        CHECK(strstr(refl, "#define RDNA4S_MAX_ID_BOUND (8u * 1024u * 1024u)") != NULL &&
+              strstr(refl, "if (m->bound > RDNA4S_MAX_ID_BOUND)") != NULL,
+              "R3: garnet_spvrefl raises ID bound cap to 8M for up to 64 MiB SPIR-V");
+        free(refl);
+    }
+
+    char *indc = read_source_file("src/garnet-metal/garnet_indirect_compute.h", "garnet_indirect_compute.h");
+    CHECK(indc != NULL, "read garnet_indirect_compute.h for 64 MiB word cap pin");
+    if (indc) {
+        CHECK(strstr(indc, "#define RDNA4I_MAX_WORDS (16u * 1024u * 1024u)") != NULL &&
+              strstr(indc, "count > RDNA4I_MAX_WORDS") != NULL,
+              "R3: garnet_indirect_compute raises SPIR-V word cap to 16M words (64 MiB)");
+        free(indc);
+    }
+
+    char *icb = read_source_file("src/garnet-metal/garnet_icb_abi.h", "garnet_icb_abi.h");
+    CHECK(icb != NULL, "read garnet_icb_abi.h for 64 MiB word cap pin");
+    if (icb) {
+        CHECK(strstr(icb, "#define RDNA4IC_MAX_WORDS (16u * 1024u * 1024u)") != NULL &&
+              strstr(icb, "count > RDNA4IC_MAX_WORDS") != NULL,
+              "R3: garnet_icb_abi raises compute ICB SPIR-V word cap to 16M words (64 MiB)");
+        free(icb);
     }
 
     char *res = read_source_file("src/garnet-metal/garnet_resources.m", "garnet_resources.m");

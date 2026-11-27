@@ -336,9 +336,17 @@ GARNET_INTERNAL NSData *rdna4_gpu_argument_spv(NSData *spv, NSDictionary **metad
     NSData *result = rdna4_argument_cached_data(codePath, RDNA4X_MAX_SPV);
     if (!result) {
         rdna4x_engine_prepare();
-        uint64_t now = rdna4_now(), left = deadline > now ? (deadline - now) / 1000000ull : 0;
-        int waitMs = left > RDNA4G_SYNC_WAIT_APP_MS ? RDNA4G_SYNC_WAIT_APP_MS : (int)left;
-        BOOL waiting = waitMs > 0 && rdna4_sync_begin(!rdna4_is_ws()); if (!waiting) waitMs = 0;
+        const BOOL unlimited = (deadline == UINT64_MAX && !rdna4_is_ws());
+        int waitMs;
+        BOOL waiting = NO;
+        if (unlimited) {
+            waitMs = -1;
+        } else {
+            uint64_t now = rdna4_now(), left = deadline > now ? (deadline - now) / 1000000ull : 0;
+            waitMs = left > RDNA4G_SYNC_WAIT_APP_MS ? RDNA4G_SYNC_WAIT_APP_MS : (int)left;
+            waiting = waitMs > 0 && rdna4_sync_begin(!rdna4_is_ws());
+            if (!waiting) waitMs = 0;
+        }
         char why[256] = {0};
         int rc = rdna4x_engine_lower_arguments(&RDNA4XL.eng, directory.fileSystemRepresentation, sha.UTF8String,
             spv.bytes, spv.length, input.bytes, input.length, waitMs, why, sizeof why);
@@ -1941,10 +1949,11 @@ static BOOL rdna4_argument_add(NSMutableDictionary *fields, MTLDataType type, MT
     }];
     for (MTLArgumentDescriptor *argument in ordered) {
         NSUInteger size = 0, align = 0;
-        if (!rdna4_argument_scalar(argument.dataType, &size, &align) || !argument.arrayLength ||
-            argument.arrayLength > 4096 || argument.arrayLength > NSUIntegerMax - argument.index) return nil;
+        NSUInteger count = (NSUInteger)rdna4_argument_descriptor_effective_count(argument.arrayLength);
+        if (!rdna4_argument_scalar(argument.dataType, &size, &align) ||
+            count > 4096 || count > NSUIntegerMax - argument.index) return nil;
         length = (length + align - 1) & ~(align - 1); alignment = MAX(alignment, align);
-        for (NSUInteger n = 0; n < argument.arrayLength; ++n) {
+        for (NSUInteger n = 0; n < count; ++n) {
             if (!rdna4_argument_add(fields, argument.dataType, nil, nil, nil, length, argument.index + n,
                                   device, 0, &size, &align)) return nil;
             length += size;

@@ -895,8 +895,11 @@ __attribute__((unused)) GARNET_INTERNAL BOOL rdna4_rt_arg_is_rt_data_type(MTLDat
 
 // Resolves & validates the 64-bit BDA (`u64_device_address`) for MTLArgumentEncoder
 // `setAccelerationStructure:atIndex:`. Raises NSInvalidArgumentException on invalid inputs
-// (matching RDNA4ArgumentEncoder semantics). If an AS created via `newAccelerationStructureWithSize:`
-// has not yet materialized a VkAccelerationStructureKHR handle, materializes it for the field kind.
+// (matching RDNA4ArgumentEncoder semantics). Accepts both BLAS and TLAS handles in either
+// MTLDataTypeInstanceAccelerationStructure (118) or MTLDataTypePrimitiveAccelerationStructure (117)
+// slots (matching Apple Metal; e.g. Cycles encodes mesh BLASes into 1-slot InstanceAS encoders).
+// If an AS created via `newAccelerationStructureWithSize:` has not yet materialized a
+// VkAccelerationStructureKHR handle, materializes it for the field kind.
 __attribute__((unused)) GARNET_INTERNAL uint64_t rdna4_rt_arg_resolve_as_address(
     id device,
     id accel,
@@ -4973,6 +4976,7 @@ static BOOL rdna4_mesh_translate_stage(id fn, const char *role, BOOL emulatedPay
     work.dynlibs = inLibs; work.ndynlibs = nl;
     work.caps = rdna4_query_caps();
     if (emulatedPayload) work.caps.flags |= GARNETX_CAP_MESH_EMULATED_PAYLOAD;
+    if (RDNA4R.shaderInt64) work.caps.flags |= GARNETX_CAP_NATIVE_INT64;
 
     int joinRc = rdna4x_run_on_worker_stack(rdna4_mesh_s3_worker, &work);
     free(inDeps); free(inLibs);

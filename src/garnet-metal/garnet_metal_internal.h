@@ -636,7 +636,7 @@ typedef struct {
     BOOL occPrecise, occOK;   // build 18 (P2): occlusionQueryPrecise enabled on the device; every query entry point resolved
     BOOL dbClamp;   // bundle 10: depthBiasClamp enabled on the device (a non-zero clamp in setDepthBias is passed on only then)
     BOOL hostExt, drmModExt; uint64_t hostAlign; uint64_t impTotal;   // host pointer import and explicit DRM-modifier linear images
-    BOOL orderedColorAccess, indirectFirstInstance, cubeArray, bufferAddress;
+    BOOL orderedColorAccess, indirectFirstInstance, cubeArray, bufferAddress, shaderInt64;
     BOOL fragInterlock;
     BOOL dualSrcBlend, depthClamp, fillModeNonSolid, multiViewport, bcCompression, sampleRateShading;
     BOOL storageImageExtFormats, storageImageMultisample;

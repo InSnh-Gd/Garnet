@@ -561,4 +561,14 @@ static inline rdna4_argument_capacity_status rdna4_argument_capacity_calculate(
     return RDNA4_ARGUMENT_CAPACITY_OK;
 }
 
+/*
+ * Apple Metal treats MTLArgumentDescriptor.arrayLength == 0 (the default) as a
+ * single non-array argument element (effective count 1); values >= 1 encode an
+ * array of that many consecutive argument indices.
+ */
+static inline uint64_t rdna4_argument_descriptor_effective_count(
+    uint64_t array_length) {
+    return array_length ? array_length : 1u;
+}
+
 #endif

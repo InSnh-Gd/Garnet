@@ -41,9 +41,9 @@
 #define RDNA4X_MAX_DEP_AIR   (8u * 1024u * 1024u)   // total bitcode of all dependencies of one stage
 #define RDNA4X_MAX_AIR       (4u * 1024u * 1024u)        // bitcode: the daemon's cap
 #define RDNA4X_MAX_LL        (64u * 1024u * 1024u)       // LLVM text
-#define RDNA4X_MAX_SPV       (16u * 1024u * 1024u)       // SPIR-V
+#define RDNA4X_MAX_SPV       (64u * 1024u * 1024u)       // SPIR-V (aligned with garnetxlate 64 MiB cap for Cycles uber-shaders)
 #define RDNA4X_MAX_META      (8u * 1024u * 1024u)        // trimmed meta JSON
-#define RDNA4X_CACHE_CAP     (256ull * 1024ull * 1024ull)   // per application; trimmed to 80% when exceeded
+#define RDNA4X_CACHE_CAP     (512ull * 1024ull * 1024ull)   // per application; trimmed to 80% when exceeded (fits 66 Cycles shaders + lowered copies)
 #define RDNA4X_WORKER_STACK  ((size_t)64u * 1024u * 1024u)   // a default secondary thread has 512 KiB; the command-line tool's 8 MiB main stack is the only depth anyone has measured
 #define RDNA4X_KILL_FILE     "/private/tmp/garnet-noinproc"
 #define RDNA4X_CACHE_SUB     "org.garnet.xlate"
@@ -923,7 +923,7 @@ static inline rdna4x_job *rdna4x_find_job(rdna4x_engine *e, const char *dir, con
     if (e->running && !strcmp(e->running->sha, sha) && !strcmp(e->running->dir, dir)) return e->running;
     return NULL;
 }
-// Submits one translation and waits up to waitMs (0 = do not wait; the worker still finishes it and installs the result). A second request for a sha already queued or running shares that job.
+// Submits one translation and waits up to waitMs (0 = do not wait; < 0 = wait synchronously until done; the worker still finishes it and installs the result). A second request for a sha already queued or running shares that job.
 // Returns the job's code, or RDNA4X_E_TIMEOUT when the wait ran out. err (optional) gets a message.
 static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const char *sha, const char *fname, const uint8_t *air, size_t airLen, const rdna4x_ldep *ld, size_t nld, const uint8_t *inputMeta, size_t inputMetaLen, int waitMs, char *err, size_t errn) {
     if (err && errn) err[0] = 0;
@@ -968,7 +968,9 @@ static inline int rdna4x_engine_submit(rdna4x_engine *e, const char *dir, const 
         pthread_cond_signal(&e->cvWork);
     }
     int rc = RDNA4X_E_TIMEOUT;
-    if (waitMs > 0) {
+    if (waitMs < 0) {
+        while (!j->done) pthread_cond_wait(&e->cvDone, &e->mu);
+    } else if (waitMs > 0) {
         struct timeval tv; gettimeofday(&tv, NULL);
         struct timespec ts; ts.tv_sec = tv.tv_sec + waitMs / 1000; ts.tv_nsec = (long)tv.tv_usec * 1000 + (long)(waitMs % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
