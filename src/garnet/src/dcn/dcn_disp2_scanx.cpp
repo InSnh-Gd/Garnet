@@ -401,14 +401,14 @@ uint32_t scanXAcquire(uint32_t inst, uint64_t out[5]) {
 	if (rc == rdna4scan::kOk) { out[0] = o[0]; out[1] = o[1]; out[2] = (uint64_t)rdna4disp_m6_gen(); out[3] = 0ull; out[4] = (uint64_t)d->w | ((uint64_t)d->h << 16) | ((uint64_t)d->pitchPx << 32); }
 	return rc;
 }
-uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2]) {
+uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2], bool boDcc) {
 	const rdna4scanx::XDesc *d = rdna4scanx::desc_of(inst);
 	if (d == nullptr || d->inst != inst) return rdna4scan::kBadArg;
 	if (!sx_latched_inst(inst)) return rdna4scan::kUnsupported;
 	SXEnv env(*d);
 	rdna4scanx::Excl ex;
 	sx_excl_snapshot(inst, &ex);
-	const rdna4scanx::RegIn in { boVis, boMc, boSize, offset, pitchBytes, width, height, format };
+	const rdna4scanx::RegIn in { boVis, boMc, boSize, offset, pitchBytes, width, height, format, boDcc };
 	return rdna4scanx::register_slot(env, *d, gSX[inst], in, ex, out);
 }
 uint32_t scanXPresent(uint32_t inst, uint64_t slotId, uint64_t flags, uint64_t out[3]) {

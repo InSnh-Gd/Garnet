@@ -124,7 +124,7 @@ uint32_t roScanSurface(rdna4_sf_dcn *s);
 uint32_t scanQuery(struct rdna4n_scan_query *o);                       // read-only, valid before Acquire
 uint32_t scanAcquire(uint64_t out[2], uint32_t sess);                // out: [0] console MC, [1] extended OTG frame count. sess = the native session (n1c_session_seq; 0 = none): only a row-120 HOLD (ABI 1.7) lets a session Acquire while the mode trial is busy
 uint32_t scanRegister(bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height,
-                      uint32_t format, uint64_t out[2]);            // out: [0] slot id, [1] slot MC; every bound is checked before any state changes
+                      uint32_t format, uint64_t out[2], bool boDcc); // out: [0] slot id, [1] slot MC; every bound is checked before any state changes
 uint32_t scanPresent(uint64_t slot, uint64_t flags, uint64_t out[3]); // out: [0] present id, [1] target frame, [2] VUPDATE count at program
 uint32_t scanStatus(struct rdna4n_scan_status *o);
 // THE console restore (one function): programs the console, waits for the latch by polling, verifies, tears the state down. Idempotent.
@@ -196,7 +196,7 @@ bool vblSampleInst(uint32_t inst, uint32_t w, uint32_t h, uint64_t pixHz, uint64
 // INSTANCE 1 = the monitor A (HUBP1 / OTG1), poll-only. The sequences are dcn/scanx_flow.h (host-tested over a fake HUBPn, one XDesc per instance). Every function takes the INSTANCE (1 or 2; anything else is BadArgument).
 // With a latch OFF every function below touches NOTHING (no register, no lock) and the selectors answer Unsupported (instance 1 without garnet-m6flip1: BadArgument at the client, exactly 0.0.661's answer). Slot ids are TAGGED (instance 1: 0x10 | k, instance 2: 0x20 | k).
 uint32_t scanXAcquire(uint32_t inst, uint64_t out[5]);                  // out: [0] A (the instance's console MC), [1] extended OTG frame count, [2] the M6 table generation, [3] 0 (the native client fills the free visible-VRAM figure), [4] geometry: w | h << 16 | pitchPx << 32
-uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2]);   // out: [0] tagged slot id, [1] slot MC
+uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2], bool boDcc);   // out: [0] tagged slot id, [1] slot MC
 uint32_t scanXPresent(uint32_t inst, uint64_t slotId, uint64_t flags, uint64_t out[3]);   // out: [0] present id, [1] target frame, [2] 0
 uint32_t scanXStatus(uint32_t inst, struct rdna4n_scan_status *o, uint64_t out[4]);      // out: [0] table generation, [1] reuse_inuse_refused, [2] restores | restoreFailures << 32, [3] write refusals | write failures << 32
 uint32_t scanXRelease(uint32_t inst, const char *why, uint64_t out[2]);                // THE restore of A (Restore); idempotent; out: [0] verified 1/0, [1] plane MC after

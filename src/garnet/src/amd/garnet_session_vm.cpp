@@ -604,7 +604,7 @@ IOReturn n1c_scan_register(const N1cRef &ref, const rdna4n_scan_reg *in, uint64_
         const uint32_t gen = rdna4dcn::scanGeneration();
         if (b.pinMask != 0u && b.pinGen != gen) b.pinMask = 0u;                // a pin of an acquisition that has ended is stale
         uint64_t o2[2] = { 0, 0 };
-        const uint32_t r = rdna4dcn::scanRegister(b.kind == kBoVis, b.mc, b.size, in->offset, in->pitch_bytes, in->width, in->height, in->format, o2);
+        const uint32_t r = rdna4dcn::scanRegister(b.kind == kBoVis, b.mc, b.size, in->offset, in->pitch_bytes, in->width, in->height, in->format, o2, b.dcc);
         if (r != kOk) { rc = (IOReturn)r; break; }
         b.pinMask = (uint8_t)(b.pinMask | (1u << (o2[0] & 7u))); b.pinGen = gen;   // recorded under gCliLock, released in bo_release / close / Release
         out[0] = o2[0]; out[1] = o2[1];
@@ -685,7 +685,7 @@ IOReturn n1c_scanx_register(const N1cRef &ref, uint64_t inst, const rdna4n_scan_
         uint32_t &pgen = inst == 1ull ? b.pinGen1 : b.pinGen2;
         mask = rdna4scanx::pins_live(mask, pgen, gen);                        // a pin of an acquisition that has ended is stale
         uint64_t o2[2] = { 0, 0 };
-        const uint32_t r = rdna4dcn::scanXRegister((uint32_t)inst, b.kind == kBoVis, b.mc, b.size, in->offset, in->pitch_bytes, in->width, in->height, in->format, o2);
+        const uint32_t r = rdna4dcn::scanXRegister((uint32_t)inst, b.kind == kBoVis, b.mc, b.size, in->offset, in->pitch_bytes, in->width, in->height, in->format, o2, b.dcc);
         if (r != kOk) { rc = (IOReturn)r; break; }
         const rdna4scanx::XDesc *xd = rdna4scanx::desc_of((uint32_t)inst);
         if (xd == nullptr || !rdna4scanx::id_ok(*xd, o2[0])) {               // the kernel returned an id that is not this instance's tag (cannot happen unless a descriptor table is wrong): the slot would be unpinned, so the instance is RELEASED (A back) and, if that is not verified, the BO leaked

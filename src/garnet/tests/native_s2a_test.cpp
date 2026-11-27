@@ -68,7 +68,7 @@ static void s1_abi() {
     expect_u("with the flag out[0] = major | minor << 16", (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16), 0xD0001);
 }
 
-static BoRef vis(uint64_t mc, uint64_t size) { return BoRef{ true, mc, size }; }
+static BoRef vis(uint64_t mc, uint64_t size) { return BoRef{ true, mc, size, false }; }
 static void s2_bounds() {
     uint64_t mc = 0, by = 0;
     const uint64_t poolMc = kPoolLo;                                            // 64 KiB aligned
@@ -79,7 +79,9 @@ static void s2_bounds() {
     expect_u("one byte short of the BO refused (offset + bytes > size)", reg_bounds(vis(poolMc, 3 * kBytes - 1), 2 * kBytes, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
     expect_u("offset beyond the BO refused", reg_bounds(vis(poolMc, kBytes), kBytes + 65536, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
     expect_u("offset == size refused (nothing fits)", reg_bounds(vis(poolMc, kBytes), kBytes, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
-    expect_u("a hi-pool / GTT BO (not visible) refused", reg_bounds(BoRef{ false, poolMc, kBytes }, 0, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
+    expect_u("a hi-pool / GTT BO (not visible) refused", reg_bounds(BoRef{ false, poolMc, kBytes, false }, 0, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
+    expect_u("a visible BO with GFX12 DCC is not a linear scanout slot",
+             reg_bounds(BoRef{ true, poolMc, kBytes, true }, 0, kPitchB, kH, kPitchB, kH, kFb, &mc, &by), kUnsupported);
     expect_u("pitch different from the live plane refused", reg_bounds(vis(poolMc, kBytes), 0, kPitchB + 64, kH, kPitchB, kH, kFb, &mc, &by), kBadArg);
     expect_u("height different from the live plane refused", reg_bounds(vis(poolMc, kBytes), 0, kPitchB, kH - 1, kPitchB, kH, kFb, &mc, &by), kBadArg);
     expect_u("pitch 0 refused", reg_bounds(vis(poolMc, kBytes), 0, 0, kH, 0, kH, kFb, &mc, &by), kBadArg);

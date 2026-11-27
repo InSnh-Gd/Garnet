@@ -496,7 +496,7 @@ uint32_t scanAcquire(uint64_t out[2], uint32_t sess) {
 }
 
 uint32_t scanRegister(bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height,
-                      uint32_t format, uint64_t out[2]) {
+                      uint32_t format, uint64_t out[2], bool boDcc) {
 	using namespace rdna4scan;
 	IOLock *l = gScan.lock;
 	if (l == nullptr) return kNotReady;
@@ -511,7 +511,7 @@ uint32_t scanRegister(bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offse
 		if (width != g.w || format != kFmtArgb8888) { rc = kBadArg; break; }
 		const Fb fb { gDcn.d.scanout_lo, gDcn.d.scanout_hi, gScan.consoleMc, gScan.consoleBytes };
 		uint64_t mc = 0, bytes = 0;
-		rc = reg_bounds(BoRef{ boVis, boMc, boSize }, offset, pitchBytes, height, g.pitchPx * 4u, g.h, fb, &mc, &bytes);
+		rc = reg_bounds(BoRef{ boVis, boMc, boSize, boDcc }, offset, pitchBytes, height, g.pitchPx * 4u, g.h, fb, &mc, &bytes);
 		if (rc != kOk) break;
 		if (rdna4m6_latched_on() && rdna4m6flip_latched_on() && scanXClash(mc, bytes)) { RDNA4LOG("rdna4scan: REGISTER refused: MC %#llx overlaps an HDMI display's buffers or slots (0.0.661 the monitor B's; 0.0.662 also the monitor A's with garnet-m6flip1)", (unsigned long long)mc); rc = kBadArg; break; }   // 0.0.661: an instance-0 slot never aliases the monitor B's memory (with the latches OFF this line is not reached: 0.0.660's path)
 		uint32_t slot = kNoSlot;

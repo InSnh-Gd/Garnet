@@ -126,7 +126,7 @@ plant 51 $E 'if (in->reserved0 != 0u) return kIOReturnBadArgument;
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);' 'if (in->reserved0 != 0u) return kIOReturnBadArgument;
-    { uint64_t o2x[2]; (void)rdna4dcn::scanRegister(false, 0, 0, 0, 0, 0, 0, 0, o2x); }
+    { uint64_t o2x[2]; (void)rdna4dcn::scanRegister(false, 0, 0, 0, 0, 0, 0, 0, o2x, false); }
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);' "LOCK ORDER: Register reaches the DCN lock BEFORE taking gCliLock"
