@@ -15,7 +15,27 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 | Navi 44 | Radeon RX 9060 XT **8GB** | `1002:7590` | `gfx1200`、`GC 12.0.0`、`MP0 14.0.2`、`SDMA 7.0.0` | 代码已就绪（离线与隔离测试通过），待物理机实机验证 |
 | Navi 48 | Radeon RX 9070 / RX 9070 XT / AI PRO R9700 | `1002:7550`、`1002:7551` | `gfx1201`、`GC 12.0.1`、`MP0 14.0.3`、`SDMA 7.0.1` | 保留来自 Cobalt64 的分芯片表、固件路径与 Mesa 条目，未在物理机验证 |
 
-共享接口、启动参数和通用文件统一使用 `RDNA4` 与 `Garnet` 命名；仅在存在硬件、固件或 PCI ID 差异处使用 `Navi 44` 与 `Navi 48`。`GarnetAccel.kext` 通过内核集合指纹匹配支持 x86_64 macOS `26.x`（以 `25G332` 为验证基线）；Release 1 二进制包仅面向物理机 Navi 44（`1002:7590`）。
+共享接口、启动参数和通用文件统一使用 `RDNA4` 与 `Garnet` 命名；仅在存在硬件、固件或 PCI ID 差异处使用 `Navi 44` 与 `Navi 48`。`GarnetAccel.kext` 通过内核集合指纹匹配支持 x86_64 macOS `26.x`（以 `25G332` 为验证基线）；v0.1.1 发布版二进制包仅面向物理机 Navi 44（`1002:7590`）。
+
+## v0.1.1 变更与 v0.2.0 计划
+
+### v0.1.1 变更内容
+
+- 中断、休眠与 4K@160Hz 桌面：默认开启 MSI EOP 中断（`garnet-interrupts=1`）、DCN 4.01 OTG `VSTARTUP` 主帧 VBLANK 与 `VUPDATE_NO_LOCK` 自愈、强制 DP/DSC 重训练的硬件 DPMS 休眠唤醒、跨 macOS 26.x 动态 AGDC 解析、4K@160Hz WindowServer 提交流水线，以及 GPL 快速链接与冷预热。
+- 8 GB Navi 44、异步计算与显存管理：新增 RX 9060 XT 8 GB 显存几何与无 Full-BAR 时的自动 Small-BAR 回退、专用 MEC 异步计算队列（`ctx.kcq`）、带事务回滚的 2 MiB `PDB0` 大页，以及默认开启的 GFX12 `PTE.DCC`（`garnet-dcc=0` 关闭开关），配合 GPU `CP_DMA` 清零与 GL2 失效保护。
+- 原生 Vulkan 光追（RX 9060 XT 实测通过）：`4,788.0 MRays/s`（10 万面）、`1,710.6 MRays/s`（100 万面）；在开启默认 GFX12 DCC 的实机 4K@160Hz 桌面上，Sascha `raytracingbasic` 实测 `398.881 FPS`、`rayquery` `374.329 FPS`；支持 `VK_KHR_ray_tracing_position_fetch`。
+- Metal 3 光追与 Bindless：实现 `intersection_query`、`@air.intersect`、IFT ABI v2、无状态嵌套 VFT、无编码器 Bindless、`primitiveDataBuffer`、`MTLHeap` 加速结构与异步计算队列 AS 构建。实机验证 `1280x720` 交互路径追踪器（默认开启 DCC 下平均 `103.93 FPS`、峰值 `136.8 FPS`，约 `630.4 MRays/s`）、未修改的 Apple 官方 Sample 1 与 Sample 2，并通过 4 路并发 RT/Metal/Vulkan 与 2 GiB 显存 / 4x4K DCC 渲染目标压测（`145,148` 条提交序列无错误、无卡死）。
+- 离线 megakernel 编译：`63/63` 个 Blender 4.2.23 Cycles（`CYCLES_METALRT=1`）内核通过 SPIR-V 校验，RADV 补丁 `0032` 将 ACO spill 内存降低约 7 到 14 倍（避免 OOM）。实机 Blender 已建完 BLAS/TLAS 并编译缓存前 `9/66` 个核，随后在出图前中止测试。
+- 日志、打包与升级清理：`RDNA4_RELEASE` `os_log` 日志分级、修复无沙盒与不存在路径的 `rdna4_sb_*` 预检、扩展 `Garnet.app` 诊断导出，以及升级时自动清理 `0.1.0` 旧残留。完整变更见 [CHANGES.md](CHANGES.md)。
+
+### v0.2.0 计划
+
+- 启用 RDNA 4 VCN 5.0.0 硬件视频编解码（`enable-rdna4-vcn5-video`）：内核初始化 VCN 5.0.0（含 Day-1 动态功耗门控、MMHUB v4.1.0 每会话 VMID 与 `'GRNT'` ABI `1.15`），开启 Mesa RADV 原生 Vulkan Video（`H.264`/`HEVC`/`AV1`/`VP9` 解码，以及 `H.264`/`HEVC` I+P/`AV1` 编码与 EFC RGB 转换），并提供独立 MIT 实现的 VideoToolbox 桥接（`libgarnetvt.dylib`、零 CPU 拷贝 `IOSurface` 导入、`garnetctl vt-run` 及按探测门控的 `MediaExtension` 解码，不修改 Seatbelt `.sb` 文件）。
+- 修复沙盒浏览器与 Electron 的 GPU 渲染（`fix-desktop-browser-sandbox-and-recovery`）：通过 `'GRNT'` ABI `1.14` WebKit 静默选择器别名、`rdna4_sb_check` 延迟入沙盒处理、两级 `inproc` 着色器缓存回退（`TemporaryItems` 与 64 MiB 内存缓存），以及在关闭 Authenticated Root 时通过 APFS 根快照将 `GarnetMetal.bundle` 部署到 `/System/Library/Extensions/` 并保留 `/Library/GPUBundles/` 符号链接回退（不修改 `.sb` 或 ESP），解决 Safari（`com.apple.WebKit.GPU`）、Chrome 与 Discord 窗口空白问题。
+- 修复桌面与应用兼容性问题（`fix-desktop-browser-sandbox-and-recovery`）：在 `FALLBACK` 路径清理 `mv_`/`mf_` 以避免冷缓存下 WindowServer `Code=49` 循环崩溃，将 IORegistry `"model"` 改为带 NUL 结尾的 `OSData`（修复 Geekbench 7 无法打开主窗口），补齐非 heap IOSurface/`vram_surf` 路径的 `VK_SHARING_MODE_CONCURRENT`，并消除启动时剩余的 2 次 MES `SET_HW_RESOURCES_1` 故障（`Garnet,IRQFaults == 0`）。
+- 降低 CPU 编码开销与冷编译停顿：用增量脏区间追踪或 BDA 间接表替代 `argscan` 对大 buffer 的逐帧 CPU 全量扫描（Apple Sample 2 实测 CPU 编码约 `845 ms/帧`，GPU 执行仅 `1.039` 到 `1.363 ms`）；补齐剩余 macOS 26 QuartzCore 桌面着色器缓存，去掉控制中心冷点击约 1.15 s 延迟中的人为轮询与等待睡眠，修正 tiled `MTLHeap`（`pf 115`）尺寸查询以减少 `mediaanalysisd` 分配回退，并加入 RADV/ACO 机器码磁盘缓存。
+- 实现 DisplayPort 热插拔（HPD）恢复并修复待机功耗：在显示器切换输入源或重新插拔线缆后执行 DPCD 链路重训练与 `DIG_FIFO_CTRL0` 复位（无需重启）；排查并修复当前约 51 到 55 W（`busy gfx 100%`）的待机功耗回退，恢复至 Stage 3 基线（4K@60Hz 约 `16.6 W` / 4K@160Hz 约 `27.6 W`）并与 VCN 5.0 DPG 协同完成 SMU DPM / `GFXOFF` 空闲门控。
+- 完成 Blender Cycles `CYCLES_METALRT=1` 标准场景（Cornell、BMW、Classroom）的完整渲染，以及 RX 9060 XT 8 GB 与 Navi 48（`RX 9070` / `RX 9070 XT`）的物理机实测验证。
 
 ## 架构概览
 

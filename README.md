@@ -15,7 +15,27 @@ Garnet is an experimental open-source macOS GPU and display driver stack for AMD
 | Navi 44 | Radeon RX 9060 XT **8GB** | `1002:7590` | `gfx1200`, `GC 12.0.0`, `MP0 14.0.2`, `SDMA 7.0.0` | Code-ready, pending physical hardware verification |
 | Navi 48 | Radeon RX 9070 / RX 9070 XT / AI PRO R9700 | `1002:7550`, `1002:7551` | `gfx1201`, `GC 12.0.1`, `MP0 14.0.3`, `SDMA 7.0.1` | Chip table, firmware path, and Mesa entry retained from Cobalt64; unverified on physical hardware |
 
-Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Navi 44` and `Navi 48` appear only where chip hardware, firmware blobs, or PCI IDs differ. `GarnetAccel.kext` kernel-collection fingerprinting targets x86_64 macOS `26.x` (`25G332` verified baseline), and Release 1 binaries target bare-metal Navi 44 (`1002:7590`) only.
+Shared interfaces, boot arguments, and files use `RDNA4` and `Garnet` names. `Navi 44` and `Navi 48` appear only where chip hardware, firmware blobs, or PCI IDs differ. `GarnetAccel.kext` kernel-collection fingerprinting targets x86_64 macOS `26.x` (`25G332` verified baseline), and Release v0.1.1 binaries target bare-metal Navi 44 (`1002:7590`) only.
+
+## Release v0.1.1 and v0.2.0 plans
+
+### Changes in v0.1.1
+
+- Display, sleep, and 4K@160Hz desktop: MSI EOP IRQ (`garnet-interrupts=1`), DCN 4.01 `VSTARTUP` VBLANK and `VUPDATE_NO_LOCK` self-heal, hardware DPMS sleep/wake with DP/DSC retrain, dynamic AGDC resolution across macOS 26.x, WindowServer 4K@160Hz pipelining, and GPL fast-link with cold pre-warm.
+- 8 GB Navi 44, async compute, and memory: RX 9060 XT 8 GB VRAM geometry with automatic Small-BAR fallback, a dedicated MEC async compute ring (`ctx.kcq`), 2 MiB `PDB0` huge pages, and GFX12 `PTE.DCC` enabled by default (`garnet-dcc=0` kill-switch) with GPU `CP_DMA` BO clear.
+- Vulkan ray tracing (verified on RX 9060 XT): `4,788.0 MRays/s` at 100k triangles and `1,710.6 MRays/s` at 1M triangles; Sascha `raytracingbasic` up to `398.881 FPS` and `rayquery` at `374.329 FPS` on a live 4K@160Hz DCC-enabled desktop; `VK_KHR_ray_tracing_position_fetch`.
+- Metal 3 ray tracing and bindless: `intersection_query`, `@air.intersect`, IFT ABI v2, nested VFT, encoder-less Metal 3 bindless, `primitiveDataBuffer`, `MTLHeap` acceleration structures, and async `computeQ` AS builds. Verified live on RX 9060 XT with an interactive `1280x720` path tracer (`103.93 FPS` average, `136.8 FPS` peak, about `630.4 MRays/s` under default-on DCC), unmodified Apple Official RT Samples 1 and 2, and 4-way concurrent RT/Metal/Vulkan plus 2 GiB VRAM and 4x4K DCC stress (`145,148` retired sequences, `0` faults or hangs).
+- Offline megakernel compilation: `63/63` Blender 4.2.23 Cycles (`CYCLES_METALRT=1`) kernels pass Metal AIR to SPIR-V validation, and `mesa-patches/0032` reduces ACO spill memory by about 7x to 14x to avoid OOM. Live Blender built BLAS/TLAS and cached `9/66` kernels before testing was stopped prior to full render.
+- Logging, packaging, and upgrade cleanup: `RDNA4_RELEASE` `os_log` severity gating, `rdna4_sb_*` sandbox preflight fix, expanded `Garnet.app` diagnostic export, and automatic removal of legacy `0.1.0` bundles. See [CHANGES.md](CHANGES.md) for the full changelog.
+
+### Planned for v0.2.0
+
+- Enable RDNA 4 VCN 5.0.0 hardware video decode and encode (`enable-rdna4-vcn5-video`): kernel VCN 5.0.0 bring-up with Day-1 Dynamic Power Gating and MMHUB v4.1.0 per-session VMIDs (`'GRNT'` ABI `1.15`), native Mesa RADV Vulkan Video (`H.264`, `HEVC`, `AV1`, `VP9` decode; `H.264`, `HEVC` I+P, `AV1` encode plus EFC RGB conversion), and a clean-room MIT VideoToolbox bridge (`libgarnetvt.dylib`, zero-CPU-copy `IOSurface` import, `garnetctl vt-run`, and probe-gated `MediaExtension` decode without Seatbelt `.sb` edits).
+- Fix sandboxed browser and Electron GPU rendering (`fix-desktop-browser-sandbox-and-recovery`): unblock blank windows in Safari (`com.apple.WebKit.GPU`), Chrome, and Discord via `'GRNT'` ABI `1.14` WebKit-safe selector aliases, late-sandbox `rdna4_sb_check` handling, two-tier `inproc` shader cache fallback (`TemporaryItems` and 64 MiB in-memory cache), and optional APFS root-snapshot deployment of `GarnetMetal.bundle` to `/System/Library/Extensions/` with `/Library/GPUBundles/` symlink fallback (no `.sb` or ESP edits).
+- Fix desktop and app stability blockers (`fix-desktop-browser-sandbox-and-recovery`): prevent cold-cache WindowServer `Code=49` crash loops, publish IORegistry `"model"` as NUL-terminated `OSData` (fixing Geekbench 7 launch), finish `VK_SHARING_MODE_CONCURRENT` on non-heap IOSurface/`vram_surf` paths, and clear the 2 remaining boot MES `SET_HW_RESOURCES_1` faults (`Garnet,IRQFaults == 0`).
+- Reduce CPU overhead and cold shader stalls: replace full-buffer CPU `argscan` walks (`~845 ms/frame` observed on Sample 2 despite `1.039 to 1.363 ms` GPU time) with incremental/dirty-range tracking or BDA indirection, bundle remaining macOS 26 QuartzCore shaders, remove the ~1.15 s Control Center cold-click sleeps, fix tiled `MTLHeap` size queries (`pf 115`), and add a persistent on-disk ACO pipeline cache.
+- Recover DisplayPort hotplug (HPD) and restore idle power: retrain DP links and clear `DIG_FIFO_CTRL0` across monitor input switches or cable replug without rebooting, fix the current ~51 to 55 W (`busy gfx 100%`) idle regression back to the Stage 3 envelope (`~16.6 W` at 4K@60Hz / `~27.6 W` at 4K@160Hz), and complete SMU DPM / `GFXOFF` governance coordinated with VCN 5.0 DPG.
+- Finish end-to-end Blender Cycles `CYCLES_METALRT=1` scene rendering (Cornell, BMW, Classroom) and complete physical verification on RX 9060 XT 8 GB and Navi 48 (`RX 9070` / `RX 9070 XT`).
 
 ## Architecture
 
