@@ -1,31 +1,33 @@
 # Documentation index
 
-Documentation in this repository covers the standalone Garnet driver architecture, build steps, subsystem specifications, and hardware test procedures. Keep canonical terminology aligned with [GLOSSARY.md](../GLOSSARY.md).
+Documentation for the standalone Garnet RDNA 4 driver stack on x86_64 macOS. Canonical names and component boundaries are defined in [GLOSSARY.md](../GLOSSARY.md).
 
 ## 1. Overview, glossary, and build
 
 | Document | Purpose |
 | --- | --- |
-| [README.md](../README.md) | Stack overview, supported hardware, build prerequisites, and credits |
-| [README.zh-CN.md](../README.zh-CN.md) | Simplified Chinese version of the project README |
-| [GLOSSARY.md](../GLOSSARY.md) | Canonical vocabulary (hardware targets, `Garnet.kext`, `GarnetAccel.kext`, `GarnetMetal.bundle`) |
-| [BUILDING.md](../BUILDING.md) | Kext prerequisites, Linux cross-build, firmware/SDK handling, and matched payload build (`build-all.sh`) |
-| [CHANGES.md](../CHANGES.md) | Upstream Cobalt64 snapshot provenance plus local Navi 44, display kext, Metal 2/3, and ray tracing additions |
+| [README.md](../README.md) | Stack overview, supported hardware, installation, prerequisites, and credits |
+| [README.zh-CN.md](../README.zh-CN.md) | Simplified Chinese project README |
+| [GLOSSARY.md](../GLOSSARY.md) | Canonical names (`Garnet`, `RDNA4`, `Navi 44`, `Navi 48`) and stack terms |
+| [BUILDING.md](../BUILDING.md) | Prerequisites, macOS/Linux builds, firmware handling, and `build-all.sh` |
+| [CHANGES.md](../CHANGES.md) | Release changelog and historical Cobalt64 baseline provenance |
 
-## 2. Active hardware runbooks and subsystem specs
+## 2. Subsystem specifications and tooling docs
 
 | Document | Purpose |
 | --- | --- |
-| [tools/rdna4/README.md](../tools/rdna4/README.md) | Build, install, activate, recover, and inspect scripts for the standalone Garnet stack |
-| [memory-reports.md](rdna4/memory-reports.md) | Native VRAM/GART reporting, large-memory budget fields, and `RDNA4Caps` |
-| [large-buffer-backing.md](rdna4/large-buffer-backing.md) | Dedicated heap allocations and 64-bit BDA (`buffer_address_table_version = 2`) |
-| [automatic-heaps.md](rdna4/automatic-heaps.md) | Automatic-heap placement and fallback rules in `GarnetMetal` |
-| [command-events.md](rdna4/command-events.md) | `MTLEvent` / `MTLSharedEvent` semaphore backing and command-buffer ordering |
-| [metal2-baseline.md](rdna4/metal2-baseline.md) | Metal 2 capability advertisement and baseline probe contracts |
-| [metal2-matrix.md](rdna4/metal2-matrix.md) | Tier 2 feature/capability matrix across kernel, translator, RADV, and Metal bundle |
-| [metal3-matrix.md](rdna4/metal3-matrix.md) | Metal 3 capability, bindless, ray tracing, and mesh shader tracking matrix |
+| [tools/rdna4/README.md](../tools/rdna4/README.md) | Payload build, verification, installation, activation, and removal scripts |
+| [tools/ioaccel-layout/README.md](../tools/ioaccel-layout/README.md) | Kernel-collection vtable extraction, header generation, and layout verification |
+| [full-bar-aperture.md](rdna4/full-bar-aperture.md) | Pre-PCI Full-BAR compatibility (`GarnetPCIBarCompat.kext`), VRAM ownership, and 8 GB checklist |
+| [memory-reports.md](rdna4/memory-reports.md) | Native VRAM/GART reporting, large-memory budgets, and `RDNA4,MemoryCaps` |
+| [large-buffer-backing.md](rdna4/large-buffer-backing.md) | Multi-gigabyte buffers, composite backing, and 64-bit BDA addressing |
+| [automatic-heaps.md](rdna4/automatic-heaps.md) | `MTLHeapTypeAutomatic` and `MTLHeapTypePlacement` backing and aliasing rules |
+| [command-events.md](rdna4/command-events.md) | `MTLEvent`, `MTLSharedEvent`, and `MTLFence` command-buffer segmentation |
+| [metal2-baseline.md](rdna4/metal2-baseline.md) | Metal 2 runtime baseline, capability contracts, and null-descriptor fallback |
+| [metal2-matrix.md](rdna4/metal2-matrix.md) | Metal 2 (`Mac2` / MSL 2.0–2.1) feature, limit, pixel-format, and large-memory matrix |
+| [metal3-matrix.md](rdna4/metal3-matrix.md) | Metal 3 (`AMD 6000-series` parity) feature, limit, sparse/PRT, mesh, and ray tracing matrix |
 | [STRUCTURE.md](../src/garnet-metal/STRUCTURE.md) | Module layout of `src/garnet-metal/` |
-| [TESTING.md](../src/garnet-metal/tests/TESTING.md) | Host regression suites, offline gates, and physical verification tiers for `GarnetMetal` |
-| [argument-summary/README.md](../src/garnet-metal/argument-summary/README.md) | Compute-assisted argument-buffer pointer summary shader and runtime layout |
+| [TESTING.md](../src/garnet-metal/tests/TESTING.md) | Host regression suites, offline gates, and live verification modes for `GarnetMetal` |
+| [argument-summary/README.md](../src/garnet-metal/argument-summary/README.md) | Compute-assisted argument-buffer pointer summary shader and bridge API |
 | [mesa-patches/README.txt](../mesa-patches/README.txt) | 32-patch Mesa RADV Darwin backend stack and host test instructions |
 | [third-party/metal2vulkan-rdna4/README.txt](../third-party/metal2vulkan-rdna4/README.txt) | 87-patch `metal2vulkan` stack and `garnetxlate` C-ABI translator notes |
