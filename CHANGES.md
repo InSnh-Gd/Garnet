@@ -1,6 +1,14 @@
 # Garnet changelog and history
 
-Standalone Garnet stack at `v0.1.1`: `Garnet.kext` `0.1.1` (`src/garnet`, `org.garnet.driver`), `GarnetAccel.kext` `0.1.1` (`src/garnet-accel`, `org.garnet.accel`), `GarnetMetal.bundle` `0.1.1` build `44` (`src/garnet-metal`, `org.garnet.metal`), `Garnet.app` `0.1.1` build `2`, 32 Mesa Darwin patches (`mesa-patches/`), and 87 `metal2vulkan` patches with `garnetxlate` (`third-party/metal2vulkan-rdna4/`). No `Lilu.kext` or external display plugin is required.
+Standalone Garnet stack on `main` (building on `v0.1.1`): `Garnet.kext` (`src/garnet`, `org.garnet.driver`, `'GRNT'` ABI `1.14`), `GarnetAccel.kext` (`src/garnet-accel`, `org.garnet.accel`), `GarnetRecover.efi` (`src/garnet-recover-efi`), `GarnetMetal.bundle` (15 `.m` compilation units in `src/garnet-metal`, `org.garnet.metal`), `Garnet.app` / `garnetctl` (`src/garnet-app`), 33 Mesa Darwin patches (`mesa-patches/`), and 90 `metal2vulkan` patches with `garnetxlate` (`third-party/metal2vulkan-rdna4/`). No `Lilu.kext` or external display plugin is required.
+
+## Unreleased (`main`, toward v0.2.0)
+
+- **Sandboxed browsers and desktop Metal fixes**: `'GRNT'` ABI `1.14` WebKit-safe selector aliases (`30`/`31`/`39`, `mesa-patches/0033`), one-way sandbox latching, two-tier `TemporaryItems` + `64 MiB` in-memory shader cache fallback, MSAA `raster_sample_count` translation (`bits 23..16`), cold-cache `WindowServer` fallback fixes, IORegistry `"model"` reporting (unblocking Geekbench 7), `MTLHeap` tiled alignment, concurrent non-heap `IOSurface` sharing, and incremental dirty-range argument-buffer scanning.
+- **DisplayPort hotplug, power, and MES boot**: DCN 4.01 HPD link-loss recovery (`regHPD_INTERRUPT_DEST` plus 1 Hz watchdog), SMU DPM / `GFXOFF` idle power policy, and MES boot initialization fixes.
+- **OpenCore Picker recovery and `AMFIAnchor` signing**: standalone x86_64 UEFI `GarnetRecover.efi` (`[1]` Safe Boot Once, `[2]` Safe Boot & Uninstall via `com.garnet.recovery`, zero ESP writes), `restore-oc` baseline rollback, optional `GARNET_SIGN_CA_DIR` CA signing + codeless Schema-1 `GarnetAnchorInjector.kext`, and `Garnet.app` / `garnetctl` integration.
+- **Metal 3.1 RT (opt-in) and incremental pipeline cache**: application `garnet-pipecache` raised to `256 MiB` (`WindowServer` capped at `32 MiB`) with debounced atomic saves after slow compiles, `garnet_mesh_rt.m` split into 5 compilation units, opt-in curve geometry (`GARNET_RT_CURVES=1`, `0088`), primitive/instance motion blur (`GARNET_RT_MOTION=1`, `0089`), and `0090` curve/motion/host optimizations (verified on RX 9060 XT: linear curves `4.92x` faster at `1,014.8 MRays/s`, cubic `1.43x`, single-slot IFT updates `2.11x`, `0` GCVM faults or hangs; `supportsPrimitiveMotionBlur` stays `NO` by default).
+- **Test layout and build variables**: `GarnetMetal` and RADV host tests moved to `src/garnet-metal/tests/` and `mesa-patches/tests/`, micro C suites consolidated and thin shell wrappers replaced with `Makefile` targets, retired autotranslate/plant scripts removed, and build variables cut over to `GARNET_KC_WORK` and `GARNET_LAYOUT_OUT`.
 
 ## Release v0.1.1
 
@@ -12,10 +20,10 @@ Standalone Garnet stack at `v0.1.1`: `Garnet.kext` `0.1.1` (`src/garnet`, `org.g
 - **Hardware ray tracing (RX 9060 XT, Vulkan RT and Metal 3 RT)**:
   - Native Vulkan RT on GFX1200: `4,788.0 MRays/s` at 100k triangles, `1,710.6 MRays/s` at 1M triangles; Sascha `raytracingbasic` at `398.881 FPS` and `rayquery` at `374.329 FPS` on live 4K@160Hz DCC-enabled desktop; `VK_KHR_ray_tracing_position_fetch`.
   - Metal 3 RT and bindless: `intersection_query` and `@air.intersect`, IFT ABI v2 (`attached_bda[31]`), stateless nested VFT, encoder-less Metal 3 bindless, `primitiveDataBuffer`, `MTLHeap` Automatic and Placement AS, async `computeQ` GPU-driven AS build/refit/compact, `reloop_nest` dominance repair (`0086`), `64 MiB` SPIR-V / `512 MiB` cache / `80 MiB` archive caps, and native int64.
-  - Verified live on RX 9060 XT: interactive `1280x720` Metal 3 path tracer (`103.93 FPS` average, `136.8 FPS` peak, ~`630.4 MRays/s` under DCC; 400-frame concurrent run `103.35 FPS` average), O0/O2 primitive-data heap tests (`71/71` pass, 5x concurrent), and unmodified Apple Metal 3 RT Samples 1 and 2 (`cb_gpu` avg `1.039`–`1.363 ms`).
+  - Verified live on RX 9060 XT: interactive `1280x720` Metal 3 path tracer (`103.93 FPS` average, `136.8 FPS` peak, ~`630.4 MRays/s` under DCC; 400-frame concurrent run `103.35 FPS` average), O0/O2 primitive-data heap tests (`71/71` pass, 5x concurrent), and unmodified Apple Metal 3 RT Samples 1 and 2 (`cb_gpu` avg `1.039` to `1.363 ms`).
   - Offline Blender 4.2.23 Cycles (`CYCLES_METALRT=1`) validation: `63/63` kernels and `14/14` IFT callbacks pass `garnetxlate` and `spirv-val`, and `mesa-patches/0032` reduces ACO spill memory by ~7x to 14x (`shade_shadow` `29.9 GiB` OOM down to `2,156 MB`; `shade_dedicated_light` `>12 GiB` OOM down to `849 MB`).
 
-For upcoming `v0.2.0` work (VCN 5.0 hardware video, sandboxed browsers, MetalFX/FSR 3.1, advanced ray tracing, Metal 4 core APIs, DisplayPort hotplug, and idle power), see [README.md](README.md#planned-for-v020).
+For remaining `v0.2.0` work, see [README.md](README.md#planned-for-v020).
 
 ---
 

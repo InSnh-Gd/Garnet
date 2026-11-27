@@ -28,14 +28,21 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 - **离线 Blender Cycles 编译**：`63/63` 个 Blender 4.2.23 Cycles（`CYCLES_METALRT=1`）内核通过 SPIR-V 校验，RADV 补丁 `0032` 将 ACO spill 内存压低约 7 到 14 倍以避免 OOM。完整场景渲染计划在 v0.2.0 完成。
 - **日志、打包与升级清理**：发布版 `os_log` 日志分级、修复 `rdna4_sb_*` 沙盒预检、扩展 `Garnet.app` 诊断导出，并在升级时自动清理 `0.1.0` 旧残留。完整记录见 [CHANGES.md](CHANGES.md)。
 
-### v0.2.0 计划
+### 当前 `main` 进展（面向 v0.2.0）
 
-- **VCN 5.0.0 硬件视频编解码**：内核初始化 VCN 5.0（含动态功耗门控与 MMHUB 每会话 VMID），开启 Mesa RADV 原生 Vulkan Video（`H.264`、`HEVC`、`AV1`、`VP9` 解码，以及 `H.264`、`HEVC`、`AV1` 编码与 EFC RGB 转换），并提供独立 MIT 实现的 VideoToolbox 桥接（`libgarnetvt.dylib`，零 CPU 拷贝 `IOSurface` 导入与按探测门控的 `MediaExtension` 解码，不修改 Seatbelt `.sb` 文件）。
-- **沙盒浏览器与桌面应用兼容性**：通过 WebKit 安全选择器别名、延迟入沙盒处理、两级进程内着色器缓存回退与可选 APFS 根快照部署，解决 Safari（`com.apple.WebKit.GPU`）、Chrome 与 Electron 窗口空白问题；修复冷缓存下 WindowServer 回退崩溃、IORegistry `"model"` 属性格式（修复 Geekbench 7 启动）、非 heap IOSurface 并发队列共享及启动阶段剩余的 MES 初始化故障。
-- **MetalFX 超分辨率与插帧**：基于 AMD FidelityFX FSR 3.1 计算着色器实现 `MTLFXSpatialScaler` 与 `MTLFXTemporalScaler`（空间缩放保留原生回退路径），让调用 MetalFX 的游戏与基准测试可在 RDNA 4 上运行。
-- **高级 Metal 3 光追与 Blender Cycles**：扩展曲线图元、运动模糊、多级实例化与间接加速结构构建，并完成 Blender 4.2 LTS Cycles（`CYCLES_METALRT=1`）完整场景实机渲染。
-- **Metal 4 核心 API 基础**：在现有 RADV 后端之上引入 Metal 4 核心接口（`MTL4CommandQueue`、`MTL4CommandBuffer`、`MTL4CommandAllocator`、统一参数表及编译/归档入口）。
-- **CPU 开销优化、DisplayPort 热插拔、功耗管理与更多显卡验证**：用增量脏区间追踪或 BDA 间接表替代逐帧全量参数缓冲区扫描，引入磁盘持久化 ACO 管线缓存并消除冷编译卡顿，实现 DisplayPort 热插拔（HPD）链路重训练而无需重启，协同 VCN 功耗门控完成 SMU DPM / `GFXOFF` 待机功耗调优，并补齐 RX 9060 XT 8 GB 与 Navi 48（`RX 9070` / `RX 9070 XT`）的物理机验证。
+- **沙盒浏览器与桌面 Metal 修复**：`'GRNT'` ABI `1.14` 加入 WebKit 安全选择器别名（`30`/`31`/`39`，配套 `mesa-patches/0033`）、单向沙盒锁存，以及两级进程内着色器缓存回退（`TemporaryItems` 与 `64 MiB` 进程内内存缓存）。同时修复 MSAA `raster_sample_count` 翻译、冷缓存下 `WindowServer` 回退崩溃、IORegistry `"model"` 属性格式（解除 Geekbench 7 启动阻塞）、`MTLHeap` 平铺对齐、非 heap `IOSurface` 并发队列共享，并加入增量脏区间参数缓冲扫描。
+- **DisplayPort 热插拔、功耗与 MES 启动**：加入 DCN 4.01 DisplayPort 热插拔（HPD）链路恢复（`regHPD_INTERRUPT_DEST` 加 1 Hz 看门狗）、SMU DPM / `GFXOFF` 待机功耗控制，以及启动阶段 MES 初始化修复。
+- **OpenCore 菜单一键恢复与 `AMFIAnchor` 签名**：新增独立 `GarnetRecover.efi`（`[1]` 单次安全启动、`[2]` 经 `com.garnet.recovery` 安全启动并卸载，全程不写 ESP 磁盘）、`restore-oc` 基线恢复、可选 `GARNET_SIGN_CA_DIR` 代码签名 CA 与无代码 Schema-1 `GarnetAnchorInjector.kext`，并接入 `Garnet.app` 与 `garnetctl`。
+- **Metal 3.1 光追（默认关闭）与增量管线缓存**：应用 `garnet-pipecache` 上限升至 `256 MiB`（`WindowServer` 保持 `32 MiB`）并在慢编译后防抖原子刷盘；RT/Mesh 运行时拆分为 5 个编译单元；加入默认关闭、需手动开启的曲线几何（`GARNET_RT_CURVES=1`、`0088`）、图元与实例动态模糊（`GARNET_RT_MOTION=1`、`0089`）及 `0090` 求解器与运行时优化（RX 9060 XT 稳态实测：线性曲线加速 `4.92x` 达 `1,014.8 MRays/s`，三次曲线加速 `1.43x`，单槽 IFT 更新加速 `2.11x`）。`supportsPrimitiveMotionBlur` 在完成发布认证前保持 `NO`。
+- **测试目录与构建变量**：将 `GarnetMetal` 与 RADV 宿主测试移入 `src/garnet-metal/tests/` 和 `mesa-patches/tests/`，用 `Makefile` 目标替代零散测试脚本，构建环境变量统一切换为 `GARNET_KC_WORK` 与 `GARNET_LAYOUT_OUT`。
+
+### v0.2.0 剩余计划
+
+- **VCN 5.0.0 硬件视频编解码**：内核初始化 VCN 5.0（含动态功耗控制与 MMHUB 每会话 VMID），开启 Mesa RADV 原生 Vulkan Video（`H.264`、`HEVC`、`AV1`、`VP9` 解码，以及 `H.264`、`HEVC`、`AV1` 编码与 EFC RGB 转换），并提供 MIT 许可的 VideoToolbox 桥接（`libgarnetvt.dylib`，零拷贝 `IOSurface` 导入与按探测结果启用的 `MediaExtension` 解码，不修改 Seatbelt `.sb` 文件）。
+- **MetalFX 超分辨率与插帧**：基于 AMD FidelityFX FSR 3.1 计算着色器实现 `MTLFXSpatialScaler` 与 `MTLFXTemporalScaler`（空间缩放保留原生回退路径）。
+- **光追与 Blender Cycles 渲染**：按实测收益决定是否启用的 `VK_KHR_ray_tracing_pipeline` + SBT 路由、曲线与动态模糊默认启用认证，以及未修改 Blender 4.2 LTS Cycles（`CYCLES_METALRT=1`）完整场景渲染。
+- **Metal 4 核心 API**：在 RADV 后端之上实现 `MTL4CommandQueue`、`MTL4CommandBuffer`、`MTL4CommandAllocator`、统一参数表与编译/归档管线。
+- **浏览器打包与其余硬件验证**：Safari/Chromium 可选 APFS 根快照部署、Chromium 在 `garnet=0` 下的内核恐慌排查，以及 RX 9060 XT 8 GB 与 Navi 48（`RX 9070` / `RX 9070 XT`）的物理机验证。
 
 ## 架构概览
 
@@ -60,7 +67,7 @@ Garnet 是面向 x86_64 OpenCore macOS 的开源 AMD RDNA 4 显卡与显示驱�
 - `GarnetPCIBarCompat.kext`（`src/garnet-pci-compat/`）：面向 Full-BAR（8GB 卡 8 GiB / 16GB 卡 16 GiB）模式的可选早期 OpenCore 驱动。在跨 `26.x` 对 `com.apple.iokit.IOPCIFamily` 完成 `exact-uuid`（`25G332`）或结构校验后开启大内存 BAR。
 - `GarnetRecover.efi`（`src/garnet-recover-efi/`）：独立 OpenCore 启动菜单恢复工具（`EFI/OC/Tools/GarnetRecover.efi`），不写 ESP 磁盘，仅通过 UEFI NVRAM 与系统内自包含守护进程 `com.garnet.recovery` 通信（支持 `[1]` 单次安全启动与 `[2]` 安全启动并自动卸载）。
 - 可选 `AMFIAnchor` 信任锚路径（`GarnetAnchorInjector.kext`）：构建时提供 `GARNET_SIGN_CA_DIR` 会使用专用代码签名 CA 签发用户态 Mach-O 并生成无代码 Schema-1 注入 kext（`org.garnet.code-signing`），配合上游 BSD-3-Clause 的 `b00t0x/AMFIAnchor`（加载顺序 `Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext`）即可去掉 `amfi=0x80` 保持 AMFI 开启；`Garnet.kext` 与 `GarnetAccel.kext` 仍保持零 `Lilu.kext` 依赖。
-- `Garnet.kext`（`src/garnet/`）：负责 PCIe BAR 映射、片上 IP 发现、固件加载、VMID 与稀疏页表管理、S3 休眠唤醒与 DP DDC/AUX 恢复、`AMDGarnetPrimaryFramebuffer` 模式设置与 128x128 硬件光标，以及 `'GRNT'` 用户客户端（`IOAccelGarnetNativeClient`）。
+- `Garnet.kext`（`src/garnet/`）：负责 PCIe BAR 映射、片上 IP 发现、固件加载、VMID 与稀疏页表管理、SMU DPM / `GFXOFF`、S3 休眠唤醒、DP DDC/AUX 与 HPD 热插拔恢复、`AMDGarnetPrimaryFramebuffer` 模式设置与 128x128 硬件光标，以及 `'GRNT'` ABI `1.14` 用户客户端（`IOAccelGarnetNativeClient`）。
 - `GarnetAccel.kext`（`src/garnet-accel/`）：在 Auxiliary Kernel Collection 中对接 `IOAcceleratorFamily2`，通过版本化布局指纹匹配虚表偏移与实例大小（`tools/ioaccel-layout/`）。
 - Mesa RADV Darwin（`mesa-patches/`）：基于 Mesa 提交 `f5cb8ee032adabef599ae892ec4e42d796b84da9` 的补丁系列，编译仅启用 ACO 的 `libvulkan_radeon.dylib`，支持 `'GRNT'` 传输、`VK_EXT_metal_surface` 及 `tools/rdna4/radv-app.sh`。
 - `GarnetMetal.bundle`（`src/garnet-metal/`）与 `libgarnetxlate.dylib`（`third-party/metal2vulkan-rdna4/`）：基于 RADV 派生 `MTLIOAccelDevice`，通过 `metal2vulkan` 补丁和 `garnetxlate` 将 Metal AIR 转为 SPIR-V，并在非 `WindowServer` 的 OpenGL 进程内提供 `GarnetGLDrawable` 表面桥接。

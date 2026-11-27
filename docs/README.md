@@ -24,10 +24,10 @@ Documentation for the standalone Garnet RDNA 4 driver stack on x86_64 macOS. Can
 | [automatic-heaps.md](rdna4/automatic-heaps.md) | `MTLHeapTypeAutomatic` and `MTLHeapTypePlacement` backing and aliasing rules |
 | [command-events.md](rdna4/command-events.md) | `MTLEvent`, `MTLSharedEvent`, and `MTLFence` command-buffer segmentation |
 | [metal2-baseline.md](rdna4/metal2-baseline.md) | Metal 2 runtime baseline, capability contracts, and null-descriptor fallback |
-| [metal2-matrix.md](rdna4/metal2-matrix.md) | Metal 2 (`Mac2` / MSL 2.0–2.1) feature, limit, pixel-format, and large-memory matrix |
+| [metal2-matrix.md](rdna4/metal2-matrix.md) | Metal 2 (`Mac2` / MSL 2.0 to 2.1) feature, limit, pixel-format, and large-memory matrix |
 | [metal3-matrix.md](rdna4/metal3-matrix.md) | Metal 3 (`AMD 6000-series` parity) feature, limit, sparse/PRT, mesh, and ray tracing matrix |
 | [STRUCTURE.md](../src/garnet-metal/STRUCTURE.md) | Module layout of `src/garnet-metal/` |
 | [TESTING.md](../src/garnet-metal/tests/TESTING.md) | Host regression suites, offline gates, and live verification modes for `GarnetMetal` |
 | [argument-summary/README.md](../src/garnet-metal/argument-summary/README.md) | Compute-assisted argument-buffer pointer summary shader and bridge API |
-| [mesa-patches/README.txt](../mesa-patches/README.txt) | 32-patch Mesa RADV Darwin backend stack and host test instructions |
-| [third-party/metal2vulkan-rdna4/README.txt](../third-party/metal2vulkan-rdna4/README.txt) | 87-patch `metal2vulkan` stack and `garnetxlate` C-ABI translator notes |
+| [mesa-patches/README.txt](../mesa-patches/README.txt) | 33-patch Mesa RADV Darwin backend stack (ABI 1.14) and host test instructions |
+| [third-party/metal2vulkan-rdna4/README.txt](../third-party/metal2vulkan-rdna4/README.txt) | 90-patch `metal2vulkan` stack and `garnetxlate` C-ABI translator notes |

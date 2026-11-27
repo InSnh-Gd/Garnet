@@ -1,8 +1,8 @@
 # Metal 3 capability and acceptance matrix (`AMD 6000-series` parity)
 
-This matrix extends the Metal 2 (`Mac2` / MSL 2.0–2.1 + 8 GiB large-memory)
+This matrix extends the Metal 2 (`Mac2` / MSL 2.0 to 2.1 + 8 GiB large-memory)
 baseline in [metal2-matrix.md](metal2-matrix.md) to match Apple's discrete
-Intel Mac `AMD 6000-series` (`Mac2` + `Metal3`, MSL 2.2–3.2) feature profile on
+Intel Mac `AMD 6000-series` (`Mac2` + `Metal3`, MSL 2.2 to 3.2) feature profile on
 RDNA 4 hardware.
 
 An entry is only complete when its execution oracle and negative/boundary checks
@@ -14,8 +14,8 @@ intermediate layers only.
 | Item | Definition |
 | --- | --- |
 | Physical target | AMD Radeon RX 9060 XT (Navi 44, `gfx1200`, GC 12.0.0, PCI `1002:7590`), x86_64 macOS 26.x (`25G332` verified baseline), SDK 26.5 |
-| Standalone stack | `Garnet.kext` (`'GRNT'` native ABI `1.13`), `GarnetAccel.kext`, `GarnetPCIBarCompat.kext`, `GarnetMetal.bundle` over Mesa RADV (`mesa@f5cb8ee` + `mesa-patches/`) and `metal2vulkan@43c46ac8` + `third-party/metal2vulkan-rdna4/` (`garnetxlate`) |
-| Feature anchor | Apple *Metal Feature Set Tables* (`AMD 6000-series` = `Mac2` + `Metal3`), MSL 2.2–3.2 |
+| Standalone stack | `Garnet.kext` (`'GRNT'` native ABI `1.14`), `GarnetAccel.kext`, `GarnetPCIBarCompat.kext`, `GarnetMetal.bundle` over Mesa RADV (`mesa@f5cb8ee` + `mesa-patches/`) and `metal2vulkan@43c46ac8` + `third-party/metal2vulkan-rdna4/` (`garnetxlate`) |
+| Feature anchor | Apple *Metal Feature Set Tables* (`AMD 6000-series` = `Mac2` + `Metal3`), MSL 2.2 to 3.2 |
 | Preserved Metal 2 gates | All rows of [metal2-matrix.md](metal2-matrix.md) (`C01..C07`, `K01..K07`, `T01..T07`, `R01..R09`, `A01..A05`, `P01..P04`, `I01..I04`, `H01..H05`, `L01..L23`, `F01..F33`, `M01..M08`) remain non-regression gates |
 | Clean-room boundary | Zero Apple `AMDRadeonX6000` binary reuse or substitution; zero `Lilu`, `AMDRadeonRDNA4.kext`, or `AppleParavirtGPU`; no closed-source private `MetalFX` protocols |
 | Public family gate | Application and WindowServer `supportsFamily:(MTLGPUFamilyMetal3)` (`5001`) both return `YES` once backend probes pass on RX 9060 XT; `EX01..EX08` (`Apple1..10` incl. `Apple6`, `Mac1`, `MacCatalyst`, `Metal4`, TBDR/`simdgroup_matrix`) remain strictly `NO` |
@@ -33,7 +33,7 @@ and validates error paths.
 | B01 | `AMD 6000-series` (`Mac2` + `Metal3`) capability matrix, limits, and Apple Silicon exclusions | `docs/rdna4/metal3-matrix.md`, `test-metal2-limits.m` | Apple *Metal Feature Set Tables* (`AMD 6000-series`) | Every capability query, limit, and exclusion maps to an explicit test oracle |
 | B02 | Conservative pre-open fallback and runtime Vulkan Metal 3 extension/feature/limit probe | `rdna4dc_metal3_caps`, `rdna4dc_metal3_from_probe()`, `rdna4_metal3_caps()` (`garnet_devcaps.h`, `garnet_backend.m`) | `VK_KHR_fragment_shader_barycentric`, `VK_EXT_shader_atomic_float` (+ `float2`), `VK_KHR_shader_atomic_int64` (Vulkan 1.2 core), `VK_EXT_mesh_shader`, `VK_KHR_deferred_host_operations`, `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, timestamp limits, sparse features | Pre-open `rdna4dc_fallback()` / `rdna4dc_from_native_memory()` and missing-dependency probes keep all Metal 3 bits `0`/`false`; probed-on flags gate accurately and clamp oversized mesh limits (`src/garnet-metal/tests/test-host-runtime.c`) |
 
-### 2. Metal 2.2–2.4 and MSL 2.2–3.2 core features (`X01..X08`)
+### 2. Metal 2.2 to 2.4 and MSL 2.2 to 3.2 core features (`X01..X08`)
 
 | ID | Feature / requirement | Capability query / selector | Vulkan / stack dependency | Oracle & negative checks |
 | --- | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ and validates error paths.
 | X05 | Pull-Model Interpolation (`interpolant<T>::interpolate_at_center`, `centroid`, `sample`, `offset`) | `supportsPullModelInterpolation` (`rdna4dc_metal3_pull_model_ok`) | Vulkan 1.0 core `sampleRateShading` -> SPIR-V `SampleRateShading` + `GLSL.std.450` `InterpolateAt*` | MSAA per-sample and explicit subpixel-offset interpolants match analytic reference; unsupported backend reports `NO` (`test-metal3-bary-pull.m`) |
 | X06 | GPU Timestamp Counter Sampling (`MTLCounterSampleBuffer`, `MTLCommonCounterSetTimestamp`) | `counterSets`, `supportsCounterSampling:` (`AtStageBoundary`, `AtDrawBoundary`, `AtDispatchBoundary`, `AtBlitBoundary`), `sampleTimestamps:gpuTimestamp:`, `resolveCounterRange:` (`rdna4dc_metal3_timestamps_supported`) | `VkQueryPool(VK_QUERY_TYPE_TIMESTAMP)`, `vkCmdWriteTimestamp2` / `vkCmdWriteTimestamp`, `timestampPeriod`, `timestampValidBits` | Real compute/render/blit work resolves valid monotonic nanosecond timestamps (`end >= start`, non-zero); out-of-range index, unsupported sampling point, or invalid descriptor returns `NSError` (`test-metal3-counters-amp.m`, `test-counters-amp.c`) |
 | X07 | Vertex Amplification (`setVertexAmplificationCount:viewMappings:`, `[[amplification_id]]`, `[[amplification_count]]`) | `supportsVertexAmplificationCount:` (`1` baseline; `> 1` only when target-verified) | `multiViewport` / layered view mapping / Vulkan 1.1 multiview | Amplified draw writes distinct viewport/layer outputs matching CPU reference; unsupported counts or invalid view mappings fail (`test-metal3-counters-amp.m`) |
-| X08 | MSL 2.2–3.2 float/64-bit/texture atomics, `bfloat`, and SIMD shift/fill (`atomic<float>`, `atomic<int64_t>`/`uint64_t`, `bfloat`, texture atomics, `simd_shuffle_and_fill_*`) | `rdna4dc_metal3_atomic_float_ok`, `atomic_float_minmax`, `atomic_float_image`, `rdna4dc_metal3_atomic_int64_ok` | `VK_EXT_shader_atomic_float`, `VK_EXT_shader_atomic_float2`, Vulkan 1.2 `shaderBufferInt64Atomics`/`shaderSharedInt64Atomics` + `shaderInt64`, core storage-image atomics, subgroup shuffles | Contended buffer/threadgroup/texture atomic sums/min/max/CAS, `bfloat` conversions/math, and SIMD fill results match race-free references (`test-metal3-msl3-atomics.m`) |
+| X08 | MSL 2.2 to 3.2 float/64-bit/texture atomics, `bfloat`, and SIMD shift/fill (`atomic<float>`, `atomic<int64_t>`/`uint64_t`, `bfloat`, texture atomics, `simd_shuffle_and_fill_*`) | `rdna4dc_metal3_atomic_float_ok`, `atomic_float_minmax`, `atomic_float_image`, `rdna4dc_metal3_atomic_int64_ok` | `VK_EXT_shader_atomic_float`, `VK_EXT_shader_atomic_float2`, Vulkan 1.2 `shaderBufferInt64Atomics`/`shaderSharedInt64Atomics` + `shaderInt64`, core storage-image atomics, subgroup shuffles | Contended buffer/threadgroup/texture atomic sums/min/max/CAS, `bfloat` conversions/math, and SIMD fill results match race-free references (`test-metal3-msl3-atomics.m`) |
 
 ### 3. Pipeline modularity and dynamic function dispatch (`D01..D03`)
 
@@ -89,7 +89,7 @@ full-stack GFX12 PRT and sparse resources as a hardware capability while
 | RT01 | `MTLAccelerationStructure` & `MTLAccelerationStructureCommandEncoder` (triangle BLAS, bounding-box BLAS, instance TLAS, build, refit, writeCompactedSize, copyAndCompact, copy, `MTLHeap` AS, async compute AS builds) | `supportsRaytracing` (`rdna4dc_metal3_raytracing_supported`); `accelerationStructureSizesWithDescriptor:` | `VK_KHR_deferred_host_operations`, `VK_KHR_acceleration_structure` (`accelerationStructure`, `bufferDeviceAddress`, `minAccelerationStructureScratchOffsetAlignment`), Private `VkBuffer` + BDA + retirement list | Size queries match Vulkan requirements; build -> compact -> refit -> copy succeed; undersized scratch/AS buffer or invalid descriptor returns controlled error with zero UAF/hang (`test-metal3-rt-accel.m`, `test-rt-accel.c`) |
 | RT02 | Inline Ray Query lowering & compute ray tracing (`raytracing::intersector`, `intersection_query`, `@air.intersect.*`, `primitiveDataBuffer`) | `supportsRaytracing` | `VK_KHR_ray_query` (`rayQuery`) -> SPIR-V `RayQueryKHR` (`OpRayQueryInitializeKHR` / `ProceedKHR` / `ConfirmIntersectionKHR` / `GenerateIntersectionKHR`), `metal2vulkan-rdna4` | Triangle hit/miss, distance, primitive ID, instance ID/transform, visibility mask, hit barycentrics, `primitiveDataBuffer`, and post-refit hits match analytic CPU oracle (`test-metal3-raytracing.m`, `test-rt-runtime.c`) |
 | RT03 | Render-stage ray tracing & `MTLIntersectionFunctionTable` (vertex/fragment TLAS binding incl. Tier 2 argument buffers; custom bounding-box intersection & triangle any-hit functions) | `supportsRaytracingFromRender` (subject to Footnote 10 mutual exclusion with Mesh pipelines); `newIntersectionFunctionTableWithDescriptor:` | `VK_KHR_ray_query` in vertex/fragment + `descriptorBindingAccelerationStructureUpdateAfterBind` + bounded switch-table intersection function dispatch (IFT ABI v2) | Fragment shadow/reflection rays and custom sphere bounding-box intersection distance/normal + any-hit filtering match analytic reference; early ARC release (`-O0`/`-O2`) has zero UAF (`test-metal3-raytracing.m`) |
-| RT04 | Primitive motion blur (`MTLAccelerationStructureMotion*Descriptor`, `intersector::intersect(..., time)`) | `supportsPrimitiveMotionBlur` (currently `NO`; flips to `YES` only after hardware execution passes) | RADV GFX12 motion-blur extension check or keyframe-interpolated build/query path | Remains `NO` with controlled descriptor refusal until verified against an analytic moving-primitive oracle |
+| RT04 | Curve geometry (`MTLAccelerationStructureCurveGeometryDescriptor`) and primitive/instance motion blur (`MTLAccelerationStructureMotion*Descriptor`, `intersector::intersect(..., time)`) | Opt-in gates `GARNET_RT_CURVES=1` and `GARNET_RT_MOTION=1` (with `GARNET_ALLOW=1`); `supportsPrimitiveMotionBlur` defaults to `NO` until full release certification | Compute AABB/union-AABB BLAS & motion TLAS builders plus `metal2vulkan-rdna4` patches `0088`, `0089`, and `0090` | Opt-in RX 9060 XT exact-oracle suites pass (`test-metal3-rt-curves.m` 10,000-ray oracle, `test-metal3-rt-motion.m`, `test-rt-curves.c`, `test-rt-motion.c`); default path keeps both off and returns `NO` |
 
 ## Metal 3 numeric limits and rules (`ML01..ML14`)
 
@@ -159,8 +159,9 @@ Every entry below remains `NO` / rejected on Garnet RX 9060 XT:
   `supportsFunctionPointersFromRender`, `supportsPullModelInterpolation`,
   `supportsShaderBarycentricCoordinates`, `supportsDynamicLibraries`,
   `supportsRenderDynamicLibraries`, and `supportsBinaryArchives` report `YES`;
-  `supportsPrimitiveMotionBlur` remains `NO` until motion-blur execution is
-  implemented and verified.
+  `supportsPrimitiveMotionBlur` remains `NO` by default (opt-in curve and motion
+  blur paths require `GARNET_ALLOW=1` with `GARNET_RT_CURVES=1` /
+  `GARNET_RT_MOTION=1`).
 - `EX01..EX08` remain strictly `NO`.
 - WindowServer keeps `supportsFamily:(MTLGPUFamilyMetal3) == YES` and
   `supportsBinaryArchives == NO`.

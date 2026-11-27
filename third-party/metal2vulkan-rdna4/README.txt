@@ -17,6 +17,30 @@ version 2). Patch-level SPIR-V, wrapper, and host/LavaPipe checks verify
 translation, metadata invariants, and software Vulkan execution only; physical
 RDNA 4 GPU execution is verified separately on target hardware.
 
+0090-metal3-rt-perf.patch applies after 0089. Curve and motion traversal reuse
+sidecar slots, and motion traversal snapshots the immutable instance header.
+Identical key indices need only one keyframe read. Nearby rotations skip the
+trigonometric path; queries without transform results use a smaller return type.
+The build-shader ABI, proxy counts and Vulkan synchronization are unchanged.
+
+0089-metal3-rt-motion-blur.patch lowers Metal 3 primitive and instance motion blur
+ray tracing (`GARNETX_CAP_RT_MOTION_BLUR`) in `src/native/ray_query_motion.rs`,
+`src/native/ray_query_air.rs`, `src/native/mod.rs`, `src/passes/mod.rs`,
+`src/lib.rs`, `src/linked_functions.rs`, `src/native/emitter/body/core_inst.rs`,
+and `src/native/ir/mod.rs`. It supports both `air.intersect.*` and
+`air.*_intersection_query.*` families with `primitive_motion` and/or
+`instance_motion`, interpolating motion keyframes (including cubic/SRT
+motion-instance transforms and Clamp/Vanish borders) via dual-slot traversal
+and software Möller-Trumbore / motion-AABB checks when traversing motion-flagged
+acceleration structures.
+
+0088-metal3-rt-curve-geometry.patch lowers Metal 3.1 curve ray tracing
+(`GARNETX_CAP_RT_CURVES`, `curve_data`) across `src/native/ray_query_air.rs`,
+`src/native/emitter/body/core_inst.rs`, `src/native/ir/mod.rs`, `src/passes/mod.rs`,
+`src/linked_functions.rs`, and `src/lib.rs`. Supports linear, quadratic, and
+cubic curves (round/flat/sphere endcaps) over AABB BLAS sidecar buffers and
+emits `curve_parameter` for both `air.intersect.*` and `intersection_query`.
+
 0087-metal3-blender-cycles-rt-and-air-fixes.patch adds Blender 4.2 Cycles
 (`CYCLES_METALRT=1`) AIR translation support and fixes across all 63 Cycles
 megakernels and 14 IFT callbacks.
@@ -35,23 +59,6 @@ resource addressing alongside stateless nested visible function tables.
 0083-metal3-intersection-query-and-rt-fixes.patch lowers Metal 3
 `intersection_query` intrinsics and ray-tracing payload/parameter forms to
 `VK_KHR_ray_query`.
-
-0089-metal3-rt-motion-blur.patch lowers Metal 3 primitive and instance motion blur
-ray tracing (`GARNETX_CAP_RT_MOTION_BLUR`) in `src/native/ray_query_motion.rs`,
-`src/native/ray_query_air.rs`, `src/native/mod.rs`, `src/passes/mod.rs`,
-`src/lib.rs`, `src/linked_functions.rs`, `src/native/emitter/body/core_inst.rs`,
-and `src/native/ir/mod.rs`. It supports both `air.intersect.*` and
-`air.*_intersection_query.*` families with `primitive_motion` and/or
-`instance_motion`, interpolating motion keyframes (including cubic/SRT
-motion-instance transforms and Clamp/Vanish borders) via dual-slot traversal
-and software Möller-Trumbore / motion-AABB checks when traversing motion-flagged
-acceleration structures.
-
-0090-metal3-rt-perf.patch applies after 0089. Curve and motion traversal reuse
-sidecar slots, and motion traversal snapshots the immutable instance header.
-Identical key indices need only one keyframe read. Nearby rotations skip the
-trigonometric path; queries without transform results use a smaller return type.
-The build-shader ABI, proxy counts and Vulkan synchronization are unchanged.
 
 0082-metal3-renderbox-visible-ref-trailing-ptr-params.patch relaxes the direct
 visible-function reference signature check in `src/linked_functions.rs`
