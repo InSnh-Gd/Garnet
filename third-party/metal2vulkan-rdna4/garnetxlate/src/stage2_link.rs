@@ -462,6 +462,9 @@ pub fn translate_bytes_stage3(
     if caps.is_some_and(RDNA4xBackendCapabilities::rt_primitive_data) {
         options = options.with_rt_primitive_data();
     }
+    if caps.is_some_and(RDNA4xBackendCapabilities::native_int64) {
+        options = options.with_native_int64();
+    }
 
     let tmp = Path::new("");
     let (spv, reflection, buffer_address_mode, uniform_control_proof) =

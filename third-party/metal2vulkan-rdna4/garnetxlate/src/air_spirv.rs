@@ -215,9 +215,11 @@ pub(crate) fn translate_text_with_mesh_options(
         query_lod_replay,
         emulated_mesh_payload,
         false,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_text_with_rt_options(
     ll_text: &str,
     local: [u32; 3],
@@ -226,6 +228,7 @@ pub(crate) fn translate_text_with_rt_options(
     query_lod_replay: QueryLodReplay,
     emulated_mesh_payload: bool,
     rt_primitive_data: bool,
+    native_int64: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (san_entry, datalayout) = sanitize_ll_text_with_datalayout(ll_text);
     let stage = detect_stage_text(&san_entry)?;
@@ -263,6 +266,9 @@ pub(crate) fn translate_text_with_rt_options(
     }
     if rt_primitive_data {
         options = options.with_rt_primitive_data();
+    }
+    if native_int64 {
+        options = options.with_native_int64();
     }
     // Never used on the Skip path (it reaches only the scratch-file helpers, which never run).
     let tmp = Path::new("");

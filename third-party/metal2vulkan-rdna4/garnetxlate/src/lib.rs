@@ -36,6 +36,7 @@ pub use query_lod::{
     lower_gpu_arguments_with_capabilities,
     RDNA4xBackendCapabilities,
     GARNETX_CAP_MESH_EMULATED_PAYLOAD,
+    GARNETX_CAP_NATIVE_INT64,
     GARNETX_CAP_RT_IFT_ABI_V2,
     GARNETX_CAP_RT_POSITION_FETCH,
     GARNETX_CAP_RT_PRIMITIVE_DATA,
@@ -71,6 +72,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 pub const ABI_VERSION: u32 = 3;
 /// Largest LLVM text accepted (the caller caps it too).
 pub const MAX_LL_BYTES: usize = 64 * 1024 * 1024;
+/// Largest SPIR-V binary accepted by post-translation rewrite exports (matches RDNA4X_MAX_SPV).
+pub const MAX_SPV_BYTES: usize = 64 * 1024 * 1024;
 
 pub const RC_OK: c_int = 0;
 pub const RC_REFUSED: c_int = 1;
@@ -362,7 +365,7 @@ pub unsafe extern "C" fn garnetx_lower_argument_resources(
         *err = 0;
     }
     if input_spv.is_null()
-        || !(20..=16 * 1024 * 1024).contains(&input_spv_len)
+        || !(20..=MAX_SPV_BYTES).contains(&input_spv_len)
         || !input_spv_len.is_multiple_of(4)
         || input_meta.is_null()
         || input_meta_len == 0

@@ -10,6 +10,8 @@ pub const GARNETX_CAP_RT_POSITION_FETCH: u32 = 1 << 9;
 pub const GARNETX_CAP_RT_IFT_ABI_V2: u32 = 1 << 10;
 /// Capability flag enabling RT `primitiveDataBuffer` GPU lookup via binding 676.
 pub const GARNETX_CAP_RT_PRIMITIVE_DATA: u32 = 1 << 11;
+/// Capability flag indicating native Vulkan `shaderInt64` arithmetic (skip u32-half i64 emulation).
+pub const GARNETX_CAP_NATIVE_INT64: u32 = 1 << 12;
 
 /// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages and RT prim data.
 pub const GARNETX_MESH_GRID_PARAMS_BINDING: u32 =
@@ -23,7 +25,8 @@ const KNOWN_CAPABILITY_FLAGS: u32 = 3
     | GARNETX_CAP_MESH_EMULATED_PAYLOAD
     | GARNETX_CAP_RT_POSITION_FETCH
     | GARNETX_CAP_RT_IFT_ABI_V2
-    | GARNETX_CAP_RT_PRIMITIVE_DATA;
+    | GARNETX_CAP_RT_PRIMITIVE_DATA
+    | GARNETX_CAP_NATIVE_INT64;
 
 /// Caller-proven language/device support and actual Vulkan subgroup properties (ABI 3).
 #[repr(C)]
@@ -60,6 +63,10 @@ impl RDNA4xBackendCapabilities {
 
     pub(crate) fn rt_primitive_data(self) -> bool {
         self.flags & GARNETX_CAP_RT_PRIMITIVE_DATA != 0
+    }
+
+    pub(crate) fn native_int64(self) -> bool {
+        self.flags & GARNETX_CAP_NATIVE_INT64 != 0
     }
 
     pub(crate) fn replay(self) -> QueryLodReplay {
@@ -324,7 +331,7 @@ pub unsafe extern "C" fn garnetx_lower_argument_resources_with_capabilities(
         }
     };
     if input_spv.is_null()
-        || !(20..=16 * 1024 * 1024).contains(&input_spv_len)
+        || !(20..=crate::MAX_SPV_BYTES).contains(&input_spv_len)
         || !input_spv_len.is_multiple_of(4)
         || input_meta.is_null()
         || input_meta_len == 0
@@ -442,6 +449,7 @@ fn translate_bytes_with_capabilities(
         capabilities.replay(),
         capabilities.emulated_mesh_payload(),
         capabilities.rt_primitive_data(),
+        capabilities.native_int64(),
     )?;
     let has_query = gate_query_lod(&spv, capabilities)?;
     let mut metadata: Value = serde_json::from_slice(&meta).map_err(|error| error.to_string())?;

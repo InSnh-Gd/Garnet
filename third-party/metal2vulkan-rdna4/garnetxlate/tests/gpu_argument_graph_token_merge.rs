@@ -161,3 +161,90 @@ fn token_phi_rejects_incompatible_incoming_image_types() {
         "{error}"
     );
 }
+
+#[test]
+fn token_lookup_deduplicates_across_switch_arms_and_dominators() {
+    // Same runtime texture token sampled across a 4-arm switch (mirroring static_sampler_table)
+    // plus a post-switch dominated sample must hoist & reuse a single binding-672 lookup call
+    // for the texture token rather than emitting 5 redundant binary-search loops.
+    let source = r#"
+target triple = "air64-apple-macosx"
+%Root = type { ptr addrspace(2) }
+%Record = type { ptr addrspace(1), [4 x ptr addrspace(2)] }
+
+define void @switch_lookup_cse(ptr addrspace(2) %args, ptr addrspace(1) %out, i32 %i) {
+entry:
+  %slot = getelementptr %Root, ptr addrspace(2) %args, i64 0, i32 0
+  %base = load ptr addrspace(2), ptr addrspace(2) %slot, align 8
+  %img_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 0
+  %tok = load i64, ptr addrspace(2) %img_slot, align 8
+  %image = inttoptr i64 %tok to ptr addrspace(1)
+  %s0_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1, i64 0
+  %s1_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1, i64 1
+  %s2_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1, i64 2
+  %s3_slot = getelementptr %Record, ptr addrspace(2) %base, i64 0, i32 1, i64 3
+  %s0 = load ptr addrspace(2), ptr addrspace(2) %s0_slot, align 8
+  %s1 = load ptr addrspace(2), ptr addrspace(2) %s1_slot, align 8
+  %s2 = load ptr addrspace(2), ptr addrspace(2) %s2_slot, align 8
+  %s3 = load ptr addrspace(2), ptr addrspace(2) %s3_slot, align 8
+  %arm = and i32 %i, 3
+  switch i32 %arm, label %case3 [
+    i32 0, label %case0
+    i32 1, label %case1
+    i32 2, label %case2
+  ]
+case0:
+  %r0 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %s0, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %v0 = extractvalue { <4 x float>, i8 } %r0, 0
+  %f0 = extractelement <4 x float> %v0, i32 0
+  br label %done
+case1:
+  %r1 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %s1, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %v1 = extractvalue { <4 x float>, i8 } %r1, 0
+  %f1 = extractelement <4 x float> %v1, i32 0
+  br label %done
+case2:
+  %r2 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %s2, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %v2 = extractvalue { <4 x float>, i8 } %r2, 0
+  %f2 = extractelement <4 x float> %v2, i32 0
+  br label %done
+case3:
+  %r3 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %s3, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %v3 = extractvalue { <4 x float>, i8 } %r3, 0
+  %f3 = extractelement <4 x float> %v3, i32 0
+  br label %done
+done:
+  %p = phi float [ %f0, %case0 ], [ %f1, %case1 ], [ %f2, %case2 ], [ %f3, %case3 ]
+  %r4 = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %image, ptr addrspace(2) %s0, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)
+  %v4 = extractvalue { <4 x float>, i8 } %r4, 0
+  %f4 = extractelement <4 x float> %v4, i32 0
+  %sum = fadd float %p, %f4
+  store float %sum, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @switch_lookup_cse, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Root"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let (spv, _) = garnetxlate::translate_text_gpu_arguments(source, [1, 1, 1]).unwrap();
+    let assembly = validate_and_disassemble(&spv, "switch_lookup_cse");
+    let entry = entry_function_body(&assembly);
+    let lookup_calls: Vec<&str> = entry
+        .lines()
+        .filter(|l| l.contains("= OpFunctionCall %uint "))
+        .collect();
+    // 1 hoisted lookup for `%image` (down from 5) + 4 distinct sampler lookups (`%s0` reused too -> 5 total, not 10!).
+    assert_eq!(
+        lookup_calls.len(),
+        5,
+        "expected 1 hoisted texture lookup + 4 unique sampler lookups (not 10):\n{}",
+        lookup_calls.join("\n")
+    );
+}

@@ -12,7 +12,8 @@ use garnetxlate::{
     garnetx_translate_linked_libraries, garnetx_translate_stage3,
     garnetx_translate_with_capabilities, RDNA4xBackendCapabilities, RDNA4xDep,
     RDNA4xDynamicLibrary, RDNA4xIntersectionFunction, GARNETX_CAP_MESH_EMULATED_PAYLOAD,
-    GARNETX_CAP_RT_IFT_ABI_V2, GARNETX_CAP_RT_POSITION_FETCH, GARNETX_CAP_RT_PRIMITIVE_DATA,
+    GARNETX_CAP_NATIVE_INT64, GARNETX_CAP_RT_IFT_ABI_V2, GARNETX_CAP_RT_POSITION_FETCH,
+    GARNETX_CAP_RT_PRIMITIVE_DATA,
     GARNETX_IFT_KIND_BOUNDING_BOX, GARNETX_IFT_KIND_TRIANGLE_ANY_HIT,
     GARNETX_MESH_GRID_PARAMS_BINDING, GARNETX_MESH_INDIRECT_BINDING, GARNETX_MESH_PAYLOAD_BINDING,
     GARNETX_RT_PRIM_DATA_BINDING,
@@ -3165,4 +3166,838 @@ entry:
         "must not fall back to flat state-machine OpSwitch (got {max_switch_cases} cases)"
     );
     assert_spirv_val("wave5_pt_nested", &spv);
+}
+
+fn lower_arg_resources_checked(
+    label: &str,
+    spv: &[u8],
+    meta: &[u8],
+    caps: Option<RDNA4xBackendCapabilities>,
+) -> Vec<u8> {
+    let mut out_spv: *mut u8 = std::ptr::null_mut();
+    let mut out_spv_len = 0usize;
+    let mut out_meta: *mut u8 = std::ptr::null_mut();
+    let mut out_meta_len = 0usize;
+    let mut err = [0 as c_char; 512];
+    let caps_ptr = caps.as_ref().map_or(std::ptr::null(), |c| c as *const _);
+    let rc = unsafe {
+        garnetxlate::garnetx_lower_argument_resources_with_capabilities(
+            spv.as_ptr(),
+            spv.len(),
+            meta.as_ptr(),
+            meta.len(),
+            &mut out_spv,
+            &mut out_spv_len,
+            &mut out_meta,
+            &mut out_meta_len,
+            err.as_mut_ptr(),
+            err.len(),
+            caps_ptr,
+        )
+    };
+    let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(rc, RC_OK, "{label}: lower_argument_resources failed: {msg}");
+    let lowered = unsafe { std::slice::from_raw_parts(out_spv, out_spv_len).to_vec() };
+    unsafe {
+        garnetx_free(out_spv, out_spv_len);
+        garnetx_free(out_meta, out_meta_len);
+    }
+    assert_spirv_val(&format!("{label}_lowered"), &lowered);
+    lowered
+}
+
+#[test]
+fn wave5_cycles_t1_curve_data_multi_payload_ift_and_as2_deref_ffi() {
+    // Self-contained Stage 3 regression for Wave 5.4 T1 (Blender Cycles MetalRT):
+    // - `air.intersect.intersection_function_buffer.instancing.triangle_data.curve_data.user_data.extended_limits`
+    //   with Apple Clang typed pointers (`i8 addrspace(1)*`)
+    // - Multiple linked IFT callbacks with distinct payload sizes (4B vs 8B) linked into the same
+    //   pipeline; call-site dispatch filters arms by payload size so mismatched structs are never
+    //   statically passed across arms
+    // - Linked callback referencing an `addrspace(2)` parameter carrying `dereferenceable(N)`
+    let caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 64,
+        subgroup_supported_stages: 0x3f,
+        subgroup_supported_operations: 0xff,
+    };
+
+    let entry_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Payload8 = type { i32, float }
+%struct.Params = type { i32, i32 }
+
+define void @k_cycles_t1(i8 addrspace(1)* %tlas, i8 addrspace(1)* %ift, %struct.Params addrspace(2)* nocapture readonly dereferenceable(8) %params, float addrspace(1)* nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %pl = alloca %struct.Payload8, align 4
+  %pl_i8 = bitcast %struct.Payload8* %pl to i8*
+  %p0 = getelementptr inbounds %struct.Payload8, %struct.Payload8* %pl, i64 0, i32 0
+  store i32 7, i32* %p0, align 4
+  %p1 = getelementptr inbounds %struct.Payload8, %struct.Payload8* %pl, i64 0, i32 1
+  store float 0.000000e+00, float* %p1, align 4
+  %params_i8 = bitcast %struct.Params addrspace(2)* %params to i8 addrspace(2)*
+  %hit = tail call { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1, float } @air.intersect.intersection_function_buffer.instancing.triangle_data.curve_data.user_data.extended_limits(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0x3F50624DE0000000, float 1.000000e+02, i8 addrspace(1)* readonly %tlas, i32 255, i8 addrspace(1)* readonly %ift, i32 4, i32 0, i8 addrspace(2)* readonly %params_i8, i8* %pl_i8, i64 8, i32 0, i32 0, i32 0, i32 0, i32 0, i32 3, i32 0, i32 0, i32 0, i1 false, i1 false, i1 false, i1 false)
+  %dist = extractvalue { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1, float } %hit, 1
+  %curve_u = extractvalue { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1, float } %hit, 9
+  %pv = load float, float* %p1, align 4
+  %sum0 = fadd float %dist, %curve_u
+  %sum1 = fadd float %sum0, %pv
+  store float %sum1, float addrspace(1)* %out, align 4
+  ret void
+}
+
+declare { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1, float } @air.intersect.intersection_function_buffer.instancing.triangle_data.curve_data.user_data.extended_limits(<3 x float>, <3 x float>, float, float, i8 addrspace(1)* readonly, i32, i8 addrspace(1)* readonly, i32, i32, i8 addrspace(2)* readonly, i8*, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1, i1, i1)
+
+!air.kernel = !{!0}
+!0 = !{void (i8 addrspace(1)*, i8 addrspace(1)*, %struct.Params addrspace(2)*, float addrspace(1)*)* @k_cycles_t1, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.instance_acceleration_structure", !"air.location_index", i32 0, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 1, i32 1, !"air.read"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Params"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+"#;
+
+    let cb_8b_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Payload8 = type { i32, float }
+%struct.Params = type { i32, i32 }
+
+define <{ i1, float }> @__intersection__curve8(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, %struct.Payload8* nocapture %pl, %struct.Params addrspace(2)* nocapture readonly dereferenceable(8) %params) local_unnamed_addr {
+entry:
+  %gp = getelementptr inbounds %struct.Params, %struct.Params addrspace(2)* %params, i64 0, i32 0
+  %gv = load i32, i32 addrspace(2)* %gp, align 4
+  %gf = sitofp i32 %gv to float
+  %pf = getelementptr inbounds %struct.Payload8, %struct.Payload8* %pl, i64 0, i32 1
+  store float %gf, float* %pf, align 4
+  %ok = fcmp oge float %tmax, %tmin
+  %r0 = insertvalue <{ i1, float }> undef, i1 %ok, 0
+  %r1 = insertvalue <{ i1, float }> %r0, float %tmin, 1
+  ret <{ i1, float }> %r1
+}
+
+!air.intersection = !{!14}
+!14 = !{<{ i1, float }> (<3 x float>, <3 x float>, float, float, %struct.Payload8*, %struct.Params addrspace(2)*)* @__intersection__curve8, !15, !18, !"air.bounding_box", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!"air.distance", !"air.arg_type_name", !"float"}
+!18 = !{!19, !20, !21, !22, !23, !24}
+!19 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!20 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!21 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+!23 = !{i32 4, !"air.payload", !"air.arg_type_size", i32 8, !"air.arg_type_name", !"Payload8"}
+!24 = !{i32 5, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Params"}
+"#;
+
+    // 4-byte payload callback linked alongside the 8-byte one; must be filtered out at the 8B call site.
+    let cb_4b_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Payload4 = type { i32 }
+
+define i1 @__intersection__tri4(<3 x float> %orig, <3 x float> %dir, float %tmin, float %tmax, %struct.Payload4* nocapture %pl) local_unnamed_addr {
+entry:
+  %p0 = getelementptr inbounds %struct.Payload4, %struct.Payload4* %pl, i64 0, i32 0
+  %v = load i32, i32* %p0, align 4
+  %ok = icmp ne i32 %v, 0
+  ret i1 %ok
+}
+
+!air.intersection = !{!14}
+!14 = !{i1 (<3 x float>, <3 x float>, float, float, %struct.Payload4*)* @__intersection__tri4, !15, !17, !"air.triangle", !"air.instancing"}
+!15 = !{!16}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!18, !19, !20, !21, !22}
+!18 = !{i32 0, !"air.origin", !"air.arg_type_name", !"float3"}
+!19 = !{i32 1, !"air.direction", !"air.arg_type_name", !"float3"}
+!20 = !{i32 2, !"air.min_distance", !"air.arg_type_name", !"float"}
+!21 = !{i32 3, !"air.max_distance", !"air.arg_type_name", !"float"}
+!22 = !{i32 4, !"air.payload", !"air.arg_type_size", i32 4, !"air.arg_type_name", !"Payload4"}
+"#;
+
+    let (spv, meta) = garnetxlate::translate_bytes_stage3(
+        entry_ll.as_bytes(),
+        [8, 8, 1],
+        &[],
+        &[],
+        &[],
+        &[
+            (
+                "__intersection__curve8".to_string(),
+                metal2vulkan::linked_functions::IntersectionFunctionKind::BoundingBox,
+                cb_8b_ll.as_bytes().to_vec(),
+            ),
+            (
+                "__intersection__tri4".to_string(),
+                metal2vulkan::linked_functions::IntersectionFunctionKind::TriangleAnyHit,
+                cb_4b_ll.as_bytes().to_vec(),
+            ),
+        ],
+        Some(caps),
+    )
+    .expect("Cycles T1 curve_data + multi-payload IFT Stage 3 failed");
+    assert_spirv_val("cycles_t1_direct", &spv);
+    let asm = spv_asm(&spv);
+    assert!(asm.contains("OpRayQueryProceedKHR"), "{asm}");
+    assert!(asm.contains("OpRayQueryGenerateIntersectionKHR"), "{asm}");
+    let _ = lower_arg_resources_checked("cycles_t1", &spv, &meta, Some(caps));
+}
+
+#[test]
+fn wave5_cycles_t2_t3_t4_t5_air_and_storage_pool_ffi() {
+    let caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 64,
+        subgroup_supported_stages: 0x3f,
+        subgroup_supported_operations: 0xff,
+    };
+
+    // T3: single-leaf threadgroup wrapper struct (`{ i32 }`) flattened workgroup rewrite.
+    let t3_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.SingleLeafTg = type { i32 }
+
+define void @k_cycles_t3(%struct.SingleLeafTg addrspace(3)* %tg, i32 addrspace(1)* %out, i32 %tid) {
+entry:
+  %f = getelementptr inbounds %struct.SingleLeafTg, %struct.SingleLeafTg addrspace(3)* %tg, i64 0, i32 0
+  store i32 %tid, i32 addrspace(3)* %f, align 4
+  %v = load i32, i32 addrspace(3)* %f, align 4
+  store i32 %v, i32 addrspace(1)* %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{void (%struct.SingleLeafTg addrspace(3)*, i32 addrspace(1)*, i32)* @k_cycles_t3, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_name", !"SingleLeafTg"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
+!5 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+    let out_t3 = call_stage3_with_caps(t3_ll, Some([32, 1, 1]), &[], Some(caps));
+    assert_eq!(out_t3.rc, RC_OK, "Cycles T3 single-leaf tg failed: {}", out_t3.msg);
+    assert_spirv_val("cycles_t3_direct", &out_t3.spv);
+    let _ = lower_arg_resources_checked("cycles_t3", &out_t3.spv, &out_t3.meta, Some(caps));
+
+    // T2 + polymorphic storage pool + Byte-box StorageAliasAlloca + Null BDA helper arg + non-null ptr icmp.
+    let t2_pool_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Globals = type { float addrspace(1)* }
+%struct.TinyBox = type { [32 x i8] }
+%struct.Closure = type { <3 x float>, i32, float, <3 x float>, [48 x i8] }
+%struct.Bsdf = type { <3 x float>, i32, float, <3 x float>, float, float, float, float, i32, i8*, <3 x float> }
+%struct.Extra = type { <3 x float>, <3 x float> }
+%struct.SD = type { <3 x float>, i32, [4 x %struct.Closure] }
+
+define internal fastcc float @helper_eval(%struct.SD* %sd, %struct.Closure* %sc, float addrspace(1)* %opt_buf, i1 %use_sd) {
+entry:
+  %has_buf = icmp ne float addrspace(1)* %opt_buf, null
+  %bsdf = bitcast %struct.Closure* %sc to %struct.Bsdf*
+  %fslot = getelementptr inbounds %struct.Bsdf, %struct.Bsdf* %bsdf, i64 0, i32 9
+  %fcast = bitcast i8** %fslot to %struct.Extra**
+  %ext = load %struct.Extra*, %struct.Extra** %fcast, align 8
+  %kptr = getelementptr inbounds %struct.Extra, %struct.Extra* %ext, i64 0, i32 1
+  %k = load <3 x float>, <3 x float>* %kptr, align 16
+  %n_sc = getelementptr inbounds %struct.Closure, %struct.Closure* %sc, i64 0, i32 3
+  %n_sd = getelementptr inbounds %struct.SD, %struct.SD* %sd, i64 0, i32 0
+  %sel_n = select i1 %use_sd, <3 x float>* %n_sd, <3 x float>* %n_sc
+  %n = load <3 x float>, <3 x float>* %sel_n, align 16
+  %nx = extractelement <3 x float> %n, i64 0
+  %kx = extractelement <3 x float> %k, i64 0
+  %sum = fadd float %nx, %kx
+  br i1 %has_buf, label %read_buf, label %done
+
+read_buf:
+  %bv = load float, float addrspace(1)* %opt_buf, align 4
+  %with_buf = fadd float %sum, %bv
+  br label %done
+
+done:
+  %res = phi float [ %with_buf, %read_buf ], [ %sum, %entry ]
+  ret float %res
+}
+
+define void @k_cycles_t2_pool(%struct.Globals addrspace(2)* %globals, float addrspace(1)* %out, i32 %idx) {
+entry:
+  %box = alloca %struct.TinyBox, align 16
+  %sd = bitcast %struct.TinyBox* %box to %struct.SD*
+  %f0 = bitcast %struct.TinyBox* %box to <3 x float>*
+  store <3 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00>, <3 x float>* %f0, align 16
+  %idx64 = sext i32 %idx to i64
+  %c0 = getelementptr inbounds %struct.SD, %struct.SD* %sd, i64 0, i32 2, i64 %idx64
+  %c1 = getelementptr inbounds %struct.Closure, %struct.Closure* %c0, i64 1
+  %n0 = getelementptr inbounds %struct.Closure, %struct.Closure* %c0, i64 0, i32 3
+  store <3 x float> zeroinitializer, <3 x float>* %n0, align 16
+  %t32 = getelementptr inbounds %struct.Closure, %struct.Closure* %c0, i64 0, i32 4, i64 32
+  %t32v = bitcast i8* %t32 to <3 x float>*
+  store <3 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00>, <3 x float>* %t32v, align 16
+  %b0 = bitcast %struct.Closure* %c0 to %struct.Bsdf*
+  %e1 = bitcast %struct.Closure* %c1 to %struct.Extra*
+  %ek = getelementptr inbounds %struct.Extra, %struct.Extra* %e1, i64 0, i32 1
+  store <3 x float> <float 4.000000e+00, float 5.000000e+00, float 6.000000e+00>, <3 x float>* %ek, align 16
+  %fslot = getelementptr inbounds %struct.Bsdf, %struct.Bsdf* %b0, i64 0, i32 9
+  %fcast = bitcast i8** %fslot to %struct.Extra**
+  store %struct.Extra* %e1, %struct.Extra** %fcast, align 8
+  %flag = icmp eq i32 %idx, 0
+  %gp = getelementptr inbounds %struct.Globals, %struct.Globals addrspace(2)* %globals, i64 0, i32 0
+  %bda_buf = load float addrspace(1)*, float addrspace(1)* addrspace(2)* %gp, align 8
+  %v1 = call fastcc float @helper_eval(%struct.SD* %sd, %struct.Closure* %c0, float addrspace(1)* null, i1 %flag)
+  %v2 = call fastcc float @helper_eval(%struct.SD* %sd, %struct.Closure* %c0, float addrspace(1)* %bda_buf, i1 %flag)
+  %tot = fadd float %v1, %v2
+  store float %tot, float addrspace(1)* %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{void (%struct.Globals addrspace(2)*, float addrspace(1)*, i32)* @k_cycles_t2_pool, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Globals"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!5 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+    let out_pool = call_stage3_with_caps(t2_pool_ll, Some([32, 1, 1]), &[], Some(caps));
+    assert_eq!(out_pool.rc, RC_OK, "Cycles T2 storage_pool + null BDA arg failed: {}", out_pool.msg);
+    assert_spirv_val("cycles_t2_pool_direct", &out_pool.spv);
+    let _ = lower_arg_resources_checked("cycles_t2_pool", &out_pool.spv, &out_pool.meta, Some(caps));
+
+    // T4 + T5: local pointer array dynamic BDA load forwarding + 64-bit raw word load.
+    let t4_t5_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.PtrTable = type { [2 x i64 addrspace(1)*] }
+
+define void @k_cycles_t4_t5(i64 addrspace(1)* %a, i64 addrspace(1)* %b, i64 addrspace(1)* %out, i32 %sel) {
+entry:
+  %tbl = alloca %struct.PtrTable, align 8
+  %p0 = getelementptr inbounds %struct.PtrTable, %struct.PtrTable* %tbl, i64 0, i32 0, i64 0
+  store i64 addrspace(1)* %a, i64 addrspace(1)** %p0, align 8
+  %p1 = getelementptr inbounds %struct.PtrTable, %struct.PtrTable* %tbl, i64 0, i32 0, i64 1
+  store i64 addrspace(1)* %b, i64 addrspace(1)** %p1, align 8
+  %idx = and i32 %sel, 1
+  %idx64 = zext i32 %idx to i64
+  %slot = getelementptr inbounds %struct.PtrTable, %struct.PtrTable* %tbl, i64 0, i32 0, i64 %idx64
+  %picked = load i64 addrspace(1)*, i64 addrspace(1)** %slot, align 8
+  %val = load i64, i64 addrspace(1)* %picked, align 8
+  store i64 %val, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{void (i64 addrspace(1)*, i64 addrspace(1)*, i64 addrspace(1)*, i32)* @k_cycles_t4_t5, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"ulong"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"ulong"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"ulong"}
+!6 = !{i32 3, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+    let out_t45 = call_stage3_with_caps(t4_t5_ll, Some([32, 1, 1]), &[], Some(caps));
+    assert_eq!(out_t45.rc, RC_OK, "Cycles T4+T5 dynamic local BDA + i64 load failed: {}", out_t45.msg);
+    assert_spirv_val("cycles_t4_t5_direct", &out_t45.spv);
+    let _ = lower_arg_resources_checked("cycles_t4_t5", &out_t45.spv, &out_t45.meta, Some(caps));
+
+    // Pin 64 MiB SPIR-V cap alignment with runtime RDNA4X_MAX_SPV (required for Cycles uber-shaders > 16 MiB).
+    assert_eq!(garnetxlate::MAX_SPV_BYTES, 64 * 1024 * 1024);
+}
+
+#[test]
+fn wave5_cycles_opaque_pointers_o1_o2_as2_deref_and_storage_pool_ffi() {
+    let caps = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 64,
+        subgroup_supported_stages: 0x3f,
+        subgroup_supported_operations: 0xff,
+    };
+
+    // O1: Production opaque-pointer IR (`setOpaquePointers(1)`) with `ptr addrspace(2) noundef align 16 dereferenceable(16)`
+    // in a linked IFT callback + internal helper called from the callback (must promote AS2 -> AS1 across both).
+    let entry_o1_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Anc = type { ptr addrspace(1), ptr addrspace(1) }
+%struct.Payload8 = type { i32, float }
+
+define void @k_cycles_o1(ptr addrspace(2) %anc, ptr addrspace(1) nocapture writeonly %out) local_unnamed_addr {
+entry:
+  %tlas_p = getelementptr inbounds %struct.Anc, ptr addrspace(2) %anc, i64 0, i32 0
+  %tlas = load ptr addrspace(1), ptr addrspace(2) %tlas_p, align 8
+  %ift_p = getelementptr inbounds %struct.Anc, ptr addrspace(2) %anc, i64 0, i32 1
+  %ift = load ptr addrspace(1), ptr addrspace(2) %ift_p, align 8
+  %pl = alloca %struct.Payload8, align 4
+  %p0 = getelementptr inbounds %struct.Payload8, ptr %pl, i64 0, i32 0
+  store i32 7, ptr %p0, align 4
+  %p1 = getelementptr inbounds %struct.Payload8, ptr %pl, i64 0, i32 1
+  store float 0.000000e+00, ptr %p1, align 4
+  %hit = tail call { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1, float } @air.intersect.instancing.triangle_data.curve_data.extended_limits(<3 x float> zeroinitializer, <3 x float> <float 0.0, float 0.0, float -1.0>, float 0x3F50624DE0000000, float 1.000000e+02, ptr addrspace(1) readonly %tlas, i32 255, ptr addrspace(1) readonly %ift, ptr nonnull align 4 %pl, i64 8, i32 0, i32 0, i32 0, i32 0, i32 2, i32 0, i32 -1, i32 -1, i32 0, i1 false, i1 false)
+  %dist = extractvalue { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1, float } %hit, 1
+  %pv = load float, ptr %p1, align 4
+  %sum = fadd float %dist, %pv
+  store float %sum, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <2 x float>, i1, float } @air.intersect.instancing.triangle_data.curve_data.extended_limits(<3 x float>, <3 x float>, float, float, ptr addrspace(1) readonly, i32, ptr addrspace(1) readonly, ptr, i64, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_cycles_o1, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Anc"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+"#;
+
+    let cb_o1_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Params = type { ptr addrspace(1), i32 }
+%struct.Payload8 = type { i32, float }
+
+define internal fastcc i1 @cb_helper(ptr addrspace(2) noundef align 16 dereferenceable(16) %launch_params_metal, ptr addrspace(5) noundef align 4 dereferenceable(8) %payload) {
+entry:
+  %buf_slot = getelementptr inbounds %struct.Params, ptr addrspace(2) %launch_params_metal, i64 0, i32 0
+  %buf = load ptr addrspace(1), ptr addrspace(2) %buf_slot, align 8
+  %v = load float, ptr addrspace(1) %buf, align 4
+  %pf = getelementptr inbounds %struct.Payload8, ptr addrspace(5) %payload, i64 0, i32 1
+  store float %v, ptr addrspace(5) %pf, align 4
+  %ok = fcmp ogt float %v, 0.000000e+00
+  ret i1 %ok
+}
+
+define <{ i1, i1 }> @__intersection__tri_o1(ptr addrspace(2) noundef align 16 dereferenceable(16) "air-buffer-no-alias" %launch_params_metal, ptr addrspace(5) noundef align 4 dereferenceable(8) %payload, i32 noundef %object, i32 noundef %primitive_id) local_unnamed_addr {
+entry:
+  %acc = call fastcc i1 @cb_helper(ptr addrspace(2) noundef align 16 dereferenceable(16) %launch_params_metal, ptr addrspace(5) noundef align 4 dereferenceable(8) %payload)
+  %r0 = insertvalue <{ i1, i1 }> undef, i1 %acc, 0
+  %r1 = insertvalue <{ i1, i1 }> %r0, i1 false, 1
+  ret <{ i1, i1 }> %r1
+}
+
+!air.intersection = !{!14}
+!14 = !{ptr @__intersection__tri_o1, !15, !18, !"air.triangle", !"air.instancing"}
+!15 = !{!16, !17}
+!16 = !{!"air.accept_intersection", !"air.arg_type_name", !"bool"}
+!17 = !{!"air.continue_search", !"air.arg_type_name", !"bool"}
+!18 = !{!19, !20, !21, !22}
+!19 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Params"}
+!20 = !{i32 1, !"air.payload", !"air.arg_type_size", i32 8, !"air.arg_type_name", !"Payload8"}
+!21 = !{i32 2, !"air.instance_id", !"air.arg_type_name", !"uint"}
+!22 = !{i32 3, !"air.primitive_id", !"air.arg_type_name", !"uint"}
+"#;
+
+    let (spv_o1, meta_o1) = garnetxlate::translate_bytes_stage3(
+        entry_o1_ll.as_bytes(),
+        [32, 1, 1],
+        &[],
+        &[],
+        &[],
+        &[(
+            "__intersection__tri_o1".to_string(),
+            metal2vulkan::linked_functions::IntersectionFunctionKind::TriangleAnyHit,
+            cb_o1_ll.as_bytes().to_vec(),
+        )],
+        Some(caps),
+    )
+    .expect("Cycles O1 opaque-pointer AS2 deref IFT Stage 3 failed");
+    assert_spirv_val("cycles_o1_direct", &spv_o1);
+    let _ = lower_arg_resources_checked("cycles_o1", &spv_o1, &meta_o1, Some(caps));
+
+    // O2: Opaque-pointer `storage_alias_alloca` (`TinyBox` -> `SD`) + `storage_pool` (`SD.closure[4]`) + mixed `select`.
+    let o2_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Globals = type { ptr addrspace(1) }
+%struct.TinyBox = type { [32 x i8] }
+%struct.Closure = type { <3 x float>, i32, float, <3 x float>, [48 x i8] }
+%struct.Bsdf = type { <3 x float>, i32, float, <3 x float>, float, float, float, float, i32, ptr, <3 x float> }
+%struct.Extra = type { <3 x float>, <3 x float> }
+%struct.SD = type { <3 x float>, i32, [4 x %struct.Closure] }
+
+define internal fastcc float @helper_eval_o2(ptr noundef %sd, ptr noundef %sc, ptr addrspace(1) noundef %opt_buf, i1 %use_sd) {
+entry:
+  %has_buf = icmp ne ptr addrspace(1) %opt_buf, null
+  %bsdf = bitcast ptr %sc to ptr
+  %fslot = getelementptr inbounds %struct.Bsdf, ptr %bsdf, i64 0, i32 9
+  %fcast = bitcast ptr %fslot to ptr
+  %ext = load ptr, ptr %fcast, align 8
+  %kptr = getelementptr inbounds %struct.Extra, ptr %ext, i64 0, i32 1
+  %k = load <3 x float>, ptr %kptr, align 16
+  %n_sc = getelementptr inbounds %struct.Closure, ptr %sc, i64 0, i32 3
+  %n_sd = getelementptr inbounds %struct.SD, ptr %sd, i64 0, i32 0
+  %sel_n = select i1 %use_sd, ptr %n_sd, ptr %n_sc
+  %n = load <3 x float>, ptr %sel_n, align 16
+  %nx = extractelement <3 x float> %n, i64 0
+  %kx = extractelement <3 x float> %k, i64 0
+  %sum = fadd float %nx, %kx
+  br i1 %has_buf, label %read_buf, label %done
+
+read_buf:
+  %bv = load float, ptr addrspace(1) %opt_buf, align 4
+  %with_buf = fadd float %sum, %bv
+  br label %done
+
+done:
+  %res = phi float [ %with_buf, %read_buf ], [ %sum, %entry ]
+  ret float %res
+}
+
+define void @k_cycles_o2(ptr addrspace(2) %globals, ptr addrspace(1) %out, i32 %idx) {
+entry:
+  %box = alloca %struct.TinyBox, align 16
+  %sd = bitcast ptr %box to ptr
+  %f0 = bitcast ptr %box to ptr
+  store <3 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00>, ptr %f0, align 16
+  %f1_raw = getelementptr inbounds %struct.TinyBox, ptr %box, i64 0, i32 0, i64 16
+  %f1 = bitcast ptr %f1_raw to ptr
+  store i32 7, ptr %f1, align 4
+  %idx64 = sext i32 %idx to i64
+  %c0 = getelementptr inbounds %struct.SD, ptr %sd, i64 0, i32 2, i64 %idx64
+  %c1 = getelementptr inbounds %struct.Closure, ptr %c0, i64 1
+  %n0 = getelementptr inbounds %struct.Closure, ptr %c0, i64 0, i32 3
+  store <3 x float> zeroinitializer, ptr %n0, align 16
+  %b0 = bitcast ptr %c0 to ptr
+  %e1 = bitcast ptr %c1 to ptr
+  %ek = getelementptr inbounds %struct.Extra, ptr %e1, i64 0, i32 1
+  store <3 x float> <float 4.000000e+00, float 5.000000e+00, float 6.000000e+00>, ptr %ek, align 16
+  %fslot = getelementptr inbounds %struct.Bsdf, ptr %b0, i64 0, i32 9
+  %fcast = bitcast ptr %fslot to ptr
+  store ptr %e1, ptr %fcast, align 8
+  %flag = icmp eq i32 %idx, 0
+  %gp = getelementptr inbounds %struct.Globals, ptr addrspace(2) %globals, i64 0, i32 0
+  %bda_buf = load ptr addrspace(1), ptr addrspace(2) %gp, align 8
+  %v1 = call fastcc float @helper_eval_o2(ptr noundef nonnull %sd, ptr noundef %c0, ptr addrspace(1) null, i1 %flag)
+  %v2 = call fastcc float @helper_eval_o2(ptr noundef nonnull %sd, ptr noundef %c0, ptr addrspace(1) %bda_buf, i1 %flag)
+  %tot = fadd float %v1, %v2
+  store float %tot, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_cycles_o2, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"Globals"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!5 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+    let out_o2 = call_stage3_with_caps(o2_ll, Some([32, 1, 1]), &[], Some(caps));
+    assert_eq!(out_o2.rc, RC_OK, "Cycles O2 opaque storage_alias + storage_pool failed: {}", out_o2.msg);
+    assert_spirv_val("cycles_o2_direct", &out_o2.spv);
+    let _ = lower_arg_resources_checked("cycles_o2", &out_o2.spv, &out_o2.meta, Some(caps));
+}
+
+#[test]
+fn wave5_cycles_native_int64_x1_x2_x3_and_ptr2_context_ffi() {
+    assert_eq!(GARNETX_CAP_NATIVE_INT64, 1 << 12);
+
+    let caps_base = RDNA4xBackendCapabilities {
+        struct_size: 24,
+        version: 1,
+        flags: GARNETX_CAP_RT_POSITION_FETCH
+            | GARNETX_CAP_RT_IFT_ABI_V2
+            | GARNETX_CAP_RT_PRIMITIVE_DATA,
+        subgroup_size: 64,
+        subgroup_supported_stages: 0x3f,
+        subgroup_supported_operations: 0xff,
+    };
+    let caps_i64 = RDNA4xBackendCapabilities {
+        flags: caps_base.flags | GARNETX_CAP_NATIVE_INT64,
+        ..caps_base
+    };
+
+    // X1: GARNETX_CAP_NATIVE_INT64 keeps native 64-bit integer arithmetic + OpCapability Int64
+    // (through both garnetx_translate_stage3 and garnetx_translate_with_capabilities), while the
+    // default without bit 12 keeps u32-half emulation unchanged.
+    let i64_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+define void @k_i64(ptr addrspace(1) readonly %inp, ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %a = load i64, ptr addrspace(1) %inp, align 8
+  %ext = zext i32 %tid to i64
+  %b = mul i64 %a, 7046029254386353131
+  %c = add i64 %b, 1234567890123
+  %d = sub i64 %c, %ext
+  store i64 %d, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_i64, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"ulong"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"ulong"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let find_u64_ty = |asm: &str| -> Option<String> {
+        asm.lines().find_map(|l| {
+            let t = l.trim();
+            t.ends_with("= OpTypeInt 64 0")
+                .then(|| t.split_whitespace().next().unwrap().to_string())
+        })
+    };
+    let has_typed_op = |asm: &str, op: &str, ty_id: &str| -> bool {
+        asm.lines().any(|l| {
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            toks.len() >= 4 && toks[1] == "=" && toks[2] == op && toks[3] == ty_id
+        })
+    };
+
+    let out_native = call_stage3_with_caps(i64_ll, Some([32, 1, 1]), &[], Some(caps_i64));
+    assert_eq!(out_native.rc, RC_OK, "X1 native_int64 stage3 failed: {}", out_native.msg);
+    let asm_native = spv_asm(&out_native.spv);
+    assert!(asm_native.contains("OpCapability Int64"), "{asm_native}");
+    let u64_ty = find_u64_ty(&asm_native).expect("missing OpTypeInt 64 0");
+    assert!(
+        has_typed_op(&asm_native, "OpIMul", &u64_ty),
+        "expected native 64-bit OpIMul ({u64_ty}):\n{asm_native}"
+    );
+    assert!(
+        has_typed_op(&asm_native, "OpIAdd", &u64_ty),
+        "expected native 64-bit OpIAdd ({u64_ty}):\n{asm_native}"
+    );
+    assert!(
+        has_typed_op(&asm_native, "OpISub", &u64_ty),
+        "expected native 64-bit OpISub ({u64_ty}):\n{asm_native}"
+    );
+    assert_spirv_val("x1_native_int64_stage3", &out_native.spv);
+    let _ = lower_arg_resources_checked("x1_native_int64", &out_native.spv, &out_native.meta, Some(caps_i64));
+
+    let out_emul = call_stage3_with_caps(i64_ll, Some([32, 1, 1]), &[], Some(caps_base));
+    assert_eq!(out_emul.rc, RC_OK, "X1 default u32-half stage3 failed: {}", out_emul.msg);
+    let asm_emul = spv_asm(&out_emul.spv);
+    if let Some(emul_u64) = find_u64_ty(&asm_emul) {
+        assert!(
+            !has_typed_op(&asm_emul, "OpIMul", &emul_u64),
+            "default (no GARNETX_CAP_NATIVE_INT64) must keep u32-half lowering:\n{asm_emul}"
+        );
+    }
+    assert_spirv_val("x1_default_emul_stage3", &out_emul.spv);
+
+    // Also test garnetx_translate_with_capabilities (ABI 3 entry point) with GARNETX_CAP_NATIVE_INT64.
+    let mut spv_ptr: *mut u8 = std::ptr::null_mut();
+    let mut spv_len = 0usize;
+    let mut meta_ptr: *mut u8 = std::ptr::null_mut();
+    let mut meta_len = 0usize;
+    let mut err_buf = [0 as c_char; 512];
+    let local = [32u32, 1, 1];
+    let rc_abi3 = unsafe {
+        garnetx_translate_with_capabilities(
+            i64_ll.as_ptr(),
+            i64_ll.len(),
+            local.as_ptr(),
+            &mut spv_ptr,
+            &mut spv_len,
+            &mut meta_ptr,
+            &mut meta_len,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+            &caps_i64,
+        )
+    };
+    assert_eq!(rc_abi3, RC_OK, "X1 ABI 3 garnetx_translate_with_capabilities failed");
+    let spv_abi3 = unsafe { std::slice::from_raw_parts(spv_ptr, spv_len).to_vec() };
+    unsafe {
+        garnetx_free(spv_ptr, spv_len);
+        garnetx_free(meta_ptr, meta_len);
+    }
+    let asm_abi3 = spv_asm(&spv_abi3);
+    assert!(asm_abi3.contains("OpCapability Int64"), "{asm_abi3}");
+    let abi3_u64 = find_u64_ty(&asm_abi3).expect("missing OpTypeInt 64 0 in ABI 3");
+    assert!(has_typed_op(&asm_abi3, "OpIMul", &abi3_u64), "{asm_abi3}");
+    assert_spirv_val("x1_native_int64_abi3", &spv_abi3);
+
+    // X3 + ptr addrspace(2) MetalKernelContext BDA forwarding:
+    // - MetalKernelContext { ptr addrspace(2) } stored in entry and loaded in fastcc helper must
+    //   forward the real 64-bit BDA (NOT OpConstantNull 0).
+    // - Opaque byte-box alloca with sub-struct call arg (%struct.Diff), read-only <3 x float>
+    //   prefix load of a <4 x float> field alongside a sibling <4 x float> load, and pointer
+    //   select across sub-fields must promote cleanly to %struct.SDVol.
+    let x3_ptr2_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%class.MetalKernelContext = type { ptr addrspace(2) }
+%struct.KernelCam = type { i32, float, float }
+%struct.KernelParams = type { ptr addrspace(1), float, %struct.KernelCam }
+%struct.TinyBox = type { [64 x i8] }
+%struct.Diff = type { float, float }
+%struct.Tfm = type { <4 x float>, <4 x float> }
+%struct.SDVol = type { %struct.Diff, i64, %struct.Tfm, <3 x float> }
+
+define internal fastcc float @read_cam_aperture(ptr addrspace(2) noundef %cam) {
+entry:
+  %blades = getelementptr inbounds %struct.KernelCam, ptr addrspace(2) %cam, i64 0, i32 1
+  %b = load float, ptr addrspace(2) %blades, align 4
+  %rot = getelementptr inbounds %struct.KernelCam, ptr addrspace(2) %cam, i64 0, i32 2
+  %r = load float, ptr addrspace(2) %rot, align 4
+  %sum = fadd float %b, %r
+  ret float %sum
+}
+
+define internal fastcc void @write_diff(ptr noundef %d, float %x, float %y) {
+entry:
+  %dx = getelementptr inbounds %struct.Diff, ptr %d, i64 0, i32 0
+  store float %x, ptr %dx, align 4
+  %dy = getelementptr inbounds %struct.Diff, ptr %d, i64 0, i32 1
+  store float %y, ptr %dy, align 4
+  ret void
+}
+
+define internal fastcc float @vol_helper(ptr noundef %this, i32 %tid) {
+entry:
+  %storage = alloca %struct.TinyBox, align 16
+  %lp_slot = getelementptr inbounds %class.MetalKernelContext, ptr %this, i64 0, i32 0
+  %lp = load ptr addrspace(2), ptr %lp_slot, align 8
+  %arr_slot = getelementptr inbounds %struct.KernelParams, ptr addrspace(2) %lp, i64 0, i32 0
+  %arr = load ptr addrspace(1), ptr addrspace(2) %arr_slot, align 8
+  %cam_p = getelementptr inbounds %struct.KernelParams, ptr addrspace(2) %lp, i64 0, i32 2
+  %cam_v = call fastcc float @read_cam_aperture(ptr addrspace(2) noundef %cam_p)
+  %idx = zext i32 %tid to i64
+  %elem_p = getelementptr inbounds float, ptr addrspace(1) %arr, i64 %idx
+  %raw_val = load float, ptr addrspace(1) %elem_p, align 4
+  %val = fadd float %raw_val, %cam_v
+  %sd_alias = bitcast ptr %storage to ptr
+  %diff_raw = getelementptr inbounds %struct.TinyBox, ptr %storage, i64 0, i32 0, i64 0
+  %diff_p = bitcast ptr %diff_raw to ptr
+  call fastcc void @write_diff(ptr noundef nonnull %diff_p, float %val, float 2.000000e+00)
+  %r0_raw = getelementptr inbounds %struct.TinyBox, ptr %storage, i64 0, i32 0, i64 16
+  %r0_v3 = bitcast ptr %r0_raw to ptr
+  %r0_v4 = bitcast ptr %r0_raw to ptr
+  %r1_raw = getelementptr inbounds %struct.TinyBox, ptr %storage, i64 0, i32 0, i64 32
+  %r1_v4 = bitcast ptr %r1_raw to ptr
+  %v4_init = insertelement <4 x float> <float 1.0, float 2.0, float 3.0, float 4.0>, float %val, i64 0
+  store <4 x float> %v4_init, ptr %r0_v4, align 16
+  store <4 x float> <float 5.0, float 6.0, float 7.0, float 8.0>, ptr %r1_v4, align 16
+  %v3 = load <3 x float>, ptr %r0_v3, align 16
+  %v4 = load <4 x float>, ptr %r0_v4, align 16
+  %cond = icmp eq i32 %tid, 0
+  %sel_raw = select i1 %cond, ptr %r0_raw, ptr %r1_raw
+  %sel_p = bitcast ptr %sel_raw to ptr
+  %sel_v4 = load <4 x float>, ptr %sel_p, align 16
+  %sd_dx_p = getelementptr inbounds %struct.SDVol, ptr %sd_alias, i64 0, i32 0, i32 0
+  %sd_dx = load float, ptr %sd_dx_p, align 4
+  %a = extractelement <3 x float> %v3, i64 0
+  %b = extractelement <4 x float> %v4, i64 3
+  %c = extractelement <4 x float> %sel_v4, i64 0
+  %s0 = fadd float %sd_dx, %a
+  %s1 = fadd float %s0, %b
+  %s2 = fadd float %s1, %c
+  ret float %s2
+}
+
+define void @k_x3_ptr2(ptr addrspace(2) readonly %launch_params, ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %ctx = alloca %class.MetalKernelContext, align 8
+  %lp_slot = getelementptr inbounds %class.MetalKernelContext, ptr %ctx, i64 0, i32 0
+  store ptr addrspace(2) %launch_params, ptr %lp_slot, align 8
+  %res = call fastcc float @vol_helper(ptr noundef nonnull %ctx, i32 %tid)
+  %idx = zext i32 %tid to i64
+  %dst = getelementptr inbounds float, ptr addrspace(1) %out, i64 %idx
+  store float %res, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_x3_ptr2, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"KernelParams"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let out_x3 = call_stage3_with_caps(x3_ptr2_ll, Some([32, 1, 1]), &[], Some(caps_i64));
+    assert_eq!(out_x3.rc, RC_OK, "X3 + ptr(2) MetalKernelContext failed: {}", out_x3.msg);
+    let asm_x3 = spv_asm(&out_x3.spv);
+    let x3_u64 = find_u64_ty(&asm_x3).expect("missing OpTypeInt 64 0 in X3+ptr2");
+    assert!(
+        has_typed_op(&asm_x3, "OpLoad", &x3_u64) && asm_x3.contains("Aligned 8"),
+        "MetalKernelContext->launch_params must load real 64-bit BDA (not OpConstantNull):\n{asm_x3}"
+    );
+    assert_spirv_val("x3_ptr2_direct", &out_x3.spv);
+    let _ = lower_arg_resources_checked("x3_ptr2", &out_x3.spv, &out_x3.meta, Some(caps_i64));
+
+    // shade_volume regression:
+    // 1) polymorphic storage pool (`ShaderData.closure[64]`) with a pool-to-pool
+    //    `llvm.memcpy.p0.p0.i64(..., 96)` compaction alongside polymorphic `%struct.Bsdf` field access,
+    // 2) `llvm.memset.p0.i64` entering a struct (`VolumeIntegrateResult`-shaped) through a GEP to a
+    //    leading `i8` field (`%f0 = gep %VolRes, %res, 0, 0`).
+    let pool_memcpy_ll = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-v96:128:128-v128:128:128"
+target triple = "air64_v28-apple-macosx26.7.0"
+
+%struct.Closure = type { <3 x float>, i32, float, <3 x float>, [48 x i8] }
+%struct.Bsdf = type { <3 x float>, i32, float, <3 x float>, float, float }
+%struct.State = type { i32, [4 x %struct.Closure] }
+%struct.VolRes = type { i8, <3 x float>, float, [8 x i8], i8, <3 x float> }
+
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)
+
+define void @k_pool_memcpy(ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %sd = alloca %struct.State, align 16
+  %vr = alloca %struct.VolRes, align 16
+  %vr0 = getelementptr inbounds %struct.VolRes, ptr %vr, i64 0, i32 0
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 16 dereferenceable(64) %vr0, i8 0, i64 64, i1 false)
+  %vr_f = getelementptr inbounds %struct.VolRes, ptr %vr, i64 0, i32 2
+  %z = load float, ptr %vr_f, align 4
+  %idx = and i32 %tid, 1
+  %idx64 = zext i32 %idx to i64
+  %base = getelementptr inbounds %struct.State, ptr %sd, i64 0, i32 1, i64 %idx64
+  %next = getelementptr inbounds %struct.Closure, ptr %base, i64 1
+  %next_bsdf = getelementptr inbounds %struct.Bsdf, ptr %next, i64 0, i32 4
+  store float 3.500000e+00, ptr %next_bsdf, align 16
+  %dst_bc = bitcast ptr %base to ptr
+  %src_bc = bitcast ptr %next to ptr
+  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 16 dereferenceable(96) %dst_bc, ptr noundef nonnull align 16 dereferenceable(96) %src_bc, i64 96, i1 false)
+  %dst_bsdf = getelementptr inbounds %struct.Bsdf, ptr %base, i64 0, i32 4
+  %v = load float, ptr %dst_bsdf, align 16
+  %sum = fadd float %v, %z
+  %out_idx = zext i32 %tid to i64
+  %dst = getelementptr inbounds float, ptr addrspace(1) %out, i64 %out_idx
+  store float %sum, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k_pool_memcpy, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let out_pm = call_stage3_with_caps(pool_memcpy_ll, Some([32, 1, 1]), &[], Some(caps_i64));
+    assert_eq!(out_pm.rc, RC_OK, "storage_pool pool-to-pool memcpy failed: {}", out_pm.msg);
+    assert_spirv_val("pool_memcpy_direct", &out_pm.spv);
+    let _ = lower_arg_resources_checked("pool_memcpy", &out_pm.spv, &out_pm.meta, Some(caps_i64));
 }
