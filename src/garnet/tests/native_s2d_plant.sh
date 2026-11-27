@@ -160,7 +160,7 @@ plant 52 $SR/amd/garnet_session_vm.cpp "the selector body ignores non-zero flags
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);' '    if (out == nullptr) return kIOReturnBadArgument;
     return (IOReturn)rdna4dcn::modeTrial(row, dwellMs, flags, out);'
 plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = GARNET_KEXT_BUILD;' 'kN1cKextBuild = 606;'
-plant 54 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     13u' '#define RDNA4N_ABI_MINOR     4u'
+plant 54 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     14u' '#define RDNA4N_ABI_MINOR     4u'
 plant 55 $SR/amd/smu_dal_pure.h "the DID table: divider of DID 0x40..0x5F is 4-stepped" 'did < 0x60u ? 64u + 2u * (did - 0x40u)' 'did < 0x60u ? 64u + 4u * (did - 0x40u)'
 plant 56 tools/native/rdna4mode.c "the tool does not print the watch warning" '; WATCH THE MONITOR)' ')'
 

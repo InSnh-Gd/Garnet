@@ -154,7 +154,7 @@ plant 68 $SR/amd/garnet_session_vm.cpp '    if (!sess_hello(ref)) return kIORetu
     if (flags != 0ull || step < RDNA4N_DAL_STEP_E1B' '    if (app_refused(ref, rdna4native::g4::kCallScanout)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): the display plane / mode / DAL belong to WindowServer and the administrator
     if (flags != 0ull || step < RDNA4N_DAL_STEP_E1B' "selector 15 does not need Hello"
 plant 69 $SR/GarnetNativeClient.cpp 'if (!shape(2, 0, 0, sizeof(rdna4n_dal_result))) return kIOReturnBadArgument;' 'if (!shape(2, 0, 0, 0)) return kIOReturnBadArgument;' "selector 15's output shape is not checked"
-plant 70 $SR/GarnetNativeABI.h '#define RDNA4N_ABI_MINOR     13u ' '#define RDNA4N_ABI_MINOR     1u ' "the ABI minor is not raised"
+plant 70 $SR/GarnetNativeABI.h '#define RDNA4N_ABI_MINOR     14u ' '#define RDNA4N_ABI_MINOR     1u ' "the ABI minor is not raised"
 VER=$(tr -d ' \t\r\n' < "$K/VERSION")
 plant 71 $K/Info.plist "<key>CFBundleVersion</key>
 	<string>$VER</string>" '<key>CFBundleVersion</key>

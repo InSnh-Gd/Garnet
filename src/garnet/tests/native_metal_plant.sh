@@ -141,7 +141,7 @@ plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = GA
 plant 41 $K/Info.plist "the plist is not bumped (one occurrence)" "<key>CFBundleShortVersionString</key>
 	<string>$VER</string>" '<key>CFBundleShortVersionString</key>
 	<string>0.0.610</string>'
-plant 42 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     13u ' '#define RDNA4N_ABI_MINOR     7u '
+plant 42 $SR/GarnetNativeABI.h "the ABI minor is not bumped" '#define RDNA4N_ABI_MINOR     14u ' '#define RDNA4N_ABI_MINOR     7u '
 plant 43 $SR/GarnetNativeABI.h "the withdraw selector moves" 'RDNA4N_SEL_METAL_NUB_WITHDRAW = 20,' 'RDNA4N_SEL_METAL_NUB_WITHDRAW = 21,'
 plant 44 $SR/GarnetMetalOps.h "the ops table grows a member in the middle (offsets move)" '    uint32_t reserved0;    /*  20  0 */' '    uint32_t reserved0;    /*  20  0 */
     uint32_t sneaky;'

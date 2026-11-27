@@ -139,7 +139,7 @@ plant 46 $E 'rdna4native::g4::budget_pack(rdna4native::g4::budget_report(' '(voi
 plant 47 $E '    othersHeld = gVramOthers; ptHeld = rdna4native::g2::pt_held_bytes(gPtN, kArenaBlockBytes);' '    othersHeld = 0; ptHeld = 0;' "BUDGET 47 (kernel): QueryInfo reports an empty budget counter (always full headroom)"
 plant 110 $E '    IOLockLock(gCliLock);   // one snapshot for the pool numbers and the budget below (no session lock is held here, never across a GPU wait)' '    (void)gCliLock;' "BUDGET 110 (kernel): QueryInfo mixes pool and counter generations (no snapshot lock)"
 plant 48 $A '#define RDNA4N_INFO_R_BUDGET_AVAIL_LO 6u' '#define RDNA4N_INFO_R_BUDGET_AVAIL_LO 5u' "BUDGET 48: the ABI index of the available word collides"
-plant 49 $A '#define RDNA4N_ABI_MINOR     13u ' '#define RDNA4N_ABI_MINOR     9u ' "BUDGET 49: the ABI minor is not bumped"
+plant 49 $A '#define RDNA4N_ABI_MINOR     14u ' '#define RDNA4N_ABI_MINOR     9u ' "BUDGET 49: the ABI minor is not bumped"
 # ---- R6 on the close path ----
 plant 50 $P '    return !(appsOn && isVisVram && hasDescriptor && descriptorRefs > 1u);' '    return !(appsOn && isVisVram && hasDescriptor && descriptorRefs > 2u);' "CLOSE 50 (pure): one live mapping is not seen at close"
 plant 51 $P '    return !(appsOn && isVisVram && hasDescriptor && descriptorRefs > 1u);' '    (void)appsOn; return !(isVisVram && hasDescriptor && descriptorRefs > 1u);' "CLOSE 51 (pure): the switch-off identity is lost (OFF leaks too)"

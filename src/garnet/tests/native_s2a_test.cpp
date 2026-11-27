@@ -57,7 +57,7 @@ static void s1_abi() {
     expect_u("the v1.0 selector count is unchanged (old clients' tables stay valid)", RDNA4N_SEL_COUNT, 9);
     expect_u("the ABI 1.1 selector count", RDNA4N_SEL_COUNT_1_1, 15);
     expect_u("ABI major unchanged: every v1.0 client still handshakes", RDNA4N_ABI_VERSION, 1);
-    expect_u("ABI minor (1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26; 1.12 since 0.0.662: the instance-1 (monitor A) scanout behind garnet-m6flip1)", RDNA4N_ABI_MINOR, 13);
+    expect_u("ABI minor (1.14: WebKit-silent APP aliases 30/31/39 + info flags 8..10; 1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26; 1.12 since 0.0.662: the instance-1 (monitor A) scanout behind garnet-m6flip1)", RDNA4N_ABI_MINOR, 14);
     expect(RDNA4N_HELLO_F_MINOR != 1u && (RDNA4N_HELLO_F_MINOR & 1u) == 0u, "the minor flag is not bit 0: T1's Hello(flags = 1) is still refused");
     expect_u("query size", sizeof(rdna4n_scan_query), 96); expect_u("reg size", sizeof(rdna4n_scan_reg), 32);
     expect_u("slot size", sizeof(rdna4n_scan_slot), 32);   expect_u("status size", sizeof(rdna4n_scan_status), 256);
@@ -65,7 +65,7 @@ static void s1_abi() {
     expect_u("no-slot value equal", RDNA4N_SCAN_NO_SLOT, kNoSlot);
     expect_u("format constant", RDNA4N_SCAN_FMT_ARGB8888, kFmtArgb8888);
     expect_u("a v1.0 client's Hello out[0] (no flag) would be exactly the major", (uint64_t)RDNA4N_ABI_VERSION, 1);
-    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16), 0xD0001);
+    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16), 0xE0001);
 }
 
 static BoRef vis(uint64_t mc, uint64_t size) { return BoRef{ true, mc, size }; }

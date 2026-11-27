@@ -43,8 +43,8 @@ static std::string fn_body(const std::string &src, const std::string &sig) {    
 
 // ---- R1 ------------------------------------------------------------------------------------------------------------------------------------------------
 // The expected sets are written out here, NOT derived from the functions under test.
-static bool in_app_set(uint32_t s) { return s == 0 || s == 1 || (s >= 3 && s <= 8) || s == 21 || s == 27 || s == 28; }
-static bool in_ws_set(uint32_t s) { return s <= 14 || s == 21 || (s >= 22 && s <= 28); }
+static bool in_app_set(uint32_t s) { return s == 0 || s == 1 || (s >= 3 && s <= 8) || s == 21 || s == 27 || s == 28 || s == 30 || s == 31 || s == 39; }
+static bool in_ws_set(uint32_t s) { return s <= 14 || s == 21 || (s >= 22 && s <= 28) || s == 30 || s == 31 || s == 39; }
 static void r1_matrix() {
     expect_u("route Bringup is 0", kRouteBringup, 0); expect_u("route Accelerator is 1", kRouteAccelerator, 1);
     expect(route_valid(0) && route_valid(1) && !route_valid(2) && !route_valid(0xFFFFFFFFu), "only the two routes are valid");
@@ -66,7 +66,9 @@ static void r1_matrix() {
             expect(selector_permitted(kRouteBringup, admin != 0, app != 0, sel) == (selector_allowed(admin != 0, sel) && (!app || selector_allowed_for_app(sel))), "BRINGUP route = the two old predicates and nothing else");
         }
     }
-    expect_u("the accelerator route admits 11 selectors x 4 flag combinations over 0..69", accelAllowed, 11 * 4);
+    expect_u("the accelerator route admits 14 selectors x 4 flag combinations over 0..69 (incl. ABI 1.14 aliases 30/31/39, excluding VCN5 reserved 29)", accelAllowed, 14 * 4);
+    expect(!selector_permitted(kRouteAccelerator, true, false, 29), "accelerator route, selector 29 (reserved for VCN 5.0): refused in ABI 1.14");
+    expect(selector_permitted(kRouteAccelerator, false, true, 30) && selector_permitted(kRouteAccelerator, false, true, 31) && selector_permitted(kRouteAccelerator, false, true, 39), "accelerator route, APP, WebKit-silent aliases 30/31/39: allowed");
     // the named cases of the brief
     expect(selector_permitted(kRouteAccelerator, true, false, 4), "accelerator route, administrator, BoCreate: allowed");
     expect(!selector_permitted(kRouteAccelerator, true, false, 19), "accelerator route, administrator, selector 19: refused");
