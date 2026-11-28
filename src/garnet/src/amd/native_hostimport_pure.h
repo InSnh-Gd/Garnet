@@ -1,5 +1,5 @@
 //
-//  native_hostimport_pure.h - the pure half of BoImportHost (ABI 1.9, kext 0.0.612, milestone #11 step 11c; an internal design note sections 3 (Q2) and 4 (Q3)). No kernel
+//  native_hostimport_pure.h - the pure half of BoImportHost (ABI 1.9, kext 0.0.612, milestone #11 step 11c; driver contract
 //  header: tests/native_hostimport_test.cpp compiles this very file and drives it; n1c_bo_import_host / bo_release in native_s1c.cpp are the callers.
 //
 //  What BoImportHost is: the caller (WindowServer, through the bundle) hands the kernel a page-aligned range of ITS OWN address space (an IOSurface's base address); the kernel wires

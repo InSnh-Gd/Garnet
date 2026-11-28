@@ -1,11 +1,11 @@
 //
 //  scanx_flow.h - build 0.0.661 (M6 Stage 1b, ABI 1.11, behind the boot-arg latches garnet-m6=1 AND garnet-m6flip=1) + 0.0.662 (M6 Stage 2, ABI 1.12, plus garnet-m6flip1=1): the SEQUENCES of the HDMI displays' scanout (the monitor B, "instance 2": HUBP2 / OTG2, and the monitor A, "instance 1": HUBP1 / OTG1) for the GPU-composited
 //  desktop, written against an environment E so tests/native_scanx_test.cpp runs the code the kext runs over a fake HUBP2 register file and a call recorder. C++17, no kernel header. The contract is the last section
-//  ("Q2: Stage 1b build contract") of an internal design note, items 4..11; the decisions it reuses are scanout_pure.h's (slot table, reuse rule, restore verification) UNCHANGED.
+//  multi-display scanout contract; the decisions it reuses are scanout_pure.h's (slot table, reuse rule, restore verification) UNCHANGED.
 //
 //  0.0.659's glue escapes (c06 / c08) were sequencing in glue that no test reached: THIS FILE is the only place the sequencing lives (the kext glue in dcn/dcn.cpp supplies the environment and nothing else).
 //
-//  0.0.662 (Stage 2, "Stage 2 build contract (monitor A, instance 1)" of an internal design note, section 2): EVERYTHING that was hard-wired to the monitor B is now a field of an XDesc (one constexpr per instance: kDescMonA, kDescMonB; ONE lookup, desc_of(inst)). Every flow takes
+//  0.0.662 (Stage 2, monitor A scanout contract): EVERYTHING that was hard-wired to the monitor B is now a field of an XDesc (one constexpr per instance: kDescMonA, kDescMonB; ONE lookup, desc_of(inst)). Every flow takes
 //  the descriptor (`const XDesc &d`) next to the environment; one ScanX and one leaf lock exist PER INSTANCE and the glue never holds two of them. The monitor B's descriptor carries exactly 0.0.661's constants (the monitor B's behaviour is unchanged).
 //
 //  WHAT THIS WRITES: exactly two registers PER INSTANCE - HUBPREQn_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH then ..._ADDRESS (instance 2: 0x3c83 then 0x3c82; instance 1: 0x3ba7 then 0x3ba6, d.addrHigh / d.addrLow) - through ONE guarded writer

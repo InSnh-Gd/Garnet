@@ -35,6 +35,13 @@ ACCEL_EXECUTABLE = "GarnetAccel"
 PCIBARCOMPAT_KEXT = "GarnetPCIBarCompat.kext"
 PCIBARCOMPAT_ID = "org.garnet.pcibarcompat"
 PCIBARCOMPAT_EXECUTABLE = "GarnetPCIBarCompat"
+ANCHOR_INJECTOR_KEXT = "GarnetAnchorInjector.kext"
+ANCHOR_INJECTOR_ID = "org.garnet.anchor-injector"
+ANCHOR_ID = "org.garnet.code-signing"
+AMFIANCHOR_KEXT = "AMFIAnchor.kext"
+AMFIANCHOR_ID = "org.b00t0x.AMFIAnchor"
+AMFIANCHOR_EXECUTABLE = "AMFIAnchor"
+RECOVER_EFI_REL = "optional/GarnetRecover.efi"
 DELIVERY_FORMAT = "garnet-delivery-v1"
 LEGACY_IDENTITY_TOKENS = (
     b"AMDRadeonRDNA4",
@@ -412,6 +419,64 @@ def command_pcibarcompat(args):
     )
 
 
+def verify_amfianchor_kext(kext_path):
+    kext = Path(kext_path).resolve()
+    if kext.name != AMFIANCHOR_KEXT:
+        raise IdentityError(
+            "amfianchor bundle must be {}, got {}".format(AMFIANCHOR_KEXT, kext.name)
+        )
+    plist = kext / "Contents/Info.plist"
+    try:
+        data = plist.read_bytes()
+        info = plistlib.loads(data)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise IdentityError("cannot read {}: {}".format(plist, error)) from error
+    if info.get("CFBundleIdentifier") != AMFIANCHOR_ID:
+        raise IdentityError("wrong AMFIAnchor CFBundleIdentifier: {!r}".format(info.get("CFBundleIdentifier")))
+    executable = info.get("CFBundleExecutable")
+    if executable != AMFIANCHOR_EXECUTABLE:
+        raise IdentityError("wrong AMFIAnchor CFBundleExecutable: {!r}".format(executable))
+    binary = kext / "Contents/MacOS" / executable
+    if not binary.is_file():
+        raise IdentityError("missing AMFIAnchor executable: {}".format(binary))
+    version = info.get("CFBundleVersion")
+    if not version:
+        raise IdentityError("AMFIAnchor bundle has no CFBundleVersion")
+    output = {
+        "amfianchor.bundle": kext.name,
+        "amfianchor.identifier": info["CFBundleIdentifier"],
+        "amfianchor.executable": executable,
+        "amfianchor.version": str(version),
+        "amfianchor.info_plist_sha256": sha256_bytes(data),
+        "amfianchor.executable_sha256": sha256_bytes(binary.read_bytes()),
+    }
+    return output
+
+
+def command_amfianchor(args):
+    for key, value in verify_amfianchor_kext(args.kext).items():
+        print("{}={}".format(key, value))
+
+
+def verify_pe32plus_efi(efi_path):
+    data = efi_path.read_bytes()
+    if len(data) < 0x100 or data[:2] != b"MZ":
+        raise IdentityError("invalid EFI binary (missing MZ header): {}".format(efi_path))
+    pe_off = int.from_bytes(data[0x3C:0x40], "little")
+    if pe_off + 0x70 > len(data) or data[pe_off : pe_off + 4] != b"PE\x00\x00":
+        raise IdentityError("invalid EFI binary (missing PE header): {}".format(efi_path))
+    machine = int.from_bytes(data[pe_off + 4 : pe_off + 6], "little")
+    opt_off = pe_off + 24
+    magic = int.from_bytes(data[opt_off : opt_off + 2], "little")
+    subsystem = int.from_bytes(data[opt_off + 68 : opt_off + 70], "little")
+    if machine != 0x8664 or magic != 0x020B or subsystem != 10:
+        raise IdentityError(
+            "EFI binary {} must be x86_64 PE32+ EFI application (machine=0x{:x}, magic=0x{:x}, subsystem={})".format(
+                efi_path, machine, magic, subsystem
+            )
+        )
+
+
 def command_input(args):
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", args.label):
         raise IdentityError("input label must be uppercase KEY: {!r}".format(args.label))
@@ -510,16 +575,16 @@ def command_manifest(args):
         )
     if args.release_mode == "1":
         if args.pcibarcompat_identity is None:
-            raise IdentityError("Release 1 manifest requires --pcibarcompat-identity")
+            raise IdentityError("Release manifest requires --pcibarcompat-identity")
         if args.target_silicon != RELEASE_TARGET_SILICON:
             raise IdentityError(
-                "Release 1 TARGET_SILICON must be {}, got {!r}".format(
+                "Release TARGET_SILICON must be {}, got {!r}".format(
                     RELEASE_TARGET_SILICON, args.target_silicon
                 )
             )
         if args.target_pci_ids != RELEASE_TARGET_PCI_IDS:
             raise IdentityError(
-                "Release 1 TARGET_PCI_IDS must be {}, got {!r}".format(
+                "Release TARGET_PCI_IDS must be {}, got {!r}".format(
                     RELEASE_TARGET_PCI_IDS, args.target_pci_ids
                 )
             )
@@ -527,13 +592,13 @@ def command_manifest(args):
             r"[0-9a-f]{64}", args.default_layout_id
         ):
             raise IdentityError(
-                "Release 1 DEFAULT_LAYOUT_ID must be 64-char hex SHA256, got {!r}".format(
+                "Release DEFAULT_LAYOUT_ID must be 64-char hex SHA256, got {!r}".format(
                     args.default_layout_id
                 )
             )
         if args.amd_firmware_license != RELEASE_FIRMWARE_LICENSE:
             raise IdentityError(
-                "Release 1 AMD_FIRMWARE_LICENSE must be {}, got {!r}".format(
+                "Release AMD_FIRMWARE_LICENSE must be {}, got {!r}".format(
                     RELEASE_FIRMWARE_LICENSE, args.amd_firmware_license
                 )
             )
@@ -546,6 +611,26 @@ def command_manifest(args):
             values["DEFAULT_ACCEL_VARIANT_PATH"] = args.default_accel_variant_path
     elif args.release_mode not in (None, "0"):
         raise IdentityError("invalid --release-mode: {!r}".format(args.release_mode))
+    if args.trust_anchor_identity is not None:
+        if not args.trust_anchor_identity:
+            raise IdentityError("delivery manifest trust-anchor identity path is empty")
+        anchor = read_identity_values(Path(args.trust_anchor_identity).resolve())
+        values["TRUST_ANCHOR_ENABLED"] = "1"
+        values["TRUST_ANCHOR_BUNDLE_ID"] = anchor.get("anchor.bundle_id", "")
+        values["TRUST_ANCHOR_ID"] = anchor.get("anchor.id", "")
+        values["TRUST_ANCHOR_SKID"] = anchor.get("anchor.skid", "")
+        values["TRUST_ANCHOR_INFO_SHA256"] = anchor.get("anchor.info_plist_sha256", "")
+        expected_ids["TRUST_ANCHOR_BUNDLE_ID"] = ANCHOR_INJECTOR_ID
+        expected_ids["TRUST_ANCHOR_ID"] = ANCHOR_ID
+        sha_keys.append("TRUST_ANCHOR_INFO_SHA256")
+        if not re.fullmatch(r"[0-9a-f]{40}", values["TRUST_ANCHOR_SKID"]):
+            raise IdentityError("delivery manifest TRUST_ANCHOR_SKID must be 40-char lowercase hex")
+        if args.amfianchor_bundled not in ("0", "1"):
+            raise IdentityError("invalid --amfianchor-bundled: {!r}".format(args.amfianchor_bundled))
+        values["AMFIANCHOR_BUNDLED"] = args.amfianchor_bundled
+    else:
+        values["TRUST_ANCHOR_ENABLED"] = "0"
+        values["AMFIANCHOR_BUNDLED"] = "0"
     for key, value in values.items():
         if not value:
             raise IdentityError("delivery manifest is missing {}".format(key))
@@ -704,9 +789,11 @@ def command_verify_release_payload(args):
         "uninstall-native.sh",
         "deploy-common.sh",
         "activate-native.sh",
+        "recover-uninstall.sh",
         "collect-installed.sh",
         "com.garnet.native.plist",
         "com.garnet.native-translate.plist",
+        "com.garnet.recovery.plist",
         "LICENSE.amdgpu",
         "default-app-denylist.txt",
         "layout-fingerprint.json",
@@ -720,7 +807,7 @@ def command_verify_release_payload(args):
         if not p.is_file() or p.stat().st_size == 0 and rel not in ("default-app-denylist.txt",):
             raise IdentityError("missing or empty required release file: {}".format(rel))
     if (payload / "GarnetAccel.kext").exists():
-        raise IdentityError("Release 1 payload must place GarnetAccel.kext under variants/<shortId>/ only")
+        raise IdentityError("Release payload must place GarnetAccel.kext under variants/<shortId>/ only")
 
     icd = json.loads((payload / "optional/vulkan/radeon_icd.x86_64.json").read_text(encoding="utf-8"))
     if icd.get("file_format_version") != "1.0.0":
@@ -760,9 +847,41 @@ def command_verify_release_payload(args):
     if not seen_default:
         raise IdentityError("defaultVariant {} not listed in variants/index.json".format(default_lid))
 
+    recover_efi = payload / RECOVER_EFI_REL
+    if recover_efi.exists():
+        verify_pe32plus_efi(recover_efi)
+
+    trust_enabled = manifest_kv.get("TRUST_ANCHOR_ENABLED", "0")
+    anchor_kext = payload / "optional" / ANCHOR_INJECTOR_KEXT
+    amfianchor_kext = payload / "optional" / AMFIANCHOR_KEXT
+    if trust_enabled == "1":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import make_anchor_injector  # noqa: E402
+
+        try:
+            anchor_kv = make_anchor_injector.verify_injector_bundle(
+                anchor_kext,
+                expected_bundle_id=ANCHOR_INJECTOR_ID,
+                expected_anchor_id=ANCHOR_ID,
+            )
+        except make_anchor_injector.AnchorError as err:
+            raise IdentityError("trust-anchor injector verification failed: {}".format(err)) from err
+        if manifest_kv.get("TRUST_ANCHOR_ID") != ANCHOR_ID:
+            raise IdentityError("MANIFEST.txt TRUST_ANCHOR_ID mismatch")
+        if manifest_kv.get("TRUST_ANCHOR_SKID") != anchor_kv["anchor.skid"]:
+            raise IdentityError("MANIFEST.txt TRUST_ANCHOR_SKID disagrees with GarnetAnchorInjector.kext")
+        if manifest_kv.get("AMFIANCHOR_BUNDLED") == "1":
+            verify_amfianchor_kext(amfianchor_kext)
+    elif trust_enabled == "0":
+        if anchor_kext.exists():
+            raise IdentityError("GarnetAnchorInjector.kext present while TRUST_ANCHOR_ENABLED=0")
+    else:
+        raise IdentityError("invalid TRUST_ANCHOR_ENABLED value: {!r}".format(trust_enabled))
+
     print("release_payload.verified=true")
     print("release_payload.file_count={}".format(len(recorded)))
     print("release_payload.default_layout_id={}".format(default_lid))
+    print("release_payload.trust_anchor_enabled={}".format(trust_enabled))
 
 
 def local_source_entry(repo, relative):
@@ -901,6 +1020,10 @@ def build_parser():
     pcibarcompat.add_argument("kext")
     pcibarcompat.set_defaults(func=command_pcibarcompat)
 
+    amfianchor = subparsers.add_parser("amfianchor")
+    amfianchor.add_argument("kext")
+    amfianchor.set_defaults(func=command_amfianchor)
+
     input_identity = subparsers.add_parser("input")
     input_identity.add_argument("label")
     input_identity.add_argument("path")
@@ -911,6 +1034,8 @@ def build_parser():
     manifest.add_argument("--garnet-identity", required=True)
     manifest.add_argument("--accel-identity", required=True)
     manifest.add_argument("--pcibarcompat-identity")
+    manifest.add_argument("--trust-anchor-identity")
+    manifest.add_argument("--amfianchor-bundled", default="0")
     manifest.add_argument("--release-mode", default="0")
     manifest.add_argument("--target-silicon", default="")
     manifest.add_argument("--target-pci-ids", default="")

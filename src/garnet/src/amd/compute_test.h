@@ -121,7 +121,7 @@ struct ComputeTestResult {
 //                     buffer whose first 8 bytes hold the result address, which
 //                     is the standard convention and the only one that
 //                     generalises past a single argument. Selected by the
-//                     boot-arg rdna4-hsa-abi=1. See notes/B1-COMPILER-BRIDGE.md.
+//                     boot-arg rdna4-hsa-abi=1. Built via src/garnet/tools/build-shader.sh.
 kern_return_t compute_dispatch_test(DeviceContext &dev,
                                     GMCContext &gmc,
                                     CPContext &cp,

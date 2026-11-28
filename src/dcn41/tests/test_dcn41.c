@@ -1,7 +1,7 @@
 /*
  * test_dcn41.c - host unit tests for the dcn41 register layer that do NOT depend on Linux being compiled.
  *
- * Expected absolute addresses are written out by hand from notes/DISPLAY-TRACK.md section 6 ("Absolute = 0x34c0 +
+ * Expected absolute addresses are written out by hand from DCN 4.1 IP discovery bases("Absolute = 0x34c0 +
  * base-2 offset", with offsets such as regOTG0_OTG_CONTROL 0x1b43 and regHUBPREQ3_DCSURF_PRIMARY_SURFACE_ADDRESS
  * 0x89e checked there against dcn_4_1_0_offset.h), so a generator or addressing mistake cannot pass by agreeing with
  * itself. Register-sequence equivalence with Linux is tools/dcn41/harness.py's job, not this file's.
@@ -129,7 +129,7 @@ static void test_addresses(void)
     struct dcn41_dev d;
     struct model *m = new_model();
     dcn41_dev_init(&d, m, m_read, m_write, m_udelay, SEG, MMIO_DWORDS, 0);
-    /* hand-written from notes/DISPLAY-TRACK.md section 2.2 / 6 */
+    /* hand-written from DCN 4.1 IP discovery bases*/
     CHECK(dcn41_abs(&d, DCN41_OTG_OTG_CONTROL(0), 2) == 0x34c0 + 0x1b43, "OTG0_OTG_CONTROL");
     CHECK(dcn41_abs(&d, DCN41_OTG_OTG_CONTROL(1), 2) == 0x34c0 + 0x1bc3, "OTG1_OTG_CONTROL");
     CHECK(DCN41_OTG_OTG_CONTROL(3) == 0x1cc3, "regOTG3_OTG_CONTROL 0x1cc3");

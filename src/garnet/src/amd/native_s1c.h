@@ -1,6 +1,6 @@
 //
 //  native_s1c.h - the kernel half of native-stack step S1c (kext 0.0.601): the engine behind the native user client
-//  (GarnetNativeClient, type 'GRNT'). Contract: an internal design note. Default OFF: nothing here runs unless a client opens,
+//  (GarnetNativeClient, type 'GRNT'). Contract: driver design. Default OFF: nothing here runs unless a client opens,
 //  and a client opens only on a native boot (rdna4-native=1 accepted) whose S1b self-test reported POSITIVE PASS.
 //
 //  One client at a time, on VMID 8 (0.0.627: up to eight with boot-arg garnet-multisession=1, VMIDs 8..15), with a fresh empty 4-level tree per client. All GPU work goes through the kernel GFX ring (the
@@ -46,6 +46,11 @@ bool n1c_is_open();   // any session open
 // 0.0.610 (ABI 1.8): read-only views for the Metal nub's gate. Hello done on the live session / the GPU declared HUNG this boot.
 bool n1c_hello_done();
 bool n1c_hung();
+// Lock-free busy probe for the activity-driven SMU GFXCLK idle governor (true if GFX or KCQ has unretired work).
+bool n1c_rings_busy();
+// ABI 1.14: kernel-authoritative kill switch (synced with /private/tmp/garnet-off via root-only accel action 115).
+bool n1c_kill_switch();
+void n1c_set_kill_switch(bool on);
 
 // Selector bodies. The caller (the client) has already checked scalar counts and struct sizes EXACTLY. Every one returns NotReady
 // until Hello succeeded. Locking is described in the contract: all but QueryInfo / ReadRegs / WaitSeq take the client lock.
@@ -72,20 +77,20 @@ void n1c_irq_notify();
 bool n1c_irq_wait_enabled();
 void n1c_irq_wait_stats(uint64_t *sleeps, uint64_t *wakes);
 // ---- ABI 1.1 (kext 0.0.603, native S2a): the scanout selectors 9..14. Same shape rules as the selectors above (the client checked counts and
-// sizes exactly); all need Hello. Lock order: gCliLock, then the scanout (DCN) lock inside rdna4dcn::scan*. Contract: NATIVE-S1C-ABI.md, "ABI 1.1 addendum".
+// sizes exactly); all need Hello. Lock order: gCliLock, then the scanout (DCN) lock inside rdna4dcn::scan*. ABI 1.1 scanout contract.
 IOReturn n1c_scan_query(const N1cRef &ref, rdna4n_scan_query *out);
 IOReturn n1c_scan_acquire(const N1cRef &ref, uint64_t flags, uint64_t out[2]);
 IOReturn n1c_scan_register(const N1cRef &ref, const rdna4n_scan_reg *in, uint64_t out[2]);
 IOReturn n1c_scan_present(const N1cRef &ref, uint64_t slot, uint64_t flags, uint64_t out[3]);
 IOReturn n1c_scan_status(const N1cRef &ref, rdna4n_scan_status *out);
 IOReturn n1c_scan_release(const N1cRef &ref, uint64_t out[2]);
-// ---- ABI 1.11 (0.0.661, M6 Stage 1b) + 1.12 (0.0.662, M6 Stage 2): selectors 22..26, instance 2 (the monitor B) or - with garnet-m6flip1 - 1 (the monitor A). inst must be one of them. Unsupported with garnet-m6 / garnet-m6flip OFF; Contract: NATIVE-S7-MULTIMON.md "Q2: Stage 1b build contract".
+// ---- ABI 1.11 (0.0.661, M6 Stage 1b) + 1.12 (0.0.662, M6 Stage 2): selectors 22..26, instance 2 (the monitor B) or - with garnet-m6flip1 - 1 (the monitor A). inst must be one of them. Unsupported with garnet-m6 / garnet-m6flip OFF; ABI 1.11/1.12 multi-display scanout contract.
 IOReturn n1c_scanx_acquire(const N1cRef &ref, uint64_t inst, uint64_t flags, uint64_t out[5]);   // 0.0.662: out[4] = the instance's geometry (w | h << 16 | pitch_px << 32); the client copies as many words as the caller asked for (4 or 5)
 IOReturn n1c_scanx_register(const N1cRef &ref, uint64_t inst, const rdna4n_scan_reg *in, uint64_t out[2]);
 IOReturn n1c_scanx_present(const N1cRef &ref, uint64_t inst, uint64_t slot, uint64_t flags, uint64_t out[3]);
 IOReturn n1c_scanx_status(const N1cRef &ref, uint64_t inst, rdna4n_scan_status *out, uint64_t sout[4]);
 IOReturn n1c_scanx_release(const N1cRef &ref, uint64_t inst, uint64_t out[2]);
-// ---- ABI 1.2 (kext 0.0.604, native S2-DISPCLK): selector 15. Runs one named experiment step of an internal design note (1 E1b, 2 E2, 3 E3, 4 E4)
+// ---- ABI 1.2 (kext 0.0.604, native S2-DISPCLK): selector 15. Runs one named DAL experiment step (1 E1b, 2 E2, 3 E3, 4 E4)
 // against the DAL mailbox (smu_dal.cpp) and fills *out. BadArgument for a step outside 1..4 or non-zero flags, NotReady until Hello; otherwise
 // Success with the verdict inside *out (DENIED when the gate, the rdna4-dalsmc level, the order, the latch or a concurrent step refuses it).
 // The client lock is NOT held while the step runs (it sleeps for up to ~65 s): a busy flag refuses a second concurrent step.

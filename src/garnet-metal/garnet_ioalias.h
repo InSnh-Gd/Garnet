@@ -1,4 +1,4 @@
-// garnet_ioalias.h: bundle build 16, app-fix round 1 (an internal design note section P1, "Preview: the image disappears"). Pure C (host test: test-ioalias.c).
+// garnet_ioalias.h: bundle build 16, app-fix round 1 (app compatibility fix). Pure C (host test: test-ioalias.c).
 //
 // THE PROBLEM. Core Image wraps ONE IOSurface in a NEW texture object for every use. A texture on "path (b)" (optimal image + a copy to / from the surface's pages) only copies back into the pages
 // at the END of the command buffer, and uploads from the pages at its FIRST touch. So a second wrapper that reads the surface later in the same command buffer uploads stale pages (a fresh surface is
@@ -13,7 +13,7 @@
 // "When in doubt, copy back and re-upload": correct, only slower. Different planes (different offsets) never interact; the key includes the offset.
 //
 // THE GATE (rdna4ia_enabled): applications only. WindowServer stays byte-identical to build 14 and only COUNTS how often the case occurs (the decisions are computed but not acted on). Kill file
-// /private/tmp/rdna4m-noioalias turns the actions off in applications too.
+// /private/tmp/garnet-noioalias turns the actions off in applications too.
 #ifndef RDNA4_IOALIAS_H
 #define RDNA4_IOALIAS_H
 #include <stdint.h>

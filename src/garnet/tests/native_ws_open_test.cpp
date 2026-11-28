@@ -1,4 +1,4 @@
-// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, an internal design note sections 3, 7, 8): W1 the class rename, W2 the open policy (uid 88 behind
+// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, driver contract: W1 the class rename, W2 the open policy (uid 88 behind
 // garnet-metal-ws=1), W3 the "Garnet,Ready" property and where the HUNG latch writes it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_ws_open_test.cpp -o /tmp/native_ws_open && /tmp/native_ws_open .
@@ -264,25 +264,26 @@ static void o5_reach(const std::string &root) {
     const uint32_t allowedWs[] = { RDNA4N_SEL_HELLO, RDNA4N_SEL_QUERYINFO, RDNA4N_SEL_READREGS, RDNA4N_SEL_BOCREATE, RDNA4N_SEL_BOFREE, RDNA4N_SEL_GEMVA, RDNA4N_SEL_CTX, RDNA4N_SEL_SUBMIT, RDNA4N_SEL_WAITSEQ,
                                   RDNA4N_SEL_SCAN_QUERY, RDNA4N_SEL_SCAN_ACQUIRE, RDNA4N_SEL_SCAN_REGISTER, RDNA4N_SEL_SCAN_PRESENT, RDNA4N_SEL_SCAN_STATUS, RDNA4N_SEL_SCAN_RELEASE, RDNA4N_SEL_BO_IMPORT_HOST,
                                   RDNA4N_SEL_SCANX_ACQUIRE, RDNA4N_SEL_SCANX_REGISTER, RDNA4N_SEL_SCANX_PRESENT, RDNA4N_SEL_SCANX_STATUS, RDNA4N_SEL_SCANX_RELEASE,
-                                  RDNA4N_SEL_BUFFER_COPY, RDNA4N_SEL_BUFFER_FILL };
+                                  RDNA4N_SEL_BUFFER_COPY, RDNA4N_SEL_BUFFER_FILL,
+                                  RDNA4N_SEL_BOCREATE_APP, RDNA4N_SEL_BO_IMPORT_HOST_APP, RDNA4N_SEL_BUFFER_COPY_APP };
     const uint32_t refusedWs[] = { RDNA4N_SEL_DAL_STEP, RDNA4N_SEL_MODE_TRIAL, RDNA4N_SEL_MODE_HOLD, RDNA4N_SEL_MODE_RELEASE, RDNA4N_SEL_METAL_NUB_PUBLISH, RDNA4N_SEL_METAL_NUB_WITHDRAW,
-                                   29u, 30u, 64u, 255u, 0x80000000u, 0xFFFFFFFFu };
+                                   29u, 32u, 38u, 40u, 64u, 255u, 0x80000000u, 0xFFFFFFFFu };
     for (uint32_t sel : allowedWs) {
-        expect(selector_allowed(false, sel) && selector_allowed(true, sel), "a uid-88 client may call the WindowServer set (Hello .. WaitSeq, scanout, BoImportHost)");
+        expect(selector_allowed(false, sel) && selector_allowed(true, sel), "a uid-88 client may call the WindowServer set (Hello .. WaitSeq, scanout, BoImportHost, ABI 1.14 APP aliases)");
         expect(selector_allowed_for_windowserver(sel), "the WindowServer set holds it");
     }
     for (uint32_t sel : refusedWs) {
-        expect(!selector_allowed(false, sel), "a uid-88 client may NOT call DAL / mode trial / hold / release / nub publish / nub withdraw / an unknown selector");
+        expect(!selector_allowed(false, sel), "a uid-88 client may NOT call DAL / mode trial / hold / release / nub publish / nub withdraw / reserved 29 / an unknown selector");
         expect(selector_allowed(true, sel), "an administrator client reaches every selector, unchanged");
     }
-    // the exact set over every number the ABI names, and beyond: 16 allowed, 6 refused below the ABI count
+    // the exact set over every number the ABI names, and beyond: 26 allowed, 6 refused below the ABI count
     uint32_t nAllowed = 0, nRefusedBelowCount = 0;
     for (uint32_t sel = 0; sel < 300u; sel++) {
         expect(selector_allowed(true, sel), "administrator: every selector is allowed");
         if (selector_allowed(false, sel)) nAllowed++; else if (sel < RDNA4N_SEL_COUNT_1_9) nRefusedBelowCount++;
-        expect(selector_allowed(false, sel) == (sel <= 14u || sel == 21u || (sel >= 22u && sel <= 28u)), "uid 88: exactly 0..14, 21 and 22..28");
+        expect(selector_allowed(false, sel) == (sel <= 14u || sel == 21u || (sel >= 22u && sel <= 28u) || sel == 30u || sel == 31u || sel == 39u), "uid 88: exactly 0..14, 21, 22..28, and ABI 1.14 aliases 30, 31, 39");
     }
-    expect_u("the WindowServer set has 23 selectors including bounded buffer operations", nAllowed, 23u);
+    expect_u("the WindowServer set has 26 selectors including bounded buffer operations and ABI 1.14 aliases", nAllowed, 26u);
     expect_u("six ABI selectors are refused to it (15..20)", nRefusedBelowCount, 6u);
     expect_u("selector 21 is BoImportHost", RDNA4N_SEL_BO_IMPORT_HOST, 21u); expect_u("selector 14 is the last scanout selector", RDNA4N_SEL_SCAN_RELEASE, 14u);
     expect_u("selector 8 is WaitSeq", RDNA4N_SEL_WAITSEQ, 8u); expect_u("selector 15 is the DAL step", RDNA4N_SEL_DAL_STEP, 15u); expect_u("selector 19 is the nub publish", RDNA4N_SEL_METAL_NUB_PUBLISH, 19u);

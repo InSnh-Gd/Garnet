@@ -16,10 +16,12 @@
 #define RDNA4RT_TRANSFORM_ALIGN             UINT64_C(16)
 #define RDNA4RT_VK_INSTANCE_SIZE            UINT64_C(64)
 #define RDNA4RT_VK_INSTANCE_ALIGN           UINT64_C(16)
-#define RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE   UINT64_C(64)
-#define RDNA4RT_MTL_INSTANCE_USERID_SIZE    UINT64_C(68)
-#define RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE  UINT64_C(72)
-#define RDNA4RT_MTL_INSTANCE_MOTION_SIZE    UINT64_C(44)
+#define RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE         UINT64_C(64)
+#define RDNA4RT_MTL_INSTANCE_USERID_SIZE          UINT64_C(68)
+#define RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE        UINT64_C(72)
+#define RDNA4RT_MTL_INSTANCE_MOTION_SIZE          UINT64_C(44)
+#define RDNA4RT_MTL_INSTANCE_INDIRECT_MOTION_SIZE UINT64_C(48)
+#define RDNA4RT_MTL_COMPONENT_TRANSFORM_SIZE      UINT64_C(64)
 #define RDNA4RT_STAGING_POOL_MIN_BUCKET     UINT64_C(4096)
 #define RDNA4RT_STAGING_POOL_MAX_BUCKET     (UINT64_C(64) << 20)
 #define RDNA4RT_STAGING_POOL_MAX_SLABS      32u
@@ -65,6 +67,12 @@ typedef enum {
     RDNA4RT_MATRIX_COLUMN_MAJOR = 0u,
     RDNA4RT_MATRIX_ROW_MAJOR    = 1u,
 } rdna4rt_matrix_layout_t;
+
+/* Metal MTLTransformType values (macOS 15+). */
+typedef enum {
+    RDNA4RT_XFORM_PACKED_FLOAT4X3 = 0u,
+    RDNA4RT_XFORM_COMPONENT       = 1u,
+} rdna4rt_xform_type_t;
 
 /* Metal MTLMotionBorderMode values (macOS 12+). */
 typedef enum {
@@ -130,9 +138,12 @@ enum {
 };
 
 typedef enum {
-    RDNA4RT_GEOM_TRIANGLES = 0u,
-    RDNA4RT_GEOM_AABBS     = 1u,
-    RDNA4RT_GEOM_INSTANCES = 2u,
+    RDNA4RT_GEOM_TRIANGLES        = 0u,
+    RDNA4RT_GEOM_AABBS            = 1u,
+    RDNA4RT_GEOM_INSTANCES        = 2u,
+    RDNA4RT_GEOM_CURVES           = 3u,
+    RDNA4RT_GEOM_MOTION_TRIANGLES = 4u,
+    RDNA4RT_GEOM_MOTION_AABBS     = 5u,
 } rdna4rt_geom_kind_t;
 
 typedef enum {
@@ -229,6 +240,14 @@ typedef struct {
 } rdna4rt_mtl_instance_indirect_t;
 
 typedef struct {
+    float scale[3];
+    float shear[3];
+    float pivot[3];
+    float rotation[4]; /* quaternion (x, y, z, w) */
+    float translation[3];
+} rdna4rt_component_transform_t;
+
+typedef struct {
     uint32_t options;
     uint32_t mask;
     uint32_t intersection_function_offset;
@@ -242,6 +261,20 @@ typedef struct {
     float motion_end_time;
 } rdna4rt_mtl_instance_motion_t;
 
+typedef struct {
+    uint32_t options;
+    uint32_t mask;
+    uint32_t intersection_function_offset;
+    uint32_t user_id;
+    uint64_t accel_struct_id;
+    uint32_t motion_transforms_start_index;
+    uint32_t motion_transforms_count;
+    uint32_t motion_start_border_mode;
+    uint32_t motion_end_border_mode;
+    float motion_start_time;
+    float motion_end_time;
+} rdna4rt_mtl_instance_indirect_motion_t;
+
 _Static_assert(sizeof(rdna4rt_packed_float4x3_t) == 48u, "packed float4x3 must be 48 bytes");
 _Static_assert(sizeof(rdna4rt_vk_transform_t) == 48u, "VkTransformMatrixKHR must be 48 bytes");
 _Static_assert(sizeof(rdna4rt_vk_aabb_t) == 24u, "VkAabbPositionsKHR must be 24 bytes");
@@ -250,6 +283,17 @@ _Static_assert(sizeof(rdna4rt_mtl_instance_default_t) == 64u, "MTLAccelerationSt
 _Static_assert(sizeof(rdna4rt_mtl_instance_userid_t) == 68u, "MTLAccelerationStructureUserIDInstanceDescriptor must be 68 bytes");
 _Static_assert(sizeof(rdna4rt_mtl_instance_indirect_t) == 72u, "MTLIndirectAccelerationStructureInstanceDescriptor must be 72 bytes");
 _Static_assert(sizeof(rdna4rt_mtl_instance_motion_t) == 44u, "MTLAccelerationStructureMotionInstanceDescriptor must be 44 bytes");
+_Static_assert(sizeof(rdna4rt_mtl_instance_indirect_motion_t) == 48u, "MTLIndirectAccelerationStructureMotionInstanceDescriptor must be 48 bytes");
+_Static_assert(offsetof(rdna4rt_mtl_instance_indirect_motion_t, user_id) == 12u, "indirect motion userID offset");
+_Static_assert(offsetof(rdna4rt_mtl_instance_indirect_motion_t, accel_struct_id) == 16u, "indirect motion accelStructID offset");
+_Static_assert(offsetof(rdna4rt_mtl_instance_indirect_motion_t, motion_transforms_start_index) == 24u, "indirect motion startIdx offset");
+_Static_assert(offsetof(rdna4rt_mtl_instance_indirect_motion_t, motion_end_time) == 44u, "indirect motion endTime offset");
+_Static_assert(sizeof(rdna4rt_component_transform_t) == 64u, "MTLComponentTransform must be 64 bytes");
+_Static_assert(offsetof(rdna4rt_component_transform_t, scale) == 0u, "MTLComponentTransform scale offset");
+_Static_assert(offsetof(rdna4rt_component_transform_t, shear) == 12u, "MTLComponentTransform shear offset");
+_Static_assert(offsetof(rdna4rt_component_transform_t, pivot) == 24u, "MTLComponentTransform pivot offset");
+_Static_assert(offsetof(rdna4rt_component_transform_t, rotation) == 36u, "MTLComponentTransform rotation offset");
+_Static_assert(offsetof(rdna4rt_component_transform_t, translation) == 52u, "MTLComponentTransform translation offset");
 
 #ifdef VK_KHR_acceleration_structure
 _Static_assert(sizeof(rdna4rt_vk_transform_t) == sizeof(VkTransformMatrixKHR), "VkTransformMatrixKHR size mismatch");
@@ -772,6 +816,7 @@ typedef struct {
     uint64_t motion_transform_buf_len;
     uint64_t motion_transform_buf_offset;
     uint64_t motion_transform_count;
+    rdna4rt_xform_type_t motion_transform_type;
 } rdna4rt_tlas_desc_t;
 
 typedef struct {
@@ -794,6 +839,7 @@ static inline rdna4rt_err_t rdna4rt_validate_tlas_desc(
         return RDNA4RT_ERR_LIMIT;
 
     uint64_t min_size = 0;
+    int is_motion = 0;
     switch (d->descriptor_type) {
     case RDNA4RT_INST_DESC_DEFAULT:
         min_size = RDNA4RT_MTL_INSTANCE_DEFAULT_SIZE;
@@ -804,12 +850,16 @@ static inline rdna4rt_err_t rdna4rt_validate_tlas_desc(
     case RDNA4RT_INST_DESC_MOTION:
         if (!allow_motion_blur) return RDNA4RT_ERR_MOTION_UNSUPPORTED;
         min_size = RDNA4RT_MTL_INSTANCE_MOTION_SIZE;
+        is_motion = 1;
         break;
     case RDNA4RT_INST_DESC_INDIRECT:
         min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE;
         break;
     case RDNA4RT_INST_DESC_INDIRECT_MOTION:
-        return allow_motion_blur ? RDNA4RT_ERR_UNSUPPORTED : RDNA4RT_ERR_MOTION_UNSUPPORTED;
+        if (!allow_motion_blur) return RDNA4RT_ERR_MOTION_UNSUPPORTED;
+        min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_MOTION_SIZE;
+        is_motion = 1;
+        break;
     default:
         return RDNA4RT_ERR_INVALID_ARG;
     }
@@ -828,15 +878,17 @@ static inline rdna4rt_err_t rdna4rt_validate_tlas_desc(
                 return RDNA4RT_ERR_OVERFLOW;
             if (need > d->inst_buf_len - d->inst_buf_offset) return RDNA4RT_ERR_BOUNDS;
         }
-        if (d->descriptor_type == RDNA4RT_INST_DESC_MOTION &&
-            (require_buffers || d->has_motion_transform_buf)) {
+        if (is_motion && (require_buffers || d->has_motion_transform_buf)) {
+            if (d->motion_transform_type > RDNA4RT_XFORM_COMPONENT) return RDNA4RT_ERR_INVALID_ARG;
             if (!d->has_motion_transform_buf || d->motion_transform_count == 0u)
                 return RDNA4RT_ERR_INVALID_ARG;
             if (d->motion_transform_buf_offset > d->motion_transform_buf_len)
                 return RDNA4RT_ERR_BOUNDS;
             if ((d->motion_transform_buf_offset % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+            uint64_t xform_elem = (d->motion_transform_type == RDNA4RT_XFORM_COMPONENT)
+                ? RDNA4RT_MTL_COMPONENT_TRANSFORM_SIZE : RDNA4RT_TRANSFORM_SIZE;
             uint64_t mbytes = 0;
-            if (!rdna4rt_mul_u64(d->motion_transform_count, RDNA4RT_TRANSFORM_SIZE, &mbytes))
+            if (!rdna4rt_mul_u64(d->motion_transform_count, xform_elem, &mbytes))
                 return RDNA4RT_ERR_OVERFLOW;
             if (mbytes > d->motion_transform_buf_len - d->motion_transform_buf_offset)
                 return RDNA4RT_ERR_BOUNDS;
@@ -873,6 +925,11 @@ typedef struct {
     int has_count_buf;
     uint64_t count_buf_len;
     uint64_t count_buf_offset;
+    int has_motion_transform_buf;
+    uint64_t motion_transform_buf_len;
+    uint64_t motion_transform_buf_offset;
+    uint64_t motion_transform_count;
+    rdna4rt_xform_type_t motion_transform_type;
 } rdna4rt_indirect_tlas_desc_t;
 
 static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
@@ -887,12 +944,18 @@ static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
     if (caps && caps->rt_max_instances > 0u && d->max_instance_count > caps->rt_max_instances)
         return RDNA4RT_ERR_LIMIT;
 
-    if (d->descriptor_type == RDNA4RT_INST_DESC_INDIRECT_MOTION)
-        return allow_motion_blur ? RDNA4RT_ERR_UNSUPPORTED : RDNA4RT_ERR_MOTION_UNSUPPORTED;
-    if (d->descriptor_type != RDNA4RT_INST_DESC_INDIRECT)
+    int is_motion = 0;
+    uint64_t min_size = 0;
+    if (d->descriptor_type == RDNA4RT_INST_DESC_INDIRECT_MOTION) {
+        if (!allow_motion_blur) return RDNA4RT_ERR_MOTION_UNSUPPORTED;
+        min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_MOTION_SIZE;
+        is_motion = 1;
+    } else if (d->descriptor_type == RDNA4RT_INST_DESC_INDIRECT) {
+        min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE;
+    } else {
         return RDNA4RT_ERR_INVALID_ARG;
+    }
 
-    uint64_t min_size = RDNA4RT_MTL_INSTANCE_INDIRECT_SIZE;
     uint64_t stride = d->inst_stride ? d->inst_stride : min_size;
     if (stride < min_size || (stride % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
 
@@ -913,6 +976,21 @@ static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
             if ((d->count_buf_offset % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
             if (4u > d->count_buf_len - d->count_buf_offset) return RDNA4RT_ERR_BOUNDS;
         }
+        if (is_motion && (require_buffers || d->has_motion_transform_buf)) {
+            if (d->motion_transform_type > RDNA4RT_XFORM_COMPONENT) return RDNA4RT_ERR_INVALID_ARG;
+            if (!d->has_motion_transform_buf || d->motion_transform_count == 0u)
+                return RDNA4RT_ERR_INVALID_ARG;
+            if (d->motion_transform_buf_offset > d->motion_transform_buf_len)
+                return RDNA4RT_ERR_BOUNDS;
+            if ((d->motion_transform_buf_offset % 4u) != 0u) return RDNA4RT_ERR_ALIGNMENT;
+            uint64_t xform_elem = (d->motion_transform_type == RDNA4RT_XFORM_COMPONENT)
+                ? RDNA4RT_MTL_COMPONENT_TRANSFORM_SIZE : RDNA4RT_TRANSFORM_SIZE;
+            uint64_t mbytes = 0;
+            if (!rdna4rt_mul_u64(d->motion_transform_count, xform_elem, &mbytes))
+                return RDNA4RT_ERR_OVERFLOW;
+            if (mbytes > d->motion_transform_buf_len - d->motion_transform_buf_offset)
+                return RDNA4RT_ERR_BOUNDS;
+        }
     }
 
     out->elem_size = min_size;
@@ -924,6 +1002,18 @@ static inline rdna4rt_err_t rdna4rt_validate_indirect_tlas_desc(
 
 /* Staging pool bucket rounding: power-of-2 buckets in [4 KiB, 64 MiB].
  * Returns 1 with bucket size if poolable, 0 if allocation exceeds pool cap (allocate directly). */
+static inline int rdna4rt_take_transform_slice(uint64_t capacity, uint64_t *next) {
+    if (!next || *next % RDNA4RT_TRANSFORM_ALIGN || *next > capacity ||
+        capacity - *next < RDNA4RT_TRANSFORM_SIZE) return 0;
+    *next += RDNA4RT_TRANSFORM_SIZE;
+    return 1;
+}
+
+static inline int rdna4rt_motion_table_fits(uint64_t capacity, uint64_t offset, uint32_t keyframes) {
+    return offset % sizeof(uint64_t) == 0 && offset <= capacity &&
+           (uint64_t)keyframes <= (capacity - offset) / sizeof(uint64_t);
+}
+
 static inline int rdna4rt_staging_bucket_size(uint64_t size, uint64_t *bucket_out) {
     if (!bucket_out) return 0;
     if (size > RDNA4RT_STAGING_POOL_MAX_BUCKET) return 0;
@@ -1003,10 +1093,10 @@ static inline rdna4rt_barrier_spec_t rdna4rt_barrier_spec(rdna4rt_barrier_kind_t
                        RDNA4RT_VK_ACCESS_TRANSFER_READ | RDNA4RT_VK_ACCESS_TRANSFER_WRITE;
         break;
     case RDNA4RT_BARRIER_POST_BUILD:
-        s.src_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER;
+        s.src_stage = RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER | RDNA4RT_VK_STAGE_COMPUTE_SHADER;
         s.dst_stage = RDNA4RT_VK_STAGE_COMPUTE_SHADER | RDNA4RT_VK_STAGE_AS_BUILD | RDNA4RT_VK_STAGE_TRANSFER |
                       (is_compute_queue ? 0u : (RDNA4RT_VK_STAGE_VERTEX_SHADER | RDNA4RT_VK_STAGE_FRAGMENT_SHADER));
-        s.src_access = RDNA4RT_VK_ACCESS_AS_WRITE | RDNA4RT_VK_ACCESS_TRANSFER_WRITE;
+        s.src_access = RDNA4RT_VK_ACCESS_AS_WRITE | RDNA4RT_VK_ACCESS_TRANSFER_WRITE | RDNA4RT_VK_ACCESS_SHADER_WRITE;
         s.dst_access = RDNA4RT_VK_ACCESS_AS_READ | RDNA4RT_VK_ACCESS_AS_WRITE |
                        RDNA4RT_VK_ACCESS_SHADER_READ | RDNA4RT_VK_ACCESS_TRANSFER_READ;
         break;
@@ -1765,5 +1855,12 @@ static inline int rdna4rt_qp_pool_push(rdna4rt_qp_pool_t *p, uint64_t handle) {
     p->handles[p->count++] = handle;
     return 1;
 }
+
+static inline float rdna4rt_v3_dot(const float a[3], const float b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+#include "garnet_rt_curves.h"
+#include "garnet_rt_motion.h"
 
 #endif /* RDNA4_RT_ACCEL_H */

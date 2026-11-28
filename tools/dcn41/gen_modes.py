@@ -30,7 +30,7 @@ OUT_TSV = L.SRC / "dcn41_modes.tsv"
 
 # Connector layout of this card: "AtomBIOS,Connectors" =
 # "DisplayPort/ddc0/hpd1,DisplayPort/ddc1/hpd2,HDMI-A/ddc2/hpd3,HDMI-A/ddc3/hpd4" (framebuffer-pre.txt), and the
-# board ROM's display object table (notes/DISPLAY-DESIGN.md 3.5) gives the PHY and DIG per path.
+# board ROM's display object table gives the PHY and DIG per path.
 SINKS = {
     "AUX1": dict(name="SINK-A", link=1, signal="DP", phy="UNIPHY_B", phyid=1, dig="DIGB", hpd=2, ddc=1),
     "DDC2": dict(name="SINK-B", link=2, signal="HDMI", phy="UNIPHY_C", phyid=2, dig="DIGC", hpd=3, ddc=2),

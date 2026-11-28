@@ -64,7 +64,7 @@
 //     as a cross-check.
 //
 //  5. Logging: every harvest/config register value is logged with its
-//     absolute dword address (PORTING.md rule 6 — on hardware the log
+//     absolute dword address (on hardware the log
 //     is all we get). The reference logs only summaries.
 //
 //  6. gfx_constants_init(dev) convenience overload uses a file-scope
@@ -160,7 +160,7 @@ gfx_probe_gc_bases(const DeviceContext &dev, GFXConfig &cfg)
             kGFXRegBaseIdx_GRBM_STATUS, st_reg, v_st);
 
     // Cross-check read of GRBM_GFX_INDEX at the OTHER segment — pure
-    // diagnostics, kept so the log still shows both (PORTING.md rule 6).
+    // diagnostics, kept so the log still shows both (for hardware trace logging).
     if (dev.ip.isResolved(IPBlock::GC, GFXRegBaseIdx::kProbeAlternate)) {
         const uint32_t idx_alt = SOC15_REG_OFFSET_BIDX(
             dev, IPBlock::GC, GFXRegBaseIdx::kProbeAlternate,
@@ -1046,6 +1046,8 @@ gfx_build_gfx_mqd(uint32_t *mqd_cpu, const GFXMqdProps &p)
         v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BUFSZ, rb_bufsz);
         v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_BLKSZ,
                           (rb_bufsz >= 2) ? (rb_bufsz - 2) : 0);
+        // Upstream 14741c01680a (gfx_v12_0.c:3063): mark kernel GFX queues.
+        v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, KMD_QUEUE, p.kernel_queue ? 1u : 0u);
         if (!p.kernel_queue) {
             v = REG_SET_FIELD(v, CP_GFX_HQD_CNTL, RB_NON_PRIV, 1);
         }

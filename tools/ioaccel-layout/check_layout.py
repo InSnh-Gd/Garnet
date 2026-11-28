@@ -2,7 +2,7 @@
 """Mechanical guard: does a -fapple-kext subclass of our reconstructed declarations emit a vtable
 that has the KC's slot count and the KC's slot order?
 
-For every class in $C64_LAYOUT_OUT/IOAccelFamily2_decl.h it builds a minimal subclass GarnetT_<Class> that
+For every class in $GARNET_LAYOUT_OUT/IOAccelFamily2_decl.h it builds a minimal subclass GarnetT_<Class> that
 overrides exactly the slots the KC vtable of <Class> has as __cxa_pure_virtual, compiles it (x86_64,
 -fapple-kext, the usual kext flags), reads OUR vtable out of the object file, and compares:
   * slot count (our vtable minus the zero terminator) == KC slot count;
@@ -20,11 +20,11 @@ import objvt
 import exports
 from kcmod import demangle, OUT
 
-MKSDK = os.environ.get('C64_MKSDK')   # path of a MacKernelSDK checkout (needs Headers/)
+MKSDK = os.environ.get('GARNET_MKSDK')   # path of a MacKernelSDK checkout (needs Headers/)
 if not MKSDK:
-    sys.exit('set C64_MKSDK to a MacKernelSDK checkout')
-C64_NM = os.environ.get('C64_NM') or 'nm'   # tool choice: Makefile exports C64_NM (llvm-nm on Linux cross)
-C64_SDK = os.environ.get('C64_SDK')          # SDK path: Makefile exports C64_SDK; empty keeps the xcrun query
+    sys.exit('set GARNET_MKSDK to a MacKernelSDK checkout')
+GARNET_NM = os.environ.get('GARNET_NM') or 'nm'   # tool choice: Makefile exports GARNET_NM (llvm-nm on Linux cross)
+GARNET_SDK = os.environ.get('GARNET_SDK')          # SDK path: Makefile exports GARNET_SDK; empty keeps the xcrun query
 SDK_BASES = ('IOService', 'IOUserClient', 'OSObject')
 BUILD = os.path.join(OUT, 'build')
 
@@ -76,7 +76,7 @@ def gen_tu(model, slots, classes):
 
 def compile_tu(src, obj):
     cxx = os.environ.get('KEXT_CXX') or os.environ.get('CXX') or 'clang++'
-    sdk = C64_SDK or subprocess.run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], capture_output=True, text=True).stdout.strip()
+    sdk = GARNET_SDK or subprocess.run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], capture_output=True, text=True).stdout.strip()
     cmd = [cxx, '-arch', 'x86_64', '-target', 'x86_64-apple-macos11.0', '-isysroot', sdk, '-I%s/Headers' % MKSDK,
            '-mmacosx-version-min=11.0', '-DKERNEL', '-DKERNEL_PRIVATE', '-DDRIVER_PRIVATE', '-DAPPLE', '-DNeXT',
            '-D_FORTIFY_SOURCE=0', '-nostdinc', '-fno-builtin', '-fno-common', '-fno-stack-protector', '-mkernel',
@@ -191,7 +191,7 @@ def main():
     # family's own exported symbol) the ONLY ones left are the __garnet_nonexported_* markers of slots the family does not export; the leaf class must override
     # those with a forwarder (forwarded.json); verify the linked kext separately.
     ex = exports.load()
-    und = [l.strip() for l in subprocess.run([C64_NM, '-u', obj], capture_output=True, text=True).stdout.splitlines() if l.strip()]
+    und = [l.strip() for l in subprocess.run([GARNET_NM, '-u', obj], capture_output=True, text=True).stdout.splitlines() if l.strip()]
     missing = sorted(u for u in und if u not in ex)
     marker = [u for u in missing if u.startswith('__garnet_nonexported_')]
     other = [u for u in missing if not u.startswith('__garnet_nonexported_')]

@@ -1,4 +1,4 @@
-// native_dispread_test.cpp - build 0.0.622 (multi-monitor track, stage M1: READ-ONLY instruments; an internal design note). It compiles the REAL sequences of
+// native_dispread_test.cpp - build 0.0.622 (multi-monitor track, stage M1: READ-ONLY instruments; driver design). It compiles the REAL sequences of
 // dcn/dispread_flow.h and the REAL decisions of dcn/dispread.h and drives them against a model of the DC_I2C engine (a register file with an arbiter, a FIFO and a DDC bus
 // holding four EDID blocks), a model of the DMUB inbox ring in BAR0-visible memory, and a census register file. The kext glue (dcn/dcn.cpp, GarnetDriver.cpp) is checked by source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/dcn -I src/garnet/src/amd -I src/dcn41 \
@@ -614,7 +614,7 @@ static void f_census2() {
     expect(absok, "census2: the CLI's absolute address (rdna4dr_census_abs) equals dcn41_abs_rd for every register");
     expect(blk, "census2: every register lies inside a display block (DCCG clock sources, DIG0..3, RDPCSTX1/2); none elsewhere");
     expect(RDNA4DR_SEG1 == DCN41_SEG1_EXPECTED && RDNA4DR_SEG2 == DCN41_SEG2_EXPECTED && RDNA4DR_SEG3 == DCN41_SEG3_EXPECTED && kSeg[1] == RDNA4DR_SEG1 && kSeg[2] == RDNA4DR_SEG2 && kSeg[3] == RDNA4DR_SEG3, "census2: the CLI's segment bases are the dcn41 layer's");
-    // the design's absolute addresses (an internal design note M4 table): OTG_PIXEL_RATE_DIV 0x12f, OTG1_PIXEL_RATE_CNTL 0x144, OTG1_PHYPLL_PIXEL_RATE_CNTL 0x147, SYMCLKC 0x162, PHYCSYMCLK 0x3514, DIG2_STREAM_MAPPER 0x53cf, RDPCSTX2 0x5fa0..0x5fce
+    // the design's absolute addresses (DCN4 register map): OTG_PIXEL_RATE_DIV 0x12f, OTG1_PIXEL_RATE_CNTL 0x144, OTG1_PHYPLL_PIXEL_RATE_CNTL 0x147, SYMCLKC 0x162, PHYCSYMCLK 0x3514, DIG2_STREAM_MAPPER 0x53cf, RDPCSTX2 0x5fa0..0x5fce
     auto absof = [&](const char *n) -> uint32_t { for (uint32_t i = 0; i < RDNA4DR_CENSUS2_COUNT; i++) if (!std::strcmp(rdna4dr_census2[i].name, n)) return rdna4dr_census_abs(rdna4dr_census2[i].base_idx, rdna4dr_census2[i].off); return 0xdeadbeefu; };
     expect(absof("OTG_PIXEL_RATE_DIV") == 0x12f && absof("OTG1_PIXEL_RATE_CNTL") == 0x144 && absof("OTG1_PHYPLL_PIXEL_RATE_CNTL") == 0x147 && absof("SYMCLKC_CLOCK_ENABLE") == 0x162 && absof("PHYCSYMCLK_CLOCK_CNTL") == 0x3514 &&
            absof("DIG2_STREAM_MAPPER_CONTROL") == 0x53cf && absof("RDPCSTX2_RDPCSTX_CNTL") == 0x5fa0 && absof("RDPCSTX2_RDPCS_TX_PLL_UPDATE_DATA_OVRRD") == 0x5fce && absof("DP_DTO0_PHASE") == 0x141, "census2: absolute addresses equal the design memo's");
@@ -1037,10 +1037,10 @@ static void s_pins(const std::string &root) {
                       flow = slurp(src + "dcn/dispread_flow.h"), hdr = slurp(src + "dcn/dispread.h"), mk = slurp(root + "/src/garnet/Makefile"), sh = slurp(root + "/tools/rdna4/build-native-tools.sh");
     expect(!brg.empty() && !dcn.empty() && !pure.empty() && !cli.empty() && !flow.empty() && !hdr.empty(), "the sources are readable");
     // the glue region of the new file content
-    const size_t g0 = dcn.find("build 0.0.622 (multi-monitor track, stage M1; an internal design note): THE THREE READ-ONLY INSTRUMENTS.");
+    const size_t g0 = dcn.find("Multi-monitor read-only telemetry instruments");
     expect(g0 != std::string::npos, "the glue block is present");
     // 0.0.625: the DMUB command verbs' glue (dmubSend / dmubMode / dmubCtx) follows this block in the file and is pinned by tests/native_dmubcmd_test.cpp; THIS suite's pins are about the three read-only instruments + region4read
-    const size_t g1 = dcn.find("build 0.0.625 (stages M2 / M3; an internal design note");
+    const size_t g1 = dcn.find("DMUB display firmware command interface");
     expect(g1 != std::string::npos && g0 != std::string::npos && g1 > g0, "the 0.0.625 command glue follows the read-only glue");
     const std::string glue = (g0 == std::string::npos || g1 == std::string::npos) ? "" : strip_line_comments(dcn.substr(g0, g1 - g0));
     // 1. the dispatch: verb_args_ok first, bind only for ddcread, the other two never bind
@@ -1157,7 +1157,7 @@ static void s_pins(const std::string &root) {
       expect(!pl.empty() && count_of(pl, "p->t[k].addr8 = ") == 2 && pl.find("p->t[k].addr8 = RDNA4DR_SCDC_ADDR_W; p->t[k].wlen = 1u; p->t[k].wdata = (uint8_t)off; k++;") != std::string::npos && pl.find("p->t[k].addr8 = RDNA4DR_SCDC_ADDR_R; p->t[k].is_read = 1u; p->t[k].rlen = (uint16_t)len; p->t[k].stop = 1u; k++;") != std::string::npos && pl.find("rdna4dr_scdc_range_ok(off, len)") != std::string::npos,
              "scdcread plan: exactly two transactions - one 1-byte write of the register offset to 0xA8, one read from 0xA9 - behind the line and range checks");
       expect(hdr.find("return off <= RDNA4DR_SCDC_OFF_MAX && len >= 1u && len <= RDNA4DR_SCDC_LEN_MAX && off + len <= RDNA4DR_SCDC_END;") != std::string::npos, "scdcread range: offset <= 0x5f, 1..16 bytes, offset + length <= 0x60");
-      for (const char *t : { "static int cmd_scdcread(const char *a1, const char *a2, const char *a3) {", "else if (what && !strcmp(what, \"scdcread\")) in = 99;", "in == 99 ? \"scdcread\"", "if (in == 99) return cmd_scdcread(arg, arg2, arg3);", "hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\\n", "scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream", "dr_call(RDNA4DR_ACT_SCDCREAD, rdna4dr_scdc_arg(line, off, len), o)",
+      for (const char *t : { "static int cmd_scdcread(const char *a1, const char *a2, const char *a3) {", "else if (what && !strcmp(what, \"scdcread\")) in = 99;", "in == 99 ? \"scdcread\"", "if (in == 99) return cmd_scdcread(arg, arg2, arg3);", "hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny killswitch\\n", "scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream", "dr_call(RDNA4DR_ACT_SCDCREAD, rdna4dr_scdc_arg(line, off, len), o)",
                              "rdna4dr_scdc_range_ok(off, len)", "Status_Flags_0", "the sink LOCKS onto our TMDS", "Err_Det_Checksum", "scrambling %s, TMDS bit clock ratio %s\\n\", b[i], rdna4dr_scdc_scrambling_enabled(b[i]) ? \"ENABLED\" : \"off\", rdna4dr_scdc_ratio_by_40(b[i]) ? \"1/40\" : \"1/10\");" })
         expect(cli.find(t) != std::string::npos, (std::string("the CLI carries ") + t).c_str());
       expect(cli.find("verbs 91..99") != std::string::npos, "the CLI's admission hint names verbs 91..99");

@@ -10,12 +10,12 @@
 
 #if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Build 16 (app-fix round 1; an internal design note P5 + P1). garnet_ledger.h / garnet_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
+// Build 16 (app-fix round 1; import ledger and alias gate). garnet_ledger.h / garnet_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
 //  * Step 0, the LIVE-IMPORT LEDGER: every IOSurface texture is entered when it comes alive and removed in -dealloc; the T1 tick logs "T1 ledger: ..." (live textures, distinct surface ids, bytes, textures with no
 //    command buffer in flight, the top 5 by size / format / planes with the age of the oldest). Logging only.
 //  * F3, the USE-COUNT POLICY: a texture NO LONGER holds IOSurfaceIncrementUseCount for its life (Apple's Metal does not: measured on the host Mac). A command buffer use-counts a surface from the first touch of a texture of it
-//    until the command buffer is finished with the GPU (rdna4PoolDone / dealloc). Kill file /private/tmp/rdna4m-nousecount = never (Apple-identical), latched once per process.
-//  * P1, the ALIAS GATE: applications act on the per-command-buffer aliasing decisions; WindowServer only counts them (it keeps build 14's behaviour exactly). Kill file /private/tmp/rdna4m-noioalias.
+//    until the command buffer is finished with the GPU (rdna4PoolDone / dealloc). Kill file /private/tmp/garnet-nousecount = never (Apple-identical), latched once per process.
+//  * P1, the ALIAS GATE: applications act on the per-command-buffer aliasing decisions; WindowServer only counts them (it keeps build 14's behaviour exactly). Kill file /private/tmp/garnet-noioalias.
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_NOUSECOUNT_FILE "/private/tmp/garnet-nousecount"
 #define RDNA4_NOIOALIAS_FILE  "/private/tmp/garnet-noioalias"
@@ -115,10 +115,10 @@ GARNET_INTERNAL BOOL rdna4_oneshot(NSError **err, void (^rec)(VkCommandBuffer cm
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// S5.2a D-copy present (an internal design note section 3, native #12). CoreDisplay's GPUPass renders into 3 IOSurfaces; at the end of each command buffer
+// S5.2a D-copy present (driver contract#12). CoreDisplay's GPUPass renders into 3 IOSurfaces; at the end of each command buffer
 // that wrote one, rdna4Finish appends a GPU copy (import -> a visible-VRAM scanout slot) and the completion block presents that slot (VUPDATE-latched flip) through
 // the six radv_darwin_scanout_* exports of the loaded RADV (same per-process RDNA4N connection). The state machine is the pure garnet_dispflip.h (host test:
-// test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/rdna4m-noflip (read once per process); one mutex around every scanout call.
+// test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/garnet-noflip (read once per process); one mutex around every scanout call.
 // ---------------------------------------------------------------------------------------------------------------
 #define RDNA4_NOFLIP_FILE "/private/tmp/garnet-noflip"
 #define RDNA4_PRESENTALL_FILE "/private/tmp/garnet-presentall"   // native #12 P2 kill switch: present EVERY display write (the pre-final-pass-rule behaviour); polled every 1 s
@@ -803,7 +803,7 @@ GARNET_INTERNAL void rdna4s_record_copy(VkCommandBuffer cmd, VkBuffer src, VkDev
     RDNA4S.sm.dm_regions += n;   // statistic only (a racy increment is acceptable)
     pthread_mutex_unlock(&rmu);
 }
-// ---- opt-in per-frame CRC diagnostic (NATIVE-S5-FLIP.md "Tearing diagnostic (CRC)"). Off unless /private/tmp/rdna4m-crc exists (polled every 2 s, WindowServer only; the
+// ---- opt-in per-frame CRC diagnostic (per-frame CRC diagnostic). Off unless /private/tmp/garnet-crc exists (polled every 2 s, WindowServer only; the
 // file may hold a row step (default 64) and the word "noslot" = skip the slot read, which is the expensive part: the slot is write-combined BAR memory). Per frame that carries a copy: A1 = sampled CRC of the display surface's import memory after the fence, B = the same rows of the
 // slot, A2 = the surface again after B, C = the surface again just before scanout_present. Reads only; nothing here changes what is copied or presented.
 #define RDNA4_CRC_FILE "/private/tmp/garnet-crc"
@@ -856,9 +856,9 @@ static void rdna4s_crc_free(rdna4crc_rec_t *r) { if (!r) return; if (r->ios) CFR
 // The command buffer that carried the copy into `slot` ended (fence result r) or never ran: present on VK_SUCCESS only. `rec` (nil unless the CRC diagnostic runs) is consumed.
 
 // ---------------------------------------------------------------------------------------------------------------
-// native #12 Stage 0b (an internal design note): per-process command-buffer / present log and the cross-queue RAW-inversion counter.
-// OFF unless /private/tmp/rdna4m-cblog exists (polled every 1 s by its own timer; removed -> the file is closed). Output goes to
-// /private/var/tmp/rdna4m-cblog.<pid>.txt (a plain file, written with write(2) line by line: no os_log, so nothing is lost to log throttling), capped at 50 MB.
+// native #12 Stage 0b (driver design): per-process command-buffer / present log and the cross-queue RAW-inversion counter.
+// OFF unless /private/tmp/garnet-cblog exists (polled every 1 s by its own timer; removed -> the file is closed). Output goes to
+// /private/var/tmp/garnet-cblog.<pid>.txt (a plain file, written with write(2) line by line: no os_log, so nothing is lost to log throttling), capped at 50 MB.
 // Observation only: nothing it logs changes what is submitted or presented. All times are CLOCK_UPTIME_RAW ns (rdna4_now); "K" lines pair it with CLOCK_REALTIME every second.
 // IOSurface ids are IOSurfaceGetID, the same ids the DTrace transaction log prints. Line types (key=value, one per line):
 //   H header (pid, up, wall)     K clock pair; K10 has submits, writebacks, accepted presents, present calls, skips and idle flag
@@ -1099,7 +1099,7 @@ static void rdna4s_complete_run(int inst, int slot, VkResult r, uint64_t seq, ui
             int rc = xinst ? rdna4x_k_present(inst, sids[slot], o) : RDNA4S.fp(RDNA4R.dev, sids[slot], o);   // bundle 13/15: the instance's own present
             const uint64_t tk = rdna4_now() - tk0;
             if (tk > 250000000ull) RDNA4LOG_WARN("scanout STALL: the kernel present ioctl took %.1f ms (instance %d slot %d seq %llu rc %d)", (double)tk / 1e6, inst, slot, (unsigned long long)seq, rc);
-            rdna4cbl_present(tp0_, rdna4_now(), sid, seq, slot, rc);   // Stage 0b (no-op unless /private/tmp/rdna4m-cblog exists)
+            rdna4cbl_present(tp0_, rdna4_now(), sid, seq, slot, rc);   // Stage 0b (no-op unless /private/tmp/garnet-cblog exists)
             if (rc == 0) {
                 rdna4_capture_present(inst, slot, sid, seq, rc, o[0]);
                 rdna4df_count_present_cls(sm, cls);

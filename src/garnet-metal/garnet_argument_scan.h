@@ -900,4 +900,504 @@ static inline rdna4_as_status rdna4_argument_scan_reflection_plan_materialize(
 
 #endif
 
+/*
+ * Incremental dirty-range and fast pure-C token scanning for mapped argument
+ * transport buffers.
+ *
+ * Correctness contract:
+ *   - Coherent storage (MTLStorageModeShared and Garnet's coherent
+ *     MTLStorageModeManaged) may be mutated directly via -contents without
+ *     calling -didModifyRange: or MTLArgumentEncoder. Passing
+ *     coherent_direct_writes=true ALWAYS reads all covered token words through
+ *     the pure-C 4x-unrolled range-filtered scanner (zero ObjC overhead, zero
+ *     hash collisions, 100% exact).
+ *   - Immutable / read-only or explicitly dirty-tracked buffers
+ *     (coherent_direct_writes=false) maintain a 4 KiB chunk dirty bitset and
+ *     cached 0x5244-prefixed token list per chunk, rescanning only dirty chunks
+ *     and skipping clean empty chunks 64 at a time.
+ */
+#ifndef RDNA4_ARGUMENT_SCAN_INCREMENTAL_INC
+#define RDNA4_ARGUMENT_SCAN_INCREMENTAL_INC
+
+#define RDNA4_AS_TOKEN_PREFIX_SHIFT 48u
+#define RDNA4_AS_TOKEN_PREFIX UINT64_C(0x5244)
+#define RDNA4_AS_INC_CHUNK_SHIFT 12u
+#define RDNA4_AS_INC_CHUNK_BYTES (UINT64_C(1) << RDNA4_AS_INC_CHUNK_SHIFT)
+#define RDNA4_AS_LIVE_BITSET_SPAN 4096u
+
+typedef struct {
+    uint64_t token;
+    uint32_t value_index;
+} rdna4_as_live_entry;
+
+typedef struct {
+    rdna4_as_live_entry *entries;
+    size_t count;
+    uint64_t min_token;
+    uint64_t max_token;
+    uint64_t span;
+    bool use_bitset;
+    uint64_t bitset[RDNA4_AS_LIVE_BITSET_SPAN / 64u];
+} rdna4_as_live_table;
+
+typedef struct {
+    uint64_t *bits;
+    size_t bit_words;
+    size_t value_count;
+    uint64_t inline_bits[8];
+} rdna4_as_match_set;
+
+typedef struct {
+    uint64_t *tokens;
+    uint32_t count;
+    uint32_t cap;
+} rdna4_as_inc_chunk;
+
+typedef struct {
+    uint64_t buffer_length;
+    size_t chunk_count;
+    size_t bit_words;
+    uint64_t *dirty_bits;
+    uint64_t *nonempty_bits;
+    rdna4_as_inc_chunk *chunks;
+    uint64_t generation;
+    uint64_t dirty_chunks_scanned;
+    uint64_t clean_chunks_skipped;
+    uint64_t coherent_words_scanned;
+} rdna4_as_inc_cache;
+
+static inline int rdna4_as_live_entry_compare(const void *left,
+                                              const void *right) {
+    const rdna4_as_live_entry *a = (const rdna4_as_live_entry *)left;
+    const rdna4_as_live_entry *b = (const rdna4_as_live_entry *)right;
+    if (a->token < b->token) return -1;
+    if (a->token > b->token) return 1;
+    return a->value_index < b->value_index ? -1 :
+        a->value_index > b->value_index ? 1 : 0;
+}
+
+static inline rdna4_as_status rdna4_as_live_table_build(
+    rdna4_as_live_table *table, rdna4_as_live_entry *entries, size_t count) {
+    if (!table || (!entries && count)) return RDNA4_AS_INVALID;
+    memset(table, 0, sizeof(*table));
+    if (!count) return RDNA4_AS_OK;
+    if (count > 1u)
+        qsort(entries, count, sizeof(*entries), rdna4_as_live_entry_compare);
+    table->entries = entries;
+    table->count = count;
+    table->min_token = entries[0].token;
+    table->max_token = entries[count - 1u].token;
+    table->span = table->max_token - table->min_token;
+    if (table->span < RDNA4_AS_LIVE_BITSET_SPAN) {
+        table->use_bitset = true;
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t delta = entries[i].token - table->min_token;
+            table->bitset[delta >> 6] |= UINT64_C(1) << (delta & 63u);
+        }
+    }
+    return RDNA4_AS_OK;
+}
+
+static inline bool rdna4_as_live_table_find(const rdna4_as_live_table *table,
+                                            uint64_t token,
+                                            uint32_t *out_index) {
+    if (!table || !table->count) return false;
+    uint64_t delta = token - table->min_token;
+    if (delta > table->span) return false;
+    if (table->use_bitset &&
+        !((table->bitset[delta >> 6] >> (delta & 63u)) & UINT64_C(1)))
+        return false;
+    size_t lo = 0, hi = table->count;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) >> 1);
+        uint64_t cur = table->entries[mid].token;
+        if (cur == token) {
+            if (out_index) *out_index = table->entries[mid].value_index;
+            return true;
+        }
+        if (cur < token) lo = mid + 1u;
+        else hi = mid;
+    }
+    return false;
+}
+
+static inline bool rdna4_as_match_set_init(rdna4_as_match_set *set,
+                                           size_t value_count) {
+    if (!set) return false;
+    memset(set, 0, sizeof(*set));
+    set->value_count = value_count;
+    if (!value_count) return true;
+    size_t words = (value_count + 63u) >> 6;
+    set->bit_words = words;
+    if (words <= (sizeof(set->inline_bits) / sizeof(set->inline_bits[0]))) {
+        set->bits = set->inline_bits;
+        return true;
+    }
+    set->bits = (uint64_t *)calloc(words, sizeof(*set->bits));
+    if (!set->bits) {
+        set->bit_words = 0;
+        set->value_count = 0;
+        return false;
+    }
+    return true;
+}
+
+static inline void rdna4_as_match_set_destroy(rdna4_as_match_set *set) {
+    if (!set) return;
+    if (set->bits && set->bits != set->inline_bits) free(set->bits);
+    memset(set, 0, sizeof(*set));
+}
+
+static inline void rdna4_as_match_set_add(rdna4_as_match_set *set,
+                                          uint32_t index) {
+    if (!set || !set->bits || (size_t)index >= set->value_count) return;
+    set->bits[index >> 6] |= UINT64_C(1) << (index & 63u);
+}
+
+static inline bool rdna4_as_match_set_has(const rdna4_as_match_set *set,
+                                          uint32_t index) {
+    if (!set || !set->bits || (size_t)index >= set->value_count) return false;
+    return ((set->bits[index >> 6] >> (index & 63u)) & UINT64_C(1)) != 0;
+}
+
+static inline rdna4_as_status rdna4_as_scan_dense_words(
+    const uint8_t *bytes, uint64_t byte_len, uint64_t offset,
+    uint64_t word_count, const rdna4_as_live_table *live,
+    rdna4_as_match_set *out) {
+    if (!bytes || !live || !out) return RDNA4_AS_INVALID;
+    if (offset > byte_len ||
+        word_count > (byte_len - offset) / RDNA4_AS_TOKEN_BYTES)
+        return RDNA4_AS_OVERFLOW;
+    if (!word_count || !live->count) return RDNA4_AS_OK;
+    const uint8_t *p = bytes + offset;
+    const uint64_t min_tok = live->min_token;
+    const uint64_t span = live->span;
+    uint64_t rem = word_count;
+    while (rem >= 4u) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p, sizeof(w0));
+        memcpy(&w1, p + 8u, sizeof(w1));
+        memcpy(&w2, p + 16u, sizeof(w2));
+        memcpy(&w3, p + 24u, sizeof(w3));
+        if (__builtin_expect(((w0 - min_tok) <= span) |
+                             ((w1 - min_tok) <= span) |
+                             ((w2 - min_tok) <= span) |
+                             ((w3 - min_tok) <= span), 0)) {
+            uint32_t idx = 0;
+            if (rdna4_as_live_table_find(live, w0, &idx))
+                rdna4_as_match_set_add(out, idx);
+            if (rdna4_as_live_table_find(live, w1, &idx))
+                rdna4_as_match_set_add(out, idx);
+            if (rdna4_as_live_table_find(live, w2, &idx))
+                rdna4_as_match_set_add(out, idx);
+            if (rdna4_as_live_table_find(live, w3, &idx))
+                rdna4_as_match_set_add(out, idx);
+        }
+        p += 32u;
+        rem -= 4u;
+    }
+    while (rem--) {
+        uint64_t w;
+        memcpy(&w, p, sizeof(w));
+        if (__builtin_expect((w - min_tok) <= span, 0)) {
+            uint32_t idx = 0;
+            if (rdna4_as_live_table_find(live, w, &idx))
+                rdna4_as_match_set_add(out, idx);
+        }
+        p += 8u;
+    }
+    return RDNA4_AS_OK;
+}
+
+static inline rdna4_as_status rdna4_as_scan_strided_words(
+    const uint8_t *bytes, uint64_t byte_len, const rdna4_as_work *work,
+    const rdna4_as_live_table *live, rdna4_as_match_set *out) {
+    if (!bytes || !work || !live || !out ||
+        work->width != RDNA4_AS_TOKEN_BYTES)
+        return RDNA4_AS_INVALID;
+    uint64_t extent = 0;
+    rdna4_as_status st = rdna4_as_work_extent(work, &extent);
+    if (st != RDNA4_AS_OK) return st;
+    if (work->offset > byte_len || extent > byte_len - work->offset)
+        return RDNA4_AS_OVERFLOW;
+    if (!live->count) return RDNA4_AS_OK;
+    if (work->stride == RDNA4_AS_TOKEN_BYTES)
+        return rdna4_as_scan_dense_words(bytes, byte_len, work->offset,
+                                         work->count, live, out);
+    const uint64_t min_tok = live->min_token;
+    const uint64_t span = live->span;
+    uint64_t off = work->offset;
+    for (uint64_t i = 0; i < work->count; ++i) {
+        uint64_t w;
+        memcpy(&w, bytes + off, sizeof(w));
+        if (__builtin_expect((w - min_tok) <= span, 0)) {
+            uint32_t idx = 0;
+            if (rdna4_as_live_table_find(live, w, &idx))
+                rdna4_as_match_set_add(out, idx);
+        }
+        if (i + 1u < work->count) off += work->stride;
+    }
+    return RDNA4_AS_OK;
+}
+
+static inline void rdna4_as_inc_cache_destroy(rdna4_as_inc_cache *cache) {
+    if (!cache) return;
+    if (cache->chunks) {
+        for (size_t i = 0; i < cache->chunk_count; ++i)
+            free(cache->chunks[i].tokens);
+        free(cache->chunks);
+    }
+    free(cache->dirty_bits);
+    free(cache->nonempty_bits);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static inline rdna4_as_status rdna4_as_inc_cache_init(
+    rdna4_as_inc_cache *cache, uint64_t buffer_length) {
+    if (!cache) return RDNA4_AS_INVALID;
+    memset(cache, 0, sizeof(*cache));
+    cache->buffer_length = buffer_length;
+    if (!buffer_length) return RDNA4_AS_OK;
+    if (buffer_length > UINT64_MAX - (RDNA4_AS_INC_CHUNK_BYTES - 1u))
+        return RDNA4_AS_OVERFLOW;
+    uint64_t chunks64 =
+        (buffer_length + RDNA4_AS_INC_CHUNK_BYTES - 1u) >>
+        RDNA4_AS_INC_CHUNK_SHIFT;
+    if (chunks64 > (uint64_t)SIZE_MAX) return RDNA4_AS_OVERFLOW;
+    size_t chunk_count = (size_t)chunks64;
+    if (chunk_count > SIZE_MAX - 63u) return RDNA4_AS_OVERFLOW;
+    size_t bit_words = (chunk_count + 63u) >> 6;
+    cache->dirty_bits =
+        (uint64_t *)calloc(bit_words, sizeof(*cache->dirty_bits));
+    cache->nonempty_bits =
+        (uint64_t *)calloc(bit_words, sizeof(*cache->nonempty_bits));
+    cache->chunks = (rdna4_as_inc_chunk *)calloc(
+        chunk_count, sizeof(*cache->chunks));
+    if (!cache->dirty_bits || !cache->nonempty_bits || !cache->chunks) {
+        rdna4_as_inc_cache_destroy(cache);
+        return RDNA4_AS_CAPACITY;
+    }
+    cache->chunk_count = chunk_count;
+    cache->bit_words = bit_words;
+    for (size_t i = 0; i < bit_words; ++i)
+        cache->dirty_bits[i] = UINT64_MAX;
+    unsigned rem_bits = (unsigned)(chunk_count & 63u);
+    if (rem_bits)
+        cache->dirty_bits[bit_words - 1u] = (UINT64_C(1) << rem_bits) - 1u;
+    return RDNA4_AS_OK;
+}
+
+static inline void rdna4_as_inc_cache_mark_dirty(rdna4_as_inc_cache *cache,
+                                                 uint64_t offset,
+                                                 uint64_t length) {
+    if (!cache || !cache->chunk_count || !length ||
+        offset >= cache->buffer_length)
+        return;
+    uint64_t avail = cache->buffer_length - offset;
+    uint64_t clamped = length > avail ? avail : length;
+    size_t first = (size_t)(offset >> RDNA4_AS_INC_CHUNK_SHIFT);
+    size_t last =
+        (size_t)((offset + clamped - 1u) >> RDNA4_AS_INC_CHUNK_SHIFT);
+    if (last >= cache->chunk_count) last = cache->chunk_count - 1u;
+    size_t w_first = first >> 6, w_last = last >> 6;
+    if (w_first == w_last) {
+        unsigned lo = (unsigned)(first & 63u);
+        unsigned hi = (unsigned)(last & 63u);
+        uint64_t mask = hi == 63u ? (~UINT64_C(0) << lo)
+                                  : (((UINT64_C(1) << (hi - lo + 1u)) - 1u) << lo);
+        cache->dirty_bits[w_first] |= mask;
+    } else {
+        cache->dirty_bits[w_first] |= (~UINT64_C(0) << (first & 63u));
+        for (size_t wi = w_first + 1u; wi < w_last; ++wi)
+            cache->dirty_bits[wi] = UINT64_MAX;
+        unsigned hi = (unsigned)(last & 63u);
+        uint64_t tail = hi == 63u ? UINT64_MAX : ((UINT64_C(1) << (hi + 1u)) - 1u);
+        cache->dirty_bits[w_last] |= tail;
+    }
+    cache->generation++;
+}
+
+static inline void rdna4_as_inc_cache_mark_all_dirty(
+    rdna4_as_inc_cache *cache) {
+    if (!cache || !cache->chunk_count) return;
+    rdna4_as_inc_cache_mark_dirty(cache, 0, cache->buffer_length);
+}
+
+static inline bool rdna4_as_inc_chunk_push_unique(rdna4_as_inc_chunk *chunk,
+                                                  uint64_t token) {
+    for (uint32_t i = 0; i < chunk->count; ++i)
+        if (chunk->tokens[i] == token) return true;
+    if (chunk->count == chunk->cap) {
+        uint32_t next_cap = chunk->cap ? chunk->cap * 2u : 4u;
+        if (next_cap < chunk->cap) return false;
+        uint64_t *grown = (uint64_t *)realloc(
+            chunk->tokens, (size_t)next_cap * sizeof(*grown));
+        if (!grown) return false;
+        chunk->tokens = grown;
+        chunk->cap = next_cap;
+    }
+    chunk->tokens[chunk->count++] = token;
+    return true;
+}
+
+static inline bool rdna4_as_inc_cache_refresh_chunk(
+    rdna4_as_inc_cache *cache, size_t chunk_idx, const uint8_t *bytes,
+    uint64_t byte_len) {
+    uint64_t chunk_off = (uint64_t)chunk_idx << RDNA4_AS_INC_CHUNK_SHIFT;
+    if (chunk_off >= byte_len) return true;
+    uint64_t avail = byte_len - chunk_off;
+    uint64_t chunk_bytes =
+        avail < RDNA4_AS_INC_CHUNK_BYTES ? avail : RDNA4_AS_INC_CHUNK_BYTES;
+    uint64_t words = chunk_bytes / RDNA4_AS_TOKEN_BYTES;
+    rdna4_as_inc_chunk *chunk = &cache->chunks[chunk_idx];
+    chunk->count = 0;
+    const uint8_t *p = bytes + chunk_off;
+    uint64_t rem = words;
+    while (rem >= 4u) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p, sizeof(w0));
+        memcpy(&w1, p + 8u, sizeof(w1));
+        memcpy(&w2, p + 16u, sizeof(w2));
+        memcpy(&w3, p + 24u, sizeof(w3));
+        if (__builtin_expect(((w0 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX) |
+                             ((w1 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX) |
+                             ((w2 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX) |
+                             ((w3 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX), 0)) {
+            if ((w0 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX &&
+                !rdna4_as_inc_chunk_push_unique(chunk, w0)) return false;
+            if ((w1 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX &&
+                !rdna4_as_inc_chunk_push_unique(chunk, w1)) return false;
+            if ((w2 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX &&
+                !rdna4_as_inc_chunk_push_unique(chunk, w2)) return false;
+            if ((w3 >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX &&
+                !rdna4_as_inc_chunk_push_unique(chunk, w3)) return false;
+        }
+        p += 32u;
+        rem -= 4u;
+    }
+    while (rem--) {
+        uint64_t w;
+        memcpy(&w, p, sizeof(w));
+        if (__builtin_expect((w >> RDNA4_AS_TOKEN_PREFIX_SHIFT) == RDNA4_AS_TOKEN_PREFIX, 0)) {
+            if (!rdna4_as_inc_chunk_push_unique(chunk, w)) return false;
+        }
+        p += 8u;
+    }
+    size_t wi = chunk_idx >> 6;
+    uint64_t bit = UINT64_C(1) << (chunk_idx & 63u);
+    if (chunk->count) cache->nonempty_bits[wi] |= bit;
+    else cache->nonempty_bits[wi] &= ~bit;
+    cache->dirty_bits[wi] &= ~bit;
+    cache->dirty_chunks_scanned++;
+    return true;
+}
+
+static inline rdna4_as_status rdna4_as_inc_cache_scan_work(
+    rdna4_as_inc_cache *cache, const uint8_t *bytes, uint64_t byte_len,
+    const rdna4_as_work *work, const rdna4_as_live_table *live,
+    bool coherent_direct_writes, rdna4_as_match_set *out) {
+    if (!bytes || !work || !live || !out ||
+        work->width != RDNA4_AS_TOKEN_BYTES)
+        return RDNA4_AS_INVALID;
+    uint64_t extent = 0;
+    rdna4_as_status st = rdna4_as_work_extent(work, &extent);
+    if (st != RDNA4_AS_OK) return st;
+    if (work->offset > byte_len || extent > byte_len - work->offset)
+        return RDNA4_AS_OVERFLOW;
+    if (!live->count) return RDNA4_AS_OK;
+
+    if (coherent_direct_writes || !cache || !cache->chunk_count ||
+        byte_len != cache->buffer_length ||
+        work->stride != RDNA4_AS_TOKEN_BYTES ||
+        (work->offset & (RDNA4_AS_TOKEN_BYTES - 1u)) != 0) {
+        st = rdna4_as_scan_strided_words(bytes, byte_len, work, live, out);
+        if (st == RDNA4_AS_OK && cache && coherent_direct_writes)
+            cache->coherent_words_scanned += work->count;
+        return st;
+    }
+
+    const uint64_t work_begin = work->offset;
+    const uint64_t work_end = work->offset + extent;
+    size_t first_chunk = (size_t)(work_begin >> RDNA4_AS_INC_CHUNK_SHIFT);
+    size_t last_chunk = (size_t)((work_end - 1u) >> RDNA4_AS_INC_CHUNK_SHIFT);
+
+    /* Partial leading chunk (or single-chunk subrange). */
+    uint64_t first_start = (uint64_t)first_chunk << RDNA4_AS_INC_CHUNK_SHIFT;
+    uint64_t first_limit = byte_len - first_start < RDNA4_AS_INC_CHUNK_BYTES
+        ? byte_len : first_start + RDNA4_AS_INC_CHUNK_BYTES;
+    uint64_t first_aligned_end = first_start +
+        ((first_limit - first_start) & ~(uint64_t)(RDNA4_AS_TOKEN_BYTES - 1u));
+    if (work_begin > first_start || work_end < first_aligned_end) {
+        uint64_t seg_end = work_end < first_limit ? work_end : first_limit;
+        uint64_t seg_words = (seg_end - work_begin) / RDNA4_AS_TOKEN_BYTES;
+        st = rdna4_as_scan_dense_words(bytes, byte_len, work_begin, seg_words,
+                                       live, out);
+        if (st != RDNA4_AS_OK) return st;
+        if (first_chunk == last_chunk) return RDNA4_AS_OK;
+        first_chunk++;
+    }
+
+    /* Partial trailing chunk. */
+    uint64_t last_start = (uint64_t)last_chunk << RDNA4_AS_INC_CHUNK_SHIFT;
+    uint64_t last_limit = byte_len - last_start < RDNA4_AS_INC_CHUNK_BYTES
+        ? byte_len : last_start + RDNA4_AS_INC_CHUNK_BYTES;
+    uint64_t last_aligned_end = last_start +
+        ((last_limit - last_start) & ~(uint64_t)(RDNA4_AS_TOKEN_BYTES - 1u));
+    if (work_end < last_aligned_end) {
+        uint64_t seg_words = (work_end - last_start) / RDNA4_AS_TOKEN_BYTES;
+        st = rdna4_as_scan_dense_words(bytes, byte_len, last_start, seg_words,
+                                       live, out);
+        if (st != RDNA4_AS_OK) return st;
+        if (first_chunk == last_chunk) return RDNA4_AS_OK;
+        last_chunk--;
+    }
+
+    /* Full chunks [first_chunk, last_chunk]: skip clean empty chunks 64 at a time. */
+    size_t w_first = first_chunk >> 6;
+    size_t w_last = last_chunk >> 6;
+    for (size_t wi = w_first; wi <= w_last; ++wi) {
+        unsigned lo = wi == w_first ? (unsigned)(first_chunk & 63u) : 0u;
+        unsigned hi = wi == w_last ? (unsigned)(last_chunk & 63u) : 63u;
+        uint64_t mask = (lo == 0u && hi == 63u) ? UINT64_MAX
+            : hi == 63u ? (~UINT64_C(0) << lo)
+            : (((UINT64_C(1) << (hi - lo + 1u)) - 1u) << lo);
+        uint64_t dirty = cache->dirty_bits[wi] & mask;
+        uint64_t clean = mask & ~dirty;
+        if (clean)
+            cache->clean_chunks_skipped += (uint64_t)__builtin_popcountll(clean);
+        uint64_t active = (dirty | (cache->nonempty_bits[wi] & mask));
+        while (active) {
+            unsigned bit = (unsigned)__builtin_ctzll(active);
+            size_t c = (wi << 6) + bit;
+            uint64_t bit_mask = UINT64_C(1) << bit;
+            if (dirty & bit_mask) {
+                if (!rdna4_as_inc_cache_refresh_chunk(cache, c, bytes, byte_len)) {
+                    uint64_t c_off = (uint64_t)c << RDNA4_AS_INC_CHUNK_SHIFT;
+                    uint64_t c_avail = byte_len - c_off;
+                    uint64_t c_bytes = c_avail < RDNA4_AS_INC_CHUNK_BYTES
+                        ? c_avail : RDNA4_AS_INC_CHUNK_BYTES;
+                    st = rdna4_as_scan_dense_words(
+                        bytes, byte_len, c_off, c_bytes / RDNA4_AS_TOKEN_BYTES,
+                        live, out);
+                    if (st != RDNA4_AS_OK) return st;
+                    active &= active - 1u;
+                    continue;
+                }
+            }
+            if (cache->nonempty_bits[wi] & bit_mask) {
+                const rdna4_as_inc_chunk *chunk = &cache->chunks[c];
+                for (uint32_t ti = 0; ti < chunk->count; ++ti) {
+                    uint32_t idx = 0;
+                    if (rdna4_as_live_table_find(live, chunk->tokens[ti], &idx))
+                        rdna4_as_match_set_add(out, idx);
+                }
+            }
+            active &= active - 1u;
+        }
+    }
+    return RDNA4_AS_OK;
+}
+
+#endif
+
 #endif

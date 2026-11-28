@@ -19,8 +19,8 @@
 #include <stdatomic.h>
 
 #define RDNA4HS_MAXKEY        2                      // render: vertex + fragment; compute: kernel
-#define RDNA4HS_POLL_NS       100000000LL
-#define RDNA4HS_MIN_AGE_NS    400000000LL            // newest file must be at least this old
+#define RDNA4HS_POLL_NS       20000000LL             // 20 ms watcher poll interval while a fallback pipeline is pending
+#define RDNA4HS_MIN_AGE_NS    20000000LL             // newest file must be at least this old (atomic rename + 2 identical ticks)
 #define RDNA4HS_META_GRACE_NS 5000000000LL           // a render pipeline proceeds without a .meta.json after the .spv has been stable this long
 #define RDNA4HS_MAX_ATTEMPTS  4
 

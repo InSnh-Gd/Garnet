@@ -1,7 +1,8 @@
 # tools/rdna4
 
-Native payload scripts for the test bench's macOS 26.7.2 (25G332). Every name, flag and
-path below is taken from the scripts themselves.
+Native payload build, verification, installation, and recovery scripts for
+x86_64 macOS 26.x (`25G332` verified baseline). Every name, flag, and path
+below matches the scripts directly.
 
 ## Scripts
 
@@ -21,7 +22,7 @@ path below is taken from the scripts themselves.
   current delivery installs both `Garnet.kext` and `GarnetAccel.kext` into
   `/Library/Extensions` and adds both to the Aux KC (no `Lilu.kext` or `AMDRadeonRDNA4.kext`
   dependency). `Garnet.kext` inherits `IOFramebuffer` (`IOGraphicsFamily`), which exists only in
-  `SystemKernelExtensions.kc` on macOS 25G332 and cannot be prelinked into OpenCore's `BootKC`.
+  `SystemKernelExtensions.kc` on macOS 26.x and cannot be prelinked into OpenCore's `BootKC`.
   Retired pre-Garnet `RDNA4*`/`Navi48*`/`AMDRadeonRDNA4`
   artefacts are backup-and-remove only after bundle identity verification. Never run directly.
 - `build-radv.sh MESA_SRC OUT_DIR`: builds x86_64 `libvulkan_radeon.dylib` from Mesa
@@ -33,13 +34,15 @@ path below is taken from the scripts themselves.
   source snapshots, and the `garnet-delivery-v1` manifest contract. `build-all.sh` invokes it;
   it uses only Python's standard library and local Git.
 - `build-all.sh OUT_DIR`: builds one matched, signed standalone Garnet payload (`$PWD/payload`,
-  outside the repo). Needs `MKSDK`, `C64_LAYOUT_OUT`, `C64_WORK` dirs; `CHIPS`
+  outside the repo). Needs `MKSDK`, `GARNET_LAYOUT_OUT`, `GARNET_KC_WORK` dirs; `CHIPS`
   (default `navi44`, only `navi44`/`navi48`; `RDNA4_RELEASE=1` enforces `navi44` and implies
   `RDNA4_BUILD_PCIBARCOMPAT=1`); `RDNA4_RADV_LIB` or `RDNA4_MESA_SRC`;
   `RDNA4_XLATE_LIB` or `RDNA4_M2V_SRC`; `RDNA4_VK_INC` (default `-I$RDNA4_MESA_SRC/include`);
-  `RDNA4_RELEASE` (`0` default dev layout, `1` Navi 44 Release 1 payload layout requiring
-  `src/garnet/firmware/LICENSE.amdgpu` or `RDNA4_AMD_FIRMWARE_LICENSE`).
-  `C64_WORK` is the directory holding `kc/` and `kexts/` carved from the target OS, used by the
+  `RDNA4_RELEASE` (`0` default dev layout, `1` Navi 44 release payload layout requiring
+  `src/garnet/firmware/LICENSE.amdgpu` or `RDNA4_AMD_FIRMWARE_LICENSE`); optional
+  `RDNA4_RECOVER_EFI` (prebuilt x86_64 `GarnetRecover.efi`), `GARNET_SIGN_CA_DIR`, and
+  `GARNET_AMFIANCHOR_KEXT` (dual-track `AMFIAnchor` code-signing CA path).
+  `GARNET_KC_WORK` is the directory holding `kc/` and `kexts/` carved from the target OS, used by the
   accel trampoline generator. Verifies bundle ids, rejects `Lilu` dependencies and legacy tokens
   (`Navi48Bringup|Navi48Metal|RDNA4Bringup|RDNA4Accel|RDNA4Metal|AMDRadeonRDNA4|com.navi48|n48m`),
   and writes `MANIFEST.txt` plus `SHA256SUMS` starting with the `garnet-delivery-v1` installer
@@ -71,6 +74,15 @@ path below is taken from the scripts themselves.
   `/Library/Extensions/Garnet*.kext` and residual ESP `Garnet.kext`). `--legacy-only` removes
   only retired artefacts (`Navi48*`/`RDNA4*`/`AMDRadeonRDNA4`) and migrates legacy boot-args to
   `garnet-*`, preserving standalone Garnet.
+- `make-signing-ca.sh CA_DIR`: generates an out-of-repo local code-signing CA for optional
+  `AMFIAnchor` signing (`GARNET_SIGN_CA_DIR`).
+- `make_anchor_injector.py`: builds and verifies codeless Schema-1 `GarnetAnchorInjector.kext`
+  (`org.garnet.code-signing`) from the signing CA certificate.
+- `sign-with-anchor.sh`: signs userspace Mach-O binaries with the local CA via `rcodesign`.
+- `recover-uninstall.sh` / `com.garnet.recovery.plist`: self-contained boot recovery LaunchDaemon
+  triggered by `GarnetRecover.efi` `[2] Safe Boot & Uninstall Garnet` via UEFI NVRAM; clears the
+  flag first, uninstalls Garnet, writes `/Library/Logs/Garnet/recovery-complete.txt`, and leaves
+  the system on the safe desktop without rebooting.
 - `activate-native.sh`: runs at boot from `/Library/Application Support/Garnet/native/`.
   Requires `org.garnet.driver` to be boot-loaded, rejects legacy conflicting kexts, and late-loads
   `org.garnet.accel`. It checks `garnet-native/metal/metal-disp/metal-ws/apps/multisession` flags,
@@ -82,16 +94,17 @@ path below is taken from the scripts themselves.
 `Garnet.kext`, `GarnetAccel.kext`, `GarnetMetal.bundle.tar`,
 `native-translate`, `native-bundle-check`, `publish-metal`, `mtlprobe-direct`,
 `garnettest`, `install-native.sh`, `uninstall-native.sh`, `deploy-common.sh`,
-`activate-native.sh`, `collect-installed.sh`,
-`com.garnet.native.plist`, `com.garnet.native-translate.plist`,
+`activate-native.sh`, `collect-installed.sh`, `recover-uninstall.sh`,
+`com.garnet.native.plist`, `com.garnet.native-translate.plist`, `com.garnet.recovery.plist`,
+optional `optional/GarnetRecover.efi` and `optional/GarnetAnchorInjector.kext`,
 `LOCAL-SOURCE-MANIFEST.txt`, `MANIFEST.txt`, `SHA256SUMS`.
 
 The Metal bundle carries `libvulkan_radeon.dylib` and `libgarnetxlate.dylib`; the default dev build
 (`RDNA4_RELEASE=0`) does not supply a Vulkan loader, `vulkaninfo`, or an ICD JSON manifest.
 
-### Release 1 payload layout (`RDNA4_RELEASE=1 build-all.sh OUT_DIR`)
+### Release payload layout (`RDNA4_RELEASE=1 build-all.sh OUT_DIR`)
 
-Adds Release provenance and layout selection assets while moving `GarnetAccel.kext` under a single
+Adds release provenance and layout selection assets while placing `GarnetAccel.kext` under a single
 variant path (`SHA256SUMS` covers 100% of payload files and `build_identity.py verify-release-payload`
 enforces completeness):
 
@@ -104,17 +117,19 @@ enforces completeness):
 - `MANIFEST.txt` includes `RELEASE_MODE=1`, `TARGET_SILICON=navi44`, `TARGET_PCI_IDS=1002:7590`,
   `DEFAULT_LAYOUT_ID=<sha256>`, and `AMD_FIRMWARE_LICENSE=LICENSE.amdgpu`.
 
-## Build identity tests
+## Build identity and recovery tests
 
-`python3 tools/rdna4/tests/build-identity-test.py -v` uses local Git, plist and
+`python3 tools/rdna4/tests/build-identity-test.py -v`,
+`python3 tools/rdna4/tests/anchor-injector-test.py -v`, and
+`bash tools/rdna4/tests/recover-uninstall-test.sh` use local Git, plist, CA, and
 object fixtures to verify standalone `Garnet`/`GarnetAccel` identity rules, `Lilu`-dependency
-and legacy-token rejection, the `garnet-delivery-v1` manifest contract, and local-source
-detection of dirty/untracked inputs while ignoring build outputs. The tests do not build or load a
-kext.
+and legacy-token rejection, `GarnetAnchorInjector.kext` generation, recovery uninstall behavior,
+the `garnet-delivery-v1` manifest contract, and local-source detection of dirty/untracked inputs
+while ignoring build outputs. The tests do not build or load a kext.
 
 ## Safety
 
-- Installers need root, macOS build 25G332, and a verified payload
+- Installers need root, a supported x86_64 macOS 26.x build, and a verified payload
   (`shasum -a 256 -c SHA256SUMS`); they touch the ESP `config.plist` only after
   copying `config-before.plist` into the backup, and roll the EFI, Aux KC and files
   back on failure.

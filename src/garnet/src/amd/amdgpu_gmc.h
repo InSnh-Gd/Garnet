@@ -12,7 +12,7 @@
 //
 //  Deviations from reference (see gmc_v12_0.cpp for the full list):
 //    * DriverKit IOBufferMemoryDescriptor/IODMACommand → amdgpu::SysMem.
-//    * VRAM byte offsets are relative to dev.vramBase (PORTING.md rule).
+//    * VRAM byte offsets are relative to dev.vramBase (avoiding low boot framebuffer).
 //    * `skipDisplayRisky` gate added (defaults false = reference behaviour).
 //
 #pragma once

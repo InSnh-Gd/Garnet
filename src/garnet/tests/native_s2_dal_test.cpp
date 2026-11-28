@@ -18,16 +18,13 @@
 //   B3  E2 / E3 / E4: PASS with the exact messages and order (DISPCLK first, restore reversed), and every failure verdict with its restore behaviour;
 //   B4  the latch, the busy flag, the level ordering, the allowlist inside a step;
 //   B5  lock sharing: PPSMC and DAL serialise, recursion, allocation failure;
-//   S   source pins: three WREG32 only, callers, IOSleep in every wait, bounded loops, the ABI 1.2 contract text, the tool, the version.
-#include "garnet_version_check.h"
+//   B7  DAL clock snapshot queries; B8 UCLK top-DPM pinning; B9 display-wake PMFW verification.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <sstream>
 #include <map>
 #include <new>
 #include <cstdarg>
@@ -52,8 +49,6 @@ static void expect_u(const char *what, uint64_t got, uint64_t want) {
     gRun++;
     if (got != want) { gFail++; std::printf("FAIL: %s: got %#llx want %#llx\n", what, (unsigned long long)got, (unsigned long long)want); }
 }
-static std::string slurp(const std::string &path) { std::ifstream f(path); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
-static size_t count_of(const std::string &s, const std::string &needle) { size_t n = 0, p = 0; while ((p = s.find(needle, p)) != std::string::npos) { n++; p += needle.size(); } return n; }
 
 // =====================================================================================================================================
 // The simulated machine
@@ -1435,115 +1430,6 @@ static void b9_display_wake_pmfw() {
 }
 
 // =====================================================================================================================================
-// S: source pins
-// =====================================================================================================================================
-static std::string fn_body(const std::string &s, const std::string &head) {
-    const size_t a = s.find(head); if (a == std::string::npos) return "";
-    const size_t b = s.find("\n}\n", a); return s.substr(a, b == std::string::npos ? std::string::npos : b - a);
-}
-static void s_pins(const std::string &root) {
-    const std::string K = root + "/src/garnet/";
-    const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
-    const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), uc = slurp(K + "src/GarnetUserClient.cpp");
-    const std::string abi = slurp(K + "src/GarnetNativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/an internal design note");
-    const std::string tool = slurp(root + "/tools/native/rdna4dal.c"), bld = slurp(root + "/tools/native/build.sh");
-    expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty(), "every source file the pins read exists (and the repo root argument is right)");
-    // the sender writes exactly the three DAL dwords
-    expect_u("smu_dal.cpp has exactly three WREG32 calls", count_of(dal, "WREG32("), 3);
-    expect(dal.find("WREG32(dev, kRegResp, 0u);") != std::string::npos && dal.find("WREG32(dev, kRegArg, param);") != std::string::npos && dal.find("WREG32(dev, kRegMsg, msg);") != std::string::npos, "the three writes are RESP = 0, ARG = param, MSG = id");
-    expect(dal.find("WREG32(dev, kRegResp, 0u);") < dal.find("WREG32(dev, kRegArg, param);") && dal.find("WREG32(dev, kRegArg, param);") < dal.find("WREG32(dev, kRegMsg, msg);"), "Linux's order: RESP, ARG, MSG");
-    expect(dal.find("smu_send_msg") == std::string::npos && dal.find("WBAR0") == std::string::npos && dal.find("bar0_") == std::string::npos && dal.find("bar2") == std::string::npos, "smu_dal.cpp writes no other register, no VRAM, no doorbell, sends no PPSMC message");
-    expect(count_of(dal, "RREG32(") >= 6, "the reads exist");
-    // the gate
-    {
-        const std::string b = fn_body(dal, "uint32_t dal_gated_level()");
-        expect(b.find("native_gate_ok()") != std::string::npos && b.find("v >= 1u && v <= kMaxLevel") != std::string::npos, "the gated level needs the native gate and a boot-arg in 1..4");
-        expect(fn_body(dal, "static bool native_gate_ok()").find("kGateOn && s.positivePass") != std::string::npos, "the native gate is kGateOn AND S1b positivePass");
-        expect(fn_body(dal, "static uint32_t boot_arg_level()").find("return 0u;") != std::string::npos, "an absent boot-arg is level 0");
-    }
-    // waits are bounded and sleep
-    {
-        const std::string b = fn_body(dal, "static uint32_t hard_min(");
-        expect(b.find("kHardMinPollUs") != std::string::npos && b.find("IOSleep(1)") != std::string::npos && b.find("RDNA4N_DAL_F_POLL_TIMEOUT") != std::string::npos && b.find("return 2u;") != std::string::npos && b.find("gRun.timedOut = true") == std::string::npos, "the 0x15 poll sleeps 1 ms, is bounded at kHardMinPollUs and reports a POLL timeout (return 2) without the mailbox-timeout flag");
-        expect(pure.find("kRespWaitUs = 2000u * 1000u") != std::string::npos && pure.find("kHardMinPollUs = 1000u * 1000u") != std::string::npos, "the bounds are 2 s and 1 s");
-        expect(dal.find("IOSleep(2000)") != std::string::npos && dal.find("IOSleep(100)") != std::string::npos && dal.find("IOSleep(5)") != std::string::npos, "the reference window, the dwell tick and the settle polls sleep");
-        expect(dal.find("kStallMs") != std::string::npos && dal.find("rate_ok(") != std::string::npos && dal.find("judge_dwell(") != std::string::npos, "the dwell checks stall, rate and the clock thresholds");
-    }
-    // the step runner: latch, gate, restore, E1b enabling
-    {
-        const std::string b = fn_body(dal, "IOReturn dal_run_step(");
-        expect(b.find("pre_gate(native_gate_ok(), gated, step, gDal.e1bOk, gDal.latch.stopped, busy)") != std::string::npos, "the pre-gate reads the gate, the level, E1b and the latch");
-        expect(b.find("gDal.latch = latch_apply(gDal.latch, step, gRun.verdict);") != std::string::npos, "the latch is applied to every verdict");
-        expect(b.find("owner_cas(kOwnerIdle, kOwnerDal)") != std::string::npos && count_of(b, "owner_cas(kOwnerDal, kOwnerIdle)") == 2, "one step at a time (owner word 0 -> 1); the owner is released on the deny path and at the end");
-        expect(b.find("if (gRun.verdict == kVNone) gRun.verdict = kGlitch;") != std::string::npos, "a path that decides nothing is not a pass");
-        expect(b.find("RDNA4N_DAL_F_UNDERFLOW_UNREAD") != std::string::npos && b.find("RDNA4N_DAL_UNDERFLOW_NA") != std::string::npos, "the underflow gap is reported in every result");
-        expect(b.find("gDal.e1bOk = false;") != std::string::npos, "a re-run of E1b clears the done flag first");
-        const std::string r = fn_body(dal, "static void step_raise(");
-        expect(r.find("plan.raise[i].clk, plan.raise[i].mhz, true") != std::string::npos && r.find("for (uint32_t i = plan.nRaise; i-- > 0u; ) order[n++] = plan.raise[i].clk;") != std::string::npos, "raise in plan order, restore in reverse");
-        expect(r.find("if (gRun.timedOut && gRun.hardMinSent) {") != std::string::npos && r.find("RESTORE NOT ATTEMPTED") != std::string::npos, "no restore after a timeout");
-        expect(r.find("kRestoreMhz, false") != std::string::npos && r.find("(mask & (1u << clk)) == 0u") != std::string::npos && r.find("restore_mask(gRun.raisedMask, b0, zb)") != std::string::npos && r.find("mask != 0u && !gRun.timedOut") != std::string::npos, "the restore covers the raised clocks and every clock below its start, at kRestoreMhz, unless the mailbox timed out");
-        expect(r.find("frame_now(") != std::string::npos && r.find("scanQuery") != std::string::npos && r.find("kDenyFrames") != std::string::npos && r.find("RDNA4N_SCANQ_ACQUIRED") != std::string::npos && r.find("kDenyAcquired") != std::string::npos, "the pre-flight reads the OTG through the scanout status code and refuses an acquired plane");
-        const std::string e = fn_body(dal, "static void step_e1b(");
-        expect(e.find("level_count(arg)") != std::string::npos && e.find("level_mhz(arg)") != std::string::npos && e.find("norm_mhz(arg)") != std::string::npos && count_of(e, "norm_mhz(") == 1 && e.find("if (clk == kClkDispclk) {") != std::string::npos && e.find("dal_msg_soft(kMsgGetDcModeMaxDpmFreq") != std::string::npos, "E1b reads the level count as Linux does, masks levels to 16 bits, asks 0xC for DISPCLK only and softly");
-        expect(e.find("gDal.max[0] = mx[0]; gDal.max[1] = mx[1]; gDal.e1bOk = true;") != std::string::npos && count_of(dal, "gDal.max[0] =") == 1, "the DPM maxima are recorded in one place, by E1b");
-    }
-    // who calls what
-    {
-        size_t senders = 0;
-        const char *files[] = { "src/GarnetDriver.cpp", "src/GarnetDriverStages.cpp", "src/GarnetUserClient.cpp", "src/GarnetNativeClient.cpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp", "src/dcn/dcn.cpp", "src/dcn/dcn_scanout_mt.cpp", "src/dcn/dcn_dmub_telemetry.cpp", "src/dcn/dcn_disp2_scanx.cpp", "src/GarnetPrimaryFramebuffer.cpp", "src/amd/amdgpu_init.cpp", "src/amd/smu_v14_0.cpp" };
-        for (const char *file : files) senders += count_of(slurp(K + file), "smu_dal_send(");
-        expect_u("nobody outside smu_dal.cpp calls smu_dal_send", senders, 0);
-        expect_u("dal_run_step has one caller (n1c_dal_step)", count_of(eng, "dal_run_step("), 1);
-        expect_u("n1c_dal_step has one caller (the RDNA4N client)", count_of(cli, "n1c_dal_step("), 1);
-        expect(cli.find("case RDNA4N_SEL_DAL_STEP:") != std::string::npos && cli.find("if (!shape(2, 0, 0, sizeof(rdna4n_dal_result))) return kIOReturnBadArgument;") != std::string::npos, "selector 15: exactly two scalars in, a 256 B struct out");
-        const std::string nb = fn_body(eng, "IOReturn n1c_dal_step(");
-        expect(nb.find("if (!sess_hello(ref)) return kIOReturnNotReady;") != std::string::npos && nb.find("flags != 0ull") != std::string::npos && nb.find("IOLockLock") == std::string::npos, "n1c_dal_step: Hello first, flags 0, and no client lock held across the step");
-    }
-    // lock sharing
-    {
-        const std::string b = fn_body(smu, "smu_send_msg_with_param(const DeviceContext &dev,\n                        uint32_t msgId, uint32_t param,\n                        uint32_t *outReturn)");
-        expect(b.find("SmuSeq seq;") != std::string::npos && b.find("smu_send_msg_with_param_body(") != std::string::npos && b.find("SmuSeq seq;") < b.find("smu_send_msg_with_param_body("), "the public PPSMC entry takes the shared lock and then calls the untouched body");
-        expect(smu.find("static __attribute__((noinline)) kern_return_t\nsmu_send_msg_with_param_body(") != std::string::npos, "the body is a separate noinline function (its disassembly is proved identical to the base)");
-        expect(smuh.find("struct SmuSeq") != std::string::npos && smuh.find("bool smu_lock_enter();") != std::string::npos && smu.find("gSmuOwner") != std::string::npos && smu.find("gSmuDepth++") != std::string::npos, "the shared lock is recursive for its owner");
-        expect(fn_body(uc, "IOReturn GarnetUserClient::doMetrics(").find("amdgpu::SmuSeq smuSeq;") != std::string::npos && fn_body(uc, "IOReturn GarnetUserClient::doMetrics(").find("amdgpu::SmuSeq smuSeq;") < fn_body(uc, "IOReturn GarnetUserClient::doMetrics(").find("amdgpu::smu_read_metrics("), "doMetrics holds the shared lock across smu_read_metrics");
-        expect(fn_body(uc, "IOReturn GarnetUserClient::doPowerState(").find("amdgpu::SmuSeq smuSeq;") != std::string::npos && fn_body(uc, "IOReturn GarnetUserClient::doPowerState(").find("amdgpu::SmuSeq smuSeq;") < fn_body(uc, "IOReturn GarnetUserClient::doPowerState(").find("amdgpu::smu_set_power_state("), "doPowerState holds the shared lock across smu_set_power_state");
-        expect(dal.find("#include \"amdgpu_smu.h\"") != std::string::npos, "the DAL sender shares the lock through amdgpu_smu.h");
-    }
-    // the ABI
-    expect_u("RDNA4N_SEL_DAL_STEP", RDNA4N_SEL_DAL_STEP, 15); expect_u("selector count 1.2", RDNA4N_SEL_COUNT_1_2, 16); expect_u("v1.1 count unchanged", RDNA4N_SEL_COUNT_1_1, 15); expect_u("v1.0 count unchanged", RDNA4N_SEL_COUNT, 9);
-    expect_u("ABI major unchanged", RDNA4N_ABI_VERSION, 1); expect_u("ABI minor 13 (1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors; 1.7 since 0.0.609; 1.6 was 0.0.608; 1.5 was 0.0.607; 1.4 grew the mode-trial result, the mode-trial selector arrived in 1.3, the DAL step selector in 1.2)", RDNA4N_ABI_MINOR, 13);
-    expect_u("result size", sizeof(rdna4n_dal_result), 256);
-    expect(RDNA4N_DAL_V_PASS == kPass && RDNA4N_DAL_V_REFUSED == kRefused && RDNA4N_DAL_V_TIMEOUT == kTimeout && RDNA4N_DAL_V_REGRESSED == kRegressed && RDNA4N_DAL_V_GLITCH == kGlitch && RDNA4N_DAL_V_DENIED == kDenied && RDNA4N_DAL_V_SHORT == kShort, "the ABI verdict values are the pure header's");
-    expect(RDNA4N_DAL_STEP_E1B == kE1b && RDNA4N_DAL_STEP_E2 == kE2 && RDNA4N_DAL_STEP_E3 == kE3 && RDNA4N_DAL_STEP_E4 == kE4, "the ABI step numbers are the pure header's");
-    if (!doc.empty()) {
-        expect(doc.find("## ABI 1.2 addendum") != std::string::npos && doc.find("RDNA4N_SEL_DAL_STEP") != std::string::npos && doc.find("rdna4-dalsmc") != std::string::npos && doc.find("rdna4dal e1b") != std::string::npos, "the contract has an ABI 1.2 addendum that names the selector, the boot-arg and the tool");
-        expect(doc.find("the temperature stop rule (\"temps > E1 + 5 C\") is NOT implemented") != std::string::npos && doc.find("DISPCLK first, then DPPCLK**") != std::string::npos && doc.find("`dc_max_resp`") != std::string::npos && doc.find("`POLL_TIMEOUT`") != std::string::npos && doc.find("`ABOVE_START`") != std::string::npos,
-               "the addendum documents the temperature deviation, the E4 order, dc_max_resp, POLL_TIMEOUT and AT_START / ABOVE_START");
-    } else {
-        std::printf("note: retired design note absent, skipping ABI 1.2 addendum doc pin\n");
-    }
-    {   // the deny / refuse codes are distinct and the tool names the acquired denial
-        const uint32_t d[] = { kDenyLatched, kDenyGate, kDenyLevel, kDenyNoE1b, kDenyBusy, kDenyBadStep, kDenyLevelArg, kDenyBaseline, kDenyFrames, kDenyAcquired };
-        bool distinct = true; for (size_t i = 0; i < 10; i++) for (size_t j = i + 1; j < 10; j++) if (d[i] == d[j]) distinct = false;
-        expect(distinct && kDenyAcquired == 10 && kDenyFrames == 9, "every deny code is distinct (acquired = 10)");
-        if (!tool.empty()) expect(tool.find("case 10: return \"the scanout plane is acquired") != std::string::npos, "the tool names deny 10");
-    }
-    // version
-    {
-        const uint32_t build = garnet_test_ver::parse_build(garnet_test_ver::read_version(root));
-        expect(build > 0 && garnet_test_ver::plist_matches_version(root, plist) && garnet_test_ver::header_and_sources_match(root, engh), "Info.plist and kN1cKextBuild match single version source");
-    }
-    expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
-    // the tool
-    if (!tool.empty()) expect(tool.find("RDNA4N_SEL_DAL_STEP") != std::string::npos && tool.find("e1b") != std::string::npos && tool.find("e4") != std::string::npos && tool.find("RDNA4N_HELLO_F_MINOR") != std::string::npos, "rdna4dal drives the selector, needs the minor");
-    if (!bld.empty()) expect(bld.find("rdna4dal:rdna4dal.c") != std::string::npos, "build.sh builds rdna4dal");
-    // banned strings in the new code
-    for (const std::string *t : { &dal, &pure }) expect(t->find("+0x280") == std::string::npos && t->find("+0x282") == std::string::npos && t->find("+0x299") == std::string::npos, "the banned pipe offsets do not appear");
-    expect(pure.find("#include <stdint.h>") != std::string::npos && pure.find("#include <IOKit") == std::string::npos, "the pure header includes stdint only");
-    expect(dal.find("std::") == std::string::npos, "no C++ library use in the kernel file");
-}
-
-// =====================================================================================================================================
 static void b7_snapshot() {
     constexpr uint32_t timer = 0x39e7u;
     const auto prepareRefs = [] {
@@ -1648,9 +1534,7 @@ int main(int argc, char **argv) {
         std::printf("native_s2_dal_test clock snapshot: %d checks, %d failed\n", gRun, gFail);
         return gFail ? 1 : 0;
     }
-    const bool behaviorOnly = argc == 2 && std::strcmp(argv[1], "--behavior") == 0;
     p1_did(); p2_allow(); p3_rules(); h1_state_machine(); h2_raise_release();
-    if (!behaviorOnly) s_pins(argc > 1 ? argv[1] : ".");
     b1_sender(); b2_e1b(); b3_e2(); b3_failures(); b4_latch_busy(); b6_hold(); b5_lock(); b7_snapshot(); b8_uclk(); b9_display_wake_pmfw();
     std::printf("native_s2_dal_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;

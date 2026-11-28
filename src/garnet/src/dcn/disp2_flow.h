@@ -323,7 +323,7 @@ inline uint32_t status3(E &e, uint64_t *v, uint32_t inst = RDNA4D2_INST_MONA)
 }
 
 // =====================================================================================================================================================================================================
-// 0.0.635 (multi-monitor stages M4c / M4d): ops 8..12, the monitor B's plane. INSTANCE 2 ONLY. The order of the plane op (an internal design note, "M4c/M4d build spec"):
+// 0.0.635 (multi-monitor stages M4c / M4d): ops 8..12, the monitor B's plane. INSTANCE 2 ONLY. The order of the plane op (secondary plane bring-up):
 //    0  the stage the op needs (no register is read);   1  the admission of the two buffers and EVERY list of the op judged by the guard (a refusal reads and writes nothing; op 8 gives the buffers back);
 //    2  the DP side before (fifteen reads + the six) and proof that OTG0 and OTG2 are counting;   3  the prechecks (EXPECT pages, the equal pairs, neither HUBP0's primary NOR its EARLIEST_INUSE overlaps A or B);   4  the buffers drawn (op 8) and read back at 24 points each;
 //  0.0.636, op 8 in Linux's order (clocks on BEFORE the programming; the 0.0.635 run showed DSCL2_LB_MEMORY_CTRL does not take with HUBP2 / DPP2 unclocked); 0.0.638 changes in the marked steps:

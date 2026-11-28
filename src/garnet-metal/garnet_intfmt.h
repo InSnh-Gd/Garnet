@@ -1,4 +1,4 @@
-// garnet_intfmt.h (bundle 19, NATIVE-S8-MENUS.md): the integer colour-format rules of the bundle, pure C so they are host-tested (test-intfmt.c) AND checked against Apple's Metal on the host Mac (test-intclear-semantics.m).
+// garnet_intfmt.h (bundle 19, integer format support): the integer colour-format rules of the bundle, pure C so they are host-tested (test-intfmt.c) AND checked against Apple's Metal on the host Mac (test-intclear-semantics.m).
 // Core Animation's large-shadow pass ping-pongs two MTLPixelFormatRG16Uint targets; refusing the format dropped the whole layer (menus, Spotlight). Two rules follow from accepting it:
 //  (1) a Clear load action on an integer attachment fills VkClearColorValue.uint32, never .float32 (the float bits of a clear colour are not the integer the client asked for);
 //  (2) the magenta FALLBACK fragment shader writes float4: into an integer attachment that is a type mismatch, so the pipeline masks the attachment off (colorWriteMask 0) until the real shader is hot-swapped in.

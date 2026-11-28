@@ -890,16 +890,12 @@ static BOOL rdna4_compute_desc_wants_icb(MTLComputePipelineDescriptor *d, NSErro
 // placement extent, not just the bytes charged to -usedSize.
 static BOOL rdna4_heap_query_extent(VkMemoryRequirements mr, BOOL hostImport,
                                     NSUInteger *size, NSUInteger *align) {
-    if (!size || !align || !mr.size || !mr.alignment) return NO;
-    uint64_t gran = RDNA4R.lim.bufferImageGranularity ? RDNA4R.lim.bufferImageGranularity : 1;
-    uint64_t host = hostImport ? RDNA4R.hostAlign : 1;
-    if (!gran || (gran & (gran - 1)) || !host || (host & (host - 1))) return NO;
-    uint64_t a = MAX((uint64_t)mr.alignment, gran);
-    if (hostImport) a = MAX(a, host);
-    uint64_t extent = (uint64_t)rdna4_alup((NSUInteger)mr.size, (NSUInteger)gran);
-    if (extent == UINT64_MAX) return NO;
-    if (hostImport) extent = (uint64_t)rdna4_alup((NSUInteger)extent, (NSUInteger)host);
-    if (extent == UINT64_MAX || extent > NSUIntegerMax || a > NSUIntegerMax) return NO;
+    if (!size || !align) return NO;
+    uint64_t extent = 0, a = 0;
+    if (!rdna4ha_query_extent(mr.size, mr.alignment, RDNA4R.lim.bufferImageGranularity,
+                              hostImport ? 1 : 0, RDNA4R.hostAlign, &extent, &a) ||
+        extent > NSUIntegerMax || a > NSUIntegerMax)
+        return NO;
     *size = (NSUInteger)extent;
     *align = (NSUInteger)a;
     return YES;
@@ -1391,7 +1387,7 @@ static BOOL rdna4_heap_image_size_align(MTLTextureDescriptor *d,
 - (NSUInteger)maxBufferLength                { return (NSUInteger)[self rdna4MemoryCaps].buffer_length; }
 - (uint64_t)recommendedMaxWorkingSetSize     { return [self rdna4MemoryCaps].working_set; }
 - (BOOL)hasUnifiedMemory { return NO; }
-- (BOOL)isHeadless       { return rdna4_headless(); }   // 11b: YES unless /private/tmp/rdna4m-headless-no exists (read once per process)
+- (BOOL)isHeadless       { return rdna4_headless(); }   // 11b: YES unless /private/tmp/garnet-headless-no exists (read once per process)
 - (BOOL)isLowPower       { return NO; }
 - (BOOL)isRemovable      { return NO; }
 #endif

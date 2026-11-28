@@ -66,6 +66,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_log.h"
 #include "amdgpu_psp.h"
+#include "amdgpu_smu.h"
 #include "garnet_gfxoff_pure.h"
 // amdgpu_ucode_extract.h carries its own copy of the PSPGfxFwType
 // constants, guarded by AMDGPU_PSP_GFX_FW_TYPE_DEFINED. amdgpu_psp.h
@@ -985,7 +986,7 @@ sdma_q1_set_wptr_mmio(const DeviceContext &dev, const SDMAInstance &inst,
 //------------------------------------------------------------------
 // sdma_q1_selftest — does BAR2 dword `doorbell_index` reach SDMA0 QUEUE1?
 //
-// Open question 1 of notes/re/sdma-takeover-design.md, settled with OUR OWN ring
+// SDMA doorbell/fence routing, settled with OUR OWN ring
 // before Apple's is ever involved. 4 KiB of VRAM, one FENCE packet, RB_ENABLE=1,
 // a doorbell-only kick, a 200 ms poll; only if that fails, the MMIO control leg.
 // QUEUE1 ends DISABLED and the ring is freed either way.
@@ -1454,6 +1455,9 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
     if (!inst.inited || !inst.enabled || inst.dma_unconfirmed) return kIOReturnNotReady;
     const uint64_t offs = uint64_t{inst.doorbell_index} * 4u;
     if (!sdma_bar2_slot_valid(dev, offs)) return kIOReturnNotReady;
+    // Notify the activity-driven GFXCLK idle governor without blocking (caller
+    // may hold gScanoutLock).
+    smu_idle_dpm_note_activity(false);
     const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
 
     // 1) WPTR shadow in the writeback page — upstream

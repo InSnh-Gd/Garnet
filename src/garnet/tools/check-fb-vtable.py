@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify primary IOFramebuffer 350-slot vtable layout and 25G332 KC symbol exports.
+"""Verify primary IOFramebuffer 350-slot vtable layout and target KC symbol exports.
 
-Usage: check-fb-vtable.py [--class CLASSNAME] <linked_kext_binary>
+Usage: GARNET_KC_WORK=/path/to/kc-work [GARNET_LAYOUT_OUT=/path/to/layout-out] check-fb-vtable.py [--class CLASSNAME] <linked_kext_binary>
 """
 import argparse
 import json
@@ -11,16 +11,14 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
-DEFAULT_WORK = os.path.join(REPO, "build-offline", "vm-25G332")
-DEFAULT_LAYOUT_OUT = os.path.join(DEFAULT_WORK, "layout-25G332")
-
-# Set defaults before importing exports/kcmod because kcmod binds env vars at import time.
-os.environ.setdefault("C64_WORK", DEFAULT_WORK)
-os.environ.setdefault("C64_LAYOUT_OUT", DEFAULT_LAYOUT_OUT)
-os.environ.setdefault("C64_NM", "llvm-nm")
-
 GATES_DIR = os.path.join(REPO, "src", "garnet-accel", "gates")
 LAYOUT_DIR = os.path.join(REPO, "tools", "ioaccel-layout")
+DEFAULT_LAYOUT_OUT = os.path.join(LAYOUT_DIR, "layout-out")
+
+# Set defaults before importing exports/kcmod because kcmod binds env vars at import time.
+os.environ.setdefault("GARNET_LAYOUT_OUT", DEFAULT_LAYOUT_OUT)
+os.environ.setdefault("GARNET_NM", "llvm-nm")
+
 sys.path.insert(0, GATES_DIR)
 sys.path.insert(0, LAYOUT_DIR)
 
@@ -105,7 +103,7 @@ def check_vtable(k, cls, c_fb):
 def check_exports(k):
     ex = exports.load()
     if len(ex) < 10000:
-        return [], [], f"exports.load() returned too few symbols ({len(ex)}); ensure C64_NM=llvm-nm"
+        return [], [], f"exports.load() returned too few symbols ({len(ex)}); ensure GARNET_NM=llvm-nm"
     und = [
         s["name"]
         for s in k.syms
@@ -122,7 +120,7 @@ def main():
     ap.add_argument("kext", help="Path to linked Mach-O x86_64 kext executable")
     args = ap.parse_args()
 
-    layout_out = os.environ["C64_LAYOUT_OUT"]
+    layout_out = os.environ["GARNET_LAYOUT_OUT"]
     with open(os.path.join(layout_out, "model.json"), "r", encoding="utf-8") as fp:
         c_fb = json.load(fp)["classes"]["IOFramebuffer"]
 

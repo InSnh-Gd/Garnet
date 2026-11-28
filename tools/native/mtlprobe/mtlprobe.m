@@ -444,7 +444,7 @@ static int cmd_timeout(uint64_t rid, int haveRid, int passes) {
 }
 
 // mtlprobe libhash <path.metallib> [--registry-id N]: newLibraryWithURL:, then for every functionNames entry
-// newFunctionWithName: and print name, stage and sha256(bitcodeData) (the bundle's spvcache key, NATIVE-S4-M10 10a).
+// newFunctionWithName: and print name, stage and sha256(bitcodeData) (the bundle's spvcache key, spvcache key).
 // Output lines: "libhash: fn <idx> <name> stage=<vertex|fragment|kernel|other> bytes=<n> sha256=<hex>". Creates no pipeline.
 static int cmd_libhash(const char *path, uint64_t rid, int haveRid) {
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
@@ -1069,7 +1069,7 @@ static int cmd_msaa(uint64_t rid, int haveRid) {
     return fails ? 1 : 0;
 }
 
-// bundle 19 (missing menus, NATIVE-S8-MENUS.md): oracle for `mtlprobe rg16uint`.  Core Animation's large-shadow pass (brim_init / brim_jump / brim_outline) ping-pongs two RG16Uint targets
+// bundle 19 (missing menus, integer format support): oracle for `mtlprobe rg16uint`.  Core Animation's large-shadow pass (brim_init / brim_jump / brim_outline) ping-pongs two RG16Uint targets
 // (pixel format 63): a uint2 fragment output, an integer read() of the previous pass, and an integer clear.  The shaders below have the same shape.
 // Metal's integer clear (measured on an Apple-silicon Mac, bundle 19): clearColor doubles are TRUNCATED toward zero and SATURATED to [0, 65535] per channel (NaN -> 0): (1.5, 2.5) -> (1, 2), (-5, 70000) -> (0, 65535), (255.9999, ..) -> 255.
 static const char *kRgSrc =
@@ -1767,10 +1767,10 @@ static void io_expect_blend(uint8_t *exp, int w, int h, const uint8_t clear[4] /
     }
 }
 
-// ---- S5.2a: dispflip (native #12, an internal design note). A 2560x1440 BGRA IOSurface render target with moving bands, rendered on the RDNA4 device; the bundle's D-copy
+// ---- S5.2a: dispflip (native #12, driver design). A 2560x1440 BGRA IOSurface render target with moving bands, rendered on the RDNA4 device; the bundle's D-copy
 // identifies it as a display surface (RDNA4M_TEST_DISPFLIP=1 waives the CoreDisplay backtrace signal; root + RDNA4M_ALLOW=1 only), copies it into a scanout slot after each command buffer
 // and presents. Reports latched/s from the kernel status (via the bundle's rdna4ScanoutStats selector: the RDNA4N client is exclusive, mtlprobe cannot open a second one).
-// On any other device (an Apple-silicon Mac's AGX) the selector is absent and the command REFUSES cleanly (exit 3). Needs the PC with WindowServer NOT holding RDNA4N: see NATIVE-S5-FLIP.md "S5.2a build".
+// On any other device (an Apple-silicon Mac's AGX) the selector is absent and the command REFUSES cleanly (exit 3). Needs the PC with WindowServer NOT holding RDNA4N: requires WindowServer not holding the native client.
 static uint64_t df_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static double df_num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
 static int cmd_dispflip(uint64_t rid, int haveRid, int seconds) {
@@ -3005,7 +3005,7 @@ static int cmd_cdpipe(const char *only, uint64_t rid, int haveRid) {
 
 
 // ---------------------------------------------------------------------------------------------------------------
-// gaps2 (m11h9, NATIVE-S4-METAL-GAPS.md section 10): the textures WindowServer asked for in the first Metal-compositor run:
+// gaps2 (m11h9, WindowServer texture coverage): the textures WindowServer asked for in the first Metal-compositor run:
 // g1 IOSurface textures of BGR10A2Unorm (pf 94, the crash) and RGBA16Float, g2 A8Unorm, g3 3D textures, g4 mipmapped 2D textures (+ generateMipmaps,
 // render into a level), refuse (bundle refusals, PC only). Every expectation was checked on an Apple-silicon Mac first (mtlprobe-arm64 gaps2: real Metal).
 // ---------------------------------------------------------------------------------------------------------------

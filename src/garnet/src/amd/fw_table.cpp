@@ -92,8 +92,7 @@ void build_table() {
     g_built = true;
 }
 
-// Manual equality check — deliberately not strcmp/strncmp. PORTING.md /
-// the task brief only guarantee memcpy/memset/strlen/strncmp out of
+// Manual equality check — deliberately not strcmp/strncmp. kernel freestanding environment// the task brief only guarantee memcpy/memset/strlen/strncmp out of
 // <string.h> in this kernel; strcmp isn't in that guaranteed set, and a
 // bounded strncmp would need an arbitrary length cap for what is really
 // an unbounded exact-match. Blob names are short, static, NUL-terminated

@@ -49,7 +49,11 @@ static inline int rdna4t_fmt(const char *name, const rdna4t_snap *s, char *out, 
 // NOTE: the 8-byte pipeline-cache magic below is the legacy wire signature
 // "N48PCv1". It is a serialized on-disk format and is NOT renamed with the
 // RDNA4 software identities (cf. N48N/N48D serialized constants policy).
-#define RDNA4PC_MAX_PAYLOAD (256ULL << 20)
+#define RDNA4PC_MAX_PAYLOAD      (256ULL << 20)
+#define RDNA4PC_WS_MAX_PAYLOAD   (32ULL << 20)
+#define RDNA4PC_SLOW_COMPILE_NS  (500ULL * 1000000ULL)
+#define RDNA4PC_BATCH_PIPES      8ULL
+#define RDNA4PC_SAVE_DEBOUNCE_NS (5ULL * 1000000000ULL)
 typedef struct {
     char magic[8];            // "N48PCv1" legacy wire signature (kept, not a chip name)
     uint32_t version;         // RDNA4PC_VERSION
@@ -81,17 +85,29 @@ static inline int rdna4pc_vk_header_ok(const void *payload, size_t len, const ui
     uint32_t w[4]; if (len < 32) return 0; memcpy(w, payload, 16);
     return w[0] >= 32 && w[0] <= len && w[1] == 1 && w[2] == vendor && w[3] == device && !memcmp((const uint8_t *)payload + 16, uuid, 16);
 }
-static inline int rdna4pc_check(const void *file, size_t flen, const uint8_t key[32], const uint8_t uuid[16], uint32_t vendor, uint32_t device, const void **payload, size_t *plen) {
+static inline uint64_t rdna4pc_max_payload(int is_ws) {
+    return is_ws ? RDNA4PC_WS_MAX_PAYLOAD : RDNA4PC_MAX_PAYLOAD;
+}
+static inline int rdna4pc_should_incremental_save(uint64_t compile_ns, uint64_t pipes_new, uint64_t pipes_saved, uint64_t now_ns, uint64_t last_save_ns) {
+    if (pipes_new <= pipes_saved) return 0;
+    if (last_save_ns != 0 && now_ns >= last_save_ns && (now_ns - last_save_ns) < RDNA4PC_SAVE_DEBOUNCE_NS) return 0;
+    if (compile_ns >= RDNA4PC_SLOW_COMPILE_NS || (pipes_new - pipes_saved) >= RDNA4PC_BATCH_PIPES) return 1;
+    return 0;
+}
+static inline int rdna4pc_check_bounded(const void *file, size_t flen, const uint8_t key[32], const uint8_t uuid[16], uint32_t vendor, uint32_t device, uint64_t max_payload, const void **payload, size_t *plen) {
     rdna4pc_hdr h; if (flen < sizeof h) return RDNA4PC_SHORT;
     memcpy(&h, file, sizeof h);
     if (memcmp(h.magic, "N48PCv1", 8)) return RDNA4PC_MAGIC;
     if (h.version != RDNA4PC_VERSION || h.hdr_size != sizeof h) return RDNA4PC_VERSION_BAD;
     if (memcmp(h.key, key, 32)) return RDNA4PC_KEY;
     if (memcmp(h.uuid, uuid, 16) || h.vendor != vendor || h.device != device) return RDNA4PC_UUID;
-    if (h.payload_len > RDNA4PC_MAX_PAYLOAD || h.payload_len != flen - sizeof h) return RDNA4PC_LEN;
+    if (h.payload_len > max_payload || h.payload_len != flen - sizeof h) return RDNA4PC_LEN;
     const uint8_t *p = (const uint8_t *)file + sizeof h;
     if (rdna4pc_fnv(p, (size_t)h.payload_len) != h.payload_fnv) return RDNA4PC_HASH;
     if (!rdna4pc_vk_header_ok(p, (size_t)h.payload_len, uuid, vendor, device)) return RDNA4PC_VKHDR;
     *payload = p; *plen = (size_t)h.payload_len; return RDNA4PC_OK;
+}
+static inline int rdna4pc_check(const void *file, size_t flen, const uint8_t key[32], const uint8_t uuid[16], uint32_t vendor, uint32_t device, const void **payload, size_t *plen) {
+    return rdna4pc_check_bounded(file, flen, key, uuid, vendor, device, RDNA4PC_MAX_PAYLOAD, payload, plen);
 }
 #endif

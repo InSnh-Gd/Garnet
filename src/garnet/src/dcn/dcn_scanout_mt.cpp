@@ -63,8 +63,8 @@ static bool scan_poll_locked(bool byIrq) {
 
 // The interrupt path (see the declaration before ihEntry). VUPDATE_NO_LOCK: one per frame; here it is the latch witness and the rate guard's input.
 bool scanIrq(const struct dcn41_irq &irq, uint64_t nowNs, int *ar) {
-	// Primary framebuffer VSTARTUP has its own rate storm guard in ihEntry(); keep it out of scanout's budget.
-	if (irq.kind == DCN41_IRQ_VSTARTUP) return false;
+	// Primary framebuffer VSTARTUP and HPD/HPD_RX have their own rate storm guards in ihEntry(); keep them out of scanout's budget.
+	if (irq.kind == DCN41_IRQ_VSTARTUP || irq.kind == DCN41_IRQ_HPD || irq.kind == DCN41_IRQ_HPD_RX) return false;
 	IOLock *l = gScan.lock;
 	if (l == nullptr) return false;
 	IOLockLock(l);

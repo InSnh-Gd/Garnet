@@ -3,7 +3,7 @@
 //  tests/native_disp_test.cpp compiles this very file (and amd/native_disp_flow.h, the sequencing built on it) and drives it, with planted breaks
 //  (tests/native_disp_plant.sh).
 //
-//  Design: an internal design note, section 3.4 (the aux alternative: GarnetDisplayPipe in the aux kext 0.0.3) and the "11h.1 RE facts" section, which
+//  Design: aux display pipe (GarnetDisplayPipe in the aux kext 0.0.3), which
 //  CORRECTS the memo and is binding where they differ. Layout facts come ONLY from that note, the memo, tools/ioaccel-layout (summary.md and the
 //  vtables) and the repo's own pure headers; nothing here was re-derived from an Apple binary. Every offset below is a NAMED CONSTANT with its source.
 //
@@ -428,7 +428,7 @@ inline void ival_note(Ival &v, uint64_t nowNs) {
 }
 inline void ival_reset(Ival &v) { __atomic_store_n(&v.last, 0ull, __ATOMIC_RELEASE); v.d = Dur{}; }
 
-// ---- 0.0.618 (V1/V2): the vblank timestamps CoreDisplay reads (an internal design note section 2 and 4 fix 1) ----------------------------------------------------------------
+// ---- 0.0.618 (V1/V2): the vblank timestamps CoreDisplay reads (driver contract
 // CONFIRMED (IOAccelDisplayPipe executeTransaction layout: +0x30 -> +0x178 and +0x40 -> +0x188): writes the
 // transaction's +0x178 (the vblank time) and +0x188 (the next vblank time) before completion, in mach_absolute_time units. The family's sendNotification forwards them as the TransactionPerformed event's
 // +0x40 / +0x50, from which CoreDisplay calls SetVBLInfo(base, period = +0x50 - +0x40). +0x190 (the event's +0x58) is copied by Apple from the same record (0xbdcdbf8) but its meaning is not established:

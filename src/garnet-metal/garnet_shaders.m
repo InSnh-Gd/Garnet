@@ -10,7 +10,7 @@
 
 #if !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// AIR dump for the pipeline-creation overrides (NATIVE-S4-M10 "Shaders": cache miss -> /tmp/rdna4m/<sha256>.air).
+// AIR dump for the pipeline-creation overrides (cache miss -> /private/tmp/garnet-xlate/<sha256>.air).
 // ---------------------------------------------------------------------------------------------------------------
 GARNET_INTERNAL NSString *rdna4_sha256hex(NSData *d) {
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
@@ -30,7 +30,7 @@ __attribute__((constructor)) static void rdna4_cienv_ctor(void) {
     else if (r == RDNA4CE_ALREADY_SET) RDNA4_ONCE("cienv: " RDNA4CE_VAR " is already set in this process (=%s); left alone", getenv(RDNA4CE_VAR));
     else RDNA4_ONCE_WARN("cienv: setenv " RDNA4CE_VAR " failed (errno %d)", errno);
 }
-// 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /tmp/rdna4m/<euid> (0700, a
+// 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/rdna4m (sticky 01777 parent, rdna4g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /private/tmp/garnet-xlate/<euid> (0700, a
 // real directory owned by the caller, rdna4g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
 // account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (garnet_dumpacl.h); a failed grant is logged and the dump still happens.
 GARNET_INTERNAL int rdna4_dump_dir_ready(char *sub, size_t subn) {
@@ -180,11 +180,11 @@ static int rdna4x_capture_request(NSString *directory, NSString *sha, NSString *
 }
 #if !defined(GARNET_SHADER_REQUEST_CAPTURE_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Bundle 14: in-process shader translation (an internal design note). The policy, the cache, the crash markers, the reader and the engine are in garnet_xlate.h (host tests test-xlate.c and
+// Bundle 14: in-process shader translation (driver design). The policy, the cache, the crash markers, the reader and the engine are in garnet_xlate.h (host tests test-xlate.c and
 // test-xlate-corpus.sh run that very header); this is the glue. A spvcache miss in an ADMITTED APPLICATION (or an RDNA4M_ALLOW root tool with RDNA4M_TEST_INPROC=1) is translated inside the process by the
 // operating system's own LLVM (the bitcode reader, loaded on the first miss only) and Resources/libgarnetxlate.dylib (the LGPL translator), and installed in the user's cache directory
 // <confstr user cache dir>/org.garnet.xlate/<K>/. WindowServer NEVER applies: it keeps the precompiled spvcache plus the daemon and loads neither library.
-//   /private/tmp/rdna4m-noinproc      exists (or cannot be read) -> in-process translation OFF for the process (read once); the dump + daemon path is then exactly bundle 13's
+//   /private/tmp/garnet-noinproc      exists (or cannot be read) -> in-process translation OFF for the process (read once); the dump + daemon path is then exactly bundle 13's
 //   METAL2VULKAN_*                  any such variable in the environment -> OFF (several change the translator's output; the cache key does not cover them)
 //   RDNA4M_TEST_INPROC=1              (root + RDNA4M_ALLOW=1) -> a root tool translates in process (retires the add-air.py seeding root probes needed)
 //   RDNA4M_TEST_LLVM_LIB=<dylib>      (root + RDNA4M_ALLOW=1) -> that library is the bitcode reader (a second LLVM for host comparisons)
@@ -205,7 +205,8 @@ static void rdna4x_gate_read(void) {
         RDNA4XL.gateDone = 1;
         if (!rdna4_is_ws()) {   // WindowServer never reads these: it never applies
             struct stat st; const int rc = rdna4_sb_stat(RDNA4X_KILL_FILE, &st), er = errno;
-            RDNA4XL.killed = rdna4x_killed_from_stat(rc, er);
+            const int admitted = atomic_load(&rdna4_app_admitted);
+            RDNA4XL.killed = rdna4x_killed_from_stat_for_app(rc, er, admitted);
             RDNA4XL.envDirty = rdna4x_env_dirty(*_NSGetEnviron());
             if (RDNA4XL.killed) RDNA4LOG_WARN("inproc: kill file " RDNA4X_KILL_FILE " %s: in-process translation is OFF for this process", rc == 0 ? "exists" : "could not be read (fail closed)");
             if (RDNA4XL.envDirty) RDNA4LOG("inproc: a " RDNA4X_ENV_PREFIX "* variable is set: in-process translation is OFF for this process");
@@ -224,13 +225,21 @@ static rdna4x_backend_capabilities rdna4_rt_xlate_caps(void) {
     rdna4x_backend_capabilities caps = rdna4_query_caps();
     if (RDNA4R.rtPositionFetch) caps.flags |= GARNETX_CAP_RT_POSITION_FETCH;
     caps.flags |= GARNETX_CAP_RT_IFT_ABI_V2;
-    if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress)
+    if (RDNA4R.accelStruct && RDNA4R.rayQuery && RDNA4R.bufferAddress) {
         caps.flags |= GARNETX_CAP_RT_PRIMITIVE_DATA;
+        if (rdna4_rt_curves_enabled())
+            caps.flags |= GARNETX_CAP_RT_CURVES;
+        if (rdna4_rt_motion_enabled())
+            caps.flags |= GARNETX_CAP_RT_MOTION_BLUR;
+    }
     if (RDNA4R.shaderInt64)
         caps.flags |= GARNETX_CAP_NATIVE_INT64;
     return caps;
 }
-// Sets up <user cache dir>/org.garnet.xlate/<K> once, after admission (never inside rdna4_spv_dirs' dispatch_once). Caller holds RDNA4XL.mu.
+// Sets up Tier-0 <DARWIN_USER_CACHE_DIR>/org.garnet.xlate/<K>, falling back to Tier-1
+// <DARWIN_USER_TEMP_DIR>/TemporaryItems/org.garnet.xlate/<K>, and finally Tier-2 bounded 64 MiB
+// process-local memory cache (dirState == 2) for strictly read-only sandboxes like WebKit.GPU.
+// Caller holds RDNA4XL.mu.
 static void rdna4x_setup_locked(void) {
     uint8_t xl[16], rd[16]; memset(rd, 0, sizeof rd);
     if (!rdna4x_file_uuid(rdna4x_xlib_path().fileSystemRepresentation, xl)) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: %s is missing or has no LC_UUID: in-process translation is unavailable", RDNA4X_LIB_NAME); return; }
@@ -245,27 +254,86 @@ static void rdna4x_setup_locked(void) {
     const char *tu = rdna4_allow() ? garnet_getenv("GARNET_TEST_USERCACHE", "RDNA4M_TEST_USERCACHE") : NULL;
     if (tu && tu[0]) snprintf(ucd, sizeof ucd, "%s", tu);
     else { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
-    char parent[RDNA4X_PATH_MAX];
-    if (!rdna4x_parent_path(parent, sizeof parent, ucd) || !rdna4x_dir_path(RDNA4XL.dir, sizeof RDNA4XL.dir, ucd, key)) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: no user cache directory: in-process translation is unavailable"); return; }
-    if (rdna4x_prepare_dirs(parent, RDNA4XL.dir, key) != 0) { RDNA4XL.dirState = -1; RDNA4LOG_WARN("inproc: cannot use the cache directory %s (not a real directory of ours?): in-process translation is unavailable", RDNA4XL.dir); return; }
-    RDNA4XL.dirNS = [NSString stringWithUTF8String:RDNA4XL.dir];
-    RDNA4XL.dirState = 1;
-    RDNA4LOG("inproc: enabled for %s (%s); cache %s (key %s); reader: the OS's GPUCompiler libLLVM, loaded on the first miss", getprogname(), rdna4_is_ws() ? "WindowServer?!" : rdna4_allow() ? "root test" : "application", RDNA4XL.dir, key);
+    char utd[1024]; utd[0] = 0;
+    const char *tt = rdna4_allow() ? garnet_getenv("GARNET_TEST_USERTEMP", "RDNA4M_TEST_USERTEMP") : NULL;
+    if (tt && tt[0]) snprintf(utd, sizeof utd, "%s", tt);
+    else { const size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, utd, sizeof utd); if (tn == 0 || tn > sizeof utd) utd[0] = 0; }
+    const int tier = rdna4x_select_disk_cache(ucd, utd, key, RDNA4XL.dir, sizeof RDNA4XL.dir);
+    if (tier == 1 || tier == 2) {
+        RDNA4XL.dirNS = [NSString stringWithUTF8String:RDNA4XL.dir];
+        RDNA4XL.dirState = 1;
+        RDNA4LOG("inproc: enabled for %s (%s); cache %s (%s, key %s); reader: the OS's GPUCompiler libLLVM, loaded on the first miss",
+                 getprogname(), rdna4_is_ws() ? "WindowServer?!" : rdna4_allow() ? "root test" : "application",
+                 RDNA4XL.dir, tier == 2 ? "TemporaryItems fallback" : "user cache", key);
+        return;
+    }
+    if (!RDNA4XL.memcacheInit) {
+        rdna4x_memcache_init(&RDNA4XL.memcache, RDNA4X_MEMCACHE_CAP);
+        RDNA4XL.memcacheInit = 1;
+    }
+    strlcpy(RDNA4XL.dir, RDNA4X_MEMCACHE_DIR, sizeof RDNA4XL.dir);
+    RDNA4XL.dirNS = nil;
+    RDNA4XL.dirState = 2;
+    RDNA4LOG("inproc: enabled for %s (disk cache denied; using bounded %u MiB in-memory SPIR-V cache, key %s)",
+             getprogname(), (unsigned)(RDNA4X_MEMCACHE_CAP >> 20), key);
 }
-// The user cache directory K, or nil (not applicable, or unavailable).
-GARNET_INTERNAL NSString *rdna4x_user_dir(void) {
-    if (!rdna4x_active()) return nil;
-    if (!rdna4_radv_open(NULL)) return nil;
+static int rdna4x_ensure_setup(void) {
+    if (!rdna4x_active()) return -1;
+    if (!rdna4_radv_open(NULL)) return -1;
     pthread_mutex_lock(&RDNA4XL.mu);
     if (RDNA4XL.dirState == 0 ||
         (RDNA4XL.dirState == -1 && RDNA4XL.dirTries < 3 && rdna4_now() >= RDNA4XL.dirNextNs)) {
         RDNA4XL.dirTries++;
         rdna4x_setup_locked();
-        if (RDNA4XL.dirState != 1) RDNA4XL.dirNextNs = rdna4_now() + 2000000000ull;
+        if (RDNA4XL.dirState <= 0) RDNA4XL.dirNextNs = rdna4_now() + 2000000000ull;
     }
+    const int st = RDNA4XL.dirState;
+    pthread_mutex_unlock(&RDNA4XL.mu);
+    return st;
+}
+// The user cache directory K, or nil (not applicable, unavailable, or Tier-2 memory-only mode).
+GARNET_INTERNAL NSString *rdna4x_user_dir(void) {
+    if (rdna4x_ensure_setup() != 1) return nil;
+    pthread_mutex_lock(&RDNA4XL.mu);
     NSString *r = RDNA4XL.dirState == 1 ? RDNA4XL.dirNS : nil;
     pthread_mutex_unlock(&RDNA4XL.mu);
     return r;
+}
+GARNET_INTERNAL BOOL rdna4x_memcache_active(void) {
+    return rdna4x_ensure_setup() == 2 ? YES : NO;
+}
+GARNET_INTERNAL BOOL rdna4x_memcache_lookup(NSString *sha, NSData **outSpv, NSDictionary **outMeta, NSString **outRefusal) {
+    if (outSpv) *outSpv = nil;
+    if (outMeta) *outMeta = nil;
+    if (outRefusal) *outRefusal = nil;
+    if (!sha.length || !RDNA4XL.memcacheInit) return NO;
+    uint8_t *spvBuf = NULL, *metaBuf = NULL;
+    size_t spvLen = 0, metaLen = 0;
+    char errBuf[256] = "";
+    const int hit = rdna4x_memcache_get(&RDNA4XL.memcache, sha.UTF8String,
+                                        outSpv ? &spvBuf : NULL, &spvLen,
+                                        outMeta ? &metaBuf : NULL, &metaLen,
+                                        errBuf, sizeof errBuf);
+    if (hit < 0) {
+        if (outRefusal && errBuf[0]) *outRefusal = [NSString stringWithUTF8String:errBuf];
+        return NO;
+    }
+    if (hit <= 0) return NO;
+    if (outSpv && spvBuf && spvLen >= 20 && !(spvLen & 3))
+        *outSpv = [NSData dataWithBytesNoCopy:spvBuf length:spvLen freeWhenDone:YES];
+    else
+        free(spvBuf);
+    if (outMeta && metaBuf && metaLen) {
+        id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytesNoCopy:metaBuf length:metaLen freeWhenDone:YES] options:0 error:NULL];
+        if ([j isKindOfClass:[NSDictionary class]]) *outMeta = (NSDictionary *)j;
+    } else {
+        free(metaBuf);
+    }
+    return YES;
+}
+GARNET_INTERNAL BOOL rdna4x_memcache_store(NSString *sha, const void *spv, size_t spvLen, const void *meta, size_t metaLen) {
+    if (!sha.length || !RDNA4XL.memcacheInit) return NO;
+    return rdna4x_memcache_put(&RDNA4XL.memcache, sha.UTF8String, (const uint8_t *)spv, spvLen, (const uint8_t *)meta, metaLen) == 0 ? YES : NO;
 }
 // A translation that failed on I/O (the cache directory vanished: a sandboxed
 // application's container cache is materialised lazily, another key's cleanup
@@ -277,16 +345,21 @@ static BOOL rdna4x_dir_recheck(void) {
     pthread_mutex_lock(&RDNA4XL.mu);
     RDNA4XL.dirState = 0; RDNA4XL.dirTries = 0; RDNA4XL.dirNextNs = 0;
     rdna4x_setup_locked();
-    const BOOL ok = RDNA4XL.dirState == 1;
+    const BOOL ok = RDNA4XL.dirState == 1 || RDNA4XL.dirState == 2;
     pthread_mutex_unlock(&RDNA4XL.mu);
     return ok;
 }
+static int rdna4x_sb_probe_fn(void *ctx) {
+    (void)ctx;
+    return sandbox_check(getpid(), NULL, 0);
+}
 static BOOL rdna4x_sandboxed(void) {
     pthread_mutex_lock(&RDNA4XL.mu);
-    if (!RDNA4XL.sandboxedDone) { RDNA4XL.sandboxed = sandbox_check(getpid(), NULL, 0) != 0; RDNA4XL.sandboxedDone = 1; }
-    const BOOL r = RDNA4XL.sandboxed;
+    int next = 0;
+    const int sb = rdna4g_sb_check_latch(RDNA4XL.sandboxedLatched, rdna4x_sb_probe_fn, NULL, &next);
+    if (next) RDNA4XL.sandboxedLatched = 1;
     pthread_mutex_unlock(&RDNA4XL.mu);
-    return r;
+    return sb != 0;
 }
 // Unsandboxed cache hits refresh modification time once per sha per process.
 GARNET_INTERNAL void rdna4x_touch_hit(NSString *path, NSString *sha) {
@@ -298,7 +371,7 @@ GARNET_INTERNAL void rdna4x_touch_hit(NSString *path, NSString *sha) {
     pthread_mutex_unlock(&RDNA4XL.mu);
     if (first) { rdna4x_touch(path.fileSystemRepresentation); if ([path hasSuffix:@".spv"]) { NSString *m = [[path stringByDeletingPathExtension] stringByAppendingString:@".meta.json"]; rdna4x_touch(m.fileSystemRepresentation); } }
 }
-// ---- build 18 (P3): linked functions (NATIVE-S8-APPFIX1.md section P3) ----
+// ---- build 18 (P3): linked functions (linked functions) ----
 // A pipeline stage whose descriptor links functions (MTLLinkedFunctions.functions / privateFunctions / groups) is translated TOGETHER with them: garnetxlate's garnetx_translate_linked resolves the entry's direct
 // visible-function references (RenderBox's custom effects, Maps' magenta fragment) to the exact authored dependencies. The cache key is rdna4x_link_sha (entry + sorted dependencies), never the entry's sha alone.
 // The context is per THREAD and per creation call (thread-local, cleared by a cleanup scope): the lookups, the translation request and the hot-swap registration all run on the thread that creates the
@@ -382,11 +455,16 @@ GARNET_INTERNAL NSString *rdna4x_cached_refusal(NSString *dir, NSString *sha) {
 
 GARNET_INTERNAL void rdna4x_engine_prepare(void) {
     pthread_mutex_lock(&RDNA4XL.mu);
+    if (!RDNA4XL.memcacheInit) {
+        rdna4x_memcache_init(&RDNA4XL.memcache, RDNA4X_MEMCACHE_CAP);
+        RDNA4XL.memcacheInit = 1;
+    }
     if (!RDNA4XL.engineInit) {
         const char *rl = rdna4_allow() ? garnet_getenv("GARNET_TEST_LLVM_LIB", "RDNA4M_TEST_LLVM_LIB") : NULL;
         rdna4x_engine_init(&RDNA4XL.eng, NULL, NULL, rl, rdna4x_xlib_path().fileSystemRepresentation, RDNA4X_WORKER_STACK);
         RDNA4XL.eng.lowerTranslatedArguments = RDNA4R.gpuArgumentTables;
         RDNA4XL.eng.capabilities = rdna4_rt_xlate_caps();
+        rdna4x_engine_set_memcache(&RDNA4XL.eng, &RDNA4XL.memcache);
         RDNA4XL.engineInit = 1;
     }
     pthread_mutex_unlock(&RDNA4XL.mu);
@@ -782,48 +860,51 @@ static void *rdna4x_stage2_worker(void *opaque) {
         return NULL;
     }
 
-    switch (rdna4x_probe(w->dir, w->sha)) {
-    case RDNA4X_PL_SKIP_CRASH:
-    case RDNA4X_PL_PROMOTE_THEN_SKIP:
-        snprintf(w->err, sizeof w->err, "a Stage 2 translation of this shader crashed a process before (.crash)");
-        w->rc = RDNA4X_E_SKIP_CRASH;
-        return NULL;
-    case RDNA4X_PL_SKIP_FAIL:
-        snprintf(w->err, sizeof w->err, "the Stage 2 translator refused this shader before (.fail)");
-        w->rc = RDNA4X_E_SKIP_FAIL;
-        return NULL;
-    case RDNA4X_PL_SKIP_LIVE:
-        snprintf(w->err, sizeof w->err, "another process is translating this Stage 2 shader");
-        w->rc = RDNA4X_E_SKIP_LIVE;
-        return NULL;
-    default:
-        break;
-    }
-
-    int mk = rdna4x_marker_create(w->dir, w->sha);
-    if (mk < 0) {
-        char parent[RDNA4X_PATH_MAX], key[17];
-        const char *slash = strrchr(w->dir, '/');
-        const size_t pl = slash ? (size_t)(slash - w->dir) : 0;
-        const size_t kl = slash ? strlen(slash + 1) : 0;
-        if (slash && pl > 0 && pl < sizeof parent && kl == 16 && kl < sizeof key) {
-            memcpy(parent, w->dir, pl); parent[pl] = 0;
-            memcpy(key, slash + 1, kl + 1);
-            if (rdna4x_key_ok(key) && rdna4x_prepare_dirs(parent, w->dir, key) == 0)
-                mk = rdna4x_marker_create(w->dir, w->sha);
+    const int memOnly = rdna4x_is_mem_dir(w->dir);
+    if (!memOnly) {
+        switch (rdna4x_probe(w->dir, w->sha)) {
+        case RDNA4X_PL_SKIP_CRASH:
+        case RDNA4X_PL_PROMOTE_THEN_SKIP:
+            snprintf(w->err, sizeof w->err, "a Stage 2 translation of this shader crashed a process before (.crash)");
+            w->rc = RDNA4X_E_SKIP_CRASH;
+            return NULL;
+        case RDNA4X_PL_SKIP_FAIL:
+            snprintf(w->err, sizeof w->err, "the Stage 2 translator refused this shader before (.fail)");
+            w->rc = RDNA4X_E_SKIP_FAIL;
+            return NULL;
+        case RDNA4X_PL_SKIP_LIVE:
+            snprintf(w->err, sizeof w->err, "another process is translating this Stage 2 shader");
+            w->rc = RDNA4X_E_SKIP_LIVE;
+            return NULL;
+        default:
+            break;
         }
+
+        int mk = rdna4x_marker_create(w->dir, w->sha);
+        if (mk < 0) {
+            char parent[RDNA4X_PATH_MAX], key[17];
+            const char *slash = strrchr(w->dir, '/');
+            const size_t pl = slash ? (size_t)(slash - w->dir) : 0;
+            const size_t kl = slash ? strlen(slash + 1) : 0;
+            if (slash && pl > 0 && pl < sizeof parent && kl == 16 && kl < sizeof key) {
+                memcpy(parent, w->dir, pl); parent[pl] = 0;
+                memcpy(key, slash + 1, kl + 1);
+                if (rdna4x_key_ok(key) && rdna4x_prepare_dirs(parent, w->dir, key) == 0)
+                    mk = rdna4x_marker_create(w->dir, w->sha);
+            }
+        }
+        if (mk == 1) {
+            snprintf(w->err, sizeof w->err, "another process is translating this Stage 2 shader");
+            w->rc = RDNA4X_E_SKIP_LIVE;
+            return NULL;
+        }
+        if (mk != 0) {
+            snprintf(w->err, sizeof w->err, "cannot create Stage 2 crash marker in %s: %s", w->dir, strerror(mk < 0 ? -mk : EIO));
+            w->rc = RDNA4X_E_IO;
+            return NULL;
+        }
+        (void)rdna4x_file_path(failPath, sizeof failPath, w->dir, w->sha, RDNA4X_EXT_FAIL);
     }
-    if (mk == 1) {
-        snprintf(w->err, sizeof w->err, "another process is translating this Stage 2 shader");
-        w->rc = RDNA4X_E_SKIP_LIVE;
-        return NULL;
-    }
-    if (mk != 0) {
-        snprintf(w->err, sizeof w->err, "cannot create Stage 2 crash marker in %s: %s", w->dir, strerror(mk < 0 ? -mk : EIO));
-        w->rc = RDNA4X_E_IO;
-        return NULL;
-    }
-    (void)rdna4x_file_path(failPath, sizeof failPath, w->dir, w->sha, RDNA4X_EXT_FAIL);
 
     char *entryLl = NULL; size_t entryLlLen = 0;
     char **depTexts = NULL, **libTexts = NULL, **visTexts = NULL, **iftTexts = NULL;
@@ -982,18 +1063,20 @@ static void *rdna4x_stage2_worker(void *opaque) {
         }
     }
 
-    // Publish .meta.json FIRST, .spv LAST (matches rdna4x_process_job contract).
-    if (!rdna4x_file_path(path, sizeof path, w->dir, w->sha, RDNA4X_EXT_META) ||
-        rdna4x_write_atomic(path, meta, metaLen) != 0) {
-        snprintf(w->err, sizeof w->err, "cannot write Stage 2 meta file");
-        rc = RDNA4X_E_IO;
-        goto done;
-    }
-    if (!rdna4x_file_path(path, sizeof path, w->dir, w->sha, RDNA4X_EXT_SPV) ||
-        rdna4x_write_atomic(path, spv, spvLen) != 0) {
-        snprintf(w->err, sizeof w->err, "cannot write Stage 2 spv file");
-        rc = RDNA4X_E_IO;
-        goto done;
+    // Publish .meta.json FIRST, .spv LAST (matches rdna4x_process_job contract) when disk cache is active.
+    if (!memOnly) {
+        if (!rdna4x_file_path(path, sizeof path, w->dir, w->sha, RDNA4X_EXT_META) ||
+            rdna4x_write_atomic(path, meta, metaLen) != 0) {
+            snprintf(w->err, sizeof w->err, "cannot write Stage 2 meta file");
+            rc = RDNA4X_E_IO;
+            goto done;
+        }
+        if (!rdna4x_file_path(path, sizeof path, w->dir, w->sha, RDNA4X_EXT_SPV) ||
+            rdna4x_write_atomic(path, spv, spvLen) != 0) {
+            snprintf(w->err, sizeof w->err, "cannot write Stage 2 spv file");
+            rc = RDNA4X_E_IO;
+            goto done;
+        }
     }
     w->outSpv = (uint8_t *)malloc(spvLen);
     w->outMeta = (uint8_t *)malloc(metaLen);
@@ -1009,7 +1092,7 @@ static void *rdna4x_stage2_worker(void *opaque) {
     goto done;
 
 refused:
-    if (failPath[0] && w->err[0]) (void)rdna4x_write_atomic(failPath, w->err, strlen(w->err));
+    if (!memOnly && failPath[0] && w->err[0]) (void)rdna4x_write_atomic(failPath, w->err, strlen(w->err));
 done:
     free(entryLl);
     if (depTexts) { for (size_t i = 0; i < w->ndeps; i++) free(depTexts[i]); free(depTexts); }
@@ -1019,14 +1102,16 @@ done:
     free(cdeps); free(clibs); free(cvis); free(cift);
     if (spv) w->xlib->freep(spv, spvLen);
     if (meta) w->xlib->freep(meta, metaLen);
-    rdna4x_marker_remove(w->dir, w->sha);
-    if (rc == RDNA4X_OK) (void)rdna4x_trim_dir(w->dir, RDNA4X_CACHE_CAP);
+    if (!memOnly) {
+        rdna4x_marker_remove(w->dir, w->sha);
+        if (rc == RDNA4X_OK) (void)rdna4x_trim_dir(w->dir, RDNA4X_CACHE_CAP);
+    }
     w->rc = rc;
     return NULL;
 }
 
 static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSString *name, const char *role,
-                                             NSData *entryAir, RDNA4LinkCtx *lk,
+                                             NSData *entryAir, RDNA4LinkCtx *lk, uint32_t rasterSamples,
                                              NSData **outSpv, NSDictionary **outMeta,
                                              rdna4vft_reflection_t *outVft, NSError **error) {
     if (outSpv) *outSpv = nil;
@@ -1042,9 +1127,25 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         return NO;
     }
 
+    const BOOL memOnly = rdna4x_is_mem_dir(dir.fileSystemRepresentation) ? YES : NO;
     char spvp[RDNA4X_PATH_MAX], metap[RDNA4X_PATH_MAX];
     struct stat sb;
-    if (rdna4x_file_path(spvp, sizeof spvp, dir.fileSystemRepresentation, sha.UTF8String, RDNA4X_EXT_SPV) &&
+    if (memOnly) {
+        NSData *cachedSpv = nil; NSDictionary *cachedMeta = nil; NSString *refused = nil;
+        if (rdna4x_memcache_lookup(sha, &cachedSpv, &cachedMeta, &refused) && cachedSpv.length >= 20 && !(cachedSpv.length & 3) && cachedMeta) {
+            if (outVft) {
+                NSData *mdata = [NSJSONSerialization dataWithJSONObject:cachedMeta options:0 error:NULL];
+                if (!mdata.length || rdna4vft_parse_reflection_json((const char *)mdata.bytes, mdata.length, outVft) != RDNA4VFT_OK) { rdna4vft_refl_destroy(outVft); rdna4x_translation_error(error, role, name, sha, RDNA4X_E_REFUSED, @"cached visible_function_tables metadata invalid"); return NO; }
+            }
+            if (outSpv) *outSpv = cachedSpv;
+            if (outMeta) *outMeta = cachedMeta;
+            return YES;
+        }
+        if (refused.length) {
+            rdna4x_translation_error(error, role, name, sha, RDNA4X_E_SKIP_FAIL, refused);
+            return NO;
+        }
+    } else if (rdna4x_file_path(spvp, sizeof spvp, dir.fileSystemRepresentation, sha.UTF8String, RDNA4X_EXT_SPV) &&
         stat(spvp, &sb) == 0 && S_ISREG(sb.st_mode)) {
         NSData *cachedSpv = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:spvp]];
         NSDictionary *cachedMeta = nil;
@@ -1142,6 +1243,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
     work.ift = inIft; work.nift = ni;
     work.useStage3 = wantStage3 ? 1 : 0;
     work.caps = rdna4_rt_xlate_caps();
+    work.caps.flags |= garnetx_cap_raster_samples(rasterSamples);
     work.lowerArgs = RDNA4R.gpuArgumentTables ? 1 : 0;
 
     int rc = RDNA4X_E_IO;
@@ -1157,7 +1259,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
         }
         rc = work.rc;
         if (rc != RDNA4X_E_IO || !rdna4x_dir_recheck()) break;
-        dir = rdna4x_user_dir() ?: dir;
+        dir = rdna4x_user_dir() ?: (rdna4x_memcache_active() ? @RDNA4X_MEMCACHE_DIR : dir);
         RDNA4LOG("inproc Stage 2/3 RETRY %s '%s' %s: cache directory rebuilt after: %s", role, name.UTF8String, sha.UTF8String, work.err);
     }
     free(inDeps); free(inLibs); free(inVis); free(inIft);
@@ -1200,6 +1302,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
             }
         }
         if (okOut) {
+            if (memOnly) (void)rdna4x_memcache_store(sha, work.outSpv, work.outSpvLen, work.outMeta, work.outMetaLen);
             if (outSpv) *outSpv = spvObj;
             if (outMeta) *outMeta = metaDict;
         }
@@ -1222,7 +1325,7 @@ static BOOL rdna4x_translate_stage2_to_cache(NSString *dir, NSString *sha, NSStr
 
 // Both render stages share the app deadline. After timeouts, jobs still run off
 // the caller's thread and publish into the user directory watched by hot-swap.
-GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error) {
+GARNET_INTERNAL BOOL rdna4x_translate_fn_with_samples(id fn, const char *role, uint64_t deadlineNs, uint32_t rasterSamples, NSError **error) {
     if (error) *error = nil;
     NSString *name = fn && [fn respondsToSelector:@selector(name)] ? [fn name] : @"?";
     RDNA4LinkCtx *lk = rdna4_lk_for(fn);   // build 18 (P3) + Metal 3 Stage 2 linkage
@@ -1231,6 +1334,8 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
         return NO;
     }
     NSString *dir = rdna4x_user_dir();
+    const BOOL useMem = (!dir && rdna4x_memcache_active());
+    if (useMem) dir = @RDNA4X_MEMCACHE_DIR;
     if (!dir) {
         rdna4x_translation_error(error, role, name, nil, RDNA4X_E_UNAVAILABLE,
                                  @"in-process translation cache is unavailable");
@@ -1245,16 +1350,29 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
     }
     NSString *sha = rdna4_sha256hex(bc);
     if (lk) sha = lk->lsha;
-    rdna4x_capture_request(dir, sha, name, role, bc, lk ? lk->deps : nil);
-    char spvp[RDNA4X_PATH_MAX]; struct stat sb;
-    if (rdna4x_file_path(spvp, sizeof spvp, dir.fileSystemRepresentation, sha.UTF8String, RDNA4X_EXT_SPV) && stat(spvp, &sb) == 0 && S_ISREG(sb.st_mode)) return YES;   // installed meanwhile (another thread / process)
+    if (rasterSamples != 0u) {
+        char msSha[65];
+        if (rdna4x_msaa_sha(msSha, sha.UTF8String, rasterSamples) != 0) {
+            rdna4x_translation_error(error, role, name, sha, RDNA4X_E_CAP,
+                                     @"invalid raster sample count for MSAA shader specialization");
+            return NO;
+        }
+        sha = [NSString stringWithUTF8String:msSha];
+    }
+    if (!useMem) {
+        rdna4x_capture_request(dir, sha, name, role, bc, lk ? lk->deps : nil);
+        char spvp[RDNA4X_PATH_MAX]; struct stat sb;
+        if (rdna4x_file_path(spvp, sizeof spvp, dir.fileSystemRepresentation, sha.UTF8String, RDNA4X_EXT_SPV) && stat(spvp, &sb) == 0 && S_ISREG(sb.st_mode)) return YES;   // installed meanwhile (another thread / process)
+    } else if (rdna4x_memcache_lookup(sha, NULL, NULL, NULL)) {
+        return YES;
+    }
     NSError *backendError = nil;
     if (!rdna4_radv_open(&backendError)) {
         rdna4x_translation_error(error, role, name, sha, RDNA4X_E_UNAVAILABLE, backendError.localizedDescription);
         return NO;
     }
     if (lk && (lk->useStage2 || lk->useStage3) && (lk->requireStage2 || rdna4x_stage2_symbols_available())) {
-        return rdna4x_translate_stage2_to_cache(dir, sha, name, role, bc, lk, NULL, NULL, NULL, error);
+        return rdna4x_translate_stage2_to_cache(dir, sha, name, role, bc, lk, rasterSamples, NULL, NULL, NULL, error);
     }
     rdna4x_engine_prepare();
     const BOOL unlimited = (deadlineNs == UINT64_MAX && !rdna4_is_ws());
@@ -1275,12 +1393,13 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
         if (lk) {
             const NSUInteger nd = lk->deps.count; rdna4x_ldep *ld = (rdna4x_ldep *)calloc(nd ? nd : 1, sizeof *ld);
             for (NSUInteger i = 0; i < nd && ld; i++) { NSDictionary *dd = lk->deps[i]; ld[i].symbol = [dd[@"name"] UTF8String]; ld[i].air = (const uint8_t *)[dd[@"bc"] bytes]; ld[i].airLen = [dd[@"bc"] length]; }
-            if (ld) rc = rdna4x_engine_run_linked(&RDNA4XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, ld, nd, waitMs, err, sizeof err);
+            if (ld) rc = rdna4x_engine_run_samples(&RDNA4XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, ld, nd, rasterSamples, waitMs, err, sizeof err);
             else { rc = RDNA4X_E_IO; strlcpy(err, "out of memory allocating linked dependencies", sizeof err); }
             free(ld);
         } else
-            rc = rdna4x_engine_run(&RDNA4XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, waitMs, err, sizeof err);
-        if (rc != RDNA4X_E_IO || !rdna4x_dir_recheck()) break;
+            rc = rdna4x_engine_run_samples(&RDNA4XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, NULL, 0, rasterSamples, waitMs, err, sizeof err);
+        if (useMem || rc != RDNA4X_E_IO || !rdna4x_dir_recheck()) break;
+        dir = rdna4x_user_dir() ?: (rdna4x_memcache_active() ? @RDNA4X_MEMCACHE_DIR : dir);
         RDNA4LOG("inproc RETRY %s '%s' %s: the cache directory was rebuilt after: %s", role, name.UTF8String, sha.UTF8String, err);
     }
     if (waiting) rdna4_sync_end(rc == RDNA4X_OK, rc == RDNA4X_E_TIMEOUT);
@@ -1289,20 +1408,30 @@ GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uin
     if (!rdna4x_logged) rdna4x_logged = [NSMutableSet set];
     const BOOL firstLog = ![rdna4x_logged containsObject:sha]; if (firstLog) [rdna4x_logged addObject:sha];
     pthread_mutex_unlock(&RDNA4XL.mu);
-    if (rc == RDNA4X_OK) RDNA4LOG("inproc OK %s '%s' %s: translated in %.0f ms", role, name.UTF8String, sha.UTF8String, ms);
+    if (rc == RDNA4X_OK) RDNA4LOG("inproc OK %s '%s' %s: translated in %.0f ms%s", role, name.UTF8String, sha.UTF8String, ms, rasterSamples ? " (msaa)" : "");
     else if (rc == RDNA4X_E_TIMEOUT) RDNA4LOG_WARN("inproc TIMEOUT %s '%s' %s: compilation did not finish within %d ms", role, name.UTF8String, sha.UTF8String, waitMs);
-    else if (firstLog) RDNA4LOG_ERR("inproc FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, err);
+    else if (firstLog) {
+        if (!rasterSamples && rdna4x_needs_raster_sample_count(err))
+            RDNA4LOG("inproc MSAA-RETRY %s '%s' %s: %s", role, name.UTF8String, sha.UTF8String, err);
+        else
+            RDNA4LOG_ERR("inproc FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, err);
+    }
     if (rc != RDNA4X_OK) {
         NSString *reason = rc == RDNA4X_E_TIMEOUT
             ? [NSString stringWithFormat:@"translation exceeded the %d ms wait deadline", waitMs]
             : [NSString stringWithUTF8String:err[0] ? err : "translation failed without an engine reason"];
         if (rc == RDNA4X_E_SKIP_FAIL) {
-            NSString *cached = rdna4x_cached_refusal(dir, sha);
+            NSString *cached = nil;
+            if (useMem) (void)rdna4x_memcache_lookup(sha, NULL, NULL, &cached);
+            else cached = rdna4x_cached_refusal(dir, sha);
             if (cached.length) reason = [NSString stringWithFormat:@"the translator refused before: %@", cached];
         }
         rdna4x_translation_error(error, role, name, sha, rc, reason);
     }
     return rc == RDNA4X_OK;
+}
+GARNET_INTERNAL BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error) {
+    return rdna4x_translate_fn_with_samples(fn, role, deadlineNs, 0u, error);
 }
 // Stage 2 linkage helpers for compute/vertex/fragment pipelines (MTLLinkedFunctions + preloadedLibraries + binaryFunctions).
 GARNET_INTERNAL BOOL rdna4x_array_nonempty(id obj, const char *prop) {
@@ -1701,13 +1830,13 @@ __attribute__((unused)) static BOOL rdna4x_compile_stage_with_linkage(id desc, i
         rdna4x_translation_error(error, role ?: "stage", name, nil, RDNA4X_E_CAP, @"function has no bitcodeData");
         return NO;
     }
-    NSString *dir = rdna4x_user_dir();
+    NSString *dir = rdna4x_user_dir() ?: (rdna4x_memcache_active() ? @RDNA4X_MEMCACHE_DIR : nil);
     if (!dir) {
         rdna4x_translation_error(error, role ?: "stage", name, nil, RDNA4X_E_UNAVAILABLE, @"in-process translation cache is unavailable");
         return NO;
     }
     NSString *sha = (lk && lk->lsha.length) ? lk->lsha : rdna4_sha256hex(bc);
-    return rdna4x_translate_stage2_to_cache(dir, sha, name, role ?: "stage", bc, lk, outSpv, outMeta, outVft, error);
+    return rdna4x_translate_stage2_to_cache(dir, sha, name, role ?: "stage", bc, lk, 0u, outSpv, outMeta, outVft, error);
 }
 
 // ---- spvcache sidecars (<sha>.meta.json, add-air.py) ----

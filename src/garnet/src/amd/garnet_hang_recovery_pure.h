@@ -1,6 +1,6 @@
 //
 //  garnet_hang_recovery_pure.h - the PURE half of GPU-apps stage G1 (kext 0.0.623): recovering the native kernel GFX queue from a submission that never
-//  retires, WITHOUT a reboot (an internal design note section 4, G1). No kernel header is included: tests/native_g1_test.cpp compiles
+//  retires, WITHOUT a reboot (multi-client GPU policy). No kernel header is included: tests/native_g1_test.cpp compiles
 //  this file and drives the very decision functions and run templates the kext calls (native_s1c.cpp, n1c_g1_*), with a fake environment.
 //
 //  DEFAULT OFF: the three accel verbs exist only when the boot-arg rdna4-g1=1 was latched (latch_value / action_admitted); with it absent the

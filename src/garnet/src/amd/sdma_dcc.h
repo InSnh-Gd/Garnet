@@ -1,5 +1,5 @@
 // sdma_dcc.h — the SDMA0_DCC_CNTL no-PTE compression arithmetic the `accel sdmadcc` verb and its host
-// test drive (an internal design note, bindings D1/D5;). No kernel headers, no hardware:
+// test drive (SDMA DCC control). No kernel headers, no hardware:
 // the kext (GarnetDriver.cpp) and the host test (tests/sdma_dcc_test.cpp) compile this same file, so
 // there is no second implementation of the mask or the argument rules that could drift from the one
 // that runs.
@@ -92,7 +92,7 @@ static inline uint32_t rdna4_sdma_dcc_op(uint64_t arg, int captured)
 }
 
 // ---------------------------------------------------------------------------------------------------
-// E1 (0.0.418, an internal design note) — THE CLEAR IS THE DEFAULT. `rdna4-sdmadcc` is parsed with
+// E1 (0.0.418, driver design) — THE CLEAR IS THE DEFAULT. `rdna4-sdmadcc` is parsed with
 // PE_parse_boot_argn exactly as this project parses its other boot-args: absent => the default (ON), an
 // explicit 0 => skipped, any other value => ON. Pure so tests/sdma_dcc_test.cpp drives the same rule the
 // kext dispatches on. The value the default writes is `rdna4_sdma_dcc_cleared(captured)`, the SAME arithmetic

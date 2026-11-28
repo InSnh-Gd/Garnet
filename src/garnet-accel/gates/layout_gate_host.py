@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Host twin of the runtime vtable gate (MUST-FIX 3). Simulates what the kernel linker does with OUR linked kext and compares it, with the SAME C++ function
-the kext runs in probe(), against the family's real vtables read out of the EXTRACTED family binary (~/rdna4-native/re-s3/kexts/com.apple.iokit.IOAcceleratorFamily2):
+"""Host twin of the runtime vtable gate. Simulates what the kernel linker does with OUR linked kext and compares it, with the SAME C++ function
+the kext runs in probe(), against the family's real vtables read out of the extracted family binary ($GARNET_KC_WORK/kexts/com.apple.iokit.IOAcceleratorFamily2):
   ours[i]   = a reference to symbol S  -> the address of S in the family / kernel image (exact, not by name);  a defined slot -> a fake address inside a fake text window;
   family[i] = the target address the family's own __ZTV<Parent> holds (chained-fixup decoded by ioaccel-layout/model.py).
 Prints MATCH per class. Usage: layout_gate_host.py <linked kext binary>"""
@@ -8,16 +8,17 @@ import os, subprocess, sys, tempfile
 from common import *
 import kextimg, exports
 
-C64_NM = os.environ.get('C64_NM') or 'nm'   # tool choice: Makefile exports C64_NM (llvm-nm on Linux cross)
+GARNET_NM = os.environ.get('GARNET_NM') or 'nm'   # tool choice: Makefile exports GARNET_NM (llvm-nm on Linux cross)
 
 def sym_addr_table():
     """name -> (lvl, va) for every exported symbol (family kext: level 1; boot KC / kernel: level 0), the same encoding the model uses."""
     import model as M
     from kcmod import FAMILY, BOOT_KC, SYS_KC
     tab = {}
-    # aux 0.0.4 (M5): the System KC too - IOFramebuffer's methods (IOGraphicsFamily, level 1) are not in the carved family kext; the family kext stays FIRST so every earlier class resolves exactly as before (setdefault)
+    # Include the System KC so IOFramebuffer methods (IOGraphicsFamily, level 1) resolve;
+    # keep the family kext first so IOAcceleratorFamily2 symbols retain priority via setdefault.
     for lvl, p in ((1, FAMILY), (0, BOOT_KC), (1, SYS_KC)):
-        for l in subprocess.run([C64_NM, '-gU', p], capture_output=True, text=True).stdout.splitlines():
+        for l in subprocess.run([GARNET_NM, '-gU', p], capture_output=True, text=True).stdout.splitlines():
             q = l.split(' ', 2)
             if len(q) == 3 and all(c in '0123456789abcdef' for c in q[0]) and q[0]:
                 tab.setdefault(q[2], (lvl, int(q[0], 16)))

@@ -65,8 +65,26 @@ struct StatusTroubleshootView: View {
                                 Text(st.smuDriverIfVersion ?? "n/a")
                                     .font(.system(.caption, design: .monospaced))
                             }
+                            GridRow {
+                                Text("AMFI Trust Mode:").bold()
+                                Text(amfiStatusLabel(st))
+                                    .foregroundColor(st.garnetAnchorLoaded ? .green : (st.amfiDisabledByBootArg ? .secondary : .orange))
+                                Text("AMFIAnchor Status:").bold()
+                                Text(st.amfiAnchorInstallStatus.map { "InstallStatus=\($0)" } ?? (st.amfiAnchorLoaded ? "Present" : "Not loaded"))
+                                    .font(.system(.caption, design: .monospaced))
+                            }
                         }
                         .font(.caption)
+                        if let recNotice = st.recoveryCompleteNotice {
+                            Label {
+                                Text("Safe-Boot Recovery Uninstall Completed: \(recNotice.replacingOccurrences(of: "\n", with: " · "))")
+                                    .font(.caption)
+                            } icon: {
+                                Image(systemName: "arrow.uturn.backward.circle.fill")
+                            }
+                            .foregroundColor(.blue)
+                            .padding(.top, 4)
+                        }
                         if st.smuTelemetryState == .unverified {
                             Label {
                                 Text(smuUnverifiedWarning(st))
@@ -182,6 +200,16 @@ struct StatusTroubleshootView: View {
                 Button("Cancel", role: .cancel) {}
             }
         }
+    }
+
+    private func amfiStatusLabel(_ st: RuntimeStatusReport) -> String {
+        if st.garnetAnchorLoaded {
+            return "AMFIAnchor (org.garnet.code-signing)"
+        }
+        if st.amfiDisabledByBootArg {
+            return "Legacy (amfi=0x80)"
+        }
+        return st.amfiAnchorLoaded ? "AMFIAnchor (Anchor Missing)" : "Not Configured"
     }
 
     private func smuTelemetryLabel(_ st: RuntimeStatusReport) -> String {

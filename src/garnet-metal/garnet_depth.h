@@ -1,7 +1,7 @@
 // garnet_depth.h (bundle 10): the pure decisions for depth/stencil textures, depth/stencil pipeline state, MSAA and multisample resolve.
 // Pure C (no Metal / Vulkan headers): the numeric values are asserted against the real enums in GarnetDevice.m with _Static_assert, and the header is host-tested by test-depth.c
 // (tables, plus source pins that tie the REAL GarnetDevice.m to these functions) and used by test-vkimage.c (the MoltenVK call-shape tests) and by the bundle itself.
-// an internal design note, "App crash study" (2) Risk and "Safari study" W6: depth/stencil attachments and MSAA are the next walls after the cube texture.
+// depth/stencil and MSAA compatibility: depth/stencil attachments and MSAA are the next walls after the cube texture.
 //
 // Rule that binds this file: nothing a build-9 client could do changes.  A colour-only pipeline gets the key 0 (no depth/stencil state), the same three dynamic states,
 // one sample and no depth bias; a single-sample colour attachment keeps STORE; every texture descriptor build 9 accepted maps as before (test-texdesc.c).

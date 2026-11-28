@@ -12,6 +12,7 @@
 #include "amd/garnet_hang_recovery_pure.h"   // 0.0.623 (G1): the hang-recovery verbs 100..102 open only with boot-arg garnet-g1=1
 #include "amd/garnet_multisession_pure.h"   // 0.0.627 (G2): the session stat verb 103 opens only with boot-arg garnet-multisession=1
 #include "amd/garnet_app_policy_pure.h"   // 0.0.640 (G4): the allow-list verb 104 opens only with boot-args garnet-apps=1 + garnet-multisession=1
+#include "amd/native_open_policy_pure.h"  // ABI 1.14: action 115 killswitch
 #include "amd/amdgpu_cp.h"
 #include "amd/amdgpu_gmc.h"
 #include "amd/amdgpu_pm4.h"
@@ -238,6 +239,7 @@ IOReturn GarnetUserClient::doSubmitIB(IOExternalMethodArguments *args) {
 	auto *dev = owner->deviceContext();
 	if (!ctx || !dev || !ctx->cp.inited) return kIOReturnNotReady;
 
+	amdgpu::smu_idle_dpm_note_activity(true, true);
 	uint32_t fence = 0;
 	kern_return_t r = amdgpu::cp_submit_ib(*dev, ctx->cp, gpu_va, len_dw, vmid, &fence);
 	if (r == kIOReturnSuccess) owner->noteSubmit();
@@ -289,6 +291,7 @@ IOReturn GarnetUserClient::doSelfTest(IOExternalMethodArguments *args) {
 
 	RDNA4SelfTestOut out {};
 	out.test_id = in.test_id;
+	amdgpu::smu_idle_dpm_note_activity(true, true);
 
 	// The compute test owns its own buffers and verification; run it as many
 	// times as asked. This is how a shader change gets exercised without a new
@@ -527,7 +530,9 @@ IOReturn GarnetUserClient::doPowerState(IOExternalMethodArguments *args) {
 	auto *dev = owner->deviceContext();
 	if (!dev) return kIOReturnNotReady;
 	amdgpu::SmuSeq smuSeq;   // 0.0.604: both clock messages of the power state under the shared mailbox lock
-	return amdgpu::smu_set_power_state(*dev, state);
+	const IOReturn kr = amdgpu::smu_set_power_state(*dev, state);
+	if (kr == kIOReturnSuccess) amdgpu::smu_idle_dpm_manual_override(state);
+	return kr;
 }
 
 
@@ -555,8 +560,8 @@ IOReturn GarnetUserClient::doAccelExperiment(IOExternalMethodArguments *args) {
 	//   91..99 = ddcread / dmubring / dispcensus / region4read / dmub* / disp2 / scdcread,
 	//   100..102 = hangtest / hangrecover / hangstat (G1), 103 = sessstat (G2/G5),
 	//   104 = appallow (G4), 105 = fbpublish, 109 = bartest (direct CPU BAR0 <-> GPU test), 110 = appdeny (G4).
-	if (rdna4rebar::bartest_is_action(action)) {
-		// 109 is admitted by the admin-only legacy client (its own argument/mode gate runs in accelExperiment)
+	if (rdna4rebar::bartest_is_action(action) || rdna4native::policy::killswitch_is_action(action)) {
+		// 109 (bartest) and 115 (killswitch) are admitted by the admin-only legacy client
 	} else
 	if (rdna4native::g4::action_admitted(amdgpu::n1c_apps_enabled(), action)) {
 		// 104 is admitted: it skips the old bound below (the verb's own argument check is rdna4native::g4::native_exempt in accelExperiment)

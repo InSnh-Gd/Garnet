@@ -16,8 +16,8 @@
 #include <string.h>
 
 // ---- build 16 (app-fix round 1, P5) -------------------------------------------------------------------------------------------------
-// F2: the import cache is ON by default (one import per IOSurface instead of one per texture wrapper). The file /private/tmp/rdna4m-noimpcache is a KILL file (killedStat = it exists); the old presence
-// file /private/tmp/rdna4m-impcache is no longer read. rdna4ic_default_on is what GarnetDevice.m's latch calls.
+// F2: the import cache is ON by default (one import per IOSurface instead of one per texture wrapper). The file /private/tmp/garnet-noimpcache is a KILL file (killedStat = it exists); the old presence
+// file /private/tmp/garnet-impcache is no longer read. rdna4ic_default_on is what GarnetDevice.m's latch calls.
 static inline int rdna4ic_default_on(int killedStat) { return killedStat ? 0 : 1; }
 // F1: what a texture does when the import of its IOSurface is refused (out of the kernel's import budget, a bad range): NEVER return nil (SkyLight aborts on a nil texture: AbortWithTextureInfo).
 // 0 = imported, go on; 1 = fall back to the GPU-only image (the "baseless" path: the captured content is blank, the process stays up). Applies to every process that gets an import failure.

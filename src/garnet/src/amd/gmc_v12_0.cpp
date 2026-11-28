@@ -21,7 +21,7 @@
 //     → amdgpu::SysMem / sysmem_alloc / sysmem_free. No IOMMU here, so
 //     SysMem.bus is the host physical address the GPU sees directly.
 //  3. VRAM offsets: every fixed VRAM offset the reference hardcodes is
-//     relative to dev.vramBase (PORTING.md). The UEFI/GOP console owns
+//     relative to dev.vramBase (kext constraint). The UEFI/GOP console owns
 //     VRAM [0, 0x7e9000) and the kernel keeps drawing into it — we never
 //     write below dev.vramBase. GART page table: dev.vramBase + 0x700000
 //     (512 KiB). VRAM allocator: [dev.vramBase + 0x1800000, dev.vramLimit).
@@ -108,6 +108,7 @@
 #include "amdgpu_log.h"
 #include "amdgpu_field_defs.h"
 #include "amdgpu_sdma.h"   // 0.0.193: sdma_ib_copy_linear_test for the vmfrag self-test
+#include "amdgpu_smu.h"    // refcounted GC MMIO GFXOFF guard
 
 // amdgpu_regs.h's REG_SET_FIELD complements `reg##__##field##_MASK`, and
 // amdgpu_field_defs.h spells those masks as plain (signed) `int` literals
@@ -147,7 +148,7 @@ constexpr uint64_t kGARTAlignment        = 0x0000000100000000ULL;
 // reliably reach host memory for the PT fetch, so PT-must-be-in-VRAM is
 // a hard requirement.
 //
-// Offsets below are relative to dev.vramBase (PORTING.md VRAM layout);
+// Offsets below are relative to dev.vramBase (relative to VRAM arena base);
 // dev.vramBase sits above the live UEFI console framebuffer:
 //   +0x00000000  fw_pri            1 MiB   PSP staging
 //   +0x00100000  PSP ring/cmd/fence       48 KiB
@@ -1964,10 +1965,12 @@ static void log_hub_faults(DeviceContext &dev, const char *name, IPBlock block,
 
 void gmc_log_vm_faults(DeviceContext &dev, const GMCContext &gmc) {
     (void)gmc;
-    ScopedGfxOffGuard gfxOffGuard(dev);
-    if (gfxOffGuard.ok())
-        log_hub_faults(dev, "GCVM (gfxhub)",  IPBlock::GC,    0x15d0, 0x15d1, 0x15d2, 0x15d3);
-    log_hub_faults(dev, "MMVM (mmhub)",   IPBlock::MMHUB, 0x04f0, 0x04f1, 0x04f2, 0x04f3);
+    {
+        ScopedGfxOffGuard gfxOffGuard(dev);
+        if (gfxOffGuard.ok())
+            log_hub_faults(dev, "GCVM (gfxhub)", IPBlock::GC, 0x15d0, 0x15d1, 0x15d2, 0x15d3);
+    }
+    log_hub_faults(dev, "MMVM (mmhub)", IPBlock::MMHUB, 0x04f0, 0x04f1, 0x04f2, 0x04f3);
 }
 
 // Linux gmc_v12_0_process_interrupt: after reading the status,

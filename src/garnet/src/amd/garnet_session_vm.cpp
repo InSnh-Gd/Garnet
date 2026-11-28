@@ -9,6 +9,7 @@ VRAMAllocation gPt[kArenaReserve];
 uint16_t gPtFree[kArenaReserve];
 uint32_t gPtN, gPtFreeN;
 static volatile UInt32 gBar0Conflict;
+static volatile uint32_t gKillSwitch = 0u;
 FenceWindow gWin[kMaxSessions];
 ParkRoot gPark;
 rdna4vmid::Pool gVmidPool;
@@ -226,10 +227,10 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
                     sysmem_rmb();
                     const uint64_t kcqEm = kcq_emitted_now();
                     const uint64_t kcqRet = kcq_retired_now(kcqEm);
-                    if ((*ctx.kcq.rptr_cpu & ctx.kcq.ring_ptr_mask) == ctx.kcq.wptr && kcqRet >= kcqEm) break;
+                    if ((*ctx.kcq.rptr_cpu & ctx.kcq.ring_ptr_mask) == static_cast<uint32_t>(ctx.kcq.wptr & ctx.kcq.ring_ptr_mask) && kcqRet >= kcqEm) break;
                     if (now_ns() - tKcq >= kWaitCapNs) {
-                        N1C_LOG("open refused (NotReady): the compute ring is not idle (rptr %u wptr %u emitted %llu retired %llu)",
-                                *ctx.kcq.rptr_cpu, ctx.kcq.wptr, (unsigned long long)kcqEm, (unsigned long long)kcqRet);
+                        N1C_LOG("open refused (NotReady): the compute ring is not idle (rptr %u wptr %llu emitted %llu retired %llu)",
+                                *ctx.kcq.rptr_cpu, (unsigned long long)ctx.kcq.wptr, (unsigned long long)kcqEm, (unsigned long long)kcqRet);
                         rc = kIOReturnNotReady;
                         break;
                     }
@@ -484,6 +485,11 @@ bool n1c_hello_done() {
     return false;
 }
 bool n1c_hung() { return hung_now(); }
+bool n1c_kill_switch() { return __atomic_load_n(&gKillSwitch, __ATOMIC_ACQUIRE) != 0u; }
+void n1c_set_kill_switch(bool on) {
+    __atomic_store_n(&gKillSwitch, on ? 1u : 0u, __ATOMIC_RELEASE);
+    N1C_LOG("kill switch: %s", on ? "ON (RDNA4N_INFO_KILL_SWITCH set)" : "OFF");
+}
 
 IOReturn n1c_hello(const N1cRef &ref, uint64_t clientAbi, uint64_t flags, uint64_t out[4]) {
     Session *s = sess_lock(ref, false);
@@ -512,7 +518,10 @@ IOReturn n1c_query_info(const N1cRef &ref, rdna4n_info *o) {
     o->abi_version = RDNA4N_ABI_VERSION; o->kext_build = kN1cKextBuild;
     o->flags = RDNA4N_INFO_BUFFER_OPS | RDNA4N_CAP_VM_PRT | (dcc_on() ? RDNA4N_CAP_GFX12_DCC : 0u) | (async_compute_on() ? RDNA4N_CAP_ASYNC_COMPUTE : 0u) |
                (hung_now() ? RDNA4N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? RDNA4N_INFO_S1B_POSITIVE : 0u) |
-               (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u);
+               (native_s1b_state().gate == kGateOn ? RDNA4N_INFO_NATIVE_BOOT : 0u) |
+               ((garnetmetal_ready() && !hung_now()) ? RDNA4N_INFO_READY : 0u) |
+               (rdna4disp_pipe_armed() ? RDNA4N_INFO_DISPLAY_ACTIVE : 0u) |
+               (n1c_kill_switch() ? RDNA4N_INFO_KILL_SWITCH : 0u);
     o->vmid = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     {
         ScopedGfxOffGuard gfxOffGuard(*c.dev);
@@ -746,7 +755,7 @@ IOReturn n1c_scanx_release(const N1cRef &ref, uint64_t inst, uint64_t out[2]) {
     return rc;
 }
 
-// ---- ABI 1.2: the DAL experiment (0.0.604). One named step of an internal design note per call. The client lock is NOT held: a step
+// ---- ABI 1.2: the DAL experiment (0.0.604). One named DAL experiment step per call. The client lock is NOT held: a step
 // sleeps for up to ~65 s (E4's dwell) and a racing close must not wait for it; smu_dal.cpp's own busy flag refuses a second concurrent step, and
 // its latch, gate and allowlist do all the refusing. Nothing here touches a session field.
 IOReturn n1c_dal_step(const N1cRef &ref, uint64_t step, uint64_t flags, rdna4n_dal_result *out) {

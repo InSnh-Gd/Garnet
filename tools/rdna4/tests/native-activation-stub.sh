@@ -52,7 +52,7 @@ case "$name" in
         case "${2:-}" in
             appallow)
                 case "$*" in
-                    'accel appallow add WallpaperAerialsExtension'|'accel appallow add System Information'|'accel appallow add system_profiler'|'accel appallow add System Settings'|'accel appallow add iconservicesagent'|'accel appallow add Terminal') ;;
+                    'accel appallow add WallpaperAerialsExtension'|'accel appallow add System Information'|'accel appallow add system_profiler'|'accel appallow add System Settings'|'accel appallow add iconservicesagent'|'accel appallow add Terminal'|'accel appallow add com.apple.WebKit') ;;
                     *) exit 64;;
                 esac
                 allow=ok

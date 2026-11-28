@@ -9,6 +9,7 @@ using namespace amdgpu;
 namespace amdgpu {
 void rdna4_logf(const char *, ...) {}
 void sysmem_free(SysMem &) {}
+void smu_idle_dpm_note_activity(bool, bool) {}
 }
 
 static int failures;

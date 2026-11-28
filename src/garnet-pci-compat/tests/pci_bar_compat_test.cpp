@@ -332,12 +332,15 @@ struct TestRig {
 // ---- Tests ---------------------------------------------------------------------------------
 
 void test_real_bootkc_if_available() {
-    const char *candidates[] = {
-        "/home/gdzzc/Projects/WhateverRed-Navi44/build-offline/vm-25G332/kc/BootKernelExtensions.kc",
-        "../../build-offline/vm-25G332/kc/BootKernelExtensions.kc",
-    };
+    std::vector<std::string> candidates;
+    if (const char *kcPath = std::getenv("GARNET_BOOT_KC"); kcPath && kcPath[0] != '\0') {
+        candidates.emplace_back(kcPath);
+    }
+    if (const char *kcWork = std::getenv("GARNET_KC_WORK"); kcWork && kcWork[0] != '\0') {
+        candidates.emplace_back(std::string(kcWork) + "/kc/BootKernelExtensions.kc");
+    }
     PageAlignedBuffer kc;
-    for (const char *p : candidates) {
+    for (const std::string &p : candidates) {
         std::ifstream ifs(p, std::ios::binary);
         if (ifs) {
             ifs.seekg(0, std::ios::end);
@@ -351,7 +354,7 @@ void test_real_bootkc_if_available() {
         }
     }
     if (kc.empty()) {
-        std::printf("note: BootKernelExtensions.kc not found locally; skipping real-KC scan\n");
+        std::printf("note: GARNET_BOOT_KC / GARNET_KC_WORK not set; skipping real-KC scan\n");
         return;
     }
 

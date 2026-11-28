@@ -1,6 +1,7 @@
 #include "dcn/dcn41_vbl_irq_pure.h"
 #include "dcn/dcn41_det_pure.h"
 #include "dcn/dcn41_dpms_pure.h"
+#include "dcn/dcn41_hpd_pure.h"
 #include "amd/garnet_power_policy_pure.h"
 #include "amd/rdna4_sleep_pure.h"
 #include <atomic>
@@ -55,6 +56,7 @@ struct IOTimerEventSource {
 	void disable() { enabled = false; }
 	void cancelTimeout() { scheduled = false; }
 	void setTimeoutUS(unsigned timeout) { period = timeout; scheduled = true; }
+	void retain() {}
 };
 
 using IOFBInterruptProc = void (*)(OSObject *, void *);
@@ -187,6 +189,7 @@ static bool cursor_wr_seg2(void *cookie, uint32_t, uint32_t value) {
 	static_cast<MmioAccess *>(cookie)->optc->value = value;
 	return true;
 }
+static uint32_t mmio_rd_seg(MmioAccess *, uint32_t, uint32_t) { return 0u; }
 static void aux_delay_us(void *cookie, uint32_t us) { static_cast<MmioAccess *>(cookie)->optc->elapsedUs += us; }
 static void ddcpad_sleep_ms(void *, uint32_t) {}
 struct AMDGarnetPrimaryFramebuffer : OSObject {
@@ -216,8 +219,17 @@ struct AMDGarnetPrimaryFramebuffer : OSObject {
 	IOLock *fDpmsLock = &dpmsLock;
 	FakeOptc optc;
 	FakeOptc *fPci = &optc;
-	struct { bool found = true, isDp = true, auxValid = true; unsigned otg = 0, aux = 0; } fActiveOutput;
+	struct { bool found = true, isDp = true, auxValid = true; unsigned otg = 0, aux = 0, hpd = 0, dig = 0; } fActiveOutput;
 	unsigned fPowerState = 2, fConnPower = 1;
+	bool fSystemSleeping = false;
+	IOLock *fHpdLock = nullptr;
+	bool fHpdRecoverAllowed = false;
+	rdna4hpd::StateMachine fHpdState {};
+	IOTimerEventSource *fHpdTimer = nullptr;
+	uint64_t hpdNowMs() const { return fakeNowNs / 1000000ULL; }
+	void syncHardwareHpd(bool, GarnetDriver *) {}
+	void applyHpdTimerAction(const rdna4hpd::Action &, IOTimerEventSource *) {}
+	void scheduleHpdWatchdogIfNeeded() {}
 	IOLock *fCursorLock = nullptr;
 	bool fCursorHwAvailable = false, fCursorNeedsProgram = false;
 	unsigned wakeRetrains = 0;
@@ -318,6 +330,8 @@ static IOReturn acknowledgeSleepWakeNotification(void *argument) {
 	transition.changed.notify_all();
 	return kIOReturnSuccess;
 }
+
+static void garnet_primary_fb_notify_sleep(GarnetDriver *, bool) {}
 
 #include "primary_vbl_actual.inc"
 

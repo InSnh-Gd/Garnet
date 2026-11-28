@@ -1,38 +1,9 @@
-// garnet_rt_spv.h - Embedded SPIR-V 1.6 (Vulkan 1.3) compute kernels for GPU-driven
-// Metal 3 acceleration structure builds (Private instance/transform buffers and
-// MTLIndirectInstanceAccelerationStructureDescriptor). Validated with spirv-val --target-env vulkan1.3.
+// garnet_rt_spv.h - Embedded SPIR-V 1.6 (Vulkan 1.3) compute kernels for base
+// instance conversion and 4x3 transform transposition.
 #ifndef GARNET_RT_SPV_H
 #define GARNET_RT_SPV_H
 
-#include <stdint.h>
-
-typedef struct {
-    uint64_t src_addr;
-    uint64_t dst_addr;
-    uint64_t blas_table_addr;
-    uint64_t count_addr;
-    uint32_t max_count;
-    uint32_t src_stride;
-    uint32_t desc_type;
-    uint32_t blas_count;
-} rdna4rt_inst_convert_pc_t;
-
-typedef struct {
-    uint64_t bda;
-    uint32_t geom_ift_base;
-    uint32_t _pad;
-} rdna4rt_blas_table_entry_t;
-
-typedef struct {
-    uint64_t src_addr;
-    uint64_t dst_addr;
-    uint32_t layout_mode;
-    uint32_t _pad;
-} rdna4rt_xform_transpose_pc_t;
-
-_Static_assert(sizeof(rdna4rt_inst_convert_pc_t) == 48u, "inst convert push constant size");
-_Static_assert(sizeof(rdna4rt_blas_table_entry_t) == 16u, "blas table entry size");
-_Static_assert(sizeof(rdna4rt_xform_transpose_pc_t) == 24u, "xform transpose push constant size");
+#include "garnet_rt_spv_abi.h"
 
 static const uint32_t rdna4rt_spv_inst_convert[2686] = {
     0x07230203u, 0x00010600u, 0x0008000bu, 0x000001a8u, 0x00000000u, 0x00020011u, 0x00000001u, 0x00020011u,
@@ -526,5 +497,6 @@ static const uint32_t rdna4rt_spv_xform_transpose[1207] = {
     0x000000afu, 0x00050080u, 0x0000000cu, 0x000000beu, 0x000000bdu, 0x00000016u, 0x0003003eu, 0x000000afu,
     0x000000beu, 0x000200f9u, 0x000000b0u, 0x000200f8u, 0x000000b2u, 0x000100fdu, 0x00010038u,
 };
+
 
 #endif /* GARNET_RT_SPV_H */

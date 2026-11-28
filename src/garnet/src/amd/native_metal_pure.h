@@ -1,5 +1,5 @@
 //
-//  native_metal_pure.h - the pure half of the Metal nub and its ops table (kext 0.0.610, milestone #9 route A; an internal design note sections 1 and 3 + the
+//  native_metal_pure.h - the pure half of the Metal nub and its ops table (kext 0.0.610, milestone #9 route A; driver contract
 //  review MUST-FIX 1, 2, 5, 6). No IOKit, no kernel: tests/native_metal_test.cpp compiles this very file and drives it, with planted breaks.
 //
 //  What lives here (and NOT in the aux kext, which every rebuild of requires a security approval (Allow click) from the user): the publish / withdraw verdicts, the nub state machine,
@@ -134,7 +134,7 @@ inline int task_window(uint32_t kind, uint64_t *size, uint64_t *reserve) {
 }
 
 // ---- factories ---------------------------------------------------------------------------------------------------------------------------------------------
-// Default 0 (every optional factory of the aux kext returns NULL: NATIVE-S3 "before 9e: NULL"). boot-arg rdna4-metal-fact=<mask> enables the optional aux classes (bit 0 SysMemory, 1 MemoryMap, 2 VidMemory, 3 Resource, 4 2DContext, 5 SharedUserClient, 6 CommandQueue).
+// Default 0 (every optional factory of the aux kext returns NULL: default NULL optional factories). boot-arg rdna4-metal-fact=<mask> enables the optional aux classes (bit 0 SysMemory, 1 MemoryMap, 2 VidMemory, 3 Resource, 4 2DContext, 5 SharedUserClient, 6 CommandQueue).
 inline uint32_t factory_mask(bool argPresent, uint32_t argValue) { return argPresent ? (argValue & GARNET_FACT_ALL) : 0u; }
 
 // ---- the generic virtual hook (0.0.611) ------------------------------------------------------------------------------------------------------------------
@@ -187,7 +187,7 @@ inline int vhook_handle(uint32_t mask, uint32_t cls, uint32_t slot, const uint64
     return 0;
 }
 
-// ---- the Ready property (0.0.612, milestone #11 step 11c; NATIVE-S4-M11 section 7 L3) ---------------------------------------------------------------------------
+// ---- the Ready property (0.0.612, milestone #11 step 11c; Ready property gate) ---------------------------------------------------------------------------
 // The nub carries "RDNA4,Ready": 1 while the native path is usable, 0 once the GPU was declared HUNG. Sticky: it is written 1 at publish only if no hang was latched, is set to 0 by the
 // HUNG latch itself (native_s1c.cpp hang_announce -> GarnetMetalNub::hungLatched), and NEVER goes back to 1 on that boot (the bundle reads it to decline without opening RDNA4N).
 constexpr uint32_t kReadyYes = 1u, kReadyNo = 0u;

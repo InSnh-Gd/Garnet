@@ -15,6 +15,7 @@
 #include "amd/amdgpu_sdma.h"
 #include "GarnetMetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
 #include "GarnetDisplayNub.hpp"       // 0.0.652 (M5): fbpublish 2
+#include "webkit_mmap_hook.hpp"       // Version-independent _mac_file_check_mmap hook for Safari WebKit.GPU
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
 #include "amd/native_s1b.h"   // 0.0.600 (native S1b): garnet-native=1, default OFF
@@ -767,7 +768,7 @@ uint32_t rdna4_vram_apple_dest_check(uint64_t off, uint64_t len) {
 #include "amd/sdma_dcc.h"
 
 // =====================================================================================================
-// 0.0.417 (an internal design note, D1) — action 82 `sdmadcc [0|1|2]`.
+// 0.0.417 (SDMA probe/DCC control) — action 82 `sdmadcc [0|1|2]`.
 //
 // SDMA0_DCC_CNTL (GC BASE_IDX 0, offset 0x0034) turns on no-PTE read DECOMPRESSION and write COMPRESSION for
 // our SDMA0 QUEUE0 (VMID 0, FB aperture passed through —), which is why a uniform block reads back as a
@@ -855,7 +856,7 @@ done:
 }
 
 // =====================================================================================================
-// E1 (0.0.418, an internal design note) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
+// E1 (0.0.418, driver design) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
 //
 // THE SITE, cited: SDMA0's QUEUE0 ring is up when `sdma_init_full` returns in the ladder's SDMAInit stage
 // (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case). 0.0.657 (GitHub issue #1, fixed on the public repo in
@@ -1208,6 +1209,7 @@ bool GarnetDriver::start(IOService *provider) {
 	gBringupSelf = this;
 	IOLockUnlock(gBringupLifecycleLock);
 	publishDisplayPeer(rdna4peer::kStateReady);
+	garnet_webkit::install(this);
 	registerService();
 	garnet_primary_fb_notify_driver_ready(this);
 	RDNA4LOG("start: ready");
@@ -1361,7 +1363,7 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < rdna4native::g4::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
 	}
-	// action 109 (enable-rdna4-16g-bar Task 4.1): direct CPU BAR0 <-> GPU bidirectional verification on exclusive high-VRAM regions.
+	// action 109: direct CPU BAR0 <-> GPU bidirectional verification on exclusive high-VRAM regions.
 	// Root-only legacy client; fails closed if BAR0 does not cover targets; never falls back to MM_INDEX.
 	if (rdna4rebar::bartest_is_action(action)) {
 		uint64_t v[kAccelExtraScalars] = { 0 };
@@ -1373,6 +1375,15 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 		if (outExtra)
 			for (unsigned i = 0; i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
+	}
+	// action 115 (ABI 1.14): root-only kernel kill-switch control (0 = off, 1 = on, 2 = read only).
+	if (rdna4native::policy::killswitch_is_action(action)) {
+		if (!rdna4native::policy::killswitch_arg_ok(argScalar)) return kIOReturnBadArgument;
+		if (argScalar == rdna4native::policy::kKillSwitchOff) amdgpu::n1c_set_kill_switch(false);
+		else if (argScalar == rdna4native::policy::kKillSwitchOn) amdgpu::n1c_set_kill_switch(true);
+		const uint64_t now = amdgpu::n1c_kill_switch() ? 1ull : 0ull;
+		if (outExtra) outExtra[0] = now;
+		return kIOReturnSuccess;
 	}
 	if (!rdna4scan::accel_exempt(action, argScalar) && !rdna4disp::native_exempt(rdna4disp_latched_on(), action, argScalar)) {
 	if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;
@@ -1596,6 +1607,7 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 }
 
 void GarnetDriver::stop(IOService *provider) {
+	garnet_webkit::uninstall();
 	publishDisplayPeer(rdna4peer::kStateStopping);
 	rdna4fbname::restore_on_unload();
 	rdna4dcn::primaryVblShutdown();
@@ -1603,6 +1615,7 @@ void GarnetDriver::stop(IOService *provider) {
 	GarnetDisplayNub::shutdown();
 	GarnetMetalNub::shutdown();
 	const bool drained = waitForDisplayLeasesAndReleasePrimary();
+	if (drained) amdgpu::smu_idle_dpm_stop();
 	const kern_return_t result = drained ? amdgpu::bringup_teardown(gBringup) : kIOReturnBusy;
 	if (sleepNotifier) {
 		sleepNotifier->remove();
@@ -1755,7 +1768,13 @@ IOReturn GarnetDriver::sleepWakeCallback(void *target, void *, UInt32 messageTyp
 		RDNA4LOG("sleep: graphics queues remain quarantined (%#x); a cold reset is required", powerResult);
 	}
 
-	if (recoverDisplay) garnet_primary_fb_notify_wake(self);
+	if (act.quiesceEngines) {
+		garnet_primary_fb_notify_sleep(self, true);
+	} else if (recoverDisplay) {
+		garnet_primary_fb_notify_wake(self);
+	} else if (act.resumeEngines && powerResult == kIOReturnSuccess) {
+		garnet_primary_fb_notify_sleep(self, false);
+	}
 	ackIfNeeded();
 	return kIOReturnSuccess;
 }

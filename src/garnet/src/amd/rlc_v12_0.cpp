@@ -27,13 +27,13 @@
 //  1. Platform shims: os_log(OS_LOG_DEFAULT, "mac.amdgpu.rlc: " …) ->
 //     IOLog via RLC_LOG (amdgpu_log.h); <DriverKit/IOLib.h> ->
 //     <IOKit/IOLib.h>. No %{public}s existed in this file. uint64_t log
-//     arguments carry explicit (unsigned long long) casts (PORTING.md).
+//     arguments carry explicit (unsigned long long) casts (kext constraint).
 //
 //  2. CSB staging buffer. The reference builds the CSB in a 4 KB stack
 //     array (`uint32_t cpu[1024]`) inside rlc_setup_csb_buffer. A dext
 //     thread has a userspace-sized stack; an x86_64 kernel stack is
 //     16 KB, so 4 KB of it for a scratch buffer is not acceptable here.
-//     The staging buffer is a file-static fixed array instead (PORTING.md
+//     The staging buffer is a file-static fixed array instead (kext constraint
 //     rule 3 allows fixed arrays; no dynamic C++ allocation). Contents,
 //     size math and the bar0_memcpy_to_vram write are unchanged. Bring-up
 //     stages run one at a time from a single thread, so the shared static
@@ -47,7 +47,7 @@
 //     instead of just failing:
 //       (a) reference: if clear_state.gpu_va < gmc.vram_start it sets
 //           csb_vram_byte_offset = 0. VRAM byte 0 here is the UEFI console
-//           framebuffer the kernel is still drawing into (PORTING.md VRAM
+//           framebuffer the kernel is still drawing into (relative to VRAM arena base
 //           layout), and RLC would then fetch its clear state from the
 //           console. We refuse instead.
 //       (b) bar0_memcpy_to_vram() drops the write silently when the range

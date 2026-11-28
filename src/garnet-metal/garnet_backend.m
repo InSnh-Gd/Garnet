@@ -52,17 +52,24 @@ GARNET_INTERNAL BOOL rdna4_t1_log_enabled(void) {
 GARNET_INTERNAL BOOL rdna4_debug_log_active(void) {
     return !RDNA4_RELEASE || rdna4_verbose_log() || rdna4_t1_emit_default || os_log_debug_enabled(rdna4_oslog());
 }
+typedef int (*rdna4_sb_check_fn)(pid_t, const char *, int, ...);
+static int rdna4_sb_probe_pid(void *ctx) {
+    rdna4_sb_check_fn fn = (rdna4_sb_check_fn)ctx;
+    return fn ? fn(getpid(), NULL, 0) : 0;
+}
 static BOOL rdna4_sb_check(const char *op, const char *path) {
     if (!op || !path || !path[0]) return NO;
-    typedef int (*sb_check_fn)(pid_t, const char *, int, ...);
-    static sb_check_fn fn;
-    static int sandboxed = -1;
+    static rdna4_sb_check_fn fn;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        fn = (sb_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
-        sandboxed = (fn && fn(getpid(), NULL, 0) != 0) ? 1 : 0;
+        fn = (rdna4_sb_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
     });
-    if (!fn || !sandboxed) return YES;
+    if (!fn) return YES;
+    static _Atomic int sb_latched = 0;
+    int next = 0;
+    const int prev = atomic_load_explicit(&sb_latched, memory_order_relaxed);
+    if (!rdna4g_sb_check_latch(prev, rdna4_sb_probe_pid, (void *)fn, &next)) return YES;
+    if (!prev && next) atomic_store_explicit(&sb_latched, 1, memory_order_relaxed);
     // SANDBOX_FILTER_PATH (1) | SANDBOX_CHECK_NO_REPORT (0x40000000): silent probe with zero kernel Sandbox log.
     const int flags = 1 | 0x40000000;
     if (fn(getpid(), op, flags, path) == 0) return YES;
@@ -153,7 +160,7 @@ GARNET_INTERNAL const char *garnet_getenv(const char *newName, const char *legac
 // #12 R5: per-command-buffer / per-encoder lines are rate limited per call site: the first 8, then every 1024th (errors and WARN lines stay RDNA4LOG).
 
 // ---------------------------------------------------------------------------------------------------------------
-// Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
+// Load policy (load policy L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
 // tool that opts in with GARNET_ALLOW=1 (or legacy RDNA4M_ALLOW=1), or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
 // successful RDNA4N open + QueryInfo, never by name; garnet_gate.h) may get a device. All test hooks are honoured only with GARNET_ALLOW=1 as root.
 // Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see garnet_gate.h.
@@ -322,9 +329,15 @@ static int rdna4_nub_autodisarmed(uint32_t port) {
 // admits user clients only on an IOAccelerator service, and the accelerator's newUserClient hands out the same native client. The port is the caller's (Metal's) object: it is NOT released here.
 // A successful open IS the allow-list verdict (uid >= 501, rdna4-apps=1, rdna4-multisession=1, the process on the kernel's list); any failure - including a sandbox that denies the service
 // lookup or the open - declines. Returns NULL = admitted.
-static const char *rdna4_app_probe(uint32_t port) {
+// ABI 1.14: cached kernel QueryInfo state from rdna4_app_probe for sandboxed rdna4_headless() fallback.
+static _Atomic int rdna4_probe_have;
+static _Atomic uint32_t rdna4_probe_abi_minor;
+static _Atomic uint32_t rdna4_probe_info_flags;
+
+static const char *rdna4_app_probe(uint32_t port, int killDeferred, int readyDeferred) {
     io_service_t svc = (io_service_t)port;   // G6: the accelerator port (0 = none); never released here
-    io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE, hk = KERN_FAILURE, ik = KERN_FAILURE; uint32_t infoFlags = 0, budgetFlags = 0;
+    io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE, hk = KERN_FAILURE, ik = KERN_FAILURE;
+    uint32_t infoFlags = 0, budgetFlags = 0, abiMinor = 0;
     if (svc) {
         for (int tries = 0;; tries++) {
             kr = IOServiceOpen(svc, mach_task_self(), RDNA4G_UC_TYPE, &conn);
@@ -335,16 +348,28 @@ static const char *rdna4_app_probe(uint32_t port) {
             uint64_t in[2] = { 1ull, RDNA4G_HELLO_F_MINOR }, out[4] = { 0 }; uint32_t outCnt = 4;
             hk = IOConnectCallScalarMethod(conn, RDNA4G_SEL_HELLO, in, 2, out, &outCnt);
             if (hk == KERN_SUCCESS) {
+                abiMinor = (uint32_t)(out[0] >> 16);
                 uint8_t info[RDNA4G_INFO_SIZE]; size_t isz = sizeof info; memset(info, 0, sizeof info);
                 ik = IOConnectCallStructMethod(conn, RDNA4G_SEL_QUERYINFO, NULL, 0, info, &isz);
-                if (ik == KERN_SUCCESS && isz == sizeof info) { memcpy(&infoFlags, info + RDNA4G_INFO_FLAGS_OFF, sizeof infoFlags); memcpy(&budgetFlags, info + RDNA4G_INFO_BUDGET_OFF, sizeof budgetFlags); } else if (ik == KERN_SUCCESS) ik = KERN_FAILURE;
+                if (ik == KERN_SUCCESS && isz == sizeof info) {
+                    memcpy(&infoFlags, info + RDNA4G_INFO_FLAGS_OFF, sizeof infoFlags);
+                    memcpy(&budgetFlags, info + RDNA4G_INFO_BUDGET_OFF, sizeof budgetFlags);
+                    uint32_t infoMinor = 0;
+                    memcpy(&infoMinor, info + RDNA4G_INFO_MINOR_OFF, sizeof infoMinor);
+                    if (infoMinor > abiMinor) abiMinor = infoMinor;
+                } else if (ik == KERN_SUCCESS) ik = KERN_FAILURE;
             }
             IOServiceClose(conn);   // the session is released at once; Mesa opens its own later
         }
     }
-    const int v = rdna4g_probe_verdict(svc != 0, (uint32_t)kr, (uint32_t)hk, (uint32_t)ik, infoFlags, budgetFlags);
-    if (v != RDNA4G_PROBE_OK) RDNA4LOG_WARN("APP probe: declined (%s): open 0x%x hello 0x%x info 0x%x flags 0x%x budget 0x%x", rdna4g_probe_text(v), (unsigned)kr, (unsigned)hk, (unsigned)ik, infoFlags, budgetFlags);
-    else RDNA4LOG_KEY("APP probe: the kernel admitted this process (allow-listed application): GPU path enabled for %s", getprogname());
+    const int v = rdna4g_probe_verdict_v2(svc != 0, (uint32_t)kr, (uint32_t)hk, (uint32_t)ik, infoFlags, budgetFlags, abiMinor, killDeferred, readyDeferred);
+    if (v != RDNA4G_PROBE_OK) RDNA4LOG_WARN("APP probe: declined (%s): open 0x%x hello 0x%x info 0x%x flags 0x%x budget 0x%x minor %u", rdna4g_probe_text(v), (unsigned)kr, (unsigned)hk, (unsigned)ik, infoFlags, budgetFlags, abiMinor);
+    else {
+        atomic_store_explicit(&rdna4_probe_abi_minor, abiMinor, memory_order_relaxed);
+        atomic_store_explicit(&rdna4_probe_info_flags, infoFlags, memory_order_relaxed);
+        atomic_store_explicit(&rdna4_probe_have, 1, memory_order_release);
+        RDNA4LOG_KEY("APP probe: the kernel admitted this process (allow-listed application, ABI 1.%u): GPU path enabled for %s", abiMinor, getprogname());
+    }
     return v == RDNA4G_PROBE_OK ? NULL : rdna4g_probe_text(v);
 }
 
@@ -411,7 +436,7 @@ GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
         RDNA4LOG_WARN("admit: kill file %s exists but is IGNORED (root test bypass GARNET_ALLOW=1 + GARNET_TEST_IGNORE_KILL=1, not WindowServer)",
                       usedLegacyKill ? RDNA4_LEGACY_KILL_FILE : RDNA4_KILL_FILE);
     }
-    if (rdna4g_kill_declines(isWs, ks, killIgnored)) {
+    if (rdna4g_kill_declines_for_class(cls, ks, killIgnored)) {
         const int failErr = rdna4g_kill_state(srcRc, srcErr) == RDNA4G_KILL_ABSENT ? legErr : srcErr;
         if (failErr != EPERM)
             RDNA4LOG_WARN("admit: kill file " RDNA4_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", failErr);
@@ -419,15 +444,17 @@ GARNET_INTERNAL const char *rdna4_admit(uint32_t port) {
             RDNA4LOG("admit: kill file " RDNA4_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", failErr);
         return "kill file " RDNA4_KILL_FILE " could not be read (fail closed outside WindowServer)";
     }
+    const int killDeferred = (cls == RDNA4G_CLASS_OTHER && ks == RDNA4G_KILL_UNREADABLE);
     const int rdy = rdna4_nub_ready(port);
-    if (rdna4g_ready_declines(isWs, rdy)) return rdy == 0 ? "nub property Garnet,Ready is 0" : "nub property Garnet,Ready is absent or unreadable (fail closed outside WindowServer)";
+    if (rdna4g_ready_declines_for_class(cls, rdy)) return rdy == 0 ? "nub property Garnet,Ready is 0" : "nub property Garnet,Ready is absent or unreadable (fail closed outside WindowServer)";
+    const int readyDeferred = (cls == RDNA4G_CLASS_OTHER && rdy != 1);
     if (rdna4g_autodisarm_declines(isWs, rdna4_nub_autodisarmed(port))) return "nub property Garnet,AutoDisarmed is 1";
     int count = 0;
     if (rdna4_counter_tripped(&count)) return "crash counter: >= 3 starts within 300 s";
     if (cls == RDNA4G_CLASS_OTHER) {   // not WindowServer, not a GARNET_ALLOW root tool: only the kernel can admit it
         const char *denyWhy = rdna4_denylist_decline(cls);
         if (denyWhy) return denyWhy;
-        const char *why = rdna4_app_probe(port);
+        const char *why = rdna4_app_probe(port, killDeferred, readyDeferred);
         if (why) return why;
         atomic_store(&rdna4_app_admitted, 1);
     }
@@ -447,9 +474,12 @@ GARNET_INTERNAL BOOL rdna4_headless(void) {
                 RDNA4_ONCE_WARN("DEPRECATED marker %s used; migrate to %s", RDNA4_LEGACY_HEADLESS_NO, RDNA4_HEADLESS_NO);
             }
         }
-        v = result != 0;
-        RDNA4LOG("isHeadless=%d markerResult=%d errno=%d process=%s",
-                 v, result, error, getprogname());
+        const int haveProbe = atomic_load_explicit(&rdna4_probe_have, memory_order_acquire);
+        const uint32_t pMinor = atomic_load_explicit(&rdna4_probe_abi_minor, memory_order_relaxed);
+        const uint32_t pFlags = atomic_load_explicit(&rdna4_probe_info_flags, memory_order_relaxed);
+        v = rdna4g_headless_from_probe(result, error, haveProbe, pMinor, pFlags) != 0;
+        RDNA4LOG("isHeadless=%d markerResult=%d errno=%d probe=%d minor=%u dispActive=%d process=%s",
+                 v, result, error, haveProbe, pMinor, (pFlags & RDNA4G_INFO_DISPLAY_ACTIVE) != 0u, getprogname());
     });
     return v;
 }
@@ -1113,7 +1143,7 @@ rdna4_argument_limit_result rdna4_argument_limit_snapshot_source_matches_path(
 #endif
 #if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)
 // ---------------------------------------------------------------------------------------------------------------
-// Lazy in-process RADV (NATIVE-S4-M10 route a', F5). Opened on the first resource/queue request, NEVER in
+// Lazy in-process RADV (lazy RADV initialization). Opened on the first resource/queue request, NEVER in
 // initWithAcceleratorPort: (every Metal-enumerating process loads this bundle). RDNA4N is root-only and exclusive:
 // a refusal (non-root, second client) becomes nil + NSError, never an abort.
 // ---------------------------------------------------------------------------------------------------------------
@@ -1344,7 +1374,7 @@ GARNET_INTERNAL void rdna4_quarantine(id resources, VkResult fault) {
     RDNA4LOG_ERR("GPU work unresolved (%d): retaining resources until process exit; further submissions disabled", fault);
 }
 
-static struct { char path[300]; uint8_t key[32], uuid[16]; uint32_t vendor, device; BOOL save; uint64_t lastHash, savedPipes; pthread_mutex_t mu; } RDNA4PC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static struct { char path[300]; uint8_t key[32], uuid[16]; uint32_t vendor, device; BOOL save; uint64_t lastHash, savedPipes, lastSaveNs; pthread_mutex_t mu; } RDNA4PC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static BOOL rdna4_pc_derive_key(void) {
     NSBundle *b = [NSBundle bundleForClass:[GarnetDevice class]];
@@ -1377,16 +1407,17 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
     RDNA4PC.save = rdna4g_pcache_save(pcls, (rdna4_allow() && garnet_getenv("GARNET_PCACHE_SAVE", "RDNA4M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with GARNET_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
     char marker[sizeof RDNA4PC.path + 16]; snprintf(marker, sizeof marker, "%s.loading", RDNA4PC.path);
     if (access(marker, F_OK) == 0) { unlink(RDNA4PC.path); unlink(marker); RDNA4LOG("T2 pipeline cache: a previous load never finished (%s present): cache file discarded", marker); }
+    const uint64_t maxPay = rdna4pc_max_payload(rdna4_is_ws() ? 1 : 0);
     void *buf = NULL; size_t flen = 0; const void *payload = NULL; size_t plen = 0; int c = -1;
     int fd = open(RDNA4PC.path, O_RDONLY);
     if (fd >= 0) {
         struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size > 0 && (uint64_t)st.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (buf = malloc((size_t)st.st_size))) {
+        if (fstat(fd, &st) == 0 && st.st_size > 0 && (uint64_t)st.st_size <= maxPay + sizeof(rdna4pc_hdr) && (buf = malloc((size_t)st.st_size))) {
             size_t got = 0; while (got < (size_t)st.st_size) { ssize_t n = read(fd, (char *)buf + got, (size_t)st.st_size - got); if (n <= 0) break; got += (size_t)n; }
             flen = got;
         }
         close(fd);
-        if (buf) { c = rdna4pc_check(buf, flen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, &payload, &plen);
+        if (buf) { c = rdna4pc_check_bounded(buf, flen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, maxPay, &payload, &plen);
                    if (c) { RDNA4LOG("T2 pipeline cache: %s ignored: %s", RDNA4PC.path, rdna4pc_why(c)); payload = NULL; plen = 0; } }
         else RDNA4LOG("T2 pipeline cache: %s unreadable/empty/oversized, ignored", RDNA4PC.path);
     } else RDNA4LOG("T2 pipeline cache: no file %s yet (cold start; saving %s)", RDNA4PC.path, RDNA4PC.save ? "ON" : "OFF in this process");
@@ -1397,12 +1428,12 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
         int sfd = rdna4_sb_open_ro(kSeedPath, O_RDONLY);
         if (sfd >= 0) {
             struct stat sst; void *sbuf = NULL; size_t sflen = 0;
-            if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= RDNA4PC_MAX_PAYLOAD + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
+            if (fstat(sfd, &sst) == 0 && sst.st_size > 0 && (uint64_t)sst.st_size <= maxPay + sizeof(rdna4pc_hdr) && (sbuf = malloc((size_t)sst.st_size))) {
                 size_t got = 0; while (got < (size_t)sst.st_size) { ssize_t n = read(sfd, (char *)sbuf + got, (size_t)sst.st_size - got); if (n <= 0) break; got += (size_t)n; }
                 sflen = got;
             }
             close(sfd);
-            if (sbuf && rdna4pc_check(sbuf, sflen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, &payload, &plen) == 0) {
+            if (sbuf && rdna4pc_check_bounded(sbuf, sflen, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, maxPay, &payload, &plen) == 0) {
                 free(buf); buf = sbuf; seeded = YES;
                 RDNA4LOG("T2 pipeline cache: seeded read-only from %s (%zu B)", kSeedPath, plen);
             } else free(sbuf);
@@ -1426,16 +1457,17 @@ static void rdna4_pc_open(const VkPhysicalDeviceProperties *pp) {
 }
 GARNET_INTERNAL void rdna4_pc_save(const char *why) {
     if (!RDNA4R.ok || !RDNA4R.pc || !RDNA4PC.save || !RDNA4PC.path[0]) return;
+    const uint64_t maxPay = rdna4pc_max_payload(rdna4_is_ws() ? 1 : 0);
     uint64_t np = atomic_load(&rdna4_pipes_new);
     pthread_mutex_lock(&RDNA4PC.mu);
     if (np == RDNA4PC.savedPipes) { pthread_mutex_unlock(&RDNA4PC.mu); return; }
     RDNA4PC.savedPipes = np;   // retried only when another pipeline appears (no log spam on a persistent write failure)
     uint64_t t0 = rdna4_now(); size_t sz = 0; uint8_t *buf = NULL;
-    if (vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, NULL) == VK_SUCCESS && sz >= 32 && sz <= RDNA4PC_MAX_PAYLOAD && (buf = malloc(sizeof(rdna4pc_hdr) + sz))) {
+    if (vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, NULL) == VK_SUCCESS && sz >= 32 && (uint64_t)sz <= maxPay && (buf = malloc(sizeof(rdna4pc_hdr) + sz))) {
         VkResult r = vkGetPipelineCacheData(RDNA4R.dev, RDNA4R.pc, &sz, buf + sizeof(rdna4pc_hdr));
         if (r == VK_SUCCESS && rdna4pc_vk_header_ok(buf + sizeof(rdna4pc_hdr), sz, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device)) {
             uint64_t h = rdna4pc_fnv(buf + sizeof(rdna4pc_hdr), sz);
-            if (h == RDNA4PC.lastHash) { free(buf); pthread_mutex_unlock(&RDNA4PC.mu); return; }   // nothing new in the cache
+            if (h == RDNA4PC.lastHash) { RDNA4PC.lastSaveNs = rdna4_now(); free(buf); pthread_mutex_unlock(&RDNA4PC.mu); return; }   // nothing new in the cache
             rdna4pc_hdr hd; rdna4pc_fill(&hd, RDNA4PC.key, RDNA4PC.uuid, RDNA4PC.vendor, RDNA4PC.device, buf + sizeof hd, sz); memcpy(buf, &hd, sizeof hd);
             char tmp[sizeof RDNA4PC.path + 24]; snprintf(tmp, sizeof tmp, "%s.tmp.%d", RDNA4PC.path, (int)getpid());
             int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644); BOOL ok = NO; int en = 0;
@@ -1445,12 +1477,23 @@ GARNET_INTERNAL void rdna4_pc_save(const char *why) {
                 if (ok && rename(tmp, RDNA4PC.path) != 0) { ok = NO; en = errno; }
                 if (!ok) unlink(tmp);
             } else en = errno;
-            if (ok) { RDNA4PC.lastHash = h; RDNA4LOG("T2 pipeline cache: SAVED %zu B to %s (%s; %llu pipelines created so far) in %.2f ms", sizeof hd + sz, RDNA4PC.path, why, (unsigned long long)np, (double)(rdna4_now() - t0) / 1e6); }
+            if (ok) { RDNA4PC.lastHash = h; RDNA4PC.lastSaveNs = rdna4_now(); RDNA4LOG("T2 pipeline cache: SAVED %zu B to %s (%s; %llu pipelines created so far) in %.2f ms", sizeof hd + sz, RDNA4PC.path, why, (unsigned long long)np, (double)(rdna4_now() - t0) / 1e6); }
             else RDNA4LOG_WARN("T2 pipeline cache: save to %s FAILED (errno %d)", RDNA4PC.path, en);
         } else RDNA4LOG_WARN("T2 pipeline cache: vkGetPipelineCacheData = %d / header check failed, not saved", r);
     }
     free(buf);
     pthread_mutex_unlock(&RDNA4PC.mu);
+}
+// Caller MUST NOT hold any PSO _lock, rdna4_heavy_compute_pipe_mu, or RDNA4R.qlock.
+GARNET_INTERNAL void rdna4_pc_maybe_save_after_compile(uint64_t compile_ns, const char *why) {
+    if (!RDNA4R.ok || !RDNA4R.pc || !RDNA4PC.save || !RDNA4PC.path[0]) return;
+    const uint64_t np = atomic_load(&rdna4_pipes_new);
+    pthread_mutex_lock(&RDNA4PC.mu);
+    const uint64_t saved = RDNA4PC.savedPipes;
+    const uint64_t lastSave = RDNA4PC.lastSaveNs;
+    pthread_mutex_unlock(&RDNA4PC.mu);
+    if (rdna4pc_should_incremental_save(compile_ns, np, saved, rdna4_now(), lastSave))
+        rdna4_pc_save(why);
 }
 static void rdna4_pc_atexit(void) { rdna4_pc_save("exit"); }
 
@@ -2181,10 +2224,10 @@ static BOOL rdna4_radv_open_once(NSError **err) {
         r = vkCreateCommandPool(RDNA4R.dev, &opc, NULL, &RDNA4R.opool);   // one-shot uploads (replaceRegion, getBytes)
         if (r != VK_SUCCESS) { RDNA4R.err = rdna4_err(8, [NSString stringWithFormat:@"vkCreateCommandPool(one-shot) = %d", r]); goto fail; }
         rdna4_pc_open(&pp);
-        rdna4_pool_latch();   // P1: reads /private/tmp/rdna4m-pool ONCE
-        rdna4_imp_latch();    // P4: reads the kill file /private/tmp/rdna4m-noimpcache ONCE (build 16: the cache is ON by default)
+        rdna4_pool_latch();   // P1: reads /private/tmp/garnet-pool ONCE
+        rdna4_imp_latch();    // P4: reads the kill file /private/tmp/garnet-noimpcache ONCE (build 16: the cache is ON by default)
         rdna4_vs_latch();     // Phase B: WindowServer OPTIMAL VRAM surface cache (kill file /private/tmp/garnet-no-vram-surf)
-        rdna4_drawopt_latch();   // P5b: reads /private/tmp/rdna4m-drawopt ONCE
+        rdna4_drawopt_latch();   // P5b: reads /private/tmp/garnet-drawopt ONCE
         RDNA4R.ok = YES;
         rdna4dc_heap heaps[VK_MAX_MEMORY_HEAPS] = {0};
         uint32_t heapCount = MIN(RDNA4R.mp.memoryHeapCount, VK_MAX_MEMORY_HEAPS);

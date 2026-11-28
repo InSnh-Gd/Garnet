@@ -1,5 +1,5 @@
 //
-//  GarnetNativeClient.cpp - see the header. The contract is an internal design note (ABI 1.1 addendum: selectors 9..14, 0.0.603; ABI 1.9: selector 21, the class rename and the uid-88 policy, 0.0.612).
+//  GarnetNativeClient.cpp - see the header. The contract is driver design (ABI 1.1 addendum: selectors 9..14, 0.0.603; ABI 1.9: selector 21, the class rename and the uid-88 policy, 0.0.612).
 //
 #include "GarnetNativeClient.hpp"
 #include "GarnetDriver.hpp"
@@ -184,6 +184,7 @@ IOReturn IOAccelGarnetNativeClient::externalMethod(uint32_t selector, IOExternal
 		if (si[1] < 1 || si[1] > 16 || sos != (uint32_t)si[1] * 4u || args->structureOutput == nullptr) return kIOReturnBadArgument;
 		return amdgpu::n1c_read_regs(r, si[0], si[1], si[2], static_cast<uint32_t *>(args->structureOutput));
 	}
+	case RDNA4N_SEL_BOCREATE_APP:
 	case RDNA4N_SEL_BOCREATE:
 		if (!shape(0, 4, sizeof(rdna4n_gem_create_in), 0)) return kIOReturnBadArgument;
 		return amdgpu::n1c_bo_create(r, static_cast<const rdna4n_gem_create_in *>(args->structureInput), so);
@@ -202,6 +203,7 @@ IOReturn IOAccelGarnetNativeClient::externalMethod(uint32_t selector, IOExternal
 			return kIOReturnBadArgument;
 		return amdgpu::n1c_submit(r, static_cast<const uint8_t *>(args->structureInput), sis, so);
 	}
+	case RDNA4N_SEL_BUFFER_COPY_APP:
 	case RDNA4N_SEL_BUFFER_COPY:
 	case RDNA4N_SEL_BUFFER_FILL:
 		if (!shape(0, 1, sizeof(rdna4n_buffer_op), 0)) return kIOReturnBadArgument;
@@ -287,6 +289,7 @@ IOReturn IOAccelGarnetNativeClient::externalMethod(uint32_t selector, IOExternal
 		if (!shape(1, 1, 0, 0)) return kIOReturnBadArgument;
 		return GarnetMetalNub::selectorWithdraw(si[0], so);
 	// ---- ABI 1.9 (0.0.612): host-memory import (milestone #11 step 11c). The task is the one this client was opened with (the caller's own address space).
+	case RDNA4N_SEL_BO_IMPORT_HOST_APP:
 	case RDNA4N_SEL_BO_IMPORT_HOST:
 		if (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;
 		// 0.0.612 (review item B): only a thread of the task this client was opened with may import: the range is read from THAT task's address space.

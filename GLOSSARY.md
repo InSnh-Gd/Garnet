@@ -1,77 +1,67 @@
-# Garnet
+# Garnet Glossary
 
-Garnet brings a shared macOS RDNA4 GPU driver stack up on one card, the Radeon
-RX 9060 XT, on one PC.
+Shared naming and domain terms across the Garnet RDNA 4 driver stack for x86_64 macOS.
 
-## Hardware
+## Hardware and naming
+
+**Garnet**:
+Standalone driver stack identity used for bundles (`Garnet.kext`, `GarnetAccel.kext`, `GarnetMetal.bundle`, `GarnetPCIBarCompat.kext`, `GarnetRecover.efi`, `GarnetAnchorInjector.kext`, `Garnet.app`), bundle IDs (`org.garnet.*`), boot arguments (`garnet-*`), CLI tools (`garnetctl`, `garnettest`), and user-client type `'GRNT'`.
 
 **RDNA4**:
-The GPU family this stack implements. Shared code, interfaces, boot-args, bundle
-identifiers, and file names all say RDNA4.
+Shared GPU-family name used for cross-chip driver code, register logic, and documentation under `docs/rdna4/` and `tools/rdna4/`.
 
 **Navi 44**:
-The GPU die in the RX 9060 XT (PCI 1002:7590, gfx1200, GC 12.0.0). The only target of this project.
-The name appears only where the chip genuinely differs: the per-chip table
-(`src/garnet/src/amd/amdgpu_asic.*`), firmware selection (`CHIPS=navi44`), and the
-canned `gfx1200` Mesa device entry.
+GPU die in the Radeon RX 9060 XT (`1002:7590`, `gfx1200`, `GC 12.0.0`, `MP0 14.0.2`, `SDMA 7.0.0`). Primary physically verified target (16 GB verified; 8 GB code-ready, pending physical verification). The chip name appears only where hardware differs: `src/garnet/src/amd/amdgpu_asic.*`, firmware selection (`CHIPS=navi44`), and the Mesa `gfx1200` device entry.
 
 **Navi 48**:
-The GPU die in the RX 9070 XT and R9700 (gfx1201, GC 12.0.1) that upstream Cobalt64 was built
-and tested on. The driver retains its per-chip selection and firmware path, plus the canned
-`gfx1201` Mesa entry. This project's current physical target remains the RX 9060 XT;
-retaining the Navi 48 path does not establish physical validation here. Shared code uses RDNA4.
+GPU die in the Radeon RX 9070 / RX 9070 XT / AI PRO R9700 (`1002:7550`, `1002:7551`, `gfx1201`, `GC 12.0.1`, `MP0 14.0.3`, `SDMA 7.0.1`). Retained from upstream Cobalt64 in the per-chip table, firmware path, and Mesa `gfx1201` entry; not yet physically verified in this repository.
 
 **Test bench**:
-The separated two-machine test setup: development runs on a Linux workstation (plus an optional offline local macOS VM), and physical hardware validation runs remotely over SSH, Screen Sharing (VNC), and an attached physical monitor against a dedicated RX 9060 XT 16 GB (Navi 44) test machine booting macOS 26.7.2 (`25G332`) by default via OpenCore. Upstream Cobalt64 uses a separate Navi 48 machine over SSH.
+Dedicated recoverable x86_64 macOS 26.x machine running OpenCore with a physical monitor attached, kept separate from the development host.
 _Avoid_: test PC, rig
 
 ## Driver stack
 
 **Upstream**:
-The Cobalt64 project (`github.com/Almosst-DEV/Cobalt64`) this repo is based on.
+The [Cobalt64](https://github.com/Almosst-DEV/Cobalt64) project this repository originated from.
 
 **Garnet kext**:
-The standalone primary kernel extension built from `src/garnet/` (`Garnet.kext`,
-`org.garnet.driver`, OpenCore ESP `Kernel.Add`). It takes the GPU from power-on to a usable
-device: PCIe setup, IP discovery, firmware load and engine initialisation, built-in display
-mode-setting and primary framebuffer (`AMDGarnetPrimaryFramebuffer`, `AMD*` prefix for CoreDisplay vendor classification; `GarnetDisplayNub`), the
-`'GRNT'` native user client (`IOAccelGarnetNativeClient`), and `GarnetMetalNub`. Has no `Lilu.kext` or external display plugin
-dependency.
+Standalone primary kernel extension built from `src/garnet/` (`Garnet.kext`, `org.garnet.driver`). Brings the GPU up from PCIe enumeration through IP discovery, firmware load, VMID and page-table management, DCN 4.01 modesetting and primary framebuffer (`AMDGarnetPrimaryFramebuffer`, using the `AMD*` prefix for CoreDisplay vendor classification; `GarnetDisplayNub`), the `'GRNT'` user client (`IOAccelGarnetNativeClient`), and `GarnetMetalNub`. Requires no `Lilu.kext` or external display plugin.
 _Avoid_: driver (ambiguous)
 
 **Accelerator kext**:
-The Auxiliary Kernel Collection extension built from `src/garnet-accel/` (`GarnetAccel.kext`,
-`org.garnet.accel`), publishing `GarnetFramebuffer` and `GarnetAccelerator` over
-`GarnetMetalNub`.
+Auxiliary Kernel Collection extension built from `src/garnet-accel/` (`GarnetAccel.kext`, `org.garnet.accel`), publishing `GarnetFramebuffer` and `GarnetAccelerator` over `GarnetMetalNub` and verified against target `IOAcceleratorFamily2` vtable layouts via `tools/ioaccel-layout/`.
+
+**PCI BAR compat kext**:
+Optional early OpenCore kernel extension built from `src/garnet-pci-compat/` (`GarnetPCIBarCompat.kext`, `org.garnet.pcibarcompat`) that enables 64-bit Full-BAR (`8 GiB` / `16 GiB`) allocation after verifying `IOPCIFamily`.
+
+**Recovery EFI tool**:
+Standalone x86_64 UEFI binary (`GarnetRecover.efi`, built from `src/garnet-recover-efi/` and installed into `EFI/OC/Tools/`) that triggers one-shot safe boot or safe boot plus uninstall via UEFI NVRAM and `com.garnet.recovery`, with zero ESP writes.
+
+**Trust-anchor injector**:
+Optional codeless Schema-1 kext (`GarnetAnchorInjector.kext`, `org.garnet.code-signing`, generated by `tools/rdna4/make_anchor_injector.py`) paired with `b00t0x/AMFIAnchor` and `GARNET_SIGN_CA_DIR` so userspace Garnet binaries run without `amfi=0x80`.
 
 **Display peer**:
-The runtime coordination state (`Garnet,DisplayPeer*` and `Garnet,DisplayPrimary*` via
-`GarnetDisplayGate` / `GarnetDisplayNub`) keeping primary framebuffer ownership and scanout
-handoff serialized. Historical `AMDRadeonRDNA4.kext` (`Lilu` plugin) and `RDNA4FB` are retired.
+Runtime coordination state (`Garnet,DisplayPeer*` and `Garnet,DisplayPrimary*` via `GarnetDisplayGate` / `GarnetDisplayNub`) that serializes primary framebuffer ownership and scanout handoff.
 
 **Metal bundle**:
-The user-space Metal driver bundle (`GarnetMetal.bundle`, `org.garnet.metal`) built from
-`src/garnet-metal/`, subclassing `MTLIOAccelDevice` over `libvulkan_radeon.dylib` and
-`libgarnetxlate.dylib`.
+Userspace Metal driver bundle (`GarnetMetal.bundle`, `org.garnet.metal`) built from `src/garnet-metal/`, subclassing `MTLIOAccelDevice` over `libvulkan_radeon.dylib` and `libgarnetxlate.dylib`.
 
 **Native route**:
-The path where Metal runs on Mesa's RADV Vulkan driver, ported to macOS, on top of the bring-up kext.
+Running Metal on Mesa's RADV Vulkan driver (ported to Darwin) directly on top of `Garnet.kext` and `GarnetAccel.kext`.
 
 **Substitution route**:
-Upstream's older path that swaps shaders inside Apple's own AMD accelerator kext using Apple-derived shader files. Out of scope.
+Upstream's retired approach that swapped shaders inside Apple's AMD accelerator kext. Out of scope.
 
 **Compute test**:
-Upstream's first end-to-end GPU check: a shader dispatched through the command processor writes a known value to memory that the CPU reads back.
+Minimal end-to-end GPU check: a shader dispatched through the command processor writes a known pattern to GPU memory that the CPU reads back.
 
 **GPU-composited desktop**:
-The macOS desktop with WindowServer's Metal compositor running on this driver stack instead of the CPU.
+macOS desktop with `WindowServer`'s Metal compositor rendering on the Garnet stack instead of software fallback.
 _Avoid_: acceleration, QE/CI
 
 **Sampler configuration**:
-The filter, address, comparison, coordinate, LOD and anisotropy settings of a
-Metal sampler. Equivalent configurations share backend handles and one public
-argument-sampler capacity reservation, regardless of the number of sampler objects.
+The filter, address, comparison, coordinate, LOD, and anisotropy settings of a Metal sampler. Equivalent configurations share backend handles and one public argument-sampler capacity reservation, regardless of how many sampler objects exist.
 
 **Sampler binding**:
-A sampler configuration used by an encoder, optionally with effective LOD clamps.
-A clamp override changes the binding without changing the public sampler token.
+A sampler configuration bound on an encoder, optionally with effective LOD clamps. A clamp override changes the binding without changing the public sampler token.

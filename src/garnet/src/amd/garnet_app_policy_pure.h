@@ -1,5 +1,5 @@
 //
-//  garnet_app_policy_pure.h - the PURE half of GPU-apps stage G4 (kext 0.0.640): ordinary user applications as a third client role, APP (an internal design note section 4, G4,
+//  garnet_app_policy_pure.h - the PURE half of GPU-apps stage G4 (kext 0.0.640): ordinary user applications as a third client role, APP (multi-client GPU policy,
 //  and the G1 / G2 reviews). No kernel header is included: tests/native_g4_test.cpp compiles this file and drives the very functions the kext calls
 //  (amd/native_s1c.cpp, GarnetNativeClient.cpp, GarnetDriver.cpp, GarnetUserClient.cpp).
 //

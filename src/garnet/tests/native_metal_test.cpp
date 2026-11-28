@@ -1,4 +1,4 @@
-// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, an internal design note): the pure half of the Metal nub and its ops table, plus source pins.
+// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, driver design): the pure half of the Metal nub and its ops table, plus source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_metal_test.cpp -o /tmp/native_metal && /tmp/native_metal .
 //   (run from the repo root; the argument is the repo root the source pins read from; an optional second argument is the tree that holds the aux kext
@@ -349,14 +349,14 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect_u("selector count 1.8", RDNA4N_SEL_COUNT_1_8, 21); expect_u("selector count 1.9", RDNA4N_SEL_COUNT_1_9, 22); expect_u("BoImportHost is selector 21", RDNA4N_SEL_BO_IMPORT_HOST, 21);
     expect_u("selector count 1.7 unchanged", RDNA4N_SEL_COUNT_1_7, 19);
     expect_u("ABI major unchanged", RDNA4N_ABI_VERSION, 1);
-    expect_u("ABI minor 13 (1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662: instance 1 behind garnet-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", RDNA4N_ABI_MINOR, 13);
+    expect_u("ABI minor 14 (1.14: WebKit-silent APP aliases + info flags 8..10; 1.13: GFX12 Sparse/PRT VM; 1.12 since 0.0.662: instance 1 behind garnet-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", RDNA4N_ABI_MINOR, 14);
     expect(cli.find("case RDNA4N_SEL_METAL_NUB_PUBLISH:\n\t\tif (!shape(1, 4, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "publish: shape 1 scalar in, 4 out, no structs");
     expect(cli.find("case RDNA4N_SEL_METAL_NUB_WITHDRAW:\n\t\tif (!shape(1, 1, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "withdraw: shape 1 in, 1 out, no structs");
     {   // the selectors sit behind the same guard as every other native selector
         const std::string e = fn_body(cli, "IOReturn IOAccelGarnetNativeClient::externalMethod(");
         const size_t g = e.find("if (!args || !opened) return kIOReturnNotReady;"), sw = e.find("switch (selector)"), p = e.find("case RDNA4N_SEL_METAL_NUB_PUBLISH:");
         expect(g != std::string::npos && sw != std::string::npos && p != std::string::npos && g < sw && sw < p, "the nub selectors are inside the opened-session switch");
-        expect(count_of(e, "case RDNA4N_SEL_") == 29, "the native client dispatches 27 legacy selectors plus buffer copy/fill at 27/28");
+        expect(count_of(e, "case RDNA4N_SEL_") == 32, "the native client dispatches 27 legacy selectors + copy/fill 27/28 + 3 ABI 1.14 WebKit-silent aliases 30/31/39");
     }
     // -- the hooks are the pure code --
     expect(nub.find("garnetmetal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName)") != std::string::npos, "populate_config is the pure config_populate on the kext's own name string");
@@ -410,6 +410,16 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
              hello < query && query < gate && gate < publish && tool.find("RDNA4N_INFO_HUNG") != std::string::npos && tool.find("RDNA4N_INFO_S1B_POSITIVE | RDNA4N_INFO_NATIVE_BOOT") != std::string::npos,
              "Hello and native self-test validation precede publication");
       expect(bsh.find("build_tool publish-metal \"$repo/tools/rdna4/native/publish-metal.c\"") != std::string::npos, "the native tool builder builds publish-metal"); }
+    // -- IORegistry "model" must be NUL-terminated OSData (macOS PCI GPU convention) --
+    {
+        const std::string stages = slurp(root + "/src/garnet/src/GarnetDriverStages.cpp");
+        expect(nub.find("OSData *model = OSData::withBytes(modelName, static_cast<unsigned int>(strlen(modelName) + 1));") != std::string::npos &&
+               nub.find("OSString *model = OSString::withCString(modelName);") == std::string::npos,
+               "GarnetMetalNub publishes model as NUL-terminated OSData");
+        expect(stages.find("OSData::withBytes(model, static_cast<unsigned int>(strlen(model) + 1))") != std::string::npos &&
+               stages.find("pciDevice->setProperty(\"model\", modelData);") != std::string::npos,
+               "GarnetDriverStages publishes PCI model as NUL-terminated OSData");
+    }
     // -- banned strings --
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";
     for (const std::string *f : { &nub, &nubh, &pure, &opsh }) expect(f->find(bad1) == std::string::npos && f->find(bad2) == std::string::npos && f->find(bad3) == std::string::npos, "no banned pipe offsets in the new files");

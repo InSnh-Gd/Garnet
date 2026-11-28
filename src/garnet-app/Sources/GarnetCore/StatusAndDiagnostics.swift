@@ -30,6 +30,12 @@ public struct RuntimeStatusReport: Codable, Equatable, Sendable {
     public let smuDriverIfVersion: String?
     public let smuTelemetryState: SmuTelemetryState
     public let smuMetricsPlausible: Bool?
+    public let amfiAnchorLoaded: Bool
+    public let amfiAnchorInstallStatus: Int?
+    public let amfiAnchorReady: Bool
+    public let garnetAnchorLoaded: Bool
+    public let amfiDisabledByBootArg: Bool
+    public let recoveryCompleteNotice: String?
 }
 
 public enum DiagnosticsManager {
@@ -126,6 +132,19 @@ public enum DiagnosticsManager {
         }
 
         let denyCount = (try? DenylistManager.load(env: env).count) ?? 0
+        let amfiStatus = env.readAMFIAnchorStatus(bootArgs: sip.bootArgs)
+        let amfiAnchorKextLoaded = tokens.contains("org.b00t0x.AMFIAnchor") || amfiStatus.servicePresent
+
+        var recoveryNotice: String?
+        let recURL = env.url(forSystemPath: GarnetPaths.recoveryCompletePath)
+        var recStat = stat()
+        if lstat(recURL.path, &recStat) == 0 && (recStat.st_mode & S_IFMT) == S_IFREG,
+           let rawRec = try? String(contentsOf: recURL, encoding: .utf8) {
+            let trimmed = rawRec.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                recoveryNotice = trimmed
+            }
+        }
 
         return RuntimeStatusReport(
             driverLoaded: drvLoaded,
@@ -144,7 +163,13 @@ public enum DiagnosticsManager {
             denylistCount: denyCount,
             smuDriverIfVersion: smuIfVer,
             smuTelemetryState: smuState,
-            smuMetricsPlausible: smuValuesPlausible
+            smuMetricsPlausible: smuValuesPlausible,
+            amfiAnchorLoaded: amfiAnchorKextLoaded,
+            amfiAnchorInstallStatus: amfiStatus.installStatus,
+            amfiAnchorReady: amfiStatus.anchorReady,
+            garnetAnchorLoaded: amfiStatus.garnetAnchorLoaded,
+            amfiDisabledByBootArg: amfiStatus.amfiDisabledByBootArg,
+            recoveryCompleteNotice: recoveryNotice
         )
     }
 
@@ -340,6 +365,19 @@ public enum DiagnosticsManager {
             ("ioreg -rc GarnetPCIBarCompat -d 1", env.runner.run("/usr/sbin/ioreg", ["-rc", "GarnetPCIBarCompat", "-d", "1"]))
         ].map { formatCommandDump(title: $0.0, result: $0.1) }
         writeText("ioreg-accel-display.txt", accelDispParts.joined(separator: "\n"))
+
+        let amfiRaw = env.runner.run("/usr/sbin/ioreg", ["-r", "-c", "AMFIAnchor", "-l"]).stdout
+        try sanitizeText(amfiRaw).data(using: .utf8)?.write(to: stageDir.appendingPathComponent("ioreg-amfianchor.txt"))
+
+        for (srcAbs, dstName) in [
+            (GarnetPaths.recoveryLogPath, "recovery.log"),
+            (GarnetPaths.recoveryCompletePath, "recovery-complete.txt")
+        ] {
+            let u = env.url(forSystemPath: srcAbs)
+            if let text = try? String(contentsOf: u, encoding: .utf8) {
+                try sanitizeText(text).data(using: .utf8)?.write(to: stageDir.appendingPathComponent(dstName))
+            }
+        }
 
         let kmLoaded = env.runner.run("/usr/bin/kmutil", ["showloaded"]).stdout
         writeText("kmutil-showloaded.txt", kmLoaded)

@@ -26,7 +26,7 @@
 #define GARNETN_UC_TYPE      0x47524E54u      /* 'GRNT' */
 #define RDNA4N_UC_TYPE       GARNETN_UC_TYPE
 #define RDNA4N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, rdna4native, s1d-replay) still handshakes */
-#define RDNA4N_ABI_MINOR     13u           /* 1.13: GFX12 Sparse/PRT VM support (RDNA4N_CAP_VM_PRT in rdna4n_info.flags; RDNA4N_VA_OP_CLEAR, RDNA4N_VA_OP_REPLACE, and RDNA4N_VM_PAGE_PRT with handle == 0; no new selector, no struct size changes). 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1 (the monitor A: HUBP1 / OTG1; slot ids tagged 0x10 | k) behind the boot-arg garnet-m6flip1=1 (with garnet-m6=1 and garnet-m6flip=1; with it OFF instance 1 is answered kIOReturnBadArgument exactly as 1.11 did); SCANX_ACQUIRE returns the instance's geometry in a fifth output word (a call with four output words still works: the fifth is not written); RDNA4N_SCANQ_M6FLIP1 in scan_query.flags says all three latches are on; no struct changes. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 RDNA4N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args garnet-m6=1 AND garnet-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); RDNA4N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): rdna4n_info.reserved[3..7] report the session's VRAM budget (RDNA4N_INFO_R_* / RDNA4N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args garnet-apps=1 + garnet-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
+#define RDNA4N_ABI_MINOR     14u           /* 1.14: WebKit-silent APP selector aliases 30 (BOCREATE), 31 (BO_IMPORT_HOST), 39 (BUFFER_COPY) and kernel-authoritative rdna4n_info.flags bits 8..10 (READY, DISPLAY_ACTIVE, KILL_SWITCH); reserves selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 (ABI 1.15). 1.13: GFX12 Sparse/PRT VM support (RDNA4N_CAP_VM_PRT in rdna4n_info.flags; RDNA4N_VA_OP_CLEAR, RDNA4N_VA_OP_REPLACE, and RDNA4N_VM_PAGE_PRT with handle == 0; no new selector, no struct size changes). 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1 (the monitor A: HUBP1 / OTG1; slot ids tagged 0x10 | k) behind the boot-arg garnet-m6flip1=1 (with garnet-m6=1 and garnet-m6flip=1; with it OFF instance 1 is answered kIOReturnBadArgument exactly as 1.11 did); SCANX_ACQUIRE returns the instance's geometry in a fifth output word (a call with four output words still works: the fifth is not written); RDNA4N_SCANQ_M6FLIP1 in scan_query.flags says all three latches are on; no struct changes. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 RDNA4N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args garnet-m6=1 AND garnet-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); RDNA4N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): rdna4n_info.reserved[3..7] report the session's VRAM budget (RDNA4N_INFO_R_* / RDNA4N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args garnet-apps=1 + garnet-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
 #define RDNA4N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
 #define RDNA4N_MAX_IBS       64u
 #define RDNA4N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
@@ -34,7 +34,8 @@
 #define RDNA4N_FENCE_SLOTS   16u
 #define RDNA4N_WAIT_CAP_NS   2000000000ull
 #define RDNA4N_SEQ_LAST      0xFFFFFFFFFFFFFFFFull   /* WaitSeq: "last emitted at entry" (GFX ring) */
-#define RDNA4N_SEQ_RING_COMPUTE (1ull << 62)         /* Tag bit identifying a KCQ/compute-ring seqno (raw seqno in bits 61:0) */
+#define RDNA4N_SEQ_RING_COMPUTE (1ull << 62)         /* Tag bit identifying a KCQ/compute-ring seqno (raw seqno in bits 60:0) */
+/* Seqno tag bit 61 (1ull << 61) reserved for enable-rdna4-vcn5-video (RDNA4N_SEQ_RING_VCN, ABI 1.15). */
 
 /* ---- selectors of the native client (own numbering; type 0 is the legacy GarnetUserClient) ---------------- */
 enum {
@@ -48,7 +49,7 @@ enum {
     RDNA4N_SEL_SUBMIT    = 7,   /* struct in: rdna4n_cs_in (32 + 32*n B)   out: [0] seqno */
     RDNA4N_SEL_WAITSEQ   = 8,   /* in: [0] seqno [1] timeout ns (relative) [2] ctx id (ignored)   out: [0] busy [1] retired [2] emitted */
     RDNA4N_SEL_COUNT     = 9,   /* the v1.0 selectors; unchanged so old clients' tables stay valid */
-    /* ---- ABI 1.1 (kext 0.0.603): native scanout, contract section "ABI 1.1 addendum" of NATIVE-S1C-ABI.md. All need Hello first. ---- */
+    /* ---- ABI 1.1 (kext 0.0.603): native scanout, ABI addendum. All need Hello first. ---- */
     RDNA4N_SEL_SCAN_QUERY    = 9,   /* struct out: rdna4n_scan_query (96 B). Valid without Acquire. */
     RDNA4N_SEL_SCAN_ACQUIRE  = 10,  /* in: [0] flags (0)   out: [0] console MC [1] OTG frame count (24-bit, extended) */
     RDNA4N_SEL_SCAN_REGISTER = 11,  /* struct in: rdna4n_scan_reg (32 B)   out: [0] slot id [1] slot MC */
@@ -56,7 +57,7 @@ enum {
     RDNA4N_SEL_SCAN_STATUS   = 13,  /* struct out: rdna4n_scan_status (256 B) */
     RDNA4N_SEL_SCAN_RELEASE  = 14,  /* out: [0] console restore verified (1/0) [1] plane MC after; idempotent */
     RDNA4N_SEL_COUNT_1_1     = 15,
-    /* ---- ABI 1.2 (kext 0.0.604): the DISPCLK/DPPCLK experiment, contract section "ABI 1.2 addendum" of NATIVE-S1C-ABI.md. Needs Hello first. ---- */
+    /* ---- ABI 1.2 (kext 0.0.604): the DISPCLK/DPPCLK experiment, ABI addendum. Needs Hello first. ---- */
     RDNA4N_SEL_DAL_STEP      = 15,  /* in: [0] step (1 E1b, 2 E2, 3 E3, 4 E4) [1] flags (0)   struct out: rdna4n_dal_result (256 B). Blocks up to ~65 s (E4 dwell). Success = the step RAN; the verdict word says how it went. */
     RDNA4N_SEL_COUNT_1_2     = 16,
     /* ---- ABI 1.3 (kext 0.0.605): the timed mode trial, native-S2d (contract text: the "ABI 1.3 addendum" block below the structs). Needs Hello first. ---- */
@@ -83,7 +84,13 @@ enum {
     RDNA4N_SEL_COUNT_1_11     = 27,
     RDNA4N_SEL_COUNT_1_12     = 27, /* ABI 1.12 count, retained for old callers. */
     RDNA4N_SEL_BUFFER_COPY   = 27,
-    RDNA4N_SEL_BUFFER_FILL   = 28
+    RDNA4N_SEL_BUFFER_FILL   = 28,
+    /* Selector 29 reserved for enable-rdna4-vcn5-video (RDNA4N_SEL_QUERY_VIDEO, ABI 1.15). */
+    /* ---- ABI 1.14: WebKit-silent APP selector aliases (match com.apple.WebKit.GPUProcess.sb IOAccelerator allow-list). ---- */
+    RDNA4N_SEL_BOCREATE_APP       = 30, /* alias of RDNA4N_SEL_BOCREATE (3) */
+    RDNA4N_SEL_BO_IMPORT_HOST_APP = 31, /* alias of RDNA4N_SEL_BO_IMPORT_HOST (21) */
+    RDNA4N_SEL_BUFFER_COPY_APP    = 39, /* alias of RDNA4N_SEL_BUFFER_COPY (27) */
+    RDNA4N_SEL_COUNT_1_14         = 40
 };
 /* Optional bounded operations: struct input only, one scalar output (WaitSeq timeline).
  * Older kernels reject these selectors (Unsupported or role-policy refusal).
@@ -221,6 +228,10 @@ struct rdna4n_info {                 /* 192 B */
 #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
 #define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
 #define RDNA4N_CAP_ASYNC_COMPUTE  (1u << 6)   /* Dedicated MEC async compute ring (RDNA4N_HW_IP_COMPUTE, seqno bit 62 tag; kill-switch: garnet-async-compute=0) */
+/* Bit 7 (1u << 7) reserved for enable-rdna4-vcn5-video (RDNA4N_CAP_VCN_UNIFIED, ABI 1.15). */
+#define RDNA4N_INFO_READY         (1u << 8)   /* ABI 1.14: GarnetMetalNub published and Garnet,Ready == 1 (not HUNG) */
+#define RDNA4N_INFO_DISPLAY_ACTIVE (1u << 9)  /* ABI 1.14: primary display pipe armed (isHeadless == NO) */
+#define RDNA4N_INFO_KILL_SWITCH   (1u << 10)  /* ABI 1.14: kernel kill switch active (synced with /private/tmp/garnet-off) */
 /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
  *   reserved[3] = RDNA4N_BUDGET_* flags
@@ -341,7 +352,7 @@ struct rdna4n_dal_result {           /* 256 B */
 };
 
 /* ---- ABI 1.3: the timed mode trial (kext 0.0.605, native S2d) --------------------------------------------------------------------------
- * ABI 1.3 addendum (proposed text for an internal design note; the header is the only place it lives until the reviewer merges it):
+ * ABI 1.3 addendum (ABI 1.3 specification):
  *   Selector 16 RDNA4N_SEL_MODE_TRIAL. Native boots only (rdna4-native=1 with S1b POSITIVE PASS), scanout plane NOT acquired, DISPCLK/DPPCLK at least what the row's DML
  *   needs (read from the DFS registers, never assumed), the live mode the 60 Hz census raster. It programs the display to the row's refresh (row 50 = the 60 Hz raster at a
  *   201 MHz pixel clock, 49.90 Hz, the live 60 Hz DLG/TTU stays; row 120 = 497.75 MHz, 2720x1525, the DML DLG/TTU/prefetch goldens; row 120 needs a passed row-50 trial on
@@ -353,7 +364,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   Time in the trial mode is about 0.5 s + 3 s + dwell. The hardware writes are the ones listed in modetrial_tables.h (the generated golden tables), nothing else.
  *   It never raises a clock: a row whose DML clocks exceed the live DFS readback is DENIED (rdna4dal / rdna4-dalsmc is the only clock path).
  *   rdna4n_mode_result: verdict RDNA4N_MODE_V_*, deny RDNA4N_MODE_D_* (verdict DENIED: nothing was written), flags RDNA4N_MODE_F_*. Tool: tools/native/rdna4mode.c.
- * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design an internal design note P1 / P2 / P3):
+ * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design mode-trial hardware sequences):
  *   The result is 512 B: the first 256 B are the 1.3 layout unchanged, the second 256 B are `ext` (below). A client built for 1.3 must not call selector 16 on a 1.4 kext (the output size differs).
  *   Two new rows, both at 60 Hz with no clock or DTO change: row 1 = the DP1 stream resync (blank, then unblank, exactly Linux's order: field-exact writes of DP1_DP_VID_STREAM_CNTL,
  *   DP1_DP_STEER_FIFO and DIG1_DIG_FIFO_CTRL0 only; one retry; the stream is left blanked only if both attempts failed, and then the restore / watchdog / `dcnmode 0` / kext stop unblank it);
@@ -363,7 +374,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   The underflow registers (HUBP0_DCHUBP_CNTL, ODM0_OPTC_INPUT_GLOBAL_CONTROL) are read before the trial (must be clean), after the settle (reported), every 250 ms during the rate window and
  *   the dwell (an underflow ends the trial: verdict UNDERFLOW, restored, latched) and after the restore (an underflow there makes the verdict RESTORE). They are cleared with their write-1
  *   strobes (never while ODM0_OPTC_INPUT_GLOBAL_CONTROL.INPUT_SOFT_RESET is set). Row 120 stays hard-denied. */
-/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design an internal design note P4 / P5):
+/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design clock-hold sequence):
  *   Row 120 (2560x1440, 2720x1525, 497.75 MHz = 119.998 Hz) is DENIED (RDNA4N_MODE_D_ROW120_OFF) unless the boot-arg garnet-row120=1 is present. With it, the trial needs: a native boot with S1b POSITIVE PASS and
  *   rdna4-dalsmc=4; E1b (rdna4dal e1b) run on THIS boot; a passed row-50 trial, a passed row-1 resync and a row-2 PASS with RDNA4N_MODE_F_LOCK_HELD_PROVEN on THIS boot (deny 15 / 23); the F6 / F7 / P1 baselines
  *   (OTG lock usable, FIFO health, underflow clean); the clock hold available (deny 22: the reason is ext.hold_pre, rdna4dal::HoldPre 1 level, 2 no E1b, 3 DAL latch, 4 hold state, 5 mailbox owner busy). The operator keeps the
@@ -375,7 +386,7 @@ struct rdna4n_dal_result {           /* 256 B */
  *   underflow; (14) only then release the clock hold (DPPCLK then DISPCLK to the 272 MHz floor). A restore that did not verify never releases (hold state STUCK: the clocks stay up, harmless at 60 Hz; cold power cycle).
  *   Any failure at any step goes to the restore. The watchdog restores registers only; it never touches a clock. New words: verdict 12 CLOCK_LOST (the DFS readback fell under the need while held), verdict 15 HOLD (the release
  *   did not verify), flags 22..24, the hold report in ext (hold_*). The result struct keeps its 512 B; the hold report lives in what 1.4 called ext.reserved. */
-/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of an internal design note and the comments of dcn/modetrial_pure.h):
+/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the comments of dcn/modetrial_pure.h):
  *   A mode trial and a scanout client exclude each other (scanAcquire refuses while a trial is busy; the trial refuses while the plane is acquired). The HELD mode lets a scanout client present WHILE the display runs at 1440p 120 Hz.
  *   Selector 17 RDNA4N_SEL_MODE_HOLD (row 120 only, needs everything `rdna4mode 120` needs): runs the SAME trial on a kernel thread - deny gate, clock hold, blank, lock, writes, unlock, latch, DTO, MSA, unblank, 500 ms settle, the
  *   3 s judged rate window - and, when that is clean (no failure, rate inside 1 %, no underflow judged), does NOT dwell for a fixed time: it publishes the entry snapshot and returns it (verdict RDNA4N_MODE_V_HELD) with the mode UP.
@@ -600,5 +611,7 @@ RDNA4N_STATIC_ASSERT(__builtin_offsetof(struct rdna4n_mode_result, uf_optc_rs_dt
 RDNA4N_STATIC_ASSERT(__builtin_offsetof(struct rdna4n_mode_result, dio_hold_errs) == 240, "mode_result.dio_hold_errs at 240");
 RDNA4N_STATIC_ASSERT(__builtin_offsetof(struct rdna4n_mode_ext, hold_state) == 192, "mode_ext.hold_state at 192");
 RDNA4N_STATIC_ASSERT(__builtin_offsetof(struct rdna4n_mode_ext, hold_pre) == 240, "mode_ext.hold_pre at 240");
+RDNA4N_STATIC_ASSERT(RDNA4N_SEL_BOCREATE_APP == 30 && RDNA4N_SEL_BO_IMPORT_HOST_APP == 31 && RDNA4N_SEL_BUFFER_COPY_APP == 39, "ABI 1.14 WebKit-silent APP aliases (29 reserved for VCN 5.0)");
+RDNA4N_STATIC_ASSERT(RDNA4N_INFO_READY == (1u << 8) && RDNA4N_INFO_DISPLAY_ACTIVE == (1u << 9) && RDNA4N_INFO_KILL_SWITCH == (1u << 10), "ABI 1.14 kernel-authoritative info flags (bit 7 reserved for VCN 5.0)");
 
 #endif /* GARNET_NATIVE_ABI_H */

@@ -5,7 +5,7 @@
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/garnet/src -I src/garnet/src/dcn -I src/garnet/src/amd \
 //       src/garnet/tests/native_scanx_test.cpp -o /tmp/native_scanx && /tmp/native_scanx .     (run from the repo root; the argument is the repo root the source pins read from;
 //   tests/native_scanx_plant.sh plants breaks and shows every check that catches them)
-// Covers (contract item numbers are the "Q2: Stage 1b build contract" and the "Stage 2 build contract (monitor A, instance 1)" of an internal design note):
+// Covers (contract item numbers are the multi-display scanout contract):
 //   X1  the registers (re-derived from the HUBP0 twin + n * 0xdc through the disp2 mirror table), the write allowlist (exactly this instance's two address registers), the slot tag            [per instance]
 //   X2  Acquire: every precondition refuses with NOTHING written; the success path; the latch-OFF gate reads and writes nothing, takes no lock                                                [per instance]
 //   X3  Register: tagged ids, B / A / DP / other-display overlaps, bounds, full table                                                                                                         [per instance]
@@ -892,7 +892,7 @@ static void suite_pins(const std::string &root) {
     EXPECT(has(disp, "void m6_flush_deferred() { if (rdna4m6flip_latched_on()) (void)rdna4m6::pub_rate_flush(gD.m6Rate, now_ns(), [this]() { m6_publish_now(); }); }") && disp.find("m6_flush_deferred();\n        const uint32_t r = rdna4m6::learn_surface") != std::string::npos, "M1: EVERY submit of ANY pipe (m6_learn, before the learn) flushes a deferred publish once its gap has passed: no Status call is needed");
     EXPECT(has(disp, "if (!rdna4m6flip_latched_on() || rdna4m6::log_admit(gD.m6LogNs, now_ns())) {"), "S-2: the per-learn log line is rate-limited behind the latch");
     // ABI / policy / client
-    EXPECT(RDNA4N_ABI_MINOR == 13u && RDNA4N_SEL_SCANX_ACQUIRE == 22 && RDNA4N_SEL_SCANX_REGISTER == 23 && RDNA4N_SEL_SCANX_PRESENT == 24 && RDNA4N_SEL_SCANX_STATUS == 25 && RDNA4N_SEL_SCANX_RELEASE == 26 && RDNA4N_SEL_COUNT_1_11 == 27 && RDNA4N_SEL_COUNT_1_12 == 27, "X11: ABI 1.13, the same selectors 22..26 (no new selector)");
+    EXPECT(RDNA4N_ABI_MINOR == 14u && RDNA4N_SEL_SCANX_ACQUIRE == 22 && RDNA4N_SEL_SCANX_REGISTER == 23 && RDNA4N_SEL_SCANX_PRESENT == 24 && RDNA4N_SEL_SCANX_STATUS == 25 && RDNA4N_SEL_SCANX_RELEASE == 26 && RDNA4N_SEL_COUNT_1_11 == 27 && RDNA4N_SEL_COUNT_1_12 == 27, "X11: ABI 1.14, the same selectors 22..26 (no new scanout selector)");
     EXPECT(RDNA4N_SCANQ_M6FLIP == (1u << 6) && RDNA4N_SCANQ_M6FLIP1 == (1u << 7) && RDNA4N_SCANX_INSTANCE == 2u && RDNA4N_SCANX_SLOT_TAG == 0x20u && RDNA4N_SCANX_INSTANCE_MONA == 1u && RDNA4N_SCANX_SLOT_TAG_MONA == 0x10u, "X11: the flag bits, the instances, the tags");
     EXPECT(RDNA4N_SCANX_INSTANCE == kDescMonB.inst && RDNA4N_SCANX_SLOT_TAG == kDescMonB.slotTag && RDNA4N_SCANX_INSTANCE_MONA == kDescMonA.inst && RDNA4N_SCANX_SLOT_TAG_MONA == kDescMonA.slotTag, "X11: the ABI's instances and tags are the descriptors'");
     EXPECT(sizeof(rdna4n_scan_status) == 256 && sizeof(rdna4n_scan_reg) == 32, "X11: the structs are unchanged");

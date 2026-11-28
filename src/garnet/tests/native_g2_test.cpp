@@ -1,4 +1,4 @@
-// native_g2_test.cpp - kext 0.0.627 (GPU-apps stage G2: several native client sessions; an internal design note section 1 and section 4 G2): the pure half
+// native_g2_test.cpp - kext 0.0.627 (GPU-apps stage G2: several native client sessions; multi-session policy): the pure half
 // (amd/garnet_multisession_pure.h) driven directly and through a small model of the kernel's session table and in-order ring, the close-disarm rule (amd/native_disp_pure.h), plus
 // source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetNativeClient.cpp, GarnetDriver.cpp, GarnetUserClient.cpp, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -505,7 +505,7 @@ static void t11_pins(const std::string &root) {
            "accelExperiment: 103 is gated by its latch and sits before the native refusal");
     expect(ucl.find("!rdna4native::g2::action_admitted(amdgpu::n1c_multi_latched_on(), action)) {") != std::string::npos, "the user client: 103 skips the old bound only with the latch");
     expect(hdr.find("IOReturn n1c_g2_stat(uint64_t page, uint64_t *o);") != std::string::npos && hdr.find("bool n1c_multi_latched_on();") != std::string::npos, "declared");
-    expect(cli.find("else if (what && !strcmp(what, \"sessstat\")) in = 103;") != std::string::npos && cli.find("in == 103 ? \"sessstat\"") != std::string::npos && cli.find("if (in == 103 && !arg) in2[1] = 8;") != std::string::npos && cli.find("if (c == 0 && out[4] == 8) {") != std::string::npos && cli.find("hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\\n") != std::string::npos && cli.find("|sessstat [0..9]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add") != std::string::npos,
+    expect(cli.find("else if (what && !strcmp(what, \"sessstat\")) in = 103;") != std::string::npos && cli.find("in == 103 ? \"sessstat\"") != std::string::npos && cli.find("if (in == 103 && !arg) in2[1] = 8;") != std::string::npos && cli.find("if (c == 0 && out[4] == 8) {") != std::string::npos && cli.find("hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny killswitch\\n") != std::string::npos && cli.find("|sessstat [0..9]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add") != std::string::npos,
            "rdna4test: page 8 defaults to and prints G2's global page");
     // no single-session leftovers, the stack rule
     expect(eng.find("static Session *gS;") == std::string::npos && eng.find("gS->") == std::string::npos && eng.find("&gS,") == std::string::npos, "no global single-session pointer is left");

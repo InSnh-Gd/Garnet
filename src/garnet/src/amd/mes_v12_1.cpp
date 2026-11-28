@@ -25,7 +25,7 @@
 //  Deviations from the reference
 //  ==================================================================
 //   1. DriverKit IOBufferMemoryDescriptor + IODMACommand → amdgpu::SysMem
-//      (PORTING.md). There is no IOMMU on this platform, so SysMem.bus
+//      (kext constraint). There is no IOMMU on this platform, so SysMem.bus
 //      is the HOST PHYSICAL address, which is not a GPU address: each
 //      MES buffer is additionally bound into the GART with
 //      gmc_bind_existing() and `MESInstance::*_bus` holds the returned
@@ -73,7 +73,7 @@
 //      kicks and fence polls. The reference relied on `volatile` alone.
 //   9. mes_release_storage() added — the dext never freed these buffers.
 //  10. Logging: every programmed address and every touched register is
-//      logged with its before/after value (PORTING.md rule 6). No
+//      logged with its before/after value (for hardware trace logging). No
 //      %{public}s; uint64_t values are cast to unsigned long long.
 //
 //  11. ADDRESSING. The reference addressed every GC register in this file
@@ -150,7 +150,8 @@ mes_alloc_gtt_block(DeviceContext &dev, GMCContext &gmc, uint64_t size,
 // mes_alloc_storage — EOP + MQD + ring + cmd buffer.
 //------------------------------------------------------------------
 kern_return_t
-mes_alloc_storage(DeviceContext &dev, GMCContext &gmc, MESInstance &inst)
+mes_alloc_storage(DeviceContext &dev, GMCContext &gmc, MESInstance &inst,
+                  MESPipe pipe)
 {
     if (inst.inited) return kIOReturnSuccess;
     if (!gmc.inited || gmc.gart_pt_bus == 0) {
@@ -194,7 +195,7 @@ mes_alloc_storage(DeviceContext &dev, GMCContext &gmc, MESInstance &inst)
     }
     inst.cmd_cpu = cpu;
 
-    // Write-back page — rptr/wptr shadows for the SCHED ring.
+    // Write-back page — rptr/wptr shadows for this MES pipe ring.
     r = mes_alloc_gtt_block(dev, gmc, kASPageSize,
                             inst.wb_mem, &inst.wb_bus, &cpu, "wb");
     if (r != kIOReturnSuccess) {
@@ -205,19 +206,21 @@ mes_alloc_storage(DeviceContext &dev, GMCContext &gmc, MESInstance &inst)
     inst.ring_rptr_gpu_addr = inst.wb_bus + 0x00;
     inst.ring_wptr_gpu_addr = inst.wb_bus + 0x40;
     inst.ring_size_dwords   = kMES_RING_SIZE / 4;
-    // Doorbell index: Sched pipe gets slot from doorbell_index map.
-    // MES ring0 doorbell offset (BAR2 DWORD offset) — matches
-    // doorbell.index.mes_ring0 = 0x20 in the ASIC-specific map.
-    inst.doorbell_index = dev.doorbell.index.mes_ring0;
+    // Doorbell index: Sched pipe uses mes_ring0 (0x00B), KIQ pipe uses mes_ring1 (0x00C).
+    inst.doorbell_index = (pipe == MESPipe::KIQ)
+                              ? dev.doorbell.index.mes_ring1
+                              : dev.doorbell.index.mes_ring0;
 
     inst.inited = true;
-    MES_LOG("storage: EOP %#llx, MQD %#llx, ring %#llx, cmd %#llx",
+    MES_LOG("storage[pipe %u]: EOP %#llx, MQD %#llx, ring %#llx, cmd %#llx",
+            static_cast<uint32_t>(pipe),
             (unsigned long long)inst.eop_bus,
             (unsigned long long)inst.mqd_bus,
             (unsigned long long)inst.ring_bus,
             (unsigned long long)inst.cmd_bus);
-    MES_LOG("storage: wb %#llx (rptr %#llx, wptr %#llx), ring %u dw, "
+    MES_LOG("storage[pipe %u]: wb %#llx (rptr %#llx, wptr %#llx), ring %u dw, "
             "doorbell idx %#x (BAR2 byte %#llx)",
+            static_cast<uint32_t>(pipe),
             (unsigned long long)inst.wb_bus,
             (unsigned long long)inst.ring_rptr_gpu_addr,
             (unsigned long long)inst.ring_wptr_gpu_addr,
@@ -232,7 +235,7 @@ mes_alloc_storage(DeviceContext &dev, GMCContext &gmc, MESInstance &inst)
 // back. Safe to call on a partially-initialised context.
 //------------------------------------------------------------------
 void
-mes_release_storage(MESContext &mes)
+mes_release_storage(MESContext &mes, GMCContext *gmc)
 {
     for (uint32_t p = 0; p < kMaxMESPipes; p++) {
         MESInstance &inst = mes.pipe[p];
@@ -241,18 +244,24 @@ mes_release_storage(MESContext &mes)
         sysmem_free(inst.ring_mem);
         sysmem_free(inst.cmd_mem);
         sysmem_free(inst.wb_mem);
+        sysmem_free(inst.sch_ctx_mem);
+        sysmem_free(inst.status_fence_mem);
+        if (inst.resource_1_is_vram) {
+            if (gmc != nullptr && gmc->vram_alloc.is_inited() && inst.resource_1_vram.size != 0)
+                gmc->vram_alloc.free(inst.resource_1_vram);
+            inst.resource_1_vram = {};
+            inst.resource_1_is_vram = false;
+        }
+        sysmem_free(inst.resource_1_mem);
         inst.eop_bus = inst.mqd_bus = inst.ring_bus = 0;
         inst.cmd_bus = inst.wb_bus = 0;
+        inst.sch_ctx_bus = inst.status_fence_bus = inst.resource_1_bus = 0;
         inst.eop_cpu = inst.mqd_cpu = inst.ring_cpu = nullptr;
         inst.cmd_cpu = inst.wb_cpu = nullptr;
         inst.inited  = false;
         inst.enabled = false;
     }
-    sysmem_free(mes.sch_ctx_mem);
-    sysmem_free(mes.status_fence_mem);
-    sysmem_free(mes.resource_1_mem);
-    mes.sch_ctx_bus = mes.status_fence_bus = mes.resource_1_bus = 0;
-    MES_LOG("release_storage: all MES sysmem released");
+    MES_LOG("release_storage: all MES storage released");
 }
 
 //------------------------------------------------------------------
@@ -386,13 +395,19 @@ mes_load_firmware(DeviceContext &dev, PSPContext &psp, MESContext &mes,
                 pl.name, pl.fw_type, (unsigned long long)mc, pl.size);
     }
 
-    return mes_parse_ucode_header(mes, MESPipe::Sched, bin, size);
+    kern_return_t hr = mes_parse_ucode_header(mes, MESPipe::Sched, bin, size);
+    if (hr != kIOReturnSuccess) return hr;
+    if (kEnableUniMES) {
+        hr = mes_parse_ucode_header(mes, MESPipe::KIQ, bin, size);
+        if (hr != kIOReturnSuccess) return hr;
+    }
+    return kIOReturnSuccess;
 }
 
 //------------------------------------------------------------------
-// mes_enable — port of mes_v12_0_enable. For our uni_mes path we
-// only program pipe 0; the non-uni path is deferred until we need
-// the KIQ pipe.
+// mes_enable — port of mes_v12_0_enable (mes_v12_0.c:1440-1518).
+// Enables both MES pipes (pipe 0 SCHED + pipe 1 KIQ) when both have
+// uc_start_addr populated (uni-MES standard path).
 //------------------------------------------------------------------
 kern_return_t
 mes_enable(const DeviceContext &dev, MESContext &mes, bool enable)
@@ -434,139 +449,129 @@ mes_enable(const DeviceContext &dev, MESContext &mes, bool enable)
             RREG32(dev, cnt_reg),
             RREG32(dev, MES_REG(dev, CP_MES_INSTR_PNTR)));
 
-    // GRBM select MES pipe 0 (me=3, pipe=0, queue=0, vmid=0).
-    mes_grbm_select(dev, /*me=*/3, /*pipe=*/0, /*queue=*/0, /*vmid=*/0);
+    const uint32_t mscratch_lo_reg = MES_REG(dev, CP_MES_MSCRATCH_LO_OFFSET);
+    const uint32_t mscratch_hi_reg = MES_REG(dev, CP_MES_MSCRATCH_HI_OFFSET);
+    const uint32_t pc_lo_reg       = MES_REG(dev, CP_MES_PRGRM_CNTR_START);
+    const uint32_t pc_hi_reg       = MES_REG(dev, CP_MES_PRGRM_CNTR_START_HI);
 
-    // CP_MES_MSCRATCH_{HI,LO} — direct port of mes_v12_0.c:1100-1108.
-    // Upstream writes these only when amdgpu_mes_log_enable is true
-    // and event_log_size is large enough. We don't enable event log,
-    // so we zero the registers (they latch reset garbage otherwise on
-    // some SOC variants; explicit zeroing matches upstream's
-    // "register value is undefined unless written" warning in the
-    // gc_12_0_0 reg-doc).
-    //
-    // Audit-7 #5.
-    const uint32_t mscratch_lo_reg =
-        MES_REG(dev, CP_MES_MSCRATCH_LO_OFFSET);
-    const uint32_t mscratch_hi_reg =
-        MES_REG(dev, CP_MES_MSCRATCH_HI_OFFSET);
-    MES_LOG("enable: CP_MES_MSCRATCH_LO before %#x, HI before %#x",
-            RREG32(dev, mscratch_lo_reg), RREG32(dev, mscratch_hi_reg));
-    WREG32(dev, mscratch_lo_reg, 0);
-    WREG32(dev, mscratch_hi_reg, 0);
+    const uint32_t num_pipes = (mes.pipe[1].uc_start_addr != 0) ? kMaxMESPipes : 1u;
+    for (uint32_t pipe = 0; pipe < num_pipes; pipe++) {
+        mes_grbm_select(dev, /*me=*/3, /*pipe=*/pipe, /*queue=*/0, /*vmid=*/0);
 
-    // Pre-reset: pulse PIPE0_RESET. mes_v12_0.c:1112-1117 reads the
-    // CNTL register first and OR'd PIPE0_RESET — keep that RMW.
-    {
-        uint32_t v = RREG32(dev, cnt_reg);
-        v = REG_SET_FIELD(v, CP_MES_CNTL, MES_PIPE0_RESET, 1);
-        WREG32(dev, cnt_reg, v);
-        MES_LOG("enable: PIPE0_RESET pulse, CP_MES_CNTL = %#x (readback %#x)",
-                v, RREG32(dev, cnt_reg));
-    }
+        WREG32(dev, mscratch_lo_reg, 0);
+        WREG32(dev, mscratch_hi_reg, 0);
 
-    // Program ucode start address (shift right 2 per upstream).
-    // mes_v12_0.c:1119-1123.
-    const uint64_t ucode_addr = mes.pipe[0].uc_start_addr >> 2;
-    const uint32_t pc_lo_reg =
-        MES_REG(dev, CP_MES_PRGRM_CNTR_START);
-    const uint32_t pc_hi_reg =
-        MES_REG(dev, CP_MES_PRGRM_CNTR_START_HI);
-    WREG32(dev, pc_lo_reg, static_cast<uint32_t>(ucode_addr));
-    WREG32(dev, pc_hi_reg, static_cast<uint32_t>(ucode_addr >> 32));
-    MES_LOG("enable: PRGRM_CNTR_START = %#x / _HI = %#x "
-            "(uc_start %#llx >> 2 = %#llx)",
-            RREG32(dev, pc_lo_reg), RREG32(dev, pc_hi_reg),
-            (unsigned long long)mes.pipe[0].uc_start_addr,
-            (unsigned long long)ucode_addr);
+        // Pre-reset: pulse PIPE0_RESET or PIPE1_RESET (mes_v12_0.c:1476-1481).
+        uint32_t rst = RREG32(dev, cnt_reg);
+        if (pipe == 0) rst = REG_SET_FIELD(rst, CP_MES_CNTL, MES_PIPE0_RESET, 1);
+        else           rst = REG_SET_FIELD(rst, CP_MES_CNTL, MES_PIPE1_RESET, 1);
+        WREG32(dev, cnt_reg, rst);
 
-    // Activate pipe 0 (start from cleared CP_MES_CNTL — matches
-    // upstream which builds the activate value from 0 at
-    // mes_v12_0.c:1126).
-    {
-        uint32_t v = 0;
-        v = REG_SET_FIELD(v, CP_MES_CNTL, MES_PIPE0_ACTIVE, 1);
-        WREG32(dev, cnt_reg, v);
-        MES_LOG("enable: activate write CP_MES_CNTL = %#x", v);
+        // Program ucode start address (shift right 2 per upstream, mes_v12_0.c:1483-1487).
+        const uint64_t ucode_addr = mes.pipe[pipe].uc_start_addr >> 2;
+        WREG32(dev, pc_lo_reg, static_cast<uint32_t>(ucode_addr));
+        WREG32(dev, pc_hi_reg, static_cast<uint32_t>(ucode_addr >> 32));
+
+        // Unhalt MES and activate one pipe each loop (mes_v12_0.c:1490-1495).
+        uint32_t act = REG_SET_FIELD(0u, CP_MES_CNTL, MES_PIPE0_ACTIVE, 1);
+        if (pipe != 0) act = REG_SET_FIELD(act, CP_MES_CNTL, MES_PIPE1_ACTIVE, 1);
+        WREG32(dev, cnt_reg, act);
+        mes.pipe[pipe].enabled = true;
+
+        MES_LOG("enable: pipe %u PRGRM_CNTR_START=%#x/_HI=%#x (uc_start %#llx) -> CP_MES_CNTL=%#x",
+                pipe, RREG32(dev, pc_lo_reg), RREG32(dev, pc_hi_reg),
+                (unsigned long long)mes.pipe[pipe].uc_start_addr, act);
     }
 
     // GRBM deselect.
     mes_grbm_select(dev, 0, 0, 0, 0);
 
-    // mes_v12_0.c:1140 — udelay(500) for uni_mes. Deviation 6: the
-    // reference used IOSleep(1) because DriverKit has no sub-ms sleep;
-    // the kernel has IODelay, so we use upstream's exact 500 us.
+    // mes_v12_0.c:1504 — udelay(500) for uni_mes.
     IODelay(500);
 
-    mes.pipe[0].enabled = true;
-    MES_LOG("enable: pipe 0 active, uc_start=%#llx; CP_MES_CNTL after = %#x, "
-            "CP_MES_INSTR_PNTR = %#x",
-            (unsigned long long)mes.pipe[0].uc_start_addr,
-            RREG32(dev, cnt_reg),
+    MES_LOG("enable: %u pipe(s) active; CP_MES_CNTL after = %#x, CP_MES_INSTR_PNTR = %#x",
+            num_pipes, RREG32(dev, cnt_reg),
             RREG32(dev, MES_REG(dev, CP_MES_INSTR_PNTR)));
     return kIOReturnSuccess;
 }
 
 //------------------------------------------------------------------
 // mes_set_hw_resources_1 — port of mes_v12_0_set_hw_resources_1
-// (mes_v12_0.c:711).
-//
-// Audit-7 #6. Sent after SET_HW_RESOURCES, gated on
-// sched_version >= 0x4b. Lazy-allocates the cleaner-shader fence
-// buffer.
+// (mes_v12_0.c:1013). Lazy-allocates per-pipe cleaner_shader_fence in VRAM.
 //------------------------------------------------------------------
-kern_return_t
-mes_set_hw_resources_1(DeviceContext &dev, GMCContext &gmc, MESContext &mes)
+static kern_return_t
+mes_set_hw_resources_1_pipe(DeviceContext &dev, GMCContext &gmc,
+                            MESContext &mes, MESPipe pipe)
 {
-    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
+    const uint32_t p = static_cast<uint32_t>(pipe);
+    if (p >= kMaxMESPipes) return kIOReturnBadArgument;
+    MESInstance &inst = mes.pipe[p];
+    if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
 
-    // Lazy-alloc the cleaner-shader fence (4 KB sysmem).
-    if (mes.resource_1_bus == 0) {
-        void *cpu = nullptr;
-        kern_return_t r = mes_alloc_gtt_block(dev, gmc, kMES_Resource1Bytes,
-                                              mes.resource_1_mem,
-                                              &mes.resource_1_bus, &cpu,
-                                              "cleaner_shader_fence");
-        if (r != kIOReturnSuccess) return r;
+    // Lazy-alloc the cleaner-shader fence buffer in VRAM (matching upstream
+    // AMDGPU_GEM_DOMAIN_VRAM in mes_v12_0.c:2000).
+    if (inst.resource_1_bus == 0) {
+        if (gmc.vram_alloc.is_inited()) {
+            if (!gmc.vram_alloc.alloc(kMES_Resource1Bytes, kAMDGPUGPUPageSize,
+                                      &inst.resource_1_vram)) {
+                MES_LOG("set_hw_resources_1[pipe %u]: VRAM alloc failed (%u B, free=%llu)",
+                        p, kMES_Resource1Bytes,
+                        (unsigned long long)gmc.vram_alloc.bytes_free());
+                return kIOReturnNoMemory;
+            }
+            const uint64_t vram_off = inst.resource_1_vram.gpu_va - gmc.vram_start;
+            if (!bar0_range_ok(dev, vram_off, kMES_Resource1Bytes)) {
+                MES_LOG("set_hw_resources_1[pipe %u]: resource_1 vram_off %#llx outside BAR0 (%llu)",
+                        p, (unsigned long long)vram_off, (unsigned long long)dev.bar0Size);
+                gmc.vram_alloc.free(inst.resource_1_vram);
+                inst.resource_1_vram = {};
+                return kIOReturnNoMemory;
+            }
+            bar0_memset_vram(dev, vram_off, 0u, kMES_Resource1Bytes);
+            amdgpu_hdp_flush(dev);
+            inst.resource_1_bus     = inst.resource_1_vram.gpu_va;
+            inst.resource_1_is_vram = true;
+            MES_LOG("set_hw_resources_1[pipe %u]: allocated cleaner_shader_fence in VRAM "
+                    "mc=%#llx (vram_off=%#llx, %u B)",
+                    p, (unsigned long long)inst.resource_1_bus,
+                    (unsigned long long)vram_off, kMES_Resource1Bytes);
+        } else {
+            void *cpu = nullptr;
+            kern_return_t r = mes_alloc_gtt_block(dev, gmc, kMES_Resource1Bytes,
+                                                  inst.resource_1_mem,
+                                                  &inst.resource_1_bus, &cpu,
+                                                  "cleaner_shader_fence");
+            if (r != kIOReturnSuccess) return r;
+            inst.resource_1_is_vram = false;
+        }
     }
 
-    // mes_v12_0.c:713-726 — header, mes_kiq_unmap_timeout=0xa,
-    // cleaner_shader_fence_mc_addr, then submit. We mirror the
-    // upstream layout in mes_v12_api_def.h:312-335 verbatim. Natural
-    // C struct alignment on x86_64 / aarch64 introduces 4-byte
-    // padding before each uint64_t that follows a uint32_t — match
-    // that with explicit `_pad*` members so the offsets stay bit-
-    // compatible.
-    //
-    // Upstream layout (after natural alignment):
-    //   header                       u32  @  0 dw
-    //   api_status                   16B  @  1 dw  (4 dw)
-    //   timestamp                    u64  @  6 dw  (after 4 B pad)
-    //   flags (u32 union)            u32  @  8 dw
-    //   mes_debug_ctx_mc_addr        u64  @ 10 dw  (after 4 B pad)
-    //   mes_debug_ctx_size           u32  @ 12 dw
-    //   mes_kiq_unmap_timeout        u32  @ 13 dw
-    // MES_SetHwResources1 wire layout (and offsetof static_asserts) live in amdgpu_mes.h.
     MES_SetHwResources1 pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.header.u32All = mes_api_header(kMES_API_TYPE_SCHEDULER,
                                        MESSchOp::SET_HW_RSRC_1,
                                        kMES_API_FRAME_DWORDS);
-    pkt.mes_kiq_unmap_timeout = 0xa;  // mes_v12_0.c:720
-    pkt.cleaner_shader_fence_mc_addr = mes.resource_1_bus;
+    pkt.mes_kiq_unmap_timeout = 0xa;  // mes_v12_0.c:1022
+    pkt.cleaner_shader_fence_mc_addr = inst.resource_1_bus;
 
     const uint32_t api_status_dw =
         offsetof(MES_SetHwResources1, api_status) / 4;
-    MES_LOG("set_hw_resources_1: header=%#x kiq_unmap_timeout=%#x "
+    MES_LOG("set_hw_resources_1[pipe %u]: header=%#x kiq_unmap_timeout=%#x "
             "cleaner_shader_fence_mc=%#llx (api_status @ dw %u)",
-            pkt.header.u32All, pkt.mes_kiq_unmap_timeout,
+            p, pkt.header.u32All, pkt.mes_kiq_unmap_timeout,
             (unsigned long long)pkt.cleaner_shader_fence_mc_addr,
             api_status_dw);
-    return mes_submit_pkt(dev, mes, MESPipe::Sched,
+    return mes_submit_pkt(dev, mes, pipe,
                           reinterpret_cast<const uint32_t *>(&pkt),
                           api_status_dw,
                           /*timeout_us=*/2000000);
+}
+
+kern_return_t
+mes_set_hw_resources_1(DeviceContext &dev, GMCContext &gmc, MESContext &mes)
+{
+    return mes_set_hw_resources_1_pipe(dev, gmc, mes, MESPipe::Sched);
 }
 
 //------------------------------------------------------------------
@@ -666,7 +671,7 @@ mes_queue_init(const DeviceContext &dev, MESContext &mes, MESPipe pipe)
     persist = REG_SET_FIELD(persist, CP_HQD_PERSISTENT_STATE,
                             PRELOAD_SIZE, 0x55);
 
-    uint32_t mqd_ctrl = 0;
+    uint32_t mqd_ctrl = kCP_MQD_CONTROL_DEFAULT;
     mqd_ctrl = REG_SET_FIELD(mqd_ctrl, CP_MQD_CONTROL, VMID, 0);
 
     // EOP fields (upstream sets in mqd_init):
@@ -679,27 +684,23 @@ mes_queue_init(const DeviceContext &dev, MESContext &mes, MESPipe pipe)
     eop_ctrl = (eop_ctrl & ~0x3fu)
              | ((order_base_2_u32(kMES_EOP_SIZE / 4u) - 1u) & 0x3fu);
 
-    // ---- 2) Write the MQD struct in memory ----
+    // ---- 2) Write the MQD struct in memory (exact v12_compute_mqd offsets) ----
     auto *mqd = static_cast<uint32_t *>(inst.mqd_cpu);
     if (mqd != nullptr) {
-        // Header magic from upstream mqd_init.
-        mqd[80]                                  = 0xC0310800u;  // header
-        // compute_pipelinestat_enable (idx 81) + compute_static_thread_mgmt
-        // (82..85) + compute_misc_reserved (86): not strictly needed
-        // for a kernel-mode queue but set to upstream defaults to
-        // keep MES happy on context save.
-        mqd[81] = 0x00000001u;
-        mqd[82] = 0xffffffffu;
-        mqd[83] = 0xffffffffu;
-        mqd[84] = 0xffffffffu;
-        mqd[85] = 0xffffffffu;
-        mqd[86] = 0x00000007u;
+        mqd[ComputeMqdOff::header]                        = 0xC0310800u;
+        mqd[ComputeMqdOff::compute_pipelinestat_enable]   = 0x00000001u;
+        mqd[ComputeMqdOff::compute_static_thread_mgmt_se0]= 0xffffffffu;
+        mqd[ComputeMqdOff::compute_static_thread_mgmt_se1]= 0xffffffffu;
+        mqd[ComputeMqdOff::compute_static_thread_mgmt_se2]= 0xffffffffu;
+        mqd[ComputeMqdOff::compute_static_thread_mgmt_se3]= 0xffffffffu;
+        mqd[ComputeMqdOff::compute_misc_reserved]         = 0x00000007u;
 
         mqd[MQDOff::cp_mqd_base_addr_lo]         = cp_mqd_base_lo;
         mqd[MQDOff::cp_mqd_base_addr_hi]         = cp_mqd_base_hi;
         mqd[MQDOff::cp_hqd_active]               = 1;
         mqd[MQDOff::cp_hqd_vmid]                 = 0;
         mqd[MQDOff::cp_hqd_persistent_state]     = persist;
+        mqd[ComputeMqdOff::cp_hqd_quantum]       = kRegCP_HQD_QUANTUM_DEFAULT;
         mqd[MQDOff::cp_hqd_pq_base_lo]           = cp_pq_lo;
         mqd[MQDOff::cp_hqd_pq_base_hi]           = cp_pq_hi;
         mqd[MQDOff::cp_hqd_pq_rptr_report_addr_lo] = cp_rptr_addr_lo;
@@ -708,6 +709,7 @@ mes_queue_init(const DeviceContext &dev, MESContext &mes, MESPipe pipe)
         mqd[MQDOff::cp_hqd_pq_wptr_poll_addr_hi] = cp_wptr_addr_hi;
         mqd[MQDOff::cp_hqd_pq_doorbell_control]  = db_ctrl;
         mqd[MQDOff::cp_hqd_pq_control]           = pq_ctrl;
+        mqd[ComputeMqdOff::cp_hqd_ib_control]    = kRegCP_HQD_IB_CONTROL_DEFAULT;
         mqd[MQDOff::cp_mqd_control]              = mqd_ctrl;
         mqd[MQDOff::cp_hqd_eop_base_addr_lo]     = cp_eop_lo;
         mqd[MQDOff::cp_hqd_eop_base_addr_hi]     = cp_eop_hi;
@@ -719,17 +721,50 @@ mes_queue_init(const DeviceContext &dev, MESContext &mes, MESPipe pipe)
         sysmem_wmb();   // deviation 8 — MQD visible before HQD activation
     }
 
-    MES_LOG("queue_init: MQD mc=%#llx cpu=%p | pq_base=%#x/%#x (ring %#llx>>8) "
+    MES_LOG("queue_init[pipe %u]: MQD mc=%#llx cpu=%p | pq_base=%#x/%#x (ring %#llx>>8) "
             "| rptr=%#x/%#x | wptr_poll=%#x/%#x | eop=%#x/%#x (%#llx>>8) "
             "eop_ctrl=%#x | persist=%#x mqd_ctrl=%#x",
-            (unsigned long long)inst.mqd_bus, inst.mqd_cpu,
+            p, (unsigned long long)inst.mqd_bus, inst.mqd_cpu,
             cp_pq_lo, cp_pq_hi, (unsigned long long)inst.ring_bus,
             cp_rptr_addr_lo, cp_rptr_addr_hi,
             cp_wptr_addr_lo, cp_wptr_addr_hi,
             cp_eop_lo, cp_eop_hi, (unsigned long long)inst.eop_bus,
             eop_ctrl, persist, mqd_ctrl);
 
-    // ---- 3) GRBM-select MES pipe, write the same values live ----
+    // ---- 3) Map SCHED pipe via KIQ ADD_QUEUE(SCHQ) for uni-MES, or program HQD registers directly ----
+    // Mirrors upstream mes_v12_0_queue_init (mes_v12_0.c:1852-1861) + mes_v12_0_map_legacy_queue (:782-816).
+    if (pipe == MESPipe::Sched && mes.uni_mes_active &&
+        mes.pipe[1].inited && mes.pipe[1].enabled) {
+        MES_AddQueue pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.header.u32All   = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                                             MESSchOp::ADD_QUEUE,
+                                             kMES_API_FRAME_DWORDS);
+        pkt.pipe_id         = 0;
+        pkt.queue_id        = 0;
+        pkt.doorbell_offset = inst.doorbell_index;
+        pkt.mqd_addr        = inst.mqd_bus;
+        pkt.wptr_addr       = inst.ring_wptr_gpu_addr;
+        pkt.queue_type      = kMESQueueType_SCHQ;
+        pkt.flags           = kAddQueueFlag_map_legacy_kq;
+        const uint32_t api_status_dw = offsetof(MES_AddQueue, api_status) / 4;
+        MES_LOG("queue_init[pipe 0]: mapping SCHQ via KIQ pipe 1 "
+                "(db=%#x mqd_mc=%#llx wptr_mc=%#llx)",
+                pkt.doorbell_offset, (unsigned long long)pkt.mqd_addr,
+                (unsigned long long)pkt.wptr_addr);
+        kern_return_t r = mes_submit_pkt(dev, mes, MESPipe::KIQ,
+                                         reinterpret_cast<const uint32_t *>(&pkt),
+                                         api_status_dw,
+                                         /*timeout_us=*/2000000);
+        if (r != kIOReturnSuccess) {
+            MES_LOG("queue_init[pipe 0]: KIQ ADD_QUEUE(SCHQ) failed (%#x)", r);
+            return r;
+        }
+        MES_LOG("queue_init[pipe 0]: SCHQ mapped via KIQ pipe 1");
+        return kIOReturnSuccess;
+    }
+
+    // Direct HQD register programming (KIQ pipe 1, or fallback when KIQ pipe is not active).
     mes_grbm_select(dev, /*me=*/3, /*pipe=*/p, /*queue=*/0, /*vmid=*/0);
 
     // Disable doorbell first while we reprogram.
@@ -832,6 +867,10 @@ mes_kick_doorbell(const DeviceContext &dev, const MESInstance &inst)
     // the scheduler never saw a kick, stage 13 runs 1-3).
     const uint64_t offs = static_cast<uint64_t>(inst.doorbell_index) * 4ull;
     const uint32_t v = *sw_wptr;
+    // Update WPTR poll shadow (+0x40) before kicking doorbell so CPC sees current wptr.
+    *reinterpret_cast<volatile uint64_t *>(wb_bytes + 0x40) = static_cast<uint64_t>(v);
+    sysmem_wmb();
+    // Keep 32-bit doorbell write: mes_ring0 (0x00B) and mes_ring1 (0x00C) are 4 bytes apart.
     WDOORBELL32(dev, offs, v);
     MES_LOG("kick_doorbell: BAR2+%#llx <= %#x (sw_wptr %u dw)",
             (unsigned long long)offs, v, *sw_wptr);
@@ -982,127 +1021,116 @@ mes_query_sched_status(const DeviceContext &dev, MESContext &mes,
 // the SCHED pipe. Lazy-allocates the scheduler context + status-
 // fence buffers (4 KB sysmem each) on first call.
 //------------------------------------------------------------------
-kern_return_t
-mes_set_hw_resources(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
-                     const MESSetHwResourcesInput &in)
+static kern_return_t
+mes_set_hw_resources_pipe(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
+                          MESPipe pipe, const MESSetHwResourcesInput &in)
 {
-    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
+    const uint32_t p = static_cast<uint32_t>(pipe);
+    if (p >= kMaxMESPipes) return kIOReturnBadArgument;
+    MESInstance &inst = mes.pipe[p];
+    if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
 
-    // 1) Lazy-alloc scheduler context + status fence.
-    if (mes.sch_ctx_bus == 0) {
+    // 1) Lazy-alloc per-pipe scheduler context + status fence.
+    if (inst.sch_ctx_bus == 0) {
         void *cpu = nullptr;
         kern_return_t r = mes_alloc_gtt_block(dev, gmc, kMES_SchCtxBytes,
-                                              mes.sch_ctx_mem,
-                                              &mes.sch_ctx_bus, &cpu,
-                                              "sch_ctx");
+                                              inst.sch_ctx_mem,
+                                              &inst.sch_ctx_bus, &cpu,
+                                              pipe == MESPipe::KIQ ? "kiq_sch_ctx" : "sch_ctx");
         if (r != kIOReturnSuccess) return r;
     }
-    if (mes.status_fence_bus == 0) {
+    if (inst.status_fence_bus == 0) {
         void *cpu = nullptr;
         kern_return_t r = mes_alloc_gtt_block(dev, gmc, kMES_StatusFenceBytes,
-                                              mes.status_fence_mem,
-                                              &mes.status_fence_bus, &cpu,
-                                              "status_fence");
+                                              inst.status_fence_mem,
+                                              &inst.status_fence_bus, &cpu,
+                                              pipe == MESPipe::KIQ ? "kiq_status_fence" : "status_fence");
         if (r != kIOReturnSuccess) return r;
     }
 
-    // 2) Build the 64-dword frame.
+    // 2) Build the 64-dword frame (mirrors mes_v12_0_set_hw_resources, mes_v12_0.c:1031-1114).
     MES_SetHwResources pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.header.u32All = mes_api_header(kMES_API_TYPE_SCHEDULER,
                                        MESSchOp::SET_HW_RSRC,
                                        kMES_API_FRAME_DWORDS);
-    pkt.vmid_mask_mmhub  = in.vmid_mask_mmhub;
-    pkt.vmid_mask_gfxhub = in.vmid_mask_gfxhub;
-    pkt.gds_size         = 0;
-    pkt.paging_vmid      = 0;
-    for (int i = 0; i < 8; i++) pkt.compute_hqd_mask[i] = in.compute_hqd_mask[i];
-    for (int i = 0; i < 2; i++) pkt.gfx_hqd_mask[i]     = in.gfx_hqd_mask[i];
-    for (int i = 0; i < 2; i++) pkt.sdma_hqd_mask[i]    = in.sdma_hqd_mask[i];
-    for (int i = 0; i < 5; i++) pkt.aggregated_doorbells[i] = in.aggregated_doorbells[i];
+    if (pipe == MESPipe::Sched) {
+        pkt.vmid_mask_mmhub  = in.vmid_mask_mmhub;
+        pkt.vmid_mask_gfxhub = in.vmid_mask_gfxhub;
+        pkt.gds_size         = 0;
+        pkt.paging_vmid      = 0;
+        for (int i = 0; i < 8; i++) pkt.compute_hqd_mask[i] = in.compute_hqd_mask[i];
+        for (int i = 0; i < 2; i++) pkt.gfx_hqd_mask[i]     = in.gfx_hqd_mask[i];
+        for (int i = 0; i < 2; i++) pkt.sdma_hqd_mask[i]    = in.sdma_hqd_mask[i];
+        for (int i = 0; i < 5; i++) pkt.aggregated_doorbells[i] = in.aggregated_doorbells[i];
+    }
 
-    pkt.g_sch_ctx_gpu_mc_ptr              = mes.sch_ctx_bus;
-    pkt.query_status_fence_gpu_mc_ptr     = mes.status_fence_bus;
+    pkt.g_sch_ctx_gpu_mc_ptr              = inst.sch_ctx_bus;
+    pkt.query_status_fence_gpu_mc_ptr     = inst.status_fence_bus;
 
-    // gc_base / mmhub_base / osssys_base — upstream
-    // mes_v12_0_set_hw_resources (mes_v12_0.c:979-985) copies FIVE
-    // segments per IP:
-    //     for (i = 0; i < 5; i++)
-    //         pkt.gc_base[i] = adev->reg_offset[GC_HWIP][0][i];
-    // MES firmware then resolves its own registers as
-    // base[BASE_IDX] + offset, exactly like the driver. The reference
-    // filled only slot 0 and zeroed the rest, so every register MES
-    // reaches at BASE_IDX 1 (the whole CP_MES_* block, GRBM_GFX_CNTL,
-    // RLC_CP_SCHEDULERS) resolved against base 0 — the same class of
-    // bug this audit fixes on the driver side. Our IPBaseTable does
-    // track all segments (getBase(block, idx)), so fill all five.
-    //
-    // Deviation 7: the reference reads IPBlock::GMC for mmhub_base;
-    // our discovery fills IPBlock::MMHUB (hwid 34) and leaves GMC at
-    // the unresolved sentinel, so prefer MMHUB and fall back to GMC.
-    // Unresolved segments go out as 0 rather than 0xFFFFFFFF.
     auto seg_or_zero = [&](IPBlock b, int i) -> uint32_t {
         return dev.ip.isResolved(b, i) ? dev.ip.getBase(b, i) : 0u;
     };
     const IPBlock mmhub_blk = dev.ip.isResolved(IPBlock::MMHUB)
                             ? IPBlock::MMHUB : IPBlock::GMC;
-    constexpr int kMESBaseSegments = 5;   // mes_v12_0.c:979
+    constexpr int kMESBaseSegments = 5;   // mes_v12_0.c:1074
     for (int i = 0; i < kMESBaseSegments; i++) {
         pkt.gc_base[i]     = seg_or_zero(IPBlock::GC, i);
         pkt.mmhub_base[i]  = seg_or_zero(mmhub_blk, i);
         pkt.osssys_base[i] = seg_or_zero(IPBlock::OSSSYS, i);
     }
 
-    // Flags match mes_v12_0_set_hw_resources (mes_v12_0.c:780-792):
-    //   disable_reset = 1, disable_mes_log = 1,
-    //   use_different_vmid_compute = 1, enable_reg_active_poll = 1,
-    //   enable_level_process_quantum_check = 1,
-    //   unmapped_doorbell_handling = 1 (basic version)
     pkt.flags = kSetHwRsrcFlag_disable_reset
               | kSetHwRsrcFlag_disable_mes_log
               | kSetHwRsrcFlag_use_different_vmid_compute
               | kSetHwRsrcFlag_enable_reg_active_poll
               | kSetHwRsrcFlag_enable_level_process_quantum_check
-              | kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC;
+              | kSetHwRsrcFlag_unmapped_doorbell_handling_BASIC_PLUS;
 
-    // mes_v12_0.c:791 — oversubscription_timer is 0 for sched_version
-    // < 0x8b and 50 otherwise. We pick 50 for safety since RDNA4
-    // ships ≥ 0x4b firmware. (No SDMA-only sched_version split is
-    // exposed in our struct.)
-    pkt.oversubscription_timer = 50;
+    // Upstream 4e22a5fe6ea6 (mes_v12_0.c:1099): 0 for mes_rev < 0x8b, 50 otherwise.
+    pkt.oversubscription_timer = (pipe == MESPipe::Sched)
+        ? mes_oversubscription_timer(mes.sched_version)
+        : mes_oversubscription_timer(mes.kiq_version);
 
-    MES_LOG("set_hw_resources: header=%#x flags=%#x oversub=%u "
+    MES_LOG("set_hw_resources[pipe %u]: header=%#x flags=%#x oversub=%u "
             "vmid_mmhub=%#x vmid_gfxhub=%#x",
-            pkt.header.u32All, pkt.flags, pkt.oversubscription_timer,
+            p, pkt.header.u32All, pkt.flags, pkt.oversubscription_timer,
             pkt.vmid_mask_mmhub, pkt.vmid_mask_gfxhub);
-    MES_LOG("set_hw_resources: sch_ctx_mc=%#llx status_fence_mc=%#llx",
-            (unsigned long long)pkt.g_sch_ctx_gpu_mc_ptr,
+    MES_LOG("set_hw_resources[pipe %u]: sch_ctx_mc=%#llx status_fence_mc=%#llx",
+            p, (unsigned long long)pkt.g_sch_ctx_gpu_mc_ptr,
             (unsigned long long)pkt.query_status_fence_gpu_mc_ptr);
-    MES_LOG("set_hw_resources: gc_base[0..4]=%#x/%#x/%#x/%#x/%#x",
-            pkt.gc_base[0], pkt.gc_base[1], pkt.gc_base[2],
-            pkt.gc_base[3], pkt.gc_base[4]);
-    MES_LOG("set_hw_resources: mmhub_base[0..4]=%#x/%#x/%#x/%#x/%#x",
-            pkt.mmhub_base[0], pkt.mmhub_base[1], pkt.mmhub_base[2],
-            pkt.mmhub_base[3], pkt.mmhub_base[4]);
-    MES_LOG("set_hw_resources: osssys_base[0..4]=%#x/%#x/%#x/%#x/%#x",
-            pkt.osssys_base[0], pkt.osssys_base[1], pkt.osssys_base[2],
-            pkt.osssys_base[3], pkt.osssys_base[4]);
-    MES_LOG("set_hw_resources: gfx_hqd=%#x/%#x sdma_hqd=%#x/%#x "
-            "compute_hqd[0..3]=%#x/%#x/%#x/%#x",
-            pkt.gfx_hqd_mask[0], pkt.gfx_hqd_mask[1],
-            pkt.sdma_hqd_mask[0], pkt.sdma_hqd_mask[1],
-            pkt.compute_hqd_mask[0], pkt.compute_hqd_mask[1],
-            pkt.compute_hqd_mask[2], pkt.compute_hqd_mask[3]);
+    if (pipe == MESPipe::Sched) {
+        MES_LOG("set_hw_resources: gc_base[0..4]=%#x/%#x/%#x/%#x/%#x",
+                pkt.gc_base[0], pkt.gc_base[1], pkt.gc_base[2],
+                pkt.gc_base[3], pkt.gc_base[4]);
+        MES_LOG("set_hw_resources: mmhub_base[0..4]=%#x/%#x/%#x/%#x/%#x",
+                pkt.mmhub_base[0], pkt.mmhub_base[1], pkt.mmhub_base[2],
+                pkt.mmhub_base[3], pkt.mmhub_base[4]);
+        MES_LOG("set_hw_resources: osssys_base[0..4]=%#x/%#x/%#x/%#x/%#x",
+                pkt.osssys_base[0], pkt.osssys_base[1], pkt.osssys_base[2],
+                pkt.osssys_base[3], pkt.osssys_base[4]);
+        MES_LOG("set_hw_resources: gfx_hqd=%#x/%#x sdma_hqd=%#x/%#x "
+                "compute_hqd[0..3]=%#x/%#x/%#x/%#x",
+                pkt.gfx_hqd_mask[0], pkt.gfx_hqd_mask[1],
+                pkt.sdma_hqd_mask[0], pkt.sdma_hqd_mask[1],
+                pkt.compute_hqd_mask[0], pkt.compute_hqd_mask[1],
+                pkt.compute_hqd_mask[2], pkt.compute_hqd_mask[3]);
+    }
 
-    // 3) Submit. api_status sits at byte offsetof(MES_SetHwResources,
-    //    api_status); convert to dword offset for mes_submit_pkt.
     const uint32_t api_status_dw =
         offsetof(MES_SetHwResources, api_status) / 4;
-    return mes_submit_pkt(dev, mes, MESPipe::Sched,
+    return mes_submit_pkt(dev, mes, pipe,
                           reinterpret_cast<const uint32_t *>(&pkt),
                           api_status_dw,
                           /*timeout_us=*/2000000);
+}
+
+kern_return_t
+mes_set_hw_resources(DeviceContext &dev, GMCContext &gmc, MESContext &mes,
+                     const MESSetHwResourcesInput &in)
+{
+    return mes_set_hw_resources_pipe(dev, gmc, mes, MESPipe::Sched, in);
 }
 
 //------------------------------------------------------------------
@@ -1204,6 +1232,35 @@ mes_remove_hw_queue_flags(const DeviceContext &dev, MESContext &mes,
                                      api_status_dw,
                                      /*timeout_us=*/1000000);
     MES_LOG("remove_hw_queue: %s (%#x)",
+            r == kIOReturnSuccess ? "acked" : "not acked", r);
+    return r;
+}
+
+kern_return_t
+mes_unmap_sched_queue(const DeviceContext &dev, MESContext &mes)
+{
+    if (!mes.uni_mes_active || !mes.pipe[0].inited || !mes.pipe[0].enabled ||
+        !mes.pipe[1].inited || !mes.pipe[1].enabled)
+        return kIOReturnSuccess;
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    MES_RemoveQueue pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.header.u32All   = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                                         MESSchOp::REMOVE_QUEUE,
+                                         kMES_API_FRAME_DWORDS);
+    pkt.doorbell_offset = mes.pipe[0].doorbell_index;
+    pkt.pipe_id         = 0;
+    pkt.queue_id        = 0;
+    pkt.queue_type      = kMESQueueType_SCHQ;
+    pkt.flags           = kRemoveQueueFlag_unmap_legacy_queue;
+
+    const uint32_t api_status_dw = offsetof(MES_RemoveQueue, api_status) / 4;
+    kern_return_t r = mes_submit_pkt(dev, mes, MESPipe::KIQ,
+                                     reinterpret_cast<const uint32_t *>(&pkt),
+                                     api_status_dw,
+                                     /*timeout_us=*/1000000);
+    MES_LOG("unmap_sched_queue: KIQ REMOVE_QUEUE(SCHQ) %s (%#x)",
             r == kIOReturnSuccess ? "acked" : "not acked", r);
     return r;
 }
@@ -1428,22 +1485,14 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
         return kIOReturnNotReady;
     }
 
-    // Always allocate storage. mes_enable runs only when microcode
-    // has been loaded for the SCHED pipe.
-    kern_return_t r = mes_alloc_storage(dev, gmc, mes.pipe[0]);
+    // Allocate storage for BOTH pipes (SCHED pipe 0 + KIQ pipe 1) —
+    // mirrors upstream mes_v12_0_sw_init (mes_v12_0.c:1984-2010).
+    kern_return_t r = mes_alloc_storage(dev, gmc, mes.pipe[0], MESPipe::Sched);
     if (r != kIOReturnSuccess) return r;
-    if (!kEnableUniMES) {
-        r = mes_alloc_storage(dev, gmc, mes.pipe[1]);
-        if (r != kIOReturnSuccess) return r;
-    }
+    r = mes_alloc_storage(dev, gmc, mes.pipe[1], MESPipe::KIQ);
+    if (r != kIOReturnSuccess) return r;
     mes.uni_mes_active = kEnableUniMES;
 
-    // Deviation 3: the reference's host-side LoadFirmware pushed the
-    // MES microcode through the PSP *and* stashed uc_start_addr from
-    // the file header. In this kext the LOAD_IP_FW half already ran in
-    // BringupStage::PSPFwLoad (psp_load_non_psp_fw step 6, which sends
-    // CP_MES + CP_MES_DATA); only the header parse is missing, so do
-    // it here from the embedded uni_mes blob.
     if (mes.pipe[0].uc_start_addr == 0) {
         const uint8_t *bin  = mes_fw;
         uint64_t       size = mes_fw_size;
@@ -1462,60 +1511,76 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
             if (hr != kIOReturnSuccess) {
                 MES_LOG("init_full: MES firmware header parse failed (%#x)",
                         hr);
+            } else if (kEnableUniMES) {
+                (void)mes_parse_ucode_header(mes, MESPipe::KIQ, bin, size);
             }
         } else {
             MES_LOG("init_full: no MES firmware blob available for the "
                     "uc_start_addr parse");
         }
+    } else if (kEnableUniMES && mes.pipe[1].uc_start_addr == 0) {
+        (void)mes_set_uc_start_addr(mes, MESPipe::KIQ, mes.pipe[0].uc_start_addr);
     }
 
     if (!mes.sched_ucode_loaded) {
         MES_LOG("init_full: storage allocated; awaiting MES microcode "
-                "via LoadFirmware before enabling pipe 0");
+                "via LoadFirmware before enabling pipes");
         return kIOReturnSuccess;
     }
 
-    // Audit-7 #5: order MUST be enable → queue_init.
-    //
-    // Upstream mes_v12_0_hw_init (mes_v12_0.c:1820) sequence:
-    //   1) mes_v12_0_enable(true)           — MES microcode running
-    //   2) mes_v12_0_enable_unmapped_doorbell_handling(true)
-    //   3) mes_v12_0_queue_init(SCHED_PIPE) — programs HQD live
-    //   4) mes_v12_0_set_hw_resources(SCHED_PIPE)
-    //   5) [if sched_version >= 0x4b] mes_v12_0_set_hw_resources_1
-    //   6) mes_v12_0_init_aggregated_doorbell
-    //   7) mes_v12_0_query_sched_status
-    //
-    // Writing CP_HQD_* while MES pipe 0 is still in reset (the bug
-    // we had) makes the HQD registers latch the new values on the
-    // wrong side of MES's internal state machine — some writes are
-    // dropped because the GRBM_GFX_CNTL-selected pipe context isn't
-    // backed by a running MES yet.
+    // Upstream uni-MES bringup sequence (mes_v12_0_kiq_hw_init + mes_v12_0_hw_init,
+    // mes_v12_0.c:2104-2232):
+    //   0) mes_kiq_setting(me=3, pipe=1, queue=0)
+    //   1) mes_enable(true)                          — activates pipe 0 & pipe 1
+    //   2) KIQ pipe 1: queue_init (HQD regs) -> read kiq_version ->
+    //                  SET_HW_RESOURCES(KIQ) -> SET_HW_RESOURCES_1(KIQ)
+    //   3) mes_enable_unmapped_doorbell_handling(true)
+    //   4) SCHED pipe 0: queue_init (ADD_QUEUE(SCHQ) via KIQ) -> read sched_version ->
+    //                    SET_HW_RESOURCES(SCHED) -> SET_HW_RESOURCES_1(SCHED) ->
+    //                    init_aggregated_doorbell -> query_sched_status(SCHED)
 
-    // (0) Tell RLC about the KIQ queue BEFORE enabling MES — upstream
-    // does this in mes_v12_0_kiq_hw_init (mes_v12_0.c:1748), which
-    // runs before mes_v12_0_enable in the kiq_hw_init flow. For uni-MES
-    // KIQ pipe (1) shares microcode with sched pipe (0) but RLC
-    // routing must be set first.  Audit-7 #5/#6.
+    // (0) Tell RLC about the KIQ queue (me=3, pipe=1, queue=0) BEFORE enabling MES.
     mes_kiq_setting(dev, /*me=*/3, /*pipe=*/1, /*queue=*/0);
 
-    // (1) Enable MES microcode.
+    // (1) Enable MES microcode on both pipe 0 (SCHED) and pipe 1 (KIQ).
     r = mes_enable(dev, mes, true);
     if (r != kIOReturnSuccess) return r;
 
-    // (2) Enable unmapped doorbell handling.  Audit-7 #6. Runs AFTER
-    // mes_enable per mes_v12_0_hw_init (mes_v12_0.c:1849).
+    // (2) KIQ pipe 1 initialization (mes_v12_0_kiq_hw_init, mes_v12_0.c:2141-2151).
+    if (mes.uni_mes_active && mes.pipe[1].enabled) {
+        r = mes_queue_init(dev, mes, MESPipe::KIQ);
+        if (r != kIOReturnSuccess) { (void)mes_enable(dev, mes, false); return r; }
+
+        mes_read_sched_version(dev, mes, MESPipe::KIQ);
+
+        MESSetHwResourcesInput kiqIn{};
+        r = mes_set_hw_resources_pipe(dev, gmc, mes, MESPipe::KIQ, kiqIn);
+        if (r != kIOReturnSuccess) {
+            MES_LOG("init_full: KIQ set_hw_resources failed (%#x) — halting MES and FAILING stage", r);
+            (void)mes_enable(dev, mes, false);
+            return r;
+        }
+        if ((mes.kiq_version & kMES_VERSION_MASK) >= kMES_HwResources1MinSchedVersion) {
+            kern_return_t kr1 = mes_set_hw_resources_1_pipe(dev, gmc, mes, MESPipe::KIQ);
+            if (kr1 != kIOReturnSuccess) {
+                MES_LOG("init_full: KIQ set_hw_resources_1 failed (%#x) — continuing", kr1);
+            }
+        }
+    }
+
+    // (3) Enable unmapped doorbell handling (mes_v12_0_hw_init, mes_v12_0.c:2213).
     mes_enable_unmapped_doorbell_handling(dev, true);
 
-    // (3) Program the SCHED HQD AFTER MES is running.
+    // (4) Map the SCHED pipe via KIQ ADD_QUEUE(SCHQ) (mes_v12_0.c:2215 -> :1854).
     r = mes_queue_init(dev, mes, MESPipe::Sched);
-    if (r != kIOReturnSuccess) return r;
+    if (r != kIOReturnSuccess) { (void)mes_enable(dev, mes, false); return r; }
 
     // Read sched_version from CP_MES_GP3_LO — gates set_hw_resources_1.
     mes_read_sched_version(dev, mes, MESPipe::Sched);
 
-    // (6) Program aggregated doorbells (5 priority levels). We pick a
-    // 5-slot window starting at kMES_AggregatedDoorbellsBase.
+    // Compute aggregated doorbell offsets (5 priority levels) for
+    // SET_HW_RESOURCES; hardware programming (mes_init_aggregated_doorbell)
+    // runs AFTER SET_HW_RESOURCES_1 per upstream mes_v12_0_hw_init (mes_v12_0.c:2080).
     uint32_t doorbells[kMES_PriorityLevels];
     // 0.0.18: these come from the one owner of the BAR2 layout,
     // DeviceContext::doorbell.index.mes_aggregated[] (amdgpu_ip.h), spaced
@@ -1526,7 +1591,6 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
                            ? dev.doorbell.index.mes_aggregated[i]
                            : kMES_AggregatedDoorbellsBase + i * 2;
     }
-    mes_init_aggregated_doorbell(dev, doorbells);
 
     // (4) Tell MES which hw resources it owns. VMID 0 stays kernel-only;
     // VMIDs 1..7 are MES-scheduled compute VMIDs. We keep GFX HQD 0
@@ -1573,10 +1637,11 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
     kern_return_t sr = mes_set_hw_resources(dev, gmc, mes, in);
     if (sr != kIOReturnSuccess) {
         // GarnetDriver: made FATAL — a scheduler that never acknowledged
-        // SET_HW_RESOURCES cannot schedule anything; the ladder must stop
-        // here instead of reporting MESInit as done run 1).
-        MES_LOG("init_full: set_hw_resources failed (%#x) — MES enabled "
-                "but scheduler not configured; FAILING the stage", sr);
+        // SET_HW_RESOURCES cannot schedule anything; halt MES so it does
+        // not spin ungated at full clock, and stop the ladder here.
+        MES_LOG("init_full: set_hw_resources failed (%#x) — halting MES and FAILING stage", sr);
+        (void)mes_unmap_sched_queue(dev, mes);
+        (void)mes_enable(dev, mes, false);
         return sr;
     }
 
@@ -1594,6 +1659,10 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
         MES_LOG("init_full: sched_version %#x < 0x4b, skipping "
                 "SET_HW_RESOURCES_1", mes.sched_version & kMES_VERSION_MASK);
     }
+
+    // (6) Program aggregated doorbells AFTER SET_HW_RESOURCES + SET_HW_RESOURCES_1
+    // (upstream mes_v12_0_hw_init, mes_v12_0.c:2073-2082).
+    mes_init_aggregated_doorbell(dev, doorbells);
 
     // (7) Query echoes the running scheduler — confirms MES is alive
     // before we hand it user queues.  Non-fatal failure.

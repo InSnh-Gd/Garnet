@@ -63,7 +63,11 @@ IOReturn GarnetVMFixture::publish(uint64_t *entryID) {
     // Background Metal enumeration must decline this hardware-free provider.
     created->setProperty("Garnet,Ready", 0ull, 32);
     created->setProperty("VMTestOnly", true);
-    created->setProperty("model", "Garnet VM software fixture");
+    static const char kFixtureModel[] = "Garnet VM software fixture";
+    if (OSData *modelData = OSData::withBytes(kFixtureModel, static_cast<unsigned int>(sizeof(kFixtureModel)))) {
+        created->setProperty("model", modelData);
+        modelData->release();
+    }
     if (!created->attach(this)) {
         created->release(); IOLockUnlock(lock); return kIOReturnInternalError;
     }

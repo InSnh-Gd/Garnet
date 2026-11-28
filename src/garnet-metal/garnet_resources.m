@@ -7,7 +7,7 @@
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------
-// P1 "memory pooling" (garnet_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/rdna4m-pool exists, latched ONCE when the device is
+// P1 "memory pooling" (garnet_pool.h decides, this block does the Vulkan calls). ON only when /private/tmp/garnet-pool exists, latched ONCE when the device is
 // created; OFF = every call site below runs the code that was there before (the `else` branches are the old lines, unchanged).
 //  * RDNA4Buffer / RDNA4Texture memory: <= 256 KiB from 4 MiB slabs (bound at the slab offset; host-visible slabs mapped once), 256 KiB..64 MiB from a recycle
 //    cache keyed by (memory type, size), the rest (and anything VkMemoryDedicatedRequirements marks dedicated) on its own allocation as before.
@@ -347,7 +347,7 @@ GARNET_INTERNAL BOOL rdna4nc_any_readonly_buffer(void) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // P5b "per-draw redundancy" (garnet_drawcache.h decides, this block holds the latch, the device-wide render-pass cache and the counters). ON only when
-// /private/tmp/rdna4m-drawopt exists, latched ONCE at device creation; OFF = every call site runs the code that was there before.
+// /private/tmp/garnet-drawopt exists, latched ONCE at device creation; OFF = every call site runs the code that was there before.
 //  * RDNA4RenderEncoder: re-uses a stage's VkDescriptorSet while the exact slot contents its set layout reads are unchanged; skips vkCmdBindPipeline for the pipeline
 //    already bound in the current render pass; remembers the last (topology, cull, front, pso) -> VkPipeline answer.
 //  * Render passes are cached device-wide by their attachment descriptions (<= 64, never destroyed while the device lives; beyond the cap created / destroyed as before).
@@ -374,7 +374,7 @@ GARNET_INTERNAL void rdna4_drawopt_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// P4 import cache (garnet_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/rdna4m-noimpcache switches it OFF, latched ONCE at device creation;
+// P4 import cache (garnet_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/garnet-noimpcache switches it OFF, latched ONCE at device creation;
 // OFF = -initWithDevice:descriptor:iosurface:plane: and -dealloc run the per-texture import exactly as before (`_impShared` stays NO).
 //  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused (512 MiB in WindowServer).
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
@@ -1033,6 +1033,11 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
         .extent = { (uint32_t)w, (uint32_t)h, 1 }, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = superUse, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (garnet_async_compute_use_concurrent_image(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi, 0)) {
+        ic.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        ic.queueFamilyIndexCount = 2;
+        ic.pQueueFamilyIndices = RDNA4R.sharedQfis;
+    }
     VkImage optImg = VK_NULL_HANDLE;
     if (vkCreateImage(RDNA4R.dev, &ic, NULL, &optImg) != VK_SUCCESS) return NO;
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(RDNA4R.dev, optImg, &mr);
@@ -1056,6 +1061,11 @@ static BOOL rdna4_vs_try_bind(IOSurfaceRef s, void *base, size_t ialloc, size_t 
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
     VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &emb,
         .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    if (garnet_async_compute_use_concurrent_buffer(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi)) {
+        bc.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bc.queueFamilyIndexCount = 2;
+        bc.pQueueFamilyIndices = RDNA4R.sharedQfis;
+    }
     VkBuffer entryIbuf = VK_NULL_HANDLE;
     if (vkCreateBuffer(RDNA4R.dev, &bc, NULL, &entryIbuf) != VK_SUCCESS ||
         vkBindBufferMemory(RDNA4R.dev, entryIbuf, entryImem, 0) != VK_SUCCESS) {
@@ -1141,7 +1151,7 @@ GARNET_INTERNAL void rdna4_vs_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Metal API gap census fixes (an internal design note). Shared pieces:
+// Metal API gap census fixes (driver design). Shared pieces:
 //   RDNA4_ONCE          one log line per call site per process (no-op stubs are called thousands of times a second by the compositor)
 //   RDNA4_RES_IVARS /   state + the public/SPI MTLResource surface that QuartzCore / SkyLight send to every texture and buffer
 //   RDNA4_RESOURCE_SPI  (census: -setResponsibleProcess: 7450, -protectionOptions 6741, -heap 1397, -virtualAddress 1092 in 45 s)
@@ -1238,11 +1248,17 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
 // The heap owns physical memory, not the Metal resource object. A dedicated block must
 // outlive the resource's Vulkan handles until the completion point, so retain this small
 // handle owner in the lease instead of a raw RDNA4Buffer/RDNA4Texture pointer.
+@interface RDNA4HeapBacking (RDNA4HeapHandleState)
+- (void)rdna4MarkHandleOpen;
+- (BOOL)rdna4ConsumeHandleOpen;
+@end
+
 @implementation RDNA4HeapBacking {
     VkBuffer _buffer;
     VkImage _image;
     NSMutableArray<NSNumber *> *_views;
     BOOL _destroyed;
+    BOOL _handleOpen;
 }
 - (instancetype)initWithBuffer:(VkBuffer)buffer image:(VkImage)image view:(VkImageView)view {
     self = [super init];
@@ -1252,6 +1268,16 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
     _views = [NSMutableArray array];
     if (view) [_views addObject:@((uintptr_t)view)];
     return self;
+}
+- (void)rdna4MarkHandleOpen {
+    @synchronized (self) { _handleOpen = YES; }
+}
+- (BOOL)rdna4ConsumeHandleOpen {
+    @synchronized (self) {
+        BOOL was = _handleOpen;
+        _handleOpen = NO;
+        return was;
+    }
 }
 - (void)addView:(VkImageView)view {
     if (!view) return;
@@ -1345,8 +1371,15 @@ static void *rdna4nc_owned_allocate(uint64_t len, uint64_t hostAlign, uint64_t *
                 return nil;
             }
             _hpSize = (NSUInteger)mr.size;
-            if (![heap rdna4AcquireBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr dedicated:dedicated hostImport:heapImport
-                                                mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
+            BOOL acquired = [heap rdna4AcquireBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr dedicated:dedicated hostImport:heapImport
+                                                           mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err];
+            if (!acquired && dedicated && !requiresDedicated) {
+                if (err) *err = nil;
+                dedicated = NO;
+                acquired = [heap rdna4AcquireBackingForBuffer:_vkbuf image:VK_NULL_HANDLE requirements:mr dedicated:NO hostImport:heapImport
+                                                          mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err];
+            }
+            if (!acquired) {
                 [self rdna4AbortHeapConstruction];
                 return nil;
             }
@@ -1675,7 +1708,7 @@ static void rdna4nc_region_summary(void *p, NSUInteger len, char *out, size_t ca
 - (MTLStorageMode)storageMode { return (MTLStorageMode)((_opts >> 4) & 0xF); }
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)(_opts & 0xF); }
 - (MTLHazardTrackingMode)hazardTrackingMode { return (MTLHazardTrackingMode)((_opts >> 8) & 0x3); }
-- (void)didModifyRange:(NSRange)r { (void)r; }   // Shared memory is coherent
+- (void)didModifyRange:(NSRange)r { rdna4_argument_note_dirty_range(self, r); }   // Shared memory is coherent; notify incremental argscan cache if present
 // ---- gap census: MTLResource / MTLBuffer surface sent by QuartzCore, SkyLight and Metal ----
 RDNA4_RESOURCE_SPI
 - (NSUInteger)allocatedSize { return _hpHeap ? _hpSize : (_asz ? _asz : _len); }
@@ -1932,7 +1965,9 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
         return NO;
     }
     if (!rdna4swz_is_identity(rdna4_swz_from_mtl(d.swizzle))) p->canRT = NO;
-    p->wantSt = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    // Vulkan forbids VK_IMAGE_USAGE_STORAGE_BIT on multisample images without shaderStorageImageMultisample;
+    // MSAA textures with RenderTarget/ShaderRead (e.g., ANGLE WebGL) omit STORAGE_BIT while staying renderable/sampled.
+    p->wantSt = (d.usage & MTLTextureUsageShaderWrite) != 0 && p->td.samples <= 1;
     if (p->wantSt && !(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
         if (err) *err = rdna4_err(40, [NSString stringWithFormat:@"pixel format %lu (vk %d) has no storage-image support on RADV (features 0x%x)",
             (unsigned long)d.pixelFormat, p->fmt->vk, ff]);
@@ -2119,8 +2154,15 @@ GARNET_INTERNAL BOOL rdna4_heap_image_plan_make(MTLTextureDescriptor *d, BOOL al
                 return nil;
             }
             _hpSize = (NSUInteger)mr.size;
-            if (![heap rdna4AcquireBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr dedicated:dedicated hostImport:NO
-                                                mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err]) {
+            BOOL acquired = [heap rdna4AcquireBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr dedicated:dedicated hostImport:NO
+                                                           mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err];
+            if (!acquired && dedicated && !requiresDedicated) {
+                if (err) *err = nil;
+                dedicated = NO;
+                acquired = [heap rdna4AcquireBackingForBuffer:VK_NULL_HANDLE image:_img requirements:mr dedicated:NO hostImport:NO
+                                                          mem:&hmem offset:&bindOff map:&map block:&_hpBlk lease:&_hpLease rangeSize:&rangeSize error:err];
+            }
+            if (!acquired) {
                 [self rdna4AbortHeapConstruction];
                 return nil;
             }
@@ -2387,7 +2429,7 @@ RDNA4_DNR(RDNA4Texture)
     if (d.textureType != MTLTextureType2D || d.depth != 1 || d.arrayLength != 1 || d.mipmapLevelCount != 1 || d.sampleCount != 1) IOSFAIL(72, @"only single 2D textures (no mips/array/MSAA)");
     size_t pc = IOSurfaceGetPlaneCount(s);
     // P2: a plane p < planeCount of a 2- or 3-plane surface is accepted (CoreAnimation makes one texture per plane of a bi-planar YUV surface). The kill file
-    // /private/tmp/rdna4m-noplanes (latched once per process) restores the old refusal of every multi-plane surface.
+    // /private/tmp/garnet-noplanes (latched once per process) restores the old refusal of every multi-plane surface.
     static int noplanes = -1; if (noplanes < 0) { noplanes = rdna4_sb_access_exists(RDNA4_NOPLANES_FILE) ? 1 : 0; if (noplanes) RDNA4LOG("P2 planes: multi-plane IOSurfaces REFUSED (kill file " RDNA4_NOPLANES_FILE " exists; latched for the life of this process)"); }
     if (pc > 1 && noplanes) IOSFAIL(73, @"IOSurface has %zu planes; single-plane surfaces only", pc);
     size_t pidx = pc > 1 ? plane : 0;   // pc <= 1: any plane != 0 is refused by rdna4pl_geom below, exactly as before
@@ -2429,6 +2471,11 @@ RDNA4_DNR(RDNA4Texture)
                                 ((d.usage & MTLTextureUsageShaderWrite) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
         VkImageCreateInfo nic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = nbu, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        if (garnet_async_compute_use_concurrent_image(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi, 0)) {
+            nic.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            nic.queueFamilyIndexCount = 2;
+            nic.pQueueFamilyIndices = RDNA4R.sharedQfis;
+        }
         VkResult nr = vkCreateImage(RDNA4R.dev, &nic, NULL, &_img);
         if (nr != VK_SUCCESS) { _img = VK_NULL_HANDLE; IOSFAIL(85, @"vkCreateImage(optimal, no CPU mapping) = %d", nr); }
         VkMemoryRequirements nmr; vkGetImageMemoryRequirements(RDNA4R.dev, _img, &nmr);
@@ -2535,6 +2582,11 @@ RDNA4_DNR(RDNA4Texture)
         VkExternalMemoryImageCreateInfo emi = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
         VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &emi, .flags = liFlags, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        if (garnet_async_compute_use_concurrent_image(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi, 0)) {
+            ic.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            ic.queueFamilyIndexCount = 2;
+            ic.pQueueFamilyIndices = RDNA4R.sharedQfis;
+        }
         VkImage li = VK_NULL_HANDLE; r = vkCreateImage(RDNA4R.dev, &ic, NULL, &li);
         if (r != VK_SUCCESS) RDNA4LOGR("newTexture(iosurface): path (a) unavailable: linear vkCreateImage = %d", r);
         else {
@@ -2550,7 +2602,9 @@ RDNA4_DNR(RDNA4Texture)
                 VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierQuery = {
                     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
                     .drmFormatModifier = 0,
-                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+                    .sharingMode = ic.sharingMode,
+                    .queueFamilyIndexCount = ic.queueFamilyIndexCount,
+                    .pQueueFamilyIndices = ic.pQueueFamilyIndices };
                 VkPhysicalDeviceImageFormatInfo2 formatQuery = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
                     .pNext = &modifierQuery, .format = ic.format, .type = ic.imageType,
                     .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, .usage = ic.usage, .flags = ic.flags };
@@ -2620,6 +2674,11 @@ RDNA4_DNR(RDNA4Texture)
     if (!_vramSurfCached && !_iosLinear) {   // path (b): optimal device-local image + a VkBuffer over the import
         VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = (_usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0, .imageType = VK_IMAGE_TYPE_2D, .format = _fmt->vk, .extent = { (uint32_t)_w, (uint32_t)_h, 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        if (garnet_async_compute_use_concurrent_image(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi, 0)) {
+            ic.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            ic.queueFamilyIndexCount = 2;
+            ic.pQueueFamilyIndices = RDNA4R.sharedQfis;
+        }
         r = vkCreateImage(RDNA4R.dev, &ic, NULL, &_img);
         if (r != VK_SUCCESS) { _img = VK_NULL_HANDLE; IOSFAIL(85, @"vkCreateImage(optimal) = %d", r); }
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(RDNA4R.dev, _img, &mr);
@@ -2646,6 +2705,11 @@ RDNA4_DNR(RDNA4Texture)
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
         VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &emb,
             .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+        if (garnet_async_compute_use_concurrent_buffer(RDNA4R.asyncComputeOn ? 1 : 0, RDNA4R.qfi, RDNA4R.computeQfi)) {
+            bc.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            bc.queueFamilyIndexCount = 2;
+            bc.pQueueFamilyIndices = RDNA4R.sharedQfis;
+        }
         r = vkCreateBuffer(RDNA4R.dev, &bc, NULL, &_ibuf);
         if (r != VK_SUCCESS) { _ibuf = VK_NULL_HANDLE; IOSFAIL(89, @"vkCreateBuffer(import) = %d", r); }
         r = vkBindBufferMemory(RDNA4R.dev, _ibuf, _imem, 0);
@@ -3179,7 +3243,9 @@ static uint64_t rdna4_heap_completed_serial(void) {
         if (!rdna4hb_finalize_candidate(&_hb, &lease, &block, &owner)) break;
         id backing = (__bridge_transfer id)owner;
         if ([backing respondsToSelector:@selector(destroyHandles)]) [backing destroyHandles];
-        rdna4hb_handle_close(&_hb, block);
+        if (![backing isKindOfClass:[RDNA4HeapBacking class]] ||
+            [(RDNA4HeapBacking *)backing rdna4ConsumeHandleOpen])
+            rdna4hb_handle_close(&_hb, block);
         rdna4hb_finalized(&_hb, lease);
     }
     // A lease abandoned before bind has no owner, and an object that already destroyed
@@ -3187,14 +3253,28 @@ static uint64_t rdna4_heap_completed_serial(void) {
     for (size_t i = 0; i < _hb.nlease;) {
         rdna4hb_lease *lease = &_hb.lease[i];
         const rdna4hb_block *block = rdna4hb_find_block_const(&_hb, lease->block);
-        if (lease->dedicated && lease->retired && !lease->owner && block && !block->handles) {
+        if (lease->retired && !lease->owner && block && !block->handles) {
             uint64_t lease_id = lease->id;
-            rdna4hb_finalized(&_hb, lease_id);
+            rdna4hb_finalized_retired(&_hb, lease_id);
             i = 0;
         } else i++;
     }
     rdna4hb_reclaim block;
     while (rdna4hb_take_reclaimable(&_hb, &block)) [self rdna4FreeBlockLocked:block];
+}
+- (void)rdna4EvictRetiredBlocksLocked {
+    [self rdna4CollectLocked];
+    for (;;) {
+        uint64_t lease = 0, block = 0; void *owner = NULL;
+        if (!rdna4hb_evict_candidate(&_hb, &lease, &block, &owner)) break;
+        id backing = (__bridge_transfer id)owner;
+        if ([backing respondsToSelector:@selector(destroyHandles)]) [backing destroyHandles];
+        if (![backing isKindOfClass:[RDNA4HeapBacking class]] ||
+            [(RDNA4HeapBacking *)backing rdna4ConsumeHandleOpen])
+            rdna4hb_handle_close(&_hb, block);
+        rdna4hb_finalized_retired(&_hb, lease);
+    }
+    [self rdna4CollectLocked];
 }
 - (BOOL)rdna4AcquireBackingForBuffer:(VkBuffer)buffer image:(VkImage)image requirements:(VkMemoryRequirements)mr
                            dedicated:(BOOL)dedicated hostImport:(BOOL)hostImport
@@ -3243,7 +3323,7 @@ static uint64_t rdna4_heap_completed_serial(void) {
                 *rangeSize = res.range_size;
                 return YES;
             }
-            if (action == RDNA4HB_R_RETRY) { [self rdna4CollectLocked]; continue; }
+            if (action == RDNA4HB_R_RETRY) { [self rdna4EvictRetiredBlocksLocked]; continue; }
             if (action != RDNA4HB_R_NEED_BLOCK) {
                 if (err) *err = rdna4_err(22, [NSString stringWithFormat:@"no physical heap backing for %llu bytes (backing %llu of %llu)",
                                                (unsigned long long)mr.size, (unsigned long long)_hb.backing, (unsigned long long)_hb.size]);
@@ -3501,8 +3581,13 @@ static uint64_t rdna4_heap_completed_serial(void) {
             RDNA4LOG_ERR("heap: backing lease %llu disappeared before bind", (unsigned long long)lease);
             return NO;
         }
-        if (!found->dedicated) return YES;
+        if (found->placement) {
+            if ([owner isKindOfClass:[RDNA4HeapBacking class]])
+                [(RDNA4HeapBacking *)owner rdna4MarkHandleOpen];
+            return YES;
+        }
         if (!owner) {
+            if (!found->dedicated) return YES;
             rdna4hb_handle_close(&_hb, block);
             RDNA4LOG_ERR("heap: dedicated block %llu has no lifecycle owner", (unsigned long long)block);
             return NO;
@@ -3515,12 +3600,23 @@ static uint64_t rdna4_heap_completed_serial(void) {
             RDNA4LOG_ERR("heap: failed to attach the lifecycle owner to lease %llu", (unsigned long long)lease);
             return NO;
         }
+        if ([owner isKindOfClass:[RDNA4HeapBacking class]])
+            [(RDNA4HeapBacking *)owner rdna4MarkHandleOpen];
         return YES;
     }
 }
 - (void)rdna4AbandonBacking:(uint64_t)lease {
     if (!lease) return;
     @synchronized (self) {
+        rdna4hb_lease *found = rdna4hb_find_lease(&_hb, lease);
+        if (found && found->owner) {
+            void *owner = found->owner;
+            found->owner = NULL;
+            id retained = (__bridge_transfer id)owner;
+            if ([retained isKindOfClass:[RDNA4HeapBacking class]])
+                (void)[(RDNA4HeapBacking *)retained rdna4ConsumeHandleOpen];
+            if ([retained respondsToSelector:@selector(destroyHandles)]) [retained destroyHandles];
+        }
         rdna4hb_release(&_hb, lease, 0);
         rdna4hb_reap(&_hb, 0);
         [self rdna4CollectLocked];
@@ -3545,12 +3641,16 @@ static uint64_t rdna4_heap_completed_serial(void) {
             return;
         }
         [backing destroyHandles];
-        if (block) rdna4hb_handle_close(&_hb, block);
+        BOOL shouldClose = !backing || [backing rdna4ConsumeHandleOpen];
+        if (block && shouldClose) rdna4hb_handle_close(&_hb, block);
         found = rdna4hb_find_lease(&_hb, lease);
         void *owner = found ? found->owner : NULL;
         if (owner && rdna4hb_lease_owner_clear(&_hb, lease, (__bridge void *)backing)) {
             id retained = (__bridge_transfer id)owner;
             if ([retained respondsToSelector:@selector(destroyHandles)]) [retained destroyHandles];
+            found = rdna4hb_find_lease(&_hb, lease);
+            if (found && found->retired && !found->dedicated)
+                rdna4hb_finalized_retired(&_hb, lease);
         }
         [self rdna4CollectLocked];
     }

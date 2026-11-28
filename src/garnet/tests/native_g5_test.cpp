@@ -1,4 +1,4 @@
-// native_g5_test.cpp - kext 0.0.650 (GPU-apps stage G5 Stage 1: the application credit; an internal design note "G5 design" and "G5 Stage 1 build spec"): the pure half
+// native_g5_test.cpp - kext 0.0.650 (GPU-apps stage G5 Stage 1: the application credit; per-app GPU credit accounting): the pure half
 // (amd/garnet_app_credit_pure.h) driven directly and through a simulation of the ring (WindowServer every 10.7 ms, three apps with 50 ms jobs, the GPU retiring in FIFO order) that calls
 // the very function the kernel calls (g5::admission), plus source pins that tie the REAL kernel code (amd/native_s1c.cpp, GarnetDriver.cpp, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \

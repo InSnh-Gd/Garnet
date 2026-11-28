@@ -1,0 +1,252 @@
+From: Garnet RDNA4 Darwin <garnet@local>
+Subject: [PATCH 33/33] radv/darwin: use ABI 1.14 WebKit-silent APP selector aliases on GarnetAccelerator
+
+Sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.14
+(reserving selector 29, rdna4n_info.flags bit 7, and seqno bit 61 for
+VCN 5.0 ABI 1.15; adding WebKit-silent APP aliases 30/31/39 for
+BOCREATE/BO_IMPORT_HOST/BUFFER_COPY and info flags bits 8..10).
+
+Route RADV's GarnetAccelerator APP connection through selectors 30/31/39
+when the kernel reports ABI minor >= 14, falling back automatically to
+legacy selectors 3/21/27 on ABI <= 13 kernels and on the GarnetDriver route.
+---
+--- a/include/darwin/rdna4_native_abi.h
++++ b/include/darwin/rdna4_native_abi.h
+@@ -26,7 +26,7 @@
+ 
+ #define RDNA4N_UC_TYPE       0x47524E54u      /* 'GRNT' */
+ #define RDNA4N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, rdna4native, s1d-replay) still handshakes */
+-#define RDNA4N_ABI_MINOR     13u           /* 1.13: GFX12 Sparse/PRT VM support (RDNA4N_CAP_VM_PRT in rdna4n_info.flags; RDNA4N_VA_OP_CLEAR, RDNA4N_VA_OP_REPLACE, and RDNA4N_VM_PAGE_PRT with handle == 0; no new selector, no struct size changes). 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 RDNA4N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args garnet-m6=1 AND garnet-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); RDNA4N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): rdna4n_info.reserved[3..7] report the session's VRAM budget (RDNA4N_INFO_R_* / RDNA4N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args garnet-apps=1 + garnet-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
++#define RDNA4N_ABI_MINOR     14u           /* 1.14: WebKit-silent APP selector aliases 30 (BOCREATE), 31 (BO_IMPORT_HOST), 39 (BUFFER_COPY) and kernel-authoritative rdna4n_info.flags bits 8..10 (READY, DISPLAY_ACTIVE, KILL_SWITCH); reserves selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 (ABI 1.15). 1.13: GFX12 Sparse/PRT VM support (RDNA4N_CAP_VM_PRT in rdna4n_info.flags; RDNA4N_VA_OP_CLEAR, RDNA4N_VA_OP_REPLACE, and RDNA4N_VM_PAGE_PRT with handle == 0; no new selector, no struct size changes). 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 RDNA4N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args garnet-m6=1 AND garnet-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); RDNA4N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): rdna4n_info.reserved[3..7] report the session's VRAM budget (RDNA4N_INFO_R_* / RDNA4N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args garnet-apps=1 + garnet-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 RDNA4N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the RDNA4N user client is renamed IOAccelGarnetNativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'GRNT' are unchanged), and a uid-88 caller is admitted behind the boot-arg garnet-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 RDNA4N_SEL_METAL_NUB_PUBLISH and 20 RDNA4N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software GarnetMetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg garnet-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 RDNA4N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 RDNA4N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, RDNA4N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg garnet-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in rdna4n_info.reserved[2]. */
+ #define RDNA4N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define RDNA4N_MAX_IBS       64u
+ #define RDNA4N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+@@ -34,7 +34,8 @@
+ #define RDNA4N_FENCE_SLOTS   16u
+ #define RDNA4N_WAIT_CAP_NS   2000000000ull
+ #define RDNA4N_SEQ_LAST      0xFFFFFFFFFFFFFFFFull   /* WaitSeq: "last emitted at entry" (GFX ring) */
+-#define RDNA4N_SEQ_RING_COMPUTE (1ull << 62)         /* Tag bit identifying a KCQ/compute-ring seqno (raw seqno in bits 61:0) */
++#define RDNA4N_SEQ_RING_COMPUTE (1ull << 62)         /* Tag bit identifying a KCQ/compute-ring seqno (raw seqno in bits 60:0) */
++/* Seqno tag bit 61 (1ull << 61) reserved for enable-rdna4-vcn5-video (RDNA4N_SEQ_RING_VCN, ABI 1.15). */
+ 
+ /* ---- selectors of the native client (own numbering; type 0 is the legacy GarnetUserClient) ---------------- */
+ enum {
+@@ -82,7 +83,13 @@
+     RDNA4N_SEL_SCANX_RELEASE  = 26, /* in: [0] instance (2)   out: [0] restore of A verified (1/0) [1] plane MC after; idempotent */
+     RDNA4N_SEL_COUNT_1_11     = 27,
+     RDNA4N_SEL_BUFFER_COPY   = 27,
+-    RDNA4N_SEL_BUFFER_FILL   = 28
++    RDNA4N_SEL_BUFFER_FILL   = 28,
++    /* Selector 29 reserved for enable-rdna4-vcn5-video (RDNA4N_SEL_QUERY_VIDEO, ABI 1.15). */
++    /* ---- ABI 1.14: WebKit-silent APP selector aliases (match com.apple.WebKit.GPUProcess.sb IOAccelerator allow-list). ---- */
++    RDNA4N_SEL_BOCREATE_APP       = 30, /* alias of RDNA4N_SEL_BOCREATE (3) */
++    RDNA4N_SEL_BO_IMPORT_HOST_APP = 31, /* alias of RDNA4N_SEL_BO_IMPORT_HOST (21) */
++    RDNA4N_SEL_BUFFER_COPY_APP    = 39, /* alias of RDNA4N_SEL_BUFFER_COPY (27) */
++    RDNA4N_SEL_COUNT_1_14         = 40
+ };
+ 
+ #define RDNA4N_BUFFER_MAX_BYTES (1024u * 1024u)
+@@ -208,6 +215,10 @@
+ #define RDNA4N_CAP_VM_PRT         (1u << 4)   /* ABI 1.13: kernel supports CLEAR/REPLACE and GFX12 PRT (0 on ABI <= 1.12 kernels) */
+ #define RDNA4N_CAP_GFX12_DCC      (1u << 5)   /* GFX12 PTE.DCC (bit 58) enabled for NO_CPU_ACCESS VRAM BOs with RDNA4N_GEM_GFX12_DCC (kill-switch: garnet-dcc=0) */
+ #define RDNA4N_CAP_ASYNC_COMPUTE  (1u << 6)   /* Dedicated MEC async compute ring (RDNA4N_HW_IP_COMPUTE, seqno bit 62 tag; kill-switch: garnet-async-compute=0) */
++/* Bit 7 (1u << 7) reserved for enable-rdna4-vcn5-video (RDNA4N_CAP_VCN_UNIFIED, ABI 1.15). */
++#define RDNA4N_INFO_READY         (1u << 8)   /* ABI 1.14: GarnetMetalNub published and Garnet,Ready == 1 (not HUNG) */
++#define RDNA4N_INFO_DISPLAY_ACTIVE (1u << 9)  /* ABI 1.14: primary display pipe armed (isHeadless == NO) */
++#define RDNA4N_INFO_KILL_SWITCH   (1u << 10)  /* ABI 1.14: kernel kill switch active (synced with /private/tmp/garnet-off) */
+ /* ABI 1.10 (kext 0.0.640): rdna4n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+  *   reserved[3] = RDNA4N_BUDGET_* flags
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -48,8 +48,15 @@
+    ACD_SEL_SCANX_PRESENT = 24,
+    ACD_SEL_SCANX_STATUS = 25,
+    ACD_SEL_SCANX_RELEASE = 26,
++   /* ABI 1.14: WebKit-silent APP selector aliases (selector 29 reserved for VCN 5.0) */
++   ACD_SEL_BO_CREATE_APP = 30,
++   ACD_SEL_BO_IMPORT_HOST_APP = 31,
++   ACD_SEL_BUFFER_COPY_APP = 39,
+ };
+ 
++/* The first ABI minor with WebKit-silent APP selector aliases (30, 31, 39). */
++#define ACD_ABI_MINOR_WEBKIT_SAFE_APP 14
++
+ /* The first ABI minor with GFX12 sparse/PRT VM support (RDNA4N_CAP_VM_PRT, CLEAR/REPLACE/PRT). */
+ #define ACD_ABI_MINOR_VM_PRT 13
+ 
+@@ -111,6 +118,8 @@
+ #define ACD_SERVICE_ACCELERATOR "GarnetAccelerator"
+ int acd_kext_set_service_class(const char *cls);
+ const char *acd_kext_service_class(void);
++void acd_kext_set_accel_route(struct acd_kext *k, bool is_accel_route);
++uint32_t acd_kext_select_app_selector(uint32_t sel, bool is_accel_route, uint32_t abi_minor);
+ int acd_kext_open_iokit(struct acd_kext **out);      /* ac_darwin_iokit.c */
+ int acd_mock_open(struct acd_kext **out);            /* ac_darwin_mock.c */
+ 
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -73,6 +73,12 @@
+ _Static_assert(RDNA4N_CAP_VM_PRT == (1u << 4), "vm prt capability bit");
+ _Static_assert(RDNA4N_CAP_GFX12_DCC == (1u << 5), "gfx12 dcc capability bit");
+ _Static_assert(RDNA4N_CAP_ASYNC_COMPUTE == (1u << 6), "async compute capability bit");
++_Static_assert(ACD_SEL_BO_CREATE_APP == RDNA4N_SEL_BOCREATE_APP &&
++               ACD_SEL_BO_IMPORT_HOST_APP == RDNA4N_SEL_BO_IMPORT_HOST_APP &&
++               ACD_SEL_BUFFER_COPY_APP == RDNA4N_SEL_BUFFER_COPY_APP,
++               "ABI 1.14 WebKit-silent APP alias selector numbers");
++_Static_assert(RDNA4N_INFO_READY == (1u << 8) && RDNA4N_INFO_DISPLAY_ACTIVE == (1u << 9) &&
++               RDNA4N_INFO_KILL_SWITCH == (1u << 10), "ABI 1.14 info flags");
+ _Static_assert(RDNA4N_HW_IP_COMPUTE == AMDGPU_HW_IP_COMPUTE, "compute ip_type");
+ _Static_assert(RDNA4N_SEQ_RING_COMPUTE == (1ull << 62), "compute seqno tag bit");
+ _Static_assert(RDNA4N_CTX_OP_ALLOC == AMDGPU_CTX_OP_ALLOC_CTX && RDNA4N_CTX_OP_FREE == AMDGPU_CTX_OP_FREE_CTX &&
+@@ -90,6 +96,8 @@
+ struct acd_kext {
+    struct acd_kext_ops ops;
+    void *ctx;
++   bool is_accel_route;
++   atomic_uint abi_minor;
+    atomic_bool submit_lost;
+    atomic_int buffer_support;
+    atomic_int vm_prt_support;
+@@ -129,6 +137,8 @@
+    }
+    k->ops = *ops;
+    k->ctx = ctx;
++   k->is_accel_route = false;
++   atomic_init(&k->abi_minor, 0u);
+    atomic_init(&k->submit_lost, false);
+    atomic_init(&k->buffer_support, 0);
+    atomic_init(&k->vm_prt_support, 0);
+@@ -136,6 +146,27 @@
+ }
+ 
+ void
++acd_kext_set_accel_route(struct acd_kext *k, bool is_accel_route)
++{
++   if (k)
++      k->is_accel_route = is_accel_route;
++}
++
++uint32_t
++acd_kext_select_app_selector(uint32_t sel, bool is_accel_route, uint32_t abi_minor)
++{
++   if (!is_accel_route || abi_minor < ACD_ABI_MINOR_WEBKIT_SAFE_APP)
++      return sel;
++   if (sel == ACD_SEL_BO_CREATE)
++      return ACD_SEL_BO_CREATE_APP;
++   if (sel == ACD_SEL_BO_IMPORT_HOST)
++      return ACD_SEL_BO_IMPORT_HOST_APP;
++   if (sel == RDNA4N_SEL_BUFFER_COPY)
++      return ACD_SEL_BUFFER_COPY_APP;
++   return sel;
++}
++
++void
+ acd_kext_destroy(struct acd_kext *k)
+ {
+    if (!k)
+@@ -177,7 +208,7 @@
+    case ACD_KR_NOT_FOUND:
+       return -ENOENT;
+    case ACD_KR_UNSUPPORTED:
+-      return sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_FILL ? -ENOSYS :
++      return sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_COPY_APP || sel == RDNA4N_SEL_BUFFER_FILL ? -ENOSYS :
+              sel == ACD_SEL_HELLO ? -ENODEV : -EINVAL;
+    case ACD_KR_NO_MEMORY:
+    case ACD_KR_NO_RESOURCES:
+@@ -187,7 +218,7 @@
+    case ACD_KR_EXCLUSIVE_ACCESS:
+       return -EBUSY;
+    case ACD_KR_NOT_PRIVILEGED:
+-      if (sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_FILL)
++      if (sel == RDNA4N_SEL_BUFFER_COPY || sel == RDNA4N_SEL_BUFFER_COPY_APP || sel == RDNA4N_SEL_BUFFER_FILL)
+          return -ENOSYS;
+       return -EACCES;
+    case ACD_KR_NOT_PERMITTED:
+@@ -236,7 +267,7 @@
+ {
+    int kr = k->ops.call(k->ctx, sel, sin, nsin, stin, stinsz, sout, nsout, stout, stoutsz);
+    const int r = acd_kr_to_errno(sel, kr);
+-   if (r && sel == ACD_SEL_BO_IMPORT_HOST)
++   if (r && (sel == ACD_SEL_BO_IMPORT_HOST || sel == ACD_SEL_BO_IMPORT_HOST_APP))
+       fprintf(stderr,
+               "radv-darwin: host import failed pid=%ld sel=%u host=0x%llx size=%llu flags=0x%llx gpuVA=0x%llx "
+               "IOReturn=0x%08x errno=%d\n",
+@@ -304,6 +335,7 @@
+       out->build = (uint32_t)sout[1];
+       out->max_ibs = (uint32_t)sout[2];
+       out->vmid = (uint32_t)sout[3];
++      atomic_store(&k->abi_minor, out->minor);
+       return 0;
+    }
+    return -EINVAL;
+@@ -319,6 +351,8 @@
+       return r;
+    if (sz != sizeof(*info))
+       return -EIO;
++   if (atomic_load(&k->abi_minor) == 0u && info->reserved[2] != 0u)
++      atomic_store(&k->abi_minor, info->reserved[2]);
+    atomic_store(&k->vm_prt_support, (info->flags & RDNA4N_CAP_VM_PRT) ? 1 : -1);
+    return 0;
+ }
+@@ -341,7 +375,8 @@
+ {
+    uint64_t sout[4] = {0};
+    uint32_t nout = 4;
+-   int r = kcall(k, ACD_SEL_BO_CREATE, NULL, 0, in, sizeof(*in), sout, &nout, NULL, NULL);
++   const uint32_t sel = acd_kext_select_app_selector(ACD_SEL_BO_CREATE, k->is_accel_route, atomic_load(&k->abi_minor));
++   int r = kcall(k, sel, NULL, 0, in, sizeof(*in), sout, &nout, NULL, NULL);
+    if (r)
+       return r;
+    if (nout != 4 || sout[0] == 0 || sout[0] >= RDNA4N_MAX_BOS)
+@@ -369,7 +404,8 @@
+    uint64_t sout[4] = {0};
+    uint32_t nout = 4;
+    acd_sfence();
+-   int r = kcall(k, ACD_SEL_BO_IMPORT_HOST, sin, 4, NULL, 0, sout, &nout, NULL, NULL);
++   const uint32_t sel = acd_kext_select_app_selector(ACD_SEL_BO_IMPORT_HOST, k->is_accel_route, atomic_load(&k->abi_minor));
++   int r = kcall(k, sel, sin, 4, NULL, 0, sout, &nout, NULL, NULL);
+    if (r)
+       return r;
+    if (nout != 4 || sout[0] == 0 || sout[0] >= RDNA4N_MAX_BOS)
+@@ -800,8 +836,10 @@
+    uint64_t out = 0;
+    uint32_t nout = 1;
+    acd_sfence();
+-   int r = kcall(k, fill ? RDNA4N_SEL_BUFFER_FILL : RDNA4N_SEL_BUFFER_COPY,
+-                 NULL, 0, op, sizeof(*op), &out, &nout, NULL, NULL);
++   const uint32_t sel = fill ? RDNA4N_SEL_BUFFER_FILL
++                             : acd_kext_select_app_selector(RDNA4N_SEL_BUFFER_COPY, k->is_accel_route,
++                                                            atomic_load(&k->abi_minor));
++   int r = kcall(k, sel, NULL, 0, op, sizeof(*op), &out, &nout, NULL, NULL);
+    if (r)
+       return r;
+    if (nout != 1 || !out) {
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -11,6 +11,7 @@
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ 
+ #include <IOKit/IOKitLib.h>
+@@ -110,5 +111,7 @@
+       .close = iokit_close,
+    };
+    *out = acd_kext_create(&ops, c);
++   if (*out && !strcmp(svc_class, ACD_SERVICE_ACCELERATOR))
++      acd_kext_set_accel_route(*out, true);
+    return *out ? 0 : -ENOMEM;
+ }
+--- a/src/amd/common/darwin/ac_darwin_mock.c
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -763,6 +763,7 @@
+       *stoutsz = sin[1] * 4;
+       break;
+    }
++   case ACD_SEL_BO_CREATE_APP:
+    case ACD_SEL_BO_CREATE:
+       NEED(shape(0, 4, sizeof(struct rdna4n_gem_create_in), 0));
+       kr = do_bo_create(m, stin, sout);

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -20,8 +21,7 @@ import export_fingerprint as ef  # noqa: E402
 def make_synthetic_layout(tmp: Path) -> Path:
     gates_dir = REPO / "src" / "garnet-accel" / "gates"
     leaves = ef.load_leaves_spec(gates_dir)
-    # Match EXPECT_CLASSES (13) and EXPECT_SLOTS (2720) with exact parent slot counts
-    # if present in build-offline, otherwise distribute deterministic synthetic counts.
+    # Match EXPECT_CLASSES (13) and EXPECT_SLOTS (2720) with exact parent slot counts.
     sample_counts = {
         "IOGraphicsAccelerator2": (3544, 350),
         "IOAccelEventMachineFast2": (3376, 95),
@@ -168,8 +168,11 @@ class ExportFingerprintTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ef.build_fingerprint(layout_dir, self.gates_dir)
 
-    def test_real_25g332_layout_if_present(self):
-        real_layout = REPO / "build-offline" / "vm-25G332" / "layout-25G332"
+    def test_real_layout_if_present(self):
+        env_layout = os.environ.get("GARNET_LAYOUT_OUT")
+        if not env_layout:
+            return
+        real_layout = Path(env_layout)
         if not (real_layout / "model.json").is_file():
             return
         fp = ef.build_fingerprint(real_layout, self.gates_dir)

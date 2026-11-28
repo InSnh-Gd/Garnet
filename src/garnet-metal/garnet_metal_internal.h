@@ -268,7 +268,7 @@ GARNET_INTERNAL_EXTERN const char *garnet_getenv(const char *newName, const char
     - (void)useResourceGroup:(id)g usage:(NSUInteger)u stages:(NSUInteger)st { (void)g; (void)u; (void)st; RDNA4_ONCE("useResourceGroup: ignored"); }
 #define RDNA4F_A8   1u
 #define RDNA4F_SINT 8u
-#define RDNA4F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/rdna4m-nouint restores the old refusal. (2u is RDNA4F_DS below.)
+#define RDNA4F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/garnet-nouint restores the old refusal. (2u is RDNA4F_DS below.)
 #define RDNA4F_BC   16u  // 4x4 block-compressed format; bpp holds bytes per 4x4 block (8 or 16)
 #define RDNA4_HAS_MULTI_DRAW_INDIRECT 1
 #define RDNA4_HAS_MESH_PIPELINE_QUERY 1
@@ -745,10 +745,11 @@ typedef struct { _Atomic int on; int fd; uint64_t bytes; int capped; uint64_t in
 typedef struct {
     pthread_mutex_t mu;
     int gateDone, killed, envDirty;       // read once per process (never in WindowServer)
-    int dirState;                         // 0 not set up, 1 ready, -1 unavailable (retried a few times: a sandboxed cache dir may not exist yet)
+    int dirState;                         // 0 not set up, 1 disk ready, 2 Tier-2 64 MiB memory-only fallback, -1 unavailable
     int dirTries; uint64_t dirNextNs;     // bounded retries of a failed setup
     char dir[RDNA4X_PATH_MAX];
     NSString *dirNS;
+    int memcacheInit; rdna4x_memcache_t memcache;
     int engineInit; rdna4x_engine eng;
     int icbXlibTried; rdna4x_xlib icbXlib; char icbXlibErr[256];
     rdna4x_detect_stage_fn detectStage;
@@ -756,7 +757,7 @@ typedef struct {
     rdna4x_translate_linked_libraries_fn translateLinkedLibraries;
     rdna4x_translate_stage3_fn translateStage3;
     int stage2ReaderTried; rdna4x_reader stage2Reader; char stage2ReaderErr[256];
-    int sandboxedDone, sandboxed;
+    int sandboxedLatched;
 } RDNA4XlateState;
 
 // ---- Shared ObjC @interface declarations ----
@@ -2161,8 +2162,10 @@ typedef struct {
     VkAccelerationStructureKHR _vkAS;
     VkDeviceAddress _deviceAddress;
     rdna4rt_kind_t _kind;
+    RDNA4RTStagingBuffer *_localAabbBuf;
 }
 - (instancetype)initWithStorage:(GarnetASStorage *)storage kind:(rdna4rt_kind_t)kind error:(NSError **)err;
+- (VkDeviceAddress)rdna4EnsureLocalAabbAddress:(NSError **)err;
 @end
 
 @interface GarnetAccelerationStructure : _MTLResource {
@@ -3564,6 +3567,7 @@ GARNET_INTERNAL_EXTERN BOOL rdna4s_classify(size_t w, size_t h, uint32_t spf, NS
 GARNET_INTERNAL_EXTERN BOOL rdna4s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const rdna4df_wr_t *wr, int *pinst, int *ptent);
 GARNET_INTERNAL_EXTERN void rdna4s_prebind_on_radv_open(void);
 GARNET_INTERNAL_EXTERN void rdna4_pc_save(const char *why);
+GARNET_INTERNAL_EXTERN void rdna4_pc_maybe_save_after_compile(uint64_t compile_ns, const char *why);
 GARNET_INTERNAL_EXTERN void rdna4_gpl_prewarm_start(void);
 GARNET_INTERNAL_EXTERN int rdna4s_damage_on(void);
 GARNET_INTERNAL_EXTERN int rdna4s_plan(const rdna4df_wr_t *wr, int inst, int tent, rdna4df_plan_t *pl);
@@ -3586,6 +3590,9 @@ GARNET_INTERNAL_EXTERN void rdna4_dump_function(id fn, const char *role, NSMutab
 GARNET_INTERNAL_EXTERN NSError *rdna4_dump_pipeline(MTLRenderPipelineDescriptor *d, BOOL vertexMissing, BOOL fragmentMissing);
 GARNET_INTERNAL_EXTERN BOOL rdna4x_active(void);
 GARNET_INTERNAL_EXTERN NSString *rdna4x_user_dir(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4x_memcache_active(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4x_memcache_lookup(NSString *sha, NSData **outSpv, NSDictionary **outMeta, NSString **outRefusal);
+GARNET_INTERNAL_EXTERN BOOL rdna4x_memcache_store(NSString *sha, const void *spv, size_t spvLen, const void *meta, size_t metaLen);
 GARNET_INTERNAL_EXTERN void rdna4x_touch_hit(NSString *path, NSString *sha);
 GARNET_INTERNAL_EXTERN void rdna4_lk_install(int slot, RDNA4LinkCtx *c);
 GARNET_INTERNAL_EXTERN void rdna4_lk_scope_end(rdna4_lkscope *sc);
@@ -3607,6 +3614,7 @@ GARNET_INTERNAL_EXTERN int rdna4x_module_to_llvm_text(const uint8_t *bytes, size
                                       char **outText, size_t *outLen, char *errBuf, size_t errCap);
 GARNET_INTERNAL_EXTERN BOOL rdna4x_parse_vft_from_meta(NSDictionary *meta, rdna4vft_reflection_t *outVft, NSError **err);
 GARNET_INTERNAL_EXTERN BOOL rdna4x_translate_fn_with_error(id fn, const char *role, uint64_t deadlineNs, NSError **error);
+GARNET_INTERNAL_EXTERN BOOL rdna4x_translate_fn_with_samples(id fn, const char *role, uint64_t deadlineNs, uint32_t rasterSamples, NSError **error);
 GARNET_INTERNAL_EXTERN BOOL rdna4x_array_nonempty(id obj, const char *prop);
 GARNET_INTERNAL_EXTERN id rdna4x_prop(id obj, const char *prop);
 GARNET_INTERNAL_EXTERN BOOL rdna4x_bool_prop(id obj, const char *prop);
@@ -3662,6 +3670,7 @@ GARNET_INTERNAL_EXTERN id<MTLVisibleFunctionTable> rdna4_vft_pipeline_new_table(
 GARNET_INTERNAL_EXTERN BOOL rdna4_vft_validate_render_footnote10(
     id desc, BOOL isMeshDesc, BOOL hasVftMeta, BOOL hasRenderRT, NSError **error);
 GARNET_INTERNAL_EXTERN NSData *rdna4_spv_lookup(id fn, const char *role, NSError **err, NSString **fname, NSDictionary **meta);
+GARNET_INTERNAL_EXTERN NSData *rdna4_spv_lookup_samples(id fn, const char *role, uint32_t rasterSamples, NSError **err, NSString **fname, NSDictionary **meta);
 GARNET_INTERNAL_EXTERN VkShaderModule rdna4_spv_module(const void *code, size_t bytes, const char *role, NSError **err);
 GARNET_INTERNAL_EXTERN NSArray *rdna4_icb_compute_reg_for_device(id dev);
 GARNET_INTERNAL_EXTERN id rdna4_ba_compile_compute_state(id dev, id fn, NSData *spv, NSDictionary *meta, NSString *fname, NSError **err);
@@ -3760,6 +3769,7 @@ GARNET_INTERNAL_EXTERN BOOL rdna4_argument_sampler_intent_matches_ranges(
         BOOL fillOnly);
 GARNET_INTERNAL_EXTERN void rdna4_argument_sampler_store(id buffer, NSUInteger offset, uint64_t value, id sampler);
 GARNET_INTERNAL_EXTERN void rdna4_argument_sampler_write(id buffer, NSUInteger offset, id sampler, uint64_t token);
+GARNET_INTERNAL_EXTERN void rdna4_argument_note_dirty_range(id buffer, NSRange range);
 GARNET_INTERNAL_EXTERN BOOL rdna4_argument_sampler_scope(
         id device, const RDNA4ArgumentScanPrepared *scan,
         NSSet *declaredBuffers, NSSet *writable,
@@ -3812,6 +3822,8 @@ GARNET_INTERNAL_EXTERN void rdna4_device_convert_sparse_tile_regions(const MTLRe
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_raytracing_from_render(void);
 GARNET_INTERNAL_EXTERN BOOL rdna4_rt_runtime_supports_primitive_motion_blur(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_curves_enabled(void);
+GARNET_INTERNAL_EXTERN BOOL rdna4_rt_motion_enabled(void);
 GARNET_INTERNAL_EXTERN uint32_t rdna4_rt_descriptor_pool_append(
     VkDescriptorPoolSize *sizes,
     uint32_t count,

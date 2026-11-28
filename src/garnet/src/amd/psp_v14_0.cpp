@@ -24,7 +24,7 @@
 //      IOBufferMemoryDescriptor/
 //        IODMACommand               → dropped; every buffer is VRAM and is
 //                                     reached with bar0_* / RBAR2_32
-//      hardcoded VRAM offset k…      → dev.vramBase + k…  (PORTING.md)
+//      hardcoded VRAM offset k…      → dev.vramBase + k…  (kext constraint)
 //      gmc.vram_start                → dev.vramMcBase
 //      mdelay(20) / IOSleep(20)      → IOSleep(20)   (unchanged)
 //      poll_reg / poll_psp_response  → unchanged (amdgpu_regs.h)
@@ -105,7 +105,7 @@ psp_read_vram_start(const DeviceContext &dev)
 // VRAM layout for PSP-accessed buffers. IDENTICAL to the reference's
 // constants; every one of them is used as `dev.vramBase + k…` because VRAM
 // [0, vramBase) here is the UEFI console framebuffer the kernel keeps
-// drawing into. See PORTING.md "VRAM layout".
+// drawing into. Avoid overlapping the active boot framebuffer.
 static constexpr uint64_t kFwPriVRAMOffset  = 0;          // [0, 1MB)
 static constexpr uint64_t kRingVRAMOffset   = 0x100000;   // 1 MB
 static constexpr uint64_t kCmdBufVRAMOffset = 0x104000;   // 1 MB + 16 KB
@@ -1691,14 +1691,17 @@ psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
         }
     }
 
-    // 4. Load MES firmware (CP_MES + CP_MES_DATA for uni_mes packaging).
+    // 4. Load MES firmware (SCHED pipe: CP_MES + CP_MES_DATA;
+    //    KIQ pipe: CP_MES_KIQ + MES_KIQ_STACK for uni_mes dual-pipe bringup).
     {
         struct MESBin {
             uint32_t fw_type;
             const char *name;
         } bins[] = {
-            { PSPGfxFwType::CP_MES,       "CP_MES" },
-            { PSPGfxFwType::CP_MES_DATA,  "CP_MES_DATA" },
+            { PSPGfxFwType::CP_MES,        "CP_MES" },
+            { PSPGfxFwType::CP_MES_DATA,   "CP_MES_DATA" },
+            { PSPGfxFwType::CP_MES_KIQ,    "CP_MES_KIQ" },
+            { PSPGfxFwType::MES_KIQ_STACK, "MES_KIQ_STACK" },
         };
 
         for (auto &bin : bins) {

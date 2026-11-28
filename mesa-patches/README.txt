@@ -21,13 +21,12 @@ Apply (or use tools/rdna4/build-radv.sh):
         patch -p1 < "$file" || break
     done
 
-Order matters: 0001 .. 0031. The kext ABI header that patches 0002-0004,
-0028, 0030, and 0031 mirror is src/garnet/src/GarnetNativeABI.h in this repository;
-Mesa's copy and the kext's copy must stay ABI-compatible (currently 1.13; older
-ABI <= 1.12 kernels remain compatible with sparse/PRT, GFX12 DCC, and async
-compute disabled).
+Order matters: 0001 .. 0033. The kext ABI header that patches 0002-0004,
+0028, 0030, 0031, and 0033 mirror is src/garnet/src/GarnetNativeABI.h in this repository;
+Mesa's copy and the kext's copy must stay ABI-compatible (currently 1.14; older
+ABI <= 1.13 kernels remain compatible with automatic fallback to legacy selectors 3/21/27).
 
-0010: Navi 44 (RX 9060 XT, gfx1200) canned device entry; the chip is chosen at runtime from the kext QueryInfo gc_version (0x0c0001 gfx1201 / 0x0c0000 gfx1200, 0 = old kext -> gfx1201). Env: RADV_DARWIN_CHIP=gfx1200|gfx1201 forces the chip (also the HOST_BO stand-in choice); RADV_DARWIN_MOCK_GC=gfx1200 makes the mock report GC 12.0.0. The gfx1200 device fields are confirmed by the target's Linux amdgpu DRM_INFO dump, preserved in `.omo/evidence/navi44-topology/linux-amdgpu-dump.txt`.
+0010: Navi 44 (RX 9060 XT, gfx1200) canned device entry; the chip is chosen at runtime from the kext QueryInfo gc_version (0x0c0001 gfx1201 / 0x0c0000 gfx1200, 0 = old kext -> gfx1201). Env: RADV_DARWIN_CHIP=gfx1200|gfx1201 forces the chip (also the HOST_BO stand-in choice); RADV_DARWIN_MOCK_GC=gfx1200 makes the mock report GC 12.0.0. The gfx1200 device fields match the RX 9060 XT Linux amdgpu DRM_INFO topology.
 
 0011: hide asynchronous COMPUTE rings on native/mock connections. The kernel Submit parser accepts only GFX instance 0, ring 0; RADV's general GFX queue still supports compute dispatch. HOST_BO retains its synthetic ring masks. Also replaces null-pointer member arithmetic in the vendored VA-manager list helper with offsetof (UBSan failed during device teardown).
 
@@ -55,7 +54,7 @@ compute disabled).
 
 0023: propagate failed graphics shader allocation instead of caching or dereferencing an incomplete pipeline.
 
-0024: on Darwin, retry an ordinary CPU-mapped shader arena in GTT after a visible-VRAM device-memory error. Preserve its flags and alignment, and do not retry capture/replay or non-mappable arenas. Run `bash mesa-patches/test-shader-arena-fallback.sh /path/to/patched-mesa "$TMPDIR/arena-test"` to exercise both attempts and the double-failure case without a GPU. The native `test-pipeline-oom.sh` visible-VRAM-only refusal check applies to the 0023 baseline; it does not exhaust the GTT fallback.
+0024: on Darwin, retry an ordinary CPU-mapped shader arena in GTT after a visible-VRAM device-memory error. Preserve its flags and alignment, and do not retry capture/replay or non-mappable arenas.
 
 0025: disable GFX12 color compression on Darwin. Garnet accepts the allocation flag without setting the GPU page table compression bit. Keep image format queries, image creation, and allocation on the uncompressed path. The gfx1200 pipeline probe checks the reported color attachment compression mode.
 
@@ -69,54 +68,20 @@ compute disabled).
 
 0030: sync RDNA4N_CAP_GFX12_DCC (1u << 5) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; report drm_minor = 60 in acd_device_initialize() when QueryInfo.flags advertises RDNA4N_CAP_GFX12_DCC (unlocking gfx12_supports_dcc_write_compress_disable), and gate radv_is_dcc_disabled() on Darwin on !pdev->info.gfx12_supports_dcc_write_compress_disable (superseding 0025's unconditional GFX12 disable while preserving RADV_DEBUG=nodcc, garnet-dcc=0, and HOST_BO fallback).
 
-0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]), per-ring pending pairs (seq[2]) for gang submissions, multi-point cross-ring timeline wait polling, and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit_ex() for concurrent Task+Mesh launch while propagating both leader and follower seqnos into last_compute_seq and syncobjs; drain both rings in acd_cmd_gem_wait_idle(). Exercised by `mesa-patches/dual_ring_sync_test.c` (invoked from `test-gfx1200-runtime.sh`).
+0031: sync RDNA4N_HW_IP_COMPUTE (1u), RDNA4N_CAP_ASYNC_COMPUTE (1u << 6), and RDNA4N_SEQ_RING_COMPUTE (1ull << 62) into include/darwin/rdna4_native_abi.h and ac_darwin_kext.c; expose available_rings = 1 for AMDGPU_HW_IP_COMPUTE when QueryInfo.flags advertises RDNA4N_CAP_ASYNC_COMPUTE (unlocking a dedicated Vulkan compute queue family and Task+Mesh in 0029 while preserving available_rings = 0 on older kernels, garnet-async-compute=0, and mock); upgrade ac_darwin_sync.c to per-ring retirement (known_retired[2]), per-ring pending pairs (seq[2]) for gang submissions, multi-point cross-ring timeline wait polling, and cross-ring synchronization in acd_sync_cs_wait_ready(); partition mixed COMPUTE+GFX gang submissions in acd_kext_submit_ex() for concurrent Task+Mesh launch while propagating both leader and follower seqnos into last_compute_seq and syncobjs; drain both rings in acd_cmd_gem_wait_idle(). Exercised by `mesa-patches/tests/dual_ring_sync_test.c` (invoked from `mesa-patches/tests/test-gfx1200-runtime.sh`).
 
-Targeted large-buffer checks (all outputs in a caller-selected scratch directory):
-    python3 mesa-patches/test-composite-bo.py /path/to/patched-mesa "$TMPDIR/private-test"
-    python3 mesa-patches/test-host-composite.py /path/to/patched-mesa "$TMPDIR/host-test"
-    python3 mesa-patches/test-large-buffer-api.py /path/to/patched-mesa "$TMPDIR/api-test"
-    python3 mesa-patches/test-large-buffer-transfer.py /path/to/patched-mesa "$TMPDIR/transfer-test"
-These compile extracted production functions with stub transport boundaries and
-ASan/UBSan. Synthetic 8 GiB layouts do not allocate 8 GiB physical backing or
-execute the target GPU. Hardware capacity acceptance remains separate.
+0032: use IDSet for interference tracking in aco_spill.cpp (`0032-aco-spill-use-idset-for-interferences.patch`), cutting peak host memory by ~7x to 14x when compiling large MetalRT / Blender Cycles megakernels without OOM.
 
-Read-only argument-limit export check (no Vulkan object, native open or GPU
-work):
-    python3 mesa-patches/test-radv-darwin-argument-limits.py /path/to/patched-mesa "$TMPDIR/argument-limits-test"
+0033: sync include/darwin/rdna4_native_abi.h with GarnetNativeABI.h ABI 1.14 (reserving selector 29, flags bit 7, and seqno bit 61 for VCN 5.0 ABI 1.15; adding WebKit-silent APP aliases 30/31/39 for BOCREATE/BO_IMPORT_HOST/BUFFER_COPY and info flags bits 8..10); route RADV's GarnetAccelerator connection through selectors 30/31/39 on ABI >= 1.14 kernels with automatic fallback to 3/21/27 on ABI <= 1.13 kernels and on the GarnetDriver route. Verified by `python3 mesa-patches/tests/test-webkit-safe-selectors.py "$TMPDIR/webkit-sel-test"`.
 
-The same check can also prove the ordered canonical patch series from a clean
-pinned archive:
-    python3 mesa-patches/test-radv-darwin-argument-limits-series.py \
-      /path/to/mesa.tar.gz "$TMPDIR/argument-limits-series-test" \
-      --expected-archive-sha256 4bc5830a77c420e6fcd1d13d8edf12c8b17c95fa5c689ed27370b19c47cbae1d
-This extracts a fresh tree, applies 0001..0022 with `patch -p1 --fuzz=0`,
-rejects any `.rej`/`.orig`, and runs the optimized and ASan+UBSan export tests.
-
-Sparse / PRT series and host check (no Mesa tarball, IOKit, or GPU needed):
-    python3 mesa-patches/test-radv-darwin-sparse-prt-series.py "$TMPDIR/sparse-prt-test"
-This verifies contiguous 0001..0028 patch integrity, replays 0001..0028 with
-`patch -p1 --fuzz=0` on all Darwin-added files plus post-0027 upstream anchors,
-checks ABI 1.13 constants against src/garnet/src/GarnetNativeABI.h bit-for-bit,
-and compiles and runs the real post-0028 Darwin kext/mock marshaller and
-radv_sparse_enabled() gating harness under -Wall -Wextra -Werror with ASan+UBSan.
-Pass `--mesa-archive /path/to/mesa.tar.gz` when the pinned Mesa archive is
-available to replay the full 0001..0028 series end-to-end.
-
-Mesh shader series and host check (no Mesa tarball, IOKit, or GPU needed):
-    python3 mesa-patches/test-radv-darwin-mesh-series.py "$TMPDIR/mesh-test"
-This verifies contiguous 0001..0029 patch integrity, validates 0029 with
-`patch -p1 --fuzz=0` and `git apply --check` against exact post-0028
-`radv_physical_device.c` context (or a full Mesa archive via `--mesa-archive`),
-and compiles and runs the extracted `radv_mesh_enabled()` /
-`radv_taskmesh_enabled()` feature and stage-mask harness under
-`-Wall -Wextra -Werror` (both `-O2` and ASan+UBSan). Full `mesa@f5cb8ee` build
-and live RX 9060 XT execution remain separate.
-
-Standalone Vulkan sparse/PRT execution test (buffer + 2D/3D/MSAA residency,
-non-resident zero-read / discard-write, and rebinding; ready for RX 9060 XT
-and Vulkan 1.4 ICDs exposing sparseBinding):
-    cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/vulkan_sparse_prt_test.c -lvulkan -o "$TMPDIR/vulkan_sparse_prt_test"
-    "$TMPDIR/vulkan_sparse_prt_test"
+Active RADV Darwin tests live under `mesa-patches/tests/`:
+    - Host runtime / submit / dual-ring sync / kernel Submit contract:
+        bash mesa-patches/tests/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
+    - Native macOS mock pipeline / queue marshalling / hang propagation:
+        bash mesa-patches/tests/test-gfx1200-pipeline.sh /path/to/patched-mesa /path/to/libvulkan_radeon.dylib /path/to/output
+    - Standalone Vulkan sparse / GFX12 PRT residency test:
+        cc -std=c11 -O2 -Wall -Wextra -Werror mesa-patches/tests/vulkan_sparse_prt_test.c -lvulkan -o "$TMPDIR/vulkan_sparse_prt_test"
+    - Argument-limit export test: `mesa-patches/tests/radv_darwin_argument_limits_test.c`
 
 Memory and topology audit (offline, 2026-11-01):
     The gfx1200 .mem values are synthetic HOST_BO/drm-shim inputs, copied from
@@ -140,7 +105,7 @@ Memory and topology audit (offline, 2026-11-01):
     report and native GPU execution still require a physical acceptance run.
 
 Host regression test (no Mesa configure, IOKit, Vulkan loader, or GPU needed):
-    bash mesa-patches/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
+    bash mesa-patches/tests/test-gfx1200-runtime.sh /path/to/patched-mesa [output-dir]
     Run from this repository after applying the full series to the pinned
     Mesa base. Requires clang/clang++ (or CC/CXX), pthreads, and sanitizer
     runtimes. Builds the actual backend, marshaller, mock, sync provider,
@@ -163,7 +128,7 @@ Native macOS build (ACO only, no LLVM/Rust/system installations):
     without installing SPIRV-Tools or LLVM. Put both prefixes on PATH.
 
     meson setup radv-build /path/to/patched-mesa --buildtype=release \
-      --prefix="$HOME/navi44-offline/mesa/install" \
+      --prefix="/path/to/mesa-install" \
       -Dgallium-drivers= -Dvulkan-drivers=amd -Dplatforms=macos \
       -Dllvm=disabled -Damd-use-llvm=false -Dglx=disabled \
       -Degl=disabled -Dgbm=disabled -Dopengl=false \
@@ -173,74 +138,31 @@ Native macOS build (ACO only, no LLVM/Rust/system installations):
     meson compile -C radv-build -j3 vulkan_radeon
     meson compile -C radv-build -j3 radeon_icd radeon_devenv_icd
 
-    Verified on the macOS 26.7.2 x86_64 VM with Apple clang 21: all 777
-    native RADV build steps completed, including the ACO compiler and dylib
-    link. No LLVM or Rust was needed. Both ICD manifests were generated.
-    The development manifest points to the build dylib; the installation
-    manifest points to the configured prefix, where Mesa was not installed.
-    Logs, configuration, dylib and manifests are preserved locally under
-    build-offline/mesa-gfx1200/ (native-artifacts/ contains the binaries).
-    Dylib SHA256:
-      845214bb3e31b878f784df61fa02f3f0b7971c7f15df14a1d1e79800b420379e
-
-Native buffer bridge dylib check (macOS, no queue submission):
-    clang -std=gnu11 -O1 -g -Wall -Wextra -Werror \
-      -I/path/to/patched-mesa/include -I/path/to/patched-mesa/include/darwin \
-      -I/path/to/patched-mesa/src/amd/vulkan/winsys/amdgpu \
-      mesa-patches/0015-native-buffer-dylib-test.c -o /path/to/dylib-bridge-test
-    /path/to/dylib-bridge-test /path/to/libvulkan_radeon.dylib
-    The production ICD is loaded directly. Only this test process selects the
-    mock transport, which lacks the buffer capability. Typed exports, real
-    gfx1200 device/memory objects, same-device/bounds checks and -ENOSYS
-    fallback are exercised; teardown must report 0 submits, 0 seqs.
+    On macOS 26.x x86_64 with Apple clang, `tools/rdna4/build-radv.sh` automates
+    patching and compiling `libvulkan_radeon.dylib` with ACO only (no LLVM or
+    Rust required) and generates both the development and install ICD manifests.
 
 Native Vulkan mock pipeline test (macOS, no queue submission):
-    Put the user-prefix glslangValidator on PATH, then run:
-    bash mesa-patches/test-gfx1200-pipeline.sh /path/to/patched-mesa \
+    Put glslangValidator on PATH, then run:
+    bash mesa-patches/tests/test-gfx1200-pipeline.sh /path/to/patched-mesa \
       /path/to/radv-build/src/amd/vulkan/libvulkan_radeon.dylib /path/to/output
-    This loads the actual ICD directly through vk_icdGetInstanceProcAddr;
-    a Vulkan loader installation is unnecessary. The harness forces
-    RADV_DARWIN_MOCK=1 and RADV_DARWIN_MOCK_GC=gfx1200, clears chip/HOST_BO
-    overrides, disables shader caches, and creates one owned compute pipeline.
-    It checks the gfx1200 physical device, queue families, device creation,
-    and nonempty ACO IR through VK_KHR_pipeline_executable_properties.
-    The shader writes integer arithmetic results to an SSBO; no descriptor
-    storage, dispatch, or submission is needed to compile it.
-
-    Verified on the same unsigned dylib hash above: dlopen(RTLD_NOW), instance,
-    physical-device enumeration, device and compute-pipeline creation succeed.
-    There is one general graphics/compute queue and no dedicated compute
-    family. Captured artifacts include the owned SPIR-V, optimized NIR,
-    ACO IR, and lowered ACO instructions. The representation named Assembly
-    contains the ACO fallback printer because LLVM disassembly is unavailable.
-    Both mock connections report 0 submits, 0 seqs at teardown. Exact commands
-    and results: build-offline/mesa-gfx1200/vm-pipeline-final.log; artifacts:
-    build-offline/mesa-gfx1200/native-pipeline-final/.
-
-    This validates native RADV/ACO compilation in a mock environment. The target
-    Linux DRM_INFO dump confirms the gfx1200 topology and device fields used by
-    the canned entry; physical GPU execution and Metal acceleration remain
-    unverified.
+    This loads the ICD directly through vk_icdGetInstanceProcAddr; no Vulkan
+    loader installation is needed. The harness forces RADV_DARWIN_MOCK=1 and
+    RADV_DARWIN_MOCK_GC=gfx1200, clears chip/HOST_BO overrides, disables shader
+    caches, and compiles an owned compute pipeline, verifying physical-device
+    enumeration, queue families, device creation, and nonempty ACO IR through
+    VK_KHR_pipeline_executable_properties.
 
     Add --submit to exercise real RADV queue marshalling through mock RDNA4N:
     one compute command buffer, 65 simultaneous-use command buffers (split into
-    64+2 IBs including the preamble), timeline signal/wait and an empty submit.
-    The test verifies fence completion and timeline values, then checks that the
-    storage sentinel is unchanged: mock acceptance never executes the shader.
-    Verified with the installed bundle 24 RADV; five RDNA4N submits accepted.
-    Evidence: .omo/evidence/navi44-native-queue/installed-b24.txt.
+    64+2 IBs including the preamble), timeline signal/wait, and an empty submit.
+    The test verifies fence completion and timeline values while confirming that
+    mock acceptance never executes the shader.
 
     Use --query-hang or --wait-hang for a single compute submission followed by
     an injected mock hang. Both modes require DEVICE_LOST on the detecting call
-    and later calls, unchanged query output, and refusal of a later submission.
-    These modes use the existing mock transport and never execute GPU work.
+    and later calls, unchanged query output, and refusal of later submissions.
 
-Verified (historical checkpoint, patches 0001..0013): the first 13 patches applied
-in order with patch -p1 --fuzz=0 to the f5cb8ee032adabef599ae892ec4e42d796b84da9
-source archive on 2026-11-02; patches 0014..0022 were added afterwards (see the
-per-patch checks and Targeted large-buffer checks above, and tools/rdna4/build-radv.sh
-for building the full 22-patch stack). In that 2026-11-02 checkpoint, the runtime
-and submission tests passed 321 and 72 checks on both Linux and native macOS with
-ASan+UBSan, plus the kernel Submit contract check (original `.omo/evidence/...`
-history is indexed under logs/legacy/). Physical GPU execution and Metal
-acceleration remain unverified by offline tests.
+Offline host and mock checks validate patch application, marshalling, sync
+state machines, and ACO lowering; physical GPU execution requires running on
+target RDNA 4 hardware.

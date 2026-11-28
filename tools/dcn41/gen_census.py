@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """gen_census.py - emit the exact T1 read-only register census as a TSV (src/dcn41/dcn41_census.tsv).
 
-Every address in notes/DISPLAY-DESIGN.md section 6's T1 is produced here from the DCN 4.1 offset header, never typed by
+Every address in the DCN 4.1 register census is produced here from the DCN 4.1 offset header, never typed by
 hand: the script looks each name up in dcn_4_1_0_offset.h, reads its BASE_IDX from the header too, and computes the
 absolute BAR5 dword as seg[base_idx] + offset with the segment bases our kext discovered on this card
-(notes/DISPLAY-DESIGN.md section 2.1). It refuses to write anything if a name is missing or a BASE_IDX is outside the
+(per IP discovery register bases). It refuses to write anything if a name is missing or a BASE_IDX is outside the
 five segments. The DMCUB rows are the same 27 registers src/dcn41/dcn41_dmub.c's probe table reads, in the same order,
 and the script checks that correspondence against the .c file so the census and the probe cannot drift apart.
 

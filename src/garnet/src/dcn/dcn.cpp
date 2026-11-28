@@ -768,6 +768,10 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 	}
 	bool notifyPrimaryVbl = false;
 	uint32_t notifyPrimaryOtg = 0u;
+	bool notifyPrimaryHpd = false;
+	uint32_t notifyPrimaryHpdPin = 0u;
+	bool notifyPrimaryHpdShort = false;
+	bool notifyPrimaryHpdSense = false;
 	{
 		// The work-loop entry is a complete, non-blocking attempt at the same local
 		// display transaction every other DCN write path takes.  If another thread
@@ -781,6 +785,7 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 			gDcn.irqRefusals++;
 			// Mark ACK recovery so the watchdog can un-wedge a latched DCN level interrupt.
 			__atomic_store_n(&gDcn.irqAckRecoveryNeeded, true, __ATOMIC_RELEASE);
+			__atomic_store_n(&gDcn.hpdAckRecoveryNeeded, true, __ATOMIC_RELEASE);
 			if (gDcn.irqRefusalLogs < 8u) {
 				gDcn.irqRefusalLogs++;
 				RDNA4LOG("dcn-irq: REFUSED src %u data %08x: no display transaction; entry consumed without ACK or register write",
@@ -866,6 +871,31 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 			}
 		}
 
+		// Primary framebuffer DisplayPort HPD / HPD_RX delivery with rate storm guard.
+		if ((irq.kind == DCN41_IRQ_HPD || irq.kind == DCN41_IRQ_HPD_RX) &&
+		    __atomic_load_n(&gDcn.primaryHpdEnabled, __ATOMIC_ACQUIRE) &&
+		    irq.inst == gDcn.primaryHpdPin) {
+			if (ar == DCN41_OK) {
+				__atomic_store_n(&gDcn.hpdAckRecoveryNeeded, false, __ATOMIC_RELEASE);
+			}
+			if (rdna4hpd::record_hpd_irq(gDcn.primaryHpdStorm, t)) {
+				struct dcn41_irq offHpd { DCN41_IRQ_HPD, gDcn.primaryHpdPin };
+				struct dcn41_irq offRx  { DCN41_IRQ_HPD_RX, gDcn.primaryHpdPin };
+				__atomic_store_n(&gDcn.primaryHpdEnabled, false, __ATOMIC_RELEASE);
+				gDcn.tag = "hpdstorm";
+				(void)dcn41_irq_set(&gDcn.d, offHpd, false);
+				(void)dcn41_irq_set(&gDcn.d, offRx, false);
+				RDNA4LOG("dcn-irq: PRIMARY HPD STORM GUARD — > %u HPD IRQs/s on HPD %u; HPD IRQ DISABLED",
+				         rdna4hpd::kHpdStormMaxIrqs, offHpd.inst);
+			} else {
+				const uint32_t hs = dcn_rreg(&gDcn, gDcn.seg[2] + rdna4hpd::hpd_status_reg(irq.inst));
+				notifyPrimaryHpd = true;
+				notifyPrimaryHpdPin = irq.inst;
+				notifyPrimaryHpdShort = (irq.kind == DCN41_IRQ_HPD_RX);
+				notifyPrimaryHpdSense = rdna4hpd::hpd_sense_delayed(hs);
+			}
+		}
+
 		// Storm guard: disable what we enabled rather than let it spin the work loop.
 		// build 0.0.603: not while a native client holds the plane or primary VBL is active -
 		// both paths enforce a rate guard instead of a cumulative cap (~20 min at 160 Hz).
@@ -884,8 +914,9 @@ bool ihEntry(uint32_t clientId, uint32_t srcId, uint32_t srcData0) {
 			       (unsigned long long)kDceStormCap, off.kind, off.inst);
 		}
 	}
-	// Dispatch primary FB VBL callback AFTER releasing rdna4_display_txn (zero DCN locks held).
+	// Dispatch primary FB callbacks AFTER releasing rdna4_display_txn (zero DCN locks held).
 	if (notifyPrimaryVbl) garnet_primary_fb_notify_vbl(notifyPrimaryOtg);
+	if (notifyPrimaryHpd) garnet_primary_fb_notify_hpd(notifyPrimaryHpdPin, notifyPrimaryHpdShort, notifyPrimaryHpdSense);
 	return true;
 }
 
@@ -1247,8 +1278,112 @@ void primaryVblRecoverAckIfNeeded(uint32_t otg) {
 	if (l != nullptr) IOLockUnlock(l);
 }
 
+bool primaryHpdIrqSet(GarnetDriver *owner, uint32_t hpd, bool enable) {
+	if (hpd >= DCN41_NUM_HPD) return false;
+	if (enable) {
+		if (!owner || !owner->interruptsArmed()) return false;
+		if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) && bind(owner) != 0u) return false;
+		if (__atomic_load_n(&gDcn.primaryHpdStorm.tripped, __ATOMIC_ACQUIRE)) return false;
+		if (__atomic_load_n(&gDcn.primaryHpdEnabled, __ATOMIC_ACQUIRE) && gDcn.primaryHpdPin == hpd) {
+			const uint32_t destMask = rdna4hpd::hpd_interrupt_dest_mask(hpd);
+			const uint32_t destVal = dcn_rreg(&gDcn, gDcn.seg[2] + rdna4hpd::kSeg2HpdInterruptDest);
+			if (destVal != 0xffffffffu && (destVal & destMask) == 0u) {
+				return true;
+			}
+		}
+	} else {
+		if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return false;
+		if (!__atomic_load_n(&gDcn.primaryHpdEnabled, __ATOMIC_ACQUIRE)) return true;
+	}
+
+	for (uint32_t attempt = 0u; attempt < 25u; ++attempt) {
+		rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+		if (!txn.ok) {
+			IODelay(100u);
+			continue;
+		}
+		if (enable) {
+			if (__atomic_load_n(&gDcn.primaryHpdEnabled, __ATOMIC_ACQUIRE) && gDcn.primaryHpdPin != hpd) {
+				const uint8_t prevPin = gDcn.primaryHpdPin;
+				__atomic_store_n(&gDcn.primaryHpdEnabled, false, __ATOMIC_RELEASE);
+				gDcn.tag = "phpdoff";
+				(void)dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD, prevPin }, false);
+				(void)dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD_RX, prevPin }, false);
+			}
+			rdna4hpd::reset_hpd_storm(gDcn.primaryHpdStorm);
+			const uint8_t pin = static_cast<uint8_t>(hpd);
+			// Reclaim HPD/HPD_RX routing from UEFI GOP's DMCUB to Host IH before arming.
+			const uint32_t destAbs = gDcn.seg[2] + rdna4hpd::kSeg2HpdInterruptDest;
+			const uint32_t destMask = rdna4hpd::hpd_interrupt_dest_mask(pin);
+			const uint32_t destBefore = dcn_rreg(&gDcn, destAbs);
+			uint32_t destAfter = destBefore;
+			if (destBefore != 0xffffffffu && (destBefore & destMask) != 0u) {
+				gDcn.tag = "phpdrt";
+				dcn_wreg(&gDcn, destAbs, destBefore & ~destMask);
+				destAfter = dcn_rreg(&gDcn, destAbs);
+			}
+			const bool hostRouted = (destAfter != 0xffffffffu) && ((destAfter & destMask) == 0u);
+			RDNA4LOG("dcn-hpd: HPD%u interrupt dest 0x%08x -> 0x%08x (host=%u)",
+			         pin, destBefore, destAfter, hostRouted ? 1u : 0u);
+			gDcn.tag = "phpdon";
+			if (dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD, pin }, true) != DCN41_OK) {
+				return false;
+			}
+			gDcn.tag = "phpdrx";
+			if (dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD_RX, pin }, true) != DCN41_OK) {
+				gDcn.tag = "phpdoff";
+				(void)dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD, pin }, false);
+				return false;
+			}
+			__atomic_store_n(&gDcn.hpdAckRecoveryNeeded, false, __ATOMIC_RELEASE);
+			gDcn.primaryHpdPin = pin;
+			__atomic_store_n(&gDcn.primaryHpdEnabled, true, __ATOMIC_RELEASE);
+			return true;
+		}
+		if (__atomic_load_n(&gDcn.primaryHpdEnabled, __ATOMIC_ACQUIRE)) {
+			const uint8_t curPin = gDcn.primaryHpdPin;
+			__atomic_store_n(&gDcn.primaryHpdEnabled, false, __ATOMIC_RELEASE);
+			gDcn.tag = "phpdoff";
+			const int r1 = dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD, curPin }, false);
+			const int r2 = dcn41_irq_set(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD_RX, curPin }, false);
+			return r1 == DCN41_OK && r2 == DCN41_OK;
+		}
+		return true;
+	}
+	RDNA4LOG("dcn-hpd: primaryHpdIrqSet(hpd=%u, en=%u) timed out waiting for display lease",
+	         hpd, enable ? 1u : 0u);
+	return false;
+}
+
+void primaryHpdRecoverAck(uint32_t hpd) {
+	if (hpd >= DCN41_NUM_HPD) return;
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
+	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
+	if (!txn.ok) return;
+	bool need = __atomic_load_n(&gDcn.hpdAckRecoveryNeeded, __ATOMIC_ACQUIRE);
+	if (!need) {
+		const uint32_t hs = dcn_rreg(&gDcn, gDcn.seg[2] + rdna4hpd::hpd_status_reg(hpd));
+		if (hs != 0xffffffffu && (hs & rdna4hpd::kHpdAnyIrqStatusMask) != 0u) {
+			need = true;
+		}
+	}
+	if (!need) return;
+	const uint8_t pin = static_cast<uint8_t>(hpd);
+	gDcn.tag = "hpdrecov";
+	(void)dcn41_irq_ack(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD, pin });
+	(void)dcn41_irq_ack(&gDcn.d, dcn41_irq { DCN41_IRQ_HPD_RX, pin });
+	__atomic_store_n(&gDcn.hpdAckRecoveryNeeded, false, __ATOMIC_RELEASE);
+}
+
+void primaryHpdShutdown() {
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
+	(void)primaryHpdIrqSet(nullptr, gDcn.primaryHpdPin, false);
+	__atomic_store_n(&gDcn.primaryHpdEnabled, false, __ATOMIC_RELEASE);
+}
+
 void primaryVblShutdown() {
 	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return;
+	primaryHpdShutdown();
 	(void)primaryVblIrqSet(nullptr, gDcn.primaryVblOtg, false);
 	__atomic_store_n(&gDcn.primaryVblEnabled, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&gDcn.armed, false, __ATOMIC_RELEASE);

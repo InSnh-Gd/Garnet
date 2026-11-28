@@ -1,4 +1,4 @@
-/* garnet_m6route.h: bundle build 11 (M6 Stage 1a, an internal design note "M6 study", section 3): WHICH DISPLAY a display surface belongs to, no Vulkan, no ObjC, no locking.
+/* garnet_m6route.h: bundle build 11 (M6 Stage 1a, multi-display surface routing): WHICH DISPLAY a display surface belongs to, no Vulkan, no ObjC, no locking.
  *
  * Until build 10 the bundle called an IOSurface a DISPLAY surface when its size matched HUBP0's plane (rdna4s_classify). With three displays the monitor B's 2560x1440 surfaces match the DP's plane, so their
  * frames would be copied into a DP scanout slot and flipped onto the DP. With the kernel latch garnet-m6=1 the kernel learns, from the display transactions themselves, which pipe (= which display)

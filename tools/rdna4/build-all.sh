@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build one matched standalone Garnet payload for install-native.sh; never install or load it.
-# Usage: MKSDK=... C64_LAYOUT_OUT=... C64_WORK=... [other inputs] build-all.sh OUT_DIR
+# Usage: MKSDK=... GARNET_LAYOUT_OUT=... GARNET_KC_WORK=... [other inputs] build-all.sh OUT_DIR
 set -euo pipefail
 export LC_ALL=C
 export PYTHONDONTWRITEBYTECODE=1
@@ -42,7 +42,8 @@ if [ "$1" = --label-self-check ]; then
     done
     for label in OUTPUT_METAL_BUNDLE OUTPUT_METAL_EXECUTABLE OUTPUT_METAL_INFO \
         OUTPUT_METAL_RADV OUTPUT_METAL_XLATE OUTPUT_METAL_SPVCACHE \
-        OUTPUT_METAL_UNSIGNED_EXECUTABLE PAYLOAD_COLLECTOR; do
+        OUTPUT_METAL_UNSIGNED_EXECUTABLE PAYLOAD_COLLECTOR \
+        OUTPUT_RECOVER_EFI OUTPUT_ANCHOR_INJECTOR_INFO_PLIST; do
         record_input "$label" "$work/fixture"
     done
     if grep -Ev '^[A-Z][A-Z0-9_]*\.' "$input_identities" >/dev/null; then
@@ -72,16 +73,16 @@ require_file() { [ -n "$2" ] && [ -f "$2" ] || fail "$1 must name an existing fi
 absolute_file() { printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"; }
 plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1"; }
 require_dir MKSDK "${MKSDK:-}"
-require_dir C64_LAYOUT_OUT "${C64_LAYOUT_OUT:-}"
-require_dir C64_WORK "${C64_WORK:-}"
-require_dir C64_WORK/kc "$C64_WORK/kc"
-require_dir C64_WORK/kexts "$C64_WORK/kexts"
+require_dir GARNET_LAYOUT_OUT "${GARNET_LAYOUT_OUT:-}"
+require_dir GARNET_KC_WORK "${GARNET_KC_WORK:-}"
+require_dir GARNET_KC_WORK/kc "$GARNET_KC_WORK/kc"
+require_dir GARNET_KC_WORK/kexts "$GARNET_KC_WORK/kexts"
 [ -z "${RDNA4_FB_KEXT:-}" ] || fail 'RDNA4_FB_KEXT is obsolete; standalone Garnet builds directly from src/garnet'
 [ -z "${RDNA4_DISPLAY_SRC:-}" ] || fail 'RDNA4_DISPLAY_SRC is obsolete; standalone Garnet builds directly from src/garnet'
 [ -z "${RDNA4_LILU_KEXT:-}" ] || fail 'RDNA4_LILU_KEXT is obsolete; standalone Garnet requires no Lilu dependency'
 MKSDK=$(cd "$MKSDK" && pwd -P)
-C64_LAYOUT_OUT=$(cd "$C64_LAYOUT_OUT" && pwd -P)
-C64_WORK=$(cd "$C64_WORK" && pwd -P)
+GARNET_LAYOUT_OUT=$(cd "$GARNET_LAYOUT_OUT" && pwd -P)
+GARNET_KC_WORK=$(cd "$GARNET_KC_WORK" && pwd -P)
 CHIPS=${CHIPS:-navi44}
 for chip in $CHIPS; do
     case "$chip" in navi44|navi48) ;; *) fail "CHIPS contains unsupported chip: $chip";; esac
@@ -130,6 +131,23 @@ for command in make clang codesign file find strings tar shasum git xcrun zsh py
     command -v "$command" >/dev/null 2>&1 || fail "Required tool not found: $command"
 done
 [ -x /usr/libexec/PlistBuddy ] || fail 'Required tool not found: /usr/libexec/PlistBuddy'
+if [ -n "${GARNET_SIGN_CA_DIR:-}" ]; then
+    require_dir GARNET_SIGN_CA_DIR "$GARNET_SIGN_CA_DIR"
+    GARNET_SIGN_CA_DIR=$(cd "$GARNET_SIGN_CA_DIR" && pwd -P)
+    for ca_item in leaf.key.pem leaf.cert.pem intermediate.cert.pem root.cert.pem; do
+        require_file "CA signing file ($ca_item)" "$GARNET_SIGN_CA_DIR/$ca_item"
+    done
+    command -v "${RCODESIGN:-rcodesign}" >/dev/null 2>&1 || fail "GARNET_SIGN_CA_DIR requires ${RCODESIGN:-rcodesign}"
+fi
+if [ -n "${GARNET_AMFIANCHOR_KEXT:-}" ]; then
+    [ -n "${GARNET_SIGN_CA_DIR:-}" ] || fail 'GARNET_AMFIANCHOR_KEXT requires GARNET_SIGN_CA_DIR'
+    require_dir GARNET_AMFIANCHOR_KEXT "$GARNET_AMFIANCHOR_KEXT"
+    GARNET_AMFIANCHOR_KEXT=$(cd "$GARNET_AMFIANCHOR_KEXT" && pwd -P)
+fi
+if [ -n "${RDNA4_RECOVER_EFI:-}" ]; then
+    require_file RDNA4_RECOVER_EFI "$RDNA4_RECOVER_EFI"
+    RDNA4_RECOVER_EFI=$(absolute_file "$RDNA4_RECOVER_EFI")
+fi
 collector="$repo/tools/rdna4/collect-installed.sh"
 require_file 'Build identity helper' "$helper"
 require_file 'Collector script' "$collector"
@@ -167,8 +185,8 @@ metal_meta_count=$(find "$metal_cache" -maxdepth 1 -type f -name '*.meta.json' |
 [ "$metal_spv_count" -gt 0 ] && [ "$metal_spv_count" -eq "$metal_meta_count" ] || \
     fail 'Metal shader cache must contain matching .spv and .meta.json files'
 record_input MKSDK "$MKSDK"
-record_input C64_LAYOUT_OUT "$C64_LAYOUT_OUT"
-record_input C64_WORK "$C64_WORK"
+record_input GARNET_LAYOUT_OUT "$GARNET_LAYOUT_OUT"
+record_input GARNET_KC_WORK "$GARNET_KC_WORK"
 if [ -n "${RDNA4_MESA_SRC:-}" ]; then
     record_input RDNA4_MESA_SRC "$RDNA4_MESA_SRC"
 fi
@@ -195,10 +213,10 @@ bash "$repo/tools/rdna4/xlate-guard.sh" verify "$repo" "$RDNA4_XLATE_LIB" \
     || fail 'RDNA4_XLATE_LIB failed symbol/freshness verification'
 record_input RDNA4_RADV_LIB "$RDNA4_RADV_LIB"
 record_input RDNA4_XLATE_LIB "$RDNA4_XLATE_LIB"
-export RDNA4_RADV_LIB RDNA4_XLATE_LIB RDNA4_VK_INC C64_WORK
+export RDNA4_RADV_LIB RDNA4_XLATE_LIB RDNA4_VK_INC GARNET_KC_WORK
 make -C "$repo/src/garnet" all "CHIPS=$CHIPS" "MKSDK=$MKSDK" "BUILD=$work/garnet" >&2
-C64_MKSDK="$MKSDK" make -C "$repo/src/garnet-accel" all "MKSDK=$MKSDK" \
-    "C64_LAYOUT_OUT=$C64_LAYOUT_OUT" "C64_WORK=$C64_WORK" "BUILD=$work/accel" >&2
+GARNET_MKSDK="$MKSDK" make -C "$repo/src/garnet-accel" all "MKSDK=$MKSDK" \
+    "GARNET_LAYOUT_OUT=$GARNET_LAYOUT_OUT" "GARNET_KC_WORK=$GARNET_KC_WORK" "BUILD=$work/accel" >&2
 if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     make -C "$repo/src/garnet-pci-compat" all "MKSDK=$MKSDK" "BUILD=$work/pcibarcompat" SIGN=1 >&2
 fi
@@ -212,7 +230,7 @@ release_layout_id=
 release_short_id=
 if [ "$RDNA4_RELEASE" = 1 ]; then
     release_layout_id=$(python3 "$fp_exporter" \
-        --layout-out "$C64_LAYOUT_OUT" \
+        --layout-out "$GARNET_LAYOUT_OUT" \
         --gates-dir "$repo/src/garnet-accel/gates" \
         --out "$work/layout-fingerprint.json" \
         --variants-index "$work/variants-index.json" \
@@ -241,14 +259,27 @@ if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     mkdir -p "$payload/optional"
     cp -R "$work/pcibarcompat/GarnetPCIBarCompat.kext" "$payload/optional/"
 fi
+recover_efi_staged=0
+if [ -n "${RDNA4_RECOVER_EFI:-}" ]; then
+    mkdir -p "$payload/optional"
+    cp "$RDNA4_RECOVER_EFI" "$payload/optional/GarnetRecover.efi"
+    recover_efi_staged=1
+elif command -v "${LLD_LINK:-lld-link}" >/dev/null 2>&1; then
+    make -C "$repo/src/garnet-recover-efi" efi BUILD="$work/recover-efi" LLD_LINK="${LLD_LINK:-lld-link}" >&2
+    mkdir -p "$payload/optional"
+    cp "$work/recover-efi/GarnetRecover.efi" "$payload/optional/GarnetRecover.efi"
+    recover_efi_staged=1
+fi
 cp "$repo/src/garnet-metal/build/GarnetMetal.bundle.tar" "$payload/"
 cp "$work/LOCAL-SOURCE-MANIFEST.txt" "$payload/"
 tools=(native-translate native-bundle-check publish-metal mtlprobe-direct garnettest)
 for name in "${tools[@]}"; do cp "$work/tools/$name" "$payload/"; done
 for name in install-native.sh uninstall-native.sh deploy-common.sh activate-native.sh \
-    collect-installed.sh com.garnet.native.plist com.garnet.native-translate.plist; do
+    recover-uninstall.sh collect-installed.sh com.garnet.native.plist \
+    com.garnet.native-translate.plist com.garnet.recovery.plist; do
     cp "$repo/tools/rdna4/$name" "$payload/"
 done
+chmod 755 "$payload/recover-uninstall.sh"
 require_file 'Payload collector' "$payload/collect-installed.sh"
 record_input PAYLOAD_COLLECTOR "$payload/collect-installed.sh"
 
@@ -322,15 +353,42 @@ if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     record_input OUTPUT_GARNETPCIBARCOMPAT_EXECUTABLE "$payload/optional/GarnetPCIBarCompat.kext/Contents/MacOS/$executable"
     record_input OUTPUT_GARNETPCIBARCOMPAT_INFO_PLIST "$payload/optional/GarnetPCIBarCompat.kext/Contents/Info.plist"
 fi
-mkdir -p "$work/signed-ref"
-cp "$RDNA4_RADV_LIB" "$work/signed-ref/libvulkan_radeon.dylib"
-codesign --force --sign - "$work/signed-ref/libvulkan_radeon.dylib"
-cmp -s "$work/signed-ref/libvulkan_radeon.dylib" "$bundle/Contents/Resources/libvulkan_radeon.dylib" \
-    || fail 'Bundled RADV differs from ad-hoc signed RDNA4_RADV_LIB'
-cp "$RDNA4_XLATE_LIB" "$work/signed-ref/libgarnetxlate.dylib"
-codesign --force --sign - "$work/signed-ref/libgarnetxlate.dylib"
-cmp -s "$work/signed-ref/libgarnetxlate.dylib" "$bundle/Contents/Resources/libgarnetxlate.dylib" \
-    || fail 'Bundled XLATE differs from ad-hoc signed RDNA4_XLATE_LIB'
+amfianchor_bundled=0
+if [ -n "${GARNET_SIGN_CA_DIR:-}" ]; then
+    # Dual-track CA trust-anchor signing: sign inner dylibs + bundle and userspace tools via rcodesign,
+    # repack GarnetMetal.bundle.tar, and emit Schema-1 codeless GarnetAnchorInjector.kext (public CA only).
+    bash "$repo/tools/rdna4/sign-with-anchor.sh" "$GARNET_SIGN_CA_DIR" "$bundle" >&2
+    for name in "${tools[@]}"; do
+        bash "$repo/tools/rdna4/sign-with-anchor.sh" "$GARNET_SIGN_CA_DIR" "$payload/$name" >&2
+    done
+    (cd "$extracted" && COPYFILE_DISABLE=1 tar -cf "$payload/GarnetMetal.bundle.tar" GarnetMetal.bundle)
+    mkdir -p "$payload/optional"
+    python3 "$repo/tools/rdna4/make_anchor_injector.py" generate \
+        --certificate "$GARNET_SIGN_CA_DIR/root.cert.pem" \
+        --bundle "$payload/optional/GarnetAnchorInjector.kext" \
+        --overwrite > "$work/payload-anchor-identity.txt" \
+        || fail 'failed to generate GarnetAnchorInjector.kext'
+    record_input OUTPUT_ANCHOR_INJECTOR_INFO_PLIST "$payload/optional/GarnetAnchorInjector.kext/Contents/Info.plist"
+    if [ -n "${GARNET_AMFIANCHOR_KEXT:-}" ]; then
+        cp -R "$GARNET_AMFIANCHOR_KEXT" "$payload/optional/AMFIAnchor.kext"
+        python3 "$helper" amfianchor "$payload/optional/AMFIAnchor.kext" > "$work/payload-amfianchor-identity.txt" \
+            || fail 'GARNET_AMFIANCHOR_KEXT failed identity verification'
+        amfianchor_bundled=1
+    fi
+else
+    mkdir -p "$work/signed-ref"
+    cp "$RDNA4_RADV_LIB" "$work/signed-ref/libvulkan_radeon.dylib"
+    codesign --force --sign - "$work/signed-ref/libvulkan_radeon.dylib"
+    cmp -s "$work/signed-ref/libvulkan_radeon.dylib" "$bundle/Contents/Resources/libvulkan_radeon.dylib" \
+        || fail 'Bundled RADV differs from ad-hoc signed RDNA4_RADV_LIB'
+    cp "$RDNA4_XLATE_LIB" "$work/signed-ref/libgarnetxlate.dylib"
+    codesign --force --sign - "$work/signed-ref/libgarnetxlate.dylib"
+    cmp -s "$work/signed-ref/libgarnetxlate.dylib" "$bundle/Contents/Resources/libgarnetxlate.dylib" \
+        || fail 'Bundled XLATE differs from ad-hoc signed RDNA4_XLATE_LIB'
+fi
+if [ "$recover_efi_staged" = 1 ]; then
+    record_input OUTPUT_RECOVER_EFI "$payload/optional/GarnetRecover.efi"
+fi
 codesign --verify --deep --strict "$bundle"
 
 check_legacy() {
@@ -397,6 +455,10 @@ ninja_version=unavailable
 if command -v ninja >/dev/null 2>&1; then ninja_version=$(ninja --version); fi
 meson_version=unavailable
 if command -v meson >/dev/null 2>&1; then meson_version=$(meson --version); fi
+manifest_extra=()
+if [ -n "${GARNET_SIGN_CA_DIR:-}" ]; then
+    manifest_extra+=(--trust-anchor-identity "$work/payload-anchor-identity.txt" --amfianchor-bundled "$amfianchor_bundled")
+fi
 if [ "$RDNA4_RELEASE" = 1 ]; then
     python3 "$helper" manifest \
         --garnet-identity "$work/payload-garnet-identity.txt" \
@@ -407,18 +469,21 @@ if [ "$RDNA4_RELEASE" = 1 ]; then
         --target-pci-ids 1002:7590 \
         --default-layout-id "$release_layout_id" \
         --amd-firmware-license LICENSE.amdgpu \
-        --default-accel-variant-path "$accel_rel" > "$work/delivery-manifest.txt" \
+        --default-accel-variant-path "$accel_rel" \
+        ${manifest_extra[@]+"${manifest_extra[@]}"} > "$work/delivery-manifest.txt" \
         || fail 'delivery release manifest identity check failed'
 elif [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
     python3 "$helper" manifest \
         --garnet-identity "$work/payload-garnet-identity.txt" \
         --accel-identity "$work/payload-accel-identity.txt" \
-        --pcibarcompat-identity "$work/payload-pcibarcompat-identity.txt" > "$work/delivery-manifest.txt" \
+        --pcibarcompat-identity "$work/payload-pcibarcompat-identity.txt" \
+        ${manifest_extra[@]+"${manifest_extra[@]}"} > "$work/delivery-manifest.txt" \
         || fail 'delivery manifest identity check failed'
 else
     python3 "$helper" manifest \
         --garnet-identity "$work/payload-garnet-identity.txt" \
-        --accel-identity "$work/payload-accel-identity.txt" > "$work/delivery-manifest.txt" \
+        --accel-identity "$work/payload-accel-identity.txt" \
+        ${manifest_extra[@]+"${manifest_extra[@]}"} > "$work/delivery-manifest.txt" \
         || fail 'delivery manifest identity check failed'
 fi
 {
@@ -441,8 +506,8 @@ fi
     printf 'BUILD_CARGO=%s\nBUILD_NINJA=%s\nBUILD_MESON=%s\n' \
         "$cargo_version" "$ninja_version" "$meson_version"
     printf 'BUILD_GARNET_OPTIONS=CHIPS=%s BUILD=work/garnet\n' "$CHIPS"
-    printf 'BUILD_ACCEL_OPTIONS=CHIPS=%s BUILD=work/accel C64_LAYOUT_OUT=%s C64_WORK=%s\n' \
-        "$CHIPS" "$C64_LAYOUT_OUT" "$C64_WORK"
+    printf 'BUILD_ACCEL_OPTIONS=CHIPS=%s BUILD=work/accel GARNET_LAYOUT_OUT=%s GARNET_KC_WORK=%s\n' \
+        "$CHIPS" "$GARNET_LAYOUT_OUT" "$GARNET_KC_WORK"
     if [ "$RDNA4_BUILD_PCIBARCOMPAT" = 1 ]; then
         printf 'BUILD_PCIBARCOMPAT_OPTIONS=BUILD=work/pcibarcompat STAGED=optional/GarnetPCIBarCompat.kext LOAD_ORDER=after-IOPCIFamily-before-PCI-config-and-Garnet-via-OpenCore-Kernel-Add-Root DISABLE_BOOT_ARG=garnet-rebar-compat=0\n'
     fi
@@ -451,6 +516,11 @@ fi
     printf 'BUILD_METAL_SPVCACHE_SOURCE=%s spv=%s meta=%s\n' \
         "$metal_cache" "$metal_spv_count" "$metal_meta_count"
     printf 'KEXT_SIGNING=strict-verified-after-ad-hoc-fallback\n'
+    if [ -n "${GARNET_SIGN_CA_DIR:-}" ]; then
+        printf 'USERSPACE_SIGNING=amfianchor-ca-rcodesign\n'
+    else
+        printf 'USERSPACE_SIGNING=ad-hoc-amfi-0x80\n'
+    fi
     printf 'RADV_INPUT=%s\nXLATE_INPUT=%s\n' "$RDNA4_RADV_LIB" "$RDNA4_XLATE_LIB"
     for kext_ver_entry in "Garnet:$payload/Garnet.kext" "GarnetAccel:$accel_kext"; do
         name=${kext_ver_entry%%:*}
@@ -483,6 +553,6 @@ fi
 )
 if [ "$RDNA4_RELEASE" = 1 ]; then
     python3 "$helper" verify-release-payload "$payload" >&2 \
-        || fail 'Release 1 payload verification failed'
+        || fail 'Release payload verification failed'
 fi
 printf '%s\n' "$payload"

@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include "amdgpu_regs.h"
 #include "garnet_gfxoff_pure.h"
+#include "garnet_power_policy_pure.h"
 
 namespace amdgpu {
 
@@ -58,7 +59,7 @@ kern_return_t smu_send_msg_with_param(const DeviceContext &dev,
 //
 kern_return_t smu_send_msg(const DeviceContext &dev, uint32_t msgId);
 
-// 0.0.604 (an internal design note C6): the ONE lock shared by every PPSMC message (smu_send_msg_with_param takes it itself), the
+// 0.0.604 (shared SMU mailbox lock): the ONE lock shared by every PPSMC message (smu_send_msg_with_param takes it itself), the
 // DAL sender (smu_dal.cpp) and any caller that needs several messages back to back. Recursive for the owning thread. smu_lock_enter()
 // returns false only when the lock could not be allocated (nothing is held then; smu_lock_exit must not be called).
 bool smu_lock_enter();
@@ -158,7 +159,7 @@ kern_return_t smu_transfer_table_smu_to_dram(const DeviceContext &dev,
 // module's bump allocator. GarnetDriver has no PSPContext yet (the
 // PSP module is a separate in-flight file) and DeviceContext
 // carries no VRAMBumpAllocator, so the table lives at a FIXED byte
-// offset from dev.vramBase — the first 64 KB of the region PORTING.md
+// offset from dev.vramBase — the first 64 KB of the reserved VRAM region
 // reserves for the bump allocator:
 //
 //   dev.vramBase + 0x0E00000 .. + 0x0E10000   (64 KB, = +14 MiB)
@@ -288,25 +289,28 @@ kern_return_t smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz = n
 kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
 
 // Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard with
-// ~100 ms delayed-idle AllowGfxOff hysteresis (`rdna4-gfxoff-default`).
+// ~100 ms delayed-idle AllowGfxOff hysteresis and activity-driven GFXCLK idle DPM governor.
 enum class DisplayWakePhase : uint8_t { Idle, Sleeping, Waking, PoweredOn };
 struct SMUContext {
-    rdna4gfxoff::GuardState gfxoff {};
-    const DeviceContext    *gfxoffDev   { nullptr };
-    void                   *gfxoffTimer { nullptr }; // thread_call_t in kernel
-    bool                    inited      { false };
-    bool                    powerEpochManaged { false };
-    bool                    sleepPending { false };
-    bool                    wakeUnverified { false };
-    const DeviceContext    *displayWakeDev { nullptr };
-    DisplayWakePhase        displayWakePhase { DisplayWakePhase::Idle };
+    rdna4gfxoff::GuardState   gfxoff {};
+    rdna4pwr::IdleDpmGovernor idleDpm {};
+    const DeviceContext      *gfxoffDev   { nullptr };
+    void                     *gfxoffTimer { nullptr }; // thread_call_t in kernel
+    bool                      inited      { false };
+    bool                      powerEpochManaged { false };
+    bool                      sleepPending { false };
+    bool                      wakeUnverified { false };
+    const DeviceContext      *displayWakeDev { nullptr };
+    DisplayWakePhase          displayWakePhase { DisplayWakePhase::Idle };
 };
 
+// Refcounted GC MMIO GFXOFF guard.
 kern_return_t gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow);
 kern_return_t gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
                                 bool bootArgPresent, uint32_t bootArgValue,
                                 bool *outAllowed = nullptr);
 kern_return_t gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
+void          gfx_off_register_context(SMUContext *smu);
 enum class GfxOffPowerEvent : uint8_t { WillSleep, WillNotSleep, WillPowerOn, HasPoweredOn, Shutdown };
 kern_return_t gfx_off_power_event(DeviceContext &dev, SMUContext &smu, GfxOffPowerEvent event);
 bool smu_display_wake_pin_allowed(const SMUContext &smu);
@@ -333,11 +337,27 @@ struct ScopedGfxOffGuard {
             (void)gfx_off_ctrl(*dev, *ctx, true);
         }
     }
-    ScopedGfxOffGuard(const ScopedGfxOffGuard &) = delete;
-    ScopedGfxOffGuard &operator=(const ScopedGfxOffGuard &) = delete;
     bool ok() const { return kr == kIOReturnSuccess; }
     kern_return_t status() const { return kr; }
+    ScopedGfxOffGuard(const ScopedGfxOffGuard &) = delete;
+    ScopedGfxOffGuard &operator=(const ScopedGfxOffGuard &) = delete;
 };
+
+// Activity-driven SMU GFXCLK idle governor (`garnet-idle-dpm`).
+// Serialized via SmuSeq on a dedicated IOWorkLoop/IOTimerEventSource (never
+// in IRQ context, never holding GPU ring locks across SMU mailbox I/O).
+using IdleDpmBusyFn = bool (*)(void *);
+void smu_idle_dpm_start(DeviceContext &dev, SMUContext &smu,
+                        bool dpmEnabled, bool idleClamp,
+                        IdleDpmBusyFn hwBusyFn, void *hwBusyCtx);
+void smu_idle_dpm_stop();
+// Notify governor of GFX/KCQ/SDMA submission activity.
+// `canBlock == true` boosts Low -> Auto synchronously (caller must hold no GPU
+// ring/scanout lock); `canBlock == false` updates timestamp lock-free and kicks
+// the governor workloop asynchronously when currently in Low.
+void smu_idle_dpm_note_activity(bool canBlock, bool heavy = false);
+// Lock out automatic idle governance after manual `garnettest power <state>`.
+void smu_idle_dpm_manual_override(uint32_t state);
 
 //=====================================================================
 //  Telemetry — the SMU metrics table

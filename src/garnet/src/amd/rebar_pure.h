@@ -1,5 +1,5 @@
 // rebar_pure.h - 0.0.663: Resizable BAR support, the PURE logic (no kernel types, no hardware access; host-tested by tests/native_rebar_test.cpp).
-// Contract: an internal design note section 3. Rule: with a 256 MiB BAR0 everything behaves exactly as 0.0.662; a larger BAR maps at most 1 GiB
+// Contract: driver contract: with a 256 MiB BAR0 everything behaves exactly as 0.0.662; a larger BAR maps at most 1 GiB
 // (what Tahoe's IOPCIFamily can size), and ANY inconsistency refuses the native ladder (the CPU desktop through RDNA4FB, as with no BAR0).
 //
 // What lives here:

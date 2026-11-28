@@ -133,6 +133,14 @@ void garnet_primary_fb_notify_driver_ready(GarnetDriver *driver) {
 	fb->release();
 }
 
+void garnet_primary_fb_notify_sleep(GarnetDriver *driver, bool sleeping) {
+	(void)driver;
+	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
+	if (!fb) return;
+	fb->onSystemSleep(sleeping);
+	fb->release();
+}
+
 void garnet_primary_fb_notify_wake(GarnetDriver *driver) {
 	if (!driver) return;
 	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
@@ -161,6 +169,13 @@ void garnet_primary_fb_notify_vbl(uint32_t otg) {
 	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
 	if (!fb) return;
 	fb->onHardwareVbl(otg);
+	fb->release();
+}
+
+void garnet_primary_fb_notify_hpd(uint32_t hpd, bool isShortPulse, bool senseHigh) {
+	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
+	if (!fb) return;
+	fb->onHardwareHpd(hpd, isShortPulse, senseHigh);
 	fb->release();
 }
 
@@ -593,7 +608,17 @@ bool modeset_phy_control(void *cookie, uint32_t action, uint8_t rateCode, uint8_
 	    0u,                                            // digfe_sel = 0 (matches Linux/dpphy.cpp)
 	    connObjId,
 	    0u, 0u);
-	return dmub_submit_one(c->mmio, cmd);
+	const bool ok = dmub_submit_one(c->mmio, cmd);
+	if (ok && action == 1u && c->out.hpd < rdna4hpd::kMaxHpdPins) {
+		// Reclaim HPD/HPD_RX routing if VBIOS DMCUB's DIG1_TRANSMITTER_CONTROL re-claimed it.
+		const rdna4hpd::Seg2Hw seg2Hw { const_cast<MmioAccess *>(&c->mmio), cursor_rd_seg2, cursor_wr_seg2, nullptr };
+		const rdna4hpd::HpdDestResult rt = rdna4hpd::route_hpd_to_host(seg2Hw, c->out.hpd);
+		if (rt.changed || !rt.hostRouted) {
+			RDNA4LOG("primaryfb: post-PHY HPD%u interrupt dest 0x%08x -> 0x%08x (host=%u)",
+			         c->out.hpd, rt.before, rt.after, rt.hostRouted ? 1u : 0u);
+		}
+	}
+	return ok;
 }
 
 __attribute__((noinline))
@@ -935,6 +960,12 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 	};
 
 	if (!wantOn) {
+		// Suppress HPD auto-recovery before blanking PHY so DPMS-off never triggers link recovery.
+		if (fHpdLock) {
+			IOLockLock(fHpdLock);
+			(void)fHpdState.setDpmsOff(true, hpdNowMs());
+			IOLockUnlock(fHpdLock);
+		}
 		// Pause hardware VBL IRQ + timer and drain any in-flight VBL callback while display sleeps.
 		syncHardwareVbl(false);
 		vblDispatchDrain();
@@ -981,6 +1012,11 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 		if (ok) {
 			__atomic_store_n(&fDpmsOff, true, __ATOMIC_RELEASE);
 		} else {
+			if (fHpdLock) {
+				IOLockLock(fHpdLock);
+				(void)fHpdState.setDpmsOff(false, hpdNowMs());
+				IOLockUnlock(fHpdLock);
+			}
 			// Failed DPMS-off must restore cursor + VBL so WindowServer never freezes.
 			restoreCursorAfterDpms();
 			restoreVblAfterDpms();
@@ -1023,6 +1059,14 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 	}
 	if (woke) {
 		__atomic_store_n(&fDpmsOff, false, __ATOMIC_RELEASE);
+		if (fHpdLock) {
+			IOLockLock(fHpdLock);
+			(void)fHpdState.setDpmsOff(false, hpdNowMs());
+			IOLockUnlock(fHpdLock);
+		}
+		if (fActiveOutput.found && fActiveOutput.hpd < rdna4hpd::kMaxHpdPins) {
+			rdna4dcn::primaryHpdRecoverAck(fActiveOutput.hpd);
+		}
 		RDNA4LOG("primaryfb: DPMS ON retrain OK (%ux%u@%u.%03uHz, rate=0x%02x, dsc=%u)",
 		         curTiming.width, curTiming.height,
 		         curTiming.refreshMilliHz() / 1000u, curTiming.refreshMilliHz() % 1000u,
@@ -1271,8 +1315,13 @@ void AMDGarnetPrimaryFramebuffer::readProviderEdid(IOService *provider) {
 
 void AMDGarnetPrimaryFramebuffer::free() {
 	teardownUclkWatchdog();
+	teardownHpdTimer();
 	teardownVblTimer();
 	teardownCursorSlot();
+	if (fHpdLock) {
+		IOLockFree(fHpdLock);
+		fHpdLock = nullptr;
+	}
 	if (fVblLock) {
 		IOLockFree(fVblLock);
 		fVblLock = nullptr;
@@ -1367,6 +1416,19 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 			RDNA4LOG("primaryfb: hardware VBLANK IRQ disabled by boot-arg garnet-vbl-irq=0 (using timer)");
 		}
 	}
+	{
+		uint32_t hpdArg = 1u;
+		const bool present = PE_parse_boot_argn("garnet-hpd-recover", &hpdArg, sizeof(hpdArg));
+		fHpdRecoverAllowed = rdna4hpd::boot_arg_enabled(present, hpdArg);
+		if (!fHpdRecoverAllowed) {
+			RDNA4LOG("primaryfb: DisplayPort HPD auto-recovery disabled by boot-arg garnet-hpd-recover=0");
+		}
+	}
+	fHpdState.init(fHpdRecoverAllowed);
+	fHpdHwArmed = false;
+	fHpdDestWriteFailed = false;
+	fSystemSleeping = false;
+	fHpdPin = fActiveOutput.found ? fActiveOutput.hpd : 0u;
 	fVblHwArmed = false;
 	fVblOtg = fActiveOutput.found ? fActiveOutput.otg : 0u;
 	fVblLastHwNs = 0u;
@@ -1398,6 +1460,10 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 	if (!fDpmsLock) {
 		fDpmsLock = IOLockAlloc();
 		if (!fDpmsLock) return false;
+	}
+	if (!fHpdLock) {
+		fHpdLock = IOLockAlloc();
+		if (!fHpdLock) return false;
 	}
 	{
 		GarnetDriver *cursorDriver = retain_driver();
@@ -1447,6 +1513,7 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 		}
 		if (fPeerRegistered) optimizeDet0AndUclkLocked(driver);
 		syncHardwareVbl(true);
+		syncHardwareHpd(true, driver);
 		if (fVblLock) {
 			IOLockLock(fVblLock);
 			const bool wantVbl = fVblEnabled && !fStopping;
@@ -1457,10 +1524,15 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 		}
 		if (!fPeerRegistered) registerPeerLocked(driver);
 	}
-	IOLockUnlock(fDpmsLock);
+	if (fDpmsLock) IOLockUnlock(fDpmsLock);
+	if (fStopping) return;
+	scheduleHpdWatchdogIfNeeded();
 }
 
 void AMDGarnetPrimaryFramebuffer::registerPeerLocked(GarnetDriver *driver) {
+	// Never call IOFramebuffer::handleEvent(kIOFBNotifyDisplayModeDidChange, nullptr) from GarnetDriver's
+	// thread: handleEvent() is only defined for power-state notifications under IOFramebuffer's own lock.
+	if (fPeerRegistered) return;
 	rdna4peer::Snapshot snap {};
 	if (!driver->snapshotDisplayState(&snap)) return;
 	if (!rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)) {
@@ -1490,6 +1562,13 @@ void AMDGarnetPrimaryFramebuffer::registerPeerLocked(GarnetDriver *driver) {
 }
 
 void AMDGarnetPrimaryFramebuffer::stop(IOService *provider) {
+	if (fHpdLock) IOLockLock(fHpdLock);
+	fStopping = true;
+	__atomic_store_n(&fHpdHwArmed, false, __ATOMIC_RELEASE);
+	if (fHpdLock) IOLockUnlock(fHpdLock);
+	syncHardwareHpd(false);
+	teardownHpdTimer();
+
 	if (fVblLock) IOLockLock(fVblLock);
 	__atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
 	fVblEnabled = false;
@@ -1761,6 +1840,544 @@ void AMDGarnetPrimaryFramebuffer::teardownVblTimer() {
 	fVblWorkLoop = nullptr;
 }
 
+uint64_t AMDGarnetPrimaryFramebuffer::hpdNowMs() const {
+	return vblNowNs() / 1000000ULL;
+}
+
+bool AMDGarnetPrimaryFramebuffer::ensureHpdTimer() {
+	if (!fHpdLock) return false;
+	IOLockLock(fHpdLock);
+	if (fStopping) {
+		IOLockUnlock(fHpdLock);
+		return false;
+	}
+	if (fHpdTimer && fHpdWorkLoop) {
+		IOLockUnlock(fHpdLock);
+		return true;
+	}
+	IOLockUnlock(fHpdLock);
+
+	IOWorkLoop *wl = IOWorkLoop::workLoop();
+	if (!wl) return false;
+	IOTimerEventSource *timer =
+	    IOTimerEventSource::timerEventSource(this, &AMDGarnetPrimaryFramebuffer::onHpdTimer);
+	if (!timer) {
+		wl->release();
+		return false;
+	}
+	if (wl->addEventSource(timer) != kIOReturnSuccess) {
+		timer->release();
+		wl->release();
+		return false;
+	}
+	timer->enable();
+
+	bool published = false;
+	IOLockLock(fHpdLock);
+	if (!fStopping && !fHpdTimer && !fHpdWorkLoop) {
+		fHpdWorkLoop = wl;
+		fHpdTimer = timer;
+		published = true;
+	}
+	IOLockUnlock(fHpdLock);
+	if (!published) {
+		timer->disable();
+		timer->cancelTimeout();
+		wl->removeEventSource(timer);
+		timer->release();
+		wl->release();
+		return fHpdTimer != nullptr && !fStopping;
+	}
+	return true;
+}
+
+void AMDGarnetPrimaryFramebuffer::teardownHpdTimer() {
+	IOTimerEventSource *timer = nullptr;
+	IOWorkLoop *wl = nullptr;
+	if (fHpdLock) IOLockLock(fHpdLock);
+	timer = fHpdTimer;
+	wl = fHpdWorkLoop;
+	fHpdTimer = nullptr;
+	fHpdWorkLoop = nullptr;
+	if (fHpdLock) IOLockUnlock(fHpdLock);
+
+	if (timer) {
+		timer->disable();
+		timer->cancelTimeout();
+		if (wl) wl->removeEventSource(timer);
+		timer->release();
+	}
+	if (wl) wl->release();
+}
+
+void AMDGarnetPrimaryFramebuffer::applyHpdTimerAction(const rdna4hpd::Action &act,
+                                                      IOTimerEventSource *retainedTimer) {
+	if (!retainedTimer) return;
+	if (act.cancelTimer) {
+		retainedTimer->cancelTimeout();
+	} else if (act.scheduleTimerMs > 0u) {
+		retainedTimer->setTimeoutMS(act.scheduleTimerMs);
+	}
+	retainedTimer->release();
+}
+
+// Arm or cancel the 1 Hz HPD/link watchdog outside fDpmsLock (never call IOTimerEventSource under fDpmsLock).
+void AMDGarnetPrimaryFramebuffer::scheduleHpdWatchdogIfNeeded() {
+	if (!fHpdLock || fStopping) return;
+	IOLockLock(fHpdLock);
+	IOTimerEventSource *timer = fHpdTimer;
+	const bool want = !fStopping &&
+	                  __atomic_load_n(&fHpdHwArmed, __ATOMIC_ACQUIRE) &&
+	                  fHpdState.shouldRunWatchdog();
+	const bool suppressed = fStopping || fHpdState.suppressed();
+	if (timer && (want || suppressed)) timer->retain();
+	else timer = nullptr;
+	IOLockUnlock(fHpdLock);
+
+	if (!timer) return;
+	if (want) {
+		timer->setTimeoutMS(rdna4hpd::kDefaultWatchdogMs);
+	} else {
+		timer->cancelTimeout();
+	}
+	timer->release();
+}
+
+void AMDGarnetPrimaryFramebuffer::syncHardwareHpd(bool want, GarnetDriver *knownDriver) {
+	if (!want || !fHpdRecoverAllowed || fStopping ||
+	    !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid ||
+	    fActiveOutput.hpd >= rdna4hpd::kMaxHpdPins) {
+		uint32_t pin = 0u;
+		if (fHpdLock) IOLockLock(fHpdLock);
+		pin = fHpdPin;
+		__atomic_store_n(&fHpdHwArmed, false, __ATOMIC_RELEASE);
+		if (fHpdLock) IOLockUnlock(fHpdLock);
+		(void)rdna4dcn::primaryHpdIrqSet(nullptr, pin, false);
+		return;
+	}
+	if (!ensureHpdTimer()) return;
+
+	GarnetDriver *driver = knownDriver ? knownDriver : retain_driver();
+	const bool ownDriver = (knownDriver == nullptr && driver != nullptr);
+	const uint32_t pin = fActiveOutput.hpd;
+	const bool armed = driver && rdna4dcn::primaryHpdIrqSet(driver, pin, true);
+	if (ownDriver) driver->release();
+
+	if (fHpdLock) IOLockLock(fHpdLock);
+	const bool prev = __atomic_load_n(&fHpdHwArmed, __ATOMIC_ACQUIRE);
+	fHpdPin = pin;
+	const bool nextArmed = armed && !fStopping && fHpdRecoverAllowed;
+	__atomic_store_n(&fHpdHwArmed, nextArmed, __ATOMIC_RELEASE);
+	const bool disarmNow = armed && !nextArmed;
+	if (fHpdLock) IOLockUnlock(fHpdLock);
+
+	if (disarmNow) {
+		(void)rdna4dcn::primaryHpdIrqSet(nullptr, pin, false);
+	} else if (nextArmed && !prev) {
+		RDNA4LOG("primaryfb: hardware DCN41 HPD/HPD_RX IRQ armed on HPD%u (DIG%u OTG%u AUX%u, debounce %u ms, maxRetries %u)",
+		         pin, fActiveOutput.dig, fActiveOutput.otg, fActiveOutput.aux,
+		         fHpdState.cfg.debounceMs, fHpdState.cfg.maxRetries);
+	}
+}
+
+void AMDGarnetPrimaryFramebuffer::onSystemSleep(bool sleeping) {
+	__atomic_store_n(&fSystemSleeping, sleeping, __ATOMIC_RELEASE);
+	if (!fHpdLock) return;
+	IOLockLock(fHpdLock);
+	const rdna4hpd::Action act = fHpdState.setSystemSleeping(sleeping, hpdNowMs());
+	IOTimerEventSource *timer = (act.cancelTimer || act.scheduleTimerMs > 0u) ? fHpdTimer : nullptr;
+	if (timer) timer->retain();
+	IOLockUnlock(fHpdLock);
+	applyHpdTimerAction(act, timer);
+	if (!sleeping) scheduleHpdWatchdogIfNeeded();
+}
+
+void AMDGarnetPrimaryFramebuffer::onHardwareHpd(uint32_t hpd, bool isShortPulse, bool senseHigh) {
+	if (!fHpdRecoverAllowed || !fHpdLock || fStopping) return;
+	if (!__atomic_load_n(&fHpdHwArmed, __ATOMIC_ACQUIRE)) return;
+
+	IOLockLock(fHpdLock);
+	if (fStopping || hpd != fHpdPin) {
+		IOLockUnlock(fHpdLock);
+		return;
+	}
+	const uint64_t nowMs = hpdNowMs();
+	const rdna4hpd::Action act = isShortPulse ? fHpdState.onHpdRxShortPulse(senseHigh, nowMs)
+	                                          : fHpdState.onHpdIrq(senseHigh, nowMs);
+	const bool wantWatchdog = !fStopping && act.cancelTimer && act.scheduleTimerMs == 0u &&
+	                          fHpdState.shouldRunWatchdog();
+	IOTimerEventSource *timer = (act.cancelTimer || act.scheduleTimerMs > 0u || wantWatchdog) ? fHpdTimer : nullptr;
+	if (timer) timer->retain();
+	IOLockUnlock(fHpdLock);
+
+	RDNA4LOG("primaryfb: HPD%u %s sense=%u -> timer=%u ms cancel=%u",
+	         hpd, isShortPulse ? "short-pulse(RX)" : "edge", senseHigh ? 1u : 0u,
+	         act.scheduleTimerMs, act.cancelTimer ? 1u : 0u);
+	rdna4hpd::Action timerAct = act;
+	if (wantWatchdog) {
+		timerAct.cancelTimer = false;
+		timerAct.scheduleTimerMs = rdna4hpd::kDefaultWatchdogMs;
+	}
+	applyHpdTimerAction(timerAct, timer);
+}
+
+__attribute__((noinline))
+bool AMDGarnetPrimaryFramebuffer::runHpdRecoveryLocked(rdna4hpd::Reason reason, bool *outSenseStillHigh) {
+	if (outSenseStillHigh) *outSenseStillHigh = false;
+	if (!fHpdRecoverAllowed || fStopping || !fPci ||
+	    !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid ||
+	    fActiveOutput.hpd >= rdna4hpd::kMaxHpdPins || fActiveOutput.dig >= rdna4hpd::kMaxDigInsts) {
+		return false;
+	}
+	if (__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&fSystemSleeping, __ATOMIC_ACQUIRE)) {
+		if (outSenseStillHigh) *outSenseStillHigh = true;
+		return false;
+	}
+
+	GarnetDriver *driver = retain_driver();
+	if (!driver) return false;
+
+	rdna4edidmodes::DetailedTiming curTiming {};
+	const bool haveTiming = rdna4fbprimary::modeForId(fModeTable, fCurrentMode, &curTiming);
+	if (!haveTiming) {
+		driver->release();
+		return false;
+	}
+
+	// Step 1: Restore dcn-dp AUX routing and probe HPD sense + DIG_FIFO_CTRL0 + DPCD link status.
+	MmioAccess mmio {};
+	if (!acquire_mmio(fPci, driver, &mmio)) {
+		driver->release();
+		return false;
+	}
+	const uint32_t dtoMod = mmio_rd_seg(&mmio, 1u, rdna4modeset::kSeg1DpDto0Modulo + fActiveOutput.otg * 4u);
+	const uint32_t expPixCode = (dtoMod != 0u && dtoMod != 0xffffffffu)
+	                                ? rdna4hpd::dig_fifo_expected_pix_per_cycle(curTiming.pixelClockHz, dtoMod)
+	                                : 4u;
+	const rdna4hpd::Seg2Hw seg2Hw { &mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
+	const rdna4ddcpad::DdcPadHw padHw { &mmio, cursor_rd_seg2, cursor_wr_seg2, ddcpad_sleep_ms };
+	const rdna4aux::Io auxIo { &mmio, aux_mmio_read, aux_mmio_write, aux_now_us, aux_delay_us };
+	const uint8_t expLanes = (fDpcdCaps.valid && fDpcdCaps.curLaneCountSet) ? fDpcdCaps.curLaneCountSet : 4u;
+	const rdna4hpd::ProbeResult probe = rdna4hpd::prepare_recovery_aux_and_probe(
+	    seg2Hw, padHw, auxIo, fActiveOutput, expLanes, expPixCode, reason);
+	release_mmio(mmio);
+
+	if (outSenseStillHigh) *outSenseStillHigh = probe.hpdConnected;
+	if (!probe.hpdConnected) {
+		RDNA4LOG("primaryfb: HPD%u recovery skipped — sink disconnected (status=0x%08x)",
+		         fActiveOutput.hpd, probe.hpdStatusReg);
+		driver->release();
+		return false;
+	}
+	if (!probe.needsRetrain) {
+		RDNA4LOG("primaryfb: HPD%u short-pulse healthy (lanes=%02x%02x%02x fifo=0x%08x stream=0x%08x); no retrain needed",
+		         fActiveOutput.hpd, probe.laneStatus[0], probe.laneStatus[1], probe.laneStatus[2],
+		         probe.digFifoReg, probe.vidStreamReg);
+		rdna4dcn::primaryHpdRecoverAck(fActiveOutput.hpd);
+		driver->release();
+		return true;
+	}
+
+	RDNA4LOG("primaryfb: HPD%u recovery starting (reason=%u auxPad=%u auxCtl=%u d0=%u dpcdOk=%u linkOk=%u fifo=0x%08x stream=0x%08x)",
+	         fActiveOutput.hpd, static_cast<unsigned>(reason),
+	         probe.auxPadRestored ? 1u : 0u, probe.auxCtlOk ? 1u : 0u,
+	         probe.sinkD0Written ? 1u : 0u, probe.dpcdReadOk ? 1u : 0u, probe.dpcdLinkOk ? 1u : 0u,
+	         probe.digFifoReg, probe.vidStreamReg);
+
+	// Step 2: Pause hardware VBL IRQ cleanly before taking rdna4_display_txn so VUPDATE_NO_LOCK
+	// never collides with recovery or latches a watchdog ACK storm.
+	syncHardwareVbl(false);
+	vblDispatchDrain();
+
+	if (fCursorLock) {
+		IOLockLock(fCursorLock);
+		if (fCursorHwAvailable) fCursorNeedsProgram = true;
+		IOLockUnlock(fCursorLock);
+	}
+
+	struct RetryDisplayTxn {
+		uint64_t token { 0u };
+		bool ok { false };
+		explicit RetryDisplayTxn(uint32_t kind) {
+			if (rdna4displaytxn::held_for(0u)) {
+				ok = true;
+				return;
+			}
+			for (uint32_t attempt = 0u; attempt < 25u; ++attempt) {
+				if (rdna4displaytxn::begin(kind, 0u, &token)) {
+					ok = true;
+					return;
+				}
+				IOSleep(2u);
+			}
+		}
+		~RetryDisplayTxn() {
+			if (token) rdna4displaytxn::end(token);
+		}
+		RetryDisplayTxn(const RetryDisplayTxn &) = delete;
+		RetryDisplayTxn &operator=(const RetryDisplayTxn &) = delete;
+	};
+
+	bool recovered = false;
+	uint32_t fifoAfter = 0xffffffffu;
+	{
+		RetryDisplayTxn txn(rdna4peer::kLeaseLocalDisplay);
+		if (!txn.ok) {
+			RDNA4LOG("primaryfb: HPD%u recovery deferred — display transaction lease busy", fActiveOutput.hpd);
+		} else {
+			// Refresh DPCD capabilities if readable (keeping prior cached caps on transient read error).
+			MmioAccess mDpcd {};
+			if (acquire_mmio(fPci, driver, &mDpcd)) {
+				const rdna4aux::Io ioDpcd { &mDpcd, aux_mmio_read, aux_mmio_write, aux_now_us, aux_delay_us };
+				rdna4aux::DpcdCaps freshCaps {};
+				if (rdna4aux::readDpcdCaps(ioDpcd, fActiveOutput.aux, fActiveOutput.hpd, &freshCaps) == rdna4aux::kOk &&
+				    freshCaps.valid) {
+					fDpcdCaps = freshCaps;
+				}
+				release_mmio(mDpcd);
+			}
+
+			recovered = applyHardwareModeLocked(curTiming, /*forceRetrain=*/true, driver);
+
+			// Verify DIG_FIFO_CTRL0 error bit is clear and PIXEL_PER_CYCLE matches mode; explicitly reset if needed.
+			MmioAccess mPost {};
+			if (acquire_mmio(fPci, driver, &mPost)) {
+				const uint32_t fifoOff = rdna4hpd::dig_fifo_ctrl0_reg(fActiveOutput.dig);
+				fifoAfter = mmio_rd_seg(&mPost, 2u, fifoOff);
+				const uint32_t postMod = mmio_rd_seg(&mPost, 1u, rdna4modeset::kSeg1DpDto0Modulo + fActiveOutput.otg * 4u);
+				const uint32_t wantPix = (postMod != 0u && postMod != 0xffffffffu)
+				                             ? rdna4hpd::dig_fifo_expected_pix_per_cycle(curTiming.pixelClockHz, postMod)
+				                             : rdna4hpd::dig_fifo_pix_per_cycle(fifoAfter);
+				if (recovered &&
+				    (rdna4hpd::dig_fifo_has_error(fifoAfter) ||
+				     rdna4hpd::dig_fifo_pix_per_cycle(fifoAfter) != wantPix)) {
+					const rdna4hpd::Seg2Hw postHw { &mPost, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
+					const rdna4hpd::ClearFifoResult cf =
+					    rdna4hpd::clear_dig_fifo_error(postHw, fActiveOutput.dig, wantPix);
+					fifoAfter = cf.after;
+					if (!cf.ok) recovered = false;
+				}
+				if (outSenseStillHigh) {
+					const uint32_t hs = mmio_rd_seg(&mPost, 2u, rdna4hpd::hpd_status_reg(fActiveOutput.hpd));
+					*outSenseStillHigh = rdna4hpd::hpd_sense_connected(hs);
+				}
+				release_mmio(mPost);
+			}
+		}
+	}
+
+	// Step 3: Re-program HW cursor, re-arm hardware VBL IRQ, and clear any latched HPD ACK outside txn.
+	if (recovered && fCursorLock) {
+		IOLockLock(fCursorLock);
+		if (fCursorHwAvailable && !fCursorDpmsSuspended && fCursorVisible && fCursorW > 0u && fCursorH > 0u) {
+			MmioAccess mCur {};
+			if (acquire_mmio(fPci, driver, &mCur)) {
+				const rdna4cursor::CursorHw chw { &mCur, cursor_rd_seg2, cursor_wr_seg2 };
+				const rdna4cursor::CursorPlaneConfig cfg {
+					fCursorPipe, fCursorMcAddr, fCursorW, fCursorH,
+					fCursorX, fCursorY, fCursorHotX, fCursorHotY,
+					currentPixelClockKhz(), true,
+				};
+				if (rdna4cursor::program_cursor_plane(chw, cfg)) {
+					fCursorNeedsProgram = false;
+				}
+				release_mmio(mCur);
+			}
+		}
+		IOLockUnlock(fCursorLock);
+	}
+
+	if (!__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) && !fStopping) {
+		syncHardwareVbl(true);
+		bool vblWanted = false;
+		if (fVblLock) {
+			IOLockLock(fVblLock);
+			vblWanted = fVblEnabled && !fStopping;
+			IOLockUnlock(fVblLock);
+		}
+		if (vblWanted && fVblTimer) {
+			fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
+		}
+	}
+	rdna4dcn::primaryHpdRecoverAck(fActiveOutput.hpd);
+
+	RDNA4LOG("primaryfb: HPD%u recovery %s (%ux%u@%u.%03uHz, rate=0x%02x, dsc=%u, fifo 0x%08x -> 0x%08x, sense=%u)",
+	         fActiveOutput.hpd, recovered ? "OK" : "FAILED",
+	         curTiming.width, curTiming.height,
+	         curTiming.refreshMilliHz() / 1000u, curTiming.refreshMilliHz() % 1000u,
+	         fActiveLinkRate, fActiveDscOn ? 1u : 0u, probe.digFifoReg, fifoAfter,
+	         (outSenseStillHigh && *outSenseStillHigh) ? 1u : 0u);
+
+	driver->release();
+	return recovered;
+}
+
+void AMDGarnetPrimaryFramebuffer::onHpdTimer(OSObject *owner, IOTimerEventSource *sender) {
+	AMDGarnetPrimaryFramebuffer *self = OSDynamicCast(AMDGarnetPrimaryFramebuffer, owner);
+	if (!self || !sender || !self->fHpdLock) return;
+
+	IOLockLock(self->fHpdLock);
+	if (self->fStopping) {
+		IOLockUnlock(self->fHpdLock);
+		return;
+	}
+	const rdna4hpd::Action act = self->fHpdState.onTimer(self->hpdNowMs());
+	const bool wantWatchdog = !act.runRecovery && act.scheduleTimerMs == 0u &&
+	                          !self->fStopping &&
+	                          __atomic_load_n(&self->fHpdHwArmed, __ATOMIC_ACQUIRE) &&
+	                          self->fHpdState.shouldRunWatchdog();
+	IOLockUnlock(self->fHpdLock);
+
+	if (!act.runRecovery) {
+		if (act.scheduleTimerMs > 0u) {
+			sender->setTimeoutMS(act.scheduleTimerMs);
+			return;
+		}
+		if (!wantWatchdog) return;
+
+		// Lightweight 1 Hz belt-and-suspenders watchdog (MMIO-only, zero AUX traffic when healthy).
+		if (!self->fDpmsLock || !IOLockTryLock(self->fDpmsLock)) {
+			sender->setTimeoutMS(rdna4hpd::kDefaultWatchdogMs);
+			return;
+		}
+		bool sampled = false;
+		bool senseHigh = true;
+		bool irqLatched = false;
+		bool linkFault = false;
+		uint32_t hpdStatus = 0u;
+		uint32_t fifo = 0u;
+		uint32_t vid = 0u;
+		uint32_t expPixCode = 4u;
+		uint32_t hpdPin = 0u;
+		bool destReclaimed = false;
+		bool destWriteFailedNow = false;
+		uint32_t destBefore = 0u;
+		uint32_t destAfter = 0u;
+
+		if (!self->fStopping && self->fPci &&
+		    !__atomic_load_n(&self->fDpmsOff, __ATOMIC_ACQUIRE) &&
+		    !__atomic_load_n(&self->fSystemSleeping, __ATOMIC_ACQUIRE) &&
+		    self->fActiveOutput.found && self->fActiveOutput.isDp &&
+		    self->fActiveOutput.hpd < rdna4hpd::kMaxHpdPins &&
+		    self->fActiveOutput.dig < rdna4hpd::kMaxDigInsts) {
+			GarnetDriver *driver = retain_driver();
+			MmioAccess mmio {};
+			if (acquire_mmio(self->fPci, driver, &mmio)) {
+				hpdPin = self->fActiveOutput.hpd;
+				const uint32_t dig = self->fActiveOutput.dig;
+				const uint32_t otg = self->fActiveOutput.otg;
+				hpdStatus = mmio_rd_seg(&mmio, 2u, rdna4hpd::hpd_status_reg(hpdPin));
+				fifo = mmio_rd_seg(&mmio, 2u, rdna4hpd::dig_fifo_ctrl0_reg(dig));
+				vid = mmio_rd_seg(&mmio, 2u, rdna4modeset::kSeg2Dp0VidStreamCntl + dig * rdna4hpd::kSeg2DigStride);
+				const uint32_t dtoMod = mmio_rd_seg(&mmio, 1u, rdna4modeset::kSeg1DpDto0Modulo + otg * 4u);
+				rdna4edidmodes::DetailedTiming curTiming {};
+				if (dtoMod != 0u && dtoMod != 0xffffffffu &&
+				    rdna4fbprimary::modeForId(self->fModeTable, self->fCurrentMode, &curTiming)) {
+					expPixCode = rdna4hpd::dig_fifo_expected_pix_per_cycle(curTiming.pixelClockHz, dtoMod);
+				}
+				const uint32_t destMask = rdna4hpd::hpd_interrupt_dest_mask(hpdPin);
+				destBefore = mmio_rd_seg(&mmio, 2u, rdna4hpd::kSeg2HpdInterruptDest);
+				if (!self->fHpdDestWriteFailed && destBefore != 0xffffffffu && (destBefore & destMask) != 0u) {
+					const rdna4hpd::Seg2Hw seg2Hw { &mmio, cursor_rd_seg2, cursor_wr_seg2, nullptr };
+					const rdna4hpd::HpdDestResult rt = rdna4hpd::route_hpd_to_host(seg2Hw, hpdPin);
+					destAfter = rt.after;
+					if (rt.hostRouted) {
+						destReclaimed = true;
+					} else {
+						self->fHpdDestWriteFailed = true;
+						destWriteFailedNow = true;
+					}
+				}
+				release_mmio(mmio);
+
+				if (hpdStatus != 0xffffffffu) {
+					senseHigh = rdna4hpd::hpd_sense_connected(hpdStatus);
+					irqLatched = (hpdStatus & rdna4hpd::kHpdAnyIrqStatusMask) != 0u;
+					const bool fifoErr = rdna4hpd::dig_fifo_has_error(fifo);
+					const bool pixMismatch = (fifo != 0xffffffffu) && (expPixCode <= 3u) &&
+					                         (rdna4hpd::dig_fifo_pix_per_cycle(fifo) != expPixCode);
+					const bool streamDead = (vid == 0xffffffffu) || ((vid & 0x00010001u) != 0x00010001u);
+					linkFault = fifoErr || pixMismatch || streamDead;
+					sampled = true;
+				}
+			}
+			if (driver) driver->release();
+		}
+		IOLockUnlock(self->fDpmsLock);
+
+		if (destReclaimed) {
+			RDNA4LOG("primaryfb: watchdog reclaimed HPD%u interrupt dest 0x%08x -> 0x%08x",
+			         hpdPin, destBefore, destAfter);
+		} else if (destWriteFailedNow) {
+			RDNA4LOG("primaryfb: watchdog could not clear HPD%u interrupt dest (0x%08x -> 0x%08x); relying on MMIO link watchdog",
+			         hpdPin, destBefore, destAfter);
+		}
+
+		if (!sampled) {
+			IOLockLock(self->fHpdLock);
+			const bool keep = !self->fStopping && self->fHpdState.shouldRunWatchdog();
+			IOLockUnlock(self->fHpdLock);
+			if (keep) sender->setTimeoutMS(rdna4hpd::kDefaultWatchdogMs);
+			return;
+		}
+		if (irqLatched) {
+			rdna4dcn::primaryHpdRecoverAck(hpdPin);
+		}
+
+		IOLockLock(self->fHpdLock);
+		const rdna4hpd::State prevState = self->fHpdState.state;
+		const rdna4hpd::Action wdAct =
+		    self->fHpdState.onWatchdogTick(senseHigh, irqLatched, linkFault, self->hpdNowMs());
+		const bool stopping = self->fStopping;
+		IOLockUnlock(self->fHpdLock);
+
+		if (wdAct.reason != rdna4hpd::Reason::None) {
+			RDNA4LOG("primaryfb: HPD%u watchdog detected event (reason=%u sense=%u irq=%u fault=%u fifo=0x%08x expPix=%u stream=0x%08x hpd=0x%08x)",
+			         hpdPin, static_cast<unsigned>(wdAct.reason), senseHigh ? 1u : 0u,
+			         irqLatched ? 1u : 0u, linkFault ? 1u : 0u, fifo, expPixCode, vid, hpdStatus);
+		} else if (!senseHigh && prevState != rdna4hpd::State::Disconnected) {
+			RDNA4LOG("primaryfb: HPD%u watchdog observed disconnect (hpd=0x%08x)", hpdPin, hpdStatus);
+		}
+		if (!stopping && wdAct.scheduleTimerMs > 0u) {
+			sender->setTimeoutMS(wdAct.scheduleTimerMs);
+		}
+		return;
+	}
+
+	bool senseStillHigh = false;
+	bool ok = false;
+	if (self->fDpmsLock) IOLockLock(self->fDpmsLock);
+	if (!self->fStopping) {
+		ok = self->runHpdRecoveryLocked(act.reason, &senseStillHigh);
+	}
+	if (self->fDpmsLock) IOLockUnlock(self->fDpmsLock);
+
+	if (ok) rdna4disp_on_mode_change();
+
+	IOLockLock(self->fHpdLock);
+	const rdna4hpd::Action post = self->fHpdState.onRecoveryResult(ok, senseStillHigh, self->hpdNowMs());
+	const bool stopping = self->fStopping;
+	const uint32_t retries = self->fHpdState.retryCount;
+	const bool inCooldown = (self->fHpdState.state == rdna4hpd::State::Cooldown);
+	const bool wantNextWatchdog = !stopping && post.scheduleTimerMs == 0u &&
+	                              __atomic_load_n(&self->fHpdHwArmed, __ATOMIC_ACQUIRE) &&
+	                              self->fHpdState.shouldRunWatchdog();
+	IOLockUnlock(self->fHpdLock);
+
+	if (!ok && inCooldown) {
+		RDNA4LOG("primaryfb: HPD recovery reached retry ceiling (%u); entering %u ms cooldown",
+		         retries, self->fHpdState.cfg.cooldownMs);
+	}
+	if (!stopping) {
+		if (post.scheduleTimerMs > 0u) {
+			sender->setTimeoutMS(post.scheduleTimerMs);
+		} else if (wantNextWatchdog) {
+			sender->setTimeoutMS(rdna4hpd::kDefaultWatchdogMs);
+		}
+	}
+}
+
 void AMDGarnetPrimaryFramebuffer::initForPM() {
 	if (fPmRegistered) return;
 	fPmRegistered = true;
@@ -1971,6 +2588,7 @@ IOReturn AMDGarnetPrimaryFramebuffer::setAttribute(IOSelect attribute, uintptr_t
 		const bool wantOn = rdna4dpms::should_be_on(fPowerState, fConnPower);
 		(void)applyDpmsLocked(wantOn);
 		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		scheduleHpdWatchdogIfNeeded();
 
 		if (goingOn) handleEvent(kIOFBNotifyDidPowerOn, nullptr);
 		return kIOReturnSuccess;
@@ -2030,6 +2648,7 @@ IOReturn AMDGarnetPrimaryFramebuffer::setAttributeForConnection(IOIndex connectI
 		const bool wantOn = rdna4dpms::should_be_on(fPowerState, fConnPower);
 		(void)applyDpmsLocked(wantOn);
 		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		scheduleHpdWatchdogIfNeeded();
 		return kIOReturnSuccess;
 	}
 	return super::setAttributeForConnection(connectIndex, attribute, value);
@@ -2448,6 +3067,13 @@ void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
 		IOLockUnlock(fDpmsLock);
 		return;
 	}
+	__atomic_store_n(&fSystemSleeping, false, __ATOMIC_RELEASE);
+	if (fHpdLock) {
+		IOLockLock(fHpdLock);
+		(void)fHpdState.setSystemSleeping(false, hpdNowMs());
+		IOLockUnlock(fHpdLock);
+	}
+	bool wakeNeedsLinkRecover = false;
 	// S3 resume may reset DCHUBBUB_DET0_CTRL back to UEFI's 192 KiB default; re-verify DET0 & UCLK.
 	fDet0Expanded = false;
 	++fUclkWatchGeneration;
@@ -2471,6 +3097,16 @@ void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
 				if (rdna4ddcpad::set_ddc_pad_mode(padHw, static_cast<uint8_t>(fActiveOutput.aux), false)) {
 					RDNA4LOG("primaryfb: wake restored DP AUX%u pads to AUX mode", fActiveOutput.aux);
 				}
+				if (fHpdRecoverAllowed && fActiveOutput.hpd < rdna4hpd::kMaxHpdPins &&
+				    fActiveOutput.dig < rdna4hpd::kMaxDigInsts) {
+					const uint32_t hs = mmio_rd_seg(&mmio, 2u, rdna4hpd::hpd_status_reg(fActiveOutput.hpd));
+					const uint32_t fifo = mmio_rd_seg(&mmio, 2u, rdna4hpd::dig_fifo_ctrl0_reg(fActiveOutput.dig));
+					const uint32_t vid = mmio_rd_seg(&mmio, 2u, rdna4modeset::kSeg2Dp0VidStreamCntl + fActiveOutput.dig * rdna4hpd::kSeg2DigStride);
+					if (rdna4hpd::hpd_sense_connected(hs) &&
+					    (rdna4hpd::dig_fifo_has_error(fifo) || vid == 0xffffffffu || (vid & 0x00010001u) != 0x00010001u)) {
+						wakeNeedsLinkRecover = true;
+					}
+				}
 				release_mmio(mmio);
 			}
 		}
@@ -2481,5 +3117,16 @@ void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
 		}
 	}
 	optimizeDet0AndUclkLocked(driver);
+	syncHardwareHpd(true, driver);
 	if (fDpmsLock) IOLockUnlock(fDpmsLock);
+
+	if (wakeNeedsLinkRecover && fHpdLock && !fStopping) {
+		IOLockLock(fHpdLock);
+		const rdna4hpd::Action act = fHpdState.onLinkFaultDetected(true, hpdNowMs());
+		IOTimerEventSource *timer = (act.cancelTimer || act.scheduleTimerMs > 0u) ? fHpdTimer : nullptr;
+		if (timer) timer->retain();
+		IOLockUnlock(fHpdLock);
+		applyHpdTimerAction(act, timer);
+	}
+	scheduleHpdWatchdogIfNeeded();
 }

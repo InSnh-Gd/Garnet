@@ -1,92 +1,62 @@
-# Garnet changes and snapshot provenance
+# Garnet changelog and history
 
-Current standalone Garnet architecture: `Garnet` `0.1.1` (`src/garnet`, `org.garnet.driver`), `GarnetAccel` `0.1.1` (`src/garnet-accel`, `org.garnet.accel`), `GarnetMetal` `0.1.1` bundle `44` (`src/garnet-metal/Info.plist`, `org.garnet.metal`), `Garnet.app` `0.1.1` build `2`, 32 Mesa Darwin patches (`mesa-patches/`, including `VK_EXT_metal_surface`, async compute, GFX12 DCC, and `aco::spill` `IDSet` memory reduction), and 87 `metal2vulkan` patches with `garnetxlate` (`third-party/metal2vulkan-rdna4/`), with `Lilu.kext` and `AMDRadeonRDNA4.kext` dependencies removed and selected non-Lilu display/cursor/WSI/VM/sleep/GL-drawable advancements absorbed from `RX4Darwin/AMDRadeonRDNA4.kext`.
-Host suites run without a GPU; physical validation requires running on target hardware.
+Standalone Garnet stack on `main` (building on `v0.1.1`): `Garnet.kext` (`src/garnet`, `org.garnet.driver`, `'GRNT'` ABI `1.14`), `GarnetAccel.kext` (`src/garnet-accel`, `org.garnet.accel`), `GarnetRecover.efi` (`src/garnet-recover-efi`), `GarnetMetal.bundle` (15 `.m` compilation units in `src/garnet-metal`, `org.garnet.metal`), `Garnet.app` / `garnetctl` (`src/garnet-app`), 33 Mesa Darwin patches (`mesa-patches/`), and 90 `metal2vulkan` patches with `garnetxlate` (`third-party/metal2vulkan-rdna4/`). No `Lilu.kext` or external display plugin is required.
 
-The baseline entries below preserve upstream Cobalt64's 5 October 2026 release notes as historical pre-Garnet context (when components used `tools/pc/`, `src/rdna4-bringup/`, `tools/native/rdna4metal/`, and `librdna4xlate`). Where upstream validated a stage on its Navi 48 bench, that belongs to upstream; local validation evidence lives under `logs/`.
+## Unreleased (`main`, toward v0.2.0)
+
+- **Sandboxed browsers and desktop Metal fixes**: `'GRNT'` ABI `1.14` WebKit-safe selector aliases (`30`/`31`/`39`, `mesa-patches/0033`), one-way sandbox latching, two-tier `TemporaryItems` + `64 MiB` in-memory shader cache fallback, MSAA `raster_sample_count` translation (`bits 23..16`), cold-cache `WindowServer` fallback fixes, IORegistry `"model"` reporting (unblocking Geekbench 7), `MTLHeap` tiled alignment, concurrent non-heap `IOSurface` sharing, and incremental dirty-range argument-buffer scanning.
+- **DisplayPort hotplug, power, and MES boot**: DCN 4.01 HPD link-loss recovery (`regHPD_INTERRUPT_DEST` plus 1 Hz watchdog), SMU DPM / `GFXOFF` idle power policy, and MES boot initialization fixes.
+- **OpenCore Picker recovery and `AMFIAnchor` signing**: standalone x86_64 UEFI `GarnetRecover.efi` (`[1]` Safe Boot Once, `[2]` Safe Boot & Uninstall via `com.garnet.recovery`, zero ESP writes), `restore-oc` baseline rollback, optional `GARNET_SIGN_CA_DIR` CA signing + codeless Schema-1 `GarnetAnchorInjector.kext`, and `Garnet.app` / `garnetctl` integration.
+- **Metal 3.1 RT (opt-in) and incremental pipeline cache**: application `garnet-pipecache` raised to `256 MiB` (`WindowServer` capped at `32 MiB`) with debounced atomic saves after slow compiles, `garnet_mesh_rt.m` split into 5 compilation units, opt-in curve geometry (`GARNET_RT_CURVES=1`, `0088`), primitive/instance motion blur (`GARNET_RT_MOTION=1`, `0089`), and `0090` curve/motion/host optimizations (verified on RX 9060 XT: linear curves `4.92x` faster at `1,014.8 MRays/s`, cubic `1.43x`, single-slot IFT updates `2.11x`, `0` GCVM faults or hangs; `supportsPrimitiveMotionBlur` stays `NO` by default).
+- **Test layout and build variables**: `GarnetMetal` and RADV host tests moved to `src/garnet-metal/tests/` and `mesa-patches/tests/`, micro C suites consolidated and thin shell wrappers replaced with `Makefile` targets, retired autotranslate/plant scripts removed, and build variables cut over to `GARNET_KC_WORK` and `GARNET_LAYOUT_OUT`.
 
 ## Release v0.1.1
 
-- Release alignment, logging, and sandbox preflight: aligned all four layers to `0.1.1` (`Garnet.kext` `0.1.1`, `GarnetAccel.kext` `0.1.1`, `GarnetMetal.bundle` `0.1.1` build `44`, `Garnet.app` `0.1.1` build `2`), added `RDNA4_RELEASE` `os_log` severity gating (`RDNA4LOG_WARN`/`ERR`/`KEY`), added `rdna4_sb_*` sandbox preflight with unsandboxed and parent-directory metadata handling so absent kill/flag paths report `ENOENT` instead of synthetic `EPERM`, enforced `libgarnetxlate.dylib.patches.sha256` freshness checks, expanded `Garnet.app` diagnostics export, and retired legacy `0.1.0` `AMDRadeonRDNA4MTLDriver.bundle` artifacts on upgrade.
-- 8 GB Navi 44 and Full-BAR fallback: added 8 GB Navi 44 VRAM/pool cap reporting and automatic Small-BAR fallback when Full-BAR is requested without a full ReBAR aperture.
-- Modular refactor and clean-room translation: split `Garnet.kext` ring submit, session VM, VRAM, and scanout units and centralized MES v12.1 wire layouts; split `GarnetMetal` into 11 modular `.m` compilation units; migrated runtime paths and environment variables to `Garnet`/`GARNET_*`; clean-room replaced sampler-array and cube-storage `metal2vulkan` patches.
-- Interrupts, sleep/wake, and 4K@160Hz desktop: enabled MSI EOP IRQ fence wakeup (`garnet-interrupts=1`), DCN 4.01 OTG `VSTARTUP` primary VBLANK and `VUPDATE_NO_LOCK` self-healing, hardware DPMS sleep/wake with forced DP/DSC retrain, dynamic AGDC resolution across macOS 26.x, `Doze` PM, effective `GFXCLK` telemetry, 4K@160Hz WindowServer commit pipelining, and Graphics Pipeline Libraries (GPL) fast-link with cold pre-warm.
-- Kernel memory and MEC async compute: exposed a dedicated MEC async compute ring (`ctx.kcq` / `qfi=1`) with dual-ring sync and pure-compute routing, added 2 MiB `PDB0` huge pages with transactional split rollback, and enabled GFX12 `PTE.DCC` by default (`garnet-dcc=0` kill-switch) backed by GPU `CP_DMA` BO clear and ReBAR GL2 invalidation. Physically verified on an RX 9060 XT live `3840x2160@160Hz` Metal desktop (`VRAM_DCC_STRESS_PASS` 8x256 MiB VRAM + 4x4K DCC render targets, 4-way concurrent RT 400f + Wave4 x5 + Metal x10 + Sascha Vulkan RT stress, `145,148/145,148` retired seqs, `0` GCVM faults, `0` hangs, `29,606/29,606` latched scanout presents with `0` GPU failures).
-- Hardware ray tracing (`RX 9060 XT`, Vulkan RT and Metal 3 RT):
-  - Verified native Vulkan RT on GFX1200 (`4,788.0 MRays/s` at 100k tris, `1,710.6 MRays/s` at 1M tris; Sascha `raytracingbasic` `398.881 FPS` and `rayquery` `374.329 FPS` on live 4K@160Hz DCC-enabled desktop; `VK_KHR_ray_tracing_position_fetch`).
-  - Implemented Metal 3 RT and bindless end-to-end: `intersection_query` and `@air.intersect`, IFT ABI v2 (`attached_bda[31]`), stateless nested VFT, encoder-less 3-bridge Metal 3 bindless, `primitiveDataBuffer`, `MTLHeap` Automatic and Placement AS, async `computeQ` GPU-driven AS build/refit/compact, `reloop_nest` dominance repair (`0086`), `64 MiB` SPIR-V / `512 MiB` cache / `80 MiB` archive caps, and native int64.
-  - Verified live on RX 9060 XT: interactive `1280x720` Metal 3 path tracer (`103.93 FPS` avg, `136.8 FPS` peak, `~630.4 MRays/s` under default-on DCC; 400-frame concurrent run `103.35 FPS` avg), `wave4_primdata_heap_test` O0/O2 (`71/71` pass, 5x concurrent), and unmodified Apple Official Metal 3 RT Samples (`AcceleratingRayTracingUsingMetal` 9/9 spheres and `RenderingReflectionsInRealTimeUsingRayTracing` `cb_gpu avg = 1.039 to 1.363 ms`).
-  - Verified 63/63 Blender 4.2.23 Cycles (`CYCLES_METALRT=1`) kernels and 14/14 IFT callbacks through `garnetxlate` and `spirv-val`, plus `mesa-patches/0032` cutting ACO spill memory by ~7x to 14x (`shade_shadow` `29.9 GiB` OOM to `2,156 MB`; `shade_dedicated_light` `>12 GiB` OOM to `849 MB`). Live Blender startup built 9 BLAS/TLAS objects and compiled/cached 9/66 kernels before testing was stopped at user request prior to scene render.
+- **Release alignment, logging, and sandbox preflight**: aligned all four layers to `0.1.1`, added release `os_log` severity gating (`RDNA4LOG_WARN`/`ERR`/`KEY`), fixed `rdna4_sb_*` sandbox preflight so absent kill/flag files report `ENOENT` rather than synthetic `EPERM`, enforced `libgarnetxlate.dylib.patches.sha256` freshness checks, expanded `Garnet.app` diagnostics export, and added automatic cleanup of legacy `0.1.0` `AMDRadeonRDNA4MTLDriver.bundle` directories on upgrade.
+- **8 GB Navi 44 and Full-BAR fallback**: added 8 GB Navi 44 VRAM/pool cap reporting and automatic Small-BAR fallback when Full-BAR is requested without a full ReBAR aperture.
+- **Modular refactor and clean-room translation**: split `Garnet.kext` ring submit, session VM, VRAM, and scanout units; centralized MES v12.1 wire layouts; split `GarnetMetal` into 11 `.m` compilation units; migrated runtime paths and environment variables to `Garnet`/`GARNET_*`; clean-room replaced sampler-array and cube-storage `metal2vulkan` patches.
+- **Interrupts, sleep/wake, and 4K@160Hz desktop**: enabled MSI EOP IRQ fence wakeup (`garnet-interrupts=1`), DCN 4.01 OTG `VSTARTUP` primary VBLANK and `VUPDATE_NO_LOCK` self-healing, hardware DPMS sleep/wake with forced DP/DSC retrain, dynamic AGDC resolution across macOS 26.x, `Doze` PM, effective `GFXCLK` telemetry, 4K@160Hz WindowServer commit pipelining, and Graphics Pipeline Libraries (GPL) fast-link with cold pre-warm.
+- **Kernel memory and MEC async compute**: exposed a dedicated MEC async compute ring (`ctx.kcq` / `qfi=1`) with dual-ring sync and pure-compute routing, added 2 MiB `PDB0` huge pages with transactional split rollback, and enabled GFX12 `PTE.DCC` by default (`garnet-dcc=0` kill-switch) backed by GPU `CP_DMA` buffer clears and ReBAR GL2 invalidation. Physically verified on RX 9060 XT at `3840x2160@160Hz` (`VRAM_DCC_STRESS_PASS` 8x256 MiB VRAM + 4x4K DCC render targets, 4-way concurrent RT + Metal + Vulkan stress, `145,148/145,148` retired sequences, `0` GCVM faults, `0` hangs, `29,606/29,606` scanout presents).
+- **Hardware ray tracing (RX 9060 XT, Vulkan RT and Metal 3 RT)**:
+  - Native Vulkan RT on GFX1200: `4,788.0 MRays/s` at 100k triangles, `1,710.6 MRays/s` at 1M triangles; Sascha `raytracingbasic` at `398.881 FPS` and `rayquery` at `374.329 FPS` on live 4K@160Hz DCC-enabled desktop; `VK_KHR_ray_tracing_position_fetch`.
+  - Metal 3 RT and bindless: `intersection_query` and `@air.intersect`, IFT ABI v2 (`attached_bda[31]`), stateless nested VFT, encoder-less Metal 3 bindless, `primitiveDataBuffer`, `MTLHeap` Automatic and Placement AS, async `computeQ` GPU-driven AS build/refit/compact, `reloop_nest` dominance repair (`0086`), `64 MiB` SPIR-V / `512 MiB` cache / `80 MiB` archive caps, and native int64.
+  - Verified live on RX 9060 XT: interactive `1280x720` Metal 3 path tracer (`103.93 FPS` average, `136.8 FPS` peak, ~`630.4 MRays/s` under DCC; 400-frame concurrent run `103.35 FPS` average), O0/O2 primitive-data heap tests (`71/71` pass, 5x concurrent), and unmodified Apple Metal 3 RT Samples 1 and 2 (`cb_gpu` avg `1.039` to `1.363 ms`).
+  - Offline Blender 4.2.23 Cycles (`CYCLES_METALRT=1`) validation: `63/63` kernels and `14/14` IFT callbacks pass `garnetxlate` and `spirv-val`, and `mesa-patches/0032` reduces ACO spill memory by ~7x to 14x (`shade_shadow` `29.9 GiB` OOM down to `2,156 MB`; `shade_dedicated_light` `>12 GiB` OOM down to `849 MB`).
 
-## Planned for v0.2.0
+For remaining `v0.2.0` work, see [README.md](README.md#planned-for-v020).
 
-- RDNA 4 VCN 5.0.0 hardware video (`enable-rdna4-vcn5-video`): bring up kernel VCN 5.0.0 (`vcn_5_0_0.bin`, Day-1 Dynamic Power Gating with 1000 ms idle gate, NBIF v6.3.1 doorbell, IH v7.0 fence IRQ, MMHUB v4.1.0 per-session VMIDs, per-queue VCN ring reset, and `'GRNT'` ABI `1.15`), enable Mesa RADV Vulkan Video (`-Dvideo-codecs=all`, `mesa-patches/0034+`, 3-ring `GFX`/`COMPUTE`/`VCN` sync) for `H.264`/`HEVC`/`AV1`/`VP9` decode and `H.264`/`HEVC` (I+P)/`AV1` encode with VCN 5.0 EFC RGB conversion, and add a clean-room MIT VideoToolbox bridge (`libgarnetvt.dylib`, shared `VkDevice` VCN queue, zero-CPU-copy `IOSurface` import, `garnetctl vt-run`, and probe-gated `MediaExtension` decode without Seatbelt `.sb` or `VCPHEVC`/`AppleGVA` edits).
-- Browser and Electron sandbox compatibility (`fix-desktop-browser-sandbox-and-recovery`): advance `'GRNT'` to ABI `1.14` with WebKit-silent APP selector aliases (`30`/`31`/`39`, `mesa-patches/0033`) and `rdna4n_info.flags` readiness/headless bits, handle late Seatbelt entry in `rdna4_sb_check`, add two-tier `inproc` shader cache fallback (`TemporaryItems` then 64 MiB in-memory cache), and support atomic APFS root-snapshot deployment of `GarnetMetal.bundle` to `/System/Library/Extensions/` with `/Library/GPUBundles/` symlink fallback and `--last-sealed-snapshot` uninstall (zero `.sb`/ESP edits) so Safari (`com.apple.WebKit.GPU`), Chrome, and Discord render without blank windows.
-- Desktop stability, app identity, and zero-fault MES init (`fix-desktop-browser-sandbox-and-recovery`): clear `mv_`/`mf_` when entering `FALLBACK` in `garnet_pipelines.m` (preventing cold-cache WindowServer `Code=49` crash loops), publish IORegistry `"model"` as NUL-terminated `OSData` (fixing Geekbench 7 window launch), apply `VK_SHARING_MODE_CONCURRENT` across the 6 non-heap IOSurface/`vram_surf` paths, and fix the remaining 2 boot MES `SET_HW_RESOURCES_1` faults (`Garnet,IRQFaults == 0`).
-- Argument-buffer encoding, cold shader latency, and `MTLHeap` sizing (`fix-desktop-browser-sandbox-and-recovery`): replace full-buffer CPU `argscan` walks on large declared-transport buffers (`cb_encode avg = 845.29 ms` on Apple Sample 2 despite `1.039 to 1.363 ms` GPU execution) with incremental/dirty-range tracking or BDA indirection; bundle remaining macOS 26 QuartzCore shaders and remove artificial sleeps in `native-translate.m`, `garnet_hotswap.h`, and `garnet_dispflip.h` behind the ~1.15 s Control Center cold-click delay; fix tiled `MTLHeap` `VkImage` size queries (`pf 115`, `mediaanalysisd` fallbacks); and persist compiled ACO machine pipelines on disk.
-- DCN 4.01 DP hotplug (HPD) recovery and idle power (`fix-desktop-browser-sandbox-and-recovery`): implement DisplayPort HPD link-loss retraining, `DIG_FIFO_CTRL0` error clearing, and `dcn-dp` AUX restoration after monitor input switches or cable replug without rebooting; fix the `~51 to 55 W` (`busy gfx 100%`) baseline idle regression back to the Stage 3 envelope (`~16.6 W` at 4K@60Hz / `~27.6 W` at 4K@160Hz) and close SMU DPM / `GFXOFF` governance jointly with VCN 5.0 DPG.
-- Blender Cycles MetalRT and additional GPU verification (`complete-rdna4-raytracing` Task 5.4): complete full Blender 4.2 LTS Cycles `CYCLES_METALRT=1` scene rendering (`Cornell`, `BMW`, `Classroom`) and complete physical bring-up and release verification for RX 9060 XT 8 GB and Navi 48 (`RX 9070` / `RX 9070 XT`, GFX1201) alongside automated `.dmg` validation.
+---
 
-## Multi-display (milestone "M6")
+## Historical pre-Garnet baseline (Cobalt64, October 2026)
 
-- **Stage 1a** (kext 0.0.659, boot-arg `rdna4-m6=1`)
-  The second display's pipe is adopted on Apple's presentation path beside the first:
-  every pipe is adopted, and the surface-ID table is learned in the submit hook.
-- **Stage 1b** (0.0.661, `rdna4-m6=1` and `rdna4-m6flip=1`)
-  The second display gets its own scanout (instance 2): user-client ABI 1.11, selectors
-  22..26 (acquire / register / present / status / release), poll-only. The matching Mesa
-  entry points are in `mesa-patches/`.
-- **Stage 2** (0.0.662, additionally `rdna4-m6flip1=1`)
-  A third display (instance 1): per-instance descriptors (HUBP1/OTG1), scanout state,
-  locks, pins and watchdog, a teardown-all path, and clash checks against the other
-  instances. ABI 1.12 (selectors 22..26 also accept instance 1; an extra output word).
-- **Review fixes:** a self-healing surface table (staleness, re-learn, eviction), a serialised
-  table publish, the blob sizing hot fix in 0.0.661, and DP-plane geometry checks in the
-  Metal bundle. Run kits: `tools/pc/m6-stage1a-*`, `m6-stage1b-*`, `m6-stage2-run.sh` and a
-  simulation harness (`tools/pc/m6-stage2-sim`) that checks the scripts' parsers and
-  scenarios without hardware.
+The entries below preserve upstream Cobalt64's pre-Garnet milestones for provenance, from when components lived under `tools/pc/`, `src/rdna4-bringup/`, and `tools/native/rdna4metal/` and were validated on upstream's Navi 48 bench.
 
-## Resizable BAR (0.0.663, 0.0.664)
+## Multi-display ("M6")
 
-The kext can map a BAR0 larger than 256 MiB (up to 1 GiB). The decision is a pure,
-unit-tested function (`src/rdna4-bringup/src/amd/rebar_pure.h`, `plan_bar0`) that refuses a
-zero or non-power-of-two length, a misaligned base, a disagreement between IOPCIFamily and
-config space, a ReBAR size mismatch and over-large maps. 0.0.664 adds review fixes: the
-doorbell self-ring is not enabled after a BASE_LOW/HIGH read-back mismatch, and BAR2 is
-refused when IOPCIFamily and config space disagree.
+- **Stage 1a** (`0.0.659`, boot-arg `rdna4-m6=1`): adopted the second display pipe on Apple's presentation path and learned the surface-ID table in the submit hook.
+- **Stage 1b** (`0.0.661`, `rdna4-m6=1`, `rdna4-m6flip=1`): gave the second display its own scanout instance (`instance 2`), ABI 1.11 selectors `22..26` (acquire / register / present / status / release).
+- **Stage 2** (`0.0.662`, `rdna4-m6flip1=1`): added third display scanout (`instance 1`, HUBP1/OTG1), per-instance locks/watchdogs, teardown-all, and ABI 1.12 geometry output.
+- **Follow-up fixes**: self-healing surface table (staleness, re-learn, eviction), serialized table publish, blob sizing fix, and DP-plane geometry checks in the Metal bundle.
 
-## In-process shader translation (Metal bundle 14)
+### Resizable BAR (`0.0.663`, `0.0.664`)
 
-Processes other than WindowServer (sandboxed applications) can translate Metal AIR to
-SPIR-V inside the process: Apple's own compiler library prints the AIR as LLVM text, and a
-small C-ABI library (librdna4xlate) translates it, replacing the helper daemon. The library
-is the LGPL-3.0 rdna4xlate crate, a wrapper around metal2vulkan; it is NOT part of the MIT
-code and lives, with our changes to metal2vulkan, in `third-party/metal2vulkan-rdna4/`
-(see its NOTICE). `tools/native/rdna4metal/rdna4_xlate.h` is the loader.
+- Added unit-tested BAR0 sizing (`plan_bar0` in `rebar_pure.h`) capable of mapping >256 MiB BAR0 apertures while refusing misaligned bases, non-power-of-two lengths, and IOPCIFamily/config-space mismatches, plus doorbell self-ring read-back checks and BAR2 validation.
 
-## Application fixes (Metal bundles 15..20)
+### In-process shader translation (Metal bundle 14)
 
-- WindowServer import-memory exhaustion: a live-import ledger, a refused import never
-  returns nil, an import cache on by default.
-- Occlusion queries (setVisibilityResultMode) over a per-command-buffer Vulkan query pool;
-  resolve before the command buffer completion handler.
-- RG16Uint pixel format mapped to VK_FORMAT_R16G16_UINT (menus whose shadow pass needs it).
-- Visible-function linking for translated shaders (ABI 2 of librdna4xlate).
-- HDMI scanout "rubber band" fix: routed non-tentative writes are scanout writes while the
-  routing latch is on; per-slot supersede marks replace an 8-entry surface table.
-- GPU-application allow-list (kext: RDNA4AppKey.h, appallow), default-deny.
+- Enabled sandboxed processes outside `WindowServer` to translate Metal AIR to SPIR-V in-process via Apple's compiler library printing LLVM IR text into the LGPL-3.0 `metal2vulkan` C-ABI wrapper (`third-party/metal2vulkan-rdna4/`).
 
-## Auto-arm (`tools/pc/autoarm`)
+### Application fixes (Metal bundles 15..20)
 
-A LaunchDaemon (once per boot) plus a fail-safe script that brings up the multi-display
-GPU desktop unattended at the login window. The first failing step stops it and leaves the
-CPU-rendered desktop; it stops if a user logs in; WindowServer is restarted exactly once.
-The expected display CRC is measured on the boot itself (or set with `AA_CRC_RG2` /
-`AA_CRC_B2`) rather than compiled in. Kill switch: a file named `autoarm-off`. `install.sh` and
-`uninstall.sh` are provided; `run-tests.sh` runs the script against fake tools on a host Mac.
+- WindowServer import-memory exhaustion: live-import ledger, never returning `nil` on refused import, import cache enabled by default.
+- Occlusion queries (`setVisibilityResultMode`) via per-command-buffer Vulkan query pools resolved before command-buffer completion handlers.
+- `RG16Uint` mapped to `VK_FORMAT_R16G16_UINT` for menu shadow passes.
+- Visible-function linking for translated shaders (ABI 2).
+- HDMI scanout routing fix with per-slot supersede marks.
+- Default-deny GPU application policy (`appallow`, later superseded by Garnet's `app-denylist.txt` model).
 
-## Other
+### Packaging and source-tree policy
 
-- Pure-function headers with host-run test suites and planted-break scripts (`src/garnet/tests/native_*_plant.sh`).
-- Standalone Garnet backend and SDK: active builds use standalone `Garnet.kext` + `GarnetAccel.kext` + `GarnetMetal.bundle` with `MacKernelSDK` (no `Lilu.kext` or `AMDRadeonRDNA4.kext`); AMD firmware blobs come from `linux-firmware` (`tools/fetch-firmware.sh`) so generated firmware C files stay out of `src/`.
-- Excluded from version control: AMD firmware binaries, captures and fixtures derived from Apple binaries, generated `.spv` binaries (`src/garnet-metal/spvcache/` tracks `.meta.json` sidecars; `.spv` payloads are generated at build/translation time), build outputs, and run logs.
+- Pure-function C/C++ headers paired with host-run unit tests and planted-break suites (`src/garnet/tests/native_*_plant.sh`).
+- Standalone Garnet builds use `MacKernelSDK` and fetch AMD firmware blobs from `linux-firmware` (`tools/fetch-firmware.sh`) so generated firmware files stay out of `src/`.
+- Excluded from version control: AMD firmware binaries, Apple-derived fixtures, generated `.spv` payloads (`src/garnet-metal/spvcache/` tracks `.meta.json` sidecars only), build outputs, and run logs.

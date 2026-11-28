@@ -12,6 +12,18 @@ public enum OpenCoreMode: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum OpenCoreAMFIMode: String, Codable, CaseIterable, Sendable {
+    case anchor = "anchor"
+    case legacy = "legacy"
+
+    public var displayName: String {
+        switch self {
+        case .anchor: return "AMFIAnchor (AMFI Enabled)"
+        case .legacy: return "Legacy (amfi=0x80)"
+        }
+    }
+}
+
 public enum FindingSeverity: String, Codable, Equatable, Sendable {
     case pass = "PASS"
     case warn = "WARN"
@@ -27,6 +39,7 @@ public struct OpenCoreFinding: Codable, Equatable, Sendable {
 public struct OpenCoreReport: Codable, Equatable, Sendable {
     public let configPath: String
     public let mode: OpenCoreMode
+    public let amfiMode: OpenCoreAMFIMode
     public let valid: Bool
     public let errorCount: Int
     public let warnCount: Int
@@ -47,13 +60,30 @@ public enum OpenCoreConfigureError: Error, CustomStringConvertible {
 public struct OpenCoreConfigureResult: Codable, Equatable, Sendable {
     public let configPath: String
     public let backupPath: String
+    public let baselineBackupPath: String?
     public let kextInstalledPath: String?
+    public let recoverToolInstalledPath: String?
+    public let anchorInjectorInstalledPath: String?
+    public let amfiAnchorInstalledPath: String?
     public let mode: OpenCoreMode
+    public let amfiMode: OpenCoreAMFIMode
     public let report: OpenCoreReport
+}
+
+public struct OpenCoreRestoreResult: Codable, Equatable, Sendable {
+    public let configPath: String
+    public let preRestoreBackupPath: String
+    public let restoredFromBackupPath: String?
+    public let stripOnly: Bool
+    public let removedArtifacts: [String]
 }
 
 public enum OpenCoreValidator {
     public static let nvramBootGUID = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
+    public static let garnetVendorGUID = "6E727447-6172-4E65-9452-65636F766572"
+    public static let baselineBackupFilename = "config.plist.garnet-pre-garnet"
+    public static let recoverToolFilename = "GarnetRecover.efi"
+    public static let recoverToolDisplayName = "Garnet: Safe Boot & Recovery"
 
     private static let forbiddenSystemKexts: [(pattern: String, why: String)] = [
         ("Garnet.kext", "Must live in /Library/Extensions (AuxKC), never in OpenCore EFI/OC/Kexts/ (requires SystemKC IOGraphicsFamily)"),
@@ -65,7 +95,7 @@ public enum OpenCoreValidator {
         ("Navi48Bringup.kext", "Retired Navi 48 bringup kext; must be disabled/removed")
     ]
 
-    private static let requiredBootArgs: [String] = [
+    private static let baseRequiredBootArgs: [String] = [
         "garnet=1",
         "garnet-interrupts=1",
         "garnet-stage=17",
@@ -74,11 +104,14 @@ public enum OpenCoreValidator {
         "garnet-metal-disp=1",
         "garnet-metal-ws=1",
         "garnet-multisession=1",
-        "garnet-apps=1",
-        "amfi=0x80"
+        "garnet-apps=1"
     ]
 
-    public static func validate(configURL: URL, mode: OpenCoreMode) throws -> OpenCoreReport {
+    public static func validate(
+        configURL: URL,
+        mode: OpenCoreMode,
+        amfiMode: OpenCoreAMFIMode = .legacy
+    ) throws -> OpenCoreReport {
         // Strictly read-only: open read bytes without ever writing or re-serializing the source file.
         let rawData = try Data(contentsOf: configURL, options: .mappedIfSafe)
         let plistAny = try PropertyListSerialization.propertyList(from: rawData, options: [], format: nil)
@@ -86,6 +119,7 @@ public enum OpenCoreValidator {
             return OpenCoreReport(
                 configPath: configURL.path,
                 mode: mode,
+                amfiMode: amfiMode,
                 valid: false,
                 errorCount: 1,
                 warnCount: 0,
@@ -96,17 +130,31 @@ public enum OpenCoreValidator {
 
         var findings: [OpenCoreFinding] = []
 
-        // 1. Kernel -> Add checks (placement contrast + GarnetPCIBarCompat mode rules)
+        // 1. Kernel -> Add checks (placement contrast, GarnetPCIBarCompat, and AMFIAnchor ordering)
         let kernelAdd = ((root["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
         var pciCompatEntry: [String: Any]?
+        var liluIdx: Int?
+        var amfiAnchorIdx: Int?
+        var garnetInjectorIdx: Int?
+        var garnetInjectorEntry: [String: Any]?
+        var amfiPassIdx: Int?
 
-        for entry in kernelAdd {
+        for (idx, entry) in kernelAdd.enumerated() {
             let bundlePath = (entry["BundlePath"] as? String) ?? ""
             let enabled = (entry["Enabled"] as? Bool) ?? false
             let baseName = (bundlePath as NSString).lastPathComponent
 
             if baseName == "GarnetPCIBarCompat.kext" {
                 pciCompatEntry = entry
+            }
+            if enabled {
+                if baseName == "Lilu.kext" && liluIdx == nil { liluIdx = idx }
+                if baseName == "AMFIAnchor.kext" && amfiAnchorIdx == nil { amfiAnchorIdx = idx }
+                if baseName == "GarnetAnchorInjector.kext" && garnetInjectorIdx == nil {
+                    garnetInjectorIdx = idx
+                    garnetInjectorEntry = entry
+                }
+                if baseName == "AMFIPass.kext" && amfiPassIdx == nil { amfiPassIdx = idx }
             }
             for rule in forbiddenSystemKexts {
                 if (baseName == rule.pattern || baseName.hasPrefix("Navi48")) && enabled {
@@ -167,13 +215,83 @@ public enum OpenCoreValidator {
             }
         }
 
+        // AMFIAnchor load-order checks when in anchor mode
+        if amfiMode == .anchor {
+            if liluIdx == nil {
+                findings.append(OpenCoreFinding(
+                    severity: .error,
+                    keyPath: "Kernel.Add[Lilu.kext]",
+                    message: "AMFIAnchor mode requires user-installed Lilu.kext enabled in Kernel.Add"
+                ))
+            }
+            if amfiAnchorIdx == nil {
+                findings.append(OpenCoreFinding(
+                    severity: .error,
+                    keyPath: "Kernel.Add[AMFIAnchor.kext]",
+                    message: "AMFIAnchor mode requires AMFIAnchor.kext enabled in Kernel.Add after Lilu.kext"
+                ))
+            }
+            if let inj = garnetInjectorEntry {
+                let execPath = (inj["ExecutablePath"] as? String) ?? ""
+                let plistPath = (inj["PlistPath"] as? String) ?? ""
+                if !execPath.isEmpty || plistPath != "Contents/Info.plist" {
+                    findings.append(OpenCoreFinding(
+                        severity: .error,
+                        keyPath: "Kernel.Add[GarnetAnchorInjector.kext]",
+                        message: "Codeless GarnetAnchorInjector.kext must have empty ExecutablePath and PlistPath = Contents/Info.plist"
+                    ))
+                }
+            } else {
+                findings.append(OpenCoreFinding(
+                    severity: .error,
+                    keyPath: "Kernel.Add[GarnetAnchorInjector.kext]",
+                    message: "AMFIAnchor mode requires GarnetAnchorInjector.kext enabled in Kernel.Add after AMFIAnchor.kext"
+                ))
+            }
+            if let li = liluIdx, let ai = amfiAnchorIdx, let gi = garnetInjectorIdx {
+                var orderOK = true
+                if !(li < ai) {
+                    orderOK = false
+                    findings.append(OpenCoreFinding(
+                        severity: .error,
+                        keyPath: "Kernel.Add[AMFIAnchor.kext]",
+                        message: "Load order error: AMFIAnchor.kext (index \(ai)) must load AFTER Lilu.kext (index \(li))"
+                    ))
+                }
+                if !(ai < gi) {
+                    orderOK = false
+                    findings.append(OpenCoreFinding(
+                        severity: .error,
+                        keyPath: "Kernel.Add[GarnetAnchorInjector.kext]",
+                        message: "Load order error: GarnetAnchorInjector.kext (index \(gi)) must load AFTER AMFIAnchor.kext (index \(ai))"
+                    ))
+                }
+                if let pi = amfiPassIdx, !(gi < pi) {
+                    orderOK = false
+                    findings.append(OpenCoreFinding(
+                        severity: .error,
+                        keyPath: "Kernel.Add[AMFIPass.kext]",
+                        message: "Load order error: AMFIPass.kext (index \(pi)) must load AFTER Lilu -> AMFIAnchor -> GarnetAnchorInjector"
+                    ))
+                }
+                if orderOK {
+                    findings.append(OpenCoreFinding(
+                        severity: .pass,
+                        keyPath: "Kernel.Add[AMFIAnchor]",
+                        message: "AMFIAnchor order verified: Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext"
+                    ))
+                }
+            }
+        }
+
         // 2. NVRAM -> Add -> 7C436110... (boot-args + csr-active-config) & Delete
         let nvramAdd = (((root["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[nvramBootGUID] as? [String: Any]) ?? [:]
         let bootArgsStr = (nvramAdd["boot-args"] as? String) ?? ""
         let argTokens = bootArgsStr.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         let argSet = Set(argTokens)
 
-        let missingArgs = requiredBootArgs.filter { !argSet.contains($0) }
+        let expectedRequiredArgs = baseRequiredBootArgs + (amfiMode == .legacy ? ["amfi=0x80"] : [])
+        let missingArgs = expectedRequiredArgs.filter { !argSet.contains($0) }
         if missingArgs.isEmpty {
             findings.append(OpenCoreFinding(
                 severity: .pass,
@@ -185,6 +303,14 @@ public enum OpenCoreValidator {
                 severity: .error,
                 keyPath: "NVRAM.Add.\(nvramBootGUID).boot-args",
                 message: "Missing required boot-args: \(missingArgs.joined(separator: " "))"
+            ))
+        }
+
+        if amfiMode == .anchor && argSet.contains("amfi=0x80") {
+            findings.append(OpenCoreFinding(
+                severity: .warn,
+                keyPath: "NVRAM.Add.\(nvramBootGUID).boot-args[amfi]",
+                message: "Remove amfi=0x80 in AMFIAnchor mode so macOS AMFI remains enabled"
             ))
         }
 
@@ -254,12 +380,32 @@ public enum OpenCoreValidator {
             findings.append(OpenCoreFinding(severity: .error, keyPath: "NVRAM.Delete.\(nvramBootGUID)", message: "NVRAM.Delete.\(nvramBootGUID) must contain both 'boot-args' and 'csr-active-config'"))
         }
 
-        // 3. Misc -> Security -> SecureBootModel
-        let secModel = (((root["Misc"] as? [String: Any])?["Security"] as? [String: Any])?["SecureBootModel"] as? String) ?? ""
+        // 3. Misc -> Security -> SecureBootModel & Misc -> Tools (GarnetRecover.efi if present)
+        let miscDict = (root["Misc"] as? [String: Any]) ?? [:]
+        let secModel = ((miscDict["Security"] as? [String: Any])?["SecureBootModel"] as? String) ?? ""
         if secModel == "Disabled" {
             findings.append(OpenCoreFinding(severity: .pass, keyPath: "Misc.Security.SecureBootModel", message: "SecureBootModel = Disabled"))
         } else {
             findings.append(OpenCoreFinding(severity: .error, keyPath: "Misc.Security.SecureBootModel", message: "SecureBootModel must be 'Disabled' (got '\(secModel)')"))
+        }
+
+        let miscTools = (miscDict["Tools"] as? [[String: Any]]) ?? []
+        if let recTool = miscTools.first(where: { ((($0["Path"] as? String) ?? "") as NSString).lastPathComponent == recoverToolFilename }) {
+            let enabled = (recTool["Enabled"] as? Bool) ?? false
+            let path = (recTool["Path"] as? String) ?? ""
+            if enabled && path == recoverToolFilename {
+                findings.append(OpenCoreFinding(
+                    severity: .pass,
+                    keyPath: "Misc.Tools[\(recoverToolFilename)]",
+                    message: "\(recoverToolFilename) enabled in OpenCore Picker"
+                ))
+            } else if enabled {
+                findings.append(OpenCoreFinding(
+                    severity: .error,
+                    keyPath: "Misc.Tools[\(recoverToolFilename)]",
+                    message: "\(recoverToolFilename) must use Path = '\(recoverToolFilename)' (got '\(path)')"
+                ))
+            }
         }
 
         // 4. Booter / UEFI / Kernel BAR Quirks
@@ -295,6 +441,7 @@ public enum OpenCoreValidator {
         return OpenCoreReport(
             configPath: configURL.path,
             mode: mode,
+            amfiMode: amfiMode,
             valid: errCnt == 0,
             errorCount: errCnt,
             warnCount: warnCnt,
@@ -335,9 +482,22 @@ public enum OpenCoreValidator {
         return configURL
     }
 
-    /// Back up config.plist, export GarnetPCIBarCompat.kext (Full-BAR mode), apply Garnet OpenCore settings, and verify.
-    public static func configure(targetURL: URL, mode: OpenCoreMode, payloadURL: URL?) throws -> OpenCoreConfigureResult {
+    /// Back up config.plist (including one-time pre-Garnet baseline), deploy optional OpenCore artifacts,
+    /// apply Garnet OpenCore settings, and verify.
+    public static func configure(
+        targetURL: URL,
+        mode: OpenCoreMode,
+        amfiMode: OpenCoreAMFIMode? = nil,
+        payloadURL: URL?
+    ) throws -> OpenCoreConfigureResult {
+        let fm = FileManager.default
         let configURL = try resolveConfigURL(from: targetURL)
+        let ocDir = configURL.deletingLastPathComponent()
+        let kextsDir = ocDir.appendingPathComponent("Kexts")
+        let toolsDir = ocDir.appendingPathComponent("Tools")
+        try rejectSymlink(at: kextsDir)
+        try rejectSymlink(at: toolsDir)
+
         let rawData = try Data(contentsOf: configURL)
         let plistAny = try PropertyListSerialization.propertyList(from: rawData, options: [], format: nil)
         guard var root = plistAny as? [String: Any] else {
@@ -348,24 +508,97 @@ public enum OpenCoreValidator {
             throw OpenCoreConfigureError.failed("Full-BAR (8/16 GiB) mode requires a valid payload to copy GarnetPCIBarCompat.kext")
         }
 
-        let backupURL = try writeTimestampedBackup(rawData: rawData, nextTo: configURL)
+        let liluInEFI = kextsDir.appendingPathComponent("Lilu.kext")
+        let amfiAnchorInEFI = kextsDir.appendingPathComponent("AMFIAnchor.kext")
+        let injectorInEFI = kextsDir.appendingPathComponent("GarnetAnchorInjector.kext")
+        let amfiAnchorInPayload = payloadURL?.appendingPathComponent("optional/AMFIAnchor.kext")
+        let injectorInPayload = payloadURL?.appendingPathComponent("optional/GarnetAnchorInjector.kext")
+        let recoverInPayload = payloadURL?.appendingPathComponent("optional/\(recoverToolFilename)")
+
+        let hasLiluInEFI = isRegularDir(at: liluInEFI)
+        let hasAmfiInPayload = amfiAnchorInPayload.map { isRegularDir(at: $0) } ?? false
+        let hasAmfiInEFI = isRegularDir(at: amfiAnchorInEFI)
+        let hasInjectorInPayload = injectorInPayload.map { isRegularDir(at: $0) } ?? false
+        let hasInjectorInEFI = isRegularDir(at: injectorInEFI)
+
+        let resolvedAmfiMode: OpenCoreAMFIMode
+        if let explicit = amfiMode {
+            resolvedAmfiMode = explicit
+        } else if hasInjectorInPayload && hasLiluInEFI && (hasAmfiInPayload || hasAmfiInEFI) {
+            resolvedAmfiMode = .anchor
+        } else {
+            resolvedAmfiMode = .legacy
+        }
+
+        // Fail closed before mutating config.plist or EFI if AMFIAnchor dependencies are missing.
+        if resolvedAmfiMode == .anchor {
+            guard hasLiluInEFI else {
+                throw OpenCoreConfigureError.failed(
+                    "AMFIAnchor mode requires user-installed Lilu.kext (1.7.2+) in \(kextsDir.path). Place Lilu.kext there or use --amfi legacy."
+                )
+            }
+            guard hasAmfiInPayload || hasAmfiInEFI else {
+                throw OpenCoreConfigureError.failed(
+                    "AMFIAnchor mode requires AMFIAnchor.kext in \(kextsDir.path) (or bundled in payload). Place AMFIAnchor.kext there or use --amfi legacy."
+                )
+            }
+            guard hasInjectorInPayload || hasInjectorInEFI else {
+                throw OpenCoreConfigureError.failed(
+                    "AMFIAnchor mode requires GarnetAnchorInjector.kext in payload (built with GARNET_SIGN_CA_DIR) or in \(kextsDir.path)."
+                )
+            }
+        }
+
+        let backupURL = try writeTimestampedBackup(rawData: rawData, nextTo: configURL, label: "garnet-backup")
+        let baselineURL = ocDir.appendingPathComponent(baselineBackupFilename)
+        try rejectSymlink(at: baselineURL)
+        var baselineRecordedPath: String?
+        if fm.fileExists(atPath: baselineURL.path) {
+            baselineRecordedPath = baselineURL.path
+        } else if !looksAlreadyGarnetConfigured(root) {
+            try rawData.write(to: baselineURL, options: .atomic)
+            baselineRecordedPath = baselineURL.path
+        }
 
         var kextInstalledPath: String?
         if mode == .full, let payloadURL {
-            let kextsDir = configURL.deletingLastPathComponent().appendingPathComponent("Kexts")
-            try rejectSymlink(at: kextsDir)
             let dst = try SystemDiskInstaller.exportPCIBarCompat(fromPayload: payloadURL, toDestination: kextsDir)
             kextInstalledPath = dst.path
         }
 
-        applyKernelSettings(to: &root, mode: mode)
+        var recoverInstalledPath: String?
+        if let payloadURL, let recSrc = recoverInPayload, fm.fileExists(atPath: recSrc.path) {
+            let dst = try SystemDiskInstaller.exportRecoverEFI(fromPayload: payloadURL, toDestination: toolsDir)
+            recoverInstalledPath = dst.path
+            applyRecoveryToolEntry(to: &root)
+        }
+
+        var anchorInjectorInstalledPath: String?
+        var amfiAnchorInstalledPath: String?
+        if resolvedAmfiMode == .anchor {
+            if let payloadURL, hasInjectorInPayload {
+                let dst = try SystemDiskInstaller.exportAnchorInjector(fromPayload: payloadURL, toDestination: kextsDir)
+                anchorInjectorInstalledPath = dst.path
+            } else {
+                anchorInjectorInstalledPath = injectorInEFI.path
+            }
+            if let payloadURL, hasAmfiInPayload {
+                if let dst = try SystemDiskInstaller.exportAMFIAnchor(fromPayload: payloadURL, toDestination: kextsDir) {
+                    amfiAnchorInstalledPath = dst.path
+                }
+            } else {
+                amfiAnchorInstalledPath = amfiAnchorInEFI.path
+            }
+        }
+
+        applyKernelSettings(to: &root, mode: mode, amfiMode: resolvedAmfiMode)
         applyQuirks(to: &root, mode: mode)
-        applySecurityAndNVRAM(to: &root, mode: mode)
+        applySecurityAndNVRAM(to: &root, mode: mode, amfiMode: resolvedAmfiMode)
 
         let newData = try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
         try newData.write(to: configURL, options: .atomic)
 
-        let report = try validate(configURL: configURL, mode: mode)
+        let report = try validate(configURL: configURL, mode: mode, amfiMode: resolvedAmfiMode)
         guard report.valid else {
             try? rawData.write(to: configURL, options: .atomic)
             let issues = report.findings.filter { $0.severity == .error }.map { "\($0.keyPath): \($0.message)" }.joined(separator: "; ")
@@ -375,10 +608,127 @@ public enum OpenCoreValidator {
         return OpenCoreConfigureResult(
             configPath: configURL.path,
             backupPath: backupURL.path,
+            baselineBackupPath: baselineRecordedPath,
             kextInstalledPath: kextInstalledPath,
+            recoverToolInstalledPath: recoverInstalledPath,
+            anchorInjectorInstalledPath: anchorInjectorInstalledPath,
+            amfiAnchorInstalledPath: amfiAnchorInstalledPath,
             mode: mode,
+            amfiMode: resolvedAmfiMode,
             report: report
         )
+    }
+
+    /// Restore a manually mounted OpenCore config.plist from the recorded pre-Garnet baseline backup
+    /// (or explicit backup), or strip Garnet-managed entries in-place. Never removes Lilu.kext or AMFIAnchor.kext.
+    public static func restore(
+        targetURL: URL,
+        backupURL: URL? = nil,
+        stripOnly: Bool = false
+    ) throws -> OpenCoreRestoreResult {
+        let fm = FileManager.default
+        let configURL = try resolveConfigURL(from: targetURL)
+        let ocDir = configURL.deletingLastPathComponent()
+        let kextsDir = ocDir.appendingPathComponent("Kexts")
+        let toolsDir = ocDir.appendingPathComponent("Tools")
+        try rejectSymlink(at: kextsDir)
+        try rejectSymlink(at: toolsDir)
+
+        let currentData = try Data(contentsOf: configURL)
+        let preRestoreBackup = try writeTimestampedBackup(rawData: currentData, nextTo: configURL, label: "garnet-before-restore")
+
+        var restoredFrom: String?
+        var effectiveStripOnly = stripOnly
+
+        if !stripOnly {
+            let candidate: URL?
+            if let explicit = backupURL {
+                try rejectSymlink(at: explicit)
+                guard fm.fileExists(atPath: explicit.path) else {
+                    throw OpenCoreConfigureError.failed("Specified backup does not exist: \(explicit.path)")
+                }
+                candidate = explicit
+            } else {
+                let baseline = ocDir.appendingPathComponent(baselineBackupFilename)
+                try rejectSymlink(at: baseline)
+                candidate = fm.fileExists(atPath: baseline.path) ? baseline : nil
+            }
+
+            if let srcBackup = candidate {
+                let bakData = try Data(contentsOf: srcBackup)
+                let obj = try PropertyListSerialization.propertyList(from: bakData, options: [], format: nil)
+                guard obj is [String: Any] else {
+                    throw OpenCoreConfigureError.failed("Backup plist is not a valid dictionary: \(srcBackup.path)")
+                }
+                try bakData.write(to: configURL, options: .atomic)
+                restoredFrom = srcBackup.path
+            } else {
+                effectiveStripOnly = true
+            }
+        }
+
+        if effectiveStripOnly {
+            let plistAny = try PropertyListSerialization.propertyList(from: currentData, options: [], format: nil)
+            guard var root = plistAny as? [String: Any] else {
+                throw OpenCoreConfigureError.failed("Root object of \(configURL.path) must be a dictionary")
+            }
+            stripGarnetEntries(from: &root)
+            let strippedData = try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+            try strippedData.write(to: configURL, options: .atomic)
+        }
+
+        // Remove only verified Garnet-owned artifacts from EFI; never touch Lilu.kext or AMFIAnchor.kext.
+        var removed: [String] = []
+        let pciCompatURL = kextsDir.appendingPathComponent("GarnetPCIBarCompat.kext")
+        if try removeVerifiedKextIfPresent(at: pciCompatURL, expectedBundleID: "org.garnet.pcibarcompat") {
+            removed.append(pciCompatURL.path)
+        }
+        let anchorInjURL = kextsDir.appendingPathComponent("GarnetAnchorInjector.kext")
+        if try removeVerifiedKextIfPresent(at: anchorInjURL, expectedBundleID: "org.garnet.anchor-injector") {
+            removed.append(anchorInjURL.path)
+        }
+        let recoverToolURL = toolsDir.appendingPathComponent(recoverToolFilename)
+        try rejectSymlink(at: recoverToolURL)
+        if fm.fileExists(atPath: recoverToolURL.path) {
+            if (try? PayloadVerifier.verifyPE32PlusEFI(at: recoverToolURL)) != nil {
+                try fm.removeItem(at: recoverToolURL)
+                removed.append(recoverToolURL.path)
+            }
+        }
+
+        return OpenCoreRestoreResult(
+            configPath: configURL.path,
+            preRestoreBackupPath: preRestoreBackup.path,
+            restoredFromBackupPath: restoredFrom,
+            stripOnly: effectiveStripOnly,
+            removedArtifacts: removed
+        )
+    }
+
+    private static func isRegularDir(at url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private static func looksAlreadyGarnetConfigured(_ root: [String: Any]) -> Bool {
+        let nvramAdd = (((root["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[nvramBootGUID] as? [String: Any]) ?? [:]
+        let args = Set(((nvramAdd["boot-args"] as? String) ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        return args.contains("garnet=1") && args.contains("garnet-stage=17")
+    }
+
+    private static func removeVerifiedKextIfPresent(at kextURL: URL, expectedBundleID: String) throws -> Bool {
+        try rejectSymlink(at: kextURL)
+        let fm = FileManager.default
+        guard isRegularDir(at: kextURL) else { return false }
+        let plistURL = kextURL.appendingPathComponent("Contents/Info.plist")
+        try rejectSymlink(at: plistURL)
+        guard let data = try? Data(contentsOf: plistURL),
+              let dict = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              (dict["CFBundleIdentifier"] as? String) == expectedBundleID else {
+            return false
+        }
+        try fm.removeItem(at: kextURL)
+        return true
     }
 
     private static func rejectSymlink(at url: URL) throws {
@@ -388,11 +738,11 @@ public enum OpenCoreValidator {
         }
     }
 
-    private static func writeTimestampedBackup(rawData: Data, nextTo configURL: URL) throws -> URL {
+    private static func writeTimestampedBackup(rawData: Data, nextTo configURL: URL, label: String) throws -> URL {
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.dateFormat = "yyyyMMdd-HHmmss"
-        let baseName = "\(configURL.lastPathComponent).garnet-backup-\(df.string(from: Date()))"
+        let baseName = "\(configURL.lastPathComponent).\(label)-\(df.string(from: Date()))"
         let dir = configURL.deletingLastPathComponent()
 
         var backupURL = dir.appendingPathComponent(baseName)
@@ -405,7 +755,45 @@ public enum OpenCoreValidator {
         return backupURL
     }
 
-    private static func applyKernelSettings(to root: inout [String: Any], mode: OpenCoreMode) {
+    private static func applyRecoveryToolEntry(to root: inout [String: Any]) {
+        var misc = (root["Misc"] as? [String: Any]) ?? [:]
+        var tools = (misc["Tools"] as? [[String: Any]]) ?? []
+        let entry: [String: Any] = [
+            "Arguments": "",
+            "Auxiliary": false,
+            "Comment": "Garnet Safe Boot & Recovery Tool (zero ESP writes)",
+            "Enabled": true,
+            "Flavour": "Auto",
+            "FullNvramAccess": true,
+            "Name": recoverToolDisplayName,
+            "Path": recoverToolFilename,
+            "RealPath": false,
+            "TextMode": true
+        ]
+        var updated = false
+        for idx in tools.indices {
+            let p = ((tools[idx]["Path"] as? String) ?? "") as NSString
+            if p.lastPathComponent == recoverToolFilename {
+                if !updated {
+                    tools[idx] = entry
+                    updated = true
+                } else {
+                    tools[idx]["Enabled"] = false
+                }
+            }
+        }
+        if !updated {
+            tools.append(entry)
+        }
+        misc["Tools"] = tools
+        root["Misc"] = misc
+    }
+
+    private static func applyKernelSettings(
+        to root: inout [String: Any],
+        mode: OpenCoreMode,
+        amfiMode: OpenCoreAMFIMode
+    ) {
         var kernel = (root["Kernel"] as? [String: Any]) ?? [:]
         var kernelAdd = (kernel["Add"] as? [[String: Any]]) ?? []
         var foundCompat = false
@@ -437,6 +825,10 @@ public enum OpenCoreValidator {
                     kernelAdd[idx]["Enabled"] = false
                 }
             }
+
+            if amfiMode == .legacy && baseName == "GarnetAnchorInjector.kext" {
+                kernelAdd[idx]["Enabled"] = false
+            }
         }
 
         if mode == .full && !foundCompat {
@@ -452,11 +844,128 @@ public enum OpenCoreValidator {
             ])
         }
 
+        if amfiMode == .anchor {
+            kernelAdd = arrangeAMFIAnchorEntries(in: kernelAdd)
+        }
+
         var quirks = (kernel["Quirks"] as? [String: Any]) ?? [:]
         quirks["IncreasePciBarSize"] = false
         kernel["Add"] = kernelAdd
         kernel["Quirks"] = quirks
         root["Kernel"] = kernel
+    }
+
+    /// Guarantee enabled order: Lilu.kext -> AMFIAnchor.kext -> GarnetAnchorInjector.kext (all before AMFIPass.kext).
+    private static func arrangeAMFIAnchorEntries(in entries: [[String: Any]]) -> [[String: Any]] {
+        var result: [[String: Any]] = []
+        var liluEntry: [String: Any]?
+        var amfiEntry: [String: Any]?
+        var injEntry: [String: Any]?
+
+        for entry in entries {
+            let base = (((entry["BundlePath"] as? String) ?? "") as NSString).lastPathComponent
+            if base == "Lilu.kext" && liluEntry == nil {
+                var e = entry
+                e["Enabled"] = true
+                liluEntry = e
+            } else if base == "AMFIAnchor.kext" && amfiEntry == nil {
+                var e = entry
+                e["BundlePath"] = "AMFIAnchor.kext"
+                e["Enabled"] = true
+                e["ExecutablePath"] = "Contents/MacOS/AMFIAnchor"
+                e["PlistPath"] = "Contents/Info.plist"
+                e["MinKernel"] = "20.0.0"
+                e["MaxKernel"] = "25.99.99"
+                amfiEntry = e
+            } else if base == "GarnetAnchorInjector.kext" && injEntry == nil {
+                var e = entry
+                e["BundlePath"] = "GarnetAnchorInjector.kext"
+                e["Enabled"] = true
+                e["ExecutablePath"] = ""
+                e["PlistPath"] = "Contents/Info.plist"
+                e["MinKernel"] = "25.0.0"
+                e["MaxKernel"] = "25.99.99"
+                injEntry = e
+            } else if base == "AMFIAnchor.kext" || base == "GarnetAnchorInjector.kext" {
+                continue
+            } else {
+                result.append(entry)
+            }
+        }
+
+        let finalLilu: [String: Any] = liluEntry ?? [
+            "Arch": "x86_64",
+            "BundlePath": "Lilu.kext",
+            "Comment": "Lilu (required for AMFIAnchor)",
+            "Enabled": true,
+            "ExecutablePath": "Contents/MacOS/Lilu",
+            "MaxKernel": "",
+            "MinKernel": "",
+            "PlistPath": "Contents/Info.plist"
+        ]
+        let finalAmfi: [String: Any] = amfiEntry ?? [
+            "Arch": "x86_64",
+            "BundlePath": "AMFIAnchor.kext",
+            "Comment": "AMFIAnchor trust-anchor engine",
+            "Enabled": true,
+            "ExecutablePath": "Contents/MacOS/AMFIAnchor",
+            "MaxKernel": "25.99.99",
+            "MinKernel": "20.0.0",
+            "PlistPath": "Contents/Info.plist"
+        ]
+        let finalInj: [String: Any] = injEntry ?? [
+            "Arch": "x86_64",
+            "BundlePath": "GarnetAnchorInjector.kext",
+            "Comment": "Garnet Root CA public trust anchor (codeless)",
+            "Enabled": true,
+            "ExecutablePath": "",
+            "MaxKernel": "25.99.99",
+            "MinKernel": "25.0.0",
+            "PlistPath": "Contents/Info.plist"
+        ]
+
+        // Insert Lilu -> AMFIAnchor -> GarnetAnchorInjector at index 0 (guaranteed before AMFIPass.kext and other plugins).
+        return [finalLilu, finalAmfi, finalInj] + result
+    }
+
+    private static func stripGarnetEntries(from root: inout [String: Any]) {
+        if var kernel = root["Kernel"] as? [String: Any],
+           var kernelAdd = kernel["Add"] as? [[String: Any]] {
+            kernelAdd.removeAll { entry in
+                let base = (((entry["BundlePath"] as? String) ?? "") as NSString).lastPathComponent
+                return base == "GarnetPCIBarCompat.kext" || base == "GarnetAnchorInjector.kext"
+            }
+            kernel["Add"] = kernelAdd
+            root["Kernel"] = kernel
+        }
+
+        if var misc = root["Misc"] as? [String: Any],
+           var tools = misc["Tools"] as? [[String: Any]] {
+            tools.removeAll { entry in
+                (((entry["Path"] as? String) ?? "") as NSString).lastPathComponent == recoverToolFilename
+            }
+            misc["Tools"] = tools
+            root["Misc"] = misc
+        }
+
+        if var nvram = root["NVRAM"] as? [String: Any],
+           var nvramAdd = nvram["Add"] as? [String: Any],
+           var bootDict = nvramAdd[nvramBootGUID] as? [String: Any],
+           let existing = bootDict["boot-args"] as? String {
+            let stripPrefixes = [
+                "garnet=", "garnet-interrupts=", "garnet-stage=", "garnet-native=",
+                "garnet-metal=", "garnet-metal-disp=", "garnet-metal-ws=", "garnet-multisession=",
+                "garnet-apps=", "garnet-apps-all=", "garnet-full-bar=", "garnet-aux=",
+                "garnet-rebar-compat=", "rdna4-", "rdna4bringup", "navi48-", "navi48bringup"
+            ]
+            let kept = existing.split(whereSeparator: { $0.isWhitespace }).map(String.init).filter { tok in
+                !stripPrefixes.contains(where: { tok.hasPrefix($0) })
+            }
+            bootDict["boot-args"] = kept.joined(separator: " ")
+            nvramAdd[nvramBootGUID] = bootDict
+            nvram["Add"] = nvramAdd
+            root["NVRAM"] = nvram
+        }
     }
 
     private static func applyQuirks(to root: inout [String: Any], mode: OpenCoreMode) {
@@ -475,7 +984,11 @@ public enum OpenCoreValidator {
         root["UEFI"] = uefi
     }
 
-    private static func applySecurityAndNVRAM(to root: inout [String: Any], mode: OpenCoreMode) {
+    private static func applySecurityAndNVRAM(
+        to root: inout [String: Any],
+        mode: OpenCoreMode,
+        amfiMode: OpenCoreAMFIMode
+    ) {
         var misc = (root["Misc"] as? [String: Any]) ?? [:]
         var security = (misc["Security"] as? [String: Any]) ?? [:]
         security["SecureBootModel"] = "Disabled"
@@ -488,7 +1001,7 @@ public enum OpenCoreValidator {
 
         bootDict["csr-active-config"] = Data([0x03, 0x08, 0x00, 0x00])
         let existingArgs = (bootDict["boot-args"] as? String) ?? ""
-        bootDict["boot-args"] = updatedBootArgs(from: existingArgs, mode: mode)
+        bootDict["boot-args"] = updatedBootArgs(from: existingArgs, mode: mode, amfiMode: amfiMode)
         nvramAdd[nvramBootGUID] = bootDict
         nvram["Add"] = nvramAdd
 
@@ -502,7 +1015,11 @@ public enum OpenCoreValidator {
         root["NVRAM"] = nvram
     }
 
-    private static func updatedBootArgs(from existing: String, mode: OpenCoreMode) -> String {
+    private static func updatedBootArgs(
+        from existing: String,
+        mode: OpenCoreMode,
+        amfiMode: OpenCoreAMFIMode
+    ) -> String {
         let managedPrefixes = [
             "garnet=", "garnet-interrupts=", "garnet-stage=", "garnet-native=",
             "garnet-metal=", "garnet-metal-disp=", "garnet-metal-ws=", "garnet-multisession=",
@@ -518,8 +1035,11 @@ public enum OpenCoreValidator {
             kept.append(tok)
         }
 
-        kept.append(contentsOf: requiredBootArgs)
+        kept.append(contentsOf: baseRequiredBootArgs)
         kept.append("garnet-apps-all=1")
+        if amfiMode == .legacy {
+            kept.append("amfi=0x80")
+        }
         switch mode {
         case .full:
             kept.append("garnet-full-bar=1")
@@ -531,44 +1051,64 @@ public enum OpenCoreValidator {
         return kept.joined(separator: " ")
     }
 
-    public static func sampleConfigSnippet(mode: OpenCoreMode) -> String {
+    public static func sampleConfigSnippet(mode: OpenCoreMode, amfiMode: OpenCoreAMFIMode = .legacy) -> String {
+        let amfiArg = (amfiMode == .legacy) ? " amfi=0x80" : ""
+        let anchorNote: String
+        if amfiMode == .anchor {
+            anchorNote = """
+               - AMFIAnchor mode (no amfi=0x80): place in EFI/OC/Kexts/ and Enable in exact order (before AMFIPass.kext if used):
+                 1) Lilu.kext (1.7.2+, user-supplied)
+                 2) AMFIAnchor.kext (MinKernel=20.0.0 MaxKernel=25.99.99)
+                 3) GarnetAnchorInjector.kext (codeless: ExecutablePath="", MinKernel=25.0.0 MaxKernel=25.99.99)
+            """
+        } else {
+            anchorNote = "   - Legacy AMFI mode: uses amfi=0x80 in boot-args (no Lilu/AMFIAnchor required)."
+        }
+
         switch mode {
         case .full:
             return """
-            # Full-BAR (8/16 GiB) OpenCore Checklist
+            # Full-BAR (8/16 GiB) OpenCore Checklist [\(amfiMode.displayName)]
             1. Copy `GarnetPCIBarCompat.kext` to `EFI/OC/Kexts/` and add & Enable in `Kernel -> Add`
                (Place AFTER Lilu/WEG/VirtualSMC; set MaxKernel="" MinKernel="25.0.0").
+            \(anchorNote)
             2. NEVER put Garnet.kext or GarnetAccel.kext inside `EFI/OC/Kexts/`.
-            3. `Booter -> Quirks -> ResizeAppleGpuBars` = -1
+            3. Optional Recovery Tool: copy `GarnetRecover.efi` to `EFI/OC/Tools/` and enable in `Misc -> Tools` (`FullNvramAccess = true`, `TextMode = true`).
+            4. `Booter -> Quirks -> ResizeAppleGpuBars` = -1
                `UEFI -> Quirks -> ResizeGpuBars` = -1
+               `Kernel -> Quirks -> IncreasePciBarSize` = False
+            5. `Misc -> Security -> SecureBootModel` = "Disabled"
+            6. `NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`:
+               csr-active-config = <03080000>  (0x0803)
+               boot-args = -v keepsyms=1 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1\(amfiArg) garnet-full-bar=1
+               (DO NOT include npci=0x2000 or -radvesa)
+            7. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
+            """
+        case .modeSmall:
+            return """
+            # 256 MiB Small-BAR OpenCore Checklist [\(amfiMode.displayName)]
+            1. Remove or Disable `GarnetPCIBarCompat.kext` in `Kernel -> Add`.
+            \(anchorNote)
+            2. Optional Recovery Tool: copy `GarnetRecover.efi` to `EFI/OC/Tools/` and enable in `Misc -> Tools` (`FullNvramAccess = true`, `TextMode = true`).
+            3. `Booter -> Quirks -> ResizeAppleGpuBars` = 0
+               `UEFI -> Quirks -> ResizeGpuBars` = 0
                `Kernel -> Quirks -> IncreasePciBarSize` = False
             4. `Misc -> Security -> SecureBootModel` = "Disabled"
             5. `NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`:
                csr-active-config = <03080000>  (0x0803)
-               boot-args = -v keepsyms=1 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1
-               (DO NOT include npci=0x2000 or -radvesa)
-            6. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
-            """
-        case .modeSmall:
-            return """
-            # 256 MiB Small-BAR OpenCore Checklist (Fallback / Recovery)
-            1. Remove or Disable `GarnetPCIBarCompat.kext` in `Kernel -> Add`.
-            2. `Booter -> Quirks -> ResizeAppleGpuBars` = 0
-               `UEFI -> Quirks -> ResizeGpuBars` = 0
-               `Kernel -> Quirks -> IncreasePciBarSize` = False
-            3. `Misc -> Security -> SecureBootModel` = "Disabled"
-            4. `NVRAM -> Add -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`:
-               csr-active-config = <03080000>  (0x0803)
-               boot-args = -v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80
+               boot-args = -v keepsyms=1 npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1\(amfiArg)
                (DO NOT include garnet-full-bar=1 or -radvesa)
-            5. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
+            6. `NVRAM -> Delete -> 7C436110-AB2A-4BBB-A880-FE41995C9F82`: add `boot-args` and `csr-active-config`.
             """
         }
     }
 
     public static func emergencyKillSwitchesText() -> String {
         """
-        Emergency OpenCore boot-arg kill-switches (add to boot-args at OpenCore Picker / config.plist):
+        Emergency OpenCore Recovery & boot-arg Kill-Switches:
+          - OpenCore Picker -> `Garnet: Safe Boot & Recovery` (`GarnetRecover.efi`, zero ESP disk writes):
+              [1] Safe Boot Once (`garnet=0 garnet-aux=0 garnet-rebar-compat=0`, keeps driver installed)
+              [2] Safe Boot & Uninstall Garnet (uninstalls system-disk files on next macOS boot, stays on safe desktop; restore config.plist via `restore-oc`)
           - `garnet=0`              Disables Garnet.kext primary driver & GPU init completely (boots on VESA/fallback display).
           - `garnet-aux=0`          Disables GarnetAccel.kext / GarnetFramebuffer while keeping bringup diagnostics accessible.
           - `garnet-rebar-compat=0` Disables GarnetPCIBarCompat.kext Full-BAR hook without removing it from EFI/OC/Kexts/.
@@ -577,9 +1117,12 @@ public enum OpenCoreValidator {
           - `garnet-vbl-irq=0`      Reverts primary framebuffer VBLANK delivery to software timer without disabling MSI.
           - `garnet-dpms=0`         Disables hardware DisplayPort DPMS sleep/wake stream blanking and PHY power-down.
           - `garnet-gfx-cg=0`       Disables GFX12 CGCG/CGLS/MGCG/FGCG clock gating (leaves hardware reset defaults).
-          - `garnet-gfxoff=0`       Keeps the graphics core awake; GFXOFF is opt-in.
           - `garnet-det0=0`         Disables single-pipe DCN41 DET0 CRB expansion (keeps UEFI 192 KiB DET0).
           - `garnet-uclk-pin=1`     Forces GDDR6 UCLK pinned at top DPM clock (disables DET0-guarded UCLK unpinning).
+          - `garnet-webkitgpu=0`    Disables Garnet.kext's version-independent _mac_file_check_mmap Safari WebKit.GPU hook.
+          - `garnet-hpd-recover=0`  Disables automatic DCN 4.0.1 DisplayPort HPD & link-loss recovery retraining.
+          - `garnet-idle-dpm=0`     Disables activity-driven SMU GFXCLK idle governor (keeps SMUPowerState::Auto).
+          - `garnet-gfxoff=0`       Disables SMU GFXOFF power-gating and keeps the graphics core awake.
           - `garnet-dmcub-fw=0`     Keeps the VBIOS display firmware and skips the experimental DAL firmware preflight.
           - `garnet-fams2=0`        Keeps firmware-assisted display memory-clock switching off.
           - `garnet-mall=0`         Keeps SubVP and static-screen display caching off.

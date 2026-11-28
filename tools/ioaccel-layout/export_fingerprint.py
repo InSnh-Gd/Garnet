@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export canonical zero-Apple-binary layout fingerprint JSON for GarnetAccel.
 
-Consumes generated C64_LAYOUT_OUT/{model.json,forwarded.json} and
+Consumes generated GARNET_LAYOUT_OUT/{model.json,forwarded.json} and
 src/garnet-accel/gates/{common.py,leaves.py} to emit:
   - layout-fingerprint.json (schema: garnet-layout-fingerprint-v1)
   - optional variants/index.json (schema: garnet-accel-variants-v1)
@@ -207,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--layout-out",
         required=True,
-        help="Path to C64_LAYOUT_OUT containing model.json and forwarded.json",
+        help="Path to GARNET_LAYOUT_OUT containing model.json and forwarded.json",
     )
     ap.add_argument(
         "--gates-dir",

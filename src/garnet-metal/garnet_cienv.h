@@ -1,5 +1,5 @@
 // garnet_cienv.h (bundle 9, app crash study item 1): the Core Image switch that keeps CIKL string kernels off the nil -[MTLDevice compiler] path.
-// Pure C so it is host-testable (test-cienv.c).  an internal design note, "App crash study", item (1).
+// Pure C so it is host-testable (test-cienv.c).  Metal app compatibility.
 //
 // Why: -[CIKernel _initWithString:...] reflects the kernel-language source through [device newLibraryWithSource:] and asks the function for its arguments;
 // for a stitchable function Metal asks [device compiler], which is nil on this device, so the argument list stays empty and CIKernelReflection's consolidate()

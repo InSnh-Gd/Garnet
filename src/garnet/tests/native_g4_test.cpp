@@ -1,4 +1,4 @@
-// native_g4_test.cpp - kext 0.0.640, review fixes 0.0.641 (GPU-apps stage G4: ordinary user applications as a third client role; an internal design note section 4 and the G1 / G2 reviews): the pure half
+// native_g4_test.cpp - kext 0.0.640, review fixes 0.0.641 (GPU-apps stage G4: ordinary user applications as a third client role; sandbox/app load policy): the pure half
 // (amd/garnet_app_policy_pure.h, amd/native_open_policy_pure.h, GarnetAppKey.h) driven directly and through small models, plus source pins that tie the REAL kernel code
 // (amd/native_s1c.cpp, GarnetNativeClient.cpp / .hpp, GarnetDriver.cpp, GarnetUserClient.cpp, GarnetNativeABI.h, tools/rdna4/native/garnettest.c) to it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -110,11 +110,15 @@ static void t3_selectors() {
     using namespace policy;
     uint32_t nAllowed = 0;
     for (uint32_t sel = 0; sel < 64; sel++) {
-        const bool want = sel == 0 || sel == 1 || (sel >= 3 && sel <= 8) || sel == 21 || sel == 27 || sel == 28;
-        expect(selector_allowed_for_app(sel) == want, "T3: an APP reaches exactly 0, 1, 3..8 and 21");
+        const bool want = sel == 0 || sel == 1 || (sel >= 3 && sel <= 8) || sel == 21 || sel == 27 || sel == 28 || sel == 30 || sel == 31 || sel == 39;
+        expect(selector_allowed_for_app(sel) == want, "T3: an APP reaches exactly 0, 1, 3..8, 21, 27..28 and ABI 1.14 WebKit-silent aliases 30, 31, 39 (29 reserved for VCN5)");
         if (selector_allowed_for_app(sel)) { nAllowed++; expect(selector_allowed_for_windowserver(sel) && selector_allowed(true, sel), "T3: the APP set is inside WindowServer's set"); }
     }
-    expect_u("T3: eleven selectors including bounded buffer operations", nAllowed, 11);
+    expect_u("T3: fourteen selectors including bounded buffer operations and ABI 1.14 WebKit-silent aliases", nAllowed, 14);
+    expect_u("T3: canonical alias 30 -> 3", canonical_app_selector(RDNA4N_SEL_BOCREATE_APP), RDNA4N_SEL_BOCREATE);
+    expect_u("T3: canonical alias 31 -> 21", canonical_app_selector(RDNA4N_SEL_BO_IMPORT_HOST_APP), RDNA4N_SEL_BO_IMPORT_HOST);
+    expect_u("T3: canonical alias 39 -> 27", canonical_app_selector(RDNA4N_SEL_BUFFER_COPY_APP), RDNA4N_SEL_BUFFER_COPY);
+    expect(!selector_allowed_for_app(29u), "T3: selector 29 reserved for VCN 5.0 (refused in ABI 1.14)");
     expect(!selector_allowed_for_app(RDNA4N_SEL_READREGS), "T3: never ReadRegs");
     for (uint32_t sel = RDNA4N_SEL_SCAN_QUERY; sel <= RDNA4N_SEL_SCAN_RELEASE; sel++) expect(!selector_allowed_for_app(sel), "T3: never the scanout set 9..14");
     for (uint32_t sel = 15; sel <= 20; sel++) expect(!selector_allowed_for_app(sel), "T3: never DAL / mode trial / hold / release / nub publish / withdraw");
@@ -256,7 +260,7 @@ static void t5_budget() {
     }
     expect(RDNA4N_INFO_R_BUDGET_FLAGS == 3u && RDNA4N_INFO_R_BUDGET_CAP_LO == 4u && RDNA4N_INFO_R_BUDGET_CAP_HI == 5u && RDNA4N_INFO_R_BUDGET_AVAIL_LO == 6u && RDNA4N_INFO_R_BUDGET_AVAIL_HI == 7u, "T5: the ABI indices");
     expect(sizeof(((rdna4n_info *)nullptr)->reserved) / sizeof(uint32_t) == 8, "T5: reserved[] has eight words (the struct size is unchanged)");
-    expect_u("T5: ABI minor 13", RDNA4N_ABI_MINOR, 13);
+    expect_u("T5: ABI minor 14", RDNA4N_ABI_MINOR, 14);
 }
 
 // ---- T6 -------------------------------------------------------------------------------------------------------------------------------------------------
@@ -343,7 +347,7 @@ static void t8_pins(const std::string &root) {
     // version and ABI
     expect(garnet_test_ver::plist_matches_version(root, plist), "T8: Info.plist matches VERSION, carried twice");
     expect(garnet_test_ver::header_and_sources_match(root, engh), "T8: native client matches single version source");
-    expect(abi.find("#define RDNA4N_ABI_MINOR     13u ") != std::string::npos, "T8: ABI minor 13");
+    expect(abi.find("#define RDNA4N_ABI_MINOR     14u ") != std::string::npos, "T8: ABI minor 14");
     expect(abi.find("#define RDNA4N_BUDGET_VALID (1u << 0)") != std::string::npos && abi.find("#define RDNA4N_BUDGET_APP   (1u << 1)") != std::string::npos, "T8: the budget flags are in the ABI header");
     // the latch: one reader, latched once, needs multi
     expect_u("T8: boot-arg garnet-apps is read in exactly one place in the whole kext", count_of(eng, "PE_parse_boot_argn(\"garnet-apps\""), 1);
@@ -431,7 +435,7 @@ static void t8_pins(const std::string &root) {
                            "if (action > 82 && !rdna4disp::action_admitted(rdna4disp_latched_on(), action)) return kIOReturnBadArgument;" }),
            "T8: the user client lets 104 past the old action bound only with the role on");
     expect(slurp(K + "src/GarnetUserClient.cpp").find("kIOClientPrivilegeAdministrator") != std::string::npos, "T8: the verb's user client is the root-only legacy client");
-    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\\n") != std::string::npos &&
+    expect(cmd.find("else if (what && !strcmp(what, \"appallow\")) in = 104;") != std::string::npos && cmd.find("in == 104 ? \"appallow\" :") != std::string::npos && cmd.find("scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny killswitch\\n") != std::string::npos &&
            cmd.find("appallow add <name>/remove <name>/list/strikes]") != std::string::npos, "T8: rdna4test: the table line, the name, the known list and the usage");
     expect(cmd.find("rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2))") != std::string::npos && cmd.find("rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0)") != std::string::npos && cmd.find("GarnetAppKey.h") != std::string::npos, "T8: garnettest hashes the name with the kext's own function");
     expect(g4p.find("#include \"../GarnetAppKey.h\"") != std::string::npos && cli.find("#include \"GarnetAppKey.h\"") != std::string::npos, "T8: kext and CLI share one key header");

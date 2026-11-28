@@ -3,7 +3,7 @@
 #include "dcn_scanout_internal.hpp"
 
 // =====================================================================================================
-// 0.0.416 (an internal design note, G2;) — MODE 7: THE SDMA CACHE-RINSE INSTRUMENT.
+// 0.0.416 (SDMA GCR cache-rinse) — MODE 7: THE SDMA CACHE-RINSE INSTRUMENT.
 //
 // READ-ONLY on the source. ONE SDMA COPY_LINEAR moves a 256 KiB window from VRAM offset `vramOff` into a low
 // scratch buffer of ours; if `gcr` is asked for, the SDMA GCR_REQ (GL2 write-back + invalidate) goes
@@ -149,7 +149,7 @@ static uint32_t scanout_gcr_case(amdgpu::DeviceContext &dev, amdgpu::SDMAInstanc
 uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 	uint64_t v[13] = { 0 };
 	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
-	// 0.0.416 (an internal design note, G2): mode 7 packs the mode, the GCR flag and the source VRAM offset
+	// 0.0.416 (SDMA GCR cache-rinse): mode 7 packs the mode, the GCR flag and the source VRAM offset
 	// into the one ABI scalar (rdna4_scanout7_scalar). Modes 0..6 keep scalar == mode, byte-identical; any other
 	// scalar with high bits set is refused exactly as it was before (kScanStPlan).
 	const uint32_t mode = (uint32_t)(arg & RDNA4_SCANOUT_MODE_MASK);
@@ -596,7 +596,7 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			if (detileBad || tileBad || subBad || discBad || v[10]) st = kScanStReadback;
 			goto done;
 		}
-		// 0.0.414 (an internal design note) — MODE 6: THE FULL-GEOMETRY SDMA SELF-TEST.
+		// 0.0.414 (driver design) — MODE 6: THE FULL-GEOMETRY SDMA SELF-TEST.
 		// ONE call, two cases IN ORDER (S1): (a) 256x256, the control, and (b) 1920x1080, the live plane's
 		// exact packet fields (swizzle 3, pitch 1920, 15 blocks wide, a partial 9th block row). Both run S3/S4's
 		// method on OUR OWN three scratch buffers and never touch the scanout or Apple's surfaces. Mode 5's
@@ -629,7 +629,7 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			       c0.tileStatus, c0.detStatus, c1.tileStatus, c1.detStatus, st);
 			goto done;
 		}
-		// D7 (0.0.417, an internal design note) — MODE 8: THE UNIFORM PROBE. Mode 6's live 1920x1080 case
+		// D7 (0.0.417, driver design) — MODE 8: THE UNIFORM PROBE. Mode 6's live 1920x1080 case
 		// EXACTLY - same buffers, same packet fields, same bounded sample set, same `scanout-full:` report lines and
 		// the same POISON detection - except the CPU writes RDNA4_TILE_UNIFORM_PIXEL (0xff00ff00) everywhere and every
 		// expected value is that value. It is the write-compression half of the DCC fault: with our no-PTE write
@@ -650,7 +650,7 @@ uint32_t rdna4_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			       c1.poison, c1.tileStatus, c1.detStatus, st);
 			goto done;
 		}
-		// 0.0.416 (an internal design note, G2) — MODE 7: the SDMA cache-rinse instrument. READ-ONLY on the
+		// 0.0.416 (SDMA GCR cache-rinse) — MODE 7: the SDMA cache-rinse instrument. READ-ONLY on the
 		// source; our own low scratch only; the same interlock-free proof discipline as modes 5/6 (three/four
 		// scratch buffers, no WindowServer, no Apple accelerator, no reboot). out: 1 gcr|control<<1, 2 source
 		// VRAM offset, 3 scratch VRAM offset, 4 fence us | copy dwords<<32, 5 lines full|part<<16|diff<<32,
@@ -1081,7 +1081,7 @@ fin:
 // the shim read them out of the resource - both come from the caller, neither is guessed here.
 // out[0] status, [1] plan reason, [2] srcOff, [3] rect, [4] fence us, [5] readback mismatches, [6] pixels compared,
 // [7] swizzle | surfW<<16 | surfH<<32, [8..10] samples dst<<32|src at (0,0), (w/2,h/2), (w-1,h-1).
-// 0.0.416 (an internal design note, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
+// 0.0.416 (SDMA GCR cache-rinse): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
 // tiled copy (and so grows the ring traffic from 18 to 23 dwords). false is the 0.0.415 behaviour, byte for byte.
 uint32_t rdna4_scanout_copy_tiled(uint64_t srcOff, uint64_t srcLen, uint32_t surfW, uint32_t surfH, uint32_t swizzle,
                                    uint32_t dstX, uint32_t dstY, uint32_t w, uint32_t h, uint64_t *out, unsigned count,

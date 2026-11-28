@@ -400,7 +400,7 @@ constexpr uint32_t kPSPErrUnknownCommand = 0x100;
 
 //
 // psp_init — pick the fixed VRAM slots and populate PSPContext.
-// All offsets are relative to dev.vramBase (PORTING.md VRAM layout):
+// All offsets are relative to dev.vramBase (relative to VRAM arena base):
 //   fw_pri +0x000000 (1 MiB), ring +0x100000, cmd +0x104000,
 //   fence +0x108000, TMR +0x200000 (4 MiB), fw_buf +0x1000000 (8 MiB).
 // Requires MP0 + MMHUB IP bases resolved and dev.vramMcBase set.

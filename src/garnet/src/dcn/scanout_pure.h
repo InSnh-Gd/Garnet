@@ -1,6 +1,6 @@
 //
 //  scanout_pure.h - the PURE half of native-stack step S2a (kext 0.0.603): the decisions behind the native scanout selectors
-//  of the RDNA4N client (an internal design note and its Review; the ABI addendum is the last section of NATIVE-S1C-ABI.md).
+//  of the RDNA4N client (ABI 1.1 scanout contract).
 //  No kernel header is included, so tests/native_s2a_test.cpp compiles this on the host Mac and drives the exact functions the kext calls
 //  (dcn/dcn.cpp for the plane, amd/native_s1c.cpp for the BO side, GarnetDriver.cpp for the exemption table).
 //

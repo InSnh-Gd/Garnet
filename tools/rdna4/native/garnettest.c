@@ -116,7 +116,7 @@ static int cmd_reg(const char *arg) {
     return 0;
 }
 
-// `regs` — the T1 census reader (notes/DISPLAY-DESIGN.md section 6).
+// `regs` — the T1 census reader (DCN 4.1 register census).
 //
 // Same selector as `reg`, but ONE process and ONE user-client connection for the
 // whole list, read from stdin as `<abs_dword_hex> [label]` lines (# comments and
@@ -1700,7 +1700,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "gfxmap")) in = 36;
     else if (what && !strcmp(what, "gfxstate")) in = 37;
     // 38/39 — 0.0.185, the SDMA counterpart of gfxmap (design memo
-    // notes/re/sdma-takeover-design.md, recorded as an earlier analysis). `sdmamap`
+    // SDMA takeover verification). `sdmamap`
     // puts APPLE'S SDMA ring (chan id 14, the (queue 10, inst 1) ring at
     // 0x8400220000) onto OUR SDMA0 QUEUE1 at doorbell dword index 0x202 by direct
     // register programming - no MES, no MQD - after PTE-checking every page of
@@ -1796,8 +1796,8 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     // SURFACE_EARLIEST_INUSE: the console A or flip mode's B) into the kext by SDMA, then this tool pulls it and writes a 256-byte
     // header + the raw surface to [file] (default ./scanout-full-<n>-<time>.rdna4scan; never over an existing file) and frees it
     // (`scanout 10`). READ-ONLY toward the display; decode with tools/runkit/scanout2png.py.
-    // an internal design note; 7 is 0.0.416, an internal design note; 8 is 0.0.417,
-    // an internal design note D7 - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
+    // driver design; 7 is 0.0.416, driver design; 8 is 0.0.417,
+    // SDMA probe/DCC control - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
     // 6 (0.0.414, section 950) is the FULL-GEOMETRY SDMA self-test: one call, the 256x256 section 719 control then
     // the live 1920x1080 ADDR3 64KB_2D geometry, on our own three scratch VRAM buffers. 7 (0.0.416, section 953) is
     // the SDMA CACHE-RINSE instrument: `scanout 7 <vramOff>` copies a 256 KiB plane window linearly into our scratch
@@ -1846,7 +1846,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "ucprobe")) in = 81;
     else if (what && !strcmp(what, "fbbench")) in = 68;
     else if (what && !strcmp(what, "fbwc")) in = 69;
-    // 82 - 0.0.417 (an internal design note, D1; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
+    // 82 - 0.0.417 (SDMA probe/DCC control; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
     // no-PTE read-decompression / write-compression switch. 0 READ SDMA0_DCC_CNTL (GC[0]+0x34) and
     // SDMA1_DCC_CNTL (GC[0]+0x634) raw and decoded per set; 1 CAPTURE SDMA0's value on first use, write
     // captured & ~0x00015554 (only the eight *_COMP_EN_n bits), read back and report; 2 RESTORE the captured
@@ -1916,7 +1916,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     //     killall -9 WindowServer            (within 15 s; no `pipearm 1` dance and no 120 s spacing needed)
     //     garnettest accel pipereload 1      (optional: the window should read closed, "closed by slot 267" 1)
     else if (what && !strcmp(what, "pipereload")) in = 90;
-    // 91..93 - 0.0.622 (multi-monitor stage M1, an internal design note): the display instruments. All need boot-arg garnet-metal-disp=1 (admitted past 82 only then).
+    // 91..93 - 0.0.622 (multi-monitor stage M1, driver design): the display instruments. All need boot-arg garnet-metal-disp=1 (admitted past 82 only then).
     //     ddcread <line 2|3> <block 0..3> : an EDID block over the HDMI DDC line with the DC_I2C engine (writes only that engine's registers, after the arbitration read says it is free)
     //     dmubring [0|1..25|0x80]          : READ-ONLY DMUB state and ring decode (the ring is beyond the BAR0 aperture on this card: reported, not read)
     //     dispcensus [0|1|2..9]            : READ-ONLY census of power gates, DIG, OTG, DCCG / PHY PLL and hot-plug registers
@@ -1939,7 +1939,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "dmubctx")) in = 97;
     // 98 - 0.0.631 (stage M4d): disp2 timing|connect|off|status - the OTG1 -> DIG2 test pattern. Needs boot-arg garnet-metal-disp=1 AND garnet-disp2=1. `accel disp2` alone prints the run script.
     else if (what && !strcmp(what, "disp2")) in = 98;
-    // 100..102 - 0.0.623 (GPU-apps G1, an internal design note section 4): hang recovery. They exist ONLY when the PC booted with boot-arg garnet-g1=1 (else
+    // 100..102 - 0.0.623 (GPU-apps G1, driver contract: hang recovery. They exist ONLY when the PC booted with boot-arg garnet-g1=1 (else
     // 0xe00002c2). Root only (this client). Run with WindowServer on the CPU renderer: hangtest refuses while ANY native session is open (a WindowServer one by name).
     //   hangtest [1]        a kernel-owned VMID-8 test context submits ONE IB that never retires (WAIT_REG_MEM on a dword nobody writes); after 2 s HUNG is latched
     //   hangrecover <0..4>  0 auto (mesreset then remap), 1 release (the CPU writes the awaited value: harness control), 2 mesreset (MES RESET legacy GFX queue),
@@ -1949,10 +1949,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "hangtest")) in = 100;
     else if (what && !strcmp(what, "hangrecover")) in = 101;
     else if (what && !strcmp(what, "hangstat")) in = 102;
-    // 103 - 0.0.627 (GPU-apps G2, an internal design note section 4): `sessstat [0..9]`, READ-ONLY. Exists ONLY when the PC booted with boot-arg
+    // 103 - 0.0.627 (GPU-apps G2, driver contract: `sessstat [0..9]`, READ-ONLY. Exists ONLY when the PC booted with boot-arg
     // garnet-multisession=1 (else 0xe00002c2). Pages 0..7: native session slots 0..7 (VMID 8..15); page 8 (the default): global; page 9: G5 stats.
     else if (what && !strcmp(what, "sessstat")) in = 103;
-    // 104 - 0.0.640 (GPU-apps G4, an internal design note section 4): `appallow add <name>|remove <name>|list`, the kernel's allow-list of user applications that may open a native
+    // 104 - 0.0.640 (GPU-apps G4, driver contract: `appallow add <name>|remove <name>|list`, the kernel's allow-list of user applications that may open a native
     // GPU session (name = the executable's base name, the first 16 characters; see GarnetAppKey.h for what that is worth). Touches no hardware. Exists ONLY when the PC booted with BOTH
     // boot-args garnet-apps=1 and garnet-multisession=1 (else 0xe00002c2). The list is empty at every boot and holds 32 entries; this verb is the only way to change it.
     else if (what && !strcmp(what, "appallow")) in = 104;
@@ -1969,6 +1969,8 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "bartest")) in = 109;
     // 110 - prepare-release-multi26x-driver Task 3.1/3.2: `appdeny add <name>|remove <name>|list [page 0..7]|clear`, kernel 64-slot denylist overriding garnet-apps-all=1.
     else if (what && !strcmp(what, "appdeny")) in = 110;
+    // 115 - ABI 1.14: `killswitch [0|1|status]` syncs /private/tmp/garnet-off to RDNA4N_INFO_KILL_SWITCH.
+    else if (what && !strcmp(what, "killswitch")) in = 115;
     // 51 — 0.0.239, `shadercache [1|2|3]` (milestone 3 step 2, an earlier analysis).
     // Arms the hash-keyed substitution of gfx1201 code for Apple's GFX10 shaders at
     // the residency copy: kernsub's seam, with kernsub's one hard-coded kernel at one
@@ -2044,10 +2046,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         fprintf(stderr, "accel: unknown verb \"%s\"\n", what);
         fprintf(stderr, "  known: status fire memenable synctables enablerings "
                         "startengines ringstate dumpring programqueue ringhooks "
-                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload ddcread dmubring dispcensus region4read region4dump dmubsend dmubmode dmubctx disp2 hangtest hangrecover hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\n");
+                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload ddcread dmubring dispcensus region4read region4dump dmubsend dmubmode dmubctx disp2 hangtest hangrecover hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny killswitch\n");
         return 2;
     }
-    const char *verb = in == 110 ? "appdeny" : in == 109 ? "bartest" : in == 108 ? "vramstat" : in == 107 ? "m6xstat" : in == 106 ? "m6stat" : in == 105 ? "fbpublish" : in == 104 ? "appallow" : in == 103 ? "sessstat" : in == 99 ? "scdcread" : in == 102 ? "hangstat" : in == 101 ? "hangrecover" : in == 100 ? "hangtest" : in == 98 ? "disp2" : in == 97 ? "dmubctx" : in == 96 ? "dmubmode" : in == 95 ? "dmubsend" : in == 94 ? "region4read" : in == 93 ? "dispcensus" : in == 92 ? "dmubring" : in == 91 ? "ddcread" : in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
+    const char *verb = in == 115 ? "killswitch" : in == 110 ? "appdeny" : in == 109 ? "bartest" : in == 108 ? "vramstat" : in == 107 ? "m6xstat" : in == 106 ? "m6stat" : in == 105 ? "fbpublish" : in == 104 ? "appallow" : in == 103 ? "sessstat" : in == 99 ? "scdcread" : in == 102 ? "hangstat" : in == 101 ? "hangrecover" : in == 100 ? "hangtest" : in == 98 ? "disp2" : in == 97 ? "dmubctx" : in == 96 ? "dmubmode" : in == 95 ? "dmubsend" : in == 94 ? "region4read" : in == 93 ? "dispcensus" : in == 92 ? "dmubring" : in == 91 ? "ddcread" : in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
                      : in == 39 ? "sdmastate" : in == 38 ? "sdmamap"
                      : in == 37 ? "gfxstate" : in == 36 ? "gfxmap"
                      : in == 35 ? "kiqchan" : in == 34 ? "kiqstamp" : in == 33 ? "kiqenable" : in == 32 ? "setvspace" : in == 31 ? "pm4powerup" : in == 30 ? "resume" : in == 29 ? "srbmprobe" : in == 28 ? "xlatregs" : in == 27 ? "runadvance" : in == 26 ? "runcheckts" : in == 25 ? "stampgap" : in == 24 ? "signalstamp" : in == 23 ? "stampstate" : in == 22 ? "schedstate" : in == 21 ? "bindchannel" : in == 20 ? "signalcompletion" : in == 19 ? "pokecompletion" : in == 18 ? "chanstate" : in == 17 ? "neuterpoll" : in == 16 ? "opengate" : in == 15 ? "queuestate" : in == 14 ? "ringrefs" : in == 13 ? "kickdoorbell" : in == 12 ? "enablequeue" : in == 11 ? "rebaseib" : in == 10 ? "dumpib" : in == 9 ? "ringhooks" : in == 8 ? "programqueue" : in == 7 ? "dumpring" : in == 6 ? "ringstate" : in == 5 ? "startengines" : in == 4 ? "enablerings" : in == 3 ? "synctables"
@@ -2081,7 +2083,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     if (in == 100 && !arg) in2[1] = 1;
     if (in == 103 && !arg) in2[1] = 8;   // 0.0.627 (G2): sessstat defaults to the global page
     if (in == 101 && !arg) { fprintf(stderr, "accel hangrecover: give the method: 0 auto, 1 release, 2 mesreset, 3 remap, 4 abandon (read the state with `accel hangstat`)\n"); return 2; }
-    // 0.0.416 (an internal design note, G2): mode 7 carries its source VRAM offset as a SECOND CLI token
+    // 0.0.416 (SDMA GCR cache-rinse): mode 7 carries its source VRAM offset as a SECOND CLI token
     // (`accel scanout 7 <vramOff> [gcr]`) and packs it into the ONE ABI scalar with the mode and the GCR flag
     // (sdma_gcr.h). All other verbs ignore arg2/arg3.
     // build 0.0.542: `accel scanout full [file]` is mode 9 (the optional file is written by scanfull_pull below).
@@ -2101,6 +2103,12 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         }
         in2[1] = isStrikes ? rdna4a_arg(RDNA4A_OP_STRIKES, 0) : isList ? rdna4a_arg(RDNA4A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0) : rdna4a_arg(isAdd ? RDNA4A_OP_ADD : RDNA4A_OP_REMOVE, rdna4a_comm_key(arg2));
         if (!isList && !isStrikes) printf("accel appallow: name \"%.16s\" -> key %#llx\n", arg2, (unsigned long long)rdna4a_comm_key(arg2));
+    }
+    if (in == 115) {
+        if (!arg || !strcmp(arg, "status")) in2[1] = 2;
+        else if (!strcmp(arg, "0") || !strcmp(arg, "off")) in2[1] = 0;
+        else if (!strcmp(arg, "1") || !strcmp(arg, "on")) in2[1] = 1;
+        else { fprintf(stderr, "accel killswitch: usage: killswitch [0|1|status]\n"); return 2; }
     }
     if (in == 110) {   // action 110 (G4): `appdeny add <name>|remove <name>|list [page 0..7]|clear` -> (op << 60) | key / page
         int warnLong = 0;
@@ -2468,6 +2476,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         }
         return c == 0 || c == 4 || c == 5 ? 0 : 3;
     }
+    if (in == 115) {
+        printf("  killswitch              : %llu (%s)\n", (unsigned long long)out[3], out[3] ? "ON" : "OFF");
+        return 0;
+    }
     if (in == 110) {
         static const char *cn[] = { "ok", "OFF: boot-arg garnet-apps or garnet-multisession is not 1", "bad argument", "FULL (64 entries)", "already on the denylist", "not on the denylist" };
         const unsigned long long c = out[3];
@@ -2724,7 +2736,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
                                      "source control FAILED", "PRE-FLIGHT copy FAILED", "FENCE timeout", "READBACK mismatch",
                                      "plan refused", "interlock: positive control not passed", "ring write failed",
                                      "nothing saved to restore", "buffer unresolved", "backing unprepared or short",
-                                     /* 0.0.416 mode 7 (an internal design note G2) */
+                                     /* 0.0.416 mode 7 (SDMA GCR cache-rinse) */
                                      "mode 7 source not 4 KiB aligned", "mode 7 source outside the card's VRAM",
                                      "mode 7 source overlaps one of our own allocations",
                                      /* 0.0.518 / 0.0.542 */
@@ -2785,7 +2797,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 6) {
-            /* 0.0.414 (an internal design note, section 950): the FULL-GEOMETRY SDMA self-test.
+            /* 0.0.414 (driver design, section 950): the FULL-GEOMETRY SDMA self-test.
                One call, two cases in order: the 256x256 section 719 control, then the live 1920x1080 geometry.
                Three scratch VRAM buffers only - it never touches the scanout, needs no interlock, no WindowServer
                and no Apple accelerator. The 16x16 wrong-cell maps and the decoded wrong pixels are in the driver
@@ -2804,7 +2816,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 7) {
-            /* 0.0.416 (an internal design note, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
+            /* 0.0.416 (driver design, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
                source. ONE COPY_LINEAR of a 256 KiB window, optionally with the GCR_REQ (GL2 write-back + invalidate)
                immediately before it in the SAME submission, into a low scratch of ours; then the scratch and the
                source are both read through the MM window and compared per 256-byte line.
@@ -2827,7 +2839,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 8) {
-            /* D7 (0.0.417, an internal design note): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
+            /* D7 (0.0.417, driver design): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
                exactly - same buffers, packet fields, sample set, report lines and POISON detection - except the
                CPU writes 0xff00ff00 everywhere and every expected value is 0xff00ff00. It measures the WRITE
                compression half: with SDMA0's no-PTE write compression ON a constant block is stored as a code
@@ -2879,7 +2891,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         if (st != 0) return 3;
     }
     if (in == 82) {
-        /* D1 (0.0.417, an internal design note): out[i] = v[i] of rdna4_sdmadcc_control.
+        /* D1 (0.0.417, driver design): out[i] = v[i] of rdna4_sdmadcc_control.
            v: 0 op (0 refused, 1 read, 2 set, 3 restore), 1 SDMA0 raw, 2 SDMA1 raw, 3 restore value,
            4 written/target, 5 read-back, 6 match, 7 status (0 ok, 1 bad arg, 2 no context, 3 no GC base,
            4 mismatch), 8 captured. The per-set decode uses sdma_dcc.h's own accessors. */

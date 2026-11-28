@@ -152,7 +152,7 @@ int main() {
         if (m.id == amdgpu::PPSMC::GetDpmFreqByIndex || m.id == amdgpu::PPSMC::SetHardMinByFreq) ++any_dpm_query;
     expect(any_dpm_query == 0, "failed EnableAllSmuFeatures skips DPM clock pinning");
 
-    // Wave 10: SMU IF 0x2E..0x33 verification and effective GFXCLK decoding.
+    // SMU IF 0x2E..0x33 verification and effective GFXCLK decoding.
     expect(!amdgpu::smu_driver_if_verified(0x2Du), "IF 0x2D is below verified range");
     expect(amdgpu::smu_driver_if_verified(0x2Eu), "IF 0x2E is verified");
     expect(amdgpu::smu_driver_if_verified(0x33u), "IF 0x33 (RX 9060 XT PMFW) is verified");

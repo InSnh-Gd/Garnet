@@ -1,4 +1,4 @@
-// native_rebar_test.cpp - build 0.0.663 (Resizable BAR support, an internal design note section 3 items 1-9; plus `vramstat`, Stage 2 review S3).
+// native_rebar_test.cpp - build 0.0.663 (Resizable BAR support, ReBAR BAR0 sizing contract; plus `vramstat`, Stage 2 review S3).
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/garnet/src -I src/garnet/src/amd src/garnet/tests/native_rebar_test.cpp -o /tmp/native_rebar && /tmp/native_rebar .
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_rebar_plant.sh plants breaks)
@@ -345,7 +345,7 @@ static void p6_vramstat(const std::string &root) {
     expect(at(b, "if (action == rdna4disp::kActVramStat) {") < at(b, "if (action == 83 || action == 84"), "P6: served before the pipe verbs");
     const std::string cli = slurp(root + "/tools/rdna4/native/garnettest.c");
     expect(has(cli, "else if (what && !strcmp(what, \"vramstat\")) in = 108;") && has(cli, "in == 108 ? \"vramstat\"") && has(cli, "if (in == 108) return cmd_vramstat(arg);") && has(cli, "static int cmd_vramstat(const char *a1) {") && has(cli, "dr_call(108, 0, o)"), "P6: the CLI sites (table, name, dispatch, command)");
-    expect(has(cli, "scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny\\n") && has(cli, "|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream"), "P6: the known list and the usage string name vramstat and bartest");
+    expect(has(cli, "scdcread appallow fbpublish m6stat m6xstat vramstat bartest appdeny killswitch\\n") && has(cli, "|m6xstat [0|1|2]|vramstat|bartest [0|1]|appdeny add <name>/remove <name>/list [page]/clear|capstream"), "P6: the known list and the usage string name vramstat and bartest");
     const std::string uc = slurp(root + "/src/garnet/src/GarnetUserClient.cpp");
     expect(has(uc, "108 = vramstat"), "P6: the user client's table comment names the verb (its bound is the pure admission)");
     const std::string pure = slurp(root + "/src/garnet/src/amd/native_disp_pure.h");

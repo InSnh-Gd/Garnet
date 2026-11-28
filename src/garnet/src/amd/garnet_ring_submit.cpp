@@ -323,9 +323,9 @@ static bool kcq_hang_poll() {
     }
     IOLockUnlock(gHangLock);
     if (det) {
-        N1C_LOG("KCQ HUNG: compute seq emitted %llu retired %llu rptr %u wptr %u",
+        N1C_LOG("KCQ HUNG: compute seq emitted %llu retired %llu rptr %u wptr %llu",
                 (unsigned long long)em, (unsigned long long)re,
-                gCtx->kcq.rptr_cpu ? *gCtx->kcq.rptr_cpu : 0u, gCtx->kcq.wptr);
+                gCtx->kcq.rptr_cpu ? *gCtx->kcq.rptr_cpu : 0u, (unsigned long long)gCtx->kcq.wptr);
         hang_announce(emitted_now(), retired_now(emitted_now()));
     }
     return det;
@@ -636,7 +636,7 @@ static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, 
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
     irq_arm_ring_eop(ring, startWc, n, mask, dw);
     gKcqWc = wc;
-    cq.wptr = ring_idx(wc, mask);
+    cq.wptr = wc;
     const uint64_t emBefore = kcq_emitted_now();
     const uint64_t reNow = kcq_retired_now(emBefore);
     IOLockLock(gHangLock);
@@ -833,11 +833,21 @@ static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_
     return kOk;
 }
 
+bool n1c_rings_busy() {
+    if (gCtx == nullptr) return false;
+    const uint64_t gfxEm = emitted_now();
+    if (gfxEm != 0ull && retired_now(gfxEm) < gfxEm) return true;
+    const uint64_t kcqEm = kcq_emitted_now();
+    if (kcqEm != 0ull && kcq_retired_now(kcqEm) < kcqEm) return true;
+    return false;
+}
+
 IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_t *seqOut) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
     CsView v;
     const uint32_t prc = cs_parse(in, size, &v, async_compute_on());
     if (prc != kOk) return (IOReturn)prc;
+    smu_idle_dpm_note_activity(true, v.ipType == RDNA4N_HW_IP_COMPUTE);
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOReturn rc = kIOReturnSuccess;
@@ -995,6 +1005,7 @@ IOReturn n1c_buffer_op(const N1cRef &ref, const rdna4n_buffer_op *in, bool fill,
     *seqOut = 0;
     if (!sess_hello(ref)) return kIOReturnNotReady;
     const rdna4n_buffer_op q = *in;
+    smu_idle_dpm_note_activity(true);
     Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;
     BufferEnv env{s};

@@ -3,23 +3,23 @@
 - **Date**: 2026-11-27
 - **Targets**: Navi 44 (RX 9060 XT, `gfx1200`, `1002:7590`, 32 MiB MALL) and Navi 48 (RX 9070 XT, `gfx1201`, 64 MiB MALL)
 - **Primary Sources**:
-  - Local Garnet repository (`src/garnet/`, `src/dcn41/`, `logs/rdna4-perf-baseline/`)
+  - Local Garnet repository (`src/garnet/`, `src/dcn41/`)
   - Upstream Linux `torvalds/linux` (`ref=9437ee8b6cf607e883b36e44bd755968daaebd48`): `drivers/gpu/drm/amd/display/` and `drivers/gpu/drm/amd/amdgpu/`
 
 ---
 
 ## 1. Baseline & Problem Statement
 
-Stage 3 (`optimize-garnet-display-vbl-and-power`) eliminated major idle power waste on the RX 9060 XT (Navi 44) by enabling GFX12 clock gating via RLC safe mode, hardware `VUPDATE_NO_LOCK` VBLANK IRQs, DPMS for primary DisplayPort, single-pipe `DET0` expansion (`192 KiB -> 576 KiB`), and self-protected `UCLK` unpinning (`logs/rdna4-perf-baseline/stage3-fix-post-20261125T112015Z/REPORT.md`):
+Current Garnet display power management eliminated major idle power waste on the RX 9060 XT (Navi 44) by enabling GFX12 clock gating via RLC safe mode, hardware `VUPDATE_NO_LOCK` VBLANK IRQs, DPMS for primary DisplayPort, single-pipe `DET0` expansion (`192 KiB -> 576 KiB`), and self-protected `UCLK` unpinning:
 
 | Mode | Idle Socket W | GFX / UCLK / FCLK MHz | `DET0` Buffer Time | VBLANK Duration | Result |
 |---|---:|---:|---:|---:|---|
 | 4K@60Hz (533.25 MHz, non-DSC) | **16.6 W** | 1000 / **96** / 1096 | **288 µs** | **465 µs** | `UCLK` unpinned safely (`0` OPTC0 underflows) |
 | 4K@160Hz (1479 MHz, DSC) | **27.6 W** | 1000 / **1258** / 2016 | **103 µs** | **108 µs** | Forced `UCLK` top-DPM pin (**+11.0 W** gap) |
 
-Because GDDR6 `UCLK` P-state transitions introduce a `~150–250 µs` memory blackout window (`src/garnet/src/amd/garnet_power_policy_pure.h:183-219`), modes whose VBLANK and `DET0` drain time fall below `350 µs` / `250 µs` (4K@160Hz DSC, multi-display configs) cannot lower `UCLK` without DMUB **FAMS2** / **Display MALL (SubVP / Static Screen CAB)** and **DML2.1** watermarks.
+Because GDDR6 `UCLK` P-state transitions introduce a `~150 to 250 µs` memory blackout window (`src/garnet/src/amd/garnet_power_policy_pure.h:183-219`), modes whose VBLANK and `DET0` drain time fall below `350 µs` / `250 µs` (4K@160Hz DSC, multi-display configs) cannot lower `UCLK` without DMUB **FAMS2** / **Display MALL (SubVP / Static Screen CAB)** and **DML2.1** watermarks.
 
-Meanwhile, Wave 9 compute benchmarks (`logs/rdna4-perf-baseline/perf-160fps-wave9-summary.md`) established Navi 44's 32 MiB Infinity Cache (MALL) bandwidth at `819–928 GB/s` (vs `284–312 GB/s` GDDR6). Any Display MALL policy must therefore preserve Wave 9/11 compute & render cache behavior when Display MALL is inactive or strictly scoped per upstream `amdgpu_dm`.
+Meanwhile, RX 9060 XT compute benchmarks established Navi 44's 32 MiB Infinity Cache (MALL) bandwidth at `819 to 928 GB/s` (vs `284 to 312 GB/s` GDDR6). Any Display MALL policy must therefore preserve existing compute and render cache behavior when Display MALL is inactive or strictly scoped per upstream `amdgpu_dm`.
 
 ---
 

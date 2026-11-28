@@ -124,7 +124,7 @@ uint32_t scanout_sdma_copies(amdgpu::DeviceContext &dev, amdgpu::SDMAInstance &i
 }
 
 // =====================================================================================================
-// build 0.0.496 (an internal design note) — SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
+// build 0.0.496 (driver design) — SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
 //
 // amd/fastcopy.h holds the argument and every decision; this is its kernel half, beside the SDMA code it reuses:
 //   - the staging buffer: ONE physically contiguous 1 MiB system-memory buffer (amdgpu::sysmem_alloc, snooped), bound into the
@@ -968,7 +968,7 @@ void rdna4_fc_copy_report(uint64_t copyNo) {
 // rdna4_scanout_tiled_dst_ok over EVERY byte the packet may write). tiledMc/linearMc are MC addresses the caller has
 // already range-checked. CPV IS NEVER SET: found COPY_LINEAR grows a trailing dword only when CPV is set,
 // and a 15-dword packet in a 14-dword slot desynchronises the ring for ever.
-// 0.0.416 (an internal design note, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
+// 0.0.416 (SDMA GCR cache-rinse): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
 // copy — one ring write, one doorbell, one fence — so the cache rinse is ordered before the copy the engine then
 // reads the tiled source with. Default false: every pre-0.0.416 caller is byte-identical (18 dwords, no GCR).
 uint32_t scanout_sdma_tiled_copy(amdgpu::DeviceContext &dev, amdgpu::SDMAInstance &inst,
@@ -1023,7 +1023,7 @@ uint32_t scanout_sdma_tiled_copy(amdgpu::DeviceContext &dev, amdgpu::SDMAInstanc
 	return v == fenceValue ? kScanStOk : kScanStFence;
 }
 
-// 0.0.416 (an internal design note, G2) — ONE COPY_LINEAR window plus, if asked, the GCR_REQ immediately before
+// 0.0.416 (SDMA GCR cache-rinse) — ONE COPY_LINEAR window plus, if asked, the GCR_REQ immediately before
 // it in the SAME submission (one ring write, one doorbell, one fence). The COPY_LINEAR shape is scanout_sdma_copies'
 // (header with CPV 1, bytes-1, src, dst), so mode 7's copy is the same packet the scanout path already proved.
 uint32_t scanout_sdma_copy_linear_gcr(amdgpu::DeviceContext &dev, amdgpu::SDMAInstance &inst,
@@ -1095,7 +1095,7 @@ void scanout_free_vram(amdgpu::VRAMAllocation &a) {
 }
 
 // =====================================================================================================
-// 0.0.414 (an internal design note,) — THE FULL-GEOMETRY SDMA SELF-TEST.
+// 0.0.414 (driver design) — THE FULL-GEOMETRY SDMA SELF-TEST.
 //
 // Mode 5 proves the 14-dword COPY_TILED_SUB_WINDOW packet on a 256x256 surface.'s live
 // plane is 1920x1080, ADDR3 64KB_2D, pitch 1920, 15 blocks across and a partial 9th block row, and the
@@ -1135,7 +1135,7 @@ static void scanout_full_decode(const RDNA4FullCase *r, char *out, unsigned cap)
 	}
 }
 
-// D7 (0.0.417, an internal design note): `uniform` selects the probe pattern. Mode 6 passes false and is
+// D7 (0.0.417, driver design): `uniform` selects the probe pattern. Mode 6 passes false and is
 // byte-identical; mode 8 passes true for its 1920x1080 case only, so the CPU writes RDNA4_TILE_UNIFORM_PIXEL at
 // every position and every expected value is that same value. Everything else - buffers, packet fields, sample
 // set, report lines, POISON detection - is the same code the two modes share.

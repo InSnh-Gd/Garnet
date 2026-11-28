@@ -12,6 +12,14 @@ pub const GARNETX_CAP_RT_IFT_ABI_V2: u32 = 1 << 10;
 pub const GARNETX_CAP_RT_PRIMITIVE_DATA: u32 = 1 << 11;
 /// Capability flag indicating native Vulkan `shaderInt64` arithmetic (skip u32-half i64 emulation).
 pub const GARNETX_CAP_NATIVE_INT64: u32 = 1 << 12;
+/// Capability flag enabling Metal 3.1 curve geometry & curve intersection lowering.
+pub const GARNETX_CAP_RT_CURVES: u32 = 1 << 13;
+/// Capability flag enabling Metal 3 primitive/instance motion blur lowering.
+pub const GARNETX_CAP_RT_MOTION_BLUR: u32 = 1 << 14;
+/// Bit shift & mask for optional `TransformOptions::raster_sample_count` packed in `flags[23:16]`.
+/// Value `0` leaves `raster_sample_count` unset (`None`); valid non-zero values are powers of two in `1..=64`.
+pub const GARNETX_CAP_RASTER_SAMPLES_SHIFT: u32 = 16;
+pub const GARNETX_CAP_RASTER_SAMPLES_MASK: u32 = 0xFF << GARNETX_CAP_RASTER_SAMPLES_SHIFT;
 
 /// Set-0 `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` bindings for emulated Object+Mesh stages and RT prim data.
 pub const GARNETX_MESH_GRID_PARAMS_BINDING: u32 =
@@ -26,7 +34,9 @@ const KNOWN_CAPABILITY_FLAGS: u32 = 3
     | GARNETX_CAP_RT_POSITION_FETCH
     | GARNETX_CAP_RT_IFT_ABI_V2
     | GARNETX_CAP_RT_PRIMITIVE_DATA
-    | GARNETX_CAP_NATIVE_INT64;
+    | GARNETX_CAP_NATIVE_INT64
+    | GARNETX_CAP_RT_CURVES
+    | GARNETX_CAP_RT_MOTION_BLUR;
 
 /// Caller-proven language/device support and actual Vulkan subgroup properties (ABI 3).
 #[repr(C)]
@@ -44,13 +54,22 @@ pub struct RDNA4xBackendCapabilities {
 
 impl RDNA4xBackendCapabilities {
     pub(crate) fn validate(self) -> Result<Self, String> {
+        let sample_bits =
+            (self.flags & GARNETX_CAP_RASTER_SAMPLES_MASK) >> GARNETX_CAP_RASTER_SAMPLES_SHIFT;
+        let samples_ok = sample_bits == 0 || (sample_bits.is_power_of_two() && sample_bits <= 64);
         if self.struct_size != 24
             || self.version != 1
-            || self.flags & !KNOWN_CAPABILITY_FLAGS != 0
+            || (self.flags & !(KNOWN_CAPABILITY_FLAGS | GARNETX_CAP_RASTER_SAMPLES_MASK)) != 0
+            || !samples_ok
         {
             return Err("invalid ABI 3 backend capabilities".into());
         }
         Ok(self)
+    }
+
+    pub(crate) fn raster_sample_count(self) -> Option<u32> {
+        let n = (self.flags & GARNETX_CAP_RASTER_SAMPLES_MASK) >> GARNETX_CAP_RASTER_SAMPLES_SHIFT;
+        (n != 0).then_some(n)
     }
 
     pub(crate) fn emulated_mesh_payload(self) -> bool {
@@ -67,6 +86,14 @@ impl RDNA4xBackendCapabilities {
 
     pub(crate) fn native_int64(self) -> bool {
         self.flags & GARNETX_CAP_NATIVE_INT64 != 0
+    }
+
+    pub(crate) fn rt_curves(self) -> bool {
+        self.flags & GARNETX_CAP_RT_CURVES != 0
+    }
+
+    pub(crate) fn rt_motion(self) -> bool {
+        self.flags & GARNETX_CAP_RT_MOTION_BLUR != 0
     }
 
     pub(crate) fn replay(self) -> QueryLodReplay {
@@ -449,7 +476,10 @@ fn translate_bytes_with_capabilities(
         capabilities.replay(),
         capabilities.emulated_mesh_payload(),
         capabilities.rt_primitive_data(),
+        capabilities.rt_curves(),
+        capabilities.rt_motion(),
         capabilities.native_int64(),
+        capabilities.raster_sample_count(),
     )?;
     let has_query = gate_query_lod(&spv, capabilities)?;
     let mut metadata: Value = serde_json::from_slice(&meta).map_err(|error| error.to_string())?;

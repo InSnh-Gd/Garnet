@@ -20,8 +20,7 @@
 #         0 progress_track
 #
 # The resulting shader uses the standard HSA kernarg convention, so dispatch it
-# with the kext's hsaAbi path (boot-arg rdna4-hsa-abi=1). See
-# notes/B1-COMPILER-BRIDGE.md.
+# with the kext's hsaAbi path (boot-arg rdna4-hsa-abi=1).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

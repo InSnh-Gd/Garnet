@@ -13,6 +13,13 @@ void rdna4_sdmadcc_default(void);
 
 namespace amdgpu {
 
+// Lock-free native GFX/KCQ busy probe implemented in garnet_ring_submit.cpp.
+bool n1c_rings_busy();
+
+static bool idle_dpm_hw_busy(void *) {
+    return n1c_rings_busy();
+}
+
 const char *stage_name(BringupStage s) {
     switch (s) {
     case BringupStage::None: return "None";               case BringupStage::IPDiscovery: return "IPDiscovery";
@@ -793,6 +800,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
 kern_return_t bringup_teardown(BringupContext &ctx) {
     if (ctx.dev == nullptr || ctx.tornDown) return kIOReturnSuccess;
     DeviceContext &dev = *ctx.dev;
+    smu_idle_dpm_stop();
     const kern_return_t gfxOffResult = gfx_off_teardown(dev, ctx.smu);
     if (gfxOffResult != kIOReturnSuccess) {
         INIT_LOG("teardown refused (%#x): cannot safely stop GC; retaining engine and DMA storage",
@@ -811,7 +819,8 @@ kern_return_t bringup_teardown(BringupContext &ctx) {
     INIT_LOG("teardown: unwinding from stage %u (%s)",
              (unsigned)ctx.reached, stage_name(ctx.reached));
 
-    // (0) Stage 3C: unwind GFXOFF and GFX12 clock gating before halting engines.
+    // (0) Power teardown: idle governor and GFXOFF already unwound above;
+    //     unwind GFX12 clock gating before halting engines.
     ctx.gfxOffAllowed = false;
     if (ctx.rlc.cg_enabled && dev.ip.isResolved(IPBlock::GC)) {
         (void)rlc_set_clock_gating(dev, ctx.rlc, false, ctx.sdma.instance_present[1]);
@@ -845,7 +854,8 @@ kern_return_t bringup_teardown(BringupContext &ctx) {
             cp_compute_enable(dev, false);
         }
         // (3) Park the scheduler last: REMOVE_QUEUE above needed it running.
-        if (ctx.mes.pipe[0].enabled) {
+        if (ctx.mes.pipe[0].enabled || ctx.mes.pipe[1].enabled) {
+            (void)mes_unmap_sched_queue(dev, ctx.mes);
             kern_return_t r = mes_enable(dev, ctx.mes, false);
             INIT_LOG("teardown: MES disable %s (%#x)",
                      r == kIOReturnSuccess ? "ok" : "failed", r);
@@ -866,7 +876,7 @@ kern_return_t bringup_teardown(BringupContext &ctx) {
     //     no-op on a context that never got that far.
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++)
         sdma_release_storage(ctx.gmc, ctx.sdma.instance[i]);
-    mes_release_storage(ctx.mes);
+    mes_release_storage(ctx.mes, &ctx.gmc);
     cp_compute_queue_release(ctx.gmc, ctx.kcq);
     cp_release_storage(ctx.cp);
     ih_release(ctx.ih);
@@ -929,16 +939,23 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
         }
     }
 
-    // With Stage 3C GFX12 CGCG/CGLS active, SMUPowerState::Auto idles cool (~34 W at
-    // 4K@160Hz DSC, ~17 W at 4K@60Hz) while delivering full shader/compute boost clocks.
-    // Opt-in `garnet-idle-clamp=1` (or runtime `garnettest power 1`) clamps GFXCLK to 200 MHz.
+    // With GFX12 CGCG/CGLS active, the activity-driven idle governor
+    // (`garnet-idle-dpm`, default ON; kill-switch `garnet-idle-dpm=0`) keeps SMUPowerState::Auto
+    // during GPU work and drops to SMUPowerState::Low (200 MHz) after 1000 ms idle.
+    // Opt-in `garnet-idle-clamp=1` (or runtime `garnettest power <N>`) bypasses the governor.
     if (ctx.idleClamp && ctx.smuOnline && ctx.dev) {
         kern_return_t pr = smu_set_power_state(*ctx.dev, SMUPowerState::Low);
         INIT_LOG("idle clamp: GFXCLK -> low %s (%#x) (garnet-idle-clamp=1 active; "
                  "`garnettest power 0` to restore Auto).",
                  pr == kIOReturnSuccess ? "applied" : "FAILED", pr);
+        smu_idle_dpm_start(*ctx.dev, ctx.smu, ctx.idleDpmEnabled, /*idleClamp=*/true,
+                           &idle_dpm_hw_busy, nullptr);
     } else if (ctx.smuOnline && ctx.dev) {
-        INIT_LOG("GFXCLK auto (Stage 3C CGCG/CGLS active); pass garnet-idle-clamp=1 to clamp to 200 MHz.");
+        smu_idle_dpm_start(*ctx.dev, ctx.smu, ctx.idleDpmEnabled, /*idleClamp=*/false,
+                           &idle_dpm_hw_busy, nullptr);
+        if (!ctx.idleDpmEnabled) {
+            INIT_LOG("GFXCLK auto (garnet-idle-dpm=0 disabled idle governor); pass garnet-idle-clamp=1 to clamp to 200 MHz.");
+        }
     }
     return kIOReturnSuccess;
 }

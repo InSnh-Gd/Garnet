@@ -323,6 +323,8 @@ GARNET_INTERNAL NSData *rdna4_gpu_argument_spv(NSData *spv, NSDictionary **metad
     NSData *input = [NSJSONSerialization dataWithJSONObject:*metadata options:NSJSONWritingSortedKeys error:error];
     if (!input) return nil;
     NSString *directory = rdna4x_user_dir();
+    const BOOL useMem = (!directory && rdna4x_memcache_active());
+    if (useMem) directory = @RDNA4X_MEMCACHE_DIR;
     if (!directory || !rdna4x_spv_size_ok(spv.length) || !rdna4x_meta_size_ok(input.length)) {
         if (error) *error = rdna4_err(49, @"GPU argument input exceeds the translator caps or its cache is unavailable"); return nil;
     }
@@ -331,9 +333,12 @@ GARNET_INTERNAL NSData *rdna4_gpu_argument_spv(NSData *spv, NSDictionary **metad
     rdna4x_capabilities_hash(capHash, &queryCaps); rdna4x_hex(capHex, capHash, sizeof capHash);
     NSString *identity = [NSString stringWithFormat:@"rdna4x-argument-resources-47-dynamic-texel\n%s\n%@\n%@\n", capHex, rdna4_sha256hex(spv), rdna4_sha256hex(input)];
     NSString *sha = rdna4_sha256hex([identity dataUsingEncoding:NSUTF8StringEncoding]);
-    NSString *codePath = [directory stringByAppendingPathComponent:[sha stringByAppendingString:@".spv"]];
-    NSString *jsonPath = [directory stringByAppendingPathComponent:[sha stringByAppendingString:@".meta.json"]];
-    NSData *result = rdna4_argument_cached_data(codePath, RDNA4X_MAX_SPV);
+    NSString *codePath = useMem ? nil : [directory stringByAppendingPathComponent:[sha stringByAppendingString:@".spv"]];
+    NSString *jsonPath = useMem ? nil : [directory stringByAppendingPathComponent:[sha stringByAppendingString:@".meta.json"]];
+    NSData *result = nil;
+    NSDictionary *memMeta = nil;
+    if (useMem) (void)rdna4x_memcache_lookup(sha, &result, &memMeta, NULL);
+    else result = rdna4_argument_cached_data(codePath, RDNA4X_MAX_SPV);
     if (!result) {
         rdna4x_engine_prepare();
         const BOOL unlimited = (deadline == UINT64_MAX && !rdna4_is_ws());
@@ -352,10 +357,22 @@ GARNET_INTERNAL NSData *rdna4_gpu_argument_spv(NSData *spv, NSDictionary **metad
             spv.bytes, spv.length, input.bytes, input.length, waitMs, why, sizeof why);
         if (waiting) rdna4_sync_end(rc == RDNA4X_OK, rc == RDNA4X_E_TIMEOUT);
         if (rc != RDNA4X_OK) {
-            NSString *reason = why[0] ? @(why) : rdna4x_cached_refusal(directory, sha) ?: @"no failure reason was reported";
+            NSString *refused = nil;
+            if (useMem) (void)rdna4x_memcache_lookup(sha, NULL, NULL, &refused);
+            else refused = rdna4x_cached_refusal(directory, sha);
+            NSString *reason = why[0] ? @(why) : refused ?: @"no failure reason was reported";
             if (error) *error = rdna4_err(49, [NSString stringWithFormat:@"GPU argument lowering failed: code %d: %@", rc, reason]); return nil;
         }
-        result = rdna4_argument_cached_data(codePath, RDNA4X_MAX_SPV);
+        if (useMem) (void)rdna4x_memcache_lookup(sha, &result, &memMeta, NULL);
+        else result = rdna4_argument_cached_data(codePath, RDNA4X_MAX_SPV);
+    }
+    if (useMem) {
+        if (!rdna4x_spv_size_ok(result.length) || ![memMeta isKindOfClass:[NSDictionary class]]) {
+            if (error) *error = rdna4_err(49, @"GPU argument memory cache pair is missing or invalid");
+            return nil;
+        }
+        *metadata = memMeta;
+        return result;
     }
     NSData *json = rdna4_argument_cached_data(jsonPath, RDNA4X_MAX_META);
     id meta = json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:error] : nil;
@@ -1308,9 +1325,17 @@ static _Atomic uint64_t rdna4_argument_pool_descriptors;
 @end
 #endif // !defined(RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST) && !defined(GARNET_ARGUMENT_SUMMARY_OWNERS_ONLY)
 #if !defined(RDNA4_ARGUMENT_SUMMARY_RUNTIME_TEST) && !defined(GARNET_ARGUMENT_SUMMARY_OWNERS_ONLY)
+typedef struct {
+    BOOL loaded;
+    void *dictRetained;
+    const void **objects;
+    rdna4_as_live_entry *entries;
+    rdna4_as_live_table table;
+} RDNA4ArgumentLiveContext;
+static void rdna4_argument_live_ctx_destroy(RDNA4ArgumentLiveContext *ctx);
 static BOOL rdna4_argument_sampler_scope_work(
         id device, RDNA4Buffer *buffer, const rdna4_as_work *work,
-        NSDictionary *__strong *live, NSMutableSet *samplers,
+        RDNA4ArgumentLiveContext *liveCtx, NSMutableSet *samplers,
         NSMutableArray<NSDictionary *> *writes, NSString **why);
 @implementation RDNA4CommandBuffer (RDNA4ArgumentCommands)
 - (BOOL)rdna4PrepareArguments:(const RDNA4ArgumentTables *)tables resources:(NSSet *)resources writable:(NSSet *)writable scan:(const RDNA4ArgumentScanPrepared *)scan textures:(void (^)(RDNA4Texture *, VkImageLayout, BOOL))prepare {
@@ -1368,7 +1393,7 @@ static BOOL rdna4_argument_sampler_scope_work(
         return NO;
     }
     if (iftAttachedBuffers.count) {
-        NSDictionary *iftLive = nil;
+        RDNA4ArgumentLiveContext iftLiveCtx = {0};
         for (RDNA4Buffer *att in iftAttachedBuffers) {
             if (att.device != [self device] || [att isAliasable] || att.length < RDNA4_AS_TOKEN_BYTES)
                 continue;
@@ -1386,12 +1411,14 @@ static BOOL rdna4_argument_sampler_scope_work(
                 .count = att.length / RDNA4_AS_TOKEN_BYTES,
                 .width = RDNA4_AS_TOKEN_BYTES,
             };
-            if (!rdna4_argument_sampler_scope_work([self device], att, &work, &iftLive,
+            if (!rdna4_argument_sampler_scope_work([self device], att, &work, &iftLiveCtx,
                                                    samplers, writes, &scopeError)) {
+                rdna4_argument_live_ctx_destroy(&iftLiveCtx);
                 [self rdna4Fail:scopeError ?: @"IFT attached buffer sampler scope failed"];
                 return NO;
             }
         }
+        rdna4_argument_live_ctx_destroy(&iftLiveCtx);
     }
     for (NSDictionary *write in writes) {
         id buffer = write[@"buffer"];
@@ -2010,6 +2037,7 @@ static BOOL rdna4_argument_add(NSMutableDictionary *fields, MTLDataType type, MT
 static NSMutableDictionary<NSNumber *, RDNA4ArgumentResourceToken *> *rdna4_argument_tokens;
 static NSLock *rdna4_argument_tokens_lock;
 static _Atomic uint64_t rdna4_argument_token_id;
+static _Atomic uint32_t rdna4_argument_sampler_registered;
 static char rdna4_argument_token_key;
 static void rdna4_argument_tokens_init(void) {
     static dispatch_once_t once;
@@ -2079,6 +2107,7 @@ GARNET_INTERNAL uint64_t rdna4_argument_resource_token_bindless(id object, id de
     if (texture) {
         entry.object = object;
     } else {
+        atomic_store_explicit(&rdna4_argument_sampler_registered, 1u, memory_order_release);
         entry.object = nil;
         rdna4_argument_token_prune_aliases_locked(entry);
         BOOL found = NO;
@@ -2230,6 +2259,8 @@ static void rdna4_argument_sampler_fill_locked(RDNA4ArgumentSamplerOwners *owner
 }
 
 static NSDictionary *rdna4_argument_live_samplers(id device) {
+    if (!atomic_load_explicit(&rdna4_argument_sampler_registered, memory_order_acquire))
+        return @{};
     rdna4_argument_tokens_init();
     NSMutableDictionary *live = [NSMutableDictionary dictionary];
     [rdna4_argument_tokens_lock lock];
@@ -2242,6 +2273,123 @@ static NSDictionary *rdna4_argument_live_samplers(id device) {
     }
     [rdna4_argument_tokens_lock unlock];
     return live;
+}
+
+@interface RDNA4ArgumentIncScanCache : NSObject {
+@public
+    rdna4_as_inc_cache cache;
+    BOOL ready;
+}
+@end
+@implementation RDNA4ArgumentIncScanCache
+- (void)dealloc {
+    if (ready) rdna4_as_inc_cache_destroy(&cache);
+}
+@end
+
+static char rdna4_argument_inc_cache_key;
+static RDNA4ArgumentIncScanCache *rdna4_argument_inc_cache_for(id buffer, BOOL create) {
+    if (!buffer) return nil;
+    RDNA4ArgumentIncScanCache *box = objc_getAssociatedObject(buffer, &rdna4_argument_inc_cache_key);
+    if (!box && create) {
+        NSUInteger len = [(id<MTLBuffer>)buffer length];
+        if (len < RDNA4_AS_INC_CHUNK_BYTES) return nil;
+        box = [RDNA4ArgumentIncScanCache new];
+        if (box && rdna4_as_inc_cache_init(&box->cache, (uint64_t)len) == RDNA4_AS_OK) {
+            box->ready = YES;
+            objc_setAssociatedObject(buffer, &rdna4_argument_inc_cache_key, box,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else {
+            box = nil;
+        }
+    }
+    return box;
+}
+
+GARNET_INTERNAL void rdna4_argument_note_dirty_range(id buffer, NSRange range) {
+    if (!buffer || !range.length) return;
+    @synchronized (buffer) {
+        RDNA4ArgumentIncScanCache *box = rdna4_argument_inc_cache_for(buffer, NO);
+        if (box && box->ready)
+            rdna4_as_inc_cache_mark_dirty(&box->cache, (uint64_t)range.location,
+                                          (uint64_t)range.length);
+    }
+}
+
+static BOOL rdna4_argument_live_ctx_from_dict(RDNA4ArgumentLiveContext *ctx,
+                                              NSDictionary<NSNumber *, id> *dict) {
+    if (!ctx) return NO;
+    rdna4_argument_live_ctx_destroy(ctx);
+    ctx->loaded = YES;
+    NSUInteger count = dict.count;
+    if (!count) return YES;
+    const void **objects = (const void **)calloc((size_t)count, sizeof(*objects));
+    rdna4_as_live_entry *entries =
+        (rdna4_as_live_entry *)calloc((size_t)count, sizeof(*entries));
+    if (!objects || !entries) {
+        free(objects);
+        free(entries);
+        ctx->loaded = NO;
+        return NO;
+    }
+    uint32_t idx = 0;
+    for (NSNumber *key in dict) {
+        id val = dict[key];
+        objects[idx] = (__bridge const void *)val;
+        entries[idx] = (rdna4_as_live_entry){
+            .token = key.unsignedLongLongValue,
+            .value_index = idx,
+        };
+        idx++;
+    }
+    if (rdna4_as_live_table_build(&ctx->table, entries, (size_t)idx) != RDNA4_AS_OK) {
+        free(objects);
+        free(entries);
+        memset(&ctx->table, 0, sizeof(ctx->table));
+        ctx->loaded = NO;
+        return NO;
+    }
+    ctx->dictRetained = (__bridge_retained void *)dict;
+    ctx->objects = objects;
+    ctx->entries = entries;
+    return YES;
+}
+
+static BOOL rdna4_argument_live_ctx_ensure(RDNA4ArgumentLiveContext *ctx, id device) {
+    if (!ctx) return NO;
+    if (ctx->loaded) return YES;
+    return rdna4_argument_live_ctx_from_dict(ctx, rdna4_argument_live_samplers(device));
+}
+
+static void rdna4_argument_live_ctx_destroy(RDNA4ArgumentLiveContext *ctx) {
+    if (!ctx) return;
+    free(ctx->objects);
+    free(ctx->entries);
+    ctx->objects = NULL;
+    ctx->entries = NULL;
+    if (ctx->dictRetained) {
+        id releaseDict = (__bridge_transfer id)ctx->dictRetained;
+        (void)releaseDict;
+        ctx->dictRetained = NULL;
+    }
+    ctx->loaded = NO;
+    memset(&ctx->table, 0, sizeof(ctx->table));
+}
+
+static void rdna4_argument_live_ctx_collect(const RDNA4ArgumentLiveContext *ctx,
+                                            const rdna4_as_match_set *matches,
+                                            NSMutableSet *found) {
+    if (!ctx || !matches || !found) return;
+    for (size_t wi = 0; wi < matches->bit_words; ++wi) {
+        uint64_t bits = matches->bits[wi];
+        while (bits) {
+            unsigned bit = (unsigned)__builtin_ctzll(bits);
+            size_t idx = (wi << 6) + bit;
+            if (idx < ctx->table.count)
+                [found addObject:(__bridge id)ctx->objects[idx]];
+            bits &= bits - 1u;
+        }
+    }
 }
 
 static rdna4_ae_range rdna4_argument_epoch_range(NSRange range) {
@@ -2351,6 +2499,9 @@ GARNET_INTERNAL void rdna4_argument_sampler_store(id buffer, NSUInteger offset, 
         RDNA4ArgumentSamplerOwners *owners = rdna4_argument_sampler_owners(buffer, NO);
         if (owners) refine = rdna4_argument_sampler_note_host_write_locked(owners, range);
         memcpy(bytes + offset, &value, sizeof value);
+        RDNA4ArgumentIncScanCache *incCache = rdna4_argument_inc_cache_for(buffer, NO);
+        if (incCache && incCache->ready)
+            rdna4_as_inc_cache_mark_dirty(&incCache->cache, (uint64_t)offset, sizeof value);
         if (!owners) owners = rdna4_argument_sampler_owners(buffer, sampler != nil);
         if (!owners) return;
         rdna4_argument_sampler_fill_locked(owners, range);
@@ -2396,56 +2547,36 @@ static NSSet *rdna4_argument_buffer_samplers(id buffer, NSRange range, NSDiction
             if (!bytes || token == [slot[0] unsignedLongLongValue]) [found addObject:slot[1]];
             else [owners.slots removeObjectForKey:key];
         }
-        if (bytes) {
+        if (bytes && live.count) {
             NSUInteger end = range.location + range.length;
             NSUInteger offset = range.location;
             NSUInteger alignment = offset & (sizeof(uint64_t) - 1);
             if (alignment) offset += sizeof(uint64_t) - alignment;
-            for (; offset <= end && sizeof(uint64_t) <= end - offset; offset += sizeof(uint64_t)) {
-                uint64_t token; memcpy(&token, bytes + offset, sizeof token);
-                if ((token >> 48) != 0x5244) continue;
-                id sampler = live[@(token)];
-                if (sampler) [found addObject:sampler];
+            if (offset <= end && sizeof(uint64_t) <= end - offset) {
+                uint64_t words = (uint64_t)((end - offset) / sizeof(uint64_t));
+                RDNA4ArgumentLiveContext liveCtx = {0};
+                if (rdna4_argument_live_ctx_from_dict(&liveCtx, live)) {
+                    rdna4_as_match_set matches;
+                    if (rdna4_as_match_set_init(&matches, liveCtx.table.count)) {
+                        (void)rdna4_as_scan_dense_words(bytes, (uint64_t)[buffer length],
+                                                        (uint64_t)offset, words,
+                                                        &liveCtx.table, &matches);
+                        rdna4_argument_live_ctx_collect(&liveCtx, &matches, found);
+                        rdna4_as_match_set_destroy(&matches);
+                    }
+                    rdna4_argument_live_ctx_destroy(&liveCtx);
+                } else {
+                    for (; offset <= end && sizeof(uint64_t) <= end - offset; offset += sizeof(uint64_t)) {
+                        uint64_t token; memcpy(&token, bytes + offset, sizeof token);
+                        if ((token >> 48) != 0x5244) continue;
+                        id sampler = live[@(token)];
+                        if (sampler) [found addObject:sampler];
+                    }
+                }
             }
         }
     }
     return found;
-}
-
-typedef struct {
-    __unsafe_unretained RDNA4Buffer *buffer;
-    __unsafe_unretained NSDictionary<NSNumber *, id> *live;
-    RDNA4ArgumentSamplerOwners *owners;
-    NSMutableSet *found;
-    BOOL readBytes;
-} RDNA4ArgumentScopeTokenScan;
-
-static bool rdna4_argument_scope_visit_token(void *context,
-        const rdna4_as_work *work, uint64_t offset, uint64_t width) {
-    RDNA4ArgumentScopeTokenScan *scan = context;
-    if (!scan || !work || width != RDNA4_AS_TOKEN_BYTES ||
-        !scan->readBytes)
-        return false;
-    RDNA4Buffer *buffer = scan->buffer;
-    if (offset > [buffer length] || width > [buffer length] - offset)
-        return false;
-    uint64_t token = 0;
-    const uint8_t *bytes = (const uint8_t *)[(id<MTLBuffer>)buffer contents];
-    if (!bytes) return false;
-    memcpy(&token, bytes + offset, sizeof token);
-
-    NSNumber *key = @(offset);
-    NSArray *slot = scan->owners.slots[key];
-    if (slot.count == 2) {
-        uint64_t known = [slot[0] unsignedLongLongValue];
-        if (token == known) [scan->found addObject:slot[1]];
-        else [scan->owners.slots removeObjectForKey:key];
-    }
-    if ((token >> 48) == 0x5244) {
-        id sampler = scan->live[@(token)];
-        if (sampler) [scan->found addObject:sampler];
-    }
-    return true;
 }
 
 static BOOL rdna4_argument_scope_intersects(NSRange left, NSRange right) {
@@ -2505,13 +2636,14 @@ static BOOL rdna4_argument_scope_contains_token(const rdna4_as_work *work,
 
 static BOOL rdna4_argument_sampler_scope_work(
         id device, RDNA4Buffer *buffer, const rdna4_as_work *work,
-        NSDictionary *__strong *live, NSMutableSet *samplers,
+        RDNA4ArgumentLiveContext *liveCtx, NSMutableSet *samplers,
         NSMutableArray<NSDictionary *> *writes, NSString **why) {
     if (!buffer) return YES;
     uint64_t extent = 0;
+    const NSUInteger bufferLength = [buffer length];
     if (rdna4_as_work_extent(work, &extent) != RDNA4_AS_OK ||
-        work->offset > [buffer length] ||
-        extent > [buffer length] - work->offset) {
+        work->offset > bufferLength ||
+        extent > bufferLength - work->offset) {
         if (why) *why = @"argument sampler scope work exceeds its buffer";
         return NO;
     }
@@ -2550,19 +2682,61 @@ static BOOL rdna4_argument_sampler_scope_work(
                 [found unionSet:write->candidates];
 
         if (work->mode == RDNA4_AS_SCAN_CPU_MAPPED) {
-            if (!*live) *live = rdna4_argument_live_samplers(device);
-            RDNA4ArgumentScopeTokenScan tokenScan = {
-                .buffer = buffer,
-                .live = *live,
-                .owners = owners,
-                .found = found,
-                .readBytes = YES,
-            };
-            if (![buffer contents] ||
-                rdna4_as_visit_tokens(work, rdna4_argument_scope_visit_token,
-                                      &tokenScan) != RDNA4_AS_OK) {
+            const uint8_t *bytes = (const uint8_t *)[(id<MTLBuffer>)buffer contents];
+            if (!bytes || work->width != RDNA4_AS_TOKEN_BYTES) {
                 if (why) *why = @"argument sampler scope cannot scan mapped token work";
                 return NO;
+            }
+            // Verify recorded exact sampler slots in O(slots.count) rather than O(words).
+            if (owners && owners.slots.count) {
+                for (NSNumber *key in owners.slots.allKeys) {
+                    uint64_t slotOffset = key.unsignedLongLongValue;
+                    if (!rdna4_argument_scope_contains_token(work, slotOffset)) continue;
+                    if (slotOffset > bufferLength ||
+                        RDNA4_AS_TOKEN_BYTES > bufferLength - slotOffset) continue;
+                    NSArray *slot = owners.slots[key];
+                    if (slot.count != 2) continue;
+                    uint64_t token = 0;
+                    memcpy(&token, bytes + slotOffset, sizeof token);
+                    if (token == [slot[0] unsignedLongLongValue]) [found addObject:slot[1]];
+                    else [owners.slots removeObjectForKey:key];
+                }
+            }
+            if (!rdna4_argument_live_ctx_ensure(liveCtx, device)) {
+                if (why) *why = @"argument sampler scope failed to build live sampler table";
+                return NO;
+            }
+            if (liveCtx->table.count > 0) {
+                rdna4_as_match_set matches;
+                if (!rdna4_as_match_set_init(&matches, liveCtx->table.count)) {
+                    if (why) *why = @"argument sampler scope match allocation failed";
+                    return NO;
+                }
+                const BOOL immutable = [buffer rdna4HostReadOnly];
+                rdna4_as_status scanStatus;
+                if (immutable && bufferLength >= RDNA4_AS_INC_CHUNK_BYTES) {
+                    RDNA4ArgumentIncScanCache *box = rdna4_argument_inc_cache_for(buffer, YES);
+                    if (box && box->ready && box->cache.buffer_length == bufferLength) {
+                        scanStatus = rdna4_as_inc_cache_scan_work(
+                            &box->cache, bytes, (uint64_t)bufferLength, work,
+                            &liveCtx->table, false, &matches);
+                    } else {
+                        scanStatus = rdna4_as_scan_strided_words(
+                            bytes, (uint64_t)bufferLength, work, &liveCtx->table, &matches);
+                    }
+                } else {
+                    // Coherent Shared/Managed buffers may receive direct -contents writes
+                    // without -didModifyRange:. Always verify all covered words in pure C.
+                    scanStatus = rdna4_as_scan_strided_words(
+                        bytes, (uint64_t)bufferLength, work, &liveCtx->table, &matches);
+                }
+                if (scanStatus == RDNA4_AS_OK)
+                    rdna4_argument_live_ctx_collect(liveCtx, &matches, found);
+                rdna4_as_match_set_destroy(&matches);
+                if (scanStatus != RDNA4_AS_OK) {
+                    if (why) *why = @"argument sampler scope cannot scan mapped token work";
+                    return NO;
+                }
             }
         } else if (work->mode != RDNA4_AS_SCAN_GPU_SUMMARY &&
                    work->mode != RDNA4_AS_SCAN_OPAQUE_CONSERVATIVE) {
@@ -2604,12 +2778,13 @@ GARNET_INTERNAL BOOL rdna4_argument_sampler_scope(
         if (why) *why = @"argument sampler scope has no scan plan";
         return NO;
     }
-    NSDictionary *live = nil;
+    RDNA4ArgumentLiveContext liveCtx = {0};
     BOOL needsDeclaredTransports = NO;
     NSMutableSet *fullyScanned = [NSMutableSet set];
     for (size_t stageIndex = 0; stageIndex < scan->count; ++stageIndex) {
         const RDNA4ArgumentScanStage *stage = &scan->stages[stageIndex];
         if (!stage->state || (stage->count && !stage->works)) {
+            rdna4_argument_live_ctx_destroy(&liveCtx);
             if (why) *why = @"argument sampler scope has malformed stage work";
             return NO;
         }
@@ -2624,12 +2799,16 @@ GARNET_INTERNAL BOOL rdna4_argument_sampler_scope(
         for (size_t workIndex = 0; workIndex < stage->count; ++workIndex) {
             const rdna4_as_work *work = &stage->works[workIndex];
             if (work->root >= RDNA4_AS_ROOTS || work->width != RDNA4_AS_TOKEN_BYTES) {
+                rdna4_argument_live_ctx_destroy(&liveCtx);
                 if (why) *why = @"argument sampler scope has malformed token work";
                 return NO;
             }
             RDNA4Buffer *buffer = stage->state->buf[work->root].b;
-            if (!rdna4_argument_sampler_scope_work(device, buffer, work, &live,
-                                                    samplers, writes, why)) return NO;
+            if (!rdna4_argument_sampler_scope_work(device, buffer, work, &liveCtx,
+                                                    samplers, writes, why)) {
+                rdna4_argument_live_ctx_destroy(&liveCtx);
+                return NO;
+            }
             if (buffer && !work->offset && work->stride == RDNA4_AS_TOKEN_BYTES &&
                 work->count == buffer.length / RDNA4_AS_TOKEN_BYTES &&
                 !!(work->flags & RDNA4_AS_WRITABLE) ==
@@ -2662,9 +2841,13 @@ GARNET_INTERNAL BOOL rdna4_argument_sampler_scope(
         RDNA4LOGR("argscan declared transport: %llu bytes, %llu words, mode %u",
             (unsigned long long)buffer.length, (unsigned long long)work.count,
             (unsigned)work.mode);
-        if (!rdna4_argument_sampler_scope_work(device, buffer, &work, &live,
-                                                samplers, writes, why)) return NO;
+        if (!rdna4_argument_sampler_scope_work(device, buffer, &work, &liveCtx,
+                                                samplers, writes, why)) {
+            rdna4_argument_live_ctx_destroy(&liveCtx);
+            return NO;
+        }
     }
+    rdna4_argument_live_ctx_destroy(&liveCtx);
     if (writes.count) {
         NSSet *allCandidates = [samplers copy];
         for (NSUInteger i = 0; i < writes.count; ++i) {
@@ -2794,18 +2977,27 @@ static void rdna4_argument_sampler_add_possible_locked(RDNA4ArgumentSamplerOwner
 
 static void rdna4_argument_sampler_scan_locked(RDNA4ArgumentSamplerOwners *owners,
         NSRange range, const uint8_t *bytes, NSDictionary *live) {
-    if (!bytes || !range.length) return;
+    if (!bytes || !range.length || !live.count) return;
     NSUInteger end = range.location + range.length;
     NSUInteger offset = range.location;
     NSUInteger alignment = offset & (sizeof(uint64_t) - 1);
     if (alignment) offset += sizeof(uint64_t) - alignment;
+    RDNA4ArgumentLiveContext liveCtx = {0};
+    BOOL hasTable = rdna4_argument_live_ctx_from_dict(&liveCtx, live);
     for (; offset <= end && sizeof(uint64_t) <= end - offset; offset += sizeof(uint64_t)) {
         uint64_t token;
         memcpy(&token, bytes + offset, sizeof token);
-        if ((token >> 48) != 0x5244) continue;
-        id sampler = live[@(token)];
-        if (sampler) owners.slots[@(offset)] = @[@(token), sampler];
+        if (hasTable) {
+            uint32_t idx = 0;
+            if (rdna4_as_live_table_find(&liveCtx.table, token, &idx))
+                owners.slots[@(offset)] = @[@(token), (__bridge id)liveCtx.objects[idx]];
+        } else {
+            if ((token >> 48) != 0x5244) continue;
+            id sampler = live[@(token)];
+            if (sampler) owners.slots[@(offset)] = @[@(token), sampler];
+        }
     }
+    if (hasTable) rdna4_argument_live_ctx_destroy(&liveCtx);
 }
 
 static void rdna4_argument_sampler_refine_locked(id buffer, RDNA4ArgumentSamplerOwners *owners,
@@ -2866,6 +3058,10 @@ static void rdna4_argument_sampler_refine_locked(id buffer, RDNA4ArgumentSampler
             rdna4_argument_sampler_subtract_ranges(exclusiveRanges, value.rangeValue);
 
         if (bytes) {
+            RDNA4ArgumentIncScanCache *incCache = rdna4_argument_inc_cache_for(buffer, NO);
+            if (incCache && incCache->ready)
+                rdna4_as_inc_cache_mark_dirty(&incCache->cache, (uint64_t)span.location,
+                                              (uint64_t)span.length);
             for (NSValue *value in exclusiveRanges) {
                 NSRange exact = value.rangeValue;
                 rdna4_argument_sampler_fill_locked(owners, exact);

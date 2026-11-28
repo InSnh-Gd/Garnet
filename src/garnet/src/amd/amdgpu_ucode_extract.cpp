@@ -24,7 +24,7 @@
 //      pure header-parsing/table-building module with no PSP_LOG/etc.
 //      call sites), so there was nothing to port to UCODE_LOG here.
 //    - `#include <string.h>` for `memset` only — within this kernel's
-//      guaranteed subset (memcpy/memset/strlen/strncmp per PORTING.md).
+//      guaranteed subset (standard libkern subset).
 //    - Function names/signatures, every upstream Linux file:line citation
 //      in the comments, and all per-IP extraction logic are otherwise
 //      unchanged from the reference — do not "simplify" a step without

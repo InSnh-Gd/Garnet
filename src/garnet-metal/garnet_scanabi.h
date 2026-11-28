@@ -1,6 +1,6 @@
-/* garnet_scanabi.h: the scanout structs and flags the bundle needs, copied VERBATIM from
- * ~/rdna4-native/mesa-mac/include/darwin/rdna4_native_abi.h (kext ABI 1.1, selectors 9..14) so the bundle build needs no Mesa include path.
- * src/garnet-metal/build.sh does not check this; the S5.2a section of an internal design note records the line-by-line diff check. */
+/* garnet_scanabi.h: scanout structs and flags mirrored verbatim from
+ * src/garnet/src/GarnetNativeABI.h (kext ABI 1.1+, selectors 9..14 and 22..26)
+ * so the Metal bundle build needs no Mesa or kernel include path. */
 #ifndef RDNA4_SCANABI_H
 #define RDNA4_SCANABI_H
 #include <stdint.h>

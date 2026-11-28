@@ -659,7 +659,7 @@ kern_return_t sdma_program_external_queue(const DeviceContext &dev,
 // 0.0.185 — the same programming with the two write-back addresses supplied by
 // the caller instead of carved from our own WB page.
 //
-// The SDMA takeover ( / notes/re/sdma-takeover-design.md) has to hand the
+// The SDMA takeover  has to hand the
 // engine APPLE'S addresses: its wptr write-back (ring->0xd0, the value slot 36
 // received at IN+0x18) goes in RB_WPTR_POLL_ADDR, and its rptr report
 // (ring->0xb8) in RB_RPTR_ADDR. had those two swapped; the GFX ring is the

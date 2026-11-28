@@ -22,6 +22,82 @@ struct GarnetCoreTestsRunner {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    private static func runSystemTar(_ args: [String]) -> CommandResult {
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/tar") {
+            return ProcessCommandRunner().run("/usr/bin/tar", args)
+        }
+        return ProcessCommandRunner().run("/usr/bin/env", ["tar"] + args)
+    }
+
+    private static func makeSyntheticPE32PlusEFI(subsystem: UInt16 = 10, machine: UInt16 = 0x8664) -> Data {
+        var d = Data(count: 0x200)
+        // DOS MZ header + e_lfanew = 0x80
+        d[0] = 0x4D; d[1] = 0x5A
+        d[0x3C] = 0x80
+        // PE\0\0
+        let pe = 0x80
+        d[pe] = 0x50; d[pe + 1] = 0x45; d[pe + 2] = 0x00; d[pe + 3] = 0x00
+        // COFF Machine
+        d[pe + 4] = UInt8(machine & 0xFF)
+        d[pe + 5] = UInt8((machine >> 8) & 0xFF)
+        // Optional header magic = PE32+ (0x020B) at pe + 24
+        let opt = pe + 24
+        d[opt] = 0x0B; d[opt + 1] = 0x02
+        // Subsystem at opt + 68 (10 = EFI application)
+        d[opt + 68] = UInt8(subsystem & 0xFF)
+        d[opt + 69] = UInt8((subsystem >> 8) & 0xFF)
+        return d
+    }
+
+    private static func hexToData(_ hex: String) -> Data {
+        var b = Data()
+        var idx = hex.startIndex
+        while hex.distance(from: idx, to: hex.endIndex) >= 2 {
+            let nxt = hex.index(idx, offsetBy: 2)
+            b.append(UInt8(hex[idx..<nxt], radix: 16) ?? 0)
+            idx = nxt
+        }
+        return b
+    }
+
+    private static func writeDummyAnchorInjector(
+        at dir: URL,
+        skidHex: String = "0102030405060708090a0b0c0d0e0f1011121314",
+        anchorID: String = "org.garnet.code-signing"
+    ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: dir.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+        let spkiB64 = Data(repeating: 0x30, count: 96).base64EncodedString()
+        let skidB64 = hexToData(skidHex).base64EncodedString()
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>CFBundleIdentifier</key><string>org.garnet.anchor-injector</string>
+        <key>CFBundleVersion</key><string>1.0.0</string>
+        <key>OSBundleRequired</key><string>Root</string>
+        <key>OSBundleLibraries</key><dict><key>org.b00t0x.AMFIAnchor</key><string>0.1.0</string></dict>
+        <key>IOKitPersonalities</key><dict>
+            <key>org.garnet.anchor-injector</key><dict>
+                <key>CFBundleIdentifier</key><string>org.b00t0x.AMFIAnchor</string>
+                <key>IOClass</key><string>AMFIAnchorProvider</string>
+                <key>IOProviderClass</key><string>IOResources</string>
+                <key>AMFIAnchorConfig</key><dict>
+                    <key>SchemaVersion</key><integer>1</integer>
+                    <key>Anchors</key><dict>
+                        <key>\(anchorID)</key><dict>
+                            <key>SPKI</key><data>\(spkiB64)</data>
+                            <key>SKID</key><data>\(skidB64)</data>
+                        </dict>
+                    </dict>
+                </dict>
+            </dict>
+        </dict>
+        </dict></plist>
+        """
+        try plist.write(to: dir.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+    }
+
     // MARK: - Little-Endian Binary Builders for Synthetic Mach-O / KC Tests
 
     private static func appendLE32(_ d: inout Data, _ v: UInt32) {
@@ -342,7 +418,7 @@ struct GarnetCoreTestsRunner {
         let sysKCURL = kcDir.appendingPathComponent("SystemKernelExtensions.kc")
         try sysKCData.write(to: sysKCURL)
 
-        // Compute layout fingerprint and assemble full synthetic Release 1 payload
+        // Compute layout fingerprint and assemble full synthetic release payload
         let tempFP = LayoutFingerprint(
             schema: "garnet-layout-fingerprint-v1",
             arch: "x86_64",
@@ -373,7 +449,13 @@ struct GarnetCoreTestsRunner {
         )
     }
 
-    private static func makeCompleteReleasePayload(at payload: URL, fingerprint: LayoutFingerprint) throws {
+    private static func makeCompleteReleasePayload(
+        at payload: URL,
+        fingerprint: LayoutFingerprint,
+        includeRecoverEFI: Bool = true,
+        trustAnchorSKID: String? = nil,
+        includeAMFIAnchor: Bool = false
+    ) throws {
         let fm = FileManager.default
         try? fm.removeItem(at: payload)
         try fm.createDirectory(at: payload, withIntermediateDirectories: true)
@@ -431,7 +513,7 @@ struct GarnetCoreTestsRunner {
         try Data("metal-bin".utf8).write(to: tmpBundleRoot.appendingPathComponent("GarnetMetal.bundle/Contents/MacOS/GarnetMetal"))
         try Data("radv-bin".utf8).write(to: tmpBundleRoot.appendingPathComponent("GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib"))
         try Data("xlate-bin".utf8).write(to: tmpBundleRoot.appendingPathComponent("GarnetMetal.bundle/Contents/Resources/libgarnetxlate.dylib"))
-        let tarRes = ProcessCommandRunner().run("/usr/bin/tar", [
+        let tarRes = runSystemTar([
             "-cf", payload.appendingPathComponent("GarnetMetal.bundle.tar").path,
             "-C", tmpBundleRoot.path, "GarnetMetal.bundle"
         ])
@@ -440,6 +522,16 @@ struct GarnetCoreTestsRunner {
         }
         try fm.removeItem(at: tmpBundleRoot)
 
+        if includeRecoverEFI {
+            try makeSyntheticPE32PlusEFI().write(to: payload.appendingPathComponent("optional/GarnetRecover.efi"))
+        }
+        if let skid = trustAnchorSKID {
+            try writeDummyAnchorInjector(at: payload.appendingPathComponent("optional/GarnetAnchorInjector.kext"), skidHex: skid)
+            if includeAMFIAnchor {
+                try writeDummyBundle(at: payload.appendingPathComponent("optional/AMFIAnchor.kext"), bid: "org.b00t0x.AMFIAnchor", exec: "AMFIAnchor", ver: "0.1.0")
+            }
+        }
+
         try fm.createDirectory(at: payload.appendingPathComponent("optional/vulkan"), withIntermediateDirectories: true)
         try Data("{\"file_format_version\":\"1.0.0\"}\n".utf8).write(to: payload.appendingPathComponent("optional/vulkan/radeon_icd.x86_64.json"))
         try Data("#!/bin/bash\nexit 0\n".utf8).write(to: payload.appendingPathComponent("optional/vulkan/radv-app.sh"))
@@ -447,11 +539,26 @@ struct GarnetCoreTestsRunner {
         try Data("# default denylist\nproc:DefaultBlockedApp\n".utf8).write(to: payload.appendingPathComponent("default-app-denylist.txt"))
 
         for rel in [
-            "activate-native.sh", "deploy-common.sh", "garnettest", "native-translate",
+            "activate-native.sh", "recover-uninstall.sh", "deploy-common.sh", "garnettest", "native-translate",
             "native-bundle-check", "publish-metal", "mtlprobe-direct",
-            "com.garnet.native.plist", "com.garnet.native-translate.plist"
+            "com.garnet.native.plist", "com.garnet.native-translate.plist", "com.garnet.recovery.plist"
         ] {
             try Data("fixture-\(rel)\n".utf8).write(to: payload.appendingPathComponent(rel))
+        }
+
+        let trustLines: String
+        if let skid = trustAnchorSKID {
+            trustLines = """
+            TRUST_ANCHOR_ENABLED=1
+            TRUST_ANCHOR_ID=org.garnet.code-signing
+            TRUST_ANCHOR_SKID=\(skid)
+            AMFIANCHOR_BUNDLED=\(includeAMFIAnchor ? "1" : "0")
+            """
+        } else {
+            trustLines = """
+            TRUST_ANCHOR_ENABLED=0
+            AMFIANCHOR_BUNDLED=0
+            """
         }
 
         let manifestText = """
@@ -468,6 +575,7 @@ struct GarnetCoreTestsRunner {
         ACCEL_VERSION=0.1.1
         PCIBARCOMPAT_BUNDLE_ID=org.garnet.pcibarcompat
         PCIBARCOMPAT_VERSION=1.0.0
+        \(trustLines)
         #
         # Payload files
 
@@ -519,6 +627,7 @@ struct GarnetCoreTestsRunner {
         var garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 51\n\"SMU,MetricsLayoutVerified\" = Yes"
         var garnetTestMetricsStdout = "clocks  gfx 3200 MHz  soc 1200 MHz  mem 1250 MHz  fclk 1800 MHz\n"
         var pciCompatIoreg = "\"GarnetPCIBarCompat,MatchMode\" = \"exact-uuid\"\n\"GarnetPCIBarCompat,IOPCIFamilyUUID\" = \"227771C6-ADC2-30C7-8408-263F723CF81C\""
+        var amfiAnchorIoreg = ""
         var kmutilLoaded = "org.garnet.driver\norg.garnet.accel\norg.garnet.pcibarcompat"
         var foreignAuxKexts: [(bundleID: String, bundlePath: String)] = []
         var failKmutilCreate = false
@@ -527,7 +636,10 @@ struct GarnetCoreTestsRunner {
 
         func run(_ executable: String, arguments: [String], environment: [String: String]?) -> CommandResult {
             calls.append((executable, arguments))
-            if executable == "/usr/bin/tar" || executable == "/usr/sbin/chown" {
+            if executable == "/usr/bin/tar" {
+                return runSystemTar(arguments)
+            }
+            if executable == "/usr/sbin/chown" {
                 return ProcessCommandRunner().run(executable, arguments: arguments, environment: environment)
             }
             if executable == "/usr/bin/sw_vers" {
@@ -560,6 +672,7 @@ struct GarnetCoreTestsRunner {
                 if arguments.contains("GarnetMetalNub") { return CommandResult(exitCode: 0, stdout: "+-o GarnetMetalNub <class GarnetMetalNub>\n", stderr: "") }
                 if arguments.contains("GarnetAccelerator") { return CommandResult(exitCode: 0, stdout: "+-o GarnetAccelerator <class GarnetAccelerator>\n", stderr: "") }
                 if arguments.contains("AMDGarnetPrimaryFramebuffer") { return CommandResult(exitCode: 0, stdout: "+-o AMDGarnetPrimaryFramebuffer\n", stderr: "") }
+                if arguments.contains("AMFIAnchor") { return CommandResult(exitCode: 0, stdout: amfiAnchorIoreg, stderr: "") }
             }
             if executable == "/bin/launchctl" {
                 return CommandResult(exitCode: 0, stdout: "system/com.garnet.native = {\n\tstate = running\n}\n", stderr: "")
@@ -634,6 +747,8 @@ struct GarnetCoreTestsRunner {
             ("VirtualSMC.kext", true),
             ("GarnetPCIBarCompat.kext", true)
         ],
+        codelessKexts: Set<String> = ["GarnetAnchorInjector.kext"],
+        tools: [[String: Any]] = [],
         resizeApple: Int = -1,
         resizeUefi: Int = -1,
         increasePciBar: Bool = false,
@@ -645,23 +760,21 @@ struct GarnetCoreTestsRunner {
         let kEntries: [[String: Any]] = exts.map { item in
             let base = (item.path as NSString).lastPathComponent
             let stem = (base as NSString).deletingPathExtension
+            let execPath = codelessKexts.contains(base) ? "" : "Contents/MacOS/\(stem)"
             return [
                 "BundlePath": item.path,
                 "Enabled": item.enabled,
-                "ExecutablePath": "Contents/MacOS/\(stem)",
+                "ExecutablePath": execPath,
                 "PlistPath": "Contents/Info.plist"
             ]
         }
         var nvramAddDict: [String: Any] = ["boot-args": bootArgs]
         if let ch = csrHex {
-            var b = Data()
-            var idx = ch.startIndex
-            while ch.distance(from: idx, to: ch.endIndex) >= 2 {
-                let nxt = ch.index(idx, offsetBy: 2)
-                b.append(UInt8(ch[idx..<nxt], radix: 16) ?? 0)
-                idx = nxt
-            }
-            nvramAddDict["csr-active-config"] = b
+            nvramAddDict["csr-active-config"] = hexToData(ch)
+        }
+        var miscDict: [String: Any] = ["Security": ["SecureBootModel": secureBoot]]
+        if !tools.isEmpty {
+            miscDict["Tools"] = tools
         }
         return [
             "Kernel": [
@@ -670,7 +783,7 @@ struct GarnetCoreTestsRunner {
             ],
             "Booter": ["Quirks": ["ResizeAppleGpuBars": resizeApple]],
             "UEFI": ["Quirks": ["ResizeGpuBars": resizeUefi]],
-            "Misc": ["Security": ["SecureBootModel": secureBoot]],
+            "Misc": miscDict,
             "NVRAM": [
                 "Add": [OpenCoreValidator.nvramBootGUID: nvramAddDict],
                 "Delete": [OpenCoreValidator.nvramBootGUID: deleteKeys]
@@ -766,8 +879,17 @@ struct GarnetCoreTestsRunner {
             "vendor-id" = <02100000>
             "device-id" = <90750000>
             "class-code" = <00000300>
-            "model" = "AMD Radeon RX 9060 XT"
+            "model" = <"AMD Radeon RX 9060 XT">
         """
+        check("SystemEnv decodes quoted OSData model", env.readPCIGPUs().first?.model == "AMD Radeon RX 9060 XT")
+        mock.pciGPUsIoreg = """
+        +-o PEG0@1  <class IOPCIDevice>
+            "vendor-id" = <02100000>
+            "device-id" = <90750000>
+            "class-code" = <00000300>
+            "model" = <414d4420 52616465 6f6e2052 58203930 36302058 5400>
+        """
+        check("SystemEnv decodes hex OSData model", env.readPCIGPUs().first?.model == "AMD Radeon RX 9060 XT")
 
         // Blocked: macOS 15.x, arm64, VM
         mock.productVersion = "15.7.1"
@@ -788,14 +910,101 @@ struct GarnetCoreTestsRunner {
         check("Preflight recommends 256M fallback on PFM64Insufficient", smallRec.barRecommendation == .small256M)
         mock.pciCompatIoreg = "\"GarnetPCIBarCompat,MatchMode\" = \"exact-uuid\""
 
-        // PayloadVerifier tests (valid, tamper, extra file, symlink, missing license, navi48 manifest)
+        // PayloadVerifier tests (valid, tamper, extra file, symlink, missing license, navi48 manifest, EFI & trust anchor)
         let pv = try PayloadVerifier.verify(payloadURL: fix.payloadDir, runner: mock, verifyCodeSignatures: false)
-        check("PayloadVerifier passes valid release payload", pv.targetSilicon == "navi44" && pv.targetPCIIDs == "1002:7590")
+        check("PayloadVerifier passes valid release payload with GarnetRecover.efi",
+              pv.targetSilicon == "navi44" && pv.targetPCIIDs == "1002:7590" && pv.recoverEFIPresent && !pv.trustAnchorEnabled)
+
+        // Corrupt GarnetRecover.efi subsystem -> rejected
+        let badEFIDir = tempRoot.appendingPathComponent("pv-badefi")
+        try FileManager.default.copyItem(at: fix.payloadDir, to: badEFIDir)
+        try makeSyntheticPE32PlusEFI(subsystem: 3).write(to: badEFIDir.appendingPathComponent("optional/GarnetRecover.efi"))
+        try regenerateSHA256SUMS(at: badEFIDir)
+        var threw = false
+        do { _ = try PayloadVerifier.verify(payloadURL: badEFIDir, runner: mock, verifyCodeSignatures: false) } catch { threw = true }
+        check("PayloadVerifier rejects non-EFI subsystem GarnetRecover.efi", threw)
+
+        // Trust-anchor payload (TRUST_ANCHOR_ENABLED=1 + AMFIANCHOR_BUNDLED=1)
+        let fpLoaded = try JSONDecoder().decode(LayoutFingerprint.self, from: Data(contentsOf: fix.payloadDir.appendingPathComponent("layout-fingerprint.json")))
+        let anchorSKID = "0102030405060708090a0b0c0d0e0f1011121314"
+        let anchorPayload = tempRoot.appendingPathComponent("pv-anchor")
+        try makeCompleteReleasePayload(at: anchorPayload, fingerprint: fpLoaded, includeRecoverEFI: true, trustAnchorSKID: anchorSKID, includeAMFIAnchor: true)
+        let pvAnchor = try PayloadVerifier.verify(payloadURL: anchorPayload, runner: mock, verifyCodeSignatures: false)
+        check("PayloadVerifier validates TRUST_ANCHOR_ENABLED=1 payload",
+              pvAnchor.trustAnchorEnabled && pvAnchor.trustAnchorID == "org.garnet.code-signing"
+              && pvAnchor.trustAnchorSKID == anchorSKID && pvAnchor.amfiAnchorBundled && pvAnchor.recoverEFIPresent)
+
+        // Trust-anchor SKID mismatch -> rejected
+        let badSkidDir = tempRoot.appendingPathComponent("pv-badskid")
+        try FileManager.default.copyItem(at: anchorPayload, to: badSkidDir)
+        let badSkidM = try String(contentsOf: badSkidDir.appendingPathComponent("MANIFEST.txt"), encoding: .utf8)
+            .replacingOccurrences(of: anchorSKID, with: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        try badSkidM.write(to: badSkidDir.appendingPathComponent("MANIFEST.txt"), atomically: true, encoding: .utf8)
+        try regenerateSHA256SUMS(at: badSkidDir)
+        threw = false
+        do { _ = try PayloadVerifier.verify(payloadURL: badSkidDir, runner: mock, verifyCodeSignatures: false) } catch { threw = true }
+        check("PayloadVerifier rejects TRUST_ANCHOR_SKID mismatch", threw)
+
+        // Stray GarnetAnchorInjector.kext when TRUST_ANCHOR_ENABLED=0 -> rejected
+        let strayInjDir = tempRoot.appendingPathComponent("pv-strayinj")
+        try FileManager.default.copyItem(at: fix.payloadDir, to: strayInjDir)
+        try writeDummyAnchorInjector(at: strayInjDir.appendingPathComponent("optional/GarnetAnchorInjector.kext"))
+        try regenerateSHA256SUMS(at: strayInjDir)
+        threw = false
+        do { _ = try PayloadVerifier.verify(payloadURL: strayInjDir, runner: mock, verifyCodeSignatures: false) } catch { threw = true }
+        check("PayloadVerifier rejects stray GarnetAnchorInjector when TRUST_ANCHOR_ENABLED=0", threw)
+
+        // Private key marker inside GarnetAnchorInjector.kext -> rejected
+        let privInjDir = tempRoot.appendingPathComponent("pv-privkey")
+        try FileManager.default.copyItem(at: anchorPayload, to: privInjDir)
+        let injPlistURL = privInjDir.appendingPathComponent("optional/GarnetAnchorInjector.kext/Contents/Info.plist")
+        let privPlist = try String(contentsOf: injPlistURL, encoding: .utf8) + "\n<!-- BEGIN PRIVATE KEY -->\n"
+        try privPlist.write(to: injPlistURL, atomically: true, encoding: .utf8)
+        try regenerateSHA256SUMS(at: privInjDir)
+        threw = false
+        do { _ = try PayloadVerifier.verify(payloadURL: privInjDir, runner: mock, verifyCodeSignatures: false) } catch { threw = true }
+        check("PayloadVerifier rejects PRIVATE KEY material in GarnetAnchorInjector", threw)
+
+        // PreflightChecker live AMFIAnchor ioreg detection (both array and dict shapes, without amfi=0x80)
+        mock.optionsIoreg = "\"csr-active-config\" = <03080000>\n\"boot-args\" = \"garnet=1\""
+        mock.amfiAnchorIoreg = """
+        +-o AMFIAnchor  <class AMFIAnchor>
+          {
+            "InstallStatus" = 1
+            "AnchorReady" = Yes
+            "LoadedAnchors" = ({"ID"="org.garnet.code-signing"})
+          }
+        """
+        let amfiArrRep = PreflightChecker.run(env: env, payloadURL: anchorPayload)
+        let amfiArrCheck = amfiArrRep.checks.first(where: { $0.name == "AMFI / Trust Anchor" })
+        check("Preflight detects live AMFIAnchor (array shape) without amfi=0x80",
+              amfiArrRep.amfi.garnetAnchorLoaded && !amfiArrRep.amfi.amfiDisabledByBootArg && (amfiArrCheck?.passed == true))
+
+        mock.amfiAnchorIoreg = """
+        +-o AMFIAnchor  <class AMFIAnchor>
+          {
+            "InstallStatus" = 1
+            "AnchorReady" = Yes
+            "LoadedAnchors" = {
+              "org.garnet.code-signing" = {
+                "SKID" = <01020304>
+              }
+            }
+          }
+        """
+        let amfiDictRep = PreflightChecker.run(env: env, payloadURL: anchorPayload)
+        check("Preflight detects live AMFIAnchor (dict shape)", amfiDictRep.amfi.garnetAnchorLoaded && amfiDictRep.amfi.installStatus == 1)
+
+        mock.amfiAnchorIoreg = ""
+        let amfiMissingRep = PreflightChecker.run(env: env, payloadURL: anchorPayload)
+        let amfiMissingCheck = amfiMissingRep.checks.first(where: { $0.name == "AMFI / Trust Anchor" })
+        check("Preflight warns when neither AMFIAnchor nor amfi=0x80 is active",
+              !amfiMissingRep.amfi.garnetAnchorLoaded && (amfiMissingCheck?.passed == false) && (amfiMissingCheck?.level == "WARN"))
 
         let badHashDir = tempRoot.appendingPathComponent("pv-tamper")
         try FileManager.default.copyItem(at: fix.payloadDir, to: badHashDir)
         try Data("tampered".utf8).write(to: badHashDir.appendingPathComponent("default-app-denylist.txt"))
-        var threw = false
+        threw = false
         do { _ = try PayloadVerifier.verify(payloadURL: badHashDir, runner: mock, verifyCodeSignatures: false) } catch { threw = true }
         check("PayloadVerifier rejects tampered SHA", threw)
 
@@ -836,11 +1045,11 @@ struct GarnetCoreTestsRunner {
         let ocDir = tempRoot.appendingPathComponent("oc")
         try FileManager.default.createDirectory(at: ocDir, withIntermediateDirectories: true)
 
-        func verifyCase(_ name: String, _ plist: [String: Any], mode: OpenCoreMode, expectValid: Bool, expectWarn: Bool? = nil) throws {
+        func verifyCase(_ name: String, _ plist: [String: Any], mode: OpenCoreMode, amfiMode: OpenCoreAMFIMode = .legacy, expectValid: Bool, expectWarn: Bool? = nil) throws {
             let u = ocDir.appendingPathComponent("\(name).plist")
             try writePlist(plist, to: u)
             let preSHA = try PayloadVerifier.sha256Hex(fileURL: u)
-            let rep = try OpenCoreValidator.validate(configURL: u, mode: mode)
+            let rep = try OpenCoreValidator.validate(configURL: u, mode: mode, amfiMode: amfiMode)
             let postSHA = try PayloadVerifier.sha256Hex(fileURL: u)
             check("OC read-only invariance (\(name))", preSHA == postSHA && rep.readOnlyVerified)
             check("OC valid state (\(name))", rep.valid == expectValid, detail: rep.findings.map { "[\($0.severity.rawValue)] \($0.keyPath): \($0.message)" }.joined(separator: " | "))
@@ -879,6 +1088,77 @@ struct GarnetCoreTestsRunner {
         try verifyCase("bad-npci-with-16g", makeOCPlist(bootArgs: "npci=0x2000 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 amfi=0x80 garnet-full-bar=1"), mode: .full, expectValid: false)
         try verifyCase("bad-resize-apple-16g", makeOCPlist(resizeApple: 0), mode: .full, expectValid: false)
         try verifyCase("bad-increase-pci-bar", makeOCPlist(increasePciBar: true), mode: .full, expectValid: false)
+
+        // AMFIAnchor validation & load-order cases + Misc.Tools GarnetRecover.efi
+        let anchorBootArgs = "-v keepsyms=1 garnet=1 garnet-interrupts=1 garnet-stage=17 garnet-native=1 garnet-metal=1 garnet-metal-disp=1 garnet-metal-ws=1 garnet-multisession=1 garnet-apps=1 garnet-apps-all=1 garnet-full-bar=1"
+        let validAnchorExts: [(String, Bool)] = [
+            ("Lilu.kext", true),
+            ("AMFIAnchor.kext", true),
+            ("GarnetAnchorInjector.kext", true),
+            ("AMFIPass.kext", true),
+            ("GarnetPCIBarCompat.kext", true)
+        ]
+        try verifyCase(
+            "valid-anchor-mode",
+            makeOCPlist(
+                exts: validAnchorExts,
+                tools: [["Path": "GarnetRecover.efi", "Enabled": true, "FullNvramAccess": true, "TextMode": true]],
+                bootArgs: anchorBootArgs
+            ),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: true,
+            expectWarn: false
+        )
+        try verifyCase(
+            "warn-anchor-leftover-amfi0x80",
+            makeOCPlist(exts: validAnchorExts, bootArgs: anchorBootArgs + " amfi=0x80"),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: true,
+            expectWarn: true
+        )
+        try verifyCase(
+            "bad-anchor-missing-lilu",
+            makeOCPlist(exts: [("AMFIAnchor.kext", true), ("GarnetAnchorInjector.kext", true), ("GarnetPCIBarCompat.kext", true)], bootArgs: anchorBootArgs),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: false
+        )
+        try verifyCase(
+            "bad-anchor-amfi-before-lilu",
+            makeOCPlist(exts: [("AMFIAnchor.kext", true), ("Lilu.kext", true), ("GarnetAnchorInjector.kext", true), ("GarnetPCIBarCompat.kext", true)], bootArgs: anchorBootArgs),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: false
+        )
+        try verifyCase(
+            "bad-anchor-injector-before-amfi",
+            makeOCPlist(exts: [("Lilu.kext", true), ("GarnetAnchorInjector.kext", true), ("AMFIAnchor.kext", true), ("GarnetPCIBarCompat.kext", true)], bootArgs: anchorBootArgs),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: false
+        )
+        try verifyCase(
+            "bad-anchor-amfipass-before-injector",
+            makeOCPlist(exts: [("Lilu.kext", true), ("AMFIAnchor.kext", true), ("AMFIPass.kext", true), ("GarnetAnchorInjector.kext", true), ("GarnetPCIBarCompat.kext", true)], bootArgs: anchorBootArgs),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: false
+        )
+        try verifyCase(
+            "bad-anchor-noncodeless-injector",
+            makeOCPlist(exts: validAnchorExts, codelessKexts: [], bootArgs: anchorBootArgs),
+            mode: .full,
+            amfiMode: .anchor,
+            expectValid: false
+        )
+        try verifyCase(
+            "bad-recover-tool-path",
+            makeOCPlist(tools: [["Path": "EFI/OC/Tools/GarnetRecover.efi", "Enabled": true]]),
+            mode: .full,
+            expectValid: false
+        )
     }
 
     static func runOpenCoreConfigureTests(tempRoot: URL) throws {
@@ -889,6 +1169,7 @@ struct GarnetCoreTestsRunner {
         try Data("<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>org.garnet.pcibarcompat</string></dict></plist>".utf8)
             .write(to: payloadDir.appendingPathComponent("optional/GarnetPCIBarCompat.kext/Contents/Info.plist"))
         try Data("dummy-pcibar".utf8).write(to: compatSrc.appendingPathComponent("GarnetPCIBarCompat"))
+        try makeSyntheticPE32PlusEFI().write(to: payloadDir.appendingPathComponent("optional/GarnetRecover.efi"))
 
         // 1. 16G directory auto-configure
         let efi16 = tempRoot.appendingPathComponent("efi16")
@@ -910,12 +1191,23 @@ struct GarnetCoreTestsRunner {
 
         let res16 = try OpenCoreValidator.configure(targetURL: efi16, mode: .full, payloadURL: payloadDir)
         let backupSHA = try PayloadVerifier.sha256Hex(fileURL: URL(fileURLWithPath: res16.backupPath))
-        check("OC configure 16g backup exists with original SHA", fm.fileExists(atPath: res16.backupPath) && backupSHA == origSHA)
-        check("OC configure 16g copied GarnetPCIBarCompat.kext", fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/GarnetPCIBarCompat.kext/Contents/MacOS/GarnetPCIBarCompat").path))
+        let baselineURL = ocDir.appendingPathComponent(OpenCoreValidator.baselineBackupFilename)
+        let baselineSHA = try PayloadVerifier.sha256Hex(fileURL: baselineURL)
+        check("OC configure 16g backup + baseline backup preserve original SHA",
+              fm.fileExists(atPath: res16.backupPath) && backupSHA == origSHA
+              && res16.baselineBackupPath == baselineURL.path && baselineSHA == origSHA)
+        check("OC configure 16g copied GarnetPCIBarCompat.kext and GarnetRecover.efi",
+              fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/GarnetPCIBarCompat.kext/Contents/MacOS/GarnetPCIBarCompat").path)
+              && fm.fileExists(atPath: ocDir.appendingPathComponent("Tools/GarnetRecover.efi").path)
+              && res16.recoverToolInstalledPath != nil)
         check("OC configure 16g valid with 0 warnings", res16.report.valid && res16.report.warnCount == 0)
 
         let configuredData = try Data(contentsOf: cfgURL)
         let configuredRoot = try PropertyListSerialization.propertyList(from: configuredData, options: [], format: nil) as? [String: Any] ?? [:]
+        let miscTools = ((configuredRoot["Misc"] as? [String: Any])?["Tools"] as? [[String: Any]]) ?? []
+        let recEntry = miscTools.first { (($0["Path"] as? String) ?? "") == OpenCoreValidator.recoverToolFilename }
+        check("OC configure registers GarnetRecover.efi in Misc.Tools",
+              (recEntry?["Enabled"] as? Bool) == true && (recEntry?["FullNvramAccess"] as? Bool) == true && (recEntry?["TextMode"] as? Bool) == true)
         let kernelAdd = ((configuredRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
         let compatEntries = kernelAdd.filter { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }
         let garnetEntry = kernelAdd.first { (($0["BundlePath"] as? String) ?? "") == "Garnet.kext" }
@@ -930,13 +1222,15 @@ struct GarnetCoreTestsRunner {
                 && !argsTokens.contains("-radvesa") && !argsTokens.contains("npci=0x2000") && !argsTokens.contains("rdna4-foo=1")
         )
 
-        // 2. Idempotency
+        // 2. Idempotency + baseline backup immutability
         let res16Again = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .full, payloadURL: payloadDir)
         let againRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgURL), options: [], format: nil) as? [String: Any] ?? [:]
         let againAdd = ((againRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
         let againCompatCount = againAdd.filter { (($0["BundlePath"] as? String) ?? "") == "GarnetPCIBarCompat.kext" }.count
         let againArgs = ((((againRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any])?["boot-args"] as? String ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        check("OC configure 16g is idempotent", res16Again.report.valid && againCompatCount == 1 && Set(againArgs).count == againArgs.count)
+        let baselineSHAAfter = try PayloadVerifier.sha256Hex(fileURL: baselineURL)
+        check("OC configure 16g is idempotent and preserves pre-Garnet baseline",
+              res16Again.report.valid && againCompatCount == 1 && Set(againArgs).count == againArgs.count && baselineSHAAfter == origSHA)
 
         // 3. Switch to 256 MiB Small-BAR
         let resSmall = try OpenCoreValidator.configure(targetURL: cfgURL, mode: .modeSmall, payloadURL: nil)
@@ -962,6 +1256,106 @@ struct GarnetCoreTestsRunner {
         do { _ = try OpenCoreValidator.configure(targetURL: symLink, mode: .full, payloadURL: payloadDir) } catch { refusedSym = true }
         let targetPostSHA = try PayloadVerifier.sha256Hex(fileURL: symTarget)
         check("OC configure refuses symlink and leaves target untouched", refusedSym && targetPreSHA == targetPostSHA)
+
+        // 5. Restore from baseline backup + strip-only + preserve Lilu/AMFIAnchor
+        let liluDir = ocDir.appendingPathComponent("Kexts/Lilu.kext/Contents/MacOS")
+        let amfiDir = ocDir.appendingPathComponent("Kexts/AMFIAnchor.kext/Contents/MacOS")
+        try fm.createDirectory(at: liluDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: amfiDir, withIntermediateDirectories: true)
+        try Data("lilu".utf8).write(to: liluDir.appendingPathComponent("Lilu"))
+        try Data("amfi".utf8).write(to: amfiDir.appendingPathComponent("AMFIAnchor"))
+
+        let restRes = try OpenCoreValidator.restore(targetURL: efi16, backupURL: nil, stripOnly: false)
+        let restoredSHA = try PayloadVerifier.sha256Hex(fileURL: cfgURL)
+        check("OC restore restores exact baseline SHA and preserves Lilu/AMFIAnchor",
+              restoredSHA == origSHA && restRes.restoredFromBackupPath == baselineURL.path
+              && !restRes.stripOnly && fm.fileExists(atPath: restRes.preRestoreBackupPath)
+              && !fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/GarnetPCIBarCompat.kext").path)
+              && !fm.fileExists(atPath: ocDir.appendingPathComponent("Tools/GarnetRecover.efi").path)
+              && fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/Lilu.kext").path)
+              && fm.fileExists(atPath: ocDir.appendingPathComponent("Kexts/AMFIAnchor.kext").path))
+
+        // Reconfigure then test --strip-only
+        _ = try OpenCoreValidator.configure(targetURL: efi16, mode: .full, payloadURL: payloadDir)
+        let stripRes = try OpenCoreValidator.restore(targetURL: efi16, backupURL: nil, stripOnly: true)
+        let strippedRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgURL), options: [], format: nil) as? [String: Any] ?? [:]
+        let strippedAdd = ((strippedRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let strippedTools = ((strippedRoot["Misc"] as? [String: Any])?["Tools"] as? [[String: Any]]) ?? []
+        let strippedArgs = ((((strippedRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any])?["boot-args"] as? String ?? "")
+        check("OC restore --strip-only removes Garnet kexts/tool/boot-args while keeping user flags",
+              stripRes.stripOnly
+              && !strippedAdd.contains(where: {
+                  let b = (($0["BundlePath"] as? String) ?? "")
+                  return b == "GarnetPCIBarCompat.kext" || b == "GarnetAnchorInjector.kext"
+              })
+              && !strippedTools.contains(where: { (($0["Path"] as? String) ?? "").contains("GarnetRecover.efi") })
+              && strippedArgs.contains("alcid=11") && !strippedArgs.contains("garnet=1"))
+
+        var refusedRestoreSym = false
+        do { _ = try OpenCoreValidator.restore(targetURL: symLink) } catch { refusedRestoreSym = true }
+        check("OC restore refuses symlink", refusedRestoreSym)
+
+        // 6. AMFIAnchor configure: fail-closed when Lilu.kext missing, then succeed with exact load ordering before AMFIPass
+        try writeDummyAnchorInjector(at: payloadDir.appendingPathComponent("optional/GarnetAnchorInjector.kext"))
+        let amfiPayloadDir = payloadDir.appendingPathComponent("optional/AMFIAnchor.kext/Contents/MacOS")
+        try fm.createDirectory(at: amfiPayloadDir, withIntermediateDirectories: true)
+        try Data("<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>org.b00t0x.AMFIAnchor</string></dict></plist>".utf8)
+            .write(to: payloadDir.appendingPathComponent("optional/AMFIAnchor.kext/Contents/Info.plist"))
+        try Data("amfianchor-bin".utf8).write(to: amfiPayloadDir.appendingPathComponent("AMFIAnchor"))
+
+        let efiAnchor = tempRoot.appendingPathComponent("efi-anchor")
+        let ocAnchorDir = efiAnchor.appendingPathComponent("EFI/OC")
+        try fm.createDirectory(at: ocAnchorDir.appendingPathComponent("Kexts"), withIntermediateDirectories: true)
+        let cfgAnchorURL = ocAnchorDir.appendingPathComponent("config.plist")
+        try writePlist(
+            makeOCPlist(
+                exts: [("AMFIPass.kext", true), ("Lilu.kext", true), ("VirtualSMC.kext", true)],
+                bootArgs: "-v alcid=11 amfi=0x80"
+            ),
+            to: cfgAnchorURL
+        )
+        let preFailSHA = try PayloadVerifier.sha256Hex(fileURL: cfgAnchorURL)
+        var failedNoLilu = false
+        do { _ = try OpenCoreValidator.configure(targetURL: efiAnchor, mode: .full, amfiMode: .anchor, payloadURL: payloadDir) } catch { failedNoLilu = true }
+        let postFailSHA = try PayloadVerifier.sha256Hex(fileURL: cfgAnchorURL)
+        check("OC configure --amfi anchor fails closed when Lilu.kext missing on EFI", failedNoLilu && preFailSHA == postFailSHA)
+
+        // Auto-mode without Lilu.kext falls back to .legacy
+        let autoLegacyRes = try OpenCoreValidator.configure(targetURL: efiAnchor, mode: .full, amfiMode: nil, payloadURL: payloadDir)
+        check("OC configure auto-mode selects legacy when Lilu.kext absent", autoLegacyRes.amfiMode == .legacy && autoLegacyRes.report.valid)
+
+        // Place Lilu.kext in EFI/OC/Kexts/ and configure in anchor mode (auto-detects .anchor)
+        try fm.createDirectory(at: ocAnchorDir.appendingPathComponent("Kexts/Lilu.kext/Contents/MacOS"), withIntermediateDirectories: true)
+        let anchorRes = try OpenCoreValidator.configure(targetURL: efiAnchor, mode: .full, amfiMode: nil, payloadURL: payloadDir)
+        let anchorRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgAnchorURL), options: [], format: nil) as? [String: Any] ?? [:]
+        let anchorAdd = ((anchorRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let names = anchorAdd.map { ($0["BundlePath"] as? String) ?? "" }
+        let idxLilu = names.firstIndex(of: "Lilu.kext") ?? -1
+        let idxAmfi = names.firstIndex(of: "AMFIAnchor.kext") ?? -1
+        let idxInj = names.firstIndex(of: "GarnetAnchorInjector.kext") ?? -1
+        let idxPass = names.firstIndex(of: "AMFIPass.kext") ?? -1
+        let anchorArgs = ((((anchorRoot["NVRAM"] as? [String: Any])?["Add"] as? [String: Any])?[OpenCoreValidator.nvramBootGUID] as? [String: Any])?["boot-args"] as? String ?? "")
+        check("OC configure AMFIAnchor enforces Lilu -> AMFIAnchor -> GarnetAnchorInjector < AMFIPass and drops amfi=0x80",
+              anchorRes.amfiMode == .anchor && anchorRes.report.valid && anchorRes.report.warnCount == 0
+              && idxLilu >= 0 && idxLilu < idxAmfi && idxAmfi < idxInj && idxInj < idxPass
+              && !anchorArgs.contains("amfi=0x80") && anchorArgs.contains("alcid=11")
+              && fm.fileExists(atPath: ocAnchorDir.appendingPathComponent("Kexts/GarnetAnchorInjector.kext/Contents/Info.plist").path)
+              && fm.fileExists(atPath: ocAnchorDir.appendingPathComponent("Kexts/AMFIAnchor.kext/Contents/MacOS/AMFIAnchor").path))
+
+        // Restore --strip-only after AMFIAnchor configure removes GarnetAnchorInjector.kext + GarnetPCIBarCompat.kext but preserves Lilu.kext + AMFIAnchor.kext
+        let anchorStripRes = try OpenCoreValidator.restore(targetURL: efiAnchor, backupURL: nil, stripOnly: true)
+        let anchorStrippedRoot = try PropertyListSerialization.propertyList(from: Data(contentsOf: cfgAnchorURL), options: [], format: nil) as? [String: Any] ?? [:]
+        let anchorStrippedAdd = ((anchorStrippedRoot["Kernel"] as? [String: Any])?["Add"] as? [[String: Any]]) ?? []
+        let anchorStrippedNames = anchorStrippedAdd.map { ($0["BundlePath"] as? String) ?? "" }
+        check("OC restore --strip-only on AMFIAnchor EFI removes GarnetAnchorInjector/PCIBarCompat and preserves Lilu/AMFIAnchor",
+              anchorStripRes.stripOnly
+              && !anchorStrippedNames.contains("GarnetAnchorInjector.kext")
+              && !anchorStrippedNames.contains("GarnetPCIBarCompat.kext")
+              && anchorStrippedNames.contains("Lilu.kext")
+              && anchorStrippedNames.contains("AMFIAnchor.kext")
+              && !fm.fileExists(atPath: ocAnchorDir.appendingPathComponent("Kexts/GarnetAnchorInjector.kext").path)
+              && fm.fileExists(atPath: ocAnchorDir.appendingPathComponent("Kexts/Lilu.kext").path)
+              && fm.fileExists(atPath: ocAnchorDir.appendingPathComponent("Kexts/AMFIAnchor.kext").path))
     }
 
     static func runDenylistInstallerDiagTests(tempRoot: URL) throws {
@@ -1010,13 +1404,20 @@ struct GarnetCoreTestsRunner {
         check("Installer dryRun preserves foreign kext list", dryPlan.preservedForeignAuxKexts.count == 1)
         check("Installer dryRun leaves icon caches intact", fm.fileExists(atPath: iconStoreURL.path) && fm.fileExists(atPath: iconSvcURL.path) && fm.fileExists(atPath: dockCacheURL.path))
 
-        // Real sandbox install (Vulkan OFF by default)
+        // Real sandbox install (Vulkan OFF by default, with self-contained garnetctl binary)
+        let mockSelfCLI = tempRoot.appendingPathComponent("garnetctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: mockSelfCLI)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockSelfCLI.path)
         let instRes = try SystemDiskInstaller.install(
             payloadURL: fix.payloadDir,
-            options: InstallOptions(installVulkanICD: false, dryRun: false, verifyCodeSignatures: false, allowNonRootSandbox: true),
+            options: InstallOptions(installVulkanICD: false, dryRun: false, verifyCodeSignatures: false, allowNonRootSandbox: true, selfContainedCLIURL: mockSelfCLI),
             env: env
         )
         check("Installer executed", instRes.executed && !instRes.vulkanICDInstalled)
+        check("Installer stages com.garnet.recovery.plist, recover-uninstall.sh, and self-contained garnetctl",
+              fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/LaunchDaemons/com.garnet.recovery.plist").path)
+              && fm.isExecutableFile(atPath: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/recover-uninstall.sh").path)
+              && fm.isExecutableFile(atPath: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/garnetctl").path))
         check("Installer clears macOS icon caches and preserves unrelated files",
               !fm.fileExists(atPath: iconStoreURL.path)
               && !fm.fileExists(atPath: iconSvcURL.path)
@@ -1027,6 +1428,13 @@ struct GarnetCoreTestsRunner {
         check("GarnetPCIBarCompat.kext NEVER placed in /Library/Extensions", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/GarnetPCIBarCompat.kext").path))
         check("Vulkan ICD omitted by default", !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Vulkan/icd.d/radeon_icd.x86_64.json").path))
         check("GarnetMetal.bundle extracted", fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/GPUBundles/GarnetMetal.bundle/Contents/Resources/libvulkan_radeon.dylib").path))
+        check("Installer enforces go-w,a+rX (o+r) permissions on GarnetMetal.bundle and kexts",
+              mock.calls.contains(where: {
+                  $0.exe == "/bin/chmod"
+                  && $0.args.count == 5
+                  && $0.args[0] == "-R" && $0.args[1] == "go-w,a+rX"
+                  && $0.args[4].hasSuffix("/Library/GPUBundles/GarnetMetal.bundle")
+              }))
         check("Legacy 0.1.0 AMDRadeonRDNA4MTLDriver.bundle retired", !fm.fileExists(atPath: legacyMtlBundleURL.path))
 
         // Denylist persistence + upgrade test
@@ -1082,14 +1490,34 @@ struct GarnetCoreTestsRunner {
         let postRollbackText = try String(contentsOf: manifestSysURL, encoding: .utf8)
         check("Transactional rollback triggered and restored MANIFEST", rolledBackErr && postRollbackText.contains("# SENTINEL_PRE_ROLLBACK"))
 
-        // Export GarnetPCIBarCompat
+        // Export GarnetPCIBarCompat & GarnetRecover.efi & AMFIAnchor artifacts
         let expDir = tempRoot.appendingPathComponent("exported-oc")
         let expKext = try SystemDiskInstaller.exportPCIBarCompat(fromPayload: fix.payloadDir, toDestination: expDir)
-        check("Exported GarnetPCIBarCompat.kext", fm.fileExists(atPath: expKext.appendingPathComponent("Contents/Info.plist").path))
+        let expEFI = try SystemDiskInstaller.exportRecoverEFI(fromPayload: fix.payloadDir, toDestination: expDir)
+        check("Exported GarnetPCIBarCompat.kext and GarnetRecover.efi",
+              fm.fileExists(atPath: expKext.appendingPathComponent("Contents/Info.plist").path)
+              && fm.fileExists(atPath: expEFI.path))
 
-        // Status & sanitized diagnostics export
+        // Status & sanitized diagnostics export (including AMFIAnchor ioreg and recovery-complete notice)
+        mock.amfiAnchorIoreg = """
+        +-o AMFIAnchor  <class AMFIAnchor>
+          {
+            "InstallStatus" = 1
+            "AnchorReady" = Yes
+            "LoadedAnchors" = ("org.garnet.code-signing")
+          }
+        """
+        let recNoticeURL = sysRoot.appendingPathComponent("Library/Logs/Garnet/recovery-complete.txt")
+        try Data("Recovery uninstall succeeded at 2026-11-26T17:00:00Z\n".utf8).write(to: recNoticeURL)
         let st = DiagnosticsManager.collectStatus(env: env)
-        check("Status parses driver/BAR/compat/denylist/SMU verified", st.driverLoaded && st.accelLoaded && st.pciBarCompatLoaded && st.bar0CurrentMB == 16384 && st.iopciCompatMatchMode == "exact-uuid" && st.vulkanInstalled && st.denylistCount >= 2 && st.smuDriverIfVersion == "0x33" && st.smuTelemetryState == .verified)
+        check("Status parses driver/BAR/compat/denylist/SMU verified + AMFIAnchor + recovery notice",
+              st.driverLoaded && st.accelLoaded && st.pciBarCompatLoaded && st.bar0CurrentMB == 16384
+              && st.iopciCompatMatchMode == "exact-uuid" && st.vulkanInstalled && st.denylistCount >= 2
+              && st.smuDriverIfVersion == "0x33" && st.smuTelemetryState == .verified
+              && st.amfiAnchorLoaded && st.amfiAnchorInstallStatus == 1 && st.amfiAnchorReady && st.garnetAnchorLoaded
+              && (st.recoveryCompleteNotice?.contains("Recovery uninstall succeeded") == true))
+        try? fm.removeItem(at: recNoticeURL)
+        mock.amfiAnchorIoreg = ""
 
         // SMU UNVERIFIED detection via ioreg (non-root Garnet.app path)
         mock.garnetDriverIoreg = "\"ReBAR,BAR0,CurrentMB\" = 16384\n\"Garnet,DisplayPrimaryStatus\" = \"enabled\"\n\"SMU,DriverIfVersion\" = 52\n\"SMU,MetricsLayoutVerified\" = No\n\"SMU,MetricsValuesPlausible\" = No"
@@ -1194,12 +1622,25 @@ struct GarnetCoreTestsRunner {
         try fm.createDirectory(at: symIconDir, withIntermediateDirectories: true)
         try fm.createSymbolicLink(at: symIconDir.appendingPathComponent("com.apple.dock.iconcache"), withDestinationURL: symRealTarget)
 
-        // Uninstall preserving foreign kext & denylist
+        // Uninstall preserving foreign kext & denylist + self-bootout guard check
+        let defaultBootouts = SystemDiskInstaller.bootoutLabelsForUninstall(skipRecoveryDaemonBootout: false, environment: [:])
+        let skipFlagBootouts = SystemDiskInstaller.bootoutLabelsForUninstall(skipRecoveryDaemonBootout: true, environment: [:])
+        let skipEnvBootouts = SystemDiskInstaller.bootoutLabelsForUninstall(skipRecoveryDaemonBootout: false, environment: ["GARNET_RECOVERY_DAEMON": "1"])
+        check("Uninstall bootout filter protects com.garnet.recovery during recovery daemon run",
+              defaultBootouts.contains("com.garnet.recovery")
+              && !skipFlagBootouts.contains("com.garnet.recovery") && skipFlagBootouts.contains("com.garnet.native")
+              && !skipEnvBootouts.contains("com.garnet.recovery") && skipEnvBootouts.contains("com.garnet.native-translate"))
+
         let unRes = try SystemDiskInstaller.uninstall(
-            options: UninstallOptions(removeDenylist: false, dryRun: false, allowNonRootSandbox: true),
+            options: UninstallOptions(removeDenylist: false, dryRun: false, allowNonRootSandbox: true, skipRecoveryDaemonBootout: true),
             env: env
         )
-        check("Uninstall removed Garnet.kext & preserved foreign AuxKC", unRes.executed && !unRes.auxKCRemoved && unRes.preservedForeignAuxKexts.count == 1 && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/Garnet.kext").path))
+        check("Uninstall removed Garnet.kext, recovery daemon, self-contained garnetctl & preserved foreign AuxKC",
+              unRes.executed && !unRes.auxKCRemoved && unRes.preservedForeignAuxKexts.count == 1
+              && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Extensions/Garnet.kext").path)
+              && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/LaunchDaemons/com.garnet.recovery.plist").path)
+              && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/recover-uninstall.sh").path)
+              && !fm.fileExists(atPath: sysRoot.appendingPathComponent("Library/Application Support/Garnet/native/garnetctl").path))
         check("Uninstall clears macOS icon caches and never deletes symlink targets",
               !fm.fileExists(atPath: iconStoreURL.path)
               && !fm.fileExists(atPath: iconSvcURL.path)
@@ -1337,13 +1778,16 @@ struct GarnetCoreTestsRunner {
               && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")
 
         let killText = OpenCoreValidator.emergencyKillSwitchesText()
-        check("OpenCoreValidator documents the interrupt, display and power recovery switches",
+        check("OpenCoreValidator documents all interrupt, display, recovery, and power kill-switches",
               killText.contains("garnet-irq-wait=0")
               && killText.contains("garnet-vbl-irq=0")
               && killText.contains("garnet-dpms=0")
               && killText.contains("garnet-gfx-cg=0")
               && killText.contains("garnet-det0=0")
               && killText.contains("garnet-uclk-pin=1")
+              && killText.contains("garnet-webkitgpu=0")
+              && killText.contains("garnet-hpd-recover=0")
+              && killText.contains("garnet-idle-dpm=0")
               && killText.contains("garnet-gfxoff=0")
               && killText.contains("garnet-dmcub-fw=0")
               && killText.contains("garnet-fams2=0")

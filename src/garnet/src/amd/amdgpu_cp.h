@@ -18,7 +18,7 @@
 // ===========================================================================
 //  1. DriverKit members removed. `IOBufferMemoryDescriptor *x_buf` +
 //     `IODMACommand *x_dma` pairs become one `amdgpu::SysMem x_sys` each
-//     (PORTING.md rule 2). No <DriverKit/…> includes anywhere.
+//     (IOKit kext ABI). No <DriverKit/…> includes anywhere.
 //
 //  2. `*_bus` now means "GART MC address", not "DART iova". The reference
 //     ran on Apple Silicon where IODMACommand::PrepareForDMA handed back a
@@ -938,7 +938,7 @@ struct ComputeQueue {
     uint64_t  wptr_gpu_addr  { 0 };
     uint64_t  fence_gpu_addr { 0 };
 
-    uint32_t  wptr { 0 };
+    uint64_t  wptr { 0 };
     uint32_t  fence_counter { 0 };
     uint32_t  doorbell_index { 0 };
     // Which HQD this queue occupies. me is always 1 (the MEC); Linux's KCQs

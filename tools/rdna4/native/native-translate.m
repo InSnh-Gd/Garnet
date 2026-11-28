@@ -157,12 +157,20 @@ static NSString *shaderName(int dir, const char *sha, uid_t uid, size_t airBytes
 }
 
 static BOOL libraryHash(const char *path, uint8_t hash[32]) {
+    static BOOL cachedValid;
+    static struct stat cachedStat;
+    static uint8_t cachedHash[32];
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     struct stat before, after;
     if (fd < 0) return NO;
     BOOL ok = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) && before.st_size > 0 &&
         before.st_size <= 512 * 1024 * 1024 && !(before.st_mode & 0022) &&
         (before.st_uid == 0 || before.st_uid == geteuid());
+    if (ok && cachedValid && sameFile(&before, &cachedStat)) {
+        close(fd);
+        memcpy(hash, cachedHash, sizeof cachedHash);
+        return YES;
+    }
     CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
     uint8_t buf[65536]; off_t used = 0;
     while (ok && used < before.st_size) {
@@ -173,25 +181,37 @@ static BOOL libraryHash(const char *path, uint8_t hash[32]) {
     }
     ok = ok && fstat(fd, &after) == 0 && sameFile(&before, &after);
     close(fd);
-    if (ok) CC_SHA256_Final(hash, &ctx);
+    if (ok) {
+        CC_SHA256_Final(hash, &ctx);
+        cachedStat = after;
+        memcpy(cachedHash, hash, sizeof cachedHash);
+        cachedValid = YES;
+    }
     return ok;
 }
 static BOOL translationKey(const char *library, char key[17]) {
-    uint8_t libHash[32], readerID[16], overrideHash[32];
+    static BOOL readerCached;
+    static uint8_t cachedReaderID[16];
+    static char cachedOS[128];
+    uint8_t libHash[32], overrideHash[32];
     if (!libraryHash(library, libHash)) return NO;
-    rdna4x_reader reader; char why[256];
-    if (rdna4x_reader_load(&reader, RDNA4X_GPUC_BASE, NULL, why, sizeof why) != 0) {
-        fprintf(stderr, "%s\n", why); return NO;
+    if (!readerCached) {
+        rdna4x_reader reader; char why[256];
+        if (rdna4x_reader_load(&reader, RDNA4X_GPUC_BASE, NULL, why, sizeof why) != 0) {
+            fprintf(stderr, "%s\n", why); return NO;
+        }
+        Dl_info image = {0};
+        BOOL ok = dladdr((const void *)reader.ParseBitcodeInContext2, &image) && image.dli_fbase &&
+            rdna4x_macho_uuid(image.dli_fbase, 65536, cachedReaderID);
+        dlclose(reader.h);
+        size_t len = sizeof cachedOS;
+        memset(cachedOS, 0, sizeof cachedOS);
+        if (!ok || sysctlbyname("kern.osversion", cachedOS, &len, NULL, 0) != 0 || !cachedOS[0]) return NO;
+        readerCached = YES;
     }
-    Dl_info image = {0};
-    BOOL ok = dladdr((const void *)reader.ParseBitcodeInContext2, &image) && image.dli_fbase &&
-        rdna4x_macho_uuid(image.dli_fbase, 65536, readerID);
-    dlclose(reader.h);
-    char os[128] = {0}; size_t len = sizeof os;
-    if (!ok || sysctlbyname("kern.osversion", os, &len, NULL, 0) != 0 || !os[0]) return NO;
     rdna4x_override_hash(overrideHash);
     // Include every dylib byte (also handles fat Mach-O), reader UUID, overrides and OS.
-    char engineKey[17]; rdna4x_key(engineKey, libHash, readerID, overrideHash, os);
+    char engineKey[17]; rdna4x_key(engineKey, libHash, cachedReaderID, overrideHash, cachedOS);
     CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
     CC_SHA256_Update(&ctx, "rdna4-worker-1", 14);
     CC_SHA256_Update(&ctx, engineKey, 16); CC_SHA256_Update(&ctx, libHash, sizeof libHash);
@@ -306,7 +326,7 @@ static int runRequest(const char *executable, const char *library, int airFD, co
             while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
             break;
         }
-        pauseUntil(now() + 0.05);
+        pauseUntil(now() + 0.005);
     }
     if (stopping) return REQUEST_CANCELLED;
     if (killed || !WIFEXITED(status)) return RDNA4X_E_TIMEOUT;
@@ -423,7 +443,7 @@ static void usage(void) {
          "Output must belong to this service uid, mode 0755; private decisions in .native-translate/<key>.\n"
          "Publishes <sha>.meta.json then <sha>.spv, mode 0644, using atomic rename.\n"
          "--once scans to EOF (0: no new failures, 1: request/setup failure, 64: usage).\n"
-         "Service uses vnode notifications, 250ms pacing, and a 5s fallback scan.\n"
+         "Service uses vnode notifications with immediate backlog draining and a 5s fallback scan.\n"
          "--wait-ready waits for a live initialized nobody service using a local socket.\n"
          "No GPU access or external SPIR-V validator; translation is not a GPU validation claim.");
 }
@@ -484,8 +504,10 @@ int main(int argc, char **argv) {
                     nextKey = now() + 5;
                 }
                 if (!scan.root) {
-                    if (beginScan(&scan, source)) rescan = NO;
-                    else if (once) { fprintf(stderr, "cannot scan source: %s\n", source); errors++; break; }
+                    rescan = NO;
+                    if (!beginScan(&scan, source) && once) {
+                        fprintf(stderr, "cannot scan source: %s\n", source); errors++; break;
+                    }
                 }
                 BOOL scanning = scan.root != NULL;
                 if (scanning && listener >= 0) readyReply(listener);
@@ -496,17 +518,16 @@ int main(int argc, char **argv) {
                     ready = YES;
                 }
                 if (once) { if (!more) break; continue; }
+                if (!scanning) { pauseUntil(now() + 0.25); continue; }
                 // A notification may refer to a UID already passed by this scan.
                 BOOL pace = more || rescan;
-                const double paced = now() + 0.25;
                 if (scan.kq >= 0) {
-                    struct timespec timeout = { pace ? 0 : 5, pace ? 250000000 : 0 };
+                    struct timespec timeout = { pace ? 0 : 5, 0 };
                     struct kevent events[16];
                     int count = kevent(scan.kq, NULL, 0, events, 16, &timeout);
                     for (int i = 0; i < count; i++)
                         if (events[i].filter == EVFILT_VNODE) rescan = YES;
-                }
-                pauseUntil(pace || rescan ? paced : now() + 0.25);
+                } else if (!pace) pauseUntil(now() + 0.25);
             }
         } while (!stopping);
         if (scan.sub) closedir(scan.sub);

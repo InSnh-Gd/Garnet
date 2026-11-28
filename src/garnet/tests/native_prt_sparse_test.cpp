@@ -349,9 +349,9 @@ struct TestVm {
 // ---- P1: ABI minor 13 + RDNA4N_CAP_VM_PRT negotiation --------------------------------------------------------------------
 static void p1_abi_negotiation() {
     expect_u("ABI major remains 1", RDNA4N_ABI_VERSION, 1u);
-    expect_u("ABI minor bumped to 13", RDNA4N_ABI_MINOR, 13u);
-    expect_u("Hello with RDNA4N_HELLO_F_MINOR reports 1.13 (0xD0001)",
-             (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16), 0xD0001ull);
+    expect_u("ABI minor bumped to 14", RDNA4N_ABI_MINOR, 14u);
+    expect_u("Hello with RDNA4N_HELLO_F_MINOR reports 1.14 (0xE0001)",
+             (uint64_t)RDNA4N_ABI_VERSION | ((uint64_t)RDNA4N_ABI_MINOR << 16), 0xE0001ull);
     expect_u("RDNA4N_CAP_VM_PRT is bit 4", RDNA4N_CAP_VM_PRT, 1u << 4);
     expect_u("RDNA4N_CAP_VM_PRT does not collide with existing INFO flags",
              RDNA4N_CAP_VM_PRT & (RDNA4N_INFO_HUNG | RDNA4N_INFO_S1B_POSITIVE | RDNA4N_INFO_NATIVE_BOOT | RDNA4N_INFO_BUFFER_OPS), 0u);
@@ -804,7 +804,7 @@ static void p8_source_pins(const std::string &root) {
     const std::string eng = garnet_test_ver::read_native_engine(root + "/src/garnet/src/amd");
     expect(!abi.empty() && !iph.empty() && !gmc.empty() && !eng.empty(), "production sources readable");
 
-    expect(abi.find("#define RDNA4N_ABI_MINOR     13u ") != std::string::npos, "GarnetNativeABI.h sets RDNA4N_ABI_MINOR = 13u");
+    expect(abi.find("#define RDNA4N_ABI_MINOR     14u ") != std::string::npos, "GarnetNativeABI.h sets RDNA4N_ABI_MINOR = 14u");
     expect(abi.find("#define RDNA4N_CAP_VM_PRT         (1u << 4)") != std::string::npos, "GarnetNativeABI.h defines RDNA4N_CAP_VM_PRT");
     expect(iph.find("constexpr uint64_t PRT_GFX12 = (1ULL << 56);") != std::string::npos &&
            iph.find("constexpr uint64_t PRT_LEAF  = PRT_GFX12 | SNOOPED | SYSTEM | IS_PTE;") != std::string::npos,

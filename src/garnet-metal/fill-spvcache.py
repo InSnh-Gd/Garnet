@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Install the census OK translations into spvcache/<sha256(bitcodeData)>.spv (native #11 step 11e).
+"""Install translated system shaders into spvcache/<sha256(bitcodeData)>.spv.
 
-usage: fill-spvcache.py [census2 dir, default ~/rdna4-native/census2]
+usage: fill-spvcache.py <census2 dir>
 Libraries: SkyLight (SkyLightShaders.air64), QuartzCore (AIR slice), CoreDisplay, CoreImage default.
-Every entry is checked: sha256 of the extracted .air blob must equal the results.tsv key (which the PC measured equal
-to sha256(-[MTLFunction bitcodeData]) for 275/275 functions, NATIVE-S4-SHADER-CENSUS Part A), the .spv must start
-with the SPIR-V magic, and two libraries sharing a key must have byte-identical .spv.
+Every entry is checked: sha256 of the extracted .air blob must equal the results.tsv key
+(which matches sha256(-[MTLFunction bitcodeData])), the .spv must start with the SPIR-V magic,
+and two libraries sharing a key must have byte-identical .spv.
 No sidecar is installed: the bundle reflects the SPIR-V (descriptor sets, push constants, vertex inputs, outputs) itself.
 """
 import hashlib, os, shutil, sys
-root = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/rdna4-native/census2")
+if len(sys.argv) < 2:
+    sys.exit("usage: fill-spvcache.py <census2 dir>")
+root = os.path.expanduser(sys.argv[1])
 libs = ["SkyLight__SkyLightShaders.air64", "QuartzCore__default", "CoreDisplay__default", "CoreImage__default"]
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spvcache")
 seen = {}; n = 0; dup = 0

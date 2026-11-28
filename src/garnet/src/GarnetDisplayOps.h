@@ -1,6 +1,6 @@
 /*
  *  GarnetDisplayOps.h - the interface between Garnet.kext (owner of the GPU and of the monitor B's and the monitor A's display planes; ESP-injected: rebuilds are free) and GarnetFramebuffer of
- *  GarnetAccel.kext (ANY rebuild of the aux kext needs the new-install-path procedure), an internal design note "M5 build spec: GarnetFramebuffer for the monitor B", section 3, and (0.0.658,
+ *  GarnetAccel.kext (ANY rebuild of the aux kext needs the new-install-path procedure), GarnetFramebuffer design and (0.0.658,
  *  ABI 2) "monitor A (instance 1) plane + framebuffer spec at 1080p60", corrections 5 and 6 and section 4.
  *  BYTE-IDENTICAL copies live in src/garnet/src/ and src/garnet-accel/src/ (both host tests compare them). Plain C, append-only, like GarnetMetalOps.h.
  *

@@ -4,7 +4,7 @@
 //  WHAT THE RENAME IS FOR
 //
 //  CoreDisplay resolves a framebuffer's GPU vendor by a case-sensitive substring search on its IOKit
-//  class name (notes/M4-CAPABILITIES-STRUCT.md). Our framebuffer publishes as `RDNA4FB`, matches
+//  class name (CoreDisplay vendor classification). Our framebuffer publishes as `RDNA4FB`, matches
 //  none of "Intel"/"AMD"/"AppleParavirt", takes the unknown-vendor bit 0x1, and that bit cannot be
 //  covered by any preference — so `UseIOPresentment()` is false and the desktop is CPU-composited.
 //  The compile-time fix is blocked: the kext installs through the Auxiliary collection, which cannot
