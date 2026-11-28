@@ -289,19 +289,28 @@ kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
 
 // Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard with
 // ~100 ms delayed-idle AllowGfxOff hysteresis (`rdna4-gfxoff-default`).
+enum class DisplayWakePhase : uint8_t { Idle, Sleeping, Waking, PoweredOn };
 struct SMUContext {
     rdna4gfxoff::GuardState gfxoff {};
     const DeviceContext    *gfxoffDev   { nullptr };
     void                   *gfxoffTimer { nullptr }; // thread_call_t in kernel
     bool                    inited      { false };
+    bool                    powerEpochManaged { false };
+    bool                    sleepPending { false };
+    bool                    wakeUnverified { false };
+    const DeviceContext    *displayWakeDev { nullptr };
+    DisplayWakePhase        displayWakePhase { DisplayWakePhase::Idle };
 };
 
 kern_return_t gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow);
 kern_return_t gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
                                 bool bootArgPresent, uint32_t bootArgValue,
                                 bool *outAllowed = nullptr);
-void          gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
-void          gfx_off_register_context(SMUContext *smu);
+kern_return_t gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
+enum class GfxOffPowerEvent : uint8_t { WillSleep, WillNotSleep, WillPowerOn, HasPoweredOn, Shutdown };
+kern_return_t gfx_off_power_event(DeviceContext &dev, SMUContext &smu, GfxOffPowerEvent event);
+bool smu_display_wake_pin_allowed(const SMUContext &smu);
+kern_return_t smu_repin_uclk_after_wake(const DeviceContext &dev, SMUContext &smu, uint32_t expectedVersion);
 SMUContext   *gfx_off_active_context();
 
 // Balanced RAII guard for GC MMIO critical sections.

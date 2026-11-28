@@ -41,6 +41,10 @@ void initSoc(dml2_initialize_instance_in_out &init, const Input &input) {
 	clocks.dram_config.channel_width_bytes = soc.dramChannelWidthBytes;
 	clocks.dram_config.transactions_per_clock = soc.dramTransactionsPerClock;
 	init.soc_bb.mall_allocated_for_dcn_mbytes = soc.mallMiB;
+	if (soc.crystalKHz) init.soc_bb.xtalclk_mhz = soc.crystalKHz / 1000u;
+	if (soc.references.dpRefKHz) init.soc_bb.dprefclk_mhz = soc.references.dpRefKHz / 1000u;
+	if (soc.references.dchubRefKHz) init.soc_bb.dchub_refclk_mhz = soc.references.dchubRefKHz / 1000u;
+	if (soc.references.vcoKHz) init.soc_bb.dispclk_dppclk_vco_speed_mhz = soc.references.vcoKHz / 1000.0;
 	auto &power = init.soc_bb.power_management_parameters;
 	power.dram_clk_change_blackout_us = soc.uclkBlackoutNs / 1000.0;
 	power.fclk_change_blackout_us = soc.fclkBlackoutNs / 1000.0;
@@ -139,12 +143,26 @@ bool mapResult(const dml2_display_cfg_programming &programming, uint32_t count, 
 		output.surfaceMallBytes = plane.surface_size_mall_bytes;
 		output.svpMallBytes = plane.svp_size_mall_bytes;
 		output.phantom = plane.phantom_plane.valid;
+		if (output.phantom != stream.phantom_stream.enabled) return false;
+		if (output.phantom) {
+			const auto &timing = stream.phantom_stream.descriptor.timing;
+			if (!timing.v_active || timing.v_active >= timing.v_total || timing.v_total > UINT32_MAX ||
+			    timing.v_front_porch >= timing.v_total - timing.v_active) return false;
+			output.phantomVertical = {static_cast<uint32_t>(timing.v_active),
+			                          static_cast<uint32_t>(timing.v_total),
+			                          static_cast<uint32_t>(timing.v_front_porch)};
+		}
 		for (uint32_t pipe = 0; pipe < output.dppCount; ++pipe) {
 			if (!plane.pipe_regs[pipe]) return false;
 			output.detSegments[pipe] = plane.pipe_regs[pipe]->det_size;
 			if (output.phantom) {
-				if (!plane.phantom_plane.pipe_regs[pipe]) return false;
-				output.phantomDetSegments[pipe] = plane.phantom_plane.pipe_regs[pipe]->det_size;
+				const auto *phantom = plane.phantom_plane.pipe_regs[pipe];
+				if (!phantom) return false;
+				output.phantomDetSegments[pipe] = phantom->det_size;
+				const auto &ttu = phantom->ttu_regs;
+				output.phantomLumaTtu[pipe] = {ttu.qos_level_low_wm, ttu.qos_level_high_wm,
+				                             ttu.refcyc_per_req_delivery_l, ttu.qos_level_fixed_l,
+				                             ttu.qos_ramp_disable_l != 0u, ttu.refcyc_per_req_delivery_pre_l};
 			}
 		}
 		const auto &base = stream.fams2_base_params.stream_v1.base;
@@ -161,6 +179,15 @@ bool mapResult(const dml2_display_cfg_programming &programming, uint32_t count, 
 
 size_t dml21WorkspaceBytes() { return sizeof(Workspace); }
 size_t dml21InstanceBytes() { return dml2_get_instance_size_bytes(); }
+
+void dcn401SocDefaults(Soc &soc) {
+	const auto &power = dml2_socbb_dcn401.power_management_parameters;
+	soc.dramTransactionsPerClock = dml2_socbb_dcn401.clk_table.dram_config.transactions_per_clock;
+	soc.uclkBlackoutNs = static_cast<uint32_t>(power.dram_clk_change_blackout_us * 1000.0);
+	soc.fclkBlackoutNs = static_cast<uint32_t>(power.fclk_change_blackout_us * 1000.0);
+	soc.stutterEnterExitNs = static_cast<uint32_t>(power.stutter_enter_plus_exit_latency_us * 1000.0);
+	soc.stutterExitNs = static_cast<uint32_t>(power.stutter_exit_latency_us * 1000.0);
+}
 
 bool solveWithDml21(const Input &input, Result &result, void *workspaceMemory, void *instanceMemory) {
 	auto *workspace = static_cast<Workspace *>(workspaceMemory);

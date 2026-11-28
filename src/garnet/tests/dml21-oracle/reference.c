@@ -137,6 +137,25 @@ static void print_det(struct dml2_dchub_per_pipe_register_set *const *regs, unsi
     printf("}");
 }
 
+static void print_phantom(const struct dml2_per_plane_programming *plane,
+                          const struct dml2_per_stream_programming *stream)
+{
+    if (!plane->phantom_plane.valid) {
+        printf("{0,0,0},{{0,0,0,0,0,0}}");
+        return;
+    }
+    assert(stream->phantom_stream.enabled);
+    const struct dml2_timing_cfg *timing = &stream->phantom_stream.descriptor.timing;
+    printf("{%lu,%lu,%lu},{", timing->v_active, timing->v_total, timing->v_front_porch);
+    for (unsigned int index = 0; index < plane->num_dpps_required; ++index) {
+        const struct dml2_display_ttu_regs *ttu = &plane->phantom_plane.pipe_regs[index]->ttu_regs;
+        printf("%s{%u,%u,%u,%u,%u,%u}", index ? "," : "", ttu->qos_level_low_wm,
+               ttu->qos_level_high_wm, ttu->refcyc_per_req_delivery_l, ttu->qos_level_fixed_l,
+               ttu->qos_ramp_disable_l, ttu->refcyc_per_req_delivery_pre_l);
+    }
+    printf("}");
+}
+
 static void print_result(const struct dml2_display_cfg_programming *programming, uint32_t streams)
 {
     const struct dml2_dchub_global_register_set *global = &programming->global_regs;
@@ -164,6 +183,8 @@ static void print_result(const struct dml2_display_cfg_programming *programming,
         print_bytes(&stream->fams2_base_params.stream_v1.base, sizeof(stream->fams2_base_params.stream_v1.base));
         printf(",");
         print_bytes(&stream->fams2_sub_params.stream_v1.sub_state, sizeof(stream->fams2_sub_params.stream_v1.sub_state));
+        printf(",");
+        print_phantom(plane, stream);
         puts("},");
     }
     puts("    }},");

@@ -169,6 +169,7 @@ static void run_pdb0_selftest(BringupContext &ctx) {
         amdgpu_hdp_flush(dev);
         t.identity_addr = ident.gpu_va;
         kern_return_t r = fill_via_copy(ident.gpu_va, pat);
+        if (inst.dma_unconfirmed) return;
         uint32_t bad = 0;
         for (uint32_t i = 0; i < kDwords; i++)
             if (RBAR0_32(dev, off + (uint64_t)i * 4) != pat) bad++;
@@ -192,6 +193,7 @@ static void run_pdb0_selftest(BringupContext &ctx) {
         amdgpu_hdp_flush(dev);
         t.alias_addr = off;
         kern_return_t r = fill_via_copy(off, pat);
+        if (inst.dma_unconfirmed) return;
         uint32_t bad = 0;
         for (uint32_t i = 0; i < kDwords; i++)
             if (RBAR0_32(dev, off + (uint64_t)i * 4) != pat) bad++;
@@ -222,6 +224,7 @@ static void run_pdb0_selftest(BringupContext &ctx) {
             sysmem_wmb();
             t.gart_addr = mc;
             kern_return_t r = fill_via_copy(mc, pat);
+            if (inst.dma_unconfirmed) return;
             sysmem_rmb();
             uint32_t bad = 0;
             for (uint32_t i = 0; i < kDwords; i++) if (cpu[i] != pat) bad++;
@@ -486,7 +489,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         // NBIO S2A doorbell range for SDMA0 (Linux sdma_v7_0_gfx_resume via nbio->sdma_doorbell_range):
         // index = doorbell_index.sdma_engine[0] << 1 (64-bit doorbells), range size 20.
         r = nbif_v6_3_1_sdma_doorbell_range(dev, 0, true, (int)(dev.doorbell.index.sdma_engine[0] << 1), 20);
-        if (r != kIOReturnSuccess) INIT_LOG("SDMAInit: sdma_doorbell_range failed %#x (SDMA also kicks RB_WPTR via MMIO)", r);
+        if (r != kIOReturnSuccess) return r;
         r = sdma_init_full(dev, ctx.psp, ctx.gmc, ctx.sdma);
         if (r != kIOReturnSuccess) return r;
         // 0.0.657 (GitHub issue #1): the SDMA0_DCC_CNTL no-PTE compression clear (0xaabe -> 0xaaaa) lands BEFORE any SDMA copy,
@@ -501,6 +504,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         INIT_LOG("SDMAInit: VRAM copy test %s (kr=%#x, %u bytes, %u mismatched, %llu us)",
                  ctx.sdmaCopyPassed ? "PASSED — the GPU wrote VRAM on command" : "FAILED", r,
                  ctx.sdmaCopy.bytes, ctx.sdmaCopy.mismatched, (unsigned long long)ctx.sdmaCopy.elapsed_us);
+        if (ctx.sdma.instance[0].dma_unconfirmed) return r;
         // 0.0.339: the size / address / CPV sweep. The 4 KiB test
         // just above passes in every boot in which the scanout pre-flight's
         // 64 KiB copy mis-delivers 7904 of 16384 dwords, so the discriminator
@@ -531,6 +535,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
             const kern_return_t sw = sdma_vram_copy_sweep(dev, ctx.gmc, ctx.sdma.instance[0]);
             INIT_LOG("SDMAInit: VRAM copy SWEEP %s (kr=%#x) — see the `copy_sweep` lines",
                      sw == kIOReturnSuccess ? "every case matched" : "AT LEAST ONE CASE WRONG", sw);
+            if (ctx.sdma.instance[0].dma_unconfirmed) return sw;
         } else {
             INIT_LOG("SDMAInit: VRAM copy SWEEP DELIBERATELY NOT RUN — 0.0.341 is the "
                      "CONTROL BOOT for an earlier analysis: does the scanout pre-flight "
@@ -541,6 +546,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         // CPInit: measuring now is the last chance to revert before PM4Test
         // and ComputeDispatch run on top of it.
         run_pdb0_selftest(ctx);
+        if (ctx.sdma.instance[0].dma_unconfirmed) return kIOReturnTimeout;
         // 0.0.185: the SDMA0 QUEUE1 doorbell-routing self-test. Opt-in
         // (rdna4-sdma-q1-test=1) and a complete no-op otherwise. It programs,
         // fences and then DISABLES QUEUE1, so a plain boot is unchanged and a
@@ -548,6 +554,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         if (ctx.sdmaQ1TestWant) {
             (void)sdma_q1_selftest(dev, ctx.gmc, ctx.sdma.instance[0],
                                    kSDMAQ1AppleDoorbellIndex, &ctx.sdmaQ1Test);
+            if (ctx.sdma.instance[0].dma_unconfirmed) return kIOReturnTimeout;
         }
         // 0.0.196: the same test, once per hardware queue `sdmamap` may hand
         // Apple. Each leg programs, fences, reads back and then DISABLES its
@@ -567,6 +574,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
                 (void)sdma_q1_selftest(dev, ctx.gmc, ctx.sdma.instance[sl.instance],
                                        sl.doorbell_dword, &ctx.sdmaQnTest[slot],
                                        sl.queue);
+                if (ctx.sdma.instance[sl.instance].dma_unconfirmed) return kIOReturnTimeout;
             }
         }
         // 0.0.191: the SRBM_WRITE self-test (rdna4-srbm-test=1). LAST, so a
@@ -576,6 +584,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         if (ctx.srbmTestWant) {
             (void)sdma_srbm_selftest(dev, ctx.gmc, ctx.sdma.instance[0],
                                      &ctx.srbmTest);
+            if (ctx.sdma.instance[0].dma_unconfirmed) return kIOReturnTimeout;
         }
         // 0.0.193: the vmfrag self-test (rdna4-vmfrag-test=1) — INCREMENT 1 of
         // the Apple page-table encoding fix. After the SRBM one, i.e. last of
@@ -586,6 +595,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         if (ctx.vmfragTestWant) {
             (void)gmc_vmfrag_selftest(dev, ctx.gmc, ctx.sdma.instance[0],
                                       &ctx.vmfragTest, ctx.vmfragNoValidWant);
+            if (ctx.sdma.instance[0].dma_unconfirmed) return kIOReturnTimeout;
         }
         return kIOReturnSuccess;   // engine init succeeded; the copy result is reported separately
     }
@@ -780,15 +790,28 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
 //     would otherwise have to re-load);
 //   * SMU features are left enabled — smu_disable_all_features() would drop
 //     the GFX core's power, and the display side shares that rail.
-void bringup_teardown(BringupContext &ctx) {
-    if (ctx.dev == nullptr || ctx.tornDown) return;
+kern_return_t bringup_teardown(BringupContext &ctx) {
+    if (ctx.dev == nullptr || ctx.tornDown) return kIOReturnSuccess;
     DeviceContext &dev = *ctx.dev;
+    const kern_return_t gfxOffResult = gfx_off_teardown(dev, ctx.smu);
+    if (gfxOffResult != kIOReturnSuccess) {
+        INIT_LOG("teardown refused (%#x): cannot safely stop GC; retaining engine and DMA storage",
+                 gfxOffResult);
+        return gfxOffResult;
+    }
+    for (auto &inst : ctx.sdma.instance) {
+        const kern_return_t result = sdma_quiesce_for_teardown(dev, inst);
+        if (result != kIOReturnSuccess) {
+            INIT_LOG("teardown refused (%#x): SDMA%u DMA not quiescent; retaining engine and DMA storage",
+                     result, inst.instance);
+            return result;
+        }
+    }
     ctx.tornDown = true;
     INIT_LOG("teardown: unwinding from stage %u (%s)",
              (unsigned)ctx.reached, stage_name(ctx.reached));
 
     // (0) Stage 3C: unwind GFXOFF and GFX12 clock gating before halting engines.
-    gfx_off_teardown(dev, ctx.smu);
     ctx.gfxOffAllowed = false;
     if (ctx.rlc.cg_enabled && dev.ip.isResolved(IPBlock::GC)) {
         (void)rlc_set_clock_gating(dev, ctx.rlc, false, ctx.sdma.instance_present[1]);
@@ -815,14 +838,8 @@ void bringup_teardown(BringupContext &ctx) {
         ctx.kcqMapped = false;
     }
 
-    // (2) Stop the engines that fetch from memory: SDMA queues first (they
-    //     have no dependency on the CP), then the CP front-ends and the MEC.
+    // (2) SDMA is quiescent; stop the CP front-ends and the MEC.
     if (dev.ip.isResolved(IPBlock::GC)) {
-        for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
-            if (!ctx.sdma.instance[i].inited) continue;
-            sdma_gfx_stop_instance(dev, i);
-            sdma_engine_halt(dev, i, true);
-        }
         if (ctx.cp.inited || ctx.reached >= BringupStage::CPInit) {
             cp_enable(dev, false);
             cp_compute_enable(dev, false);
@@ -860,6 +877,7 @@ void bringup_teardown(BringupContext &ctx) {
     ctx.doorbellPathReady = false;
     ctx.reached          = BringupStage::None;
     INIT_LOG("teardown: done — engines halted, scheduler parked, all buffers released");
+    return kIOReturnSuccess;
 }
 
 kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
@@ -894,11 +912,20 @@ kern_return_t bringup_to(BringupContext &ctx, BringupStage target) {
     }
     if (ctx.dev && ctx.smuOnline && ctx.reached >= BringupStage::SDMAInit && !ctx.gfxOffAllowed) {
         uint32_t goArg = 0u;
-        const bool goPresent = PE_parse_boot_argn("garnet-gfxoff", &goArg, sizeof(goArg));
+        bool goPresent = PE_parse_boot_argn("garnet-gfxoff", &goArg, sizeof(goArg));
+        if (rdna4gfxoff::gfxoff_hw_opt_in(goPresent, goArg) && !ctx.gfxOffSleepObserved) {
+            INIT_LOG("GFXOFF opt-in refused: power notifications unavailable");
+            goPresent = false;
+        }
+        if (rdna4gfxoff::gfxoff_hw_opt_in(goPresent, goArg) &&
+            (!ctx.doorbellPathReady || !sdma_doorbells_proven(*ctx.dev, ctx.sdma))) {
+            INIT_LOG("GFXOFF opt-in refused: SDMA BAR2 fence round trip not proven");
+            goPresent = false;
+        }
         kern_return_t gor = gfx_off_boot_init(*ctx.dev, ctx.smu, goPresent, goArg, &ctx.gfxOffAllowed);
         if (rdna4gfxoff::gfxoff_hw_opt_in(goPresent, goArg)) {
             INIT_LOG("Stage 3C: opt-in SMU GFXOFF %s (%#x)",
-                     ctx.gfxOffAllowed ? "ALLOWED" : "FAILED", gor);
+                     ctx.gfxOffAllowed ? "ARMED" : "FAILED", gor);
         }
     }
 

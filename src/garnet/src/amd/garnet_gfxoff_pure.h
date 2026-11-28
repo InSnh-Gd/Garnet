@@ -27,7 +27,7 @@ inline bool gfxoff_kill_switch_active(bool present, uint32_t value) {
 }
 
 inline bool gfxoff_hw_opt_in(bool present, uint32_t value) {
-    return present && value != 0u;
+    return present && value == 1u;
 }
 
 // Pure SDMA7 doorbell policy: when BAR2 covers [offs, offs + 8), sysmem wptr +
@@ -47,12 +47,13 @@ enum class Action : uint8_t {
 };
 
 struct GuardState {
-    bool     hw_enabled         { false }; // true only when opt-in boot AllowGfxOff succeeded and !kill_switch
+    bool     hw_enabled         { false }; // opt-in with a working guard and idle timer
     bool     kill_switch        { false }; // true when garnet-gfxoff=0 explicitly specified
-    bool     hw_disallowed      { true };  // true when GC is currently kept awake (safe default)
+    bool     hw_disallowed      { true };  // false also covers an unknown result from AllowGfxOff
     bool     faulted            { false }; // sticky fail-safe latch on DisallowGfxOff / SMU-not-ready failure
     bool     hysteresis_enabled { true };  // true: 1 -> 0 schedules 100 ms delayed AllowGfxOff
     bool     pending_allow      { false }; // true while delayed AllowGfxOff timer is armed
+    uint64_t allow_deadline     { 0u };
     uint32_t disallow_count     { 0u };    // active nested disallow depth
     uint32_t disallow_ops       { 0u };    // successful hw_disallowed=false -> true DisallowGfxOff transitions
     uint32_t allow_ops          { 0u };    // successful AllowGfxOff transitions
@@ -68,6 +69,7 @@ struct GuardState {
         faulted            = false;
         hysteresis_enabled = hysteresis;
         pending_allow      = false;
+        allow_deadline     = 0u;
         disallow_count     = 0u;
         disallow_ops       = 0u;
         allow_ops          = 0u;
@@ -77,24 +79,26 @@ struct GuardState {
         fault_count        = 0u;
     }
 
-    // Arm hardware GFXOFF tracking after boot-time PPSMC::AllowGfxOff succeeded.
-    // Refuses if kill-switch is active, previously faulted, or any disallow guard is held.
-    bool arm_hw_allowed() {
-        if (kill_switch || faulted || disallow_count != 0u) return false;
-        hw_enabled    = true;
-        hw_disallowed = false;
-        pending_allow = false;
+    bool arm_while_awake() {
+        if (!hw_disallowed || kill_switch || faulted) return false;
+        hw_enabled = true;
         return true;
     }
 
     // Teardown / permanent disable for remainder of boot.
     // Clears any pending delayed allow and returns SendDisallow if hardware currently allows GFXOFF.
     Action disable_hw() {
-        const bool needDisallow = hw_enabled && !hw_disallowed;
         hw_enabled    = false;
-        hw_disallowed = true;
         pending_allow = false;
-        return needDisallow ? Action::SendDisallow : Action::None;
+        return hw_disallowed ? Action::None : Action::SendDisallow;
+    }
+
+    void finish_disable(bool smuOk) {
+        hw_disallowed = smuOk;
+        if (!smuOk) {
+            faulted = true;
+            fault_count++;
+        }
     }
 
     // Request GFXOFF disallowed (allow == false) or re-allowed (allow == true).
@@ -103,10 +107,6 @@ struct GuardState {
     //   - ScheduleAllow: caller arms the ~100 ms idle timer to later run on_idle_timer().
     Action request(bool allow, bool smuReady) {
         if (!allow) {
-            if (kill_switch || !hw_enabled) {
-                if (disallow_count != UINT32_MAX) disallow_count++;
-                return Action::None;
-            }
             if (faulted) {
                 fault_count++;
                 return Action::Faulted;
@@ -155,12 +155,13 @@ struct GuardState {
         return Action::None;
     }
 
-    // Invoked when the 100 ms delayed-idle timer expires.
-    Action on_idle_timer(bool smuReady) {
+    // An invocation already waiting on the SMU lock can outlive its scheduled epoch.
+    Action on_idle_timer(bool smuReady, uint64_t now) {
         if (kill_switch || !hw_enabled || faulted || !pending_allow) {
             pending_allow = false;
             return Action::None;
         }
+        if (now < allow_deadline) return Action::None;
         if (disallow_count > 0u || !hw_disallowed || !smuReady) {
             pending_allow = false;
             return Action::None;
@@ -184,14 +185,10 @@ struct GuardState {
                 fault_count++;
             }
         } else if (action == Action::SendAllow) {
+            hw_disallowed = false;
+            pending_allow = false;
             if (smuOk) {
-                hw_disallowed = false;
-                pending_allow = false;
                 allow_ops++;
-            } else {
-                // Fail-safe: stay disallowed on AllowGfxOff failure.
-                hw_disallowed = true;
-                pending_allow = false;
             }
         }
     }

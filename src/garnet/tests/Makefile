@@ -11,8 +11,10 @@ TESTS := $(BUILD)/ipdiscovery_test $(BUILD)/asic_rdna4_test $(BUILD)/fw_loader_t
   $(BUILD)/dcn_irq_contract_test $(BUILD)/dcn_txn_boundary_test
 TLB83_TEST := $(BUILD)/gfx_tlb83_test
 SCANOUT_FULL_TEST := $(BUILD)/scanout_full_test
+NATIVE_S2_DAL_TEST := $(BUILD)/native_s2_dal_test
 TESTS += $(TLB83_TEST)
 TESTS += $(SCANOUT_FULL_TEST)
+TESTS += $(NATIVE_S2_DAL_TEST)
 TESTS += $(BUILD)/smu_setup_test
 TESTS += $(BUILD)/init_gart_test
 TESTS += $(BUILD)/mes_resources_test
@@ -28,9 +30,12 @@ TESTS += $(BUILD)/garnet_power_policy_test
 TESTS += $(BUILD)/dcn41_fams2_test
 TESTS += $(BUILD)/dcn41_fams2_mall_test
 TESTS += $(BUILD)/dcn41_det_test
+TESTS += $(BUILD)/dcn41_atom_test
 TESTS += $(BUILD)/garnet_gfxoff_guard_test
+TESTS += $(BUILD)/sdma_doorbell_test
 TESTS += $(BUILD)/dcn41_dmub_boot_test
 TESTS += $(BUILD)/dcn41_dml21_test
+TESTS += $(BUILD)/dcn41_dml21_soc_test
 DML21_DIR := $(SRC)/dcn/dml21
 include $(DML21_DIR)/sources.mk
 DML21_OBJS := $(patsubst $(DML21_DIR)/src/%.c,$(BUILD)/dml21/%.o,$(DML21_C_SRCS))
@@ -42,7 +47,8 @@ TLB83_PINNED_SOURCES := $(TLB83_ARGS) $(addprefix $(SRC)/amd/,psp_v14_0.cpp smu_
 SCANOUT_FULL_ARGS := $(SRC)/dcn/garnet_sdma_fastcopy.cpp $(SRC)/dcn/dcn.cpp $(SRC)/GarnetUserClient.cpp
 
 all: $(TESTS) $(PRT_SPARSE_TEST)
-	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST) $(BUILD)/garnet_gfxoff_guard_test $(BUILD)/dcn41_dmub_boot_test,$(TESTS)); do "$$test"; done
+	@set -e; for test in $(filter-out $(TLB83_TEST) $(SCANOUT_FULL_TEST) $(NATIVE_S2_DAL_TEST) $(BUILD)/garnet_gfxoff_guard_test $(BUILD)/dcn41_dmub_boot_test,$(TESTS)); do "$$test"; done
+	$(NATIVE_S2_DAL_TEST) --behavior
 	$(BUILD)/dcn41_dmub_boot_test $(wildcard ../firmware/dcn_4_0_1_dmcub.bin)
 	$(BUILD)/garnet_gfxoff_guard_test "$(abspath ..)"
 	$(TLB83_TEST) $(TLB83_ARGS)
@@ -54,6 +60,9 @@ $(BUILD):
 
 $(BUILD)/ipdiscovery_test: ipdiscovery_test.cpp $(SRC)/ipdiscovery.cpp $(SRC)/ipdiscovery.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) ipdiscovery_test.cpp $(SRC)/ipdiscovery.cpp -o $@
+
+$(BUILD)/dcn41_atom_test: dcn41_atom_test.cpp $(SRC)/dcn/dcn41_atom_pure.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) dcn41_atom_test.cpp -o $@
 
 $(BUILD)/asic_rdna4_test: asic_rdna4_test.cpp $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/fw_table.cpp $(SRC)/amd/amdgpu_asic.h $(SRC)/fw/fw_table.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) asic_rdna4_test.cpp $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/fw_table.cpp -o $@
@@ -71,13 +80,17 @@ $(BUILD)/dml21/%.o: $(DML21_DIR)/src/%.c $(DML21_DIR)/sources.mk Makefile
 $(BUILD)/dml21-adapter.o: $(SRC)/dcn/dml21_adapter/dcn41_dml21_adapter.cpp $(DML21_DIR)/sources.mk Makefile | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(DML21_CPPFLAGS) $(DML21_FP_FLAGS) -Wno-missing-field-initializers -MMD -MP -c $< -o $@
 
-$(BUILD)/dcn41_dml21_test: dcn41_dml21_test.cpp dml21-oracle/fixture.h dml21-oracle/expected.h dml21-oracle/expected.inc $(SRC)/dcn/dcn41_dml21_bridge.cpp $(SRC)/dcn/dcn41_dml21_bridge.h $(SRC)/dcn/dml21_adapter/dcn41_dml21_adapter.h $(BUILD)/dml21-adapter.o $(DML21_OBJS) | $(BUILD)
+$(BUILD)/dcn41_dml21_test: dcn41_dml21_test.cpp dml21-oracle/fixture.h dml21-oracle/expected.h dml21-oracle/expected.inc $(SRC)/dcn/dcn41_dml21_bridge.cpp $(SRC)/dcn/dcn41_dml21_bridge.h $(SRC)/dcn/dcn41_fams2_dml_pure.h $(SRC)/dcn/dcn41_fams2_pure.h $(DML21_DIR)/port/dmub_cmd.h ../../dcn41/dcn41_dmub.h $(SRC)/dcn/dml21_adapter/dcn41_dml21_adapter.h $(BUILD)/dml21-adapter.o $(DML21_OBJS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@
+$(BUILD)/dcn41_dml21_test: $(SRC)/dcn/dcn41_det_pure.h ../../dcn41/dcn41_allow_ranges.h ../../dcn41/dcn41_regs.h
 
 -include $(DML21_OBJS:.o=.d) $(BUILD)/dml21-adapter.d
 
-$(BUILD)/dcn41_fams2_mall_test: dcn41_fams2_mall_test.cpp $(SRC)/dcn/dcn41_mall_pure.h $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/amdgpu_asic.h ../../dcn41/dcn41_dmub.h | $(BUILD)
-	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) dcn41_fams2_mall_test.cpp $(SRC)/amd/amdgpu_asic.cpp -o $@
+$(BUILD)/dcn41_dml21_soc_test: dcn41_dml21_soc_test.cpp dml21-oracle/fixture.h $(SRC)/dcn/dcn41_dml21_bridge.cpp $(SRC)/dcn/dcn41_dml21_bridge.h $(SRC)/dcn/dcn41_dml21_soc.cpp $(SRC)/dcn/dcn41_dml21_soc.h $(SRC)/dcn/dcn41_atom_pure.h $(SRC)/amd/smu_dal_pure.h $(SRC)/amd/amdgpu_asic.cpp $(SRC)/dcn/dcn41_mall_pure.h $(BUILD)/dml21-adapter.o $(DML21_OBJS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@
+
+$(BUILD)/dcn41_fams2_mall_test: dcn41_fams2_mall_test.cpp $(SRC)/dcn/dcn41_cursor_pure.h $(SRC)/dcn/dcn41_mall_pure.h $(SRC)/amd/amdgpu_asic.cpp $(SRC)/amd/amdgpu_asic.h $(addprefix ../../dcn41/,dcn41_dmub.h dcn41_dmub.c dcn41_regs.h dcn41_io.h dcn41_core.c dcn41_hubp.c dcn41_allow.c dcn41_allow.h) | $(BUILD)
+	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) dcn41_fams2_mall_test.cpp $(SRC)/amd/amdgpu_asic.cpp -x c++ ../../dcn41/dcn41_dmub.c ../../dcn41/dcn41_core.c ../../dcn41/dcn41_hubp.c ../../dcn41/dcn41_allow.c -o $@
 
 $(BUILD)/gfx_golden_test: gfx_golden_test.cpp $(SRC)/amd/gfx_v12_0.cpp $(SRC)/amd/amdgpu_asic.cpp $(wildcard $(SRC)/amd/*.h ../hosttest/shim/IOKit/*.h) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) gfx_golden_test.cpp $(SRC)/amd/amdgpu_asic.cpp -o $@
@@ -130,17 +143,20 @@ $(BUILD)/dcn41_det_test: dcn41_det_test.cpp $(SRC)/dcn/dcn41_det_pure.h ../../dc
 $(BUILD)/garnet_gfxoff_guard_test: garnet_gfxoff_guard_test.cpp $(SRC)/amd/garnet_gfxoff_pure.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) garnet_gfxoff_guard_test.cpp -o $@
 
+$(BUILD)/sdma_doorbell_test: sdma_doorbell_test.cpp $(SRC)/amd/sdma_v7_0.cpp $(SRC)/amd/amdgpu_sdma.h $(SRC)/amd/amdgpu_regs.h $(SRC)/amd/garnet_gfxoff_pure.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -ffunction-sections -fdata-sections $< $(SRC)/amd/sdma_v7_0.cpp -Xlinker $(if $(filter Darwin,$(shell uname -s)),-dead_strip,--gc-sections) -o $@
+
 $(BUILD)/dcn41_dmub_boot_test: dcn41_dmub_boot_test.cpp $(SRC)/dcn/dcn41_dmub_boot_pure.h $(SRC)/amd/amdgpu_ucode_extract.cpp $(SRC)/amd/amdgpu_ucode_extract.h $(SRC)/amd/amdgpu_ucode_psp.h ../../dcn41/dcn41_dmub.h ../../dcn41/dcn41_dmub.c ../../dcn41/dcn41_core.c ../../dcn41/dcn41_allow_ranges.h ../../dcn41/dcn41_regs.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) -I../../dcn41 $(CXXFLAGS) dcn41_dmub_boot_test.cpp $(SRC)/amd/amdgpu_ucode_extract.cpp -x c++ ../../dcn41/dcn41_dmub.c ../../dcn41/dcn41_core.c -o $@
 
 $(BUILD)/primary_fb_test: primary_fb_test.cpp $(SRC)/dcn/primary_fb_pure.h $(SRC)/dcn/edid_modes_pure.h $(SRC)/dcn/display_state_pure.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) primary_fb_test.cpp -o $@
 
-$(BUILD)/primary_vbl_actual.inc: test-primary-vbl-production.py $(SRC)/GarnetPrimaryFramebuffer.cpp | $(BUILD)
-	python3 test-primary-vbl-production.py $(SRC)/GarnetPrimaryFramebuffer.cpp $@
+$(BUILD)/primary_vbl_actual.inc: test-primary-vbl-production.py $(SRC)/GarnetPrimaryFramebuffer.cpp $(SRC)/GarnetDriver.cpp | $(BUILD)
+	python3 test-primary-vbl-production.py $(SRC)/GarnetPrimaryFramebuffer.cpp $(SRC)/GarnetDriver.cpp $@
 
 $(BUILD)/primary_vbl_test: primary_vbl_test.cpp $(BUILD)/primary_vbl_actual.inc | $(BUILD)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD) primary_vbl_test.cpp -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread -I$(BUILD) primary_vbl_test.cpp -o $@
 
 DCN_IRQ_INC := $(BUILD)/dcn_irq_actual.inc
 $(DCN_IRQ_INC): $(SRC)/dcn/dcn.cpp | $(BUILD)
@@ -178,6 +194,11 @@ $(SCANOUT_FULL_TEST): scanout_full_test.cpp $(SRC)/dcn/scanout_full.h $(SRC)/dcn
 
 gfx-golden: $(BUILD)/gfx_golden_test
 	$<
+
+NATIVE_S2_DAL_SRCS := native_s2_dal_test.cpp $(SRC)/amd/smu_dal.cpp $(SRC)/amd/smu_v14_0.cpp
+$(NATIVE_S2_DAL_TEST): $(NATIVE_S2_DAL_SRCS) garnet_version_check.h $(SRC)/GarnetNativeABI.h \
+  $(SRC)/dcn/dcn.hpp $(wildcard $(SRC)/amd/*.h dalshim/*/*.h) Makefile | $(BUILD)
+	$(CXX) -Idalshim $(CPPFLAGS) $(CXXFLAGS) -pthread $(NATIVE_S2_DAL_SRCS) -o $@
 
 $(BUILD)/smu_setup_actual.inc: test-smu-setup-production.py $(SRC)/amd/smu_v14_0.cpp | $(BUILD)
 	python3 $< "$@" "$(SRC)/amd/smu_v14_0.cpp"

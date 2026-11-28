@@ -133,7 +133,8 @@ struct BringupContext {
     bool kgqMapped { false };        // PM4Test: MES acked ADD_QUEUE(map_legacy_kq) for the kernel GFX ring
     bool cpRingTestPassed { false }; // PM4Test: gfx_v12_0_ring_test_ring (SET_UCONFIG_REG SCRATCH_REG0) landed
     bool idleClamp { false };        // garnet-idle-clamp=1 to clamp GFXCLK to 200 MHz Low (default OFF: Auto)
-    bool gfxOffAllowed { false };    // Stage 3C: opt-in garnet-gfxoff=1 enabled AllowGfxOff
+    bool gfxOffAllowed { false };    // Stage 3C: opt-in permits the guarded idle transition
+    bool gfxOffSleepObserved { false };
     bool wantKcq { false };
     // rdna4-hsa-abi=1: dispatch the LLVM-compiled kernel (shaders/store_magic_hsa.s)
     // with the standard HSA kernarg convention instead of the hand-written shader.
@@ -157,6 +158,6 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s);
 //
 // It deliberately does NOT reset the GPU or tear the PSP down: the console
 // framebuffer is still scanning out of VRAM the whole time.
-void bringup_teardown(BringupContext &ctx);
+kern_return_t bringup_teardown(BringupContext &ctx);
 
 } // namespace amdgpu

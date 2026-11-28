@@ -6,6 +6,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 
 #include "dcn/dcn41_cursor_pure.h"
 #include "dcn/dcn41_ddc_pad_pure.h"
@@ -21,6 +22,9 @@ class GarnetDriver;
 
 void garnet_primary_fb_notify_driver_ready(GarnetDriver *driver);
 void garnet_primary_fb_notify_wake(GarnetDriver *driver);
+void garnet_primary_fb_block_system_transitions(bool shutdown);
+void garnet_primary_fb_resume_system_transitions();
+void garnet_primary_fb_drain_system_transitions();
 void garnet_primary_fb_notify_vbl(uint32_t otg);
 IOMemoryDescriptor *rdna4_scanout_descriptor(bool viaFramebuffer);
 
@@ -84,10 +88,12 @@ public:
 
 	void onDriverReady(GarnetDriver *driver);
 	void onSystemWake(GarnetDriver *driver);
+	void drainSystemTransitions();
 	void onHardwareVbl(uint32_t otg);
 
 private:
 	void initForPM();
+	void registerPeerLocked(GarnetDriver *driver);
 	void readProviderEdid(IOService *provider);
 	bool readLiveHardwareEdid(IOPCIDevice *pci, GarnetDriver *driver);
 	void queryClockCaps(IOPCIDevice *pci, GarnetDriver *driver);
@@ -95,12 +101,17 @@ private:
 	bool applyHardwareModeLocked(const rdna4edidmodes::DetailedTiming &target,
 	                             bool forceRetrain = false,
 	                             GarnetDriver *knownDriver = nullptr);
-	bool applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver = nullptr);
+	bool applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver = nullptr, bool systemWake = false);
 	void updateUclkPolicyLocked(GarnetDriver *driver, const rdna4det::Hw &detHw,
 	                            uint32_t hActive, uint32_t hTotal,
 	                            uint32_t vActive, uint32_t vTotal,
 	                            uint64_t pixelClockHz, bool dscEnabled);
 	void optimizeDet0AndUclkLocked(GarnetDriver *driver);
+	uint64_t acquireUclkWatchLeaseLocked(GarnetDriver *driver);
+	bool pinUclkForModesetLocked(GarnetDriver *driver, bool systemWake = false);
+	void scheduleUclkWatchdogLocked();
+	void teardownUclkWatchdog();
+	static void onUclkWatchdog(thread_call_param_t owner, thread_call_param_t generation);
 	bool captureConsoleAndBar0(IOPCIDevice *pci);
 	bool ensureVblTimer();
 	void teardownVblTimer();
@@ -146,7 +157,12 @@ private:
 	bool fDet0Allowed { true };
 	bool fUclkForcePin { false };
 	bool fDet0Expanded { false };
-	bool fUclkUnpinned { false };
+	enum class UclkFloor { Unmanaged, Pinned, MayBeLowered };
+	UclkFloor fUclkFloor { UclkFloor::Unmanaged };
+	bool fUclkUnpinTripped { false };
+	thread_call_t fUclkWatchdog { nullptr };
+	uintptr_t fUclkWatchGeneration { 0u };
+	uint8_t fUclkRecoveryAttempts { 0u };
 	bool fPmRegistered { false };
 	bool fPeerRegistered { false };
 	uint64_t fPeerGeneration { 0u };

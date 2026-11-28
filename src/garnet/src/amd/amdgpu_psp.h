@@ -155,6 +155,8 @@ struct PSPContext {
     uint32_t  bootCfgBitmask;    // BOOT_CFG_FEATURE_* flags
     uint32_t  scpmStatus;        // 0=disabled, 1=enabled, 2=enabled+err
     bool      scpmEnabled;
+    uint64_t  fwReserveExtVramOffset;
+    uint32_t  fwReserveExtSize;
 
     // ---- PSP GPCOM command ring (km_ring), VRAM-backed ------------------
     uint64_t  ringVRAMOffset;    // absolute VRAM byte offset

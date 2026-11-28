@@ -107,36 +107,25 @@ void test_ddc_pad_modes_all_lines() {
 void test_sleep_state_machine() {
 	rdna4sleep::State st;
 
-	// Normal sleep -> abort -> resume.
-	auto a1 = st.on_message(rdna4sleep::Message::WillSleep, true, 0u);
-	check(st.phase == rdna4sleep::Phase::Sleeping && st.vramMark == rdna4sleep::kVramSentinel,
-	      "WillSleep enters Sleeping with sentinel mark");
-	check(a1.logPci && a1.writeVramMark && a1.quiesceEngines && !a1.recoverDisplayPads,
+	auto a1 = st.on_message(rdna4sleep::Message::WillSleep);
+	check(st.phase == rdna4sleep::Phase::Sleeping && st.sleepCount == 1u,
+	      "WillSleep enters Sleeping");
+	check(a1.logPci && a1.quiesceEngines && !a1.recoverDisplayPads,
 	      "WillSleep actions");
-	auto aAbort = st.on_message(rdna4sleep::Message::WillNotSleep, false, 0u);
-	check(st.phase == rdna4sleep::Phase::Awake && st.vramMark == 0u && st.abortedSleepCount == 1u,
+	auto aAbort = st.on_message(rdna4sleep::Message::WillNotSleep);
+	check(st.phase == rdna4sleep::Phase::Awake && st.abortedSleepCount == 1u,
 	      "WillNotSleep returns to Awake");
 	check(aAbort.resumeEngines && !aAbort.recoverDisplayPads, "WillNotSleep resumes without wake recovery");
 
-	// Full S3 sleep -> wake with VRAM retained.
-	(void)st.on_message(rdna4sleep::Message::WillSleep, true, 0u);
-	auto aWillPow = st.on_message(rdna4sleep::Message::WillPowerOn, false, 0u);
+	(void)st.on_message(rdna4sleep::Message::WillSleep);
+	auto aWillPow = st.on_message(rdna4sleep::Message::WillPowerOn);
 	check(st.phase == rdna4sleep::Phase::Waking && st.coldWakePending && aWillPow.logPci,
 	      "WillPowerOn arms coldWakePending");
-	auto aHasPow = st.on_message(rdna4sleep::Message::HasPoweredOn, false, rdna4sleep::kVramSentinel);
+	auto aHasPow = st.on_message(rdna4sleep::Message::HasPoweredOn);
 	check(st.phase == rdna4sleep::Phase::Awake && !st.coldWakePending && st.wakeCount == 1u,
 	      "HasPoweredOn restores Awake");
-	check(aHasPow.logPci && aHasPow.checkVramMark && aHasPow.resumeEngines && aHasPow.recoverDisplayPads,
-	      "HasPoweredOn requests pad recovery and VRAM verification");
-	check(st.vramRetainedCount == 1u && st.vramLostCount == 0u && st.vramMark == 0u,
-	      "VRAM retained recorded and mark cleared");
-
-	// Full S3 sleep -> wake with VRAM lost.
-	(void)st.on_message(rdna4sleep::Message::WillSleep, true, 0u);
-	(void)st.on_message(rdna4sleep::Message::WillPowerOn, false, 0u);
-	auto aLost = st.on_message(rdna4sleep::Message::HasPoweredOn, false, 0xffffffffu);
-	check(aLost.checkVramMark && st.vramLostCount == 1u && st.vramRetainedCount == 1u,
-	      "VRAM loss detected cleanly");
+	check(aHasPow.logPci && aHasPow.resumeEngines && aHasPow.recoverDisplayPads,
+	      "HasPoweredOn requests pad recovery");
 }
 
 } // namespace

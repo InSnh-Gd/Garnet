@@ -6,6 +6,7 @@
 #include "GarnetDriver.hpp"
 #include "GarnetDriverInternal.hpp"
 #include "amd/amdgpu_asic.h"
+#include "amd/amdgpu_init.h"
 #include "amd/amdgpu_smu.h"
 #include "amd/garnet_power_policy_pure.h"
 #include "amd/native_disp.h"
@@ -44,6 +45,12 @@ namespace {
 
 IOLock *gPrimaryFbLock = nullptr;
 AMDGarnetPrimaryFramebuffer *gPrimaryFbInstance = nullptr;
+bool gSystemDisplayTransitionsBlocked = false;
+bool gSystemDisplayShutdown = false;
+
+bool system_display_transitions_blocked() {
+	return __atomic_load_n(&gSystemDisplayTransitionsBlocked, __ATOMIC_ACQUIRE);
+}
 
 IOLock *primary_fb_lock() {
 	IOLock *lk = __atomic_load_n(&gPrimaryFbLock, __ATOMIC_ACQUIRE);
@@ -131,6 +138,22 @@ void garnet_primary_fb_notify_wake(GarnetDriver *driver) {
 	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
 	if (!fb) return;
 	fb->onSystemWake(driver);
+	fb->release();
+}
+
+void garnet_primary_fb_block_system_transitions(bool shutdown) {
+	if (shutdown) gSystemDisplayShutdown = true;
+	__atomic_store_n(&gSystemDisplayTransitionsBlocked, true, __ATOMIC_RELEASE);
+}
+
+void garnet_primary_fb_resume_system_transitions() {
+	if (!gSystemDisplayShutdown) __atomic_store_n(&gSystemDisplayTransitionsBlocked, false, __ATOMIC_RELEASE);
+}
+
+void garnet_primary_fb_drain_system_transitions() {
+	AMDGarnetPrimaryFramebuffer *fb = retain_primary_fb();
+	if (!fb) return;
+	fb->drainSystemTransitions();
 	fb->release();
 }
 
@@ -798,13 +821,7 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareModeLocked(const rdna4edidmodes::
 	hw.delayUs = aux_delay_us;
 	hw.auxIo = rdna4aux::Io { &ctx->mmio, aux_mmio_read, aux_mmio_write, aux_now_us, aux_delay_us };
 
-	// Temporarily pin UCLK across modeset transitions so DP/OTG resync never races a GDDR6 P-state switch.
-	amdgpu::DeviceContext *smuDev = driver->deviceContext();
-	if (fUclkUnpinned && smuDev && smuDev->smuOnline) {
-		if (amdgpu::smu_pin_uclk_top(*smuDev) == kIOReturnSuccess) {
-			fUclkUnpinned = false;
-		}
-	}
+	++fUclkWatchGeneration;
 
 	const rdna4modeset::ApplyResult r = rdna4modeset::applyMode(
 	    hw, fActiveOutput, fDpcdCaps, target, fMaxDispClkKhz, fMaxDppClkKhz,
@@ -863,8 +880,8 @@ bool AMDGarnetPrimaryFramebuffer::applyHardwareModeLocked(const rdna4edidmodes::
 }
 
 __attribute__((noinline))
-bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver) {
-	if (!fDpmsAllowed || fStopping || !fPci ||
+bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *knownDriver, bool systemWake) {
+	if (!fDpmsAllowed || fStopping || system_display_transitions_blocked() || !fPci ||
 	    !fActiveOutput.found || !fActiveOutput.isDp || !fActiveOutput.auxValid) {
 		return false;
 	}
@@ -973,6 +990,10 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 	}
 
 	// DPMS ON: restore AUX pads -> DPCD D0 -> forced link/DSC retrain -> restore cursor & VBL.
+	if (!pinUclkForModesetLocked(driver, systemWake)) {
+		if (ownDriver) driver->release();
+		return false;
+	}
 	auto *ctx = static_cast<ModesetCtx *>(IOMalloc(sizeof(ModesetCtx)));
 	if (ctx) {
 		bzero(ctx, sizeof(*ctx));
@@ -1018,51 +1039,181 @@ bool AMDGarnetPrimaryFramebuffer::applyDpmsLocked(bool wantOn, GarnetDriver *kno
 	return woke;
 }
 
+namespace {
+struct UclkDisplayLease {
+	GarnetDriver *driver;
+	uint64_t token;
+	~UclkDisplayLease() { if (token) driver->displayGateEnd(token); }
+};
+
+amdgpu::DeviceContext *awakeUclkDevice(GarnetDriver *driver, const amdgpu::SmuSeq &smu) {
+	if (!smu.held || !driver) return nullptr;
+	auto *dev = driver->deviceContext();
+	const auto *bringup = driver->bringupContext();
+	return dev && dev->smuOnline && bringup && bringup->dev == dev &&
+	       bringup->gfxOffSleepObserved && !bringup->smu.sleepPending &&
+	       !bringup->smu.wakeUnverified && !dev->graphicsPowerQuarantined() &&
+	       !amdgpu::smu_display_wake_pin_allowed(bringup->smu) ? dev : nullptr;
+}
+
+constexpr uint8_t kUclkRecoveryLimit = 3u;
+}
+
+uint64_t AMDGarnetPrimaryFramebuffer::acquireUclkWatchLeaseLocked(GarnetDriver *driver) {
+	uint64_t token = 0u;
+	const auto entry = getRegistryEntryID();
+	if (!fPeerGeneration || !driver || !driver->displayGateBegin(rdna4peer::kLeaseLocalDisplay, entry, &token))
+		return 0u;
+	rdna4peer::PrimaryView primary {};
+	if (driver->queryPrimaryFramebuffer(nullptr, &primary) && primary.fbEntryID == entry &&
+	    primary.generation == fPeerGeneration) return token;
+	driver->displayGateEnd(token);
+	return 0u;
+}
+
+bool AMDGarnetPrimaryFramebuffer::pinUclkForModesetLocked(GarnetDriver *driver, bool systemWake) {
+	if (fUclkFloor == UclkFloor::Unmanaged && !fUclkForcePin) return true;
+	const UclkDisplayLease lease { driver, acquireUclkWatchLeaseLocked(driver) };
+	if (!lease.token) return false;
+	amdgpu::SmuSeq smu;
+	auto *dev = driver->deviceContext();
+	auto *bringup = driver->bringupContext();
+	if (!smu.held || !dev || !dev->smuOnline || !bringup || bringup->dev != dev || !bringup->gfxOffSleepObserved)
+		return false;
+	if (amdgpu::smu_display_wake_pin_allowed(bringup->smu)) {
+		if (!bringup->smuVersion || !driver->displayWakePciReady() ||
+		    amdgpu::smu_repin_uclk_after_wake(*dev, bringup->smu, bringup->smuVersion) != kIOReturnSuccess)
+			return false;
+	} else {
+		if (systemWake || !awakeUclkDevice(driver, smu)) return false;
+		if (fUclkFloor != UclkFloor::Pinned && amdgpu::smu_pin_uclk_top(*dev) != kIOReturnSuccess) return false;
+	}
+	fUclkFloor = UclkFloor::Pinned;
+	return true;
+}
+
+void AMDGarnetPrimaryFramebuffer::scheduleUclkWatchdogLocked() {
+	uint64_t interval = 0, deadline = 0;
+	nanoseconds_to_absolutetime(50000000u, &interval);
+	clock_absolutetime_interval_to_deadline(interval, &deadline);
+	(void)thread_call_enter1_delayed(fUclkWatchdog, reinterpret_cast<void *>(fUclkWatchGeneration), deadline);
+}
+
+void AMDGarnetPrimaryFramebuffer::onUclkWatchdog(thread_call_param_t owner, thread_call_param_t generation) {
+	auto *self = static_cast<AMDGarnetPrimaryFramebuffer *>(owner);
+	IOLockLock(self->fDpmsLock);
+	if (!__atomic_load_n(&self->fStopping, __ATOMIC_ACQUIRE) &&
+	    reinterpret_cast<uintptr_t>(generation) == self->fUclkWatchGeneration &&
+	    self->fUclkFloor == UclkFloor::MayBeLowered && self->fUclkRecoveryAttempts < kUclkRecoveryLimit &&
+	    !__atomic_load_n(&self->fDpmsOff, __ATOMIC_ACQUIRE)) {
+		if (system_display_transitions_blocked()) {
+			self->scheduleUclkWatchdogLocked();
+			IOLockUnlock(self->fDpmsLock);
+			return;
+		}
+		GarnetDriver *driver = retain_driver();
+		bool active = false;
+		{
+			const UclkDisplayLease lease { driver, self->acquireUclkWatchLeaseLocked(driver) };
+			if (lease.token) {
+				amdgpu::SmuSeq smu;
+				auto *dev = awakeUclkDevice(driver, smu);
+				active = dev != nullptr;
+				const auto *bringup = driver->bringupContext();
+				if (smu.held && bringup && bringup->dev == driver->deviceContext() &&
+				    bringup->smu.sleepPending && !bringup->smu.wakeUnverified) active = true;
+				uint32_t optcReg = UINT32_MAX;
+				if (dev && !self->fUclkUnpinTripped) {
+					MmioAccess mmio {};
+					const bool mapped = acquire_mmio(self->fPci, driver, &mmio);
+					const rdna4det::Hw hw { &mmio, cursor_rd_seg2, nullptr, nullptr };
+					self->fUclkUnpinTripped = !mapped || rdna4det::probe_optc0_underflow(hw, 0u, &optcReg);
+					release_mmio(mmio);
+				}
+				if (dev && self->fUclkUnpinTripped) {
+					++self->fUclkRecoveryAttempts;
+					if (amdgpu::smu_pin_uclk_top(*dev) == kIOReturnSuccess) self->fUclkFloor = UclkFloor::Pinned;
+					RDNA4LOG("primaryfb: UCLK watchdog tripped (OPTC0=0x%08x, attempt=%u, floor confirmed=%u)",
+					         optcReg, self->fUclkRecoveryAttempts, self->fUclkFloor == UclkFloor::Pinned ? 1u : 0u);
+				}
+			} else if (driver) {
+				rdna4peer::Snapshot snapshot {};
+				active = driver->snapshotDisplayState(&snapshot) && snapshot.generation == self->fPeerGeneration;
+				if (active) self->fUclkUnpinTripped = true;
+			}
+		}
+		if (driver) driver->release();
+		if (active && self->fUclkFloor == UclkFloor::MayBeLowered && self->fUclkRecoveryAttempts < kUclkRecoveryLimit)
+			self->scheduleUclkWatchdogLocked();
+	}
+	IOLockUnlock(self->fDpmsLock);
+}
+
+void AMDGarnetPrimaryFramebuffer::teardownUclkWatchdog() {
+	if (!fUclkWatchdog) return;
+	do {
+		thread_call_cancel_wait(fUclkWatchdog);
+	} while (thread_call_isactive(fUclkWatchdog));
+	thread_call_free(fUclkWatchdog);
+	fUclkWatchdog = nullptr;
+}
+
 __attribute__((noinline))
 void AMDGarnetPrimaryFramebuffer::updateUclkPolicyLocked(GarnetDriver *driver,
                                                          const rdna4det::Hw &detHw,
                                                          uint32_t hActive, uint32_t hTotal,
                                                          uint32_t vActive, uint32_t vTotal,
                                                          uint64_t pixelClockHz, bool dscEnabled) {
-	amdgpu::DeviceContext *smuDev = driver ? driver->deviceContext() : nullptr;
-	if (!smuDev || !smuDev->smuOnline) return;
+	if (!fDpmsLock || __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) return;
+	const UclkDisplayLease lease { driver, acquireUclkWatchLeaseLocked(driver) };
+	if (!lease.token) return;
+	amdgpu::SmuSeq smu;
+	auto *smuDev = awakeUclkDevice(driver, smu);
+	if (!smuDev) return;
 
 	const uint32_t detBufUs =
 	    rdna4pwr::det0_buffer_us(rdna4pwr::kDet0ExpandedBytes, hActive, hTotal, pixelClockHz);
 	const uint32_t vbUs = rdna4pwr::vblank_us(vActive, vTotal, hTotal, pixelClockHz);
-	const bool safe =
+	const bool safe = !fUclkUnpinTripped && fActiveOutput.found && fActiveOutput.otg == 0u &&
 	    rdna4pwr::uclk_unpin_safe_for_mode(fUclkForcePin, fDet0Expanded, dscEnabled, detBufUs, vbUs);
-
-	if (!safe) {
-		uint32_t topMhz = 0u;
-		if (amdgpu::smu_pin_uclk_top(*smuDev, &topMhz) == kIOReturnSuccess) {
-			fUclkUnpinned = false;
-			RDNA4LOG("primaryfb: UCLK pinned at %u MHz for %ux%u (dsc=%u, detBuf=%u us, vblank=%u us, det0=%u, forcePin=%u)",
-			         topMhz, hActive, vActive, dscEnabled ? 1u : 0u, detBufUs, vbUs,
-			         fDet0Expanded ? 1u : 0u, fUclkForcePin ? 1u : 0u);
+	if (fUclkFloor != UclkFloor::Pinned) {
+		if (amdgpu::smu_pin_uclk_top(*smuDev) != kIOReturnSuccess) {
+			fUclkUnpinTripped = true;
+			RDNA4LOG("primaryfb: UCLK floor not confirmed; dynamic UCLK disabled");
+			return;
 		}
-		return;
+		fUclkFloor = UclkFloor::Pinned;
 	}
-
-	if (!fUclkUnpinned && amdgpu::smu_set_uclk_hard_min(*smuDev, 0u) == kIOReturnSuccess) {
-		uint32_t optcReg = 0u;
-		if (rdna4det::probe_optc0_underflow(detHw, 250000u, &optcReg)) {
-			uint32_t topMhz = 0u;
-			(void)amdgpu::smu_pin_uclk_top(*smuDev, &topMhz);
-			fUclkUnpinned = false;
-			RDNA4LOG("primaryfb: UCLK unpin underflowed OPTC0 (0x%08x); auto-repinned UCLK to %u MHz",
-			         optcReg, topMhz);
-		} else {
-			fUclkUnpinned = true;
-			RDNA4LOG("primaryfb: UCLK unpinned cleanly with 576 KiB DET0 (%ux%u, detBuf=%u us, vblank=%u us, 0 OPTC0 underflows over 250 ms)",
-			         hActive, vActive, detBufUs, vbUs);
+	++fUclkWatchGeneration;
+	if (safe) {
+		if (!fUclkWatchdog)
+			fUclkWatchdog = thread_call_allocate_with_priority(onUclkWatchdog, this, THREAD_CALL_PRIORITY_KERNEL);
+		if (!fUclkWatchdog || __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) return;
+		fUclkRecoveryAttempts = 0u;
+		uint32_t optcReg = UINT32_MAX;
+		if (rdna4det::clear_optc0_underflow_before_unpin(detHw)) {
+			fUclkFloor = UclkFloor::MayBeLowered;
+			const auto unpin = amdgpu::smu_set_uclk_hard_min(*smuDev, 0u);
+			const bool underflow = rdna4det::probe_optc0_underflow(detHw, unpin == kIOReturnSuccess ? 250000u : 0u, &optcReg);
+			if (unpin == kIOReturnSuccess && !underflow) {
+				scheduleUclkWatchdogLocked();
+				RDNA4LOG("primaryfb: UCLK unpinned cleanly with 576 KiB DET0 (%ux%u, detBuf=%u us, vblank=%u us, 0 OPTC0 underflows over 250 ms)",
+				         hActive, vActive, detBufUs, vbUs);
+				return;
+			}
+			++fUclkRecoveryAttempts;
+			if (amdgpu::smu_pin_uclk_top(*smuDev) == kIOReturnSuccess) fUclkFloor = UclkFloor::Pinned;
 		}
+		fUclkUnpinTripped = true;
+		if (fUclkFloor == UclkFloor::MayBeLowered) scheduleUclkWatchdogLocked();
+		RDNA4LOG("primaryfb: UCLK guard tripped (OPTC0=0x%08x, floor confirmed=%u); dynamic UCLK disabled",
+		         optcReg, fUclkFloor == UclkFloor::Pinned ? 1u : 0u);
 	}
 }
 
 __attribute__((noinline))
 void AMDGarnetPrimaryFramebuffer::optimizeDet0AndUclkLocked(GarnetDriver *driver) {
-	if (!driver || !fPci || fStopping) return;
+	if (!driver || !fPci || fStopping || system_display_transitions_blocked()) return;
 	MmioAccess mmio {};
 	if (!acquire_mmio(fPci, driver, &mmio)) return;
 	const rdna4det::Hw detHw { &mmio, cursor_rd_seg2, cursor_wr_seg2, aux_delay_us };
@@ -1119,6 +1270,7 @@ void AMDGarnetPrimaryFramebuffer::readProviderEdid(IOService *provider) {
 }
 
 void AMDGarnetPrimaryFramebuffer::free() {
+	teardownUclkWatchdog();
 	teardownVblTimer();
 	teardownCursorSlot();
 	if (fVblLock) {
@@ -1191,7 +1343,8 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 		}
 	}
 	fDet0Expanded = false;
-	fUclkUnpinned = false;
+	fUclkFloor = UclkFloor::Unmanaged;
+	fUclkUnpinTripped = false;
 	{
 		uint32_t detArg = 1u;
 		const bool detPresent = PE_parse_boot_argn("garnet-det0", &detArg, sizeof(detArg));
@@ -1275,9 +1428,9 @@ bool AMDGarnetPrimaryFramebuffer::start(IOService *provider) {
 }
 
 void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
-	if (!driver || fStopping) return;
-	if (fDpmsLock) IOLockLock(fDpmsLock);
-	if (!fStopping) {
+	if (!driver || !fDpmsLock) return;
+	IOLockLock(fDpmsLock);
+	if (!fStopping && !system_display_transitions_blocked()) {
 		if (fEdidLen < rdna4edidmodes::BlockSize && fPci && readLiveHardwareEdid(fPci, driver)) {
 			if (OSData *edidProp = OSData::withBytes(fEdid, static_cast<unsigned int>(fEdidLen))) {
 				setProperty("DDC,EDID", edidProp);
@@ -1292,7 +1445,7 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 		if (!fCursorHwAvailable) {
 			initCursorSlot(driver);
 		}
-		optimizeDet0AndUclkLocked(driver);
+		if (fPeerRegistered) optimizeDet0AndUclkLocked(driver);
 		syncHardwareVbl(true);
 		if (fVblLock) {
 			IOLockLock(fVblLock);
@@ -1302,12 +1455,12 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 				fVblTimer->setTimeoutUS(vblInitialTimeoutUs());
 			}
 		}
+		if (!fPeerRegistered) registerPeerLocked(driver);
 	}
-	if (fDpmsLock) IOLockUnlock(fDpmsLock);
-	if (fStopping) return;
-	// Never call IOFramebuffer::handleEvent(kIOFBNotifyDisplayModeDidChange, nullptr) from GarnetDriver's
-	// thread: handleEvent() is only defined for power-state notifications under IOFramebuffer's own lock.
-	if (fPeerRegistered) return;
+	IOLockUnlock(fDpmsLock);
+}
+
+void AMDGarnetPrimaryFramebuffer::registerPeerLocked(GarnetDriver *driver) {
 	rdna4peer::Snapshot snap {};
 	if (!driver->snapshotDisplayState(&snap)) return;
 	if (!rdna4fbprimary::primaryMatchesSnapshot(fBar0Phys, fBar0Size, fConsolePhys, fConsoleLen, snap)) {
@@ -1329,15 +1482,16 @@ void AMDGarnetPrimaryFramebuffer::onDriverReady(GarnetDriver *driver) {
 	if (rc == rdna4peer::kOk) {
 		fPeerRegistered = true;
 		fPeerGeneration = stored.generation;
+		optimizeDet0AndUclkLocked(driver);
 		RDNA4LOG("primaryfb: registered canonical peer (gen=%llu, entry=%#llx)",
-		         static_cast<unsigned long long>(fPeerGeneration),
+		         static_cast<unsigned long long>(stored.generation),
 		         static_cast<unsigned long long>(candidate.fbEntryID));
 	}
 }
 
 void AMDGarnetPrimaryFramebuffer::stop(IOService *provider) {
 	if (fVblLock) IOLockLock(fVblLock);
-	fStopping = true;
+	__atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
 	fVblEnabled = false;
 	__atomic_store_n(&fVblHwArmed, false, __ATOMIC_RELEASE);
 	fVblProc = nullptr;
@@ -1351,6 +1505,7 @@ void AMDGarnetPrimaryFramebuffer::stop(IOService *provider) {
 		IOLockLock(fDpmsLock);
 		IOLockUnlock(fDpmsLock);
 	}
+	teardownUclkWatchdog();
 	teardownVblTimer();
 
 	{
@@ -1751,13 +1906,26 @@ IOReturn AMDGarnetPrimaryFramebuffer::setDisplayMode(IODisplayModeID displayMode
 		rdna4disp_on_mode_change();
 		return kIOReturnSuccess;
 	}
+	if (system_display_transitions_blocked()) {
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		return kIOReturnNotReady;
+	}
 	RDNA4LOG("primaryfb: setDisplayMode request id=%d -> %d (%ux%u@%u.%03uHz pclk=%lluHz)",
 	         static_cast<int>(fCurrentMode), static_cast<int>(displayMode),
 	         target.width, target.height,
 	         target.refreshMilliHz() / 1000u, target.refreshMilliHz() % 1000u,
 	         static_cast<unsigned long long>(target.pixelClockHz));
+	GarnetDriver *driver = retain_driver();
+	if (!driver || !pinUclkForModesetLocked(driver)) {
+		RDNA4LOG("primaryfb: modeset refused: UCLK floor not confirmed");
+		if (driver) driver->release();
+		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+		return kIOReturnError;
+	}
 	syncHardwareVbl(false);
-	if (!applyHardwareModeLocked(target)) {
+	const bool applied = applyHardwareModeLocked(target, /*forceRetrain=*/false, driver);
+	driver->release();
+	if (!applied) {
 		syncHardwareVbl(true);
 		if (fDpmsLock) IOLockUnlock(fDpmsLock);
 		return kIOReturnError;
@@ -2267,20 +2435,34 @@ IOReturn AMDGarnetPrimaryFramebuffer::setCursorState(SInt32 x, SInt32 y, bool vi
 	return ok ? kIOReturnSuccess : kIOReturnError;
 }
 
+void AMDGarnetPrimaryFramebuffer::drainSystemTransitions() {
+	if (!fDpmsLock) return;
+	IOLockLock(fDpmsLock);
+	IOLockUnlock(fDpmsLock);
+}
+
 void AMDGarnetPrimaryFramebuffer::onSystemWake(GarnetDriver *driver) {
-	if (fStopping) return;
-	if (fDpmsLock) IOLockLock(fDpmsLock);
-	if (fStopping) {
-		if (fDpmsLock) IOLockUnlock(fDpmsLock);
+	if (!fDpmsLock) return;
+	IOLockLock(fDpmsLock);
+	if (fStopping || system_display_transitions_blocked()) {
+		IOLockUnlock(fDpmsLock);
 		return;
 	}
 	// S3 resume may reset DCHUBBUB_DET0_CTRL back to UEFI's 192 KiB default; re-verify DET0 & UCLK.
 	fDet0Expanded = false;
-	fUclkUnpinned = false;
+	++fUclkWatchGeneration;
+	if (fUclkFloor == UclkFloor::Pinned) fUclkFloor = UclkFloor::MayBeLowered;
 	if (__atomic_load_n(&fDpmsOff, __ATOMIC_ACQUIRE) &&
 	    rdna4dpms::should_be_on(fPowerState, fConnPower)) {
-		(void)applyDpmsLocked(true, driver);
+		if (!applyDpmsLocked(true, driver, /*systemWake=*/true)) {
+			if (fDpmsLock) IOLockUnlock(fDpmsLock);
+			return;
+		}
 	} else {
+		if (!pinUclkForModesetLocked(driver, /*systemWake=*/true)) {
+			if (fDpmsLock) IOLockUnlock(fDpmsLock);
+			return;
+		}
 		if (fPci && fActiveOutput.found && fActiveOutput.isDp && fActiveOutput.auxValid &&
 		    fActiveOutput.aux < rdna4ddcpad::kMaxDdcLines) {
 			MmioAccess mmio {};

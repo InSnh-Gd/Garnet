@@ -30,8 +30,10 @@ void scan_read_geom(ScanGeom *g) {
 	const uint32_t ctl   = dcn_rreg(&gDcn, hubp_reg(kOffSurfControl,  0u));
 	g->w = dim & 0xFFFFu; g->h = (dim >> 16) & 0xFFFFu;
 	g->pitchPx = (pitch & 0xFFFFu) + 1u;        /* hubp401 writes surface_pitch - 1 */
-	g->fmt = cfg & 0x7Fu; g->sw = tile & 0x1Fu;
-	g->dcc = (ctl & 0x2u) != 0u;                /* HUBPREQ0_DCSURF_SURFACE_CONTROL.PRIMARY_SURFACE_DCC_EN */
+	g->fmt = cfg & 0x7Fu;
+	g->sw = tile == UINT32_MAX ? UINT32_MAX : tile & DCN41_HUBP_DCSURF_TILING_CONFIG__SW_MODE_MASK;
+	g->dcc = (ctl & (DCN41_HUBPREQ_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_DCC_EN_MASK |
+	                 DCN41_HUBPREQ_DCSURF_SURFACE_CONTROL__SECONDARY_SURFACE_DCC_EN_MASK)) != 0u;
 }
 
 // The four fields that make the restore exact (rdna4scan::restore_exact). Acquire only.
@@ -106,7 +108,9 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 		// Another thread is restoring: wait for it (the lock is dropped around every wait), bounded at 2 s.
 		for (uint32_t i = 0; i < 2000u && gScan.restoring; i++) { IOLockUnlock(l); IOSleep(1); IOLockLock(l); }
 		uint64_t cur = 0;
-		const bool ok = !gScan.restoring && gDcn.armed && dcn41_hubp_read_primary_addr(&gDcn.d, 0u, &cur) == DCN41_OK && cur == gScan.consoleMc;
+		const bool ok = !gScan.restoring && !gScan.restoreFailed && gDcn.armed &&
+		                dcn41_hubp_require_linear(&gDcn.d, 0u) == DCN41_OK &&
+		                dcn41_hubp_read_primary_addr(&gDcn.d, 0u, &cur) == DCN41_OK && cur == gScan.consoleMc;
 		IOLockUnlock(l);
 		if (out) { out[0] = ok ? 1u : 0u; out[1] = cur; }
 		return 0;
@@ -117,7 +121,8 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 	if (!need) {
 		// Nothing to do. The verdict is still honest: a console learned earlier that the plane is NOT on (a failed restore, or a stray
 		// flip) reads as NOT verified, so an idempotent second Release never turns a failure into a success.
-		const bool ok = !gScan.haveConsole || (planeOk && plane == gScan.consoleMc);
+		const bool ok = !gScan.haveConsole || (planeOk && plane == gScan.consoleMc &&
+		                                      dcn41_hubp_require_linear(&gDcn.d, 0u) == DCN41_OK);
 		if (gScan.haveConsole && planeOk) gScan.restoreFailed = !ok;
 		IOLockUnlock(l);
 		if (out) { out[0] = ok ? 1u : 0u; out[1] = planeOk ? plane : 0; }
@@ -135,6 +140,7 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 	RestoreAct act = restore_next(sm, false, 0ull, 0ull, true);
 	while (act != kActDone) {
 		if (act == kActProgram) {
+			if (dcn41_hubp_require_linear(&gDcn.d, 0u) != DCN41_OK) break;
 			gDcn.tag = "scanback";
 			const int pr = dcn41_hubp_program_flip(&gDcn.d, 0u, consoleMc, 0u, false, false);
 			if (pr != DCN41_OK) RDNA4LOG("rdna4scan: RESTORE attempt %u: programming the console %#llx returned %d", sm.attempts, (unsigned long long)consoleMc, pr);
@@ -152,7 +158,8 @@ static uint32_t scan_restore(const char *why, bool force, uint32_t expectGen, ui
 	// (3) verification read and the state teardown, under the lock
 	bool pend = true; uint64_t early = 0, cur = 0;
 	const bool rd = dcn41_hubp_is_flip_pending(&gDcn.d, 0u, &pend, &early) == DCN41_OK && dcn41_hubp_read_primary_addr(&gDcn.d, 0u, &cur) == DCN41_OK;
-	verified = rd && restore_verified(cur, early, pend, consoleMc);
+	verified = rd && restore_verified(cur, early, pend, consoleMc) &&
+	           dcn41_hubp_require_linear(&gDcn.d, 0u) == DCN41_OK;
 	if (gDcn.srcEnabled && gDcn.srcKind == (uint8_t)DCN41_IRQ_VUPDATE_NO_LOCK && gDcn.srcInst == 0u) {
 		if (!(__atomic_load_n(&gDcn.primaryVblEnabled, __ATOMIC_ACQUIRE) && gDcn.primaryVblOtg == 0u)) {
 			struct dcn41_irq off { gDcn.srcKind, gDcn.srcInst };

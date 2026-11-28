@@ -12,8 +12,6 @@
 
 namespace rdna4sleep {
 
-constexpr uint32_t kVramSentinel = 0x5a5a1234u;
-
 enum class Phase {
 	Awake = 0,
 	Sleeping = 1,
@@ -29,8 +27,6 @@ enum class Message {
 
 struct Actions {
 	bool logPci { false };
-	bool writeVramMark { false };
-	bool checkVramMark { false };
 	bool quiesceEngines { false };
 	bool resumeEngines { false };
 	bool recoverDisplayPads { false };
@@ -39,29 +35,23 @@ struct Actions {
 struct State {
 	Phase    phase { Phase::Awake };
 	bool     coldWakePending { false };
-	uint32_t vramMark { 0u };
 	uint32_t sleepCount { 0u };
 	uint32_t wakeCount { 0u };
 	uint32_t abortedSleepCount { 0u };
-	uint32_t vramRetainedCount { 0u };
-	uint32_t vramLostCount { 0u };
 
-	Actions on_message(Message msg, bool vramWriteOk, uint32_t vramReadBack) {
+	Actions on_message(Message msg) {
 		Actions act {};
 		switch (msg) {
 		case Message::WillSleep:
 			phase = Phase::Sleeping;
 			coldWakePending = false;
-			vramMark = vramWriteOk ? kVramSentinel : 0u;
 			sleepCount++;
 			act.logPci = true;
-			act.writeVramMark = true;
 			act.quiesceEngines = true;
 			break;
 		case Message::WillNotSleep:
 			phase = Phase::Awake;
 			coldWakePending = false;
-			vramMark = 0u;
 			abortedSleepCount++;
 			act.resumeEngines = true;
 			break;
@@ -77,15 +67,6 @@ struct State {
 			act.logPci = true;
 			act.resumeEngines = true;
 			act.recoverDisplayPads = true;
-			if (vramMark != 0u) {
-				act.checkVramMark = true;
-				if (vramReadBack == vramMark) {
-					vramRetainedCount++;
-				} else {
-					vramLostCount++;
-				}
-				vramMark = 0u;
-			}
 			break;
 		}
 		return act;

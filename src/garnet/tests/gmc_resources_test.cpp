@@ -6,7 +6,6 @@
 #include <memory>
 #include <vector>
 
-constexpr kern_return_t kIOReturnNoSpace = 0x2db;
 namespace amdgpu {
 bool fail_dma;
 unsigned dma_allocations, dma_frees;

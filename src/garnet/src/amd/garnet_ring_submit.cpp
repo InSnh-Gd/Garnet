@@ -377,6 +377,7 @@ bool own_wait(Session *s, bool *noBlame) {
 // gRingLock. Returns kOk, or kTimeout when the space wait reached 2 s (the CALLER decides what that means, after dropping the lock).
 static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, uint8_t ownerSlot, uint32_t ownerId, Session *owner) {
     DeviceContext &dev = *gCtx->dev;
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     CPContext &cp = gCtx->cp;
     const uint32_t mask = cp.ring_ptr_mask;
     if (n > cp.ring_size_dwords / 2u) return kBadArg;
@@ -395,6 +396,7 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
         n1c_wait_relax(el, kWaitCapNs - el, ep);
     }
     auto *ring = static_cast<uint32_t *>(cp.ring_cpu);
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     const uint64_t startWc = gWc;
     uint64_t wc = gWc;
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
@@ -607,6 +609,7 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
 // Runs completely independently of gRingLock so GFX and Compute submissions never serialize on ring writes or GPU execution.
 static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, Session *owner) {
     DeviceContext &dev = *gCtx->dev;
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     ComputeQueue &cq = gCtx->kcq;
     const uint32_t mask = cq.ring_ptr_mask;
     if (n > cq.ring_size_dwords / 2u) return kBadArg;
@@ -627,6 +630,7 @@ static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, 
         n1c_wait_relax(el, kWaitCapNs - el, ep);
     }
     auto *ring = static_cast<uint32_t *>(cq.ring_cpu);
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     const uint64_t startWc = gKcqWc;
     uint64_t wc = gKcqWc;
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }

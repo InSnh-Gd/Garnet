@@ -29,6 +29,10 @@ uint32_t dal_gated_level();
 // lock (smu_lock_enter), waits at most 500 ms for the reply with IOSleep, and logs one line. Returns kIOReturnSuccess only for RESP == 1.
 kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t param, DalMsg *m);
 
+// Sleepable opt-in collection outside display locks. The caller resolves the DCN 4.01 timer via the read-only DCN device. On failure no row is usable.
+kern_return_t smu_dal_query_clock_snapshot(const DeviceContext &dev, uint32_t dchubTimerAddress,
+                                          rdna4dal::ClockSnapshot &snapshot);
+
 // True while a DAL STEP runs (owner 1; the mode trial refuses to start then; 0.0.605). 0.0.607: a clock hold (owner 2) does NOT count - it belongs to the mode trial that holds it.
 bool dal_busy();
 

@@ -23,6 +23,9 @@
 #include "dcn41_regs.h"
 #include "amd/amdgpu_ucode_extract.h"
 #include "fw/fw_table.h"
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
 
 namespace rdna4dcn {
 
@@ -315,11 +318,72 @@ uint32_t liveRaster(uint32_t *hAct, uint32_t *vAct, uint32_t *hTot, uint32_t *vT
 // build 0.0.542: `accel scanout full`'s display read - the read-only device only (never gDcn, never a write).
 uint32_t roScanSurface(rdna4_sf_dcn *s) { return rdna4lr_scan_surface(&gLr, s); }
 
-// Report only the first refusal; an unread prerequisite is not a claim about hardware state.
-static void preflightDalDmub(GarnetDriver *owner) {
+static bool addDalSnapshotNumber(OSDictionary &dict, const char *key, uint32_t value) {
+	OSNumber *number = OSNumber::withNumber(value, 32);
+	if (!number) return false;
+	const bool ok = dict.setObject(key, number);
+	number->release();
+	return ok;
+}
+
+static bool addDalSnapshotRow(OSDictionary &root, const rdna4dal::SnapshotClock &clock,
+                              const rdna4dal::ClockSnapshotRow &value) {
+	OSDictionary *row = OSDictionary::withCapacity(5);
+	OSArray *levels = OSArray::withCapacity(value.count);
+	bool ok = row && levels;
+	for (uint32_t index = 0; ok && index < value.count; ++index) {
+		OSNumber *frequency = OSNumber::withNumber(value.kHz[index], 32);
+		ok = frequency && levels->setObject(frequency);
+		if (frequency) frequency->release();
+	}
+	if (ok) {
+		ok = row->setObject("LevelsKHz", levels) &&
+		     addDalSnapshotNumber(*row, "RawCount", value.rawCount) &&
+		     addDalSnapshotNumber(*row, "FineGrained", value.fineGrained);
+		if (ok && clock.id != rdna4dal::kClkDppclk)
+			ok = addDalSnapshotNumber(*row, "DcMaxKHz", value.dcMaxKHz) &&
+			     addDalSnapshotNumber(*row, "RawDcMax", value.rawDcMax);
+		if (ok) ok = root.setObject(clock.name, row);
+	}
+	if (levels) levels->release();
+	if (row) row->release();
+	return ok;
+}
+
+static void publishDalClockSnapshot(GarnetDriver *owner) {
+	const auto *dev = owner->deviceContext();
+	if (!dev || !dev->smuOnline) {
+		RDNA4LOG("dmcub-fw: DAL clock snapshot unavailable: SMU not online");
+		return;
+	}
+	const uint32_t timer = dcn41_abs_rd(&gLr.d, rdna4dal::kDchubTimerOffset, 2u);
+	if (timer == DCN41_BAD_OFFSET) return;
+	auto *snapshot = static_cast<rdna4dal::ClockSnapshot *>(IOMalloc(sizeof(rdna4dal::ClockSnapshot)));
+	if (!snapshot) return;
+	if (amdgpu::smu_dal_query_clock_snapshot(*dev, timer, *snapshot) == kIOReturnSuccess) {
+		OSDictionary *root = OSDictionary::withCapacity(11);
+		bool ok = root && addDalSnapshotNumber(*root, "UmcChannels", snapshot->umcChannels) &&
+		    addDalSnapshotNumber(*root, "Clk0PllReq", snapshot->references.pllRequest) &&
+		    addDalSnapshotNumber(*root, "Clk0DpRefDfs", snapshot->references.dpRefDfs) &&
+		    addDalSnapshotNumber(*root, "DchubGlobalTimerCntl", snapshot->references.dchubTimer);
+		for (const auto &clock : rdna4dal::kSnapshotClocks) {
+			if (!ok) break;
+			ok = addDalSnapshotRow(*root, clock, snapshot->*clock.row);
+		}
+		if (ok && owner->setProperty("garnet-dal-clock-snapshot", root)) {
+			RDNA4LOG("dmcub-fw: recorded DAL clock snapshot (7 clocks, %u UMC channels; query-only)", snapshot->umcChannels);
+		}
+		if (root) root->release();
+	}
+	IOFree(snapshot, sizeof(rdna4dal::ClockSnapshot));
+}
+
+// Report only the first firmware refusal; an unread prerequisite is not a claim about hardware state.
+static void preflightDalDmub(GarnetDriver *owner, bool hasDcn401) {
 	uint32_t optIn = 0;
 	const bool present = PE_parse_boot_argn("garnet-dmcub-fw", &optIn, sizeof(optIn));
 	if (!rdna4dmub::dmcub_fw_opt_in(present, optIn)) return;
+	if (hasDcn401) publishDalClockSnapshot(owner);
 
 	const auto *firmware = amdgpu::fw_get(amdgpu::FwId::DCN_DMUB);
 	if (!firmware || !firmware->data || !firmware->size) {
@@ -346,6 +410,11 @@ static void preflightDalDmub(GarnetDriver *owner) {
 		RDNA4LOG("dmcub-fw: preflight refused: PSP or VRAM allocator unavailable; no STOP or PSP load");
 		return;
 	}
+	if (!dcn41_dmub_ring_in_vram_reservation(&current, bringup->dev->vramSizeBytes,
+	                                     bringup->psp.fwReserveExtVramOffset, bringup->psp.fwReserveExtSize)) {
+		RDNA4LOG("dmcub-fw: preflight refused: VBIOS inbox not confirmed in PSP extended reservation; no STOP or PSP load");
+		return;
+	}
 	const uint32_t cw0 = dcn41_abs(&gLr.d, DCN41_DMCUB_REGION3_CW0_TOP_ADDRESS, DCN41_DMCUB_REGION3_CW0_TOP_ADDRESS_BASE_IDX);
 	const uint32_t cw1 = dcn41_abs(&gLr.d, DCN41_DMCUB_REGION3_CW1_TOP_ADDRESS, DCN41_DMCUB_REGION3_CW1_TOP_ADDRESS_BASE_IDX);
 	if (cw0 == DCN41_BAD_OFFSET || cw1 == DCN41_BAD_OFFSET) {
@@ -354,7 +423,7 @@ static void preflightDalDmub(GarnetDriver *owner) {
 	}
 	const uint32_t codeWindow = gLr.d.rreg(gLr.d.cookie, cw0);
 	const uint32_t stackWindow = gLr.d.rreg(gLr.d.cookie, cw1);
-	RDNA4LOG("dmcub-fw: preflight refused: VBIOS recovery unverified (DAL version=%#x, CW0_TOP=%#x, CW1_TOP=%#x, inbox_map=%u); no STOP or PSP load",
+	RDNA4LOG("dmcub-fw: preflight refused: VBIOS inbox within PSP extended reservation, but firmware recovery unverified (DAL version=%#x, CW0_TOP=%#x, CW1_TOP=%#x, inbox_map=%u); no STOP or PSP load",
 	         metadata.fw_version, codeWindow, stackWindow, static_cast<unsigned>(current.ring_map));
 }
 
@@ -379,7 +448,7 @@ void attach(GarnetDriver *owner) {
 	const uint32_t ok = rdna4lr_ro_build(&gLr, dev, lr_rreg, seg, (uint32_t)(dev->rmmioSize / 4));
 	RDNA4LOG("dcn: read-only raster path %s (dcn41_dev_init %d; segs %08x %08x %08x %08x %08x; no register read or written here)",
 	       ok ? "BUILT" : "NOT BUILT", gLr.init_rc, seg[0], seg[1], seg[2], seg[3], seg[4]);
-	preflightDalDmub(owner);
+	preflightDalDmub(owner, e.major == 4u && e.minor == 1u && e.revision == 0u);
 }
 
 static uint32_t bind_locked(GarnetDriver *owner);
@@ -559,6 +628,8 @@ uint64_t measure_refresh_mhz(uint32_t otg, uint32_t ms, uint32_t *frames_out) {
 
 /* Program the plane address. Returns the dcn41 status. */
 int flip_program(uint64_t mc, const char *tag) {
+    const int layout = dcn41_hubp_require_linear(&gDcn.d, gDcn.flipHubp);
+    if (layout != DCN41_OK) return layout;
     gDcn.tag = tag;
     return dcn41_hubp_program_flip(&gDcn.d, gDcn.flipHubp, mc, 0u, false, false);
 }
@@ -567,9 +638,11 @@ int flip_program(uint64_t mc, const char *tag) {
 void flip_restore(const char *why) {
     if (!gDcn.flipPrepared || gDcn.origMc == 0) return;
     const int r = flip_program(gDcn.origMc, "flipback");
-    gDcn.flipHeld = false;
-    gDcn.heldFrames = 0;
-    gDcn.flipsOut++;
+    if (r == DCN41_OK) {
+        gDcn.flipHeld = false;
+        gDcn.heldFrames = 0;
+        gDcn.flipsOut++;
+    }
     RDNA4LOG("dcn-flip: RESTORE (%s) -> console plane %#llx, status %d",
            why, (unsigned long long)gDcn.origMc, r);
 }
@@ -590,6 +663,7 @@ uint32_t flip_prepare() {
     if (otg < 0) { RDNA4LOG("dcn-flip: no OTG is master-enabled — REFUSING"); return 2; }
     gDcn.flipOtg = (uint32_t)otg;
     gDcn.flipHubp = (uint32_t)otg;      /* T1: OTG0 + HUBP0; HUBP_VTG_SEL ties HUBPn to OTGn */
+    if (dcn41_hubp_require_linear(&gDcn.d, gDcn.flipHubp) != DCN41_OK) return 5;
 
     uint64_t cur = 0;
     if (dcn41_hubp_read_primary_addr(&gDcn.d, gDcn.flipHubp, &cur) != DCN41_OK || cur == 0) {
@@ -1642,6 +1716,8 @@ int fmFlip(uint64_t mc, const char *tag) {
 	if (!gDcn.armed) return DCN41_E_UNINIT;
 	rdna4_display_txn txn(rdna4peer::kLeaseLocalDisplay);
 	if (!txn.ok) return DCN41_E_UNINIT;
+	const int layout = dcn41_hubp_require_linear(&gDcn.d, 0u);
+	if (layout != DCN41_OK) return layout;
 	gDcn.tag = tag;
 	return dcn41_hubp_program_flip(&gDcn.d, 0u, mc, 0u, false, false);
 }

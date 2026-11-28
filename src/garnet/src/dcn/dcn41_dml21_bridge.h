@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dcn41_det_pure.h"
+
 #include <stdint.h>
 
 namespace rdna4dml {
@@ -15,6 +17,10 @@ struct ClockTable {
 	uint32_t kHz[kMaxClocks];
 };
 
+struct RefClocks {
+	uint32_t dpRefKHz, dchubRefKHz, vcoKHz;
+};
+
 struct Soc {
 	uint32_t mallMiB;
 	uint32_t dramChannels;
@@ -22,6 +28,8 @@ struct Soc {
 	uint32_t dramTransactionsPerClock;
 	ClockTable uclk, fclk, dcfclk, socclk, dispclk, dppclk, dtbclk;
 	uint32_t uclkBlackoutNs, fclkBlackoutNs, stutterEnterExitNs, stutterExitNs;
+	RefClocks references;
+	uint32_t crystalKHz;
 };
 
 struct Stream {
@@ -51,6 +59,10 @@ struct StreamResult {
 	uint32_t surfaceMallBytes, svpMallBytes;
 	bool phantom;
 	uint8_t fams2Base[48], fams2Sub[20];
+	struct PhantomVertical {
+		uint32_t active, total, frontPorch;
+	} phantomVertical;
+	rdna4det::HubpTtuTiming phantomLumaTtu[kMaxStreams];
 };
 
 struct Result {

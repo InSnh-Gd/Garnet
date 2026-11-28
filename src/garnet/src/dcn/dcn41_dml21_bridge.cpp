@@ -51,15 +51,15 @@ bool validClockTable(const ClockTable &table) {
 	if (!table.count || table.count > kMaxClocks) return false;
 	for (uint32_t index = 0; index < table.count; ++index)
 		if (table.kHz[index] < 1000 || table.kHz[index] > 10000000 ||
-		    (index != 0 && table.kHz[index] <= table.kHz[index - 1])) return false;
+		    (index != 0 && table.kHz[index] < table.kHz[index - 1])) return false;
 	return true;
 }
 
 bool validSoc(const Soc &soc) {
-	return soc.dramChannels >= 2 && soc.dramChannels <= 16 &&
+	return soc.dramChannels >= 2 && soc.dramChannels <= 32 &&
 	       soc.dramChannelWidthBytes == 2 && soc.dramTransactionsPerClock == 16 &&
 	       soc.mallMiB <= soc.dramChannels * 4 && (soc.mallMiB & (soc.mallMiB - 1u)) == 0 &&
-	       soc.uclkBlackoutNs && soc.fclkBlackoutNs && soc.stutterExitNs &&
+	       soc.uclkBlackoutNs && soc.stutterExitNs &&
 	       soc.stutterEnterExitNs >= soc.stutterExitNs &&
 	       validClockTable(soc.uclk) && validClockTable(soc.fclk) && validClockTable(soc.dcfclk) &&
 	       validClockTable(soc.socclk) && validClockTable(soc.dispclk) &&

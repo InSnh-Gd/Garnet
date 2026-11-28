@@ -1,4 +1,8 @@
 #include "dcn/dcn41_dml21_bridge.h"
+#include "dcn/dcn41_fams2_dml_pure.h"
+#include "dcn/dml21/port/dmub_cmd.h"
+#include "../../dcn41/dcn41_allow_ranges.h"
+#include "../../dcn41/dcn41_regs.h"
 #include "dml21-oracle/expected.h"
 #include "dml21-oracle/fixture.h"
 
@@ -118,6 +122,63 @@ static void equalArray(const char *field, const Value (&got)[Count], const Value
 	for (size_t index = 0; index < Count; ++index) equal(field, got[index], want[index]);
 }
 
+struct PhantomTtuReplay {
+	static constexpr uint32_t kSeg2 = 0x34c0u;
+	static constexpr uint32_t kInitial = 0x80000000u;
+	uint32_t registers[3];
+	uint32_t values[3] = {kInitial, kInitial, kInitial};
+	unsigned writes = 0u;
+
+	explicit PhantomTtuReplay(unsigned hubp) : registers{DCN41_HUBPREQ_DCN_TTU_QOS_WM(hubp),
+		DCN41_HUBPREQ_DCN_SURF0_TTU_CNTL0(hubp), DCN41_HUBPREQ_DCN_SURF0_TTU_CNTL1(hubp)} {}
+
+	rdna4det::Hw callbacks() {
+		return {this,
+			[](void *cookie, uint32_t offset) {
+				auto &replay = *static_cast<PhantomTtuReplay *>(cookie);
+				for (unsigned index = 0; index < 3; ++index)
+					if (replay.registers[index] == offset) return replay.values[index];
+				return UINT32_MAX;
+			},
+			[](void *cookie, uint32_t offset, uint32_t value) {
+				auto &replay = *static_cast<PhantomTtuReplay *>(cookie);
+				const unsigned index = replay.writes;
+				if (index >= 3 || replay.registers[index] != offset) return false;
+				const uint32_t address = kSeg2 + offset;
+				for (const auto &range : dcn41_allow_ranges) {
+					if (address < range.abs_lo || address > range.abs_hi) continue;
+					replay.values[index] = value;
+					++replay.writes;
+					return true;
+				}
+				return false;
+			}, nullptr};
+	}
+};
+
+template <size_t Count>
+static void replayPhantomTtu(const StreamResult &actual, const fixture_expected_stream &expected,
+                             const rdna4fams2::PlaneRoute &route, const unsigned (&hubpOrder)[Count]) {
+	assert(actual.phantom && actual.dppCount == Count);
+	unsigned hubps = route.hubps;
+	for (size_t part = 0; part < Count; ++part) {
+		const unsigned hubp = hubpOrder[part];
+		assert(hubp < rdna4fams2::kPipeCount && (hubps & (1u << hubp)));
+		hubps &= ~(1u << hubp);
+		PhantomTtuReplay replay(hubp);
+		assert(rdna4det::program_hubp_ttu(replay.callbacks(), hubp, actual.phantomLumaTtu[part]));
+		equal("phantom luma TTU write count", replay.writes, 3u);
+		const auto &ttu = expected.phantom_luma_ttu[part];
+		const uint32_t words[] = {
+			PhantomTtuReplay::kInitial | ttu[0] | (ttu[1] << 16),
+			PhantomTtuReplay::kInitial | ttu[2] | (ttu[3] << 24) | (ttu[4] << 28),
+			PhantomTtuReplay::kInitial | ttu[5],
+		};
+		equalArray("phantom luma TTU MMIO", replay.values, words);
+	}
+	assert(!hubps);
+}
+
 static void compare(const Input &input, const fixture_expected &want) {
 	Result result{};
 	equal("mode supported", solve(input, result), want.supported);
@@ -149,7 +210,109 @@ static void compare(const Input &input, const fixture_expected &want) {
 		equal("phantom selected", actual.phantom, expected.phantom);
 		equalArray("FAMS2 base", actual.fams2Base, expected.fams2_base);
 		equalArray("FAMS2 sub", actual.fams2Sub, expected.fams2_sub);
+		const auto &vertical = actual.phantomVertical;
+		const uint32_t geometry[] {vertical.active, vertical.total, vertical.frontPorch};
+		equalArray("phantom vertical geometry", geometry, expected.phantom_vertical);
 	}
+}
+
+static void compareFams21Chain(const Result &solved, const rdna4fams2::Config &config,
+                              uint32_t count, const uint8_t *mainOtgs, const uint8_t *mainMasks,
+                              const uint8_t *phantomOtgs, const uint8_t *phantomMasks) {
+	using namespace rdna4fams2;
+	ConfigCommands chain{};
+	assert(build_config(config, chain) == 1 + 2 * count);
+	dmub_cmd_fams2_global_config global{};
+	memcpy(&global, solved.fams2Global, sizeof(global));
+	global.num_streams = count;
+	assert(!memcmp(chain[0].payload, &global, sizeof(global)));
+	for (uint32_t stream = 0; stream < count; ++stream) {
+		dmub_fams2_cmd_stream_static_base_state base{};
+		memcpy(&base, solved.streams[stream].fams2Base, sizeof(base));
+		assert(base.type == FAMS2_STREAM_TYPE_SUBVP);
+		base.otg_inst = mainOtgs[stream];
+		base.pipe_mask = base.plane_pipe_masks[0] = mainMasks[stream];
+		base.num_planes = 1;
+		assert(!memcmp(chain[1 + stream].payload, &base, sizeof(base)));
+		dmub_fams2_cmd_stream_static_sub_state sub{};
+		memcpy(&sub, solved.streams[stream].fams2Sub, sizeof(sub));
+		sub.subvp.phantom_otg_inst = phantomOtgs[stream];
+		sub.subvp.phantom_pipe_mask = sub.subvp.phantom_plane_pipe_masks[0] = phantomMasks[stream];
+		assert(!memcmp(chain[1 + count + stream].payload, &sub, sizeof(sub)));
+	}
+}
+
+static void mapFams21() {
+	using namespace rdna4fams2;
+	const TopologyStamp current{16, 22};
+	const Topology topology{current, 2, 0xf, {
+		{{3, 1, 0x8, 0x8, 0x8}, {0, 1, 0x1, 0x1, 0x1}},
+		{{1, 1, 0x2, 0x2, 0x2}, {2, 1, 0x4, 0x4, 0x4}},
+	}};
+	Result solved{};
+	assert(solve(makeInput(fixture_socs[0], fixture_modes[2]), solved));
+	Config config{};
+	assert(lower_config(solved, current, topology, current, config));
+	const uint8_t mainOtgs[]{3, 1}, mainMasks[]{0x8, 0x2}, phantomOtgs[]{0, 2}, phantomMasks[]{0x1, 0x4};
+	compareFams21Chain(solved, config, 2, mainOtgs, mainMasks, phantomOtgs, phantomMasks);
+	replayPhantomTtu(solved.streams[0], fixture_results[2].streams[0], topology.streams[0].phantom, {0});
+	replayPhantomTtu(solved.streams[1], fixture_results[2].streams[1], topology.streams[1].phantom, {2});
+
+	const auto populatedConfig = config;
+	auto reject = [&](const Result &candidate, const Topology &mapping, TopologyStamp solvedFor) {
+		config = populatedConfig;
+		assert(!lower_config(candidate, solvedFor, mapping, current, config));
+		ConfigCommands chain{};
+		assert(build_config(config, chain) == 0);
+	};
+	reject(solved, topology, {current.owner, current.generation - 1});
+	auto bad = topology;
+	bad.stamp.owner++;
+	reject(solved, bad, current);
+	bad = topology;
+	bad.streams[0].phantom = {};
+	reject(solved, bad, current);
+	bad = topology;
+	bad.streams[1].phantom = bad.streams[0].phantom;
+	reject(solved, bad, current);
+	bad = topology;
+	bad.streams[0].main.otg = 1;
+	reject(solved, bad, current);
+	bad = topology;
+	bad.streams[1].main.planeCount = 2;
+	reject(solved, bad, current);
+	auto badResult = solved;
+	badResult.streams[0].pstateMethod = UINT32_MAX;
+	reject(badResult, topology, current);
+
+	assert(solve(makeInput(fixture_socs[0], fixture_modes[1]), solved));
+	const Topology split{current, 1, 0xf, {
+		{{3, 1, 0xa, 0xa, 0xa}, {2, 1, 0x5, 0x5, 0x5}},
+	}};
+	assert(lower_config(solved, current, split, current, config));
+	const uint8_t splitMainOtg[]{3}, splitMainMask[]{0xa}, splitPhantomOtg[]{2}, splitPhantomMask[]{0x5};
+	compareFams21Chain(solved, config, 1, splitMainOtg, splitMainMask, splitPhantomOtg, splitPhantomMask);
+	replayPhantomTtu(solved.streams[0], fixture_results[1].streams[0], split.streams[0].phantom, {2, 0});
+	bad = split;
+	bad.streams[0].phantom.odmHeads = 0x4;
+	reject(solved, bad, current);
+	bad = split;
+	bad.streams[1].phantom = split.streams[0].phantom;
+	reject(solved, bad, current);
+
+	auto input = makeInput(fixture_socs[0], fixture_modes[0]);
+	input.soc.uclkBlackoutNs = 550000;
+	assert(solve(input, solved));
+	const Topology fused{current, 1, 0xd, {
+		{{3, 1, 0x4, 0x4, 0x8}, {2, 1, 0x2, 0x2, 0x4}},
+	}};
+	assert(lower_config(solved, current, fused, current, config));
+	const uint8_t fusedMainOtg[]{3}, fusedMainMask[]{0x4}, fusedPhantomOtg[]{2}, fusedPhantomMask[]{0x2};
+	compareFams21Chain(solved, config, 1, fusedMainOtg, fusedMainMask, fusedPhantomOtg, fusedPhantomMask);
+	bad = fused;
+	bad.streams[0].phantom.hubps = bad.streams[0].phantom.pipeSlots;
+	reject(solved, bad, current);
+	puts("DML2.1 FAMS2.1 matched Linux CONFIG fields for permuted, split and fused SubVP routes");
 }
 
 int main() {
@@ -162,6 +325,7 @@ int main() {
 		}
 	}
 	printf("DML2.1 matched %zu pinned Linux reference vectors\n", index);
+	mapFams21();
 	auto input = makeInput(fixture_socs[0], fixture_modes[1]);
 	input.count = kMaxStreams;
 	for (uint32_t index = 1; index < input.count; ++index) input.streams[index] = input.streams[0];

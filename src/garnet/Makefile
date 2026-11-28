@@ -43,7 +43,7 @@ CXX_SRCS := src/GarnetDriver.cpp src/GarnetDriverStages.cpp src/GarnetDisplayGat
             src/GarnetPrimaryFramebuffer.cpp src/GarnetUserClient.cpp \
             src/GarnetNativeClient.cpp src/GarnetMetalNub.cpp \
             src/GarnetDisplayNub.cpp src/ipdiscovery.cpp src/psp.cpp \
-            $(wildcard src/amd/*.cpp) $(filter-out src/dcn/dcn41_dml21_bridge.cpp,$(wildcard src/dcn/*.cpp))
+            $(wildcard src/amd/*.cpp) $(filter-out src/dcn/dcn41_dml21_bridge.cpp src/dcn/dcn41_dml21_soc.cpp,$(wildcard src/dcn/*.cpp))
 # Generated firmware belongs to this build, so concurrent chip builds cannot reuse stale stubs.
 FW_GEN   := $(BUILD)/firmware
 FW_BINS  := $(wildcard firmware/*.bin)

@@ -86,6 +86,25 @@ namespace amdgpu {
 // because kHostFwFile_SDMA is .cpp-local to the extractor.
 constexpr uint64_t kHostFwType_SDMA = 0x100ULL + PSPGfxFwType::SDMA_UCODE_TH0;
 
+static bool sdma_bar2_slot_valid(const DeviceContext &dev, uint64_t offset)
+{
+    return !dev.graphicsPowerQuarantined() && (offset & 7u) == 0 &&
+           rdna4gfxoff::sdma_use_bar2_doorbell_only(dev.bar2 != nullptr, offset, dev.bar2Size);
+}
+
+bool sdma_doorbells_proven(const DeviceContext &dev, const SDMAContext &sdma)
+{
+    if (!sdma.instance_present[0]) return false;
+    for (uint32_t i = 0; i < kSDMAInstanceCount; ++i) {
+        if (!sdma.instance_present[i]) continue;
+        const auto &instance = sdma.instance[i];
+        if (!instance.inited || !instance.enabled || !instance.doorbell_test_passed || instance.dma_unconfirmed ||
+            !sdma_bar2_slot_valid(dev, uint64_t{instance.doorbell_index} * 4u))
+            return false;
+    }
+    return true;
+}
+
 //------------------------------------------------------------------
 // Writeback-page access. The page is either GART-bound sysmem (CPU
 // pointer, PCIe-snooped so plain volatile loads see engine writes) or
@@ -128,7 +147,7 @@ sdma_wb_write32(const DeviceContext &dev, const SDMAInstance &inst,
 // Deviation D5: real delays instead of the reference's fake spin.
 //------------------------------------------------------------------
 static kern_return_t
-sdma_poll_fence(const DeviceContext &dev, const SDMAInstance &inst,
+sdma_poll_fence(const DeviceContext &dev, SDMAInstance &inst,
                 uint32_t wb_offset, uint32_t want, uint64_t timeout_us,
                 uint64_t *out_elapsed_us, uint32_t *out_last)
 {
@@ -150,6 +169,7 @@ sdma_poll_fence(const DeviceContext &dev, const SDMAInstance &inst,
     }
     if (out_elapsed_us) *out_elapsed_us = elapsed;
     if (out_last) *out_last = v;
+    inst.dma_unconfirmed = true;
     return kIOReturnTimeout;
 }
 
@@ -319,7 +339,7 @@ sdma_alloc_storage(DeviceContext &dev, SDMAInstance &inst, GMCContext &gmc)
 void
 sdma_release_storage(GMCContext &gmc, SDMAInstance &inst)
 {
-    if (!inst.inited) return;
+    if (!inst.inited || inst.dma_unconfirmed || inst.enabled) return;
     if (gmc.vram_alloc.is_inited()) {
         VRAMAllocation a{};
         a.gpu_va = inst.ring_gpu_va;
@@ -336,6 +356,7 @@ sdma_release_storage(GMCContext &gmc, SDMAInstance &inst)
     if (!inst.wb_in_vram) sysmem_free(inst.wb_sysmem);
     inst.inited  = false;
     inst.enabled = false;
+    inst.doorbell_test_passed = false;
     inst.wb_cpu   = nullptr;
     inst.rptr_cpu = nullptr;
     inst.wb_bus   = 0;
@@ -399,6 +420,31 @@ sdma_gfx_stop_instance(const DeviceContext &dev, uint32_t instance)
     return kIOReturnSuccess;
 }
 
+kern_return_t sdma_quiesce_for_teardown(const DeviceContext &dev, SDMAInstance &inst)
+{
+    if (inst.dma_unconfirmed) return kIOReturnTimeout;
+    if (!inst.enabled) return kIOReturnSuccess;
+    if (!dev.ip.isResolved(IPBlock::GC, 0) || !dev.ip.isResolved(IPBlock::GC, 1))
+        return kIOReturnNotReady;
+    const auto &regs = sdma_regs(dev);
+    const auto reg = [&](uint32_t offset) { return sdma_reg_offset(dev, inst.instance, offset); };
+    const uint32_t status = RREG32(dev, reg(regs.STATUS_REG));
+    if (status == UINT32_MAX || (status & 1u) == 0u) return kIOReturnNotReady;
+    const kern_return_t stop = sdma_gfx_stop_instance(dev, inst.instance);
+    if (stop != kIOReturnSuccess) return stop;
+    const kern_return_t halt = sdma_engine_halt(dev, inst.instance, true);
+    if (halt != kIOReturnSuccess) return halt;
+    const uint32_t rb = RREG32(dev, reg(regs.QUEUE0_RB_CNTL));
+    const uint32_t ib = RREG32(dev, reg(regs.QUEUE0_IB_CNTL));
+    const uint32_t mcu = RREG32(dev, reg(regs.MCU_CNTL));
+    if (rb == UINT32_MAX || ib == UINT32_MAX || mcu == UINT32_MAX ||
+        REG_GET_FIELD(rb, SDMA0_SDMA_QUEUE0_RB_CNTL, RB_ENABLE) ||
+        REG_GET_FIELD(ib, SDMA0_SDMA_QUEUE0_IB_CNTL, IB_ENABLE) ||
+        !REG_GET_FIELD(mcu, SDMA0_SDMA_MCU_CNTL, HALT)) return kIOReturnIOError;
+    inst.enabled = false;
+    return kIOReturnSuccess;
+}
+
 //------------------------------------------------------------------
 // order_base_2 — log2 of a power-of-two. SDMA RB_SIZE expects the
 // ring size as log2(dwords).
@@ -428,6 +474,7 @@ sdma_gfx_resume_instance(const DeviceContext &dev, SDMAInstance &inst)
 {
     if (!inst.inited) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    inst.doorbell_test_passed = false;
 
     const uint32_t i = inst.instance;
     auto reg = [&](uint32_t r) { return sdma_reg_offset(dev, i, r); };
@@ -846,6 +893,8 @@ sdma_disable_external_queue(const DeviceContext &dev, const SDMAInstance &inst,
     ib_cntl = REG_SET_FIELD(ib_cntl, SDMA0_SDMA_QUEUE0_IB_CNTL, IB_ENABLE, 0);
     WREG32(dev, q1(R.QUEUE0_RB_CNTL), rb_cntl);
     WREG32(dev, q1(R.QUEUE0_IB_CNTL), ib_cntl);
+    if (RREG32(dev, q1(R.QUEUE0_RB_CNTL)) != rb_cntl ||
+        RREG32(dev, q1(R.QUEUE0_IB_CNTL)) != ib_cntl) return kIOReturnIOError;
     SDMA_LOG("SDMA%u QUEUE%u: DISABLED — RB_CNTL=%#010x IB_CNTL=%#010x; the engine "
              "fetches nothing from this queue. QUEUE0 untouched.",
              inst.instance, queue, rb_cntl, ib_cntl);
@@ -896,6 +945,8 @@ sdma_q1_kick_doorbell_only(const DeviceContext &dev, const SDMAInstance &inst,
     if (queue == 0 || queue >= kSDMAQueuesPerInstance) return kIOReturnBadArgument;
     if (!inst.inited)                    return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    const uint64_t offs = uint64_t{doorbellIndex} * 4u;
+    if (!sdma_bar2_slot_valid(dev, offs)) return kIOReturnBadArgument;
     const uint64_t v = static_cast<uint64_t>(wptrDwords) << 2;   // byte wptr
 
     sdma_wb_write32(dev, inst, kSDMAWBExtWptrOffset, static_cast<uint32_t>(v));
@@ -903,13 +954,6 @@ sdma_q1_kick_doorbell_only(const DeviceContext &dev, const SDMAInstance &inst,
                     static_cast<uint32_t>(v >> 32));
     amdgpu_hdp_flush(dev);
 
-    const uint64_t offs = static_cast<uint64_t>(doorbellIndex) * 4ull;
-    if (dev.bar2 == nullptr || offs + 8 > dev.bar2Size) {
-        SDMA_LOG("SDMA%u q1-kick: doorbell dword %#x (byte %#llx) is outside BAR2 "
-                 "(%llu bytes) — REFUSING", inst.instance, doorbellIndex,
-                 (unsigned long long)offs, (unsigned long long)dev.bar2Size);
-        return kIOReturnBadArgument;
-    }
     WDOORBELL64(dev, offs, v);
     SDMA_LOG("SDMA%u QUEUE%u q1-kick: DOORBELL ONLY — wptr=%u (byte %#llx) to "
              "BAR2+%#llx (dword index %#x). No MMIO RB_WPTR write: if the queue "
@@ -1041,11 +1085,12 @@ sdma_q1_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
     }
 
     // ---- leg B, only as the control: was it the doorbell or the queue?
-    if (!t.doorbell_ok) {
+    if (!t.doorbell_ok && !inst.dma_unconfirmed) {
         elapsed = 0; last = 0;
-        (void)sdma_q1_set_wptr_mmio(dev, inst, /*wptrDwords=*/4, queue);
-        r = sdma_poll_fence(dev, inst, kSDMAWBExtFenceOffset, fence_value,
-                            /*timeout_us=*/200000ull, &elapsed, &last);
+        r = sdma_q1_set_wptr_mmio(dev, inst, /*wptrDwords=*/4, queue);
+        if (r == kIOReturnSuccess)
+            r = sdma_poll_fence(dev, inst, kSDMAWBExtFenceOffset, fence_value,
+                                /*timeout_us=*/200000ull, &elapsed, &last);
         t.mmio_ok    = (r == kIOReturnSuccess);
         t.mmio_us    = elapsed;
         t.fence_last = last;
@@ -1072,9 +1117,12 @@ sdma_q1_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
              (doorbell_index << 2) & 0x0FFFFFFCu, doorbell_index);
 
     // Leave nothing armed: disable the queue, free the scratch ring.
-    (void)sdma_disable_external_queue(dev, inst, queue);
-    gmc.vram_alloc.free(ring);
+    if (!inst.dma_unconfirmed && sdma_disable_external_queue(dev, inst, queue) == kIOReturnSuccess)
+        gmc.vram_alloc.free(ring);
+    else
+        inst.dma_unconfirmed = true;
     if (out) *out = t;
+    if (inst.dma_unconfirmed) return kIOReturnTimeout;
     return t.doorbell_ok ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
@@ -1249,13 +1297,16 @@ srbm_run_target(const DeviceContext &dev, SDMAInstance &inst,
     // the alternate encoding's stray write never happens needlessly.
     (void)srbm_run_leg(dev, inst, tr, 0, false, false, true, clear,
                        ib_gpu_va, ib_vram_off, tag);
+    if (inst.dma_unconfirmed) return;
     if (!tr.landed[0])
         (void)srbm_run_leg(dev, inst, tr, 1, false, true, true, clear,
                            ib_gpu_va, ib_vram_off, tag);
+    if (inst.dma_unconfirmed) return;
 
     // Same two through an INDIRECT_BUFFER carrying Apple's header.
     (void)srbm_run_leg(dev, inst, tr, 2, true, false, true, clear,
                        ib_gpu_va, ib_vram_off, tag);
+    if (inst.dma_unconfirmed) return;
     if (!tr.landed[2])
         (void)srbm_run_leg(dev, inst, tr, 3, true, true, true, clear,
                            ib_gpu_va, ib_vram_off, tag);
@@ -1263,7 +1314,7 @@ srbm_run_target(const DeviceContext &dev, SDMAInstance &inst,
     // Only when the ring worked and neither IB leg did is bit 31 of the IB
     // header worth a leg of its own: rerun the WINNING operand form with the
     // plain Linux header, so one dword is the only difference.
-    if ((tr.landed[0] || tr.landed[1]) && !tr.landed[2] && !tr.landed[3])
+    if (!inst.dma_unconfirmed && (tr.landed[0] || tr.landed[1]) && !tr.landed[2] && !tr.landed[3])
         (void)srbm_run_leg(dev, inst, tr, 4, true, tr.landed[1], false, clear,
                            ib_gpu_va, ib_vram_off, tag);
 
@@ -1333,9 +1384,13 @@ sdma_srbm_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
 
     srbm_run_target(dev, inst, t.scratch, kSRBMScratchClear,
                     ib.gpu_va, ib_off, "scratch(SCRATCH_REG7)");
-    srbm_run_target(dev, inst, t.ctx2, 0u,
-                    ib.gpu_va, ib_off, "ctx2(GCVM_CONTEXT2 PT base LO)");
-
+    if (!inst.dma_unconfirmed)
+        srbm_run_target(dev, inst, t.ctx2, 0u,
+                        ib.gpu_va, ib_off, "ctx2(GCVM_CONTEXT2 PT base LO)");
+    if (inst.dma_unconfirmed) {
+        if (out) *out = t;
+        return kIOReturnTimeout;
+    }
     gmc.vram_alloc.free(ib);
 
     // One line that answers the question on its own.
@@ -1366,7 +1421,8 @@ uint32_t
 sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
                 const uint32_t *src, uint32_t dwords)
 {
-    if (!inst.inited || dwords == 0) return 0;
+    if (!inst.inited || !inst.enabled || inst.dma_unconfirmed || dwords == 0) return 0;
+    if (!sdma_bar2_slot_valid(dev, uint64_t{inst.doorbell_index} * 4u)) return 0;
     if (dwords > inst.ring_size_dwords) return 0;
     for (uint32_t i = 0; i < dwords; i++) {
         // ring INDEX — upstream's buf_mask (amdgpu_ring.c:122, `ring->wptr & ring->buf_mask`).
@@ -1388,25 +1444,16 @@ sdma_ring_write(const DeviceContext &dev, SDMAInstance &inst,
 // sdma_kick_doorbell — write the new wptr into the BAR2 doorbell
 // aperture.
 //
-// Upstream (sdma_v7_0_ring_set_wptr → WDOORBELL64) does a 64-bit
-// write to the doorbell at:
-//     BAR2 + ring->doorbell_index * 8
-//
-// where `ring->doorbell_index = sdma_engine[i] << 1` (already in
-// qword-index units, e.g. 0x200 for SDMA0). The PCIe write must be
-// 64-bit (WDOORBELL64, not WDOORBELL32) — the doorbell controller
-// distinguishes; a 32-bit write may be silently dropped on RDNA4.
-//
-// Linux uses BAR2 via pci_resource_start(pdev, 2) in
-// amdgpu_doorbell_mgr.c. BAR5 holds MMIO registers, NOT doorbells.
-//
-// Value: `wptr << 2` (byte_wptr); high 32 bits zero.
+// The index is already in dwords (sdma_engine[i] << 1); the write and
+// the byte pointer are both 64-bit. Scanout callers hold gScanoutLock:
+// never fall back to GC MMIO or acquire the SMU lock here.
 //------------------------------------------------------------------
 kern_return_t
 sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
 {
-    if (!inst.inited) return kIOReturnNotReady;
-    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+    if (!inst.inited || !inst.enabled || inst.dma_unconfirmed) return kIOReturnNotReady;
+    const uint64_t offs = uint64_t{inst.doorbell_index} * 4u;
+    if (!sdma_bar2_slot_valid(dev, offs)) return kIOReturnNotReady;
     const uint64_t v = static_cast<uint64_t>(inst.wptr) << 2;
 
     // 1) WPTR shadow in the writeback page — upstream
@@ -1422,51 +1469,10 @@ sdma_kick_doorbell(const DeviceContext &dev, const SDMAInstance &inst)
     //    our CPU write.
     amdgpu_hdp_flush(dev);
 
-    // 3) BAR2 doorbell aperture write — port of upstream WDOORBELL64.
-    //    On the reference platform (Apple Silicon + TB5) this write did
-    //    NOT cause the SDMA MCU to update its internal RB_WPTR: verified
-    //    across mac-amdgpu v0.1.30-v0.1.46 with every plausible NBIF
-    //    routing, SELFRING base, WC-flush readback and engine-side
-    //    DOORBELL_OFFSET configuration, so there step 4 was the
-    //    functional path. [[feedback_mac_amdgpu_doorbell_mmio_mode_as_tb5]]
-    //    On x86 in a plain PCIe slot BAR2 is a normal doorbell aperture
-    //    and this is expected to be the path that works; both writes are
-    //    kept (they carry the same value) and the readback below says
-    //    which one the MCU honoured.
-    // Dword-indexed aperture: byte offset = doorbell_index * 4 (Linux WDOORBELL64 →
-    // amdgpu_mm_wdoorbell64: u32 *ptr + index). The reference used *8. Value stays
-    // wptr<<2 (bytes) as in sdma_v7_0_ring_set_wptr.
-    const uint64_t offs =
-        static_cast<uint64_t>(inst.doorbell_index) * 4ull;
-    if (rdna4gfxoff::sdma_use_bar2_doorbell_only(dev.bar2 != nullptr, offs, dev.bar2Size)) {
-        // BAR2 WDOORBELL64 wakes GFXOFF in hardware with zero GC MMIO and zero
-        // SMU lock dependency (callers may hold gScanoutLock).
-        WDOORBELL64(dev, offs, v);
-        SDMA_LOG("SDMA%u kick: wptr=%llu (byte %#llx) doorbell@BAR2+%#llx wb_rptr=%#010x",
-                 inst.instance, (unsigned long long)inst.wptr, (unsigned long long)v,
-                 (unsigned long long)offs, sdma_wb_read32(dev, inst, kSDMAWBRptrOffset));
-        return kIOReturnSuccess;
-    }
-
-    // Fallback ONLY when BAR2 doorbell aperture is unavailable/out-of-range.
-    SDMA_LOG("SDMA%u kick: doorbell offset %#llx outside BAR2 "
-             "(bar2=%p bar2Size=%llu) — MMIO WPTR fallback",
-             inst.instance, (unsigned long long)offs,
-             (const void *)dev.bar2, (unsigned long long)dev.bar2Size);
-    const uint32_t wptr_reg = sdma_reg_offset(
-        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR);
-    const uint32_t wptr_hi_reg = sdma_reg_offset(
-        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_WPTR_HI);
-    WREG32(dev, wptr_reg,    static_cast<uint32_t>(v));
-    WREG32(dev, wptr_hi_reg, static_cast<uint32_t>(v >> 32));
-
-    const uint32_t rptr_reg = sdma_reg_offset(
-        dev, inst.instance, sdma_regs(dev).QUEUE0_RB_RPTR);
-    SDMA_LOG("SDMA%u kick(MMIO): wptr=%llu (byte %#llx) "
-             "readback RB_WPTR=%#010x RB_RPTR=%#010x wb_rptr=%#010x",
+    WDOORBELL64(dev, offs, v);
+    SDMA_LOG("SDMA%u kick: wptr=%llu (byte %#llx) doorbell@BAR2+%#llx wb_rptr=%#010x",
              inst.instance, (unsigned long long)inst.wptr, (unsigned long long)v,
-             RREG32(dev, wptr_reg), RREG32(dev, rptr_reg),
-             sdma_wb_read32(dev, inst, kSDMAWBRptrOffset));
+             (unsigned long long)offs, sdma_wb_read32(dev, inst, kSDMAWBRptrOffset));
     return kIOReturnSuccess;
 }
 
@@ -1485,6 +1491,7 @@ kern_return_t
 sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
                uint64_t timeout_us)
 {
+    inst.doorbell_test_passed = false;
     if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
 
     // Use an unused part of the WB page (offset 0x80) as the fence
@@ -1517,6 +1524,7 @@ sdma_ring_test(const DeviceContext &dev, SDMAInstance &inst,
     r = sdma_poll_fence(dev, inst, kSDMAWBFenceOffset, fence_value,
                         timeout_us, &elapsed, &last);
     if (r == kIOReturnSuccess) {
+        inst.doorbell_test_passed = true;
         SDMA_LOG("instance %u: ring_test ok in ~%llu us",
                  inst.instance, (unsigned long long)elapsed);
         return kIOReturnSuccess;
@@ -1967,6 +1975,13 @@ sdma_vram_copy_test(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
 
     kern_return_t r = sdma_copy_linear_test(dev, inst, src.gpu_va, dst.gpu_va,
                                             bytes, /*timeout_us=*/100000ull);
+    if (inst.dma_unconfirmed) {
+        res.kr = r;
+        res.src_gpu_va = src.gpu_va;
+        res.dst_gpu_va = dst.gpu_va;
+        if (out) *out = res;
+        return r;
+    }
 
     // Read back regardless of fence status — even a partial copy tells
     // us whether the engine touched dst at all.
@@ -2196,6 +2211,7 @@ sdma_vram_copy_sweep(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst)
             sdma_copy_linear_test(dev, inst, rgn.gpu_va + K.src_off,
                                   rgn.gpu_va + K.dst_off, K.bytes,
                                   /*timeout_us=*/500000ull, K.cpv != 0);
+        if (inst.dma_unconfirmed) return r;
 
         // Read back. The MM window is the verdict (it is what
         // sdma_vram_copy_test uses); BAR0 is carried as a second opinion so the
@@ -2499,7 +2515,7 @@ sdma_init_full(DeviceContext &dev,
         SDMA_LOG("init_full: microcode_loaded=false — storage allocated, "
                  "deferring gfx_resume + ring_test until the SDMA ucode "
                  "(GFX_FW_TYPE_SDMA_UCODE_TH0) has been PSP-loaded");
-        return kIOReturnSuccess;
+        return kIOReturnNotReady;
     }
 
     // 4) gfx_resume each. Mirrors upstream sdma_v7_0_gfx_resume.
@@ -2520,14 +2536,13 @@ sdma_init_full(DeviceContext &dev,
         sdma_log_status(dev, i);
     }
 
-    // 5) Ring test on each. Failure is logged but doesn't kill the
-    //    init — the caller can re-run it. Mirrors upstream
-    //    sdma_v7_0_ring_test_ring (sdma_v7_0.c:934).
+    // 5) Prove each ring before admitting additional DMA.
     SDMA_LOG("init_full: step 5/5 — sdma_ring_test on each instance "
              "(submit FENCE pkt, watch WB write)");
     for (uint32_t i = 0; i < kSDMAInstanceCount; i++) {
         if (!sdma.instance_present[i]) continue;
-        sdma_ring_test(dev, sdma.instance[i], /*timeout_us=*/100000);
+        const auto result = sdma_ring_test(dev, sdma.instance[i], /*timeout_us=*/100000);
+        if (result != kIOReturnSuccess) return result;
     }
 
     SDMA_LOG("init_full: done — final per-instance status:");

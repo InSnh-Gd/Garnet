@@ -20,6 +20,7 @@ typedef kern_return_t IOReturn;
 #define kIOReturnBusy            iokit_common_err(0x2d5)
 #define kIOReturnTimeout         iokit_common_err(0x2d6)
 #define kIOReturnNotReady        iokit_common_err(0x2d8)
+#define kIOReturnUnderrun        iokit_common_err(0x2e7)
 #define kIOReturnAborted         iokit_common_err(0x2eb)
 #define kIOReturnNotPermitted    iokit_common_err(0x2e2)
 #define kIOReturnNotFound        iokit_common_err(0x2f0)

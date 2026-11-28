@@ -43,6 +43,7 @@ constexpr uint32_t kNumPipes            = 4u;
 constexpr uint32_t kDetSizeMask         = 0x0000001Fu; // bits [4:0]
 constexpr uint32_t kDetCurShift         = 8u;          // bits [12:8]
 constexpr uint32_t kDetCurMask          = 0x00001F00u;
+constexpr uint32_t kCompbufIntEnable    = 0x00010000u;
 constexpr uint32_t kCompbufCfgErrMask   = 0x80000000u; // DCHUBBUB_COMPBUF_CTRL.CONFIG_ERROR [31]
 
 constexpr uint32_t kOtgActiveMask       = 0x00010001u; // MASTER_EN[0] | CURRENT_MASTER_EN[16]
@@ -56,10 +57,7 @@ constexpr uint32_t kOptcWriteClearMask  = 0x80003C00u;
 // DCN 4.01 (dcn401_hubbub.h) full hardware CRB budget = 21 x 64 KiB segments (1344 KiB).
 // UEFI GOP conservative budget = 13 segments (832 KiB) for single-pipe legacy expand_single_pipe_det0.
 constexpr uint32_t kHardwareCrbBudgetSegs = 21u;       // DCN4_01_CRB_SIZE_KB (1344) / 64
-constexpr uint32_t kCrbSegmentBytes       = 65536u;    // 64 KiB per CRB segment
-constexpr uint32_t kDefaultCompbufSegs    = 5u;        // DCN4_01_DEFAULT_DET_SIZE (320 KiB = 5 segs)
-constexpr uint32_t kDisp2Det0Segs         = 3u;        // disp2 invariant: DET0 = 0x303
-constexpr uint32_t kDisp2PipeDetSegs      = 3u;        // disp2 invariant: DET1/DET2 = 3
+constexpr uint32_t kDisp2DetSegs          = 3u;
 constexpr uint32_t kUefiCrbBudgetSegs     = 13u;
 constexpr uint32_t kTargetDet0Segs        = 9u;
 constexpr uint32_t kDetPollMaxIters       = 2000u;     // 20 ms at 10 us/step
@@ -120,7 +118,10 @@ inline ExpandResult expand_single_pipe_det0(const Hw &hw, uint32_t targetSegs = 
 	// 2. Check CRB budget against max(COMPBUF_SIZE, COMPBUF_SIZE_CURRENT) and DET0_SIZE_CURRENT.
 	const uint32_t compRaw = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
 	const uint32_t det0Raw = hw.rdSeg2(hw.cookie, kSeg2Det0Ctrl);
-	if (compRaw == 0xffffffffu || det0Raw == 0xffffffffu) { res.status = kIoError; return res; }
+	if (compRaw == 0xffffffffu || (compRaw & kCompbufCfgErrMask) != 0u || det0Raw == 0xffffffffu) {
+		res.status = kIoError;
+		return res;
+	}
 	const uint32_t compProg = compRaw & kDetSizeMask;
 	const uint32_t compCur = (compRaw & kDetCurMask) >> kDetCurShift;
 	res.compbufCur = (compProg > compCur) ? compProg : compCur;
@@ -178,139 +179,95 @@ struct CrbPlan {
 	Status status { kSkippedBudget };
 	uint32_t compbufSegs { 0u };
 	uint32_t detSegs[kNumPipes] {};
-	uint32_t compbufReserved64B { 64u }; // 2048 B / 32 = 64 (4096 B)
 	bool disp2Preserved { false };
 };
 
-// Distribute 21-segment (1344 KiB) hardware CRB across active pipes and COMPBUF,
-// preserving disp2 DET0=0x303 and DET1/2=3 invariants when `disp2Active` is true.
-inline CrbPlan plan_crb_distribution(uint32_t activePipeMask,
-                                     uint32_t compbufSegs = kDefaultCompbufSegs,
-                                     uint32_t crbBudgetSegs = kHardwareCrbBudgetSegs,
-                                     bool disp2Active = false) {
+// DET and COMPBUF sizes come from the solved mode; pipe counts alone cannot determine them.
+inline CrbPlan plan_crb_distribution(uint32_t activePipeMask, uint32_t compbufSegs,
+                                     const uint32_t (&modeDetSegs)[kNumPipes], bool disp2Active = false) {
 	CrbPlan plan {};
-	const uint32_t mask = activePipeMask & ((1u << kNumPipes) - 1u);
-	if (mask == 0u || compbufSegs >= crbBudgetSegs || crbBudgetSegs > 31u) {
-		plan.status = kSkippedBudget;
-		return plan;
-	}
-
-	uint32_t activeCount = 0u;
-	for (uint32_t p = 0u; p < kNumPipes; ++p) {
-		if ((mask & (1u << p)) != 0u) ++activeCount;
-	}
-	uint32_t remaining = crbBudgetSegs - compbufSegs;
-
-	if (disp2Active) {
-		// Preserve UEFI/disp2 invariant: keep COMPBUF modest if needed, DET0 >= 3 (0x303),
-		// and DET1/DET2 == 3 on active disp2 pipes.
-		if (remaining < activeCount * kDisp2PipeDetSegs) {
-			plan.status = kSkippedBudget;
+	if (activePipeMask == 0u || activePipeMask >= (1u << kNumPipes) || compbufSegs >= kHardwareCrbBudgetSegs) return plan;
+	uint32_t used = compbufSegs;
+	for (uint32_t pipe = 0u; pipe < kNumPipes; ++pipe) {
+		const bool active = (activePipeMask & (1u << pipe)) != 0u;
+		const bool preserve = disp2Active && pipe < 3u;
+		const uint32_t target = modeDetSegs[pipe];
+		if (target > kHardwareCrbBudgetSegs || active != (target != 0u)) return plan;
+		if (preserve && target > kDisp2DetSegs) {
+			plan.status = kSkippedMultiPipe;
 			return plan;
 		}
-		if ((mask & 1u) != 0u) {
-			plan.detSegs[0] = kDisp2Det0Segs;
-			remaining -= kDisp2Det0Segs;
-		}
-		for (uint32_t p = 1u; p < kNumPipes; ++p) {
-			if ((mask & (1u << p)) != 0u) {
-				plan.detSegs[p] = kDisp2PipeDetSegs;
-				remaining -= kDisp2PipeDetSegs;
-			}
-		}
-		// Give any remaining budget above the 3-seg floor only to non-disp2 pipes or DET0 if idle,
-		// keeping secondary disp2 pipes strictly at 3 segments.
-		if ((mask & 1u) != 0u && remaining > 0u) {
-			plan.detSegs[0] += remaining;
-		}
-		plan.compbufSegs = compbufSegs;
-		plan.disp2Preserved = true;
-		plan.status = kOk;
-		return plan;
+		plan.detSegs[pipe] = preserve ? kDisp2DetSegs : target;
+		used += plan.detSegs[pipe];
 	}
-
-	const uint32_t base = remaining / activeCount;
-	uint32_t extra = remaining % activeCount;
-	if (base == 0u) {
-		plan.status = kSkippedBudget;
-		return plan;
-	}
-	for (uint32_t p = 0u; p < kNumPipes; ++p) {
-		if ((mask & (1u << p)) == 0u) continue;
-		uint32_t seg = base + (extra > 0u ? 1u : 0u);
-		if (extra > 0u) --extra;
-		if (seg > kDetSizeMask) seg = kDetSizeMask;
-		plan.detSegs[p] = seg;
-	}
+	if (used > kHardwareCrbBudgetSegs) return plan;
 	plan.compbufSegs = compbufSegs;
+	plan.disp2Preserved = disp2Active;
 	plan.status = kOk;
 	return plan;
 }
 
-// Program multi-pipe DET & COMPBUF across all 4 pipes using strict shrink-before-grow ordering.
-inline Status program_multi_pipe_det(const Hw &hw, const CrbPlan &plan,
-                                     uint32_t crbBudgetSegs = kHardwareCrbBudgetSegs) {
+// Caller owns the pipe state and must validate the target allocation against the mode.
+// COMPBUF_RESERVED_SPACE is set at CRB initialization from the pixel chunk size, not here.
+inline Status program_multi_pipe_det(const Hw &hw, const CrbPlan &plan) {
 	if (!hw.rdSeg2 || !hw.wrSeg2 || plan.status != kOk) return kIoError;
+	if (plan.compbufSegs > kHardwareCrbBudgetSegs) return kSkippedBudget;
 	uint32_t sum = plan.compbufSegs;
 	for (uint32_t p = 0u; p < kNumPipes; ++p) {
 		if (plan.detSegs[p] > kDetSizeMask) return kSkippedBudget;
 		sum += plan.detSegs[p];
 	}
-	if (sum > crbBudgetSegs) return kSkippedBudget;
+	if (sum > kHardwareCrbBudgetSegs) return kSkippedBudget;
 
-	const uint32_t compRaw = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
-	if (compRaw == 0xffffffffu) return kIoError;
-	const uint32_t compCur = (compRaw & kDetCurMask) >> kDetCurShift;
-
-	uint32_t detRaw[kNumPipes] {};
-	uint32_t detCur[kNumPipes] {};
-	for (uint32_t p = 0u; p < kNumPipes; ++p) {
-		detRaw[p] = hw.rdSeg2(hw.cookie, kSeg2Det0Ctrl + p);
-		if (detRaw[p] == 0xffffffffu) return kIoError;
-		detCur[p] = (detRaw[p] & kDetCurMask) >> kDetCurShift;
-	}
-
-	// Phase 1: shrink COMPBUF or any DET pipe whose target < current first.
-	if (plan.compbufSegs < compCur) {
-		if (!hw.wrSeg2(hw.cookie, kSeg2CompbufCtrl,
-		               (compRaw & ~kDetSizeMask) | (plan.compbufSegs & kDetSizeMask))) {
-			return kIoError;
+	uint32_t raw[kNumPipes + 1u] {};
+	uint32_t allocated[kNumPipes + 1u] {};
+	uint32_t liveSum = 0u;
+	for (uint32_t block = 0u; block <= kNumPipes; ++block) {
+		const bool comp = block == kNumPipes;
+		const uint32_t reg = comp ? kSeg2CompbufCtrl : kSeg2Det0Ctrl + block;
+		raw[block] = hw.rdSeg2(hw.cookie, reg);
+		if (raw[block] == 0xffffffffu || (comp && (raw[block] & kCompbufCfgErrMask) != 0u)) return kIoError;
+		const uint32_t request = raw[block] & kDetSizeMask;
+		const uint32_t current = (raw[block] & kDetCurMask) >> kDetCurShift;
+		if (plan.disp2Preserved && block < 3u) {
+			if (plan.detSegs[block] != kDisp2DetSegs || request != kDisp2DetSegs ||
+			    (current != kDisp2DetSegs && (block == 0u || current != 0u))) return kSkippedMultiPipe;
 		}
-		if (!wait_crb_current(hw, kSeg2CompbufCtrl, plan.compbufSegs)) return kPollTimeout;
+		allocated[block] = request > current ? request : current;
+		liveSum += allocated[block];
 	}
-	for (uint32_t p = 0u; p < kNumPipes; ++p) {
-		if (plan.detSegs[p] < detCur[p] ||
-		    (plan.detSegs[p] == 0u && (detRaw[p] & kDetSizeMask) != 0u)) {
-			if (!hw.wrSeg2(hw.cookie, kSeg2Det0Ctrl + p,
-			               (detRaw[p] & ~kDetSizeMask) | (plan.detSegs[p] & kDetSizeMask))) {
-				return kIoError;
+	if (liveSum > kHardwareCrbBudgetSegs) return kSkippedBudget;
+
+	// Shrinking must be confirmed before any growth can reuse the released segments.
+	for (uint32_t phase = 0u; phase < 2u; ++phase) {
+		const bool grow = phase == 1u;
+		for (uint32_t block = 0u; block <= kNumPipes; ++block) {
+			if (plan.disp2Preserved && block < 3u) continue;
+			const bool comp = block == kNumPipes;
+			const uint32_t target = comp ? plan.compbufSegs : plan.detSegs[block];
+			if ((target > allocated[block]) != grow) continue;
+			const uint32_t expected = target | (target << kDetCurShift);
+			if ((raw[block] & (kDetSizeMask | kDetCurMask)) == expected) continue;
+			const uint32_t reg = comp ? kSeg2CompbufCtrl : kSeg2Det0Ctrl + block;
+			const uint32_t write = (comp ? raw[block] & kCompbufIntEnable : 0u) | target;
+			if (!hw.wrSeg2(hw.cookie, reg, write)) return kIoError;
+			bool matched = false;
+			for (uint32_t attempt = 0u; attempt < kDetPollMaxIters; ++attempt) {
+				const uint32_t value = hw.rdSeg2(hw.cookie, reg);
+				if (value == 0xffffffffu || (comp && (value & kCompbufCfgErrMask) != 0u)) return kIoError;
+				if ((value & (kDetSizeMask | kDetCurMask)) == expected) {
+					matched = true;
+					break;
+				}
+				if (hw.delayUs) hw.delayUs(hw.cookie, 10u);
 			}
-			if (!wait_det_current(hw, p, plan.detSegs[p])) return kPollTimeout;
-		}
-	}
-
-	// Phase 2: grow COMPBUF and DET pipes, then set COMPBUF_RESERVED_SPACE and verify CONFIG_ERROR == 0.
-	if (plan.compbufSegs > compCur || (compRaw & kDetSizeMask) != plan.compbufSegs) {
-		const uint32_t cLatest = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
-		if (cLatest == 0xffffffffu ||
-		    !hw.wrSeg2(hw.cookie, kSeg2CompbufCtrl,
-		               (cLatest & ~kDetSizeMask) | (plan.compbufSegs & kDetSizeMask))) {
-			return kIoError;
-		}
-		if (!wait_crb_current(hw, kSeg2CompbufCtrl, plan.compbufSegs)) return kPollTimeout;
-	}
-	for (uint32_t p = 0u; p < kNumPipes; ++p) {
-		if (plan.detSegs[p] > detCur[p]) {
-			const uint32_t latest = hw.rdSeg2(hw.cookie, kSeg2Det0Ctrl + p);
-			if (latest == 0xffffffffu ||
-			    !hw.wrSeg2(hw.cookie, kSeg2Det0Ctrl + p,
-			               (latest & ~kDetSizeMask) | (plan.detSegs[p] & kDetSizeMask))) {
-				return kIoError;
+			if (!matched) return kPollTimeout;
+			if (!comp) {
+				const uint32_t compValue = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
+				if (compValue == UINT32_MAX || (compValue & kCompbufCfgErrMask) != 0u) return kIoError;
 			}
-			if (!wait_det_current(hw, p, plan.detSegs[p])) return kPollTimeout;
 		}
 	}
-	(void)hw.wrSeg2(hw.cookie, kSeg2CompbufRsvSpace, plan.compbufReserved64B & 0xfffu);
 	const uint32_t compAfter = hw.rdSeg2(hw.cookie, kSeg2CompbufCtrl);
 	return (compAfter != 0xffffffffu && (compAfter & kCompbufCfgErrMask) == 0u) ? kOk : kIoError;
 }
@@ -334,40 +291,44 @@ struct WatermarkSet {
 struct HubbubWatermarks {
 	WatermarkSet setA;
 	WatermarkSet setB;
-	bool selectSetB { false };
 };
 
-// Program DCHUBBUB ARB urgent, stutter, UCLK/FCLK P-state (sets A & B) and trigger
-// atomic watermark change request (dcn401_hubbub.c layout: Set B sits +0x13 above Set A).
-inline bool program_hubbub_watermarks(const Hw &hw, const HubbubWatermarks &wm) {
+// Inputs are mode-validated reference-cycle and bandwidth values. DCN 4.01 programs both banks
+// without changing the running bank selector or requesting a switch.
+inline bool program_hubbub_watermarks(const Hw &hw, const HubbubWatermarks &wm, bool safeToLower = false) {
 	if (!hw.rdSeg2 || !hw.wrSeg2) return false;
-	auto progSet = [&](uint32_t baseDelta, const WatermarkSet &s) -> bool {
-		bool ok = true;
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmUrgA + baseDelta, s.urgent & 0x3fffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmUsrA + baseDelta, s.usrRetrain & 0x3fffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmTripMemA + baseDelta, s.refcycPerTripToMem & 0x3fffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmMetaTripA + baseDelta, s.refcycPerMetaTrip & 0x3fffu);
-		for (uint32_t i = 0u; i < 4u; ++i) {
-			ok &= hw.wrSeg2(hw.cookie, kSeg2WmSrEnterA + baseDelta + i * 2u, s.srEnter & 0xffffu);
-			ok &= hw.wrSeg2(hw.cookie, kSeg2WmSrExitA + baseDelta + i * 2u, s.srExit & 0xffffu);
-		}
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmUclkPstateA + baseDelta, s.uclkPstate & 0xffffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmUclkPstate1A + baseDelta, s.uclkPstate1 & 0xffffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmFclkPstateA + baseDelta, s.fclkPstate & 0xffffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmFclkPstate1A + baseDelta, s.fclkPstate1 & 0xffffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmFracNomA + baseDelta, s.fracUrgBwNom & 0x3ffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmFracFlipA + baseDelta, s.fracUrgBwFlip & 0x3ffu);
-		ok &= hw.wrSeg2(hw.cookie, kSeg2WmFracMallA + baseDelta, s.fracUrgBwMall & 0x3ffu);
-		return ok;
+	constexpr uint32_t kBankRegs = kSeg2WmUrgB - kSeg2WmUrgA;
+	const uint32_t values[2][kBankRegs] {
+		{ wm.setA.urgent, wm.setA.usrRetrain, wm.setA.refcycPerTripToMem, wm.setA.refcycPerMetaTrip,
+		  wm.setA.srEnter, wm.setA.srExit, wm.setA.srEnter, wm.setA.srExit,
+		  wm.setA.srEnter, wm.setA.srExit, wm.setA.srEnter, wm.setA.srExit,
+		  wm.setA.uclkPstate, wm.setA.uclkPstate1, wm.setA.fclkPstate, wm.setA.fclkPstate1,
+		  wm.setA.fracUrgBwNom, wm.setA.fracUrgBwFlip, wm.setA.fracUrgBwMall },
+		{ wm.setB.urgent, wm.setB.usrRetrain, wm.setB.refcycPerTripToMem, wm.setB.refcycPerMetaTrip,
+		  wm.setB.srEnter, wm.setB.srExit, wm.setB.srEnter, wm.setB.srExit,
+		  wm.setB.srEnter, wm.setB.srExit, wm.setB.srEnter, wm.setB.srExit,
+		  wm.setB.uclkPstate, wm.setB.uclkPstate1, wm.setB.fclkPstate, wm.setB.fclkPstate1,
+		  wm.setB.fracUrgBwNom, wm.setB.fracUrgBwFlip, wm.setB.fracUrgBwMall },
 	};
-	if (!progSet(0u, wm.setA) || !progSet(0x13u, wm.setB)) return false;
-
-	const uint32_t selMask = (1u << 0) | (1u << 25) | (1u << 26); // WM/UCLK/FCLK set select
-	const uint32_t cur = hw.rdSeg2(hw.cookie, kSeg2WmChangeCntl);
-	const uint32_t next = (cur == 0xffffffffu ? 0u : cur) & ~selMask;
-	const uint32_t armed = next | (wm.selectSetB ? selMask : 0u);
-	if (!hw.wrSeg2(hw.cookie, kSeg2WmChangeCntl, armed)) return false;
-	return hw.wrSeg2(hw.cookie, kSeg2WmChangeCntl, armed | (1u << 8)); // WATERMARK_CHANGE_REQUEST
+	uint32_t unchanged[2][kBankRegs] {};
+	for (uint32_t bank = 0u; bank < 2u; ++bank) {
+		for (uint32_t idx = 0u; idx < kBankRegs; ++idx) {
+			const uint32_t reg = kSeg2WmUrgA + idx;
+			const uint32_t mask = reg < kSeg2WmSrEnterA ? 0x3fffu : reg < kSeg2WmFracNomA ? 0xffffu : 0x3ffu;
+			const uint32_t old = hw.rdSeg2(hw.cookie, reg + bank * kBankRegs);
+			if (old == UINT32_MAX || values[bank][idx] > mask ||
+			    (!safeToLower && values[bank][idx] < (old & mask))) return false;
+			unchanged[bank][idx] = old & ~mask;
+		}
+	}
+	for (uint32_t bank = 0u; bank < 2u; ++bank) {
+		for (uint32_t idx = 0u; idx < kBankRegs; ++idx) {
+			const uint32_t reg = kSeg2WmUrgA + bank * kBankRegs + idx;
+			const uint32_t value = unchanged[bank][idx] | values[bank][idx];
+			if (!hw.wrSeg2(hw.cookie, reg, value) || hw.rdSeg2(hw.cookie, reg) != value) return false;
+		}
+	}
+	return true;
 }
 
 struct HubpTtuTiming {
@@ -381,35 +342,51 @@ struct HubpTtuTiming {
 
 // Program per-pipe HUBPREQ TTU timing & QoS watermarks within DCHUBBUB..CURSOR0 allowlist.
 inline bool program_hubp_ttu(const Hw &hw, uint32_t pipe, const HubpTtuTiming &t) {
-	if (!hw.wrSeg2 || pipe >= kNumPipes) return false;
+	if (!hw.rdSeg2 || !hw.wrSeg2 || pipe >= kNumPipes ||
+	    t.qosLevelLowWm > t.qosLevelHighWm || t.qosLevelHighWm > 0x3fffu ||
+	    t.refcycPerReqDelivery > 0x7fffffu || t.qosLevelFixed > 0xfu ||
+	    t.refcycPerReqDeliveryPre > 0x7fffffu) return false;
 	const uint32_t hb = pipe * kSeg2HubpStride;
-	bool ok = true;
-	ok &= hw.wrSeg2(hw.cookie, kSeg2HubpReq0TtuQosWm + hb,
-	                (t.qosLevelLowWm & 0x3fffu) | ((t.qosLevelHighWm & 0x3fffu) << 16));
-	ok &= hw.wrSeg2(hw.cookie, kSeg2HubpReq0Ttu0 + hb,
-	                (t.refcycPerReqDelivery & 0x7fffffu) |
-	                ((t.qosLevelFixed & 0xfu) << 24) |
-	                (t.qosRampDisable ? (1u << 28) : 0u));
-	ok &= hw.wrSeg2(hw.cookie, kSeg2HubpReq0Ttu1 + hb, t.refcycPerReqDeliveryPre & 0x7fffffu);
-	return ok;
+	const uint32_t regs[] { kSeg2HubpReq0TtuQosWm + hb, kSeg2HubpReq0Ttu0 + hb, kSeg2HubpReq0Ttu1 + hb };
+	const uint32_t masks[] { 0x3fff3fffu, 0x1f7fffffu, 0x007fffffu };
+	uint32_t values[] {
+		t.qosLevelLowWm | (t.qosLevelHighWm << 16),
+		t.refcycPerReqDelivery | (t.qosLevelFixed << 24) | (t.qosRampDisable ? (1u << 28) : 0u),
+		t.refcycPerReqDeliveryPre,
+	};
+	for (uint32_t idx = 0u; idx < 3u; ++idx) {
+		const uint32_t old = hw.rdSeg2(hw.cookie, regs[idx]);
+		if (old == UINT32_MAX) return false;
+		values[idx] |= old & ~masks[idx];
+	}
+	for (uint32_t idx = 0u; idx < 3u; ++idx) {
+		if (!hw.wrSeg2(hw.cookie, regs[idx], values[idx]) || hw.rdSeg2(hw.cookie, regs[idx]) != values[idx]) return false;
+	}
+	return true;
 }
 
-// Clear OPTC0 underflow latch (without touching soft-reset bit 0), dwell `dwellUs`,
-// and return true if ANY OPTC0 underflow bit (0x2400) latched (fail-safe true on I/O error).
+inline bool clear_optc0_underflow_before_unpin(const Hw &hw) {
+	if (!hw.rdSeg2 || !hw.wrSeg2) return false;
+	const uint32_t initial = hw.rdSeg2(hw.cookie, kSeg2Optc0Global);
+	if (initial == UINT32_MAX || (initial & kOptcSoftResetBit)) return false;
+	const uint32_t base = initial & ~kOptcWriteClearMask;
+	if (!hw.wrSeg2(hw.cookie, kSeg2Optc0Global, base | kOptcUnderflowClear) ||
+	    !hw.wrSeg2(hw.cookie, kSeg2Optc0Global, base)) return false;
+	const uint32_t armed = hw.rdSeg2(hw.cookie, kSeg2Optc0Global);
+	return (armed & (kOptcUnderflowMask | kOptcUnderflowClear | kOptcSoftResetBit)) == 0u;
+}
+
 inline bool probe_optc0_underflow(const Hw &hw, uint32_t dwellUs, uint32_t *outReg = nullptr) {
-	if (!hw.rdSeg2 || !hw.wrSeg2) return true;
-	const uint32_t pre = hw.rdSeg2(hw.cookie, kSeg2Optc0Global);
-	if (pre == 0xffffffffu || (pre & kOptcSoftResetBit) != 0u) {
-		if (outReg) *outReg = pre;
-		return true;
+	if (!hw.rdSeg2 || (dwellUs && !hw.delayUs)) return true;
+	for (;;) {
+		const uint32_t observed = hw.rdSeg2(hw.cookie, kSeg2Optc0Global);
+		if (outReg) *outReg = observed;
+		if (observed & (kOptcUnderflowMask | kOptcUnderflowClear | kOptcSoftResetBit)) return true;
+		if (!dwellUs) return false;
+		const uint32_t stepUs = dwellUs < 1000u ? dwellUs : 1000u;
+		hw.delayUs(hw.cookie, stepUs);
+		dwellUs -= stepUs;
 	}
-	const uint32_t base = pre & ~kOptcWriteClearMask;
-	if (!hw.wrSeg2(hw.cookie, kSeg2Optc0Global, base | kOptcUnderflowClear)) return true;
-	if (!hw.wrSeg2(hw.cookie, kSeg2Optc0Global, base)) return true;
-	if (hw.delayUs && dwellUs > 0u) hw.delayUs(hw.cookie, dwellUs);
-	const uint32_t after = hw.rdSeg2(hw.cookie, kSeg2Optc0Global);
-	if (outReg) *outReg = after;
-	return after == 0xffffffffu || (after & kOptcUnderflowMask) != 0u;
 }
 
 }  // namespace rdna4det

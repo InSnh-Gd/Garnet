@@ -33,6 +33,12 @@ firmware submission. Both 4K60 cases use VACTIVE (method 1); the DSC and
 mixed-link cases use firmware SubVP (method 6). Zero phantom DET and the
 zero global FAMS2 config in the VACTIVE cases are direct solver outputs.
 
+For SubVP, the oracle also records the phantom stream's active height, total
+height and front porch, and each phantom DPP's luma QoS and request-delivery
+TTU fields. The Garnet test replays those fields through its existing TTU
+register helper against a simulated register bank. It does not program a
+complete phantom pipe or submit FAMS2 to firmware.
+
 ## Reproduce offline
 
 Build on little-endian x86_64 Linux with Clang (vectors captured with 21.1.8).

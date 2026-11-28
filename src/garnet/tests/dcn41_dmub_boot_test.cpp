@@ -24,6 +24,36 @@ constexpr uint32_t kCntl = kSegs[2] + DCN41_DMCUB_CNTL;
 constexpr uint32_t kCntl2 = kSegs[2] + DCN41_DMCUB_CNTL2;
 constexpr uint32_t kCw4Top = kSegs[2] + DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS;
 
+void test_vbios_inbox_reservation() {
+    constexpr uint64_t kVramSize = 16ULL << 30;
+    constexpr uint64_t kReserveStart = 0x3dac00000ULL;
+    constexpr uint32_t kReserveSize = 4U << 20;
+    dcn41_dmub_state state {};
+    state.enabled = state.mailbox_rdy = 1;
+    state.verdict = DCN41_DMUB_ALIVE_IDLE;
+    state.ring_map = DCN41_DMUB_MAP_REGION4;
+    state.fb_base_mc = 0x8000000000ULL;
+    state.ring_addr = state.fb_base_mc + kReserveStart;
+    state.inbox1_size = DCN41_DMUB_RB_SIZE;
+    check(dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, kReserveStart, kReserveSize),
+          "VBIOS inbox at the observed PSP extended reservation start fits");
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, kReserveStart + 0x1000, kReserveSize),
+          "inbox below the reservation start is not owned by the reservation");
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, kReserveStart, DCN41_DMUB_RB_SIZE - 1),
+          "partial overlap cannot prove ownership of the entire inbox");
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kReserveStart + DCN41_DMUB_RB_SIZE, kReserveStart, kReserveSize),
+          "reservation crossing VRAM top is not valid");
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, UINT64_MAX, kReserveSize),
+          "wrapped PSP reservation is not valid");
+    state.ring_addr = state.fb_base_mc - DCN41_DMUB_RB_SIZE;
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, kReserveStart, kReserveSize),
+          "invalid MC-to-VRAM conversion fails closed");
+    state.ring_addr = state.fb_base_mc + kReserveStart;
+    state.ring_map = DCN41_DMUB_MAP_UNKNOWN;
+    check(!dcn41_dmub_ring_in_vram_reservation(&state, kVramSize, kReserveStart, kReserveSize),
+          "unknown DMUB mapping does not prove reservation ownership");
+}
+
 struct SimDmubHw {
     dcn41_dev dev {};
     std::vector<uint32_t> regs;
@@ -33,6 +63,8 @@ struct SimDmubHw {
     uint32_t writes { 0 };
     bool injectPreflightFail { false };
     bool injectStopTimeout { false };
+    bool omitStopAck { false };
+    bool omitStopResponse { false };
     bool injectPwaitTimeout { false };
     bool injectWindowFail { false };
     bool injectPspFail { false };
@@ -66,8 +98,10 @@ struct SimDmubHw {
         s->regs[a] = v;
         if (a == 0x34c0u + DCN41_DMCUB_GPINT_DATAIN1 && (v & DCN41_DMUB_GPINT_STATUS_MASK) &&
             !s->injectStopTimeout) {
-            s->regs[a] = v & ~DCN41_DMUB_GPINT_STATUS_MASK;
-            s->regs[0x34c0u + DCN41_DMCUB_SCRATCH7] = DCN41_DMUB_GPINT_STOP_FW_RESPONSE;
+            if (!s->omitStopAck)
+                s->regs[a] = v & ~DCN41_DMUB_GPINT_STATUS_MASK;
+            if (!s->omitStopResponse)
+                s->regs[0x34c0u + DCN41_DMCUB_SCRATCH7] = DCN41_DMUB_GPINT_STOP_FW_RESPONSE;
             if (!s->injectPwaitTimeout)
                 s->regs[0x34c0u + DCN41_DMCUB_CNTL] |= DCN41_DMCUB_CNTL__DMCUB_PWAIT_MODE_STATUS_MASK;
         }
@@ -149,6 +183,7 @@ std::vector<uint8_t> make_signed_fixture(bool dalFw, uint32_t footerBytes = 256u
 } // namespace
 
 int main(int argc, char **argv) {
+    test_vbios_inbox_reservation();
     check(!rdna4dmub::dmcub_fw_opt_in(false, 0u), "garnet-dmcub-fw absent defaults OFF");
     check(!rdna4dmub::dmcub_fw_opt_in(true, 0u), "garnet-dmcub-fw=0 disables DAL DMUB");
     check(rdna4dmub::dmcub_fw_opt_in(true, 1u), "garnet-dmcub-fw=1 opts in");
@@ -234,6 +269,23 @@ int main(int argc, char **argv) {
         hw.regs[kCw4Top] = DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_ENABLE_MASK;
         check(dcn41_dmub_stop_and_reset(&hw.dev, 4u) == DCN41_E_READBACK && hw.regs[kCw4Top] != 0u,
               "dropped reset or disable write leaves VBIOS windows intact");
+    }
+
+    {
+        SimDmubHw hw;
+        hw.omitStopAck = true;
+        hw.regs[kCw4Top] = DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_ENABLE_MASK;
+        check(dcn41_dmub_stop_and_reset(&hw.dev, 4u) == DCN41_E_TIMEOUT && hw.regs[kCw4Top] != 0u &&
+              hw.regs[kCntl2] == 0u && hw.regs[kGpint] == 0u,
+              "DEADDEAD and PWAIT do not replace the GPINT STOP acknowledgement");
+    }
+    {
+        SimDmubHw hw;
+        hw.omitStopResponse = true;
+        hw.regs[kCw4Top] = DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_ENABLE_MASK;
+        check(dcn41_dmub_stop_and_reset(&hw.dev, 4u) == DCN41_E_TIMEOUT && hw.regs[kCw4Top] != 0u &&
+              hw.regs[kCntl2] == 0u && hw.regs[kGpint] == 0u,
+              "GPINT STOP acknowledgement and PWAIT do not replace DEADDEAD");
     }
 
     // 1. Default OFF fails closed to VBIOS without touching HW

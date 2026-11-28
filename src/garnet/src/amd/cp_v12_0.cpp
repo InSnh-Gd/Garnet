@@ -2225,7 +2225,7 @@ cp_enable(const DeviceContext &dev, bool enable)
 kern_return_t
 cp_kick_doorbell(const DeviceContext &dev, const CPContext &cp)
 {
-    if (!cp.inited) return kIOReturnNotReady;
+    if (!cp.inited || dev.graphicsPowerQuarantined()) return kIOReturnNotReady;
     if (dev.bar2 == nullptr) return kIOReturnNotAttached;
     if (cp.wb_cpu == nullptr) return kIOReturnNotReady;
 
@@ -2859,7 +2859,7 @@ kern_return_t
 cp_compute_submit_ib(const DeviceContext &dev, ComputeQueue &cq, uint64_t ib_gpu_va,
                      uint32_t length_dw, uint32_t vmid, uint32_t *out_fence)
 {
-    if (!cq.inited || cq.fence_cpu == nullptr) return kIOReturnNotReady;
+    if (!cq.inited || cq.fence_cpu == nullptr || dev.graphicsPowerQuarantined()) return kIOReturnNotReady;
     if (length_dw == 0 || length_dw > 0xFFFFFu) return kIOReturnBadArgument;
     if ((ib_gpu_va & 0x3ull) != 0 || vmid > 15) return kIOReturnBadArgument;
 

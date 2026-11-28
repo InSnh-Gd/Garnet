@@ -13,6 +13,8 @@ struct fixture_expected_stream {
     uint32_t surface_mall_bytes, svp_mall_bytes;
     bool phantom;
     uint8_t fams2_base[48], fams2_sub[20];
+    uint32_t phantom_vertical[3];
+    uint32_t phantom_luma_ttu[4][6];
 };
 
 struct fixture_expected {

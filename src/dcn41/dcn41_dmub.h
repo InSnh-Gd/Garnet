@@ -166,6 +166,9 @@ struct dcn41_dmub_state {
 };
 /* Reads only (27 registers, no write, no delay). Classifies the firmware and locates the inbox1 ring. */
 int dcn41_dmub_probe(struct dcn41_dev *dev, struct dcn41_dmub_state *st);
+/* Containment only: neither this nor dcn41_dmub_probe proves firmware recovery. */
+bool dcn41_dmub_ring_in_vram_reservation(const struct dcn41_dmub_state *st, uint64_t vram_size,
+                                        uint64_t reserve_vram_off, uint32_t reserve_size);
 
 /* ---- GPINT: the register command channel ----------------------------------------------------------------- */
 /* dmub_srv_send_gpint_command: DATAIN1 = status 1 | command << 16 | param; then up to timeout_us times udelay(1) and

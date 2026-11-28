@@ -46,6 +46,21 @@ static const struct { uint32_t off; uint32_t base_idx; } dcn41_dmub_probe_regs[]
 };
 #define DCN41_DMUB_PROBE_NREGS (sizeof(dcn41_dmub_probe_regs) / sizeof(dcn41_dmub_probe_regs[0]))
 
+bool dcn41_dmub_ring_in_vram_reservation(const struct dcn41_dmub_state *st, uint64_t vram_size,
+                                        uint64_t reserve_vram_off, uint32_t reserve_size)
+{
+    if (!st || (st->ring_map != DCN41_DMUB_MAP_CW4 && st->ring_map != DCN41_DMUB_MAP_REGION4) ||
+        !st->fb_base_mc || st->ring_addr < st->fb_base_mc || st->ring_addr >= (1ull << 48) ||
+        !st->inbox1_size || st->inbox1_size > DCN41_DMUB_MAX_RING || st->inbox1_size % DCN41_DMUB_CMD_SIZE ||
+        reserve_vram_off > vram_size || reserve_size > vram_size - reserve_vram_off)
+        return false;
+    const uint64_t inbox_vram_off = st->ring_addr - st->fb_base_mc;
+    if (inbox_vram_off < reserve_vram_off)
+        return false;
+    const uint64_t within_reserve = inbox_vram_off - reserve_vram_off;
+    return within_reserve <= reserve_size && st->inbox1_size <= reserve_size - within_reserve;
+}
+
 int dcn41_dmub_probe(struct dcn41_dev *dev, struct dcn41_dmub_state *st)
 {
     uint32_t addr[DCN41_DMUB_PROBE_NREGS], v[DCN41_DMUB_PROBE_NREGS];

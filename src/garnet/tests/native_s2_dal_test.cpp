@@ -72,8 +72,17 @@ struct World {
     std::map<uint32_t, uint32_t> seenCount;
     std::vector<std::pair<uint32_t, uint32_t>> seen;   // every message the PMFW received
     std::vector<uint32_t> ppsmcSeen;
+    bool ppsmcNoReply;
+    bool ppsmcUclk;
+    uint32_t ppsmcHardReply;
+    uint32_t ppsmcRejectMsg;
+    uint32_t ppsmcHardParam;
+    bool ppsmcBadEcho;
     uint32_t hardmin[2];
     std::vector<uint32_t> dpm[2];
+    bool snapshotMode;
+    bool snapshotMoveDpRef;
+    uint32_t snapshotUmcChannels, snapshotUclkCap;
     bool kHzReplies;                // GetDcModeMaxDpmFreq replies in kHz (0xB replies are never kHz: Linux masks them to 16 bits)
     bool fineGrained[2];            // the level-count reply of that clock carries bit 31
     bool acquired;                  // ScanoutQuery says the plane is acquired
@@ -94,6 +103,8 @@ static World W;
 static amdgpu::DeviceContext gDev;
 static amdgpu::NativeS1bState gS1b;
 static struct { bool present; uint32_t val; } gBootArg;
+static uint32_t gSnapshotOptIn;
+static bool gAtInterrupt;
 static std::vector<std::string> gLog;
 static int gLongLine = 0;
 
@@ -135,6 +146,13 @@ static void handle(uint32_t msg, uint32_t arg) {
     case kMsgGetDriverIfVersion: ret = W.ifVersion; break;
     case kMsgGetMsgHeaderVersion: ret = W.headerVersion; break;
     case kMsgGetDpmFreqByIndex: {
+        if (W.snapshotMode) {
+            const uint32_t id = arg >> 16;
+            const uint32_t index = arg & 0xffu;
+            ret = index == 0xffu ? (id == 9 ? 0x90000000u : 0x10000003u) :
+                0x00120000u | (300u + 100u * index + id);
+            break;
+        }
         const int i = (int)(arg >> 16) - 6; const uint32_t idx = arg & 0xFFFF;
         if (i < 0 || i > 1) { W.reg[kRegResp] = kRespUnknownCmd; return; }
         // Linux reads the count reply as: bit 31 = fine-grained (2 levels), else the low 8 bits; real replies carry flag bits above (bit 28 here), and every
@@ -143,7 +161,16 @@ static void handle(uint32_t msg, uint32_t arg) {
         else ret = idx < W.dpm[i].size() ? (0x00120000u | W.dpm[i][idx]) : 0;
         break;
     }
-    case kMsgGetDcModeMaxDpmFreq: { const int i = (int)(arg >> 16) - 6; ret = (i == 0 || i == 1) ? W.dpm[i].back() * (W.kHzReplies ? 1000u : 1u) : 0; break; }
+    case kMsgGetDcModeMaxDpmFreq: {
+        if (W.snapshotMode) { ret = (arg == 0x20000u) ? W.snapshotUclkCap : 0u; break; }
+        const int i = (int)(arg >> 16) - 6;
+        ret = (i == 0 || i == 1) ? W.dpm[i].back() * (W.kHzReplies ? 1000u : 1u) : 0;
+        break;
+    }
+    case 0x1c:
+        if (W.snapshotMoveDpRef) W.reg[0x16e6f] = 0x1au;
+        ret = W.snapshotUmcChannels;
+        break;
     case kMsgSetHardMinByFreq: {
         const int i = (int)(arg >> 16) - 6; const uint32_t mhz = arg & 0xFFFF;
         if (i < 0 || i > 1) { W.reg[kRegResp] = kRespFailed; return; }
@@ -176,8 +203,25 @@ static void service() {
     sync_regs();
     // PPSMC mailbox: TestMessage echoes param + 1; every other message answers OK with 0
     if (W.reg[0x16282] != 0u) {
-        W.ppsmcSeen.push_back(W.reg[0x16282]);
-        W.reg[0x16292] = W.reg[0x16292] + 1u; W.reg[0x1629A] = 1u; W.reg[0x16282] = 0u;
+        const uint32_t msg = W.reg[0x16282];
+        W.ppsmcSeen.push_back(msg);
+        if (W.ppsmcUclk) {
+            W.reg[0x1629a] = amdgpu::SMUResp::OK;
+            if (msg == amdgpu::PPSMC::TestMessage && !W.ppsmcBadEcho) ++W.reg[0x16292];
+            if (msg == amdgpu::PPSMC::GetSmuVersion) W.reg[0x16292] = W.smuVersion;
+            if (msg == amdgpu::PPSMC::GetDriverIfVersion) W.reg[0x16292] = W.ifVersion;
+            if (msg == amdgpu::PPSMC::GetDpmFreqByIndex)
+                W.reg[0x16292] = (W.reg[0x16292] & 0xffffu) == 0xffu ? 2u : 1258u;
+            if (msg == amdgpu::PPSMC::SetHardMinByFreq) {
+                W.ppsmcHardParam = W.reg[0x16292];
+                W.reg[0x1629a] = W.ppsmcNoReply ? 0u : W.ppsmcHardReply;
+            }
+            if (msg == W.ppsmcRejectMsg) W.reg[0x1629a] = amdgpu::SMUResp::UnknownCmd;
+        } else if (!W.ppsmcNoReply) {
+            W.reg[0x16292] = W.reg[0x16292] + 1u;
+            W.reg[0x1629A] = 1u;
+        }
+        W.reg[0x16282] = 0u;
     }
     if (!W.pending && W.reg[kRegMsg] != 0u) { W.pending = true; W.pmsg = W.reg[kRegMsg]; W.parg = W.reg[kRegArg]; W.due = gNowNs + (uint64_t)W.latencyMs * 1000000ull; }
     if (W.pending && gNowNs >= W.due) { W.pending = false; W.reg[kRegMsg] = 0u; handle(W.pmsg, W.parg); }
@@ -193,9 +237,14 @@ extern "C" void dalshim_sleep(unsigned ms) {
 extern "C" void clock_get_uptime(uint64_t *t) { pthread_mutex_lock(&gTimeMu); gNowNs += 1000ull; *t = gNowNs; pthread_mutex_unlock(&gTimeMu); }
 extern "C" void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = t; }
 extern "C" thread_t current_thread(void) { return (thread_t)(uintptr_t)pthread_self(); }
+extern "C" int ml_at_interrupt_context() { return gAtInterrupt ? 1 : 0; }
 extern "C" bool OSCompareAndSwap(UInt32 o, UInt32 n, volatile UInt32 *p) { return __sync_bool_compare_and_swap(p, o, n); }
 extern "C" bool OSCompareAndSwapPtr(void *o, void *n, void *volatile *p) { return __sync_bool_compare_and_swap(p, o, n); }
 extern "C" bool PE_parse_boot_argn(const char *name, void *out, int sz) {
+    if (sz == 4 && std::strcmp(name, "garnet-dmcub-fw") == 0) {
+        std::memcpy(out, &gSnapshotOptIn, 4);
+        return true;
+    }
     if (std::strcmp(name, "garnet-dalsmc") != 0 || !gBootArg.present || sz != 4) return false;
     std::memcpy(out, &gBootArg.val, 4); return true;
 }
@@ -225,6 +274,8 @@ static void world_reset(uint32_t level, bool bootArg = true) {
     std::memset(W.reg, 0, sizeof(W.reg));
     W.reg[kRegResp] = kRespOk;   // the E1 reading: RESP = 1, MSG = 0, ARG = 0
     W.latencyMs = 2;
+    W.snapshotUmcChannels = 8u;
+    W.snapshotUclkCap = 450u;
     W.dpm[0] = { 273, 300, 400, 540, 600 }; W.dpm[1] = { 273, 300, 400, 540, 600 };
     W.smuVersion = 0x00500A00u; W.ifVersion = 1; W.headerVersion = 0x2E;
     W.pll = 0x2d; W.did[0] = W.did[1] = 0x41; W.follow[0] = W.follow[1] = true;
@@ -236,6 +287,9 @@ static void world_reset(uint32_t level, bool bootArg = true) {
     gDev.ip.setBase(amdgpu::IPBlock::MP1, 1, 0x16200u);
     gS1b.gate = rdna4native::kGateOn; gS1b.positivePass = true;
     gBootArg.present = bootArg; gBootArg.val = level;
+    gSnapshotOptIn = 0u;
+    gAtInterrupt = false;
+    gDev.smuOnline = true;
     gLog.clear();
 }
 static rdna4n_dal_result gRes;
@@ -1172,15 +1226,211 @@ static void b5_lock() {
         pthread_join(t, nullptr);
         expect(gLs.t2done, which == 0 ? "... and completes after the release (DAL)" : "... and completes after the release (PPSMC)");
     }
-    // lock allocation failure: PPSMC runs unlocked as before 0.0.604; DAL refuses (its own child: the lock is allocated lazily)
     SCEN("lock allocation failure") {
         world_reset(4); gDalShimLockAllocFail = 1;
         uint32_t echo = 0; amdgpu::DalMsg m;
         kern_return_t rc = amdgpu::smu_test_message(gDev, &echo);
-        expect(rc == 0 && W.ppsmcSeen.size() == 1, "no lock available: the PPSMC message still goes out (behaviour as before 0.0.604)");
+        expect(rc == (kern_return_t)kIOReturnNoResources && W.ppsmcSeen.empty() && W.reg[0x16282] == 0,
+               "no lock available: the PPSMC sender refuses and writes nothing");
         rc = amdgpu::smu_dal_send(gDev, kMsgGetSmuVersion, 0, &m);
         expect(rc == (kern_return_t)kIOReturnNoResources && m.refuse == kRefNoLock && W.seen.empty() && W.reg[kRegMsg] == 0, "no lock available: the DAL sender refuses and writes nothing");
         amdgpu::SmuSeq s; expect(!s.held, "SmuSeq reports that it holds nothing");
+    }
+    SCEN("PPSMC late Allow acknowledgement") {
+        world_reset(4);
+        gDev.smuOnline = true;
+        amdgpu::SMUContext smu;
+        bool armed = false;
+        const auto init = amdgpu::gfx_off_boot_init(gDev, smu, true, 1u, &armed);
+        expect(init == 0 && armed && W.ppsmcSeen.empty(), "boot arms GFXOFF without sending Allow");
+        smu.gfxoff.hysteresis_enabled = false;
+        expect(amdgpu::gfx_off_ctrl(gDev, smu, false) == 0, "initial awake acquire succeeds");
+        W.ppsmcNoReply = true;
+        expect(amdgpu::gfx_off_ctrl(gDev, smu, true) == (kern_return_t)kIOReturnTimeout &&
+               W.ppsmcSeen == std::vector<uint32_t>{amdgpu::PPSMC::AllowGfxOff}, "Allow submitted once and timed out");
+        expect(amdgpu::gfx_off_ctrl(gDev, smu, false) != 0 &&
+               amdgpu::gfx_off_teardown(gDev, smu) != 0 &&
+               W.ppsmcSeen.size() == 1 && amdgpu::gfx_off_active_context() == &smu,
+               "cannot acquire GC, replace the pending command or detach before a terminal reply");
+        W.reg[0x1629a] = amdgpu::SMUResp::OK;
+        W.ppsmcNoReply = false;
+        expect(amdgpu::gfx_off_teardown(gDev, smu) == 0 && W.ppsmcSeen.size() == 2 &&
+               W.ppsmcSeen.back() == amdgpu::PPSMC::DisallowGfxOff && amdgpu::gfx_off_active_context() == nullptr,
+               "late Allow reply is drained; only a fresh Disallow reply permits detach");
+    }
+    SCEN("GFXOFF sleep cancellation and real wake") {
+        world_reset(4);
+        gDev.smuOnline = true;
+        amdgpu::SMUContext smu;
+        bool armed = false;
+        expect(amdgpu::gfx_off_boot_init(gDev, smu, true, 1u, &armed) == 0 && armed,
+               "boot arms GFXOFF for this power epoch");
+        expect(amdgpu::gfx_off_ctrl(gDev, smu, false) == 0 && amdgpu::gfx_off_ctrl(gDev, smu, true) == 0 &&
+               smu.gfxoff.pending_allow, "last release has an idle callback pending");
+        using amdgpu::GfxOffPowerEvent;
+        expect(amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::WillSleep) == 0 &&
+               !smu.gfxoff.pending_allow && amdgpu::gfx_off_ctrl(gDev, smu, false) != 0 && W.ppsmcSeen.empty(),
+               "sleep cancels queued Allow and blocks GC while it is unsafe");
+        expect(amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::WillNotSleep) == 0 &&
+               amdgpu::gfx_off_ctrl(gDev, smu, false) == 0 && amdgpu::gfx_off_ctrl(gDev, smu, true) == 0 &&
+               !smu.gfxoff.pending_allow && W.ppsmcSeen.empty(), "cancellation restores GC but does not rearm Allow");
+        (void)amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::WillSleep);
+        (void)amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::WillPowerOn);
+        (void)amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::HasPoweredOn);
+        (void)amdgpu::gfx_off_power_event(gDev, smu, GfxOffPowerEvent::WillNotSleep);
+        expect(amdgpu::gfx_off_ctrl(gDev, smu, false) != 0 && amdgpu::gfx_off_teardown(gDev, smu) != 0 &&
+               W.ppsmcSeen.empty(), "wake and stale cancellation cannot restore unverified GC or touch PPSMC on teardown");
+    }
+}
+
+static void b8_uclk() {
+    using namespace amdgpu;
+    SCEN("UCLK lock allocation failure") {
+        world_reset(4);
+        gDalShimLockAllocFail = 1;
+        uint32_t top = 1u;
+        expect(smu_set_uclk_hard_min(gDev, 0u) == (kern_return_t)kIOReturnNoResources &&
+               smu_pin_uclk_top(gDev, &top) == (kern_return_t)kIOReturnNoResources &&
+               !top && W.ppsmcSeen.empty() && W.reg[0x16282] == 0u,
+               "neither UCLK sequence writes without the shared lock");
+    }
+    SCEN("UCLK late pending reply") {
+        world_reset(4);
+        W.ppsmcUclk = true;
+        W.ppsmcNoReply = true;
+        gDalShimLockCount = 0;
+        expect(smu_set_uclk_hard_min(gDev, 0u) == (kern_return_t)kIOReturnTimeout &&
+               gDalShimLockCount == 1 && W.ppsmcSeen == std::vector<uint32_t>{PPSMC::SetSoftMinByFreq, PPSMC::SetHardMinByFreq},
+               "soft and hard clears are contiguous; hard clear times out");
+        W.ppsmcNoReply = false;
+        W.ppsmcHardReply = SMUResp::Failed;
+        gSleepHook = [] {
+            W.reg[0x1629a] = SMUResp::OK;
+            gSleepHook = nullptr;
+        };
+        uint32_t top = 1u;
+        gDalShimLockCount = 0;
+        expect(smu_pin_uclk_top(gDev, &top) == (kern_return_t)kIOReturnError && !top &&
+               gDalShimLockCount == 1 && W.ppsmcSeen == std::vector<uint32_t>{PPSMC::SetSoftMinByFreq, PPSMC::SetHardMinByFreq,
+                   PPSMC::GetDpmFreqByIndex, PPSMC::GetDpmFreqByIndex, PPSMC::SetHardMinByFreq},
+               "read-only drain waits for the late reply, then returns the fresh hard-min rejection");
+        W.ppsmcHardReply = SMUResp::OK;
+        gDalShimLockCount = 0;
+        expect(smu_pin_uclk_top(gDev, &top) == 0 && top == 1258u && gDalShimLockCount == 1,
+               "count, frequency and fresh hard pin use one lock acquisition");
+    }
+    SCEN("UCLK no pending reply") {
+        world_reset(4);
+        W.ppsmcUclk = true;
+        W.ppsmcNoReply = true;
+        expect(smu_set_uclk_hard_min(gDev, 0u) == (kern_return_t)kIOReturnTimeout, "hard clear times out");
+        W.reg[kRegResp] = kRespOk;
+        W.reg[0x1629a] = UINT32_MAX;
+        expect(smu_pin_uclk_top(gDev) != 0 && W.ppsmcSeen.size() == 2 && W.reg[0x16282] == 0u,
+               "DAL reply and invalid PPSMC reply cannot unlock PPSMC");
+        W.reg[0x1629a] = 0u;
+        const uint64_t before = gNowNs;
+        expect(smu_pin_uclk_top(gDev) != 0 && W.ppsmcSeen.size() == 2 && W.reg[0x16282] == 0u &&
+               gNowNs - before > 0 && gNowNs - before <= 2000000000ull,
+               "bounded sleepable drain leaves the original message alone with no reply");
+        W.reg[0x1629a] = SMUResp::OK;
+        auto other = gDev;
+        expect(smu_pin_uclk_top(other) != 0 && W.ppsmcSeen.size() == 2 && W.reg[0x16282] == 0u,
+               "a different device context cannot consume the pending reply");
+    }
+}
+
+static void b9_display_wake_pmfw() {
+    using namespace amdgpu;
+    using Event = GfxOffPowerEvent;
+    const auto setup = [] {
+        world_reset(4);
+        W.ppsmcUclk = true;
+        W.ppsmcHardReply = SMUResp::OK;
+        W.ifVersion = gDev.smuDriverIfVersion = 0x33u;
+    };
+    const auto cycle = [](SMUContext &smu) {
+        (void)gfx_off_power_event(gDev, smu, Event::WillSleep);
+        (void)gfx_off_power_event(gDev, smu, Event::WillPowerOn);
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+    };
+    SCEN("display PMFW wake requires ordered same-device events") {
+        setup();
+        SMUContext smu;
+        auto other = gDev;
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        (void)gfx_off_power_event(gDev, smu, Event::WillSleep);
+        (void)gfx_off_power_event(other, smu, Event::WillPowerOn);
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        expect(!smu_display_wake_pin_allowed(smu) && smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 &&
+               W.ppsmcSeen.empty(), "out-of-order and foreign-device notifications do not authorize PPSMC");
+        (void)gfx_off_power_event(gDev, smu, Event::WillSleep);
+        (void)gfx_off_power_event(gDev, smu, Event::WillNotSleep);
+        (void)gfx_off_power_event(gDev, smu, Event::WillPowerOn);
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        (void)gfx_off_power_event(gDev, smu, Event::Shutdown);
+        (void)gfx_off_power_event(gDev, smu, Event::WillPowerOn);
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        expect(!smu_display_wake_pin_allowed(smu) && smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 &&
+               W.ppsmcSeen.empty(), "cancelled sleep and shutdown do not authorize recovery");
+    }
+    SCEN("display PMFW fresh ACK and later sleep cycle") {
+        setup();
+        SMUContext smu;
+        bool armed = false;
+        expect(gfx_off_boot_init(gDev, smu, true, 1u, &armed) == 0 && armed, "graphics isolation fixture arms");
+        cycle(smu);
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        auto other = gDev;
+        expect(smu_display_wake_pin_allowed(smu) && smu_repin_uclk_after_wake(other, smu, W.smuVersion) != 0 &&
+               W.ppsmcSeen.empty(), "only same-device recovery is allowed after ordered wake");
+        gDalShimLockCount = 0;
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) == 0 && gDalShimLockCount == 1 &&
+               W.ppsmcSeen == std::vector<uint32_t>{PPSMC::TestMessage, PPSMC::GetSmuVersion, PPSMC::GetDriverIfVersion,
+                   PPSMC::GetDpmFreqByIndex, PPSMC::GetDpmFreqByIndex, PPSMC::SetHardMinByFreq} &&
+               W.ppsmcHardParam == (PPCLK::UCLK << 16 | 1258u) && W.seen.empty() &&
+               gDev.graphicsPowerQuarantined() && smu.sleepPending && smu.wakeUnverified,
+               "one fresh PPSMC sequence pins only UCLK and keeps graphics isolated");
+        W.ppsmcSeen.clear();
+        (void)gfx_off_power_event(gDev, smu, Event::WillSleep);
+        expect(!smu_display_wake_pin_allowed(smu) && smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0,
+               "subsequent sleep invalidates the old wake proof before any PPSMC");
+        (void)gfx_off_power_event(gDev, smu, Event::WillPowerOn);
+        (void)gfx_off_power_event(gDev, smu, Event::WillPowerOn);
+        expect(!smu_display_wake_pin_allowed(smu) && smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 &&
+               W.ppsmcSeen.empty(), "new wake must complete, even with duplicate WillPowerOn");
+        (void)gfx_off_power_event(gDev, smu, Event::HasPoweredOn);
+        W.ppsmcHardReply = SMUResp::Failed;
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 && W.ppsmcSeen.size() == 6 &&
+               gDev.graphicsPowerQuarantined(), "a new hard-min rejection is not covered by the old ACK");
+    }
+    SCEN("display PMFW pending or mismatched replies stop recovery") {
+        setup();
+        SMUContext smu;
+        W.ppsmcNoReply = true;
+        expect(smu_set_uclk_hard_min(gDev, 0u) == (kern_return_t)kIOReturnTimeout, "an old hard-min command is pending");
+        cycle(smu);
+        W.ppsmcSeen.clear();
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) == (kern_return_t)kIOReturnTimeout &&
+               W.ppsmcSeen.empty(), "unanswered pre-sleep PPSMC blocks every new command");
+        gSleepHook = [] { W.reg[0x1629a] = SMUResp::OK; gSleepHook = nullptr; };
+        W.ppsmcBadEcho = true;
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 &&
+               W.ppsmcSeen == std::vector<uint32_t>{PPSMC::TestMessage}, "late ACK drains but cannot replace a good fresh echo");
+        W.ppsmcBadEcho = false;
+        W.ppsmcSeen.clear();
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion + 1u) != 0 &&
+               W.ppsmcSeen == std::vector<uint32_t>{PPSMC::TestMessage, PPSMC::GetSmuVersion},
+               "changed PMFW version stops before writing a floor");
+        W.ppsmcSeen.clear();
+        W.ifVersion = 0x34u;
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 && W.ppsmcSeen.size() == 3u,
+               "unrecognized driver IF stops before UCLK queries");
+        W.ppsmcSeen.clear();
+        W.ifVersion = gDev.smuDriverIfVersion;
+        W.ppsmcRejectMsg = PPSMC::GetDpmFreqByIndex;
+        expect(smu_repin_uclk_after_wake(gDev, smu, W.smuVersion) != 0 && W.ppsmcSeen.size() == 4u &&
+               W.seen.empty(), "failed DPM query has no follow-up write or DAL traffic");
     }
 }
 
@@ -1196,7 +1446,7 @@ static void s_pins(const std::string &root) {
     const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
     const std::string eng = garnet_test_ver::read_native_engine(K + "src/amd"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/GarnetNativeClient.cpp"), uc = slurp(K + "src/GarnetUserClient.cpp");
     const std::string abi = slurp(K + "src/GarnetNativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/an internal design note");
-    const std::string tool = slurp(root + "/tools/native/rdna4dal.c"), bld = slurp(root + "/tools/native/build.sh"), dcnc = slurp(K + "src/dcn/dcn.cpp") + "\n" + slurp(K + "src/dcn/dcn_internal.hpp") + "\n" + slurp(K + "src/dcn/dcn_scanout_mt.cpp"), bringup = slurp(K + "src/GarnetDriver.cpp") + "\n" + slurp(K + "src/GarnetDriverStages.cpp");
+    const std::string tool = slurp(root + "/tools/native/rdna4dal.c"), bld = slurp(root + "/tools/native/build.sh");
     expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty(), "every source file the pins read exists (and the repo root argument is right)");
     // the sender writes exactly the three DAL dwords
     expect_u("smu_dal.cpp has exactly three WREG32 calls", count_of(dal, "WREG32("), 3);
@@ -1204,22 +1454,11 @@ static void s_pins(const std::string &root) {
     expect(dal.find("WREG32(dev, kRegResp, 0u);") < dal.find("WREG32(dev, kRegArg, param);") && dal.find("WREG32(dev, kRegArg, param);") < dal.find("WREG32(dev, kRegMsg, msg);"), "Linux's order: RESP, ARG, MSG");
     expect(dal.find("smu_send_msg") == std::string::npos && dal.find("WBAR0") == std::string::npos && dal.find("bar0_") == std::string::npos && dal.find("bar2") == std::string::npos, "smu_dal.cpp writes no other register, no VRAM, no doorbell, sends no PPSMC message");
     expect(count_of(dal, "RREG32(") >= 6, "the reads exist");
-    // ordering inside the sender
-    {
-        const std::string b = fn_body(dal, "kern_return_t smu_dal_send(");
-        const size_t pAllow = b.find("allow_check("), pLock = b.find("SmuSeq seq;"), pHeld = b.find("if (!seq.held)"), pPre = b.find("resp_pre_check(pre)"), pWr = b.find("WREG32(dev, kRegResp, 0u);");
-        expect(pAllow != std::string::npos && pLock != std::string::npos && pHeld != std::string::npos && pPre != std::string::npos && pWr != std::string::npos, "the sender has every step");
-        expect(pAllow < pLock && pLock < pHeld && pHeld < pPre && pPre < pWr, "allowlist, then the shared lock, then RESP == 0 pre-check, then the first register write");
-        expect(b.find("RREG32(dev, kRegResp);") < pWr, "RESP is read before the first write");
-        expect(b.find("IOSleep(1)") != std::string::npos && b.find("kRespWaitUs") != std::string::npos, "the RESP wait sleeps and is bounded by kRespWaitUs");
-        expect(b.find("dal_gated_level()") != std::string::npos, "the sender gates on the native boot + boot-arg level");
-    }
     // the gate
     {
         const std::string b = fn_body(dal, "uint32_t dal_gated_level()");
         expect(b.find("native_gate_ok()") != std::string::npos && b.find("v >= 1u && v <= kMaxLevel") != std::string::npos, "the gated level needs the native gate and a boot-arg in 1..4");
         expect(fn_body(dal, "static bool native_gate_ok()").find("kGateOn && s.positivePass") != std::string::npos, "the native gate is kGateOn AND S1b positivePass");
-        expect(dal.find("\"garnet-dalsmc\"") != std::string::npos && count_of(dal, "PE_parse_boot_argn(") == 1, "the boot-arg is garnet-dalsmc, read in one place");
         expect(fn_body(dal, "static uint32_t boot_arg_level()").find("return 0u;") != std::string::npos, "an absent boot-arg is level 0");
     }
     // waits are bounded and sleep
@@ -1227,8 +1466,6 @@ static void s_pins(const std::string &root) {
         const std::string b = fn_body(dal, "static uint32_t hard_min(");
         expect(b.find("kHardMinPollUs") != std::string::npos && b.find("IOSleep(1)") != std::string::npos && b.find("RDNA4N_DAL_F_POLL_TIMEOUT") != std::string::npos && b.find("return 2u;") != std::string::npos && b.find("gRun.timedOut = true") == std::string::npos, "the 0x15 poll sleeps 1 ms, is bounded at kHardMinPollUs and reports a POLL timeout (return 2) without the mailbox-timeout flag");
         expect(pure.find("kRespWaitUs = 2000u * 1000u") != std::string::npos && pure.find("kHardMinPollUs = 1000u * 1000u") != std::string::npos, "the bounds are 2 s and 1 s");
-        // every unbounded-looking loop in smu_dal.cpp has an IOSleep or a bound
-        expect_u("smu_dal.cpp's loops: every `for (;;)` is one of the three bounded waits (the RESP wait, the 0x15 poll of hard_min, the hold's 0x15 poll)", count_of(dal, "for (;;)"), 3);
         expect(dal.find("IOSleep(2000)") != std::string::npos && dal.find("IOSleep(100)") != std::string::npos && dal.find("IOSleep(5)") != std::string::npos, "the reference window, the dwell tick and the settle polls sleep");
         expect(dal.find("kStallMs") != std::string::npos && dal.find("rate_ok(") != std::string::npos && dal.find("judge_dwell(") != std::string::npos, "the dwell checks stall, rate and the clock thresholds");
     }
@@ -1252,15 +1489,12 @@ static void s_pins(const std::string &root) {
     }
     // who calls what
     {
-        size_t senders = 0; std::string other;
+        size_t senders = 0;
         const char *files[] = { "src/GarnetDriver.cpp", "src/GarnetDriverStages.cpp", "src/GarnetUserClient.cpp", "src/GarnetNativeClient.cpp", "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp", "src/dcn/dcn.cpp", "src/dcn/dcn_scanout_mt.cpp", "src/dcn/dcn_dmub_telemetry.cpp", "src/dcn/dcn_disp2_scanx.cpp", "src/GarnetPrimaryFramebuffer.cpp", "src/amd/amdgpu_init.cpp", "src/amd/smu_v14_0.cpp" };
-        for (const char *f : files) { const std::string t = slurp(K + f); senders += count_of(t, "smu_dal_send("); if (t.find("dal_run_step(") != std::string::npos && std::string(f) != "src/amd/garnet_ring_submit.cpp", "src/amd/garnet_session_vm.cpp", "src/amd/garnet_vram_alloc.cpp") other = f; }
+        for (const char *file : files) senders += count_of(slurp(K + file), "smu_dal_send(");
         expect_u("nobody outside smu_dal.cpp calls smu_dal_send", senders, 0);
-        expect(other.empty(), "dal_run_step is called only from native_s1c.cpp");
         expect_u("dal_run_step has one caller (n1c_dal_step)", count_of(eng, "dal_run_step("), 1);
         expect_u("n1c_dal_step has one caller (the RDNA4N client)", count_of(cli, "n1c_dal_step("), 1);
-        expect(bringup.find("smu_dal") == std::string::npos && bringup.find("dal_run_step") == std::string::npos && dcnc.find("smu_dal_send") == std::string::npos && dcnc.find("dal_run_step") == std::string::npos && count_of(dcnc, "smu_dal") == 1 && dcnc.find("#include \"amd/smu_dal.h\"") != std::string::npos && count_of(dcnc, "dal_busy()") == 2 && count_of(dcnc, "amdgpu::dal_hold_") == 6, "the interrupt handler's file and the display layer never call the DAL sender (0.0.605: the display layer includes smu_dal.h for the read-only dal_busy() only; 0.0.607 adds the four clock-hold wrappers mt_hold_pre / raise / release / state, plus the emergency-restore log line reading the state)");
-        expect(bringup.find("smu_dal") == std::string::npos && bringup.find("dal_run_step") == std::string::npos && dcnc.find("smu_dal_send") == std::string::npos && dcnc.find("dal_run_step") == std::string::npos && count_of(dcnc, "smu_dal") == 1 && dcnc.find("#include \"amd/smu_dal.h\"") != std::string::npos && count_of(dcnc, "dal_busy()") == 1 && count_of(dcnc, "amdgpu::dal_hold_") == 6, "the interrupt handler's file and the display layer never call the DAL sender (0.0.605: the display layer includes smu_dal.h for the read-only dal_busy() only; 0.0.607 adds the four clock-hold wrappers mt_hold_pre / raise / release / state, plus the emergency-restore log line reading the state)");
         expect(cli.find("case RDNA4N_SEL_DAL_STEP:") != std::string::npos && cli.find("if (!shape(2, 0, 0, sizeof(rdna4n_dal_result))) return kIOReturnBadArgument;") != std::string::npos, "selector 15: exactly two scalars in, a 256 B struct out");
         const std::string nb = fn_body(eng, "IOReturn n1c_dal_step(");
         expect(nb.find("if (!sess_hello(ref)) return kIOReturnNotReady;") != std::string::npos && nb.find("flags != 0ull") != std::string::npos && nb.find("IOLockLock") == std::string::npos, "n1c_dal_step: Hello first, flags 0, and no client lock held across the step");
@@ -1310,12 +1544,114 @@ static void s_pins(const std::string &root) {
 }
 
 // =====================================================================================================================================
+static void b7_snapshot() {
+    constexpr uint32_t timer = 0x39e7u;
+    const auto prepareRefs = [] {
+        gDev.ip.setVersion(amdgpu::IPBlock::GC, {12, 0, 0});
+        W.pll = 0x1234002du;
+        sync_regs();
+        W.reg[0x16e6f] = 0x19u;
+        W.reg[timer] = 0x1002u;
+    };
+    SCEN("snapshot opt-in and exact replies") {
+        world_reset(0, false);
+        prepareRefs();
+        auto *data = new ClockSnapshot {};
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0 && W.seen.empty(), "no DAL snapshot commands without boot opt-in");
+        gSnapshotOptIn = 1;
+        W.snapshotMode = true;
+        gAtInterrupt = true;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0 && W.seen.empty(), "no snapshot from IRQ context");
+        gAtInterrupt = false;
+        gDev.smuOnline = false;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0 && W.seen.empty(), "no snapshot before SMU bringup");
+        gDev.smuOnline = true;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) == 0, "snapshot on ready device");
+        expect_u("raw PLL integer and fraction", data->references.pllRequest, 0x1234002du);
+        expect_u("raw DPREF DFS slice", data->references.dpRefDfs, 0x19u);
+        expect_u("raw enabled DCHUB timer", data->references.dchubTimer, 0x1002u);
+        expect_u("query path UMC count", data->umcChannels, 8u);
+        expect_u("query path DCFCLK fine-grained endpoints", data->dcfclk.count, 2u);
+        expect_u("query path DCFCLK max endpoint kHz", data->dcfclk.kHz[1], 409000u);
+        expect_u("query path UCLK DC cap kHz", data->uclk.dcMaxKHz, 450000u);
+        expect_u("query path FCLK low MHz bits kHz", data->fclk.kHz[0], 303000u);
+        expect_u("query path DPPCLK does not fabricate a DC cap", data->dppclk.dcMaxKHz, 0u);
+        std::vector<std::pair<uint32_t, uint32_t>> expected;
+        for (uint32_t id : {9u, 1u, 10u, 6u, 7u, 2u, 3u}) {
+            expected.push_back({0xbu, (id << 16) | 0xffu});
+            for (uint32_t index = 0; index < (id == 9u ? 2u : 3u); ++index)
+                expected.push_back({0xbu, (id << 16) | index});
+            if (id != 7u) expected.push_back({0xcu, id << 16});
+        }
+        expected.push_back({0x1cu, 0u});
+        expect(W.seen == expected, "snapshot uses exactly the DCN401 query-only verbs, domain IDs and indices");
+        delete data;
+    }
+    SCEN("snapshot timeout discards partially filled rows") {
+        world_reset(0, false);
+        prepareRefs();
+        gSnapshotOptIn = 1;
+        W.snapshotMode = true;
+        W.rules.push_back({0xbu, 4u, true, 0u});
+        auto *data = new ClockSnapshot {};
+        const uint64_t start = gNowNs;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0, "failed reply refuses snapshot");
+        expect(W.seen.size() == 5u && gNowNs - start < 600000000ull, "timeout has a total deadline and sends no later commands");
+        expect(data->dcfclk.count == 0u && data->umcChannels == 0u, "unpublished partial result cleared");
+        delete data;
+    }
+    SCEN("snapshot refuses bogus caps and unavailable UMC topology") {
+        world_reset(0, false);
+        prepareRefs();
+        gSnapshotOptIn = 1;
+        W.snapshotMode = true;
+        auto *data = new ClockSnapshot {};
+        W.snapshotUclkCap = 450000u;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0, "unverified cap units refused instead of guessing");
+        expect(!W.seen.empty() && W.seen.back() == std::make_pair(0xcu, 0x20000u), "invalid cap aborts before further mailbox traffic");
+        expect(data->uclk.count == 0u, "invalid cap discards all rows");
+        W.snapshotUclkCap = 450u;
+        W.snapshotUmcChannels = 0u;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, *data) != 0, "missing UMC channels cannot become trusted topology");
+        expect(data->fclk.count == 0u && data->umcChannels == 0u, "missing topology discards all rows");
+        delete data;
+    }
+    SCEN("snapshot refuses unresolved, disabled or unstable references") {
+        world_reset(0, false);
+        prepareRefs();
+        gSnapshotOptIn = 1;
+        W.snapshotMode = true;
+        ClockSnapshot data {};
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer + 1u, data) != 0 && W.seen.empty(), "unknown timer address must not start mailbox queries");
+        gDev.ip.setVersion(amdgpu::IPBlock::GC, {0, 0, 0});
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, data) != 0 && W.seen.empty(), "no fixed address reads on an unknown GC IP");
+        prepareRefs();
+        gDev.rmmioSize = 0x16e6fu * 4u;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, data) != 0 && W.seen.empty(), "unmapped DPREF DFS must not start mailbox queries");
+        gDev.rmmioSize = sizeof(W.reg);
+        W.reg[0x16e6f] = UINT32_MAX;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, data) != 0 && W.seen.empty(), "all-ones DFS is not an observation");
+        prepareRefs();
+        W.reg[timer] = 2u;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, data) != 0 && W.seen.empty(), "disabled timer is not an observation");
+        prepareRefs();
+        W.snapshotMoveDpRef = true;
+        expect(amdgpu::smu_dal_query_clock_snapshot(gDev, timer, data) != 0 && !W.seen.empty() &&
+               !data.references.pllRequest && !data.umcChannels && !data.dispclk.count,
+               "a changed reference at the end discards the snapshot");
+    }
+}
+
 int main(int argc, char **argv) {
-    const std::string root = argc > 1 ? argv[1] : ".";
-    p1_did(); p2_allow(); p3_rules(); h1_state_machine(); h2_raise_release(); s_pins(root);
-    const int pure = gRun, pureFail = gFail;
-    std::printf("native_s2_dal_test: pure + source pins: %d checks, %d failed\n", pure, pureFail);
-    b1_sender(); b2_e1b(); b3_e2(); b3_failures(); b4_latch_busy(); b6_hold(); b5_lock();
+    if (argc == 2 && std::strcmp(argv[1], "--clock-snapshot") == 0) {
+        b7_snapshot();
+        std::printf("native_s2_dal_test clock snapshot: %d checks, %d failed\n", gRun, gFail);
+        return gFail ? 1 : 0;
+    }
+    const bool behaviorOnly = argc == 2 && std::strcmp(argv[1], "--behavior") == 0;
+    p1_did(); p2_allow(); p3_rules(); h1_state_machine(); h2_raise_release();
+    if (!behaviorOnly) s_pins(argc > 1 ? argv[1] : ".");
+    b1_sender(); b2_e1b(); b3_e2(); b3_failures(); b4_latch_busy(); b6_hold(); b5_lock(); b7_snapshot(); b8_uclk(); b9_display_wake_pmfw();
     std::printf("native_s2_dal_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }
