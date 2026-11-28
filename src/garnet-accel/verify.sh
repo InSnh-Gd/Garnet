@@ -15,8 +15,11 @@ has_token(){ printf '%s\n' "$1" | awk -v wanted="$2" '{ for (i = 1; i <= NF; i++
 echo "== GarnetAccel verify $(date '+%F %T') =="
 product=$(sw_vers -productVersion 2>/dev/null) || product=
 build=$(sw_vers -buildVersion 2>/dev/null) || build=
-inf "macOS ${product:-unknown} build ${build:-unknown} (expect 26.7.2 / 25G332)"
-[ "$product" = 26.7.2 ] && [ "$build" = 25G332 ] && ok "target macOS build" || no "unsupported macOS (expected 26.7.2 / 25G332)"
+inf "macOS ${product:-unknown} build ${build:-unknown} (expect 26.x)"
+case "$product" in
+  26.[0-9]*) [ -n "$build" ] && ok "target macOS 26.x ($product / $build)" || no "unsupported macOS (expected 26.x with build version, got ${product:-unknown} / ${build:-unknown})" ;;
+  *) no "unsupported macOS (expected 26.x, got ${product:-unknown} / ${build:-unknown})" ;;
+esac
 inf "boot-args: $(nvram boot-args 2>/dev/null | cut -f2)"
 [ -d "$R/Library/Extensions/Garnet.kext" ] && ok "Garnet.kext is in /Library/Extensions" || no "Garnet.kext is missing from /Library/Extensions"
 [ -d "$R/Library/Extensions/RDNA4Bringup.kext" ] && no "the old /Library/Extensions/RDNA4Bringup.kext is still installed" || ok "no RDNA4Bringup.kext in /Library/Extensions"

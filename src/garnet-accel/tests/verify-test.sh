@@ -19,15 +19,15 @@ printf '{}\n' > "$work/root/Library/Extensions/GarnetAccel.kext/Contents/Info.pl
 printf 'aux fixture\n' > "$work/root/Library/KernelCollections/AuxiliaryKernelExtensions.kc"
 
 cat > "$work/bin/sw_vers" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 case "${1:-}" in
-    -productVersion) printf '%s\n' "${STUB_PRODUCT:-26.7.2}";;
-    -buildVersion) printf '%s\n' "${STUB_BUILD:-25G332}";;
+    -productVersion) printf '%s\n' "${STUB_PRODUCT-26.7.2}";;
+    -buildVersion) printf '%s\n' "${STUB_BUILD-25G332}";;
     *) exit 64;;
 esac
 SH
 cat > "$work/bin/kmutil" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 case "${1:-}" in
     inspect)
         [ "${STUB_INSPECT_FAIL:-0}" != 1 ] || { echo 'inspect read failed'; exit 9; }
@@ -44,27 +44,27 @@ org.garnet.accel /Library/Extensions/GarnetAccel.kext}"
 esac
 SH
 cat > "$work/bin/ioreg" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 exit 0
 SH
 cat > "$work/bin/nvram" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 printf 'boot-args\tgarnet=1 garnet-metal=1\n'
 SH
 cat > "$work/bin/log" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 printf 'garnetaccel: layout PASS 2720/2720\n'
 SH
 cat > "$work/bin/sudo" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 exit 0
 SH
 cat > "$work/bin/pgrep" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 exit 0
 SH
 cat > "$work/bin/PlistBuddy" <<'SH'
-#!/bin/bash
+#!/usr/bin/env bash
 printf '%s\n' "${STUB_VERSION:-0.1.1}"
 SH
 chmod 700 "$work"/bin/*
@@ -85,6 +85,7 @@ run_verify() {
 unset STUB_PRODUCT STUB_BUILD STUB_LOADED STUB_AUX STUB_VERSION
 unset STUB_INSPECT_FAIL STUB_SHOWLOADED_FAIL
 run_verify 0
+grep -Fq 'PASS  target macOS 26.x (26.7.2 / 25G332)' "$work/output"
 grep -Fq 'PASS  verification complete' "$work/output"
 ! grep -Fq 'FAIL  ' "$work/output"
 
@@ -106,4 +107,19 @@ run_verify 1
 grep -Fq 'FAIL  kmutil inspect failed for the Aux KC' "$work/output"
 grep -Fq 'FAIL  kmutil showloaded failed' "$work/output"
 
-printf 'VERIFY_SCRIPT_TEST cases=3 failures=0 hardware_commands=stubbed\n'
+unset STUB_INSPECT_FAIL STUB_SHOWLOADED_FAIL
+export STUB_PRODUCT=26.6.2 STUB_BUILD=25F200
+run_verify 0
+grep -Fq 'PASS  target macOS 26.x (26.6.2 / 25F200)' "$work/output"
+grep -Fq 'PASS  verification complete' "$work/output"
+! grep -Fq 'FAIL  ' "$work/output"
+
+export STUB_PRODUCT=15.4.1 STUB_BUILD=24E263
+run_verify 1
+grep -Fq 'FAIL  unsupported macOS (expected 26.x, got 15.4.1 / 24E263)' "$work/output"
+
+export STUB_PRODUCT=26.6.2 STUB_BUILD=""
+run_verify 1
+grep -Fq 'FAIL  unsupported macOS (expected 26.x with build version, got 26.6.2 / unknown)' "$work/output"
+
+printf 'VERIFY_SCRIPT_TEST cases=6 failures=0 hardware_commands=stubbed\n'
