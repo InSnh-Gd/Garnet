@@ -1778,7 +1778,7 @@ struct GarnetCoreTestsRunner {
               && OpenCoreMode.modeSmall.displayName == "256 MiB Small-BAR")
 
         let killText = OpenCoreValidator.emergencyKillSwitchesText()
-        check("OpenCoreValidator emergencyKillSwitchesText documents all Stage 2, Stage 3, and recovery kill-switches",
+        check("OpenCoreValidator documents all interrupt, display, recovery, and power kill-switches",
               killText.contains("garnet-irq-wait=0")
               && killText.contains("garnet-vbl-irq=0")
               && killText.contains("garnet-dpms=0")
@@ -1788,7 +1788,10 @@ struct GarnetCoreTestsRunner {
               && killText.contains("garnet-webkitgpu=0")
               && killText.contains("garnet-hpd-recover=0")
               && killText.contains("garnet-idle-dpm=0")
-              && killText.contains("garnet-gfxoff=0"))
+              && killText.contains("garnet-gfxoff=0")
+              && killText.contains("garnet-dmcub-fw=0")
+              && killText.contains("garnet-fams2=0")
+              && killText.contains("garnet-mall=0"))
     }
 
     static func runOptionalReal25G332Checks() throws {

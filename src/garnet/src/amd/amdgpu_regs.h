@@ -61,11 +61,15 @@ struct DeviceContext {
     // --- state flags kept for API compatibility with the reference ---
     bool psoCAlive { false };   // (sic) SOS alive
     bool smuOnline { false };
+    bool gfxoffPowerQuarantined { false };
     uint32_t smuDriverIfVersion { 0 };
     bool gmcReady  { false };
     DoorbellState doorbell {};   // BAR2 doorbell map (amdgpu_ip.h), filled by the doorbell module
 
     uint64_t vramMC(uint64_t vramByteOffset) const { return vramMcBase + vramByteOffset; }
+    bool graphicsPowerQuarantined() const {
+        return __atomic_load_n(&gfxoffPowerQuarantined, __ATOMIC_ACQUIRE);
+    }
 };
 
 // ---- register addressing (absolute dword index into BAR5) ----------------------

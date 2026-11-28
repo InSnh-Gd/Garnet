@@ -46,6 +46,21 @@ static const struct { uint32_t off; uint32_t base_idx; } dcn41_dmub_probe_regs[]
 };
 #define DCN41_DMUB_PROBE_NREGS (sizeof(dcn41_dmub_probe_regs) / sizeof(dcn41_dmub_probe_regs[0]))
 
+bool dcn41_dmub_ring_in_vram_reservation(const struct dcn41_dmub_state *st, uint64_t vram_size,
+                                        uint64_t reserve_vram_off, uint32_t reserve_size)
+{
+    if (!st || (st->ring_map != DCN41_DMUB_MAP_CW4 && st->ring_map != DCN41_DMUB_MAP_REGION4) ||
+        !st->fb_base_mc || st->ring_addr < st->fb_base_mc || st->ring_addr >= (1ull << 48) ||
+        !st->inbox1_size || st->inbox1_size > DCN41_DMUB_MAX_RING || st->inbox1_size % DCN41_DMUB_CMD_SIZE ||
+        reserve_vram_off > vram_size || reserve_size > vram_size - reserve_vram_off)
+        return false;
+    const uint64_t inbox_vram_off = st->ring_addr - st->fb_base_mc;
+    if (inbox_vram_off < reserve_vram_off)
+        return false;
+    const uint64_t within_reserve = inbox_vram_off - reserve_vram_off;
+    return within_reserve <= reserve_size && st->inbox1_size <= reserve_size - within_reserve;
+}
+
 int dcn41_dmub_probe(struct dcn41_dev *dev, struct dcn41_dmub_state *st)
 {
     uint32_t addr[DCN41_DMUB_PROBE_NREGS], v[DCN41_DMUB_PROBE_NREGS];
@@ -170,6 +185,12 @@ static bool ring_ok(const struct dcn41_dmub_ring *ring)
     return ring && ring->magic == DCN41_DMUB_RING_MAGIC && dcn41_ready(ring->dev) && ring->mread && ring->mwrite;
 }
 
+static bool ring_ptr_valid(const struct dcn41_dmub_ring *ring, uint32_t ptr)
+{
+    return ring->capacity % DCN41_DMUB_CMD_SIZE == 0 &&
+           ptr % DCN41_DMUB_CMD_SIZE == 0 && ptr < ring->capacity;
+}
+
 int dcn41_dmub_ring_attach(struct dcn41_dmub_ring *ring, struct dcn41_dev *dev, const struct dcn41_dmub_state *st,
                            dcn41_mem_read32_fn mread, dcn41_mem_write32_fn mwrite, void *mcookie)
 {
@@ -207,16 +228,33 @@ bool dcn41_dmub_ring_full(const struct dcn41_dmub_ring *ring)
     return data_count == ring->capacity - DCN41_DMUB_CMD_SIZE;
 }
 
-int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd)
+static int ring_stage(const struct dcn41_dmub_ring *ring, uint32_t offset, const struct dcn41_dmub_cmd *cmd)
 {
-    const uint8_t *src;
-    uint32_t hw_wptr = 0, hw_rptr = 0, i, next;
+    const uint8_t *src = (const uint8_t *)cmd;
+    for (uint32_t i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
+        uint32_t word = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
+                        ((uint32_t)src[i + 3] << 24);
+        ring->mwrite(ring->mcookie, ring->ring_addr + offset + i, word);
+    }
+    /* dmub_rb_flush_pending reads the queued entries back before WPTR moves; we also compare them. */
+    for (uint32_t i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
+        uint32_t word = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
+                        ((uint32_t)src[i + 3] << 24);
+        if (ring->mread(ring->mcookie, ring->ring_addr + offset + i) != word)
+            return DCN41_E_READBACK;
+    }
+    return DCN41_OK;
+}
+
+int dcn41_dmub_ring_submit_batch(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmds, uint32_t count)
+{
+    uint32_t hw_wptr = 0, hw_rptr = 0, used, next;
     uint32_t wptr_addr, rptr_addr;
     int rc;
 
     if (!ring_ok(ring))
         return DCN41_E_UNINIT;
-    if (!cmd)
+    if (!cmds || !count)
         return DCN41_E_ARG;
     wptr_addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_WPTR);
     rptr_addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_RPTR);
@@ -230,34 +268,32 @@ int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub
     rc = dcn41_read(ring->dev, rptr_addr, &hw_rptr);
     if (rc)
         return rc;
-    /* dmub_srv_fb_cmd_queue: "if (dmub->inbox1.rb.rptr > capacity || wrpt > capacity) return DMUB_STATUS_HW_FAILURE" */
-    if (hw_rptr > ring->capacity || ring->wptr > ring->capacity)
+    if (!ring_ptr_valid(ring, hw_rptr) || !ring_ptr_valid(ring, ring->wptr))
         return DCN41_E_HW;
     ring->rptr = hw_rptr;
-    if (dcn41_dmub_ring_full(ring))
+    used = ring->wptr >= hw_rptr ? ring->wptr - hw_rptr : ring->capacity - (hw_rptr - ring->wptr);
+    if (count >= (ring->capacity - used) / DCN41_DMUB_CMD_SIZE)
         return DCN41_E_FULL;
-    src = (const uint8_t *)cmd;
-    for (i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
-        uint32_t w = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
-                     ((uint32_t)src[i + 3] << 24);
-        ring->mwrite(ring->mcookie, ring->ring_addr + ring->wptr + i, w);
+    next = ring->wptr;
+    for (uint32_t index = 0; index < count; ++index) {
+        rc = ring_stage(ring, next, &cmds[index]);
+        if (rc)
+            return rc;
+        next += DCN41_DMUB_CMD_SIZE;
+        if (next == ring->capacity)
+            next = 0;
     }
-    /* dmub_rb_flush_pending reads the queued entries back before WPTR moves; we also compare them */
-    for (i = 0; i < DCN41_DMUB_CMD_SIZE; i += 4) {
-        uint32_t w = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) | ((uint32_t)src[i + 2] << 16) |
-                     ((uint32_t)src[i + 3] << 24);
-        if (ring->mread(ring->mcookie, ring->ring_addr + ring->wptr + i) != w)
-            return DCN41_E_READBACK;
-    }
-    next = ring->wptr + DCN41_DMUB_CMD_SIZE;
-    if (next >= ring->capacity)
-        next %= ring->capacity;
     rc = dcn41_write(ring->dev, wptr_addr, next);   /* dmub_dcn401_set_inbox1_wptr */
     if (rc)
         return rc;
     ring->wptr = next;
-    ring->submitted++;
+    ring->submitted += count;
     return DCN41_OK;
+}
+
+int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd)
+{
+    return dcn41_dmub_ring_submit_batch(ring, cmd, 1);
 }
 
 int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
@@ -267,6 +303,8 @@ int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
 
     if (!ring_ok(ring))
         return DCN41_E_UNINIT;
+    if (!ring_ptr_valid(ring, ring->rptr) || !ring_ptr_valid(ring, ring->wptr))
+        return DCN41_E_HW;
     addr = DCN41_ADDR(ring->dev, DCN41_DMCUB_INBOX1_RPTR);
     if (addr == DCN41_BAD_OFFSET)
         return DCN41_E_WINDOW;
@@ -275,7 +313,7 @@ int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us)
         rc = dcn41_read(ring->dev, addr, &rptr);
         if (rc)
             return rc;
-        if (rptr > ring->capacity)
+        if (!ring_ptr_valid(ring, rptr))
             return DCN41_E_HW;
         if (ring->rptr > rptr)
             ring->reported += (rptr + ring->capacity - ring->rptr) / DCN41_DMUB_CMD_SIZE;
@@ -443,4 +481,292 @@ int dcn41_dmub_fw_meta_scan(const uint8_t *blob, uint32_t size, struct dcn41_dmu
         if (dcn41_dmub_fw_meta_from_blob(blob, size, i, out) == DCN41_OK)
             return DCN41_OK;
     return DCN41_E_ARG;
+}
+
+int dcn41_dmub_fw_meta_from_psp(const uint8_t *signed_blob, uint32_t signed_bytes,
+                                struct dcn41_dmub_fw_meta_info *out, uint32_t *code_bytes)
+{
+    const uint32_t header = 256u;
+    const uint32_t footer = 256u;
+    if (!signed_blob || !out || signed_bytes < header + footer + 64u)
+        return DCN41_E_ARG;
+    const uint8_t *code = signed_blob + header;
+    uint32_t bytes = signed_bytes - header - footer;
+    if (dcn41_dmub_fw_meta_scan(code, bytes, out) != DCN41_OK) {
+        if (bytes < footer + 64u)
+            return DCN41_E_ARG;
+        bytes -= footer;
+        if (dcn41_dmub_fw_meta_scan(code, bytes, out) != DCN41_OK)
+            return DCN41_E_ARG;
+    }
+    if (code_bytes)
+        *code_bytes = bytes;
+    return DCN41_OK;
+}
+
+static int wr_reg(struct dcn41_dev *dev, uint32_t off, uint32_t base_idx, uint32_t v)
+{
+    uint32_t addr = dcn41_abs(dev, off, base_idx);
+    if (addr == DCN41_BAD_OFFSET)
+        return DCN41_E_WINDOW;
+    return dcn41_write(dev, addr, v);
+}
+
+static int rd_reg(struct dcn41_dev *dev, uint32_t off, uint32_t base_idx, uint32_t *v)
+{
+    uint32_t addr = dcn41_abs(dev, off, base_idx);
+    if (addr == DCN41_BAD_OFFSET)
+        return DCN41_E_WINDOW;
+    return dcn41_read(dev, addr, v);
+}
+
+int dcn41_dmub_stop_and_reset(struct dcn41_dev *dev, uint32_t timeout_us)
+{
+    uint32_t cntl, cntl2, scratch, gpint, initial_gpint, elapsed;
+    int rc;
+
+    if (!dcn41_ready(dev))
+        return DCN41_E_UNINIT;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX, &cntl);
+    if (rc) return rc;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX, &cntl2);
+    if (rc) return rc;
+    if (cntl == UINT32_MAX || cntl2 == UINT32_MAX ||
+        !DCN41_FG(DCN41_DMCUB_CNTL, DMCUB_ENABLE, cntl) ||
+        DCN41_FG(DCN41_DMCUB_CNTL2, DMCUB_SOFT_RESET, cntl2))
+        return DCN41_E_STATE;
+    if (timeout_us == 0u)
+        return DCN41_E_ARG;
+
+    const uint32_t stop_code = DCN41_DMUB_GPINT_STOP_FW << DCN41_DMUB_GPINT_COMMAND_SHIFT;
+    const uint32_t stop_request = stop_code | (1u << DCN41_DMUB_GPINT_STATUS_SHIFT);
+    rc = rd_reg(dev, DCN41_DMCUB_SCRATCH7, DCN41_DMCUB_SCRATCH7_BASE_IDX, &scratch);
+    if (rc) return rc;
+    rc = rd_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, &initial_gpint);
+    if (rc) return rc;
+    if ((initial_gpint & DCN41_DMUB_GPINT_STATUS_MASK) ||
+        (initial_gpint & DCN41_DMUB_GPINT_COMMAND_MASK) == stop_code ||
+        scratch == DCN41_DMUB_GPINT_STOP_FW_RESPONSE || scratch == UINT32_MAX)
+        return DCN41_E_STATE;
+
+    rc = wr_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, stop_request);
+    if (rc) return rc;
+    for (elapsed = 0; elapsed < timeout_us; ++elapsed) {
+        rc = rd_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, &gpint);
+        if (rc) break;
+        if (gpint != stop_request && gpint != stop_code && gpint != initial_gpint)
+            return DCN41_E_RACE;
+        rc = rd_reg(dev, DCN41_DMCUB_SCRATCH7, DCN41_DMCUB_SCRATCH7_BASE_IDX, &scratch);
+        if (rc) break;
+        rc = rd_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX, &cntl);
+        if (rc) break;
+        if (gpint == stop_code && scratch == DCN41_DMUB_GPINT_STOP_FW_RESPONSE &&
+            cntl != UINT32_MAX && DCN41_FG(DCN41_DMCUB_CNTL, DMCUB_PWAIT_MODE_STATUS, cntl))
+            break;
+        dev->udelay(dev->cookie, 1);
+    }
+    if (rc || elapsed == timeout_us) {
+        int clear_rc = rd_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, &gpint);
+        if (!clear_rc && (gpint == stop_request || gpint == stop_code))
+            clear_rc = wr_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, 0u);
+        return rc ? rc : (clear_rc ? clear_rc : DCN41_E_TIMEOUT);
+    }
+
+    rc = wr_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX,
+                cntl2 | DCN41_DMCUB_CNTL2__DMCUB_SOFT_RESET_MASK);
+    if (rc) return rc;
+    dev->udelay(dev->cookie, 1);
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX, &cntl2);
+    if (rc) return rc;
+    if (cntl2 == UINT32_MAX || !DCN41_FG(DCN41_DMCUB_CNTL2, DMCUB_SOFT_RESET, cntl2))
+        return DCN41_E_READBACK;
+    rc = wr_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX,
+                cntl & ~DCN41_DMCUB_CNTL__DMCUB_ENABLE_MASK);
+    if (rc) return rc;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX, &cntl);
+    if (rc) return rc;
+    if (cntl == UINT32_MAX || DCN41_FG(DCN41_DMCUB_CNTL, DMCUB_ENABLE, cntl))
+        return DCN41_E_READBACK;
+
+#define CLEAR_HANDOFF_REG(reg) do { \
+    rc = wr_reg(dev, DCN41_##reg, DCN41_##reg##_BASE_IDX, 0u); \
+    if (rc) return rc; \
+} while (0)
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW2_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW3_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW4_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW5_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW6_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_REGION3_CW7_TOP_ADDRESS);
+    CLEAR_HANDOFF_REG(DMCUB_INBOX1_RPTR);
+    CLEAR_HANDOFF_REG(DMCUB_INBOX1_WPTR);
+    CLEAR_HANDOFF_REG(DMCUB_OUTBOX1_RPTR);
+    CLEAR_HANDOFF_REG(DMCUB_OUTBOX1_WPTR);
+    CLEAR_HANDOFF_REG(DMCUB_OUTBOX0_RPTR);
+    CLEAR_HANDOFF_REG(DMCUB_OUTBOX0_WPTR);
+    CLEAR_HANDOFF_REG(DMCUB_SCRATCH0);
+#undef CLEAR_HANDOFF_REG
+    rc = rd_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, &gpint);
+    if (rc) return rc;
+    if (gpint == stop_code || gpint == stop_request)
+        return wr_reg(dev, DCN41_DMCUB_GPINT_DATAIN1, DCN41_DMCUB_GPINT_DATAIN1_BASE_IDX, 0u);
+    if (gpint != 0u)
+        return DCN41_E_RACE;
+    return DCN41_OK;
+}
+
+static int wr_cw(struct dcn41_dev *dev, uint32_t off_lo, uint32_t off_hi, uint32_t reg_base, uint32_t reg_top,
+                 uint32_t base_mask, uint32_t top_mask, uint32_t en_mask, const struct dcn41_dmub_window *w)
+{
+    int rc;
+    rc = wr_reg(dev, off_lo, DCN41_DMCUB_CNTL_BASE_IDX, (uint32_t)(w->gpu_addr & 0xFFFFFFFFu));
+    if (rc) return rc;
+    rc = wr_reg(dev, off_hi, DCN41_DMCUB_CNTL_BASE_IDX, (uint32_t)(w->gpu_addr >> 32));
+    if (rc) return rc;
+    rc = wr_reg(dev, reg_base, DCN41_DMCUB_CNTL_BASE_IDX, w->base & base_mask);
+    if (rc) return rc;
+    return wr_reg(dev, reg_top, DCN41_DMCUB_CNTL_BASE_IDX, (w->top & top_mask) | en_mask);
+}
+
+int dcn41_dmub_program_windows(struct dcn41_dev *dev, const struct dcn41_dmub_handoff_windows *w)
+{
+    uint32_t cntl, cntl2;
+    uint32_t r5_top, r6_top;
+    int rc;
+
+    if (!dcn41_ready(dev))
+        return DCN41_E_UNINIT;
+    if (!w || w->inbox1_base != DCN41_DMUB_CW4_BASE || w->inbox1_size != DCN41_DMUB_RB_SIZE ||
+        w->outbox1_base != DCN41_DMUB_CW4_BASE + DCN41_DMUB_RB_SIZE || w->outbox1_size != DCN41_DMUB_RB_SIZE ||
+        w->outbox0_base != DCN41_DMUB_OUTBOX0_TRACE_BASE || w->outbox0_size == 0 ||
+        w->cw3.base != DCN41_DMUB_CW3_BASE || w->cw4.base != DCN41_DMUB_CW4_BASE ||
+        w->cw5.base != DCN41_DMUB_CW5_BASE || w->cw6.base != DCN41_DMUB_CW6_BASE ||
+        w->region6.base != DCN41_DMUB_CW6_BASE)
+        return DCN41_E_ARG;
+    const struct dcn41_dmub_window * const windows[] = { &w->cw3, &w->cw4, &w->cw5, &w->cw6, &w->region6 };
+    for (unsigned index = 0; index < sizeof(windows) / sizeof(windows[0]); ++index) {
+        const struct dcn41_dmub_window *window = windows[index];
+        const uint64_t limit = 1ULL << 48;
+        if (window->top <= window->base || window->top - window->base >= 0x1000000u ||
+            !window->gpu_addr || (window->gpu_addr & 0xffu) != 0 || window->gpu_addr >= limit ||
+            window->top - window->base > limit - window->gpu_addr)
+            return DCN41_E_ARG;
+    }
+    if (w->cw4.top - w->cw4.base != 2u * DCN41_DMUB_RB_SIZE ||
+        w->cw5.top - w->cw5.base <= DCN41_DMUB_TRACE_ENTRY_OFFSET ||
+        w->outbox0_size != w->cw5.top - w->cw5.base - DCN41_DMUB_TRACE_ENTRY_OFFSET)
+        return DCN41_E_ARG;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX, &cntl);
+    if (rc) return rc;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX, &cntl2);
+    if (rc) return rc;
+    if (cntl == UINT32_MAX || cntl2 == UINT32_MAX ||
+        DCN41_FG(DCN41_DMCUB_CNTL, DMCUB_ENABLE, cntl) ||
+        !DCN41_FG(DCN41_DMCUB_CNTL2, DMCUB_SOFT_RESET, cntl2))
+        return DCN41_E_STATE;
+
+    rc = wr_cw(dev, DCN41_DMCUB_REGION3_CW3_OFFSET, DCN41_DMCUB_REGION3_CW3_OFFSET_HIGH,
+               DCN41_DMCUB_REGION3_CW3_BASE_ADDRESS, DCN41_DMCUB_REGION3_CW3_TOP_ADDRESS,
+               DCN41_DMCUB_REGION3_CW3_BASE_ADDRESS__DMCUB_REGION3_CW3_BASE_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW3_TOP_ADDRESS__DMCUB_REGION3_CW3_TOP_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW3_TOP_ADDRESS__DMCUB_REGION3_CW3_ENABLE_MASK, &w->cw3);
+    if (rc) return rc;
+    rc = wr_cw(dev, DCN41_DMCUB_REGION3_CW4_OFFSET, DCN41_DMCUB_REGION3_CW4_OFFSET_HIGH,
+               DCN41_DMCUB_REGION3_CW4_BASE_ADDRESS, DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS,
+               DCN41_DMCUB_REGION3_CW4_BASE_ADDRESS__DMCUB_REGION3_CW4_BASE_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_TOP_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW4_TOP_ADDRESS__DMCUB_REGION3_CW4_ENABLE_MASK, &w->cw4);
+    if (rc) return rc;
+    rc = wr_cw(dev, DCN41_DMCUB_REGION3_CW5_OFFSET, DCN41_DMCUB_REGION3_CW5_OFFSET_HIGH,
+               DCN41_DMCUB_REGION3_CW5_BASE_ADDRESS, DCN41_DMCUB_REGION3_CW5_TOP_ADDRESS,
+               DCN41_DMCUB_REGION3_CW5_BASE_ADDRESS__DMCUB_REGION3_CW5_BASE_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW5_TOP_ADDRESS__DMCUB_REGION3_CW5_TOP_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW5_TOP_ADDRESS__DMCUB_REGION3_CW5_ENABLE_MASK, &w->cw5);
+    if (rc) return rc;
+
+    r5_top = w->cw5.top - w->cw5.base - 1u;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION5_OFFSET, DCN41_DMCUB_REGION5_OFFSET_BASE_IDX, (uint32_t)w->cw5.gpu_addr);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION5_OFFSET_HIGH, DCN41_DMCUB_REGION5_OFFSET_HIGH_BASE_IDX,
+                (uint32_t)(w->cw5.gpu_addr >> 32));
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION5_TOP_ADDRESS, DCN41_DMCUB_REGION5_TOP_ADDRESS_BASE_IDX,
+                r5_top | DCN41_DMCUB_REGION5_TOP_ADDRESS__DMCUB_REGION5_ENABLE_MASK);
+    if (rc) return rc;
+
+    rc = wr_cw(dev, DCN41_DMCUB_REGION3_CW6_OFFSET, DCN41_DMCUB_REGION3_CW6_OFFSET_HIGH,
+               DCN41_DMCUB_REGION3_CW6_BASE_ADDRESS, DCN41_DMCUB_REGION3_CW6_TOP_ADDRESS,
+               DCN41_DMCUB_REGION3_CW6_BASE_ADDRESS__DMCUB_REGION3_CW6_BASE_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW6_TOP_ADDRESS__DMCUB_REGION3_CW6_TOP_ADDRESS_MASK,
+               DCN41_DMCUB_REGION3_CW6_TOP_ADDRESS__DMCUB_REGION3_CW6_ENABLE_MASK, &w->cw6);
+    if (rc) return rc;
+
+    r6_top = w->region6.top - w->region6.base - 1u;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION6_OFFSET, DCN41_DMCUB_REGION6_OFFSET_BASE_IDX, (uint32_t)w->region6.gpu_addr);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION6_OFFSET_HIGH, DCN41_DMCUB_REGION6_OFFSET_HIGH_BASE_IDX,
+                (uint32_t)(w->region6.gpu_addr >> 32));
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_REGION6_TOP_ADDRESS, DCN41_DMCUB_REGION6_TOP_ADDRESS_BASE_IDX,
+                r6_top | DCN41_DMCUB_REGION6_TOP_ADDRESS__DMCUB_REGION6_ENABLE_MASK);
+    if (rc) return rc;
+
+    rc = wr_reg(dev, DCN41_DMCUB_OUTBOX0_BASE_ADDRESS, DCN41_DMCUB_OUTBOX0_BASE_ADDRESS_BASE_IDX, w->outbox0_base);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_OUTBOX0_SIZE, DCN41_DMCUB_OUTBOX0_SIZE_BASE_IDX, w->outbox0_size);
+    if (rc) return rc;
+
+    rc = wr_reg(dev, DCN41_DMCUB_INBOX1_BASE_ADDRESS, DCN41_DMCUB_INBOX1_BASE_ADDRESS_BASE_IDX, w->inbox1_base);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_INBOX1_SIZE, DCN41_DMCUB_INBOX1_SIZE_BASE_IDX, w->inbox1_size);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_OUTBOX1_BASE_ADDRESS, DCN41_DMCUB_OUTBOX1_BASE_ADDRESS_BASE_IDX, w->outbox1_base);
+    if (rc) return rc;
+    return wr_reg(dev, DCN41_DMCUB_OUTBOX1_SIZE, DCN41_DMCUB_OUTBOX1_SIZE_BASE_IDX, w->outbox1_size);
+}
+
+int dcn41_dmub_release_and_wait(struct dcn41_dev *dev, uint32_t psp_version, uint32_t timeout_us)
+{
+    uint32_t mmhb = 0, cntl = 0, cntl2 = 0, scratch0 = 0, i;
+    const uint32_t ready_mask = DCN41_DMUB_BOOT_DAL_FW | DCN41_DMUB_BOOT_MAILBOX_RDY | DCN41_DMUB_BOOT_HW_POWER_INIT_DONE;
+    int rc;
+
+    if (!dcn41_ready(dev))
+        return DCN41_E_UNINIT;
+    if (timeout_us == 0u)
+        return DCN41_E_ARG;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX, &cntl);
+    if (rc) return rc;
+    rc = rd_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX, &cntl2);
+    if (rc) return rc;
+    if (cntl == UINT32_MAX || cntl2 == UINT32_MAX ||
+        DCN41_FG(DCN41_DMCUB_CNTL, DMCUB_ENABLE, cntl) ||
+        !DCN41_FG(DCN41_DMCUB_CNTL2, DMCUB_SOFT_RESET, cntl2))
+        return DCN41_E_STATE;
+
+    rc = rd_reg(dev, DCN41_MMHUBBUB_SOFT_RESET, DCN41_MMHUBBUB_SOFT_RESET_BASE_IDX, &mmhb);
+    if (rc) return rc;
+    if (mmhb == UINT32_MAX)
+        return DCN41_E_HW;
+    rc = wr_reg(dev, DCN41_MMHUBBUB_SOFT_RESET, DCN41_MMHUBBUB_SOFT_RESET_BASE_IDX,
+                mmhb & ~DCN41_MMHUBBUB_SOFT_RESET__DMUIF_SOFT_RESET_MASK);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_SCRATCH15, DCN41_DMCUB_SCRATCH15_BASE_IDX, psp_version & 0x001100FFu);
+    if (rc) return rc;
+
+    rc = wr_reg(dev, DCN41_DMCUB_CNTL, DCN41_DMCUB_CNTL_BASE_IDX,
+                cntl | DCN41_DMCUB_CNTL__DMCUB_ENABLE_MASK | DCN41_DMCUB_CNTL__DMCUB_TRACEPORT_EN_MASK);
+    if (rc) return rc;
+    rc = wr_reg(dev, DCN41_DMCUB_CNTL2, DCN41_DMCUB_CNTL2_BASE_IDX,
+                cntl2 & ~DCN41_DMCUB_CNTL2__DMCUB_SOFT_RESET_MASK);
+    if (rc) return rc;
+
+    for (i = 0; i < timeout_us; ++i) {
+        rc = rd_reg(dev, DCN41_DMCUB_SCRATCH0, DCN41_DMCUB_SCRATCH0_BASE_IDX, &scratch0);
+        if (rc) return rc;
+        if (scratch0 != UINT32_MAX && (scratch0 & ready_mask) == ready_mask)
+            return DCN41_OK;
+        dev->udelay(dev->cookie, 1);
+    }
+    return DCN41_E_TIMEOUT;
 }

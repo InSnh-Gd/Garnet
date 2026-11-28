@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <vector>
 
-constexpr kern_return_t kIOReturnNoSpace = 0x2db;
+constexpr kern_return_t kIOReturnNoResources = static_cast<kern_return_t>(0xe00002beu);
 
 namespace {
 struct Message { uint32_t id, param; };
@@ -10,6 +10,7 @@ std::vector<Message> messages;
 bool high_written;
 bool reject_high;
 bool reject_hardmin;
+bool reject_softmin;
 bool reject_enable;
 bool bad_uclk_freq;
 bool fine_uclk;
@@ -20,6 +21,9 @@ void expect(bool value, const char *description) {
 }
 
 namespace amdgpu {
+bool smu_lock_enter() { return true; }
+void smu_lock_exit() {}
+static kern_return_t uclk_wait_pending_reply(const DeviceContext &) { return kIOReturnSuccess; }
 uint64_t smu_driver_table_mc(const DeviceContext &) { return 0; }
 kern_return_t smu_get_driver_if_version(const DeviceContext &, uint32_t *value) {
     *value = 0x33;
@@ -56,6 +60,8 @@ kern_return_t smu_send_msg_with_param(const DeviceContext &, uint32_t id,
         }
     }
     if (id == PPSMC::SetHardMinByFreq && reject_hardmin)
+        return kIOReturnUnsupported;
+    if (id == PPSMC::SetSoftMinByFreq && reject_softmin)
         return kIOReturnUnsupported;
     return kIOReturnSuccess;
 }
@@ -114,6 +120,20 @@ int main() {
         if (m.id == amdgpu::PPSMC::SetSoftMinByFreq && m.param == ((amdgpu::PPCLK::UCLK << 16) | 1258u)) ++soft_uclk;
     expect(soft_uclk == 1, "SetHardMin rejection falls back to SetSoftMinByFreq for UCLK");
 
+    dev.smuOnline = true;
+    uint32_t pinnedMhz = 0;
+    expect(amdgpu::smu_pin_uclk_top(dev, &pinnedMhz) != kIOReturnSuccess && !pinnedMhz,
+           "a rejected hard floor cannot authorize a modeset, even when a soft floor would succeed");
+    reject_hardmin = false;
+    reject_softmin = true;
+    messages.clear();
+    expect(amdgpu::smu_set_uclk_hard_min(dev, 0) != kIOReturnSuccess && messages.size() == 1 &&
+           messages.front().id == amdgpu::PPSMC::SetSoftMinByFreq,
+           "a failed soft-floor clear leaves the hard floor untouched");
+    reject_softmin = false;
+    expect(amdgpu::smu_pin_uclk_top(dev, &pinnedMhz) == kIOReturnSuccess && pinnedMhz == 1258u,
+           "a confirmed hard floor reports the queried top level");
+
     // Out-of-range frequency is skipped safely without sending a bogus floor.
     reject_hardmin = false; bad_uclk_freq = true; high_written = false;
     messages.clear();
@@ -132,7 +152,7 @@ int main() {
         if (m.id == amdgpu::PPSMC::GetDpmFreqByIndex || m.id == amdgpu::PPSMC::SetHardMinByFreq) ++any_dpm_query;
     expect(any_dpm_query == 0, "failed EnableAllSmuFeatures skips DPM clock pinning");
 
-    // Wave 10: SMU IF 0x2E..0x33 verification and effective GFXCLK decoding.
+    // SMU IF 0x2E..0x33 verification and effective GFXCLK decoding.
     expect(!amdgpu::smu_driver_if_verified(0x2Du), "IF 0x2D is below verified range");
     expect(amdgpu::smu_driver_if_verified(0x2Eu), "IF 0x2E is verified");
     expect(amdgpu::smu_driver_if_verified(0x33u), "IF 0x33 (RX 9060 XT PMFW) is verified");

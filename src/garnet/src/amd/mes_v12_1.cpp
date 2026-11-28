@@ -897,7 +897,7 @@ mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
     const uint32_t p = static_cast<uint32_t>(pipe);
     if (p >= kMaxMESPipes) return kIOReturnBadArgument;
     MESInstance &inst = mes.pipe[p];
-    if (!inst.inited || !inst.enabled) return kIOReturnNotReady;
+    if (!inst.inited || !inst.enabled || dev.graphicsPowerQuarantined()) return kIOReturnNotReady;
     if (pkt == nullptr || api_status_off_dw + 4 > kMES_API_FRAME_DWORDS) {
         return kIOReturnBadArgument;
     }

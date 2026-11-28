@@ -31,6 +31,7 @@ BLOB(smu_14_0_3, 19) BLOB(sdma_7_0_1, 20)
 BLOB(psp_14_0_2_sos, 21) BLOB(psp_14_0_2_ta, 0) BLOB(gc_12_0_0_imu, 23) BLOB(gc_12_0_0_pfp, 24)
 BLOB(gc_12_0_0_me, 25) BLOB(gc_12_0_0_mec, 26) BLOB(gc_12_0_0_uni_mes, 27) BLOB(gc_12_0_0_rlc, 28)
 BLOB(smu_14_0_2, 29) BLOB(sdma_7_0_0, 30)
+BLOB(dcn_4_0_1_dmcub, 31)
 
 // ---- a synthetic discovery binary carrying a gc_info table ---------------------------------------------------
 static void put16(std::vector<uint8_t> &b, size_t o, uint16_t v) { b[o] = v & 0xff; b[o + 1] = v >> 8; }
@@ -109,6 +110,7 @@ int main() {
         expect(asic_expected_mp0(&mj, &mn, &rv) && mj == 14 && mn == 0 && rv == 3, "Navi 48: expected MP0 14.0.3");
     }
     expect(std::strcmp(fw_get(FwId::PSP_SOS)->name, "psp_14_0_3_sos") == 0 && fw_get(FwId::PSP_SOS)->size == 11, "Navi 48: PSP_SOS = psp_14_0_3_sos");
+    expect(std::strcmp(fw_get(FwId::DCN_DMUB)->name, "dcn_4_0_1_dmcub") == 0 && fw_get(FwId::DCN_DMUB)->size == 31, "Navi 48: DCN_DMUB = dcn_4_0_1_dmcub");
     // ---- firmware selection: Navi 44 ----
     asic_select(n44);
     expect(asic_current() == n44, "select Navi 44");
@@ -118,6 +120,7 @@ int main() {
     }
     expect(std::strcmp(fw_get(FwId::PSP_SOS)->name, "psp_14_0_2_sos") == 0 && fw_get(FwId::PSP_SOS)->size == 21, "Navi 44: PSP_SOS = psp_14_0_2_sos");
     expect(std::strcmp(fw_get(FwId::GC_RLC)->name, "gc_12_0_0_rlc") == 0 && fw_get(FwId::SDMA)->size == 30, "Navi 44: GC / SDMA names follow");
+    expect(std::strcmp(fw_get(FwId::DCN_DMUB)->name, "dcn_4_0_1_dmcub") == 0 && fw_get(FwId::DCN_DMUB)->size == 31, "Navi 44: shared DCN_DMUB = dcn_4_0_1_dmcub");
     expect(fw_get(FwId::PSP_TA)->size == 0, "Navi 44: a stubbed blob reads as size 0");
     expect(!fw_chip_complete(n44), "Navi 44 with one stubbed required blob is NOT complete");
     expect(fw_chip_complete(n48), "Navi 48 with all blobs is complete");

@@ -510,6 +510,8 @@ struct SDMAInstance {
     uint32_t  instance;          // 0 or 1
     bool      inited;
     bool      enabled;
+    bool      doorbell_test_passed;
+    bool      dma_unconfirmed;
 
     // Ring buffer — VRAM-resident (the reference moved it there because
     // GPU-initiated reads of DART-mapped sysmem return zero on AS+TB5;
@@ -855,6 +857,8 @@ uint32_t sdma_read_external_rptr(const DeviceContext &dev,
 
 kern_return_t sdma_kick_doorbell(const DeviceContext &dev,
                                  const SDMAInstance &inst);
+bool sdma_doorbells_proven(const DeviceContext &dev, const SDMAContext &sdma);
+kern_return_t sdma_quiesce_for_teardown(const DeviceContext &dev, SDMAInstance &inst);
 
 // Append dwords to the ring at the current software wptr; wraps.
 // Returns the number of dwords actually written (0 on overflow).

@@ -379,6 +379,7 @@ psp_release(PSPContext &psp)
     psp.tmrVRAMOffset   = 0;
     psp.tmrSize         = 0;
     psp.tmrSetUp        = false;
+    psp.tmr_fw_addr_by_type[PSPGfxFwType::DMUB] = 0;
 
     psp.ringBusAddr     = 0;
     psp.ringVRAMOffset  = 0;
@@ -395,6 +396,8 @@ psp_release(PSPContext &psp)
     psp.fwPriVRAMOffset = 0;
     psp.fwPriSize       = 0;
     psp.sosAlive        = false;
+    psp.fwReserveExtVramOffset = 0;
+    psp.fwReserveExtSize = 0;
 
     psp.fwBufVRAMOffset = 0;
     psp.fwBufBaseMC     = 0;
@@ -914,6 +917,8 @@ psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
 kern_return_t
 psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
 {
+    psp.fwReserveExtVramOffset = 0;
+    psp.fwReserveExtSize = 0;
     if (!psp.ringCreated) {
         return kIOReturnNotReady;
     }
@@ -967,6 +972,11 @@ psp_query_fw_reservation(DeviceContext &dev, PSPContext &psp)
             uint32_t rsv_sz  = RBAR2_32(dev,
                 psp.cmdVRAMOffset + kPSPGfxRespUrespOffset + 8);
             uint64_t addr    = ((uint64_t)addr_hi << 32) | addr_lo;
+            if (cmd_id == PSPGfxCmd::FB_FW_RESERV_EXT_ADDR && rsv_sz &&
+                addr <= dev.vramSizeBytes && rsv_sz <= dev.vramSizeBytes - addr) {
+                psp.fwReserveExtVramOffset = addr;
+                psp.fwReserveExtSize = rsv_sz;
+            }
             PSP_LOG("query_fw_reservation: %s ok (resp=%#x) addr=%#llx "
                     "size=%#x", name, resp, (unsigned long long)addr, rsv_sz);
             return kIOReturnSuccess;
@@ -1801,6 +1811,31 @@ psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
     }
 
     PSP_LOG("load_non_psp_fw: all firmware loaded successfully");
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+psp_load_dmub_fw(DeviceContext &dev, PSPContext &psp,
+                 const FirmwareLoader &loader)
+{
+    psp.tmr_fw_addr_by_type[PSPGfxFwType::DMUB] = 0;
+    if (!psp.tmrSetUp || !psp.ringCreated || !psp.sosAlive ||
+        !dev.ip.isResolved(IPBlock::MP0)) {
+        PSP_LOG("psp_load_dmub_fw: PSP transport not ready");
+        return kIOReturnNotReady;
+    }
+    uint64_t fwBusAddr = 0;
+    uint32_t fwSize = 0;
+    kern_return_t r = loader.get_payload(PSPGfxFwType::DMUB, fwBusAddr, fwSize);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("psp_load_dmub_fw: DMUB get_payload failed kr=%#x", r);
+        return r;
+    }
+    r = psp_load_ip_fw(dev, psp, fwBusAddr, fwSize, PSPGfxFwType::DMUB);
+    if (r != kIOReturnSuccess) {
+        PSP_LOG("psp_load_dmub_fw: DMUB LOAD_IP_FW failed kr=%#x", r);
+        return r;
+    }
     return kIOReturnSuccess;
 }
 

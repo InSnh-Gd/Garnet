@@ -24,6 +24,7 @@ static int nops, gpint_ack_after = -1, gpint_reads;
 static uint8_t vram[0x4000];
 static uint64_t vram_base = 0x83fe000000ull;
 static int corrupt_readback;
+static uint64_t corrupt_addr;
 
 static uint32_t m_read(void *c, uint32_t a)
 {
@@ -50,7 +51,7 @@ static uint32_t v_read(void *c, uint64_t a)
     uint32_t v;
     (void)c;
     memcpy(&v, vram + (a - vram_base), 4);
-    return corrupt_readback ? v ^ 1u : v;
+    return (corrupt_readback || (corrupt_addr && a == corrupt_addr)) ? v ^ 1u : v;
 }
 static void v_write(void *c, uint64_t a, uint32_t v)
 {
@@ -313,12 +314,54 @@ static void test_ring(void)
     CHECK(dcn41_dmub_ring_return_data(&rg, &back) == DCN41_OK && !memcmp(&back, &c, 64), "return data at rptr - 64");
     mem[R(0x1d7)] = 0x3000;
     CHECK(dcn41_dmub_ring_wait_idle(&rg, 3) == DCN41_E_HW, "rptr beyond capacity");
+    mem[R(0x1d7)] = 0x2000;
+    CHECK(dcn41_dmub_ring_wait_idle(&rg, 3) == DCN41_E_HW, "rptr at capacity must wrap to zero");
+    CHECK(rg.rptr == 0x80 && rg.reported == 1, "invalid end pointer must not change completion accounting");
+    mem[R(0x1d7)] = 0x81;
+    CHECK(dcn41_dmub_ring_wait_idle(&rg, 3) == DCN41_E_HW, "misaligned completion rptr");
+    CHECK(rg.rptr == 0x80 && rg.reported == 1, "invalid alignment must not change completion accounting");
     /* attach refuses anything but a live idle ring with a mapping */
     st = idle_state(0, 0); st.verdict = DCN41_DMUB_ALIVE_BUSY;
     CHECK(dcn41_dmub_ring_attach(&rg, &d, &st, v_read, v_write, NULL) == DCN41_E_STATE, "busy refused");
     st = idle_state(0, 0); st.ring_map = DCN41_DMUB_MAP_UNKNOWN;
     CHECK(dcn41_dmub_ring_attach(&rg, &d, &st, v_read, v_write, NULL) == DCN41_E_STATE, "no map refused");
     CHECK(dcn41_dmub_ring_submit(&rg, &c) == DCN41_E_UNINIT, "failed attach leaves the ring unusable");
+}
+
+static void test_ring_batch(void)
+{
+    struct dcn41_dev dev;
+    struct dcn41_dmub_ring ring;
+    struct dcn41_dmub_cmd cmds[2];
+    const struct dcn41_dmub_state state = idle_state(0x1fc0, 0x1fc0);
+
+    dcn41_dev_init(&dev, NULL, m_read, m_write, m_udelay, SEG, 0x100000, 0);
+    CHECK(dcn41_dmub_ring_attach(&ring, &dev, &state, v_read, v_write, NULL) == DCN41_OK, "batch attach");
+    dcn41_dmub_build_disp_power_gating(&cmds[0], 1, 1);
+    cmds[0].header |= DCN41_DMUB_HDR_MULTI_CMD_PENDING_MASK;
+    dcn41_dmub_build_disp_power_gating(&cmds[1], 2, 1);
+
+    nops = 0;
+    corrupt_addr = vram_base;
+    CHECK(dcn41_dmub_ring_submit_batch(&ring, cmds, 2) == DCN41_E_READBACK, "second packet readback fails");
+    corrupt_addr = 0;
+    CHECK(ring.wptr == 0x1fc0 && mem[R(0x1d6)] == 0x1fc0 && ring.submitted == 0,
+          "partial batch must not reach the firmware");
+
+    nops = 0;
+    CHECK(dcn41_dmub_ring_submit_batch(&ring, cmds, 2) == DCN41_OK, "valid batch wraps");
+    CHECK(ring.wptr == 0x40 && ring.submitted == 2 && mem[R(0x1d6)] == 0x40, "two entries, one publication");
+    CHECK(!memcmp(vram + 0x1fc0, &cmds[0], 64) && !memcmp(vram, &cmds[1], 64), "batch slot order");
+    int writes = 0;
+    for (int index = 0; index < nops; ++index)
+        writes += ops[index].kind == 'W';
+    CHECK(writes == 1 && ops[nops - 1].addr == R(0x1d6), "WPTR written once, after all slots");
+
+    mem[R(0x1d7)] = 0xc0;
+    CHECK(dcn41_dmub_ring_submit_batch(&ring, cmds, 2) == DCN41_E_FULL, "one spare slot is insufficient");
+    CHECK(ring.wptr == 0x40 && ring.submitted == 2, "full batch did not advance");
+    CHECK(dcn41_dmub_ring_submit_batch(&ring, cmds, 0) == DCN41_E_ARG, "empty batch refused");
+    CHECK(dcn41_dmub_ring_submit_batch(&ring, cmds, UINT32_MAX) == DCN41_E_FULL, "unbounded count refused");
 }
 
 static void test_meta(void)
@@ -345,6 +388,7 @@ int main(void)
     test_gpint();
     test_builders();
     test_ring();
+    test_ring_batch();
     test_meta();
     printf("test_dcn41_dmub: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

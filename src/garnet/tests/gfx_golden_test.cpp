@@ -6,9 +6,6 @@
 #include <cstdarg>
 #include <string>
 
-// The firmware-only host shim omits this IOReturn used by the GC probe.
-constexpr kern_return_t kIOReturnNoDevice = static_cast<kern_return_t>(0xe00002c0u);
-
 namespace {
 struct Access { char op; uint32_t reg, value; };
 std::map<uint32_t, uint32_t> registers;

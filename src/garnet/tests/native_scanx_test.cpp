@@ -121,7 +121,7 @@ struct Env {
     unsigned countRegReads(uint32_t abs) const { unsigned n = 0; for (auto &e : ev) if (e.k == 'R' && e.a == abs) n++; return n; }
     void clear() { ev.clear(); sleptLocked = false; }
 };
-static RegIn regin(uint64_t mc, uint64_t size = 0ull, uint64_t off = 0) { return RegIn{ true, mc, size ? size : D().bytes, off, D().pitchPx * 4u, D().w, D().h, rdna4scan::kFmtArgb8888 }; }
+static RegIn regin(uint64_t mc, uint64_t size = 0ull, uint64_t off = 0) { return RegIn{ true, mc, size ? size : D().bytes, off, D().pitchPx * 4u, D().w, D().h, rdna4scan::kFmtArgb8888, false }; }
 static Excl excl_default() { Excl e; std::memset(&e, 0, sizeof e); e.n = 1; e.lo[0] = DPC; e.bytes[0] = D().bytes; return e; }
 static bool acquire_ok(Env &e, ScanX &x) { uint64_t o[2] = { 0, 0 }; reset(x); const uint32_t rc = acquire(e, D(), x, o); return rc == kOk && x.acquired; }
 static uint64_t reg_slot(Env &e, ScanX &x, uint64_t mc, uint32_t *rc = nullptr) { uint64_t o[2] = { 0, 0 }; const Excl ex = excl_default(); const uint32_t r = register_slot(e, D(), x, regin(mc), ex, o); if (rc) *rc = r; return r == kOk ? o[0] : 0ull; }
@@ -258,6 +258,9 @@ static void suite_x3() {
       bad = regin(S0); bad.height = D().inst == 2u ? 1080u : 1440u; EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kBadArg, "X3: a wrong height is refused");
       bad = regin(S0); bad.width = D().inst == 2u ? 1920u : 2560u; EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kBadArg, "X3: a wrong width is refused");
       bad = regin(S0); bad.vis = false; EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kBadArg, "X3: a BO outside the visible pool is refused");
+      bad = regin(S0); bad.dcc = true; o[0] = 100; o[1] = 200;
+      EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kUnsupported && !x2.tbl.s[0].used && o[0] == 100 && o[1] == 200,
+              "X3: a visible DCC BO is refused without creating a linear slot");
       bad = regin(S0); bad.format = 0; EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kBadArg, "X3: a wrong format is refused");
       bad = regin(S0, 1000000ull); EXPECTI(register_slot(e2, D(), x2, bad, ex, o) == kBadArg, "X3: a BO that cannot hold the slot is refused"); }
     EXPECTI(x2.tbl.s[0].used == false && x2.tbl.s[1].used == false, "X3: no refused request registered anything");
@@ -590,14 +593,14 @@ static void suite_xc() {
     Excl exa; std::memset(&exa, 0, sizeof exa); Excl exd = exa; exa.n = 2; exa.lo[0] = 0x8000000000ull; exa.bytes[0] = kDescMonB.bytes; exa.lo[1] = card.h[1].prog; exa.bytes[1] = kDescMonB.allocBytes;
     exd.n = 2; exd.lo[0] = 0x8000000000ull; exd.bytes[0] = kDescMonB.bytes; exd.lo[1] = card.h[0].prog; exd.bytes[1] = kDescMonA.allocBytes;
     for (int k = 0; k < 3; k++) {
-        EXPECT(register_slot(ea, kDescMonA, xa, RegIn{ true, sa[k], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888 }, exa, o) == kOk && o[0] == (0x10u | (uint32_t)k), "XC: the monitor A's slots are tagged 0x10 | k");
-        EXPECT(register_slot(ed, kDescMonB, xd, RegIn{ true, sd[k], kDescMonB.bytes, 0, 10240u, 2560u, 1440u, rdna4scan::kFmtArgb8888 }, exd, o) == kOk && o[0] == (0x20u | (uint32_t)k), "XC: the monitor B's slots are tagged 0x20 | k");
+        EXPECT(register_slot(ea, kDescMonA, xa, RegIn{ true, sa[k], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888, false }, exa, o) == kOk && o[0] == (0x10u | (uint32_t)k), "XC: the monitor A's slots are tagged 0x10 | k");
+        EXPECT(register_slot(ed, kDescMonB, xd, RegIn{ true, sd[k], kDescMonB.bytes, 0, 10240u, 2560u, 1440u, rdna4scan::kFmtArgb8888, false }, exd, o) == kOk && o[0] == (0x20u | (uint32_t)k), "XC: the monitor B's slots are tagged 0x20 | k");
     }
     // the monitor A's Register refuses an overlap with the monitor B's pair / slot (the other display's snapshot ranges)
     { ScanX xt; reset(xt); CEnv et(card, kDescMonA); et.stateInst = 1; Card c2; (void)c2; (void)xt; }
     { Card c2; CEnv e2(c2, kDescMonA); ScanX x2; reset(x2); EXPECT(acquire(e2, kDescMonA, x2, o) == kOk, "XC (setup)");
       Excl ex = exa; ex.lo[1] = sa[1]; ex.bytes[1] = 0x10000ull;       // the monitor B's slot inside the monitor A's candidate range
-      EXPECT(register_slot(e2, kDescMonA, x2, RegIn{ true, sa[1], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888 }, ex, o) == kBadArg, "XC: the monitor A's Register refuses a slot overlapping the monitor B's pair / slot (snapshot)"); }
+      EXPECT(register_slot(e2, kDescMonA, x2, RegIn{ true, sa[1], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888, false }, ex, o) == kBadArg, "XC: the monitor A's Register refuses a slot overlapping the monitor B's pair / slot (snapshot)"); }
     // ---- a long interleaved run: every write lands in its own pair, the other recorder never sees a write for it
     ea.ev.clear(); ed.ev.clear();
     const Hubp d0 = card.h[1];
@@ -637,7 +640,7 @@ static void suite_xc() {
       EXPECT(acquire(e6, kDescMonB, x6, oo) == kUnsupported && x6.lastAcquireWhy == kWhyGeometry && e6.writes().empty(), "XC: Acquire2 fed HUBP1's registers (1920x1080) refuses with kWhyGeometry"); }
     // ---- reuse is judged on THIS HUBP's EARLIEST: the other HUBP's EARLIEST equal to the slot does not refuse; this one's does
     { Card c7; CEnv e7(c7, kDescMonA); ScanX x7; reset(x7); uint64_t oo[2], oo3[3]; (void)acquire(e7, kDescMonA, x7, oo);
-      (void)register_slot(e7, kDescMonA, x7, RegIn{ true, sa[0], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888 }, exa, oo);
+      (void)register_slot(e7, kDescMonA, x7, RegIn{ true, sa[0], kDescMonA.bytes, 0, 7680u, 1920u, 1080u, rdna4scan::kFmtArgb8888, false }, exa, oo);
       c7.h[1].early = sa[0];     // HUBP2 'fetches' the monitor A's slot: irrelevant to instance 1
       EXPECT(present(e7, kDescMonA, x7, 0x10u, 0, oo3) == kOk, "XC: HUBP2's EARLIEST equal to the monitor A's slot does NOT refuse the monitor A's present (reuse is judged on HUBP1's)");
       c7.nowMs += 100; c7.upd();

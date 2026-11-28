@@ -176,6 +176,8 @@ struct dcn41_flip_irq_status {
 int dcn41_hubp_flip_irq_status(struct dcn41_dev *dev, uint32_t hubp, struct dcn41_flip_irq_status *st);
 
 /* ---- HUBP flip -------------------------------------------------------------------------------------------- */
+/* A linear address-only caller must hold ownership of the pipe across this read and the subsequent flip. */
+int dcn41_hubp_require_linear(struct dcn41_dev *dev, uint32_t hubp);
 /* Program a graphics-plane flip: flip type, VMID (vsync flips only), stereo off, TMZ, then the address, high dword
  * first ("program high first and then the low addr, order matters!"). immediate = false latches at VUPDATE. */
 int dcn41_hubp_program_flip(struct dcn41_dev *dev, uint32_t hubp, uint64_t mc_addr, uint32_t vmid, bool tmz,

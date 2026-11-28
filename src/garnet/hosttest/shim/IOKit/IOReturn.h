@@ -28,4 +28,7 @@ enum {
     kIOReturnNotReady,
     kIOReturnIOError,
     kIOReturnNotFound,
+    kIOReturnNoDevice,
+    kIOReturnNoSpace,
+    kIOReturnNotAligned,
 };

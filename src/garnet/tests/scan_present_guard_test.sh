@@ -26,12 +26,14 @@ def function(head):
     end = source.index('\n}\n', start) + 3
     return source[start:end]
 present = function('uint32_t scanPresent(uint64_t slotIn, uint64_t flags, uint64_t out[3]) {')
+register = function('uint32_t scanRegister(')
 poll = function('static bool scan_poll_locked(bool byIrq) {')
+restore = function('static uint32_t scan_restore(')
 status = function('uint32_t scanStatus(struct rdna4n_scan_status *o) {')
 start = hdr.index('struct ScanState {')
 end = hdr.index('\n};', start) + len('\n};')
 state = hdr[start:end] + '\nScanState gScan;\n'
-actual = poll + '\n' + present + '\n' + status
+actual = '\n'.join((poll, restore, register, present, status))
 (ev / 'scan_present_state.inc').write_text(state)
 (ev / 'scan_present_actual.inc').write_text(actual)
 assert (ev / 'scan_present_actual.inc').read_text() == actual
@@ -55,14 +57,19 @@ changes = [
 for before, after in changes:
     assert status_old.count(before) == 1, before
     status_old = status_old.replace(before, after)
-(old / 'scan_present_actual.inc').write_text(poll + '\n' + baseline + '\n' + status_old)
+register_old = register.replace('boSize, boDcc }', 'boSize, (static_cast<void>(boDcc), false) }')
+assert register_old != register
+restore_old = restore.replace('if (dcn41_hubp_require_linear(&gDcn.d, 0u) != DCN41_OK) break;', '(void)0;')
+assert restore_old != restore
+(old / 'scan_present_actual.inc').write_text('\n'.join((poll, restore_old, register_old, baseline, status_old)))
 (ev / 'status-control.txt').write_text(status_old)
 (ev / 'removed-guard.txt').write_text(guard)
 (ev / 'extraction.txt').write_text(
     f'Source: {path}\nSHA256: {hashlib.sha256(raw).hexdigest()}\n'
     f'scanPresent: original line {source[:source.index(present)].count(chr(10)) + 1}, {len(present.encode())} bytes\n'
-    f'scan_poll_locked: {len(poll.encode())} bytes; scanStatus: {len(status.encode())} bytes; all three functions extracted verbatim.\n'
-    'Baseline removes the Present guard and restores the previous Status reuse logic; not a historical checkout.\n')
+    f'scanRegister: {len(register.encode())} bytes; scan_restore: {len(restore.encode())} bytes; '
+    f'scan_poll_locked: {len(poll.encode())} bytes; scanStatus: {len(status.encode())} bytes; all five functions extracted verbatim.\n'
+    'The negative control removes the changed guards; it is not a historical checkout.\n')
 print((ev / 'extraction.txt').read_text())
 PY
 cxx=${CXX:-clang++}
@@ -85,6 +92,8 @@ done
 grep -F 'FAIL [status primary reuse]: PRIMARY slot is not REUSABLE' "$ev/before.log"
 grep -F 'FAIL [status primary reuse]: PRIMARY slot is INUSE' "$ev/before.log"
 grep -F 'FAIL [status primary read failure]: unknown live address exposes no REUSABLE slot' "$ev/before.log"
+grep -F 'FAIL [register DCC backing]: DCC backing not admitted as linear' "$ev/before.log"
+grep -F 'FAIL [restore after DCC appeared]: no address write on non-linear layout' "$ev/before.log"
 "$cxx" "${flags[@]}" -I "$ev" -I "$inc" "$src" -o "$ev/scan_present_guard_test"
 "$ev/scan_present_guard_test" | tee "$ev/after.log"
-printf 'PASS: pre-protection control fails Present and Status cases; unchanged production functions pass under ASan/UBSan\n'
+printf 'PASS: the negative control fails; production Register, Present, Status and Restore pass under ASan/UBSan\n'

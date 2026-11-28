@@ -101,6 +101,7 @@ public:
 	bool     displayGateHeld() const;
 	bool     displayGateHeldFor(uint64_t expectedFbEntryID) const;
 	bool     displayPeerActive() const;        // READY snapshot and gate at one generation
+	bool     displayWakePciReady() const;
 
 private:
 	// --- register harness (BAR5) ---
@@ -189,6 +190,7 @@ private:
 	uint64_t fenceTimeouts   { 0 };
 
 	IOPCIDevice       *pciDevice  { nullptr };
+	uint32_t           bootPciIdentity { UINT32_MAX };
 	IOMemoryMap       *rmmioMap   { nullptr };
 	volatile uint32_t *rmmio      { nullptr };
 	size_t             rmmioSize  { 0 };

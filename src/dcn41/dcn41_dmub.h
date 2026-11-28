@@ -38,6 +38,15 @@ extern "C" {
 #define DCN41_DMUB_FW_META_MAGIC 0x444D5542u      /* "DMUB" */
 #define DCN41_DMUB_GPINT_STOP_FW_RESPONSE 0xDEADDEADu
 #define DCN41_DMUB_GPINT_GET_FW_VERSION 1u        /* DMUB_GPINT__GET_FW_VERSION: "Queries the firmware version." */
+#define DCN41_DMUB_GPINT_STOP_FW 2u               /* DMUB_GPINT__STOP_FW */
+
+#define DCN41_DMUB_CW0_BASE 0x60000000u
+#define DCN41_DMUB_CW1_BASE 0x61000000u
+#define DCN41_DMUB_CW3_BASE 0x63000000u
+#define DCN41_DMUB_CW5_BASE 0x65000000u
+#define DCN41_DMUB_CW6_BASE 0x66000000u
+#define DCN41_DMUB_TRACE_ENTRY_OFFSET 16u
+#define DCN41_DMUB_OUTBOX0_TRACE_BASE (0xa0000000u + DCN41_DMUB_TRACE_ENTRY_OFFSET)
 
 /* struct dmub_cmd_header bit positions (encoded explicitly; dcn41_dmub_layout.h checks them against Linux's bitfields) */
 #define DCN41_DMUB_HDR_TYPE_SHIFT 0u
@@ -157,6 +166,9 @@ struct dcn41_dmub_state {
 };
 /* Reads only (27 registers, no write, no delay). Classifies the firmware and locates the inbox1 ring. */
 int dcn41_dmub_probe(struct dcn41_dev *dev, struct dcn41_dmub_state *st);
+/* Containment only: neither this nor dcn41_dmub_probe proves firmware recovery. */
+bool dcn41_dmub_ring_in_vram_reservation(const struct dcn41_dmub_state *st, uint64_t vram_size,
+                                        uint64_t reserve_vram_off, uint32_t reserve_size);
 
 /* ---- GPINT: the register command channel ----------------------------------------------------------------- */
 /* dmub_srv_send_gpint_command: DATAIN1 = status 1 | command << 16 | param; then up to timeout_us times udelay(1) and
@@ -192,6 +204,8 @@ bool dcn41_dmub_ring_full(const struct dcn41_dmub_ring *ring);
  * equals ours (someone else wrote), or the ring is full; writes the 16 dwords at wptr, reads them back and refuses on any
  * mismatch WITHOUT moving WPTR, then writes DMCUB_INBOX1_WPTR. */
 int dcn41_dmub_ring_submit(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmd);
+/* Under caller serialization, stage and verify all entries before publishing them with one WPTR write. */
+int dcn41_dmub_ring_submit_batch(struct dcn41_dmub_ring *ring, const struct dcn41_dmub_cmd *cmds, uint32_t count);
 /* dmub_srv_wait_for_idle: poll DMCUB_INBOX1_RPTR (udelay(1) between polls) until it equals our WPTR. */
 int dcn41_dmub_ring_wait_idle(struct dcn41_dmub_ring *ring, uint32_t timeout_us);
 /* dmub_rb_get_return_data: the entry just behind RPTR, for commands sent with ret_status set. */
@@ -223,6 +237,30 @@ void dcn41_dmub_build_query_feature_caps(struct dcn41_dmub_cmd *cmd);
 int dcn41_dmub_fw_meta_from_blob(const uint8_t *blob, uint32_t size, uint32_t meta_offset,
                                  struct dcn41_dmub_fw_meta_info *out);
 int dcn41_dmub_fw_meta_scan(const uint8_t *blob, uint32_t size, struct dcn41_dmub_fw_meta_info *out);
+/* Accept exactly the signed PSP LOAD_IP_FW slice, excluding the common file header.
+ * On success, report the size excluding the PSP header/footer if code_bytes is non-null. */
+int dcn41_dmub_fw_meta_from_psp(const uint8_t *signed_blob, uint32_t signed_bytes,
+                                struct dcn41_dmub_fw_meta_info *out, uint32_t *code_bytes);
+
+/* ---- VBIOS -> DAL DMUB handoff hardware helpers (dmub_dcn401.c) ------------------------------------------- */
+struct dcn41_dmub_window {
+    uint64_t gpu_addr;
+    uint32_t base;
+    uint32_t top;
+};
+
+struct dcn41_dmub_handoff_windows {
+    struct dcn41_dmub_window cw0, cw1, cw2, cw3, cw4, cw5, cw6, region6;
+    uint32_t inbox1_base, inbox1_size;
+    uint32_t outbox1_base, outbox1_size;
+    uint32_t outbox0_base, outbox0_size;
+};
+
+/* Caller must exclusively own GPINT throughout. E_STATE means no register was written. */
+int dcn41_dmub_stop_and_reset(struct dcn41_dev *dev, uint32_t timeout_us);
+/* PSP mode: CW0/CW1 and the security reset are not programmed by this helper. */
+int dcn41_dmub_program_windows(struct dcn41_dev *dev, const struct dcn41_dmub_handoff_windows *w);
+int dcn41_dmub_release_and_wait(struct dcn41_dev *dev, uint32_t psp_version, uint32_t timeout_us);
 
 #ifdef __cplusplus
 }

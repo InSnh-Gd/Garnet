@@ -25,6 +25,10 @@ static_assert(kRegResp != kPpsmcMsg && kRegResp != kPpsmcArg && kRegResp != kPps
 constexpr uint32_t kRegPllReq = 0x16E37u;   // CLK0_CLK_PLL_REQ
 constexpr uint32_t kRegDfs0   = 0x16E69u;   // CLK0_CLK0_DFS_CNTL  (DISPCLK slice)
 constexpr uint32_t kRegDfs1   = 0x16E6Cu;   // CLK0_CLK1_DFS_CNTL  (DPPCLK slice)
+constexpr uint32_t kRegDpRefDfs = 0x16e6fu;
+constexpr uint32_t kRegDchubTimer = 0x39e7u;
+constexpr uint32_t kDchubTimerOffset = 0x527u;
+constexpr uint32_t kDchubTimerEnable = 0x1000u;
 constexpr uint32_t kRegDentist = 0x124u;    // DENTIST_DISPCLK_CNTL
 
 // ---- DAL message ids (dalsmc.h) -----------------------------------------------------------------------------------------------------
@@ -44,6 +48,39 @@ constexpr uint32_t kRespWaitUs = 2000u * 1000u;        // RESP <= 2 s (Linux's b
 constexpr uint32_t kHardMinPollUs = 1000u * 1000u;     // ReturnHardMinStatus polled <= 1 s, every 1 ms
 constexpr uint32_t kDpmMaxLevels = 16u;
 constexpr uint32_t kIndexAll = 0xFFu;         // GetDpmFreqByIndex(0xFF) = the number of levels
+
+struct ClockSnapshotRow {
+    uint32_t rawCount;
+    uint32_t count;
+    uint32_t kHz[kDpmMaxLevels];
+    uint32_t rawDcMax;
+    uint32_t dcMaxKHz;
+    bool fineGrained;
+};
+
+struct ClockReferenceRegisters {
+    uint32_t pllRequest, dpRefDfs, dchubTimer;
+};
+
+struct ClockSnapshot {
+    ClockSnapshotRow dcfclk, socclk, dtbclk, dispclk, dppclk, uclk, fclk;
+    uint32_t umcChannels;
+    ClockReferenceRegisters references {};
+};
+
+struct SnapshotClock {
+    const char *name;
+    uint32_t id;
+    ClockSnapshotRow ClockSnapshot::*row;
+};
+
+// DCN401 DAL PPCLK order and query set, not the PPSMC clock enumeration.
+constexpr SnapshotClock kSnapshotClocks[] = {
+    {"DCFCLK", 9u, &ClockSnapshot::dcfclk}, {"SOCCLK", 1u, &ClockSnapshot::socclk},
+    {"DTBCLK", 10u, &ClockSnapshot::dtbclk}, {"DISPCLK", 6u, &ClockSnapshot::dispclk},
+    {"DPPCLK", 7u, &ClockSnapshot::dppclk}, {"UCLK", 2u, &ClockSnapshot::uclk},
+    {"FCLK", 3u, &ClockSnapshot::fclk},
+};
 
 // ---- the allowlist (design section 4) --------------------------------------------------------------------------------------------
 // Reasons a message is not sent. kAllow = 0. Nothing is sent for any other value.

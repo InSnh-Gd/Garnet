@@ -253,7 +253,10 @@ static uint32_t fc_sdma_up() {
 static uint32_t fc_dcc_raw() {
 	if (!gBringup.dev) return 0xffffffffu;
 	const uint32_t gc = rdna4_gc_base();
-	return gc ? rdna4_reg_read32(gc + RDNA4_SDMA_DCC_CNTL_OFF) : 0xffffffffu;
+	if (!gc) return 0xffffffffu;
+	amdgpu::ScopedGfxOffGuard gfxOffGuard(*gBringup.dev);
+	if (!gfxOffGuard.ok()) return 0xffffffffu;
+	return rdna4_reg_read32(gc + RDNA4_SDMA_DCC_CNTL_OFF);
 }
 
 // The submission context: which destination check applies (a residency copy: the VRAM guard; the control: our scratch only).

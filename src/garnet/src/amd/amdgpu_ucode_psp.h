@@ -353,6 +353,16 @@ struct imu_firmware_header_v1_0 {
 static_assert(sizeof(imu_firmware_header_v1_0) == 32 + 16,
               "imu_firmware_header_v1_0 must be 48 bytes");
 
+// version_major=1, version_minor=0
+// Upstream: drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:425-429
+struct dmcub_firmware_header_v1_0 {
+    common_firmware_header header;
+    uint32_t inst_const_bytes;
+    uint32_t bss_data_bytes;
+} __attribute__((packed));
+static_assert(sizeof(dmcub_firmware_header_v1_0) == 32 + 8,
+              "dmcub_firmware_header_v1_0 must be 40 bytes");
+
 // ---- Bootloader command codes ------------------------------------------
 //
 // Written to MP0_C2PMSG_35 to tell the PSP bootloader which sub-firmware

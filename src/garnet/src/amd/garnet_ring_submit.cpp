@@ -242,9 +242,14 @@ bool n1c_refuse_legacy(uint32_t site) {
 // ---- the HUNG latch -----------------------------------------------------------------------------------------------------------
 static void hang_log(uint64_t emitted, uint64_t retired) {
     CPContext &cp = gCtx->cp;
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    const uint32_t cpStat = gfxOffGuard.ok()
+        ? RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u))
+        : 0xFFFFFFFFu;
+    const uint32_t faultLo = gfxOffGuard.ok() ? hub_rd(0x15d0) : 0xFFFFFFFFu;
     N1C_LOG("HUNG: seq emitted %llu retired %llu rptr %u wptr %u CP_STAT %#x GCVM_L2_PROTECTION_FAULT_STATUS_LO32 %#x",
             (unsigned long long)emitted, (unsigned long long)retired, cp.rptr_cpu ? *cp.rptr_cpu : 0u, cp.wptr,
-            RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u)), hub_rd(0x15d0));   // CP_STAT, GC base idx 0
+            cpStat, faultLo);   // CP_STAT, GC base idx 0
 }
 // 0.0.612 (W3): the ONE place a latch is announced. Every latch site calls it only after hang_detect / hang_latch_wait returned true (gHang.hung is set),
 // and it writes RDNA4,Ready = 0 on the Metal nub (sticky: never back to 1 this boot). Called with no hang lock held.
@@ -372,6 +377,7 @@ bool own_wait(Session *s, bool *noBlame) {
 // gRingLock. Returns kOk, or kTimeout when the space wait reached 2 s (the CALLER decides what that means, after dropping the lock).
 static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, uint8_t ownerSlot, uint32_t ownerId, Session *owner) {
     DeviceContext &dev = *gCtx->dev;
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     CPContext &cp = gCtx->cp;
     const uint32_t mask = cp.ring_ptr_mask;
     if (n > cp.ring_size_dwords / 2u) return kBadArg;
@@ -390,6 +396,7 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
         n1c_wait_relax(el, kWaitCapNs - el, ep);
     }
     auto *ring = static_cast<uint32_t *>(cp.ring_cpu);
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     const uint64_t startWc = gWc;
     uint64_t wc = gWc;
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
@@ -602,6 +609,7 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
 // Runs completely independently of gRingLock so GFX and Compute submissions never serialize on ring writes or GPU execution.
 static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, Session *owner) {
     DeviceContext &dev = *gCtx->dev;
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     ComputeQueue &cq = gCtx->kcq;
     const uint32_t mask = cq.ring_ptr_mask;
     if (n > cq.ring_size_dwords / 2u) return kBadArg;
@@ -622,6 +630,7 @@ static uint32_t kcq_put_locked(const uint32_t *dw, uint32_t n, uint64_t rawSeq, 
         n1c_wait_relax(el, kWaitCapNs - el, ep);
     }
     auto *ring = static_cast<uint32_t *>(cq.ring_cpu);
+    if (dev.graphicsPowerQuarantined()) return kNotReady;
     const uint64_t startWc = gKcqWc;
     uint64_t wc = gKcqWc;
     for (uint32_t i = 0; i < n; i++) { ring[ring_idx(wc, mask)] = dw[i]; wc++; }
@@ -1321,7 +1330,11 @@ IOLock *gG1Lock;
 }
 
 bool g1_holds() { return gG1.holds; }   // 0.0.627 (G2): n1c_open refuses every open while a test context holds the GPU (switch ON)
-static uint32_t g1_cp_stat() { return RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u)); }   // CP_STAT (read only), as hang_log
+static uint32_t g1_cp_stat() {
+    ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+    if (!gfxOffGuard.ok()) return 0xFFFFFFFFu;
+    return RREG32(*gCtx->dev, SOC15_REG_OFFSET_BIDX(*gCtx->dev, IPBlock::GC, 0, 0x0F40u));   // CP_STAT (read only), as hang_log
+}
 static uint32_t g1_rptr() { sysmem_rmb(); return gCtx->cp.rptr_cpu ? *gCtx->cp.rptr_cpu : 0u; }
 
 // NOP every ring dword outside the live range [gG1.liveStart, gWc). Caller holds gCliLock; the ring lock is taken here.
@@ -1558,7 +1571,9 @@ IOReturn n1c_g1_verb(uint32_t action, uint64_t arg, BringupContext &ctx, uint64_
             gG1.lastCode = t.outcome;
             if (gCtx != nullptr) {
                 const uint64_t em = emitted_now();
-                o[3] = em; o[4] = retired_now(em); o[5] = g1_cp_stat(); o[6] = g1_rptr(); o[7] = gWc; o[8] = hub_rd(0x15d0);
+                ScopedGfxOffGuard gfxOffGuard(*gCtx->dev);
+                const uint64_t f0 = gfxOffGuard.ok() ? hub_rd(0x15d0) : 0xFFFFFFFFull;
+                o[3] = em; o[4] = retired_now(em); o[5] = g1_cp_stat(); o[6] = g1_rptr(); o[7] = gWc; o[8] = f0;
             }
             N1C_LOG("g1 hangtest: outcome %u (rc %#x, seq %llu)", t.outcome, t.rc, (unsigned long long)t.seq);
         }

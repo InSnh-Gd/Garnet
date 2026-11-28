@@ -22,24 +22,44 @@ static void IOLockLock(IOLock *l) { expect(l == &lock && !l->held, "lock acquire
 static void IOLockUnlock(IOLock *l) { expect(l == &lock && l->held, "lock released once"); l->held = false; calls += 'U'; }
 static void locked() { expect(lock.held, "hardware boundary runs under scan lock"); }
 static uint64_t now_ns() { return 1000; }
+static void IOSleep(int) { expect(!lock.held, "restore waits without the scan lock"); }
 static void test_log(const char *, ...) {}
 #define RDNA4LOG(...) test_log(__VA_ARGS__)
 constexpr int DCN41_OK = 0;
+constexpr unsigned DCN41_IRQ_VUPDATE_NO_LOCK = 1u;
+struct dcn41_irq { uint8_t kind, inst; };
 constexpr uint32_t kOffFlipControl = 0x1234;
-struct Device {};
-static struct { Device d; const char *tag = nullptr; bool armed = true; } gDcn;
+struct Device { uint64_t scanout_lo = 0x100000, scanout_hi = 0x300000; };
+static struct {
+    Device d;
+    const char *tag = nullptr;
+    bool armed = true, srcEnabled = false, primaryVblEnabled = false;
+    uint8_t srcKind = 0, srcInst = 0, primaryVblOtg = 0;
+} gDcn;
 struct ScanGeom { uint32_t w, h, pitchPx, fmt, sw; bool dcc; };
 namespace rdna4peer { constexpr uint32_t kLeaseLocalDisplay = 1u; }
 struct rdna4_display_txn { bool ok = true; explicit rdna4_display_txn(uint32_t) {} };
+static int dcn41_irq_set(Device *, struct dcn41_irq, bool) { locked(); return DCN41_OK; }
 // The full production ScanState declaration, not a test copy of its fields.
 #include "scan_present_state.inc"
 static struct Hardware {
     uint64_t plane = 0x100000, early = 0x100000, programmed = 0;
     bool pending = true;
+    bool linear = true;
     int primaryRc = DCN41_OK, earlyRc = DCN41_OK, flipRc = DCN41_OK;
     uint32_t flipControl = 0x100, frame = 20, writes = 0;
 } hw;
 static void scan_read_geom(ScanGeom *g) { locked(); calls += 'G'; *g = {64, 64, 64, kFmtArgb8888, 0, false}; }
+static int dcn41_hubp_require_linear(Device *, uint32_t inst) {
+    locked(); expect(inst == 0, "restore checks live layout on HUBP0");
+    return hw.linear ? DCN41_OK : -1;
+}
+static bool rdna4m6_latched_on() { return true; }
+static bool rdna4m6flip_latched_on() { return true; }
+static bool scanXClash(uint64_t, uint64_t) { locked(); calls += 'X'; return false; }
+static void recoverVupdateAckUnderTxn(uint32_t otg, bool checkHwStatus) {
+    locked(); expect(otg == 0 && !checkHwStatus, "Present checks software ACK recovery on OTG0");
+}
 static int dcn41_hubp_read_primary_addr(Device *, uint32_t inst, uint64_t *out) {
     locked(); expect(inst == 0, "PRIMARY reads HUBP0"); calls += 'R';
     if (hw.primaryRc == DCN41_OK) *out = hw.plane;
@@ -63,7 +83,7 @@ static int dcn41_hubp_program_flip(Device *, uint32_t inst, uint64_t mc, uint32_
     locked(); expect(inst == 0 && vmid == 0 && !tmz && !immediate, "flip arguments remain HUBP0 VMID0 non-immediate");
     calls += 'W'; ++hw.writes; hw.programmed = mc; return hw.flipRc;
 }
-// All three production functions are included unchanged, including their logging.
+// The production functions are included unchanged, including their logging.
 #include "scan_present_actual.inc"
 
 static void setup(const char *name) {
@@ -125,6 +145,47 @@ static rdna4n_scan_status status() {
     expect(!lock.held && out.acquired == 1 && out.presents == before.presents, "status unlocks and reports actual accounting");
     return out;
 }
+static void register_cases() {
+    setup("register DCC backing");
+    const uint64_t target = 0x240000;
+    gScan.consoleMc = 0x100000;
+    gScan.consoleBytes = 0x4000;
+    table_init(gScan.tbl, gScan.consoleMc, gScan.consoleBytes);
+    uint64_t out[2] = {101, 102};
+    expect(scanRegister(true, target, 0x10000, 0, 256, 64, 64, kFmtArgb8888, out, true) == kUnsupported,
+           "DCC backing not admitted as linear");
+    expect(!gScan.tbl.s[0].used && out[0] == 101 && out[1] == 102 && calls.find('X') == std::string::npos,
+           "DCC refusal publishes no slot, address or overlap query");
+    setup("register linear backing");
+    gScan.consoleMc = 0x100000;
+    gScan.consoleBytes = 0x4000;
+    table_init(gScan.tbl, gScan.consoleMc, gScan.consoleBytes);
+    expect(scanRegister(true, target, 0x10000, 0, 256, 64, 64, kFmtArgb8888, out, false) == kOk &&
+           gScan.tbl.s[0].used && out[0] == 0 && out[1] == target && calls.find('X') != std::string::npos,
+           "ordinary linear backing is registered and checks overlap");
+}
+
+static void restore_cases() {
+    setup("restore after DCC appeared");
+    gScan.consoleMc = 0x100000;
+    gScan.consoleBytes = 0x4000;
+    gScan.haveConsole = true;
+    hw.plane = hw.early = 0x200000;
+    hw.pending = false;
+    hw.linear = false;
+    uint64_t out[2] = {101, 102};
+    expect(scan_restore("layout change", false, 0u, out) == 0u, "restore reports a verdict");
+    expect(hw.writes == 0, "no address write on non-linear layout");
+    expect(gScan.restoreFailed && out[0] == 0u && out[1] == 0x200000, "refusal is not mistaken for completed restore");
+
+    hw.plane = hw.early = gScan.consoleMc;
+    expect(scan_restore("duplicate release", false, 0u, out) == 0u && gScan.restoreFailed && out[0] == 0u,
+           "already selected console address cannot verify an incompatible layout");
+    hw.linear = true;
+    expect(scan_restore("linear readback", false, 0u, out) == 0u && !gScan.restoreFailed && out[0] == 1u,
+           "unmodified linear restore remains verifiable");
+}
+
 static void status_cases() {
     for (uint32_t slot = 0; slot < kMaxSlots; ++slot) {
         setup("status primary reuse"); hw.plane = gScan.tbl.s[slot].mc;
@@ -212,6 +273,8 @@ int main() {
     setup("invalid arguments");
     expect(scanPresent(kMaxSlots, 0, out) == kBadArg && scanPresent(0, 1, out) == kBadArg && calls.empty(), "invalid arguments rejected before lock or MMIO");
     status_cases();
+    register_cases();
+    restore_cases();
     std::printf("scan_present_guard: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

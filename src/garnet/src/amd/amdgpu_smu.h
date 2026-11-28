@@ -288,27 +288,33 @@ kern_return_t smu_set_uclk_hard_min(const DeviceContext &dev, uint32_t mhz);
 kern_return_t smu_pin_uclk_top(const DeviceContext &dev, uint32_t *outTopMhz = nullptr);
 kern_return_t smu_set_gfx_off(const DeviceContext &dev, bool allow);
 
-// Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard
-// and activity-driven GFXCLK idle DPM governor.
+// Per-driver SMU runtime state: refcounted GC MMIO GFXOFF guard with
+// ~100 ms delayed-idle AllowGfxOff hysteresis and activity-driven GFXCLK idle DPM governor.
+enum class DisplayWakePhase : uint8_t { Idle, Sleeping, Waking, PoweredOn };
 struct SMUContext {
     rdna4gfxoff::GuardState   gfxoff {};
     rdna4pwr::IdleDpmGovernor idleDpm {};
-    volatile uint32_t         hwGfxOffActive { 0u };
-    bool                      inited         { false };
+    const DeviceContext      *gfxoffDev   { nullptr };
+    void                     *gfxoffTimer { nullptr }; // thread_call_t in kernel
+    bool                      inited      { false };
+    bool                      powerEpochManaged { false };
+    bool                      sleepPending { false };
+    bool                      wakeUnverified { false };
+    const DeviceContext      *displayWakeDev { nullptr };
+    DisplayWakePhase          displayWakePhase { DisplayWakePhase::Idle };
 };
 
 // Refcounted GC MMIO GFXOFF guard.
-// Exported cleanly so GC MMIO paths (TLB flush, diagnostics, hang recovery)
-// and VCN 5.0 DPG handoff (`enable-rdna4-vcn5-video`) share one serialized
-// refcount. When hardware GFXOFF is active, allow=false increments refcount
-// (0 -> 1 sends DisallowGfxOff) and allow=true decrements (1 -> 0 sends
-// AllowGfxOff). Fails closed on underflow or DisallowGfxOff failure.
 kern_return_t gfx_off_ctrl(const DeviceContext &dev, SMUContext &smu, bool allow);
 kern_return_t gfx_off_boot_init(const DeviceContext &dev, SMUContext &smu,
                                 bool bootArgPresent, uint32_t bootArgValue,
                                 bool *outAllowed = nullptr);
-void          gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
+kern_return_t gfx_off_teardown(const DeviceContext &dev, SMUContext &smu);
 void          gfx_off_register_context(SMUContext *smu);
+enum class GfxOffPowerEvent : uint8_t { WillSleep, WillNotSleep, WillPowerOn, HasPoweredOn, Shutdown };
+kern_return_t gfx_off_power_event(DeviceContext &dev, SMUContext &smu, GfxOffPowerEvent event);
+bool smu_display_wake_pin_allowed(const SMUContext &smu);
+kern_return_t smu_repin_uclk_after_wake(const DeviceContext &dev, SMUContext &smu, uint32_t expectedVersion);
 SMUContext   *gfx_off_active_context();
 
 // Balanced RAII guard for GC MMIO critical sections.

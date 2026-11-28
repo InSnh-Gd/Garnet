@@ -24,6 +24,28 @@ static int hubp_get_live(struct dcn41_dev *dev, uint32_t address, uint32_t mask,
     return DCN41_OK;
 }
 
+int dcn41_hubp_require_linear(struct dcn41_dev *dev, uint32_t hubp)
+{
+    uint32_t swizzle = 0, dcc = 0;
+    int rc;
+
+    if (!dcn41_ready(dev))
+        return DCN41_E_UNINIT;
+    if (hubp >= DCN41_NUM_PIPES)
+        return DCN41_E_INST;
+    rc = hubp_get_live(dev, DCN41_ADDR_I(dev, DCN41_HUBP_DCSURF_TILING_CONFIG, hubp),
+                       DCN41_M(DCN41_HUBP_DCSURF_TILING_CONFIG, SW_MODE),
+                       DCN41_HUBP_DCSURF_TILING_CONFIG__SW_MODE__SHIFT, &swizzle);
+    if (rc)
+        return rc;
+    rc = hubp_get_live(dev, DCN41_ADDR_I(dev, DCN41_HUBPREQ_DCSURF_SURFACE_CONTROL, hubp),
+                       DCN41_M(DCN41_HUBPREQ_DCSURF_SURFACE_CONTROL, PRIMARY_SURFACE_DCC_EN) |
+                       DCN41_M(DCN41_HUBPREQ_DCSURF_SURFACE_CONTROL, SECONDARY_SURFACE_DCC_EN), 0, &dcc);
+    if (rc)
+        return rc;
+    return swizzle == 0 && dcc == 0 ? DCN41_OK : DCN41_E_STATE;
+}
+
 int dcn41_hubp_program_flip(struct dcn41_dev *dev, uint32_t hubp, uint64_t mc_addr, uint32_t vmid, bool tmz,
                             bool immediate)
 {

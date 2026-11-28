@@ -69,6 +69,56 @@ struct MockCursorHw {
 	}
 };
 
+void test_mall_cursor_uses_padded_footprint() {
+	using namespace rdna4cursor;
+	check(mall_cursor_bytes(false, 128u) == 0u, "hidden cursor allocates no CAB bytes");
+	check(mall_cursor_bytes(true, 32u) == 0u, "16 KiB cursor fits SRAM");
+	check(mall_cursor_bytes(true, 33u) == 131072u, "CAB reserves one block plus alignment slack for the padded cursor");
+	check(mall_cursor_bytes(true, 128u) == 131072u, "128x128 ARGB cursor uses two CAB blocks");
+	check(mall_cursor_subvp_eligible(false, 0u, 0u), "hidden cursor does not limit SubVP");
+	check(mall_cursor_subvp_eligible(true, 64u, 32u), "cursor that fits SRAM permits SubVP");
+	check(!mall_cursor_subvp_eligible(true, 64u, 33u), "SubVP rejects cursor whose padded pitch exceeds SRAM");
+	check(!mall_cursor_subvp_eligible(true, 0u, 0u), "SubVP rejects unknown visible cursor geometry");
+	check(mall_cursor_select(0xffu, 0u, true, 64u, 128u, false) == 0xfbu, "no allocation clears only the cursor bit");
+	check(mall_cursor_select(0xffu, 131071u, true, 64u, 128u, false) == 0xfbu, "undersized allocation cannot cache the cursor");
+	check(mall_cursor_select(0xffu, 131072u, false, 64u, 128u, false) == 0xfbu, "hidden cursor does not request MALL");
+	check(mall_cursor_select(0xffu, 131072u, true, 64u, 32u, false) == 0xfbu, "cursor that fits SRAM never requests MALL");
+	check(mall_cursor_select(0xffu, 131072u, true, 64u, 128u, true) == 0xfbu, "phantom never requests cursor MALL");
+	check(mall_cursor_select(0xffu, 131072u, true, 64u, 129u, false) == 0xfbu, "unknown cursor geometry does not request MALL");
+	check(mall_cursor_select(0xfbu, 131072u, true, 64u, 128u, false) == 0xffu, "confirmed allocation enables only the cursor bit");
+
+	MockCursorHw mock;
+	CursorPlaneConfig cursor { 0u, 0x0080017ea000ull, 64u, 128u,
+		0, 0, 0u, 0u, 594000u, true };
+	mock.regs[kSeg2HubpMallConfig] = 0x15u;
+	check(program_cursor_plane(mock.hw(), cursor), "restore visible cursor without a CAB allocation");
+	check(mock.regs[kSeg2HubpMallConfig] == 0x11u, "cursor restore clears only unsupported cursor MALL");
+	mock.regs[kSeg2HubpMallConfig] = 0x15u;
+	check(move_cursor_plane(mock.hw(), cursor, true), "show cursor without a CAB allocation");
+	check(mock.regs[kSeg2HubpMallConfig] == 0x11u, "show clears a previous cursor MALL selection");
+	mock.regs[kSeg2HubpMallConfig] = 0x15u;
+	cursor.enabled = false;
+	check(move_cursor_plane(mock.hw(), cursor, true), "hide cursor");
+	check(mock.regs[kSeg2HubpMallConfig] == 0x11u, "hide clears a previous cursor MALL selection");
+	mock.regs[kSeg2HubpMallConfig] = 0x15u;
+	check(disable_cursor_plane(mock.hw(), 0u), "disable cursor");
+	check(mock.regs[kSeg2HubpMallConfig] == 0x11u, "disable clears only cursor MALL");
+	mock.regs[kSeg2HubpMallConfig] = 0xffffffffu;
+	cursor.enabled = true;
+	check(!program_cursor_plane(mock.hw(), cursor), "dead MALL register read refuses cursor programming");
+	check(mock.regs[kSeg2HubpMallConfig] == 0xffffffffu, "dead MALL register read is never written back");
+	check(mock.regs[kSeg2OtgMasterUpdateLock] == 0u, "dead MALL read releases update lock");
+	check(!move_cursor_plane(mock.hw(), cursor, true), "dead MALL read refuses show");
+	check(!disable_cursor_plane(mock.hw(), 0u), "disable reports dead MALL read");
+	check((mock.regs[kSeg2HubpCursorControl] & 1u) == 0u, "dead MALL read still leaves cursor disabled");
+	mock.regs[kSeg2HubpCursorControl] = cursor_control_word(true);
+	mock.regs[kSeg2DppCursorCmControl] = cursor_cm_control_word(true);
+	cursor.enabled = false;
+	check(!program_cursor_plane(mock.hw(), cursor), "program disabled cursor reports dead MALL read");
+	check((mock.regs[kSeg2HubpCursorControl] & 1u) == 0u &&
+	      (mock.regs[kSeg2DppCursorCmControl] & 1u) == 0u, "disabled programming attempts both hides despite MALL failure");
+}
+
 void test_allowlist_and_program_all_pipes() {
 	for (uint32_t pipe = 0u; pipe < rdna4cursor::kCursorMaxPipes; ++pipe) {
 		MockCursorHw mock;
@@ -138,7 +188,7 @@ void test_allowlist_and_program_all_pipes() {
 		// Also verify disable path on same pipe passes allowlist.
 		mock.clearLog();
 		check(rdna4cursor::disable_cursor_plane(mock.hw(), pipe), "disable_cursor_plane succeeds");
-		check(mock.writes.size() == 4u, "disable locks, writes 2 controls, unlocks");
+		check(mock.writes.size() == 4u, "disable locks, writes 2 controls, unlocks when MALL already clear");
 		check(mock.regs[rdna4cursor::hubp_reg(pipe, rdna4cursor::kSeg2HubpCursorControl)] ==
 		          rdna4cursor::cursor_control_word(false),
 		      "disable clears CURSOR_ENABLE");
@@ -276,6 +326,7 @@ void test_plan_cursor_slot() {
 } // namespace
 
 int main() {
+	test_mall_cursor_uses_padded_footprint();
 	test_allowlist_and_program_all_pipes();
 	test_position_and_hotspot_encoding();
 	test_move_visibility_only_controls();

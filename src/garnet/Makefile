@@ -12,12 +12,14 @@ HOST_OS   := $(shell uname -s)
 ifeq ($(HOST_OS),Darwin)
 SDK       := $(shell xcrun --sdk macosx --show-sdk-path)
 NM        := nm -arch $(ARCH)
+DML21_NM_DEFINED = $(NM) -gUj
 CXXFILT   := c++filt
 SIGN      ?= 1
 else
 # Kernel-only builds need MacKernelSDK, not the macOS userspace SDK.
 SDK       = $(MKSDK)
 NM        := llvm-nm
+DML21_NM_DEFINED = $(NM) -g --defined-only -j
 CXXFILT   := $(shell command -v llvm-cxxfilt || command -v c++filt || echo llvm-cxxfilt) -_
 SIGN      ?= 0
 endif
@@ -41,7 +43,7 @@ CXX_SRCS := src/GarnetDriver.cpp src/GarnetDriverStages.cpp src/GarnetDisplayGat
             src/GarnetPrimaryFramebuffer.cpp src/GarnetUserClient.cpp \
             src/GarnetNativeClient.cpp src/GarnetMetalNub.cpp \
             src/GarnetDisplayNub.cpp src/webkit_mmap_hook.cpp src/ipdiscovery.cpp src/psp.cpp \
-            $(wildcard src/amd/*.cpp) $(wildcard src/dcn/*.cpp)
+            $(wildcard src/amd/*.cpp) $(filter-out src/dcn/dcn41_dml21_bridge.cpp src/dcn/dcn41_dml21_soc.cpp,$(wildcard src/dcn/*.cpp))
 # Generated firmware belongs to this build, so concurrent chip builds cannot reuse stale stubs.
 FW_GEN   := $(BUILD)/firmware
 FW_BINS  := $(wildcard firmware/*.bin)
@@ -57,8 +59,9 @@ FW_navi48   := gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp gc_12_0_1_
                psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3
 FW_navi44   := gc_12_0_0_imu gc_12_0_0_me gc_12_0_0_mec gc_12_0_0_pfp gc_12_0_0_rlc gc_12_0_0_uni_mes \
                psp_14_0_2_sos psp_14_0_2_ta sdma_7_0_0 smu_14_0_2
-FW_ALLCHIPS := $(FW_navi48) $(FW_navi44)
-FW_REQUIRED := $(foreach c,$(CHIPS),$(FW_$(c)))
+FW_SHARED   := dcn_4_0_1_dmcub
+FW_ALLCHIPS := $(FW_navi48) $(FW_navi44) $(FW_SHARED)
+FW_REQUIRED := $(foreach c,$(CHIPS),$(FW_$(c))) $(FW_SHARED)
 ifneq ($(filter-out navi48 navi44,$(CHIPS)),)
 $(error CHIPS may only contain navi48 and navi44, got: $(CHIPS))
 endif
@@ -90,6 +93,12 @@ $(FW_STUB_SRCS): $(FW_GEN)/fw_%.c: Makefile
 DCN41_DIR := ../dcn41
 DCN41_SRCS := $(wildcard $(DCN41_DIR)/*.c)
 DCN41_OBJS := $(patsubst $(DCN41_DIR)/%.c,$(BUILD)/dcn41/%.o,$(DCN41_SRCS))
+DML21_DIR := src/dcn/dml21
+include $(DML21_DIR)/sources.mk
+DML21_C_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(DML21_C_SRCS))
+DML21_ADAPTER := src/dcn/dml21_adapter/dcn41_dml21_adapter.cpp
+DML21_ADAPTER_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(DML21_ADAPTER))
+DML21_OBJS := $(DML21_C_OBJS) $(DML21_ADAPTER_OBJ)
 C_SRCS   := src/kmod_info.c
 $(FW_GEN)/fw_%.c: firmware/%.bin tools/embed-firmware.py
 	@mkdir -p $(dir $@)
@@ -102,10 +111,12 @@ COMMON := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -I$(MKSDK)/Headers -Isrc -Isrc/amd -I$(DCN41_DIR) -mmacosx-version-min=$(DEPLOY) \
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
   -D_FORTIFY_SOURCE=0 -nostdinc -fno-builtin -fno-common -fno-stack-protector \
-  -mkernel -fapple-kext -Wall -Os -g
+  -mkernel -mno-sse -mno-mmx -mno-80387 -fapple-kext -Wall -Os -g
 CXXFLAGS := $(COMMON) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors \
   -include src/GarnetBootArgs.h   # rdna4-* boot-arg fallback (logs when a legacy token is used)
 CFLAGS   := $(filter-out -fapple-kext,$(COMMON))
+DML21_FP_FLAGS := $(DML21_CPPFLAGS) -DGARNET_DML21_COMPILE_ONLY -msse -msse2 -mno-avx -ffp-contract=off \
+  -Wframe-larger-than=3072 -Werror=frame-larger-than
 LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 \
   $(if $(wildcard $(MKSDK)/Library/x86_64/libkmodc++.a),-lkmodc++) -lkmod -Wl,-no_deduplicate \
@@ -113,7 +124,28 @@ LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) 
 
 all: $(KEXT)
 
-$(OBJS): | check-firmware check-version
+OBJDUMP ?= llvm-objdump
+.PHONY: check-kernel-fp
+check-kernel-fp: $(OBJS)
+	@count=$$(python3 ../../tools/dcn41/fpu_count.py "$(OBJDUMP)" $(OBJS)) && \
+	  printf 'FP/SIMD instructions in %s kernel objects: %s\n' '$(words $(OBJS))' "$$count" && test "$$count" = 0
+
+.PHONY: check-dml21-kernel
+check-dml21-kernel: $(DML21_OBJS)
+	@set -e; disasm=$$($(OBJDUMP) -d --no-show-raw-insn $(DML21_OBJS)); \
+	  if printf '%s\n' "$$disasm" | grep -E '^[[:space:]]*[0-9a-f]+:[[:space:]]+v[[:alnum:]]+[[:space:]]|^[[:space:]]*[0-9a-f]+:[[:space:]]+v[[:alnum:]]+$$'; then \
+	    echo 'DML2.1 objects contain AVX instructions'; exit 1; fi; \
+	  defined=$$($(DML21_NM_DEFINED) $(DML21_OBJS)); \
+	  undefined=$$($(NM) -u -j $(DML21_OBJS)); \
+	  unresolved=$$(printf '%s\n' "$$defined" '===UNDEFINED===' "$$undefined" | awk '\
+	    /^===UNDEFINED===$$/ { refs=1; next } \
+	    /^_/ && !refs { defs[$$0]=1 } \
+	    /^_/ && refs && !defs[$$0] && $$0 !~ /^(___bzero|_memcmp|_memcpy|_memset)$$/ { print }'); \
+	  if [ -n "$$unresolved" ]; then printf 'DML2.1 unresolved symbols:\n%s\n' "$$unresolved"; exit 1; fi; \
+	  printf 'DML2.1: %s compile-only kernel objects, without AVX or unexpected dependencies\n' '$(words $(DML21_OBJS))'
+
+$(OBJS): Makefile | check-firmware check-version
+$(DML21_OBJS): Makefile
 check-version:
 	@ver=$$(tr -d ' \t\r\n' < VERSION); \
 	 grep -q "GARNET_KEXT_VERSION_STR \"$$ver\"" src/garnet_version.h || { echo "error: src/garnet_version.h does not match VERSION ($$ver)"; exit 1; }; \
@@ -141,7 +173,13 @@ $(FW_GEN)/%.o: $(FW_GEN)/%.c
 $(BUILD)/dcn41/%.o: $(DCN41_DIR)/%.c
 	@mkdir -p $(BUILD)/dcn41
 	$(CC) $(CFLAGS) -std=c11 -MMD -MP -c $< -o $@
--include $(OBJS:.o=.d)
+$(DML21_C_OBJS): $(BUILD)/%.o: %.c $(DML21_DIR)/sources.mk
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mno-sse,$(CFLAGS)) $(DML21_FP_FLAGS) -std=c11 -MMD -MP -c $< -o $@
+$(DML21_ADAPTER_OBJ): $(DML21_ADAPTER) $(DML21_DIR)/sources.mk
+	@mkdir -p $(dir $@)
+	$(CXX) $(filter-out -mno-sse,$(CXXFLAGS)) $(DML21_FP_FLAGS) -MMD -MP -c $< -o $@
+-include $(OBJS:.o=.d) $(DML21_OBJS:.o=.d)
 
 $(KEXT): $(OBJS) Info.plist
 	@mkdir -p $(KEXT)/Contents/MacOS

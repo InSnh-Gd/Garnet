@@ -20,7 +20,8 @@ const AsicInfo kAsics[] = {
         GcGeometry{ true, false, 0, 0, 4, 2, 4, 8, 32 },
         { "psp_14_0_3_sos", "psp_14_0_3_ta", "gc_12_0_1_imu", "gc_12_0_1_pfp", "gc_12_0_1_me",
           "gc_12_0_1_mec", "gc_12_0_1_mes", "gc_12_0_1_mes1", "gc_12_0_1_uni_mes", "gc_12_0_1_rlc",
-          "gc_12_0_1_toc", "smu_14_0_3", "sdma_7_0_1" },
+          "gc_12_0_1_toc", "smu_14_0_3", "sdma_7_0_1", "dcn_4_0_1_dmcub" },
+        64, 16,
     },
     {
         AsicId::Navi44, "Navi 44",
@@ -32,7 +33,8 @@ const AsicInfo kAsics[] = {
         GcGeometry{ true, false, 0, 0, 2, 2, 4, 8, 16 },
         { "psp_14_0_2_sos", "psp_14_0_2_ta", "gc_12_0_0_imu", "gc_12_0_0_pfp", "gc_12_0_0_me",
           "gc_12_0_0_mec", "gc_12_0_0_mes", "gc_12_0_0_mes1", "gc_12_0_0_uni_mes", "gc_12_0_0_rlc",
-          "gc_12_0_0_toc", "smu_14_0_2", "sdma_7_0_0" },
+          "gc_12_0_0_toc", "smu_14_0_2", "sdma_7_0_0", "dcn_4_0_1_dmcub" },
+        32, 8,
     },
 };
 constexpr size_t kNumAsics = sizeof(kAsics) / sizeof(kAsics[0]);

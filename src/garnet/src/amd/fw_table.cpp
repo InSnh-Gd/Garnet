@@ -25,6 +25,8 @@ FW_DECL(psp_14_0_2_sos) FW_DECL(psp_14_0_2_ta)
 FW_DECL(gc_12_0_0_imu) FW_DECL(gc_12_0_0_pfp) FW_DECL(gc_12_0_0_me) FW_DECL(gc_12_0_0_mec)
 FW_DECL(gc_12_0_0_uni_mes) FW_DECL(gc_12_0_0_rlc)
 FW_DECL(smu_14_0_2) FW_DECL(sdma_7_0_0)
+// Shared DCN 4.01 DAL DMUB
+FW_DECL(dcn_4_0_1_dmcub)
 } // extern "C"
 #undef FW_DECL
 
@@ -67,23 +69,23 @@ void build_table() {
     const uint8_t *data[kChips][kCount] = {
         { fw_psp_14_0_3_sos, fw_psp_14_0_3_ta, fw_gc_12_0_1_imu, fw_gc_12_0_1_pfp, fw_gc_12_0_1_me,
           fw_gc_12_0_1_mec, nullptr, nullptr, fw_gc_12_0_1_uni_mes, fw_gc_12_0_1_rlc, nullptr,
-          fw_smu_14_0_3, fw_sdma_7_0_1 },
+          fw_smu_14_0_3, fw_sdma_7_0_1, fw_dcn_4_0_1_dmcub },
         { fw_psp_14_0_2_sos, fw_psp_14_0_2_ta, fw_gc_12_0_0_imu, fw_gc_12_0_0_pfp, fw_gc_12_0_0_me,
           fw_gc_12_0_0_mec, nullptr, nullptr, fw_gc_12_0_0_uni_mes, fw_gc_12_0_0_rlc, nullptr,
-          fw_smu_14_0_2, fw_sdma_7_0_0 },
+          fw_smu_14_0_2, fw_sdma_7_0_0, fw_dcn_4_0_1_dmcub },
     };
     const size_t size[kChips][kCount] = {
         { fw_psp_14_0_3_sos_size, fw_psp_14_0_3_ta_size, fw_gc_12_0_1_imu_size, fw_gc_12_0_1_pfp_size,
           fw_gc_12_0_1_me_size, fw_gc_12_0_1_mec_size, 0, 0, fw_gc_12_0_1_uni_mes_size,
-          fw_gc_12_0_1_rlc_size, 0, fw_smu_14_0_3_size, fw_sdma_7_0_1_size },
+          fw_gc_12_0_1_rlc_size, 0, fw_smu_14_0_3_size, fw_sdma_7_0_1_size, fw_dcn_4_0_1_dmcub_size },
         { fw_psp_14_0_2_sos_size, fw_psp_14_0_2_ta_size, fw_gc_12_0_0_imu_size, fw_gc_12_0_0_pfp_size,
           fw_gc_12_0_0_me_size, fw_gc_12_0_0_mec_size, 0, 0, fw_gc_12_0_0_uni_mes_size,
-          fw_gc_12_0_0_rlc_size, 0, fw_smu_14_0_2_size, fw_sdma_7_0_0_size },
+          fw_gc_12_0_0_rlc_size, 0, fw_smu_14_0_2_size, fw_sdma_7_0_0_size, fw_dcn_4_0_1_dmcub_size },
     };
     for (uint32_t c = 0; c < kChips; c++) {
         const AsicFwNames &n = chips[c]->fw;
         const char *names[kCount] = { n.psp_sos, n.psp_ta, n.gc_imu, n.gc_pfp, n.gc_me, n.gc_mec, n.gc_mes,
-                                      n.gc_mes1, n.gc_uni_mes, n.gc_rlc, n.gc_toc, n.smu, n.sdma };
+                                      n.gc_mes1, n.gc_uni_mes, n.gc_rlc, n.gc_toc, n.smu, n.sdma, n.dcn_dmcub };
         for (uint32_t i = 0; i < kCount; i++)
             set(c, static_cast<FwId>(i), size[c][i] ? data[c][i] : nullptr, size[c][i], names[i]);
     }
@@ -106,7 +108,7 @@ bool str_eq(const char *a, const char *b) {
 
 bool is_optional(uint32_t i) {
     const FwId id = static_cast<FwId>(i);
-    return id == FwId::GC_MES || id == FwId::GC_MES1 || id == FwId::GC_TOC;
+    return id == FwId::GC_MES || id == FwId::GC_MES1 || id == FwId::GC_TOC || id == FwId::DCN_DMUB;
 }
 
 } // anonymous namespace

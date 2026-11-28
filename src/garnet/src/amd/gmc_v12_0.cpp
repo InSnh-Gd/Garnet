@@ -103,6 +103,7 @@
 #include <IOKit/IOLib.h>
 
 #include "amdgpu_gmc.h"
+#include "amdgpu_smu.h"
 #include "rebar_pure.h"   // 0.0.663: visible_size / pool_sizes (pure, host-tested)
 #include "amdgpu_log.h"
 #include "amdgpu_field_defs.h"
@@ -2203,6 +2204,7 @@ gmc_vmfrag_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
         const kern_return_t r =
             sdma_ib_copy_linear_test(dev, inst, ibVa, ibOff, srcVa, dstVa,
                                      kVMFragCopyBytes, /*vmid*/ 1, tag, 200000ull);
+        if (inst.dma_unconfirmed) return false;
         uint32_t bad = 0;
         for (uint32_t i = 0; i < kVMFragCopyBytes / 4; i++)
             if (RBAR0_32(dev, dstOff + (uint64_t)i * 4) != pattern) bad++;
@@ -2228,6 +2230,7 @@ gmc_vmfrag_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
                        sub_va + 0x0000, sub_va + 0x1000,
                        data_off + 0x10000, data_off + 0x11000,
                        0x5B7AB1E0u, 0xA1, &t.sub_bad);
+    if (inst.dma_unconfirmed) return kIOReturnTimeout;
     if (!t.sub_ok) {
         GMC_LOG("vmfrag: leg (a) failed with pointer P=0 / PTE P=1 — retrying ONCE "
                 "with the inverse polarity, which is the one rule the the reviewer pass "
@@ -2238,6 +2241,7 @@ gmc_vmfrag_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
                            data_off + 0x12000, sub_va + 0x0000, sub_va + 0x1000,
                            data_off + 0x10000, data_off + 0x11000,
                            0x5B7AB1E1u, 0xA2, &t.sub_bad);
+        if (inst.dma_unconfirmed) return kIOReturnTimeout;
         if (!t.sub_ok) build_table(/*invertedPolarity*/ false);   // leg (b) wants the normal one
     }
 
@@ -2246,6 +2250,7 @@ gmc_vmfrag_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
                         leaf_va + 0x0000, leaf_va + 0x1000,
                         data_off + 0x0000, data_off + 0x1000,
                         0x64C0FFEEu, 0xB1, &t.leaf_bad);
+    if (inst.dma_unconfirmed) return kIOReturnTimeout;
     t.fault_walker = (t.fault_lo >> 1) & 7u;
 
     // ---- leg (c), M4-WS-VMID-VALID: the SAME 64 KiB leaf copy on a base WITHOUT the VALID bit ----
@@ -2272,6 +2277,7 @@ gmc_vmfrag_selftest(DeviceContext &dev, GMCContext &gmc, SDMAInstance &inst,
             t.nv_ok = run_leg("(c) 64 KiB LEAF, BASE WITHOUT VALID", leaf_va + 0x2000, data_off + 0x2000,
                               leaf_va + 0x0000, leaf_va + 0x1000, data_off + 0x0000, data_off + 0x1000,
                               0x0DDBA5E0u, 0xC1, &t.nv_bad);
+        if (inst.dma_unconfirmed) return kIOReturnTimeout;
         t.nv_fault_lo = t.fault_lo;
         t.nv_fault_addr_lo = RREG32(dev, SOC15_REG_OFFSET_BIDX(dev, h.ip, h.base_idx, 0x15d2));
         t.fault_lo = faultB;   // RDNA4,VMFragTest keeps leg (b)'s status

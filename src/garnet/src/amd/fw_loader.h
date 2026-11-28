@@ -26,7 +26,8 @@ struct FwLoaderState {
     Entry    entries[kMaxEntries] {};
     uint32_t count { 0 };
     bool imuPresent { false }, rlcPresent { false }, cpPresent { false },
-         sdmaPresent { false }, mesPresent { false }, smuPresent { false };
+         sdmaPresent { false }, mesPresent { false }, smuPresent { false },
+         dmubPresent { false };
 };
 
 // Decode every embedded blob into payload entries (no hardware access).

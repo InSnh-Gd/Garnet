@@ -14,7 +14,7 @@
   CHIPS=navi44 bash tools/fetch-firmware.sh /path/to/linux-firmware
   ```
 
-  `fetch-firmware.sh` only copies local files (no network) into gitignored `src/garnet/firmware/`. Ten blobs are embedded per chip:
+  `fetch-firmware.sh` only copies local files (no network) into gitignored `src/garnet/firmware/`. Ten blobs are embedded per chip plus one shared DCN 4.01 display firmware image:
 
   ```text
   Navi 44 (RX 9060 XT; CHIPS=navi44):
@@ -28,9 +28,12 @@
   gc_12_0_1_rlc.bin  gc_12_0_1_uni_mes.bin
   psp_14_0_3_sos.bin  psp_14_0_3_ta.bin
   sdma_7_0_1.bin  smu_14_0_3.bin
+
+  Shared (required for either build):
+  dcn_4_0_1_dmcub.bin
   ```
 
-  `make` embeds both chips by default (`CHIPS="navi48 navi44"`). Setting `CHIPS=navi44` builds a kext containing only Navi 44 firmware; unsupported chips are stubbed out and refused at probe time. The Makefile stops with a list if any required blob is missing, and `fetch-firmware.sh` verifies SHA-256 digests against the tested revision.
+  `make` embeds both chips by default (`CHIPS="navi48 navi44"`). Setting `CHIPS=navi44` builds a kext containing only Navi 44 firmware; unsupported chips are stubbed out and refused at probe time. The Makefile stops with a list if any required blob is missing, and `fetch-firmware.sh` verifies SHA-256 digests against the tested revision. Re-run `tools/fetch-firmware.sh` on older build trees to copy `dcn_4_0_1_dmcub.bin`; embedding it leaves VBIOS in control (`garnet-dmcub-fw=1` currently runs read-only preflight, not a firmware load).
 
 ## Build `Garnet.kext` on macOS
 

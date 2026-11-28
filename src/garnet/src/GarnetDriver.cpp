@@ -23,6 +23,8 @@
 #include "GarnetNativeClient.hpp"   // 0.0.601 (native S1c): the GARNETN user client
 #include "GarnetUserClient.hpp"
 #include "dcn/dcn.hpp"
+#include "dcn/dcn41_atom_pure.h"
+#include "dcn/dcn41_mall_pure.h"
 #include "dcn/scanout_pure.h"   // 0.0.603 (native S2a): rdna4scan::accel_exempt
 #include "amd/native_display_identity.h"
 #include "amd/native_disp.h"            // 0.0.613 (#11 11h.2): the display pipe glue (boot-arg garnet-metal-disp=1)
@@ -36,6 +38,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
 #include <kern/thread.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
@@ -60,6 +64,51 @@ constexpr uint64_t kMaxBar0Map    = rdna4rebar::kMaxBar0Map;   // 0.0.663 (ReBAR
 // Drain write-combining buffers so BAR0 writes are visible to the GPU before
 // we ring its doorbell registers.
 inline void storeFence() { __asm__ __volatile__("sfence" ::: "memory"); }
+
+bool publishAtomBoard(GarnetDriver &driver, IOPCIDevice &pci) {
+	constexpr const char *key = "Garnet,DisplayBoardVfct";
+	driver.removeProperty(key);
+	const uint32_t ids = pci.configRead32(kIOPCIConfigVendorID);
+	const uint32_t subsystem = pci.configRead32(kIOPCIConfigSubSystemVendorID);
+	const rdna4atom::PciIdentity identity {
+		pci.getBusNumber(), pci.getDeviceNumber(), pci.getFunctionNumber(),
+		static_cast<uint16_t>(ids), static_cast<uint16_t>(ids >> 16),
+		static_cast<uint16_t>(subsystem), static_cast<uint16_t>(subsystem >> 16),
+	};
+	const auto *asic = amdgpu::asic_from_pci(identity.vendor, identity.device);
+	if (!asic || !identity.subVendor || subsystem == UINT32_MAX) return false;
+
+	auto *match = IOService::serviceMatching("AppleACPIPlatformExpert");
+	if (!match) return false;
+	auto *expert = IOService::waitForMatchingService(match, 0);
+	match->release();
+	if (!expert) return false;
+	OSObject *property = expert->copyProperty("ACPI Tables");
+	expert->release();
+	auto *tables = OSDynamicCast(OSDictionary, property);
+	auto *vfct = tables ? OSDynamicCast(OSData, tables->getObject("VFCT")) : nullptr;
+	rdna4atom::Board board {};
+	const bool decoded = vfct && rdna4atom::parse_vfct(
+	    static_cast<const uint8_t *>(vfct->getBytesNoCopy()), vfct->getLength(), identity, board);
+	if (property) property->release();
+	if (!decoded) return false;
+
+	auto *values = OSDictionary::withCapacity(7);
+	if (!values) return false;
+	const auto put = [values](const char *name, uint64_t value) {
+		auto *number = OSNumber::withNumber(value, 64);
+		if (!number) return false;
+		const bool added = values->setObject(name, number);
+		number->release();
+		return added;
+	};
+	const bool published = put("UmcChannels", board.channels) && put("UmcChannelWidthBytes", board.channelWidthBytes) &&
+	    put("CrystalKhz", board.crystalKhz) && put("DramClockChange100Ns", board.dramClockChange100Ns) &&
+	    put("StutterExit100Ns", board.stutterExit100Ns) && put("StutterEnterExit100Ns", board.stutterEnterExit100Ns) &&
+	    put("BiosMallBudgetBytes", rdna4mall::display_budget(asic->id, board.channels)) && driver.setProperty(key, values);
+	values->release();
+	return published;
+}
 
 } // namespace
 
@@ -752,6 +801,8 @@ uint32_t rdna4_sdmadcc_control(uint64_t arg, uint64_t *out, unsigned count) {
 	{
 		const uint32_t gc = rdna4_gc_base();
 		if (!gc) { v[7] = kRDNA4DccStNoGc; goto done; }
+		amdgpu::ScopedGfxOffGuard gfxOffGuard(*gBringup.dev);
+		if (!gfxOffGuard.ok()) { v[7] = kRDNA4DccStNoGc; goto done; }
 		const uint32_t reg0 = gc + RDNA4_SDMA_DCC_CNTL_OFF;
 		const uint32_t reg1 = gc + RDNA4_SDMA1_DCC_CNTL_OFF;
 		// Both registers are READ on every mode (including before a write) so the report always shows the raw
@@ -839,6 +890,8 @@ void rdna4_sdmadcc_default(void) {
 	if (!gBringup.dev) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - no DeviceContext"); return; }
 	const uint32_t gc = rdna4_gc_base();
 	if (!gc) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - GC BASE_IDX 0 did not resolve"); return; }
+	amdgpu::ScopedGfxOffGuard gfxOffGuard(*gBringup.dev);
+	if (!gfxOffGuard.ok()) { RDNA4LOG("sdmadcc: DEFAULT SKIPPED - GFXOFF guard failed (%#x)", gfxOffGuard.status()); return; }
 	const uint32_t reg0 = gc + RDNA4_SDMA_DCC_CNTL_OFF;
 	if (!gSdmaDccCaptured) { gSdmaDccRestore = rdna4_reg_read32(reg0); gSdmaDccCaptured = true; }
 	const uint32_t target = rdna4_sdma_dcc_cleared(gSdmaDccRestore);
@@ -1091,6 +1144,7 @@ IOService *GarnetDriver::probe(IOService *provider, SInt32 *score) {
 }
 
 bool GarnetDriver::start(IOService *provider) {
+	if (provider->getProperty("Garnet,TeardownQuarantined")) return false;
 	if (!super::start(provider)) return false;
 	if (!gVramMmLock) gVramMmLock = IOLockAlloc();   // never freed: a verb may hold it at stop
 	rdna4_scanout_sdma_init_locks();
@@ -1116,6 +1170,7 @@ bool GarnetDriver::start(IOService *provider) {
 	// Derive host RAM top once from the EFI memory map before sysmem import checks run.
 	amdgpu::sysmem_ramtop_init();
 	if (!pciDevice) { RDNA4LOG("start: no PCI provider"); return false; }
+	if (!publishAtomBoard(*this, *pciDevice)) RDNA4LOG("start: no validated VFCT display board inputs");
 	pciDevice->setMemoryEnable(true);
 	latchPciBars(pciDevice);   // 0.0.612 (review item A): every BAR's FULL base and size, once, for BoImportHost's device-page refusal
 	publishDisplayPeer(rdna4peer::kStateStarting);
@@ -1123,7 +1178,16 @@ bool GarnetDriver::start(IOService *provider) {
 	if (!mapRegisters()) { RDNA4LOG("start: BAR5 unavailable — aborting"); return false; }
 	if (!probeMemSize())  { RDNA4LOG("start: MMIO not usable — aborting"); unmapRegisters(); return false; }
 	const bool haveDiscovery = loadOnDieDiscovery();
+	bootPciIdentity = pciDevice->configRead32(kIOPCIConfigVendorID);
 	if (!selectAsic(haveDiscovery)) { unmapRegisters(); return false; }
+	if (!sleepLock) sleepLock = IOLockAlloc();
+	uint32_t sysSleepArg = 1u;
+	PE_parse_boot_argn("garnet-syssleep", &sysSleepArg, sizeof(sysSleepArg));
+	if (sysSleepArg != 0u && sleepLock && !sleepNotifier) {
+		sleepNotifier = registerPrioritySleepWakeInterest(&GarnetDriver::sleepWakeCallback, this, nullptr);
+		RDNA4LOG("sleep: priority sleep/wake interest %s", sleepNotifier ? "registered" : "failed");
+	}
+	gBringup.gfxOffSleepObserved = sleepNotifier != nullptr;
 	if (!haveDiscovery) {
 		RDNA4LOG("start: IP discovery unavailable — MMIO works, but no register map");
 	} else {
@@ -1144,15 +1208,6 @@ bool GarnetDriver::start(IOService *provider) {
 	retain();
 	gBringupSelf = this;
 	IOLockUnlock(gBringupLifecycleLock);
-	if (!sleepLock) sleepLock = IOLockAlloc();
-	{
-		uint32_t sysSleepArg = 1u;
-		PE_parse_boot_argn("garnet-syssleep", &sysSleepArg, sizeof(sysSleepArg));
-		if (sysSleepArg != 0u && sleepLock && !sleepNotifier) {
-			sleepNotifier = registerPrioritySleepWakeInterest(&GarnetDriver::sleepWakeCallback, this, nullptr);
-			RDNA4LOG("sleep: priority sleep/wake interest %s", sleepNotifier ? "registered" : "failed");
-		}
-	}
 	publishDisplayPeer(rdna4peer::kStateReady);
 	garnet_webkit::install(this);
 	registerService();
@@ -1308,7 +1363,7 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < rdna4native::g4::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
 	}
-	// action 109 (enable-rdna4-16g-bar Task 4.1): direct CPU BAR0 <-> GPU bidirectional verification on exclusive high-VRAM regions.
+	// action 109: direct CPU BAR0 <-> GPU bidirectional verification on exclusive high-VRAM regions.
 	// Root-only legacy client; fails closed if BAR0 does not cover targets; never falls back to MM_INDEX.
 	if (rdna4rebar::bartest_is_action(action)) {
 		uint64_t v[kAccelExtraScalars] = { 0 };
@@ -1553,28 +1608,35 @@ IOReturn GarnetDriver::accelExperiment(uint32_t action, uint64_t *outInstalled,
 
 void GarnetDriver::stop(IOService *provider) {
 	garnet_webkit::uninstall();
-	if (sleepNotifier) {
-		sleepNotifier->remove();
-		sleepNotifier = nullptr;
-	}
 	publishDisplayPeer(rdna4peer::kStateStopping);
 	rdna4fbname::restore_on_unload();
 	rdna4dcn::primaryVblShutdown();
 	rdna4dcn::scanShutdown();
 	GarnetDisplayNub::shutdown();
 	GarnetMetalNub::shutdown();
-	if (waitForDisplayLeasesAndReleasePrimary()) {
-		amdgpu::smu_idle_dpm_stop();
-		amdgpu::bringup_teardown(gBringup);
+	const bool drained = waitForDisplayLeasesAndReleasePrimary();
+	if (drained) amdgpu::smu_idle_dpm_stop();
+	const kern_return_t result = drained ? amdgpu::bringup_teardown(gBringup) : kIOReturnBusy;
+	if (sleepNotifier) {
+		sleepNotifier->remove();
+		sleepNotifier = nullptr;
+	}
+	if (drained) {
 		disarmInterrupts();
-		if (bar2Map) {
-			bar2Map->release();
-			bar2Map = nullptr;
-			dev.bar2 = nullptr;
-			dev.bar2Size = 0;
+		if (result == kIOReturnSuccess) {
+			if (bar2Map) {
+				bar2Map->release();
+				bar2Map = nullptr;
+				dev.bar2 = nullptr;
+				dev.bar2Size = 0;
+			}
+			unmapVramAperture();
+			unmapRegisters();
+		} else {
+			provider->setProperty("Garnet,TeardownQuarantined", true);
+			retain();
+			RDNA4LOG("stop: retained GPU mappings and DMA allocations; a cold reset is required");
 		}
-		unmapVramAperture();
-		unmapRegisters();
 	}
 	publishDisplayPeer(rdna4peer::kStateStopped);
 	IOService *service = nullptr;
@@ -1600,6 +1662,39 @@ void GarnetDriver::free() {
 	super::free();
 }
 
+bool GarnetDriver::displayWakePciReady() const {
+	if (!pciDevice || getProvider() != pciDevice || !rmmioMap || !rmmio || !rmmioSize ||
+	    dev.rmmio != rmmio || dev.rmmioSize != rmmioSize) return false;
+	const uint32_t identity = pciDevice->configRead32(kIOPCIConfigVendorID);
+	if (identity != bootPciIdentity) return false;
+	const auto *asic = amdgpu::asic_from_pci(static_cast<uint16_t>(identity), static_cast<uint16_t>(identity >> 16));
+	if (!asic || asic != amdgpu::asic_current()) return false;
+	const uint16_t command = pciDevice->configRead16(kIOPCIConfigCommand);
+	const uint16_t status = pciDevice->configRead16(kIOPCIConfigStatus);
+	if (command == UINT16_MAX || (command & kIOPCICommandMemorySpace) == 0 ||
+	    status == UINT16_MAX || (status & kIOPCIStatusCapabilities) == 0 ||
+	    (pciDevice->configRead8(kIOPCIConfigHeaderType) & 0x7f) != 0) return false;
+	uint8_t pmOffset = 0;
+	const uint32_t pm = pciDevice->findPCICapability(kIOPCIPowerManagementCapability, &pmOffset);
+	if ((pm & UINT8_MAX) != kIOPCIPowerManagementCapability ||
+	    pmOffset < 0x40 || pmOffset > 0xf8 || (pmOffset & 3) != 0) return false;
+	const uint16_t pmcsr = pciDevice->configRead16(pmOffset + 4u);
+	if (pmcsr == UINT16_MAX || (pmcsr & kPCIPMCSPowerStateMask) != kPCIPMCSPowerStateD0) return false;
+	const uint32_t bar4 = pciDevice->configRead32(kIOPCIConfigBaseAddress4);
+	const uint32_t bar5 = pciDevice->configRead32(kIOPCIConfigBaseAddress5);
+	if (bar4 == UINT32_MAX || (bar4 & 7u) == 4u || bar5 == UINT32_MAX || (bar5 & 7u) != 0u) return false;
+	const uint64_t base = bar5 & ~0xfu;
+	if (base == 0 || rmmioSize > (1ull << 32) - base) return false;
+	IODeviceMemory *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
+	if (!bar || rmmioMap->getMemoryDescriptor() != bar ||
+	    rmmioMap->getVirtualAddress() != reinterpret_cast<uintptr_t>(rmmio) ||
+	    bar->getLength() != rmmioSize || rmmioMap->getLength() != rmmioSize) return false;
+	IOByteCount barSpan = 0;
+	IOByteCount mapSpan = 0;
+	return bar->getPhysicalSegment(0, &barSpan, kIOMemoryMapperNone) == base && barSpan >= rmmioSize &&
+	       rmmioMap->getPhysicalSegment(0, &mapSpan, kIOMemoryMapperNone) == base && mapSpan >= rmmioSize;
+}
+
 void GarnetDriver::logPciSleepState(const char *tag) {
 	if (!pciDevice) return;
 	const uint16_t vid = pciDevice->configRead16(kIOPCIConfigVendorID);
@@ -1615,7 +1710,7 @@ void GarnetDriver::logPciSleepState(const char *tag) {
 IOReturn GarnetDriver::sleepWakeCallback(void *target, void *, UInt32 messageType,
                                          IOService *, void *messageArgument, vm_size_t) {
 	auto *self = static_cast<GarnetDriver *>(target);
-	if (!self) return kIOReturnSuccess;
+	if (!self || !self->sleepLock) return kIOReturnSuccess;
 
 	auto ackIfNeeded = [&]() {
 		if (messageArgument &&
@@ -1628,55 +1723,56 @@ IOReturn GarnetDriver::sleepWakeCallback(void *target, void *, UInt32 messageTyp
 	};
 
 	rdna4sleep::Message msg {};
+	amdgpu::GfxOffPowerEvent powerEvent {};
 	const char *tag = nullptr;
 	if (messageType == kIOMessageSystemWillSleep) {
 		msg = rdna4sleep::Message::WillSleep;
+		powerEvent = amdgpu::GfxOffPowerEvent::WillSleep;
 		tag = "before-sleep";
 	} else if (messageType == kIOMessageSystemWillNotSleep) {
 		msg = rdna4sleep::Message::WillNotSleep;
+		powerEvent = amdgpu::GfxOffPowerEvent::WillNotSleep;
 	} else if (messageType == kIOMessageSystemWillPowerOn) {
 		msg = rdna4sleep::Message::WillPowerOn;
+		powerEvent = amdgpu::GfxOffPowerEvent::WillPowerOn;
 		tag = "waking";
 	} else if (messageType == kIOMessageSystemHasPoweredOn) {
 		msg = rdna4sleep::Message::HasPoweredOn;
+		powerEvent = amdgpu::GfxOffPowerEvent::HasPoweredOn;
 		tag = "woken";
 	} else {
+		if (messageType == kIOMessageSystemWillPowerOff || messageType == kIOMessageSystemWillRestart) {
+			IOLockLock(self->sleepLock);
+			garnet_primary_fb_block_system_transitions(/*shutdown=*/true);
+			(void)amdgpu::gfx_off_power_event(self->dev, gBringup.smu, amdgpu::GfxOffPowerEvent::Shutdown);
+			IOLockUnlock(self->sleepLock);
+			garnet_primary_fb_drain_system_transitions();
+		}
 		ackIfNeeded();
 		return kIOReturnSuccess;
 	}
-
-	rdna4sleep::Actions act {};
-	uint32_t readBack = 0u;
-	if (self->sleepLock) IOLockLock(self->sleepLock);
-	const uint64_t cap = self->bar0AccessLimit();
-	const uint64_t markOff =
-	    (self->vramBase != 0u && self->vramBase <= cap && 4u <= cap - self->vramBase)
-	        ? self->vramBase
-	        : ((self->bootFbOff != 0u && self->bootFbOff != ~0ULL && cap >= 4u) ? 0u : ~0ULL);
-	bool writeOk = false;
-	if (msg == rdna4sleep::Message::WillSleep && self->bar0 && markOff != ~0ULL) {
-		auto *w = reinterpret_cast<volatile uint32_t *>(self->bar0 + markOff);
-		*w = rdna4sleep::kVramSentinel;
-		storeFence();
-		writeOk = (*w == rdna4sleep::kVramSentinel);
-	} else if (msg == rdna4sleep::Message::HasPoweredOn && self->bar0 && markOff != ~0ULL) {
-		auto *w = reinterpret_cast<volatile uint32_t *>(self->bar0 + markOff);
-		readBack = *w;
+	IOLockLock(self->sleepLock);
+	if (powerEvent == amdgpu::GfxOffPowerEvent::WillSleep) {
+		garnet_primary_fb_block_system_transitions(/*shutdown=*/false);
 	}
-	act = self->sleepState.on_message(msg, writeOk, readBack);
+	const kern_return_t powerResult = amdgpu::gfx_off_power_event(self->dev, gBringup.smu, powerEvent);
+	const rdna4sleep::Actions act = self->sleepState.on_message(msg);
+	const bool recoverDisplay = act.recoverDisplayPads && amdgpu::smu_display_wake_pin_allowed(gBringup.smu);
+	if (recoverDisplay || (powerEvent == amdgpu::GfxOffPowerEvent::WillNotSleep && powerResult == kIOReturnSuccess)) {
+		garnet_primary_fb_resume_system_transitions();
+	}
 	if (act.logPci) self->logPciSleepState(tag);
-	if (act.checkVramMark) {
-		RDNA4LOG("sleep: VRAM %s through sleep (readback=0x%08x)",
-		         readBack == rdna4sleep::kVramSentinel ? "kept its contents" : "lost its contents",
-		         readBack);
+	IOLockUnlock(self->sleepLock);
+	if (powerEvent == amdgpu::GfxOffPowerEvent::WillSleep) garnet_primary_fb_drain_system_transitions();
+	if (powerResult != kIOReturnSuccess && self->dev.graphicsPowerQuarantined()) {
+		RDNA4LOG("sleep: graphics queues remain quarantined (%#x); a cold reset is required", powerResult);
 	}
-	if (self->sleepLock) IOLockUnlock(self->sleepLock);
 
 	if (act.quiesceEngines) {
 		garnet_primary_fb_notify_sleep(self, true);
-	} else if (act.recoverDisplayPads) {
+	} else if (recoverDisplay) {
 		garnet_primary_fb_notify_wake(self);
-	} else if (act.resumeEngines) {
+	} else if (act.resumeEngines && powerResult == kIOReturnSuccess) {
 		garnet_primary_fb_notify_sleep(self, false);
 	}
 	ackIfNeeded();

@@ -243,7 +243,7 @@ inline uint32_t acquire(E &e, const XDesc &d, ScanX &x, uint64_t out[2]) {
 }
 
 // ---- Register ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-struct RegIn { bool vis; uint64_t boMc, boSize, offset; uint32_t pitchBytes, width, height, format; };
+struct RegIn { bool vis; uint64_t boMc, boSize, offset; uint32_t pitchBytes, width, height, format; bool dcc; };
 // out[0] = the tagged slot id (d.slotTag | k), out[1] = the slot MC.
 template <class E>
 inline uint32_t register_slot(E &e, const XDesc &d, ScanX &x, const RegIn &in, const Excl &ex, uint64_t out[2]) {
@@ -263,7 +263,7 @@ inline uint32_t register_slot(E &e, const XDesc &d, ScanX &x, const RegIn &in, c
         if (!e.window(&lo, &hi)) { rc = kNotReady; break; }
         const Fb fb { lo, hi, x.bufA, d.bytes };                  // the slot shares A's HIGH dword and cannot overlap A (reg_bounds)
         uint64_t mc = 0, bytes = 0;
-        rc = reg_bounds(BoRef{ in.vis, in.boMc, in.boSize }, in.offset, in.pitchBytes, in.height, gm.pitchPx * 4u, gm.h, fb, &mc, &bytes);
+        rc = reg_bounds(BoRef{ in.vis, in.boMc, in.boSize, in.dcc }, in.offset, in.pitchBytes, in.height, gm.pitchPx * 4u, gm.h, fb, &mc, &bytes);
         if (rc != kOk) break;
         if (ranges_overlap(mc, bytes, x.bufB, d.allocBytes) || ranges_overlap(mc, bytes, x.bufA, d.allocBytes)) { rc = kBadArg; break; }   // never B, and never A's whole allocation (not just the frame): 0.0.662 judges the ALLOCATION size
         bool clash = false;

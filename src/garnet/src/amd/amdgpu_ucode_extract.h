@@ -55,6 +55,7 @@ constexpr uint64_t kHostFwFile_MES_UNI = 0x200 + 3;  // gc_<v>_uni_mes.bin
 constexpr uint64_t kHostFwFile_CP_PFP  = 0x200 + 4;  // gc_<v>_pfp.bin (RS64)
 constexpr uint64_t kHostFwFile_CP_ME   = 0x200 + 5;  // gc_<v>_me.bin  (RS64)
 constexpr uint64_t kHostFwFile_CP_MEC  = 0x200 + 6;  // gc_<v>_mec.bin (RS64)
+constexpr uint64_t kHostFwFile_DCN_DMUB = 0x200 + 7; // dcn_<v>_dmcub.bin (DMCUB v1.0)
  // AMDGPU_PSP_GFX_FW_TYPE_DEFINED
 
 } // namespace amdgpu

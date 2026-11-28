@@ -39,7 +39,7 @@ struct GcGeometry {
 // Firmware blob base names, in FwId order minus Count (see ../fw/fw_table.h).
 struct AsicFwNames {
     const char *psp_sos, *psp_ta, *gc_imu, *gc_pfp, *gc_me, *gc_mec, *gc_mes, *gc_mes1,
-               *gc_uni_mes, *gc_rlc, *gc_toc, *smu, *sdma;
+               *gc_uni_mes, *gc_rlc, *gc_toc, *smu, *sdma, *dcn_dmcub;
 };
 
 struct AsicInfo {
@@ -56,6 +56,8 @@ struct AsicInfo {
     // Used only when the discovery gc_info table is unavailable.
     GcGeometry  fallbackGeometry;
     AsicFwNames fw;
+    uint8_t     mallSizeMiB;
+    uint8_t     displayMallChannelLimit;
 };
 
 // Table lookups. nullptr when nothing matches.

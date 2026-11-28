@@ -12,6 +12,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
 #include "smu_dal.h"
@@ -75,6 +76,35 @@ static kern_return_t resp_to_rc(uint32_t resp) {
     }
 }
 
+static bool dal_mmio_available(const DeviceContext &dev) {
+    return dev.rmmio && dev.rmmioSize / 4u > kRegMsg &&
+        dev.rmmioSize / 4u > kRegArg && dev.rmmioSize / 4u > kRegResp;
+}
+
+static kern_return_t dal_transfer_locked(const DeviceContext &dev, uint32_t msg, uint32_t param,
+                                         uint64_t deadline, DalMsg &out) {
+    const uint64_t start = now_us();
+    if (start >= deadline) return kIOReturnTimeout;
+    out.preResp = RREG32(dev, kRegResp);
+    if (resp_pre_check(out.preResp) != kAllow) {
+        out.refuse = kRefRespZero;
+        return kIOReturnNotReady;
+    }
+    WREG32(dev, kRegResp, 0u);
+    WREG32(dev, kRegArg, param);
+    WREG32(dev, kRegMsg, msg);
+    uint32_t resp = 0;
+    do {
+        resp = RREG32(dev, kRegResp);
+        if (resp != 0u || now_us() >= deadline) break;
+        IOSleep(1);
+    } while (now_us() < deadline);
+    out.us = us32(now_us() - start);
+    out.resp = resp;
+    out.arg = RREG32(dev, kRegArg);
+    return resp_to_rc(resp);
+}
+
 kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t param, DalMsg *m) {
     DalMsg local;
     DalMsg *o = m != nullptr ? m : &local;
@@ -87,7 +117,7 @@ kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t para
         return (kern_return_t)o->rc;
     }
     // 2. The three dwords must be inside the BAR5 mapping (RREG32 answers all-ones outside it and WREG32 silently drops the write).
-    if (!dev.rmmio || ((size_t)kRegMsg * 4u + 4u) > dev.rmmioSize || ((size_t)kRegArg * 4u + 4u) > dev.rmmioSize || ((size_t)kRegResp * 4u + 4u) > dev.rmmioSize) {
+    if (!dal_mmio_available(dev)) {
         o->refuse = kRefNoDevice; o->rc = (uint32_t)kIOReturnNoDevice;
         DAL_LOG("send REFUSED msg=0x%02x: the DAL mailbox dwords are outside the BAR5 mapping (rmmio %llu bytes)", msg, (unsigned long long)dev.rmmioSize);
         return (kern_return_t)o->rc;
@@ -99,32 +129,92 @@ kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t para
         DAL_LOG("send REFUSED msg=0x%02x: the shared mailbox lock is unavailable", msg);
         return (kern_return_t)o->rc;
     }
-    // 4. RESP must be non-zero BEFORE the send (Linux polls for it; a zero here means a message is in flight or the mailbox is unhealthy).
-    const uint32_t pre = RREG32(dev, kRegResp);
-    o->preResp = pre;
-    if (resp_pre_check(pre) != kAllow) {
-        o->refuse = kRefRespZero; o->rc = (uint32_t)kIOReturnNotReady;
-        DAL_LOG("send REFUSED msg=0x%02x param=0x%08x: RESP=0x%x before the send (nothing sent)", msg, param, pre);
-        return (kern_return_t)o->rc;
+    o->rc = (uint32_t)dal_transfer_locked(dev, msg, param, now_us() + kRespWaitUs, *o);
+    if (o->refuse != kAllow) {
+        DAL_LOG("send REFUSED msg=0x%02x param=0x%08x: RESP=0x%x before the send (nothing sent)", msg, param, o->preResp);
+    } else {
+        DAL_LOG("msg=0x%02x param=0x%08x preresp=0x%x resp=0x%x (%s) arg=0x%08x us=%u", msg, param, o->preResp, o->resp, resp_name(o->resp), o->arg, o->us);
     }
-    // 5. The Linux sequence: RESP = 0, ARG = param, MSG = id, then poll RESP != 0. Bounded (500 ms), IOSleep between reads.
-    const uint64_t t0 = now_us();
-    WREG32(dev, kRegResp, 0u);
-    WREG32(dev, kRegArg, param);
-    WREG32(dev, kRegMsg, msg);
-    uint32_t resp = 0;
-    for (;;) {
-        resp = RREG32(dev, kRegResp);
-        if (resp != 0u) break;
-        if (now_us() - t0 >= kRespWaitUs) break;
-        IOSleep(1);
-    }
-    o->us = us32(now_us() - t0);
-    o->resp = resp;
-    o->arg = RREG32(dev, kRegArg);
-    o->rc = (uint32_t)resp_to_rc(resp);
-    DAL_LOG("msg=0x%02x param=0x%08x preresp=0x%x resp=0x%x (%s) arg=0x%08x us=%u", msg, param, pre, resp, resp_name(resp), o->arg, o->us);
     return (kern_return_t)o->rc;
+}
+
+constexpr uint32_t kMsgGetNumUmcChannels = 0x1cu;
+constexpr uint64_t kSnapshotTimeoutUs = 500000u;
+
+kern_return_t smu_dal_query_clock_snapshot(const DeviceContext &dev, uint32_t dchubTimerAddress,
+                                          ClockSnapshot &snapshot) {
+    memset(&snapshot, 0, sizeof(snapshot));
+    uint32_t optIn = 0;
+    if (!PE_parse_boot_argn("garnet-dmcub-fw", &optIn, sizeof(optIn)) || optIn != 1u)
+        return kIOReturnNotPermitted;
+    if (ml_at_interrupt_context() || !dev.smuOnline) return kIOReturnNotReady;
+    if (!dal_mmio_available(dev)) return kIOReturnNoDevice;
+    if (!dev.ip.isVersionRange(IPBlock::GC, 12, 0, 0, 12, 0, 1) || dchubTimerAddress != kRegDchubTimer)
+        return kIOReturnUnsupported;
+    if (dev.rmmioSize / sizeof(uint32_t) <= kRegDpRefDfs) return kIOReturnNoDevice;
+
+    const auto readReferences = [&]() -> ClockReferenceRegisters {
+        return {RREG32(dev, kRegPllReq), RREG32(dev, kRegDpRefDfs), RREG32(dev, dchubTimerAddress)};
+    };
+
+    uint32_t lastMsg = 0, lastParam = 0;
+    DalMsg lastReply {};
+    const auto acquire = [&]() -> kern_return_t {
+        SmuSeq seq;
+        if (!seq.held) return kIOReturnNoResources;
+        const auto references = readReferences();
+        if (references.pllRequest == UINT32_MAX || !(references.pllRequest & 0x1ffu) ||
+            !dfs_did_ok(references.dpRefDfs) || references.dchubTimer == UINT32_MAX ||
+            !(references.dchubTimer & kDchubTimerEnable)) return kIOReturnNotReady;
+        const uint64_t deadline = now_us() + kSnapshotTimeoutUs;
+        const auto query = [&](uint32_t msg, uint32_t param, uint32_t &value) {
+            lastMsg = msg;
+            lastParam = param;
+            lastReply = {};
+            const auto rc = dal_transfer_locked(dev, msg, param, deadline, lastReply);
+            if (rc == kIOReturnSuccess) value = lastReply.arg;
+            return rc;
+        };
+        for (const auto &clock : kSnapshotClocks) {
+            auto &row = snapshot.*clock.row;
+            const uint32_t param = clock.id << 16;
+            auto rc = query(kMsgGetDpmFreqByIndex, param | kIndexAll, row.rawCount);
+            if (rc != kIOReturnSuccess) return rc;
+            row.count = level_count(row.rawCount);
+            row.fineGrained = level_fine_grained(row.rawCount);
+            if (row.rawCount == UINT32_MAX || !row.count || row.count > kDpmMaxLevels)
+                return kIOReturnBadArgument;
+            for (uint32_t index = 0; index < row.count; ++index) {
+                uint32_t raw = 0;
+                rc = query(kMsgGetDpmFreqByIndex, param | index, raw);
+                if (rc != kIOReturnSuccess) return rc;
+                const uint32_t mhz = level_mhz(raw);
+                if (!mhz || mhz == 0xffffu) return kIOReturnBadArgument;
+                row.kHz[index] = mhz * 1000u;
+                if (index && row.kHz[index] < row.kHz[index - 1u]) return kIOReturnBadArgument;
+            }
+            if (clock.id == kClkDppclk) continue;
+            rc = query(kMsgGetDcModeMaxDpmFreq, param, row.rawDcMax);
+            if (rc != kIOReturnSuccess) return rc;
+            if (row.rawDcMax > row.kHz[row.count - 1u] / 1000u) return kIOReturnBadArgument;
+            row.dcMaxKHz = row.rawDcMax * 1000u;
+        }
+        const auto rc = query(kMsgGetNumUmcChannels, 0u, snapshot.umcChannels);
+        if (rc != kIOReturnSuccess) return rc;
+        if (!snapshot.umcChannels || snapshot.umcChannels > 32u) return kIOReturnBadArgument;
+        const auto after = readReferences();
+        if (after.pllRequest != references.pllRequest || after.dpRefDfs != references.dpRefDfs ||
+            after.dchubTimer != references.dchubTimer) return kIOReturnBusy;
+        snapshot.references = references;
+        return kIOReturnSuccess;
+    };
+    const auto rc = acquire();
+    if (rc != kIOReturnSuccess) {
+        memset(&snapshot, 0, sizeof(snapshot));
+        DAL_LOG("clock snapshot refused: msg=0x%02x param=%#x pre=%#x resp=%#x arg=%#x rc=%#x",
+                lastMsg, lastParam, lastReply.preResp, lastReply.resp, lastReply.arg, static_cast<unsigned>(rc));
+    }
+    return rc;
 }
 
 // ---- one experiment run ----------------------------------------------------------------------------------------------------------------

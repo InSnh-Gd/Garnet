@@ -18,6 +18,8 @@ constexpr uint32_t kCursorPixels    = kCursorMaxDim * kCursorMaxDim;
 constexpr uint32_t kCursorSlotBytes = kCursorPixels * 4u; // 64 KiB fixed 128x128 ARGB8888 slot
 constexpr uint32_t kCursorSlotAlign = 65536u;
 constexpr uint32_t kCursorMaxPipes  = 4u;
+constexpr uint32_t kCursorSramBytes = 16384u;
+constexpr uint32_t kMallBlockBytes  = 65536u;
 
 // DMU seg2 dword bases & instance strides (all within src/dcn41/dcn41_allow_ranges.h).
 constexpr uint32_t kSeg2HubpStride            = 0x00dcu;
@@ -45,6 +47,27 @@ constexpr uint32_t kSeg2OtgMasterUpdateLock   = 0x1b89u; // OTG0_OTG_MASTER_UPDA
 constexpr uint32_t kMallUseForCursorBit       = (1u << 2);
 constexpr uint32_t kCursorSettingsDefault     = (3u << 8); // CHUNK_HDL_ADJUST = 3
 constexpr uint32_t kFp16One                   = 0x3c00u;
+
+constexpr uint32_t mall_cursor_bytes(bool enabled, uint32_t height) {
+	if (!enabled) return 0u;
+	const uint32_t bytes = kCursorPitch * 4u *
+		((height == 0u || height > kCursorMaxDim) ? kCursorMaxDim : height);
+	return bytes <= kCursorSramBytes ? 0u :
+		((bytes + kMallBlockBytes - 1u) / kMallBlockBytes + 1u) * kMallBlockBytes;
+}
+
+constexpr bool mall_cursor_subvp_eligible(bool enabled, uint32_t width, uint32_t height) {
+	return !enabled || (width != 0u && width <= kCursorMaxDim && height != 0u &&
+		height <= kCursorSramBytes / (kCursorPitch * 4u));
+}
+
+constexpr uint32_t mall_cursor_select(uint32_t current, uint32_t reservedBytes, bool enabled,
+                                     uint32_t width, uint32_t height, bool phantom) {
+	const uint32_t bytes = mall_cursor_bytes(enabled, height);
+	return (current & ~kMallUseForCursorBit) |
+		(!phantom && width != 0u && width <= kCursorMaxDim && height != 0u &&
+		 height <= kCursorMaxDim && bytes != 0u && bytes <= reservedBytes ? kMallUseForCursorBit : 0u);
+}
 
 struct CursorSlotPlan {
 	uint64_t slotOffset;
@@ -204,6 +227,25 @@ inline void encode_cursor_position(int32_t x, int32_t y,
 	                     : 0u;
 }
 
+inline bool clear_cursor_mall(const CursorHw &hw, uint32_t pipe) {
+	const uint32_t reg = hubp_reg(pipe, kSeg2HubpMallConfig);
+	const uint32_t current = hw.rdSeg2(hw.cookie, reg);
+	return current != 0xffffffffu &&
+	       ((current & kMallUseForCursorBit) == 0u || hw.wrSeg2(hw.cookie, reg, current & ~kMallUseForCursorBit));
+}
+
+inline bool cursor_write_visibility(const CursorHw &hw, uint32_t pipe, bool enabled) {
+	const bool hubpOk = hw.wrSeg2(hw.cookie, hubp_reg(pipe, kSeg2HubpCursorControl), cursor_control_word(enabled));
+	const bool cmOk = hw.wrSeg2(hw.cookie, dpp_reg(pipe, kSeg2DppCursorCmControl), cursor_cm_control_word(enabled));
+	return hubpOk && cmOk;
+}
+
+inline bool cursor_set_visibility(const CursorHw &hw, uint32_t pipe, bool enabled) {
+	const bool mallCleared = clear_cursor_mall(hw, pipe);
+	if (enabled && !mallCleared) return false;
+	return cursor_write_visibility(hw, pipe, enabled) && mallCleared;
+}
+
 inline bool program_cursor_plane(const CursorHw &hw, const CursorPlaneConfig &cfg) {
 	if (!hw.rdSeg2 || !hw.wrSeg2) return false;
 	if (cfg.pipe >= kCursorMaxPipes || cfg.mcAddr == 0u ||
@@ -218,10 +260,7 @@ inline bool program_cursor_plane(const CursorHw &hw, const CursorPlaneConfig &cf
 	const uint32_t lockReg = otg_reg(cfg.pipe, kSeg2OtgMasterUpdateLock);
 	if (!hw.wrSeg2(hw.cookie, lockReg, 1u)) return false;
 
-	bool ok = true;
-	const uint32_t mallReg = hubp_reg(cfg.pipe, kSeg2HubpMallConfig);
-	const uint32_t mallVal = hw.rdSeg2(hw.cookie, mallReg);
-	ok = ok && hw.wrSeg2(hw.cookie, mallReg, mallVal & ~kMallUseForCursorBit);
+	bool ok = clear_cursor_mall(hw, cfg.pipe);
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorSettings), kCursorSettingsDefault);
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorAddr),
 	                     static_cast<uint32_t>(cfg.mcAddr & 0xffffffffu));
@@ -232,19 +271,21 @@ inline bool program_cursor_plane(const CursorHw &hw, const CursorPlaneConfig &cf
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorPosition), pos.posReg);
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorHotSpot), pos.hotReg);
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorDstOffset), pos.dstOffset);
-	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorControl),
-	                     cursor_control_word(cfg.enabled));
+	if (cfg.enabled)
+		ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorControl), cursor_control_word(true));
 	ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmScaleGY), kFp16One);
 	ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmScaleRB), kFp16One);
 	ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmMatrix), 0u);
-	ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmControl),
-	                     cursor_cm_control_word(cfg.enabled));
+	if (cfg.enabled)
+		ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmControl), cursor_cm_control_word(true));
+	else
+		ok = cursor_write_visibility(hw, cfg.pipe, false) && ok;
 	ok = hw.wrSeg2(hw.cookie, lockReg, 0u) && ok;
 	return ok;
 }
 
 inline bool move_cursor_plane(const CursorHw &hw, const CursorPlaneConfig &cfg, bool visibilityChanged) {
-	if (!hw.wrSeg2) return false;
+	if (!hw.wrSeg2 || (visibilityChanged && !hw.rdSeg2)) return false;
 	if (cfg.pipe >= kCursorMaxPipes || cfg.width == 0u || cfg.height == 0u ||
 	    cfg.width > kCursorMaxDim || cfg.height > kCursorMaxDim) {
 		return false;
@@ -261,26 +302,18 @@ inline bool move_cursor_plane(const CursorHw &hw, const CursorPlaneConfig &cfg, 
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorHotSpot), pos.hotReg);
 	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorDstOffset), pos.dstOffset);
 	if (visibilityChanged) {
-		ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(cfg.pipe, kSeg2HubpCursorControl),
-		                     cursor_control_word(cfg.enabled));
-		ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(cfg.pipe, kSeg2DppCursorCmControl),
-		                     cursor_cm_control_word(cfg.enabled));
+		if (!cfg.enabled || ok) ok = cursor_set_visibility(hw, cfg.pipe, cfg.enabled) && ok;
 	}
 	ok = hw.wrSeg2(hw.cookie, lockReg, 0u) && ok;
 	return ok;
 }
 
 inline bool disable_cursor_plane(const CursorHw &hw, uint32_t pipe) {
-	if (!hw.wrSeg2 || pipe >= kCursorMaxPipes) return false;
+	if (!hw.rdSeg2 || !hw.wrSeg2 || pipe >= kCursorMaxPipes) return false;
 	const uint32_t lockReg = otg_reg(pipe, kSeg2OtgMasterUpdateLock);
 	if (!hw.wrSeg2(hw.cookie, lockReg, 1u)) return false;
-	bool ok = true;
-	ok = ok && hw.wrSeg2(hw.cookie, hubp_reg(pipe, kSeg2HubpCursorControl),
-	                     cursor_control_word(false));
-	ok = ok && hw.wrSeg2(hw.cookie, dpp_reg(pipe, kSeg2DppCursorCmControl),
-	                     cursor_cm_control_word(false));
-	ok = hw.wrSeg2(hw.cookie, lockReg, 0u) && ok;
-	return ok;
+	const bool ok = cursor_set_visibility(hw, pipe, false);
+	return hw.wrSeg2(hw.cookie, lockReg, 0u) && ok;
 }
 
 } // namespace rdna4cursor

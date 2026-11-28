@@ -1122,7 +1122,10 @@ public enum OpenCoreValidator {
           - `garnet-webkitgpu=0`    Disables Garnet.kext's version-independent _mac_file_check_mmap Safari WebKit.GPU hook.
           - `garnet-hpd-recover=0`  Disables automatic DCN 4.0.1 DisplayPort HPD & link-loss recovery retraining.
           - `garnet-idle-dpm=0`     Disables activity-driven SMU GFXCLK idle governor (keeps SMUPowerState::Auto).
-          - `garnet-gfxoff=0`       Disables SMU GFXOFF power-gating and its refcounted GC MMIO guard.
+          - `garnet-gfxoff=0`       Disables SMU GFXOFF power-gating and keeps the graphics core awake.
+          - `garnet-dmcub-fw=0`     Keeps the VBIOS display firmware and skips the experimental DAL firmware preflight.
+          - `garnet-fams2=0`        Keeps firmware-assisted display memory-clock switching off.
+          - `garnet-mall=0`         Keeps SubVP and static-screen display caching off.
         """
     }
 }

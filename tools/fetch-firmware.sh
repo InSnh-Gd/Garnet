@@ -51,11 +51,14 @@ navi44 psp_14_0_2_sos    7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2
 navi44 psp_14_0_2_ta     21b8898e56524240c19a1f834fcea3dde7d98c33044658a1641f0cb3c3b1bddd
 navi44 sdma_7_0_0        beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38
 navi44 smu_14_0_2        1b2054e3f710d1ab8dbdf6ff35914ad376b51caa6337831260c955add874b2ee
+shared dcn_4_0_1_dmcub   74b567655ac89bfe03389b660e973dc3c067aebd464c6389a071662cfbe6237f
 "
 
 while read -r chip name want; do
     [ -n "$name" ] || continue
-    case " $CHIPS " in *" $chip "*) ;; *) continue ;; esac
+    if [ "$chip" != shared ]; then
+        case " $CHIPS " in *" $chip "*) ;; *) continue ;; esac
+    fi
     if [ -f "$SRC/$name.bin" ]; then
         cp "$SRC/$name.bin" "$DST/$name.bin"
     elif [ -f "$SRC/$name.bin.zst" ] && command -v zstd >/dev/null 2>&1; then

@@ -155,6 +155,8 @@ struct PSPContext {
     uint32_t  bootCfgBitmask;    // BOOT_CFG_FEATURE_* flags
     uint32_t  scpmStatus;        // 0=disabled, 1=enabled, 2=enabled+err
     bool      scpmEnabled;
+    uint64_t  fwReserveExtVramOffset;
+    uint32_t  fwReserveExtSize;
 
     // ---- PSP GPCOM command ring (km_ring), VRAM-backed ------------------
     uint64_t  ringVRAMOffset;    // absolute VRAM byte offset
@@ -189,7 +191,7 @@ struct PSPContext {
     uint64_t  fwBufSize;         // total bytes reserved
     uint64_t  fwBufBumpOffset;   // next free offset within fw_buf
 
-    // GarnetDriver: TMR address the PSP reported for each LOAD_IP_FW fw_type (0 = not loaded).
+    // GarnetDriver: TMR address the PSP reported for each successful LOAD_IP_FW fw_type.
     // The RS64 CP needs these for its IC/DC base registers when the PSP does not program them.
     uint64_t tmr_fw_addr_by_type[128];
 };
@@ -312,6 +314,7 @@ namespace PSPGfxFwType {
     // SDMA_UCODE_TH0 instead — see below.
     constexpr uint32_t SDMA0     = 9;
     constexpr uint32_t SDMA1     = 10;
+    constexpr uint32_t DMUB      = 51;   // DCN4 DMUB/DMCUB (dcn_4_0_1_dmcub.bin)
     // RDNA4 (sdma_v7_1) packs both engines into one RS64 firmware that
     // PSP loads ONCE with TH0=71. Per upstream amdgpu_sdma_init_microcode.
     constexpr uint32_t SDMA_UCODE_TH0 = 71;
@@ -559,6 +562,13 @@ kern_return_t psp_asd_initialize(DeviceContext &dev, PSPContext &psp);
 //
 kern_return_t psp_load_non_psp_fw(DeviceContext &dev, PSPContext &psp,
                                   const FirmwareLoader &loader);
+
+// Load authenticated DCN4 DMUB firmware (GFX_FW_TYPE_DMUB = 51) into TMR.
+// No live caller yet. The caller must serialize use of the shared PSP buffers.
+// A fence timeout ends the CPU wait (~20 s nominal), not PSP DMA. Do not retry or
+// reuse those buffers without first establishing PSP quiescence.
+kern_return_t psp_load_dmub_fw(DeviceContext &dev, PSPContext &psp,
+                               const FirmwareLoader &loader);
 
 //
 // psp_fw_buf_stage — NOT in the reference (there, the dext's LoadFirmware

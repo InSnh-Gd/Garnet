@@ -223,6 +223,26 @@ static void test_flip(void)
     uint64_t early = 0, addr = 0;
 
     dcn41_dev_init(&d, m, m_read, m_write, m_udelay, SEG, MMIO_DWORDS, 0);
+    const uint32_t tile = SEG[2] + 0x05e7u;
+    const uint32_t control = SEG[2] + 0x0612u;
+    m->mem[tile] = 0x10u; /* reserved bits are not SW_MODE */
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_OK, "linear live surface");
+    m->mem[tile] = 3u;
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_E_STATE, "tiled surface cannot use the linear address writer");
+    m->mem[tile] = 0u;
+    m->mem[control] = 2u;
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_E_STATE, "primary DCC cannot use the linear address writer");
+    m->mem[control] = 0x200u;
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_E_STATE, "secondary DCC is not an uncompressed plane");
+    m->mem[control] = 0xffffffffu;
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_E_HW, "dead surface control read fails closed");
+    m->mem[control] = 0u;
+    m->mem[tile] = 0xffffffffu;
+    CHECK(dcn41_hubp_require_linear(&d, 0) == DCN41_E_HW, "dead tiling read fails closed");
+    for (int i = 0; i < m->nops; i++)
+        CHECK(m->ops[i].kind == 'R', "layout guard reads only");
+    m->nops = 0;
+    m->mem[tile] = 0u;
     CHECK(dcn41_hubp_program_flip(&d, 0, 0x8000000000ull, 0, false, false) == DCN41_OK, "flip");
     /* last two ops: W ADDRESS_HIGH (0x34c0+0x60b) = 0x80, then W ADDRESS (0x34c0+0x60a) = 0 */
     CHECK(m->nops == 12, "12 ops (5 RMW + 2 SET), got %d", m->nops);

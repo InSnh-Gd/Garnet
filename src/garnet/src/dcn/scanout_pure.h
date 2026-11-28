@@ -67,7 +67,13 @@ constexpr bool restore_exact(uint32_t vmid, bool tmz, uint32_t flipType, uint32_
 // ---- the buffer bounds (ScanoutRegister) ------------------------------------------------------------------------------------
 // fb = the scanout window the flip layer was armed with ([lo, hi) in MC space; hi 0 = none, which FAILS CLOSED here) and the console.
 struct Fb { uint64_t lo, hi; uint64_t consoleMc, consoleBytes; };
-struct BoRef { bool vis; uint64_t mc; uint64_t size; };   // vis: the BO lives in the BAR0-visible pool (kind == kBoVis); mc: its MC base
+struct BoRef {
+    bool vis;
+    uint64_t mc, size;
+    bool dcc;
+    constexpr BoRef(bool visible, uint64_t address, uint64_t bytes, bool compressed)
+        : vis(visible), mc(address), size(bytes), dcc(compressed) {}
+};
 // Every check runs before any state changes. On kOk *mcOut is the buffer's MC address and *bytesOut its length.
 //   * visible pool only (a hi-pool or GTT BO is refused: it is not what the console shares a HIGH dword with);
 //   * the geometry the client states equals the live plane (pitch in bytes, height);
@@ -77,6 +83,7 @@ struct BoRef { bool vis; uint64_t mc; uint64_t size; };   // vis: the BO lives i
 inline uint32_t reg_bounds(const BoRef &bo, uint64_t offset, uint32_t pitchBytes, uint32_t height, uint32_t livePitchBytes, uint32_t liveHeight,
                            const Fb &fb, uint64_t *mcOut, uint64_t *bytesOut) {
     if (!bo.vis) return kBadArg;
+    if (bo.dcc) return kUnsupported;
     if (height == 0u || pitchBytes == 0u || (pitchBytes & 3u) != 0u) return kBadArg;
     if (pitchBytes != livePitchBytes || height != liveHeight) return kBadArg;
     const uint64_t bytes = (uint64_t)pitchBytes * (uint64_t)height;            // <= 2^16 * 2^14 * 4: no overflow

@@ -34,8 +34,8 @@ if sys.platform == "darwin":
     NM_BIN = pathlib.Path("/usr/bin/nm")
     LIPO_BIN = pathlib.Path("/usr/bin/lipo")
 else:
-    CCTOOLS_BIN = L.ROOT / "build-toolchain/cctools/bin"
-    LD_BIN = CCTOOLS_BIN / "x86_64-apple-darwin-ld"
+    LD_BIN = pathlib.Path(os.environ.get("KEXT_LD") or L.ROOT / "build-toolchain/cctools/bin/x86_64-apple-darwin-ld")
+    CCTOOLS_BIN = LD_BIN.parent
     NM_BIN = CCTOOLS_BIN / "x86_64-apple-darwin-nm"
     LIPO_BIN = CCTOOLS_BIN / "x86_64-apple-darwin-lipo"
 
@@ -167,10 +167,11 @@ def cmd_cxx():
 def cmd_kextcheck():
     out = L.BUILD / "kext"
     out.mkdir(parents=True, exist_ok=True)
-    kflags = ["-arch", "x86_64", "-target", "x86_64-apple-macos11.0", "-isysroot", sdk(), f"-I{MKSDK}/Headers",
+    target_flags = ["-arch", "x86_64", "-target", "x86_64-apple-macos11.0", "-isysroot", sdk()]
+    kflags = [*target_flags, f"-I{MKSDK}/Headers",
               f"-I{L.SRC}", "-mmacosx-version-min=11.0", "-DKERNEL", "-DKERNEL_PRIVATE", "-DDRIVER_PRIVATE", "-DAPPLE",
               "-DNeXT", "-D_FORTIFY_SOURCE=0", "-nostdinc", "-fno-builtin", "-fno-common", "-fno-stack-protector",
-              "-mkernel", "-Wall", "-Werror", "-Os", "-g"]
+              "-mkernel", "-mno-sse", "-mno-mmx", "-mno-80387", "-Wall", "-Werror", "-Os", "-g"]
     objs = []
     for lang, extra in (("c", ["-std=c11"]),
                         ("c++", ["-x", "c++", "-std=c++17", "-fapple-kext", "-fno-exceptions", "-fno-rtti"])):
@@ -205,21 +206,19 @@ def cmd_kextcheck():
     L.check(r, "kext modes table")
     print("kextcheck: the generated mode table compiles as x86_64 kernel code")
 
-    # positive control for the counter: the same flags on a file that does use double arithmetic
-    ctl = out / "fpu_control.c"
-    ctl.write_text("double dcn41_fpu_control(double a, unsigned b);\n"
-                   "double dcn41_fpu_control(double a, unsigned b) { return a * 1.5 + (double)b; }\n")
-    r = L.run([KEXT_CLANG, *kflags, "-std=c11", "-c", str(ctl), "-o", str(out / "fpu_control.o")], "kext fpu control",
+    ctl = out / "fpu_control.s"
+    ctl.write_text(".text\n.globl _dcn41_fpu_control\n_dcn41_fpu_control:\n"
+                   "  fld1\n  fnop\n  fstpl (%rsp)\n  movaps %xmm0, %xmm1\n"
+                   "  ldmxcsr (%rsp)\n  vzeroupper\n  emms\n  lfence\n  ret\n")
+    r = L.run([KEXT_CLANG, *target_flags, "-c", str(ctl), "-o", str(out / "fpu_control.o")], "kext fpu control",
               log=out / "fpu_control.log")
-    if r.returncode == 0:
-        rc = L.run([sys.executable, str(FPU_COUNT), OBJDUMP, str(out / "fpu_control.o")], "fpu_count control")
-        print(f"kextcheck: positive control (double arithmetic, same flags) counts {rc.stdout.strip()} SSE/x87 "
-              f"instructions")
-        if rc.stdout.strip() in ("", "0"):
-            raise SystemExit("kextcheck: the SSE/x87 counter missed the positive control: FAILED")
-    else:
-        print("kextcheck: positive control: the kernel flags reject double arithmetic outright:",
-              r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"rc={r.returncode}")
+    L.check(r, "kext fpu control")
+    r = L.run([sys.executable, str(FPU_COUNT), OBJDUMP, str(out / "fpu_control.o")], "fpu_count control",
+              log=out / "fpu_count_control.log")
+    L.check(r, "fpu_count control")
+    print(f"kextcheck: positive control counts {r.stdout.strip()}/7 planted FP/SIMD instructions")
+    if r.stdout.strip() != "7":
+        raise SystemExit("kextcheck: the FP/SIMD counter failed the positive control")
     r = L.run([str(LIPO_BIN), "-info", str(objs[0])], "lipo")
     print("kextcheck:", r.stdout.strip())
     if undef or n != "0":
