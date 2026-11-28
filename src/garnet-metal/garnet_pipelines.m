@@ -12,6 +12,8 @@
 #include "garnet_gpl.h"
 #include "garnet_hotswap.h"
 #include "garnet_counters.h"
+#include "garnet_fragment_output.h"
+#include "garnet_fallback_spv.h"
 #include "garnet_pipelines_internal.h"
 
 

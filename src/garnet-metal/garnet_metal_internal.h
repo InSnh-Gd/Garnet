@@ -1129,6 +1129,7 @@ typedef struct {
 - (void)rdna4GiveComputeCmdBuf:(VkCommandBuffer)cmd;
 - (VkSemaphore)rdna4OrderSemaphore;
 - (BOOL)rdna4OrderLastWasCompute;
+- (uint64_t)rdna4PendingCrossQueueWaitForCompute:(BOOL)isCompute;
 - (garnet_async_submit_order_t)rdna4NextOrderForCompute:(BOOL)isCompute;
 - (BOOL)rdna4HasResidencySets;
 - (dispatch_queue_t)rdna4CompletionQueue;

@@ -10,6 +10,8 @@
 #define GARNET_INTERNAL_EXTERN static
 #endif
 
+#include "garnet_argument_summary.h"
+
 @interface RDNA4ArgumentPool : NSObject {
 @public
     VkDescriptorPool handle;

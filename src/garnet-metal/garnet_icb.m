@@ -113,8 +113,6 @@
 }
 @end
 
-#ifdef VK_VERSION_1_0
-
 
 GARNET_INTERNAL NSString *rdna4icb_range_problem(NSRange range, NSUInteger count, BOOL execution) {
     if (range.location > count || range.length > count - range.location)

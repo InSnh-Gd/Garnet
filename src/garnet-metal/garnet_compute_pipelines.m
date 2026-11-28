@@ -11,6 +11,7 @@
 #include "garnet_hotswap.h"
 #include "garnet_pipelines_internal.h"
 #include "garnet_luma_workgroup.h"
+#include "garnet_indirect_compute.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // RDNA4ComputePipelineState (11e R2): SPIR-V + meta sidecar from spvcache; ThreadsDynamic modules take the local size as spec ids 0..2.

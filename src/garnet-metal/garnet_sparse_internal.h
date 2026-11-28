@@ -2,6 +2,8 @@
 #ifndef GARNET_SPARSE_INTERNAL_H
 #define GARNET_SPARSE_INTERNAL_H
 
+#include "garnet_sparse.h"
+
 @interface RDNA4SparseHeap : _MTLHeap
 @end
 

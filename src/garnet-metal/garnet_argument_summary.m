@@ -56,32 +56,6 @@
 #define RDNA4_ARGUMENT_SUMMARY_MIN_COPY_ALIGN 4u
 
 typedef struct {
-    uint32_t max_storage_buffer_range;
-    uint32_t min_storage_buffer_offset_alignment;
-    uint32_t max_compute_workgroup_count_x;
-    uint32_t max_compute_workgroup_invocations;
-    uint32_t max_compute_workgroup_size_x;
-    /* Zero selects the corresponding RDNA4_ARGUMENT_SUMMARY_DEFAULT_* value. */
-    uint32_t requested_chunk_bytes;
-    uint32_t requested_dictionary_page;
-} rdna4_argument_summary_runtime_limits;
-
-typedef struct {
-    uint64_t generation;
-    uint64_t source_size;
-    uint64_t chunk_count;
-    uint64_t job_count;
-    uint32_t chunk_bytes;
-    uint32_t candidate_count;
-    uint32_t dictionary_page_size;
-    uint32_t dictionary_page_count;
-    uint32_t output_word_count;
-    uint32_t source_binding_bytes;
-    uint32_t dictionary_binding_bytes;
-    uint32_t output_page_bytes;
-} rdna4_argument_summary_runtime_plan;
-
-typedef struct {
     uint64_t source_offset;
     uint64_t dictionary_offset;
     uint32_t page_index;
@@ -527,21 +501,6 @@ fail:
     rdna4_argument_summary_pipeline_release(state, ops);
     return RDNA4_ARGUMENT_SUMMARY_FAILED;
 }
-
-typedef enum {
-    RDNA4_ARGUMENT_SUMMARY_COMPLETION_ENCODING = 0,
-    RDNA4_ARGUMENT_SUMMARY_COMPLETION_ENCODED,
-    RDNA4_ARGUMENT_SUMMARY_COMPLETION_COMPLETE,
-    RDNA4_ARGUMENT_SUMMARY_COMPLETION_FAILED,
-    RDNA4_ARGUMENT_SUMMARY_COMPLETION_OBSOLETE,
-} rdna4_argument_summary_completion_state;
-
-typedef struct {
-    uint64_t generation;
-    uint64_t job_count;
-    uint64_t encoded_jobs;
-    rdna4_argument_summary_completion_state state;
-} rdna4_argument_summary_completion;
 
 static inline void rdna4_argument_summary_completion_init(
     rdna4_argument_summary_completion *completion,

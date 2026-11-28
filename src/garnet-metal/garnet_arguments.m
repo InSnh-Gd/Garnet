@@ -5,6 +5,7 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_commands_internal.h"
 #include "garnet_pipelines_internal.h"
 #include "garnet_rt_internal.h"
 #include "garnet_argument_descriptor_scan.h"

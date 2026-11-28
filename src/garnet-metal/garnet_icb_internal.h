@@ -60,7 +60,6 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 @end
 #endif
 
-#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4RenderEncoder (RDNA4IndirectCommands)
 - (id)rdna4ICBDevice;
 - (RDNA4CommandBuffer *)rdna4ICBCommandBuffer;
@@ -71,7 +70,6 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (void)rdna4ICBClearExplicitBuffers;
 - (void)rdna4ICBRetainResource:(id)resource;
 @end
-#endif
 
 #ifdef VK_VERSION_1_0
 #ifndef GARNET_METAL_INTERNAL_H
@@ -97,7 +95,6 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 @end
 #endif
 
-#ifndef GARNET_METAL_INTERNAL_H
 @interface RDNA4ComputeEncoder (RDNA4IndirectCommands)
 - (id)rdna4ICBDevice;
 - (RDNA4CommandBuffer *)rdna4ICBCommandBuffer;
@@ -113,7 +110,6 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
                    indirectOffset:(NSUInteger)indirectOff
                       useIndirect:(BOOL)useIndirect;
 @end
-#endif
 #endif
 
 @interface RDNA4ICBBind : NSObject
@@ -162,6 +158,7 @@ typedef NS_ENUM(NSUInteger, RDNA4ICBCommandKind) {
 - (RDNA4ICBRecord *)rdna4Copy;
 @end
 
+#ifdef VK_VERSION_1_0
 @interface RDNA4IndirectCommandBuffer : NSObject <RDNA4ComputeICBInternal> {
 #else
 @interface RDNA4IndirectCommandBuffer : NSObject {

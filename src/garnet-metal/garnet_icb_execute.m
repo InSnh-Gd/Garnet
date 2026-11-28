@@ -5,6 +5,9 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#ifdef GARNET_METAL_INTERNAL_H
+#include "garnet_icb_expand.h"
+#endif
 #include "garnet_icb_internal.h"
 
 #ifndef RDNA4_ICB_EXECUTE_INC
