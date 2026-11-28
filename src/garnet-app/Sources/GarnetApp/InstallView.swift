@@ -120,7 +120,7 @@ struct InstallView: View {
 
                 Section("Uninstall") {
                     Toggle("Also remove saved app-denylist.txt", isOn: $model.removeDenylistOnUninstall)
-                    Text("Removes Garnet components and legacy v0.1.0 runtime files from \(GarnetPaths.nativeSupportDir) and system directories, then rebuilds AuxKC. Reboot and disable Garnet entries in OpenCore if reverting.")
+                    Text("Removes Garnet components and legacy v0.1.0 runtime files from \(GarnetPaths.nativeSupportDir) and system directories, then rebuilds AuxKC. Use OpenCore Assistant -> Restore OpenCore… on your mounted EFI before rebooting to revert OpenCore entries.")
                         .font(.caption)
                         .foregroundColor(.secondary)
 

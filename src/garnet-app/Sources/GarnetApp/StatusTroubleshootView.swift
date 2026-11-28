@@ -16,12 +16,6 @@ struct StatusTroubleshootView: View {
                 Text("Runtime Status, App Denylist & Diagnostics")
                     .font(.title2).bold()
                 Spacer()
-                Button {
-                    model.exportDiagnosticsOneClick()
-                } label: {
-                    Label("Export Diagnostics", systemImage: "square.and.arrow.up")
-                }
-                .disabled(model.isExportingDiag)
                 Button("Refresh Status") { model.refreshAll() }
                     .disabled(model.isBusy)
             }
@@ -159,7 +153,7 @@ struct StatusTroubleshootView: View {
                         Button {
                             model.exportDiagnosticsOneClick()
                         } label: {
-                            Label("One-Click Export to Desktop", systemImage: "square.and.arrow.up")
+                            Label("Export Diagnostics to Desktop", systemImage: "square.and.arrow.up")
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.isExportingDiag)

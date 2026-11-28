@@ -148,7 +148,7 @@ struct OpenCoreAssistantView: View {
                                 OpenCoreValidator.sampleConfigSnippet(mode: model.selectedOCMode, amfiMode: model.selectedAMFIMode),
                                 forType: .string
                             )
-                            copiedBanner = "Copied \(model.selectedOCMode.displayName) snippet"
+                            copiedBanner = "Copied \(model.selectedOCMode.displayName) (\(model.selectedAMFIMode.displayName)) snippet"
                         }
                         if let copiedBanner {
                             Text(copiedBanner).font(.caption).foregroundColor(.green)
@@ -174,6 +174,9 @@ struct OpenCoreAssistantView: View {
             }
             .formStyle(.grouped)
             .onChange(of: model.selectedOCMode) {
+                copiedBanner = nil
+            }
+            .onChange(of: model.selectedAMFIMode) {
                 copiedBanner = nil
             }
         }
