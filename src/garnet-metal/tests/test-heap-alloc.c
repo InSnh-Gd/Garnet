@@ -464,11 +464,12 @@ static void test_inflight_safety_and_same_block_reuse_and_dedicated_fallback(voi
 }
 
 static void test_source_pins(void) {
-    char *res = read_text_file("garnet_resources.m");
+    char *tex = read_text_file("garnet_textures.m");
+    char *heaps = read_text_file("garnet_heaps.m");
     char *dev = read_text_file("garnet_device.m");
-    CHECK("garnet_resources.m and garnet_device.m readable", res != NULL && dev != NULL,
+    CHECK("garnet_textures.m, garnet_heaps.m, and garnet_device.m readable", tex != NULL && heaps != NULL && dev != NULL,
           "run from src/garnet-metal");
-    if (res && dev) {
+    if (tex && heaps && dev) {
         CHECK("garnet_device.m delegates query extent to rdna4ha_query_extent",
               strstr(dev, "rdna4ha_query_extent(mr.size, mr.alignment, RDNA4R.lim.bufferImageGranularity,") != NULL,
               "rdna4ha_query_extent call missing in garnet_device.m");
@@ -477,20 +478,21 @@ static void test_source_pins(void) {
                   strstr(dev, "vkCreateImage(RDNA4R.dev, &plan.create, NULL, &image)") != NULL &&
                   strstr(dev, "rdna4_requirements2(VK_NULL_HANDLE, image, &mr, NULL, NULL, YES)") != NULL,
               "image size/align parity missing in garnet_device.m");
-        CHECK("garnet_resources.m shares rdna4_heap_image_plan_make in RDNA4Texture",
-              strstr(res, "rdna4_heap_image_plan_make(d, heap != nil, &plan, err)") != NULL,
-              "rdna4_heap_image_plan_make missing in garnet_resources.m");
-        CHECK("garnet_resources.m wires retired-block eviction and one-shot handle close",
-              strstr(res, "rdna4EvictRetiredBlocksLocked") != NULL &&
-                  strstr(res, "rdna4hb_evict_candidate") != NULL &&
-                  strstr(res, "rdna4hb_finalized_retired") != NULL &&
-                  strstr(res, "rdna4ConsumeHandleOpen") != NULL,
-              "eviction helpers missing in garnet_resources.m");
-        CHECK("garnet_resources.m falls back from prefersDedicated when !requiresDedicated",
-              strstr(res, "if (!acquired && dedicated && !requiresDedicated)") != NULL,
-              "prefersDedicated fallback missing in garnet_resources.m");
+        CHECK("garnet_textures.m shares rdna4_heap_image_plan_make in RDNA4Texture",
+              strstr(tex, "rdna4_heap_image_plan_make(d, heap != nil, &plan, err)") != NULL,
+              "rdna4_heap_image_plan_make missing in garnet_textures.m");
+        CHECK("garnet_heaps.m wires retired-block eviction and one-shot handle close",
+              strstr(heaps, "rdna4EvictRetiredBlocksLocked") != NULL &&
+                  strstr(heaps, "rdna4hb_evict_candidate") != NULL &&
+                  strstr(heaps, "rdna4hb_finalized_retired") != NULL &&
+                  strstr(heaps, "rdna4ConsumeHandleOpen") != NULL,
+              "eviction helpers missing in garnet_heaps.m");
+        CHECK("garnet_textures.m falls back from prefersDedicated when !requiresDedicated",
+              strstr(tex, "if (!acquired && dedicated && !requiresDedicated)") != NULL,
+              "prefersDedicated fallback missing in garnet_textures.m");
     }
-    free(res);
+    free(tex);
+    free(heaps);
     free(dev);
 }
 

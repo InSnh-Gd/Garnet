@@ -5,6 +5,8 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_rt_internal.h"
+#include "garnet_shaders_internal.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Metal 3 Hardware Ray Tracing Runtime Binding & MTLIntersectionFunctionTable (Task 7.3).

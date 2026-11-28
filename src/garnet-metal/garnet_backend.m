@@ -6,6 +6,7 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_gpl.h"
 #endif
 
 #if !defined(GARNET_ARGUMENT_LIMIT_SNAPSHOT_ONLY)

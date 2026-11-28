@@ -78,8 +78,14 @@ int main(int argc, char **argv) {
             CHECK("source: render fallback immediately clears mv_ and mf_ before argument-table checks",
                   clearPos != NULL && clearPos < dslPos && (size_t)(clearPos - fbPos) < 128u);
         }
+        free(src);
+    }
+    snprintf(path, sizeof path, "%s/garnet_compute_pipelines.m", dir);
+    char *csrc = slurp(path);
+    CHECK("source: read garnet_compute_pipelines.m", csrc != NULL);
+    if (csrc) {
         // Compute fallback placeholder audit: initPlaceholderWithDevice sets _noop = YES and never touches meta.
-        const char *cpPos = strstr(src, "- (instancetype)initPlaceholderWithDevice:(id)dev function:(id)fn");
+        const char *cpPos = strstr(csrc, "- (instancetype)initPlaceholderWithDevice:(id)dev function:(id)fn");
         const char *cpEnd = cpPos ? strstr(cpPos, "- (RDNA4ComputePipelineState *)rdna4Real") : NULL;
         CHECK("source: compute placeholder exists", cpPos != NULL && cpEnd != NULL && cpPos < cpEnd);
         if (cpPos && cpEnd) {
@@ -91,7 +97,7 @@ int main(int argc, char **argv) {
                   strstr(slice, "_noop = YES;") != NULL && strstr(slice, "argument_resource_tables") == NULL);
             free(slice);
         }
-        free(src);
+        free(csrc);
     }
 
     printf("test-pipeline-fallback: %d checks, %d failed\n", runs, fails);

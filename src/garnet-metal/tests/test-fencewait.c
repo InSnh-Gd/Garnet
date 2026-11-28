@@ -289,7 +289,7 @@ int main(int argc, char **argv) {
     }
 
     // ---- 4. production source pins ----
-    char *cb = slurp(dir, "garnet_commands.m");
+    char *cb = slurp(dir, "garnet_command_buffer.m");
     char *cq = slurp(dir, "garnet_commands.m");
     CHECK("sources readable", cb != NULL && cq != NULL, "%s", dir);
     if (cb && cq) {

@@ -688,29 +688,31 @@ static char *read_source_file(const char *name) {
 }
 
 static void test_source_pins(void) {
-    char *args = read_source_file("garnet_arguments.m");
+    char *args = read_source_file("garnet_argument_encoder.m");
+    char *argHdr = read_source_file("garnet_arguments_internal.h");
     char *res = read_source_file("garnet_resources.m");
     char *hdr = read_source_file("garnet_metal_internal.h");
-    CHECK("source files readable", args && res && hdr, "missing source file(s)");
-    if (args) {
-        CHECK("garnet_arguments.m has zero-sampler atomic fast path",
+    CHECK("source files readable", args && argHdr && res && hdr, "missing source file(s)");
+    if (args && argHdr) {
+        CHECK("garnet_argument_encoder.m has zero-sampler atomic fast path",
               strstr(args, "rdna4_argument_sampler_registered") != NULL,
               "missing rdna4_argument_sampler_registered");
-        CHECK("garnet_arguments.m uses ARC-safe void *dictRetained in RDNA4ArgumentLiveContext",
-              strstr(args, "void *dictRetained;") != NULL &&
+        CHECK("garnet_arguments_internal.h uses ARC-safe void *dictRetained in RDNA4ArgumentLiveContext",
+              strstr(argHdr, "void *dictRetained;") != NULL &&
+              strstr(argHdr, "NSDictionary<NSNumber *, id> *dict;") == NULL &&
               strstr(args, "NSDictionary<NSNumber *, id> *dict;") == NULL,
               "ARC-unsafe ObjC pointer in C struct");
-        CHECK("garnet_arguments.m verifies recorded slots in O(slots.count)",
+        CHECK("garnet_argument_encoder.m verifies recorded slots in O(slots.count)",
               strstr(args, "owners.slots.allKeys") != NULL,
               "missing O(slots) verification");
-        CHECK("garnet_arguments.m removes per-word ObjC visitor rdna4_argument_scope_visit_token",
+        CHECK("garnet_argument_encoder.m removes per-word ObjC visitor rdna4_argument_scope_visit_token",
               strstr(args, "rdna4_argument_scope_visit_token") == NULL,
               "old per-word ObjC visitor still present");
-        CHECK("garnet_arguments.m uses pure-C strided/incremental scanners in scope work",
+        CHECK("garnet_argument_encoder.m uses pure-C strided/incremental scanners in scope work",
               strstr(args, "rdna4_as_inc_cache_scan_work(") != NULL &&
               strstr(args, "rdna4_as_scan_strided_words(") != NULL,
               "missing pure-C scanner wiring");
-        CHECK("garnet_arguments.m uses dedicated associated-object key for incremental cache",
+        CHECK("garnet_argument_encoder.m uses dedicated associated-object key for incremental cache",
               strstr(args, "rdna4_argument_inc_cache_key") != NULL &&
               strstr(args, "rdna4_argument_note_dirty_range") != NULL,
               "missing incremental cache key or dirty notifier");
@@ -726,6 +728,7 @@ static void test_source_pins(void) {
               "missing extern declaration");
     }
     free(args);
+    free(argHdr);
     free(res);
     free(hdr);
 }

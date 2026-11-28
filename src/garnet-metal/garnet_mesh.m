@@ -5,7 +5,95 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_arguments_internal.h"
+#include "garnet_commands_internal.h"
+#include "garnet_mesh_internal.h"
+#include "garnet_argument_descriptor_scan.h"
 #include "garnet_fragment_output.h"
+#include "garnet_mesh.h"
+
+@interface RDNA4MeshRenderPipelineState () {
+    rdna4mesh_exec_mode_t _meshExecMode;
+    BOOL _hasObject;
+    rdna4mesh_linked_info_t _linkedInfo;
+    rdna4mesh_refl_t _objRefl, _meshRefl, _fragRefl;
+
+    // Initial shader modules + runtime LocalSize specialization caches.
+    VkShaderModule _objMod, _meshMod;
+    char _oep[128], _mep[128];
+    uint32_t _initObjLocal[3], _initMeshLocal[3];
+    id _objFn, _meshFn;
+    NSArray<NSDictionary *> *_objDeps, *_objDynlibs, *_meshDeps, *_meshDynlibs;
+    NSMutableDictionary<NSString *, NSValue *> *_objModCache;  // "x,y,z" -> VkShaderModule
+    NSMutableDictionary<NSString *, NSValue *> *_meshModCache; // "x,y,z" -> VkShaderModule
+
+    // Object stage descriptors: native TaskEXT uses graphics set _objSet; emulated uses _objCompDsl/_objCompPl.
+    VkDescriptorSetLayout _dslObj;
+    uint32_t _objSet;
+    VkDescriptorSetLayout _objCompDsl;
+    VkPipelineLayout _objCompPl;
+    NSMutableDictionary<NSString *, NSValue *> *_objCompVariants; // "x,y,z" -> VkPipeline (compute)
+    NSMutableDictionary<NSString *, NSValue *> *_meshVariants;    // graphics pipeline variants
+
+    RDNA4PB *_pbO, *_pbM;
+    uint32_t _npbO, _npbM;
+    uint32_t _emulObjMask, _emulMeshMask;
+
+    uint32_t _maxObjThreads, _maxMeshThreads;
+    uint32_t _objExecWidth, _meshExecWidth;
+    BOOL _objMultExecW, _meshMultExecW;
+    BOOL _alphaToOne;
+}
+- (instancetype)initWithDevice:(id)dev meshDescriptor:(id)d options:(NSUInteger)options error:(NSError **)err;
+- (BOOL)rdna4IsMeshPipeline;
+- (rdna4mesh_exec_mode_t)rdna4MeshExecMode;
+- (BOOL)rdna4HasObjectStage;
+- (const rdna4mesh_linked_info_t *)rdna4MeshLinkedInfo;
+- (const rdna4mesh_refl_t *)rdna4ObjRefl;
+- (const rdna4mesh_refl_t *)rdna4MeshRefl;
+- (uint32_t)rdna4ObjectSet;
+- (VkDescriptorSetLayout)rdna4ObjectDsl;
+- (VkDescriptorSetLayout)rdna4ObjectComputeDsl;
+- (VkPipelineLayout)rdna4ObjectComputeLayout;
+- (const RDNA4PB *)rdna4PbO; - (uint32_t)rdna4NpbO;
+- (const RDNA4PB *)rdna4PbM; - (uint32_t)rdna4NpbM;
+- (uint32_t)rdna4EmulObjMask;
+- (uint32_t)rdna4EmulMeshMask;
+- (BOOL)rdna4ObjMultExecWidth;
+- (BOOL)rdna4MeshMultExecWidth;
+- (NSUInteger)maxTotalThreadsPerObjectThreadgroup;
+- (NSUInteger)maxTotalThreadsPerMeshThreadgroup;
+- (NSUInteger)objectThreadExecutionWidth;
+- (NSUInteger)meshThreadExecutionWidth;
+- (VkPipeline)rdna4ObjectComputePipelineForLocal:(const uint32_t[3])objLocal error:(NSError **)err;
+- (VkPipeline)rdna4MeshPipelineForCull:(VkCullModeFlags)cull front:(VkFrontFace)front
+                                    ds:(uint32_t)dk rflags:(uint32_t)rflags
+                              objLocal:(const uint32_t[3])objLocal
+                             meshLocal:(const uint32_t[3])meshLocal
+                                 error:(NSError **)err;
++ (void)initialize;
+- (VkPipeline)vkPipeline;
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function stage:(MTLRenderStages)stage;
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:(MTLVisibleFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor stage:(MTLRenderStages)stage;
+- (VkShaderModule)rdna4ShaderModuleForObjectLocalLocked:(const uint32_t[3])local error:(NSError **)err;
+- (VkShaderModule)rdna4ShaderModuleForMeshLocalLocked:(const uint32_t[3])local error:(NSError **)err;
+- (VkPipeline)rdna4BuildObjectComputeLocked:(const uint32_t[3])objLocal error:(NSError **)err;
+- (VkPipeline)rdna4BuildMeshGfxLocked:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk rflags:(uint32_t)rflags objLocal:(const uint32_t[3])objLocal meshLocal:(const uint32_t[3])meshLocal error:(NSError **)err;
+@end
+
+@interface RDNA4MeshEncoderState : NSObject {
+    @public
+    RDNA4StageState objState;
+    RDNA4StageState meshState;
+    uint64_t objTgMem[RDNA4MESH_MAX_TG_MEM_INDICES];
+    NSMutableSet *samplers;
+}
+@end
+
+@interface RDNA4RenderEncoder (RDNA4MeshInternal)
+- (RDNA4MeshEncoderState *)rdna4MeshState;
+@end
 
 // ---------------------------------------------------------------------------------------------------------------
 // Metal 3 Mesh & Object Shader Runtime (Task 6.2):

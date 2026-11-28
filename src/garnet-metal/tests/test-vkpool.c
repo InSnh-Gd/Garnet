@@ -55,28 +55,44 @@ static void test_stage2_command_invariants(void) {
                              GARNET_DYN_STENCIL_M | GARNET_DYN_STENCIL_R | GARNET_DYN_DEPTHBIAS |
                              GARNET_DYN_RAST | GARNET_DYN_TOPO | GARNET_DYN_DS_OP),
           "GARNET_DYN_ALL covers all dynamic-state dirty bits");
-    FILE *f = fopen("garnet_commands.m", "rb");
-    check(f != NULL, "open garnet_commands.m");
-    if (!f) return;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)len + 1u);
-    check(buf != NULL, "alloc garnet_commands.m buffer");
-    if (buf) {
-        size_t nr = fread(buf, 1, (size_t)len, f);
-        buf[nr] = '\0';
-        const char *bind = strstr(buf, "if (!rdna4dc_enc_pipe_same(&sc->dc, (uint64_t)(uintptr_t)vkp))");
-        const char *dirty = bind ? strstr(bind, "_dynDirty = GARNET_DYN_ALL;") : NULL;
-        check(bind != NULL && dirty != NULL && (dirty - bind) < 200,
-              "pipeline switch re-dirties all dynamic state (prevents vpCount/depthBias/mesh stale leaks)");
-        const char *pd = strstr(buf, "- (void)rdna4PoolDone {");
-        const char *pser_zero = pd ? strstr(pd, "rdna4_fence_close(_pser); _pser = 0;") : NULL;
-        check(pd != NULL && pser_zero != NULL && (pser_zero - pd) < 160,
-              "rdna4PoolDone clears _pser so dealloc does not double-close under RDNA4P.mu");
-        free(buf);
+    FILE *f = fopen("garnet_render_encoder.m", "rb");
+    check(f != NULL, "open garnet_render_encoder.m");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = (char *)malloc((size_t)len + 1u);
+        check(buf != NULL, "alloc garnet_render_encoder.m buffer");
+        if (buf) {
+            size_t nr = fread(buf, 1, (size_t)len, f);
+            buf[nr] = '\0';
+            const char *bind = strstr(buf, "if (!rdna4dc_enc_pipe_same(&sc->dc, (uint64_t)(uintptr_t)vkp))");
+            const char *dirty = bind ? strstr(bind, "_dynDirty = GARNET_DYN_ALL;") : NULL;
+            check(bind != NULL && dirty != NULL && (dirty - bind) < 200,
+                  "pipeline switch re-dirties all dynamic state (prevents vpCount/depthBias/mesh stale leaks)");
+            free(buf);
+        }
+        fclose(f);
     }
-    fclose(f);
+    FILE *cb = fopen("garnet_command_buffer.m", "rb");
+    check(cb != NULL, "open garnet_command_buffer.m");
+    if (cb) {
+        fseek(cb, 0, SEEK_END);
+        long len = ftell(cb);
+        fseek(cb, 0, SEEK_SET);
+        char *buf = (char *)malloc((size_t)len + 1u);
+        check(buf != NULL, "alloc garnet_command_buffer.m buffer");
+        if (buf) {
+            size_t nr = fread(buf, 1, (size_t)len, cb);
+            buf[nr] = '\0';
+            const char *pd = strstr(buf, "- (void)rdna4PoolDone {");
+            const char *pser_zero = pd ? strstr(pd, "rdna4_fence_close(_pser); _pser = 0;") : NULL;
+            check(pd != NULL && pser_zero != NULL && (pser_zero - pd) < 160,
+                  "rdna4PoolDone clears _pser so dealloc does not double-close under RDNA4P.mu");
+            free(buf);
+        }
+        fclose(cb);
+    }
 }
 
 int main(void) {

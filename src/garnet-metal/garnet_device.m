@@ -9,6 +9,35 @@
 #include "garnet_ca_sw_compat.h"
 #include "garnet_coredisplay_compat.h"
 #include "garnet_census.h"
+#include "garnet_arguments_internal.h"
+#include "garnet_commands_internal.h"
+#include "garnet_io_internal.h"
+#include "garnet_mesh_internal.h"
+#include "garnet_rt_internal.h"
+#include "garnet_sparse_internal.h"
+#include "garnet_heapalloc.h"
+#include "garnet_system_profile.h"
+#include "garnet_gl_surface_pure.h"
+
+@interface GarnetGLDrawable : NSObject {
+    uint32_t _sid;
+}
+@end
+
+@interface GarnetGLDrawable (GarnetInternalMethods)
+- (int)setDrawableSurface:(unsigned)surface mode:(unsigned long long)mode colorDepthMode:(unsigned)depth face:(unsigned)face level:(unsigned)level volatile:(unsigned)vol fixedSource:(unsigned)fixed scaleOptions:(unsigned)scale scaledWidth:(unsigned)w scaledHeight:(unsigned)h;
+- (IOSurfaceRef)lookupIOSurfaceAtIndex:(unsigned long long)i;
+- (unsigned)width;
+- (unsigned)height;
+- (unsigned)surfaceWidth;
+- (unsigned)surfaceHeight;
+- (int)clearDrawable;
+- (int)setSwapInterval:(int)interval limit:(int)limit;
+- (int)setSwapRectX:(unsigned)x y:(unsigned)y w:(unsigned)w h:(unsigned)h;
+- (unsigned long long)windowMode;
+- (int)signalSharedEvent:(id)e value:(unsigned long long)v operation:(unsigned long long)op;
+@end
+
 #endif
 
 // SPDisplaysReporter merges only the PCI function's immediate children. Our accelerator

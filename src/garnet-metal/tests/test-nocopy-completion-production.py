@@ -3,17 +3,17 @@ import re
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
-blit = (root / "garnet_commands.m").read_text()
-compute = (root / "garnet_commands.m").read_text()
-render = (root / "garnet_commands.m").read_text()
-queue = (root / "garnet_commands.m").read_text()
-command_buffer = (root / "garnet_commands.m").read_text()
+blit = (root / "garnet_compute_blit_encoder.m").read_text()
+compute = blit
+render = (root / "garnet_render_encoder.m").read_text()
+command_buffer = (root / "garnet_command_buffer.m").read_text()
+queue = command_buffer
 runtime_test = Path(__file__).with_name("test-nocopy-readonly.m").read_text()
 
 compute_rejection = compute[compute.index("if (rdna4nc_stage_writes("):].split("return;", 1)[0]
 render_rejection = render[render.index("if (roV || roF)"):].split("return NO;", 1)[0]
 attachment_rejection = render[render.index("if (_hostWriteDropped)"):].split("return self;", 1)[0]
-writeback_rejection = queue[queue.index("static BOOL rdna4_ios_writeback"):].split("if (![t rdna4IsIOS])", 1)[0]
+writeback_rejection = queue[queue.index("GARNET_INTERNAL BOOL rdna4_ios_writeback_ex"):].split("if (![t rdna4IsIOS])", 1)[0]
 finish = command_buffer[command_buffer.index("- (BOOL)rdna4Finish:"):]
 flush_at = finish.index("[self rdna4FlushEventWrites:_vk];")
 display_at = finish.index("for (RDNA4Texture *t in _iow)")
@@ -29,7 +29,7 @@ checks = {
     "render-stage rejections fail the command buffer": "[_cb rdna4Fail:" in render_rejection,
     "read-only attachments fail the command buffer": "[_cb rdna4Fail:" in attachment_rejection,
     "write-back reports refusal": bool(
-        "static BOOL rdna4_ios_writeback" in queue
+        "GARNET_INTERNAL BOOL rdna4_ios_writeback_ex" in queue
         and "rdna4nc_drop_write" in writeback_rejection
         and "return NO;" in writeback_rejection
     ),

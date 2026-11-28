@@ -82,7 +82,7 @@ int main(void) {
     // 4. Source contract checks
     char *be = slurp("garnet_backend.m");
     char *pi = slurp("garnet_pipelines.m");
-    char *cm = slurp("garnet_commands.m");
+    char *cm = slurp("garnet_render_encoder.m");
     check(be && pi && cm, "source files readable");
     if (be && pi && cm) {
         check(strstr(be, "VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME") != NULL &&

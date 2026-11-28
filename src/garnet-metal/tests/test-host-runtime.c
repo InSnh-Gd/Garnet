@@ -183,28 +183,36 @@ static void suite_async_compute(void) {
           garnet_async_compute_use_concurrent_image(1, 0, 1, 0) == 1 &&
           garnet_async_compute_use_concurrent_image(1, 0, 1, 1) == 0);
 
-    FILE *rf = fopen("src/garnet-metal/garnet_resources.m", "rb");
-    if (!rf) rf = fopen("garnet_resources.m", "rb");
-    CHECK("async resources file readable", rf != NULL);
-    if (rf) {
-        fseek(rf, 0, SEEK_END);
-        long sz = ftell(rf);
-        fseek(rf, 0, SEEK_SET);
-        char *buf = malloc((size_t)sz + 1);
-        CHECK("async resources alloc", buf != NULL);
-        if (buf) {
-            CHECK("async resources read", fread(buf, 1, (size_t)sz, rf) == (size_t)sz);
-            buf[sz] = 0;
-            size_t imgCreates = 0, bufCreates = 0, concAssign = 0;
-            for (const char *p = buf; (p = strstr(p, "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO")) != NULL; p += 35) imgCreates++;
-            for (const char *p = buf; (p = strstr(p, "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO")) != NULL; p += 36) bufCreates++;
-            for (const char *p = buf; (p = strstr(p, "VK_SHARING_MODE_CONCURRENT")) != NULL; p += 26) concAssign++;
-            CHECK("async resources concurrent count", imgCreates == 5u && bufCreates == 3u && concAssign == imgCreates + bufCreates);
-            CHECK("async resources drm sharingMode", strstr(buf, ".sharingMode = ic.sharingMode") != NULL);
-            free(buf);
+    const char *res_paths[2][2] = {
+        { "src/garnet-metal/garnet_resources.m", "garnet_resources.m" },
+        { "src/garnet-metal/garnet_textures.m", "garnet_textures.m" },
+    };
+    size_t imgCreates = 0, bufCreates = 0, concAssign = 0;
+    int sawDrmSharing = 0;
+    for (size_t fi = 0; fi < 2; fi++) {
+        FILE *rf = fopen(res_paths[fi][0], "rb");
+        if (!rf) rf = fopen(res_paths[fi][1], "rb");
+        CHECK("async resources file readable", rf != NULL);
+        if (rf) {
+            fseek(rf, 0, SEEK_END);
+            long sz = ftell(rf);
+            fseek(rf, 0, SEEK_SET);
+            char *buf = malloc((size_t)sz + 1);
+            CHECK("async resources alloc", buf != NULL);
+            if (buf) {
+                CHECK("async resources read", fread(buf, 1, (size_t)sz, rf) == (size_t)sz);
+                buf[sz] = 0;
+                for (const char *p = buf; (p = strstr(p, "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO")) != NULL; p += 35) imgCreates++;
+                for (const char *p = buf; (p = strstr(p, "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO")) != NULL; p += 36) bufCreates++;
+                for (const char *p = buf; (p = strstr(p, "VK_SHARING_MODE_CONCURRENT")) != NULL; p += 26) concAssign++;
+                if (strstr(buf, ".sharingMode = ic.sharingMode") != NULL) sawDrmSharing = 1;
+                free(buf);
+            }
+            fclose(rf);
         }
-        fclose(rf);
     }
+    CHECK("async resources concurrent count", imgCreates == 5u && bufCreates == 3u && concAssign == imgCreates + bufCreates);
+    CHECK("async resources drm sharingMode", sawDrmSharing);
 }
 
 static rdna4cb_t g_cb_tab;

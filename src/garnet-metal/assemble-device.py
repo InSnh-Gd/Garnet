@@ -9,18 +9,18 @@ import sys
 
 def assemble(source: Path, include_dir: Path) -> str:
     # Leave ordinary includes intact, just as in the historical monolithic source.
-    # Honor include-once semantics for garnet_metal_internal.h across modular units.
+    # Honor include-once semantics for garnet_*_internal.h across modular units.
     seen_headers: set[Path] = set()
     def expand(path: Path, parents: tuple[Path, ...]) -> str:
         path = path.resolve()
         if path in parents:
             raise ValueError(f"cyclic device module include: {path.name}")
-        if path.name == "garnet_metal_internal.h":
+        if path.name.endswith("_internal.h"):
             if path in seen_headers:
                 return ""
             seen_headers.add(path)
         return re.sub(
-            r'^#include "(garnet_metal_internal\.h|garnet_[a-z0-9_]+\.m|rdna4_[a-z0-9_]+_impl\.inc)"\n',
+            r'^#include "(garnet_[a-z0-9_]*_internal\.h|garnet_[a-z0-9_]+\.m|rdna4_[a-z0-9_]+_impl\.inc)"\n',
             lambda match: expand(include_dir / match[1], (*parents, path)),
             path.read_text(),
             flags=re.MULTILINE,

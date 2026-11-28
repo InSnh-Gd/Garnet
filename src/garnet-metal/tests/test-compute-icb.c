@@ -659,25 +659,31 @@ static void test_source_pins(void) {
         "rdna4_icb_emit_compute_expand_spv",
         "rdna4ExecuteComputeOnEncoder:",
         "rdna4ExecuteComputeICBGPU:",
-        "vkCmdDispatchIndirect",
         "cannot mix render and compute commands",
+    };
+    static const char *const icb_exec_pins[] = {
+        "rdna4ExecuteComputeICBGPU:",
+        "vkCmdDispatchIndirect",
     };
     static const char *const hdr_pins[] = {
         "RDNA4_COMPUTE_ICB_ENABLED",
         "RDNA4ComputeICBInternal",
     };
     assert_file_contains("src/garnet-metal/garnet_metal_internal.h", hdr_pins, sizeof hdr_pins / sizeof hdr_pins[0]);
-    assert_file_contains("src/garnet-metal/garnet_pipelines.m", pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
-    assert_file_contains("src/garnet-metal/garnet_commands.m", enc_pins, sizeof enc_pins / sizeof enc_pins[0]);
-    assert_file_contains("src/garnet-metal/garnet_arguments.m", arg_pins, sizeof arg_pins / sizeof arg_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_compute_pipelines.m", pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_compute_blit_encoder.m", enc_pins, sizeof enc_pins / sizeof enc_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_argument_encoder.m", arg_pins, sizeof arg_pins / sizeof arg_pins[0]);
     assert_file_contains("src/garnet-metal/garnet_icb.m", icb_pins, sizeof icb_pins / sizeof icb_pins[0]);
+    assert_file_contains("src/garnet-metal/garnet_icb_execute.m", icb_exec_pins, sizeof icb_exec_pins / sizeof icb_exec_pins[0]);
 
     const char *assembled = getenv("RDNA4_TEST_ASSEMBLED_DEVICE");
     if (assembled && assembled[0]) {
         static const char *const asm_inc_pins[] = {
             "#include \"garnet_icb_abi.h\"",
             "#include \"garnet_arguments.m\"",
+            "#include \"garnet_argument_encoder.m\"",
             "#include \"garnet_icb.m\"",
+            "#include \"garnet_icb_execute.m\"",
         };
         assert_file_contains(assembled, pipe_pins, sizeof pipe_pins / sizeof pipe_pins[0]);
         assert_file_contains(assembled, enc_pins, sizeof enc_pins / sizeof enc_pins[0]);

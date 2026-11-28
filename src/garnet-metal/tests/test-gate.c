@@ -213,16 +213,16 @@ int main(int argc, char **argv) {
       char *gd = assembled ? NULL : slurp(dir, "garnet_device.m");
       char *gh = assembled ? NULL : slurp(dir, "garnet_metal_internal.h");
       char *rp = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
-      char *cp = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
-      char *re = assembled ? NULL : slurp(dir, "garnet_commands.m");
-      char *ce = assembled ? NULL : slurp(dir, "garnet_commands.m");
+      char *cp = assembled ? NULL : slurp(dir, "garnet_compute_pipelines.m");
+      char *re = assembled ? NULL : slurp(dir, "garnet_render_encoder.m");
+      char *ce = assembled ? NULL : slurp(dir, "garnet_compute_blit_encoder.m");
       char *bf = assembled ? NULL : slurp(dir, "garnet_resources.m");
-      char *rs = assembled ? NULL : slurp(dir, "garnet_resources.m");
-      char *cb = assembled ? NULL : slurp(dir, "garnet_commands.m");
+      char *rs = assembled ? NULL : slurp(dir, "garnet_states_residency.m");
+      char *cb = assembled ? NULL : slurp(dir, "garnet_command_buffer.m");
       char *sr = assembled ? NULL : slurp(dir, "garnet_shaders.m");
       char *bk = assembled ? NULL : slurp(dir, "garnet_backend.m");
-      char *sb = assembled ? NULL : slurp(dir, "garnet_pipelines.m");
-      char *ag = assembled ? NULL : slurp(dir, "garnet_arguments.m");
+      char *sb = assembled ? NULL : slurp(dir, "garnet_pipeline_bindings.m");
+      char *ag = assembled ? NULL : slurp(dir, "garnet_argument_encoder.m");
       const char *devSrc = assembled ? gm : gd;
       const char *hdrSrc = assembled ? gm : gh;
       const char *rpSrc = assembled ? gm : rp;
@@ -259,9 +259,11 @@ int main(int argc, char **argv) {
       CHECK("G14: GarnetDevice.m wires Wave 2A counters, binary archive, IO queue, and residency set factories",
             gm && devSrc && rpSrc
                && (assembled || (strstr(gm, "#include \"garnet_shaders.m\"")
+                                 && strstr(gm, "#include \"garnet_binary_archive.m\"")
                                  && strstr(gm, "#include \"garnet_commands.m\"")
                                  && strstr(gm, "#include \"garnet_resources.m\"")
-                                 && strstr(gm, "#include \"garnet_sparse_io.m\"")))
+                                 && strstr(gm, "#include \"garnet_states_residency.m\"")
+                                 && strstr(gm, "#include \"garnet_io_queue.m\"")))
                && strstr(devSrc, "(id<MTLBinaryArchive>)[[RDNA4BinaryArchive alloc] initWithDevice:self descriptor:descriptor error:error]")
                && strstr(rpSrc, "rdna4_ba_lookup_render(")
                && strstr(rpSrc, "rdna4_ba_vkcache()")
@@ -276,7 +278,7 @@ int main(int argc, char **argv) {
             gm && devSrc && cbSrc
                && (assembled ? (strstr(gm, "@implementation RDNA4ResourceStateEncoder")
                                 && strstr(gm, "@implementation GarnetAccelerationStructureCommandEncoder"))
-                             : (strstr(gm, "#include \"garnet_sparse_io.m\"")
+                             : (strstr(gm, "#include \"garnet_sparse.m\"")
                                 && strstr(gm, "#include \"garnet_rt_runtime.m\"")
                                 && strstr(gm, "#include \"garnet_rt_accel.m\"")
                                 && strstr(gm, "#include \"garnet_rt_plan.m\"")
@@ -307,7 +309,7 @@ int main(int argc, char **argv) {
                && (assembled ? (strstr(gm, "@implementation RDNA4DynamicLibrary")
                                 && strstr(gm, "@implementation RDNA4FunctionHandle")
                                 && strstr(gm, "@implementation RDNA4VisibleFunctionTable"))
-                             : (strstr(gm, "#include \"garnet_shaders.m\"") != NULL))
+                             : (strstr(gm, "#include \"garnet_dynlib_vft.m\"") != NULL))
                && strstr(devSrc, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self library:library error:error]")
                && strstr(devSrc, "(id<MTLDynamicLibrary>)[[RDNA4DynamicLibrary alloc] initWithDevice:self url:url error:error]")
                && strstr(devSrc, "\"MTLDynamicLibrary\"")

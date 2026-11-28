@@ -5,6 +5,7 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_resources_internal.h"
 #include "garnet_rt_internal.h"
 #include "garnet_rt_spv.h"
 #include "garnet_rt_spv_curves.h"

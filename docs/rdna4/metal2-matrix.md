@@ -84,7 +84,7 @@ addressing (`M02`/`M03`).
 
 | ID | Requirement | Implementation / coverage | Oracle criteria |
 | --- | --- | --- | --- |
-| A01 | Direct buffer/texture/sampler/inline binding and stage limits | `garnet_arguments.m`, `arguments-layout` | Last valid slot, invalid slot rejection, offsets, inline sizes across all three stages |
+| A01 | Direct buffer/texture/sampler/inline binding and stage limits | `garnet_arguments.m` / `garnet_argument_encoder.m`, `arguments-layout` | Last valid slot, invalid slot rejection, offsets, inline sizes across all three stages |
 | A02 | Tier 2 layout/reflection, arrays, nested arguments, pointer indexing (spec 2.12.1) | `argument-arrays`, `argument-nested`, `argument-resources` | Dynamic/nonuniform indexing picks distinct resources across vertex/fragment/compute |
 | A03 | Tier 2 GPU-produced resource and sampler references | `argument-gpu`, `argument-copy`, `test-gpu-resource-tables.c` | GPU copies device argument members, synchronized consumers observe updates; illegal thread-to-device sampler copy rejected |
 | A04 | Indirect resources, usage declarations, and lifetime | `argument-scan-runtime`, `summary-*`, `writer-epochs-*` | Dropping application references before submit preserves indirect reads/writes through completion and heap reuse |

@@ -102,7 +102,7 @@ static inline int rdna4x_env_dirty(char *const *envp) {
 }
 // The kill file, with garnet_gate.h's states: anything but a clean "absent" is killed (fail closed).
 static inline int rdna4x_killed_from_stat(int statRc, int err) { return rdna4g_kill_state(statRc, err) != RDNA4G_KILL_ABSENT; }
-// The side directory /private/var/tmp/rdna4m-spv is read by WindowServer's sandbox profile and by root tools; a sandboxed application is denied it (deny-log spam), so it is skipped there.
+// The side directory /private/var/tmp/garnet-spv is read by WindowServer's sandbox profile and by root tools; a sandboxed application is denied it (deny-log spam), so it is skipped there.
 static inline int rdna4x_skip_side_dir(int isWs, int sandboxed) { return !isWs && sandboxed; }
 
 // ======================================================================================================================================================================

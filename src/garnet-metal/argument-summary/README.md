@@ -37,7 +37,7 @@ persistent possible-token set; in-flight snapshots stay unchanged.
 
 ## Runtime bridge
 
-Implemented in `../garnet_arguments.m` (and `../garnet_argument_summary.h`),
+Implemented in `../garnet_argument_summary.m` (and `../garnet_argument_summary.h`),
 the Objective-C/Vulkan bridge:
 
 - Lazily creates the descriptor set layout, pipeline layout, shader module, and

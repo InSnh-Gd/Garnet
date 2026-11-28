@@ -51,8 +51,14 @@ def main() -> int:
     # --- Phase A2: Adaptive + condvar-wakeable Present Hold ---
     df_h = read(GM / "garnet_dispflip.h")
     surf_m = read(GM / "garnet_surface.m")
-    cmd_m = read(GM / "garnet_commands.m")
-    int_h = read(GM / "garnet_metal_internal.h")
+    cmd_m = "\n".join(read(GM / n) for n in (
+        "garnet_commands.m", "garnet_command_buffer.m",
+        "garnet_render_encoder.m", "garnet_compute_blit_encoder.m",
+    ))
+    int_h = "\n".join(read(GM / n) for n in (
+        "garnet_metal_internal.h", "garnet_commands_internal.h",
+        "garnet_pipelines_internal.h", "garnet_shaders_internal.h",
+    ))
     check("A2: adaptive hold decay=8 and 3.0 ms post-hoc window in garnet_dispflip.h",
           "RDNA4DF_HOLD_ADAPT_DECAY_FRAMES 8u" in df_h
           and "RDNA4DF_HOLD_ADAPT_WINDOW_NS    (3000000ULL)" in df_h
@@ -87,7 +93,7 @@ def main() -> int:
     bar_h = read(GM / "garnet_bar_policy.h")
     imp_h = read(GM / "garnet_impcache.h")
     be_m = read(GM / "garnet_backend.m")
-    res_m = read(GM / "garnet_resources.m")
+    res_m = read(GM / "garnet_resources.m") + "\n" + read(GM / "garnet_textures.m")
     check("A4: dual-BAR policy caps (512 MiB Small-BAR / 1536 MiB Full-BAR)",
           "GARNET_VRAM_SURF_CAP_SMALL_BAR  (512ULL << 20)" in bar_h
           and "GARNET_VRAM_SURF_CAP_FULL_BAR   (1536ULL << 20)" in bar_h)
@@ -155,8 +161,10 @@ def main() -> int:
           and "IOSurfaceLock(s, kIOSurfaceLockAvoidSync, NULL)" not in res_m)
 
     # --- Wave 7: Sync commit, lazy dispCopyVk, VK_KHR_push_descriptor, CB render scratch ---
-    shd_m = read(GM / "garnet_shaders.m")
-    pipe_m = read(GM / "garnet_pipelines.m")
+    shd_m = read(GM / "garnet_shaders.m") + "\n" + read(GM / "garnet_spvcache.m")
+    pipe_m = "\n".join(read(GM / n) for n in (
+        "garnet_pipelines.m", "garnet_compute_pipelines.m", "garnet_pipeline_bindings.m",
+    ))
     check("W7A: synchronous queue commit enabled with /private/tmp/garnet-async-commit kill switch",
           'setValue:@YES forKey:@"commitSynchronously"' in cmd_m
           and '"/private/tmp/garnet-async-commit"' in cmd_m)

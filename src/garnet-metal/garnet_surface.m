@@ -6,6 +6,8 @@
 #ifdef GARNET_METAL_MODULAR_BUILD
 #include "garnet_metal_internal.h"
 #endif
+#include "garnet_plane.h"
+#include "garnet_binary_archive.h"
 #endif
 
 #if !defined(GARNET_DISPLAY_LATE_ONLY) && !defined(GARNET_PRESENT_CAPTURE_ONLY)

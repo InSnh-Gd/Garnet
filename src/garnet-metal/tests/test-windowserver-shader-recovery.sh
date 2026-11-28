@@ -2,6 +2,7 @@
 set -euo pipefail
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
 runtime="$source_dir/garnet_shaders.m"
+spvcache="$source_dir/garnet_spvcache.m"
 out=$(mktemp -d "${TMPDIR:-/tmp}/windowserver-shader-recovery.XXXXXXXX")
 trap 'rm -rf "$out"' EXIT
 {
@@ -32,7 +33,7 @@ static BOOL rebuild(BOOL ok) {
 C
     awk '/if \(rdna4hs_build_done\(&e->st, ok,/ { emit = 1 }
          emit && /else if \(e->st.st == RDNA4HS_GAVEUP\)/ { exit }
-         emit { print }' "$runtime"
+         emit { print }' "$spvcache"
     cat <<'C'
     return e->st.st == RDNA4HS_SWAPPED;
 }

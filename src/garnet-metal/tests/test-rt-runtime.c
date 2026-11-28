@@ -1127,12 +1127,13 @@ static void test_source_pins(void) {
     }
 
     char *shd = read_source_file("src/garnet-metal/garnet_shaders.m", "garnet_shaders.m");
-    CHECK(shd != NULL, "read garnet_shaders.m for Wave 4.1B pins");
-    if (shd) {
+    char *spv = read_source_file("src/garnet-metal/garnet_spvcache.m", "garnet_spvcache.m");
+    CHECK(shd != NULL && spv != NULL, "read garnet_shaders.m and garnet_spvcache.m for Wave 4.1B pins");
+    if (shd && spv) {
         CHECK(strstr(shd, "GARNETX_CAP_RT_PRIMITIVE_DATA") != NULL &&
-              strstr(shd, "rtPrimDataTable") != NULL &&
-              strstr(shd, "RTPrimDataTable") != NULL,
-              "garnet_shaders wires GARNETX_CAP_RT_PRIMITIVE_DATA and binding 676 RTPrimDataTable");
+              strstr(spv, "rtPrimDataTable") != NULL &&
+              strstr(spv, "RTPrimDataTable") != NULL,
+              "garnet_shaders/garnet_spvcache wire GARNETX_CAP_RT_PRIMITIVE_DATA and binding 676 RTPrimDataTable");
         CHECK(strstr(shd, "const BOOL unlimited = (deadlineNs == UINT64_MAX && !rdna4_is_ws());") != NULL &&
               strstr(shd, "waitMs = -1;") != NULL,
               "R4: rdna4x_translate_fn_with_error honors UINT64_MAX sentinel -> waitMs=-1 for non-WS");
@@ -1140,8 +1141,9 @@ static void test_source_pins(void) {
               "R6: rdna4_rt_xlate_caps sets GARNETX_CAP_NATIVE_INT64 when RDNA4R.shaderInt64 is enabled");
         CHECK(strstr(shd, "GARNETX_CAP_RT_MOTION_BLUR") != NULL,
               "Wave 3.2: garnet_shaders wires GARNETX_CAP_RT_MOTION_BLUR");
-        free(shd);
     }
+    free(shd);
+    free(spv);
 
     char *devm = read_source_file("src/garnet-metal/garnet_device.m", "garnet_device.m");
     CHECK(devm != NULL, "read garnet_device.m for Wave 4.2 pins");
@@ -1155,8 +1157,8 @@ static void test_source_pins(void) {
         free(devm);
     }
 
-    char *cmds = read_source_file("src/garnet-metal/garnet_commands.m", "garnet_commands.m");
-    CHECK(cmds != NULL, "read garnet_commands.m for useResource RT pins");
+    char *cmds = read_source_file("src/garnet-metal/garnet_command_buffer.m", "garnet_command_buffer.m");
+    CHECK(cmds != NULL, "read garnet_command_buffer.m for useResource RT pins");
     if (cmds) {
         const char *ur = strstr(cmds, "- (void)rdna4UseResource:(id)resource usage:(NSUInteger)usage");
         CHECK(ur != NULL, "found rdna4UseResource:usage:");
@@ -1191,23 +1193,25 @@ static void test_source_pins(void) {
     }
 
     char *args = read_source_file("src/garnet-metal/garnet_arguments.m", "garnet_arguments.m");
-    CHECK(args != NULL, "read garnet_arguments.m for IFT/VFT backing BDA registry pin");
-    if (args) {
+    char *argenc = read_source_file("src/garnet-metal/garnet_argument_encoder.m", "garnet_argument_encoder.m");
+    CHECK(args != NULL && argenc != NULL, "read garnet_arguments.m and garnet_argument_encoder.m for IFT/VFT backing BDA registry pin");
+    if (args && argenc) {
         CHECK(strstr(args, "[object isKindOfClass:[RDNA4IntersectionFunctionTable class]]") != NULL &&
               strstr(args, "rdna4BackingBuffer") != NULL &&
               strstr(args, "rdna4AttachedBufferAtIndex:") != NULL &&
-              strstr(args, "bindlessQueried") != NULL,
+              strstr(argenc, "bindlessQueried") != NULL,
               "rdna4PrepareArguments registers IFT attached buffers and honors bindlessQueried samplers");
-        CHECK(strstr(args, "rdna4_argument_descriptor_effective_count(argument.arrayLength)") != NULL &&
-              strstr(args, "|| !argument.arrayLength") == NULL,
+        CHECK(strstr(argenc, "rdna4_argument_descriptor_effective_count(argument.arrayLength)") != NULL &&
+              strstr(argenc, "|| !argument.arrayLength") == NULL,
               "RDNA4ArgumentLayout initWithArguments normalizes arrayLength == 0 to 1");
-        CHECK(strstr(args, "field.type != MTLDataTypeInstanceAccelerationStructure && field.type != MTLDataTypePrimitiveAccelerationStructure") != NULL,
+        CHECK(strstr(argenc, "field.type != MTLDataTypeInstanceAccelerationStructure && field.type != MTLDataTypePrimitiveAccelerationStructure") != NULL,
               "RDNA4ArgumentEncoder setAccelerationStructure accepts both InstanceAS (118) and PrimitiveAS (117) slots");
         CHECK(strstr(args, "const BOOL unlimited = (deadline == UINT64_MAX && !rdna4_is_ws());") != NULL &&
               strstr(args, "waitMs = -1;") != NULL,
               "R4: rdna4_gpu_argument_spv honors UINT64_MAX sentinel -> waitMs=-1 for non-WS");
-        free(args);
     }
+    free(args);
+    free(argenc);
 
     char *xl = read_source_file("src/garnet-metal/garnet_xlate.h", "garnet_xlate.h");
     CHECK(xl != NULL, "read garnet_xlate.h for 64 MiB SPIR-V cap pin");
@@ -1221,8 +1225,8 @@ static void test_source_pins(void) {
         free(xl);
     }
 
-    char *pipes = read_source_file("src/garnet-metal/garnet_pipelines.m", "garnet_pipelines.m");
-    CHECK(pipes != NULL, "read garnet_pipelines.m for R4 compute arg-lowering deadline pin");
+    char *pipes = read_source_file("src/garnet-metal/garnet_compute_pipelines.m", "garnet_compute_pipelines.m");
+    CHECK(pipes != NULL, "read garnet_compute_pipelines.m for R4 compute arg-lowering deadline pin");
     if (pipes) {
         CHECK(strstr(pipes, "const uint64_t deadline = rdna4_is_ws()\n        ? (rdna4_now() + (uint64_t)RDNA4G_SYNC_WAIT_WS_MS * 1000000ull)\n        : UINT64_MAX;") != NULL,
               "R4: compute pipeline passes UINT64_MAX deadline to rdna4_gpu_argument_spv for non-WS");
@@ -1269,18 +1273,22 @@ static void test_source_pins(void) {
         free(icb);
     }
 
-    char *res = read_source_file("src/garnet-metal/garnet_resources.m", "garnet_resources.m");
-    CHECK(res != NULL, "read garnet_resources.m for Wave 2 Bindless Bridges 1 & 2 pins");
-    if (res) {
-        CHECK(strstr(res, "rdna4_argument_resource_token_bindless(self, _dev, YES, YES)") != NULL,
+    char *tex = read_source_file("src/garnet-metal/garnet_textures.m", "garnet_textures.m");
+    char *sr = read_source_file("src/garnet-metal/garnet_states_residency.m", "garnet_states_residency.m");
+    char *heaps = read_source_file("src/garnet-metal/garnet_heaps.m", "garnet_heaps.m");
+    CHECK(tex != NULL && sr != NULL && heaps != NULL, "read garnet_textures.m, garnet_states_residency.m, and garnet_heaps.m for Wave 2 Bindless Bridges 1 & 2 pins");
+    if (tex && sr && heaps) {
+        CHECK(strstr(tex, "rdna4_argument_resource_token_bindless(self, _dev, YES, YES)") != NULL,
               "Bridge 1: RDNA4Texture unifies uniqueIdentifier/gpuResourceID to 0x5244 token");
-        CHECK(strstr(res, "rdna4_argument_resource_token_bindless(self, _dev, NO, YES)") != NULL,
+        CHECK(strstr(sr, "rdna4_argument_resource_token_bindless(self, _dev, NO, YES)") != NULL,
               "Bridge 2: RDNA4SamplerState.gpuResourceID marks bindlessQueried");
-        CHECK(strstr(res, "newAccelerationStructureWithSize:(NSUInteger)size offset:") != NULL &&
-              strstr(res, "newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d offset:") != NULL,
+        CHECK(strstr(heaps, "newAccelerationStructureWithSize:(NSUInteger)size offset:") != NULL &&
+              strstr(heaps, "newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d offset:") != NULL,
               "Wave 4.2: RDNA4Heap wires placement & automatic acceleration structure constructors");
-        free(res);
     }
+    free(tex);
+    free(sr);
+    free(heaps);
 
     char *live = read_source_file("src/garnet-metal/tests/test-metal3-raytracing.m", "test-metal3-raytracing.m");
     CHECK(live != NULL, "read test-metal3-raytracing.m for source pins");

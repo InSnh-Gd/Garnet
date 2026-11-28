@@ -606,10 +606,10 @@ static void test_pool_and_batch_planner(void) {
 }
 
 static void test_source_pins(const char *dir) {
-    char *impl = slurp(dir, "garnet_sparse_io.m");
-    char *hdr = slurp(dir, "garnet_metal_internal.h");
+    char *impl = slurp(dir, "garnet_sparse.m");
+    char *hdr = slurp(dir, "garnet_sparse_internal.h");
     char *live = slurp(dir, "tests/test-metal3-sparse-prt.m");
-    CHECK("source pins: read garnet_sparse_io.m, garnet_metal_internal.h, and test-metal3-sparse-prt.m",
+    CHECK("source pins: read garnet_sparse.m, garnet_sparse_internal.h, and test-metal3-sparse-prt.m",
           impl != NULL && hdr != NULL && live != NULL, "dir=%s", dir);
     if (impl && hdr) {
         CHECK("pin: RDNA4ResourceStateEncoder implements all 5 sparse/fence selectors & vkQueueBindSparse fence wait",
@@ -627,10 +627,10 @@ static void test_source_pins(const char *dir) {
               strstr(impl, "rdna4fw_wait_bounded") != NULL &&
               strstr(hdr, "RDNA4SparseTexture : RDNA4Texture") != NULL &&
               strstr(impl, "RDNA4SparseHeap") != NULL &&
-              strstr(hdr, "RDNA4Heap (RDNA4SparseBacking)") != NULL &&
+              strstr(impl, "RDNA4Heap (RDNA4SparseBacking)") != NULL &&
               strstr(impl, "Wave 3 integration notes") != NULL,
               "encoder + sparse texture/heap + fence wait + safety guards present");
-        CHECK("pin: garnet_sparse_io.m never enables MTLGPUFamilyApple6",
+        CHECK("pin: garnet_sparse.m never enables MTLGPUFamilyApple6",
               strstr(impl, "RDNA4G_FAMILY_APPLE6") == NULL &&
               strstr(impl, "- (BOOL)supportsFamily:") == NULL &&
               strstr(impl, "-(BOOL)supportsFamily:") == NULL,

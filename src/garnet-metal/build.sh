@@ -46,13 +46,30 @@ fi
 GARNET_UNITS=(
   garnet_backend
   garnet_resources
+  garnet_textures
+  garnet_heaps
+  garnet_states_residency
   garnet_surface
   garnet_shaders
+  garnet_spvcache
+  garnet_binary_archive
+  garnet_dynlib_vft
   garnet_pipelines
+  garnet_compute_pipelines
+  garnet_pipeline_bindings
   garnet_commands
+  garnet_command_buffer
+  garnet_counters
+  garnet_render_encoder
+  garnet_compute_blit_encoder
   garnet_arguments
+  garnet_argument_encoder
+  garnet_argument_summary
+  garnet_argument_summary_owners
   garnet_icb
-  garnet_sparse_io
+  garnet_icb_execute
+  garnet_io_queue
+  garnet_sparse
   garnet_rt_runtime
   garnet_rt_accel
   garnet_rt_plan

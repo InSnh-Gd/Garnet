@@ -643,8 +643,8 @@ static char *read_entire_text_file(const char *path) {
 static void test_source_pins(const char *src_dir) {
     char p1[512], p2[512], ph[512];
     snprintf(p1, sizeof(p1), "%s/garnet_shaders.m", src_dir);
-    snprintf(p2, sizeof(p2), "%s/garnet_shaders.m", src_dir);
-    snprintf(ph, sizeof(ph), "%s/garnet_metal_internal.h", src_dir);
+    snprintf(p2, sizeof(p2), "%s/garnet_dynlib_vft.m", src_dir);
+    snprintf(ph, sizeof(ph), "%s/garnet_shaders_internal.h", src_dir);
 
     char *rt = read_entire_text_file(p1);
     char *hdr = read_entire_text_file(ph);
@@ -675,7 +675,7 @@ static void test_source_pins(const char *src_dir) {
     free(hdr);
 
     char *impl = read_entire_text_file(p2);
-    CHECK(impl != NULL, "read garnet_shaders.m");
+    CHECK(impl != NULL, "read garnet_dynlib_vft.m");
     if (impl) {
         const char *libBcPos = strstr(impl, "rdna4_dl_objc_prop(library, \"bitcodeData\")");
         const char *extFnPos = strstr(impl, "\"newExternFunctionWithName:\"");
